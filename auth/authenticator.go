@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,12 +28,13 @@ const (
 // It handles the device code flow, token caching to disk, and automatic
 // refresh using a read-write mutex for concurrent access.
 type Authenticator struct {
-	tokenDir     string
-	accessToken  string
-	copilotToken string
-	tokenExpiry  time.Time
-	mu           sync.RWMutex
-	client       *http.Client
+	tokenDir       string
+	accessToken    string
+	copilotToken   string
+	tokenExpiry    time.Time
+	mu             sync.RWMutex
+	client         *http.Client
+	copilotBaseURL string // overridable for tests; defaults to https://api.github.com
 }
 
 // DeviceCodeResponse is the response from GitHub's device code endpoint.
@@ -180,8 +180,6 @@ func (a *Authenticator) deviceCodeFlow(ctx context.Context) error {
 			return fmt.Errorf("decoding access token response: %w (body: %s)", err, string(respBody))
 		}
 
-		log.Printf("poll response: error=%q token_present=%v", atResp.Error, atResp.AccessToken != "")
-
 		switch atResp.Error {
 		case "":
 			a.accessToken = atResp.AccessToken
@@ -202,8 +200,15 @@ func (a *Authenticator) deviceCodeFlow(ctx context.Context) error {
 	return fmt.Errorf("device code flow timed out")
 }
 
+func (a *Authenticator) getCopilotTokenURL() string {
+	if a.copilotBaseURL != "" {
+		return a.copilotBaseURL + "/copilot_internal/v2/token"
+	}
+	return copilotTokenURL
+}
+
 func (a *Authenticator) exchangeForCopilotToken(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, copilotTokenURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.getCopilotTokenURL(), nil)
 	if err != nil {
 		return fmt.Errorf("creating copilot token request: %w", err)
 	}

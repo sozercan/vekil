@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sozercan/copilot-proxy/auth"
+	"github.com/sozercan/copilot-proxy/logger"
 	"github.com/sozercan/copilot-proxy/proxy"
 )
 
@@ -22,27 +22,26 @@ func main() {
 	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
 	flag.Parse()
 
-	if *logLevel == "debug" {
-		log.SetFlags(log.LstdFlags | log.Lshortfile)
-	}
+	log := logger.New(logger.ParseLevel(*logLevel))
 
 	authenticator := auth.NewAuthenticator(*tokenDir)
 
 	// Authenticate on startup so the device code flow can run interactively
-	log.Println("authenticating with GitHub Copilot...")
+	log.Info("authenticating with GitHub Copilot...")
 	ctx := context.Background()
 	if _, err := authenticator.GetToken(ctx); err != nil {
-		log.Fatalf("authentication failed: %v", err)
+		log.Fatal("authentication failed", logger.Err(err))
 	}
-	log.Println("authenticated successfully")
+	log.Info("authenticated successfully")
 
-	handler := proxy.NewProxyHandler(authenticator)
+	handler := proxy.NewProxyHandler(authenticator, log)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/messages", handler.HandleAnthropicMessages)
 	mux.HandleFunc("POST /v1/chat/completions", handler.HandleOpenAIChatCompletions)
 	mux.HandleFunc("POST /v1/responses", handler.HandleResponses)
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
+	mux.HandleFunc("GET /v1/models", handler.HandleModels)
 
 	addr := fmt.Sprintf("%s:%s", *host, *port)
 	server := &http.Server{
@@ -57,22 +56,22 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("copilot-proxy listening on %s", addr)
+		log.Info("copilot-proxy listening", logger.F("addr", addr))
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server error: %v", err)
+			log.Fatal("server error", logger.Err(err))
 		}
 	}()
 
 	<-stop
-	log.Println("shutting down...")
+	log.Info("shutting down...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("shutdown error: %v", err)
+		log.Fatal("shutdown error", logger.Err(err))
 	}
-	log.Println("server stopped")
+	log.Info("server stopped")
 }
 
 func getEnv(key, fallback string) string {

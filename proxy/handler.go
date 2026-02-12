@@ -10,24 +10,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/sozercan/copilot-proxy/auth"
+	"github.com/sozercan/copilot-proxy/logger"
 	"github.com/sozercan/copilot-proxy/models"
 )
 
 // ProxyHandler holds dependencies for all HTTP handlers.
 type ProxyHandler struct {
-	auth       *auth.Authenticator
-	client     *http.Client
-	copilotURL string
+	auth           *auth.Authenticator
+	client         *http.Client
+	copilotURL     string
+	log            *logger.Logger
+	maxRetries     int
+	retryBaseDelay time.Duration
 }
 
 // NewProxyHandler creates a ProxyHandler with connection pooling and HTTP/2.
-func NewProxyHandler(a *auth.Authenticator) *ProxyHandler {
+func NewProxyHandler(a *auth.Authenticator, log *logger.Logger) *ProxyHandler {
 	return &ProxyHandler{
 		auth: a,
 		client: &http.Client{
@@ -41,6 +44,7 @@ func NewProxyHandler(a *auth.Authenticator) *ProxyHandler {
 			},
 		},
 		copilotURL: "https://api.githubcopilot.com",
+		log:        log,
 	}
 }
 
@@ -91,23 +95,27 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	}
 
 	// Use background context to avoid cancellation from client disconnects
-	httpReq, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.copilotURL+"/chat/completions", bytes.NewReader(oaiBody))
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.copilotURL+"/chat/completions", bytes.NewReader(oaiBody))
+		if err != nil {
+			return nil, err
+		}
+		setCopilotHeaders(req, token)
+		return req, nil
+	})
 	if err != nil {
-		writeAnthropicError(w, http.StatusInternalServerError, "api_error", "failed to create request")
-		return
-	}
-	setCopilotHeaders(httpReq, token)
-
-	resp, err := h.client.Do(httpReq)
-	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", fmt.Sprintf("upstream request failed: %v", err))
+		status := http.StatusBadGateway
+		if ue, ok := err.(*upstreamError); ok {
+			status = ue.statusCode
+		}
+		writeAnthropicError(w, status, "api_error", fmt.Sprintf("upstream request failed: %v", err))
 		return
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		errBody, _ := io.ReadAll(resp.Body)
-		log.Printf("[anthropic] upstream error %d: %s", resp.StatusCode, string(errBody))
+		h.log.Error("upstream error", logger.F("endpoint", "anthropic"), logger.F("status", resp.StatusCode), logger.F("body", string(errBody)))
 		writeAnthropicError(w, resp.StatusCode, "api_error", fmt.Sprintf("upstream error (%d): %s", resp.StatusCode, string(errBody)))
 		return
 	}
@@ -157,16 +165,20 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 
-	httpReq, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.copilotURL+"/chat/completions", bytes.NewReader(body))
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.copilotURL+"/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		setCopilotHeaders(req, token)
+		return req, nil
+	})
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "failed to create request", "server_error")
-		return
-	}
-	setCopilotHeaders(httpReq, token)
-
-	resp, err := h.client.Do(httpReq)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, fmt.Sprintf("upstream request failed: %v", err), "server_error")
+		status := http.StatusBadGateway
+		if ue, ok := err.(*upstreamError); ok {
+			status = ue.statusCode
+		}
+		writeOpenAIError(w, status, fmt.Sprintf("upstream request failed: %v", err), "server_error")
 		return
 	}
 
@@ -203,16 +215,20 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httpReq, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.copilotURL+"/responses", bytes.NewReader(body))
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.copilotURL+"/responses", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		setCopilotHeaders(req, token)
+		return req, nil
+	})
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "failed to create request", "server_error")
-		return
-	}
-	setCopilotHeaders(httpReq, token)
-
-	resp, err := h.client.Do(httpReq)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, fmt.Sprintf("upstream request failed: %v", err), "server_error")
+		status := http.StatusBadGateway
+		if ue, ok := err.(*upstreamError); ok {
+			status = ue.statusCode
+		}
+		writeOpenAIError(w, status, fmt.Sprintf("upstream request failed: %v", err), "server_error")
 		return
 	}
 
@@ -231,6 +247,52 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 func (h *ProxyHandler) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"status":"ok"}`))
+}
+
+// HandleModels handles GET /v1/models and returns a list of available models.
+func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
+	models := []string{
+		"gpt-4o",
+		"gpt-4o-mini",
+		"gpt-4.1",
+		"gpt-4.1-mini",
+		"gpt-4.1-nano",
+		"o1",
+		"o1-mini",
+		"o1-preview",
+		"o3",
+		"o3-mini",
+		"o4-mini",
+		"claude-3.5-sonnet",
+		"claude-sonnet-4",
+		"claude-sonnet-4.5",
+		"claude-haiku-4.5",
+		"claude-opus-4",
+		"claude-opus-4.5",
+		"claude-sonnet-4.6",
+		"claude-opus-4.6",
+	}
+
+	type modelObj struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		OwnedBy string `json:"owned_by"`
+	}
+
+	var data []modelObj
+	for _, m := range models {
+		data = append(data, modelObj{
+			ID:      m,
+			Object:  "model",
+			OwnedBy: "github-copilot",
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"object": "list",
+		"data":   data,
+	})
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, errType, message string) {

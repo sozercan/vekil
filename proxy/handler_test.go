@@ -7,8 +7,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sozercan/copilot-proxy/auth"
+	"github.com/sozercan/copilot-proxy/logger"
 	"github.com/sozercan/copilot-proxy/models"
 )
 
@@ -17,9 +19,11 @@ func newTestProxyHandler(t *testing.T, backend http.HandlerFunc) *ProxyHandler {
 	server := httptest.NewServer(backend)
 	t.Cleanup(server.Close)
 	return &ProxyHandler{
-		auth:       auth.NewTestAuthenticator("test-token"),
-		client:     server.Client(),
-		copilotURL: server.URL,
+		auth:           auth.NewTestAuthenticator("test-token"),
+		client:         server.Client(),
+		copilotURL:     server.URL,
+		log:            logger.New(logger.LevelInfo),
+		retryBaseDelay: 1 * time.Millisecond,
 	}
 }
 
@@ -355,5 +359,45 @@ func TestHandleOpenAIChatCompletionsUpstreamError(t *testing.T) {
 	resp := w.Result()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d", resp.StatusCode)
+	}
+}
+
+func TestHandleModels(t *testing.T) {
+	h := &ProxyHandler{}
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+
+	h.HandleModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if result.Object != "list" {
+		t.Errorf("expected object list, got %q", result.Object)
+	}
+	if len(result.Data) == 0 {
+		t.Fatal("expected models in data, got none")
+	}
+	for _, m := range result.Data {
+		if m.Object != "model" {
+			t.Errorf("expected object model, got %q", m.Object)
+		}
+		if m.OwnedBy != "github-copilot" {
+			t.Errorf("expected owned_by github-copilot, got %q", m.OwnedBy)
+		}
 	}
 }
