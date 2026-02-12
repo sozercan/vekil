@@ -11,6 +11,8 @@ High-performance Go proxy that exposes Anthropic and OpenAI-compatible APIs, for
 - **Tool use** — Anthropic tool definitions are translated to OpenAI function calling format
 - **Extended thinking** — Anthropic `thinking` parameter is mapped to `max_completion_tokens`
 - **GitHub OAuth device code flow** with automatic token caching and refresh
+- **Automatic retry** with exponential backoff on transient upstream errors (429, 502, 503, 504)
+- **Structured JSON logging** with configurable log levels
 - **Connection pooling** and HTTP/2 support
 - **Single static binary**, zero runtime dependencies (distroless Docker image)
 
@@ -47,7 +49,7 @@ Tokens are cached to `~/.config/copilot-proxy/` and automatically refreshed befo
 | `--port` | `PORT` | `8080` | Listen port |
 | `--host` | `HOST` | `0.0.0.0` | Listen host |
 | `--token-dir` | `TOKEN_DIR` | `~/.config/copilot-proxy` | Token storage directory |
-| `--log-level` | `LOG_LEVEL` | `info` | Log level (`info` or `debug`) |
+| `--log-level` | `LOG_LEVEL` | `info` | Log level (`debug`, `info`, or `error`) |
 
 ## Usage Examples
 
@@ -169,8 +171,9 @@ Health check endpoint. Returns `{"status":"ok"}`.
 |---------|---------------|
 | `main` | CLI flags, HTTP server setup, graceful shutdown |
 | `auth/` | GitHub OAuth device code flow, Copilot token exchange, disk caching, auto-refresh with `sync.RWMutex` |
-| `proxy/` | HTTP handlers, Anthropic↔OpenAI translation, SSE streaming |
+| `proxy/` | HTTP handlers, Anthropic↔OpenAI translation, SSE streaming, retry with backoff |
 | `models/` | Request/response type definitions for both APIs (data-only, no logic) |
+| `logger/` | Structured JSON logging with level filtering |
 
 ## Development
 
