@@ -257,6 +257,7 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 		"gpt-4.1",
 		"gpt-4.1-mini",
 		"gpt-4.1-nano",
+		"gpt-5.3-codex",
 		"o1",
 		"o1-mini",
 		"o1-preview",
@@ -271,6 +272,7 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 		"claude-opus-4.5",
 		"claude-sonnet-4.6",
 		"claude-opus-4.6",
+		"claude-opus-4.6-fast",
 	}
 
 	type modelObj struct {

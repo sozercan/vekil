@@ -130,6 +130,32 @@ Full Anthropic Messages API compatibility. Incoming requests are translated to O
 **Model name normalization:**
 Dated model suffixes (e.g., `claude-sonnet-4-20250514`) are stripped automatically. Hyphenated version numbers (e.g., `claude-sonnet-4-5`) are mapped to dotted form (`claude-sonnet-4.5`).
 
+**Available model names (`GET /v1/models`):**
+
+| Provider  | Model name             |
+| --------- | ---------------------- |
+| OpenAI    | `gpt-4o`               |
+| OpenAI    | `gpt-4o-mini`          |
+| OpenAI    | `gpt-4.1`              |
+| OpenAI    | `gpt-4.1-mini`         |
+| OpenAI    | `gpt-4.1-nano`         |
+| OpenAI    | `gpt-5.3-codex`        |
+| OpenAI    | `o1`                   |
+| OpenAI    | `o1-mini`              |
+| OpenAI    | `o1-preview`           |
+| OpenAI    | `o3`                   |
+| OpenAI    | `o3-mini`              |
+| OpenAI    | `o4-mini`              |
+| Anthropic | `claude-3.5-sonnet`    |
+| Anthropic | `claude-sonnet-4`      |
+| Anthropic | `claude-sonnet-4.5`    |
+| Anthropic | `claude-haiku-4.5`     |
+| Anthropic | `claude-opus-4`        |
+| Anthropic | `claude-opus-4.5`      |
+| Anthropic | `claude-sonnet-4.6`    |
+| Anthropic | `claude-opus-4.6`      |
+| Anthropic | `claude-opus-4.6-fast` |
+
 ### `POST /v1/chat/completions` (OpenAI)
 
 Near zero-copy passthrough. Only authentication headers are injected; request and response bodies are streamed through untouched.
