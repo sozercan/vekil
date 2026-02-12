@@ -136,6 +136,10 @@ Near zero-copy passthrough. Only authentication headers are injected; request an
 
 Near zero-copy passthrough for the OpenAI Responses API. Only authentication headers are injected.
 
+### `GET /v1/models`
+
+Returns a list of available models in OpenAI-compatible format. Useful for clients that enumerate models before making requests.
+
 ### `GET /healthz`
 
 Health check endpoint. Returns `{"status":"ok"}`.
