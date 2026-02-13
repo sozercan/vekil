@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: copilot-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: copilot-proxy
+  template:
+    metadata:
+      labels:
+        app: copilot-proxy
+    spec:
+      containers:
+        - name: copilot-proxy
+          image: docker.io/sozercan/copilot-proxy:20260212-112512-amd64
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 1337
+          env:
+            - name: PORT
+              value: "1337"
+            - name: TOKEN_DIR
+              value: /home/nonroot/.config/copilot-proxy
+          volumeMounts:
+            - name: token-cache
+              mountPath: /home/nonroot/.config/copilot-proxy
+      volumes:
+        - name: token-cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: copilot-proxy
+spec:
+  selector:
+    app: copilot-proxy
+  ports:
+    - port: 1337
+      targetPort: 1337

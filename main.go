@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	port := flag.String("port", getEnv("PORT", "8080"), "Listen port")
+	port := flag.String("port", getEnv("PORT", "1337"), "Listen port")
 	host := flag.String("host", getEnv("HOST", "0.0.0.0"), "Listen host")
 	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/copilot-proxy)")
 	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
