@@ -200,12 +200,35 @@ Health check endpoint. Returns `{"status":"ok"}`.
 | `proxy/` | HTTP handlers, Anthropic↔OpenAI translation, SSE streaming, retry with backoff |
 | `models/` | Request/response type definitions for both APIs (data-only, no logic) |
 | `logger/` | Structured JSON logging with level filtering |
+| `server/` | Reusable HTTP server lifecycle (Start/Stop/IsRunning) |
+| `cmd/menubar/` | macOS menubar app using systray |
+
+## macOS Menubar App
+
+A native macOS menubar app that lets you start/stop the proxy without a terminal.
+
+### Build & Run
+
+```bash
+make build-menubar
+./copilot-proxy-menubar
+```
+
+### Features
+
+- **Start/Stop toggle** — click the menu item to start or stop the proxy
+- **Status icon** — white robot when running, gray when stopped
+- **Launch at Login** — optional macOS LaunchAgent integration
+- Hover the icon for status tooltip (running/stopped, port)
 
 ## Development
 
 ```bash
 # Build
 go build -o copilot-proxy .
+
+# Build menubar app
+make build-menubar
 
 # Run all tests
 go test ./... -count=1
