@@ -146,18 +146,18 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 // HandleOpenAIChatCompletions handles POST /v1/chat/completions by forwarding the
 // request to Copilot with only auth headers injected (near zero-copy passthrough).
 func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
-		return
-	}
-	defer r.Body.Close()
+	// Peek at the stream field without buffering the full body
+	var buf bytes.Buffer
+	tee := io.TeeReader(r.Body, &buf)
 
 	var partial struct {
 		Stream *bool `json:"stream,omitempty"`
 	}
-	json.Unmarshal(body, &partial)
+	json.NewDecoder(tee).Decode(&partial)
 	isStreaming := partial.Stream != nil && *partial.Stream
+
+	// Reconstruct body: already-read bytes + remainder
+	body := io.MultiReader(&buf, r.Body)
 
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
@@ -165,8 +165,16 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 
+	// Buffer the full body for retry support
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
+		return
+	}
+	defer r.Body.Close()
+
 	resp, err := h.doWithRetry(func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.copilotURL+"/chat/completions", bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.copilotURL+"/chat/completions", bytes.NewReader(bodyBytes))
 		if err != nil {
 			return nil, err
 		}
@@ -196,18 +204,18 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 // HandleResponses handles POST /v1/responses by forwarding the request to
 // Copilot's responses endpoint with only auth headers injected.
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
-		return
-	}
-	defer r.Body.Close()
+	// Peek at the stream field without buffering the full body
+	var buf bytes.Buffer
+	tee := io.TeeReader(r.Body, &buf)
 
 	var partial struct {
 		Stream *bool `json:"stream,omitempty"`
 	}
-	json.Unmarshal(body, &partial)
+	json.NewDecoder(tee).Decode(&partial)
 	isStreaming := partial.Stream != nil && *partial.Stream
+
+	// Reconstruct body: already-read bytes + remainder
+	body := io.MultiReader(&buf, r.Body)
 
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
@@ -215,8 +223,16 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Buffer the full body for retry support
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
+		return
+	}
+	defer r.Body.Close()
+
 	resp, err := h.doWithRetry(func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.copilotURL+"/responses", bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.copilotURL+"/responses", bytes.NewReader(bodyBytes))
 		if err != nil {
 			return nil, err
 		}

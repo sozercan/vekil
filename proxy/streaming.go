@@ -2,23 +2,37 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/sozercan/copilot-proxy/models"
 )
 
 func intVal(i int) *int { return &i }
 
+// bufPool reduces GC pressure by reusing bytes.Buffer instances for JSON encoding.
+var bufPool = sync.Pool{
+	New: func() interface{} { return new(bytes.Buffer) },
+}
+
 func writeSSEEvent(w http.ResponseWriter, eventType string, data interface{}) error {
-	b, err := json.Marshal(data)
-	if err != nil {
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(data); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, b)
+	// Encode adds a trailing newline; trim it for SSE format
+	b := bytes.TrimRight(buf.Bytes(), "\n")
+	_, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, b)
 	if err != nil {
 		return err
 	}
@@ -41,22 +55,30 @@ func setSSEHeaders(w http.ResponseWriter) {
 	w.Header().Set("Connection", "keep-alive")
 }
 
+// flushWriter wraps an http.ResponseWriter and flushes after every Write.
+type flushWriter struct {
+	w       http.ResponseWriter
+	flusher http.Flusher
+}
+
+func (fw *flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if err == nil && fw.flusher != nil {
+		fw.flusher.Flush()
+	}
+	return n, err
+}
+
 // StreamOpenAIPassthrough streams OpenAI SSE bytes directly to the client with no parsing.
 func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
 	defer body.Close()
 	setSSEHeaders(w)
 
-	scanner := bufio.NewScanner(body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		fmt.Fprintf(w, "%s\n", line)
-		// Flush after blank lines (SSE event delimiter)
-		if line == "" {
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-		}
+	fw := &flushWriter{w: w}
+	if f, ok := w.(http.Flusher); ok {
+		fw.flusher = f
 	}
+	io.Copy(fw, body)
 }
 
 // StreamOpenAIToAnthropic translates an OpenAI SSE stream into Anthropic SSE format.
@@ -84,7 +106,9 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 	// Track open tool call blocks by tool call index
 	openToolBlocks := make(map[int]bool)
 
+	// 1MB buffer to handle large tool call arguments
 	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 
