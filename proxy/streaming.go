@@ -11,6 +11,8 @@ import (
 	"github.com/sozercan/copilot-proxy/models"
 )
 
+func intVal(i int) *int { return &i }
+
 func writeSSEEvent(w http.ResponseWriter, eventType string, data interface{}) error {
 	b, err := json.Marshal(data)
 	if err != nil {
@@ -96,12 +98,12 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 			if textBlockOpen || len(openToolBlocks) > 0 {
 				writeSSEEvent(w, "content_block_stop", models.AnthropicStreamEvent{
 					Type:  "content_block_stop",
-					Index: blockIndex,
+					Index: intVal(blockIndex),
 				})
 			}
 
 			// Send message_delta with stop reason and usage
-			delta := &models.AnthropicDelta{Type: "message_delta"}
+			delta := &models.AnthropicDelta{}
 			if storedFinishReason != "" {
 				delta.StopReason = convertFinishReason(storedFinishReason)
 			}
@@ -136,7 +138,7 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 					if !textBlockOpen {
 						writeSSEEvent(w, "content_block_start", models.AnthropicStreamEvent{
 							Type:  "content_block_start",
-							Index: blockIndex,
+							Index: intVal(blockIndex),
 							ContentBlock: &models.ContentBlock{
 								Type: "text",
 								Text: "",
@@ -146,7 +148,7 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 					}
 					writeSSEEvent(w, "content_block_delta", models.AnthropicStreamEvent{
 						Type:  "content_block_delta",
-						Index: blockIndex,
+						Index: intVal(blockIndex),
 						Delta: &models.AnthropicDelta{
 							Type: "text_delta",
 							Text: text,
@@ -162,21 +164,21 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 					if textBlockOpen {
 						writeSSEEvent(w, "content_block_stop", models.AnthropicStreamEvent{
 							Type:  "content_block_stop",
-							Index: blockIndex,
+							Index: intVal(blockIndex),
 						})
 						textBlockOpen = false
 						blockIndex++
 					} else if len(openToolBlocks) > 0 {
 						writeSSEEvent(w, "content_block_stop", models.AnthropicStreamEvent{
 							Type:  "content_block_stop",
-							Index: blockIndex,
+							Index: intVal(blockIndex),
 						})
 						blockIndex++
 					}
 
 					writeSSEEvent(w, "content_block_start", models.AnthropicStreamEvent{
 						Type:  "content_block_start",
-						Index: blockIndex,
+						Index: intVal(blockIndex),
 						ContentBlock: &models.ContentBlock{
 							Type: "tool_use",
 							ID:   tc.ID,
@@ -193,7 +195,7 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 				if tc.Function.Arguments != "" {
 					writeSSEEvent(w, "content_block_delta", models.AnthropicStreamEvent{
 						Type:  "content_block_delta",
-						Index: blockIndex,
+						Index: intVal(blockIndex),
 						Delta: &models.AnthropicDelta{
 							Type:        "input_json_delta",
 							PartialJSON: tc.Function.Arguments,
@@ -212,11 +214,11 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 	if textBlockOpen || len(openToolBlocks) > 0 {
 		writeSSEEvent(w, "content_block_stop", models.AnthropicStreamEvent{
 			Type:  "content_block_stop",
-			Index: blockIndex,
+			Index: intVal(blockIndex),
 		})
 	}
 
-	delta := &models.AnthropicDelta{Type: "message_delta"}
+	delta := &models.AnthropicDelta{}
 	if storedFinishReason != "" {
 		delta.StopReason = convertFinishReason(storedFinishReason)
 	}
@@ -241,6 +243,8 @@ func convertFinishReason(reason string) string {
 		return "tool_use"
 	case "length":
 		return "max_tokens"
+	case "content_filter":
+		return "end_turn"
 	default:
 		return reason
 	}

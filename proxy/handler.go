@@ -278,6 +278,7 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	type modelObj struct {
 		ID      string `json:"id"`
 		Object  string `json:"object"`
+		Created int64  `json:"created"`
 		OwnedBy string `json:"owned_by"`
 	}
 
@@ -286,6 +287,7 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 		data = append(data, modelObj{
 			ID:      m,
 			Object:  "model",
+			Created: 0,
 			OwnedBy: "github-copilot",
 		})
 	}
@@ -319,6 +321,7 @@ func writeOpenAIError(w http.ResponseWriter, status int, message, errType string
 		"error": map[string]interface{}{
 			"message": message,
 			"type":    errType,
+			"param":   nil,
 			"code":    nil,
 		},
 	})

@@ -200,6 +200,7 @@ func TestTranslateAnthropicToOpenAI(t *testing.T) {
 		}{
 			{"auto", &models.AnthropicToolChoice{Type: "auto"}, `"auto"`},
 			{"any", &models.AnthropicToolChoice{Type: "any"}, `"required"`},
+			{"none", &models.AnthropicToolChoice{Type: "none"}, `"none"`},
 			{"tool with name", &models.AnthropicToolChoice{Type: "tool", Name: "get_weather"}, `{"function":{"name":"get_weather"},"type":"function"}`},
 		}
 		for _, tt := range tests {
@@ -262,7 +263,7 @@ func TestTranslateAnthropicToOpenAI(t *testing.T) {
 			Messages: []models.AnthropicMessage{
 				{Role: "user", Content: json.RawMessage(`"Think hard"`)},
 			},
-			Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: 1000},
+			Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(1000)},
 		}
 		got, err := TranslateAnthropicToOpenAI(req)
 		if err != nil {
@@ -273,6 +274,48 @@ func TestTranslateAnthropicToOpenAI(t *testing.T) {
 		}
 		if got.MaxTokens != nil {
 			t.Errorf("MaxTokens should be nil when thinking is enabled, got %v", *got.MaxTokens)
+		}
+	})
+
+	t.Run("thinking/disabled", func(t *testing.T) {
+		req := &models.AnthropicRequest{
+			Model:     "claude-3-opus",
+			MaxTokens: intPtr(500),
+			Messages: []models.AnthropicMessage{
+				{Role: "user", Content: json.RawMessage(`"Hi"`)},
+			},
+			Thinking: &models.AnthropicThinking{Type: "disabled"},
+		}
+		got, err := TranslateAnthropicToOpenAI(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.MaxCompletionTokens != nil {
+			t.Errorf("MaxCompletionTokens should be nil when thinking is disabled, got %v", *got.MaxCompletionTokens)
+		}
+		if got.MaxTokens == nil || *got.MaxTokens != 500 {
+			t.Errorf("MaxTokens = %v, want 500", got.MaxTokens)
+		}
+	})
+
+	t.Run("thinking/adaptive", func(t *testing.T) {
+		req := &models.AnthropicRequest{
+			Model:     "claude-opus-4-6",
+			MaxTokens: intPtr(500),
+			Messages: []models.AnthropicMessage{
+				{Role: "user", Content: json.RawMessage(`"Hi"`)},
+			},
+			Thinking: &models.AnthropicThinking{Type: "adaptive"},
+		}
+		got, err := TranslateAnthropicToOpenAI(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.MaxCompletionTokens != nil {
+			t.Errorf("MaxCompletionTokens should be nil when thinking is adaptive, got %v", *got.MaxCompletionTokens)
+		}
+		if got.MaxTokens == nil || *got.MaxTokens != 500 {
+			t.Errorf("MaxTokens = %v, want 500", got.MaxTokens)
 		}
 	})
 

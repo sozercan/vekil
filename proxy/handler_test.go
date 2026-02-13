@@ -380,6 +380,7 @@ func TestHandleModels(t *testing.T) {
 		Data   []struct {
 			ID      string `json:"id"`
 			Object  string `json:"object"`
+			Created int64  `json:"created"`
 			OwnedBy string `json:"owned_by"`
 		} `json:"data"`
 	}
@@ -399,5 +400,305 @@ func TestHandleModels(t *testing.T) {
 		if m.OwnedBy != "github-copilot" {
 			t.Errorf("expected owned_by github-copilot, got %q", m.OwnedBy)
 		}
+	}
+
+	// Validate each model object has all OpenAI-required fields
+	var rawResult map[string]json.RawMessage
+	json.Unmarshal(body, &rawResult)
+	var rawData []map[string]json.RawMessage
+	json.Unmarshal(rawResult["data"], &rawData)
+	for i, m := range rawData {
+		for _, field := range []string{"id", "object", "created", "owned_by"} {
+			if _, ok := m[field]; !ok {
+				t.Errorf("model[%d] missing required field %q", i, field)
+			}
+		}
+	}
+}
+
+// TestOpenAIErrorResponseShape validates error responses match the OpenAI spec:
+// {"error": {"message": "...", "type": "...", "param": null, "code": null}}
+func TestOpenAIErrorResponseShape(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeOpenAIError(w, http.StatusBadRequest, "test error message", "invalid_request_error")
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", w.Code)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// Must have top-level "error" key
+	if _, ok := raw["error"]; !ok {
+		t.Fatal("missing top-level 'error' key")
+	}
+
+	var errObj map[string]json.RawMessage
+	if err := json.Unmarshal(raw["error"], &errObj); err != nil {
+		t.Fatalf("unmarshal error object: %v", err)
+	}
+
+	// Check all required fields exist
+	requiredFields := []string{"message", "type", "param", "code"}
+	for _, f := range requiredFields {
+		if _, ok := errObj[f]; !ok {
+			t.Errorf("error object missing required field %q", f)
+		}
+	}
+
+	// Check values
+	var msg string
+	json.Unmarshal(errObj["message"], &msg)
+	if msg != "test error message" {
+		t.Errorf("message = %q, want %q", msg, "test error message")
+	}
+
+	var errType string
+	json.Unmarshal(errObj["type"], &errType)
+	if errType != "invalid_request_error" {
+		t.Errorf("type = %q, want %q", errType, "invalid_request_error")
+	}
+
+	// param and code should be null
+	if string(errObj["param"]) != "null" {
+		t.Errorf("param = %s, want null", errObj["param"])
+	}
+	if string(errObj["code"]) != "null" {
+		t.Errorf("code = %s, want null", errObj["code"])
+	}
+}
+
+// TestOpenAIChatCompletionsStreaming validates that streaming responses are
+// passed through correctly with proper SSE headers.
+func TestOpenAIChatCompletionsStreaming(t *testing.T) {
+	sseBody := "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\ndata: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}]}\n\ndata: [DONE]\n\n"
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		// Verify streaming detection
+		var partial struct {
+			Stream *bool `json:"stream"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		json.Unmarshal(body, &partial)
+		if partial.Stream == nil || !*partial.Stream {
+			t.Error("expected stream=true in upstream request")
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sseBody))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	// Verify SSE headers
+	ct := resp.Header.Get("Content-Type")
+	if ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	// Verify SSE body is passed through
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+	if !strings.Contains(bodyStr, "data: {") {
+		t.Error("streaming response should contain 'data:' lines")
+	}
+	if !strings.Contains(bodyStr, "[DONE]") {
+		t.Error("streaming response should contain [DONE]")
+	}
+}
+
+// TestOpenAIResponsesStreaming validates streaming passthrough for the Responses API.
+func TestOpenAIResponsesStreaming(t *testing.T) {
+	sseBody := "event: response.created\ndata: {\"id\":\"resp-1\",\"type\":\"response\"}\n\nevent: response.completed\ndata: {\"id\":\"resp-1\",\"status\":\"completed\"}\n\n"
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Errorf("expected path /responses, got %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sseBody))
+	})
+
+	reqBody := `{"model":"gpt-4","input":"Hello","stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	if ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "response.created") {
+		t.Error("streaming response should contain event data")
+	}
+}
+
+// TestOpenAIChatCompletionsUpstreamErrorPassthrough validates that upstream error
+// responses are forwarded with correct status and content-type.
+func TestOpenAIChatCompletionsUpstreamErrorPassthrough(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":{"message":"Invalid model","type":"invalid_request_error","param":"model","code":null}}`))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+
+	// Verify the error body is passed through unchanged
+	body, _ := io.ReadAll(resp.Body)
+	var errResp map[string]map[string]interface{}
+	if err := json.Unmarshal(body, &errResp); err != nil {
+		t.Fatalf("failed to parse error: %v", err)
+	}
+	if errResp["error"]["type"] != "invalid_request_error" {
+		t.Errorf("error.type = %v, want invalid_request_error", errResp["error"]["type"])
+	}
+}
+
+// TestOpenAIChatCompletionsResponseShape validates a non-streaming response
+// has the correct OpenAI Chat Completions response structure.
+func TestOpenAIChatCompletionsResponseShape(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"id": "chatcmpl-test",
+			"object": "chat.completion",
+			"created": 1700000000,
+			"model": "gpt-4",
+			"choices": [{
+				"index": 0,
+				"message": {"role": "assistant", "content": "Hello!"},
+				"finish_reason": "stop",
+				"logprobs": null
+			}],
+			"usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+			"system_fingerprint": "fp_test"
+		}`))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	body, _ := io.ReadAll(resp.Body)
+
+	// Verify passthrough preserved all OpenAI response fields
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	requiredFields := []string{"id", "object", "created", "model", "choices", "usage"}
+	for _, f := range requiredFields {
+		if _, ok := raw[f]; !ok {
+			t.Errorf("response missing required field %q", f)
+		}
+	}
+
+	// Verify object is "chat.completion"
+	var obj string
+	json.Unmarshal(raw["object"], &obj)
+	if obj != "chat.completion" {
+		t.Errorf("object = %q, want chat.completion", obj)
+	}
+
+	// Verify choices structure
+	var choices []map[string]json.RawMessage
+	json.Unmarshal(raw["choices"], &choices)
+	if len(choices) != 1 {
+		t.Fatalf("expected 1 choice, got %d", len(choices))
+	}
+	for _, f := range []string{"index", "message", "finish_reason"} {
+		if _, ok := choices[0][f]; !ok {
+			t.Errorf("choice missing field %q", f)
+		}
+	}
+
+	// Verify system_fingerprint is preserved
+	if _, ok := raw["system_fingerprint"]; !ok {
+		t.Error("response missing system_fingerprint (should be preserved in passthrough)")
+	}
+}
+
+// TestOpenAIResponsesResponseShape validates the Responses API non-streaming
+// passthrough preserves the response structure.
+func TestOpenAIResponsesResponseShape(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"id": "resp-test",
+			"object": "response",
+			"created_at": 1700000000,
+			"status": "completed",
+			"model": "gpt-4",
+			"output": [
+				{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Hello!"}]}
+			],
+			"usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+		}`))
+	})
+
+	reqBody := `{"model":"gpt-4","input":"Hi"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	body, _ := io.ReadAll(resp.Body)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// Verify key Responses API fields are preserved in passthrough
+	for _, f := range []string{"id", "object", "status", "model", "output", "usage"} {
+		if _, ok := raw[f]; !ok {
+			t.Errorf("response missing field %q", f)
+		}
+	}
+
+	var obj string
+	json.Unmarshal(raw["object"], &obj)
+	if obj != "response" {
+		t.Errorf("object = %q, want response", obj)
 	}
 }

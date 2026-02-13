@@ -311,3 +311,390 @@ func TestStreamOpenAIToAnthropic_ToolCall(t *testing.T) {
 		t.Errorf("message_delta stop_reason = %q, want %q", msgDelta.Delta.StopReason, "tool_use")
 	}
 }
+
+func TestConvertFinishReason(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  string
+		expect string
+	}{
+		{"stop", "stop", "end_turn"},
+		{"length", "length", "max_tokens"},
+		{"tool_calls", "tool_calls", "tool_use"},
+		{"content_filter", "content_filter", "end_turn"},
+		{"unknown", "unknown_reason", "unknown_reason"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := convertFinishReason(tt.input)
+			if got != tt.expect {
+				t.Errorf("convertFinishReason(%q) = %q, want %q", tt.input, got, tt.expect)
+			}
+		})
+	}
+}
+
+func TestStreamMessageDeltaNoTypeField(t *testing.T) {
+	finishReason := "stop"
+	body := buildSSEStream(
+		`{"id":"1","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}`,
+		`{"id":"1","choices":[{"index":0,"delta":{},"finish_reason":"`+finishReason+`"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`,
+		"[DONE]",
+	)
+	w := httptest.NewRecorder()
+	StreamOpenAIToAnthropic(w, body, "claude-test", "msg_test")
+	events := parseSSEEvents(w.Body.String())
+
+	// Find message_delta event
+	var found bool
+	for _, evt := range events {
+		if evt.Event == "message_delta" {
+			found = true
+			// Parse the raw JSON to check the delta doesn't have a "type" field
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(evt.Data), &raw); err != nil {
+				t.Fatalf("unmarshal event data: %v", err)
+			}
+			var delta map[string]json.RawMessage
+			if err := json.Unmarshal(raw["delta"], &delta); err != nil {
+				t.Fatalf("unmarshal delta: %v", err)
+			}
+			if _, hasType := delta["type"]; hasType {
+				t.Error("message_delta delta should not have a 'type' field")
+			}
+			if _, hasStopReason := delta["stop_reason"]; !hasStopReason {
+				t.Error("message_delta delta should have 'stop_reason' field")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("did not find message_delta event")
+	}
+}
+
+// TestAnthropicResponseJSONShape validates the non-streaming response matches
+// the exact shape the Anthropic Messages API returns.
+func TestAnthropicResponseJSONShape(t *testing.T) {
+	resp := &models.OpenAIResponse{
+		ID:      "chatcmpl-abc",
+		Created: 1000,
+		Choices: []models.OpenAIChoice{
+			{
+				Index:        0,
+				Message:      models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"Hello"`)},
+				FinishReason: strPtr("stop"),
+			},
+		},
+		Usage: &models.OpenAIUsage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15},
+	}
+	got := TranslateOpenAIToAnthropic(resp, "claude-sonnet-4")
+
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// Parse as generic map to validate exact field presence
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// Required fields per Anthropic spec
+	requiredFields := []string{"id", "type", "role", "content", "model", "stop_reason", "usage"}
+	for _, f := range requiredFields {
+		if _, ok := raw[f]; !ok {
+			t.Errorf("missing required field %q in response", f)
+		}
+	}
+
+	// Validate type is "message"
+	var typ string
+	json.Unmarshal(raw["type"], &typ)
+	if typ != "message" {
+		t.Errorf("type = %q, want %q", typ, "message")
+	}
+
+	// Validate role is "assistant"
+	var role string
+	json.Unmarshal(raw["role"], &role)
+	if role != "assistant" {
+		t.Errorf("role = %q, want %q", role, "assistant")
+	}
+
+	// Validate content is an array
+	var content []json.RawMessage
+	if err := json.Unmarshal(raw["content"], &content); err != nil {
+		t.Fatalf("content is not an array: %v", err)
+	}
+	if len(content) != 1 {
+		t.Fatalf("expected 1 content block, got %d", len(content))
+	}
+
+	// Validate content block shape
+	var block map[string]json.RawMessage
+	json.Unmarshal(content[0], &block)
+	if _, ok := block["type"]; !ok {
+		t.Error("content block missing 'type' field")
+	}
+	if _, ok := block["text"]; !ok {
+		t.Error("text content block missing 'text' field")
+	}
+
+	// Validate usage shape
+	var usage map[string]json.RawMessage
+	json.Unmarshal(raw["usage"], &usage)
+	if _, ok := usage["input_tokens"]; !ok {
+		t.Error("usage missing 'input_tokens'")
+	}
+	if _, ok := usage["output_tokens"]; !ok {
+		t.Error("usage missing 'output_tokens'")
+	}
+}
+
+// TestAnthropicStreamEventShapes validates all streaming event types match
+// the exact JSON shapes the Anthropic Messages API returns.
+func TestAnthropicStreamEventShapes(t *testing.T) {
+	stop := "stop"
+	chunk1 := models.OpenAIStreamChunk{
+		ID: "1", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{
+			Index: 0,
+			Delta: models.OpenAIMessage{Content: json.RawMessage(`"Hello"`)},
+		}},
+	}
+	chunk2 := models.OpenAIStreamChunk{
+		ID: "1", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{
+			Index:        0,
+			Delta:        models.OpenAIMessage{},
+			FinishReason: &stop,
+		}},
+		Usage: &models.OpenAIUsage{PromptTokens: 10, CompletionTokens: 3, TotalTokens: 13},
+	}
+
+	body := buildSSEStream(mustMarshal(t, chunk1), mustMarshal(t, chunk2), "[DONE]")
+	w := httptest.NewRecorder()
+	StreamOpenAIToAnthropic(w, body, "claude-sonnet-4", "msg_123")
+	events := parseSSEEvents(w.Body.String())
+
+	// Validate each event type's JSON shape
+	for _, evt := range events {
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(evt.Data), &raw); err != nil {
+			t.Fatalf("event %q: unmarshal failed: %v", evt.Event, err)
+		}
+
+		// Every event must have a "type" field
+		if _, ok := raw["type"]; !ok {
+			t.Errorf("event %q missing 'type' field", evt.Event)
+		}
+
+		switch evt.Event {
+		case "message_start":
+			if _, ok := raw["message"]; !ok {
+				t.Error("message_start missing 'message' field")
+			}
+			var msg map[string]json.RawMessage
+			json.Unmarshal(raw["message"], &msg)
+			for _, f := range []string{"id", "type", "role", "model", "content", "usage"} {
+				if _, ok := msg[f]; !ok {
+					t.Errorf("message_start.message missing '%s'", f)
+				}
+			}
+
+		case "content_block_start":
+			if _, ok := raw["index"]; !ok {
+				t.Error("content_block_start missing 'index'")
+			}
+			if _, ok := raw["content_block"]; !ok {
+				t.Error("content_block_start missing 'content_block'")
+			}
+
+		case "content_block_delta":
+			if _, ok := raw["index"]; !ok {
+				t.Error("content_block_delta missing 'index'")
+			}
+			if _, ok := raw["delta"]; !ok {
+				t.Error("content_block_delta missing 'delta'")
+			}
+			// content_block_delta's delta MUST have a "type" field
+			var delta map[string]json.RawMessage
+			json.Unmarshal(raw["delta"], &delta)
+			if _, ok := delta["type"]; !ok {
+				t.Error("content_block_delta.delta missing 'type'")
+			}
+
+		case "content_block_stop":
+			if _, ok := raw["index"]; !ok {
+				t.Error("content_block_stop missing 'index'")
+			}
+
+		case "message_delta":
+			if _, ok := raw["delta"]; !ok {
+				t.Error("message_delta missing 'delta'")
+			}
+			// message_delta's delta must NOT have a "type" field
+			var delta map[string]json.RawMessage
+			json.Unmarshal(raw["delta"], &delta)
+			if _, hasType := delta["type"]; hasType {
+				t.Error("message_delta.delta should NOT have 'type' field")
+			}
+			if _, ok := delta["stop_reason"]; !ok {
+				t.Error("message_delta.delta missing 'stop_reason'")
+			}
+
+		case "message_stop":
+			// Just needs "type"
+		}
+	}
+}
+
+// TestAnthropicRequestDeserialization validates that all official Anthropic API
+// request parameters are accepted without error.
+func TestAnthropicRequestDeserialization(t *testing.T) {
+	// Full request with all known Anthropic parameters
+	reqJSON := `{
+		"model": "claude-sonnet-4-20250514",
+		"max_tokens": 1024,
+		"messages": [{"role": "user", "content": "Hello"}],
+		"system": "You are helpful",
+		"stream": false,
+		"stop_sequences": ["STOP"],
+		"temperature": 0.7,
+		"top_p": 0.9,
+		"top_k": 40,
+		"metadata": {"user_id": "user-123"},
+		"thinking": {"type": "enabled", "budget_tokens": 2000},
+		"service_tier": "auto",
+		"inference_geo": "us",
+		"output_config": {"effort": "high"},
+		"tools": [{"name": "get_weather", "description": "Get weather", "input_schema": {"type": "object"}}],
+		"tool_choice": {"type": "auto"}
+	}`
+
+	var req models.AnthropicRequest
+	if err := json.Unmarshal([]byte(reqJSON), &req); err != nil {
+		t.Fatalf("failed to deserialize full Anthropic request: %v", err)
+	}
+
+	if req.Model != "claude-sonnet-4-20250514" {
+		t.Errorf("model = %q", req.Model)
+	}
+	if req.MaxTokens == nil || *req.MaxTokens != 1024 {
+		t.Errorf("max_tokens = %v", req.MaxTokens)
+	}
+	if req.ServiceTier != "auto" {
+		t.Errorf("service_tier = %q, want %q", req.ServiceTier, "auto")
+	}
+	if req.InferenceGeo != "us" {
+		t.Errorf("inference_geo = %q, want %q", req.InferenceGeo, "us")
+	}
+	if req.OutputConfig == nil || req.OutputConfig.Effort != "high" {
+		t.Errorf("output_config.effort = %v", req.OutputConfig)
+	}
+	if req.Thinking == nil || req.Thinking.Type != "enabled" || req.Thinking.BudgetTokens == nil || *req.Thinking.BudgetTokens != 2000 {
+		t.Errorf("thinking = %v", req.Thinking)
+	}
+
+	// Verify translation works
+	oai, err := TranslateAnthropicToOpenAI(&req)
+	if err != nil {
+		t.Fatalf("translation error: %v", err)
+	}
+	if oai.Model != "claude-sonnet-4" {
+		t.Errorf("translated model = %q, want %q", oai.Model, "claude-sonnet-4")
+	}
+}
+
+// TestAnthropicRequestDisabledThinking validates disabled thinking is deserialized correctly.
+func TestAnthropicRequestDisabledThinking(t *testing.T) {
+	reqJSON := `{
+		"model": "claude-sonnet-4",
+		"max_tokens": 1024,
+		"messages": [{"role": "user", "content": "Hi"}],
+		"thinking": {"type": "disabled"}
+	}`
+	var req models.AnthropicRequest
+	if err := json.Unmarshal([]byte(reqJSON), &req); err != nil {
+		t.Fatalf("deserialize: %v", err)
+	}
+	if req.Thinking == nil || req.Thinking.Type != "disabled" {
+		t.Errorf("thinking.type = %v, want disabled", req.Thinking)
+	}
+	if req.Thinking.BudgetTokens != nil {
+		t.Errorf("thinking.budget_tokens should be nil for disabled, got %v", *req.Thinking.BudgetTokens)
+	}
+}
+
+// TestAnthropicRequestAdaptiveThinking validates adaptive thinking is deserialized correctly.
+func TestAnthropicRequestAdaptiveThinking(t *testing.T) {
+	reqJSON := `{
+		"model": "claude-opus-4.6",
+		"max_tokens": 1024,
+		"messages": [{"role": "user", "content": "Hi"}],
+		"thinking": {"type": "adaptive"}
+	}`
+	var req models.AnthropicRequest
+	if err := json.Unmarshal([]byte(reqJSON), &req); err != nil {
+		t.Fatalf("deserialize: %v", err)
+	}
+	if req.Thinking == nil || req.Thinking.Type != "adaptive" {
+		t.Errorf("thinking.type = %v, want adaptive", req.Thinking)
+	}
+	if req.Thinking.BudgetTokens != nil {
+		t.Errorf("thinking.budget_tokens should be nil for adaptive, got %v", *req.Thinking.BudgetTokens)
+	}
+}
+
+// TestAnthropicErrorShape validates the error response matches Anthropic spec.
+func TestAnthropicErrorShape(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeAnthropicError(w, 400, "invalid_request_error", "test error")
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// Must have "type" = "error"
+	var typ string
+	json.Unmarshal(raw["type"], &typ)
+	if typ != "error" {
+		t.Errorf("type = %q, want %q", typ, "error")
+	}
+
+	// Must have "error" object with "type" and "message"
+	var errObj map[string]string
+	if err := json.Unmarshal(raw["error"], &errObj); err != nil {
+		t.Fatalf("error field unmarshal: %v", err)
+	}
+	if errObj["type"] != "invalid_request_error" {
+		t.Errorf("error.type = %q, want %q", errObj["type"], "invalid_request_error")
+	}
+	if errObj["message"] != "test error" {
+		t.Errorf("error.message = %q, want %q", errObj["message"], "test error")
+	}
+}
+
+// TestToolChoiceNone validates "none" tool_choice produces correct OpenAI format.
+func TestToolChoiceNone(t *testing.T) {
+	req := &models.AnthropicRequest{
+		Model:      "claude-sonnet-4",
+		MaxTokens:  intPtr(100),
+		Messages:   []models.AnthropicMessage{{Role: "user", Content: json.RawMessage(`"Hi"`)}},
+		ToolChoice: &models.AnthropicToolChoice{Type: "none"},
+	}
+	got, err := TranslateAnthropicToOpenAI(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var val string
+	if err := json.Unmarshal(got.ToolChoice, &val); err != nil {
+		t.Fatalf("tool_choice not a string: %v", err)
+	}
+	if val != "none" {
+		t.Errorf("tool_choice = %q, want %q", val, "none")
+	}
+}

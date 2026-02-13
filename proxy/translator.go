@@ -88,8 +88,8 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 	oaiReq.MaxTokens = req.MaxTokens
 
 	// Thinking / extended thinking
-	if req.Thinking != nil && req.Thinking.Type == "enabled" {
-		tokens := req.Thinking.BudgetTokens
+	if req.Thinking != nil && req.Thinking.Type == "enabled" && req.Thinking.BudgetTokens != nil {
+		tokens := *req.Thinking.BudgetTokens
 		oaiReq.MaxCompletionTokens = &tokens
 		oaiReq.MaxTokens = nil
 	}
@@ -242,6 +242,8 @@ func translateToolChoice(tc *models.AnthropicToolChoice) (json.RawMessage, error
 		return json.Marshal("auto")
 	case "any":
 		return json.Marshal("required")
+	case "none":
+		return json.Marshal("none")
 	case "tool":
 		return json.Marshal(map[string]interface{}{
 			"type": "function",
