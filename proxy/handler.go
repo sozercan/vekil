@@ -150,36 +150,38 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 // HandleOpenAIChatCompletions handles POST /v1/chat/completions by forwarding the
 // request to Copilot with only auth headers injected (near zero-copy passthrough).
 func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
-	// Peek at the stream field without buffering the full body
-	var buf bytes.Buffer
-	tee := io.TeeReader(r.Body, &buf)
-
-	var partial struct {
-		Stream *bool `json:"stream,omitempty"`
-	}
-	json.NewDecoder(tee).Decode(&partial)
-	isStreaming := partial.Stream != nil && *partial.Stream
-
-	// Reconstruct body: already-read bytes + remainder
-	body := io.MultiReader(&buf, r.Body)
-
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error")
 		return
 	}
 
-	// Buffer the full body for retry support
-	bodyBytes, err := io.ReadAll(body)
+	// Buffer the full body for retry support and inspection
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
 		return
 	}
 	defer r.Body.Close()
 
-	// Inject parallel_tool_calls: true when tools are present to ensure
-	// the upstream returns parallel tool calls.
+	// Detect if the client requested streaming and if tools are present
+	var partial struct {
+		Stream *bool           `json:"stream,omitempty"`
+		Tools  json.RawMessage `json:"tools,omitempty"`
+	}
+	json.Unmarshal(bodyBytes, &partial)
+	isStreaming := partial.Stream != nil && *partial.Stream
+	hasTools := len(partial.Tools) > 0 && string(partial.Tools) != "null"
+
+	// Inject parallel_tool_calls: true when tools are present
 	bodyBytes = injectParallelToolCalls(bodyBytes)
+
+	// Force streaming to upstream for non-streaming requests with tools
+	// to ensure reliable parallel tool call support.
+	forceStream := !isStreaming && hasTools
+	if forceStream {
+		bodyBytes = injectForceStream(bodyBytes)
+	}
 
 	resp, err := h.doWithRetry(func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.copilotURL+"/chat/completions", bytes.NewReader(bodyBytes))
@@ -200,6 +202,18 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 
 	if isStreaming && resp.StatusCode == http.StatusOK {
 		StreamOpenAIPassthrough(w, resp.Body)
+		return
+	}
+
+	if forceStream && resp.StatusCode == http.StatusOK {
+		// Aggregate forced-streaming response back to non-streaming
+		oaiResp, err := aggregateStreamToResponse(resp.Body)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "failed to aggregate upstream response", "server_error")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(oaiResp)
 		return
 	}
 
@@ -365,6 +379,22 @@ func injectParallelToolCalls(body []byte) []byte {
 		return body
 	}
 	m["parallel_tool_calls"] = json.RawMessage("true")
+	result, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return result
+}
+
+// injectForceStream adds stream: true and stream_options to a request body
+// for forced streaming to the upstream.
+func injectForceStream(body []byte) []byte {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	m["stream"] = json.RawMessage("true")
+	m["stream_options"] = json.RawMessage(`{"include_usage":true}`)
 	result, err := json.Marshal(m)
 	if err != nil {
 		return body

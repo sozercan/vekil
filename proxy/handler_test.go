@@ -804,7 +804,7 @@ func TestInjectParallelToolCalls(t *testing.T) {
 }
 
 // TestOpenAIChatCompletions_InjectsParallelToolCalls verifies parallel_tool_calls
-// is injected in the upstream request when tools are present.
+// is injected and forced streaming is used when tools are present.
 func TestOpenAIChatCompletions_InjectsParallelToolCalls(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		var oaiReq models.OpenAIRequest
@@ -813,9 +813,16 @@ func TestOpenAIChatCompletions_InjectsParallelToolCalls(t *testing.T) {
 		if oaiReq.ParallelToolCalls == nil || !*oaiReq.ParallelToolCalls {
 			t.Error("expected parallel_tool_calls=true injected by proxy")
 		}
+		if oaiReq.Stream == nil || !*oaiReq.Stream {
+			t.Error("expected stream=true forced by proxy when tools present")
+		}
 
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"id":"c1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+		// Return SSE since proxy forced streaming
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n"))
+		w.Write([]byte("data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+		w.Write([]byte("data: [DONE]\n\n"))
 	})
 
 	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}`
