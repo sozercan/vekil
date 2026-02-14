@@ -312,6 +312,123 @@ func TestStreamOpenAIToAnthropic_ToolCall(t *testing.T) {
 	}
 }
 
+func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
+	toolCallStop := "tool_calls"
+	idx0, idx1 := 0, 1
+
+	// First tool call start
+	chunk1 := models.OpenAIStreamChunk{
+		ID: "chatcmpl-3", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{
+			ToolCalls: []models.OpenAIToolCall{
+				{ID: "call_1", Index: &idx0, Function: models.OpenAIFunctionCall{Name: "delegate_task", Arguments: ""}},
+			},
+		}}},
+	}
+	// First tool call args
+	chunk2 := models.OpenAIStreamChunk{
+		ID: "chatcmpl-3", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{
+			ToolCalls: []models.OpenAIToolCall{
+				{Index: &idx0, Function: models.OpenAIFunctionCall{Arguments: `{"agent":"researcher"}`}},
+			},
+		}}},
+	}
+	// Second tool call start
+	chunk3 := models.OpenAIStreamChunk{
+		ID: "chatcmpl-3", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{
+			ToolCalls: []models.OpenAIToolCall{
+				{ID: "call_2", Index: &idx1, Function: models.OpenAIFunctionCall{Name: "wait_for_tasks", Arguments: ""}},
+			},
+		}}},
+	}
+	// Second tool call args
+	chunk4 := models.OpenAIStreamChunk{
+		ID: "chatcmpl-3", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{
+			ToolCalls: []models.OpenAIToolCall{
+				{Index: &idx1, Function: models.OpenAIFunctionCall{Arguments: `{}`}},
+			},
+		}}},
+	}
+	// Finish
+	chunk5 := models.OpenAIStreamChunk{
+		ID: "chatcmpl-3", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{}, FinishReason: &toolCallStop}},
+	}
+
+	body := buildSSEStream(
+		mustMarshal(t, chunk1), mustMarshal(t, chunk2),
+		mustMarshal(t, chunk3), mustMarshal(t, chunk4),
+		mustMarshal(t, chunk5), "[DONE]",
+	)
+
+	w := httptest.NewRecorder()
+	StreamOpenAIToAnthropic(w, body, "claude-opus-4.6-fast", "req-789")
+	events := parseSSEEvents(w.Body.String())
+
+	expectedTypes := []string{
+		"message_start",
+		"content_block_start",  // tool_use call_1
+		"content_block_delta",  // args for call_1
+		"content_block_stop",   // close call_1
+		"content_block_start",  // tool_use call_2
+		"content_block_delta",  // args for call_2
+		"content_block_stop",   // close call_2
+		"message_delta",
+		"message_stop",
+	}
+
+	if len(events) != len(expectedTypes) {
+		t.Fatalf("got %d events, want %d\nevents: %+v\nraw:\n%s", len(events), len(expectedTypes), events, w.Body.String())
+	}
+
+	for i, exp := range expectedTypes {
+		if events[i].Event != exp {
+			t.Errorf("event[%d].Event = %q, want %q", i, events[i].Event, exp)
+		}
+	}
+
+	// Verify first tool call block
+	var cb1 models.AnthropicStreamEvent
+	json.Unmarshal([]byte(events[1].Data), &cb1)
+	if cb1.ContentBlock == nil || cb1.ContentBlock.Type != "tool_use" || cb1.ContentBlock.ID != "call_1" || cb1.ContentBlock.Name != "delegate_task" {
+		t.Errorf("first tool block = %+v, want tool_use call_1 delegate_task", cb1.ContentBlock)
+	}
+	if cb1.Index == nil || *cb1.Index != 0 {
+		t.Errorf("first tool block index = %v, want 0", cb1.Index)
+	}
+
+	// Verify second tool call block
+	var cb2 models.AnthropicStreamEvent
+	json.Unmarshal([]byte(events[4].Data), &cb2)
+	if cb2.ContentBlock == nil || cb2.ContentBlock.Type != "tool_use" || cb2.ContentBlock.ID != "call_2" || cb2.ContentBlock.Name != "wait_for_tasks" {
+		t.Errorf("second tool block = %+v, want tool_use call_2 wait_for_tasks", cb2.ContentBlock)
+	}
+	if cb2.Index == nil || *cb2.Index != 1 {
+		t.Errorf("second tool block index = %v, want 1", cb2.Index)
+	}
+
+	// Verify argument deltas go to correct blocks
+	var d1, d2 models.AnthropicStreamEvent
+	json.Unmarshal([]byte(events[2].Data), &d1)
+	json.Unmarshal([]byte(events[5].Data), &d2)
+	if d1.Index == nil || *d1.Index != 0 {
+		t.Errorf("first arg delta index = %v, want 0", d1.Index)
+	}
+	if d2.Index == nil || *d2.Index != 1 {
+		t.Errorf("second arg delta index = %v, want 1", d2.Index)
+	}
+
+	// Verify stop reason is tool_use
+	var msgDelta models.AnthropicStreamEvent
+	json.Unmarshal([]byte(events[7].Data), &msgDelta)
+	if msgDelta.Delta == nil || msgDelta.Delta.StopReason != "tool_use" {
+		t.Errorf("message_delta stop_reason = %q, want %q", msgDelta.Delta.StopReason, "tool_use")
+	}
+}
+
 func TestConvertFinishReason(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -696,5 +813,88 @@ func TestToolChoiceNone(t *testing.T) {
 	}
 	if val != "none" {
 		t.Errorf("tool_choice = %q, want %q", val, "none")
+	}
+}
+
+func TestAggregateStreamToResponse_ParallelToolCalls(t *testing.T) {
+	idx0, idx1 := 0, 1
+	chunks := []models.OpenAIStreamChunk{
+		{ID: "c1", Created: 1700000000, Model: "gpt-4", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{Content: json.RawMessage(`"I'll delegate"`)}}}},
+		{ID: "c1", Model: "gpt-4", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{ID: "call_1", Index: &idx0, Type: "function", Function: models.OpenAIFunctionCall{Name: "delegate_task", Arguments: ""}}}}}}},
+		{ID: "c1", Model: "gpt-4", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{Index: &idx0, Function: models.OpenAIFunctionCall{Arguments: `{"agent":"r"}`}}}}}}},
+		{ID: "c1", Model: "gpt-4", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{ID: "call_2", Index: &idx1, Type: "function", Function: models.OpenAIFunctionCall{Name: "wait", Arguments: ""}}}}}}},
+		{ID: "c1", Model: "gpt-4", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{Index: &idx1, Function: models.OpenAIFunctionCall{Arguments: `{}`}}}}}}},
+		{ID: "c1", Model: "gpt-4", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{}, FinishReason: strPtr("tool_calls")}}, Usage: &models.OpenAIUsage{PromptTokens: 42, CompletionTokens: 17, TotalTokens: 59}},
+	}
+
+	body := buildSSEStream(append(
+		func() []string {
+			var s []string
+			for _, c := range chunks {
+				s = append(s, mustMarshal(t, c))
+			}
+			return s
+		}(), "[DONE]")...)
+
+	resp, err := aggregateStreamToResponse(body)
+	if err != nil {
+		t.Fatalf("aggregateStreamToResponse: %v", err)
+	}
+
+	if resp.ID != "c1" {
+		t.Errorf("ID = %q, want c1", resp.ID)
+	}
+	if len(resp.Choices) != 1 {
+		t.Fatalf("expected 1 choice, got %d", len(resp.Choices))
+	}
+
+	msg := resp.Choices[0].Message
+	var text string
+	json.Unmarshal(msg.Content, &text)
+	if text != "I'll delegate" {
+		t.Errorf("content = %q, want 'I'll delegate'", text)
+	}
+
+	if len(msg.ToolCalls) != 2 {
+		t.Fatalf("expected 2 tool_calls, got %d", len(msg.ToolCalls))
+	}
+	if msg.ToolCalls[0].ID != "call_1" || msg.ToolCalls[0].Function.Name != "delegate_task" || msg.ToolCalls[0].Function.Arguments != `{"agent":"r"}` {
+		t.Errorf("tool_calls[0] = %+v", msg.ToolCalls[0])
+	}
+	if msg.ToolCalls[1].ID != "call_2" || msg.ToolCalls[1].Function.Name != "wait" || msg.ToolCalls[1].Function.Arguments != `{}` {
+		t.Errorf("tool_calls[1] = %+v", msg.ToolCalls[1])
+	}
+
+	if resp.Choices[0].FinishReason == nil || *resp.Choices[0].FinishReason != "tool_calls" {
+		t.Errorf("finish_reason = %v, want tool_calls", resp.Choices[0].FinishReason)
+	}
+	if resp.Usage == nil || resp.Usage.PromptTokens != 42 || resp.Usage.CompletionTokens != 17 {
+		t.Errorf("usage = %+v, want prompt=42 completion=17", resp.Usage)
+	}
+}
+
+func TestAggregateStreamToResponse_TextOnly(t *testing.T) {
+	body := buildSSEStream(
+		`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"}}]}`,
+		`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{"content":" world"}}]}`,
+		`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`,
+		"[DONE]",
+	)
+
+	resp, err := aggregateStreamToResponse(body)
+	if err != nil {
+		t.Fatalf("aggregateStreamToResponse: %v", err)
+	}
+
+	var text string
+	json.Unmarshal(resp.Choices[0].Message.Content, &text)
+	if text != "Hello world" {
+		t.Errorf("content = %q, want 'Hello world'", text)
+	}
+	if len(resp.Choices[0].Message.ToolCalls) != 0 {
+		t.Errorf("expected 0 tool_calls, got %d", len(resp.Choices[0].Message.ToolCalls))
+	}
+	if *resp.Choices[0].FinishReason != "stop" {
+		t.Errorf("finish_reason = %q, want stop", *resp.Choices[0].FinishReason)
 	}
 }

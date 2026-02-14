@@ -103,8 +103,8 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 	textBlockOpen := false
 	var storedFinishReason string
 	var storedUsage *models.OpenAIUsage
-	// Track open tool call blocks by tool call index
-	openToolBlocks := make(map[int]bool)
+	// Map OpenAI tool call index → Anthropic block index
+	toolCallBlockIndex := make(map[int]int)
 
 	// 1MB buffer to handle large tool call arguments
 	scanner := bufio.NewScanner(body)
@@ -119,7 +119,7 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 
 		if data == "[DONE]" {
 			// Close any open content block
-			if textBlockOpen || len(openToolBlocks) > 0 {
+			if textBlockOpen || len(toolCallBlockIndex) > 0 {
 				writeSSEEvent(w, "content_block_stop", models.AnthropicStreamEvent{
 					Type:  "content_block_stop",
 					Index: intVal(blockIndex),
@@ -183,6 +183,11 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 
 			// Handle tool calls
 			for _, tc := range choice.Delta.ToolCalls {
+				tcIdx := 0
+				if tc.Index != nil {
+					tcIdx = *tc.Index
+				}
+
 				if tc.ID != "" {
 					// New tool call — close previous block if open
 					if textBlockOpen {
@@ -192,7 +197,7 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 						})
 						textBlockOpen = false
 						blockIndex++
-					} else if len(openToolBlocks) > 0 {
+					} else if len(toolCallBlockIndex) > 0 {
 						writeSSEEvent(w, "content_block_stop", models.AnthropicStreamEvent{
 							Type:  "content_block_stop",
 							Index: intVal(blockIndex),
@@ -209,17 +214,17 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 							Name: tc.Function.Name,
 						},
 					})
-					idx := 0
-					if tc.Index != nil {
-						idx = *tc.Index
-					}
-					openToolBlocks[idx] = true
+					toolCallBlockIndex[tcIdx] = blockIndex
 				}
 
 				if tc.Function.Arguments != "" {
+					targetBlock := blockIndex
+					if bi, ok := toolCallBlockIndex[tcIdx]; ok {
+						targetBlock = bi
+					}
 					writeSSEEvent(w, "content_block_delta", models.AnthropicStreamEvent{
 						Type:  "content_block_delta",
-						Index: intVal(blockIndex),
+						Index: intVal(targetBlock),
 						Delta: &models.AnthropicDelta{
 							Type:        "input_json_delta",
 							PartialJSON: tc.Function.Arguments,
@@ -235,7 +240,7 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 	}
 
 	// After loop: handle case where stream ended without [DONE]
-	if textBlockOpen || len(openToolBlocks) > 0 {
+	if textBlockOpen || len(toolCallBlockIndex) > 0 {
 		writeSSEEvent(w, "content_block_stop", models.AnthropicStreamEvent{
 			Type:  "content_block_stop",
 			Index: intVal(blockIndex),
@@ -257,6 +262,108 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 	}
 	writeSSEEvent(w, "message_delta", evt)
 	writeSSEEvent(w, "message_stop", models.AnthropicStreamEvent{Type: "message_stop"})
+}
+
+// aggregateStreamToResponse collects an OpenAI SSE stream into a complete
+// OpenAIResponse. This is used when we force streaming to the upstream for
+// reliable parallel tool call support, but the client requested non-streaming.
+func aggregateStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, error) {
+	defer body.Close()
+
+	var result models.OpenAIResponse
+	var contentBuilder strings.Builder
+	toolCalls := make(map[int]*models.OpenAIToolCall)
+	var finishReason *string
+
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		data, ok := parseSSELine(line)
+		if !ok {
+			continue
+		}
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk models.OpenAIStreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+
+		if result.ID == "" {
+			result.ID = chunk.ID
+			result.Object = "chat.completion"
+			result.Created = chunk.Created
+			result.Model = chunk.Model
+		}
+
+		if chunk.Usage != nil {
+			result.Usage = chunk.Usage
+		}
+
+		for _, choice := range chunk.Choices {
+			if choice.Delta.Content != nil {
+				var text string
+				if err := json.Unmarshal(choice.Delta.Content, &text); err == nil {
+					contentBuilder.WriteString(text)
+				}
+			}
+
+			for _, tc := range choice.Delta.ToolCalls {
+				idx := 0
+				if tc.Index != nil {
+					idx = *tc.Index
+				}
+
+				if _, exists := toolCalls[idx]; !exists {
+					toolCalls[idx] = &models.OpenAIToolCall{}
+				}
+
+				if tc.ID != "" {
+					toolCalls[idx].ID = tc.ID
+					toolCalls[idx].Type = tc.Type
+					toolCalls[idx].Function.Name = tc.Function.Name
+				}
+
+				toolCalls[idx].Function.Arguments += tc.Function.Arguments
+			}
+
+			if choice.FinishReason != nil {
+				finishReason = choice.FinishReason
+			}
+		}
+	}
+
+	msg := models.OpenAIMessage{Role: "assistant"}
+	if contentBuilder.Len() > 0 {
+		c, _ := json.Marshal(contentBuilder.String())
+		msg.Content = c
+	}
+
+	if len(toolCalls) > 0 {
+		maxIdx := 0
+		for idx := range toolCalls {
+			if idx > maxIdx {
+				maxIdx = idx
+			}
+		}
+		for i := 0; i <= maxIdx; i++ {
+			if tc, ok := toolCalls[i]; ok {
+				msg.ToolCalls = append(msg.ToolCalls, *tc)
+			}
+		}
+	}
+
+	result.Choices = []models.OpenAIChoice{{
+		Index:        0,
+		Message:      msg,
+		FinishReason: finishReason,
+	}}
+
+	return &result, nil
 }
 
 func convertFinishReason(reason string) string {

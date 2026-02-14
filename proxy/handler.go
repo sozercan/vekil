@@ -82,6 +82,16 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Force streaming to upstream for non-streaming requests to ensure
+	// reliable parallel tool call support. The upstream may not return
+	// parallel tool calls in non-streaming mode.
+	forceStream := !req.Stream
+	if forceStream {
+		b := true
+		oaiReq.Stream = &b
+		oaiReq.StreamOptions = &models.StreamOptions{IncludeUsage: true}
+	}
+
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
 		writeAnthropicError(w, http.StatusInternalServerError, "api_error", fmt.Sprintf("failed to get token: %v", err))
@@ -125,20 +135,14 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	defer resp.Body.Close()
-	respBody, err := io.ReadAll(resp.Body)
+	// Non-streaming: aggregate the forced-streaming upstream response
+	oaiResp, err := aggregateStreamToResponse(resp.Body)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", "failed to read upstream response")
+		writeAnthropicError(w, http.StatusBadGateway, "api_error", "failed to aggregate upstream response")
 		return
 	}
 
-	var oaiResp models.OpenAIResponse
-	if err := json.Unmarshal(respBody, &oaiResp); err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", "failed to parse upstream response")
-		return
-	}
-
-	anthropicResp := TranslateOpenAIToAnthropic(&oaiResp, req.Model)
+	anthropicResp := TranslateOpenAIToAnthropic(oaiResp, req.Model)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(anthropicResp)
 }
@@ -172,6 +176,10 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 	defer r.Body.Close()
+
+	// Inject parallel_tool_calls: true when tools are present to ensure
+	// the upstream returns parallel tool calls.
+	bodyBytes = injectParallelToolCalls(bodyBytes)
 
 	resp, err := h.doWithRetry(func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.copilotURL+"/chat/completions", bytes.NewReader(bodyBytes))
@@ -341,4 +349,25 @@ func writeOpenAIError(w http.ResponseWriter, status int, message, errType string
 			"code":    nil,
 		},
 	})
+}
+
+// injectParallelToolCalls adds parallel_tool_calls: true to an OpenAI request
+// body when tools are present but the flag is not already set.
+func injectParallelToolCalls(body []byte) []byte {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	if _, hasTools := m["tools"]; !hasTools {
+		return body
+	}
+	if _, hasPTC := m["parallel_tool_calls"]; hasPTC {
+		return body
+	}
+	m["parallel_tool_calls"] = json.RawMessage("true")
+	result, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return result
 }

@@ -20,6 +20,7 @@ type OpenAIRequest struct {
 	User               string          `json:"user,omitempty"`
 	Tools              []OpenAITool    `json:"tools,omitempty"`
 	ToolChoice         json.RawMessage `json:"tool_choice,omitempty"`
+	ParallelToolCalls  *bool           `json:"parallel_tool_calls,omitempty"`
 	ResponseFormat     json.RawMessage `json:"response_format,omitempty"`
 	Seed               *int            `json:"seed,omitempty"`
 }

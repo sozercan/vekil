@@ -50,29 +50,6 @@ func TestHandleHealthz(t *testing.T) {
 }
 
 func TestHandleAnthropicMessages(t *testing.T) {
-	finishReason := "stop"
-	oaiResp := models.OpenAIResponse{
-		ID:      "chatcmpl-123",
-		Object:  "chat.completion",
-		Created: 1234567890,
-		Model:   "gpt-4",
-		Choices: []models.OpenAIChoice{
-			{
-				Index: 0,
-				Message: models.OpenAIMessage{
-					Role:    "assistant",
-					Content: json.RawMessage(`"Hello from the backend!"`),
-				},
-				FinishReason: &finishReason,
-			},
-		},
-		Usage: &models.OpenAIUsage{
-			PromptTokens:     10,
-			CompletionTokens: 5,
-			TotalTokens:      15,
-		},
-	}
-
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		// Verify headers are set
 		if r.Header.Get("Authorization") != "Bearer test-token" {
@@ -81,7 +58,7 @@ func TestHandleAnthropicMessages(t *testing.T) {
 		if r.Header.Get("Content-Type") != "application/json" {
 			t.Errorf("expected application/json content-type, got %q", r.Header.Get("Content-Type"))
 		}
-		// Verify the request was translated to OpenAI format
+		// Verify the request was translated to OpenAI format with forced streaming
 		var oaiReq models.OpenAIRequest
 		body, _ := io.ReadAll(r.Body)
 		if err := json.Unmarshal(body, &oaiReq); err != nil {
@@ -91,9 +68,16 @@ func TestHandleAnthropicMessages(t *testing.T) {
 		if oaiReq.Model != "claude-sonnet-4" {
 			t.Errorf("expected model claude-sonnet-4, got %q", oaiReq.Model)
 		}
+		if oaiReq.Stream == nil || !*oaiReq.Stream {
+			t.Error("expected stream=true in upstream request (forced streaming)")
+		}
 
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(oaiResp)
+		// Return SSE streaming response (since handler forces streaming)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: {\"id\":\"chatcmpl-123\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello from the backend!\"},\"finish_reason\":null}]}\n\n"))
+		w.Write([]byte("data: {\"id\":\"chatcmpl-123\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n"))
+		w.Write([]byte("data: [DONE]\n\n"))
 	})
 
 	anthropicReq := `{
@@ -700,5 +684,148 @@ func TestOpenAIResponsesResponseShape(t *testing.T) {
 	json.Unmarshal(raw["object"], &obj)
 	if obj != "response" {
 		t.Errorf("object = %q, want response", obj)
+	}
+}
+
+// TestHandleAnthropicMessages_ParallelToolCalls verifies that parallel tool
+// calls are preserved through the forced-streaming aggregation path.
+func TestHandleAnthropicMessages_ParallelToolCalls(t *testing.T) {
+	idx0, idx1 := 0, 1
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		json.Unmarshal(body, &oaiReq)
+		if oaiReq.Stream == nil || !*oaiReq.Stream {
+			t.Error("expected stream=true (forced streaming)")
+		}
+		if oaiReq.ParallelToolCalls == nil || !*oaiReq.ParallelToolCalls {
+			t.Error("expected parallel_tool_calls=true")
+		}
+
+		// Return SSE with text + 2 parallel tool calls (interleaved by index)
+		chunks := []models.OpenAIStreamChunk{
+			{ID: "c1", Model: "gpt-4", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{Content: json.RawMessage(`"I'll delegate both tasks"`)}}}},
+			{ID: "c1", Model: "gpt-4", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{ID: "call_1", Index: &idx0, Type: "function", Function: models.OpenAIFunctionCall{Name: "delegate_task", Arguments: ""}}}}}}},
+			{ID: "c1", Model: "gpt-4", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{Index: &idx0, Function: models.OpenAIFunctionCall{Arguments: `{"agent":"researcher","prompt":"pros"}`}}}}}}},
+			{ID: "c1", Model: "gpt-4", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{ID: "call_2", Index: &idx1, Type: "function", Function: models.OpenAIFunctionCall{Name: "delegate_task", Arguments: ""}}}}}}},
+			{ID: "c1", Model: "gpt-4", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{Index: &idx1, Function: models.OpenAIFunctionCall{Arguments: `{"agent":"researcher","prompt":"cons"}`}}}}}}},
+			{ID: "c1", Model: "gpt-4", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{}, FinishReason: strPtr("tool_calls")}}, Usage: &models.OpenAIUsage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150}},
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		for _, chunk := range chunks {
+			b, _ := json.Marshal(chunk)
+			w.Write([]byte("data: " + string(b) + "\n\n"))
+		}
+		w.Write([]byte("data: [DONE]\n\n"))
+	})
+
+	anthropicReq := `{
+		"model": "claude-opus-4.6-fast",
+		"max_tokens": 4096,
+		"messages": [{"role": "user", "content": "Call delegate_task twice"}],
+		"tools": [{"name": "delegate_task", "description": "Delegate", "input_schema": {"type": "object"}}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(anthropicReq))
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var anthropicResp models.AnthropicResponse
+	body, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(body, &anthropicResp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	if anthropicResp.StopReason != "tool_use" {
+		t.Errorf("stop_reason = %q, want tool_use", anthropicResp.StopReason)
+	}
+	if len(anthropicResp.Content) != 3 {
+		t.Fatalf("expected 3 content blocks (1 text + 2 tool_use), got %d", len(anthropicResp.Content))
+	}
+	if anthropicResp.Content[0].Type != "text" || anthropicResp.Content[0].Text != "I'll delegate both tasks" {
+		t.Errorf("content[0] = %+v, want text", anthropicResp.Content[0])
+	}
+	if anthropicResp.Content[1].Type != "tool_use" || anthropicResp.Content[1].ID != "call_1" || anthropicResp.Content[1].Name != "delegate_task" {
+		t.Errorf("content[1] = %+v, want tool_use call_1", anthropicResp.Content[1])
+	}
+	if anthropicResp.Content[2].Type != "tool_use" || anthropicResp.Content[2].ID != "call_2" || anthropicResp.Content[2].Name != "delegate_task" {
+		t.Errorf("content[2] = %+v, want tool_use call_2", anthropicResp.Content[2])
+	}
+	if anthropicResp.Usage.InputTokens != 100 || anthropicResp.Usage.OutputTokens != 50 {
+		t.Errorf("usage = %+v, want input=100 output=50", anthropicResp.Usage)
+	}
+}
+
+// TestInjectParallelToolCalls validates the parallel_tool_calls injection for OpenAI passthrough.
+func TestInjectParallelToolCalls(t *testing.T) {
+	t.Run("injects when tools present", func(t *testing.T) {
+		input := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}`
+		result := injectParallelToolCalls([]byte(input))
+		var m map[string]json.RawMessage
+		json.Unmarshal(result, &m)
+		if string(m["parallel_tool_calls"]) != "true" {
+			t.Errorf("parallel_tool_calls = %s, want true", m["parallel_tool_calls"])
+		}
+	})
+
+	t.Run("preserves existing value", func(t *testing.T) {
+		input := `{"model":"gpt-4","tools":[{"type":"function"}],"parallel_tool_calls":false}`
+		result := injectParallelToolCalls([]byte(input))
+		var m map[string]json.RawMessage
+		json.Unmarshal(result, &m)
+		if string(m["parallel_tool_calls"]) != "false" {
+			t.Errorf("parallel_tool_calls = %s, want false (preserved)", m["parallel_tool_calls"])
+		}
+	})
+
+	t.Run("no-op without tools", func(t *testing.T) {
+		input := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`
+		result := injectParallelToolCalls([]byte(input))
+		if string(result) != input {
+			t.Errorf("body was modified: %s", result)
+		}
+	})
+
+	t.Run("no-op for invalid JSON", func(t *testing.T) {
+		input := `{invalid}`
+		result := injectParallelToolCalls([]byte(input))
+		if string(result) != input {
+			t.Errorf("body was modified for invalid JSON: %s", result)
+		}
+	})
+}
+
+// TestOpenAIChatCompletions_InjectsParallelToolCalls verifies parallel_tool_calls
+// is injected in the upstream request when tools are present.
+func TestOpenAIChatCompletions_InjectsParallelToolCalls(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		json.Unmarshal(body, &oaiReq)
+		if oaiReq.ParallelToolCalls == nil || !*oaiReq.ParallelToolCalls {
+			t.Error("expected parallel_tool_calls=true injected by proxy")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"c1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	if w.Result().StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(w.Result().Body)
+		t.Fatalf("expected 200, got %d: %s", w.Result().StatusCode, body)
 	}
 }

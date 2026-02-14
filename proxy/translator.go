@@ -84,6 +84,15 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 		oaiReq.ToolChoice = tc
 	}
 
+	// Parallel tool calls
+	if len(oaiReq.Tools) > 0 {
+		parallelToolCalls := true
+		if req.ToolChoice != nil && req.ToolChoice.DisableParallelToolUse != nil && *req.ToolChoice.DisableParallelToolUse {
+			parallelToolCalls = false
+		}
+		oaiReq.ParallelToolCalls = &parallelToolCalls
+	}
+
 	// MaxTokens
 	oaiReq.MaxTokens = req.MaxTokens
 

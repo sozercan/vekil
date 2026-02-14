@@ -319,6 +319,60 @@ func TestTranslateAnthropicToOpenAI(t *testing.T) {
 		}
 	})
 
+	t.Run("parallel tool calls enabled by default", func(t *testing.T) {
+		schema := json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}}}`)
+		req := &models.AnthropicRequest{
+			Model:     "claude-3-opus",
+			MaxTokens: intPtr(100),
+			Messages:  []models.AnthropicMessage{{Role: "user", Content: json.RawMessage(`"Hi"`)}},
+			Tools:     []models.AnthropicTool{{Name: "get_weather", Description: "Get weather", InputSchema: schema}},
+		}
+		got, err := TranslateAnthropicToOpenAI(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.ParallelToolCalls == nil || !*got.ParallelToolCalls {
+			t.Error("expected ParallelToolCalls=true when tools are present")
+		}
+	})
+
+	t.Run("parallel tool calls disabled via tool_choice", func(t *testing.T) {
+		schema := json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}}}`)
+		disable := true
+		req := &models.AnthropicRequest{
+			Model:     "claude-3-opus",
+			MaxTokens: intPtr(100),
+			Messages:  []models.AnthropicMessage{{Role: "user", Content: json.RawMessage(`"Hi"`)}},
+			Tools:     []models.AnthropicTool{{Name: "get_weather", Description: "Get weather", InputSchema: schema}},
+			ToolChoice: &models.AnthropicToolChoice{
+				Type:                   "auto",
+				DisableParallelToolUse: &disable,
+			},
+		}
+		got, err := TranslateAnthropicToOpenAI(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.ParallelToolCalls == nil || *got.ParallelToolCalls {
+			t.Error("expected ParallelToolCalls=false when disable_parallel_tool_use is true")
+		}
+	})
+
+	t.Run("no parallel tool calls without tools", func(t *testing.T) {
+		req := &models.AnthropicRequest{
+			Model:     "claude-3-opus",
+			MaxTokens: intPtr(100),
+			Messages:  []models.AnthropicMessage{{Role: "user", Content: json.RawMessage(`"Hi"`)}},
+		}
+		got, err := TranslateAnthropicToOpenAI(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.ParallelToolCalls != nil {
+			t.Error("expected ParallelToolCalls=nil when no tools are present")
+		}
+	})
+
 	t.Run("stop sequences", func(t *testing.T) {
 		req := &models.AnthropicRequest{
 			Model:         "claude-3-opus",
@@ -434,6 +488,57 @@ func TestTranslateOpenAIToAnthropic(t *testing.T) {
 		}
 		if block.Name != "get_weather" {
 			t.Errorf("name = %q, want %q", block.Name, "get_weather")
+		}
+		if got.StopReason != "tool_use" {
+			t.Errorf("stop_reason = %q, want %q", got.StopReason, "tool_use")
+		}
+	})
+
+	t.Run("multiple tool calls response", func(t *testing.T) {
+		resp := &models.OpenAIResponse{
+			ID:      "chatcmpl-multi",
+			Created: 6000,
+			Choices: []models.OpenAIChoice{
+				{
+					Index: 0,
+					Message: models.OpenAIMessage{
+						Role:    "assistant",
+						Content: json.RawMessage(`"I'll delegate both tasks"`),
+						ToolCalls: []models.OpenAIToolCall{
+							{
+								ID:   "call_1",
+								Type: "function",
+								Function: models.OpenAIFunctionCall{
+									Name:      "delegate_task",
+									Arguments: `{"agent":"researcher","prompt":"List 3 pros of Go"}`,
+								},
+							},
+							{
+								ID:   "call_2",
+								Type: "function",
+								Function: models.OpenAIFunctionCall{
+									Name:      "delegate_task",
+									Arguments: `{"agent":"researcher","prompt":"List 3 cons of Go"}`,
+								},
+							},
+						},
+					},
+					FinishReason: strPtr("tool_calls"),
+				},
+			},
+		}
+		got := TranslateOpenAIToAnthropic(resp, "claude-opus-4.6-fast")
+		if len(got.Content) != 3 {
+			t.Fatalf("expected 3 content blocks, got %d", len(got.Content))
+		}
+		if got.Content[0].Type != "text" || got.Content[0].Text != "I'll delegate both tasks" {
+			t.Errorf("first block = %+v, want text", got.Content[0])
+		}
+		if got.Content[1].Type != "tool_use" || got.Content[1].ID != "call_1" || got.Content[1].Name != "delegate_task" {
+			t.Errorf("second block = %+v, want tool_use call_1", got.Content[1])
+		}
+		if got.Content[2].Type != "tool_use" || got.Content[2].ID != "call_2" || got.Content[2].Name != "delegate_task" {
+			t.Errorf("third block = %+v, want tool_use call_2", got.Content[2])
 		}
 		if got.StopReason != "tool_use" {
 			t.Errorf("stop_reason = %q, want %q", got.StopReason, "tool_use")
