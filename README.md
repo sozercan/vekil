@@ -5,10 +5,11 @@ High-performance Go proxy that exposes Anthropic and OpenAI-compatible APIs, for
 ## Features
 
 - **Anthropic Messages API** (`POST /v1/messages`) — full request/response translation between Anthropic and OpenAI formats
-- **OpenAI Chat Completions API** (`POST /v1/chat/completions`) — near zero-copy passthrough
+- **OpenAI Chat Completions API** (`POST /v1/chat/completions`) — near zero-copy passthrough (tools-aware, see below)
 - **OpenAI Responses API** (`POST /v1/responses`) — near zero-copy passthrough
 - **SSE streaming** support for all endpoints
 - **Tool use** — Anthropic tool definitions are translated to OpenAI function calling format
+- **Parallel tool use** — reliable parallel tool calls on both Anthropic and OpenAI paths via forced-streaming aggregation
 - **Extended thinking** — Anthropic `thinking` parameter is mapped to `max_completion_tokens`
 - **GitHub OAuth device code flow** with automatic token caching and refresh
 - **Automatic retry** with exponential backoff on transient upstream errors (429, 502, 503, 504)
@@ -158,7 +159,7 @@ Dated model suffixes (e.g., `claude-sonnet-4-20250514`) are stripped automatical
 
 ### `POST /v1/chat/completions` (OpenAI)
 
-Near zero-copy passthrough. Only authentication headers are injected; request and response bodies are streamed through untouched.
+Near zero-copy passthrough for requests without tools. When tools are present, the proxy injects `parallel_tool_calls: true` and forces streaming to the upstream for reliable parallel tool call support, then aggregates the response back to non-streaming JSON for the client. Streaming requests with tools are passed through as-is (parallel tool calls work natively in streaming mode).
 
 ### `POST /v1/responses` (OpenAI)
 
@@ -184,6 +185,8 @@ Health check endpoint. Returns `{"status":"ok"}`.
 │                   OAI→Anthropic                      │
 │                                                      │
 │  /v1/chat/completions ─────────► /chat/completions   │
+│                   (passthrough; forced-stream         │
+│                    + aggregate when tools present)    │
 │  /v1/responses ────────────────► /responses          │
 │                   (passthrough)                       │
 │                                                      │
