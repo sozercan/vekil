@@ -220,18 +220,17 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 				}
 
 				if tc.Function.Arguments != "" {
-					targetBlock := blockIndex
+					// Only emit deltas for tool calls that have an open block
 					if bi, ok := toolCallBlockIndex[tcIdx]; ok {
-						targetBlock = bi
+						writeSSEEvent(w, "content_block_delta", models.AnthropicStreamEvent{
+							Type:  "content_block_delta",
+							Index: intVal(bi),
+							Delta: &models.AnthropicDelta{
+								Type:        "input_json_delta",
+								PartialJSON: tc.Function.Arguments,
+							},
+						})
 					}
-					writeSSEEvent(w, "content_block_delta", models.AnthropicStreamEvent{
-						Type:  "content_block_delta",
-						Index: intVal(targetBlock),
-						Delta: &models.AnthropicDelta{
-							Type:        "input_json_delta",
-							PartialJSON: tc.Function.Arguments,
-						},
-					})
 				}
 			}
 
