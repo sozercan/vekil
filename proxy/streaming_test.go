@@ -192,6 +192,9 @@ func TestStreamOpenAIToAnthropic_TextOnly(t *testing.T) {
 	if msgDelta.Usage == nil || msgDelta.Usage.OutputTokens != 5 {
 		t.Errorf("message_delta usage output_tokens = %v, want 5", msgDelta.Usage)
 	}
+	if msgDelta.Usage.InputTokens != 10 {
+		t.Errorf("message_delta usage input_tokens = %v, want 10", msgDelta.Usage.InputTokens)
+	}
 }
 
 func TestStreamOpenAIToAnthropic_ToolCall(t *testing.T) {
@@ -288,6 +291,9 @@ func TestStreamOpenAIToAnthropic_ToolCall(t *testing.T) {
 	}
 	if cbStart.ContentBlock.Name != "get_weather" {
 		t.Errorf("content_block name = %q, want %q", cbStart.ContentBlock.Name, "get_weather")
+	}
+	if string(cbStart.ContentBlock.Input) != "{}" {
+		t.Errorf("content_block input = %q, want %q", string(cbStart.ContentBlock.Input), "{}")
 	}
 
 	// Verify content_block_delta has input_json_delta type

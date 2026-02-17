@@ -137,6 +137,7 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 			}
 			if storedUsage != nil {
 				evt.Usage = &models.AnthropicUsage{
+					InputTokens:  storedUsage.PromptTokens,
 					OutputTokens: storedUsage.CompletionTokens,
 				}
 			}
@@ -209,9 +210,10 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 						Type:  "content_block_start",
 						Index: intVal(blockIndex),
 						ContentBlock: &models.ContentBlock{
-							Type: "tool_use",
-							ID:   tc.ID,
-							Name: tc.Function.Name,
+							Type:  "tool_use",
+							ID:    tc.ID,
+							Name:  tc.Function.Name,
+							Input: json.RawMessage(`{}`),
 						},
 					})
 					toolCallBlockIndex[tcIdx] = blockIndex
@@ -257,6 +259,7 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 	}
 	if storedUsage != nil {
 		evt.Usage = &models.AnthropicUsage{
+			InputTokens:  storedUsage.PromptTokens,
 			OutputTokens: storedUsage.CompletionTokens,
 		}
 	}
