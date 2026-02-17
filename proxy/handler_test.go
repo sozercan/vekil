@@ -111,8 +111,8 @@ func TestHandleAnthropicMessages(t *testing.T) {
 	if anthropicResp.Model != "claude-sonnet-4" {
 		t.Errorf("expected model claude-sonnet-4, got %q", anthropicResp.Model)
 	}
-	if anthropicResp.StopReason != "end_turn" {
-		t.Errorf("expected stop_reason end_turn, got %q", anthropicResp.StopReason)
+	if anthropicResp.StopReason == nil || *anthropicResp.StopReason != "end_turn" {
+		t.Errorf("expected stop_reason end_turn, got %v", anthropicResp.StopReason)
 	}
 	if len(anthropicResp.Content) == 0 {
 		t.Fatal("expected content blocks, got none")
@@ -744,8 +744,8 @@ func TestHandleAnthropicMessages_ParallelToolCalls(t *testing.T) {
 		t.Fatalf("failed to parse response: %v", err)
 	}
 
-	if anthropicResp.StopReason != "tool_use" {
-		t.Errorf("stop_reason = %q, want tool_use", anthropicResp.StopReason)
+	if anthropicResp.StopReason == nil || *anthropicResp.StopReason != "tool_use" {
+		t.Errorf("stop_reason = %v, want tool_use", anthropicResp.StopReason)
 	}
 	if len(anthropicResp.Content) != 3 {
 		t.Fatalf("expected 3 content blocks (1 text + 2 tool_use), got %d", len(anthropicResp.Content))

@@ -72,8 +72,8 @@ type AnthropicResponse struct {
 	Role         string         `json:"role"`
 	Content      []ContentBlock `json:"content"`
 	Model        string         `json:"model"`
-	StopReason   string         `json:"stop_reason,omitempty"`
-	StopSequence string         `json:"stop_sequence,omitempty"`
+	StopReason   *string        `json:"stop_reason"`
+	StopSequence *string        `json:"stop_sequence"`
 	Usage        AnthropicUsage `json:"usage"`
 }
 

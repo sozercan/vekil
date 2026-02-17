@@ -40,9 +40,9 @@ if c.Type == "tool_use" {
 toolCount++
 }
 }
-t.Logf("LLM response: stop_reason=%s, tool_calls=%d, tools_sent=1", resp.StopReason, toolCount)
-if resp.StopReason != "tool_use" {
-t.Errorf("stop_reason = %q, want tool_use", resp.StopReason)
+t.Logf("LLM response: stop_reason=%v, tool_calls=%d, tools_sent=1", resp.StopReason, toolCount)
+if resp.StopReason == nil || *resp.StopReason != "tool_use" {
+t.Errorf("stop_reason = %v, want tool_use", resp.StopReason)
 }
 if toolCount != 1 {
 t.Fatalf("tool_calls = %d, want 1", toolCount)
@@ -85,9 +85,9 @@ if c.Type == "tool_use" {
 toolCount++
 }
 }
-t.Logf("LLM response: stop_reason=%s, tool_calls=%d, content_blocks=%d", resp.StopReason, toolCount, len(resp.Content))
-if resp.StopReason != "tool_use" {
-t.Errorf("stop_reason = %q, want tool_use", resp.StopReason)
+t.Logf("LLM response: stop_reason=%v, tool_calls=%d, content_blocks=%d", resp.StopReason, toolCount, len(resp.Content))
+if resp.StopReason == nil || *resp.StopReason != "tool_use" {
+t.Errorf("stop_reason = %v, want tool_use", resp.StopReason)
 }
 if toolCount != 2 {
 t.Fatalf("tool_calls = %d, want 2 ← THIS WAS THE BUG (was 0 before fix)", toolCount)

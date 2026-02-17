@@ -446,8 +446,8 @@ func TestTranslateOpenAIToAnthropic(t *testing.T) {
 		if got.Content[0].Text != "Hello there" {
 			t.Errorf("content text = %q, want %q", got.Content[0].Text, "Hello there")
 		}
-		if got.StopReason != "end_turn" {
-			t.Errorf("stop_reason = %q, want %q", got.StopReason, "end_turn")
+		if got.StopReason == nil || *got.StopReason != "end_turn" {
+			t.Errorf("stop_reason = %v, want %q", got.StopReason, "end_turn")
 		}
 	})
 
@@ -489,8 +489,8 @@ func TestTranslateOpenAIToAnthropic(t *testing.T) {
 		if block.Name != "get_weather" {
 			t.Errorf("name = %q, want %q", block.Name, "get_weather")
 		}
-		if got.StopReason != "tool_use" {
-			t.Errorf("stop_reason = %q, want %q", got.StopReason, "tool_use")
+		if got.StopReason == nil || *got.StopReason != "tool_use" {
+			t.Errorf("stop_reason = %v, want %q", got.StopReason, "tool_use")
 		}
 	})
 
@@ -540,8 +540,8 @@ func TestTranslateOpenAIToAnthropic(t *testing.T) {
 		if got.Content[2].Type != "tool_use" || got.Content[2].ID != "call_2" || got.Content[2].Name != "delegate_task" {
 			t.Errorf("third block = %+v, want tool_use call_2", got.Content[2])
 		}
-		if got.StopReason != "tool_use" {
-			t.Errorf("stop_reason = %q, want %q", got.StopReason, "tool_use")
+		if got.StopReason == nil || *got.StopReason != "tool_use" {
+			t.Errorf("stop_reason = %v, want %q", got.StopReason, "tool_use")
 		}
 	})
 
@@ -589,8 +589,8 @@ func TestTranslateOpenAIToAnthropic(t *testing.T) {
 			Choices: []models.OpenAIChoice{},
 		}
 		got := TranslateOpenAIToAnthropic(resp, "claude-3-opus")
-		if got.StopReason != "end_turn" {
-			t.Errorf("stop_reason = %q, want %q", got.StopReason, "end_turn")
+		if got.StopReason == nil || *got.StopReason != "end_turn" {
+			t.Errorf("stop_reason = %v, want %q", got.StopReason, "end_turn")
 		}
 		if got.Content == nil {
 			t.Fatal("content should not be nil")

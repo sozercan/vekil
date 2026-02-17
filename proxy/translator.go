@@ -311,11 +311,15 @@ func TranslateOpenAIToAnthropic(resp *models.OpenAIResponse, model string) *mode
 
 		// Add tool_use blocks
 		for _, tc := range msg.ToolCalls {
+			input := json.RawMessage(tc.Function.Arguments)
+			if !json.Valid(input) {
+				input = json.RawMessage(`{}`)
+			}
 			content = append(content, models.ContentBlock{
 				Type:  "tool_use",
 				ID:    tc.ID,
 				Name:  tc.Function.Name,
-				Input: json.RawMessage(tc.Function.Arguments),
+				Input: input,
 			})
 		}
 
@@ -334,7 +338,7 @@ func TranslateOpenAIToAnthropic(resp *models.OpenAIResponse, model string) *mode
 		Role:       "assistant",
 		Content:    content,
 		Model:      model,
-		StopReason: stopReason,
+		StopReason: &stopReason,
 	}
 
 	if resp.Usage != nil {
