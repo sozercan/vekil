@@ -197,7 +197,7 @@ func translateMessage(msg models.AnthropicMessage) ([]models.OpenAIMessage, erro
 				Content:    contentJSON,
 			})
 
-		case "thinking":
+		case "thinking", "redacted_thinking":
 			// skip thinking blocks
 		}
 	}
@@ -298,10 +298,11 @@ func TranslateOpenAIToAnthropic(resp *models.OpenAIResponse, model string) *mode
 		choice := resp.Choices[0]
 		msg := choice.Message
 
-		// Try to extract text content
+		// Try to extract text content (skip empty/whitespace — Anthropic
+		// rejects text blocks that contain no non-whitespace characters).
 		if len(msg.Content) > 0 {
 			var text string
-			if err := json.Unmarshal(msg.Content, &text); err == nil && text != "" {
+			if err := json.Unmarshal(msg.Content, &text); err == nil && strings.TrimSpace(text) != "" {
 				content = append(content, models.ContentBlock{
 					Type: "text",
 					Text: text,

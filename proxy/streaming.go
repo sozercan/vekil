@@ -355,6 +355,10 @@ func aggregateStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, erro
 		}
 		for i := 0; i <= maxIdx; i++ {
 			if tc, ok := toolCalls[i]; ok {
+				// Validate concatenated arguments are valid JSON
+				if !json.Valid([]byte(tc.Function.Arguments)) {
+					tc.Function.Arguments = "{}"
+				}
 				msg.ToolCalls = append(msg.ToolCalls, *tc)
 			}
 		}

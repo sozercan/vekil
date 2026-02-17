@@ -373,6 +373,35 @@ func TestTranslateAnthropicToOpenAI(t *testing.T) {
 		}
 	})
 
+	t.Run("thinking and redacted_thinking blocks skipped", func(t *testing.T) {
+		content := `[{"type":"thinking","thinking":"deep thought","signature":"sig"},{"type":"redacted_thinking","data":"secret"},{"type":"text","text":"Here is my answer"}]`
+		req := &models.AnthropicRequest{
+			Model:     "claude-3-opus",
+			MaxTokens: intPtr(100),
+			Messages: []models.AnthropicMessage{
+				{Role: "assistant", Content: json.RawMessage(content)},
+			},
+		}
+		got, err := TranslateAnthropicToOpenAI(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got.Messages) != 1 {
+			t.Fatalf("expected 1 message, got %d", len(got.Messages))
+		}
+		msg := got.Messages[0]
+		var text string
+		if err := json.Unmarshal(msg.Content, &text); err != nil {
+			t.Fatalf("content not a JSON string: %v", err)
+		}
+		if text != "Here is my answer" {
+			t.Errorf("content = %q, want %q", text, "Here is my answer")
+		}
+		if len(msg.ToolCalls) != 0 {
+			t.Errorf("expected 0 tool calls, got %d", len(msg.ToolCalls))
+		}
+	})
+
 	t.Run("stop sequences", func(t *testing.T) {
 		req := &models.AnthropicRequest{
 			Model:         "claude-3-opus",
@@ -597,6 +626,42 @@ func TestTranslateOpenAIToAnthropic(t *testing.T) {
 		}
 		if len(got.Content) != 0 {
 			t.Errorf("expected 0 content blocks, got %d", len(got.Content))
+		}
+	})
+
+	t.Run("empty text content skipped", func(t *testing.T) {
+		resp := &models.OpenAIResponse{
+			ID:      "chatcmpl-empty-text",
+			Created: 7000,
+			Choices: []models.OpenAIChoice{
+				{
+					Index:        0,
+					Message:      models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`""`)},
+					FinishReason: strPtr("stop"),
+				},
+			},
+		}
+		got := TranslateOpenAIToAnthropic(resp, "claude-3-opus")
+		if len(got.Content) != 0 {
+			t.Errorf("expected 0 content blocks for empty text, got %d", len(got.Content))
+		}
+	})
+
+	t.Run("whitespace-only text content skipped", func(t *testing.T) {
+		resp := &models.OpenAIResponse{
+			ID:      "chatcmpl-ws-text",
+			Created: 7001,
+			Choices: []models.OpenAIChoice{
+				{
+					Index:        0,
+					Message:      models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"   \n\t  "`)},
+					FinishReason: strPtr("stop"),
+				},
+			},
+		}
+		got := TranslateOpenAIToAnthropic(resp, "claude-3-opus")
+		if len(got.Content) != 0 {
+			t.Errorf("expected 0 content blocks for whitespace text, got %d", len(got.Content))
 		}
 	})
 

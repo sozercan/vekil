@@ -904,3 +904,28 @@ func TestAggregateStreamToResponse_TextOnly(t *testing.T) {
 		t.Errorf("finish_reason = %q, want stop", *resp.Choices[0].FinishReason)
 	}
 }
+
+func TestAggregateStreamToResponse_InvalidToolArgs(t *testing.T) {
+	// Simulate concatenated JSON objects in tool call arguments (LiteLLM bug #20543)
+	body := buildSSEStream(
+		`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":""}}]}}]}`,
+		`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"ls\"}"}}]}}]}`,
+		`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"pwd\"}"}}]}}]}`,
+		`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		"[DONE]",
+	)
+
+	resp, err := aggregateStreamToResponse(body)
+	if err != nil {
+		t.Fatalf("aggregateStreamToResponse: %v", err)
+	}
+
+	if len(resp.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(resp.Choices[0].Message.ToolCalls))
+	}
+	tc := resp.Choices[0].Message.ToolCalls[0]
+	// The concatenated arguments are invalid JSON, should be replaced with {}
+	if !json.Valid([]byte(tc.Function.Arguments)) {
+		t.Errorf("tool call arguments should be valid JSON, got %q", tc.Function.Arguments)
+	}
+}
