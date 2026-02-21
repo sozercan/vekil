@@ -8,5 +8,5 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /copilot-proxy .
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /copilot-proxy /copilot-proxy
-EXPOSE 8080
+EXPOSE 1337
 ENTRYPOINT ["/copilot-proxy"]

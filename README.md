@@ -29,9 +29,26 @@ go build -o copilot-proxy .
 ### Docker
 
 ```bash
-docker build -t copilot-proxy .
-docker run -p 8080:8080 -v ~/.config/copilot-proxy:/home/nonroot/.config/copilot-proxy copilot-proxy
+docker pull docker.io/sozercan/copilot-proxy:latest
+docker run -p 1337:1337 -v ~/.config/copilot-proxy:/home/nonroot/.config/copilot-proxy sozercan/copilot-proxy:latest
 ```
+
+Or build from source:
+
+```bash
+docker build -t copilot-proxy .
+docker run -p 1337:1337 -v ~/.config/copilot-proxy:/home/nonroot/.config/copilot-proxy copilot-proxy
+```
+
+### Kubernetes
+
+A sample deployment manifest is included in `k8s/copilot-proxy.yaml`:
+
+```bash
+kubectl apply -f k8s/copilot-proxy.yaml
+```
+
+The image is available at `docker.io/sozercan/copilot-proxy` with multi-arch support (linux/amd64, linux/arm64).
 
 ### First Run
 
@@ -47,7 +64,7 @@ Tokens are cached to `~/.config/copilot-proxy/` and automatically refreshed befo
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--port` | `PORT` | `8080` | Listen port |
+| `--port` | `PORT` | `1337` | Listen port |
 | `--host` | `HOST` | `0.0.0.0` | Listen host |
 | `--token-dir` | `TOKEN_DIR` | `~/.config/copilot-proxy` | Token storage directory |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level (`debug`, `info`, or `error`) |
@@ -57,14 +74,14 @@ Tokens are cached to `~/.config/copilot-proxy/` and automatically refreshed befo
 ### Claude Code
 
 ```bash
-export ANTHROPIC_BASE_URL=http://localhost:8080
+export ANTHROPIC_BASE_URL=http://localhost:1337
 # Claude Code will use the /v1/messages endpoint automatically
 ```
 
 ### Anthropic Messages API
 
 ```bash
-curl http://localhost:8080/v1/messages \
+curl http://localhost:1337/v1/messages \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-sonnet-4",
@@ -78,7 +95,7 @@ curl http://localhost:8080/v1/messages \
 ### Anthropic Messages API (streaming)
 
 ```bash
-curl http://localhost:8080/v1/messages \
+curl http://localhost:1337/v1/messages \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-sonnet-4",
@@ -93,7 +110,7 @@ curl http://localhost:8080/v1/messages \
 ### OpenAI Chat Completions API
 
 ```bash
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:1337/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4o",
@@ -106,7 +123,7 @@ curl http://localhost:8080/v1/chat/completions \
 ### OpenAI Responses API
 
 ```bash
-curl http://localhost:8080/v1/responses \
+curl http://localhost:1337/v1/responses \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4o",
@@ -213,8 +230,8 @@ A native macOS menubar app that lets you start/stop the proxy without a terminal
 ### Build & Run
 
 ```bash
-make build-menubar
-./copilot-proxy-menubar
+make build-app
+open "Copilot Proxy.app"
 ```
 
 ### Features
@@ -231,7 +248,7 @@ make build-menubar
 go build -o copilot-proxy .
 
 # Build menubar app
-make build-menubar
+make build-app
 
 # Run all tests
 go test ./... -count=1

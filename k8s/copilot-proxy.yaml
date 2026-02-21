@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
         - name: copilot-proxy
-          image: docker.io/sozercan/copilot-proxy:20260214-170100-amd64
+          image: docker.io/sozercan/copilot-proxy:20260217-211321
           imagePullPolicy: Always
           ports:
             - containerPort: 1337

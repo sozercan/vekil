@@ -25,6 +25,9 @@ This is a Go proxy server that exposes Anthropic and OpenAI-compatible APIs, for
 - `auth/` — GitHub OAuth device code flow, Copilot token exchange, disk caching (`~/.config/copilot-proxy/`), auto-refresh with `sync.RWMutex`
 - `proxy/` — HTTP handlers, Anthropic↔OpenAI translation, SSE streaming
 - `models/` — Request/response type definitions for both APIs (data-only, no logic)
+- `logger/` — Structured JSON logging with level filtering
+- `server/` — Reusable HTTP server lifecycle (Start/Stop/IsRunning)
+- `cmd/menubar/` — macOS menubar app using systray
 
 ## Conventions
 
