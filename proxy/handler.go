@@ -294,54 +294,31 @@ func (h *ProxyHandler) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"ok"}`))
 }
 
-// HandleModels handles GET /v1/models and returns a list of available models.
+// HandleModels handles GET /v1/models by proxying to the upstream Copilot API.
 func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
-	models := []string{
-		"gpt-4o",
-		"gpt-4o-mini",
-		"gpt-4.1",
-		"gpt-4.1-mini",
-		"gpt-4.1-nano",
-		"gpt-5.3-codex",
-		"o1",
-		"o1-mini",
-		"o1-preview",
-		"o3",
-		"o3-mini",
-		"o4-mini",
-		"claude-3.5-sonnet",
-		"claude-sonnet-4",
-		"claude-sonnet-4.5",
-		"claude-haiku-4.5",
-		"claude-opus-4",
-		"claude-opus-4.5",
-		"claude-sonnet-4.6",
-		"claude-opus-4.6",
-		"claude-opus-4.6-fast",
+	token, err := h.auth.GetToken(r.Context())
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error")
+		return
 	}
 
-	type modelObj struct {
-		ID      string `json:"id"`
-		Object  string `json:"object"`
-		Created int64  `json:"created"`
-		OwnedBy string `json:"owned_by"`
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, h.copilotURL+"/models", nil)
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to create request", "server_error")
+		return
 	}
+	setCopilotHeaders(req, token)
 
-	var data []modelObj
-	for _, m := range models {
-		data = append(data, modelObj{
-			ID:      m,
-			Object:  "model",
-			Created: 0,
-			OwnedBy: "github-copilot",
-		})
+	resp, err := h.client.Do(req)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, fmt.Sprintf("upstream request failed: %v", err), "server_error")
+		return
 	}
+	defer resp.Body.Close()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"object": "list",
-		"data":   data,
-	})
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, errType, message string) {

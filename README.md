@@ -148,31 +148,44 @@ Full Anthropic Messages API compatibility. Incoming requests are translated to O
 **Model name normalization:**
 Dated model suffixes (e.g., `claude-sonnet-4-20250514`) are stripped automatically. Hyphenated version numbers (e.g., `claude-sonnet-4-5`) are mapped to dotted form (`claude-sonnet-4.5`).
 
-**Available model names (`GET /v1/models`):**
+**Available models (`GET /v1/models`):**
+
+The list of available models is fetched dynamically from the upstream GitHub Copilot API. Query the endpoint to see all currently available models:
+
+```bash
+curl http://localhost:1337/v1/models
+```
+
+<details>
+<summary>Known models</summary>
 
 | Provider  | Model name             |
 | --------- | ---------------------- |
 | OpenAI    | `gpt-4o`               |
 | OpenAI    | `gpt-4o-mini`          |
-| OpenAI    | `gpt-4.1`              |
-| OpenAI    | `gpt-4.1-mini`         |
-| OpenAI    | `gpt-4.1-nano`         |
-| OpenAI    | `gpt-5.3-codex`        |
-| OpenAI    | `o1`                   |
-| OpenAI    | `o1-mini`              |
-| OpenAI    | `o1-preview`           |
-| OpenAI    | `o3`                   |
-| OpenAI    | `o3-mini`              |
-| OpenAI    | `o4-mini`              |
-| Anthropic | `claude-3.5-sonnet`    |
+| OpenAI    | `gpt-4.1`             |
+| OpenAI    | `gpt-5-mini`           |
+| OpenAI    | `gpt-5.1`             |
+| OpenAI    | `gpt-5.1-codex`       |
+| OpenAI    | `gpt-5.1-codex-mini`  |
+| OpenAI    | `gpt-5.1-codex-max`   |
+| OpenAI    | `gpt-5.2`             |
+| OpenAI    | `gpt-5.2-codex`       |
+| OpenAI    | `gpt-5.3-codex`       |
+| Anthropic | `claude-haiku-4.5`     |
 | Anthropic | `claude-sonnet-4`      |
 | Anthropic | `claude-sonnet-4.5`    |
-| Anthropic | `claude-haiku-4.5`     |
-| Anthropic | `claude-opus-4`        |
-| Anthropic | `claude-opus-4.5`      |
 | Anthropic | `claude-sonnet-4.6`    |
+| Anthropic | `claude-opus-4.5`      |
 | Anthropic | `claude-opus-4.6`      |
 | Anthropic | `claude-opus-4.6-fast` |
+| Anthropic | `claude-opus-4.6-1m`   |
+| Google    | `gemini-2.5-pro`       |
+| Google    | `gemini-3-pro-preview` |
+| Google    | `gemini-3-flash-preview` |
+| Google    | `gemini-3.1-pro-preview` |
+
+</details>
 
 ### `POST /v1/chat/completions` (OpenAI)
 
@@ -184,7 +197,7 @@ Near zero-copy passthrough for the OpenAI Responses API. Only authentication hea
 
 ### `GET /v1/models`
 
-Returns a list of available models in OpenAI-compatible format. Useful for clients that enumerate models before making requests.
+Proxies the upstream GitHub Copilot models endpoint, returning all available models dynamically. No hardcoded model list — new models are available as soon as Copilot adds them.
 
 ### `GET /healthz`
 

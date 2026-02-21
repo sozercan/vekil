@@ -347,57 +347,70 @@ func TestHandleOpenAIChatCompletionsUpstreamError(t *testing.T) {
 }
 
 func TestHandleModels(t *testing.T) {
-	h := &ProxyHandler{}
-	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	w := httptest.NewRecorder()
-
-	h.HandleModels(w, req)
-
-	resp := w.Result()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-	var result struct {
-		Object string `json:"object"`
-		Data   []struct {
-			ID      string `json:"id"`
-			Object  string `json:"object"`
-			Created int64  `json:"created"`
-			OwnedBy string `json:"owned_by"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-	if result.Object != "list" {
-		t.Errorf("expected object list, got %q", result.Object)
-	}
-	if len(result.Data) == 0 {
-		t.Fatal("expected models in data, got none")
-	}
-	for _, m := range result.Data {
-		if m.Object != "model" {
-			t.Errorf("expected object model, got %q", m.Object)
-		}
-		if m.OwnedBy != "github-copilot" {
-			t.Errorf("expected owned_by github-copilot, got %q", m.OwnedBy)
-		}
-	}
-
-	// Validate each model object has all OpenAI-required fields
-	var rawResult map[string]json.RawMessage
-	json.Unmarshal(body, &rawResult)
-	var rawData []map[string]json.RawMessage
-	json.Unmarshal(rawResult["data"], &rawData)
-	for i, m := range rawData {
-		for _, field := range []string{"id", "object", "created", "owned_by"} {
-			if _, ok := m[field]; !ok {
-				t.Errorf("model[%d] missing required field %q", i, field)
+	t.Run("proxies upstream response", func(t *testing.T) {
+		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/models" {
+				t.Errorf("expected path /models, got %s", r.URL.Path)
 			}
+			if r.Method != http.MethodGet {
+				t.Errorf("expected GET, got %s", r.Method)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+				t.Errorf("expected Authorization header 'Bearer test-token', got %q", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4o","object":"model","created":0,"owned_by":"github-copilot"},{"id":"claude-sonnet-4","object":"model","created":0,"owned_by":"github-copilot"}]}`))
+		})
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+
+		h.HandleModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.StatusCode)
 		}
-	}
+
+		body, _ := io.ReadAll(resp.Body)
+		var result struct {
+			Object string `json:"object"`
+			Data   []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if result.Object != "list" {
+			t.Errorf("expected object list, got %q", result.Object)
+		}
+		if len(result.Data) != 2 {
+			t.Fatalf("expected 2 models, got %d", len(result.Data))
+		}
+		if result.Data[0].ID != "gpt-4o" {
+			t.Errorf("expected first model gpt-4o, got %q", result.Data[0].ID)
+		}
+		if result.Data[1].ID != "claude-sonnet-4" {
+			t.Errorf("expected second model claude-sonnet-4, got %q", result.Data[1].ID)
+		}
+	})
+
+	t.Run("upstream error is forwarded", func(t *testing.T) {
+		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"internal server error"}`))
+		})
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+
+		h.HandleModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("expected 500, got %d", resp.StatusCode)
+		}
+	})
 }
 
 // TestOpenAIErrorResponseShape validates error responses match the OpenAI spec:
