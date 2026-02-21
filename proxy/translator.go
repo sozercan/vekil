@@ -202,7 +202,12 @@ func translateMessage(msg models.AnthropicMessage) ([]models.OpenAIMessage, erro
 		}
 	}
 
-	// Build the primary message for text/tool_use blocks
+	// Build the primary message for text/tool_use blocks.
+	// When tool_calls are present, prepend before tool_result messages so
+	// assistant→tool ordering is preserved.  When only text is present
+	// (e.g. a user message carrying both text and tool_results), append
+	// after the tool_result messages so tool responses stay adjacent to
+	// the preceding assistant tool_calls.
 	if textParts != "" || len(toolCalls) > 0 {
 		m := models.OpenAIMessage{Role: msg.Role}
 		if textParts != "" {
@@ -211,9 +216,10 @@ func translateMessage(msg models.AnthropicMessage) ([]models.OpenAIMessage, erro
 		}
 		if len(toolCalls) > 0 {
 			m.ToolCalls = toolCalls
+			result = append([]models.OpenAIMessage{m}, result...)
+		} else {
+			result = append(result, m)
 		}
-		// Prepend before any tool_result messages
-		result = append([]models.OpenAIMessage{m}, result...)
 	}
 
 	return result, nil
