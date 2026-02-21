@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -223,5 +224,226 @@ func TestNewAuthenticator_CustomDir(t *testing.T) {
 	a := NewAuthenticator(dir)
 	if a.tokenDir != dir {
 		t.Errorf("expected %q, got %q", dir, a.tokenDir)
+	}
+}
+
+func TestIsSignedIn_NoToken(t *testing.T) {
+	a := &Authenticator{tokenDir: t.TempDir()}
+	if a.IsSignedIn() {
+		t.Error("expected IsSignedIn() == false with no token")
+	}
+}
+
+func TestIsSignedIn_WithDiskToken(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("ghu_xxxx"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &Authenticator{tokenDir: dir}
+	if !a.IsSignedIn() {
+		t.Error("expected IsSignedIn() == true with disk token")
+	}
+}
+
+func TestSignOut_ClearsTokens(t *testing.T) {
+	dir := t.TempDir()
+	// Write both token files
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("ghu_xxxx"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "api-key.json"), []byte(`{"token":"tok"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &Authenticator{
+		tokenDir:     dir,
+		accessToken:  "ghu_xxxx",
+		copilotToken: "tok",
+		tokenExpiry:  time.Now().Add(1 * time.Hour),
+	}
+
+	if err := a.SignOut(); err != nil {
+		t.Fatalf("SignOut error: %v", err)
+	}
+
+	// Memory cleared
+	if a.accessToken != "" {
+		t.Errorf("accessToken not cleared: %q", a.accessToken)
+	}
+	if a.copilotToken != "" {
+		t.Errorf("copilotToken not cleared: %q", a.copilotToken)
+	}
+	if !a.tokenExpiry.IsZero() {
+		t.Errorf("tokenExpiry not cleared: %v", a.tokenExpiry)
+	}
+
+	// Disk cleared
+	if _, err := os.Stat(filepath.Join(dir, "access-token")); !os.IsNotExist(err) {
+		t.Error("access-token file still exists")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "api-key.json")); !os.IsNotExist(err) {
+		t.Error("api-key.json file still exists")
+	}
+}
+
+func TestSignOut_Idempotent(t *testing.T) {
+	a := &Authenticator{tokenDir: t.TempDir()}
+	// Calling SignOut when no files exist should not error
+	if err := a.SignOut(); err != nil {
+		t.Fatalf("SignOut on empty dir should not error: %v", err)
+	}
+}
+
+func TestRequestDeviceCode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if ct := r.Header.Get("Content-Type"); ct != "application/x-www-form-urlencoded" {
+			t.Errorf("unexpected content-type: %s", ct)
+		}
+		_ = json.NewEncoder(w).Encode(DeviceCodeResponse{
+			DeviceCode:      "dc_test123",
+			UserCode:        "ABCD-1234",
+			VerificationURI: "https://github.com/login/device",
+			ExpiresIn:       900,
+			Interval:        5,
+		})
+	}))
+	defer server.Close()
+
+	// We need to override the deviceCodeURL for testing. Since it's a const,
+	// we create a custom HTTP client that redirects to our test server.
+	a := &Authenticator{
+		client: server.Client(),
+	}
+	// We'll use a transport that rewrites the URL to our test server.
+	a.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		req.URL, _ = url.Parse(server.URL + req.URL.Path)
+		return http.DefaultTransport.RoundTrip(req)
+	})
+
+	dcResp, err := a.RequestDeviceCode(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dcResp.UserCode != "ABCD-1234" {
+		t.Errorf("expected ABCD-1234, got %q", dcResp.UserCode)
+	}
+	if dcResp.DeviceCode != "dc_test123" {
+		t.Errorf("expected dc_test123, got %q", dcResp.DeviceCode)
+	}
+}
+
+// roundTripFunc adapts a function to http.RoundTripper.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestPollForAuthorization_Success(t *testing.T) {
+	call := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/login/oauth/access_token":
+			call++
+			if call == 1 {
+				// First call: authorization_pending
+				_ = json.NewEncoder(w).Encode(AccessTokenResponse{
+					Error: "authorization_pending",
+				})
+			} else {
+				// Second call: success
+				_ = json.NewEncoder(w).Encode(AccessTokenResponse{
+					AccessToken: "ghu_success",
+				})
+			}
+		case r.URL.Path == "/copilot_internal/v2/token":
+			_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
+				Token:     "copilot-tok-poll",
+				ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
+			})
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	a := &Authenticator{
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+		tokenDir:       dir,
+	}
+	a.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		req.URL, _ = url.Parse(server.URL + req.URL.Path)
+		return http.DefaultTransport.RoundTrip(req)
+	})
+
+	dcResp := &DeviceCodeResponse{
+		DeviceCode: "dc_test",
+		ExpiresIn:  60,
+		Interval:   1,
+	}
+
+	err := a.PollForAuthorization(context.Background(), dcResp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if a.accessToken != "ghu_success" {
+		t.Errorf("expected ghu_success, got %q", a.accessToken)
+	}
+	if a.copilotToken != "copilot-tok-poll" {
+		t.Errorf("expected copilot-tok-poll, got %q", a.copilotToken)
+	}
+
+	// Verify access token was saved to disk
+	data, err := os.ReadFile(filepath.Join(dir, "access-token"))
+	if err != nil {
+		t.Fatalf("access-token not saved: %v", err)
+	}
+	if string(data) != "ghu_success" {
+		t.Errorf("expected ghu_success on disk, got %q", string(data))
+	}
+}
+
+func TestPollForAuthorization_Cancelled(t *testing.T) {
+	a := &Authenticator{
+		client:   &http.Client{Timeout: 5 * time.Second},
+		tokenDir: t.TempDir(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	dcResp := &DeviceCodeResponse{
+		DeviceCode: "dc_cancel",
+		ExpiresIn:  60,
+		Interval:   1,
+	}
+
+	err := a.PollForAuthorization(ctx, dcResp)
+	if err == nil {
+		t.Fatal("expected error from cancelled context")
+	}
+	if err != context.Canceled {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestRefreshToken_DisableAutoDeviceFlow(t *testing.T) {
+	a := &Authenticator{
+		tokenDir:              t.TempDir(),
+		client:                &http.Client{Timeout: 5 * time.Second},
+		DisableAutoDeviceFlow: true,
+	}
+
+	err := a.refreshToken(context.Background())
+	if err == nil {
+		t.Fatal("expected error when DisableAutoDeviceFlow is true")
+	}
+	if err.Error() != "not authenticated" {
+		t.Errorf("expected 'not authenticated', got %q", err.Error())
 	}
 }

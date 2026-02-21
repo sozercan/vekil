@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +19,25 @@ import (
 	"github.com/sozercan/copilot-proxy/logger"
 	"github.com/sozercan/copilot-proxy/models"
 )
+
+const (
+	// maxRequestBodySize is the maximum allowed request body size (10MB).
+	maxRequestBodySize = 10 << 20
+	// upstreamTimeout is the timeout for LLM inference requests.
+	upstreamTimeout = 5 * time.Minute
+	// modelsUpstreamTimeout is the timeout for the /models metadata request.
+	modelsUpstreamTimeout = 30 * time.Second
+	// modelsCacheTTL is how long the /models response is cached.
+	modelsCacheTTL = 5 * time.Minute
+)
+
+// modelsCache holds a cached /models response to avoid repeated upstream calls.
+type modelsCache struct {
+	mu         sync.RWMutex
+	body       []byte
+	statusCode int
+	expiry     time.Time
+}
 
 // ProxyHandler holds dependencies for all HTTP handlers.
 type ProxyHandler struct {
@@ -27,6 +47,7 @@ type ProxyHandler struct {
 	log            *logger.Logger
 	maxRetries     int
 	retryBaseDelay time.Duration
+	models         modelsCache
 }
 
 // NewProxyHandler creates a ProxyHandler with connection pooling and HTTP/2.
@@ -63,9 +84,13 @@ func setCopilotHeaders(req *http.Request, token string) {
 // HandleAnthropicMessages handles POST /v1/messages by translating the Anthropic
 // request to OpenAI format, forwarding to Copilot, and translating the response back.
 func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	body, err := readBody(r)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "failed to read request body")
+		status := http.StatusBadRequest
+		if len(body) == 0 {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeAnthropicError(w, status, "invalid_request_error", err.Error())
 		return
 	}
 	defer r.Body.Close()
@@ -111,9 +136,13 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Use background context to avoid cancellation from client disconnects
+	// Use background context with timeout to avoid cancellation from client
+	// disconnects while still preventing goroutine leaks on upstream hangs.
+	upstreamCtx, upstreamCancel := context.WithTimeout(context.Background(), upstreamTimeout)
+	defer upstreamCancel()
+
 	resp, err := h.doWithRetry(func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.copilotURL+"/chat/completions", bytes.NewReader(oaiBody))
+		req, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, h.copilotURL+"/chat/completions", bytes.NewReader(oaiBody))
 		if err != nil {
 			return nil, err
 		}
@@ -163,10 +192,13 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Buffer the full body for retry support and inspection
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := readBody(r)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
+		status := http.StatusBadRequest
+		if len(bodyBytes) == 0 {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
 	defer r.Body.Close()
@@ -190,8 +222,11 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		bodyBytes = injectForceStream(bodyBytes)
 	}
 
+	upstreamCtx, upstreamCancel := context.WithTimeout(context.Background(), upstreamTimeout)
+	defer upstreamCancel()
+
 	resp, err := h.doWithRetry(func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.copilotURL+"/chat/completions", bytes.NewReader(bodyBytes))
+		req, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, h.copilotURL+"/chat/completions", bytes.NewReader(bodyBytes))
 		if err != nil {
 			return nil, err
 		}
@@ -233,35 +268,35 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 // HandleResponses handles POST /v1/responses by forwarding the request to
 // Copilot's responses endpoint with only auth headers injected.
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
-	// Peek at the stream field without buffering the full body
-	var buf bytes.Buffer
-	tee := io.TeeReader(r.Body, &buf)
-
-	var partial struct {
-		Stream *bool `json:"stream,omitempty"`
-	}
-	json.NewDecoder(tee).Decode(&partial)
-	isStreaming := partial.Stream != nil && *partial.Stream
-
-	// Reconstruct body: already-read bytes + remainder
-	body := io.MultiReader(&buf, r.Body)
-
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error")
 		return
 	}
 
-	// Buffer the full body for retry support
-	bodyBytes, err := io.ReadAll(body)
+	bodyBytes, err := readBody(r)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
+		status := http.StatusBadRequest
+		if len(bodyBytes) == 0 {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
 	defer r.Body.Close()
 
+	// Detect if the client requested streaming
+	var partial struct {
+		Stream *bool `json:"stream,omitempty"`
+	}
+	json.Unmarshal(bodyBytes, &partial)
+	isStreaming := partial.Stream != nil && *partial.Stream
+
+	upstreamCtx, upstreamCancel := context.WithTimeout(context.Background(), upstreamTimeout)
+	defer upstreamCancel()
+
 	resp, err := h.doWithRetry(func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.copilotURL+"/responses", bytes.NewReader(bodyBytes))
+		req, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, h.copilotURL+"/responses", bytes.NewReader(bodyBytes))
 		if err != nil {
 			return nil, err
 		}
@@ -295,14 +330,31 @@ func (h *ProxyHandler) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleModels handles GET /v1/models by proxying to the upstream Copilot API.
+// Responses are cached for modelsCacheTTL to avoid repeated upstream calls.
 func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
+	// Check cache first
+	h.models.mu.RLock()
+	if h.models.body != nil && time.Now().Before(h.models.expiry) {
+		body := h.models.body
+		status := h.models.statusCode
+		h.models.mu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		w.Write(body)
+		return
+	}
+	h.models.mu.RUnlock()
+
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error")
 		return
 	}
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, h.copilotURL+"/models", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), modelsUpstreamTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.copilotURL+"/models", nil)
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to create request", "server_error")
 		return
@@ -316,9 +368,24 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
+		return
+	}
+
+	// Cache successful responses
+	if resp.StatusCode == http.StatusOK {
+		h.models.mu.Lock()
+		h.models.body = body
+		h.models.statusCode = resp.StatusCode
+		h.models.expiry = time.Now().Add(modelsCacheTTL)
+		h.models.mu.Unlock()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	w.Write(body)
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, errType, message string) {
@@ -347,6 +414,19 @@ func writeOpenAIError(w http.ResponseWriter, status int, message, errType string
 			"code":    nil,
 		},
 	})
+}
+
+// readBody reads the request body up to maxRequestBodySize. If the body exceeds
+// the limit, it returns an error so callers can return HTTP 413.
+func readBody(r *http.Request) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxRequestBodySize {
+		return nil, fmt.Errorf("request body too large (max %d bytes)", maxRequestBodySize)
+	}
+	return body, nil
 }
 
 // injectParallelToolCalls adds parallel_tool_calls: true to an OpenAI request

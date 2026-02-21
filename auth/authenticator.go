@@ -35,6 +35,12 @@ type Authenticator struct {
 	mu             sync.RWMutex
 	client         *http.Client
 	copilotBaseURL string // overridable for tests; defaults to https://api.github.com
+
+	// DisableAutoDeviceFlow prevents refreshToken from falling through to the
+	// interactive device-code flow. When true, callers (e.g. the menubar app)
+	// are expected to drive the flow themselves via RequestDeviceCode /
+	// PollForAuthorization.
+	DisableAutoDeviceFlow bool
 }
 
 // DeviceCodeResponse is the response from GitHub's device code endpoint.
@@ -84,6 +90,27 @@ func NewAuthenticator(tokenDir string) *Authenticator {
 	}
 }
 
+// IsSignedIn reports whether the authenticator has a GitHub access token
+// either in memory or persisted on disk.
+func (a *Authenticator) IsSignedIn() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.accessToken != "" {
+		return true
+	}
+	return a.hasAccessTokenOnDisk()
+}
+
+// hasAccessTokenOnDisk returns true when the access-token file exists and is
+// non-empty. Must NOT be called with the write lock held.
+func (a *Authenticator) hasAccessTokenOnDisk() bool {
+	data, err := os.ReadFile(filepath.Join(a.tokenDir, "access-token"))
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(data)) != ""
+}
+
 // GetToken returns a valid Copilot API token, refreshing it if necessary.
 // It is safe for concurrent use.
 func (a *Authenticator) GetToken(ctx context.Context) (string, error) {
@@ -115,34 +142,53 @@ func (a *Authenticator) refreshToken(ctx context.Context) error {
 			return nil
 		}
 	}
+	if a.DisableAutoDeviceFlow {
+		return fmt.Errorf("not authenticated")
+	}
 	return a.deviceCodeFlow(ctx)
 }
 
-func (a *Authenticator) deviceCodeFlow(ctx context.Context) error {
+// RequestDeviceCode initiates the GitHub device-code flow by requesting a
+// device code and user code from GitHub. The caller should present the
+// UserCode and VerificationURI to the user, then call PollForAuthorization.
+// No lock is required — only immutable fields (client) are accessed.
+func (a *Authenticator) RequestDeviceCode(ctx context.Context) (*DeviceCodeResponse, error) {
 	data := url.Values{
 		"client_id": {githubClientID},
 		"scope":     {"read:user"},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, deviceCodeURL, strings.NewReader(data.Encode()))
 	if err != nil {
-		return fmt.Errorf("creating device code request: %w", err)
+		return nil, fmt.Errorf("creating device code request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("requesting device code: %w", err)
+		return nil, fmt.Errorf("requesting device code: %w", err)
 	}
 	defer resp.Body.Close()
 
 	var dcResp DeviceCodeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&dcResp); err != nil {
-		return fmt.Errorf("decoding device code response: %w", err)
+		return nil, fmt.Errorf("decoding device code response: %w", err)
 	}
+	return &dcResp, nil
+}
 
-	fmt.Fprintf(os.Stderr, "Please visit %s and enter code: %s\n", dcResp.VerificationURI, dcResp.UserCode)
+// PollForAuthorization polls GitHub until the user authorizes the device code,
+// then saves the access token and exchanges it for a Copilot API token.
+// It acquires the write lock internally.
+func (a *Authenticator) PollForAuthorization(ctx context.Context, dcResp *DeviceCodeResponse) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.pollForAuthorization(ctx, dcResp)
+}
 
+// pollForAuthorization is the internal implementation that must be called with
+// the write lock already held (or from PollForAuthorization which acquires it).
+func (a *Authenticator) pollForAuthorization(ctx context.Context, dcResp *DeviceCodeResponse) error {
 	interval := time.Duration(dcResp.Interval) * time.Second
 	if interval == 0 {
 		interval = 5 * time.Second
@@ -198,6 +244,39 @@ func (a *Authenticator) deviceCodeFlow(ctx context.Context) error {
 	}
 
 	return fmt.Errorf("device code flow timed out")
+}
+
+func (a *Authenticator) deviceCodeFlow(ctx context.Context) error {
+	dcResp, err := a.RequestDeviceCode(ctx)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "Please visit %s and enter code: %s\n", dcResp.VerificationURI, dcResp.UserCode)
+
+	return a.pollForAuthorization(ctx, dcResp)
+}
+
+// SignOut clears all authentication state from memory and removes persisted
+// token files from disk. It is safe for concurrent use.
+func (a *Authenticator) SignOut() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.accessToken = ""
+	a.copilotToken = ""
+	a.tokenExpiry = time.Time{}
+
+	var errs []error
+	for _, name := range []string{"access-token", "api-key.json"} {
+		if err := os.Remove(filepath.Join(a.tokenDir, name)); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("sign out cleanup: %v", errs)
+	}
+	return nil
 }
 
 func (a *Authenticator) getCopilotTokenURL() string {
