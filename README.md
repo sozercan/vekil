@@ -162,7 +162,6 @@ curl http://localhost:1337/v1/models
 | Provider  | Model name             |
 | --------- | ---------------------- |
 | OpenAI    | `gpt-4o`               |
-| OpenAI    | `gpt-4o-mini`          |
 | OpenAI    | `gpt-4.1`             |
 | OpenAI    | `gpt-5-mini`           |
 | OpenAI    | `gpt-5.1`             |
@@ -172,13 +171,13 @@ curl http://localhost:1337/v1/models
 | OpenAI    | `gpt-5.2`             |
 | OpenAI    | `gpt-5.2-codex`       |
 | OpenAI    | `gpt-5.3-codex`       |
+| OpenAI    | `gpt-5.4`             |
 | Anthropic | `claude-haiku-4.5`     |
 | Anthropic | `claude-sonnet-4`      |
 | Anthropic | `claude-sonnet-4.5`    |
 | Anthropic | `claude-sonnet-4.6`    |
 | Anthropic | `claude-opus-4.5`      |
 | Anthropic | `claude-opus-4.6`      |
-| Anthropic | `claude-opus-4.6-fast` |
 | Anthropic | `claude-opus-4.6-1m`   |
 | Google    | `gemini-2.5-pro`       |
 | Google    | `gemini-3-pro-preview` |
