@@ -13,6 +13,7 @@ High-performance Go proxy that exposes Anthropic and OpenAI-compatible APIs, for
 - **Extended thinking** — Anthropic `thinking` parameter is mapped to `max_completion_tokens`
 - **GitHub OAuth device code flow** with automatic token caching and refresh
 - **Automatic retry** with exponential backoff on transient upstream errors (429, 502, 503, 504)
+- **Compressed request bodies** — transparent decompression of `gzip` and `zstd` Content-Encoding (used by Codex CLI)
 - **Structured JSON logging** with configurable log levels
 - **Connection pooling** and HTTP/2 support
 - **Single static binary**, zero runtime dependencies (distroless Docker image)
@@ -76,6 +77,13 @@ Tokens are cached to `~/.config/copilot-proxy/` and automatically refreshed befo
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:1337
 # Claude Code will use the /v1/messages endpoint automatically
+```
+
+### OpenAI Codex CLI
+
+```bash
+export OPENAI_BASE_URL=http://localhost:1337/v1
+codex --model gpt-5.4
 ```
 
 ### Anthropic Messages API

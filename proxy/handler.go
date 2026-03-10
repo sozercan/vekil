@@ -5,16 +5,19 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/klauspost/compress/zstd"
 	"github.com/sozercan/copilot-proxy/auth"
 	"github.com/sozercan/copilot-proxy/logger"
 	"github.com/sozercan/copilot-proxy/models"
@@ -419,7 +422,28 @@ func writeOpenAIError(w http.ResponseWriter, status int, message, errType string
 // readBody reads the request body up to maxRequestBodySize. If the body exceeds
 // the limit, it returns an error so callers can return HTTP 413.
 func readBody(r *http.Request) ([]byte, error) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize+1))
+	var reader io.Reader = r.Body
+
+	// Decompress request body if Content-Encoding is set.
+	// Some clients (e.g., Codex CLI) send compressed request bodies.
+	switch strings.ToLower(r.Header.Get("Content-Encoding")) {
+	case "gzip":
+		gr, err := gzip.NewReader(r.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress gzip body: %w", err)
+		}
+		defer gr.Close()
+		reader = gr
+	case "zstd":
+		zr, err := zstd.NewReader(r.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress zstd body: %w", err)
+		}
+		defer zr.Close()
+		reader = zr
+	}
+
+	body, err := io.ReadAll(io.LimitReader(reader, maxRequestBodySize+1))
 	if err != nil {
 		return nil, err
 	}
