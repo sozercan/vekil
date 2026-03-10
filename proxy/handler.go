@@ -432,7 +432,7 @@ func readBody(r *http.Request) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to decompress gzip body: %w", err)
 		}
-		defer gr.Close()
+		defer func() { _ = gr.Close() }()
 		reader = gr
 	case "zstd":
 		zr, err := zstd.NewReader(r.Body)

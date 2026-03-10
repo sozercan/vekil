@@ -872,15 +872,15 @@ func TestHandleResponses_GzipBody(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"id":"resp-gz","object":"response","status":"completed"}`))
+		_, _ = w.Write([]byte(`{"id":"resp-gz","object":"response","status":"completed"}`))
 	})
 
 	// Gzip-compress the request body
 	responsesReq := `{"model":"gpt-4","input":"Hello"}`
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
-	gw.Write([]byte(responsesReq))
-	gw.Close()
+	_, _ = gw.Write([]byte(responsesReq))
+	_ = gw.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", &buf)
 	req.Header.Set("Content-Type", "application/json")
@@ -908,15 +908,15 @@ func TestHandleResponses_GzipBody(t *testing.T) {
 func TestHandleAnthropicMessages_GzipBody(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		w.Write([]byte("data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\ndata: [DONE]\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\ndata: [DONE]\n\n"))
 	})
 
 	// Gzip-compress an Anthropic request
 	anthropicReq := `{"model":"claude-sonnet-4","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
-	gw.Write([]byte(anthropicReq))
-	gw.Close()
+	_, _ = gw.Write([]byte(anthropicReq))
+	_ = gw.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", &buf)
 	req.Header.Set("Content-Type", "application/json")
@@ -947,7 +947,7 @@ func TestHandleResponses_ZstdBody(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"id":"resp-zstd","object":"response","status":"completed"}`))
+		_, _ = w.Write([]byte(`{"id":"resp-zstd","object":"response","status":"completed"}`))
 	})
 
 	// Zstd-compress the request body
@@ -957,8 +957,8 @@ func TestHandleResponses_ZstdBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create zstd writer: %v", err)
 	}
-	zw.Write([]byte(responsesReq))
-	zw.Close()
+	_, _ = zw.Write([]byte(responsesReq))
+	_ = zw.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", &buf)
 	req.Header.Set("Content-Type", "application/json")
@@ -998,7 +998,7 @@ func TestHandleOpenAIChatCompletions_GzipBody(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(models.OpenAIResponse{
+		_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
 			ID:      "chatcmpl-gz",
 			Object:  "chat.completion",
 			Choices: []models.OpenAIChoice{{Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"Hi"`)}}},
@@ -1008,8 +1008,8 @@ func TestHandleOpenAIChatCompletions_GzipBody(t *testing.T) {
 	reqBody := `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}`
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
-	gw.Write([]byte(reqBody))
-	gw.Close()
+	_, _ = gw.Write([]byte(reqBody))
+	_ = gw.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", &buf)
 	req.Header.Set("Content-Type", "application/json")
@@ -1036,7 +1036,7 @@ func TestHandleOpenAIChatCompletions_ZstdBody(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(models.OpenAIResponse{
+		_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
 			ID:      "chatcmpl-zstd",
 			Object:  "chat.completion",
 			Choices: []models.OpenAIChoice{{Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"Hi"`)}}},
@@ -1046,8 +1046,8 @@ func TestHandleOpenAIChatCompletions_ZstdBody(t *testing.T) {
 	reqBody := `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}`
 	var buf bytes.Buffer
 	zw, _ := zstd.NewWriter(&buf)
-	zw.Write([]byte(reqBody))
-	zw.Close()
+	_, _ = zw.Write([]byte(reqBody))
+	_ = zw.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", &buf)
 	req.Header.Set("Content-Type", "application/json")
