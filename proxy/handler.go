@@ -268,9 +268,13 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	io.Copy(w, resp.Body)
 }
 
-// HandleResponses handles POST /v1/responses by forwarding the request to
-// Copilot's responses endpoint with only auth headers injected.
+// HandleResponses handles POST /v1/responses and sub-paths (e.g., /v1/responses/compact)
+// by forwarding the request to Copilot's responses endpoint with only auth headers injected.
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
+	// Preserve the sub-path after /v1/ for upstream forwarding.
+	// e.g., /v1/responses → /responses, /v1/responses/compact → /responses/compact
+	upstreamPath := strings.TrimPrefix(r.URL.Path, "/v1")
+
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error")
@@ -299,7 +303,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	defer upstreamCancel()
 
 	resp, err := h.doWithRetry(func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, h.copilotURL+"/responses", bytes.NewReader(bodyBytes))
+		req, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, h.copilotURL+upstreamPath, bytes.NewReader(bodyBytes))
 		if err != nil {
 			return nil, err
 		}

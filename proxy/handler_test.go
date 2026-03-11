@@ -295,6 +295,39 @@ func TestHandleResponses(t *testing.T) {
 	}
 }
 
+func TestHandleResponses_SubPath(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses/compact" {
+			t.Errorf("expected upstream path /responses/compact, got %q", r.URL.Path)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-compact","object":"response","status":"completed"}`))
+	})
+
+	reqBody := `{"model":"gpt-5.4","input":"Hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if result["id"] != "resp-compact" {
+		t.Errorf("expected id resp-compact, got %v", result["id"])
+	}
+}
+
 func TestSetCopilotHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/test", nil)
 	setCopilotHeaders(req, "my-test-token")
