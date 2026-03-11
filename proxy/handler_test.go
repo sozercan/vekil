@@ -399,6 +399,90 @@ func TestHandleCompact_AppendsToExistingInstructions(t *testing.T) {
 	}
 }
 
+func TestHandleMemorySummarize(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Errorf("expected upstream path /responses, got %q", r.URL.Path)
+		}
+
+		// Return a response with the model's JSON summary
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"[{\"trace_summary\":\"User asked to fix a bug in auth module\",\"memory_summary\":\"Fixed auth bug\"}]"}]}]}`))
+	})
+
+	reqBody := `{"model":"gpt-5.4","traces":[{"id":"t1","metadata":{"source_path":"/tmp/trace.json"},"items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the bug"}]}]}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/memories/trace_summarize", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleMemorySummarize(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Output []struct {
+			TraceSummary   string `json:"trace_summary"`
+			MemorySummary  string `json:"memory_summary"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if len(result.Output) != 1 {
+		t.Fatalf("expected 1 output, got %d", len(result.Output))
+	}
+	if result.Output[0].TraceSummary == "" {
+		t.Error("expected non-empty trace_summary")
+	}
+	if result.Output[0].MemorySummary == "" {
+		t.Error("expected non-empty memory_summary")
+	}
+}
+
+func TestHandleMemorySummarize_FallbackOnInvalidJSON(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		// Model returns plain text instead of JSON
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"This is a plain text summary, not JSON"}]}]}`))
+	})
+
+	reqBody := `{"model":"gpt-5.4","traces":[{"id":"t1","metadata":{"source_path":"/tmp/trace.json"},"items":[]}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/memories/trace_summarize", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleMemorySummarize(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Output []struct {
+			TraceSummary   string `json:"trace_summary"`
+			MemorySummary  string `json:"memory_summary"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if len(result.Output) != 1 {
+		t.Fatalf("expected 1 output, got %d", len(result.Output))
+	}
+	// Fallback: raw text used for both fields
+	if result.Output[0].TraceSummary == "" {
+		t.Error("expected fallback trace_summary")
+	}
+}
+
 func TestSetCopilotHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/test", nil)
 	setCopilotHeaders(req, "my-test-token")

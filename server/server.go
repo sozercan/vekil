@@ -28,6 +28,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("POST /v1/chat/completions", handler.HandleOpenAIChatCompletions)
 	mux.HandleFunc("POST /v1/responses/compact", handler.HandleCompact)
 	mux.HandleFunc("POST /v1/responses", handler.HandleResponses)
+	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)
 

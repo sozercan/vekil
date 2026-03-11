@@ -465,6 +465,177 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(compactResp)
 }
 
+// memorySummarizePrompt is the system instruction used to summarize conversation
+// traces into memory entries when the upstream does not support the
+// /memories/trace_summarize endpoint natively.
+const memorySummarizePrompt = `You are summarizing a past coding session trace for future reference.
+
+For each trace provided, produce TWO outputs:
+1. "trace_summary": A detailed summary of what happened in the session — key actions, decisions, files modified, errors encountered, and outcomes.
+2. "memory_summary": A concise, high-level summary (1-3 sentences) suitable for injecting into a future session as context.
+
+Respond with a JSON array where each element has "trace_summary" and "memory_summary" fields. Output ONLY valid JSON, no markdown fences.`
+
+// HandleMemorySummarize handles POST /v1/memories/trace_summarize by sending
+// the traces to the upstream /responses endpoint with a summarization prompt,
+// then transforming the response into the format Codex expects.
+func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Request) {
+	token, err := h.auth.GetToken(r.Context())
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error")
+		return
+	}
+
+	bodyBytes, err := readBody(r)
+	if err != nil {
+		status := http.StatusBadRequest
+		if len(bodyBytes) == 0 {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
+		return
+	}
+	defer func() { _ = r.Body.Close() }()
+
+	// Parse the memory summarize request.
+	var memReq struct {
+		Model      string            `json:"model"`
+		Traces     []json.RawMessage `json:"traces"`
+		Reasoning  json.RawMessage   `json:"reasoning,omitempty"`
+	}
+	if err := json.Unmarshal(bodyBytes, &memReq); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
+		return
+	}
+
+	// Build a /responses request with the traces as user input.
+	tracesJSON, _ := json.Marshal(memReq.Traces)
+	userContent := "Summarize the following session traces:\n\n" + string(tracesJSON)
+
+	responsesReq := map[string]interface{}{
+		"model":        memReq.Model,
+		"instructions": memorySummarizePrompt,
+		"input": []map[string]interface{}{
+			{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": userContent},
+				},
+			},
+		},
+	}
+	reqBody, _ := json.Marshal(responsesReq)
+
+	upstreamCtx, upstreamCancel := context.WithTimeout(context.Background(), upstreamTimeout)
+	defer upstreamCancel()
+
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, h.copilotURL+"/responses", bytes.NewReader(reqBody))
+		if err != nil {
+			return nil, err
+		}
+		setCopilotHeaders(req, token)
+		return req, nil
+	})
+	if err != nil {
+		status := http.StatusBadGateway
+		if ue, ok := err.(*upstreamError); ok {
+			status = ue.statusCode
+		}
+		writeOpenAIError(w, status, fmt.Sprintf("upstream request failed: %v", err), "server_error")
+		return
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+		return
+	}
+
+	// Extract text from upstream response.
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
+		return
+	}
+
+	var upstream struct {
+		Output []json.RawMessage `json:"output"`
+	}
+	if err := json.Unmarshal(respBody, &upstream); err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "failed to parse upstream response", "server_error")
+		return
+	}
+
+	var summaryText string
+	for _, item := range upstream.Output {
+		var outputItem struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		}
+		if err := json.Unmarshal(item, &outputItem); err != nil {
+			continue
+		}
+		if outputItem.Type == "message" {
+			for _, c := range outputItem.Content {
+				if (c.Type == "output_text" || c.Type == "text") && c.Text != "" {
+					summaryText += c.Text
+				}
+			}
+		}
+	}
+
+	// Try to parse the model's response as a JSON array of summaries.
+	// Strip markdown code fences if present.
+	cleaned := strings.TrimSpace(summaryText)
+	cleaned = strings.TrimPrefix(cleaned, "```json")
+	cleaned = strings.TrimPrefix(cleaned, "```")
+	cleaned = strings.TrimSuffix(cleaned, "```")
+	cleaned = strings.TrimSpace(cleaned)
+
+	type memorySummary struct {
+		TraceSummary   string `json:"trace_summary"`
+		MemorySummary  string `json:"memory_summary"`
+	}
+	var summaries []memorySummary
+	if err := json.Unmarshal([]byte(cleaned), &summaries); err != nil {
+		// Fallback: if the model didn't return valid JSON, use the raw text
+		// as both summary fields for each trace.
+		summaries = make([]memorySummary, len(memReq.Traces))
+		for i := range summaries {
+			summaries[i] = memorySummary{
+				TraceSummary:  cleaned,
+				MemorySummary: cleaned,
+			}
+		}
+	}
+
+	// Pad or trim to match the number of input traces.
+	for len(summaries) < len(memReq.Traces) {
+		summaries = append(summaries, memorySummary{
+			TraceSummary:  "No summary available.",
+			MemorySummary: "No summary available.",
+		})
+	}
+	summaries = summaries[:len(memReq.Traces)]
+
+	memResp := struct {
+		Output []memorySummary `json:"output"`
+	}{
+		Output: summaries,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(memResp)
+}
+
 // HandleHealthz handles GET /healthz and returns {"status":"ok"}.
 func (h *ProxyHandler) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
