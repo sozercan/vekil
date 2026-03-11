@@ -268,13 +268,9 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	io.Copy(w, resp.Body)
 }
 
-// HandleResponses handles POST /v1/responses and sub-paths (e.g., /v1/responses/compact)
-// by forwarding the request to Copilot's responses endpoint with only auth headers injected.
+// HandleResponses handles POST /v1/responses by forwarding the request to
+// Copilot's responses endpoint with only auth headers injected.
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
-	// Preserve the sub-path after /v1/ for upstream forwarding.
-	// e.g., /v1/responses → /responses, /v1/responses/compact → /responses/compact
-	upstreamPath := strings.TrimPrefix(r.URL.Path, "/v1")
-
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error")
@@ -303,7 +299,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	defer upstreamCancel()
 
 	resp, err := h.doWithRetry(func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, h.copilotURL+upstreamPath, bytes.NewReader(bodyBytes))
+		req, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, h.copilotURL+"/responses", bytes.NewReader(bodyBytes))
 		if err != nil {
 			return nil, err
 		}
@@ -328,6 +324,80 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+// compactPrompt is the system instruction used when the upstream does not
+// support the /responses/compact endpoint natively.  The proxy converts
+// the compact request into a regular /responses call with this prompt so
+// the model produces a summarised conversation that Codex can resume from.
+const compactPrompt = `You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
+
+Include:
+- Current progress and key decisions made
+- Important context, constraints, or user preferences
+- What remains to be done (clear next steps)
+- Any critical data, examples, or references needed to continue
+
+Be concise, structured, and focused on helping the next LLM seamlessly continue the work.`
+
+// HandleCompact handles POST /v1/responses/compact by forwarding the request
+// to the upstream /responses endpoint with a compaction system prompt injected.
+// If the upstream supports /responses/compact natively, the request is forwarded
+// as-is; otherwise the proxy rewrites the request as a regular /responses call.
+func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
+	token, err := h.auth.GetToken(r.Context())
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error")
+		return
+	}
+
+	bodyBytes, err := readBody(r)
+	if err != nil {
+		status := http.StatusBadRequest
+		if len(bodyBytes) == 0 {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
+		return
+	}
+	defer func() { _ = r.Body.Close() }()
+
+	// Inject the compaction prompt as instructions if not already set.
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
+		return
+	}
+	if _, ok := body["instructions"]; !ok {
+		prompt, _ := json.Marshal(compactPrompt)
+		body["instructions"] = prompt
+	}
+	bodyBytes, _ = json.Marshal(body)
+
+	upstreamCtx, upstreamCancel := context.WithTimeout(context.Background(), upstreamTimeout)
+	defer upstreamCancel()
+
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, h.copilotURL+"/responses", bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, err
+		}
+		setCopilotHeaders(req, token)
+		return req, nil
+	})
+	if err != nil {
+		status := http.StatusBadGateway
+		if ue, ok := err.(*upstreamError); ok {
+			status = ue.statusCode
+		}
+		writeOpenAIError(w, status, fmt.Sprintf("upstream request failed: %v", err), "server_error")
+		return
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 // HandleHealthz handles GET /healthz and returns {"status":"ok"}.

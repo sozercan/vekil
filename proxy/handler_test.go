@@ -295,22 +295,32 @@ func TestHandleResponses(t *testing.T) {
 	}
 }
 
-func TestHandleResponses_SubPath(t *testing.T) {
+func TestHandleCompact(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/responses/compact" {
-			t.Errorf("expected upstream path /responses/compact, got %q", r.URL.Path)
+		if r.URL.Path != "/responses" {
+			t.Errorf("expected upstream path /responses, got %q", r.URL.Path)
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+		instructions, ok := req["instructions"].(string)
+		if !ok || instructions == "" {
+			t.Error("expected instructions to be injected for compact")
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"resp-compact","object":"response","status":"completed"}`))
+		_, _ = w.Write([]byte(`{"id":"resp-compact","object":"response.compaction","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"compacted summary"}]}]}`))
 	})
 
-	reqBody := `{"model":"gpt-5.4","input":"Hello"}`
+	reqBody := `{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
-	handler.HandleResponses(w, req)
+	handler.HandleCompact(w, req)
 
 	resp := w.Result()
 	if resp.StatusCode != http.StatusOK {
@@ -325,6 +335,34 @@ func TestHandleResponses_SubPath(t *testing.T) {
 	}
 	if result["id"] != "resp-compact" {
 		t.Errorf("expected id resp-compact, got %v", result["id"])
+	}
+}
+
+func TestHandleCompact_PreservesExistingInstructions(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+		if req["instructions"] != "custom prompt" {
+			t.Errorf("expected original instructions preserved, got %v", req["instructions"])
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-compact","object":"response.compaction","output":[]}`))
+	})
+
+	reqBody := `{"model":"gpt-5.4","input":"Hello","instructions":"custom prompt"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	if w.Result().StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(w.Result().Body)
+		t.Fatalf("expected 200, got %d: %s", w.Result().StatusCode, body)
 	}
 }
 
