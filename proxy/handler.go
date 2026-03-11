@@ -362,20 +362,17 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = r.Body.Close() }()
 
-	// Append the compaction prompt to instructions so the model produces
-	// a summary. Codex always sends its base instructions, so we append
-	// rather than replace.
+	// Replace instructions with the compaction prompt. The conversation
+	// history in the input array already contains all context — the model
+	// just needs to know its job is to produce a handoff summary, not
+	// continue acting as a coding assistant.
 	var body map[string]json.RawMessage
 	if err := json.Unmarshal(bodyBytes, &body); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
 		return
 	}
-	var existing string
-	if raw, ok := body["instructions"]; ok {
-		_ = json.Unmarshal(raw, &existing)
-	}
-	combined, _ := json.Marshal(existing + "\n\n" + compactPrompt)
-	body["instructions"] = combined
+	prompt, _ := json.Marshal(compactPrompt)
+	body["instructions"] = prompt
 	bodyBytes, _ = json.Marshal(body)
 
 	upstreamCtx, upstreamCancel := context.WithTimeout(context.Background(), upstreamTimeout)
