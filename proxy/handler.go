@@ -644,6 +644,8 @@ func (h *ProxyHandler) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 
 // HandleModels handles GET /v1/models by proxying to the upstream Copilot API.
 // Responses are cached for modelsCacheTTL to avoid repeated upstream calls.
+// The response includes both the standard OpenAI "data" field and a Codex-compatible
+// "models" field so that both OpenAI SDK clients and Codex CLI can parse it.
 func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	// Check cache first
 	h.models.mu.RLock()
@@ -653,7 +655,7 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 		h.models.mu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		w.Write(body)
+		_, _ = w.Write(body)
 		return
 	}
 	h.models.mu.RUnlock()
@@ -679,12 +681,17 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadGateway, fmt.Sprintf("upstream request failed: %v", err), "server_error")
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
 		return
+	}
+
+	// Transform the response to include a Codex-compatible "models" field.
+	if resp.StatusCode == http.StatusOK {
+		body = transformModelsResponse(body)
 	}
 
 	// Cache successful responses
@@ -698,7 +705,151 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
-	w.Write(body)
+	_, _ = w.Write(body)
+}
+
+// transformModelsResponse adds a Codex-compatible "models" field to the
+// upstream Copilot /models response. The original "data" and "object" fields
+// are preserved for standard OpenAI SDK compatibility.
+func transformModelsResponse(body []byte) []byte {
+	var upstream struct {
+		Data   []json.RawMessage `json:"data"`
+		Object string            `json:"object"`
+	}
+	if err := json.Unmarshal(body, &upstream); err != nil || len(upstream.Data) == 0 {
+		return body
+	}
+
+	type reasoningPreset struct {
+		Effort      string `json:"effort"`
+		Description string `json:"description"`
+	}
+	type truncationPolicy struct {
+		Mode  string `json:"mode"`
+		Limit int64  `json:"limit"`
+	}
+	type codexModel struct {
+		Slug                      string            `json:"slug"`
+		DisplayName               string            `json:"display_name"`
+		Description               string            `json:"description"`
+		DefaultReasoningLevel     *string           `json:"default_reasoning_level,omitempty"`
+		SupportedReasoningLevels  []reasoningPreset `json:"supported_reasoning_levels"`
+		ShellType                 string            `json:"shell_type"`
+		Visibility                string            `json:"visibility"`
+		SupportedInAPI            bool              `json:"supported_in_api"`
+		Priority                  int               `json:"priority"`
+		BaseInstructions          string            `json:"base_instructions"`
+		SupportsReasoningSummaries bool             `json:"supports_reasoning_summaries"`
+		SupportVerbosity          bool              `json:"support_verbosity"`
+		TruncationPolicy          truncationPolicy  `json:"truncation_policy"`
+		SupportsParallelToolCalls bool              `json:"supports_parallel_tool_calls"`
+		SupportsImageDetailOriginal bool            `json:"supports_image_detail_original"`
+		ContextWindow             *int64            `json:"context_window,omitempty"`
+		ExperimentalSupportedTools []string         `json:"experimental_supported_tools"`
+		InputModalities           []string          `json:"input_modalities"`
+	}
+
+	var codexModels []codexModel
+	for _, raw := range upstream.Data {
+		var m struct {
+			ID           string `json:"id"`
+			Name         string `json:"name"`
+			Capabilities struct {
+				Limits struct {
+					MaxContextWindowTokens int64 `json:"max_context_window_tokens"`
+				} `json:"limits"`
+				Supports struct {
+					ParallelToolCalls bool     `json:"parallel_tool_calls"`
+					ReasoningEffort   []string `json:"reasoning_effort"`
+					Vision            bool     `json:"vision"`
+					ToolCalls         bool     `json:"tool_calls"`
+				} `json:"supports"`
+			} `json:"capabilities"`
+			ModelPickerEnabled  bool   `json:"model_picker_enabled"`
+			ModelPickerCategory string `json:"model_picker_category"`
+		}
+		if err := json.Unmarshal(raw, &m); err != nil {
+			continue
+		}
+
+		visibility := "hide"
+		if m.ModelPickerEnabled {
+			visibility = "list"
+		}
+
+		var reasoningLevels []reasoningPreset
+		var defaultReasoning *string
+		for _, level := range m.Capabilities.Supports.ReasoningEffort {
+			reasoningLevels = append(reasoningLevels, reasoningPreset{
+				Effort:      level,
+				Description: level,
+			})
+		}
+		if len(reasoningLevels) > 0 {
+			mid := "medium"
+			defaultReasoning = &mid
+		}
+
+		var ctxWindow *int64
+		if m.Capabilities.Limits.MaxContextWindowTokens > 0 {
+			v := m.Capabilities.Limits.MaxContextWindowTokens
+			ctxWindow = &v
+		}
+
+		modalities := []string{"text"}
+		if m.Capabilities.Supports.Vision {
+			modalities = append(modalities, "image")
+		}
+
+		priority := 10
+		switch m.ModelPickerCategory {
+		case "powerful":
+			priority = 0
+		case "versatile":
+			priority = 5
+		case "lightweight":
+			priority = 8
+		}
+
+		cm := codexModel{
+			Slug:                       m.ID,
+			DisplayName:                m.Name,
+			Description:                m.Name,
+			DefaultReasoningLevel:      defaultReasoning,
+			SupportedReasoningLevels:   reasoningLevels,
+			ShellType:                  "shell_command",
+			Visibility:                 visibility,
+			SupportedInAPI:             true,
+			Priority:                   priority,
+			BaseInstructions:           "",
+			SupportsReasoningSummaries: len(reasoningLevels) > 0,
+			SupportVerbosity:           false,
+			TruncationPolicy:           truncationPolicy{Mode: "bytes", Limit: 10000},
+			SupportsParallelToolCalls:  m.Capabilities.Supports.ParallelToolCalls,
+			SupportsImageDetailOriginal: false,
+			ContextWindow:              ctxWindow,
+			ExperimentalSupportedTools: []string{},
+			InputModalities:            modalities,
+		}
+		codexModels = append(codexModels, cm)
+	}
+
+	// Build combined response with both "data" (OpenAI) and "models" (Codex).
+	result := struct {
+		Data   []json.RawMessage `json:"data"`
+		Object string            `json:"object"`
+		Models []codexModel      `json:"models"`
+	}{
+		Data:   upstream.Data,
+		Object: upstream.Object,
+		Models: codexModels,
+	}
+
+	out, err := json.Marshal(result)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, errType, message string) {

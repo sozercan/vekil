@@ -550,7 +550,7 @@ func TestHandleModels(t *testing.T) {
 				t.Errorf("expected Authorization header 'Bearer test-token', got %q", got)
 			}
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4o","object":"model","created":0,"owned_by":"github-copilot"},{"id":"claude-sonnet-4","object":"model","created":0,"owned_by":"github-copilot"}]}`))
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4o","object":"model","created":0,"owned_by":"github-copilot","capabilities":{"supports":{"parallel_tool_calls":true,"vision":true},"limits":{"max_context_window_tokens":128000}},"model_picker_enabled":true,"model_picker_category":"versatile","name":"GPT-4o"},{"id":"claude-sonnet-4","object":"model","created":0,"owned_by":"github-copilot","name":"Claude Sonnet 4"}]}`))
 		})
 		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 		w := httptest.NewRecorder()
@@ -568,6 +568,14 @@ func TestHandleModels(t *testing.T) {
 			Data   []struct {
 				ID string `json:"id"`
 			} `json:"data"`
+			Models []struct {
+				Slug                     string `json:"slug"`
+				DisplayName              string `json:"display_name"`
+				Visibility               string `json:"visibility"`
+				ContextWindow            *int64 `json:"context_window"`
+				SupportsParallelToolCalls bool  `json:"supports_parallel_tool_calls"`
+				ShellType                string `json:"shell_type"`
+			} `json:"models"`
 		}
 		if err := json.Unmarshal(body, &result); err != nil {
 			t.Fatalf("invalid JSON: %v", err)
@@ -576,13 +584,36 @@ func TestHandleModels(t *testing.T) {
 			t.Errorf("expected object list, got %q", result.Object)
 		}
 		if len(result.Data) != 2 {
-			t.Fatalf("expected 2 models, got %d", len(result.Data))
+			t.Fatalf("expected 2 data entries, got %d", len(result.Data))
 		}
 		if result.Data[0].ID != "gpt-4o" {
 			t.Errorf("expected first model gpt-4o, got %q", result.Data[0].ID)
 		}
-		if result.Data[1].ID != "claude-sonnet-4" {
-			t.Errorf("expected second model claude-sonnet-4, got %q", result.Data[1].ID)
+		// Verify Codex-compatible models field
+		if len(result.Models) != 2 {
+			t.Fatalf("expected 2 models entries, got %d", len(result.Models))
+		}
+		if result.Models[0].Slug != "gpt-4o" {
+			t.Errorf("expected first model slug gpt-4o, got %q", result.Models[0].Slug)
+		}
+		if result.Models[0].DisplayName != "GPT-4o" {
+			t.Errorf("expected display_name GPT-4o, got %q", result.Models[0].DisplayName)
+		}
+		if result.Models[0].Visibility != "list" {
+			t.Errorf("expected visibility list, got %q", result.Models[0].Visibility)
+		}
+		if result.Models[0].ContextWindow == nil || *result.Models[0].ContextWindow != 128000 {
+			t.Errorf("expected context_window 128000, got %v", result.Models[0].ContextWindow)
+		}
+		if !result.Models[0].SupportsParallelToolCalls {
+			t.Error("expected supports_parallel_tool_calls true")
+		}
+		if result.Models[0].ShellType != "shell_command" {
+			t.Errorf("expected shell_type shell_command, got %q", result.Models[0].ShellType)
+		}
+		// Second model should have visibility "hide" (model_picker_enabled not set)
+		if result.Models[1].Visibility != "hide" {
+			t.Errorf("expected second model visibility hide, got %q", result.Models[1].Visibility)
 		}
 	})
 
