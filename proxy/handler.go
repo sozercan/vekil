@@ -442,15 +442,27 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build the compact response format Codex expects.
-	type compactionItem struct {
-		Type             string `json:"type"`
-		EncryptedContent string `json:"encrypted_content"`
+	// Build the compact response format Codex expects: an assistant message
+	// with the summary text followed by a compaction item.
+	type contentPart struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	type outputItem struct {
+		Type             string        `json:"type"`
+		Role             string        `json:"role,omitempty"`
+		Content          []contentPart `json:"content,omitempty"`
+		EncryptedContent string        `json:"encrypted_content,omitempty"`
 	}
 	compactResp := struct {
-		Output []compactionItem `json:"output"`
+		Output []outputItem `json:"output"`
 	}{
-		Output: []compactionItem{
+		Output: []outputItem{
+			{
+				Type:    "message",
+				Role:    "assistant",
+				Content: []contentPart{{Type: "output_text", Text: summaryText}},
+			},
 			{
 				Type:             "compaction",
 				EncryptedContent: summaryText,

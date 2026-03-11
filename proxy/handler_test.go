@@ -333,20 +333,36 @@ func TestHandleCompact(t *testing.T) {
 	var result struct {
 		Output []struct {
 			Type             string `json:"type"`
+			Role             string `json:"role"`
 			EncryptedContent string `json:"encrypted_content"`
+			Content          []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
 		} `json:"output"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
 		t.Fatalf("failed to parse response: %v", err)
 	}
-	if len(result.Output) != 1 {
-		t.Fatalf("expected 1 output item, got %d", len(result.Output))
+	if len(result.Output) != 2 {
+		t.Fatalf("expected 2 output items (message + compaction), got %d", len(result.Output))
 	}
-	if result.Output[0].Type != "compaction" {
-		t.Errorf("expected type compaction, got %q", result.Output[0].Type)
+	// First item: assistant message with summary
+	if result.Output[0].Type != "message" {
+		t.Errorf("expected first item type message, got %q", result.Output[0].Type)
 	}
-	if result.Output[0].EncryptedContent != "compacted summary of conversation" {
-		t.Errorf("expected encrypted_content to contain summary, got %q", result.Output[0].EncryptedContent)
+	if result.Output[0].Role != "assistant" {
+		t.Errorf("expected role assistant, got %q", result.Output[0].Role)
+	}
+	if len(result.Output[0].Content) == 0 || result.Output[0].Content[0].Text != "compacted summary of conversation" {
+		t.Errorf("expected summary text in message content, got %+v", result.Output[0].Content)
+	}
+	// Second item: compaction with encrypted_content
+	if result.Output[1].Type != "compaction" {
+		t.Errorf("expected second item type compaction, got %q", result.Output[1].Type)
+	}
+	if result.Output[1].EncryptedContent != "compacted summary of conversation" {
+		t.Errorf("expected encrypted_content to contain summary, got %q", result.Output[1].EncryptedContent)
 	}
 }
 
@@ -395,8 +411,14 @@ func TestHandleCompact_ReplacesInstructions(t *testing.T) {
 	if err := json.Unmarshal(body, &result); err != nil {
 		t.Fatalf("failed to parse compact response: %v", err)
 	}
-	if len(result.Output) != 1 || result.Output[0].Type != "compaction" {
-		t.Errorf("expected compaction output item, got %+v", result.Output)
+	if len(result.Output) != 2 {
+		t.Fatalf("expected 2 output items, got %d", len(result.Output))
+	}
+	if result.Output[0].Type != "message" {
+		t.Errorf("expected first item type message, got %q", result.Output[0].Type)
+	}
+	if result.Output[1].Type != "compaction" {
+		t.Errorf("expected second item type compaction, got %q", result.Output[1].Type)
 	}
 }
 
