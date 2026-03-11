@@ -311,8 +311,9 @@ func TestHandleCompact(t *testing.T) {
 			t.Error("expected instructions to be injected for compact")
 		}
 
+		// Return a standard /responses response — the handler should transform it
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"resp-compact","object":"response.compaction","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"compacted summary"}]}]}`))
+		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"compacted summary of conversation"}]}]}`))
 	})
 
 	reqBody := `{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}]}`
@@ -329,12 +330,23 @@ func TestHandleCompact(t *testing.T) {
 	}
 
 	body, _ := io.ReadAll(resp.Body)
-	var result map[string]interface{}
+	var result struct {
+		Output []struct {
+			Type             string `json:"type"`
+			EncryptedContent string `json:"encrypted_content"`
+		} `json:"output"`
+	}
 	if err := json.Unmarshal(body, &result); err != nil {
 		t.Fatalf("failed to parse response: %v", err)
 	}
-	if result["id"] != "resp-compact" {
-		t.Errorf("expected id resp-compact, got %v", result["id"])
+	if len(result.Output) != 1 {
+		t.Fatalf("expected 1 output item, got %d", len(result.Output))
+	}
+	if result.Output[0].Type != "compaction" {
+		t.Errorf("expected type compaction, got %q", result.Output[0].Type)
+	}
+	if result.Output[0].EncryptedContent != "compacted summary of conversation" {
+		t.Errorf("expected encrypted_content to contain summary, got %q", result.Output[0].EncryptedContent)
 	}
 }
 
@@ -350,7 +362,7 @@ func TestHandleCompact_PreservesExistingInstructions(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"resp-compact","object":"response.compaction","output":[]}`))
+		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"custom summary"}]}]}`))
 	})
 
 	reqBody := `{"model":"gpt-5.4","input":"Hello","instructions":"custom prompt"}`
@@ -363,6 +375,20 @@ func TestHandleCompact_PreservesExistingInstructions(t *testing.T) {
 	if w.Result().StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(w.Result().Body)
 		t.Fatalf("expected 200, got %d: %s", w.Result().StatusCode, body)
+	}
+
+	body, _ := io.ReadAll(w.Result().Body)
+	var result struct {
+		Output []struct {
+			Type             string `json:"type"`
+			EncryptedContent string `json:"encrypted_content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to parse compact response: %v", err)
+	}
+	if len(result.Output) != 1 || result.Output[0].Type != "compaction" {
+		t.Errorf("expected compaction output item, got %+v", result.Output)
 	}
 }
 

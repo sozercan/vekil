@@ -342,8 +342,8 @@ Be concise, structured, and focused on helping the next LLM seamlessly continue 
 
 // HandleCompact handles POST /v1/responses/compact by forwarding the request
 // to the upstream /responses endpoint with a compaction system prompt injected.
-// If the upstream supports /responses/compact natively, the request is forwarded
-// as-is; otherwise the proxy rewrites the request as a regular /responses call.
+// The upstream response is then transformed into the compact response format
+// that Codex expects: {"output": [{"type": "compaction", "encrypted_content": "..."}]}.
 func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
@@ -395,9 +395,70 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	}
 
 	defer func() { _ = resp.Body.Close() }()
-	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+		return
+	}
+
+	// Parse the upstream /responses response and transform it into the
+	// compact format Codex expects.
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
+		return
+	}
+
+	var upstream struct {
+		Output []json.RawMessage `json:"output"`
+	}
+	if err := json.Unmarshal(respBody, &upstream); err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "failed to parse upstream response", "server_error")
+		return
+	}
+
+	// Extract text from the assistant's output to use as the compaction summary.
+	var summaryText string
+	for _, item := range upstream.Output {
+		var outputItem struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		}
+		if err := json.Unmarshal(item, &outputItem); err != nil {
+			continue
+		}
+		if outputItem.Type == "message" {
+			for _, c := range outputItem.Content {
+				if (c.Type == "output_text" || c.Type == "text") && c.Text != "" {
+					summaryText += c.Text
+				}
+			}
+		}
+	}
+
+	// Build the compact response format Codex expects.
+	type compactionItem struct {
+		Type             string `json:"type"`
+		EncryptedContent string `json:"encrypted_content"`
+	}
+	compactResp := struct {
+		Output []compactionItem `json:"output"`
+	}{
+		Output: []compactionItem{
+			{
+				Type:             "compaction",
+				EncryptedContent: summaryText,
+			},
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(compactResp)
 }
 
 // HandleHealthz handles GET /healthz and returns {"status":"ok"}.
