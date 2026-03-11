@@ -39,11 +39,8 @@ jobs:
           files: copilot-proxy-*
 
   macos-app:
-    runs-on: macos-latest
+    runs-on: macos-26
     needs: release
-    strategy:
-      matrix:
-        goarch: [arm64, amd64]
     steps:
       - uses: actions/checkout@v4
 
@@ -52,15 +49,15 @@ jobs:
           go-version-file: go.mod
 
       - name: Build macOS menubar app
-        run: GOARCH=${{ matrix.goarch }} make build-app
+        run: GOARCH=arm64 make build-app
 
       - name: Zip app bundle
-        run: zip -r "Copilot-Proxy-macos-${{ matrix.goarch }}.zip" "Copilot Proxy.app"
+        run: zip -r "Copilot-Proxy-macos-arm64.zip" "Copilot Proxy.app"
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: "Copilot-Proxy-macos-${{ matrix.goarch }}.zip"
+          files: "Copilot-Proxy-macos-arm64.zip"
 
   publish:
     runs-on: ubuntu-latest
