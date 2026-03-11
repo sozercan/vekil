@@ -350,15 +350,22 @@ func TestHandleCompact(t *testing.T) {
 	}
 }
 
-func TestHandleCompact_PreservesExistingInstructions(t *testing.T) {
+func TestHandleCompact_AppendsToExistingInstructions(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		var req map[string]interface{}
 		if err := json.Unmarshal(body, &req); err != nil {
 			t.Fatalf("upstream received invalid JSON: %v", err)
 		}
-		if req["instructions"] != "custom prompt" {
-			t.Errorf("expected original instructions preserved, got %v", req["instructions"])
+		instructions, ok := req["instructions"].(string)
+		if !ok {
+			t.Fatal("expected instructions to be a string")
+		}
+		if !strings.Contains(instructions, "custom prompt") {
+			t.Errorf("expected original instructions preserved, got %q", instructions)
+		}
+		if !strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
+			t.Errorf("expected compaction prompt appended, got %q", instructions)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
