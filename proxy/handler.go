@@ -8,6 +8,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,6 +33,9 @@ const (
 	modelsUpstreamTimeout = 30 * time.Second
 	// modelsCacheTTL is how long the /models response is cached.
 	modelsCacheTTL = 5 * time.Minute
+	// syntheticCompactionPrefix marks proxy-owned compaction payloads so they
+	// can be expanded back into normal context on subsequent /responses calls.
+	syntheticCompactionPrefix = "copilot-proxy.compaction.v1:"
 )
 
 // modelsCache holds a cached /models response to avoid repeated upstream calls.
@@ -288,6 +292,14 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
+	if rewrittenBody, rewriteCount := rewriteSyntheticCompactionRequest(bodyBytes); rewriteCount > 0 {
+		bodyBytes = rewrittenBody
+		h.log.Debug("rewrote compaction items",
+			logger.F("endpoint", "responses"),
+			logger.F("count", rewriteCount),
+		)
+	}
+
 	// Detect if the client requested streaming
 	var partial struct {
 		Stream *bool `json:"stream,omitempty"`
@@ -327,9 +339,10 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 }
 
 // compactPrompt is the system instruction used when the upstream does not
-// support the /responses/compact endpoint natively.  The proxy converts
-// the compact request into a regular /responses call with this prompt so
-// the model produces a summarised conversation that Codex can resume from.
+// support the /responses/compact endpoint natively. The proxy converts the
+// compact request into a regular /responses call with this prompt so the
+// model produces a summarized handoff. The resulting compaction item is a
+// proxy-owned opaque token rather than a real upstream-encrypted payload.
 const compactPrompt = `You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
 
 Include:
@@ -343,7 +356,8 @@ Be concise, structured, and focused on helping the next LLM seamlessly continue 
 // HandleCompact handles POST /v1/responses/compact by forwarding the request
 // to the upstream /responses endpoint with a compaction system prompt injected.
 // The upstream response is then transformed into the compact response format
-// that Codex expects: {"output": [{"type": "compaction", "encrypted_content": "..."}]}.
+// that Codex expects. The returned compaction item is a proxy-owned token that
+// this proxy can later expand back into summarized context for /responses.
 func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
@@ -361,6 +375,14 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+
+	if rewrittenBody, rewriteCount := rewriteSyntheticCompactionRequest(bodyBytes); rewriteCount > 0 {
+		bodyBytes = rewrittenBody
+		h.log.Debug("rewrote compaction items",
+			logger.F("endpoint", "responses/compact"),
+			logger.F("count", rewriteCount),
+		)
+	}
 
 	// Replace instructions with the compaction prompt. The conversation
 	// history in the input array already contains all context — the model
@@ -465,7 +487,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 			},
 			{
 				Type:             "compaction",
-				EncryptedContent: summaryText,
+				EncryptedContent: encodeSyntheticCompaction(summaryText),
 			},
 		},
 	}
@@ -508,9 +530,9 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 
 	// Parse the memory summarize request.
 	var memReq struct {
-		Model      string            `json:"model"`
-		Traces     []json.RawMessage `json:"traces"`
-		Reasoning  json.RawMessage   `json:"reasoning,omitempty"`
+		Model     string            `json:"model"`
+		Traces    []json.RawMessage `json:"traces"`
+		Reasoning json.RawMessage   `json:"reasoning,omitempty"`
 	}
 	if err := json.Unmarshal(bodyBytes, &memReq); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
@@ -610,8 +632,8 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	cleaned = strings.TrimSpace(cleaned)
 
 	type memorySummary struct {
-		TraceSummary   string `json:"trace_summary"`
-		MemorySummary  string `json:"memory_summary"`
+		TraceSummary  string `json:"trace_summary"`
+		MemorySummary string `json:"memory_summary"`
 	}
 	var summaries []memorySummary
 	if err := json.Unmarshal([]byte(cleaned), &summaries); err != nil {
@@ -738,24 +760,24 @@ func transformModelsResponse(body []byte) []byte {
 		Limit int64  `json:"limit"`
 	}
 	type codexModel struct {
-		Slug                      string            `json:"slug"`
-		DisplayName               string            `json:"display_name"`
-		Description               string            `json:"description"`
-		DefaultReasoningLevel     *string           `json:"default_reasoning_level,omitempty"`
-		SupportedReasoningLevels  []reasoningPreset `json:"supported_reasoning_levels"`
-		ShellType                 string            `json:"shell_type"`
-		Visibility                string            `json:"visibility"`
-		SupportedInAPI            bool              `json:"supported_in_api"`
-		Priority                  int               `json:"priority"`
-		BaseInstructions          string            `json:"base_instructions"`
-		SupportsReasoningSummaries bool             `json:"supports_reasoning_summaries"`
-		SupportVerbosity          bool              `json:"support_verbosity"`
-		TruncationPolicy          truncationPolicy  `json:"truncation_policy"`
-		SupportsParallelToolCalls bool              `json:"supports_parallel_tool_calls"`
-		SupportsImageDetailOriginal bool            `json:"supports_image_detail_original"`
-		ContextWindow             *int64            `json:"context_window,omitempty"`
-		ExperimentalSupportedTools []string         `json:"experimental_supported_tools"`
-		InputModalities           []string          `json:"input_modalities"`
+		Slug                        string            `json:"slug"`
+		DisplayName                 string            `json:"display_name"`
+		Description                 string            `json:"description"`
+		DefaultReasoningLevel       *string           `json:"default_reasoning_level,omitempty"`
+		SupportedReasoningLevels    []reasoningPreset `json:"supported_reasoning_levels"`
+		ShellType                   string            `json:"shell_type"`
+		Visibility                  string            `json:"visibility"`
+		SupportedInAPI              bool              `json:"supported_in_api"`
+		Priority                    int               `json:"priority"`
+		BaseInstructions            string            `json:"base_instructions"`
+		SupportsReasoningSummaries  bool              `json:"supports_reasoning_summaries"`
+		SupportVerbosity            bool              `json:"support_verbosity"`
+		TruncationPolicy            truncationPolicy  `json:"truncation_policy"`
+		SupportsParallelToolCalls   bool              `json:"supports_parallel_tool_calls"`
+		SupportsImageDetailOriginal bool              `json:"supports_image_detail_original"`
+		ContextWindow               *int64            `json:"context_window,omitempty"`
+		ExperimentalSupportedTools  []string          `json:"experimental_supported_tools"`
+		InputModalities             []string          `json:"input_modalities"`
 	}
 
 	var codexModels []codexModel
@@ -821,24 +843,24 @@ func transformModelsResponse(body []byte) []byte {
 		}
 
 		cm := codexModel{
-			Slug:                       m.ID,
-			DisplayName:                m.Name,
-			Description:                m.Name,
-			DefaultReasoningLevel:      defaultReasoning,
-			SupportedReasoningLevels:   reasoningLevels,
-			ShellType:                  "shell_command",
-			Visibility:                 visibility,
-			SupportedInAPI:             true,
-			Priority:                   priority,
-			BaseInstructions:           "",
-			SupportsReasoningSummaries: len(reasoningLevels) > 0,
-			SupportVerbosity:           false,
-			TruncationPolicy:           truncationPolicy{Mode: "bytes", Limit: 10000},
-			SupportsParallelToolCalls:  m.Capabilities.Supports.ParallelToolCalls,
+			Slug:                        m.ID,
+			DisplayName:                 m.Name,
+			Description:                 m.Name,
+			DefaultReasoningLevel:       defaultReasoning,
+			SupportedReasoningLevels:    reasoningLevels,
+			ShellType:                   "shell_command",
+			Visibility:                  visibility,
+			SupportedInAPI:              true,
+			Priority:                    priority,
+			BaseInstructions:            "",
+			SupportsReasoningSummaries:  len(reasoningLevels) > 0,
+			SupportVerbosity:            false,
+			TruncationPolicy:            truncationPolicy{Mode: "bytes", Limit: 10000},
+			SupportsParallelToolCalls:   m.Capabilities.Supports.ParallelToolCalls,
 			SupportsImageDetailOriginal: false,
-			ContextWindow:              ctxWindow,
-			ExperimentalSupportedTools: []string{},
-			InputModalities:            modalities,
+			ContextWindow:               ctxWindow,
+			ExperimentalSupportedTools:  []string{},
+			InputModalities:             modalities,
 		}
 		codexModels = append(codexModels, cm)
 	}
@@ -958,4 +980,138 @@ func injectForceStream(body []byte) []byte {
 		return body
 	}
 	return result
+}
+
+type syntheticCompactionPayload struct {
+	Summary string `json:"summary"`
+}
+
+func encodeSyntheticCompaction(summary string) string {
+	payload, err := json.Marshal(syntheticCompactionPayload{Summary: summary})
+	if err != nil {
+		return syntheticCompactionPrefix
+	}
+	return syntheticCompactionPrefix + base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func rewriteSyntheticCompactionRequest(body []byte) ([]byte, int) {
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body, 0
+	}
+
+	rawInput, ok := req["input"]
+	if !ok {
+		return body, 0
+	}
+
+	var input interface{}
+	if err := json.Unmarshal(rawInput, &input); err != nil {
+		return body, 0
+	}
+
+	rewrittenInput, rewriteCount := rewriteSyntheticCompactionValue(input)
+	if rewriteCount == 0 {
+		return body, 0
+	}
+
+	encodedInput, err := json.Marshal(rewrittenInput)
+	if err != nil {
+		return body, 0
+	}
+	req["input"] = encodedInput
+
+	rewrittenBody, err := json.Marshal(req)
+	if err != nil {
+		return body, 0
+	}
+	return rewrittenBody, rewriteCount
+}
+
+func rewriteSyntheticCompactionValue(v interface{}) (interface{}, int) {
+	switch typed := v.(type) {
+	case []interface{}:
+		rewritten := make([]interface{}, 0, len(typed))
+		total := 0
+		for _, item := range typed {
+			next, count := rewriteSyntheticCompactionValue(item)
+			total += count
+			rewritten = append(rewritten, next)
+		}
+		return rewritten, total
+
+	case map[string]interface{}:
+		if itemType, _ := typed["type"].(string); itemType == "compaction" {
+			if encryptedContent, _ := typed["encrypted_content"].(string); encryptedContent != "" {
+				if summary, ok := extractSyntheticOrLegacyCompactionSummary(encryptedContent); ok {
+					return proxyCompactionContextMessage(summary), 1
+				}
+			}
+		}
+
+		rewritten := make(map[string]interface{}, len(typed))
+		total := 0
+		for key, value := range typed {
+			next, count := rewriteSyntheticCompactionValue(value)
+			total += count
+			rewritten[key] = next
+		}
+		return rewritten, total
+	default:
+		return v, 0
+	}
+}
+
+func extractSyntheticOrLegacyCompactionSummary(encryptedContent string) (string, bool) {
+	if strings.HasPrefix(encryptedContent, syntheticCompactionPrefix) {
+		raw := strings.TrimPrefix(encryptedContent, syntheticCompactionPrefix)
+		payloadBytes, err := base64.RawURLEncoding.DecodeString(raw)
+		if err != nil {
+			return "", false
+		}
+
+		var payload syntheticCompactionPayload
+		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+			return "", false
+		}
+		return payload.Summary, true
+	}
+
+	// Legacy fallback: older proxy versions wrote plaintext summaries directly
+	// into encrypted_content. Real upstream tokens are opaque, space-free blobs.
+	if encryptedContent != "" && (!looksOpaqueCompactionToken(encryptedContent) || strings.ContainsAny(encryptedContent, " \t\r\n")) {
+		return encryptedContent, true
+	}
+	return "", false
+}
+
+func looksOpaqueCompactionToken(token string) bool {
+	if len(token) < 32 {
+		return false
+	}
+	for _, r := range token {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '=', r == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func proxyCompactionContextMessage(summary string) map[string]interface{} {
+	text := "Context checkpoint summary from an earlier conversation. Treat this as background context for continuing the same task, not as a new user request.\n\n" + summary
+	return map[string]interface{}{
+		"type": "message",
+		"role": "developer",
+		"content": []interface{}{
+			map[string]interface{}{
+				"type": "input_text",
+				"text": text,
+			},
+		},
+	}
 }

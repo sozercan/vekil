@@ -296,6 +296,7 @@ func TestHandleResponses(t *testing.T) {
 }
 
 func TestHandleCompact(t *testing.T) {
+	priorSummary := "previous compacted context"
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/responses" {
 			t.Errorf("expected upstream path /responses, got %q", r.URL.Path)
@@ -310,14 +311,40 @@ func TestHandleCompact(t *testing.T) {
 		if !ok || instructions == "" {
 			t.Error("expected instructions to be injected for compact")
 		}
+		input, ok := req["input"].([]interface{})
+		if !ok || len(input) != 2 {
+			t.Fatalf("expected rewritten input with 2 items, got %#v", req["input"])
+		}
+		contextText := requireCompactionContextMessage(t, input[0])
+		if !strings.Contains(contextText, priorSummary) {
+			t.Errorf("expected compacted context in rewritten input, got %q", contextText)
+		}
 
 		// Return a standard /responses response — the handler should transform it
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"compacted summary of conversation"}]}]}`))
 	})
 
-	reqBody := `{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}]}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(reqBody))
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type":              "compaction",
+				"encrypted_content": encodeSyntheticCompaction(priorSummary),
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "Hello"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -361,8 +388,8 @@ func TestHandleCompact(t *testing.T) {
 	if result.Output[1].Type != "compaction" {
 		t.Errorf("expected second item type compaction, got %q", result.Output[1].Type)
 	}
-	if result.Output[1].EncryptedContent != "compacted summary of conversation" {
-		t.Errorf("expected encrypted_content to contain summary, got %q", result.Output[1].EncryptedContent)
+	if got := decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent); got != "compacted summary of conversation" {
+		t.Errorf("expected encoded compaction summary, got %q", got)
 	}
 }
 
@@ -420,6 +447,166 @@ func TestHandleCompact_ReplacesInstructions(t *testing.T) {
 	if result.Output[1].Type != "compaction" {
 		t.Errorf("expected second item type compaction, got %q", result.Output[1].Type)
 	}
+	if got := decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent); got != "custom summary" {
+		t.Errorf("expected encoded custom summary, got %q", got)
+	}
+}
+
+func TestHandleResponses_RewritesSyntheticCompaction(t *testing.T) {
+	summary := "Synthetic compacted summary"
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+
+		input, ok := req["input"].([]interface{})
+		if !ok || len(input) != 2 {
+			t.Fatalf("expected 2 input items, got %#v", req["input"])
+		}
+
+		contextText := requireCompactionContextMessage(t, input[0])
+		if !strings.Contains(contextText, summary) {
+			t.Errorf("expected rewritten compaction summary, got %q", contextText)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-synth","object":"response","status":"completed"}`))
+	})
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type":              "compaction",
+				"encrypted_content": encodeSyntheticCompaction(summary),
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "continue"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	if w.Result().StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(w.Result().Body)
+		t.Fatalf("expected 200, got %d: %s", w.Result().StatusCode, body)
+	}
+}
+
+func TestHandleResponses_RewritesLegacyPlaintextCompaction(t *testing.T) {
+	legacySummary := "The previous work fixed auth refresh but left retry handling open."
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+
+		input, ok := req["input"].([]interface{})
+		if !ok || len(input) != 1 {
+			t.Fatalf("expected 1 input item, got %#v", req["input"])
+		}
+
+		contextText := requireCompactionContextMessage(t, input[0])
+		if !strings.Contains(contextText, legacySummary) {
+			t.Errorf("expected legacy summary to be rewritten, got %q", contextText)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-legacy","object":"response","status":"completed"}`))
+	})
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type":              "compaction",
+				"encrypted_content": legacySummary,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	if w.Result().StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(w.Result().Body)
+		t.Fatalf("expected 200, got %d: %s", w.Result().StatusCode, body)
+	}
+}
+
+func TestHandleResponses_PreservesOpaqueCompaction(t *testing.T) {
+	opaqueToken := strings.Repeat("Abc123_-", 8)
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+
+		input, ok := req["input"].([]interface{})
+		if !ok || len(input) != 1 {
+			t.Fatalf("expected 1 input item, got %#v", req["input"])
+		}
+
+		item, ok := input[0].(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected input item object, got %#v", input[0])
+		}
+		if item["type"] != "compaction" {
+			t.Fatalf("expected opaque token to pass through as compaction, got %#v", item)
+		}
+		if item["encrypted_content"] != opaqueToken {
+			t.Errorf("expected opaque token to be preserved, got %v", item["encrypted_content"])
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-opaque","object":"response","status":"completed"}`))
+	})
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type":              "compaction",
+				"encrypted_content": opaqueToken,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	if w.Result().StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(w.Result().Body)
+		t.Fatalf("expected 200, got %d: %s", w.Result().StatusCode, body)
+	}
 }
 
 func TestHandleMemorySummarize(t *testing.T) {
@@ -449,8 +636,8 @@ func TestHandleMemorySummarize(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	var result struct {
 		Output []struct {
-			TraceSummary   string `json:"trace_summary"`
-			MemorySummary  string `json:"memory_summary"`
+			TraceSummary  string `json:"trace_summary"`
+			MemorySummary string `json:"memory_summary"`
 		} `json:"output"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
@@ -464,6 +651,122 @@ func TestHandleMemorySummarize(t *testing.T) {
 	}
 	if result.Output[0].MemorySummary == "" {
 		t.Error("expected non-empty memory_summary")
+	}
+}
+
+func decodeCompactionSummaryForTest(t *testing.T, encryptedContent string) string {
+	t.Helper()
+	summary, ok := extractSyntheticOrLegacyCompactionSummary(encryptedContent)
+	if !ok {
+		t.Fatalf("expected synthetic compaction payload, got %q", encryptedContent)
+	}
+	return summary
+}
+
+func requireCompactionContextMessage(t *testing.T, raw interface{}) string {
+	t.Helper()
+	item, ok := raw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected message object, got %#v", raw)
+	}
+	if item["type"] != "message" {
+		t.Fatalf("expected rewritten item type message, got %#v", item)
+	}
+	if item["role"] != "developer" {
+		t.Fatalf("expected rewritten item role developer, got %#v", item)
+	}
+
+	content, ok := item["content"].([]interface{})
+	if !ok || len(content) == 0 {
+		t.Fatalf("expected message content, got %#v", item["content"])
+	}
+
+	part, ok := content[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected content object, got %#v", content[0])
+	}
+	if part["type"] != "input_text" {
+		t.Fatalf("expected input_text content, got %#v", part)
+	}
+
+	text, ok := part["text"].(string)
+	if !ok {
+		t.Fatalf("expected text content, got %#v", part["text"])
+	}
+	return text
+}
+
+func TestRewriteSyntheticCompactionRequest(t *testing.T) {
+	syntheticSummary := "Synthetic checkpoint summary"
+	legacySummary := "Legacy plaintext summary from an older proxy run."
+	opaqueToken := strings.Repeat("Abc123_-", 8)
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type":              "compaction",
+				"encrypted_content": encodeSyntheticCompaction(syntheticSummary),
+			},
+			map[string]interface{}{
+				"type":              "compaction",
+				"encrypted_content": legacySummary,
+			},
+			map[string]interface{}{
+				"type":              "compaction",
+				"encrypted_content": opaqueToken,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	rewritten, rewriteCount := rewriteSyntheticCompactionRequest(reqBody)
+	if rewriteCount != 2 {
+		t.Fatalf("expected 2 rewritten compaction items, got %d", rewriteCount)
+	}
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(rewritten, &req); err != nil {
+		t.Fatalf("failed to parse rewritten request: %v", err)
+	}
+
+	input, ok := req["input"].([]interface{})
+	if !ok || len(input) != 3 {
+		t.Fatalf("expected 3 input items, got %#v", req["input"])
+	}
+
+	if got := requireCompactionContextMessage(t, input[0]); !strings.Contains(got, syntheticSummary) {
+		t.Errorf("expected synthetic summary to be rewritten, got %q", got)
+	}
+	if got := requireCompactionContextMessage(t, input[1]); !strings.Contains(got, legacySummary) {
+		t.Errorf("expected legacy summary to be rewritten, got %q", got)
+	}
+
+	item, ok := input[2].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected opaque item object, got %#v", input[2])
+	}
+	if item["type"] != "compaction" {
+		t.Fatalf("expected opaque token to remain a compaction item, got %#v", item)
+	}
+}
+
+func TestExtractSyntheticOrLegacyCompactionSummary(t *testing.T) {
+	summary := "Compacted conversation summary"
+	if got, ok := extractSyntheticOrLegacyCompactionSummary(encodeSyntheticCompaction(summary)); !ok || got != summary {
+		t.Fatalf("expected synthetic summary round-trip, got %q ok=%v", got, ok)
+	}
+
+	legacySummary := "The issue is partially fixed."
+	if got, ok := extractSyntheticOrLegacyCompactionSummary(legacySummary); !ok || got != legacySummary {
+		t.Fatalf("expected legacy summary salvage, got %q ok=%v", got, ok)
+	}
+
+	opaqueToken := strings.Repeat("Abc123_-", 8)
+	if got, ok := extractSyntheticOrLegacyCompactionSummary(opaqueToken); ok {
+		t.Fatalf("expected opaque token to pass through unchanged, got %q", got)
 	}
 }
 
@@ -490,8 +793,8 @@ func TestHandleMemorySummarize_FallbackOnInvalidJSON(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	var result struct {
 		Output []struct {
-			TraceSummary   string `json:"trace_summary"`
-			MemorySummary  string `json:"memory_summary"`
+			TraceSummary  string `json:"trace_summary"`
+			MemorySummary string `json:"memory_summary"`
 		} `json:"output"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
@@ -592,12 +895,12 @@ func TestHandleModels(t *testing.T) {
 				ID string `json:"id"`
 			} `json:"data"`
 			Models []struct {
-				Slug                     string `json:"slug"`
-				DisplayName              string `json:"display_name"`
-				Visibility               string `json:"visibility"`
-				ContextWindow            *int64 `json:"context_window"`
-				SupportsParallelToolCalls bool  `json:"supports_parallel_tool_calls"`
-				ShellType                string `json:"shell_type"`
+				Slug                      string `json:"slug"`
+				DisplayName               string `json:"display_name"`
+				Visibility                string `json:"visibility"`
+				ContextWindow             *int64 `json:"context_window"`
+				SupportsParallelToolCalls bool   `json:"supports_parallel_tool_calls"`
+				ShellType                 string `json:"shell_type"`
 			} `json:"models"`
 		}
 		if err := json.Unmarshal(body, &result); err != nil {
