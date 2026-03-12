@@ -40,10 +40,15 @@ const (
 
 // modelsCache holds a cached /models response to avoid repeated upstream calls.
 type modelsCache struct {
-	mu         sync.RWMutex
+	mu      sync.RWMutex
+	entries map[string]cachedModelsResponse
+}
+
+type cachedModelsResponse struct {
 	body       []byte
 	statusCode int
 	expiry     time.Time
+	etag       string
 }
 
 // ProxyHandler holds dependencies for all HTTP handlers.
@@ -86,6 +91,53 @@ func setCopilotHeaders(req *http.Request, token string) {
 	req.Header.Set("x-request-id", uuid.New().String())
 	req.Header.Set("openai-intent", "conversation-panel")
 	req.Header.Set("Content-Type", "application/json")
+}
+
+var hopByHopHeaders = map[string]struct{}{
+	"Connection":          {},
+	"Proxy-Connection":    {},
+	"Keep-Alive":          {},
+	"Proxy-Authenticate":  {},
+	"Proxy-Authorization": {},
+	"Te":                  {},
+	"Trailer":             {},
+	"Transfer-Encoding":   {},
+	"Upgrade":             {},
+}
+
+func copyPassthroughHeaders(dst, src http.Header) {
+	connectionTokens := make(map[string]struct{})
+	for _, value := range src.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			token = http.CanonicalHeaderKey(strings.TrimSpace(token))
+			if token != "" {
+				connectionTokens[token] = struct{}{}
+			}
+		}
+	}
+
+	for key, values := range src {
+		canonicalKey := http.CanonicalHeaderKey(key)
+		if _, skip := hopByHopHeaders[canonicalKey]; skip {
+			continue
+		}
+		if _, skip := connectionTokens[canonicalKey]; skip {
+			continue
+		}
+		dst.Del(key)
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func writeCachedModelsResponse(w http.ResponseWriter, entry cachedModelsResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	if entry.etag != "" {
+		w.Header().Set("ETag", entry.etag)
+	}
+	w.WriteHeader(entry.statusCode)
+	_, _ = w.Write(entry.body)
 }
 
 // HandleAnthropicMessages handles POST /v1/messages by translating the Anthropic
@@ -250,6 +302,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 
 	if isStreaming && resp.StatusCode == http.StatusOK {
+		copyPassthroughHeaders(w.Header(), resp.Header)
 		StreamOpenAIPassthrough(w, resp.Body)
 		return
 	}
@@ -267,9 +320,9 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 
 	defer resp.Body.Close()
-	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 // HandleResponses handles POST /v1/responses by forwarding the request to
@@ -328,14 +381,15 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isStreaming && resp.StatusCode == http.StatusOK {
+		copyPassthroughHeaders(w.Header(), resp.Header)
 		StreamOpenAIPassthrough(w, resp.Body)
 		return
 	}
 
 	defer resp.Body.Close()
-	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 // compactPrompt is the system instruction used when the upstream does not
@@ -556,6 +610,9 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 			},
 		},
 	}
+	if len(memReq.Reasoning) > 0 && string(memReq.Reasoning) != "null" {
+		responsesReq["reasoning"] = json.RawMessage(memReq.Reasoning)
+	}
 	reqBody, _ := json.Marshal(responsesReq)
 
 	upstreamCtx, upstreamCancel := context.WithTimeout(context.Background(), upstreamTimeout)
@@ -678,18 +735,22 @@ func (h *ProxyHandler) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 // The response includes both the standard OpenAI "data" field and a Codex-compatible
 // "models" field so that both OpenAI SDK clients and Codex CLI can parse it.
 func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
-	// Check cache first
+	cacheKey := r.URL.RawQuery
+	now := time.Now()
+
+	var cachedEntry cachedModelsResponse
+	var hasCachedEntry bool
 	h.models.mu.RLock()
-	if h.models.body != nil && time.Now().Before(h.models.expiry) {
-		body := h.models.body
-		status := h.models.statusCode
-		h.models.mu.RUnlock()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		_, _ = w.Write(body)
-		return
+	if h.models.entries != nil {
+		cachedEntry, hasCachedEntry = h.models.entries[cacheKey]
 	}
 	h.models.mu.RUnlock()
+
+	// Without an ETag we cannot safely revalidate, so honor the TTL-based cache.
+	if hasCachedEntry && cachedEntry.etag == "" && now.Before(cachedEntry.expiry) {
+		writeCachedModelsResponse(w, cachedEntry)
+		return
+	}
 
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
@@ -700,12 +761,20 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), modelsUpstreamTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.copilotURL+"/models", nil)
+	upstreamURL := h.copilotURL + "/models"
+	if cacheKey != "" {
+		upstreamURL += "?" + cacheKey
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL, nil)
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to create request", "server_error")
 		return
 	}
 	setCopilotHeaders(req, token)
+	if hasCachedEntry && cachedEntry.etag != "" {
+		req.Header.Set("If-None-Match", cachedEntry.etag)
+	}
 
 	resp, err := h.client.Do(req)
 	if err != nil {
@@ -720,6 +789,19 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if resp.StatusCode == http.StatusNotModified && hasCachedEntry {
+		cachedEntry.expiry = time.Now().Add(modelsCacheTTL)
+		h.models.mu.Lock()
+		if h.models.entries == nil {
+			h.models.entries = make(map[string]cachedModelsResponse)
+		}
+		h.models.entries[cacheKey] = cachedEntry
+		h.models.mu.Unlock()
+
+		writeCachedModelsResponse(w, cachedEntry)
+		return
+	}
+
 	// Transform the response to include a Codex-compatible "models" field.
 	if resp.StatusCode == http.StatusOK {
 		body = transformModelsResponse(body)
@@ -727,14 +809,28 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 
 	// Cache successful responses
 	if resp.StatusCode == http.StatusOK {
+		entry := cachedModelsResponse{
+			body:       body,
+			statusCode: resp.StatusCode,
+			expiry:     time.Now().Add(modelsCacheTTL),
+			etag:       resp.Header.Get("ETag"),
+		}
 		h.models.mu.Lock()
-		h.models.body = body
-		h.models.statusCode = resp.StatusCode
-		h.models.expiry = time.Now().Add(modelsCacheTTL)
+		if h.models.entries == nil {
+			h.models.entries = make(map[string]cachedModelsResponse)
+		}
+		h.models.entries[cacheKey] = entry
 		h.models.mu.Unlock()
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	if contentType := resp.Header.Get("Content-Type"); contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	if etag := resp.Header.Get("ETag"); etag != "" {
+		w.Header().Set("ETag", etag)
+	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(body)
 }

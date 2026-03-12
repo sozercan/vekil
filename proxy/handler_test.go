@@ -654,6 +654,42 @@ func TestHandleMemorySummarize(t *testing.T) {
 	}
 }
 
+func TestHandleMemorySummarize_PassesReasoning(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]json.RawMessage
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+
+		var reasoning map[string]string
+		if err := json.Unmarshal(req["reasoning"], &reasoning); err != nil {
+			t.Fatalf("expected reasoning object, got %s: %v", req["reasoning"], err)
+		}
+		if reasoning["effort"] != "high" {
+			t.Errorf("reasoning.effort = %q, want %q", reasoning["effort"], "high")
+		}
+		if reasoning["summary"] != "detailed" {
+			t.Errorf("reasoning.summary = %q, want %q", reasoning["summary"], "detailed")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"[{\"trace_summary\":\"trace\",\"memory_summary\":\"memory\"}]"}]}]}`))
+	})
+
+	reqBody := `{"model":"gpt-5.4","traces":[{"id":"t1","metadata":{"source_path":"/tmp/trace.json"},"items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the bug"}]}]}],"reasoning":{"effort":"high","summary":"detailed"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/memories/trace_summarize", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleMemorySummarize(w, req)
+
+	if w.Result().StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(w.Result().Body)
+		t.Fatalf("expected 200, got %d: %s", w.Result().StatusCode, body)
+	}
+}
+
 func decodeCompactionSummaryForTest(t *testing.T, encryptedContent string) string {
 	t.Helper()
 	summary, ok := extractSyntheticOrLegacyCompactionSummary(encryptedContent)
@@ -961,6 +997,139 @@ func TestHandleModels(t *testing.T) {
 	})
 }
 
+func TestHandleModels_ForwardsQueryAndETag(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.RawQuery; got != "client_version=0.99.0" {
+			t.Errorf("expected client_version query, got %q", got)
+		}
+		if got := r.Header.Get("If-None-Match"); got != "" {
+			t.Errorf("expected no If-None-Match on first request, got %q", got)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `"models-etag-1"`)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4o","object":"model","created":0,"owned_by":"github-copilot","name":"GPT-4o"}]}`))
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.99.0", nil)
+	w := httptest.NewRecorder()
+
+	handler.HandleModels(w, req)
+
+	resp := w.Result()
+	if got := resp.Header.Get("ETag"); got != `"models-etag-1"` {
+		t.Errorf("ETag = %q, want %q", got, `"models-etag-1"`)
+	}
+}
+
+func TestHandleModels_RevalidatesCachedEntryWhenETagChanges(t *testing.T) {
+	requestCount := 0
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if got := r.URL.RawQuery; got != "client_version=0.99.0" {
+			t.Errorf("expected client_version query, got %q", got)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		switch requestCount {
+		case 1:
+			if got := r.Header.Get("If-None-Match"); got != "" {
+				t.Errorf("expected no If-None-Match on first request, got %q", got)
+			}
+			w.Header().Set("ETag", `"models-etag-1"`)
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4o","object":"model","created":0,"owned_by":"github-copilot","name":"GPT-4o"}]}`))
+		case 2:
+			if got := r.Header.Get("If-None-Match"); got != `"models-etag-1"` {
+				t.Errorf("If-None-Match = %q, want %q", got, `"models-etag-1"`)
+			}
+			w.Header().Set("ETag", `"models-etag-2"`)
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5","object":"model","created":0,"owned_by":"github-copilot","name":"GPT-5"}]}`))
+		default:
+			t.Fatalf("unexpected request count %d", requestCount)
+		}
+	})
+
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.99.0", nil)
+	w1 := httptest.NewRecorder()
+	handler.HandleModels(w1, req1)
+
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.99.0", nil)
+	w2 := httptest.NewRecorder()
+	handler.HandleModels(w2, req2)
+
+	if requestCount != 2 {
+		t.Fatalf("expected 2 upstream requests, got %d", requestCount)
+	}
+
+	resp := w2.Result()
+	if got := resp.Header.Get("ETag"); got != `"models-etag-2"` {
+		t.Errorf("ETag = %q, want %q", got, `"models-etag-2"`)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Models []struct {
+			Slug string `json:"slug"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if len(result.Models) != 1 || result.Models[0].Slug != "gpt-5" {
+		t.Fatalf("expected refreshed gpt-5 model, got %+v", result.Models)
+	}
+}
+
+func TestHandleModels_UsesCachedEntryOnNotModified(t *testing.T) {
+	requestCount := 0
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		switch requestCount {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("ETag", `"models-etag-1"`)
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4o","object":"model","created":0,"owned_by":"github-copilot","name":"GPT-4o"}]}`))
+		case 2:
+			if got := r.Header.Get("If-None-Match"); got != `"models-etag-1"` {
+				t.Errorf("If-None-Match = %q, want %q", got, `"models-etag-1"`)
+			}
+			w.Header().Set("ETag", `"models-etag-1"`)
+			w.WriteHeader(http.StatusNotModified)
+		default:
+			t.Fatalf("unexpected request count %d", requestCount)
+		}
+	})
+
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.99.0", nil)
+	w1 := httptest.NewRecorder()
+	handler.HandleModels(w1, req1)
+
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.99.0", nil)
+	w2 := httptest.NewRecorder()
+	handler.HandleModels(w2, req2)
+
+	resp := w2.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected cached 200 response, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("ETag"); got != `"models-etag-1"` {
+		t.Errorf("ETag = %q, want %q", got, `"models-etag-1"`)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Models []struct {
+			Slug string `json:"slug"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if len(result.Models) != 1 || result.Models[0].Slug != "gpt-4o" {
+		t.Fatalf("expected cached gpt-4o model, got %+v", result.Models)
+	}
+}
+
 // TestOpenAIErrorResponseShape validates error responses match the OpenAI spec:
 // {"error": {"message": "...", "type": "...", "param": null, "code": null}}
 func TestOpenAIErrorResponseShape(t *testing.T) {
@@ -1099,6 +1268,41 @@ func TestOpenAIResponsesStreaming(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), "response.created") {
 		t.Error("streaming response should contain event data")
+	}
+}
+
+func TestOpenAIResponsesStreaming_PreservesUpstreamHeaders(t *testing.T) {
+	sseBody := "event: response.created\ndata: {\"id\":\"resp-1\",\"type\":\"response\"}\n\n"
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Models-Etag", "\"models-etag-2\"")
+		w.Header().Set("OpenAI-Model", "gpt-5.2")
+		w.Header().Set("X-Reasoning-Included", "true")
+		w.Header().Set("X-Codex-Turn-State", "sticky-turn-state")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(sseBody))
+	})
+
+	reqBody := `{"model":"gpt-4","input":"Hello","stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if got := resp.Header.Get("X-Models-Etag"); got != `"models-etag-2"` {
+		t.Errorf("X-Models-Etag = %q, want %q", got, `"models-etag-2"`)
+	}
+	if got := resp.Header.Get("OpenAI-Model"); got != "gpt-5.2" {
+		t.Errorf("OpenAI-Model = %q, want %q", got, "gpt-5.2")
+	}
+	if got := resp.Header.Get("X-Reasoning-Included"); got != "true" {
+		t.Errorf("X-Reasoning-Included = %q, want true", got)
+	}
+	if got := resp.Header.Get("X-Codex-Turn-State"); got != "sticky-turn-state" {
+		t.Errorf("X-Codex-Turn-State = %q, want %q", got, "sticky-turn-state")
 	}
 }
 
@@ -1245,6 +1449,37 @@ func TestOpenAIResponsesResponseShape(t *testing.T) {
 	json.Unmarshal(raw["object"], &obj)
 	if obj != "response" {
 		t.Errorf("object = %q, want response", obj)
+	}
+}
+
+func TestHandleResponses_NonStreamingPreservesUpstreamHeaders(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Models-Etag", "\"models-etag-3\"")
+		w.Header().Set("OpenAI-Model", "gpt-5.3")
+		w.Header().Set("X-Reasoning-Included", "true")
+		w.Header().Set("X-Codex-Turn-State", "sticky-turn-state-2")
+		_, _ = w.Write([]byte(`{"id":"resp-test","object":"response","status":"completed","model":"gpt-5.3","output":[]}`))
+	})
+
+	reqBody := `{"model":"gpt-5.3","input":"Hi"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if got := resp.Header.Get("X-Models-Etag"); got != `"models-etag-3"` {
+		t.Errorf("X-Models-Etag = %q, want %q", got, `"models-etag-3"`)
+	}
+	if got := resp.Header.Get("OpenAI-Model"); got != "gpt-5.3" {
+		t.Errorf("OpenAI-Model = %q, want %q", got, "gpt-5.3")
+	}
+	if got := resp.Header.Get("X-Reasoning-Included"); got != "true" {
+		t.Errorf("X-Reasoning-Included = %q, want true", got)
+	}
+	if got := resp.Header.Get("X-Codex-Turn-State"); got != "sticky-turn-state-2" {
+		t.Errorf("X-Codex-Turn-State = %q, want %q", got, "sticky-turn-state-2")
 	}
 }
 
