@@ -2,7 +2,7 @@
 
 ## Project
 
-Go reverse proxy that routes Anthropic/OpenAI API requests to GitHub Copilot's backend (`api.githubcopilot.com`), using a Copilot subscription instead of direct API keys.
+Go reverse proxy that routes Anthropic, Gemini, and OpenAI API requests to GitHub Copilot's backend (`api.githubcopilot.com`), using a Copilot subscription instead of direct API keys.
 
 ## Build & Test
 
@@ -24,6 +24,9 @@ Run specific tests: `go test ./proxy/ -run TestHandle -v`
 | `main.go` | CLI entry, flags, signal handling |
 | `auth/` | GitHub OAuth device code flow, token caching/refresh (`sync.RWMutex` + double-check) |
 | `proxy/handler.go` | HTTP handlers — the core of the proxy |
+| `proxy/gemini_handler.go` | Gemini-native HTTP handlers and countTokens probe flow |
+| `proxy/gemini.go` | Gemini↔OpenAI request/response translation and validation |
+| `proxy/gemini_streaming.go` | OpenAI SSE → Gemini SSE translation |
 | `proxy/translator.go` | Bidirectional Anthropic↔OpenAI request/response translation |
 | `proxy/streaming.go` | SSE stream translation (OpenAI→Anthropic events) and aggregation |
 | `proxy/retry.go` | Exponential backoff on 429/502/503/504 |
@@ -36,6 +39,7 @@ Run specific tests: `go test ./proxy/ -run TestHandle -v`
 
 - **No frameworks**: Pure `net/http` with Go 1.22+ `ServeMux` method routing. Do not add web frameworks.
 - **Forced streaming for parallel tool calls**: Non-streaming requests with tools are force-streamed upstream then aggregated back, because Copilot's non-streaming mode doesn't reliably return parallel tool calls. This is the project's core value-add.
+- **Gemini is a translation layer**: Gemini endpoints are implemented like Anthropic, not as zero-copy passthrough. Keep Gemini-specific protocol logic in `proxy/gemini*.go`.
 - **Zero-copy passthrough**: OpenAI endpoints proxy requests with minimal modification (inject auth headers + `parallel_tool_calls`).
 - **Minimal dependencies**: Only 3 direct deps (`systray`, `uuid`, `compress`). Avoid adding dependencies unless absolutely necessary.
 - **Distroless container**: Single static binary, CGO_ENABLED=0.
@@ -49,4 +53,4 @@ Run specific tests: `go test ./proxy/ -run TestHandle -v`
 
 ## CI
 
-GitHub Actions runs lint (golangci-lint v2), test, build, vet, then e2e (binary smoke test + docker build). All must pass before merge.
+GitHub Actions in `.github/workflows/ci.yaml` runs `golangci-lint` (only new issues), test, build, vet, then e2e (binary smoke test + docker build). All must pass before merge.
