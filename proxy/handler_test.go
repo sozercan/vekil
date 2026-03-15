@@ -393,6 +393,55 @@ func TestHandleCompact(t *testing.T) {
 	}
 }
 
+func TestHandleCompact_StripsInlineRenderMarkers(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Keep the passthrough tests. citeturn5view1turn9view0"}]}]}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"gpt-5.4","input":"Hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Output []struct {
+			Type             string `json:"type"`
+			EncryptedContent string `json:"encrypted_content"`
+			Content          []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if len(result.Output) != 2 {
+		t.Fatalf("expected 2 output items, got %d", len(result.Output))
+	}
+
+	gotText := result.Output[0].Content[0].Text
+	if strings.Contains(gotText, "") || strings.Contains(gotText, "") {
+		t.Fatalf("expected summary text to be sanitized, got %q", gotText)
+	}
+	if gotText != "Keep the passthrough tests." {
+		t.Errorf("summary text = %q, want %q", gotText, "Keep the passthrough tests.")
+	}
+
+	if got := decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent); got != "Keep the passthrough tests." {
+		t.Errorf("encoded compaction summary = %q, want %q", got, "Keep the passthrough tests.")
+	}
+}
+
 func TestHandleCompact_ReplacesInstructions(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -597,6 +646,64 @@ func TestHandleResponses_RewritesSyntheticCompaction(t *testing.T) {
 	}
 }
 
+func TestHandleResponses_RewritesSyntheticCompaction_StripsInlineRenderMarkers(t *testing.T) {
+	summary := "Synthetic compacted summary. citeturn5view1turn9view0"
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+
+		input, ok := req["input"].([]interface{})
+		if !ok || len(input) != 2 {
+			t.Fatalf("expected 2 input items, got %#v", req["input"])
+		}
+
+		contextText := requireCompactionContextMessage(t, input[0])
+		if strings.Contains(contextText, "") || strings.Contains(contextText, "") {
+			t.Fatalf("expected rewritten compaction summary to be sanitized, got %q", contextText)
+		}
+		if !strings.Contains(contextText, "Synthetic compacted summary.") {
+			t.Errorf("expected sanitized summary in rewritten input, got %q", contextText)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-synth","object":"response","status":"completed"}`))
+	})
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type":              "compaction",
+				"encrypted_content": encodeSyntheticCompaction(summary),
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "continue"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	if w.Result().StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(w.Result().Body)
+		t.Fatalf("expected 200, got %d: %s", w.Result().StatusCode, body)
+	}
+}
+
 func TestHandleResponses_RewritesLegacyPlaintextCompaction(t *testing.T) {
 	legacySummary := "The previous work fixed auth refresh but left retry handling open."
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -741,6 +848,50 @@ func TestHandleMemorySummarize(t *testing.T) {
 	}
 	if result.Output[0].MemorySummary == "" {
 		t.Error("expected non-empty memory_summary")
+	}
+}
+
+func TestHandleMemorySummarize_StripsInlineRenderMarkers(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Errorf("expected upstream path /responses, got %q", r.URL.Path)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"[{\"trace_summary\":\"trace\",\"memory_summary\":\"memory\"}] citeturn5view1turn9view0"}]}]}`))
+	})
+
+	reqBody := `{"model":"gpt-5.4","traces":[{"id":"t1","metadata":{"source_path":"/tmp/trace.json"},"items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the bug"}]}]}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/memories/trace_summarize", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleMemorySummarize(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Output []struct {
+			TraceSummary  string `json:"trace_summary"`
+			MemorySummary string `json:"memory_summary"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if len(result.Output) != 1 {
+		t.Fatalf("expected 1 output, got %d", len(result.Output))
+	}
+	if got := result.Output[0].TraceSummary; got != "trace" {
+		t.Errorf("trace_summary = %q, want %q", got, "trace")
+	}
+	if got := result.Output[0].MemorySummary; got != "memory" {
+		t.Errorf("memory_summary = %q, want %q", got, "memory")
 	}
 }
 

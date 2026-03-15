@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -116,6 +117,18 @@ var hopByHopHeaders = map[string]struct{}{
 	"Trailer":             {},
 	"Transfer-Encoding":   {},
 	"Upgrade":             {},
+}
+
+// Strip inline render markers that some upstream clients inject into plain text,
+// such as citation tokens like "citeturn5view1". These are useful only to
+// richer UIs, so proxy-owned summary surfaces should store clean text instead.
+var inlineRenderMarkerRegexp = regexp.MustCompile(`[^]*`)
+
+func sanitizeProxySummaryText(text string) string {
+	if text == "" {
+		return ""
+	}
+	return strings.TrimSpace(inlineRenderMarkerRegexp.ReplaceAllString(text, ""))
 }
 
 func copyPassthroughHeaders(dst, src http.Header) {
@@ -523,6 +536,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	summaryText = sanitizeProxySummaryText(summaryText)
 
 	// Build the compact response format Codex expects: an assistant message
 	// with the summary text followed by a compaction item.
@@ -678,6 +692,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 			}
 		}
 	}
+	summaryText = sanitizeProxySummaryText(summaryText)
 
 	// Try to parse the model's response as a JSON array of summaries.
 	// Strip markdown code fences if present.
@@ -1396,6 +1411,7 @@ func looksOpaqueCompactionToken(token string) bool {
 }
 
 func proxyCompactionContextMessage(summary string) map[string]interface{} {
+	summary = sanitizeProxySummaryText(summary)
 	text := "Context checkpoint summary from an earlier conversation. Treat this as background context for continuing the same task, not as a new user request.\n\n" + summary
 	return map[string]interface{}{
 		"type": "message",
