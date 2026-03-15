@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -51,14 +52,19 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 // Start begins listening in a goroutine. It returns an error if the listener
 // cannot be established.
 func (s *Server) Start() error {
+	ln, err := net.Listen("tcp", s.httpServer.Addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", s.httpServer.Addr, err)
+	}
+
 	s.running.Store(true)
 	s.log.Info("copilot-proxy listening", logger.F("addr", s.httpServer.Addr))
 
 	go func() {
-		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			s.log.Fatal("server error", logger.Err(err))
+		defer s.running.Store(false)
+		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+			s.log.Error("server error", logger.Err(err))
 		}
-		s.running.Store(false)
 	}()
 
 	return nil
