@@ -335,6 +335,53 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 			t.Errorf("tool_choice = %q, want required", toolChoice)
 		}
 	})
+
+	t.Run("auto mode keeps auto tool choice while filtering allowed tools", func(t *testing.T) {
+		req := &models.GeminiGenerateContentRequest{
+			Contents: []models.GeminiContent{{
+				Role: "user",
+				Parts: []models.GeminiPart{
+					{Text: stringPtr("Pick automatically from the allowed tools")},
+				},
+			}},
+			Tools: []models.GeminiTool{{
+				FunctionDeclarations: []models.GeminiFunctionDeclaration{
+					{Name: "lookup_weather", Parameters: json.RawMessage(`{"type":"object"}`)},
+					{Name: "lookup_time", Parameters: json.RawMessage(`{"type":"object"}`)},
+					{Name: "delete_everything", Parameters: json.RawMessage(`{"type":"object"}`)},
+				},
+			}},
+			ToolConfig: &models.GeminiToolConfig{
+				FunctionCallingConfig: &models.GeminiFunctionCallingConfig{
+					Mode:                 "AUTO",
+					AllowedFunctionNames: []string{"lookup_weather", "lookup_time"},
+				},
+			},
+		}
+
+		got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+		if err != nil {
+			t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+		}
+
+		if len(got.Tools) != 2 {
+			t.Fatalf("len(Tools) = %d, want 2", len(got.Tools))
+		}
+		if got.Tools[0].Function.Name != "lookup_weather" {
+			t.Errorf("tools[0].function.name = %q, want lookup_weather", got.Tools[0].Function.Name)
+		}
+		if got.Tools[1].Function.Name != "lookup_time" {
+			t.Errorf("tools[1].function.name = %q, want lookup_time", got.Tools[1].Function.Name)
+		}
+
+		var toolChoice string
+		if err := json.Unmarshal(got.ToolChoice, &toolChoice); err != nil {
+			t.Fatalf("unmarshal tool_choice: %v", err)
+		}
+		if toolChoice != "auto" {
+			t.Errorf("tool_choice = %q, want auto", toolChoice)
+		}
+	})
 }
 
 func TestDecodeGeminiGenerateContentRequestSnakeCase(t *testing.T) {
@@ -429,6 +476,123 @@ func TestDecodeGeminiGenerateContentRequestSnakeCase(t *testing.T) {
 	}
 	if responseFormat["type"] != "json_schema" {
 		t.Errorf("response_format.type = %v, want json_schema", responseFormat["type"])
+	}
+}
+
+func TestDecodeGeminiGenerateContentRequestEdgeCases(t *testing.T) {
+	t.Run("duplicate canonical field via snake case alias is rejected", func(t *testing.T) {
+		body := []byte(`{
+			"contents": [{"role":"user","parts":[{"text":"Hi"}]}],
+			"generationConfig": {"maxOutputTokens": 10},
+			"generation_config": {"max_output_tokens": 10}
+		}`)
+
+		_, err := decodeGeminiGenerateContentRequest(body)
+		if err == nil {
+			t.Fatal("decodeGeminiGenerateContentRequest() error = nil, want non-nil")
+		}
+
+		var geminiErr *geminiProtocolError
+		if !errors.As(err, &geminiErr) {
+			t.Fatalf("error type = %T, want *geminiProtocolError", err)
+		}
+		if geminiErr.statusCode != http.StatusBadRequest {
+			t.Fatalf("statusCode = %d, want 400", geminiErr.statusCode)
+		}
+		if !strings.Contains(geminiErr.message, `request contains duplicate field "generationConfig"`) {
+			t.Fatalf("message = %q, want duplicate generationConfig detail", geminiErr.message)
+		}
+	})
+
+	t.Run("unknown nested snake case field is rejected with full path", func(t *testing.T) {
+		body := []byte(`{
+			"contents": [{"role":"user","parts":[{"text":"Hi"}]}],
+			"generation_config": {"unexpected_option": true}
+		}`)
+
+		_, err := decodeGeminiGenerateContentRequest(body)
+		if err == nil {
+			t.Fatal("decodeGeminiGenerateContentRequest() error = nil, want non-nil")
+		}
+
+		var geminiErr *geminiProtocolError
+		if !errors.As(err, &geminiErr) {
+			t.Fatalf("error type = %T, want *geminiProtocolError", err)
+		}
+		if geminiErr.statusCode != http.StatusBadRequest {
+			t.Fatalf("statusCode = %d, want 400", geminiErr.statusCode)
+		}
+		if !strings.Contains(geminiErr.message, "request.generationConfig.unexpected_option is not supported or unknown") {
+			t.Fatalf("message = %q, want nested unknown-field detail", geminiErr.message)
+		}
+	})
+
+	t.Run("null object aliases decode to nil pointers", func(t *testing.T) {
+		body := []byte(`{
+			"contents": [{"role":"user","parts":[{"text":"Hi"}]}],
+			"generation_config": null,
+			"tool_config": null,
+			"system_instruction": null
+		}`)
+
+		req, err := decodeGeminiGenerateContentRequest(body)
+		if err != nil {
+			t.Fatalf("decodeGeminiGenerateContentRequest() error = %v", err)
+		}
+		if req.GenerationConfig != nil {
+			t.Fatalf("GenerationConfig = %#v, want nil", req.GenerationConfig)
+		}
+		if req.ToolConfig != nil {
+			t.Fatalf("ToolConfig = %#v, want nil", req.ToolConfig)
+		}
+		if req.SystemInstruction != nil {
+			t.Fatalf("SystemInstruction = %#v, want nil", req.SystemInstruction)
+		}
+	})
+}
+
+func TestDecodeGeminiGenerateContentRequestErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantMsg string
+	}{
+		{
+			name: "duplicate camel and snake aliases are rejected",
+			body: `{
+				"systemInstruction": {"parts":[{"text":"one"}]},
+				"system_instruction": {"parts":[{"text":"two"}]},
+				"contents": [{"role":"user","parts":[{"text":"hi"}]}]
+			}`,
+			wantMsg: `request contains duplicate field "systemInstruction"`,
+		},
+		{
+			name: "unknown nested generation config field is rejected",
+			body: `{
+				"contents": [{"role":"user","parts":[{"text":"hi"}]}],
+				"generation_config": {"unexpected_option": true}
+			}`,
+			wantMsg: "request.generationConfig.unexpected_option is not supported or unknown",
+		},
+		{
+			name: "contents must be an array",
+			body: `{
+				"contents": {"role":"user","parts":[{"text":"hi"}]}
+			}`,
+			wantMsg: "request.contents must be a JSON array",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := decodeGeminiGenerateContentRequest([]byte(tt.body))
+			if err == nil {
+				t.Fatal("decodeGeminiGenerateContentRequest() error = nil, want non-nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantMsg) {
+				t.Fatalf("error = %q, want substring %q", err.Error(), tt.wantMsg)
+			}
+		})
 	}
 }
 
@@ -667,6 +831,33 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			wantMsg:    "generationConfig.thinkingConfig is not supported",
 		},
 		{
+			name: "response modalities unsupported",
+			req: &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
+				GenerationConfig: &models.GeminiGenerationConfig{
+					ResponseModalities: json.RawMessage(`["AUDIO"]`),
+				},
+			},
+			pathModel:  "gemini-2.5-pro",
+			wantCode:   http.StatusNotImplemented,
+			wantStatus: "UNIMPLEMENTED",
+			wantMsg:    "generationConfig.responseModalities is not supported",
+		},
+		{
+			name: "conflicting response schema aliases rejected",
+			req: &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
+				GenerationConfig: &models.GeminiGenerationConfig{
+					ResponseSchema:     json.RawMessage(`{"type":"object","properties":{"a":{"type":"string"}}}`),
+					ResponseJSONSchema: json.RawMessage(`{"type":"object","properties":{"b":{"type":"string"}}}`),
+				},
+			},
+			pathModel:  "gemini-2.5-pro",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    "generationConfig.responseSchema and generationConfig.responseJsonSchema cannot differ",
+		},
+		{
 			name: "google search unsupported",
 			req: &models.GeminiGenerateContentRequest{
 				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
@@ -678,6 +869,32 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			wantCode:   http.StatusNotImplemented,
 			wantStatus: "UNIMPLEMENTED",
 			wantMsg:    "Gemini native web tools cannot be translated to Copilot function calls",
+		},
+		{
+			name: "google maps unsupported",
+			req: &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
+				Tools: []models.GeminiTool{{
+					GoogleMaps: json.RawMessage(`{}`),
+				}},
+			},
+			pathModel:  "gemini-2.5-pro",
+			wantCode:   http.StatusNotImplemented,
+			wantStatus: "UNIMPLEMENTED",
+			wantMsg:    "tools[0].googleMaps is not supported",
+		},
+		{
+			name: "enterprise web search unsupported",
+			req: &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
+				Tools: []models.GeminiTool{{
+					EnterpriseWebSearch: json.RawMessage(`{}`),
+				}},
+			},
+			pathModel:  "gemini-2.5-pro",
+			wantCode:   http.StatusNotImplemented,
+			wantStatus: "UNIMPLEMENTED",
+			wantMsg:    "tools[0].enterpriseWebSearch is not supported",
 		},
 		{
 			name: "unmatched function response",
@@ -802,6 +1019,86 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			}
 			if tt.wantMsg != "" && !strings.Contains(geminiErr.message, tt.wantMsg) {
 				t.Errorf("message = %q, want substring %q", geminiErr.message, tt.wantMsg)
+			}
+		})
+	}
+}
+
+func TestTranslateGeminiToOpenAIAdditionalUnsupportedCases(t *testing.T) {
+	configCases := []struct {
+		name    string
+		config  *models.GeminiGenerationConfig
+		wantMsg string
+	}{
+		{
+			name:    "speech config unsupported",
+			config:  &models.GeminiGenerationConfig{SpeechConfig: json.RawMessage(`{"voiceConfig":{"prebuiltVoiceConfig":{"voiceName":"Aoede"}}}`)},
+			wantMsg: "generationConfig.speechConfig is not supported",
+		},
+		{
+			name:    "image config unsupported",
+			config:  &models.GeminiGenerationConfig{ImageConfig: json.RawMessage(`{"aspectRatio":"1:1"}`)},
+			wantMsg: "generationConfig.imageConfig is not supported",
+		},
+		{
+			name:    "media resolution unsupported",
+			config:  &models.GeminiGenerationConfig{MediaResolution: json.RawMessage(`"MEDIA_RESOLUTION_HIGH"`)},
+			wantMsg: "generationConfig.mediaResolution is not supported",
+		},
+		{
+			name:    "response logprobs unsupported",
+			config:  &models.GeminiGenerationConfig{ResponseLogprobs: json.RawMessage(`true`)},
+			wantMsg: "generationConfig.responseLogprobs is not supported",
+		},
+		{
+			name:    "logprobs unsupported",
+			config:  &models.GeminiGenerationConfig{Logprobs: json.RawMessage(`3`)},
+			wantMsg: "generationConfig.logprobs is not supported",
+		},
+	}
+
+	for _, tt := range configCases {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &models.GeminiGenerateContentRequest{
+				Contents:         []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
+				GenerationConfig: tt.config,
+			}
+
+			_, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+			if err == nil {
+				t.Fatal("TranslateGeminiToOpenAI() error = nil, want non-nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantMsg) {
+				t.Fatalf("error = %q, want substring %q", err.Error(), tt.wantMsg)
+			}
+		})
+	}
+
+	toolCases := []struct {
+		name    string
+		tool    models.GeminiTool
+		wantMsg string
+	}{
+		{
+			name:    "computer use unsupported",
+			tool:    models.GeminiTool{ComputerUse: json.RawMessage(`{}`)},
+			wantMsg: "tools[0].computerUse is not supported",
+		},
+	}
+
+	for _, tt := range toolCases {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
+				Tools:    []models.GeminiTool{tt.tool},
+			}
+
+			_, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+			if err == nil {
+				t.Fatal("TranslateGeminiToOpenAI() error = nil, want non-nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantMsg) {
+				t.Fatalf("error = %q, want substring %q", err.Error(), tt.wantMsg)
 			}
 		})
 	}
@@ -1513,6 +1810,84 @@ func TestHandleGeminiModelsCountTokensWithInlineImageOmitsPromptDetails(t *testi
 	}
 }
 
+func TestHandleGeminiModelsCountTokensCacheNormalizesSnakeCase(t *testing.T) {
+	callCount := 0
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+
+		switch callCount {
+		case 1:
+			if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != 1 {
+				t.Fatalf("MaxCompletionTokens = %v, want 1", oaiReq.MaxCompletionTokens)
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"max_completion_tokens unsupported"}`))
+		case 2:
+			if oaiReq.MaxTokens == nil || *oaiReq.MaxTokens != 1 {
+				t.Fatalf("MaxTokens = %v, want 1", oaiReq.MaxTokens)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+				ID:      "chatcmpl-cache",
+				Object:  "chat.completion",
+				Created: 123,
+				Model:   "gemini-2.5-pro",
+				Choices: []models.OpenAIChoice{{
+					Index:        0,
+					Message:      models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)},
+					FinishReason: strPtr("stop"),
+				}},
+				Usage: &models.OpenAIUsage{PromptTokens: 19, CompletionTokens: 1, TotalTokens: 20},
+			})
+		default:
+			t.Fatalf("unexpected upstream call %d", callCount)
+		}
+	})
+
+	bodies := []string{
+		`{
+			"contents": [{"role":"user","parts":[{"text":"Count this"}]}],
+			"tools": [{"functionDeclarations":[{"name":"lookup_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}]}]
+		}`,
+		`{
+			"contents": [{"role":"user","parts":[{"text":"Count this"}]}],
+			"tools": [{"function_declarations":[{"name":"lookup_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}]}]
+		}`,
+	}
+
+	for i, reqBody := range bodies {
+		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:countTokens", strings.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		handler.HandleGeminiModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("iteration %d StatusCode = %d, want 200: %s", i, resp.StatusCode, string(body))
+		}
+
+		var countResp models.GeminiCountTokensResponse
+		if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+			t.Fatalf("decode countTokens response: %v", err)
+		}
+		if countResp.TotalTokens != 19 {
+			t.Errorf("iteration %d TotalTokens = %d, want 19", i, countResp.TotalTokens)
+		}
+	}
+
+	if callCount != 2 {
+		t.Fatalf("upstream callCount = %d, want 2", callCount)
+	}
+}
+
 func TestHandleGeminiModelsErrors(t *testing.T) {
 	t.Run("invalid action", func(t *testing.T) {
 		handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1630,6 +2005,71 @@ func TestHandleGeminiModelsErrors(t *testing.T) {
 		}
 	})
 
+	t.Run("snake case response modalities returns unimplemented", func(t *testing.T) {
+		handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("backend should not be called")
+		})
+
+		reqBody := `{
+			"contents": [{"role":"user","parts":[{"text":"hi"}]}],
+			"generation_config": {"response_modalities": ["AUDIO"]}
+		}`
+		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:generateContent", strings.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		handler.HandleGeminiModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusNotImplemented {
+			t.Fatalf("StatusCode = %d, want 501", resp.StatusCode)
+		}
+
+		var errResp models.GeminiErrorResponse
+		if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+			t.Fatalf("decode error response: %v", err)
+		}
+		if errResp.Error.Status != "UNIMPLEMENTED" {
+			t.Errorf("status = %q, want UNIMPLEMENTED", errResp.Error.Status)
+		}
+		if !strings.Contains(errResp.Error.Message, "generationConfig.responseModalities is not supported") {
+			t.Errorf("message = %q, want responseModalities unsupported detail", errResp.Error.Message)
+		}
+	})
+
+	t.Run("duplicate snake case alias returns invalid argument", func(t *testing.T) {
+		handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("backend should not be called")
+		})
+
+		reqBody := `{
+			"contents": [{"role":"user","parts":[{"text":"hi"}]}],
+			"generationConfig": {"maxOutputTokens": 1},
+			"generation_config": {"max_output_tokens": 1}
+		}`
+		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:generateContent", strings.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		handler.HandleGeminiModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("StatusCode = %d, want 400", resp.StatusCode)
+		}
+
+		var errResp models.GeminiErrorResponse
+		if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+			t.Fatalf("decode error response: %v", err)
+		}
+		if errResp.Error.Status != "INVALID_ARGUMENT" {
+			t.Errorf("status = %q, want INVALID_ARGUMENT", errResp.Error.Status)
+		}
+		if !strings.Contains(errResp.Error.Message, `request contains duplicate field "generationConfig"`) {
+			t.Errorf("message = %q, want duplicate generationConfig detail", errResp.Error.Message)
+		}
+	})
+
 	t.Run("unknown snake case field returns invalid argument", func(t *testing.T) {
 		handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 			t.Fatal("backend should not be called")
@@ -1659,6 +2099,38 @@ func TestHandleGeminiModelsErrors(t *testing.T) {
 		}
 		if !strings.Contains(errResp.Error.Message, "request.unexpected_field is not supported or unknown") {
 			t.Errorf("message = %q, want unexpected_field detail", errResp.Error.Message)
+		}
+	})
+
+	t.Run("unknown nested snake case field returns invalid argument", func(t *testing.T) {
+		handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("backend should not be called")
+		})
+
+		reqBody := `{
+			"contents": [{"role":"user","parts":[{"text":"hi"}]}],
+			"generation_config": {"unexpected_option": true}
+		}`
+		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:generateContent", strings.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		handler.HandleGeminiModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("StatusCode = %d, want 400", resp.StatusCode)
+		}
+
+		var errResp models.GeminiErrorResponse
+		if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+			t.Fatalf("decode error response: %v", err)
+		}
+		if errResp.Error.Status != "INVALID_ARGUMENT" {
+			t.Errorf("status = %q, want INVALID_ARGUMENT", errResp.Error.Status)
+		}
+		if !strings.Contains(errResp.Error.Message, "request.generationConfig.unexpected_option is not supported or unknown") {
+			t.Errorf("message = %q, want nested unexpected_option detail", errResp.Error.Message)
 		}
 	})
 }
