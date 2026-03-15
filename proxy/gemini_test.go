@@ -1388,6 +1388,95 @@ func TestHandleGeminiModelsGenerateContentIgnoresTopKAndThinkingConfig(t *testin
 	}
 }
 
+func TestHandleGeminiModelsGenerateContentGeminiCLIDefaults(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+
+		if oaiReq.Model != "gemini-2.5-pro" {
+			t.Errorf("Model = %q, want gemini-2.5-pro", oaiReq.Model)
+		}
+		if oaiReq.Stream == nil || !*oaiReq.Stream {
+			t.Fatalf("Stream = %v, want true", oaiReq.Stream)
+		}
+		if oaiReq.StreamOptions == nil || !oaiReq.StreamOptions.IncludeUsage {
+			t.Fatalf("StreamOptions = %#v, want include_usage", oaiReq.StreamOptions)
+		}
+		if len(oaiReq.Tools) != 1 {
+			t.Fatalf("len(Tools) = %d, want 1", len(oaiReq.Tools))
+		}
+		if oaiReq.Tools[0].Function.Name != "lookup_weather" {
+			t.Fatalf("tools[0].function.name = %q, want lookup_weather", oaiReq.Tools[0].Function.Name)
+		}
+
+		var parameters map[string]interface{}
+		if err := json.Unmarshal(oaiReq.Tools[0].Function.Parameters, &parameters); err != nil {
+			t.Fatalf("unmarshal tool parameters: %v", err)
+		}
+		if parameters["type"] != "object" {
+			t.Fatalf("tool parameters type = %v, want object", parameters["type"])
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-cli\",\"model\":\"gemini-2.5-pro\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"CLI defaults accepted\"},\"finish_reason\":null}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-cli\",\"model\":\"gemini-2.5-pro\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":6,\"completion_tokens\":3,\"total_tokens\":9}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	})
+
+	reqBody := `{
+		"contents": [{"role":"user","parts":[{"text":"Look up the weather"}]}],
+		"tools": [{
+			"functionDeclarations": [{
+				"name": "lookup_weather",
+				"parametersJsonSchema": {
+					"type": "object",
+					"properties": {"city": {"type": "string"}},
+					"required": ["city"]
+				}
+			}]
+		}],
+		"generationConfig": {
+			"topK": 64,
+			"thinkingConfig": {
+				"includeThoughts": true,
+				"thinkingBudget": 8192,
+				"thinkingLevel": "HIGH"
+			}
+		}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:generateContent", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleGeminiModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, string(body))
+	}
+
+	var geminiResp models.GeminiGenerateContentResponse
+	if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(geminiResp.Candidates) != 1 || geminiResp.Candidates[0].Content == nil || len(geminiResp.Candidates[0].Content.Parts) != 1 {
+		t.Fatalf("unexpected response: %#v", geminiResp)
+	}
+	text := geminiResp.Candidates[0].Content.Parts[0].Text
+	if text == nil || *text != "CLI defaults accepted" {
+		t.Errorf("text = %v, want CLI defaults accepted", text)
+	}
+	if geminiResp.UsageMetadata == nil || geminiResp.UsageMetadata.TotalTokenCount != 9 {
+		t.Errorf("UsageMetadata = %#v, want totalTokenCount=9", geminiResp.UsageMetadata)
+	}
+}
+
 func TestHandleGeminiModelsGenerateContentGemini31Preview(t *testing.T) {
 	const model = "gemini-3.1-pro-preview"
 

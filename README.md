@@ -88,6 +88,16 @@ export OPENAI_BASE_URL=http://localhost:1337/v1
 codex --model gpt-5.4
 ```
 
+### Gemini CLI
+
+```bash
+env GEMINI_API_KEY=dummy \
+  GOOGLE_GEMINI_BASE_URL=http://localhost:1337 \
+  GOOGLE_GENAI_API_VERSION=v1beta \
+  GEMINI_CLI_NO_RELAUNCH=true \
+  gemini -m gemini-2.5-pro -p "Reply with exactly PROXY_OK" -o json
+```
+
 ### Anthropic Messages API
 
 ```bash
