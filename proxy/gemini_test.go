@@ -289,6 +289,51 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 		}
 	})
 
+	t.Run("tools accept parametersJsonSchema", func(t *testing.T) {
+		req := &models.GeminiGenerateContentRequest{
+			Contents: []models.GeminiContent{{
+				Role: "user",
+				Parts: []models.GeminiPart{
+					{Text: stringPtr("Use the tool")},
+				},
+			}},
+			Tools: []models.GeminiTool{{
+				FunctionDeclarations: []models.GeminiFunctionDeclaration{{
+					Name: "lookup_weather",
+					ParametersJSONSchema: json.RawMessage(`{
+						"type":"object",
+						"properties":{"city":{"type":"string"}},
+						"required":["city"]
+					}`),
+				}},
+			}},
+		}
+
+		got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+		if err != nil {
+			t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+		}
+
+		if len(got.Tools) != 1 {
+			t.Fatalf("len(Tools) = %d, want 1", len(got.Tools))
+		}
+
+		var parameters map[string]interface{}
+		if err := json.Unmarshal(got.Tools[0].Function.Parameters, &parameters); err != nil {
+			t.Fatalf("unmarshal tool parameters: %v", err)
+		}
+		if parameters["type"] != "object" {
+			t.Fatalf("tool parameters type = %v, want object", parameters["type"])
+		}
+		properties, ok := parameters["properties"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("tool parameters properties = %#v, want object", parameters["properties"])
+		}
+		if _, ok := properties["city"]; !ok {
+			t.Fatalf("tool parameters properties = %#v, want city property", properties)
+		}
+	})
+
 	t.Run("allowed function names narrow the forwarded tool list", func(t *testing.T) {
 		req := &models.GeminiGenerateContentRequest{
 			Contents: []models.GeminiContent{{
@@ -410,8 +455,14 @@ func TestDecodeGeminiGenerateContentRequestSnakeCase(t *testing.T) {
 			}
 		},
 		"generation_config": {
+			"top_k": 64,
 			"max_output_tokens": 64,
 			"response_json_schema": {"type":"object","properties":{"answer":{"type":"string"}}},
+			"thinking_config": {
+				"include_thoughts": true,
+				"thinking_budget": 8192,
+				"thinking_level": "HIGH"
+			},
 			"presence_penalty": 0.1,
 			"frequency_penalty": 0.2,
 			"seed": 7
@@ -421,6 +472,30 @@ func TestDecodeGeminiGenerateContentRequestSnakeCase(t *testing.T) {
 	req, err := decodeGeminiGenerateContentRequest(body)
 	if err != nil {
 		t.Fatalf("decodeGeminiGenerateContentRequest() error = %v", err)
+	}
+	if req.GenerationConfig == nil {
+		t.Fatal("GenerationConfig = nil, want non-nil")
+	}
+	if req.GenerationConfig.TopK == nil || *req.GenerationConfig.TopK != 64 {
+		t.Fatalf("TopK = %v, want 64", req.GenerationConfig.TopK)
+	}
+
+	var thinking struct {
+		IncludeThoughts *bool   `json:"includeThoughts"`
+		ThinkingBudget  *int    `json:"thinkingBudget"`
+		ThinkingLevel   *string `json:"thinkingLevel"`
+	}
+	if err := json.Unmarshal(req.GenerationConfig.ThinkingConfig, &thinking); err != nil {
+		t.Fatalf("unmarshal thinkingConfig: %v", err)
+	}
+	if thinking.IncludeThoughts == nil || !*thinking.IncludeThoughts {
+		t.Fatalf("IncludeThoughts = %v, want true", thinking.IncludeThoughts)
+	}
+	if thinking.ThinkingBudget == nil || *thinking.ThinkingBudget != 8192 {
+		t.Fatalf("ThinkingBudget = %v, want 8192", thinking.ThinkingBudget)
+	}
+	if thinking.ThinkingLevel == nil || *thinking.ThinkingLevel != "HIGH" {
+		t.Fatalf("ThinkingLevel = %v, want HIGH", thinking.ThinkingLevel)
 	}
 
 	got, err := TranslateGeminiToOpenAI(req, "models/gemini-2.5-pro", false)
@@ -573,6 +648,14 @@ func TestDecodeGeminiGenerateContentRequestErrors(t *testing.T) {
 				"generation_config": {"unexpected_option": true}
 			}`,
 			wantMsg: "request.generationConfig.unexpected_option is not supported or unknown",
+		},
+		{
+			name: "unknown nested thinking config field is rejected",
+			body: `{
+				"contents": [{"role":"user","parts":[{"text":"hi"}]}],
+				"generation_config": {"thinking_config": {"unexpected_option": true}}
+			}`,
+			wantMsg: "request.generationConfig.thinkingConfig.unexpected_option is not supported or unknown",
 		},
 		{
 			name: "contents must be an array",
@@ -803,32 +886,6 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			pathModel:  "gemini-2.5-pro",
 			wantCode:   http.StatusNotImplemented,
 			wantStatus: "UNIMPLEMENTED",
-		},
-		{
-			name: "top k unsupported",
-			req: &models.GeminiGenerateContentRequest{
-				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
-				GenerationConfig: &models.GeminiGenerationConfig{
-					TopK: intPtr(64),
-				},
-			},
-			pathModel:  "gemini-2.5-pro",
-			wantCode:   http.StatusNotImplemented,
-			wantStatus: "UNIMPLEMENTED",
-			wantMsg:    "generationConfig.topK=64 is not supported",
-		},
-		{
-			name: "thinking config unsupported",
-			req: &models.GeminiGenerateContentRequest{
-				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
-				GenerationConfig: &models.GeminiGenerationConfig{
-					ThinkingConfig: json.RawMessage(`{"includeThoughts":true}`),
-				},
-			},
-			pathModel:  "gemini-2.5-pro",
-			wantCode:   http.StatusNotImplemented,
-			wantStatus: "UNIMPLEMENTED",
-			wantMsg:    "generationConfig.thinkingConfig is not supported",
 		},
 		{
 			name: "response modalities unsupported",
@@ -1104,6 +1161,32 @@ func TestTranslateGeminiToOpenAIAdditionalUnsupportedCases(t *testing.T) {
 	}
 }
 
+func TestDecodeGeminiGenerateContentRequestAcceptsParametersJSONSchema(t *testing.T) {
+	req, err := decodeGeminiGenerateContentRequest([]byte(`{
+		"contents": [{"role":"user","parts":[{"text":"Use the tool"}]}],
+		"tools": [{
+			"functionDeclarations": [{
+				"name": "lookup_weather",
+				"parametersJsonSchema": {
+					"type": "object",
+					"properties": {"city": {"type": "string"}},
+					"required": ["city"]
+				}
+			}]
+		}]
+	}`))
+	if err != nil {
+		t.Fatalf("decodeGeminiGenerateContentRequest() error = %v", err)
+	}
+
+	if len(req.Tools) != 1 || len(req.Tools[0].FunctionDeclarations) != 1 {
+		t.Fatalf("decoded tools = %#v, want one function declaration", req.Tools)
+	}
+	if !hasRawJSON(req.Tools[0].FunctionDeclarations[0].ParametersJSONSchema) {
+		t.Fatalf("ParametersJSONSchema = %s, want non-empty schema", string(req.Tools[0].FunctionDeclarations[0].ParametersJSONSchema))
+	}
+}
+
 func TestTranslateOpenAIToGemini(t *testing.T) {
 	finishReason := "tool_calls"
 	resp := &models.OpenAIResponse{
@@ -1237,6 +1320,71 @@ func TestHandleGeminiModelsGenerateContent(t *testing.T) {
 	}
 	if geminiResp.UsageMetadata == nil || geminiResp.UsageMetadata.TotalTokenCount != 13 {
 		t.Errorf("UsageMetadata = %#v, want totalTokenCount=13", geminiResp.UsageMetadata)
+	}
+}
+
+func TestHandleGeminiModelsGenerateContentIgnoresTopKAndThinkingConfig(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+
+		if oaiReq.Model != "gemini-2.5-pro" {
+			t.Errorf("Model = %q, want gemini-2.5-pro", oaiReq.Model)
+		}
+
+		_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+			ID:      "chatcmpl-topk",
+			Model:   "gemini-2.5-pro",
+			Created: 1234,
+			Choices: []models.OpenAIChoice{{
+				Index: 0,
+				Message: models.OpenAIMessage{
+					Role:    "assistant",
+					Content: json.RawMessage(`"Ignored topK"`),
+				},
+				FinishReason: strPtr("stop"),
+			}},
+			Usage: &models.OpenAIUsage{PromptTokens: 3, CompletionTokens: 2, TotalTokens: 5},
+		})
+	})
+
+	reqBody := `{
+		"contents": [{"role":"user","parts":[{"text":"Reply briefly"}]}],
+		"generationConfig": {
+			"topK": 64,
+			"thinkingConfig": {
+				"includeThoughts": true,
+				"thinkingBudget": 8192,
+				"thinkingLevel": "HIGH"
+			}
+		}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:generateContent", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleGeminiModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, string(body))
+	}
+
+	var geminiResp models.GeminiGenerateContentResponse
+	if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(geminiResp.Candidates) != 1 || geminiResp.Candidates[0].Content == nil || len(geminiResp.Candidates[0].Content.Parts) != 1 {
+		t.Fatalf("unexpected response: %#v", geminiResp)
+	}
+	text := geminiResp.Candidates[0].Content.Parts[0].Text
+	if text == nil || *text != "Ignored topK" {
+		t.Errorf("text = %v, want Ignored topK", text)
 	}
 }
 
@@ -1938,38 +2086,6 @@ func TestHandleGeminiModelsErrors(t *testing.T) {
 		}
 		if errResp.Error.Status != "UNIMPLEMENTED" {
 			t.Errorf("status = %q, want UNIMPLEMENTED", errResp.Error.Status)
-		}
-	})
-
-	t.Run("unsupported topK returns Google error envelope", func(t *testing.T) {
-		handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-			t.Fatal("backend should not be called")
-		})
-
-		reqBody := `{
-			"contents": [{"role":"user","parts":[{"text":"hi"}]}],
-			"generationConfig": {"topK": 64}
-		}`
-		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:generateContent", strings.NewReader(reqBody))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-
-		handler.HandleGeminiModels(w, req)
-
-		resp := w.Result()
-		if resp.StatusCode != http.StatusNotImplemented {
-			t.Fatalf("StatusCode = %d, want 501", resp.StatusCode)
-		}
-
-		var errResp models.GeminiErrorResponse
-		if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
-			t.Fatalf("decode error response: %v", err)
-		}
-		if errResp.Error.Status != "UNIMPLEMENTED" {
-			t.Errorf("status = %q, want UNIMPLEMENTED", errResp.Error.Status)
-		}
-		if !strings.Contains(errResp.Error.Message, "generationConfig.topK=64 is not supported") {
-			t.Errorf("message = %q, want topK unsupported detail", errResp.Error.Message)
 		}
 	})
 

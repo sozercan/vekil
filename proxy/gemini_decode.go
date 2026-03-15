@@ -78,10 +78,14 @@ var geminiContentNode = geminiJSONNode{
 }
 
 var geminiFunctionDeclarationNode = geminiJSONNode{
+	aliases: map[string]string{
+		"parameters_json_schema": "parametersJsonSchema",
+	},
 	allowed: geminiJSONSet(
 		"name",
 		"description",
 		"parameters",
+		"parametersJsonSchema",
 	),
 }
 
@@ -133,6 +137,19 @@ var geminiToolConfigNode = geminiJSONNode{
 	},
 }
 
+var geminiThinkingConfigNode = geminiJSONNode{
+	aliases: map[string]string{
+		"include_thoughts": "includeThoughts",
+		"thinking_budget":  "thinkingBudget",
+		"thinking_level":   "thinkingLevel",
+	},
+	allowed: geminiJSONSet(
+		"includeThoughts",
+		"thinkingBudget",
+		"thinkingLevel",
+	),
+}
+
 var geminiGenerationConfigNode = geminiJSONNode{
 	aliases: map[string]string{
 		"top_p":                "topP",
@@ -173,6 +190,9 @@ var geminiGenerationConfigNode = geminiJSONNode{
 		"responseLogprobs",
 		"logprobs",
 	),
+	objectChildren: map[string]geminiJSONNode{
+		"thinkingConfig": geminiThinkingConfigNode,
+	},
 }
 
 var geminiRequestNode = geminiJSONNode{

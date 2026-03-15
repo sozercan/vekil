@@ -253,7 +253,7 @@ The request decoder accepts both the standard Gemini camelCase envelope fields a
 - `contents[].parts[].inlineData` for `image/*` payloads
 - `contents[].parts[].functionCall`
 - `contents[].parts[].functionResponse`
-- `tools[].functionDeclarations`
+- `tools[].functionDeclarations` with either `parameters` or `parametersJsonSchema`
 - `toolConfig.functionCallingConfig`
 - `generationConfig.temperature`
 - `generationConfig.topP`
@@ -262,6 +262,8 @@ The request decoder accepts both the standard Gemini camelCase envelope fields a
 - `generationConfig.responseMimeType`
 - `generationConfig.responseSchema`
 - `generationConfig.responseJsonSchema`
+- `generationConfig.topK` is accepted but ignored because Copilot/OpenAI has no equivalent control
+- `generationConfig.thinkingConfig` with `includeThoughts`, `thinkingBudget`, and `thinkingLevel` is accepted but ignored because Copilot/OpenAI has no equivalent thinking control
 - `generationConfig.candidateCount` only when it is `1`
 - `generationConfig.presencePenalty`
 - `generationConfig.frequencyPenalty`
@@ -274,8 +276,6 @@ The request decoder accepts both the standard Gemini camelCase envelope fields a
 
 **Explicit `501 UNIMPLEMENTED` cases:**
 - `generationConfig.candidateCount != 1`
-- `generationConfig.topK`
-- `generationConfig.thinkingConfig`
 - `generationConfig.responseModalities`
 - `generationConfig.speechConfig`
 - `generationConfig.imageConfig`

@@ -70,9 +70,10 @@ type GeminiTool struct {
 
 // GeminiFunctionDeclaration is a tool schema declaration.
 type GeminiFunctionDeclaration struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	Name                 string          `json:"name"`
+	Description          string          `json:"description,omitempty"`
+	Parameters           json.RawMessage `json:"parameters,omitempty"`
+	ParametersJSONSchema json.RawMessage `json:"parametersJsonSchema,omitempty"`
 }
 
 // GeminiToolConfig configures tool selection.

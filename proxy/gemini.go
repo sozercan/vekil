@@ -670,9 +670,16 @@ func translateGeminiTools(tools []models.GeminiTool) ([]models.OpenAITool, map[s
 				return nil, nil, invalidGeminiArgument("tools[%d].functionDeclarations[%d].name is required", toolIdx, declIdx)
 			}
 
-			parameters, err := canonicalizeJSON(decl.Parameters)
+			schemaField := "parameters"
+			schema := decl.Parameters
+			if !hasRawJSON(schema) && hasRawJSON(decl.ParametersJSONSchema) {
+				schemaField = "parametersJsonSchema"
+				schema = decl.ParametersJSONSchema
+			}
+
+			parameters, err := canonicalizeJSON(schema)
 			if err != nil {
-				return nil, nil, invalidGeminiArgument("tools[%d].functionDeclarations[%d].parameters must be valid JSON schema", toolIdx, declIdx)
+				return nil, nil, invalidGeminiArgument("tools[%d].functionDeclarations[%d].%s must be valid JSON schema", toolIdx, declIdx, schemaField)
 			}
 
 			translated = append(translated, models.OpenAITool{
@@ -826,11 +833,8 @@ func validateGeminiGenerationConfig(config *models.GeminiGenerationConfig) error
 	if config.CandidateCount != nil && *config.CandidateCount != 1 {
 		return unsupportedGemini("generationConfig.candidateCount=%d is not supported", *config.CandidateCount)
 	}
-	if config.TopK != nil {
-		return unsupportedGemini("generationConfig.topK=%d is not supported", *config.TopK)
-	}
-	if hasRawJSON(config.ThinkingConfig) {
-		return unsupportedGemini("generationConfig.thinkingConfig is not supported; Gemini CLI thinking options cannot be translated today")
+	if err := validateGeminiThinkingConfig(config.ThinkingConfig); err != nil {
+		return err
 	}
 	if hasRawJSON(config.ResponseModalities) {
 		return unsupportedGemini("generationConfig.responseModalities is not supported; Gemini audio/image response modes cannot be translated today")
@@ -849,6 +853,30 @@ func validateGeminiGenerationConfig(config *models.GeminiGenerationConfig) error
 	}
 	if hasRawJSON(config.Logprobs) {
 		return unsupportedGemini("generationConfig.logprobs is not supported")
+	}
+
+	return nil
+}
+
+type geminiThinkingConfig struct {
+	IncludeThoughts *bool   `json:"includeThoughts,omitempty"`
+	ThinkingBudget  *int    `json:"thinkingBudget,omitempty"`
+	ThinkingLevel   *string `json:"thinkingLevel,omitempty"`
+}
+
+func validateGeminiThinkingConfig(raw json.RawMessage) error {
+	if !hasRawJSON(raw) {
+		return nil
+	}
+
+	normalized, err := normalizeGeminiJSON(raw, geminiThinkingConfigNode, "generationConfig.thinkingConfig", true)
+	if err != nil {
+		return err
+	}
+
+	var config geminiThinkingConfig
+	if err := json.Unmarshal(normalized, &config); err != nil {
+		return invalidGeminiArgument("generationConfig.thinkingConfig has invalid field types")
 	}
 
 	return nil
