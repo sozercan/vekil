@@ -1,15 +1,17 @@
 # copilot-proxy
 
-High-performance Go proxy that exposes Anthropic and OpenAI-compatible APIs, forwarding all requests to GitHub Copilot's backend (`api.githubcopilot.com`). This lets you use any tool that speaks the Anthropic or OpenAI protocol — such as [Claude Code](https://docs.anthropic.com/en/docs/claude-code), the OpenAI Python SDK, or `curl` — with your GitHub Copilot subscription.
+High-performance Go proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs, forwarding all requests to GitHub Copilot's backend (`api.githubcopilot.com`). This lets you use tools that speak the Anthropic, Gemini, or OpenAI protocol — such as [Claude Code](https://docs.anthropic.com/en/docs/claude-code), Gemini-compatible SDKs, the OpenAI Python SDK, or `curl` — with your GitHub Copilot subscription.
 
 ## Features
 
 - **Anthropic Messages API** (`POST /v1/messages`) — full request/response translation between Anthropic and OpenAI formats
+- **Gemini Generate Content API** (`POST /v1beta/models/{model}:generateContent`, `POST /models/{model}:generateContent`) — Gemini request/response/SSE translation on top of Copilot chat completions
+- **Gemini Count Tokens API** (`POST /v1beta/models/{model}:countTokens`, `POST /models/{model}:countTokens`) — translated token counting via a minimal upstream probe with short-lived caching
 - **OpenAI Chat Completions API** (`POST /v1/chat/completions`) — near zero-copy passthrough (tools-aware, see below)
 - **OpenAI Responses API** (`POST /v1/responses`) — near zero-copy passthrough
 - **SSE streaming** support for all endpoints
-- **Tool use** — Anthropic tool definitions are translated to OpenAI function calling format
-- **Parallel tool use** — reliable parallel tool calls on both Anthropic and OpenAI paths via forced-streaming aggregation
+- **Tool use** — Anthropic and Gemini function/tool definitions are translated to OpenAI function calling format
+- **Parallel tool use** — reliable parallel tool calls on Anthropic, Gemini, and OpenAI paths via forced-streaming aggregation
 - **Extended thinking** — Anthropic `thinking` parameter is mapped to `max_completion_tokens`
 - **GitHub OAuth device code flow** with automatic token caching and refresh
 - **Automatic retry** with exponential backoff on transient upstream errors (429, 502, 503, 504)
@@ -128,6 +130,51 @@ curl http://localhost:1337/v1/chat/completions \
   }'
 ```
 
+### Gemini Generate Content API
+
+```bash
+curl http://localhost:1337/v1beta/models/gemini-2.5-pro:generateContent \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [
+      {
+        "role": "user",
+        "parts": [{"text": "Hello, world!"}]
+      }
+    ]
+  }'
+```
+
+### Gemini Stream Generate Content API
+
+```bash
+curl http://localhost:1337/v1beta/models/gemini-2.5-pro:streamGenerateContent \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [
+      {
+        "role": "user",
+        "parts": [{"text": "Stream a short answer"}]
+      }
+    ]
+  }'
+```
+
+### Gemini Count Tokens API
+
+```bash
+curl http://localhost:1337/v1beta/models/gemini-2.5-pro:countTokens \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [
+      {
+        "role": "user",
+        "parts": [{"text": "Count these tokens"}]
+      }
+    ]
+  }'
+```
+
 ### OpenAI Responses API
 
 ```bash
@@ -194,6 +241,63 @@ curl http://localhost:1337/v1/models
 
 </details>
 
+### `POST /v1beta/models/{model}:generateContent` and `POST /models/{model}:generateContent` (Gemini)
+
+Gemini is implemented as a translation path like Anthropic, not a passthrough path like OpenAI. Gemini requests are translated into OpenAI Chat Completions, forwarded to GitHub Copilot, and translated back into Gemini responses. When function declarations are present, non-streaming `generateContent` requests force upstream streaming and aggregate the result back into a normal Gemini JSON response so parallel function calls remain reliable.
+
+The request decoder accepts both the standard Gemini camelCase envelope fields and LiteLLM-style snake_case aliases such as `system_instruction`, `function_declarations`, `inline_data`, `max_output_tokens`, and `response_json_schema`.
+
+**Supported subset:**
+- `systemInstruction.parts[].text`
+- `contents[].parts[].text`
+- `contents[].parts[].inlineData` for `image/*` payloads
+- `contents[].parts[].functionCall`
+- `contents[].parts[].functionResponse`
+- `tools[].functionDeclarations`
+- `toolConfig.functionCallingConfig`
+- `generationConfig.temperature`
+- `generationConfig.topP`
+- `generationConfig.maxOutputTokens`
+- `generationConfig.stopSequences`
+- `generationConfig.responseMimeType`
+- `generationConfig.responseSchema`
+- `generationConfig.responseJsonSchema`
+- `generationConfig.candidateCount` only when it is `1`
+- `generationConfig.presencePenalty`
+- `generationConfig.frequencyPenalty`
+- `generationConfig.seed`
+
+**Streaming behavior:**
+- `streamGenerateContent` always returns Gemini-style data-only SSE (`data: {...}\n\n`)
+- Partial OpenAI tool-call chunks are buffered until the arguments become valid JSON, then emitted as Gemini `functionCall` parts
+- Final streaming chunks include Gemini `finishReason` and `usageMetadata`
+
+**Explicit `501 UNIMPLEMENTED` cases:**
+- `generationConfig.candidateCount != 1`
+- `generationConfig.topK`
+- `generationConfig.thinkingConfig`
+- `generationConfig.responseModalities`
+- `generationConfig.speechConfig`
+- `generationConfig.imageConfig`
+- `generationConfig.mediaResolution`
+- `generationConfig.responseLogprobs`
+- `generationConfig.logprobs`
+- `cachedContent`
+- `safetySettings`
+- `functionResponse.parts` and other multimodal tool-response payloads
+- Gemini built-in tools such as `googleSearch`, `googleSearchRetrieval`, `urlContext`, `codeExecution`, `googleMaps`, `computerUse`, and `enterpriseWebSearch`
+- Non-image `inlineData`, `fileData`, and other non-text/media parts
+
+**Validation failures (`400 INVALID_ARGUMENT`):**
+- Path/body model mismatches
+- Malformed content parts
+- Invalid function-call history
+- Unmatched `functionResponse` parts
+
+### `POST /v1beta/models/{model}:countTokens` and `POST /models/{model}:countTokens` (Gemini)
+
+`countTokens` translates the Gemini request into the same normalized OpenAI-style prompt/tool payload used by `generateContent`, then performs a minimal upstream `/chat/completions` probe with `stream=false`, `temperature=0`, and `max_completion_tokens=1` (falling back to `max_tokens=1` when needed). The proxy returns `usage.prompt_tokens` as Gemini `totalTokens` and caches normalized requests for 60 seconds.
+
 ### `POST /v1/chat/completions` (OpenAI)
 
 Near zero-copy passthrough for requests without tools. When tools are present, the proxy injects `parallel_tool_calls: true` and forces streaming to the upstream for reliable parallel tool call support, then aggregates the response back to non-streaming JSON for the client. Streaming requests with tools are passed through as-is (parallel tool calls work natively in streaming mode).
@@ -221,6 +325,11 @@ Health check endpoint. Returns `{"status":"ok"}`.
 │                   Translate ◄──   .com               │
 │                   OAI→Anthropic                      │
 │                                                      │
+│  /v1beta/models/... ─► Translate ─► /chat/completions│
+│  /models/...          Gemini→OAI     api.githubcopilot│
+│                       Translate ◄──   .com            │
+│                       OAI→Gemini                      │
+│                                                      │
 │  /v1/chat/completions ─────────► /chat/completions   │
 │                   (passthrough; forced-stream         │
 │                    + aggregate when tools present)    │
@@ -237,8 +346,8 @@ Health check endpoint. Returns `{"status":"ok"}`.
 |---------|---------------|
 | `main` | CLI flags, HTTP server setup, graceful shutdown |
 | `auth/` | GitHub OAuth device code flow, Copilot token exchange, disk caching, auto-refresh with `sync.RWMutex` |
-| `proxy/` | HTTP handlers, Anthropic↔OpenAI translation, SSE streaming, retry with backoff |
-| `models/` | Request/response type definitions for both APIs (data-only, no logic) |
+| `proxy/` | HTTP handlers, Anthropic↔OpenAI and Gemini↔OpenAI translation, SSE streaming, retry with backoff |
+| `models/` | Request/response type definitions for all supported APIs (data-only, no logic) |
 | `logger/` | Structured JSON logging with level filtering |
 | `server/` | Reusable HTTP server lifecycle (Start/Stop/IsRunning) |
 | `cmd/menubar/` | macOS menubar app using systray |
