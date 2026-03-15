@@ -45,7 +45,7 @@ func writeGeminiSSEData(w http.ResponseWriter, data interface{}) error {
 // StreamOpenAIToGemini translates upstream OpenAI SSE into Gemini-style
 // data-only SSE frames.
 func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
 	scanner := bufio.NewScanner(body)

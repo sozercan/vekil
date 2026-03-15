@@ -58,7 +58,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		writeGeminiError(w, status, "INVALID_ARGUMENT", err.Error())
 		return
 	}
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 
 	req, err := decodeGeminiGenerateContentRequest(body)
 	if err != nil {
@@ -108,7 +108,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		errBody, _ := io.ReadAll(resp.Body)
 		h.log.Error("upstream error", logger.F("endpoint", "gemini"), logger.F("status", resp.StatusCode), logger.F("body", string(errBody)), logger.F("request", string(oaiBody)))
 		writeGeminiError(w, resp.StatusCode, mapGeminiUpstreamStatus(resp.StatusCode), fmt.Sprintf("upstream error (%d): %s", resp.StatusCode, string(errBody)))
@@ -128,7 +128,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 			return
 		}
 	} else {
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		var parsed models.OpenAIResponse
 		if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 			writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", "failed to parse upstream response")
@@ -151,7 +151,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 		writeGeminiError(w, status, "INVALID_ARGUMENT", err.Error())
 		return
 	}
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 
 	req, err := decodeGeminiCountTokensRequest(body)
 	if err != nil {
@@ -290,7 +290,7 @@ func (h *ProxyHandler) executeGeminiCountTokensProbe(token string, probeReq *mod
 	}
 
 	if resp.StatusCode == http.StatusBadRequest && probeReq.MaxCompletionTokens != nil {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, true, nil
 	}
 
@@ -320,7 +320,7 @@ func (h *ProxyHandler) executeGeminiCountTokensProbeFinal(token string, probeReq
 }
 
 func (h *ProxyHandler) decodeGeminiProbeResponse(resp *http.Response) (*models.OpenAIResponse, bool, error) {
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(resp.Body)
