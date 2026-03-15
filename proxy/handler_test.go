@@ -452,6 +452,96 @@ func TestHandleCompact_ReplacesInstructions(t *testing.T) {
 	}
 }
 
+func TestHandleCompact_FallsBackWhenModelUnsupported(t *testing.T) {
+	responsesRequests := 0
+	modelsRequests := 0
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/responses":
+			responsesRequests++
+
+			body, _ := io.ReadAll(r.Body)
+			var req map[string]interface{}
+			if err := json.Unmarshal(body, &req); err != nil {
+				t.Fatalf("upstream received invalid JSON: %v", err)
+			}
+			model, _ := req["model"].(string)
+
+			switch responsesRequests {
+			case 1:
+				if model != "gpt-4o" {
+					t.Fatalf("expected first compaction attempt to use gpt-4o, got %q", model)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"message":"model gpt-4o is not supported via Responses API.","code":"unsupported_api_for_model","param":"model","type":"invalid_request_error"}}`))
+			case 2:
+				if model != "gpt-5.4" {
+					t.Fatalf("expected fallback compaction attempt to use gpt-5.4, got %q", model)
+				}
+				instructions, _ := req["instructions"].(string)
+				if !strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
+					t.Fatalf("expected compaction prompt to be preserved on fallback, got %q", instructions)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fallback summary"}]}]}`))
+			default:
+				t.Fatalf("unexpected /responses request count %d", responsesRequests)
+			}
+		case "/models":
+			modelsRequests++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5-mini","supported_endpoints":["/responses"]},{"id":"gpt-5.4","supported_endpoints":["/responses"]},{"id":"gpt-4o","supported_endpoints":["/chat/completions"]}]}`))
+		default:
+			t.Fatalf("unexpected upstream path %q", r.URL.Path)
+		}
+	})
+
+	reqBody := `{"model":"gpt-4o","input":"Hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if responsesRequests != 2 {
+		t.Fatalf("expected 2 /responses attempts, got %d", responsesRequests)
+	}
+	if modelsRequests != 1 {
+		t.Fatalf("expected 1 /models lookup, got %d", modelsRequests)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Output []struct {
+			Type             string `json:"type"`
+			EncryptedContent string `json:"encrypted_content"`
+			Content          []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to parse compact response: %v", err)
+	}
+	if len(result.Output) != 2 {
+		t.Fatalf("expected 2 output items, got %d", len(result.Output))
+	}
+	if len(result.Output[0].Content) == 0 || result.Output[0].Content[0].Text != "fallback summary" {
+		t.Fatalf("expected fallback summary in first output item, got %+v", result.Output[0].Content)
+	}
+	if got := decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent); got != "fallback summary" {
+		t.Fatalf("expected encoded fallback summary, got %q", got)
+	}
+}
+
 func TestHandleResponses_RewritesSyntheticCompaction(t *testing.T) {
 	summary := "Synthetic compacted summary"
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -912,7 +1002,7 @@ func TestHandleModels(t *testing.T) {
 				t.Errorf("expected Authorization header 'Bearer test-token', got %q", got)
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4o","object":"model","created":0,"owned_by":"github-copilot","capabilities":{"supports":{"parallel_tool_calls":true,"vision":true},"limits":{"max_context_window_tokens":128000}},"model_picker_enabled":true,"model_picker_category":"versatile","name":"GPT-4o"},{"id":"claude-sonnet-4","object":"model","created":0,"owned_by":"github-copilot","name":"Claude Sonnet 4"}]}`))
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.4","object":"model","created":0,"owned_by":"github-copilot","supported_endpoints":["/responses"],"capabilities":{"supports":{"parallel_tool_calls":true,"vision":true,"reasoning_effort":["low","medium","high"]},"limits":{"max_context_window_tokens":128000}},"model_picker_enabled":true,"model_picker_category":"powerful","name":"GPT-5.4"},{"id":"claude-sonnet-4","object":"model","created":0,"owned_by":"github-copilot","supported_endpoints":["/chat/completions","/v1/messages"],"name":"Claude Sonnet 4","model_picker_enabled":true,"model_picker_category":"versatile"}]}`))
 		})
 		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 		w := httptest.NewRecorder()
@@ -934,6 +1024,7 @@ func TestHandleModels(t *testing.T) {
 				Slug                      string `json:"slug"`
 				DisplayName               string `json:"display_name"`
 				Visibility                string `json:"visibility"`
+				SupportedInAPI            bool   `json:"supported_in_api"`
 				ContextWindow             *int64 `json:"context_window"`
 				SupportsParallelToolCalls bool   `json:"supports_parallel_tool_calls"`
 				ShellType                 string `json:"shell_type"`
@@ -948,21 +1039,24 @@ func TestHandleModels(t *testing.T) {
 		if len(result.Data) != 2 {
 			t.Fatalf("expected 2 data entries, got %d", len(result.Data))
 		}
-		if result.Data[0].ID != "gpt-4o" {
-			t.Errorf("expected first model gpt-4o, got %q", result.Data[0].ID)
+		if result.Data[0].ID != "gpt-5.4" {
+			t.Errorf("expected first model gpt-5.4, got %q", result.Data[0].ID)
 		}
 		// Verify Codex-compatible models field
 		if len(result.Models) != 2 {
 			t.Fatalf("expected 2 models entries, got %d", len(result.Models))
 		}
-		if result.Models[0].Slug != "gpt-4o" {
-			t.Errorf("expected first model slug gpt-4o, got %q", result.Models[0].Slug)
+		if result.Models[0].Slug != "gpt-5.4" {
+			t.Errorf("expected first model slug gpt-5.4, got %q", result.Models[0].Slug)
 		}
-		if result.Models[0].DisplayName != "GPT-4o" {
-			t.Errorf("expected display_name GPT-4o, got %q", result.Models[0].DisplayName)
+		if result.Models[0].DisplayName != "GPT-5.4" {
+			t.Errorf("expected display_name GPT-5.4, got %q", result.Models[0].DisplayName)
 		}
 		if result.Models[0].Visibility != "list" {
 			t.Errorf("expected visibility list, got %q", result.Models[0].Visibility)
+		}
+		if !result.Models[0].SupportedInAPI {
+			t.Error("expected first model supported_in_api true")
 		}
 		if result.Models[0].ContextWindow == nil || *result.Models[0].ContextWindow != 128000 {
 			t.Errorf("expected context_window 128000, got %v", result.Models[0].ContextWindow)
@@ -976,6 +1070,9 @@ func TestHandleModels(t *testing.T) {
 		// Second model should have visibility "hide" (model_picker_enabled not set)
 		if result.Models[1].Visibility != "hide" {
 			t.Errorf("expected second model visibility hide, got %q", result.Models[1].Visibility)
+		}
+		if result.Models[1].SupportedInAPI {
+			t.Error("expected second model supported_in_api false")
 		}
 	})
 

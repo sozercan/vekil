@@ -38,6 +38,18 @@ const (
 	syntheticCompactionPrefix = "copilot-proxy.compaction.v1:"
 )
 
+var preferredResponsesFallbackModels = []string{
+	"gpt-5.4",
+	"gpt-5.3-codex",
+	"gpt-5.2",
+	"gpt-5.2-codex",
+	"gpt-5.1",
+	"gpt-5.1-codex",
+	"gpt-5.1-codex-max",
+	"gpt-5.1-codex-mini",
+	"gpt-5-mini",
+}
+
 // modelsCache holds a cached /models response to avoid repeated upstream calls.
 type modelsCache struct {
 	mu      sync.RWMutex
@@ -60,6 +72,7 @@ type ProxyHandler struct {
 	maxRetries     int
 	retryBaseDelay time.Duration
 	models         modelsCache
+	geminiCounts   geminiCountTokensCache
 }
 
 // NewProxyHandler creates a ProxyHandler with connection pooling and HTTP/2.
@@ -454,14 +467,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	upstreamCtx, upstreamCancel := context.WithTimeout(context.Background(), upstreamTimeout)
 	defer upstreamCancel()
 
-	resp, err := h.doWithRetry(func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, h.copilotURL+"/responses", bytes.NewReader(bodyBytes))
-		if err != nil {
-			return nil, err
-		}
-		setCopilotHeaders(req, token)
-		return req, nil
-	})
+	resp, err := h.postResponsesWithFallback(upstreamCtx, token, bodyBytes)
 	if err != nil {
 		status := http.StatusBadGateway
 		if ue, ok := err.(*upstreamError); ok {
@@ -618,14 +624,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	upstreamCtx, upstreamCancel := context.WithTimeout(context.Background(), upstreamTimeout)
 	defer upstreamCancel()
 
-	resp, err := h.doWithRetry(func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, h.copilotURL+"/responses", bytes.NewReader(reqBody))
-		if err != nil {
-			return nil, err
-		}
-		setCopilotHeaders(req, token)
-		return req, nil
-	})
+	resp, err := h.postResponsesWithFallback(upstreamCtx, token, reqBody)
 	if err != nil {
 		status := http.StatusBadGateway
 		if ue, ok := err.(*upstreamError); ok {
@@ -879,9 +878,10 @@ func transformModelsResponse(body []byte) []byte {
 	var codexModels []codexModel
 	for _, raw := range upstream.Data {
 		var m struct {
-			ID           string `json:"id"`
-			Name         string `json:"name"`
-			Capabilities struct {
+			ID                 string   `json:"id"`
+			Name               string   `json:"name"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
+			Capabilities       struct {
 				Limits struct {
 					MaxContextWindowTokens int64 `json:"max_context_window_tokens"`
 				} `json:"limits"`
@@ -899,8 +899,10 @@ func transformModelsResponse(body []byte) []byte {
 			continue
 		}
 
+		supportsResponses := supportsEndpoint(m.SupportedEndpoints, "/responses")
+
 		visibility := "hide"
-		if m.ModelPickerEnabled {
+		if m.ModelPickerEnabled && supportsResponses {
 			visibility = "list"
 		}
 
@@ -946,7 +948,7 @@ func transformModelsResponse(body []byte) []byte {
 			SupportedReasoningLevels:    reasoningLevels,
 			ShellType:                   "shell_command",
 			Visibility:                  visibility,
-			SupportedInAPI:              true,
+			SupportedInAPI:              supportsResponses,
 			Priority:                    priority,
 			BaseInstructions:            "",
 			SupportsReasoningSummaries:  len(reasoningLevels) > 0,
@@ -977,6 +979,201 @@ func transformModelsResponse(body []byte) []byte {
 		return body
 	}
 	return out
+}
+
+func supportsEndpoint(supportedEndpoints []string, endpoint string) bool {
+	for _, candidate := range supportedEndpoints {
+		if candidate == endpoint {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *ProxyHandler) postResponses(ctx context.Context, token string, bodyBytes []byte) (*http.Response, error) {
+	return h.doWithRetry(func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.copilotURL+"/responses", bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, err
+		}
+		setCopilotHeaders(req, token)
+		return req, nil
+	})
+}
+
+func (h *ProxyHandler) postResponsesWithFallback(ctx context.Context, token string, bodyBytes []byte) (*http.Response, error) {
+	resp, err := h.postResponses(ctx, token, bodyBytes)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusOK {
+		return resp, nil
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		_ = resp.Body.Close()
+		return nil, err
+	}
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(respBody))
+
+	if !isUnsupportedResponsesModelError(resp.StatusCode, respBody) {
+		return resp, nil
+	}
+
+	requestedModel := extractResponsesRequestModel(bodyBytes)
+	fallbackModel, fallbackErr := h.pickResponsesCompatibleModel(ctx, token, requestedModel)
+	if fallbackErr != nil {
+		h.log.Debug("responses fallback lookup failed", logger.Err(fallbackErr))
+		return resp, nil
+	}
+	if fallbackModel == "" || fallbackModel == requestedModel {
+		return resp, nil
+	}
+
+	fallbackBody, changed, fallbackErr := rewriteResponsesRequestModel(bodyBytes, fallbackModel)
+	if fallbackErr != nil {
+		h.log.Debug("responses fallback rewrite failed", logger.Err(fallbackErr))
+		return resp, nil
+	}
+	if !changed {
+		return resp, nil
+	}
+
+	h.log.Info("retrying responses request with fallback model",
+		logger.F("requested_model", requestedModel),
+		logger.F("fallback_model", fallbackModel),
+	)
+
+	retryResp, retryErr := h.postResponses(ctx, token, fallbackBody)
+	if retryErr != nil {
+		h.log.Debug("responses fallback request failed", logger.Err(retryErr))
+		return resp, nil
+	}
+
+	return retryResp, nil
+}
+
+func isUnsupportedResponsesModelError(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadRequest {
+		return false
+	}
+
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Param   string `json:"param"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return false
+	}
+
+	switch envelope.Error.Code {
+	case "model_not_supported", "unsupported_api_for_model":
+		return true
+	}
+
+	message := strings.ToLower(envelope.Error.Message)
+	return envelope.Error.Param == "model" &&
+		strings.Contains(message, "model") &&
+		strings.Contains(message, "not supported")
+}
+
+func extractResponsesRequestModel(body []byte) string {
+	var payload struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Model)
+}
+
+func rewriteResponsesRequestModel(body []byte, model string) ([]byte, bool, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, false, err
+	}
+
+	current := extractResponsesRequestModel(body)
+	if current == model {
+		return body, false, nil
+	}
+
+	rawModel, err := json.Marshal(model)
+	if err != nil {
+		return nil, false, err
+	}
+	payload["model"] = rawModel
+
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false, err
+	}
+	return rewritten, true, nil
+}
+
+func (h *ProxyHandler) pickResponsesCompatibleModel(ctx context.Context, token, exclude string) (string, error) {
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.copilotURL+"/models", nil)
+		if err != nil {
+			return nil, err
+		}
+		setCopilotHeaders(req, token)
+		return req, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("unexpected /models status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var upstream struct {
+		Data []struct {
+			ID                 string   `json:"id"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
+			Policy             struct {
+				State string `json:"state"`
+			} `json:"policy"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&upstream); err != nil {
+		return "", err
+	}
+
+	supported := make(map[string]struct{})
+	firstAvailable := ""
+	for _, model := range upstream.Data {
+		if model.ID == "" || model.ID == exclude {
+			continue
+		}
+		if !supportsEndpoint(model.SupportedEndpoints, "/responses") {
+			continue
+		}
+		if strings.EqualFold(model.Policy.State, "disabled") {
+			continue
+		}
+		supported[model.ID] = struct{}{}
+		if firstAvailable == "" {
+			firstAvailable = model.ID
+		}
+	}
+
+	for _, preferred := range preferredResponsesFallbackModels {
+		if _, ok := supported[preferred]; ok {
+			return preferred, nil
+		}
+	}
+
+	return firstAvailable, nil
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, errType, message string) {
