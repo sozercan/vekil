@@ -47,6 +47,9 @@ func onReady() {
 
 	mLaunch := systray.AddMenuItemCheckbox("Launch at Login", "Launch at Login", false)
 	if isLaunchAgentInstalled() {
+		if err := installLaunchAgent(); err != nil {
+			log.Error("failed to refresh launch agent", logger.Err(err))
+		}
 		mLaunch.Check()
 	}
 
