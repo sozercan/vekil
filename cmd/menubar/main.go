@@ -110,11 +110,13 @@ func startProxy() {
 		return
 	}
 
-	srv = server.New(authenticator, log, "0.0.0.0", "1337")
-	if err := srv.Start(); err != nil {
+	nextSrv := server.New(authenticator, log, "0.0.0.0", "1337")
+	if err := nextSrv.Start(); err != nil {
 		log.Error("server start failed", logger.Err(err))
+		showErrorDialog("Proxy Start Failed", fmt.Sprintf("Could not start the proxy on port 1337.\n\n%v", err))
 		return
 	}
+	srv = nextSrv
 
 	mToggle.SetTitle("Stop Proxy")
 	systray.SetIcon(iconOn)
