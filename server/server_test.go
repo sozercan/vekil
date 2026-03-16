@@ -15,7 +15,11 @@ func TestStart_ReturnsErrorWhenPortInUse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to reserve port: %v", err)
 	}
-	defer listener.Close()
+	defer func() {
+		if err := listener.Close(); err != nil {
+			t.Fatalf("failed to close listener: %v", err)
+		}
+	}()
 
 	addr, ok := listener.Addr().(*net.TCPAddr)
 	if !ok {
