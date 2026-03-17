@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/sozercan/copilot-proxy/models"
@@ -9,6 +10,16 @@ import (
 
 func strPtr(s string) *string { return &s }
 func intPtr(i int) *int       { return &i }
+
+func decodeContentParts(t *testing.T, raw json.RawMessage) []models.OpenAIContentPart {
+	t.Helper()
+
+	var parts []models.OpenAIContentPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		t.Fatalf("content is not a JSON content-part array: %v", err)
+	}
+	return parts
+}
 
 func TestTranslateAnthropicToOpenAI(t *testing.T) {
 	t.Run("simple text message", func(t *testing.T) {
@@ -35,6 +46,82 @@ func TestTranslateAnthropicToOpenAI(t *testing.T) {
 		}
 		if text != "Hello" {
 			t.Errorf("content = %q, want %q", text, "Hello")
+		}
+	})
+
+	t.Run("text and image content blocks become multimodal content array", func(t *testing.T) {
+		content := `[{"type":"text","text":"What is in this screenshot?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AQID"}}]`
+		req := &models.AnthropicRequest{
+			Model:     "claude-3-opus",
+			MaxTokens: intPtr(100),
+			Messages: []models.AnthropicMessage{
+				{Role: "user", Content: json.RawMessage(content)},
+			},
+		}
+
+		got, err := TranslateAnthropicToOpenAI(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got.Messages) != 1 {
+			t.Fatalf("expected 1 message, got %d", len(got.Messages))
+		}
+
+		parts := decodeContentParts(t, got.Messages[0].Content)
+		if len(parts) != 2 {
+			t.Fatalf("expected 2 content parts, got %d", len(parts))
+		}
+		if parts[0].Type != "text" || parts[0].Text == nil || *parts[0].Text != "What is in this screenshot?" {
+			t.Fatalf("parts[0] = %#v, want text part", parts[0])
+		}
+		if parts[1].Type != "image_url" || parts[1].ImageURL == nil || parts[1].ImageURL.URL != "data:image/png;base64,AQID" {
+			t.Fatalf("parts[1] = %#v, want image_url data URL", parts[1])
+		}
+	})
+
+	t.Run("image-only content block is preserved", func(t *testing.T) {
+		content := `[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AQID"}}]`
+		req := &models.AnthropicRequest{
+			Model:     "claude-3-opus",
+			MaxTokens: intPtr(100),
+			Messages: []models.AnthropicMessage{
+				{Role: "user", Content: json.RawMessage(content)},
+			},
+		}
+
+		got, err := TranslateAnthropicToOpenAI(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got.Messages) != 1 {
+			t.Fatalf("expected 1 message, got %d", len(got.Messages))
+		}
+
+		parts := decodeContentParts(t, got.Messages[0].Content)
+		if len(parts) != 1 {
+			t.Fatalf("expected 1 content part, got %d", len(parts))
+		}
+		if parts[0].Type != "image_url" || parts[0].ImageURL == nil || parts[0].ImageURL.URL != "data:image/png;base64,AQID" {
+			t.Fatalf("parts[0] = %#v, want image_url data URL", parts[0])
+		}
+	})
+
+	t.Run("unsupported content blocks fail instead of being dropped", func(t *testing.T) {
+		content := `[{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"AQID"}}]`
+		req := &models.AnthropicRequest{
+			Model:     "claude-3-opus",
+			MaxTokens: intPtr(100),
+			Messages: []models.AnthropicMessage{
+				{Role: "user", Content: json.RawMessage(content)},
+			},
+		}
+
+		_, err := TranslateAnthropicToOpenAI(req)
+		if err == nil {
+			t.Fatal("expected error for unsupported content block")
+		}
+		if !strings.Contains(err.Error(), `unsupported content block type "document"`) {
+			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 
