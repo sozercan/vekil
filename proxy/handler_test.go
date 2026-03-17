@@ -131,6 +131,71 @@ func TestHandleAnthropicMessages(t *testing.T) {
 	}
 }
 
+func TestHandleAnthropicMessages_ImageBlocksForwarded(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("failed to parse upstream request: %v", err)
+		}
+		if len(oaiReq.Messages) != 1 {
+			t.Fatalf("expected 1 upstream message, got %d", len(oaiReq.Messages))
+		}
+
+		var parts []models.OpenAIContentPart
+		if err := json.Unmarshal(oaiReq.Messages[0].Content, &parts); err != nil {
+			t.Fatalf("expected multimodal content array, got error: %v", err)
+		}
+		if len(parts) != 2 {
+			t.Fatalf("expected 2 content parts, got %d", len(parts))
+		}
+		if parts[0].Type != "text" || parts[0].Text == nil || *parts[0].Text != "What is in this screenshot?" {
+			t.Fatalf("parts[0] = %#v, want text part", parts[0])
+		}
+		if parts[1].Type != "image_url" || parts[1].ImageURL == nil || parts[1].ImageURL.URL != "data:image/png;base64,AQID" {
+			t.Fatalf("parts[1] = %#v, want image_url data URL", parts[1])
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-image\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I can see the screenshot.\"},\"finish_reason\":null}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-image\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	})
+
+	anthropicReq := `{
+		"model": "claude-sonnet-4",
+		"max_tokens": 1024,
+		"messages": [{
+			"role": "user",
+			"content": [
+				{"type":"text","text":"What is in this screenshot?"},
+				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AQID"}}
+			]
+		}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(anthropicReq))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var anthropicResp models.AnthropicResponse
+	body, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(body, &anthropicResp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if len(anthropicResp.Content) != 1 || anthropicResp.Content[0].Type != "text" || anthropicResp.Content[0].Text != "I can see the screenshot." {
+		t.Fatalf("unexpected content: %+v", anthropicResp.Content)
+	}
+}
+
 func TestHandleAnthropicMessagesInvalidJSON(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("backend should not be called for invalid JSON")

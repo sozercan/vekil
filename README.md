@@ -4,7 +4,7 @@ High-performance Go proxy that exposes Anthropic, Gemini, and OpenAI-compatible 
 
 ## Features
 
-- **Anthropic Messages API** (`POST /v1/messages`) — full request/response translation between Anthropic and OpenAI formats
+- **Anthropic Messages API** (`POST /v1/messages`) — request/response translation for supported Anthropic text, image, and tool formats
 - **Gemini Generate Content API** (`POST /v1beta/models/{model}:generateContent`, `POST /models/{model}:generateContent`) — Gemini request/response/SSE translation on top of Copilot chat completions
 - **Gemini Count Tokens API** (`POST /v1beta/models/{model}:countTokens`, `POST /models/{model}:countTokens`) — translated token counting via a minimal upstream probe with short-lived caching
 - **OpenAI Chat Completions API** (`POST /v1/chat/completions`) — near zero-copy passthrough (tools-aware, see below)
@@ -200,10 +200,10 @@ curl http://localhost:1337/v1/responses \
 
 ### `POST /v1/messages` (Anthropic)
 
-Full Anthropic Messages API compatibility. Incoming requests are translated to OpenAI Chat Completions format, forwarded to GitHub Copilot, and responses are translated back to Anthropic format.
+Anthropic Messages API compatibility for the supported content and tool subset. Incoming requests are translated to OpenAI Chat Completions format, forwarded to GitHub Copilot, and responses are translated back to Anthropic format.
 
 **Supported features:**
-- Text and tool-use content blocks
+- Text, image-input, and tool-use content blocks
 - System messages (string or content block array)
 - Tool definitions and tool choice (`auto`, `any`, `tool`)
 - Stop sequences

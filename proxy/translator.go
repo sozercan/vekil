@@ -14,11 +14,11 @@ var dateModelRegex = regexp.MustCompile(`-\d{8}$`)
 
 // modelAliases maps Anthropic model names to Copilot-compatible names.
 var modelAliases = map[string]string{
-	"claude-haiku-4-5":   "claude-haiku-4.5",
-	"claude-sonnet-4-5":  "claude-sonnet-4.5",
-	"claude-opus-4-5":    "claude-opus-4.5",
-	"claude-sonnet-4-6":  "claude-sonnet-4.6",
-	"claude-opus-4-6":    "claude-opus-4.6",
+	"claude-haiku-4-5":  "claude-haiku-4.5",
+	"claude-sonnet-4-5": "claude-sonnet-4.5",
+	"claude-opus-4-5":   "claude-opus-4.5",
+	"claude-sonnet-4-6": "claude-sonnet-4.6",
+	"claude-opus-4-6":   "claude-opus-4.6",
 }
 
 // NormalizeModelName converts Anthropic model names to Copilot-compatible names.
@@ -141,8 +141,11 @@ func parseSystemMessage(raw json.RawMessage) (*models.OpenAIMessage, error) {
 
 	var text string
 	for _, b := range blocks {
-		if b.Type == "text" {
+		switch b.Type {
+		case "text":
 			text += b.Text
+		default:
+			return nil, fmt.Errorf("unsupported system content block type %q", b.Type)
 		}
 	}
 	if text == "" {
@@ -167,13 +170,22 @@ func translateMessage(msg models.AnthropicMessage) ([]models.OpenAIMessage, erro
 	}
 
 	var result []models.OpenAIMessage
-	var textParts string
+	var textParts strings.Builder
+	var multimodalParts []models.OpenAIContentPart
 	var toolCalls []models.OpenAIToolCall
 
 	for _, block := range blocks {
 		switch block.Type {
 		case "text":
-			textParts += block.Text
+			appendTextContentPart(&textParts, &multimodalParts, block.Text)
+
+		case "image":
+			part, err := translateAnthropicImageBlock(block)
+			if err != nil {
+				return nil, err
+			}
+			flushTextContentPart(&textParts, &multimodalParts)
+			multimodalParts = append(multimodalParts, *part)
 
 		case "tool_use":
 			toolCalls = append(toolCalls, models.OpenAIToolCall{
@@ -199,19 +211,25 @@ func translateMessage(msg models.AnthropicMessage) ([]models.OpenAIMessage, erro
 
 		case "thinking", "redacted_thinking":
 			// skip thinking blocks
+
+		default:
+			return nil, fmt.Errorf("unsupported content block type %q", block.Type)
 		}
 	}
-
 	// Build the primary message for text/tool_use blocks.
 	// When tool_calls are present, prepend before tool_result messages so
 	// assistant→tool ordering is preserved.  When only text is present
 	// (e.g. a user message carrying both text and tool_results), append
 	// after the tool_result messages so tool responses stay adjacent to
 	// the preceding assistant tool_calls.
-	if textParts != "" || len(toolCalls) > 0 {
+	if textParts.Len() > 0 || len(multimodalParts) > 0 || len(toolCalls) > 0 {
 		m := models.OpenAIMessage{Role: msg.Role}
-		if textParts != "" {
-			content, _ := json.Marshal(textParts)
+		switch {
+		case len(multimodalParts) > 0:
+			content, _ := json.Marshal(multimodalParts)
+			m.Content = content
+		case textParts.Len() > 0:
+			content, _ := json.Marshal(textParts.String())
 			m.Content = content
 		}
 		if len(toolCalls) > 0 {
@@ -223,6 +241,64 @@ func translateMessage(msg models.AnthropicMessage) ([]models.OpenAIMessage, erro
 	}
 
 	return result, nil
+}
+
+func appendTextContentPart(textParts *strings.Builder, multimodalParts *[]models.OpenAIContentPart, text string) {
+	if len(*multimodalParts) == 0 {
+		textParts.WriteString(text)
+		return
+	}
+	partText := text
+	*multimodalParts = append(*multimodalParts, models.OpenAIContentPart{
+		Type: "text",
+		Text: &partText,
+	})
+}
+
+func flushTextContentPart(textParts *strings.Builder, multimodalParts *[]models.OpenAIContentPart) {
+	if textParts.Len() == 0 {
+		return
+	}
+	partText := textParts.String()
+	*multimodalParts = append(*multimodalParts, models.OpenAIContentPart{
+		Type: "text",
+		Text: &partText,
+	})
+	textParts.Reset()
+}
+
+func translateAnthropicImageBlock(block models.ContentBlock) (*models.OpenAIContentPart, error) {
+	if block.Source == nil {
+		return nil, fmt.Errorf("image content block is missing source")
+	}
+
+	switch block.Source.Type {
+	case "base64":
+		if block.Source.MediaType == "" || block.Source.Data == "" {
+			return nil, fmt.Errorf("base64 image source requires media_type and data")
+		}
+		if !strings.HasPrefix(strings.ToLower(block.Source.MediaType), "image/") {
+			return nil, fmt.Errorf("unsupported image media_type %q", block.Source.MediaType)
+		}
+		return &models.OpenAIContentPart{
+			Type: "image_url",
+			ImageURL: &models.OpenAIImageURL{
+				URL: fmt.Sprintf("data:%s;base64,%s", block.Source.MediaType, block.Source.Data),
+			},
+		}, nil
+	case "url":
+		if block.Source.URL == "" {
+			return nil, fmt.Errorf("url image source requires url")
+		}
+		return &models.OpenAIContentPart{
+			Type: "image_url",
+			ImageURL: &models.OpenAIImageURL{
+				URL: block.Source.URL,
+			},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported image source type %q", block.Source.Type)
+	}
 }
 
 func extractToolResultContent(raw json.RawMessage) (string, error) {

@@ -6,21 +6,21 @@ import "encoding/json"
 
 // AnthropicRequest represents an incoming Anthropic Messages API request.
 type AnthropicRequest struct {
-	Model         string               `json:"model"`
-	Messages      []AnthropicMessage   `json:"messages"`
-	MaxTokens     *int                 `json:"max_tokens,omitempty"`
-	System        json.RawMessage      `json:"system,omitempty"`
-	Stream        bool                 `json:"stream,omitempty"`
-	StopSequences []string             `json:"stop_sequences,omitempty"`
-	Temperature   *float64             `json:"temperature,omitempty"`
-	TopP          *float64             `json:"top_p,omitempty"`
-	TopK          *int                 `json:"top_k,omitempty"`
-	Tools         []AnthropicTool      `json:"tools,omitempty"`
-	ToolChoice    *AnthropicToolChoice `json:"tool_choice,omitempty"`
-	Metadata      json.RawMessage      `json:"metadata,omitempty"`
-	Thinking      *AnthropicThinking   `json:"thinking,omitempty"`
-	ServiceTier   string               `json:"service_tier,omitempty"`
-	InferenceGeo  string               `json:"inference_geo,omitempty"`
+	Model         string                 `json:"model"`
+	Messages      []AnthropicMessage     `json:"messages"`
+	MaxTokens     *int                   `json:"max_tokens,omitempty"`
+	System        json.RawMessage        `json:"system,omitempty"`
+	Stream        bool                   `json:"stream,omitempty"`
+	StopSequences []string               `json:"stop_sequences,omitempty"`
+	Temperature   *float64               `json:"temperature,omitempty"`
+	TopP          *float64               `json:"top_p,omitempty"`
+	TopK          *int                   `json:"top_k,omitempty"`
+	Tools         []AnthropicTool        `json:"tools,omitempty"`
+	ToolChoice    *AnthropicToolChoice   `json:"tool_choice,omitempty"`
+	Metadata      json.RawMessage        `json:"metadata,omitempty"`
+	Thinking      *AnthropicThinking     `json:"thinking,omitempty"`
+	ServiceTier   string                 `json:"service_tier,omitempty"`
+	InferenceGeo  string                 `json:"inference_geo,omitempty"`
 	OutputConfig  *AnthropicOutputConfig `json:"output_config,omitempty"`
 }
 
@@ -32,17 +32,27 @@ type AnthropicMessage struct {
 }
 
 // ContentBlock represents a typed content block in Anthropic messages.
-// The Type field determines which other fields are populated (text, tool_use, tool_result, thinking).
+// The Type field determines which other fields are populated
+// (text, image, tool_use, tool_result, thinking).
 type ContentBlock struct {
-	Type      string          `json:"type"`
-	Text      string          `json:"text,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Input     json.RawMessage `json:"input,omitempty"`
-	ToolUseID string          `json:"tool_use_id,omitempty"`
-	Content   json.RawMessage `json:"content,omitempty"`
-	Thinking  string          `json:"thinking,omitempty"`
-	Signature string          `json:"signature,omitempty"`
+	Type      string                `json:"type"`
+	Text      string                `json:"text,omitempty"`
+	Source    *AnthropicImageSource `json:"source,omitempty"`
+	ID        string                `json:"id,omitempty"`
+	Name      string                `json:"name,omitempty"`
+	Input     json.RawMessage       `json:"input,omitempty"`
+	ToolUseID string                `json:"tool_use_id,omitempty"`
+	Content   json.RawMessage       `json:"content,omitempty"`
+	Thinking  string                `json:"thinking,omitempty"`
+	Signature string                `json:"signature,omitempty"`
+}
+
+// AnthropicImageSource describes an image content-block source.
+type AnthropicImageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
 }
 
 // AnthropicTool defines a tool available for the model to call.
