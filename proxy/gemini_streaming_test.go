@@ -300,3 +300,49 @@ func TestStreamOpenAIToGeminiToolCallWithoutArgumentsFlushesEmptyObject(t *testi
 		t.Errorf("UsageMetadata = %#v, want totalTokenCount=7", tail.UsageMetadata)
 	}
 }
+
+func TestStreamOpenAIToGemini_NoTailWithoutDone(t *testing.T) {
+	stop := "stop"
+	chunk1 := models.OpenAIStreamChunk{
+		ID:    "chatcmpl-no-done",
+		Model: "gemini-2.5-pro",
+		Choices: []models.OpenAIStreamChoice{{
+			Index: 0,
+			Delta: models.OpenAIMessage{Content: json.RawMessage(`"Hello"`)},
+		}},
+	}
+	chunk2 := models.OpenAIStreamChunk{
+		ID:    "chatcmpl-no-done",
+		Model: "gemini-2.5-pro",
+		Choices: []models.OpenAIStreamChoice{{
+			Index:        0,
+			Delta:        models.OpenAIMessage{},
+			FinishReason: &stop,
+		}},
+		Usage: &models.OpenAIUsage{PromptTokens: 12, CompletionTokens: 5, TotalTokens: 17},
+	}
+
+	body := buildSSEStream(
+		mustMarshal(t, chunk1),
+		mustMarshal(t, chunk2),
+	)
+
+	w := httptest.NewRecorder()
+	StreamOpenAIToGemini(w, body)
+
+	frames := parseGeminiSSEFrames(w.Body.String())
+	if len(frames) != 1 {
+		t.Fatalf("len(frames) = %d, want 1\nraw:\n%s", len(frames), w.Body.String())
+	}
+
+	var first models.GeminiGenerateContentResponse
+	if err := json.Unmarshal([]byte(frames[0]), &first); err != nil {
+		t.Fatalf("unmarshal first frame: %v", err)
+	}
+	if first.UsageMetadata != nil {
+		t.Fatalf("unexpected usage metadata in non-terminal frame: %#v", first.UsageMetadata)
+	}
+	if len(first.Candidates) == 0 || first.Candidates[0].FinishReason != "" {
+		t.Fatalf("unexpected finish reason in non-terminal frame: %#v", first.Candidates)
+	}
+}

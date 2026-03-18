@@ -63,8 +63,10 @@ func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
 		}
 
 		if data == "[DONE]" {
-			flushGeminiStreamingToolCalls(w, bufferedToolCalls, true)
-			writeGeminiStreamingTail(w, storedFinishReason, storedUsage)
+			if err := flushGeminiStreamingToolCalls(w, bufferedToolCalls, true); err != nil {
+				return
+			}
+			_ = writeGeminiStreamingTail(w, storedFinishReason, storedUsage)
 			return
 		}
 
@@ -82,7 +84,7 @@ func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
 				var text string
 				if err := json.Unmarshal(choice.Delta.Content, &text); err == nil && text != "" {
 					candidateIndex := 0
-					_ = writeGeminiSSEData(w, models.GeminiGenerateContentResponse{
+					if err := writeGeminiSSEData(w, models.GeminiGenerateContentResponse{
 						Candidates: []models.GeminiCandidate{{
 							Content: &models.GeminiContent{
 								Role: "model",
@@ -92,7 +94,9 @@ func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
 							},
 							Index: &candidateIndex,
 						}},
-					})
+					}); err != nil {
+						return
+					}
 				}
 			}
 
@@ -141,7 +145,7 @@ func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
 
 				if len(parts) > 0 {
 					candidateIndex := 0
-					_ = writeGeminiSSEData(w, models.GeminiGenerateContentResponse{
+					if err := writeGeminiSSEData(w, models.GeminiGenerateContentResponse{
 						Candidates: []models.GeminiCandidate{{
 							Content: &models.GeminiContent{
 								Role:  "model",
@@ -149,7 +153,9 @@ func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
 							},
 							Index: &candidateIndex,
 						}},
-					})
+					}); err != nil {
+						return
+					}
 				}
 			}
 
@@ -159,13 +165,15 @@ func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
 		}
 	}
 
-	flushGeminiStreamingToolCalls(w, bufferedToolCalls, true)
-	writeGeminiStreamingTail(w, storedFinishReason, storedUsage)
+	// Unexpected EOF or scanner error: do not emit synthetic terminal frames.
+	if scanner.Err() != nil {
+		return
+	}
 }
 
-func flushGeminiStreamingToolCalls(w http.ResponseWriter, bufferedToolCalls map[int]*geminiStreamingToolCall, terminal bool) {
+func flushGeminiStreamingToolCalls(w http.ResponseWriter, bufferedToolCalls map[int]*geminiStreamingToolCall, terminal bool) error {
 	if len(bufferedToolCalls) == 0 {
-		return
+		return nil
 	}
 
 	maxIdx := -1
@@ -206,11 +214,11 @@ func flushGeminiStreamingToolCalls(w http.ResponseWriter, bufferedToolCalls map[
 	}
 
 	if len(parts) == 0 {
-		return
+		return nil
 	}
 
 	candidateIndex := 0
-	_ = writeGeminiSSEData(w, models.GeminiGenerateContentResponse{
+	return writeGeminiSSEData(w, models.GeminiGenerateContentResponse{
 		Candidates: []models.GeminiCandidate{{
 			Content: &models.GeminiContent{
 				Role:  "model",
@@ -221,9 +229,9 @@ func flushGeminiStreamingToolCalls(w http.ResponseWriter, bufferedToolCalls map[
 	})
 }
 
-func writeGeminiStreamingTail(w http.ResponseWriter, finishReason string, usage *models.OpenAIUsage) {
+func writeGeminiStreamingTail(w http.ResponseWriter, finishReason string, usage *models.OpenAIUsage) error {
 	if finishReason == "" && usage == nil {
-		return
+		return nil
 	}
 
 	response := models.GeminiGenerateContentResponse{}
@@ -241,5 +249,5 @@ func writeGeminiStreamingTail(w http.ResponseWriter, finishReason string, usage 
 			TotalTokenCount:      usage.TotalTokens,
 		}
 	}
-	_ = writeGeminiSSEData(w, response)
+	return writeGeminiSSEData(w, response)
 }

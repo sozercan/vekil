@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 
@@ -86,8 +87,12 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 	defer body.Close()
 	setSSEHeaders(w)
 
+	emitSSE := func(eventType string, data interface{}) bool {
+		return writeSSEEvent(w, eventType, data) == nil
+	}
+
 	// Send message_start
-	writeSSEEvent(w, "message_start", models.AnthropicStreamEvent{
+	if !emitSSE("message_start", models.AnthropicStreamEvent{
 		Type: "message_start",
 		Message: &models.AnthropicResponse{
 			ID:      requestID,
@@ -97,14 +102,84 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 			Content: []models.ContentBlock{},
 			Usage:   models.AnthropicUsage{},
 		},
-	})
+	}) {
+		return
+	}
 
-	blockIndex := 0
-	textBlockOpen := false
+	nextBlockIndex := 0
+	textBlockIndex := -1
 	var storedFinishReason string
 	var storedUsage *models.OpenAIUsage
 	// Map OpenAI tool call index → Anthropic block index
 	toolCallBlockIndex := make(map[int]int)
+	openToolCallIndexes := make(map[int]struct{})
+
+	closeTextBlock := func() bool {
+		if textBlockIndex < 0 {
+			return true
+		}
+		if !emitSSE("content_block_stop", models.AnthropicStreamEvent{
+			Type:  "content_block_stop",
+			Index: intVal(textBlockIndex),
+		}) {
+			return false
+		}
+		textBlockIndex = -1
+		return true
+	}
+
+	closeOpenToolBlocks := func() bool {
+		if len(openToolCallIndexes) == 0 {
+			return true
+		}
+
+		blockIndexes := make([]int, 0, len(openToolCallIndexes))
+		for tcIdx := range openToolCallIndexes {
+			if bi, ok := toolCallBlockIndex[tcIdx]; ok {
+				blockIndexes = append(blockIndexes, bi)
+			}
+		}
+		sort.Ints(blockIndexes)
+
+		for _, bi := range blockIndexes {
+			if !emitSSE("content_block_stop", models.AnthropicStreamEvent{
+				Type:  "content_block_stop",
+				Index: intVal(bi),
+			}) {
+				return false
+			}
+		}
+		clear(openToolCallIndexes)
+		return true
+	}
+
+	finishMessage := func() bool {
+		if !closeTextBlock() {
+			return false
+		}
+		if !closeOpenToolBlocks() {
+			return false
+		}
+
+		delta := &models.AnthropicDelta{}
+		if storedFinishReason != "" {
+			delta.StopReason = convertFinishReason(storedFinishReason)
+		}
+		evt := models.AnthropicStreamEvent{
+			Type:  "message_delta",
+			Delta: delta,
+		}
+		if storedUsage != nil {
+			evt.Usage = &models.AnthropicUsage{
+				InputTokens:  storedUsage.PromptTokens,
+				OutputTokens: storedUsage.CompletionTokens,
+			}
+		}
+		if !emitSSE("message_delta", evt) {
+			return false
+		}
+		return emitSSE("message_stop", models.AnthropicStreamEvent{Type: "message_stop"})
+	}
 
 	// 1MB buffer to handle large tool call arguments
 	scanner := bufio.NewScanner(body)
@@ -118,31 +193,7 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 		}
 
 		if data == "[DONE]" {
-			// Close any open content block
-			if textBlockOpen || len(toolCallBlockIndex) > 0 {
-				writeSSEEvent(w, "content_block_stop", models.AnthropicStreamEvent{
-					Type:  "content_block_stop",
-					Index: intVal(blockIndex),
-				})
-			}
-
-			// Send message_delta with stop reason and usage
-			delta := &models.AnthropicDelta{}
-			if storedFinishReason != "" {
-				delta.StopReason = convertFinishReason(storedFinishReason)
-			}
-			evt := models.AnthropicStreamEvent{
-				Type:  "message_delta",
-				Delta: delta,
-			}
-			if storedUsage != nil {
-				evt.Usage = &models.AnthropicUsage{
-					InputTokens:  storedUsage.PromptTokens,
-					OutputTokens: storedUsage.CompletionTokens,
-				}
-			}
-			writeSSEEvent(w, "message_delta", evt)
-			writeSSEEvent(w, "message_stop", models.AnthropicStreamEvent{Type: "message_stop"})
+			_ = finishMessage()
 			return
 		}
 
@@ -160,25 +211,33 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 			if choice.Delta.Content != nil {
 				var text string
 				if err := json.Unmarshal(choice.Delta.Content, &text); err == nil && text != "" {
-					if !textBlockOpen {
-						writeSSEEvent(w, "content_block_start", models.AnthropicStreamEvent{
+					if !closeOpenToolBlocks() {
+						return
+					}
+					if textBlockIndex < 0 {
+						textBlockIndex = nextBlockIndex
+						nextBlockIndex++
+						if !emitSSE("content_block_start", models.AnthropicStreamEvent{
 							Type:  "content_block_start",
-							Index: intVal(blockIndex),
+							Index: intVal(textBlockIndex),
 							ContentBlock: &models.ContentBlock{
 								Type: "text",
 								Text: "",
 							},
-						})
-						textBlockOpen = true
+						}) {
+							return
+						}
 					}
-					writeSSEEvent(w, "content_block_delta", models.AnthropicStreamEvent{
+					if !emitSSE("content_block_delta", models.AnthropicStreamEvent{
 						Type:  "content_block_delta",
-						Index: intVal(blockIndex),
+						Index: intVal(textBlockIndex),
 						Delta: &models.AnthropicDelta{
 							Type: "text_delta",
 							Text: text,
 						},
-					})
+					}) {
+						return
+					}
 				}
 			}
 
@@ -190,46 +249,49 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 				}
 
 				if tc.ID != "" {
-					// New tool call — close previous block if open
-					if textBlockOpen {
-						writeSSEEvent(w, "content_block_stop", models.AnthropicStreamEvent{
-							Type:  "content_block_stop",
-							Index: intVal(blockIndex),
-						})
-						textBlockOpen = false
-						blockIndex++
-					} else if len(toolCallBlockIndex) > 0 {
-						writeSSEEvent(w, "content_block_stop", models.AnthropicStreamEvent{
-							Type:  "content_block_stop",
-							Index: intVal(blockIndex),
-						})
-						blockIndex++
+					if !closeTextBlock() {
+						return
 					}
 
-					writeSSEEvent(w, "content_block_start", models.AnthropicStreamEvent{
-						Type:  "content_block_start",
-						Index: intVal(blockIndex),
-						ContentBlock: &models.ContentBlock{
-							Type:  "tool_use",
-							ID:    tc.ID,
-							Name:  tc.Function.Name,
-							Input: json.RawMessage(`{}`),
-						},
-					})
-					toolCallBlockIndex[tcIdx] = blockIndex
+					if _, ok := toolCallBlockIndex[tcIdx]; !ok {
+						toolCallBlockIndex[tcIdx] = nextBlockIndex
+						nextBlockIndex++
+					}
+
+					if _, open := openToolCallIndexes[tcIdx]; !open {
+						bi := toolCallBlockIndex[tcIdx]
+						if !emitSSE("content_block_start", models.AnthropicStreamEvent{
+							Type:  "content_block_start",
+							Index: intVal(bi),
+							ContentBlock: &models.ContentBlock{
+								Type:  "tool_use",
+								ID:    tc.ID,
+								Name:  tc.Function.Name,
+								Input: json.RawMessage(`{}`),
+							},
+						}) {
+							return
+						}
+						openToolCallIndexes[tcIdx] = struct{}{}
+					}
 				}
 
 				if tc.Function.Arguments != "" {
-					// Only emit deltas for tool calls that have an open block
+					// Only emit deltas for tool calls that still have an open block.
 					if bi, ok := toolCallBlockIndex[tcIdx]; ok {
-						writeSSEEvent(w, "content_block_delta", models.AnthropicStreamEvent{
+						if _, open := openToolCallIndexes[tcIdx]; !open {
+							continue
+						}
+						if !emitSSE("content_block_delta", models.AnthropicStreamEvent{
 							Type:  "content_block_delta",
 							Index: intVal(bi),
 							Delta: &models.AnthropicDelta{
 								Type:        "input_json_delta",
 								PartialJSON: tc.Function.Arguments,
 							},
-						})
+						}) {
+							return
+						}
 					}
 				}
 			}
@@ -240,30 +302,10 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 		}
 	}
 
-	// After loop: handle case where stream ended without [DONE]
-	if textBlockOpen || len(toolCallBlockIndex) > 0 {
-		writeSSEEvent(w, "content_block_stop", models.AnthropicStreamEvent{
-			Type:  "content_block_stop",
-			Index: intVal(blockIndex),
-		})
+	// Unexpected EOF or scanner error: do not emit synthetic success events.
+	if scanner.Err() != nil {
+		return
 	}
-
-	delta := &models.AnthropicDelta{}
-	if storedFinishReason != "" {
-		delta.StopReason = convertFinishReason(storedFinishReason)
-	}
-	evt := models.AnthropicStreamEvent{
-		Type:  "message_delta",
-		Delta: delta,
-	}
-	if storedUsage != nil {
-		evt.Usage = &models.AnthropicUsage{
-			InputTokens:  storedUsage.PromptTokens,
-			OutputTokens: storedUsage.CompletionTokens,
-		}
-	}
-	writeSSEEvent(w, "message_delta", evt)
-	writeSSEEvent(w, "message_stop", models.AnthropicStreamEvent{Type: "message_stop"})
 }
 
 // aggregateStreamToResponse collects an OpenAI SSE stream into a complete
@@ -272,10 +314,17 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 func aggregateStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, error) {
 	defer body.Close()
 
+	type aggregatedChoice struct {
+		index        int
+		role         string
+		content      strings.Builder
+		toolCalls    map[int]*models.OpenAIToolCall
+		finishReason *string
+	}
+
 	var result models.OpenAIResponse
-	var contentBuilder strings.Builder
-	toolCalls := make(map[int]*models.OpenAIToolCall)
-	var finishReason *string
+	choicesByIndex := make(map[int]*aggregatedChoice)
+	sawDone := false
 
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -287,6 +336,7 @@ func aggregateStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, erro
 			continue
 		}
 		if data == "[DONE]" {
+			sawDone = true
 			break
 		}
 
@@ -301,16 +351,33 @@ func aggregateStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, erro
 			result.Created = chunk.Created
 			result.Model = chunk.Model
 		}
+		if result.SystemFingerprint == "" && chunk.SystemFingerprint != "" {
+			result.SystemFingerprint = chunk.SystemFingerprint
+		}
 
 		if chunk.Usage != nil {
 			result.Usage = chunk.Usage
 		}
 
 		for _, choice := range chunk.Choices {
+			aggChoice, ok := choicesByIndex[choice.Index]
+			if !ok {
+				aggChoice = &aggregatedChoice{
+					index:     choice.Index,
+					role:      "assistant",
+					toolCalls: make(map[int]*models.OpenAIToolCall),
+				}
+				choicesByIndex[choice.Index] = aggChoice
+			}
+
+			if choice.Delta.Role != "" {
+				aggChoice.role = choice.Delta.Role
+			}
+
 			if choice.Delta.Content != nil {
 				var text string
 				if err := json.Unmarshal(choice.Delta.Content, &text); err == nil {
-					contentBuilder.WriteString(text)
+					aggChoice.content.WriteString(text)
 				}
 			}
 
@@ -320,54 +387,74 @@ func aggregateStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, erro
 					idx = *tc.Index
 				}
 
-				if _, exists := toolCalls[idx]; !exists {
-					toolCalls[idx] = &models.OpenAIToolCall{}
+				if _, exists := aggChoice.toolCalls[idx]; !exists {
+					aggChoice.toolCalls[idx] = &models.OpenAIToolCall{}
 				}
 
+				call := aggChoice.toolCalls[idx]
 				if tc.ID != "" {
-					toolCalls[idx].ID = tc.ID
-					toolCalls[idx].Type = tc.Type
-					toolCalls[idx].Function.Name = tc.Function.Name
+					call.ID = tc.ID
+				}
+				if tc.Type != "" {
+					call.Type = tc.Type
+				}
+				if tc.Function.Name != "" {
+					call.Function.Name = tc.Function.Name
 				}
 
-				toolCalls[idx].Function.Arguments += tc.Function.Arguments
+				call.Function.Arguments += tc.Function.Arguments
 			}
 
 			if choice.FinishReason != nil {
-				finishReason = choice.FinishReason
+				finishReason := *choice.FinishReason
+				aggChoice.finishReason = &finishReason
 			}
 		}
 	}
 
-	msg := models.OpenAIMessage{Role: "assistant"}
-	if contentBuilder.Len() > 0 {
-		c, _ := json.Marshal(contentBuilder.String())
-		msg.Content = c
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("reading SSE stream: %w", err)
+	}
+	if !sawDone {
+		return nil, fmt.Errorf("stream ended before [DONE]")
 	}
 
-	if len(toolCalls) > 0 {
-		maxIdx := 0
-		for idx := range toolCalls {
-			if idx > maxIdx {
-				maxIdx = idx
-			}
+	choiceIndexes := make([]int, 0, len(choicesByIndex))
+	for idx := range choicesByIndex {
+		choiceIndexes = append(choiceIndexes, idx)
+	}
+	sort.Ints(choiceIndexes)
+
+	for _, choiceIndex := range choiceIndexes {
+		aggChoice := choicesByIndex[choiceIndex]
+		msg := models.OpenAIMessage{Role: aggChoice.role}
+		if aggChoice.content.Len() > 0 {
+			c, _ := json.Marshal(aggChoice.content.String())
+			msg.Content = c
 		}
-		for i := 0; i <= maxIdx; i++ {
-			if tc, ok := toolCalls[i]; ok {
-				// Validate concatenated arguments are valid JSON
+
+		if len(aggChoice.toolCalls) > 0 {
+			toolIndexes := make([]int, 0, len(aggChoice.toolCalls))
+			for toolIndex := range aggChoice.toolCalls {
+				toolIndexes = append(toolIndexes, toolIndex)
+			}
+			sort.Ints(toolIndexes)
+			for _, toolIndex := range toolIndexes {
+				tc := aggChoice.toolCalls[toolIndex]
+				// Validate concatenated arguments are valid JSON.
 				if !json.Valid([]byte(tc.Function.Arguments)) {
 					tc.Function.Arguments = "{}"
 				}
 				msg.ToolCalls = append(msg.ToolCalls, *tc)
 			}
 		}
-	}
 
-	result.Choices = []models.OpenAIChoice{{
-		Index:        0,
-		Message:      msg,
-		FinishReason: finishReason,
-	}}
+		result.Choices = append(result.Choices, models.OpenAIChoice{
+			Index:        choiceIndex,
+			Message:      msg,
+			FinishReason: aggChoice.finishReason,
+		})
+	}
 
 	return &result, nil
 }

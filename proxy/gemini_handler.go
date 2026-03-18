@@ -51,10 +51,7 @@ func (h *ProxyHandler) HandleGeminiModels(w http.ResponseWriter, r *http.Request
 func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *http.Request, pathModel string, stream bool) {
 	body, err := readBody(r)
 	if err != nil {
-		status := http.StatusBadRequest
-		if len(body) == 0 {
-			status = http.StatusRequestEntityTooLarge
-		}
+		status := readBodyStatusCode(err)
 		writeGeminiError(w, status, "INVALID_ARGUMENT", err.Error())
 		return
 	}
@@ -144,10 +141,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request, pathModel string) {
 	body, err := readBody(r)
 	if err != nil {
-		status := http.StatusBadRequest
-		if len(body) == 0 {
-			status = http.StatusRequestEntityTooLarge
-		}
+		status := readBodyStatusCode(err)
 		writeGeminiError(w, status, "INVALID_ARGUMENT", err.Error())
 		return
 	}
@@ -387,6 +381,14 @@ func mapGeminiTransportError(err error) error {
 
 func mapGeminiUpstreamStatus(statusCode int) string {
 	switch statusCode {
+	case http.StatusBadRequest:
+		return "INVALID_ARGUMENT"
+	case http.StatusUnauthorized:
+		return "UNAUTHENTICATED"
+	case http.StatusForbidden:
+		return "PERMISSION_DENIED"
+	case http.StatusNotFound:
+		return "NOT_FOUND"
 	case http.StatusTooManyRequests:
 		return "RESOURCE_EXHAUSTED"
 	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:

@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -70,6 +71,19 @@ type cachedModelsResponse struct {
 	statusCode int
 	expiry     time.Time
 	etag       string
+}
+
+type requestBodyError struct {
+	statusCode int
+	err        error
+}
+
+func (e *requestBodyError) Error() string {
+	return e.err.Error()
+}
+
+func (e *requestBodyError) Unwrap() error {
+	return e.err
 }
 
 // CopilotHeaderConfig controls the synthetic editor-identifying headers sent to
@@ -252,10 +266,7 @@ func writeCachedModelsResponse(w http.ResponseWriter, entry cachedModelsResponse
 func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
-		status := http.StatusBadRequest
-		if len(body) == 0 {
-			status = http.StatusRequestEntityTooLarge
-		}
+		status := readBodyStatusCode(err)
 		writeAnthropicError(w, status, "invalid_request_error", err.Error())
 		return
 	}
@@ -360,10 +371,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 
 	bodyBytes, err := readBody(r)
 	if err != nil {
-		status := http.StatusBadRequest
-		if len(bodyBytes) == 0 {
-			status = http.StatusRequestEntityTooLarge
-		}
+		status := readBodyStatusCode(err)
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
@@ -376,7 +384,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 	json.Unmarshal(bodyBytes, &partial)
 	isStreaming := partial.Stream != nil && *partial.Stream
-	hasTools := len(partial.Tools) > 0 && string(partial.Tools) != "null"
+	hasTools := hasNonEmptyTools(partial.Tools)
 
 	// Inject parallel_tool_calls: true when tools are present
 	bodyBytes = injectParallelToolCalls(bodyBytes)
@@ -443,10 +451,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	bodyBytes, err := readBody(r)
 	if err != nil {
-		status := http.StatusBadRequest
-		if len(bodyBytes) == 0 {
-			status = http.StatusRequestEntityTooLarge
-		}
+		status := readBodyStatusCode(err)
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
@@ -537,10 +542,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 
 	bodyBytes, err := readBody(r)
 	if err != nil {
-		status := http.StatusBadRequest
-		if len(bodyBytes) == 0 {
-			status = http.StatusRequestEntityTooLarge
-		}
+		status := readBodyStatusCode(err)
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
@@ -683,10 +685,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 
 	bodyBytes, err := readBody(r)
 	if err != nil {
-		status := http.StatusBadRequest
-		if len(bodyBytes) == 0 {
-			status = http.StatusRequestEntityTooLarge
-		}
+		status := readBodyStatusCode(err)
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
@@ -1376,14 +1375,20 @@ func readBody(r *http.Request) ([]byte, error) {
 	case "gzip":
 		gr, err := gzip.NewReader(r.Body)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decompress gzip body: %w", err)
+			return nil, &requestBodyError{
+				statusCode: http.StatusBadRequest,
+				err:        fmt.Errorf("failed to decompress gzip body: %w", err),
+			}
 		}
 		defer func() { _ = gr.Close() }()
 		reader = gr
 	case "zstd":
 		zr, err := zstd.NewReader(r.Body)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decompress zstd body: %w", err)
+			return nil, &requestBodyError{
+				statusCode: http.StatusBadRequest,
+				err:        fmt.Errorf("failed to decompress zstd body: %w", err),
+			}
 		}
 		defer zr.Close()
 		reader = zr
@@ -1391,12 +1396,39 @@ func readBody(r *http.Request) ([]byte, error) {
 
 	body, err := io.ReadAll(io.LimitReader(reader, maxRequestBodySize+1))
 	if err != nil {
-		return nil, err
+		return nil, &requestBodyError{
+			statusCode: http.StatusBadRequest,
+			err:        err,
+		}
 	}
 	if len(body) > maxRequestBodySize {
-		return nil, fmt.Errorf("request body too large (max %d bytes)", maxRequestBodySize)
+		return nil, &requestBodyError{
+			statusCode: http.StatusRequestEntityTooLarge,
+			err:        fmt.Errorf("request body too large (max %d bytes)", maxRequestBodySize),
+		}
 	}
 	return body, nil
+}
+
+func readBodyStatusCode(err error) int {
+	var bodyErr *requestBodyError
+	if errors.As(err, &bodyErr) {
+		return bodyErr.statusCode
+	}
+	return http.StatusBadRequest
+}
+
+func hasNonEmptyTools(raw json.RawMessage) bool {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return false
+	}
+
+	var tools []json.RawMessage
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return false
+	}
+
+	return len(tools) > 0
 }
 
 // injectParallelToolCalls adds parallel_tool_calls: true to an OpenAI request
@@ -1406,7 +1438,8 @@ func injectParallelToolCalls(body []byte) []byte {
 	if err := json.Unmarshal(body, &m); err != nil {
 		return body
 	}
-	if _, hasTools := m["tools"]; !hasTools {
+	tools, hasTools := m["tools"]
+	if !hasTools || !hasNonEmptyTools(tools) {
 		return body
 	}
 	if _, hasPTC := m["parallel_tool_calls"]; hasPTC {

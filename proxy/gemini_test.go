@@ -2149,6 +2149,39 @@ func TestHandleGeminiModelsErrors(t *testing.T) {
 		}
 	})
 
+	t.Run("upstream bad request maps to invalid argument", func(t *testing.T) {
+		handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"bad upstream request"}}`))
+		})
+
+		reqBody := `{
+			"contents": [{"role":"user","parts":[{"text":"hi"}]}]
+		}`
+		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:generateContent", strings.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		handler.HandleGeminiModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("StatusCode = %d, want 400", resp.StatusCode)
+		}
+
+		var errResp models.GeminiErrorResponse
+		if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+			t.Fatalf("decode error response: %v", err)
+		}
+		if errResp.Error.Status != "INVALID_ARGUMENT" {
+			t.Errorf("status = %q, want INVALID_ARGUMENT", errResp.Error.Status)
+		}
+		if !strings.Contains(errResp.Error.Message, "upstream error (400)") {
+			t.Errorf("message = %q, want upstream 400 detail", errResp.Error.Message)
+		}
+	})
+
 	t.Run("unsupported feature returns Google error envelope", func(t *testing.T) {
 		handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 			t.Fatal("backend should not be called")
