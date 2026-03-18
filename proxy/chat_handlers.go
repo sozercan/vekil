@@ -1,0 +1,266 @@
+package proxy
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+
+	"github.com/google/uuid"
+	"github.com/sozercan/copilot-proxy/logger"
+	"github.com/sozercan/copilot-proxy/models"
+)
+
+type chatCompletionsMode struct {
+	clientRequestedStream bool
+	forceUpstreamStream   bool
+}
+
+type chatCompletionsResponseHandlers struct {
+	stream      func(*http.Response)
+	aggregate   func(*models.OpenAIResponse)
+	passthrough func(*http.Response) error
+}
+
+func parseOpenAIChatCompletionsMode(body []byte) chatCompletionsMode {
+	var partial struct {
+		Stream *bool           `json:"stream,omitempty"`
+		Tools  json.RawMessage `json:"tools,omitempty"`
+	}
+	_ = json.Unmarshal(body, &partial)
+
+	clientRequestedStream := partial.Stream != nil && *partial.Stream
+	return chatCompletionsMode{
+		clientRequestedStream: clientRequestedStream,
+		forceUpstreamStream:   !clientRequestedStream && hasNonEmptyTools(partial.Tools),
+	}
+}
+
+func prepareOpenAIChatCompletionsRequest(body []byte) ([]byte, chatCompletionsMode) {
+	mode := parseOpenAIChatCompletionsMode(body)
+	body = injectParallelToolCalls(body)
+	if mode.forceUpstreamStream {
+		body = injectForceStream(body)
+	}
+	return body, mode
+}
+
+func prepareAnthropicChatCompletionsRequest(req *models.AnthropicRequest) ([]byte, chatCompletionsMode, error) {
+	oaiReq, err := TranslateAnthropicToOpenAI(req)
+	if err != nil {
+		return nil, chatCompletionsMode{}, err
+	}
+
+	mode := chatCompletionsMode{
+		clientRequestedStream: req.Stream,
+		forceUpstreamStream:   !req.Stream,
+	}
+	if mode.forceUpstreamStream {
+		stream := true
+		oaiReq.Stream = &stream
+		oaiReq.StreamOptions = &models.StreamOptions{IncludeUsage: true}
+	}
+
+	body, err := json.Marshal(oaiReq)
+	if err != nil {
+		return nil, chatCompletionsMode{}, err
+	}
+	return body, mode, nil
+}
+
+func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp *http.Response, mode chatCompletionsMode, handlers chatCompletionsResponseHandlers) error {
+	if resp.StatusCode == http.StatusOK && mode.clientRequestedStream {
+		if handlers.stream == nil {
+			return fmt.Errorf("missing stream response handler")
+		}
+		handlers.stream(resp)
+		return nil
+	}
+
+	if resp.StatusCode == http.StatusOK && mode.forceUpstreamStream {
+		if handlers.aggregate == nil {
+			return fmt.Errorf("missing aggregate response handler")
+		}
+		oaiResp, err := aggregateStreamToResponse(resp.Body)
+		if err != nil {
+			return err
+		}
+		handlers.aggregate(oaiResp)
+		return nil
+	}
+
+	if handlers.passthrough != nil {
+		return handlers.passthrough(resp)
+	}
+
+	writeUpstreamResponse(w, resp)
+	return nil
+}
+
+// HandleAnthropicMessages handles POST /v1/messages by translating the Anthropic
+// request to OpenAI format, forwarding to Copilot, and translating the response back.
+func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
+	body, err := readBody(r)
+	if err != nil {
+		status := readBodyStatusCode(err)
+		writeAnthropicError(w, status, "invalid_request_error", err.Error())
+		return
+	}
+	defer func() { _ = r.Body.Close() }()
+
+	var req models.AnthropicRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON in request body")
+		return
+	}
+
+	h.log.Debug("anthropic request",
+		logger.F("model", req.Model),
+		logger.F("stream", req.Stream),
+		logger.F("messages", len(req.Messages)),
+		logger.F("tools", len(req.Tools)),
+	)
+
+	oaiBody, mode, err := prepareAnthropicChatCompletionsRequest(&req)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("translation error: %v", err))
+		return
+	}
+
+	token, err := h.auth.GetToken(r.Context())
+	if err != nil {
+		writeAnthropicError(w, http.StatusInternalServerError, "api_error", fmt.Sprintf("failed to get token: %v", err))
+		return
+	}
+
+	upstreamCtx, upstreamCancel := newInferenceUpstreamContext()
+	defer upstreamCancel()
+
+	resp, err := h.postChatCompletions(upstreamCtx, token, oaiBody)
+	if err != nil {
+		writeAnthropicError(w, upstreamStatusCode(err, http.StatusBadGateway), "api_error", fmt.Sprintf("upstream request failed: %v", err))
+		return
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		defer func() { _ = resp.Body.Close() }()
+		errBody, _ := io.ReadAll(resp.Body)
+		h.log.Error("upstream error",
+			logger.F("endpoint", "anthropic"),
+			logger.F("status", resp.StatusCode),
+			logger.F("body", string(errBody)),
+			logger.F("request", string(oaiBody)),
+		)
+		writeAnthropicError(w, resp.StatusCode, "api_error", fmt.Sprintf("upstream error (%d): %s", resp.StatusCode, string(errBody)))
+		return
+	}
+
+	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
+		stream: func(resp *http.Response) {
+			StreamOpenAIToAnthropic(w, resp.Body, req.Model, "msg_"+uuid.New().String())
+		},
+		aggregate: func(oaiResp *models.OpenAIResponse) {
+			anthropicResp := TranslateOpenAIToAnthropic(oaiResp, req.Model)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(anthropicResp)
+		},
+	})
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadGateway, "api_error", "failed to aggregate upstream response")
+	}
+}
+
+// HandleOpenAIChatCompletions handles POST /v1/chat/completions by forwarding the
+// request to Copilot with only auth headers injected (near zero-copy passthrough).
+func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
+	token, err := h.auth.GetToken(r.Context())
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error")
+		return
+	}
+
+	bodyBytes, err := readBody(r)
+	if err != nil {
+		status := readBodyStatusCode(err)
+		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
+		return
+	}
+	defer func() { _ = r.Body.Close() }()
+
+	bodyBytes, mode := prepareOpenAIChatCompletionsRequest(bodyBytes)
+
+	upstreamCtx, upstreamCancel := newInferenceUpstreamContext()
+	defer upstreamCancel()
+
+	resp, err := h.postChatCompletions(upstreamCtx, token, bodyBytes)
+	if err != nil {
+		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), fmt.Sprintf("upstream request failed: %v", err), "server_error")
+		return
+	}
+
+	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
+		stream: func(resp *http.Response) {
+			copyPassthroughHeaders(w.Header(), resp.Header)
+			StreamOpenAIPassthrough(w, resp.Body)
+		},
+		aggregate: func(oaiResp *models.OpenAIResponse) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(oaiResp)
+		},
+	})
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "failed to aggregate upstream response", "server_error")
+	}
+}
+
+func hasNonEmptyTools(raw json.RawMessage) bool {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return false
+	}
+
+	var tools []json.RawMessage
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return false
+	}
+
+	return len(tools) > 0
+}
+
+// injectParallelToolCalls adds parallel_tool_calls: true to an OpenAI request
+// body when tools are present but the flag is not already set.
+func injectParallelToolCalls(body []byte) []byte {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	tools, hasTools := m["tools"]
+	if !hasTools || !hasNonEmptyTools(tools) {
+		return body
+	}
+	if _, hasPTC := m["parallel_tool_calls"]; hasPTC {
+		return body
+	}
+	m["parallel_tool_calls"] = json.RawMessage("true")
+	result, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return result
+}
+
+// injectForceStream adds stream: true and stream_options to a request body
+// for forced streaming to the upstream.
+func injectForceStream(body []byte) []byte {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	m["stream"] = json.RawMessage("true")
+	m["stream_options"] = json.RawMessage(`{"include_usage":true}`)
+	result, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return result
+}
