@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -48,144 +47,161 @@ func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	bufferedToolCalls := make(map[int]*geminiStreamingToolCall)
-	var storedFinishReason string
-	var storedUsage *models.OpenAIUsage
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		data, ok := parseSSELine(line)
-		if !ok {
-			continue
-		}
-
-		if data == "[DONE]" {
-			if err := flushGeminiStreamingToolCalls(w, bufferedToolCalls, true); err != nil {
-				return
-			}
-			_ = writeGeminiStreamingTail(w, storedFinishReason, storedUsage)
-			return
-		}
-
-		var chunk models.OpenAIStreamChunk
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue
-		}
-
-		if chunk.Usage != nil {
-			storedUsage = chunk.Usage
-		}
-
-		for _, choice := range chunk.Choices {
-			if choice.Delta.Content != nil {
-				var text string
-				if err := json.Unmarshal(choice.Delta.Content, &text); err == nil && text != "" {
-					candidateIndex := 0
-					if err := writeGeminiSSEData(w, models.GeminiGenerateContentResponse{
-						Candidates: []models.GeminiCandidate{{
-							Content: &models.GeminiContent{
-								Role: "model",
-								Parts: []models.GeminiPart{{
-									Text: stringPtr(text),
-								}},
-							},
-							Index: &candidateIndex,
-						}},
-					}); err != nil {
-						return
-					}
-				}
-			}
-
-			if len(choice.Delta.ToolCalls) > 0 {
-				var parts []models.GeminiPart
-				for _, toolCall := range choice.Delta.ToolCalls {
-					idx := 0
-					if toolCall.Index != nil {
-						idx = *toolCall.Index
-					}
-
-					buffered, ok := bufferedToolCalls[idx]
-					if !ok {
-						buffered = &geminiStreamingToolCall{}
-						bufferedToolCalls[idx] = buffered
-					}
-					if toolCall.ID != "" {
-						buffered.ID = toolCall.ID
-					}
-					if toolCall.Function.Name != "" {
-						buffered.Name = toolCall.Function.Name
-					}
-					if toolCall.Function.Arguments != "" {
-						buffered.Arguments.WriteString(toolCall.Function.Arguments)
-					}
-
-					args := strings.TrimSpace(buffered.Arguments.String())
-					if buffered.Emitted || buffered.Name == "" || args == "" {
-						continue
-					}
-
-					normalized, err := canonicalizeJSON(json.RawMessage(args))
-					if err != nil {
-						continue
-					}
-
-					parts = append(parts, models.GeminiPart{
-						FunctionCall: &models.GeminiFunctionCall{
-							ID:   buffered.ID,
-							Name: buffered.Name,
-							Args: normalized,
-						},
-					})
-					buffered.Emitted = true
-				}
-
-				if len(parts) > 0 {
-					candidateIndex := 0
-					if err := writeGeminiSSEData(w, models.GeminiGenerateContentResponse{
-						Candidates: []models.GeminiCandidate{{
-							Content: &models.GeminiContent{
-								Role:  "model",
-								Parts: parts,
-							},
-							Index: &candidateIndex,
-						}},
-					}); err != nil {
-						return
-					}
-				}
-			}
-
-			if choice.FinishReason != nil {
-				storedFinishReason = *choice.FinishReason
-			}
-		}
+	state := newGeminiStreamState(w)
+	sawDone, err := consumeOpenAIStreamChunks(body, state.consumeChunk)
+	if err != nil || !sawDone {
+		return
 	}
 
-	// Unexpected EOF or scanner error: do not emit synthetic terminal frames.
-	if scanner.Err() != nil {
-		return
+	_ = state.finish()
+}
+
+type geminiStreamState struct {
+	w                  http.ResponseWriter
+	bufferedToolCalls  map[int]*geminiStreamingToolCall
+	storedFinishReason string
+	storedUsage        *models.OpenAIUsage
+}
+
+func newGeminiStreamState(w http.ResponseWriter) *geminiStreamState {
+	return &geminiStreamState{
+		w:                 w,
+		bufferedToolCalls: make(map[int]*geminiStreamingToolCall),
 	}
 }
 
-func flushGeminiStreamingToolCalls(w http.ResponseWriter, bufferedToolCalls map[int]*geminiStreamingToolCall, terminal bool) error {
-	if len(bufferedToolCalls) == 0 {
-		return nil
+func (s *geminiStreamState) consumeChunk(chunk models.OpenAIStreamChunk) bool {
+	if chunk.Usage != nil {
+		s.storedUsage = chunk.Usage
 	}
 
-	maxIdx := -1
-	for idx := range bufferedToolCalls {
-		if idx > maxIdx {
-			maxIdx = idx
+	for _, choice := range chunk.Choices {
+		if !s.consumeChoice(choice) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (s *geminiStreamState) consumeChoice(choice models.OpenAIStreamChoice) bool {
+	if choice.Delta.Content != nil {
+		var text string
+		if err := json.Unmarshal(choice.Delta.Content, &text); err == nil && text != "" {
+			if !s.emitText(text) {
+				return false
+			}
+		}
+	}
+
+	if len(choice.Delta.ToolCalls) > 0 && !s.consumeToolCalls(choice.Delta.ToolCalls) {
+		return false
+	}
+
+	if choice.FinishReason != nil {
+		s.storedFinishReason = *choice.FinishReason
+	}
+
+	return true
+}
+
+func (s *geminiStreamState) emitText(text string) bool {
+	candidateIndex := 0
+	return s.writeData(models.GeminiGenerateContentResponse{
+		Candidates: []models.GeminiCandidate{{
+			Content: &models.GeminiContent{
+				Role: "model",
+				Parts: []models.GeminiPart{{
+					Text: stringPtr(text),
+				}},
+			},
+			Index: &candidateIndex,
+		}},
+	})
+}
+
+func (s *geminiStreamState) consumeToolCalls(toolCalls []models.OpenAIToolCall) bool {
+	var parts []models.GeminiPart
+	for _, toolCall := range toolCalls {
+		toolIndex := 0
+		if toolCall.Index != nil {
+			toolIndex = *toolCall.Index
+		}
+
+		buffered, ok := s.bufferedToolCalls[toolIndex]
+		if !ok {
+			buffered = &geminiStreamingToolCall{}
+			s.bufferedToolCalls[toolIndex] = buffered
+		}
+		if toolCall.ID != "" {
+			buffered.ID = toolCall.ID
+		}
+		if toolCall.Function.Name != "" {
+			buffered.Name = toolCall.Function.Name
+		}
+		if toolCall.Function.Arguments != "" {
+			buffered.Arguments.WriteString(toolCall.Function.Arguments)
+		}
+
+		args := strings.TrimSpace(buffered.Arguments.String())
+		if buffered.Emitted || buffered.Name == "" || args == "" {
+			continue
+		}
+
+		normalized, err := canonicalizeJSON(json.RawMessage(args))
+		if err != nil {
+			continue
+		}
+
+		parts = append(parts, models.GeminiPart{
+			FunctionCall: &models.GeminiFunctionCall{
+				ID:   buffered.ID,
+				Name: buffered.Name,
+				Args: normalized,
+			},
+		})
+		buffered.Emitted = true
+	}
+
+	if len(parts) == 0 {
+		return true
+	}
+
+	candidateIndex := 0
+	return s.writeData(models.GeminiGenerateContentResponse{
+		Candidates: []models.GeminiCandidate{{
+			Content: &models.GeminiContent{
+				Role:  "model",
+				Parts: parts,
+			},
+			Index: &candidateIndex,
+		}},
+	})
+}
+
+func (s *geminiStreamState) finish() bool {
+	if !s.flushToolCalls(true) {
+		return false
+	}
+
+	return s.writeTail()
+}
+
+func (s *geminiStreamState) flushToolCalls(terminal bool) bool {
+	if len(s.bufferedToolCalls) == 0 {
+		return true
+	}
+
+	maxIndex := -1
+	for toolIndex := range s.bufferedToolCalls {
+		if toolIndex > maxIndex {
+			maxIndex = toolIndex
 		}
 	}
 
 	var parts []models.GeminiPart
-	for idx := 0; idx <= maxIdx; idx++ {
-		buffered, ok := bufferedToolCalls[idx]
+	for toolIndex := 0; toolIndex <= maxIndex; toolIndex++ {
+		buffered, ok := s.bufferedToolCalls[toolIndex]
 		if !ok || buffered.Emitted || buffered.Name == "" {
 			continue
 		}
@@ -214,11 +230,11 @@ func flushGeminiStreamingToolCalls(w http.ResponseWriter, bufferedToolCalls map[
 	}
 
 	if len(parts) == 0 {
-		return nil
+		return true
 	}
 
 	candidateIndex := 0
-	return writeGeminiSSEData(w, models.GeminiGenerateContentResponse{
+	return s.writeData(models.GeminiGenerateContentResponse{
 		Candidates: []models.GeminiCandidate{{
 			Content: &models.GeminiContent{
 				Role:  "model",
@@ -229,25 +245,30 @@ func flushGeminiStreamingToolCalls(w http.ResponseWriter, bufferedToolCalls map[
 	})
 }
 
-func writeGeminiStreamingTail(w http.ResponseWriter, finishReason string, usage *models.OpenAIUsage) error {
-	if finishReason == "" && usage == nil {
-		return nil
+func (s *geminiStreamState) writeTail() bool {
+	if s.storedFinishReason == "" && s.storedUsage == nil {
+		return true
 	}
 
 	response := models.GeminiGenerateContentResponse{}
-	if finishReason != "" {
+	if s.storedFinishReason != "" {
 		candidateIndex := 0
 		response.Candidates = []models.GeminiCandidate{{
-			FinishReason: mapOpenAIFinishReasonToGemini(&finishReason),
+			FinishReason: mapOpenAIFinishReasonToGemini(&s.storedFinishReason),
 			Index:        &candidateIndex,
 		}}
 	}
-	if usage != nil {
+	if s.storedUsage != nil {
 		response.UsageMetadata = &models.GeminiUsageMetadata{
-			PromptTokenCount:     usage.PromptTokens,
-			CandidatesTokenCount: usage.CompletionTokens,
-			TotalTokenCount:      usage.TotalTokens,
+			PromptTokenCount:     s.storedUsage.PromptTokens,
+			CandidatesTokenCount: s.storedUsage.CompletionTokens,
+			TotalTokenCount:      s.storedUsage.TotalTokens,
 		}
 	}
-	return writeGeminiSSEData(w, response)
+
+	return s.writeData(response)
+}
+
+func (s *geminiStreamState) writeData(data interface{}) bool {
+	return writeGeminiSSEData(s.w, data) == nil
 }
