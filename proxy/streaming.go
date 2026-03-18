@@ -103,7 +103,7 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 // OpenAIResponse. This is used when we force streaming to the upstream for
 // reliable parallel tool call support, but the client requested non-streaming.
 func aggregateStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, error) {
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	aggregator := newOpenAIResponseAggregator()
 	sawDone, err := consumeOpenAIStreamChunks(body, func(chunk models.OpenAIStreamChunk) bool {

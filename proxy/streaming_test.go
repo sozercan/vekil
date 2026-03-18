@@ -402,7 +402,9 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 
 	// Verify first tool call block
 	var cb1 models.AnthropicStreamEvent
-	json.Unmarshal([]byte(events[1].Data), &cb1)
+	if err := json.Unmarshal([]byte(events[1].Data), &cb1); err != nil {
+		t.Fatalf("unmarshal first tool block: %v", err)
+	}
 	if cb1.ContentBlock == nil || cb1.ContentBlock.Type != "tool_use" || cb1.ContentBlock.ID != "call_1" || cb1.ContentBlock.Name != "delegate_task" {
 		t.Errorf("first tool block = %+v, want tool_use call_1 delegate_task", cb1.ContentBlock)
 	}
@@ -412,7 +414,9 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 
 	// Verify second tool call block
 	var cb2 models.AnthropicStreamEvent
-	json.Unmarshal([]byte(events[3].Data), &cb2)
+	if err := json.Unmarshal([]byte(events[3].Data), &cb2); err != nil {
+		t.Fatalf("unmarshal second tool block: %v", err)
+	}
 	if cb2.ContentBlock == nil || cb2.ContentBlock.Type != "tool_use" || cb2.ContentBlock.ID != "call_2" || cb2.ContentBlock.Name != "wait_for_tasks" {
 		t.Errorf("second tool block = %+v, want tool_use call_2 wait_for_tasks", cb2.ContentBlock)
 	}
@@ -422,8 +426,12 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 
 	// Verify argument deltas go to correct blocks
 	var d1, d2 models.AnthropicStreamEvent
-	json.Unmarshal([]byte(events[2].Data), &d1)
-	json.Unmarshal([]byte(events[4].Data), &d2)
+	if err := json.Unmarshal([]byte(events[2].Data), &d1); err != nil {
+		t.Fatalf("unmarshal first arg delta: %v", err)
+	}
+	if err := json.Unmarshal([]byte(events[4].Data), &d2); err != nil {
+		t.Fatalf("unmarshal second arg delta: %v", err)
+	}
 	if d1.Index == nil || *d1.Index != 0 {
 		t.Errorf("first arg delta index = %v, want 0", d1.Index)
 	}
@@ -432,8 +440,12 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 	}
 
 	var stop1, stop2 models.AnthropicStreamEvent
-	json.Unmarshal([]byte(events[5].Data), &stop1)
-	json.Unmarshal([]byte(events[6].Data), &stop2)
+	if err := json.Unmarshal([]byte(events[5].Data), &stop1); err != nil {
+		t.Fatalf("unmarshal first tool stop: %v", err)
+	}
+	if err := json.Unmarshal([]byte(events[6].Data), &stop2); err != nil {
+		t.Fatalf("unmarshal second tool stop: %v", err)
+	}
 	if stop1.Index == nil || *stop1.Index != 0 {
 		t.Errorf("first tool stop index = %v, want 0", stop1.Index)
 	}
