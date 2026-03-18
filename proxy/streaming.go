@@ -320,6 +320,8 @@ func (s *anthropicStreamState) closeOpenToolBlocks() bool {
 			blockIndexes = append(blockIndexes, blockIndex)
 		}
 	}
+	// Sort by Anthropic block index so stop events are emitted in the same
+	// client-visible order as the corresponding block_start events.
 	sort.Ints(blockIndexes)
 
 	for _, blockIndex := range blockIndexes {

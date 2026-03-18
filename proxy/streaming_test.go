@@ -19,7 +19,7 @@ func buildSSEStream(chunks ...string) io.ReadCloser {
 }
 
 func oversizedSSEPayload() string {
-	return strings.Repeat("x", 1024*1024+32)
+	return strings.Repeat("x", openAIStreamScannerMaxBuffer+32)
 }
 
 type sseEvent struct {

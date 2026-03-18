@@ -28,6 +28,9 @@ func parseOpenAIChatCompletionsMode(body []byte) chatCompletionsMode {
 		Stream *bool           `json:"stream,omitempty"`
 		Tools  json.RawMessage `json:"tools,omitempty"`
 	}
+	// Best-effort mode detection only: malformed JSON should still fall through
+	// to the real request validation path instead of making this helper another
+	// source of hard failures.
 	_ = json.Unmarshal(body, &partial)
 
 	clientRequestedStream := partial.Stream != nil && *partial.Stream
