@@ -1234,6 +1234,46 @@ func TestInjectSyntheticCompactionResumePrompt(t *testing.T) {
 	}
 }
 
+func TestInjectSyntheticCompactionResumePrompt_IgnoresHistoricalUserMessagesBeforeCheckpoint(t *testing.T) {
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "Run /review on my current changes"},
+				},
+			},
+			proxyCompactionContextMessage("Checkpoint summary"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	rewritten, injected := injectSyntheticCompactionResumePrompt(reqBody)
+	if !injected {
+		t.Fatal("expected resume prompt to be injected when only historical user messages remain")
+	}
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(rewritten, &req); err != nil {
+		t.Fatalf("failed to parse rewritten request: %v", err)
+	}
+
+	input, ok := req["input"].([]interface{})
+	if !ok || len(input) != 3 {
+		t.Fatalf("expected 3 input items, got %#v", req["input"])
+	}
+	if got := requireMessageTextWithRole(t, input[0], "user"); got != "Run /review on my current changes" {
+		t.Fatalf("expected historical user message to be preserved, got %q", got)
+	}
+	if got := requireMessageTextWithRole(t, input[2], "user"); !strings.Contains(got, "Continue from the checkpoint above and resume the interrupted task") {
+		t.Fatalf("expected injected resume prompt, got %q", got)
+	}
+}
+
 func TestInjectSyntheticCompactionResumePrompt_SkipsWhenUserMessageExists(t *testing.T) {
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",

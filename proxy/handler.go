@@ -1440,6 +1440,8 @@ type syntheticCompactionPayload struct {
 	Summary string `json:"summary"`
 }
 
+const proxyCompactionContextIntro = "You are resuming an interrupted assistant turn from a context checkpoint."
+
 func encodeSyntheticCompaction(summary string) string {
 	payload, err := json.Marshal(syntheticCompactionPayload{Summary: summary})
 	if err != nil {
@@ -1501,12 +1503,11 @@ func injectSyntheticCompactionResumePrompt(body []byte) ([]byte, bool) {
 		return body, false
 	}
 
-	if inputHasMessageRole(input, "user") {
-		return body, false
-	}
-
 	inputItems, ok := input.([]interface{})
 	if !ok {
+		return body, false
+	}
+	if !shouldInjectSyntheticCompactionResumePrompt(inputItems) {
 		return body, false
 	}
 
@@ -1522,6 +1523,26 @@ func injectSyntheticCompactionResumePrompt(body []byte) ([]byte, bool) {
 		return body, false
 	}
 	return rewrittenBody, true
+}
+
+func shouldInjectSyntheticCompactionResumePrompt(inputItems []interface{}) bool {
+	lastCheckpointIdx := -1
+	for i, item := range inputItems {
+		if isProxyCompactionContextMessage(item) {
+			lastCheckpointIdx = i
+		}
+	}
+
+	if lastCheckpointIdx == -1 {
+		return !inputHasMessageRole(inputItems, "user")
+	}
+
+	for _, item := range inputItems[lastCheckpointIdx+1:] {
+		if messageHasRole(item, "user") {
+			return false
+		}
+	}
+	return true
 }
 
 func rewriteSyntheticCompactionValue(v interface{}) (interface{}, int) {
@@ -1581,6 +1602,40 @@ func inputHasMessageRole(v interface{}, role string) bool {
 	return false
 }
 
+func messageHasRole(v interface{}, role string) bool {
+	typed, ok := v.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	if itemType, _ := typed["type"].(string); itemType != "message" {
+		return false
+	}
+	messageRole, _ := typed["role"].(string)
+	return messageRole == role
+}
+
+func isProxyCompactionContextMessage(v interface{}) bool {
+	typed, ok := v.(map[string]interface{})
+	if !ok || !messageHasRole(v, "developer") {
+		return false
+	}
+
+	content, ok := typed["content"].([]interface{})
+	if !ok || len(content) == 0 {
+		return false
+	}
+
+	firstPart, ok := content[0].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	if partType, _ := firstPart["type"].(string); partType != "input_text" {
+		return false
+	}
+	text, _ := firstPart["text"].(string)
+	return strings.HasPrefix(text, proxyCompactionContextIntro)
+}
+
 func extractSyntheticOrLegacyCompactionSummary(encryptedContent string) (string, bool) {
 	if strings.HasPrefix(encryptedContent, syntheticCompactionPrefix) {
 		raw := strings.TrimPrefix(encryptedContent, syntheticCompactionPrefix)
@@ -1623,7 +1678,7 @@ func looksOpaqueCompactionToken(token string) bool {
 
 func proxyCompactionContextMessage(summary string) map[string]interface{} {
 	summary = sanitizeProxySummaryText(summary)
-	text := "You are resuming an interrupted assistant turn from a context checkpoint. This checkpoint is the active working state for the same conversation, not passive background history.\n\nResume behavior:\n- Continue the same task immediately from this checkpoint.\n- Treat the checkpoint as authoritative for prior progress, constraints, and next steps.\n- Do not ask the user what to work on next unless the checkpoint explicitly says the assistant was blocked waiting for user input or that the task is complete.\n\nCheckpoint summary:\n" + summary
+	text := proxyCompactionContextIntro + " This checkpoint is the active working state for the same conversation, not passive background history.\n\nResume behavior:\n- Continue the same task immediately from this checkpoint.\n- Treat the checkpoint as authoritative for prior progress, constraints, and next steps.\n- Do not ask the user what to work on next unless the checkpoint explicitly says the assistant was blocked waiting for user input or that the task is complete.\n\nCheckpoint summary:\n" + summary
 	return map[string]interface{}{
 		"type": "message",
 		"role": "developer",
