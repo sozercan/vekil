@@ -49,7 +49,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Build macOS menubar app
-        run: GOARCH=arm64 make build-app
+        run: VERSION=${GITHUB_REF#refs/tags/} GOARCH=arm64 make build-app
 
       - name: Zip app bundle
         run: zip -r "Copilot-Proxy-macos-arm64.zip" "Copilot Proxy.app"

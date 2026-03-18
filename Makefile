@@ -2,6 +2,8 @@ BINARY := copilot-proxy
 LDFLAGS := -s -w
 APP_NAME := Copilot Proxy.app
 APP_BUNDLE_ID := com.copilot-proxy.menubar
+VERSION ?= 0.0.0
+APP_VERSION := $(patsubst v%,%,$(VERSION))
 
 .PHONY: build build-app test vet lint clean docker-build
 
@@ -26,9 +28,9 @@ build-app:
 	<key>CFBundlePackageType</key>\n\
 	<string>APPL</string>\n\
 	<key>CFBundleVersion</key>\n\
-	<string>1.0</string>\n\
+	<string>$(APP_VERSION)</string>\n\
 	<key>CFBundleShortVersionString</key>\n\
-	<string>1.0</string>\n\
+	<string>$(APP_VERSION)</string>\n\
 	<key>LSUIElement</key>\n\
 	<true/>\n\
 </dict>\n\
