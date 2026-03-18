@@ -373,9 +373,15 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	if rewrittenBody, rewriteCount := rewriteSyntheticCompactionRequest(bodyBytes); rewriteCount > 0 {
 		bodyBytes = rewrittenBody
+		resumePromptInjected := false
+		if resumedBody, injected := injectSyntheticCompactionResumePrompt(bodyBytes); injected {
+			bodyBytes = resumedBody
+			resumePromptInjected = true
+		}
 		h.log.Debug("rewrote compaction items",
 			logger.F("endpoint", "responses"),
 			logger.F("count", rewriteCount),
+			logger.F("resume_prompt_injected", resumePromptInjected),
 		)
 	}
 
@@ -423,15 +429,18 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 // compact request into a regular /responses call with this prompt so the
 // model produces a summarized handoff. The resulting compaction item is a
 // proxy-owned opaque token rather than a real upstream-encrypted payload.
-const compactPrompt = `You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
+const compactPrompt = `You are performing a CONTEXT CHECKPOINT COMPACTION for an interrupted coding-agent session. Create a handoff summary for another LLM that must continue the same task seamlessly.
+
+Write the summary so the next assistant can resume work without asking the user to restate the task.
 
 Include:
-- Current progress and key decisions made
-- Important context, constraints, or user preferences
-- What remains to be done (clear next steps)
-- Any critical data, examples, or references needed to continue
+- Current objective and task status: IN_PROGRESS, BLOCKED_ON_USER, or COMPLETE
+- Completed work and key decisions already made
+- The last concrete action taken and any important intermediate results
+- The next exact step the next assistant should take first
+- Critical context, constraints, user preferences, files, commands, errors, or references needed to continue
 
-Be concise, structured, and focused on helping the next LLM seamlessly continue the work.`
+Be concise, structured, and action-oriented. Do not chat with the user. Do not ask follow-up questions unless the task status is BLOCKED_ON_USER.`
 
 // HandleCompact handles POST /v1/responses/compact by forwarding the request
 // to the upstream /responses endpoint with a compaction system prompt injected.
@@ -1336,6 +1345,48 @@ func rewriteSyntheticCompactionRequest(body []byte) ([]byte, int) {
 	return rewrittenBody, rewriteCount
 }
 
+// When a compacted checkpoint is restored without a remaining user turn, add a
+// small synthetic user prompt so the upstream model resumes the interrupted
+// task instead of replying with a generic "what should I work on next?".
+func injectSyntheticCompactionResumePrompt(body []byte) ([]byte, bool) {
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body, false
+	}
+
+	rawInput, ok := req["input"]
+	if !ok {
+		return body, false
+	}
+
+	var input interface{}
+	if err := json.Unmarshal(rawInput, &input); err != nil {
+		return body, false
+	}
+
+	if inputHasMessageRole(input, "user") {
+		return body, false
+	}
+
+	inputItems, ok := input.([]interface{})
+	if !ok {
+		return body, false
+	}
+
+	inputItems = append(inputItems, proxyCompactionResumeMessage())
+	encodedInput, err := json.Marshal(inputItems)
+	if err != nil {
+		return body, false
+	}
+	req["input"] = encodedInput
+
+	rewrittenBody, err := json.Marshal(req)
+	if err != nil {
+		return body, false
+	}
+	return rewrittenBody, true
+}
+
 func rewriteSyntheticCompactionValue(v interface{}) (interface{}, int) {
 	switch typed := v.(type) {
 	case []interface{}:
@@ -1368,6 +1419,29 @@ func rewriteSyntheticCompactionValue(v interface{}) (interface{}, int) {
 	default:
 		return v, 0
 	}
+}
+
+func inputHasMessageRole(v interface{}, role string) bool {
+	switch typed := v.(type) {
+	case []interface{}:
+		for _, item := range typed {
+			if inputHasMessageRole(item, role) {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		if itemType, _ := typed["type"].(string); itemType == "message" {
+			if messageRole, _ := typed["role"].(string); messageRole == role {
+				return true
+			}
+		}
+		for _, value := range typed {
+			if inputHasMessageRole(value, role) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func extractSyntheticOrLegacyCompactionSummary(encryptedContent string) (string, bool) {
@@ -1412,7 +1486,7 @@ func looksOpaqueCompactionToken(token string) bool {
 
 func proxyCompactionContextMessage(summary string) map[string]interface{} {
 	summary = sanitizeProxySummaryText(summary)
-	text := "Context checkpoint summary from an earlier conversation. Treat this as background context for continuing the same task, not as a new user request.\n\n" + summary
+	text := "You are resuming an interrupted assistant turn from a context checkpoint. This checkpoint is the active working state for the same conversation, not passive background history.\n\nResume behavior:\n- Continue the same task immediately from this checkpoint.\n- Treat the checkpoint as authoritative for prior progress, constraints, and next steps.\n- Do not ask the user what to work on next unless the checkpoint explicitly says the assistant was blocked waiting for user input or that the task is complete.\n\nCheckpoint summary:\n" + summary
 	return map[string]interface{}{
 		"type": "message",
 		"role": "developer",
@@ -1420,6 +1494,19 @@ func proxyCompactionContextMessage(summary string) map[string]interface{} {
 			map[string]interface{}{
 				"type": "input_text",
 				"text": text,
+			},
+		},
+	}
+}
+
+func proxyCompactionResumeMessage() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "message",
+		"role": "user",
+		"content": []interface{}{
+			map[string]interface{}{
+				"type": "input_text",
+				"text": "Continue from the checkpoint above and resume the interrupted task from the next unfinished step. Do not ask for a new assignment unless the checkpoint says you were blocked waiting for user input or the work is already complete.",
 			},
 		},
 	}
