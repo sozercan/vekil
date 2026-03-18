@@ -674,6 +674,9 @@ func TestHandleResponses_RewritesSyntheticCompaction(t *testing.T) {
 		if !strings.Contains(contextText, summary) {
 			t.Errorf("expected rewritten compaction summary, got %q", contextText)
 		}
+		if got := requireMessageTextWithRole(t, input[1], "user"); got != "continue" {
+			t.Errorf("expected original user follow-up to be preserved, got %q", got)
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp-synth","object":"response","status":"completed"}`))
@@ -779,13 +782,17 @@ func TestHandleResponses_RewritesLegacyPlaintextCompaction(t *testing.T) {
 		}
 
 		input, ok := req["input"].([]interface{})
-		if !ok || len(input) != 1 {
-			t.Fatalf("expected 1 input item, got %#v", req["input"])
+		if !ok || len(input) != 2 {
+			t.Fatalf("expected 2 input items, got %#v", req["input"])
 		}
 
 		contextText := requireCompactionContextMessage(t, input[0])
 		if !strings.Contains(contextText, legacySummary) {
 			t.Errorf("expected legacy summary to be rewritten, got %q", contextText)
+		}
+		resumePrompt := requireMessageTextWithRole(t, input[1], "user")
+		if !strings.Contains(resumePrompt, "Continue from the checkpoint above and resume the interrupted task") {
+			t.Errorf("expected resume prompt to be appended, got %q", resumePrompt)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -1007,6 +1014,11 @@ func decodeCompactionSummaryForTest(t *testing.T, encryptedContent string) strin
 
 func requireCompactionContextMessage(t *testing.T, raw interface{}) string {
 	t.Helper()
+	return requireMessageTextWithRole(t, raw, "developer")
+}
+
+func requireMessageTextWithRole(t *testing.T, raw interface{}, wantRole string) string {
+	t.Helper()
 	item, ok := raw.(map[string]interface{})
 	if !ok {
 		t.Fatalf("expected message object, got %#v", raw)
@@ -1014,8 +1026,8 @@ func requireCompactionContextMessage(t *testing.T, raw interface{}) string {
 	if item["type"] != "message" {
 		t.Fatalf("expected rewritten item type message, got %#v", item)
 	}
-	if item["role"] != "developer" {
-		t.Fatalf("expected rewritten item role developer, got %#v", item)
+	if item["role"] != wantRole {
+		t.Fatalf("expected rewritten item role %s, got %#v", wantRole, item)
 	}
 
 	content, ok := item["content"].([]interface{})
@@ -1092,6 +1104,63 @@ func TestRewriteSyntheticCompactionRequest(t *testing.T) {
 	}
 	if item["type"] != "compaction" {
 		t.Fatalf("expected opaque token to remain a compaction item, got %#v", item)
+	}
+}
+
+func TestInjectSyntheticCompactionResumePrompt(t *testing.T) {
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			proxyCompactionContextMessage("Checkpoint summary"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	rewritten, injected := injectSyntheticCompactionResumePrompt(reqBody)
+	if !injected {
+		t.Fatal("expected resume prompt to be injected")
+	}
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(rewritten, &req); err != nil {
+		t.Fatalf("failed to parse rewritten request: %v", err)
+	}
+
+	input, ok := req["input"].([]interface{})
+	if !ok || len(input) != 2 {
+		t.Fatalf("expected 2 input items, got %#v", req["input"])
+	}
+	if got := requireMessageTextWithRole(t, input[1], "user"); !strings.Contains(got, "Continue from the checkpoint above and resume the interrupted task") {
+		t.Fatalf("expected injected resume prompt, got %q", got)
+	}
+}
+
+func TestInjectSyntheticCompactionResumePrompt_SkipsWhenUserMessageExists(t *testing.T) {
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			proxyCompactionContextMessage("Checkpoint summary"),
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "continue"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	rewritten, injected := injectSyntheticCompactionResumePrompt(reqBody)
+	if injected {
+		t.Fatal("expected resume prompt injection to be skipped")
+	}
+	if !bytes.Equal(rewritten, reqBody) {
+		t.Fatal("expected request body to remain unchanged when user message exists")
 	}
 }
 
