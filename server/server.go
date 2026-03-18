@@ -20,9 +20,36 @@ type Server struct {
 	running    atomic.Bool
 }
 
+type options struct {
+	proxyOptions []proxy.Option
+}
+
+// Option customizes server creation.
+type Option func(*options)
+
+// WithProxyOptions forwards proxy-level options to the underlying handler.
+func WithProxyOptions(opts ...proxy.Option) Option {
+	return func(o *options) {
+		o.proxyOptions = append(o.proxyOptions, opts...)
+	}
+}
+
+// WithCopilotHeaderConfig overrides the synthetic Copilot-identifying headers
+// sent on upstream requests.
+func WithCopilotHeaderConfig(cfg proxy.CopilotHeaderConfig) Option {
+	return WithProxyOptions(proxy.WithCopilotHeaderConfig(cfg))
+}
+
 // New creates a Server with routes and timeouts configured.
-func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string) *Server {
-	handler := proxy.NewProxyHandler(authenticator, log)
+func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) *Server {
+	cfg := options{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+
+	handler := proxy.NewProxyHandler(authenticator, log, cfg.proxyOptions...)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/messages", handler.HandleAnthropicMessages)
@@ -34,6 +61,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("POST /v1/responses", handler.HandleResponses)
 	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
+	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)
 
 	addr := fmt.Sprintf("%s:%s", host, port)

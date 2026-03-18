@@ -30,13 +30,21 @@ const (
 	maxRequestBodySize = 10 << 20
 	// upstreamTimeout is the timeout for LLM inference requests.
 	upstreamTimeout = 5 * time.Minute
+	// readyzUpstreamTimeout bounds readiness probes that validate upstream reachability.
+	readyzUpstreamTimeout = 10 * time.Second
 	// modelsUpstreamTimeout is the timeout for the /models metadata request.
 	modelsUpstreamTimeout = 30 * time.Second
 	// modelsCacheTTL is how long the /models response is cached.
 	modelsCacheTTL = 5 * time.Minute
 	// syntheticCompactionPrefix marks proxy-owned compaction payloads so they
 	// can be expanded back into normal context on subsequent /responses calls.
-	syntheticCompactionPrefix = "copilot-proxy.compaction.v1:"
+	syntheticCompactionPrefix         = "copilot-proxy.compaction.v1:"
+	defaultCopilotEditorVersion       = "vscode/1.95.0"
+	defaultCopilotEditorPluginVersion = "copilot-chat/0.26.7"
+	defaultCopilotUserAgent           = "GitHubCopilotChat/0.26.7"
+	defaultCopilotIntegrationID       = "vscode-chat"
+	defaultCopilotGitHubAPIVersion    = "2025-04-01"
+	defaultCopilotOpenAIIntent        = "conversation-panel"
 )
 
 var preferredResponsesFallbackModels = []string{
@@ -64,11 +72,57 @@ type cachedModelsResponse struct {
 	etag       string
 }
 
+// CopilotHeaderConfig controls the synthetic editor-identifying headers sent to
+// the upstream Copilot backend. Empty fields fall back to project defaults.
+type CopilotHeaderConfig struct {
+	EditorVersion       string
+	EditorPluginVersion string
+	UserAgent           string
+	IntegrationID       string
+	GitHubAPIVersion    string
+	OpenAIIntent        string
+}
+
+func DefaultCopilotHeaderConfig() CopilotHeaderConfig {
+	return CopilotHeaderConfig{
+		EditorVersion:       defaultCopilotEditorVersion,
+		EditorPluginVersion: defaultCopilotEditorPluginVersion,
+		UserAgent:           defaultCopilotUserAgent,
+		IntegrationID:       defaultCopilotIntegrationID,
+		GitHubAPIVersion:    defaultCopilotGitHubAPIVersion,
+		OpenAIIntent:        defaultCopilotOpenAIIntent,
+	}
+}
+
+func (c CopilotHeaderConfig) withDefaults() CopilotHeaderConfig {
+	defaults := DefaultCopilotHeaderConfig()
+	if c.EditorVersion == "" {
+		c.EditorVersion = defaults.EditorVersion
+	}
+	if c.EditorPluginVersion == "" {
+		c.EditorPluginVersion = defaults.EditorPluginVersion
+	}
+	if c.UserAgent == "" {
+		c.UserAgent = defaults.UserAgent
+	}
+	if c.IntegrationID == "" {
+		c.IntegrationID = defaults.IntegrationID
+	}
+	if c.GitHubAPIVersion == "" {
+		c.GitHubAPIVersion = defaults.GitHubAPIVersion
+	}
+	if c.OpenAIIntent == "" {
+		c.OpenAIIntent = defaults.OpenAIIntent
+	}
+	return c
+}
+
 // ProxyHandler holds dependencies for all HTTP handlers.
 type ProxyHandler struct {
 	auth           *auth.Authenticator
 	client         *http.Client
 	copilotURL     string
+	copilotHeaders CopilotHeaderConfig
 	log            *logger.Logger
 	maxRetries     int
 	retryBaseDelay time.Duration
@@ -76,9 +130,20 @@ type ProxyHandler struct {
 	geminiCounts   geminiCountTokensCache
 }
 
+// Option customizes ProxyHandler behavior.
+type Option func(*ProxyHandler)
+
+// WithCopilotHeaderConfig overrides the synthetic Copilot-identifying headers
+// used for upstream requests.
+func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
+	return func(h *ProxyHandler) {
+		h.copilotHeaders = cfg.withDefaults()
+	}
+}
+
 // NewProxyHandler creates a ProxyHandler with connection pooling and HTTP/2.
-func NewProxyHandler(a *auth.Authenticator, log *logger.Logger) *ProxyHandler {
-	return &ProxyHandler{
+func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) *ProxyHandler {
+	h := &ProxyHandler{
 		auth: a,
 		client: &http.Client{
 			Transport: &http.Transport{
@@ -90,21 +155,37 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger) *ProxyHandler {
 				TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
 			},
 		},
-		copilotURL: "https://api.githubcopilot.com",
-		log:        log,
+		copilotURL:     "https://api.githubcopilot.com",
+		copilotHeaders: DefaultCopilotHeaderConfig(),
+		log:            log,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(h)
+		}
+	}
+	return h
 }
 
 func setCopilotHeaders(req *http.Request, token string) {
+	setCopilotHeadersWithConfig(req, token, DefaultCopilotHeaderConfig())
+}
+
+func setCopilotHeadersWithConfig(req *http.Request, token string, cfg CopilotHeaderConfig) {
+	cfg = cfg.withDefaults()
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("editor-version", "vscode/1.95.0")
-	req.Header.Set("editor-plugin-version", "copilot-chat/0.26.7")
-	req.Header.Set("user-agent", "GitHubCopilotChat/0.26.7")
-	req.Header.Set("copilot-integration-id", "vscode-chat")
-	req.Header.Set("x-github-api-version", "2025-04-01")
+	req.Header.Set("editor-version", cfg.EditorVersion)
+	req.Header.Set("editor-plugin-version", cfg.EditorPluginVersion)
+	req.Header.Set("user-agent", cfg.UserAgent)
+	req.Header.Set("copilot-integration-id", cfg.IntegrationID)
+	req.Header.Set("x-github-api-version", cfg.GitHubAPIVersion)
 	req.Header.Set("x-request-id", uuid.New().String())
-	req.Header.Set("openai-intent", "conversation-panel")
+	req.Header.Set("openai-intent", cfg.OpenAIIntent)
 	req.Header.Set("Content-Type", "application/json")
+}
+
+func (h *ProxyHandler) setCopilotHeaders(req *http.Request, token string) {
+	setCopilotHeadersWithConfig(req, token, h.copilotHeaders)
 }
 
 var hopByHopHeaders = map[string]struct{}{
@@ -231,7 +312,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		if err != nil {
 			return nil, err
 		}
-		setCopilotHeaders(req, token)
+		h.setCopilotHeaders(req, token)
 		return req, nil
 	})
 	if err != nil {
@@ -315,7 +396,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		if err != nil {
 			return nil, err
 		}
-		setCopilotHeaders(req, token)
+		h.setCopilotHeaders(req, token)
 		return req, nil
 	})
 	if err != nil {
@@ -400,7 +481,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return nil, err
 		}
-		setCopilotHeaders(req, token)
+		h.setCopilotHeaders(req, token)
 		return req, nil
 	})
 	if err != nil {
@@ -753,6 +834,62 @@ func (h *ProxyHandler) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"ok"}`))
 }
 
+// HandleReadyz validates that the proxy can obtain an auth token and reach the
+// upstream Copilot API.
+func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), readyzUpstreamTimeout)
+	defer cancel()
+
+	token, err := h.auth.GetTokenNonInteractive(ctx)
+	if err != nil {
+		writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", fmt.Sprintf("failed to get token: %v", err))
+		return
+	}
+
+	if err := h.checkUpstreamReady(ctx, token); err != nil {
+		writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", err.Error())
+		return
+	}
+
+	writeReadyzStatus(w, http.StatusOK, "ready", "")
+}
+
+func (h *ProxyHandler) checkUpstreamReady(ctx context.Context, token string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.copilotURL+"/models", nil)
+	if err != nil {
+		return fmt.Errorf("failed to create upstream probe request: %w", err)
+	}
+	h.setCopilotHeaders(req, token)
+
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("upstream probe failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		message := fmt.Sprintf("upstream probe returned %d", resp.StatusCode)
+		if trimmed := strings.TrimSpace(string(body)); trimmed != "" {
+			message += ": " + trimmed
+		}
+		return fmt.Errorf("%s", message)
+	}
+
+	return nil
+}
+
+func writeReadyzStatus(w http.ResponseWriter, statusCode int, status string, errMessage string) {
+	response := map[string]string{"status": status}
+	if errMessage != "" {
+		response["error"] = errMessage
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(response)
+}
+
 // HandleModels handles GET /v1/models by proxying to the upstream Copilot API.
 // Responses are cached for modelsCacheTTL to avoid repeated upstream calls.
 // The response includes both the standard OpenAI "data" field and a Codex-compatible
@@ -794,7 +931,7 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to create request", "server_error")
 		return
 	}
-	setCopilotHeaders(req, token)
+	h.setCopilotHeaders(req, token)
 	if hasCachedEntry && cachedEntry.etag != "" {
 		req.Header.Set("If-None-Match", cachedEntry.etag)
 	}
@@ -1020,7 +1157,7 @@ func (h *ProxyHandler) postResponses(ctx context.Context, token string, bodyByte
 		if err != nil {
 			return nil, err
 		}
-		setCopilotHeaders(req, token)
+		h.setCopilotHeaders(req, token)
 		return req, nil
 	})
 }
@@ -1147,7 +1284,7 @@ func (h *ProxyHandler) pickResponsesCompatibleModel(ctx context.Context, token, 
 		if err != nil {
 			return nil, err
 		}
-		setCopilotHeaders(req, token)
+		h.setCopilotHeaders(req, token)
 		return req, nil
 	})
 	if err != nil {

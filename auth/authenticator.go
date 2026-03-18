@@ -98,7 +98,10 @@ func (a *Authenticator) IsSignedIn() bool {
 	if a.accessToken != "" {
 		return true
 	}
-	return a.hasAccessTokenOnDisk()
+	if a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
+		return true
+	}
+	return a.hasAccessTokenOnDisk() || a.hasValidCopilotTokenOnDisk()
 }
 
 // hasAccessTokenOnDisk returns true when the access-token file exists and is
@@ -111,9 +114,36 @@ func (a *Authenticator) hasAccessTokenOnDisk() bool {
 	return strings.TrimSpace(string(data)) != ""
 }
 
+// hasValidCopilotTokenOnDisk returns true when the persisted Copilot token file
+// exists, is valid JSON, and has not expired yet. Must NOT be called with the
+// write lock held.
+func (a *Authenticator) hasValidCopilotTokenOnDisk() bool {
+	data, err := os.ReadFile(filepath.Join(a.tokenDir, "api-key.json"))
+	if err != nil {
+		return false
+	}
+
+	var ctResp CopilotTokenResponse
+	if err := json.Unmarshal(data, &ctResp); err != nil {
+		return false
+	}
+
+	return ctResp.Token != "" && time.Now().Unix() < ctResp.ExpiresAt-300
+}
+
 // GetToken returns a valid Copilot API token, refreshing it if necessary.
 // It is safe for concurrent use.
 func (a *Authenticator) GetToken(ctx context.Context) (string, error) {
+	return a.getToken(ctx, !a.DisableAutoDeviceFlow)
+}
+
+// GetTokenNonInteractive returns a valid Copilot API token without falling
+// back to the interactive device-code flow.
+func (a *Authenticator) GetTokenNonInteractive(ctx context.Context) (string, error) {
+	return a.getToken(ctx, false)
+}
+
+func (a *Authenticator) getToken(ctx context.Context, allowDeviceFlow bool) (string, error) {
 	a.mu.RLock()
 	if a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
 		token := a.copilotToken
@@ -129,20 +159,23 @@ func (a *Authenticator) GetToken(ctx context.Context) (string, error) {
 	if a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
 		return a.copilotToken, nil
 	}
+	if err := a.loadCopilotToken(); err == nil {
+		return a.copilotToken, nil
+	}
 
-	if err := a.refreshToken(ctx); err != nil {
+	if err := a.refreshToken(ctx, allowDeviceFlow); err != nil {
 		return "", err
 	}
 	return a.copilotToken, nil
 }
 
-func (a *Authenticator) refreshToken(ctx context.Context) error {
+func (a *Authenticator) refreshToken(ctx context.Context, allowDeviceFlow bool) error {
 	if err := a.loadAccessToken(); err == nil {
 		if err := a.exchangeForCopilotToken(ctx); err == nil {
 			return nil
 		}
 	}
-	if a.DisableAutoDeviceFlow {
+	if !allowDeviceFlow {
 		return fmt.Errorf("not authenticated")
 	}
 	return a.deviceCodeFlow(ctx)

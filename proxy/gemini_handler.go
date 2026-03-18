@@ -349,7 +349,7 @@ func (h *ProxyHandler) postChatCompletions(ctx context.Context, token string, bo
 		if err != nil {
 			return nil, err
 		}
-		setCopilotHeaders(req, token)
+		h.setCopilotHeaders(req, token)
 		return req, nil
 	})
 }

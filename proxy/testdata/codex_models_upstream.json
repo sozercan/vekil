@@ -1,0 +1,84 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "gpt-5.4",
+      "object": "model",
+      "created": 0,
+      "owned_by": "github-copilot",
+      "supported_endpoints": [
+        "/responses",
+        "/chat/completions"
+      ],
+      "capabilities": {
+        "supports": {
+          "parallel_tool_calls": true,
+          "vision": true,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "tool_calls": true
+        },
+        "limits": {
+          "max_context_window_tokens": 400000
+        }
+      },
+      "model_picker_enabled": true,
+      "model_picker_category": "powerful",
+      "name": "GPT-5.4"
+    },
+    {
+      "id": "claude-sonnet-4.5",
+      "object": "model",
+      "created": 0,
+      "owned_by": "github-copilot",
+      "supported_endpoints": [
+        "/chat/completions",
+        "/v1/messages"
+      ],
+      "capabilities": {
+        "supports": {
+          "parallel_tool_calls": true,
+          "vision": true,
+          "reasoning_effort": [],
+          "tool_calls": true
+        },
+        "limits": {
+          "max_context_window_tokens": 200000
+        }
+      },
+      "model_picker_enabled": true,
+      "model_picker_category": "versatile",
+      "name": "Claude Sonnet 4.5"
+    },
+    {
+      "id": "gpt-5.1-codex",
+      "object": "model",
+      "created": 0,
+      "owned_by": "github-copilot",
+      "supported_endpoints": [
+        "/responses"
+      ],
+      "capabilities": {
+        "supports": {
+          "parallel_tool_calls": true,
+          "vision": false,
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "tool_calls": true
+        },
+        "limits": {
+          "max_context_window_tokens": 256000
+        }
+      },
+      "model_picker_enabled": true,
+      "model_picker_category": "powerful",
+      "name": "GPT-5.1 Codex"
+    }
+  ]
+}
