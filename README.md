@@ -71,6 +71,10 @@ Tokens are cached to `~/.config/copilot-proxy/` and automatically refreshed befo
 | `--host` | `HOST` | `0.0.0.0` | Listen host |
 | `--token-dir` | `TOKEN_DIR` | `~/.config/copilot-proxy` | Token storage directory |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level (`debug`, `info`, or `error`) |
+| `--copilot-editor-version` | `COPILOT_EDITOR_VERSION` | `vscode/1.95.0` | Upstream `editor-version` header |
+| `--copilot-plugin-version` | `COPILOT_PLUGIN_VERSION` | `copilot-chat/0.26.7` | Upstream `editor-plugin-version` header |
+| `--copilot-user-agent` | `COPILOT_USER_AGENT` | `GitHubCopilotChat/0.26.7` | Upstream `User-Agent` header |
+| `--copilot-github-api-version` | `COPILOT_GITHUB_API_VERSION` | `2025-04-01` | Upstream `x-github-api-version` header |
 
 ## Usage Examples
 
@@ -323,6 +327,10 @@ Proxies the upstream GitHub Copilot models endpoint, returning all available mod
 ### `GET /healthz`
 
 Health check endpoint. Returns `{"status":"ok"}`.
+
+### `GET /readyz`
+
+Readiness endpoint. Validates that the proxy can obtain a Copilot token and successfully probe the upstream Copilot `/models` API. Returns `{"status":"ready"}` on success or `503` with `{"status":"not_ready","error":"..."}` on failure.
 
 ## Architecture
 

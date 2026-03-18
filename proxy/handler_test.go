@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +51,102 @@ func TestHandleHealthz(t *testing.T) {
 	if result["status"] != "ok" {
 		t.Fatalf("expected status ok, got %q", result["status"])
 	}
+}
+
+func TestHandleReadyz(t *testing.T) {
+	t.Run("ready when auth and upstream probe succeed", func(t *testing.T) {
+		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/models" {
+				t.Fatalf("expected readiness probe to hit /models, got %s", r.URL.Path)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		w := httptest.NewRecorder()
+
+		h.HandleReadyz(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.StatusCode)
+		}
+
+		var result map[string]string
+		body, _ := io.ReadAll(resp.Body)
+		if err := json.Unmarshal(body, &result); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if result["status"] != "ready" {
+			t.Fatalf("expected status ready, got %q", result["status"])
+		}
+		if _, hasError := result["error"]; hasError {
+			t.Fatalf("unexpected error field in ready response: %v", result)
+		}
+	})
+
+	t.Run("not ready when auth fails", func(t *testing.T) {
+		authenticator := auth.NewAuthenticator(t.TempDir())
+		authenticator.DisableAutoDeviceFlow = true
+
+		h := &ProxyHandler{
+			auth: authenticator,
+			log:  logger.New(logger.LevelInfo),
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		w := httptest.NewRecorder()
+
+		h.HandleReadyz(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503, got %d", resp.StatusCode)
+		}
+
+		var result map[string]string
+		body, _ := io.ReadAll(resp.Body)
+		if err := json.Unmarshal(body, &result); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if result["status"] != "not_ready" {
+			t.Fatalf("expected status not_ready, got %q", result["status"])
+		}
+		if !strings.Contains(result["error"], "failed to get token") {
+			t.Fatalf("unexpected error message: %q", result["error"])
+		}
+	})
+
+	t.Run("not ready when upstream probe fails", func(t *testing.T) {
+		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"service unavailable"}`))
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		w := httptest.NewRecorder()
+
+		h.HandleReadyz(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503, got %d", resp.StatusCode)
+		}
+
+		var result map[string]string
+		body, _ := io.ReadAll(resp.Body)
+		if err := json.Unmarshal(body, &result); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if result["status"] != "not_ready" {
+			t.Fatalf("expected status not_ready, got %q", result["status"])
+		}
+		if !strings.Contains(result["error"], "upstream probe returned 503") {
+			t.Fatalf("unexpected error message: %q", result["error"])
+		}
+	})
 }
 
 func TestHandleAnthropicMessages(t *testing.T) {
@@ -1251,6 +1348,37 @@ func TestSetCopilotHeaders(t *testing.T) {
 	}
 }
 
+func TestSetCopilotHeadersWithConfig(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/test", nil)
+	setCopilotHeadersWithConfig(req, "my-test-token", CopilotHeaderConfig{
+		EditorVersion:       "vscode/1.96.0",
+		EditorPluginVersion: "copilot-chat/0.27.0",
+		UserAgent:           "GitHubCopilotChat/0.27.0",
+		GitHubAPIVersion:    "2025-05-01",
+	})
+
+	tests := []struct {
+		header   string
+		expected string
+	}{
+		{"Authorization", "Bearer my-test-token"},
+		{"editor-version", "vscode/1.96.0"},
+		{"editor-plugin-version", "copilot-chat/0.27.0"},
+		{"user-agent", "GitHubCopilotChat/0.27.0"},
+		{"copilot-integration-id", defaultCopilotIntegrationID},
+		{"x-github-api-version", "2025-05-01"},
+		{"openai-intent", defaultCopilotOpenAIIntent},
+		{"Content-Type", "application/json"},
+	}
+
+	for _, tt := range tests {
+		got := req.Header.Get(tt.header)
+		if got != tt.expected {
+			t.Errorf("header %q: expected %q, got %q", tt.header, tt.expected, got)
+		}
+	}
+}
+
 func TestHandleOpenAIChatCompletionsUpstreamError(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1377,6 +1505,124 @@ func TestHandleModels(t *testing.T) {
 			t.Fatalf("expected 500, got %d", resp.StatusCode)
 		}
 	})
+}
+
+func TestHandleModels_CodexContractFixture(t *testing.T) {
+	upstreamBody, err := os.ReadFile("testdata/codex_models_upstream.json")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+
+	h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(upstreamBody)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+
+	h.HandleModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	type reasoningPreset struct {
+		Effort      string `json:"effort"`
+		Description string `json:"description"`
+	}
+	type truncationPolicy struct {
+		Mode  string `json:"mode"`
+		Limit int64  `json:"limit"`
+	}
+	type codexModelContract struct {
+		Slug                       string            `json:"slug"`
+		DisplayName                string            `json:"display_name"`
+		DefaultReasoningLevel      *string           `json:"default_reasoning_level,omitempty"`
+		SupportedReasoningLevels   []reasoningPreset `json:"supported_reasoning_levels"`
+		ShellType                  string            `json:"shell_type"`
+		Visibility                 string            `json:"visibility"`
+		SupportedInAPI             bool              `json:"supported_in_api"`
+		Priority                   int               `json:"priority"`
+		BaseInstructions           string            `json:"base_instructions"`
+		SupportsReasoningSummaries bool              `json:"supports_reasoning_summaries"`
+		SupportVerbosity           bool              `json:"support_verbosity"`
+		TruncationPolicy           truncationPolicy  `json:"truncation_policy"`
+		SupportsParallelToolCalls  bool              `json:"supports_parallel_tool_calls"`
+		ContextWindow              *int64            `json:"context_window,omitempty"`
+		ExperimentalSupportedTools []string          `json:"experimental_supported_tools"`
+		InputModalities            []string          `json:"input_modalities"`
+	}
+	var result struct {
+		Data   []json.RawMessage    `json:"data"`
+		Models []codexModelContract `json:"models"`
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(result.Data) != 3 {
+		t.Fatalf("expected 3 data entries, got %d", len(result.Data))
+	}
+	if len(result.Models) != 3 {
+		t.Fatalf("expected 3 transformed models, got %d", len(result.Models))
+	}
+
+	bySlug := make(map[string]codexModelContract, len(result.Models))
+	for _, model := range result.Models {
+		bySlug[model.Slug] = model
+	}
+
+	gpt54, ok := bySlug["gpt-5.4"]
+	if !ok {
+		t.Fatal("expected gpt-5.4 in transformed models")
+	}
+	if gpt54.DisplayName != "GPT-5.4" {
+		t.Errorf("gpt-5.4 display_name = %q, want GPT-5.4", gpt54.DisplayName)
+	}
+	if gpt54.DefaultReasoningLevel == nil || *gpt54.DefaultReasoningLevel != "medium" {
+		t.Errorf("gpt-5.4 default_reasoning_level = %v, want medium", gpt54.DefaultReasoningLevel)
+	}
+	if len(gpt54.SupportedReasoningLevels) != 3 {
+		t.Fatalf("gpt-5.4 supported_reasoning_levels = %d, want 3", len(gpt54.SupportedReasoningLevels))
+	}
+	if gpt54.ShellType != "shell_command" {
+		t.Errorf("gpt-5.4 shell_type = %q, want shell_command", gpt54.ShellType)
+	}
+	if gpt54.Visibility != "list" {
+		t.Errorf("gpt-5.4 visibility = %q, want list", gpt54.Visibility)
+	}
+	if !gpt54.SupportedInAPI {
+		t.Error("expected gpt-5.4 supported_in_api = true")
+	}
+	if gpt54.TruncationPolicy.Mode != "bytes" || gpt54.TruncationPolicy.Limit != 10000 {
+		t.Errorf("gpt-5.4 truncation_policy = %+v, want bytes/10000", gpt54.TruncationPolicy)
+	}
+	if !gpt54.SupportsParallelToolCalls {
+		t.Error("expected gpt-5.4 supports_parallel_tool_calls = true")
+	}
+	if got := strings.Join(gpt54.InputModalities, ","); got != "text,image" {
+		t.Errorf("gpt-5.4 input_modalities = %q, want text,image", got)
+	}
+
+	claude, ok := bySlug["claude-sonnet-4.5"]
+	if !ok {
+		t.Fatal("expected claude-sonnet-4.5 in transformed models")
+	}
+	if claude.Visibility != "hide" {
+		t.Errorf("claude-sonnet-4.5 visibility = %q, want hide", claude.Visibility)
+	}
+	if claude.SupportedInAPI {
+		t.Error("expected claude-sonnet-4.5 supported_in_api = false")
+	}
+	if claude.SupportsReasoningSummaries {
+		t.Error("expected claude-sonnet-4.5 supports_reasoning_summaries = false")
+	}
+	if len(claude.SupportedReasoningLevels) != 0 {
+		t.Errorf("claude-sonnet-4.5 supported_reasoning_levels = %d, want 0", len(claude.SupportedReasoningLevels))
+	}
 }
 
 func TestHandleModels_ForwardsQueryAndETag(t *testing.T) {

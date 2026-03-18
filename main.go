@@ -10,6 +10,7 @@ import (
 
 	"github.com/sozercan/copilot-proxy/auth"
 	"github.com/sozercan/copilot-proxy/logger"
+	"github.com/sozercan/copilot-proxy/proxy"
 	"github.com/sozercan/copilot-proxy/server"
 )
 
@@ -18,6 +19,10 @@ func main() {
 	host := flag.String("host", getEnv("HOST", "0.0.0.0"), "Listen host")
 	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/copilot-proxy)")
 	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
+	copilotEditorVersion := flag.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header")
+	copilotPluginVersion := flag.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
+	copilotUserAgent := flag.String("copilot-user-agent", getEnv("COPILOT_USER_AGENT", ""), "Upstream Copilot user-agent header")
+	copilotGitHubAPIVersion := flag.String("copilot-github-api-version", getEnv("COPILOT_GITHUB_API_VERSION", ""), "Upstream Copilot x-github-api-version header")
 	flag.Parse()
 
 	log := logger.New(logger.ParseLevel(*logLevel))
@@ -31,7 +36,12 @@ func main() {
 	}
 	log.Info("authenticated successfully")
 
-	srv := server.New(authenticator, log, *host, *port)
+	srv := server.New(authenticator, log, *host, *port, server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
+		EditorVersion:       *copilotEditorVersion,
+		EditorPluginVersion: *copilotPluginVersion,
+		UserAgent:           *copilotUserAgent,
+		GitHubAPIVersion:    *copilotGitHubAPIVersion,
+	}))
 
 	if err := srv.Start(); err != nil {
 		log.Fatal("server start error", logger.Err(err))

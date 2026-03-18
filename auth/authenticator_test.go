@@ -56,6 +56,30 @@ func TestGetToken_RefreshesExpiredToken(t *testing.T) {
 	}
 }
 
+func TestGetToken_LoadsPersistedCopilotToken(t *testing.T) {
+	dir := t.TempDir()
+	data, err := json.Marshal(CopilotTokenResponse{
+		Token:     "persisted-token",
+		ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("marshal token: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "api-key.json"), data, 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	a := &Authenticator{tokenDir: dir}
+
+	token, err := a.GetToken(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if token != "persisted-token" {
+		t.Errorf("expected persisted-token, got %q", token)
+	}
+}
+
 func TestGetToken_ConcurrentAccess(t *testing.T) {
 	a := NewTestAuthenticator("concurrent-token")
 
@@ -242,6 +266,25 @@ func TestIsSignedIn_WithDiskToken(t *testing.T) {
 	a := &Authenticator{tokenDir: dir}
 	if !a.IsSignedIn() {
 		t.Error("expected IsSignedIn() == true with disk token")
+	}
+}
+
+func TestIsSignedIn_WithDiskCopilotToken(t *testing.T) {
+	dir := t.TempDir()
+	data, err := json.Marshal(CopilotTokenResponse{
+		Token:     "persisted-token",
+		ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("marshal token: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "api-key.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &Authenticator{tokenDir: dir}
+	if !a.IsSignedIn() {
+		t.Error("expected IsSignedIn() == true with valid copilot token on disk")
 	}
 }
 
@@ -439,7 +482,7 @@ func TestRefreshToken_DisableAutoDeviceFlow(t *testing.T) {
 		DisableAutoDeviceFlow: true,
 	}
 
-	err := a.refreshToken(context.Background())
+	err := a.refreshToken(context.Background(), false)
 	if err == nil {
 		t.Fatal("expected error when DisableAutoDeviceFlow is true")
 	}
