@@ -8,7 +8,8 @@ High-performance Go proxy that exposes Anthropic, Gemini, and OpenAI-compatible 
 - **Gemini Generate Content API** (`POST /v1beta/models/{model}:generateContent`, `POST /models/{model}:generateContent`) — Gemini request/response/SSE translation on top of Copilot chat completions
 - **Gemini Count Tokens API** (`POST /v1beta/models/{model}:countTokens`, `POST /models/{model}:countTokens`) — translated token counting via a minimal upstream probe with short-lived caching
 - **OpenAI Chat Completions API** (`POST /v1/chat/completions`) — near zero-copy passthrough (tools-aware, see below)
-- **OpenAI Responses API** (`POST /v1/responses`) — near zero-copy passthrough
+- **OpenAI Responses API** (`POST /v1/responses`) — near zero-copy passthrough with proxy-owned compaction resume support
+- **Codex compatibility endpoints** (`POST /v1/responses/compact`, `POST /v1/memories/trace_summarize`) — proxy-owned adapters backed by the upstream Responses API
 - **SSE streaming** support for all endpoints
 - **Tool use** — Anthropic and Gemini function/tool definitions are translated to OpenAI function calling format
 - **Parallel tool use** — reliable parallel tool calls on Anthropic, Gemini, and OpenAI paths via forced-streaming aggregation
@@ -219,14 +220,16 @@ Dated model suffixes (e.g., `claude-sonnet-4-20250514`) are stripped automatical
 
 **Available models (`GET /v1/models`):**
 
-The list of available models is fetched dynamically from the upstream GitHub Copilot API. Query the endpoint to see all currently available models:
+The list of available models is fetched dynamically from the upstream GitHub Copilot API. The proxy preserves the upstream OpenAI-style `data` payload and also adds a Codex-compatible `models` array so both standard SDKs and Codex-style clients can consume the same endpoint. Query the endpoint to see the currently available models:
 
 ```bash
 curl http://localhost:1337/v1/models
 ```
 
 <details>
-<summary>Known models</summary>
+<summary>Example model IDs</summary>
+
+Illustrative only: the live `/v1/models` response is authoritative and may change without a proxy release.
 
 | Provider  | Model name             |
 | --------- | ---------------------- |
@@ -318,11 +321,26 @@ Near zero-copy passthrough for requests without tools. When tools are present, t
 
 ### `POST /v1/responses` (OpenAI)
 
-Near zero-copy passthrough for the OpenAI Responses API. Only authentication headers are injected.
+Near zero-copy passthrough for the OpenAI Responses API. Authentication headers are always injected, and proxy-owned synthetic compaction items are expanded back into normal context before forwarding so resumed Codex sessions keep working through the standard `/v1/responses` path.
+
+Streaming Responses requests are passed through directly with upstream headers preserved.
+
+### `POST /v1/responses/compact`
+
+Codex compatibility shim for environments that expect the OpenAI `/responses/compact` endpoint. The proxy rewrites the request into a normal upstream `/responses` call with a compaction prompt, then returns:
+
+- a normal assistant summary message
+- a proxy-owned opaque `compaction` item whose `encrypted_content` can later be sent back to `/v1/responses` or `/v1/responses/compact`
+
+If the requested model does not support the upstream Responses API, the proxy retries the compaction request against a compatible fallback model discovered from `/models`.
+
+### `POST /v1/memories/trace_summarize`
+
+Codex compatibility shim that summarizes one or more traces into `{trace_summary, memory_summary}` objects. The proxy sends the traces through the upstream `/responses` endpoint with a JSON-only summarization prompt and reshapes the result into the format Codex expects.
 
 ### `GET /v1/models`
 
-Proxies the upstream GitHub Copilot models endpoint, returning all available models dynamically. No hardcoded model list — new models are available as soon as Copilot adds them.
+Proxies the upstream GitHub Copilot models endpoint, returning all available models dynamically. No hardcoded model list is used for the live response. The proxy also adds a Codex-compatible top-level `models` array derived from the upstream metadata.
 
 ### `GET /healthz`
 
@@ -352,7 +370,11 @@ Readiness endpoint. Validates that the proxy can obtain a Copilot token and succ
 │                   (passthrough; forced-stream         │
 │                    + aggregate when tools present)    │
 │  /v1/responses ────────────────► /responses          │
-│                   (passthrough)                       │
+│                   (passthrough + proxy compaction     │
+│                    expansion when needed)             │
+│  /v1/responses/compact ────────► /responses          │
+│  /v1/memories/trace_summarize ─► /responses          │
+│                   (proxy-owned Codex compatibility)   │
 │                                                      │
 │  auth/ ── Device code flow ── Token cache & refresh  │
 └─────────────────────────────────────────────────────┘

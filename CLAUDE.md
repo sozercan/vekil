@@ -23,7 +23,9 @@ Run specific tests: `go test ./proxy/ -run TestHandle -v`
 |---------|---------|
 | `main.go` | CLI entry, flags, signal handling |
 | `auth/` | GitHub OAuth device code flow, token caching/refresh (`sync.RWMutex` + double-check) |
-| `proxy/handler.go` | HTTP handlers — the core of the proxy |
+| `proxy/chat_handlers.go` | Anthropic and OpenAI chat handlers, including forced-streaming aggregation for tool calls |
+| `proxy/responses_handler.go` | OpenAI Responses passthrough plus Codex compatibility endpoints (`/v1/responses/compact`, `/v1/memories/trace_summarize`) |
+| `proxy/handler.go` | Shared proxy plumbing: health/ready/models handlers, request-body decoding, Copilot headers, caches |
 | `proxy/gemini_handler.go` | Gemini-native HTTP handlers and countTokens probe flow |
 | `proxy/gemini.go` | Gemini↔OpenAI request/response translation and validation |
 | `proxy/gemini_streaming.go` | OpenAI SSE → Gemini SSE translation |
@@ -40,8 +42,9 @@ Run specific tests: `go test ./proxy/ -run TestHandle -v`
 - **No frameworks**: Pure `net/http` with Go 1.22+ `ServeMux` method routing. Do not add web frameworks.
 - **Forced streaming for parallel tool calls**: Non-streaming requests with tools are force-streamed upstream then aggregated back, because Copilot's non-streaming mode doesn't reliably return parallel tool calls. This is the project's core value-add.
 - **Gemini is a translation layer**: Gemini endpoints are implemented like Anthropic, not as zero-copy passthrough. Keep Gemini-specific protocol logic in `proxy/gemini*.go`.
-- **Zero-copy passthrough**: OpenAI endpoints proxy requests with minimal modification (inject auth headers + `parallel_tool_calls`).
-- **Minimal dependencies**: Only 3 direct deps (`systray`, `uuid`, `compress`). Avoid adding dependencies unless absolutely necessary.
+- **Responses compatibility is proxy-owned**: `/v1/responses/compact` and `/v1/memories/trace_summarize` are compatibility shims implemented on top of the upstream `/responses` API. Preserve this behavior for Codex-style clients.
+- **OpenAI passthrough is near-zero-copy, not literal zero-copy**: chat completions may inject `parallel_tool_calls` and force streaming; `/v1/responses` may rewrite proxy-owned compaction items before forwarding.
+- **Minimal dependencies**: Keep third-party deps minimal. Current non-stdlib dependencies used in production code are `systray`, `uuid`, and `klauspost/compress`.
 - **Distroless container**: Single static binary, CGO_ENABLED=0.
 
 ## Code Conventions
