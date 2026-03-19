@@ -18,6 +18,10 @@ func buildSSEStream(chunks ...string) io.ReadCloser {
 	return io.NopCloser(strings.NewReader(buf.String()))
 }
 
+func oversizedSSEPayload() string {
+	return strings.Repeat("x", openAIStreamScannerMaxBuffer+32)
+}
+
 type sseEvent struct {
 	Event string
 	Data  string
@@ -376,12 +380,12 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 
 	expectedTypes := []string{
 		"message_start",
-		"content_block_start",  // tool_use call_1
-		"content_block_delta",  // args for call_1
-		"content_block_stop",   // close call_1
-		"content_block_start",  // tool_use call_2
-		"content_block_delta",  // args for call_2
-		"content_block_stop",   // close call_2
+		"content_block_start", // tool_use call_1
+		"content_block_delta", // args for call_1
+		"content_block_start", // tool_use call_2
+		"content_block_delta", // args for call_2
+		"content_block_stop",  // close call_1
+		"content_block_stop",  // close call_2
 		"message_delta",
 		"message_stop",
 	}
@@ -398,7 +402,9 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 
 	// Verify first tool call block
 	var cb1 models.AnthropicStreamEvent
-	json.Unmarshal([]byte(events[1].Data), &cb1)
+	if err := json.Unmarshal([]byte(events[1].Data), &cb1); err != nil {
+		t.Fatalf("unmarshal first tool block: %v", err)
+	}
 	if cb1.ContentBlock == nil || cb1.ContentBlock.Type != "tool_use" || cb1.ContentBlock.ID != "call_1" || cb1.ContentBlock.Name != "delegate_task" {
 		t.Errorf("first tool block = %+v, want tool_use call_1 delegate_task", cb1.ContentBlock)
 	}
@@ -408,7 +414,9 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 
 	// Verify second tool call block
 	var cb2 models.AnthropicStreamEvent
-	json.Unmarshal([]byte(events[4].Data), &cb2)
+	if err := json.Unmarshal([]byte(events[3].Data), &cb2); err != nil {
+		t.Fatalf("unmarshal second tool block: %v", err)
+	}
 	if cb2.ContentBlock == nil || cb2.ContentBlock.Type != "tool_use" || cb2.ContentBlock.ID != "call_2" || cb2.ContentBlock.Name != "wait_for_tasks" {
 		t.Errorf("second tool block = %+v, want tool_use call_2 wait_for_tasks", cb2.ContentBlock)
 	}
@@ -418,8 +426,12 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 
 	// Verify argument deltas go to correct blocks
 	var d1, d2 models.AnthropicStreamEvent
-	json.Unmarshal([]byte(events[2].Data), &d1)
-	json.Unmarshal([]byte(events[5].Data), &d2)
+	if err := json.Unmarshal([]byte(events[2].Data), &d1); err != nil {
+		t.Fatalf("unmarshal first arg delta: %v", err)
+	}
+	if err := json.Unmarshal([]byte(events[4].Data), &d2); err != nil {
+		t.Fatalf("unmarshal second arg delta: %v", err)
+	}
 	if d1.Index == nil || *d1.Index != 0 {
 		t.Errorf("first arg delta index = %v, want 0", d1.Index)
 	}
@@ -427,11 +439,246 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 		t.Errorf("second arg delta index = %v, want 1", d2.Index)
 	}
 
+	var stop1, stop2 models.AnthropicStreamEvent
+	if err := json.Unmarshal([]byte(events[5].Data), &stop1); err != nil {
+		t.Fatalf("unmarshal first tool stop: %v", err)
+	}
+	if err := json.Unmarshal([]byte(events[6].Data), &stop2); err != nil {
+		t.Fatalf("unmarshal second tool stop: %v", err)
+	}
+	if stop1.Index == nil || *stop1.Index != 0 {
+		t.Errorf("first tool stop index = %v, want 0", stop1.Index)
+	}
+	if stop2.Index == nil || *stop2.Index != 1 {
+		t.Errorf("second tool stop index = %v, want 1", stop2.Index)
+	}
+
 	// Verify stop reason is tool_use
 	var msgDelta models.AnthropicStreamEvent
 	json.Unmarshal([]byte(events[7].Data), &msgDelta)
 	if msgDelta.Delta == nil || msgDelta.Delta.StopReason != "tool_use" {
 		t.Errorf("message_delta stop_reason = %q, want %q", msgDelta.Delta.StopReason, "tool_use")
+	}
+}
+
+func TestStreamOpenAIToAnthropic_InterleavedParallelToolCalls(t *testing.T) {
+	toolCallStop := "tool_calls"
+	idx0, idx1 := 0, 1
+
+	chunk1 := models.OpenAIStreamChunk{
+		ID: "chatcmpl-interleaved", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{
+			ToolCalls: []models.OpenAIToolCall{
+				{ID: "call_1", Index: &idx0, Function: models.OpenAIFunctionCall{Name: "delegate_task"}},
+			},
+		}}},
+	}
+	chunk2 := models.OpenAIStreamChunk{
+		ID: "chatcmpl-interleaved", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{
+			ToolCalls: []models.OpenAIToolCall{
+				{ID: "call_2", Index: &idx1, Function: models.OpenAIFunctionCall{Name: "wait_for_tasks"}},
+			},
+		}}},
+	}
+	chunk3 := models.OpenAIStreamChunk{
+		ID: "chatcmpl-interleaved", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{
+			ToolCalls: []models.OpenAIToolCall{
+				{Index: &idx0, Function: models.OpenAIFunctionCall{Arguments: `{"agent":"researcher"}`}},
+			},
+		}}},
+	}
+	chunk4 := models.OpenAIStreamChunk{
+		ID: "chatcmpl-interleaved", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{
+			ToolCalls: []models.OpenAIToolCall{
+				{Index: &idx1, Function: models.OpenAIFunctionCall{Arguments: `{"ids":["call_1"]}`}},
+			},
+		}}},
+	}
+	chunk5 := models.OpenAIStreamChunk{
+		ID: "chatcmpl-interleaved", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{}, FinishReason: &toolCallStop}},
+	}
+
+	body := buildSSEStream(
+		mustMarshal(t, chunk1),
+		mustMarshal(t, chunk2),
+		mustMarshal(t, chunk3),
+		mustMarshal(t, chunk4),
+		mustMarshal(t, chunk5),
+		"[DONE]",
+	)
+
+	w := httptest.NewRecorder()
+	StreamOpenAIToAnthropic(w, body, "claude-opus-4.6-fast", "req-interleaved")
+	events := parseSSEEvents(w.Body.String())
+
+	expectedTypes := []string{
+		"message_start",
+		"content_block_start",
+		"content_block_start",
+		"content_block_delta",
+		"content_block_delta",
+		"content_block_stop",
+		"content_block_stop",
+		"message_delta",
+		"message_stop",
+	}
+
+	if len(events) != len(expectedTypes) {
+		t.Fatalf("got %d events, want %d\nevents: %+v\nraw:\n%s", len(events), len(expectedTypes), events, w.Body.String())
+	}
+
+	for i, exp := range expectedTypes {
+		if events[i].Event != exp {
+			t.Errorf("event[%d].Event = %q, want %q", i, events[i].Event, exp)
+		}
+	}
+
+	var start1, start2, delta1, delta2, stop1, stop2 models.AnthropicStreamEvent
+	if err := json.Unmarshal([]byte(events[1].Data), &start1); err != nil {
+		t.Fatalf("unmarshal first start: %v", err)
+	}
+	if err := json.Unmarshal([]byte(events[2].Data), &start2); err != nil {
+		t.Fatalf("unmarshal second start: %v", err)
+	}
+	if err := json.Unmarshal([]byte(events[3].Data), &delta1); err != nil {
+		t.Fatalf("unmarshal first delta: %v", err)
+	}
+	if err := json.Unmarshal([]byte(events[4].Data), &delta2); err != nil {
+		t.Fatalf("unmarshal second delta: %v", err)
+	}
+	if err := json.Unmarshal([]byte(events[5].Data), &stop1); err != nil {
+		t.Fatalf("unmarshal first stop: %v", err)
+	}
+	if err := json.Unmarshal([]byte(events[6].Data), &stop2); err != nil {
+		t.Fatalf("unmarshal second stop: %v", err)
+	}
+
+	if start1.Index == nil || *start1.Index != 0 {
+		t.Errorf("first start index = %v, want 0", start1.Index)
+	}
+	if start2.Index == nil || *start2.Index != 1 {
+		t.Errorf("second start index = %v, want 1", start2.Index)
+	}
+	if delta1.Index == nil || *delta1.Index != 0 {
+		t.Errorf("first delta index = %v, want 0", delta1.Index)
+	}
+	if delta2.Index == nil || *delta2.Index != 1 {
+		t.Errorf("second delta index = %v, want 1", delta2.Index)
+	}
+	if stop1.Index == nil || *stop1.Index != 0 {
+		t.Errorf("first stop index = %v, want 0", stop1.Index)
+	}
+	if stop2.Index == nil || *stop2.Index != 1 {
+		t.Errorf("second stop index = %v, want 1", stop2.Index)
+	}
+}
+
+func TestStreamOpenAIToAnthropic_TextAfterToolCall(t *testing.T) {
+	stop := "stop"
+	idx0 := 0
+
+	chunk1 := models.OpenAIStreamChunk{
+		ID: "chatcmpl-tool-text", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{
+			ToolCalls: []models.OpenAIToolCall{
+				{ID: "call_1", Index: &idx0, Function: models.OpenAIFunctionCall{Name: "get_weather"}},
+			},
+		}}},
+	}
+	chunk2 := models.OpenAIStreamChunk{
+		ID: "chatcmpl-tool-text", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{
+			ToolCalls: []models.OpenAIToolCall{
+				{Index: &idx0, Function: models.OpenAIFunctionCall{Arguments: `{"location":"NYC"}`}},
+			},
+		}}},
+	}
+	chunk3 := models.OpenAIStreamChunk{
+		ID: "chatcmpl-tool-text", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{
+			Content: json.RawMessage(`"Done."`),
+		}}},
+	}
+	chunk4 := models.OpenAIStreamChunk{
+		ID: "chatcmpl-tool-text", Model: "gpt-4",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{}, FinishReason: &stop}},
+	}
+
+	body := buildSSEStream(
+		mustMarshal(t, chunk1),
+		mustMarshal(t, chunk2),
+		mustMarshal(t, chunk3),
+		mustMarshal(t, chunk4),
+		"[DONE]",
+	)
+
+	w := httptest.NewRecorder()
+	StreamOpenAIToAnthropic(w, body, "claude-opus-4.6-fast", "req-tool-text")
+	events := parseSSEEvents(w.Body.String())
+
+	expectedTypes := []string{
+		"message_start",
+		"content_block_start",
+		"content_block_delta",
+		"content_block_stop",
+		"content_block_start",
+		"content_block_delta",
+		"content_block_stop",
+		"message_delta",
+		"message_stop",
+	}
+
+	if len(events) != len(expectedTypes) {
+		t.Fatalf("got %d events, want %d\nevents: %+v\nraw:\n%s", len(events), len(expectedTypes), events, w.Body.String())
+	}
+
+	for i, exp := range expectedTypes {
+		if events[i].Event != exp {
+			t.Errorf("event[%d].Event = %q, want %q", i, events[i].Event, exp)
+		}
+	}
+
+	var toolStart, toolStop, textStart, textDelta, textStop models.AnthropicStreamEvent
+	if err := json.Unmarshal([]byte(events[1].Data), &toolStart); err != nil {
+		t.Fatalf("unmarshal tool start: %v", err)
+	}
+	if err := json.Unmarshal([]byte(events[3].Data), &toolStop); err != nil {
+		t.Fatalf("unmarshal tool stop: %v", err)
+	}
+	if err := json.Unmarshal([]byte(events[4].Data), &textStart); err != nil {
+		t.Fatalf("unmarshal text start: %v", err)
+	}
+	if err := json.Unmarshal([]byte(events[5].Data), &textDelta); err != nil {
+		t.Fatalf("unmarshal text delta: %v", err)
+	}
+	if err := json.Unmarshal([]byte(events[6].Data), &textStop); err != nil {
+		t.Fatalf("unmarshal text stop: %v", err)
+	}
+
+	if toolStart.Index == nil || *toolStart.Index != 0 {
+		t.Errorf("tool start index = %v, want 0", toolStart.Index)
+	}
+	if toolStop.Index == nil || *toolStop.Index != 0 {
+		t.Errorf("tool stop index = %v, want 0", toolStop.Index)
+	}
+	if textStart.Index == nil || *textStart.Index != 1 {
+		t.Errorf("text start index = %v, want 1", textStart.Index)
+	}
+	if textStart.ContentBlock == nil || textStart.ContentBlock.Type != "text" {
+		t.Errorf("text start content block = %+v, want text", textStart.ContentBlock)
+	}
+	if textDelta.Index == nil || *textDelta.Index != 1 {
+		t.Errorf("text delta index = %v, want 1", textDelta.Index)
+	}
+	if textDelta.Delta == nil || textDelta.Delta.Text != "Done." {
+		t.Errorf("text delta = %+v, want Done.", textDelta.Delta)
+	}
+	if textStop.Index == nil || *textStop.Index != 1 {
+		t.Errorf("text stop index = %v, want 1", textStop.Index)
 	}
 }
 
@@ -905,6 +1152,59 @@ func TestAggregateStreamToResponse_TextOnly(t *testing.T) {
 	}
 }
 
+func TestAggregateStreamToResponse_MultipleChoices(t *testing.T) {
+	body := buildSSEStream(
+		`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":1,"delta":{"content":"Beta"}}]}`,
+		`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{"content":"Alpha"}}]}`,
+		`{"id":"c1","model":"gpt-4","choices":[{"index":1,"delta":{"content":" one"}}]}`,
+		`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{"content":" zero"}}]}`,
+		`{"id":"c1","model":"gpt-4","choices":[{"index":1,"delta":{},"finish_reason":"stop"},{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":7,"completion_tokens":4,"total_tokens":11}}`,
+		"[DONE]",
+	)
+
+	resp, err := aggregateStreamToResponse(body)
+	if err != nil {
+		t.Fatalf("aggregateStreamToResponse: %v", err)
+	}
+
+	if len(resp.Choices) != 2 {
+		t.Fatalf("expected 2 choices, got %d", len(resp.Choices))
+	}
+
+	if resp.Choices[0].Index != 0 {
+		t.Fatalf("choice[0].Index = %d, want 0", resp.Choices[0].Index)
+	}
+	if resp.Choices[1].Index != 1 {
+		t.Fatalf("choice[1].Index = %d, want 1", resp.Choices[1].Index)
+	}
+
+	var text0, text1 string
+	if err := json.Unmarshal(resp.Choices[0].Message.Content, &text0); err != nil {
+		t.Fatalf("unmarshal choice[0] content: %v", err)
+	}
+	if err := json.Unmarshal(resp.Choices[1].Message.Content, &text1); err != nil {
+		t.Fatalf("unmarshal choice[1] content: %v", err)
+	}
+
+	if text0 != "Alpha zero" {
+		t.Errorf("choice[0] content = %q, want %q", text0, "Alpha zero")
+	}
+	if text1 != "Beta one" {
+		t.Errorf("choice[1] content = %q, want %q", text1, "Beta one")
+	}
+
+	if resp.Choices[0].FinishReason == nil || *resp.Choices[0].FinishReason != "length" {
+		t.Errorf("choice[0] finish_reason = %v, want length", resp.Choices[0].FinishReason)
+	}
+	if resp.Choices[1].FinishReason == nil || *resp.Choices[1].FinishReason != "stop" {
+		t.Errorf("choice[1] finish_reason = %v, want stop", resp.Choices[1].FinishReason)
+	}
+
+	if resp.Usage == nil || resp.Usage.PromptTokens != 7 || resp.Usage.CompletionTokens != 4 || resp.Usage.TotalTokens != 11 {
+		t.Errorf("usage = %+v, want prompt=7 completion=4 total=11", resp.Usage)
+	}
+}
+
 func TestAggregateStreamToResponse_InvalidToolArgs(t *testing.T) {
 	// Simulate concatenated JSON objects in tool call arguments (LiteLLM bug #20543)
 	body := buildSSEStream(
@@ -927,5 +1227,46 @@ func TestAggregateStreamToResponse_InvalidToolArgs(t *testing.T) {
 	// The concatenated arguments are invalid JSON, should be replaced with {}
 	if !json.Valid([]byte(tc.Function.Arguments)) {
 		t.Errorf("tool call arguments should be valid JSON, got %q", tc.Function.Arguments)
+	}
+}
+
+func TestAggregateStreamToResponse_ErrorsWithoutDone(t *testing.T) {
+	body := buildSSEStream(
+		`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"}}]}`,
+		`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+	)
+
+	if _, err := aggregateStreamToResponse(body); err == nil {
+		t.Fatal("expected error when stream ends before [DONE]")
+	}
+}
+
+func TestAggregateStreamToResponse_ErrorsOnScannerFailure(t *testing.T) {
+	body := buildSSEStream(
+		`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"}}]}`,
+		oversizedSSEPayload(),
+		"[DONE]",
+	)
+
+	if _, err := aggregateStreamToResponse(body); err == nil {
+		t.Fatal("expected error on scanner failure")
+	}
+}
+
+func TestStreamOpenAIToAnthropic_NoSuccessTailOnScannerFailure(t *testing.T) {
+	body := buildSSEStream(
+		`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"}}]}`,
+		oversizedSSEPayload(),
+		"[DONE]",
+	)
+
+	w := httptest.NewRecorder()
+	StreamOpenAIToAnthropic(w, body, "claude-sonnet-4", "req-scan-fail")
+
+	events := parseSSEEvents(w.Body.String())
+	for _, evt := range events {
+		if evt.Event == "message_delta" || evt.Event == "message_stop" {
+			t.Fatalf("unexpected terminal success event %q after scanner failure\nraw:\n%s", evt.Event, w.Body.String())
+		}
 	}
 }

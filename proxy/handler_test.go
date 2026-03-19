@@ -2258,6 +2258,14 @@ func TestInjectParallelToolCalls(t *testing.T) {
 		}
 	})
 
+	t.Run("no-op with empty tools array", func(t *testing.T) {
+		input := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"tools":[]}`
+		result := injectParallelToolCalls([]byte(input))
+		if string(result) != input {
+			t.Errorf("body was modified for empty tools array: %s", result)
+		}
+	})
+
 	t.Run("no-op for invalid JSON", func(t *testing.T) {
 		input := `{invalid}`
 		result := injectParallelToolCalls([]byte(input))
@@ -2298,6 +2306,113 @@ func TestOpenAIChatCompletions_InjectsParallelToolCalls(t *testing.T) {
 	if w.Result().StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(w.Result().Body)
 		t.Fatalf("expected 200, got %d: %s", w.Result().StatusCode, body)
+	}
+}
+
+func TestOpenAIChatCompletions_EmptyToolsDoesNotForceStreaming(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		var raw map[string]json.RawMessage
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &raw); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+		if _, ok := raw["parallel_tool_calls"]; ok {
+			t.Error("did not expect parallel_tool_calls for empty tools array")
+		}
+		if _, ok := raw["stream"]; ok {
+			t.Error("did not expect forced stream=true for empty tools array")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+			ID:      "chatcmpl-empty-tools",
+			Object:  "chat.completion",
+			Choices: []models.OpenAIChoice{{Index: 0, Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"Hi"`)}}},
+		})
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"tools":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	if w.Result().StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(w.Result().Body)
+		t.Fatalf("expected 200, got %d: %s", w.Result().StatusCode, body)
+	}
+}
+
+func TestOpenAIChatCompletions_ForcedStreamingPreservesMultipleChoices(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+		if oaiReq.Stream == nil || !*oaiReq.Stream {
+			t.Error("expected stream=true forced by proxy when tools present")
+		}
+		if oaiReq.N == nil || *oaiReq.N != 2 {
+			t.Errorf("n = %v, want 2", oaiReq.N)
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"c2\",\"created\":1000,\"model\":\"gpt-4\",\"choices\":[{\"index\":1,\"delta\":{\"content\":\"Beta\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"c2\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Alpha\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"c2\",\"model\":\"gpt-4\",\"choices\":[{\"index\":1,\"delta\":{\"content\":\" one\"}},{\"index\":0,\"delta\":{\"content\":\" zero\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"c2\",\"model\":\"gpt-4\",\"choices\":[{\"index\":1,\"delta\":{},\"finish_reason\":\"stop\"},{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":5,\"total_tokens\":14}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	})
+
+	reqBody := `{"model":"gpt-4","n":2,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var got models.OpenAIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(got.Choices) != 2 {
+		t.Fatalf("expected 2 choices, got %d", len(got.Choices))
+	}
+
+	if got.Choices[0].Index != 0 {
+		t.Fatalf("choice[0].Index = %d, want 0", got.Choices[0].Index)
+	}
+	if got.Choices[1].Index != 1 {
+		t.Fatalf("choice[1].Index = %d, want 1", got.Choices[1].Index)
+	}
+
+	var text0, text1 string
+	if err := json.Unmarshal(got.Choices[0].Message.Content, &text0); err != nil {
+		t.Fatalf("unmarshal choice[0] content: %v", err)
+	}
+	if err := json.Unmarshal(got.Choices[1].Message.Content, &text1); err != nil {
+		t.Fatalf("unmarshal choice[1] content: %v", err)
+	}
+
+	if text0 != "Alpha zero" {
+		t.Errorf("choice[0] content = %q, want %q", text0, "Alpha zero")
+	}
+	if text1 != "Beta one" {
+		t.Errorf("choice[1] content = %q, want %q", text1, "Beta one")
+	}
+	if got.Choices[0].FinishReason == nil || *got.Choices[0].FinishReason != "length" {
+		t.Errorf("choice[0] finish_reason = %v, want length", got.Choices[0].FinishReason)
+	}
+	if got.Choices[1].FinishReason == nil || *got.Choices[1].FinishReason != "stop" {
+		t.Errorf("choice[1] finish_reason = %v, want stop", got.Choices[1].FinishReason)
 	}
 }
 
@@ -2507,5 +2622,33 @@ func TestHandleOpenAIChatCompletions_ZstdBody(t *testing.T) {
 	if w.Result().StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(w.Result().Body)
 		t.Fatalf("expected 200, got %d: %s", w.Result().StatusCode, body)
+	}
+}
+
+func TestHandleOpenAIChatCompletions_InvalidGzipBodyReturnsBadRequest(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be called for invalid gzip body")
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("not-gzip"))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, body)
+	}
+
+	var errResp map[string]map[string]interface{}
+	body, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(body, &errResp); err != nil {
+		t.Fatalf("failed to parse error response: %v", err)
+	}
+	if errResp["error"]["type"] != "invalid_request_error" {
+		t.Errorf("error.type = %v, want invalid_request_error", errResp["error"]["type"])
 	}
 }

@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -51,10 +50,7 @@ func (h *ProxyHandler) HandleGeminiModels(w http.ResponseWriter, r *http.Request
 func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *http.Request, pathModel string, stream bool) {
 	body, err := readBody(r)
 	if err != nil {
-		status := http.StatusBadRequest
-		if len(body) == 0 {
-			status = http.StatusRequestEntityTooLarge
-		}
+		status := readBodyStatusCode(err)
 		writeGeminiError(w, status, "INVALID_ARGUMENT", err.Error())
 		return
 	}
@@ -115,39 +111,43 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		return
 	}
 
-	if stream {
-		StreamOpenAIToGemini(w, resp.Body)
-		return
+	mode := chatCompletionsMode{
+		clientRequestedStream: stream,
+		forceUpstreamStream:   forceStream,
 	}
+	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
+		stream: func(resp *http.Response) {
+			StreamOpenAIToGemini(w, resp.Body)
+		},
+		aggregate: func(oaiResp *models.OpenAIResponse) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(oaiResp))
+		},
+		passthrough: func(resp *http.Response) error {
+			defer func() { _ = resp.Body.Close() }()
+			var parsed models.OpenAIResponse
+			if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+				return err
+			}
 
-	var oaiResp *models.OpenAIResponse
-	if forceStream {
-		oaiResp, err = aggregateStreamToResponse(resp.Body)
-		if err != nil {
-			writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", "failed to aggregate upstream response")
-			return
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(&parsed))
+			return nil
+		},
+	})
+	if err != nil {
+		message := "failed to parse upstream response"
+		if mode.forceUpstreamStream {
+			message = "failed to aggregate upstream response"
 		}
-	} else {
-		defer func() { _ = resp.Body.Close() }()
-		var parsed models.OpenAIResponse
-		if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-			writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", "failed to parse upstream response")
-			return
-		}
-		oaiResp = &parsed
+		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", message)
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(oaiResp))
 }
 
 func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request, pathModel string) {
 	body, err := readBody(r)
 	if err != nil {
-		status := http.StatusBadRequest
-		if len(body) == 0 {
-			status = http.StatusRequestEntityTooLarge
-		}
+		status := readBodyStatusCode(err)
 		writeGeminiError(w, status, "INVALID_ARGUMENT", err.Error())
 		return
 	}
@@ -343,17 +343,6 @@ func (h *ProxyHandler) decodeGeminiProbeResponse(resp *http.Response) (*models.O
 	return &oaiResp, false, nil
 }
 
-func (h *ProxyHandler) postChatCompletions(ctx context.Context, token string, body []byte) (*http.Response, error) {
-	return h.doWithRetry(func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.copilotURL+"/chat/completions", bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		h.setCopilotHeaders(req, token)
-		return req, nil
-	})
-}
-
 func (h *ProxyHandler) writeGeminiProtocolError(w http.ResponseWriter, err error) {
 	var geminiErr *geminiProtocolError
 	if errors.As(err, &geminiErr) {
@@ -387,6 +376,14 @@ func mapGeminiTransportError(err error) error {
 
 func mapGeminiUpstreamStatus(statusCode int) string {
 	switch statusCode {
+	case http.StatusBadRequest:
+		return "INVALID_ARGUMENT"
+	case http.StatusUnauthorized:
+		return "UNAUTHENTICATED"
+	case http.StatusForbidden:
+		return "PERMISSION_DENIED"
+	case http.StatusNotFound:
+		return "NOT_FOUND"
 	case http.StatusTooManyRequests:
 		return "RESOURCE_EXHAUSTED"
 	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
