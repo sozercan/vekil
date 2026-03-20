@@ -28,7 +28,7 @@ TMP_PARENT="${LIVE_CLI_SMOKE_TMP_PARENT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
 SMOKE_DIR="${LIVE_CLI_SMOKE_DIR:-$(mktemp -d "${TMP_PARENT%/}/live-cli-smoke.XXXXXX")}"
 PROXY_LOG="${SMOKE_DIR}/proxy.log"
 MODELS_JSON="${SMOKE_DIR}/models.json"
-PROMPT="Read left.txt and right.txt in the current directory and reply with exactly the two file contents joined by a vertical bar, with no spaces or extra text."
+PROMPT="Read left.txt and right.txt in the current directory and reply with exactly the two file contents joined by a vertical bar, with no spaces, no markdown, no commentary, and no extra text. Output only the final string."
 
 if [[ -n "${COPILOT_GITHUB_TOKEN:-}" ]]; then
   PROXY_TOKEN_DIR="${PROXY_TOKEN_DIR:-${SMOKE_DIR}/proxy-token}"
@@ -100,7 +100,7 @@ assert_exact_output() {
 }
 
 read_normalized_output() {
-  tr -d '\r\n' < "$1"
+  awk 'NF { line = $0 } END { gsub(/\r/, "", line); printf "%s", line }' "$1"
 }
 
 start_proxy() {
