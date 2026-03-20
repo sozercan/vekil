@@ -29,19 +29,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = r.Body.Close() }()
 
-	if rewrittenBody, rewriteCount := rewriteSyntheticCompactionRequest(bodyBytes); rewriteCount > 0 {
-		bodyBytes = rewrittenBody
-		resumePromptInjected := false
-		if resumedBody, injected := injectSyntheticCompactionResumePrompt(bodyBytes); injected {
-			bodyBytes = resumedBody
-			resumePromptInjected = true
-		}
-		h.log.Debug("rewrote compaction items",
-			logger.F("endpoint", "responses"),
-			logger.F("count", rewriteCount),
-			logger.F("resume_prompt_injected", resumePromptInjected),
-		)
-	}
+	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses", true)
 
 	var partial struct {
 		Stream *bool `json:"stream,omitempty"`
@@ -105,13 +93,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = r.Body.Close() }()
 
-	if rewrittenBody, rewriteCount := rewriteSyntheticCompactionRequest(bodyBytes); rewriteCount > 0 {
-		bodyBytes = rewrittenBody
-		h.log.Debug("rewrote compaction items",
-			logger.F("endpoint", "responses/compact"),
-			logger.F("count", rewriteCount),
-		)
-	}
+	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/compact", false)
 
 	var body map[string]json.RawMessage
 	if err := json.Unmarshal(bodyBytes, &body); err != nil {
@@ -346,8 +328,36 @@ func extractResponsesOutputText(body []byte) (string, error) {
 	return sanitizeProxySummaryText(text), nil
 }
 
+func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint string, injectResumePrompt bool) []byte {
+	if rewrittenBody, rewriteCount := rewriteSyntheticCompactionRequest(bodyBytes); rewriteCount > 0 {
+		bodyBytes = rewrittenBody
+		resumePromptInjected := false
+		if injectResumePrompt {
+			if resumedBody, injected := injectSyntheticCompactionResumePrompt(bodyBytes); injected {
+				bodyBytes = resumedBody
+				resumePromptInjected = true
+			}
+		}
+
+		fields := []logger.Field{
+			logger.F("endpoint", endpoint),
+			logger.F("count", rewriteCount),
+		}
+		if injectResumePrompt {
+			fields = append(fields, logger.F("resume_prompt_injected", resumePromptInjected))
+		}
+		h.log.Debug("rewrote compaction items", fields...)
+	}
+
+	return bodyBytes
+}
+
 func (h *ProxyHandler) postResponsesWithFallback(ctx context.Context, token string, bodyBytes []byte) (*http.Response, error) {
-	resp, err := h.postResponses(ctx, token, bodyBytes)
+	return h.postResponsesWithFallbackHeaders(ctx, token, bodyBytes, nil)
+}
+
+func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, token string, bodyBytes []byte, extraHeaders http.Header) (*http.Response, error) {
+	resp, err := h.postResponsesWithHeaders(ctx, token, bodyBytes, extraHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -391,13 +401,47 @@ func (h *ProxyHandler) postResponsesWithFallback(ctx context.Context, token stri
 		logger.F("fallback_model", fallbackModel),
 	)
 
-	retryResp, retryErr := h.postResponses(ctx, token, fallbackBody)
+	retryResp, retryErr := h.postResponsesWithHeaders(ctx, token, fallbackBody, extraHeaders)
 	if retryErr != nil {
 		h.log.Debug("responses fallback request failed", logger.Err(retryErr))
 		return resp, nil
 	}
 
 	return retryResp, nil
+}
+
+func (h *ProxyHandler) compactResponsesInput(ctx context.Context, token, model string, input []json.RawMessage, extraHeaders http.Header) (string, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "", fmt.Errorf("missing model for websocket compaction")
+	}
+
+	bodyBytes, err := json.Marshal(map[string]interface{}{
+		"model":        model,
+		"instructions": compactPrompt,
+		"input":        input,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := h.postResponsesWithFallbackHeaders(ctx, token, bodyBytes, extraHeaders)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return "", fmt.Errorf("compaction request returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return extractResponsesOutputText(respBody)
 }
 
 func isUnsupportedResponsesModelError(statusCode int, body []byte) bool {

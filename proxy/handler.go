@@ -44,6 +44,9 @@ const (
 	defaultCopilotIntegrationID       = "vscode-chat"
 	defaultCopilotGitHubAPIVersion    = "2025-04-01"
 	defaultCopilotOpenAIIntent        = "conversation-panel"
+	defaultResponsesWSCompactMaxItems = 48
+	defaultResponsesWSCompactMaxBytes = 256 << 10
+	defaultResponsesWSCompactKeepTail = 12
 )
 
 var preferredResponsesFallbackModels = []string{
@@ -95,6 +98,16 @@ type CopilotHeaderConfig struct {
 	OpenAIIntent        string
 }
 
+// ResponsesWebSocketConfig controls websocket-session state management for
+// Codex-style GET /v1/responses clients.
+type ResponsesWebSocketConfig struct {
+	TurnStateDelta      bool
+	DisableAutoCompact  bool
+	AutoCompactMaxItems int
+	AutoCompactMaxBytes int
+	AutoCompactKeepTail int
+}
+
 func DefaultCopilotHeaderConfig() CopilotHeaderConfig {
 	return CopilotHeaderConfig{
 		EditorVersion:       defaultCopilotEditorVersion,
@@ -103,6 +116,14 @@ func DefaultCopilotHeaderConfig() CopilotHeaderConfig {
 		IntegrationID:       defaultCopilotIntegrationID,
 		GitHubAPIVersion:    defaultCopilotGitHubAPIVersion,
 		OpenAIIntent:        defaultCopilotOpenAIIntent,
+	}
+}
+
+func DefaultResponsesWebSocketConfig() ResponsesWebSocketConfig {
+	return ResponsesWebSocketConfig{
+		AutoCompactMaxItems: defaultResponsesWSCompactMaxItems,
+		AutoCompactMaxBytes: defaultResponsesWSCompactMaxBytes,
+		AutoCompactKeepTail: defaultResponsesWSCompactKeepTail,
 	}
 }
 
@@ -129,12 +150,33 @@ func (c CopilotHeaderConfig) withDefaults() CopilotHeaderConfig {
 	return c
 }
 
+func (c ResponsesWebSocketConfig) withDefaults() ResponsesWebSocketConfig {
+	defaults := DefaultResponsesWebSocketConfig()
+	if c.AutoCompactMaxItems <= 0 {
+		c.AutoCompactMaxItems = defaults.AutoCompactMaxItems
+	}
+	if c.AutoCompactMaxBytes <= 0 {
+		c.AutoCompactMaxBytes = defaults.AutoCompactMaxBytes
+	}
+	if c.AutoCompactKeepTail <= 0 {
+		c.AutoCompactKeepTail = defaults.AutoCompactKeepTail
+	}
+	return c
+}
+
+func (c ResponsesWebSocketConfig) autoCompactEnabled() bool {
+	return !c.DisableAutoCompact &&
+		c.AutoCompactKeepTail > 0 &&
+		(c.AutoCompactMaxItems > 0 || c.AutoCompactMaxBytes > 0)
+}
+
 // ProxyHandler holds dependencies for all HTTP handlers.
 type ProxyHandler struct {
 	auth           *auth.Authenticator
 	client         *http.Client
 	copilotURL     string
 	copilotHeaders CopilotHeaderConfig
+	responsesWS    ResponsesWebSocketConfig
 	log            *logger.Logger
 	maxRetries     int
 	retryBaseDelay time.Duration
@@ -150,6 +192,14 @@ type Option func(*ProxyHandler)
 func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
 	return func(h *ProxyHandler) {
 		h.copilotHeaders = cfg.withDefaults()
+	}
+}
+
+// WithResponsesWebSocketConfig overrides websocket-session state behavior for
+// GET /v1/responses Codex clients.
+func WithResponsesWebSocketConfig(cfg ResponsesWebSocketConfig) Option {
+	return func(h *ProxyHandler) {
+		h.responsesWS = cfg.withDefaults()
 	}
 }
 
@@ -169,6 +219,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		},
 		copilotURL:     "https://api.githubcopilot.com",
 		copilotHeaders: DefaultCopilotHeaderConfig(),
+		responsesWS:    DefaultResponsesWebSocketConfig(),
 		log:            log,
 	}
 	for _, opt := range opts {
@@ -177,6 +228,10 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		}
 	}
 	return h
+}
+
+func (h *ProxyHandler) responsesWebSocketConfig() ResponsesWebSocketConfig {
+	return h.responsesWS.withDefaults()
 }
 
 func setCopilotHeaders(req *http.Request, token string) {

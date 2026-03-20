@@ -40,6 +40,12 @@ func WithCopilotHeaderConfig(cfg proxy.CopilotHeaderConfig) Option {
 	return WithProxyOptions(proxy.WithCopilotHeaderConfig(cfg))
 }
 
+// WithResponsesWebSocketConfig overrides websocket-session handling for
+// GET /v1/responses Codex clients.
+func WithResponsesWebSocketConfig(cfg proxy.ResponsesWebSocketConfig) Option {
+	return WithProxyOptions(proxy.WithResponsesWebSocketConfig(cfg))
+}
+
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) *Server {
 	cfg := options{}
@@ -59,6 +65,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("POST /models/", handler.HandleGeminiModels)
 	mux.HandleFunc("POST /v1/responses/compact", handler.HandleCompact)
 	mux.HandleFunc("POST /v1/responses", handler.HandleResponses)
+	mux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
 	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
 	mux.HandleFunc("GET /readyz", handler.HandleReadyz)

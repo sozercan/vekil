@@ -261,6 +261,14 @@ func proxyCompactionContextMessage(summary string) map[string]interface{} {
 	}
 }
 
+func proxyCompactionContextRawMessage(summary string) (json.RawMessage, error) {
+	encoded, err := json.Marshal(proxyCompactionContextMessage(summary))
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(encoded), nil
+}
+
 func proxyCompactionResumeMessage() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "message",

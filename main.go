@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -23,6 +24,11 @@ func main() {
 	copilotPluginVersion := flag.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
 	copilotUserAgent := flag.String("copilot-user-agent", getEnv("COPILOT_USER_AGENT", ""), "Upstream Copilot user-agent header")
 	copilotGitHubAPIVersion := flag.String("copilot-github-api-version", getEnv("COPILOT_GITHUB_API_VERSION", ""), "Upstream Copilot x-github-api-version header")
+	responsesWSTurnStateDelta := flag.Bool("responses-ws-turn-state-delta", getEnvBool("RESPONSES_WS_TURN_STATE_DELTA", false), "Attempt delta-only replay when upstream returns X-Codex-Turn-State")
+	responsesWSDisableAutoCompact := flag.Bool("responses-ws-disable-auto-compact", getEnvBool("RESPONSES_WS_DISABLE_AUTO_COMPACT", false), "Disable automatic websocket-session history compaction")
+	responsesWSCompactMaxItems := flag.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items")
+	responsesWSCompactMaxBytes := flag.Int("responses-ws-auto-compact-max-bytes", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes), "Auto-compact websocket session history after this many raw bytes")
+	responsesWSCompactKeepTail := flag.Int("responses-ws-auto-compact-keep-tail", getEnvInt("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail), "When auto-compacting websocket history, keep this many most recent items verbatim")
 	flag.Parse()
 
 	log := logger.New(logger.ParseLevel(*logLevel))
@@ -36,12 +42,25 @@ func main() {
 	}
 	log.Info("authenticated successfully")
 
-	srv := server.New(authenticator, log, *host, *port, server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
-		EditorVersion:       *copilotEditorVersion,
-		EditorPluginVersion: *copilotPluginVersion,
-		UserAgent:           *copilotUserAgent,
-		GitHubAPIVersion:    *copilotGitHubAPIVersion,
-	}))
+	srv := server.New(
+		authenticator,
+		log,
+		*host,
+		*port,
+		server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
+			EditorVersion:       *copilotEditorVersion,
+			EditorPluginVersion: *copilotPluginVersion,
+			UserAgent:           *copilotUserAgent,
+			GitHubAPIVersion:    *copilotGitHubAPIVersion,
+		}),
+		server.WithResponsesWebSocketConfig(proxy.ResponsesWebSocketConfig{
+			TurnStateDelta:      *responsesWSTurnStateDelta,
+			DisableAutoCompact:  *responsesWSDisableAutoCompact,
+			AutoCompactMaxItems: *responsesWSCompactMaxItems,
+			AutoCompactMaxBytes: *responsesWSCompactMaxBytes,
+			AutoCompactKeepTail: *responsesWSCompactKeepTail,
+		}),
+	)
 
 	if err := srv.Start(); err != nil {
 		log.Fatal("server start error", logger.Err(err))
@@ -66,4 +85,28 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	v := getEnv(key, "")
+	if v == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func getEnvInt(key string, fallback int) int {
+	v := getEnv(key, "")
+	if v == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }

@@ -16,6 +16,29 @@ make docker-build   # docker image
 ```
 
 Run specific tests: `go test ./proxy/ -run TestHandle -v`
+Run websocket benchmark: `go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesWebSocketRequestBuild' -benchmem -count=1`
+
+## Documentation
+
+Documentation is intentionally split under `docs/` into small, single-purpose files:
+
+| File | Scope |
+|------|-------|
+| `README.md` | Short landing page only |
+| `docs/README.md` | Documentation index and doc map |
+| `docs/getting-started.md` | install, run, first auth, deployment entry points |
+| `docs/configuration.md` | flags, env vars, websocket tuning |
+| `docs/clients.md` | copy-paste client examples |
+| `docs/api.md` | endpoint behavior and compatibility notes |
+| `docs/architecture.md` | package boundaries and design notes |
+| `docs/menubar.md` | macOS app usage |
+| `docs/development.md` | build, test, benchmark, CI |
+
+Documentation update rules:
+
+- Keep `README.md` concise; put detail into the focused file under `docs/`.
+- When behavior changes, update the narrowest relevant doc instead of appending to the root README.
+- Prefer linking between docs rather than duplicating long sections.
 
 ## Architecture
 
