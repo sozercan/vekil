@@ -28,7 +28,7 @@ TMP_PARENT="${LIVE_CLI_SMOKE_TMP_PARENT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
 SMOKE_DIR="${LIVE_CLI_SMOKE_DIR:-$(mktemp -d "${TMP_PARENT%/}/live-cli-smoke.XXXXXX")}"
 PROXY_LOG="${SMOKE_DIR}/proxy.log"
 MODELS_JSON="${SMOKE_DIR}/models.json"
-PROMPT="Read left.txt and right.txt in the current directory and reply with exactly the two file contents joined by a vertical bar, with no spaces or extra text."
+PROMPT="Read left.txt and right.txt in the current directory and reply with exactly the two file contents joined by a vertical bar, with no spaces, no markdown, no commentary, and no extra text. Output only the final string."
 
 if [[ -n "${COPILOT_GITHUB_TOKEN:-}" ]]; then
   PROXY_TOKEN_DIR="${PROXY_TOKEN_DIR:-${SMOKE_DIR}/proxy-token}"
@@ -46,6 +46,15 @@ cleanup() {
 }
 
 trap cleanup EXIT
+
+seed_access_token() {
+  if [[ -z "${COPILOT_GITHUB_TOKEN:-}" ]]; then
+    return 0
+  fi
+
+  printf '%s\n' "${COPILOT_GITHUB_TOKEN}" > "${PROXY_TOKEN_DIR}/access-token"
+  chmod 600 "${PROXY_TOKEN_DIR}/access-token"
+}
 
 model_exists() {
   jq -e --arg model "$1" '.data[]? | select(.id == $model)' "${MODELS_JSON}" >/dev/null
@@ -91,7 +100,7 @@ assert_exact_output() {
 }
 
 read_normalized_output() {
-  tr -d '\r\n' < "$1"
+  awk 'NF { line = $0 } END { gsub(/\r/, "", line); printf "%s", line }' "$1"
 }
 
 start_proxy() {
@@ -99,6 +108,7 @@ start_proxy() {
 
   mkdir -p "${SMOKE_DIR}" "${SMOKE_DIR}/cases" "${SMOKE_DIR}/homes" "${SMOKE_DIR}/outputs"
   mkdir -p "${PROXY_TOKEN_DIR}"
+  seed_access_token
 
   log "Starting proxy at ${PROXY_BASE_URL}"
   "${PROXY_BIN}" \
