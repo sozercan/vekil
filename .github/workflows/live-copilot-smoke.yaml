@@ -1,0 +1,72 @@
+name: Live Copilot Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Require Copilot token secret
+        run: |
+          if [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
+            echo "Set the COPILOT_GITHUB_TOKEN repository secret to a GitHub token with Copilot access." >&2
+            exit 1
+          fi
+
+      - name: Build
+        run: make build
+
+      - name: Install Codex CLI
+        run: |
+          npm install -g @openai/codex@latest
+
+      - name: Install Claude Code
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash -s stable
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install Gemini CLI
+        run: |
+          npm install -g @google/gemini-cli@latest
+
+      - name: Show CLI versions
+        run: |
+          codex --version
+          claude --version
+          gemini --version
+
+      - name: Run live CLI smoke checks
+        env:
+          LIVE_CLI_SMOKE_DIR: ${{ runner.temp }}/live-cli-smoke
+        run: scripts/live-cli-smoke.sh
+
+      - name: Show proxy log on failure
+        if: failure()
+        run: |
+          if [ -f "$RUNNER_TEMP/live-cli-smoke/proxy.log" ]; then
+            cat "$RUNNER_TEMP/live-cli-smoke/proxy.log"
+          fi
+
+      - name: Show CLI outputs on failure
+        if: failure()
+        run: |
+          if [ -d "$RUNNER_TEMP/live-cli-smoke/outputs" ]; then
+            find "$RUNNER_TEMP/live-cli-smoke/outputs" -maxdepth 1 -type f -print -exec cat {} \;
+          fi

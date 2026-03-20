@@ -13,6 +13,12 @@
 | `--copilot-user-agent` | `COPILOT_USER_AGENT` | `GitHubCopilotChat/0.26.7` | Upstream `user-agent` header |
 | `--copilot-github-api-version` | `COPILOT_GITHUB_API_VERSION` | `2025-04-01` | Upstream `x-github-api-version` header |
 
+## Non-Interactive Authentication
+
+For CI or other non-interactive environments, the proxy also accepts a GitHub token from `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN`.
+
+If one of these is set, it overrides any cached login state and is exchanged for a short-lived Copilot token at startup.
+
 ## WebSocket Session Tuning
 
 These settings affect the Codex-style `GET /v1/responses` websocket bridge.
