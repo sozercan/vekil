@@ -24,6 +24,10 @@ const (
 	defaultTokenDir = "~/.config/copilot-proxy"
 )
 
+var accessTokenEnvVars = []string{
+	"COPILOT_GITHUB_TOKEN",
+}
+
 // Authenticator manages GitHub OAuth and Copilot API tokens.
 // It handles the device code flow, token caching to disk, and automatic
 // refresh using a read-write mutex for concurrent access.
@@ -93,6 +97,10 @@ func NewAuthenticator(tokenDir string) *Authenticator {
 // IsSignedIn reports whether the authenticator has a GitHub access token
 // either in memory or persisted on disk.
 func (a *Authenticator) IsSignedIn() bool {
+	if token, _ := lookupAccessTokenFromEnv(); token != "" {
+		return true
+	}
+
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	if a.accessToken != "" {
@@ -144,6 +152,10 @@ func (a *Authenticator) GetTokenNonInteractive(ctx context.Context) (string, err
 }
 
 func (a *Authenticator) getToken(ctx context.Context, allowDeviceFlow bool) (string, error) {
+	if envToken, _ := lookupAccessTokenFromEnv(); envToken != "" {
+		return a.getTokenFromEnv(ctx, envToken)
+	}
+
 	a.mu.RLock()
 	if a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
 		token := a.copilotToken
@@ -169,7 +181,43 @@ func (a *Authenticator) getToken(ctx context.Context, allowDeviceFlow bool) (str
 	return a.copilotToken, nil
 }
 
+func (a *Authenticator) getTokenFromEnv(ctx context.Context, envToken string) (string, error) {
+	a.mu.RLock()
+	if a.accessToken == envToken && a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
+		token := a.copilotToken
+		a.mu.RUnlock()
+		return token, nil
+	}
+	a.mu.RUnlock()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Double-check after acquiring write lock.
+	if a.accessToken == envToken && a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
+		return a.copilotToken, nil
+	}
+
+	// Environment-provided access tokens intentionally override any persisted
+	// login state so CI or explicit shell configuration always wins.
+	if a.accessToken != envToken {
+		a.accessToken = envToken
+		a.copilotToken = ""
+		a.tokenExpiry = time.Time{}
+	}
+
+	if err := a.exchangeForCopilotToken(ctx); err != nil {
+		return "", err
+	}
+	return a.copilotToken, nil
+}
+
 func (a *Authenticator) refreshToken(ctx context.Context, allowDeviceFlow bool) error {
+	if envToken, _ := lookupAccessTokenFromEnv(); envToken != "" {
+		a.accessToken = envToken
+		return a.exchangeForCopilotToken(ctx)
+	}
+
 	if err := a.loadAccessToken(); err == nil {
 		if err := a.exchangeForCopilotToken(ctx); err == nil {
 			return nil
@@ -391,4 +439,13 @@ func (a *Authenticator) saveCopilotToken() error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(a.tokenDir, "api-key.json"), data, 0o600)
+}
+
+func lookupAccessTokenFromEnv() (string, string) {
+	for _, name := range accessTokenEnvVars {
+		if token := strings.TrimSpace(os.Getenv(name)); token != "" {
+			return token, name
+		}
+	}
+	return "", ""
 }

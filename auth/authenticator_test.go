@@ -80,6 +80,83 @@ func TestGetToken_LoadsPersistedCopilotToken(t *testing.T) {
 	}
 }
 
+func TestGetToken_EnvAccessTokenOverridesPersistedState(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "env-access-token")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "token env-access-token" {
+			t.Errorf("expected 'token env-access-token', got %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
+			Token:     "env-copilot-token",
+			ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
+		})
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	data, err := json.Marshal(CopilotTokenResponse{
+		Token:     "persisted-token",
+		ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("marshal token: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "api-key.json"), data, 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	a := &Authenticator{
+		tokenDir:       dir,
+		accessToken:    "stale-access-token",
+		copilotToken:   "stale-copilot-token",
+		tokenExpiry:    time.Now().Add(1 * time.Hour),
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	token, err := a.GetToken(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if token != "env-copilot-token" {
+		t.Errorf("expected env-copilot-token, got %q", token)
+	}
+}
+
+func TestGetToken_EnvAccessTokenCachesInMemory(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "env-access-token")
+
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
+			Token:     "env-copilot-token",
+			ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
+		})
+	}))
+	defer server.Close()
+
+	a := &Authenticator{
+		tokenDir:       t.TempDir(),
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	for range 2 {
+		token, err := a.GetToken(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if token != "env-copilot-token" {
+			t.Errorf("expected env-copilot-token, got %q", token)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 token exchange, got %d", calls)
+	}
+}
+
 func TestGetToken_ConcurrentAccess(t *testing.T) {
 	a := NewTestAuthenticator("concurrent-token")
 
@@ -184,6 +261,18 @@ func TestLoadAccessToken_Missing(t *testing.T) {
 	}
 }
 
+func TestLookupAccessTokenFromEnv_UsesCopilotTokenVar(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "copilot-token")
+
+	token, name := lookupAccessTokenFromEnv()
+	if token != "copilot-token" {
+		t.Fatalf("expected copilot-token, got %q", token)
+	}
+	if name != "COPILOT_GITHUB_TOKEN" {
+		t.Fatalf("expected COPILOT_GITHUB_TOKEN, got %q", name)
+	}
+}
+
 func TestSaveAndLoadCopilotToken(t *testing.T) {
 	dir := t.TempDir()
 	expiry := time.Now().Add(1 * time.Hour)
@@ -255,6 +344,56 @@ func TestIsSignedIn_NoToken(t *testing.T) {
 	a := &Authenticator{tokenDir: t.TempDir()}
 	if a.IsSignedIn() {
 		t.Error("expected IsSignedIn() == false with no token")
+	}
+}
+
+func TestIsSignedIn_WithEnvToken(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "env-access-token")
+
+	a := &Authenticator{tokenDir: t.TempDir()}
+	if !a.IsSignedIn() {
+		t.Error("expected IsSignedIn() == true with env token")
+	}
+}
+
+func TestGetToken_IgnoresGenericGitHubEnvVars(t *testing.T) {
+	t.Setenv("GH_TOKEN", "generic-gh-token")
+	t.Setenv("GITHUB_TOKEN", "generic-github-token")
+
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		t.Fatalf("unexpected token exchange using %q", r.Header.Get("Authorization"))
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	data, err := json.Marshal(CopilotTokenResponse{
+		Token:     "persisted-token",
+		ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("marshal token: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "api-key.json"), data, 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	a := &Authenticator{
+		tokenDir:       dir,
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	token, err := a.GetToken(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if token != "persisted-token" {
+		t.Fatalf("expected persisted-token, got %q", token)
+	}
+	if calls != 0 {
+		t.Fatalf("expected no token exchanges, got %d", calls)
 	}
 }
 
@@ -488,5 +627,37 @@ func TestRefreshToken_DisableAutoDeviceFlow(t *testing.T) {
 	}
 	if err.Error() != "not authenticated" {
 		t.Errorf("expected 'not authenticated', got %q", err.Error())
+	}
+}
+
+func TestRefreshToken_UsesEnvAccessTokenWithoutSavingAccessToken(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "env-access-token")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "token env-access-token" {
+			t.Errorf("expected 'token env-access-token', got %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
+			Token:     "env-copilot-token",
+			ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
+		})
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	a := &Authenticator{
+		tokenDir:       dir,
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	if err := a.refreshToken(context.Background(), false); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if a.accessToken != "env-access-token" {
+		t.Fatalf("expected access token to be loaded from env, got %q", a.accessToken)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "access-token")); !os.IsNotExist(err) {
+		t.Fatalf("expected no access-token file to be written, got err=%v", err)
 	}
 }
