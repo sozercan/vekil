@@ -41,6 +41,23 @@ The full documentation now lives under [`docs/`](docs/README.md) in smaller, top
 - [macOS Menubar App](docs/menubar.md)
 - [Development](docs/development.md)
 
+For non-interactive environments, the proxy also accepts a GitHub token from `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN`. If one of these is set, it overrides any cached login state and is exchanged for a short-lived Copilot token at startup.
+
+## GitHub Actions
+
+The repository includes a manual `Live Copilot Smoke` workflow in [`.github/workflows/live-copilot-smoke.yaml`](.github/workflows/live-copilot-smoke.yaml). It builds the proxy, installs Codex, Claude Code, and Gemini CLI on a GitHub-hosted runner, and then runs [`scripts/live-cli-smoke.sh`](scripts/live-cli-smoke.sh).
+
+The smoke script starts the proxy with a non-interactive GitHub token, waits for `/readyz`, selects currently available OpenAI, Anthropic, and Gemini models from `/v1/models`, and runs one file-reading headless check per CLI using isolated temp-home config directories.
+
+To use it:
+
+1. Create a GitHub token for a user that has GitHub Copilot access.
+2. Grant that token the `Copilot Requests` permission.
+3. Save it as the repository secret `COPILOT_GITHUB_TOKEN`.
+4. Run the `Live Copilot Smoke` workflow from the Actions tab.
+
+This is intentionally separate from the normal CI workflow so pull requests and forked builds remain deterministic and do not depend on Copilot credentials. You can also run the same smoke script locally after building `copilot-proxy` and installing those three CLIs.
+
 ## Most Common Client Setup
 
 ### Claude Code
