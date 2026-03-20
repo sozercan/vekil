@@ -18,13 +18,15 @@ go build -o copilot-proxy .
 ./copilot-proxy
 ```
 
-Or with Docker:
+Or with Docker from GHCR:
 
 ```bash
 docker run -p 1337:1337 \
   -v ~/.config/copilot-proxy:/home/nonroot/.config/copilot-proxy \
-  docker.io/sozercan/copilot-proxy:latest
+  ghcr.io/sozercan/copilot-proxy:latest
 ```
+
+On macOS, you can also use the native menubar app instead of keeping a terminal open. Build it with `make build-app` and open `Copilot Proxy.app`, or download the packaged app from the GitHub release assets. See [macOS Menubar App](docs/menubar.md).
 
 On first run, authenticate with GitHub's device code flow. Tokens are cached in `~/.config/copilot-proxy/`.
 
@@ -46,14 +48,17 @@ The full documentation now lives under [`docs/`](docs/README.md) in smaller, top
 ### Claude Code
 
 ```bash
-export ANTHROPIC_BASE_URL=http://localhost:1337
+env ANTHROPIC_BASE_URL=http://localhost:1337 \
+  ANTHROPIC_API_KEY=dummy \
+  claude --model claude-sonnet-4 --print --output-format text "Reply with exactly PROXY_OK"
 ```
 
 ### OpenAI Codex CLI
 
 ```bash
-export OPENAI_BASE_URL=http://localhost:1337/v1
-codex --model gpt-5.4
+env OPENAI_API_KEY=dummy \
+  OPENAI_BASE_URL=http://localhost:1337/v1 \
+  codex exec --skip-git-repo-check -m gpt-5.4 "Reply with exactly PROXY_OK"
 ```
 
 ### Gemini CLI
@@ -65,16 +70,6 @@ env GEMINI_API_KEY=dummy \
   GEMINI_CLI_NO_RELAUNCH=true \
   gemini -m gemini-2.5-pro -p "Reply with exactly PROXY_OK" -o json
 ```
-
-## Development
-
-```bash
-go test ./... -count=1
-go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesWebSocketRequestBuild' -benchmem -count=1
-go vet ./...
-```
-
-More detail is in [docs/development.md](docs/development.md).
 
 ## License
 
