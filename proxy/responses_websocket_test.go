@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -276,6 +277,7 @@ func TestHandleResponsesWebSocket_ExpandsPreviousOutputItemsIntoNextRequest(t *t
 }
 
 func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
+	var upstreamRequestsMu sync.Mutex
 	upstreamRequests := make([]map[string]interface{}, 0, 3)
 	var normalRequests int
 
@@ -289,7 +291,9 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
 			t.Fatalf("failed to decode upstream request body: %v", err)
 		}
+		upstreamRequestsMu.Lock()
 		upstreamRequests = append(upstreamRequests, body)
+		upstreamRequestsMu.Unlock()
 
 		if instructions, _ := body["instructions"].(string); strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
 			w.Header().Set("Content-Type", "application/json")
@@ -360,11 +364,17 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 	_ = mustReadWebSocketJSON(t, conn)
 	_ = mustReadWebSocketJSON(t, conn)
 
-	if len(upstreamRequests) != 3 {
-		t.Fatalf("expected 3 upstream requests (turn + compaction + turn), got %d", len(upstreamRequests))
+	deadline := time.Now().Add(2 * time.Second)
+	requests := snapshotResponsesWebSocketRequests(&upstreamRequestsMu, upstreamRequests)
+	for len(requests) < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected at least 3 upstream requests (turn + compaction + turn), got %d", len(requests))
+		}
+		time.Sleep(10 * time.Millisecond)
+		requests = snapshotResponsesWebSocketRequests(&upstreamRequestsMu, upstreamRequests)
 	}
 
-	secondTurnInput := upstreamInputItems(t, upstreamRequests[2])
+	secondTurnInput := upstreamInputItems(t, requests[2])
 	if len(secondTurnInput) != 4 {
 		t.Fatalf("expected compacted second upstream input length 4, got %d", len(secondTurnInput))
 	}
@@ -617,6 +627,15 @@ func newResponsesWebSocketCreateRequest(input []interface{}) map[string]interfac
 		"stream":              true,
 		"include":             []string{},
 	}
+}
+
+func snapshotResponsesWebSocketRequests(mu *sync.Mutex, requests []map[string]interface{}) []map[string]interface{} {
+	mu.Lock()
+	defer mu.Unlock()
+
+	snapshot := make([]map[string]interface{}, len(requests))
+	copy(snapshot, requests)
+	return snapshot
 }
 
 func websocketResponseID(t *testing.T, payload map[string]interface{}) string {

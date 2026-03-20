@@ -1187,6 +1187,81 @@ func TestDecodeGeminiGenerateContentRequestAcceptsParametersJSONSchema(t *testin
 	}
 }
 
+func TestDecodeGeminiGenerateContentRequestAcceptsThoughtMetadata(t *testing.T) {
+	req, err := decodeGeminiGenerateContentRequest([]byte(`{
+		"contents": [
+			{
+				"role": "model",
+				"parts": [
+					{
+						"text": "reasoning",
+						"thought": true,
+						"thought_signature": "c2ln"
+					},
+					{
+						"function_call": {
+							"id": "call-1",
+							"name": "read_file",
+							"args": {"path": "README.md"}
+						}
+					}
+				]
+			},
+			{
+				"role": "user",
+				"parts": [
+					{
+						"function_response": {
+							"id": "call-1",
+							"name": "read_file",
+							"response": {"output": "ok"}
+						}
+					}
+				]
+			}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("decodeGeminiGenerateContentRequest() error = %v", err)
+	}
+
+	if len(req.Contents) != 2 || len(req.Contents[0].Parts) != 2 {
+		t.Fatalf("decoded contents = %#v, want 2 content entries with 2 model parts", req.Contents)
+	}
+	if req.Contents[0].Parts[0].Thought == nil || !*req.Contents[0].Parts[0].Thought {
+		t.Fatalf("Thought = %v, want true", req.Contents[0].Parts[0].Thought)
+	}
+	if req.Contents[0].Parts[0].ThoughtSignature != "c2ln" {
+		t.Fatalf("ThoughtSignature = %q, want %q", req.Contents[0].Parts[0].ThoughtSignature, "c2ln")
+	}
+
+	got, err := TranslateGeminiToOpenAI(req, "models/gemini-3.1-pro-preview-customtools", false)
+	if err != nil {
+		t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+	}
+
+	if got.Model != "gemini-3.1-pro-preview" {
+		t.Fatalf("Model = %q, want gemini-3.1-pro-preview", got.Model)
+	}
+	if len(got.Messages) != 2 {
+		t.Fatalf("len(Messages) = %d, want 2", len(got.Messages))
+	}
+	if len(got.Messages[0].ToolCalls) != 1 || got.Messages[0].ToolCalls[0].Function.Name != "read_file" {
+		t.Fatalf("assistant tool calls = %#v, want read_file call", got.Messages[0].ToolCalls)
+	}
+	if got.Messages[0].Content != nil {
+		t.Fatalf("assistant content = %s, want nil because thought text should be ignored", string(got.Messages[0].Content))
+	}
+
+	var toolResult string
+	if err := json.Unmarshal(got.Messages[1].Content, &toolResult); err != nil {
+		t.Fatalf("unmarshal tool result: %v", err)
+	}
+	if toolResult != `{"output":"ok"}` {
+		t.Fatalf("tool result = %q, want %q", toolResult, `{"output":"ok"}`)
+	}
+}
+
 func TestTranslateOpenAIToGemini(t *testing.T) {
 	finishReason := "tool_calls"
 	resp := &models.OpenAIResponse{

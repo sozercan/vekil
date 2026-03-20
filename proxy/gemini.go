@@ -278,6 +278,25 @@ func canonicalizeJSONDocument(v interface{}) ([]byte, error) {
 	return json.Marshal(doc)
 }
 
+func geminiPartContainsThought(part models.GeminiPart) bool {
+	return part.Thought != nil && *part.Thought
+}
+
+func geminiPartHasOnlyThoughtMetadata(part models.GeminiPart) bool {
+	return strings.TrimSpace(part.ThoughtSignature) != "" &&
+		part.Text == nil &&
+		part.FunctionCall == nil &&
+		part.FunctionResponse == nil &&
+		!hasRawJSON(part.InlineData) &&
+		!hasRawJSON(part.FileData) &&
+		!hasRawJSON(part.ExecutableCode) &&
+		!hasRawJSON(part.CodeExecutionResult)
+}
+
+func shouldSkipGeminiPart(part models.GeminiPart) bool {
+	return geminiPartContainsThought(part) || geminiPartHasOnlyThoughtMetadata(part)
+}
+
 func hashOpenAIRequest(req *models.OpenAIRequest) (string, error) {
 	doc, err := canonicalizeJSONDocument(req)
 	if err != nil {
@@ -444,6 +463,10 @@ func translateGeminiSystemInstruction(systemInstruction *models.GeminiContent) (
 
 	var textParts []string
 	for partIdx, part := range systemInstruction.Parts {
+		if shouldSkipGeminiPart(part) {
+			continue
+		}
+
 		kind, err := geminiPartKind(part)
 		if err != nil {
 			return "", annotateGeminiProtocolError(err, "systemInstruction.parts[%d]", partIdx)
@@ -488,6 +511,10 @@ func translateGeminiContents(contents []models.GeminiContent) ([]models.OpenAIMe
 			}
 
 			for partIdx, part := range content.Parts {
+				if shouldSkipGeminiPart(part) {
+					continue
+				}
+
 				kind, err := geminiPartKind(part)
 				if err != nil {
 					return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d]", contentIdx, partIdx)
@@ -524,12 +551,18 @@ func translateGeminiContents(contents []models.GeminiContent) ([]models.OpenAIMe
 		case "model":
 			var textParts []string
 			var toolCalls []models.OpenAIToolCall
+			var processedPart bool
 
 			for partIdx, part := range content.Parts {
+				if shouldSkipGeminiPart(part) {
+					continue
+				}
+
 				kind, err := geminiPartKind(part)
 				if err != nil {
 					return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d]", contentIdx, partIdx)
 				}
+				processedPart = true
 
 				switch kind {
 				case "text":
@@ -551,6 +584,9 @@ func translateGeminiContents(contents []models.GeminiContent) ([]models.OpenAIMe
 			}
 
 			if len(textParts) == 0 && len(toolCalls) == 0 {
+				if !processedPart {
+					continue
+				}
 				return nil, invalidGeminiArgument("contents[%d] must include text or functionCall parts", contentIdx)
 			}
 
