@@ -95,13 +95,34 @@ jobs:
       - name: Show proxy log on failure
         if: failure() && steps.gate.outputs.run == 'true'
         run: |
+          redact() {
+            sed -E \
+              -e 's/(Authorization: (Bearer|token) )[[:graph:]]+/\1[REDACTED]/g' \
+              -e 's/gh[opusr]_[A-Za-z0-9_]+/[REDACTED_GITHUB_TOKEN]/g' \
+              -e 's/github_pat_[A-Za-z0-9_]+/[REDACTED_GITHUB_TOKEN]/g' \
+              -e 's/("access_token":"[^"]*")/"access_token":"[REDACTED]"/g' \
+              -e 's/("token":"[^"]*")/"token":"[REDACTED]"/g' \
+              -e 's/(Please visit https:\/\/github\.com\/login\/device and enter code: )[A-Z0-9-]+/\1[REDACTED]/g'
+          }
           if [ -f "$RUNNER_TEMP/live-cli-smoke/proxy.log" ]; then
-            cat "$RUNNER_TEMP/live-cli-smoke/proxy.log"
+            redact < "$RUNNER_TEMP/live-cli-smoke/proxy.log"
           fi
 
       - name: Show CLI outputs on failure
         if: failure() && steps.gate.outputs.run == 'true'
         run: |
+          redact() {
+            sed -E \
+              -e 's/(Authorization: (Bearer|token) )[[:graph:]]+/\1[REDACTED]/g' \
+              -e 's/gh[opusr]_[A-Za-z0-9_]+/[REDACTED_GITHUB_TOKEN]/g' \
+              -e 's/github_pat_[A-Za-z0-9_]+/[REDACTED_GITHUB_TOKEN]/g' \
+              -e 's/("access_token":"[^"]*")/"access_token":"[REDACTED]"/g' \
+              -e 's/("token":"[^"]*")/"token":"[REDACTED]"/g' \
+              -e 's/(Please visit https:\/\/github\.com\/login\/device and enter code: )[A-Z0-9-]+/\1[REDACTED]/g'
+          }
           if [ -d "$RUNNER_TEMP/live-cli-smoke/outputs" ]; then
-            find "$RUNNER_TEMP/live-cli-smoke/outputs" -maxdepth 1 -type f -print -exec cat {} \;
+            find "$RUNNER_TEMP/live-cli-smoke/outputs" -maxdepth 1 -type f -print0 | while IFS= read -r -d '' file; do
+              echo "$file"
+              redact < "$file"
+            done
           fi
