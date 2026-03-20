@@ -1,0 +1,705 @@
+package proxy
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+	"github.com/sozercan/copilot-proxy/logger"
+)
+
+const responsesWebSocketRequestHeaderPrefix = "ws_request_header_"
+
+var responsesWebSocketUpgrader = websocket.Upgrader{
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+	CheckOrigin: func(r *http.Request) bool {
+		return strings.TrimSpace(r.Header.Get("Origin")) == ""
+	},
+}
+
+type responsesWebSocketCreateRequest struct {
+	Type               string            `json:"type"`
+	Model              string            `json:"model"`
+	Input              []json.RawMessage `json:"input"`
+	PreviousResponseID string            `json:"previous_response_id,omitempty"`
+	Generate           *bool             `json:"generate,omitempty"`
+	ClientMetadata     map[string]string `json:"client_metadata,omitempty"`
+	signatureValue     string
+	upstreamFields     []responsesWebSocketJSONField
+}
+
+type responsesWebSocketJSONField struct {
+	key   string
+	value json.RawMessage
+}
+
+type responsesWebSocketStreamEvent struct {
+	Type     string `json:"type"`
+	Response struct {
+		ID string `json:"id"`
+	} `json:"response,omitempty"`
+	Item json.RawMessage `json:"item,omitempty"`
+}
+
+type responsesWebSocketSession struct {
+	conn           *websocket.Conn
+	baseHeaders    http.Header
+	turnState      string
+	lastResponseID string
+	lastSignature  string
+	historyItems   []json.RawMessage
+}
+
+type responsesWebSocketRequestPlan struct {
+	signature          string
+	resetHistory       bool
+	currentInput       []json.RawMessage
+	fullReplaySegments [][]json.RawMessage
+	useTurnStateDelta  bool
+}
+
+type responsesWebSocketRequestMetrics struct {
+	deltaAttempted     bool
+	deltaFallback      bool
+	autoCompacted      bool
+	compactedFromItems int
+	compactedFromBytes int
+	compactedToItems   int
+	compactedToBytes   int
+}
+
+func (p responsesWebSocketRequestPlan) upstreamSegments() [][]json.RawMessage {
+	if p.useTurnStateDelta {
+		return [][]json.RawMessage{p.currentInput}
+	}
+	return p.fullReplaySegments
+}
+
+// HandleResponsesWebSocket handles GET /v1/responses websocket upgrades used
+// by Codex. Each websocket request is translated into a normal upstream
+// streaming /responses HTTP request and the SSE data payloads are forwarded back
+// as websocket text frames.
+func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
+	if !websocket.IsWebSocketUpgrade(r) {
+		w.Header().Set("Connection", "Upgrade")
+		w.Header().Set("Upgrade", "websocket")
+		http.Error(w, http.StatusText(http.StatusUpgradeRequired), http.StatusUpgradeRequired)
+		return
+	}
+
+	conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer func() { _ = conn.Close() }()
+
+	conn.SetReadLimit(maxRequestBodySize)
+	session := newResponsesWebSocketSession(conn, r)
+
+	for {
+		messageType, payload, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		if messageType != websocket.TextMessage {
+			session.sendWrappedError(http.StatusBadRequest, "responses websocket only accepts text frames", "invalid_request_error", nil)
+			return
+		}
+
+		request, err := parseResponsesWebSocketCreateRequest(payload)
+		if err != nil {
+			session.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
+			return
+		}
+
+		if err := session.handleCreateRequest(h, request); err != nil {
+			h.log.Debug("responses websocket request failed", logger.Err(err))
+			return
+		}
+	}
+}
+
+func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *responsesWebSocketSession {
+	baseHeaders := make(http.Header)
+	for _, name := range []string{"X-Codex-Beta-Features", "X-Codex-Turn-Metadata"} {
+		for _, value := range r.Header.Values(name) {
+			baseHeaders.Add(name, value)
+		}
+	}
+
+	return &responsesWebSocketSession{
+		conn:        conn,
+		baseHeaders: baseHeaders,
+		turnState:   strings.TrimSpace(r.Header.Get("X-Codex-Turn-State")),
+	}
+}
+
+func parseResponsesWebSocketCreateRequest(payload []byte) (*responsesWebSocketCreateRequest, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return nil, fmt.Errorf("invalid JSON in websocket request")
+	}
+
+	var request responsesWebSocketCreateRequest
+	if err := json.Unmarshal(payload, &request); err != nil {
+		return nil, fmt.Errorf("invalid websocket request body")
+	}
+	if request.Type != "response.create" {
+		return nil, fmt.Errorf("unsupported websocket request type %q", request.Type)
+	}
+	if request.Input == nil {
+		request.Input = []json.RawMessage{}
+	}
+	signatureValue, upstreamFields, err := prepareResponsesWebSocketRequest(raw)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode websocket request")
+	}
+	request.signatureValue = signatureValue
+	request.upstreamFields = upstreamFields
+	return &request, nil
+}
+
+func prepareResponsesWebSocketRequest(raw map[string]json.RawMessage) (string, []responsesWebSocketJSONField, error) {
+	signatureBody := make(map[string]json.RawMessage, len(raw))
+	keys := make([]string, 0, len(raw))
+	for key, value := range raw {
+		switch key {
+		case "type", "input", "previous_response_id", "generate", "client_metadata":
+		default:
+			signatureBody[key] = value
+		}
+
+		switch key {
+		case "type", "input", "previous_response_id", "generate", "client_metadata", "stream":
+		default:
+			keys = append(keys, key)
+		}
+	}
+
+	signatureBytes, err := json.Marshal(signatureBody)
+	if err != nil {
+		return "", nil, err
+	}
+
+	sort.Strings(keys)
+	fields := make([]responsesWebSocketJSONField, 0, len(keys))
+	for _, key := range keys {
+		fields = append(fields, responsesWebSocketJSONField{
+			key:   key,
+			value: raw[key],
+		})
+	}
+
+	return string(signatureBytes), fields, nil
+}
+
+func (r *responsesWebSocketCreateRequest) signature() string {
+	return r.signatureValue
+}
+
+func (r *responsesWebSocketCreateRequest) upstreamBody(inputSegments ...[]json.RawMessage) ([]byte, error) {
+	capacity := len(r.upstreamFields)*16 + rawMessageSegmentsSize(inputSegments...) + 32
+	var buf bytes.Buffer
+	buf.Grow(capacity)
+	buf.WriteByte('{')
+	first := true
+	for _, field := range r.upstreamFields {
+		if !first {
+			buf.WriteByte(',')
+		}
+		first = false
+		buf.WriteString(strconv.Quote(field.key))
+		buf.WriteByte(':')
+		buf.Write(field.value)
+	}
+	if !first {
+		buf.WriteByte(',')
+	}
+	buf.WriteString(`"input":[`)
+	if err := writeRawMessageSegments(&buf, inputSegments...); err != nil {
+		return nil, err
+	}
+	buf.WriteString(`],"stream":true}`)
+	return buf.Bytes(), nil
+}
+
+func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) error {
+	plan, err := s.planRequest(h, request)
+	if err != nil {
+		s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
+		return err
+	}
+	metrics := responsesWebSocketRequestMetrics{}
+
+	if request.Generate != nil && !*request.Generate {
+		responseID := "copilot-proxy-ws-" + uuid.NewString()
+		s.rememberResponse(plan.resetHistory, responseID, plan.signature, plan.currentInput, nil)
+		s.logRequestMetrics(h, request, responseID, metrics)
+		if err := s.writeJSON(map[string]interface{}{
+			"type": "response.created",
+			"response": map[string]interface{}{
+				"id": responseID,
+			},
+		}); err != nil {
+			return err
+		}
+		return s.writeJSON(map[string]interface{}{
+			"type": "response.completed",
+			"response": map[string]interface{}{
+				"id":    responseID,
+				"usage": zeroResponsesUsage(),
+			},
+		})
+	}
+
+	token, err := h.auth.GetToken(context.Background())
+	if err != nil {
+		s.sendWrappedError(http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error", nil)
+		return err
+	}
+
+	upstreamCtx, upstreamCancel := newInferenceUpstreamContext()
+	defer upstreamCancel()
+
+	resp, deltaAttempted, deltaFallback, err := s.postCreateRequest(h, upstreamCtx, token, request, plan)
+	metrics.deltaAttempted = deltaAttempted
+	metrics.deltaFallback = deltaFallback
+	if err != nil {
+		s.sendWrappedError(upstreamStatusCode(err, http.StatusBadGateway), fmt.Sprintf("upstream request failed: %v", err), "server_error", nil)
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	s.updateTurnState(resp.Header)
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if readErr != nil {
+			respBody = nil
+		}
+		message, code := extractResponsesWebSocketError(resp.StatusCode, respBody)
+		s.sendWrappedError(resp.StatusCode, message, code, resp.Header)
+		return fmt.Errorf("upstream websocket bridge status %d", resp.StatusCode)
+	}
+
+	responseID, outputItems, err := s.streamUpstreamResponse(resp.Body)
+	if err != nil {
+		s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil)
+		return err
+	}
+
+	s.rememberResponse(plan.resetHistory, responseID, plan.signature, plan.currentInput, outputItems)
+	metrics = s.maybeAutoCompactHistory(h, token, request, metrics)
+	s.logRequestMetrics(h, request, responseID, metrics)
+	return nil
+}
+
+func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) (responsesWebSocketRequestPlan, error) {
+	plan := responsesWebSocketRequestPlan{
+		signature:    request.signature(),
+		currentInput: request.Input,
+	}
+	if request.PreviousResponseID == "" {
+		plan.resetHistory = true
+		plan.fullReplaySegments = [][]json.RawMessage{request.Input}
+		return plan, nil
+	}
+	if request.PreviousResponseID != s.lastResponseID {
+		return responsesWebSocketRequestPlan{}, fmt.Errorf("unknown previous_response_id %q for websocket session", request.PreviousResponseID)
+	}
+	if plan.signature != s.lastSignature {
+		return responsesWebSocketRequestPlan{}, fmt.Errorf("incremental websocket request changed non-input fields")
+	}
+
+	plan.fullReplaySegments = [][]json.RawMessage{s.historyItems, request.Input}
+	cfg := h.responsesWebSocketConfig()
+	plan.useTurnStateDelta = cfg.TurnStateDelta && s.turnState != ""
+	return plan, nil
+}
+
+func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx context.Context, token string, request *responsesWebSocketCreateRequest, plan responsesWebSocketRequestPlan) (*http.Response, bool, bool, error) {
+	resp, err := s.postCreateRequestSegments(h, ctx, token, request, plan.upstreamSegments(), plan.useTurnStateDelta)
+	if !plan.useTurnStateDelta || (err == nil && resp != nil && resp.StatusCode == http.StatusOK) {
+		return resp, plan.useTurnStateDelta, false, err
+	}
+
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	h.log.Debug("responses websocket delta replay failed; retrying full history",
+		logger.F("model", request.Model),
+		logger.F("previous_response_id", request.PreviousResponseID),
+		logger.F("had_turn_state", s.turnState != ""),
+		logger.F("delta_attempted", true),
+		logger.F("delta_fallback", true),
+	)
+	s.turnState = ""
+
+	resp, err = s.postCreateRequestSegments(h, ctx, token, request, plan.fullReplaySegments, false)
+	return resp, true, true, err
+}
+
+func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, ctx context.Context, token string, request *responsesWebSocketCreateRequest, inputSegments [][]json.RawMessage, includeTurnState bool) (*http.Response, error) {
+	bodyBytes, err := request.upstreamBody(inputSegments...)
+	if err != nil {
+		return nil, err
+	}
+	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/websocket", true)
+	return h.postResponsesWithHeaders(ctx, token, bodyBytes, s.requestHeaders(request, includeTurnState))
+}
+
+func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCreateRequest, includeTurnState bool) http.Header {
+	headers := make(http.Header)
+	mergeHeaderValues(headers, s.baseHeaders)
+	if includeTurnState && s.turnState != "" {
+		headers.Set("X-Codex-Turn-State", s.turnState)
+	}
+
+	for key, value := range request.ClientMetadata {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+
+		switch {
+		case strings.EqualFold(key, "x-codex-turn-metadata"):
+			headers.Set("X-Codex-Turn-Metadata", trimmed)
+		case strings.HasPrefix(key, responsesWebSocketRequestHeaderPrefix):
+			name := strings.TrimSpace(strings.TrimPrefix(key, responsesWebSocketRequestHeaderPrefix))
+			if name != "" {
+				headers.Set(name, trimmed)
+			}
+		}
+	}
+
+	return headers
+}
+
+func (s *responsesWebSocketSession) updateTurnState(headers http.Header) {
+	if turnState := strings.TrimSpace(headers.Get("X-Codex-Turn-State")); turnState != "" {
+		s.turnState = turnState
+	}
+}
+
+func (s *responsesWebSocketSession) rememberResponse(resetHistory bool, responseID, signature string, currentInput, outputItems []json.RawMessage) {
+	s.lastResponseID = responseID
+	s.lastSignature = signature
+	if resetHistory {
+		s.historyItems = nil
+	}
+	s.historyItems = append(s.historyItems, currentInput...)
+	s.historyItems = append(s.historyItems, outputItems...)
+}
+
+func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, token string, request *responsesWebSocketCreateRequest, metrics responsesWebSocketRequestMetrics) responsesWebSocketRequestMetrics {
+	cfg := h.responsesWebSocketConfig()
+	if !cfg.autoCompactEnabled() {
+		return metrics
+	}
+	if !responsesWebSocketHistoryExceedsThreshold(s.historyItems, cfg) {
+		return metrics
+	}
+	if strings.TrimSpace(request.Model) == "" {
+		return metrics
+	}
+
+	prefixLen := len(s.historyItems) - cfg.AutoCompactKeepTail
+	if prefixLen <= 0 {
+		return metrics
+	}
+
+	prefix := s.historyItems[:prefixLen]
+	tail := s.historyItems[prefixLen:]
+	priorItems := len(s.historyItems)
+	priorBytes := rawMessagesSize(s.historyItems)
+
+	ctx, cancel := newInferenceUpstreamContext()
+	defer cancel()
+
+	summary, err := h.compactResponsesInput(ctx, token, request.Model, prefix, s.requestHeaders(request, false))
+	if err != nil {
+		h.log.Debug("responses websocket auto-compaction failed",
+			logger.Err(err),
+			logger.F("model", request.Model),
+			logger.F("history_items", len(s.historyItems)),
+			logger.F("history_bytes", rawMessagesSize(s.historyItems)),
+		)
+		return metrics
+	}
+
+	checkpoint, err := proxyCompactionContextRawMessage(summary)
+	if err != nil {
+		h.log.Debug("responses websocket auto-compaction checkpoint encode failed", logger.Err(err))
+		return metrics
+	}
+
+	compacted := make([]json.RawMessage, 0, 1+len(tail))
+	compacted = append(compacted, checkpoint)
+	compacted = append(compacted, tail...)
+
+	h.log.Debug("responses websocket auto-compacted history",
+		logger.F("prior_items", len(s.historyItems)),
+		logger.F("prior_bytes", rawMessagesSize(s.historyItems)),
+		logger.F("new_items", len(compacted)),
+		logger.F("new_bytes", rawMessagesSize(compacted)),
+		logger.F("auto_compacted", true),
+	)
+	s.historyItems = compacted
+	metrics.autoCompacted = true
+	metrics.compactedFromItems = priorItems
+	metrics.compactedFromBytes = priorBytes
+	metrics.compactedToItems = len(compacted)
+	metrics.compactedToBytes = rawMessagesSize(compacted)
+	return metrics
+}
+
+func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *responsesWebSocketCreateRequest, responseID string, metrics responsesWebSocketRequestMetrics) {
+	h.log.Debug("responses websocket request completed",
+		logger.F("model", request.Model),
+		logger.F("previous_response_id", request.PreviousResponseID),
+		logger.F("response_id", responseID),
+		logger.F("delta_attempted", metrics.deltaAttempted),
+		logger.F("delta_fallback", metrics.deltaFallback),
+		logger.F("auto_compacted", metrics.autoCompacted),
+		logger.F("history_items", len(s.historyItems)),
+		logger.F("history_bytes", rawMessagesSize(s.historyItems)),
+		logger.F("compacted_from_items", metrics.compactedFromItems),
+		logger.F("compacted_from_bytes", metrics.compactedFromBytes),
+		logger.F("compacted_to_items", metrics.compactedToItems),
+		logger.F("compacted_to_bytes", metrics.compactedToBytes),
+	)
+}
+
+func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader) (string, []json.RawMessage, error) {
+	var responseID string
+	var outputItems []json.RawMessage
+	sawCompleted := false
+
+	if err := consumeResponsesSSEData(body, func(data string) error {
+		if data == "" || data == "[DONE]" {
+			return nil
+		}
+		if err := s.conn.WriteMessage(websocket.TextMessage, []byte(data)); err != nil {
+			return err
+		}
+
+		var event responsesWebSocketStreamEvent
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			return nil
+		}
+
+		switch event.Type {
+		case "response.created":
+			if responseID == "" && event.Response.ID != "" {
+				responseID = event.Response.ID
+			}
+		case "response.output_item.done":
+			if len(event.Item) > 0 {
+				outputItems = append(outputItems, cloneRawMessage(event.Item))
+			}
+		case "response.completed":
+			sawCompleted = true
+			if event.Response.ID != "" {
+				responseID = event.Response.ID
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return "", nil, err
+	}
+
+	if !sawCompleted {
+		return "", nil, fmt.Errorf("stream ended before response.completed")
+	}
+	if responseID == "" {
+		return "", nil, fmt.Errorf("response.completed missing response id")
+	}
+
+	return responseID, outputItems, nil
+}
+
+func (s *responsesWebSocketSession) writeJSON(payload interface{}) error {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return s.conn.WriteMessage(websocket.TextMessage, encoded)
+}
+
+func (s *responsesWebSocketSession) sendWrappedError(status int, message, code string, headers http.Header) {
+	payload := map[string]interface{}{
+		"type":        "error",
+		"status_code": status,
+		"error": map[string]interface{}{
+			"message": message,
+		},
+	}
+	if code != "" {
+		payload["error"].(map[string]interface{})["code"] = code
+	}
+	if mappedHeaders := flattenResponsesWebSocketHeaders(headers); len(mappedHeaders) > 0 {
+		payload["headers"] = mappedHeaders
+	}
+	_ = s.writeJSON(payload)
+}
+
+func consumeResponsesSSEData(body io.Reader, onData func(string) error) error {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, openAIStreamScannerInitialBuffer), openAIStreamScannerMaxBuffer)
+
+	var dataLines []string
+	dispatch := func() error {
+		if len(dataLines) == 0 {
+			return nil
+		}
+		data := strings.Join(dataLines, "\n")
+		dataLines = dataLines[:0]
+		return onData(data)
+	}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case line == "":
+			if err := dispatch(); err != nil {
+				return err
+			}
+		case strings.HasPrefix(line, "data:"):
+			data := strings.TrimPrefix(line, "data:")
+			data = strings.TrimPrefix(data, " ")
+			dataLines = append(dataLines, data)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("reading SSE stream: %w", err)
+	}
+	return dispatch()
+}
+
+func zeroResponsesUsage() map[string]interface{} {
+	return map[string]interface{}{
+		"input_tokens":          0,
+		"input_tokens_details":  nil,
+		"output_tokens":         0,
+		"output_tokens_details": nil,
+		"total_tokens":          0,
+	}
+}
+
+func extractResponsesWebSocketError(status int, body []byte) (string, string) {
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err == nil && strings.TrimSpace(envelope.Error.Message) != "" {
+		return envelope.Error.Message, envelope.Error.Code
+	}
+
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed != "" {
+		return trimmed, ""
+	}
+
+	return http.StatusText(status), ""
+}
+
+func flattenResponsesWebSocketHeaders(headers http.Header) map[string]interface{} {
+	if len(headers) == 0 {
+		return nil
+	}
+
+	filtered := make(http.Header)
+	copyPassthroughHeaders(filtered, headers)
+	if len(filtered) == 0 {
+		return nil
+	}
+
+	result := make(map[string]interface{}, len(filtered))
+	for key, values := range filtered {
+		switch len(values) {
+		case 0:
+		case 1:
+			result[key] = values[0]
+		default:
+			result[key] = strings.Join(values, ", ")
+		}
+	}
+	return result
+}
+
+func responsesWebSocketHistoryExceedsThreshold(items []json.RawMessage, cfg ResponsesWebSocketConfig) bool {
+	if len(items) <= cfg.AutoCompactKeepTail {
+		return false
+	}
+	if cfg.AutoCompactMaxItems > 0 && len(items) > cfg.AutoCompactMaxItems {
+		return true
+	}
+	if cfg.AutoCompactMaxBytes > 0 && rawMessagesSize(items) > cfg.AutoCompactMaxBytes {
+		return true
+	}
+	return false
+}
+
+func rawMessagesSize(items []json.RawMessage) int {
+	return rawMessageSegmentsSize(items)
+}
+
+func rawMessageSegmentsSize(segments ...[]json.RawMessage) int {
+	size := 0
+	for _, segment := range segments {
+		for _, item := range segment {
+			size += len(item) + 1
+		}
+	}
+	return size
+}
+
+func writeRawMessageSegments(buf *bytes.Buffer, segments ...[]json.RawMessage) error {
+	first := true
+	for _, segment := range segments {
+		for _, item := range segment {
+			if len(item) == 0 {
+				return fmt.Errorf("empty input item")
+			}
+			if !first {
+				buf.WriteByte(',')
+			}
+			first = false
+			buf.Write(item)
+		}
+	}
+	return nil
+}
+
+func cloneRawMessages(items []json.RawMessage) []json.RawMessage {
+	if len(items) == 0 {
+		return nil
+	}
+
+	cloned := make([]json.RawMessage, len(items))
+	for idx, item := range items {
+		cloned[idx] = cloneRawMessage(item)
+	}
+	return cloned
+}
+
+func cloneRawMessage(item json.RawMessage) json.RawMessage {
+	if len(item) == 0 {
+		return nil
+	}
+	return append(json.RawMessage(nil), item...)
+}

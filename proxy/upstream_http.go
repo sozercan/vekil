@@ -23,12 +23,28 @@ func upstreamStatusCode(err error, fallback int) int {
 }
 
 func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, token, path string, body []byte) (*http.Response, error) {
+	return h.postJSONEndpointWithHeaders(ctx, token, path, body, nil)
+}
+
+func mergeHeaderValues(dst, src http.Header) {
+	for key, values := range src {
+		dst.Del(key)
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, token, path string, body []byte, extraHeaders http.Header) (*http.Response, error) {
 	return h.doWithRetry(func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.copilotURL+path, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
 		h.setCopilotHeaders(req, token)
+		if len(extraHeaders) > 0 {
+			mergeHeaderValues(req.Header, extraHeaders)
+		}
 		return req, nil
 	})
 }
@@ -39,6 +55,10 @@ func (h *ProxyHandler) postChatCompletions(ctx context.Context, token string, bo
 
 func (h *ProxyHandler) postResponses(ctx context.Context, token string, body []byte) (*http.Response, error) {
 	return h.postJSONEndpoint(ctx, token, "/responses", body)
+}
+
+func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, token string, body []byte, extraHeaders http.Header) (*http.Response, error) {
+	return h.postJSONEndpointWithHeaders(ctx, token, "/responses", body, extraHeaders)
 }
 
 func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
