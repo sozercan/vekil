@@ -329,6 +329,14 @@ func extractResponsesOutputText(body []byte) (string, error) {
 }
 
 func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint string, injectResumePrompt bool) []byte {
+	if rewrittenBody, strippedFields := stripUnsupportedResponsesRequestFields(bodyBytes); len(strippedFields) > 0 {
+		bodyBytes = rewrittenBody
+		h.log.Debug("stripped unsupported responses request fields",
+			logger.F("endpoint", endpoint),
+			logger.F("fields", strippedFields),
+		)
+	}
+
 	if rewrittenBody, rewriteCount := rewriteSyntheticCompactionRequest(bodyBytes); rewriteCount > 0 {
 		bodyBytes = rewrittenBody
 		resumePromptInjected := false
@@ -350,6 +358,31 @@ func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint st
 	}
 
 	return bodyBytes
+}
+
+func stripUnsupportedResponsesRequestFields(bodyBytes []byte) ([]byte, []string) {
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		return bodyBytes, nil
+	}
+
+	var strippedFields []string
+	for _, field := range []string{"service_tier"} {
+		if _, ok := req[field]; ok {
+			delete(req, field)
+			strippedFields = append(strippedFields, field)
+		}
+	}
+	if len(strippedFields) == 0 {
+		return bodyBytes, nil
+	}
+
+	rewrittenBody, err := json.Marshal(req)
+	if err != nil {
+		return bodyBytes, nil
+	}
+
+	return rewrittenBody, strippedFields
 }
 
 func (h *ProxyHandler) postResponsesWithFallback(ctx context.Context, token string, bodyBytes []byte) (*http.Response, error) {

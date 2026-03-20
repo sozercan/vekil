@@ -426,6 +426,14 @@ func TestHandleResponses(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer test-token" {
 			t.Errorf("expected Bearer test-token, got %q", r.Header.Get("Authorization"))
 		}
+		body, _ := io.ReadAll(r.Body)
+		var upstreamReq map[string]json.RawMessage
+		if err := json.Unmarshal(body, &upstreamReq); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+		if _, ok := upstreamReq["service_tier"]; ok {
+			t.Fatalf("upstream request should not include service_tier")
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"id":"resp-123","object":"response","status":"completed"}`))
@@ -433,7 +441,8 @@ func TestHandleResponses(t *testing.T) {
 
 	responsesReq := `{
 		"model": "gpt-4",
-		"input": "Hello"
+		"input": "Hello",
+		"service_tier": "auto"
 	}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(responsesReq))
 	req.Header.Set("Content-Type", "application/json")
@@ -1911,12 +1920,20 @@ func TestOpenAIResponsesStreaming(t *testing.T) {
 		if r.URL.Path != "/responses" {
 			t.Errorf("expected path /responses, got %q", r.URL.Path)
 		}
+		body, _ := io.ReadAll(r.Body)
+		var upstreamReq map[string]json.RawMessage
+		if err := json.Unmarshal(body, &upstreamReq); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+		if _, ok := upstreamReq["service_tier"]; ok {
+			t.Fatalf("upstream request should not include service_tier")
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(sseBody))
 	})
 
-	reqBody := `{"model":"gpt-4","input":"Hello","stream":true}`
+	reqBody := `{"model":"gpt-4","input":"Hello","stream":true,"service_tier":"auto"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
