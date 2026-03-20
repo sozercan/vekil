@@ -20,6 +20,7 @@ go test ./proxy/ -run TestMapStopReason/stop -v
 
 ```bash
 go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesWebSocketRequestBuild' -benchmem -count=1
+go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesTransport' -benchmem -count=1
 ```
 
 ## Lint

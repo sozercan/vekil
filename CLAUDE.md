@@ -17,6 +17,7 @@ make docker-build   # docker image
 
 Run specific tests: `go test ./proxy/ -run TestHandle -v`
 Run websocket benchmark: `go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesWebSocketRequestBuild' -benchmem -count=1`
+Run transport benchmark: `go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesTransport' -benchmem -count=1`
 
 ## Documentation
 

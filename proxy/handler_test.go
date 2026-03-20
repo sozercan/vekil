@@ -18,7 +18,7 @@ import (
 	"github.com/sozercan/copilot-proxy/models"
 )
 
-func newTestProxyHandler(t *testing.T, backend http.HandlerFunc) *ProxyHandler {
+func newTestProxyHandler(t testing.TB, backend http.HandlerFunc) *ProxyHandler {
 	t.Helper()
 	server := httptest.NewServer(backend)
 	t.Cleanup(server.Close)
