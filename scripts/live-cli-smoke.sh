@@ -47,6 +47,15 @@ cleanup() {
 
 trap cleanup EXIT
 
+seed_access_token() {
+  if [[ -z "${COPILOT_GITHUB_TOKEN:-}" ]]; then
+    return 0
+  fi
+
+  printf '%s\n' "${COPILOT_GITHUB_TOKEN}" > "${PROXY_TOKEN_DIR}/access-token"
+  chmod 600 "${PROXY_TOKEN_DIR}/access-token"
+}
+
 model_exists() {
   jq -e --arg model "$1" '.data[]? | select(.id == $model)' "${MODELS_JSON}" >/dev/null
 }
@@ -99,6 +108,7 @@ start_proxy() {
 
   mkdir -p "${SMOKE_DIR}" "${SMOKE_DIR}/cases" "${SMOKE_DIR}/homes" "${SMOKE_DIR}/outputs"
   mkdir -p "${PROXY_TOKEN_DIR}"
+  seed_access_token
 
   log "Starting proxy at ${PROXY_BASE_URL}"
   "${PROXY_BIN}" \
