@@ -67,6 +67,9 @@ func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 		if _, ok := body["previous_response_id"]; ok {
 			t.Fatalf("upstream request should not include websocket previous_response_id")
 		}
+		if _, ok := body["service_tier"]; ok {
+			t.Fatalf("upstream request should not include service_tier")
+		}
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n")
@@ -93,6 +96,7 @@ func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 		"ws_request_header_traceparent": "00-11111111111111111111111111111111-2222222222222222-01",
 		"x-codex-turn-metadata":         `{"turn_id":"turn-1"}`,
 	}
+	request["service_tier"] = "auto"
 
 	if err := conn.WriteJSON(request); err != nil {
 		t.Fatalf("failed to write websocket request: %v", err)
