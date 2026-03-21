@@ -326,13 +326,23 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), readyzUpstreamTimeout)
 	defer cancel()
 
+	if err := ctx.Err(); err != nil {
+		return
+	}
+
 	token, err := h.auth.GetTokenNonInteractive(ctx)
 	if err != nil {
+		if shouldSuppressReadyzResponse(r.Context(), err) {
+			return
+		}
 		writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", fmt.Sprintf("failed to get token: %v", err))
 		return
 	}
 
 	if err := h.checkUpstreamReady(ctx, token); err != nil {
+		if shouldSuppressReadyzResponse(r.Context(), err) {
+			return
+		}
 		writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", err.Error())
 		return
 	}
@@ -363,6 +373,22 @@ func (h *ProxyHandler) checkUpstreamReady(ctx context.Context, token string) err
 	}
 
 	return nil
+}
+
+func shouldSuppressReadyzResponse(parent context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	// Only suppress deadline errors when the caller's context already timed out.
+	// The proxy's own readiness timeout should still surface as not_ready.
+	return parent.Err() != nil
 }
 
 func writeReadyzStatus(w http.ResponseWriter, statusCode int, status string, errMessage string) {
@@ -489,7 +515,7 @@ func transformModelsResponse(body []byte) []byte {
 		Data   []json.RawMessage `json:"data"`
 		Object string            `json:"object"`
 	}
-	if err := json.Unmarshal(body, &upstream); err != nil || len(upstream.Data) == 0 {
+	if err := json.Unmarshal(body, &upstream); err != nil {
 		return body
 	}
 
@@ -522,7 +548,7 @@ func transformModelsResponse(body []byte) []byte {
 		InputModalities             []string          `json:"input_modalities"`
 	}
 
-	var codexModels []codexModel
+	codexModels := make([]codexModel, 0, len(upstream.Data))
 	for _, raw := range upstream.Data {
 		var m struct {
 			ID                 string   `json:"id"`
@@ -562,8 +588,14 @@ func transformModelsResponse(body []byte) []byte {
 			})
 		}
 		if len(reasoningLevels) > 0 {
-			mid := "medium"
-			defaultReasoning = &mid
+			defaultLevel := reasoningLevels[0].Effort
+			for _, level := range reasoningLevels {
+				if level.Effort == "medium" {
+					defaultLevel = level.Effort
+					break
+				}
+			}
+			defaultReasoning = &defaultLevel
 		}
 
 		var ctxWindow *int64

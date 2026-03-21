@@ -3,12 +3,14 @@ package proxy
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,6 +31,12 @@ func newTestProxyHandler(t testing.TB, backend http.HandlerFunc) *ProxyHandler {
 		log:            logger.New(logger.LevelInfo),
 		retryBaseDelay: 1 * time.Millisecond,
 	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
 func TestHandleHealthz(t *testing.T) {
@@ -54,6 +62,16 @@ func TestHandleHealthz(t *testing.T) {
 }
 
 func TestHandleReadyz(t *testing.T) {
+	assertProbeAborted := func(t *testing.T, w *httptest.ResponseRecorder) {
+		t.Helper()
+		if got := w.Header().Get("Content-Type"); got != "" {
+			t.Fatalf("expected no content type for aborted probe, got %q", got)
+		}
+		if got := w.Body.String(); got != "" {
+			t.Fatalf("expected no response body for aborted probe, got %q", got)
+		}
+	}
+
 	t.Run("ready when auth and upstream probe succeed", func(t *testing.T) {
 		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/models" {
@@ -145,6 +163,106 @@ func TestHandleReadyz(t *testing.T) {
 		}
 		if !strings.Contains(result["error"], "upstream probe returned 503") {
 			t.Fatalf("unexpected error message: %q", result["error"])
+		}
+	})
+
+	t.Run("canceled request does not rewrite readiness status", func(t *testing.T) {
+		var probeHits atomic.Int32
+		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			probeHits.Add(1)
+			t.Fatalf("upstream probe should not be sent for a canceled request")
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		ctx, cancel := context.WithCancel(req.Context())
+		cancel()
+		req = req.WithContext(ctx)
+
+		w := httptest.NewRecorder()
+		h.HandleReadyz(w, req)
+
+		if got := probeHits.Load(); got != 0 {
+			t.Fatalf("expected no upstream probe, got %d hits", got)
+		}
+		assertProbeAborted(t, w)
+	})
+
+	t.Run("timed out upstream probe does not rewrite readiness status", func(t *testing.T) {
+		probeStarted := make(chan struct{})
+		probeCanceled := make(chan struct{})
+
+		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			close(probeStarted)
+			<-r.Context().Done()
+			close(probeCanceled)
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		ctx, cancel := context.WithTimeout(req.Context(), 100*time.Millisecond)
+		defer cancel()
+		req = req.WithContext(ctx)
+
+		w := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			h.HandleReadyz(w, req)
+		}()
+
+		select {
+		case <-probeStarted:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for readiness probe to start")
+		}
+
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for handler to return")
+		}
+
+		select {
+		case <-probeCanceled:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for upstream probe cancellation")
+		}
+
+		assertProbeAborted(t, w)
+	})
+
+	t.Run("proxy readiness timeout still returns not ready", func(t *testing.T) {
+		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			t.Fatalf("unexpected upstream request handler invocation")
+		})
+		h.client = &http.Client{
+			Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if err := r.Context().Err(); err != nil {
+					t.Fatalf("expected active request context, got %v", err)
+				}
+				return nil, context.DeadlineExceeded
+			}),
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		w := httptest.NewRecorder()
+
+		h.HandleReadyz(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503, got %d", resp.StatusCode)
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		var result map[string]string
+		if err := json.Unmarshal(body, &result); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if result["status"] != "not_ready" {
+			t.Fatalf("expected status not_ready, got %q", result["status"])
+		}
+		if !strings.Contains(result["error"], "upstream probe failed") {
+			t.Fatalf("expected upstream timeout error, got %q", result["error"])
 		}
 	})
 }
@@ -431,8 +549,12 @@ func TestHandleResponses(t *testing.T) {
 		if err := json.Unmarshal(body, &upstreamReq); err != nil {
 			t.Fatalf("upstream received invalid JSON: %v", err)
 		}
-		if _, ok := upstreamReq["service_tier"]; ok {
-			t.Fatalf("upstream request should not include service_tier")
+		var serviceTier string
+		if err := json.Unmarshal(upstreamReq["service_tier"], &serviceTier); err != nil {
+			t.Fatalf("upstream request should preserve service_tier: %v", err)
+		}
+		if serviceTier != "auto" {
+			t.Fatalf("expected upstream service_tier auto, got %q", serviceTier)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -1428,6 +1550,44 @@ func TestSetCopilotHeadersWithConfig(t *testing.T) {
 	}
 }
 
+func TestPostJSONEndpointWithHeaders_ProxyHeadersTakePrecedence(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("expected Authorization header from proxy, got %q", got)
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Fatalf("expected Content-Type header from proxy, got %q", got)
+		}
+		if got := r.Header.Get("Traceparent"); got != "00-11111111111111111111111111111111-2222222222222222-01" {
+			t.Fatalf("expected passthrough header to survive merge, got %q", got)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+
+	resp, err := handler.postJSONEndpointWithHeaders(
+		context.Background(),
+		"test-token",
+		"/responses",
+		[]byte(`{"input":"hello"}`),
+		http.Header{
+			"Authorization": []string{"Bearer wrong-token"},
+			"Content-Type":  []string{"text/plain"},
+			"Traceparent":   []string{"00-11111111111111111111111111111111-2222222222222222-01"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("postJSONEndpointWithHeaders returned error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+}
+
 func TestHandleOpenAIChatCompletionsUpstreamError(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1552,6 +1712,82 @@ func TestHandleModels(t *testing.T) {
 		resp := w.Result()
 		if resp.StatusCode != http.StatusInternalServerError {
 			t.Fatalf("expected 500, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("empty data still returns models array", func(t *testing.T) {
+		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		})
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+
+		h.HandleModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.StatusCode)
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		if !bytes.Contains(body, []byte(`"models":[]`)) {
+			t.Fatalf("expected transformed response to include empty models array, got %s", body)
+		}
+
+		var result struct {
+			Data   []json.RawMessage `json:"data"`
+			Models []json.RawMessage `json:"models"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if len(result.Data) != 0 {
+			t.Fatalf("expected 0 data entries, got %d", len(result.Data))
+		}
+		if result.Models == nil {
+			t.Fatal("expected models to be an empty array, got nil")
+		}
+		if len(result.Models) != 0 {
+			t.Fatalf("expected 0 models entries, got %d", len(result.Models))
+		}
+	})
+
+	t.Run("default reasoning falls back to first supported level", func(t *testing.T) {
+		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5-thinking","object":"model","created":0,"owned_by":"github-copilot","supported_endpoints":["/responses"],"capabilities":{"supports":{"reasoning_effort":["low","high"]}},"model_picker_enabled":true,"name":"GPT-5 Thinking"}]}`))
+		})
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+
+		h.HandleModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.StatusCode)
+		}
+
+		var result struct {
+			Models []struct {
+				DefaultReasoningLevel    *string `json:"default_reasoning_level,omitempty"`
+				SupportedReasoningLevels []struct {
+					Effort string `json:"effort"`
+				} `json:"supported_reasoning_levels"`
+			} `json:"models"`
+		}
+		body, _ := io.ReadAll(resp.Body)
+		if err := json.Unmarshal(body, &result); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if len(result.Models) != 1 {
+			t.Fatalf("expected 1 model entry, got %d", len(result.Models))
+		}
+		if result.Models[0].DefaultReasoningLevel == nil || *result.Models[0].DefaultReasoningLevel != "low" {
+			t.Fatalf("expected default_reasoning_level low, got %v", result.Models[0].DefaultReasoningLevel)
+		}
+		if len(result.Models[0].SupportedReasoningLevels) != 2 {
+			t.Fatalf("expected 2 supported reasoning levels, got %d", len(result.Models[0].SupportedReasoningLevels))
 		}
 	})
 }
@@ -1925,8 +2161,12 @@ func TestOpenAIResponsesStreaming(t *testing.T) {
 		if err := json.Unmarshal(body, &upstreamReq); err != nil {
 			t.Fatalf("upstream received invalid JSON: %v", err)
 		}
-		if _, ok := upstreamReq["service_tier"]; ok {
-			t.Fatalf("upstream request should not include service_tier")
+		var serviceTier string
+		if err := json.Unmarshal(upstreamReq["service_tier"], &serviceTier); err != nil {
+			t.Fatalf("upstream request should preserve service_tier: %v", err)
+		}
+		if serviceTier != "auto" {
+			t.Fatalf("expected upstream service_tier auto, got %q", serviceTier)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)

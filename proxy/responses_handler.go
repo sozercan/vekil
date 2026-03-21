@@ -361,28 +361,7 @@ func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint st
 }
 
 func stripUnsupportedResponsesRequestFields(bodyBytes []byte) ([]byte, []string) {
-	var req map[string]json.RawMessage
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		return bodyBytes, nil
-	}
-
-	var strippedFields []string
-	for _, field := range []string{"service_tier"} {
-		if _, ok := req[field]; ok {
-			delete(req, field)
-			strippedFields = append(strippedFields, field)
-		}
-	}
-	if len(strippedFields) == 0 {
-		return bodyBytes, nil
-	}
-
-	rewrittenBody, err := json.Marshal(req)
-	if err != nil {
-		return bodyBytes, nil
-	}
-
-	return rewrittenBody, strippedFields
+	return bodyBytes, nil
 }
 
 func (h *ProxyHandler) postResponsesWithFallback(ctx context.Context, token string, bodyBytes []byte) (*http.Response, error) {
