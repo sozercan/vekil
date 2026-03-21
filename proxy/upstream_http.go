@@ -41,10 +41,10 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, token, p
 		if err != nil {
 			return nil, err
 		}
-		h.setCopilotHeaders(req, token)
 		if len(extraHeaders) > 0 {
 			mergeHeaderValues(req.Header, extraHeaders)
 		}
+		h.setCopilotHeaders(req, token)
 		return req, nil
 	})
 }

@@ -53,6 +53,7 @@ type responsesWebSocketStreamEvent struct {
 
 type responsesWebSocketSession struct {
 	conn           *websocket.Conn
+	ctx            context.Context
 	baseHeaders    http.Header
 	turnState      string
 	lastResponseID string
@@ -139,6 +140,7 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 
 	return &responsesWebSocketSession{
 		conn:        conn,
+		ctx:         r.Context(),
 		baseHeaders: baseHeaders,
 		turnState:   strings.TrimSpace(r.Header.Get("X-Codex-Turn-State")),
 	}
@@ -262,7 +264,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		})
 	}
 
-	token, err := h.auth.GetToken(context.Background())
+	token, err := h.auth.GetToken(s.ctx)
 	if err != nil {
 		s.sendWrappedError(http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error", nil)
 		return err
@@ -329,12 +331,16 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 
 func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx context.Context, token string, request *responsesWebSocketCreateRequest, plan responsesWebSocketRequestPlan) (*http.Response, bool, bool, error) {
 	resp, err := s.postCreateRequestSegments(h, ctx, token, request, plan.upstreamSegments(), plan.useTurnStateDelta)
-	if !plan.useTurnStateDelta || (err == nil && resp != nil && resp.StatusCode == http.StatusOK) {
+	if !plan.useTurnStateDelta || err != nil || resp == nil || resp.StatusCode == http.StatusOK {
 		return resp, plan.useTurnStateDelta, false, err
 	}
 
-	if resp != nil {
-		_ = resp.Body.Close()
+	respBody, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	_, code := extractResponsesWebSocketError(resp.StatusCode, respBody)
+	if readErr != nil || resp.StatusCode != http.StatusBadRequest || code != "invalid_turn_state" {
+		resp.Body = io.NopCloser(bytes.NewReader(respBody))
+		return resp, true, false, nil
 	}
 	h.log.Debug("responses websocket delta replay failed; retrying full history",
 		logger.F("model", request.Model),
