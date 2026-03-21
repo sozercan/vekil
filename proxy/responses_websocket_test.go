@@ -394,7 +394,7 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 	}
 }
 
-func TestHandleResponsesWebSocket_TurnStateDeltaReplayUsesOnlyCurrentInput(t *testing.T) {
+func TestHandleResponsesWebSocket_TurnStateDeltaReplayUsesOnlyCurrentInputAndIgnoresClientTurnStateHeader(t *testing.T) {
 	upstreamRequests := make([]map[string]interface{}, 0, 2)
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, err := io.ReadAll(r.Body)
@@ -446,6 +446,9 @@ func TestHandleResponsesWebSocket_TurnStateDeltaReplayUsesOnlyCurrentInput(t *te
 			},
 		},
 	})
+	first["client_metadata"] = map[string]string{
+		"ws_request_header_x-codex-turn-state": "client-state-first",
+	}
 	if err := conn.WriteJSON(first); err != nil {
 		t.Fatalf("failed to write first request: %v", err)
 	}
@@ -464,6 +467,9 @@ func TestHandleResponsesWebSocket_TurnStateDeltaReplayUsesOnlyCurrentInput(t *te
 		},
 	})
 	second["previous_response_id"] = websocketResponseID(t, firstCreated)
+	second["client_metadata"] = map[string]string{
+		"ws_request_header_x-codex-turn-state": "client-state-second",
+	}
 	if err := conn.WriteJSON(second); err != nil {
 		t.Fatalf("failed to write second request: %v", err)
 	}
