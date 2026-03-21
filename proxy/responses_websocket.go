@@ -367,9 +367,6 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCreateRequest, includeTurnState bool) http.Header {
 	headers := make(http.Header)
 	mergeHeaderValues(headers, s.baseHeaders)
-	if includeTurnState && s.turnState != "" {
-		headers.Set("X-Codex-Turn-State", s.turnState)
-	}
 
 	for key, value := range request.ClientMetadata {
 		trimmed := strings.TrimSpace(value)
@@ -382,10 +379,14 @@ func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCr
 			headers.Set("X-Codex-Turn-Metadata", trimmed)
 		case strings.HasPrefix(key, responsesWebSocketRequestHeaderPrefix):
 			name := strings.TrimSpace(strings.TrimPrefix(key, responsesWebSocketRequestHeaderPrefix))
-			if name != "" {
+			if name != "" && !strings.EqualFold(name, "X-Codex-Turn-State") {
 				headers.Set(name, trimmed)
 			}
 		}
+	}
+
+	if includeTurnState && s.turnState != "" {
+		headers.Set("X-Codex-Turn-State", s.turnState)
 	}
 
 	return headers

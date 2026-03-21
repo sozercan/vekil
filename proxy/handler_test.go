@@ -39,6 +39,16 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+func assertOnlySubagentHeaderForwarded(t testing.TB, r *http.Request, want string) {
+	t.Helper()
+	if got := r.Header.Get("X-OpenAI-Subagent"); got != want {
+		t.Fatalf("expected X-OpenAI-Subagent %q, got %q", want, got)
+	}
+	if got := r.Header.Get("X-Test-Client-Header"); got != "" {
+		t.Fatalf("expected X-Test-Client-Header to be stripped, got %q", got)
+	}
+}
+
 func TestHandleHealthz(t *testing.T) {
 	h := &ProxyHandler{}
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -544,6 +554,7 @@ func TestHandleResponses(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer test-token" {
 			t.Errorf("expected Bearer test-token, got %q", r.Header.Get("Authorization"))
 		}
+		assertOnlySubagentHeaderForwarded(t, r, "review")
 		body, _ := io.ReadAll(r.Body)
 		var upstreamReq map[string]json.RawMessage
 		if err := json.Unmarshal(body, &upstreamReq); err != nil {
@@ -568,6 +579,8 @@ func TestHandleResponses(t *testing.T) {
 	}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(responsesReq))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-OpenAI-Subagent", "review")
+	req.Header.Set("X-Test-Client-Header", "blocked")
 	w := httptest.NewRecorder()
 
 	handler.HandleResponses(w, req)
@@ -594,6 +607,7 @@ func TestHandleCompact(t *testing.T) {
 		if r.URL.Path != "/responses" {
 			t.Errorf("expected upstream path /responses, got %q", r.URL.Path)
 		}
+		assertOnlySubagentHeaderForwarded(t, r, "compact")
 
 		body, _ := io.ReadAll(r.Body)
 		var req map[string]interface{}
@@ -639,6 +653,8 @@ func TestHandleCompact(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-OpenAI-Subagent", "compact")
+	req.Header.Set("X-Test-Client-Header", "blocked")
 	w := httptest.NewRecorder()
 
 	handler.HandleCompact(w, req)
@@ -1111,6 +1127,7 @@ func TestHandleMemorySummarize(t *testing.T) {
 		if r.URL.Path != "/responses" {
 			t.Errorf("expected upstream path /responses, got %q", r.URL.Path)
 		}
+		assertOnlySubagentHeaderForwarded(t, r, "memory_consolidation")
 
 		// Return a response with the model's JSON summary
 		w.Header().Set("Content-Type", "application/json")
@@ -1120,6 +1137,8 @@ func TestHandleMemorySummarize(t *testing.T) {
 	reqBody := `{"model":"gpt-5.4","traces":[{"id":"t1","metadata":{"source_path":"/tmp/trace.json"},"items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the bug"}]}]}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/memories/trace_summarize", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-OpenAI-Subagent", "memory_consolidation")
+	req.Header.Set("X-Test-Client-Header", "blocked")
 	w := httptest.NewRecorder()
 
 	handler.HandleMemorySummarize(w, req)

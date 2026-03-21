@@ -12,6 +12,16 @@ import (
 	"github.com/sozercan/copilot-proxy/logger"
 )
 
+func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
+	if subagent := strings.TrimSpace(r.Header.Get("X-OpenAI-Subagent")); subagent != "" {
+		headers := make(http.Header, 1)
+		headers.Set("X-OpenAI-Subagent", subagent)
+		return headers
+	}
+
+	return nil
+}
+
 // HandleResponses handles POST /v1/responses by forwarding the request to
 // Copilot's responses endpoint with only auth headers injected.
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
@@ -40,7 +50,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	upstreamCtx, upstreamCancel := newInferenceUpstreamContext()
 	defer upstreamCancel()
 
-	resp, err := h.postResponses(upstreamCtx, token, bodyBytes)
+	resp, err := h.postResponsesWithHeaders(upstreamCtx, token, bodyBytes, responsesExtraHeadersFromRequest(r))
 	if err != nil {
 		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), fmt.Sprintf("upstream request failed: %v", err), "server_error")
 		return
@@ -107,7 +117,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	upstreamCtx, upstreamCancel := newInferenceUpstreamContext()
 	defer upstreamCancel()
 
-	resp, err := h.postResponsesWithFallback(upstreamCtx, token, bodyBytes)
+	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, token, bodyBytes, responsesExtraHeadersFromRequest(r))
 	if err != nil {
 		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), fmt.Sprintf("upstream request failed: %v", err), "server_error")
 		return
@@ -228,7 +238,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	upstreamCtx, upstreamCancel := newInferenceUpstreamContext()
 	defer upstreamCancel()
 
-	resp, err := h.postResponsesWithFallback(upstreamCtx, token, reqBody)
+	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, token, reqBody, responsesExtraHeadersFromRequest(r))
 	if err != nil {
 		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), fmt.Sprintf("upstream request failed: %v", err), "server_error")
 		return
