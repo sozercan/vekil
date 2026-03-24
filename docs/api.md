@@ -129,11 +129,15 @@ Compatibility shim for environments expecting `/responses/compact`. The proxy re
 - a normal assistant summary message
 - a proxy-owned opaque `compaction` item whose `encrypted_content` can later be sent back to `/v1/responses` or `/v1/responses/compact`
 
+Requests to this endpoint are accepted up to `64 MiB` so large session histories can be compacted without tripping the default request-body limit.
+
 If the requested model does not support the upstream Responses API, the proxy retries against a compatible fallback model discovered from `/models`.
 
 ## `POST /v1/memories/trace_summarize`
 
 Compatibility shim that summarizes one or more traces into `{trace_summary, memory_summary}` objects using the upstream `/responses` endpoint plus a JSON-only summarization prompt.
+
+Requests to this endpoint are accepted up to `64 MiB` so larger trace bundles can be summarized in a single call.
 
 ## `GET /healthz`
 

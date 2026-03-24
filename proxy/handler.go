@@ -27,6 +27,10 @@ import (
 const (
 	// maxRequestBodySize is the maximum allowed request body size (10MB).
 	maxRequestBodySize = 10 << 20
+	// maxLargeRequestBodySize gives proxy-owned summarization endpoints a higher
+	// ceiling because they can legitimately contain full session histories or
+	// trace bundles that need to be summarized.
+	maxLargeRequestBodySize = 64 << 20
 	// upstreamTimeout is the timeout for LLM inference requests.
 	upstreamTimeout = 5 * time.Minute
 	// readyzUpstreamTimeout bounds readiness probes that validate upstream reachability.
@@ -700,6 +704,13 @@ func writeOpenAIError(w http.ResponseWriter, status int, message, errType string
 // readBody reads the request body up to maxRequestBodySize. If the body exceeds
 // the limit, it returns an error so callers can return HTTP 413.
 func readBody(r *http.Request) ([]byte, error) {
+	return readBodyWithLimit(r, maxRequestBodySize)
+}
+
+// readBodyWithLimit reads and transparently decompresses the request body up to
+// the provided limit. If the body exceeds the limit, it returns an error so
+// callers can return HTTP 413.
+func readBodyWithLimit(r *http.Request, limit int64) ([]byte, error) {
 	var reader io.Reader = r.Body
 
 	// Decompress request body if Content-Encoding is set.
@@ -727,17 +738,17 @@ func readBody(r *http.Request) ([]byte, error) {
 		reader = zr
 	}
 
-	body, err := io.ReadAll(io.LimitReader(reader, maxRequestBodySize+1))
+	body, err := io.ReadAll(io.LimitReader(reader, limit+1))
 	if err != nil {
 		return nil, &requestBodyError{
 			statusCode: http.StatusBadRequest,
 			err:        err,
 		}
 	}
-	if len(body) > maxRequestBodySize {
+	if int64(len(body)) > limit {
 		return nil, &requestBodyError{
 			statusCode: http.StatusRequestEntityTooLarge,
-			err:        fmt.Errorf("request body too large (max %d bytes)", maxRequestBodySize),
+			err:        fmt.Errorf("request body too large (max %d bytes)", limit),
 		}
 	}
 	return body, nil

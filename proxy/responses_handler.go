@@ -95,7 +95,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	bodyBytes, err := readBody(r)
+	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
@@ -196,7 +196,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	bodyBytes, err := readBody(r)
+	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
