@@ -1,3 +1,4 @@
 copilot-proxy
 Copilot Proxy.app/
+.build/
 .DS_Store
