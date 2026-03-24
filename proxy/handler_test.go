@@ -601,6 +601,35 @@ func TestHandleResponses(t *testing.T) {
 	}
 }
 
+func TestHandleResponses_LargeBodyStillRejected(t *testing.T) {
+	var upstreamHits atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-too-large","object":"response","status":"completed"}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(makeOversizedResponsesRequestBody(t)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 413, got %d: %s", resp.StatusCode, body)
+	}
+	if upstreamHits.Load() != 0 {
+		t.Fatalf("expected oversized request to be rejected before upstream call, got %d upstream hits", upstreamHits.Load())
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("request body too large")) {
+		t.Fatalf("expected 413 body to mention oversized request, got %s", body)
+	}
+}
+
 func TestHandleCompact(t *testing.T) {
 	priorSummary := "previous compacted context"
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -699,6 +728,41 @@ func TestHandleCompact(t *testing.T) {
 	}
 	if got := decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent); got != "compacted summary of conversation" {
 		t.Errorf("expected encoded compaction summary, got %q", got)
+	}
+}
+
+func TestHandleCompact_LargeBodyAllowed(t *testing.T) {
+	var upstreamHits atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		if r.URL.Path != "/responses" {
+			t.Errorf("expected upstream path /responses, got %q", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		if len(body) <= maxRequestBodySize {
+			t.Fatalf("expected forwarded compact body to exceed default limit, got %d bytes", len(body))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"compacted summary of conversation"}]}]}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(makeOversizedResponsesRequestBody(t)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if upstreamHits.Load() != 1 {
+		t.Fatalf("expected upstream to receive oversized compact request, got %d hits", upstreamHits.Load())
 	}
 }
 
@@ -1170,6 +1234,41 @@ func TestHandleMemorySummarize(t *testing.T) {
 	}
 }
 
+func TestHandleMemorySummarize_LargeBodyAllowed(t *testing.T) {
+	var upstreamHits atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		if r.URL.Path != "/responses" {
+			t.Errorf("expected upstream path /responses, got %q", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		if len(body) <= maxRequestBodySize {
+			t.Fatalf("expected forwarded memory summarize body to exceed default limit, got %d bytes", len(body))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"[{\"trace_summary\":\"trace\",\"memory_summary\":\"memory\"}]"}]}]}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/memories/trace_summarize", bytes.NewReader(makeOversizedMemorySummarizeRequestBody(t)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleMemorySummarize(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if upstreamHits.Load() != 1 {
+		t.Fatalf("expected upstream to receive oversized memory summarize request, got %d hits", upstreamHits.Load())
+	}
+}
+
 func TestHandleMemorySummarize_StripsInlineRenderMarkers(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/responses" {
@@ -1295,6 +1394,60 @@ func requireMessageTextWithRole(t *testing.T, raw interface{}, wantRole string) 
 		t.Fatalf("expected text content, got %#v", part["text"])
 	}
 	return text
+}
+
+func makeOversizedResponsesRequestBody(t testing.TB) []byte {
+	t.Helper()
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": strings.Repeat("a", maxRequestBodySize),
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal oversized responses request: %v", err)
+	}
+	if len(reqBody) <= maxRequestBodySize {
+		t.Fatalf("expected oversized responses body, got %d bytes", len(reqBody))
+	}
+	if len(reqBody) > maxLargeRequestBodySize {
+		t.Fatalf("expected oversized responses body to stay below large limit, got %d bytes", len(reqBody))
+	}
+	return reqBody
+}
+
+func makeOversizedMemorySummarizeRequestBody(t testing.TB) []byte {
+	t.Helper()
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"traces": []interface{}{
+			map[string]interface{}{
+				"id": "t1",
+				"metadata": map[string]string{
+					"source_path": "/tmp/trace.json",
+				},
+				"items": []interface{}{
+					map[string]interface{}{
+						"type": "message",
+						"role": "user",
+						"content": []map[string]string{
+							{"type": "input_text", "text": strings.Repeat("a", maxRequestBodySize)},
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal oversized memory summarize request: %v", err)
+	}
+	if len(reqBody) <= maxRequestBodySize {
+		t.Fatalf("expected oversized memory summarize body, got %d bytes", len(reqBody))
+	}
+	if len(reqBody) > maxLargeRequestBodySize {
+		t.Fatalf("expected oversized memory summarize body to stay below large limit, got %d bytes", len(reqBody))
+	}
+	return reqBody
 }
 
 func TestRewriteSyntheticCompactionRequest(t *testing.T) {
