@@ -40,6 +40,8 @@ func onReady() {
 
 	mStatus = systray.AddMenuItem("○ Not signed in", "")
 	mStatus.Disable()
+	mVersion := systray.AddMenuItem(versionMenuTitle(), "Current app version")
+	mVersion.Disable()
 	systray.AddSeparator()
 
 	mToggle = systray.AddMenuItem("Start Proxy", "Start or stop the proxy")
