@@ -33,7 +33,7 @@ build-app: $(SPARKLE_FRAMEWORK)
 	@mkdir -p "$(APP_NAME)/Contents/Resources"
 	@mkdir -p "$(APP_NAME)/Contents/Frameworks"
 	CGO_ENABLED=1 CGO_LDFLAGS="-F$(abspath $(SPARKLE_UNPACK_DIR))" \
-		go build -tags sparkle -ldflags="$(LDFLAGS)" -o "$(APP_NAME)/Contents/MacOS/copilot-proxy-menubar" ./cmd/menubar/
+		go build -tags sparkle -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o "$(APP_NAME)/Contents/MacOS/copilot-proxy-menubar" ./cmd/menubar/
 	ditto "$(SPARKLE_FRAMEWORK)" "$(APP_NAME)/Contents/Frameworks/Sparkle.framework"
 	@printf '<?xml version="1.0" encoding="UTF-8"?>\n\
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n\

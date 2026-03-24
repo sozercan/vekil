@@ -24,6 +24,7 @@ open "Copilot Proxy.app"
 
 - start/stop toggle from the menubar
 - status icon: white robot when running, gray when stopped
+- current app version shown in the menu
 - optional LaunchAgent integration for launch at login
 - tooltip showing running/stopped state and port
 - `Check for Updates…` menu item in packaged macOS app builds
