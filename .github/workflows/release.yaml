@@ -49,15 +49,32 @@ jobs:
           go-version-file: go.mod
 
       - name: Build macOS menubar app
+        env:
+          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
         run: VERSION=${GITHUB_REF#refs/tags/} GOARCH=arm64 make build-app
 
       - name: Zip app bundle
-        run: zip -r "Copilot-Proxy-macos-arm64.zip" "Copilot Proxy.app"
+        run: |
+          mkdir -p dist/macos-release
+          ditto -c -k --sequesterRsrc --keepParent "Copilot Proxy.app" dist/macos-release/"Copilot-Proxy-macos-arm64.zip"
+
+      - name: Generate Sparkle appcast
+        env:
+          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+        run: |
+          printf '%s' "$SPARKLE_PRIVATE_ED_KEY" | .build/sparkle/unpacked/bin/generate_appcast \
+            --ed-key-file - \
+            --download-url-prefix "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/" \
+            --full-release-notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}" \
+            --maximum-deltas 0 \
+            dist/macos-release
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: "Copilot-Proxy-macos-arm64.zip"
+          files: |
+            dist/macos-release/Copilot-Proxy-macos-arm64.zip
+            dist/macos-release/appcast.xml
 
   publish:
     runs-on: ubuntu-latest
