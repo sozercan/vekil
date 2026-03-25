@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1183,6 +1184,287 @@ func TestHandleResponses_PreservesOpaqueCompaction(t *testing.T) {
 	if w.Result().StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(w.Result().Body)
 		t.Fatalf("expected 200, got %d: %s", w.Result().StatusCode, body)
+	}
+}
+
+func TestHandleResponses_RetriesCompacted413Replay(t *testing.T) {
+	var upstreamRequestsMu sync.Mutex
+	upstreamRequests := make([]map[string]interface{}, 0, 3)
+	var normalRequests atomic.Int32
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+
+		upstreamRequestsMu.Lock()
+		upstreamRequests = append(upstreamRequests, body)
+		upstreamRequestsMu.Unlock()
+
+		if instructions, _ := body["instructions"].(string); strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"comp-413","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint summary after 413"}]}]}`))
+			return
+		}
+
+		switch normalRequests.Add(1) {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+		case 2:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-413-retried","object":"response","status":"completed"}`))
+		default:
+			t.Fatalf("unexpected normal upstream request count %d", normalRequests.Load())
+		}
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		DisableAutoCompact:  true,
+		AutoCompactKeepTail: 2,
+	}
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model":                "gpt-5.4",
+		"previous_response_id": "resp-prev",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "first turn"},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "assistant",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "first answer"},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "second turn"},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "assistant",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "second answer"},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "latest turn"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to parse retried response: %v", err)
+	}
+	if result["id"] != "resp-413-retried" {
+		t.Fatalf("expected retried response id resp-413-retried, got %v", result["id"])
+	}
+
+	upstreamRequestsMu.Lock()
+	requests := append([]map[string]interface{}(nil), upstreamRequests...)
+	upstreamRequestsMu.Unlock()
+
+	if len(requests) != 3 {
+		t.Fatalf("expected 3 upstream requests (413 + compaction + retry), got %d", len(requests))
+	}
+
+	initialReplayInput := upstreamInputItems(t, requests[0])
+	if len(initialReplayInput) != 5 {
+		t.Fatalf("expected first upstream request to keep full replay, got %d items", len(initialReplayInput))
+	}
+	if got := requireMessageTextWithRole(t, initialReplayInput[0], "user"); got != "first turn" {
+		t.Fatalf("expected first upstream request to start with oldest input, got %q", got)
+	}
+	if got := requireMessageTextWithRole(t, initialReplayInput[4], "user"); got != "latest turn" {
+		t.Fatalf("expected first upstream request to keep latest input, got %q", got)
+	}
+
+	compactionInput := upstreamInputItems(t, requests[1])
+	if len(compactionInput) != 3 {
+		t.Fatalf("expected compaction request to summarize only the replay prefix, got %d items", len(compactionInput))
+	}
+	if got := requireMessageTextWithRole(t, compactionInput[0], "user"); got != "first turn" {
+		t.Fatalf("expected compaction request to preserve oldest user turn, got %q", got)
+	}
+	if got := requireMessageTextWithRole(t, compactionInput[1], "assistant"); got != "first answer" {
+		t.Fatalf("expected compaction request to include first assistant reply, got %q", got)
+	}
+	if got := requireMessageTextWithRole(t, compactionInput[2], "user"); got != "second turn" {
+		t.Fatalf("expected compaction request to stop before kept tail, got %q", got)
+	}
+
+	retriedInput := upstreamInputItems(t, requests[2])
+	if len(retriedInput) != 3 {
+		t.Fatalf("expected retried request to include compacted checkpoint plus tail, got %d items", len(retriedInput))
+	}
+	if got := requireCompactionContextMessage(t, retriedInput[0]); !strings.Contains(got, "checkpoint summary after 413") {
+		t.Fatalf("expected retried request to start with compacted checkpoint, got %q", got)
+	}
+	if got := requireMessageTextWithRole(t, retriedInput[1], "assistant"); got != "second answer" {
+		t.Fatalf("expected retried request to keep assistant tail item, got %q", got)
+	}
+	if got := requireMessageTextWithRole(t, retriedInput[2], "user"); got != "latest turn" {
+		t.Fatalf("expected retried request to keep latest user tail item, got %q", got)
+	}
+}
+
+func TestHandleResponses_DoesNotRetry413WithoutPreviousResponseID(t *testing.T) {
+	var upstreamRequests atomic.Int32
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		DisableAutoCompact:  true,
+		AutoCompactKeepTail: 2,
+	}
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "first turn"},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "assistant",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "first answer"},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "second turn"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 413, got %d: %s", resp.StatusCode, body)
+	}
+	if upstreamRequests.Load() != 1 {
+		t.Fatalf("expected no retry without previous_response_id, got %d upstream requests", upstreamRequests.Load())
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("payload_too_large")) {
+		t.Fatalf("expected original 413 body to be preserved, got %s", body)
+	}
+}
+
+func TestHandleResponses_DoesNotRetry413WithinKeepTail(t *testing.T) {
+	var upstreamRequests atomic.Int32
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		DisableAutoCompact:  true,
+		AutoCompactKeepTail: 2,
+	}
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model":                "gpt-5.4",
+		"previous_response_id": "resp-prev",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "assistant",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "second answer"},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "latest turn"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 413, got %d: %s", resp.StatusCode, body)
+	}
+	if upstreamRequests.Load() != 1 {
+		t.Fatalf("expected no retry when replay already fits keep-tail window, got %d upstream requests", upstreamRequests.Load())
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("payload_too_large")) {
+		t.Fatalf("expected original 413 body to be preserved, got %s", body)
 	}
 }
 
