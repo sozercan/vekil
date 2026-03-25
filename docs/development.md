@@ -8,8 +8,6 @@ make build-app
 make docker-build
 ```
 
-`go test ./...` and ordinary Go builds do not require Sparkle. The updater code is only compiled for the packaged macOS app build via `make build-app`, which passes the `sparkle` build tag and embeds the framework.
-
 ## Test
 
 ```bash

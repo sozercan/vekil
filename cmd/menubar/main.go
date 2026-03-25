@@ -57,17 +57,6 @@ func onReady() {
 
 	mAuth = systray.AddMenuItem("Sign In", "Sign in or out of GitHub")
 	systray.AddSeparator()
-
-	var mCheckUpdates *systray.MenuItem
-	if updaterSupported() {
-		mCheckUpdates = systray.AddMenuItem("Check for Updates…", "Check for Copilot Proxy updates")
-		if err := startUpdater(); err != nil {
-			log.Error("failed to start updater", logger.Err(err))
-			mCheckUpdates.Disable()
-		}
-		systray.AddSeparator()
-	}
-
 	mQuit := systray.AddMenuItem("Quit", "Quit the application")
 
 	// Set initial UI state based on whether we already have credentials.
@@ -75,11 +64,6 @@ func onReady() {
 		setSignedInUI()
 	} else {
 		setSignedOutUI()
-	}
-
-	var mCheckUpdatesClicked <-chan struct{}
-	if mCheckUpdates != nil {
-		mCheckUpdatesClicked = mCheckUpdates.ClickedCh
 	}
 
 	go func() {
@@ -110,11 +94,6 @@ func onReady() {
 					signOut()
 				} else {
 					go signIn()
-				}
-			case <-mCheckUpdatesClicked:
-				if err := checkForUpdates(); err != nil {
-					log.Error("failed to check for updates", logger.Err(err))
-					showErrorDialog("Update Check Failed", err.Error())
 				}
 			case <-mQuit.ClickedCh:
 				if srv != nil && srv.IsRunning() {
