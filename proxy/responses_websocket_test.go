@@ -394,6 +394,141 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 	}
 }
 
+func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T) {
+	var upstreamRequestsMu sync.Mutex
+	upstreamRequests := make([]map[string]interface{}, 0, 4)
+	var normalRequests int
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+		upstreamRequestsMu.Lock()
+		upstreamRequests = append(upstreamRequests, body)
+		upstreamRequestsMu.Unlock()
+
+		if instructions, _ := body["instructions"].(string); strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"comp-413","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint summary after 413"}]}]}`)
+			return
+		}
+
+		normalRequests++
+		switch normalRequests {
+		case 1:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-1\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"}]}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-2\",\"content\":[{\"type\":\"output_text\",\"text\":\"second\"}]}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-3\",\"content\":[{\"type\":\"output_text\",\"text\":\"third\"}]}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		case 2:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = fmt.Fprint(w, `{"error":{"message":"failed to parse request","code":"payload_too_large"}}`)
+		case 3:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		default:
+			t.Fatalf("unexpected normal upstream request count %d", normalRequests)
+		}
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		DisableAutoCompact:  true,
+		AutoCompactKeepTail: 2,
+	}
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	first := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "first turn"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(first); err != nil {
+		t.Fatalf("failed to write first request: %v", err)
+	}
+
+	firstCreated := mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+
+	second := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "second turn"},
+			},
+		},
+	})
+	second["previous_response_id"] = websocketResponseID(t, firstCreated)
+	if err := conn.WriteJSON(second); err != nil {
+		t.Fatalf("failed to write second request: %v", err)
+	}
+
+	created := mustReadWebSocketJSON(t, conn)
+	completed := mustReadWebSocketJSON(t, conn)
+	if created["type"] != "response.created" {
+		t.Fatalf("expected retried response.created event, got %v", created["type"])
+	}
+	if completed["type"] != "response.completed" {
+		t.Fatalf("expected retried response.completed event, got %v", completed["type"])
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	requests := snapshotResponsesWebSocketRequests(&upstreamRequestsMu, upstreamRequests)
+	for len(requests) < 4 {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected 4 upstream requests (turn + 413 + compaction + retry), got %d", len(requests))
+		}
+		time.Sleep(10 * time.Millisecond)
+		requests = snapshotResponsesWebSocketRequests(&upstreamRequestsMu, upstreamRequests)
+	}
+
+	initialReplayInput := upstreamInputItems(t, requests[1])
+	if len(initialReplayInput) != 5 {
+		t.Fatalf("expected oversized replay to include full history plus latest input, got %d items", len(initialReplayInput))
+	}
+	if got := inputTextFromMessage(t, initialReplayInput[0]); got != "first turn" {
+		t.Fatalf("expected oversized replay to start with original user turn, got %q", got)
+	}
+
+	compactionInput := upstreamInputItems(t, requests[2])
+	if len(compactionInput) != 2 {
+		t.Fatalf("expected 413 compaction request to summarize only the old prefix, got %d items", len(compactionInput))
+	}
+	if got := inputTextFromMessage(t, compactionInput[0]); got != "first turn" {
+		t.Fatalf("expected compaction request to preserve the oldest user turn, got %q", got)
+	}
+
+	retriedInput := upstreamInputItems(t, requests[3])
+	if len(retriedInput) != 4 {
+		t.Fatalf("expected retried request to use compacted history plus latest input, got %d items", len(retriedInput))
+	}
+	if got := requireMessageTextWithRole(t, retriedInput[0], "developer"); !strings.Contains(got, "checkpoint summary after 413") {
+		t.Fatalf("expected retried request to start with compacted checkpoint, got %q", got)
+	}
+	if got := inputTextFromMessage(t, retriedInput[3]); got != "second turn" {
+		t.Fatalf("expected retried request to keep latest user turn, got %q", got)
+	}
+}
+
 func TestHandleResponsesWebSocket_TurnStateDeltaReplayUsesOnlyCurrentInputAndIgnoresClientTurnStateHeader(t *testing.T) {
 	upstreamRequests := make([]map[string]interface{}, 0, 2)
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {

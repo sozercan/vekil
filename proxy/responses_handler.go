@@ -47,10 +47,17 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(bodyBytes, &partial)
 	isStreaming := partial.Stream != nil && *partial.Stream
 
+	extraHeaders := responsesExtraHeadersFromRequest(r)
+
 	upstreamCtx, upstreamCancel := newInferenceUpstreamContext()
 	defer upstreamCancel()
 
-	resp, err := h.postResponsesWithHeaders(upstreamCtx, token, bodyBytes, responsesExtraHeadersFromRequest(r))
+	resp, err := h.postResponsesWithHeaders(upstreamCtx, token, bodyBytes, extraHeaders)
+	if err != nil {
+		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), fmt.Sprintf("upstream request failed: %v", err), "server_error")
+		return
+	}
+	resp, err = h.maybeRetryCompactedResponsesRequest(upstreamCtx, token, bodyBytes, extraHeaders, resp)
 	if err != nil {
 		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), fmt.Sprintf("upstream request failed: %v", err), "server_error")
 		return
@@ -426,6 +433,92 @@ func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, tok
 	retryResp, retryErr := h.postResponsesWithHeaders(ctx, token, fallbackBody, extraHeaders)
 	if retryErr != nil {
 		h.log.Debug("responses fallback request failed", logger.Err(retryErr))
+		return resp, nil
+	}
+
+	return retryResp, nil
+}
+
+func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, token string, bodyBytes []byte, extraHeaders http.Header, resp *http.Response) (*http.Response, error) {
+	if resp == nil || resp.StatusCode != http.StatusRequestEntityTooLarge {
+		return resp, nil
+	}
+
+	var requestFields map[string]json.RawMessage
+	if err := json.Unmarshal(bodyBytes, &requestFields); err != nil {
+		return resp, nil
+	}
+
+	var previousResponseID string
+	if err := json.Unmarshal(requestFields["previous_response_id"], &previousResponseID); err != nil || strings.TrimSpace(previousResponseID) == "" {
+		return resp, nil
+	}
+
+	var model string
+	if err := json.Unmarshal(requestFields["model"], &model); err != nil || strings.TrimSpace(model) == "" {
+		return resp, nil
+	}
+
+	var input []json.RawMessage
+	if err := json.Unmarshal(requestFields["input"], &input); err != nil {
+		return resp, nil
+	}
+
+	keepTail := h.responsesWebSocketConfig().AutoCompactKeepTail
+	if keepTail <= 0 || len(input) <= keepTail {
+		return resp, nil
+	}
+
+	prefixLen := len(input) - keepTail
+	summary, err := h.compactResponsesInput(ctx, token, model, input[:prefixLen], extraHeaders)
+	if err != nil {
+		h.log.Debug("responses 413 compaction failed", logger.Err(err))
+		return resp, nil
+	}
+
+	checkpoint, err := proxyCompactionContextRawMessage(summary)
+	if err != nil {
+		h.log.Debug("responses 413 compaction checkpoint build failed", logger.Err(err))
+		return resp, nil
+	}
+
+	compactedInput := make([]json.RawMessage, 0, keepTail+1)
+	compactedInput = append(compactedInput, checkpoint)
+	compactedInput = append(compactedInput, input[prefixLen:]...)
+
+	compactedInputRaw, err := json.Marshal(compactedInput)
+	if err != nil {
+		h.log.Debug("responses 413 compaction marshal failed", logger.Err(err))
+		return resp, nil
+	}
+	requestFields["input"] = compactedInputRaw
+
+	retryBody, err := json.Marshal(requestFields)
+	if err != nil {
+		h.log.Debug("responses 413 retry body marshal failed", logger.Err(err))
+		return resp, nil
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		_ = resp.Body.Close()
+		return nil, err
+	}
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(respBody))
+
+	h.log.Info("retrying responses request with compacted history after 413",
+		logger.F("model", model),
+		logger.F("previous_response_id", previousResponseID),
+		logger.F("original_items", len(input)),
+		logger.F("compacted_items", len(compactedInput)),
+		logger.F("original_bytes", rawMessagesSize(input)),
+		logger.F("compacted_bytes", rawMessagesSize(compactedInput)),
+	)
+
+	retryResp, retryErr := h.postResponsesWithHeaders(ctx, token, retryBody, extraHeaders)
+	if retryErr != nil {
+		h.log.Debug("responses 413 retry request failed", logger.Err(retryErr))
 		return resp, nil
 	}
 
