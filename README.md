@@ -23,7 +23,7 @@ docker run -p 1337:1337 \
   ghcr.io/sozercan/copilot-proxy:latest
 ```
 
-On macOS, you can also use the native menubar app instead of keeping a terminal open. Build it locally with `make build-app` and open `Copilot Proxy.app`. See [macOS Menubar App](docs/menubar.md).
+On Apple Silicon Macs, you can also use the native menubar app instead of keeping a terminal open. Download `Copilot-Proxy-macos-arm64.zip` from [GitHub Releases](https://github.com/sozercan/copilot-proxy/releases/latest), unzip it, and open `Copilot Proxy.app`. See [macOS Menubar App](docs/menubar.md).
 
 On first run, authenticate with GitHub's device code flow. Tokens are cached in `~/.config/copilot-proxy/`.
 

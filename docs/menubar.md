@@ -2,7 +2,13 @@
 
 The repo includes a native macOS menubar app for running the proxy without keeping a terminal open.
 
-## Build And Run
+## Download And Run
+
+Download `Copilot-Proxy-macos-arm64.zip` from [GitHub Releases](https://github.com/sozercan/copilot-proxy/releases/latest), unzip it, and open `Copilot Proxy.app`.
+
+The published app bundle is currently available for Apple Silicon (`arm64`). On Intel Macs, build the app from source instead.
+
+## Build From Source
 
 ```bash
 make build-app
