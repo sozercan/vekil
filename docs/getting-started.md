@@ -1,5 +1,11 @@
 # Getting Started
 
+## Download From GitHub Releases
+
+Download the latest binary for your platform from [GitHub Releases](https://github.com/sozercan/copilot-proxy/releases/latest).
+
+Published binaries are available for `linux/amd64`, `linux/arm64`, `darwin/amd64`, and `darwin/arm64`. After downloading, make the binary executable if needed and run it locally.
+
 ## Build From Source
 
 ```bash

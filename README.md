@@ -13,10 +13,7 @@ High-performance Go proxy that exposes Anthropic, Gemini, and OpenAI-compatible 
 
 ## Quick Start
 
-```bash
-go build -o copilot-proxy .
-./copilot-proxy
-```
+Download the latest binary for your platform from [GitHub Releases](https://github.com/sozercan/copilot-proxy/releases/latest), then run it locally.
 
 Or with Docker from GHCR:
 
@@ -26,7 +23,7 @@ docker run -p 1337:1337 \
   ghcr.io/sozercan/copilot-proxy:latest
 ```
 
-On macOS, you can also use the native menubar app instead of keeping a terminal open. Build it with `make build-app` and open `Copilot Proxy.app`, or download the packaged app from the GitHub release assets. See [macOS Menubar App](docs/menubar.md).
+On macOS, you can also use the native menubar app instead of keeping a terminal open. Build it locally with `make build-app` and open `Copilot Proxy.app`. See [macOS Menubar App](docs/menubar.md).
 
 On first run, authenticate with GitHub's device code flow. Tokens are cached in `~/.config/copilot-proxy/`.
 
