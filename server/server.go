@@ -46,6 +46,12 @@ func WithResponsesWebSocketConfig(cfg proxy.ResponsesWebSocketConfig) Option {
 	return WithProxyOptions(proxy.WithResponsesWebSocketConfig(cfg))
 }
 
+// WithStreamingUpstreamTimeout overrides the timeout used for streaming
+// upstream inference requests and derives the server write timeout from it.
+func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
+	return WithProxyOptions(proxy.WithStreamingUpstreamTimeout(timeout))
+}
+
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) *Server {
 	cfg := options{}
@@ -77,7 +83,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 			Addr:         addr,
 			Handler:      mux,
 			ReadTimeout:  30 * time.Second,
-			WriteTimeout: 65 * time.Minute,
+			WriteTimeout: handler.ServerWriteTimeout(),
 			IdleTimeout:  120 * time.Second,
 		},
 		log: log,

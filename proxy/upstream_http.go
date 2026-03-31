@@ -8,12 +8,12 @@ import (
 	"net/http"
 )
 
-func newInferenceUpstreamContext(streaming bool) (context.Context, context.CancelFunc) {
+func (h *ProxyHandler) newInferenceUpstreamContext(streaming bool) (context.Context, context.CancelFunc) {
 	// Use background context with timeout to avoid cancellation from client
 	// disconnects while still preventing goroutine leaks on upstream hangs.
 	timeout := upstreamTimeout
 	if streaming {
-		timeout = streamingUpstreamTimeout
+		timeout = h.effectiveStreamingUpstreamTimeout()
 	}
 	return context.WithTimeout(context.Background(), timeout)
 }

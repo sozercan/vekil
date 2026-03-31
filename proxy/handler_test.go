@@ -691,6 +691,34 @@ func TestHandleResponses_UpstreamDeadlineDependsOnStreamFlag(t *testing.T) {
 
 		assertDeadlineApprox(t, <-deadlineCh, streamingUpstreamTimeout)
 	})
+
+	t.Run("streaming uses configured timeout", func(t *testing.T) {
+		const customTimeout = 17 * time.Minute
+
+		deadlineCh := make(chan time.Duration, 1)
+		handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			deadline, ok := r.Context().Deadline()
+			if !ok {
+				t.Fatal("expected upstream request deadline")
+			}
+			deadlineCh <- time.Until(deadline)
+			return sseHTTPResponse("data: {\"id\":\"resp-stream-custom\",\"object\":\"response\",\"status\":\"in_progress\"}\n\ndata: [DONE]\n\n"), nil
+		}))
+		WithStreamingUpstreamTimeout(customTimeout)(handler)
+
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4","input":"Hello","stream":true}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		handler.HandleResponses(w, req)
+
+		if resp := w.Result(); resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+		}
+
+		assertDeadlineApprox(t, <-deadlineCh, customTimeout)
+	})
 }
 
 func TestHandleResponses_LargeBodyStillRejected(t *testing.T) {

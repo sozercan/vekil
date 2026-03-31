@@ -137,7 +137,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	upstreamCtx, upstreamCancel := newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 
 	resp, err := h.postChatCompletions(upstreamCtx, token, oaiBody)
@@ -193,7 +193,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 
 	bodyBytes, mode := prepareOpenAIChatCompletionsRequest(bodyBytes)
 
-	upstreamCtx, upstreamCancel := newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 
 	resp, err := h.postChatCompletions(upstreamCtx, token, bodyBytes)

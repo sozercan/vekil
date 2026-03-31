@@ -9,6 +9,7 @@ import (
 
 	"github.com/sozercan/copilot-proxy/auth"
 	"github.com/sozercan/copilot-proxy/logger"
+	"github.com/sozercan/copilot-proxy/proxy"
 )
 
 func TestStart_ReturnsErrorWhenPortInUse(t *testing.T) {
@@ -50,5 +51,39 @@ func TestNew_ConfiguresExtendedWriteTimeout(t *testing.T) {
 
 	if got, want := srv.httpServer.WriteTimeout, 65*time.Minute; got != want {
 		t.Fatalf("WriteTimeout = %v, want %v", got, want)
+	}
+}
+
+func TestNew_DerivesWriteTimeoutFromConfiguredProxyHandler(t *testing.T) {
+	const customTimeout = 17 * time.Minute
+
+	tests := []struct {
+		name string
+		opts []Option
+	}{
+		{
+			name: "server wrapper",
+			opts: []Option{WithStreamingUpstreamTimeout(customTimeout)},
+		},
+		{
+			name: "proxy option",
+			opts: []Option{WithProxyOptions(proxy.WithStreamingUpstreamTimeout(customTimeout))},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := New(
+				auth.NewTestAuthenticator("test-token"),
+				logger.New(logger.ParseLevel("error")),
+				"127.0.0.1",
+				"0",
+				tc.opts...,
+			)
+
+			if got, want := srv.httpServer.WriteTimeout, customTimeout+5*time.Minute; got != want {
+				t.Fatalf("WriteTimeout = %v, want %v", got, want)
+			}
+		})
 	}
 }
