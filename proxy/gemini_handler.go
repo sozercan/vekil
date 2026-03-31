@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -94,7 +93,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		return
 	}
 
-	upstreamCtx, upstreamCancel := context.WithTimeout(context.Background(), upstreamTimeout)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(stream || forceStream)
 	defer upstreamCancel()
 
 	resp, err := h.postChatCompletions(upstreamCtx, token, oaiBody)
@@ -272,7 +271,7 @@ func (h *ProxyHandler) runGeminiCountTokensProbe(token string, baseReq *models.O
 }
 
 func (h *ProxyHandler) executeGeminiCountTokensProbe(token string, probeReq *models.OpenAIRequest) (*models.OpenAIResponse, bool, error) {
-	upstreamCtx, upstreamCancel := context.WithTimeout(context.Background(), upstreamTimeout)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
 
 	body, err := json.Marshal(probeReq)
@@ -298,7 +297,7 @@ func (h *ProxyHandler) executeGeminiCountTokensProbe(token string, probeReq *mod
 }
 
 func (h *ProxyHandler) executeGeminiCountTokensProbeFinal(token string, probeReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
-	upstreamCtx, upstreamCancel := context.WithTimeout(context.Background(), upstreamTimeout)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
 
 	body, err := json.Marshal(probeReq)

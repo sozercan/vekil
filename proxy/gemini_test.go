@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sozercan/copilot-proxy/models"
 )
@@ -1396,6 +1397,46 @@ func TestHandleGeminiModelsGenerateContent(t *testing.T) {
 	if geminiResp.UsageMetadata == nil || geminiResp.UsageMetadata.TotalTokenCount != 13 {
 		t.Errorf("UsageMetadata = %#v, want totalTokenCount=13", geminiResp.UsageMetadata)
 	}
+}
+
+func TestHandleGeminiModelsGenerateContent_ForcedStreamingUsesStreamingUpstreamTimeout(t *testing.T) {
+	deadlineCh := make(chan time.Duration, 1)
+	handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		deadline, ok := r.Context().Deadline()
+		if !ok {
+			t.Fatal("expected upstream request deadline")
+		}
+		deadlineCh <- time.Until(deadline)
+
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+		if oaiReq.Stream == nil || !*oaiReq.Stream {
+			t.Fatal("expected proxy to force upstream stream=true for Gemini tool calls")
+		}
+
+		return sseHTTPResponse("data: {\"id\":\"chatcmpl-gemini-deadline\",\"model\":\"gemini-2.5-pro\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello from Gemini\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-gemini-deadline\",\"model\":\"gemini-2.5-pro\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4,\"total_tokens\":13}}\n\ndata: [DONE]\n\n"), nil
+	}))
+
+	reqBody := `{
+		"model": "models/gemini-2.5-pro",
+		"contents": [{"role":"user","parts":[{"text":"Hi"}]}],
+		"tools": [{"functionDeclarations":[{"name":"lookup_weather","parameters":{"type":"object"}}]}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/models/models/gemini-2.5-pro:generateContent", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleGeminiModels(w, req)
+
+	if resp := w.Result(); resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, string(body))
+	}
+
+	assertDeadlineApprox(t, <-deadlineCh, streamingUpstreamTimeout)
 }
 
 func TestHandleGeminiModelsGenerateContentIgnoresTopKAndThinkingConfig(t *testing.T) {

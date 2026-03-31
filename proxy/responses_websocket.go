@@ -277,7 +277,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return err
 	}
 
-	upstreamCtx, upstreamCancel := newInferenceUpstreamContext()
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
 	defer upstreamCancel()
 
 	resp, deltaAttempted, deltaFallback, err := s.postCreateRequest(h, upstreamCtx, token, request, plan)
@@ -427,7 +427,7 @@ func (s *responsesWebSocketSession) rememberResponse(resetHistory bool, response
 }
 
 func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, token string, request *responsesWebSocketCreateRequest, metrics responsesWebSocketRequestMetrics) responsesWebSocketRequestMetrics {
-	ctx, cancel := newInferenceUpstreamContext()
+	ctx, cancel := h.newInferenceUpstreamContext(false)
 	defer cancel()
 
 	compaction, compacted, err := s.compactHistory(h, ctx, token, request, false)

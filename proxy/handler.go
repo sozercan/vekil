@@ -31,8 +31,10 @@ const (
 	// ceiling because they can legitimately contain full session histories or
 	// trace bundles that need to be summarized.
 	maxLargeRequestBodySize = 64 << 20
-	// upstreamTimeout is the timeout for LLM inference requests.
+	// upstreamTimeout is the timeout for non-streaming LLM inference requests.
 	upstreamTimeout = 5 * time.Minute
+	// streamingUpstreamTimeout gives streaming inference enough time to finish.
+	streamingUpstreamTimeout = 60 * time.Minute
 	// readyzUpstreamTimeout bounds readiness probes that validate upstream reachability.
 	readyzUpstreamTimeout = 10 * time.Second
 	// modelsUpstreamTimeout is the timeout for the /models metadata request.
@@ -176,16 +178,17 @@ func (c ResponsesWebSocketConfig) autoCompactEnabled() bool {
 
 // ProxyHandler holds dependencies for all HTTP handlers.
 type ProxyHandler struct {
-	auth           *auth.Authenticator
-	client         *http.Client
-	copilotURL     string
-	copilotHeaders CopilotHeaderConfig
-	responsesWS    ResponsesWebSocketConfig
-	log            *logger.Logger
-	maxRetries     int
-	retryBaseDelay time.Duration
-	models         modelsCache
-	geminiCounts   geminiCountTokensCache
+	auth                     *auth.Authenticator
+	client                   *http.Client
+	copilotURL               string
+	copilotHeaders           CopilotHeaderConfig
+	responsesWS              ResponsesWebSocketConfig
+	streamingUpstreamTimeout time.Duration
+	log                      *logger.Logger
+	maxRetries               int
+	retryBaseDelay           time.Duration
+	models                   modelsCache
+	geminiCounts             geminiCountTokensCache
 }
 
 // Option customizes ProxyHandler behavior.
@@ -207,6 +210,27 @@ func WithResponsesWebSocketConfig(cfg ResponsesWebSocketConfig) Option {
 	}
 }
 
+func normalizeStreamingUpstreamTimeout(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return streamingUpstreamTimeout
+	}
+	return timeout
+}
+
+// DefaultStreamingUpstreamTimeout returns the default timeout used for
+// streaming upstream inference requests.
+func DefaultStreamingUpstreamTimeout() time.Duration {
+	return streamingUpstreamTimeout
+}
+
+// WithStreamingUpstreamTimeout overrides the timeout used for streaming
+// upstream inference requests. Non-positive values fall back to the default.
+func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
+	return func(h *ProxyHandler) {
+		h.streamingUpstreamTimeout = normalizeStreamingUpstreamTimeout(timeout)
+	}
+}
+
 // NewProxyHandler creates a ProxyHandler with connection pooling and HTTP/2.
 func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) *ProxyHandler {
 	h := &ProxyHandler{
@@ -221,10 +245,11 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 				TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
 			},
 		},
-		copilotURL:     "https://api.githubcopilot.com",
-		copilotHeaders: DefaultCopilotHeaderConfig(),
-		responsesWS:    DefaultResponsesWebSocketConfig(),
-		log:            log,
+		copilotURL:               "https://api.githubcopilot.com",
+		copilotHeaders:           DefaultCopilotHeaderConfig(),
+		responsesWS:              DefaultResponsesWebSocketConfig(),
+		streamingUpstreamTimeout: streamingUpstreamTimeout,
+		log:                      log,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -236,6 +261,19 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 
 func (h *ProxyHandler) responsesWebSocketConfig() ResponsesWebSocketConfig {
 	return h.responsesWS.withDefaults()
+}
+
+func (h *ProxyHandler) effectiveStreamingUpstreamTimeout() time.Duration {
+	if h == nil {
+		return DefaultStreamingUpstreamTimeout()
+	}
+	return normalizeStreamingUpstreamTimeout(h.streamingUpstreamTimeout)
+}
+
+// ServerWriteTimeout returns the HTTP server write timeout derived from the
+// configured streaming upstream timeout plus the non-streaming request budget.
+func (h *ProxyHandler) ServerWriteTimeout() time.Duration {
+	return h.effectiveStreamingUpstreamTimeout() + upstreamTimeout
 }
 
 func setCopilotHeaders(req *http.Request, token string) {

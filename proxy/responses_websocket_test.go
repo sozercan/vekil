@@ -124,6 +124,51 @@ func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 	}
 }
 
+func TestHandleResponsesWebSocket_CreateRequestUsesStreamingUpstreamTimeout(t *testing.T) {
+	deadlineCh := make(chan time.Duration, 1)
+	handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		deadline, ok := r.Context().Deadline()
+		if !ok {
+			t.Fatal("expected upstream request deadline")
+		}
+		deadlineCh <- time.Until(deadline)
+
+		return sseHTTPResponse(
+			"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-deadline\"}}\n\n" +
+				"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-deadline\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n",
+		), nil
+	}))
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+
+	created := mustReadWebSocketJSON(t, conn)
+	if created["type"] != "response.created" {
+		t.Fatalf("expected first event to be response.created, got %v", created["type"])
+	}
+	completed := mustReadWebSocketJSON(t, conn)
+	if completed["type"] != "response.completed" {
+		t.Fatalf("expected second event to be response.completed, got %v", completed["type"])
+	}
+
+	assertDeadlineApprox(t, <-deadlineCh, streamingUpstreamTimeout)
+}
+
 func TestHandleResponsesWebSocket_WarmupStaysLocalAndNextRequestExpandsState(t *testing.T) {
 	var upstreamRequests int
 	var upstreamBody map[string]interface{}
