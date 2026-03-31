@@ -8,10 +8,14 @@ import (
 	"net/http"
 )
 
-func newInferenceUpstreamContext() (context.Context, context.CancelFunc) {
+func newInferenceUpstreamContext(streaming bool) (context.Context, context.CancelFunc) {
 	// Use background context with timeout to avoid cancellation from client
 	// disconnects while still preventing goroutine leaks on upstream hangs.
-	return context.WithTimeout(context.Background(), upstreamTimeout)
+	timeout := upstreamTimeout
+	if streaming {
+		timeout = streamingUpstreamTimeout
+	}
+	return context.WithTimeout(context.Background(), timeout)
 }
 
 func upstreamStatusCode(err error, fallback int) int {

@@ -49,7 +49,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	extraHeaders := responsesExtraHeadersFromRequest(r)
 
-	upstreamCtx, upstreamCancel := newInferenceUpstreamContext()
+	upstreamCtx, upstreamCancel := newInferenceUpstreamContext(isStreaming)
 	defer upstreamCancel()
 
 	resp, err := h.postResponsesWithHeaders(upstreamCtx, token, bodyBytes, extraHeaders)
@@ -121,7 +121,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	body["instructions"] = prompt
 	bodyBytes, _ = json.Marshal(body)
 
-	upstreamCtx, upstreamCancel := newInferenceUpstreamContext()
+	upstreamCtx, upstreamCancel := newInferenceUpstreamContext(false)
 	defer upstreamCancel()
 
 	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, token, bodyBytes, responsesExtraHeadersFromRequest(r))
@@ -242,7 +242,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	}
 	reqBody, _ := json.Marshal(responsesReq)
 
-	upstreamCtx, upstreamCancel := newInferenceUpstreamContext()
+	upstreamCtx, upstreamCancel := newInferenceUpstreamContext(false)
 	defer upstreamCancel()
 
 	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, token, reqBody, responsesExtraHeadersFromRequest(r))

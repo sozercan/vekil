@@ -40,6 +40,45 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+func newRoundTripTestProxyHandler(t testing.TB, transport roundTripFunc) *ProxyHandler {
+	t.Helper()
+	return &ProxyHandler{
+		auth:           auth.NewTestAuthenticator("test-token"),
+		client:         &http.Client{Transport: transport},
+		copilotURL:     "http://upstream.test",
+		log:            logger.New(logger.LevelInfo),
+		retryBaseDelay: 1 * time.Millisecond,
+	}
+}
+
+func assertDeadlineApprox(t *testing.T, got, want time.Duration) {
+	t.Helper()
+	const tolerance = 15 * time.Second
+	if got < want-tolerance || got > want+tolerance {
+		t.Fatalf("deadline remaining = %v, want about %v", got, want)
+	}
+}
+
+func jsonHTTPResponse(body string) *http.Response {
+	h := make(http.Header)
+	h.Set("Content-Type", "application/json")
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     h,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func sseHTTPResponse(body string) *http.Response {
+	h := make(http.Header)
+	h.Set("Content-Type", "text/event-stream")
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     h,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
 func assertOnlySubagentHeaderForwarded(t testing.TB, r *http.Request, want string) {
 	t.Helper()
 	if got := r.Header.Get("X-OpenAI-Subagent"); got != want {
@@ -600,6 +639,58 @@ func TestHandleResponses(t *testing.T) {
 	if result["id"] != "resp-123" {
 		t.Errorf("expected id resp-123, got %v", result["id"])
 	}
+}
+
+func TestHandleResponses_UpstreamDeadlineDependsOnStreamFlag(t *testing.T) {
+	t.Run("non-streaming", func(t *testing.T) {
+		deadlineCh := make(chan time.Duration, 1)
+		handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			deadline, ok := r.Context().Deadline()
+			if !ok {
+				t.Fatal("expected upstream request deadline")
+			}
+			deadlineCh <- time.Until(deadline)
+			return jsonHTTPResponse(`{"id":"resp-non-stream","object":"response","status":"completed"}`), nil
+		}))
+
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4","input":"Hello","stream":false}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		handler.HandleResponses(w, req)
+
+		if resp := w.Result(); resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+		}
+
+		assertDeadlineApprox(t, <-deadlineCh, upstreamTimeout)
+	})
+
+	t.Run("streaming", func(t *testing.T) {
+		deadlineCh := make(chan time.Duration, 1)
+		handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			deadline, ok := r.Context().Deadline()
+			if !ok {
+				t.Fatal("expected upstream request deadline")
+			}
+			deadlineCh <- time.Until(deadline)
+			return sseHTTPResponse("data: {\"id\":\"resp-stream\",\"object\":\"response\",\"status\":\"in_progress\"}\n\ndata: [DONE]\n\n"), nil
+		}))
+
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4","input":"Hello","stream":true}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		handler.HandleResponses(w, req)
+
+		if resp := w.Result(); resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+		}
+
+		assertDeadlineApprox(t, <-deadlineCh, streamingUpstreamTimeout)
+	})
 }
 
 func TestHandleResponses_LargeBodyStillRejected(t *testing.T) {
@@ -3018,6 +3109,42 @@ func TestOpenAIChatCompletions_InjectsParallelToolCalls(t *testing.T) {
 		body, _ := io.ReadAll(w.Result().Body)
 		t.Fatalf("expected 200, got %d: %s", w.Result().StatusCode, body)
 	}
+}
+
+func TestHandleOpenAIChatCompletions_ForcedStreamingUsesStreamingUpstreamTimeout(t *testing.T) {
+	deadlineCh := make(chan time.Duration, 1)
+	handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		deadline, ok := r.Context().Deadline()
+		if !ok {
+			t.Fatal("expected upstream request deadline")
+		}
+		deadlineCh <- time.Until(deadline)
+
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+		if oaiReq.Stream == nil || !*oaiReq.Stream {
+			t.Fatal("expected proxy to force upstream stream=true when tools are present")
+		}
+
+		return sseHTTPResponse("data: {\"id\":\"chatcmpl-deadline\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-deadline\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"), nil
+	}))
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	if resp := w.Result(); resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	assertDeadlineApprox(t, <-deadlineCh, streamingUpstreamTimeout)
 }
 
 func TestOpenAIChatCompletions_EmptyToolsDoesNotForceStreaming(t *testing.T) {

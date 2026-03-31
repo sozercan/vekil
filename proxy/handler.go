@@ -31,8 +31,10 @@ const (
 	// ceiling because they can legitimately contain full session histories or
 	// trace bundles that need to be summarized.
 	maxLargeRequestBodySize = 64 << 20
-	// upstreamTimeout is the timeout for LLM inference requests.
+	// upstreamTimeout is the timeout for non-streaming LLM inference requests.
 	upstreamTimeout = 5 * time.Minute
+	// streamingUpstreamTimeout gives streaming inference enough time to finish.
+	streamingUpstreamTimeout = 60 * time.Minute
 	// readyzUpstreamTimeout bounds readiness probes that validate upstream reachability.
 	readyzUpstreamTimeout = 10 * time.Second
 	// modelsUpstreamTimeout is the timeout for the /models metadata request.

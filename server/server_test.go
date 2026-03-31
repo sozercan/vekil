@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sozercan/copilot-proxy/auth"
 	"github.com/sozercan/copilot-proxy/logger"
@@ -36,5 +37,18 @@ func TestStart_ReturnsErrorWhenPortInUse(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "address already in use") {
 		t.Fatalf("expected address-in-use error, got %v", err)
+	}
+}
+
+func TestNew_ConfiguresExtendedWriteTimeout(t *testing.T) {
+	srv := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+	)
+
+	if got, want := srv.httpServer.WriteTimeout, 65*time.Minute; got != want {
+		t.Fatalf("WriteTimeout = %v, want %v", got, want)
 	}
 }

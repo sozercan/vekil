@@ -77,7 +77,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 			Addr:         addr,
 			Handler:      mux,
 			ReadTimeout:  30 * time.Second,
-			WriteTimeout: 5 * time.Minute,
+			WriteTimeout: 65 * time.Minute,
 			IdleTimeout:  120 * time.Second,
 		},
 		log: log,
