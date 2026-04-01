@@ -147,7 +147,7 @@ func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.R
 
 func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *responsesWebSocketSession {
 	baseHeaders := make(http.Header)
-	for _, name := range []string{"X-Codex-Beta-Features", "X-Codex-Turn-Metadata", "OpenAI-Beta"} {
+	for _, name := range []string{"X-Codex-Beta-Features", "X-Codex-Turn-Metadata", "OpenAI-Beta", "session_id", "X-Client-Request-Id"} {
 		for _, value := range r.Header.Values(name) {
 			baseHeaders.Add(name, value)
 		}
@@ -580,16 +580,6 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, heade
 		})
 	}
 
-	// Emit rate-limit headers as a codex.rate_limits frame. The Codex CLI
-	// only parses rate limits from frames with type=codex.rate_limits (the
-	// frame loop and parse_rate_limit_event both guard on this type).
-	if rateLimitHeaders := responsesWebSocketRateLimitHeaders(headers); len(rateLimitHeaders) > 0 {
-		_ = s.writeJSON(map[string]interface{}{
-			"type":    "codex.rate_limits",
-			"headers": rateLimitHeaders,
-		})
-	}
-
 	var responseID string
 	var outputItems []json.RawMessage
 	sawCompleted := false
@@ -758,61 +748,26 @@ func flattenResponsesWebSocketHeaders(headers http.Header) map[string]interface{
 
 // responsesWebSocketMetadataHeaders extracts headers that are meaningful to
 // Codex CLI WebSocket clients via the codex.response.metadata frame. The CLI
-// only parses openai-model from metadata frames (via response_model()); other
-// headers like x-reasoning-included and x-models-etag are only read from the
-// HTTP upgrade response which this proxy cannot influence post-upgrade.
+// parses openai-model from metadata frames using case-insensitive comparison
+// (eq_ignore_ascii_case in response_model()); we use lowercase keys to match
+// the wire format the real OpenAI backend uses.
 func responsesWebSocketMetadataHeaders(headers http.Header) map[string]interface{} {
 	if len(headers) == 0 {
 		return nil
 	}
 
 	result := make(map[string]interface{}, 2)
-	for _, key := range []string{
-		"Openai-Model",
-		"X-Openai-Model",
-	} {
-		if value := headers.Get(key); value != "" {
-			result[key] = value
-		}
+	// Go's Header.Get is case-insensitive, but we store the JSON key in
+	// lowercase to match what the real OpenAI backend sends.
+	if value := headers.Get("Openai-Model"); value != "" {
+		result["openai-model"] = value
+	}
+	if value := headers.Get("X-Openai-Model"); value != "" {
+		result["x-openai-model"] = value
 	}
 
 	if len(result) == 0 {
 		return nil
-	}
-	return result
-}
-
-// responsesWebSocketRateLimitHeaders extracts x-codex-* rate-limit headers
-// from upstream response headers and formats them for a codex.rate_limits
-// frame. The Codex CLI only parses rate limits from frames with
-// type=codex.rate_limits (double-guarded in the frame loop and in
-// parse_rate_limit_event), so these must be emitted as a separate frame.
-// Non-rate-limit headers that share the x-codex- prefix (like
-// X-Codex-Turn-State and X-Codex-Beta-Features) are excluded.
-func responsesWebSocketRateLimitHeaders(headers http.Header) map[string]interface{} {
-	if len(headers) == 0 {
-		return nil
-	}
-
-	var result map[string]interface{}
-	for key, values := range headers {
-		canonical := http.CanonicalHeaderKey(key)
-		lower := strings.ToLower(canonical)
-		if !strings.HasPrefix(lower, "x-codex-") {
-			continue
-		}
-		// Skip non-rate-limit headers that share the x-codex- prefix.
-		if lower == "x-codex-turn-state" || lower == "x-codex-beta-features" || lower == "x-codex-turn-metadata" {
-			continue
-		}
-		if result == nil {
-			result = make(map[string]interface{}, 4)
-		}
-		if len(values) == 1 {
-			result[canonical] = values[0]
-		} else if len(values) > 1 {
-			result[canonical] = strings.Join(values, ", ")
-		}
 	}
 	return result
 }

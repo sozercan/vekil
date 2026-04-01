@@ -950,8 +950,9 @@ func TestHandleResponsesWebSocket_RelaysUpstreamHeadersOnSuccess(t *testing.T) {
 		t.Fatalf("failed to write websocket request: %v", err)
 	}
 
-	// First frame: codex.response.metadata with only openai-model (the only
-	// header the Codex CLI parses from metadata frames).
+	// First frame: codex.response.metadata with openai-model in lowercase
+	// (the only header the Codex CLI parses from metadata frames via
+	// response_model() using case-insensitive comparison).
 	metadata := mustReadWebSocketJSON(t, conn)
 	if metadata["type"] != "codex.response.metadata" {
 		t.Fatalf("expected codex.response.metadata, got %v", metadata["type"])
@@ -960,8 +961,8 @@ func TestHandleResponsesWebSocket_RelaysUpstreamHeadersOnSuccess(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected headers map in metadata, got %T", metadata["headers"])
 	}
-	if got := metaHeaders["Openai-Model"]; got != "gpt-5.4-actual" {
-		t.Fatalf("expected Openai-Model header, got %v", got)
+	if got := metaHeaders["openai-model"]; got != "gpt-5.4-actual" {
+		t.Fatalf("expected openai-model header, got %v", got)
 	}
 	// X-Reasoning-Included and X-Models-Etag should NOT be in the metadata
 	// frame — the Codex CLI only reads them from HTTP upgrade headers.
@@ -970,19 +971,6 @@ func TestHandleResponsesWebSocket_RelaysUpstreamHeadersOnSuccess(t *testing.T) {
 	}
 	if _, found := metaHeaders["X-Models-Etag"]; found {
 		t.Fatalf("X-Models-Etag should not be in metadata frame")
-	}
-
-	// Second frame: codex.rate_limits with rate-limit headers.
-	rateLimits := mustReadWebSocketJSON(t, conn)
-	if rateLimits["type"] != "codex.rate_limits" {
-		t.Fatalf("expected codex.rate_limits, got %v", rateLimits["type"])
-	}
-	rlHeaders, ok := rateLimits["headers"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("expected headers map in rate_limits, got %T", rateLimits["headers"])
-	}
-	if got := rlHeaders["X-Codex-Primary-Used-Percent"]; got != "42.5" {
-		t.Fatalf("expected X-Codex-Primary-Used-Percent header, got %v", got)
 	}
 
 	// Remaining frames are the normal SSE stream.
@@ -1029,6 +1017,47 @@ func TestHandleResponsesWebSocket_ForwardsOpenAIBetaHeader(t *testing.T) {
 
 	if gotOpenAIBeta != "responses_websockets=2026-02-06" {
 		t.Fatalf("expected OpenAI-Beta header to be forwarded upstream, got %q", gotOpenAIBeta)
+	}
+}
+
+func TestHandleResponsesWebSocket_ForwardsSessionAndClientRequestHeaders(t *testing.T) {
+	var gotSessionID, gotClientRequestID string
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		gotSessionID = r.Header.Get("session_id")
+		gotClientRequestID = r.Header.Get("X-Client-Request-Id")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-sess\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-sess\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, http.Header{
+		"session_id":           []string{"conv-123"},
+		"X-Client-Request-Id": []string{"req-456"},
+	})
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+
+	_ = mustReadWebSocketJSON(t, conn) // response.created
+	_ = mustReadWebSocketJSON(t, conn) // response.completed
+
+	if gotSessionID != "conv-123" {
+		t.Fatalf("expected session_id to be forwarded upstream, got %q", gotSessionID)
+	}
+	if gotClientRequestID != "req-456" {
+		t.Fatalf("expected X-Client-Request-Id to be forwarded upstream, got %q", gotClientRequestID)
 	}
 }
 
