@@ -651,7 +651,7 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 		gotSessionID = r.Header.Get("Session-Id")
 		gotClientRequestID = r.Header.Get("X-Client-Request-Id")
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"id":"resp-headers","object":"response","status":"completed"}`))
+		_, _ = w.Write([]byte(`{"id":"resp-headers","object":"response","status":"completed"}`))
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4","input":"Hello"}`))
