@@ -468,7 +468,8 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error")
+		h.log.Error("failed to get token", logger.F("endpoint", "models"), logger.Err(err))
+		writeOpenAIError(w, http.StatusInternalServerError, "authentication failed", "server_error")
 		return
 	}
 
@@ -492,7 +493,8 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.client.Do(req)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, fmt.Sprintf("upstream request failed: %v", err), "server_error")
+		h.log.Error("upstream request failed", logger.F("endpoint", "models"), logger.Err(err))
+		writeOpenAIError(w, http.StatusBadGateway, "upstream request failed", "server_error")
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()

@@ -326,7 +326,10 @@ func TestLoadCopilotToken_Expired(t *testing.T) {
 }
 
 func TestNewAuthenticator_DefaultDir(t *testing.T) {
-	a := NewAuthenticator("")
+	a, err := NewAuthenticator("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if a.tokenDir == "" {
 		t.Fatal("expected tokenDir to be set")
 	}
@@ -334,7 +337,10 @@ func TestNewAuthenticator_DefaultDir(t *testing.T) {
 
 func TestNewAuthenticator_CustomDir(t *testing.T) {
 	dir := t.TempDir()
-	a := NewAuthenticator(dir)
+	a, err := NewAuthenticator(dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if a.tokenDir != dir {
 		t.Errorf("expected %q, got %q", dir, a.tokenDir)
 	}

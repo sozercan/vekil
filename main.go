@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"strconv"
@@ -34,7 +35,10 @@ func main() {
 
 	log := logger.New(logger.ParseLevel(*logLevel))
 
-	authenticator := auth.NewAuthenticator(*tokenDir)
+	authenticator, err := auth.NewAuthenticator(*tokenDir)
+	if err != nil {
+		log.Fatal("failed to initialize authenticator", logger.Err(err))
+	}
 
 	log.Info("authenticating with GitHub Copilot...")
 	ctx := context.Background()
@@ -96,6 +100,7 @@ func getEnvBool(key string, fallback bool) bool {
 	}
 	parsed, err := strconv.ParseBool(v)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -108,6 +113,7 @@ func getEnvInt(key string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(v)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -120,6 +126,7 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	}
 	parsed, err := time.ParseDuration(v)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
