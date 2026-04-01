@@ -102,11 +102,11 @@ func TestGetEnvWarnsOnInvalidValue(t *testing.T) {
 	t.Setenv(envKey, "not-a-bool")
 	getEnvBool(envKey, false)
 
-	w.Close()
+	_ = w.Close()
 	os.Stderr = old
 
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	_, _ = buf.ReadFrom(r)
 	output := buf.String()
 
 	want := fmt.Sprintf("warning: ignoring invalid %s=%q", envKey, "not-a-bool")
