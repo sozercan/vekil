@@ -2,7 +2,7 @@ BINARY := copilot-proxy
 LDFLAGS := -s -w
 APP_NAME := Copilot Proxy.app
 APP_BUNDLE_ID := com.copilot-proxy.menubar
-VERSION ?= 0.0.0
+VERSION ?= dev-$(shell git rev-parse --short HEAD)
 APP_VERSION := $(patsubst v%,%,$(VERSION))
 
 .PHONY: build build-app test vet lint clean docker-build
