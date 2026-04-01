@@ -633,7 +633,7 @@ func TestHandleResponsesWebSocket_TurnStateDeltaReplayUsesOnlyCurrentInputAndIgn
 		t.Fatalf("failed to write first request: %v", err)
 	}
 
-	firstCreated := mustReadWebSocketJSON(t, conn)
+	firstCreated := mustReadWebSocketJSONSkipMetadata(t, conn)
 	_ = mustReadWebSocketJSON(t, conn)
 	_ = mustReadWebSocketJSON(t, conn)
 
@@ -654,7 +654,7 @@ func TestHandleResponsesWebSocket_TurnStateDeltaReplayUsesOnlyCurrentInputAndIgn
 		t.Fatalf("failed to write second request: %v", err)
 	}
 
-	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSONSkipMetadata(t, conn)
 	_ = mustReadWebSocketJSON(t, conn)
 
 	if len(upstreamRequests) != 2 {
@@ -730,7 +730,7 @@ func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing
 		t.Fatalf("failed to write first request: %v", err)
 	}
 
-	firstCreated := mustReadWebSocketJSON(t, conn)
+	firstCreated := mustReadWebSocketJSONSkipMetadata(t, conn)
 	_ = mustReadWebSocketJSON(t, conn)
 	_ = mustReadWebSocketJSON(t, conn)
 
@@ -748,7 +748,7 @@ func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing
 		t.Fatalf("failed to write second request: %v", err)
 	}
 
-	created := mustReadWebSocketJSON(t, conn)
+	created := mustReadWebSocketJSONSkipMetadata(t, conn)
 	completed := mustReadWebSocketJSON(t, conn)
 	if created["type"] != "response.created" {
 		t.Fatalf("expected fallback response.created event, got %v", created["type"])
@@ -770,6 +770,252 @@ func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing
 	}
 	if got := inputTextFromMessage(t, fallbackInput[2]); got != "follow up" {
 		t.Fatalf("expected fallback replay to include latest user turn, got %q", got)
+	}
+}
+
+func TestHandleResponsesWebSocket_ResponseFailedIsTerminal(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-fail\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-fail\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"context too long\"}}}\n\n")
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+
+	// Should receive the response.created event.
+	created := mustReadWebSocketJSON(t, conn)
+	if created["type"] != "response.created" {
+		t.Fatalf("expected response.created, got %v", created["type"])
+	}
+
+	// Should receive the response.failed event relayed from upstream.
+	failed := mustReadWebSocketJSON(t, conn)
+	if failed["type"] != "response.failed" {
+		t.Fatalf("expected response.failed, got %v", failed["type"])
+	}
+
+	// The connection should close without a proxy-generated error frame.
+	// If the proxy sent a second error, we'd read it here.
+	if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatalf("failed to set read deadline: %v", err)
+	}
+	_, _, err := conn.ReadMessage()
+	if err == nil {
+		t.Fatalf("expected connection to close after response.failed, but got another message")
+	}
+}
+
+func TestHandleResponsesWebSocket_ResponseIncompleteIsTerminal(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-inc\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-inc\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n")
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+
+	created := mustReadWebSocketJSON(t, conn)
+	if created["type"] != "response.created" {
+		t.Fatalf("expected response.created, got %v", created["type"])
+	}
+
+	incomplete := mustReadWebSocketJSON(t, conn)
+	if incomplete["type"] != "response.incomplete" {
+		t.Fatalf("expected response.incomplete, got %v", incomplete["type"])
+	}
+
+	// No proxy-generated error frame should follow.
+	if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatalf("failed to set read deadline: %v", err)
+	}
+	_, _, err := conn.ReadMessage()
+	if err == nil {
+		t.Fatalf("expected connection to close after response.incomplete, but got another message")
+	}
+}
+
+func TestHandleResponsesWebSocket_ResponseFailedExitsImmediatelyOnStalledUpstream(t *testing.T) {
+	// Regression test: if upstream emits response.failed and then stalls
+	// (keeps the body open), the proxy should exit the SSE loop immediately
+	// rather than blocking until EOF or the 60-minute timeout.
+	stallReleased := make(chan struct{})
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-stall\"}}\n\n")
+		flusher.Flush()
+		_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-stall\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"context too long\"}}}\n\n")
+		flusher.Flush()
+		// Stall: keep the body open until the test signals release.
+		<-stallReleased
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() {
+		_ = conn.Close()
+		close(stallReleased)
+	}()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+
+	created := mustReadWebSocketJSON(t, conn)
+	if created["type"] != "response.created" {
+		t.Fatalf("expected response.created, got %v", created["type"])
+	}
+
+	failed := mustReadWebSocketJSON(t, conn)
+	if failed["type"] != "response.failed" {
+		t.Fatalf("expected response.failed, got %v", failed["type"])
+	}
+
+	// The connection should close promptly without waiting for upstream EOF.
+	// Use a tight deadline: if the proxy blocked on the stalled body, this
+	// would time out at 2 seconds (mustReadWebSocketJSON's deadline).
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("failed to set read deadline: %v", err)
+	}
+	_, _, err := conn.ReadMessage()
+	if err == nil {
+		t.Fatalf("expected connection to close after response.failed on stalled upstream, but got another message")
+	}
+}
+
+func TestHandleResponsesWebSocket_RelaysUpstreamHeadersOnSuccess(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Openai-Model", "gpt-5.4-actual")
+		w.Header().Set("X-Reasoning-Included", "true")
+		w.Header().Set("X-Models-Etag", `"models-v42"`)
+		w.Header().Set("X-Codex-Primary-Used-Percent", "42.5")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-headers\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-headers\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+
+	// First frame should be the synthetic metadata event with upstream headers.
+	metadata := mustReadWebSocketJSON(t, conn)
+	if metadata["type"] != "codex.response.metadata" {
+		t.Fatalf("expected codex.response.metadata, got %v", metadata["type"])
+	}
+	headers, ok := metadata["headers"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected headers map in metadata, got %T", metadata["headers"])
+	}
+	if got := headers["Openai-Model"]; got != "gpt-5.4-actual" {
+		t.Fatalf("expected Openai-Model header, got %v", got)
+	}
+	if got := headers["X-Reasoning-Included"]; got != "true" {
+		t.Fatalf("expected X-Reasoning-Included header, got %v", got)
+	}
+	if got := headers["X-Models-Etag"]; got != `"models-v42"` {
+		t.Fatalf("expected X-Models-Etag header, got %v", got)
+	}
+	if got := headers["X-Codex-Primary-Used-Percent"]; got != "42.5" {
+		t.Fatalf("expected X-Codex-Primary-Used-Percent header, got %v", got)
+	}
+
+	// Next events are the normal SSE stream.
+	created := mustReadWebSocketJSON(t, conn)
+	if created["type"] != "response.created" {
+		t.Fatalf("expected response.created, got %v", created["type"])
+	}
+	completed := mustReadWebSocketJSON(t, conn)
+	if completed["type"] != "response.completed" {
+		t.Fatalf("expected response.completed, got %v", completed["type"])
+	}
+}
+
+func TestHandleResponsesWebSocket_ForwardsOpenAIBetaHeader(t *testing.T) {
+	var gotOpenAIBeta string
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		gotOpenAIBeta = r.Header.Get("OpenAI-Beta")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-beta\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-beta\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, http.Header{
+		"OpenAI-Beta": []string{"responses_websockets=2026-02-06"},
+	})
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+
+	_ = mustReadWebSocketJSON(t, conn) // response.created
+	_ = mustReadWebSocketJSON(t, conn) // response.completed
+
+	if gotOpenAIBeta != "responses_websockets=2026-02-06" {
+		t.Fatalf("expected OpenAI-Beta header to be forwarded upstream, got %q", gotOpenAIBeta)
 	}
 }
 
@@ -806,6 +1052,18 @@ func mustReadWebSocketJSON(t *testing.T, conn *websocket.Conn) map[string]interf
 		t.Fatalf("failed to decode websocket payload %s: %v", string(data), err)
 	}
 	return payload
+}
+
+// mustReadWebSocketJSONSkipMetadata reads the next WebSocket frame, skipping
+// over any synthetic codex.response.metadata frames injected by the proxy.
+func mustReadWebSocketJSONSkipMetadata(t *testing.T, conn *websocket.Conn) map[string]interface{} {
+	t.Helper()
+	for {
+		payload := mustReadWebSocketJSON(t, conn)
+		if payload["type"] != "codex.response.metadata" {
+			return payload
+		}
+	}
 }
 
 func newResponsesWebSocketCreateRequest(input []interface{}) map[string]interface{} {
