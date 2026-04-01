@@ -139,19 +139,19 @@ func parseSystemMessage(raw json.RawMessage) (*models.OpenAIMessage, error) {
 		return nil, fmt.Errorf("system is neither string nor []ContentBlock: %w", err)
 	}
 
-	var text string
+	var sb strings.Builder
 	for _, b := range blocks {
 		switch b.Type {
 		case "text":
-			text += b.Text
+			sb.WriteString(b.Text)
 		default:
 			return nil, fmt.Errorf("unsupported system content block type %q", b.Type)
 		}
 	}
-	if text == "" {
+	if sb.Len() == 0 {
 		return nil, nil
 	}
-	content, _ := json.Marshal(text)
+	content, _ := json.Marshal(sb.String())
 	return &models.OpenAIMessage{Role: "system", Content: content}, nil
 }
 
@@ -318,13 +318,13 @@ func extractToolResultContent(raw json.RawMessage) (string, error) {
 		return "", fmt.Errorf("tool_result content is neither string nor []ContentBlock: %w", err)
 	}
 
-	var text string
+	var sb strings.Builder
 	for _, b := range blocks {
 		if b.Type == "text" {
-			text += b.Text
+			sb.WriteString(b.Text)
 		}
 	}
-	return text, nil
+	return sb.String(), nil
 }
 
 func translateToolChoice(tc *models.AnthropicToolChoice) (json.RawMessage, error) {

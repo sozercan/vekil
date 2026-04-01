@@ -27,7 +27,8 @@ func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error")
+		h.log.Error("failed to get token", logger.F("endpoint", "responses"), logger.Err(err))
+		writeOpenAIError(w, http.StatusInternalServerError, "authentication failed", "server_error")
 		return
 	}
 
@@ -54,12 +55,14 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.postResponsesWithHeaders(upstreamCtx, token, bodyBytes, extraHeaders)
 	if err != nil {
-		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), fmt.Sprintf("upstream request failed: %v", err), "server_error")
+		h.log.Error("upstream request failed", logger.F("endpoint", "responses"), logger.Err(err))
+		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), "upstream request failed", "server_error")
 		return
 	}
 	resp, err = h.maybeRetryCompactedResponsesRequest(upstreamCtx, token, bodyBytes, extraHeaders, resp)
 	if err != nil {
-		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), fmt.Sprintf("upstream request failed: %v", err), "server_error")
+		h.log.Error("upstream request failed", logger.F("endpoint", "responses"), logger.Err(err))
+		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), "upstream request failed", "server_error")
 		return
 	}
 
@@ -98,7 +101,8 @@ Be concise, structured, and action-oriented. Do not chat with the user. Do not a
 func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error")
+		h.log.Error("failed to get token", logger.F("endpoint", "compact"), logger.Err(err))
+		writeOpenAIError(w, http.StatusInternalServerError, "authentication failed", "server_error")
 		return
 	}
 
@@ -126,7 +130,8 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, token, bodyBytes, responsesExtraHeadersFromRequest(r))
 	if err != nil {
-		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), fmt.Sprintf("upstream request failed: %v", err), "server_error")
+		h.log.Error("upstream request failed", logger.F("endpoint", "compact"), logger.Err(err))
+		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), "upstream request failed", "server_error")
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -199,7 +204,8 @@ Respond with a JSON array where each element has "trace_summary" and "memory_sum
 func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Request) {
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error")
+		h.log.Error("failed to get token", logger.F("endpoint", "memory_summarize"), logger.Err(err))
+		writeOpenAIError(w, http.StatusInternalServerError, "authentication failed", "server_error")
 		return
 	}
 
@@ -247,7 +253,8 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 
 	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, token, reqBody, responsesExtraHeadersFromRequest(r))
 	if err != nil {
-		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), fmt.Sprintf("upstream request failed: %v", err), "server_error")
+		h.log.Error("upstream request failed", logger.F("endpoint", "memory_summarize"), logger.Err(err))
+		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), "upstream request failed", "server_error")
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -320,7 +327,7 @@ func extractResponsesOutputText(body []byte) (string, error) {
 		return "", err
 	}
 
-	var text string
+	var sb strings.Builder
 	for _, item := range upstream.Output {
 		var outputItem struct {
 			Type    string `json:"type"`
@@ -337,12 +344,12 @@ func extractResponsesOutputText(body []byte) (string, error) {
 		}
 		for _, content := range outputItem.Content {
 			if (content.Type == "output_text" || content.Type == "text") && content.Text != "" {
-				text += content.Text
+				sb.WriteString(content.Text)
 			}
 		}
 	}
 
-	return sanitizeProxySummaryText(text), nil
+	return sanitizeProxySummaryText(sb.String()), nil
 }
 
 func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint string, injectResumePrompt bool) []byte {
@@ -636,7 +643,7 @@ func (h *ProxyHandler) pickResponsesCompatibleModel(ctx context.Context, token, 
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return "", fmt.Errorf("unexpected /models status %d: %s", resp.StatusCode, string(body))
 	}
 

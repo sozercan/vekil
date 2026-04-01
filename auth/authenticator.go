@@ -74,7 +74,7 @@ type CopilotTokenResponse struct {
 
 // NewAuthenticator creates an Authenticator that stores tokens in tokenDir.
 // If tokenDir is empty, it defaults to ~/.config/copilot-proxy.
-func NewAuthenticator(tokenDir string) *Authenticator {
+func NewAuthenticator(tokenDir string) (*Authenticator, error) {
 	if tokenDir == "" {
 		tokenDir = defaultTokenDir
 	}
@@ -84,14 +84,16 @@ func NewAuthenticator(tokenDir string) *Authenticator {
 			tokenDir = filepath.Join(home, tokenDir[1:])
 		}
 	}
-	_ = os.MkdirAll(tokenDir, 0o700)
+	if err := os.MkdirAll(tokenDir, 0o700); err != nil {
+		return nil, fmt.Errorf("creating token directory: %w", err)
+	}
 
 	return &Authenticator{
 		tokenDir: tokenDir,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-	}
+	}, nil
 }
 
 // IsSignedIn reports whether the authenticator has a GitHub access token
@@ -410,7 +412,7 @@ func (a *Authenticator) loadAccessToken() error {
 }
 
 func (a *Authenticator) saveAccessToken() error {
-	return os.WriteFile(filepath.Join(a.tokenDir, "access-token"), []byte(a.accessToken), 0o600)
+	return atomicWriteFile(filepath.Join(a.tokenDir, "access-token"), []byte(a.accessToken), 0o600)
 }
 
 func (a *Authenticator) loadCopilotToken() error {
@@ -438,7 +440,7 @@ func (a *Authenticator) saveCopilotToken() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(a.tokenDir, "api-key.json"), data, 0o600)
+	return atomicWriteFile(filepath.Join(a.tokenDir, "api-key.json"), data, 0o600)
 }
 
 func lookupAccessTokenFromEnv() (string, string) {
@@ -448,4 +450,36 @@ func lookupAccessTokenFromEnv() (string, string) {
 		}
 	}
 	return "", ""
+}
+
+// atomicWriteFile writes data to a temporary file in the same directory as
+// path and then renames it into place, ensuring the target file is never
+// partially written.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("writing temp file: %w", err)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("setting temp file permissions: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("closing temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("renaming temp file: %w", err)
+	}
+	return nil
 }

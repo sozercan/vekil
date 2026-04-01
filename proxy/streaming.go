@@ -78,7 +78,9 @@ func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
 	if f, ok := w.(http.Flusher); ok {
 		fw.flusher = f
 	}
-	io.Copy(fw, body)
+	// Errors here (client disconnect, upstream drop) are unrecoverable for SSE
+	// since headers have already been sent. The client must handle truncated streams.
+	_, _ = io.Copy(fw, body)
 }
 
 // StreamOpenAIToAnthropic translates an OpenAI SSE stream into Anthropic SSE format.

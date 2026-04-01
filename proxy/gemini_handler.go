@@ -83,7 +83,8 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
-		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", fmt.Sprintf("failed to get token: %v", err))
+		h.log.Error("failed to get token", logger.F("endpoint", "gemini"), logger.Err(err))
+		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", "authentication failed")
 		return
 	}
 
@@ -104,9 +105,9 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 
 	if resp.StatusCode != http.StatusOK {
 		defer func() { _ = resp.Body.Close() }()
-		errBody, _ := io.ReadAll(resp.Body)
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		h.log.Error("upstream error", logger.F("endpoint", "gemini"), logger.F("status", resp.StatusCode), logger.F("body", string(errBody)), logger.F("request", string(oaiBody)))
-		writeGeminiError(w, resp.StatusCode, mapGeminiUpstreamStatus(resp.StatusCode), fmt.Sprintf("upstream error (%d): %s", resp.StatusCode, string(errBody)))
+		writeGeminiError(w, resp.StatusCode, mapGeminiUpstreamStatus(resp.StatusCode), fmt.Sprintf("upstream error (%d)", resp.StatusCode))
 		return
 	}
 
@@ -178,7 +179,8 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 
 	token, err := h.auth.GetToken(r.Context())
 	if err != nil {
-		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", fmt.Sprintf("failed to get token: %v", err))
+		h.log.Error("failed to get token", logger.F("endpoint", "gemini_count_tokens"), logger.Err(err))
+		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", "authentication failed")
 		return
 	}
 
@@ -322,11 +324,12 @@ func (h *ProxyHandler) decodeGeminiProbeResponse(resp *http.Response) (*models.O
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		errBody, _ := io.ReadAll(resp.Body)
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		h.log.Error("upstream error", logger.F("endpoint", "gemini_count_tokens"), logger.F("status", resp.StatusCode), logger.F("body", string(errBody)))
 		return nil, false, &geminiProtocolError{
 			statusCode: resp.StatusCode,
 			status:     mapGeminiUpstreamStatus(resp.StatusCode),
-			message:    fmt.Sprintf("upstream error (%d): %s", resp.StatusCode, string(errBody)),
+			message:    fmt.Sprintf("upstream error (%d)", resp.StatusCode),
 		}
 	}
 

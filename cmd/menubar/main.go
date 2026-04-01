@@ -29,7 +29,11 @@ var (
 )
 
 func main() {
-	authenticator = auth.NewAuthenticator("")
+	var err error
+	authenticator, err = auth.NewAuthenticator("")
+	if err != nil {
+		log.Fatal("failed to initialize authenticator", logger.Err(err))
+	}
 	authenticator.DisableAutoDeviceFlow = true
 	systray.Run(onReady, onExit)
 }

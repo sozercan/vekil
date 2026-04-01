@@ -155,7 +155,10 @@ func TestHandleReadyz(t *testing.T) {
 	})
 
 	t.Run("not ready when auth fails", func(t *testing.T) {
-		authenticator := auth.NewAuthenticator(t.TempDir())
+		authenticator, err := auth.NewAuthenticator(t.TempDir())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		authenticator.DisableAutoDeviceFlow = true
 
 		h := &ProxyHandler{
