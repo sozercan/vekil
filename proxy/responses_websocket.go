@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,9 +20,16 @@ import (
 
 const responsesWebSocketRequestHeaderPrefix = "ws_request_header_"
 
+// errStreamFailedUpstream is a sentinel error indicating the upstream stream
+// ended with response.failed or response.incomplete. The error event has already
+// been forwarded to the WebSocket client, so no additional error frame should
+// be sent.
+var errStreamFailedUpstream = errors.New("upstream stream ended with response.failed or response.incomplete")
+
 var responsesWebSocketUpgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 4096,
+	ReadBufferSize:    4096,
+	WriteBufferSize:   4096,
+	EnableCompression: true,
 	CheckOrigin: func(r *http.Request) bool {
 		return strings.TrimSpace(r.Header.Get("Origin")) == ""
 	},
@@ -139,7 +147,7 @@ func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.R
 
 func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *responsesWebSocketSession {
 	baseHeaders := make(http.Header)
-	for _, name := range []string{"X-Codex-Beta-Features", "X-Codex-Turn-Metadata"} {
+	for _, name := range []string{"X-Codex-Beta-Features", "X-Codex-Turn-Metadata", "OpenAI-Beta", "session_id", "X-Client-Request-Id", "X-OpenAI-Subagent"} {
 		for _, value := range r.Header.Values(name) {
 			baseHeaders.Add(name, value)
 		}
@@ -301,9 +309,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return fmt.Errorf("upstream websocket bridge status %d", resp.StatusCode)
 	}
 
-	responseID, outputItems, err := s.streamUpstreamResponse(resp.Body)
+	responseID, outputItems, err := s.streamUpstreamResponse(resp.Body, resp.Header)
 	if err != nil {
-		s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil)
+		if !errors.Is(err, errStreamFailedUpstream) {
+			s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil)
+		}
 		return err
 	}
 
@@ -559,7 +569,17 @@ func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *
 	)
 }
 
-func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader) (string, []json.RawMessage, error) {
+func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, headers http.Header) (string, []json.RawMessage, error) {
+	// Emit a synthetic metadata event so WebSocket clients can discover the
+	// actual model used. The Codex CLI parses openai-model from
+	// codex.response.metadata frames via response_model().
+	if mappedHeaders := responsesWebSocketMetadataHeaders(headers); len(mappedHeaders) > 0 {
+		_ = s.writeJSON(map[string]interface{}{
+			"type":    "codex.response.metadata",
+			"headers": mappedHeaders,
+		})
+	}
+
 	var responseID string
 	var outputItems []json.RawMessage
 	sawCompleted := false
@@ -591,21 +611,27 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader) (stri
 			if event.Response.ID != "" {
 				responseID = event.Response.ID
 			}
+		case "response.failed", "response.incomplete":
+			// Return the sentinel immediately to break out of the SSE
+			// scanner loop. The event has already been forwarded to the
+			// client above, so no additional error frame is needed.
+			return errStreamFailedUpstream
 		}
 
 		return nil
-	}); err != nil {
+	}); err != nil && !errors.Is(err, errStreamFailedUpstream) {
 		return "", nil, err
+	} else if errors.Is(err, errStreamFailedUpstream) {
+		return "", nil, errStreamFailedUpstream
 	}
 
-	if !sawCompleted {
-		return "", nil, fmt.Errorf("stream ended before response.completed")
+	if sawCompleted {
+		if responseID == "" {
+			return "", nil, fmt.Errorf("response.completed missing response id")
+		}
+		return responseID, outputItems, nil
 	}
-	if responseID == "" {
-		return "", nil, fmt.Errorf("response.completed missing response id")
-	}
-
-	return responseID, outputItems, nil
+	return "", nil, fmt.Errorf("stream ended before response.completed")
 }
 
 func (s *responsesWebSocketSession) writeJSON(payload interface{}) error {
@@ -716,6 +742,32 @@ func flattenResponsesWebSocketHeaders(headers http.Header) map[string]interface{
 		default:
 			result[key] = strings.Join(values, ", ")
 		}
+	}
+	return result
+}
+
+// responsesWebSocketMetadataHeaders extracts headers that are meaningful to
+// Codex CLI WebSocket clients via the codex.response.metadata frame. The CLI
+// parses openai-model from metadata frames using case-insensitive comparison
+// (eq_ignore_ascii_case in response_model()); we use lowercase keys to match
+// the wire format the real OpenAI backend uses.
+func responsesWebSocketMetadataHeaders(headers http.Header) map[string]interface{} {
+	if len(headers) == 0 {
+		return nil
+	}
+
+	result := make(map[string]interface{}, 2)
+	// Go's Header.Get is case-insensitive, but we store the JSON key in
+	// lowercase to match what the real OpenAI backend sends.
+	if value := headers.Get("Openai-Model"); value != "" {
+		result["openai-model"] = value
+	}
+	if value := headers.Get("X-Openai-Model"); value != "" {
+		result["x-openai-model"] = value
+	}
+
+	if len(result) == 0 {
+		return nil
 	}
 	return result
 }

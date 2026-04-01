@@ -13,13 +13,20 @@ import (
 )
 
 func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
-	if subagent := strings.TrimSpace(r.Header.Get("X-OpenAI-Subagent")); subagent != "" {
-		headers := make(http.Header, 1)
-		headers.Set("X-OpenAI-Subagent", subagent)
-		return headers
+	var headers http.Header
+
+	for _, name := range []string{"X-OpenAI-Subagent", "OpenAI-Beta", "session_id", "X-Client-Request-Id"} {
+		for _, value := range r.Header.Values(name) {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				if headers == nil {
+					headers = make(http.Header, 2)
+				}
+				headers.Add(name, trimmed)
+			}
+		}
 	}
 
-	return nil
+	return headers
 }
 
 // HandleResponses handles POST /v1/responses by forwarding the request to
