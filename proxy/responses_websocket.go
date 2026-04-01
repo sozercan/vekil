@@ -570,13 +570,23 @@ func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *
 }
 
 func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, headers http.Header) (string, []json.RawMessage, error) {
-	// Emit a synthetic metadata event with upstream response headers so
-	// WebSocket clients can read openai-model, x-reasoning-included, rate
-	// limit headers, etc. that would otherwise be lost in the HTTP→WS bridge.
+	// Emit a synthetic metadata event so WebSocket clients can discover the
+	// actual model used. The Codex CLI parses openai-model from
+	// codex.response.metadata frames via response_model().
 	if mappedHeaders := responsesWebSocketMetadataHeaders(headers); len(mappedHeaders) > 0 {
 		_ = s.writeJSON(map[string]interface{}{
 			"type":    "codex.response.metadata",
 			"headers": mappedHeaders,
+		})
+	}
+
+	// Emit rate-limit headers as a codex.rate_limits frame. The Codex CLI
+	// only parses rate limits from frames with type=codex.rate_limits (the
+	// frame loop and parse_rate_limit_event both guard on this type).
+	if rateLimitHeaders := responsesWebSocketRateLimitHeaders(headers); len(rateLimitHeaders) > 0 {
+		_ = s.writeJSON(map[string]interface{}{
+			"type":    "codex.rate_limits",
+			"headers": rateLimitHeaders,
 		})
 	}
 
@@ -747,44 +757,62 @@ func flattenResponsesWebSocketHeaders(headers http.Header) map[string]interface{
 }
 
 // responsesWebSocketMetadataHeaders extracts headers that are meaningful to
-// Codex CLI WebSocket clients. Only headers the client actively reads are
-// included so that generic HTTP headers (Content-Type, Date, etc.) don't
-// produce spurious metadata frames.
+// Codex CLI WebSocket clients via the codex.response.metadata frame. The CLI
+// only parses openai-model from metadata frames (via response_model()); other
+// headers like x-reasoning-included and x-models-etag are only read from the
+// HTTP upgrade response which this proxy cannot influence post-upgrade.
 func responsesWebSocketMetadataHeaders(headers http.Header) map[string]interface{} {
 	if len(headers) == 0 {
 		return nil
 	}
 
-	result := make(map[string]interface{}, 4)
+	result := make(map[string]interface{}, 2)
 	for _, key := range []string{
 		"Openai-Model",
 		"X-Openai-Model",
-		"X-Reasoning-Included",
-		"X-Models-Etag",
-		"X-Codex-Turn-State",
 	} {
 		if value := headers.Get(key); value != "" {
 			result[key] = value
 		}
 	}
 
-	// Include rate-limit headers (x-codex-* prefix pattern).
-	for key, values := range headers {
-		canonical := http.CanonicalHeaderKey(key)
-		if strings.HasPrefix(strings.ToLower(canonical), "x-codex-") {
-			if _, already := result[canonical]; already {
-				continue
-			}
-			if len(values) == 1 {
-				result[canonical] = values[0]
-			} else if len(values) > 1 {
-				result[canonical] = strings.Join(values, ", ")
-			}
-		}
-	}
-
 	if len(result) == 0 {
 		return nil
+	}
+	return result
+}
+
+// responsesWebSocketRateLimitHeaders extracts x-codex-* rate-limit headers
+// from upstream response headers and formats them for a codex.rate_limits
+// frame. The Codex CLI only parses rate limits from frames with
+// type=codex.rate_limits (double-guarded in the frame loop and in
+// parse_rate_limit_event), so these must be emitted as a separate frame.
+// Non-rate-limit headers that share the x-codex- prefix (like
+// X-Codex-Turn-State and X-Codex-Beta-Features) are excluded.
+func responsesWebSocketRateLimitHeaders(headers http.Header) map[string]interface{} {
+	if len(headers) == 0 {
+		return nil
+	}
+
+	var result map[string]interface{}
+	for key, values := range headers {
+		canonical := http.CanonicalHeaderKey(key)
+		lower := strings.ToLower(canonical)
+		if !strings.HasPrefix(lower, "x-codex-") {
+			continue
+		}
+		// Skip non-rate-limit headers that share the x-codex- prefix.
+		if lower == "x-codex-turn-state" || lower == "x-codex-beta-features" || lower == "x-codex-turn-metadata" {
+			continue
+		}
+		if result == nil {
+			result = make(map[string]interface{}, 4)
+		}
+		if len(values) == 1 {
+			result[canonical] = values[0]
+		} else if len(values) > 1 {
+			result[canonical] = strings.Join(values, ", ")
+		}
 	}
 	return result
 }

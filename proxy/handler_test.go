@@ -648,7 +648,7 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	var gotOpenAIBeta, gotSessionID, gotClientRequestID string
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		gotOpenAIBeta = r.Header.Get("OpenAI-Beta")
-		gotSessionID = r.Header.Get("Session-Id")
+		gotSessionID = r.Header.Get("session_id")
 		gotClientRequestID = r.Header.Get("X-Client-Request-Id")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp-headers","object":"response","status":"completed"}`))
@@ -657,7 +657,7 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4","input":"Hello"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("OpenAI-Beta", "responses_websockets=2026-02-06")
-	req.Header.Set("Session-Id", "sess-abc-123")
+	req.Header.Set("session_id", "sess-abc-123")
 	req.Header.Set("X-Client-Request-Id", "client-req-456")
 	w := httptest.NewRecorder()
 
@@ -673,7 +673,7 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 		t.Fatalf("expected OpenAI-Beta to be forwarded, got %q", gotOpenAIBeta)
 	}
 	if gotSessionID != "sess-abc-123" {
-		t.Fatalf("expected Session-Id to be forwarded, got %q", gotSessionID)
+		t.Fatalf("expected session_id to be forwarded, got %q", gotSessionID)
 	}
 	if gotClientRequestID != "client-req-456" {
 		t.Fatalf("expected X-Client-Request-Id to be forwarded, got %q", gotClientRequestID)

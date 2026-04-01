@@ -950,29 +950,42 @@ func TestHandleResponsesWebSocket_RelaysUpstreamHeadersOnSuccess(t *testing.T) {
 		t.Fatalf("failed to write websocket request: %v", err)
 	}
 
-	// First frame should be the synthetic metadata event with upstream headers.
+	// First frame: codex.response.metadata with only openai-model (the only
+	// header the Codex CLI parses from metadata frames).
 	metadata := mustReadWebSocketJSON(t, conn)
 	if metadata["type"] != "codex.response.metadata" {
 		t.Fatalf("expected codex.response.metadata, got %v", metadata["type"])
 	}
-	headers, ok := metadata["headers"].(map[string]interface{})
+	metaHeaders, ok := metadata["headers"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("expected headers map in metadata, got %T", metadata["headers"])
 	}
-	if got := headers["Openai-Model"]; got != "gpt-5.4-actual" {
+	if got := metaHeaders["Openai-Model"]; got != "gpt-5.4-actual" {
 		t.Fatalf("expected Openai-Model header, got %v", got)
 	}
-	if got := headers["X-Reasoning-Included"]; got != "true" {
-		t.Fatalf("expected X-Reasoning-Included header, got %v", got)
+	// X-Reasoning-Included and X-Models-Etag should NOT be in the metadata
+	// frame — the Codex CLI only reads them from HTTP upgrade headers.
+	if _, found := metaHeaders["X-Reasoning-Included"]; found {
+		t.Fatalf("X-Reasoning-Included should not be in metadata frame")
 	}
-	if got := headers["X-Models-Etag"]; got != `"models-v42"` {
-		t.Fatalf("expected X-Models-Etag header, got %v", got)
+	if _, found := metaHeaders["X-Models-Etag"]; found {
+		t.Fatalf("X-Models-Etag should not be in metadata frame")
 	}
-	if got := headers["X-Codex-Primary-Used-Percent"]; got != "42.5" {
+
+	// Second frame: codex.rate_limits with rate-limit headers.
+	rateLimits := mustReadWebSocketJSON(t, conn)
+	if rateLimits["type"] != "codex.rate_limits" {
+		t.Fatalf("expected codex.rate_limits, got %v", rateLimits["type"])
+	}
+	rlHeaders, ok := rateLimits["headers"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected headers map in rate_limits, got %T", rateLimits["headers"])
+	}
+	if got := rlHeaders["X-Codex-Primary-Used-Percent"]; got != "42.5" {
 		t.Fatalf("expected X-Codex-Primary-Used-Percent header, got %v", got)
 	}
 
-	// Next events are the normal SSE stream.
+	// Remaining frames are the normal SSE stream.
 	created := mustReadWebSocketJSON(t, conn)
 	if created["type"] != "response.created" {
 		t.Fatalf("expected response.created, got %v", created["type"])
