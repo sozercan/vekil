@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/sozercan/copilot-proxy/models"
+	"github.com/sozercan/vekil/models"
 )
 
 func TestPrepareOpenAIChatCompletionsRequest_ForceStreamWithTools(t *testing.T) {

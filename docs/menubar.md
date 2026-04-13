@@ -4,7 +4,7 @@ The repo includes a native macOS menubar app for running the proxy without keepi
 
 ## Download And Run
 
-Download `Copilot-Proxy-macos-arm64.zip` from [GitHub Releases](https://github.com/sozercan/copilot-proxy/releases/latest), unzip it, and open `Copilot Proxy.app`.
+Download `vekil-macos-arm64.zip` from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest), unzip it, and open `Vekil.app`.
 
 The published app bundle is currently available for Apple Silicon (`arm64`). On Intel Macs, build the app from source instead.
 
@@ -12,7 +12,7 @@ The published app bundle is currently available for Apple Silicon (`arm64`). On 
 
 ```bash
 make build-app
-open "Copilot Proxy.app"
+open "Vekil.app"
 ```
 
 ## Features

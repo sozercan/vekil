@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sozercan/copilot-proxy/logger"
-	"github.com/sozercan/copilot-proxy/models"
+	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/models"
 )
 
 const geminiCountTokensCacheTTL = 60 * time.Second

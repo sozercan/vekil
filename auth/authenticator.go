@@ -21,7 +21,7 @@ const (
 	deviceCodeURL   = "https://github.com/login/device/code"
 	accessTokenURL  = "https://github.com/login/oauth/access_token"
 	copilotTokenURL = "https://api.github.com/copilot_internal/v2/token"
-	defaultTokenDir = "~/.config/copilot-proxy"
+	defaultTokenDir = "~/.config/vekil"
 )
 
 var accessTokenEnvVars = []string{
@@ -73,7 +73,7 @@ type CopilotTokenResponse struct {
 }
 
 // NewAuthenticator creates an Authenticator that stores tokens in tokenDir.
-// If tokenDir is empty, it defaults to ~/.config/copilot-proxy.
+// If tokenDir is empty, it defaults to ~/.config/vekil.
 func NewAuthenticator(tokenDir string) (*Authenticator, error) {
 	if tokenDir == "" {
 		tokenDir = defaultTokenDir

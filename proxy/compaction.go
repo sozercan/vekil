@@ -207,8 +207,12 @@ func isProxyCompactionContextMessage(v interface{}) bool {
 }
 
 func extractSyntheticOrLegacyCompactionSummary(encryptedContent string) (string, bool) {
-	if strings.HasPrefix(encryptedContent, syntheticCompactionPrefix) {
-		raw := strings.TrimPrefix(encryptedContent, syntheticCompactionPrefix)
+	for _, prefix := range []string{syntheticCompactionPrefix, legacySyntheticCompactionPrefix} {
+		if !strings.HasPrefix(encryptedContent, prefix) {
+			continue
+		}
+
+		raw := strings.TrimPrefix(encryptedContent, prefix)
 		payloadBytes, err := base64.RawURLEncoding.DecodeString(raw)
 		if err != nil {
 			return "", false

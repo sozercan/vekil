@@ -1,7 +1,7 @@
-BINARY := copilot-proxy
+BINARY := vekil
 LDFLAGS := -s -w
-APP_NAME := Copilot Proxy.app
-APP_BUNDLE_ID := com.copilot-proxy.menubar
+APP_NAME := Vekil.app
+APP_BUNDLE_ID := com.vekil.menubar
 VERSION ?= dev-$(shell git rev-parse --short HEAD)
 APP_VERSION := $(patsubst v%,%,$(VERSION))
 
@@ -14,17 +14,17 @@ build-app:
 	@rm -rf "$(APP_NAME)"
 	@mkdir -p "$(APP_NAME)/Contents/MacOS"
 	@mkdir -p "$(APP_NAME)/Contents/Resources"
-	go build -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o "$(APP_NAME)/Contents/MacOS/copilot-proxy-menubar" ./cmd/menubar/
+	go build -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o "$(APP_NAME)/Contents/MacOS/vekil-menubar" ./cmd/menubar/
 	@printf '<?xml version="1.0" encoding="UTF-8"?>\n\
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n\
 <plist version="1.0">\n\
 <dict>\n\
 	<key>CFBundleExecutable</key>\n\
-	<string>copilot-proxy-menubar</string>\n\
+	<string>vekil-menubar</string>\n\
 	<key>CFBundleIdentifier</key>\n\
 	<string>$(APP_BUNDLE_ID)</string>\n\
 	<key>CFBundleName</key>\n\
-	<string>Copilot Proxy</string>\n\
+	<string>Vekil</string>\n\
 	<key>CFBundlePackageType</key>\n\
 	<string>APPL</string>\n\
 	<key>CFBundleVersion</key>\n\

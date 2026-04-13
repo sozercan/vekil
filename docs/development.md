@@ -3,7 +3,7 @@
 ## Build
 
 ```bash
-go build -o copilot-proxy .
+go build -o vekil .
 make build-app
 make docker-build
 ```
@@ -52,4 +52,4 @@ To use it:
 
 This workflow is intentionally separate from the normal CI workflow so pull requests and forked builds remain deterministic and do not depend on Copilot credentials.
 
-You can also run the same smoke script locally after building `copilot-proxy` and installing those three CLIs.
+You can also run the same smoke script locally after building `vekil` and installing those three CLIs.

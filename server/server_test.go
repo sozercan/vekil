@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sozercan/copilot-proxy/auth"
-	"github.com/sozercan/copilot-proxy/logger"
-	"github.com/sozercan/copilot-proxy/proxy"
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/proxy"
 )
 
 func TestStart_ReturnsErrorWhenPortInUse(t *testing.T) {

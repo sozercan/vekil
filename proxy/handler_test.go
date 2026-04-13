@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -16,9 +17,9 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
-	"github.com/sozercan/copilot-proxy/auth"
-	"github.com/sozercan/copilot-proxy/logger"
-	"github.com/sozercan/copilot-proxy/models"
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/models"
 )
 
 func newTestProxyHandler(t testing.TB, backend http.HandlerFunc) *ProxyHandler {
@@ -2048,6 +2049,16 @@ func TestExtractSyntheticOrLegacyCompactionSummary(t *testing.T) {
 	summary := "Compacted conversation summary"
 	if got, ok := extractSyntheticOrLegacyCompactionSummary(encodeSyntheticCompaction(summary)); !ok || got != summary {
 		t.Fatalf("expected synthetic summary round-trip, got %q ok=%v", got, ok)
+	}
+
+	legacySyntheticSummary := "Legacy synthetic compaction summary"
+	legacyPayload, err := json.Marshal(syntheticCompactionPayload{Summary: legacySyntheticSummary})
+	if err != nil {
+		t.Fatalf("marshal legacy synthetic payload: %v", err)
+	}
+	legacyEncoded := legacySyntheticCompactionPrefix + base64.RawURLEncoding.EncodeToString(legacyPayload)
+	if got, ok := extractSyntheticOrLegacyCompactionSummary(legacyEncoded); !ok || got != legacySyntheticSummary {
+		t.Fatalf("expected legacy synthetic summary round-trip, got %q ok=%v", got, ok)
 	}
 
 	legacySummary := "The issue is partially fixed."

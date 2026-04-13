@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	launchAgentLabel = "com.copilot-proxy.menubar"
+	launchAgentLabel = "com.vekil.menubar"
 	// Keep this in sync with APP_BUNDLE_ID in the Makefile.
 	appBundleID = launchAgentLabel
 )

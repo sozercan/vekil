@@ -8,9 +8,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sozercan/copilot-proxy/auth"
-	"github.com/sozercan/copilot-proxy/logger"
-	"github.com/sozercan/copilot-proxy/proxy"
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/proxy"
 )
 
 // Server encapsulates the HTTP server lifecycle.
@@ -99,7 +99,7 @@ func (s *Server) Start() error {
 	}
 
 	s.running.Store(true)
-	s.log.Info("copilot-proxy listening", logger.F("addr", s.httpServer.Addr))
+	s.log.Info("vekil listening", logger.F("addr", s.httpServer.Addr))
 
 	go func() {
 		defer s.running.Store(false)

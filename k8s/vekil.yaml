@@ -1,20 +1,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: copilot-proxy
+  name: vekil
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: copilot-proxy
+      app: vekil
   template:
     metadata:
       labels:
-        app: copilot-proxy
+        app: vekil
     spec:
       containers:
-        - name: copilot-proxy
-          image: docker.io/sozercan/copilot-proxy:20260310-190750
+        - name: vekil
+          image: ghcr.io/sozercan/vekil:20260310-190750
           imagePullPolicy: Always
           ports:
             - containerPort: 1337
@@ -22,10 +22,10 @@ spec:
             - name: PORT
               value: "1337"
             - name: TOKEN_DIR
-              value: /home/nonroot/.config/copilot-proxy
+              value: /home/nonroot/.config/vekil
           volumeMounts:
             - name: token-cache
-              mountPath: /home/nonroot/.config/copilot-proxy
+              mountPath: /home/nonroot/.config/vekil
       volumes:
         - name: token-cache
           emptyDir: {}
@@ -33,10 +33,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: copilot-proxy
+  name: vekil
 spec:
   selector:
-    app: copilot-proxy
+    app: vekil
   ports:
     - port: 1337
       targetPort: 1337

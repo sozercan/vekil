@@ -19,9 +19,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
-	"github.com/sozercan/copilot-proxy/auth"
-	"github.com/sozercan/copilot-proxy/logger"
-	"github.com/sozercan/copilot-proxy/models"
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/models"
 )
 
 const (
@@ -43,7 +43,10 @@ const (
 	modelsCacheTTL = 5 * time.Minute
 	// syntheticCompactionPrefix marks proxy-owned compaction payloads so they
 	// can be expanded back into normal context on subsequent /responses calls.
-	syntheticCompactionPrefix         = "copilot-proxy.compaction.v1:"
+	syntheticCompactionPrefix = "vekil.compaction.v1:"
+	// legacySyntheticCompactionPrefix keeps older compacted histories readable
+	// after the project rename.
+	legacySyntheticCompactionPrefix   = "copilot-proxy.compaction.v1:"
 	defaultCopilotEditorVersion       = "vscode/1.95.0"
 	defaultCopilotEditorPluginVersion = "copilot-chat/0.26.7"
 	defaultCopilotUserAgent           = "GitHubCopilotChat/0.26.7"

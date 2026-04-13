@@ -1,4 +1,4 @@
-# copilot-proxy
+# vekil
 
 High-performance Go proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs, forwarding all requests to GitHub Copilot's backend (`api.githubcopilot.com`). This lets you use tools that speak the Anthropic, Gemini, or OpenAI protocol with your GitHub Copilot subscription.
 
@@ -13,19 +13,19 @@ High-performance Go proxy that exposes Anthropic, Gemini, and OpenAI-compatible 
 
 ## Quick Start
 
-Download the latest binary for your platform from [GitHub Releases](https://github.com/sozercan/copilot-proxy/releases/latest), then run it locally.
+Download the latest binary for your platform from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest), then run it locally.
 
 Or with Docker from GHCR:
 
 ```bash
 docker run -p 1337:1337 \
-  -v ~/.config/copilot-proxy:/home/nonroot/.config/copilot-proxy \
-  ghcr.io/sozercan/copilot-proxy:latest
+  -v ~/.config/vekil:/home/nonroot/.config/vekil \
+  ghcr.io/sozercan/vekil:latest
 ```
 
-On Apple Silicon Macs, you can also use the native menubar app instead of keeping a terminal open. Download `Copilot-Proxy-macos-arm64.zip` from [GitHub Releases](https://github.com/sozercan/copilot-proxy/releases/latest), unzip it, and open `Copilot Proxy.app`. See [macOS Menubar App](docs/menubar.md).
+On Apple Silicon Macs, you can also use the native menubar app instead of keeping a terminal open. Download `vekil-macos-arm64.zip` from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest), unzip it, and open `Vekil.app`. See [macOS Menubar App](docs/menubar.md).
 
-On first run, authenticate with GitHub's device code flow. Tokens are cached in `~/.config/copilot-proxy/`.
+On first run, authenticate with GitHub's device code flow. Tokens are cached in `~/.config/vekil/`.
 
 ## Docs
 

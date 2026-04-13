@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/sozercan/copilot-proxy/models"
+	"github.com/sozercan/vekil/models"
 )
 
 const geminiFunctionCallIDPrefix = "gemini-fc"

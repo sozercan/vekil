@@ -8,7 +8,7 @@ import (
 "strings"
 "testing"
 
-"github.com/sozercan/copilot-proxy/models"
+"github.com/sozercan/vekil/models"
 )
 
 // TestBugReport_AnthropicSingleTool verifies single tool call works (Anthropic path).

@@ -67,7 +67,7 @@ jobs:
 
       - name: Verify binary runs
         run: |
-          ./copilot-proxy --help 2>&1 || true
+          ./vekil --help 2>&1 || true
           echo "Binary executes successfully"
 
       - name: Docker build

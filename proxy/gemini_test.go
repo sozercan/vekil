@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sozercan/copilot-proxy/models"
+	"github.com/sozercan/vekil/models"
 )
 
 func TestTranslateGeminiToOpenAI(t *testing.T) {
