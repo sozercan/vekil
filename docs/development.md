@@ -35,6 +35,18 @@ make lint
 
 GitHub Actions in `.github/workflows/ci.yaml` runs lint, tests, build, vet, and e2e validation before merge.
 
+## Release
+
+Tag pushes to [`.github/workflows/release.yaml`](../.github/workflows/release.yaml) now use [`.goreleaser.yaml`](../.goreleaser.yaml) to publish the CLI binaries and checksums to GitHub Releases.
+
+The same release workflow also:
+
+- builds `vekil-macos-arm64.zip` on a macOS runner and uploads it to the tagged release
+- updates the `vekil` cask in `sozercan/homebrew-repo`
+- pushes the multi-arch container image to GHCR
+
+To publish the Homebrew cask, configure the repository secret `HOMEBREW_REPO_TOKEN` with push access to `sozercan/homebrew-repo`.
+
 ## Manual Live Smoke Workflow
 
 The repository also includes a manual `Live Copilot Smoke` workflow in [`.github/workflows/live-copilot-smoke.yaml`](../.github/workflows/live-copilot-smoke.yaml).
