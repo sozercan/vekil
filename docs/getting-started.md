@@ -2,45 +2,45 @@
 
 ## Download From GitHub Releases
 
-Download the latest binary for your platform from [GitHub Releases](https://github.com/sozercan/copilot-proxy/releases/latest).
+Download the latest binary for your platform from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest).
 
 Published binaries are available for `linux/amd64`, `linux/arm64`, `darwin/amd64`, and `darwin/arm64`. After downloading, make the binary executable if needed and run it locally.
 
-On Apple Silicon Macs, GitHub Releases also includes a `Copilot-Proxy-macos-arm64.zip` menubar app bundle if you prefer a native app instead of the CLI binary.
+On Apple Silicon Macs, GitHub Releases also includes a `vekil-macos-arm64.zip` menubar app bundle if you prefer a native app instead of the CLI binary.
 
 ## Build From Source
 
 ```bash
-go build -o copilot-proxy .
-./copilot-proxy
+go build -o vekil .
+./vekil
 ```
 
 ## Docker
 
 ```bash
-docker pull docker.io/sozercan/copilot-proxy:latest
+docker pull ghcr.io/sozercan/vekil:latest
 docker run -p 1337:1337 \
-  -v ~/.config/copilot-proxy:/home/nonroot/.config/copilot-proxy \
-  docker.io/sozercan/copilot-proxy:latest
+  -v ~/.config/vekil:/home/nonroot/.config/vekil \
+  ghcr.io/sozercan/vekil:latest
 ```
 
 Or build locally:
 
 ```bash
-docker build -t copilot-proxy .
+docker build -t vekil .
 docker run -p 1337:1337 \
-  -v ~/.config/copilot-proxy:/home/nonroot/.config/copilot-proxy \
-  copilot-proxy
+  -v ~/.config/vekil:/home/nonroot/.config/vekil \
+  vekil
 ```
 
 The published image supports `linux/amd64` and `linux/arm64`.
 
 ## Kubernetes
 
-A sample manifest is included at [`k8s/copilot-proxy.yaml`](../k8s/copilot-proxy.yaml).
+A sample manifest is included at [`k8s/vekil.yaml`](../k8s/vekil.yaml).
 
 ```bash
-kubectl apply -f k8s/copilot-proxy.yaml
+kubectl apply -f k8s/vekil.yaml
 ```
 
 ## First Run
@@ -51,4 +51,4 @@ On first run, the proxy starts GitHub's device code flow:
 2. Enter the one-time code.
 3. Authorize the application.
 
-Tokens are cached in `~/.config/copilot-proxy/` and refreshed automatically before expiry.
+Tokens are cached in `~/.config/vekil/` and refreshed automatically before expiry.

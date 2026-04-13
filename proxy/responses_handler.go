@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/sozercan/copilot-proxy/logger"
+	"github.com/sozercan/vekil/logger"
 )
 
 func responsesExtraHeadersFromRequest(r *http.Request) http.Header {

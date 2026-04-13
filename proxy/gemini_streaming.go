@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/sozercan/copilot-proxy/models"
+	"github.com/sozercan/vekil/models"
 )
 
 type geminiStreamingToolCall struct {

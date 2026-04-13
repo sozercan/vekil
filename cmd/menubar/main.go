@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"fyne.io/systray"
-	"github.com/sozercan/copilot-proxy/auth"
-	"github.com/sozercan/copilot-proxy/logger"
-	"github.com/sozercan/copilot-proxy/server"
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/server"
 )
 
 var log = logger.New(logger.ParseLevel("info"))
@@ -40,7 +40,7 @@ func main() {
 
 func onReady() {
 	systray.SetIcon(iconOff)
-	systray.SetTooltip("Copilot Proxy - Stopped")
+	systray.SetTooltip("Vekil - Stopped")
 
 	mStatus = systray.AddMenuItem("○ Not signed in", "")
 	mStatus.Disable()
@@ -48,7 +48,7 @@ func onReady() {
 	mVersion.Disable()
 	systray.AddSeparator()
 
-	mToggle = systray.AddMenuItem("Start Proxy", "Start or stop the proxy")
+	mToggle = systray.AddMenuItem("Start Vekil", "Start or stop Vekil")
 	systray.AddSeparator()
 
 	mLaunch := systray.AddMenuItemCheckbox("Launch at Login", "Launch at Login", false)
@@ -122,14 +122,14 @@ func startProxy() {
 	nextSrv := server.New(authenticator, log, "0.0.0.0", "1337")
 	if err := nextSrv.Start(); err != nil {
 		log.Error("server start failed", logger.Err(err))
-		showErrorDialog("Proxy Start Failed", fmt.Sprintf("Could not start the proxy on port 1337.\n\n%v", err))
+		showErrorDialog("Vekil Start Failed", fmt.Sprintf("Could not start Vekil on port 1337.\n\n%v", err))
 		return
 	}
 	srv = nextSrv
 
-	mToggle.SetTitle("Stop Proxy")
+	mToggle.SetTitle("Stop Vekil")
 	systray.SetIcon(iconOn)
-	systray.SetTooltip("Copilot Proxy - Running on :1337")
+	systray.SetTooltip("Vekil - Running on :1337")
 	log.Info("proxy started")
 }
 
@@ -141,9 +141,9 @@ func stopProxy() {
 		log.Error("server stop failed", logger.Err(err))
 	}
 
-	mToggle.SetTitle("Start Proxy")
+	mToggle.SetTitle("Start Vekil")
 	systray.SetIcon(iconOff)
-	systray.SetTooltip("Copilot Proxy - Stopped")
+	systray.SetTooltip("Vekil - Stopped")
 	log.Info("proxy stopped")
 }
 
@@ -209,7 +209,7 @@ func signIn() {
 	}
 
 	setSignedInUI()
-	showNotification("Copilot Proxy", "Successfully signed in to GitHub.")
+	showNotification("Vekil", "Successfully signed in to GitHub.")
 	log.Info("sign-in complete")
 }
 
@@ -249,7 +249,7 @@ func setSignedOutUI() {
 	mAuth.Enable()
 	mToggle.Disable()
 	systray.SetIcon(iconOff)
-	systray.SetTooltip("Copilot Proxy - Stopped")
+	systray.SetTooltip("Vekil - Stopped")
 }
 
 func onExit() {

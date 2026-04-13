@@ -1,4 +1,4 @@
-module github.com/sozercan/copilot-proxy
+module github.com/sozercan/vekil
 
 go 1.25
 

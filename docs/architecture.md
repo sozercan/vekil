@@ -4,7 +4,7 @@
 
 ```text
 ┌─────────────────────────────────────────────────────┐
-│                   copilot-proxy                     │
+│                   vekil                     │
 │                                                     │
 │  /v1/messages ──► Translate ──► /chat/completions   │
 │                   Anthropic→OAI   api.githubcopilot │

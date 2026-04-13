@@ -15,7 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/sozercan/copilot-proxy/logger"
+	"github.com/sozercan/vekil/logger"
 )
 
 const responsesWebSocketRequestHeaderPrefix = "ws_request_header_"
@@ -259,7 +259,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	metrics := responsesWebSocketRequestMetrics{}
 
 	if request.Generate != nil && !*request.Generate {
-		responseID := "copilot-proxy-ws-" + uuid.NewString()
+		responseID := "vekil-ws-" + uuid.NewString()
 		s.rememberResponse(plan.resetHistory, responseID, plan.signature, plan.currentInput, nil)
 		s.logRequestMetrics(h, request, responseID, metrics)
 		if err := s.writeJSON(map[string]interface{}{

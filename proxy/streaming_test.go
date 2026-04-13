@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sozercan/copilot-proxy/models"
+	"github.com/sozercan/vekil/models"
 )
 
 func buildSSEStream(chunks ...string) io.ReadCloser {

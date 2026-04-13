@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ORIGINAL_HOME="${HOME}"
 
-PROXY_BIN="${PROXY_BIN:-${REPO_ROOT}/copilot-proxy}"
+PROXY_BIN="${PROXY_BIN:-${REPO_ROOT}/vekil}"
 PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
 PROXY_PORT="${PROXY_PORT:-1337}"
 PROXY_BASE_URL="http://${PROXY_HOST}:${PROXY_PORT}"
@@ -33,7 +33,7 @@ PROMPT="Read left.txt and right.txt in the current directory and reply with exac
 if [[ -n "${COPILOT_GITHUB_TOKEN:-}" ]]; then
   PROXY_TOKEN_DIR="${PROXY_TOKEN_DIR:-${SMOKE_DIR}/proxy-token}"
 else
-  PROXY_TOKEN_DIR="${PROXY_TOKEN_DIR:-${ORIGINAL_HOME}/.config/copilot-proxy}"
+  PROXY_TOKEN_DIR="${PROXY_TOKEN_DIR:-${ORIGINAL_HOME}/.config/vekil}"
 fi
 
 proxy_pid=""

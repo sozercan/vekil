@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sozercan/copilot-proxy/auth"
-	"github.com/sozercan/copilot-proxy/logger"
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestDoWithRetry_SuccessOnFirstTry(t *testing.T) {

@@ -16,13 +16,13 @@ func TestLaunchAgentProgramArguments(t *testing.T) {
 	}{
 		{
 			name:       "app bundle executable uses open by bundle id",
-			executable: "/Applications/Copilot Proxy.app/Contents/MacOS/copilot-proxy-menubar",
+			executable: "/Applications/Vekil.app/Contents/MacOS/vekil-menubar",
 			want:       []string{"/usr/bin/open", "-b", appBundleID},
 		},
 		{
 			name:       "standalone executable uses direct path",
-			executable: "/usr/local/bin/copilot-proxy-menubar",
-			want:       []string{"/usr/local/bin/copilot-proxy-menubar"},
+			executable: "/usr/local/bin/vekil-menubar",
+			want:       []string{"/usr/local/bin/vekil-menubar"},
 		},
 	}
 

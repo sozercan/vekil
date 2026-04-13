@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/sozercan/copilot-proxy/models"
+	"github.com/sozercan/vekil/models"
 )
 
 func intVal(i int) *int { return &i }

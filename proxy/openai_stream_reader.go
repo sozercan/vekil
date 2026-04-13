@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/sozercan/copilot-proxy/models"
+	"github.com/sozercan/vekil/models"
 )
 
 const (

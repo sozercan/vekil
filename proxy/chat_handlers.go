@@ -8,8 +8,8 @@ import (
 	"net/http"
 
 	"github.com/google/uuid"
-	"github.com/sozercan/copilot-proxy/logger"
-	"github.com/sozercan/copilot-proxy/models"
+	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/models"
 )
 
 type chatCompletionsMode struct {

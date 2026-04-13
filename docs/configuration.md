@@ -6,7 +6,7 @@
 |------|---------|---------|-------------|
 | `--port` | `PORT` | `1337` | Listen port |
 | `--host` | `HOST` | `0.0.0.0` | Listen host |
-| `--token-dir` | `TOKEN_DIR` | `~/.config/copilot-proxy` | Token storage directory |
+| `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 | `--copilot-editor-version` | `COPILOT_EDITOR_VERSION` | `vscode/1.95.0` | Upstream `editor-version` header |
@@ -35,7 +35,7 @@ These settings affect the Codex-style `GET /v1/responses` websocket bridge.
 ## Suggested Debug Run
 
 ```bash
-./copilot-proxy \
+./vekil \
   --log-level debug \
   --responses-ws-turn-state-delta \
   --responses-ws-auto-compact-max-items 64 \

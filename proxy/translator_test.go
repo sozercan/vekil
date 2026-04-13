@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sozercan/copilot-proxy/models"
+	"github.com/sozercan/vekil/models"
 )
 
 func strPtr(s string) *string { return &s }
