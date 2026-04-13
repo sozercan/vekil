@@ -9,7 +9,7 @@ Published binaries are available for `linux/amd64`, `linux/arm64`, `darwin/amd64
 On Apple Silicon Macs, you can use the native menubar app:
 
 ```bash
-brew tap sozercan/repo && brew install --cask vekil
+brew install --cask sozercan/repo/vekil
 ```
 
 If macOS adds quarantine-style attributes, clear them with `xattr -cr /Applications/Vekil.app`.
