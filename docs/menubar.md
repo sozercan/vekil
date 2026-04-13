@@ -7,9 +7,10 @@ The repo includes a native macOS menubar app for running the proxy without keepi
 Install the menubar app from Homebrew:
 
 ```bash
-brew tap sozercan/repo
-brew install --cask vekil
+brew tap sozercan/repo && brew install --cask vekil
 ```
+
+If macOS adds quarantine-style attributes, clear them with `xattr -cr /Applications/Vekil.app`.
 
 Or download `vekil-macos-arm64.zip` from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest), unzip it, and open `Vekil.app`.
 

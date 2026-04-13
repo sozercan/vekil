@@ -23,12 +23,13 @@ docker run -p 1337:1337 \
   ghcr.io/sozercan/vekil:latest
 ```
 
-On Apple Silicon Macs, you can also use the native menubar app instead of keeping a terminal open:
+On Apple Silicon Macs, you can also use the native menubar app.
 
 ```bash
-brew tap sozercan/repo
-brew install --cask vekil
+brew tap sozercan/repo && brew install --cask vekil
 ```
+
+If macOS adds quarantine-style attributes, clear them with `xattr -cr /Applications/Vekil.app`.
 
 Manual downloads still work through the `vekil-macos-arm64.zip` asset on [GitHub Releases](https://github.com/sozercan/vekil/releases/latest). See [macOS Menubar App](docs/menubar.md).
 

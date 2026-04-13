@@ -6,12 +6,13 @@ Download the latest binary for your platform from [GitHub Releases](https://gith
 
 Published binaries are available for `linux/amd64`, `linux/arm64`, `darwin/amd64`, and `darwin/arm64`. After downloading, make the binary executable if needed and run it locally.
 
-On Apple Silicon Macs, you can install the native menubar app from the Homebrew tap:
+On Apple Silicon Macs, you can use the native menubar app:
 
 ```bash
-brew tap sozercan/repo
-brew install --cask vekil
+brew tap sozercan/repo && brew install --cask vekil
 ```
+
+If macOS adds quarantine-style attributes, clear them with `xattr -cr /Applications/Vekil.app`.
 
 GitHub Releases also includes a `vekil-macos-arm64.zip` menubar app bundle if you prefer a manual download.
 
