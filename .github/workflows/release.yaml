@@ -99,7 +99,7 @@ jobs:
       - name: Publish draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${GITHUB_REF#refs/tags/}" --draft=false
+        run: gh release edit "${GITHUB_REF#refs/tags/}" --draft=false --repo "${GITHUB_REPOSITORY}"
 
   homebrew-cask:
     runs-on: ubuntu-latest
