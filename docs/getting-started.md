@@ -12,7 +12,11 @@ On Apple Silicon Macs, you can use the native menubar app:
 brew install --cask sozercan/repo/vekil
 ```
 
-macOS will add quarantine-style attributes to the app. Clear them with `xattr -cr /Applications/Vekil.app`.
+> **Note:** The app is not signed.
+> Clear extended attributes, including quarantine, with:
+> ```bash
+> xattr -cr /Applications/Vekil.app
+> ```
 
 GitHub Releases also includes a `vekil-macos-arm64.zip` menubar app bundle if you prefer a manual download.
 

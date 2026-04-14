@@ -10,7 +10,11 @@ Install the menubar app from Homebrew:
 brew install --cask sozercan/repo/vekil
 ```
 
-macOS will add quarantine-style attributes to the app. Clear them with `xattr -cr /Applications/Vekil.app`.
+> **Note:** The app is not signed.
+> Clear extended attributes, including quarantine, with:
+> ```bash
+> xattr -cr /Applications/Vekil.app
+> ```
 
 Or download `vekil-macos-arm64.zip` from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest), unzip it, and open `Vekil.app`.
 
