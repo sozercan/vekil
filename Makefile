@@ -4,6 +4,7 @@ APP_NAME := Vekil.app
 APP_BUNDLE_ID := com.vekil.menubar
 VERSION ?= dev-$(shell git rev-parse --short HEAD)
 APP_VERSION := $(patsubst v%,%,$(VERSION))
+APP_CGO_LDFLAGS = -F$(abspath $(SPARKLE_UNPACK_DIR)) -Wl,-rpath,@executable_path/../Frameworks
 SPARKLE_VERSION := 2.9.0
 SPARKLE_BUILD_DIR := .build/sparkle
 SPARKLE_ARCHIVE := $(SPARKLE_BUILD_DIR)/Sparkle-$(SPARKLE_VERSION).tar.xz
@@ -32,8 +33,9 @@ build-app: $(SPARKLE_FRAMEWORK)
 	@mkdir -p "$(APP_NAME)/Contents/MacOS"
 	@mkdir -p "$(APP_NAME)/Contents/Resources"
 	@mkdir -p "$(APP_NAME)/Contents/Frameworks"
-	CGO_ENABLED=1 CGO_LDFLAGS="-F$(abspath $(SPARKLE_UNPACK_DIR))" \
+	CGO_ENABLED=1 CGO_LDFLAGS="$(APP_CGO_LDFLAGS)" \
 		go build -tags sparkle -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o "$(APP_NAME)/Contents/MacOS/vekil-menubar" ./cmd/menubar/
+	otool -l "$(APP_NAME)/Contents/MacOS/vekil-menubar" | grep -q '@executable_path/../Frameworks'
 	ditto "$(SPARKLE_FRAMEWORK)" "$(APP_NAME)/Contents/Frameworks/Sparkle.framework"
 	@printf '<?xml version="1.0" encoding="UTF-8"?>\n\
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n\
