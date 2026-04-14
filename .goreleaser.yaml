@@ -1,0 +1,37 @@
+version: 2
+
+project_name: vekil
+
+builds:
+  - id: vekil
+    main: .
+    binary: vekil
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    ldflags:
+      - -s -w
+
+archives:
+  - id: binaries
+    ids:
+      - vekil
+    name_template: "{{ .ProjectName }}-{{ .Os }}-{{ .Arch }}"
+    formats:
+      - binary
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  github:
+    owner: sozercan
+    name: vekil
+  draft: true
+  prerelease: auto

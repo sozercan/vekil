@@ -6,7 +6,19 @@ Download the latest binary for your platform from [GitHub Releases](https://gith
 
 Published binaries are available for `linux/amd64`, `linux/arm64`, `darwin/amd64`, and `darwin/arm64`. After downloading, make the binary executable if needed and run it locally.
 
-On Apple Silicon Macs, GitHub Releases also includes a `vekil-macos-arm64.zip` menubar app bundle if you prefer a native app instead of the CLI binary.
+On Apple Silicon Macs, you can use the native menubar app:
+
+```bash
+brew install --cask sozercan/repo/vekil
+```
+
+> **Note:** The app is not signed.
+> Clear extended attributes, including quarantine, with:
+> ```bash
+> xattr -cr /Applications/Vekil.app
+> ```
+
+GitHub Releases also includes a `vekil-macos-arm64.zip` menubar app bundle if you prefer a manual download.
 
 ## Build From Source
 
