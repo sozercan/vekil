@@ -4,7 +4,7 @@ package main
 
 import "errors"
 
-var errUpdaterDisabled = errors.New("Sparkle updater is not available in this build")
+var errUpdaterDisabled = errors.New("sparkle updater is not available in this build")
 
 func updaterSupported() bool {
 	return false
