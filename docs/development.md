@@ -14,6 +14,8 @@ make docker-build
 
 ```bash
 go test ./... -count=1
+make test-app          # macOS only; builds and verifies Vekil.app
+scripts/macos-app-smoke.sh  # macOS only; build + launch smoke for Vekil.app
 go test ./proxy/ -run TestHandle -v
 go test ./proxy/ -run TestMapStopReason/stop -v
 ```
@@ -35,7 +37,9 @@ make lint
 
 ## CI
 
-GitHub Actions in `.github/workflows/ci.yaml` runs lint, tests, build, vet, and e2e validation before merge.
+GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs lint, tests, build, vet, and e2e validation before merge.
+
+The macOS menubar app has its own workflow in [`.github/workflows/macos-app.yaml`](../.github/workflows/macos-app.yaml). It runs `scripts/macos-app-smoke.sh` on a macOS runner, which builds `Vekil.app`, validates the bundle contents, launches the app through Launch Services, verifies it stays up, and then quits it cleanly.
 
 ## Release
 

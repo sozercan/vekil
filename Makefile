@@ -14,7 +14,7 @@ SPARKLE_DOWNLOAD_URL := https://github.com/sparkle-project/Sparkle/releases/down
 SPARKLE_FEED_URL ?= https://github.com/sozercan/vekil/releases/latest/download/appcast.xml
 SPARKLE_PUBLIC_ED_KEY ?=
 
-.PHONY: build build-app test vet lint clean docker-build
+.PHONY: build build-app test-app test vet lint clean docker-build
 
 build:
 	go build -ldflags="$(LDFLAGS)" -o $(BINARY) .
@@ -71,6 +71,18 @@ build-app: $(SPARKLE_FRAMEWORK)
 </plist>' > "$(APP_NAME)/Contents/Info.plist"
 	codesign --force --deep --sign - --timestamp=none "$(APP_NAME)"
 	codesign --verify --deep --strict "$(APP_NAME)"
+
+test-app: build-app
+	test -x "$(APP_NAME)/Contents/MacOS/vekil-menubar"
+	test -f "$(APP_NAME)/Contents/Info.plist"
+	test -d "$(APP_NAME)/Contents/Frameworks/Sparkle.framework"
+	plutil -lint "$(APP_NAME)/Contents/Info.plist"
+	/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$(APP_NAME)/Contents/Info.plist" | grep -Fxq 'vekil-menubar'
+	/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$(APP_NAME)/Contents/Info.plist" | grep -Fxq '$(APP_BUNDLE_ID)'
+	/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$(APP_NAME)/Contents/Info.plist" | grep -Fxq '$(APP_VERSION)'
+	/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$(APP_NAME)/Contents/Info.plist" | grep -Fxq 'true'
+	/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$(APP_NAME)/Contents/Info.plist" | grep -Fxq '$(SPARKLE_FEED_URL)'
+	otool -L "$(APP_NAME)/Contents/MacOS/vekil-menubar" | grep -Fq '@rpath/Sparkle.framework/Versions/B/Sparkle'
 
 test:
 	go test ./... -count=1
