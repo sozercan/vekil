@@ -36,7 +36,7 @@ type AnthropicMessage struct {
 // (text, image, tool_use, tool_result, thinking).
 type ContentBlock struct {
 	Type      string                `json:"type"`
-	Text      string                `json:"text,omitempty"`
+	Text      *string               `json:"text,omitempty"`
 	Source    *AnthropicImageSource `json:"source,omitempty"`
 	ID        string                `json:"id,omitempty"`
 	Name      string                `json:"name,omitempty"`

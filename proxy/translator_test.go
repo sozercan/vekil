@@ -559,8 +559,8 @@ func TestTranslateOpenAIToAnthropic(t *testing.T) {
 		if got.Content[0].Type != "text" {
 			t.Errorf("content type = %q, want %q", got.Content[0].Type, "text")
 		}
-		if got.Content[0].Text != "Hello there" {
-			t.Errorf("content text = %q, want %q", got.Content[0].Text, "Hello there")
+		if derefString(got.Content[0].Text) != "Hello there" {
+			t.Errorf("content text = %q, want %q", derefString(got.Content[0].Text), "Hello there")
 		}
 		if got.StopReason == nil || *got.StopReason != "end_turn" {
 			t.Errorf("stop_reason = %v, want %q", got.StopReason, "end_turn")
@@ -647,7 +647,7 @@ func TestTranslateOpenAIToAnthropic(t *testing.T) {
 		if len(got.Content) != 3 {
 			t.Fatalf("expected 3 content blocks, got %d", len(got.Content))
 		}
-		if got.Content[0].Type != "text" || got.Content[0].Text != "I'll delegate both tasks" {
+		if got.Content[0].Type != "text" || derefString(got.Content[0].Text) != "I'll delegate both tasks" {
 			t.Errorf("first block = %+v, want text", got.Content[0])
 		}
 		if got.Content[1].Type != "tool_use" || got.Content[1].ID != "call_1" || got.Content[1].Name != "delegate_task" {
@@ -690,7 +690,7 @@ func TestTranslateOpenAIToAnthropic(t *testing.T) {
 		if len(got.Content) != 2 {
 			t.Fatalf("expected 2 content blocks, got %d", len(got.Content))
 		}
-		if got.Content[0].Type != "text" || got.Content[0].Text != "Let me check" {
+		if got.Content[0].Type != "text" || derefString(got.Content[0].Text) != "Let me check" {
 			t.Errorf("first block = %+v, want text 'Let me check'", got.Content[0])
 		}
 		if got.Content[1].Type != "tool_use" || got.Content[1].Name != "search" {

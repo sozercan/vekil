@@ -214,7 +214,7 @@ func (s *anthropicStreamState) emitText(text string) bool {
 			Index: intVal(s.textBlockIndex),
 			ContentBlock: &models.ContentBlock{
 				Type: "text",
-				Text: "",
+				Text: stringPtr(""),
 			},
 		}) {
 			return false
