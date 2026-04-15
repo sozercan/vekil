@@ -143,7 +143,7 @@ func parseSystemMessage(raw json.RawMessage) (*models.OpenAIMessage, error) {
 	for _, b := range blocks {
 		switch b.Type {
 		case "text":
-			sb.WriteString(b.Text)
+			sb.WriteString(derefString(b.Text))
 		default:
 			return nil, fmt.Errorf("unsupported system content block type %q", b.Type)
 		}
@@ -177,7 +177,7 @@ func translateMessage(msg models.AnthropicMessage) ([]models.OpenAIMessage, erro
 	for _, block := range blocks {
 		switch block.Type {
 		case "text":
-			appendTextContentPart(&textParts, &multimodalParts, block.Text)
+			appendTextContentPart(&textParts, &multimodalParts, derefString(block.Text))
 
 		case "image":
 			part, err := translateAnthropicImageBlock(block)
@@ -321,7 +321,7 @@ func extractToolResultContent(raw json.RawMessage) (string, error) {
 	var sb strings.Builder
 	for _, b := range blocks {
 		if b.Type == "text" {
-			sb.WriteString(b.Text)
+			sb.WriteString(derefString(b.Text))
 		}
 	}
 	return sb.String(), nil
@@ -387,7 +387,7 @@ func TranslateOpenAIToAnthropic(resp *models.OpenAIResponse, model string) *mode
 			if err := json.Unmarshal(msg.Content, &text); err == nil && strings.TrimSpace(text) != "" {
 				content = append(content, models.ContentBlock{
 					Type: "text",
-					Text: text,
+					Text: stringPtr(text),
 				})
 			}
 		}

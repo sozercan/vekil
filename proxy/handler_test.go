@@ -389,8 +389,8 @@ func TestHandleAnthropicMessages(t *testing.T) {
 	if len(anthropicResp.Content) == 0 {
 		t.Fatal("expected content blocks, got none")
 	}
-	if anthropicResp.Content[0].Text != "Hello from the backend!" {
-		t.Errorf("expected text 'Hello from the backend!', got %q", anthropicResp.Content[0].Text)
+	if derefString(anthropicResp.Content[0].Text) != "Hello from the backend!" {
+		t.Errorf("expected text 'Hello from the backend!', got %q", derefString(anthropicResp.Content[0].Text))
 	}
 	if anthropicResp.Usage.InputTokens != 10 {
 		t.Errorf("expected input_tokens 10, got %d", anthropicResp.Usage.InputTokens)
@@ -460,7 +460,7 @@ func TestHandleAnthropicMessages_ImageBlocksForwarded(t *testing.T) {
 	if err := json.Unmarshal(body, &anthropicResp); err != nil {
 		t.Fatalf("failed to parse response: %v", err)
 	}
-	if len(anthropicResp.Content) != 1 || anthropicResp.Content[0].Type != "text" || anthropicResp.Content[0].Text != "I can see the screenshot." {
+	if len(anthropicResp.Content) != 1 || anthropicResp.Content[0].Type != "text" || derefString(anthropicResp.Content[0].Text) != "I can see the screenshot." {
 		t.Fatalf("unexpected content: %+v", anthropicResp.Content)
 	}
 }
@@ -3094,7 +3094,7 @@ func TestHandleAnthropicMessages_ParallelToolCalls(t *testing.T) {
 	if len(anthropicResp.Content) != 3 {
 		t.Fatalf("expected 3 content blocks (1 text + 2 tool_use), got %d", len(anthropicResp.Content))
 	}
-	if anthropicResp.Content[0].Type != "text" || anthropicResp.Content[0].Text != "I'll delegate both tasks" {
+	if anthropicResp.Content[0].Type != "text" || derefString(anthropicResp.Content[0].Text) != "I'll delegate both tasks" {
 		t.Errorf("content[0] = %+v, want text", anthropicResp.Content[0])
 	}
 	if anthropicResp.Content[1].Type != "tool_use" || anthropicResp.Content[1].ID != "call_1" || anthropicResp.Content[1].Name != "delegate_task" {
