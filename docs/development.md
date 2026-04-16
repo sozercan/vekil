@@ -43,7 +43,7 @@ The macOS menubar app has its own workflow in [`.github/workflows/macos-app.yaml
 
 ## Release
 
-Tag pushes to [`.github/workflows/release.yaml`](../.github/workflows/release.yaml) now use [`.goreleaser.yaml`](../.goreleaser.yaml) to publish the CLI binaries and checksums to GitHub Releases.
+Tag pushes to [`.github/workflows/release.yaml`](../.github/workflows/release.yaml) now use [`.goreleaser.yaml`](../.goreleaser.yaml) to publish the CLI binaries and checksums to GitHub Releases for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`.
 
 The same release workflow also:
 
