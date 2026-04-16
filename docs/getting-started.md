@@ -4,7 +4,7 @@
 
 Download the latest binary for your platform from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest).
 
-Published binaries are available for `linux/amd64`, `linux/arm64`, `darwin/amd64`, and `darwin/arm64`. After downloading, make the binary executable if needed and run it locally.
+Published binaries are available for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`. Windows release assets are published as `.exe` binaries. After downloading, make the binary executable if needed and run it locally.
 
 On Apple Silicon Macs, you can use the native menubar app:
 
