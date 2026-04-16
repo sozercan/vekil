@@ -182,7 +182,9 @@ func dbusNotify(summary, body string) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	obj := conn.Object(dbusNotifyDest, dbusNotifyPath)
 	call := obj.Call(dbusNotifyIface+".Notify", 0,
@@ -208,7 +210,9 @@ func dbusNotifyWithActions(summary, body string, actions []string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	obj := conn.Object(dbusNotifyDest, dbusNotifyPath)
 
