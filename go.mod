@@ -11,5 +11,6 @@ require (
 require (
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/klauspost/compress v1.18.4 // indirect
+	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	golang.org/x/sys v0.15.0 // indirect
 )

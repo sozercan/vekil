@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pkg/browser"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
@@ -17,6 +18,79 @@ import (
 )
 
 func main() {
+	// Dispatch subcommands before falling through to the default server mode.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "login":
+			runLogin(os.Args[2:])
+			return
+		case "logout":
+			runLogout(os.Args[2:])
+			return
+		}
+	}
+
+	runServe()
+}
+
+func runLogin(args []string) {
+	fs := flag.NewFlagSet("login", flag.ExitOnError)
+	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
+	fs.Parse(args) //nolint:errcheck
+
+	authenticator, err := auth.NewAuthenticator(*tokenDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if authenticator.IsSignedIn() {
+		fmt.Fprintln(os.Stderr, "Already logged in.")
+		return
+	}
+
+	ctx := context.Background()
+	dcResp, err := authenticator.RequestDeviceCode(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error requesting device code: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stderr, "Opening browser to %s\n", dcResp.VerificationURI)
+	fmt.Fprintf(os.Stderr, "Enter code: %s\n", dcResp.UserCode)
+
+	if err := browser.OpenURL(dcResp.VerificationURI); err != nil {
+		fmt.Fprintf(os.Stderr, "Could not open browser automatically, please visit the URL above.\n")
+	}
+
+	if err := authenticator.PollForAuthorization(ctx, dcResp); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintln(os.Stderr, "Login successful.")
+}
+
+func runLogout(args []string) {
+	fs := flag.NewFlagSet("logout", flag.ExitOnError)
+	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
+	fs.Parse(args) //nolint:errcheck
+
+	authenticator, err := auth.NewAuthenticator(*tokenDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := authenticator.SignOut(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintln(os.Stderr, "Logged out.")
+}
+
+func runServe() {
 	port := flag.String("port", getEnv("PORT", "1337"), "Listen port")
 	host := flag.String("host", getEnv("HOST", "0.0.0.0"), "Listen host")
 	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
