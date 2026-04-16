@@ -1,6 +1,6 @@
-# macOS Menubar App
+# System Tray App
 
-The repo includes a native macOS menubar app for running the proxy without keeping a terminal open. Published app bundles also include Sparkle-based update checks.
+The repo includes a system tray app for running the proxy without keeping a terminal open. It supports macOS and Linux. Published macOS app bundles also include Sparkle-based update checks.
 
 ## Download And Run
 
@@ -55,3 +55,45 @@ The release workflow publishes two macOS updater assets:
 - `appcast.xml`
 
 It signs the appcast with `SPARKLE_PRIVATE_ED_KEY`, so repository releases need both `SPARKLE_PUBLIC_ED_KEY` and `SPARKLE_PRIVATE_ED_KEY` secrets configured.
+
+## Linux System Tray
+
+The same tray app runs on Linux using the DBus StatusNotifierItem protocol (supported by Waybar, KDE Plasma, GNOME with the AppIndicator extension, and others).
+
+### Build
+
+```bash
+make build-tray-linux
+./vekil-tray
+```
+
+No CGO or external libraries are required. To cross-compile for a different architecture:
+
+```bash
+GOARCH=arm64 make build-tray-linux
+```
+
+### Features
+
+Same as macOS:
+
+- start/stop toggle from the tray
+- status icon: white robot when running, gray when stopped
+- current app version shown in the menu
+- optional XDG autostart for launch at login (`~/.config/autostart/vekil.desktop`)
+- tooltip showing running/stopped state and port
+
+The `Check for Updates...` menu item is not available on Linux.
+
+### Optional Dependencies
+
+Dialogs, notifications, and the sign-in flow use DBus (`org.freedesktop.Notifications`) directly -- no external tools are required when a notification daemon is running (GNOME, KDE, dunst, mako, swaync, etc.). If `zenity` or `kdialog` is installed, those are preferred for richer dialog windows.
+
+The clipboard and URL opening still require external tools:
+
+| Feature | Packages |
+|---------|----------|
+| Dialogs | Built-in via DBus; optionally `zenity` (GTK) or `kdialog` (KDE) for richer UI |
+| Clipboard | `wl-clipboard` (Wayland), `xclip`, or `xsel` (X11) |
+| Open URLs | `xdg-open` (usually pre-installed via `xdg-utils`) |
+| Notifications | Built-in via DBus; falls back to `notify-send` |

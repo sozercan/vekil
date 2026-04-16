@@ -14,7 +14,7 @@ SPARKLE_DOWNLOAD_URL := https://github.com/sparkle-project/Sparkle/releases/down
 SPARKLE_FEED_URL ?= https://github.com/sozercan/vekil/releases/latest/download/appcast.xml
 SPARKLE_PUBLIC_ED_KEY ?=
 
-.PHONY: build build-app test-app test vet lint clean docker-build
+.PHONY: build build-app build-tray-linux test-app test vet lint clean docker-build
 
 build:
 	go build -ldflags="$(LDFLAGS)" -o $(BINARY) .
@@ -84,6 +84,12 @@ test-app: build-app
 	/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$(APP_NAME)/Contents/Info.plist" | grep -Fxq '$(SPARKLE_FEED_URL)'
 	otool -L "$(APP_NAME)/Contents/MacOS/vekil-menubar" | grep -Fq '@rpath/Sparkle.framework/Versions/B/Sparkle'
 
+TRAY_LINUX_BINARY := vekil-tray
+
+build-tray-linux:
+	CGO_ENABLED=0 GOOS=linux \
+		go build -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o $(TRAY_LINUX_BINARY) ./cmd/menubar/
+
 test:
 	go test ./... -count=1
 
@@ -93,7 +99,7 @@ vet:
 lint: vet
 
 clean:
-	rm -f $(BINARY)
+	rm -f $(BINARY) $(TRAY_LINUX_BINARY)
 	rm -rf "$(APP_NAME)" .build
 
 docker-build:
