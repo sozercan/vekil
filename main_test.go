@@ -47,9 +47,9 @@ func TestGetEnvBool(t *testing.T) {
 	const envKey = "TEST_BOOL_VAR"
 
 	tests := []struct {
-		name string
+		name  string
 		value string
-		want bool
+		want  bool
 	}{
 		{name: "empty uses fallback", value: "", want: false},
 		{name: "true parses", value: "true", want: true},
@@ -72,9 +72,9 @@ func TestGetEnvInt(t *testing.T) {
 	const envKey = "TEST_INT_VAR"
 
 	tests := []struct {
-		name string
+		name  string
 		value string
-		want int
+		want  int
 	}{
 		{name: "empty uses fallback", value: "", want: 42},
 		{name: "valid int parses", value: "100", want: 100},
@@ -112,5 +112,42 @@ func TestGetEnvWarnsOnInvalidValue(t *testing.T) {
 	want := fmt.Sprintf("warning: ignoring invalid %s=%q", envKey, "not-a-bool")
 	if !bytes.Contains([]byte(output), []byte(want)) {
 		t.Errorf("expected stderr to contain %q, got %q", want, output)
+	}
+}
+
+func TestCommandFromArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want cliCommand
+	}{
+		{
+			name: "no subcommand falls back to serve",
+			args: []string{"vekil"},
+			want: cliCommandServe,
+		},
+		{
+			name: "login subcommand dispatches",
+			args: []string{"vekil", "login"},
+			want: cliCommandLogin,
+		},
+		{
+			name: "logout subcommand dispatches",
+			args: []string{"vekil", "logout"},
+			want: cliCommandLogout,
+		},
+		{
+			name: "unknown subcommand falls back to serve",
+			args: []string{"vekil", "serve"},
+			want: cliCommandServe,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := commandFromArgs(tc.args); got != tc.want {
+				t.Fatalf("commandFromArgs(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
 	}
 }
