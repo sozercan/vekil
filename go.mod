@@ -11,5 +11,4 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/klauspost/compress v1.18.4
 )
-
 require golang.org/x/sys v0.15.0 // indirect
