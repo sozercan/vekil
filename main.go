@@ -17,20 +17,41 @@ import (
 	"github.com/sozercan/vekil/server"
 )
 
+type cliCommand int
+
+const (
+	cliCommandServe cliCommand = iota
+	cliCommandLogin
+	cliCommandLogout
+)
+
 func main() {
 	// Dispatch subcommands before falling through to the default server mode.
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "login":
-			runLogin(os.Args[2:])
-			return
-		case "logout":
-			runLogout(os.Args[2:])
-			return
-		}
+	switch commandFromArgs(os.Args) {
+	case cliCommandLogin:
+		runLogin(os.Args[2:])
+		return
+	case cliCommandLogout:
+		runLogout(os.Args[2:])
+		return
 	}
 
 	runServe()
+}
+
+func commandFromArgs(args []string) cliCommand {
+	if len(args) < 2 {
+		return cliCommandServe
+	}
+
+	switch args[1] {
+	case "login":
+		return cliCommandLogin
+	case "logout":
+		return cliCommandLogout
+	default:
+		return cliCommandServe
+	}
 }
 
 func runLogin(args []string) {
@@ -48,6 +69,9 @@ func runLogin(args []string) {
 	if _, err := authenticator.RefreshTokenNonInteractive(ctx); err == nil {
 		fmt.Fprintln(os.Stderr, "Already logged in.")
 		return
+	} else if !auth.IsInteractiveLoginRequired(err) {
+		fmt.Fprintf(os.Stderr, "error refreshing existing login: %v\n", err)
+		os.Exit(1)
 	}
 
 	dcResp, err := authenticator.RequestDeviceCode(ctx)

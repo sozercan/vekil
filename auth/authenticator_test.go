@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -631,8 +632,8 @@ func TestRefreshToken_DisableAutoDeviceFlow(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when DisableAutoDeviceFlow is true")
 	}
-	if err.Error() != "not authenticated" {
-		t.Errorf("expected 'not authenticated', got %q", err.Error())
+	if !errors.Is(err, ErrNotAuthenticated) {
+		t.Errorf("expected ErrNotAuthenticated, got %v", err)
 	}
 }
 
@@ -736,6 +737,8 @@ func TestRefreshTokenNonInteractive_DetectsRevokedAccessTokenDespiteCachedCopilo
 
 	if _, err := a.RefreshTokenNonInteractive(context.Background()); err == nil {
 		t.Fatal("expected error for revoked access token")
+	} else if !errors.Is(err, ErrInvalidAccessToken) {
+		t.Fatalf("expected ErrInvalidAccessToken, got %v", err)
 	}
 	if calls != 1 {
 		t.Fatalf("expected 1 token exchange, got %d", calls)
@@ -762,7 +765,71 @@ func TestRefreshTokenNonInteractive_RequiresGitHubAccessToken(t *testing.T) {
 
 	if _, err := a.RefreshTokenNonInteractive(context.Background()); err == nil {
 		t.Fatal("expected error when only copilot token is persisted")
-	} else if err.Error() != "not authenticated" {
-		t.Fatalf("expected not authenticated, got %q", err.Error())
+	} else if !errors.Is(err, ErrNotAuthenticated) {
+		t.Fatalf("expected ErrNotAuthenticated, got %v", err)
+	}
+}
+
+func TestRefreshTokenNonInteractive_PreservesTransientExchangeError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
+			ErrorDetails: "temporary upstream failure",
+		})
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("valid-access-token"), 0o600); err != nil {
+		t.Fatalf("write access token: %v", err)
+	}
+
+	a := &Authenticator{
+		tokenDir:       dir,
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	_, err := a.RefreshTokenNonInteractive(context.Background())
+	if err == nil {
+		t.Fatal("expected transient refresh error")
+	}
+	if errors.Is(err, ErrNotAuthenticated) || errors.Is(err, ErrInvalidAccessToken) {
+		t.Fatalf("expected transient error classification, got %v", err)
+	}
+	if got := err.Error(); got != "copilot token request failed with status 503: temporary upstream failure" {
+		t.Fatalf("unexpected error: %q", got)
+	}
+}
+
+func TestRefreshToken_AutoDeviceFlowReturnsTransientRefreshError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
+			ErrorDetails: "gateway unavailable",
+		})
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("valid-access-token"), 0o600); err != nil {
+		t.Fatalf("write access token: %v", err)
+	}
+
+	a := &Authenticator{
+		tokenDir:       dir,
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	err := a.refreshToken(context.Background(), true)
+	if err == nil {
+		t.Fatal("expected refresh error")
+	}
+	if IsInteractiveLoginRequired(err) {
+		t.Fatalf("expected transient error to bypass device flow, got %v", err)
+	}
+	if got := err.Error(); got != "copilot token request failed with status 502: gateway unavailable" {
+		t.Fatalf("unexpected error: %q", got)
 	}
 }

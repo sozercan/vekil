@@ -5,6 +5,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,6 +28,16 @@ const (
 var accessTokenEnvVars = []string{
 	"COPILOT_GITHUB_TOKEN",
 }
+
+var (
+	// ErrNotAuthenticated indicates that no reusable GitHub access token was
+	// available for a token refresh attempt.
+	ErrNotAuthenticated = errors.New("not authenticated")
+
+	// ErrInvalidAccessToken indicates that a stored GitHub access token exists
+	// but can no longer be exchanged for a Copilot token.
+	ErrInvalidAccessToken = errors.New("invalid access token")
+)
 
 // Authenticator manages GitHub OAuth and Copilot API tokens.
 // It handles the device code flow, token caching to disk, and automatic
@@ -167,6 +178,12 @@ func (a *Authenticator) RefreshTokenNonInteractive(ctx context.Context) (string,
 	return a.copilotToken, nil
 }
 
+// IsInteractiveLoginRequired reports whether resolving the error should fall
+// back to an interactive device-code login flow.
+func IsInteractiveLoginRequired(err error) bool {
+	return errors.Is(err, ErrNotAuthenticated) || errors.Is(err, ErrInvalidAccessToken)
+}
+
 func (a *Authenticator) getToken(ctx context.Context, allowDeviceFlow bool) (string, error) {
 	if envToken, _ := lookupAccessTokenFromEnv(); envToken != "" {
 		return a.getTokenFromEnv(ctx, envToken)
@@ -234,21 +251,39 @@ func (a *Authenticator) refreshToken(ctx context.Context, allowDeviceFlow bool) 
 		return a.exchangeForCopilotToken(ctx)
 	}
 
-	if a.accessToken != "" {
+	currentAccessToken := a.accessToken
+	var refreshErr error
+
+	if currentAccessToken != "" {
 		if err := a.exchangeForCopilotToken(ctx); err == nil {
 			return nil
+		} else {
+			refreshErr = err
 		}
 	}
 
 	if err := a.loadAccessToken(); err == nil {
-		if err := a.exchangeForCopilotToken(ctx); err == nil {
-			return nil
+		if a.accessToken != currentAccessToken || currentAccessToken == "" {
+			if err := a.exchangeForCopilotToken(ctx); err == nil {
+				return nil
+			} else {
+				refreshErr = err
+			}
 		}
+	} else if refreshErr == nil && !os.IsNotExist(err) {
+		refreshErr = fmt.Errorf("loading access token: %w", err)
+	}
+
+	if refreshErr == nil {
+		refreshErr = ErrNotAuthenticated
 	}
 	if !allowDeviceFlow {
-		return fmt.Errorf("not authenticated")
+		return refreshErr
 	}
-	return a.deviceCodeFlow(ctx)
+	if IsInteractiveLoginRequired(refreshErr) {
+		return a.deviceCodeFlow(ctx)
+	}
+	return refreshErr
 }
 
 // RequestDeviceCode initiates the GitHub device-code flow by requesting a
@@ -410,6 +445,21 @@ func (a *Authenticator) exchangeForCopilotToken(ctx context.Context) error {
 	}
 
 	if ctResp.Token == "" {
+		if resp.StatusCode == http.StatusUnauthorized || isInvalidAccessTokenDetail(ctResp.ErrorDetails) {
+			if strings.TrimSpace(ctResp.ErrorDetails) == "" {
+				return ErrInvalidAccessToken
+			}
+			return fmt.Errorf("%w: %s", ErrInvalidAccessToken, ctResp.ErrorDetails)
+		}
+		if resp.StatusCode != http.StatusOK {
+			if strings.TrimSpace(ctResp.ErrorDetails) != "" {
+				return fmt.Errorf("copilot token request failed with status %d: %s", resp.StatusCode, ctResp.ErrorDetails)
+			}
+			return fmt.Errorf("copilot token request failed with status %d", resp.StatusCode)
+		}
+		if strings.TrimSpace(ctResp.ErrorDetails) == "" {
+			return fmt.Errorf("empty copilot token")
+		}
 		return fmt.Errorf("empty copilot token: %s", ctResp.ErrorDetails)
 	}
 
@@ -470,6 +520,11 @@ func lookupAccessTokenFromEnv() (string, string) {
 		}
 	}
 	return "", ""
+}
+
+func isInvalidAccessTokenDetail(detail string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(detail))
+	return strings.Contains(normalized, "invalid access token")
 }
 
 // atomicWriteFile writes data to a temporary file in the same directory as
