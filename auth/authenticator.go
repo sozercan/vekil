@@ -153,6 +153,20 @@ func (a *Authenticator) GetTokenNonInteractive(ctx context.Context) (string, err
 	return a.getToken(ctx, false)
 }
 
+// RefreshTokenNonInteractive refreshes the Copilot API token using existing
+// GitHub authentication without falling back to the interactive device-code
+// flow. Unlike GetTokenNonInteractive, it bypasses any cached Copilot token so
+// callers can verify that the underlying GitHub auth is still refreshable.
+func (a *Authenticator) RefreshTokenNonInteractive(ctx context.Context) (string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if err := a.refreshToken(ctx, false); err != nil {
+		return "", err
+	}
+	return a.copilotToken, nil
+}
+
 func (a *Authenticator) getToken(ctx context.Context, allowDeviceFlow bool) (string, error) {
 	if envToken, _ := lookupAccessTokenFromEnv(); envToken != "" {
 		return a.getTokenFromEnv(ctx, envToken)
@@ -218,6 +232,12 @@ func (a *Authenticator) refreshToken(ctx context.Context, allowDeviceFlow bool) 
 	if envToken, _ := lookupAccessTokenFromEnv(); envToken != "" {
 		a.accessToken = envToken
 		return a.exchangeForCopilotToken(ctx)
+	}
+
+	if a.accessToken != "" {
+		if err := a.exchangeForCopilotToken(ctx); err == nil {
+			return nil
+		}
 	}
 
 	if err := a.loadAccessToken(); err == nil {

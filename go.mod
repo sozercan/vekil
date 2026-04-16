@@ -2,15 +2,14 @@ module github.com/sozercan/vekil
 
 go 1.25
 
-require (
-	fyne.io/systray v1.12.0
-	github.com/google/uuid v1.6.0
-	github.com/gorilla/websocket v1.5.3
-)
+require github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
 
 require (
-	github.com/godbus/dbus/v5 v5.1.0 // indirect
-	github.com/klauspost/compress v1.18.4 // indirect
-	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
-	golang.org/x/sys v0.15.0 // indirect
+	fyne.io/systray v1.12.0
+	github.com/godbus/dbus/v5 v5.1.0
+	github.com/google/uuid v1.6.0
+	github.com/gorilla/websocket v1.5.3
+	github.com/klauspost/compress v1.18.4
 )
+
+require golang.org/x/sys v0.15.0 // indirect

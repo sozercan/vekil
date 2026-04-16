@@ -667,3 +667,102 @@ func TestRefreshToken_UsesEnvAccessTokenWithoutSavingAccessToken(t *testing.T) {
 		t.Fatalf("expected no access-token file to be written, got err=%v", err)
 	}
 }
+
+func TestRefreshTokenNonInteractive_UsesPersistedAccessToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "token valid-access-token" {
+			t.Errorf("expected 'token valid-access-token', got %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
+			Token:     "refreshed-copilot-token",
+			ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
+		})
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("valid-access-token"), 0o600); err != nil {
+		t.Fatalf("write access token: %v", err)
+	}
+
+	a := &Authenticator{
+		tokenDir:       dir,
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	token, err := a.RefreshTokenNonInteractive(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if token != "refreshed-copilot-token" {
+		t.Fatalf("expected refreshed-copilot-token, got %q", token)
+	}
+}
+
+func TestRefreshTokenNonInteractive_DetectsRevokedAccessTokenDespiteCachedCopilotToken(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if got := r.Header.Get("Authorization"); got != "token revoked-access-token" {
+			t.Errorf("expected 'token revoked-access-token', got %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
+			ErrorDetails: "invalid access token",
+		})
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("revoked-access-token"), 0o600); err != nil {
+		t.Fatalf("write access token: %v", err)
+	}
+	data, err := json.Marshal(CopilotTokenResponse{
+		Token:     "persisted-copilot-token",
+		ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("marshal token: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "api-key.json"), data, 0o600); err != nil {
+		t.Fatalf("write copilot token: %v", err)
+	}
+
+	a := &Authenticator{
+		tokenDir:       dir,
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	if _, err := a.RefreshTokenNonInteractive(context.Background()); err == nil {
+		t.Fatal("expected error for revoked access token")
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 token exchange, got %d", calls)
+	}
+}
+
+func TestRefreshTokenNonInteractive_RequiresGitHubAccessToken(t *testing.T) {
+	dir := t.TempDir()
+	data, err := json.Marshal(CopilotTokenResponse{
+		Token:     "persisted-copilot-token",
+		ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("marshal token: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "api-key.json"), data, 0o600); err != nil {
+		t.Fatalf("write copilot token: %v", err)
+	}
+
+	a := &Authenticator{
+		tokenDir: dir,
+		client:   &http.Client{Timeout: 5 * time.Second},
+	}
+
+	if _, err := a.RefreshTokenNonInteractive(context.Background()); err == nil {
+		t.Fatal("expected error when only copilot token is persisted")
+	} else if err.Error() != "not authenticated" {
+		t.Fatalf("expected not authenticated, got %q", err.Error())
+	}
+}

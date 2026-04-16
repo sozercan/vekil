@@ -44,12 +44,12 @@ func runLogin(args []string) {
 		os.Exit(1)
 	}
 
-	if authenticator.IsSignedIn() {
+	ctx := context.Background()
+	if _, err := authenticator.RefreshTokenNonInteractive(ctx); err == nil {
 		fmt.Fprintln(os.Stderr, "Already logged in.")
 		return
 	}
 
-	ctx := context.Background()
 	dcResp, err := authenticator.RequestDeviceCode(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error requesting device code: %v\n", err)
