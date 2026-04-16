@@ -27,6 +27,16 @@ func TestDesktopEntry(t *testing.T) {
 	}
 }
 
+func TestDesktopEntryEscapesExecPath(t *testing.T) {
+	t.Parallel()
+
+	entry := desktopEntry(`/tmp/My Apps/vekil%tray`)
+
+	if !strings.Contains(entry, `Exec="/tmp/My Apps/vekil%%tray"`) {
+		t.Fatalf("desktopEntry() did not escape Exec path:\n%s", entry)
+	}
+}
+
 func TestInstallRemoveLaunchAgent(t *testing.T) {
 	// Cannot use t.Parallel() because t.Setenv modifies process environment.
 

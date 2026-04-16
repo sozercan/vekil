@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const autostartFilename = "vekil.desktop"
@@ -33,7 +34,38 @@ Comment=Vekil proxy system tray
 Exec=%s
 Terminal=false
 X-GNOME-Autostart-enabled=true
-`, executable)
+`, desktopExec(executable))
+}
+
+const desktopExecReservedChars = " \t\n\"'\\><~|&;$*?#()`"
+
+func desktopExec(executable string) string {
+	executable = strings.ReplaceAll(executable, "%", "%%")
+	if !strings.ContainsAny(executable, desktopExecReservedChars) {
+		return executable
+	}
+
+	var b strings.Builder
+	b.Grow(len(executable) + 2)
+	b.WriteByte('"')
+	for _, r := range executable {
+		switch r {
+		case '\\':
+			b.WriteString(`\\\\`)
+		case '"':
+			b.WriteString(`\\"`)
+		case '$':
+			b.WriteString(`\\$`)
+		case '`':
+			b.WriteByte('\\')
+			b.WriteByte('\\')
+			b.WriteByte('`')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 func isLaunchAgentInstalled() bool {

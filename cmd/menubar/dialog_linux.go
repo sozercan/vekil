@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -12,42 +14,60 @@ const dbusNotifyDest = "org.freedesktop.Notifications"
 const dbusNotifyPath = "/org/freedesktop/Notifications"
 const dbusNotifyIface = "org.freedesktop.Notifications"
 
+var (
+	errNotificationDismissed = errors.New("notification dismissed")
+	execLookPath             = exec.LookPath
+	execCommand              = exec.Command
+	notifyWithActions        = dbusNotifyWithActions
+	notify                   = dbusNotify
+)
+
+type dialogAttemptResult int
+
+const (
+	dialogUnavailable dialogAttemptResult = iota
+	dialogAccepted
+	dialogCanceled
+)
+
 // showOsascriptDialog displays a dialog using zenity, kdialog, or a DBus
 // notification with action buttons, and returns the button the user clicked.
 // If no dialog mechanism is available, defaultButton is returned so that the
 // calling flow proceeds automatically.
 func showOsascriptDialog(title, message, defaultButton, secondButton string) string {
 	// Try zenity first (GNOME/GTK).
-	if zenity, err := exec.LookPath("zenity"); err == nil {
-		err := exec.Command(zenity,
+	if zenity, err := execLookPath("zenity"); err == nil {
+		switch runQuestionDialog(zenity,
 			"--question",
 			"--title="+title,
 			"--text="+message,
 			"--ok-label="+defaultButton,
 			"--cancel-label="+secondButton,
-		).Run()
-		if err != nil {
+		) {
+		case dialogAccepted:
+			return defaultButton
+		case dialogCanceled:
 			return "Cancel"
 		}
-		return defaultButton
 	}
 
 	// Fall back to kdialog (KDE).
-	if kdialog, err := exec.LookPath("kdialog"); err == nil {
-		err := exec.Command(kdialog,
+	if kdialog, err := execLookPath("kdialog"); err == nil {
+		switch runQuestionDialog(kdialog,
 			"--title", title,
 			"--yesno", message,
 			"--yes-label", defaultButton,
 			"--no-label", secondButton,
-		).Run()
-		if err != nil {
+		) {
+		case dialogAccepted:
+			return defaultButton
+		case dialogCanceled:
 			return "Cancel"
 		}
-		return defaultButton
 	}
 
 	// Fall back to DBus notification with action buttons.
-	action, err := dbusNotifyWithActions(title, message, []string{
+	action, err := notifyWithActions(title, message, []string{
 		"default", defaultButton,
 		"cancel", secondButton,
 	})
@@ -57,6 +77,9 @@ func showOsascriptDialog(title, message, defaultButton, secondButton string) str
 		}
 		return defaultButton
 	}
+	if errors.Is(err, errNotificationDismissed) {
+		return "Cancel"
+	}
 
 	// No dialog mechanism available — proceed automatically.
 	return defaultButton
@@ -65,25 +88,23 @@ func showOsascriptDialog(title, message, defaultButton, secondButton string) str
 // showErrorDialog displays a simple error dialog using zenity, kdialog, or a
 // DBus notification.
 func showErrorDialog(title, message string) {
-	if zenity, err := exec.LookPath("zenity"); err == nil {
-		_ = exec.Command(zenity,
-			"--error",
-			"--title="+title,
-			"--text="+message,
-		).Run()
+	if zenity, err := execLookPath("zenity"); err == nil && runDialog(zenity,
+		"--error",
+		"--title="+title,
+		"--text="+message,
+	) {
 		return
 	}
 
-	if kdialog, err := exec.LookPath("kdialog"); err == nil {
-		_ = exec.Command(kdialog,
-			"--title", title,
-			"--error", message,
-		).Run()
+	if kdialog, err := execLookPath("kdialog"); err == nil && runDialog(kdialog,
+		"--title", title,
+		"--error", message,
+	) {
 		return
 	}
 
 	// Fall back to a plain DBus notification (no actions needed).
-	_ = dbusNotify(title, message)
+	_ = notify(title, message)
 }
 
 // copyToClipboard copies the given text to the clipboard, trying Wayland and
@@ -123,10 +144,36 @@ func openURL(url string) {
 // showNotification displays a desktop notification. It tries DBus directly
 // first, falling back to notify-send.
 func showNotification(title, message string) {
-	if err := dbusNotify(title, message); err == nil {
+	if err := notify(title, message); err == nil {
 		return
 	}
-	_ = exec.Command("notify-send", title, message).Run()
+	_ = execCommand("notify-send", title, message).Run()
+}
+
+func runQuestionDialog(command string, args ...string) dialogAttemptResult {
+	output, err := execCommand(command, args...).CombinedOutput()
+	if err == nil {
+		return dialogAccepted
+	}
+	if isDialogCancel(err, output) {
+		return dialogCanceled
+	}
+	return dialogUnavailable
+}
+
+func runDialog(command string, args ...string) bool {
+	return execCommand(command, args...).Run() == nil
+}
+
+func isDialogCancel(err error, output []byte) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	if exitErr.ExitCode() != 1 {
+		return false
+	}
+	return len(bytes.TrimSpace(output)) == 0
 }
 
 // dbusNotify sends a simple notification (no action buttons) via DBus.
@@ -211,7 +258,7 @@ func dbusNotifyWithActions(summary, body string, actions []string) (string, erro
 		case dbusNotifyIface + ".NotificationClosed":
 			if len(sig.Body) >= 1 {
 				if id, ok := sig.Body[0].(uint32); ok && id == nid {
-					return "", fmt.Errorf("notification dismissed")
+					return "", errNotificationDismissed
 				}
 			}
 		}
