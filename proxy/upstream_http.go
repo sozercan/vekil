@@ -94,10 +94,6 @@ func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*h
 	return h.postJSONEndpoint(ctx, "/chat/completions", body)
 }
 
-func (h *ProxyHandler) postResponses(ctx context.Context, body []byte) (*http.Response, error) {
-	return h.postJSONEndpoint(ctx, "/responses", body)
-}
-
 func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
 	return h.postJSONEndpointWithHeaders(ctx, "/responses", body, extraHeaders)
 }

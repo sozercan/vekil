@@ -410,10 +410,6 @@ func stripUnsupportedResponsesRequestFields(bodyBytes []byte) ([]byte, []string)
 	return bodyBytes, nil
 }
 
-func (h *ProxyHandler) postResponsesWithFallback(ctx context.Context, bodyBytes []byte) (*http.Response, error) {
-	return h.postResponsesWithFallbackHeaders(ctx, bodyBytes, nil)
-}
-
 func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, bodyBytes []byte, extraHeaders http.Header) (*http.Response, error) {
 	resp, err := h.postResponsesWithHeaders(ctx, bodyBytes, extraHeaders)
 	if err != nil {
