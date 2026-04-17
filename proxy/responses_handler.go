@@ -32,13 +32,6 @@ func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
 // HandleResponses handles POST /v1/responses by forwarding the request to
 // Copilot's responses endpoint with only auth headers injected.
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
-	token, err := h.auth.GetToken(r.Context())
-	if err != nil {
-		h.log.Error("failed to get token", logger.F("endpoint", "responses"), logger.Err(err))
-		writeOpenAIError(w, http.StatusInternalServerError, "authentication failed", "server_error")
-		return
-	}
-
 	bodyBytes, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
@@ -60,16 +53,34 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(isStreaming)
 	defer upstreamCancel()
 
-	resp, err := h.postResponsesWithHeaders(upstreamCtx, token, bodyBytes, extraHeaders)
+	resp, err := h.postResponsesWithHeaders(upstreamCtx, bodyBytes, extraHeaders)
 	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "responses"), logger.Err(err))
-		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), "upstream request failed", "server_error")
+		if statusCode == http.StatusBadRequest {
+			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+			return
+		}
+		if statusCode == http.StatusInternalServerError {
+			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
+			return
+		}
+		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
 		return
 	}
-	resp, err = h.maybeRetryCompactedResponsesRequest(upstreamCtx, token, bodyBytes, extraHeaders, resp)
+	resp, err = h.maybeRetryCompactedResponsesRequest(upstreamCtx, bodyBytes, extraHeaders, resp)
 	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "responses"), logger.Err(err))
-		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), "upstream request failed", "server_error")
+		if statusCode == http.StatusBadRequest {
+			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+			return
+		}
+		if statusCode == http.StatusInternalServerError {
+			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
+			return
+		}
+		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
 		return
 	}
 
@@ -106,13 +117,6 @@ Be concise, structured, and action-oriented. Do not chat with the user. Do not a
 // that Codex expects. The returned compaction item is a proxy-owned token that
 // this proxy can later expand back into summarized context for /responses.
 func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
-	token, err := h.auth.GetToken(r.Context())
-	if err != nil {
-		h.log.Error("failed to get token", logger.F("endpoint", "compact"), logger.Err(err))
-		writeOpenAIError(w, http.StatusInternalServerError, "authentication failed", "server_error")
-		return
-	}
-
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
@@ -135,10 +139,19 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
 
-	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, token, bodyBytes, responsesExtraHeadersFromRequest(r))
+	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, bodyBytes, responsesExtraHeadersFromRequest(r))
 	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "compact"), logger.Err(err))
-		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), "upstream request failed", "server_error")
+		if statusCode == http.StatusBadRequest {
+			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+			return
+		}
+		if statusCode == http.StatusInternalServerError {
+			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
+			return
+		}
+		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -209,13 +222,6 @@ Respond with a JSON array where each element has "trace_summary" and "memory_sum
 // the traces to the upstream /responses endpoint with a summarization prompt,
 // then transforming the response into the format Codex expects.
 func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Request) {
-	token, err := h.auth.GetToken(r.Context())
-	if err != nil {
-		h.log.Error("failed to get token", logger.F("endpoint", "memory_summarize"), logger.Err(err))
-		writeOpenAIError(w, http.StatusInternalServerError, "authentication failed", "server_error")
-		return
-	}
-
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
@@ -258,10 +264,19 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
 
-	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, token, reqBody, responsesExtraHeadersFromRequest(r))
+	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, reqBody, responsesExtraHeadersFromRequest(r))
 	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "memory_summarize"), logger.Err(err))
-		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), "upstream request failed", "server_error")
+		if statusCode == http.StatusBadRequest {
+			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+			return
+		}
+		if statusCode == http.StatusInternalServerError {
+			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
+			return
+		}
+		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -395,12 +410,12 @@ func stripUnsupportedResponsesRequestFields(bodyBytes []byte) ([]byte, []string)
 	return bodyBytes, nil
 }
 
-func (h *ProxyHandler) postResponsesWithFallback(ctx context.Context, token string, bodyBytes []byte) (*http.Response, error) {
-	return h.postResponsesWithFallbackHeaders(ctx, token, bodyBytes, nil)
+func (h *ProxyHandler) postResponsesWithFallback(ctx context.Context, bodyBytes []byte) (*http.Response, error) {
+	return h.postResponsesWithFallbackHeaders(ctx, bodyBytes, nil)
 }
 
-func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, token string, bodyBytes []byte, extraHeaders http.Header) (*http.Response, error) {
-	resp, err := h.postResponsesWithHeaders(ctx, token, bodyBytes, extraHeaders)
+func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, bodyBytes []byte, extraHeaders http.Header) (*http.Response, error) {
+	resp, err := h.postResponsesWithHeaders(ctx, bodyBytes, extraHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -421,7 +436,8 @@ func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, tok
 	}
 
 	requestedModel := extractResponsesRequestModel(bodyBytes)
-	fallbackModel, fallbackErr := h.pickResponsesCompatibleModel(ctx, token, requestedModel)
+	provider, _, _ := h.resolveProviderModel(requestedModel, "/responses")
+	fallbackModel, fallbackErr := h.pickResponsesCompatibleModel(ctx, provider, requestedModel)
 	if fallbackErr != nil {
 		h.log.Debug("responses fallback lookup failed", logger.Err(fallbackErr))
 		return resp, nil
@@ -444,7 +460,7 @@ func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, tok
 		logger.F("fallback_model", fallbackModel),
 	)
 
-	retryResp, retryErr := h.postResponsesWithHeaders(ctx, token, fallbackBody, extraHeaders)
+	retryResp, retryErr := h.postResponsesWithHeaders(ctx, fallbackBody, extraHeaders)
 	if retryErr != nil {
 		h.log.Debug("responses fallback request failed", logger.Err(retryErr))
 		return resp, nil
@@ -453,7 +469,7 @@ func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, tok
 	return retryResp, nil
 }
 
-func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, token string, bodyBytes []byte, extraHeaders http.Header, resp *http.Response) (*http.Response, error) {
+func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, resp *http.Response) (*http.Response, error) {
 	if resp == nil || resp.StatusCode != http.StatusRequestEntityTooLarge {
 		return resp, nil
 	}
@@ -484,7 +500,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, 
 	}
 
 	prefixLen := len(input) - keepTail
-	summary, err := h.compactResponsesInput(ctx, token, model, input[:prefixLen], extraHeaders)
+	summary, err := h.compactResponsesInput(ctx, model, input[:prefixLen], extraHeaders)
 	if err != nil {
 		h.log.Debug("responses 413 compaction failed", logger.Err(err))
 		return resp, nil
@@ -530,7 +546,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, 
 		logger.F("compacted_bytes", rawMessagesSize(compactedInput)),
 	)
 
-	retryResp, retryErr := h.postResponsesWithHeaders(ctx, token, retryBody, extraHeaders)
+	retryResp, retryErr := h.postResponsesWithHeaders(ctx, retryBody, extraHeaders)
 	if retryErr != nil {
 		h.log.Debug("responses 413 retry request failed", logger.Err(retryErr))
 		return resp, nil
@@ -539,7 +555,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, 
 	return retryResp, nil
 }
 
-func (h *ProxyHandler) compactResponsesInput(ctx context.Context, token, model string, input []json.RawMessage, extraHeaders http.Header) (string, error) {
+func (h *ProxyHandler) compactResponsesInput(ctx context.Context, model string, input []json.RawMessage, extraHeaders http.Header) (string, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return "", fmt.Errorf("missing model for websocket compaction")
@@ -554,7 +570,7 @@ func (h *ProxyHandler) compactResponsesInput(ctx context.Context, token, model s
 		return "", err
 	}
 
-	resp, err := h.postResponsesWithFallbackHeaders(ctx, token, bodyBytes, extraHeaders)
+	resp, err := h.postResponsesWithFallbackHeaders(ctx, bodyBytes, extraHeaders)
 	if err != nil {
 		return "", err
 	}
@@ -635,53 +651,31 @@ func rewriteResponsesRequestModel(body []byte, model string) ([]byte, bool, erro
 	return rewritten, true, nil
 }
 
-func (h *ProxyHandler) pickResponsesCompatibleModel(ctx context.Context, token, exclude string) (string, error) {
-	resp, err := h.doWithRetry(func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.copilotURL+"/models", nil)
-		if err != nil {
-			return nil, err
-		}
-		h.setCopilotHeaders(req, token)
-		return req, nil
-	})
+func (h *ProxyHandler) pickResponsesCompatibleModel(ctx context.Context, provider *providerRuntime, exclude string) (string, error) {
+	if provider == nil {
+		return "", fmt.Errorf("provider is required")
+	}
+
+	result, err := h.fetchProviderModels(ctx, provider, "", "")
 	if err != nil {
-		return "", err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("unexpected /models status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var upstream struct {
-		Data []struct {
-			ID                 string   `json:"id"`
-			SupportedEndpoints []string `json:"supported_endpoints"`
-			Policy             struct {
-				State string `json:"state"`
-			} `json:"policy"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&upstream); err != nil {
 		return "", err
 	}
 
 	supported := make(map[string]struct{})
 	firstAvailable := ""
-	for _, model := range upstream.Data {
-		if model.ID == "" || model.ID == exclude {
+	for _, model := range result.models {
+		if model.publicID == "" || model.publicID == exclude {
 			continue
 		}
-		if !supportsEndpoint(model.SupportedEndpoints, "/responses") {
+		if !providerModelSupportsEndpoint(model, "/responses") {
 			continue
 		}
-		if strings.EqualFold(model.Policy.State, "disabled") {
+		if model.disabled {
 			continue
 		}
-		supported[model.ID] = struct{}{}
+		supported[model.publicID] = struct{}{}
 		if firstAvailable == "" {
-			firstAvailable = model.ID
+			firstAvailable = model.publicID
 		}
 	}
 

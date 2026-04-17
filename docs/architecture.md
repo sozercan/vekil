@@ -16,10 +16,9 @@
 │                       Translate ◄──   .com           │
 │                       OAI→Gemini                     │
 │                                                     │
-│  /v1/chat/completions ─────────► /chat/completions  │
-│                   (passthrough; forced-stream       │
-│                    + aggregate when tools present)  │
-│  /v1/responses ────────────────► /responses         │
+│  /v1/chat/completions ─────────► Provider router ─► │
+│  /v1/responses ────────────────► (Copilot / Azure  │
+│                   HTTP /responses)                 │
 │                   (passthrough + proxy compaction   │
 │                    expansion when needed)           │
 │  /v1/responses/compact ────────► /responses         │
@@ -36,7 +35,7 @@
 |---------|---------------|
 | `main` | CLI flags, HTTP server setup, graceful shutdown |
 | `auth/` | GitHub OAuth device code flow, Copilot token exchange, disk caching, auto-refresh |
-| `proxy/` | HTTP handlers, Anthropic/OpenAI and Gemini/OpenAI translation, SSE streaming, retry logic |
+| `proxy/` | HTTP handlers, provider routing, Anthropic/OpenAI and Gemini/OpenAI translation, SSE streaming, retry logic |
 | `models/` | Request and response type definitions only |
 | `logger/` | Structured JSON logging |
 | `server/` | Reusable HTTP server lifecycle |
@@ -45,7 +44,11 @@
 ## Key Decisions
 
 - Pure `net/http` with Go `ServeMux` routing; no web framework.
+- Public model IDs are a single namespace across providers. The proxy validates ownership during startup and fails fast on collisions.
+- Provider endpoint support is explicit. `models[].endpoints` is an allowlist, so do not expose `/chat/completions` or other routes for a provider/model until that upstream capability is verified.
 - Gemini is a translation path like Anthropic, not a passthrough path.
 - OpenAI Chat Completions is near-zero-copy except where forced streaming is needed for tool reliability.
 - OpenAI Responses compatibility is partly proxy-owned, especially for Codex compaction and websocket bridging.
+- The Codex websocket bridge is transport adaptation over upstream HTTP `/responses`, not a claim that the selected provider has native websocket or realtime support.
+- Azure OpenAI support is implemented as an OpenAI-compatible provider behind the existing proxy surface; Azure deployment names are internal to provider config.
 - Production dependencies stay minimal.

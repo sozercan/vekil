@@ -19,3 +19,4 @@ This folder is intentionally split into small, single-purpose files so humans an
 - Prefer linking to one focused file instead of expanding the root `README.md`.
 - When behavior changes, update the smallest relevant doc instead of adding more material to the root README.
 - Keep each doc narrowly scoped and avoid duplicating long explanations across files.
+- When documenting provider features, distinguish proxy-owned websocket bridging from upstream-native websocket or realtime APIs.

@@ -131,20 +131,22 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	token, err := h.auth.GetToken(r.Context())
-	if err != nil {
-		h.log.Error("failed to get token", logger.F("endpoint", "anthropic"), logger.Err(err))
-		writeAnthropicError(w, http.StatusInternalServerError, "api_error", "authentication failed")
-		return
-	}
-
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 
-	resp, err := h.postChatCompletions(upstreamCtx, token, oaiBody)
+	resp, err := h.postChatCompletions(upstreamCtx, oaiBody)
 	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "anthropic"), logger.Err(err))
-		writeAnthropicError(w, upstreamStatusCode(err, http.StatusBadGateway), "api_error", "upstream request failed")
+		if statusCode == http.StatusBadRequest {
+			writeAnthropicError(w, statusCode, "invalid_request_error", err.Error())
+			return
+		}
+		if statusCode == http.StatusInternalServerError {
+			writeAnthropicError(w, statusCode, "api_error", "authentication failed")
+			return
+		}
+		writeAnthropicError(w, statusCode, "api_error", "upstream request failed")
 		return
 	}
 
@@ -179,13 +181,6 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 // HandleOpenAIChatCompletions handles POST /v1/chat/completions by forwarding the
 // request to Copilot with only auth headers injected (near zero-copy passthrough).
 func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
-	token, err := h.auth.GetToken(r.Context())
-	if err != nil {
-		h.log.Error("failed to get token", logger.F("endpoint", "openai"), logger.Err(err))
-		writeOpenAIError(w, http.StatusInternalServerError, "authentication failed", "server_error")
-		return
-	}
-
 	bodyBytes, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
@@ -199,10 +194,19 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 
-	resp, err := h.postChatCompletions(upstreamCtx, token, bodyBytes)
+	resp, err := h.postChatCompletions(upstreamCtx, bodyBytes)
 	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "openai"), logger.Err(err))
-		writeOpenAIError(w, upstreamStatusCode(err, http.StatusBadGateway), "upstream request failed", "server_error")
+		if statusCode == http.StatusBadRequest {
+			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+			return
+		}
+		if statusCode == http.StatusInternalServerError {
+			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
+			return
+		}
+		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
 		return
 	}
 

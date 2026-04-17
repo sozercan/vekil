@@ -8,6 +8,7 @@ High-performance Go proxy that exposes Anthropic, Gemini, and OpenAI-compatible 
 - Gemini Generate Content and Count Tokens APIs
 - OpenAI Chat Completions API
 - OpenAI Responses API, including Codex websocket bridging
+- Multi-provider model routing, including Azure OpenAI deployments behind the same `/v1` endpoint
 - Proxy-owned Codex compatibility endpoints for compaction and memory summarization
 - Streaming, tool use, parallel tool calls, compressed request bodies, and OAuth token caching
 

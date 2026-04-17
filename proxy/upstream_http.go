@@ -1,11 +1,13 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 )
 
 func (h *ProxyHandler) newInferenceUpstreamContext(streaming bool) (context.Context, context.CancelFunc) {
@@ -23,11 +25,21 @@ func upstreamStatusCode(err error, fallback int) int {
 	if errors.As(err, &upstreamErr) {
 		return upstreamErr.statusCode
 	}
+	var providerErr *providerRequestError
+	if errors.As(err, &providerErr) {
+		return providerErr.statusCode
+	}
 	return fallback
 }
 
-func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, token, path string, body []byte) (*http.Response, error) {
-	return h.postJSONEndpointWithHeaders(ctx, token, path, body, nil)
+func extractRequestModel(body []byte) string {
+	var payload struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Model)
 }
 
 func mergeHeaderValues(dst, src http.Header) {
@@ -39,30 +51,55 @@ func mergeHeaderValues(dst, src http.Header) {
 	}
 }
 
-func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, token, path string, body []byte, extraHeaders http.Header) (*http.Response, error) {
+func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*providerRuntime, []byte, error) {
+	model := extractRequestModel(body)
+	provider, owner, known := h.resolveProviderModel(model, endpoint)
+	if provider == nil {
+		return nil, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no provider available for endpoint %s", endpoint)}
+	}
+	if known && !providerModelSupportsEndpoint(owner, endpoint) {
+		return nil, nil, &providerRequestError{
+			statusCode: http.StatusBadRequest,
+			err:        fmt.Errorf("model %q does not support %s", model, endpoint),
+		}
+	}
+
+	rewrittenBody, _, err := rewriteRequestModelForProvider(body, owner.upstreamModel)
+	if err != nil {
+		return nil, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+	}
+	return provider, rewrittenBody, nil
+}
+
+func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body []byte) (*http.Response, error) {
+	return h.postJSONEndpointWithHeaders(ctx, path, body, nil)
+}
+
+func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header) (*http.Response, error) {
+	provider, rewrittenBody, err := h.resolveProviderRequest(body, path)
+	if err != nil {
+		return nil, err
+	}
+
 	return h.doWithRetry(func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.copilotURL+path, bytes.NewReader(body))
+		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "")
 		if err != nil {
 			return nil, err
 		}
-		if len(extraHeaders) > 0 {
-			mergeHeaderValues(req.Header, extraHeaders)
-		}
-		h.setCopilotHeaders(req, token)
 		return req, nil
 	})
 }
 
-func (h *ProxyHandler) postChatCompletions(ctx context.Context, token string, body []byte) (*http.Response, error) {
-	return h.postJSONEndpoint(ctx, token, "/chat/completions", body)
+func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
+	return h.postJSONEndpoint(ctx, "/chat/completions", body)
 }
 
-func (h *ProxyHandler) postResponses(ctx context.Context, token string, body []byte) (*http.Response, error) {
-	return h.postJSONEndpoint(ctx, token, "/responses", body)
+func (h *ProxyHandler) postResponses(ctx context.Context, body []byte) (*http.Response, error) {
+	return h.postJSONEndpoint(ctx, "/responses", body)
 }
 
-func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, token string, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	return h.postJSONEndpointWithHeaders(ctx, token, "/responses", body, extraHeaders)
+func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
+	return h.postJSONEndpointWithHeaders(ctx, "/responses", body, extraHeaders)
 }
 
 func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {

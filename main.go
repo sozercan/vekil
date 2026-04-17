@@ -118,6 +118,7 @@ func runServe() {
 	port := flag.String("port", getEnv("PORT", "1337"), "Listen port")
 	host := flag.String("host", getEnv("HOST", "0.0.0.0"), "Listen host")
 	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
+	providersConfigPath := flag.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON provider configuration")
 	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
 	streamingUpstreamTimeout := flag.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
 	copilotEditorVersion := flag.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header")
@@ -138,14 +139,21 @@ func runServe() {
 		log.Fatal("failed to initialize authenticator", logger.Err(err))
 	}
 
-	log.Info("authenticating with GitHub Copilot...")
-	ctx := context.Background()
-	if _, err := authenticator.GetToken(ctx); err != nil {
-		log.Fatal("authentication failed", logger.Err(err))
+	providersCfg, err := proxy.LoadProvidersConfigFile(*providersConfigPath)
+	if err != nil {
+		log.Fatal("failed to load providers config", logger.Err(err))
 	}
-	log.Info("authenticated successfully")
 
-	srv := server.New(
+	if providersCfg.UsesCopilot() {
+		log.Info("authenticating with GitHub Copilot...")
+		ctx := context.Background()
+		if _, err := authenticator.GetToken(ctx); err != nil {
+			log.Fatal("authentication failed", logger.Err(err))
+		}
+		log.Info("authenticated successfully")
+	}
+
+	srv, err := server.New(
 		authenticator,
 		log,
 		*host,
@@ -164,7 +172,11 @@ func runServe() {
 			AutoCompactMaxBytes: *responsesWSCompactMaxBytes,
 			AutoCompactKeepTail: *responsesWSCompactKeepTail,
 		}),
+		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
 	)
+	if err != nil {
+		log.Fatal("failed to initialize server", logger.Err(err))
+	}
 
 	if err := srv.Start(); err != nil {
 		log.Fatal("server start error", logger.Err(err))
