@@ -773,11 +773,21 @@ func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing
 	}
 }
 
-func TestHandleResponsesWebSocket_ResponseFailedIsTerminal(t *testing.T) {
+func TestHandleResponsesWebSocket_ResponseFailedKeepsSessionOpen(t *testing.T) {
+	var upstreamRequests int
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-fail\"}}\n\n")
-		_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-fail\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"context too long\"}}}\n\n")
+		switch upstreamRequests {
+		case 1:
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-fail\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-fail\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"context too long\"}}}\n\n")
+		case 2:
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-retry\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-retry\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		default:
+			t.Fatalf("unexpected upstream request count %d", upstreamRequests)
+		}
 	})
 
 	server := startResponsesWebSocketProxyServer(t, handler)
@@ -809,22 +819,45 @@ func TestHandleResponsesWebSocket_ResponseFailedIsTerminal(t *testing.T) {
 		t.Fatalf("expected response.failed, got %v", failed["type"])
 	}
 
-	// The connection should close without a proxy-generated error frame.
-	// If the proxy sent a second error, we'd read it here.
-	if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
-		t.Fatalf("failed to set read deadline: %v", err)
+	retry := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "try again"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(retry); err != nil {
+		t.Fatalf("failed to write retry websocket request: %v", err)
 	}
-	_, _, err := conn.ReadMessage()
-	if err == nil {
-		t.Fatalf("expected connection to close after response.failed, but got another message")
+
+	retryCreated := mustReadWebSocketJSON(t, conn)
+	if retryCreated["type"] != "response.created" {
+		t.Fatalf("expected retry response.created, got %v", retryCreated["type"])
+	}
+
+	retryCompleted := mustReadWebSocketJSON(t, conn)
+	if retryCompleted["type"] != "response.completed" {
+		t.Fatalf("expected retry response.completed, got %v", retryCompleted["type"])
 	}
 }
 
-func TestHandleResponsesWebSocket_ResponseIncompleteIsTerminal(t *testing.T) {
+func TestHandleResponsesWebSocket_ResponseIncompleteKeepsSessionOpen(t *testing.T) {
+	var upstreamRequests int
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-inc\"}}\n\n")
-		_, _ = fmt.Fprint(w, "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-inc\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n")
+		switch upstreamRequests {
+		case 1:
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-inc\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-inc\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n")
+		case 2:
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-next\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-next\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		default:
+			t.Fatalf("unexpected upstream request count %d", upstreamRequests)
+		}
 	})
 
 	server := startResponsesWebSocketProxyServer(t, handler)
@@ -854,30 +887,60 @@ func TestHandleResponsesWebSocket_ResponseIncompleteIsTerminal(t *testing.T) {
 		t.Fatalf("expected response.incomplete, got %v", incomplete["type"])
 	}
 
-	// No proxy-generated error frame should follow.
-	if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
-		t.Fatalf("failed to set read deadline: %v", err)
+	next := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "continue"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(next); err != nil {
+		t.Fatalf("failed to write follow-up websocket request: %v", err)
 	}
-	_, _, err := conn.ReadMessage()
-	if err == nil {
-		t.Fatalf("expected connection to close after response.incomplete, but got another message")
+
+	nextCreated := mustReadWebSocketJSON(t, conn)
+	if nextCreated["type"] != "response.created" {
+		t.Fatalf("expected follow-up response.created, got %v", nextCreated["type"])
+	}
+
+	nextCompleted := mustReadWebSocketJSON(t, conn)
+	if nextCompleted["type"] != "response.completed" {
+		t.Fatalf("expected follow-up response.completed, got %v", nextCompleted["type"])
 	}
 }
 
-func TestHandleResponsesWebSocket_ResponseFailedExitsImmediatelyOnStalledUpstream(t *testing.T) {
+func TestHandleResponsesWebSocket_ResponseFailedOnStalledUpstreamKeepsSessionOpen(t *testing.T) {
 	// Regression test: if upstream emits response.failed and then stalls
 	// (keeps the body open), the proxy should exit the SSE loop immediately
-	// rather than blocking until EOF or the 60-minute timeout.
+	// rather than blocking until EOF or the 60-minute timeout, and the
+	// websocket session should remain usable for the next turn.
 	stallReleased := make(chan struct{})
+	var mu sync.Mutex
+	upstreamRequests := 0
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		upstreamRequests++
+		requestNumber := upstreamRequests
+		mu.Unlock()
+
 		w.Header().Set("Content-Type", "text/event-stream")
-		flusher, _ := w.(http.Flusher)
-		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-stall\"}}\n\n")
-		flusher.Flush()
-		_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-stall\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"context too long\"}}}\n\n")
-		flusher.Flush()
-		// Stall: keep the body open until the test signals release.
-		<-stallReleased
+		switch requestNumber {
+		case 1:
+			flusher, _ := w.(http.Flusher)
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-stall\"}}\n\n")
+			flusher.Flush()
+			_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-stall\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"context too long\"}}}\n\n")
+			flusher.Flush()
+			// Stall: keep the body open until the test signals release.
+			<-stallReleased
+		case 2:
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-after-stall\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-after-stall\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		default:
+			t.Fatalf("unexpected upstream request count %d", requestNumber)
+		}
 	})
 
 	server := startResponsesWebSocketProxyServer(t, handler)
@@ -910,15 +973,27 @@ func TestHandleResponsesWebSocket_ResponseFailedExitsImmediatelyOnStalledUpstrea
 		t.Fatalf("expected response.failed, got %v", failed["type"])
 	}
 
-	// The connection should close promptly without waiting for upstream EOF.
-	// Use a tight deadline: if the proxy blocked on the stalled body, this
-	// would time out at 2 seconds (mustReadWebSocketJSON's deadline).
-	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("failed to set read deadline: %v", err)
+	next := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "after failure"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(next); err != nil {
+		t.Fatalf("failed to write follow-up websocket request: %v", err)
 	}
-	_, _, err := conn.ReadMessage()
-	if err == nil {
-		t.Fatalf("expected connection to close after response.failed on stalled upstream, but got another message")
+
+	nextCreated := mustReadWebSocketJSON(t, conn)
+	if nextCreated["type"] != "response.created" {
+		t.Fatalf("expected follow-up response.created, got %v", nextCreated["type"])
+	}
+
+	nextCompleted := mustReadWebSocketJSON(t, conn)
+	if nextCompleted["type"] != "response.completed" {
+		t.Fatalf("expected follow-up response.completed, got %v", nextCompleted["type"])
 	}
 }
 
@@ -1032,7 +1107,7 @@ func TestHandleResponsesWebSocket_ForwardsSessionAndClientRequestHeaders(t *test
 
 	server := startResponsesWebSocketProxyServer(t, handler)
 	conn := mustDialResponsesWebSocket(t, server, http.Header{
-		"session_id":           []string{"conv-123"},
+		"session_id":          []string{"conv-123"},
 		"X-Client-Request-Id": []string{"req-456"},
 	})
 	defer func() { _ = conn.Close() }()

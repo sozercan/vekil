@@ -305,9 +305,10 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 
 	responseID, outputItems, err := s.streamUpstreamResponse(resp.Body, resp.Header)
 	if err != nil {
-		if !errors.Is(err, errStreamFailedUpstream) {
-			s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil)
+		if errors.Is(err, errStreamFailedUpstream) {
+			return nil
 		}
+		s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil)
 		return err
 	}
 
