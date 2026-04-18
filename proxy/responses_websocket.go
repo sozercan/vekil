@@ -279,16 +279,10 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		})
 	}
 
-	token, err := h.auth.GetToken(s.ctx)
-	if err != nil {
-		s.sendWrappedError(http.StatusInternalServerError, fmt.Sprintf("failed to get token: %v", err), "server_error", nil)
-		return err
-	}
-
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
 	defer upstreamCancel()
 
-	resp, deltaAttempted, deltaFallback, err := s.postCreateRequest(h, upstreamCtx, token, request, plan)
+	resp, deltaAttempted, deltaFallback, err := s.postCreateRequest(h, upstreamCtx, request, plan)
 	metrics.deltaAttempted = deltaAttempted
 	metrics.deltaFallback = deltaFallback
 	if err != nil {
@@ -311,14 +305,15 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 
 	responseID, outputItems, err := s.streamUpstreamResponse(resp.Body, resp.Header)
 	if err != nil {
-		if !errors.Is(err, errStreamFailedUpstream) {
-			s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil)
+		if errors.Is(err, errStreamFailedUpstream) {
+			return nil
 		}
+		s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil)
 		return err
 	}
 
 	s.rememberResponse(plan.resetHistory, responseID, plan.signature, plan.currentInput, outputItems)
-	metrics = s.maybeAutoCompactHistory(h, token, request, metrics)
+	metrics = s.maybeAutoCompactHistory(h, request, metrics)
 	s.logRequestMetrics(h, request, responseID, metrics)
 	return nil
 }
@@ -346,13 +341,13 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 	return plan, nil
 }
 
-func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx context.Context, token string, request *responsesWebSocketCreateRequest, plan responsesWebSocketRequestPlan) (*http.Response, bool, bool, error) {
-	resp, err := s.postCreateRequestSegments(h, ctx, token, request, plan.upstreamSegments(), plan.useTurnStateDelta)
+func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, plan responsesWebSocketRequestPlan) (*http.Response, bool, bool, error) {
+	resp, err := s.postCreateRequestSegments(h, ctx, request, plan.upstreamSegments(), plan.useTurnStateDelta)
 	if err != nil || resp == nil {
 		return resp, plan.useTurnStateDelta, false, err
 	}
 	if !plan.useTurnStateDelta {
-		resp, err = s.maybeRetryCompactedCreateRequest(h, ctx, token, request, resp, true)
+		resp, err = s.maybeRetryCompactedCreateRequest(h, ctx, request, resp, true)
 		return resp, false, false, err
 	}
 	if resp.StatusCode == http.StatusOK {
@@ -375,21 +370,21 @@ func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx conte
 	)
 	s.turnState = ""
 
-	resp, err = s.postCreateRequestSegments(h, ctx, token, request, plan.fullReplaySegments, false)
+	resp, err = s.postCreateRequestSegments(h, ctx, request, plan.fullReplaySegments, false)
 	if err != nil || resp == nil {
 		return resp, true, true, err
 	}
-	resp, err = s.maybeRetryCompactedCreateRequest(h, ctx, token, request, resp, true)
+	resp, err = s.maybeRetryCompactedCreateRequest(h, ctx, request, resp, true)
 	return resp, true, true, err
 }
 
-func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, ctx context.Context, token string, request *responsesWebSocketCreateRequest, inputSegments [][]json.RawMessage, includeTurnState bool) (*http.Response, error) {
+func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, inputSegments [][]json.RawMessage, includeTurnState bool) (*http.Response, error) {
 	bodyBytes, err := request.upstreamBody(inputSegments...)
 	if err != nil {
 		return nil, err
 	}
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/websocket", true)
-	return h.postResponsesWithHeaders(ctx, token, bodyBytes, s.requestHeaders(request, includeTurnState))
+	return h.postResponsesWithHeaders(ctx, bodyBytes, s.requestHeaders(request, includeTurnState))
 }
 
 func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCreateRequest, includeTurnState bool) http.Header {
@@ -436,11 +431,11 @@ func (s *responsesWebSocketSession) rememberResponse(resetHistory bool, response
 	s.historyItems = append(s.historyItems, outputItems...)
 }
 
-func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, token string, request *responsesWebSocketCreateRequest, metrics responsesWebSocketRequestMetrics) responsesWebSocketRequestMetrics {
+func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, request *responsesWebSocketCreateRequest, metrics responsesWebSocketRequestMetrics) responsesWebSocketRequestMetrics {
 	ctx, cancel := h.newInferenceUpstreamContext(false)
 	defer cancel()
 
-	compaction, compacted, err := s.compactHistory(h, ctx, token, request, false)
+	compaction, compacted, err := s.compactHistory(h, ctx, request, false)
 	if err != nil {
 		h.log.Debug("responses websocket auto-compaction failed",
 			logger.Err(err),
@@ -469,12 +464,12 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, tok
 	return metrics
 }
 
-func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHandler, ctx context.Context, token string, request *responsesWebSocketCreateRequest, resp *http.Response, fullReplayUsed bool) (*http.Response, error) {
+func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, resp *http.Response, fullReplayUsed bool) (*http.Response, error) {
 	if resp == nil || !fullReplayUsed || resp.StatusCode != http.StatusRequestEntityTooLarge || strings.TrimSpace(request.PreviousResponseID) == "" {
 		return resp, nil
 	}
 
-	compaction, compacted, err := s.compactHistory(h, ctx, token, request, true)
+	compaction, compacted, err := s.compactHistory(h, ctx, request, true)
 	if err != nil {
 		h.log.Debug("responses websocket 413 compaction failed",
 			logger.Err(err),
@@ -499,10 +494,10 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 	)
 
 	_ = resp.Body.Close()
-	return s.postCreateRequestSegments(h, ctx, token, request, [][]json.RawMessage{s.historyItems, request.Input}, false)
+	return s.postCreateRequestSegments(h, ctx, request, [][]json.RawMessage{s.historyItems, request.Input}, false)
 }
 
-func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.Context, token string, request *responsesWebSocketCreateRequest, force bool) (responsesWebSocketHistoryCompaction, bool, error) {
+func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, force bool) (responsesWebSocketHistoryCompaction, bool, error) {
 	var result responsesWebSocketHistoryCompaction
 
 	cfg := h.responsesWebSocketConfig()
@@ -532,7 +527,7 @@ func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.
 	result.fromItems = len(s.historyItems)
 	result.fromBytes = rawMessagesSize(s.historyItems)
 
-	summary, err := h.compactResponsesInput(ctx, token, request.Model, prefix, s.requestHeaders(request, false))
+	summary, err := h.compactResponsesInput(ctx, request.Model, prefix, s.requestHeaders(request, false))
 	if err != nil {
 		return result, false, err
 	}

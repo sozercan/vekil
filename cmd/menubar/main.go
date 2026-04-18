@@ -140,7 +140,12 @@ func startProxy() {
 		return
 	}
 
-	nextSrv := server.New(authenticator, log, "0.0.0.0", "1337")
+	nextSrv, err := server.New(authenticator, log, "0.0.0.0", "1337")
+	if err != nil {
+		log.Error("server init failed", logger.Err(err))
+		showErrorDialog("Vekil Start Failed", fmt.Sprintf("Could not initialize Vekil.\n\n%v", err))
+		return
+	}
 	if err := nextSrv.Start(); err != nil {
 		log.Error("server start failed", logger.Err(err))
 		showErrorDialog("Vekil Start Failed", fmt.Sprintf("Could not start Vekil on port 1337.\n\n%v", err))

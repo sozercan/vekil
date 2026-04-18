@@ -185,6 +185,8 @@ type ProxyHandler struct {
 	client                   *http.Client
 	copilotURL               string
 	copilotHeaders           CopilotHeaderConfig
+	providersConfig          ProvidersConfig
+	providersState           *providerSetup
 	responsesWS              ResponsesWebSocketConfig
 	streamingUpstreamTimeout time.Duration
 	log                      *logger.Logger
@@ -202,6 +204,20 @@ type Option func(*ProxyHandler)
 func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
 	return func(h *ProxyHandler) {
 		h.copilotHeaders = cfg.withDefaults()
+	}
+}
+
+// WithProvidersConfig enables multi-provider model routing. When unset, the
+// proxy keeps its legacy single-upstream Copilot behavior.
+func WithProvidersConfig(cfg ProvidersConfig) Option {
+	return func(h *ProxyHandler) {
+		h.providersConfig = cfg
+	}
+}
+
+func withCopilotBaseURLForTest(baseURL string) Option {
+	return func(h *ProxyHandler) {
+		h.copilotURL = strings.TrimRight(baseURL, "/")
 	}
 }
 
@@ -235,7 +251,7 @@ func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 }
 
 // NewProxyHandler creates a ProxyHandler with connection pooling and HTTP/2.
-func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) *ProxyHandler {
+func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) (*ProxyHandler, error) {
 	h := &ProxyHandler{
 		auth: a,
 		client: &http.Client{
@@ -259,7 +275,10 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 			opt(h)
 		}
 	}
-	return h
+	if err := h.initializeProviders(); err != nil {
+		return nil, err
+	}
+	return h, nil
 }
 
 func (h *ProxyHandler) responsesWebSocketConfig() ResponsesWebSocketConfig {
@@ -366,7 +385,7 @@ func (h *ProxyHandler) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleReadyz validates that the proxy can obtain an auth token and reach the
-// upstream Copilot API.
+// configured upstream providers.
 func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), readyzUpstreamTimeout)
 	defer cancel()
@@ -375,42 +394,39 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := h.auth.GetTokenNonInteractive(ctx)
-	if err != nil {
-		if shouldSuppressReadyzResponse(r.Context(), err) {
+	setup := h.providerSetup()
+	for _, providerID := range setup.providerOrder {
+		provider := setup.providerByID(providerID)
+		if provider == nil {
+			continue
+		}
+		if err := h.checkProviderReady(ctx, provider); err != nil {
+			if shouldSuppressReadyzResponse(r.Context(), err) {
+				return
+			}
+			writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", err.Error())
 			return
 		}
-		writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", fmt.Sprintf("failed to get token: %v", err))
-		return
-	}
-
-	if err := h.checkUpstreamReady(ctx, token); err != nil {
-		if shouldSuppressReadyzResponse(r.Context(), err) {
-			return
-		}
-		writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", err.Error())
-		return
 	}
 
 	writeReadyzStatus(w, http.StatusOK, "ready", "")
 }
 
-func (h *ProxyHandler) checkUpstreamReady(ctx context.Context, token string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.copilotURL+"/models", nil)
+func (h *ProxyHandler) checkProviderReady(ctx context.Context, provider *providerRuntime) error {
+	req, err := h.newProviderProbeRequest(ctx, provider)
 	if err != nil {
-		return fmt.Errorf("failed to create upstream probe request: %w", err)
+		return err
 	}
-	h.setCopilotHeaders(req, token)
 
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("upstream probe failed: %w", err)
+		return fmt.Errorf("provider %q upstream probe failed: %w", provider.id, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		message := fmt.Sprintf("upstream probe returned %d", resp.StatusCode)
+		message := fmt.Sprintf("provider %q upstream probe returned %d", provider.id, resp.StatusCode)
 		if trimmed := strings.TrimSpace(string(body)); trimmed != "" {
 			message += ": " + trimmed
 		}
@@ -418,6 +434,40 @@ func (h *ProxyHandler) checkUpstreamReady(ctx context.Context, token string) err
 	}
 
 	return nil
+}
+
+func (h *ProxyHandler) newProviderProbeRequest(ctx context.Context, provider *providerRuntime) (*http.Request, error) {
+	if provider == nil {
+		return nil, fmt.Errorf("provider is required")
+	}
+
+	switch provider.kind {
+	case providerTypeCopilot:
+		token, err := h.auth.GetTokenNonInteractive(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get token for provider %q: %w", provider.id, err)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, provider.baseURL+"/models", nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create upstream probe request: %w", err)
+		}
+		h.setCopilotHeaders(req, token)
+		return req, nil
+	case providerTypeAzureOpenAI:
+		fullURL, err := h.providerRequestURL(provider, "/models", "")
+		if err != nil {
+			return nil, fmt.Errorf("failed to build provider %q probe URL: %w", provider.id, err)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create upstream probe request: %w", err)
+		}
+		req.Header.Set("api-key", provider.apiKey)
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	default:
+		return nil, fmt.Errorf("unsupported provider type %q", provider.kind)
+	}
 }
 
 func shouldSuppressReadyzResponse(parent context.Context, err error) bool {
@@ -447,10 +497,9 @@ func writeReadyzStatus(w http.ResponseWriter, statusCode int, status string, err
 	_ = json.NewEncoder(w).Encode(response)
 }
 
-// HandleModels handles GET /v1/models by proxying to the upstream Copilot API.
-// Responses are cached for modelsCacheTTL to avoid repeated upstream calls.
-// The response includes both the standard OpenAI "data" field and a Codex-compatible
-// "models" field so that both OpenAI SDK clients and Codex CLI can parse it.
+// HandleModels handles GET /v1/models by building a merged model catalog across
+// the configured providers. Responses are cached for modelsCacheTTL to avoid
+// repeated upstream calls.
 func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	cacheKey := r.URL.RawQuery
 	now := time.Now()
@@ -469,46 +518,30 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := h.auth.GetToken(r.Context())
-	if err != nil {
-		h.log.Error("failed to get token", logger.F("endpoint", "models"), logger.Err(err))
-		writeOpenAIError(w, http.StatusInternalServerError, "authentication failed", "server_error")
-		return
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), modelsUpstreamTimeout)
 	defer cancel()
 
-	upstreamURL := h.copilotURL + "/models"
-	if cacheKey != "" {
-		upstreamURL += "?" + cacheKey
+	conditionalETag := ""
+	if hasCachedEntry {
+		conditionalETag = cachedEntry.etag
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL, nil)
-	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "failed to create request", "server_error")
-		return
-	}
-	h.setCopilotHeaders(req, token)
-	if hasCachedEntry && cachedEntry.etag != "" {
-		req.Header.Set("If-None-Match", cachedEntry.etag)
-	}
-
-	resp, err := h.client.Do(req)
+	entry, notModified, err := h.buildMergedModelsEntry(ctx, cacheKey, conditionalETag)
 	if err != nil {
 		h.log.Error("upstream request failed", logger.F("endpoint", "models"), logger.Err(err))
-		writeOpenAIError(w, http.StatusBadGateway, "upstream request failed", "server_error")
+		if hasCachedEntry {
+			writeCachedModelsResponse(w, cachedEntry)
+			return
+		}
+		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		if statusCode == http.StatusInternalServerError {
+			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
+			return
+		}
+		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
 		return
 	}
-	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
-		return
-	}
-
-	if resp.StatusCode == http.StatusNotModified && hasCachedEntry {
+	if notModified && hasCachedEntry {
 		cachedEntry.expiry = time.Now().Add(modelsCacheTTL)
 		h.models.mu.Lock()
 		if h.models.entries == nil {
@@ -521,19 +554,8 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Transform the response to include a Codex-compatible "models" field.
-	if resp.StatusCode == http.StatusOK {
-		body = transformModelsResponse(body)
-	}
-
 	// Cache successful responses
-	if resp.StatusCode == http.StatusOK {
-		entry := cachedModelsResponse{
-			body:       body,
-			statusCode: resp.StatusCode,
-			expiry:     time.Now().Add(modelsCacheTTL),
-			etag:       resp.Header.Get("ETag"),
-		}
+	if entry.statusCode == http.StatusOK {
 		h.models.mu.Lock()
 		if h.models.entries == nil {
 			h.models.entries = make(map[string]cachedModelsResponse)
@@ -542,16 +564,87 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 		h.models.mu.Unlock()
 	}
 
-	if contentType := resp.Header.Get("Content-Type"); contentType != "" {
-		w.Header().Set("Content-Type", contentType)
-	} else {
-		w.Header().Set("Content-Type", "application/json")
-	}
-	if etag := resp.Header.Get("ETag"); etag != "" {
+	w.Header().Set("Content-Type", "application/json")
+	if etag := entry.etag; etag != "" {
 		w.Header().Set("ETag", etag)
 	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(body)
+	w.WriteHeader(entry.statusCode)
+	_, _ = w.Write(entry.body)
+}
+
+func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifNoneMatch string) (cachedModelsResponse, bool, error) {
+	setup := h.providerSetup()
+	rawEntries := make([]json.RawMessage, 0)
+	owners := make(map[string]string)
+	refreshedDynamicModels := make(map[string][]providerModel)
+	mergedETag := ""
+	sawDynamicProvider := false
+	allDynamicProvidersUnchanged := true
+
+	for _, providerID := range setup.providerOrder {
+		provider := setup.providerByID(providerID)
+		if provider == nil {
+			continue
+		}
+
+		result, err := h.fetchProviderModels(ctx, provider, rawQuery, ifNoneMatch)
+		if err != nil {
+			return cachedModelsResponse{}, false, err
+		}
+
+		if provider.kind == providerTypeCopilot {
+			sawDynamicProvider = true
+			if result.notModified {
+				continue
+			}
+			allDynamicProvidersUnchanged = false
+			if len(setup.providers) > 1 {
+				refreshedDynamicModels[provider.id] = result.models
+			}
+			if result.etag != "" {
+				mergedETag = result.etag
+			}
+		}
+
+		for _, model := range result.models {
+			if existingProvider, exists := owners[model.publicID]; exists {
+				if existingProvider == model.providerID {
+					continue
+				}
+				return cachedModelsResponse{}, false, fmt.Errorf("model %q is exposed by both provider %q and provider %q", model.publicID, existingProvider, model.providerID)
+			}
+			owners[model.publicID] = model.providerID
+			rawEntries = append(rawEntries, model.raw)
+		}
+	}
+
+	if sawDynamicProvider && allDynamicProvidersUnchanged {
+		return cachedModelsResponse{etag: ifNoneMatch}, true, nil
+	}
+
+	body, err := json.Marshal(struct {
+		Object string            `json:"object"`
+		Data   []json.RawMessage `json:"data"`
+	}{
+		Object: "list",
+		Data:   rawEntries,
+	})
+	if err != nil {
+		return cachedModelsResponse{}, false, err
+	}
+
+	for providerID, models := range refreshedDynamicModels {
+		if err := setup.replaceProviderModels(providerID, models); err != nil {
+			return cachedModelsResponse{}, false, err
+		}
+	}
+
+	return cachedModelsResponse{
+		body:       transformModelsResponse(body),
+		statusCode: http.StatusOK,
+		expiry:     time.Now().Add(modelsCacheTTL),
+		etag:       mergedETag,
+	}, false, nil
 }
 
 // transformModelsResponse adds a Codex-compatible "models" field to the

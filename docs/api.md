@@ -20,11 +20,18 @@ Model normalization:
 
 ### `GET /v1/models`
 
-The live model list is fetched dynamically from the upstream Copilot API. The proxy preserves the upstream OpenAI-style `data` payload and also adds a Codex-compatible top-level `models` array.
+The proxy builds a merged model catalog across the configured providers. It preserves the OpenAI-style `data` payload and also adds a Codex-compatible top-level `models` array.
 
 ```bash
 curl http://localhost:1337/v1/models
 ```
+
+When multiple providers are configured:
+
+- public model IDs stay unprefixed, for example `gpt-5.4`
+- each public ID must be owned by exactly one provider
+- startup fails if providers collide on the same model ID
+- Azure OpenAI deployments can be exposed under a different public ID while the proxy rewrites the upstream `model` field
 
 Example IDs in recent upstream responses have included:
 
@@ -100,9 +107,17 @@ Validation failures (`400 INVALID_ARGUMENT`) include path/body model mismatches,
 
 Near zero-copy passthrough for requests without tools. When tools are present, the proxy injects `parallel_tool_calls: true`, forces upstream streaming for reliable parallel tool calls, and aggregates the result back to non-streaming JSON.
 
+When provider routing is configured, the request is routed by the public `model` ID. If the selected provider uses a different upstream model or deployment name, the proxy rewrites the outgoing `model` field before forwarding.
+
+The proxy also enforces the model's configured `supported_endpoints` before forwarding. If a model is exposed as `/responses`-only, `POST /v1/chat/completions` fails fast with `400` instead of probing an unsupported upstream route. The Azure `gpt-5.4-pro` example configuration is set up this way.
+
 ## `POST /v1/responses` and `GET /v1/responses` (OpenAI)
 
 `POST /v1/responses` is a near zero-copy passthrough for the OpenAI Responses API. Proxy-owned synthetic compaction items are expanded back into normal context before forwarding so resumed Codex sessions continue through the standard `/v1/responses` path.
+
+Like chat completions, Responses requests are routed by the public `model` ID. Fallback retries for unsupported `/responses` models stay within the selected provider; the proxy does not silently switch providers.
+
+For responses-only Azure deployments such as the `gpt-5.4-pro` example configuration, this is the canonical inference path.
 
 Streaming Responses requests are passed through directly with upstream headers preserved.
 
@@ -120,6 +135,8 @@ Websocket bridge behavior:
 - optional turn-state delta replay can be enabled with `--responses-ws-turn-state-delta`
 - if upstream rejects delta replay, the proxy automatically falls back to full replay
 
+This websocket bridge is a proxy transport adaptation layered over upstream HTTP `/responses`. It is not the same feature as provider-native websocket or realtime APIs such as Azure `/realtime`.
+
 See [configuration.md](configuration.md) for tuning flags.
 
 ## `POST /v1/responses/compact`
@@ -132,6 +149,7 @@ Compatibility shim for environments expecting `/responses/compact`. The proxy re
 Requests to this endpoint are accepted up to `64 MiB` so large session histories can be compacted without tripping the default request-body limit.
 
 If the requested model does not support the upstream Responses API, the proxy retries against a compatible fallback model discovered from `/models`.
+That fallback stays within the selected provider; the proxy does not silently switch providers.
 
 ## `POST /v1/memories/trace_summarize`
 
@@ -145,4 +163,4 @@ Returns `{"status":"ok"}`.
 
 ## `GET /readyz`
 
-Validates that the proxy can obtain a Copilot token and successfully probe upstream `/models`. On success it returns `{"status":"ready"}`. On failure it returns `503` with `{"status":"not_ready","error":"..."}`.
+Validates that the proxy can authenticate to and successfully probe the configured upstream providers. On success it returns `{"status":"ready"}`. On failure it returns `503` with `{"status":"not_ready","error":"..."}`.

@@ -28,7 +28,10 @@ func TestStart_ReturnsErrorWhenPortInUse(t *testing.T) {
 		t.Fatalf("expected TCP address, got %T", listener.Addr())
 	}
 
-	srv := New(auth.NewTestAuthenticator("test-token"), logger.New(logger.ParseLevel("error")), "127.0.0.1", strconv.Itoa(addr.Port))
+	srv, err := New(auth.NewTestAuthenticator("test-token"), logger.New(logger.ParseLevel("error")), "127.0.0.1", strconv.Itoa(addr.Port))
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
 	err = srv.Start()
 	if err == nil {
 		t.Fatal("expected Start to fail when port is already in use")
@@ -42,12 +45,15 @@ func TestStart_ReturnsErrorWhenPortInUse(t *testing.T) {
 }
 
 func TestNew_ConfiguresExtendedWriteTimeout(t *testing.T) {
-	srv := New(
+	srv, err := New(
 		auth.NewTestAuthenticator("test-token"),
 		logger.New(logger.ParseLevel("error")),
 		"127.0.0.1",
 		"0",
 	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
 
 	if got, want := srv.httpServer.WriteTimeout, 65*time.Minute; got != want {
 		t.Fatalf("WriteTimeout = %v, want %v", got, want)
@@ -73,13 +79,16 @@ func TestNew_DerivesWriteTimeoutFromConfiguredProxyHandler(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := New(
+			srv, err := New(
 				auth.NewTestAuthenticator("test-token"),
 				logger.New(logger.ParseLevel("error")),
 				"127.0.0.1",
 				"0",
 				tc.opts...,
 			)
+			if err != nil {
+				t.Fatalf("failed to initialize server: %v", err)
+			}
 
 			if got, want := srv.httpServer.WriteTimeout, customTimeout+5*time.Minute; got != want {
 				t.Fatalf("WriteTimeout = %v, want %v", got, want)

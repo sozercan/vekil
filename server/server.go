@@ -53,7 +53,7 @@ func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 }
 
 // New creates a Server with routes and timeouts configured.
-func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) *Server {
+func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
 	cfg := options{}
 	for _, opt := range opts {
 		if opt != nil {
@@ -61,7 +61,10 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 		}
 	}
 
-	handler := proxy.NewProxyHandler(authenticator, log, cfg.proxyOptions...)
+	handler, err := proxy.NewProxyHandler(authenticator, log, cfg.proxyOptions...)
+	if err != nil {
+		return nil, err
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/messages", handler.HandleAnthropicMessages)
@@ -87,7 +90,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 			IdleTimeout:  120 * time.Second,
 		},
 		log: log,
-	}
+	}, nil
 }
 
 // Start begins listening in a goroutine. It returns an error if the listener
