@@ -2422,6 +2422,32 @@ func TestNewProxyHandler_FailsWhenProvidersSharePlainModelID(t *testing.T) {
 	}
 }
 
+func TestNewProxyHandler_RejectsMultipleCopilotProviders(t *testing.T) {
+	_, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{
+					ID:      "copilot",
+					Type:    "copilot",
+					Default: true,
+				},
+				{
+					ID:   "copilot-secondary",
+					Type: "copilot",
+				},
+			},
+		}),
+	)
+	if err == nil {
+		t.Fatal("expected multiple copilot providers to be rejected")
+	}
+	if !strings.Contains(err.Error(), "multiple copilot providers configured") {
+		t.Fatalf("expected multiple copilot providers error, got %v", err)
+	}
+}
+
 func TestNewProxyHandler_AllowsDuplicateModelIDsWithinSameProvider(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 
@@ -2478,7 +2504,8 @@ func TestNewProxyHandler_AllowsDuplicateModelIDsWithinSameProvider(t *testing.T)
 
 	var result struct {
 		Data []struct {
-			ID string `json:"id"`
+			ID                 string   `json:"id"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -2486,11 +2513,241 @@ func TestNewProxyHandler_AllowsDuplicateModelIDsWithinSameProvider(t *testing.T)
 	}
 
 	seen := make(map[string]int)
+	var gpt4Endpoints []string
 	for _, model := range result.Data {
 		seen[model.ID]++
+		if model.ID == "gpt-4" {
+			gpt4Endpoints = model.SupportedEndpoints
+		}
 	}
 	if seen["gpt-4"] != 1 {
 		t.Fatalf("expected deduped gpt-4 entry once, got %+v", seen)
+	}
+	if !supportsEndpoint(gpt4Endpoints, "/chat/completions") || !supportsEndpoint(gpt4Endpoints, "/responses") {
+		t.Fatalf("expected merged gpt-4 endpoints, got %+v", gpt4Endpoints)
+	}
+}
+
+func TestHandleResponses_AllowsMergedDuplicateDynamicProviderEndpoints(t *testing.T) {
+	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+
+	var responsesCalls int32
+	copilotServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[
+				{"id":"gpt-4","object":"model","created":0,"owned_by":"github-copilot","supported_endpoints":["/chat/completions"],"name":"GPT-4"},
+				{"id":"gpt-4","object":"model","created":0,"owned_by":"github-copilot","supported_endpoints":["/responses"],"name":"GPT-4"}
+			]}`))
+		case "/responses":
+			atomic.AddInt32(&responsesCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-copilot","object":"response","status":"completed"}`))
+		default:
+			t.Fatalf("unexpected Copilot path %q", r.URL.Path)
+		}
+	}))
+	defer copilotServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		withCopilotBaseURLForTest(copilotServer.URL),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{
+					ID:      "copilot",
+					Type:    "copilot",
+					Default: true,
+				},
+				{
+					ID:        "azure",
+					Type:      "azure-openai",
+					BaseURL:   "https://example.openai.azure.com/openai/v1",
+					APIKeyEnv: "TEST_AZURE_API_KEY",
+					Models: []ProviderModelConfig{{
+						PublicID:   "gpt-5.4-pro",
+						Deployment: "gpt-5-4-pro",
+						Endpoints:  []string{"/responses"},
+					}},
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4","input":"Hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var responseBody struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&responseBody); err != nil {
+		t.Fatalf("decode responses body: %v", err)
+	}
+	if responseBody.ID != "resp-copilot" {
+		t.Fatalf("expected Copilot response, got %+v", responseBody)
+	}
+	if got := atomic.LoadInt32(&responsesCalls); got != 1 {
+		t.Fatalf("expected one Copilot responses request, got %d", got)
+	}
+}
+
+func TestHandleModels_RefreshesDynamicProviderOwnershipForRouting(t *testing.T) {
+	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+
+	var modelsCalls int32
+	var copilotResponses int32
+	var azureResponses int32
+
+	copilotServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			call := atomic.AddInt32(&modelsCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			switch call {
+			case 1:
+				_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4","object":"model","created":0,"owned_by":"github-copilot","supported_endpoints":["/responses"],"name":"GPT-4"}]}`))
+			default:
+				_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-new","object":"model","created":0,"owned_by":"github-copilot","supported_endpoints":["/responses"],"name":"GPT New"}]}`))
+			}
+		case "/responses":
+			atomic.AddInt32(&copilotResponses, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-copilot","object":"response","status":"completed"}`))
+		default:
+			t.Fatalf("unexpected Copilot path %q", r.URL.Path)
+		}
+	}))
+	defer copilotServer.Close()
+
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/openai/v1/responses" {
+			t.Fatalf("unexpected Azure path %q", r.URL.Path)
+		}
+		atomic.AddInt32(&azureResponses, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-azure","object":"response","status":"completed"}`))
+	}))
+	defer azureServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		withCopilotBaseURLForTest(copilotServer.URL),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{
+					ID:   "copilot",
+					Type: "copilot",
+				},
+				{
+					ID:        "azure",
+					Type:      "azure-openai",
+					Default:   true,
+					BaseURL:   azureServer.URL + "/openai/v1",
+					APIKeyEnv: "TEST_AZURE_API_KEY",
+					Models: []ProviderModelConfig{{
+						PublicID:   "gpt-5.4-pro",
+						Deployment: "gpt-5-4-pro",
+						Endpoints:  []string{"/responses"},
+					}},
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	modelsReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	modelsW := httptest.NewRecorder()
+	handler.HandleModels(modelsW, modelsReq)
+
+	modelsResp := modelsW.Result()
+	if modelsResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(modelsResp.Body)
+		t.Fatalf("expected models refresh 200, got %d: %s", modelsResp.StatusCode, body)
+	}
+
+	var modelsBody struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(modelsResp.Body).Decode(&modelsBody); err != nil {
+		t.Fatalf("decode refreshed models response: %v", err)
+	}
+	if len(modelsBody.Data) == 0 || modelsBody.Data[0].ID != "gpt-new" {
+		t.Fatalf("expected refreshed models to include gpt-new, got %+v", modelsBody.Data)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-new","input":"Hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var responseBody struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&responseBody); err != nil {
+		t.Fatalf("decode responses body: %v", err)
+	}
+	if responseBody.ID != "resp-copilot" {
+		t.Fatalf("expected Copilot routing after refresh, got %+v", responseBody)
+	}
+	if got := atomic.LoadInt32(&copilotResponses); got != 1 {
+		t.Fatalf("expected one Copilot responses request, got %d", got)
+	}
+	if got := atomic.LoadInt32(&azureResponses); got != 0 {
+		t.Fatalf("expected no Azure responses requests, got %d", got)
+	}
+}
+
+func TestNewProviderJSONRequest_OmitsBodyForGetNilPayload(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {})
+
+	req, err := handler.newProviderJSONRequest(
+		context.Background(),
+		&providerRuntime{
+			id:      "copilot",
+			kind:    providerTypeCopilot,
+			baseURL: "http://example.test",
+		},
+		http.MethodGet,
+		"/models",
+		nil,
+		nil,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("newProviderJSONRequest returned error: %v", err)
+	}
+	if req.Body != nil && req.Body != http.NoBody {
+		t.Fatalf("expected no GET body, got %T", req.Body)
+	}
+	if req.GetBody != nil {
+		t.Fatal("expected GetBody to be nil for GET without payload")
+	}
+	if req.ContentLength != 0 {
+		t.Fatalf("expected ContentLength 0, got %d", req.ContentLength)
 	}
 }
 

@@ -576,6 +576,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 	setup := h.providerSetup()
 	rawEntries := make([]json.RawMessage, 0)
 	owners := make(map[string]string)
+	refreshedDynamicModels := make(map[string][]providerModel)
 	mergedETag := ""
 	sawDynamicProvider := false
 	allDynamicProvidersUnchanged := true
@@ -597,6 +598,9 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 				continue
 			}
 			allDynamicProvidersUnchanged = false
+			if len(setup.providers) > 1 {
+				refreshedDynamicModels[provider.id] = result.models
+			}
 			if result.etag != "" {
 				mergedETag = result.etag
 			}
@@ -627,6 +631,12 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 	})
 	if err != nil {
 		return cachedModelsResponse{}, false, err
+	}
+
+	for providerID, models := range refreshedDynamicModels {
+		if err := setup.replaceProviderModels(providerID, models); err != nil {
+			return cachedModelsResponse{}, false, err
+		}
 	}
 
 	return cachedModelsResponse{

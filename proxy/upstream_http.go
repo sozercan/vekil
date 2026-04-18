@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -33,13 +34,78 @@ func upstreamStatusCode(err error, fallback int) int {
 }
 
 func extractRequestModel(body []byte) string {
-	var payload struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	tok, err := dec.Token()
+	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(payload.Model)
+
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
+		return ""
+	}
+
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+
+		key, ok := keyToken.(string)
+		if !ok {
+			return ""
+		}
+
+		if key == "model" {
+			var model string
+			if err := dec.Decode(&model); err != nil {
+				return ""
+			}
+			return strings.TrimSpace(model)
+		}
+
+		if err := skipJSONValue(dec); err != nil {
+			return ""
+		}
+	}
+
+	return ""
+}
+
+func skipJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+
+	switch delim {
+	case '{':
+		for dec.More() {
+			if _, err := dec.Token(); err != nil {
+				return err
+			}
+			if err := skipJSONValue(dec); err != nil {
+				return err
+			}
+		}
+		_, err = dec.Token()
+		return err
+	case '[':
+		for dec.More() {
+			if err := skipJSONValue(dec); err != nil {
+				return err
+			}
+		}
+		_, err = dec.Token()
+		return err
+	default:
+		return nil
+	}
 }
 
 func mergeHeaderValues(dst, src http.Header) {

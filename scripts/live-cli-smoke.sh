@@ -100,7 +100,7 @@ assert_exact_output() {
 }
 
 read_normalized_output() {
-  awk 'NF { line = $0 } END { gsub(/\r/, "", line); printf "%s", line }' "$1"
+  awk 'NF { gsub(/\r/, "", $0); printf "%s", $0 }' "$1"
 }
 
 start_proxy() {

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 )
 
 type providerType string
@@ -80,6 +81,7 @@ type providerSetup struct {
 	providers          map[string]*providerRuntime
 	providerOrder      []string
 	defaultProviderID  string
+	modelsMu           sync.RWMutex
 	models             map[string]providerModel
 	hasConfiguredState bool
 }
@@ -181,8 +183,37 @@ func (ps *providerSetup) lookupModel(model string) (providerModel, bool) {
 	if ps == nil {
 		return providerModel{}, false
 	}
+	ps.modelsMu.RLock()
+	defer ps.modelsMu.RUnlock()
 	pm, ok := ps.models[strings.TrimSpace(model)]
 	return pm, ok
+}
+
+func (ps *providerSetup) replaceProviderModels(providerID string, models []providerModel) error {
+	if ps == nil {
+		return nil
+	}
+
+	ps.modelsMu.Lock()
+	defer ps.modelsMu.Unlock()
+
+	next := make(map[string]providerModel, len(ps.models)+len(models))
+	for publicID, model := range ps.models {
+		if model.providerID == providerID {
+			continue
+		}
+		next[publicID] = model
+	}
+
+	for _, model := range models {
+		if existing, exists := next[model.publicID]; exists && existing.providerID != model.providerID {
+			return fmt.Errorf("model %q is exposed by both provider %q and provider %q", model.publicID, existing.providerID, model.providerID)
+		}
+		next[model.publicID] = model
+	}
+
+	ps.models = next
+	return nil
 }
 
 func (h *ProxyHandler) initializeProviders() error {
@@ -284,6 +315,9 @@ func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*provider
 		providerOrder = append(providerOrder, provider.id)
 		if provider.kind == providerTypeCopilot {
 			copilotProviders++
+			if copilotProviders > 1 {
+				return nil, nil, "", fmt.Errorf("multiple copilot providers configured; only one copilot provider is supported")
+			}
 		}
 		if provider.isDefault {
 			if defaultProviderID != "" {
@@ -624,7 +658,12 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, fullURL, bytes.NewReader(body))
+	var bodyReader io.Reader
+	if len(body) > 0 {
+		bodyReader = bytes.NewReader(body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
 	if err != nil {
 		return nil, err
 	}
@@ -706,7 +745,7 @@ func decodeProviderModelsFromBody(providerID string, body []byte, excluded map[s
 	}
 
 	models := make([]providerModel, 0, len(upstream.Data))
-	seen := make(map[string]struct{}, len(upstream.Data))
+	indexByID := make(map[string]int, len(upstream.Data))
 	for _, raw := range upstream.Data {
 		var parsed struct {
 			ID                 string   `json:"id"`
@@ -725,19 +764,99 @@ func decodeProviderModelsFromBody(providerID string, body []byte, excluded map[s
 		if _, skip := excluded[publicID]; skip {
 			continue
 		}
-		if _, duplicate := seen[publicID]; duplicate {
+
+		supportedEndpoints := normalizeDynamicProviderEndpoints(parsed.SupportedEndpoints)
+		disabled := strings.EqualFold(parsed.Policy.State, "disabled")
+		if index, duplicate := indexByID[publicID]; duplicate {
+			merged := models[index]
+			merged.supportedEndpoints = mergeDynamicProviderEndpoints(merged.supportedEndpoints, supportedEndpoints)
+			merged.disabled = merged.disabled && disabled
+			baseRaw := merged.raw
+			if merged.disabled != models[index].disabled && !merged.disabled {
+				baseRaw = raw
+			}
+			merged.raw = mergeProviderModelRaw(baseRaw, merged.supportedEndpoints)
+			models[index] = merged
 			continue
 		}
-		seen[publicID] = struct{}{}
+
+		indexByID[publicID] = len(models)
 		models = append(models, providerModel{
 			publicID:           publicID,
 			upstreamModel:      publicID,
 			providerID:         providerID,
-			supportedEndpoints: append([]string(nil), parsed.SupportedEndpoints...),
-			disabled:           strings.EqualFold(parsed.Policy.State, "disabled"),
-			raw:                raw,
+			supportedEndpoints: supportedEndpoints,
+			disabled:           disabled,
+			raw:                mergeProviderModelRaw(raw, supportedEndpoints),
 		})
 	}
 
 	return models, nil
+}
+
+func normalizeDynamicProviderEndpoints(endpoints []string) []string {
+	if len(endpoints) == 0 {
+		return nil
+	}
+
+	normalized := make([]string, 0, len(endpoints))
+	seen := make(map[string]struct{}, len(endpoints))
+	for _, endpoint := range endpoints {
+		endpoint = strings.TrimSpace(endpoint)
+		if endpoint == "" {
+			continue
+		}
+		if _, exists := seen[endpoint]; exists {
+			continue
+		}
+		seen[endpoint] = struct{}{}
+		normalized = append(normalized, endpoint)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func mergeDynamicProviderEndpoints(existing, incoming []string) []string {
+	if len(existing) == 0 || len(incoming) == 0 {
+		return nil
+	}
+
+	merged := append([]string(nil), existing...)
+	seen := make(map[string]struct{}, len(existing)+len(incoming))
+	for _, endpoint := range existing {
+		seen[endpoint] = struct{}{}
+	}
+	for _, endpoint := range incoming {
+		if _, exists := seen[endpoint]; exists {
+			continue
+		}
+		seen[endpoint] = struct{}{}
+		merged = append(merged, endpoint)
+	}
+	return merged
+}
+
+func mergeProviderModelRaw(raw json.RawMessage, supportedEndpoints []string) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return append(json.RawMessage(nil), raw...)
+	}
+
+	if len(supportedEndpoints) == 0 {
+		delete(payload, "supported_endpoints")
+	} else if encoded, err := json.Marshal(supportedEndpoints); err == nil {
+		payload["supported_endpoints"] = encoded
+	}
+
+	merged, err := json.Marshal(payload)
+	if err != nil {
+		return append(json.RawMessage(nil), raw...)
+	}
+	return merged
 }

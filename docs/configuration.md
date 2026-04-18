@@ -41,7 +41,7 @@ Example:
     {
       "id": "azure-openai",
       "type": "azure-openai",
-      "base_url": "https://myresource.cognitiveservices.azure.com/openai",
+      "base_url": "https://myresource.cognitiveservices.azure.com/openai/v1",
       "api_key_env": "AZURE_OPENAI_API_KEY",
       "api_version": "2025-04-01-preview",
       "models": [
@@ -61,9 +61,11 @@ Routing rules:
 
 - Clients keep using plain model IDs such as `gpt-5.4-pro`.
 - Azure `deployment` is the upstream model name; the proxy rewrites the public ID before forwarding.
+- Azure `base_url` must include the OpenAI-compatible `/openai/v1` prefix because the proxy appends routes like `/chat/completions`, `/responses`, and `/models` directly.
 - Public model IDs are global across all providers. Startup fails if two providers expose the same ID.
 - `exclude_models` lets one provider give ownership of a public ID to another provider.
 - When `api_version` is set for Azure OpenAI, the proxy appends `api-version=...` to upstream requests.
+- Only one Copilot provider is supported in a config today.
 - `models[].endpoints` is an allowlist, not a guess. Keep it limited to the routes you have validated for that deployment.
 - The example Azure `gpt-5.4-pro` model shown above is `/responses`-only. Do not advertise `/chat/completions` for that model unless you have verified native support.
 
