@@ -13,7 +13,11 @@ import (
 
 const menubarConfigFilename = "menubar.json"
 
-var userConfigDir = os.UserConfigDir
+var (
+	userConfigDir          = os.UserConfigDir
+	errMenubarConfigLoad   = errors.New("menubar config load failed")
+	errProvidersConfigLoad = errors.New("providers config load failed")
+)
 
 type menubarConfig struct {
 	ProvidersConfigPath string `json:"providers_config_path,omitempty"`
@@ -84,13 +88,17 @@ func saveMenubarConfig(cfg menubarConfig) error {
 func loadProvidersConfigForMenubar() (menubarConfig, proxy.ProvidersConfig, error) {
 	cfg, err := loadMenubarConfig()
 	if err != nil {
-		return menubarConfig{}, proxy.ProvidersConfig{}, err
+		return menubarConfig{}, proxy.ProvidersConfig{}, fmt.Errorf("%w: %w", errMenubarConfigLoad, err)
 	}
 
 	providersCfg, err := proxy.LoadProvidersConfigFile(cfg.ProvidersConfigPath)
 	if err != nil {
-		return cfg, proxy.ProvidersConfig{}, err
+		return cfg, proxy.ProvidersConfig{}, fmt.Errorf("%w: %w", errProvidersConfigLoad, err)
 	}
 
 	return cfg, providersCfg, nil
+}
+
+func isMenubarConfigLoadError(err error) bool {
+	return errors.Is(err, errMenubarConfigLoad)
 }

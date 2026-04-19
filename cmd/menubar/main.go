@@ -48,7 +48,7 @@ func main() {
 
 	menubarCfg, providersCfg, providersConfigErr = loadProvidersConfigForMenubar()
 	if providersConfigErr != nil {
-		log.Error("failed to load providers config", logger.Err(providersConfigErr), logger.F("path", menubarCfg.ProvidersConfigPath))
+		logProvidersConfigLoadError(providersConfigErr)
 	}
 
 	systray.Run(onReady, onExit)
@@ -98,7 +98,8 @@ func onReady() {
 
 	refreshSessionUI()
 	if providersConfigErr != nil {
-		showErrorDialog("Providers Config Unavailable", fmt.Sprintf("Could not load the saved providers config.\n\n%v", providersConfigErr))
+		title, message := providersConfigUnavailableDialog(providersConfigErr)
+		showErrorDialog(title, fmt.Sprintf("%s\n\n%v", message, providersConfigErr))
 	}
 
 	var mCheckUpdatesClicked <-chan struct{}
@@ -157,7 +158,8 @@ func onReady() {
 
 func startProxy() {
 	if providersConfigErr != nil {
-		showErrorDialog("Invalid Providers Config", fmt.Sprintf("Could not load the selected providers config.\n\n%v", providersConfigErr))
+		title, message := providersConfigStartDialog(providersConfigErr)
+		showErrorDialog(title, fmt.Sprintf("%s\n\n%v", message, providersConfigErr))
 		return
 	}
 
@@ -372,7 +374,7 @@ func refreshSessionUI() {
 
 	switch {
 	case providersConfigErr != nil:
-		mStatus.SetTitle("⚠ Invalid providers config")
+		mStatus.SetTitle(providersConfigStatusTitle(providersConfigErr))
 		mAuth.SetTitle(authMenuTitle())
 		mAuth.Enable()
 		mToggle.Disable()
@@ -406,6 +408,8 @@ func refreshProvidersMenu() {
 
 func providersMenuTitle() string {
 	switch {
+	case isMenubarConfigLoadError(providersConfigErr):
+		return "Providers: Config unavailable"
 	case providersConfigErr != nil && menubarCfg.ProvidersConfigPath != "":
 		return fmt.Sprintf("Providers: Invalid (%s)", filepath.Base(menubarCfg.ProvidersConfigPath))
 	case providersConfigErr != nil:
@@ -422,6 +426,35 @@ func authMenuTitle() string {
 		return "Sign Out"
 	}
 	return "Sign In"
+}
+
+func logProvidersConfigLoadError(err error) {
+	if isMenubarConfigLoadError(err) {
+		log.Error("failed to load menubar config", logger.Err(err))
+		return
+	}
+	log.Error("failed to load providers config", logger.Err(err), logger.F("path", menubarCfg.ProvidersConfigPath))
+}
+
+func providersConfigUnavailableDialog(err error) (string, string) {
+	if isMenubarConfigLoadError(err) {
+		return "Menubar Config Unavailable", "Could not load the saved menubar config."
+	}
+	return "Providers Config Unavailable", "Could not load the saved providers config."
+}
+
+func providersConfigStartDialog(err error) (string, string) {
+	if isMenubarConfigLoadError(err) {
+		return "Menubar Config Unavailable", "Could not load the saved menubar config."
+	}
+	return "Invalid Providers Config", "Could not load the selected providers config."
+}
+
+func providersConfigStatusTitle(err error) string {
+	if isMenubarConfigLoadError(err) {
+		return "⚠ Config unavailable"
+	}
+	return "⚠ Invalid providers config"
 }
 
 func providersRequireGitHubAuth(cfg proxy.ProvidersConfig, err error) bool {
