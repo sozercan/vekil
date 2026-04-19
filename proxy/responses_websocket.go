@@ -21,9 +21,9 @@ import (
 const responsesWebSocketRequestHeaderPrefix = "ws_request_header_"
 
 // errStreamFailedUpstream is a sentinel error indicating the upstream stream
-// ended with response.failed or response.incomplete. The error event has already
-// been forwarded to the WebSocket client, so no additional error frame should
-// be sent.
+// ended with response.failed or response.incomplete after forwarding the
+// upstream failure event. This path also emits the standard websocket error
+// payload so clients can surface the upstream error details.
 var errStreamFailedUpstream = errors.New("upstream stream ended with response.failed or response.incomplete")
 
 var responsesWebSocketUpgrader = websocket.Upgrader{
