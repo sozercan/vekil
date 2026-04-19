@@ -818,6 +818,23 @@ func TestHandleResponsesWebSocket_ResponseFailedKeepsSessionOpen(t *testing.T) {
 	if failed["type"] != "response.failed" {
 		t.Fatalf("expected response.failed, got %v", failed["type"])
 	}
+	errFrame := mustReadWebSocketJSON(t, conn)
+	if errFrame["type"] != "error" {
+		t.Fatalf("expected error frame after response.failed, got %v", errFrame["type"])
+	}
+	if statusCode, _ := errFrame["status_code"].(float64); statusCode != float64(http.StatusInternalServerError) {
+		t.Fatalf("expected error status %d, got %v", http.StatusInternalServerError, errFrame["status_code"])
+	}
+	errPayload, ok := errFrame["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error payload, got %T", errFrame["error"])
+	}
+	if errPayload["code"] != "context_length_exceeded" {
+		t.Fatalf("expected error code context_length_exceeded, got %v", errPayload["code"])
+	}
+	if errPayload["message"] != "context too long" {
+		t.Fatalf("expected error message context too long, got %v", errPayload["message"])
+	}
 
 	retry := newResponsesWebSocketCreateRequest([]interface{}{
 		map[string]interface{}{
@@ -885,6 +902,23 @@ func TestHandleResponsesWebSocket_ResponseIncompleteKeepsSessionOpen(t *testing.
 	incomplete := mustReadWebSocketJSON(t, conn)
 	if incomplete["type"] != "response.incomplete" {
 		t.Fatalf("expected response.incomplete, got %v", incomplete["type"])
+	}
+	errFrame := mustReadWebSocketJSON(t, conn)
+	if errFrame["type"] != "error" {
+		t.Fatalf("expected error frame after response.incomplete, got %v", errFrame["type"])
+	}
+	if statusCode, _ := errFrame["status_code"].(float64); statusCode != float64(http.StatusConflict) {
+		t.Fatalf("expected error status %d, got %v", http.StatusConflict, errFrame["status_code"])
+	}
+	errPayload, ok := errFrame["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error payload, got %T", errFrame["error"])
+	}
+	if errPayload["code"] != "max_output_tokens" {
+		t.Fatalf("expected error code max_output_tokens, got %v", errPayload["code"])
+	}
+	if errPayload["message"] != "upstream response.incomplete: max_output_tokens" {
+		t.Fatalf("expected incomplete error message, got %v", errPayload["message"])
 	}
 
 	next := newResponsesWebSocketCreateRequest([]interface{}{
@@ -971,6 +1005,17 @@ func TestHandleResponsesWebSocket_ResponseFailedOnStalledUpstreamKeepsSessionOpe
 	failed := mustReadWebSocketJSON(t, conn)
 	if failed["type"] != "response.failed" {
 		t.Fatalf("expected response.failed, got %v", failed["type"])
+	}
+	errFrame := mustReadWebSocketJSON(t, conn)
+	if errFrame["type"] != "error" {
+		t.Fatalf("expected error frame after response.failed, got %v", errFrame["type"])
+	}
+	errPayload, ok := errFrame["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error payload, got %T", errFrame["error"])
+	}
+	if errPayload["message"] != "context too long" {
+		t.Fatalf("expected error message context too long, got %v", errPayload["message"])
 	}
 
 	next := newResponsesWebSocketCreateRequest([]interface{}{
