@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -49,6 +50,7 @@ type Authenticator struct {
 	tokenExpiry    time.Time
 	mu             sync.RWMutex
 	client         *http.Client
+	directClient   *http.Client
 	copilotBaseURL string // overridable for tests; defaults to https://api.github.com
 
 	// DisableAutoDeviceFlow prevents refreshToken from falling through to the
@@ -100,10 +102,9 @@ func NewAuthenticator(tokenDir string) (*Authenticator, error) {
 	}
 
 	return &Authenticator{
-		tokenDir: tokenDir,
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		tokenDir:     tokenDir,
+		client:       newAuthHTTPClient(30*time.Second, true),
+		directClient: newAuthHTTPClient(30*time.Second, false),
 	}, nil
 }
 
@@ -302,7 +303,7 @@ func (a *Authenticator) RequestDeviceCode(ctx context.Context) (*DeviceCodeRespo
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := a.client.Do(req)
+	resp, err := a.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("requesting device code: %w", err)
 	}
@@ -352,7 +353,7 @@ func (a *Authenticator) pollForAuthorization(ctx context.Context, dcResp *Device
 		tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		tokenReq.Header.Set("Accept", "application/json")
 
-		tokenResp, err := a.client.Do(tokenReq)
+		tokenResp, err := a.do(tokenReq)
 		if err != nil {
 			return fmt.Errorf("requesting access token: %w", err)
 		}
@@ -433,7 +434,7 @@ func (a *Authenticator) exchangeForCopilotToken(ctx context.Context) error {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "GitHubCopilotChat/0.26.7")
 
-	resp, err := a.client.Do(req)
+	resp, err := a.do(req)
 	if err != nil {
 		return fmt.Errorf("requesting copilot token: %w", err)
 	}
@@ -470,6 +471,136 @@ func (a *Authenticator) exchangeForCopilotToken(ctx context.Context) error {
 		return fmt.Errorf("saving copilot token: %w", err)
 	}
 	return nil
+}
+
+func newAuthHTTPClient(timeout time.Duration, useProxy bool) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if !useProxy {
+		transport.Proxy = nil
+	}
+
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	}
+}
+
+func (a *Authenticator) do(req *http.Request) (*http.Response, error) {
+	client := a.client
+	if client == nil {
+		client = newAuthHTTPClient(30*time.Second, true)
+	}
+
+	resp, err := client.Do(req)
+	if err == nil || !shouldRetryWithoutProxy(req, err) {
+		return resp, err
+	}
+
+	retryReq, retryErr := cloneRequest(req)
+	if retryErr != nil {
+		return nil, err
+	}
+
+	directClient := a.directClient
+	if directClient == nil {
+		timeout := client.Timeout
+		if timeout == 0 {
+			timeout = 30 * time.Second
+		}
+		directClient = newAuthHTTPClient(timeout, false)
+	}
+
+	resp, retryErr = directClient.Do(retryReq)
+	if retryErr == nil {
+		return resp, nil
+	}
+
+	return nil, fmt.Errorf("%w; direct retry without loopback proxy also failed: %v", err, retryErr)
+}
+
+func cloneRequest(req *http.Request) (*http.Request, error) {
+	cloned := req.Clone(req.Context())
+	if req.Body == nil || req.Body == http.NoBody {
+		return cloned, nil
+	}
+	if req.GetBody == nil {
+		return nil, errors.New("request body cannot be retried")
+	}
+
+	body, err := req.GetBody()
+	if err != nil {
+		return nil, err
+	}
+	cloned.Body = body
+	cloned.GetBody = req.GetBody
+	return cloned, nil
+}
+
+func shouldRetryWithoutProxy(req *http.Request, err error) bool {
+	if req == nil || req.URL == nil || err == nil {
+		return false
+	}
+
+	proxyURL := proxyURLFromEnvironment(req.URL.Scheme)
+	if proxyURL == nil || !isLoopbackProxyHost(proxyURL.Hostname()) {
+		return false
+	}
+
+	errText := strings.ToLower(err.Error())
+	return strings.Contains(errText, "proxyconnect tcp:") && strings.Contains(errText, "connection refused")
+}
+
+func proxyURLFromEnvironment(scheme string) *url.URL {
+	for _, raw := range proxyEnvCandidates(scheme) {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+
+		proxyURL, err := url.Parse(raw)
+		if err == nil && proxyURL.Host != "" {
+			return proxyURL
+		}
+
+		if strings.Contains(raw, "://") {
+			continue
+		}
+
+		proxyURL, err = url.Parse("http://" + raw)
+		if err == nil && proxyURL.Host != "" {
+			return proxyURL
+		}
+	}
+
+	return nil
+}
+
+func proxyEnvCandidates(scheme string) []string {
+	if strings.EqualFold(scheme, "https") {
+		return []string{
+			os.Getenv("HTTPS_PROXY"),
+			os.Getenv("https_proxy"),
+			os.Getenv("HTTP_PROXY"),
+			os.Getenv("http_proxy"),
+			os.Getenv("ALL_PROXY"),
+			os.Getenv("all_proxy"),
+		}
+	}
+
+	return []string{
+		os.Getenv("HTTP_PROXY"),
+		os.Getenv("http_proxy"),
+		os.Getenv("ALL_PROXY"),
+		os.Getenv("all_proxy"),
+	}
+}
+
+func isLoopbackProxyHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (a *Authenticator) loadAccessToken() error {

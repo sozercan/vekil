@@ -524,6 +524,92 @@ func TestRequestDeviceCode(t *testing.T) {
 	}
 }
 
+func TestRequestDeviceCode_RetriesWithoutLoopbackProxy(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://[::1]:1337")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(DeviceCodeResponse{
+			DeviceCode:      "dc_retry",
+			UserCode:        "RETRY-1234",
+			VerificationURI: "https://github.com/login/device",
+			ExpiresIn:       900,
+			Interval:        5,
+		})
+	}))
+	defer server.Close()
+
+	proxyAttempts := 0
+	directAttempts := 0
+
+	proxyClient := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			proxyAttempts++
+			return nil, &url.Error{
+				Op:  req.Method,
+				URL: req.URL.String(),
+				Err: errors.New("proxyconnect tcp: dial tcp [::1]:1337: connect: connection refused"),
+			}
+		}),
+	}
+
+	directClient := server.Client()
+	directClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		directAttempts++
+		req.URL, _ = url.Parse(server.URL + req.URL.Path)
+		return http.DefaultTransport.RoundTrip(req)
+	})
+
+	a := &Authenticator{
+		client:       proxyClient,
+		directClient: directClient,
+	}
+
+	dcResp, err := a.RequestDeviceCode(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dcResp.UserCode != "RETRY-1234" {
+		t.Errorf("expected RETRY-1234, got %q", dcResp.UserCode)
+	}
+	if proxyAttempts != 1 {
+		t.Errorf("expected 1 proxy attempt, got %d", proxyAttempts)
+	}
+	if directAttempts != 1 {
+		t.Errorf("expected 1 direct retry, got %d", directAttempts)
+	}
+}
+
+func TestRequestDeviceCode_DoesNotRetryWithoutLoopbackProxy(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://proxy.example.com:8080")
+
+	directAttempted := false
+	a := &Authenticator{
+		client: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return nil, &url.Error{
+					Op:  req.Method,
+					URL: req.URL.String(),
+					Err: errors.New("proxyconnect tcp: dial tcp proxy.example.com:8080: connect: connection refused"),
+				}
+			}),
+		},
+		directClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				directAttempted = true
+				return nil, errors.New("direct client should not be called")
+			}),
+		},
+	}
+
+	_, err := a.RequestDeviceCode(context.Background())
+	if err == nil {
+		t.Fatal("expected proxy error")
+	}
+	if directAttempted {
+		t.Fatal("expected no direct retry for non-loopback proxy")
+	}
+}
+
 // roundTripFunc adapts a function to http.RoundTripper.
 type roundTripFunc func(*http.Request) (*http.Response, error)
 

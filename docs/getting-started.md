@@ -64,5 +64,6 @@ If your setup includes a Copilot provider, the proxy starts GitHub's device code
 3. Authorize the application.
 
 Tokens are cached in `~/.config/vekil/` and refreshed automatically before expiry.
+If `HTTP_PROXY` or `HTTPS_PROXY` points at a local loopback proxy that is not running, the auth flow automatically retries GitHub requests directly.
 
 If your provider config does not include Copilot, startup skips GitHub authentication. See [configuration.md](configuration.md) for multi-provider setup details.
