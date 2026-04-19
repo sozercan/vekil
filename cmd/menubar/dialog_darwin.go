@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -32,6 +33,36 @@ func showErrorDialog(title, message string) {
 		message, title,
 	)
 	_ = exec.Command("osascript", "-e", script).Run()
+}
+
+func chooseProvidersConfigPath() (string, error) {
+	script := `POSIX path of (choose file with prompt "Choose a providers config JSON file")`
+	out, err := exec.Command("osascript", "-e", script).CombinedOutput()
+	if err != nil {
+		if isOsascriptCancel(err, out) {
+			return "", errDialogCanceled
+		}
+		message := strings.TrimSpace(string(out))
+		if message == "" {
+			return "", fmt.Errorf("run osascript file chooser: %w", err)
+		}
+		return "", fmt.Errorf("run osascript file chooser: %w: %s", err, message)
+	}
+
+	path := strings.TrimSpace(string(out))
+	if path == "" {
+		return "", errDialogCanceled
+	}
+
+	return path, nil
+}
+
+func isOsascriptCancel(err error, output []byte) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	return exitErr.ExitCode() == 1 && strings.Contains(string(output), "(-128)")
 }
 
 // copyToClipboard copies the given text to the macOS clipboard using pbcopy.
