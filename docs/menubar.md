@@ -43,9 +43,18 @@ open "Vekil.app"
 - start/stop toggle from the menubar
 - status icon: white robot when running, gray when stopped
 - current app version shown in the menu
+- choose and persist a `providers-config` JSON file from the menu
 - optional LaunchAgent integration for launch at login
 - tooltip showing running/stopped state and port
 - `Check for Updates…` in packaged macOS app builds
+
+## Providers Config
+
+Use `Choose Providers Config…` from the menubar menu to select the same JSON file you would pass to the CLI with `--providers-config`.
+
+- The app saves the selected path in its menubar config so it is reused on the next launch and when started at login.
+- `Use Default Copilot Routing` clears the saved path and returns to the zero-config Copilot-only behavior.
+- If the selected config does not include a Copilot provider, the app no longer requires GitHub sign-in before starting the proxy.
 
 ## Release Assets
 

@@ -34,6 +34,21 @@ func showErrorDialog(title, message string) {
 	_ = exec.Command("osascript", "-e", script).Run()
 }
 
+func chooseProvidersConfigPath() (string, error) {
+	script := `POSIX path of (choose file with prompt "Choose a providers config JSON file")`
+	out, err := exec.Command("osascript", "-e", script).Output()
+	if err != nil {
+		return "", errDialogCanceled
+	}
+
+	path := strings.TrimSpace(string(out))
+	if path == "" {
+		return "", errDialogCanceled
+	}
+
+	return path, nil
+}
+
 // copyToClipboard copies the given text to the macOS clipboard using pbcopy.
 func copyToClipboard(text string) {
 	cmd := exec.Command("pbcopy")
