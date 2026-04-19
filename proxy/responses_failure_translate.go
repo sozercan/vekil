@@ -526,9 +526,7 @@ func nextResponsesSSEMessage(buf []byte, allowBOM bool) (responsesSSEMessage, in
 		if colon := bytes.IndexByte(line, ':'); colon >= 0 {
 			field = line[:colon]
 			value = string(line[colon+1:])
-			if strings.HasPrefix(value, " ") {
-				value = value[1:]
-			}
+			value = strings.TrimPrefix(value, " ")
 		}
 
 		switch string(field) {
