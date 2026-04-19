@@ -57,10 +57,12 @@ kubectl apply -f k8s/vekil.yaml
 
 ## First Run
 
-On first run, the proxy starts GitHub's device code flow:
+If your setup includes a Copilot provider, the proxy starts GitHub's device code flow on first run:
 
 1. Visit the URL shown in the terminal.
 2. Enter the one-time code.
 3. Authorize the application.
 
 Tokens are cached in `~/.config/vekil/` and refreshed automatically before expiry.
+
+If your provider config does not include Copilot, startup skips GitHub authentication. See [configuration.md](configuration.md) for multi-provider setup details.

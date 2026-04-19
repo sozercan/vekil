@@ -1,6 +1,6 @@
 # vekil
 
-High-performance Go proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs, forwarding all requests to GitHub Copilot's backend (`api.githubcopilot.com`). This lets you use tools that speak the Anthropic, Gemini, or OpenAI protocol with your GitHub Copilot subscription.
+High-performance Go proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs. By default it forwards requests to GitHub Copilot's backend (`api.githubcopilot.com`), and it can also route selected models to configured providers such as Azure OpenAI behind the same proxy endpoint. This lets you use tools that speak the Anthropic, Gemini, or OpenAI protocol with your GitHub Copilot subscription, while still exposing additional provider-backed models when configured.
 
 ## What It Supports
 
@@ -38,7 +38,9 @@ brew install --cask sozercan/repo/vekil
 
 Manual downloads still work through the `vekil-macos-arm64.zip` asset on [GitHub Releases](https://github.com/sozercan/vekil/releases/latest). See [macOS Menubar App](docs/menubar.md).
 
-On first run, authenticate with GitHub's device code flow. Tokens are cached in `~/.config/vekil/`.
+If your setup includes a Copilot provider, first run starts GitHub's device code flow. Tokens are cached in `~/.config/vekil/`.
+
+For multi-provider setup and non-Copilot-only deployments, see [Configuration](docs/configuration.md).
 
 ## Docs
 
