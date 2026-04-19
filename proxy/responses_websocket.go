@@ -21,9 +21,9 @@ import (
 const responsesWebSocketRequestHeaderPrefix = "ws_request_header_"
 
 // errStreamFailedUpstream is a sentinel error indicating the upstream stream
-// ended with response.failed or response.incomplete. The error event has already
-// been forwarded to the WebSocket client, so no additional error frame should
-// be sent.
+// ended with response.failed or response.incomplete after forwarding the
+// upstream failure event. This path also emits the standard websocket error
+// payload so clients can surface the upstream error details.
 var errStreamFailedUpstream = errors.New("upstream stream ended with response.failed or response.incomplete")
 
 var responsesWebSocketUpgrader = websocket.Upgrader{
@@ -54,9 +54,21 @@ type responsesWebSocketJSONField struct {
 type responsesWebSocketStreamEvent struct {
 	Type     string `json:"type"`
 	Response struct {
-		ID string `json:"id"`
+		ID                string                                    `json:"id"`
+		Error             responsesWebSocketStreamError             `json:"error"`
+		IncompleteDetails responsesWebSocketStreamIncompleteDetails `json:"incomplete_details"`
 	} `json:"response,omitempty"`
 	Item json.RawMessage `json:"item,omitempty"`
+}
+
+type responsesWebSocketStreamError struct {
+	Type    string `json:"type"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type responsesWebSocketStreamIncompleteDetails struct {
+	Reason string `json:"reason"`
 }
 
 type responsesWebSocketSession struct {
@@ -607,9 +619,11 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, heade
 				responseID = event.Response.ID
 			}
 		case "response.failed", "response.incomplete":
+			s.sendUpstreamStreamFailure(event, headers)
 			// Return the sentinel immediately to break out of the SSE
-			// scanner loop. The event has already been forwarded to the
-			// client above, so no additional error frame is needed.
+			// scanner loop. The failure event has already been forwarded to
+			// the client above, and we also emit a standard error payload so
+			// websocket clients can surface the upstream error details.
 			return errStreamFailedUpstream
 		}
 
@@ -635,6 +649,14 @@ func (s *responsesWebSocketSession) writeJSON(payload interface{}) error {
 		return err
 	}
 	return s.conn.WriteMessage(websocket.TextMessage, encoded)
+}
+
+func (s *responsesWebSocketSession) sendUpstreamStreamFailure(event responsesWebSocketStreamEvent, headers http.Header) {
+	status, message, code := responsesWebSocketStreamFailureDetails(event)
+	if status == 0 || strings.TrimSpace(message) == "" {
+		return
+	}
+	s.sendWrappedError(status, message, code, headers)
 }
 
 func (s *responsesWebSocketSession) sendWrappedError(status int, message, code string, headers http.Header) {
@@ -715,6 +737,52 @@ func extractResponsesWebSocketError(status int, body []byte) (string, string) {
 	}
 
 	return http.StatusText(status), ""
+}
+
+func responsesWebSocketStreamFailureDetails(event responsesWebSocketStreamEvent) (int, string, string) {
+	switch event.Type {
+	case "response.failed":
+		errType := strings.TrimSpace(event.Response.Error.Type)
+		code := strings.TrimSpace(event.Response.Error.Code)
+		message := strings.TrimSpace(event.Response.Error.Message)
+		if message == "" {
+			if code != "" {
+				message = code
+			} else {
+				message = "upstream response.failed"
+			}
+		}
+		return responsesWebSocketErrorStatus(errType), message, code
+	case "response.incomplete":
+		reason := strings.TrimSpace(event.Response.IncompleteDetails.Reason)
+		if reason == "" {
+			return http.StatusConflict, "upstream response.incomplete", "response_incomplete"
+		}
+		return http.StatusConflict, "upstream response.incomplete: " + reason, reason
+	default:
+		return 0, "", ""
+	}
+}
+
+func responsesWebSocketErrorStatus(errType string) int {
+	switch strings.TrimSpace(errType) {
+	case "invalid_request_error":
+		return http.StatusBadRequest
+	case "authentication_error":
+		return http.StatusUnauthorized
+	case "permission_error":
+		return http.StatusForbidden
+	case "not_found_error":
+		return http.StatusNotFound
+	case "conflict_error":
+		return http.StatusConflict
+	case "rate_limit_error":
+		return http.StatusTooManyRequests
+	case "server_error":
+		return http.StatusInternalServerError
+	default:
+		return http.StatusBadGateway
+	}
 }
 
 func flattenResponsesWebSocketHeaders(headers http.Header) map[string]interface{} {
