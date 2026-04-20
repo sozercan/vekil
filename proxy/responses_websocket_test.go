@@ -860,6 +860,89 @@ func TestHandleResponsesWebSocket_ResponseFailedKeepsSessionOpen(t *testing.T) {
 	}
 }
 
+func TestHandleResponsesWebSocket_FirstEventTransientResponseFailedSendsOnlyErrorFrame(t *testing.T) {
+	var upstreamRequests int
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Retry-After", "3")
+		switch upstreamRequests {
+		case 1:
+			_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-rate-limit\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"Too Many Requests\"}}}\n\n")
+		case 2:
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-next\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-next\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		default:
+			t.Fatalf("unexpected upstream request count %d", upstreamRequests)
+		}
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+
+	errFrame := mustReadWebSocketJSON(t, conn)
+	if errFrame["type"] != "error" {
+		t.Fatalf("expected error frame for first-event transient failure, got %v", errFrame["type"])
+	}
+	if statusCode, _ := errFrame["status_code"].(float64); statusCode != float64(http.StatusTooManyRequests) {
+		t.Fatalf("expected error status %d, got %v", http.StatusTooManyRequests, errFrame["status_code"])
+	}
+	errPayload, ok := errFrame["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error payload, got %T", errFrame["error"])
+	}
+	if errPayload["code"] != "too_many_requests" {
+		t.Fatalf("expected error code too_many_requests, got %v", errPayload["code"])
+	}
+	if errPayload["message"] != "Too Many Requests" {
+		t.Fatalf("expected error message Too Many Requests, got %v", errPayload["message"])
+	}
+	headers, ok := errFrame["headers"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected forwarded headers, got %T", errFrame["headers"])
+	}
+	if headers["Retry-After"] != "3" {
+		t.Fatalf("expected Retry-After header 3, got %v", headers["Retry-After"])
+	}
+
+	next := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "after rate limit"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(next); err != nil {
+		t.Fatalf("failed to write follow-up websocket request: %v", err)
+	}
+
+	nextCreated := mustReadWebSocketJSON(t, conn)
+	if nextCreated["type"] != "response.created" {
+		t.Fatalf("expected follow-up response.created, got %v", nextCreated["type"])
+	}
+
+	nextCompleted := mustReadWebSocketJSON(t, conn)
+	if nextCompleted["type"] != "response.completed" {
+		t.Fatalf("expected follow-up response.completed, got %v", nextCompleted["type"])
+	}
+}
+
 func TestHandleResponsesWebSocket_ResponseIncompleteKeepsSessionOpen(t *testing.T) {
 	var upstreamRequests int
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1039,6 +1122,59 @@ func TestHandleResponsesWebSocket_ResponseFailedOnStalledUpstreamKeepsSessionOpe
 	nextCompleted := mustReadWebSocketJSON(t, conn)
 	if nextCompleted["type"] != "response.completed" {
 		t.Fatalf("expected follow-up response.completed, got %v", nextCompleted["type"])
+	}
+}
+
+func TestHandleResponsesWebSocket_LaterTransientResponseFailedStillRelaysEventAndMaps429(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-later-rate-limit\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-later-rate-limit\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"Too Many Requests\"}}}\n\n")
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+
+	created := mustReadWebSocketJSON(t, conn)
+	if created["type"] != "response.created" {
+		t.Fatalf("expected response.created, got %v", created["type"])
+	}
+
+	failed := mustReadWebSocketJSON(t, conn)
+	if failed["type"] != "response.failed" {
+		t.Fatalf("expected response.failed, got %v", failed["type"])
+	}
+
+	errFrame := mustReadWebSocketJSON(t, conn)
+	if errFrame["type"] != "error" {
+		t.Fatalf("expected error frame after response.failed, got %v", errFrame["type"])
+	}
+	if statusCode, _ := errFrame["status_code"].(float64); statusCode != float64(http.StatusTooManyRequests) {
+		t.Fatalf("expected error status %d, got %v", http.StatusTooManyRequests, errFrame["status_code"])
+	}
+	errPayload, ok := errFrame["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error payload, got %T", errFrame["error"])
+	}
+	if errPayload["code"] != "too_many_requests" {
+		t.Fatalf("expected error code too_many_requests, got %v", errPayload["code"])
+	}
+	if errPayload["message"] != "Too Many Requests" {
+		t.Fatalf("expected error message Too Many Requests, got %v", errPayload["message"])
 	}
 }
 

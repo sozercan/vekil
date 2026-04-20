@@ -119,7 +119,7 @@ Like chat completions, Responses requests are routed by the public `model` ID. F
 
 For responses-only Azure deployments such as the `gpt-5.4-pro` example configuration, this is the canonical inference path.
 
-Streaming Responses requests are passed through directly with upstream headers preserved.
+Streaming Responses requests preserve upstream headers and are otherwise passed through directly. One narrow exception exists for `POST /v1/responses` with `stream: true`: if the first semantic SSE event is an immediate transient `response.failed` admission error such as `too_many_requests`, `model_overloaded`, `bad_gateway`, or `gateway_timeout`, the proxy translates that pre-commit failure into a normal HTTP error before flushing `200 OK`. All other streaming failures stay passthrough SSE.
 
 `GET /v1/responses` upgrades to a websocket bridge for Codex-style clients. The proxy:
 
@@ -134,6 +134,7 @@ Websocket bridge behavior:
 - long sessions are auto-compacted into one proxy-owned checkpoint plus a recent tail
 - optional turn-state delta replay can be enabled with `--responses-ws-turn-state-delta`
 - if upstream rejects delta replay, the proxy automatically falls back to full replay
+- if the first streamed upstream event is a transient `response.failed` admission error, the bridge sends a wrapped websocket error frame instead of relaying the raw `response.failed` event
 
 This websocket bridge is a proxy transport adaptation layered over upstream HTTP `/responses`. It is not the same feature as provider-native websocket or realtime APIs such as Azure `/realtime`.
 
