@@ -2240,8 +2240,8 @@ func TestHandleOpenAIChatCompletions_RoutesConfiguredAzureModel(t *testing.T) {
 		if got := r.URL.Path; got != "/openai/v1/chat/completions" {
 			t.Fatalf("expected Azure path /openai/v1/chat/completions, got %s", got)
 		}
-		if got := r.URL.Query().Get("api-version"); got != "preview" {
-			t.Fatalf("expected api-version=preview, got %q", got)
+		if got := r.URL.RawQuery; got != "" {
+			t.Fatalf("expected no Azure query params for /openai/v1 base URL, got %q", got)
 		}
 		if got := r.Header.Get("api-key"); got != "azure-test-key" {
 			t.Fatalf("expected api-key header, got %q", got)
@@ -3117,8 +3117,8 @@ func TestHandleModels(t *testing.T) {
 			if r.URL.Path != "/openai/v1/models" {
 				t.Fatalf("unexpected Azure path %q", r.URL.Path)
 			}
-			if got := r.URL.Query().Get("api-version"); got != "preview" {
-				t.Fatalf("expected api-version=preview, got %q", got)
+			if got := r.URL.RawQuery; got != "" {
+				t.Fatalf("expected no Azure query params for /openai/v1 base URL, got %q", got)
 			}
 			if got := r.Header.Get("api-key"); got != "azure-test-key" {
 				t.Fatalf("expected api-key header, got %q", got)

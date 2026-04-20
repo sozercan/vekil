@@ -624,10 +624,18 @@ func (h *ProxyHandler) providerRequestURL(provider *providerRuntime, path string
 
 	baseURL := strings.TrimRight(provider.baseURL, "/")
 	fullURL := baseURL + path
-	if provider.kind != providerTypeAzureOpenAI || provider.apiVersion == "" {
+	if provider.kind != providerTypeAzureOpenAI || provider.apiVersion == "" || azureUsesOpenAIV1BaseURL(baseURL) {
 		return appendRawQuery(fullURL, extraQuery), nil
 	}
 	return appendRawQuery(fullURL, appendQuery("api-version="+url.QueryEscape(provider.apiVersion), extraQuery)), nil
+}
+
+func azureUsesOpenAIV1BaseURL(baseURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return strings.HasSuffix(strings.TrimRight(strings.TrimSpace(baseURL), "/"), "/openai/v1")
+	}
+	return strings.HasSuffix(strings.TrimRight(parsed.Path, "/"), "/openai/v1")
 }
 
 func appendQuery(parts ...string) string {
