@@ -85,8 +85,8 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isStreaming && resp.StatusCode == http.StatusOK {
-		copyPassthroughHeaders(w.Header(), resp.Header)
-		StreamOpenAIPassthrough(w, resp.Body)
+		model := extractRequestModel(bodyBytes)
+		peekAndForwardResponses(h, w, r, resp, upstreamCancel, model)
 		return
 	}
 

@@ -590,17 +590,30 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, heade
 	var responseID string
 	var outputItems []json.RawMessage
 	sawCompleted := false
+	sawSemanticEvent := false
 
 	if err := consumeResponsesSSEData(body, func(data string) error {
 		if data == "" || data == "[DONE]" {
 			return nil
 		}
+
+		var event responsesWebSocketStreamEvent
+		parsedEvent := json.Unmarshal([]byte(data), &event) == nil
+		if !sawSemanticEvent {
+			sawSemanticEvent = true
+			if parsedEvent && event.Type == "response.failed" {
+				if status, _, ok := classifyPrecommitResponsesFailure(event); ok {
+					s.sendWrappedError(status, responsesPrecommitErrorMessage(event, status), strings.TrimSpace(event.Response.Error.Code), headers)
+					return errStreamFailedUpstream
+				}
+			}
+		}
+
 		if err := s.conn.WriteMessage(websocket.TextMessage, []byte(data)); err != nil {
 			return err
 		}
 
-		var event responsesWebSocketStreamEvent
-		if err := json.Unmarshal([]byte(data), &event); err != nil {
+		if !parsedEvent {
 			return nil
 		}
 
@@ -742,6 +755,10 @@ func extractResponsesWebSocketError(status int, body []byte) (string, string) {
 func responsesWebSocketStreamFailureDetails(event responsesWebSocketStreamEvent) (int, string, string) {
 	switch event.Type {
 	case "response.failed":
+		if status, _, ok := classifyPrecommitResponsesFailure(event); ok {
+			message := responsesPrecommitErrorMessage(event, status)
+			return status, message, strings.TrimSpace(event.Response.Error.Code)
+		}
 		errType := strings.TrimSpace(event.Response.Error.Type)
 		code := strings.TrimSpace(event.Response.Error.Code)
 		message := strings.TrimSpace(event.Response.Error.Message)

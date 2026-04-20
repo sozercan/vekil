@@ -824,8 +824,16 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, message str
 	})
 }
 
-func writeOpenAIError(w http.ResponseWriter, status int, message, errType string) {
+func writeOpenAIErrorWithRetryAfter(w http.ResponseWriter, status int, message, errType, retryAfter string, upstreamHeaders http.Header) {
 	w.Header().Set("Content-Type", "application/json")
+	if retryAfter != "" {
+		w.Header().Set("Retry-After", retryAfter)
+	}
+	for _, name := range []string{"X-Request-Id", "X-Azure-Request-Id", "Openai-Request-Id"} {
+		for _, value := range headerValuesCI(upstreamHeaders, name) {
+			w.Header().Add(name, value)
+		}
+	}
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": map[string]interface{}{
@@ -835,6 +843,10 @@ func writeOpenAIError(w http.ResponseWriter, status int, message, errType string
 			"code":    nil,
 		},
 	})
+}
+
+func writeOpenAIError(w http.ResponseWriter, status int, message, errType string) {
+	writeOpenAIErrorWithRetryAfter(w, status, message, errType, "", nil)
 }
 
 // readBody reads the request body up to maxRequestBodySize. If the body exceeds
