@@ -134,6 +134,7 @@ Websocket bridge behavior:
 - long sessions are auto-compacted into one proxy-owned checkpoint plus a recent tail
 - optional turn-state delta replay can be enabled with `--responses-ws-turn-state-delta`
 - if upstream rejects delta replay, the proxy automatically falls back to full replay
+- if the first streamed upstream event is a transient `response.failed` admission error, the bridge sends a wrapped websocket error frame instead of relaying the raw `response.failed` event
 
 This websocket bridge is a proxy transport adaptation layered over upstream HTTP `/responses`. It is not the same feature as provider-native websocket or realtime APIs such as Azure `/realtime`.
 
