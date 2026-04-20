@@ -112,6 +112,17 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantRawBody:     "\xEF\xBB\xBF: keepalive\n\nevent: response.created\ndata: first snowman ☃\ndata: second line\n\n",
 		},
 		{
+			name: "control only message does not consume first semantic event",
+			body: "id: msg-1\nretry: 1000\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-control\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"back off\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "back off",
+		},
+		{
 			name: "crlf framing works",
 			body: "event: response.failed\r\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-crlf\",\"error\":{\"type\":\"server_error\",\"code\":\"bad_gateway\",\"message\":\"gateway\"}}}\r\n\r\n",
 			headers: http.Header{

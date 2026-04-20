@@ -41,7 +41,6 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = r.Body.Close() }()
 
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses", true)
-	model := extractRequestModel(bodyBytes)
 
 	var partial struct {
 		Stream *bool `json:"stream,omitempty"`
@@ -86,6 +85,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isStreaming && resp.StatusCode == http.StatusOK {
+		model := extractRequestModel(bodyBytes)
 		peekAndForwardResponses(h, w, r, resp, upstreamCancel, model)
 		return
 	}

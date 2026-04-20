@@ -520,7 +520,6 @@ func nextResponsesSSEMessage(buf []byte, allowBOM bool) (responsesSSEMessage, in
 			continue
 		}
 
-		msg.semantic = true
 		field := line
 		value := ""
 		if colon := bytes.IndexByte(line, ':'); colon >= 0 {
@@ -532,8 +531,10 @@ func nextResponsesSSEMessage(buf []byte, allowBOM bool) (responsesSSEMessage, in
 		switch string(field) {
 		case "event":
 			msg.event = value
+			msg.semantic = true
 		case "data":
 			dataLines = append(dataLines, value)
+			msg.semantic = true
 		}
 	}
 }
