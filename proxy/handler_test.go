@@ -3110,7 +3110,7 @@ func TestHandleModels(t *testing.T) {
 		}
 	})
 
-	t.Run("Azure discovered metadata best-effort enriches configured public model", func(t *testing.T) {
+	t.Run("Azure upstream metadata best-effort enriches configured public model", func(t *testing.T) {
 		t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 
 		azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3125,7 +3125,7 @@ func TestHandleModels(t *testing.T) {
 			}
 
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.4","object":"model","created":0,"owned_by":"azure-openai","supported_endpoints":["/chat/completions","/responses"],"capabilities":{"supports":{"parallel_tool_calls":true,"vision":true,"reasoning_effort":["low","medium","high"]},"limits":{"max_context_window_tokens":128000}},"model_picker_enabled":true,"model_picker_category":"powerful","name":"GPT-5.4 Discovered"}]}`))
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.4","object":"model","created":0,"owned_by":"azure-openai","supported_endpoints":["/chat/completions","/responses"],"capabilities":{"supports":{"parallel_tool_calls":true,"vision":true,"reasoning_effort":["low","medium","high"]},"limits":{"max_context_window_tokens":128000}},"model_picker_enabled":true,"model_picker_category":"powerful","name":"GPT-5.4 Overlay"}]}`))
 		}))
 		defer azureServer.Close()
 
@@ -3188,8 +3188,8 @@ func TestHandleModels(t *testing.T) {
 		if result.Data[0].ID != "gpt-5.4" {
 			t.Fatalf("expected public id gpt-5.4, got %q", result.Data[0].ID)
 		}
-		if result.Data[0].Name != "GPT-5.4 Discovered" {
-			t.Fatalf("expected discovered name, got %q", result.Data[0].Name)
+		if result.Data[0].Name != "GPT-5.4 Overlay" {
+			t.Fatalf("expected Azure overlay name, got %q", result.Data[0].Name)
 		}
 		if got := strings.Join(result.Data[0].SupportedEndpoints, ","); got != "/responses" {
 			t.Fatalf("expected configured supported_endpoints /responses, got %q", got)
@@ -3199,27 +3199,27 @@ func TestHandleModels(t *testing.T) {
 		if model.Slug != "gpt-5.4" {
 			t.Fatalf("expected slug gpt-5.4, got %q", model.Slug)
 		}
-		if model.DisplayName != "GPT-5.4 Discovered" {
-			t.Fatalf("expected discovered display name, got %q", model.DisplayName)
+		if model.DisplayName != "GPT-5.4 Overlay" {
+			t.Fatalf("expected Azure overlay display name, got %q", model.DisplayName)
 		}
 		if model.DefaultReasoningLevel == nil || *model.DefaultReasoningLevel != "medium" {
 			t.Fatalf("expected default_reasoning_level medium, got %v", model.DefaultReasoningLevel)
 		}
 		if !model.SupportsParallelToolCalls {
-			t.Fatal("expected discovered supports_parallel_tool_calls true")
+			t.Fatal("expected Azure overlay supports_parallel_tool_calls true")
 		}
 		if model.ContextWindow == nil || *model.ContextWindow != 128000 {
-			t.Fatalf("expected discovered context_window 128000, got %v", model.ContextWindow)
+			t.Fatalf("expected Azure overlay context_window 128000, got %v", model.ContextWindow)
 		}
 		if got := strings.Join(model.InputModalities, ","); got != "text,image" {
-			t.Fatalf("expected discovered input_modalities text,image, got %q", got)
+			t.Fatalf("expected Azure overlay input_modalities text,image, got %q", got)
 		}
 		if model.Priority != 0 {
 			t.Fatalf("expected powerful priority 0, got %d", model.Priority)
 		}
 	})
 
-	t.Run("Azure sparse discovered metadata leaves static model minimal but valid", func(t *testing.T) {
+	t.Run("Azure sparse upstream metadata leaves static model minimal but valid", func(t *testing.T) {
 		t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 
 		azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3337,7 +3337,7 @@ func TestHandleModels(t *testing.T) {
 		}
 	})
 
-	t.Run("Azure best-effort discovered metadata matches deployment and respects explicit overrides", func(t *testing.T) {
+	t.Run("Azure best-effort upstream metadata matches deployment and respects explicit overrides", func(t *testing.T) {
 		t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 
 		azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3345,7 +3345,7 @@ func TestHandleModels(t *testing.T) {
 				t.Fatalf("unexpected Azure path %q", r.URL.Path)
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5-4-prod","object":"model","created":0,"owned_by":"azure-openai","supported_endpoints":["/chat/completions","/responses"],"capabilities":{"supports":{"parallel_tool_calls":true,"vision":true,"reasoning_effort":["low","medium","high"]},"limits":{"max_context_window_tokens":128000}},"model_picker_enabled":true,"model_picker_category":"versatile","name":"Discovered GPT-5.4 Prod"}]}`))
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5-4-prod","object":"model","created":0,"owned_by":"azure-openai","supported_endpoints":["/chat/completions","/responses"],"capabilities":{"supports":{"parallel_tool_calls":true,"vision":true,"reasoning_effort":["low","medium","high"]},"limits":{"max_context_window_tokens":128000}},"model_picker_enabled":true,"model_picker_category":"versatile","name":"Overlay GPT-5.4 Prod"}]}`))
 		}))
 		defer azureServer.Close()
 
@@ -3450,7 +3450,7 @@ func TestHandleModels(t *testing.T) {
 			t.Fatalf("expected configured powerful priority 0, got %d", model.Priority)
 		}
 		if model.SupportsParallelToolCalls {
-			t.Fatal("expected configured parallel_tool_calls=false to win over discovered metadata")
+			t.Fatal("expected configured parallel_tool_calls=false to win over Azure overlay metadata")
 		}
 		if model.ContextWindow == nil || *model.ContextWindow != 64000 {
 			t.Fatalf("expected configured context_window 64000, got %v", model.ContextWindow)

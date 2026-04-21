@@ -722,7 +722,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 
 		// Azure /models is only a best-effort metadata overlay for the configured
 		// static catalog. Routing still comes from provider.models[], and sparse
-		// or failed discovery should leave the configured model list untouched.
+		// or failed Azure metadata probes should leave the configured model list untouched.
 		resp, err := h.doWithRetry(func() (*http.Request, error) {
 			return h.newProviderJSONRequest(ctx, provider, http.MethodGet, "/models", nil, nil, "")
 		})
@@ -739,25 +739,25 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 			return providerModelsFetchResult{models: models}, nil
 		}
 
-		discoveredModels, err := decodeProviderModelsFromBody(provider.id, body, provider.excludeModels)
+		overlayModels, err := decodeProviderModelsFromBody(provider.id, body, provider.excludeModels)
 		if err != nil {
 			return providerModelsFetchResult{models: models}, nil
 		}
 
-		discoveredByID := make(map[string]providerModel, len(discoveredModels))
-		for _, discovered := range discoveredModels {
-			discoveredByID[discovered.publicID] = discovered
+		overlayByID := make(map[string]providerModel, len(overlayModels))
+		for _, overlay := range overlayModels {
+			overlayByID[overlay.publicID] = overlay
 		}
 		for i, staticModel := range models {
 			cfg, ok := provider.staticConfigs[staticModel.publicID]
 			if !ok {
 				continue
 			}
-			discovered, ok := findDiscoveredProviderModel(cfg, discoveredByID)
+			overlay, ok := findProviderModelMetadataOverlay(cfg, overlayByID)
 			if !ok {
 				continue
 			}
-			models[i] = mergeStaticProviderMetadata(staticModel, cfg, discovered)
+			models[i] = mergeStaticProviderMetadata(staticModel, cfg, overlay)
 		}
 
 		return providerModelsFetchResult{models: models}, nil
@@ -820,26 +820,26 @@ func orderedStaticProviderModels(provider *providerRuntime) []providerModel {
 	return models
 }
 
-func findDiscoveredProviderModel(cfg ProviderModelConfig, discoveredByID map[string]providerModel) (providerModel, bool) {
+func findProviderModelMetadataOverlay(cfg ProviderModelConfig, overlayByID map[string]providerModel) (providerModel, bool) {
 	publicID := strings.TrimSpace(cfg.PublicID)
 	if publicID != "" {
-		if discovered, ok := discoveredByID[publicID]; ok {
-			return discovered, true
+		if overlay, ok := overlayByID[publicID]; ok {
+			return overlay, true
 		}
 	}
 
 	deployment := strings.TrimSpace(cfg.Deployment)
 	if deployment != "" && deployment != publicID {
-		if discovered, ok := discoveredByID[deployment]; ok {
-			return discovered, true
+		if overlay, ok := overlayByID[deployment]; ok {
+			return overlay, true
 		}
 	}
 
 	return providerModel{}, false
 }
 
-func mergeStaticProviderMetadata(static providerModel, cfg ProviderModelConfig, discovered providerModel) providerModel {
-	mergedRaw, err := mergeDiscoveredProviderModelRaw(static.raw, discovered.raw, cfg)
+func mergeStaticProviderMetadata(static providerModel, cfg ProviderModelConfig, overlay providerModel) providerModel {
+	mergedRaw, err := mergeProviderModelMetadataOverlayRaw(static.raw, overlay.raw, cfg)
 	if err != nil {
 		return static
 	}
@@ -847,12 +847,12 @@ func mergeStaticProviderMetadata(static providerModel, cfg ProviderModelConfig, 
 	return static
 }
 
-// mergeDiscoveredProviderModelRaw opportunistically copies provider metadata
-// that already exists in the discovered /models payload. It does not rewrite
+// mergeProviderModelMetadataOverlayRaw opportunistically copies provider metadata
+// that already exists in the Azure /models overlay payload. It does not rewrite
 // configured public IDs or endpoint allowlists, and it does not synthesize
 // Codex-facing fields that an upstream provider omitted.
-func mergeDiscoveredProviderModelRaw(baseRaw, discoveredRaw json.RawMessage, cfg ProviderModelConfig) (json.RawMessage, error) {
-	if len(baseRaw) == 0 || len(discoveredRaw) == 0 {
+func mergeProviderModelMetadataOverlayRaw(baseRaw, overlayRaw json.RawMessage, cfg ProviderModelConfig) (json.RawMessage, error) {
+	if len(baseRaw) == 0 || len(overlayRaw) == 0 {
 		return append(json.RawMessage(nil), baseRaw...), nil
 	}
 
@@ -860,28 +860,28 @@ func mergeDiscoveredProviderModelRaw(baseRaw, discoveredRaw json.RawMessage, cfg
 	if err != nil {
 		return nil, err
 	}
-	discovered, err := decodeRawJSONObject(discoveredRaw)
+	overlay, err := decodeRawJSONObject(overlayRaw)
 	if err != nil {
 		return nil, err
 	}
 
-	for key, value := range discovered {
+	for key, value := range overlay {
 		if _, exists := base[key]; !exists {
 			base[key] = append(json.RawMessage(nil), value...)
 		}
 	}
 
 	if strings.TrimSpace(cfg.Name) == "" {
-		copyRawField(base, discovered, "name")
+		copyRawField(base, overlay, "name")
 	}
 	if cfg.ModelPickerEnabled == nil {
-		copyRawField(base, discovered, "model_picker_enabled")
+		copyRawField(base, overlay, "model_picker_enabled")
 	}
 	if strings.TrimSpace(cfg.ModelPickerCategory) == "" {
-		copyRawField(base, discovered, "model_picker_category")
+		copyRawField(base, overlay, "model_picker_category")
 	}
 
-	if err := mergeDiscoveredProviderCapabilities(base, discovered, cfg); err != nil {
+	if err := mergeProviderModelCapabilitiesOverlay(base, overlay, cfg); err != nil {
 		return nil, err
 	}
 
@@ -892,12 +892,12 @@ func mergeDiscoveredProviderModelRaw(baseRaw, discoveredRaw json.RawMessage, cfg
 	return merged, nil
 }
 
-func mergeDiscoveredProviderCapabilities(base, discovered map[string]json.RawMessage, cfg ProviderModelConfig) error {
+func mergeProviderModelCapabilitiesOverlay(base, overlay map[string]json.RawMessage, cfg ProviderModelConfig) error {
 	baseCaps, err := decodeOptionalRawJSONObject(base["capabilities"])
 	if err != nil {
 		return err
 	}
-	discoveredCaps, err := decodeOptionalRawJSONObject(discovered["capabilities"])
+	overlayCaps, err := decodeOptionalRawJSONObject(overlay["capabilities"])
 	if err != nil {
 		return err
 	}
@@ -906,19 +906,19 @@ func mergeDiscoveredProviderCapabilities(base, discovered map[string]json.RawMes
 	if err != nil {
 		return err
 	}
-	discoveredSupports, err := decodeOptionalRawJSONObject(discoveredCaps["supports"])
+	overlaySupports, err := decodeOptionalRawJSONObject(overlayCaps["supports"])
 	if err != nil {
 		return err
 	}
 
 	if cfg.ReasoningEffort == nil {
-		copyRawField(baseSupports, discoveredSupports, "reasoning_effort")
+		copyRawField(baseSupports, overlaySupports, "reasoning_effort")
 	}
 	if cfg.ParallelToolCalls == nil {
-		copyRawField(baseSupports, discoveredSupports, "parallel_tool_calls")
+		copyRawField(baseSupports, overlaySupports, "parallel_tool_calls")
 	}
 	if cfg.Vision == nil {
-		copyRawField(baseSupports, discoveredSupports, "vision")
+		copyRawField(baseSupports, overlaySupports, "vision")
 	}
 
 	if len(baseSupports) > 0 {
@@ -933,13 +933,13 @@ func mergeDiscoveredProviderCapabilities(base, discovered map[string]json.RawMes
 	if err != nil {
 		return err
 	}
-	discoveredLimits, err := decodeOptionalRawJSONObject(discoveredCaps["limits"])
+	overlayLimits, err := decodeOptionalRawJSONObject(overlayCaps["limits"])
 	if err != nil {
 		return err
 	}
 
 	if cfg.ContextWindow == nil {
-		copyRawField(baseLimits, discoveredLimits, "max_context_window_tokens")
+		copyRawField(baseLimits, overlayLimits, "max_context_window_tokens")
 	}
 
 	if len(baseLimits) > 0 {
