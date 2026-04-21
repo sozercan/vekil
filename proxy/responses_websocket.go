@@ -309,11 +309,9 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return err
 	}
 	if translated != nil {
-		code := translated.errType
+		code := ""
 		if translated.failure != nil {
-			if upstreamCode := strings.TrimSpace(translated.failure.Response.Error.Code); upstreamCode != "" {
-				code = upstreamCode
-			}
+			code = strings.TrimSpace(translated.failure.Response.Error.Code)
 		}
 		s.sendWrappedError(translated.status, translated.message, code, translatedHeaders)
 		return nil
