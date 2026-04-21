@@ -729,7 +729,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 		if err != nil {
 			return providerModelsFetchResult{models: models}, nil
 		}
-		defer func() { _ = resp.Body.Close() }()
+		defer drainAndClose(resp.Body)
 		if resp.StatusCode != http.StatusOK {
 			return providerModelsFetchResult{models: models}, nil
 		}

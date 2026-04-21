@@ -52,6 +52,27 @@ func newRoundTripTestProxyHandler(t testing.TB, transport roundTripFunc) *ProxyH
 	}
 }
 
+type trackingReadCloser struct {
+	reader    io.Reader
+	bytesRead int
+	closed    bool
+}
+
+func newTrackingReadCloser(body string) *trackingReadCloser {
+	return &trackingReadCloser{reader: strings.NewReader(body)}
+}
+
+func (r *trackingReadCloser) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	r.bytesRead += n
+	return n, err
+}
+
+func (r *trackingReadCloser) Close() error {
+	r.closed = true
+	return nil
+}
+
 func assertDeadlineApprox(t *testing.T, got, want time.Duration) {
 	t.Helper()
 	const tolerance = 15 * time.Second
@@ -2752,6 +2773,38 @@ func TestNewProviderJSONRequest_OmitsBodyForGetNilPayload(t *testing.T) {
 	}
 	if req.ContentLength != 0 {
 		t.Fatalf("expected ContentLength 0, got %d", req.ContentLength)
+	}
+}
+
+func TestFetchProviderModels_AzureNonOKDrainsResponseBody(t *testing.T) {
+	body := newTrackingReadCloser("azure metadata unavailable")
+	handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if got := r.URL.Path; got != "/openai/v1/models" {
+			t.Fatalf("expected /openai/v1/models, got %s", got)
+		}
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Header:     make(http.Header),
+			Body:       body,
+		}, nil
+	}))
+
+	result, err := handler.fetchProviderModels(context.Background(), &providerRuntime{
+		id:      "azure",
+		kind:    providerTypeAzureOpenAI,
+		baseURL: "http://example.test/openai/v1",
+	}, "", "")
+	if err != nil {
+		t.Fatalf("fetchProviderModels returned error: %v", err)
+	}
+	if len(result.models) != 0 {
+		t.Fatalf("expected no models, got %+v", result.models)
+	}
+	if !body.closed {
+		t.Fatal("expected Azure /models body to be closed")
+	}
+	if body.bytesRead == 0 {
+		t.Fatal("expected Azure /models body to be drained before close")
 	}
 }
 
