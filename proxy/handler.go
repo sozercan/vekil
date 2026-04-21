@@ -719,7 +719,7 @@ func transformModelsResponse(body []byte) []byte {
 			visibility = "list"
 		}
 
-		var reasoningLevels []reasoningPreset
+		reasoningLevels := make([]reasoningPreset, 0, len(m.Capabilities.Supports.ReasoningEffort))
 		var defaultReasoning *string
 		for _, level := range m.Capabilities.Supports.ReasoningEffort {
 			reasoningLevels = append(reasoningLevels, reasoningPreset{

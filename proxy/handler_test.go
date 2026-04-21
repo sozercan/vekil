@@ -52,6 +52,27 @@ func newRoundTripTestProxyHandler(t testing.TB, transport roundTripFunc) *ProxyH
 	}
 }
 
+type trackingReadCloser struct {
+	reader    io.Reader
+	bytesRead int
+	closed    bool
+}
+
+func newTrackingReadCloser(body string) *trackingReadCloser {
+	return &trackingReadCloser{reader: strings.NewReader(body)}
+}
+
+func (r *trackingReadCloser) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	r.bytesRead += n
+	return n, err
+}
+
+func (r *trackingReadCloser) Close() error {
+	r.closed = true
+	return nil
+}
+
 func assertDeadlineApprox(t *testing.T, got, want time.Duration) {
 	t.Helper()
 	const tolerance = 15 * time.Second
@@ -2240,8 +2261,8 @@ func TestHandleOpenAIChatCompletions_RoutesConfiguredAzureModel(t *testing.T) {
 		if got := r.URL.Path; got != "/openai/v1/chat/completions" {
 			t.Fatalf("expected Azure path /openai/v1/chat/completions, got %s", got)
 		}
-		if got := r.URL.Query().Get("api-version"); got != "preview" {
-			t.Fatalf("expected api-version=preview, got %q", got)
+		if got := r.URL.RawQuery; got != "" {
+			t.Fatalf("expected no Azure query params for /openai/v1 base URL, got %q", got)
 		}
 		if got := r.Header.Get("api-key"); got != "azure-test-key" {
 			t.Fatalf("expected api-key header, got %q", got)
@@ -2633,12 +2654,16 @@ func TestHandleModels_RefreshesDynamicProviderOwnershipForRouting(t *testing.T) 
 	defer copilotServer.Close()
 
 	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/openai/v1/responses" {
+		switch r.URL.Path {
+		case "/openai/v1/models":
+			w.WriteHeader(http.StatusInternalServerError)
+		case "/openai/v1/responses":
+			atomic.AddInt32(&azureResponses, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-azure","object":"response","status":"completed"}`))
+		default:
 			t.Fatalf("unexpected Azure path %q", r.URL.Path)
 		}
-		atomic.AddInt32(&azureResponses, 1)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"resp-azure","object":"response","status":"completed"}`))
 	}))
 	defer azureServer.Close()
 
@@ -2748,6 +2773,38 @@ func TestNewProviderJSONRequest_OmitsBodyForGetNilPayload(t *testing.T) {
 	}
 	if req.ContentLength != 0 {
 		t.Fatalf("expected ContentLength 0, got %d", req.ContentLength)
+	}
+}
+
+func TestFetchProviderModels_AzureNonOKDrainsResponseBody(t *testing.T) {
+	body := newTrackingReadCloser("azure metadata unavailable")
+	handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if got := r.URL.Path; got != "/openai/v1/models" {
+			t.Fatalf("expected /openai/v1/models, got %s", got)
+		}
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Header:     make(http.Header),
+			Body:       body,
+		}, nil
+	}))
+
+	result, err := handler.fetchProviderModels(context.Background(), &providerRuntime{
+		id:      "azure",
+		kind:    providerTypeAzureOpenAI,
+		baseURL: "http://example.test/openai/v1",
+	}, "", "")
+	if err != nil {
+		t.Fatalf("fetchProviderModels returned error: %v", err)
+	}
+	if len(result.models) != 0 {
+		t.Fatalf("expected no models, got %+v", result.models)
+	}
+	if !body.closed {
+		t.Fatal("expected Azure /models body to be closed")
+	}
+	if body.bytesRead == 0 {
+		t.Fatal("expected Azure /models body to be drained before close")
 	}
 }
 
@@ -2928,6 +2985,531 @@ func TestHandleModels(t *testing.T) {
 		}
 		if len(result.Models[0].SupportedReasoningLevels) != 2 {
 			t.Fatalf("expected 2 supported reasoning levels, got %d", len(result.Models[0].SupportedReasoningLevels))
+		}
+	})
+
+	t.Run("static Azure model serializes empty reasoning levels as array", func(t *testing.T) {
+		t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+
+		azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/openai/v1/models" {
+				t.Fatalf("unexpected Azure path %q", r.URL.Path)
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer azureServer.Close()
+
+		handler, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.New(logger.LevelInfo),
+			WithProvidersConfig(ProvidersConfig{
+				Providers: []ProviderConfig{{
+					ID:        "azure",
+					Type:      "azure-openai",
+					Default:   true,
+					BaseURL:   azureServer.URL + "/openai/v1",
+					APIKeyEnv: "TEST_AZURE_API_KEY",
+					Models: []ProviderModelConfig{{
+						PublicID:   "gpt-5.4",
+						Deployment: "gpt-5-4-prod",
+						Endpoints:  []string{"/responses"},
+						Name:       "GPT-5.4",
+					}},
+				}},
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler returned error: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+
+		handler.HandleModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		if !bytes.Contains(body, []byte(`"supported_reasoning_levels":[]`)) {
+			t.Fatalf("expected supported_reasoning_levels to serialize as [], got %s", body)
+		}
+
+		var result struct {
+			Models []struct {
+				Slug                     string `json:"slug"`
+				SupportedReasoningLevels []struct {
+					Effort string `json:"effort"`
+				} `json:"supported_reasoning_levels"`
+			} `json:"models"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if len(result.Models) != 1 {
+			t.Fatalf("expected 1 model entry, got %d", len(result.Models))
+		}
+		if result.Models[0].Slug != "gpt-5.4" {
+			t.Fatalf("expected model slug gpt-5.4, got %q", result.Models[0].Slug)
+		}
+		if result.Models[0].SupportedReasoningLevels == nil {
+			t.Fatal("expected supported_reasoning_levels to be a non-nil empty slice")
+		}
+		if len(result.Models[0].SupportedReasoningLevels) != 0 {
+			t.Fatalf("expected 0 supported reasoning levels, got %d", len(result.Models[0].SupportedReasoningLevels))
+		}
+	})
+
+	t.Run("static Azure model exposes configured Codex metadata", func(t *testing.T) {
+		t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+
+		azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/openai/v1/models" {
+				t.Fatalf("unexpected Azure path %q", r.URL.Path)
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer azureServer.Close()
+
+		parallelToolCalls := true
+		vision := true
+		contextWindow := int64(400000)
+		handler, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.New(logger.LevelInfo),
+			WithProvidersConfig(ProvidersConfig{
+				Providers: []ProviderConfig{{
+					ID:        "azure",
+					Type:      "azure-openai",
+					Default:   true,
+					BaseURL:   azureServer.URL + "/openai/v1",
+					APIKeyEnv: "TEST_AZURE_API_KEY",
+					Models: []ProviderModelConfig{{
+						PublicID:            "gpt-5.4",
+						Deployment:          "gpt-5-4-prod",
+						Endpoints:           []string{"/responses"},
+						Name:                "GPT-5.4",
+						ModelPickerCategory: "powerful",
+						ReasoningEffort:     []string{"low", "medium", "high"},
+						Vision:              &vision,
+						ParallelToolCalls:   &parallelToolCalls,
+						ContextWindow:       &contextWindow,
+					}},
+				}},
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler returned error: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+
+		handler.HandleModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+		}
+
+		var result struct {
+			Models []struct {
+				Slug                     string  `json:"slug"`
+				DefaultReasoningLevel    *string `json:"default_reasoning_level,omitempty"`
+				SupportedReasoningLevels []struct {
+					Effort string `json:"effort"`
+				} `json:"supported_reasoning_levels"`
+				Priority                   int      `json:"priority"`
+				SupportsReasoningSummaries bool     `json:"supports_reasoning_summaries"`
+				SupportsParallelToolCalls  bool     `json:"supports_parallel_tool_calls"`
+				ContextWindow              *int64   `json:"context_window,omitempty"`
+				InputModalities            []string `json:"input_modalities"`
+			} `json:"models"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(result.Models) != 1 {
+			t.Fatalf("expected 1 model entry, got %d", len(result.Models))
+		}
+		model := result.Models[0]
+		if model.Slug != "gpt-5.4" {
+			t.Fatalf("expected model slug gpt-5.4, got %q", model.Slug)
+		}
+		if model.DefaultReasoningLevel == nil || *model.DefaultReasoningLevel != "medium" {
+			t.Fatalf("expected default_reasoning_level medium, got %v", model.DefaultReasoningLevel)
+		}
+		if len(model.SupportedReasoningLevels) != 3 {
+			t.Fatalf("expected 3 supported reasoning levels, got %d", len(model.SupportedReasoningLevels))
+		}
+		if model.Priority != 0 {
+			t.Fatalf("expected powerful model priority 0, got %d", model.Priority)
+		}
+		if !model.SupportsReasoningSummaries {
+			t.Fatal("expected supports_reasoning_summaries true")
+		}
+		if !model.SupportsParallelToolCalls {
+			t.Fatal("expected supports_parallel_tool_calls true")
+		}
+		if model.ContextWindow == nil || *model.ContextWindow != 400000 {
+			t.Fatalf("expected context_window 400000, got %v", model.ContextWindow)
+		}
+		if got := strings.Join(model.InputModalities, ","); got != "text,image" {
+			t.Fatalf("expected input_modalities text,image, got %q", got)
+		}
+	})
+
+	t.Run("Azure upstream metadata best-effort enriches configured public model", func(t *testing.T) {
+		t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+
+		azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/openai/v1/models" {
+				t.Fatalf("unexpected Azure path %q", r.URL.Path)
+			}
+			if got := r.URL.RawQuery; got != "" {
+				t.Fatalf("expected no Azure query params for /openai/v1 base URL, got %q", got)
+			}
+			if got := r.Header.Get("api-key"); got != "azure-test-key" {
+				t.Fatalf("expected api-key header, got %q", got)
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.4","object":"model","created":0,"owned_by":"azure-openai","supported_endpoints":["/chat/completions","/responses"],"capabilities":{"supports":{"parallel_tool_calls":true,"vision":true,"reasoning_effort":["low","medium","high"]},"limits":{"max_context_window_tokens":128000}},"model_picker_enabled":true,"model_picker_category":"powerful","name":"GPT-5.4 Overlay"}]}`))
+		}))
+		defer azureServer.Close()
+
+		handler, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.New(logger.LevelInfo),
+			WithProvidersConfig(ProvidersConfig{
+				Providers: []ProviderConfig{{
+					ID:         "azure",
+					Type:       "azure-openai",
+					Default:    true,
+					BaseURL:    azureServer.URL + "/openai/v1",
+					APIKeyEnv:  "TEST_AZURE_API_KEY",
+					APIVersion: "preview",
+					Models: []ProviderModelConfig{{
+						PublicID:   "gpt-5.4",
+						Deployment: "gpt-5-4-prod",
+						Endpoints:  []string{"/responses"},
+					}},
+				}},
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler returned error: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+
+		handler.HandleModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+		}
+
+		var result struct {
+			Data []struct {
+				ID                 string   `json:"id"`
+				Name               string   `json:"name"`
+				SupportedEndpoints []string `json:"supported_endpoints"`
+			} `json:"data"`
+			Models []struct {
+				Slug                      string   `json:"slug"`
+				DisplayName               string   `json:"display_name"`
+				DefaultReasoningLevel     *string  `json:"default_reasoning_level,omitempty"`
+				SupportsParallelToolCalls bool     `json:"supports_parallel_tool_calls"`
+				ContextWindow             *int64   `json:"context_window,omitempty"`
+				InputModalities           []string `json:"input_modalities"`
+				Priority                  int      `json:"priority"`
+			} `json:"models"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(result.Data) != 1 || len(result.Models) != 1 {
+			t.Fatalf("expected one Azure model entry, got data=%d models=%d", len(result.Data), len(result.Models))
+		}
+		if result.Data[0].ID != "gpt-5.4" {
+			t.Fatalf("expected public id gpt-5.4, got %q", result.Data[0].ID)
+		}
+		if result.Data[0].Name != "GPT-5.4 Overlay" {
+			t.Fatalf("expected Azure overlay name, got %q", result.Data[0].Name)
+		}
+		if got := strings.Join(result.Data[0].SupportedEndpoints, ","); got != "/responses" {
+			t.Fatalf("expected configured supported_endpoints /responses, got %q", got)
+		}
+
+		model := result.Models[0]
+		if model.Slug != "gpt-5.4" {
+			t.Fatalf("expected slug gpt-5.4, got %q", model.Slug)
+		}
+		if model.DisplayName != "GPT-5.4 Overlay" {
+			t.Fatalf("expected Azure overlay display name, got %q", model.DisplayName)
+		}
+		if model.DefaultReasoningLevel == nil || *model.DefaultReasoningLevel != "medium" {
+			t.Fatalf("expected default_reasoning_level medium, got %v", model.DefaultReasoningLevel)
+		}
+		if !model.SupportsParallelToolCalls {
+			t.Fatal("expected Azure overlay supports_parallel_tool_calls true")
+		}
+		if model.ContextWindow == nil || *model.ContextWindow != 128000 {
+			t.Fatalf("expected Azure overlay context_window 128000, got %v", model.ContextWindow)
+		}
+		if got := strings.Join(model.InputModalities, ","); got != "text,image" {
+			t.Fatalf("expected Azure overlay input_modalities text,image, got %q", got)
+		}
+		if model.Priority != 0 {
+			t.Fatalf("expected powerful priority 0, got %d", model.Priority)
+		}
+	})
+
+	t.Run("Azure sparse upstream metadata leaves static model minimal but valid", func(t *testing.T) {
+		t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+
+		azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/openai/v1/models" {
+				t.Fatalf("unexpected Azure path %q", r.URL.Path)
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.4","object":"model","created":0,"owned_by":"azure-openai"}]}`))
+		}))
+		defer azureServer.Close()
+
+		handler, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.New(logger.LevelInfo),
+			WithProvidersConfig(ProvidersConfig{
+				Providers: []ProviderConfig{{
+					ID:        "azure",
+					Type:      "azure-openai",
+					Default:   true,
+					BaseURL:   azureServer.URL + "/openai/v1",
+					APIKeyEnv: "TEST_AZURE_API_KEY",
+					Models: []ProviderModelConfig{{
+						PublicID:   "gpt-5.4",
+						Deployment: "gpt-5-4-prod",
+						Endpoints:  []string{"/responses"},
+					}},
+				}},
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler returned error: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+
+		handler.HandleModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+		}
+
+		var result struct {
+			Data []struct {
+				ID                 string   `json:"id"`
+				Name               string   `json:"name"`
+				SupportedEndpoints []string `json:"supported_endpoints"`
+			} `json:"data"`
+			Models []struct {
+				Slug                       string   `json:"slug"`
+				DisplayName                string   `json:"display_name"`
+				Visibility                 string   `json:"visibility"`
+				SupportedInAPI             bool     `json:"supported_in_api"`
+				DefaultReasoningLevel      *string  `json:"default_reasoning_level,omitempty"`
+				SupportedReasoningLevels   []string `json:"supported_reasoning_levels"`
+				SupportsReasoningSummaries bool     `json:"supports_reasoning_summaries"`
+				Priority                   int      `json:"priority"`
+				SupportsParallelToolCalls  bool     `json:"supports_parallel_tool_calls"`
+				ContextWindow              *int64   `json:"context_window,omitempty"`
+				InputModalities            []string `json:"input_modalities"`
+			} `json:"models"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(result.Data) != 1 || len(result.Models) != 1 {
+			t.Fatalf("expected one Azure model entry, got data=%d models=%d", len(result.Data), len(result.Models))
+		}
+		if result.Data[0].ID != "gpt-5.4" {
+			t.Fatalf("expected public id gpt-5.4, got %q", result.Data[0].ID)
+		}
+		if result.Data[0].Name != "gpt-5.4" {
+			t.Fatalf("expected static fallback name gpt-5.4, got %q", result.Data[0].Name)
+		}
+		if got := strings.Join(result.Data[0].SupportedEndpoints, ","); got != "/responses" {
+			t.Fatalf("expected configured supported_endpoints /responses, got %q", got)
+		}
+
+		model := result.Models[0]
+		if model.Slug != "gpt-5.4" {
+			t.Fatalf("expected slug gpt-5.4, got %q", model.Slug)
+		}
+		if model.DisplayName != "gpt-5.4" {
+			t.Fatalf("expected static fallback display name gpt-5.4, got %q", model.DisplayName)
+		}
+		if model.Visibility != "list" {
+			t.Fatalf("expected default visibility list for /responses model, got %q", model.Visibility)
+		}
+		if !model.SupportedInAPI {
+			t.Fatal("expected supported_in_api true from configured /responses endpoint")
+		}
+		if model.DefaultReasoningLevel != nil {
+			t.Fatalf("expected no default_reasoning_level for sparse metadata, got %v", model.DefaultReasoningLevel)
+		}
+		if len(model.SupportedReasoningLevels) != 0 {
+			t.Fatalf("expected no supported_reasoning_levels for sparse metadata, got %v", model.SupportedReasoningLevels)
+		}
+		if model.SupportsReasoningSummaries {
+			t.Fatal("expected supports_reasoning_summaries false for sparse metadata")
+		}
+		if model.Priority != 5 {
+			t.Fatalf("expected default versatile priority 5, got %d", model.Priority)
+		}
+		if model.SupportsParallelToolCalls {
+			t.Fatal("expected supports_parallel_tool_calls false for sparse metadata")
+		}
+		if model.ContextWindow != nil {
+			t.Fatalf("expected no context_window for sparse metadata, got %v", model.ContextWindow)
+		}
+		if got := strings.Join(model.InputModalities, ","); got != "text" {
+			t.Fatalf("expected text-only input_modalities for sparse metadata, got %q", got)
+		}
+	})
+
+	t.Run("Azure best-effort upstream metadata matches deployment and respects explicit overrides", func(t *testing.T) {
+		t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+
+		azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/openai/v1/models" {
+				t.Fatalf("unexpected Azure path %q", r.URL.Path)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5-4-prod","object":"model","created":0,"owned_by":"azure-openai","supported_endpoints":["/chat/completions","/responses"],"capabilities":{"supports":{"parallel_tool_calls":true,"vision":true,"reasoning_effort":["low","medium","high"]},"limits":{"max_context_window_tokens":128000}},"model_picker_enabled":true,"model_picker_category":"versatile","name":"Overlay GPT-5.4 Prod"}]}`))
+		}))
+		defer azureServer.Close()
+
+		modelPickerEnabled := false
+		parallelToolCalls := false
+		vision := false
+		contextWindow := int64(64000)
+
+		handler, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.New(logger.LevelInfo),
+			WithProvidersConfig(ProvidersConfig{
+				Providers: []ProviderConfig{{
+					ID:        "azure",
+					Type:      "azure-openai",
+					Default:   true,
+					BaseURL:   azureServer.URL + "/openai/v1",
+					APIKeyEnv: "TEST_AZURE_API_KEY",
+					Models: []ProviderModelConfig{{
+						PublicID:            "gpt-5.4-proxy",
+						Deployment:          "gpt-5-4-prod",
+						Endpoints:           []string{"/responses"},
+						Name:                "Alias GPT-5.4",
+						ModelPickerEnabled:  &modelPickerEnabled,
+						ModelPickerCategory: "powerful",
+						ReasoningEffort:     []string{"low"},
+						Vision:              &vision,
+						ParallelToolCalls:   &parallelToolCalls,
+						ContextWindow:       &contextWindow,
+					}},
+				}},
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler returned error: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+
+		handler.HandleModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+		}
+
+		var result struct {
+			Data []struct {
+				ID                 string   `json:"id"`
+				Name               string   `json:"name"`
+				SupportedEndpoints []string `json:"supported_endpoints"`
+			} `json:"data"`
+			Models []struct {
+				Slug                     string  `json:"slug"`
+				DisplayName              string  `json:"display_name"`
+				Visibility               string  `json:"visibility"`
+				DefaultReasoningLevel    *string `json:"default_reasoning_level,omitempty"`
+				SupportedReasoningLevels []struct {
+					Effort string `json:"effort"`
+				} `json:"supported_reasoning_levels"`
+				Priority                  int      `json:"priority"`
+				SupportsParallelToolCalls bool     `json:"supports_parallel_tool_calls"`
+				ContextWindow             *int64   `json:"context_window,omitempty"`
+				InputModalities           []string `json:"input_modalities"`
+			} `json:"models"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(result.Data) != 1 || len(result.Models) != 1 {
+			t.Fatalf("expected one Azure model entry, got data=%d models=%d", len(result.Data), len(result.Models))
+		}
+		if result.Data[0].ID != "gpt-5.4-proxy" {
+			t.Fatalf("expected aliased public id, got %q", result.Data[0].ID)
+		}
+		if result.Data[0].Name != "Alias GPT-5.4" {
+			t.Fatalf("expected configured name override, got %q", result.Data[0].Name)
+		}
+		if got := strings.Join(result.Data[0].SupportedEndpoints, ","); got != "/responses" {
+			t.Fatalf("expected configured supported_endpoints /responses, got %q", got)
+		}
+
+		model := result.Models[0]
+		if model.Slug != "gpt-5.4-proxy" {
+			t.Fatalf("expected aliased slug, got %q", model.Slug)
+		}
+		if model.DisplayName != "Alias GPT-5.4" {
+			t.Fatalf("expected configured display name override, got %q", model.DisplayName)
+		}
+		if model.Visibility != "hide" {
+			t.Fatalf("expected hidden visibility from configured model_picker_enabled=false, got %q", model.Visibility)
+		}
+		if model.DefaultReasoningLevel == nil || *model.DefaultReasoningLevel != "low" {
+			t.Fatalf("expected configured default_reasoning_level low, got %v", model.DefaultReasoningLevel)
+		}
+		if len(model.SupportedReasoningLevels) != 1 || model.SupportedReasoningLevels[0].Effort != "low" {
+			t.Fatalf("expected configured reasoning_effort override, got %+v", model.SupportedReasoningLevels)
+		}
+		if model.Priority != 0 {
+			t.Fatalf("expected configured powerful priority 0, got %d", model.Priority)
+		}
+		if model.SupportsParallelToolCalls {
+			t.Fatal("expected configured parallel_tool_calls=false to win over Azure overlay metadata")
+		}
+		if model.ContextWindow == nil || *model.ContextWindow != 64000 {
+			t.Fatalf("expected configured context_window 64000, got %v", model.ContextWindow)
+		}
+		if got := strings.Join(model.InputModalities, ","); got != "text" {
+			t.Fatalf("expected configured vision=false to keep text-only input_modalities, got %q", got)
 		}
 	})
 }

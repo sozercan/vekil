@@ -51,9 +51,9 @@ type ProviderModelConfig struct {
 	ModelPickerEnabled  *bool    `json:"model_picker_enabled,omitempty"`
 	ModelPickerCategory string   `json:"model_picker_category,omitempty"`
 	ReasoningEffort     []string `json:"reasoning_effort,omitempty"`
-	Vision              bool     `json:"vision,omitempty"`
+	Vision              *bool    `json:"vision,omitempty"`
 	ParallelToolCalls   *bool    `json:"parallel_tool_calls,omitempty"`
-	ContextWindow       int64    `json:"context_window,omitempty"`
+	ContextWindow       *int64   `json:"context_window,omitempty"`
 }
 
 type providerRuntime struct {
@@ -65,6 +65,7 @@ type providerRuntime struct {
 	apiVersion    string
 	excludeModels map[string]struct{}
 	staticModels  map[string]providerModel
+	staticConfigs map[string]ProviderModelConfig
 	staticOrder   []string
 }
 
@@ -376,6 +377,7 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string) (*provid
 		isDefault:     cfg.Default,
 		excludeModels: make(map[string]struct{}, len(cfg.ExcludeModels)),
 		staticModels:  make(map[string]providerModel, len(cfg.Models)),
+		staticConfigs: make(map[string]ProviderModelConfig, len(cfg.Models)),
 	}
 
 	for _, excluded := range cfg.ExcludeModels {
@@ -417,6 +419,7 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string) (*provid
 				return nil, fmt.Errorf("provider %q configures model %q more than once", id, model.publicID)
 			}
 			runtime.staticModels[model.publicID] = model
+			runtime.staticConfigs[model.publicID] = normalizeProviderModelConfig(modelCfg)
 			runtime.staticOrder = append(runtime.staticOrder, model.publicID)
 		}
 	}
@@ -453,6 +456,20 @@ func buildStaticProviderModel(providerID string, cfg ProviderModelConfig) (provi
 		supportedEndpoints: endpoints,
 		raw:                raw,
 	}, nil
+}
+
+func normalizeProviderModelConfig(cfg ProviderModelConfig) ProviderModelConfig {
+	cfg.PublicID = strings.TrimSpace(cfg.PublicID)
+	cfg.Deployment = strings.TrimSpace(cfg.Deployment)
+	cfg.Name = strings.TrimSpace(cfg.Name)
+	cfg.ModelPickerCategory = strings.TrimSpace(cfg.ModelPickerCategory)
+	if cfg.Endpoints != nil {
+		cfg.Endpoints = append([]string(nil), cfg.Endpoints...)
+	}
+	if cfg.ReasoningEffort != nil {
+		cfg.ReasoningEffort = append([]string(nil), cfg.ReasoningEffort...)
+	}
+	return cfg
 }
 
 func normalizeProviderEndpoints(endpoints []string) []string {
@@ -503,6 +520,16 @@ func synthesizeProviderModelRaw(providerID, publicID, name string, endpoints []s
 		parallelToolCalls = *cfg.ParallelToolCalls
 	}
 
+	vision := false
+	if cfg.Vision != nil {
+		vision = *cfg.Vision
+	}
+
+	contextWindow := int64(0)
+	if cfg.ContextWindow != nil {
+		contextWindow = *cfg.ContextWindow
+	}
+
 	category := strings.TrimSpace(cfg.ModelPickerCategory)
 	if category == "" {
 		category = "versatile"
@@ -517,12 +544,12 @@ func synthesizeProviderModelRaw(providerID, publicID, name string, endpoints []s
 		"supported_endpoints": endpoints,
 		"capabilities": capabilities{
 			Limits: limits{
-				MaxContextWindowTokens: cfg.ContextWindow,
+				MaxContextWindowTokens: contextWindow,
 			},
 			Supports: supports{
 				ParallelToolCalls: parallelToolCalls,
 				ReasoningEffort:   append([]string(nil), cfg.ReasoningEffort...),
-				Vision:            cfg.Vision,
+				Vision:            vision,
 			},
 		},
 		"model_picker_enabled":  modelPickerEnabled,
@@ -597,10 +624,18 @@ func (h *ProxyHandler) providerRequestURL(provider *providerRuntime, path string
 
 	baseURL := strings.TrimRight(provider.baseURL, "/")
 	fullURL := baseURL + path
-	if provider.kind != providerTypeAzureOpenAI || provider.apiVersion == "" {
+	if provider.kind != providerTypeAzureOpenAI || provider.apiVersion == "" || azureUsesOpenAIV1BaseURL(baseURL) {
 		return appendRawQuery(fullURL, extraQuery), nil
 	}
 	return appendRawQuery(fullURL, appendQuery("api-version="+url.QueryEscape(provider.apiVersion), extraQuery)), nil
+}
+
+func azureUsesOpenAIV1BaseURL(baseURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return strings.HasSuffix(strings.TrimRight(strings.TrimSpace(baseURL), "/"), "/openai/v1")
+	}
+	return strings.HasSuffix(strings.TrimRight(parsed.Path, "/"), "/openai/v1")
 }
 
 func appendQuery(parts ...string) string {
@@ -683,13 +718,48 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 
 	switch provider.kind {
 	case providerTypeAzureOpenAI:
-		models := make([]providerModel, 0, len(provider.staticModels))
-		for _, publicID := range provider.staticOrder {
-			model, ok := provider.staticModels[publicID]
-			if ok {
-				models = append(models, model)
-			}
+		models := orderedStaticProviderModels(provider)
+
+		// Azure /models is only a best-effort metadata overlay for the configured
+		// static catalog. Routing still comes from provider.models[], and sparse
+		// or failed Azure metadata probes should leave the configured model list untouched.
+		resp, err := h.doWithRetry(func() (*http.Request, error) {
+			return h.newProviderJSONRequest(ctx, provider, http.MethodGet, "/models", nil, nil, "")
+		})
+		if err != nil {
+			return providerModelsFetchResult{models: models}, nil
 		}
+		defer drainAndClose(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			return providerModelsFetchResult{models: models}, nil
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return providerModelsFetchResult{models: models}, nil
+		}
+
+		overlayModels, err := decodeProviderModelsFromBody(provider.id, body, provider.excludeModels)
+		if err != nil {
+			return providerModelsFetchResult{models: models}, nil
+		}
+
+		overlayByID := make(map[string]providerModel, len(overlayModels))
+		for _, overlay := range overlayModels {
+			overlayByID[overlay.publicID] = overlay
+		}
+		for i, staticModel := range models {
+			cfg, ok := provider.staticConfigs[staticModel.publicID]
+			if !ok {
+				continue
+			}
+			overlay, ok := findProviderModelMetadataOverlay(cfg, overlayByID)
+			if !ok {
+				continue
+			}
+			models[i] = mergeStaticProviderMetadata(staticModel, cfg, overlay)
+		}
+
 		return providerModelsFetchResult{models: models}, nil
 	case providerTypeCopilot:
 		resp, err := h.doWithRetry(func() (*http.Request, error) {
@@ -734,6 +804,190 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 	default:
 		return providerModelsFetchResult{}, fmt.Errorf("unsupported provider type %q", provider.kind)
 	}
+}
+
+func orderedStaticProviderModels(provider *providerRuntime) []providerModel {
+	if provider == nil {
+		return nil
+	}
+	models := make([]providerModel, 0, len(provider.staticModels))
+	for _, publicID := range provider.staticOrder {
+		model, ok := provider.staticModels[publicID]
+		if ok {
+			models = append(models, model)
+		}
+	}
+	return models
+}
+
+func findProviderModelMetadataOverlay(cfg ProviderModelConfig, overlayByID map[string]providerModel) (providerModel, bool) {
+	publicID := strings.TrimSpace(cfg.PublicID)
+	if publicID != "" {
+		if overlay, ok := overlayByID[publicID]; ok {
+			return overlay, true
+		}
+	}
+
+	deployment := strings.TrimSpace(cfg.Deployment)
+	if deployment != "" && deployment != publicID {
+		if overlay, ok := overlayByID[deployment]; ok {
+			return overlay, true
+		}
+	}
+
+	return providerModel{}, false
+}
+
+func mergeStaticProviderMetadata(static providerModel, cfg ProviderModelConfig, overlay providerModel) providerModel {
+	mergedRaw, err := mergeProviderModelMetadataOverlayRaw(static.raw, overlay.raw, cfg)
+	if err != nil {
+		return static
+	}
+	static.raw = mergedRaw
+	return static
+}
+
+// mergeProviderModelMetadataOverlayRaw opportunistically copies provider metadata
+// that already exists in the Azure /models overlay payload. It does not rewrite
+// configured public IDs or endpoint allowlists, and it does not synthesize
+// Codex-facing fields that an upstream provider omitted.
+func mergeProviderModelMetadataOverlayRaw(baseRaw, overlayRaw json.RawMessage, cfg ProviderModelConfig) (json.RawMessage, error) {
+	if len(baseRaw) == 0 || len(overlayRaw) == 0 {
+		return append(json.RawMessage(nil), baseRaw...), nil
+	}
+
+	base, err := decodeRawJSONObject(baseRaw)
+	if err != nil {
+		return nil, err
+	}
+	overlay, err := decodeRawJSONObject(overlayRaw)
+	if err != nil {
+		return nil, err
+	}
+
+	for key, value := range overlay {
+		if _, exists := base[key]; !exists {
+			base[key] = append(json.RawMessage(nil), value...)
+		}
+	}
+
+	if strings.TrimSpace(cfg.Name) == "" {
+		copyRawField(base, overlay, "name")
+	}
+	if cfg.ModelPickerEnabled == nil {
+		copyRawField(base, overlay, "model_picker_enabled")
+	}
+	if strings.TrimSpace(cfg.ModelPickerCategory) == "" {
+		copyRawField(base, overlay, "model_picker_category")
+	}
+
+	if err := mergeProviderModelCapabilitiesOverlay(base, overlay, cfg); err != nil {
+		return nil, err
+	}
+
+	merged, err := json.Marshal(base)
+	if err != nil {
+		return nil, err
+	}
+	return merged, nil
+}
+
+func mergeProviderModelCapabilitiesOverlay(base, overlay map[string]json.RawMessage, cfg ProviderModelConfig) error {
+	baseCaps, err := decodeOptionalRawJSONObject(base["capabilities"])
+	if err != nil {
+		return err
+	}
+	overlayCaps, err := decodeOptionalRawJSONObject(overlay["capabilities"])
+	if err != nil {
+		return err
+	}
+
+	baseSupports, err := decodeOptionalRawJSONObject(baseCaps["supports"])
+	if err != nil {
+		return err
+	}
+	overlaySupports, err := decodeOptionalRawJSONObject(overlayCaps["supports"])
+	if err != nil {
+		return err
+	}
+
+	if cfg.ReasoningEffort == nil {
+		copyRawField(baseSupports, overlaySupports, "reasoning_effort")
+	}
+	if cfg.ParallelToolCalls == nil {
+		copyRawField(baseSupports, overlaySupports, "parallel_tool_calls")
+	}
+	if cfg.Vision == nil {
+		copyRawField(baseSupports, overlaySupports, "vision")
+	}
+
+	if len(baseSupports) > 0 {
+		encoded, err := json.Marshal(baseSupports)
+		if err != nil {
+			return err
+		}
+		baseCaps["supports"] = encoded
+	}
+
+	baseLimits, err := decodeOptionalRawJSONObject(baseCaps["limits"])
+	if err != nil {
+		return err
+	}
+	overlayLimits, err := decodeOptionalRawJSONObject(overlayCaps["limits"])
+	if err != nil {
+		return err
+	}
+
+	if cfg.ContextWindow == nil {
+		copyRawField(baseLimits, overlayLimits, "max_context_window_tokens")
+	}
+
+	if len(baseLimits) > 0 {
+		encoded, err := json.Marshal(baseLimits)
+		if err != nil {
+			return err
+		}
+		baseCaps["limits"] = encoded
+	}
+
+	if len(baseCaps) > 0 {
+		encoded, err := json.Marshal(baseCaps)
+		if err != nil {
+			return err
+		}
+		base["capabilities"] = encoded
+	}
+
+	return nil
+}
+
+func decodeRawJSONObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	if payload == nil {
+		payload = map[string]json.RawMessage{}
+	}
+	return payload, nil
+}
+
+func decodeOptionalRawJSONObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
+	if len(raw) == 0 {
+		return map[string]json.RawMessage{}, nil
+	}
+	return decodeRawJSONObject(raw)
+}
+
+func copyRawField(dst, src map[string]json.RawMessage, field string) {
+	if dst == nil || src == nil {
+		return
+	}
+	value, ok := src[field]
+	if !ok {
+		return
+	}
+	dst[field] = append(json.RawMessage(nil), value...)
 }
 
 func decodeProviderModelsFromBody(providerID string, body []byte, excluded map[string]struct{}) ([]providerModel, error) {
