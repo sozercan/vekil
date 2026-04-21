@@ -57,15 +57,38 @@ type responsesSSEParser struct {
 	allowBOM bool
 }
 
-func peekAndForwardResponses(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string) {
-	peekAndForwardResponsesWithConfig(h, w, r, resp, upstreamCancel, model, responsesPrecommitPeekTimeout, responsesPrecommitMaxPeekBytes)
+type responsesPreparedStream struct {
+	resp     *http.Response
+	pr       *io.PipeReader
+	peekDone chan peekResult
+	commitCh chan struct{}
+	abortCh  chan struct{}
+	commitFn func()
+	abortFn  func()
 }
 
-func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, peekTimeout time.Duration, maxPeekBytes int) {
+type responsesPreparedBody struct {
+	reader  *io.PipeReader
+	closeFn func()
+}
+
+func (b *responsesPreparedBody) Read(p []byte) (int, error) {
+	return b.reader.Read(p)
+}
+
+func (b *responsesPreparedBody) Close() error {
+	if b.closeFn != nil {
+		b.closeFn()
+	}
+	return nil
+}
+
+func newResponsesPreparedStream(resp *http.Response, maxPeekBytes int) *responsesPreparedStream {
 	pr, pw := io.Pipe()
 	peekDone := make(chan peekResult, 1)
 	commitCh := make(chan struct{})
 	abortCh := make(chan struct{})
+	upstreamBody := resp.Body
 
 	var commitOnce sync.Once
 	commit := func() {
@@ -78,58 +101,131 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 	abort := func() {
 		abortOnce.Do(func() {
 			close(abortCh)
-			upstreamCancel()
-			_ = resp.Body.Close()
-			_ = pr.Close()
+			_ = upstreamBody.Close()
 		})
 	}
 
-	go runResponsesPeekPump(resp.Body, pw, resp.Header, peekDone, commitCh, abortCh, maxPeekBytes)
+	go runResponsesPeekPump(upstreamBody, pw, resp.Header, peekDone, commitCh, abortCh, maxPeekBytes)
 
+	return &responsesPreparedStream{
+		resp:     resp,
+		pr:       pr,
+		peekDone: peekDone,
+		commitCh: commitCh,
+		abortCh:  abortCh,
+		commitFn: commit,
+		abortFn:  abort,
+	}
+}
+
+func (s *responsesPreparedStream) await(waitCtx, retryCtx context.Context, peekTimeout time.Duration) (peekResult, bool, error) {
 	timer := time.NewTimer(peekTimeout)
 	defer timer.Stop()
 
-	handleCommit := func(result *peekResult) {
-		if result != nil && result.failure != nil && result.decision == responsesPeekDecisionPassthrough {
-			logResponsesPrecommitFailOpen(h, result.failure, model, resp.Header)
-		}
-
-		commit()
-		copyPassthroughHeaders(w.Header(), resp.Header)
-		w.WriteHeader(http.StatusOK)
-		streamResponsesPipeWithFailureLog(h, w, pr, resp.Header)
-		abort()
+	var waitDone <-chan struct{}
+	if waitCtx != nil {
+		waitDone = waitCtx.Done()
 	}
-
-	handleResult := func(result peekResult) {
-		if result.decision == responsesPeekDecisionTranslate {
-			logResponsesPrecommitTranslated(h, result, model, resp.Header)
-			abort()
-			writeOpenAIErrorWithRetryAfter(w, result.status, result.message, result.errType, result.retryAfter, resp.Header)
-			return
-		}
-		handleCommit(&result)
+	var retryDone <-chan struct{}
+	if retryCtx != nil && retryCtx != waitCtx {
+		retryDone = retryCtx.Done()
 	}
 
 	for {
 		select {
-		case result := <-peekDone:
-			handleResult(result)
-			return
+		case result := <-s.peekDone:
+			return result, true, nil
 		case <-timer.C:
 			select {
-			case result := <-peekDone:
-				handleResult(result)
-				return
+			case result := <-s.peekDone:
+				return result, true, nil
 			default:
 			}
-			handleCommit(nil)
-			return
-		case <-r.Context().Done():
-			abort()
-			return
+			return peekResult{}, false, nil
+		case <-waitDone:
+			return peekResult{}, false, waitCtx.Err()
+		case <-retryDone:
+			return peekResult{}, false, retryCtx.Err()
 		}
 	}
+}
+
+func (s *responsesPreparedStream) commitResponse() *http.Response {
+	s.commitFn()
+	s.resp.Body = &responsesPreparedBody{reader: s.pr, closeFn: s.abortFn}
+	return s.resp
+}
+
+func (s *responsesPreparedStream) abort() {
+	s.abortFn()
+}
+
+func peekAndForwardResponses(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string) {
+	peekAndForwardResponsesWithConfig(h, w, r, resp, upstreamCancel, model, responsesPrecommitPeekTimeout, responsesPrecommitMaxPeekBytes)
+}
+
+func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, peekTimeout time.Duration, maxPeekBytes int) {
+	if upstreamCancel != nil {
+		defer upstreamCancel()
+	}
+
+	prepared := newResponsesPreparedStream(resp, maxPeekBytes)
+	result, hasResult, err := prepared.await(r.Context(), nil, peekTimeout)
+	if err != nil {
+		prepared.abort()
+		return
+	}
+	if hasResult && result.decision == responsesPeekDecisionTranslate {
+		logResponsesPrecommitTranslated(h, result, model, resp.Header)
+		prepared.abort()
+		writeOpenAIErrorWithRetryAfter(w, result.status, result.message, result.errType, result.retryAfter, resp.Header)
+		return
+	}
+	if hasResult && result.failure != nil && result.decision == responsesPeekDecisionPassthrough {
+		logResponsesPrecommitFailOpen(h, result.failure, model, resp.Header)
+	}
+
+	resp = prepared.commitResponse()
+	copyPassthroughHeaders(w.Header(), resp.Header)
+	w.WriteHeader(http.StatusOK)
+	streamResponsesPipeWithFailureLog(h, w, resp.Body, resp.Header)
+}
+
+func prepareResponsesStreamAttempt(waitCtx, streamCtx context.Context, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
+	resp, err := request()
+	if err != nil || resp == nil || resp.StatusCode != http.StatusOK {
+		return resp, nil, nil, err
+	}
+
+	prepared := newResponsesPreparedStream(resp, responsesPrecommitMaxPeekBytes)
+	result, hasResult, err := prepared.await(waitCtx, streamCtx, responsesPrecommitPeekTimeout)
+	if err != nil {
+		prepared.abort()
+		return nil, nil, nil, err
+	}
+	if hasResult && result.decision == responsesPeekDecisionTranslate {
+		prepared.abort()
+		return nil, &result, resp.Header.Clone(), nil
+	}
+	if hasResult && result.failure != nil {
+		return prepared.commitResponse(), &result, nil, nil
+	}
+	return prepared.commitResponse(), nil, nil, nil
+}
+
+func (h *ProxyHandler) prepareResponsesStream(waitCtx, streamCtx context.Context, model string, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
+	resp, result, translatedHeaders, err := prepareResponsesStreamAttempt(waitCtx, streamCtx, request)
+	if err != nil || result == nil {
+		return resp, nil, nil, err
+	}
+	if result.decision == responsesPeekDecisionTranslate {
+		logResponsesPrecommitTranslated(h, *result, model, translatedHeaders)
+		return nil, result, translatedHeaders, nil
+	}
+	if result.failure != nil && resp != nil {
+		logResponsesPrecommitFailOpen(h, result.failure, model, resp.Header)
+	}
+	return resp, nil, nil, nil
 }
 
 func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.Header, peekDone chan<- peekResult, commitCh, abortCh <-chan struct{}, maxPeekBytes int) {

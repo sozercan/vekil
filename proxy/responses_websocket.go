@@ -294,12 +294,31 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
 	defer upstreamCancel()
 
-	resp, deltaAttempted, deltaFallback, err := s.postCreateRequest(h, upstreamCtx, request, plan)
-	metrics.deltaAttempted = deltaAttempted
-	metrics.deltaFallback = deltaFallback
+	resp, translated, translatedHeaders, err := h.prepareResponsesStream(s.ctx, upstreamCtx, request.Model, func() (*http.Response, error) {
+		attemptPlan, err := s.planRequest(h, request)
+		if err != nil {
+			return nil, err
+		}
+		attemptResp, attemptDeltaAttempted, attemptDeltaFallback, err := s.postCreateRequest(h, upstreamCtx, request, attemptPlan)
+		metrics.deltaAttempted = metrics.deltaAttempted || attemptDeltaAttempted
+		metrics.deltaFallback = metrics.deltaFallback || attemptDeltaFallback
+		return attemptResp, err
+	})
 	if err != nil {
 		s.sendWrappedError(upstreamStatusCode(err, http.StatusBadGateway), fmt.Sprintf("upstream request failed: %v", err), "server_error", nil)
 		return err
+	}
+	if translated != nil {
+		code := ""
+		if translated.failure != nil {
+			code = strings.TrimSpace(translated.failure.Response.Error.Code)
+		}
+		s.sendWrappedError(translated.status, translated.message, code, translatedHeaders)
+		return nil
+	}
+	if resp == nil {
+		s.sendWrappedError(http.StatusBadGateway, "upstream request failed", "server_error", nil)
+		return fmt.Errorf("upstream websocket bridge returned no response")
 	}
 	defer func() { _ = resp.Body.Close() }()
 
