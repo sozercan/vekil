@@ -71,9 +71,9 @@ Routing rules:
 - Static provider models can also advertise richer Codex `/v1/models` metadata via optional fields on each `models[]` entry:
   `model_picker_category`, `reasoning_effort`, `vision`, `parallel_tool_calls`, and `context_window`.
   Without those fields, the proxy exposes a minimal but valid model entry.
-- For Azure OpenAI, `/v1/models` also tries to enrich each configured `models[]` entry from Azure's upstream `/models` response. The proxy matches by `public_id` first, then by `deployment` for aliased models.
-- Azure's upstream `/models` catalog can be sparse for Codex-style fields such as reasoning levels, vision, and context window, so configure those fields statically when you need richer `/v1/models` output for an alias.
-- Explicit `models[]` metadata overrides discovered Azure metadata. Configured public IDs and endpoint allowlists always win, and the proxy falls back to the static entry if the Azure `/models` probe fails.
+- For Azure OpenAI, `/v1/models` only does a best-effort metadata overlay for each configured `models[]` entry by probing Azure's upstream `/models` response. The proxy matches by `public_id` first, then by `deployment` for aliased models.
+- Azure's upstream `/models` catalog can omit Codex-style fields entirely. The proxy only copies fields that Azure already returns; it does not derive reasoning levels, vision, parallel tool calls, model picker metadata, or context window from other Azure docs or capability hints.
+- Explicit `models[]` metadata overrides discovered Azure metadata. Configured public IDs and endpoint allowlists always win, and the proxy falls back to the static entry if the Azure `/models` probe fails or returns a sparse payload.
 - The example Azure `gpt-5.4-pro` model shown above is `/responses`-only. Do not advertise `/chat/completions` for that model unless you have verified native support.
 
 Use the JSON example above as a starting point for your local providers config file.

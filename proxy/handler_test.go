@@ -3110,7 +3110,7 @@ func TestHandleModels(t *testing.T) {
 		}
 	})
 
-	t.Run("Azure model enriches configured metadata from discovered public model", func(t *testing.T) {
+	t.Run("Azure discovered metadata best-effort enriches configured public model", func(t *testing.T) {
 		t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 
 		azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3219,7 +3219,125 @@ func TestHandleModels(t *testing.T) {
 		}
 	})
 
-	t.Run("Azure discovered metadata matches deployment and respects explicit overrides", func(t *testing.T) {
+	t.Run("Azure sparse discovered metadata leaves static model minimal but valid", func(t *testing.T) {
+		t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+
+		azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/openai/v1/models" {
+				t.Fatalf("unexpected Azure path %q", r.URL.Path)
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.4","object":"model","created":0,"owned_by":"azure-openai"}]}`))
+		}))
+		defer azureServer.Close()
+
+		handler, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.New(logger.LevelInfo),
+			WithProvidersConfig(ProvidersConfig{
+				Providers: []ProviderConfig{{
+					ID:        "azure",
+					Type:      "azure-openai",
+					Default:   true,
+					BaseURL:   azureServer.URL + "/openai/v1",
+					APIKeyEnv: "TEST_AZURE_API_KEY",
+					Models: []ProviderModelConfig{{
+						PublicID:   "gpt-5.4",
+						Deployment: "gpt-5-4-prod",
+						Endpoints:  []string{"/responses"},
+					}},
+				}},
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler returned error: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+
+		handler.HandleModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+		}
+
+		var result struct {
+			Data []struct {
+				ID                 string   `json:"id"`
+				Name               string   `json:"name"`
+				SupportedEndpoints []string `json:"supported_endpoints"`
+			} `json:"data"`
+			Models []struct {
+				Slug                       string   `json:"slug"`
+				DisplayName                string   `json:"display_name"`
+				Visibility                 string   `json:"visibility"`
+				SupportedInAPI             bool     `json:"supported_in_api"`
+				DefaultReasoningLevel      *string  `json:"default_reasoning_level,omitempty"`
+				SupportedReasoningLevels   []string `json:"supported_reasoning_levels"`
+				SupportsReasoningSummaries bool     `json:"supports_reasoning_summaries"`
+				Priority                   int      `json:"priority"`
+				SupportsParallelToolCalls  bool     `json:"supports_parallel_tool_calls"`
+				ContextWindow              *int64   `json:"context_window,omitempty"`
+				InputModalities            []string `json:"input_modalities"`
+			} `json:"models"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(result.Data) != 1 || len(result.Models) != 1 {
+			t.Fatalf("expected one Azure model entry, got data=%d models=%d", len(result.Data), len(result.Models))
+		}
+		if result.Data[0].ID != "gpt-5.4" {
+			t.Fatalf("expected public id gpt-5.4, got %q", result.Data[0].ID)
+		}
+		if result.Data[0].Name != "gpt-5.4" {
+			t.Fatalf("expected static fallback name gpt-5.4, got %q", result.Data[0].Name)
+		}
+		if got := strings.Join(result.Data[0].SupportedEndpoints, ","); got != "/responses" {
+			t.Fatalf("expected configured supported_endpoints /responses, got %q", got)
+		}
+
+		model := result.Models[0]
+		if model.Slug != "gpt-5.4" {
+			t.Fatalf("expected slug gpt-5.4, got %q", model.Slug)
+		}
+		if model.DisplayName != "gpt-5.4" {
+			t.Fatalf("expected static fallback display name gpt-5.4, got %q", model.DisplayName)
+		}
+		if model.Visibility != "list" {
+			t.Fatalf("expected default visibility list for /responses model, got %q", model.Visibility)
+		}
+		if !model.SupportedInAPI {
+			t.Fatal("expected supported_in_api true from configured /responses endpoint")
+		}
+		if model.DefaultReasoningLevel != nil {
+			t.Fatalf("expected no default_reasoning_level for sparse metadata, got %v", model.DefaultReasoningLevel)
+		}
+		if len(model.SupportedReasoningLevels) != 0 {
+			t.Fatalf("expected no supported_reasoning_levels for sparse metadata, got %v", model.SupportedReasoningLevels)
+		}
+		if model.SupportsReasoningSummaries {
+			t.Fatal("expected supports_reasoning_summaries false for sparse metadata")
+		}
+		if model.Priority != 5 {
+			t.Fatalf("expected default versatile priority 5, got %d", model.Priority)
+		}
+		if model.SupportsParallelToolCalls {
+			t.Fatal("expected supports_parallel_tool_calls false for sparse metadata")
+		}
+		if model.ContextWindow != nil {
+			t.Fatalf("expected no context_window for sparse metadata, got %v", model.ContextWindow)
+		}
+		if got := strings.Join(model.InputModalities, ","); got != "text" {
+			t.Fatalf("expected text-only input_modalities for sparse metadata, got %q", got)
+		}
+	})
+
+	t.Run("Azure best-effort discovered metadata matches deployment and respects explicit overrides", func(t *testing.T) {
 		t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 
 		azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

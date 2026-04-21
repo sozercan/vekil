@@ -720,6 +720,9 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 	case providerTypeAzureOpenAI:
 		models := orderedStaticProviderModels(provider)
 
+		// Azure /models is only a best-effort metadata overlay for the configured
+		// static catalog. Routing still comes from provider.models[], and sparse
+		// or failed discovery should leave the configured model list untouched.
 		resp, err := h.doWithRetry(func() (*http.Request, error) {
 			return h.newProviderJSONRequest(ctx, provider, http.MethodGet, "/models", nil, nil, "")
 		})
@@ -844,6 +847,10 @@ func mergeStaticProviderMetadata(static providerModel, cfg ProviderModelConfig, 
 	return static
 }
 
+// mergeDiscoveredProviderModelRaw opportunistically copies provider metadata
+// that already exists in the discovered /models payload. It does not rewrite
+// configured public IDs or endpoint allowlists, and it does not synthesize
+// Codex-facing fields that an upstream provider omitted.
 func mergeDiscoveredProviderModelRaw(baseRaw, discoveredRaw json.RawMessage, cfg ProviderModelConfig) (json.RawMessage, error) {
 	if len(baseRaw) == 0 || len(discoveredRaw) == 0 {
 		return append(json.RawMessage(nil), baseRaw...), nil
