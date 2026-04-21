@@ -1,8 +1,8 @@
-# CLAUDE.md
+# Contributor Guide
 
 ## Project
 
-Go reverse proxy that routes Anthropic, Gemini, and OpenAI API requests to GitHub Copilot's backend (`api.githubcopilot.com`), using a Copilot subscription instead of direct API keys.
+Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs. By default it forwards requests to GitHub Copilot's backend (`api.githubcopilot.com`), and it can also route selected models to configured providers such as Azure OpenAI behind the same proxy endpoint. This lets clients use a Copilot subscription by default while still exposing additional provider-backed models when configured.
 
 ## Build & Test
 
@@ -46,11 +46,13 @@ Documentation update rules:
 
 | Package | Purpose |
 |---------|---------|
-| `main.go` | CLI entry, flags, signal handling |
-| `auth/` | GitHub OAuth device code flow, token caching/refresh (`sync.RWMutex` + double-check) |
+| `main.go` | CLI entry, flags (including providers config), signal handling |
+| `auth/` | GitHub OAuth device code flow and Copilot token caching/refresh (`sync.RWMutex` + double-check) |
 | `proxy/chat_handlers.go` | Anthropic and OpenAI chat handlers, including forced-streaming aggregation for tool calls |
 | `proxy/responses_handler.go` | OpenAI Responses passthrough plus Codex compatibility endpoints (`/v1/responses/compact`, `/v1/memories/trace_summarize`) |
-| `proxy/handler.go` | Shared proxy plumbing: health/ready/models handlers, request-body decoding, Copilot headers, caches |
+| `proxy/handler.go` | Shared proxy plumbing: health/ready/models handlers, request-body decoding, provider-aware model catalogs, Copilot headers, caches |
+| `proxy/providers.go` | Provider config loading, model ownership, Azure metadata overlay, endpoint allowlists, and routing state |
+| `proxy/upstream_http.go` | Provider selection, public→upstream model rewriting, and provider-specific upstream HTTP dispatch |
 | `proxy/gemini_handler.go` | Gemini-native HTTP handlers and countTokens probe flow |
 | `proxy/gemini.go` | Gemini↔OpenAI request/response translation and validation |
 | `proxy/gemini_streaming.go` | OpenAI SSE → Gemini SSE translation |
@@ -65,11 +67,14 @@ Documentation update rules:
 ## Key Design Decisions
 
 - **No frameworks**: Pure `net/http` with Go 1.22+ `ServeMux` method routing. Do not add web frameworks.
-- **Forced streaming for parallel tool calls**: Non-streaming requests with tools are force-streamed upstream then aggregated back, because Copilot's non-streaming mode doesn't reliably return parallel tool calls. This is the project's core value-add.
+- **Default behavior is Copilot; multi-provider routing is additive**: Zero-config startup still targets GitHub Copilot. Configured providers can extend or replace that default behind the same public API surface.
+- **Public model IDs are global across providers**: Model ownership is explicit and startup must fail on collisions rather than silently shadowing one provider with another.
+- **Forced streaming for reliable parallel tool calls**: Non-streaming requests with tools may be force-streamed upstream then aggregated back before returning to the client. This behavior started as a Copilot reliability workaround and still applies to provider-backed OpenAI chat handling.
 - **Gemini is a translation layer**: Gemini endpoints are implemented like Anthropic, not as zero-copy passthrough. Keep Gemini-specific protocol logic in `proxy/gemini*.go`.
 - **Responses compatibility is proxy-owned**: `/v1/responses/compact` and `/v1/memories/trace_summarize` are compatibility shims implemented on top of the upstream `/responses` API. Preserve this behavior for Codex-style clients.
 - **OpenAI passthrough is near-zero-copy, not literal zero-copy**: chat completions may inject `parallel_tool_calls` and force streaming; `/v1/responses` may rewrite proxy-owned compaction items before forwarding.
 - **Provider endpoint support is explicit**: `models[].endpoints` is an allowlist. Do not advertise `/chat/completions` or other routes for a provider/model unless that upstream capability has been verified. The Azure `gpt-5.4-pro` example configuration is `/responses`-only.
+- **Azure support is OpenAI-compatible provider routing, not a separate public surface**: Azure deployment names stay internal to provider config, and Azure `/models` probing is only a best-effort metadata overlay for configured models.
 - **Proxy websocket bridging is not upstream realtime**: `GET /v1/responses` remains a proxy-owned websocket transport over upstream HTTP `/responses`. Do not describe it as native Azure websocket or `/realtime` support.
 - **Minimal dependencies**: Keep third-party deps minimal. Current non-stdlib dependencies used in production code are `systray`, `uuid`, and `klauspost/compress`.
 - **Distroless container**: Single static binary, CGO_ENABLED=0.
