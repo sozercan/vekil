@@ -666,6 +666,104 @@ func TestHandleResponses(t *testing.T) {
 	}
 }
 
+func TestHandleResponses_RoutesConfiguredAzureModelAndPreservesPriorityServiceTier(t *testing.T) {
+	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/openai/v1/responses" {
+			t.Fatalf("expected Azure path /openai/v1/responses, got %s", got)
+		}
+		if got := r.URL.RawQuery; got != "" {
+			t.Fatalf("expected no Azure query params for /openai/v1 base URL, got %q", got)
+		}
+		if got := r.Header.Get("api-key"); got != "azure-test-key" {
+			t.Fatalf("expected api-key header, got %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Fatalf("expected no Copilot Authorization header, got %q", got)
+		}
+
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream request body: %v", err)
+		}
+		var upstreamReq map[string]json.RawMessage
+		if err := json.Unmarshal(bodyBytes, &upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+
+		var model string
+		if err := json.Unmarshal(upstreamReq["model"], &model); err != nil {
+			t.Fatalf("decode upstream model: %v", err)
+		}
+		if model != "gpt-5-4-prod" {
+			t.Fatalf("expected Azure deployment model gpt-5-4-prod, got %q", model)
+		}
+
+		var serviceTier string
+		if err := json.Unmarshal(upstreamReq["service_tier"], &serviceTier); err != nil {
+			t.Fatalf("decode upstream service_tier: %v", err)
+		}
+		if serviceTier != "priority" {
+			t.Fatalf("expected upstream service_tier priority, got %q", serviceTier)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-azure","object":"response","status":"completed","model":"gpt-5-4-prod","output":[]}`))
+	}))
+	defer azureServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:         "azure",
+				Type:       "azure-openai",
+				Default:    true,
+				BaseURL:    azureServer.URL + "/openai/v1",
+				APIKeyEnv:  "TEST_AZURE_API_KEY",
+				APIVersion: "preview",
+				Models: []ProviderModelConfig{{
+					PublicID:   "gpt-5-public",
+					Deployment: "gpt-5-4-prod",
+					Endpoints:  []string{"/responses"},
+					Name:       "GPT-5 Public",
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model": "gpt-5-public",
+		"input": "Hello",
+		"service_tier": "priority"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var responseBody struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&responseBody); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if responseBody.ID != "resp-azure" {
+		t.Fatalf("unexpected response body: %+v", responseBody)
+	}
+}
+
 func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	var gotOpenAIBeta, gotSessionID, gotClientRequestID string
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {

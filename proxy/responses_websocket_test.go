@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestHandleResponsesWebSocket_UpgradeRequiredWithoutUpgradeHeaders(t *testing.T) {
@@ -117,6 +119,117 @@ func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 	completed := mustReadWebSocketJSON(t, conn)
 	if completed["type"] != "response.completed" {
 		t.Fatalf("expected third event to be response.completed, got %v", completed["type"])
+	}
+
+	if upstreamRequests != 1 {
+		t.Fatalf("expected 1 upstream request, got %d", upstreamRequests)
+	}
+}
+
+func TestHandleResponsesWebSocket_RoutesConfiguredAzureModelAndPreservesPriorityServiceTier(t *testing.T) {
+	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+
+	var upstreamRequests int
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected POST, got %s", r.Method)
+		}
+		if got := r.URL.Path; got != "/openai/v1/responses" {
+			t.Fatalf("expected Azure path /openai/v1/responses, got %s", got)
+		}
+		if got := r.URL.RawQuery; got != "" {
+			t.Fatalf("expected no Azure query params for /openai/v1 base URL, got %q", got)
+		}
+		if got := r.Header.Get("api-key"); got != "azure-test-key" {
+			t.Fatalf("expected api-key header, got %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Fatalf("expected no Copilot Authorization header, got %q", got)
+		}
+
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+
+		var model string
+		if err := json.Unmarshal(body["model"], &model); err != nil {
+			t.Fatalf("failed to decode upstream model: %v", err)
+		}
+		if model != "gpt-5-4-prod" {
+			t.Fatalf("expected Azure deployment model gpt-5-4-prod, got %q", model)
+		}
+
+		var serviceTier string
+		if err := json.Unmarshal(body["service_tier"], &serviceTier); err != nil {
+			t.Fatalf("failed to decode upstream service_tier: %v", err)
+		}
+		if serviceTier != "priority" {
+			t.Fatalf("expected upstream service_tier priority, got %q", serviceTier)
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-azure-ws\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-azure-ws\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+	}))
+	defer azureServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:         "azure",
+				Type:       "azure-openai",
+				Default:    true,
+				BaseURL:    azureServer.URL + "/openai/v1",
+				APIKeyEnv:  "TEST_AZURE_API_KEY",
+				APIVersion: "preview",
+				Models: []ProviderModelConfig{{
+					PublicID:   "gpt-5-public",
+					Deployment: "gpt-5-4-prod",
+					Endpoints:  []string{"/responses"},
+					Name:       "GPT-5 Public",
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	request["model"] = "gpt-5-public"
+	request["service_tier"] = "priority"
+
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+
+	created := mustReadWebSocketJSON(t, conn)
+	if created["type"] != "response.created" {
+		t.Fatalf("expected first event to be response.created, got %v", created["type"])
+	}
+	completed := mustReadWebSocketJSON(t, conn)
+	if completed["type"] != "response.completed" {
+		t.Fatalf("expected second event to be response.completed, got %v", completed["type"])
 	}
 
 	if upstreamRequests != 1 {
