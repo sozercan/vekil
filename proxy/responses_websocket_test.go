@@ -67,12 +67,8 @@ func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 		if _, ok := body["previous_response_id"]; ok {
 			t.Fatalf("upstream request should not include websocket previous_response_id")
 		}
-		var serviceTier string
-		if err := json.Unmarshal(body["service_tier"], &serviceTier); err != nil {
-			t.Fatalf("upstream request should preserve service_tier: %v", err)
-		}
-		if serviceTier != "auto" {
-			t.Fatalf("expected upstream service_tier auto, got %q", serviceTier)
+		if _, ok := body["service_tier"]; ok {
+			t.Fatalf("upstream request should not include service_tier")
 		}
 
 		w.Header().Set("Content-Type", "text/event-stream")

@@ -625,12 +625,8 @@ func TestHandleResponses(t *testing.T) {
 		if err := json.Unmarshal(body, &upstreamReq); err != nil {
 			t.Fatalf("upstream received invalid JSON: %v", err)
 		}
-		var serviceTier string
-		if err := json.Unmarshal(upstreamReq["service_tier"], &serviceTier); err != nil {
-			t.Fatalf("upstream request should preserve service_tier: %v", err)
-		}
-		if serviceTier != "auto" {
-			t.Fatalf("expected upstream service_tier auto, got %q", serviceTier)
+		if _, ok := upstreamReq["service_tier"]; ok {
+			t.Fatalf("upstream request should not include service_tier")
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -3883,12 +3879,8 @@ func TestOpenAIResponsesStreaming(t *testing.T) {
 		if err := json.Unmarshal(body, &upstreamReq); err != nil {
 			t.Fatalf("upstream received invalid JSON: %v", err)
 		}
-		var serviceTier string
-		if err := json.Unmarshal(upstreamReq["service_tier"], &serviceTier); err != nil {
-			t.Fatalf("upstream request should preserve service_tier: %v", err)
-		}
-		if serviceTier != "auto" {
-			t.Fatalf("expected upstream service_tier auto, got %q", serviceTier)
+		if _, ok := upstreamReq["service_tier"]; ok {
+			t.Fatalf("upstream request should not include service_tier")
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
