@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,9 +34,9 @@ func TestHandleResponsesWebSocket_UpgradeRequiredWithoutUpgradeHeaders(t *testin
 }
 
 func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
-	var upstreamRequests int
+	var upstreamRequests atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		upstreamRequests++
+		upstreamRequests.Add(1)
 		if r.Method != http.MethodPost {
 			t.Fatalf("expected POST, got %s", r.Method)
 		}
@@ -121,17 +122,17 @@ func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 		t.Fatalf("expected third event to be response.completed, got %v", completed["type"])
 	}
 
-	if upstreamRequests != 1 {
-		t.Fatalf("expected 1 upstream request, got %d", upstreamRequests)
+	if got := upstreamRequests.Load(); got != 1 {
+		t.Fatalf("expected 1 upstream request, got %d", got)
 	}
 }
 
 func TestHandleResponsesWebSocket_RoutesConfiguredAzureModelAndPreservesPriorityServiceTier(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 
-	var upstreamRequests int
+	var upstreamRequests atomic.Int32
 	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamRequests++
+		upstreamRequests.Add(1)
 		if r.Method != http.MethodPost {
 			t.Fatalf("expected POST, got %s", r.Method)
 		}
@@ -232,8 +233,8 @@ func TestHandleResponsesWebSocket_RoutesConfiguredAzureModelAndPreservesPriority
 		t.Fatalf("expected second event to be response.completed, got %v", completed["type"])
 	}
 
-	if upstreamRequests != 1 {
-		t.Fatalf("expected 1 upstream request, got %d", upstreamRequests)
+	if got := upstreamRequests.Load(); got != 1 {
+		t.Fatalf("expected 1 upstream request, got %d", got)
 	}
 }
 
@@ -283,17 +284,22 @@ func TestHandleResponsesWebSocket_CreateRequestUsesStreamingUpstreamTimeout(t *t
 }
 
 func TestHandleResponsesWebSocket_WarmupStaysLocalAndNextRequestExpandsState(t *testing.T) {
-	var upstreamRequests int
+	var upstreamRequests atomic.Int32
+	var upstreamBodyMu sync.Mutex
 	var upstreamBody map[string]interface{}
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		upstreamRequests++
+		upstreamRequests.Add(1)
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Fatalf("failed to read upstream request body: %v", err)
 		}
-		if err := json.Unmarshal(bodyBytes, &upstreamBody); err != nil {
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
 			t.Fatalf("failed to decode upstream request body: %v", err)
 		}
+		upstreamBodyMu.Lock()
+		upstreamBody = body
+		upstreamBodyMu.Unlock()
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n")
@@ -327,8 +333,8 @@ func TestHandleResponsesWebSocket_WarmupStaysLocalAndNextRequestExpandsState(t *
 	if warmupCompleted["type"] != "response.completed" {
 		t.Fatalf("expected warmup response.completed event, got %v", warmupCompleted["type"])
 	}
-	if upstreamRequests != 0 {
-		t.Fatalf("expected warmup request to avoid upstream call, got %d requests", upstreamRequests)
+	if got := upstreamRequests.Load(); got != 0 {
+		t.Fatalf("expected warmup request to avoid upstream call, got %d requests", got)
 	}
 
 	warmupID := websocketResponseID(t, warmupCreated)
@@ -342,11 +348,15 @@ func TestHandleResponsesWebSocket_WarmupStaysLocalAndNextRequestExpandsState(t *
 	_ = mustReadWebSocketJSON(t, conn)
 	_ = mustReadWebSocketJSON(t, conn)
 
-	if upstreamRequests != 1 {
-		t.Fatalf("expected 1 upstream request after warmup, got %d", upstreamRequests)
+	if got := upstreamRequests.Load(); got != 1 {
+		t.Fatalf("expected 1 upstream request after warmup, got %d", got)
 	}
 
-	input := upstreamInputItems(t, upstreamBody)
+	upstreamBodyMu.Lock()
+	body := upstreamBody
+	upstreamBodyMu.Unlock()
+
+	input := upstreamInputItems(t, body)
 	if len(input) != 1 {
 		t.Fatalf("expected expanded upstream input length 1, got %d", len(input))
 	}
@@ -356,6 +366,7 @@ func TestHandleResponsesWebSocket_WarmupStaysLocalAndNextRequestExpandsState(t *
 }
 
 func TestHandleResponsesWebSocket_ExpandsPreviousOutputItemsIntoNextRequest(t *testing.T) {
+	var upstreamRequestsMu sync.Mutex
 	upstreamRequests := make([]map[string]interface{}, 0, 2)
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, err := io.ReadAll(r.Body)
@@ -366,10 +377,13 @@ func TestHandleResponsesWebSocket_ExpandsPreviousOutputItemsIntoNextRequest(t *t
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
 			t.Fatalf("failed to decode upstream request body: %v", err)
 		}
+		upstreamRequestsMu.Lock()
 		upstreamRequests = append(upstreamRequests, body)
+		requestCount := len(upstreamRequests)
+		upstreamRequestsMu.Unlock()
 
 		w.Header().Set("Content-Type", "text/event-stream")
-		switch len(upstreamRequests) {
+		switch requestCount {
 		case 1:
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call-1\",\"name\":\"shell_command\",\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}\n\n")
@@ -378,7 +392,7 @@ func TestHandleResponsesWebSocket_ExpandsPreviousOutputItemsIntoNextRequest(t *t
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
 		default:
-			t.Fatalf("unexpected upstream request count %d", len(upstreamRequests))
+			t.Fatalf("unexpected upstream request count %d", requestCount)
 		}
 	})
 
@@ -418,16 +432,17 @@ func TestHandleResponsesWebSocket_ExpandsPreviousOutputItemsIntoNextRequest(t *t
 	_ = mustReadWebSocketJSON(t, conn)
 	_ = mustReadWebSocketJSON(t, conn)
 
-	if len(upstreamRequests) != 2 {
-		t.Fatalf("expected 2 upstream requests, got %d", len(upstreamRequests))
+	requests := snapshotResponsesWebSocketRequests(&upstreamRequestsMu, upstreamRequests)
+	if len(requests) != 2 {
+		t.Fatalf("expected 2 upstream requests, got %d", len(requests))
 	}
 
-	firstInput := upstreamInputItems(t, upstreamRequests[0])
+	firstInput := upstreamInputItems(t, requests[0])
 	if len(firstInput) != 1 {
 		t.Fatalf("expected first upstream input length 1, got %d", len(firstInput))
 	}
 
-	secondInput := upstreamInputItems(t, upstreamRequests[1])
+	secondInput := upstreamInputItems(t, requests[1])
 	if len(secondInput) != 3 {
 		t.Fatalf("expected second upstream input length 3, got %d", len(secondInput))
 	}
@@ -445,7 +460,7 @@ func TestHandleResponsesWebSocket_ExpandsPreviousOutputItemsIntoNextRequest(t *t
 func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 	var upstreamRequestsMu sync.Mutex
 	upstreamRequests := make([]map[string]interface{}, 0, 3)
-	var normalRequests int
+	var normalRequests atomic.Int32
 
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, err := io.ReadAll(r.Body)
@@ -467,9 +482,9 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 			return
 		}
 
-		normalRequests++
+		requestNumber := normalRequests.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
-		switch normalRequests {
+		switch requestNumber {
 		case 1:
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-1\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"}]}}\n\n")
@@ -480,7 +495,7 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
 		default:
-			t.Fatalf("unexpected normal upstream request count %d", normalRequests)
+			t.Fatalf("unexpected normal upstream request count %d", requestNumber)
 		}
 	})
 	handler.responsesWS = ResponsesWebSocketConfig{
@@ -555,7 +570,7 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T) {
 	var upstreamRequestsMu sync.Mutex
 	upstreamRequests := make([]map[string]interface{}, 0, 4)
-	var normalRequests int
+	var normalRequests atomic.Int32
 
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, err := io.ReadAll(r.Body)
@@ -577,8 +592,8 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 			return
 		}
 
-		normalRequests++
-		switch normalRequests {
+		requestNumber := normalRequests.Add(1)
+		switch requestNumber {
 		case 1:
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n")
@@ -595,7 +610,7 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
 		default:
-			t.Fatalf("unexpected normal upstream request count %d", normalRequests)
+			t.Fatalf("unexpected normal upstream request count %d", requestNumber)
 		}
 	})
 	handler.responsesWS = ResponsesWebSocketConfig{
@@ -688,6 +703,7 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 }
 
 func TestHandleResponsesWebSocket_TurnStateDeltaReplayUsesOnlyCurrentInputAndIgnoresClientTurnStateHeader(t *testing.T) {
+	var upstreamRequestsMu sync.Mutex
 	upstreamRequests := make([]map[string]interface{}, 0, 2)
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, err := io.ReadAll(r.Body)
@@ -698,10 +714,13 @@ func TestHandleResponsesWebSocket_TurnStateDeltaReplayUsesOnlyCurrentInputAndIgn
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
 			t.Fatalf("failed to decode upstream request body: %v", err)
 		}
+		upstreamRequestsMu.Lock()
 		upstreamRequests = append(upstreamRequests, body)
+		requestCount := len(upstreamRequests)
+		upstreamRequestsMu.Unlock()
 
 		w.Header().Set("Content-Type", "text/event-stream")
-		switch len(upstreamRequests) {
+		switch requestCount {
 		case 1:
 			if got := r.Header.Get("X-Codex-Turn-State"); got != "" {
 				t.Fatalf("expected first request to omit turn state, got %q", got)
@@ -718,7 +737,7 @@ func TestHandleResponsesWebSocket_TurnStateDeltaReplayUsesOnlyCurrentInputAndIgn
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
 		default:
-			t.Fatalf("unexpected upstream request count %d", len(upstreamRequests))
+			t.Fatalf("unexpected upstream request count %d", requestCount)
 		}
 	})
 	handler.responsesWS = ResponsesWebSocketConfig{
@@ -770,11 +789,12 @@ func TestHandleResponsesWebSocket_TurnStateDeltaReplayUsesOnlyCurrentInputAndIgn
 	_ = mustReadWebSocketJSONSkipMetadata(t, conn)
 	_ = mustReadWebSocketJSON(t, conn)
 
-	if len(upstreamRequests) != 2 {
-		t.Fatalf("expected 2 upstream requests, got %d", len(upstreamRequests))
+	requests := snapshotResponsesWebSocketRequests(&upstreamRequestsMu, upstreamRequests)
+	if len(requests) != 2 {
+		t.Fatalf("expected 2 upstream requests, got %d", len(requests))
 	}
 
-	secondInput := upstreamInputItems(t, upstreamRequests[1])
+	secondInput := upstreamInputItems(t, requests[1])
 	if len(secondInput) != 1 {
 		t.Fatalf("expected delta replay to send only latest input, got %d items", len(secondInput))
 	}
@@ -784,6 +804,7 @@ func TestHandleResponsesWebSocket_TurnStateDeltaReplayUsesOnlyCurrentInputAndIgn
 }
 
 func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing.T) {
+	var upstreamRequestsMu sync.Mutex
 	upstreamRequests := make([]map[string]interface{}, 0, 3)
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, err := io.ReadAll(r.Body)
@@ -794,9 +815,12 @@ func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
 			t.Fatalf("failed to decode upstream request body: %v", err)
 		}
+		upstreamRequestsMu.Lock()
 		upstreamRequests = append(upstreamRequests, body)
+		requestCount := len(upstreamRequests)
+		upstreamRequestsMu.Unlock()
 
-		switch len(upstreamRequests) {
+		switch requestCount {
 		case 1:
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("X-Codex-Turn-State", "turn-state-1")
@@ -818,7 +842,7 @@ func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
 		default:
-			t.Fatalf("unexpected upstream request count %d", len(upstreamRequests))
+			t.Fatalf("unexpected upstream request count %d", requestCount)
 		}
 	})
 	handler.responsesWS = ResponsesWebSocketConfig{
@@ -870,11 +894,12 @@ func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing
 		t.Fatalf("expected fallback response.completed event, got %v", completed["type"])
 	}
 
-	if len(upstreamRequests) != 3 {
-		t.Fatalf("expected 3 upstream requests including fallback, got %d", len(upstreamRequests))
+	requests := snapshotResponsesWebSocketRequests(&upstreamRequestsMu, upstreamRequests)
+	if len(requests) != 3 {
+		t.Fatalf("expected 3 upstream requests including fallback, got %d", len(requests))
 	}
 
-	fallbackInput := upstreamInputItems(t, upstreamRequests[2])
+	fallbackInput := upstreamInputItems(t, requests[2])
 	if len(fallbackInput) != 3 {
 		t.Fatalf("expected fallback replay to include full history plus latest input, got %d items", len(fallbackInput))
 	}
@@ -887,11 +912,11 @@ func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing
 }
 
 func TestHandleResponsesWebSocket_ResponseFailedKeepsSessionOpen(t *testing.T) {
-	var upstreamRequests int
+	var upstreamRequests atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		upstreamRequests++
+		requestNumber := upstreamRequests.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
-		switch upstreamRequests {
+		switch requestNumber {
 		case 1:
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-fail\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-fail\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"context too long\"}}}\n\n")
@@ -899,7 +924,7 @@ func TestHandleResponsesWebSocket_ResponseFailedKeepsSessionOpen(t *testing.T) {
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-retry\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-retry\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
 		default:
-			t.Fatalf("unexpected upstream request count %d", upstreamRequests)
+			t.Fatalf("unexpected upstream request count %d", requestNumber)
 		}
 	})
 
@@ -974,19 +999,19 @@ func TestHandleResponsesWebSocket_ResponseFailedKeepsSessionOpen(t *testing.T) {
 }
 
 func TestHandleResponsesWebSocket_FirstEventTransientResponseFailedSendsOnlyErrorFrame(t *testing.T) {
-	var upstreamRequests int
+	var upstreamRequests atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		upstreamRequests++
+		requestNumber := upstreamRequests.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Retry-After", "3")
-		switch upstreamRequests {
+		switch requestNumber {
 		case 1:
 			_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-rate-limit\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"Too Many Requests\"}}}\n\n")
 		case 2:
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-next\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-next\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
 		default:
-			t.Fatalf("unexpected upstream request count %d", upstreamRequests)
+			t.Fatalf("unexpected upstream request count %d", requestNumber)
 		}
 	})
 
@@ -1057,19 +1082,19 @@ func TestHandleResponsesWebSocket_FirstEventTransientResponseFailedSendsOnlyErro
 }
 
 func TestHandleResponsesWebSocket_FirstEventTransientResponseFailedWithoutUpstreamCodeOmitsErrorCode(t *testing.T) {
-	var upstreamRequests int
+	var upstreamRequests atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		upstreamRequests++
+		requestNumber := upstreamRequests.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Retry-After", "3")
-		switch upstreamRequests {
+		switch requestNumber {
 		case 1:
 			_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-rate-limit-no-code\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Too Many Requests\"}}}\n\n")
 		case 2:
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-next\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-next\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
 		default:
-			t.Fatalf("unexpected upstream request count %d", upstreamRequests)
+			t.Fatalf("unexpected upstream request count %d", requestNumber)
 		}
 	})
 
@@ -1140,11 +1165,11 @@ func TestHandleResponsesWebSocket_FirstEventTransientResponseFailedWithoutUpstre
 }
 
 func TestHandleResponsesWebSocket_ResponseIncompleteKeepsSessionOpen(t *testing.T) {
-	var upstreamRequests int
+	var upstreamRequests atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		upstreamRequests++
+		requestNumber := upstreamRequests.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
-		switch upstreamRequests {
+		switch requestNumber {
 		case 1:
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-inc\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-inc\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n")
@@ -1152,7 +1177,7 @@ func TestHandleResponsesWebSocket_ResponseIncompleteKeepsSessionOpen(t *testing.
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-next\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-next\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
 		default:
-			t.Fatalf("unexpected upstream request count %d", upstreamRequests)
+			t.Fatalf("unexpected upstream request count %d", requestNumber)
 		}
 	})
 
