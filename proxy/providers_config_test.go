@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -128,5 +129,81 @@ func TestProviderRequestURLAzureLegacyBaseURLAppendsAPIVersion(t *testing.T) {
 	}
 	if modelsURL != "https://example.openai.azure.com/openai/models?api-version=2025-04-01-preview" {
 		t.Fatalf("providerRequestURL() = %q", modelsURL)
+	}
+}
+
+func TestBuildProvidersAzureLegacyBaseURLAccepted(t *testing.T) {
+	t.Parallel()
+
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	providers, _, _, err := handler.buildProviders(ProvidersConfig{
+		Providers: []ProviderConfig{{
+			ID:         "azure-openai",
+			Type:       "azure-openai",
+			BaseURL:    "https://example.openai.azure.com/openai",
+			APIKey:     "test-key",
+			APIVersion: "2025-04-01-preview",
+			Models: []ProviderModelConfig{{
+				PublicID:   "gpt-4.1",
+				Deployment: "gpt-4.1",
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+
+	provider := providers["azure-openai"]
+	if provider == nil {
+		t.Fatal("expected azure-openai provider to be built")
+	}
+	if provider.baseURL != "https://example.openai.azure.com/openai" {
+		t.Fatalf("provider.baseURL = %q, want Azure /openai endpoint", provider.baseURL)
+	}
+}
+
+func TestBuildProvidersAzureModelsBaseURLRejected(t *testing.T) {
+	t.Parallel()
+
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	_, _, _, err := handler.buildProviders(ProvidersConfig{
+		Providers: []ProviderConfig{{
+			ID:      "azure-openai",
+			Type:    "azure-openai",
+			BaseURL: "https://example.services.ai.azure.com/models",
+			APIKey:  "test-key",
+			Models: []ProviderModelConfig{{
+				PublicID: "Kimi-K2.6",
+			}},
+		}},
+	})
+	if err == nil {
+		t.Fatal("buildProviders() error = nil, want unsupported /models base_url error")
+	}
+	if !strings.Contains(err.Error(), "use the OpenAI-compatible endpoint ending in /openai/v1 instead") {
+		t.Fatalf("buildProviders() error = %v, want /openai/v1 guidance", err)
+	}
+}
+
+func TestBuildProvidersAzureUnsupportedBaseURLRejected(t *testing.T) {
+	t.Parallel()
+
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	_, _, _, err := handler.buildProviders(ProvidersConfig{
+		Providers: []ProviderConfig{{
+			ID:      "azure-openai",
+			Type:    "azure-openai",
+			BaseURL: "https://example.services.ai.azure.com/inference",
+			APIKey:  "test-key",
+			Models: []ProviderModelConfig{{
+				PublicID: "Kimi-K2.6",
+			}},
+		}},
+	})
+	if err == nil {
+		t.Fatal("buildProviders() error = nil, want unsupported Azure base_url error")
+	}
+	if !strings.Contains(err.Error(), "expected a URL ending in /openai/v1 or /openai") {
+		t.Fatalf("buildProviders() error = %v, want supported Azure base_url suffixes", err)
 	}
 }
