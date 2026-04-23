@@ -409,7 +409,7 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string) (*provid
 		case azureBaseURLKindModels:
 			return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: Azure AI Foundry /models inference endpoints are not supported; use the OpenAI-compatible endpoint ending in /openai/v1 instead", id, baseURL)
 		default:
-			return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: expected a URL ending in /openai/v1 or /openai", id, baseURL)
+			return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: expected an absolute URL whose path ends in /openai/v1 or /openai, with no query string or fragment", id, baseURL)
 		}
 		runtime.baseURL = baseURL
 		runtime.apiVersion = strings.TrimSpace(cfg.APIVersion)
@@ -652,13 +652,15 @@ func classifyAzureBaseURL(baseURL string) azureBaseURLKind {
 		return azureBaseURLKindInvalid
 	}
 
-	path := trimmed
 	parsed, err := url.Parse(trimmed)
-	if err == nil {
-		path = parsed.Path
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return azureBaseURLKindInvalid
 	}
-	path = strings.TrimRight(path, "/")
+	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || strings.Contains(trimmed, "#") {
+		return azureBaseURLKindInvalid
+	}
 
+	path := strings.TrimRight(parsed.Path, "/")
 	switch {
 	case strings.HasSuffix(path, "/openai/v1"):
 		return azureBaseURLKindOpenAIV1

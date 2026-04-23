@@ -203,7 +203,51 @@ func TestBuildProvidersAzureUnsupportedBaseURLRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("buildProviders() error = nil, want unsupported Azure base_url error")
 	}
-	if !strings.Contains(err.Error(), "expected a URL ending in /openai/v1 or /openai") {
-		t.Fatalf("buildProviders() error = %v, want supported Azure base_url suffixes", err)
+	if !strings.Contains(err.Error(), "expected an absolute URL whose path ends in /openai/v1 or /openai") {
+		t.Fatalf("buildProviders() error = %v, want supported Azure base_url guidance", err)
+	}
+}
+
+func TestBuildProvidersAzureMalformedBaseURLRejected(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name    string
+		baseURL string
+	}{
+		{name: "missing scheme", baseURL: "example.openai.azure.com/openai/v1"},
+		{name: "missing host", baseURL: "https:///openai/v1"},
+		{name: "query string", baseURL: "https://example.openai.azure.com/openai/v1?api-version=2025-04-01-preview"},
+		{name: "empty query string", baseURL: "https://example.openai.azure.com/openai/v1?"},
+		{name: "fragment", baseURL: "https://example.openai.azure.com/openai/v1#chat"},
+		{name: "empty fragment", baseURL: "https://example.openai.azure.com/openai/v1#"},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+			_, _, _, err := handler.buildProviders(ProvidersConfig{
+				Providers: []ProviderConfig{{
+					ID:      "azure-openai",
+					Type:    "azure-openai",
+					BaseURL: tc.baseURL,
+					APIKey:  "test-key",
+					Models: []ProviderModelConfig{{
+						PublicID:   "gpt-4.1",
+						Deployment: "gpt-4.1",
+					}},
+				}},
+			})
+			if err == nil {
+				t.Fatalf("buildProviders() error = nil for base_url %q, want unsupported Azure base_url error", tc.baseURL)
+			}
+			if !strings.Contains(err.Error(), "expected an absolute URL whose path ends in /openai/v1 or /openai") {
+				t.Fatalf("buildProviders() error = %v, want absolute Azure base_url guidance", err)
+			}
+			if !strings.Contains(err.Error(), "no query string or fragment") {
+				t.Fatalf("buildProviders() error = %v, want query/fragment guidance", err)
+			}
+		})
 	}
 }

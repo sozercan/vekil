@@ -61,7 +61,7 @@ Routing rules:
 - Clients keep using plain model IDs such as `gpt-5.4-pro`.
 - Azure `deployment` is the upstream model name; the proxy rewrites the public ID before forwarding.
 - Azure `models[]` remains the routing source of truth. The proxy does not autodiscover new Azure deployments for inference.
-- Azure `base_url` must end with either the OpenAI-compatible `/openai/v1` prefix or the legacy `/openai` prefix.
+- Azure `base_url` must be an absolute URL whose path ends with either the OpenAI-compatible `/openai/v1` path or the legacy `/openai` path, with no query string or fragment.
 - Azure AI Foundry inference URLs ending in `/models` are not supported in `type: "azure-openai"` configs. Use the corresponding OpenAI-compatible `.../openai/v1` endpoint instead.
 - For `/openai/v1` base URLs, omit `api_version`; the proxy calls `/chat/completions`, `/responses`, and `/models` directly with no `api-version` query string.
 - For legacy `/openai` base URLs, set `api_version`; the proxy appends `api-version=...` to upstream requests.
