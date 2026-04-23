@@ -1,0 +1,127 @@
+name: Dependabot Auto Merge
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dependabot:
+    if: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_URL: ${{ github.event.pull_request.html_url }}
+    steps:
+      - name: Skip draft pull requests
+        if: ${{ github.event.pull_request.draft }}
+        run: echo "Skipping draft Dependabot pull request."
+
+      - name: Dependabot metadata
+        if: ${{ !github.event.pull_request.draft }}
+        id: metadata
+        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a # v2.5.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Inspect pull request state
+        if: ${{ !github.event.pull_request.draft }}
+        id: state
+        env:
+          AUTO_MERGE_METHOD: ${{ vars.DEPENDABOT_AUTO_MERGE_METHOD }}
+          PACKAGE_ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+        run: |
+          set -euo pipefail
+
+          skip() {
+            printf 'approve=false\n' >> "$GITHUB_OUTPUT"
+            printf 'enable_auto_merge=false\n' >> "$GITHUB_OUTPUT"
+            printf 'reason=%s\n' "$1" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          case "${PACKAGE_ECOSYSTEM}" in
+            docker|github-actions)
+              skip "Skipping ${PACKAGE_ECOSYSTEM} Dependabot updates because this workflow only auto-merges application dependency updates."
+              ;;
+          esac
+
+          if [ "${UPDATE_TYPE}" != "version-update:semver-patch" ] && [ "${UPDATE_TYPE}" != "version-update:semver-minor" ]; then
+            skip "Skipping ${UPDATE_TYPE:-unknown} Dependabot update."
+          fi
+
+          merge_method="$(printf '%s' "${AUTO_MERGE_METHOD:-}" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"
+          case "${merge_method}" in
+            MERGE)
+              merge_flag="--merge"
+              ;;
+            REBASE)
+              merge_flag="--rebase"
+              ;;
+            SQUASH)
+              merge_flag="--squash"
+              ;;
+            "")
+              skip "Skipping because the DEPENDABOT_AUTO_MERGE_METHOD repository variable is not configured."
+              ;;
+            *)
+              skip "Skipping because DEPENDABOT_AUTO_MERGE_METHOD must be one of: merge, rebase, or squash."
+              ;;
+          esac
+
+          review_decision="$(gh pr view "$PR_URL" --json reviewDecision --jq '.reviewDecision // ""')"
+          if [ "${review_decision}" = "CHANGES_REQUESTED" ]; then
+            skip "Skipping because the pull request has requested changes."
+          fi
+
+          auto_merge_enabled="$(gh pr view "$PR_URL" --json autoMergeRequest --jq 'if .autoMergeRequest then "true" else "false" end')"
+
+          if [ "${review_decision}" = "APPROVED" ]; then
+            approve="false"
+          else
+            approve="true"
+          fi
+
+          if [ "${auto_merge_enabled}" = "true" ]; then
+            enable_auto_merge="false"
+          else
+            enable_auto_merge="true"
+          fi
+
+          if [ "${approve}" = "false" ] && [ "${enable_auto_merge}" = "false" ]; then
+            reason="Pull request is already approved and auto-merge is already enabled."
+          else
+            reason=""
+          fi
+
+          printf 'approve=%s\n' "${approve}" >> "$GITHUB_OUTPUT"
+          printf 'enable_auto_merge=%s\n' "${enable_auto_merge}" >> "$GITHUB_OUTPUT"
+          printf 'merge_flag=%s\n' "${merge_flag}" >> "$GITHUB_OUTPUT"
+          printf 'reason=%s\n' "${reason}" >> "$GITHUB_OUTPUT"
+
+      - name: Explain no-op
+        if: ${{ !github.event.pull_request.draft && steps.state.outputs.approve != 'true' && steps.state.outputs.enable_auto_merge != 'true' }}
+        run: echo "${{ steps.state.outputs.reason }}"
+
+      - name: Approve pull request
+        if: ${{ steps.state.outputs.approve == 'true' }}
+        run: gh pr review --approve "$PR_URL"
+
+      - name: Enable auto-merge
+        if: ${{ steps.state.outputs.enable_auto_merge == 'true' }}
+        env:
+          MERGE_FLAG: ${{ steps.state.outputs.merge_flag }}
+        run: gh pr merge --auto "$MERGE_FLAG" "$PR_URL"
