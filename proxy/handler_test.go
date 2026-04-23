@@ -2494,6 +2494,60 @@ func TestHandleOpenAIChatCompletions_RejectsConfiguredAzureModelWithoutChatSuppo
 	}
 }
 
+func TestHandleResponses_RejectsConfiguredAzureModelWithoutResponsesSupport(t *testing.T) {
+	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:        "azure",
+				Type:      "azure-openai",
+				Default:   true,
+				BaseURL:   "https://example.openai.azure.com/openai",
+				APIKeyEnv: "TEST_AZURE_API_KEY",
+				Models: []ProviderModelConfig{{
+					PublicID:   "gpt-5.4-pro",
+					Deployment: "gpt-5.4-pro",
+					Endpoints:  []string{"/chat/completions"},
+					Name:       "GPT-5.4 Pro",
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model": "gpt-5.4-pro",
+		"input": "Hello"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, body)
+	}
+
+	var errResp struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if !strings.Contains(errResp.Error.Message, `does not support /responses`) {
+		t.Fatalf("expected unsupported endpoint message, got %q", errResp.Error.Message)
+	}
+}
+
 func TestNewProxyHandler_FailsWhenProvidersSharePlainModelID(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 
