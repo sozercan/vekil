@@ -1,6 +1,6 @@
 # vekil
 
-High-performance Go proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs. By default it forwards requests to GitHub Copilot's backend (`api.githubcopilot.com`), and it can also route selected models to configured providers such as Azure OpenAI behind the same proxy endpoint. This lets you use tools that speak the Anthropic, Gemini, or OpenAI protocol with your GitHub Copilot subscription, while still exposing additional provider-backed models when configured.
+High-performance Go proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs behind one local endpoint. Vekil can run in zero-config mode against GitHub Copilot, or route selected models to configured providers such as Azure OpenAI and OpenAI Codex. The client-facing API surface stays the same while model ownership is configured behind the proxy.
 
 ## What It Supports
 
@@ -8,9 +8,9 @@ High-performance Go proxy that exposes Anthropic, Gemini, and OpenAI-compatible 
 - Gemini Generate Content and Count Tokens APIs
 - OpenAI Chat Completions API
 - OpenAI Responses API, including Codex websocket bridging
-- Multi-provider model routing, including Azure OpenAI deployments behind the same `/v1` endpoint
+- Multi-provider model routing across GitHub Copilot, Azure OpenAI, and OpenAI Codex
 - Proxy-owned Codex compatibility endpoints for compaction and memory summarization
-- Streaming, tool use, parallel tool calls, compressed request bodies, and OAuth token caching
+- Streaming, tool use, parallel tool calls, compressed request bodies, and auth/token caching
 
 ## Quick Start
 
@@ -23,6 +23,8 @@ docker run -p 1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   ghcr.io/sozercan/vekil:latest
 ```
+
+For explicit provider routing, start the proxy with `--providers-config /path/to/providers.json`.
 
 On Apple Silicon Macs, you can also use the native menubar app.
 
@@ -38,9 +40,12 @@ brew install --cask sozercan/repo/vekil
 
 Manual downloads still work through the `vekil-macos-arm64.zip` asset on [GitHub Releases](https://github.com/sozercan/vekil/releases/latest). See [macOS Menubar App](docs/menubar.md).
 
-If your setup includes a Copilot provider, first run starts GitHub's device code flow. Tokens are cached in `~/.config/vekil/`.
+Depending on your active providers:
 
-For multi-provider setup and non-Copilot-only deployments, see [Configuration](docs/configuration.md).
+- Copilot-backed setups start GitHub's device code flow on first run.
+- OpenAI Codex setups require `codex login` so `~/.codex/auth.json` exists.
+
+For provider configuration, model routing, and provider-specific auth details, see [Getting Started](docs/getting-started.md) and [Configuration](docs/configuration.md).
 
 ## Docs
 
@@ -55,7 +60,9 @@ The full documentation now lives under [`docs/`](docs/README.md) in smaller, top
 - [macOS Menubar App](docs/menubar.md)
 - [Development](docs/development.md)
 
-## Most Common Client Setup
+## Common Client Setup
+
+Use any public model ID exposed by `/v1/models`; the local client configuration stays the same even when a different upstream provider owns that model.
 
 ### Claude Code
 
@@ -67,10 +74,12 @@ env ANTHROPIC_BASE_URL=http://localhost:1337 \
 
 ### OpenAI Codex CLI
 
+For OpenAI Codex subscription models, configure an `openai-codex` provider first; exposed IDs stay unprefixed.
+
 ```bash
 env OPENAI_API_KEY=dummy \
   OPENAI_BASE_URL=http://localhost:1337/v1 \
-  codex exec --skip-git-repo-check -m gpt-5.4 "Reply with exactly PROXY_OK"
+  codex exec --skip-git-repo-check -m gpt-5.5 "Reply with exactly PROXY_OK"
 ```
 
 ### Gemini CLI

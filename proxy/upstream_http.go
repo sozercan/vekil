@@ -123,6 +123,12 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 	if provider == nil {
 		return nil, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no provider available for endpoint %s", endpoint)}
 	}
+	if !providerSupportsEndpoint(provider, endpoint) {
+		return nil, nil, &providerRequestError{
+			statusCode: http.StatusBadRequest,
+			err:        fmt.Errorf("provider %q does not support %s", provider.id, endpoint),
+		}
+	}
 	if known && !providerModelSupportsEndpoint(owner, endpoint) {
 		return nil, nil, &providerRequestError{
 			statusCode: http.StatusBadRequest,
@@ -135,6 +141,16 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 		return nil, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
 	return provider, rewrittenBody, nil
+}
+
+func providerSupportsEndpoint(provider *providerRuntime, endpoint string) bool {
+	if provider == nil {
+		return false
+	}
+	if provider.kind == providerTypeOpenAICodex {
+		return supportsEndpoint(openAICodexProviderEndpoints, endpoint)
+	}
+	return true
 }
 
 func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body []byte) (*http.Response, error) {

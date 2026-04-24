@@ -2,7 +2,7 @@
 
 ## `POST /v1/messages` (Anthropic)
 
-Anthropic Messages compatibility for the supported content and tool subset. Requests are translated to OpenAI Chat Completions, forwarded upstream, and translated back to Anthropic.
+Anthropic Messages compatibility for the supported content and tool subset. Requests are translated to OpenAI Chat Completions, routed through the provider that owns the selected public model, and translated back to Anthropic.
 
 Supported features:
 
@@ -18,9 +18,9 @@ Model normalization:
 - dated suffixes are stripped automatically, for example `claude-sonnet-4-20250514`
 - hyphenated version numbers are mapped to dotted form, for example `claude-sonnet-4-5` to `claude-sonnet-4.5`
 
-### `GET /v1/models`
+## `GET /v1/models`
 
-The proxy builds a merged model catalog across the configured providers. It preserves the OpenAI-style `data` payload and also adds a Codex-compatible top-level `models` array.
+The proxy builds a merged model catalog across the active providers. It preserves the OpenAI-style `data` payload and also adds a Codex-compatible top-level `models` array.
 
 ```bash
 curl http://localhost:1337/v1/models
@@ -31,36 +31,14 @@ When multiple providers are configured:
 - public model IDs stay unprefixed, for example `gpt-5.4`
 - each public ID must be owned by exactly one provider
 - startup fails if providers collide on the same model ID
-- Azure OpenAI deployments can be exposed under a different public ID while the proxy rewrites the upstream `model` field
+- dynamic providers such as Copilot or OpenAI Codex can be narrowed with `include_models` or `exclude_models`
+- static providers such as Azure OpenAI can expose a deployment under a different public ID while the proxy rewrites the upstream `model` field
 
-Example IDs in recent upstream responses have included:
-
-- `gpt-4o`
-- `gpt-4.1`
-- `gpt-5-mini`
-- `gpt-5.1`
-- `gpt-5.1-codex`
-- `gpt-5.1-codex-mini`
-- `gpt-5.1-codex-max`
-- `gpt-5.2`
-- `gpt-5.2-codex`
-- `gpt-5.3-codex`
-- `gpt-5.4`
-- `claude-haiku-4.5`
-- `claude-sonnet-4`
-- `claude-sonnet-4.5`
-- `claude-sonnet-4.6`
-- `claude-opus-4.5`
-- `claude-opus-4.6`
-- `claude-opus-4.6-1m`
-- `gemini-2.5-pro`
-- `gemini-3-pro-preview`
-- `gemini-3-flash-preview`
-- `gemini-3.1-pro-preview`
+The exact catalog depends on your configured providers and current upstream availability. Query `/v1/models` in your own deployment instead of hard-coding one global model list.
 
 ## `POST /v1beta/models/{model}:generateContent` and `POST /models/{model}:generateContent` (Gemini)
 
-Gemini is implemented as a translation layer, not a zero-copy passthrough layer. Gemini requests are translated to OpenAI Chat Completions, sent upstream, and translated back into Gemini responses.
+Gemini is implemented as a translation layer, not a zero-copy passthrough layer. Gemini requests are translated to OpenAI Chat Completions, routed through the provider that owns the selected public model, and translated back into Gemini responses.
 
 The decoder accepts both standard Gemini camelCase fields and LiteLLM-style snake_case aliases such as `system_instruction`, `function_declarations`, `inline_data`, `max_output_tokens`, and `response_json_schema`.
 
@@ -109,7 +87,7 @@ Near zero-copy passthrough for requests without tools. When tools are present, t
 
 When provider routing is configured, the request is routed by the public `model` ID. If the selected provider uses a different upstream model or deployment name, the proxy rewrites the outgoing `model` field before forwarding.
 
-The proxy also enforces the model's configured `supported_endpoints` before forwarding. If a model is exposed as `/responses`-only, `POST /v1/chat/completions` fails fast with `400` instead of probing an unsupported upstream route. The Azure `gpt-5.4-pro` example configuration is set up this way.
+The proxy also enforces the model's configured `supported_endpoints` before forwarding. If a model is exposed as `/responses`-only, `POST /v1/chat/completions` fails fast with `400` instead of probing an unsupported upstream route. The Azure `gpt-5.4-pro` example configuration and OpenAI Codex subscription models are set up this way.
 
 ## `POST /v1/responses` and `GET /v1/responses` (OpenAI)
 

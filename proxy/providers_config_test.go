@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -159,6 +160,98 @@ func TestBuildProvidersAzureLegacyBaseURLAccepted(t *testing.T) {
 	}
 	if provider.baseURL != "https://example.openai.azure.com/openai" {
 		t.Fatalf("provider.baseURL = %q, want Azure /openai endpoint", provider.baseURL)
+	}
+}
+
+func TestBuildConfiguredProviderSetupRejectsStaticModelCollision(t *testing.T) {
+	t.Parallel()
+
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	_, err := handler.buildConfiguredProviderSetup(context.Background(), ProvidersConfig{
+		Providers: []ProviderConfig{
+			{
+				ID:      "azure-a",
+				Type:    "azure-openai",
+				Default: true,
+				BaseURL: "https://a.openai.azure.com/openai/v1",
+				APIKey:  "test-key-a",
+				Models: []ProviderModelConfig{{
+					PublicID: "gpt-5.4",
+				}},
+			},
+			{
+				ID:      "azure-b",
+				Type:    "azure-openai",
+				BaseURL: "https://b.openai.azure.com/openai/v1",
+				APIKey:  "test-key-b",
+				Models: []ProviderModelConfig{{
+					PublicID: "gpt-5.4",
+				}},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("buildConfiguredProviderSetup() error = nil, want model collision")
+	}
+	if !strings.Contains(err.Error(), "gpt-5.4") || !strings.Contains(err.Error(), "azure-a") || !strings.Contains(err.Error(), "azure-b") {
+		t.Fatalf("expected static collision details, got %v", err)
+	}
+}
+
+func TestBuildProvidersOpenAICodexDefaultBaseURLAndFilters(t *testing.T) {
+	t.Parallel()
+
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	providers, _, defaultProviderID, err := handler.buildProviders(ProvidersConfig{
+		Providers: []ProviderConfig{{
+			ID:            "codex",
+			Type:          "openai-codex",
+			Default:       true,
+			IncludeModels: []string{"gpt-5.5"},
+			ExcludeModels: []string{"gpt-5.4"},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+	if defaultProviderID != "codex" {
+		t.Fatalf("default provider = %q, want codex", defaultProviderID)
+	}
+
+	provider := providers["codex"]
+	if provider == nil {
+		t.Fatal("expected codex provider to be built")
+	}
+	if provider.baseURL != defaultOpenAICodexBaseURL {
+		t.Fatalf("provider.baseURL = %q, want %q", provider.baseURL, defaultOpenAICodexBaseURL)
+	}
+	if !provider.allowsModel("gpt-5.5") {
+		t.Fatal("expected include_models to allow gpt-5.5")
+	}
+	if provider.allowsModel("gpt-5.4") {
+		t.Fatal("expected exclude_models to block gpt-5.4")
+	}
+	if provider.allowsModel("gpt-other") {
+		t.Fatal("expected include_models to block gpt-other")
+	}
+}
+
+func TestBuildProvidersOpenAICodexMalformedBaseURLRejected(t *testing.T) {
+	t.Parallel()
+
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	_, _, _, err := handler.buildProviders(ProvidersConfig{
+		Providers: []ProviderConfig{{
+			ID:      "codex",
+			Type:    "openai-codex",
+			BaseURL: "https://chatgpt.com/backend-api/codex?client_version=1.0.0",
+		}},
+	})
+	if err == nil {
+		t.Fatal("buildProviders() error = nil, want malformed OpenAI Codex base_url error")
+	}
+	if !strings.Contains(err.Error(), "no query string or fragment") {
+		t.Fatalf("buildProviders() error = %v, want query/fragment guidance", err)
 	}
 }
 

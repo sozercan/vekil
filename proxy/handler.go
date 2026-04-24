@@ -465,6 +465,12 @@ func (h *ProxyHandler) newProviderProbeRequest(ctx context.Context, provider *pr
 		req.Header.Set("api-key", provider.apiKey)
 		req.Header.Set("Content-Type", "application/json")
 		return req, nil
+	case providerTypeOpenAICodex:
+		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodGet, "/models", nil, nil, openAICodexModelsRawQuery(""))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create provider %q probe request: %w", provider.id, err)
+		}
+		return req, nil
 	default:
 		return nil, fmt.Errorf("unsupported provider type %q", provider.kind)
 	}
@@ -592,7 +598,20 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 			return cachedModelsResponse{}, false, err
 		}
 
-		if provider.kind == providerTypeCopilot {
+		if result.notModified {
+			for _, model := range setup.modelsForProvider(provider.id) {
+				if existingProvider, exists := owners[model.publicID]; exists {
+					if existingProvider == model.providerID {
+						continue
+					}
+					return cachedModelsResponse{}, false, providerModelCollisionError(model.publicID, existingProvider, model.providerID)
+				}
+				owners[model.publicID] = model.providerID
+				rawEntries = append(rawEntries, model.raw)
+			}
+		}
+
+		if providerUsesDynamicModels(provider) {
 			sawDynamicProvider = true
 			if result.notModified {
 				continue
@@ -611,7 +630,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 				if existingProvider == model.providerID {
 					continue
 				}
-				return cachedModelsResponse{}, false, fmt.Errorf("model %q is exposed by both provider %q and provider %q", model.publicID, existingProvider, model.providerID)
+				return cachedModelsResponse{}, false, providerModelCollisionError(model.publicID, existingProvider, model.providerID)
 			}
 			owners[model.publicID] = model.providerID
 			rawEntries = append(rawEntries, model.raw)

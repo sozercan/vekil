@@ -53,8 +53,9 @@ open "Vekil.app"
 Use `Choose Providers Config…` from the menubar menu to select the same JSON file you would pass to the CLI with `--providers-config`.
 
 - The app saves the selected path in its menubar config so it is reused on the next launch and when started at login.
-- `Use Default Copilot Routing` clears the saved path and returns to the zero-config Copilot-only behavior.
+- `Use Default Copilot Routing` clears the saved path and returns to zero-config startup, which currently uses the built-in Copilot provider.
 - If the selected config does not include a Copilot provider, the app no longer requires GitHub sign-in before starting the proxy.
+- Provider-specific extra state still comes from the normal locations, for example `~/.codex/auth.json` for `type: "openai-codex"`.
 
 ## Release Assets
 

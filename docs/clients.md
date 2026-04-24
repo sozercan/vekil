@@ -1,5 +1,7 @@
 # Client Usage Examples
 
+These examples all target the same local proxy. Replace model IDs with public IDs from `/v1/models` in your deployment; client setup does not need to change when a model is backed by GitHub Copilot, Azure OpenAI, or OpenAI Codex.
+
 ## Claude Code
 
 ```bash
@@ -10,10 +12,12 @@ env ANTHROPIC_BASE_URL=http://localhost:1337 \
 
 ## OpenAI Codex CLI
 
+Use any public `/responses`-capable model ID exposed by your current setup. For an OpenAI Codex subscription model, first add an `openai-codex` provider with an `include_models` entry such as `gpt-5.5`; the model remains unprefixed for clients.
+
 ```bash
 env OPENAI_API_KEY=dummy \
   OPENAI_BASE_URL=http://localhost:1337/v1 \
-  codex exec --skip-git-repo-check -m gpt-5.4 "Reply with exactly PROXY_OK"
+  codex exec --skip-git-repo-check -m gpt-5.5 "Reply with exactly PROXY_OK"
 ```
 
 ## Gemini CLI

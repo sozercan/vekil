@@ -18,9 +18,11 @@ type providerType string
 const (
 	providerTypeCopilot     providerType = "copilot"
 	providerTypeAzureOpenAI providerType = "azure-openai"
+	providerTypeOpenAICodex providerType = "openai-codex"
 )
 
 var defaultStaticProviderEndpoints = []string{"/chat/completions", "/responses"}
+var openAICodexProviderEndpoints = []string{"/responses"}
 
 // ProvidersConfig configures optional non-Copilot upstream providers.
 // When empty, the proxy keeps its legacy zero-config Copilot behavior.
@@ -33,6 +35,7 @@ type ProviderConfig struct {
 	ID            string                `json:"id"`
 	Type          string                `json:"type"`
 	Default       bool                  `json:"default,omitempty"`
+	IncludeModels []string              `json:"include_models,omitempty"`
 	ExcludeModels []string              `json:"exclude_models,omitempty"`
 	BaseURL       string                `json:"base_url,omitempty"`
 	APIKey        string                `json:"api_key,omitempty"`
@@ -63,10 +66,12 @@ type providerRuntime struct {
 	baseURL       string
 	apiKey        string
 	apiVersion    string
+	includeModels map[string]struct{}
 	excludeModels map[string]struct{}
 	staticModels  map[string]providerModel
 	staticConfigs map[string]ProviderModelConfig
 	staticOrder   []string
+	codexAuth     *openAICodexAuth
 }
 
 type providerModel struct {
@@ -91,6 +96,30 @@ type providerModelsFetchResult struct {
 	models      []providerModel
 	etag        string
 	notModified bool
+}
+
+type openAICodexReasoningPreset struct {
+	Effort string `json:"effort"`
+}
+
+type openAICodexModelPayload struct {
+	Slug                        string                       `json:"slug"`
+	DisplayName                 string                       `json:"display_name"`
+	Description                 string                       `json:"description"`
+	Visibility                  string                       `json:"visibility"`
+	SupportedInAPI              bool                         `json:"supported_in_api"`
+	Priority                    int                          `json:"priority"`
+	SupportedReasoningLevels    []openAICodexReasoningPreset `json:"supported_reasoning_levels"`
+	SupportsParallelToolCalls   bool                         `json:"supports_parallel_tool_calls"`
+	SupportsImageDetailOriginal bool                         `json:"supports_image_detail_original"`
+	SupportsReasoningSummaries  bool                         `json:"supports_reasoning_summaries"`
+	SupportVerbosity            bool                         `json:"support_verbosity"`
+	ContextWindow               int64                        `json:"context_window"`
+	InputModalities             []string                     `json:"input_modalities"`
+	ExperimentalSupportedTools  []string                     `json:"experimental_supported_tools"`
+	BaseInstructions            string                       `json:"base_instructions"`
+	ShellType                   string                       `json:"shell_type"`
+	DefaultReasoningLevel       string                       `json:"default_reasoning_level"`
 }
 
 type providerRequestError struct {
@@ -158,6 +187,7 @@ func defaultProviderSetup(h *ProxyHandler) *providerSetup {
 				kind:          providerTypeCopilot,
 				isDefault:     true,
 				baseURL:       strings.TrimRight(h.copilotURL, "/"),
+				includeModels: map[string]struct{}{},
 				excludeModels: map[string]struct{}{},
 				staticModels:  map[string]providerModel{},
 			},
@@ -217,13 +247,29 @@ func (ps *providerSetup) replaceProviderModels(providerID string, models []provi
 
 	for _, model := range models {
 		if existing, exists := next[model.publicID]; exists && existing.providerID != model.providerID {
-			return fmt.Errorf("model %q is exposed by both provider %q and provider %q", model.publicID, existing.providerID, model.providerID)
+			return providerModelCollisionError(model.publicID, existing.providerID, model.providerID)
 		}
 		next[model.publicID] = model
 	}
 
 	ps.models = next
 	return nil
+}
+
+func (ps *providerSetup) modelsForProvider(providerID string) []providerModel {
+	if ps == nil {
+		return nil
+	}
+	ps.modelsMu.RLock()
+	defer ps.modelsMu.RUnlock()
+
+	models := make([]providerModel, 0)
+	for _, model := range ps.models {
+		if model.providerID == providerID {
+			models = append(models, model)
+		}
+	}
+	return models
 }
 
 func (h *ProxyHandler) initializeProviders() error {
@@ -253,17 +299,17 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 		hasConfiguredState: true,
 	}
 
-	needsDynamicModelValidation := false
-	for _, provider := range providers {
-		if provider.kind == providerTypeCopilot && len(providers) > 1 {
-			needsDynamicModelValidation = true
-			break
-		}
-	}
+	needsDynamicModelValidation := len(providers) > 1 && hasDynamicProvider(providers)
 
 	if !needsDynamicModelValidation {
 		for _, provider := range providers {
 			for publicID, model := range provider.staticModels {
+				if existing, exists := setup.models[publicID]; exists {
+					if existing.providerID == model.providerID {
+						continue
+					}
+					return nil, providerModelCollisionError(publicID, existing.providerID, model.providerID)
+				}
 				setup.models[publicID] = model
 			}
 		}
@@ -279,10 +325,10 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 
 	for _, providerID := range providerOrder {
 		provider := providers[providerID]
-		if provider.kind != providerTypeCopilot {
+		if !providerUsesDynamicModels(provider) {
 			for publicID, model := range provider.staticModels {
 				if existing, exists := setup.models[publicID]; exists {
-					return nil, fmt.Errorf("model %q is exposed by both provider %q and provider %q", publicID, existing.providerID, model.providerID)
+					return nil, providerModelCollisionError(publicID, existing.providerID, model.providerID)
 				}
 				setup.models[publicID] = model
 			}
@@ -298,7 +344,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 				if existing.providerID == model.providerID {
 					continue
 				}
-				return nil, fmt.Errorf("model %q is exposed by both provider %q and provider %q", model.publicID, existing.providerID, model.providerID)
+				return nil, providerModelCollisionError(model.publicID, existing.providerID, model.providerID)
 			}
 			setup.models[model.publicID] = model
 		}
@@ -374,8 +420,7 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string) (*provid
 
 	kind := providerType(strings.TrimSpace(cfg.Type))
 	switch kind {
-	case providerTypeCopilot:
-	case providerTypeAzureOpenAI:
+	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICodex:
 	default:
 		return nil, fmt.Errorf("provider %q has unsupported type %q", id, cfg.Type)
 	}
@@ -384,9 +429,17 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string) (*provid
 		id:            id,
 		kind:          kind,
 		isDefault:     cfg.Default,
+		includeModels: make(map[string]struct{}, len(cfg.IncludeModels)),
 		excludeModels: make(map[string]struct{}, len(cfg.ExcludeModels)),
 		staticModels:  make(map[string]providerModel, len(cfg.Models)),
 		staticConfigs: make(map[string]ProviderModelConfig, len(cfg.Models)),
+	}
+
+	for _, included := range cfg.IncludeModels {
+		included = strings.TrimSpace(included)
+		if included != "" {
+			runtime.includeModels[included] = struct{}{}
+		}
 	}
 
 	for _, excluded := range cfg.ExcludeModels {
@@ -428,7 +481,7 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string) (*provid
 			if err != nil {
 				return nil, err
 			}
-			if _, excluded := runtime.excludeModels[model.publicID]; excluded {
+			if !runtime.allowsModel(model.publicID) {
 				continue
 			}
 			if _, exists := runtime.staticModels[model.publicID]; exists {
@@ -438,9 +491,67 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string) (*provid
 			runtime.staticConfigs[model.publicID] = normalizeProviderModelConfig(modelCfg)
 			runtime.staticOrder = append(runtime.staticOrder, model.publicID)
 		}
+	case providerTypeOpenAICodex:
+		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+		if baseURL == "" {
+			baseURL = defaultOpenAICodexBaseURL
+		}
+		if err := validateGenericProviderBaseURL(id, "OpenAI Codex", baseURL); err != nil {
+			return nil, err
+		}
+		codexAuth, err := newOpenAICodexAuth()
+		if err != nil {
+			return nil, fmt.Errorf("provider %q: %w", id, err)
+		}
+		runtime.baseURL = baseURL
+		runtime.codexAuth = codexAuth
 	}
 
 	return runtime, nil
+}
+
+func hasDynamicProvider(providers map[string]*providerRuntime) bool {
+	for _, provider := range providers {
+		if providerUsesDynamicModels(provider) {
+			return true
+		}
+	}
+	return false
+}
+
+func providerUsesDynamicModels(provider *providerRuntime) bool {
+	if provider == nil {
+		return false
+	}
+	return provider.kind == providerTypeCopilot || provider.kind == providerTypeOpenAICodex
+}
+
+func (p *providerRuntime) allowsModel(model string) bool {
+	if p == nil {
+		return true
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	if len(p.includeModels) > 0 {
+		if _, included := p.includeModels[model]; !included {
+			return false
+		}
+	}
+	if _, excluded := p.excludeModels[model]; excluded {
+		return false
+	}
+	return true
+}
+
+func providerModelCollisionError(publicID, existingProviderID, incomingProviderID string) error {
+	return fmt.Errorf(
+		"model %q is exposed by both provider %q and provider %q; resolve by adding include_models to the dynamic provider or exclude_models to one provider",
+		publicID,
+		existingProviderID,
+		incomingProviderID,
+	)
 }
 
 func buildStaticProviderModel(providerID string, cfg ProviderModelConfig) (providerModel, error) {
@@ -673,6 +784,18 @@ func classifyAzureBaseURL(baseURL string) azureBaseURLKind {
 	}
 }
 
+func validateGenericProviderBaseURL(providerID, label, baseURL string) error {
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("provider %q has unsupported %s base_url %q: expected an absolute URL with no query string or fragment", providerID, label, baseURL)
+	}
+	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || strings.Contains(trimmed, "#") {
+		return fmt.Errorf("provider %q has unsupported %s base_url %q: expected an absolute URL with no query string or fragment", providerID, label, baseURL)
+	}
+	return nil
+}
+
 func appendQuery(parts ...string) string {
 	combined := ""
 	for _, part := range parts {
@@ -715,6 +838,22 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 		h.setCopilotHeaders(req, token)
 	case providerTypeAzureOpenAI:
 		req.Header.Set("api-key", provider.apiKey)
+		req.Header.Set("Content-Type", "application/json")
+	case providerTypeOpenAICodex:
+		if provider.codexAuth == nil {
+			return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no OpenAI Codex auth configured", provider.id)}
+		}
+		credentials, err := provider.codexAuth.credentials(req.Context(), h.client)
+		if err != nil {
+			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
+		}
+		req.Header.Set("Authorization", "Bearer "+credentials.accessToken)
+		if credentials.accountID != "" {
+			req.Header.Set("ChatGPT-Account-ID", credentials.accountID)
+		}
+		if credentials.fedRAMP {
+			req.Header.Set("X-OpenAI-Fedramp", "true")
+		}
 		req.Header.Set("Content-Type", "application/json")
 	default:
 		return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("unsupported provider type %q", provider.kind)}
@@ -774,7 +913,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 			return providerModelsFetchResult{models: models}, nil
 		}
 
-		overlayModels, err := decodeProviderModelsFromBody(provider.id, body, provider.excludeModels)
+		overlayModels, err := decodeProviderModelsFromBody(provider, body)
 		if err != nil {
 			return providerModelsFetchResult{models: models}, nil
 		}
@@ -830,7 +969,48 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 			return providerModelsFetchResult{}, err
 		}
 
-		models, err := decodeProviderModelsFromBody(provider.id, body, provider.excludeModels)
+		models, err := decodeProviderModelsFromBody(provider, body)
+		if err != nil {
+			return providerModelsFetchResult{}, err
+		}
+		result.models = models
+		return result, nil
+	case providerTypeOpenAICodex:
+		modelsQuery := openAICodexModelsRawQuery(rawQuery)
+		resp, err := h.doWithRetry(func() (*http.Request, error) {
+			req, err := h.newProviderJSONRequest(ctx, provider, http.MethodGet, "/models", nil, nil, modelsQuery)
+			if err != nil {
+				return nil, err
+			}
+			if strings.TrimSpace(ifNoneMatch) != "" {
+				req.Header.Set("If-None-Match", ifNoneMatch)
+			}
+			return req, nil
+		})
+		if err != nil {
+			return providerModelsFetchResult{}, err
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		result := providerModelsFetchResult{etag: resp.Header.Get("ETag")}
+		if resp.StatusCode == http.StatusNotModified {
+			result.notModified = true
+			return result, nil
+		}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			return providerModelsFetchResult{}, &providerRequestError{
+				statusCode: resp.StatusCode,
+				err:        fmt.Errorf("unexpected /models status %d: %s", resp.StatusCode, string(body)),
+			}
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return providerModelsFetchResult{}, err
+		}
+
+		models, err := decodeOpenAICodexModelsFromBody(provider, body)
 		if err != nil {
 			return providerModelsFetchResult{}, err
 		}
@@ -1025,7 +1205,11 @@ func copyRawField(dst, src map[string]json.RawMessage, field string) {
 	dst[field] = append(json.RawMessage(nil), value...)
 }
 
-func decodeProviderModelsFromBody(providerID string, body []byte, excluded map[string]struct{}) ([]providerModel, error) {
+func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]providerModel, error) {
+	if provider == nil {
+		return nil, fmt.Errorf("provider is required")
+	}
+
 	var upstream struct {
 		Data []json.RawMessage `json:"data"`
 	}
@@ -1050,7 +1234,7 @@ func decodeProviderModelsFromBody(providerID string, body []byte, excluded map[s
 		if publicID == "" {
 			continue
 		}
-		if _, skip := excluded[publicID]; skip {
+		if !provider.allowsModel(publicID) {
 			continue
 		}
 
@@ -1073,7 +1257,7 @@ func decodeProviderModelsFromBody(providerID string, body []byte, excluded map[s
 		models = append(models, providerModel{
 			publicID:           publicID,
 			upstreamModel:      publicID,
-			providerID:         providerID,
+			providerID:         provider.id,
 			supportedEndpoints: supportedEndpoints,
 			disabled:           disabled,
 			raw:                mergeProviderModelRaw(raw, supportedEndpoints),
@@ -1081,6 +1265,154 @@ func decodeProviderModelsFromBody(providerID string, body []byte, excluded map[s
 	}
 
 	return models, nil
+}
+
+func decodeOpenAICodexModelsFromBody(provider *providerRuntime, body []byte) ([]providerModel, error) {
+	if provider == nil {
+		return nil, fmt.Errorf("provider is required")
+	}
+
+	var upstream struct {
+		Models []json.RawMessage `json:"models"`
+	}
+	if err := json.Unmarshal(body, &upstream); err != nil {
+		return nil, err
+	}
+
+	models := make([]providerModel, 0, len(upstream.Models))
+	seen := make(map[string]struct{}, len(upstream.Models))
+	for _, raw := range upstream.Models {
+		var parsed openAICodexModelPayload
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			continue
+		}
+
+		publicID := strings.TrimSpace(parsed.Slug)
+		if publicID == "" {
+			continue
+		}
+		if _, duplicate := seen[publicID]; duplicate {
+			continue
+		}
+		visibilityList := strings.EqualFold(strings.TrimSpace(parsed.Visibility), "list")
+		if !parsed.SupportedInAPI || !visibilityList {
+			continue
+		}
+		if !provider.allowsModel(publicID) {
+			continue
+		}
+
+		modelRaw, err := synthesizeOpenAICodexModelRaw(provider.id, parsed)
+		if err != nil {
+			return nil, err
+		}
+
+		seen[publicID] = struct{}{}
+		models = append(models, providerModel{
+			publicID:           publicID,
+			upstreamModel:      publicID,
+			providerID:         provider.id,
+			supportedEndpoints: append([]string(nil), openAICodexProviderEndpoints...),
+			raw:                modelRaw,
+		})
+	}
+
+	return models, nil
+}
+
+func synthesizeOpenAICodexModelRaw(providerID string, parsed openAICodexModelPayload) (json.RawMessage, error) {
+	reasoningEffort := make([]string, 0, len(parsed.SupportedReasoningLevels))
+	for _, level := range parsed.SupportedReasoningLevels {
+		effort := strings.TrimSpace(level.Effort)
+		if effort != "" {
+			reasoningEffort = append(reasoningEffort, effort)
+		}
+	}
+
+	name := strings.TrimSpace(parsed.DisplayName)
+	if name == "" {
+		name = strings.TrimSpace(parsed.Slug)
+	}
+
+	vision := parsed.SupportsImageDetailOriginal
+	for _, modality := range parsed.InputModalities {
+		if strings.EqualFold(strings.TrimSpace(modality), "image") {
+			vision = true
+			break
+		}
+	}
+
+	modelPickerCategory := "versatile"
+	switch {
+	case parsed.Priority <= 0:
+		modelPickerCategory = "powerful"
+	case parsed.Priority >= 8:
+		modelPickerCategory = "lightweight"
+	}
+
+	payload := map[string]interface{}{
+		"id":                    parsed.Slug,
+		"object":                "model",
+		"created":               0,
+		"owned_by":              providerID,
+		"name":                  name,
+		"supported_endpoints":   openAICodexProviderEndpoints,
+		"model_picker_enabled":  parsed.SupportedInAPI && strings.EqualFold(strings.TrimSpace(parsed.Visibility), "list"),
+		"model_picker_category": modelPickerCategory,
+		"capabilities": map[string]interface{}{
+			"limits": map[string]interface{}{
+				"max_context_window_tokens": parsed.ContextWindow,
+			},
+			"supports": map[string]interface{}{
+				"parallel_tool_calls": parsed.SupportsParallelToolCalls,
+				"reasoning_effort":    reasoningEffort,
+				"vision":              vision,
+			},
+		},
+		"slug":                           parsed.Slug,
+		"display_name":                   name,
+		"description":                    parsed.Description,
+		"visibility":                     parsed.Visibility,
+		"supported_in_api":               parsed.SupportedInAPI,
+		"priority":                       parsed.Priority,
+		"supports_reasoning_summaries":   parsed.SupportsReasoningSummaries,
+		"support_verbosity":              parsed.SupportVerbosity,
+		"supports_parallel_tool_calls":   parsed.SupportsParallelToolCalls,
+		"supports_image_detail_original": parsed.SupportsImageDetailOriginal,
+		"context_window":                 parsed.ContextWindow,
+		"input_modalities":               parsed.InputModalities,
+		"experimental_supported_tools":   parsed.ExperimentalSupportedTools,
+		"base_instructions":              parsed.BaseInstructions,
+		"shell_type":                     parsed.ShellType,
+		"default_reasoning_level":        strings.TrimSpace(parsed.DefaultReasoningLevel),
+	}
+
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal OpenAI Codex model %q for provider %q: %w", parsed.Slug, providerID, err)
+	}
+	return raw, nil
+}
+
+func openAICodexModelsRawQuery(rawQuery string) string {
+	rawQuery = strings.TrimSpace(strings.TrimPrefix(rawQuery, "?"))
+	if rawQueryHasParam(rawQuery, "client_version") {
+		return rawQuery
+	}
+	return appendQuery(rawQuery, "client_version="+url.QueryEscape(defaultOpenAICodexClientVersion))
+}
+
+func rawQueryHasParam(rawQuery, name string) bool {
+	rawQuery = strings.TrimSpace(strings.TrimPrefix(rawQuery, "?"))
+	if rawQuery == "" {
+		return false
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return strings.Contains(rawQuery, url.QueryEscape(name)+"=") || strings.Contains(rawQuery, name+"=")
+	}
+	_, ok := values[name]
+	return ok
 }
 
 func normalizeDynamicProviderEndpoints(endpoints []string) []string {
