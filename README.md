@@ -74,7 +74,7 @@ env ANTHROPIC_BASE_URL=http://localhost:1337 \
 
 ### OpenAI Codex CLI
 
-For OpenAI Codex subscription models, configure an `openai-codex` provider first; exposed IDs stay unprefixed.
+Use any public `/responses`-capable model ID exposed by your current setup. If you want the proxy to expose an OpenAI Codex subscription model, add an `openai-codex` provider first; model IDs still stay unprefixed for clients.
 
 ```bash
 env OPENAI_API_KEY=dummy \

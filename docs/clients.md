@@ -12,7 +12,7 @@ env ANTHROPIC_BASE_URL=http://localhost:1337 \
 
 ## OpenAI Codex CLI
 
-Use any public `/responses`-capable model ID exposed by your current setup. For an OpenAI Codex subscription model, first add an `openai-codex` provider with an `include_models` entry such as `gpt-5.5`; the model remains unprefixed for clients.
+Use any public `/responses`-capable model ID exposed by your current setup. If you want the proxy to expose an OpenAI Codex subscription model, add an `openai-codex` provider with an `include_models` entry such as `gpt-5.5`; the model remains unprefixed for clients.
 
 ```bash
 env OPENAI_API_KEY=dummy \
