@@ -39,11 +39,11 @@ make lint
 
 GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs lint, tests, build, vet, and e2e validation before merge.
 
-The macOS menubar app has its own workflow in [`.github/workflows/macos-app.yaml`](../.github/workflows/macos-app.yaml). It runs `scripts/macos-app-smoke.sh` on a macOS runner, which builds `Vekil.app`, validates the bundle contents, launches the app through Launch Services, verifies it stays up, and then quits it cleanly.
+The macOS tray app has its own workflow in [`.github/workflows/macos-app.yaml`](../.github/workflows/macos-app.yaml). It runs `scripts/macos-app-smoke.sh` on a macOS runner, which builds `Vekil.app`, validates the bundle contents, launches the app through Launch Services, verifies it stays up, and then quits it cleanly.
 
 ## Release
 
-Tag pushes to [`.github/workflows/release.yaml`](../.github/workflows/release.yaml) now use [`.goreleaser.yaml`](../.goreleaser.yaml) to publish the CLI binaries and checksums to GitHub Releases for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`.
+Tag pushes to [`.github/workflows/release.yaml`](../.github/workflows/release.yaml) use [`.goreleaser.yaml`](../.goreleaser.yaml) to publish the CLI binaries and checksums to GitHub Releases for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`.
 
 The same release workflow also:
 
@@ -64,6 +64,8 @@ It builds the proxy, installs Codex, Claude Code, and Gemini CLI on a GitHub-hos
 
 The smoke script starts the proxy with a non-interactive GitHub token, waits for `/readyz`, selects currently available OpenAI, Anthropic, and Gemini models from `/v1/models`, and runs one file-reading headless check per CLI using isolated temp-home config directories.
 
+This workflow is intentionally provider-specific: it exercises a live Copilot-backed deployment because zero-config startup is the simplest upstream path to run in GitHub Actions. It is useful as a real integration smoke test, but it is not the complete provider matrix for Azure OpenAI or OpenAI Codex configs.
+
 To use it:
 
 1. Create a GitHub token for a user that has GitHub Copilot access.
@@ -71,6 +73,6 @@ To use it:
 3. Save it as the repository secret `COPILOT_GITHUB_TOKEN`.
 4. Run the `Live Copilot Smoke` workflow from the Actions tab.
 
-This workflow is intentionally separate from the normal CI workflow so pull requests and forked builds remain deterministic and do not depend on Copilot credentials.
+This workflow is intentionally separate from the normal CI workflow so pull requests and forked builds remain deterministic and do not depend on live provider credentials.
 
 You can also run the same smoke script locally after building `vekil` and installing those three CLIs.

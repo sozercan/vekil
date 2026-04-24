@@ -1,5 +1,7 @@
 # Client Usage Examples
 
+These examples all target the same local proxy. Replace model IDs with public IDs from `/v1/models` in your deployment; client setup does not need to change when a model is backed by GitHub Copilot, Azure OpenAI, or OpenAI Codex.
+
 ## Claude Code
 
 ```bash
@@ -13,7 +15,7 @@ env ANTHROPIC_BASE_URL=http://localhost:1337 \
 ```bash
 env OPENAI_API_KEY=dummy \
   OPENAI_BASE_URL=http://localhost:1337/v1 \
-  codex exec --skip-git-repo-check -m gpt-5.4 "Reply with exactly PROXY_OK"
+  codex exec --skip-git-repo-check -m gpt-5.5 "Reply with exactly PROXY_OK"
 ```
 
 ## Gemini CLI
@@ -97,7 +99,7 @@ curl http://localhost:1337/v1beta/models/gemini-2.5-pro:generateContent \
 ## Gemini Stream Generate Content API
 
 ```bash
-curl http://localhost:1337/v1beta/models/gemini-2.5-pro:streamGenerateContent \
+curl -N http://localhost:1337/v1/models/gemini-2.5-pro:streamGenerateContent \
   -H "Content-Type: application/json" \
   -d '{
     "contents": [
@@ -108,6 +110,8 @@ curl http://localhost:1337/v1beta/models/gemini-2.5-pro:streamGenerateContent \
     ]
   }'
 ```
+
+`-N` disables curl buffering so SSE chunks print as they arrive. The proxy accepts Gemini routes under `/v1beta/models`, `/v1/models`, and `/models`.
 
 ## Gemini Count Tokens API
 

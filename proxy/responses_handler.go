@@ -15,7 +15,17 @@ import (
 func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
 	var headers http.Header
 
-	for _, name := range []string{"X-OpenAI-Subagent", "OpenAI-Beta", "session_id", "X-Client-Request-Id"} {
+	for _, name := range []string{
+		"X-OpenAI-Subagent",
+		"OpenAI-Beta",
+		"session_id",
+		"X-Client-Request-Id",
+		"X-Codex-Beta-Features",
+		"X-Codex-Turn-State",
+		"X-Codex-Turn-Metadata",
+		"X-Codex-Parent-Thread-Id",
+		"X-Codex-Window-Id",
+	} {
 		for _, value := range r.Header.Values(name) {
 			if trimmed := strings.TrimSpace(value); trimmed != "" {
 				if headers == nil {

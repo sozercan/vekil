@@ -241,6 +241,7 @@ EOF
     GOOGLE_GEMINI_BASE_URL="${PROXY_BASE_URL}" \
     GOOGLE_GENAI_API_VERSION=v1beta \
     GEMINI_CLI_NO_RELAUNCH=true \
+    GEMINI_CLI_TRUST_WORKSPACE=true \
     gemini \
       -m "${GEMINI_MODEL}" \
       -p "${PROMPT}" \

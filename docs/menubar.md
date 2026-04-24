@@ -1,10 +1,10 @@
-# System Tray App
+# macOS/Linux Tray App
 
-The repo includes a system tray app for running the proxy without keeping a terminal open. It supports macOS and Linux. Published macOS app bundles also include Sparkle-based update checks.
+The repo includes a tray app for running the proxy without keeping a terminal open. It supports macOS and Linux. Published macOS app bundles also include Sparkle-based update checks.
 
 ## Download And Run
 
-Install the menubar app from Homebrew:
+Install the macOS tray app from Homebrew:
 
 ```bash
 brew install --cask sozercan/repo/vekil
@@ -27,7 +27,7 @@ make build-app
 open "Vekil.app"
 ```
 
-`make build-app` downloads Sparkle 2.9.0 into `.build/sparkle/`, builds the menubar app with the `sparkle` build tag, embeds `Sparkle.framework`, and ad-hoc signs the finished app bundle.
+`make build-app` downloads Sparkle 2.9.0 into `.build/sparkle/`, builds the macOS tray app with the `sparkle` build tag, embeds `Sparkle.framework`, and ad-hoc signs the finished app bundle.
 
 If `SPARKLE_PUBLIC_ED_KEY` is not set, the app still builds, but `Check for Updates…` is disabled because Sparkle cannot start without a public EdDSA key.
 
@@ -40,7 +40,7 @@ open "Vekil.app"
 
 ## Features
 
-- start/stop toggle from the menubar
+- start/stop toggle from the tray menu
 - status icon: white robot when running, gray when stopped
 - current app version shown in the menu
 - choose and persist a `providers-config` JSON file from the menu
@@ -50,11 +50,12 @@ open "Vekil.app"
 
 ## Providers Config
 
-Use `Choose Providers Config…` from the menubar menu to select the same JSON file you would pass to the CLI with `--providers-config`.
+Use `Choose Providers Config…` from the tray menu to select the same JSON file you would pass to the CLI with `--providers-config`.
 
-- The app saves the selected path in its menubar config so it is reused on the next launch and when started at login.
-- `Use Default Copilot Routing` clears the saved path and returns to the zero-config Copilot-only behavior.
+- The app saves the selected path in its local app config so it is reused on the next launch and when started at login.
+- `Use Default Copilot Routing` clears the saved path and returns to zero-config startup, which currently uses the built-in Copilot provider.
 - If the selected config does not include a Copilot provider, the app no longer requires GitHub sign-in before starting the proxy.
+- Provider-specific extra state still comes from the normal locations, for example `~/.codex/auth.json` for `type: "openai-codex"`.
 
 ## Release Assets
 

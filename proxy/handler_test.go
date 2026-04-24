@@ -2548,6 +2548,141 @@ func TestHandleResponses_RejectsConfiguredAzureModelWithoutResponsesSupport(t *t
 	}
 }
 
+func TestHandleResponses_RoutesConfiguredOpenAICodexProvider(t *testing.T) {
+	tokens := testOpenAICodexTokens(t, time.Now().Add(time.Hour), "acct-123", true, "refresh-token")
+	codexHome := t.TempDir()
+	writeTestOpenAICodexAuth(t, codexHome, tokens)
+	t.Setenv("CODEX_HOME", codexHome)
+
+	codexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/responses" {
+			t.Fatalf("expected OpenAI Codex path /responses, got %s", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+tokens.AccessToken {
+			t.Fatalf("expected Codex Authorization header, got %q", got)
+		}
+		if got := r.Header.Get("ChatGPT-Account-ID"); got != "acct-123" {
+			t.Fatalf("expected ChatGPT-Account-ID acct-123, got %q", got)
+		}
+		if got := r.Header.Get("X-OpenAI-Fedramp"); got != "true" {
+			t.Fatalf("expected X-OpenAI-Fedramp true, got %q", got)
+		}
+		if got := r.Header.Get("X-Codex-Turn-State"); got != "sticky-turn-state" {
+			t.Fatalf("expected X-Codex-Turn-State passthrough, got %q", got)
+		}
+		if got := r.Header.Get("api-key"); got != "" {
+			t.Fatalf("expected no Azure api-key header, got %q", got)
+		}
+
+		var upstreamReq struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamReq.Model != "gpt-5.5" {
+			t.Fatalf("upstream model = %q, want gpt-5.5", upstreamReq.Model)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-codex","object":"response","status":"completed"}`))
+	}))
+	defer codexServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:      "codex",
+				Type:    "openai-codex",
+				Default: true,
+				BaseURL: codexServer.URL,
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"Hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Codex-Turn-State", "sticky-turn-state")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var responseBody struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&responseBody); err != nil {
+		t.Fatalf("decode responses body: %v", err)
+	}
+	if responseBody.ID != "resp-codex" {
+		t.Fatalf("expected OpenAI Codex response, got %+v", responseBody)
+	}
+}
+
+func TestHandleOpenAIChatCompletions_RejectsOpenAICodexProvider(t *testing.T) {
+	codexHome := t.TempDir()
+	writeTestOpenAICodexAuth(t, codexHome, testOpenAICodexTokens(t, time.Now().Add(time.Hour), "acct-123", false, "refresh-token"))
+	t.Setenv("CODEX_HOME", codexHome)
+
+	codexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("OpenAI Codex upstream should not be called for chat completions")
+	}))
+	defer codexServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:      "codex",
+				Type:    "openai-codex",
+				Default: true,
+				BaseURL: codexServer.URL,
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model": "gpt-5.5",
+		"messages": [{"role": "user", "content": "Hello"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, body)
+	}
+
+	var errResp struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if !strings.Contains(errResp.Error.Message, `provider "codex" does not support /chat/completions`) {
+		t.Fatalf("expected provider unsupported endpoint message, got %q", errResp.Error.Message)
+	}
+}
+
 func TestNewProxyHandler_FailsWhenProvidersSharePlainModelID(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 
@@ -2592,6 +2727,185 @@ func TestNewProxyHandler_FailsWhenProvidersSharePlainModelID(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "copilot") || !strings.Contains(err.Error(), "azure") {
 		t.Fatalf("expected both provider ids in error, got %v", err)
+	}
+}
+
+func TestNewProxyHandler_FailsWhenOpenAICodexModelCollidesWithAzure(t *testing.T) {
+	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+	codexHome := t.TempDir()
+	writeTestOpenAICodexAuth(t, codexHome, testOpenAICodexTokens(t, time.Now().Add(time.Hour), "acct-123", false, "refresh-token"))
+	t.Setenv("CODEX_HOME", codexHome)
+
+	codexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/models" {
+			t.Fatalf("expected /models lookup, got %s", got)
+		}
+		if got := r.URL.Query().Get("client_version"); got != defaultOpenAICodexClientVersion {
+			t.Fatalf("client_version = %q, want %q", got, defaultOpenAICodexClientVersion)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"models":[{"slug":"gpt-5.4","display_name":"GPT-5.4","visibility":"list","supported_in_api":true,"supported_reasoning_levels":[{"effort":"medium"}],"context_window":128000}]}`))
+	}))
+	defer codexServer.Close()
+
+	_, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{
+					ID:      "codex",
+					Type:    "openai-codex",
+					BaseURL: codexServer.URL,
+				},
+				{
+					ID:        "azure",
+					Type:      "azure-openai",
+					Default:   true,
+					BaseURL:   "https://example.openai.azure.com/openai/v1",
+					APIKeyEnv: "TEST_AZURE_API_KEY",
+					Models: []ProviderModelConfig{{
+						PublicID:   "gpt-5.4",
+						Deployment: "gpt-5-4-prod",
+					}},
+				},
+			},
+		}),
+	)
+	if err == nil {
+		t.Fatal("expected provider model collision error")
+	}
+	if !strings.Contains(err.Error(), "gpt-5.4") {
+		t.Fatalf("expected model id in error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "codex") || !strings.Contains(err.Error(), "azure") {
+		t.Fatalf("expected both provider ids in error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "include_models") || !strings.Contains(err.Error(), "exclude_models") {
+		t.Fatalf("expected include/exclude guidance in error, got %v", err)
+	}
+}
+
+func TestNewProxyHandler_OpenAICodexIncludeModelsAvoidsCollision(t *testing.T) {
+	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+	codexHome := t.TempDir()
+	writeTestOpenAICodexAuth(t, codexHome, testOpenAICodexTokens(t, time.Now().Add(time.Hour), "acct-123", false, "refresh-token"))
+	t.Setenv("CODEX_HOME", codexHome)
+
+	codexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"models":[
+				{"slug":"gpt-5.4","display_name":"GPT-5.4","visibility":"list","supported_in_api":true},
+				{"slug":"gpt-5.5","display_name":"GPT-5.5","visibility":"list","supported_in_api":true,"supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"}],"supports_parallel_tool_calls":true,"context_window":272000,"input_modalities":["text","image"],"priority":0}
+			]}`))
+		default:
+			t.Fatalf("unexpected OpenAI Codex path %q", r.URL.Path)
+		}
+	}))
+	defer codexServer.Close()
+
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/openai/v1/models" {
+			t.Fatalf("unexpected Azure path %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer azureServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{
+					ID:            "codex",
+					Type:          "openai-codex",
+					BaseURL:       codexServer.URL,
+					IncludeModels: []string{"gpt-5.5"},
+				},
+				{
+					ID:        "azure",
+					Type:      "azure-openai",
+					Default:   true,
+					BaseURL:   azureServer.URL + "/openai/v1",
+					APIKeyEnv: "TEST_AZURE_API_KEY",
+					Models: []ProviderModelConfig{{
+						PublicID:   "gpt-5.4",
+						Deployment: "gpt-5-4-prod",
+						Endpoints:  []string{"/responses"},
+					}},
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	handler.HandleModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Data []struct {
+			ID                 string   `json:"id"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
+		} `json:"data"`
+		Models []struct {
+			Slug                      string  `json:"slug"`
+			DefaultReasoningLevel     *string `json:"default_reasoning_level,omitempty"`
+			SupportsParallelToolCalls bool    `json:"supports_parallel_tool_calls"`
+			ContextWindow             *int64  `json:"context_window,omitempty"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+
+	ids := make(map[string][]string)
+	for _, model := range result.Data {
+		ids[model.ID] = model.SupportedEndpoints
+	}
+	if _, ok := ids["gpt-5.4"]; !ok {
+		t.Fatalf("expected Azure model gpt-5.4 in merged catalog, got %+v", ids)
+	}
+	if endpoints, ok := ids["gpt-5.5"]; !ok {
+		t.Fatalf("expected OpenAI Codex model gpt-5.5 in merged catalog, got %+v", ids)
+	} else if got := strings.Join(endpoints, ","); got != "/responses" {
+		t.Fatalf("expected gpt-5.5 responses-only endpoint, got %q", got)
+	}
+
+	var codexModel *struct {
+		Slug                      string  `json:"slug"`
+		DefaultReasoningLevel     *string `json:"default_reasoning_level,omitempty"`
+		SupportsParallelToolCalls bool    `json:"supports_parallel_tool_calls"`
+		ContextWindow             *int64  `json:"context_window,omitempty"`
+	}
+	for i := range result.Models {
+		if result.Models[i].Slug == "gpt-5.5" {
+			codexModel = &result.Models[i]
+			break
+		}
+	}
+	if codexModel == nil {
+		t.Fatalf("expected Codex model metadata for gpt-5.5, got %+v", result.Models)
+	}
+	if codexModel.DefaultReasoningLevel == nil || *codexModel.DefaultReasoningLevel != "medium" {
+		t.Fatalf("expected default reasoning medium, got %v", codexModel.DefaultReasoningLevel)
+	}
+	if !codexModel.SupportsParallelToolCalls {
+		t.Fatal("expected supports_parallel_tool_calls true")
+	}
+	if codexModel.ContextWindow == nil || *codexModel.ContextWindow != 272000 {
+		t.Fatalf("expected context_window 272000, got %v", codexModel.ContextWindow)
 	}
 }
 

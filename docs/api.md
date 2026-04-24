@@ -2,7 +2,7 @@
 
 ## `POST /v1/messages` (Anthropic)
 
-Anthropic Messages compatibility for the supported content and tool subset. Requests are translated to OpenAI Chat Completions, forwarded upstream, and translated back to Anthropic.
+Anthropic Messages compatibility for the supported content and tool subset. Requests are translated to OpenAI Chat Completions, routed through the provider that owns the selected public model, and translated back to Anthropic.
 
 Supported features:
 
@@ -18,9 +18,9 @@ Model normalization:
 - dated suffixes are stripped automatically, for example `claude-sonnet-4-20250514`
 - hyphenated version numbers are mapped to dotted form, for example `claude-sonnet-4-5` to `claude-sonnet-4.5`
 
-### `GET /v1/models`
+## `GET /v1/models`
 
-The proxy builds a merged model catalog across the configured providers. It preserves the OpenAI-style `data` payload and also adds a Codex-compatible top-level `models` array.
+The proxy builds a merged model catalog across the active providers. It preserves the OpenAI-style `data` payload and also adds a Codex-compatible top-level `models` array.
 
 ```bash
 curl http://localhost:1337/v1/models
@@ -31,36 +31,16 @@ When multiple providers are configured:
 - public model IDs stay unprefixed, for example `gpt-5.4`
 - each public ID must be owned by exactly one provider
 - startup fails if providers collide on the same model ID
-- Azure OpenAI deployments can be exposed under a different public ID while the proxy rewrites the upstream `model` field
+- dynamic providers such as Copilot or OpenAI Codex can be narrowed with `include_models` or `exclude_models`
+- static providers such as Azure OpenAI can expose a deployment under a different public ID while the proxy rewrites the upstream `model` field
 
-Example IDs in recent upstream responses have included:
+The exact catalog depends on your configured providers and current upstream availability. Query `/v1/models` in your own deployment instead of hard-coding one global model list.
 
-- `gpt-4o`
-- `gpt-4.1`
-- `gpt-5-mini`
-- `gpt-5.1`
-- `gpt-5.1-codex`
-- `gpt-5.1-codex-mini`
-- `gpt-5.1-codex-max`
-- `gpt-5.2`
-- `gpt-5.2-codex`
-- `gpt-5.3-codex`
-- `gpt-5.4`
-- `claude-haiku-4.5`
-- `claude-sonnet-4`
-- `claude-sonnet-4.5`
-- `claude-sonnet-4.6`
-- `claude-opus-4.5`
-- `claude-opus-4.6`
-- `claude-opus-4.6-1m`
-- `gemini-2.5-pro`
-- `gemini-3-pro-preview`
-- `gemini-3-flash-preview`
-- `gemini-3.1-pro-preview`
+## `POST /v1beta/models/{model}:generateContent`, `POST /v1/models/{model}:generateContent`, and `POST /models/{model}:generateContent` (Gemini)
 
-## `POST /v1beta/models/{model}:generateContent` and `POST /models/{model}:generateContent` (Gemini)
+The proxy accepts all three Gemini route prefixes: `/v1beta/models/{model}:...`, `/v1/models/{model}:...`, and `/models/{model}:...`.
 
-Gemini is implemented as a translation layer, not a zero-copy passthrough layer. Gemini requests are translated to OpenAI Chat Completions, sent upstream, and translated back into Gemini responses.
+Gemini is implemented as a translation layer, not a zero-copy passthrough layer. Gemini requests are translated to OpenAI Chat Completions, routed through the provider that owns the selected public model, and translated back into Gemini responses.
 
 The decoder accepts both standard Gemini camelCase fields and LiteLLM-style snake_case aliases such as `system_instruction`, `function_declarations`, `inline_data`, `max_output_tokens`, and `response_json_schema`.
 
@@ -99,9 +79,22 @@ Explicit `501 UNIMPLEMENTED` cases include:
 
 Validation failures (`400 INVALID_ARGUMENT`) include path/body model mismatches, malformed content parts, invalid function-call history, and unmatched `functionResponse` parts.
 
-## `POST /v1beta/models/{model}:countTokens` and `POST /models/{model}:countTokens` (Gemini)
+## `POST /v1beta/models/{model}:streamGenerateContent`, `POST /v1/models/{model}:streamGenerateContent`, and `POST /models/{model}:streamGenerateContent` (Gemini)
 
-`countTokens` normalizes the Gemini request into the same prompt/tool payload used by `generateContent`, performs a minimal upstream `/chat/completions` probe, and returns `usage.prompt_tokens` as Gemini `totalTokens`. Normalized requests are cached for 60 seconds.
+`streamGenerateContent` uses the same request body, translation rules, and validation behavior as `generateContent`, but returns data-only SSE frames instead of a single JSON response.
+
+Streaming behavior:
+
+- each SSE `data:` frame contains a partial Gemini `GenerateContentResponse` payload
+- text deltas are emitted as Gemini `candidates[].content.parts[].text` parts
+- tool calls are buffered until the proxy has valid JSON arguments, then emitted as Gemini `functionCall` parts
+- a final frame can include Gemini `finishReason` and `usageMetadata`
+
+Use `curl -N` or another SSE-capable client so streamed frames are not buffered locally.
+
+## `POST /v1beta/models/{model}:countTokens`, `POST /v1/models/{model}:countTokens`, and `POST /models/{model}:countTokens` (Gemini)
+
+`countTokens` uses the same accepted route prefixes as the other Gemini compatibility routes. It normalizes the Gemini request into the same prompt/tool payload used by `generateContent`, performs a minimal upstream `/chat/completions` probe, and returns `usage.prompt_tokens` as Gemini `totalTokens`. Normalized requests are cached for 60 seconds.
 
 ## `POST /v1/chat/completions` (OpenAI)
 
@@ -109,7 +102,7 @@ Near zero-copy passthrough for requests without tools. When tools are present, t
 
 When provider routing is configured, the request is routed by the public `model` ID. If the selected provider uses a different upstream model or deployment name, the proxy rewrites the outgoing `model` field before forwarding.
 
-The proxy also enforces the model's configured `supported_endpoints` before forwarding. If a model is exposed as `/responses`-only, `POST /v1/chat/completions` fails fast with `400` instead of probing an unsupported upstream route. The Azure `gpt-5.4-pro` example configuration is set up this way.
+The proxy also enforces the model's configured `supported_endpoints` before forwarding. If a model is exposed as `/responses`-only, `POST /v1/chat/completions` fails fast with `400` instead of probing an unsupported upstream route. The Azure `gpt-5.4-pro` example configuration and OpenAI Codex subscription models are set up this way.
 
 ## `POST /v1/responses` and `GET /v1/responses` (OpenAI)
 
