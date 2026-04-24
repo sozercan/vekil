@@ -2,6 +2,7 @@ BINARY := vekil
 LDFLAGS := -s -w
 APP_NAME := Vekil.app
 APP_BUNDLE_ID := com.vekil.menubar
+APP_ICON := assets/macos/Vekil.icns
 VERSION ?= dev-$(shell git rev-parse --short HEAD)
 APP_VERSION := $(patsubst v%,%,$(VERSION))
 APP_CGO_LDFLAGS = -F$(abspath $(SPARKLE_UNPACK_DIR)) -Wl,-rpath,@executable_path/../Frameworks
@@ -36,6 +37,7 @@ build-app: $(SPARKLE_FRAMEWORK)
 	CGO_ENABLED=1 CGO_LDFLAGS="$(APP_CGO_LDFLAGS)" \
 		go build -tags sparkle -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o "$(APP_NAME)/Contents/MacOS/vekil-menubar" ./cmd/menubar/
 	otool -l "$(APP_NAME)/Contents/MacOS/vekil-menubar" | grep -q '@executable_path/../Frameworks'
+	cp "$(APP_ICON)" "$(APP_NAME)/Contents/Resources/Vekil.icns"
 	ditto "$(SPARKLE_FRAMEWORK)" "$(APP_NAME)/Contents/Frameworks/Sparkle.framework"
 	@printf '<?xml version="1.0" encoding="UTF-8"?>\n\
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n\
@@ -45,6 +47,8 @@ build-app: $(SPARKLE_FRAMEWORK)
 	<string>vekil-menubar</string>\n\
 	<key>CFBundleIdentifier</key>\n\
 	<string>$(APP_BUNDLE_ID)</string>\n\
+	<key>CFBundleIconFile</key>\n\
+	<string>Vekil.icns</string>\n\
 	<key>CFBundleName</key>\n\
 	<string>Vekil</string>\n\
 	<key>CFBundlePackageType</key>\n\
@@ -75,10 +79,12 @@ build-app: $(SPARKLE_FRAMEWORK)
 test-app: build-app
 	test -x "$(APP_NAME)/Contents/MacOS/vekil-menubar"
 	test -f "$(APP_NAME)/Contents/Info.plist"
+	test -f "$(APP_NAME)/Contents/Resources/Vekil.icns"
 	test -d "$(APP_NAME)/Contents/Frameworks/Sparkle.framework"
 	plutil -lint "$(APP_NAME)/Contents/Info.plist"
 	/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$(APP_NAME)/Contents/Info.plist" | grep -Fxq 'vekil-menubar'
 	/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$(APP_NAME)/Contents/Info.plist" | grep -Fxq '$(APP_BUNDLE_ID)'
+	/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$(APP_NAME)/Contents/Info.plist" | grep -Fxq 'Vekil.icns'
 	/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$(APP_NAME)/Contents/Info.plist" | grep -Fxq '$(APP_VERSION)'
 	/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$(APP_NAME)/Contents/Info.plist" | grep -Fxq 'true'
 	/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$(APP_NAME)/Contents/Info.plist" | grep -Fxq '$(SPARKLE_FEED_URL)'
