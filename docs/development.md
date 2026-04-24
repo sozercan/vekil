@@ -39,6 +39,10 @@ make lint
 
 GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs lint, tests, build, vet, and e2e validation before merge.
 
+Safe Dependabot updates are handled by [`.github/workflows/dependabot-auto-merge.yaml`](../.github/workflows/dependabot-auto-merge.yaml). It listens for Dependabot pull request lifecycle events, skips drafts and pull requests with requested changes, and auto-approves plus enables auto-merge for semver patch/minor updates.
+
+For that workflow to work, the repository must allow GitHub Actions to create and approve pull requests in Actions settings, and it must also have auto-merge enabled in the repository settings.
+
 The macOS menubar app has its own workflow in [`.github/workflows/macos-app.yaml`](../.github/workflows/macos-app.yaml). It runs `scripts/macos-app-smoke.sh` on a macOS runner, which builds `Vekil.app`, validates the bundle contents, launches the app through Launch Services, verifies it stays up, and then quits it cleanly.
 
 ## Release
