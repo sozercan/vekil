@@ -36,7 +36,9 @@ When multiple providers are configured:
 
 The exact catalog depends on your configured providers and current upstream availability. Query `/v1/models` in your own deployment instead of hard-coding one global model list.
 
-## `POST /v1beta/models/{model}:generateContent` and `POST /models/{model}:generateContent` (Gemini)
+## `POST /v1beta/models/{model}:generateContent`, `POST /v1/models/{model}:generateContent`, and `POST /models/{model}:generateContent` (Gemini)
+
+The proxy accepts all three Gemini route prefixes: `/v1beta/models/{model}:...`, `/v1/models/{model}:...`, and `/models/{model}:...`.
 
 Gemini is implemented as a translation layer, not a zero-copy passthrough layer. Gemini requests are translated to OpenAI Chat Completions, routed through the provider that owns the selected public model, and translated back into Gemini responses.
 
@@ -77,9 +79,22 @@ Explicit `501 UNIMPLEMENTED` cases include:
 
 Validation failures (`400 INVALID_ARGUMENT`) include path/body model mismatches, malformed content parts, invalid function-call history, and unmatched `functionResponse` parts.
 
-## `POST /v1beta/models/{model}:countTokens` and `POST /models/{model}:countTokens` (Gemini)
+## `POST /v1beta/models/{model}:streamGenerateContent`, `POST /v1/models/{model}:streamGenerateContent`, and `POST /models/{model}:streamGenerateContent` (Gemini)
 
-`countTokens` normalizes the Gemini request into the same prompt/tool payload used by `generateContent`, performs a minimal upstream `/chat/completions` probe, and returns `usage.prompt_tokens` as Gemini `totalTokens`. Normalized requests are cached for 60 seconds.
+`streamGenerateContent` uses the same request body, translation rules, and validation behavior as `generateContent`, but returns data-only SSE frames instead of a single JSON response.
+
+Streaming behavior:
+
+- each SSE `data:` frame contains a partial Gemini `GenerateContentResponse` payload
+- text deltas are emitted as Gemini `candidates[].content.parts[].text` parts
+- tool calls are buffered until the proxy has valid JSON arguments, then emitted as Gemini `functionCall` parts
+- a final frame can include Gemini `finishReason` and `usageMetadata`
+
+Use `curl -N` or another SSE-capable client so streamed frames are not buffered locally.
+
+## `POST /v1beta/models/{model}:countTokens`, `POST /v1/models/{model}:countTokens`, and `POST /models/{model}:countTokens` (Gemini)
+
+`countTokens` uses the same accepted route prefixes as the other Gemini compatibility routes. It normalizes the Gemini request into the same prompt/tool payload used by `generateContent`, performs a minimal upstream `/chat/completions` probe, and returns `usage.prompt_tokens` as Gemini `totalTokens`. Normalized requests are cached for 60 seconds.
 
 ## `POST /v1/chat/completions` (OpenAI)
 

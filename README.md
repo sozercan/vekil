@@ -5,7 +5,7 @@ High-performance Go proxy that exposes Anthropic, Gemini, and OpenAI-compatible 
 ## What It Supports
 
 - Anthropic Messages API
-- Gemini Generate Content and Count Tokens APIs
+- Gemini Generate Content, Stream Generate Content, and Count Tokens APIs
 - OpenAI Chat Completions API
 - OpenAI Responses API, including Codex websocket bridging
 - Multi-provider model routing across GitHub Copilot, Azure OpenAI, and OpenAI Codex
@@ -26,7 +26,7 @@ docker run -p 1337:1337 \
 
 For explicit provider routing, start the proxy with `--providers-config /path/to/providers.json`.
 
-On Apple Silicon Macs, you can also use the native menubar app.
+On Apple Silicon Macs, you can also use the native macOS tray app.
 
 ```bash
 brew install --cask sozercan/repo/vekil
@@ -38,12 +38,14 @@ brew install --cask sozercan/repo/vekil
 > xattr -cr /Applications/Vekil.app
 > ```
 
-Manual downloads still work through the `vekil-macos-arm64.zip` asset on [GitHub Releases](https://github.com/sozercan/vekil/releases/latest). See [macOS Menubar App](docs/menubar.md).
+Manual downloads still work through the `vekil-macos-arm64.zip` asset on [GitHub Releases](https://github.com/sozercan/vekil/releases/latest). See [Tray App (macOS/Linux)](docs/menubar.md).
 
 Depending on your active providers:
 
 - Copilot-backed setups start GitHub's device code flow on first run.
 - OpenAI Codex setups require `codex login` so `~/.codex/auth.json` exists.
+
+If you run an `openai-codex` provider inside Docker, mount your Codex home into the same in-container path referenced by `CODEX_HOME` (default `/home/nonroot/.codex`).
 
 For provider configuration, model routing, and provider-specific auth details, see [Getting Started](docs/getting-started.md) and [Configuration](docs/configuration.md).
 
@@ -57,7 +59,7 @@ The full documentation now lives under [`docs/`](docs/README.md) in smaller, top
 - [Client Usage Examples](docs/clients.md)
 - [API Reference](docs/api.md)
 - [Architecture](docs/architecture.md)
-- [macOS Menubar App](docs/menubar.md)
+- [Tray App (macOS/Linux)](docs/menubar.md)
 - [Development](docs/development.md)
 
 ## Common Client Setup

@@ -11,7 +11,7 @@ Download the latest binary for your platform from [GitHub Releases](https://gith
 
 Published binaries are available for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`. Windows release assets are published as `.exe` binaries. After downloading, make the binary executable if needed and run it locally.
 
-On Apple Silicon Macs, you can use the native menubar app:
+On Apple Silicon Macs, you can use the native macOS tray app:
 
 ```bash
 brew install --cask sozercan/repo/vekil
@@ -23,7 +23,7 @@ brew install --cask sozercan/repo/vekil
 > xattr -cr /Applications/Vekil.app
 > ```
 
-GitHub Releases also includes a `vekil-macos-arm64.zip` menubar app bundle if you prefer a manual download.
+GitHub Releases also includes a `vekil-macos-arm64.zip` tray app bundle if you prefer a manual download.
 
 ## Build From Source
 
@@ -59,6 +59,18 @@ If your provider config includes `type: "openai-codex"`, also mount the Codex ho
 docker run -p 1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   -v ~/.codex:/home/nonroot/.codex:ro \
+  -v /path/to/providers.json:/config/providers.json:ro \
+  ghcr.io/sozercan/vekil:latest \
+  --providers-config /config/providers.json
+```
+
+If you customize `CODEX_HOME`, remember that the container reads the container-side path, not your host path. Mount your host Codex directory to the same path you set in `CODEX_HOME`, for example:
+
+```bash
+docker run -p 1337:1337 \
+  -e CODEX_HOME=/codex-home \
+  -v ~/.config/vekil:/home/nonroot/.config/vekil \
+  -v /path/to/custom-codex-home:/codex-home:ro \
   -v /path/to/providers.json:/config/providers.json:ro \
   ghcr.io/sozercan/vekil:latest \
   --providers-config /config/providers.json
@@ -108,6 +120,22 @@ Azure OpenAI credentials are configured per provider entry, usually with `api_ke
 
 When your providers config includes `type: "openai-codex"`, first sign in with the OpenAI Codex CLI using ChatGPT auth so `~/.codex/auth.json` exists. The proxy reads that file directly and refreshes the access token as needed.
 
-Codex API-key auth and OS keychain-backed credentials are not read by the proxy. If your Codex home is not `~/.codex`, set `CODEX_HOME` before starting the proxy.
+Codex API-key auth and OS keychain-backed credentials are not read by the proxy. If your Codex home is not `~/.codex`, set `CODEX_HOME` before starting the proxy. In Docker, `CODEX_HOME` is resolved inside the container, so your bind mount target must match the in-container `CODEX_HOME` path.
 
 If your provider config does not include Copilot, startup skips GitHub authentication entirely. See [configuration.md](configuration.md) for provider routing examples and provider-specific knobs.
+
+## Verify The Proxy Is Up
+
+After the proxy is running and any first-run authentication has completed, check the basic health and model endpoints:
+
+```bash
+curl http://localhost:1337/healthz
+curl http://localhost:1337/readyz
+curl http://localhost:1337/v1/models
+```
+
+What each endpoint tells you:
+
+- `/healthz` confirms the process is listening and serving HTTP. It should return `{"status":"ok"}`.
+- `/readyz` verifies the proxy can authenticate to and probe the configured upstream providers. It should return `{"status":"ready"}`; `503` usually means auth or upstream reachability still needs attention.
+- `/v1/models` shows the merged public model catalog that clients will see. Use it to confirm the models you expect are actually exposed before testing a client.

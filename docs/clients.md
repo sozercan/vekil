@@ -101,7 +101,7 @@ curl http://localhost:1337/v1beta/models/gemini-2.5-pro:generateContent \
 ## Gemini Stream Generate Content API
 
 ```bash
-curl http://localhost:1337/v1beta/models/gemini-2.5-pro:streamGenerateContent \
+curl -N http://localhost:1337/v1/models/gemini-2.5-pro:streamGenerateContent \
   -H "Content-Type: application/json" \
   -d '{
     "contents": [
@@ -112,6 +112,8 @@ curl http://localhost:1337/v1beta/models/gemini-2.5-pro:streamGenerateContent \
     ]
   }'
 ```
+
+`-N` disables curl buffering so SSE chunks print as they arrive. The proxy accepts Gemini routes under `/v1beta/models`, `/v1/models`, and `/models`.
 
 ## Gemini Count Tokens API
 
