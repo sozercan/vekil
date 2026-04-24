@@ -385,7 +385,10 @@ func extractResponsesOutputText(body []byte) (string, error) {
 }
 
 func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint string, injectResumePrompt bool) []byte {
-	if rewrittenBody, strippedFields := stripUnsupportedResponsesRequestFields(bodyBytes); len(strippedFields) > 0 {
+	requestedModel := extractResponsesRequestModel(bodyBytes)
+	provider, _, _ := h.resolveProviderModel(requestedModel, "/responses")
+
+	if rewrittenBody, strippedFields := stripUnsupportedResponsesRequestFields(bodyBytes, provider); len(strippedFields) > 0 {
 		bodyBytes = rewrittenBody
 		h.log.Debug("stripped unsupported responses request fields",
 			logger.F("endpoint", endpoint),
@@ -416,8 +419,110 @@ func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint st
 	return bodyBytes
 }
 
-func stripUnsupportedResponsesRequestFields(bodyBytes []byte) ([]byte, []string) {
-	return bodyBytes, nil
+func stripUnsupportedResponsesRequestFields(bodyBytes []byte, provider *providerRuntime) ([]byte, []string) {
+	if provider == nil {
+		return bodyBytes, nil
+	}
+
+	unsupportedToolTypes := unsupportedResponsesToolTypes(provider)
+	if len(unsupportedToolTypes) == 0 {
+		return bodyBytes, nil
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+		return bodyBytes, nil
+	}
+
+	rawTools, ok := payload["tools"]
+	if !ok {
+		return bodyBytes, nil
+	}
+
+	var tools []json.RawMessage
+	if err := json.Unmarshal(rawTools, &tools); err != nil {
+		return bodyBytes, nil
+	}
+
+	filteredTools := make([]json.RawMessage, 0, len(tools))
+	strippedFields := make([]string, 0, len(tools)+1)
+	strippedToolTypes := make(map[string]struct{})
+	for i, rawTool := range tools {
+		toolType := responsesToolType(rawTool)
+		if _, unsupported := unsupportedToolTypes[toolType]; unsupported {
+			strippedFields = append(strippedFields, fmt.Sprintf("tools[%d]", i))
+			strippedToolTypes[toolType] = struct{}{}
+			continue
+		}
+		filteredTools = append(filteredTools, rawTool)
+	}
+
+	if len(strippedFields) == 0 {
+		return bodyBytes, nil
+	}
+
+	rewrittenTools, err := json.Marshal(filteredTools)
+	if err != nil {
+		return bodyBytes, nil
+	}
+	payload["tools"] = rewrittenTools
+
+	if rawToolChoice, ok := payload["tool_choice"]; ok {
+		if _, stripped := stripUnsupportedResponsesToolChoice(rawToolChoice, len(filteredTools) == 0, strippedToolTypes); stripped {
+			delete(payload, "tool_choice")
+			strippedFields = append(strippedFields, "tool_choice")
+		}
+	}
+
+	rewrittenBody, err := json.Marshal(payload)
+	if err != nil {
+		return bodyBytes, nil
+	}
+
+	return rewrittenBody, strippedFields
+}
+
+func unsupportedResponsesToolTypes(provider *providerRuntime) map[string]struct{} {
+	if provider == nil {
+		return nil
+	}
+
+	switch provider.kind {
+	case providerTypeCopilot, providerTypeAzureOpenAI:
+		return map[string]struct{}{
+			"image_generation": {},
+		}
+	default:
+		return nil
+	}
+}
+
+func responsesToolType(rawTool json.RawMessage) string {
+	var tool struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(rawTool, &tool); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(tool.Type)
+}
+
+func stripUnsupportedResponsesToolChoice(rawToolChoice json.RawMessage, noRemainingTools bool, strippedToolTypes map[string]struct{}) (json.RawMessage, bool) {
+	if noRemainingTools {
+		return nil, true
+	}
+
+	var toolChoiceString string
+	if err := json.Unmarshal(rawToolChoice, &toolChoiceString); err == nil {
+		return rawToolChoice, false
+	}
+
+	toolType := responsesToolType(rawToolChoice)
+	if _, unsupported := strippedToolTypes[toolType]; unsupported {
+		return nil, true
+	}
+
+	return rawToolChoice, false
 }
 
 func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, bodyBytes []byte, extraHeaders http.Header) (*http.Response, error) {

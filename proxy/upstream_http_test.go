@@ -135,6 +135,141 @@ func TestResolveProviderRequest_RejectsKnownModelWithoutEndpointSupport(t *testi
 	}
 }
 
+func TestResponsesRequestRewriting_StripsUnsupportedImageGenerationToolForAzure(t *testing.T) {
+	handler := newProviderRoutingTestHandler(t, []string{"/responses"})
+	originalBody := []byte(`{"model":"gpt-5-public","input":"hello","tools":[{"type":"function","name":"lookup_weather","description":"Lookup the weather","parameters":{"type":"object","properties":{}}},{"type":"image_generation"}],"tool_choice":"auto"}`)
+
+	rewrittenForResponses := handler.rewriteResponsesRequestBody(originalBody, "responses", true)
+	provider, rewrittenBody, err := handler.resolveProviderRequest(rewrittenForResponses, "/responses")
+	if err != nil {
+		t.Fatalf("resolveProviderRequest() error = %v", err)
+	}
+	if provider == nil {
+		t.Fatal("resolveProviderRequest() provider = nil, want azure provider")
+	}
+	if provider.kind != providerTypeAzureOpenAI {
+		t.Fatalf("resolveProviderRequest() provider.kind = %q, want %q", provider.kind, providerTypeAzureOpenAI)
+	}
+	if got := extractResponsesRequestModel(rewrittenBody); got != "gpt-5-4-prod" {
+		t.Fatalf("rewritten model = %q, want gpt-5-4-prod", got)
+	}
+
+	payload := decodeResponsesRequestPayload(t, rewrittenBody)
+	tools := decodeResponsesRequestTools(t, payload)
+	if len(tools) != 1 {
+		t.Fatalf("len(tools) = %d, want 1 after stripping unsupported tools", len(tools))
+	}
+	if tools[0].Type != "function" {
+		t.Fatalf("tools[0].Type = %q, want function", tools[0].Type)
+	}
+	if tools[0].Name != "lookup_weather" {
+		t.Fatalf("tools[0].Name = %q, want lookup_weather", tools[0].Name)
+	}
+
+	rawToolChoice, ok := payload["tool_choice"]
+	if !ok {
+		t.Fatal("rewritten payload missing tool_choice")
+	}
+	var toolChoice string
+	if err := json.Unmarshal(rawToolChoice, &toolChoice); err != nil {
+		t.Fatalf("json.Unmarshal(tool_choice) error = %v", err)
+	}
+	if toolChoice != "auto" {
+		t.Fatalf("tool_choice = %q, want auto", toolChoice)
+	}
+}
+
+func TestResponsesRequestRewriting_StripsUnsupportedImageGenerationToolForDefaultCopilot(t *testing.T) {
+	handler := newTestProxyHandler(t, func(http.ResponseWriter, *http.Request) {})
+	originalBody := []byte(`{"model":"gpt-5.4","input":"hello","tools":[{"type":"image_generation"}],"tool_choice":"required"}`)
+
+	rewrittenForResponses := handler.rewriteResponsesRequestBody(originalBody, "responses", true)
+	provider, rewrittenBody, err := handler.resolveProviderRequest(rewrittenForResponses, "/responses")
+	if err != nil {
+		t.Fatalf("resolveProviderRequest() error = %v", err)
+	}
+	if provider == nil {
+		t.Fatal("resolveProviderRequest() provider = nil, want default copilot provider")
+	}
+	if provider.kind != providerTypeCopilot {
+		t.Fatalf("resolveProviderRequest() provider.kind = %q, want %q", provider.kind, providerTypeCopilot)
+	}
+	if provider.id != "copilot" {
+		t.Fatalf("resolveProviderRequest() provider.id = %q, want copilot", provider.id)
+	}
+	if got := extractResponsesRequestModel(rewrittenBody); got != "gpt-5.4" {
+		t.Fatalf("rewritten model = %q, want gpt-5.4", got)
+	}
+
+	payload := decodeResponsesRequestPayload(t, rewrittenBody)
+	tools := decodeResponsesRequestTools(t, payload)
+	if len(tools) != 0 {
+		t.Fatalf("len(tools) = %d, want 0 after stripping unsupported tools", len(tools))
+	}
+	if _, ok := payload["tool_choice"]; ok {
+		t.Fatalf("rewritten payload unexpectedly retained tool_choice: %s", payload["tool_choice"])
+	}
+}
+
+func TestResponsesRequestRewriting_StripsUnsupportedImageGenerationToolChoiceForAzure(t *testing.T) {
+	handler := newProviderRoutingTestHandler(t, []string{"/responses"})
+	originalBody := []byte(`{"model":"gpt-5-public","input":"hello","tools":[{"type":"function","name":"lookup_weather","description":"Lookup the weather","parameters":{"type":"object","properties":{}}},{"type":"image_generation"}],"tool_choice":{"type":"image_generation"}}`)
+
+	rewrittenForResponses := handler.rewriteResponsesRequestBody(originalBody, "responses", true)
+	provider, rewrittenBody, err := handler.resolveProviderRequest(rewrittenForResponses, "/responses")
+	if err != nil {
+		t.Fatalf("resolveProviderRequest() error = %v", err)
+	}
+	if provider == nil {
+		t.Fatal("resolveProviderRequest() provider = nil, want azure provider")
+	}
+	if provider.kind != providerTypeAzureOpenAI {
+		t.Fatalf("resolveProviderRequest() provider.kind = %q, want %q", provider.kind, providerTypeAzureOpenAI)
+	}
+
+	payload := decodeResponsesRequestPayload(t, rewrittenBody)
+	tools := decodeResponsesRequestTools(t, payload)
+	if len(tools) != 1 {
+		t.Fatalf("len(tools) = %d, want 1 after stripping unsupported tools", len(tools))
+	}
+	if tools[0].Type != "function" {
+		t.Fatalf("tools[0].Type = %q, want function", tools[0].Type)
+	}
+	if _, ok := payload["tool_choice"]; ok {
+		t.Fatalf("rewritten payload unexpectedly retained tool_choice: %s", payload["tool_choice"])
+	}
+}
+
+type responsesRequestTool struct {
+	Type string `json:"type"`
+	Name string `json:"name"`
+}
+
+func decodeResponsesRequestPayload(t *testing.T, body []byte) map[string]json.RawMessage {
+	t.Helper()
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("json.Unmarshal(body) error = %v", err)
+	}
+	return payload
+}
+
+func decodeResponsesRequestTools(t *testing.T, payload map[string]json.RawMessage) []responsesRequestTool {
+	t.Helper()
+
+	rawTools, ok := payload["tools"]
+	if !ok {
+		return nil
+	}
+
+	var tools []responsesRequestTool
+	if err := json.Unmarshal(rawTools, &tools); err != nil {
+		t.Fatalf("json.Unmarshal(tools) error = %v", err)
+	}
+	return tools
+}
+
 func TestRewriteRequestModelForProvider_RewritesGenericJSONModelAndNoopsWhenUnchanged(t *testing.T) {
 	originalBody := []byte(`{"model":"gpt-5-public","messages":[{"role":"user","content":"hello"}]}`)
 
