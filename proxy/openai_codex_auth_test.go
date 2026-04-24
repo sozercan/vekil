@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -263,6 +264,145 @@ func TestOpenAICodexAuthCredentialsRefreshesExpiredToken(t *testing.T) {
 	}
 	if state.lastRefresh.Before(before) || state.lastRefresh.After(after) {
 		t.Fatalf("last_refresh = %v, want between %v and %v", state.lastRefresh, before, after)
+	}
+}
+
+func TestOpenAICodexAuthCredentialsSharesRefreshAcrossInstances(t *testing.T) {
+	oldTokens := testOpenAICodexTokens(t, time.Now().Add(-time.Hour), "acct-123", false, "old-refresh")
+	newAccessToken := testOpenAICodexJWT(t, map[string]interface{}{"exp": time.Now().Add(time.Hour).Unix()})
+	newIDToken := testOpenAICodexJWT(t, map[string]interface{}{
+		"https://api.openai.com/auth": map[string]interface{}{
+			"chatgpt_account_id":         "acct-123",
+			"chatgpt_account_is_fedramp": true,
+		},
+	})
+
+	var refreshCalls atomic.Int32
+	firstRequestSeen := make(chan struct{})
+	allowFirstResponse := make(chan struct{}, 1)
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := refreshCalls.Add(1)
+		if call == 1 {
+			close(firstRequestSeen)
+			<-allowFirstResponse
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  newAccessToken,
+			"id_token":      newIDToken,
+			"refresh_token": "new-refresh",
+		})
+	}))
+	defer refreshServer.Close()
+	t.Setenv(openAICodexRefreshURLEnv, refreshServer.URL)
+
+	authPath := writeTestOpenAICodexAuth(t, t.TempDir(), oldTokens)
+	authA := &openAICodexAuth{path: authPath}
+	authB := &openAICodexAuth{path: authPath}
+
+	type result struct {
+		credentials openAICodexCredentials
+		err         error
+	}
+	results := make(chan result, 2)
+
+	go func() {
+		credentials, err := authA.credentials(context.Background(), refreshServer.Client())
+		results <- result{credentials: credentials, err: err}
+	}()
+
+	select {
+	case <-firstRequestSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first refresh request")
+	}
+
+	go func() {
+		credentials, err := authB.credentials(context.Background(), refreshServer.Client())
+		results <- result{credentials: credentials, err: err}
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refreshCalls before releasing first response = %d, want 1", got)
+	}
+	allowFirstResponse <- struct{}{}
+
+	for i := 0; i < 2; i++ {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("credentials() error = %v", result.err)
+		}
+		if result.credentials.accessToken != newAccessToken {
+			t.Fatalf("accessToken = %q, want refreshed token", result.credentials.accessToken)
+		}
+	}
+
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refreshCalls = %d, want 1", got)
+	}
+
+	state, err := (&openAICodexAuth{path: authPath}).read()
+	if err != nil {
+		t.Fatalf("read() error = %v", err)
+	}
+	if state.tokens.AccessToken != newAccessToken || state.tokens.IDToken != newIDToken || state.tokens.RefreshToken != "new-refresh" {
+		t.Fatalf("tokens were not persisted after shared refresh: %+v", state.tokens)
+	}
+}
+
+func TestOpenAICodexAuthCredentialsUsesCachedRefreshWhenPersistFails(t *testing.T) {
+	oldTokens := testOpenAICodexTokens(t, time.Now().Add(-time.Hour), "acct-123", false, "old-refresh")
+	newAccessToken := testOpenAICodexJWT(t, map[string]interface{}{"exp": time.Now().Add(time.Hour).Unix()})
+
+	var refreshCalls atomic.Int32
+	refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  newAccessToken,
+			"refresh_token": "new-refresh",
+		})
+	}))
+	defer refreshServer.Close()
+	t.Setenv(openAICodexRefreshURLEnv, refreshServer.URL)
+
+	authPath := writeTestOpenAICodexAuth(t, t.TempDir(), oldTokens)
+	if err := os.Mkdir(authPath+".tmp", 0o700); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
+
+	authA := &openAICodexAuth{path: authPath}
+	credentialsA, err := authA.credentials(context.Background(), refreshServer.Client())
+	if err != nil {
+		t.Fatalf("credentials() error = %v", err)
+	}
+	if credentialsA.accessToken != newAccessToken {
+		t.Fatalf("accessToken = %q, want refreshed token", credentialsA.accessToken)
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refreshCalls after first refresh = %d, want 1", got)
+	}
+
+	state, err := (&openAICodexAuth{path: authPath}).read()
+	if err != nil {
+		t.Fatalf("read() error = %v", err)
+	}
+	if state.tokens.AccessToken != oldTokens.AccessToken || state.tokens.RefreshToken != oldTokens.RefreshToken {
+		t.Fatalf("expected auth.json to remain stale after persistence failure: %+v", state.tokens)
+	}
+	if state.lastRefresh != nil {
+		t.Fatalf("lastRefresh = %v, want nil after persistence failure", state.lastRefresh)
+	}
+
+	authB := &openAICodexAuth{path: authPath}
+	credentialsB, err := authB.credentials(context.Background(), refreshServer.Client())
+	if err != nil {
+		t.Fatalf("second credentials() error = %v", err)
+	}
+	if credentialsB.accessToken != newAccessToken {
+		t.Fatalf("second accessToken = %q, want refreshed token", credentialsB.accessToken)
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refreshCalls after cached lookup = %d, want 1", got)
 	}
 }
 

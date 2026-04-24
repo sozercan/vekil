@@ -28,8 +28,14 @@ const (
 
 type openAICodexAuth struct {
 	path string
-	mu   sync.Mutex
 }
+
+type openAICodexAuthSharedState struct {
+	mu    sync.Mutex
+	state *openAICodexAuthState
+}
+
+var openAICodexAuthSharedStates sync.Map
 
 type openAICodexTokenData struct {
 	IDToken      string `json:"id_token,omitempty"`
@@ -73,42 +79,165 @@ func (a *openAICodexAuth) credentials(ctx context.Context, client *http.Client) 
 		return openAICodexCredentials{}, fmt.Errorf("OpenAI Codex auth is not configured")
 	}
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	shared := a.sharedState()
+	shared.mu.Lock()
+	defer shared.mu.Unlock()
 
-	state, err := a.read()
+	now := time.Now().UTC()
+	state, err := a.loadState(shared, now)
 	if err != nil {
 		return openAICodexCredentials{}, err
 	}
-	tokens := state.tokens
-	if !openAICodexNeedsRefresh(tokens.AccessToken, state.lastRefresh, time.Now()) {
-		return openAICodexCredentialsFromTokens(tokens), nil
+	if !openAICodexNeedsRefresh(state.tokens.AccessToken, state.lastRefresh, now) {
+		return openAICodexCredentialsFromTokens(state.tokens), nil
 	}
-	if strings.TrimSpace(tokens.RefreshToken) == "" {
+	if strings.TrimSpace(state.tokens.RefreshToken) == "" {
 		return openAICodexCredentials{}, fmt.Errorf("OpenAI Codex access token expired or stale and auth.json has no refresh_token; run `codex login`")
 	}
 
-	refreshed, err := requestOpenAICodexTokenRefresh(ctx, client, tokens.RefreshToken)
+	refreshed, err := requestOpenAICodexTokenRefresh(ctx, client, state.tokens.RefreshToken)
 	if err != nil {
 		return openAICodexCredentials{}, err
 	}
 	if strings.TrimSpace(refreshed.AccessToken) != "" {
-		tokens.AccessToken = refreshed.AccessToken
+		state.tokens.AccessToken = refreshed.AccessToken
 	}
 	if strings.TrimSpace(refreshed.IDToken) != "" {
-		tokens.IDToken = refreshed.IDToken
+		state.tokens.IDToken = refreshed.IDToken
 	}
 	if strings.TrimSpace(refreshed.RefreshToken) != "" {
-		tokens.RefreshToken = refreshed.RefreshToken
+		state.tokens.RefreshToken = refreshed.RefreshToken
 	}
-	if strings.TrimSpace(tokens.AccessToken) == "" {
+	if strings.TrimSpace(state.tokens.AccessToken) == "" {
 		return openAICodexCredentials{}, fmt.Errorf("OpenAI Codex token refresh returned no access_token")
 	}
 
-	if err := a.write(state.raw, tokens); err != nil {
-		return openAICodexCredentials{}, err
+	refreshedAt := time.Now().UTC()
+	state = openAICodexStateWithTokens(state, state.tokens, refreshedAt)
+	shared.state = openAICodexCloneStatePtr(&state)
+	if err := a.write(state.raw, state.tokens, refreshedAt); err != nil {
+		return openAICodexCredentialsFromTokens(state.tokens), nil
 	}
-	return openAICodexCredentialsFromTokens(tokens), nil
+	return openAICodexCredentialsFromTokens(state.tokens), nil
+}
+
+func (a *openAICodexAuth) loadState(shared *openAICodexAuthSharedState, now time.Time) (openAICodexAuthState, error) {
+	diskState, err := a.read()
+	cachedState := openAICodexCloneStatePtr(shared.state)
+	if err != nil {
+		if cachedState != nil {
+			return *cachedState, nil
+		}
+		return openAICodexAuthState{}, err
+	}
+
+	state := openAICodexPreferState(diskState, cachedState, now)
+	shared.state = openAICodexCloneStatePtr(&state)
+	return state, nil
+}
+
+func (a *openAICodexAuth) sharedState() *openAICodexAuthSharedState {
+	key := openAICodexAuthPathKey(a.path)
+	if shared, ok := openAICodexAuthSharedStates.Load(key); ok {
+		return shared.(*openAICodexAuthSharedState)
+	}
+	shared := &openAICodexAuthSharedState{}
+	actual, _ := openAICodexAuthSharedStates.LoadOrStore(key, shared)
+	return actual.(*openAICodexAuthSharedState)
+}
+
+func openAICodexAuthPathKey(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	return filepath.Clean(path)
+}
+
+func openAICodexPreferState(diskState openAICodexAuthState, cachedState *openAICodexAuthState, now time.Time) openAICodexAuthState {
+	if cachedState == nil {
+		return openAICodexCloneState(diskState)
+	}
+
+	diskNeedsRefresh := openAICodexNeedsRefresh(diskState.tokens.AccessToken, diskState.lastRefresh, now)
+	cachedNeedsRefresh := openAICodexNeedsRefresh(cachedState.tokens.AccessToken, cachedState.lastRefresh, now)
+	if diskNeedsRefresh && !cachedNeedsRefresh {
+		return openAICodexCloneState(*cachedState)
+	}
+	if !diskNeedsRefresh && cachedNeedsRefresh {
+		return openAICodexCloneState(diskState)
+	}
+	if !diskNeedsRefresh && !cachedNeedsRefresh {
+		return openAICodexCloneState(diskState)
+	}
+	if openAICodexLastRefreshUnix(cachedState.lastRefresh) > openAICodexLastRefreshUnix(diskState.lastRefresh) {
+		return openAICodexCloneState(*cachedState)
+	}
+	return openAICodexCloneState(diskState)
+}
+
+func openAICodexLastRefreshUnix(lastRefresh *time.Time) int64 {
+	if lastRefresh == nil {
+		return 0
+	}
+	return lastRefresh.UTC().UnixNano()
+}
+
+func openAICodexStateWithTokens(state openAICodexAuthState, tokens openAICodexTokenData, refreshedAt time.Time) openAICodexAuthState {
+	updated := openAICodexCloneState(state)
+	updated.tokens = tokens
+	refreshedAt = refreshedAt.UTC()
+	updated.lastRefresh = &refreshedAt
+	if updated.raw == nil {
+		updated.raw = map[string]json.RawMessage{}
+	}
+	if tokensRaw, err := json.Marshal(tokens); err == nil {
+		updated.raw["tokens"] = tokensRaw
+	}
+	if lastRefreshRaw, err := json.Marshal(refreshedAt.Format(time.RFC3339)); err == nil {
+		updated.raw["last_refresh"] = lastRefreshRaw
+	}
+	return updated
+}
+
+func openAICodexCloneStatePtr(state *openAICodexAuthState) *openAICodexAuthState {
+	if state == nil {
+		return nil
+	}
+	cloned := openAICodexCloneState(*state)
+	return &cloned
+}
+
+func openAICodexCloneState(state openAICodexAuthState) openAICodexAuthState {
+	cloned := openAICodexAuthState{
+		raw:    openAICodexCloneRaw(state.raw),
+		tokens: state.tokens,
+	}
+	if state.lastRefresh != nil {
+		refreshedAt := state.lastRefresh.UTC()
+		cloned.lastRefresh = &refreshedAt
+	}
+	return cloned
+}
+
+func openAICodexCloneRaw(raw map[string]json.RawMessage) map[string]json.RawMessage {
+	if raw == nil {
+		return nil
+	}
+	cloned := make(map[string]json.RawMessage, len(raw))
+	for key, value := range raw {
+		if value == nil {
+			cloned[key] = nil
+			continue
+		}
+		copied := make(json.RawMessage, len(value))
+		copy(copied, value)
+		cloned[key] = copied
+	}
+	return cloned
 }
 
 func (a *openAICodexAuth) read() (openAICodexAuthState, error) {
@@ -143,14 +272,17 @@ func (a *openAICodexAuth) read() (openAICodexAuthState, error) {
 	return openAICodexAuthState{raw: raw, tokens: tokens, lastRefresh: lastRefresh}, nil
 }
 
-func (a *openAICodexAuth) write(raw map[string]json.RawMessage, tokens openAICodexTokenData) error {
+func (a *openAICodexAuth) write(raw map[string]json.RawMessage, tokens openAICodexTokenData, refreshedAt time.Time) error {
 	tokensRaw, err := json.Marshal(tokens)
 	if err != nil {
 		return fmt.Errorf("marshal refreshed OpenAI Codex tokens: %w", err)
 	}
-	lastRefreshRaw, err := json.Marshal(time.Now().UTC().Format(time.RFC3339))
+	lastRefreshRaw, err := json.Marshal(refreshedAt.UTC().Format(time.RFC3339))
 	if err != nil {
 		return fmt.Errorf("marshal OpenAI Codex last_refresh: %w", err)
+	}
+	if raw == nil {
+		raw = map[string]json.RawMessage{}
 	}
 	raw["tokens"] = tokensRaw
 	raw["last_refresh"] = lastRefreshRaw
