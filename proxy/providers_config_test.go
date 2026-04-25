@@ -249,6 +249,73 @@ func TestLoadProvidersConfigFileYAML(t *testing.T) {
 	}
 }
 
+func TestLoadProvidersConfigFileRejectsEmptyBody(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		ext  string
+		body string
+	}{
+		{name: "empty JSON", ext: ".json", body: ""},
+		{name: "empty YAML", ext: ".yaml", body: ""},
+		{name: "whitespace YAML", ext: ".yml", body: " \n\t \n"},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			providersPath := filepath.Join(t.TempDir(), "providers"+tc.ext)
+			if err := os.WriteFile(providersPath, []byte(tc.body), 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+
+			_, err := LoadProvidersConfigFile(providersPath)
+			if err == nil {
+				t.Fatal("LoadProvidersConfigFile() error = nil, want empty config error")
+			}
+			if !strings.Contains(err.Error(), "empty") {
+				t.Fatalf("LoadProvidersConfigFile() error = %v, want empty config error", err)
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileAllowsExplicitEmptyProviders(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		ext  string
+		body string
+	}{
+		{name: "JSON", ext: ".json", body: `{"providers": []}`},
+		{name: "YAML", ext: ".yaml", body: "providers: []\n"},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			providersPath := filepath.Join(t.TempDir(), "providers"+tc.ext)
+			if err := os.WriteFile(providersPath, []byte(tc.body), 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+
+			cfg, err := LoadProvidersConfigFile(providersPath)
+			if err != nil {
+				t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+			}
+			if len(cfg.Providers) != 0 {
+				t.Fatalf("providers count = %d, want 0", len(cfg.Providers))
+			}
+		})
+	}
+}
+
 func TestProviderRequestURLAzureLegacyBaseURLAppendsAPIVersion(t *testing.T) {
 	t.Parallel()
 

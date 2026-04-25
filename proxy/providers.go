@@ -171,6 +171,10 @@ func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
 }
 
 func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) error {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return fmt.Errorf("providers config %q is empty", path)
+	}
+
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".yaml", ".yml":
 		if err := yaml.Unmarshal(body, cfg); err != nil {
