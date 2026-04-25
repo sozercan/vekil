@@ -309,7 +309,7 @@ func signInWithGitHubCLI() {
 	if err := authenticator.SignInWithGitHubCLI(ctx); err != nil {
 		log.Error("github cli sign-in failed", logger.Err(err))
 		if ctx.Err() == nil {
-			showErrorDialog("GitHub CLI Sign In Failed", fmt.Sprintf("Could not sign in with GitHub CLI. Make sure gh is installed and already authenticated with GitHub.\n\n%v", err))
+			showErrorDialog("GitHub CLI Sign In Failed", fmt.Sprintf("Could not sign in with GitHub CLI. Make sure gh is installed, authenticated with GitHub, and using an account with Copilot access.\n\n%v", err))
 		}
 		refreshSessionUI()
 		setAuthActionsEnabled(true)

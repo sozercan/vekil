@@ -973,7 +973,7 @@ printf 'gh-cli-access-token\n'
 	}
 }
 
-func TestRefreshTokenNonInteractive_UsesGitHubCLITokenWithoutSavingAccessToken(t *testing.T) {
+func TestRefreshTokenNonInteractive_UsesGitHubCLITokenWithoutPersistingToken(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake gh shell script test is Unix-only")
 	}
@@ -999,13 +999,17 @@ printf 'gh-cli-access-token\n'
 	t.Setenv("GH_TOKEN", "generic-gh-token")
 	t.Setenv("GITHUB_TOKEN", "generic-github-token")
 
+	chatEnabled := true
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "token gh-cli-access-token" {
-			t.Errorf("expected 'token gh-cli-access-token', got %q", got)
+		if r.URL.Path != "/copilot_internal/user" {
+			t.Errorf("expected copilot user validation request, got %s", r.URL.Path)
 		}
-		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
-			Token:     "gh-cli-copilot-token",
-			ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
+		if got := r.Header.Get("Authorization"); got != "Bearer gh-cli-access-token" {
+			t.Errorf("expected 'Bearer gh-cli-access-token', got %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(CopilotUserResponse{
+			Login:       "test-user",
+			ChatEnabled: &chatEnabled,
 		})
 	}))
 	defer server.Close()
@@ -1023,30 +1027,22 @@ printf 'gh-cli-access-token\n'
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if token != "gh-cli-copilot-token" {
-		t.Fatalf("expected gh-cli-copilot-token, got %q", token)
+	if token != "gh-cli-access-token" {
+		t.Fatalf("expected gh-cli-access-token, got %q", token)
 	}
-	if a.accessToken != "gh-cli-access-token" {
-		t.Fatalf("expected access token to be loaded from gh, got %q", a.accessToken)
+	if a.accessToken != "" {
+		t.Fatalf("expected GitHub CLI token not to be stored as access token, got %q", a.accessToken)
 	}
 	if _, err := os.Stat(filepath.Join(tokenDir, "access-token")); !os.IsNotExist(err) {
 		t.Fatalf("expected gh access token not to be persisted, got err=%v", err)
 	}
 
-	data, err := os.ReadFile(filepath.Join(tokenDir, "api-key.json"))
-	if err != nil {
-		t.Fatalf("expected copilot token cache to be saved: %v", err)
-	}
-	var saved CopilotTokenResponse
-	if err := json.Unmarshal(data, &saved); err != nil {
-		t.Fatalf("decode saved copilot token: %v", err)
-	}
-	if saved.Token != "gh-cli-copilot-token" {
-		t.Fatalf("expected saved copilot token, got %q", saved.Token)
+	if _, err := os.Stat(filepath.Join(tokenDir, "api-key.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected gh token not to be persisted in copilot token cache, got err=%v", err)
 	}
 }
 
-func TestSignInWithGitHubCLI_ClearsSignedOutMarkerWritesPreferenceAndDoesNotSaveAccessToken(t *testing.T) {
+func TestSignInWithGitHubCLI_ClearsSignedOutMarkerWritesPreferenceAndDoesNotPersistToken(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake gh shell script test is Unix-only")
 	}
@@ -1074,13 +1070,17 @@ printf 'gh-cli-access-token\n'
 	t.Setenv("GH_TOKEN", "generic-gh-token")
 	t.Setenv("GITHUB_TOKEN", "generic-github-token")
 
+	chatEnabled := true
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "token gh-cli-access-token" {
-			t.Errorf("expected 'token gh-cli-access-token', got %q", got)
+		if r.URL.Path != "/copilot_internal/user" {
+			t.Errorf("expected copilot user validation request, got %s", r.URL.Path)
 		}
-		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
-			Token:     "explicit-gh-cli-copilot-token",
-			ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
+		if got := r.Header.Get("Authorization"); got != "Bearer gh-cli-access-token" {
+			t.Errorf("expected 'Bearer gh-cli-access-token', got %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(CopilotUserResponse{
+			Login:       "test-user",
+			ChatEnabled: &chatEnabled,
 		})
 	}))
 	defer server.Close()
@@ -1088,6 +1088,16 @@ printf 'gh-cli-access-token\n'
 	tokenDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(tokenDir, "access-token"), []byte("stale-access-token"), 0o600); err != nil {
 		t.Fatalf("write stale access token: %v", err)
+	}
+	staleCopilotCache, err := json.Marshal(CopilotTokenResponse{
+		Token:     "stale-copilot-token",
+		ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("marshal stale copilot cache: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tokenDir, "api-key.json"), staleCopilotCache, 0o600); err != nil {
+		t.Fatalf("write stale copilot cache: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(tokenDir, signedOutMarkerFile), []byte("signed out\n"), 0o600); err != nil {
 		t.Fatalf("write signed-out marker: %v", err)
@@ -1107,11 +1117,11 @@ printf 'gh-cli-access-token\n'
 	if _, err := os.Stat(calledPath); err != nil {
 		t.Fatalf("expected gh to be invoked: %v", err)
 	}
-	if a.accessToken != "gh-cli-access-token" {
-		t.Fatalf("expected GitHub CLI access token in memory, got %q", a.accessToken)
+	if a.accessToken != "" {
+		t.Fatalf("expected GitHub CLI token not to be stored as access token, got %q", a.accessToken)
 	}
-	if a.copilotToken != "explicit-gh-cli-copilot-token" {
-		t.Fatalf("expected copilot token in memory, got %q", a.copilotToken)
+	if a.copilotToken != "gh-cli-access-token" {
+		t.Fatalf("expected GitHub CLI bearer token in memory, got %q", a.copilotToken)
 	}
 	if _, err := os.Stat(filepath.Join(tokenDir, signedOutMarkerFile)); !os.IsNotExist(err) {
 		t.Fatalf("expected signed-out marker to be cleared, got err=%v", err)
@@ -1123,16 +1133,61 @@ printf 'gh-cli-access-token\n'
 		t.Fatal("expected explicit GitHub CLI sign-in to enable auto sign-in preference")
 	}
 
-	data, err := os.ReadFile(filepath.Join(tokenDir, "api-key.json"))
-	if err != nil {
-		t.Fatalf("expected copilot token cache to be saved: %v", err)
+	if _, err := os.Stat(filepath.Join(tokenDir, "api-key.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected stale copilot token cache to be removed, got err=%v", err)
 	}
-	var saved CopilotTokenResponse
-	if err := json.Unmarshal(data, &saved); err != nil {
-		t.Fatalf("decode saved copilot token: %v", err)
+}
+
+func TestSignInWithGitHubCLI_ValidationFailureRestoresPreviousState(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake gh shell script test is Unix-only")
 	}
-	if saved.Token != "explicit-gh-cli-copilot-token" {
-		t.Fatalf("expected saved copilot token, got %q", saved.Token)
+
+	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+printf 'gh-cli-access-token\n'
+`
+	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/copilot_internal/user" {
+			t.Errorf("expected copilot user validation request, got %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(githubAPIErrorResponse{Message: "Not Found", Status: "404"})
+	}))
+	defer server.Close()
+
+	tokenDir := t.TempDir()
+	writeAuthPreferencesForTest(t, tokenDir, false)
+	a := &Authenticator{
+		tokenDir:       tokenDir,
+		githubCLIPath:  ghPath,
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+		accessToken:    "previous-access-token",
+		copilotToken:   "previous-copilot-token",
+		tokenExpiry:    time.Now().Add(1 * time.Hour),
+	}
+
+	err := a.SignInWithGitHubCLI(context.Background())
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !errors.Is(err, ErrInvalidAccessToken) {
+		t.Fatalf("expected ErrInvalidAccessToken, got %v", err)
+	}
+	if a.accessToken != "previous-access-token" {
+		t.Fatalf("expected access token to be restored, got %q", a.accessToken)
+	}
+	if a.copilotToken != "previous-copilot-token" {
+		t.Fatalf("expected copilot token to be restored, got %q", a.copilotToken)
+	}
+	if prefs := readAuthPreferencesForTest(t, tokenDir); prefs.GitHubCLIAutoSignIn {
+		t.Fatal("expected failed GitHub CLI sign-in not to enable auto sign-in preference")
 	}
 }
 

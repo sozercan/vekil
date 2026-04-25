@@ -24,8 +24,10 @@ const (
 	deviceCodeURL         = "https://github.com/login/device/code"
 	accessTokenURL        = "https://github.com/login/oauth/access_token"
 	copilotTokenURL       = "https://api.github.com/copilot_internal/v2/token"
+	copilotUserURL        = "https://api.github.com/copilot_internal/user"
 	defaultTokenDir       = "~/.config/vekil"
 	githubCLITokenTimeout = 5 * time.Second
+	githubCLITokenTTL     = 15 * time.Minute
 	signedOutMarkerFile   = "signed-out"
 	authPreferencesFile   = "auth-preferences.json"
 )
@@ -93,6 +95,19 @@ type AccessTokenResponse struct {
 type CopilotTokenResponse struct {
 	Token        string `json:"token"`
 	ExpiresAt    int64  `json:"expires_at"`
+	ErrorDetails string `json:"error_details,omitempty"`
+}
+
+// CopilotUserResponse is the response from the Copilot user endpoint used to
+// validate GitHub CLI tokens. Only the fields needed for validation are modeled.
+type CopilotUserResponse struct {
+	Login       string `json:"login,omitempty"`
+	ChatEnabled *bool  `json:"chat_enabled,omitempty"`
+}
+
+type githubAPIErrorResponse struct {
+	Message      string `json:"message,omitempty"`
+	Status       string `json:"status,omitempty"`
 	ErrorDetails string `json:"error_details,omitempty"`
 }
 
@@ -366,15 +381,9 @@ func (a *Authenticator) refreshToken(ctx context.Context, allowDeviceFlow bool) 
 	// should be surfaced as-is.
 	if refreshErr == nil || IsInteractiveLoginRequired(refreshErr) {
 		if !a.hasSignedOutMarker() && a.isGitHubCLIAutoSignInEnabled() {
-			previousAccessToken := a.accessToken
-			if err := a.loadGitHubCLIAccessToken(ctx); err == nil {
-				if err := a.exchangeForCopilotToken(ctx); err == nil {
-					return nil
-				} else {
-					a.accessToken = previousAccessToken
-					refreshErr = err
-				}
-			} else if !errors.Is(err, ErrNotAuthenticated) && refreshErr == nil {
+			if err := a.useGitHubCLICopilotToken(ctx); err == nil {
+				return nil
+			} else if !errors.Is(err, ErrNotAuthenticated) || refreshErr == nil {
 				refreshErr = err
 			}
 		}
@@ -539,33 +548,26 @@ func (a *Authenticator) SignOut() error {
 }
 
 // SignInWithGitHubCLI explicitly signs in using the currently authenticated
-// GitHub CLI account. The GitHub CLI token is used only for the Copilot token
-// exchange and is never persisted as Vekil's access-token cache.
+// GitHub CLI account. The GitHub CLI token is kept only in memory as a
+// short-lived Copilot bearer token and is never persisted by Vekil.
 func (a *Authenticator) SignInWithGitHubCLI(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-
-	accessToken, err := a.gitHubCLIAccessToken(ctx)
-	if err != nil {
-		return err
-	}
 
 	previousAccessToken := a.accessToken
 	previousCopilotToken := a.copilotToken
 	previousTokenExpiry := a.tokenExpiry
 
-	a.accessToken = accessToken
-	a.copilotToken = ""
-	a.tokenExpiry = time.Time{}
-
-	if err := a.exchangeForCopilotToken(ctx); err != nil {
+	if err := a.useGitHubCLICopilotToken(ctx); err != nil {
 		a.accessToken = previousAccessToken
 		a.copilotToken = previousCopilotToken
 		a.tokenExpiry = previousTokenExpiry
 		return err
 	}
-	if err := os.Remove(filepath.Join(a.tokenDir, "access-token")); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("removing stale access token: %w", err)
+	for _, name := range []string{"access-token", "api-key.json"} {
+		if err := os.Remove(filepath.Join(a.tokenDir, name)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing stale %s: %w", name, err)
+		}
 	}
 	if err := a.clearSignedOutMarker(); err != nil {
 		return fmt.Errorf("clearing signed-out marker: %w", err)
@@ -582,6 +584,92 @@ func (a *Authenticator) getCopilotTokenURL() string {
 		return a.copilotBaseURL + "/copilot_internal/v2/token"
 	}
 	return copilotTokenURL
+}
+
+func (a *Authenticator) getCopilotUserURL() string {
+	if a.copilotBaseURL != "" {
+		return a.copilotBaseURL + "/copilot_internal/user"
+	}
+	return copilotUserURL
+}
+
+func (a *Authenticator) useGitHubCLICopilotToken(ctx context.Context) error {
+	accessToken, err := a.gitHubCLIAccessToken(ctx)
+	if err != nil {
+		return err
+	}
+
+	if err := a.validateGitHubCLIToken(ctx, accessToken); err != nil {
+		return err
+	}
+
+	// GitHub CLI OAuth tokens are accepted directly by the Copilot API as bearer
+	// tokens. Keep them in memory only: do not persist them as Vekil-managed
+	// GitHub access tokens, do not write them to the Copilot token cache, and do
+	// not feed them through the legacy Copilot token exchange endpoint. Some
+	// GitHub CLI OAuth tokens can validate against Copilot but return 404 from
+	// that exchange.
+	a.accessToken = ""
+	a.copilotToken = accessToken
+	a.tokenExpiry = time.Now().Add(githubCLITokenTTL)
+	return nil
+}
+
+func (a *Authenticator) validateGitHubCLIToken(ctx context.Context, accessToken string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.getCopilotUserURL(), nil)
+	if err != nil {
+		return fmt.Errorf("creating copilot user request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "GitHubCopilotChat/0.26.7")
+
+	resp, err := a.do(req)
+	if err != nil {
+		return fmt.Errorf("validating github cli copilot access: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		detail := readGitHubAPIErrorDetail(resp.Body)
+		if detail != "" {
+			detail = ": " + detail
+		}
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
+			return fmt.Errorf("%w: github cli token cannot access Copilot (status %d%s)", ErrInvalidAccessToken, resp.StatusCode, detail)
+		}
+		return fmt.Errorf("github cli copilot validation failed with status %d%s", resp.StatusCode, detail)
+	}
+
+	var user CopilotUserResponse
+	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
+		return fmt.Errorf("decoding copilot user response: %w", err)
+	}
+	if user.ChatEnabled != nil && !*user.ChatEnabled {
+		return fmt.Errorf("%w: github cli account does not have Copilot Chat enabled", ErrInvalidAccessToken)
+	}
+	return nil
+}
+
+func readGitHubAPIErrorDetail(body io.Reader) string {
+	data, err := io.ReadAll(io.LimitReader(body, 4096))
+	if err != nil {
+		return ""
+	}
+	text := strings.TrimSpace(string(data))
+	if text == "" {
+		return ""
+	}
+
+	var apiErr githubAPIErrorResponse
+	if err := json.Unmarshal(data, &apiErr); err == nil {
+		for _, detail := range []string{apiErr.ErrorDetails, apiErr.Message, apiErr.Status} {
+			if strings.TrimSpace(detail) != "" {
+				return strings.TrimSpace(detail)
+			}
+		}
+	}
+	return text
 }
 
 func (a *Authenticator) exchangeForCopilotToken(ctx context.Context) error {
@@ -843,15 +931,6 @@ func (a *Authenticator) clearSignedOutMarker() error {
 	if err := os.Remove(a.signedOutMarkerPath()); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	return nil
-}
-
-func (a *Authenticator) loadGitHubCLIAccessToken(ctx context.Context) error {
-	token, err := a.gitHubCLIAccessToken(ctx)
-	if err != nil {
-		return err
-	}
-	a.accessToken = token
 	return nil
 }
 
