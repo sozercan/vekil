@@ -36,7 +36,7 @@ func showErrorDialog(title, message string) {
 }
 
 func chooseProvidersConfigPath() (string, error) {
-	script := `POSIX path of (choose file with prompt "Choose a providers config JSON file")`
+	script := `POSIX path of (choose file with prompt "Choose a providers config JSON or YAML file")`
 	out, err := exec.Command("osascript", "-e", script).CombinedOutput()
 	if err != nil {
 		if isOsascriptCancel(err, out) {

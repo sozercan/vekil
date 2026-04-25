@@ -47,12 +47,12 @@ Documentation update rules:
 
 | Package | Purpose |
 |---------|---------|
-| `main.go` | CLI entry, flags (including providers config), signal handling |
+| `main.go` | CLI entry, flags (including JSON/YAML providers config), signal handling |
 | `auth/` | GitHub OAuth device code flow and Copilot token caching/refresh (`sync.RWMutex` + double-check) |
 | `proxy/chat_handlers.go` | Anthropic and OpenAI chat handlers, including forced-streaming aggregation for tool calls |
 | `proxy/responses_handler.go` | OpenAI Responses passthrough plus Codex compatibility endpoints (`/v1/responses/compact`, `/v1/memories/trace_summarize`) |
 | `proxy/handler.go` | Shared proxy plumbing: health/ready/models handlers, request-body decoding, provider-aware model catalogs, provider headers, caches |
-| `proxy/providers.go` | Provider config loading, model ownership, Azure metadata overlay, endpoint allowlists, and routing state |
+| `proxy/providers.go` | JSON/YAML provider config loading, model ownership, Azure metadata overlay, endpoint allowlists, and routing state |
 | `proxy/upstream_http.go` | Provider selection, public→upstream model rewriting, and provider-specific upstream HTTP dispatch |
 | `proxy/openai_codex_auth.go` | OpenAI Codex CLI auth.json loading, refresh, and request credentials |
 | `proxy/gemini_handler.go` | Gemini-native HTTP handlers and countTokens probe flow |
@@ -69,7 +69,7 @@ Documentation update rules:
 ## Key Design Decisions
 
 - **No frameworks**: Pure `net/http` with Go 1.22+ `ServeMux` method routing. Do not add web frameworks.
-- **Vekil is a multi-provider proxy**: zero-config startup currently targets GitHub Copilot, but explicit provider configs can extend or replace that default behind the same public API surface.
+- **Vekil is a multi-provider proxy**: zero-config startup currently targets GitHub Copilot, but explicit JSON/YAML provider configs can extend or replace that default behind the same public API surface.
 - **Public model IDs are global across providers**: Model ownership is explicit and startup must fail on collisions rather than silently shadowing one provider with another.
 - **Forced streaming for reliable parallel tool calls**: Non-streaming requests with tools may be force-streamed upstream then aggregated back before returning to the client. This behavior started as an upstream compatibility workaround and still applies to provider-backed OpenAI chat handling.
 - **Gemini is a translation layer**: Gemini endpoints are implemented like Anthropic, not as zero-copy passthrough. Keep Gemini-specific protocol logic in `proxy/gemini*.go`.
@@ -79,7 +79,7 @@ Documentation update rules:
 - **Azure support is OpenAI-compatible provider routing, not a separate public surface**: Azure deployment names stay internal to provider config, and Azure `/models` probing is only a best-effort metadata overlay for configured models.
 - **OpenAI Codex support is file-auth-backed provider routing**: Codex models use the CLI ChatGPT auth file, dynamic `/models` discovery, and `/responses`-only routing.
 - **Proxy websocket bridging is not upstream realtime**: `GET /v1/responses` remains a proxy-owned websocket transport over upstream HTTP `/responses`. Do not describe it as native Azure websocket or `/realtime` support.
-- **Minimal dependencies**: Keep third-party deps minimal. Current non-stdlib dependencies used in production code are `systray`, `uuid`, and `klauspost/compress`.
+- **Minimal dependencies**: Keep third-party deps minimal. Current direct non-stdlib dependencies used in production code include `github.com/pkg/browser`, `fyne.io/systray`, `github.com/godbus/dbus/v5`, `github.com/google/uuid`, `github.com/gorilla/websocket`, `github.com/klauspost/compress`, and `gopkg.in/yaml.v3`.
 - **Distroless container**: Single static binary, `CGO_ENABLED=0`.
 
 ## Code Conventions

@@ -12,7 +12,7 @@ Vekil supports two runtime patterns:
 | `--port` | `PORT` | `1337` | Listen port |
 | `--host` | `HOST` | `0.0.0.0` | Listen host |
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
-| `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON provider configuration for explicit provider routing |
+| `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 
@@ -47,7 +47,7 @@ Azure OpenAI credentials are configured in the provider entry, using either `api
 
 ## Provider Routing
 
-Use `--providers-config` when you want explicit ownership of public model IDs across providers such as GitHub Copilot, Azure OpenAI, and OpenAI Codex.
+Use `--providers-config` when you want explicit ownership of public model IDs across providers such as GitHub Copilot, Azure OpenAI, and OpenAI Codex. Provider config files can be JSON (`.json`) or YAML (`.yaml`/`.yml`).
 
 You can run Azure-only or Codex-only configs, or mix those providers with Copilot behind the same local endpoint.
 
@@ -73,6 +73,23 @@ You can run Azure-only or Codex-only configs, or mix those providers with Copilo
     }
   ]
 }
+```
+
+The same config can be written as YAML:
+
+```yaml
+providers:
+  - id: azure-openai
+    type: azure-openai
+    default: true
+    base_url: https://myresource.cognitiveservices.azure.com/openai/v1
+    api_key_env: AZURE_OPENAI_API_KEY
+    models:
+      - public_id: gpt-5.4-pro
+        deployment: gpt-5.4-pro
+        endpoints:
+          - /responses
+        name: GPT-5.4 Pro
 ```
 
 ### Copilot + Azure Example
@@ -123,6 +140,19 @@ You can run Azure-only or Codex-only configs, or mix those providers with Copilo
 }
 ```
 
+The same Codex config can be written as YAML:
+
+```yaml
+providers:
+  - id: copilot
+    type: copilot
+    default: true
+  - id: openai-codex
+    type: openai-codex
+    include_models:
+      - gpt-5.5
+```
+
 Routing rules:
 
 - Clients keep using plain model IDs such as `gpt-5.4-pro`.
@@ -145,7 +175,7 @@ Routing rules:
 - Explicit `models[]` metadata overrides Azure `/models` overlay metadata. Configured public IDs and endpoint allowlists always win, and the proxy falls back to the static entry if the Azure `/models` probe fails or returns a sparse payload.
 - The example Azure `gpt-5.4-pro` model shown above is `/responses`-only. Do not advertise `/chat/completions` for that model unless you have verified native support.
 
-Use the JSON examples above as a starting point for your local providers config file.
+Use the examples above as a starting point for your local providers config file. JSON and YAML use the same snake_case field names.
 
 ## WebSocket Session Tuning
 

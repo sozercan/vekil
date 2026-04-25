@@ -114,6 +114,141 @@ func TestLoadProvidersConfigFileAzureV1BaseURLAndModelMetadata(t *testing.T) {
 	}
 }
 
+func TestLoadProvidersConfigFileYAML(t *testing.T) {
+	t.Parallel()
+
+	for _, ext := range []string{".yaml", ".yml"} {
+		ext := ext
+		t.Run(ext, func(t *testing.T) {
+			t.Parallel()
+
+			providersPath := filepath.Join(t.TempDir(), "providers"+ext)
+			body := []byte(`providers:
+  - id: copilot
+    type: copilot
+    default: true
+    exclude_models:
+      - gpt-5.4-pro
+  - id: azure-openai
+    type: azure-openai
+    base_url: https://example.openai.azure.com/openai/v1
+    api_key: test-key
+    api_version: 2025-04-01-preview
+    models:
+      - public_id: gpt-5.4-pro
+        deployment: gpt-5.4-pro
+        endpoints:
+          - /responses
+        name: GPT-5.4 Pro
+        model_picker_enabled: false
+        model_picker_category: powerful
+        reasoning_effort:
+          - low
+          - medium
+          - high
+        vision: true
+        parallel_tool_calls: true
+        context_window: 400000
+  - id: openai-codex
+    type: openai-codex
+    include_models:
+      - gpt-5.5
+`)
+			if err := os.WriteFile(providersPath, body, 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+
+			cfg, err := LoadProvidersConfigFile(providersPath)
+			if err != nil {
+				t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+			}
+
+			if len(cfg.Providers) != 3 {
+				t.Fatalf("providers count = %d, want 3", len(cfg.Providers))
+			}
+			if !cfg.Providers[0].Default {
+				t.Fatal("copilot default = false, want true")
+			}
+			if !reflect.DeepEqual(cfg.Providers[0].ExcludeModels, []string{"gpt-5.4-pro"}) {
+				t.Fatalf("exclude_models = %v, want [gpt-5.4-pro]", cfg.Providers[0].ExcludeModels)
+			}
+
+			provider := cfg.Providers[1]
+			if provider.ID != "azure-openai" || provider.Type != "azure-openai" {
+				t.Fatalf("provider = %#v, want azure-openai", provider)
+			}
+			if provider.BaseURL != "https://example.openai.azure.com/openai/v1" {
+				t.Fatalf("base_url = %q", provider.BaseURL)
+			}
+			if provider.APIKey != "test-key" {
+				t.Fatalf("api_key = %q, want test-key", provider.APIKey)
+			}
+			if provider.APIVersion != "2025-04-01-preview" {
+				t.Fatalf("api_version = %q, want 2025-04-01-preview", provider.APIVersion)
+			}
+			if len(provider.Models) != 1 {
+				t.Fatalf("models count = %d, want 1", len(provider.Models))
+			}
+
+			model := provider.Models[0]
+			if model.PublicID != "gpt-5.4-pro" || model.Deployment != "gpt-5.4-pro" {
+				t.Fatalf("model IDs = (%q, %q), want gpt-5.4-pro", model.PublicID, model.Deployment)
+			}
+			if !reflect.DeepEqual(model.Endpoints, []string{"/responses"}) {
+				t.Fatalf("endpoints = %v, want [/responses]", model.Endpoints)
+			}
+			if model.ModelPickerEnabled == nil || *model.ModelPickerEnabled {
+				t.Fatalf("model_picker_enabled = %v, want false", model.ModelPickerEnabled)
+			}
+			if model.ModelPickerCategory != "powerful" {
+				t.Fatalf("model_picker_category = %q, want powerful", model.ModelPickerCategory)
+			}
+			if !reflect.DeepEqual(model.ReasoningEffort, []string{"low", "medium", "high"}) {
+				t.Fatalf("reasoning_effort = %v, want [low medium high]", model.ReasoningEffort)
+			}
+			if model.Vision == nil || !*model.Vision {
+				t.Fatalf("vision = %v, want true", model.Vision)
+			}
+			if model.ParallelToolCalls == nil || !*model.ParallelToolCalls {
+				t.Fatalf("parallel_tool_calls = %v, want true", model.ParallelToolCalls)
+			}
+			if model.ContextWindow == nil || *model.ContextWindow != 400000 {
+				t.Fatalf("context_window = %v, want 400000", model.ContextWindow)
+			}
+
+			codexProvider := cfg.Providers[2]
+			if codexProvider.ID != "openai-codex" || codexProvider.Type != "openai-codex" {
+				t.Fatalf("codex provider = %#v, want openai-codex", codexProvider)
+			}
+			if !reflect.DeepEqual(codexProvider.IncludeModels, []string{"gpt-5.5"}) {
+				t.Fatalf("codex include_models = %v, want [gpt-5.5]", codexProvider.IncludeModels)
+			}
+
+			handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+			providers, _, defaultProviderID, err := handler.buildProviders(cfg)
+			if err != nil {
+				t.Fatalf("buildProviders() error = %v", err)
+			}
+			if defaultProviderID != "copilot" {
+				t.Fatalf("default provider = %q, want copilot", defaultProviderID)
+			}
+			codexRuntime := providers["openai-codex"]
+			if codexRuntime == nil {
+				t.Fatal("expected openai-codex provider to be built")
+			}
+			if codexRuntime.baseURL != defaultOpenAICodexBaseURL {
+				t.Fatalf("codex baseURL = %q, want %q", codexRuntime.baseURL, defaultOpenAICodexBaseURL)
+			}
+			if !codexRuntime.allowsModel("gpt-5.5") {
+				t.Fatal("expected YAML include_models to allow gpt-5.5")
+			}
+			if codexRuntime.allowsModel("gpt-5.4") {
+				t.Fatal("expected YAML include_models to block gpt-5.4")
+			}
+		})
+	}
+}
+
 func TestProviderRequestURLAzureLegacyBaseURLAppendsAPIVersion(t *testing.T) {
 	t.Parallel()
 
