@@ -255,6 +255,9 @@ func (ps *providerSetup) replaceProviderModels(providerID string, models []provi
 		return nil
 	}
 
+	provider := ps.providerByID(providerID)
+	models = filterProviderModels(provider, models)
+
 	ps.modelsMu.Lock()
 	defer ps.modelsMu.Unlock()
 
@@ -324,14 +327,14 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 
 	if !needsDynamicModelValidation {
 		for _, provider := range providers {
-			for publicID, model := range provider.staticModels {
-				if existing, exists := setup.models[publicID]; exists {
+			for _, model := range filterProviderModels(provider, orderedStaticProviderModels(provider)) {
+				if existing, exists := setup.models[model.publicID]; exists {
 					if existing.providerID == model.providerID {
 						continue
 					}
-					return nil, providerModelCollisionError(publicID, existing.providerID, model.providerID)
+					return nil, providerModelCollisionError(model.publicID, existing.providerID, model.providerID)
 				}
-				setup.models[publicID] = model
+				setup.models[model.publicID] = model
 			}
 		}
 		return setup, nil
@@ -347,11 +350,11 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 	for _, providerID := range providerOrder {
 		provider := providers[providerID]
 		if !providerUsesDynamicModels(provider) {
-			for publicID, model := range provider.staticModels {
-				if existing, exists := setup.models[publicID]; exists {
-					return nil, providerModelCollisionError(publicID, existing.providerID, model.providerID)
+			for _, model := range filterProviderModels(provider, orderedStaticProviderModels(provider)) {
+				if existing, exists := setup.models[model.publicID]; exists {
+					return nil, providerModelCollisionError(model.publicID, existing.providerID, model.providerID)
 				}
-				setup.models[publicID] = model
+				setup.models[model.publicID] = model
 			}
 			continue
 		}
@@ -360,7 +363,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 		if err != nil {
 			return nil, fmt.Errorf("load models for provider %q: %w", provider.id, err)
 		}
-		for _, model := range result.models {
+		for _, model := range filterProviderModels(provider, result.models) {
 			if existing, exists := setup.models[model.publicID]; exists {
 				if existing.providerID == model.providerID {
 					continue
@@ -529,6 +532,21 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string) (*provid
 	}
 
 	return runtime, nil
+}
+
+func filterProviderModels(provider *providerRuntime, models []providerModel) []providerModel {
+	if provider == nil || len(models) == 0 {
+		return models
+	}
+
+	filtered := make([]providerModel, 0, len(models))
+	for _, model := range models {
+		if !provider.allowsModel(model.publicID) {
+			continue
+		}
+		filtered = append(filtered, model)
+	}
+	return filtered
 }
 
 func hasDynamicProvider(providers map[string]*providerRuntime) bool {

@@ -598,8 +598,11 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 			return cachedModelsResponse{}, false, err
 		}
 
+		models := filterProviderModels(provider, result.models)
+
 		if result.notModified {
-			for _, model := range setup.modelsForProvider(provider.id) {
+			models = filterProviderModels(provider, setup.modelsForProvider(provider.id))
+			for _, model := range models {
 				if existingProvider, exists := owners[model.publicID]; exists {
 					if existingProvider == model.providerID {
 						continue
@@ -618,14 +621,14 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 			}
 			allDynamicProvidersUnchanged = false
 			if len(setup.providers) > 1 {
-				refreshedDynamicModels[provider.id] = result.models
+				refreshedDynamicModels[provider.id] = models
 			}
 			if result.etag != "" {
 				mergedETag = result.etag
 			}
 		}
 
-		for _, model := range result.models {
+		for _, model := range models {
 			if existingProvider, exists := owners[model.publicID]; exists {
 				if existingProvider == model.providerID {
 					continue
