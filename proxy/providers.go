@@ -538,13 +538,27 @@ func filterProviderModels(provider *providerRuntime, models []providerModel) []p
 	if provider == nil || len(models) == 0 {
 		return models
 	}
+	if len(provider.includeModels) == 0 && len(provider.excludeModels) == 0 {
+		return models
+	}
 
-	filtered := make([]providerModel, 0, len(models))
-	for _, model := range models {
+	firstFiltered := -1
+	for i, model := range models {
 		if !provider.allowsModel(model.publicID) {
-			continue
+			firstFiltered = i
+			break
 		}
-		filtered = append(filtered, model)
+	}
+	if firstFiltered == -1 {
+		return models
+	}
+
+	filtered := make([]providerModel, 0, len(models)-1)
+	filtered = append(filtered, models[:firstFiltered]...)
+	for _, model := range models[firstFiltered+1:] {
+		if provider.allowsModel(model.publicID) {
+			filtered = append(filtered, model)
+		}
 	}
 	return filtered
 }
