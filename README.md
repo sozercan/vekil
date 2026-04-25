@@ -1,22 +1,33 @@
-# vekil
+<p align="center">
+  <img src="assets/macos/Vekil.png" alt="Vekil" width="128" height="128" />
+</p>
 
-High-performance Go proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs behind one local endpoint. Vekil can run in zero-config mode against GitHub Copilot, or route selected models to configured providers such as Azure OpenAI and OpenAI Codex. The client-facing API surface stays the same while model ownership is configured behind the proxy.
+<h1 align="center">vekil</h1>
 
-## What It Supports
+<p align="center">
+  <em>One local endpoint for Anthropic, Gemini, and OpenAI clients — backed by the provider of your choice.</em>
+</p>
 
-- Anthropic Messages API
-- Gemini Generate Content, Stream Generate Content, and Count Tokens APIs
-- OpenAI Chat Completions API
-- OpenAI Responses API, including Codex websocket bridging
-- Multi-provider model routing across GitHub Copilot, Azure OpenAI, and OpenAI Codex
-- Proxy-owned Codex compatibility endpoints for compaction and memory summarization
-- Streaming, tool use, parallel tool calls, compressed request bodies, and auth/token caching
+---
+
+Vekil is a Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs behind one local endpoint. Run it in zero-config mode against GitHub Copilot, or route selected models to providers like Azure OpenAI and OpenAI Codex. The client-facing API surface stays the same while model ownership is configured behind the proxy.
+
+## Why Vekil?
+
+Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Azure OpenAI, or send Gemini-CLI traffic through any OpenAI-compatible upstream — all without touching client config. Swap providers behind the proxy; your tools never notice.
+
+## Features
+
+- **Anthropic Messages API** — drop-in compatible with Claude clients
+- **Gemini API** — Generate Content, Stream Generate Content, and Count Tokens
+- **OpenAI Chat Completions** and **Responses** APIs, including Codex websocket bridging
+- **Multi-provider routing** across GitHub Copilot, Azure OpenAI, and OpenAI Codex
+- **Codex compatibility shims** for compaction and memory summarization
+- **Streaming**, tool use, parallel tool calls, compressed request bodies, and auth/token caching
 
 ## Quick Start
 
-Download the latest binary for your platform from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest), then run it locally.
-
-Or with Docker from GHCR:
+Grab a binary from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest), or run the container from GHCR:
 
 ```bash
 docker run -p 1337:1337 \
@@ -24,47 +35,40 @@ docker run -p 1337:1337 \
   ghcr.io/sozercan/vekil:latest
 ```
 
-For explicit provider routing, start the proxy with `--providers-config /path/to/providers.json` or `--providers-config /path/to/providers.yaml`.
-
-On Apple Silicon Macs, you can also use the native macOS tray app.
+On Apple Silicon Macs, install the native tray app via Homebrew:
 
 ```bash
 brew install --cask sozercan/repo/vekil
 ```
 
-> **Note:** The app is not signed.
-> Clear extended attributes, including quarantine, with:
-> ```bash
-> xattr -cr /Applications/Vekil.app
-> ```
+> The app is not signed. Clear quarantine with `xattr -cr /Applications/Vekil.app`. Manual `vekil-macos-arm64.zip` downloads are also on [Releases](https://github.com/sozercan/vekil/releases/latest). See [Tray App (macOS/Linux)](docs/menubar.md).
 
-Manual downloads still work through the `vekil-macos-arm64.zip` asset on [GitHub Releases](https://github.com/sozercan/vekil/releases/latest). See [Tray App (macOS/Linux)](docs/menubar.md).
+For explicit provider routing, start the proxy with `--providers-config /path/to/providers.{json,yaml}`.
 
-Depending on your active providers:
+**First-run auth** depends on your providers:
 
-- Copilot-backed setups start GitHub's device code flow on first run.
-- OpenAI Codex setups require `codex login` so `~/.codex/auth.json` exists.
+- **Copilot** — kicks off GitHub's device code flow on first run.
+- **OpenAI Codex** — requires `codex login` so `~/.codex/auth.json` exists. In Docker, mount your Codex home into `CODEX_HOME` (default `/home/nonroot/.codex`).
 
-If you run an `openai-codex` provider inside Docker, mount your Codex home into the same in-container path referenced by `CODEX_HOME` (default `/home/nonroot/.codex`).
-
-For provider configuration, model routing, and provider-specific auth details, see [Getting Started](docs/getting-started.md) and [Configuration](docs/configuration.md).
+For full configuration and routing details, see [Getting Started](docs/getting-started.md) and [Configuration](docs/configuration.md).
 
 ## Docs
 
-The full documentation now lives under [`docs/`](docs/README.md) in smaller, topic-focused files:
+Full documentation lives under [`docs/`](docs/README.md):
 
-- [Docs Index](docs/README.md)
-- [Getting Started](docs/getting-started.md)
-- [Configuration](docs/configuration.md)
-- [Client Usage Examples](docs/clients.md)
-- [API Reference](docs/api.md)
-- [Architecture](docs/architecture.md)
-- [Tray App (macOS/Linux)](docs/menubar.md)
-- [Development](docs/development.md)
+|                                            |                                     |
+| ------------------------------------------ | ----------------------------------- |
+| [Getting Started](docs/getting-started.md) | Install, run, first auth            |
+| [Configuration](docs/configuration.md)     | Flags, env vars, provider routing   |
+| [Client Examples](docs/clients.md)         | Copy-paste snippets per client      |
+| [API Reference](docs/api.md)               | Endpoint behavior and compatibility |
+| [Architecture](docs/architecture.md)       | Package layout and design notes     |
+| [Tray App](docs/menubar.md)                | macOS/Linux menubar usage           |
+| [Development](docs/development.md)         | Build, test, benchmarks, CI         |
 
-## Common Client Setup
+## Client Examples
 
-Use any public model ID exposed by `/v1/models`; the local client configuration stays the same even when a different upstream provider owns that model.
+Use any public model ID exposed by `/v1/models` — your client config is the same regardless of which provider owns the model upstream.
 
 ### Claude Code
 
@@ -91,7 +95,3 @@ env GEMINI_API_KEY=dummy \
   GEMINI_CLI_NO_RELAUNCH=true \
   gemini -m gemini-2.5-pro -p "Reply with exactly PROXY_OK" -o json
 ```
-
-## License
-
-MIT
