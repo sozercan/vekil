@@ -2786,6 +2786,97 @@ func TestNewProxyHandler_FailsWhenOpenAICodexModelCollidesWithAzure(t *testing.T
 	}
 }
 
+func TestNewProxyHandler_CopilotExcludeAndOpenAICodexIncludeAvoidsCollision(t *testing.T) {
+	codexHome := t.TempDir()
+	writeTestOpenAICodexAuth(t, codexHome, testOpenAICodexTokens(t, time.Now().Add(time.Hour), "acct-123", false, "refresh-token"))
+	t.Setenv("CODEX_HOME", codexHome)
+
+	copilotServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/models" {
+			t.Fatalf("expected Copilot /models lookup, got %s", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[
+			{"id":"gpt-5.4","object":"model","created":0,"owned_by":"github-copilot","supported_endpoints":["/responses"],"name":"GPT-5.4"},
+			{"id":"gpt-5.5","object":"model","created":0,"owned_by":"github-copilot","supported_endpoints":["/responses"],"name":"GPT-5.5 Copilot"}
+		]}`))
+	}))
+	defer copilotServer.Close()
+
+	codexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/models" {
+			t.Fatalf("expected OpenAI Codex /models lookup, got %s", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"models":[
+			{"slug":"gpt-5.4","display_name":"GPT-5.4","visibility":"list","supported_in_api":true},
+			{"slug":"gpt-5.5","display_name":"GPT-5.5","visibility":"list","supported_in_api":true,"supported_reasoning_levels":[{"effort":"medium"}],"context_window":272000}
+		]}`))
+	}))
+	defer codexServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		withCopilotBaseURLForTest(copilotServer.URL),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{
+					ID:            "copilot",
+					Type:          "copilot",
+					Default:       true,
+					ExcludeModels: []string{"gpt-5.5"},
+				},
+				{
+					ID:            "codex",
+					Type:          "openai-codex",
+					BaseURL:       codexServer.URL,
+					IncludeModels: []string{"gpt-5.5"},
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	handler.HandleModels(w, req)
+
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Data []struct {
+			ID      string `json:"id"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+
+	ownersByID := make(map[string][]string)
+	for _, model := range result.Data {
+		ownersByID[model.ID] = append(ownersByID[model.ID], model.OwnedBy)
+	}
+	if _, ok := ownersByID["gpt-5.4"]; !ok {
+		t.Fatalf("expected Copilot model gpt-5.4 in merged catalog, got %+v", ownersByID)
+	}
+	owners := ownersByID["gpt-5.5"]
+	if len(owners) != 1 {
+		t.Fatalf("expected exactly one gpt-5.5 entry, got owners %v in %+v", owners, ownersByID)
+	}
+	if owners[0] != "codex" {
+		t.Fatalf("expected gpt-5.5 to come from codex after Copilot exclusion, got owner %q", owners[0])
+	}
+}
+
 func TestNewProxyHandler_OpenAICodexIncludeModelsAvoidsCollision(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 	codexHome := t.TempDir()

@@ -400,6 +400,47 @@ func TestBuildConfiguredProviderSetupRejectsStaticModelCollision(t *testing.T) {
 	}
 }
 
+func TestReplaceProviderModelsFiltersBeforeCollisionCheck(t *testing.T) {
+	ps := &providerSetup{
+		providers: map[string]*providerRuntime{
+			"copilot": {
+				id:            "copilot",
+				kind:          providerTypeCopilot,
+				includeModels: map[string]struct{}{},
+				excludeModels: map[string]struct{}{"gpt-5.5": {}},
+			},
+			"codex": {
+				id:            "codex",
+				kind:          providerTypeOpenAICodex,
+				includeModels: map[string]struct{}{"gpt-5.5": {}},
+				excludeModels: map[string]struct{}{},
+			},
+		},
+		models: map[string]providerModel{
+			"gpt-5.5": {publicID: "gpt-5.5", providerID: "codex"},
+			"legacy":  {publicID: "legacy", providerID: "copilot"},
+		},
+	}
+
+	err := ps.replaceProviderModels("copilot", []providerModel{
+		{publicID: "gpt-5.5", providerID: "copilot"},
+		{publicID: "gpt-5.4", providerID: "copilot"},
+	})
+	if err != nil {
+		t.Fatalf("replaceProviderModels returned error before filtering exclusions: %v", err)
+	}
+
+	if model, ok := ps.lookupModel("gpt-5.5"); !ok || model.providerID != "codex" {
+		t.Fatalf("expected excluded gpt-5.5 to remain owned by codex, got %+v, ok=%v", model, ok)
+	}
+	if model, ok := ps.lookupModel("gpt-5.4"); !ok || model.providerID != "copilot" {
+		t.Fatalf("expected allowed gpt-5.4 to be refreshed for copilot, got %+v, ok=%v", model, ok)
+	}
+	if _, ok := ps.lookupModel("legacy"); ok {
+		t.Fatal("expected replacing copilot models to remove stale copilot-owned legacy model")
+	}
+}
+
 func TestBuildProvidersOpenAICodexDefaultBaseURLAndFilters(t *testing.T) {
 	t.Parallel()
 
