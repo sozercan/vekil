@@ -22,9 +22,11 @@ var (
 	authenticator *auth.Authenticator
 
 	// Menu items kept at package level so helpers can update them.
-	mStatus          *systray.MenuItem
+	mAuthStatus      *systray.MenuItem
 	mToggle          *systray.MenuItem
-	mAuth            *systray.MenuItem
+	mSignInGitHub    *systray.MenuItem
+	mUseGitHubCLI    *systray.MenuItem
+	mSignOut         *systray.MenuItem
 	mProvidersStatus *systray.MenuItem
 	mProvidersChoose *systray.MenuItem
 	mProvidersClear  *systray.MenuItem
@@ -58,8 +60,8 @@ func onReady() {
 	systray.SetIcon(iconOff)
 	systray.SetTooltip("Vekil - Stopped")
 
-	mStatus = systray.AddMenuItem("○ Not signed in", "")
-	mStatus.Disable()
+	mAuthStatus = systray.AddMenuItem("○ Not signed in", "")
+	mAuthStatus.Disable()
 	mVersion := systray.AddMenuItem(versionMenuTitle(), "Current app version")
 	mVersion.Disable()
 	systray.AddSeparator()
@@ -81,7 +83,9 @@ func onReady() {
 		mLaunch.Check()
 	}
 
-	mAuth = systray.AddMenuItem("Sign In", "Sign in or out of GitHub")
+	mSignInGitHub = systray.AddMenuItem("Sign In with GitHub", "Sign in with GitHub using a browser code")
+	mUseGitHubCLI = systray.AddMenuItem("Use GitHub CLI", "Use the currently authenticated GitHub CLI account")
+	mSignOut = systray.AddMenuItem("Sign Out", "Clear Vekil authentication")
 	systray.AddSeparator()
 
 	var mCheckUpdates *systray.MenuItem
@@ -134,12 +138,12 @@ func onReady() {
 						mLaunch.Check()
 					}
 				}
-			case <-mAuth.ClickedCh:
-				if authenticator.IsSignedIn() {
-					signOut()
-				} else {
-					go signIn()
-				}
+			case <-mSignInGitHub.ClickedCh:
+				go signInWithGitHub()
+			case <-mUseGitHubCLI.ClickedCh:
+				go signInWithGitHubCLI()
+			case <-mSignOut.ClickedCh:
+				signOut()
 			case <-mCheckUpdatesClicked:
 				if err := checkForUpdates(); err != nil {
 					log.Error("failed to check for updates", logger.Err(err))
@@ -166,9 +170,11 @@ func startProxy() {
 	if providersRequireGitHubAuth(providersCfg, providersConfigErr) {
 		if _, err := authenticator.GetToken(context.Background()); err != nil {
 			log.Error("auth failed", logger.Err(err))
-			// Token refresh failed — force re-authentication.
-			_ = authenticator.SignOut()
-			go signIn()
+			showErrorDialog(
+				"GitHub Sign In Required",
+				fmt.Sprintf("The active providers config uses GitHub Copilot, but Vekil could not refresh authentication.\n\nChoose ‘Sign In with GitHub’ or ‘Use GitHub CLI’ from the Vekil menu, then start Vekil again.\n\n%v", err),
+			)
+			refreshSessionUI()
 			return
 		}
 	}
@@ -212,9 +218,9 @@ func stopProxy() {
 	log.Info("proxy stopped")
 }
 
-// signIn drives the interactive GitHub device-code flow via native macOS
+// signInWithGitHub drives the interactive GitHub device-code flow via native macOS
 // dialogs. It is expected to be called in its own goroutine.
-func signIn() {
+func signInWithGitHub() {
 	// Guard against double sign-in.
 	signInMu.Lock()
 	if signInCancel != nil {
@@ -231,15 +237,15 @@ func signIn() {
 		signInMu.Unlock()
 	}()
 
-	mAuth.Disable()
-	mStatus.SetTitle("⟳ Signing in…")
+	setAuthActionsEnabled(false)
+	mAuthStatus.SetTitle("⟳ Signing in with GitHub…")
 
 	dcResp, err := authenticator.RequestDeviceCode(ctx)
 	if err != nil {
 		log.Error("device code request failed", logger.Err(err))
 		showErrorDialog("Sign In Failed", fmt.Sprintf("Could not start sign-in: %v", err))
 		refreshSessionUI()
-		mAuth.Enable()
+		setAuthActionsEnabled(true)
 		return
 	}
 
@@ -255,12 +261,12 @@ func signIn() {
 	if button == "Cancel" {
 		cancel()
 		refreshSessionUI()
-		mAuth.Enable()
+		setAuthActionsEnabled(true)
 		return
 	}
 
 	openURL(dcResp.VerificationURI)
-	mStatus.SetTitle("⟳ Waiting for authorization…")
+	mAuthStatus.SetTitle("⟳ Waiting for authorization…")
 
 	if err := authenticator.PollForAuthorization(ctx, dcResp); err != nil {
 		log.Error("authorization failed", logger.Err(err))
@@ -269,7 +275,7 @@ func signIn() {
 			showErrorDialog("Sign In Failed", fmt.Sprintf("Authorization failed: %v", err))
 		}
 		refreshSessionUI()
-		mAuth.Enable()
+		setAuthActionsEnabled(true)
 		return
 	}
 
@@ -278,7 +284,45 @@ func signIn() {
 	log.Info("sign-in complete")
 }
 
-// signOut stops the proxy (if running) and clears all credentials.
+// signInWithGitHubCLI signs in using the currently authenticated GitHub CLI account.
+// It is expected to be called in its own goroutine.
+func signInWithGitHubCLI() {
+	// Guard against double sign-in.
+	signInMu.Lock()
+	if signInCancel != nil {
+		signInMu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	signInCancel = cancel
+	signInMu.Unlock()
+
+	defer func() {
+		signInMu.Lock()
+		signInCancel = nil
+		signInMu.Unlock()
+	}()
+
+	setAuthActionsEnabled(false)
+	mAuthStatus.SetTitle("⟳ Signing in with GitHub CLI…")
+
+	if err := authenticator.SignInWithGitHubCLI(ctx); err != nil {
+		log.Error("github cli sign-in failed", logger.Err(err))
+		if ctx.Err() == nil {
+			showErrorDialog("GitHub CLI Sign In Failed", fmt.Sprintf("Could not sign in with GitHub CLI. Make sure gh is installed and already authenticated with GitHub.\n\n%v", err))
+		}
+		refreshSessionUI()
+		setAuthActionsEnabled(true)
+		return
+	}
+
+	refreshSessionUI()
+	showNotification("Vekil", "Successfully signed in with GitHub CLI.")
+	log.Info("github cli sign-in complete")
+}
+
+// signOut clears Vekil credentials and stops the proxy only when active
+// providers require GitHub Copilot authentication.
 func signOut() {
 	// Cancel any in-progress sign-in.
 	signInMu.Lock()
@@ -287,7 +331,7 @@ func signOut() {
 	}
 	signInMu.Unlock()
 
-	if srv != nil && srv.IsRunning() {
+	if providersRequireGitHubAuth(providersCfg, providersConfigErr) && srv != nil && srv.IsRunning() {
 		stopProxy()
 	}
 
@@ -351,50 +395,105 @@ func applyProvidersConfigPath(path string) error {
 	return nil
 }
 
-// setSignedInUI updates the menu to reflect an authenticated state.
-func setSignedInUI() {
-	mStatus.SetTitle("● Signed in to GitHub")
-	mAuth.SetTitle("Sign Out")
-	mAuth.Enable()
-	mToggle.Enable()
-}
-
-// setSignedOutUI updates the menu to reflect an unauthenticated state.
-func setSignedOutUI() {
-	mStatus.SetTitle("○ Not signed in")
-	mAuth.SetTitle("Sign In")
-	mAuth.Enable()
-	mToggle.Disable()
-	systray.SetIcon(iconOff)
-	systray.SetTooltip("Vekil - Stopped")
-}
-
 func refreshSessionUI() {
 	refreshProvidersMenu()
 
+	status := auth.AuthStatus{Source: auth.AuthSourceNone}
+	if authenticator != nil {
+		status = authenticator.Status()
+	}
+	refreshAuthMenu(status)
+
+	running := srv != nil && srv.IsRunning()
 	switch {
 	case providersConfigErr != nil:
-		mStatus.SetTitle(providersConfigStatusTitle(providersConfigErr))
-		mAuth.SetTitle(authMenuTitle())
-		mAuth.Enable()
 		mToggle.Disable()
-		systray.SetIcon(iconOff)
-		systray.SetTooltip("Vekil - Stopped")
-	case !providersRequireGitHubAuth(providersCfg, providersConfigErr):
-		mStatus.SetTitle("● Provider-only mode")
-		mAuth.SetTitle(authMenuTitle())
-		mAuth.Enable()
-		mToggle.Enable()
-		if srv == nil || !srv.IsRunning() {
+		if !running {
 			mToggle.SetTitle("Start Vekil")
 			systray.SetIcon(iconOff)
 			systray.SetTooltip("Vekil - Stopped")
 		}
-	case authenticator.IsSignedIn():
-		setSignedInUI()
+	case !providersRequireGitHubAuth(providersCfg, providersConfigErr):
+		mToggle.Enable()
+		if !running {
+			mToggle.SetTitle("Start Vekil")
+			systray.SetIcon(iconOff)
+			systray.SetTooltip("Vekil - Stopped")
+		}
+	case status.SignedIn:
+		mToggle.Enable()
+		if !running {
+			mToggle.SetTitle("Start Vekil")
+			systray.SetIcon(iconOff)
+			systray.SetTooltip("Vekil - Stopped")
+		}
 	default:
-		setSignedOutUI()
+		mToggle.Disable()
+		if !running {
+			mToggle.SetTitle("Start Vekil")
+			systray.SetIcon(iconOff)
+			systray.SetTooltip("Vekil - Stopped")
+		}
 	}
+}
+
+func refreshAuthMenu(status auth.AuthStatus) {
+	if mAuthStatus != nil {
+		mAuthStatus.SetTitle(authStatusTitle(status))
+	}
+	if mSignInGitHub != nil {
+		mSignInGitHub.Enable()
+	}
+	if mUseGitHubCLI != nil {
+		mUseGitHubCLI.Enable()
+	}
+	if mSignOut != nil {
+		if status.SignedIn {
+			mSignOut.Enable()
+		} else {
+			mSignOut.Disable()
+		}
+	}
+}
+
+func authStatusTitle(status auth.AuthStatus) string {
+	if status.SignedIn {
+		switch status.Source {
+		case auth.AuthSourceEnv:
+			return "● Signed in with environment token"
+		case auth.AuthSourceVekil:
+			return "● Signed in with GitHub"
+		case auth.AuthSourceGitHubCLI:
+			return "● Using GitHub CLI"
+		default:
+			return "● Signed in"
+		}
+	}
+	if status.SignedOut {
+		return "○ Signed out"
+	}
+	return "○ Not signed in"
+}
+
+func setAuthActionsEnabled(enabled bool) {
+	if !enabled {
+		if mSignInGitHub != nil {
+			mSignInGitHub.Disable()
+		}
+		if mUseGitHubCLI != nil {
+			mUseGitHubCLI.Disable()
+		}
+		if mSignOut != nil {
+			mSignOut.Disable()
+		}
+		return
+	}
+
+	status := auth.AuthStatus{Source: auth.AuthSourceNone}
+	if authenticator != nil {
+		status = authenticator.Status()
+	}
+	refreshAuthMenu(status)
 }
 
 func refreshProvidersMenu() {
@@ -419,13 +518,6 @@ func providersMenuTitle() string {
 	default:
 		return fmt.Sprintf("Providers: %s", filepath.Base(menubarCfg.ProvidersConfigPath))
 	}
-}
-
-func authMenuTitle() string {
-	if authenticator != nil && authenticator.IsSignedIn() {
-		return "Sign Out"
-	}
-	return "Sign In"
 }
 
 func logProvidersConfigLoadError(err error) {

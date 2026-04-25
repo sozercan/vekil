@@ -107,15 +107,22 @@ If you are using zero-config startup or an explicit `type: "copilot"` provider, 
 
 1. `COPILOT_GITHUB_TOKEN` when set explicitly for CI or another non-interactive environment.
 2. Vekil's cached GitHub access token in `~/.config/vekil/`.
-3. An authenticated GitHub CLI via `gh auth token --hostname github.com`.
+3. An authenticated GitHub CLI via `gh auth token --hostname github.com`, but only after you explicitly opt in with `vekil login --github-cli` or `vekil login --gh`.
 
-If none of those sources is available, Vekil starts GitHub's device code flow on first run:
+If none of those sources is available, Vekil starts GitHub's device-code flow on first run:
 
 1. Visit the URL shown in the terminal.
 2. Enter the one-time code.
 3. Authorize the application.
 
-Tokens are cached in `~/.config/vekil/` and refreshed automatically before expiry. Tokens borrowed from the GitHub CLI are used for the Copilot exchange but are not copied into Vekil's `access-token` cache.
+You can also run `vekil login` ahead of time to start the same device-code flow. If an existing Vekil login is still refreshable, `vekil login` reuses it and prints `Already logged in.`; use `vekil login --force` to skip that refresh check and force a new device-code sign-in.
+
+To use the account that is already authenticated with the GitHub CLI, run `vekil login --github-cli` or the shorter `vekil login --gh`. This records an explicit preference to use `gh` for future Copilot token refreshes, but the GitHub CLI token itself is not copied into Vekil's `access-token` cache.
+
+Tokens are cached in `~/.config/vekil/` and refreshed automatically before expiry. GitHub CLI-backed sign-in caches only the short-lived Copilot token and the explicit `gh` opt-in preference; it does not persist the GitHub CLI access token as a Vekil-managed token.
+
+Signing out with `vekil logout` clears Vekil's cached credentials, disables GitHub CLI auto sign-in, and records a signed-out state so Vekil will not automatically borrow GitHub CLI credentials again. Run `vekil login --github-cli` to opt back into GitHub CLI auth, sign in with the device-code flow to use Vekil-managed OAuth, or set `COPILOT_GITHUB_TOKEN` explicitly for a non-interactive session.
+
 If `HTTP_PROXY` or `HTTPS_PROXY` points at a local loopback proxy that is not running, the auth flow automatically retries GitHub requests directly.
 
 ### Azure OpenAI

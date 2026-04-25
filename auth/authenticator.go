@@ -26,6 +26,8 @@ const (
 	copilotTokenURL       = "https://api.github.com/copilot_internal/v2/token"
 	defaultTokenDir       = "~/.config/vekil"
 	githubCLITokenTimeout = 5 * time.Second
+	signedOutMarkerFile   = "signed-out"
+	authPreferencesFile   = "auth-preferences.json"
 )
 
 var accessTokenEnvVars = []string{
@@ -94,6 +96,34 @@ type CopilotTokenResponse struct {
 	ErrorDetails string `json:"error_details,omitempty"`
 }
 
+// AuthPreferences stores explicit authentication preferences shared by the
+// CLI and menubar app.
+type AuthPreferences struct {
+	GitHubCLIAutoSignIn bool `json:"github_cli_auto_sign_in,omitempty"`
+}
+
+// AuthSource identifies the source of the currently usable authentication
+// state.
+type AuthSource string
+
+const (
+	AuthSourceNone      AuthSource = "none"
+	AuthSourceEnv       AuthSource = "env"
+	AuthSourceVekil     AuthSource = "vekil"
+	AuthSourceGitHubCLI AuthSource = "github-cli"
+)
+
+// AuthStatus is a fast snapshot of local authentication state. It never shells
+// out to external tools such as gh.
+type AuthStatus struct {
+	SignedIn             bool
+	Source               AuthSource
+	GitHubCLIAutoSignIn  bool
+	SignedOut            bool
+	HasValidCopilotCache bool
+	HasVekilAccessToken  bool
+}
+
 // NewAuthenticator creates an Authenticator that stores tokens in tokenDir.
 // If tokenDir is empty, it defaults to ~/.config/vekil.
 func NewAuthenticator(tokenDir string) (*Authenticator, error) {
@@ -117,22 +147,67 @@ func NewAuthenticator(tokenDir string) (*Authenticator, error) {
 	}, nil
 }
 
-// IsSignedIn reports whether the authenticator has a GitHub access token
-// either in memory or persisted on disk.
+// IsSignedIn reports whether the authenticator has a usable or explicitly
+// configured local authentication source.
 func (a *Authenticator) IsSignedIn() bool {
-	if token, _ := lookupAccessTokenFromEnv(); token != "" {
-		return true
+	return a.Status().SignedIn
+}
+
+// Status returns a fast snapshot of local authentication state without making
+// network requests or invoking external commands.
+func (a *Authenticator) Status() AuthStatus {
+	status := AuthStatus{
+		Source:              AuthSourceNone,
+		GitHubCLIAutoSignIn: a.isGitHubCLIAutoSignInEnabled(),
+		SignedOut:           a.hasSignedOutMarker(),
 	}
 
+	status.HasVekilAccessToken = a.hasAccessTokenOnDisk()
+	status.HasValidCopilotCache = a.hasValidCopilotTokenOnDisk()
+
 	a.mu.RLock()
-	defer a.mu.RUnlock()
-	if a.accessToken != "" {
-		return true
+	memoryAccessToken := strings.TrimSpace(a.accessToken) != ""
+	memoryCopilotToken := a.copilotToken != "" && time.Now().Before(a.tokenExpiry)
+	a.mu.RUnlock()
+
+	if token, _ := lookupAccessTokenFromEnv(); token != "" {
+		status.SignedIn = true
+		status.Source = AuthSourceEnv
+		return status
 	}
-	if a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
-		return true
+
+	if status.HasVekilAccessToken {
+		status.SignedIn = true
+		status.Source = AuthSourceVekil
+		return status
 	}
-	return a.hasAccessTokenOnDisk() || a.hasValidCopilotTokenOnDisk()
+
+	if memoryAccessToken {
+		status.SignedIn = true
+		if status.GitHubCLIAutoSignIn && (memoryCopilotToken || status.HasValidCopilotCache) {
+			status.Source = AuthSourceGitHubCLI
+		} else {
+			status.Source = AuthSourceVekil
+		}
+		return status
+	}
+
+	if memoryCopilotToken || status.HasValidCopilotCache {
+		status.SignedIn = true
+		if status.GitHubCLIAutoSignIn {
+			status.Source = AuthSourceGitHubCLI
+		} else {
+			status.Source = AuthSourceVekil
+		}
+		return status
+	}
+
+	if status.GitHubCLIAutoSignIn && !status.SignedOut {
+		status.SignedIn = true
+		status.Source = AuthSourceGitHubCLI
+	}
+
+	return status
 }
 
 // hasAccessTokenOnDisk returns true when the access-token file exists and is
@@ -287,16 +362,21 @@ func (a *Authenticator) refreshToken(ctx context.Context, allowDeviceFlow bool) 
 	// If there is no Vekil-managed GitHub token, or the existing token is no
 	// longer usable, try borrowing the active GitHub CLI token before falling
 	// back to the interactive device-code flow. Do not do this after transient
-	// Copilot exchange failures; those should be surfaced as-is.
+	// Copilot exchange failures, or after an explicit Vekil sign-out; those
+	// should be surfaced as-is.
 	if refreshErr == nil || IsInteractiveLoginRequired(refreshErr) {
-		if err := a.loadGitHubCLIAccessToken(ctx); err == nil {
-			if err := a.exchangeForCopilotToken(ctx); err == nil {
-				return nil
-			} else {
+		if !a.hasSignedOutMarker() && a.isGitHubCLIAutoSignInEnabled() {
+			previousAccessToken := a.accessToken
+			if err := a.loadGitHubCLIAccessToken(ctx); err == nil {
+				if err := a.exchangeForCopilotToken(ctx); err == nil {
+					return nil
+				} else {
+					a.accessToken = previousAccessToken
+					refreshErr = err
+				}
+			} else if !errors.Is(err, ErrNotAuthenticated) && refreshErr == nil {
 				refreshErr = err
 			}
-		} else if !errors.Is(err, ErrNotAuthenticated) && refreshErr == nil {
-			refreshErr = err
 		}
 	}
 
@@ -396,7 +476,16 @@ func (a *Authenticator) pollForAuthorization(ctx context.Context, dcResp *Device
 			if err := a.saveAccessToken(); err != nil {
 				return fmt.Errorf("saving access token: %w", err)
 			}
-			return a.exchangeForCopilotToken(ctx)
+			if err := a.exchangeForCopilotToken(ctx); err != nil {
+				return err
+			}
+			if err := a.clearSignedOutMarker(); err != nil {
+				return fmt.Errorf("clearing signed-out marker: %w", err)
+			}
+			if err := a.setGitHubCLIAutoSignIn(false); err != nil {
+				return fmt.Errorf("saving auth preferences: %w", err)
+			}
+			return nil
 		case "authorization_pending":
 			continue
 		case "slow_down":
@@ -434,12 +523,57 @@ func (a *Authenticator) SignOut() error {
 	var errs []error
 	for _, name := range []string{"access-token", "api-key.json"} {
 		if err := os.Remove(filepath.Join(a.tokenDir, name)); err != nil && !os.IsNotExist(err) {
-			errs = append(errs, err)
+			errs = append(errs, fmt.Errorf("remove %s: %w", name, err))
 		}
 	}
-	if len(errs) > 0 {
-		return fmt.Errorf("sign out cleanup: %v", errs)
+	if err := a.setGitHubCLIAutoSignIn(false); err != nil {
+		errs = append(errs, fmt.Errorf("writing auth preferences: %w", err))
 	}
+	if err := a.markSignedOut(); err != nil {
+		errs = append(errs, fmt.Errorf("writing signed-out marker: %w", err))
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("sign out cleanup: %w", errors.Join(errs...))
+	}
+	return nil
+}
+
+// SignInWithGitHubCLI explicitly signs in using the currently authenticated
+// GitHub CLI account. The GitHub CLI token is used only for the Copilot token
+// exchange and is never persisted as Vekil's access-token cache.
+func (a *Authenticator) SignInWithGitHubCLI(ctx context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	accessToken, err := a.gitHubCLIAccessToken(ctx)
+	if err != nil {
+		return err
+	}
+
+	previousAccessToken := a.accessToken
+	previousCopilotToken := a.copilotToken
+	previousTokenExpiry := a.tokenExpiry
+
+	a.accessToken = accessToken
+	a.copilotToken = ""
+	a.tokenExpiry = time.Time{}
+
+	if err := a.exchangeForCopilotToken(ctx); err != nil {
+		a.accessToken = previousAccessToken
+		a.copilotToken = previousCopilotToken
+		a.tokenExpiry = previousTokenExpiry
+		return err
+	}
+	if err := os.Remove(filepath.Join(a.tokenDir, "access-token")); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing stale access token: %w", err)
+	}
+	if err := a.clearSignedOutMarker(); err != nil {
+		return fmt.Errorf("clearing signed-out marker: %w", err)
+	}
+	if err := a.setGitHubCLIAutoSignIn(true); err != nil {
+		return fmt.Errorf("saving auth preferences: %w", err)
+	}
+
 	return nil
 }
 
@@ -636,6 +770,78 @@ func (a *Authenticator) loadAccessToken() error {
 	a.accessToken = strings.TrimSpace(string(data))
 	if a.accessToken == "" {
 		return ErrNotAuthenticated
+	}
+	return nil
+}
+
+func (a *Authenticator) signedOutMarkerPath() string {
+	return filepath.Join(a.tokenDir, signedOutMarkerFile)
+}
+
+func (a *Authenticator) authPreferencesPath() string {
+	return filepath.Join(a.tokenDir, authPreferencesFile)
+}
+
+func (a *Authenticator) loadAuthPreferences() (AuthPreferences, error) {
+	data, err := os.ReadFile(a.authPreferencesPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return AuthPreferences{}, nil
+		}
+		return AuthPreferences{}, err
+	}
+
+	var prefs AuthPreferences
+	if err := json.Unmarshal(data, &prefs); err != nil {
+		return AuthPreferences{}, err
+	}
+	return prefs, nil
+}
+
+func (a *Authenticator) saveAuthPreferences(prefs AuthPreferences) error {
+	data, err := json.MarshalIndent(prefs, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return atomicWriteFile(a.authPreferencesPath(), data, 0o600)
+}
+
+func (a *Authenticator) isGitHubCLIAutoSignInEnabled() bool {
+	prefs, err := a.loadAuthPreferences()
+	if err != nil {
+		return false
+	}
+	return prefs.GitHubCLIAutoSignIn
+}
+
+func (a *Authenticator) setGitHubCLIAutoSignIn(enabled bool) error {
+	prefs, err := a.loadAuthPreferences()
+	if err != nil {
+		prefs = AuthPreferences{}
+	}
+	prefs.GitHubCLIAutoSignIn = enabled
+	return a.saveAuthPreferences(prefs)
+}
+
+// GitHubCLIAutoSignInEnabled reports whether the user has explicitly opted in
+// to automatic GitHub CLI sign-in. Malformed preferences are treated as false.
+func (a *Authenticator) GitHubCLIAutoSignInEnabled() bool {
+	return a.isGitHubCLIAutoSignInEnabled()
+}
+
+func (a *Authenticator) hasSignedOutMarker() bool {
+	_, err := os.Stat(a.signedOutMarkerPath())
+	return err == nil || !os.IsNotExist(err)
+}
+
+func (a *Authenticator) markSignedOut() error {
+	return atomicWriteFile(a.signedOutMarkerPath(), []byte("signed out\n"), 0o600)
+}
+
+func (a *Authenticator) clearSignedOutMarker() error {
+	if err := os.Remove(a.signedOutMarkerPath()); err != nil && !os.IsNotExist(err) {
+		return err
 	}
 	return nil
 }
