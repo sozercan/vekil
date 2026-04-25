@@ -22,7 +22,7 @@ var (
 	authenticator *auth.Authenticator
 
 	// Menu items kept at package level so helpers can update them.
-	mAuthStatus      *systray.MenuItem
+	mAuthMenu        *systray.MenuItem
 	mToggle          *systray.MenuItem
 	mSignInGitHub    *systray.MenuItem
 	mUseGitHubCLI    *systray.MenuItem
@@ -60,8 +60,12 @@ func onReady() {
 	systray.SetIcon(iconOff)
 	systray.SetTooltip("Vekil - Stopped")
 
-	mAuthStatus = systray.AddMenuItem("○ Not signed in", "")
-	mAuthStatus.Disable()
+	mAuthMenu = systray.AddMenuItem("GitHub Auth: Not Signed In", "GitHub authentication")
+	mSignInGitHub = mAuthMenu.AddSubMenuItem("Sign In with GitHub", "Sign in through GitHub in your browser and let Vekil manage the token")
+	mUseGitHubCLI = mAuthMenu.AddSubMenuItem("Use GitHub CLI Account", "Use the account already authenticated with gh auth login")
+	mAuthMenu.AddSeparator()
+	mSignOut = mAuthMenu.AddSubMenuItem("Sign Out", "Clear Vekil authentication")
+
 	mVersion := systray.AddMenuItem(versionMenuTitle(), "Current app version")
 	mVersion.Disable()
 	systray.AddSeparator()
@@ -82,11 +86,6 @@ func onReady() {
 		}
 		mLaunch.Check()
 	}
-
-	mSignInGitHub = systray.AddMenuItem("Sign In with GitHub", "Sign in with GitHub using a browser code")
-	mUseGitHubCLI = systray.AddMenuItem("Use GitHub CLI", "Use the currently authenticated GitHub CLI account")
-	mSignOut = systray.AddMenuItem("Sign Out", "Clear Vekil authentication")
-	systray.AddSeparator()
 
 	var mCheckUpdates *systray.MenuItem
 	if updaterSupported() {
@@ -172,7 +171,7 @@ func startProxy() {
 			log.Error("auth failed", logger.Err(err))
 			showErrorDialog(
 				"GitHub Sign In Required",
-				fmt.Sprintf("The active providers config uses GitHub Copilot, but Vekil could not refresh authentication.\n\nChoose ‘Sign In with GitHub’ or ‘Use GitHub CLI’ from the Vekil menu, then start Vekil again.\n\n%v", err),
+				fmt.Sprintf("The active providers config uses GitHub Copilot, but Vekil could not refresh authentication.\n\nOpen ‘GitHub Auth’ and choose ‘Sign In with GitHub’ or ‘Use GitHub CLI Account’, then start Vekil again.\n\n%v", err),
 			)
 			refreshSessionUI()
 			return
@@ -238,7 +237,7 @@ func signInWithGitHub() {
 	}()
 
 	setAuthActionsEnabled(false)
-	mAuthStatus.SetTitle("⟳ Signing in with GitHub…")
+	mAuthMenu.SetTitle("GitHub Auth: Signing in with GitHub…")
 
 	dcResp, err := authenticator.RequestDeviceCode(ctx)
 	if err != nil {
@@ -266,7 +265,7 @@ func signInWithGitHub() {
 	}
 
 	openURL(dcResp.VerificationURI)
-	mAuthStatus.SetTitle("⟳ Waiting for authorization…")
+	mAuthMenu.SetTitle("GitHub Auth: Waiting for authorization…")
 
 	if err := authenticator.PollForAuthorization(ctx, dcResp); err != nil {
 		log.Error("authorization failed", logger.Err(err))
@@ -304,7 +303,7 @@ func signInWithGitHubCLI() {
 	}()
 
 	setAuthActionsEnabled(false)
-	mAuthStatus.SetTitle("⟳ Signing in with GitHub CLI…")
+	mAuthMenu.SetTitle("GitHub Auth: Signing in with GitHub CLI…")
 
 	if err := authenticator.SignInWithGitHubCLI(ctx); err != nil {
 		log.Error("github cli sign-in failed", logger.Err(err))
@@ -438,8 +437,8 @@ func refreshSessionUI() {
 }
 
 func refreshAuthMenu(status auth.AuthStatus) {
-	if mAuthStatus != nil {
-		mAuthStatus.SetTitle(authStatusTitle(status))
+	if mAuthMenu != nil {
+		mAuthMenu.SetTitle(authMenuTitle(status))
 	}
 	if mSignInGitHub != nil {
 		mSignInGitHub.Enable()
@@ -456,23 +455,23 @@ func refreshAuthMenu(status auth.AuthStatus) {
 	}
 }
 
-func authStatusTitle(status auth.AuthStatus) string {
+func authMenuTitle(status auth.AuthStatus) string {
 	if status.SignedIn {
 		switch status.Source {
 		case auth.AuthSourceEnv:
-			return "● Signed in with environment token"
+			return "GitHub Auth: Environment Token"
 		case auth.AuthSourceVekil:
-			return "● Signed in with GitHub"
+			return "GitHub Auth: Signed in with GitHub"
 		case auth.AuthSourceGitHubCLI:
-			return "● Using GitHub CLI"
+			return "GitHub Auth: Using GitHub CLI Account"
 		default:
-			return "● Signed in"
+			return "GitHub Auth: Signed In"
 		}
 	}
 	if status.SignedOut {
-		return "○ Signed out"
+		return "GitHub Auth: Signed Out"
 	}
-	return "○ Not signed in"
+	return "GitHub Auth: Not Signed In"
 }
 
 func setAuthActionsEnabled(enabled bool) {

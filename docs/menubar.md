@@ -44,20 +44,20 @@ open "Vekil.app"
 - status icon: white robot when running, gray when stopped
 - current app version shown in the menu
 - choose and persist a `providers-config` JSON or YAML file from the menu
-- separate authentication actions for `Sign In with GitHub`, `Use GitHub CLI`, and `Sign Out`
+- `GitHub Auth` submenu with current status and actions for `Sign In with GitHub`, `Use GitHub CLI Account`, and `Sign Out`
 - optional LaunchAgent integration for launch at login
 - tooltip showing running/stopped state and port
 - `Check for Updates…` in packaged macOS app builds
 
 ## Authentication
 
-The tray menu shows a read-only GitHub auth status plus explicit actions:
+The tray menu shows a `GitHub Auth` parent item whose title reports the current auth state. Its submenu contains explicit actions:
 
 - `Sign In with GitHub` starts Vekil's browser/device-code flow and stores Vekil-managed credentials in `~/.config/vekil/`.
-- `Use GitHub CLI` opts in to the account already authenticated by `gh auth login`. Vekil uses `gh auth token --hostname github.com` for Copilot access and keeps that token in memory only; it does not copy the GitHub CLI token into Vekil's `access-token` or `api-key.json` caches.
-- `Sign Out` clears Vekil's cached credentials, disables GitHub CLI auto sign-in, and records a signed-out state. The app will not silently fall back to GitHub CLI again until you choose `Use GitHub CLI` or run `vekil login --github-cli` / `vekil login --gh`.
+- `Use GitHub CLI Account` opts in to the account already authenticated by `gh auth login`. Vekil uses `gh auth token --hostname github.com` for Copilot access and keeps that token in memory only; it does not copy the GitHub CLI token into Vekil's `access-token` or `api-key.json` caches.
+- `Sign Out` clears Vekil's cached credentials, disables GitHub CLI auto sign-in, and records a signed-out state. The app will not silently fall back to GitHub CLI again until you choose `Use GitHub CLI Account` or run `vekil login --github-cli` / `vekil login --gh`.
 
-When the active providers config uses Copilot, start-up needs one of those GitHub auth sources or an explicit `COPILOT_GITHUB_TOKEN`. If auth is missing or expired, the app asks you to choose `Sign In with GitHub` or `Use GitHub CLI` instead of starting a sign-in flow automatically.
+When the active providers config uses Copilot, start-up needs one of those GitHub auth sources or an explicit `COPILOT_GITHUB_TOKEN`. If auth is missing or expired, the app asks you to open `GitHub Auth` and choose `Sign In with GitHub` or `Use GitHub CLI Account` instead of starting a sign-in flow automatically.
 
 Provider-only configs that omit Copilot do not require GitHub auth; the proxy can keep running after `Sign Out` in that mode.
 
