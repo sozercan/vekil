@@ -791,8 +791,8 @@ func TestStatus_ReportsAuthSources(t *testing.T) {
 func TestPollForAuthorization_Success(t *testing.T) {
 	call := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/login/oauth/access_token":
+		switch r.URL.Path {
+		case "/login/oauth/access_token":
 			call++
 			if call == 1 {
 				// First call: authorization_pending
@@ -805,7 +805,7 @@ func TestPollForAuthorization_Success(t *testing.T) {
 					AccessToken: "ghu_success",
 				})
 			}
-		case r.URL.Path == "/copilot_internal/v2/token":
+		case "/copilot_internal/v2/token":
 			_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
 				Token:     "copilot-tok-poll",
 				ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),

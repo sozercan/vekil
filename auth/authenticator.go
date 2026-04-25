@@ -421,7 +421,7 @@ func (a *Authenticator) RequestDeviceCode(ctx context.Context) (*DeviceCodeRespo
 	if err != nil {
 		return nil, fmt.Errorf("requesting device code: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var dcResp DeviceCodeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&dcResp); err != nil {
@@ -474,7 +474,7 @@ func (a *Authenticator) pollForAuthorization(ctx context.Context, dcResp *Device
 
 		var atResp AccessTokenResponse
 		respBody, _ := io.ReadAll(tokenResp.Body)
-		tokenResp.Body.Close()
+		_ = tokenResp.Body.Close()
 		if err := json.Unmarshal(respBody, &atResp); err != nil {
 			return fmt.Errorf("decoding access token response: %w (body: %s)", err, string(respBody))
 		}
@@ -514,7 +514,7 @@ func (a *Authenticator) deviceCodeFlow(ctx context.Context) error {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "Please visit %s and enter code: %s\n", dcResp.VerificationURI, dcResp.UserCode)
+	_, _ = fmt.Fprintf(os.Stderr, "Please visit %s and enter code: %s\n", dcResp.VerificationURI, dcResp.UserCode)
 
 	return a.pollForAuthorization(ctx, dcResp)
 }
@@ -628,7 +628,7 @@ func (a *Authenticator) validateGitHubCLIToken(ctx context.Context, accessToken 
 	if err != nil {
 		return fmt.Errorf("validating github cli copilot access: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		detail := readGitHubAPIErrorDetail(resp.Body)
@@ -685,7 +685,7 @@ func (a *Authenticator) exchangeForCopilotToken(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("requesting copilot token: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var ctResp CopilotTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&ctResp); err != nil {

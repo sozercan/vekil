@@ -381,7 +381,7 @@ func writeCachedModelsResponse(w http.ResponseWriter, entry cachedModelsResponse
 // HandleHealthz handles GET /healthz and returns {"status":"ok"}.
 func (h *ProxyHandler) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"status":"ok"}`))
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
 // HandleReadyz validates that the proxy can obtain an auth token and reach the
@@ -834,7 +834,7 @@ func supportsEndpoint(supportedEndpoints []string, endpoint string) bool {
 func writeAnthropicError(w http.ResponseWriter, status int, errType, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(models.AnthropicError{
+	_ = json.NewEncoder(w).Encode(models.AnthropicError{
 		Type: "error",
 		Error: struct {
 			Type    string `json:"type"`
@@ -857,7 +857,7 @@ func writeOpenAIErrorWithRetryAfter(w http.ResponseWriter, status int, message, 
 		}
 	}
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": map[string]interface{}{
 			"message": message,
 			"type":    errType,

@@ -101,56 +101,56 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 			return 0
 		}
 		if err == errConflictingLoginFlags {
-			fmt.Fprintf(deps.stderr, "error: %v\n", err)
+			_, _ = fmt.Fprintf(deps.stderr, "error: %v\n", err)
 		}
 		return 2
 	}
 
 	authenticator, err := deps.newAuthenticator(opts.tokenDir)
 	if err != nil {
-		fmt.Fprintf(deps.stderr, "error: %v\n", err)
+		_, _ = fmt.Fprintf(deps.stderr, "error: %v\n", err)
 		return 1
 	}
 
 	ctx := context.Background()
 	if opts.useGitHubCLI {
 		if err := authenticator.SignInWithGitHubCLI(ctx); err != nil {
-			fmt.Fprintf(deps.stderr, "error signing in with GitHub CLI: %v\n", err)
+			_, _ = fmt.Fprintf(deps.stderr, "error signing in with GitHub CLI: %v\n", err)
 			return 1
 		}
-		fmt.Fprintln(deps.stderr, "Login successful.")
+		_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
 		return 0
 	}
 
 	if !opts.force {
 		if _, err := authenticator.RefreshTokenNonInteractive(ctx); err == nil {
-			fmt.Fprintln(deps.stderr, "Already logged in.")
+			_, _ = fmt.Fprintln(deps.stderr, "Already logged in.")
 			return 0
 		} else if !auth.IsInteractiveLoginRequired(err) {
-			fmt.Fprintf(deps.stderr, "error refreshing existing login: %v\n", err)
+			_, _ = fmt.Fprintf(deps.stderr, "error refreshing existing login: %v\n", err)
 			return 1
 		}
 	}
 
 	dcResp, err := authenticator.RequestDeviceCode(ctx)
 	if err != nil {
-		fmt.Fprintf(deps.stderr, "error requesting device code: %v\n", err)
+		_, _ = fmt.Fprintf(deps.stderr, "error requesting device code: %v\n", err)
 		return 1
 	}
 
-	fmt.Fprintf(deps.stderr, "Opening browser to %s\n", dcResp.VerificationURI)
-	fmt.Fprintf(deps.stderr, "Enter code: %s\n", dcResp.UserCode)
+	_, _ = fmt.Fprintf(deps.stderr, "Opening browser to %s\n", dcResp.VerificationURI)
+	_, _ = fmt.Fprintf(deps.stderr, "Enter code: %s\n", dcResp.UserCode)
 
 	if err := deps.openURL(dcResp.VerificationURI); err != nil {
-		fmt.Fprintf(deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
+		_, _ = fmt.Fprintf(deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
 	}
 
 	if err := authenticator.PollForAuthorization(ctx, dcResp); err != nil {
-		fmt.Fprintf(deps.stderr, "error: %v\n", err)
+		_, _ = fmt.Fprintf(deps.stderr, "error: %v\n", err)
 		return 1
 	}
 
-	fmt.Fprintln(deps.stderr, "Login successful.")
+	_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
 	return 0
 }
 
@@ -198,16 +198,16 @@ func runLogout(args []string) {
 
 	authenticator, err := auth.NewAuthenticator(*tokenDir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
 	if err := authenticator.SignOut(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
+	_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
 }
 
 func runServe() {
@@ -306,7 +306,7 @@ func getEnvBool(key string, fallback bool) bool {
 	}
 	parsed, err := strconv.ParseBool(v)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
+		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -319,7 +319,7 @@ func getEnvInt(key string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(v)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
+		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -332,7 +332,7 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	}
 	parsed, err := time.ParseDuration(v)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
+		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
