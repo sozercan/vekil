@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -19,11 +20,12 @@ import (
 )
 
 const (
-	githubClientID  = "Iv1.b507a08c87ecfe98"
-	deviceCodeURL   = "https://github.com/login/device/code"
-	accessTokenURL  = "https://github.com/login/oauth/access_token"
-	copilotTokenURL = "https://api.github.com/copilot_internal/v2/token"
-	defaultTokenDir = "~/.config/vekil"
+	githubClientID        = "Iv1.b507a08c87ecfe98"
+	deviceCodeURL         = "https://github.com/login/device/code"
+	accessTokenURL        = "https://github.com/login/oauth/access_token"
+	copilotTokenURL       = "https://api.github.com/copilot_internal/v2/token"
+	defaultTokenDir       = "~/.config/vekil"
+	githubCLITokenTimeout = 5 * time.Second
 )
 
 var accessTokenEnvVars = []string{
@@ -31,6 +33,12 @@ var accessTokenEnvVars = []string{
 }
 
 var (
+	githubCLICommonPaths = []string{
+		"/opt/homebrew/bin/gh",
+		"/usr/local/bin/gh",
+		"/usr/bin/gh",
+	}
+
 	// ErrNotAuthenticated indicates that no reusable GitHub access token was
 	// available for a token refresh attempt.
 	ErrNotAuthenticated = errors.New("not authenticated")
@@ -52,6 +60,7 @@ type Authenticator struct {
 	client         *http.Client
 	directClient   *http.Client
 	copilotBaseURL string // overridable for tests; defaults to https://api.github.com
+	githubCLIPath  string // optional override for tests; defaults to gh lookup/common paths
 
 	// DisableAutoDeviceFlow prevents refreshToken from falling through to the
 	// interactive device-code flow. When true, callers (e.g. the menubar app)
@@ -273,6 +282,22 @@ func (a *Authenticator) refreshToken(ctx context.Context, allowDeviceFlow bool) 
 		}
 	} else if refreshErr == nil && !os.IsNotExist(err) {
 		refreshErr = fmt.Errorf("loading access token: %w", err)
+	}
+
+	// If there is no Vekil-managed GitHub token, or the existing token is no
+	// longer usable, try borrowing the active GitHub CLI token before falling
+	// back to the interactive device-code flow. Do not do this after transient
+	// Copilot exchange failures; those should be surfaced as-is.
+	if refreshErr == nil || IsInteractiveLoginRequired(refreshErr) {
+		if err := a.loadGitHubCLIAccessToken(ctx); err == nil {
+			if err := a.exchangeForCopilotToken(ctx); err == nil {
+				return nil
+			} else {
+				refreshErr = err
+			}
+		} else if !errors.Is(err, ErrNotAuthenticated) && refreshErr == nil {
+			refreshErr = err
+		}
 	}
 
 	if refreshErr == nil {
@@ -609,7 +634,88 @@ func (a *Authenticator) loadAccessToken() error {
 		return err
 	}
 	a.accessToken = strings.TrimSpace(string(data))
+	if a.accessToken == "" {
+		return ErrNotAuthenticated
+	}
 	return nil
+}
+
+func (a *Authenticator) loadGitHubCLIAccessToken(ctx context.Context) error {
+	token, err := a.gitHubCLIAccessToken(ctx)
+	if err != nil {
+		return err
+	}
+	a.accessToken = token
+	return nil
+}
+
+func (a *Authenticator) gitHubCLIAccessToken(ctx context.Context) (string, error) {
+	ghPath, err := a.gitHubCLIExecutable()
+	if err != nil {
+		return "", err
+	}
+
+	cmdCtx, cancel := context.WithTimeout(ctx, githubCLITokenTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(cmdCtx, ghPath, "auth", "token", "--hostname", "github.com")
+	cmd.Env = githubCLIEnvironment()
+
+	output, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf("%w: github cli auth token unavailable", ErrNotAuthenticated)
+	}
+
+	token := strings.TrimSpace(string(output))
+	if token == "" {
+		return "", fmt.Errorf("%w: github cli returned an empty token", ErrNotAuthenticated)
+	}
+	return token, nil
+}
+
+func (a *Authenticator) gitHubCLIExecutable() (string, error) {
+	if strings.TrimSpace(a.githubCLIPath) != "" {
+		return a.githubCLIPath, nil
+	}
+
+	if path, err := exec.LookPath("gh"); err == nil {
+		return path, nil
+	}
+
+	for _, path := range githubCLICommonPaths {
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if info.Mode()&0o111 != 0 {
+			return path, nil
+		}
+	}
+
+	return "", fmt.Errorf("%w: gh executable not found", ErrNotAuthenticated)
+}
+
+func githubCLIEnvironment() []string {
+	env := os.Environ()
+	filtered := make([]string, 0, len(env)+1)
+
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		switch name {
+		case "GH_TOKEN", "GITHUB_TOKEN", "GH_PROMPT_DISABLED":
+			continue
+		default:
+			filtered = append(filtered, kv)
+		}
+	}
+
+	// Ensure gh never opens an interactive prompt when Vekil is only probing for
+	// an existing CLI login.
+	filtered = append(filtered, "GH_PROMPT_DISABLED=1")
+	return filtered
 }
 
 func (a *Authenticator) saveAccessToken() error {

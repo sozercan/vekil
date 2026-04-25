@@ -103,13 +103,19 @@ Startup behavior depends on the providers that are active in your deployment.
 
 ### GitHub Copilot
 
-If you are using zero-config startup or an explicit `type: "copilot"` provider, the proxy starts GitHub's device code flow on first run:
+If you are using zero-config startup or an explicit `type: "copilot"` provider, the proxy first looks for GitHub authentication in this order:
+
+1. `COPILOT_GITHUB_TOKEN` when set explicitly for CI or another non-interactive environment.
+2. Vekil's cached GitHub access token in `~/.config/vekil/`.
+3. An authenticated GitHub CLI via `gh auth token --hostname github.com`.
+
+If none of those sources is available, Vekil starts GitHub's device code flow on first run:
 
 1. Visit the URL shown in the terminal.
 2. Enter the one-time code.
 3. Authorize the application.
 
-Tokens are cached in `~/.config/vekil/` and refreshed automatically before expiry.
+Tokens are cached in `~/.config/vekil/` and refreshed automatically before expiry. Tokens borrowed from the GitHub CLI are used for the Copilot exchange but are not copied into Vekil's `access-token` cache.
 If `HTTP_PROXY` or `HTTPS_PROXY` points at a local loopback proxy that is not running, the auth flow automatically retries GitHub requests directly.
 
 ### Azure OpenAI

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -363,6 +364,11 @@ func TestIsSignedIn_WithEnvToken(t *testing.T) {
 	}
 }
 
+func missingGitHubCLIPath(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "missing-gh")
+}
+
 func TestGetToken_IgnoresGenericGitHubEnvVars(t *testing.T) {
 	t.Setenv("GH_TOKEN", "generic-gh-token")
 	t.Setenv("GITHUB_TOKEN", "generic-github-token")
@@ -388,6 +394,7 @@ func TestGetToken_IgnoresGenericGitHubEnvVars(t *testing.T) {
 
 	a := &Authenticator{
 		tokenDir:       dir,
+		githubCLIPath:  missingGitHubCLIPath(t),
 		client:         server.Client(),
 		copilotBaseURL: server.URL,
 	}
@@ -711,6 +718,7 @@ func TestRefreshToken_DisableAutoDeviceFlow(t *testing.T) {
 	a := &Authenticator{
 		tokenDir:              t.TempDir(),
 		client:                &http.Client{Timeout: 5 * time.Second},
+		githubCLIPath:         missingGitHubCLIPath(t),
 		DisableAutoDeviceFlow: true,
 	}
 
@@ -752,6 +760,78 @@ func TestRefreshToken_UsesEnvAccessTokenWithoutSavingAccessToken(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "access-token")); !os.IsNotExist(err) {
 		t.Fatalf("expected no access-token file to be written, got err=%v", err)
+	}
+}
+
+func TestRefreshTokenNonInteractive_UsesGitHubCLITokenWithoutSavingAccessToken(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake gh shell script test is Unix-only")
+	}
+
+	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+if [ "$1" != "auth" ] || [ "$2" != "token" ] || [ "$3" != "--hostname" ] || [ "$4" != "github.com" ]; then
+  exit 2
+fi
+if [ -n "$GH_TOKEN" ] || [ -n "$GITHUB_TOKEN" ]; then
+  exit 3
+fi
+if [ "$GH_PROMPT_DISABLED" != "1" ]; then
+  exit 4
+fi
+printf 'gh-cli-access-token\n'
+`
+	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+
+	t.Setenv("GH_TOKEN", "generic-gh-token")
+	t.Setenv("GITHUB_TOKEN", "generic-github-token")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "token gh-cli-access-token" {
+			t.Errorf("expected 'token gh-cli-access-token', got %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
+			Token:     "gh-cli-copilot-token",
+			ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
+		})
+	}))
+	defer server.Close()
+
+	tokenDir := t.TempDir()
+	a := &Authenticator{
+		tokenDir:       tokenDir,
+		githubCLIPath:  ghPath,
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	token, err := a.RefreshTokenNonInteractive(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if token != "gh-cli-copilot-token" {
+		t.Fatalf("expected gh-cli-copilot-token, got %q", token)
+	}
+	if a.accessToken != "gh-cli-access-token" {
+		t.Fatalf("expected access token to be loaded from gh, got %q", a.accessToken)
+	}
+	if _, err := os.Stat(filepath.Join(tokenDir, "access-token")); !os.IsNotExist(err) {
+		t.Fatalf("expected gh access token not to be persisted, got err=%v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tokenDir, "api-key.json"))
+	if err != nil {
+		t.Fatalf("expected copilot token cache to be saved: %v", err)
+	}
+	var saved CopilotTokenResponse
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatalf("decode saved copilot token: %v", err)
+	}
+	if saved.Token != "gh-cli-copilot-token" {
+		t.Fatalf("expected saved copilot token, got %q", saved.Token)
 	}
 }
 
@@ -818,6 +898,7 @@ func TestRefreshTokenNonInteractive_DetectsRevokedAccessTokenDespiteCachedCopilo
 	a := &Authenticator{
 		tokenDir:       dir,
 		client:         server.Client(),
+		githubCLIPath:  missingGitHubCLIPath(t),
 		copilotBaseURL: server.URL,
 	}
 
@@ -845,8 +926,9 @@ func TestRefreshTokenNonInteractive_RequiresGitHubAccessToken(t *testing.T) {
 	}
 
 	a := &Authenticator{
-		tokenDir: dir,
-		client:   &http.Client{Timeout: 5 * time.Second},
+		tokenDir:      dir,
+		client:        &http.Client{Timeout: 5 * time.Second},
+		githubCLIPath: missingGitHubCLIPath(t),
 	}
 
 	if _, err := a.RefreshTokenNonInteractive(context.Background()); err == nil {
