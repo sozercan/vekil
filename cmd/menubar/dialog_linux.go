@@ -112,7 +112,7 @@ func chooseProvidersConfigPath() (string, error) {
 		output, runErr := execCommand(zenity,
 			"--file-selection",
 			"--title=Choose Providers Config",
-			"--file-filter=JSON files | *.json",
+			"--file-filter=Provider config files | *.json *.yaml *.yml",
 			"--file-filter=All files | *",
 		).CombinedOutput()
 		if runErr == nil {
@@ -131,7 +131,7 @@ func chooseProvidersConfigPath() (string, error) {
 		output, runErr := execCommand(kdialog,
 			"--getopenfilename",
 			"",
-			"*.json|JSON files",
+			"*.json *.yaml *.yml|Provider config files",
 		).CombinedOutput()
 		if runErr == nil {
 			path := strings.TrimSpace(string(output))

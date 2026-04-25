@@ -66,7 +66,7 @@ func onReady() {
 
 	mProvidersStatus = systray.AddMenuItem("Providers: Copilot default", "")
 	mProvidersStatus.Disable()
-	mProvidersChoose = systray.AddMenuItem("Choose Providers Config…", "Select a providers JSON file")
+	mProvidersChoose = systray.AddMenuItem("Choose Providers Config…", "Select a providers JSON or YAML file")
 	mProvidersClear = systray.AddMenuItem("Use Default Copilot Routing", "Clear custom providers config")
 	systray.AddSeparator()
 

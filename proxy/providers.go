@@ -9,8 +9,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+
+	"gopkg.in/yaml.v3"
 )
 
 type providerType string
@@ -27,36 +30,36 @@ var openAICodexProviderEndpoints = []string{"/responses"}
 // ProvidersConfig configures optional non-Copilot upstream providers.
 // When empty, the proxy keeps its legacy zero-config Copilot behavior.
 type ProvidersConfig struct {
-	Providers []ProviderConfig `json:"providers"`
+	Providers []ProviderConfig `json:"providers" yaml:"providers"`
 }
 
 // ProviderConfig configures one upstream provider instance.
 type ProviderConfig struct {
-	ID            string                `json:"id"`
-	Type          string                `json:"type"`
-	Default       bool                  `json:"default,omitempty"`
-	IncludeModels []string              `json:"include_models,omitempty"`
-	ExcludeModels []string              `json:"exclude_models,omitempty"`
-	BaseURL       string                `json:"base_url,omitempty"`
-	APIKey        string                `json:"api_key,omitempty"`
-	APIKeyEnv     string                `json:"api_key_env,omitempty"`
-	APIVersion    string                `json:"api_version,omitempty"`
-	Models        []ProviderModelConfig `json:"models,omitempty"`
+	ID            string                `json:"id" yaml:"id"`
+	Type          string                `json:"type" yaml:"type"`
+	Default       bool                  `json:"default,omitempty" yaml:"default,omitempty"`
+	IncludeModels []string              `json:"include_models,omitempty" yaml:"include_models,omitempty"`
+	ExcludeModels []string              `json:"exclude_models,omitempty" yaml:"exclude_models,omitempty"`
+	BaseURL       string                `json:"base_url,omitempty" yaml:"base_url,omitempty"`
+	APIKey        string                `json:"api_key,omitempty" yaml:"api_key,omitempty"`
+	APIKeyEnv     string                `json:"api_key_env,omitempty" yaml:"api_key_env,omitempty"`
+	APIVersion    string                `json:"api_version,omitempty" yaml:"api_version,omitempty"`
+	Models        []ProviderModelConfig `json:"models,omitempty" yaml:"models,omitempty"`
 }
 
 // ProviderModelConfig maps a public model ID exposed by this proxy to the
 // upstream model or deployment name used by the provider.
 type ProviderModelConfig struct {
-	PublicID            string   `json:"public_id"`
-	Deployment          string   `json:"deployment,omitempty"`
-	Name                string   `json:"name,omitempty"`
-	Endpoints           []string `json:"endpoints,omitempty"`
-	ModelPickerEnabled  *bool    `json:"model_picker_enabled,omitempty"`
-	ModelPickerCategory string   `json:"model_picker_category,omitempty"`
-	ReasoningEffort     []string `json:"reasoning_effort,omitempty"`
-	Vision              *bool    `json:"vision,omitempty"`
-	ParallelToolCalls   *bool    `json:"parallel_tool_calls,omitempty"`
-	ContextWindow       *int64   `json:"context_window,omitempty"`
+	PublicID            string   `json:"public_id" yaml:"public_id"`
+	Deployment          string   `json:"deployment,omitempty" yaml:"deployment,omitempty"`
+	Name                string   `json:"name,omitempty" yaml:"name,omitempty"`
+	Endpoints           []string `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
+	ModelPickerEnabled  *bool    `json:"model_picker_enabled,omitempty" yaml:"model_picker_enabled,omitempty"`
+	ModelPickerCategory string   `json:"model_picker_category,omitempty" yaml:"model_picker_category,omitempty"`
+	ReasoningEffort     []string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
+	Vision              *bool    `json:"vision,omitempty" yaml:"vision,omitempty"`
+	ParallelToolCalls   *bool    `json:"parallel_tool_calls,omitempty" yaml:"parallel_tool_calls,omitempty"`
+	ContextWindow       *int64   `json:"context_window,omitempty" yaml:"context_window,omitempty"`
 }
 
 type providerRuntime struct {
@@ -161,10 +164,28 @@ func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("read providers config %q: %w", path, err)
 	}
-	if err := json.Unmarshal(body, &cfg); err != nil {
-		return cfg, fmt.Errorf("decode providers config %q: %w", path, err)
+	if err := decodeProvidersConfigFile(path, body, &cfg); err != nil {
+		return cfg, err
 	}
 	return cfg, nil
+}
+
+func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) error {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return fmt.Errorf("providers config %q is empty", path)
+	}
+
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".yaml", ".yml":
+		if err := yaml.Unmarshal(body, cfg); err != nil {
+			return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
+		}
+	default:
+		if err := json.Unmarshal(body, cfg); err != nil {
+			return fmt.Errorf("decode providers config %q as JSON: %w", path, err)
+		}
+	}
+	return nil
 }
 
 func (c ProvidersConfig) UsesCopilot() bool {

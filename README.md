@@ -24,7 +24,7 @@ docker run -p 1337:1337 \
   ghcr.io/sozercan/vekil:latest
 ```
 
-For explicit provider routing, start the proxy with `--providers-config /path/to/providers.json`.
+For explicit provider routing, start the proxy with `--providers-config /path/to/providers.json` or `--providers-config /path/to/providers.yaml`.
 
 On Apple Silicon Macs, you can also use the native macOS tray app.
 

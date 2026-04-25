@@ -43,7 +43,7 @@ docker run -p 1337:1337 \
   ghcr.io/sozercan/vekil:latest
 ```
 
-If you use explicit provider routing, mount your config file and pass `--providers-config`:
+If you use explicit provider routing, mount your JSON or YAML config file and pass `--providers-config`:
 
 ```bash
 docker run -p 1337:1337 \
@@ -114,7 +114,7 @@ If `HTTP_PROXY` or `HTTPS_PROXY` points at a local loopback proxy that is not ru
 
 ### Azure OpenAI
 
-Azure OpenAI credentials are configured per provider entry, usually with `api_key` or `api_key_env` in the providers JSON file. There is no separate interactive login flow in the proxy.
+Azure OpenAI credentials are configured per provider entry, usually with `api_key` or `api_key_env` in the providers config file. There is no separate interactive login flow in the proxy.
 
 ### OpenAI Codex
 
