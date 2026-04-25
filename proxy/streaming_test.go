@@ -176,8 +176,12 @@ func TestStreamOpenAIToAnthropic_TextOnly(t *testing.T) {
 
 	// Verify content_block_delta texts
 	var delta1, delta2 models.AnthropicStreamEvent
-	json.Unmarshal([]byte(events[2].Data), &delta1)
-	json.Unmarshal([]byte(events[3].Data), &delta2)
+	if err := json.Unmarshal([]byte(events[2].Data), &delta1); err != nil {
+		t.Fatalf("unmarshal first content_block_delta: %v", err)
+	}
+	if err := json.Unmarshal([]byte(events[3].Data), &delta2); err != nil {
+		t.Fatalf("unmarshal second content_block_delta: %v", err)
+	}
 	if delta1.Delta == nil || delta1.Delta.Text != "Hello" {
 		t.Errorf("delta[0] text = %q, want %q", delta1.Delta.Text, "Hello")
 	}
@@ -455,7 +459,9 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 
 	// Verify stop reason is tool_use
 	var msgDelta models.AnthropicStreamEvent
-	json.Unmarshal([]byte(events[7].Data), &msgDelta)
+	if err := json.Unmarshal([]byte(events[7].Data), &msgDelta); err != nil {
+		t.Fatalf("unmarshal message_delta: %v", err)
+	}
 	if msgDelta.Delta == nil || msgDelta.Delta.StopReason != "tool_use" {
 		t.Errorf("message_delta stop_reason = %q, want %q", msgDelta.Delta.StopReason, "tool_use")
 	}
@@ -781,14 +787,18 @@ func TestAnthropicResponseJSONShape(t *testing.T) {
 
 	// Validate type is "message"
 	var typ string
-	json.Unmarshal(raw["type"], &typ)
+	if err := json.Unmarshal(raw["type"], &typ); err != nil {
+		t.Fatalf("unmarshal type: %v", err)
+	}
 	if typ != "message" {
 		t.Errorf("type = %q, want %q", typ, "message")
 	}
 
 	// Validate role is "assistant"
 	var role string
-	json.Unmarshal(raw["role"], &role)
+	if err := json.Unmarshal(raw["role"], &role); err != nil {
+		t.Fatalf("unmarshal role: %v", err)
+	}
 	if role != "assistant" {
 		t.Errorf("role = %q, want %q", role, "assistant")
 	}
@@ -804,7 +814,9 @@ func TestAnthropicResponseJSONShape(t *testing.T) {
 
 	// Validate content block shape
 	var block map[string]json.RawMessage
-	json.Unmarshal(content[0], &block)
+	if err := json.Unmarshal(content[0], &block); err != nil {
+		t.Fatalf("unmarshal content block: %v", err)
+	}
 	if _, ok := block["type"]; !ok {
 		t.Error("content block missing 'type' field")
 	}
@@ -814,7 +826,9 @@ func TestAnthropicResponseJSONShape(t *testing.T) {
 
 	// Validate usage shape
 	var usage map[string]json.RawMessage
-	json.Unmarshal(raw["usage"], &usage)
+	if err := json.Unmarshal(raw["usage"], &usage); err != nil {
+		t.Fatalf("unmarshal usage: %v", err)
+	}
 	if _, ok := usage["input_tokens"]; !ok {
 		t.Error("usage missing 'input_tokens'")
 	}
@@ -867,7 +881,9 @@ func TestAnthropicStreamEventShapes(t *testing.T) {
 				t.Error("message_start missing 'message' field")
 			}
 			var msg map[string]json.RawMessage
-			json.Unmarshal(raw["message"], &msg)
+			if err := json.Unmarshal(raw["message"], &msg); err != nil {
+				t.Fatalf("message_start.message unmarshal failed: %v", err)
+			}
 			for _, f := range []string{"id", "type", "role", "model", "content", "usage"} {
 				if _, ok := msg[f]; !ok {
 					t.Errorf("message_start.message missing '%s'", f)
@@ -891,7 +907,9 @@ func TestAnthropicStreamEventShapes(t *testing.T) {
 			}
 			// content_block_delta's delta MUST have a "type" field
 			var delta map[string]json.RawMessage
-			json.Unmarshal(raw["delta"], &delta)
+			if err := json.Unmarshal(raw["delta"], &delta); err != nil {
+				t.Fatalf("content_block_delta.delta unmarshal failed: %v", err)
+			}
 			if _, ok := delta["type"]; !ok {
 				t.Error("content_block_delta.delta missing 'type'")
 			}
@@ -907,7 +925,9 @@ func TestAnthropicStreamEventShapes(t *testing.T) {
 			}
 			// message_delta's delta must NOT have a "type" field
 			var delta map[string]json.RawMessage
-			json.Unmarshal(raw["delta"], &delta)
+			if err := json.Unmarshal(raw["delta"], &delta); err != nil {
+				t.Fatalf("message_delta.delta unmarshal failed: %v", err)
+			}
 			if _, hasType := delta["type"]; hasType {
 				t.Error("message_delta.delta should NOT have 'type' field")
 			}
@@ -1030,7 +1050,9 @@ func TestAnthropicErrorShape(t *testing.T) {
 
 	// Must have "type" = "error"
 	var typ string
-	json.Unmarshal(raw["type"], &typ)
+	if err := json.Unmarshal(raw["type"], &typ); err != nil {
+		t.Fatalf("type field unmarshal: %v", err)
+	}
 	if typ != "error" {
 		t.Errorf("type = %q, want %q", typ, "error")
 	}
@@ -1103,7 +1125,9 @@ func TestAggregateStreamToResponse_ParallelToolCalls(t *testing.T) {
 
 	msg := resp.Choices[0].Message
 	var text string
-	json.Unmarshal(msg.Content, &text)
+	if err := json.Unmarshal(msg.Content, &text); err != nil {
+		t.Fatalf("content unmarshal: %v", err)
+	}
 	if text != "I'll delegate" {
 		t.Errorf("content = %q, want 'I'll delegate'", text)
 	}
@@ -1140,7 +1164,9 @@ func TestAggregateStreamToResponse_TextOnly(t *testing.T) {
 	}
 
 	var text string
-	json.Unmarshal(resp.Choices[0].Message.Content, &text)
+	if err := json.Unmarshal(resp.Choices[0].Message.Content, &text); err != nil {
+		t.Fatalf("content unmarshal: %v", err)
+	}
 	if text != "Hello world" {
 		t.Errorf("content = %q, want 'Hello world'", text)
 	}
