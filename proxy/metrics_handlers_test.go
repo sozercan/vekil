@@ -10,6 +10,24 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
+func registerKnownMetricsTestModels(t *testing.T, handler *ProxyHandler, models ...string) {
+	t.Helper()
+
+	setup := defaultProviderSetup(handler)
+	knownModels := make([]providerModel, 0, len(models))
+	for _, model := range models {
+		knownModels = append(knownModels, providerModel{
+			publicID:      model,
+			upstreamModel: model,
+			providerID:    "copilot",
+		})
+	}
+	if err := setup.replaceProviderModels("copilot", knownModels); err != nil {
+		t.Fatalf("replaceProviderModels() error = %v", err)
+	}
+	handler.providersState = setup
+}
+
 func TestHandleOpenAIChatCompletions_RecordsRequestAndTokenMetrics(t *testing.T) {
 	metrics, err := NewMetrics("test-version")
 	if err != nil {
@@ -27,6 +45,7 @@ func TestHandleOpenAIChatCompletions_RecordsRequestAndTokenMetrics(t *testing.T)
 		}`)
 	})
 	handler.metrics = metrics
+	registerKnownMetricsTestModels(t, handler, "gpt-4.1")
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
 		"model":"gpt-4.1",
@@ -69,6 +88,7 @@ func TestHandleResponses_RecordsRequestAndTokenMetrics(t *testing.T) {
 		}`)
 	})
 	handler.metrics = metrics
+	registerKnownMetricsTestModels(t, handler, "gpt-5")
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
 		"model":"gpt-5",

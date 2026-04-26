@@ -165,7 +165,7 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 
 	ctx = withRequestMetricsContext(ctx, requestMetricsContext{
 		provider:    provider.id,
-		publicModel: extractRequestModel(body),
+		publicModel: h.boundedPublicModelLabel(extractRequestModel(body), path),
 		endpoint:    metricsEndpointLabel(path),
 	})
 

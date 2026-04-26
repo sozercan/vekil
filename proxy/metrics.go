@@ -1,10 +1,12 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,8 +19,8 @@ import (
 )
 
 const (
-	metricsUnknownLabel = "unknown"
-	tokenDirectionPrompt = "prompt"
+	metricsUnknownLabel      = "unknown"
+	tokenDirectionPrompt     = "prompt"
 	tokenDirectionCompletion = "completion"
 )
 
@@ -239,6 +241,19 @@ func normalizeMetricsLabel(value string) string {
 	return value
 }
 
+func (h *ProxyHandler) boundedPublicModelLabel(publicModel, endpoint string) string {
+	publicModel = strings.TrimSpace(publicModel)
+	if publicModel == "" || h == nil {
+		return metricsUnknownLabel
+	}
+
+	_, owner, known := h.resolveProviderModel(publicModel, endpoint)
+	if !known {
+		return metricsUnknownLabel
+	}
+	return normalizeMetricsLabel(owner.publicID)
+}
+
 func withRequestMetricsContext(ctx context.Context, meta requestMetricsContext) context.Context {
 	return context.WithValue(ctx, metricsContextKey{}, requestMetricsContext{
 		provider:    normalizeMetricsLabel(meta.provider),
@@ -266,6 +281,13 @@ func newStatusCapturingResponseWriter(w http.ResponseWriter) *statusCapturingRes
 	return &statusCapturingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 }
 
+func (w *statusCapturingResponseWriter) Unwrap() http.ResponseWriter {
+	if w == nil {
+		return nil
+	}
+	return w.ResponseWriter
+}
+
 func (w *statusCapturingResponseWriter) WriteHeader(statusCode int) {
 	w.statusCode = statusCode
 	w.wroteHeader = true
@@ -277,6 +299,43 @@ func (w *statusCapturingResponseWriter) Write(p []byte) (int, error) {
 		w.WriteHeader(http.StatusOK)
 	}
 	return w.ResponseWriter.Write(p)
+}
+
+func (w *statusCapturingResponseWriter) Flush() {
+	flusher, ok := w.ResponseWriter.(http.Flusher)
+	if !ok {
+		return
+	}
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	flusher.Flush()
+}
+
+func (w *statusCapturingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+	return hijacker.Hijack()
+}
+
+func (w *statusCapturingResponseWriter) Push(target string, opts *http.PushOptions) error {
+	pusher, ok := w.ResponseWriter.(http.Pusher)
+	if !ok {
+		return http.ErrNotSupported
+	}
+	return pusher.Push(target, opts)
+}
+
+func (w *statusCapturingResponseWriter) ReadFrom(r io.Reader) (int64, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	if readerFrom, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		return readerFrom.ReadFrom(r)
+	}
+	return io.Copy(w.ResponseWriter, r)
 }
 
 func (w *statusCapturingResponseWriter) StatusCode() int {
@@ -295,7 +354,7 @@ func (h *ProxyHandler) beginRequestObservation(w http.ResponseWriter, endpointLa
 	if providerRuntime, _, _ := h.resolveProviderModel(publicModel, providerEndpoint); providerRuntime != nil {
 		provider = providerRuntime.id
 	}
-	return wrapped, h.metrics.beginRequest(endpointLabel, provider, publicModel)
+	return wrapped, h.metrics.beginRequest(endpointLabel, provider, h.boundedPublicModelLabel(publicModel, providerEndpoint))
 }
 
 func writeBufferedUpstreamResponse(w http.ResponseWriter, resp *http.Response) ([]byte, error) {
