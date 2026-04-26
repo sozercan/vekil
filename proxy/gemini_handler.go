@@ -55,6 +55,14 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	}
 	defer func() { _ = r.Body.Close() }()
 
+	endpoint := "gemini_generate_content"
+	if stream {
+		endpoint = "gemini_stream_generate_content"
+	}
+	sw, obs := h.beginRequestObservation(w, endpoint, "/chat/completions", pathModel)
+	defer obs.finish(sw.StatusCode())
+	w = sw
+
 	req, err := decodeGeminiGenerateContentRequest(body)
 	if err != nil {
 		h.writeGeminiProtocolError(w, err)
@@ -113,6 +121,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 			StreamOpenAIToGemini(w, resp.Body)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			obs.observeUsage(oaiResp.Usage)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(oaiResp))
 		},
@@ -123,6 +132,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 				return err
 			}
 
+			obs.observeUsage(parsed.Usage)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(&parsed))
 			return nil
@@ -145,6 +155,10 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+
+	sw, obs := h.beginRequestObservation(w, "gemini_count_tokens", "/chat/completions", pathModel)
+	defer obs.finish(sw.StatusCode())
+	w = sw
 
 	req, err := decodeGeminiCountTokensRequest(body)
 	if err != nil {
@@ -180,6 +194,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", "upstream response did not include usage")
 		return
 	}
+	obs.observeUsage(oaiResp.Usage)
 
 	result := models.GeminiCountTokensResponse{
 		TotalTokens: oaiResp.Usage.PromptTokens,

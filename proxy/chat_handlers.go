@@ -117,6 +117,9 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON in request body")
 		return
 	}
+	sw, obs := h.beginRequestObservation(w, "messages", "/chat/completions", req.Model)
+	defer obs.finish(sw.StatusCode())
+	w = sw
 
 	h.log.Debug("anthropic request",
 		logger.F("model", req.Model),
@@ -168,6 +171,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			StreamOpenAIToAnthropic(w, resp.Body, req.Model, "msg_"+uuid.New().String())
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			obs.observeUsage(oaiResp.Usage)
 			anthropicResp := TranslateOpenAIToAnthropic(oaiResp, req.Model)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(anthropicResp)
@@ -188,6 +192,11 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+
+	publicModel := extractRequestModel(bodyBytes)
+	sw, obs := h.beginRequestObservation(w, "chat_completions", "/chat/completions", publicModel)
+	defer obs.finish(sw.StatusCode())
+	w = sw
 
 	bodyBytes, mode := prepareOpenAIChatCompletionsRequest(bodyBytes)
 
@@ -216,8 +225,16 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			StreamOpenAIPassthrough(w, resp.Body)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			obs.observeUsage(oaiResp.Usage)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(oaiResp)
+		},
+		passthrough: func(resp *http.Response) error {
+			body, err := writeBufferedUpstreamResponse(w, resp)
+			if err == nil {
+				obs.observeUsage(extractUsageFromBody(body))
+			}
+			return err
 		},
 	})
 	if err != nil {

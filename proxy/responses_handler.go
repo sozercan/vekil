@@ -50,6 +50,11 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = r.Body.Close() }()
 
+	publicModel := extractResponsesRequestModel(bodyBytes)
+	sw, obs := h.beginRequestObservation(w, "responses", "/responses", publicModel)
+	defer obs.finish(sw.StatusCode())
+	w = sw
+
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses", true)
 
 	var partial struct {
@@ -95,12 +100,17 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isStreaming && resp.StatusCode == http.StatusOK {
-		model := extractRequestModel(bodyBytes)
+		model := extractResponsesRequestModel(bodyBytes)
 		peekAndForwardResponses(h, w, r, resp, upstreamCancel, model)
 		return
 	}
 
-	writeUpstreamResponse(w, resp)
+	respBody, err := writeBufferedUpstreamResponse(w, resp)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
+		return
+	}
+	obs.observeUsage(extractUsageFromBody(respBody))
 }
 
 // compactPrompt is the system instruction used when the upstream does not
@@ -134,6 +144,11 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+
+	publicModel := extractResponsesRequestModel(bodyBytes)
+	sw, obs := h.beginRequestObservation(w, "responses_compact", "/responses", publicModel)
+	defer obs.finish(sw.StatusCode())
+	w = sw
 
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/compact", false)
 
@@ -180,6 +195,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
 		return
 	}
+	obs.observeUsage(extractUsageFromBody(respBody))
 
 	summaryText, err := extractResponsesOutputText(respBody)
 	if err != nil {
@@ -249,6 +265,9 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
 		return
 	}
+	sw, obs := h.beginRequestObservation(w, "memory_trace_summarize", "/responses", memReq.Model)
+	defer obs.finish(sw.StatusCode())
+	w = sw
 
 	tracesJSON, _ := json.Marshal(memReq.Traces)
 	userContent := "Summarize the following session traces:\n\n" + string(tracesJSON)
@@ -305,6 +324,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
 		return
 	}
+	obs.observeUsage(extractUsageFromBody(respBody))
 
 	summaryText, err := extractResponsesOutputText(respBody)
 	if err != nil {

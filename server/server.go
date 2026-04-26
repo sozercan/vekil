@@ -21,7 +21,9 @@ type Server struct {
 }
 
 type options struct {
-	proxyOptions []proxy.Option
+	proxyOptions       []proxy.Option
+	metricsEnabled     bool
+	metricsBuildVersion string
 }
 
 // Option customizes server creation.
@@ -31,6 +33,20 @@ type Option func(*options)
 func WithProxyOptions(opts ...proxy.Option) Option {
 	return func(o *options) {
 		o.proxyOptions = append(o.proxyOptions, opts...)
+	}
+}
+
+// WithMetricsEnabled enables or disables the Prometheus /metrics endpoint.
+func WithMetricsEnabled(enabled bool) Option {
+	return func(o *options) {
+		o.metricsEnabled = enabled
+	}
+}
+
+// WithMetricsBuildVersion sets the vekil_build_info version label.
+func WithMetricsBuildVersion(version string) Option {
+	return func(o *options) {
+		o.metricsBuildVersion = version
 	}
 }
 
@@ -54,11 +70,19 @@ func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
-	cfg := options{}
+	cfg := options{metricsEnabled: true, metricsBuildVersion: "dev"}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
 		}
+	}
+
+	if cfg.metricsEnabled {
+		metrics, err := proxy.NewMetrics(cfg.metricsBuildVersion)
+		if err != nil {
+			return nil, err
+		}
+		cfg.proxyOptions = append(cfg.proxyOptions, proxy.WithMetrics(metrics))
 	}
 
 	handler, err := proxy.NewProxyHandler(authenticator, log, cfg.proxyOptions...)
@@ -79,6 +103,11 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
 	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)
+	if cfg.metricsEnabled {
+		if metricsHandler := handlerMetricsHandler(handler); metricsHandler != nil {
+			mux.Handle("GET /metrics", metricsHandler)
+		}
+	}
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{
@@ -91,6 +120,13 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 		},
 		log: log,
 	}, nil
+}
+
+func handlerMetricsHandler(handler *proxy.ProxyHandler) http.Handler {
+	if handler == nil || handler.MetricsHandler() == nil {
+		return nil
+	}
+	return handler.MetricsHandler()
 }
 
 // Start begins listening in a goroutine. It returns an error if the listener

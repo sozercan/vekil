@@ -163,13 +163,26 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 		return nil, err
 	}
 
-	return h.doWithRetry(func() (*http.Request, error) {
+	ctx = withRequestMetricsContext(ctx, requestMetricsContext{
+		provider:    provider.id,
+		publicModel: extractRequestModel(body),
+		endpoint:    metricsEndpointLabel(path),
+	})
+
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
 		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "")
 		if err != nil {
 			return nil, err
 		}
 		return req, nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	if resp != nil && resp.StatusCode >= http.StatusBadRequest {
+		h.metrics.observeUpstreamError(requestMetricsFromContext(ctx), "status", resp.StatusCode)
+	}
+	return resp, nil
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
@@ -185,4 +198,24 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func metricsEndpointLabel(path string) string {
+	switch path {
+	case "/chat/completions":
+		return "chat_completions"
+	case "/responses":
+		return "responses"
+	case "/responses/compact":
+		return "responses_compact"
+	case "/memories/trace_summarize":
+		return "memory_trace_summarize"
+	default:
+		path = strings.Trim(path, "/")
+		path = strings.ReplaceAll(path, "/", "_")
+		if path == "" {
+			return metricsUnknownLabel
+		}
+		return path
+	}
 }

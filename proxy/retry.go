@@ -68,11 +68,14 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		if err != nil {
 			return nil, err
 		}
+		meta := requestMetricsFromContext(req.Context())
 
 		resp, err := h.client.Do(req)
 		if err != nil {
+			h.metrics.observeUpstreamError(meta, "transport", 0)
 			lastErr = err
 			if attempt < maxRetries-1 {
+				h.metrics.observeRetry(meta, "transport", 0)
 				if ctxErr := sleepWithContext(req.Context(), backoff(retryDelay, attempt)); ctxErr != nil {
 					return nil, ctxErr
 				}
@@ -85,12 +88,14 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		}
 
 		retryAfterHeader := resp.Header.Get("Retry-After")
+		h.metrics.observeUpstreamError(meta, "status", resp.StatusCode)
 
 		// Drain and close body before retry to allow connection reuse.
 		drainAndClose(resp.Body)
 		lastErr = &upstreamError{statusCode: resp.StatusCode}
 
 		if attempt < maxRetries-1 {
+			h.metrics.observeRetry(meta, "status", resp.StatusCode)
 			delay := backoff(retryDelay, attempt)
 			if ra, ok := parseRetryAfter(retryAfterHeader); ok && ra > delay {
 				delay = ra

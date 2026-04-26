@@ -185,6 +185,7 @@ type ProxyHandler struct {
 	client                   *http.Client
 	copilotURL               string
 	copilotHeaders           CopilotHeaderConfig
+	metrics                  *Metrics
 	providersConfig          ProvidersConfig
 	providersState           *providerSetup
 	responsesWS              ResponsesWebSocketConfig
@@ -250,6 +251,13 @@ func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 	}
 }
 
+// WithMetrics enables Prometheus instrumentation on the proxy handler.
+func WithMetrics(metrics *Metrics) Option {
+	return func(h *ProxyHandler) {
+		h.metrics = metrics
+	}
+}
+
 // NewProxyHandler creates a ProxyHandler with connection pooling and HTTP/2.
 func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) (*ProxyHandler, error) {
 	h := &ProxyHandler{
@@ -296,6 +304,14 @@ func (h *ProxyHandler) effectiveStreamingUpstreamTimeout() time.Duration {
 // configured streaming upstream timeout plus the non-streaming request budget.
 func (h *ProxyHandler) ServerWriteTimeout() time.Duration {
 	return h.effectiveStreamingUpstreamTimeout() + upstreamTimeout
+}
+
+// MetricsHandler returns the Prometheus exposition handler when metrics are enabled.
+func (h *ProxyHandler) MetricsHandler() http.Handler {
+	if h == nil || h.metrics == nil {
+		return nil
+	}
+	return h.metrics.Handler()
 }
 
 func setCopilotHeaders(req *http.Request, token string) {
