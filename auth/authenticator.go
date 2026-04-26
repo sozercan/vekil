@@ -20,16 +20,15 @@ import (
 )
 
 const (
-	githubClientID        = "Iv1.b507a08c87ecfe98"
-	deviceCodeURL         = "https://github.com/login/device/code"
-	accessTokenURL        = "https://github.com/login/oauth/access_token"
-	copilotTokenURL       = "https://api.github.com/copilot_internal/v2/token"
-	copilotUserURL        = "https://api.github.com/copilot_internal/user"
-	defaultTokenDir       = "~/.config/vekil"
-	githubCLITokenTimeout = 5 * time.Second
-	githubCLITokenTTL     = 15 * time.Minute
-	signedOutMarkerFile   = "signed-out"
-	authPreferencesFile   = "auth-preferences.json"
+	githubClientID      = "Iv1.b507a08c87ecfe98"
+	deviceCodeURL       = "https://github.com/login/device/code"
+	accessTokenURL      = "https://github.com/login/oauth/access_token"
+	copilotTokenURL     = "https://api.github.com/copilot_internal/v2/token"
+	copilotUserURL      = "https://api.github.com/copilot_internal/user"
+	defaultTokenDir     = "~/.config/vekil"
+	githubCLITokenTTL   = 15 * time.Minute
+	signedOutMarkerFile = "signed-out"
+	authPreferencesFile = "auth-preferences.json"
 )
 
 var accessTokenEnvVars = []string{
@@ -37,6 +36,8 @@ var accessTokenEnvVars = []string{
 }
 
 var (
+	githubCLITokenTimeout = 5 * time.Second
+
 	githubCLICommonPaths = []string{
 		"/opt/homebrew/bin/gh",
 		"/usr/local/bin/gh",
@@ -948,8 +949,8 @@ func (a *Authenticator) gitHubCLIAccessToken(ctx context.Context) (string, error
 
 	output, err := cmd.Output()
 	if err != nil {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
+		if cmdCtx.Err() != nil {
+			return "", cmdCtx.Err()
 		}
 		return "", fmt.Errorf("%w: github cli auth token unavailable", ErrNotAuthenticated)
 	}

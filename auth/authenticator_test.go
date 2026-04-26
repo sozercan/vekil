@@ -1042,6 +1042,39 @@ printf 'gh-cli-access-token\n'
 	}
 }
 
+func TestGitHubCLIAccessToken_ReturnsCommandContextTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake gh shell script test is Unix-only")
+	}
+
+	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+exec sleep 1
+`
+	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+
+	previousTimeout := githubCLITokenTimeout
+	githubCLITokenTimeout = 10 * time.Millisecond
+	t.Cleanup(func() {
+		githubCLITokenTimeout = previousTimeout
+	})
+
+	a := &Authenticator{githubCLIPath: ghPath}
+	_, err := a.gitHubCLIAccessToken(context.Background())
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context deadline exceeded, got %v", err)
+	}
+	if errors.Is(err, ErrNotAuthenticated) {
+		t.Fatalf("expected timeout not to be classified as unauthenticated, got %v", err)
+	}
+}
+
 func TestSignInWithGitHubCLI_ClearsSignedOutMarkerWritesPreferenceAndDoesNotPersistToken(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake gh shell script test is Unix-only")
