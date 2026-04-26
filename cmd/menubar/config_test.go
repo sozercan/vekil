@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/proxy"
 )
 
@@ -173,6 +174,58 @@ func TestProvidersConfigErrorPresentation(t *testing.T) {
 	providersConfigErr = providersErr
 	if got := providersMenuTitle(); got != "Providers: Invalid (providers.json)" {
 		t.Fatalf("providersMenuTitle() with providers error = %q, want %q", got, "Providers: Invalid (providers.json)")
+	}
+}
+
+func TestAuthMenuTitle(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		status auth.AuthStatus
+		want   string
+	}{
+		{
+			name:   "not signed in",
+			status: auth.AuthStatus{Source: auth.AuthSourceNone},
+			want:   "GitHub Auth: Not Signed In",
+		},
+		{
+			name:   "signed out",
+			status: auth.AuthStatus{Source: auth.AuthSourceNone, SignedOut: true},
+			want:   "GitHub Auth: Signed Out",
+		},
+		{
+			name:   "environment token",
+			status: auth.AuthStatus{SignedIn: true, Source: auth.AuthSourceEnv},
+			want:   "GitHub Auth: Environment Token",
+		},
+		{
+			name:   "vekil managed",
+			status: auth.AuthStatus{SignedIn: true, Source: auth.AuthSourceVekil},
+			want:   "GitHub Auth: Signed in with GitHub",
+		},
+		{
+			name:   "github cli",
+			status: auth.AuthStatus{SignedIn: true, Source: auth.AuthSourceGitHubCLI},
+			want:   "GitHub Auth: Using GitHub CLI Account",
+		},
+		{
+			name:   "unknown signed in source",
+			status: auth.AuthStatus{SignedIn: true, Source: auth.AuthSourceNone},
+			want:   "GitHub Auth: Signed In",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := authMenuTitle(tt.status); got != tt.want {
+				t.Fatalf("authMenuTitle() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

@@ -71,7 +71,7 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 
 // StreamOpenAIPassthrough streams OpenAI SSE bytes directly to the client with no parsing.
 func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
 	fw := &flushWriter{w: w}
@@ -85,7 +85,7 @@ func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
 
 // StreamOpenAIToAnthropic translates an OpenAI SSE stream into Anthropic SSE format.
 func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model string, requestID string) {
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
 	state := newAnthropicStreamState(w, model, requestID)

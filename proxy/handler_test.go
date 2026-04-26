@@ -368,9 +368,9 @@ func TestHandleAnthropicMessages(t *testing.T) {
 		// Return SSE streaming response (since handler forces streaming)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("data: {\"id\":\"chatcmpl-123\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello from the backend!\"},\"finish_reason\":null}]}\n\n"))
-		w.Write([]byte("data: {\"id\":\"chatcmpl-123\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n"))
-		w.Write([]byte("data: [DONE]\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-123\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello from the backend!\"},\"finish_reason\":null}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-123\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	})
 
 	anthropicReq := `{
@@ -518,7 +518,7 @@ func TestHandleAnthropicMessagesInvalidJSON(t *testing.T) {
 func TestHandleAnthropicUpstreamError(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`{"error": "internal server error"}`))
+		_, _ = w.Write([]byte(`{"error": "internal server error"}`))
 	})
 
 	anthropicReq := `{
@@ -559,7 +559,9 @@ func TestHandleOpenAIChatCompletions(t *testing.T) {
 		// Echo back the request body as a mock response
 		body, _ := io.ReadAll(r.Body)
 		var oaiReq models.OpenAIRequest
-		json.Unmarshal(body, &oaiReq)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("json.Unmarshal(upstream request) error = %v", err)
+		}
 
 		finishReason := "stop"
 		resp := models.OpenAIResponse{
@@ -579,7 +581,7 @@ func TestHandleOpenAIChatCompletions(t *testing.T) {
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 
 	oaiReq := `{
@@ -634,7 +636,7 @@ func TestHandleResponses(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"id":"resp-123","object":"response","status":"completed"}`))
+		_, _ = w.Write([]byte(`{"id":"resp-123","object":"response","status":"completed"}`))
 	})
 
 	responsesReq := `{
@@ -2333,7 +2335,7 @@ func TestHandleOpenAIChatCompletionsUpstreamError(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(`{"error":{"message":"service unavailable","type":"server_error"}}`))
+		_, _ = w.Write([]byte(`{"error":{"message":"service unavailable","type":"server_error"}}`))
 	})
 
 	oaiReq := `{
@@ -3456,7 +3458,7 @@ func TestHandleModels(t *testing.T) {
 		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`{"error":"internal server error"}`))
+			_, _ = w.Write([]byte(`{"error":"internal server error"}`))
 		})
 		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 		w := httptest.NewRecorder()
@@ -4357,13 +4359,17 @@ func TestOpenAIErrorResponseShape(t *testing.T) {
 
 	// Check values
 	var msg string
-	json.Unmarshal(errObj["message"], &msg)
+	if err := json.Unmarshal(errObj["message"], &msg); err != nil {
+		t.Fatalf("json.Unmarshal(message) error = %v", err)
+	}
 	if msg != "test error message" {
 		t.Errorf("message = %q, want %q", msg, "test error message")
 	}
 
 	var errType string
-	json.Unmarshal(errObj["type"], &errType)
+	if err := json.Unmarshal(errObj["type"], &errType); err != nil {
+		t.Fatalf("json.Unmarshal(type) error = %v", err)
+	}
 	if errType != "invalid_request_error" {
 		t.Errorf("type = %q, want %q", errType, "invalid_request_error")
 	}
@@ -4388,14 +4394,16 @@ func TestOpenAIChatCompletionsStreaming(t *testing.T) {
 			Stream *bool `json:"stream"`
 		}
 		body, _ := io.ReadAll(r.Body)
-		json.Unmarshal(body, &partial)
+		if err := json.Unmarshal(body, &partial); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
 		if partial.Stream == nil || !*partial.Stream {
 			t.Error("expected stream=true in upstream request")
 		}
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(sseBody))
+		_, _ = w.Write([]byte(sseBody))
 	})
 
 	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}],"stream":true}`
@@ -4449,7 +4457,7 @@ func TestOpenAIResponsesStreaming(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(sseBody))
+		_, _ = w.Write([]byte(sseBody))
 	})
 
 	reqBody := `{"model":"gpt-4","input":"Hello","stream":true,"service_tier":"auto"}`
@@ -4516,7 +4524,7 @@ func TestOpenAIChatCompletionsUpstreamErrorPassthrough(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error":{"message":"Invalid model","type":"invalid_request_error","param":"model","code":null}}`))
+		_, _ = w.Write([]byte(`{"error":{"message":"Invalid model","type":"invalid_request_error","param":"model","code":null}}`))
 	})
 
 	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}`
@@ -4547,7 +4555,7 @@ func TestOpenAIChatCompletionsUpstreamErrorPassthrough(t *testing.T) {
 func TestOpenAIChatCompletionsResponseShape(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{
+		_, _ = w.Write([]byte(`{
 			"id": "chatcmpl-test",
 			"object": "chat.completion",
 			"created": 1700000000,
@@ -4587,14 +4595,18 @@ func TestOpenAIChatCompletionsResponseShape(t *testing.T) {
 
 	// Verify object is "chat.completion"
 	var obj string
-	json.Unmarshal(raw["object"], &obj)
+	if err := json.Unmarshal(raw["object"], &obj); err != nil {
+		t.Fatalf("json.Unmarshal(object) error = %v", err)
+	}
 	if obj != "chat.completion" {
 		t.Errorf("object = %q, want chat.completion", obj)
 	}
 
 	// Verify choices structure
 	var choices []map[string]json.RawMessage
-	json.Unmarshal(raw["choices"], &choices)
+	if err := json.Unmarshal(raw["choices"], &choices); err != nil {
+		t.Fatalf("json.Unmarshal(choices) error = %v", err)
+	}
 	if len(choices) != 1 {
 		t.Fatalf("expected 1 choice, got %d", len(choices))
 	}
@@ -4615,7 +4627,7 @@ func TestOpenAIChatCompletionsResponseShape(t *testing.T) {
 func TestOpenAIResponsesResponseShape(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{
+		_, _ = w.Write([]byte(`{
 			"id": "resp-test",
 			"object": "response",
 			"created_at": 1700000000,
@@ -4650,7 +4662,9 @@ func TestOpenAIResponsesResponseShape(t *testing.T) {
 	}
 
 	var obj string
-	json.Unmarshal(raw["object"], &obj)
+	if err := json.Unmarshal(raw["object"], &obj); err != nil {
+		t.Fatalf("json.Unmarshal(object) error = %v", err)
+	}
 	if obj != "response" {
 		t.Errorf("object = %q, want response", obj)
 	}
@@ -4694,7 +4708,9 @@ func TestHandleAnthropicMessages_ParallelToolCalls(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		var oaiReq models.OpenAIRequest
 		body, _ := io.ReadAll(r.Body)
-		json.Unmarshal(body, &oaiReq)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
 		if oaiReq.Stream == nil || !*oaiReq.Stream {
 			t.Error("expected stream=true (forced streaming)")
 		}
@@ -4716,9 +4732,9 @@ func TestHandleAnthropicMessages_ParallelToolCalls(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		for _, chunk := range chunks {
 			b, _ := json.Marshal(chunk)
-			w.Write([]byte("data: " + string(b) + "\n\n"))
+			_, _ = w.Write([]byte("data: " + string(b) + "\n\n"))
 		}
-		w.Write([]byte("data: [DONE]\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	})
 
 	anthropicReq := `{
@@ -4770,7 +4786,9 @@ func TestInjectParallelToolCalls(t *testing.T) {
 		input := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}`
 		result := injectParallelToolCalls([]byte(input))
 		var m map[string]json.RawMessage
-		json.Unmarshal(result, &m)
+		if err := json.Unmarshal(result, &m); err != nil {
+			t.Fatalf("json.Unmarshal(result) error = %v", err)
+		}
 		if string(m["parallel_tool_calls"]) != "true" {
 			t.Errorf("parallel_tool_calls = %s, want true", m["parallel_tool_calls"])
 		}
@@ -4780,7 +4798,9 @@ func TestInjectParallelToolCalls(t *testing.T) {
 		input := `{"model":"gpt-4","tools":[{"type":"function"}],"parallel_tool_calls":false}`
 		result := injectParallelToolCalls([]byte(input))
 		var m map[string]json.RawMessage
-		json.Unmarshal(result, &m)
+		if err := json.Unmarshal(result, &m); err != nil {
+			t.Fatalf("json.Unmarshal(result) error = %v", err)
+		}
 		if string(m["parallel_tool_calls"]) != "false" {
 			t.Errorf("parallel_tool_calls = %s, want false (preserved)", m["parallel_tool_calls"])
 		}
@@ -4817,7 +4837,9 @@ func TestOpenAIChatCompletions_InjectsParallelToolCalls(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		var oaiReq models.OpenAIRequest
 		body, _ := io.ReadAll(r.Body)
-		json.Unmarshal(body, &oaiReq)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
 		if oaiReq.ParallelToolCalls == nil || !*oaiReq.ParallelToolCalls {
 			t.Error("expected parallel_tool_calls=true injected by proxy")
 		}
@@ -4828,9 +4850,9 @@ func TestOpenAIChatCompletions_InjectsParallelToolCalls(t *testing.T) {
 		// Return SSE since proxy forced streaming
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n"))
-		w.Write([]byte("data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
-		w.Write([]byte("data: [DONE]\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	})
 
 	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}`
