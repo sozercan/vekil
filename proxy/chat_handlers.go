@@ -112,14 +112,15 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	}
 	defer func() { _ = r.Body.Close() }()
 
+	sw, obs := h.beginRequestObservation(w, "messages", "/chat/completions", extractRequestModel(body))
+	defer obs.finish(sw.StatusCode())
+	w = sw
+
 	var req models.AnthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON in request body")
 		return
 	}
-	sw, obs := h.beginRequestObservation(w, "messages", "/chat/completions", req.Model)
-	defer obs.finish(sw.StatusCode())
-	w = sw
 
 	h.log.Debug("anthropic request",
 		logger.F("model", req.Model),
@@ -136,6 +137,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
+	upstreamCtx = withRequestObservationMetricsContext(upstreamCtx, obs)
 
 	resp, err := h.postChatCompletions(upstreamCtx, oaiBody)
 	if err != nil {

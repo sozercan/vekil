@@ -163,11 +163,17 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 		return nil, err
 	}
 
-	ctx = withRequestMetricsContext(ctx, requestMetricsContext{
-		provider:    provider.id,
-		publicModel: h.boundedPublicModelLabel(extractRequestModel(body), path),
-		endpoint:    metricsEndpointLabel(path),
-	})
+	meta := requestMetricsFromContext(ctx)
+	if meta.endpoint == metricsUnknownLabel {
+		meta.endpoint = metricsEndpointLabel(path)
+	}
+	if meta.publicModel == metricsUnknownLabel {
+		meta.publicModel = h.boundedPublicModelLabel(extractRequestModel(body), path)
+	}
+	if provider != nil {
+		meta.provider = provider.id
+	}
+	ctx = withRequestMetricsContext(ctx, meta)
 
 	resp, err := h.doWithRetry(func() (*http.Request, error) {
 		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "")
@@ -179,7 +185,7 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 	if err != nil {
 		return nil, err
 	}
-	if resp != nil && resp.StatusCode >= http.StatusBadRequest {
+	if h.metrics != nil && resp != nil && resp.StatusCode >= http.StatusBadRequest {
 		h.metrics.observeUpstreamError(requestMetricsFromContext(ctx), "status", resp.StatusCode)
 	}
 	return resp, nil

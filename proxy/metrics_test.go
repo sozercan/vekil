@@ -3,6 +3,7 @@ package proxy
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -119,5 +120,29 @@ func TestHandleResponses_BoundsUnknownPublicModelMetricLabel(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(metrics.tokensTotal.WithLabelValues("responses", "copilot", metricsUnknownLabel, tokenDirectionCompletion)); got != 2 {
 		t.Fatalf("unknown-model completion tokens = %v, want 2", got)
+	}
+}
+
+func TestWriteBufferedUpstreamResponse_StreamsLargeBodyWithoutFullBuffering(t *testing.T) {
+	largeBody := strings.Repeat("x", maxBufferedUpstreamBody+1024)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(largeBody)),
+	}
+	rec := httptest.NewRecorder()
+
+	body, err := writeBufferedUpstreamResponse(rec, resp)
+	if err != nil {
+		t.Fatalf("writeBufferedUpstreamResponse() error = %v", err)
+	}
+	if body != nil {
+		t.Fatal("expected no buffered body when upstream response exceeds capture limit")
+	}
+	if got := rec.Body.Len(); got != len(largeBody) {
+		t.Fatalf("streamed body length = %d, want %d", got, len(largeBody))
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want %q", got, "application/json")
 	}
 }

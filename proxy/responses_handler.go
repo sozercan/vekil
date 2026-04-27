@@ -256,6 +256,10 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	}
 	defer func() { _ = r.Body.Close() }()
 
+	sw, obs := h.beginRequestObservation(w, "memory_trace_summarize", "/responses", extractRequestModel(bodyBytes))
+	defer obs.finish(sw.StatusCode())
+	w = sw
+
 	var memReq struct {
 		Model     string            `json:"model"`
 		Traces    []json.RawMessage `json:"traces"`
@@ -265,9 +269,6 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
 		return
 	}
-	sw, obs := h.beginRequestObservation(w, "memory_trace_summarize", "/responses", memReq.Model)
-	defer obs.finish(sw.StatusCode())
-	w = sw
 
 	tracesJSON, _ := json.Marshal(memReq.Traces)
 	userContent := "Summarize the following session traces:\n\n" + string(tracesJSON)
@@ -292,6 +293,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
+	upstreamCtx = withRequestObservationMetricsContext(upstreamCtx, obs)
 
 	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, reqBody, responsesExtraHeadersFromRequest(r))
 	if err != nil {

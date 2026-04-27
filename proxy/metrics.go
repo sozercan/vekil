@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -22,6 +23,7 @@ const (
 	metricsUnknownLabel      = "unknown"
 	tokenDirectionPrompt     = "prompt"
 	tokenDirectionCompletion = "completion"
+	maxBufferedUpstreamBody  = 1 << 20
 )
 
 type metricsContextKey struct{}
@@ -357,16 +359,42 @@ func (h *ProxyHandler) beginRequestObservation(w http.ResponseWriter, endpointLa
 	return wrapped, h.metrics.beginRequest(endpointLabel, provider, h.boundedPublicModelLabel(publicModel, providerEndpoint))
 }
 
+func withRequestObservationMetricsContext(ctx context.Context, obs *requestObservation) context.Context {
+	if obs == nil {
+		return ctx
+	}
+	return withRequestMetricsContext(ctx, requestMetricsContext{
+		provider:    obs.provider,
+		publicModel: obs.publicModel,
+		endpoint:    obs.endpoint,
+	})
+}
+
 func writeBufferedUpstreamResponse(w http.ResponseWriter, resp *http.Response) ([]byte, error) {
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	copyPassthroughHeaders(w.Header(), resp.Header)
+
+	var body bytes.Buffer
+	_, err := io.CopyN(&body, resp.Body, maxBufferedUpstreamBody+1)
+	switch {
+	case err == nil:
+		w.WriteHeader(resp.StatusCode)
+		if _, writeErr := w.Write(body.Bytes()); writeErr != nil {
+			return nil, writeErr
+		}
+		if _, writeErr := io.Copy(w, resp.Body); writeErr != nil {
+			return nil, writeErr
+		}
+		return nil, nil
+	case errors.Is(err, io.EOF):
+		w.WriteHeader(resp.StatusCode)
+		if _, writeErr := w.Write(body.Bytes()); writeErr != nil {
+			return nil, writeErr
+		}
+		return body.Bytes(), nil
+	default:
 		return nil, err
 	}
-	copyPassthroughHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(body)
-	return body, nil
 }
 
 func extractUsageFromBody(body []byte) *models.OpenAIUsage {
