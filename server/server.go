@@ -154,3 +154,8 @@ func (s *Server) IsRunning() bool {
 func (s *Server) Addr() string {
 	return s.httpServer.Addr
 }
+
+// Handler returns the configured HTTP handler.
+func (s *Server) Handler() http.Handler {
+	return s.httpServer.Handler
+}

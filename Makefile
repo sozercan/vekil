@@ -109,4 +109,4 @@ clean:
 	rm -rf "$(APP_NAME)" .build
 
 docker-build:
-	docker build -t $(BINARY) .
+	docker build --build-arg VERSION=$(APP_VERSION) -t $(BINARY) .

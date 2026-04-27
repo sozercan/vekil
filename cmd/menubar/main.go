@@ -178,14 +178,7 @@ func startProxy() {
 		}
 	}
 
-	nextSrv, err := server.New(
-		authenticator,
-		log,
-		"0.0.0.0",
-		"1337",
-		server.WithBuildVersion(buildVersion),
-		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
-	)
+	nextSrv, err := newMenubarServer(authenticator, log, providersCfg)
 	if err != nil {
 		log.Error("server init failed", logger.Err(err))
 		showErrorDialog("Vekil Start Failed", fmt.Sprintf("Could not initialize Vekil.\n\n%v", err))
@@ -216,6 +209,18 @@ func stopProxy() {
 	systray.SetIcon(iconOff)
 	systray.SetTooltip("Vekil - Stopped")
 	log.Info("proxy stopped")
+}
+
+func newMenubarServer(authenticator *auth.Authenticator, log *logger.Logger, providersCfg proxy.ProvidersConfig) (*server.Server, error) {
+	return server.New(
+		authenticator,
+		log,
+		"0.0.0.0",
+		"1337",
+		server.WithBuildVersion(buildVersion),
+		server.WithMetricsEnabled(false),
+		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
+	)
 }
 
 // signInWithGitHub drives the interactive GitHub device-code flow via native macOS
