@@ -221,6 +221,8 @@ func runServe() {
 	copilotPluginVersion := flag.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
 	copilotUserAgent := flag.String("copilot-user-agent", getEnv("COPILOT_USER_AGENT", ""), "Upstream Copilot user-agent header")
 	copilotGitHubAPIVersion := flag.String("copilot-github-api-version", getEnv("COPILOT_GITHUB_API_VERSION", ""), "Upstream Copilot x-github-api-version header")
+	metrics := flag.Bool("metrics", getEnvBool("METRICS", true), "Enable Prometheus /metrics endpoint")
+	noMetrics := flag.Bool("no-metrics", getEnvBool("NO_METRICS", false), "Disable Prometheus /metrics endpoint")
 	responsesWSTurnStateDelta := flag.Bool("responses-ws-turn-state-delta", getEnvBool("RESPONSES_WS_TURN_STATE_DELTA", false), "Attempt delta-only replay when upstream returns X-Codex-Turn-State")
 	responsesWSDisableAutoCompact := flag.Bool("responses-ws-disable-auto-compact", getEnvBool("RESPONSES_WS_DISABLE_AUTO_COMPACT", false), "Disable automatic websocket-session history compaction")
 	responsesWSCompactMaxItems := flag.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items")
@@ -255,6 +257,8 @@ func runServe() {
 		*host,
 		*port,
 		server.WithStreamingUpstreamTimeout(*streamingUpstreamTimeout),
+		server.WithMetricsEnabled(*metrics && !*noMetrics),
+		server.WithBuildVersion(effectiveBuildVersion()),
 		server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
 			EditorVersion:       *copilotEditorVersion,
 			EditorPluginVersion: *copilotPluginVersion,
