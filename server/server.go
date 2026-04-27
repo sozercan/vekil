@@ -21,7 +21,9 @@ type Server struct {
 }
 
 type options struct {
-	proxyOptions []proxy.Option
+	proxyOptions   []proxy.Option
+	metricsEnabled bool
+	buildVersion   string
 }
 
 // Option customizes server creation.
@@ -52,9 +54,23 @@ func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 	return WithProxyOptions(proxy.WithStreamingUpstreamTimeout(timeout))
 }
 
+// WithMetricsEnabled enables or disables the Prometheus /metrics endpoint.
+func WithMetricsEnabled(enabled bool) Option {
+	return func(o *options) {
+		o.metricsEnabled = enabled
+	}
+}
+
+// WithBuildVersion sets the build version exported via vekil_build_info.
+func WithBuildVersion(version string) Option {
+	return func(o *options) {
+		o.buildVersion = version
+	}
+}
+
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
-	cfg := options{}
+	cfg := options{metricsEnabled: true}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
@@ -76,9 +92,17 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("POST /v1/responses", handler.HandleResponses)
 	mux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
 	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
-	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
-	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
-	mux.HandleFunc("GET /v1/models", handler.HandleModels)
+	if cfg.metricsEnabled {
+		metrics := newServerMetrics(cfg.buildVersion)
+		mux.Handle("GET /metrics", metrics.handler)
+		mux.HandleFunc("GET /healthz", metrics.wrap("healthz", handler.HandleHealthz))
+		mux.HandleFunc("GET /readyz", metrics.wrap("readyz", handler.HandleReadyz))
+		mux.HandleFunc("GET /v1/models", metrics.wrap("models", handler.HandleModels))
+	} else {
+		mux.HandleFunc("GET /healthz", handler.HandleHealthz)
+		mux.HandleFunc("GET /readyz", handler.HandleReadyz)
+		mux.HandleFunc("GET /v1/models", handler.HandleModels)
+	}
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{

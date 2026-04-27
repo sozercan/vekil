@@ -226,7 +226,12 @@ func runServe() {
 	responsesWSCompactMaxItems := flag.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items")
 	responsesWSCompactMaxBytes := flag.Int("responses-ws-auto-compact-max-bytes", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes), "Auto-compact websocket session history after this many raw bytes")
 	responsesWSCompactKeepTail := flag.Int("responses-ws-auto-compact-keep-tail", getEnvInt("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail), "When auto-compacting websocket history, keep this many most recent items verbatim")
+	metricsEnabled := flag.Bool("metrics", getEnvBool("METRICS", true), "Enable the Prometheus /metrics endpoint")
+	noMetrics := flag.Bool("no-metrics", false, "Disable the Prometheus /metrics endpoint")
 	flag.Parse()
+	if *noMetrics {
+		*metricsEnabled = false
+	}
 
 	log := logger.New(logger.ParseLevel(*logLevel))
 
@@ -255,6 +260,8 @@ func runServe() {
 		*host,
 		*port,
 		server.WithStreamingUpstreamTimeout(*streamingUpstreamTimeout),
+		server.WithBuildVersion(buildVersion),
+		server.WithMetricsEnabled(*metricsEnabled),
 		server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
 			EditorVersion:       *copilotEditorVersion,
 			EditorPluginVersion: *copilotPluginVersion,
