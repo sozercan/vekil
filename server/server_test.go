@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
@@ -155,7 +156,8 @@ func TestMetricsEndpointExposesPrometheusMetricsWithoutSensitiveLabels(t *testin
 		t.Fatalf("failed to read metrics response: %v", err)
 	}
 
-	families, err := new(expfmt.TextParser).TextToMetricFamilies(bytes.NewReader(body))
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	families, err := parser.TextToMetricFamilies(bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("/metrics response was not valid Prometheus exposition: %v\n%s", err, body)
 	}
@@ -293,6 +295,34 @@ func TestMetricsEndpointRejectsForwardedLoopbackRequests(t *testing.T) {
 				t.Fatalf("/metrics status = %d, want %d when %s is present", rec.Code, http.StatusForbidden, tc.headerName)
 			}
 		})
+	}
+}
+
+func TestMetricsEndpointRejectsDuplicatedForwardedHeaderWithEmptyFirstValue(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Add("X-Forwarded-For", "")
+	req.Header.Add("X-Forwarded-For", "198.51.100.10")
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf(
+			"/metrics status = %d, want %d for duplicated forwarding header with empty first value",
+			rec.Code,
+			http.StatusForbidden,
+		)
 	}
 }
 

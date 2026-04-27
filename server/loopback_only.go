@@ -28,8 +28,10 @@ func loopbackOnly(next http.Handler) http.Handler {
 
 func hasForwardingHeaders(header http.Header) bool {
 	for _, name := range forwardedMetricsHeaders {
-		if strings.TrimSpace(header.Get(name)) != "" {
-			return true
+		for _, value := range header.Values(name) {
+			if strings.TrimSpace(value) != "" {
+				return true
+			}
 		}
 	}
 	return false
