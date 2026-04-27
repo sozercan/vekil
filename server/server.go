@@ -21,7 +21,9 @@ type Server struct {
 }
 
 type options struct {
-	proxyOptions []proxy.Option
+	proxyOptions  []proxy.Option
+	metrics       bool
+	buildVersion  string
 }
 
 // Option customizes server creation.
@@ -52,9 +54,23 @@ func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 	return WithProxyOptions(proxy.WithStreamingUpstreamTimeout(timeout))
 }
 
+// WithMetrics enables or disables the Prometheus-compatible /metrics endpoint.
+func WithMetrics(enabled bool) Option {
+	return func(o *options) {
+		o.metrics = enabled
+	}
+}
+
+// WithBuildVersion sets the build version exposed in vekil_build_info.
+func WithBuildVersion(version string) Option {
+	return func(o *options) {
+		o.buildVersion = version
+	}
+}
+
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
-	cfg := options{}
+	cfg := options{metrics: true}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
@@ -67,18 +83,31 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/messages", handler.HandleAnthropicMessages)
-	mux.HandleFunc("POST /v1/chat/completions", handler.HandleOpenAIChatCompletions)
-	mux.HandleFunc("POST /v1beta/models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /v1/models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /v1/responses/compact", handler.HandleCompact)
-	mux.HandleFunc("POST /v1/responses", handler.HandleResponses)
-	mux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
-	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
-	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
-	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
-	mux.HandleFunc("GET /v1/models", handler.HandleModels)
+	var metrics *serverMetrics
+	if cfg.metrics {
+		metrics = newServerMetrics(cfg.buildVersion)
+		mux.Handle("GET /metrics", metrics.handler())
+	}
+
+	handle := func(pattern, route string, next http.HandlerFunc) {
+		if metrics != nil {
+			next = metrics.instrument(route, next)
+		}
+		mux.HandleFunc(pattern, next)
+	}
+
+	handle("POST /v1/messages", "/v1/messages", handler.HandleAnthropicMessages)
+	handle("POST /v1/chat/completions", "/v1/chat/completions", handler.HandleOpenAIChatCompletions)
+	handle("POST /v1beta/models/", "/v1beta/models/*", handler.HandleGeminiModels)
+	handle("POST /v1/models/", "/v1/models/*", handler.HandleGeminiModels)
+	handle("POST /models/", "/models/*", handler.HandleGeminiModels)
+	handle("POST /v1/responses/compact", "/v1/responses/compact", handler.HandleCompact)
+	handle("POST /v1/responses", "/v1/responses", handler.HandleResponses)
+	handle("GET /v1/responses", "/v1/responses", handler.HandleResponsesWebSocket)
+	handle("POST /v1/memories/trace_summarize", "/v1/memories/trace_summarize", handler.HandleMemorySummarize)
+	handle("GET /healthz", "/healthz", handler.HandleHealthz)
+	handle("GET /readyz", "/readyz", handler.HandleReadyz)
+	handle("GET /v1/models", "/v1/models", handler.HandleModels)
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{
@@ -100,6 +129,7 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.httpServer.Addr, err)
 	}
+	s.httpServer.Addr = ln.Addr().String()
 
 	s.running.Store(true)
 	s.log.Info("vekil listening", logger.F("addr", s.httpServer.Addr))

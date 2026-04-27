@@ -14,6 +14,7 @@ Vekil supports two runtime patterns:
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
+| `--metrics`, `--no-metrics` | `METRICS` | `true` | Enable or disable the Prometheus-compatible `GET /metrics` endpoint |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 
 ## Copilot Header Overrides
@@ -210,3 +211,20 @@ Important:
 ```
 
 With `--log-level debug`, websocket bridge logs include `delta_attempted`, `delta_fallback`, `auto_compacted`, `history_items`, `history_bytes`, and compaction before/after sizes.
+
+## Metrics
+
+`GET /metrics` is enabled by default and exposes Prometheus text exposition via `github.com/prometheus/client_golang`.
+
+Included metrics:
+
+- Standard Go runtime and process collectors.
+- `vekil_build_info{version=\"...\"}` from the binary build version.
+- Small bounded HTTP server metrics for the existing public handlers:
+  - `vekil_http_requests_total{route,method,code}`
+  - `vekil_http_request_duration_seconds{route,method}`
+
+Intentional deferrals for this first pass:
+
+- No per-provider, per-model, per-user, key, or prompt labels.
+- No deep upstream timing breakdowns or websocket/session-specific Prometheus series yet.
