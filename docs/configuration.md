@@ -15,7 +15,7 @@ Vekil supports two runtime patterns:
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
-| `--metrics` / `--no-metrics` | `METRICS` | `true` | Enable or disable the Prometheus-compatible `/metrics` endpoint |
+| `--metrics` / `--no-metrics` | `METRICS` | `false` | Enable or disable the Prometheus-compatible `/metrics` endpoint |
 
 ## Copilot Header Overrides
 
@@ -184,7 +184,7 @@ Use the examples above as a starting point for your local providers config file.
 
 ## Metrics
 
-`GET /metrics` is enabled by default and exposes Prometheus text exposition via `prometheus/client_golang`, including standard Go runtime and process metrics, `vekil_build_info`, and a small bounded `vekil_http_requests_total{method,route,code}` counter for the proxy's public HTTP routes.
+`GET /metrics` is opt-in via `--metrics` or `METRICS=true`. When enabled, it exposes Prometheus text exposition via `prometheus/client_golang`, including standard Go runtime and process metrics, `vekil_build_info`, and a small bounded `vekil_http_requests_total{method,route,code}` counter for the proxy's public HTTP routes.
 
 Intentionally deferred in this first PR: upstream/provider-specific dimensions, request-body or model labels, prompt/user/key-derived labels, and broader per-handler latency instrumentation.
 

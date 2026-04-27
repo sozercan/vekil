@@ -23,6 +23,7 @@ func TestMetricsEndpointExposesPrometheusText(t *testing.T) {
 		logger.New(logger.ParseLevel("error")),
 		"127.0.0.1",
 		"0",
+		WithMetricsEnabled(true),
 		WithBuildInfoVersion("1.2.3"),
 	)
 	if err != nil {
@@ -94,6 +95,7 @@ func TestMetricsEndpointDoesNotExposeSensitiveLabelValues(t *testing.T) {
 		logger.New(logger.ParseLevel("error")),
 		"127.0.0.1",
 		"0",
+		WithMetricsEnabled(true),
 	)
 	if err != nil {
 		t.Fatalf("failed to initialize server: %v", err)
@@ -188,6 +190,32 @@ func TestMetricsEndpointCanBeDisabled(t *testing.T) {
 		"127.0.0.1",
 		"0",
 		WithMetricsEnabled(false),
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer stopTestServer(t, srv)
+
+	resp, err := http.Get(fmt.Sprintf("http://%s/metrics", srv.Addr()))
+	if err != nil {
+		t.Fatalf("GET /metrics failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET /metrics status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestMetricsEndpointIsDisabledByDefault(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
 	)
 	if err != nil {
 		t.Fatalf("failed to initialize server: %v", err)

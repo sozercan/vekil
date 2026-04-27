@@ -71,7 +71,7 @@ func WithBuildInfoVersion(version string) Option {
 
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
-	cfg := options{metricsEnabled: true, buildInfoVersion: "dev"}
+	cfg := options{metricsEnabled: false, buildInfoVersion: "dev"}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
