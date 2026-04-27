@@ -67,7 +67,7 @@ func TestStreamOpenAIToGeminiText(t *testing.T) {
 	)
 
 	w := httptest.NewRecorder()
-	StreamOpenAIToGemini(w, body)
+	StreamOpenAIToGemini(w, body, nil)
 
 	if ct := w.Header().Get("Content-Type"); ct != "text/event-stream" {
 		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
@@ -180,7 +180,7 @@ func TestStreamOpenAIToGeminiToolCalls(t *testing.T) {
 	)
 
 	w := httptest.NewRecorder()
-	StreamOpenAIToGemini(w, body)
+	StreamOpenAIToGemini(w, body, nil)
 
 	frames := parseGeminiSSEFrames(w.Body.String())
 	if len(frames) != 2 {
@@ -267,7 +267,7 @@ func TestStreamOpenAIToGeminiToolCallWithoutArgumentsFlushesEmptyObject(t *testi
 	)
 
 	w := httptest.NewRecorder()
-	StreamOpenAIToGemini(w, body)
+	StreamOpenAIToGemini(w, body, nil)
 
 	frames := parseGeminiSSEFrames(w.Body.String())
 	if len(frames) != 2 {
@@ -328,7 +328,7 @@ func TestStreamOpenAIToGemini_NoTailWithoutDone(t *testing.T) {
 	)
 
 	w := httptest.NewRecorder()
-	StreamOpenAIToGemini(w, body)
+	StreamOpenAIToGemini(w, body, nil)
 
 	frames := parseGeminiSSEFrames(w.Body.String())
 	if len(frames) != 1 {

@@ -43,11 +43,11 @@ func writeGeminiSSEData(w http.ResponseWriter, data interface{}) error {
 
 // StreamOpenAIToGemini translates upstream OpenAI SSE into Gemini-style
 // data-only SSE frames.
-func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
+func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser, onUsage func(*models.OpenAIUsage)) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
-	state := newGeminiStreamState(w)
+	state := newGeminiStreamState(w, onUsage)
 	sawDone, err := consumeOpenAIStreamChunks(body, state.consumeChunk)
 	if err != nil || !sawDone {
 		return
@@ -61,18 +61,23 @@ type geminiStreamState struct {
 	bufferedToolCalls  map[int]*geminiStreamingToolCall
 	storedFinishReason string
 	storedUsage        *models.OpenAIUsage
+	onUsage            func(*models.OpenAIUsage)
 }
 
-func newGeminiStreamState(w http.ResponseWriter) *geminiStreamState {
+func newGeminiStreamState(w http.ResponseWriter, onUsage func(*models.OpenAIUsage)) *geminiStreamState {
 	return &geminiStreamState{
 		w:                 w,
 		bufferedToolCalls: make(map[int]*geminiStreamingToolCall),
+		onUsage:           onUsage,
 	}
 }
 
 func (s *geminiStreamState) consumeChunk(chunk models.OpenAIStreamChunk) bool {
 	if chunk.Usage != nil {
 		s.storedUsage = chunk.Usage
+		if s.onUsage != nil {
+			s.onUsage(chunk.Usage)
+		}
 	}
 
 	for _, choice := range chunk.Choices {

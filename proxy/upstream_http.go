@@ -8,17 +8,28 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
 func (h *ProxyHandler) newInferenceUpstreamContext(streaming bool) (context.Context, context.CancelFunc) {
-	// Use background context with timeout to avoid cancellation from client
-	// disconnects while still preventing goroutine leaks on upstream hangs.
+	return h.newInferenceUpstreamContextFromParent(nil, streaming)
+}
+
+func (h *ProxyHandler) newInferenceUpstreamContextFromParent(parent context.Context, streaming bool) (context.Context, context.CancelFunc) {
+	// Use a cancellation-detached parent context so request-scoped values such as
+	// metrics labels still flow through, without aborting upstream work on client
+	// disconnects.
+	base := context.Background()
+	if parent != nil {
+		base = context.WithoutCancel(parent)
+	}
+
 	timeout := upstreamTimeout
 	if streaming {
 		timeout = h.effectiveStreamingUpstreamTimeout()
 	}
-	return context.WithTimeout(context.Background(), timeout)
+	return context.WithTimeout(base, timeout)
 }
 
 func upstreamStatusCode(err error, fallback int) int {
@@ -117,20 +128,40 @@ func mergeHeaderValues(dst, src http.Header) {
 	}
 }
 
-func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*providerRuntime, []byte, error) {
+type resolvedProviderRequest struct {
+	provider      *providerRuntime
+	rewrittenBody []byte
+	publicModel   string
+}
+
+func (r resolvedProviderRequest) applyMetricsScope(scope *requestMetricsScope) {
+	if scope == nil {
+		return
+	}
+	scope.SetPublicModel(r.publicModel)
+	if r.provider != nil {
+		scope.SetProvider(r.provider.id)
+	}
+}
+
+func (h *ProxyHandler) resolveProviderRequestDetailed(body []byte, endpoint string) (*resolvedProviderRequest, error) {
 	model := extractRequestModel(body)
 	provider, owner, known := h.resolveProviderModel(model, endpoint)
+	resolved := &resolvedProviderRequest{
+		provider:    provider,
+		publicModel: model,
+	}
 	if provider == nil {
-		return nil, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no provider available for endpoint %s", endpoint)}
+		return resolved, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no provider available for endpoint %s", endpoint)}
 	}
 	if !providerSupportsEndpoint(provider, endpoint) {
-		return nil, nil, &providerRequestError{
+		return resolved, &providerRequestError{
 			statusCode: http.StatusBadRequest,
 			err:        fmt.Errorf("provider %q does not support %s", provider.id, endpoint),
 		}
 	}
 	if known && !providerModelSupportsEndpoint(owner, endpoint) {
-		return nil, nil, &providerRequestError{
+		return resolved, &providerRequestError{
 			statusCode: http.StatusBadRequest,
 			err:        fmt.Errorf("model %q does not support %s", model, endpoint),
 		}
@@ -138,9 +169,18 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 
 	rewrittenBody, _, err := rewriteRequestModelForProvider(body, owner.upstreamModel)
 	if err != nil {
-		return nil, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+		return resolved, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
-	return provider, rewrittenBody, nil
+	resolved.rewrittenBody = rewrittenBody
+	return resolved, nil
+}
+
+func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*providerRuntime, []byte, error) {
+	resolved, err := h.resolveProviderRequestDetailed(body, endpoint)
+	if err != nil {
+		return nil, nil, err
+	}
+	return resolved.provider, resolved.rewrittenBody, nil
 }
 
 func providerSupportsEndpoint(provider *providerRuntime, endpoint string) bool {
@@ -158,18 +198,31 @@ func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body [
 }
 
 func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	provider, rewrittenBody, err := h.resolveProviderRequest(body, path)
+	scope := requestMetricsFromContext(ctx)
+
+	resolved, err := h.resolveProviderRequestDetailed(body, path)
+	if resolved != nil {
+		resolved.applyMetricsScope(scope)
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	return h.doWithRetry(func() (*http.Request, error) {
-		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "")
+	resp, err := h.doWithRetry(ctx, func() (*http.Request, error) {
+		req, err := h.newProviderJSONRequest(ctx, resolved.provider, http.MethodPost, path, resolved.rewrittenBody, extraHeaders, "")
 		if err != nil {
 			return nil, err
 		}
 		return req, nil
 	})
+	if err != nil {
+		scope.observeUpstreamError(classifyUpstreamMetricsReason(err), classifyUpstreamMetricsCode(err))
+		return nil, err
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		scope.observeUpstreamError("status_code", strconv.Itoa(resp.StatusCode))
+	}
+	return resp, nil
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
@@ -185,4 +238,21 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func writeUpstreamResponseWithBody(w http.ResponseWriter, resp *http.Response, observeBody func([]byte)) error {
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if observeBody != nil {
+		observeBody(body)
+	}
+
+	copyPassthroughHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, err = w.Write(body)
+	return err
 }

@@ -40,6 +40,16 @@ func WithCopilotHeaderConfig(cfg proxy.CopilotHeaderConfig) Option {
 	return WithProxyOptions(proxy.WithCopilotHeaderConfig(cfg))
 }
 
+// WithBuildVersion propagates the binary version into proxy diagnostics.
+func WithBuildVersion(version string) Option {
+	return WithProxyOptions(proxy.WithBuildVersion(version))
+}
+
+// WithMetricsEnabled toggles Prometheus metrics exposure and instrumentation.
+func WithMetricsEnabled(enabled bool) Option {
+	return WithProxyOptions(proxy.WithMetricsEnabled(enabled))
+}
+
 // WithResponsesWebSocketConfig overrides websocket-session handling for
 // GET /v1/responses Codex clients.
 func WithResponsesWebSocketConfig(cfg proxy.ResponsesWebSocketConfig) Option {
@@ -67,18 +77,21 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/messages", handler.HandleAnthropicMessages)
-	mux.HandleFunc("POST /v1/chat/completions", handler.HandleOpenAIChatCompletions)
-	mux.HandleFunc("POST /v1beta/models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /v1/models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /v1/responses/compact", handler.HandleCompact)
-	mux.HandleFunc("POST /v1/responses", handler.HandleResponses)
-	mux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
-	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
+	mux.HandleFunc("POST /v1/messages", handler.InstrumentHandler("/v1/messages", handler.HandleAnthropicMessages))
+	mux.HandleFunc("POST /v1/chat/completions", handler.InstrumentHandler("/v1/chat/completions", handler.HandleOpenAIChatCompletions))
+	mux.HandleFunc("POST /v1beta/models/", handler.InstrumentHandler("/v1beta/models", handler.HandleGeminiModels))
+	mux.HandleFunc("POST /v1/models/", handler.InstrumentHandler("/v1/models", handler.HandleGeminiModels))
+	mux.HandleFunc("POST /models/", handler.InstrumentHandler("/models", handler.HandleGeminiModels))
+	mux.HandleFunc("POST /v1/responses/compact", handler.InstrumentHandler("/v1/responses/compact", handler.HandleCompact))
+	mux.HandleFunc("POST /v1/responses", handler.InstrumentHandler("/v1/responses", handler.HandleResponses))
+	mux.HandleFunc("GET /v1/responses", handler.InstrumentHandler("/v1/responses/ws", handler.HandleResponsesWebSocket))
+	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.InstrumentHandler("/v1/memories/trace_summarize", handler.HandleMemorySummarize))
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
 	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)
+	if metricsHandler := handler.MetricsHandler(); metricsHandler != nil {
+		mux.Handle("GET /metrics", metricsHandler)
+	}
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{
