@@ -185,6 +185,9 @@ type ProxyHandler struct {
 	client                   *http.Client
 	copilotURL               string
 	copilotHeaders           CopilotHeaderConfig
+	buildVersion             string
+	metricsEnabled           bool
+	metrics                  *proxyMetrics
 	providersConfig          ProvidersConfig
 	providersState           *providerSetup
 	responsesWS              ResponsesWebSocketConfig
@@ -204,6 +207,20 @@ type Option func(*ProxyHandler)
 func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
 	return func(h *ProxyHandler) {
 		h.copilotHeaders = cfg.withDefaults()
+	}
+}
+
+// WithBuildVersion sets the build version used by metrics and diagnostics.
+func WithBuildVersion(version string) Option {
+	return func(h *ProxyHandler) {
+		h.buildVersion = strings.TrimSpace(version)
+	}
+}
+
+// WithMetricsEnabled toggles Prometheus metrics exposure and instrumentation.
+func WithMetricsEnabled(enabled bool) Option {
+	return func(h *ProxyHandler) {
+		h.metricsEnabled = enabled
 	}
 }
 
@@ -266,6 +283,8 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		},
 		copilotURL:               "https://api.githubcopilot.com",
 		copilotHeaders:           DefaultCopilotHeaderConfig(),
+		buildVersion:             "dev",
+		metricsEnabled:           true,
 		responsesWS:              DefaultResponsesWebSocketConfig(),
 		streamingUpstreamTimeout: streamingUpstreamTimeout,
 		log:                      log,
@@ -277,6 +296,9 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 	}
 	if err := h.initializeProviders(); err != nil {
 		return nil, err
+	}
+	if h.metricsEnabled {
+		h.metrics = newProxyMetrics(h.buildVersion)
 	}
 	return h, nil
 }
@@ -296,6 +318,32 @@ func (h *ProxyHandler) effectiveStreamingUpstreamTimeout() time.Duration {
 // configured streaming upstream timeout plus the non-streaming request budget.
 func (h *ProxyHandler) ServerWriteTimeout() time.Duration {
 	return h.effectiveStreamingUpstreamTimeout() + upstreamTimeout
+}
+
+// MetricsHandler returns the Prometheus exposition handler when metrics are enabled.
+func (h *ProxyHandler) MetricsHandler() http.Handler {
+	if h == nil || h.metrics == nil {
+		return nil
+	}
+	return h.metrics.handler
+}
+
+func (h *ProxyHandler) instrument(endpoint string, next http.HandlerFunc) http.HandlerFunc {
+	if h == nil || h.metrics == nil {
+		return next
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		scope := h.metrics.beginRequest(endpoint)
+		recorder := newMetricsResponseWriter(w)
+		defer scope.finish(recorder.statusCode)
+		next(recorder, r.WithContext(withRequestMetricsScope(r.Context(), scope)))
+	}
+}
+
+// InstrumentHandler wraps an endpoint handler with request metrics when enabled.
+func (h *ProxyHandler) InstrumentHandler(endpoint string, next http.HandlerFunc) http.HandlerFunc {
+	return h.instrument(endpoint, next)
 }
 
 func setCopilotHeaders(req *http.Request, token string) {

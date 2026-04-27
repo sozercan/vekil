@@ -42,6 +42,7 @@ func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
 // HandleResponses handles POST /v1/responses by forwarding the request to
 // Copilot's responses endpoint with only auth headers injected.
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
+	scope := requestMetricsFromContext(r.Context())
 	bodyBytes, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
@@ -51,6 +52,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = r.Body.Close() }()
 
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses", true)
+	scope.SetPublicModel(extractRequestModel(bodyBytes))
 
 	var partial struct {
 		Stream *bool `json:"stream,omitempty"`
@@ -60,7 +62,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	extraHeaders := responsesExtraHeadersFromRequest(r)
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(isStreaming)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFromParent(r.Context(), isStreaming)
 	defer upstreamCancel()
 
 	resp, err := h.postResponsesWithHeaders(upstreamCtx, bodyBytes, extraHeaders)
@@ -100,7 +102,13 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeUpstreamResponse(w, resp)
+	if err := writeUpstreamResponseWithBody(w, resp, func(body []byte) {
+		if inputTokens, outputTokens, ok := extractResponsesUsage(body); ok {
+			scope.observeResponsesUsage(inputTokens, outputTokens)
+		}
+	}); err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
+	}
 }
 
 // compactPrompt is the system instruction used when the upstream does not
@@ -127,6 +135,7 @@ Be concise, structured, and action-oriented. Do not chat with the user. Do not a
 // that Codex expects. The returned compaction item is a proxy-owned token that
 // this proxy can later expand back into summarized context for /responses.
 func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
+	scope := requestMetricsFromContext(r.Context())
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
@@ -136,6 +145,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = r.Body.Close() }()
 
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/compact", false)
+	scope.SetPublicModel(extractRequestModel(bodyBytes))
 
 	var body map[string]json.RawMessage
 	if err := json.Unmarshal(bodyBytes, &body); err != nil {
@@ -146,7 +156,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	body["instructions"] = prompt
 	bodyBytes, _ = json.Marshal(body)
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFromParent(r.Context(), false)
 	defer upstreamCancel()
 
 	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, bodyBytes, responsesExtraHeadersFromRequest(r))
@@ -179,6 +189,9 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
 		return
+	}
+	if inputTokens, outputTokens, ok := extractResponsesUsage(respBody); ok {
+		scope.observeResponsesUsage(inputTokens, outputTokens)
 	}
 
 	summaryText, err := extractResponsesOutputText(respBody)
@@ -232,6 +245,7 @@ Respond with a JSON array where each element has "trace_summary" and "memory_sum
 // the traces to the upstream /responses endpoint with a summarization prompt,
 // then transforming the response into the format Codex expects.
 func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Request) {
+	scope := requestMetricsFromContext(r.Context())
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
@@ -249,6 +263,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
 		return
 	}
+	scope.SetPublicModel(memReq.Model)
 
 	tracesJSON, _ := json.Marshal(memReq.Traces)
 	userContent := "Summarize the following session traces:\n\n" + string(tracesJSON)
@@ -271,7 +286,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	}
 	reqBody, _ := json.Marshal(responsesReq)
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFromParent(r.Context(), false)
 	defer upstreamCancel()
 
 	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, reqBody, responsesExtraHeadersFromRequest(r))
@@ -304,6 +319,9 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
 		return
+	}
+	if inputTokens, outputTokens, ok := extractResponsesUsage(respBody); ok {
+		scope.observeResponsesUsage(inputTokens, outputTokens)
 	}
 
 	summaryText, err := extractResponsesOutputText(respBody)

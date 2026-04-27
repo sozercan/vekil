@@ -118,7 +118,7 @@ func TestStreamOpenAIToAnthropic_TextOnly(t *testing.T) {
 	)
 
 	w := httptest.NewRecorder()
-	StreamOpenAIToAnthropic(w, body, "claude-3-sonnet", "req-123")
+	StreamOpenAIToAnthropic(w, body, "claude-3-sonnet", "req-123", nil)
 
 	if ct := w.Header().Get("Content-Type"); ct != "text/event-stream" {
 		t.Errorf("Content-Type = %q, want %q", ct, "text/event-stream")
@@ -259,7 +259,7 @@ func TestStreamOpenAIToAnthropic_ToolCall(t *testing.T) {
 	)
 
 	w := httptest.NewRecorder()
-	StreamOpenAIToAnthropic(w, body, "claude-3-sonnet", "req-456")
+	StreamOpenAIToAnthropic(w, body, "claude-3-sonnet", "req-456", nil)
 
 	events := parseSSEEvents(w.Body.String())
 
@@ -379,7 +379,7 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 	)
 
 	w := httptest.NewRecorder()
-	StreamOpenAIToAnthropic(w, body, "claude-opus-4.6-fast", "req-789")
+	StreamOpenAIToAnthropic(w, body, "claude-opus-4.6-fast", "req-789", nil)
 	events := parseSSEEvents(w.Body.String())
 
 	expectedTypes := []string{
@@ -518,7 +518,7 @@ func TestStreamOpenAIToAnthropic_InterleavedParallelToolCalls(t *testing.T) {
 	)
 
 	w := httptest.NewRecorder()
-	StreamOpenAIToAnthropic(w, body, "claude-opus-4.6-fast", "req-interleaved")
+	StreamOpenAIToAnthropic(w, body, "claude-opus-4.6-fast", "req-interleaved", nil)
 	events := parseSSEEvents(w.Body.String())
 
 	expectedTypes := []string{
@@ -623,7 +623,7 @@ func TestStreamOpenAIToAnthropic_TextAfterToolCall(t *testing.T) {
 	)
 
 	w := httptest.NewRecorder()
-	StreamOpenAIToAnthropic(w, body, "claude-opus-4.6-fast", "req-tool-text")
+	StreamOpenAIToAnthropic(w, body, "claude-opus-4.6-fast", "req-tool-text", nil)
 	events := parseSSEEvents(w.Body.String())
 
 	expectedTypes := []string{
@@ -718,7 +718,7 @@ func TestStreamMessageDeltaNoTypeField(t *testing.T) {
 		"[DONE]",
 	)
 	w := httptest.NewRecorder()
-	StreamOpenAIToAnthropic(w, body, "claude-test", "msg_test")
+	StreamOpenAIToAnthropic(w, body, "claude-test", "msg_test", nil)
 	events := parseSSEEvents(w.Body.String())
 
 	// Find message_delta event
@@ -860,7 +860,7 @@ func TestAnthropicStreamEventShapes(t *testing.T) {
 
 	body := buildSSEStream(mustMarshal(t, chunk1), mustMarshal(t, chunk2), "[DONE]")
 	w := httptest.NewRecorder()
-	StreamOpenAIToAnthropic(w, body, "claude-sonnet-4", "msg_123")
+	StreamOpenAIToAnthropic(w, body, "claude-sonnet-4", "msg_123", nil)
 	events := parseSSEEvents(w.Body.String())
 
 	// Validate each event type's JSON shape
@@ -1287,7 +1287,7 @@ func TestStreamOpenAIToAnthropic_NoSuccessTailOnScannerFailure(t *testing.T) {
 	)
 
 	w := httptest.NewRecorder()
-	StreamOpenAIToAnthropic(w, body, "claude-sonnet-4", "req-scan-fail")
+	StreamOpenAIToAnthropic(w, body, "claude-sonnet-4", "req-scan-fail", nil)
 
 	events := parseSSEEvents(w.Body.String())
 	for _, evt := range events {

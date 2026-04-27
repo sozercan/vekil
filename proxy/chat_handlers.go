@@ -104,6 +104,7 @@ func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp 
 // HandleAnthropicMessages handles POST /v1/messages by translating the Anthropic
 // request to OpenAI format, forwarding to Copilot, and translating the response back.
 func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
+	scope := requestMetricsFromContext(r.Context())
 	body, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
@@ -117,6 +118,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON in request body")
 		return
 	}
+	scope.SetPublicModel(req.Model)
 
 	h.log.Debug("anthropic request",
 		logger.F("model", req.Model),
@@ -131,7 +133,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFromParent(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 
 	resp, err := h.postChatCompletions(upstreamCtx, oaiBody)
@@ -165,9 +167,12 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			StreamOpenAIToAnthropic(w, resp.Body, req.Model, "msg_"+uuid.New().String())
+			StreamOpenAIToAnthropic(w, resp.Body, req.Model, "msg_"+uuid.New().String(), func(usage *models.OpenAIUsage) {
+				observeOpenAIUsage(scope, usage)
+			})
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			observeOpenAIUsage(scope, oaiResp.Usage)
 			anthropicResp := TranslateOpenAIToAnthropic(oaiResp, req.Model)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(anthropicResp)
@@ -181,6 +186,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 // HandleOpenAIChatCompletions handles POST /v1/chat/completions by forwarding the
 // request to Copilot with only auth headers injected (near zero-copy passthrough).
 func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
+	scope := requestMetricsFromContext(r.Context())
 	bodyBytes, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
@@ -189,9 +195,10 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 	defer func() { _ = r.Body.Close() }()
 
+	scope.SetPublicModel(extractRequestModel(bodyBytes))
 	bodyBytes, mode := prepareOpenAIChatCompletionsRequest(bodyBytes)
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFromParent(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 
 	resp, err := h.postChatCompletions(upstreamCtx, bodyBytes)
@@ -216,8 +223,17 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			StreamOpenAIPassthrough(w, resp.Body)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			observeOpenAIUsage(scope, oaiResp.Usage)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(oaiResp)
+		},
+		passthrough: func(resp *http.Response) error {
+			return writeUpstreamResponseWithBody(w, resp, func(body []byte) {
+				var parsed models.OpenAIResponse
+				if err := json.Unmarshal(body, &parsed); err == nil {
+					observeOpenAIUsage(scope, parsed.Usage)
+				}
+			})
 		},
 	})
 	if err != nil {

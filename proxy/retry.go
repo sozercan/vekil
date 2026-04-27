@@ -52,7 +52,7 @@ func drainAndClose(body io.ReadCloser) {
 
 // doWithRetry executes an HTTP request with retry on transient failures.
 // The reqFactory is called on each attempt to produce a fresh request body.
-func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*http.Response, error) {
+func (h *ProxyHandler) doWithRetry(ctx context.Context, reqFactory func() (*http.Request, error)) (*http.Response, error) {
 	maxRetries := h.maxRetries
 	if maxRetries == 0 {
 		maxRetries = 3
@@ -63,7 +63,8 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 	}
 
 	var lastErr error
-	for attempt := range maxRetries {
+	scope := requestMetricsFromContext(ctx)
+	for attempt := 0; attempt < maxRetries; attempt++ {
 		req, err := reqFactory()
 		if err != nil {
 			return nil, err
@@ -73,6 +74,7 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		if err != nil {
 			lastErr = err
 			if attempt < maxRetries-1 {
+				scope.observeRetry("transport", "transport")
 				if ctxErr := sleepWithContext(req.Context(), backoff(retryDelay, attempt)); ctxErr != nil {
 					return nil, ctxErr
 				}
@@ -91,6 +93,7 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		lastErr = &upstreamError{statusCode: resp.StatusCode}
 
 		if attempt < maxRetries-1 {
+			scope.observeRetry("status_code", strconv.Itoa(resp.StatusCode))
 			delay := backoff(retryDelay, attempt)
 			if ra, ok := parseRetryAfter(retryAfterHeader); ok && ra > delay {
 				delay = ra
