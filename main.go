@@ -26,6 +26,9 @@ const (
 	cliCommandLogout
 )
 
+// buildVersion is injected by release builds. Local builds fall back to "dev".
+var buildVersion = "dev"
+
 func main() {
 	// Dispatch subcommands before falling through to the default server mode.
 	switch commandFromArgs(os.Args) {
@@ -216,6 +219,8 @@ func runServe() {
 	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
 	providersConfigPath := flag.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration")
 	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
+	metrics := flag.Bool("metrics", getEnvBool("METRICS", true), "Expose a Prometheus-compatible /metrics endpoint")
+	noMetrics := flag.Bool("no-metrics", false, "Disable the Prometheus-compatible /metrics endpoint")
 	streamingUpstreamTimeout := flag.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
 	copilotEditorVersion := flag.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header")
 	copilotPluginVersion := flag.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
@@ -249,11 +254,18 @@ func runServe() {
 		log.Info("authenticated successfully")
 	}
 
+	metricsEnabled := *metrics
+	if *noMetrics {
+		metricsEnabled = false
+	}
+
 	srv, err := server.New(
 		authenticator,
 		log,
 		*host,
 		*port,
+		server.WithMetrics(metricsEnabled),
+		server.WithBuildVersion(buildVersion),
 		server.WithStreamingUpstreamTimeout(*streamingUpstreamTimeout),
 		server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
 			EditorVersion:       *copilotEditorVersion,
