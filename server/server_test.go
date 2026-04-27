@@ -258,6 +258,44 @@ func TestMetricsEndpointAllowsLoopbackRequests(t *testing.T) {
 	}
 }
 
+func TestMetricsEndpointRejectsForwardedLoopbackRequests(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	tests := []struct {
+		name        string
+		headerName  string
+		headerValue string
+	}{
+		{name: "forwarded", headerName: "Forwarded", headerValue: "for=198.51.100.10;proto=https"},
+		{name: "x-forwarded-for", headerName: "X-Forwarded-For", headerValue: "198.51.100.10"},
+		{name: "x-real-ip", headerName: "X-Real-IP", headerValue: "198.51.100.10"},
+		{name: "via", headerName: "Via", headerValue: "1.1 proxy.example"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			req.RemoteAddr = "127.0.0.1:1234"
+			req.Header.Set(tc.headerName, tc.headerValue)
+			rec := httptest.NewRecorder()
+
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("/metrics status = %d, want %d when %s is present", rec.Code, http.StatusForbidden, tc.headerName)
+			}
+		})
+	}
+}
+
 func TestMetricsEndpointCanBeDisabled(t *testing.T) {
 	srv, err := New(
 		auth.NewTestAuthenticator("test-token"),
