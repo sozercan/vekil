@@ -88,6 +88,7 @@ type responsesWebSocketStreamIncompleteDetails struct {
 }
 
 type responsesWebSocketSession struct {
+	h              *ProxyHandler
 	conn           *websocket.Conn
 	ctx            context.Context
 	baseHeaders    http.Header
@@ -148,7 +149,7 @@ func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.R
 	defer func() { _ = conn.Close() }()
 
 	conn.SetReadLimit(maxRequestBodySize)
-	session := newResponsesWebSocketSession(conn, r)
+	session := newResponsesWebSocketSession(h, conn, r)
 
 	for {
 		messageType, payload, err := conn.ReadMessage()
@@ -173,7 +174,7 @@ func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.R
 	}
 }
 
-func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *responsesWebSocketSession {
+func newResponsesWebSocketSession(h *ProxyHandler, conn *websocket.Conn, r *http.Request) *responsesWebSocketSession {
 	baseHeaders := make(http.Header)
 	for _, name := range []string{"X-Codex-Beta-Features", "X-Codex-Turn-Metadata", "OpenAI-Beta", "session_id", "X-Client-Request-Id", "X-OpenAI-Subagent"} {
 		for _, value := range r.Header.Values(name) {
@@ -182,6 +183,7 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 	}
 
 	return &responsesWebSocketSession{
+		h:           h,
 		conn:        conn,
 		ctx:         r.Context(),
 		baseHeaders: baseHeaders,
@@ -378,7 +380,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return fmt.Errorf("upstream websocket bridge status %d", resp.StatusCode)
 	}
 
-	responseID, outputItems, usage, err := s.streamUpstreamResponse(resp.Body, resp.Header)
+	responseID, outputItems, _, err := s.streamUpstreamResponse(resp.Body, resp.Header, observer, labels)
 	if err != nil {
 		if errors.Is(err, errStreamFailedUpstream) {
 			status := http.StatusBadGateway
@@ -399,10 +401,6 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil)
 		return err
 	}
-	if observer != nil && usage.ok {
-		observer.ObserveUsageCounts(usage.promptTokens, usage.completionTokens)
-	}
-
 	s.rememberResponse(plan.resetHistory, responseID, plan.signature, plan.currentInput, outputItems)
 	metrics = s.maybeAutoCompactHistory(h, request, metrics)
 	s.logRequestMetrics(h, request, responseID, metrics)
@@ -655,7 +653,7 @@ func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *
 	)
 }
 
-func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, headers http.Header) (string, []json.RawMessage, responsesUsage, error) {
+func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, headers http.Header, observer *requestMetricsObserver, labels requestMetricLabels) (string, []json.RawMessage, responsesUsage, error) {
 	// Emit a synthetic metadata event so WebSocket clients can discover the
 	// actual model used. The Codex CLI parses openai-model from
 	// codex.response.metadata frames via response_model().
@@ -716,8 +714,11 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, heade
 				completionTokens: event.Response.Usage.OutputTokens,
 				ok:               event.Response.Usage.InputTokens > 0 || event.Response.Usage.OutputTokens > 0,
 			}
+			if observer != nil && usage.ok {
+				observer.ObserveUsageCounts(usage.promptTokens, usage.completionTokens)
+			}
 		case "response.failed", "response.incomplete":
-			status := s.sendUpstreamStreamFailure(event, headers)
+			status := s.sendUpstreamStreamFailure(event, headers, labels)
 			// Return the sentinel immediately to break out of the SSE
 			// scanner loop. The failure event has already been forwarded to
 			// the client above, and we also emit a standard error payload so
@@ -749,10 +750,26 @@ func (s *responsesWebSocketSession) writeJSON(payload interface{}) error {
 	return s.conn.WriteMessage(websocket.TextMessage, encoded)
 }
 
-func (s *responsesWebSocketSession) sendUpstreamStreamFailure(event responsesWebSocketStreamEvent, headers http.Header) int {
+func (s *responsesWebSocketSession) sendUpstreamStreamFailure(event responsesWebSocketStreamEvent, headers http.Header, labels requestMetricLabels) int {
 	status, message, code := responsesWebSocketStreamFailureDetails(event)
 	if status == 0 || strings.TrimSpace(message) == "" {
 		return 0
+	}
+	if s != nil && s.h != nil && s.h.metrics != nil {
+		switch event.Type {
+		case "response.failed":
+			reason := strings.TrimSpace(event.Response.Error.Type)
+			if reason == "" {
+				reason = "response_failed"
+			}
+			s.h.metrics.observeUpstreamError(labels, code, reason)
+		case "response.incomplete":
+			reason := strings.TrimSpace(event.Response.IncompleteDetails.Reason)
+			if reason == "" {
+				reason = "response_incomplete"
+			}
+			s.h.metrics.observeUpstreamError(labels, event.Type, reason)
+		}
 	}
 	s.sendWrappedError(status, message, code, headers)
 	return status

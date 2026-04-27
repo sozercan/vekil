@@ -107,7 +107,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isStreaming && resp.StatusCode == http.StatusOK {
-		peekAndForwardResponses(h, sw, r, resp, upstreamCancel, requestModel)
+		peekAndForwardResponses(h, sw, r, resp, upstreamCancel, requestModel, observer, labels)
 		return
 	}
 

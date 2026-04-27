@@ -70,7 +70,7 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 }
 
 // StreamOpenAIPassthrough streams OpenAI SSE bytes directly to the client with no parsing.
-func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
+func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser, observeUsage func(*models.OpenAIUsage)) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
@@ -78,17 +78,26 @@ func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
 	if f, ok := w.(http.Flusher); ok {
 		fw.flusher = f
 	}
+	if observeUsage != nil {
+		_, _ = consumeOpenAIStreamChunks(io.TeeReader(body, fw), func(chunk models.OpenAIStreamChunk) bool {
+			if chunk.Usage != nil {
+				observeUsage(chunk.Usage)
+			}
+			return true
+		})
+		return
+	}
 	// Errors here (client disconnect, upstream drop) are unrecoverable for SSE
 	// since headers have already been sent. The client must handle truncated streams.
 	_, _ = io.Copy(fw, body)
 }
 
 // StreamOpenAIToAnthropic translates an OpenAI SSE stream into Anthropic SSE format.
-func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model string, requestID string) {
+func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model string, requestID string, observeUsage func(*models.OpenAIUsage)) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
-	state := newAnthropicStreamState(w, model, requestID)
+	state := newAnthropicStreamState(w, model, requestID, observeUsage)
 	if !state.start() {
 		return
 	}
@@ -123,9 +132,10 @@ func aggregateStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, erro
 }
 
 type anthropicStreamState struct {
-	w         http.ResponseWriter
-	model     string
-	requestID string
+	w            http.ResponseWriter
+	model        string
+	requestID    string
+	observeUsage func(*models.OpenAIUsage)
 
 	nextBlockIndex      int
 	textBlockIndex      int
@@ -135,11 +145,12 @@ type anthropicStreamState struct {
 	openToolCallIndexes map[int]struct{}
 }
 
-func newAnthropicStreamState(w http.ResponseWriter, model string, requestID string) *anthropicStreamState {
+func newAnthropicStreamState(w http.ResponseWriter, model string, requestID string, observeUsage func(*models.OpenAIUsage)) *anthropicStreamState {
 	return &anthropicStreamState{
 		w:                   w,
 		model:               model,
 		requestID:           requestID,
+		observeUsage:        observeUsage,
 		textBlockIndex:      -1,
 		toolCallBlockIndex:  make(map[int]int),
 		openToolCallIndexes: make(map[int]struct{}),
@@ -167,6 +178,9 @@ func (s *anthropicStreamState) emit(eventType string, data interface{}) bool {
 func (s *anthropicStreamState) consumeChunk(chunk models.OpenAIStreamChunk) bool {
 	if chunk.Usage != nil {
 		s.storedUsage = chunk.Usage
+		if s.observeUsage != nil {
+			s.observeUsage(chunk.Usage)
+		}
 	}
 
 	for _, choice := range chunk.Choices {

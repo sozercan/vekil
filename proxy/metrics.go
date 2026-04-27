@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -294,7 +295,7 @@ func (h *ProxyHandler) observeUpstreamStatusForLabels(labels requestMetricLabels
 
 func (h *ProxyHandler) requestMetricsLabels(model, upstreamEndpoint, metricEndpoint string) requestMetricLabels {
 	labels := requestMetricLabels{
-		publicModel: model,
+		publicModel: unknownMetricLabelValue,
 		endpoint:    metricEndpoint,
 	}
 	if h == nil {
@@ -356,16 +357,60 @@ func extractResponsesCompletedUsage(body []byte) responsesUsage {
 	}
 }
 
+const bufferedUpstreamResponseCaptureLimit = 1024 * 1024
+
+type cappedResponseBuffer struct {
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func newCappedResponseBuffer(limit int) *cappedResponseBuffer {
+	return &cappedResponseBuffer{limit: limit}
+}
+
+func (b *cappedResponseBuffer) Write(p []byte) (int, error) {
+	if b == nil {
+		return len(p), nil
+	}
+	if b.limit <= 0 {
+		b.truncated = true
+		return len(p), nil
+	}
+	remaining := b.limit - b.buf.Len()
+	if remaining <= 0 {
+		b.truncated = true
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		_, _ = b.buf.Write(p[:remaining])
+		b.truncated = true
+		return len(p), nil
+	}
+	_, _ = b.buf.Write(p)
+	return len(p), nil
+}
+
+func (b *cappedResponseBuffer) Bytes() []byte {
+	if b == nil || b.truncated {
+		return nil
+	}
+	return b.buf.Bytes()
+}
+
 func writeBufferedUpstreamResponse(w http.ResponseWriter, resp *http.Response) ([]byte, error) {
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(body)
-	return body, nil
+	buf := newCappedResponseBuffer(bufferedUpstreamResponseCaptureLimit)
+	if _, err := io.Copy(io.MultiWriter(w, buf), resp.Body); err != nil {
+		return nil, err
+	}
+	body := buf.Bytes()
+	if body == nil {
+		return nil, nil
+	}
+	return append([]byte(nil), body...), nil
 }
 
 type statusCapturingResponseWriter struct {

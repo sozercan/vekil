@@ -177,7 +177,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	err = h.routeChatCompletionsResponse(sw, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			StreamOpenAIToAnthropic(sw, resp.Body, req.Model, "msg_"+uuid.New().String())
+			StreamOpenAIToAnthropic(sw, resp.Body, req.Model, "msg_"+uuid.New().String(), observer.ObserveOpenAIUsage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
 			if observer != nil {
@@ -239,7 +239,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	err = h.routeChatCompletionsResponse(sw, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
 			copyPassthroughHeaders(sw.Header(), resp.Header)
-			StreamOpenAIPassthrough(sw, resp.Body)
+			StreamOpenAIPassthrough(sw, resp.Body, observer.ObserveOpenAIUsage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
 			if observer != nil {

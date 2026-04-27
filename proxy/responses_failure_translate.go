@@ -160,11 +160,11 @@ func (s *responsesPreparedStream) abort() {
 	s.abortFn()
 }
 
-func peekAndForwardResponses(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string) {
-	peekAndForwardResponsesWithConfig(h, w, r, resp, upstreamCancel, model, responsesPrecommitPeekTimeout, responsesPrecommitMaxPeekBytes)
+func peekAndForwardResponses(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, observer *requestMetricsObserver, labels requestMetricLabels) {
+	peekAndForwardResponsesWithConfig(h, w, r, resp, upstreamCancel, model, observer, labels, responsesPrecommitPeekTimeout, responsesPrecommitMaxPeekBytes)
 }
 
-func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, peekTimeout time.Duration, maxPeekBytes int) {
+func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, observer *requestMetricsObserver, labels requestMetricLabels, peekTimeout time.Duration, maxPeekBytes int) {
 	if upstreamCancel != nil {
 		defer upstreamCancel()
 	}
@@ -188,7 +188,7 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 	resp = prepared.commitResponse()
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(http.StatusOK)
-	streamResponsesPipeWithFailureLog(h, w, resp.Body, resp.Header)
+	streamResponsesPipeWithFailureLog(h, w, resp.Body, resp.Header, observer, labels)
 }
 
 func prepareResponsesStreamAttempt(waitCtx, streamCtx context.Context, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
@@ -452,7 +452,7 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 	return "", ""
 }
 
-func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header) {
+func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header, observer *requestMetricsObserver, labels requestMetricLabels) {
 	if closer, ok := r.(io.Closer); ok {
 		defer func() { _ = closer.Close() }()
 	}
@@ -462,7 +462,7 @@ func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r
 		fw.flusher = f
 	}
 
-	tap := newResponsesFailureTap(h, upstreamHeaders)
+	tap := newResponsesFailureTap(h, upstreamHeaders, observer, labels)
 	_, _ = io.Copy(fw, io.TeeReader(r, tap))
 }
 
@@ -638,13 +638,17 @@ func nextResponsesSSEMessage(buf []byte, allowBOM bool) (responsesSSEMessage, in
 type responsesFailureTap struct {
 	h               *ProxyHandler
 	upstreamHeaders http.Header
+	observer        *requestMetricsObserver
+	labels          requestMetricLabels
 	parser          responsesSSEParser
 }
 
-func newResponsesFailureTap(h *ProxyHandler, upstreamHeaders http.Header) *responsesFailureTap {
+func newResponsesFailureTap(h *ProxyHandler, upstreamHeaders http.Header, observer *requestMetricsObserver, labels requestMetricLabels) *responsesFailureTap {
 	return &responsesFailureTap{
 		h:               h,
 		upstreamHeaders: upstreamHeaders,
+		observer:        observer,
+		labels:          labels,
 		parser:          responsesSSEParser{allowBOM: true},
 	}
 }
@@ -667,7 +671,7 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 
 func (t *responsesFailureTap) maybeLog(msg responsesSSEMessage) {
 	eventName := strings.TrimSpace(msg.event)
-	if eventName != "response.failed" && eventName != "response.incomplete" && eventName != "" {
+	if eventName != "response.completed" && eventName != "response.failed" && eventName != "response.incomplete" && eventName != "" {
 		return
 	}
 
@@ -680,7 +684,35 @@ func (t *responsesFailureTap) maybeLog(msg responsesSSEMessage) {
 	if eventName == "" {
 		eventName = eventType
 	}
-	if eventName != "response.failed" && eventName != "response.incomplete" {
+	switch eventName {
+	case "response.completed":
+		usage := responsesUsage{
+			promptTokens:     event.Response.Usage.InputTokens,
+			completionTokens: event.Response.Usage.OutputTokens,
+			ok:               event.Response.Usage.InputTokens > 0 || event.Response.Usage.OutputTokens > 0,
+		}
+		if t.observer != nil && usage.ok {
+			t.observer.ObserveUsageCounts(usage.promptTokens, usage.completionTokens)
+		}
+		return
+	case "response.failed":
+		if t.h != nil && t.h.metrics != nil {
+			code := strings.TrimSpace(event.Response.Error.Code)
+			reason := strings.TrimSpace(event.Response.Error.Type)
+			if reason == "" {
+				reason = "response_failed"
+			}
+			t.h.metrics.observeUpstreamError(t.labels, code, reason)
+		}
+	case "response.incomplete":
+		if t.h != nil && t.h.metrics != nil {
+			reason := strings.TrimSpace(event.Response.IncompleteDetails.Reason)
+			if reason == "" {
+				reason = "response_incomplete"
+			}
+			t.h.metrics.observeUpstreamError(t.labels, eventName, reason)
+		}
+	default:
 		return
 	}
 
