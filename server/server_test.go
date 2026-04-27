@@ -210,6 +210,54 @@ func TestMetricsEndpointExposesPrometheusMetricsWithoutSensitiveLabels(t *testin
 	}
 }
 
+func TestMetricsEndpointRejectsNonLoopbackRequests(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.RemoteAddr = "198.51.100.10:4321"
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("/metrics status = %d, want %d for non-loopback request", rec.Code, http.StatusForbidden)
+	}
+}
+
+func TestMetricsEndpointAllowsLoopbackRequests(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	for _, remoteAddr := range []string{"127.0.0.1:1234", "[::1]:1234"} {
+		t.Run(remoteAddr, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			req.RemoteAddr = remoteAddr
+			rec := httptest.NewRecorder()
+
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("/metrics status = %d, want %d for loopback request", rec.Code, http.StatusOK)
+			}
+		})
+	}
+}
+
 func TestMetricsEndpointCanBeDisabled(t *testing.T) {
 	srv, err := New(
 		auth.NewTestAuthenticator("test-token"),

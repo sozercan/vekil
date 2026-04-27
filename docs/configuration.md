@@ -17,7 +17,7 @@ Vekil supports two runtime patterns:
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 | `--metrics` / `--no-metrics` | `METRICS` | enabled | Enable or disable the Prometheus-compatible `/metrics` endpoint |
 
-When enabled, `/metrics` exports Prometheus text exposition from the same HTTP server, including Go runtime/process collectors, `vekil_build_info`, and a small bounded `vekil_http_requests_total` counter for `/healthz`, `/readyz`, and `/v1/models`. Broader per-provider or payload-derived handler metrics are intentionally deferred in this first PR to avoid unbounded label cardinality and accidental leakage of user, key, or prompt content into labels.
+When enabled, `/metrics` stays mounted on the main HTTP server and exports Prometheus text exposition for loopback clients only (`127.0.0.1` / `::1`). Non-local requests receive `403 Forbidden`. The endpoint includes Go runtime/process collectors, `vekil_build_info`, and a small bounded `vekil_http_requests_total` counter for `/healthz`, `/readyz`, and `/v1/models`. Broader per-provider or payload-derived handler metrics are intentionally deferred in this first PR to avoid unbounded label cardinality and accidental leakage of user, key, or prompt content into labels.
 
 ## Copilot Header Overrides
 

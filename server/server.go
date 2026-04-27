@@ -94,7 +94,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
 	if cfg.metricsEnabled {
 		metrics := newServerMetrics(cfg.buildVersion)
-		mux.Handle("GET /metrics", metrics.handler)
+		mux.Handle("GET /metrics", loopbackOnly(metrics.handler))
 		mux.HandleFunc("GET /healthz", metrics.wrap("healthz", handler.HandleHealthz))
 		mux.HandleFunc("GET /readyz", metrics.wrap("readyz", handler.HandleReadyz))
 		mux.HandleFunc("GET /v1/models", metrics.wrap("models", handler.HandleModels))
