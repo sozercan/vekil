@@ -16,6 +16,7 @@ import (
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
 	"github.com/sozercan/vekil/server"
+	buildversion "github.com/sozercan/vekil/version"
 )
 
 type cliCommand int
@@ -226,7 +227,14 @@ func runServe() {
 	responsesWSCompactMaxItems := flag.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items")
 	responsesWSCompactMaxBytes := flag.Int("responses-ws-auto-compact-max-bytes", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes), "Auto-compact websocket session history after this many raw bytes")
 	responsesWSCompactKeepTail := flag.Int("responses-ws-auto-compact-keep-tail", getEnvInt("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail), "When auto-compacting websocket history, keep this many most recent items verbatim")
+	metrics := flag.Bool("metrics", getEnvBool("METRICS", true), "Enable Prometheus-compatible /metrics endpoint")
+	noMetrics := flag.Bool("no-metrics", false, "Disable Prometheus-compatible /metrics endpoint")
 	flag.Parse()
+
+	metricsEnabled := *metrics
+	if *noMetrics {
+		metricsEnabled = false
+	}
 
 	log := logger.New(logger.ParseLevel(*logLevel))
 
@@ -269,6 +277,8 @@ func runServe() {
 			AutoCompactKeepTail: *responsesWSCompactKeepTail,
 		}),
 		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
+		server.WithMetricsEnabled(metricsEnabled),
+		server.WithBuildInfoVersion(buildversion.String()),
 	)
 	if err != nil {
 		log.Fatal("failed to initialize server", logger.Err(err))

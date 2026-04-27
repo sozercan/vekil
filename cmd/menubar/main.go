@@ -13,6 +13,7 @@ import (
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
 	"github.com/sozercan/vekil/server"
+	buildversion "github.com/sozercan/vekil/version"
 )
 
 var log = logger.New(logger.ParseLevel("info"))
@@ -184,6 +185,7 @@ func startProxy() {
 		"0.0.0.0",
 		"1337",
 		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
+		server.WithBuildInfoVersion(buildversion.String()),
 	)
 	if err != nil {
 		log.Error("server init failed", logger.Err(err))
