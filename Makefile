@@ -14,11 +14,12 @@ SPARKLE_FRAMEWORK := $(SPARKLE_UNPACK_DIR)/Sparkle.framework
 SPARKLE_DOWNLOAD_URL := https://github.com/sparkle-project/Sparkle/releases/download/$(SPARKLE_VERSION)/Sparkle-$(SPARKLE_VERSION).tar.xz
 SPARKLE_FEED_URL ?= https://github.com/sozercan/vekil/releases/latest/download/appcast.xml
 SPARKLE_PUBLIC_ED_KEY ?=
+GO ?= ./scripts/go.sh
 
 .PHONY: build build-app build-tray-linux test-app test vet lint clean docker-build
 
 build:
-	go build -ldflags="$(LDFLAGS) -X main.buildVersion=$(VERSION)" -o $(BINARY) .
+	$(GO) build -ldflags="$(LDFLAGS) -X main.buildVersion=$(VERSION)" -o $(BINARY) .
 
 $(SPARKLE_ARCHIVE):
 	@mkdir -p "$(SPARKLE_BUILD_DIR)"
@@ -35,7 +36,7 @@ build-app: $(SPARKLE_FRAMEWORK)
 	@mkdir -p "$(APP_NAME)/Contents/Resources"
 	@mkdir -p "$(APP_NAME)/Contents/Frameworks"
 	CGO_ENABLED=1 CGO_LDFLAGS="$(APP_CGO_LDFLAGS)" \
-		go build -tags sparkle -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o "$(APP_NAME)/Contents/MacOS/vekil-menubar" ./cmd/menubar/
+		$(GO) build -tags sparkle -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o "$(APP_NAME)/Contents/MacOS/vekil-menubar" ./cmd/menubar/
 	otool -l "$(APP_NAME)/Contents/MacOS/vekil-menubar" | grep -q '@executable_path/../Frameworks'
 	cp "$(APP_ICON)" "$(APP_NAME)/Contents/Resources/Vekil.icns"
 	ditto "$(SPARKLE_FRAMEWORK)" "$(APP_NAME)/Contents/Frameworks/Sparkle.framework"
@@ -94,13 +95,13 @@ TRAY_LINUX_BINARY := vekil-tray
 
 build-tray-linux:
 	CGO_ENABLED=0 GOOS=linux \
-		go build -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o $(TRAY_LINUX_BINARY) ./cmd/menubar/
+		$(GO) build -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o $(TRAY_LINUX_BINARY) ./cmd/menubar/
 
 test:
-	go test ./... -count=1
+	$(GO) test ./... -count=1
 
 vet:
-	go vet ./...
+	$(GO) vet ./...
 
 lint: vet
 
