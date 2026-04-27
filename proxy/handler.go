@@ -185,6 +185,7 @@ type ProxyHandler struct {
 	client                   *http.Client
 	copilotURL               string
 	copilotHeaders           CopilotHeaderConfig
+	buildVersion             string
 	providersConfig          ProvidersConfig
 	providersState           *providerSetup
 	responsesWS              ResponsesWebSocketConfig
@@ -192,6 +193,8 @@ type ProxyHandler struct {
 	log                      *logger.Logger
 	maxRetries               int
 	retryBaseDelay           time.Duration
+	metricsEnabled           bool
+	metrics                  *proxyMetrics
 	models                   modelsCache
 	geminiCounts             geminiCountTokensCache
 }
@@ -212,6 +215,22 @@ func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
 func WithProvidersConfig(cfg ProvidersConfig) Option {
 	return func(h *ProxyHandler) {
 		h.providersConfig = cfg
+	}
+}
+
+// WithBuildVersion sets the version label exported by the Prometheus build
+// info metric.
+func WithBuildVersion(version string) Option {
+	return func(h *ProxyHandler) {
+		h.buildVersion = strings.TrimSpace(version)
+	}
+}
+
+// WithMetricsEnabled toggles the Prometheus /metrics endpoint and request
+// instrumentation.
+func WithMetricsEnabled(enabled bool) Option {
+	return func(h *ProxyHandler) {
+		h.metricsEnabled = enabled
 	}
 }
 
@@ -266,6 +285,8 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		},
 		copilotURL:               "https://api.githubcopilot.com",
 		copilotHeaders:           DefaultCopilotHeaderConfig(),
+		buildVersion:             buildVersionDefault,
+		metricsEnabled:           true,
 		responsesWS:              DefaultResponsesWebSocketConfig(),
 		streamingUpstreamTimeout: streamingUpstreamTimeout,
 		log:                      log,
@@ -275,6 +296,10 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 			opt(h)
 		}
 	}
+	if strings.TrimSpace(h.buildVersion) == "" {
+		h.buildVersion = buildVersionDefault
+	}
+	h.metrics = newProxyMetrics(h.metricsEnabled, h.buildVersion)
 	if err := h.initializeProviders(); err != nil {
 		return nil, err
 	}

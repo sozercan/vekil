@@ -36,28 +36,37 @@ func (h *ProxyHandler) HandleGeminiModels(w http.ResponseWriter, r *http.Request
 
 	switch action {
 	case "generateContent":
-		h.handleGeminiGenerateContent(w, r, model, false)
+		h.handleGeminiGenerateContent(w, r, model, false, "gemini_generate_content")
 	case "streamGenerateContent":
-		h.handleGeminiGenerateContent(w, r, model, true)
+		h.handleGeminiGenerateContent(w, r, model, true, "gemini_stream_generate_content")
 	case "countTokens":
-		h.handleGeminiCountTokens(w, r, model)
+		h.handleGeminiCountTokens(w, r, model, "gemini_count_tokens")
 	default:
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", fmt.Sprintf("unsupported Gemini action %q", action))
 	}
 }
 
-func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *http.Request, pathModel string, stream bool) {
+func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *http.Request, pathModel string, stream bool, metricEndpoint string) {
+	sw := newStatusCapturingResponseWriter(w)
+	labels := h.requestMetricsLabels(pathModel, "/chat/completions", metricEndpoint)
+	observer := h.startRequestObserver(pathModel, "/chat/completions", metricEndpoint)
+	defer func() {
+		if observer != nil {
+			observer.Finish(sw.Status())
+		}
+	}()
+
 	body, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
-		writeGeminiError(w, status, "INVALID_ARGUMENT", err.Error())
+		writeGeminiError(sw, status, "INVALID_ARGUMENT", err.Error())
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
 
 	req, err := decodeGeminiGenerateContentRequest(body)
 	if err != nil {
-		h.writeGeminiProtocolError(w, err)
+		h.writeGeminiProtocolError(sw, err)
 		return
 	}
 
@@ -70,7 +79,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 
 	oaiReq, err := TranslateGeminiToOpenAI(req, pathModel, stream)
 	if err != nil {
-		h.writeGeminiProtocolError(w, err)
+		h.writeGeminiProtocolError(sw, err)
 		return
 	}
 
@@ -83,7 +92,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 
 	oaiBody, err := json.Marshal(oaiReq)
 	if err != nil {
-		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", "failed to marshal request")
+		writeGeminiError(sw, http.StatusInternalServerError, "INTERNAL", "failed to marshal request")
 		return
 	}
 
@@ -92,15 +101,17 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 
 	resp, err := h.postChatCompletions(upstreamCtx, oaiBody)
 	if err != nil {
-		h.writeGeminiUpstreamFailure(w, err)
+		h.observeUpstreamErrorForLabels(labels, err)
+		h.writeGeminiUpstreamFailure(sw, err)
 		return
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		h.observeUpstreamStatusForLabels(labels, resp.StatusCode)
 		defer func() { _ = resp.Body.Close() }()
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		h.log.Error("upstream error", logger.F("endpoint", "gemini"), logger.F("status", resp.StatusCode), logger.F("body", string(errBody)), logger.F("request", string(oaiBody)))
-		writeGeminiError(w, resp.StatusCode, mapGeminiUpstreamStatus(resp.StatusCode), fmt.Sprintf("upstream error (%d)", resp.StatusCode))
+		writeGeminiError(sw, resp.StatusCode, mapGeminiUpstreamStatus(resp.StatusCode), fmt.Sprintf("upstream error (%d)", resp.StatusCode))
 		return
 	}
 
@@ -108,13 +119,16 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		clientRequestedStream: stream,
 		forceUpstreamStream:   forceStream,
 	}
-	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
+	err = h.routeChatCompletionsResponse(sw, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			StreamOpenAIToGemini(w, resp.Body)
+			StreamOpenAIToGemini(sw, resp.Body)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(oaiResp))
+			if observer != nil {
+				observer.ObserveOpenAIUsage(oaiResp.Usage)
+			}
+			sw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(sw).Encode(TranslateOpenAIToGemini(oaiResp))
 		},
 		passthrough: func(resp *http.Response) error {
 			defer func() { _ = resp.Body.Close() }()
@@ -122,9 +136,12 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 			if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 				return err
 			}
+			if observer != nil {
+				observer.ObserveOpenAIUsage(parsed.Usage)
+			}
 
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(&parsed))
+			sw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(sw).Encode(TranslateOpenAIToGemini(&parsed))
 			return nil
 		},
 	})
@@ -133,52 +150,65 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		if mode.forceUpstreamStream {
 			message = "failed to aggregate upstream response"
 		}
-		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", message)
+		writeGeminiError(sw, http.StatusInternalServerError, "INTERNAL", message)
 	}
 }
 
-func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request, pathModel string) {
+func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request, pathModel string, metricEndpoint string) {
+	sw := newStatusCapturingResponseWriter(w)
+	labels := h.requestMetricsLabels(pathModel, "/chat/completions", metricEndpoint)
+	observer := h.startRequestObserver(pathModel, "/chat/completions", metricEndpoint)
+	defer func() {
+		if observer != nil {
+			observer.Finish(sw.Status())
+		}
+	}()
+
 	body, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
-		writeGeminiError(w, status, "INVALID_ARGUMENT", err.Error())
+		writeGeminiError(sw, status, "INVALID_ARGUMENT", err.Error())
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
 
 	req, err := decodeGeminiCountTokensRequest(body)
 	if err != nil {
-		h.writeGeminiProtocolError(w, err)
+		h.writeGeminiProtocolError(sw, err)
 		return
 	}
 
 	oaiReq, err := TranslateGeminiCountTokens(req, pathModel)
 	if err != nil {
-		h.writeGeminiProtocolError(w, err)
+		h.writeGeminiProtocolError(sw, err)
 		return
 	}
 
 	cacheKey, err := hashOpenAIRequest(oaiReq)
 	if err != nil {
-		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", "failed to hash countTokens request")
+		writeGeminiError(sw, http.StatusInternalServerError, "INTERNAL", "failed to hash countTokens request")
 		return
 	}
 
 	if cached, ok := h.getGeminiCountTokensCache(cacheKey); ok {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(cached)
+		sw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(sw).Encode(cached)
 		return
 	}
 
 	oaiResp, err := h.runGeminiCountTokensProbe(oaiReq)
 	if err != nil {
-		h.writeGeminiProtocolError(w, err)
+		h.observeUpstreamErrorForLabels(labels, err)
+		h.writeGeminiProtocolError(sw, err)
 		return
 	}
 
 	if oaiResp.Usage == nil {
-		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", "upstream response did not include usage")
+		writeGeminiError(sw, http.StatusInternalServerError, "INTERNAL", "upstream response did not include usage")
 		return
+	}
+	if observer != nil {
+		observer.ObserveOpenAIUsage(oaiResp.Usage)
 	}
 
 	result := models.GeminiCountTokensResponse{
@@ -193,8 +223,8 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 
 	h.setGeminiCountTokensCache(cacheKey, result)
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(result)
+	sw.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(sw).Encode(result)
 }
 
 func geminiRequestHasInlineMedia(req *models.GeminiGenerateContentRequest) bool {

@@ -30,7 +30,7 @@ func TestDoWithRetry_SuccessOnFirstTry(t *testing.T) {
 		retryBaseDelay: 1 * time.Millisecond,
 	}
 
-	resp, err := h.doWithRetry(func() (*http.Request, error) {
+	resp, err := h.doWithRetry(requestMetricLabels{}, func() (*http.Request, error) {
 		return http.NewRequest(http.MethodPost, server.URL+"/test", nil)
 	})
 	if err != nil {
@@ -67,7 +67,7 @@ func TestDoWithRetry_RetriesOnServerError(t *testing.T) {
 		retryBaseDelay: 1 * time.Millisecond,
 	}
 
-	resp, err := h.doWithRetry(func() (*http.Request, error) {
+	resp, err := h.doWithRetry(requestMetricLabels{}, func() (*http.Request, error) {
 		return http.NewRequest(http.MethodPost, server.URL+"/test", nil)
 	})
 	if err != nil {
@@ -99,7 +99,7 @@ func TestDoWithRetry_ExhaustsRetries(t *testing.T) {
 		retryBaseDelay: 1 * time.Millisecond,
 	}
 
-	_, err := h.doWithRetry(func() (*http.Request, error) {
+	_, err := h.doWithRetry(requestMetricLabels{}, func() (*http.Request, error) {
 		return http.NewRequest(http.MethodPost, server.URL+"/test", nil)
 	})
 	if err == nil {
@@ -126,7 +126,7 @@ func TestDoWithRetry_NoRetryOn4xx(t *testing.T) {
 		retryBaseDelay: 1 * time.Millisecond,
 	}
 
-	resp, err := h.doWithRetry(func() (*http.Request, error) {
+	resp, err := h.doWithRetry(requestMetricLabels{}, func() (*http.Request, error) {
 		return http.NewRequest(http.MethodPost, server.URL+"/test", nil)
 	})
 	if err != nil {
@@ -186,7 +186,7 @@ func TestDoWithRetry_CancelledDuringBackoff(t *testing.T) {
 		cancel()
 	}()
 
-	_, err := h.doWithRetry(func() (*http.Request, error) {
+	_, err := h.doWithRetry(requestMetricLabels{}, func() (*http.Request, error) {
 		return http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/test", nil)
 	})
 	if err == nil {
@@ -223,7 +223,7 @@ func TestDoWithRetry_RespectsRetryAfter(t *testing.T) {
 	}
 
 	start := time.Now()
-	resp, err := h.doWithRetry(func() (*http.Request, error) {
+	resp, err := h.doWithRetry(requestMetricLabels{}, func() (*http.Request, error) {
 		return http.NewRequest(http.MethodPost, server.URL+"/test", nil)
 	})
 	elapsed := time.Since(start)

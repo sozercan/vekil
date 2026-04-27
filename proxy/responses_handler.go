@@ -42,13 +42,23 @@ func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
 // HandleResponses handles POST /v1/responses by forwarding the request to
 // Copilot's responses endpoint with only auth headers injected.
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
+	sw := newStatusCapturingResponseWriter(w)
 	bodyBytes, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
-		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
+		writeOpenAIError(sw, status, err.Error(), "invalid_request_error")
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+
+	requestModel := extractResponsesRequestModel(bodyBytes)
+	labels := h.requestMetricsLabels(requestModel, "/responses", "responses")
+	observer := h.startRequestObserver(requestModel, "/responses", "responses")
+	defer func() {
+		if observer != nil {
+			observer.Finish(sw.Status())
+		}
+	}()
 
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses", true)
 
@@ -66,41 +76,54 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.postResponsesWithHeaders(upstreamCtx, bodyBytes, extraHeaders)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		h.observeUpstreamErrorForLabels(labels, err)
 		h.log.Error("upstream request failed", logger.F("endpoint", "responses"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
-			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+			writeOpenAIError(sw, statusCode, err.Error(), "invalid_request_error")
 			return
 		}
 		if statusCode == http.StatusInternalServerError {
-			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
+			writeOpenAIError(sw, statusCode, "authentication failed", "server_error")
 			return
 		}
-		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
+		writeOpenAIError(sw, statusCode, "upstream request failed", "server_error")
 		return
 	}
 	resp, err = h.maybeRetryCompactedResponsesRequest(upstreamCtx, bodyBytes, extraHeaders, resp)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		h.observeUpstreamErrorForLabels(labels, err)
 		h.log.Error("upstream request failed", logger.F("endpoint", "responses"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
-			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+			writeOpenAIError(sw, statusCode, err.Error(), "invalid_request_error")
 			return
 		}
 		if statusCode == http.StatusInternalServerError {
-			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
+			writeOpenAIError(sw, statusCode, "authentication failed", "server_error")
 			return
 		}
-		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
+		writeOpenAIError(sw, statusCode, "upstream request failed", "server_error")
 		return
 	}
 
 	if isStreaming && resp.StatusCode == http.StatusOK {
-		model := extractRequestModel(bodyBytes)
-		peekAndForwardResponses(h, w, r, resp, upstreamCancel, model)
+		peekAndForwardResponses(h, sw, r, resp, upstreamCancel, requestModel)
 		return
 	}
 
-	writeUpstreamResponse(w, resp)
+	if resp.StatusCode >= http.StatusBadRequest {
+		h.observeUpstreamStatusForLabels(labels, resp.StatusCode)
+	}
+	body, err := writeBufferedUpstreamResponse(sw, resp)
+	if err != nil {
+		writeOpenAIError(sw, http.StatusBadGateway, "failed to read upstream response", "server_error")
+		return
+	}
+	if observer != nil {
+		if usage := extractResponsesUsageFromBody(body); usage.ok {
+			observer.ObserveUsageCounts(usage.promptTokens, usage.completionTokens)
+		}
+	}
 }
 
 // compactPrompt is the system instruction used when the upstream does not
@@ -127,19 +150,29 @@ Be concise, structured, and action-oriented. Do not chat with the user. Do not a
 // that Codex expects. The returned compaction item is a proxy-owned token that
 // this proxy can later expand back into summarized context for /responses.
 func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
+	sw := newStatusCapturingResponseWriter(w)
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
-		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
+		writeOpenAIError(sw, status, err.Error(), "invalid_request_error")
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+
+	requestModel := extractResponsesRequestModel(bodyBytes)
+	labels := h.requestMetricsLabels(requestModel, "/responses", "responses_compact")
+	observer := h.startRequestObserver(requestModel, "/responses", "responses_compact")
+	defer func() {
+		if observer != nil {
+			observer.Finish(sw.Status())
+		}
+	}()
 
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/compact", false)
 
 	var body map[string]json.RawMessage
 	if err := json.Unmarshal(bodyBytes, &body); err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
+		writeOpenAIError(sw, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
 		return
 	}
 	prompt, _ := json.Marshal(compactPrompt)
@@ -152,38 +185,45 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, bodyBytes, responsesExtraHeadersFromRequest(r))
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		h.observeUpstreamErrorForLabels(labels, err)
 		h.log.Error("upstream request failed", logger.F("endpoint", "compact"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
-			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+			writeOpenAIError(sw, statusCode, err.Error(), "invalid_request_error")
 			return
 		}
 		if statusCode == http.StatusInternalServerError {
-			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
+			writeOpenAIError(sw, statusCode, "authentication failed", "server_error")
 			return
 		}
-		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
+		writeOpenAIError(sw, statusCode, "upstream request failed", "server_error")
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
+		h.observeUpstreamStatusForLabels(labels, resp.StatusCode)
 		if contentType := resp.Header.Get("Content-Type"); contentType != "" {
-			w.Header().Set("Content-Type", contentType)
+			sw.Header().Set("Content-Type", contentType)
 		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		sw.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(sw, resp.Body)
 		return
 	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
+		writeOpenAIError(sw, http.StatusBadGateway, "failed to read upstream response", "server_error")
 		return
+	}
+	if observer != nil {
+		if usage := extractResponsesUsageFromBody(respBody); usage.ok {
+			observer.ObserveUsageCounts(usage.promptTokens, usage.completionTokens)
+		}
 	}
 
 	summaryText, err := extractResponsesOutputText(respBody)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "failed to parse upstream response", "server_error")
+		writeOpenAIError(sw, http.StatusBadGateway, "failed to parse upstream response", "server_error")
 		return
 	}
 
@@ -213,8 +253,8 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(compactResp)
+	sw.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(sw).Encode(compactResp)
 }
 
 // memorySummarizePrompt is the system instruction used to summarize conversation
@@ -232,13 +272,26 @@ Respond with a JSON array where each element has "trace_summary" and "memory_sum
 // the traces to the upstream /responses endpoint with a summarization prompt,
 // then transforming the response into the format Codex expects.
 func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Request) {
+	sw := newStatusCapturingResponseWriter(w)
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
-		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
+		writeOpenAIError(sw, status, err.Error(), "invalid_request_error")
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+
+	var metricRequest struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(bodyBytes, &metricRequest)
+	labels := h.requestMetricsLabels(metricRequest.Model, "/responses", "memories_trace_summarize")
+	observer := h.startRequestObserver(metricRequest.Model, "/responses", "memories_trace_summarize")
+	defer func() {
+		if observer != nil {
+			observer.Finish(sw.Status())
+		}
+	}()
 
 	var memReq struct {
 		Model     string            `json:"model"`
@@ -246,8 +299,11 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		Reasoning json.RawMessage   `json:"reasoning,omitempty"`
 	}
 	if err := json.Unmarshal(bodyBytes, &memReq); err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
+		writeOpenAIError(sw, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
 		return
+	}
+	if observer != nil {
+		observer.SetLabels(h.requestMetricsLabels(memReq.Model, "/responses", "memories_trace_summarize"))
 	}
 
 	tracesJSON, _ := json.Marshal(memReq.Traces)
@@ -277,38 +333,45 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, reqBody, responsesExtraHeadersFromRequest(r))
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		h.observeUpstreamErrorForLabels(labels, err)
 		h.log.Error("upstream request failed", logger.F("endpoint", "memory_summarize"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
-			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+			writeOpenAIError(sw, statusCode, err.Error(), "invalid_request_error")
 			return
 		}
 		if statusCode == http.StatusInternalServerError {
-			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
+			writeOpenAIError(sw, statusCode, "authentication failed", "server_error")
 			return
 		}
-		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
+		writeOpenAIError(sw, statusCode, "upstream request failed", "server_error")
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
+		h.observeUpstreamStatusForLabels(labels, resp.StatusCode)
 		if contentType := resp.Header.Get("Content-Type"); contentType != "" {
-			w.Header().Set("Content-Type", contentType)
+			sw.Header().Set("Content-Type", contentType)
 		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		sw.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(sw, resp.Body)
 		return
 	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
+		writeOpenAIError(sw, http.StatusBadGateway, "failed to read upstream response", "server_error")
 		return
+	}
+	if observer != nil {
+		if usage := extractResponsesUsageFromBody(respBody); usage.ok {
+			observer.ObserveUsageCounts(usage.promptTokens, usage.completionTokens)
+		}
 	}
 
 	summaryText, err := extractResponsesOutputText(respBody)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "failed to parse upstream response", "server_error")
+		writeOpenAIError(sw, http.StatusBadGateway, "failed to parse upstream response", "server_error")
 		return
 	}
 
@@ -347,8 +410,8 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		Output: summaries,
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(memResp)
+	sw.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(sw).Encode(memResp)
 }
 
 func extractResponsesOutputText(body []byte) (string, error) {

@@ -40,6 +40,16 @@ func WithCopilotHeaderConfig(cfg proxy.CopilotHeaderConfig) Option {
 	return WithProxyOptions(proxy.WithCopilotHeaderConfig(cfg))
 }
 
+// WithBuildVersion sets the version label exposed by /metrics.
+func WithBuildVersion(version string) Option {
+	return WithProxyOptions(proxy.WithBuildVersion(version))
+}
+
+// WithMetricsEnabled toggles Prometheus metrics export at /metrics.
+func WithMetricsEnabled(enabled bool) Option {
+	return WithProxyOptions(proxy.WithMetricsEnabled(enabled))
+}
+
 // WithResponsesWebSocketConfig overrides websocket-session handling for
 // GET /v1/responses Codex clients.
 func WithResponsesWebSocketConfig(cfg proxy.ResponsesWebSocketConfig) Option {
@@ -79,6 +89,9 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
 	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)
+	if metricsHandler := handler.MetricsHandler(); metricsHandler != nil {
+		mux.Handle("GET /metrics", metricsHandler)
+	}
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{

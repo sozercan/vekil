@@ -950,7 +950,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 		// Azure /models is only a best-effort metadata overlay for the configured
 		// static catalog. Routing still comes from provider.models[], and sparse
 		// or failed Azure metadata probes should leave the configured model list untouched.
-		resp, err := h.doWithRetry(func() (*http.Request, error) {
+		resp, err := h.doWithRetry(requestMetricLabels{}, func() (*http.Request, error) {
 			return h.newProviderJSONRequest(ctx, provider, http.MethodGet, "/models", nil, nil, "")
 		})
 		if err != nil {
@@ -989,7 +989,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 
 		return providerModelsFetchResult{models: models}, nil
 	case providerTypeCopilot:
-		resp, err := h.doWithRetry(func() (*http.Request, error) {
+		resp, err := h.doWithRetry(requestMetricLabels{}, func() (*http.Request, error) {
 			req, err := h.newProviderJSONRequest(ctx, provider, http.MethodGet, "/models", nil, nil, rawQuery)
 			if err != nil {
 				return nil, err
@@ -1030,7 +1030,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 		return result, nil
 	case providerTypeOpenAICodex:
 		modelsQuery := openAICodexModelsRawQuery(rawQuery)
-		resp, err := h.doWithRetry(func() (*http.Request, error) {
+		resp, err := h.doWithRetry(requestMetricLabels{}, func() (*http.Request, error) {
 			req, err := h.newProviderJSONRequest(ctx, provider, http.MethodGet, "/models", nil, nil, modelsQuery)
 			if err != nil {
 				return nil, err
