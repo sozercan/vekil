@@ -44,7 +44,7 @@ func TestMetricsEndpointExposesPrometheusText(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /metrics failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(t, resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /metrics status = %d, want %d", resp.StatusCode, http.StatusOK)
@@ -130,7 +130,7 @@ func TestMetricsEndpointDoesNotExposeSensitiveLabelValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /metrics failed: %v", err)
 	}
-	defer metricsResp.Body.Close()
+	defer closeResponseBody(t, metricsResp.Body)
 
 	body, err := io.ReadAll(metricsResp.Body)
 	if err != nil {
@@ -183,6 +183,13 @@ func metricLabels(metric interface {
 	return labels
 }
 
+func closeResponseBody(t *testing.T, body io.Closer) {
+	t.Helper()
+	if err := body.Close(); err != nil {
+		t.Errorf("failed to close response body: %v", err)
+	}
+}
+
 func TestMetricsEndpointCanBeDisabled(t *testing.T) {
 	srv, err := New(
 		auth.NewTestAuthenticator("test-token"),
@@ -203,7 +210,7 @@ func TestMetricsEndpointCanBeDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /metrics failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(t, resp.Body)
 
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("GET /metrics status = %d, want %d", resp.StatusCode, http.StatusNotFound)
@@ -229,7 +236,7 @@ func TestMetricsEndpointIsDisabledByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /metrics failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(t, resp.Body)
 
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("GET /metrics status = %d, want %d", resp.StatusCode, http.StatusNotFound)
