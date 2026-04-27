@@ -1,10 +1,10 @@
 BINARY := vekil
-LDFLAGS := -s -w
+VERSION ?= dev-$(shell git rev-parse --short HEAD)
+APP_VERSION := $(patsubst v%,%,$(VERSION))
+LDFLAGS := -s -w -X github.com/sozercan/vekil/version.Build=$(APP_VERSION)
 APP_NAME := Vekil.app
 APP_BUNDLE_ID := com.vekil.menubar
 APP_ICON := assets/macos/Vekil.icns
-VERSION ?= dev-$(shell git rev-parse --short HEAD)
-APP_VERSION := $(patsubst v%,%,$(VERSION))
 APP_CGO_LDFLAGS = -F$(abspath $(SPARKLE_UNPACK_DIR)) -Wl,-rpath,@executable_path/../Frameworks
 SPARKLE_VERSION := 2.9.0
 SPARKLE_BUILD_DIR := .build/sparkle
@@ -35,7 +35,7 @@ build-app: $(SPARKLE_FRAMEWORK)
 	@mkdir -p "$(APP_NAME)/Contents/Resources"
 	@mkdir -p "$(APP_NAME)/Contents/Frameworks"
 	CGO_ENABLED=1 CGO_LDFLAGS="$(APP_CGO_LDFLAGS)" \
-		go build -tags sparkle -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o "$(APP_NAME)/Contents/MacOS/vekil-menubar" ./cmd/menubar/
+		go build -tags sparkle -ldflags="$(LDFLAGS)" -o "$(APP_NAME)/Contents/MacOS/vekil-menubar" ./cmd/menubar/
 	otool -l "$(APP_NAME)/Contents/MacOS/vekil-menubar" | grep -q '@executable_path/../Frameworks'
 	cp "$(APP_ICON)" "$(APP_NAME)/Contents/Resources/Vekil.icns"
 	ditto "$(SPARKLE_FRAMEWORK)" "$(APP_NAME)/Contents/Frameworks/Sparkle.framework"
@@ -94,7 +94,7 @@ TRAY_LINUX_BINARY := vekil-tray
 
 build-tray-linux:
 	CGO_ENABLED=0 GOOS=linux \
-		go build -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o $(TRAY_LINUX_BINARY) ./cmd/menubar/
+		go build -ldflags="$(LDFLAGS)" -o $(TRAY_LINUX_BINARY) ./cmd/menubar/
 
 test:
 	go test ./... -count=1
