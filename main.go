@@ -26,6 +26,8 @@ const (
 	cliCommandLogout
 )
 
+var buildVersion = "dev"
+
 func main() {
 	// Dispatch subcommands before falling through to the default server mode.
 	switch commandFromArgs(os.Args) {
@@ -216,6 +218,9 @@ func runServe() {
 	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
 	providersConfigPath := flag.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration")
 	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
+	metricsEnabled := getEnvBool("METRICS", true)
+	flag.BoolVar(&metricsEnabled, "metrics", metricsEnabled, "Enable Prometheus /metrics endpoint")
+	disableMetrics := flag.Bool("no-metrics", false, "Disable Prometheus /metrics endpoint")
 	streamingUpstreamTimeout := flag.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
 	copilotEditorVersion := flag.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header")
 	copilotPluginVersion := flag.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
@@ -227,6 +232,9 @@ func runServe() {
 	responsesWSCompactMaxBytes := flag.Int("responses-ws-auto-compact-max-bytes", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes), "Auto-compact websocket session history after this many raw bytes")
 	responsesWSCompactKeepTail := flag.Int("responses-ws-auto-compact-keep-tail", getEnvInt("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail), "When auto-compacting websocket history, keep this many most recent items verbatim")
 	flag.Parse()
+	if *disableMetrics {
+		metricsEnabled = false
+	}
 
 	log := logger.New(logger.ParseLevel(*logLevel))
 
@@ -255,6 +263,8 @@ func runServe() {
 		*host,
 		*port,
 		server.WithStreamingUpstreamTimeout(*streamingUpstreamTimeout),
+		server.WithMetricsEnabled(metricsEnabled),
+		server.WithMetricsBuildVersion(buildVersion),
 		server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
 			EditorVersion:       *copilotEditorVersion,
 			EditorPluginVersion: *copilotPluginVersion,
