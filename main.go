@@ -26,6 +26,8 @@ const (
 	cliCommandLogout
 )
 
+var buildVersion = "dev"
+
 func main() {
 	// Dispatch subcommands before falling through to the default server mode.
 	switch commandFromArgs(os.Args) {
@@ -226,7 +228,13 @@ func runServe() {
 	responsesWSCompactMaxItems := flag.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items")
 	responsesWSCompactMaxBytes := flag.Int("responses-ws-auto-compact-max-bytes", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes), "Auto-compact websocket session history after this many raw bytes")
 	responsesWSCompactKeepTail := flag.Int("responses-ws-auto-compact-keep-tail", getEnvInt("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail), "When auto-compacting websocket history, keep this many most recent items verbatim")
+	metricsEnabled := flag.Bool("metrics", getEnvBool("METRICS", true), "Enable Prometheus-compatible /metrics endpoint")
+	noMetrics := flag.Bool("no-metrics", false, "Disable the Prometheus-compatible /metrics endpoint")
 	flag.Parse()
+
+	if *noMetrics {
+		*metricsEnabled = false
+	}
 
 	log := logger.New(logger.ParseLevel(*logLevel))
 
@@ -268,6 +276,8 @@ func runServe() {
 			AutoCompactMaxBytes: *responsesWSCompactMaxBytes,
 			AutoCompactKeepTail: *responsesWSCompactKeepTail,
 		}),
+		server.WithMetricsEnabled(*metricsEnabled),
+		server.WithBuildVersion(buildVersion),
 		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
 	)
 	if err != nil {

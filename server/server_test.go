@@ -1,12 +1,20 @@
 package server
 
 import (
+	"bytes"
+	"context"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
@@ -95,4 +103,157 @@ func TestNew_DerivesWriteTimeoutFromConfiguredProxyHandler(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMetricsEndpointExposesPrometheusMetrics(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"1337",
+		WithBuildVersion("test-version"),
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		if strings.Contains(err.Error(), "address already in use") {
+			t.Skipf("skipping localhost:1337 metrics test because the port is already in use: %v", err)
+		}
+		t.Fatalf("failed to start server: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Stop(ctx); err != nil {
+			t.Fatalf("failed to stop server: %v", err)
+		}
+	})
+
+	healthReq, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:1337/healthz?user=user-secret&prompt=prompt-secret", nil)
+	if err != nil {
+		t.Fatalf("failed to create health request: %v", err)
+	}
+	healthReq.Header.Set("Authorization", "Bearer key-secret")
+	healthResp, err := http.DefaultClient.Do(healthReq)
+	if err != nil {
+		t.Fatalf("failed to call /healthz: %v", err)
+	}
+	defer healthResp.Body.Close()
+	if healthResp.StatusCode != http.StatusOK {
+		t.Fatalf("/healthz status = %d, want %d", healthResp.StatusCode, http.StatusOK)
+	}
+
+	resp, err := http.Get("http://127.0.0.1:1337/metrics")
+	if err != nil {
+		t.Fatalf("failed to call /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/metrics status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read /metrics body: %v", err)
+	}
+	if !strings.Contains(resp.Header.Get("Content-Type"), "text/plain") {
+		t.Fatalf("/metrics content-type = %q, want Prometheus text exposition", resp.Header.Get("Content-Type"))
+	}
+	for _, secret := range []string{"user-secret", "prompt-secret", "key-secret"} {
+		if bytes.Contains(body, []byte(secret)) {
+			t.Fatalf("/metrics body unexpectedly contained %q", secret)
+		}
+	}
+
+	parser := expfmt.TextParser{}
+	families, err := parser.TextToMetricFamilies(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("failed to parse Prometheus exposition: %v", err)
+	}
+	if _, ok := families["go_goroutines"]; !ok {
+		t.Fatalf("parsed metrics missing go_goroutines")
+	}
+	buildInfo := families["vekil_build_info"]
+	if buildInfo == nil {
+		t.Fatalf("parsed metrics missing vekil_build_info")
+	}
+	if got := metricLabelValue(buildInfo.GetMetric(), "version"); got != "test-version" {
+		t.Fatalf("vekil_build_info version label = %q, want %q", got, "test-version")
+	}
+
+	requests := families["vekil_http_requests_total"]
+	if requests == nil {
+		t.Fatalf("parsed metrics missing vekil_http_requests_total")
+	}
+	metric := findMetricByLabel(requests.GetMetric(), "route", "/healthz")
+	if metric == nil {
+		t.Fatalf("vekil_http_requests_total missing /healthz sample")
+	}
+	if got := metric.GetCounter().GetValue(); got < 1 {
+		t.Fatalf("vekil_http_requests_total /healthz sample = %v, want >= 1", got)
+	}
+	if got := labelNames(metric); strings.Join(got, ",") != "code,method,route" {
+		t.Fatalf("vekil_http_requests_total labels = %v, want [code method route]", got)
+	}
+}
+
+func TestMetricsEndpointCanBeDisabled(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+		WithMetricsEnabled(false),
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	req := httptestRequest(http.MethodGet, "/metrics")
+	resp := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("/metrics status = %d, want %d when metrics are disabled", resp.Code, http.StatusNotFound)
+	}
+}
+
+func findMetricByLabel(metrics []*dto.Metric, labelName, labelValue string) *dto.Metric {
+	for _, metric := range metrics {
+		for _, label := range metric.GetLabel() {
+			if label.GetName() == labelName && label.GetValue() == labelValue {
+				return metric
+			}
+		}
+	}
+	return nil
+}
+
+func metricLabelValue(metrics []*dto.Metric, labelName string) string {
+	for _, metric := range metrics {
+		for _, label := range metric.GetLabel() {
+			if label.GetName() == labelName {
+				return label.GetValue()
+			}
+		}
+	}
+	return ""
+}
+
+func labelNames(metric *dto.Metric) []string {
+	names := make([]string, 0, len(metric.GetLabel()))
+	for _, label := range metric.GetLabel() {
+		names = append(names, label.GetName())
+	}
+	sort.Strings(names)
+	return names
+}
+
+func httptestRequest(method, target string) *http.Request {
+	req, err := http.NewRequest(method, target, nil)
+	if err != nil {
+		panic(err)
+	}
+	return req
 }

@@ -15,6 +15,8 @@ Vekil supports two runtime patterns:
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
+| `--metrics` | `METRICS` | `true` | Enable the Prometheus-compatible `/metrics` endpoint |
+| `--no-metrics` | — | `false` | Disable `/metrics` even if `METRICS=true` or `--metrics` is set |
 
 ## Copilot Header Overrides
 
@@ -180,6 +182,16 @@ Routing rules:
 - The example Azure `gpt-5.4-pro` model shown above is `/responses`-only. Do not advertise `/chat/completions` for that model unless you have verified native support.
 
 Use the examples above as a starting point for your local providers config file. JSON and YAML use the same snake_case field names.
+
+## Metrics
+
+Vekil exposes a Prometheus-compatible `GET /metrics` endpoint on the main server by default. It includes standard Go runtime and process metrics, a `vekil_build_info{version="..."}` gauge from the build version ldflags, and a small proxy-owned `vekil_http_requests_total{route,method,code}` counter for the routes mounted by Vekil itself.
+
+The request metric intentionally uses only bounded route, method, and status-code labels. It does not label by model, provider, user, key, prompt, or other request content.
+
+Use `--no-metrics` to turn the endpoint off, or `METRICS=false` to disable it from the environment.
+
+Deferred for a later pass: broad per-provider metrics, upstream latency breakdowns, and per-model instrumentation.
 
 ## WebSocket Session Tuning
 
