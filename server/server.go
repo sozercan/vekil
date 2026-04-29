@@ -62,8 +62,8 @@ func WithMetricsEnabled(enabled bool) Option {
 	}
 }
 
-// WithBuildVersion records the configured build version in the
-// vekil_build_info metric when metrics are enabled.
+// WithBuildVersion preserves existing server option wiring even though the
+// /metrics endpoint intentionally omits build metadata.
 func WithBuildVersion(version string) Option {
 	return func(o *options) {
 		o.buildVersion = version

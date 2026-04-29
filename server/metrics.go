@@ -2,10 +2,8 @@ package server
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -16,12 +14,7 @@ type httpMetrics struct {
 	requestCounter *prometheus.CounterVec
 }
 
-func newHTTPMetrics(buildVersion string) *httpMetrics {
-	version := strings.TrimSpace(buildVersion)
-	if version == "" {
-		version = defaultBuildVersion
-	}
-
+func newHTTPMetrics(_ string) *httpMetrics {
 	registry := prometheus.NewRegistry()
 	requestCounter := prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -30,21 +23,7 @@ func newHTTPMetrics(buildVersion string) *httpMetrics {
 		},
 		[]string{"route", "method", "code"},
 	)
-	buildInfo := prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "vekil_build_info",
-			Help: "Build information for the running Vekil binary.",
-		},
-		[]string{"version"},
-	)
-	buildInfo.WithLabelValues(version).Set(1)
-
-	registry.MustRegister(
-		collectors.NewGoCollector(),
-		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		requestCounter,
-		buildInfo,
-	)
+	registry.MustRegister(requestCounter)
 
 	return &httpMetrics{
 		registry:       registry,

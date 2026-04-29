@@ -171,15 +171,14 @@ func TestMetricsEndpointExposesPrometheusMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to parse Prometheus exposition: %v", err)
 	}
-	if _, ok := families["go_goroutines"]; !ok {
-		t.Fatalf("parsed metrics missing go_goroutines")
+	if _, ok := families["go_goroutines"]; ok {
+		t.Fatalf("parsed metrics unexpectedly exposed go_goroutines")
 	}
-	buildInfo := families["vekil_build_info"]
-	if buildInfo == nil {
-		t.Fatalf("parsed metrics missing vekil_build_info")
+	if _, ok := families["process_cpu_seconds_total"]; ok {
+		t.Fatalf("parsed metrics unexpectedly exposed process_cpu_seconds_total")
 	}
-	if got := metricLabelValue(buildInfo.GetMetric(), "version"); got != "test-version" {
-		t.Fatalf("vekil_build_info version label = %q, want %q", got, "test-version")
+	if _, ok := families["vekil_build_info"]; ok {
+		t.Fatalf("parsed metrics unexpectedly exposed vekil_build_info")
 	}
 
 	requests := families["vekil_http_requests_total"]
@@ -228,17 +227,6 @@ func findMetricByLabel(metrics []*dto.Metric, labelName, labelValue string) *dto
 		}
 	}
 	return nil
-}
-
-func metricLabelValue(metrics []*dto.Metric, labelName string) string {
-	for _, metric := range metrics {
-		for _, label := range metric.GetLabel() {
-			if label.GetName() == labelName {
-				return label.GetValue()
-			}
-		}
-	}
-	return ""
 }
 
 func labelNames(metric *dto.Metric) []string {
