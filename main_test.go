@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -116,6 +117,55 @@ func TestGetEnvWarnsOnInvalidValue(t *testing.T) {
 	want := fmt.Sprintf("warning: ignoring invalid %s=%q", envKey, "not-a-bool")
 	if !bytes.Contains([]byte(output), []byte(want)) {
 		t.Errorf("expected stderr to contain %q, got %q", want, output)
+	}
+}
+
+func TestMetricsListenerMayBeExternallyReachable(t *testing.T) {
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{host: "", want: false},
+		{host: "localhost", want: false},
+		{host: "127.0.0.1", want: false},
+		{host: "::1", want: false},
+		{host: "0.0.0.0", want: true},
+		{host: "::", want: true},
+		{host: "192.168.1.10", want: true},
+		{host: "demo.example.com", want: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.host, func(t *testing.T) {
+			if got := metricsListenerMayBeExternallyReachable(tc.host); got != tc.want {
+				t.Fatalf("metricsListenerMayBeExternallyReachable(%q) = %v, want %v", tc.host, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLogMetricsExposureReminderWarnsForNonLoopbackHosts(t *testing.T) {
+	old := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+
+	logMetricsExposureReminder(logger.New(logger.ParseLevel("info")), "0.0.0.0", "1337")
+
+	_ = w.Close()
+	os.Stderr = old
+
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	output := buf.String()
+
+	for _, want := range []string{
+		`"msg":"WARNING: /metrics is enabled by default on the main listener and is unauthenticated; disable it with --no-metrics or METRICS=false when exposing this listener beyond a trusted network boundary"`,
+		`"addr":"0.0.0.0:1337"`,
+		`"metrics_path":"/metrics"`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected warning log to contain %q, got %q", want, output)
+		}
 	}
 }
 

@@ -5,9 +5,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -236,7 +239,7 @@ func runServe() {
 
 	log := logger.New(logger.ParseLevel(*logLevel))
 	if *metricsEnabled {
-		log.Info("/metrics is enabled on the main listener; disable it with --no-metrics or METRICS=false when exposing this listener beyond a trusted network boundary")
+		logMetricsExposureReminder(log, *host, *port)
 	}
 
 	authenticator, err := auth.NewAuthenticator(*tokenDir)
@@ -300,6 +303,39 @@ func runServe() {
 		log.Fatal("shutdown error", logger.Err(err))
 	}
 	log.Info("server stopped")
+}
+
+func logMetricsExposureReminder(log *logger.Logger, host, port string) {
+	addr := net.JoinHostPort(host, port)
+	if metricsListenerMayBeExternallyReachable(host) {
+		log.Info(
+			"WARNING: /metrics is enabled by default on the main listener and is unauthenticated; disable it with --no-metrics or METRICS=false when exposing this listener beyond a trusted network boundary",
+			logger.F("addr", addr),
+			logger.F("metrics_path", "/metrics"),
+		)
+		return
+	}
+
+	log.Info(
+		"/metrics is enabled on the main listener",
+		logger.F("addr", addr),
+		logger.F("metrics_path", "/metrics"),
+	)
+}
+
+func metricsListenerMayBeExternallyReachable(host string) bool {
+	host = strings.TrimSpace(host)
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return false
+	}
+
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return true
+	}
+
+	return !addr.IsLoopback()
 }
 
 func getEnv(key, fallback string) string {
