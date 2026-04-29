@@ -15,6 +15,19 @@ Vekil supports two runtime patterns:
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
+| `--metrics` / `--no-metrics` | `METRICS` | `enabled` | Enable or disable the Prometheus-compatible `/metrics` endpoint |
+
+## Metrics
+
+Vekil exposes a Prometheus-compatible `GET /metrics` endpoint on the same HTTP server by default. Use `--no-metrics` or `METRICS=false` to disable it.
+
+This first pass intentionally stays small:
+
+- standard Go runtime and process collectors
+- `vekil_build_info{version="..."}`
+- `vekil_http_requests_total{handler,code,method}` with bounded route labels only
+
+It intentionally does not yet add provider, model, user, API-key, prompt, or websocket-session label dimensions.
 
 ## Copilot Header Overrides
 
