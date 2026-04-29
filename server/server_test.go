@@ -13,11 +13,12 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
-	dto "github.com/prometheus/client_model/go"
 )
 
 func TestStart_ReturnsErrorWhenPortInUse(t *testing.T) {
@@ -326,7 +327,7 @@ func startTestServer(t *testing.T, opts ...Option) *Server {
 func parseMetricFamilies(t *testing.T, body []byte) map[string]*dto.MetricFamily {
 	t.Helper()
 
-	parser := expfmt.TextParser{}
+	parser := expfmt.NewTextParser(model.UTF8Validation)
 	families, err := parser.TextToMetricFamilies(bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("failed to parse Prometheus metrics: %v\n%s", err, string(body))
