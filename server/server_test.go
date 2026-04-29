@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -11,9 +13,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/common/expfmt"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func TestStart_ReturnsErrorWhenPortInUse(t *testing.T) {
@@ -136,23 +140,28 @@ func TestMetricsEndpoint_ExposesPrometheusMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read /metrics response body: %v", err)
 	}
-	metrics := string(body)
+	families := parseMetricFamilies(t, body)
 
-	if !strings.Contains(metrics, "vekil_build_info") {
-		t.Fatal("expected /metrics output to include vekil_build_info")
+	buildInfo := findMetric(t, families["vekil_build_info"], map[string]string{"version": "1.2.3-test"})
+	if got := buildInfo.GetGauge().GetValue(); got != 1 {
+		t.Fatalf("vekil_build_info value = %v, want 1", got)
 	}
-	if !strings.Contains(metrics, `version="1.2.3-test"`) {
-		t.Fatal("expected /metrics output to include the configured build version")
+
+	if _, ok := families["go_goroutines"]; !ok {
+		t.Fatal("expected Go runtime metrics to include go_goroutines")
 	}
-	if !strings.Contains(metrics, "\ngo_goroutines ") {
-		t.Fatal("expected /metrics output to include Go runtime metrics")
-	}
-	if !hasMetricLine(metrics, "vekil_http_requests_total", `method="GET"`, `route="/healthz"`, `code="200"`) {
-		t.Fatal("expected /metrics output to include a bounded HTTP request counter for /healthz")
+
+	requestMetric := findMetric(t, families["vekil_http_requests_total"], map[string]string{
+		"method": "get",
+		"route":  "/healthz",
+		"code":   "200",
+	})
+	if got := requestMetric.GetCounter().GetValue(); got != 1 {
+		t.Fatalf("vekil_http_requests_total{/healthz} = %v, want 1", got)
 	}
 }
 
-func TestMetricsEndpoint_DoesNotExposeSensitiveRequestValues(t *testing.T) {
+func TestMetricsEndpoint_DoesNotExposeSensitiveRequestValuesAsLabels(t *testing.T) {
 	srv := startTestServer(t)
 
 	const (
@@ -164,7 +173,7 @@ func TestMetricsEndpoint_DoesNotExposeSensitiveRequestValues(t *testing.T) {
 	req, err := http.NewRequest(
 		http.MethodPost,
 		"http://"+srv.httpServer.Addr+"/v1/memories/trace_summarize?user="+sensitiveUser,
-		strings.NewReader(`{"prompt":"`+sensitivePrompt+`"`),
+		strings.NewReader(`{"prompt":"`+sensitivePrompt+`"}`),
 	)
 	if err != nil {
 		t.Fatalf("failed to build request: %v", err)
@@ -197,15 +206,69 @@ func TestMetricsEndpoint_DoesNotExposeSensitiveRequestValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read /metrics response body: %v", err)
 	}
-	metrics := string(body)
+	families := parseMetricFamilies(t, body)
 
-	for _, sensitiveValue := range []string{sensitiveToken, sensitivePrompt, sensitiveUser} {
-		if strings.Contains(metrics, sensitiveValue) {
-			t.Fatalf("expected /metrics output to omit sensitive value %q", sensitiveValue)
+	requestMetric := findMetric(t, families["vekil_http_requests_total"], map[string]string{
+		"method": "post",
+		"route":  "/v1/memories/trace_summarize",
+		"code":   "400",
+	})
+	if got := requestMetric.GetCounter().GetValue(); got != 1 {
+		t.Fatalf("vekil_http_requests_total{trace_summarize} = %v, want 1", got)
+	}
+
+	for _, metric := range families["vekil_http_requests_total"].GetMetric() {
+		labels := labelMap(metric)
+		if len(labels) != 3 {
+			t.Fatalf("vekil_http_requests_total labels = %v, want exactly method/route/code", labels)
+		}
+		for _, name := range []string{"method", "route", "code"} {
+			if _, ok := labels[name]; !ok {
+				t.Fatalf("vekil_http_requests_total missing %q label in %v", name, labels)
+			}
 		}
 	}
-	if !hasMetricLine(metrics, "vekil_http_requests_total", `method="POST"`, `route="/v1/memories/trace_summarize"`, `code="400"`) {
-		t.Fatal("expected /metrics output to include a bounded HTTP request counter for trace summarize")
+
+	for familyName, family := range families {
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				for _, sensitiveValue := range []string{sensitiveToken, sensitivePrompt, sensitiveUser} {
+					if strings.Contains(label.GetValue(), sensitiveValue) {
+						t.Fatalf("unexpected sensitive value %q in %s label on %s", sensitiveValue, label.GetName(), familyName)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestMetricsInstrumentation_PreservesOptionalResponseWriterInterfaces(t *testing.T) {
+	metrics := newServerMetrics("1.2.3-test")
+	wrapped := metrics.wrap("/v1/responses", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if _, ok := w.(http.Flusher); !ok {
+			t.Fatal("wrapped response writer does not implement http.Flusher")
+		}
+		if _, ok := w.(http.Hijacker); !ok {
+			t.Fatal("wrapped response writer does not implement http.Hijacker")
+		}
+		w.(http.Flusher).Flush()
+		w.WriteHeader(http.StatusSwitchingProtocols)
+	}))
+
+	connA, connB := net.Pipe()
+	defer func() { _ = connA.Close() }()
+	defer func() { _ = connB.Close() }()
+
+	rec := &interfacePreservingResponseWriter{
+		header: make(http.Header),
+		conn:   connA,
+		rw:     bufio.NewReadWriter(bufio.NewReader(connA), bufio.NewWriter(connA)),
+	}
+
+	wrapped.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+
+	if !rec.flushed {
+		t.Fatal("expected wrapped handler to preserve Flush behavior")
 	}
 }
 
@@ -260,23 +323,81 @@ func startTestServer(t *testing.T, opts ...Option) *Server {
 	return srv
 }
 
-func hasMetricLine(metrics, name string, wantLabels ...string) bool {
-	for _, line := range strings.Split(metrics, "\n") {
-		if !strings.HasPrefix(line, name+"{") {
+func parseMetricFamilies(t *testing.T, body []byte) map[string]*dto.MetricFamily {
+	t.Helper()
+
+	parser := expfmt.TextParser{}
+	families, err := parser.TextToMetricFamilies(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("failed to parse Prometheus metrics: %v\n%s", err, string(body))
+	}
+	return families
+}
+
+func findMetric(t *testing.T, family *dto.MetricFamily, want map[string]string) *dto.Metric {
+	t.Helper()
+
+	if family == nil {
+		t.Fatalf("missing metric family for labels %v", want)
+	}
+
+	for _, metric := range family.GetMetric() {
+		labels := labelMap(metric)
+		if len(labels) < len(want) {
 			continue
 		}
 
 		matches := true
-		for _, wantLabel := range wantLabels {
-			if !strings.Contains(line, wantLabel) {
+		for name, value := range want {
+			if labels[name] != value {
 				matches = false
 				break
 			}
 		}
 		if matches {
-			return true
+			return metric
 		}
 	}
 
-	return false
+	t.Fatalf("failed to find metric %q with labels %v", family.GetName(), want)
+	return nil
+}
+
+func labelMap(metric *dto.Metric) map[string]string {
+	labels := make(map[string]string, len(metric.GetLabel()))
+	for _, label := range metric.GetLabel() {
+		labels[label.GetName()] = label.GetValue()
+	}
+	return labels
+}
+
+type interfacePreservingResponseWriter struct {
+	header  http.Header
+	status  int
+	flushed bool
+	conn    net.Conn
+	rw      *bufio.ReadWriter
+}
+
+func (w *interfacePreservingResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *interfacePreservingResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return len(p), nil
+}
+
+func (w *interfacePreservingResponseWriter) WriteHeader(status int) {
+	w.status = status
+}
+
+func (w *interfacePreservingResponseWriter) Flush() {
+	w.flushed = true
+}
+
+func (w *interfacePreservingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return w.conn, w.rw, nil
 }

@@ -24,8 +24,10 @@ Vekil exposes a Prometheus-compatible `GET /metrics` endpoint by default. Set `M
 
 The current metrics stay intentionally coarse and bounded:
 
-- runtime and build metrics such as `go_goroutines`, `go_memstats_alloc_bytes`, and `vekil_build_info`
+- standard Prometheus Go runtime/process collectors plus `vekil_build_info`
 - `vekil_http_requests_total{method,route,code}` using static route labels only
+
+Detailed per-provider, per-model, upstream timing, and websocket-session metrics are intentionally deferred in this first PR.
 
 Metrics do not include raw paths, query parameters, headers, auth tokens, prompts, or request bodies.
 
