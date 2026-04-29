@@ -1,5 +1,6 @@
 BINARY := vekil
 LDFLAGS := -s -w
+VERSION_LDFLAGS := -X github.com/sozercan/vekil/server.buildVersion=$(VERSION)
 APP_NAME := Vekil.app
 APP_BUNDLE_ID := com.vekil.menubar
 APP_ICON := assets/macos/Vekil.icns
@@ -18,7 +19,7 @@ SPARKLE_PUBLIC_ED_KEY ?=
 .PHONY: build build-app build-tray-linux test-app test vet lint clean docker-build
 
 build:
-	go build -ldflags="$(LDFLAGS)" -o $(BINARY) .
+	go build -ldflags="$(LDFLAGS) $(VERSION_LDFLAGS)" -o $(BINARY) .
 
 $(SPARKLE_ARCHIVE):
 	@mkdir -p "$(SPARKLE_BUILD_DIR)"

@@ -17,7 +17,7 @@ builds:
       - arm64
     mod_timestamp: "{{ .CommitTimestamp }}"
     ldflags:
-      - -s -w
+      - -s -w -X github.com/sozercan/vekil/server.buildVersion={{ .Version }}
 
 archives:
   - id: binaries
