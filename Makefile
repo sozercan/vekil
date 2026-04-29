@@ -18,7 +18,7 @@ SPARKLE_PUBLIC_ED_KEY ?=
 .PHONY: build build-app build-tray-linux test-app test vet lint clean docker-build
 
 build:
-	go build -ldflags="$(LDFLAGS)" -o $(BINARY) .
+	go build -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o $(BINARY) .
 
 $(SPARKLE_ARCHIVE):
 	@mkdir -p "$(SPARKLE_BUILD_DIR)"
@@ -109,4 +109,4 @@ clean:
 	rm -rf "$(APP_NAME)" .build
 
 docker-build:
-	docker build -t $(BINARY) .
+	docker build --build-arg VERSION=$(APP_VERSION) -t $(BINARY) .
