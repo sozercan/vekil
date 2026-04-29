@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"io"
 	"net"
 	"net/http"
@@ -110,27 +109,15 @@ func TestMetricsEndpointExposesPrometheusMetrics(t *testing.T) {
 		auth.NewTestAuthenticator("test-token"),
 		logger.New(logger.ParseLevel("error")),
 		"127.0.0.1",
-		"1337",
-		WithBuildVersion("test-version"),
+		"0",
 	)
 	if err != nil {
 		t.Fatalf("failed to initialize server: %v", err)
 	}
-	if err := srv.Start(); err != nil {
-		if strings.Contains(err.Error(), "address already in use") {
-			t.Skipf("skipping localhost:1337 metrics test because the port is already in use: %v", err)
-		}
-		t.Fatalf("failed to start server: %v", err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := srv.Stop(ctx); err != nil {
-			t.Fatalf("failed to stop server: %v", err)
-		}
-	})
+	ts := httptest.NewServer(srv.httpServer.Handler)
+	defer ts.Close()
 
-	healthReq, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:1337/healthz?user=user-secret&prompt=prompt-secret", nil)
+	healthReq, err := http.NewRequest(http.MethodGet, ts.URL+"/healthz?user=user-secret&prompt=prompt-secret", nil)
 	if err != nil {
 		t.Fatalf("failed to create health request: %v", err)
 	}
@@ -144,7 +131,7 @@ func TestMetricsEndpointExposesPrometheusMetrics(t *testing.T) {
 		t.Fatalf("/healthz status = %d, want %d", healthResp.StatusCode, http.StatusOK)
 	}
 
-	resp, err := http.Get("http://127.0.0.1:1337/metrics")
+	resp, err := http.Get(ts.URL + "/metrics")
 	if err != nil {
 		t.Fatalf("failed to call /metrics: %v", err)
 	}

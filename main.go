@@ -26,8 +26,6 @@ const (
 	cliCommandLogout
 )
 
-var buildVersion = "dev"
-
 func main() {
 	// Dispatch subcommands before falling through to the default server mode.
 	switch commandFromArgs(os.Args) {
@@ -228,7 +226,7 @@ func runServe() {
 	responsesWSCompactMaxItems := flag.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items")
 	responsesWSCompactMaxBytes := flag.Int("responses-ws-auto-compact-max-bytes", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes), "Auto-compact websocket session history after this many raw bytes")
 	responsesWSCompactKeepTail := flag.Int("responses-ws-auto-compact-keep-tail", getEnvInt("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail), "When auto-compacting websocket history, keep this many most recent items verbatim")
-	metricsEnabled := flag.Bool("metrics", getEnvBool("METRICS", true), "Enable the limited Prometheus-compatible /metrics endpoint on the main listener")
+	metricsEnabled := flag.Bool("metrics", getEnvBool("METRICS", true), "Enable the limited Prometheus-compatible /metrics endpoint on the main listener (recommended only on localhost or a trusted network)")
 	noMetrics := flag.Bool("no-metrics", false, "Disable the Prometheus-compatible /metrics endpoint on the main listener")
 	flag.Parse()
 
@@ -237,6 +235,9 @@ func runServe() {
 	}
 
 	log := logger.New(logger.ParseLevel(*logLevel))
+	if *metricsEnabled {
+		log.Info("/metrics is enabled on the main listener; disable it with --no-metrics or METRICS=false when exposing this listener beyond a trusted network boundary")
+	}
 
 	authenticator, err := auth.NewAuthenticator(*tokenDir)
 	if err != nil {
@@ -277,7 +278,6 @@ func runServe() {
 			AutoCompactKeepTail: *responsesWSCompactKeepTail,
 		}),
 		server.WithMetricsEnabled(*metricsEnabled),
-		server.WithBuildVersion(buildVersion),
 		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
 	)
 	if err != nil {

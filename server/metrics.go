@@ -7,14 +7,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-const defaultBuildVersion = "dev"
-
 type httpMetrics struct {
 	registry       *prometheus.Registry
 	requestCounter *prometheus.CounterVec
 }
 
-func newHTTPMetrics(_ string) *httpMetrics {
+func newHTTPMetrics() *httpMetrics {
 	registry := prometheus.NewRegistry()
 	requestCounter := prometheus.NewCounterVec(
 		prometheus.CounterOpts{

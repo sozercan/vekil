@@ -23,7 +23,6 @@ type Server struct {
 type options struct {
 	proxyOptions   []proxy.Option
 	metricsEnabled bool
-	buildVersion   string
 }
 
 // Option customizes server creation.
@@ -62,19 +61,10 @@ func WithMetricsEnabled(enabled bool) Option {
 	}
 }
 
-// WithBuildVersion preserves existing server option wiring even though the
-// /metrics endpoint intentionally omits build metadata.
-func WithBuildVersion(version string) Option {
-	return func(o *options) {
-		o.buildVersion = version
-	}
-}
-
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
 	cfg := options{
 		metricsEnabled: true,
-		buildVersion:   defaultBuildVersion,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -90,7 +80,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux := http.NewServeMux()
 	var metrics *httpMetrics
 	if cfg.metricsEnabled {
-		metrics = newHTTPMetrics(cfg.buildVersion)
+		metrics = newHTTPMetrics()
 		mux.Handle("GET /metrics", metrics.handler())
 	}
 

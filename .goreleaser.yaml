@@ -17,7 +17,7 @@ builds:
       - arm64
     mod_timestamp: "{{ .CommitTimestamp }}"
     ldflags:
-      - -s -w -X main.buildVersion={{ .Version }}
+      - -s -w
 
 archives:
   - id: binaries

@@ -15,7 +15,7 @@ Vekil supports two runtime patterns:
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
-| `--metrics` | `METRICS` | `true` | Enable the limited Prometheus-compatible `/metrics` endpoint |
+| `--metrics` | `METRICS` | `true` | Enable the limited Prometheus-compatible `/metrics` endpoint on the main listener; recommended only on localhost or a trusted network |
 | `--no-metrics` | — | `false` | Disable `/metrics` even if `METRICS=true` or `--metrics` is set |
 
 ## Copilot Header Overrides
@@ -189,7 +189,7 @@ Vekil exposes a Prometheus-compatible `GET /metrics` endpoint on the main server
 
 The request metric intentionally uses only bounded route, method, and status-code labels. It does not label by model, provider, user, key, prompt, or other request content.
 
-Because `/metrics` is served from the main listener, disable it with `--no-metrics` (or `METRICS=false`) when that listener is exposed beyond your trusted network boundary.
+Because `/metrics` is served from the main listener and remains unauthenticated, disable it with `--no-metrics` (or `METRICS=false`) when that listener is exposed beyond your trusted network boundary. At runtime Vekil also logs a reminder when metrics stay enabled.
 
 Deferred for a later pass: broad per-provider metrics, upstream latency breakdowns, and per-model instrumentation.
 
