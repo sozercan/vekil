@@ -4,9 +4,6 @@ go 1.25
 
 require (
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
-	github.com/prometheus/client_golang v1.20.5
-	github.com/prometheus/common v0.60.1
-	github.com/prometheus/client_model v0.6.1
 )
 
 require (

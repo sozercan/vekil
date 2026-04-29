@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	dto "github.com/prometheus/client_model/go"
-	"github.com/prometheus/common/expfmt"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
@@ -193,7 +191,7 @@ func TestMetricsEndpointExposesPrometheusTextFormat(t *testing.T) {
 		t.Fatalf("read /metrics body: %v", err)
 	}
 
-	families, err := new(expfmt.TextParser).TextToMetricFamilies(bytes.NewReader(body))
+	families, err := parseMetricsText(body)
 	if err != nil {
 		t.Fatalf("parse /metrics output: %v\n%s", err, body)
 	}
@@ -203,18 +201,18 @@ func TestMetricsEndpointExposesPrometheusTextFormat(t *testing.T) {
 	}
 
 	buildInfo := families["vekil_build_info"]
-	if buildInfo == nil || len(buildInfo.Metric) == 0 {
+	if len(buildInfo) == 0 {
 		t.Fatal("missing vekil_build_info metric")
 	}
-	if got := labelValue(buildInfo.Metric[0], "version"); got != "1.2.3-test" {
+	if got := buildInfo[0].labels["version"]; got != "1.2.3-test" {
 		t.Fatalf("version label = %q, want %q", got, "1.2.3-test")
 	}
 
 	requests := families["vekil_http_requests_total"]
-	if requests == nil {
+	if len(requests) == 0 {
 		t.Fatal("missing vekil_http_requests_total metric")
 	}
-	if !hasCounterSample(requests.Metric, map[string]string{
+	if !hasCounterSample(requests, map[string]string{
 		"handler": "/healthz",
 		"method":  http.MethodGet,
 		"code":    strconv.Itoa(http.StatusOK),
@@ -266,38 +264,34 @@ func TestMetricsEndpointDoesNotExposeUserDerivedLabels(t *testing.T) {
 		t.Fatal("metrics output leaked request-specific secret content")
 	}
 
-	families, err := new(expfmt.TextParser).TextToMetricFamilies(bytes.NewReader(body))
+	families, err := parseMetricsText(body)
 	if err != nil {
 		t.Fatalf("parse /metrics output: %v", err)
 	}
 
 	requests := families["vekil_http_requests_total"]
-	if requests == nil {
+	if len(requests) == 0 {
 		t.Fatal("missing vekil_http_requests_total metric")
 	}
-	for _, metric := range requests.Metric {
-		for _, label := range metric.GetLabel() {
-			if label.GetName() != "handler" && label.GetName() != "code" && label.GetName() != "method" {
-				t.Fatalf("unexpected label %q", label.GetName())
+	for _, metric := range requests {
+		for name := range metric.labels {
+			if name != "handler" && name != "code" && name != "method" {
+				t.Fatalf("unexpected label %q", name)
 			}
 		}
 	}
 }
 
-func labelValue(metric *dto.Metric, name string) string {
-	for _, label := range metric.GetLabel() {
-		if label.GetName() == name {
-			return label.GetValue()
-		}
-	}
-	return ""
+type metricSample struct {
+	labels map[string]string
+	value  string
 }
 
-func hasCounterSample(metrics []*dto.Metric, want map[string]string) bool {
+func hasCounterSample(metrics []metricSample, want map[string]string) bool {
 	for _, metric := range metrics {
 		matched := true
 		for key, wantValue := range want {
-			if got := labelValue(metric, key); got != wantValue {
+			if got := metric.labels[key]; got != wantValue {
 				matched = false
 				break
 			}
@@ -307,4 +301,103 @@ func hasCounterSample(metrics []*dto.Metric, want map[string]string) bool {
 		}
 	}
 	return false
+}
+
+func parseMetricsText(body []byte) (map[string][]metricSample, error) {
+	families := make(map[string][]metricSample)
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		nameAndLabels, value, ok := strings.Cut(line, " ")
+		if !ok {
+			return nil, strconv.ErrSyntax
+		}
+
+		name := nameAndLabels
+		labels := map[string]string{}
+		if open := strings.IndexByte(nameAndLabels, '{'); open >= 0 {
+			close := strings.LastIndexByte(nameAndLabels, '}')
+			if close < open {
+				return nil, strconv.ErrSyntax
+			}
+			name = nameAndLabels[:open]
+			parsed, err := parseMetricLabels(nameAndLabels[open+1 : close])
+			if err != nil {
+				return nil, err
+			}
+			labels = parsed
+		}
+
+		families[name] = append(families[name], metricSample{
+			labels: labels,
+			value:  value,
+		})
+	}
+	return families, nil
+}
+
+func parseMetricLabels(input string) (map[string]string, error) {
+	labels := make(map[string]string)
+	for len(strings.TrimSpace(input)) > 0 {
+		input = strings.TrimSpace(input)
+
+		eq := strings.IndexByte(input, '=')
+		if eq <= 0 || eq+1 >= len(input) || input[eq+1] != '"' {
+			return nil, strconv.ErrSyntax
+		}
+		key := strings.TrimSpace(input[:eq])
+
+		value, rest, err := parseQuotedMetricValue(input[eq+1:])
+		if err != nil {
+			return nil, err
+		}
+		labels[key] = value
+
+		rest = strings.TrimSpace(rest)
+		if rest == "" {
+			break
+		}
+		if rest[0] != ',' {
+			return nil, strconv.ErrSyntax
+		}
+		input = rest[1:]
+	}
+	return labels, nil
+}
+
+func parseQuotedMetricValue(input string) (string, string, error) {
+	if input == "" || input[0] != '"' {
+		return "", "", strconv.ErrSyntax
+	}
+
+	var b strings.Builder
+	escaped := false
+	for i := 1; i < len(input); i++ {
+		ch := input[i]
+		if escaped {
+			switch ch {
+			case '\\', '"':
+				b.WriteByte(ch)
+			case 'n':
+				b.WriteByte('\n')
+			default:
+				return "", "", strconv.ErrSyntax
+			}
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			return b.String(), input[i+1:], nil
+		}
+		b.WriteByte(ch)
+	}
+
+	return "", "", strconv.ErrSyntax
 }
