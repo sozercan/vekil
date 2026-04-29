@@ -216,6 +216,9 @@ func runServe() {
 	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
 	providersConfigPath := flag.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration")
 	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
+	metricsEnabled := getEnvBool("METRICS", true)
+	registerBoolFlag(flag.CommandLine, &metricsEnabled, "metrics", false, "Expose Prometheus metrics at /metrics")
+	registerBoolFlag(flag.CommandLine, &metricsEnabled, "no-metrics", true, "Disable Prometheus metrics at /metrics")
 	streamingUpstreamTimeout := flag.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
 	copilotEditorVersion := flag.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header")
 	copilotPluginVersion := flag.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
@@ -254,6 +257,8 @@ func runServe() {
 		log,
 		*host,
 		*port,
+		server.WithBuildVersion(normalizedBuildVersion()),
+		server.WithMetricsEnabled(metricsEnabled),
 		server.WithStreamingUpstreamTimeout(*streamingUpstreamTimeout),
 		server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
 			EditorVersion:       *copilotEditorVersion,
@@ -336,4 +341,40 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return parsed
+}
+
+type boolFlagValue struct {
+	target *bool
+	invert bool
+}
+
+func registerBoolFlag(fs *flag.FlagSet, target *bool, name string, invert bool, usage string) {
+	fs.Var(boolFlagValue{target: target, invert: invert}, name, usage)
+}
+
+func (b boolFlagValue) String() string {
+	if b.target == nil {
+		return "false"
+	}
+	return strconv.FormatBool(*b.target)
+}
+
+func (b boolFlagValue) Set(value string) error {
+	parsed := true
+	if value != "" {
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			return err
+		}
+		parsed = v
+	}
+	if b.invert {
+		parsed = !parsed
+	}
+	*b.target = parsed
+	return nil
+}
+
+func (b boolFlagValue) IsBoolFlag() bool {
+	return true
 }

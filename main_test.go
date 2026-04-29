@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -151,6 +152,36 @@ func TestCommandFromArgs(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := commandFromArgs(tc.args); got != tc.want {
 				t.Fatalf("commandFromArgs(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRegisterBoolFlagSupportsMetricsAndNoMetrics(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "default enabled", want: true},
+		{name: "metrics flag keeps enabled", args: []string{"--metrics"}, want: true},
+		{name: "metrics false disables", args: []string{"--metrics=false"}, want: false},
+		{name: "no-metrics disables", args: []string{"--no-metrics"}, want: false},
+		{name: "no-metrics false re-enables", args: []string{"--no-metrics=false"}, want: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			enabled := true
+			fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+			registerBoolFlag(fs, &enabled, "metrics", false, "")
+			registerBoolFlag(fs, &enabled, "no-metrics", true, "")
+
+			if err := fs.Parse(tc.args); err != nil {
+				t.Fatalf("Parse(%v) error = %v", tc.args, err)
+			}
+			if enabled != tc.want {
+				t.Fatalf("metrics enabled = %v, want %v", enabled, tc.want)
 			}
 		})
 	}

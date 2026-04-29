@@ -14,7 +14,18 @@ Vekil supports two runtime patterns:
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
+| `--metrics` / `--no-metrics` | `METRICS` | `true` | Enable or disable the Prometheus-compatible `GET /metrics` endpoint |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
+
+## Metrics
+
+`GET /metrics` is enabled by default and exports Prometheus text exposition for:
+
+- standard Go runtime and process metrics from the Prometheus Go client
+- `vekil_build_info{version="..."}` using the build version injected by release/build ldflags
+- coarse per-handler HTTP request totals and duration histograms with only bounded labels (`handler`, `method`, `code_class`)
+
+This first metrics pass intentionally does **not** add per-provider metrics, virtual-key dimensions, prompt-derived labels, or deeper handler-specific instrumentation. The handler label comes from the server's static route pattern, so request headers, query strings, user IDs, API keys, and prompt content are not exported as metric labels.
 
 ## Copilot Header Overrides
 
