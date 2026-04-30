@@ -1,5 +1,5 @@
 BINARY := vekil
-LDFLAGS := -s -w
+LDFLAGS := -s -w -X main.buildVersion=$(VERSION)
 APP_NAME := Vekil.app
 APP_BUNDLE_ID := com.vekil.menubar
 APP_ICON := assets/macos/Vekil.icns

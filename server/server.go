@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -21,7 +22,9 @@ type Server struct {
 }
 
 type options struct {
-	proxyOptions []proxy.Option
+	proxyOptions   []proxy.Option
+	metricsEnabled bool
+	buildVersion   string
 }
 
 // Option customizes server creation.
@@ -31,6 +34,21 @@ type Option func(*options)
 func WithProxyOptions(opts ...proxy.Option) Option {
 	return func(o *options) {
 		o.proxyOptions = append(o.proxyOptions, opts...)
+	}
+}
+
+// WithMetricsEnabled controls whether the Prometheus-compatible /metrics
+// endpoint is mounted on the server.
+func WithMetricsEnabled(enabled bool) Option {
+	return func(o *options) {
+		o.metricsEnabled = enabled
+	}
+}
+
+// WithBuildVersion sets the version label used by vekil_build_info.
+func WithBuildVersion(version string) Option {
+	return func(o *options) {
+		o.buildVersion = strings.TrimSpace(version)
 	}
 }
 
@@ -54,11 +72,17 @@ func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
-	cfg := options{}
+	cfg := options{
+		metricsEnabled: true,
+		buildVersion:   "dev",
+	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
 		}
+	}
+	if cfg.buildVersion == "" {
+		cfg.buildVersion = "dev"
 	}
 
 	handler, err := proxy.NewProxyHandler(authenticator, log, cfg.proxyOptions...)
@@ -67,6 +91,11 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	}
 
 	mux := http.NewServeMux()
+	var metrics *httpMetrics
+	if cfg.metricsEnabled {
+		metrics = newHTTPMetrics(cfg.buildVersion)
+		mux.Handle("GET /metrics", metrics)
+	}
 	mux.HandleFunc("POST /v1/messages", handler.HandleAnthropicMessages)
 	mux.HandleFunc("POST /v1/chat/completions", handler.HandleOpenAIChatCompletions)
 	mux.HandleFunc("POST /v1beta/models/", handler.HandleGeminiModels)
@@ -81,10 +110,14 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)
 
 	addr := fmt.Sprintf("%s:%s", host, port)
+	var serverHandler http.Handler = mux
+	if metrics != nil {
+		serverHandler = metrics.wrap(serverHandler)
+	}
 	return &Server{
 		httpServer: &http.Server{
 			Addr:         addr,
-			Handler:      mux,
+			Handler:      serverHandler,
 			ReadTimeout:  30 * time.Second,
 			WriteTimeout: handler.ServerWriteTimeout(),
 			IdleTimeout:  120 * time.Second,

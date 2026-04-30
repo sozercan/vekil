@@ -156,6 +156,32 @@ func TestCommandFromArgs(t *testing.T) {
 	}
 }
 
+func TestNormalizedBuildVersion(t *testing.T) {
+	original := buildVersion
+	t.Cleanup(func() {
+		buildVersion = original
+	})
+
+	tests := []struct {
+		name    string
+		version string
+		want    string
+	}{
+		{name: "empty falls back to dev", version: "", want: "dev"},
+		{name: "whitespace falls back to dev", version: "   ", want: "dev"},
+		{name: "keeps configured version", version: "v1.2.3", want: "v1.2.3"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			buildVersion = tc.version
+			if got := normalizedBuildVersion(); got != tc.want {
+				t.Fatalf("normalizedBuildVersion() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 	for _, helpArg := range []string{"-h", "--help"} {
 		t.Run(helpArg, func(t *testing.T) {
