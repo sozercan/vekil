@@ -76,6 +76,41 @@ type loginDeps struct {
 	openURL          func(string) error
 }
 
+type pairedBoolFlag struct {
+	value  *bool
+	invert bool
+}
+
+func (f pairedBoolFlag) String() string {
+	if f.value == nil {
+		return "false"
+	}
+	return strconv.FormatBool(*f.value)
+}
+
+func (f pairedBoolFlag) Set(raw string) error {
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return err
+	}
+	if f.invert {
+		value = !value
+	}
+	*f.value = value
+	return nil
+}
+
+func (f pairedBoolFlag) IsBoolFlag() bool {
+	return true
+}
+
+func registerBoolFlagPair(fs *flag.FlagSet, name string, defaultValue bool, enableUsage, disableUsage string) *bool {
+	value := defaultValue
+	fs.Var(pairedBoolFlag{value: &value}, name, enableUsage)
+	fs.Var(pairedBoolFlag{value: &value, invert: true}, "no-"+name, disableUsage)
+	return &value
+}
+
 func runLogin(args []string) {
 	if code := runLoginWithDeps(args, defaultLoginDeps()); code != 0 {
 		os.Exit(code)
@@ -216,6 +251,7 @@ func runServe() {
 	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
 	providersConfigPath := flag.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration")
 	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
+	metricsEnabled := registerBoolFlagPair(flag.CommandLine, "metrics", getEnvBool("METRICS", true), "Expose Prometheus-compatible /metrics endpoint", "Disable Prometheus-compatible /metrics endpoint")
 	streamingUpstreamTimeout := flag.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
 	copilotEditorVersion := flag.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header")
 	copilotPluginVersion := flag.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
@@ -254,6 +290,7 @@ func runServe() {
 		log,
 		*host,
 		*port,
+		server.WithMetricsEnabled(*metricsEnabled),
 		server.WithStreamingUpstreamTimeout(*streamingUpstreamTimeout),
 		server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
 			EditorVersion:       *copilotEditorVersion,

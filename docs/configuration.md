@@ -14,7 +14,20 @@ Vekil supports two runtime patterns:
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
+| `--metrics` / `--no-metrics` | `METRICS` | `true` | Expose the Prometheus-compatible `GET /metrics` endpoint on the main listener |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
+
+## Metrics
+
+By default Vekil exposes Prometheus text exposition at `GET /metrics` on the same HTTP listener as the API.
+
+This first metrics pass intentionally stays small and bounded:
+
+- Go runtime metrics from the standard Prometheus Go collector
+- `vekil_build_info{version,revision,go_version}` with safe `dev` / `unknown` fallbacks when build metadata is unavailable
+- `vekil_http_requests_total{handler,code,method}` for top-level proxy routes only
+
+Intentionally deferred for later work: per-provider and per-model metrics, upstream latency breakdowns, websocket/session internals, and any label derived from user IDs, API keys, prompt text, or other request content.
 
 ## Copilot Header Overrides
 
