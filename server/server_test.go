@@ -13,6 +13,7 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
@@ -271,7 +272,7 @@ func TestMetricsEndpointCanBeDisabled(t *testing.T) {
 func parseMetricFamilies(t *testing.T, body string) map[string]*dto.MetricFamily {
 	t.Helper()
 
-	parser := expfmt.TextParser{}
+	parser := expfmt.NewTextParser(model.UTF8Validation)
 	families, err := parser.TextToMetricFamilies(strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("parse Prometheus exposition: %v", err)
