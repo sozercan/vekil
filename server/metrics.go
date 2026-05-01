@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -18,7 +19,7 @@ type serverMetrics struct {
 
 func newServerMetrics() *serverMetrics {
 	registry := prometheus.NewRegistry()
-	registry.MustRegister(prometheus.NewGoCollector())
+	registry.MustRegister(collectors.NewGoCollector())
 
 	build := currentBuildInfo()
 	buildInfo := prometheus.NewGaugeVec(
