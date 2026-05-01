@@ -1047,6 +1047,273 @@ func TestHandleCompact_LargeBodyAllowed(t *testing.T) {
 	}
 }
 
+func TestHandleCompact_FallsBackToChunkedCompactionOnUpstream413(t *testing.T) {
+	largeText := strings.Repeat("a", 3*1024*1024)
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "first " + largeText},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "assistant",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "second " + largeText},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "third " + largeText},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	var mu sync.Mutex
+	var bodySizes []int
+	var inputCounts []int
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Errorf("expected upstream path /responses, got %q", r.URL.Path)
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+		instructions, _ := req["instructions"].(string)
+		if !strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
+			t.Fatalf("expected compaction prompt as instructions, got %q", instructions)
+		}
+		input, ok := req["input"].([]interface{})
+		if !ok {
+			t.Fatalf("expected input array, got %#v", req["input"])
+		}
+
+		mu.Lock()
+		bodySizes = append(bodySizes, len(body))
+		inputCounts = append(inputCounts, len(input))
+		call := len(bodySizes)
+		mu.Unlock()
+
+		switch call {
+		case 1:
+			if len(input) != 3 {
+				t.Fatalf("expected initial one-shot compact input to have 3 items, got %d", len(input))
+			}
+			if len(body) <= compactUpstreamChunkBodySize {
+				t.Fatalf("expected initial compact body to exceed chunk target, got %d bytes", len(body))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"payload too large"}}`))
+		case 2:
+			if len(input) != 2 {
+				t.Fatalf("expected first fallback chunk to have 2 items, got %d", len(input))
+			}
+			if len(body) > compactUpstreamChunkBodySize {
+				t.Fatalf("expected first fallback chunk body to fit target, got %d bytes", len(body))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-chunk-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary of first two items"}]}]}`))
+		case 3:
+			if len(input) != 1 {
+				t.Fatalf("expected second fallback chunk to have 1 item, got %d", len(input))
+			}
+			if len(body) > compactUpstreamChunkBodySize {
+				t.Fatalf("expected second fallback chunk body to fit target, got %d bytes", len(body))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-chunk-2","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary of final item"}]}]}`))
+		case 4:
+			if len(input) != 2 {
+				t.Fatalf("expected merge request to contain 2 chunk summaries, got %d", len(input))
+			}
+			if got := requireMessageTextWithRole(t, input[0], "user"); got != "Partial checkpoint summary 1 of 2:\nsummary of first two items" {
+				t.Fatalf("unexpected first merge summary: %q", got)
+			}
+			if got := requireMessageTextWithRole(t, input[1], "user"); got != "Partial checkpoint summary 2 of 2:\nsummary of final item" {
+				t.Fatalf("unexpected second merge summary: %q", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-merged","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"final merged summary"}]}]}`))
+		default:
+			t.Fatalf("unexpected /responses request count %d", call)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	mu.Lock()
+	gotBodySizes := append([]int(nil), bodySizes...)
+	gotInputCounts := append([]int(nil), inputCounts...)
+	mu.Unlock()
+	if len(gotBodySizes) != 4 {
+		t.Fatalf("expected 4 upstream requests (initial + 2 chunks + merge), got %d", len(gotBodySizes))
+	}
+	if gotInputCounts[0] != 3 || gotInputCounts[1] != 2 || gotInputCounts[2] != 1 || gotInputCounts[3] != 2 {
+		t.Fatalf("unexpected upstream input counts: %v", gotInputCounts)
+	}
+	if gotBodySizes[0] <= gotBodySizes[1] || gotBodySizes[0] <= gotBodySizes[2] {
+		t.Fatalf("expected fallback chunk bodies to be smaller than initial body, sizes=%v", gotBodySizes)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Output []struct {
+			Type             string `json:"type"`
+			EncryptedContent string `json:"encrypted_content"`
+			Content          []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to parse compact response: %v", err)
+	}
+	if len(result.Output) != 2 {
+		t.Fatalf("expected 2 output items, got %d", len(result.Output))
+	}
+	if result.Output[0].Type != "message" || len(result.Output[0].Content) == 0 || result.Output[0].Content[0].Text != "final merged summary" {
+		t.Fatalf("expected final merged summary message, got %+v", result.Output[0])
+	}
+	if result.Output[1].Type != "compaction" {
+		t.Fatalf("expected compaction item, got %+v", result.Output[1])
+	}
+	if got := decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent); got != "final merged summary" {
+		t.Errorf("expected encoded final merged summary, got %q", got)
+	}
+}
+
+func TestHandleCompact_ReturnsOriginal413WhenChunkedMergeFails(t *testing.T) {
+	largeText := strings.Repeat("a", 5*1024*1024)
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "first " + largeText},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "assistant",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "second " + largeText},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	const original413Body = `{"error":{"message":"original payload too large"}}`
+
+	var mu sync.Mutex
+	var inputCounts []int
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+		input, ok := req["input"].([]interface{})
+		if !ok {
+			t.Fatalf("expected input array, got %#v", req["input"])
+		}
+
+		mu.Lock()
+		inputCounts = append(inputCounts, len(input))
+		call := len(inputCounts)
+		mu.Unlock()
+
+		switch call {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(original413Body))
+		case 2:
+			if len(input) != 1 {
+				t.Fatalf("expected first fallback chunk to have 1 item, got %d", len(input))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-chunk-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary of first item"}]}]}`))
+		case 3:
+			if len(input) != 1 {
+				t.Fatalf("expected second fallback chunk to have 1 item, got %d", len(input))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-chunk-2","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary of second item"}]}]}`))
+		case 4:
+			if len(input) != 2 {
+				t.Fatalf("expected merge request to contain 2 chunk summaries, got %d", len(input))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"message":"merge failed"}}`))
+		default:
+			t.Fatalf("unexpected /responses request count %d", call)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected original 413, got %d: %s", resp.StatusCode, body)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != original413Body {
+		t.Fatalf("expected original 413 body %s, got %s", original413Body, body)
+	}
+
+	mu.Lock()
+	gotInputCounts := append([]int(nil), inputCounts...)
+	mu.Unlock()
+	if len(gotInputCounts) != 4 {
+		t.Fatalf("expected 4 upstream requests (initial + 2 chunks + failed merge), got %d", len(gotInputCounts))
+	}
+	if gotInputCounts[0] != 2 || gotInputCounts[1] != 1 || gotInputCounts[2] != 1 || gotInputCounts[3] != 2 {
+		t.Fatalf("unexpected upstream input counts: %v", gotInputCounts)
+	}
+}
+
 func TestHandleCompact_StripsInlineRenderMarkers(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
