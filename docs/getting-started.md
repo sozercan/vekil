@@ -109,7 +109,7 @@ If you are using zero-config startup or an explicit `type: "copilot"` provider, 
 2. Vekil's cached GitHub access token in `~/.config/vekil/`.
 3. An authenticated GitHub CLI via `gh auth token --hostname github.com`, but only after you explicitly opt in with `vekil login --github-cli` or `vekil login --gh`.
 
-If none of those sources is available, Vekil starts GitHub's device-code flow on first run:
+If none of those sources is available, Vekil starts GitHub's device-code flow on the first Copilot-backed request that needs auth:
 
 1. Visit the URL shown in the terminal.
 2. Enter the one-time code.

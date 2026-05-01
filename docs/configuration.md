@@ -14,6 +14,8 @@ Vekil supports two runtime patterns:
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
+| `--metrics` | `METRICS` | `true` | Enable the Prometheus-compatible `GET /metrics` endpoint |
+| `--no-metrics` | — | `false` | Disable the Prometheus-compatible `GET /metrics` endpoint |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 
 ## Copilot Header Overrides
@@ -31,7 +33,7 @@ These overrides only affect Copilot-backed upstream requests.
 
 ### GitHub Copilot
 
-For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a GitHub token for a user with GitHub Copilot access. This is the only GitHub token environment variable Vekil consumes directly; it overrides cached Vekil login state and is exchanged for a short-lived Copilot token at startup.
+For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a GitHub token for a user with GitHub Copilot access. This is the only GitHub token environment variable Vekil consumes directly; it overrides cached Vekil login state and is exchanged for a short-lived Copilot token on demand.
 
 Vekil intentionally ignores generic GitHub token variables such as `GH_TOKEN` and `GITHUB_TOKEN`. If you want Vekil to use an authenticated GitHub CLI account, opt in explicitly with `vekil login --github-cli` or `vekil login --gh`; Vekil then runs `gh auth token --hostname github.com` for Copilot access and keeps that token in memory only, without copying it into Vekil's `access-token` or `api-key.json` caches.
 
@@ -48,6 +50,18 @@ OpenAI Codex requires file-based ChatGPT auth from `codex login`; API-key auth a
 ### Azure OpenAI
 
 Azure OpenAI credentials are configured in the provider entry, using either `api_key` or `api_key_env`.
+
+## Metrics
+
+`GET /metrics` is enabled by default and stays available even before Copilot authentication succeeds, so health and metrics scrapes do not wait for interactive device-code login.
+
+This first pass exports:
+
+- standard Go runtime/process metrics plus `go_build_info`
+- `vekil_build_info{version,revision,go_version}`
+- `vekil_http_requests_total{route,method,code}` for top-level HTTP routes
+
+Intentionally deferred for a later PR: per-provider, per-model, auth-flow, websocket-session, or payload-derived metrics and labels.
 
 ## Provider Routing
 
