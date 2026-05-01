@@ -14,6 +14,7 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 )
@@ -76,7 +77,8 @@ func TestMetricsEndpointExposesPrometheusMetrics(t *testing.T) {
 		}
 	}
 
-	families, err := (&expfmt.TextParser{}).TextToMetricFamilies(bytes.NewReader(body))
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	families, err := parser.TextToMetricFamilies(bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("failed to parse metrics exposition: %v", err)
 	}
