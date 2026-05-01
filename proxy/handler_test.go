@@ -1314,6 +1314,138 @@ func TestHandleCompact_ReturnsOriginal413WhenChunkedMergeFails(t *testing.T) {
 	}
 }
 
+func TestHandleCompact_CapsOriginal413BodyWhenChunkedMergeFails(t *testing.T) {
+	largeText := strings.Repeat("a", 5*1024*1024)
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "first " + largeText},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "assistant",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "second " + largeText},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	oversized413Body := strings.Repeat("x", compactUpstreamErrorBodySize+1024)
+	var calls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+		input, ok := req["input"].([]interface{})
+		if !ok {
+			t.Fatalf("expected input array, got %#v", req["input"])
+		}
+
+		switch call := calls.Add(1); call {
+		case 1:
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(oversized413Body))
+		case 2, 3:
+			if len(input) != 1 {
+				t.Fatalf("expected fallback chunk to have 1 item, got %d", len(input))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-chunk","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"chunk summary"}]}]}`))
+		case 4:
+			if len(input) != 2 {
+				t.Fatalf("expected merge request to contain 2 chunk summaries, got %d", len(input))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"message":"merge failed"}}`))
+		default:
+			t.Fatalf("unexpected /responses request count %d", call)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected capped original 413, got %d: %s", resp.StatusCode, body)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) != compactUpstreamErrorBodySize {
+		t.Fatalf("expected capped 413 body length %d, got %d", compactUpstreamErrorBodySize, len(body))
+	}
+	if strings.Trim(string(body), "x") != "" {
+		t.Fatalf("expected capped body to preserve the upstream prefix, got %q", body[:min(len(body), 32)])
+	}
+	if calls.Load() != 4 {
+		t.Fatalf("expected initial request, 2 chunk requests, and failed merge; got %d calls", calls.Load())
+	}
+}
+
+func TestSplitCompactInputByBodySizeUsesEncodedItemSizes(t *testing.T) {
+	requestFields := map[string]json.RawMessage{
+		"model": json.RawMessage(`"gpt-5.4"`),
+		"input": json.RawMessage(`[]`),
+	}
+	input := []json.RawMessage{
+		json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"<>& first"}]}`),
+		json.RawMessage(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"<>& second"}]}`),
+		json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"<>& third"}]}`),
+	}
+
+	twoItemBody, err := marshalCompactResponsesRequest(requestFields, input[:2])
+	if err != nil {
+		t.Fatalf("failed to marshal two-item body: %v", err)
+	}
+	threeItemBody, err := marshalCompactResponsesRequest(requestFields, input)
+	if err != nil {
+		t.Fatalf("failed to marshal three-item body: %v", err)
+	}
+	if len(threeItemBody) <= len(twoItemBody) {
+		t.Fatalf("expected three-item body to exceed two-item body: %d <= %d", len(threeItemBody), len(twoItemBody))
+	}
+
+	chunks, err := splitCompactInputByBodySize(requestFields, input, len(twoItemBody))
+	if err != nil {
+		t.Fatalf("split failed: %v", err)
+	}
+	gotSizes := make([]int, 0, len(chunks))
+	for _, chunk := range chunks {
+		gotSizes = append(gotSizes, len(chunk))
+	}
+	if len(gotSizes) != 2 || gotSizes[0] != 2 || gotSizes[1] != 1 {
+		t.Fatalf("expected chunks sized [2,1], got %#v", gotSizes)
+	}
+	for i, chunk := range chunks {
+		body, err := marshalCompactResponsesRequest(requestFields, chunk)
+		if err != nil {
+			t.Fatalf("failed to marshal chunk %d: %v", i, err)
+		}
+		if len(body) > len(twoItemBody) {
+			t.Fatalf("chunk %d body exceeded max: got %d, max %d", i, len(body), len(twoItemBody))
+		}
+	}
+}
+
 func TestHandleCompact_StripsInlineRenderMarkers(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
