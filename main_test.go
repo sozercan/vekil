@@ -119,6 +119,27 @@ func TestGetEnvWarnsOnInvalidValue(t *testing.T) {
 	}
 }
 
+func TestEffectiveMetricsEnabled(t *testing.T) {
+	tests := []struct {
+		name           string
+		metricsEnabled bool
+		noMetrics      bool
+		want           bool
+	}{
+		{name: "enabled by default", metricsEnabled: true, noMetrics: false, want: true},
+		{name: "explicit metrics false", metricsEnabled: false, noMetrics: false, want: false},
+		{name: "no metrics overrides enabled", metricsEnabled: true, noMetrics: true, want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := effectiveMetricsEnabled(tc.metricsEnabled, tc.noMetrics); got != tc.want {
+				t.Fatalf("effectiveMetricsEnabled(%v, %v) = %v, want %v", tc.metricsEnabled, tc.noMetrics, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string
