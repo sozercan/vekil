@@ -12,6 +12,7 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
+	prommodel "github.com/prometheus/common/model"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 )
@@ -85,7 +86,7 @@ func TestMetricsEndpointExposesPrometheusMetrics(t *testing.T) {
 		t.Fatalf("failed to read /metrics response: %v", err)
 	}
 
-	parser := expfmt.TextParser{}
+	parser := expfmt.NewTextParser(prommodel.UTF8Validation)
 	families, err := parser.TextToMetricFamilies(bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("failed to parse /metrics response: %v\n%s", err, string(body))
