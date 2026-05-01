@@ -14,7 +14,31 @@ Vekil supports two runtime patterns:
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
+| `--metrics` | `METRICS` | `true` | Enable the Prometheus-compatible `/metrics` endpoint |
+| `--no-metrics` | — | `false` | Disable the Prometheus-compatible `/metrics` endpoint; this overrides `--metrics` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
+
+## Metrics
+
+Vekil exposes a Prometheus-compatible `GET /metrics` endpoint on the same server by default:
+
+```bash
+curl http://localhost:1337/metrics
+```
+
+This first metrics PR intentionally keeps labels bounded and the surface area small. It currently exports:
+
+- standard Go runtime metrics from `client_golang`
+- `vekil_build_info{version=...}`
+- `vekil_http_requests_total{route,method,code}` for the mounted HTTP handlers
+
+Intentionally deferred for follow-up work:
+
+- request duration histograms and any bucket tuning
+- websocket-session-specific metrics for `GET /v1/responses`
+- per-provider, per-model, token-usage, retry, and upstream-error metrics
+
+This endpoint does not label metrics with user identifiers, API keys, prompt content, or other request payload data.
 
 ## Copilot Header Overrides
 

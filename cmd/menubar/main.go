@@ -183,6 +183,7 @@ func startProxy() {
 		log,
 		"0.0.0.0",
 		"1337",
+		server.WithBuildVersion(buildVersion),
 		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
 	)
 	if err != nil {
