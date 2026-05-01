@@ -50,16 +50,16 @@ func TestMetricsEndpointExposesPrometheusMetrics(t *testing.T) {
 	if _, ok := families["go_goroutines"]; !ok {
 		t.Fatalf("expected go_goroutines metric family in /metrics output")
 	}
-	for _, unexpected := range []string{
+	for _, expected := range []string{
 		"go_gc_gogc_percent",
 		"go_sched_gomaxprocs_threads",
-		"process_cpu_seconds_total",
-		"process_virtual_memory_bytes",
-		"process_virtual_memory_max_bytes",
 	} {
-		if _, ok := families[unexpected]; ok {
-			t.Fatalf("unexpected %s metric family in /metrics output", unexpected)
+		if _, ok := families[expected]; !ok {
+			t.Fatalf("expected %s metric family in /metrics output", expected)
 		}
+	}
+	if _, ok := families["go_build_info"]; !ok {
+		t.Fatalf("expected go_build_info metric family in /metrics output")
 	}
 
 	buildInfo := families["vekil_build_info"]
@@ -158,6 +158,13 @@ func TestServerMetricsRequestLabelsStayBounded(t *testing.T) {
 	if !hasRequestMetric(requests, "/test", "202") {
 		t.Fatalf("expected vekil_http_requests_total sample for POST /test, got:\n%s", body)
 	}
+	assertMetricLabelValuesDoNotContain(t, families, []string{
+		"alice@example.com",
+		"vk_live_123",
+		"super-secret",
+		"sk-secret",
+		"sk-header-secret",
+	})
 
 	for _, secret := range []string{
 		"alice@example.com",
@@ -168,13 +175,6 @@ func TestServerMetricsRequestLabelsStayBounded(t *testing.T) {
 	} {
 		if strings.Contains(body, secret) {
 			t.Fatalf("metrics output leaked request content %q:\n%s", secret, body)
-		}
-	}
-
-	lowerBody := strings.ToLower(body)
-	for _, forbidden := range []string{"user", "key", "prompt", "virtual"} {
-		if strings.Contains(lowerBody, forbidden) {
-			t.Fatalf("metrics output contains forbidden term %q:\n%s", forbidden, body)
 		}
 	}
 }
@@ -219,6 +219,15 @@ func assertBoundedRequestLabels(t *testing.T, family *dto.MetricFamily) {
 				t.Fatalf("request metric labels = %#v, missing %q", labels, key)
 			}
 		}
+		if route := labels["route"]; route == "" || !strings.HasPrefix(route, "/") || strings.ContainsAny(route, "?=&") {
+			t.Fatalf("request metric route label = %q, want a bounded route pattern", route)
+		}
+		if method := labels["method"]; method == "" || method != strings.ToUpper(method) || strings.ContainsAny(method, " ?=&") {
+			t.Fatalf("request metric method label = %q, want a bounded HTTP method", method)
+		}
+		if code := labels["code"]; len(code) != 3 || strings.Trim(code, "0123456789") != "" {
+			t.Fatalf("request metric code label = %q, want a 3-digit status code", code)
+		}
 	}
 }
 
@@ -230,6 +239,22 @@ func hasRequestMetric(family *dto.MetricFamily, route, code string) bool {
 		}
 	}
 	return false
+}
+
+func assertMetricLabelValuesDoNotContain(t *testing.T, families map[string]*dto.MetricFamily, forbidden []string) {
+	t.Helper()
+
+	for familyName, family := range families {
+		for _, metric := range family.Metric {
+			for _, label := range metric.Label {
+				for _, value := range forbidden {
+					if strings.Contains(label.GetValue(), value) {
+						t.Fatalf("metric family %q exposed forbidden label value %q", familyName, value)
+					}
+				}
+			}
+		}
+	}
 }
 
 func labelMap(metric *dto.Metric) map[string]string {

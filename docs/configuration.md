@@ -57,9 +57,9 @@ Azure OpenAI credentials are configured in the provider entry, using either `api
 
 This first pass exports:
 
-- `go_goroutines` plus `go_build_info`
+- standard `go_*` runtime metrics from Prometheus's Go collector, plus `go_build_info` from the standard build collector
 - `vekil_build_info{version,revision,go_version}`
-- `vekil_http_requests_total{route,method,code}` for top-level HTTP routes
+- `vekil_http_requests_total{route,method,code}` for top-level HTTP routes, with labels intentionally bounded and never derived from request payloads, users, keys, or prompts
 
 Intentionally deferred for a later PR: per-provider, per-model, auth-flow, websocket-session, or payload-derived metrics and labels.
 
