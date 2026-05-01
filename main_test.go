@@ -157,6 +157,29 @@ func TestRegisterBoolFlagPair(t *testing.T) {
 	}
 }
 
+func TestRegisterBoolFlagPairNegativeFlagString(t *testing.T) {
+	fs := flag.NewFlagSet("vekil", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	registerBoolFlagPair(fs, "metrics", true, "Expose Prometheus-compatible /metrics endpoint", "Disable Prometheus-compatible /metrics endpoint")
+
+	noMetrics := fs.Lookup("no-metrics")
+	if noMetrics == nil {
+		t.Fatal("no-metrics flag not registered")
+	}
+	if got := noMetrics.DefValue; got != "false" {
+		t.Fatalf("no-metrics default = %q, want %q", got, "false")
+	}
+	if got := noMetrics.Value.String(); got != "false" {
+		t.Fatalf("no-metrics String() before parse = %q, want %q", got, "false")
+	}
+	if err := fs.Parse([]string{"--no-metrics"}); err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if got := noMetrics.Value.String(); got != "true" {
+		t.Fatalf("no-metrics String() after parse = %q, want %q", got, "true")
+	}
+}
+
 func TestGetEnvWarnsOnInvalidValue(t *testing.T) {
 	const envKey = "TEST_WARN_VAR"
 

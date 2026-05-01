@@ -82,10 +82,14 @@ type pairedBoolFlag struct {
 }
 
 func (f pairedBoolFlag) String() string {
-	if f.value == nil {
-		return "false"
+	value := false
+	if f.value != nil {
+		value = *f.value
 	}
-	return strconv.FormatBool(*f.value)
+	if f.invert {
+		value = !value
+	}
+	return strconv.FormatBool(value)
 }
 
 func (f pairedBoolFlag) Set(raw string) error {
