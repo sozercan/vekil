@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 )
@@ -70,7 +71,8 @@ func TestMetricsEndpointExposesPrometheusMetrics(t *testing.T) {
 	}
 	bodyText := string(body)
 
-	families, err := new(expfmt.TextParser).TextToMetricFamilies(strings.NewReader(bodyText))
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	families, err := parser.TextToMetricFamilies(strings.NewReader(bodyText))
 	if err != nil {
 		t.Fatalf("failed to parse Prometheus exposition: %v", err)
 	}
