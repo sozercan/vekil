@@ -14,6 +14,7 @@ Vekil supports two runtime patterns:
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
+| `--metrics` | `METRICS` | `true` | Enable the Prometheus-compatible `GET /metrics` endpoint; pass `--no-metrics` to disable it |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 
 ## Copilot Header Overrides
@@ -180,6 +181,16 @@ Routing rules:
 - The example Azure `gpt-5.4-pro` model shown above is `/responses`-only. Do not advertise `/chat/completions` for that model unless you have verified native support.
 
 Use the examples above as a starting point for your local providers config file. JSON and YAML use the same snake_case field names.
+
+## Prometheus Metrics
+
+`GET /metrics` is enabled by default on the main server and exposes:
+
+- standard Go runtime metrics from the Prometheus Go collector
+- `vekil_build_info` with build/version metadata when Go build info is available, or safe `dev`/runtime fallbacks for local builds
+- a small bounded `vekil_http_requests_total{handler="..."}` counter for mounted Vekil handlers
+
+This first pass intentionally keeps handler labels low-cardinality. It does **not** add per-provider, per-model, per-user, key, prompt, or request-body labels, and broader upstream instrumentation is deferred to follow-up work.
 
 ## WebSocket Session Tuning
 
