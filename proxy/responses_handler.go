@@ -108,6 +108,8 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 // compact request into a regular /responses call with this prompt so the
 // model produces a summarized handoff. The resulting compaction item is a
 // proxy-owned opaque token rather than a real upstream-encrypted payload.
+// compactUpstreamChunkBodySize is measured against the serialized upstream
+// request body size, not the model-visible token budget.
 const compactUpstreamChunkBodySize = 8 << 20
 
 const compactPrompt = `You are performing a CONTEXT CHECKPOINT COMPACTION for an interrupted coding-agent session. Create a handoff summary for another LLM that must continue the same task seamlessly.
