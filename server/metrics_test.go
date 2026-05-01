@@ -222,12 +222,25 @@ func assertBoundedRequestLabels(t *testing.T, family *dto.MetricFamily) {
 		if route := labels["route"]; route == "" || !strings.HasPrefix(route, "/") || strings.ContainsAny(route, "?=&") {
 			t.Fatalf("request metric route label = %q, want a bounded route pattern", route)
 		}
-		if method := labels["method"]; method == "" || method != strings.ToUpper(method) || strings.ContainsAny(method, " ?=&") {
+		if method := labels["method"]; !isBoundedHTTPMethod(method) {
 			t.Fatalf("request metric method label = %q, want a bounded HTTP method", method)
 		}
 		if code := labels["code"]; len(code) != 3 || strings.Trim(code, "0123456789") != "" {
 			t.Fatalf("request metric code label = %q, want a 3-digit status code", code)
 		}
+	}
+}
+
+func isBoundedHTTPMethod(method string) bool {
+	if method == "" || strings.ContainsAny(method, " ?=&") {
+		return false
+	}
+
+	switch strings.ToLower(method) {
+	case "get", "put", "head", "post", "delete", "connect", "options", "notify", "trace", "patch", "unknown":
+		return true
+	default:
+		return false
 	}
 }
 
