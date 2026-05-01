@@ -57,7 +57,7 @@ Azure OpenAI credentials are configured in the provider entry, using either `api
 
 This first pass exports:
 
-- standard Go runtime/process metrics plus `go_build_info`
+- `go_goroutines` plus `go_build_info`
 - `vekil_build_info{version,revision,go_version}`
 - `vekil_http_requests_total{route,method,code}` for top-level HTTP routes
 

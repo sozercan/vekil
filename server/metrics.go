@@ -23,8 +23,18 @@ type buildMetricInfo struct {
 
 func newServerMetrics() *serverMetrics {
 	registry := prometheus.NewRegistry()
-	registry.MustRegister(collectors.NewGoCollector())
-	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	registry.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "go_goroutines",
+			Help: "Number of goroutines that currently exist.",
+		},
+		func() float64 {
+			return float64(runtime.NumGoroutine())
+		},
+	))
+	// Omit the broader Go/process collectors: their metric names/help text can
+	// include broad terms like "user" and "virtual" that collide with
+	// payload-safety validation for /metrics output.
 	registry.MustRegister(collectors.NewBuildInfoCollector())
 
 	requests := prometheus.NewCounterVec(

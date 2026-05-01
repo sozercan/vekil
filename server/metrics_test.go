@@ -50,6 +50,17 @@ func TestMetricsEndpointExposesPrometheusMetrics(t *testing.T) {
 	if _, ok := families["go_goroutines"]; !ok {
 		t.Fatalf("expected go_goroutines metric family in /metrics output")
 	}
+	for _, unexpected := range []string{
+		"go_gc_gogc_percent",
+		"go_sched_gomaxprocs_threads",
+		"process_cpu_seconds_total",
+		"process_virtual_memory_bytes",
+		"process_virtual_memory_max_bytes",
+	} {
+		if _, ok := families[unexpected]; ok {
+			t.Fatalf("unexpected %s metric family in /metrics output", unexpected)
+		}
+	}
 
 	buildInfo := families["vekil_build_info"]
 	if buildInfo == nil || len(buildInfo.Metric) == 0 {
@@ -157,6 +168,13 @@ func TestServerMetricsRequestLabelsStayBounded(t *testing.T) {
 	} {
 		if strings.Contains(body, secret) {
 			t.Fatalf("metrics output leaked request content %q:\n%s", secret, body)
+		}
+	}
+
+	lowerBody := strings.ToLower(body)
+	for _, forbidden := range []string{"user", "key", "prompt", "virtual"} {
+		if strings.Contains(lowerBody, forbidden) {
+			t.Fatalf("metrics output contains forbidden term %q:\n%s", forbidden, body)
 		}
 	}
 }
