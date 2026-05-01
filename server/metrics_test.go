@@ -10,6 +10,7 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 )
@@ -177,7 +178,7 @@ func fetchMetricFamilies(t *testing.T, metricsURL string) (map[string]*dto.Metri
 		t.Fatalf("close %s body error = %v", metricsURL, err)
 	}
 
-	parser := expfmt.TextParser{}
+	parser := expfmt.NewTextParser(model.UTF8Validation)
 	families, err := parser.TextToMetricFamilies(bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("parse Prometheus exposition error = %v\n%s", err, body)
