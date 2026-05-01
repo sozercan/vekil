@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -67,6 +68,40 @@ func TestGetEnvBool(t *testing.T) {
 			t.Setenv(envKey, tc.value)
 			if got := getEnvBool(envKey, false); got != tc.want {
 				t.Fatalf("getEnvBool() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestInvertedBoolFlag(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{
+			name: "no-metrics disables metrics",
+			args: []string{"--no-metrics"},
+			want: false,
+		},
+		{
+			name: "no-metrics=false keeps metrics enabled",
+			args: []string{"--no-metrics=false"},
+			want: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			enabled := true
+			fs := flag.NewFlagSet("test", flag.ContinueOnError)
+			fs.Var(invertedBoolFlag{target: &enabled}, "no-metrics", "")
+
+			if err := fs.Parse(tc.args); err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			if enabled != tc.want {
+				t.Fatalf("metrics enabled = %v, want %v", enabled, tc.want)
 			}
 		})
 	}

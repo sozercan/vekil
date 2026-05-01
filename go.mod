@@ -2,7 +2,11 @@ module github.com/sozercan/vekil
 
 go 1.25
 
-require github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
+require (
+	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
+	github.com/prometheus/client_golang v1.23.2
+	github.com/prometheus/common v0.66.1
+)
 
 require (
 	fyne.io/systray v1.12.0
