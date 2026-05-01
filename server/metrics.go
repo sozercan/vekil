@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -29,7 +30,7 @@ func newServerMetrics(buildVersion string) (*serverMetrics, error) {
 	}, []string{"route", "method", "code"})
 
 	for _, collector := range []prometheus.Collector{
-		prometheus.NewGoCollector(),
+		collectors.NewGoCollector(),
 		buildInfo,
 		requests,
 	} {
