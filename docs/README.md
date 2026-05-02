@@ -13,6 +13,7 @@ This folder is intentionally split into small, single-purpose files so humans an
 | [`architecture.md`](architecture.md) | package responsibilities and data flow | implementation boundaries or design decisions change |
 | [`menubar.md`](menubar.md) | macOS/Linux tray app usage | tray behavior or packaging changes |
 | [`development.md`](development.md) | build, test, benchmark, and CI workflows | local dev or CI commands change |
+| [`grafana-vekil-metrics-dashboard.json`](grafana-vekil-metrics-dashboard.json) | example Grafana dashboard for Prometheus metrics | metrics names, labels, or dashboard guidance changes |
 
 ## Agent Notes
 

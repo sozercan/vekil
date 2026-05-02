@@ -160,11 +160,11 @@ func (s *responsesPreparedStream) abort() {
 	s.abortFn()
 }
 
-func peekAndForwardResponses(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string) {
-	peekAndForwardResponsesWithConfig(h, w, r, resp, upstreamCancel, model, responsesPrecommitPeekTimeout, responsesPrecommitMaxPeekBytes)
+func peekAndForwardResponses(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, obs *requestObservation) responsesStreamResult {
+	return peekAndForwardResponsesWithConfig(h, w, r, resp, upstreamCancel, model, obs, responsesPrecommitPeekTimeout, responsesPrecommitMaxPeekBytes)
 }
 
-func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, peekTimeout time.Duration, maxPeekBytes int) {
+func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, obs *requestObservation, peekTimeout time.Duration, maxPeekBytes int) responsesStreamResult {
 	if upstreamCancel != nil {
 		defer upstreamCancel()
 	}
@@ -173,13 +173,20 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 	result, hasResult, err := prepared.await(r.Context(), nil, peekTimeout)
 	if err != nil {
 		prepared.abort()
-		return
+		return responsesStreamResult{status: 499}
 	}
 	if hasResult && result.decision == responsesPeekDecisionTranslate {
 		logResponsesPrecommitTranslated(h, result, model, resp.Header)
 		prepared.abort()
 		writeOpenAIErrorWithRetryAfter(w, result.status, result.message, result.errType, result.retryAfter, resp.Header)
-		return
+		errorCode := ""
+		if result.failure != nil {
+			errorCode = strings.TrimSpace(result.failure.Response.Error.Code)
+		}
+		return responsesStreamResult{
+			status:    result.status,
+			errorCode: errorCode,
+		}
 	}
 	if hasResult && result.failure != nil && result.decision == responsesPeekDecisionPassthrough {
 		logResponsesPrecommitFailOpen(h, result.failure, model, resp.Header)
@@ -188,7 +195,18 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 	resp = prepared.commitResponse()
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(http.StatusOK)
-	streamResponsesPipeWithFailureLog(h, w, resp.Body, resp.Header)
+	streamResult, streamErr := streamResponsesPipeWithFailureLog(h, w, resp.Body, resp.Header, func() {
+		if obs != nil {
+			obs.observeFirstByte()
+		}
+	})
+	if streamErr != nil && streamResult.status == 0 {
+		streamResult.status = http.StatusBadGateway
+	}
+	if streamResult.status == 0 {
+		streamResult.status = http.StatusOK
+	}
+	return streamResult
 }
 
 func prepareResponsesStreamAttempt(waitCtx, streamCtx context.Context, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
@@ -452,7 +470,8 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 	return "", ""
 }
 
-func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header) {
+func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header, onFirstSemantic func()) (responsesStreamResult, error) {
+	var result responsesStreamResult
 	if closer, ok := r.(io.Closer); ok {
 		defer func() { _ = closer.Close() }()
 	}
@@ -462,8 +481,16 @@ func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r
 		fw.flusher = f
 	}
 
-	tap := newResponsesFailureTap(h, upstreamHeaders)
-	_, _ = io.Copy(fw, io.TeeReader(r, tap))
+	tap := newResponsesFailureTap(h, upstreamHeaders, onFirstSemantic)
+	_, err := io.Copy(fw, io.TeeReader(r, tap))
+	result = tap.result
+	if err != nil {
+		return result, err
+	}
+	if !tap.sawTerminal {
+		return result, io.ErrUnexpectedEOF
+	}
+	return result, nil
 }
 
 func parseResponsesStreamEvent(data string) (responsesWebSocketStreamEvent, error) {
@@ -639,13 +666,18 @@ type responsesFailureTap struct {
 	h               *ProxyHandler
 	upstreamHeaders http.Header
 	parser          responsesSSEParser
+	result          responsesStreamResult
+	sawSemantic     bool
+	sawTerminal     bool
+	onFirstSemantic func()
 }
 
-func newResponsesFailureTap(h *ProxyHandler, upstreamHeaders http.Header) *responsesFailureTap {
+func newResponsesFailureTap(h *ProxyHandler, upstreamHeaders http.Header, onFirstSemantic func()) *responsesFailureTap {
 	return &responsesFailureTap{
 		h:               h,
 		upstreamHeaders: upstreamHeaders,
 		parser:          responsesSSEParser{allowBOM: true},
+		onFirstSemantic: onFirstSemantic,
 	}
 }
 
@@ -666,8 +698,15 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 }
 
 func (t *responsesFailureTap) maybeLog(msg responsesSSEMessage) {
+	if !t.sawSemantic && msg.semantic {
+		t.sawSemantic = true
+		if t.onFirstSemantic != nil {
+			t.onFirstSemantic()
+		}
+	}
+
 	eventName := strings.TrimSpace(msg.event)
-	if eventName != "response.failed" && eventName != "response.incomplete" && eventName != "" {
+	if eventName != "response.failed" && eventName != "response.incomplete" && eventName != "response.completed" && eventName != "" {
 		return
 	}
 
@@ -680,8 +719,26 @@ func (t *responsesFailureTap) maybeLog(msg responsesSSEMessage) {
 	if eventName == "" {
 		eventName = eventType
 	}
-	if eventName != "response.failed" && eventName != "response.incomplete" {
+	if eventName != "response.failed" && eventName != "response.incomplete" && eventName != "response.completed" {
 		return
+	}
+
+	switch eventName {
+	case "response.completed":
+		t.sawTerminal = true
+		t.result.status = http.StatusOK
+		t.result.usage = cloneResponsesStreamUsage(event.Response.Usage)
+		return
+	case "response.failed":
+		t.sawTerminal = true
+		status, _, code := responsesWebSocketStreamFailureDetails(event)
+		t.result.status = status
+		t.result.errorCode = code
+	case "response.incomplete":
+		t.sawTerminal = true
+		status, _, code := responsesWebSocketStreamFailureDetails(event)
+		t.result.status = status
+		t.result.errorCode = code
 	}
 
 	fields := []logger.Field{

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -158,26 +159,55 @@ func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body [
 }
 
 func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header) (*http.Response, error) {
+	return h.postJSONEndpointWithHeadersObserved(ctx, path, body, extraHeaders, nil)
+}
+
+func (h *ProxyHandler) postJSONEndpointObserved(ctx context.Context, path string, body []byte, obs *requestObservation) (*http.Response, error) {
+	return h.postJSONEndpointWithHeadersObserved(ctx, path, body, nil, obs)
+}
+
+func (h *ProxyHandler) postJSONEndpointWithHeadersObserved(ctx context.Context, path string, body []byte, extraHeaders http.Header, obs *requestObservation) (*http.Response, error) {
+	if obs != nil {
+		obs.setPublicModel(extractRequestModel(body))
+	}
 	provider, rewrittenBody, err := h.resolveProviderRequest(body, path)
 	if err != nil {
 		return nil, err
 	}
+	if obs != nil && provider != nil {
+		obs.setProvider(provider.id)
+	}
 
-	return h.doWithRetry(func() (*http.Request, error) {
+	resp, err := h.doWithRetryObserved(obs, func() (*http.Request, error) {
 		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "")
 		if err != nil {
 			return nil, err
 		}
 		return req, nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	if obs != nil && resp != nil && resp.StatusCode >= http.StatusBadRequest {
+		obs.observeUpstreamError(strconv.Itoa(resp.StatusCode))
+	}
+	return resp, nil
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
 	return h.postJSONEndpoint(ctx, "/chat/completions", body)
 }
 
+func (h *ProxyHandler) postChatCompletionsObserved(ctx context.Context, body []byte, obs *requestObservation) (*http.Response, error) {
+	return h.postJSONEndpointObserved(ctx, "/chat/completions", body, obs)
+}
+
 func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
 	return h.postJSONEndpointWithHeaders(ctx, "/responses", body, extraHeaders)
+}
+
+func (h *ProxyHandler) postResponsesWithHeadersObserved(ctx context.Context, body []byte, extraHeaders http.Header, obs *requestObservation) (*http.Response, error) {
+	return h.postJSONEndpointWithHeadersObserved(ctx, "/responses", body, extraHeaders, obs)
 }
 
 func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {

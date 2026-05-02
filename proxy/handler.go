@@ -185,6 +185,9 @@ type ProxyHandler struct {
 	client                   *http.Client
 	copilotURL               string
 	copilotHeaders           CopilotHeaderConfig
+	buildInfo                BuildInfo
+	metrics                  *metricsRegistry
+	metricsEnabled           bool
 	providersConfig          ProvidersConfig
 	providersState           *providerSetup
 	responsesWS              ResponsesWebSocketConfig
@@ -212,6 +215,20 @@ func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
 func WithProvidersConfig(cfg ProvidersConfig) Option {
 	return func(h *ProxyHandler) {
 		h.providersConfig = cfg
+	}
+}
+
+// WithBuildInfo sets build metadata exposed by vekil_build_info.
+func WithBuildInfo(info BuildInfo) Option {
+	return func(h *ProxyHandler) {
+		h.buildInfo = info
+	}
+}
+
+// WithMetricsEnabled enables or disables the Prometheus /metrics surface.
+func WithMetricsEnabled(enabled bool) Option {
+	return func(h *ProxyHandler) {
+		h.metricsEnabled = enabled
 	}
 }
 
@@ -266,6 +283,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		},
 		copilotURL:               "https://api.githubcopilot.com",
 		copilotHeaders:           DefaultCopilotHeaderConfig(),
+		metricsEnabled:           true,
 		responsesWS:              DefaultResponsesWebSocketConfig(),
 		streamingUpstreamTimeout: streamingUpstreamTimeout,
 		log:                      log,
@@ -277,6 +295,9 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 	}
 	if err := h.initializeProviders(); err != nil {
 		return nil, err
+	}
+	if h.metricsEnabled {
+		h.metrics = newMetricsRegistry(h.buildInfo)
 	}
 	return h, nil
 }
@@ -296,6 +317,46 @@ func (h *ProxyHandler) effectiveStreamingUpstreamTimeout() time.Duration {
 // configured streaming upstream timeout plus the non-streaming request budget.
 func (h *ProxyHandler) ServerWriteTimeout() time.Duration {
 	return h.effectiveStreamingUpstreamTimeout() + upstreamTimeout
+}
+
+// MetricsHandler returns the Prometheus exposition handler when enabled.
+func (h *ProxyHandler) MetricsHandler() http.Handler {
+	if h == nil || h.metrics == nil {
+		return nil
+	}
+	return h.metrics.Handler()
+}
+
+func (h *ProxyHandler) beginObservedRequest(endpoint, publicModel string) *requestObservation {
+	if h == nil || h.metrics == nil {
+		return nil
+	}
+	return h.metrics.beginRequest(endpoint, publicModel)
+}
+
+func (h *ProxyHandler) resolveObservedRequest(obs *requestObservation, publicModel, upstreamEndpoint string) {
+	if obs == nil {
+		return
+	}
+	obs.setPublicModel(publicModel)
+	provider, _, _ := h.resolveProviderModel(publicModel, upstreamEndpoint)
+	if provider != nil {
+		obs.setProvider(provider.id)
+	}
+}
+
+func (h *ProxyHandler) setEndpointHealthy(providerID, endpoint string, healthy bool) {
+	if h == nil || h.metrics == nil {
+		return
+	}
+	value := 0.0
+	if healthy {
+		value = 1.0
+	}
+	h.metrics.endpointHealthy.WithLabelValues(
+		metricLabelValue(providerID, "unknown"),
+		metricLabelValue(endpoint, "unknown"),
+	).Set(value)
 }
 
 func setCopilotHeaders(req *http.Request, token string) {
@@ -415,16 +476,25 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 func (h *ProxyHandler) checkProviderReady(ctx context.Context, provider *providerRuntime) error {
 	req, err := h.newProviderProbeRequest(ctx, provider)
 	if err != nil {
+		if provider != nil {
+			h.setEndpointHealthy(provider.id, "/models", false)
+		}
 		return err
 	}
 
 	resp, err := h.client.Do(req)
 	if err != nil {
+		if provider != nil {
+			h.setEndpointHealthy(provider.id, "/models", false)
+		}
 		return fmt.Errorf("provider %q upstream probe failed: %w", provider.id, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
+		if provider != nil {
+			h.setEndpointHealthy(provider.id, "/models", false)
+		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		message := fmt.Sprintf("provider %q upstream probe returned %d", provider.id, resp.StatusCode)
 		if trimmed := strings.TrimSpace(string(body)); trimmed != "" {
@@ -433,6 +503,9 @@ func (h *ProxyHandler) checkProviderReady(ctx context.Context, provider *provide
 		return fmt.Errorf("%s", message)
 	}
 
+	if provider != nil {
+		h.setEndpointHealthy(provider.id, "/models", true)
+	}
 	return nil
 }
 

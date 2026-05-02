@@ -243,7 +243,7 @@ func TestPeekAndForwardResponses_FailsOpenOnMaxPeekBytes(t *testing.T) {
 	w := httptest.NewRecorder()
 	h := &ProxyHandler{log: logger.New(logger.LevelInfo)}
 
-	peekAndForwardResponsesWithConfig(h, w, req, resp, func() {}, "gpt-5.4", 50*time.Millisecond, 32)
+	peekAndForwardResponsesWithConfig(h, w, req, resp, func() {}, "gpt-5.4", nil, 50*time.Millisecond, 32)
 
 	result := w.Result()
 	if result.StatusCode != http.StatusOK {
@@ -270,7 +270,7 @@ func TestPeekAndForwardResponses_FailsOpenOnPeekTimeout(t *testing.T) {
 	w := httptest.NewRecorder()
 	h := &ProxyHandler{log: logger.New(logger.LevelInfo)}
 
-	peekAndForwardResponsesWithConfig(h, w, req, resp, func() {}, "gpt-5.4", 20*time.Millisecond, 1024)
+	peekAndForwardResponsesWithConfig(h, w, req, resp, func() {}, "gpt-5.4", nil, 20*time.Millisecond, 1024)
 
 	result := w.Result()
 	if result.StatusCode != http.StatusOK {
@@ -302,7 +302,7 @@ func TestPeekAndForwardResponses_ClientDisconnectDuringPeekClosesUpstream(t *tes
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		peekAndForwardResponsesWithConfig(h, w, req, resp, func() {}, "gpt-5.4", time.Second, 1024)
+		peekAndForwardResponsesWithConfig(h, w, req, resp, func() {}, "gpt-5.4", nil, time.Second, 1024)
 	}()
 
 	cancel()

@@ -69,8 +69,52 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// StreamOpenAIPassthrough streams OpenAI SSE bytes directly to the client with no parsing.
-func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
+type openAIStreamPassthroughTap struct {
+	pending       []byte
+	sawDone       bool
+	sawFirstChunk bool
+	onFirstChunk  func()
+	usage         *models.OpenAIUsage
+}
+
+func (t *openAIStreamPassthroughTap) Write(p []byte) (int, error) {
+	t.pending = append(t.pending, p...)
+	for {
+		newline := bytes.IndexByte(t.pending, '\n')
+		if newline < 0 {
+			break
+		}
+		line := string(t.pending[:newline])
+		t.pending = t.pending[newline+1:]
+		line = strings.TrimSuffix(line, "\r")
+
+		data, ok := parseSSELine(line)
+		if !ok {
+			continue
+		}
+		if data == "[DONE]" {
+			t.sawDone = true
+			continue
+		}
+		if !t.sawFirstChunk {
+			t.sawFirstChunk = true
+			if t.onFirstChunk != nil {
+				t.onFirstChunk()
+			}
+		}
+
+		var chunk models.OpenAIStreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err == nil && chunk.Usage != nil {
+			cloned := *chunk.Usage
+			t.usage = &cloned
+		}
+	}
+	return len(p), nil
+}
+
+// StreamOpenAIPassthrough streams OpenAI SSE bytes directly to the client
+// while preserving the wire format and capturing terminal usage.
+func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser, obs *requestObservation) (*models.OpenAIUsage, error) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
@@ -78,27 +122,54 @@ func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
 	if f, ok := w.(http.Flusher); ok {
 		fw.flusher = f
 	}
-	// Errors here (client disconnect, upstream drop) are unrecoverable for SSE
-	// since headers have already been sent. The client must handle truncated streams.
-	_, _ = io.Copy(fw, body)
+	tap := &openAIStreamPassthroughTap{
+		onFirstChunk: func() {
+			if obs != nil {
+				obs.observeFirstByte()
+			}
+		},
+	}
+	_, err := io.Copy(fw, io.TeeReader(body, tap))
+	if err != nil {
+		return tap.usage, err
+	}
+	if !tap.sawDone {
+		return tap.usage, fmt.Errorf("stream ended before [DONE]")
+	}
+	return tap.usage, nil
 }
 
 // StreamOpenAIToAnthropic translates an OpenAI SSE stream into Anthropic SSE format.
-func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model string, requestID string) {
+func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model string, requestID string, obs *requestObservation) (*models.OpenAIUsage, error) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
 	state := newAnthropicStreamState(w, model, requestID)
 	if !state.start() {
-		return
+		return nil, fmt.Errorf("failed to start anthropic stream")
 	}
 
-	sawDone, err := consumeOpenAIStreamChunks(body, state.consumeChunk)
-	if err != nil || !sawDone {
-		return
+	sawFirstChunk := false
+	sawDone, err := consumeOpenAIStreamChunks(body, func(chunk models.OpenAIStreamChunk) bool {
+		if !sawFirstChunk {
+			sawFirstChunk = true
+			if obs != nil {
+				obs.observeFirstByte()
+			}
+		}
+		return state.consumeChunk(chunk)
+	})
+	if err != nil {
+		return state.storedUsage, err
+	}
+	if !sawDone {
+		return state.storedUsage, fmt.Errorf("stream ended before [DONE]")
 	}
 
-	_ = state.finish()
+	if !state.finish() {
+		return state.storedUsage, fmt.Errorf("failed to finish anthropic stream")
+	}
+	return state.storedUsage, nil
 }
 
 // aggregateStreamToResponse collects an OpenAI SSE stream into a complete

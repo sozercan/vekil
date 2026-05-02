@@ -31,6 +31,7 @@ func newTestProxyHandler(t testing.TB, backend http.HandlerFunc) *ProxyHandler {
 		client:         server.Client(),
 		copilotURL:     server.URL,
 		log:            logger.New(logger.LevelInfo),
+		metrics:        newMetricsRegistry(BuildInfo{Version: "test", Commit: "test"}),
 		retryBaseDelay: 1 * time.Millisecond,
 	}
 }
@@ -48,6 +49,7 @@ func newRoundTripTestProxyHandler(t testing.TB, transport roundTripFunc) *ProxyH
 		client:         &http.Client{Transport: transport},
 		copilotURL:     "http://upstream.test",
 		log:            logger.New(logger.LevelInfo),
+		metrics:        newMetricsRegistry(BuildInfo{Version: "test", Commit: "test"}),
 		retryBaseDelay: 1 * time.Millisecond,
 	}
 }

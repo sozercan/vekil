@@ -18,7 +18,7 @@ type chatCompletionsMode struct {
 }
 
 type chatCompletionsResponseHandlers struct {
-	stream      func(*http.Response)
+	stream      func(*http.Response) error
 	aggregate   func(*models.OpenAIResponse)
 	passthrough func(*http.Response) error
 }
@@ -77,8 +77,7 @@ func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp 
 		if handlers.stream == nil {
 			return fmt.Errorf("missing stream response handler")
 		}
-		handlers.stream(resp)
-		return nil
+		return handlers.stream(resp)
 	}
 
 	if resp.StatusCode == http.StatusOK && mode.forceUpstreamStream {
@@ -104,19 +103,32 @@ func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp 
 // HandleAnthropicMessages handles POST /v1/messages by translating the Anthropic
 // request to OpenAI format, forwarding to Copilot, and translating the response back.
 func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
+	status := http.StatusOK
+	obs := h.beginObservedRequest("messages", "")
+	defer func() {
+		if obs != nil {
+			obs.finish(status)
+		}
+	}()
+
 	body, err := readBody(r)
 	if err != nil {
-		status := readBodyStatusCode(err)
+		status = readBodyStatusCode(err)
 		writeAnthropicError(w, status, "invalid_request_error", err.Error())
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+	if obs != nil {
+		obs.setPublicModel(extractRequestModel(body))
+	}
 
 	var req models.AnthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
+		status = http.StatusBadRequest
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON in request body")
 		return
 	}
+	h.resolveObservedRequest(obs, req.Model, "/chat/completions")
 
 	h.log.Debug("anthropic request",
 		logger.F("model", req.Model),
@@ -127,6 +139,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	oaiBody, mode, err := prepareAnthropicChatCompletionsRequest(&req)
 	if err != nil {
+		status = http.StatusBadRequest
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("translation error: %v", err))
 		return
 	}
@@ -134,9 +147,10 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 
-	resp, err := h.postChatCompletions(upstreamCtx, oaiBody)
+	resp, err := h.postChatCompletionsObserved(upstreamCtx, oaiBody, obs)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		status = statusCode
 		h.log.Error("upstream request failed", logger.F("endpoint", "anthropic"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
 			writeAnthropicError(w, statusCode, "invalid_request_error", err.Error())
@@ -151,6 +165,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		status = resp.StatusCode
 		defer func() { _ = resp.Body.Close() }()
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		h.log.Error("upstream error",
@@ -164,16 +179,28 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	}
 
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
-		stream: func(resp *http.Response) {
-			StreamOpenAIToAnthropic(w, resp.Body, req.Model, "msg_"+uuid.New().String())
+		stream: func(resp *http.Response) error {
+			usage, err := StreamOpenAIToAnthropic(w, resp.Body, req.Model, "msg_"+uuid.New().String(), obs)
+			obs.observeOpenAIUsage(usage)
+			if err != nil {
+				status = http.StatusBadGateway
+				obs.observeUpstreamError("stream")
+			}
+			return err
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			obs.observeOpenAIUsage(oaiResp.Usage)
 			anthropicResp := TranslateOpenAIToAnthropic(oaiResp, req.Model)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(anthropicResp)
 		},
 	})
 	if err != nil {
+		status = http.StatusBadGateway
+		if mode.clientRequestedStream {
+			h.log.Error("anthropic stream failed", logger.Err(err))
+			return
+		}
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "failed to aggregate upstream response")
 	}
 }
@@ -181,22 +208,35 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 // HandleOpenAIChatCompletions handles POST /v1/chat/completions by forwarding the
 // request to Copilot with only auth headers injected (near zero-copy passthrough).
 func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
+	status := http.StatusOK
+	obs := h.beginObservedRequest("chat_completions", "")
+	defer func() {
+		if obs != nil {
+			obs.finish(status)
+		}
+	}()
+
 	bodyBytes, err := readBody(r)
 	if err != nil {
-		status := readBodyStatusCode(err)
+		status = readBodyStatusCode(err)
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+	if obs != nil {
+		obs.setPublicModel(extractRequestModel(bodyBytes))
+	}
 
 	bodyBytes, mode := prepareOpenAIChatCompletionsRequest(bodyBytes)
+	h.resolveObservedRequest(obs, extractRequestModel(bodyBytes), "/chat/completions")
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 
-	resp, err := h.postChatCompletions(upstreamCtx, bodyBytes)
+	resp, err := h.postChatCompletionsObserved(upstreamCtx, bodyBytes, obs)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		status = statusCode
 		h.log.Error("upstream request failed", logger.F("endpoint", "openai"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
 			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
@@ -209,18 +249,34 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
 		return
 	}
+	status = resp.StatusCode
 
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
-		stream: func(resp *http.Response) {
+		stream: func(resp *http.Response) error {
 			copyPassthroughHeaders(w.Header(), resp.Header)
-			StreamOpenAIPassthrough(w, resp.Body)
+			usage, err := StreamOpenAIPassthrough(w, resp.Body, obs)
+			obs.observeOpenAIUsage(usage)
+			if err != nil {
+				status = http.StatusBadGateway
+				obs.observeUpstreamError("stream")
+			}
+			return err
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			obs.observeOpenAIUsage(oaiResp.Usage)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(oaiResp)
 		},
+		passthrough: func(resp *http.Response) error {
+			return writeObservedOpenAIJSONResponse(w, resp, obs)
+		},
 	})
 	if err != nil {
+		status = http.StatusBadGateway
+		if mode.clientRequestedStream {
+			h.log.Error("openai stream failed", logger.Err(err))
+			return
+		}
 		writeOpenAIError(w, http.StatusBadGateway, "failed to aggregate upstream response", "server_error")
 	}
 }

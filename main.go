@@ -63,6 +63,13 @@ type loginOptions struct {
 
 var errConflictingLoginFlags = fmt.Errorf("--github-cli/--gh cannot be used with --force")
 
+// buildVersion and buildCommit can be injected with -ldflags and are reused by
+// Prometheus build metadata exposure.
+var (
+	buildVersion string
+	buildCommit  string
+)
+
 type loginAuthenticator interface {
 	SignInWithGitHubCLI(context.Context) error
 	RefreshTokenNonInteractive(context.Context) (string, error)
@@ -216,6 +223,8 @@ func runServe() {
 	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
 	providersConfigPath := flag.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration")
 	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
+	metricsEnabled := flag.Bool("metrics", getEnvBool("METRICS", true), "Expose Prometheus metrics at /metrics")
+	noMetrics := flag.Bool("no-metrics", false, "Disable Prometheus metrics endpoint")
 	streamingUpstreamTimeout := flag.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
 	copilotEditorVersion := flag.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header")
 	copilotPluginVersion := flag.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
@@ -249,11 +258,21 @@ func runServe() {
 		log.Info("authenticated successfully")
 	}
 
+	enableMetrics := *metricsEnabled
+	if *noMetrics {
+		enableMetrics = false
+	}
+
 	srv, err := server.New(
 		authenticator,
 		log,
 		*host,
 		*port,
+		server.WithMetricsEnabled(enableMetrics),
+		server.WithBuildInfo(proxy.BuildInfo{
+			Version: buildVersion,
+			Commit:  buildCommit,
+		}),
 		server.WithStreamingUpstreamTimeout(*streamingUpstreamTimeout),
 		server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
 			EditorVersion:       *copilotEditorVersion,

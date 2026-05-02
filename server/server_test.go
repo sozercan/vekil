@@ -2,6 +2,8 @@ package server
 
 import (
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -94,5 +96,45 @@ func TestNew_DerivesWriteTimeoutFromConfiguredProxyHandler(t *testing.T) {
 				t.Fatalf("WriteTimeout = %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+func TestNew_RegistersMetricsRouteByDefault(t *testing.T) {
+	t.Parallel()
+
+	srv, err := New(auth.NewTestAuthenticator("test-token"), logger.New(logger.LevelError), "127.0.0.1", "0")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+}
+
+func TestNew_DisablesMetricsRoute(t *testing.T) {
+	t.Parallel()
+
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		"127.0.0.1",
+		"0",
+		WithMetricsEnabled(false),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
 	}
 }

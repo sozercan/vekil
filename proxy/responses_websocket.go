@@ -57,8 +57,27 @@ type responsesWebSocketStreamEvent struct {
 		ID                string                                    `json:"id"`
 		Error             responsesWebSocketStreamError             `json:"error"`
 		IncompleteDetails responsesWebSocketStreamIncompleteDetails `json:"incomplete_details"`
+		Usage             *responsesStreamUsage                     `json:"usage,omitempty"`
 	} `json:"response,omitempty"`
 	Item json.RawMessage `json:"item,omitempty"`
+}
+
+type responsesStreamUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+	TotalTokens  int `json:"total_tokens"`
+}
+
+type responsesStreamResult struct {
+	status    int
+	usage     *responsesStreamUsage
+	errorCode string
+}
+
+type responsesWebSocketStreamResult struct {
+	responsesStreamResult
+	responseID  string
+	outputItems []json.RawMessage
 }
 
 type responsesWebSocketStreamError struct {
@@ -263,8 +282,18 @@ func (r *responsesWebSocketCreateRequest) upstreamBody(inputSegments ...[]json.R
 }
 
 func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) error {
+	status := http.StatusOK
+	obs := h.beginObservedRequest("responses_websocket", request.Model)
+	defer func() {
+		if obs != nil {
+			obs.finish(status)
+		}
+	}()
+	h.resolveObservedRequest(obs, request.Model, "/responses")
+
 	plan, err := s.planRequest(h, request)
 	if err != nil {
+		status = http.StatusBadRequest
 		s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
 		return err
 	}
@@ -280,6 +309,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 				"id": responseID,
 			},
 		}); err != nil {
+			status = http.StatusBadGateway
 			return err
 		}
 		return s.writeJSON(map[string]interface{}{
@@ -299,28 +329,38 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		if err != nil {
 			return nil, err
 		}
-		attemptResp, attemptDeltaAttempted, attemptDeltaFallback, err := s.postCreateRequest(h, upstreamCtx, request, attemptPlan)
+		attemptResp, attemptDeltaAttempted, attemptDeltaFallback, err := s.postCreateRequest(h, upstreamCtx, request, attemptPlan, obs)
 		metrics.deltaAttempted = metrics.deltaAttempted || attemptDeltaAttempted
 		metrics.deltaFallback = metrics.deltaFallback || attemptDeltaFallback
 		return attemptResp, err
 	})
 	if err != nil {
-		s.sendWrappedError(upstreamStatusCode(err, http.StatusBadGateway), fmt.Sprintf("upstream request failed: %v", err), "server_error", nil)
+		status = upstreamStatusCode(err, http.StatusBadGateway)
+		s.sendWrappedError(status, fmt.Sprintf("upstream request failed: %v", err), "server_error", nil)
 		return err
 	}
 	if translated != nil {
+		status = translated.status
 		code := ""
 		if translated.failure != nil {
 			code = strings.TrimSpace(translated.failure.Response.Error.Code)
+		}
+		if code != "" {
+			obs.observeUpstreamError(code)
+		} else {
+			obs.observeUpstreamError(strconv.Itoa(translated.status))
 		}
 		s.sendWrappedError(translated.status, translated.message, code, translatedHeaders)
 		return nil
 	}
 	if resp == nil {
+		status = http.StatusBadGateway
+		obs.observeUpstreamError(strconv.Itoa(status))
 		s.sendWrappedError(http.StatusBadGateway, "upstream request failed", "server_error", nil)
 		return fmt.Errorf("upstream websocket bridge returned no response")
 	}
 	defer func() { _ = resp.Body.Close() }()
+	status = resp.StatusCode
 
 	s.updateTurnState(resp.Header)
 
@@ -334,18 +374,29 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return fmt.Errorf("upstream websocket bridge status %d", resp.StatusCode)
 	}
 
-	responseID, outputItems, err := s.streamUpstreamResponse(resp.Body, resp.Header)
+	streamResult, err := s.streamUpstreamResponse(resp.Body, resp.Header, obs)
 	if err != nil {
 		if errors.Is(err, errStreamFailedUpstream) {
+			status = streamResult.status
+			obs.observeResponsesUsage(streamResult.usage)
+			if streamResult.errorCode != "" {
+				obs.observeUpstreamError(streamResult.errorCode)
+			} else if streamResult.status >= http.StatusBadRequest {
+				obs.observeUpstreamError(strconv.Itoa(streamResult.status))
+			}
 			return nil
 		}
+		status = http.StatusBadGateway
+		obs.observeUpstreamError("stream")
 		s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil)
 		return err
 	}
+	status = streamResult.status
+	obs.observeResponsesUsage(streamResult.usage)
 
-	s.rememberResponse(plan.resetHistory, responseID, plan.signature, plan.currentInput, outputItems)
+	s.rememberResponse(plan.resetHistory, streamResult.responseID, plan.signature, plan.currentInput, streamResult.outputItems)
 	metrics = s.maybeAutoCompactHistory(h, request, metrics)
-	s.logRequestMetrics(h, request, responseID, metrics)
+	s.logRequestMetrics(h, request, streamResult.responseID, metrics)
 	return nil
 }
 
@@ -372,13 +423,13 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 	return plan, nil
 }
 
-func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, plan responsesWebSocketRequestPlan) (*http.Response, bool, bool, error) {
-	resp, err := s.postCreateRequestSegments(h, ctx, request, plan.upstreamSegments(), plan.useTurnStateDelta)
+func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, plan responsesWebSocketRequestPlan, obs *requestObservation) (*http.Response, bool, bool, error) {
+	resp, err := s.postCreateRequestSegments(h, ctx, request, plan.upstreamSegments(), plan.useTurnStateDelta, obs)
 	if err != nil || resp == nil {
 		return resp, plan.useTurnStateDelta, false, err
 	}
 	if !plan.useTurnStateDelta {
-		resp, err = s.maybeRetryCompactedCreateRequest(h, ctx, request, resp, true)
+		resp, err = s.maybeRetryCompactedCreateRequest(h, ctx, request, resp, obs, true)
 		return resp, false, false, err
 	}
 	if resp.StatusCode == http.StatusOK {
@@ -401,21 +452,21 @@ func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx conte
 	)
 	s.turnState = ""
 
-	resp, err = s.postCreateRequestSegments(h, ctx, request, plan.fullReplaySegments, false)
+	resp, err = s.postCreateRequestSegments(h, ctx, request, plan.fullReplaySegments, false, obs)
 	if err != nil || resp == nil {
 		return resp, true, true, err
 	}
-	resp, err = s.maybeRetryCompactedCreateRequest(h, ctx, request, resp, true)
+	resp, err = s.maybeRetryCompactedCreateRequest(h, ctx, request, resp, obs, true)
 	return resp, true, true, err
 }
 
-func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, inputSegments [][]json.RawMessage, includeTurnState bool) (*http.Response, error) {
+func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, inputSegments [][]json.RawMessage, includeTurnState bool, obs *requestObservation) (*http.Response, error) {
 	bodyBytes, err := request.upstreamBody(inputSegments...)
 	if err != nil {
 		return nil, err
 	}
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/websocket", true)
-	return h.postResponsesWithHeaders(ctx, bodyBytes, s.requestHeaders(request, includeTurnState))
+	return h.postResponsesWithHeadersObserved(ctx, bodyBytes, s.requestHeaders(request, includeTurnState), obs)
 }
 
 func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCreateRequest, includeTurnState bool) http.Header {
@@ -495,7 +546,7 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, req
 	return metrics
 }
 
-func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, resp *http.Response, fullReplayUsed bool) (*http.Response, error) {
+func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, resp *http.Response, obs *requestObservation, fullReplayUsed bool) (*http.Response, error) {
 	if resp == nil || !fullReplayUsed || resp.StatusCode != http.StatusRequestEntityTooLarge || strings.TrimSpace(request.PreviousResponseID) == "" {
 		return resp, nil
 	}
@@ -525,7 +576,7 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 	)
 
 	_ = resp.Body.Close()
-	return s.postCreateRequestSegments(h, ctx, request, [][]json.RawMessage{s.historyItems, request.Input}, false)
+	return s.postCreateRequestSegments(h, ctx, request, [][]json.RawMessage{s.historyItems, request.Input}, false, obs)
 }
 
 func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, force bool) (responsesWebSocketHistoryCompaction, bool, error) {
@@ -595,7 +646,9 @@ func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *
 	)
 }
 
-func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, headers http.Header) (string, []json.RawMessage, error) {
+func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, headers http.Header, obs *requestObservation) (responsesWebSocketStreamResult, error) {
+	var result responsesWebSocketStreamResult
+
 	// Emit a synthetic metadata event so WebSocket clients can discover the
 	// actual model used. The Codex CLI parses openai-model from
 	// codex.response.metadata frames via response_model().
@@ -620,8 +673,13 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, heade
 		parsedEvent := json.Unmarshal([]byte(data), &event) == nil
 		if !sawSemanticEvent {
 			sawSemanticEvent = true
+			if obs != nil {
+				obs.observeFirstByte()
+			}
 			if parsedEvent && event.Type == "response.failed" {
 				if status, _, ok := classifyPrecommitResponsesFailure(event); ok {
+					result.status = status
+					result.errorCode = strings.TrimSpace(event.Response.Error.Code)
 					s.sendWrappedError(status, responsesPrecommitErrorMessage(event, status), strings.TrimSpace(event.Response.Error.Code), headers)
 					return errStreamFailedUpstream
 				}
@@ -647,10 +705,15 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, heade
 			}
 		case "response.completed":
 			sawCompleted = true
+			result.status = http.StatusOK
+			result.usage = cloneResponsesStreamUsage(event.Response.Usage)
 			if event.Response.ID != "" {
 				responseID = event.Response.ID
 			}
 		case "response.failed", "response.incomplete":
+			status, _, code := responsesWebSocketStreamFailureDetails(event)
+			result.status = status
+			result.errorCode = code
 			s.sendUpstreamStreamFailure(event, headers)
 			// Return the sentinel immediately to break out of the SSE
 			// scanner loop. The failure event has already been forwarded to
@@ -661,18 +724,20 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, heade
 
 		return nil
 	}); err != nil && !errors.Is(err, errStreamFailedUpstream) {
-		return "", nil, err
+		return result, err
 	} else if errors.Is(err, errStreamFailedUpstream) {
-		return "", nil, errStreamFailedUpstream
+		return result, errStreamFailedUpstream
 	}
 
 	if sawCompleted {
 		if responseID == "" {
-			return "", nil, fmt.Errorf("response.completed missing response id")
+			return result, fmt.Errorf("response.completed missing response id")
 		}
-		return responseID, outputItems, nil
+		result.responseID = responseID
+		result.outputItems = outputItems
+		return result, nil
 	}
-	return "", nil, fmt.Errorf("stream ended before response.completed")
+	return result, fmt.Errorf("stream ended before response.completed")
 }
 
 func (s *responsesWebSocketSession) writeJSON(payload interface{}) error {
@@ -740,6 +805,14 @@ func consumeResponsesSSEData(body io.Reader, onData func(string) error) error {
 		return fmt.Errorf("reading SSE stream: %w", err)
 	}
 	return dispatch()
+}
+
+func cloneResponsesStreamUsage(usage *responsesStreamUsage) *responsesStreamUsage {
+	if usage == nil {
+		return nil
+	}
+	cloned := *usage
+	return &cloned
 }
 
 func zeroResponsesUsage() map[string]interface{} {

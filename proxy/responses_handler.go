@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/sozercan/vekil/logger"
@@ -42,13 +43,25 @@ func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
 // HandleResponses handles POST /v1/responses by forwarding the request to
 // Copilot's responses endpoint with only auth headers injected.
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
+	status := http.StatusOK
+	obs := h.beginObservedRequest("responses", "")
+	defer func() {
+		if obs != nil {
+			obs.finish(status)
+		}
+	}()
+
 	bodyBytes, err := readBody(r)
 	if err != nil {
-		status := readBodyStatusCode(err)
+		status = readBodyStatusCode(err)
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+	if obs != nil {
+		obs.setPublicModel(extractResponsesRequestModel(bodyBytes))
+	}
+	h.resolveObservedRequest(obs, extractResponsesRequestModel(bodyBytes), "/responses")
 
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses", true)
 
@@ -63,9 +76,10 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(isStreaming)
 	defer upstreamCancel()
 
-	resp, err := h.postResponsesWithHeaders(upstreamCtx, bodyBytes, extraHeaders)
+	resp, err := h.postResponsesWithHeadersObserved(upstreamCtx, bodyBytes, extraHeaders, obs)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		status = statusCode
 		h.log.Error("upstream request failed", logger.F("endpoint", "responses"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
 			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
@@ -78,9 +92,11 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
 		return
 	}
-	resp, err = h.maybeRetryCompactedResponsesRequest(upstreamCtx, bodyBytes, extraHeaders, resp)
+	status = resp.StatusCode
+	resp, err = h.maybeRetryCompactedResponsesRequest(upstreamCtx, bodyBytes, extraHeaders, resp, obs)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		status = statusCode
 		h.log.Error("upstream request failed", logger.F("endpoint", "responses"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
 			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
@@ -93,14 +109,26 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
 		return
 	}
+	status = resp.StatusCode
 
 	if isStreaming && resp.StatusCode == http.StatusOK {
 		model := extractRequestModel(bodyBytes)
-		peekAndForwardResponses(h, w, r, resp, upstreamCancel, model)
+		streamResult := peekAndForwardResponses(h, w, r, resp, upstreamCancel, model, obs)
+		status = streamResult.status
+		obs.observeResponsesUsage(streamResult.usage)
+		if streamResult.errorCode != "" {
+			obs.observeUpstreamError(streamResult.errorCode)
+		} else if streamResult.status >= http.StatusBadRequest {
+			obs.observeUpstreamError(strconv.Itoa(streamResult.status))
+		}
 		return
 	}
 
-	writeUpstreamResponse(w, resp)
+	if err := writeObservedResponsesJSONResponse(w, resp, obs); err != nil {
+		status = http.StatusBadGateway
+		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
+		return
+	}
 }
 
 // compactPrompt is the system instruction used when the upstream does not
@@ -829,7 +857,7 @@ func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, bod
 	return retryResp, nil
 }
 
-func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, resp *http.Response) (*http.Response, error) {
+func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, resp *http.Response, obs *requestObservation) (*http.Response, error) {
 	if resp == nil || resp.StatusCode != http.StatusRequestEntityTooLarge {
 		return resp, nil
 	}
@@ -906,7 +934,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, 
 		logger.F("compacted_bytes", rawMessagesSize(compactedInput)),
 	)
 
-	retryResp, retryErr := h.postResponsesWithHeaders(ctx, retryBody, extraHeaders)
+	retryResp, retryErr := h.postResponsesWithHeadersObserved(ctx, retryBody, extraHeaders, obs)
 	if retryErr != nil {
 		h.log.Debug("responses 413 retry request failed", logger.Err(retryErr))
 		return resp, nil

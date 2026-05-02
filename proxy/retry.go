@@ -2,8 +2,10 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -53,6 +55,13 @@ func drainAndClose(body io.ReadCloser) {
 // doWithRetry executes an HTTP request with retry on transient failures.
 // The reqFactory is called on each attempt to produce a fresh request body.
 func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*http.Response, error) {
+	return h.doWithRetryObserved(nil, reqFactory)
+}
+
+// doWithRetryObserved executes an HTTP request with retry on transient
+// failures while recording retry and upstream error metrics when an observer
+// is provided.
+func (h *ProxyHandler) doWithRetryObserved(obs *requestObservation, reqFactory func() (*http.Request, error)) (*http.Response, error) {
 	maxRetries := h.maxRetries
 	if maxRetries == 0 {
 		maxRetries = 3
@@ -71,8 +80,14 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 
 		resp, err := h.client.Do(req)
 		if err != nil {
+			if obs != nil {
+				obs.observeUpstreamError(upstreamTransportCode(err))
+			}
 			lastErr = err
 			if attempt < maxRetries-1 {
+				if obs != nil {
+					obs.observeRetry(retryReasonFromError(err))
+				}
 				if ctxErr := sleepWithContext(req.Context(), backoff(retryDelay, attempt)); ctxErr != nil {
 					return nil, ctxErr
 				}
@@ -83,6 +98,9 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		if !retryable(resp.StatusCode) {
 			return resp, nil
 		}
+		if obs != nil {
+			obs.observeUpstreamError(strconv.Itoa(resp.StatusCode))
+		}
 
 		retryAfterHeader := resp.Header.Get("Retry-After")
 
@@ -91,6 +109,9 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		lastErr = &upstreamError{statusCode: resp.StatusCode}
 
 		if attempt < maxRetries-1 {
+			if obs != nil {
+				obs.observeRetry(retryReasonFromStatus(resp.StatusCode))
+			}
 			delay := backoff(retryDelay, attempt)
 			if ra, ok := parseRetryAfter(retryAfterHeader); ok && ra > delay {
 				delay = ra
@@ -101,6 +122,41 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		}
 	}
 	return nil, lastErr
+}
+
+func retryReasonFromStatus(statusCode int) string {
+	switch {
+	case statusCode == http.StatusTooManyRequests:
+		return "429"
+	case statusCode >= 500 && statusCode <= 599:
+		return "5xx"
+	default:
+		return ""
+	}
+}
+
+func retryReasonFromError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	return ""
+}
+
+func upstreamTransportCode(err error) string {
+	if retryReasonFromError(err) == "timeout" {
+		return "timeout"
+	}
+	if err == nil {
+		return ""
+	}
+	return "transport"
 }
 
 // sleepWithContext blocks for the given duration or until the context is done,
