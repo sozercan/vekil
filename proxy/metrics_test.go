@@ -132,18 +132,18 @@ func TestMetrics_HandleOpenAIChatCompletions(t *testing.T) {
 
 	requireMetricSample(t, body, "vekil_requests_total", map[string]string{
 		"provider":     "copilot",
-		"public_model": "gpt-4",
+		"public_model": metricsPublicModelUnresolved,
 		"endpoint":     "/v1/chat/completions",
 		"status":       "200",
 	}, 1)
 	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
 		"provider":     "copilot",
-		"public_model": "gpt-4",
+		"public_model": metricsPublicModelUnresolved,
 		"direction":    "prompt",
 	}, 11)
 	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
 		"provider":     "copilot",
-		"public_model": "gpt-4",
+		"public_model": metricsPublicModelUnresolved,
 		"direction":    "completion",
 	}, 7)
 	requireMetricSample(t, body, "vekil_inflight_requests", map[string]string{
@@ -186,18 +186,121 @@ func TestMetrics_HandleResponses(t *testing.T) {
 	body := scrapeMetrics(t, handler)
 	requireMetricSample(t, body, "vekil_requests_total", map[string]string{
 		"provider":     "copilot",
-		"public_model": "gpt-4",
+		"public_model": metricsPublicModelUnresolved,
 		"endpoint":     "/v1/responses",
 		"status":       "200",
 	}, 1)
 	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
 		"provider":     "copilot",
-		"public_model": "gpt-4",
+		"public_model": metricsPublicModelUnresolved,
 		"direction":    "prompt",
 	}, 9)
 	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
 		"provider":     "copilot",
-		"public_model": "gpt-4",
+		"public_model": metricsPublicModelUnresolved,
+		"direction":    "completion",
+	}, 4)
+}
+
+func TestMetrics_UnresolvedRequestedModelUsesBoundedLabel(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/responses" {
+			t.Fatalf("upstream path = %q, want /responses", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"unsupported model"}}`))
+	}))
+	defer backend.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		withCopilotBaseURLForTest(backend.URL),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"tenant-a/custom-model","input":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("HandleResponses status = %d, want 400", w.Code)
+	}
+
+	body := scrapeMetrics(t, handler)
+	requireMetricSample(t, body, "vekil_requests_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": metricsPublicModelUnresolved,
+		"endpoint":     "/v1/responses",
+		"status":       "400",
+	}, 1)
+	if strings.Contains(body, "tenant-a/custom-model") {
+		t.Fatalf("metrics output leaked raw requested model label:\n%s", body)
+	}
+}
+
+func TestMetrics_KnownConfiguredModelUsesPublicModelLabel(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/openai/v1/responses" {
+			t.Fatalf("upstream path = %q, want /openai/v1/responses", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","model":"gpt-5-4-prod","output":[],"usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13}}`))
+	}))
+	defer backend.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:      "azure",
+				Type:    "azure-openai",
+				Default: true,
+				BaseURL: backend.URL + "/openai/v1",
+				APIKey:  "azure-test-key",
+				Models: []ProviderModelConfig{{
+					PublicID:   "gpt-5-public",
+					Deployment: "gpt-5-4-prod",
+					Endpoints:  []string{"/responses"},
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5-public","input":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("HandleResponses status = %d, want 200", w.Code)
+	}
+
+	body := scrapeMetrics(t, handler)
+	requireMetricSample(t, body, "vekil_requests_total", map[string]string{
+		"provider":     "azure",
+		"public_model": "gpt-5-public",
+		"endpoint":     "/v1/responses",
+		"status":       "200",
+	}, 1)
+	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
+		"provider":     "azure",
+		"public_model": "gpt-5-public",
+		"direction":    "prompt",
+	}, 9)
+	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
+		"provider":     "azure",
+		"public_model": "gpt-5-public",
 		"direction":    "completion",
 	}, 4)
 }
@@ -241,18 +344,30 @@ func TestMetrics_HandleAnthropicMessages(t *testing.T) {
 	body := scrapeMetrics(t, handler)
 	requireMetricSample(t, body, "vekil_requests_total", map[string]string{
 		"provider":     "copilot",
-		"public_model": "claude-sonnet-4.5",
+		"public_model": metricsPublicModelUnresolved,
 		"endpoint":     "/v1/messages",
 		"status":       "200",
 	}, 1)
 	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
 		"provider":     "copilot",
-		"public_model": "claude-sonnet-4.5",
+		"public_model": metricsPublicModelUnresolved,
 		"direction":    "prompt",
 	}, 4)
 	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
 		"provider":     "copilot",
-		"public_model": "claude-sonnet-4.5",
+		"public_model": metricsPublicModelUnresolved,
 		"direction":    "completion",
 	}, 2)
+}
+
+func TestProviderHealthEndpoint_RedactsBaseURL(t *testing.T) {
+	provider := &providerRuntime{
+		id:      "azure",
+		kind:    providerTypeAzureOpenAI,
+		baseURL: "https://user:secret@example.openai.azure.com:8443/openai/v1",
+	}
+
+	if got, want := providerHealthEndpoint(provider), "example.openai.azure.com"; got != want {
+		t.Fatalf("providerHealthEndpoint() = %q, want %q", got, want)
+	}
 }

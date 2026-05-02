@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"runtime"
 	"strconv"
 	"strings"
@@ -29,6 +31,7 @@ const (
 	metricsEndpointGeminiGenerateContent = "gemini:generateContent"
 	metricsEndpointGeminiStreamGenerate  = "gemini:streamGenerateContent"
 	metricsEndpointGeminiCountTokens     = "gemini:countTokens"
+	metricsPublicModelUnresolved         = "unresolved"
 )
 
 // BuildInfo captures build metadata exposed via Prometheus and the CLI version
@@ -141,7 +144,7 @@ func newProxyMetrics(info BuildInfo) *proxyMetrics {
 		endpointHealthy: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "vekil_endpoint_healthy",
-				Help: "Latest readiness result grouped by provider and upstream endpoint (1=healthy, 0=unhealthy).",
+				Help: "Latest readiness result grouped by provider and redacted upstream endpoint label (1=healthy, 0=unhealthy).",
 			},
 			[]string{"provider", "endpoint"},
 		),
@@ -212,9 +215,10 @@ func (h *ProxyHandler) newRequestObservation(endpoint string) *requestObservatio
 		return nil
 	}
 	return &requestObservation{
-		metrics:  h.metrics,
-		endpoint: strings.TrimSpace(endpoint),
-		start:    time.Now(),
+		metrics:     h.metrics,
+		endpoint:    strings.TrimSpace(endpoint),
+		start:       time.Now(),
+		publicModel: metricsPublicModelUnresolved,
 	}
 }
 
@@ -224,10 +228,10 @@ func (o *requestObservation) bindProxyRequest(h *ProxyHandler, requestedModel, r
 	}
 
 	requestedModel = strings.TrimSpace(requestedModel)
-	provider, owner, _ := h.resolveProviderModel(requestedModel, routingEndpoint)
-	publicModel := requestedModel
-	if strings.TrimSpace(owner.publicID) != "" {
-		publicModel = strings.TrimSpace(owner.publicID)
+	provider, owner, known := h.resolveProviderModel(requestedModel, routingEndpoint)
+	publicModel := metricsPublicModelUnresolved
+	if known && strings.TrimSpace(owner.publicID) != "" {
+		publicModel = normalizeKnownMetricModelLabel(owner.publicID)
 	}
 
 	if provider != nil {
@@ -301,13 +305,23 @@ func (o *requestObservation) observeOpenAIUsageFromBody(body []byte) {
 		return
 	}
 
-	var payload struct {
-		Usage *models.OpenAIUsage `json:"usage"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
+	_, usage, err := parseOpenAIResponseMetadata(bytes.NewReader(body))
+	if err != nil {
 		return
 	}
-	o.observeOpenAIUsage(payload.Usage)
+	o.observeOpenAIUsage(usage)
+}
+
+func (o *requestObservation) observeOpenAIUsageFromReader(r io.Reader) {
+	if o == nil || r == nil {
+		return
+	}
+
+	_, usage, err := parseOpenAIResponseMetadata(r)
+	if err != nil {
+		return
+	}
+	o.observeOpenAIUsage(usage)
 }
 
 func (o *requestObservation) observeResponsesUsage(usage *responsesUsage) {
@@ -322,13 +336,23 @@ func (o *requestObservation) observeResponsesUsageFromBody(body []byte) {
 		return
 	}
 
-	var payload struct {
-		Usage *responsesUsage `json:"usage"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
+	_, usage, err := parseResponsesResponseMetadata(bytes.NewReader(body))
+	if err != nil {
 		return
 	}
-	o.observeResponsesUsage(payload.Usage)
+	o.observeResponsesUsage(usage)
+}
+
+func (o *requestObservation) observeResponsesUsageFromReader(r io.Reader) {
+	if o == nil || r == nil {
+		return
+	}
+
+	_, usage, err := parseResponsesResponseMetadata(r)
+	if err != nil {
+		return
+	}
+	o.observeResponsesUsage(usage)
 }
 
 func (o *requestObservation) observeTokens(promptTokens, completionTokens int) {
@@ -444,7 +468,12 @@ func providerHealthEndpoint(provider *providerRuntime) string {
 	if provider == nil {
 		return ""
 	}
-	if endpoint := normalizeMetricLabel(provider.baseURL); endpoint != "" {
+	if parsed, err := url.Parse(strings.TrimSpace(provider.baseURL)); err == nil {
+		if host := normalizeMetricLabel(parsed.Hostname()); host != "" {
+			return host
+		}
+	}
+	if endpoint := normalizeMetricLabel(provider.id); endpoint != "" {
 		return endpoint
 	}
 	return string(provider.kind)
@@ -452,6 +481,136 @@ func providerHealthEndpoint(provider *providerRuntime) string {
 
 func normalizeMetricLabel(value string) string {
 	return strings.TrimSpace(value)
+}
+
+func normalizeKnownMetricModelLabel(value string) string {
+	value = normalizeMetricLabel(value)
+	if value == "" {
+		return metricsPublicModelUnresolved
+	}
+	return value
+}
+
+var errExpectedJSONObject = errors.New("expected JSON object")
+
+func parseOpenAIResponseMetadata(r io.Reader) (string, *models.OpenAIUsage, error) {
+	var (
+		model string
+		usage *models.OpenAIUsage
+	)
+
+	dec := json.NewDecoder(r)
+	tok, err := dec.Token()
+	if err != nil {
+		return "", nil, err
+	}
+
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
+		return "", nil, errExpectedJSONObject
+	}
+
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return "", nil, err
+		}
+
+		key, ok := keyToken.(string)
+		if !ok {
+			return "", nil, errExpectedJSONObject
+		}
+
+		switch key {
+		case "model":
+			raw, err := decodeJSONRawValue(dec)
+			if err != nil {
+				return "", nil, err
+			}
+			_ = json.Unmarshal(raw, &model)
+			model = strings.TrimSpace(model)
+		case "usage":
+			raw, err := decodeJSONRawValue(dec)
+			if err != nil {
+				return "", nil, err
+			}
+			_ = json.Unmarshal(raw, &usage)
+		default:
+			if err := skipJSONValue(dec); err != nil {
+				return "", nil, err
+			}
+		}
+	}
+
+	if _, err := dec.Token(); err != nil {
+		return "", nil, err
+	}
+
+	return model, usage, nil
+}
+
+func parseResponsesResponseMetadata(r io.Reader) (string, *responsesUsage, error) {
+	var (
+		model string
+		usage *responsesUsage
+	)
+
+	dec := json.NewDecoder(r)
+	tok, err := dec.Token()
+	if err != nil {
+		return "", nil, err
+	}
+
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
+		return "", nil, errExpectedJSONObject
+	}
+
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return "", nil, err
+		}
+
+		key, ok := keyToken.(string)
+		if !ok {
+			return "", nil, errExpectedJSONObject
+		}
+
+		switch key {
+		case "model":
+			raw, err := decodeJSONRawValue(dec)
+			if err != nil {
+				return "", nil, err
+			}
+			_ = json.Unmarshal(raw, &model)
+			model = strings.TrimSpace(model)
+		case "usage":
+			raw, err := decodeJSONRawValue(dec)
+			if err != nil {
+				return "", nil, err
+			}
+			_ = json.Unmarshal(raw, &usage)
+		default:
+			if err := skipJSONValue(dec); err != nil {
+				return "", nil, err
+			}
+		}
+	}
+
+	if _, err := dec.Token(); err != nil {
+		return "", nil, err
+	}
+
+	return model, usage, nil
+}
+
+func decodeJSONRawValue(dec *json.Decoder) (json.RawMessage, error) {
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
 }
 
 func requestStatusLabel(statusCode int) string {

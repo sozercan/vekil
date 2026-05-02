@@ -1012,6 +1012,54 @@ func TestHandleCompact(t *testing.T) {
 	}
 }
 
+func TestHandleCompact_RecordsUsageMetrics(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/responses" {
+			t.Fatalf("upstream path = %q, want /responses", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","model":"gpt-5.4","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"compacted summary of conversation"}]}],"usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13}}`))
+	}))
+	defer backend.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		withCopilotBaseURLForTest(backend.URL),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"gpt-5.4","input":"Hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("HandleCompact status = %d, want 200", w.Code)
+	}
+
+	body := scrapeMetrics(t, handler)
+	requireMetricSample(t, body, "vekil_requests_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": metricsPublicModelUnresolved,
+		"endpoint":     "/v1/responses/compact",
+		"status":       "200",
+	}, 1)
+	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": metricsPublicModelUnresolved,
+		"direction":    "prompt",
+	}, 9)
+	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": metricsPublicModelUnresolved,
+		"direction":    "completion",
+	}, 4)
+}
+
 func TestHandleCompact_LargeBodyAllowed(t *testing.T) {
 	var upstreamHits atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {

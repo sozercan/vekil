@@ -177,7 +177,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	upstreamCtx = obs.withContext(upstreamCtx)
 	defer upstreamCancel()
 
-	summaryText, resp, err := h.compactResponsesRequest(upstreamCtx, body, responsesExtraHeadersFromRequest(r))
+	result, resp, err := h.compactResponsesRequest(upstreamCtx, body, responsesExtraHeadersFromRequest(r))
 	if err != nil {
 		statusCode = upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "compact"), logger.Err(err))
@@ -202,7 +202,8 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeCompactResponse(w, summaryText)
+	obs.observeResponsesUsage(result.usage)
+	writeCompactResponse(w, result.summary)
 	statusCode = http.StatusOK
 }
 
@@ -417,46 +418,55 @@ func writeCompactResponse(w http.ResponseWriter, summaryText string) {
 	_ = json.NewEncoder(w).Encode(compactResp)
 }
 
-func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header) (string, *http.Response, error) {
+type compactResponsesResult struct {
+	summary string
+	usage   *responsesUsage
+}
+
+func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header) (compactResponsesResult, *http.Response, error) {
 	return h.compactResponsesRequestDepth(ctx, requestFields, extraHeaders, 0)
 }
 
-func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int) (string, *http.Response, error) {
+func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int) (compactResponsesResult, *http.Response, error) {
 	if depth > 8 {
-		return "", nil, fmt.Errorf("compaction chunk recursion limit exceeded")
+		return compactResponsesResult{}, nil, fmt.Errorf("compaction chunk recursion limit exceeded")
 	}
 
 	bodyBytes, err := marshalCompactResponsesRequest(requestFields, nil)
 	if err != nil {
-		return "", nil, err
+		return compactResponsesResult{}, nil, err
 	}
 
 	resp, err := h.postResponsesWithFallbackHeaders(ctx, bodyBytes, extraHeaders)
 	if err != nil {
-		return "", nil, err
+		return compactResponsesResult{}, nil, err
 	}
 
 	if resp.StatusCode == http.StatusOK {
 		defer func() { _ = resp.Body.Close() }()
 		respBody, err := io.ReadAll(resp.Body)
 		if err != nil {
-			return "", nil, err
+			return compactResponsesResult{}, nil, err
 		}
 		summary, err := extractResponsesOutputText(respBody)
 		if err != nil {
-			return "", nil, err
+			return compactResponsesResult{}, nil, err
 		}
-		return summary, nil, nil
+		_, usage, _ := parseResponsesResponseMetadata(bytes.NewReader(respBody))
+		return compactResponsesResult{
+			summary: summary,
+			usage:   usage,
+		}, nil, nil
 	}
 
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
-		return "", resp, nil
+		return compactResponsesResult{}, resp, nil
 	}
 
 	respBody, truncated, readErr := readBodyWithCap(resp.Body, compactUpstreamErrorBodySize)
 	_ = resp.Body.Close()
 	if readErr != nil {
-		return "", nil, readErr
+		return compactResponsesResult{}, nil, readErr
 	}
 	originalResp := cloneHTTPResponseWithBody(resp, respBody)
 	if truncated {
@@ -466,12 +476,12 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 		)
 	}
 
-	summary, err := h.compactResponsesRequestInChunks(ctx, requestFields, extraHeaders, depth+1)
+	result, err := h.compactResponsesRequestInChunks(ctx, requestFields, extraHeaders, depth+1)
 	if err != nil {
 		h.log.Debug("chunked compact request failed", logger.Err(err))
-		return "", originalResp, nil
+		return compactResponsesResult{}, originalResp, nil
 	}
-	return summary, nil, nil
+	return result, nil, nil
 }
 
 func marshalCompactResponsesRequest(requestFields map[string]json.RawMessage, input []json.RawMessage) ([]byte, error) {
@@ -511,6 +521,25 @@ func cloneHTTPResponseWithBody(resp *http.Response, body []byte) *http.Response 
 	return cloned
 }
 
+func addResponsesUsage(total, next *responsesUsage) *responsesUsage {
+	if next == nil {
+		return total
+	}
+
+	if total == nil {
+		copy := *next
+		if copy.TotalTokens == 0 {
+			copy.TotalTokens = copy.InputTokens + copy.OutputTokens
+		}
+		return &copy
+	}
+
+	total.InputTokens += next.InputTokens
+	total.OutputTokens += next.OutputTokens
+	total.TotalTokens = total.InputTokens + total.OutputTokens
+	return total
+}
+
 func readBodyWithCap(r io.Reader, maxBytes int) ([]byte, bool, error) {
 	if maxBytes < 0 {
 		return nil, false, fmt.Errorf("invalid body cap %d", maxBytes)
@@ -525,21 +554,21 @@ func readBodyWithCap(r io.Reader, maxBytes int) ([]byte, bool, error) {
 	return body, false, nil
 }
 
-func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int) (string, error) {
+func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int) (compactResponsesResult, error) {
 	var input []json.RawMessage
 	if err := json.Unmarshal(requestFields["input"], &input); err != nil {
-		return "", err
+		return compactResponsesResult{}, err
 	}
 	if len(input) < 2 {
-		return "", fmt.Errorf("compact request input cannot be split")
+		return compactResponsesResult{}, fmt.Errorf("compact request input cannot be split")
 	}
 
 	chunks, err := splitCompactInputByBodySize(requestFields, input, compactUpstreamChunkBodySize)
 	if err != nil {
-		return "", err
+		return compactResponsesResult{}, err
 	}
 	if len(chunks) < 2 {
-		return "", fmt.Errorf("compact request input cannot be split below upstream payload limit")
+		return compactResponsesResult{}, fmt.Errorf("compact request input cannot be split below upstream payload limit")
 	}
 
 	h.log.Info("retrying compact request with chunked history after 413",
@@ -549,21 +578,28 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 	)
 
 	summaries := make([]string, 0, len(chunks))
+	var totalUsage *responsesUsage
 	for i, chunk := range chunks {
 		chunkFields := copyResponsesRequestFieldsWithInput(requestFields, chunk)
-		summary, resp, err := h.compactResponsesRequestDepth(ctx, chunkFields, extraHeaders, depth)
+		result, resp, err := h.compactResponsesRequestDepth(ctx, chunkFields, extraHeaders, depth)
 		if err != nil {
-			return "", err
+			return compactResponsesResult{}, err
 		}
 		if resp != nil {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, compactUpstreamErrorBodySize))
 			_ = resp.Body.Close()
-			return "", fmt.Errorf("compact chunk %d returned %d: %s", i+1, resp.StatusCode, strings.TrimSpace(string(body)))
+			return compactResponsesResult{}, fmt.Errorf("compact chunk %d returned %d: %s", i+1, resp.StatusCode, strings.TrimSpace(string(body)))
 		}
-		summaries = append(summaries, summary)
+		summaries = append(summaries, result.summary)
+		totalUsage = addResponsesUsage(totalUsage, result.usage)
 	}
 
-	return h.mergeCompactionSummaries(ctx, requestFields, summaries, extraHeaders, depth)
+	merged, err := h.mergeCompactionSummaries(ctx, requestFields, summaries, extraHeaders, depth)
+	if err != nil {
+		return compactResponsesResult{}, err
+	}
+	merged.usage = addResponsesUsage(totalUsage, merged.usage)
+	return merged, nil
 }
 
 func copyResponsesRequestFieldsWithInput(requestFields map[string]json.RawMessage, input []json.RawMessage) map[string]json.RawMessage {
@@ -630,12 +666,12 @@ func encodedRawMessageSize(raw json.RawMessage) (int, error) {
 	return len(encoded), nil
 }
 
-func (h *ProxyHandler) mergeCompactionSummaries(ctx context.Context, requestFields map[string]json.RawMessage, summaries []string, extraHeaders http.Header, depth int) (string, error) {
+func (h *ProxyHandler) mergeCompactionSummaries(ctx context.Context, requestFields map[string]json.RawMessage, summaries []string, extraHeaders http.Header, depth int) (compactResponsesResult, error) {
 	switch len(summaries) {
 	case 0:
-		return "", nil
+		return compactResponsesResult{}, nil
 	case 1:
-		return summaries[0], nil
+		return compactResponsesResult{summary: summaries[0]}, nil
 	}
 
 	input := make([]json.RawMessage, 0, len(summaries))
@@ -651,22 +687,22 @@ func (h *ProxyHandler) mergeCompactionSummaries(ctx context.Context, requestFiel
 			},
 		})
 		if err != nil {
-			return "", err
+			return compactResponsesResult{}, err
 		}
 		input = append(input, json.RawMessage(message))
 	}
 
 	mergeFields := copyResponsesRequestFieldsWithInput(requestFields, input)
-	summary, resp, err := h.compactResponsesRequestDepth(ctx, mergeFields, extraHeaders, depth)
+	result, resp, err := h.compactResponsesRequestDepth(ctx, mergeFields, extraHeaders, depth)
 	if err != nil {
-		return "", err
+		return compactResponsesResult{}, err
 	}
 	if resp != nil {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, compactUpstreamErrorBodySize))
 		_ = resp.Body.Close()
-		return "", fmt.Errorf("compact summary merge returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return compactResponsesResult{}, fmt.Errorf("compact summary merge returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	return summary, nil
+	return result, nil
 }
 
 func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint string, injectResumePrompt bool) []byte {
@@ -970,7 +1006,7 @@ func (h *ProxyHandler) compactResponsesInput(ctx context.Context, model string, 
 		"model": modelRaw,
 		"input": inputRaw,
 	}
-	summary, resp, err := h.compactResponsesRequest(ctx, requestFields, extraHeaders)
+	result, resp, err := h.compactResponsesRequest(ctx, requestFields, extraHeaders)
 	if err != nil {
 		return "", err
 	}
@@ -979,7 +1015,7 @@ func (h *ProxyHandler) compactResponsesInput(ctx context.Context, model string, 
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, compactUpstreamErrorBodySize))
 		return "", fmt.Errorf("compaction request returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	return summary, nil
+	return result.summary, nil
 }
 
 func isUnsupportedResponsesModelError(statusCode int, body []byte) bool {

@@ -11,6 +11,8 @@ import (
 	"strings"
 )
 
+const upstreamPassthroughProbeSize = 32 << 10
+
 func (h *ProxyHandler) newInferenceUpstreamContext(streaming bool) (context.Context, context.CancelFunc) {
 	// Use background context with timeout to avoid cancellation from client
 	// disconnects while still preventing goroutine leaks on upstream hangs.
@@ -187,33 +189,81 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func readBufferedUpstreamResponse(resp *http.Response) ([]byte, error) {
+func writeUpstreamResponseAndObserve(w http.ResponseWriter, resp *http.Response, observe func(io.Reader)) error {
 	defer func() { _ = resp.Body.Close() }()
-	return io.ReadAll(resp.Body)
-}
 
-func writeBufferedUpstreamResponse(w http.ResponseWriter, resp *http.Response, body []byte) {
+	probe := make([]byte, upstreamPassthroughProbeSize)
+	n, readErr := resp.Body.Read(probe)
+	if n == 0 && readErr != nil && !errors.Is(readErr, io.EOF) {
+		return readErr
+	}
+
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(body)
+
+	writer := io.Writer(w)
+	var (
+		observerDone chan struct{}
+		observerPipe *io.PipeWriter
+	)
+	if observe != nil {
+		pr, pw := io.Pipe()
+		observerDone = make(chan struct{})
+		observerPipe = pw
+		go func() {
+			defer close(observerDone)
+			observe(pr)
+			_, _ = io.Copy(io.Discard, pr)
+			_ = pr.Close()
+		}()
+		writer = io.MultiWriter(w, pw)
+	}
+
+	closeObserver := func(copyErr error) {
+		if observerPipe == nil {
+			return
+		}
+		_ = observerPipe.CloseWithError(copyErr)
+		<-observerDone
+	}
+
+	if n > 0 {
+		if _, err := writer.Write(probe[:n]); err != nil {
+			closeObserver(err)
+			return nil
+		}
+	}
+
+	var copyErr error
+	switch {
+	case readErr == nil:
+		_, copyErr = io.Copy(writer, resp.Body)
+	case errors.Is(readErr, io.EOF):
+		copyErr = nil
+	default:
+		copyErr = readErr
+	}
+
+	closeObserver(copyErr)
+	return nil
 }
 
 func writeUpstreamResponseAndObserveOpenAIUsage(w http.ResponseWriter, resp *http.Response, obs *requestObservation) error {
-	body, err := readBufferedUpstreamResponse(resp)
-	if err != nil {
-		return err
+	var observe func(io.Reader)
+	if obs != nil {
+		observe = func(r io.Reader) {
+			obs.observeOpenAIUsageFromReader(r)
+		}
 	}
-	obs.observeOpenAIUsageFromBody(body)
-	writeBufferedUpstreamResponse(w, resp, body)
-	return nil
+	return writeUpstreamResponseAndObserve(w, resp, observe)
 }
 
 func writeUpstreamResponseAndObserveResponsesUsage(w http.ResponseWriter, resp *http.Response, obs *requestObservation) error {
-	body, err := readBufferedUpstreamResponse(resp)
-	if err != nil {
-		return err
+	var observe func(io.Reader)
+	if obs != nil {
+		observe = func(r io.Reader) {
+			obs.observeResponsesUsageFromReader(r)
+		}
 	}
-	obs.observeResponsesUsageFromBody(body)
-	writeBufferedUpstreamResponse(w, resp, body)
-	return nil
+	return writeUpstreamResponseAndObserve(w, resp, observe)
 }

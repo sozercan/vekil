@@ -14,7 +14,7 @@ Vekil supports two runtime patterns:
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
-| `--metrics` | `METRICS` | `true` | Expose Prometheus metrics at `/metrics` (disable with `--metrics=false`) |
+| `--metrics` | `METRICS` | `false` | Expose Prometheus metrics at `/metrics` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 
 ## Observability
@@ -30,7 +30,7 @@ Custom metrics include:
 - `vekil_retries_total{provider,public_model,reason}`
 - `vekil_upstream_errors_total{provider,public_model,code}`
 - `vekil_inflight_requests{provider}`
-- `vekil_endpoint_healthy{provider,endpoint}`
+- `vekil_endpoint_healthy{provider,endpoint}` (`endpoint` is a redacted upstream host label)
 - `vekil_build_info{version,go_version,commit}`
 
 `vekil_build_info` uses the same build metadata that `vekil --version` prints.
