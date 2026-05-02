@@ -1316,13 +1316,13 @@ func TestHandleCompact_ReturnsOriginal413WhenChunkedMergeFails(t *testing.T) {
 				t.Fatalf("expected first fallback chunk to have 1 item, got %d", len(input))
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"resp-chunk-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary of first item"}]}]}`))
+			_, _ = w.Write([]byte(`{"id":"resp-chunk-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary of first item"}]}],"usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13}}`))
 		case 3:
 			if len(input) != 1 {
 				t.Fatalf("expected second fallback chunk to have 1 item, got %d", len(input))
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"resp-chunk-2","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary of second item"}]}]}`))
+			_, _ = w.Write([]byte(`{"id":"resp-chunk-2","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary of second item"}]}],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}`))
 		case 4:
 			if len(input) != 2 {
 				t.Fatalf("expected merge request to contain 2 chunk summaries, got %d", len(input))
@@ -1334,6 +1334,7 @@ func TestHandleCompact_ReturnsOriginal413WhenChunkedMergeFails(t *testing.T) {
 			t.Fatalf("unexpected /responses request count %d", call)
 		}
 	})
+	handler.metrics = newProxyMetrics(DefaultBuildInfo())
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -1360,6 +1361,18 @@ func TestHandleCompact_ReturnsOriginal413WhenChunkedMergeFails(t *testing.T) {
 	if gotInputCounts[0] != 2 || gotInputCounts[1] != 1 || gotInputCounts[2] != 1 || gotInputCounts[3] != 2 {
 		t.Fatalf("unexpected upstream input counts: %v", gotInputCounts)
 	}
+
+	metricsBody := scrapeMetrics(t, handler)
+	requireMetricSample(t, metricsBody, "vekil_tokens_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": metricsPublicModelUnresolved,
+		"direction":    "prompt",
+	}, 16)
+	requireMetricSample(t, metricsBody, "vekil_tokens_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": metricsPublicModelUnresolved,
+		"direction":    "completion",
+	}, 7)
 }
 
 func TestHandleCompact_CapsOriginal413BodyWhenChunkedMergeFails(t *testing.T) {

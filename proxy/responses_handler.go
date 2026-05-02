@@ -193,6 +193,9 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if resp != nil {
+		// Chunked 413 fallback can consume upstream tokens before replaying the
+		// original failure response to the client.
+		obs.observeResponsesUsage(result.usage)
 		if err := writeUpstreamResponseAndObserveResponsesUsage(w, resp, obs); err != nil {
 			statusCode = http.StatusBadGateway
 			writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
@@ -479,7 +482,7 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 	result, err := h.compactResponsesRequestInChunks(ctx, requestFields, extraHeaders, depth+1)
 	if err != nil {
 		h.log.Debug("chunked compact request failed", logger.Err(err))
-		return compactResponsesResult{}, originalResp, nil
+		return compactResponsesResult{usage: result.usage}, originalResp, nil
 	}
 	return result, nil, nil
 }
@@ -582,23 +585,24 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 	for i, chunk := range chunks {
 		chunkFields := copyResponsesRequestFieldsWithInput(requestFields, chunk)
 		result, resp, err := h.compactResponsesRequestDepth(ctx, chunkFields, extraHeaders, depth)
+		partialUsage := addResponsesUsage(totalUsage, result.usage)
 		if err != nil {
-			return compactResponsesResult{}, err
+			return compactResponsesResult{usage: partialUsage}, err
 		}
 		if resp != nil {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, compactUpstreamErrorBodySize))
 			_ = resp.Body.Close()
-			return compactResponsesResult{}, fmt.Errorf("compact chunk %d returned %d: %s", i+1, resp.StatusCode, strings.TrimSpace(string(body)))
+			return compactResponsesResult{usage: partialUsage}, fmt.Errorf("compact chunk %d returned %d: %s", i+1, resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 		summaries = append(summaries, result.summary)
-		totalUsage = addResponsesUsage(totalUsage, result.usage)
+		totalUsage = partialUsage
 	}
 
 	merged, err := h.mergeCompactionSummaries(ctx, requestFields, summaries, extraHeaders, depth)
-	if err != nil {
-		return compactResponsesResult{}, err
-	}
 	merged.usage = addResponsesUsage(totalUsage, merged.usage)
+	if err != nil {
+		return merged, err
+	}
 	return merged, nil
 }
 
@@ -695,12 +699,12 @@ func (h *ProxyHandler) mergeCompactionSummaries(ctx context.Context, requestFiel
 	mergeFields := copyResponsesRequestFieldsWithInput(requestFields, input)
 	result, resp, err := h.compactResponsesRequestDepth(ctx, mergeFields, extraHeaders, depth)
 	if err != nil {
-		return compactResponsesResult{}, err
+		return result, err
 	}
 	if resp != nil {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, compactUpstreamErrorBodySize))
 		_ = resp.Body.Close()
-		return compactResponsesResult{}, fmt.Errorf("compact summary merge returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return result, fmt.Errorf("compact summary merge returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return result, nil
 }
