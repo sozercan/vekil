@@ -3,6 +3,7 @@ package proxy
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +21,81 @@ func scrapeMetrics(t *testing.T, handler *ProxyHandler) string {
 		t.Fatalf("GET /metrics status = %d, want 200", w.Code)
 	}
 	return w.Body.String()
+}
+
+func requireMetricSample(t *testing.T, body, name string, labels map[string]string, wantValue float64) {
+	t.Helper()
+	if hasMetricSample(body, name, labels, wantValue) {
+		return
+	}
+	t.Fatalf("metrics output missing %s%v %v:\n%s", name, labels, wantValue, body)
+}
+
+func hasMetricSample(body, name string, wantLabels map[string]string, wantValue float64) bool {
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		gotName, gotLabels, gotValue, ok := parseMetricSampleLine(line)
+		if !ok || gotName != name || len(gotLabels) != len(wantLabels) {
+			continue
+		}
+
+		match := true
+		for key, want := range wantLabels {
+			if gotLabels[key] != want {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+
+		value, err := strconv.ParseFloat(gotValue, 64)
+		if err != nil {
+			continue
+		}
+		if value == wantValue {
+			return true
+		}
+	}
+
+	return false
+}
+
+func parseMetricSampleLine(line string) (string, map[string]string, string, bool) {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return "", nil, "", false
+	}
+
+	nameAndLabels := fields[0]
+	open := strings.IndexByte(nameAndLabels, '{')
+	close := strings.LastIndexByte(nameAndLabels, '}')
+	if open < 0 || close < open {
+		return "", nil, "", false
+	}
+
+	labels := map[string]string{}
+	if labelText := nameAndLabels[open+1 : close]; labelText != "" {
+		for _, entry := range strings.Split(labelText, ",") {
+			key, rawValue, ok := strings.Cut(entry, "=")
+			if !ok {
+				return "", nil, "", false
+			}
+
+			value, err := strconv.Unquote(rawValue)
+			if err != nil {
+				return "", nil, "", false
+			}
+			labels[key] = value
+		}
+	}
+
+	return nameAndLabels[:open], labels, fields[1], true
 }
 
 func TestMetrics_HandleOpenAIChatCompletions(t *testing.T) {
@@ -54,16 +130,27 @@ func TestMetrics_HandleOpenAIChatCompletions(t *testing.T) {
 
 	body := scrapeMetrics(t, handler)
 
-	for _, want := range []string{
-		`vekil_requests_total{provider="copilot",public_model="gpt-4",endpoint="/v1/chat/completions",status="200"} 1`,
-		`vekil_tokens_total{provider="copilot",public_model="gpt-4",direction="prompt"} 11`,
-		`vekil_tokens_total{provider="copilot",public_model="gpt-4",direction="completion"} 7`,
-		`vekil_inflight_requests{provider="copilot"} 0`,
-		`vekil_build_info{`,
-	} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("metrics output missing %q:\n%s", want, body)
-		}
+	requireMetricSample(t, body, "vekil_requests_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": "gpt-4",
+		"endpoint":     "/v1/chat/completions",
+		"status":       "200",
+	}, 1)
+	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": "gpt-4",
+		"direction":    "prompt",
+	}, 11)
+	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": "gpt-4",
+		"direction":    "completion",
+	}, 7)
+	requireMetricSample(t, body, "vekil_inflight_requests", map[string]string{
+		"provider": "copilot",
+	}, 0)
+	if !strings.Contains(body, `vekil_build_info{`) {
+		t.Fatalf("metrics output missing %q:\n%s", `vekil_build_info{`, body)
 	}
 }
 
@@ -97,15 +184,22 @@ func TestMetrics_HandleResponses(t *testing.T) {
 	}
 
 	body := scrapeMetrics(t, handler)
-	for _, want := range []string{
-		`vekil_requests_total{provider="copilot",public_model="gpt-4",endpoint="/v1/responses",status="200"} 1`,
-		`vekil_tokens_total{provider="copilot",public_model="gpt-4",direction="prompt"} 9`,
-		`vekil_tokens_total{provider="copilot",public_model="gpt-4",direction="completion"} 4`,
-	} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("metrics output missing %q:\n%s", want, body)
-		}
-	}
+	requireMetricSample(t, body, "vekil_requests_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": "gpt-4",
+		"endpoint":     "/v1/responses",
+		"status":       "200",
+	}, 1)
+	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": "gpt-4",
+		"direction":    "prompt",
+	}, 9)
+	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": "gpt-4",
+		"direction":    "completion",
+	}, 4)
 }
 
 func TestMetrics_HandleAnthropicMessages(t *testing.T) {
@@ -145,13 +239,20 @@ func TestMetrics_HandleAnthropicMessages(t *testing.T) {
 	}
 
 	body := scrapeMetrics(t, handler)
-	for _, want := range []string{
-		`vekil_requests_total{provider="copilot",public_model="claude-sonnet-4.5",endpoint="/v1/messages",status="200"} 1`,
-		`vekil_tokens_total{provider="copilot",public_model="claude-sonnet-4.5",direction="prompt"} 4`,
-		`vekil_tokens_total{provider="copilot",public_model="claude-sonnet-4.5",direction="completion"} 2`,
-	} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("metrics output missing %q:\n%s", want, body)
-		}
-	}
+	requireMetricSample(t, body, "vekil_requests_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": "claude-sonnet-4.5",
+		"endpoint":     "/v1/messages",
+		"status":       "200",
+	}, 1)
+	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": "claude-sonnet-4.5",
+		"direction":    "prompt",
+	}, 4)
+	requireMetricSample(t, body, "vekil_tokens_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": "claude-sonnet-4.5",
+		"direction":    "completion",
+	}, 2)
 }
