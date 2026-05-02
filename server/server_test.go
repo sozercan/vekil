@@ -99,7 +99,7 @@ func TestNew_DerivesWriteTimeoutFromConfiguredProxyHandler(t *testing.T) {
 	}
 }
 
-func TestNew_DoesNotExposeMetricsRouteByDefault(t *testing.T) {
+func TestNew_ExposesMetricsRouteByDefault(t *testing.T) {
 	srv, err := New(
 		auth.NewTestAuthenticator("test-token"),
 		logger.New(logger.ParseLevel("error")),
@@ -114,12 +114,37 @@ func TestNew_DoesNotExposeMetricsRouteByDefault(t *testing.T) {
 	w := httptest.NewRecorder()
 	srv.httpServer.Handler.ServeHTTP(w, req)
 
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /metrics status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "vekil_build_info") {
+		t.Fatalf("metrics output missing vekil_build_info:\n%s", body)
+	}
+}
+
+func TestNew_DoesNotExposeMetricsRouteWhenDisabled(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+		WithMetricsEnabled(false),
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("GET /metrics status = %d, want 404", w.Code)
 	}
 }
 
-func TestNew_ExposesMetricsRouteWhenConfigured(t *testing.T) {
+func TestNew_ExposesMetricsRouteWhenExplicitlyEnabled(t *testing.T) {
 	srv, err := New(
 		auth.NewTestAuthenticator("test-token"),
 		logger.New(logger.ParseLevel("error")),

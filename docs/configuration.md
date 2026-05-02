@@ -14,12 +14,12 @@ Vekil supports two runtime patterns:
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
-| `--metrics` | `METRICS` | `false` | Expose Prometheus metrics at `/metrics` |
+| `--metrics` | `METRICS` | `true` | Expose Prometheus metrics at `/metrics` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 
 ## Observability
 
-When `--metrics` is enabled, Vekil exposes Prometheus text exposition on `GET /metrics` from the same listener as the proxy API.
+By default, Vekil exposes Prometheus text exposition on `GET /metrics` from the same listener as the proxy API. Disable it with `--metrics=false` or `METRICS=false`.
 
 Custom metrics include:
 
@@ -32,6 +32,8 @@ Custom metrics include:
 - `vekil_inflight_requests{provider}`
 - `vekil_endpoint_healthy{provider,endpoint}` (`endpoint` is a redacted upstream host label)
 - `vekil_build_info{version,go_version,commit}`
+
+To keep labels bounded and non-sensitive, unresolved request models use `public_model="unresolved"` instead of the raw requested model string, and `vekil_endpoint_healthy` exposes only a redacted upstream host label.
 
 `vekil_build_info` uses the same build metadata that `vekil --version` prints.
 

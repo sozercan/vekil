@@ -68,7 +68,7 @@ func WithBuildInfo(info proxy.BuildInfo) Option {
 
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
-	cfg := options{metricsEnabled: false}
+	cfg := options{metricsEnabled: true}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
