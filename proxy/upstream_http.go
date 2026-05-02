@@ -186,3 +186,34 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }
+
+func readBufferedUpstreamResponse(resp *http.Response) ([]byte, error) {
+	defer func() { _ = resp.Body.Close() }()
+	return io.ReadAll(resp.Body)
+}
+
+func writeBufferedUpstreamResponse(w http.ResponseWriter, resp *http.Response, body []byte) {
+	copyPassthroughHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(body)
+}
+
+func writeUpstreamResponseAndObserveOpenAIUsage(w http.ResponseWriter, resp *http.Response, obs *requestObservation) error {
+	body, err := readBufferedUpstreamResponse(resp)
+	if err != nil {
+		return err
+	}
+	obs.observeOpenAIUsageFromBody(body)
+	writeBufferedUpstreamResponse(w, resp, body)
+	return nil
+}
+
+func writeUpstreamResponseAndObserveResponsesUsage(w http.ResponseWriter, resp *http.Response, obs *requestObservation) error {
+	body, err := readBufferedUpstreamResponse(resp)
+	if err != nil {
+		return err
+	}
+	obs.observeResponsesUsageFromBody(body)
+	writeBufferedUpstreamResponse(w, resp, body)
+	return nil
+}

@@ -141,6 +141,16 @@ func TestCommandFromArgs(t *testing.T) {
 			want: cliCommandLogout,
 		},
 		{
+			name: "version subcommand dispatches",
+			args: []string{"vekil", "version"},
+			want: cliCommandVersion,
+		},
+		{
+			name: "version flag dispatches",
+			args: []string{"vekil", "--version"},
+			want: cliCommandVersion,
+		},
+		{
 			name: "unknown subcommand falls back to serve",
 			args: []string{"vekil", "serve"},
 			want: cliCommandServe,

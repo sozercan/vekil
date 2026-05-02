@@ -44,7 +44,12 @@ func writeGeminiSSEData(w http.ResponseWriter, data interface{}) error {
 // StreamOpenAIToGemini translates upstream OpenAI SSE into Gemini-style
 // data-only SSE frames.
 func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
+	streamOpenAIToGeminiObserved(w, body, nil)
+}
+
+func streamOpenAIToGeminiObserved(w http.ResponseWriter, body io.ReadCloser, obs *requestObservation) {
 	defer func() { _ = body.Close() }()
+	w = wrapFirstByteResponseWriter(w, obs)
 	setSSEHeaders(w)
 
 	state := newGeminiStreamState(w)
@@ -54,6 +59,9 @@ func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
 	}
 
 	_ = state.finish()
+	if obs != nil {
+		obs.observeOpenAIUsage(state.storedUsage)
+	}
 }
 
 type geminiStreamState struct {

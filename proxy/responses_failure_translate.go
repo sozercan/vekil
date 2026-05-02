@@ -161,10 +161,18 @@ func (s *responsesPreparedStream) abort() {
 }
 
 func peekAndForwardResponses(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string) {
-	peekAndForwardResponsesWithConfig(h, w, r, resp, upstreamCancel, model, responsesPrecommitPeekTimeout, responsesPrecommitMaxPeekBytes)
+	_ = peekAndForwardResponsesObserved(h, w, r, resp, upstreamCancel, model, nil)
+}
+
+func peekAndForwardResponsesObserved(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, obs *requestObservation) int {
+	return peekAndForwardResponsesWithConfigObserved(h, w, r, resp, upstreamCancel, model, obs, responsesPrecommitPeekTimeout, responsesPrecommitMaxPeekBytes)
 }
 
 func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, peekTimeout time.Duration, maxPeekBytes int) {
+	_ = peekAndForwardResponsesWithConfigObserved(h, w, r, resp, upstreamCancel, model, nil, peekTimeout, maxPeekBytes)
+}
+
+func peekAndForwardResponsesWithConfigObserved(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, obs *requestObservation, peekTimeout time.Duration, maxPeekBytes int) int {
 	if upstreamCancel != nil {
 		defer upstreamCancel()
 	}
@@ -173,13 +181,16 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 	result, hasResult, err := prepared.await(r.Context(), nil, peekTimeout)
 	if err != nil {
 		prepared.abort()
-		return
+		return 0
 	}
 	if hasResult && result.decision == responsesPeekDecisionTranslate {
 		logResponsesPrecommitTranslated(h, result, model, resp.Header)
 		prepared.abort()
+		if obs != nil && result.failure != nil {
+			obs.observeUpstreamError(responsesStreamErrorMetricCode(*result.failure))
+		}
 		writeOpenAIErrorWithRetryAfter(w, result.status, result.message, result.errType, result.retryAfter, resp.Header)
-		return
+		return result.status
 	}
 	if hasResult && result.failure != nil && result.decision == responsesPeekDecisionPassthrough {
 		logResponsesPrecommitFailOpen(h, result.failure, model, resp.Header)
@@ -188,7 +199,8 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 	resp = prepared.commitResponse()
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(http.StatusOK)
-	streamResponsesPipeWithFailureLog(h, w, resp.Body, resp.Header)
+	streamResponsesPipeWithFailureLog(h, wrapFirstByteResponseWriter(w, obs), resp.Body, resp.Header, obs)
+	return http.StatusOK
 }
 
 func prepareResponsesStreamAttempt(waitCtx, streamCtx context.Context, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
@@ -452,7 +464,7 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 	return "", ""
 }
 
-func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header) {
+func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header, obs *requestObservation) {
 	if closer, ok := r.(io.Closer); ok {
 		defer func() { _ = closer.Close() }()
 	}
@@ -462,7 +474,7 @@ func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r
 		fw.flusher = f
 	}
 
-	tap := newResponsesFailureTap(h, upstreamHeaders)
+	tap := newResponsesFailureTap(h, upstreamHeaders, obs)
 	_, _ = io.Copy(fw, io.TeeReader(r, tap))
 }
 
@@ -639,13 +651,15 @@ type responsesFailureTap struct {
 	h               *ProxyHandler
 	upstreamHeaders http.Header
 	parser          responsesSSEParser
+	observer        *requestObservation
 }
 
-func newResponsesFailureTap(h *ProxyHandler, upstreamHeaders http.Header) *responsesFailureTap {
+func newResponsesFailureTap(h *ProxyHandler, upstreamHeaders http.Header, obs *requestObservation) *responsesFailureTap {
 	return &responsesFailureTap{
 		h:               h,
 		upstreamHeaders: upstreamHeaders,
 		parser:          responsesSSEParser{allowBOM: true},
+		observer:        obs,
 	}
 }
 
@@ -667,7 +681,7 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 
 func (t *responsesFailureTap) maybeLog(msg responsesSSEMessage) {
 	eventName := strings.TrimSpace(msg.event)
-	if eventName != "response.failed" && eventName != "response.incomplete" && eventName != "" {
+	if eventName != "response.failed" && eventName != "response.incomplete" && eventName != "response.completed" && eventName != "" {
 		return
 	}
 
@@ -680,8 +694,18 @@ func (t *responsesFailureTap) maybeLog(msg responsesSSEMessage) {
 	if eventName == "" {
 		eventName = eventType
 	}
+	if eventName == "response.completed" {
+		if t.observer != nil {
+			t.observer.observeResponsesUsage(event.Response.Usage)
+		}
+		return
+	}
+
 	if eventName != "response.failed" && eventName != "response.incomplete" {
 		return
+	}
+	if t.observer != nil {
+		t.observer.observeUpstreamError(responsesStreamErrorMetricCode(event))
 	}
 
 	fields := []logger.Field{

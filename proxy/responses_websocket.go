@@ -35,6 +35,14 @@ var responsesWebSocketUpgrader = websocket.Upgrader{
 	},
 }
 
+type responsesWebSocketStreamErrorStatus struct {
+	status int
+}
+
+func (e *responsesWebSocketStreamErrorStatus) Error() string {
+	return errStreamFailedUpstream.Error()
+}
+
 type responsesWebSocketCreateRequest struct {
 	Type               string            `json:"type"`
 	Model              string            `json:"model"`
@@ -55,6 +63,7 @@ type responsesWebSocketStreamEvent struct {
 	Type     string `json:"type"`
 	Response struct {
 		ID                string                                    `json:"id"`
+		Usage             *responsesUsage                           `json:"usage,omitempty"`
 		Error             responsesWebSocketStreamError             `json:"error"`
 		IncompleteDetails responsesWebSocketStreamIncompleteDetails `json:"incomplete_details"`
 	} `json:"response,omitempty"`
@@ -263,8 +272,16 @@ func (r *responsesWebSocketCreateRequest) upstreamBody(inputSegments ...[]json.R
 }
 
 func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) error {
+	obs := h.newRequestObservation(metricsEndpointResponsesWebSocket)
+	obs.bindProxyRequest(h, request.Model, "/responses")
+	statusCode := http.StatusOK
+	defer func() {
+		obs.finish(statusCode)
+	}()
+
 	plan, err := s.planRequest(h, request)
 	if err != nil {
+		statusCode = http.StatusBadRequest
 		s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
 		return err
 	}
@@ -280,6 +297,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 				"id": responseID,
 			},
 		}); err != nil {
+			statusCode = http.StatusBadGateway
 			return err
 		}
 		return s.writeJSON(map[string]interface{}{
@@ -292,6 +310,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	}
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
+	upstreamCtx = obs.withContext(upstreamCtx)
 	defer upstreamCancel()
 
 	resp, translated, translatedHeaders, err := h.prepareResponsesStream(s.ctx, upstreamCtx, request.Model, func() (*http.Response, error) {
@@ -305,18 +324,22 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return attemptResp, err
 	})
 	if err != nil {
-		s.sendWrappedError(upstreamStatusCode(err, http.StatusBadGateway), fmt.Sprintf("upstream request failed: %v", err), "server_error", nil)
+		statusCode = upstreamStatusCode(err, http.StatusBadGateway)
+		s.sendWrappedError(statusCode, fmt.Sprintf("upstream request failed: %v", err), "server_error", nil)
 		return err
 	}
 	if translated != nil {
+		statusCode = translated.status
 		code := ""
 		if translated.failure != nil {
 			code = strings.TrimSpace(translated.failure.Response.Error.Code)
+			obs.observeUpstreamError(responsesStreamErrorMetricCode(*translated.failure))
 		}
 		s.sendWrappedError(translated.status, translated.message, code, translatedHeaders)
 		return nil
 	}
 	if resp == nil {
+		statusCode = http.StatusBadGateway
 		s.sendWrappedError(http.StatusBadGateway, "upstream request failed", "server_error", nil)
 		return fmt.Errorf("upstream websocket bridge returned no response")
 	}
@@ -325,6 +348,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	s.updateTurnState(resp.Header)
 
 	if resp.StatusCode != http.StatusOK {
+		statusCode = resp.StatusCode
 		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		if readErr != nil {
 			respBody = nil
@@ -334,15 +358,22 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return fmt.Errorf("upstream websocket bridge status %d", resp.StatusCode)
 	}
 
-	responseID, outputItems, err := s.streamUpstreamResponse(resp.Body, resp.Header)
+	responseID, outputItems, streamStatus, err := s.streamUpstreamResponse(resp.Body, resp.Header, obs)
 	if err != nil {
 		if errors.Is(err, errStreamFailedUpstream) {
+			if streamStatus > 0 {
+				statusCode = streamStatus
+			} else {
+				statusCode = http.StatusBadGateway
+			}
 			return nil
 		}
+		statusCode = http.StatusBadGateway
 		s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil)
 		return err
 	}
 
+	statusCode = http.StatusOK
 	s.rememberResponse(plan.resetHistory, responseID, plan.signature, plan.currentInput, outputItems)
 	metrics = s.maybeAutoCompactHistory(h, request, metrics)
 	s.logRequestMetrics(h, request, responseID, metrics)
@@ -595,7 +626,7 @@ func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *
 	)
 }
 
-func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, headers http.Header) (string, []json.RawMessage, error) {
+func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, headers http.Header, obs *requestObservation) (string, []json.RawMessage, int, error) {
 	// Emit a synthetic metadata event so WebSocket clients can discover the
 	// actual model used. The Codex CLI parses openai-model from
 	// codex.response.metadata frames via response_model().
@@ -623,7 +654,10 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, heade
 			if parsedEvent && event.Type == "response.failed" {
 				if status, _, ok := classifyPrecommitResponsesFailure(event); ok {
 					s.sendWrappedError(status, responsesPrecommitErrorMessage(event, status), strings.TrimSpace(event.Response.Error.Code), headers)
-					return errStreamFailedUpstream
+					if obs != nil {
+						obs.observeUpstreamError(responsesStreamErrorMetricCode(event))
+					}
+					return &responsesWebSocketStreamErrorStatus{status: status}
 				}
 			}
 		}
@@ -646,33 +680,42 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, heade
 				outputItems = append(outputItems, cloneRawMessage(event.Item))
 			}
 		case "response.completed":
+			if obs != nil {
+				obs.observeResponsesUsage(event.Response.Usage)
+			}
 			sawCompleted = true
 			if event.Response.ID != "" {
 				responseID = event.Response.ID
 			}
 		case "response.failed", "response.incomplete":
+			status, _, _ := responsesWebSocketStreamFailureDetails(event)
+			if obs != nil {
+				obs.observeUpstreamError(responsesStreamErrorMetricCode(event))
+			}
 			s.sendUpstreamStreamFailure(event, headers)
 			// Return the sentinel immediately to break out of the SSE
 			// scanner loop. The failure event has already been forwarded to
 			// the client above, and we also emit a standard error payload so
 			// websocket clients can surface the upstream error details.
-			return errStreamFailedUpstream
+			return &responsesWebSocketStreamErrorStatus{status: status}
 		}
 
 		return nil
-	}); err != nil && !errors.Is(err, errStreamFailedUpstream) {
-		return "", nil, err
-	} else if errors.Is(err, errStreamFailedUpstream) {
-		return "", nil, errStreamFailedUpstream
+	}); err != nil {
+		var streamErrStatus *responsesWebSocketStreamErrorStatus
+		if errors.As(err, &streamErrStatus) {
+			return "", nil, streamErrStatus.status, errStreamFailedUpstream
+		}
+		return "", nil, 0, err
 	}
 
 	if sawCompleted {
 		if responseID == "" {
-			return "", nil, fmt.Errorf("response.completed missing response id")
+			return "", nil, 0, fmt.Errorf("response.completed missing response id")
 		}
-		return responseID, outputItems, nil
+		return responseID, outputItems, http.StatusOK, nil
 	}
-	return "", nil, fmt.Errorf("stream ended before response.completed")
+	return "", nil, 0, fmt.Errorf("stream ended before response.completed")
 }
 
 func (s *responsesWebSocketSession) writeJSON(payload interface{}) error {

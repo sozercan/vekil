@@ -7,7 +7,10 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,6 +27,12 @@ const (
 	cliCommandServe cliCommand = iota
 	cliCommandLogin
 	cliCommandLogout
+	cliCommandVersion
+)
+
+var (
+	buildVersion string
+	buildCommit  string
 )
 
 func main() {
@@ -34,6 +43,9 @@ func main() {
 		return
 	case cliCommandLogout:
 		runLogout(os.Args[2:])
+		return
+	case cliCommandVersion:
+		runVersion()
 		return
 	}
 
@@ -50,6 +62,8 @@ func commandFromArgs(args []string) cliCommand {
 		return cliCommandLogin
 	case "logout":
 		return cliCommandLogout
+	case "version", "--version", "-version":
+		return cliCommandVersion
 	default:
 		return cliCommandServe
 	}
@@ -216,6 +230,7 @@ func runServe() {
 	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
 	providersConfigPath := flag.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration")
 	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
+	metricsEnabled := flag.Bool("metrics", getEnvBool("METRICS", true), "Expose Prometheus metrics at /metrics")
 	streamingUpstreamTimeout := flag.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
 	copilotEditorVersion := flag.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header")
 	copilotPluginVersion := flag.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
@@ -254,6 +269,8 @@ func runServe() {
 		log,
 		*host,
 		*port,
+		server.WithMetricsEnabled(*metricsEnabled),
+		server.WithBuildInfo(currentBuildInfo()),
 		server.WithStreamingUpstreamTimeout(*streamingUpstreamTimeout),
 		server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
 			EditorVersion:       *copilotEditorVersion,
@@ -290,6 +307,45 @@ func runServe() {
 		log.Fatal("shutdown error", logger.Err(err))
 	}
 	log.Info("server stopped")
+}
+
+func currentBuildInfo() proxy.BuildInfo {
+	info := proxy.BuildInfo{
+		Version:   strings.TrimSpace(buildVersion),
+		GoVersion: runtime.Version(),
+		Commit:    strings.TrimSpace(buildCommit),
+	}
+
+	if buildInfo, ok := debug.ReadBuildInfo(); ok {
+		if info.Version == "" && buildInfo.Main.Version != "" && buildInfo.Main.Version != "(devel)" {
+			info.Version = buildInfo.Main.Version
+		}
+		if info.Commit == "" {
+			for _, setting := range buildInfo.Settings {
+				if setting.Key == "vcs.revision" && strings.TrimSpace(setting.Value) != "" {
+					info.Commit = setting.Value
+					break
+				}
+			}
+		}
+	}
+
+	if info.Version == "" {
+		info.Version = "dev"
+	}
+	if info.GoVersion == "" {
+		info.GoVersion = runtime.Version()
+	}
+	if info.Commit == "" {
+		info.Commit = "unknown"
+	}
+
+	return info
+}
+
+func runVersion() {
+	build := currentBuildInfo()
+	_, _ = fmt.Fprintf(os.Stdout, "vekil %s\ncommit %s\ngo %s\n", build.Version, build.Commit, build.GoVersion)
 }
 
 func getEnv(key, fallback string) string {

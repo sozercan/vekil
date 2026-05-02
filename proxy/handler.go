@@ -185,6 +185,7 @@ type ProxyHandler struct {
 	client                   *http.Client
 	copilotURL               string
 	copilotHeaders           CopilotHeaderConfig
+	buildInfo                BuildInfo
 	providersConfig          ProvidersConfig
 	providersState           *providerSetup
 	responsesWS              ResponsesWebSocketConfig
@@ -194,6 +195,7 @@ type ProxyHandler struct {
 	retryBaseDelay           time.Duration
 	models                   modelsCache
 	geminiCounts             geminiCountTokensCache
+	metrics                  *proxyMetrics
 }
 
 // Option customizes ProxyHandler behavior.
@@ -212,6 +214,14 @@ func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
 func WithProvidersConfig(cfg ProvidersConfig) Option {
 	return func(h *ProxyHandler) {
 		h.providersConfig = cfg
+	}
+}
+
+// WithBuildInfo overrides the build metadata exported via Prometheus and the
+// CLI version surface.
+func WithBuildInfo(info BuildInfo) Option {
+	return func(h *ProxyHandler) {
+		h.buildInfo = info.normalized()
 	}
 }
 
@@ -266,6 +276,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		},
 		copilotURL:               "https://api.githubcopilot.com",
 		copilotHeaders:           DefaultCopilotHeaderConfig(),
+		buildInfo:                DefaultBuildInfo(),
 		responsesWS:              DefaultResponsesWebSocketConfig(),
 		streamingUpstreamTimeout: streamingUpstreamTimeout,
 		log:                      log,
@@ -278,6 +289,8 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 	if err := h.initializeProviders(); err != nil {
 		return nil, err
 	}
+	h.metrics = newProxyMetrics(h.buildInfo)
+	h.metrics.initializeProviderHealth(h.providerSetup())
 	return h, nil
 }
 
@@ -413,6 +426,11 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ProxyHandler) checkProviderReady(ctx context.Context, provider *providerRuntime) error {
+	healthy := false
+	defer func() {
+		h.recordProviderHealth(provider, healthy)
+	}()
+
 	req, err := h.newProviderProbeRequest(ctx, provider)
 	if err != nil {
 		return err
@@ -433,6 +451,7 @@ func (h *ProxyHandler) checkProviderReady(ctx context.Context, provider *provide
 		return fmt.Errorf("%s", message)
 	}
 
+	healthy = true
 	return nil
 }
 

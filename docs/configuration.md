@@ -14,7 +14,34 @@ Vekil supports two runtime patterns:
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
+| `--metrics` | `METRICS` | `true` | Expose Prometheus metrics at `/metrics` (disable with `--metrics=false`) |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
+
+## Observability
+
+When `--metrics` is enabled, Vekil exposes Prometheus text exposition on `GET /metrics` from the same listener as the proxy API.
+
+Custom metrics include:
+
+- `vekil_requests_total{provider,public_model,endpoint,status}`
+- `vekil_request_duration_seconds{provider,public_model,endpoint,status}`
+- `vekil_request_first_byte_seconds{provider,public_model,endpoint}` for streaming responses
+- `vekil_tokens_total{provider,public_model,direction}`
+- `vekil_retries_total{provider,public_model,reason}`
+- `vekil_upstream_errors_total{provider,public_model,code}`
+- `vekil_inflight_requests{provider}`
+- `vekil_endpoint_healthy{provider,endpoint}`
+- `vekil_build_info{version,go_version,commit}`
+
+`vekil_build_info` uses the same build metadata that `vekil --version` prints.
+
+`vekil_request_duration_seconds` and `vekil_request_first_byte_seconds` use Prometheus default histogram buckets:
+
+`0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10`
+
+`vekil_endpoint_healthy` is updated by `GET /readyz` and starts at `0` until the provider has been probed.
+
+An example Grafana dashboard lives at [`vekil-grafana-dashboard.json`](vekil-grafana-dashboard.json).
 
 ## Copilot Header Overrides
 
