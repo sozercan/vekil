@@ -42,7 +42,7 @@ func (h *ProxyHandler) HandleGeminiModels(w http.ResponseWriter, r *http.Request
 	r = r.WithContext(withRequestMetricsObserver(r.Context(), observer))
 	metricsWriter := newMetricsResponseWriter(w, observer)
 	defer func() {
-		observer.finish(metricsWriter.StatusCode())
+		observer.finish(metricsWriter.FinalStatus(r.Context()))
 	}()
 	w = metricsWriter
 

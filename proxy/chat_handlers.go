@@ -125,7 +125,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	r = r.WithContext(withRequestMetricsObserver(r.Context(), observer))
 	metricsWriter := newMetricsResponseWriter(w, observer)
 	defer func() {
-		observer.finish(metricsWriter.StatusCode())
+		observer.finish(metricsWriter.FinalStatus(r.Context()))
 	}()
 	w = metricsWriter
 
@@ -218,7 +218,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	r = r.WithContext(withRequestMetricsObserver(r.Context(), observer))
 	metricsWriter := newMetricsResponseWriter(w, observer)
 	defer func() {
-		observer.finish(metricsWriter.StatusCode())
+		observer.finish(metricsWriter.FinalStatus(r.Context()))
 	}()
 	w = metricsWriter
 

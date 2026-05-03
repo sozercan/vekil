@@ -1,9 +1,13 @@
 package proxy
 
 import (
+	"bytes"
+	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,7 +27,34 @@ func newMetricsTestProxyHandler(t testing.TB, backend http.HandlerFunc, opts ...
 	}
 	handler.client = server.Client()
 	handler.retryBaseDelay = time.Millisecond
+	seedMetricsTestModels(t, handler, "gpt-4", "claude-3-sonnet", "gemini-2.5-pro")
 	return handler
+}
+
+func seedMetricsTestModels(t testing.TB, handler *ProxyHandler, publicModels ...string) {
+	t.Helper()
+
+	if handler == nil || handler.providersState != nil {
+		return
+	}
+
+	handler.providersState = defaultProviderSetup(handler)
+	models := make([]providerModel, 0, len(publicModels))
+	for _, publicModel := range publicModels {
+		publicModel = strings.TrimSpace(publicModel)
+		if publicModel == "" {
+			continue
+		}
+		models = append(models, providerModel{
+			publicID:           publicModel,
+			upstreamModel:      publicModel,
+			providerID:         "copilot",
+			supportedEndpoints: append([]string(nil), defaultStaticProviderEndpoints...),
+		})
+	}
+	if err := handler.providersState.replaceProviderModels("copilot", models); err != nil {
+		t.Fatalf("replaceProviderModels() error = %v", err)
+	}
 }
 
 func renderMetricsText(t testing.TB, handler *ProxyHandler) string {
@@ -258,4 +289,187 @@ func TestMetricsRecordRetriesAndUpstreamErrors(t *testing.T) {
 		"provider":     "copilot",
 		"public_model": "gpt-4",
 	}, "1")
+}
+
+func TestMetricsClampUnknownPublicModelLabels(t *testing.T) {
+	handler := newMetricsTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","created":0,"model":"gpt-4","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`))
+	})
+
+	const rawModel = "client-controlled-unknown-model-1234567890"
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"`+rawModel+`","messages":[{"role":"user","content":"hi"}]}`))
+	handler.HandleOpenAIChatCompletions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	metricsText := renderMetricsText(t, handler)
+	assertMetricLine(t, metricsText, "vekil_requests_total", map[string]string{
+		"endpoint":     "/v1/chat/completions",
+		"provider":     "copilot",
+		"public_model": "unknown",
+		"status":       "200",
+	}, "1")
+	if strings.Contains(metricsText, rawModel) {
+		t.Fatalf("metrics unexpectedly exposed raw request model %q:\n%s", rawModel, metricsText)
+	}
+}
+
+func TestMetricsEndpointHealthUsesSanitizedIdentifier(t *testing.T) {
+	handler := newMetricsTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			t.Fatalf("unexpected upstream path %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	handler.HandleReadyz(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("readyz status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	provider := handler.providerSetup().defaultProvider()
+	metricsText := renderMetricsText(t, handler)
+	assertMetricLine(t, metricsText, "vekil_endpoint_healthy", map[string]string{
+		"provider": "copilot",
+		"endpoint": metricsEndpointIdentifier(provider),
+	}, "1")
+	if strings.Contains(metricsText, provider.baseURL) {
+		t.Fatalf("metrics unexpectedly exposed raw provider baseURL %q:\n%s", provider.baseURL, metricsText)
+	}
+}
+
+func TestWriteUpstreamResponseObservedStreamsWithoutFullBuffering(t *testing.T) {
+	collector, err := newMetricsCollector()
+	if err != nil {
+		t.Fatalf("newMetricsCollector() error = %v", err)
+	}
+	observer := collector.startRequest("copilot", "gpt-4", "/v1/chat/completions", false)
+
+	body := &passthroughBlockingReadCloser{
+		first:   []byte(`{"usage":{"prompt_tokens":5,`),
+		second:  []byte(`"completion_tokens":3}}`),
+		release: make(chan struct{}),
+	}
+	writer := newPassthroughWriteRecorder()
+	done := make(chan error, 1)
+
+	go func() {
+		done <- writeUpstreamResponseObserved(writer, &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       body,
+		}, observer)
+	}()
+
+	select {
+	case <-writer.firstBodyWrite:
+	case <-time.After(time.Second):
+		t.Fatal("expected passthrough write before upstream body was fully read")
+	}
+
+	select {
+	case err := <-done:
+		t.Fatalf("writeUpstreamResponseObserved() returned before releasing second chunk: %v", err)
+	default:
+	}
+
+	close(body.release)
+	if err := <-done; err != nil {
+		t.Fatalf("writeUpstreamResponseObserved() error = %v", err)
+	}
+
+	if got := writer.statusCode; got != http.StatusOK {
+		t.Fatalf("statusCode = %d, want 200", got)
+	}
+	if got := writer.body.String(); got != `{"usage":{"prompt_tokens":5,"completion_tokens":3}}` {
+		t.Fatalf("body = %q, want full passthrough body", got)
+	}
+}
+
+func TestMetricsHandleResponsesCanceledBeforeCommitUses499(t *testing.T) {
+	handler := newMetricsTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4","input":"Hello","stream":true}`)).WithContext(ctx)
+	handler.HandleResponses(rec, req)
+
+	metricsText := renderMetricsText(t, handler)
+	assertMetricLine(t, metricsText, "vekil_requests_total", map[string]string{
+		"endpoint":     "/v1/responses",
+		"provider":     "copilot",
+		"public_model": "gpt-4",
+		"status":       "499",
+	}, "1")
+}
+
+type passthroughBlockingReadCloser struct {
+	first   []byte
+	second  []byte
+	release chan struct{}
+	read    int
+}
+
+func (r *passthroughBlockingReadCloser) Read(p []byte) (int, error) {
+	switch r.read {
+	case 0:
+		r.read++
+		copy(p, r.first)
+		return len(r.first), nil
+	case 1:
+		<-r.release
+		r.read++
+		copy(p, r.second)
+		return len(r.second), io.EOF
+	default:
+		return 0, io.EOF
+	}
+}
+
+func (r *passthroughBlockingReadCloser) Close() error { return nil }
+
+type passthroughWriteRecorder struct {
+	header         http.Header
+	statusCode     int
+	body           bytes.Buffer
+	firstBodyWrite chan struct{}
+	once           sync.Once
+}
+
+func newPassthroughWriteRecorder() *passthroughWriteRecorder {
+	return &passthroughWriteRecorder{
+		header:         make(http.Header),
+		firstBodyWrite: make(chan struct{}),
+	}
+}
+
+func (w *passthroughWriteRecorder) Header() http.Header {
+	return w.header
+}
+
+func (w *passthroughWriteRecorder) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+}
+
+func (w *passthroughWriteRecorder) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		w.once.Do(func() {
+			close(w.firstBodyWrite)
+		})
+	}
+	return w.body.Write(p)
 }

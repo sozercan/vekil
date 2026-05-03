@@ -417,7 +417,7 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := h.checkProviderReady(ctx, provider); err != nil {
 			if h.metrics != nil {
-				h.metrics.setEndpointHealthy(provider.id, provider.baseURL, false)
+				h.metrics.setEndpointHealthy(provider, false)
 			}
 			if shouldSuppressReadyzResponse(r.Context(), err) {
 				return
@@ -426,7 +426,7 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if h.metrics != nil {
-			h.metrics.setEndpointHealthy(provider.id, provider.baseURL, true)
+			h.metrics.setEndpointHealthy(provider, true)
 		}
 	}
 

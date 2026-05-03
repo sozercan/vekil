@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,8 +23,9 @@ import (
 )
 
 const (
-	unknownMetricLabel    = "unknown"
-	metricsUsageBodyLimit = 8 << 20
+	unknownMetricLabel              = "unknown"
+	metricsUsageBodyLimit           = 8 << 20
+	clientClosedRequestMetricStatus = 499
 )
 
 type requestMetricsContextKey struct{}
@@ -64,6 +66,13 @@ type metricsUsageFields struct {
 	CompletionTokens *int `json:"completion_tokens,omitempty"`
 	InputTokens      *int `json:"input_tokens,omitempty"`
 	OutputTokens     *int `json:"output_tokens,omitempty"`
+}
+
+type metricsUsageBodyTap struct {
+	observer *requestMetricsObserver
+	limit    int
+	body     []byte
+	overflow bool
 }
 
 func newMetricsCollector() (*metricsCollector, error) {
@@ -180,15 +189,15 @@ func (m *metricsCollector) startRequest(provider, publicModel, endpoint string, 
 	return observer
 }
 
-func (m *metricsCollector) setEndpointHealthy(providerID, endpoint string, healthy bool) {
-	if m == nil {
+func (m *metricsCollector) setEndpointHealthy(provider *providerRuntime, healthy bool) {
+	if m == nil || provider == nil {
 		return
 	}
 	value := 0.0
 	if healthy {
 		value = 1
 	}
-	m.endpointHealthy.WithLabelValues(normalizeMetricLabel(providerID), normalizeMetricLabel(endpoint)).Set(value)
+	m.endpointHealthy.WithLabelValues(normalizeMetricLabel(provider.id), metricsEndpointIdentifier(provider)).Set(value)
 }
 
 func normalizeMetricLabel(value string) string {
@@ -197,6 +206,56 @@ func normalizeMetricLabel(value string) string {
 		return unknownMetricLabel
 	}
 	return value
+}
+
+func metricsEndpointIdentifier(provider *providerRuntime) string {
+	if provider == nil {
+		return unknownMetricLabel
+	}
+
+	baseURL := strings.TrimSpace(provider.baseURL)
+	if baseURL == "" {
+		return normalizeMetricLabel(string(provider.kind))
+	}
+
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Hostname() == "" {
+		return normalizeMetricLabel(string(provider.kind))
+	}
+
+	host := strings.ToLower(parsed.Hostname())
+	if port := strings.TrimSpace(parsed.Port()); port != "" {
+		host += ":" + port
+	}
+
+	pathSuffix := metricsEndpointPathSuffix(provider, parsed.Path)
+	return normalizeMetricLabel(host + pathSuffix)
+}
+
+func metricsEndpointPathSuffix(provider *providerRuntime, path string) string {
+	if provider == nil {
+		return ""
+	}
+
+	switch provider.kind {
+	case providerTypeAzureOpenAI:
+		switch classifyAzureBaseURL(provider.baseURL) {
+		case azureBaseURLKindOpenAIV1:
+			return "/openai/v1"
+		case azureBaseURLKindLegacyOpenAI:
+			return "/openai"
+		}
+	case providerTypeOpenAICodex:
+		trimmed := strings.TrimRight(strings.TrimSpace(path), "/")
+		if strings.HasSuffix(trimmed, "/backend-api/codex") {
+			return "/backend-api/codex"
+		}
+	}
+
+	if trimmed := strings.Trim(strings.TrimSpace(path), "/"); trimmed != "" {
+		return "/..."
+	}
+	return ""
 }
 
 func (o *requestMetricsObserver) observeFirstByte() {
@@ -342,18 +401,95 @@ func usageFromFields(fields *metricsUsageFields) *tokenUsage {
 func writeUpstreamResponseObserved(w http.ResponseWriter, resp *http.Response, observer *requestMetricsObserver) error {
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	usageTap := newMetricsUsageBodyTap(observer, metricsUsageBodyLimit)
+	buf := make([]byte, 32*1024)
+
+	n, err := resp.Body.Read(buf)
+	if n == 0 && err != nil && err != io.EOF {
 		return err
-	}
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 && observer != nil && len(body) <= metricsUsageBodyLimit {
-		observer.observeUsageFromBody(body)
 	}
 
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(body)
-	return nil
+	if n > 0 {
+		if usageTap != nil {
+			_, _ = usageTap.Write(buf[:n])
+		}
+		if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+			return nil
+		}
+	}
+
+	if err == io.EOF {
+		if usageTap != nil {
+			usageTap.finish(resp.StatusCode)
+		}
+		return nil
+	}
+	if err != nil {
+		return nil
+	}
+
+	for {
+		n, err = resp.Body.Read(buf)
+		if n > 0 {
+			if usageTap != nil {
+				_, _ = usageTap.Write(buf[:n])
+			}
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				return nil
+			}
+		}
+		if err != nil {
+			if err == io.EOF && usageTap != nil {
+				usageTap.finish(resp.StatusCode)
+			}
+			return nil
+		}
+	}
+}
+
+func newMetricsUsageBodyTap(observer *requestMetricsObserver, limit int) *metricsUsageBodyTap {
+	if observer == nil || limit <= 0 {
+		return nil
+	}
+	return &metricsUsageBodyTap{
+		observer: observer,
+		limit:    limit,
+	}
+}
+
+func (t *metricsUsageBodyTap) Write(p []byte) (int, error) {
+	if t == nil || t.observer == nil || t.overflow {
+		return len(p), nil
+	}
+
+	remaining := t.limit - len(t.body)
+	if remaining <= 0 {
+		t.body = nil
+		t.overflow = true
+		return len(p), nil
+	}
+
+	if len(p) > remaining {
+		t.body = append(t.body, p[:remaining]...)
+		t.body = nil
+		t.overflow = true
+		return len(p), nil
+	}
+
+	t.body = append(t.body, p...)
+	return len(p), nil
+}
+
+func (t *metricsUsageBodyTap) finish(statusCode int) {
+	if t == nil || t.observer == nil || t.overflow {
+		return
+	}
+	if statusCode < 200 || statusCode >= 300 {
+		return
+	}
+	t.observer.observeUsageFromBody(t.body)
 }
 
 type metricsResponseWriter struct {
@@ -397,6 +533,16 @@ func (w *metricsResponseWriter) StatusCode() int {
 		return http.StatusOK
 	}
 	return w.statusCode
+}
+
+func (w *metricsResponseWriter) FinalStatus(ctx context.Context) int {
+	if w != nil && w.wroteHeader {
+		return w.statusCode
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return clientClosedRequestMetricStatus
+	}
+	return http.StatusOK
 }
 
 func (w *metricsResponseWriter) Flush() {
@@ -455,7 +601,7 @@ func (h *ProxyHandler) seedEndpointHealthMetrics() {
 		if provider == nil {
 			continue
 		}
-		h.metrics.setEndpointHealthy(provider.id, provider.baseURL, false)
+		h.metrics.setEndpointHealthy(provider, false)
 	}
 }
 
@@ -463,17 +609,23 @@ func (h *ProxyHandler) startRequestMetrics(publicEndpoint, upstreamEndpoint, pub
 	if h == nil || h.metrics == nil {
 		return nil
 	}
-	return h.metrics.startRequest(h.resolveMetricsProviderID(publicModel, upstreamEndpoint), publicModel, publicEndpoint, streaming)
+	providerID, metricsPublicModel := h.resolveMetricsLabels(publicModel, upstreamEndpoint)
+	return h.metrics.startRequest(providerID, metricsPublicModel, publicEndpoint, streaming)
 }
 
-func (h *ProxyHandler) resolveMetricsProviderID(publicModel, upstreamEndpoint string) string {
+func (h *ProxyHandler) resolveMetricsLabels(publicModel, upstreamEndpoint string) (string, string) {
 	publicModel = strings.TrimSpace(publicModel)
 	if publicModel == "" {
-		return unknownMetricLabel
+		return unknownMetricLabel, unknownMetricLabel
 	}
-	provider, _, _ := h.resolveProviderModel(publicModel, upstreamEndpoint)
+	provider, owner, known := h.resolveProviderModel(publicModel, upstreamEndpoint)
+	providerID := unknownMetricLabel
 	if provider == nil {
-		return unknownMetricLabel
+		return providerID, unknownMetricLabel
 	}
-	return provider.id
+	providerID = provider.id
+	if known {
+		return providerID, normalizeMetricLabel(owner.publicID)
+	}
+	return providerID, unknownMetricLabel
 }

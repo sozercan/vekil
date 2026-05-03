@@ -64,7 +64,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(withRequestMetricsObserver(r.Context(), observer))
 	metricsWriter := newMetricsResponseWriter(w, observer)
 	defer func() {
-		observer.finish(metricsWriter.StatusCode())
+		observer.finish(metricsWriter.FinalStatus(r.Context()))
 	}()
 	w = metricsWriter
 
@@ -165,7 +165,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(withRequestMetricsObserver(r.Context(), observer))
 	metricsWriter := newMetricsResponseWriter(w, observer)
 	defer func() {
-		observer.finish(metricsWriter.StatusCode())
+		observer.finish(metricsWriter.FinalStatus(r.Context()))
 	}()
 	w = metricsWriter
 
@@ -234,7 +234,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	r = r.WithContext(withRequestMetricsObserver(r.Context(), observer))
 	metricsWriter := newMetricsResponseWriter(w, observer)
 	defer func() {
-		observer.finish(metricsWriter.StatusCode())
+		observer.finish(metricsWriter.FinalStatus(r.Context()))
 	}()
 	w = metricsWriter
 
