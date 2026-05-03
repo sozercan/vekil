@@ -3,12 +3,16 @@ package proxy
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/models"
 )
 
 func newProviderRoutingTestHandler(t *testing.T, endpoints []string) *ProxyHandler {
@@ -237,6 +241,38 @@ func TestResponsesRequestRewriting_StripsUnsupportedImageGenerationToolChoiceFor
 	}
 	if _, ok := payload["tool_choice"]; ok {
 		t.Fatalf("rewritten payload unexpectedly retained tool_choice: %s", payload["tool_choice"])
+	}
+}
+
+func TestWriteUpstreamResponseObservedStreamsBodyAndExtractsUsage(t *testing.T) {
+	largeContent := strings.Repeat("x", 2*1024*1024)
+	body := fmt.Sprintf(`{"id":"chatcmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":%q},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":4,"total_tokens":11}}`, largeContent)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: io.NopCloser(strings.NewReader(body)),
+	}
+
+	recorder := httptest.NewRecorder()
+	var usage *models.OpenAIUsage
+	writeUpstreamResponseObserved(recorder, resp, func(body io.Reader, _ http.Header) {
+		usage = extractOpenAIUsageFromReader(body)
+	})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if got := recorder.Body.String(); got != body {
+		t.Fatalf("response body mismatch: got %d bytes, want %d bytes", len(got), len(body))
+	}
+	if usage == nil {
+		t.Fatal("usage = nil, want extracted usage")
+	}
+	if usage.PromptTokens != 7 || usage.CompletionTokens != 4 || usage.TotalTokens != 11 {
+		t.Fatalf("usage = %+v, want prompt=7 completion=4 total=11", *usage)
 	}
 }
 

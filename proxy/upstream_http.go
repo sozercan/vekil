@@ -170,7 +170,7 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 			return nil, err
 		}
 		return req, nil
-	}, h.newUpstreamRequestMetrics(provider, publicModel))
+	}, h.newUpstreamRequestMetrics(provider, publicModel, path))
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
@@ -185,7 +185,7 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
 	writeUpstreamResponseObserved(w, resp, nil)
 }
 
-func writeUpstreamResponseObserved(w http.ResponseWriter, resp *http.Response, observeBody func([]byte, http.Header)) {
+func writeUpstreamResponseObserved(w http.ResponseWriter, resp *http.Response, observeBody func(io.Reader, http.Header)) {
 	defer func() { _ = resp.Body.Close() }()
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
@@ -194,7 +194,7 @@ func writeUpstreamResponseObserved(w http.ResponseWriter, resp *http.Response, o
 		return
 	}
 
-	var body bytes.Buffer
-	_, _ = io.Copy(w, io.TeeReader(resp.Body, &body))
-	observeBody(body.Bytes(), resp.Header)
+	body := io.TeeReader(resp.Body, w)
+	observeBody(body, resp.Header)
+	_, _ = io.Copy(io.Discard, body)
 }

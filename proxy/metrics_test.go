@@ -42,13 +42,13 @@ func TestHandleOpenAIChatCompletionsRecordsMetrics(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
-	if got := testutil.ToFloat64(h.metrics.requestsTotal.WithLabelValues("copilot", "gpt-4", "/v1/chat/completions", "200")); got != 1 {
+	if got := testutil.ToFloat64(h.metrics.requestsTotal.WithLabelValues("copilot", unknownMetricsLabel, "/v1/chat/completions", "200")); got != 1 {
 		t.Fatalf("requests_total = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", "gpt-4", "prompt")); got != 5 {
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", unknownMetricsLabel, "prompt")); got != 5 {
 		t.Fatalf("prompt tokens_total = %v, want 5", got)
 	}
-	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", "gpt-4", "completion")); got != 3 {
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", unknownMetricsLabel, "completion")); got != 3 {
 		t.Fatalf("completion tokens_total = %v, want 3", got)
 	}
 	if got := testutil.ToFloat64(h.metrics.inflightRequests.WithLabelValues("copilot")); got != 0 {
@@ -85,18 +85,18 @@ func TestHandleResponsesStreamingRecordsMetricsOnClose(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
-	if got := testutil.ToFloat64(h.metrics.requestsTotal.WithLabelValues("copilot", "gpt-4", "/v1/responses", "200")); got != 1 {
+	if got := testutil.ToFloat64(h.metrics.requestsTotal.WithLabelValues("copilot", unknownMetricsLabel, "/v1/responses", "200")); got != 1 {
 		t.Fatalf("requests_total = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", "gpt-4", "prompt")); got != 11 {
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", unknownMetricsLabel, "prompt")); got != 11 {
 		t.Fatalf("prompt tokens_total = %v, want 11", got)
 	}
-	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", "gpt-4", "completion")); got != 7 {
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", unknownMetricsLabel, "completion")); got != 7 {
 		t.Fatalf("completion tokens_total = %v, want 7", got)
 	}
 	if got := histogramSampleCount(t, h.metrics.registry, "vekil_stream_first_byte_latency_seconds", map[string]string{
 		"provider":     "copilot",
-		"public_model": "gpt-4",
+		"public_model": unknownMetricsLabel,
 		"endpoint":     "/v1/responses",
 	}); got != 1 {
 		t.Fatalf("stream first-byte sample_count = %d, want 1", got)
@@ -135,11 +135,112 @@ func TestHandleOpenAIChatCompletionsRecordsRetryMetrics(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
-	if got := testutil.ToFloat64(h.metrics.retriesTotal.WithLabelValues("copilot", "gpt-4", "429")); got != 1 {
+	if got := testutil.ToFloat64(h.metrics.retriesTotal.WithLabelValues("copilot", unknownMetricsLabel, "429")); got != 1 {
 		t.Fatalf("retries_total = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(h.metrics.upstreamErrorsTotal.WithLabelValues("copilot", "gpt-4", "429")); got != 1 {
+	if got := testutil.ToFloat64(h.metrics.upstreamErrorsTotal.WithLabelValues("copilot", unknownMetricsLabel, "429")); got != 1 {
 		t.Fatalf("upstream_errors_total = %v, want 1", got)
+	}
+}
+
+func TestHandleResponsesWebSocketRecordsMetrics(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/openai/v1/responses" {
+			t.Fatalf("path = %q, want /openai/v1/responses", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-ws-1\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-ws-1\",\"usage\":{\"input_tokens\":13,\"output_tokens\":8,\"total_tokens\":21}}}\n\n")
+	}))
+	defer upstream.Close()
+
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:      "azure",
+				Type:    "azure-openai",
+				Default: true,
+				BaseURL: upstream.URL + "/openai/v1",
+				APIKey:  "azure-test-key",
+				Models: []ProviderModelConfig{{
+					PublicID:   "gpt-5-public",
+					Deployment: "gpt-5-4-prod",
+					Endpoints:  []string{"/responses"},
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+
+	server := startResponsesWebSocketProxyServer(t, h)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	request["model"] = "gpt-5-public"
+
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+
+	if got := mustReadWebSocketJSONSkipMetadata(t, conn)["type"]; got != "response.created" {
+		t.Fatalf("first websocket event type = %v, want response.created", got)
+	}
+	if got := mustReadWebSocketJSONSkipMetadata(t, conn)["type"]; got != "response.completed" {
+		t.Fatalf("second websocket event type = %v, want response.completed", got)
+	}
+
+	if got := testutil.ToFloat64(h.metrics.requestsTotal.WithLabelValues("azure", "gpt-5-public", "/v1/responses", "200")); got != 1 {
+		t.Fatalf("requests_total = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("azure", "gpt-5-public", "prompt")); got != 13 {
+		t.Fatalf("prompt tokens_total = %v, want 13", got)
+	}
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("azure", "gpt-5-public", "completion")); got != 8 {
+		t.Fatalf("completion tokens_total = %v, want 8", got)
+	}
+	if got := testutil.ToFloat64(h.metrics.inflightRequests.WithLabelValues("azure")); got != 0 {
+		t.Fatalf("inflight_requests = %v, want 0", got)
+	}
+	if got := histogramSampleCount(t, h.metrics.registry, "vekil_stream_first_byte_latency_seconds", map[string]string{
+		"provider":     "azure",
+		"public_model": "gpt-5-public",
+		"endpoint":     "/v1/responses",
+	}); got != 1 {
+		t.Fatalf("stream first-byte sample_count = %d, want 1", got)
+	}
+}
+
+func TestNormalizeProvidedBuildVersionTreatsDevAsUnset(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty stays empty", in: "", want: ""},
+		{name: "dev is treated as unset", in: "dev", want: ""},
+		{name: "mixed case dev is treated as unset", in: " Dev ", want: ""},
+		{name: "real version is preserved", in: "1.2.3", want: "1.2.3"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeProvidedBuildVersion(tt.in); got != tt.want {
+				t.Fatalf("normalizeProvidedBuildVersion(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
 	}
 }
 

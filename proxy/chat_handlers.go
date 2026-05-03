@@ -233,8 +233,8 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			_ = json.NewEncoder(mw).Encode(oaiResp)
 		},
 		passthrough: func(resp *http.Response) error {
-			writeUpstreamResponseObserved(mw, resp, func(body []byte, _ http.Header) {
-				requestMetrics.setOpenAIUsage(extractOpenAIUsageFromBody(body))
+			writeUpstreamResponseObserved(mw, resp, func(body io.Reader, _ http.Header) {
+				requestMetrics.setOpenAIUsage(extractOpenAIUsageFromReader(body))
 			})
 			return nil
 		},

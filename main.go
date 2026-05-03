@@ -27,9 +27,10 @@ const (
 )
 
 // buildVersion and buildCommit can be injected with -ldflags at build time.
-// Local builds fall back to dev/embedded Go build info.
+// Local builds leave version empty so metrics can prefer embedded Go build
+// info before falling back to "dev".
 var (
-	buildVersion = "dev"
+	buildVersion = ""
 	buildCommit  = ""
 )
 

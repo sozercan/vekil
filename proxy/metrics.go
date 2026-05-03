@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime"
 	"runtime/debug"
@@ -172,7 +173,7 @@ func newProxyMetrics(cfg MetricsConfig) (*proxyMetrics, error) {
 }
 
 func normalizedBuildInfo(info BuildInfo) BuildInfo {
-	info.Version = strings.TrimSpace(info.Version)
+	info.Version = normalizeProvidedBuildVersion(info.Version)
 	info.GoVersion = strings.TrimSpace(info.GoVersion)
 	info.Commit = strings.TrimSpace(info.Commit)
 
@@ -206,6 +207,14 @@ func normalizedBuildInfo(info BuildInfo) BuildInfo {
 		info.Commit = "unknown"
 	}
 	return info
+}
+
+func normalizeProvidedBuildVersion(version string) string {
+	version = strings.TrimSpace(version)
+	if strings.EqualFold(version, "dev") {
+		return ""
+	}
+	return version
 }
 
 func (m *proxyMetrics) handler() http.Handler {
@@ -268,7 +277,7 @@ func (r *requestMetrics) setRouting(h *ProxyHandler, publicModel, upstreamEndpoi
 		return
 	}
 
-	r.publicModel = strings.TrimSpace(publicModel)
+	r.publicModel = unknownMetricsLabel
 	r.streaming = streaming
 
 	providerID := unknownMetricsLabel
@@ -277,6 +286,7 @@ func (r *requestMetrics) setRouting(h *ProxyHandler, publicModel, upstreamEndpoi
 		if provider != nil {
 			providerID = provider.id
 		}
+		r.publicModel = h.metricsPublicModelLabel(publicModel, upstreamEndpoint)
 	}
 	r.setProvider(providerID)
 }
@@ -321,6 +331,16 @@ func (r *requestMetrics) setResponsesUsage(usage *responsesTokenUsage) {
 }
 
 func (r *requestMetrics) finish(w *metricsResponseWriter) {
+	statusCode := http.StatusOK
+	var firstWrite time.Time
+	if w != nil {
+		statusCode = w.StatusCode()
+		firstWrite = w.firstWrite
+	}
+	r.finishWithStatus(statusCode, firstWrite)
+}
+
+func (r *requestMetrics) finishWithStatus(statusCode int, firstWrite time.Time) {
 	if r == nil {
 		return
 	}
@@ -333,17 +353,12 @@ func (r *requestMetrics) finish(w *metricsResponseWriter) {
 		provider := sanitizeMetricsLabel(r.provider)
 		publicModel := sanitizeMetricsLabel(r.publicModel)
 		endpoint := sanitizeMetricsLabel(r.endpoint)
-		status := strconv.Itoa(http.StatusOK)
-		if w != nil {
-			status = strconv.Itoa(w.StatusCode())
-		}
+		status := strconv.Itoa(statusCode)
 
 		r.metrics.requestsTotal.WithLabelValues(provider, publicModel, endpoint, status).Inc()
 		r.metrics.requestDuration.WithLabelValues(provider, publicModel, endpoint, status).Observe(time.Since(r.start).Seconds())
-		if r.streaming && w != nil {
-			if latency, ok := w.firstByteLatency(r.start); ok {
-				r.metrics.streamFirstByteLatency.WithLabelValues(provider, publicModel, endpoint).Observe(latency.Seconds())
-			}
+		if r.streaming && !firstWrite.IsZero() {
+			r.metrics.streamFirstByteLatency.WithLabelValues(provider, publicModel, endpoint).Observe(firstWrite.Sub(r.start).Seconds())
 		}
 
 		if r.openAIUsage != nil {
@@ -406,7 +421,7 @@ func (w *metricsResponseWriter) Flush() {
 	}
 }
 
-func (h *ProxyHandler) newUpstreamRequestMetrics(provider *providerRuntime, publicModel string) *upstreamRequestMetrics {
+func (h *ProxyHandler) newUpstreamRequestMetrics(provider *providerRuntime, publicModel, upstreamEndpoint string) *upstreamRequestMetrics {
 	if h == nil || h.metrics == nil || !h.metrics.enabled {
 		return nil
 	}
@@ -417,8 +432,26 @@ func (h *ProxyHandler) newUpstreamRequestMetrics(provider *providerRuntime, publ
 	return &upstreamRequestMetrics{
 		metrics:     h.metrics,
 		provider:    providerID,
-		publicModel: publicModel,
+		publicModel: h.metricsPublicModelLabel(publicModel, upstreamEndpoint),
 	}
+}
+
+func (h *ProxyHandler) metricsPublicModelLabel(publicModel, upstreamEndpoint string) string {
+	if h == nil {
+		return unknownMetricsLabel
+	}
+
+	model := strings.TrimSpace(publicModel)
+	if model == "" {
+		return unknownMetricsLabel
+	}
+
+	_, owner, known := h.resolveProviderModel(model, upstreamEndpoint)
+	if !known {
+		return unknownMetricsLabel
+	}
+
+	return sanitizeMetricsLabel(owner.publicID)
 }
 
 func (m *upstreamRequestMetrics) observeRetry(reason string) {
@@ -453,6 +486,75 @@ func extractResponsesUsageFromBody(body []byte) *responsesTokenUsage {
 		return nil
 	}
 	return payload.Usage
+}
+
+func extractOpenAIUsageFromReader(r io.Reader) *models.OpenAIUsage {
+	raw := extractTopLevelJSONFieldFromReader(r, "usage")
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+
+	var usage models.OpenAIUsage
+	if err := json.Unmarshal(raw, &usage); err != nil {
+		return nil
+	}
+	return &usage
+}
+
+func extractResponsesUsageFromReader(r io.Reader) *responsesTokenUsage {
+	raw := extractTopLevelJSONFieldFromReader(r, "usage")
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+
+	var usage responsesTokenUsage
+	if err := json.Unmarshal(raw, &usage); err != nil {
+		return nil
+	}
+	return &usage
+}
+
+func extractTopLevelJSONFieldFromReader(r io.Reader, field string) json.RawMessage {
+	if r == nil {
+		return nil
+	}
+
+	dec := json.NewDecoder(r)
+	tok, err := dec.Token()
+	if err != nil {
+		return nil
+	}
+
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
+		return nil
+	}
+
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return nil
+		}
+
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil
+		}
+
+		if key == field {
+			var raw json.RawMessage
+			if err := dec.Decode(&raw); err != nil {
+				return nil
+			}
+			return cloneRawMessage(raw)
+		}
+
+		if err := skipJSONValue(dec); err != nil {
+			return nil
+		}
+	}
+
+	return nil
 }
 
 func newOpenAIStreamUsageTap(onUsage func(*models.OpenAIUsage)) *openAIStreamUsageTap {

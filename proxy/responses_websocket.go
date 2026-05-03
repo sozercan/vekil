@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -73,13 +74,14 @@ type responsesWebSocketStreamIncompleteDetails struct {
 }
 
 type responsesWebSocketSession struct {
-	conn           *websocket.Conn
-	ctx            context.Context
-	baseHeaders    http.Header
-	turnState      string
-	lastResponseID string
-	lastSignature  string
-	historyItems   []json.RawMessage
+	conn            *websocket.Conn
+	ctx             context.Context
+	baseHeaders     http.Header
+	turnState       string
+	lastResponseID  string
+	lastSignature   string
+	historyItems    []json.RawMessage
+	requestObserver *responsesWebSocketRequestObserver
 }
 
 type responsesWebSocketRequestPlan struct {
@@ -105,6 +107,13 @@ type responsesWebSocketHistoryCompaction struct {
 	fromBytes int
 	toItems   int
 	toBytes   int
+}
+
+type responsesWebSocketRequestObserver struct {
+	metrics    *requestMetrics
+	firstWrite time.Time
+	statusCode int
+	statusSet  bool
 }
 
 func (p responsesWebSocketRequestPlan) upstreamSegments() [][]json.RawMessage {
@@ -140,18 +149,7 @@ func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.R
 		if err != nil {
 			return
 		}
-		if messageType != websocket.TextMessage {
-			session.sendWrappedError(http.StatusBadRequest, "responses websocket only accepts text frames", "invalid_request_error", nil)
-			return
-		}
-
-		request, err := parseResponsesWebSocketCreateRequest(payload)
-		if err != nil {
-			session.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
-			return
-		}
-
-		if err := session.handleCreateRequest(h, request); err != nil {
+		if err := session.handleMessage(h, messageType, payload); err != nil {
 			h.log.Debug("responses websocket request failed", logger.Err(err))
 			return
 		}
@@ -171,6 +169,112 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 		ctx:         r.Context(),
 		baseHeaders: baseHeaders,
 		turnState:   strings.TrimSpace(r.Header.Get("X-Codex-Turn-State")),
+	}
+}
+
+func (s *responsesWebSocketSession) handleMessage(h *ProxyHandler, messageType int, payload []byte) (err error) {
+	model := ""
+	if messageType == websocket.TextMessage {
+		model = extractRequestModel(payload)
+	}
+
+	observer := newResponsesWebSocketRequestObserver(h, model)
+	s.requestObserver = observer
+	defer func() {
+		if observer != nil {
+			if err != nil && !observer.hasStatus() {
+				observer.setStatus(http.StatusBadGateway)
+			}
+			observer.finish()
+		}
+		s.requestObserver = nil
+	}()
+
+	if messageType != websocket.TextMessage {
+		s.sendWrappedError(http.StatusBadRequest, "responses websocket only accepts text frames", "invalid_request_error", nil)
+		return fmt.Errorf("responses websocket only accepts text frames")
+	}
+
+	request, err := parseResponsesWebSocketCreateRequest(payload)
+	if err != nil {
+		s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
+		return err
+	}
+
+	return s.handleCreateRequest(h, request)
+}
+
+func newResponsesWebSocketRequestObserver(h *ProxyHandler, model string) *responsesWebSocketRequestObserver {
+	observer := &responsesWebSocketRequestObserver{}
+	if h == nil {
+		return observer
+	}
+
+	observer.metrics = h.newRequestMetrics("/v1/responses")
+	observer.metrics.setRouting(h, model, "/responses", true)
+	return observer
+}
+
+func (o *responsesWebSocketRequestObserver) markWrite() {
+	if o == nil || !o.firstWrite.IsZero() {
+		return
+	}
+	o.firstWrite = time.Now()
+}
+
+func (o *responsesWebSocketRequestObserver) setStatus(statusCode int) {
+	if o == nil {
+		return
+	}
+	o.statusCode = statusCode
+	o.statusSet = true
+}
+
+func (o *responsesWebSocketRequestObserver) hasStatus() bool {
+	return o != nil && o.statusSet
+}
+
+func (o *responsesWebSocketRequestObserver) setResponsesUsage(usage *responsesTokenUsage) {
+	if o == nil || o.metrics == nil {
+		return
+	}
+	o.metrics.setResponsesUsage(usage)
+}
+
+func (o *responsesWebSocketRequestObserver) finish() {
+	if o == nil || o.metrics == nil {
+		return
+	}
+
+	statusCode := http.StatusOK
+	if o.statusSet {
+		statusCode = o.statusCode
+	}
+	o.metrics.finishWithStatus(statusCode, o.firstWrite)
+}
+
+func (s *responsesWebSocketSession) currentRequestObserver() *responsesWebSocketRequestObserver {
+	if s == nil {
+		return nil
+	}
+	return s.requestObserver
+}
+
+func (s *responsesWebSocketSession) observeCurrentRequestWrite() {
+	if observer := s.currentRequestObserver(); observer != nil {
+		observer.markWrite()
+	}
+}
+
+func (s *responsesWebSocketSession) observeCurrentRequestStatus(statusCode int) {
+	if observer := s.currentRequestObserver(); observer != nil {
+		observer.setStatus(statusCode)
+	}
+}
+
+func (s *responsesWebSocketSession) observeCurrentRequestUsage(usage *responsesTokenUsage) {
+	if observer := s.currentRequestObserver(); observer != nil {
+		observer.setResponsesUsage(usage)
 	}
 }
 
@@ -629,12 +733,16 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, heade
 			}
 		}
 
-		if err := s.conn.WriteMessage(websocket.TextMessage, []byte(data)); err != nil {
+		if err := s.writeTextMessage([]byte(data)); err != nil {
 			return err
 		}
 
 		if !parsedEvent {
 			return nil
+		}
+
+		if event.Response.Usage != nil {
+			s.observeCurrentRequestUsage(event.Response.Usage)
 		}
 
 		switch event.Type {
@@ -681,6 +789,11 @@ func (s *responsesWebSocketSession) writeJSON(payload interface{}) error {
 	if err != nil {
 		return err
 	}
+	return s.writeTextMessage(encoded)
+}
+
+func (s *responsesWebSocketSession) writeTextMessage(encoded []byte) error {
+	s.observeCurrentRequestWrite()
 	return s.conn.WriteMessage(websocket.TextMessage, encoded)
 }
 
@@ -693,6 +806,8 @@ func (s *responsesWebSocketSession) sendUpstreamStreamFailure(event responsesWeb
 }
 
 func (s *responsesWebSocketSession) sendWrappedError(status int, message, code string, headers http.Header) {
+	s.observeCurrentRequestStatus(status)
+
 	payload := map[string]interface{}{
 		"type":        "error",
 		"status_code": status,

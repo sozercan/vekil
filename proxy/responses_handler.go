@@ -105,8 +105,8 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeUpstreamResponseObserved(mw, resp, func(body []byte, _ http.Header) {
-		requestMetrics.setResponsesUsage(extractResponsesUsageFromBody(body))
+	writeUpstreamResponseObserved(mw, resp, func(body io.Reader, _ http.Header) {
+		requestMetrics.setResponsesUsage(extractResponsesUsageFromReader(body))
 	})
 }
 
