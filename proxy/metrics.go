@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -341,11 +340,31 @@ func extractOpenAIUsageFromBody(body []byte) *models.OpenAIUsage {
 	return payload.Usage
 }
 
+func extractOpenAIUsageFromReader(body io.Reader) *models.OpenAIUsage {
+	var payload struct {
+		Usage *models.OpenAIUsage `json:"usage,omitempty"`
+	}
+	if err := json.NewDecoder(body).Decode(&payload); err != nil {
+		return nil
+	}
+	return payload.Usage
+}
+
 func extractResponsesUsageFromBody(body []byte) *responsesUsage {
 	var payload struct {
 		Usage *responsesUsage `json:"usage,omitempty"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil
+	}
+	return payload.Usage
+}
+
+func extractResponsesUsageFromReader(body io.Reader) *responsesUsage {
+	var payload struct {
+		Usage *responsesUsage `json:"usage,omitempty"`
+	}
+	if err := json.NewDecoder(body).Decode(&payload); err != nil {
 		return nil
 	}
 	return payload.Usage
@@ -381,7 +400,7 @@ func (w *firstByteObserverResponseWriter) Flush() {
 	}
 }
 
-func writeUpstreamResponseWithObserver(w http.ResponseWriter, resp *http.Response, observeBody func([]byte)) {
+func writeUpstreamResponseWithObserver(w http.ResponseWriter, resp *http.Response, observeBody func(io.Reader)) {
 	defer func() { _ = resp.Body.Close() }()
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
@@ -390,9 +409,9 @@ func writeUpstreamResponseWithObserver(w http.ResponseWriter, resp *http.Respons
 		return
 	}
 
-	var buf bytes.Buffer
-	_, _ = io.Copy(w, io.TeeReader(resp.Body, &buf))
-	observeBody(buf.Bytes())
+	tee := io.TeeReader(resp.Body, w)
+	observeBody(tee)
+	_, _ = io.Copy(io.Discard, tee)
 }
 
 type openAIStreamUsageTap struct {

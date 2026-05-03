@@ -162,13 +162,12 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 }
 
 func (h *ProxyHandler) postJSONEndpointWithMetrics(ctx context.Context, path string, body []byte, extraHeaders http.Header, tracker *requestMetricsTracker) (*http.Response, error) {
+	requestedModel := extractRequestModel(body)
 	provider, rewrittenBody, err := h.resolveProviderRequest(body, path)
 	if err != nil {
 		return nil, err
 	}
-	if tracker != nil && provider != nil {
-		tracker.setProvider(provider.id)
-	}
+	h.populateRequestMetricsRouteLabels(ctx, tracker, requestedModel, path, provider)
 
 	return h.doWithRetryWithMetrics(tracker, func() (*http.Request, error) {
 		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "")
@@ -177,6 +176,55 @@ func (h *ProxyHandler) postJSONEndpointWithMetrics(ctx context.Context, path str
 		}
 		return req, nil
 	})
+}
+
+func (h *ProxyHandler) populateRequestMetricsRouteLabels(ctx context.Context, tracker *requestMetricsTracker, requestedModel, endpoint string, provider *providerRuntime) {
+	if tracker == nil || provider == nil {
+		return
+	}
+
+	tracker.setProvider(provider.id)
+	if tracker.publicModelLabel() != metricsUnknownLabel {
+		return
+	}
+
+	requestedModel = strings.TrimSpace(requestedModel)
+	if requestedModel == "" {
+		return
+	}
+
+	resolvedProvider, owner, known := h.resolveProviderModel(requestedModel, endpoint)
+	if known && resolvedProvider != nil && resolvedProvider.id == provider.id {
+		tracker.setPublicModel(owner.publicID)
+		return
+	}
+	if !providerUsesDynamicModels(provider) {
+		return
+	}
+
+	refreshCtx := ctx
+	if refreshCtx == nil {
+		refreshCtx = context.Background()
+	}
+	refreshCtx, cancel := context.WithTimeout(refreshCtx, modelsUpstreamTimeout)
+	defer cancel()
+
+	result, err := h.fetchProviderModels(refreshCtx, provider, "", "")
+	if err != nil {
+		return
+	}
+	models := filterProviderModels(provider, result.models)
+	if h.providersState != nil {
+		if err := h.providersState.replaceProviderModels(provider.id, models); err != nil {
+			return
+		}
+	}
+	for _, model := range models {
+		if model.publicID == requestedModel && providerModelSupportsEndpoint(model, endpoint) {
+			tracker.setPublicModel(model.publicID)
+			return
+		}
+	}
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {

@@ -335,6 +335,69 @@ func TestBeginRequestMetrics_CollapsesUnknownPublicModelLabel(t *testing.T) {
 	}
 }
 
+func TestHandleOpenAIChatCompletions_PopulatesMetricsPublicModelFromCatalog(t *testing.T) {
+	var modelsCalls atomic.Int32
+	var chatCalls atomic.Int32
+
+	h := newMetricsTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			modelsCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"object":"list","data":[{"id":"gpt-4","object":"model","owned_by":"copilot"}]}`)
+		case "/chat/completions":
+			chatCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`)
+		default:
+			t.Fatalf("unexpected backend path %q", r.URL.Path)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`))
+	w := httptest.NewRecorder()
+
+	h.HandleOpenAIChatCompletions(w, req)
+
+	if got := modelsCalls.Load(); got != 1 {
+		t.Fatalf("/models calls = %d, want 1", got)
+	}
+	if got := chatCalls.Load(); got != 1 {
+		t.Fatalf("/chat/completions calls = %d, want 1", got)
+	}
+	if got := promtest.ToFloat64(h.metrics.requests.WithLabelValues("copilot", "gpt-4", "/v1/chat/completions", "200")); got != 1 {
+		t.Fatalf("requests_total = %v, want 1", got)
+	}
+	if got := promtest.ToFloat64(h.metrics.requests.WithLabelValues("copilot", "unknown", "/v1/chat/completions", "200")); got != 0 {
+		t.Fatalf("unknown-model requests_total = %v, want 0", got)
+	}
+}
+
+func TestWriteUpstreamResponseWithObserver_ForwardsBodyOnObserverParseError(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Header:     http.Header{"Content-Type": []string{"text/plain"}},
+		Body:       io.NopCloser(strings.NewReader("not-json-at-all")),
+	}
+	w := httptest.NewRecorder()
+
+	writeUpstreamResponseWithObserver(w, resp, func(body io.Reader) {
+		if usage := extractOpenAIUsageFromReader(body); usage != nil {
+			t.Fatalf("extractOpenAIUsageFromReader() = %+v, want nil", usage)
+		}
+	})
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadGateway)
+	}
+	if got := w.Header().Get("Content-Type"); got != "text/plain" {
+		t.Fatalf("Content-Type = %q, want text/plain", got)
+	}
+	if got := w.Body.String(); got != "not-json-at-all" {
+		t.Fatalf("body = %q, want %q", got, "not-json-at-all")
+	}
+}
+
 func TestMetricsHandler_ExportsBuildInfo(t *testing.T) {
 	h := newMetricsTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

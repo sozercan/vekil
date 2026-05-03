@@ -259,8 +259,8 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			if resp.StatusCode != http.StatusOK {
 				tracker.RecordUpstreamError(strconv.Itoa(resp.StatusCode))
 			}
-			writeUpstreamResponseWithObserver(w, resp, func(body []byte) {
-				tracker.ObserveOpenAIUsage(extractOpenAIUsageFromBody(body))
+			writeUpstreamResponseWithObserver(w, resp, func(body io.Reader) {
+				tracker.ObserveOpenAIUsage(extractOpenAIUsageFromReader(body))
 			})
 			return nil
 		},

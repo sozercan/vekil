@@ -120,8 +120,8 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode != http.StatusOK {
 		tracker.RecordUpstreamError(strconv.Itoa(resp.StatusCode))
 	}
-	writeUpstreamResponseWithObserver(w, resp, func(body []byte) {
-		tracker.ObserveResponsesUsage(extractResponsesUsageFromBody(body))
+	writeUpstreamResponseWithObserver(w, resp, func(body io.Reader) {
+		tracker.ObserveResponsesUsage(extractResponsesUsageFromReader(body))
 	})
 	statusCode = resp.StatusCode
 }
