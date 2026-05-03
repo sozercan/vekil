@@ -198,7 +198,7 @@ func (h *ProxyHandler) populateRequestMetricsRouteLabels(ctx context.Context, tr
 		tracker.setPublicModel(owner.publicID)
 		return
 	}
-	if !providerUsesDynamicModels(provider) {
+	if !providerSupportsRequestTimeModelRefresh(provider) {
 		return
 	}
 
@@ -225,6 +225,17 @@ func (h *ProxyHandler) populateRequestMetricsRouteLabels(ctx context.Context, tr
 			return
 		}
 	}
+}
+
+func providerSupportsRequestTimeModelRefresh(provider *providerRuntime) bool {
+	if provider == nil {
+		return false
+	}
+
+	// Keep best-effort request-time catalog refresh limited to Copilot so metrics
+	// labels can be enriched in zero-config mode without injecting extra /models
+	// calls into OpenAI Codex inference requests.
+	return provider.kind == providerTypeCopilot
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
