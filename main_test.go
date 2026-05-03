@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -92,6 +94,89 @@ func TestGetEnvInt(t *testing.T) {
 				t.Fatalf("getEnvInt() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRegisterBoolFlagPair(t *testing.T) {
+	tests := []struct {
+		name         string
+		defaultValue bool
+		args         []string
+		want         bool
+	}{
+		{
+			name:         "default value",
+			defaultValue: true,
+			want:         true,
+		},
+		{
+			name:         "positive flag enables",
+			defaultValue: false,
+			args:         []string{"--metrics"},
+			want:         true,
+		},
+		{
+			name:         "positive flag accepts explicit false",
+			defaultValue: true,
+			args:         []string{"--metrics=false"},
+			want:         false,
+		},
+		{
+			name:         "negative flag disables",
+			defaultValue: true,
+			args:         []string{"--no-metrics"},
+			want:         false,
+		},
+		{
+			name:         "negative flag accepts explicit false",
+			defaultValue: false,
+			args:         []string{"--no-metrics=false"},
+			want:         true,
+		},
+		{
+			name:         "last flag wins",
+			defaultValue: true,
+			args:         []string{"--no-metrics", "--metrics"},
+			want:         true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := flag.NewFlagSet("vekil", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			metrics := registerBoolFlagPair(fs, "metrics", tc.defaultValue, "Expose Prometheus-compatible /metrics endpoint", "Disable Prometheus-compatible /metrics endpoint")
+
+			if err := fs.Parse(tc.args); err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			if got := *metrics; got != tc.want {
+				t.Fatalf("metrics = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRegisterBoolFlagPairNegativeFlagString(t *testing.T) {
+	fs := flag.NewFlagSet("vekil", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	registerBoolFlagPair(fs, "metrics", true, "Expose Prometheus-compatible /metrics endpoint", "Disable Prometheus-compatible /metrics endpoint")
+
+	noMetrics := fs.Lookup("no-metrics")
+	if noMetrics == nil {
+		t.Fatal("no-metrics flag not registered")
+	}
+	if got := noMetrics.DefValue; got != "false" {
+		t.Fatalf("no-metrics default = %q, want %q", got, "false")
+	}
+	if got := noMetrics.Value.String(); got != "false" {
+		t.Fatalf("no-metrics String() before parse = %q, want %q", got, "false")
+	}
+	if err := fs.Parse([]string{"--no-metrics"}); err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if got := noMetrics.Value.String(); got != "true" {
+		t.Fatalf("no-metrics String() after parse = %q, want %q", got, "true")
 	}
 }
 
