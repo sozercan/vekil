@@ -293,7 +293,7 @@ func (h *ProxyHandler) runGeminiCountTokensProbe(parentCtx context.Context, base
 	probeReq.MaxCompletionTokens = &one
 	probeReq.MaxTokens = nil
 
-	oaiResp, fallback, err := h.executeGeminiCountTokensProbe(parentCtx, probeReq)
+	oaiResp, fallback, err := h.executeGeminiCountTokensProbe(probeReq)
 	if fallback {
 		probeReq.MaxCompletionTokens = nil
 		probeReq.MaxTokens = &one
@@ -302,10 +302,13 @@ func (h *ProxyHandler) runGeminiCountTokensProbe(parentCtx context.Context, base
 	return oaiResp, err
 }
 
-func (h *ProxyHandler) executeGeminiCountTokensProbe(parentCtx context.Context, probeReq *models.OpenAIRequest) (*models.OpenAIResponse, bool, error) {
+func (h *ProxyHandler) executeGeminiCountTokensProbe(probeReq *models.OpenAIRequest) (*models.OpenAIResponse, bool, error) {
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
-	upstreamCtx = withRequestMetricsObserver(upstreamCtx, requestMetricsObserverFromContext(parentCtx))
+	// This first countTokens probe is exploratory. Some providers reject
+	// max_completion_tokens and we immediately retry with max_tokens instead, so
+	// don't attach request metrics here and accidentally count that expected 400
+	// as an upstream error for an otherwise successful request.
 
 	body, err := json.Marshal(probeReq)
 	if err != nil {

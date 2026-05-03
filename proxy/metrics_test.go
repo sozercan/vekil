@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/models"
 )
 
 func newMetricsTestProxyHandler(t testing.TB, backend http.HandlerFunc, opts ...Option) *ProxyHandler {
@@ -351,6 +353,75 @@ func TestMetricsHandleGeminiCountTokensRecordsPromptOnly(t *testing.T) {
 	}, "17")
 	assertMetricMissing(t, metricsText, "vekil_tokens_total", map[string]string{
 		"direction":    "completion",
+		"endpoint":     "/v1/models/*:countTokens",
+		"provider":     "copilot",
+		"public_model": "gemini-2.5-pro",
+	})
+}
+
+func TestMetricsHandleGeminiCountTokensFallbackDoesNotRecordExpected400(t *testing.T) {
+	callCount := 0
+	handler := newMetricsTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("unexpected upstream path %q", r.URL.Path)
+		}
+
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+
+		switch callCount {
+		case 1:
+			if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != 1 {
+				t.Fatalf("MaxCompletionTokens = %v, want 1", oaiReq.MaxCompletionTokens)
+			}
+			if oaiReq.MaxTokens != nil {
+				t.Fatalf("MaxTokens = %v, want nil", oaiReq.MaxTokens)
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"max_completion_tokens unsupported"}`))
+		case 2:
+			if oaiReq.MaxCompletionTokens != nil {
+				t.Fatalf("MaxCompletionTokens = %v, want nil", oaiReq.MaxCompletionTokens)
+			}
+			if oaiReq.MaxTokens == nil || *oaiReq.MaxTokens != 1 {
+				t.Fatalf("MaxTokens = %v, want 1", oaiReq.MaxTokens)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-gemini","object":"chat.completion","created":0,"model":"gemini-2.5-pro","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":17,"completion_tokens":1,"total_tokens":18}}`))
+		default:
+			t.Fatalf("unexpected upstream call %d", callCount)
+		}
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/models/gemini-2.5-pro:countTokens", strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`))
+	handler.HandleGeminiModels(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if callCount != 2 {
+		t.Fatalf("callCount = %d, want 2", callCount)
+	}
+
+	metricsText := renderMetricsText(t, handler)
+	assertMetricLine(t, metricsText, "vekil_requests_total", map[string]string{
+		"endpoint":     "/v1/models/*:countTokens",
+		"provider":     "copilot",
+		"public_model": "gemini-2.5-pro",
+		"status":       "200",
+	}, "1")
+	assertMetricLine(t, metricsText, "vekil_tokens_total", map[string]string{
+		"direction":    "prompt",
+		"endpoint":     "/v1/models/*:countTokens",
+		"provider":     "copilot",
+		"public_model": "gemini-2.5-pro",
+	}, "17")
+	assertMetricMissing(t, metricsText, "vekil_upstream_errors_total", map[string]string{
+		"code":         "400",
 		"endpoint":     "/v1/models/*:countTokens",
 		"provider":     "copilot",
 		"public_model": "gemini-2.5-pro",
