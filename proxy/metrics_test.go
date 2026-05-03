@@ -1,10 +1,13 @@
 package proxy
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,13 +45,13 @@ func TestHandleOpenAIChatCompletionsRecordsMetrics(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
-	if got := testutil.ToFloat64(h.metrics.requestsTotal.WithLabelValues("copilot", unknownMetricsLabel, "/v1/chat/completions", "200")); got != 1 {
+	if got := testutil.ToFloat64(h.metrics.requestsTotal.WithLabelValues("copilot", "gpt-4", "/v1/chat/completions", "200")); got != 1 {
 		t.Fatalf("requests_total = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", unknownMetricsLabel, "prompt")); got != 5 {
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", "gpt-4", "prompt")); got != 5 {
 		t.Fatalf("prompt tokens_total = %v, want 5", got)
 	}
-	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", unknownMetricsLabel, "completion")); got != 3 {
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", "gpt-4", "completion")); got != 3 {
 		t.Fatalf("completion tokens_total = %v, want 3", got)
 	}
 	if got := testutil.ToFloat64(h.metrics.inflightRequests.WithLabelValues("copilot")); got != 0 {
@@ -85,21 +88,147 @@ func TestHandleResponsesStreamingRecordsMetricsOnClose(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
-	if got := testutil.ToFloat64(h.metrics.requestsTotal.WithLabelValues("copilot", unknownMetricsLabel, "/v1/responses", "200")); got != 1 {
+	if got := testutil.ToFloat64(h.metrics.requestsTotal.WithLabelValues("copilot", "gpt-4", "/v1/responses", "200")); got != 1 {
 		t.Fatalf("requests_total = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", unknownMetricsLabel, "prompt")); got != 11 {
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", "gpt-4", "prompt")); got != 11 {
 		t.Fatalf("prompt tokens_total = %v, want 11", got)
 	}
-	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", unknownMetricsLabel, "completion")); got != 7 {
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", "gpt-4", "completion")); got != 7 {
 		t.Fatalf("completion tokens_total = %v, want 7", got)
 	}
 	if got := histogramSampleCount(t, h.metrics.registry, "vekil_stream_first_byte_latency_seconds", map[string]string{
 		"provider":     "copilot",
-		"public_model": unknownMetricsLabel,
+		"public_model": "gpt-4",
 		"endpoint":     "/v1/responses",
 	}); got != 1 {
 		t.Fatalf("stream first-byte sample_count = %d, want 1", got)
+	}
+}
+
+func TestHandleCompactRecordsMetricsUsage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("path = %q, want /responses", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint summary"}]}],"usage":{"input_tokens":17,"output_tokens":9,"total_tokens":26}}`)
+	}))
+	defer upstream.Close()
+
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		withCopilotBaseURLForTest(upstream.URL),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"gpt-4","input":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.HandleCompact(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if got := testutil.ToFloat64(h.metrics.requestsTotal.WithLabelValues("copilot", "gpt-4", "/v1/responses/compact", "200")); got != 1 {
+		t.Fatalf("requests_total = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", "gpt-4", "prompt")); got != 17 {
+		t.Fatalf("prompt tokens_total = %v, want 17", got)
+	}
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", "gpt-4", "completion")); got != 9 {
+		t.Fatalf("completion tokens_total = %v, want 9", got)
+	}
+}
+
+func TestHandleCompactChunkedFallbackAggregatesMetricsUsage(t *testing.T) {
+	largeText := strings.Repeat("a", 3*1024*1024)
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "first " + largeText},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "assistant",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "second " + largeText},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "third " + largeText},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("path = %q, want /responses", r.URL.Path)
+		}
+
+		switch calls.Add(1) {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = fmt.Fprint(w, `{"error":{"message":"payload too large"}}`)
+		case 2:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"resp-chunk-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary one"}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}`)
+		case 3:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"resp-chunk-2","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary two"}]}],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}`)
+		case 4:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"resp-merged","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"merged summary"}]}],"usage":{"input_tokens":11,"output_tokens":4,"total_tokens":15}}`)
+		default:
+			t.Fatalf("unexpected upstream request #%d", calls.Load())
+		}
+	}))
+	defer upstream.Close()
+
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		withCopilotBaseURLForTest(upstream.URL),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.HandleCompact(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if calls.Load() != 4 {
+		t.Fatalf("upstream request count = %d, want 4", calls.Load())
+	}
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", "gpt-5.4", "prompt")); got != 23 {
+		t.Fatalf("prompt tokens_total = %v, want 23", got)
+	}
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", "gpt-5.4", "completion")); got != 9 {
+		t.Fatalf("completion tokens_total = %v, want 9", got)
 	}
 }
 
@@ -135,10 +264,10 @@ func TestHandleOpenAIChatCompletionsRecordsRetryMetrics(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
-	if got := testutil.ToFloat64(h.metrics.retriesTotal.WithLabelValues("copilot", unknownMetricsLabel, "429")); got != 1 {
+	if got := testutil.ToFloat64(h.metrics.retriesTotal.WithLabelValues("copilot", "gpt-4", "429")); got != 1 {
 		t.Fatalf("retries_total = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(h.metrics.upstreamErrorsTotal.WithLabelValues("copilot", unknownMetricsLabel, "429")); got != 1 {
+	if got := testutil.ToFloat64(h.metrics.upstreamErrorsTotal.WithLabelValues("copilot", "gpt-4", "429")); got != 1 {
 		t.Fatalf("upstream_errors_total = %v, want 1", got)
 	}
 }
@@ -220,6 +349,31 @@ func TestHandleResponsesWebSocketRecordsMetrics(t *testing.T) {
 		"endpoint":     "/v1/responses",
 	}); got != 1 {
 		t.Fatalf("stream first-byte sample_count = %d, want 1", got)
+	}
+}
+
+func TestMetricsPublicModelLabelCapsUnconfiguredModelsPerProvider(t *testing.T) {
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		withCopilotBaseURLForTest("http://upstream.test"),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+
+	for i := 0; i < maxDynamicMetricsPublicModelsPerProvider; i++ {
+		model := fmt.Sprintf("model-%02d", i)
+		if got := h.metricsPublicModelLabel(model, "/responses"); got != model {
+			t.Fatalf("metricsPublicModelLabel(%q) = %q, want %q", model, got, model)
+		}
+	}
+
+	if got := h.metricsPublicModelLabel("model-overflow", "/responses"); got != otherRequestedModelMetricsLabel {
+		t.Fatalf("overflow metricsPublicModelLabel = %q, want %q", got, otherRequestedModelMetricsLabel)
+	}
+	if got := h.metricsPublicModelLabel("model-00", "/responses"); got != "model-00" {
+		t.Fatalf("existing admitted model label = %q, want model-00", got)
 	}
 }
 

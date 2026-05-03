@@ -19,7 +19,12 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-const unknownMetricsLabel = "unknown"
+const (
+	unknownMetricsLabel                      = "unknown"
+	otherRequestedModelMetricsLabel          = "other_requested_model"
+	maxDynamicMetricsPublicModelsPerProvider = 32
+	maxDynamicMetricsPublicModelLabelLength  = 128
+)
 
 // BuildInfo labels the build_info metric and is populated from injected
 // build metadata when available, then from Go's embedded build info.
@@ -59,6 +64,8 @@ type proxyMetrics struct {
 	inflightRequests       *prometheus.GaugeVec
 	endpointHealthy        *prometheus.GaugeVec
 	buildInfo              *prometheus.GaugeVec
+	dynamicPublicModelsMu  sync.Mutex
+	dynamicPublicModels    map[string]map[string]struct{}
 }
 
 type requestMetrics struct {
@@ -92,6 +99,20 @@ type responsesTokenUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 	TotalTokens  int `json:"total_tokens"`
+}
+
+func addResponsesUsage(total, delta *responsesTokenUsage) *responsesTokenUsage {
+	if delta == nil {
+		return total
+	}
+	if total == nil {
+		copy := *delta
+		return &copy
+	}
+	total.InputTokens += delta.InputTokens
+	total.OutputTokens += delta.OutputTokens
+	total.TotalTokens += delta.TotalTokens
+	return total
 }
 
 type openAIStreamUsageTap struct {
@@ -255,6 +276,59 @@ func sanitizeMetricsLabel(value string) string {
 		return unknownMetricsLabel
 	}
 	return value
+}
+
+func sanitizeDynamicMetricsPublicModelLabel(value string) string {
+	value = strings.TrimSpace(value)
+	switch {
+	case value == "":
+		return unknownMetricsLabel
+	case len(value) > maxDynamicMetricsPublicModelLabelLength:
+		return otherRequestedModelMetricsLabel
+	case strings.ContainsAny(value, "\r\n\t"):
+		return otherRequestedModelMetricsLabel
+	default:
+		return value
+	}
+}
+
+// boundedRequestedPublicModelLabel preserves request-supplied model IDs for a
+// small, per-provider set of passthrough/unconfigured models so metrics stay
+// per-provider/model for common requests without allowing unbounded label
+// growth from arbitrary client input. Once the per-provider cap is reached,
+// additional unknown models fold into other_requested_model.
+func (m *proxyMetrics) boundedRequestedPublicModelLabel(providerID, publicModel string) string {
+	publicModel = sanitizeDynamicMetricsPublicModelLabel(publicModel)
+	if publicModel == unknownMetricsLabel || publicModel == otherRequestedModelMetricsLabel {
+		return publicModel
+	}
+	if m == nil {
+		return publicModel
+	}
+
+	providerID = sanitizeMetricsLabel(providerID)
+
+	m.dynamicPublicModelsMu.Lock()
+	defer m.dynamicPublicModelsMu.Unlock()
+
+	if m.dynamicPublicModels == nil {
+		m.dynamicPublicModels = make(map[string]map[string]struct{})
+	}
+
+	models := m.dynamicPublicModels[providerID]
+	if models == nil {
+		models = make(map[string]struct{}, maxDynamicMetricsPublicModelsPerProvider)
+		m.dynamicPublicModels[providerID] = models
+	}
+	if _, ok := models[publicModel]; ok {
+		return publicModel
+	}
+	if len(models) >= maxDynamicMetricsPublicModelsPerProvider {
+		return otherRequestedModelMetricsLabel
+	}
+
+	models[publicModel] = struct{}{}
+	return publicModel
 }
 
 func (h *ProxyHandler) newRequestMetrics(endpoint string) *requestMetrics {
@@ -446,9 +520,13 @@ func (h *ProxyHandler) metricsPublicModelLabel(publicModel, upstreamEndpoint str
 		return unknownMetricsLabel
 	}
 
-	_, owner, known := h.resolveProviderModel(model, upstreamEndpoint)
+	provider, owner, known := h.resolveProviderModel(model, upstreamEndpoint)
 	if !known {
-		return unknownMetricsLabel
+		providerID := unknownMetricsLabel
+		if provider != nil {
+			providerID = provider.id
+		}
+		return h.metrics.boundedRequestedPublicModelLabel(providerID, model)
 	}
 
 	return sanitizeMetricsLabel(owner.publicID)

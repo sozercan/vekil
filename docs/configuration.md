@@ -204,6 +204,8 @@ Both latency histograms use Prometheus default second buckets:
 
 `vekil_request_duration_seconds` is observed when the proxied request fully completes. For streamed HTTP responses, `vekil_stream_first_byte_latency_seconds` records time-to-first-byte separately, while the full request duration is still recorded only when the stream closes.
 
+Request, token, retry, and upstream-error metrics are labeled by `provider` and `public_model`. Configured/discovered model ownership uses the configured public ID directly. For passthrough requests that supply an unconfigured model string, Vekil preserves a small per-provider set of request-supplied model IDs and folds additional new values into `public_model="other_requested_model"` so Prometheus label cardinality stays bounded.
+
 An example Grafana dashboard is available at [`docs/grafana-metrics-dashboard.json`](grafana-metrics-dashboard.json).
 
 ## WebSocket Session Tuning
