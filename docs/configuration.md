@@ -14,6 +14,8 @@ Vekil supports two runtime patterns:
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
+| `--metrics` | `METRICS` | `true` | Expose Prometheus metrics at `GET /metrics` |
+| `--no-metrics` | — | `false` | Disable the Prometheus `/metrics` endpoint even when `METRICS=true` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 
 ## Copilot Header Overrides
@@ -180,6 +182,29 @@ Routing rules:
 - The example Azure `gpt-5.4-pro` model shown above is `/responses`-only. Do not advertise `/chat/completions` for that model unless you have verified native support.
 
 Use the examples above as a starting point for your local providers config file. JSON and YAML use the same snake_case field names.
+
+## Metrics
+
+When metrics are enabled, `GET /metrics` exposes Prometheus text exposition for:
+
+- `vekil_requests_total`
+- `vekil_request_duration_seconds`
+- `vekil_stream_first_byte_latency_seconds`
+- `vekil_tokens_total`
+- `vekil_retries_total`
+- `vekil_upstream_errors_total`
+- `vekil_inflight_requests`
+- `vekil_endpoint_healthy`
+- `vekil_build_info`
+- standard Go runtime and process collectors from the Prometheus Go client
+
+Both latency histograms use Prometheus default second buckets:
+
+`0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10`
+
+`vekil_request_duration_seconds` is observed when the proxied request fully completes. For streamed HTTP responses, `vekil_stream_first_byte_latency_seconds` records time-to-first-byte separately, while the full request duration is still recorded only when the stream closes.
+
+An example Grafana dashboard is available at [`docs/grafana-metrics-dashboard.json`](grafana-metrics-dashboard.json).
 
 ## WebSocket Session Tuning
 

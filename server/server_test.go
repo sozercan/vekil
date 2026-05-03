@@ -2,6 +2,8 @@ package server
 
 import (
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -94,5 +96,61 @@ func TestNew_DerivesWriteTimeoutFromConfiguredProxyHandler(t *testing.T) {
 				t.Fatalf("WriteTimeout = %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+func TestNew_ExposesMetricsRouteWhenEnabled(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+		WithMetricsConfig(proxy.MetricsConfig{
+			Enabled: true,
+			BuildInfo: proxy.BuildInfo{
+				Version:   "1.2.3",
+				GoVersion: "go-test",
+				Commit:    "abc123",
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /metrics status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `vekil_build_info{commit="abc123",go_version="go-test",version="1.2.3"} 1`) {
+		t.Fatalf("expected build info metric in response body, got:\n%s", body)
+	}
+	if !strings.Contains(body, "go_gc_duration_seconds") {
+		t.Fatalf("expected Go runtime metrics in response body, got:\n%s", body)
+	}
+}
+
+func TestNew_DisablesMetricsRouteWhenConfigured(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+		WithMetricsConfig(proxy.MetricsConfig{Enabled: false}),
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("GET /metrics status = %d, want 404", w.Code)
 	}
 }

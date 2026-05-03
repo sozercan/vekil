@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,28 +26,49 @@ type geminiCountTokensCacheEntry struct {
 	expiry   time.Time
 }
 
-// HandleGeminiModels routes Gemini-native model actions to the corresponding
-// translation handler.
-func (h *ProxyHandler) HandleGeminiModels(w http.ResponseWriter, r *http.Request) {
-	model, action, err := parseGeminiPath(r.URL.Path)
-	if err != nil {
-		h.writeGeminiProtocolError(w, err)
-		return
-	}
-
-	switch action {
+func geminiMetricsEndpoint(action string) string {
+	switch strings.TrimSpace(action) {
 	case "generateContent":
-		h.handleGeminiGenerateContent(w, r, model, false)
+		return "/gemini/generateContent"
 	case "streamGenerateContent":
-		h.handleGeminiGenerateContent(w, r, model, true)
+		return "/gemini/streamGenerateContent"
 	case "countTokens":
-		h.handleGeminiCountTokens(w, r, model)
+		return "/gemini/countTokens"
 	default:
-		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", fmt.Sprintf("unsupported Gemini action %q", action))
+		return "/gemini"
 	}
 }
 
-func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *http.Request, pathModel string, stream bool) {
+// HandleGeminiModels routes Gemini-native model actions to the corresponding
+// translation handler.
+func (h *ProxyHandler) HandleGeminiModels(w http.ResponseWriter, r *http.Request) {
+	mw := newMetricsResponseWriter(w)
+	requestMetrics := h.newRequestMetrics("/gemini")
+	defer requestMetrics.finish(mw)
+
+	model, action, err := parseGeminiPath(r.URL.Path)
+	if err != nil {
+		h.writeGeminiProtocolError(mw, err)
+		return
+	}
+	requestMetrics.setEndpoint(geminiMetricsEndpoint(action))
+
+	switch action {
+	case "generateContent":
+		requestMetrics.setRouting(h, model, "/chat/completions", false)
+		h.handleGeminiGenerateContent(mw, r, model, false, requestMetrics)
+	case "streamGenerateContent":
+		requestMetrics.setRouting(h, model, "/chat/completions", true)
+		h.handleGeminiGenerateContent(mw, r, model, true, requestMetrics)
+	case "countTokens":
+		requestMetrics.setRouting(h, model, "/chat/completions", false)
+		h.handleGeminiCountTokens(mw, r, model, requestMetrics)
+	default:
+		writeGeminiError(mw, http.StatusBadRequest, "INVALID_ARGUMENT", fmt.Sprintf("unsupported Gemini action %q", action))
+	}
+}
+
+func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *http.Request, pathModel string, stream bool, requestMetrics *requestMetrics) {
 	body, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
@@ -110,9 +132,10 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	}
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			StreamOpenAIToGemini(w, resp.Body)
+			StreamOpenAIToGeminiObserved(w, resp.Body, requestMetrics.setOpenAIUsage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			requestMetrics.setOpenAIUsage(oaiResp.Usage)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(oaiResp))
 		},
@@ -122,6 +145,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 			if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 				return err
 			}
+			requestMetrics.setOpenAIUsage(parsed.Usage)
 
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(&parsed))
@@ -137,7 +161,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	}
 }
 
-func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request, pathModel string) {
+func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request, pathModel string, _ *requestMetrics) {
 	body, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)

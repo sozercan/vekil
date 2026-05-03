@@ -52,6 +52,11 @@ func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 	return WithProxyOptions(proxy.WithStreamingUpstreamTimeout(timeout))
 }
 
+// WithMetricsConfig configures Prometheus metrics exposure and build labels.
+func WithMetricsConfig(cfg proxy.MetricsConfig) Option {
+	return WithProxyOptions(proxy.WithMetricsConfig(cfg))
+}
+
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
 	cfg := options{}
@@ -79,6 +84,9 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
 	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)
+	if handler.MetricsEnabled() {
+		mux.Handle("GET /metrics", handler.MetricsHandler())
+	}
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{

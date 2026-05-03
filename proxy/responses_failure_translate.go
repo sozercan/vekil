@@ -161,10 +161,18 @@ func (s *responsesPreparedStream) abort() {
 }
 
 func peekAndForwardResponses(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string) {
-	peekAndForwardResponsesWithConfig(h, w, r, resp, upstreamCancel, model, responsesPrecommitPeekTimeout, responsesPrecommitMaxPeekBytes)
+	peekAndForwardResponsesObserved(h, w, r, resp, upstreamCancel, model, nil)
+}
+
+func peekAndForwardResponsesObserved(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, onUsage func(*responsesTokenUsage)) {
+	peekAndForwardResponsesWithConfigObserved(h, w, r, resp, upstreamCancel, model, responsesPrecommitPeekTimeout, responsesPrecommitMaxPeekBytes, onUsage)
 }
 
 func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, peekTimeout time.Duration, maxPeekBytes int) {
+	peekAndForwardResponsesWithConfigObserved(h, w, r, resp, upstreamCancel, model, peekTimeout, maxPeekBytes, nil)
+}
+
+func peekAndForwardResponsesWithConfigObserved(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, peekTimeout time.Duration, maxPeekBytes int, onUsage func(*responsesTokenUsage)) {
 	if upstreamCancel != nil {
 		defer upstreamCancel()
 	}
@@ -188,7 +196,7 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 	resp = prepared.commitResponse()
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(http.StatusOK)
-	streamResponsesPipeWithFailureLog(h, w, resp.Body, resp.Header)
+	streamResponsesPipeWithFailureLogObserved(h, w, resp.Body, resp.Header, onUsage)
 }
 
 func prepareResponsesStreamAttempt(waitCtx, streamCtx context.Context, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
@@ -453,6 +461,10 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 }
 
 func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header) {
+	streamResponsesPipeWithFailureLogObserved(h, w, r, upstreamHeaders, nil)
+}
+
+func streamResponsesPipeWithFailureLogObserved(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header, onUsage func(*responsesTokenUsage)) {
 	if closer, ok := r.(io.Closer); ok {
 		defer func() { _ = closer.Close() }()
 	}
@@ -462,7 +474,7 @@ func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r
 		fw.flusher = f
 	}
 
-	tap := newResponsesFailureTap(h, upstreamHeaders)
+	tap := newResponsesFailureTap(h, upstreamHeaders, onUsage)
 	_, _ = io.Copy(fw, io.TeeReader(r, tap))
 }
 
@@ -639,13 +651,15 @@ type responsesFailureTap struct {
 	h               *ProxyHandler
 	upstreamHeaders http.Header
 	parser          responsesSSEParser
+	onUsage         func(*responsesTokenUsage)
 }
 
-func newResponsesFailureTap(h *ProxyHandler, upstreamHeaders http.Header) *responsesFailureTap {
+func newResponsesFailureTap(h *ProxyHandler, upstreamHeaders http.Header, onUsage func(*responsesTokenUsage)) *responsesFailureTap {
 	return &responsesFailureTap{
 		h:               h,
 		upstreamHeaders: upstreamHeaders,
 		parser:          responsesSSEParser{allowBOM: true},
+		onUsage:         onUsage,
 	}
 }
 
@@ -656,6 +670,7 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 		if !ok {
 			break
 		}
+		t.maybeObserveUsage(msg)
 		t.maybeLog(msg)
 	}
 	if len(t.parser.pending) > responsesFailureTapMaxBuffer {
@@ -663,6 +678,30 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 		t.parser.allowBOM = false
 	}
 	return len(p), nil
+}
+
+func (t *responsesFailureTap) maybeObserveUsage(msg responsesSSEMessage) {
+	if t == nil || t.onUsage == nil {
+		return
+	}
+
+	eventName := strings.TrimSpace(msg.event)
+	if eventName != "" && eventName != "response.completed" {
+		return
+	}
+
+	event, err := parseResponsesStreamEvent(msg.data)
+	if err != nil {
+		return
+	}
+	if eventName == "" {
+		eventName = strings.TrimSpace(event.Type)
+	}
+	if eventName != "response.completed" || event.Response.Usage == nil {
+		return
+	}
+
+	t.onUsage(event.Response.Usage)
 }
 
 func (t *responsesFailureTap) maybeLog(msg responsesSSEMessage) {

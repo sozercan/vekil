@@ -26,6 +26,13 @@ const (
 	cliCommandLogout
 )
 
+// buildVersion and buildCommit can be injected with -ldflags at build time.
+// Local builds fall back to dev/embedded Go build info.
+var (
+	buildVersion = "dev"
+	buildCommit  = ""
+)
+
 func main() {
 	// Dispatch subcommands before falling through to the default server mode.
 	switch commandFromArgs(os.Args) {
@@ -216,6 +223,8 @@ func runServe() {
 	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
 	providersConfigPath := flag.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration")
 	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
+	metrics := flag.Bool("metrics", getEnvBool("METRICS", true), "Expose Prometheus metrics at /metrics")
+	noMetrics := flag.Bool("no-metrics", false, "Disable Prometheus metrics exposure")
 	streamingUpstreamTimeout := flag.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
 	copilotEditorVersion := flag.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header")
 	copilotPluginVersion := flag.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
@@ -254,6 +263,13 @@ func runServe() {
 		log,
 		*host,
 		*port,
+		server.WithMetricsConfig(proxy.MetricsConfig{
+			Enabled: *metrics && !*noMetrics,
+			BuildInfo: proxy.BuildInfo{
+				Version: buildVersion,
+				Commit:  buildCommit,
+			},
+		}),
 		server.WithStreamingUpstreamTimeout(*streamingUpstreamTimeout),
 		server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
 			EditorVersion:       *copilotEditorVersion,

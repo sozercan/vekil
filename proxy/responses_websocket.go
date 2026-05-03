@@ -57,6 +57,7 @@ type responsesWebSocketStreamEvent struct {
 		ID                string                                    `json:"id"`
 		Error             responsesWebSocketStreamError             `json:"error"`
 		IncompleteDetails responsesWebSocketStreamIncompleteDetails `json:"incomplete_details"`
+		Usage             *responsesTokenUsage                      `json:"usage,omitempty"`
 	} `json:"response,omitempty"`
 	Item json.RawMessage `json:"item,omitempty"`
 }

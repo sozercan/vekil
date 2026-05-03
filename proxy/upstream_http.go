@@ -158,18 +158,19 @@ func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body [
 }
 
 func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header) (*http.Response, error) {
+	publicModel := extractRequestModel(body)
 	provider, rewrittenBody, err := h.resolveProviderRequest(body, path)
 	if err != nil {
 		return nil, err
 	}
 
-	return h.doWithRetry(func() (*http.Request, error) {
+	return h.doWithRetryObserved(func() (*http.Request, error) {
 		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "")
 		if err != nil {
 			return nil, err
 		}
 		return req, nil
-	})
+	}, h.newUpstreamRequestMetrics(provider, publicModel))
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
@@ -181,8 +182,19 @@ func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte
 }
 
 func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
+	writeUpstreamResponseObserved(w, resp, nil)
+}
+
+func writeUpstreamResponseObserved(w http.ResponseWriter, resp *http.Response, observeBody func([]byte, http.Header)) {
 	defer func() { _ = resp.Body.Close() }()
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	if observeBody == nil {
+		_, _ = io.Copy(w, resp.Body)
+		return
+	}
+
+	var body bytes.Buffer
+	_, _ = io.Copy(w, io.TeeReader(resp.Body, &body))
+	observeBody(body.Bytes(), resp.Header)
 }

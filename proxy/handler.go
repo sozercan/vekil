@@ -185,6 +185,8 @@ type ProxyHandler struct {
 	client                   *http.Client
 	copilotURL               string
 	copilotHeaders           CopilotHeaderConfig
+	metricsConfig            MetricsConfig
+	metrics                  *proxyMetrics
 	providersConfig          ProvidersConfig
 	providersState           *providerSetup
 	responsesWS              ResponsesWebSocketConfig
@@ -266,6 +268,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		},
 		copilotURL:               "https://api.githubcopilot.com",
 		copilotHeaders:           DefaultCopilotHeaderConfig(),
+		metricsConfig:            DefaultMetricsConfig(),
 		responsesWS:              DefaultResponsesWebSocketConfig(),
 		streamingUpstreamTimeout: streamingUpstreamTimeout,
 		log:                      log,
@@ -275,6 +278,11 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 			opt(h)
 		}
 	}
+	metrics, err := newProxyMetrics(h.metricsConfig)
+	if err != nil {
+		return nil, err
+	}
+	h.metrics = metrics
 	if err := h.initializeProviders(); err != nil {
 		return nil, err
 	}
@@ -290,6 +298,19 @@ func (h *ProxyHandler) effectiveStreamingUpstreamTimeout() time.Duration {
 		return DefaultStreamingUpstreamTimeout()
 	}
 	return normalizeStreamingUpstreamTimeout(h.streamingUpstreamTimeout)
+}
+
+// MetricsEnabled reports whether the Prometheus /metrics endpoint is enabled.
+func (h *ProxyHandler) MetricsEnabled() bool {
+	return h != nil && h.metrics != nil && h.metrics.enabled
+}
+
+// MetricsHandler returns the Prometheus exposition handler.
+func (h *ProxyHandler) MetricsHandler() http.Handler {
+	if h == nil || h.metrics == nil {
+		return http.NotFoundHandler()
+	}
+	return h.metrics.handler()
 }
 
 // ServerWriteTimeout returns the HTTP server write timeout derived from the
@@ -420,11 +441,17 @@ func (h *ProxyHandler) checkProviderReady(ctx context.Context, provider *provide
 
 	resp, err := h.client.Do(req)
 	if err != nil {
+		if h.metrics != nil {
+			h.metrics.setEndpointHealthy(provider.id, "/models", false)
+		}
 		return fmt.Errorf("provider %q upstream probe failed: %w", provider.id, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
+		if h.metrics != nil {
+			h.metrics.setEndpointHealthy(provider.id, "/models", false)
+		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		message := fmt.Sprintf("provider %q upstream probe returned %d", provider.id, resp.StatusCode)
 		if trimmed := strings.TrimSpace(string(body)); trimmed != "" {
@@ -433,6 +460,9 @@ func (h *ProxyHandler) checkProviderReady(ctx context.Context, provider *provide
 		return fmt.Errorf("%s", message)
 	}
 
+	if h.metrics != nil {
+		h.metrics.setEndpointHealthy(provider.id, "/models", true)
+	}
 	return nil
 }
 
