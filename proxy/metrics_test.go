@@ -34,11 +34,12 @@ func newMetricsTestProxyHandler(t testing.TB, backend http.HandlerFunc, opts ...
 func seedMetricsTestModels(t testing.TB, handler *ProxyHandler, publicModels ...string) {
 	t.Helper()
 
-	if handler == nil || handler.providersState != nil {
+	if handler == nil {
 		return
 	}
-
-	handler.providersState = defaultProviderSetup(handler)
+	if handler.providersState == nil {
+		handler.providersState = defaultProviderSetup(handler)
+	}
 	models := make([]providerModel, 0, len(publicModels))
 	for _, publicModel := range publicModels {
 		publicModel = strings.TrimSpace(publicModel)
@@ -102,6 +103,50 @@ func assertMetricLine(t testing.TB, metricsText, metricName string, labels map[s
 	}
 
 	t.Fatalf("metric %s with labels %v and value %q not found in:\n%s", metricName, labels, wantValue, metricsText)
+}
+
+func TestMetricsHandleOpenAIChatCompletionsDiscoversRuntimeModelLabels(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4","object":"model","supported_endpoints":["/chat/completions","/responses"]}]}`))
+		case "/chat/completions":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","created":0,"model":"gpt-4","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`))
+		default:
+			t.Fatalf("unexpected upstream path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	handler, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.New(logger.LevelInfo), withCopilotBaseURLForTest(server.URL))
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	handler.client = server.Client()
+	handler.retryBaseDelay = time.Millisecond
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`))
+	handler.HandleOpenAIChatCompletions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	metricsText := renderMetricsText(t, handler)
+	assertMetricLine(t, metricsText, "vekil_requests_total", map[string]string{
+		"endpoint":     "/v1/chat/completions",
+		"provider":     "copilot",
+		"public_model": "gpt-4",
+		"status":       "200",
+	}, "1")
+	assertMetricLine(t, metricsText, "vekil_tokens_total", map[string]string{
+		"direction":    "prompt",
+		"endpoint":     "/v1/chat/completions",
+		"provider":     "copilot",
+		"public_model": "gpt-4",
+	}, "5")
 }
 
 func TestMetricsHandleOpenAIChatCompletions(t *testing.T) {

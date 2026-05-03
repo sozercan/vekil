@@ -25,6 +25,7 @@ import (
 const (
 	unknownMetricLabel              = "unknown"
 	metricsUsageBodyLimit           = 8 << 20
+	metricsModelDiscoveryTimeout    = 2 * time.Second
 	clientClosedRequestMetricStatus = 499
 )
 
@@ -627,5 +628,39 @@ func (h *ProxyHandler) resolveMetricsLabels(publicModel, upstreamEndpoint string
 	if known {
 		return providerID, normalizeMetricLabel(owner.publicID)
 	}
+	if owner, resolved := h.resolveRuntimeMetricsModel(provider, publicModel, upstreamEndpoint); resolved {
+		return providerID, normalizeMetricLabel(owner.publicID)
+	}
 	return providerID, unknownMetricLabel
+}
+
+func (h *ProxyHandler) resolveRuntimeMetricsModel(provider *providerRuntime, publicModel, upstreamEndpoint string) (providerModel, bool) {
+	if h == nil || provider == nil || !providerUsesDynamicModels(provider) {
+		return providerModel{}, false
+	}
+
+	setup := h.providerSetup()
+	if len(setup.modelsForProvider(provider.id)) > 0 {
+		return providerModel{}, false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), metricsModelDiscoveryTimeout)
+	defer cancel()
+
+	result, err := h.fetchProviderModels(ctx, provider, "", "")
+	if err != nil {
+		return providerModel{}, false
+	}
+	if err := setup.replaceProviderModels(provider.id, result.models); err != nil {
+		return providerModel{}, false
+	}
+
+	owner, ok := setup.lookupModel(publicModel)
+	if !ok || owner.providerID != provider.id {
+		return providerModel{}, false
+	}
+	if !providerModelSupportsEndpoint(owner, upstreamEndpoint) {
+		return providerModel{}, false
+	}
+	return owner, true
 }

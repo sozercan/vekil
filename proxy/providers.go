@@ -298,6 +298,7 @@ func (ps *providerSetup) modelsForProvider(providerID string) []providerModel {
 
 func (h *ProxyHandler) initializeProviders() error {
 	if len(h.providersConfig.Providers) == 0 {
+		h.providersState = defaultProviderSetup(h)
 		return nil
 	}
 
