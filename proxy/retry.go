@@ -53,6 +53,13 @@ func drainAndClose(body io.ReadCloser) {
 // doWithRetry executes an HTTP request with retry on transient failures.
 // The reqFactory is called on each attempt to produce a fresh request body.
 func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*http.Response, error) {
+	return h.doWithRetryWithMetrics(nil, reqFactory)
+}
+
+// doWithRetryWithMetrics executes an HTTP request with retry on transient
+// failures and emits retry metrics for logical client requests when a tracker
+// is provided.
+func (h *ProxyHandler) doWithRetryWithMetrics(tracker *requestMetricsTracker, reqFactory func() (*http.Request, error)) (*http.Response, error) {
 	maxRetries := h.maxRetries
 	if maxRetries == 0 {
 		maxRetries = 3
@@ -73,6 +80,9 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		if err != nil {
 			lastErr = err
 			if attempt < maxRetries-1 {
+				if tracker != nil {
+					tracker.RecordRetry(retryMetricReasonFromError(err))
+				}
 				if ctxErr := sleepWithContext(req.Context(), backoff(retryDelay, attempt)); ctxErr != nil {
 					return nil, ctxErr
 				}
@@ -91,6 +101,9 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		lastErr = &upstreamError{statusCode: resp.StatusCode}
 
 		if attempt < maxRetries-1 {
+			if tracker != nil {
+				tracker.RecordRetry(retryMetricReason(resp.StatusCode))
+			}
 			delay := backoff(retryDelay, attempt)
 			if ra, ok := parseRetryAfter(retryAfterHeader); ok && ra > delay {
 				delay = ra

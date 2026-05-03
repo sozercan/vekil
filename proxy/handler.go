@@ -185,11 +185,14 @@ type ProxyHandler struct {
 	client                   *http.Client
 	copilotURL               string
 	copilotHeaders           CopilotHeaderConfig
+	buildInfo                BuildInfo
 	providersConfig          ProvidersConfig
 	providersState           *providerSetup
 	responsesWS              ResponsesWebSocketConfig
 	streamingUpstreamTimeout time.Duration
 	log                      *logger.Logger
+	metricsEnabled           bool
+	metrics                  *proxyMetrics
 	maxRetries               int
 	retryBaseDelay           time.Duration
 	models                   modelsCache
@@ -266,14 +269,19 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		},
 		copilotURL:               "https://api.githubcopilot.com",
 		copilotHeaders:           DefaultCopilotHeaderConfig(),
+		buildInfo:                DefaultBuildInfo(),
 		responsesWS:              DefaultResponsesWebSocketConfig(),
 		streamingUpstreamTimeout: streamingUpstreamTimeout,
 		log:                      log,
+		metricsEnabled:           true,
 	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(h)
 		}
+	}
+	if h.metricsEnabled {
+		h.metrics = newProxyMetrics(h.buildInfo)
 	}
 	if err := h.initializeProviders(); err != nil {
 		return nil, err

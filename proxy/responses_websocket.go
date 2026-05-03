@@ -52,13 +52,16 @@ type responsesWebSocketJSONField struct {
 }
 
 type responsesWebSocketStreamEvent struct {
-	Type     string `json:"type"`
-	Response struct {
-		ID                string                                    `json:"id"`
-		Error             responsesWebSocketStreamError             `json:"error"`
-		IncompleteDetails responsesWebSocketStreamIncompleteDetails `json:"incomplete_details"`
-	} `json:"response,omitempty"`
-	Item json.RawMessage `json:"item,omitempty"`
+	Type     string                           `json:"type"`
+	Response responsesWebSocketStreamResponse `json:"response,omitempty"`
+	Item     json.RawMessage                  `json:"item,omitempty"`
+}
+
+type responsesWebSocketStreamResponse struct {
+	ID                string                                    `json:"id"`
+	Error             responsesWebSocketStreamError             `json:"error"`
+	IncompleteDetails responsesWebSocketStreamIncompleteDetails `json:"incomplete_details"`
+	Usage             *responsesUsage                           `json:"usage,omitempty"`
 }
 
 type responsesWebSocketStreamError struct {

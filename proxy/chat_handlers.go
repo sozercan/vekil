@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/sozercan/vekil/logger"
@@ -107,13 +108,24 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	body, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
+		tracker := h.beginRequestMetrics("/v1/messages", "/chat/completions", "")
+		tracker.Finish(status)
 		writeAnthropicError(w, status, "invalid_request_error", err.Error())
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
 
+	tracker := h.beginRequestMetrics("/v1/messages", "/chat/completions", extractRequestModel(body))
+	statusCode := 0
+	defer func() {
+		if tracker != nil && statusCode != 0 {
+			tracker.Finish(statusCode)
+		}
+	}()
+
 	var req models.AnthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
+		statusCode = http.StatusBadRequest
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON in request body")
 		return
 	}
@@ -127,6 +139,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	oaiBody, mode, err := prepareAnthropicChatCompletionsRequest(&req)
 	if err != nil {
+		statusCode = http.StatusBadRequest
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("translation error: %v", err))
 		return
 	}
@@ -134,9 +147,12 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 
-	resp, err := h.postChatCompletions(upstreamCtx, oaiBody)
+	resp, err := h.postChatCompletionsWithMetrics(upstreamCtx, oaiBody, tracker)
 	if err != nil {
-		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		statusCode = upstreamStatusCode(err, http.StatusBadGateway)
+		if code, ok := upstreamErrorMetricCode(err); ok {
+			tracker.RecordUpstreamError(code)
+		}
 		h.log.Error("upstream request failed", logger.F("endpoint", "anthropic"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
 			writeAnthropicError(w, statusCode, "invalid_request_error", err.Error())
@@ -159,23 +175,29 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			logger.F("body", string(errBody)),
 			logger.F("request", string(oaiBody)),
 		)
+		tracker.RecordUpstreamError(strconv.Itoa(resp.StatusCode))
+		statusCode = resp.StatusCode
 		writeAnthropicError(w, resp.StatusCode, "api_error", fmt.Sprintf("upstream error (%d)", resp.StatusCode))
 		return
 	}
 
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			StreamOpenAIToAnthropic(w, resp.Body, req.Model, "msg_"+uuid.New().String())
+			streamOpenAIToAnthropicWithObserver(w, resp.Body, req.Model, "msg_"+uuid.New().String(), tracker)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			tracker.ObserveOpenAIUsage(oaiResp.Usage)
 			anthropicResp := TranslateOpenAIToAnthropic(oaiResp, req.Model)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(anthropicResp)
 		},
 	})
 	if err != nil {
+		statusCode = http.StatusBadGateway
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "failed to aggregate upstream response")
+		return
 	}
+	statusCode = http.StatusOK
 }
 
 // HandleOpenAIChatCompletions handles POST /v1/chat/completions by forwarding the
@@ -184,19 +206,32 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	bodyBytes, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
+		tracker := h.beginRequestMetrics("/v1/chat/completions", "/chat/completions", "")
+		tracker.Finish(status)
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+
+	tracker := h.beginRequestMetrics("/v1/chat/completions", "/chat/completions", extractRequestModel(bodyBytes))
+	statusCode := 0
+	defer func() {
+		if tracker != nil && statusCode != 0 {
+			tracker.Finish(statusCode)
+		}
+	}()
 
 	bodyBytes, mode := prepareOpenAIChatCompletionsRequest(bodyBytes)
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 
-	resp, err := h.postChatCompletions(upstreamCtx, bodyBytes)
+	resp, err := h.postChatCompletionsWithMetrics(upstreamCtx, bodyBytes, tracker)
 	if err != nil {
-		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		statusCode = upstreamStatusCode(err, http.StatusBadGateway)
+		if code, ok := upstreamErrorMetricCode(err); ok {
+			tracker.RecordUpstreamError(code)
+		}
 		h.log.Error("upstream request failed", logger.F("endpoint", "openai"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
 			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
@@ -213,16 +248,29 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
 			copyPassthroughHeaders(w.Header(), resp.Header)
-			StreamOpenAIPassthrough(w, resp.Body)
+			streamOpenAIPassthroughWithObserver(w, resp.Body, tracker)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			tracker.ObserveOpenAIUsage(oaiResp.Usage)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(oaiResp)
 		},
+		passthrough: func(resp *http.Response) error {
+			if resp.StatusCode != http.StatusOK {
+				tracker.RecordUpstreamError(strconv.Itoa(resp.StatusCode))
+			}
+			writeUpstreamResponseWithObserver(w, resp, func(body []byte) {
+				tracker.ObserveOpenAIUsage(extractOpenAIUsageFromBody(body))
+			})
+			return nil
+		},
 	})
 	if err != nil {
+		statusCode = http.StatusBadGateway
 		writeOpenAIError(w, http.StatusBadGateway, "failed to aggregate upstream response", "server_error")
+		return
 	}
+	statusCode = resp.StatusCode
 }
 
 func hasNonEmptyTools(raw json.RawMessage) bool {

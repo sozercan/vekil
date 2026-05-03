@@ -52,6 +52,16 @@ func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 	return WithProxyOptions(proxy.WithStreamingUpstreamTimeout(timeout))
 }
 
+// WithMetricsEnabled enables or disables the Prometheus /metrics endpoint.
+func WithMetricsEnabled(enabled bool) Option {
+	return WithProxyOptions(proxy.WithMetricsEnabled(enabled))
+}
+
+// WithBuildInfo forwards build metadata used by vekil_build_info.
+func WithBuildInfo(info proxy.BuildInfo) Option {
+	return WithProxyOptions(proxy.WithBuildInfo(info))
+}
+
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
 	cfg := options{}
@@ -79,6 +89,9 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
 	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)
+	if metricsHandler := handler.MetricsHandler(); metricsHandler != nil {
+		mux.Handle("GET /metrics", metricsHandler)
+	}
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{

@@ -71,22 +71,49 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 
 // StreamOpenAIPassthrough streams OpenAI SSE bytes directly to the client with no parsing.
 func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
+	streamOpenAIPassthroughWithObserver(w, body, nil)
+}
+
+func streamOpenAIPassthroughWithObserver(w http.ResponseWriter, body io.ReadCloser, tracker *requestMetricsTracker) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
+	w = newFirstByteObserverResponseWriter(w, func() {
+		if tracker != nil {
+			tracker.ObserveFirstByte()
+		}
+	})
 
 	fw := &flushWriter{w: w}
 	if f, ok := w.(http.Flusher); ok {
 		fw.flusher = f
 	}
+	reader := io.Reader(body)
+	var usageTap *openAIStreamUsageTap
+	if tracker != nil {
+		usageTap = newOpenAIStreamUsageTap()
+		reader = io.TeeReader(reader, usageTap)
+	}
 	// Errors here (client disconnect, upstream drop) are unrecoverable for SSE
 	// since headers have already been sent. The client must handle truncated streams.
-	_, _ = io.Copy(fw, body)
+	_, _ = io.Copy(fw, reader)
+	if tracker != nil {
+		tracker.ObserveOpenAIUsage(usageTap.usageCopy())
+	}
 }
 
 // StreamOpenAIToAnthropic translates an OpenAI SSE stream into Anthropic SSE format.
 func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model string, requestID string) {
+	streamOpenAIToAnthropicWithObserver(w, body, model, requestID, nil)
+}
+
+func streamOpenAIToAnthropicWithObserver(w http.ResponseWriter, body io.ReadCloser, model string, requestID string, tracker *requestMetricsTracker) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
+	w = newFirstByteObserverResponseWriter(w, func() {
+		if tracker != nil {
+			tracker.ObserveFirstByte()
+		}
+	})
 
 	state := newAnthropicStreamState(w, model, requestID)
 	if !state.start() {
@@ -98,6 +125,9 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 		return
 	}
 
+	if tracker != nil {
+		tracker.ObserveOpenAIUsage(state.storedUsage)
+	}
 	_ = state.finish()
 }
 

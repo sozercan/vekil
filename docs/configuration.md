@@ -14,7 +14,31 @@ Vekil supports two runtime patterns:
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
+| `--metrics` | `METRICS` | `true` | Expose Prometheus metrics at `GET /metrics` |
+| `--no-metrics` | — | `false` | Disable the Prometheus metrics endpoint even if `METRICS=true` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
+
+## Prometheus Metrics
+
+By default Vekil exposes a Prometheus-compatible `GET /metrics` endpoint on the same listener as the proxy API. Disable it with `--no-metrics` (or `--metrics=false`) if you need a smaller local surface.
+
+The proxy exports:
+
+- `vekil_requests_total`
+- `vekil_request_duration_seconds`
+- `vekil_request_first_byte_latency_seconds` for streaming endpoints
+- `vekil_tokens_total`
+- `vekil_retries_total`
+- `vekil_upstream_errors_total`
+- `vekil_inflight_requests`
+- `vekil_build_info`
+- standard Go runtime/process metrics from `client_golang`
+
+`vekil_request_duration_seconds` and `vekil_request_first_byte_latency_seconds` use Prometheus' default histogram buckets in seconds:
+
+`0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10`
+
+An example Grafana dashboard lives at [`docs/grafana-dashboard.json`](grafana-dashboard.json).
 
 ## Copilot Header Overrides
 

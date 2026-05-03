@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/sozercan/vekil/logger"
@@ -45,10 +46,20 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
+		tracker := h.beginRequestMetrics("/v1/responses", "/responses", "")
+		tracker.Finish(status)
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+
+	tracker := h.beginRequestMetrics("/v1/responses", "/responses", extractRequestModel(bodyBytes))
+	statusCode := 0
+	defer func() {
+		if tracker != nil && statusCode != 0 {
+			tracker.Finish(statusCode)
+		}
+	}()
 
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses", true)
 
@@ -63,9 +74,12 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(isStreaming)
 	defer upstreamCancel()
 
-	resp, err := h.postResponsesWithHeaders(upstreamCtx, bodyBytes, extraHeaders)
+	resp, err := h.postResponsesWithHeadersAndMetrics(upstreamCtx, bodyBytes, extraHeaders, tracker)
 	if err != nil {
-		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		statusCode = upstreamStatusCode(err, http.StatusBadGateway)
+		if code, ok := upstreamErrorMetricCode(err); ok {
+			tracker.RecordUpstreamError(code)
+		}
 		h.log.Error("upstream request failed", logger.F("endpoint", "responses"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
 			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
@@ -78,9 +92,12 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
 		return
 	}
-	resp, err = h.maybeRetryCompactedResponsesRequest(upstreamCtx, bodyBytes, extraHeaders, resp)
+	resp, err = h.maybeRetryCompactedResponsesRequestWithMetrics(upstreamCtx, bodyBytes, extraHeaders, resp, tracker)
 	if err != nil {
-		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		statusCode = upstreamStatusCode(err, http.StatusBadGateway)
+		if code, ok := upstreamErrorMetricCode(err); ok {
+			tracker.RecordUpstreamError(code)
+		}
 		h.log.Error("upstream request failed", logger.F("endpoint", "responses"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
 			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
@@ -96,11 +113,17 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	if isStreaming && resp.StatusCode == http.StatusOK {
 		model := extractRequestModel(bodyBytes)
-		peekAndForwardResponses(h, w, r, resp, upstreamCancel, model)
+		statusCode = peekAndForwardResponsesWithConfigAndTracker(h, w, r, resp, upstreamCancel, model, responsesPrecommitPeekTimeout, responsesPrecommitMaxPeekBytes, tracker)
 		return
 	}
 
-	writeUpstreamResponse(w, resp)
+	if resp.StatusCode != http.StatusOK {
+		tracker.RecordUpstreamError(strconv.Itoa(resp.StatusCode))
+	}
+	writeUpstreamResponseWithObserver(w, resp, func(body []byte) {
+		tracker.ObserveResponsesUsage(extractResponsesUsageFromBody(body))
+	})
+	statusCode = resp.StatusCode
 }
 
 // compactPrompt is the system instruction used when the upstream does not
@@ -139,15 +162,26 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
+		tracker := h.beginRequestMetrics("/v1/responses/compact", "/responses", "")
+		tracker.Finish(status)
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
 
+	tracker := h.beginRequestMetrics("/v1/responses/compact", "/responses", extractRequestModel(bodyBytes))
+	statusCode := 0
+	defer func() {
+		if tracker != nil && statusCode != 0 {
+			tracker.Finish(statusCode)
+		}
+	}()
+
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/compact", false)
 
 	var body map[string]json.RawMessage
 	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+		statusCode = http.StatusBadRequest
 		writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
 		return
 	}
@@ -155,9 +189,12 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
 
-	summaryText, resp, err := h.compactResponsesRequest(upstreamCtx, body, responsesExtraHeadersFromRequest(r))
+	summaryText, resp, err := h.compactResponsesRequestWithMetrics(upstreamCtx, body, responsesExtraHeadersFromRequest(r), tracker)
 	if err != nil {
-		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		statusCode = upstreamStatusCode(err, http.StatusBadGateway)
+		if code, ok := upstreamErrorMetricCode(err); ok {
+			tracker.RecordUpstreamError(code)
+		}
 		h.log.Error("upstream request failed", logger.F("endpoint", "compact"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
 			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
@@ -171,6 +208,10 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if resp != nil {
+		if resp.StatusCode != http.StatusOK {
+			tracker.RecordUpstreamError(strconv.Itoa(resp.StatusCode))
+		}
+		statusCode = resp.StatusCode
 		defer func() { _ = resp.Body.Close() }()
 		if contentType := resp.Header.Get("Content-Type"); contentType != "" {
 			w.Header().Set("Content-Type", contentType)
@@ -180,6 +221,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	statusCode = http.StatusOK
 	writeCompactResponse(w, summaryText)
 }
 
@@ -201,10 +243,20 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
+		tracker := h.beginRequestMetrics("/v1/memories/trace_summarize", "/responses", "")
+		tracker.Finish(status)
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+
+	tracker := h.beginRequestMetrics("/v1/memories/trace_summarize", "/responses", extractRequestModel(bodyBytes))
+	statusCode := 0
+	defer func() {
+		if tracker != nil && statusCode != 0 {
+			tracker.Finish(statusCode)
+		}
+	}()
 
 	var memReq struct {
 		Model     string            `json:"model"`
@@ -212,6 +264,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		Reasoning json.RawMessage   `json:"reasoning,omitempty"`
 	}
 	if err := json.Unmarshal(bodyBytes, &memReq); err != nil {
+		statusCode = http.StatusBadRequest
 		writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
 		return
 	}
@@ -240,9 +293,12 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
 
-	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, reqBody, responsesExtraHeadersFromRequest(r))
+	resp, err := h.postResponsesWithFallbackHeadersAndMetrics(upstreamCtx, reqBody, responsesExtraHeadersFromRequest(r), tracker)
 	if err != nil {
-		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		statusCode = upstreamStatusCode(err, http.StatusBadGateway)
+		if code, ok := upstreamErrorMetricCode(err); ok {
+			tracker.RecordUpstreamError(code)
+		}
 		h.log.Error("upstream request failed", logger.F("endpoint", "memory_summarize"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
 			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
@@ -258,6 +314,8 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
+		tracker.RecordUpstreamError(strconv.Itoa(resp.StatusCode))
+		statusCode = resp.StatusCode
 		if contentType := resp.Header.Get("Content-Type"); contentType != "" {
 			w.Header().Set("Content-Type", contentType)
 		}
@@ -268,12 +326,15 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		statusCode = http.StatusBadGateway
 		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
 		return
 	}
+	tracker.ObserveResponsesUsage(extractResponsesUsageFromBody(respBody))
 
 	summaryText, err := extractResponsesOutputText(respBody)
 	if err != nil {
+		statusCode = http.StatusBadGateway
 		writeOpenAIError(w, http.StatusBadGateway, "failed to parse upstream response", "server_error")
 		return
 	}
@@ -313,6 +374,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		Output: summaries,
 	}
 
+	statusCode = http.StatusOK
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(memResp)
 }
@@ -382,10 +444,18 @@ func writeCompactResponse(w http.ResponseWriter, summaryText string) {
 }
 
 func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header) (string, *http.Response, error) {
-	return h.compactResponsesRequestDepth(ctx, requestFields, extraHeaders, 0)
+	return h.compactResponsesRequestWithMetrics(ctx, requestFields, extraHeaders, nil)
+}
+
+func (h *ProxyHandler) compactResponsesRequestWithMetrics(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, tracker *requestMetricsTracker) (string, *http.Response, error) {
+	return h.compactResponsesRequestDepthWithMetrics(ctx, requestFields, extraHeaders, 0, tracker)
 }
 
 func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int) (string, *http.Response, error) {
+	return h.compactResponsesRequestDepthWithMetrics(ctx, requestFields, extraHeaders, depth, nil)
+}
+
+func (h *ProxyHandler) compactResponsesRequestDepthWithMetrics(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int, tracker *requestMetricsTracker) (string, *http.Response, error) {
 	if depth > 8 {
 		return "", nil, fmt.Errorf("compaction chunk recursion limit exceeded")
 	}
@@ -395,7 +465,7 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 		return "", nil, err
 	}
 
-	resp, err := h.postResponsesWithFallbackHeaders(ctx, bodyBytes, extraHeaders)
+	resp, err := h.postResponsesWithFallbackHeadersAndMetrics(ctx, bodyBytes, extraHeaders, tracker)
 	if err != nil {
 		return "", nil, err
 	}
@@ -405,6 +475,9 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 		respBody, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return "", nil, err
+		}
+		if tracker != nil {
+			tracker.ObserveResponsesUsage(extractResponsesUsageFromBody(respBody))
 		}
 		summary, err := extractResponsesOutputText(respBody)
 		if err != nil {
@@ -430,7 +503,7 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 		)
 	}
 
-	summary, err := h.compactResponsesRequestInChunks(ctx, requestFields, extraHeaders, depth+1)
+	summary, err := h.compactResponsesRequestInChunksWithMetrics(ctx, requestFields, extraHeaders, depth+1, tracker)
 	if err != nil {
 		h.log.Debug("chunked compact request failed", logger.Err(err))
 		return "", originalResp, nil
@@ -490,6 +563,10 @@ func readBodyWithCap(r io.Reader, maxBytes int) ([]byte, bool, error) {
 }
 
 func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int) (string, error) {
+	return h.compactResponsesRequestInChunksWithMetrics(ctx, requestFields, extraHeaders, depth, nil)
+}
+
+func (h *ProxyHandler) compactResponsesRequestInChunksWithMetrics(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int, tracker *requestMetricsTracker) (string, error) {
 	var input []json.RawMessage
 	if err := json.Unmarshal(requestFields["input"], &input); err != nil {
 		return "", err
@@ -515,7 +592,7 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 	summaries := make([]string, 0, len(chunks))
 	for i, chunk := range chunks {
 		chunkFields := copyResponsesRequestFieldsWithInput(requestFields, chunk)
-		summary, resp, err := h.compactResponsesRequestDepth(ctx, chunkFields, extraHeaders, depth)
+		summary, resp, err := h.compactResponsesRequestDepthWithMetrics(ctx, chunkFields, extraHeaders, depth, tracker)
 		if err != nil {
 			return "", err
 		}
@@ -527,7 +604,7 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 		summaries = append(summaries, summary)
 	}
 
-	return h.mergeCompactionSummaries(ctx, requestFields, summaries, extraHeaders, depth)
+	return h.mergeCompactionSummariesWithMetrics(ctx, requestFields, summaries, extraHeaders, depth, tracker)
 }
 
 func copyResponsesRequestFieldsWithInput(requestFields map[string]json.RawMessage, input []json.RawMessage) map[string]json.RawMessage {
@@ -595,6 +672,10 @@ func encodedRawMessageSize(raw json.RawMessage) (int, error) {
 }
 
 func (h *ProxyHandler) mergeCompactionSummaries(ctx context.Context, requestFields map[string]json.RawMessage, summaries []string, extraHeaders http.Header, depth int) (string, error) {
+	return h.mergeCompactionSummariesWithMetrics(ctx, requestFields, summaries, extraHeaders, depth, nil)
+}
+
+func (h *ProxyHandler) mergeCompactionSummariesWithMetrics(ctx context.Context, requestFields map[string]json.RawMessage, summaries []string, extraHeaders http.Header, depth int, tracker *requestMetricsTracker) (string, error) {
 	switch len(summaries) {
 	case 0:
 		return "", nil
@@ -621,7 +702,7 @@ func (h *ProxyHandler) mergeCompactionSummaries(ctx context.Context, requestFiel
 	}
 
 	mergeFields := copyResponsesRequestFieldsWithInput(requestFields, input)
-	summary, resp, err := h.compactResponsesRequestDepth(ctx, mergeFields, extraHeaders, depth)
+	summary, resp, err := h.compactResponsesRequestDepthWithMetrics(ctx, mergeFields, extraHeaders, depth, tracker)
 	if err != nil {
 		return "", err
 	}
@@ -775,7 +856,11 @@ func stripUnsupportedResponsesToolChoice(rawToolChoice json.RawMessage, noRemain
 }
 
 func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, bodyBytes []byte, extraHeaders http.Header) (*http.Response, error) {
-	resp, err := h.postResponsesWithHeaders(ctx, bodyBytes, extraHeaders)
+	return h.postResponsesWithFallbackHeadersAndMetrics(ctx, bodyBytes, extraHeaders, nil)
+}
+
+func (h *ProxyHandler) postResponsesWithFallbackHeadersAndMetrics(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, tracker *requestMetricsTracker) (*http.Response, error) {
+	resp, err := h.postResponsesWithHeadersAndMetrics(ctx, bodyBytes, extraHeaders, tracker)
 	if err != nil {
 		return nil, err
 	}
@@ -820,7 +905,7 @@ func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, bod
 		logger.F("fallback_model", fallbackModel),
 	)
 
-	retryResp, retryErr := h.postResponsesWithHeaders(ctx, fallbackBody, extraHeaders)
+	retryResp, retryErr := h.postResponsesWithHeadersAndMetrics(ctx, fallbackBody, extraHeaders, tracker)
 	if retryErr != nil {
 		h.log.Debug("responses fallback request failed", logger.Err(retryErr))
 		return resp, nil
@@ -830,6 +915,10 @@ func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, bod
 }
 
 func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, resp *http.Response) (*http.Response, error) {
+	return h.maybeRetryCompactedResponsesRequestWithMetrics(ctx, bodyBytes, extraHeaders, resp, nil)
+}
+
+func (h *ProxyHandler) maybeRetryCompactedResponsesRequestWithMetrics(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, resp *http.Response, tracker *requestMetricsTracker) (*http.Response, error) {
 	if resp == nil || resp.StatusCode != http.StatusRequestEntityTooLarge {
 		return resp, nil
 	}
@@ -860,7 +949,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, 
 	}
 
 	prefixLen := len(input) - keepTail
-	summary, err := h.compactResponsesInput(ctx, model, input[:prefixLen], extraHeaders)
+	summary, err := h.compactResponsesInputWithMetrics(ctx, model, input[:prefixLen], extraHeaders, tracker)
 	if err != nil {
 		h.log.Debug("responses 413 compaction failed", logger.Err(err))
 		return resp, nil
@@ -906,7 +995,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, 
 		logger.F("compacted_bytes", rawMessagesSize(compactedInput)),
 	)
 
-	retryResp, retryErr := h.postResponsesWithHeaders(ctx, retryBody, extraHeaders)
+	retryResp, retryErr := h.postResponsesWithHeadersAndMetrics(ctx, retryBody, extraHeaders, tracker)
 	if retryErr != nil {
 		h.log.Debug("responses 413 retry request failed", logger.Err(retryErr))
 		return resp, nil
@@ -916,6 +1005,10 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, 
 }
 
 func (h *ProxyHandler) compactResponsesInput(ctx context.Context, model string, input []json.RawMessage, extraHeaders http.Header) (string, error) {
+	return h.compactResponsesInputWithMetrics(ctx, model, input, extraHeaders, nil)
+}
+
+func (h *ProxyHandler) compactResponsesInputWithMetrics(ctx context.Context, model string, input []json.RawMessage, extraHeaders http.Header, tracker *requestMetricsTracker) (string, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return "", fmt.Errorf("missing model for websocket compaction")
@@ -934,7 +1027,7 @@ func (h *ProxyHandler) compactResponsesInput(ctx context.Context, model string, 
 		"model": modelRaw,
 		"input": inputRaw,
 	}
-	summary, resp, err := h.compactResponsesRequest(ctx, requestFields, extraHeaders)
+	summary, resp, err := h.compactResponsesRequestWithMetrics(ctx, requestFields, extraHeaders, tracker)
 	if err != nil {
 		return "", err
 	}

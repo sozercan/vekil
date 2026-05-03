@@ -158,3 +158,7 @@ Returns `{"status":"ok"}`.
 ## `GET /readyz`
 
 Validates that the proxy can authenticate to and successfully probe the configured upstream providers. On success it returns `{"status":"ready"}`. On failure it returns `503` with `{"status":"not_ready","error":"..."}`.
+
+## `GET /metrics`
+
+When metrics are enabled (the default), exposes Prometheus text exposition for Vekil request, latency, retry, error, token, build, and Go runtime metrics. Disable this route with `--no-metrics` or `--metrics=false`.

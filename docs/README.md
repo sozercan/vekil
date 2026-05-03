@@ -11,6 +11,7 @@ This folder is intentionally split into small, single-purpose files so humans an
 | [`clients.md`](clients.md) | copy-paste client examples | onboarding snippets or client compatibility changes |
 | [`api.md`](api.md) | endpoint behavior and compatibility notes | request/response semantics change |
 | [`architecture.md`](architecture.md) | package responsibilities and data flow | implementation boundaries or design decisions change |
+| [`grafana-dashboard.json`](grafana-dashboard.json) | example Prometheus/Grafana observability dashboard | metrics names, labels, or panels change |
 | [`menubar.md`](menubar.md) | macOS/Linux tray app usage | tray behavior or packaging changes |
 | [`development.md`](development.md) | build, test, benchmark, and CI workflows | local dev or CI commands change |
 

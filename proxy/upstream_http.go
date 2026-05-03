@@ -158,12 +158,19 @@ func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body [
 }
 
 func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header) (*http.Response, error) {
+	return h.postJSONEndpointWithMetrics(ctx, path, body, extraHeaders, nil)
+}
+
+func (h *ProxyHandler) postJSONEndpointWithMetrics(ctx context.Context, path string, body []byte, extraHeaders http.Header, tracker *requestMetricsTracker) (*http.Response, error) {
 	provider, rewrittenBody, err := h.resolveProviderRequest(body, path)
 	if err != nil {
 		return nil, err
 	}
+	if tracker != nil && provider != nil {
+		tracker.setProvider(provider.id)
+	}
 
-	return h.doWithRetry(func() (*http.Request, error) {
+	return h.doWithRetryWithMetrics(tracker, func() (*http.Request, error) {
 		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "")
 		if err != nil {
 			return nil, err
@@ -173,11 +180,19 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
-	return h.postJSONEndpoint(ctx, "/chat/completions", body)
+	return h.postChatCompletionsWithMetrics(ctx, body, nil)
+}
+
+func (h *ProxyHandler) postChatCompletionsWithMetrics(ctx context.Context, body []byte, tracker *requestMetricsTracker) (*http.Response, error) {
+	return h.postJSONEndpointWithMetrics(ctx, "/chat/completions", body, nil, tracker)
 }
 
 func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	return h.postJSONEndpointWithHeaders(ctx, "/responses", body, extraHeaders)
+	return h.postResponsesWithHeadersAndMetrics(ctx, body, extraHeaders, nil)
+}
+
+func (h *ProxyHandler) postResponsesWithHeadersAndMetrics(ctx context.Context, body []byte, extraHeaders http.Header, tracker *requestMetricsTracker) (*http.Response, error) {
+	return h.postJSONEndpointWithMetrics(ctx, "/responses", body, extraHeaders, tracker)
 }
 
 func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {

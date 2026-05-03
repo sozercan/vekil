@@ -165,6 +165,10 @@ func peekAndForwardResponses(h *ProxyHandler, w http.ResponseWriter, r *http.Req
 }
 
 func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, peekTimeout time.Duration, maxPeekBytes int) {
+	peekAndForwardResponsesWithConfigAndTracker(h, w, r, resp, upstreamCancel, model, peekTimeout, maxPeekBytes, nil)
+}
+
+func peekAndForwardResponsesWithConfigAndTracker(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, peekTimeout time.Duration, maxPeekBytes int, tracker *requestMetricsTracker) int {
 	if upstreamCancel != nil {
 		defer upstreamCancel()
 	}
@@ -173,13 +177,24 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 	result, hasResult, err := prepared.await(r.Context(), nil, peekTimeout)
 	if err != nil {
 		prepared.abort()
-		return
+		return 0
 	}
 	if hasResult && result.decision == responsesPeekDecisionTranslate {
 		logResponsesPrecommitTranslated(h, result, model, resp.Header)
 		prepared.abort()
+		if tracker != nil {
+			code := ""
+			if result.failure != nil {
+				code = strings.TrimSpace(result.failure.Response.Error.Code)
+			}
+			if code != "" {
+				tracker.RecordUpstreamError(code)
+			} else {
+				tracker.RecordUpstreamError(strconv.Itoa(result.status))
+			}
+		}
 		writeOpenAIErrorWithRetryAfter(w, result.status, result.message, result.errType, result.retryAfter, resp.Header)
-		return
+		return result.status
 	}
 	if hasResult && result.failure != nil && result.decision == responsesPeekDecisionPassthrough {
 		logResponsesPrecommitFailOpen(h, result.failure, model, resp.Header)
@@ -188,7 +203,7 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 	resp = prepared.commitResponse()
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(http.StatusOK)
-	streamResponsesPipeWithFailureLog(h, w, resp.Body, resp.Header)
+	return streamResponsesPipeWithFailureLogWithTracker(h, w, resp.Body, resp.Header, tracker)
 }
 
 func prepareResponsesStreamAttempt(waitCtx, streamCtx context.Context, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
@@ -453,17 +468,41 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 }
 
 func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header) {
+	streamResponsesPipeWithFailureLogWithTracker(h, w, r, upstreamHeaders, nil)
+}
+
+func streamResponsesPipeWithFailureLogWithTracker(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header, tracker *requestMetricsTracker) int {
 	if closer, ok := r.(io.Closer); ok {
 		defer func() { _ = closer.Close() }()
 	}
+
+	w = newFirstByteObserverResponseWriter(w, func() {
+		if tracker != nil {
+			tracker.ObserveFirstByte()
+		}
+	})
 
 	fw := &flushWriter{w: w}
 	if f, ok := w.(http.Flusher); ok {
 		fw.flusher = f
 	}
 
-	tap := newResponsesFailureTap(h, upstreamHeaders)
+	failureTap := newResponsesFailureTap(h, upstreamHeaders)
+	var metricsTap *responsesStreamMetricsTap
+	var tap io.Writer = failureTap
+	if tracker != nil {
+		metricsTap = newResponsesStreamMetricsTap()
+		tap = io.MultiWriter(failureTap, metricsTap)
+	}
 	_, _ = io.Copy(fw, io.TeeReader(r, tap))
+	if tracker != nil {
+		tracker.ObserveResponsesUsage(metricsTap.usageCopy())
+		if status := metricsTap.logicalStatusCode(); status != http.StatusOK {
+			tracker.RecordUpstreamError(strconv.Itoa(status))
+			return status
+		}
+	}
+	return http.StatusOK
 }
 
 func parseResponsesStreamEvent(data string) (responsesWebSocketStreamEvent, error) {
