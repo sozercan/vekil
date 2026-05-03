@@ -136,10 +136,17 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	}
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			usage := StreamOpenAIToGemini(w, resp.Body)
+			observer := requestMetricsObserverFromContext(r.Context())
+			if observer != nil {
+				observer.observeResponseHeaders(resp.Header)
+			}
+			usage := streamOpenAIToGeminiObserved(w, resp.Body, observer)
 			observeOpenAIUsageContext(r.Context(), usage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			if observer := requestMetricsObserverFromContext(r.Context()); observer != nil {
+				observer.observeResponseModel(oaiResp.Model)
+			}
 			observeOpenAIUsageContext(r.Context(), oaiResp.Usage)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(oaiResp))
@@ -149,6 +156,9 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 			var parsed models.OpenAIResponse
 			if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 				return err
+			}
+			if observer := requestMetricsObserverFromContext(r.Context()); observer != nil {
+				observer.observeResponseModel(parsed.Model)
 			}
 			observeOpenAIUsageContext(r.Context(), parsed.Usage)
 

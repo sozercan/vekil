@@ -183,10 +183,12 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			usage := StreamOpenAIToAnthropic(w, resp.Body, req.Model, "msg_"+uuid.New().String())
+			observer.observeResponseHeaders(resp.Header)
+			usage := streamOpenAIToAnthropicObserved(w, resp.Body, req.Model, "msg_"+uuid.New().String(), observer)
 			observeOpenAIUsageContext(r.Context(), usage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			observer.observeResponseModel(oaiResp.Model)
 			observeOpenAIUsageContext(r.Context(), oaiResp.Usage)
 			anthropicResp := TranslateOpenAIToAnthropic(oaiResp, req.Model)
 			w.Header().Set("Content-Type", "application/json")
@@ -244,11 +246,13 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
+			observer.observeResponseHeaders(resp.Header)
 			copyPassthroughHeaders(w.Header(), resp.Header)
-			usage := StreamOpenAIPassthrough(w, resp.Body)
+			usage := streamOpenAIPassthroughObserved(w, resp.Body, observer)
 			observeOpenAIUsageContext(r.Context(), usage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			observer.observeResponseModel(oaiResp.Model)
 			observeOpenAIUsageContext(r.Context(), oaiResp.Usage)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(oaiResp)

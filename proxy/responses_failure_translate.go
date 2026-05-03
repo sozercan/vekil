@@ -456,6 +456,9 @@ func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r
 	if closer, ok := r.(io.Closer); ok {
 		defer func() { _ = closer.Close() }()
 	}
+	if observer != nil {
+		observer.observeResponseHeaders(upstreamHeaders)
+	}
 
 	fw := &flushWriter{w: w}
 	if f, ok := w.(http.Flusher); ok {
@@ -729,6 +732,7 @@ func (t *responsesUsageTap) Write(p []byte) (int, error) {
 		if !ok {
 			break
 		}
+		t.observer.observeResponseModel(extractMetricsResponseModelFromJSONBody([]byte(msg.data)))
 		if usage := extractUsageFromJSONBody([]byte(msg.data)); usage != nil {
 			t.last = usage
 		}

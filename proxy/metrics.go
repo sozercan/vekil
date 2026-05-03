@@ -25,7 +25,6 @@ import (
 const (
 	unknownMetricLabel              = "unknown"
 	metricsUsageBodyLimit           = 8 << 20
-	metricsModelDiscoveryTimeout    = 2 * time.Second
 	clientClosedRequestMetricStatus = 499
 )
 
@@ -49,12 +48,19 @@ type requestMetricsObserver struct {
 	metrics     *metricsCollector
 	provider    string
 	publicModel string
+	requested   string
 	endpoint    string
 	streaming   bool
 	startedAt   time.Time
 	inflight    bool
 	finishOnce  sync.Once
 	firstByte   sync.Once
+	firstSeen   bool
+	firstDelay  float64
+	prompt      int
+	completion  int
+	retries     map[string]int
+	errors      map[string]int
 }
 
 type tokenUsage struct {
@@ -264,7 +270,8 @@ func (o *requestMetricsObserver) observeFirstByte() {
 		return
 	}
 	o.firstByte.Do(func() {
-		o.metrics.streamFirstByteLatency.WithLabelValues(o.provider, o.publicModel, o.endpoint).Observe(time.Since(o.startedAt).Seconds())
+		o.firstSeen = true
+		o.firstDelay = time.Since(o.startedAt).Seconds()
 	})
 }
 
@@ -279,6 +286,7 @@ func (o *requestMetricsObserver) observeOpenAIUsage(usage *models.OpenAIUsage) {
 }
 
 func (o *requestMetricsObserver) observeUsageFromBody(body []byte) {
+	o.observeResponseModel(extractMetricsResponseModelFromJSONBody(body))
 	o.observeUsage(extractUsageFromJSONBody(body))
 }
 
@@ -286,22 +294,53 @@ func (o *requestMetricsObserver) observeUsage(usage *tokenUsage) {
 	if o == nil || o.metrics == nil || usage == nil {
 		return
 	}
-	o.metrics.tokensTotal.WithLabelValues(o.provider, o.publicModel, o.endpoint, "prompt").Add(float64(usage.promptTokens))
-	o.metrics.tokensTotal.WithLabelValues(o.provider, o.publicModel, o.endpoint, "completion").Add(float64(usage.completionTokens))
+	o.prompt += usage.promptTokens
+	o.completion += usage.completionTokens
 }
 
 func (o *requestMetricsObserver) observeRetry(reason string) {
 	if o == nil || o.metrics == nil {
 		return
 	}
-	o.metrics.retriesTotal.WithLabelValues(o.provider, o.publicModel, o.endpoint, normalizeMetricLabel(reason)).Inc()
+	reason = normalizeMetricLabel(reason)
+	if o.retries == nil {
+		o.retries = make(map[string]int, 1)
+	}
+	o.retries[reason]++
 }
 
 func (o *requestMetricsObserver) observeUpstreamError(code string) {
 	if o == nil || o.metrics == nil {
 		return
 	}
-	o.metrics.upstreamErrorsTotal.WithLabelValues(o.provider, o.publicModel, o.endpoint, normalizeMetricLabel(code)).Inc()
+	code = normalizeMetricLabel(code)
+	if o.errors == nil {
+		o.errors = make(map[string]int, 1)
+	}
+	o.errors[code]++
+}
+
+func (o *requestMetricsObserver) observeResponseHeaders(headers http.Header) {
+	if o == nil || headers == nil {
+		return
+	}
+	for _, name := range []string{"OpenAI-Model", "X-OpenAI-Model"} {
+		if model := strings.TrimSpace(headers.Get(name)); model != "" {
+			o.observeResponseModel(model)
+			if o.publicModel != unknownMetricLabel {
+				return
+			}
+		}
+	}
+}
+
+func (o *requestMetricsObserver) observeResponseModel(responseModel string) {
+	if o == nil || o.metrics == nil || o.publicModel != unknownMetricLabel {
+		return
+	}
+	if resolved, ok := resolveMetricsResponsePublicModel(o.requested, responseModel); ok {
+		o.publicModel = normalizeMetricLabel(resolved)
+	}
 }
 
 func (o *requestMetricsObserver) finish(status int) {
@@ -316,6 +355,21 @@ func (o *requestMetricsObserver) finish(status int) {
 		if o.inflight {
 			o.metrics.inflightRequests.WithLabelValues(o.provider).Dec()
 			o.inflight = false
+		}
+		if o.firstSeen {
+			o.metrics.streamFirstByteLatency.WithLabelValues(o.provider, o.publicModel, o.endpoint).Observe(o.firstDelay)
+		}
+		if o.prompt != 0 {
+			o.metrics.tokensTotal.WithLabelValues(o.provider, o.publicModel, o.endpoint, "prompt").Add(float64(o.prompt))
+		}
+		if o.completion != 0 {
+			o.metrics.tokensTotal.WithLabelValues(o.provider, o.publicModel, o.endpoint, "completion").Add(float64(o.completion))
+		}
+		for reason, count := range o.retries {
+			o.metrics.retriesTotal.WithLabelValues(o.provider, o.publicModel, o.endpoint, reason).Add(float64(count))
+		}
+		for code, count := range o.errors {
+			o.metrics.upstreamErrorsTotal.WithLabelValues(o.provider, o.publicModel, o.endpoint, code).Add(float64(count))
 		}
 		o.metrics.requestsTotal.WithLabelValues(o.provider, o.publicModel, o.endpoint, statusLabel).Inc()
 		o.metrics.requestDuration.WithLabelValues(o.provider, o.publicModel, o.endpoint, statusLabel).Observe(time.Since(o.startedAt).Seconds())
@@ -372,6 +426,47 @@ func extractUsageFromJSONBody(body []byte) *tokenUsage {
 	return nil
 }
 
+func extractMetricsResponseModelFromJSONBody(body []byte) string {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return ""
+	}
+
+	var payload struct {
+		Model    string `json:"model,omitempty"`
+		Response *struct {
+			Model string `json:"model,omitempty"`
+		} `json:"response,omitempty"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	if model := strings.TrimSpace(payload.Model); model != "" {
+		return model
+	}
+	if payload.Response != nil {
+		return strings.TrimSpace(payload.Response.Model)
+	}
+	return ""
+}
+
+func resolveMetricsResponsePublicModel(requestedPublicModel, responseModel string) (string, bool) {
+	requestedPublicModel = strings.TrimSpace(requestedPublicModel)
+	responseModel = strings.TrimSpace(responseModel)
+	if requestedPublicModel == "" || responseModel == "" {
+		return "", false
+	}
+	if requestedPublicModel == responseModel {
+		return responseModel, true
+	}
+
+	normalizedRequested := strings.TrimSpace(NormalizeModelName(requestedPublicModel))
+	normalizedResponse := strings.TrimSpace(NormalizeModelName(responseModel))
+	if normalizedRequested == "" || normalizedRequested != normalizedResponse {
+		return "", false
+	}
+	return normalizedResponse, true
+}
+
 func usageFromFields(fields *metricsUsageFields) *tokenUsage {
 	if fields == nil {
 		return nil
@@ -401,6 +496,9 @@ func usageFromFields(fields *metricsUsageFields) *tokenUsage {
 
 func writeUpstreamResponseObserved(w http.ResponseWriter, resp *http.Response, observer *requestMetricsObserver) error {
 	defer func() { _ = resp.Body.Close() }()
+	if observer != nil {
+		observer.observeResponseHeaders(resp.Header)
+	}
 
 	usageTap := newMetricsUsageBodyTap(observer, metricsUsageBodyLimit)
 	buf := make([]byte, 32*1024)
@@ -611,7 +709,11 @@ func (h *ProxyHandler) startRequestMetrics(publicEndpoint, upstreamEndpoint, pub
 		return nil
 	}
 	providerID, metricsPublicModel := h.resolveMetricsLabels(publicModel, upstreamEndpoint)
-	return h.metrics.startRequest(providerID, metricsPublicModel, publicEndpoint, streaming)
+	observer := h.metrics.startRequest(providerID, metricsPublicModel, publicEndpoint, streaming)
+	if observer != nil {
+		observer.requested = strings.TrimSpace(publicModel)
+	}
+	return observer
 }
 
 func (h *ProxyHandler) resolveMetricsLabels(publicModel, upstreamEndpoint string) (string, string) {
@@ -628,39 +730,5 @@ func (h *ProxyHandler) resolveMetricsLabels(publicModel, upstreamEndpoint string
 	if known {
 		return providerID, normalizeMetricLabel(owner.publicID)
 	}
-	if owner, resolved := h.resolveRuntimeMetricsModel(provider, publicModel, upstreamEndpoint); resolved {
-		return providerID, normalizeMetricLabel(owner.publicID)
-	}
 	return providerID, unknownMetricLabel
-}
-
-func (h *ProxyHandler) resolveRuntimeMetricsModel(provider *providerRuntime, publicModel, upstreamEndpoint string) (providerModel, bool) {
-	if h == nil || provider == nil || !providerUsesDynamicModels(provider) {
-		return providerModel{}, false
-	}
-
-	setup := h.providerSetup()
-	if len(setup.modelsForProvider(provider.id)) > 0 {
-		return providerModel{}, false
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), metricsModelDiscoveryTimeout)
-	defer cancel()
-
-	result, err := h.fetchProviderModels(ctx, provider, "", "")
-	if err != nil {
-		return providerModel{}, false
-	}
-	if err := setup.replaceProviderModels(provider.id, result.models); err != nil {
-		return providerModel{}, false
-	}
-
-	owner, ok := setup.lookupModel(publicModel)
-	if !ok || owner.providerID != provider.id {
-		return providerModel{}, false
-	}
-	if !providerModelSupportsEndpoint(owner, upstreamEndpoint) {
-		return providerModel{}, false
-	}
-	return owner, true
 }
