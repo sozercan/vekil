@@ -132,6 +132,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	}
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
+			requestMetrics.markStreamingCommitted()
 			StreamOpenAIToGeminiObserved(w, resp.Body, requestMetrics.setOpenAIUsage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {

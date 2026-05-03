@@ -69,17 +69,18 @@ type proxyMetrics struct {
 }
 
 type requestMetrics struct {
-	metrics        *proxyMetrics
-	start          time.Time
-	endpoint       string
-	provider       string
-	publicModel    string
-	streaming      bool
-	inflight       bool
-	inflightLabel  string
-	openAIUsage    *models.OpenAIUsage
-	responsesUsage *responsesTokenUsage
-	finishOnce     sync.Once
+	metrics         *proxyMetrics
+	start           time.Time
+	endpoint        string
+	provider        string
+	publicModel     string
+	streamRequested bool
+	streaming       bool
+	inflight        bool
+	inflightLabel   string
+	openAIUsage     *models.OpenAIUsage
+	responsesUsage  *responsesTokenUsage
+	finishOnce      sync.Once
 }
 
 type metricsResponseWriter struct {
@@ -152,7 +153,7 @@ func newProxyMetrics(cfg MetricsConfig) (*proxyMetrics, error) {
 		}, []string{"provider", "public_model", "reason"}),
 		upstreamErrorsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "vekil_upstream_errors_total",
-			Help: "Upstream HTTP and timeout errors returned by providers.",
+			Help: "Upstream HTTP, timeout, and streamed semantic errors returned by providers.",
 		}, []string{"provider", "public_model", "code"}),
 		inflightRequests: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "vekil_inflight_requests",
@@ -352,7 +353,8 @@ func (r *requestMetrics) setRouting(h *ProxyHandler, publicModel, upstreamEndpoi
 	}
 
 	r.publicModel = unknownMetricsLabel
-	r.streaming = streaming
+	r.streamRequested = streaming
+	r.streaming = false
 
 	providerID := unknownMetricsLabel
 	if h != nil {
@@ -396,12 +398,37 @@ func (r *requestMetrics) setOpenAIUsage(usage *models.OpenAIUsage) {
 	r.openAIUsage = &copy
 }
 
+func (r *requestMetrics) markStreamingCommitted() {
+	if r == nil || !r.streamRequested {
+		return
+	}
+	r.streaming = true
+}
+
 func (r *requestMetrics) setResponsesUsage(usage *responsesTokenUsage) {
 	if r == nil || usage == nil {
 		return
 	}
 	copy := *usage
-	r.responsesUsage = &copy
+	r.responsesUsage = addResponsesUsage(r.responsesUsage, &copy)
+}
+
+func (r *requestMetrics) observeUpstreamError(code string) {
+	if r == nil || strings.TrimSpace(code) == "" || r.metrics == nil || !r.metrics.enabled {
+		return
+	}
+	r.metrics.observeUpstreamError(r.provider, r.publicModel, code)
+}
+
+func (r *requestMetrics) observeResponsesStreamFailure(event responsesWebSocketStreamEvent) {
+	if r == nil {
+		return
+	}
+	status, _, _ := responsesWebSocketStreamFailureDetails(event)
+	if status == 0 {
+		return
+	}
+	r.observeUpstreamError(strconv.Itoa(status))
 }
 
 func (r *requestMetrics) finish(w *metricsResponseWriter) {

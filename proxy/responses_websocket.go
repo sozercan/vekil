@@ -212,6 +212,7 @@ func newResponsesWebSocketRequestObserver(h *ProxyHandler, model string) *respon
 
 	observer.metrics = h.newRequestMetrics("/v1/responses")
 	observer.metrics.setRouting(h, model, "/responses", true)
+	observer.metrics.markStreamingCommitted()
 	return observer
 }
 
@@ -663,7 +664,7 @@ func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.
 	result.fromItems = len(s.historyItems)
 	result.fromBytes = rawMessagesSize(s.historyItems)
 
-	summary, err := h.compactResponsesInput(ctx, request.Model, prefix, s.requestHeaders(request, false))
+	summary, _, err := h.compactResponsesInput(ctx, request.Model, prefix, s.requestHeaders(request, false))
 	if err != nil {
 		return result, false, err
 	}

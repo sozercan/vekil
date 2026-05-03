@@ -106,6 +106,170 @@ func TestHandleResponsesStreamingRecordsMetricsOnClose(t *testing.T) {
 	}
 }
 
+func TestHandleResponses413AutoCompactionAggregatesMetricsUsage(t *testing.T) {
+	reqBody := `{
+		"model":"gpt-4",
+		"previous_response_id":"resp-prev",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"one"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"two"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"three"}]}
+		]
+	}`
+
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("path = %q, want /responses", r.URL.Path)
+		}
+
+		switch calls.Add(1) {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = fmt.Fprint(w, `{"error":{"message":"payload too large"}}`)
+		case 2:
+			var body map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("failed to decode compaction request: %v", err)
+			}
+			if _, ok := body["instructions"]; !ok {
+				t.Fatalf("expected compacted retry to issue a compaction request")
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"resp-compact","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint summary"}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}`)
+		case 3:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"resp-final","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}}`)
+		default:
+			t.Fatalf("unexpected upstream request #%d", calls.Load())
+		}
+	}))
+	defer upstream.Close()
+
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		withCopilotBaseURLForTest(upstream.URL),
+		WithResponsesWebSocketConfig(ResponsesWebSocketConfig{AutoCompactKeepTail: 2}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.HandleResponses(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("upstream request count = %d, want 3", calls.Load())
+	}
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", "gpt-4", "prompt")); got != 16 {
+		t.Fatalf("prompt tokens_total = %v, want 16", got)
+	}
+	if got := testutil.ToFloat64(h.metrics.tokensTotal.WithLabelValues("copilot", "gpt-4", "completion")); got != 9 {
+		t.Fatalf("completion tokens_total = %v, want 9", got)
+	}
+}
+
+func TestHandleResponsesStreamingTranslatedJSONErrorSkipsStreamFirstByteMetric(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("path = %q, want /responses", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-rate-limit\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"}}}\n\n")
+	}))
+	defer upstream.Close()
+
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		withCopilotBaseURLForTest(upstream.URL),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4","stream":true,"input":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.HandleResponses(w, req)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", w.Code)
+	}
+	if got := histogramSampleCountOrZero(t, h.metrics.registry, "vekil_stream_first_byte_latency_seconds", map[string]string{
+		"provider":     "copilot",
+		"public_model": "gpt-4",
+		"endpoint":     "/v1/responses",
+	}); got != 0 {
+		t.Fatalf("stream first-byte sample_count = %d, want 0", got)
+	}
+}
+
+func TestHandleResponsesStreamingPostCommitFailuresRecordUpstreamErrorMetrics(t *testing.T) {
+	tests := []struct {
+		name           string
+		body           string
+		wantMetricCode string
+	}{
+		{
+			name: "response failed",
+			body: "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n" +
+				"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-1\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"}}}\n\n",
+			wantMetricCode: "429",
+		},
+		{
+			name: "response incomplete",
+			body: "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n" +
+				"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-2\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+			wantMetricCode: "409",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/responses" {
+					t.Fatalf("path = %q, want /responses", r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprint(w, tt.body)
+			}))
+			defer upstream.Close()
+
+			h, err := NewProxyHandler(
+				auth.NewTestAuthenticator("test-token"),
+				logger.New(logger.LevelError),
+				withCopilotBaseURLForTest(upstream.URL),
+			)
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4","stream":true,"input":[]}`))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			h.HandleResponses(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+			if got := testutil.ToFloat64(h.metrics.upstreamErrorsTotal.WithLabelValues("copilot", "gpt-4", tt.wantMetricCode)); got != 1 {
+				t.Fatalf("upstream_errors_total[%s] = %v, want 1", tt.wantMetricCode, got)
+			}
+		})
+	}
+}
+
 func TestHandleCompactRecordsMetricsUsage(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/responses" {
@@ -418,6 +582,28 @@ func histogramSampleCount(t *testing.T, registry gatherer, name string, labels m
 		}
 	}
 	t.Fatalf("metric %s with labels %v not found", name, labels)
+	return 0
+}
+
+func histogramSampleCountOrZero(t *testing.T, registry gatherer, name string, labels map[string]string) uint64 {
+	t.Helper()
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather() error = %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			if labelPairsMatch(metric.GetLabel(), labels) {
+				if metric.GetHistogram() == nil {
+					t.Fatalf("metric %s is not a histogram", name)
+				}
+				return metric.GetHistogram().GetSampleCount()
+			}
+		}
+	}
 	return 0
 }
 

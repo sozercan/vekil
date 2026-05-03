@@ -83,7 +83,9 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(mw, statusCode, "upstream request failed", "server_error")
 		return
 	}
-	resp, err = h.maybeRetryCompactedResponsesRequest(upstreamCtx, bodyBytes, extraHeaders, resp)
+	var compactionUsage *responsesTokenUsage
+	resp, compactionUsage, err = h.maybeRetryCompactedResponsesRequest(upstreamCtx, bodyBytes, extraHeaders, resp)
+	requestMetrics.setResponsesUsage(compactionUsage)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "responses"), logger.Err(err))
@@ -101,7 +103,17 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	if isStreaming && resp.StatusCode == http.StatusOK {
 		model := extractRequestModel(bodyBytes)
-		peekAndForwardResponsesObserved(h, mw, r, resp, upstreamCancel, model, requestMetrics.setResponsesUsage)
+		peekAndForwardResponsesObserved(
+			h,
+			mw,
+			r,
+			resp,
+			upstreamCancel,
+			model,
+			requestMetrics.markStreamingCommitted,
+			requestMetrics.setResponsesUsage,
+			requestMetrics.observeResponsesStreamFailure,
+		)
 		return
 	}
 
@@ -853,47 +865,47 @@ func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, bod
 	return retryResp, nil
 }
 
-func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, resp *http.Response) (*http.Response, error) {
+func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, resp *http.Response) (*http.Response, *responsesTokenUsage, error) {
 	if resp == nil || resp.StatusCode != http.StatusRequestEntityTooLarge {
-		return resp, nil
+		return resp, nil, nil
 	}
 
 	var requestFields map[string]json.RawMessage
 	if err := json.Unmarshal(bodyBytes, &requestFields); err != nil {
-		return resp, nil
+		return resp, nil, nil
 	}
 
 	var previousResponseID string
 	if err := json.Unmarshal(requestFields["previous_response_id"], &previousResponseID); err != nil || strings.TrimSpace(previousResponseID) == "" {
-		return resp, nil
+		return resp, nil, nil
 	}
 
 	var model string
 	if err := json.Unmarshal(requestFields["model"], &model); err != nil || strings.TrimSpace(model) == "" {
-		return resp, nil
+		return resp, nil, nil
 	}
 
 	var input []json.RawMessage
 	if err := json.Unmarshal(requestFields["input"], &input); err != nil {
-		return resp, nil
+		return resp, nil, nil
 	}
 
 	keepTail := h.responsesWebSocketConfig().AutoCompactKeepTail
 	if keepTail <= 0 || len(input) <= keepTail {
-		return resp, nil
+		return resp, nil, nil
 	}
 
 	prefixLen := len(input) - keepTail
-	summary, err := h.compactResponsesInput(ctx, model, input[:prefixLen], extraHeaders)
+	summary, usage, err := h.compactResponsesInput(ctx, model, input[:prefixLen], extraHeaders)
 	if err != nil {
 		h.log.Debug("responses 413 compaction failed", logger.Err(err))
-		return resp, nil
+		return resp, nil, nil
 	}
 
 	checkpoint, err := proxyCompactionContextRawMessage(summary)
 	if err != nil {
 		h.log.Debug("responses 413 compaction checkpoint build failed", logger.Err(err))
-		return resp, nil
+		return resp, usage, nil
 	}
 
 	compactedInput := make([]json.RawMessage, 0, keepTail+1)
@@ -903,20 +915,20 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, 
 	compactedInputRaw, err := json.Marshal(compactedInput)
 	if err != nil {
 		h.log.Debug("responses 413 compaction marshal failed", logger.Err(err))
-		return resp, nil
+		return resp, usage, nil
 	}
 	requestFields["input"] = compactedInputRaw
 
 	retryBody, err := json.Marshal(requestFields)
 	if err != nil {
 		h.log.Debug("responses 413 retry body marshal failed", logger.Err(err))
-		return resp, nil
+		return resp, usage, nil
 	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		_ = resp.Body.Close()
-		return nil, err
+		return nil, usage, err
 	}
 	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(respBody))
@@ -933,41 +945,41 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, 
 	retryResp, retryErr := h.postResponsesWithHeaders(ctx, retryBody, extraHeaders)
 	if retryErr != nil {
 		h.log.Debug("responses 413 retry request failed", logger.Err(retryErr))
-		return resp, nil
+		return resp, usage, nil
 	}
 
-	return retryResp, nil
+	return retryResp, usage, nil
 }
 
-func (h *ProxyHandler) compactResponsesInput(ctx context.Context, model string, input []json.RawMessage, extraHeaders http.Header) (string, error) {
+func (h *ProxyHandler) compactResponsesInput(ctx context.Context, model string, input []json.RawMessage, extraHeaders http.Header) (string, *responsesTokenUsage, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
-		return "", fmt.Errorf("missing model for websocket compaction")
+		return "", nil, fmt.Errorf("missing model for websocket compaction")
 	}
 
 	modelRaw, err := json.Marshal(model)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	inputRaw, err := json.Marshal(input)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	requestFields := map[string]json.RawMessage{
 		"model": modelRaw,
 		"input": inputRaw,
 	}
-	summary, _, resp, err := h.compactResponsesRequest(ctx, requestFields, extraHeaders)
+	summary, usage, resp, err := h.compactResponsesRequest(ctx, requestFields, extraHeaders)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if resp != nil {
 		defer func() { _ = resp.Body.Close() }()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, compactUpstreamErrorBodySize))
-		return "", fmt.Errorf("compaction request returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", nil, fmt.Errorf("compaction request returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	return summary, nil
+	return summary, usage, nil
 }
 
 func isUnsupportedResponsesModelError(statusCode int, body []byte) bool {

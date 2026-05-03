@@ -161,18 +161,18 @@ func (s *responsesPreparedStream) abort() {
 }
 
 func peekAndForwardResponses(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string) {
-	peekAndForwardResponsesObserved(h, w, r, resp, upstreamCancel, model, nil)
+	peekAndForwardResponsesObserved(h, w, r, resp, upstreamCancel, model, nil, nil, nil)
 }
 
-func peekAndForwardResponsesObserved(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, onUsage func(*responsesTokenUsage)) {
-	peekAndForwardResponsesWithConfigObserved(h, w, r, resp, upstreamCancel, model, responsesPrecommitPeekTimeout, responsesPrecommitMaxPeekBytes, onUsage)
+func peekAndForwardResponsesObserved(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, onCommit func(), onUsage func(*responsesTokenUsage), onFailure func(responsesWebSocketStreamEvent)) {
+	peekAndForwardResponsesWithConfigObserved(h, w, r, resp, upstreamCancel, model, responsesPrecommitPeekTimeout, responsesPrecommitMaxPeekBytes, onCommit, onUsage, onFailure)
 }
 
 func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, peekTimeout time.Duration, maxPeekBytes int) {
-	peekAndForwardResponsesWithConfigObserved(h, w, r, resp, upstreamCancel, model, peekTimeout, maxPeekBytes, nil)
+	peekAndForwardResponsesWithConfigObserved(h, w, r, resp, upstreamCancel, model, peekTimeout, maxPeekBytes, nil, nil, nil)
 }
 
-func peekAndForwardResponsesWithConfigObserved(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, peekTimeout time.Duration, maxPeekBytes int, onUsage func(*responsesTokenUsage)) {
+func peekAndForwardResponsesWithConfigObserved(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, peekTimeout time.Duration, maxPeekBytes int, onCommit func(), onUsage func(*responsesTokenUsage), onFailure func(responsesWebSocketStreamEvent)) {
 	if upstreamCancel != nil {
 		defer upstreamCancel()
 	}
@@ -194,9 +194,12 @@ func peekAndForwardResponsesWithConfigObserved(h *ProxyHandler, w http.ResponseW
 	}
 
 	resp = prepared.commitResponse()
+	if onCommit != nil {
+		onCommit()
+	}
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(http.StatusOK)
-	streamResponsesPipeWithFailureLogObserved(h, w, resp.Body, resp.Header, onUsage)
+	streamResponsesPipeWithFailureLogObserved(h, w, resp.Body, resp.Header, onUsage, onFailure)
 }
 
 func prepareResponsesStreamAttempt(waitCtx, streamCtx context.Context, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
@@ -461,10 +464,10 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 }
 
 func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header) {
-	streamResponsesPipeWithFailureLogObserved(h, w, r, upstreamHeaders, nil)
+	streamResponsesPipeWithFailureLogObserved(h, w, r, upstreamHeaders, nil, nil)
 }
 
-func streamResponsesPipeWithFailureLogObserved(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header, onUsage func(*responsesTokenUsage)) {
+func streamResponsesPipeWithFailureLogObserved(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header, onUsage func(*responsesTokenUsage), onFailure func(responsesWebSocketStreamEvent)) {
 	if closer, ok := r.(io.Closer); ok {
 		defer func() { _ = closer.Close() }()
 	}
@@ -474,7 +477,7 @@ func streamResponsesPipeWithFailureLogObserved(h *ProxyHandler, w http.ResponseW
 		fw.flusher = f
 	}
 
-	tap := newResponsesFailureTap(h, upstreamHeaders, onUsage)
+	tap := newResponsesFailureTap(h, upstreamHeaders, onUsage, onFailure)
 	_, _ = io.Copy(fw, io.TeeReader(r, tap))
 }
 
@@ -652,14 +655,17 @@ type responsesFailureTap struct {
 	upstreamHeaders http.Header
 	parser          responsesSSEParser
 	onUsage         func(*responsesTokenUsage)
+	onFailure       func(responsesWebSocketStreamEvent)
+	failureObserved bool
 }
 
-func newResponsesFailureTap(h *ProxyHandler, upstreamHeaders http.Header, onUsage func(*responsesTokenUsage)) *responsesFailureTap {
+func newResponsesFailureTap(h *ProxyHandler, upstreamHeaders http.Header, onUsage func(*responsesTokenUsage), onFailure func(responsesWebSocketStreamEvent)) *responsesFailureTap {
 	return &responsesFailureTap{
 		h:               h,
 		upstreamHeaders: upstreamHeaders,
 		parser:          responsesSSEParser{allowBOM: true},
 		onUsage:         onUsage,
+		onFailure:       onFailure,
 	}
 }
 
@@ -671,6 +677,7 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 			break
 		}
 		t.maybeObserveUsage(msg)
+		t.maybeObserveFailure(msg)
 		t.maybeLog(msg)
 	}
 	if len(t.parser.pending) > responsesFailureTapMaxBuffer {
@@ -704,22 +711,23 @@ func (t *responsesFailureTap) maybeObserveUsage(msg responsesSSEMessage) {
 	t.onUsage(event.Response.Usage)
 }
 
+func (t *responsesFailureTap) maybeObserveFailure(msg responsesSSEMessage) {
+	if t == nil || t.onFailure == nil || t.failureObserved {
+		return
+	}
+
+	event, _, ok := parseResponsesFailureMessage(msg)
+	if !ok {
+		return
+	}
+
+	t.failureObserved = true
+	t.onFailure(event)
+}
+
 func (t *responsesFailureTap) maybeLog(msg responsesSSEMessage) {
-	eventName := strings.TrimSpace(msg.event)
-	if eventName != "response.failed" && eventName != "response.incomplete" && eventName != "" {
-		return
-	}
-
-	event, err := parseResponsesStreamEvent(msg.data)
-	if err != nil {
-		return
-	}
-
-	eventType := strings.TrimSpace(event.Type)
-	if eventName == "" {
-		eventName = eventType
-	}
-	if eventName != "response.failed" && eventName != "response.incomplete" {
+	event, eventName, ok := parseResponsesFailureMessage(msg)
+	if !ok {
 		return
 	}
 
@@ -741,4 +749,25 @@ func (t *responsesFailureTap) maybeLog(msg responsesSSEMessage) {
 		)
 	}
 	t.h.log.Info("responses stream reported failure after commit", fields...)
+}
+
+func parseResponsesFailureMessage(msg responsesSSEMessage) (responsesWebSocketStreamEvent, string, bool) {
+	eventName := strings.TrimSpace(msg.event)
+	if eventName != "response.failed" && eventName != "response.incomplete" && eventName != "" {
+		return responsesWebSocketStreamEvent{}, "", false
+	}
+
+	event, err := parseResponsesStreamEvent(msg.data)
+	if err != nil {
+		return responsesWebSocketStreamEvent{}, "", false
+	}
+
+	eventType := strings.TrimSpace(event.Type)
+	if eventName == "" {
+		eventName = eventType
+	}
+	if eventName != "response.failed" && eventName != "response.incomplete" {
+		return responsesWebSocketStreamEvent{}, "", false
+	}
+	return event, eventName, true
 }
