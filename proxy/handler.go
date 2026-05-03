@@ -190,6 +190,8 @@ type ProxyHandler struct {
 	responsesWS              ResponsesWebSocketConfig
 	streamingUpstreamTimeout time.Duration
 	log                      *logger.Logger
+	metrics                  *metricsCollector
+	metricsDisabled          bool
 	maxRetries               int
 	retryBaseDelay           time.Duration
 	models                   modelsCache
@@ -250,6 +252,14 @@ func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 	}
 }
 
+// WithMetricsEnabled enables or disables Prometheus metrics collection and the
+// /metrics exposition handler.
+func WithMetricsEnabled(enabled bool) Option {
+	return func(h *ProxyHandler) {
+		h.metricsDisabled = !enabled
+	}
+}
+
 // NewProxyHandler creates a ProxyHandler with connection pooling and HTTP/2.
 func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) (*ProxyHandler, error) {
 	h := &ProxyHandler{
@@ -277,6 +287,11 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 	}
 	if err := h.initializeProviders(); err != nil {
 		return nil, err
+	}
+	if !h.metricsDisabled {
+		if err := h.initializeMetrics(); err != nil {
+			return nil, err
+		}
 	}
 	return h, nil
 }
@@ -401,11 +416,17 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if err := h.checkProviderReady(ctx, provider); err != nil {
+			if h.metrics != nil {
+				h.metrics.setEndpointHealthy(provider.id, provider.baseURL, false)
+			}
 			if shouldSuppressReadyzResponse(r.Context(), err) {
 				return
 			}
 			writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", err.Error())
 			return
+		}
+		if h.metrics != nil {
+			h.metrics.setEndpointHealthy(provider.id, provider.baseURL, true)
 		}
 	}
 

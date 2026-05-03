@@ -45,6 +45,9 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
+		if observer := h.startRequestMetrics("/v1/responses", "/responses", "", false); observer != nil {
+			defer observer.finish(status)
+		}
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
@@ -57,11 +60,19 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(bodyBytes, &partial)
 	isStreaming := partial.Stream != nil && *partial.Stream
+	observer := h.startRequestMetrics("/v1/responses", "/responses", extractRequestModel(bodyBytes), isStreaming)
+	r = r.WithContext(withRequestMetricsObserver(r.Context(), observer))
+	metricsWriter := newMetricsResponseWriter(w, observer)
+	defer func() {
+		observer.finish(metricsWriter.StatusCode())
+	}()
+	w = metricsWriter
 
 	extraHeaders := responsesExtraHeadersFromRequest(r)
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(isStreaming)
 	defer upstreamCancel()
+	upstreamCtx = withRequestMetricsObserver(upstreamCtx, observer)
 
 	resp, err := h.postResponsesWithHeaders(upstreamCtx, bodyBytes, extraHeaders)
 	if err != nil {
@@ -100,7 +111,9 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeUpstreamResponse(w, resp)
+	if err := writeUpstreamResponseObserved(w, resp, observer); err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
+	}
 }
 
 // compactPrompt is the system instruction used when the upstream does not
@@ -139,12 +152,22 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
+		if observer := h.startRequestMetrics("/v1/responses/compact", "/responses", "", false); observer != nil {
+			defer observer.finish(status)
+		}
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
 
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/compact", false)
+	observer := h.startRequestMetrics("/v1/responses/compact", "/responses", extractRequestModel(bodyBytes), false)
+	r = r.WithContext(withRequestMetricsObserver(r.Context(), observer))
+	metricsWriter := newMetricsResponseWriter(w, observer)
+	defer func() {
+		observer.finish(metricsWriter.StatusCode())
+	}()
+	w = metricsWriter
 
 	var body map[string]json.RawMessage
 	if err := json.Unmarshal(bodyBytes, &body); err != nil {
@@ -154,6 +177,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
+	upstreamCtx = withRequestMetricsObserver(upstreamCtx, observer)
 
 	summaryText, resp, err := h.compactResponsesRequest(upstreamCtx, body, responsesExtraHeadersFromRequest(r))
 	if err != nil {
@@ -171,12 +195,9 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if resp != nil {
-		defer func() { _ = resp.Body.Close() }()
-		if contentType := resp.Header.Get("Content-Type"); contentType != "" {
-			w.Header().Set("Content-Type", contentType)
+		if err := writeUpstreamResponseObserved(w, resp, observer); err != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
 		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
 		return
 	}
 
@@ -201,10 +222,21 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
+		if observer := h.startRequestMetrics("/v1/memories/trace_summarize", "/responses", "", false); observer != nil {
+			defer observer.finish(status)
+		}
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+
+	observer := h.startRequestMetrics("/v1/memories/trace_summarize", "/responses", extractRequestModel(bodyBytes), false)
+	r = r.WithContext(withRequestMetricsObserver(r.Context(), observer))
+	metricsWriter := newMetricsResponseWriter(w, observer)
+	defer func() {
+		observer.finish(metricsWriter.StatusCode())
+	}()
+	w = metricsWriter
 
 	var memReq struct {
 		Model     string            `json:"model"`
@@ -239,6 +271,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
+	upstreamCtx = withRequestMetricsObserver(upstreamCtx, observer)
 
 	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, reqBody, responsesExtraHeadersFromRequest(r))
 	if err != nil {
@@ -258,11 +291,9 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		if contentType := resp.Header.Get("Content-Type"); contentType != "" {
-			w.Header().Set("Content-Type", contentType)
+		if err := writeUpstreamResponseObserved(w, resp, observer); err != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
 		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
 		return
 	}
 
@@ -271,6 +302,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
 		return
 	}
+	observeUsageFromBodyContext(upstreamCtx, respBody)
 
 	summaryText, err := extractResponsesOutputText(respBody)
 	if err != nil {
@@ -406,6 +438,7 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 		if err != nil {
 			return "", nil, err
 		}
+		observeUsageFromBodyContext(ctx, respBody)
 		summary, err := extractResponsesOutputText(respBody)
 		if err != nil {
 			return "", nil, err

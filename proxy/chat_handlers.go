@@ -107,10 +107,27 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	body, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
+		if observer := h.startRequestMetrics("/v1/messages", "/chat/completions", "", false); observer != nil {
+			defer observer.finish(status)
+		}
 		writeAnthropicError(w, status, "invalid_request_error", err.Error())
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+
+	var metricsReq struct {
+		Model  string `json:"model"`
+		Stream bool   `json:"stream,omitempty"`
+	}
+	_ = json.Unmarshal(body, &metricsReq)
+
+	observer := h.startRequestMetrics("/v1/messages", "/chat/completions", metricsReq.Model, metricsReq.Stream)
+	r = r.WithContext(withRequestMetricsObserver(r.Context(), observer))
+	metricsWriter := newMetricsResponseWriter(w, observer)
+	defer func() {
+		observer.finish(metricsWriter.StatusCode())
+	}()
+	w = metricsWriter
 
 	var req models.AnthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -133,6 +150,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
+	upstreamCtx = withRequestMetricsObserver(upstreamCtx, observer)
 
 	resp, err := h.postChatCompletions(upstreamCtx, oaiBody)
 	if err != nil {
@@ -165,9 +183,11 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			StreamOpenAIToAnthropic(w, resp.Body, req.Model, "msg_"+uuid.New().String())
+			usage := StreamOpenAIToAnthropic(w, resp.Body, req.Model, "msg_"+uuid.New().String())
+			observeOpenAIUsageContext(r.Context(), usage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			observeOpenAIUsageContext(r.Context(), oaiResp.Usage)
 			anthropicResp := TranslateOpenAIToAnthropic(oaiResp, req.Model)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(anthropicResp)
@@ -184,15 +204,27 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	bodyBytes, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
+		if observer := h.startRequestMetrics("/v1/chat/completions", "/chat/completions", "", false); observer != nil {
+			defer observer.finish(status)
+		}
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
 
+	publicModel := extractRequestModel(bodyBytes)
 	bodyBytes, mode := prepareOpenAIChatCompletionsRequest(bodyBytes)
+	observer := h.startRequestMetrics("/v1/chat/completions", "/chat/completions", publicModel, mode.clientRequestedStream)
+	r = r.WithContext(withRequestMetricsObserver(r.Context(), observer))
+	metricsWriter := newMetricsResponseWriter(w, observer)
+	defer func() {
+		observer.finish(metricsWriter.StatusCode())
+	}()
+	w = metricsWriter
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
+	upstreamCtx = withRequestMetricsObserver(upstreamCtx, observer)
 
 	resp, err := h.postChatCompletions(upstreamCtx, bodyBytes)
 	if err != nil {
@@ -213,11 +245,16 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
 			copyPassthroughHeaders(w.Header(), resp.Header)
-			StreamOpenAIPassthrough(w, resp.Body)
+			usage := StreamOpenAIPassthrough(w, resp.Body)
+			observeOpenAIUsageContext(r.Context(), usage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			observeOpenAIUsageContext(r.Context(), oaiResp.Usage)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(oaiResp)
+		},
+		passthrough: func(resp *http.Response) error {
+			return writeUpstreamResponseObserved(w, resp, observer)
 		},
 	})
 	if err != nil {

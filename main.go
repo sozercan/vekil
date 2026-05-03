@@ -13,6 +13,7 @@ import (
 
 	"github.com/pkg/browser"
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/buildinfo"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
 	"github.com/sozercan/vekil/server"
@@ -24,6 +25,7 @@ const (
 	cliCommandServe cliCommand = iota
 	cliCommandLogin
 	cliCommandLogout
+	cliCommandVersion
 )
 
 func main() {
@@ -34,6 +36,9 @@ func main() {
 		return
 	case cliCommandLogout:
 		runLogout(os.Args[2:])
+		return
+	case cliCommandVersion:
+		runVersion()
 		return
 	}
 
@@ -50,9 +55,15 @@ func commandFromArgs(args []string) cliCommand {
 		return cliCommandLogin
 	case "logout":
 		return cliCommandLogout
+	case "version", "--version", "-version", "-v":
+		return cliCommandVersion
 	default:
 		return cliCommandServe
 	}
+}
+
+func runVersion() {
+	_, _ = fmt.Fprintln(os.Stdout, buildinfo.String())
 }
 
 type loginOptions struct {
@@ -216,6 +227,8 @@ func runServe() {
 	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
 	providersConfigPath := flag.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration")
 	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
+	metricsEnabled := flag.Bool("metrics", getEnvBool("METRICS", true), "Enable Prometheus /metrics endpoint")
+	noMetrics := flag.Bool("no-metrics", getEnvBool("NO_METRICS", false), "Disable Prometheus /metrics endpoint")
 	streamingUpstreamTimeout := flag.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
 	copilotEditorVersion := flag.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header")
 	copilotPluginVersion := flag.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
@@ -254,6 +267,7 @@ func runServe() {
 		log,
 		*host,
 		*port,
+		server.WithMetricsEnabled(*metricsEnabled && !*noMetrics),
 		server.WithStreamingUpstreamTimeout(*streamingUpstreamTimeout),
 		server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
 			EditorVersion:       *copilotEditorVersion,

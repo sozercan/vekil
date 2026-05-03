@@ -14,7 +14,29 @@ Vekil supports two runtime patterns:
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
+| `--metrics` | `METRICS` | `true` | Enable Prometheus-compatible `GET /metrics` exposition |
+| `--no-metrics` | `NO_METRICS` | `false` | Disable the `GET /metrics` endpoint entirely |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
+
+## Observability
+
+By default Vekil exposes Prometheus metrics on `GET /metrics` alongside the existing health endpoints. Disable that surface with `--no-metrics` (or `NO_METRICS=true`) if you want the proxy to keep a smaller local HTTP surface.
+
+Key proxy-owned metrics include:
+
+- `vekil_requests_total{provider,public_model,endpoint,status}`
+- `vekil_request_duration_seconds{provider,public_model,endpoint,status}`
+- `vekil_stream_first_byte_latency_seconds{provider,public_model,endpoint}`
+- `vekil_tokens_total{provider,public_model,endpoint,direction}`
+- `vekil_retries_total{provider,public_model,endpoint,reason}`
+- `vekil_upstream_errors_total{provider,public_model,endpoint,code}`
+- `vekil_inflight_requests{provider}`
+- `vekil_endpoint_healthy{provider,endpoint}`
+- `vekil_build_info{version,go_version,commit}`
+
+The Prometheus histograms use the client library defaults: `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, and `10` seconds.
+
+The `/metrics` output also includes the standard Prometheus Go runtime and process collectors. An example Grafana dashboard lives at [`grafana-dashboard.json`](grafana-dashboard.json).
 
 ## Copilot Header Overrides
 

@@ -188,7 +188,7 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 	resp = prepared.commitResponse()
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(http.StatusOK)
-	streamResponsesPipeWithFailureLog(h, w, resp.Body, resp.Header)
+	streamResponsesPipeWithFailureLog(h, w, resp.Body, resp.Header, requestMetricsObserverFromContext(r.Context()))
 }
 
 func prepareResponsesStreamAttempt(waitCtx, streamCtx context.Context, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
@@ -452,7 +452,7 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 	return "", ""
 }
 
-func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header) {
+func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header, observer *requestMetricsObserver) {
 	if closer, ok := r.(io.Closer); ok {
 		defer func() { _ = closer.Close() }()
 	}
@@ -463,7 +463,9 @@ func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r
 	}
 
 	tap := newResponsesFailureTap(h, upstreamHeaders)
-	_, _ = io.Copy(fw, io.TeeReader(r, tap))
+	usageTap := newResponsesUsageTap(observer)
+	_, _ = io.Copy(fw, io.TeeReader(r, io.MultiWriter(tap, usageTap)))
+	usageTap.finish()
 }
 
 func parseResponsesStreamEvent(data string) (responsesWebSocketStreamEvent, error) {
@@ -641,11 +643,24 @@ type responsesFailureTap struct {
 	parser          responsesSSEParser
 }
 
+type responsesUsageTap struct {
+	observer *requestMetricsObserver
+	parser   responsesSSEParser
+	last     *tokenUsage
+}
+
 func newResponsesFailureTap(h *ProxyHandler, upstreamHeaders http.Header) *responsesFailureTap {
 	return &responsesFailureTap{
 		h:               h,
 		upstreamHeaders: upstreamHeaders,
 		parser:          responsesSSEParser{allowBOM: true},
+	}
+}
+
+func newResponsesUsageTap(observer *requestMetricsObserver) *responsesUsageTap {
+	return &responsesUsageTap{
+		observer: observer,
+		parser:   responsesSSEParser{allowBOM: true},
 	}
 }
 
@@ -702,4 +717,32 @@ func (t *responsesFailureTap) maybeLog(msg responsesSSEMessage) {
 		)
 	}
 	t.h.log.Info("responses stream reported failure after commit", fields...)
+}
+
+func (t *responsesUsageTap) Write(p []byte) (int, error) {
+	if t == nil || t.observer == nil {
+		return len(p), nil
+	}
+	t.parser.push(p)
+	for {
+		msg, ok := t.parser.nextSemantic()
+		if !ok {
+			break
+		}
+		if usage := extractUsageFromJSONBody([]byte(msg.data)); usage != nil {
+			t.last = usage
+		}
+	}
+	if len(t.parser.pending) > responsesFailureTapMaxBuffer {
+		t.parser.pending = nil
+		t.parser.allowBOM = false
+	}
+	return len(p), nil
+}
+
+func (t *responsesUsageTap) finish() {
+	if t == nil || t.observer == nil || t.last == nil {
+		return
+	}
+	t.observer.observeUsage(t.last)
 }

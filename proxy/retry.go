@@ -2,8 +2,10 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -68,9 +70,16 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		if err != nil {
 			return nil, err
 		}
+		observer := requestMetricsObserverFromContext(req.Context())
 
 		resp, err := h.client.Do(req)
 		if err != nil {
+			if observer != nil {
+				observer.observeUpstreamError(upstreamTransportErrorCode(err))
+				if attempt < maxRetries-1 {
+					observer.observeRetry(retryReasonForTransportError(err))
+				}
+			}
 			lastErr = err
 			if attempt < maxRetries-1 {
 				if ctxErr := sleepWithContext(req.Context(), backoff(retryDelay, attempt)); ctxErr != nil {
@@ -81,7 +90,16 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		}
 
 		if !retryable(resp.StatusCode) {
+			if observer != nil && resp.StatusCode >= 400 {
+				observer.observeUpstreamError(strconv.Itoa(resp.StatusCode))
+			}
 			return resp, nil
+		}
+		if observer != nil {
+			observer.observeUpstreamError(strconv.Itoa(resp.StatusCode))
+			if attempt < maxRetries-1 {
+				observer.observeRetry(retryReasonForStatus(resp.StatusCode))
+			}
 		}
 
 		retryAfterHeader := resp.Header.Get("Retry-After")
@@ -101,6 +119,41 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		}
 	}
 	return nil, lastErr
+}
+
+func retryReasonForStatus(statusCode int) string {
+	if statusCode == http.StatusTooManyRequests {
+		return "429"
+	}
+	return "5xx"
+}
+
+func retryReasonForTransportError(err error) string {
+	if isTimeoutError(err) {
+		return "timeout"
+	}
+	return "transport"
+}
+
+func upstreamTransportErrorCode(err error) string {
+	if isTimeoutError(err) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	return "transport"
+}
+
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // sleepWithContext blocks for the given duration or until the context is done,

@@ -22,6 +22,7 @@ type Server struct {
 
 type options struct {
 	proxyOptions []proxy.Option
+	metrics      bool
 }
 
 // Option customizes server creation.
@@ -52,14 +53,23 @@ func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 	return WithProxyOptions(proxy.WithStreamingUpstreamTimeout(timeout))
 }
 
+// WithMetricsEnabled enables or disables the Prometheus /metrics endpoint.
+func WithMetricsEnabled(enabled bool) Option {
+	return func(o *options) {
+		o.metrics = enabled
+	}
+}
+
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
-	cfg := options{}
+	cfg := options{metrics: true}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
 		}
 	}
+
+	cfg.proxyOptions = append(cfg.proxyOptions, proxy.WithMetricsEnabled(cfg.metrics))
 
 	handler, err := proxy.NewProxyHandler(authenticator, log, cfg.proxyOptions...)
 	if err != nil {
@@ -79,6 +89,9 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
 	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)
+	if metricsHandler := handler.MetricsHandler(); cfg.metrics && metricsHandler != nil {
+		mux.Handle("GET /metrics", metricsHandler)
+	}
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{

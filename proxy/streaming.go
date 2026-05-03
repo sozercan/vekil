@@ -69,8 +69,9 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// StreamOpenAIPassthrough streams OpenAI SSE bytes directly to the client with no parsing.
-func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
+// StreamOpenAIPassthrough streams OpenAI SSE bytes directly to the client and
+// returns the last usage block seen in the stream, if any.
+func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) *models.OpenAIUsage {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
@@ -78,27 +79,31 @@ func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
 	if f, ok := w.(http.Flusher); ok {
 		fw.flusher = f
 	}
+	tap := &openAIStreamUsageTap{}
 	// Errors here (client disconnect, upstream drop) are unrecoverable for SSE
 	// since headers have already been sent. The client must handle truncated streams.
-	_, _ = io.Copy(fw, body)
+	_, _ = io.Copy(fw, io.TeeReader(body, tap))
+	return tap.finish()
 }
 
-// StreamOpenAIToAnthropic translates an OpenAI SSE stream into Anthropic SSE format.
-func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model string, requestID string) {
+// StreamOpenAIToAnthropic translates an OpenAI SSE stream into Anthropic SSE
+// format and returns the last upstream usage block seen, if any.
+func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model string, requestID string) *models.OpenAIUsage {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
 	state := newAnthropicStreamState(w, model, requestID)
 	if !state.start() {
-		return
+		return nil
 	}
 
 	sawDone, err := consumeOpenAIStreamChunks(body, state.consumeChunk)
 	if err != nil || !sawDone {
-		return
+		return cloneOpenAIUsage(state.storedUsage)
 	}
 
 	_ = state.finish()
+	return cloneOpenAIUsage(state.storedUsage)
 }
 
 // aggregateStreamToResponse collects an OpenAI SSE stream into a complete
@@ -120,6 +125,53 @@ func aggregateStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, erro
 	}
 
 	return aggregator.buildResponse(), nil
+}
+
+type openAIStreamUsageTap struct {
+	pending []byte
+	usage   *models.OpenAIUsage
+}
+
+func (t *openAIStreamUsageTap) Write(p []byte) (int, error) {
+	t.pending = append(t.pending, p...)
+	for {
+		idx := bytes.IndexByte(t.pending, '\n')
+		if idx < 0 {
+			break
+		}
+
+		line := strings.TrimRight(string(t.pending[:idx]), "\r")
+		t.pending = t.pending[idx+1:]
+
+		data, ok := parseSSELine(line)
+		if !ok || data == "[DONE]" {
+			continue
+		}
+
+		var chunk models.OpenAIStreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if chunk.Usage != nil {
+			t.usage = cloneOpenAIUsage(chunk.Usage)
+		}
+	}
+	return len(p), nil
+}
+
+func (t *openAIStreamUsageTap) finish() *models.OpenAIUsage {
+	if len(t.pending) > 0 {
+		_, _ = t.Write([]byte{'\n'})
+	}
+	return cloneOpenAIUsage(t.usage)
+}
+
+func cloneOpenAIUsage(usage *models.OpenAIUsage) *models.OpenAIUsage {
+	if usage == nil {
+		return nil
+	}
+	cloned := *usage
+	return &cloned
 }
 
 type anthropicStreamState struct {
