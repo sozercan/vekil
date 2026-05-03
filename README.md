@@ -47,7 +47,7 @@ For explicit provider routing, start the proxy with `--providers-config /path/to
 
 **First-run auth** depends on your providers:
 
-- **Copilot** — `vekil login` uses Vekil-managed GitHub device-code sign-in; first proxy startup starts the same flow when needed. To use your current GitHub CLI account instead, opt in with `vekil login --github-cli` (or `--gh`). `vekil logout` clears cached auth and disables future silent `gh` reuse until you opt in again. `COPILOT_GITHUB_TOKEN` remains the explicit non-interactive override.
+- **Copilot** — `vekil login` uses Vekil-managed GitHub device-code sign-in; the first Copilot-backed request starts the same flow when needed. To use your current GitHub CLI account instead, opt in with `vekil login --github-cli` (or `--gh`). `vekil logout` clears cached auth and disables future silent `gh` reuse until you opt in again. `COPILOT_GITHUB_TOKEN` remains the explicit non-interactive override.
 - **OpenAI Codex** — requires `codex login` so `~/.codex/auth.json` exists. In Docker, mount your Codex home into `CODEX_HOME` (default `/home/nonroot/.codex`).
 
 For full configuration and routing details, see [Getting Started](docs/getting-started.md) and [Configuration](docs/configuration.md).

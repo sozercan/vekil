@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -208,6 +209,52 @@ func TestRunLoginRejectsGitHubCLIWithForceBeforeAuthConstruction(t *testing.T) {
 	if got := stderr.String(); !strings.Contains(got, "--github-cli/--gh cannot be used with --force") {
 		t.Fatalf("stderr missing conflict error, got %q", got)
 	}
+}
+
+func TestParseServeOptionsMetrics(t *testing.T) {
+	t.Run("metrics enabled by default", func(t *testing.T) {
+		opts, err := parseServeOptions(nil, io.Discard)
+		if err != nil {
+			t.Fatalf("parseServeOptions() error = %v", err)
+		}
+		if !opts.metricsEnabled {
+			t.Fatalf("metricsEnabled = false, want true")
+		}
+	})
+
+	t.Run("METRICS env disables metrics", func(t *testing.T) {
+		t.Setenv("METRICS", "false")
+
+		opts, err := parseServeOptions(nil, io.Discard)
+		if err != nil {
+			t.Fatalf("parseServeOptions() error = %v", err)
+		}
+		if opts.metricsEnabled {
+			t.Fatalf("metricsEnabled = true, want false")
+		}
+	})
+
+	t.Run("metrics flag overrides disabled env", func(t *testing.T) {
+		t.Setenv("METRICS", "false")
+
+		opts, err := parseServeOptions([]string{"--metrics"}, io.Discard)
+		if err != nil {
+			t.Fatalf("parseServeOptions() error = %v", err)
+		}
+		if !opts.metricsEnabled {
+			t.Fatalf("metricsEnabled = false, want true")
+		}
+	})
+
+	t.Run("no-metrics flag disables metrics", func(t *testing.T) {
+		opts, err := parseServeOptions([]string{"--no-metrics"}, io.Discard)
+		if err != nil {
+			t.Fatalf("parseServeOptions() error = %v", err)
+		}
+		if opts.metricsEnabled {
+			t.Fatalf("metricsEnabled = true, want false")
+		}
+	})
 }
 
 func TestRunLoginGHAliasUsesGitHubCLI(t *testing.T) {

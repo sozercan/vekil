@@ -210,64 +210,107 @@ func runLogout(args []string) {
 	_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
 }
 
-func runServe() {
-	port := flag.String("port", getEnv("PORT", "1337"), "Listen port")
-	host := flag.String("host", getEnv("HOST", "0.0.0.0"), "Listen host")
-	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
-	providersConfigPath := flag.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration")
-	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
-	streamingUpstreamTimeout := flag.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
-	copilotEditorVersion := flag.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header")
-	copilotPluginVersion := flag.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
-	copilotUserAgent := flag.String("copilot-user-agent", getEnv("COPILOT_USER_AGENT", ""), "Upstream Copilot user-agent header")
-	copilotGitHubAPIVersion := flag.String("copilot-github-api-version", getEnv("COPILOT_GITHUB_API_VERSION", ""), "Upstream Copilot x-github-api-version header")
-	responsesWSTurnStateDelta := flag.Bool("responses-ws-turn-state-delta", getEnvBool("RESPONSES_WS_TURN_STATE_DELTA", false), "Attempt delta-only replay when upstream returns X-Codex-Turn-State")
-	responsesWSDisableAutoCompact := flag.Bool("responses-ws-disable-auto-compact", getEnvBool("RESPONSES_WS_DISABLE_AUTO_COMPACT", false), "Disable automatic websocket-session history compaction")
-	responsesWSCompactMaxItems := flag.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items")
-	responsesWSCompactMaxBytes := flag.Int("responses-ws-auto-compact-max-bytes", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes), "Auto-compact websocket session history after this many raw bytes")
-	responsesWSCompactKeepTail := flag.Int("responses-ws-auto-compact-keep-tail", getEnvInt("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail), "When auto-compacting websocket history, keep this many most recent items verbatim")
-	flag.Parse()
+type serveOptions struct {
+	host                     string
+	port                     string
+	tokenDir                 string
+	providersConfigPath      string
+	logLevel                 string
+	metricsEnabled           bool
+	streamingUpstreamTimeout time.Duration
+	copilotHeaders           proxy.CopilotHeaderConfig
+	responsesWS              proxy.ResponsesWebSocketConfig
+}
 
-	log := logger.New(logger.ParseLevel(*logLevel))
-
-	authenticator, err := auth.NewAuthenticator(*tokenDir)
-	if err != nil {
-		log.Fatal("failed to initialize authenticator", logger.Err(err))
+func parseServeOptions(args []string, stderr io.Writer) (serveOptions, error) {
+	if stderr == nil {
+		stderr = io.Discard
 	}
 
-	providersCfg, err := proxy.LoadProvidersConfigFile(*providersConfigPath)
-	if err != nil {
-		log.Fatal("failed to load providers config", logger.Err(err))
+	opts := serveOptions{}
+	fs := flag.NewFlagSet("vekil", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	port := fs.String("port", getEnv("PORT", "1337"), "Listen port")
+	host := fs.String("host", getEnv("HOST", "0.0.0.0"), "Listen host")
+	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
+	providersConfigPath := fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration")
+	logLevel := fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
+	metricsEnabled := fs.Bool("metrics", getEnvBool("METRICS", true), "Enable Prometheus /metrics endpoint")
+	disableMetrics := fs.Bool("no-metrics", false, "Disable Prometheus /metrics endpoint")
+	streamingUpstreamTimeout := fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
+	copilotEditorVersion := fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header")
+	copilotPluginVersion := fs.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
+	copilotUserAgent := fs.String("copilot-user-agent", getEnv("COPILOT_USER_AGENT", ""), "Upstream Copilot user-agent header")
+	copilotGitHubAPIVersion := fs.String("copilot-github-api-version", getEnv("COPILOT_GITHUB_API_VERSION", ""), "Upstream Copilot x-github-api-version header")
+	responsesWSTurnStateDelta := fs.Bool("responses-ws-turn-state-delta", getEnvBool("RESPONSES_WS_TURN_STATE_DELTA", false), "Attempt delta-only replay when upstream returns X-Codex-Turn-State")
+	responsesWSDisableAutoCompact := fs.Bool("responses-ws-disable-auto-compact", getEnvBool("RESPONSES_WS_DISABLE_AUTO_COMPACT", false), "Disable automatic websocket-session history compaction")
+	responsesWSCompactMaxItems := fs.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items")
+	responsesWSCompactMaxBytes := fs.Int("responses-ws-auto-compact-max-bytes", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes), "Auto-compact websocket session history after this many raw bytes")
+	responsesWSCompactKeepTail := fs.Int("responses-ws-auto-compact-keep-tail", getEnvInt("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail), "When auto-compacting websocket history, keep this many most recent items verbatim")
+	if err := fs.Parse(args); err != nil {
+		return opts, err
 	}
 
-	if providersCfg.UsesCopilot() {
-		log.Info("authenticating with GitHub Copilot...")
-		ctx := context.Background()
-		if _, err := authenticator.GetToken(ctx); err != nil {
-			log.Fatal("authentication failed", logger.Err(err))
-		}
-		log.Info("authenticated successfully")
-	}
-
-	srv, err := server.New(
-		authenticator,
-		log,
-		*host,
-		*port,
-		server.WithStreamingUpstreamTimeout(*streamingUpstreamTimeout),
-		server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
+	opts = serveOptions{
+		host:                     *host,
+		port:                     *port,
+		tokenDir:                 *tokenDir,
+		providersConfigPath:      *providersConfigPath,
+		logLevel:                 *logLevel,
+		metricsEnabled:           *metricsEnabled,
+		streamingUpstreamTimeout: *streamingUpstreamTimeout,
+		copilotHeaders: proxy.CopilotHeaderConfig{
 			EditorVersion:       *copilotEditorVersion,
 			EditorPluginVersion: *copilotPluginVersion,
 			UserAgent:           *copilotUserAgent,
 			GitHubAPIVersion:    *copilotGitHubAPIVersion,
-		}),
-		server.WithResponsesWebSocketConfig(proxy.ResponsesWebSocketConfig{
+		},
+		responsesWS: proxy.ResponsesWebSocketConfig{
 			TurnStateDelta:      *responsesWSTurnStateDelta,
 			DisableAutoCompact:  *responsesWSDisableAutoCompact,
 			AutoCompactMaxItems: *responsesWSCompactMaxItems,
 			AutoCompactMaxBytes: *responsesWSCompactMaxBytes,
 			AutoCompactKeepTail: *responsesWSCompactKeepTail,
-		}),
+		},
+	}
+	if *disableMetrics {
+		opts.metricsEnabled = false
+	}
+
+	return opts, nil
+}
+
+func runServe() {
+	opts, err := parseServeOptions(os.Args[1:], os.Stderr)
+	if err != nil {
+		if err == flag.ErrHelp {
+			return
+		}
+		os.Exit(2)
+	}
+
+	log := logger.New(logger.ParseLevel(opts.logLevel))
+
+	authenticator, err := auth.NewAuthenticator(opts.tokenDir)
+	if err != nil {
+		log.Fatal("failed to initialize authenticator", logger.Err(err))
+	}
+
+	providersCfg, err := proxy.LoadProvidersConfigFile(opts.providersConfigPath)
+	if err != nil {
+		log.Fatal("failed to load providers config", logger.Err(err))
+	}
+
+	srv, err := server.New(
+		authenticator,
+		log,
+		opts.host,
+		opts.port,
+		server.WithMetricsEnabled(opts.metricsEnabled),
+		server.WithStreamingUpstreamTimeout(opts.streamingUpstreamTimeout),
+		server.WithCopilotHeaderConfig(opts.copilotHeaders),
+		server.WithResponsesWebSocketConfig(opts.responsesWS),
 		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
 	)
 	if err != nil {
