@@ -214,7 +214,11 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 		h.writeGeminiProtocolError(w, err)
 		return
 	}
-	observeOpenAIUsageContext(r.Context(), oaiResp.Usage)
+	if oaiResp.Usage != nil {
+		observeOpenAIUsageContext(r.Context(), &models.OpenAIUsage{
+			PromptTokens: oaiResp.Usage.PromptTokens,
+		})
+	}
 
 	if oaiResp.Usage == nil {
 		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", "upstream response did not include usage")

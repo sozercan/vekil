@@ -105,6 +105,31 @@ func assertMetricLine(t testing.TB, metricsText, metricName string, labels map[s
 	t.Fatalf("metric %s with labels %v and value %q not found in:\n%s", metricName, labels, wantValue, metricsText)
 }
 
+func assertMetricMissing(t testing.TB, metricsText, metricName string, labels map[string]string) {
+	t.Helper()
+
+	for _, line := range strings.Split(metricsText, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !strings.HasPrefix(line, metricName+"{") && !(len(labels) == 0 && strings.HasPrefix(line, metricName+" ")) {
+			continue
+		}
+
+		matched := true
+		for key, value := range labels {
+			if !strings.Contains(line, key+"=\""+value+"\"") {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			t.Fatalf("unexpected metric %s with labels %v found in:\n%s", metricName, labels, metricsText)
+		}
+	}
+}
+
 func TestMetricsHandleOpenAIChatCompletionsDiscoversRuntimeModelLabels(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -296,6 +321,40 @@ func TestMetricsHandleGeminiGenerateContent(t *testing.T) {
 		"provider":     "copilot",
 		"public_model": "gemini-2.5-pro",
 	}, "2")
+}
+
+func TestMetricsHandleGeminiCountTokensRecordsPromptOnly(t *testing.T) {
+	handler := newMetricsTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-gemini","object":"chat.completion","created":0,"model":"gemini-2.5-pro","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":17,"completion_tokens":1,"total_tokens":18}}`))
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/models/gemini-2.5-pro:countTokens", strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`))
+	handler.HandleGeminiModels(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	metricsText := renderMetricsText(t, handler)
+	assertMetricLine(t, metricsText, "vekil_requests_total", map[string]string{
+		"endpoint":     "/v1/models/*:countTokens",
+		"provider":     "copilot",
+		"public_model": "gemini-2.5-pro",
+		"status":       "200",
+	}, "1")
+	assertMetricLine(t, metricsText, "vekil_tokens_total", map[string]string{
+		"direction":    "prompt",
+		"endpoint":     "/v1/models/*:countTokens",
+		"provider":     "copilot",
+		"public_model": "gemini-2.5-pro",
+	}, "17")
+	assertMetricMissing(t, metricsText, "vekil_tokens_total", map[string]string{
+		"direction":    "completion",
+		"endpoint":     "/v1/models/*:countTokens",
+		"provider":     "copilot",
+		"public_model": "gemini-2.5-pro",
+	})
 }
 
 func TestMetricsRecordRetriesAndUpstreamErrors(t *testing.T) {
