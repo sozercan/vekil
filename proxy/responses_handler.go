@@ -121,7 +121,9 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		tracker.RecordUpstreamError(strconv.Itoa(resp.StatusCode))
 	}
 	writeUpstreamResponseWithObserver(w, resp, func(body io.Reader) {
-		tracker.ObserveResponsesUsage(extractResponsesUsageFromReader(body))
+		observed := extractResponsesResponseMetricsFromReader(body)
+		tracker.ObserveTrustedUpstreamModel(observed.Model)
+		tracker.ObserveResponsesUsage(observed.Usage)
 	})
 	statusCode = resp.StatusCode
 }
@@ -330,7 +332,9 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
 		return
 	}
-	tracker.ObserveResponsesUsage(extractResponsesUsageFromBody(respBody))
+	observedMetrics := extractResponsesResponseMetricsFromBody(respBody)
+	tracker.ObserveTrustedUpstreamModel(observedMetrics.Model)
+	tracker.ObserveResponsesUsage(observedMetrics.Usage)
 
 	summaryText, err := extractResponsesOutputText(respBody)
 	if err != nil {
@@ -477,7 +481,9 @@ func (h *ProxyHandler) compactResponsesRequestDepthWithMetrics(ctx context.Conte
 			return "", nil, err
 		}
 		if tracker != nil {
-			tracker.ObserveResponsesUsage(extractResponsesUsageFromBody(respBody))
+			observedMetrics := extractResponsesResponseMetricsFromBody(respBody)
+			tracker.ObserveTrustedUpstreamModel(observedMetrics.Model)
+			tracker.ObserveResponsesUsage(observedMetrics.Usage)
 		}
 		summary, err := extractResponsesOutputText(respBody)
 		if err != nil {

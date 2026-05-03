@@ -496,6 +496,7 @@ func streamResponsesPipeWithFailureLogWithTracker(h *ProxyHandler, w http.Respon
 	}
 	_, _ = io.Copy(fw, io.TeeReader(r, tap))
 	if tracker != nil {
+		tracker.ObserveTrustedUpstreamModel(metricsTap.modelCopy())
 		tracker.ObserveResponsesUsage(metricsTap.usageCopy())
 		if status := metricsTap.logicalStatusCode(); status != http.StatusOK {
 			tracker.RecordUpstreamError(strconv.Itoa(status))

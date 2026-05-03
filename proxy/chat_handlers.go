@@ -251,6 +251,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			streamOpenAIPassthroughWithObserver(w, resp.Body, tracker)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			tracker.ObserveTrustedUpstreamModel(oaiResp.Model)
 			tracker.ObserveOpenAIUsage(oaiResp.Usage)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(oaiResp)
@@ -260,7 +261,9 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 				tracker.RecordUpstreamError(strconv.Itoa(resp.StatusCode))
 			}
 			writeUpstreamResponseWithObserver(w, resp, func(body io.Reader) {
-				tracker.ObserveOpenAIUsage(extractOpenAIUsageFromReader(body))
+				observed := extractOpenAIResponseMetricsFromReader(body)
+				tracker.ObserveTrustedUpstreamModel(observed.Model)
+				tracker.ObserveOpenAIUsage(observed.Usage)
 			})
 			return nil
 		},

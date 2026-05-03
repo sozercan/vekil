@@ -250,6 +250,37 @@ func (ps *providerSetup) lookupModel(model string) (providerModel, bool) {
 	return pm, ok
 }
 
+func (ps *providerSetup) rememberModel(model providerModel) error {
+	if ps == nil {
+		return nil
+	}
+
+	model.publicID = strings.TrimSpace(model.publicID)
+	model.upstreamModel = strings.TrimSpace(model.upstreamModel)
+	model.providerID = strings.TrimSpace(model.providerID)
+	if model.publicID == "" || model.providerID == "" {
+		return nil
+	}
+	if model.upstreamModel == "" {
+		model.upstreamModel = model.publicID
+	}
+
+	ps.modelsMu.Lock()
+	defer ps.modelsMu.Unlock()
+
+	if ps.models == nil {
+		ps.models = make(map[string]providerModel)
+	}
+	if existing, exists := ps.models[model.publicID]; exists {
+		if existing.providerID != model.providerID {
+			return providerModelCollisionError(model.publicID, existing.providerID, model.providerID)
+		}
+		return nil
+	}
+	ps.models[model.publicID] = model
+	return nil
+}
+
 func (ps *providerSetup) replaceProviderModels(providerID string, models []providerModel) error {
 	if ps == nil {
 		return nil

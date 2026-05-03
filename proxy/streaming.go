@@ -97,6 +97,7 @@ func streamOpenAIPassthroughWithObserver(w http.ResponseWriter, body io.ReadClos
 	// since headers have already been sent. The client must handle truncated streams.
 	_, _ = io.Copy(fw, reader)
 	if tracker != nil {
+		tracker.ObserveTrustedUpstreamModel(usageTap.modelCopy())
 		tracker.ObserveOpenAIUsage(usageTap.usageCopy())
 	}
 }

@@ -335,8 +335,7 @@ func TestBeginRequestMetrics_CollapsesUnknownPublicModelLabel(t *testing.T) {
 	}
 }
 
-func TestHandleOpenAIChatCompletions_LeavesUnknownMetricsLabelWhenCatalogNotCached(t *testing.T) {
-	var modelsCalls atomic.Int32
+func TestHandleOpenAIChatCompletions_PopulatesMetricsPublicModelFromTrustedUpstreamResponseWithoutCatalog(t *testing.T) {
 	var chatCalls atomic.Int32
 
 	h := newMetricsTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -355,17 +354,42 @@ func TestHandleOpenAIChatCompletions_LeavesUnknownMetricsLabelWhenCatalogNotCach
 
 	h.HandleOpenAIChatCompletions(w, req)
 
-	if got := modelsCalls.Load(); got != 0 {
-		t.Fatalf("/models calls = %d, want 0", got)
-	}
 	if got := chatCalls.Load(); got != 1 {
 		t.Fatalf("/chat/completions calls = %d, want 1", got)
 	}
-	if got := promtest.ToFloat64(h.metrics.requests.WithLabelValues("copilot", "unknown", "/v1/chat/completions", "200")); got != 1 {
-		t.Fatalf("unknown-model requests_total = %v, want 1", got)
+	if got := promtest.ToFloat64(h.metrics.requests.WithLabelValues("copilot", "gpt-4", "/v1/chat/completions", "200")); got != 1 {
+		t.Fatalf("gpt-4 requests_total = %v, want 1", got)
 	}
-	if got := promtest.ToFloat64(h.metrics.requests.WithLabelValues("copilot", "gpt-4", "/v1/chat/completions", "200")); got != 0 {
-		t.Fatalf("gpt-4 requests_total = %v, want 0 without cached catalog", got)
+	if got := promtest.ToFloat64(h.metrics.requests.WithLabelValues("copilot", "unknown", "/v1/chat/completions", "200")); got != 0 {
+		t.Fatalf("unknown-model requests_total = %v, want 0", got)
+	}
+}
+
+func TestHandleOpenAIChatCompletions_PopulatesRetryMetricsPublicModelFromTrustedUpstreamResponseWithoutCatalog(t *testing.T) {
+	var attempts atomic.Int32
+
+	h := newMetricsTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/chat/completions" {
+			t.Fatalf("unexpected backend path %q", got)
+		}
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`))
+	w := httptest.NewRecorder()
+
+	h.HandleOpenAIChatCompletions(w, req)
+
+	if got := promtest.ToFloat64(h.metrics.retries.WithLabelValues("copilot", "gpt-4", "/v1/chat/completions", "429")); got != 1 {
+		t.Fatalf("gpt-4 retries_total = %v, want 1", got)
+	}
+	if got := promtest.ToFloat64(h.metrics.retries.WithLabelValues("copilot", "unknown", "/v1/chat/completions", "429")); got != 0 {
+		t.Fatalf("unknown-model retries_total = %v, want 0", got)
 	}
 }
 
@@ -410,6 +434,34 @@ func TestHandleOpenAIChatCompletions_PopulatesMetricsPublicModelFromCachedCatalo
 		t.Fatalf("requests_total = %v, want 1", got)
 	}
 	if got := promtest.ToFloat64(h.metrics.requests.WithLabelValues("copilot", "unknown", "/v1/chat/completions", "200")); got != 0 {
+		t.Fatalf("unknown-model requests_total = %v, want 0", got)
+	}
+}
+
+func TestHandleResponses_PopulatesMetricsPublicModelFromTrustedUpstreamResponseWithoutCatalog(t *testing.T) {
+	var responsesCalls atomic.Int32
+
+	h := newMetricsTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/responses" {
+			t.Fatalf("unexpected backend path %q", got)
+		}
+		responsesCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"resp-1","object":"response","status":"completed","model":"gpt-4","output":[],"usage":{"input_tokens":7,"output_tokens":4,"total_tokens":11}}`)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4","input":"Hi"}`))
+	w := httptest.NewRecorder()
+
+	h.HandleResponses(w, req)
+
+	if got := responsesCalls.Load(); got != 1 {
+		t.Fatalf("/responses calls = %d, want 1", got)
+	}
+	if got := promtest.ToFloat64(h.metrics.requests.WithLabelValues("copilot", "gpt-4", "/v1/responses", "200")); got != 1 {
+		t.Fatalf("gpt-4 requests_total = %v, want 1", got)
+	}
+	if got := promtest.ToFloat64(h.metrics.requests.WithLabelValues("copilot", "unknown", "/v1/responses", "200")); got != 0 {
 		t.Fatalf("unknown-model requests_total = %v, want 0", got)
 	}
 }

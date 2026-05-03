@@ -59,6 +59,7 @@ type responsesWebSocketStreamEvent struct {
 
 type responsesWebSocketStreamResponse struct {
 	ID                string                                    `json:"id"`
+	Model             string                                    `json:"model,omitempty"`
 	Error             responsesWebSocketStreamError             `json:"error"`
 	IncompleteDetails responsesWebSocketStreamIncompleteDetails `json:"incomplete_details"`
 	Usage             *responsesUsage                           `json:"usage,omitempty"`

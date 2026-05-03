@@ -154,6 +154,7 @@ type requestMetricsTracker struct {
 	metrics          *proxyMetrics
 	provider         string
 	publicModel      string
+	requestedModel   string
 	endpoint         string
 	start            time.Time
 	promptTokens     float64
@@ -161,6 +162,12 @@ type requestMetricsTracker struct {
 	inflightActive   bool
 	finished         bool
 	firstByteOnce    sync.Once
+	firstByteLatency float64
+	firstBytePending bool
+	pendingRetries   map[string]uint64
+	pendingErrors    map[string]uint64
+
+	rememberResolvedPublicModel func(string)
 }
 
 type responsesUsage struct {
@@ -191,14 +198,18 @@ func (h *ProxyHandler) beginRequestMetrics(metricEndpoint, providerEndpoint, pub
 		return nil
 	}
 
+	model := strings.TrimSpace(publicModel)
 	tracker := &requestMetricsTracker{
-		metrics:     h.metrics,
-		publicModel: metricsUnknownLabel,
-		endpoint:    normalizeMetricLabel(metricEndpoint),
-		start:       time.Now(),
+		metrics:        h.metrics,
+		publicModel:    metricsUnknownLabel,
+		requestedModel: model,
+		endpoint:       normalizeMetricLabel(metricEndpoint),
+		start:          time.Now(),
+	}
+	tracker.rememberResolvedPublicModel = func(publicModel string) {
+		h.rememberMetricsPublicModel(tracker.provider, publicModel)
 	}
 
-	model := strings.TrimSpace(publicModel)
 	if model == "" {
 		return tracker
 	}
@@ -214,11 +225,44 @@ func (h *ProxyHandler) beginRequestMetrics(metricEndpoint, providerEndpoint, pub
 	return tracker
 }
 
+func (h *ProxyHandler) rememberMetricsPublicModel(providerID, publicModel string) {
+	if h == nil {
+		return
+	}
+	providerID = strings.TrimSpace(providerID)
+	publicModel = strings.TrimSpace(publicModel)
+	if providerID == "" || providerID == metricsUnknownLabel || publicModel == "" {
+		return
+	}
+
+	setup := h.providerSetup()
+	provider := setup.providerByID(providerID)
+	if !providerUsesDynamicModels(provider) {
+		return
+	}
+
+	_ = setup.rememberModel(providerModel{
+		publicID:      publicModel,
+		upstreamModel: publicModel,
+		providerID:    providerID,
+	})
+}
+
 func (t *requestMetricsTracker) setPublicModel(publicModel string) {
 	if t == nil {
 		return
 	}
-	t.publicModel = normalizeMetricLabel(publicModel)
+	publicModel = strings.TrimSpace(publicModel)
+	if normalizeMetricLabel(publicModel) == metricsUnknownLabel {
+		return
+	}
+	if strings.TrimSpace(t.publicModel) == publicModel {
+		return
+	}
+	t.publicModel = publicModel
+	if t.rememberResolvedPublicModel != nil {
+		t.rememberResolvedPublicModel(publicModel)
+	}
 }
 
 func (t *requestMetricsTracker) setProvider(provider string) {
@@ -271,7 +315,13 @@ func (t *requestMetricsTracker) ObserveFirstByte() {
 	}
 
 	t.firstByteOnce.Do(func() {
-		t.metrics.firstByte.WithLabelValues(t.providerLabel(), t.publicModelLabel(), t.endpointLabel()).Observe(time.Since(t.start).Seconds())
+		latency := time.Since(t.start).Seconds()
+		if t.publicModelLabel() == metricsUnknownLabel {
+			t.firstByteLatency = latency
+			t.firstBytePending = true
+			return
+		}
+		t.metrics.firstByte.WithLabelValues(t.providerLabel(), t.publicModelLabel(), t.endpointLabel()).Observe(latency)
 	})
 }
 
@@ -295,14 +345,64 @@ func (t *requestMetricsTracker) RecordRetry(reason string) {
 	if t == nil || t.metrics == nil {
 		return
 	}
-	t.metrics.retries.WithLabelValues(t.providerLabel(), t.publicModelLabel(), t.endpointLabel(), normalizeMetricLabel(reason)).Inc()
+	reason = normalizeMetricLabel(reason)
+	if t.publicModelLabel() == metricsUnknownLabel {
+		if t.pendingRetries == nil {
+			t.pendingRetries = make(map[string]uint64)
+		}
+		t.pendingRetries[reason]++
+		return
+	}
+	t.metrics.retries.WithLabelValues(t.providerLabel(), t.publicModelLabel(), t.endpointLabel(), reason).Inc()
 }
 
 func (t *requestMetricsTracker) RecordUpstreamError(code string) {
 	if t == nil || t.metrics == nil {
 		return
 	}
-	t.metrics.upstreamErrors.WithLabelValues(t.providerLabel(), t.publicModelLabel(), t.endpointLabel(), normalizeMetricLabel(code)).Inc()
+	code = normalizeMetricLabel(code)
+	if t.publicModelLabel() == metricsUnknownLabel {
+		if t.pendingErrors == nil {
+			t.pendingErrors = make(map[string]uint64)
+		}
+		t.pendingErrors[code]++
+		return
+	}
+	t.metrics.upstreamErrors.WithLabelValues(t.providerLabel(), t.publicModelLabel(), t.endpointLabel(), code).Inc()
+}
+
+func (t *requestMetricsTracker) ObserveTrustedUpstreamModel(model string) {
+	if t == nil {
+		return
+	}
+	if t.publicModelLabel() != metricsUnknownLabel {
+		return
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	if model == strings.TrimSpace(t.requestedModel) {
+		t.setPublicModel(model)
+	}
+}
+
+func (t *requestMetricsTracker) flushPendingMetrics() {
+	if t == nil || t.metrics == nil {
+		return
+	}
+	if t.firstBytePending {
+		t.metrics.firstByte.WithLabelValues(t.providerLabel(), t.publicModelLabel(), t.endpointLabel()).Observe(t.firstByteLatency)
+		t.firstBytePending = false
+	}
+	for reason, count := range t.pendingRetries {
+		t.metrics.retries.WithLabelValues(t.providerLabel(), t.publicModelLabel(), t.endpointLabel(), reason).Add(float64(count))
+		delete(t.pendingRetries, reason)
+	}
+	for code, count := range t.pendingErrors {
+		t.metrics.upstreamErrors.WithLabelValues(t.providerLabel(), t.publicModelLabel(), t.endpointLabel(), code).Add(float64(count))
+		delete(t.pendingErrors, code)
+	}
 }
 
 func (t *requestMetricsTracker) Finish(statusCode int) {
@@ -310,6 +410,7 @@ func (t *requestMetricsTracker) Finish(statusCode int) {
 		return
 	}
 	t.finished = true
+	t.flushPendingMetrics()
 
 	status := strconv.Itoa(statusCode)
 	provider := t.providerLabel()
@@ -331,43 +432,85 @@ func (t *requestMetricsTracker) Finish(statusCode int) {
 }
 
 func extractOpenAIUsageFromBody(body []byte) *models.OpenAIUsage {
-	var payload struct {
-		Usage *models.OpenAIUsage `json:"usage,omitempty"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil
-	}
-	return payload.Usage
+	return extractOpenAIResponseMetricsFromBody(body).Usage
 }
 
 func extractOpenAIUsageFromReader(body io.Reader) *models.OpenAIUsage {
+	return extractOpenAIResponseMetricsFromReader(body).Usage
+}
+
+type openAIResponseMetrics struct {
+	Model string
+	Usage *models.OpenAIUsage
+}
+
+func extractOpenAIResponseMetricsFromBody(body []byte) openAIResponseMetrics {
 	var payload struct {
+		Model string              `json:"model,omitempty"`
+		Usage *models.OpenAIUsage `json:"usage,omitempty"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return openAIResponseMetrics{}
+	}
+	return openAIResponseMetrics{
+		Model: strings.TrimSpace(payload.Model),
+		Usage: payload.Usage,
+	}
+}
+
+func extractOpenAIResponseMetricsFromReader(body io.Reader) openAIResponseMetrics {
+	var payload struct {
+		Model string              `json:"model,omitempty"`
 		Usage *models.OpenAIUsage `json:"usage,omitempty"`
 	}
 	if err := json.NewDecoder(body).Decode(&payload); err != nil {
-		return nil
+		return openAIResponseMetrics{}
 	}
-	return payload.Usage
+	return openAIResponseMetrics{
+		Model: strings.TrimSpace(payload.Model),
+		Usage: payload.Usage,
+	}
 }
 
 func extractResponsesUsageFromBody(body []byte) *responsesUsage {
-	var payload struct {
-		Usage *responsesUsage `json:"usage,omitempty"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil
-	}
-	return payload.Usage
+	return extractResponsesResponseMetricsFromBody(body).Usage
 }
 
 func extractResponsesUsageFromReader(body io.Reader) *responsesUsage {
+	return extractResponsesResponseMetricsFromReader(body).Usage
+}
+
+type responsesResponseMetrics struct {
+	Model string
+	Usage *responsesUsage
+}
+
+func extractResponsesResponseMetricsFromBody(body []byte) responsesResponseMetrics {
 	var payload struct {
+		Model string          `json:"model,omitempty"`
+		Usage *responsesUsage `json:"usage,omitempty"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return responsesResponseMetrics{}
+	}
+	return responsesResponseMetrics{
+		Model: strings.TrimSpace(payload.Model),
+		Usage: payload.Usage,
+	}
+}
+
+func extractResponsesResponseMetricsFromReader(body io.Reader) responsesResponseMetrics {
+	var payload struct {
+		Model string          `json:"model,omitempty"`
 		Usage *responsesUsage `json:"usage,omitempty"`
 	}
 	if err := json.NewDecoder(body).Decode(&payload); err != nil {
-		return nil
+		return responsesResponseMetrics{}
 	}
-	return payload.Usage
+	return responsesResponseMetrics{
+		Model: strings.TrimSpace(payload.Model),
+		Usage: payload.Usage,
+	}
 }
 
 type firstByteObserverResponseWriter struct {
@@ -417,6 +560,7 @@ func writeUpstreamResponseWithObserver(w http.ResponseWriter, resp *http.Respons
 type openAIStreamUsageTap struct {
 	parser responsesSSEParser
 	usage  *models.OpenAIUsage
+	model  string
 }
 
 func newOpenAIStreamUsageTap() *openAIStreamUsageTap {
@@ -429,6 +573,9 @@ func (t *openAIStreamUsageTap) Write(p []byte) (int, error) {
 		msg, ok := t.parser.nextSemantic()
 		if !ok {
 			break
+		}
+		if model := extractOpenAIModelFromChunk(msg.data); model != "" {
+			t.model = model
 		}
 		if usage := extractOpenAIUsageFromChunk(msg.data); usage != nil {
 			t.usage = usage
@@ -449,6 +596,13 @@ func (t *openAIStreamUsageTap) usageCopy() *models.OpenAIUsage {
 	return &copied
 }
 
+func (t *openAIStreamUsageTap) modelCopy() string {
+	if t == nil {
+		return ""
+	}
+	return strings.TrimSpace(t.model)
+}
+
 func extractOpenAIUsageFromChunk(data string) *models.OpenAIUsage {
 	data = strings.TrimSpace(data)
 	if data == "" || data == "[DONE]" {
@@ -463,10 +617,24 @@ func extractOpenAIUsageFromChunk(data string) *models.OpenAIUsage {
 	return &copied
 }
 
+func extractOpenAIModelFromChunk(data string) string {
+	data = strings.TrimSpace(data)
+	if data == "" || data == "[DONE]" {
+		return ""
+	}
+
+	var chunk models.OpenAIStreamChunk
+	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(chunk.Model)
+}
+
 type responsesStreamMetricsTap struct {
 	parser     responsesSSEParser
 	usage      *responsesUsage
 	statusCode int
+	model      string
 }
 
 func newResponsesStreamMetricsTap() *responsesStreamMetricsTap {
@@ -491,6 +659,9 @@ func (t *responsesStreamMetricsTap) Write(p []byte) (int, error) {
 		if event.Response.Usage != nil {
 			copied := *event.Response.Usage
 			t.usage = &copied
+		}
+		if model := strings.TrimSpace(event.Response.Model); model != "" {
+			t.model = model
 		}
 		switch strings.TrimSpace(event.Type) {
 		case "response.completed":
@@ -517,6 +688,13 @@ func (t *responsesStreamMetricsTap) usageCopy() *responsesUsage {
 	}
 	copied := *t.usage
 	return &copied
+}
+
+func (t *responsesStreamMetricsTap) modelCopy() string {
+	if t == nil {
+		return ""
+	}
+	return strings.TrimSpace(t.model)
 }
 
 func (t *responsesStreamMetricsTap) logicalStatusCode() int {
