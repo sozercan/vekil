@@ -280,6 +280,9 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 			opt(h)
 		}
 	}
+	if h.providersState == nil {
+		h.providersState = defaultProviderSetup(h)
+	}
 	if h.metricsEnabled {
 		h.metrics = newProxyMetrics(h.buildInfo)
 	}
@@ -628,9 +631,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 				continue
 			}
 			allDynamicProvidersUnchanged = false
-			if len(setup.providers) > 1 {
-				refreshedDynamicModels[provider.id] = models
-			}
+			refreshedDynamicModels[provider.id] = models
 			if result.etag != "" {
 				mergedETag = result.etag
 			}

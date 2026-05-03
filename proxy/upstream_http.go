@@ -178,7 +178,7 @@ func (h *ProxyHandler) postJSONEndpointWithMetrics(ctx context.Context, path str
 	})
 }
 
-func (h *ProxyHandler) populateRequestMetricsRouteLabels(ctx context.Context, tracker *requestMetricsTracker, requestedModel, endpoint string, provider *providerRuntime) {
+func (h *ProxyHandler) populateRequestMetricsRouteLabels(_ context.Context, tracker *requestMetricsTracker, requestedModel, endpoint string, provider *providerRuntime) {
 	if tracker == nil || provider == nil {
 		return
 	}
@@ -196,46 +196,7 @@ func (h *ProxyHandler) populateRequestMetricsRouteLabels(ctx context.Context, tr
 	resolvedProvider, owner, known := h.resolveProviderModel(requestedModel, endpoint)
 	if known && resolvedProvider != nil && resolvedProvider.id == provider.id {
 		tracker.setPublicModel(owner.publicID)
-		return
 	}
-	if !providerSupportsRequestTimeModelRefresh(provider) {
-		return
-	}
-
-	refreshCtx := ctx
-	if refreshCtx == nil {
-		refreshCtx = context.Background()
-	}
-	refreshCtx, cancel := context.WithTimeout(refreshCtx, modelsUpstreamTimeout)
-	defer cancel()
-
-	result, err := h.fetchProviderModels(refreshCtx, provider, "", "")
-	if err != nil {
-		return
-	}
-	models := filterProviderModels(provider, result.models)
-	if h.providersState != nil {
-		if err := h.providersState.replaceProviderModels(provider.id, models); err != nil {
-			return
-		}
-	}
-	for _, model := range models {
-		if model.publicID == requestedModel && providerModelSupportsEndpoint(model, endpoint) {
-			tracker.setPublicModel(model.publicID)
-			return
-		}
-	}
-}
-
-func providerSupportsRequestTimeModelRefresh(provider *providerRuntime) bool {
-	if provider == nil {
-		return false
-	}
-
-	// Keep best-effort request-time catalog refresh limited to Copilot so metrics
-	// labels can be enriched in zero-config mode without injecting extra /models
-	// calls into OpenAI Codex inference requests.
-	return provider.kind == providerTypeCopilot
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {

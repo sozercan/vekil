@@ -335,7 +335,41 @@ func TestBeginRequestMetrics_CollapsesUnknownPublicModelLabel(t *testing.T) {
 	}
 }
 
-func TestHandleOpenAIChatCompletions_PopulatesMetricsPublicModelFromCatalog(t *testing.T) {
+func TestHandleOpenAIChatCompletions_LeavesUnknownMetricsLabelWhenCatalogNotCached(t *testing.T) {
+	var modelsCalls atomic.Int32
+	var chatCalls atomic.Int32
+
+	h := newMetricsTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/chat/completions":
+			chatCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`)
+		default:
+			t.Fatalf("unexpected backend path %q", r.URL.Path)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`))
+	w := httptest.NewRecorder()
+
+	h.HandleOpenAIChatCompletions(w, req)
+
+	if got := modelsCalls.Load(); got != 0 {
+		t.Fatalf("/models calls = %d, want 0", got)
+	}
+	if got := chatCalls.Load(); got != 1 {
+		t.Fatalf("/chat/completions calls = %d, want 1", got)
+	}
+	if got := promtest.ToFloat64(h.metrics.requests.WithLabelValues("copilot", "unknown", "/v1/chat/completions", "200")); got != 1 {
+		t.Fatalf("unknown-model requests_total = %v, want 1", got)
+	}
+	if got := promtest.ToFloat64(h.metrics.requests.WithLabelValues("copilot", "gpt-4", "/v1/chat/completions", "200")); got != 0 {
+		t.Fatalf("gpt-4 requests_total = %v, want 0 without cached catalog", got)
+	}
+}
+
+func TestHandleOpenAIChatCompletions_PopulatesMetricsPublicModelFromCachedCatalog(t *testing.T) {
 	var modelsCalls atomic.Int32
 	var chatCalls atomic.Int32
 
@@ -353,6 +387,13 @@ func TestHandleOpenAIChatCompletions_PopulatesMetricsPublicModelFromCatalog(t *t
 			t.Fatalf("unexpected backend path %q", r.URL.Path)
 		}
 	})
+
+	modelsReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	modelsW := httptest.NewRecorder()
+	h.HandleModels(modelsW, modelsReq)
+	if got := modelsW.Result().StatusCode; got != http.StatusOK {
+		t.Fatalf("/v1/models status = %d, want 200", got)
+	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`))
 	w := httptest.NewRecorder()
