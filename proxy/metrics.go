@@ -194,19 +194,32 @@ func (h *ProxyHandler) beginRequestMetrics(metricEndpoint, providerEndpoint, pub
 
 	tracker := &requestMetricsTracker{
 		metrics:     h.metrics,
-		publicModel: normalizeMetricLabel(publicModel),
+		publicModel: metricsUnknownLabel,
 		endpoint:    normalizeMetricLabel(metricEndpoint),
 		start:       time.Now(),
 	}
 
 	model := strings.TrimSpace(publicModel)
-	if model != "" {
-		if provider, _, _ := h.resolveProviderModel(model, providerEndpoint); provider != nil {
-			tracker.setProvider(provider.id)
-		}
+	if model == "" {
+		return tracker
+	}
+
+	provider, owner, known := h.resolveProviderModel(model, providerEndpoint)
+	if provider != nil {
+		tracker.setProvider(provider.id)
+	}
+	if known {
+		tracker.setPublicModel(owner.publicID)
 	}
 
 	return tracker
+}
+
+func (t *requestMetricsTracker) setPublicModel(publicModel string) {
+	if t == nil {
+		return
+	}
+	t.publicModel = normalizeMetricLabel(publicModel)
 }
 
 func (t *requestMetricsTracker) setProvider(provider string) {
@@ -505,7 +518,7 @@ func retryMetricReasonFromError(err error) string {
 	if isTimeoutError(err) {
 		return "timeout"
 	}
-	return "timeout"
+	return "transport"
 }
 
 func upstreamErrorMetricCode(err error) (string, bool) {

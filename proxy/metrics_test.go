@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,6 +34,23 @@ func newMetricsTestProxyHandler(t testing.TB, backend http.HandlerFunc, opts ...
 	h.client = server.Client()
 	h.retryBaseDelay = time.Millisecond
 	return h
+}
+
+func seedMetricsPublicModels(h *ProxyHandler, publicModels ...string) {
+	setup := defaultProviderSetup(h)
+	setup.models = make(map[string]providerModel, len(publicModels))
+	for _, publicModel := range publicModels {
+		publicModel = strings.TrimSpace(publicModel)
+		if publicModel == "" {
+			continue
+		}
+		setup.models[publicModel] = providerModel{
+			publicID:      publicModel,
+			upstreamModel: publicModel,
+			providerID:    "copilot",
+		}
+	}
+	h.providersState = setup
 }
 
 func histogramSampleCount(t testing.TB, reg *prometheus.Registry, name string, labels map[string]string) uint64 {
@@ -118,6 +136,7 @@ func TestHandleOpenAIChatCompletions_RecordsMetrics(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprint(w, `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`)
 	})
+	seedMetricsPublicModels(h, "gpt-4")
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`))
 	w := httptest.NewRecorder()
@@ -151,6 +170,7 @@ func TestHandleAnthropicMessages_RecordsMetrics(t *testing.T) {
 				"data: [DONE]\n",
 		)
 	})
+	seedMetricsPublicModels(h, "claude-sonnet-4-5")
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"Hi"}]}`))
 	w := httptest.NewRecorder()
@@ -176,6 +196,7 @@ func TestHandleResponsesStreaming_RecordsMetrics(t *testing.T) {
 				"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":7,\"output_tokens\":4,\"total_tokens\":11}}}\n\n",
 		)
 	})
+	seedMetricsPublicModels(h, "gpt-4")
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4","input":"Hi","stream":true}`))
 	w := httptest.NewRecorder()
@@ -201,6 +222,7 @@ func TestHandleGeminiGenerateContent_RecordsMetrics(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprint(w, `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}`)
 	})
+	seedMetricsPublicModels(h, "gemini-2.5-pro")
 
 	reqBody := `{"contents":[{"role":"user","parts":[{"text":"Hi"}]}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:generateContent", strings.NewReader(reqBody))
@@ -229,6 +251,7 @@ func TestHandleOpenAIChatCompletions_RetryMetrics(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprint(w, `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`)
 	})
+	seedMetricsPublicModels(h, "gpt-4")
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`))
 	w := httptest.NewRecorder()
@@ -243,10 +266,43 @@ func TestHandleOpenAIChatCompletions_RetryMetrics(t *testing.T) {
 	}
 }
 
+func TestHandleOpenAIChatCompletions_TransportRetryMetrics(t *testing.T) {
+	var attempts atomic.Int32
+	h := newMetricsTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unexpected backend request")
+	})
+	seedMetricsPublicModels(h, "gpt-4")
+	h.client = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if attempts.Add(1) == 1 {
+				return nil, errors.New("dial tcp: connection refused")
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`)),
+			}, nil
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`))
+	w := httptest.NewRecorder()
+
+	h.HandleOpenAIChatCompletions(w, req)
+
+	if got := promtest.ToFloat64(h.metrics.retries.WithLabelValues("copilot", "gpt-4", "/v1/chat/completions", "transport")); got != 1 {
+		t.Fatalf("transport retries_total = %v, want 1", got)
+	}
+	if got := promtest.ToFloat64(h.metrics.retries.WithLabelValues("copilot", "gpt-4", "/v1/chat/completions", "timeout")); got != 0 {
+		t.Fatalf("timeout retries_total = %v, want 0", got)
+	}
+}
+
 func TestHandleResponses_UpstreamErrorMetrics(t *testing.T) {
 	h := newMetricsTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
+	seedMetricsPublicModels(h, "gpt-4")
 	h.maxRetries = 1
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4","input":"Hi"}`))
@@ -259,6 +315,23 @@ func TestHandleResponses_UpstreamErrorMetrics(t *testing.T) {
 	}
 	if got := promtest.ToFloat64(h.metrics.requests.WithLabelValues("copilot", "gpt-4", "/v1/responses", "503")); got != 1 {
 		t.Fatalf("requests_total = %v, want 1", got)
+	}
+}
+
+func TestBeginRequestMetrics_CollapsesUnknownPublicModelLabel(t *testing.T) {
+	h := newMetricsTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {})
+
+	tracker := h.beginRequestMetrics("/gemini:generateContent", "/chat/completions", "tenant-secret-model")
+	if tracker == nil {
+		t.Fatal("beginRequestMetrics() = nil, want non-nil")
+	}
+	tracker.Finish(http.StatusBadRequest)
+
+	if got := promtest.ToFloat64(h.metrics.requests.WithLabelValues("copilot", "unknown", "/gemini:generateContent", "400")); got != 1 {
+		t.Fatalf("requests_total = %v, want 1", got)
+	}
+	if body := metricsBody(t, h); strings.Contains(body, `public_model="tenant-secret-model"`) {
+		t.Fatalf("metrics output leaked raw public model label:\n%s", body)
 	}
 }
 
