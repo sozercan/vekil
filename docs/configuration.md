@@ -14,6 +14,8 @@ Vekil supports two runtime patterns:
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
+| `--metrics` | `METRICS` | `true` | Enable the Prometheus-compatible `GET /metrics` endpoint |
+| `--no-metrics` | — | `false` | Disable the Prometheus-compatible `GET /metrics` endpoint |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 
 ## Copilot Header Overrides
@@ -31,7 +33,7 @@ These overrides only affect Copilot-backed upstream requests.
 
 ### GitHub Copilot
 
-For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a GitHub token for a user with GitHub Copilot access. This is the only GitHub token environment variable Vekil consumes directly; it overrides cached Vekil login state and is exchanged for a short-lived Copilot token at startup.
+For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a GitHub token for a user with GitHub Copilot access. This is the only GitHub token environment variable Vekil consumes directly; it overrides cached Vekil login state and is exchanged for a short-lived Copilot token on demand when Copilot-backed requests are handled or readiness is checked.
 
 Vekil intentionally ignores generic GitHub token variables such as `GH_TOKEN` and `GITHUB_TOKEN`. If you want Vekil to use an authenticated GitHub CLI account, opt in explicitly with `vekil login --github-cli` or `vekil login --gh`; Vekil then runs `gh auth token --hostname github.com` for Copilot access and keeps that token in memory only, without copying it into Vekil's `access-token` or `api-key.json` caches.
 
@@ -210,3 +212,13 @@ Important:
 ```
 
 With `--log-level debug`, websocket bridge logs include `delta_attempted`, `delta_fallback`, `auto_compacted`, `history_items`, `history_bytes`, and compaction before/after sizes.
+
+## Metrics
+
+`GET /metrics` is enabled by default and exposes Prometheus text format using the same HTTP listener as `/healthz`.
+
+- Disable it with `--no-metrics` or `METRICS=false`.
+- In zero-config Copilot mode, the listener still starts immediately; `/metrics` and `/healthz` do not wait for interactive device-code login.
+- Standard Go runtime and process metrics are included, along with `vekil_build_info`.
+- Vekil currently exposes a coarse `vekil_http_requests_total` counter labeled only by bounded route patterns and HTTP status codes.
+- Per-provider, per-model, token-count, and payload-level metrics are intentionally deferred for a later PR so this first change stays low-cardinality and avoids exposing prompt, key, virtual-key, or other request content in labels.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -90,6 +91,51 @@ func TestGetEnvInt(t *testing.T) {
 			t.Setenv(envKey, tc.value)
 			if got := getEnvInt(envKey, 42); got != tc.want {
 				t.Fatalf("getEnvInt() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseServeOptionsMetrics(t *testing.T) {
+	tests := []struct {
+		name       string
+		envValue   string
+		args       []string
+		wantEnable bool
+	}{
+		{
+			name:       "enabled by default",
+			wantEnable: true,
+		},
+		{
+			name:       "env disables metrics",
+			envValue:   "false",
+			wantEnable: false,
+		},
+		{
+			name:       "metrics flag overrides env false",
+			envValue:   "false",
+			args:       []string{"--metrics"},
+			wantEnable: true,
+		},
+		{
+			name:       "no metrics flag disables endpoint",
+			envValue:   "true",
+			args:       []string{"--no-metrics"},
+			wantEnable: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("METRICS", tc.envValue)
+
+			opts, err := parseServeOptions(tc.args, io.Discard)
+			if err != nil {
+				t.Fatalf("parseServeOptions() error = %v", err)
+			}
+			if opts.metricsEnabled != tc.wantEnable {
+				t.Fatalf("metricsEnabled = %v, want %v", opts.metricsEnabled, tc.wantEnable)
 			}
 		})
 	}

@@ -21,7 +21,8 @@ type Server struct {
 }
 
 type options struct {
-	proxyOptions []proxy.Option
+	proxyOptions   []proxy.Option
+	metricsEnabled bool
 }
 
 // Option customizes server creation.
@@ -52,9 +53,16 @@ func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 	return WithProxyOptions(proxy.WithStreamingUpstreamTimeout(timeout))
 }
 
+// WithMetricsEnabled enables or disables the Prometheus /metrics endpoint.
+func WithMetricsEnabled(enabled bool) Option {
+	return func(o *options) {
+		o.metricsEnabled = enabled
+	}
+}
+
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
-	cfg := options{}
+	cfg := options{metricsEnabled: true}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
@@ -66,19 +74,37 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 		return nil, err
 	}
 
+	var metrics *metricsState
+	if cfg.metricsEnabled {
+		metrics = newMetricsState()
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/messages", handler.HandleAnthropicMessages)
-	mux.HandleFunc("POST /v1/chat/completions", handler.HandleOpenAIChatCompletions)
-	mux.HandleFunc("POST /v1beta/models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /v1/models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /v1/responses/compact", handler.HandleCompact)
-	mux.HandleFunc("POST /v1/responses", handler.HandleResponses)
-	mux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
-	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
-	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
-	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
-	mux.HandleFunc("GET /v1/models", handler.HandleModels)
+	handle := func(pattern string, route string, h http.Handler) {
+		if metrics != nil {
+			h = metrics.instrument(route, h)
+		}
+		mux.Handle(pattern, h)
+	}
+	handleFunc := func(pattern string, route string, h http.HandlerFunc) {
+		handle(pattern, route, h)
+	}
+
+	handleFunc("POST /v1/messages", "POST /v1/messages", handler.HandleAnthropicMessages)
+	handleFunc("POST /v1/chat/completions", "POST /v1/chat/completions", handler.HandleOpenAIChatCompletions)
+	handleFunc("POST /v1beta/models/", "POST /v1beta/models/", handler.HandleGeminiModels)
+	handleFunc("POST /v1/models/", "POST /v1/models/", handler.HandleGeminiModels)
+	handleFunc("POST /models/", "POST /models/", handler.HandleGeminiModels)
+	handleFunc("POST /v1/responses/compact", "POST /v1/responses/compact", handler.HandleCompact)
+	handleFunc("POST /v1/responses", "POST /v1/responses", handler.HandleResponses)
+	handleFunc("GET /v1/responses", "GET /v1/responses", handler.HandleResponsesWebSocket)
+	handleFunc("POST /v1/memories/trace_summarize", "POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
+	handleFunc("GET /healthz", "GET /healthz", handler.HandleHealthz)
+	handleFunc("GET /readyz", "GET /readyz", handler.HandleReadyz)
+	handleFunc("GET /v1/models", "GET /v1/models", handler.HandleModels)
+	if metrics != nil {
+		handle("GET /metrics", "GET /metrics", metrics.handler())
+	}
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{
