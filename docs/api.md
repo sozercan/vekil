@@ -140,7 +140,7 @@ Compatibility shim for environments expecting `/responses/compact`. The proxy re
 - a normal assistant summary message
 - a proxy-owned opaque `compaction` item whose `encrypted_content` can later be sent back to `/v1/responses` or `/v1/responses/compact`
 
-Requests to this endpoint are accepted up to `64 MiB` so large session histories can be compacted without tripping the default request-body limit.
+Requests to this endpoint are accepted up to `64 MiB` so large session histories can be compacted without tripping the default request-body limit. If the upstream `/responses` call still rejects the compact payload with `413 Payload Too Large`, the proxy retries by compacting the input in chunks, including splitting oversized individual input items or string inputs into synthetic historical-context chunks before merging the partial summaries into one final checkpoint. During this fallback only, oversized fixed fields such as large `tools` arrays or `text` schemas may be omitted from retry requests when needed to stay under upstream payload limits.
 
 If the requested model does not support the upstream Responses API, the proxy retries against a compatible fallback model discovered from `/models`.
 That fallback stays within the selected provider; the proxy does not silently switch providers.
