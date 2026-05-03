@@ -383,27 +383,30 @@ func extractGeminiCountTokensFallbackError(body []byte) (message, param, code st
 }
 
 func geminiCountTokensMaxCompletionTokensFallbackMatch(message, param, code string) bool {
-	message = strings.ToLower(message)
-	param = strings.ToLower(param)
-	code = strings.ToLower(code)
+	normalizedMessage := strings.ToLower(strings.TrimSpace(message))
+	normalizedMessage = strings.NewReplacer("'", "", "\"", "", "`", "").Replace(normalizedMessage)
+	normalizedMessage = strings.Join(strings.Fields(normalizedMessage), " ")
+	param = strings.ToLower(strings.TrimSpace(param))
+	code = strings.ToLower(strings.TrimSpace(code))
 
-	mentionsMaxCompletionTokens := param == "max_completion_tokens" || strings.Contains(message, "max_completion_tokens")
-	if !mentionsMaxCompletionTokens {
-		return false
+	if param == "max_completion_tokens" {
+		switch code {
+		case "unsupported_parameter", "unknown_parameter":
+			return true
+		}
 	}
 
-	switch code {
-	case "unsupported_parameter", "unknown_parameter":
-		return true
-	}
-
-	return strings.Contains(message, "unsupported") ||
-		strings.Contains(message, "not supported") ||
-		strings.Contains(message, "unknown parameter") ||
-		strings.Contains(message, "unrecognized request argument") ||
-		strings.Contains(message, "unsupported_parameter") ||
-		strings.Contains(message, "unknown_parameter") ||
-		strings.Contains(message, "max_tokens")
+	return strings.Contains(normalizedMessage, "max_completion_tokens unsupported") ||
+		strings.Contains(normalizedMessage, "max_completion_tokens not supported") ||
+		strings.Contains(normalizedMessage, "max_completion_tokens is not supported") ||
+		strings.Contains(normalizedMessage, "parameter max_completion_tokens is not supported") ||
+		strings.Contains(normalizedMessage, "unsupported parameter: max_completion_tokens") ||
+		strings.Contains(normalizedMessage, "unknown parameter: max_completion_tokens") ||
+		strings.Contains(normalizedMessage, "unrecognized request argument supplied: max_completion_tokens") ||
+		strings.Contains(normalizedMessage, "unsupported_parameter: max_completion_tokens") ||
+		strings.Contains(normalizedMessage, "unsupported_parameter max_completion_tokens") ||
+		strings.Contains(normalizedMessage, "unknown_parameter: max_completion_tokens") ||
+		strings.Contains(normalizedMessage, "unknown_parameter max_completion_tokens")
 }
 
 func (h *ProxyHandler) writeGeminiProtocolError(w http.ResponseWriter, err error) {

@@ -2212,6 +2212,59 @@ func TestHandleGeminiModelsCountTokensDoesNotFallbackOnUnexpectedBadRequest(t *t
 	}
 }
 
+func TestHandleGeminiModelsCountTokensDoesNotFallbackOnBadRequestMentioningBothTokenFields(t *testing.T) {
+	callCount := 0
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+
+		if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != 1 {
+			t.Fatalf("MaxCompletionTokens = %v, want 1", oaiReq.MaxCompletionTokens)
+		}
+		if oaiReq.MaxTokens != nil {
+			t.Fatalf("MaxTokens = %v, want nil", oaiReq.MaxTokens)
+		}
+
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"Only one of 'max_completion_tokens' or 'max_tokens' may be set.","param":"max_completion_tokens","code":"invalid_request_error"}}`))
+	})
+
+	reqBody := `{
+		"contents": [{"role":"user","parts":[{"text":"Count this"}]}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:countTokens", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleGeminiModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("StatusCode = %d, want 400: %s", resp.StatusCode, string(body))
+	}
+
+	var errResp models.GeminiErrorResponse
+	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if errResp.Error.Status != "INVALID_ARGUMENT" {
+		t.Fatalf("status = %q, want INVALID_ARGUMENT", errResp.Error.Status)
+	}
+	if !strings.Contains(errResp.Error.Message, "upstream error (400)") {
+		t.Fatalf("message = %q, want upstream 400 detail", errResp.Error.Message)
+	}
+
+	if callCount != 1 {
+		t.Fatalf("upstream callCount = %d, want 1", callCount)
+	}
+}
+
 func TestIsGeminiCountTokensMaxCompletionTokensFallback(t *testing.T) {
 	tests := []struct {
 		name string
@@ -2231,6 +2284,11 @@ func TestIsGeminiCountTokensMaxCompletionTokensFallback(t *testing.T) {
 		{
 			name: "unrelated bad request",
 			body: `{"error":{"message":"messages[0] is invalid","param":"messages","code":"invalid_request_error"}}`,
+			want: false,
+		},
+		{
+			name: "bad request mentioning both token fields",
+			body: `{"error":{"message":"Only one of 'max_completion_tokens' or 'max_tokens' may be set.","param":"max_completion_tokens","code":"invalid_request_error"}}`,
 			want: false,
 		},
 	}
