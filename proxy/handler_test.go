@@ -1210,6 +1210,334 @@ func TestHandleCompact_FallsBackToChunkedCompactionOnUpstream413(t *testing.T) {
 	}
 }
 
+func TestHandleCompact_FallsBackToChunkedCompactionForStringInputOnUpstream413(t *testing.T) {
+	largeText := strings.Repeat("a", compactUpstreamChunkBodySize+(4*1024))
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": largeText,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	var calls atomic.Int32
+	var chunkCalls atomic.Int32
+	var mergeCalls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+
+		switch call := calls.Add(1); call {
+		case 1:
+			if len(body) <= compactUpstreamChunkBodySize {
+				t.Fatalf("expected initial compact body to exceed chunk target, got %d bytes", len(body))
+			}
+			if _, ok := req["input"].(string); !ok {
+				t.Fatalf("expected initial input to remain a string, got %#v", req["input"])
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+			return
+		default:
+			if len(body) > compactUpstreamChunkBodySize {
+				t.Fatalf("fallback compact body exceeded chunk target: got %d bytes", len(body))
+			}
+		}
+
+		input, ok := req["input"].([]interface{})
+		if !ok || len(input) == 0 {
+			t.Fatalf("expected fallback input array, got %#v", req["input"])
+		}
+		text := requireMessageTextWithRole(t, input[0], "user")
+		switch {
+		case strings.Contains(text, "Partial checkpoint summary"):
+			mergeCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-merge","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"final merged string summary"}]}]}`))
+		case strings.Contains(text, "Oversized compact input item chunk"):
+			chunkCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-chunk","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"chunk summary"}]}]}`))
+		default:
+			t.Fatalf("unexpected fallback compact input text: %.200q", text)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if chunkCalls.Load() < 2 {
+		t.Fatalf("expected at least two fallback chunk requests, got %d", chunkCalls.Load())
+	}
+	if mergeCalls.Load() != 1 {
+		t.Fatalf("expected one merge request, got %d", mergeCalls.Load())
+	}
+	if calls.Load() != 1+chunkCalls.Load()+mergeCalls.Load() {
+		t.Fatalf("unexpected upstream request accounting: calls=%d chunks=%d merges=%d", calls.Load(), chunkCalls.Load(), mergeCalls.Load())
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Output []struct {
+			Type             string `json:"type"`
+			EncryptedContent string `json:"encrypted_content"`
+			Content          []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to parse compact response: %v", err)
+	}
+	if len(result.Output) != 2 || result.Output[0].Content[0].Text != "final merged string summary" {
+		t.Fatalf("expected final merged compact response, got %+v", result.Output)
+	}
+	if got := decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent); got != "final merged string summary" {
+		t.Fatalf("expected encoded final merged summary, got %q", got)
+	}
+}
+
+func TestHandleCompact_StripsOversizedToolsDuring413Fallback(t *testing.T) {
+	hugeToolDescription := strings.Repeat("a", compactUpstreamChunkBodySize)
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "please compact this small history"},
+				},
+			},
+		},
+		"tools": []interface{}{
+			map[string]interface{}{
+				"type":        "function",
+				"name":        "oversized_tool",
+				"description": hugeToolDescription,
+				"parameters": map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
+				},
+			},
+		},
+		"tool_choice": map[string]interface{}{"type": "function", "name": "oversized_tool"},
+		"text":        map[string]interface{}{"format": map[string]string{"type": "text"}},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	var calls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+		input, ok := req["input"].([]interface{})
+		if !ok || len(input) != 1 {
+			t.Fatalf("expected one compact input item, got %#v", req["input"])
+		}
+
+		switch call := calls.Add(1); call {
+		case 1:
+			if len(body) <= compactUpstreamChunkBodySize {
+				t.Fatalf("expected initial compact body to exceed chunk target, got %d bytes", len(body))
+			}
+			if _, ok := req["tools"]; !ok {
+				t.Fatalf("expected initial upstream request to include tools")
+			}
+			if _, ok := req["tool_choice"]; !ok {
+				t.Fatalf("expected initial upstream request to include tool_choice")
+			}
+			if _, ok := req["text"]; !ok {
+				t.Fatalf("expected initial upstream request to include text")
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"payload too large"}}`))
+		case 2:
+			if len(body) > compactUpstreamChunkBodySize {
+				t.Fatalf("expected sanitized compact fallback body to fit target, got %d bytes", len(body))
+			}
+			if _, ok := req["tools"]; ok {
+				t.Fatalf("expected sanitized fallback request to omit oversized tools")
+			}
+			if _, ok := req["tool_choice"]; ok {
+				t.Fatalf("expected sanitized fallback request to omit tool_choice with tools")
+			}
+			if _, ok := req["text"]; !ok {
+				t.Fatalf("expected sanitized fallback request to preserve small text field")
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-sanitized-tools","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary without oversized tools"}]}]}`))
+		default:
+			t.Fatalf("unexpected /responses request count %d", call)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected initial request and one sanitized fallback request, got %d", calls.Load())
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	summary, encryptedSummary := requireCompactResponseSummaryForTest(t, body)
+	if summary != "summary without oversized tools" {
+		t.Fatalf("expected sanitized tools summary, got %q", summary)
+	}
+	if encryptedSummary != "summary without oversized tools" {
+		t.Fatalf("expected encoded sanitized tools summary, got %q", encryptedSummary)
+	}
+}
+
+func TestHandleCompact_StripsOversizedTextDuring413Fallback(t *testing.T) {
+	hugeJSONSchemaDescription := strings.Repeat("b", compactUpstreamChunkBodySize)
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "please compact this history with a text schema"},
+				},
+			},
+		},
+		"tools": []interface{}{
+			map[string]interface{}{
+				"type":        "function",
+				"name":        "small_tool",
+				"description": "small tool that should survive fallback sanitization",
+				"parameters": map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
+				},
+			},
+		},
+		"tool_choice": map[string]interface{}{"type": "function", "name": "small_tool"},
+		"text": map[string]interface{}{
+			"format": map[string]interface{}{
+				"type": "json_schema",
+				"name": "oversized_schema",
+				"schema": map[string]interface{}{
+					"type":        "object",
+					"description": hugeJSONSchemaDescription,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	var calls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+		input, ok := req["input"].([]interface{})
+		if !ok || len(input) != 1 {
+			t.Fatalf("expected one compact input item, got %#v", req["input"])
+		}
+
+		switch call := calls.Add(1); call {
+		case 1:
+			if len(body) <= compactUpstreamChunkBodySize {
+				t.Fatalf("expected initial compact body to exceed chunk target, got %d bytes", len(body))
+			}
+			if _, ok := req["text"]; !ok {
+				t.Fatalf("expected initial upstream request to include text")
+			}
+			if _, ok := req["tools"]; !ok {
+				t.Fatalf("expected initial upstream request to include tools")
+			}
+			if _, ok := req["tool_choice"]; !ok {
+				t.Fatalf("expected initial upstream request to include tool_choice")
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"payload too large"}}`))
+		case 2:
+			if len(body) > compactUpstreamChunkBodySize {
+				t.Fatalf("expected sanitized compact fallback body to fit target, got %d bytes", len(body))
+			}
+			if _, ok := req["text"]; ok {
+				t.Fatalf("expected sanitized fallback request to omit oversized text field")
+			}
+			if _, ok := req["tools"]; !ok {
+				t.Fatalf("expected sanitized fallback request to preserve small tools")
+			}
+			if _, ok := req["tool_choice"]; !ok {
+				t.Fatalf("expected sanitized fallback request to preserve tool_choice with tools")
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-sanitized-text","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary without oversized text schema"}]}]}`))
+		default:
+			t.Fatalf("unexpected /responses request count %d", call)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected initial request and one sanitized fallback request, got %d", calls.Load())
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	summary, encryptedSummary := requireCompactResponseSummaryForTest(t, body)
+	if summary != "summary without oversized text schema" {
+		t.Fatalf("expected sanitized text summary, got %q", summary)
+	}
+	if encryptedSummary != "summary without oversized text schema" {
+		t.Fatalf("expected encoded sanitized text summary, got %q", encryptedSummary)
+	}
+}
+
 func TestHandleCompact_ReturnsOriginal413WhenChunkedMergeFails(t *testing.T) {
 	largeText := strings.Repeat("a", 5*1024*1024)
 	reqBody, err := json.Marshal(map[string]interface{}{
@@ -1398,6 +1726,62 @@ func TestHandleCompact_CapsOriginal413BodyWhenChunkedMergeFails(t *testing.T) {
 	}
 	if calls.Load() != 4 {
 		t.Fatalf("expected initial request, 2 chunk requests, and failed merge; got %d calls", calls.Load())
+	}
+}
+
+func TestSplitOversizedCompactInputItemsByBodySize(t *testing.T) {
+	modelRaw, _ := json.Marshal("gpt-5.4")
+	inputRaw := json.RawMessage(`[]`)
+	requestFields := map[string]json.RawMessage{
+		"model": modelRaw,
+		"input": inputRaw,
+	}
+	oversizedItem, err := json.Marshal(map[string]interface{}{
+		"type": "message",
+		"role": "user",
+		"content": []map[string]string{
+			{"type": "input_text", "text": strings.Repeat("oversized ", 2048)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal oversized item: %v", err)
+	}
+
+	maxBodySize := 4096
+	singleBody, err := marshalCompactResponsesRequest(requestFields, []json.RawMessage{oversizedItem})
+	if err != nil {
+		t.Fatalf("failed to marshal single item body: %v", err)
+	}
+	if len(singleBody) <= maxBodySize {
+		t.Fatalf("expected single item body to exceed test max, got %d", len(singleBody))
+	}
+
+	splitItems, split, err := splitOversizedCompactInputItemsByBodySize(requestFields, []json.RawMessage{oversizedItem}, maxBodySize)
+	if err != nil {
+		t.Fatalf("split oversized item failed: %v", err)
+	}
+	if !split {
+		t.Fatal("expected oversized item to be split")
+	}
+	if len(splitItems) < 2 {
+		t.Fatalf("expected at least two split items, got %d", len(splitItems))
+	}
+	for i, item := range splitItems {
+		body, err := marshalCompactResponsesRequest(requestFields, []json.RawMessage{item})
+		if err != nil {
+			t.Fatalf("failed to marshal split item %d: %v", i, err)
+		}
+		if len(body) > maxBodySize {
+			t.Fatalf("split item %d exceeded max body size: got %d, max %d", i, len(body), maxBodySize)
+		}
+		var decoded map[string]interface{}
+		if err := json.Unmarshal(item, &decoded); err != nil {
+			t.Fatalf("split item %d is invalid JSON: %v", i, err)
+		}
+		text := requireMessageTextWithRole(t, decoded, "user")
+		if !strings.Contains(text, "Oversized compact input item chunk") {
+			t.Fatalf("split item %d missing oversized context marker: %.200q", i, text)
+		}
 	}
 }
 
@@ -2317,6 +2701,33 @@ func decodeCompactionSummaryForTest(t *testing.T, encryptedContent string) strin
 		t.Fatalf("expected synthetic compaction payload, got %q", encryptedContent)
 	}
 	return summary
+}
+
+func requireCompactResponseSummaryForTest(t *testing.T, body []byte) (string, string) {
+	t.Helper()
+	var result struct {
+		Output []struct {
+			Type             string `json:"type"`
+			EncryptedContent string `json:"encrypted_content"`
+			Content          []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to parse compact response: %v", err)
+	}
+	if len(result.Output) != 2 {
+		t.Fatalf("expected 2 output items, got %d", len(result.Output))
+	}
+	if result.Output[0].Type != "message" || len(result.Output[0].Content) == 0 || result.Output[0].Content[0].Type != "output_text" {
+		t.Fatalf("expected compact response summary message, got %+v", result.Output[0])
+	}
+	if result.Output[1].Type != "compaction" {
+		t.Fatalf("expected compact response compaction item, got %+v", result.Output[1])
+	}
+	return result.Output[0].Content[0].Text, decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent)
 }
 
 func requireCompactionContextMessage(t *testing.T, raw interface{}) string {
