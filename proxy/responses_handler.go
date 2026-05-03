@@ -686,14 +686,19 @@ func splitOversizedCompactInputItemsByBodySize(requestFields map[string]json.Raw
 		return nil, false, fmt.Errorf("invalid compact chunk size %d", maxBodySize)
 	}
 
+	fixedBodySize, err := compactRequestFixedBodySize(requestFields)
+	if err != nil {
+		return nil, false, err
+	}
+
 	out := make([]json.RawMessage, 0, len(input))
 	var splitAny bool
 	for _, item := range input {
-		body, err := marshalCompactResponsesRequest(requestFields, []json.RawMessage{item})
+		itemSize, err := encodedRawMessageSize(item)
 		if err != nil {
 			return nil, false, err
 		}
-		if len(body) <= maxBodySize {
+		if fixedBodySize+len("[]")+itemSize <= maxBodySize {
 			out = append(out, item)
 			continue
 		}
@@ -806,14 +811,13 @@ func splitCompactInputByBodySize(requestFields map[string]json.RawMessage, input
 		return nil, fmt.Errorf("invalid compact chunk size %d", maxBodySize)
 	}
 
-	emptyBody, err := marshalCompactResponsesRequest(requestFields, []json.RawMessage{})
+	fixedBodySize, err := compactRequestFixedBodySize(requestFields)
 	if err != nil {
 		return nil, err
 	}
 	// The rest of the compact request is stable while splitting. Track only the
 	// encoded JSON array size for input so each item is marshaled once instead of
 	// re-marshaling the whole candidate body for every append.
-	fixedBodySize := len(emptyBody) - len("[]")
 
 	chunks := make([][]json.RawMessage, 0, 2)
 	current := make([]json.RawMessage, 0, len(input))
@@ -843,6 +847,14 @@ func splitCompactInputByBodySize(requestFields map[string]json.RawMessage, input
 	}
 
 	return chunks, nil
+}
+
+func compactRequestFixedBodySize(requestFields map[string]json.RawMessage) (int, error) {
+	emptyBody, err := marshalCompactResponsesRequest(requestFields, []json.RawMessage{})
+	if err != nil {
+		return 0, err
+	}
+	return len(emptyBody) - len("[]"), nil
 }
 
 func encodedRawMessageSize(raw json.RawMessage) (int, error) {

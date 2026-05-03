@@ -1211,7 +1211,7 @@ func TestHandleCompact_FallsBackToChunkedCompactionOnUpstream413(t *testing.T) {
 }
 
 func TestHandleCompact_FallsBackToChunkedCompactionForStringInputOnUpstream413(t *testing.T) {
-	largeText := strings.Repeat("a", compactUpstreamChunkBodySize+(512*1024))
+	largeText := strings.Repeat("a", compactUpstreamChunkBodySize+(4*1024))
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
 		"input": largeText,
