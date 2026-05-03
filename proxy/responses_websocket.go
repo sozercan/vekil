@@ -242,6 +242,13 @@ func (o *responsesWebSocketRequestObserver) setResponsesUsage(usage *responsesTo
 	o.metrics.setResponsesUsage(usage)
 }
 
+func (o *responsesWebSocketRequestObserver) observeResponsesStreamFailure(event responsesWebSocketStreamEvent) {
+	if o == nil || o.metrics == nil {
+		return
+	}
+	o.metrics.observeResponsesStreamFailure(event)
+}
+
 func (o *responsesWebSocketRequestObserver) finish() {
 	if o == nil || o.metrics == nil {
 		return
@@ -276,6 +283,12 @@ func (s *responsesWebSocketSession) observeCurrentRequestStatus(statusCode int) 
 func (s *responsesWebSocketSession) observeCurrentRequestUsage(usage *responsesTokenUsage) {
 	if observer := s.currentRequestObserver(); observer != nil {
 		observer.setResponsesUsage(usage)
+	}
+}
+
+func (s *responsesWebSocketSession) observeCurrentRequestStreamFailure(event responsesWebSocketStreamEvent) {
+	if observer := s.currentRequestObserver(); observer != nil {
+		observer.observeResponsesStreamFailure(event)
 	}
 }
 
@@ -415,6 +428,9 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return err
 	}
 	if translated != nil {
+		if translated.failure != nil {
+			s.observeCurrentRequestStreamFailure(*translated.failure)
+		}
 		code := ""
 		if translated.failure != nil {
 			code = strings.TrimSpace(translated.failure.Response.Error.Code)
@@ -728,6 +744,7 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, heade
 			sawSemanticEvent = true
 			if parsedEvent && event.Type == "response.failed" {
 				if status, _, ok := classifyPrecommitResponsesFailure(event); ok {
+					s.observeCurrentRequestStreamFailure(event)
 					s.sendWrappedError(status, responsesPrecommitErrorMessage(event, status), strings.TrimSpace(event.Response.Error.Code), headers)
 					return errStreamFailedUpstream
 				}
@@ -799,6 +816,7 @@ func (s *responsesWebSocketSession) writeTextMessage(encoded []byte) error {
 }
 
 func (s *responsesWebSocketSession) sendUpstreamStreamFailure(event responsesWebSocketStreamEvent, headers http.Header) {
+	s.observeCurrentRequestStreamFailure(event)
 	status, message, code := responsesWebSocketStreamFailureDetails(event)
 	if status == 0 || strings.TrimSpace(message) == "" {
 		return

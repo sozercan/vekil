@@ -185,6 +185,9 @@ func peekAndForwardResponsesWithConfigObserved(h *ProxyHandler, w http.ResponseW
 	}
 	if hasResult && result.decision == responsesPeekDecisionTranslate {
 		logResponsesPrecommitTranslated(h, result, model, resp.Header)
+		if result.failure != nil && onFailure != nil {
+			onFailure(*result.failure)
+		}
 		prepared.abort()
 		writeOpenAIErrorWithRetryAfter(w, result.status, result.message, result.errType, result.retryAfter, resp.Header)
 		return

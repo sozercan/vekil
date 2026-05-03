@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/sozercan/vekil/auth"
@@ -204,6 +205,9 @@ func TestHandleResponsesStreamingTranslatedJSONErrorSkipsStreamFirstByteMetric(t
 
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", w.Code)
+	}
+	if got := testutil.ToFloat64(h.metrics.upstreamErrorsTotal.WithLabelValues("copilot", "gpt-4", "429")); got != 1 {
+		t.Fatalf("upstream_errors_total = %v, want 1", got)
 	}
 	if got := histogramSampleCountOrZero(t, h.metrics.registry, "vekil_stream_first_byte_latency_seconds", map[string]string{
 		"provider":     "copilot",
@@ -513,6 +517,93 @@ func TestHandleResponsesWebSocketRecordsMetrics(t *testing.T) {
 		"endpoint":     "/v1/responses",
 	}); got != 1 {
 		t.Fatalf("stream first-byte sample_count = %d, want 1", got)
+	}
+}
+
+func TestHandleResponsesWebSocketRecordsUpstreamErrorMetricsOnStreamFailure(t *testing.T) {
+	tests := []struct {
+		name           string
+		body           string
+		wantMetricCode string
+		readFrames     func(t *testing.T, conn *websocket.Conn)
+	}{
+		{
+			name:           "translated first-event response.failed",
+			body:           "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-rate-limit\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"}}}\n\n",
+			wantMetricCode: "429",
+			readFrames: func(t *testing.T, conn *websocket.Conn) {
+				t.Helper()
+				errFrame := mustReadWebSocketJSON(t, conn)
+				if got := errFrame["type"]; got != "error" {
+					t.Fatalf("error frame type = %v, want error", got)
+				}
+			},
+		},
+		{
+			name: "post-commit response.incomplete",
+			body: "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-inc\"}}\n\n" +
+				"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-inc\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+			wantMetricCode: "409",
+			readFrames: func(t *testing.T, conn *websocket.Conn) {
+				t.Helper()
+				if got := mustReadWebSocketJSONSkipMetadata(t, conn)["type"]; got != "response.created" {
+					t.Fatalf("first websocket event type = %v, want response.created", got)
+				}
+				if got := mustReadWebSocketJSONSkipMetadata(t, conn)["type"]; got != "response.incomplete" {
+					t.Fatalf("second websocket event type = %v, want response.incomplete", got)
+				}
+				if got := mustReadWebSocketJSON(t, conn)["type"]; got != "error" {
+					t.Fatalf("third websocket event type = %v, want error", got)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/responses" {
+					t.Fatalf("path = %q, want /responses", r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprint(w, tt.body)
+			}))
+			defer upstream.Close()
+
+			h, err := NewProxyHandler(
+				auth.NewTestAuthenticator("test-token"),
+				logger.New(logger.LevelError),
+				withCopilotBaseURLForTest(upstream.URL),
+			)
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+
+			server := startResponsesWebSocketProxyServer(t, h)
+			conn := mustDialResponsesWebSocket(t, server, nil)
+			defer func() { _ = conn.Close() }()
+
+			request := newResponsesWebSocketCreateRequest([]interface{}{
+				map[string]interface{}{
+					"type": "message",
+					"role": "user",
+					"content": []map[string]string{
+						{"type": "input_text", "text": "hello"},
+					},
+				},
+			})
+			request["model"] = "gpt-4"
+
+			if err := conn.WriteJSON(request); err != nil {
+				t.Fatalf("failed to write websocket request: %v", err)
+			}
+
+			tt.readFrames(t, conn)
+
+			if got := testutil.ToFloat64(h.metrics.upstreamErrorsTotal.WithLabelValues("copilot", "gpt-4", tt.wantMetricCode)); got != 1 {
+				t.Fatalf("upstream_errors_total[%s] = %v, want 1", tt.wantMetricCode, got)
+			}
+		})
 	}
 }
 
