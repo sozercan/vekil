@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -276,7 +278,7 @@ func (h *ProxyHandler) executeGeminiCountTokensProbe(probeReq *models.OpenAIRequ
 		return nil, false, mapGeminiTransportError(err)
 	}
 
-	if resp.StatusCode == http.StatusBadRequest && probeReq.MaxCompletionTokens != nil {
+	if shouldFallbackGeminiCountTokensProbe(resp, probeReq) {
 		_ = resp.Body.Close()
 		return nil, true, nil
 	}
@@ -329,6 +331,82 @@ func (h *ProxyHandler) decodeGeminiProbeResponse(resp *http.Response) (*models.O
 	}
 
 	return &oaiResp, false, nil
+}
+
+func shouldFallbackGeminiCountTokensProbe(resp *http.Response, probeReq *models.OpenAIRequest) bool {
+	if resp == nil || resp.StatusCode != http.StatusBadRequest || probeReq == nil || probeReq.MaxCompletionTokens == nil {
+		return false
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+
+	return isGeminiCountTokensMaxCompletionTokensFallback(body)
+}
+
+func isGeminiCountTokensMaxCompletionTokensFallback(body []byte) bool {
+	message, param, code := extractGeminiCountTokensFallbackError(body)
+	if geminiCountTokensMaxCompletionTokensFallbackMatch(message, param, code) {
+		return true
+	}
+
+	return geminiCountTokensMaxCompletionTokensFallbackMatch(strings.ToLower(strings.TrimSpace(string(body))), "", "")
+}
+
+func extractGeminiCountTokensFallbackError(body []byte) (message, param, code string) {
+	var envelope struct {
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return "", "", ""
+	}
+
+	if len(envelope.Error) != 0 {
+		var errorText string
+		if err := json.Unmarshal(envelope.Error, &errorText); err == nil {
+			return errorText, "", ""
+		}
+
+		var details struct {
+			Message string `json:"message"`
+			Param   string `json:"param"`
+			Code    string `json:"code"`
+		}
+		if err := json.Unmarshal(envelope.Error, &details); err == nil {
+			return details.Message, details.Param, details.Code
+		}
+	}
+
+	return envelope.Message, "", ""
+}
+
+func geminiCountTokensMaxCompletionTokensFallbackMatch(message, param, code string) bool {
+	normalizedMessage := strings.ToLower(strings.TrimSpace(message))
+	normalizedMessage = strings.NewReplacer("'", "", "\"", "", "`", "").Replace(normalizedMessage)
+	normalizedMessage = strings.Join(strings.Fields(normalizedMessage), " ")
+	param = strings.ToLower(strings.TrimSpace(param))
+	code = strings.ToLower(strings.TrimSpace(code))
+
+	if param == "max_completion_tokens" {
+		switch code {
+		case "unsupported_parameter", "unknown_parameter":
+			return true
+		}
+	}
+
+	return strings.Contains(normalizedMessage, "max_completion_tokens unsupported") ||
+		strings.Contains(normalizedMessage, "max_completion_tokens not supported") ||
+		strings.Contains(normalizedMessage, "max_completion_tokens is not supported") ||
+		strings.Contains(normalizedMessage, "parameter max_completion_tokens is not supported") ||
+		strings.Contains(normalizedMessage, "unsupported parameter: max_completion_tokens") ||
+		strings.Contains(normalizedMessage, "unknown parameter: max_completion_tokens") ||
+		strings.Contains(normalizedMessage, "unrecognized request argument supplied: max_completion_tokens") ||
+		strings.Contains(normalizedMessage, "unsupported_parameter: max_completion_tokens") ||
+		strings.Contains(normalizedMessage, "unsupported_parameter max_completion_tokens") ||
+		strings.Contains(normalizedMessage, "unknown_parameter: max_completion_tokens") ||
+		strings.Contains(normalizedMessage, "unknown_parameter max_completion_tokens")
 }
 
 func (h *ProxyHandler) writeGeminiProtocolError(w http.ResponseWriter, err error) {
