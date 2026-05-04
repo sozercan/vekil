@@ -111,13 +111,19 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 // proxy-owned opaque token rather than a real upstream-encrypted payload.
 // compactUpstreamChunkBodySize is the default target body size for chunked
 // compact retries. It is measured against the serialized upstream request body
-// size, not the model-visible token budget. Picked conservatively because
-// observed Copilot /responses payload caps sit around 1 MiB; per-provider
-// limits differ (Azure and OpenAI Codex tolerate larger bodies). When the
-// upstream still returns 413 at this size, the chunker halves the target on
-// each recursive retry until it hits compactUpstreamChunkBodyFloor.
+// size, not the model-visible token budget. Empirically validated against
+// `https://api.githubcopilot.com/responses`: bodies of exactly 5,242,880
+// bytes (5 MiB) are accepted, and bodies of 5,259,264 bytes return
+// `413 Payload Too Large` with `{"error":{"message":"failed to parse request"}}`
+// at the edge. We pick 4 MiB as the default to leave a margin for the
+// proxy's per-request overhead (instructions, fixed fields, JSON framing) so a
+// single chunk does not trip the cap on its first POST. Per-provider caps
+// differ (Azure and OpenAI Codex tolerate larger bodies), so this is a
+// safe default rather than a tight one. When upstream still returns 413 at
+// this size, the chunker halves the target on each recursive retry until it
+// hits compactUpstreamChunkBodyFloor.
 const (
-	compactUpstreamChunkBodySize  = 1 << 20
+	compactUpstreamChunkBodySize  = 4 << 20
 	compactUpstreamChunkBodyFloor = 64 << 10
 	// compactUpstreamErrorBodySize caps upstream error bodies that the compact
 	// fallback buffers only so it can replay the original failure if chunking fails.
@@ -135,9 +141,9 @@ const (
 	//   ceil(maxLargeRequestBodySize / compactUpstreamChunkBodySize)  ← worst-case chunks
 	//   * 2                                                            ← one round of halving
 	//   + initial 413 + merge call + small headroom
-	// = 64 * 2 + 16 = 144. We round up to 160 to leave room for sibling
+	// = 16 * 2 + 8 = 40. We round up to 48 to leave room for sibling
 	// re-splits when learnedTarget contracts mid-flight.
-	compactUpstreamMaxAttempts = 160
+	compactUpstreamMaxAttempts = 48
 )
 
 // compactBudget bounds the total upstream attempts the compact-413 fallback may

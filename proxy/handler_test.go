@@ -1832,9 +1832,10 @@ func TestSplitCompactInputByBodySizeUsesEncodedItemSizes(t *testing.T) {
 }
 
 func TestHandleCompact_HalvesChunkTargetOnRecursive413(t *testing.T) {
-	// Three roughly half-target items: with the initial 1 MiB target each chunk
-	// holds 1 item (3 chunks total). Upstream rejects them at 1 MiB but accepts
-	// them at <=512 KiB, forcing the recursive halving path to engage.
+	// Three roughly half-target items: with the initial default target each
+	// chunk holds 1 item (3 chunks total). Upstream rejects them at the default
+	// target but accepts them at <=half target, forcing the recursive halving
+	// path to engage.
 	itemText := strings.Repeat("a", compactUpstreamChunkBodySize/2-2048)
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
@@ -1913,11 +1914,11 @@ func TestHandleCompact_HalvesChunkTargetOnRecursive413(t *testing.T) {
 
 func TestHandleCompact_HalvesEagerlyWhenSubTargetRequest413s(t *testing.T) {
 	// Single small item: the initial compact body fits inside the configured
-	// 1 MiB target, but upstream still 413s because its real cap is lower
-	// (300 KiB here). The fix is for the depth=0 path to halve the target
-	// instead of bailing on a single chunk; we expect at least one upstream
-	// retry below the original body size, ending in 200.
-	itemText := strings.Repeat("a", 400*1024) // ~400 KiB content; total body ~ 410 KiB < 1 MiB
+	// target, but upstream still 413s because its real cap is lower (300 KiB
+	// here). The fix is for the depth=0 path to halve the target instead of
+	// bailing on a single chunk; we expect at least one upstream retry below the
+	// original body size, ending in 200.
+	itemText := strings.Repeat("a", 400*1024) // ~400 KiB content; total body ~410 KiB < default target
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
 		"input": []interface{}{
@@ -2035,14 +2036,14 @@ func TestHandleCompact_BoundsUpstreamFanoutByMaxAttempts(t *testing.T) {
 
 func TestHandleCompact_PropagatesLearnedTargetAcrossSiblings(t *testing.T) {
 	// Build many small siblings against an upstream cap that's ~half the
-	// configured target. Without learned-target propagation, each sibling
+	// configured test target. Without learned-target propagation, each sibling
 	// would burn one discovery 413 at the larger target before recursing,
-	// quickly exhausting the default 32-attempt budget. With propagation,
-	// only the FIRST sibling pays the discovery cost; the rest plan at the
-	// learned smaller size from the start.
+	// quickly exhausting the attempt budget. With propagation, only the FIRST
+	// sibling pays the discovery cost; the rest plan at the learned smaller
+	// size from the start.
 	const (
 		siblings           = 10
-		configuredTarget   = 1 << 20            // 1 MiB
+		configuredTarget   = 1 << 20              // 1 MiB
 		upstreamCap        = configuredTarget / 2 // 512 KiB
 		itemBodyTargetSize = (configuredTarget * 6) / 10
 	)
@@ -2079,6 +2080,7 @@ func TestHandleCompact_PropagatesLearnedTargetAcrossSiblings(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`))
 	})
+	handler.compactChunkBodyBytes = configuredTarget
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -2110,11 +2112,9 @@ func TestHandleCompact_PropagatesLearnedTargetAcrossSiblings(t *testing.T) {
 
 func TestHandleCompact_LargeMultiMiBSucceedsUnderDefaults(t *testing.T) {
 	// Codex-style large session: ~24 MiB of input that should chunk happily
-	// under the default attempt budget. Without raising the budget default
-	// from the previous 32, this would trip the pre-flight and return the
-	// original 413 instead of compacting.
-	const items = 32
-	itemText := strings.Repeat("x", (compactUpstreamChunkBodySize*3)/4) // ~768 KiB content
+	// under the default attempt budget and inbound request limit.
+	const items = 8
+	itemText := strings.Repeat("x", (compactUpstreamChunkBodySize*3)/4) // ~3 MiB content
 	inputs := make([]interface{}, 0, items)
 	for i := 0; i < items; i++ {
 		inputs = append(inputs, map[string]interface{}{
@@ -2127,7 +2127,7 @@ func TestHandleCompact_LargeMultiMiBSucceedsUnderDefaults(t *testing.T) {
 		t.Fatalf("marshal request: %v", err)
 	}
 
-	const upstreamCap = compactUpstreamChunkBodySize // upstream accepts up to 1 MiB
+	const upstreamCap = compactUpstreamChunkBodySize // upstream accepts up to the default 4 MiB target
 	var mu sync.Mutex
 	var calls int
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2272,7 +2272,7 @@ func TestHandleCompact_MemoizesModelFallbackAcrossSiblings(t *testing.T) {
 			return
 		}
 
-		// Trip the 1 MiB upstream cap so we engage the chunk fanout first.
+		// Trip the small upstream cap so we engage the chunk fanout first.
 		if len(body) > upstreamCap {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusRequestEntityTooLarge)
