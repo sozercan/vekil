@@ -13,6 +13,7 @@ import (
 
 	"github.com/pkg/browser"
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/buildinfo"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
 	"github.com/sozercan/vekil/server"
@@ -216,6 +217,9 @@ func runServe() {
 	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
 	providersConfigPath := flag.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration")
 	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
+	showVersion := flag.Bool("version", false, "Print version and exit")
+	metricsEnabled := flag.Bool("metrics", getEnvBool("METRICS", true), "Expose Prometheus metrics at /metrics")
+	disableMetrics := flag.Bool("no-metrics", false, "Disable Prometheus metrics endpoint")
 	streamingUpstreamTimeout := flag.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
 	copilotEditorVersion := flag.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header")
 	copilotPluginVersion := flag.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
@@ -230,7 +234,13 @@ func runServe() {
 	compactUpstreamMaxAttempts := flag.Int("compact-upstream-max-attempts", getEnvInt("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts()), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy")
 	flag.Parse()
 
+	if *showVersion {
+		_, _ = fmt.Fprintln(os.Stdout, buildinfo.NormalizedVersion())
+		return
+	}
+
 	log := logger.New(logger.ParseLevel(*logLevel))
+	metricsEndpointEnabled := *metricsEnabled && !*disableMetrics
 
 	authenticator, err := auth.NewAuthenticator(*tokenDir)
 	if err != nil {
@@ -256,6 +266,7 @@ func runServe() {
 		log,
 		*host,
 		*port,
+		server.WithMetricsEnabled(metricsEndpointEnabled),
 		server.WithStreamingUpstreamTimeout(*streamingUpstreamTimeout),
 		server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
 			EditorVersion:       *copilotEditorVersion,

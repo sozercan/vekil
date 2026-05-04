@@ -41,19 +41,26 @@ func writeGeminiSSEData(w http.ResponseWriter, data interface{}) error {
 	return nil
 }
 
-// StreamOpenAIToGemini translates upstream OpenAI SSE into Gemini-style
-// data-only SSE frames.
-func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
+// StreamOpenAIToGeminiWithUsage translates upstream OpenAI SSE into
+// Gemini-style data-only SSE frames and returns the final upstream usage when
+// present.
+func StreamOpenAIToGeminiWithUsage(w http.ResponseWriter, body io.ReadCloser) (*models.OpenAIUsage, error) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
 	state := newGeminiStreamState(w)
 	sawDone, err := consumeOpenAIStreamChunks(body, state.consumeChunk)
 	if err != nil || !sawDone {
-		return
+		return state.storedUsage, err
 	}
 
-	_ = state.finish()
+	return state.storedUsage, state.finish()
+}
+
+// StreamOpenAIToGemini translates upstream OpenAI SSE into Gemini-style
+// data-only SSE frames.
+func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
+	_, _ = StreamOpenAIToGeminiWithUsage(w, body)
 }
 
 type geminiStreamState struct {
@@ -179,12 +186,15 @@ func (s *geminiStreamState) consumeToolCalls(toolCalls []models.OpenAIToolCall) 
 	})
 }
 
-func (s *geminiStreamState) finish() bool {
+func (s *geminiStreamState) finish() error {
 	if !s.flushToolCalls(true) {
-		return false
+		return fmt.Errorf("failed to flush Gemini tool calls")
 	}
 
-	return s.writeTail()
+	if !s.writeTail() {
+		return fmt.Errorf("failed to write Gemini stream tail")
+	}
+	return nil
 }
 
 func (s *geminiStreamState) flushToolCalls(terminal bool) bool {

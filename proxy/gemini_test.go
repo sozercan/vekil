@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sozercan/vekil/models"
 )
 
@@ -2087,6 +2088,172 @@ func TestHandleGeminiModelsCountTokensFallbackAndCache(t *testing.T) {
 
 	if callCount != 2 {
 		t.Fatalf("upstream callCount = %d, want 2", callCount)
+	}
+}
+
+func TestHandleGeminiModelsCountTokensFallbackFiltersExpected400Metrics(t *testing.T) {
+	callCount := 0
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+
+		switch callCount {
+		case 1:
+			if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != 1 {
+				t.Fatalf("MaxCompletionTokens = %v, want 1", oaiReq.MaxCompletionTokens)
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"max_completion_tokens unsupported"}`))
+		case 2:
+			if oaiReq.MaxTokens == nil || *oaiReq.MaxTokens != 1 {
+				t.Fatalf("MaxTokens = %v, want 1", oaiReq.MaxTokens)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+				ID:      "chatcmpl-fallback-metrics",
+				Object:  "chat.completion",
+				Created: 123,
+				Model:   "gemini-2.5-pro",
+				Choices: []models.OpenAIChoice{{
+					Index:        0,
+					Message:      models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)},
+					FinishReason: strPtr("stop"),
+				}},
+				Usage: &models.OpenAIUsage{PromptTokens: 17, CompletionTokens: 1, TotalTokens: 18},
+			})
+		default:
+			t.Fatalf("unexpected upstream call %d", callCount)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:countTokens", strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"Count this"}]}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleGeminiModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, string(body))
+	}
+	if callCount != 2 {
+		t.Fatalf("upstream callCount = %d, want 2", callCount)
+	}
+
+	if got := testutil.ToFloat64(handler.metrics.upstreamErrorsTotal.WithLabelValues("copilot", metricLabelUnknown, metricEndpointGeminiCountTokens, "400")); got != 0 {
+		t.Fatalf("upstream_errors_total{code=400} = %v, want 0 for expected fallback", got)
+	}
+	if got := testutil.ToFloat64(handler.metrics.requestsTotal.WithLabelValues("copilot", metricLabelUnknown, metricEndpointGeminiCountTokens, "200")); got != 1 {
+		t.Fatalf("requests_total{status=200} = %v, want 1", got)
+	}
+}
+
+func TestHandleGeminiModelsCountTokensProbeBadRequestDoesNotFallbackWithoutMaxCompletionTokensSignal(t *testing.T) {
+	callCount := 0
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+		if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != 1 {
+			t.Fatalf("MaxCompletionTokens = %v, want 1", oaiReq.MaxCompletionTokens)
+		}
+
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"some other bad request"}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:countTokens", strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"Count this"}]}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleGeminiModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("StatusCode = %d, want 400: %s", resp.StatusCode, string(body))
+	}
+	if callCount != 1 {
+		t.Fatalf("upstream callCount = %d, want 1", callCount)
+	}
+	if got := testutil.ToFloat64(handler.metrics.upstreamErrorsTotal.WithLabelValues("copilot", metricLabelUnknown, metricEndpointGeminiCountTokens, "400")); got != 1 {
+		t.Fatalf("upstream_errors_total{code=400} = %v, want 1", got)
+	}
+}
+
+func TestHandleGeminiModelsCountTokensRetriesProbeBeforeSuccess(t *testing.T) {
+	callCount := 0
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+		if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != 1 {
+			t.Fatalf("MaxCompletionTokens = %v, want 1", oaiReq.MaxCompletionTokens)
+		}
+		if oaiReq.MaxTokens != nil {
+			t.Fatalf("MaxTokens = %v, want nil", oaiReq.MaxTokens)
+		}
+
+		switch callCount {
+		case 1:
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+		case 2:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+				ID:      "chatcmpl-retry-metrics",
+				Object:  "chat.completion",
+				Created: 123,
+				Model:   "gemini-2.5-pro",
+				Choices: []models.OpenAIChoice{{
+					Index:        0,
+					Message:      models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)},
+					FinishReason: strPtr("stop"),
+				}},
+				Usage: &models.OpenAIUsage{PromptTokens: 29, CompletionTokens: 1, TotalTokens: 30},
+			})
+		default:
+			t.Fatalf("unexpected upstream call %d", callCount)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:countTokens", strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"Count this"}]}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleGeminiModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, string(body))
+	}
+	if callCount != 2 {
+		t.Fatalf("upstream callCount = %d, want 2", callCount)
+	}
+
+	if got := testutil.ToFloat64(handler.metrics.retriesTotal.WithLabelValues("copilot", metricLabelUnknown, metricEndpointGeminiCountTokens, "429")); got != 1 {
+		t.Fatalf("retries_total{reason=429} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(handler.metrics.upstreamErrorsTotal.WithLabelValues("copilot", metricLabelUnknown, metricEndpointGeminiCountTokens, "429")); got != 1 {
+		t.Fatalf("upstream_errors_total{code=429} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(handler.metrics.requestsTotal.WithLabelValues("copilot", metricLabelUnknown, metricEndpointGeminiCountTokens, "200")); got != 1 {
+		t.Fatalf("requests_total{status=200} = %v, want 1", got)
 	}
 }
 

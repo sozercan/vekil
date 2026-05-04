@@ -69,8 +69,49 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// StreamOpenAIPassthrough streams OpenAI SSE bytes directly to the client with no parsing.
-func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
+type openAIStreamUsageTap struct {
+	pending []byte
+	usage   *models.OpenAIUsage
+}
+
+func (t *openAIStreamUsageTap) Write(p []byte) (int, error) {
+	t.pending = append(t.pending, p...)
+	for {
+		idx := bytes.IndexByte(t.pending, '\n')
+		if idx < 0 {
+			break
+		}
+		line := strings.TrimRight(string(t.pending[:idx]), "\r")
+		t.processLine(line)
+		t.pending = t.pending[idx+1:]
+	}
+	return len(p), nil
+}
+
+func (t *openAIStreamUsageTap) finish() {
+	if len(t.pending) == 0 {
+		return
+	}
+	t.processLine(strings.TrimRight(string(t.pending), "\r"))
+	t.pending = nil
+}
+
+func (t *openAIStreamUsageTap) processLine(line string) {
+	data, ok := parseSSELine(line)
+	if !ok || data == "[DONE]" {
+		return
+	}
+
+	var chunk models.OpenAIStreamChunk
+	if err := json.Unmarshal([]byte(data), &chunk); err != nil || chunk.Usage == nil {
+		return
+	}
+
+	usage := *chunk.Usage
+	t.usage = &usage
+}
+
+func StreamOpenAIPassthroughWithUsage(w http.ResponseWriter, body io.ReadCloser) (*models.OpenAIUsage, error) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
@@ -78,27 +119,42 @@ func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
 	if f, ok := w.(http.Flusher); ok {
 		fw.flusher = f
 	}
+	tap := &openAIStreamUsageTap{}
 	// Errors here (client disconnect, upstream drop) are unrecoverable for SSE
 	// since headers have already been sent. The client must handle truncated streams.
-	_, _ = io.Copy(fw, body)
+	_, err := io.Copy(fw, io.TeeReader(body, tap))
+	tap.finish()
+	return tap.usage, err
 }
 
-// StreamOpenAIToAnthropic translates an OpenAI SSE stream into Anthropic SSE format.
-func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model string, requestID string) {
+// StreamOpenAIPassthrough streams OpenAI SSE bytes directly to the client with no parsing.
+func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
+	_, _ = StreamOpenAIPassthroughWithUsage(w, body)
+}
+
+// StreamOpenAIToAnthropicWithUsage translates an OpenAI SSE stream into
+// Anthropic SSE format and returns the final upstream usage when present.
+func StreamOpenAIToAnthropicWithUsage(w http.ResponseWriter, body io.ReadCloser, model string, requestID string) *models.OpenAIUsage {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
 	state := newAnthropicStreamState(w, model, requestID)
 	if !state.start() {
-		return
+		return nil
 	}
 
 	sawDone, err := consumeOpenAIStreamChunks(body, state.consumeChunk)
 	if err != nil || !sawDone {
-		return
+		return state.storedUsage
 	}
 
 	_ = state.finish()
+	return state.storedUsage
+}
+
+// StreamOpenAIToAnthropic translates an OpenAI SSE stream into Anthropic SSE format.
+func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model string, requestID string) {
+	_ = StreamOpenAIToAnthropicWithUsage(w, body, model, requestID)
 }
 
 // aggregateStreamToResponse collects an OpenAI SSE stream into a complete

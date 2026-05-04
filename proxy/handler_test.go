@@ -27,12 +27,17 @@ func newTestProxyHandler(t testing.TB, backend http.HandlerFunc) *ProxyHandler {
 	t.Helper()
 	server := httptest.NewServer(backend)
 	t.Cleanup(server.Close)
+	metrics, err := newProxyMetrics()
+	if err != nil {
+		t.Fatalf("newProxyMetrics: %v", err)
+	}
 	return &ProxyHandler{
 		auth:           auth.NewTestAuthenticator("test-token"),
 		client:         server.Client(),
 		copilotURL:     server.URL,
 		log:            logger.New(logger.LevelInfo),
 		retryBaseDelay: 1 * time.Millisecond,
+		metrics:        metrics,
 	}
 }
 
@@ -44,12 +49,17 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func newRoundTripTestProxyHandler(t testing.TB, transport roundTripFunc) *ProxyHandler {
 	t.Helper()
+	metrics, err := newProxyMetrics()
+	if err != nil {
+		t.Fatalf("newProxyMetrics: %v", err)
+	}
 	return &ProxyHandler{
 		auth:           auth.NewTestAuthenticator("test-token"),
 		client:         &http.Client{Transport: transport},
 		copilotURL:     "http://upstream.test",
 		log:            logger.New(logger.LevelInfo),
 		retryBaseDelay: 1 * time.Millisecond,
+		metrics:        metrics,
 	}
 }
 
