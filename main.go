@@ -216,7 +216,10 @@ func runServe() {
 	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
 	providersConfigPath := flag.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration")
 	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
+	metricsEnabled := getEnvBool("METRICS", true)
 	streamingUpstreamTimeout := flag.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
+	flag.BoolVar(&metricsEnabled, "metrics", metricsEnabled, "Enable Prometheus /metrics endpoint")
+	flag.Var(invertedBoolFlag{target: &metricsEnabled}, "no-metrics", "Disable Prometheus /metrics endpoint")
 	copilotEditorVersion := flag.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header")
 	copilotPluginVersion := flag.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
 	copilotUserAgent := flag.String("copilot-user-agent", getEnv("COPILOT_USER_AGENT", ""), "Upstream Copilot user-agent header")
@@ -256,6 +259,7 @@ func runServe() {
 		log,
 		*host,
 		*port,
+		server.WithMetricsEnabled(metricsEnabled),
 		server.WithStreamingUpstreamTimeout(*streamingUpstreamTimeout),
 		server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
 			EditorVersion:       *copilotEditorVersion,
@@ -301,6 +305,32 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+type invertedBoolFlag struct {
+	target *bool
+}
+
+func (f invertedBoolFlag) String() string {
+	if f.target == nil {
+		return "false"
+	}
+	return strconv.FormatBool(!*f.target)
+}
+
+func (f invertedBoolFlag) Set(value string) error {
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return err
+	}
+	if f.target != nil {
+		*f.target = !parsed
+	}
+	return nil
+}
+
+func (invertedBoolFlag) IsBoolFlag() bool {
+	return true
 }
 
 func getEnvBool(key string, fallback bool) bool {
