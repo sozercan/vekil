@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -276,12 +278,64 @@ func (h *ProxyHandler) executeGeminiCountTokensProbe(probeReq *models.OpenAIRequ
 		return nil, false, mapGeminiTransportError(err)
 	}
 
-	if resp.StatusCode == http.StatusBadRequest && probeReq.MaxCompletionTokens != nil {
+	fallback, err := shouldFallbackGeminiCountTokensProbe(resp, probeReq)
+	if err != nil {
+		return nil, false, &geminiProtocolError{
+			statusCode: http.StatusInternalServerError,
+			status:     "INTERNAL",
+			message:    "failed to inspect upstream countTokens probe error",
+		}
+	}
+	if fallback {
 		_ = resp.Body.Close()
 		return nil, true, nil
 	}
 
 	return h.decodeGeminiProbeResponse(resp)
+}
+
+func shouldFallbackGeminiCountTokensProbe(resp *http.Response, probeReq *models.OpenAIRequest) (bool, error) {
+	if resp == nil || resp.StatusCode != http.StatusBadRequest || probeReq == nil || probeReq.MaxCompletionTokens == nil {
+		return false, nil
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return false, err
+	}
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+
+	return isGeminiCountTokensMaxCompletionTokensFallback(body), nil
+}
+
+func isGeminiCountTokensMaxCompletionTokensFallback(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+
+	text := strings.ToLower(string(body))
+	if !strings.Contains(text, "max_completion_tokens") {
+		return false
+	}
+
+	for _, hint := range []string{
+		"unsupported",
+		"not supported",
+		"unknown parameter",
+		"unknown field",
+		"unexpected field",
+		"unrecognized",
+		"extra inputs are not permitted",
+		"additional properties are not allowed",
+		"use max_tokens",
+	} {
+		if strings.Contains(text, hint) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (h *ProxyHandler) executeGeminiCountTokensProbeFinal(probeReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
