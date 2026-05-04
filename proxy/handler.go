@@ -192,6 +192,8 @@ type ProxyHandler struct {
 	log                      *logger.Logger
 	maxRetries               int
 	retryBaseDelay           time.Duration
+	metricsEnabled           bool
+	metrics                  *proxyMetrics
 	models                   modelsCache
 	geminiCounts             geminiCountTokensCache
 }
@@ -218,6 +220,16 @@ func WithProvidersConfig(cfg ProvidersConfig) Option {
 func withCopilotBaseURLForTest(baseURL string) Option {
 	return func(h *ProxyHandler) {
 		h.copilotURL = strings.TrimRight(baseURL, "/")
+	}
+}
+
+// WithMetricsEnabled toggles Prometheus metrics collection and exposition.
+func WithMetricsEnabled(enabled bool) Option {
+	return func(h *ProxyHandler) {
+		h.metricsEnabled = enabled
+		if !enabled {
+			h.metrics = nil
+		}
 	}
 }
 
@@ -268,12 +280,20 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		copilotHeaders:           DefaultCopilotHeaderConfig(),
 		responsesWS:              DefaultResponsesWebSocketConfig(),
 		streamingUpstreamTimeout: streamingUpstreamTimeout,
+		metricsEnabled:           true,
 		log:                      log,
 	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(h)
 		}
+	}
+	if h.metricsEnabled {
+		metrics, err := newProxyMetrics()
+		if err != nil {
+			return nil, err
+		}
+		h.metrics = metrics
 	}
 	if err := h.initializeProviders(); err != nil {
 		return nil, err
@@ -401,11 +421,17 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if err := h.checkProviderReady(ctx, provider); err != nil {
+			if h.metrics != nil {
+				h.metrics.observeEndpointHealth(provider.id, readyzMetricsEndpoint(provider), false)
+			}
 			if shouldSuppressReadyzResponse(r.Context(), err) {
 				return
 			}
 			writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", err.Error())
 			return
+		}
+		if h.metrics != nil {
+			h.metrics.observeEndpointHealth(provider.id, readyzMetricsEndpoint(provider), true)
 		}
 	}
 

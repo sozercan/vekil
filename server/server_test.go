@@ -2,6 +2,8 @@ package server
 
 import (
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -92,6 +94,47 @@ func TestNew_DerivesWriteTimeoutFromConfiguredProxyHandler(t *testing.T) {
 
 			if got, want := srv.httpServer.WriteTimeout, customTimeout+5*time.Minute; got != want {
 				t.Fatalf("WriteTimeout = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestNew_MetricsRouteToggle(t *testing.T) {
+	tests := []struct {
+		name       string
+		opts       []Option
+		wantStatus int
+	}{
+		{
+			name:       "enabled by default",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "disabled",
+			opts:       []Option{WithMetricsEnabled(false)},
+			wantStatus: http.StatusNotFound,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := New(
+				auth.NewTestAuthenticator("test-token"),
+				logger.New(logger.ParseLevel("error")),
+				"127.0.0.1",
+				"0",
+				tc.opts...,
+			)
+			if err != nil {
+				t.Fatalf("failed to initialize server: %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			w := httptest.NewRecorder()
+			srv.httpServer.Handler.ServeHTTP(w, req)
+
+			if got := w.Result().StatusCode; got != tc.wantStatus {
+				t.Fatalf("StatusCode = %d, want %d", got, tc.wantStatus)
 			}
 		})
 	}

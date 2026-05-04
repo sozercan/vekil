@@ -68,9 +68,17 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		if err != nil {
 			return nil, err
 		}
+		meta, hasMeta := upstreamMetricsFromContext(req.Context())
 
 		resp, err := h.client.Do(req)
 		if err != nil {
+			if hasMeta && h.metrics != nil {
+				code, reason := classifyUpstreamTransportMetric(err)
+				h.metrics.observeUpstreamError(meta.labels, code)
+				if attempt < maxRetries-1 && reason != "" {
+					h.metrics.observeRetry(meta.labels, reason)
+				}
+			}
 			lastErr = err
 			if attempt < maxRetries-1 {
 				if ctxErr := sleepWithContext(req.Context(), backoff(retryDelay, attempt)); ctxErr != nil {
@@ -81,10 +89,22 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		}
 
 		if !retryable(resp.StatusCode) {
+			if hasMeta && h.metrics != nil && resp.StatusCode >= http.StatusBadRequest {
+				ignore := meta.behavior.suppressExpectedMaxCompletionTokens400 && expectedMaxCompletionTokensFallback(resp)
+				if !ignore {
+					h.metrics.observeUpstreamError(meta.labels, strconv.Itoa(resp.StatusCode))
+				}
+			}
 			return resp, nil
 		}
 
 		retryAfterHeader := resp.Header.Get("Retry-After")
+		if hasMeta && h.metrics != nil {
+			h.metrics.observeUpstreamError(meta.labels, strconv.Itoa(resp.StatusCode))
+			if attempt < maxRetries-1 {
+				h.metrics.observeRetry(meta.labels, retryReasonForStatus(resp.StatusCode))
+			}
+		}
 
 		// Drain and close body before retry to allow connection reuse.
 		drainAndClose(resp.Body)

@@ -162,6 +162,7 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 	if err != nil {
 		return nil, err
 	}
+	ctx = h.ensureUpstreamMetricsContext(ctx, provider, extractRequestModel(body), metricsEndpointForUpstreamPath(path))
 
 	return h.doWithRetry(func() (*http.Request, error) {
 		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "")

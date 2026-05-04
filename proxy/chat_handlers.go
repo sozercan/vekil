@@ -104,6 +104,15 @@ func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp 
 // HandleAnthropicMessages handles POST /v1/messages by translating the Anthropic
 // request to OpenAI format, forwarding to Copilot, and translating the response back.
 func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
+	metricsW := newMetricsResponseWriter(w)
+	var tracker *requestMetricsTracker
+	defer func() {
+		if tracker != nil {
+			tracker.FinishFromResponseWriter(metricsW)
+		}
+	}()
+	w = metricsW
+
 	body, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
@@ -117,6 +126,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON in request body")
 		return
 	}
+	tracker = h.beginRequestMetrics(metricEndpointAnthropicMessages, "/chat/completions", req.Model)
 
 	h.log.Debug("anthropic request",
 		logger.F("model", req.Model),
@@ -132,6 +142,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	}
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
+	upstreamCtx = tracker.WithContext(upstreamCtx)
 	defer upstreamCancel()
 
 	resp, err := h.postChatCompletions(upstreamCtx, oaiBody)
@@ -165,9 +176,11 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			StreamOpenAIToAnthropic(w, resp.Body, req.Model, "msg_"+uuid.New().String())
+			usage := StreamOpenAIToAnthropicWithUsage(w, resp.Body, req.Model, "msg_"+uuid.New().String())
+			tracker.ObserveOpenAIUsage(usage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			tracker.ObserveOpenAIUsage(oaiResp.Usage)
 			anthropicResp := TranslateOpenAIToAnthropic(oaiResp, req.Model)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(anthropicResp)
@@ -181,6 +194,15 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 // HandleOpenAIChatCompletions handles POST /v1/chat/completions by forwarding the
 // request to Copilot with only auth headers injected (near zero-copy passthrough).
 func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
+	metricsW := newMetricsResponseWriter(w)
+	var tracker *requestMetricsTracker
+	defer func() {
+		if tracker != nil {
+			tracker.FinishFromResponseWriter(metricsW)
+		}
+	}()
+	w = metricsW
+
 	bodyBytes, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
@@ -190,8 +212,10 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	defer func() { _ = r.Body.Close() }()
 
 	bodyBytes, mode := prepareOpenAIChatCompletionsRequest(bodyBytes)
+	tracker = h.beginRequestMetrics(metricEndpointChatCompletions, "/chat/completions", extractRequestModel(bodyBytes))
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
+	upstreamCtx = tracker.WithContext(upstreamCtx)
 	defer upstreamCancel()
 
 	resp, err := h.postChatCompletions(upstreamCtx, bodyBytes)
@@ -213,11 +237,21 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
 			copyPassthroughHeaders(w.Header(), resp.Header)
-			StreamOpenAIPassthrough(w, resp.Body)
+			usage, _ := StreamOpenAIPassthroughWithUsage(w, resp.Body)
+			tracker.ObserveOpenAIUsage(usage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			tracker.ObserveOpenAIUsage(oaiResp.Usage)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(oaiResp)
+		},
+		passthrough: func(resp *http.Response) error {
+			body, err := writeBufferedUpstreamResponse(w, resp)
+			if err != nil {
+				return err
+			}
+			tracker.ObserveOpenAIUsage(extractOpenAIUsageFromBody(body))
+			return nil
 		},
 	})
 	if err != nil {

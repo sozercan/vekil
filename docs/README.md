@@ -13,6 +13,7 @@ This folder is intentionally split into small, single-purpose files so humans an
 | [`architecture.md`](architecture.md) | package responsibilities and data flow | implementation boundaries or design decisions change |
 | [`menubar.md`](menubar.md) | macOS/Linux tray app usage | tray behavior or packaging changes |
 | [`development.md`](development.md) | build, test, benchmark, and CI workflows | local dev or CI commands change |
+| [`grafana-vekil-overview.json`](grafana-vekil-overview.json) | starter Grafana dashboard for `/metrics` | metrics names or labels change |
 
 ## Agent Notes
 

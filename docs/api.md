@@ -158,3 +158,9 @@ Returns `{"status":"ok"}`.
 ## `GET /readyz`
 
 Validates that the proxy can authenticate to and successfully probe the configured upstream providers. On success it returns `{"status":"ready"}`. On failure it returns `503` with `{"status":"not_ready","error":"..."}`.
+
+## `GET /metrics`
+
+When metrics are enabled, this returns Prometheus-compatible text exposition for proxy request counts, latencies, token usage, retries, upstream errors, in-flight requests, build info, and the standard Go runtime metrics.
+
+Disable the endpoint with `--no-metrics` or `METRICS=false`.
