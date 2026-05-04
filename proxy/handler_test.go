@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1048,7 +1049,7 @@ func TestHandleCompact_LargeBodyAllowed(t *testing.T) {
 }
 
 func TestHandleCompact_FallsBackToChunkedCompactionOnUpstream413(t *testing.T) {
-	largeText := strings.Repeat("a", 3*1024*1024)
+	largeText := strings.Repeat("a", compactUpstreamChunkBodySize*3/8)
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
 		"input": []interface{}{
@@ -1539,7 +1540,7 @@ func TestHandleCompact_StripsOversizedTextDuring413Fallback(t *testing.T) {
 }
 
 func TestHandleCompact_ReturnsOriginal413WhenChunkedMergeFails(t *testing.T) {
-	largeText := strings.Repeat("a", 5*1024*1024)
+	largeText := strings.Repeat("a", compactUpstreamChunkBodySize*5/8)
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
 		"input": []interface{}{
@@ -1643,7 +1644,7 @@ func TestHandleCompact_ReturnsOriginal413WhenChunkedMergeFails(t *testing.T) {
 }
 
 func TestHandleCompact_CapsOriginal413BodyWhenChunkedMergeFails(t *testing.T) {
-	largeText := strings.Repeat("a", 5*1024*1024)
+	largeText := strings.Repeat("a", compactUpstreamChunkBodySize*5/8)
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
 		"input": []interface{}{
@@ -1827,6 +1828,492 @@ func TestSplitCompactInputByBodySizeUsesEncodedItemSizes(t *testing.T) {
 		if len(body) > len(twoItemBody) {
 			t.Fatalf("chunk %d body exceeded max: got %d, max %d", i, len(body), len(twoItemBody))
 		}
+	}
+}
+
+func TestHandleCompact_HalvesChunkTargetOnRecursive413(t *testing.T) {
+	// Three roughly half-target items: with the initial 1 MiB target each chunk
+	// holds 1 item (3 chunks total). Upstream rejects them at 1 MiB but accepts
+	// them at <=512 KiB, forcing the recursive halving path to engage.
+	itemText := strings.Repeat("a", compactUpstreamChunkBodySize/2-2048)
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message", "role": "user",
+				"content": []map[string]string{{"type": "input_text", "text": "first " + itemText}},
+			},
+			map[string]interface{}{
+				"type": "message", "role": "assistant",
+				"content": []map[string]string{{"type": "input_text", "text": "second " + itemText}},
+			},
+			map[string]interface{}{
+				"type": "message", "role": "user",
+				"content": []map[string]string{{"type": "input_text", "text": "third " + itemText}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	const halvedCap = compactUpstreamChunkBodySize / 2
+	var mu sync.Mutex
+	var bodySizes []int
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		mu.Lock()
+		bodySizes = append(bodySizes, len(body))
+		mu.Unlock()
+
+		// Reject anything above the halved cap with 413; succeed otherwise.
+		if len(body) > halvedCap {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"chunk summary"}]}]}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleCompact(w, req)
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 from adaptive halving, got %d: %s", resp.StatusCode, body)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodySizes) < 4 {
+		t.Fatalf("expected at least one initial 413, several halved retries, and a merge; got %d calls (%v)", len(bodySizes), bodySizes)
+	}
+	if bodySizes[0] <= halvedCap {
+		t.Fatalf("expected initial body to exceed halved cap; sizes=%v", bodySizes)
+	}
+	rejectsAfterFirst := 0
+	for _, size := range bodySizes[1:] {
+		if size > halvedCap {
+			rejectsAfterFirst++
+		}
+	}
+	if rejectsAfterFirst == 0 {
+		t.Fatalf("expected halving recursion to attempt sizes above the halved cap before shrinking; sizes=%v", bodySizes)
+	}
+}
+
+func TestHandleCompact_HalvesEagerlyWhenSubTargetRequest413s(t *testing.T) {
+	// Single small item: the initial compact body fits inside the configured
+	// 1 MiB target, but upstream still 413s because its real cap is lower
+	// (300 KiB here). The fix is for the depth=0 path to halve the target
+	// instead of bailing on a single chunk; we expect at least one upstream
+	// retry below the original body size, ending in 200.
+	itemText := strings.Repeat("a", 400*1024) // ~400 KiB content; total body ~ 410 KiB < 1 MiB
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message", "role": "user",
+				"content": []map[string]string{{"type": "input_text", "text": itemText}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	const upstreamCap = 300 * 1024
+	var mu sync.Mutex
+	var bodySizes []int
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		mu.Lock()
+		bodySizes = append(bodySizes, len(body))
+		mu.Unlock()
+
+		if len(body) > upstreamCap {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleCompact(w, req)
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 from sub-target halving, got %d: %s", resp.StatusCode, body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodySizes) < 2 {
+		t.Fatalf("expected at least one initial 413 plus a halved retry; got %d calls (%v)", len(bodySizes), bodySizes)
+	}
+	if bodySizes[0] > compactUpstreamChunkBodySize {
+		t.Fatalf("expected initial body to be sub-target; sizes=%v", bodySizes)
+	}
+}
+
+func TestHandleCompact_BoundsUpstreamFanoutByMaxAttempts(t *testing.T) {
+	// Multiple half-target items + tiny upstream cap = unbounded fanout
+	// without the budget. Set a deliberately low max-attempts and verify the
+	// proxy bails instead of fanning out further. The original 413 should be
+	// surfaced because the chunked merge ultimately failed.
+	itemText := strings.Repeat("a", compactUpstreamChunkBodySize/2-2048)
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "a " + itemText}}},
+			map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "b " + itemText}}},
+			map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "c " + itemText}}},
+			map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "d " + itemText}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	const maxAttempts = 3
+	var mu sync.Mutex
+	var calls int
+	backend := func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+	}
+	server := httptest.NewServer(http.HandlerFunc(backend))
+	t.Cleanup(server.Close)
+	handler := &ProxyHandler{
+		auth:               auth.NewTestAuthenticator("test-token"),
+		client:             server.Client(),
+		copilotURL:         server.URL,
+		log:                logger.New(logger.LevelInfo),
+		retryBaseDelay:     1 * time.Millisecond,
+		compactMaxAttempts: maxAttempts,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleCompact(w, req)
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected the original 413 after budget exhaustion, got %d: %s", resp.StatusCode, body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls > maxAttempts {
+		t.Fatalf("expected upstream calls to be bounded by max-attempts (%d); saw %d", maxAttempts, calls)
+	}
+}
+
+func TestHandleCompact_PropagatesLearnedTargetAcrossSiblings(t *testing.T) {
+	// Build many small siblings against an upstream cap that's ~half the
+	// configured target. Without learned-target propagation, each sibling
+	// would burn one discovery 413 at the larger target before recursing,
+	// quickly exhausting the default 32-attempt budget. With propagation,
+	// only the FIRST sibling pays the discovery cost; the rest plan at the
+	// learned smaller size from the start.
+	const (
+		siblings           = 10
+		configuredTarget   = 1 << 20            // 1 MiB
+		upstreamCap        = configuredTarget / 2 // 512 KiB
+		itemBodyTargetSize = (configuredTarget * 6) / 10
+	)
+	itemText := strings.Repeat("a", itemBodyTargetSize-2048)
+	inputs := make([]interface{}, 0, siblings)
+	for i := 0; i < siblings; i++ {
+		inputs = append(inputs, map[string]interface{}{
+			"type": "message", "role": "user",
+			"content": []map[string]string{{"type": "input_text", "text": fmt.Sprintf("item-%d %s", i, itemText)}},
+		})
+	}
+	reqBody, err := json.Marshal(map[string]interface{}{"model": "gpt-5.4", "input": inputs})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	var mu sync.Mutex
+	var bodySizes []int
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		mu.Lock()
+		bodySizes = append(bodySizes, len(body))
+		mu.Unlock()
+
+		if len(body) > upstreamCap {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleCompact(w, req)
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 with learned-target propagation, got %d: %s", resp.StatusCode, body)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	rejects := 0
+	for _, size := range bodySizes {
+		if size > upstreamCap {
+			rejects++
+		}
+	}
+	// One initial 413 at full size + at most one chunk-level discovery 413
+	// before the learned target propagates. Without the fix, every sibling
+	// burns its own discovery 413 (>= siblings rejects).
+	if rejects > 3 {
+		t.Fatalf("expected at most 3 over-cap upstream POSTs once the learned target propagates; saw %d (sizes=%v)", rejects, bodySizes)
+	}
+}
+
+func TestHandleCompact_LargeMultiMiBSucceedsUnderDefaults(t *testing.T) {
+	// Codex-style large session: ~24 MiB of input that should chunk happily
+	// under the default attempt budget. Without raising the budget default
+	// from the previous 32, this would trip the pre-flight and return the
+	// original 413 instead of compacting.
+	const items = 32
+	itemText := strings.Repeat("x", (compactUpstreamChunkBodySize*3)/4) // ~768 KiB content
+	inputs := make([]interface{}, 0, items)
+	for i := 0; i < items; i++ {
+		inputs = append(inputs, map[string]interface{}{
+			"type": "message", "role": "user",
+			"content": []map[string]string{{"type": "input_text", "text": fmt.Sprintf("item-%d %s", i, itemText)}},
+		})
+	}
+	reqBody, err := json.Marshal(map[string]interface{}{"model": "gpt-5.4", "input": inputs})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	const upstreamCap = compactUpstreamChunkBodySize // upstream accepts up to 1 MiB
+	var mu sync.Mutex
+	var calls int
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		if len(body) > upstreamCap {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleCompact(w, req)
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 for large multi-MiB compact under defaults; got %d: %s", resp.StatusCode, body)
+	}
+	if calls > compactUpstreamMaxAttempts {
+		t.Fatalf("expected total upstream calls <= %d (default budget); got %d", compactUpstreamMaxAttempts, calls)
+	}
+}
+
+func TestHandleCompact_EmptyInputAfter413SurfacesOriginal413(t *testing.T) {
+	// Pathological client request: input:[] arrives, upstream 413s anyway
+	// (e.g. a tools/text/instructions field is huge so the request is over
+	// cap even with no input items). Without explicit handling, the chunker
+	// would skip the empty fanout and return 200 with an empty compaction
+	// summary; the client would then think it has a valid checkpoint when
+	// no upstream success ever occurred.
+	hugeText := strings.Repeat("a", compactUpstreamChunkBodySize+(8*1024))
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{},
+		"text":  map[string]interface{}{"format": map[string]interface{}{"type": "json_schema", "name": "huge", "schema": map[string]interface{}{"description": hugeText}}},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	const original413Body = `{"error":{"message":"original payload too large"}}`
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = w.Write([]byte(original413Body))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleCompact(w, req)
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected original 413 for empty input + huge stripped fields; got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestHandleCompact_EmptyInputNoStripFieldsAfter413SurfacesOriginal413(t *testing.T) {
+	// Even more degenerate: input:[] with no oversized fixed fields. The
+	// fallback splitter returns zero chunks and there's nothing to strip, so
+	// historically the loop would no-op and the merge would emit an empty
+	// summary as a 200. The new len(chunks)==0 guard refuses to fabricate
+	// success and surfaces the upstream 413 verbatim.
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	const original413Body = `{"error":{"message":"upstream rejected empty compact"}}`
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = w.Write([]byte(original413Body))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleCompact(w, req)
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected original 413 for empty input with no stripped fields; got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestHandleCompact_MemoizesModelFallbackAcrossSiblings(t *testing.T) {
+	// Configure a request whose model is rejected as unsupported by upstream.
+	// Without memoization, the model-fallback probe would fire on every chunk
+	// (each logical compaction call doubles to 2 real POSTs). With B applied,
+	// the probe fires once on the first chunk and the resolved fallback model
+	// is memoized on the budget, so siblings 2..N skip the probe entirely.
+	const siblings = 5
+	itemText := strings.Repeat("a", 32*1024) // ~32 KiB per item; well under upstream cap
+	inputs := make([]interface{}, 0, siblings)
+	for i := 0; i < siblings; i++ {
+		inputs = append(inputs, map[string]interface{}{
+			"type": "message", "role": "user",
+			"content": []map[string]string{{"type": "input_text", "text": fmt.Sprintf("item-%d %s", i, itemText)}},
+		})
+	}
+	reqBody, err := json.Marshal(map[string]interface{}{"model": "gpt-4o", "input": inputs})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	const upstreamCap = 64 * 1024 // forces chunk fanout
+	var mu sync.Mutex
+	var requestedModels []string
+	var fallbackProbes int
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		// /models probes are part of the fallback lookup; track them but don't
+		// route through the compact body sniffing below.
+		if r.URL.Path == "/models" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.4","object":"model","capabilities":{"supports":{"streaming":true,"tool_calls":true}}}]}`))
+			return
+		}
+
+		// Trip the 1 MiB upstream cap so we engage the chunk fanout first.
+		if len(body) > upstreamCap {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+			return
+		}
+
+		model := extractRequestModel(body)
+		mu.Lock()
+		requestedModels = append(requestedModels, model)
+		mu.Unlock()
+
+		if model == "gpt-4o" {
+			mu.Lock()
+			fallbackProbes++
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"model not supported","param":"model","code":"model_not_supported"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleCompact(w, req)
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200; got %d: %s", resp.StatusCode, body)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if fallbackProbes != 1 {
+		t.Fatalf("expected the unsupported-model probe to fire exactly once across %d-sibling fanout (memoization); got %d (models=%v)", siblings, fallbackProbes, requestedModels)
 	}
 }
 

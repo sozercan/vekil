@@ -226,6 +226,8 @@ func runServe() {
 	responsesWSCompactMaxItems := flag.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items")
 	responsesWSCompactMaxBytes := flag.Int("responses-ws-auto-compact-max-bytes", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes), "Auto-compact websocket session history after this many raw bytes")
 	responsesWSCompactKeepTail := flag.Int("responses-ws-auto-compact-keep-tail", getEnvInt("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail), "When auto-compacting websocket history, keep this many most recent items verbatim")
+	compactUpstreamChunkBytes := flag.Int("compact-upstream-chunk-bytes", getEnvInt("COMPACT_UPSTREAM_CHUNK_BYTES", proxy.DefaultCompactUpstreamChunkBytes()), "Target body size (bytes) for chunked /v1/responses/compact retries after an upstream 413; halved on each recursive 413 down to a 64 KiB floor")
+	compactUpstreamMaxAttempts := flag.Int("compact-upstream-max-attempts", getEnvInt("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts()), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy")
 	flag.Parse()
 
 	log := logger.New(logger.ParseLevel(*logLevel))
@@ -268,6 +270,8 @@ func runServe() {
 			AutoCompactMaxBytes: *responsesWSCompactMaxBytes,
 			AutoCompactKeepTail: *responsesWSCompactKeepTail,
 		}),
+		server.WithCompactUpstreamChunkBytes(*compactUpstreamChunkBytes),
+		server.WithCompactUpstreamMaxAttempts(*compactUpstreamMaxAttempts),
 		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
 	)
 	if err != nil {
