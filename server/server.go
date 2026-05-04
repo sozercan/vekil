@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -21,7 +22,9 @@ type Server struct {
 }
 
 type options struct {
-	proxyOptions []proxy.Option
+	proxyOptions   []proxy.Option
+	metricsEnabled bool
+	buildVersion   string
 }
 
 // Option customizes server creation.
@@ -31,6 +34,21 @@ type Option func(*options)
 func WithProxyOptions(opts ...proxy.Option) Option {
 	return func(o *options) {
 		o.proxyOptions = append(o.proxyOptions, opts...)
+	}
+}
+
+// WithMetricsEnabled enables or disables the Prometheus-compatible /metrics
+// endpoint. Metrics are enabled by default.
+func WithMetricsEnabled(enabled bool) Option {
+	return func(o *options) {
+		o.metricsEnabled = enabled
+	}
+}
+
+// WithBuildVersion sets the build version exposed by vekil_build_info.
+func WithBuildVersion(version string) Option {
+	return func(o *options) {
+		o.buildVersion = version
 	}
 }
 
@@ -68,7 +86,10 @@ func WithCompactUpstreamMaxAttempts(max int) Option {
 
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
-	cfg := options{}
+	cfg := options{
+		metricsEnabled: true,
+		buildVersion:   "dev",
+	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
@@ -80,19 +101,38 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 		return nil, err
 	}
 
+	var metrics *serverMetrics
+	if cfg.metricsEnabled {
+		metrics, err = newServerMetrics(cfg.buildVersion)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/messages", handler.HandleAnthropicMessages)
-	mux.HandleFunc("POST /v1/chat/completions", handler.HandleOpenAIChatCompletions)
-	mux.HandleFunc("POST /v1beta/models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /v1/models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /v1/responses/compact", handler.HandleCompact)
-	mux.HandleFunc("POST /v1/responses", handler.HandleResponses)
+	register := func(pattern string, next http.HandlerFunc) {
+		if metrics != nil {
+			next = metrics.instrument(routeLabelFromPattern(pattern), next)
+		}
+		mux.HandleFunc(pattern, next)
+	}
+
+	register("POST /v1/messages", handler.HandleAnthropicMessages)
+	register("POST /v1/chat/completions", handler.HandleOpenAIChatCompletions)
+	register("POST /v1beta/models/", handler.HandleGeminiModels)
+	register("POST /v1/models/", handler.HandleGeminiModels)
+	register("POST /models/", handler.HandleGeminiModels)
+	register("POST /v1/responses/compact", handler.HandleCompact)
+	register("POST /v1/responses", handler.HandleResponses)
+	// Defer websocket-session metrics until follow-up instrumentation work.
 	mux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
-	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
-	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
-	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
-	mux.HandleFunc("GET /v1/models", handler.HandleModels)
+	register("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
+	register("GET /healthz", handler.HandleHealthz)
+	register("GET /readyz", handler.HandleReadyz)
+	register("GET /v1/models", handler.HandleModels)
+	if metrics != nil {
+		mux.Handle("GET /metrics", metrics.handler())
+	}
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{
@@ -115,6 +155,7 @@ func (s *Server) Start() error {
 		return fmt.Errorf("listen on %s: %w", s.httpServer.Addr, err)
 	}
 
+	s.httpServer.Addr = ln.Addr().String()
 	s.running.Store(true)
 	s.log.Info("vekil listening", logger.F("addr", s.httpServer.Addr))
 
@@ -143,4 +184,12 @@ func (s *Server) IsRunning() bool {
 // Addr returns the listen address.
 func (s *Server) Addr() string {
 	return s.httpServer.Addr
+}
+
+func routeLabelFromPattern(pattern string) string {
+	method, route, ok := strings.Cut(pattern, " ")
+	if ok && method != "" && route != "" {
+		return route
+	}
+	return pattern
 }
