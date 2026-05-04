@@ -109,14 +109,121 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 // compact request into a regular /responses call with this prompt so the
 // model produces a summarized handoff. The resulting compaction item is a
 // proxy-owned opaque token rather than a real upstream-encrypted payload.
-// compactUpstreamChunkBodySize is measured against the serialized upstream
-// request body size, not the model-visible token budget.
+// compactUpstreamChunkBodySize is the default target body size for chunked
+// compact retries. It is measured against the serialized upstream request body
+// size, not the model-visible token budget. Empirically validated against
+// `https://api.githubcopilot.com/responses`: bodies of exactly 5,242,880
+// bytes (5 MiB) are accepted, and bodies of 5,259,264 bytes return
+// `413 Payload Too Large` with `{"error":{"message":"failed to parse request"}}`
+// at the edge. We pick 4 MiB as the default to leave a margin for the
+// proxy's per-request overhead (instructions, fixed fields, JSON framing) so a
+// single chunk does not trip the cap on its first POST. Per-provider caps
+// differ (Azure and OpenAI Codex tolerate larger bodies), so this is a
+// safe default rather than a tight one. When upstream still returns 413 at
+// this size, the chunker halves the target on each recursive retry until it
+// hits compactUpstreamChunkBodyFloor.
 const (
-	compactUpstreamChunkBodySize = 8 << 20
+	compactUpstreamChunkBodySize  = 4 << 20
+	compactUpstreamChunkBodyFloor = 64 << 10
 	// compactUpstreamErrorBodySize caps upstream error bodies that the compact
 	// fallback buffers only so it can replay the original failure if chunking fails.
 	compactUpstreamErrorBodySize = 1 << 20
+	// compactUpstreamMaxAttempts caps the number of logical compaction calls
+	// the compact-413 fallback may issue per inbound request. Each logical
+	// call may make up to one extra HTTP POST if the configured model is
+	// rejected as unsupported (model-fallback) and may be retried by the
+	// shared transport-retry policy in retry.go on transient upstream
+	// failures (429/502/503/504). The cap is a runaway-fanout safety net,
+	// not a precise HTTP-POST limit.
+	//
+	// The default is sized to the documented inbound ceiling so the budget
+	// does not gatekeep legitimate large requests:
+	//   ceil(maxLargeRequestBodySize / compactUpstreamChunkBodySize)  ← worst-case chunks
+	//   * 2                                                            ← one round of halving
+	//   + initial 413 + merge call + small headroom
+	// = 16 * 2 + 8 = 40. We round up to 48 to leave room for sibling
+	// re-splits when learnedTarget contracts mid-flight.
+	compactUpstreamMaxAttempts = 48
 )
+
+// compactBudget bounds the total upstream attempts the compact-413 fallback may
+// consume per inbound request. It is threaded through the recursive chunking
+// path so siblings, retries, and merge calls all share the same allowance.
+//
+// learnedTarget records the smallest target body size we have observed working
+// (or are about to retry with) after an upstream 413. The sibling fanout loop
+// in compactResponsesRequestInChunks reads this between iterations so once one
+// chunk forces a halving, every remaining sibling drops to that new target
+// instead of repeating the same known-doomed POST.
+//
+// resolvedModel records the substitute model picked by the model-fallback path
+// the first time the configured model is rejected as unsupported. Subsequent
+// compact calls in the same fanout pre-rewrite their request body to this
+// model so they never trigger another fallback probe (which would otherwise
+// double the real upstream POST count per logical compaction call).
+type compactBudget struct {
+	attempts      int
+	max           int
+	learnedTarget int
+	resolvedModel string
+}
+
+func newCompactBudget(max int) *compactBudget {
+	if max <= 0 {
+		max = compactUpstreamMaxAttempts
+	}
+	return &compactBudget{max: max}
+}
+
+// consume bumps the attempt counter and returns true if the call is still
+// within budget. A nil receiver is treated as unbounded so the helper is safe
+// to use in code paths that do not enforce a budget.
+func (b *compactBudget) consume() bool {
+	if b == nil {
+		return true
+	}
+	b.attempts++
+	return b.attempts <= b.max
+}
+
+// recordLearnedTarget shrinks the shared adaptive target when a new lower
+// upper-bound on the upstream's payload cap is discovered. Larger values are
+// ignored so the target only ratchets downward.
+func (b *compactBudget) recordLearnedTarget(target int) {
+	if b == nil || target <= 0 {
+		return
+	}
+	if b.learnedTarget == 0 || target < b.learnedTarget {
+		b.learnedTarget = target
+	}
+}
+
+// adjustTarget returns the smaller of the caller's target and any learned
+// target, so siblings inherit shrinkage observed by an earlier chunk in the
+// same fanout.
+func (b *compactBudget) adjustTarget(target int) int {
+	if b == nil || b.learnedTarget == 0 {
+		return target
+	}
+	if b.learnedTarget < target {
+		return b.learnedTarget
+	}
+	return target
+}
+
+// recordResolvedModel memoizes the substitute model picked by the
+// model-fallback path so subsequent compact calls in the same fanout can
+// pre-rewrite their request body and skip the unsupported-model probe.
+// First-write-wins: a later resolution to a different name (e.g. across
+// providers) is ignored to keep the fanout coherent.
+func (b *compactBudget) recordResolvedModel(model string) {
+	if b == nil || model == "" {
+		return
+	}
+	if b.resolvedModel == "" {
+		b.resolvedModel = model
+	}
+}
 
 const compactPrompt = `You are performing a CONTEXT CHECKPOINT COMPACTION for an interrupted coding-agent session. Create a handoff summary for another LLM that must continue the same task seamlessly.
 
@@ -383,12 +490,18 @@ func writeCompactResponse(w http.ResponseWriter, summaryText string) {
 }
 
 func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header) (string, *http.Response, error) {
-	return h.compactResponsesRequestDepth(ctx, requestFields, extraHeaders, 0)
+	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
+	return h.compactResponsesRequestDepth(ctx, requestFields, extraHeaders, 0, h.effectiveCompactChunkBodyBytes(), budget)
 }
 
-func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int) (string, *http.Response, error) {
-	if depth > 8 {
-		return "", nil, fmt.Errorf("compaction chunk recursion limit exceeded")
+func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int, targetBodySize int, budget *compactBudget) (string, *http.Response, error) {
+	if !budget.consume() {
+		h.log.Info("compact upstream attempt budget exhausted",
+			logger.F("attempts", budget.attempts-1),
+			logger.F("max_attempts", budget.max),
+			logger.F("depth", depth),
+		)
+		return "", nil, fmt.Errorf("compact upstream attempt budget exhausted (max=%d)", budget.max)
 	}
 
 	bodyBytes, err := marshalCompactResponsesRequest(requestFields, nil)
@@ -396,7 +509,14 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 		return "", nil, err
 	}
 
-	resp, err := h.postResponsesWithFallbackHeaders(ctx, bodyBytes, extraHeaders)
+	// If a previous chunk in this fanout already discovered that the
+	// configured model is unsupported, rewrite to the resolved fallback
+	// model up front so we don't make the model-fallback probe on every
+	// chunk (which would double the real upstream POST count per logical
+	// compaction call).
+	bodyBytes = applyResolvedCompactModel(bodyBytes, budget)
+
+	resp, err := h.postResponsesCompactWithFallback(ctx, bodyBytes, extraHeaders, budget)
 	if err != nil {
 		return "", nil, err
 	}
@@ -431,9 +551,39 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 		)
 	}
 
-	summary, err := h.compactResponsesRequestInChunks(ctx, requestFields, extraHeaders, depth+1)
+	// Decide the next target body size. We halve eagerly when the rejected
+	// request was already at or below the current target, because that means
+	// our target overestimates the actual upstream cap. Without this, a request
+	// that fits in one chunk at the configured target but still 413s would
+	// abort instead of shrinking. We also halve unconditionally on recursive
+	// passes so sibling chunks contribute pressure on the target too.
+	nextTarget := targetBodySize
+	if depth > 0 || len(bodyBytes) <= targetBodySize {
+		nextTarget = targetBodySize / 2
+	}
+	if nextTarget < compactUpstreamChunkBodyFloor {
+		h.log.Debug("compact chunk size hit floor; returning original 413",
+			logger.F("target_body_size", targetBodySize),
+			logger.F("floor", compactUpstreamChunkBodyFloor),
+			logger.F("depth", depth),
+		)
+		return "", originalResp, nil
+	}
+
+	// Record the smaller target on the shared budget so sibling chunks in the
+	// outer fanout (if any) shrink to this value before they POST and burn
+	// their own discovery 413 at the larger size.
+	budget.recordLearnedTarget(nextTarget)
+
+	summary, err := h.compactResponsesRequestInChunks(ctx, requestFields, extraHeaders, depth+1, nextTarget, budget)
 	if err != nil {
-		h.log.Debug("chunked compact request failed", logger.Err(err))
+		h.log.Debug("chunked compact request failed",
+			logger.F("target_body_size", nextTarget),
+			logger.F("depth", depth),
+			logger.F("attempts", budget.attempts),
+			logger.F("max_attempts", budget.max),
+			logger.Err(err),
+		)
 		return "", originalResp, nil
 	}
 	return summary, nil, nil
@@ -490,7 +640,15 @@ func readBodyWithCap(r io.Reader, maxBytes int) ([]byte, bool, error) {
 	return body, false, nil
 }
 
-func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int) (string, error) {
+func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int, targetBodySize int, budget *compactBudget) (string, error) {
+	if targetBodySize <= 0 {
+		targetBodySize = h.effectiveCompactChunkBodyBytes()
+	}
+	// Honor any previously learned target so re-entries (e.g. after a sibling
+	// 413 forces re-splitting) inherit prior shrinkage instead of replanning
+	// at the original too-large size.
+	targetBodySize = budget.adjustTarget(targetBodySize)
+
 	originalInput, err := compactInputAsRawMessages(requestFields["input"])
 	if err != nil {
 		return "", err
@@ -498,31 +656,50 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 	originalItems := len(originalInput)
 	originalBytes := rawMessagesSize(originalInput)
 
-	fallbackFields, strippedFixedFields, err := compactFallbackRequestFieldsForBodySize(requestFields, compactUpstreamChunkBodySize)
+	fallbackFields, strippedFixedFields, err := compactFallbackRequestFieldsForBodySize(requestFields, targetBodySize)
 	if err != nil {
 		return "", err
 	}
 
-	input, oversizedItemsSplit, err := splitOversizedCompactInputItemsByBodySize(fallbackFields, originalInput, compactUpstreamChunkBodySize)
+	input, oversizedItemsSplit, err := splitOversizedCompactInputItemsByBodySize(fallbackFields, originalInput, targetBodySize)
 	if err != nil {
 		return "", err
 	}
 
-	chunks, err := splitCompactInputByBodySize(fallbackFields, input, compactUpstreamChunkBodySize)
+	chunks, err := splitCompactInputByBodySize(fallbackFields, input, targetBodySize)
 	if err != nil {
 		return "", err
 	}
 	if len(chunks) == 0 && len(input) == 0 && len(strippedFixedFields) > 0 {
 		chunks = [][]json.RawMessage{{}}
 	}
-	if len(chunks) < 2 && len(strippedFixedFields) == 0 {
-		return "", fmt.Errorf("compact request input cannot be split below upstream payload limit")
+	// If the fallback can't synthesize any chunk to send (e.g. the inbound
+	// request had input:[] and no fixed fields were stripped), refuse to
+	// pretend the compaction succeeded. Returning an error here lets the
+	// caller surface the original upstream 413 rather than a 200 with an
+	// empty summary token.
+	if len(chunks) == 0 {
+		return "", fmt.Errorf("compact request has no chunks to send after fallback splitting")
+	}
+	// Allow a single chunk to proceed; if upstream rejects it, the recursive
+	// halving + floor + budget guards in compactResponsesRequestDepth will
+	// shrink the target until either it fits or we exhaust the budget.
+
+	// Cheap pre-flight against the budget so we don't enter a fanout we can't
+	// afford to finish. +1 for the merge call when there are multiple chunks.
+	expectedAttempts := len(chunks)
+	if len(chunks) > 1 {
+		expectedAttempts++
+	}
+	if budget != nil && budget.attempts+expectedAttempts > budget.max {
+		return "", fmt.Errorf("compact upstream attempt budget would be exceeded by %d-chunk fanout (have=%d, max=%d)", len(chunks), budget.attempts, budget.max)
 	}
 
 	fields := []logger.Field{
 		logger.F("original_items", originalItems),
 		logger.F("chunks", len(chunks)),
 		logger.F("original_bytes", originalBytes),
+		logger.F("target_body_size", targetBodySize),
 	}
 	if oversizedItemsSplit {
 		fields = append(fields, logger.F("split_oversized_items", true), logger.F("expanded_items", len(input)))
@@ -530,12 +707,15 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 	if len(strippedFixedFields) > 0 {
 		fields = append(fields, logger.F("stripped_fixed_fields", strippedFixedFields))
 	}
+	if budget != nil {
+		fields = append(fields, logger.F("attempts_used", budget.attempts), logger.F("attempts_max", budget.max))
+	}
 	h.log.Info("retrying compact request with chunked history after 413", fields...)
 
 	summaries := make([]string, 0, len(chunks))
 	for i, chunk := range chunks {
 		chunkFields := copyResponsesRequestFieldsWithInput(fallbackFields, chunk)
-		summary, resp, err := h.compactResponsesRequestDepth(ctx, chunkFields, extraHeaders, depth)
+		summary, resp, err := h.compactResponsesRequestDepth(ctx, chunkFields, extraHeaders, depth, targetBodySize, budget)
 		if err != nil {
 			return "", err
 		}
@@ -545,9 +725,43 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 			return "", fmt.Errorf("compact chunk %d returned %d: %s", i+1, resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 		summaries = append(summaries, summary)
+
+		// If the just-finished chunk forced the shared target to shrink, abandon
+		// the planned chunk layout and re-split the remaining input at the
+		// learned smaller target. Otherwise every remaining sibling would burn
+		// its own discovery 413 at the known-doomed larger size before recursing.
+		if i+1 < len(chunks) && budget != nil && budget.learnedTarget > 0 && budget.learnedTarget < targetBodySize {
+			remaining := flattenCompactChunks(chunks[i+1:])
+			remainingFields := copyResponsesRequestFieldsWithInput(fallbackFields, remaining)
+			h.log.Info("re-splitting remaining compact chunks at learned smaller target",
+				logger.F("learned_target", budget.learnedTarget),
+				logger.F("prior_target", targetBodySize),
+				logger.F("remaining_chunks", len(chunks)-(i+1)),
+			)
+			tail, err := h.compactResponsesRequestInChunks(ctx, remainingFields, extraHeaders, depth, budget.learnedTarget, budget)
+			if err != nil {
+				return "", err
+			}
+			summaries = append(summaries, tail)
+			break
+		}
 	}
 
-	return h.mergeCompactionSummaries(ctx, fallbackFields, summaries, extraHeaders, depth)
+	return h.mergeCompactionSummaries(ctx, fallbackFields, summaries, extraHeaders, depth, targetBodySize, budget)
+}
+
+// flattenCompactChunks concatenates a list of chunked input slices back into
+// one flat slice so the caller can re-split at a different target size.
+func flattenCompactChunks(chunks [][]json.RawMessage) []json.RawMessage {
+	total := 0
+	for _, c := range chunks {
+		total += len(c)
+	}
+	out := make([]json.RawMessage, 0, total)
+	for _, c := range chunks {
+		out = append(out, c...)
+	}
+	return out
 }
 
 func compactFallbackRequestFieldsForBodySize(requestFields map[string]json.RawMessage, maxBodySize int) (map[string]json.RawMessage, []string, error) {
@@ -865,7 +1079,7 @@ func encodedRawMessageSize(raw json.RawMessage) (int, error) {
 	return len(encoded), nil
 }
 
-func (h *ProxyHandler) mergeCompactionSummaries(ctx context.Context, requestFields map[string]json.RawMessage, summaries []string, extraHeaders http.Header, depth int) (string, error) {
+func (h *ProxyHandler) mergeCompactionSummaries(ctx context.Context, requestFields map[string]json.RawMessage, summaries []string, extraHeaders http.Header, depth int, targetBodySize int, budget *compactBudget) (string, error) {
 	switch len(summaries) {
 	case 0:
 		return "", nil
@@ -892,7 +1106,7 @@ func (h *ProxyHandler) mergeCompactionSummaries(ctx context.Context, requestFiel
 	}
 
 	mergeFields := copyResponsesRequestFieldsWithInput(requestFields, input)
-	summary, resp, err := h.compactResponsesRequestDepth(ctx, mergeFields, extraHeaders, depth)
+	summary, resp, err := h.compactResponsesRequestDepth(ctx, mergeFields, extraHeaders, depth, targetBodySize, budget)
 	if err != nil {
 		return "", err
 	}
@@ -1046,24 +1260,34 @@ func stripUnsupportedResponsesToolChoice(rawToolChoice json.RawMessage, noRemain
 }
 
 func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, bodyBytes []byte, extraHeaders http.Header) (*http.Response, error) {
+	resp, _, err := h.postResponsesWithFallbackHeadersTracked(ctx, bodyBytes, extraHeaders)
+	return resp, err
+}
+
+// postResponsesWithFallbackHeadersTracked behaves like
+// postResponsesWithFallbackHeaders, but also returns the model the request was
+// ultimately served by — empty unless the model-fallback path engaged. The
+// compact fanout uses this to memoize the resolved fallback so siblings don't
+// each re-pay the unsupported-model probe.
+func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Context, bodyBytes []byte, extraHeaders http.Header) (*http.Response, string, error) {
 	resp, err := h.postResponsesWithHeaders(ctx, bodyBytes, extraHeaders)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if resp.StatusCode == http.StatusOK {
-		return resp, nil
+		return resp, "", nil
 	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		_ = resp.Body.Close()
-		return nil, err
+		return nil, "", err
 	}
 	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(respBody))
 
 	if !isUnsupportedResponsesModelError(resp.StatusCode, respBody) {
-		return resp, nil
+		return resp, "", nil
 	}
 
 	requestedModel := extractResponsesRequestModel(bodyBytes)
@@ -1071,19 +1295,19 @@ func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, bod
 	fallbackModel, fallbackErr := h.pickResponsesCompatibleModel(ctx, provider, requestedModel)
 	if fallbackErr != nil {
 		h.log.Debug("responses fallback lookup failed", logger.Err(fallbackErr))
-		return resp, nil
+		return resp, "", nil
 	}
 	if fallbackModel == "" || fallbackModel == requestedModel {
-		return resp, nil
+		return resp, "", nil
 	}
 
 	fallbackBody, changed, fallbackErr := rewriteResponsesRequestModel(bodyBytes, fallbackModel)
 	if fallbackErr != nil {
 		h.log.Debug("responses fallback rewrite failed", logger.Err(fallbackErr))
-		return resp, nil
+		return resp, "", nil
 	}
 	if !changed {
-		return resp, nil
+		return resp, "", nil
 	}
 
 	h.log.Info("retrying responses request with fallback model",
@@ -1094,10 +1318,43 @@ func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, bod
 	retryResp, retryErr := h.postResponsesWithHeaders(ctx, fallbackBody, extraHeaders)
 	if retryErr != nil {
 		h.log.Debug("responses fallback request failed", logger.Err(retryErr))
-		return resp, nil
+		return resp, "", nil
 	}
 
-	return retryResp, nil
+	return retryResp, fallbackModel, nil
+}
+
+// postResponsesCompactWithFallback wraps the model-fallback POST so that the
+// resolved fallback model is captured on the shared compact budget. Subsequent
+// compact calls in the same fanout pre-rewrite their body via
+// applyResolvedCompactModel and skip the unsupported-model probe entirely.
+func (h *ProxyHandler) postResponsesCompactWithFallback(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, budget *compactBudget) (*http.Response, error) {
+	resp, fallbackModel, err := h.postResponsesWithFallbackHeadersTracked(ctx, bodyBytes, extraHeaders)
+	if err != nil {
+		return nil, err
+	}
+	if fallbackModel != "" {
+		budget.recordResolvedModel(fallbackModel)
+	}
+	return resp, nil
+}
+
+// applyResolvedCompactModel rewrites bodyBytes' "model" field to the budget's
+// resolved fallback model when one has been recorded. Failures fall back to
+// the original body so a malformed request still gets the prior fallback path.
+func applyResolvedCompactModel(bodyBytes []byte, budget *compactBudget) []byte {
+	if budget == nil || budget.resolvedModel == "" {
+		return bodyBytes
+	}
+	current := extractResponsesRequestModel(bodyBytes)
+	if current == "" || current == budget.resolvedModel {
+		return bodyBytes
+	}
+	rewritten, changed, err := rewriteResponsesRequestModel(bodyBytes, budget.resolvedModel)
+	if err != nil || !changed {
+		return bodyBytes
+	}
+	return rewritten
 }
 
 func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, resp *http.Response) (*http.Response, error) {

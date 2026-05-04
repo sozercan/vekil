@@ -52,6 +52,20 @@ func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 	return WithProxyOptions(proxy.WithStreamingUpstreamTimeout(timeout))
 }
 
+// WithCompactUpstreamChunkBytes overrides the initial body size targeted when
+// chunking /v1/responses/compact retries after an upstream 413.
+func WithCompactUpstreamChunkBytes(bytes int) Option {
+	return WithProxyOptions(proxy.WithCompactUpstreamChunkBytes(bytes))
+}
+
+// WithCompactUpstreamMaxAttempts caps the total logical compaction calls the
+// /v1/responses/compact 413 fallback may perform per inbound request. Logical
+// calls can produce extra real upstream POSTs through model fallback or the
+// shared transport-retry policy.
+func WithCompactUpstreamMaxAttempts(max int) Option {
+	return WithProxyOptions(proxy.WithCompactUpstreamMaxAttempts(max))
+}
+
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
 	cfg := options{}

@@ -189,6 +189,8 @@ type ProxyHandler struct {
 	providersState           *providerSetup
 	responsesWS              ResponsesWebSocketConfig
 	streamingUpstreamTimeout time.Duration
+	compactChunkBodyBytes    int
+	compactMaxAttempts       int
 	log                      *logger.Logger
 	maxRetries               int
 	retryBaseDelay           time.Duration
@@ -250,6 +252,31 @@ func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 	}
 }
 
+// WithCompactUpstreamChunkBytes overrides the initial target body size used
+// when retrying /v1/responses/compact requests after the upstream returns
+// 413. Non-positive values fall back to the default. The chunker still
+// halves the target down to compactUpstreamChunkBodyFloor on recursive 413s.
+func WithCompactUpstreamChunkBytes(bytes int) Option {
+	return func(h *ProxyHandler) {
+		if bytes > 0 {
+			h.compactChunkBodyBytes = bytes
+		}
+	}
+}
+
+// WithCompactUpstreamMaxAttempts caps the total number of logical compaction
+// calls the /v1/responses/compact 413 fallback may make for a single inbound
+// request. Each logical call may produce extra real upstream POSTs through model
+// fallback or the shared transport-retry policy. Non-positive values fall back
+// to the default.
+func WithCompactUpstreamMaxAttempts(max int) Option {
+	return func(h *ProxyHandler) {
+		if max > 0 {
+			h.compactMaxAttempts = max
+		}
+	}
+}
+
 // NewProxyHandler creates a ProxyHandler with connection pooling and HTTP/2.
 func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) (*ProxyHandler, error) {
 	h := &ProxyHandler{
@@ -290,6 +317,33 @@ func (h *ProxyHandler) effectiveStreamingUpstreamTimeout() time.Duration {
 		return DefaultStreamingUpstreamTimeout()
 	}
 	return normalizeStreamingUpstreamTimeout(h.streamingUpstreamTimeout)
+}
+
+// DefaultCompactUpstreamChunkBytes is the default target body size for chunked
+// /v1/responses/compact retries. Exposed so callers can show the default value
+// in flag/env help text.
+func DefaultCompactUpstreamChunkBytes() int {
+	return compactUpstreamChunkBodySize
+}
+
+func (h *ProxyHandler) effectiveCompactChunkBodyBytes() int {
+	if h == nil || h.compactChunkBodyBytes <= 0 {
+		return compactUpstreamChunkBodySize
+	}
+	return h.compactChunkBodyBytes
+}
+
+// DefaultCompactUpstreamMaxAttempts returns the default upstream attempt cap
+// for chunked /v1/responses/compact 413 fallback retries.
+func DefaultCompactUpstreamMaxAttempts() int {
+	return compactUpstreamMaxAttempts
+}
+
+func (h *ProxyHandler) effectiveCompactMaxAttempts() int {
+	if h == nil || h.compactMaxAttempts <= 0 {
+		return compactUpstreamMaxAttempts
+	}
+	return h.compactMaxAttempts
 }
 
 // ServerWriteTimeout returns the HTTP server write timeout derived from the
