@@ -58,8 +58,10 @@ func WithCompactUpstreamChunkBytes(bytes int) Option {
 	return WithProxyOptions(proxy.WithCompactUpstreamChunkBytes(bytes))
 }
 
-// WithCompactUpstreamMaxAttempts caps the total upstream POSTs the
-// /v1/responses/compact 413 fallback may perform per inbound request.
+// WithCompactUpstreamMaxAttempts caps the total logical compaction calls the
+// /v1/responses/compact 413 fallback may perform per inbound request. Logical
+// calls can produce extra real upstream POSTs through model fallback or the
+// shared transport-retry policy.
 func WithCompactUpstreamMaxAttempts(max int) Option {
 	return WithProxyOptions(proxy.WithCompactUpstreamMaxAttempts(max))
 }

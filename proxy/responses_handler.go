@@ -495,10 +495,6 @@ func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestField
 }
 
 func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int, targetBodySize int, budget *compactBudget) (string, *http.Response, error) {
-	if depth > 8 {
-		return "", nil, fmt.Errorf("compaction chunk recursion limit exceeded")
-	}
-
 	if !budget.consume() {
 		h.log.Info("compact upstream attempt budget exhausted",
 			logger.F("attempts", budget.attempts-1),

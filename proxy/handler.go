@@ -264,9 +264,11 @@ func WithCompactUpstreamChunkBytes(bytes int) Option {
 	}
 }
 
-// WithCompactUpstreamMaxAttempts caps the total number of upstream POSTs the
-// /v1/responses/compact 413 fallback may make for a single inbound request.
-// Non-positive values fall back to the default.
+// WithCompactUpstreamMaxAttempts caps the total number of logical compaction
+// calls the /v1/responses/compact 413 fallback may make for a single inbound
+// request. Each logical call may produce extra real upstream POSTs through model
+// fallback or the shared transport-retry policy. Non-positive values fall back
+// to the default.
 func WithCompactUpstreamMaxAttempts(max int) Option {
 	return func(h *ProxyHandler) {
 		if max > 0 {

@@ -1912,6 +1912,53 @@ func TestHandleCompact_HalvesChunkTargetOnRecursive413(t *testing.T) {
 	}
 }
 
+func TestCompactResponsesRequestDepth_AllowsConfiguredTargetToReachFloor(t *testing.T) {
+	// A large operator-configured initial target can require more than the old
+	// fixed depth guard before the fallback reaches the documented 64 KiB floor.
+	// Depth by itself must not stop a floor-sized logical compaction call; the
+	// floor and shared attempt budget are the terminating guards.
+	message, err := compactTextInputRawMessage("small floor-sized retry")
+	if err != nil {
+		t.Fatalf("build input message: %v", err)
+	}
+	input, err := json.Marshal([]json.RawMessage{message})
+	if err != nil {
+		t.Fatalf("marshal input: %v", err)
+	}
+	requestFields := map[string]json.RawMessage{
+		"model": json.RawMessage(`"gpt-5.4"`),
+		"input": input,
+	}
+
+	var calls int
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		calls++
+		if len(body) > compactUpstreamChunkBodyFloor {
+			t.Fatalf("test setup expected a floor-sized body, got %d > %d", len(body), compactUpstreamChunkBodyFloor)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"floor ok"}]}]}`))
+	})
+
+	summary, resp, err := handler.compactResponsesRequestDepth(context.Background(), requestFields, nil, 9, compactUpstreamChunkBodyFloor, newCompactBudget(2))
+	if err != nil {
+		t.Fatalf("expected high-depth floor retry to proceed: %v", err)
+	}
+	if resp != nil {
+		t.Fatalf("expected successful summary, got response status %d", resp.StatusCode)
+	}
+	if summary != "floor ok" {
+		t.Fatalf("unexpected summary %q", summary)
+	}
+	if calls != 1 {
+		t.Fatalf("expected one upstream call, got %d", calls)
+	}
+}
+
 func TestHandleCompact_HalvesEagerlyWhenSubTargetRequest413s(t *testing.T) {
 	// Single small item: the initial compact body fits inside the configured
 	// target, but upstream still 413s because its real cap is lower (300 KiB
