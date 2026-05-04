@@ -180,13 +180,6 @@ func (b *compactBudget) consume() bool {
 	return b.attempts <= b.max
 }
 
-func (b *compactBudget) exhausted() bool {
-	if b == nil {
-		return false
-	}
-	return b.attempts >= b.max
-}
-
 // recordLearnedTarget shrinks the shared adaptive target when a new lower
 // upper-bound on the upstream's payload cap is discovered. Larger values are
 // ignored so the target only ratchets downward.
