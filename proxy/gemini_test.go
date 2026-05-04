@@ -2029,7 +2029,7 @@ func TestHandleGeminiModelsCountTokensFallbackAndCache(t *testing.T) {
 				t.Fatalf("MaxTokens = %v, want nil", oaiReq.MaxTokens)
 			}
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":"max_completion_tokens unsupported"}`))
+			_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: 'max_completion_tokens' is not supported with this model.","param":"max_completion_tokens","code":"unsupported_parameter"}}`))
 		case 2:
 			if oaiReq.MaxCompletionTokens != nil {
 				t.Fatalf("MaxCompletionTokens = %v, want nil", oaiReq.MaxCompletionTokens)
@@ -2083,6 +2083,130 @@ func TestHandleGeminiModelsCountTokensFallbackAndCache(t *testing.T) {
 		if len(countResp.PromptTokensDetails) != 1 || countResp.PromptTokensDetails[0].Modality != "TEXT" {
 			t.Errorf("iteration %d PromptTokensDetails = %#v, want TEXT detail", i, countResp.PromptTokensDetails)
 		}
+	}
+
+	if callCount != 2 {
+		t.Fatalf("upstream callCount = %d, want 2", callCount)
+	}
+}
+
+func TestHandleGeminiModelsCountTokensDoesNotFallbackOnUnexpectedBadRequest(t *testing.T) {
+	callCount := 0
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+
+		if callCount != 1 {
+			t.Fatalf("unexpected upstream call %d", callCount)
+		}
+
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+
+		if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != 1 {
+			t.Fatalf("MaxCompletionTokens = %v, want 1", oaiReq.MaxCompletionTokens)
+		}
+		if oaiReq.MaxTokens != nil {
+			t.Fatalf("MaxTokens = %v, want nil", oaiReq.MaxTokens)
+		}
+
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"messages must not be empty"}}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:countTokens", strings.NewReader(`{
+		"contents": [{"role":"user","parts":[{"text":"Count this"}]}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleGeminiModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("StatusCode = %d, want 400: %s", resp.StatusCode, string(body))
+	}
+
+	var errResp models.GeminiErrorResponse
+	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if errResp.Error.Status != "INVALID_ARGUMENT" {
+		t.Fatalf("status = %q, want INVALID_ARGUMENT", errResp.Error.Status)
+	}
+
+	if callCount != 1 {
+		t.Fatalf("upstream callCount = %d, want 1", callCount)
+	}
+}
+
+func TestHandleGeminiModelsCountTokensRetries429ThenSuccess(t *testing.T) {
+	callCount := 0
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+
+		if oaiReq.Stream == nil || *oaiReq.Stream {
+			t.Fatalf("Stream = %v, want false", oaiReq.Stream)
+		}
+		if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != 1 {
+			t.Fatalf("call %d MaxCompletionTokens = %v, want 1", callCount, oaiReq.MaxCompletionTokens)
+		}
+		if oaiReq.MaxTokens != nil {
+			t.Fatalf("call %d MaxTokens = %v, want nil", callCount, oaiReq.MaxTokens)
+		}
+
+		switch callCount {
+		case 1:
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+		case 2:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+				ID:      "chatcmpl-429",
+				Object:  "chat.completion",
+				Created: 123,
+				Model:   "gemini-2.5-pro",
+				Choices: []models.OpenAIChoice{{
+					Index:        0,
+					Message:      models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)},
+					FinishReason: strPtr("stop"),
+				}},
+				Usage: &models.OpenAIUsage{PromptTokens: 13, CompletionTokens: 1, TotalTokens: 14},
+			})
+		default:
+			t.Fatalf("unexpected upstream call %d", callCount)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:countTokens", strings.NewReader(`{
+		"contents": [{"role":"user","parts":[{"text":"Count this"}]}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleGeminiModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, string(body))
+	}
+
+	var countResp models.GeminiCountTokensResponse
+	if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+		t.Fatalf("decode countTokens response: %v", err)
+	}
+	if countResp.TotalTokens != 13 {
+		t.Fatalf("TotalTokens = %d, want 13", countResp.TotalTokens)
 	}
 
 	if callCount != 2 {

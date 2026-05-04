@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -276,7 +278,7 @@ func (h *ProxyHandler) executeGeminiCountTokensProbe(probeReq *models.OpenAIRequ
 		return nil, false, mapGeminiTransportError(err)
 	}
 
-	if resp.StatusCode == http.StatusBadRequest && probeReq.MaxCompletionTokens != nil {
+	if shouldFallbackGeminiCountTokensProbe(resp, probeReq) {
 		_ = resp.Body.Close()
 		return nil, true, nil
 	}
@@ -329,6 +331,72 @@ func (h *ProxyHandler) decodeGeminiProbeResponse(resp *http.Response) (*models.O
 	}
 
 	return &oaiResp, false, nil
+}
+
+func shouldFallbackGeminiCountTokensProbe(resp *http.Response, probeReq *models.OpenAIRequest) bool {
+	if resp == nil || resp.StatusCode != http.StatusBadRequest || probeReq == nil || probeReq.MaxCompletionTokens == nil {
+		return false
+	}
+
+	body := readGeminiProbeErrorBody(resp)
+	if len(body) == 0 {
+		return false
+	}
+
+	return isGeminiCountTokensFallbackBadRequest(body)
+}
+
+func readGeminiProbeErrorBody(resp *http.Response) []byte {
+	if resp == nil || resp.Body == nil {
+		return nil
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err == nil {
+		drainAndClose(resp.Body)
+	} else {
+		_ = resp.Body.Close()
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return body
+}
+
+func isGeminiCountTokensFallbackBadRequest(body []byte) bool {
+	type openAIErrorObject struct {
+		Message string `json:"message"`
+		Param   string `json:"param"`
+		Code    string `json:"code"`
+	}
+	type openAIErrorEnvelope struct {
+		Error json.RawMessage `json:"error"`
+	}
+
+	var envelope openAIErrorEnvelope
+	if err := json.Unmarshal(body, &envelope); err == nil && len(envelope.Error) > 0 {
+		var errorText string
+		if err := json.Unmarshal(envelope.Error, &errorText); err == nil {
+			return isUnsupportedMaxCompletionTokensText(errorText)
+		}
+
+		var errorObject openAIErrorObject
+		if err := json.Unmarshal(envelope.Error, &errorObject); err == nil {
+			if strings.EqualFold(strings.TrimSpace(errorObject.Param), "max_completion_tokens") &&
+				strings.EqualFold(strings.TrimSpace(errorObject.Code), "unsupported_parameter") {
+				return true
+			}
+			return isUnsupportedMaxCompletionTokensText(errorObject.Message)
+		}
+	}
+
+	return isUnsupportedMaxCompletionTokensText(string(body))
+}
+
+func isUnsupportedMaxCompletionTokensText(text string) bool {
+	lower := strings.ToLower(text)
+	if !strings.Contains(lower, "max_completion_tokens") {
+		return false
+	}
+	return strings.Contains(lower, "unsupported") || strings.Contains(lower, "not supported")
 }
 
 func (h *ProxyHandler) writeGeminiProtocolError(w http.ResponseWriter, err error) {
