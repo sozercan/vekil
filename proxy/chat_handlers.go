@@ -246,15 +246,19 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			_ = json.NewEncoder(w).Encode(oaiResp)
 		},
 		passthrough: func(resp *http.Response) error {
-			body, err := writeBufferedUpstreamResponse(w, resp)
+			usage, err := writeOpenAIUpstreamResponse(w, resp)
 			if err != nil {
 				return err
 			}
-			tracker.ObserveOpenAIUsage(extractOpenAIUsageFromBody(body))
+			tracker.ObserveOpenAIUsage(usage)
 			return nil
 		},
 	})
 	if err != nil {
+		if metricsW.StatusCode() != 0 {
+			h.log.Error("failed to forward upstream response", logger.F("endpoint", "openai"), logger.Err(err))
+			return
+		}
 		writeOpenAIError(w, http.StatusBadGateway, "failed to aggregate upstream response", "server_error")
 	}
 }

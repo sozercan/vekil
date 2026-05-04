@@ -2146,10 +2146,10 @@ func TestHandleGeminiModelsCountTokensFallbackFiltersExpected400Metrics(t *testi
 		t.Fatalf("upstream callCount = %d, want 2", callCount)
 	}
 
-	if got := testutil.ToFloat64(handler.metrics.upstreamErrorsTotal.WithLabelValues("copilot", "gemini-2.5-pro", metricEndpointGeminiCountTokens, "400")); got != 0 {
+	if got := testutil.ToFloat64(handler.metrics.upstreamErrorsTotal.WithLabelValues("copilot", metricLabelUnknown, metricEndpointGeminiCountTokens, "400")); got != 0 {
 		t.Fatalf("upstream_errors_total{code=400} = %v, want 0 for expected fallback", got)
 	}
-	if got := testutil.ToFloat64(handler.metrics.requestsTotal.WithLabelValues("copilot", "gemini-2.5-pro", metricEndpointGeminiCountTokens, "200")); got != 1 {
+	if got := testutil.ToFloat64(handler.metrics.requestsTotal.WithLabelValues("copilot", metricLabelUnknown, metricEndpointGeminiCountTokens, "200")); got != 1 {
 		t.Fatalf("requests_total{status=200} = %v, want 1", got)
 	}
 }
@@ -2186,7 +2186,7 @@ func TestHandleGeminiModelsCountTokensProbeBadRequestDoesNotFallbackWithoutMaxCo
 	if callCount != 1 {
 		t.Fatalf("upstream callCount = %d, want 1", callCount)
 	}
-	if got := testutil.ToFloat64(handler.metrics.upstreamErrorsTotal.WithLabelValues("copilot", "gemini-2.5-pro", metricEndpointGeminiCountTokens, "400")); got != 1 {
+	if got := testutil.ToFloat64(handler.metrics.upstreamErrorsTotal.WithLabelValues("copilot", metricLabelUnknown, metricEndpointGeminiCountTokens, "400")); got != 1 {
 		t.Fatalf("upstream_errors_total{code=400} = %v, want 1", got)
 	}
 }
@@ -2246,13 +2246,13 @@ func TestHandleGeminiModelsCountTokensRetriesProbeBeforeSuccess(t *testing.T) {
 		t.Fatalf("upstream callCount = %d, want 2", callCount)
 	}
 
-	if got := testutil.ToFloat64(handler.metrics.retriesTotal.WithLabelValues("copilot", "gemini-2.5-pro", metricEndpointGeminiCountTokens, "429")); got != 1 {
+	if got := testutil.ToFloat64(handler.metrics.retriesTotal.WithLabelValues("copilot", metricLabelUnknown, metricEndpointGeminiCountTokens, "429")); got != 1 {
 		t.Fatalf("retries_total{reason=429} = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(handler.metrics.upstreamErrorsTotal.WithLabelValues("copilot", "gemini-2.5-pro", metricEndpointGeminiCountTokens, "429")); got != 1 {
+	if got := testutil.ToFloat64(handler.metrics.upstreamErrorsTotal.WithLabelValues("copilot", metricLabelUnknown, metricEndpointGeminiCountTokens, "429")); got != 1 {
 		t.Fatalf("upstream_errors_total{code=429} = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(handler.metrics.requestsTotal.WithLabelValues("copilot", "gemini-2.5-pro", metricEndpointGeminiCountTokens, "200")); got != 1 {
+	if got := testutil.ToFloat64(handler.metrics.requestsTotal.WithLabelValues("copilot", metricLabelUnknown, metricEndpointGeminiCountTokens, "200")); got != 1 {
 		t.Fatalf("requests_total{status=200} = %v, want 1", got)
 	}
 }

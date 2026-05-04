@@ -112,12 +112,16 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := writeBufferedUpstreamResponse(w, resp)
+	promptTokens, completionTokens, ok, err := writeResponsesUpstreamResponse(w, resp)
 	if err != nil {
+		h.log.Error("failed to forward upstream response", logger.F("endpoint", "responses"), logger.Err(err))
+		if metricsW.StatusCode() != 0 {
+			return
+		}
 		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
 		return
 	}
-	if promptTokens, completionTokens, ok := extractResponsesUsageFromBody(body); ok {
+	if ok {
 		tracker.ObserveResponsesUsage(promptTokens, completionTokens)
 	}
 }

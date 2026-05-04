@@ -162,6 +162,26 @@ func normalizeRequestMetricLabels(labels requestMetricLabels) requestMetricLabel
 	}
 }
 
+func (h *ProxyHandler) requestMetricLabels(endpoint, upstreamPath, publicModel string) requestMetricLabels {
+	labels := requestMetricLabels{
+		provider:    metricLabelUnknown,
+		publicModel: metricLabelUnknown,
+		endpoint:    endpoint,
+	}
+	if h == nil {
+		return normalizeRequestMetricLabels(labels)
+	}
+
+	provider, owner, known := h.resolveProviderModel(publicModel, upstreamPath)
+	if provider != nil {
+		labels.provider = provider.id
+	}
+	if known && strings.TrimSpace(owner.publicID) != "" && providerModelSupportsEndpoint(owner, upstreamPath) {
+		labels.publicModel = owner.publicID
+	}
+	return normalizeRequestMetricLabels(labels)
+}
+
 func metricsEndpointForUpstreamPath(path string) string {
 	switch strings.TrimSpace(path) {
 	case "/chat/completions":
@@ -228,19 +248,7 @@ func (h *ProxyHandler) beginRequestMetrics(endpoint, upstreamPath, publicModel s
 		return nil
 	}
 
-	provider, owner, _ := h.resolveProviderModel(publicModel, upstreamPath)
-	labels := requestMetricLabels{
-		provider:    metricLabelUnknown,
-		publicModel: publicModel,
-		endpoint:    endpoint,
-	}
-	if provider != nil {
-		labels.provider = provider.id
-	}
-	if strings.TrimSpace(owner.publicID) != "" {
-		labels.publicModel = owner.publicID
-	}
-	labels = normalizeRequestMetricLabels(labels)
+	labels := h.requestMetricLabels(endpoint, upstreamPath, publicModel)
 
 	h.metrics.inflightRequests.WithLabelValues(labels.provider).Inc()
 	return &requestMetricsTracker{
@@ -407,19 +415,23 @@ func upstreamMetricsFromContext(ctx context.Context) (upstreamMetricsContext, bo
 	return meta, ok
 }
 
-func (h *ProxyHandler) ensureUpstreamMetricsContext(ctx context.Context, provider *providerRuntime, publicModel, endpoint string) context.Context {
+func (h *ProxyHandler) ensureUpstreamMetricsContext(ctx context.Context, provider *providerRuntime, publicModel, upstreamPath, endpoint string) context.Context {
 	if h == nil || h.metrics == nil {
 		return ctx
+	}
+	resolvedLabels := h.requestMetricLabels(endpoint, upstreamPath, publicModel)
+	if provider != nil {
+		resolvedLabels.provider = provider.id
 	}
 	if meta, ok := upstreamMetricsFromContext(ctx); ok {
 		if meta.labels.provider != "" && meta.labels.publicModel != "" && meta.labels.endpoint != "" {
 			return ctx
 		}
-		if meta.labels.provider == "" && provider != nil {
-			meta.labels.provider = provider.id
+		if meta.labels.provider == "" {
+			meta.labels.provider = resolvedLabels.provider
 		}
 		if meta.labels.publicModel == "" {
-			meta.labels.publicModel = publicModel
+			meta.labels.publicModel = resolvedLabels.publicModel
 		}
 		if meta.labels.endpoint == "" {
 			meta.labels.endpoint = endpoint
@@ -428,15 +440,7 @@ func (h *ProxyHandler) ensureUpstreamMetricsContext(ctx context.Context, provide
 		return context.WithValue(ctx, upstreamMetricsContextKey{}, meta)
 	}
 
-	labels := requestMetricLabels{
-		provider:    metricLabelUnknown,
-		publicModel: publicModel,
-		endpoint:    endpoint,
-	}
-	if provider != nil {
-		labels.provider = provider.id
-	}
-	return withUpstreamMetrics(ctx, labels)
+	return withUpstreamMetrics(ctx, resolvedLabels)
 }
 
 func readyzMetricsEndpoint(provider *providerRuntime) string {
@@ -485,17 +489,21 @@ func expectedMaxCompletionTokensFallback(resp *http.Response) bool {
 	return strings.Contains(strings.ToLower(string(body)), metricsExpectedFallbackBodySubstring)
 }
 
-func extractOpenAIUsageFromBody(body []byte) *models.OpenAIUsage {
+func extractOpenAIUsageFromReader(r io.Reader) *models.OpenAIUsage {
 	var payload struct {
 		Usage *models.OpenAIUsage `json:"usage"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil {
+	if err := json.NewDecoder(r).Decode(&payload); err != nil {
 		return nil
 	}
 	return payload.Usage
 }
 
-func extractResponsesUsageFromBody(body []byte) (int, int, bool) {
+func extractOpenAIUsageFromBody(body []byte) *models.OpenAIUsage {
+	return extractOpenAIUsageFromReader(bytes.NewReader(body))
+}
+
+func extractResponsesUsageFromReader(r io.Reader) (int, int, bool) {
 	type responsesUsage struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
@@ -506,7 +514,7 @@ func extractResponsesUsageFromBody(body []byte) (int, int, bool) {
 			Usage *responsesUsage `json:"usage"`
 		} `json:"response"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil {
+	if err := json.NewDecoder(r).Decode(&payload); err != nil {
 		return 0, 0, false
 	}
 	if payload.Usage != nil {
@@ -518,14 +526,62 @@ func extractResponsesUsageFromBody(body []byte) (int, int, bool) {
 	return 0, 0, false
 }
 
-func writeBufferedUpstreamResponse(w http.ResponseWriter, resp *http.Response) ([]byte, error) {
+func extractResponsesUsageFromBody(body []byte) (int, int, bool) {
+	return extractResponsesUsageFromReader(bytes.NewReader(body))
+}
+
+func writeObservedUpstreamResponse(w http.ResponseWriter, resp *http.Response, observe func(io.Reader)) error {
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(body)
-	return body, nil
+	if observe == nil {
+		_, err := io.Copy(w, resp.Body)
+		return err
+	}
+
+	pr, pw := io.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		observe(pr)
+		_, _ = io.Copy(io.Discard, pr)
+		_ = pr.Close()
+	}()
+
+	_, err := io.Copy(io.MultiWriter(w, pw), resp.Body)
+	_ = pw.CloseWithError(err)
+	<-done
+	return err
+}
+
+func writeOpenAIUpstreamResponse(w http.ResponseWriter, resp *http.Response) (*models.OpenAIUsage, error) {
+	var usage *models.OpenAIUsage
+	var observe func(io.Reader)
+	if resp != nil && resp.StatusCode == http.StatusOK {
+		observe = func(r io.Reader) {
+			usage = extractOpenAIUsageFromReader(r)
+		}
+	}
+	if err := writeObservedUpstreamResponse(w, resp, observe); err != nil {
+		return nil, err
+	}
+	return usage, nil
+}
+
+func writeResponsesUpstreamResponse(w http.ResponseWriter, resp *http.Response) (int, int, bool, error) {
+	var (
+		promptTokens     int
+		completionTokens int
+		ok               bool
+		observe          func(io.Reader)
+	)
+	if resp != nil && resp.StatusCode == http.StatusOK {
+		observe = func(r io.Reader) {
+			promptTokens, completionTokens, ok = extractResponsesUsageFromReader(r)
+		}
+	}
+	if err := writeObservedUpstreamResponse(w, resp, observe); err != nil {
+		return 0, 0, false, err
+	}
+	return promptTokens, completionTokens, ok, nil
 }
