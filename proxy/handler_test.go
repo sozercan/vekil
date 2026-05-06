@@ -883,6 +883,34 @@ func TestHandleResponses_UpstreamDeadlineDependsOnStreamFlag(t *testing.T) {
 	})
 }
 
+func TestHandleCompact_UsesStreamingUpstreamTimeout(t *testing.T) {
+	const customTimeout = 17 * time.Minute
+
+	deadlineCh := make(chan time.Duration, 1)
+	handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		deadline, ok := r.Context().Deadline()
+		if !ok {
+			t.Fatal("expected upstream request deadline")
+		}
+		deadlineCh <- time.Until(deadline)
+		return jsonHTTPResponse(`{"id":"resp-compact-deadline","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"compact ok"}]}]}`), nil
+	}))
+	WithStreamingUpstreamTimeout(customTimeout)(handler)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"gpt-4","input":"Hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	if resp := w.Result(); resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	assertDeadlineApprox(t, <-deadlineCh, customTimeout)
+}
+
 func TestHandleResponses_LargeBodyStillRejected(t *testing.T) {
 	var upstreamHits atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1123,20 +1151,28 @@ func TestHandleCompact_FallsBackToChunkedCompactionOnUpstream413(t *testing.T) {
 			w.WriteHeader(http.StatusRequestEntityTooLarge)
 			_, _ = w.Write([]byte(`{"error":{"message":"payload too large"}}`))
 		case 2:
-			if len(input) != 2 {
-				t.Fatalf("expected first fallback chunk to have 2 items, got %d", len(input))
+			if len(input) != 1 {
+				t.Fatalf("expected first fallback chunk to be one historical text message, got %d", len(input))
 			}
 			if len(body) > compactUpstreamChunkBodySize {
 				t.Fatalf("expected first fallback chunk body to fit target, got %d bytes", len(body))
+			}
+			text := requireMessageTextWithRole(t, input[0], "user")
+			if !strings.Contains(text, "Historical compact input chunk") || !strings.Contains(text, "first ") || !strings.Contains(text, "second ") || strings.Contains(text, "third ") {
+				t.Fatalf("expected first historical chunk to contain first two original items only, got %q", text)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"resp-chunk-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary of first two items"}]}]}`))
 		case 3:
 			if len(input) != 1 {
-				t.Fatalf("expected second fallback chunk to have 1 item, got %d", len(input))
+				t.Fatalf("expected second fallback chunk to be one historical text message, got %d", len(input))
 			}
 			if len(body) > compactUpstreamChunkBodySize {
 				t.Fatalf("expected second fallback chunk body to fit target, got %d bytes", len(body))
+			}
+			text := requireMessageTextWithRole(t, input[0], "user")
+			if !strings.Contains(text, "Historical compact input chunk") || !strings.Contains(text, "third ") || strings.Contains(text, "first ") || strings.Contains(text, "second ") {
+				t.Fatalf("expected second historical chunk to contain final original item only, got %q", text)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"resp-chunk-2","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary of final item"}]}]}`))
@@ -1176,7 +1212,7 @@ func TestHandleCompact_FallsBackToChunkedCompactionOnUpstream413(t *testing.T) {
 	if len(gotBodySizes) != 4 {
 		t.Fatalf("expected 4 upstream requests (initial + 2 chunks + merge), got %d", len(gotBodySizes))
 	}
-	if gotInputCounts[0] != 3 || gotInputCounts[1] != 2 || gotInputCounts[2] != 1 || gotInputCounts[3] != 2 {
+	if gotInputCounts[0] != 3 || gotInputCounts[1] != 1 || gotInputCounts[2] != 1 || gotInputCounts[3] != 2 {
 		t.Fatalf("unexpected upstream input counts: %v", gotInputCounts)
 	}
 	if gotBodySizes[0] <= gotBodySizes[1] || gotBodySizes[0] <= gotBodySizes[2] {
@@ -1208,6 +1244,240 @@ func TestHandleCompact_FallsBackToChunkedCompactionOnUpstream413(t *testing.T) {
 	}
 	if got := decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent); got != "final merged summary" {
 		t.Errorf("expected encoded final merged summary, got %q", got)
+	}
+}
+
+func TestSplitCompactInputAsHistoricalChunks_FlattenPreservesOriginalItems(t *testing.T) {
+	first, err := compactTextInputRawMessage("first " + strings.Repeat("a", 4096))
+	if err != nil {
+		t.Fatalf("build first message: %v", err)
+	}
+	second, err := compactTextInputRawMessage("second " + strings.Repeat("b", 4096))
+	if err != nil {
+		t.Fatalf("build second message: %v", err)
+	}
+	requestFields := map[string]json.RawMessage{"model": json.RawMessage(`"gpt-5.4"`)}
+
+	_, oneSize, err := compactHistoricalChunkFitsBodySize(requestFields, []json.RawMessage{first}, 1, 1<<20)
+	if err != nil {
+		t.Fatalf("measure one-item chunk: %v", err)
+	}
+	_, twoSize, err := compactHistoricalChunkFitsBodySize(requestFields, []json.RawMessage{first, second}, 1, 1<<20)
+	if err != nil {
+		t.Fatalf("measure two-item chunk: %v", err)
+	}
+	maxBodySize := oneSize + 16
+	if twoSize <= maxBodySize {
+		t.Fatalf("test setup expected two-item historical chunk size %d to exceed target %d", twoSize, maxBodySize)
+	}
+
+	chunks, splitAny, expandedItems, err := splitCompactInputAsHistoricalChunksByBodySize(requestFields, []json.RawMessage{first, second}, maxBodySize)
+	if err != nil {
+		t.Fatalf("split historical chunks: %v", err)
+	}
+	if splitAny {
+		t.Fatalf("did not expect oversized input item splitting")
+	}
+	if expandedItems != 2 {
+		t.Fatalf("expandedItems = %d, want 2", expandedItems)
+	}
+	if len(chunks) != 2 || len(chunks[0]) != 1 || len(chunks[1]) != 1 {
+		t.Fatalf("expected two one-item original chunks, got %#v", chunks)
+	}
+	if !bytes.Equal(chunks[0][0], first) || !bytes.Equal(chunks[1][0], second) {
+		t.Fatalf("expected chunks to retain original items for future re-splitting")
+	}
+
+	remaining := flattenCompactChunks(chunks[1:])
+	if len(remaining) != 1 || !bytes.Equal(remaining[0], second) {
+		t.Fatalf("expected flattened remainder to contain original second item, got %#v", remaining)
+	}
+	if bytes.Contains(remaining[0], []byte("Historical compact input chunk")) {
+		t.Fatalf("flattened remainder should not contain a nested historical wrapper: %s", remaining[0])
+	}
+
+	wireInput, err := compactHistoricalChunkInput(chunks[0], 1)
+	if err != nil {
+		t.Fatalf("wrap chunk for upstream: %v", err)
+	}
+	if len(wireInput) != 1 {
+		t.Fatalf("expected one wrapped wire message, got %#v", wireInput)
+	}
+	var wireMessage struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(wireInput[0], &wireMessage); err != nil {
+		t.Fatalf("unmarshal wrapped wire message: %v", err)
+	}
+	if len(wireMessage.Content) == 0 || !strings.Contains(wireMessage.Content[0].Text, "Historical compact input chunk") {
+		t.Fatalf("expected send-time historical wrapper, got %#v", wireMessage)
+	}
+}
+
+func TestHandleCompact_FallbackWrapsChunksAsHistoricalText(t *testing.T) {
+	inputHasType := func(input []interface{}, want string) bool {
+		for _, raw := range input {
+			item, ok := raw.(map[string]interface{})
+			if ok && item["type"] == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "summarize this tool-call history"},
+				},
+			},
+			map[string]interface{}{
+				"type":      "function_call",
+				"call_id":   "call_missing_output",
+				"name":      "lookup",
+				"arguments": `{"query":"large history"}`,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	var calls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		var upstreamReq map[string]interface{}
+		if err := json.Unmarshal(body, &upstreamReq); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+		input, ok := upstreamReq["input"].([]interface{})
+		if !ok {
+			t.Fatalf("expected upstream input array, got %#v", upstreamReq["input"])
+		}
+
+		switch calls.Add(1) {
+		case 1:
+			if !inputHasType(input, "function_call") {
+				t.Fatalf("expected initial compact attempt to preserve function_call, got %#v", input)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+			return
+		default:
+			if inputHasType(input, "function_call") {
+				t.Fatalf("fallback chunk replayed raw function_call input: %#v", input)
+			}
+			if len(input) != 1 {
+				t.Fatalf("expected fallback chunk to be one historical text message, got %#v", input)
+			}
+			text := requireMessageTextWithRole(t, input[0], "user")
+			if !strings.Contains(text, "Historical compact input chunk") || !strings.Contains(text, `"type":"function_call"`) {
+				t.Fatalf("expected serialized function_call in historical text chunk, got %q", text)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-chunk","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summarized tool-call history"}]}]}`))
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleCompact(w, req)
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 for historical-text fallback chunk, got %d: %s", resp.StatusCode, body)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected initial 413 plus one fallback chunk, got %d calls", calls.Load())
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	gotSummary, gotCompaction := requireCompactResponseSummaryForTest(t, body)
+	if gotSummary != "summarized tool-call history" || gotCompaction != "summarized tool-call history" {
+		t.Fatalf("unexpected compact response summary=%q compaction=%q", gotSummary, gotCompaction)
+	}
+}
+
+func TestHandleCompact_ShrinksHistoricalChunksOnPromptTokenLimit(t *testing.T) {
+	const initialTarget = 128 * 1024
+	const tokenCap = (initialTarget * 3) / 4
+
+	largeText := strings.Repeat("token ", 25000)
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": largeText},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	var calls atomic.Int32
+	var sawPromptLimit atomic.Bool
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+
+		if calls.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+			return
+		}
+
+		if len(body) > tokenCap {
+			sawPromptLimit.Store(true)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"prompt token count of 341106 exceeds the limit of 272000","code":"model_max_prompt_tokens_exceeded"}}`))
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"token-limit chunk ok"}]}]}`))
+	})
+	handler.compactChunkBodyBytes = initialTarget
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleCompact(w, req)
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 after shrinking prompt-token-limited chunk, got %d: %s", resp.StatusCode, body)
+	}
+	if !sawPromptLimit.Load() {
+		t.Fatalf("expected upstream prompt-token-limit 400 to be exercised")
+	}
+	body, _ := io.ReadAll(resp.Body)
+	gotSummary, gotCompaction := requireCompactResponseSummaryForTest(t, body)
+	if gotSummary != "token-limit chunk ok" || gotCompaction != "token-limit chunk ok" {
+		t.Fatalf("unexpected compact response summary=%q compaction=%q", gotSummary, gotCompaction)
 	}
 }
 
@@ -2403,7 +2673,7 @@ func TestHandleCompact_MemoizesModelFallbackAcrossSiblings(t *testing.T) {
 		t.Fatalf("marshal request: %v", err)
 	}
 
-	const upstreamCap = 64 * 1024 // forces chunk fanout
+	const upstreamCap = 128 * 1024 // forces chunk fanout while allowing historical-text chunks
 	var mu sync.Mutex
 	var requestedModels []string
 	var fallbackProbes int
@@ -2445,6 +2715,7 @@ func TestHandleCompact_MemoizesModelFallbackAcrossSiblings(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`))
 	})
+	handler.compactChunkBodyBytes = upstreamCap
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")

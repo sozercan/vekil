@@ -463,7 +463,7 @@ func (s *responsesWebSocketSession) rememberResponse(resetHistory bool, response
 }
 
 func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, request *responsesWebSocketCreateRequest, metrics responsesWebSocketRequestMetrics) responsesWebSocketRequestMetrics {
-	ctx, cancel := h.newInferenceUpstreamContext(false)
+	ctx, cancel := h.newInferenceUpstreamContext(true)
 	defer cancel()
 
 	compaction, compacted, err := s.compactHistory(h, ctx, request, false)
