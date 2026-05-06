@@ -1643,6 +1643,107 @@ func TestHandleCompact_ReturnsOriginal413WhenChunkedMergeFails(t *testing.T) {
 	}
 }
 
+func TestHandleCompact_UsesPartialSummariesWhenChunkedMerge413s(t *testing.T) {
+	largeText := strings.Repeat("a", compactUpstreamChunkBodySize*5/8)
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "first " + largeText},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "assistant",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "second " + largeText},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	var calls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+		input, ok := req["input"].([]interface{})
+		if !ok {
+			t.Fatalf("expected input array, got %#v", req["input"])
+		}
+
+		switch call := calls.Add(1); call {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request"}}`))
+		case 2:
+			if len(input) != 1 {
+				t.Fatalf("expected first fallback chunk to have 1 item, got %d", len(input))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-chunk-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary of first item"}]}]}`))
+		case 3:
+			if len(input) != 1 {
+				t.Fatalf("expected second fallback chunk to have 1 item, got %d", len(input))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-chunk-2","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary of second item"}]}]}`))
+		case 4:
+			if len(input) != 2 {
+				t.Fatalf("expected merge request to contain 2 chunk summaries, got %d", len(input))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request"}}`))
+		default:
+			t.Fatalf("unexpected /responses request count %d", call)
+		}
+	})
+	// Allow the initial request, two successful chunk requests, and the first
+	// merge attempt. If that merge 413s, the proxy should synthesize a local
+	// merged summary from the already-successful chunks instead of retrying until
+	// it ultimately replays the initial 413 to the client.
+	handler.compactMaxAttempts = 4
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 with partial-summary fallback, got %d: %s", resp.StatusCode, body)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	summary, encryptedSummary := requireCompactResponseSummaryForTest(t, body)
+	for _, want := range []string{"summary of first item", "summary of second item"} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("expected summary to contain %q, got %q", want, summary)
+		}
+		if !strings.Contains(encryptedSummary, want) {
+			t.Fatalf("expected encrypted summary to contain %q, got %q", want, encryptedSummary)
+		}
+	}
+	if calls.Load() != 4 {
+		t.Fatalf("expected initial request, chunks, and one merge attempt; got %d calls", calls.Load())
+	}
+}
+
 func TestHandleCompact_CapsOriginal413BodyWhenChunkedMergeFails(t *testing.T) {
 	largeText := strings.Repeat("a", compactUpstreamChunkBodySize*5/8)
 	reqBody, err := json.Marshal(map[string]interface{}{

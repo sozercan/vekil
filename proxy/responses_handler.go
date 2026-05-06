@@ -1113,9 +1113,37 @@ func (h *ProxyHandler) mergeCompactionSummaries(ctx context.Context, requestFiel
 	if resp != nil {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, compactUpstreamErrorBodySize))
 		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusRequestEntityTooLarge {
+			h.log.Info("using unmerged compact chunk summaries after merge 413",
+				logger.F("summaries", len(summaries)),
+				logger.F("target_body_size", targetBodySize),
+				logger.F("depth", depth),
+			)
+			return fallbackMergedCompactionSummaries(summaries), nil
+		}
 		return "", fmt.Errorf("compact summary merge returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return summary, nil
+}
+
+func fallbackMergedCompactionSummaries(summaries []string) string {
+	switch len(summaries) {
+	case 0:
+		return ""
+	case 1:
+		return summaries[0]
+	}
+
+	var b strings.Builder
+	b.WriteString("The upstream compact merge request was rejected as too large. Preserve these partial checkpoint summaries in order.\n\n")
+	for i, summary := range summaries {
+		summary = strings.TrimSpace(summary)
+		if summary == "" {
+			continue
+		}
+		_, _ = fmt.Fprintf(&b, "## Partial checkpoint summary %d of %d\n%s\n\n", i+1, len(summaries), summary)
+	}
+	return sanitizeProxySummaryText(b.String())
 }
 
 func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint string, injectResumePrompt bool) []byte {
