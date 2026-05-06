@@ -15,7 +15,7 @@ concurrency:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
     steps:
@@ -65,6 +65,12 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         run: make build
 
+      - name: Run live compaction smoke check
+        if: steps.gate.outputs.run == 'true'
+        env:
+          LIVE_COMPACT_SMOKE_DIR: ${{ runner.temp }}/live-compact-smoke
+        run: scripts/live-compact-smoke.sh
+
       - name: Install Codex CLI
         if: steps.gate.outputs.run == 'true'
         run: npm install -g @openai/codex@latest
@@ -92,7 +98,7 @@ jobs:
           LIVE_CLI_SMOKE_DIR: ${{ runner.temp }}/live-cli-smoke
         run: scripts/live-cli-smoke.sh
 
-      - name: Show proxy log on failure
+      - name: Show proxy logs on failure
         if: failure() && steps.gate.outputs.run == 'true'
         run: |
           redact() {
@@ -102,13 +108,17 @@ jobs:
               -e 's/github_pat_[A-Za-z0-9_]+/[REDACTED_GITHUB_TOKEN]/g' \
               -e 's/("access_token":"[^"]*")/"access_token":"[REDACTED]"/g' \
               -e 's/("token":"[^"]*")/"token":"[REDACTED]"/g' \
+              -e 's/("encrypted_content"[[:space:]]*:[[:space:]]*")[^"]*(")/\1[REDACTED]\2/g' \
               -e 's/(Please visit https:\/\/github\.com\/login\/device and enter code: )[A-Z0-9-]+/\1[REDACTED]/g'
           }
-          if [ -f "$RUNNER_TEMP/live-cli-smoke/proxy.log" ]; then
-            redact < "$RUNNER_TEMP/live-cli-smoke/proxy.log"
-          fi
+          for log in "$RUNNER_TEMP/live-compact-smoke/proxy.log" "$RUNNER_TEMP/live-cli-smoke/proxy.log"; do
+            if [ -f "$log" ]; then
+              echo "--- $log ---"
+              redact < "$log"
+            fi
+          done
 
-      - name: Show CLI outputs on failure
+      - name: Show smoke outputs on failure
         if: failure() && steps.gate.outputs.run == 'true'
         run: |
           redact() {
@@ -118,11 +128,19 @@ jobs:
               -e 's/github_pat_[A-Za-z0-9_]+/[REDACTED_GITHUB_TOKEN]/g' \
               -e 's/("access_token":"[^"]*")/"access_token":"[REDACTED]"/g' \
               -e 's/("token":"[^"]*")/"token":"[REDACTED]"/g' \
+              -e 's/("encrypted_content"[[:space:]]*:[[:space:]]*")[^"]*(")/\1[REDACTED]\2/g' \
               -e 's/(Please visit https:\/\/github\.com\/login\/device and enter code: )[A-Z0-9-]+/\1[REDACTED]/g'
           }
+          if [ -d "$RUNNER_TEMP/live-compact-smoke" ]; then
+            find "$RUNNER_TEMP/live-compact-smoke" -maxdepth 1 -type f \
+              \( -name '*.json' -o -name '*.txt' \) -print0 | while IFS= read -r -d '' file; do
+              echo "--- $file ---"
+              redact < "$file"
+            done
+          fi
           if [ -d "$RUNNER_TEMP/live-cli-smoke/outputs" ]; then
             find "$RUNNER_TEMP/live-cli-smoke/outputs" -maxdepth 1 -type f -print0 | while IFS= read -r -d '' file; do
-              echo "$file"
+              echo "--- $file ---"
               redact < "$file"
             done
           fi
