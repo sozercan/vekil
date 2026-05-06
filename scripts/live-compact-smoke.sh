@@ -134,7 +134,7 @@ write_compact_request() {
           content: [
             {
               type: "input_text",
-              text: "We are testing live /v1/responses/compact through the local proxy. The task is in progress: create a compact checkpoint, then replay the returned compaction item through /v1/responses. Remember the verification marker VEKIL_COMPACTION_LIVE_SMOKE."
+              text: "We are testing live /v1/responses/compact through the local proxy. The task is in progress: create a compact checkpoint, then replay the returned compaction item through /v1/responses."
             }
           ]
         },
@@ -211,16 +211,21 @@ write_replay_request() {
 }
 
 responses_output_text() {
-  jq -r '[.output[]? | select(.type == "message") | .content[]? | select(.type == "output_text" or .type == "text") | .text] | join("\n")' "$1"
+  jq -r '
+    ([.output[]? | select(.type == "message") | .content[]? | select(.type == "output_text" or .type == "text") | .text] | join("\n"))
+    | gsub("\r"; "")
+    | sub("^[[:space:]]+"; "")
+    | sub("[[:space:]]+$"; "")
+  ' "$1"
 }
 
 assert_replay_response() {
   local replay_text
   replay_text="$(responses_output_text "${REPLAY_RESPONSE_JSON}")"
 
-  if [[ "${replay_text}" != *"${REPLAY_MARKER}"* ]]; then
-    printf 'expected replay response to contain %s\n' "${REPLAY_MARKER}" >&2
-    printf 'actual replay response:\n%s\n' "${replay_text}" >&2
+  if [[ "${replay_text}" != "${REPLAY_MARKER}" ]]; then
+    printf 'expected replay response to equal %s after trimming whitespace\n' "${REPLAY_MARKER}" >&2
+    printf 'actual normalized replay response:\n%s\n' "${replay_text}" >&2
     die "compaction replay output mismatch"
   fi
 
