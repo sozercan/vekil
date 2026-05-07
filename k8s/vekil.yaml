@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
         - name: vekil
-          image: ghcr.io/sozercan/vekil:20260310-190750
+          image: ghcr.io/sozercan/vekil:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 1337
