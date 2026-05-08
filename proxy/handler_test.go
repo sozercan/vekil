@@ -1304,6 +1304,78 @@ func TestHandleCompact_UsesLearnedChunkTargetAfterPrior413(t *testing.T) {
 	}
 }
 
+func TestCompactResponsesRequestDepth_ProactiveSplitDoesNotConsumeBudgetBeforePosting(t *testing.T) {
+	const targetBodySize = 64 << 10
+
+	input := make([]json.RawMessage, 0, 8)
+	for i := 0; i < 8; i++ {
+		message, err := compactTextInputRawMessage(fmt.Sprintf("item %d: %s", i+1, strings.Repeat("x", 12<<10)))
+		if err != nil {
+			t.Fatalf("build input message: %v", err)
+		}
+		input = append(input, message)
+	}
+	inputRaw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatalf("marshal input: %v", err)
+	}
+	requestFields := map[string]json.RawMessage{
+		"model": json.RawMessage(`"gpt-5.4"`),
+		"input": inputRaw,
+	}
+
+	body, err := marshalCompactResponsesRequest(requestFields, nil)
+	if err != nil {
+		t.Fatalf("marshal compact request: %v", err)
+	}
+	if len(body) <= targetBodySize {
+		t.Fatalf("test setup expected original body %d to exceed target %d", len(body), targetBodySize)
+	}
+
+	fallbackFields, _, err := compactFallbackRequestFieldsForBodySize(requestFields, targetBodySize)
+	if err != nil {
+		t.Fatalf("build fallback fields: %v", err)
+	}
+	chunks, _, _, err := splitCompactInputAsHistoricalChunksByBodySize(fallbackFields, input, targetBodySize)
+	if err != nil {
+		t.Fatalf("split input: %v", err)
+	}
+	if len(chunks) == 0 {
+		t.Fatal("test setup expected at least one chunk")
+	}
+	expectedAttempts := len(chunks)
+	if len(chunks) > 1 {
+		expectedAttempts++
+	}
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		if len(body) > targetBodySize {
+			t.Fatalf("proactive split should avoid posting original oversized body: got %d > %d", len(body), targetBodySize)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary"}]}]}`))
+	})
+
+	budget := newCompactBudget(expectedAttempts)
+	summary, resp, err := handler.compactResponsesRequestDepth(context.Background(), requestFields, nil, 0, targetBodySize, budget, true)
+	if err != nil {
+		t.Fatalf("expected proactive split to fit exact budget: %v", err)
+	}
+	if resp != nil {
+		t.Fatalf("expected successful summary, got response status %d", resp.StatusCode)
+	}
+	if summary != "summary" {
+		t.Fatalf("expected summary, got %q", summary)
+	}
+	if budget.attempts > expectedAttempts {
+		t.Fatalf("expected at most %d budgeted attempts, got %d", expectedAttempts, budget.attempts)
+	}
+}
+
 func TestSplitCompactInputAsHistoricalChunks_FlattenPreservesOriginalItems(t *testing.T) {
 	first, err := compactTextInputRawMessage("first " + strings.Repeat("a", 4096))
 	if err != nil {

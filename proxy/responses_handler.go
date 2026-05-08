@@ -531,15 +531,6 @@ func (h *ProxyHandler) compactResponsesRequestWithBudget(ctx context.Context, re
 }
 
 func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int, targetBodySize int, budget *compactBudget, proactiveChunk bool) (string, *http.Response, error) {
-	if !budget.consume() {
-		h.log.Info("compact upstream attempt budget exhausted",
-			logger.F("attempts", budget.attempts-1),
-			logger.F("max_attempts", budget.max),
-			logger.F("depth", depth),
-		)
-		return "", nil, fmt.Errorf("compact upstream attempt budget exhausted (max=%d)", budget.max)
-	}
-
 	bodyBytes, err := marshalCompactResponsesRequest(requestFields, nil)
 	if err != nil {
 		return "", nil, err
@@ -563,6 +554,15 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 		} else {
 			h.log.Debug("learned compact chunk target pre-split failed; falling back to upstream post", logger.Err(err))
 		}
+	}
+
+	if !budget.consume() {
+		h.log.Info("compact upstream attempt budget exhausted",
+			logger.F("attempts", budget.attempts-1),
+			logger.F("max_attempts", budget.max),
+			logger.F("depth", depth),
+		)
+		return "", nil, fmt.Errorf("compact upstream attempt budget exhausted (max=%d)", budget.max)
 	}
 
 	resp, err := h.postResponsesCompactWithFallback(ctx, bodyBytes, extraHeaders, budget)
