@@ -1889,6 +1889,25 @@ func compactedResponsesAlignedPrefixLen(input []json.RawMessage, keepTail int) i
 	}
 
 	start := len(input) - keepTail
+	for {
+		aligned := compactedResponsesAdjacentTailStart(input, start)
+		aligned = compactedResponsesCallIDAlignedTailStart(input, aligned)
+		if aligned >= start {
+			start = aligned
+			break
+		}
+		start = aligned
+		if start <= 0 {
+			return 0
+		}
+	}
+	if start < 0 {
+		return 0
+	}
+	return start
+}
+
+func compactedResponsesAdjacentTailStart(input []json.RawMessage, start int) int {
 	for start > 0 && responsesInputItemIsToolLikeOutput(input[start]) {
 		start--
 	}
@@ -1901,13 +1920,59 @@ func compactedResponsesAlignedPrefixLen(input []json.RawMessage, keepTail int) i
 	return start
 }
 
+func compactedResponsesCallIDAlignedTailStart(input []json.RawMessage, start int) int {
+	if start <= 0 {
+		return 0
+	}
+
+	earliest := start
+	for outputIndex := start; outputIndex < len(input); outputIndex++ {
+		for _, id := range responsesInputItemToolLikeOutputIDs(input[outputIndex]) {
+			callIndex := compactedResponsesMatchingToolCallIndex(input, id, outputIndex)
+			if callIndex >= 0 && callIndex < earliest {
+				earliest = callIndex
+			}
+		}
+	}
+	return earliest
+}
+
+func compactedResponsesMatchingToolCallIndex(input []json.RawMessage, id string, before int) int {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return -1
+	}
+	if before > len(input) {
+		before = len(input)
+	}
+	for i := before - 1; i >= 0; i-- {
+		for _, callID := range responsesInputItemToolLikeCallIDs(input[i]) {
+			if callID == id {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 func responsesInputItemIsToolLikeCall(raw json.RawMessage) bool {
 	var item map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &item); err != nil {
 		return false
 	}
+	if responsesInputItemIsToolLikeOutput(raw) {
+		return false
+	}
 
-	switch rawJSONString(item["type"]) {
+	if responsesInputItemTypeIsToolLikeCall(rawJSONString(item["type"])) {
+		return true
+	}
+
+	return len(responsesInputItemToolLikeCallIDsFromItem(item)) > 0
+}
+
+func responsesInputItemTypeIsToolLikeCall(itemType string) bool {
+	switch itemType {
 	case "function_call",
 		"computer_call",
 		"local_shell_call",
@@ -1915,8 +1980,7 @@ func responsesInputItemIsToolLikeCall(raw json.RawMessage) bool {
 		"code_interpreter_call", "image_generation_call", "web_search_call":
 		return true
 	}
-
-	return rawJSONHasNonEmptyValue(item["call_id"]) || rawJSONHasNonEmptyValue(item["tool_call_id"])
+	return false
 }
 
 func responsesInputItemIsToolLikeOutput(raw json.RawMessage) bool {
@@ -1937,6 +2001,64 @@ func responsesInputItemIsToolLikeOutput(raw json.RawMessage) bool {
 		return true
 	}
 	return false
+}
+
+func responsesInputItemToolLikeOutputIDs(raw json.RawMessage) []string {
+	if !responsesInputItemIsToolLikeOutput(raw) {
+		return nil
+	}
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return nil
+	}
+	return responsesInputItemDirectCallIDsFromItem(item)
+}
+
+func responsesInputItemToolLikeCallIDs(raw json.RawMessage) []string {
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return nil
+	}
+	if responsesInputItemIsToolLikeOutput(raw) {
+		return nil
+	}
+	return responsesInputItemToolLikeCallIDsFromItem(item)
+}
+
+func responsesInputItemToolLikeCallIDsFromItem(item map[string]json.RawMessage) []string {
+	ids := responsesInputItemDirectCallIDsFromItem(item)
+	if responsesInputItemTypeIsToolLikeCall(rawJSONString(item["type"])) {
+		ids = appendUniqueNonEmptyID(ids, rawJSONString(item["id"]))
+	}
+
+	var toolCalls []map[string]json.RawMessage
+	if err := json.Unmarshal(item["tool_calls"], &toolCalls); err == nil {
+		for _, toolCall := range toolCalls {
+			ids = appendUniqueNonEmptyID(ids, rawJSONString(toolCall["id"]))
+		}
+	}
+
+	return ids
+}
+
+func responsesInputItemDirectCallIDsFromItem(item map[string]json.RawMessage) []string {
+	var ids []string
+	ids = appendUniqueNonEmptyID(ids, rawJSONString(item["call_id"]))
+	ids = appendUniqueNonEmptyID(ids, rawJSONString(item["tool_call_id"]))
+	return ids
+}
+
+func appendUniqueNonEmptyID(ids []string, id string) []string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ids
+	}
+	for _, existing := range ids {
+		if existing == id {
+			return ids
+		}
+	}
+	return append(ids, id)
 }
 
 func compactedResponsesRetryKeepTailSchedule(inputItems int, configuredKeepTail int) []int {
