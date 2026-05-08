@@ -99,7 +99,12 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	if resp.StatusCode != http.StatusOK {
 		defer func() { _ = resp.Body.Close() }()
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		h.log.Error("upstream error", logger.F("endpoint", "gemini"), logger.F("status", resp.StatusCode), logger.F("body", string(errBody)), logger.F("request", string(oaiBody)))
+		h.log.Error("upstream error",
+			logger.F("endpoint", "gemini"),
+			logger.F("status", resp.StatusCode),
+			logger.F("body", string(errBody)),
+			logger.F("request_bytes", len(oaiBody)),
+		)
 		writeGeminiError(w, resp.StatusCode, mapGeminiUpstreamStatus(resp.StatusCode), fmt.Sprintf("upstream error (%d)", resp.StatusCode))
 		return
 	}

@@ -210,34 +210,85 @@ func runLogout(args []string) {
 	_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
 }
 
+type serveFlags struct {
+	port                          *string
+	host                          *string
+	tokenDir                      *string
+	providersConfigPath           *string
+	logLevel                      *string
+	streamingUpstreamTimeout      *time.Duration
+	copilotEditorVersion          *string
+	copilotPluginVersion          *string
+	copilotUserAgent              *string
+	copilotIntegrationID          *string
+	copilotGitHubAPIVersion       *string
+	copilotOpenAIIntent           *string
+	responsesWSTurnStateDelta     *bool
+	responsesWSDisableAutoCompact *bool
+	responsesWSCompactMaxItems    *int
+	responsesWSCompactMaxBytes    *int
+	responsesWSCompactKeepTail    *int
+	compactUpstreamChunkBytes     *int
+	compactUpstreamMaxAttempts    *int
+}
+
+func registerServeFlags(fs *flag.FlagSet) serveFlags {
+	return serveFlags{
+		port:                          fs.String("port", getEnv("PORT", "1337"), "Listen port"),
+		host:                          fs.String("host", getEnv("HOST", "0.0.0.0"), "Listen host"),
+		tokenDir:                      fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
+		providersConfigPath:           fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
+		logLevel:                      fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
+		streamingUpstreamTimeout:      fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
+		copilotEditorVersion:          fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
+		copilotPluginVersion:          fs.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header"),
+		copilotUserAgent:              fs.String("copilot-user-agent", getEnv("COPILOT_USER_AGENT", ""), "Upstream Copilot user-agent header"),
+		copilotIntegrationID:          fs.String("copilot-integration-id", getEnv("COPILOT_INTEGRATION_ID", ""), "Upstream Copilot copilot-integration-id header"),
+		copilotGitHubAPIVersion:       fs.String("copilot-github-api-version", getEnv("COPILOT_GITHUB_API_VERSION", ""), "Upstream Copilot x-github-api-version header"),
+		copilotOpenAIIntent:           fs.String("copilot-openai-intent", getEnv("COPILOT_OPENAI_INTENT", ""), "Upstream Copilot openai-intent header"),
+		responsesWSTurnStateDelta:     fs.Bool("responses-ws-turn-state-delta", getEnvBool("RESPONSES_WS_TURN_STATE_DELTA", false), "Attempt delta-only replay when upstream returns X-Codex-Turn-State"),
+		responsesWSDisableAutoCompact: fs.Bool("responses-ws-disable-auto-compact", getEnvBool("RESPONSES_WS_DISABLE_AUTO_COMPACT", false), "Disable automatic websocket-session history compaction"),
+		responsesWSCompactMaxItems:    fs.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items"),
+		responsesWSCompactMaxBytes:    fs.Int("responses-ws-auto-compact-max-bytes", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes), "Auto-compact websocket session history after this many raw bytes"),
+		responsesWSCompactKeepTail:    fs.Int("responses-ws-auto-compact-keep-tail", getEnvInt("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail), "When auto-compacting websocket history, keep this many most recent items verbatim"),
+		compactUpstreamChunkBytes:     fs.Int("compact-upstream-chunk-bytes", getEnvInt("COMPACT_UPSTREAM_CHUNK_BYTES", proxy.DefaultCompactUpstreamChunkBytes()), "Target body size (bytes) for chunked /v1/responses/compact retries after an upstream 413; halved on each recursive 413 down to a 64 KiB floor"),
+		compactUpstreamMaxAttempts:    fs.Int("compact-upstream-max-attempts", getEnvInt("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts()), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy"),
+	}
+}
+
+func (f serveFlags) copilotHeaderConfig() proxy.CopilotHeaderConfig {
+	return proxy.CopilotHeaderConfig{
+		EditorVersion:       *f.copilotEditorVersion,
+		EditorPluginVersion: *f.copilotPluginVersion,
+		UserAgent:           *f.copilotUserAgent,
+		IntegrationID:       *f.copilotIntegrationID,
+		GitHubAPIVersion:    *f.copilotGitHubAPIVersion,
+		OpenAIIntent:        *f.copilotOpenAIIntent,
+	}
+}
+
+func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
+	return proxy.ResponsesWebSocketConfig{
+		TurnStateDelta:      *f.responsesWSTurnStateDelta,
+		DisableAutoCompact:  *f.responsesWSDisableAutoCompact,
+		AutoCompactMaxItems: *f.responsesWSCompactMaxItems,
+		AutoCompactMaxBytes: *f.responsesWSCompactMaxBytes,
+		AutoCompactKeepTail: *f.responsesWSCompactKeepTail,
+	}
+}
+
 func runServe() {
-	port := flag.String("port", getEnv("PORT", "1337"), "Listen port")
-	host := flag.String("host", getEnv("HOST", "0.0.0.0"), "Listen host")
-	tokenDir := flag.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
-	providersConfigPath := flag.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration")
-	logLevel := flag.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level")
-	streamingUpstreamTimeout := flag.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
-	copilotEditorVersion := flag.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header")
-	copilotPluginVersion := flag.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header")
-	copilotUserAgent := flag.String("copilot-user-agent", getEnv("COPILOT_USER_AGENT", ""), "Upstream Copilot user-agent header")
-	copilotGitHubAPIVersion := flag.String("copilot-github-api-version", getEnv("COPILOT_GITHUB_API_VERSION", ""), "Upstream Copilot x-github-api-version header")
-	responsesWSTurnStateDelta := flag.Bool("responses-ws-turn-state-delta", getEnvBool("RESPONSES_WS_TURN_STATE_DELTA", false), "Attempt delta-only replay when upstream returns X-Codex-Turn-State")
-	responsesWSDisableAutoCompact := flag.Bool("responses-ws-disable-auto-compact", getEnvBool("RESPONSES_WS_DISABLE_AUTO_COMPACT", false), "Disable automatic websocket-session history compaction")
-	responsesWSCompactMaxItems := flag.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items")
-	responsesWSCompactMaxBytes := flag.Int("responses-ws-auto-compact-max-bytes", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes), "Auto-compact websocket session history after this many raw bytes")
-	responsesWSCompactKeepTail := flag.Int("responses-ws-auto-compact-keep-tail", getEnvInt("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail), "When auto-compacting websocket history, keep this many most recent items verbatim")
-	compactUpstreamChunkBytes := flag.Int("compact-upstream-chunk-bytes", getEnvInt("COMPACT_UPSTREAM_CHUNK_BYTES", proxy.DefaultCompactUpstreamChunkBytes()), "Target body size (bytes) for chunked /v1/responses/compact retries after an upstream 413; halved on each recursive 413 down to a 64 KiB floor")
-	compactUpstreamMaxAttempts := flag.Int("compact-upstream-max-attempts", getEnvInt("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts()), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy")
+	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
 
-	log := logger.New(logger.ParseLevel(*logLevel))
+	log := logger.New(logger.ParseLevel(*serve.logLevel))
 
-	authenticator, err := auth.NewAuthenticator(*tokenDir)
+	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
 		log.Fatal("failed to initialize authenticator", logger.Err(err))
 	}
 
-	providersCfg, err := proxy.LoadProvidersConfigFile(*providersConfigPath)
+	providersCfg, err := proxy.LoadProvidersConfigFile(*serve.providersConfigPath)
 	if err != nil {
 		log.Fatal("failed to load providers config", logger.Err(err))
 	}
@@ -254,24 +305,13 @@ func runServe() {
 	srv, err := server.New(
 		authenticator,
 		log,
-		*host,
-		*port,
-		server.WithStreamingUpstreamTimeout(*streamingUpstreamTimeout),
-		server.WithCopilotHeaderConfig(proxy.CopilotHeaderConfig{
-			EditorVersion:       *copilotEditorVersion,
-			EditorPluginVersion: *copilotPluginVersion,
-			UserAgent:           *copilotUserAgent,
-			GitHubAPIVersion:    *copilotGitHubAPIVersion,
-		}),
-		server.WithResponsesWebSocketConfig(proxy.ResponsesWebSocketConfig{
-			TurnStateDelta:      *responsesWSTurnStateDelta,
-			DisableAutoCompact:  *responsesWSDisableAutoCompact,
-			AutoCompactMaxItems: *responsesWSCompactMaxItems,
-			AutoCompactMaxBytes: *responsesWSCompactMaxBytes,
-			AutoCompactKeepTail: *responsesWSCompactKeepTail,
-		}),
-		server.WithCompactUpstreamChunkBytes(*compactUpstreamChunkBytes),
-		server.WithCompactUpstreamMaxAttempts(*compactUpstreamMaxAttempts),
+		*serve.host,
+		*serve.port,
+		server.WithStreamingUpstreamTimeout(*serve.streamingUpstreamTimeout),
+		server.WithCopilotHeaderConfig(serve.copilotHeaderConfig()),
+		server.WithResponsesWebSocketConfig(serve.responsesWebSocketConfig()),
+		server.WithCompactUpstreamChunkBytes(*serve.compactUpstreamChunkBytes),
+		server.WithCompactUpstreamMaxAttempts(*serve.compactUpstreamMaxAttempts),
 		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
 	)
 	if err != nil {

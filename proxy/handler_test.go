@@ -3961,7 +3961,7 @@ func TestSetCopilotHeaders(t *testing.T) {
 		{"editor-plugin-version", "copilot-chat/0.26.7"},
 		{"user-agent", "GitHubCopilotChat/0.26.7"},
 		{"copilot-integration-id", "vscode-chat"},
-		{"x-github-api-version", "2025-04-01"},
+		{"x-github-api-version", "2025-05-01"},
 		{"openai-intent", "conversation-panel"},
 		{"Content-Type", "application/json"},
 	}
@@ -4007,6 +4007,330 @@ func TestSetCopilotHeadersWithConfig(t *testing.T) {
 		if got != tt.expected {
 			t.Errorf("header %q: expected %q, got %q", tt.header, tt.expected, got)
 		}
+	}
+}
+
+func TestCopilotHeaderProfilesConfigProfileForEndpointRawDoesNotApplyDefaults(t *testing.T) {
+	profiles := CopilotHeaderProfilesConfig{
+		Default: CopilotHeaderConfig{
+			UserAgent: "provider-agent",
+		},
+	}
+	base := CopilotHeaderConfig{
+		EditorVersion: "base-editor",
+	}
+
+	raw := profiles.profileForEndpointRaw("/models", base)
+	if raw.EditorVersion != "base-editor" {
+		t.Fatalf("raw EditorVersion = %q, want base-editor", raw.EditorVersion)
+	}
+	if raw.UserAgent != "provider-agent" {
+		t.Fatalf("raw UserAgent = %q, want provider-agent", raw.UserAgent)
+	}
+	if raw.OpenAIIntent != "" {
+		t.Fatalf("raw OpenAIIntent = %q, want empty", raw.OpenAIIntent)
+	}
+
+	withDefaults := profiles.profileForEndpoint("/models", base)
+	if withDefaults.OpenAIIntent != defaultCopilotOpenAIIntent {
+		t.Fatalf("defaulted OpenAIIntent = %q, want %q", withDefaults.OpenAIIntent, defaultCopilotOpenAIIntent)
+	}
+}
+
+func TestCopilotHeaderProfilesConfigProfileForEndpoint(t *testing.T) {
+	base := CopilotHeaderConfig{
+		EditorVersion:       "base-editor",
+		EditorPluginVersion: "base-plugin",
+		UserAgent:           "base-agent",
+		IntegrationID:       "base-integration",
+		GitHubAPIVersion:    "base-api",
+		OpenAIIntent:        "base-intent",
+	}
+	profiles := CopilotHeaderProfilesConfig{
+		Default: CopilotHeaderConfig{
+			UserAgent:     "provider-agent",
+			IntegrationID: "provider-integration",
+		},
+		ChatCompletions: CopilotHeaderConfig{
+			EditorVersion: "chat-editor",
+			OpenAIIntent:  "chat-intent",
+		},
+		Responses: CopilotHeaderConfig{
+			EditorVersion: "responses-editor",
+			OpenAIIntent:  "responses-intent",
+		},
+	}
+
+	tests := []struct {
+		name       string
+		endpoint   string
+		wantEditor string
+		wantIntent string
+	}{
+		{name: "chat completions profile", endpoint: "/chat/completions", wantEditor: "chat-editor", wantIntent: "chat-intent"},
+		{name: "responses profile", endpoint: "/responses", wantEditor: "responses-editor", wantIntent: "responses-intent"},
+		{name: "models use provider default profile", endpoint: "/models", wantEditor: "base-editor", wantIntent: "base-intent"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := profiles.profileForEndpoint(tt.endpoint, base)
+			if got.EditorVersion != tt.wantEditor {
+				t.Fatalf("EditorVersion = %q, want %q", got.EditorVersion, tt.wantEditor)
+			}
+			if got.OpenAIIntent != tt.wantIntent {
+				t.Fatalf("OpenAIIntent = %q, want %q", got.OpenAIIntent, tt.wantIntent)
+			}
+			if got.UserAgent != "provider-agent" {
+				t.Fatalf("UserAgent = %q, want provider-agent", got.UserAgent)
+			}
+			if got.IntegrationID != "provider-integration" {
+				t.Fatalf("IntegrationID = %q, want provider-integration", got.IntegrationID)
+			}
+			if got.EditorPluginVersion != "base-plugin" {
+				t.Fatalf("EditorPluginVersion = %q, want base-plugin", got.EditorPluginVersion)
+			}
+			if got.GitHubAPIVersion != "base-api" {
+				t.Fatalf("GitHubAPIVersion = %q, want base-api", got.GitHubAPIVersion)
+			}
+		})
+	}
+}
+
+func TestNewProviderJSONRequest_UsesConfiguredCopilotHeaderProfiles(t *testing.T) {
+	handler := &ProxyHandler{
+		auth: auth.NewTestAuthenticator("test-token"),
+		copilotHeaders: CopilotHeaderConfig{
+			EditorVersion:       "base-editor",
+			EditorPluginVersion: "base-plugin",
+			UserAgent:           "base-agent",
+			IntegrationID:       "base-integration",
+			GitHubAPIVersion:    "base-api",
+			OpenAIIntent:        "base-intent",
+		},
+	}
+	provider := &providerRuntime{
+		id:      "copilot",
+		kind:    providerTypeCopilot,
+		baseURL: "https://copilot.example.test",
+		headerProfiles: CopilotHeaderProfilesConfig{
+			Default: CopilotHeaderConfig{
+				UserAgent:     "provider-agent",
+				IntegrationID: "provider-integration",
+			},
+			ChatCompletions: CopilotHeaderConfig{
+				EditorVersion: "chat-editor",
+				OpenAIIntent:  "chat-intent",
+			},
+			Responses: CopilotHeaderConfig{
+				EditorVersion: "responses-editor",
+				OpenAIIntent:  "responses-intent",
+			},
+		},
+	}
+
+	tests := []struct {
+		path       string
+		wantEditor string
+		wantIntent string
+	}{
+		{path: "/chat/completions", wantEditor: "chat-editor", wantIntent: "chat-intent"},
+		{path: "/responses", wantEditor: "responses-editor", wantIntent: "responses-intent"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			req, err := handler.newProviderJSONRequest(context.Background(), provider, http.MethodPost, tt.path, []byte(`{"model":"gpt-test"}`), nil, "")
+			if err != nil {
+				t.Fatalf("newProviderJSONRequest() error = %v", err)
+			}
+			if got := req.Header.Get("Authorization"); got != "Bearer test-token" {
+				t.Fatalf("Authorization = %q, want bearer token", got)
+			}
+			if got := req.Header.Get("editor-version"); got != tt.wantEditor {
+				t.Fatalf("editor-version = %q, want %q", got, tt.wantEditor)
+			}
+			if got := req.Header.Get("openai-intent"); got != tt.wantIntent {
+				t.Fatalf("openai-intent = %q, want %q", got, tt.wantIntent)
+			}
+			if got := req.Header.Get("user-agent"); got != "provider-agent" {
+				t.Fatalf("user-agent = %q, want provider-agent", got)
+			}
+			if got := req.Header.Get("copilot-integration-id"); got != "provider-integration" {
+				t.Fatalf("copilot-integration-id = %q, want provider-integration", got)
+			}
+			if got := req.Header.Get("editor-plugin-version"); got != "base-plugin" {
+				t.Fatalf("editor-plugin-version = %q, want base-plugin", got)
+			}
+			if got := req.Header.Get("x-github-api-version"); got != "base-api" {
+				t.Fatalf("x-github-api-version = %q, want base-api", got)
+			}
+		})
+	}
+}
+
+func TestNewProviderJSONRequest_CopilotModelsOmitsIntentAndContentTypeByDefault(t *testing.T) {
+	handler := &ProxyHandler{
+		auth: auth.NewTestAuthenticator("test-token"),
+	}
+	provider := &providerRuntime{
+		id:      "copilot",
+		kind:    providerTypeCopilot,
+		baseURL: "https://copilot.example.test",
+	}
+
+	req, err := handler.newProviderJSONRequest(context.Background(), provider, http.MethodGet, "/models", nil, nil, "")
+	if err != nil {
+		t.Fatalf("newProviderJSONRequest() error = %v", err)
+	}
+
+	tests := []struct {
+		header   string
+		expected string
+	}{
+		{"Authorization", "Bearer test-token"},
+		{"editor-version", defaultCopilotEditorVersion},
+		{"editor-plugin-version", defaultCopilotEditorPluginVersion},
+		{"user-agent", defaultCopilotUserAgent},
+		{"copilot-integration-id", defaultCopilotIntegrationID},
+		{"x-github-api-version", defaultCopilotGitHubAPIVersion},
+	}
+	for _, tt := range tests {
+		if got := req.Header.Get(tt.header); got != tt.expected {
+			t.Fatalf("%s = %q, want %q", tt.header, got, tt.expected)
+		}
+	}
+	if got := req.Header.Get("x-request-id"); got == "" {
+		t.Fatal("x-request-id = empty, want generated UUID")
+	}
+	if got := req.Header.Get("openai-intent"); got != "" {
+		t.Fatalf("openai-intent = %q, want omitted for default /models", got)
+	}
+	if got := req.Header.Get("Content-Type"); got != "" {
+		t.Fatalf("Content-Type = %q, want omitted for GET /models", got)
+	}
+}
+
+func TestNewProviderJSONRequest_CopilotModelsKeepsExplicitIntent(t *testing.T) {
+	tests := []struct {
+		name           string
+		copilotHeaders CopilotHeaderConfig
+		headerProfiles CopilotHeaderProfilesConfig
+		wantIntent     string
+	}{
+		{
+			name: "global config",
+			copilotHeaders: CopilotHeaderConfig{
+				OpenAIIntent: "global-intent",
+			},
+			wantIntent: "global-intent",
+		},
+		{
+			name: "provider default profile",
+			headerProfiles: CopilotHeaderProfilesConfig{
+				Default: CopilotHeaderConfig{
+					OpenAIIntent: "provider-intent",
+				},
+			},
+			wantIntent: "provider-intent",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := &ProxyHandler{
+				auth:           auth.NewTestAuthenticator("test-token"),
+				copilotHeaders: tt.copilotHeaders,
+			}
+			provider := &providerRuntime{
+				id:             "copilot",
+				kind:           providerTypeCopilot,
+				baseURL:        "https://copilot.example.test",
+				headerProfiles: tt.headerProfiles,
+			}
+
+			req, err := handler.newProviderJSONRequest(context.Background(), provider, http.MethodGet, "/models", nil, nil, "")
+			if err != nil {
+				t.Fatalf("newProviderJSONRequest() error = %v", err)
+			}
+			if got := req.Header.Get("openai-intent"); got != tt.wantIntent {
+				t.Fatalf("openai-intent = %q, want %q", got, tt.wantIntent)
+			}
+			if got := req.Header.Get("Content-Type"); got != "" {
+				t.Fatalf("Content-Type = %q, want omitted for GET /models", got)
+			}
+		})
+	}
+}
+
+func TestNewProviderJSONRequest_CopilotChatAndResponsesUseDefaultIntent(t *testing.T) {
+	handler := &ProxyHandler{
+		auth: auth.NewTestAuthenticator("test-token"),
+	}
+	provider := &providerRuntime{
+		id:      "copilot",
+		kind:    providerTypeCopilot,
+		baseURL: "https://copilot.example.test",
+	}
+
+	for _, path := range []string{"/chat/completions", "/responses"} {
+		t.Run(path, func(t *testing.T) {
+			req, err := handler.newProviderJSONRequest(context.Background(), provider, http.MethodPost, path, []byte(`{"model":"gpt-test"}`), nil, "")
+			if err != nil {
+				t.Fatalf("newProviderJSONRequest() error = %v", err)
+			}
+			if got := req.Header.Get("openai-intent"); got != defaultCopilotOpenAIIntent {
+				t.Fatalf("openai-intent = %q, want %q", got, defaultCopilotOpenAIIntent)
+			}
+			if got := req.Header.Get("Content-Type"); got != "application/json" {
+				t.Fatalf("Content-Type = %q, want application/json", got)
+			}
+		})
+	}
+}
+
+func TestNewProviderJSONRequest_StripsClientCopilotHeadersForAzure(t *testing.T) {
+	handler := &ProxyHandler{}
+	provider := &providerRuntime{
+		id:      "azure",
+		kind:    providerTypeAzureOpenAI,
+		baseURL: "https://azure.example.test/openai/v1",
+		apiKey:  "azure-key",
+	}
+
+	req, err := handler.newProviderJSONRequest(
+		context.Background(),
+		provider,
+		http.MethodPost,
+		"/responses",
+		[]byte(`{"model":"gpt-test"}`),
+		http.Header{
+			"Authorization":          []string{"Bearer client-copilot-token"},
+			"editor-version":         []string{"client-editor"},
+			"editor-plugin-version":  []string{"client-plugin"},
+			"user-agent":             []string{"client-agent"},
+			"copilot-integration-id": []string{"client-integration"},
+			"x-github-api-version":   []string{"client-api"},
+			"x-request-id":           []string{"client-request-id"},
+			"openai-intent":          []string{"client-intent"},
+			"Traceparent":            []string{"00-11111111111111111111111111111111-2222222222222222-01"},
+		},
+		"",
+	)
+	if err != nil {
+		t.Fatalf("newProviderJSONRequest() error = %v", err)
+	}
+
+	for _, header := range []string{"Authorization", "editor-version", "editor-plugin-version", "user-agent", "copilot-integration-id", "x-github-api-version", "x-request-id", "openai-intent"} {
+		if got := req.Header.Get(header); got != "" {
+			t.Fatalf("%s = %q, want stripped for Azure", header, got)
+		}
+	}
+	if got := req.Header.Get("api-key"); got != "azure-key" {
+		t.Fatalf("api-key = %q, want azure-key", got)
+	}
+	if got := req.Header.Get("Traceparent"); got != "00-11111111111111111111111111111111-2222222222222222-01" {
+		t.Fatalf("Traceparent = %q, want passthrough trace header", got)
 	}
 }
 

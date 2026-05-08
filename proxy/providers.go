@@ -35,16 +35,17 @@ type ProvidersConfig struct {
 
 // ProviderConfig configures one upstream provider instance.
 type ProviderConfig struct {
-	ID            string                `json:"id" yaml:"id"`
-	Type          string                `json:"type" yaml:"type"`
-	Default       bool                  `json:"default,omitempty" yaml:"default,omitempty"`
-	IncludeModels []string              `json:"include_models,omitempty" yaml:"include_models,omitempty"`
-	ExcludeModels []string              `json:"exclude_models,omitempty" yaml:"exclude_models,omitempty"`
-	BaseURL       string                `json:"base_url,omitempty" yaml:"base_url,omitempty"`
-	APIKey        string                `json:"api_key,omitempty" yaml:"api_key,omitempty"`
-	APIKeyEnv     string                `json:"api_key_env,omitempty" yaml:"api_key_env,omitempty"`
-	APIVersion    string                `json:"api_version,omitempty" yaml:"api_version,omitempty"`
-	Models        []ProviderModelConfig `json:"models,omitempty" yaml:"models,omitempty"`
+	ID            string                      `json:"id" yaml:"id"`
+	Type          string                      `json:"type" yaml:"type"`
+	Default       bool                        `json:"default,omitempty" yaml:"default,omitempty"`
+	IncludeModels []string                    `json:"include_models,omitempty" yaml:"include_models,omitempty"`
+	ExcludeModels []string                    `json:"exclude_models,omitempty" yaml:"exclude_models,omitempty"`
+	BaseURL       string                      `json:"base_url,omitempty" yaml:"base_url,omitempty"`
+	APIKey        string                      `json:"api_key,omitempty" yaml:"api_key,omitempty"`
+	APIKeyEnv     string                      `json:"api_key_env,omitempty" yaml:"api_key_env,omitempty"`
+	APIVersion    string                      `json:"api_version,omitempty" yaml:"api_version,omitempty"`
+	Headers       CopilotHeaderProfilesConfig `json:"headers,omitempty" yaml:"headers,omitempty"`
+	Models        []ProviderModelConfig       `json:"models,omitempty" yaml:"models,omitempty"`
 }
 
 // ProviderModelConfig maps a public model ID exposed by this proxy to the
@@ -63,18 +64,19 @@ type ProviderModelConfig struct {
 }
 
 type providerRuntime struct {
-	id            string
-	kind          providerType
-	isDefault     bool
-	baseURL       string
-	apiKey        string
-	apiVersion    string
-	includeModels map[string]struct{}
-	excludeModels map[string]struct{}
-	staticModels  map[string]providerModel
-	staticConfigs map[string]ProviderModelConfig
-	staticOrder   []string
-	codexAuth     *openAICodexAuth
+	id             string
+	kind           providerType
+	isDefault      bool
+	baseURL        string
+	apiKey         string
+	apiVersion     string
+	includeModels  map[string]struct{}
+	excludeModels  map[string]struct{}
+	staticModels   map[string]providerModel
+	staticConfigs  map[string]ProviderModelConfig
+	staticOrder    []string
+	codexAuth      *openAICodexAuth
+	headerProfiles CopilotHeaderProfilesConfig
 }
 
 type providerModel struct {
@@ -476,6 +478,7 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string) (*provid
 	switch kind {
 	case providerTypeCopilot:
 		runtime.baseURL = strings.TrimRight(defaultCopilotURL, "/")
+		runtime.headerProfiles = cfg.Headers
 	case providerTypeAzureOpenAI:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 		if baseURL == "" {
@@ -877,7 +880,7 @@ func appendRawQuery(rawURL, rawQuery string) string {
 	return rawURL + separator + rawQuery
 }
 
-func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *providerRuntime) error {
+func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *providerRuntime, endpoint string) error {
 	if provider == nil {
 		return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider is required")}
 	}
@@ -888,11 +891,13 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 		if err != nil {
 			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
 		}
-		h.setCopilotHeaders(req, token)
+		h.setCopilotHeadersForProvider(req, token, provider, endpoint)
 	case providerTypeAzureOpenAI:
+		clearCopilotHeaders(req.Header)
 		req.Header.Set("api-key", provider.apiKey)
 		req.Header.Set("Content-Type", "application/json")
 	case providerTypeOpenAICodex:
+		clearCopilotHeaders(req.Header)
 		if provider.codexAuth == nil {
 			return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no OpenAI Codex auth configured", provider.id)}
 		}
@@ -932,7 +937,7 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 	if len(extraHeaders) > 0 {
 		mergeHeaderValues(req.Header, extraHeaders)
 	}
-	if err := h.applyProviderHeaders(req, provider); err != nil {
+	if err := h.applyProviderHeaders(req, provider, path); err != nil {
 		return nil, err
 	}
 	return req, nil

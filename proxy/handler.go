@@ -51,7 +51,7 @@ const (
 	defaultCopilotEditorPluginVersion = "copilot-chat/0.26.7"
 	defaultCopilotUserAgent           = "GitHubCopilotChat/0.26.7"
 	defaultCopilotIntegrationID       = "vscode-chat"
-	defaultCopilotGitHubAPIVersion    = "2025-04-01"
+	defaultCopilotGitHubAPIVersion    = "2025-05-01"
 	defaultCopilotOpenAIIntent        = "conversation-panel"
 	defaultResponsesWSCompactMaxItems = 48
 	defaultResponsesWSCompactMaxBytes = 256 << 10
@@ -99,12 +99,21 @@ func (e *requestBodyError) Unwrap() error {
 // CopilotHeaderConfig controls the synthetic editor-identifying headers sent to
 // the upstream Copilot backend. Empty fields fall back to project defaults.
 type CopilotHeaderConfig struct {
-	EditorVersion       string
-	EditorPluginVersion string
-	UserAgent           string
-	IntegrationID       string
-	GitHubAPIVersion    string
-	OpenAIIntent        string
+	EditorVersion       string `json:"editor_version,omitempty" yaml:"editor_version,omitempty"`
+	EditorPluginVersion string `json:"editor_plugin_version,omitempty" yaml:"editor_plugin_version,omitempty"`
+	UserAgent           string `json:"user_agent,omitempty" yaml:"user_agent,omitempty"`
+	IntegrationID       string `json:"copilot_integration_id,omitempty" yaml:"copilot_integration_id,omitempty"`
+	GitHubAPIVersion    string `json:"github_api_version,omitempty" yaml:"github_api_version,omitempty"`
+	OpenAIIntent        string `json:"openai_intent,omitempty" yaml:"openai_intent,omitempty"`
+}
+
+// CopilotHeaderProfilesConfig allows provider config to override Copilot header
+// profiles globally for the provider or for a specific upstream endpoint. Empty
+// fields inherit from the provider default profile and then the project defaults.
+type CopilotHeaderProfilesConfig struct {
+	Default         CopilotHeaderConfig `json:"default,omitempty" yaml:"default,omitempty"`
+	ChatCompletions CopilotHeaderConfig `json:"chat_completions,omitempty" yaml:"chat_completions,omitempty"`
+	Responses       CopilotHeaderConfig `json:"responses,omitempty" yaml:"responses,omitempty"`
 }
 
 // ResponsesWebSocketConfig controls websocket-session state management for
@@ -159,6 +168,43 @@ func (c CopilotHeaderConfig) withDefaults() CopilotHeaderConfig {
 	return c
 }
 
+func mergeCopilotHeaderConfig(base, override CopilotHeaderConfig) CopilotHeaderConfig {
+	if override.EditorVersion != "" {
+		base.EditorVersion = override.EditorVersion
+	}
+	if override.EditorPluginVersion != "" {
+		base.EditorPluginVersion = override.EditorPluginVersion
+	}
+	if override.UserAgent != "" {
+		base.UserAgent = override.UserAgent
+	}
+	if override.IntegrationID != "" {
+		base.IntegrationID = override.IntegrationID
+	}
+	if override.GitHubAPIVersion != "" {
+		base.GitHubAPIVersion = override.GitHubAPIVersion
+	}
+	if override.OpenAIIntent != "" {
+		base.OpenAIIntent = override.OpenAIIntent
+	}
+	return base
+}
+
+func (c CopilotHeaderProfilesConfig) profileForEndpointRaw(endpoint string, base CopilotHeaderConfig) CopilotHeaderConfig {
+	profile := mergeCopilotHeaderConfig(base, c.Default)
+	switch strings.TrimSpace(endpoint) {
+	case "/chat/completions":
+		profile = mergeCopilotHeaderConfig(profile, c.ChatCompletions)
+	case "/responses":
+		profile = mergeCopilotHeaderConfig(profile, c.Responses)
+	}
+	return profile
+}
+
+func (c CopilotHeaderProfilesConfig) profileForEndpoint(endpoint string, base CopilotHeaderConfig) CopilotHeaderConfig {
+	return c.profileForEndpointRaw(endpoint, base).withDefaults()
+}
+
 func (c ResponsesWebSocketConfig) withDefaults() ResponsesWebSocketConfig {
 	defaults := DefaultResponsesWebSocketConfig()
 	if c.AutoCompactMaxItems <= 0 {
@@ -202,10 +248,12 @@ type ProxyHandler struct {
 type Option func(*ProxyHandler)
 
 // WithCopilotHeaderConfig overrides the synthetic Copilot-identifying headers
-// used for upstream requests.
+// used for upstream requests. The raw override values are retained so endpoint-
+// scoped header logic can distinguish an explicitly configured OpenAI intent
+// from the built-in chat/responses default.
 func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
 	return func(h *ProxyHandler) {
-		h.copilotHeaders = cfg.withDefaults()
+		h.copilotHeaders = cfg
 	}
 }
 
@@ -291,8 +339,11 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 				TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
 			},
 		},
-		copilotURL:               "https://api.githubcopilot.com",
-		copilotHeaders:           DefaultCopilotHeaderConfig(),
+		copilotURL: "https://api.githubcopilot.com",
+		// Keep global Copilot header overrides empty by default. Header application
+		// fills built-in defaults per endpoint, and /models must not inherit the
+		// built-in openai-intent value.
+		copilotHeaders:           CopilotHeaderConfig{},
 		responsesWS:              DefaultResponsesWebSocketConfig(),
 		streamingUpstreamTimeout: streamingUpstreamTimeout,
 		log:                      log,
@@ -369,8 +420,60 @@ func setCopilotHeadersWithConfig(req *http.Request, token string, cfg CopilotHea
 	req.Header.Set("Content-Type", "application/json")
 }
 
+func clearCopilotHeaders(headers http.Header) {
+	for _, header := range []string{
+		"Authorization",
+		"editor-version",
+		"editor-plugin-version",
+		"user-agent",
+		"copilot-integration-id",
+		"x-github-api-version",
+		"x-request-id",
+		"openai-intent",
+	} {
+		headers.Del(header)
+	}
+}
+
 func (h *ProxyHandler) setCopilotHeaders(req *http.Request, token string) {
 	setCopilotHeadersWithConfig(req, token, h.copilotHeaders)
+}
+
+func copilotEndpointUsesDefaultOpenAIIntent(endpoint string) bool {
+	switch strings.TrimSpace(endpoint) {
+	case "/chat/completions", "/responses":
+		return true
+	default:
+		return false
+	}
+}
+
+func setCopilotHeadersForEndpoint(req *http.Request, token string, cfg CopilotHeaderConfig, endpoint string) {
+	explicitOpenAIIntent := cfg.OpenAIIntent != ""
+	cfg = cfg.withDefaults()
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("editor-version", cfg.EditorVersion)
+	req.Header.Set("editor-plugin-version", cfg.EditorPluginVersion)
+	req.Header.Set("user-agent", cfg.UserAgent)
+	req.Header.Set("copilot-integration-id", cfg.IntegrationID)
+	req.Header.Set("x-github-api-version", cfg.GitHubAPIVersion)
+	req.Header.Set("x-request-id", uuid.New().String())
+	if explicitOpenAIIntent || copilotEndpointUsesDefaultOpenAIIntent(endpoint) {
+		req.Header.Set("openai-intent", cfg.OpenAIIntent)
+	} else {
+		req.Header.Del("openai-intent")
+	}
+	if req.Method != http.MethodGet {
+		req.Header.Set("Content-Type", "application/json")
+	}
+}
+
+func (h *ProxyHandler) setCopilotHeadersForProvider(req *http.Request, token string, provider *providerRuntime, endpoint string) {
+	cfg := h.copilotHeaders
+	if provider != nil && provider.kind == providerTypeCopilot {
+		cfg = provider.headerProfiles.profileForEndpointRaw(endpoint, cfg)
+	}
+	setCopilotHeadersForEndpoint(req, token, cfg, endpoint)
 }
 
 var hopByHopHeaders = map[string]struct{}{
@@ -505,7 +608,7 @@ func (h *ProxyHandler) newProviderProbeRequest(ctx context.Context, provider *pr
 		if err != nil {
 			return nil, fmt.Errorf("failed to create upstream probe request: %w", err)
 		}
-		h.setCopilotHeaders(req, token)
+		h.setCopilotHeadersForProvider(req, token, provider, "/models")
 		return req, nil
 	case providerTypeAzureOpenAI:
 		fullURL, err := h.providerRequestURL(provider, "/models", "")
