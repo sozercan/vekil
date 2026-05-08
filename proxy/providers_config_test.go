@@ -249,6 +249,118 @@ func TestLoadProvidersConfigFileYAML(t *testing.T) {
 	}
 }
 
+func TestLoadProvidersConfigFileCopilotHeaderProfiles(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		ext  string
+		body string
+	}{
+		{
+			name: "json",
+			ext:  ".json",
+			body: `{
+  "providers": [
+    {
+      "id": "copilot",
+      "type": "copilot",
+      "default": true,
+      "headers": {
+        "default": {
+          "editor_version": "default-editor",
+          "copilot_integration_id": "default-integration"
+        },
+        "chat_completions": {
+          "user_agent": "chat-agent",
+          "openai_intent": "chat-intent"
+        },
+        "responses": {
+          "editor_version": "responses-editor",
+          "github_api_version": "responses-api"
+        }
+      }
+    }
+  ]
+}`,
+		},
+		{
+			name: "yaml",
+			ext:  ".yaml",
+			body: `providers:
+  - id: copilot
+    type: copilot
+    default: true
+    headers:
+      default:
+        editor_version: default-editor
+        copilot_integration_id: default-integration
+      chat_completions:
+        user_agent: chat-agent
+        openai_intent: chat-intent
+      responses:
+        editor_version: responses-editor
+        github_api_version: responses-api
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			providersPath := filepath.Join(t.TempDir(), "providers"+tt.ext)
+			if err := os.WriteFile(providersPath, []byte(tt.body), 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+
+			cfg, err := LoadProvidersConfigFile(providersPath)
+			if err != nil {
+				t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+			}
+			if len(cfg.Providers) != 1 {
+				t.Fatalf("providers count = %d, want 1", len(cfg.Providers))
+			}
+
+			headers := cfg.Providers[0].Headers
+			if headers.Default.EditorVersion != "default-editor" {
+				t.Fatalf("default editor_version = %q, want default-editor", headers.Default.EditorVersion)
+			}
+			if headers.Default.IntegrationID != "default-integration" {
+				t.Fatalf("default copilot_integration_id = %q, want default-integration", headers.Default.IntegrationID)
+			}
+			if headers.ChatCompletions.UserAgent != "chat-agent" {
+				t.Fatalf("chat user_agent = %q, want chat-agent", headers.ChatCompletions.UserAgent)
+			}
+			if headers.ChatCompletions.OpenAIIntent != "chat-intent" {
+				t.Fatalf("chat openai_intent = %q, want chat-intent", headers.ChatCompletions.OpenAIIntent)
+			}
+			if headers.Responses.EditorVersion != "responses-editor" {
+				t.Fatalf("responses editor_version = %q, want responses-editor", headers.Responses.EditorVersion)
+			}
+			if headers.Responses.GitHubAPIVersion != "responses-api" {
+				t.Fatalf("responses github_api_version = %q, want responses-api", headers.Responses.GitHubAPIVersion)
+			}
+
+			handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+			providers, _, defaultProviderID, err := handler.buildProviders(cfg)
+			if err != nil {
+				t.Fatalf("buildProviders() error = %v", err)
+			}
+			if defaultProviderID != "copilot" {
+				t.Fatalf("default provider = %q, want copilot", defaultProviderID)
+			}
+			runtime := providers["copilot"]
+			if runtime == nil {
+				t.Fatal("expected copilot runtime")
+			}
+			if runtime.headerProfiles.Responses.EditorVersion != "responses-editor" {
+				t.Fatalf("runtime responses editor_version = %q, want responses-editor", runtime.headerProfiles.Responses.EditorVersion)
+			}
+		})
+	}
+}
+
 func TestLoadProvidersConfigFileRejectsEmptyBody(t *testing.T) {
 	t.Parallel()
 

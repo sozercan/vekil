@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -116,6 +118,50 @@ func TestGetEnvWarnsOnInvalidValue(t *testing.T) {
 	want := fmt.Sprintf("warning: ignoring invalid %s=%q", envKey, "not-a-bool")
 	if !bytes.Contains([]byte(output), []byte(want)) {
 		t.Errorf("expected stderr to contain %q, got %q", want, output)
+	}
+}
+
+func parseServeFlagsForTest(t *testing.T, args ...string) serveFlags {
+	t.Helper()
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	serve := registerServeFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		t.Fatalf("parse serve flags: %v", err)
+	}
+	return serve
+}
+
+func TestServeFlagsCopilotHeaderEnvDefaults(t *testing.T) {
+	t.Setenv("COPILOT_INTEGRATION_ID", "env-integration")
+	t.Setenv("COPILOT_OPENAI_INTENT", "env-intent")
+
+	serve := parseServeFlagsForTest(t)
+	cfg := serve.copilotHeaderConfig()
+
+	if cfg.IntegrationID != "env-integration" {
+		t.Fatalf("IntegrationID = %q, want env-integration", cfg.IntegrationID)
+	}
+	if cfg.OpenAIIntent != "env-intent" {
+		t.Fatalf("OpenAIIntent = %q, want env-intent", cfg.OpenAIIntent)
+	}
+}
+
+func TestServeFlagsCopilotHeaderCLIOverridesEnv(t *testing.T) {
+	t.Setenv("COPILOT_INTEGRATION_ID", "env-integration")
+	t.Setenv("COPILOT_OPENAI_INTENT", "env-intent")
+
+	serve := parseServeFlagsForTest(t,
+		"--copilot-integration-id", "cli-integration",
+		"--copilot-openai-intent", "cli-intent",
+	)
+	cfg := serve.copilotHeaderConfig()
+
+	if cfg.IntegrationID != "cli-integration" {
+		t.Fatalf("IntegrationID = %q, want cli-integration", cfg.IntegrationID)
+	}
+	if cfg.OpenAIIntent != "cli-intent" {
+		t.Fatalf("OpenAIIntent = %q, want cli-intent", cfg.OpenAIIntent)
 	}
 }
 
