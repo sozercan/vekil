@@ -116,13 +116,18 @@ Streaming Responses requests preserve upstream headers and are otherwise passed 
 
 `GET /v1/responses` upgrades to a websocket bridge for Codex-style clients. The proxy:
 
-- accepts `response.create` frames
+- accepts `response.create` frames, including websocket-only top-level fields such as `client_metadata` and `initiator`
+- uses supported `client_metadata` values to derive request headers, then strips websocket-only metadata before forwarding upstream
 - handles warmup and incremental follow-up requests locally
 - forwards the active turn to upstream HTTP `/responses`
 - relays streamed JSON events back as websocket text frames
 
 Websocket bridge behavior:
 
+- each websocket session is serialized: one active turn is processed at a time
+- Vekil does not multiplex turns or implement Copilot-style request superseding
+- closing the websocket ends the session; once Vekil observes the disconnect, it stops relaying and closes the upstream response body
+- upstream requests use the proxy streaming timeout rather than websocket/client-disconnect cancellation
 - history is stored append-only in memory
 - long sessions are auto-compacted into one proxy-owned checkpoint plus a recent tail
 - optional turn-state delta replay can be enabled with `--responses-ws-turn-state-delta`

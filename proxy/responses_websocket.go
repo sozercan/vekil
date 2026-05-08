@@ -203,13 +203,13 @@ func prepareResponsesWebSocketRequest(raw map[string]json.RawMessage) (string, [
 	keys := make([]string, 0, len(raw))
 	for key, value := range raw {
 		switch key {
-		case "type", "input", "previous_response_id", "generate", "client_metadata":
+		case "type", "input", "previous_response_id", "generate", "client_metadata", "initiator":
 		default:
 			signatureBody[key] = value
 		}
 
 		switch key {
-		case "type", "input", "previous_response_id", "generate", "client_metadata", "stream":
+		case "type", "input", "previous_response_id", "generate", "client_metadata", "initiator", "stream":
 		default:
 			keys = append(keys, key)
 		}
