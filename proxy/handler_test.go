@@ -3902,6 +3902,27 @@ func TestCompactedResponsesAlignedPrefixLen(t *testing.T) {
 			want:     1,
 		},
 		{
+			name: "non adjacent MCP approval response preserves approval request",
+			input: []json.RawMessage{
+				msg("user", "one"),
+				raw(map[string]interface{}{
+					"type":         "mcp_approval_request",
+					"id":           "approval-1",
+					"server_label": "github",
+					"name":         "create_pull_request",
+				}),
+				msg("assistant", "thinking"),
+				raw(map[string]interface{}{
+					"type":                "mcp_approval_response",
+					"approval_request_id": "approval-1",
+					"approve":             true,
+				}),
+				msg("user", "latest"),
+			},
+			keepTail: 3,
+			want:     1,
+		},
+		{
 			name: "parallel retained outputs preserve all matching calls",
 			input: []json.RawMessage{
 				msg("user", "one"),

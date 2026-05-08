@@ -2045,6 +2045,7 @@ func responsesInputItemDirectCallIDsFromItem(item map[string]json.RawMessage) []
 	var ids []string
 	ids = appendUniqueNonEmptyID(ids, rawJSONString(item["call_id"]))
 	ids = appendUniqueNonEmptyID(ids, rawJSONString(item["tool_call_id"]))
+	ids = appendUniqueNonEmptyID(ids, rawJSONString(item["approval_request_id"]))
 	return ids
 }
 
