@@ -33,6 +33,59 @@ func TestHandleResponsesWebSocket_UpgradeRequiredWithoutUpgradeHeaders(t *testin
 	}
 }
 
+func TestResponsesWebSocketCreateRequest_IgnoresInitiatorForSignatureAndUpstream(t *testing.T) {
+	base := map[string]interface{}{
+		"type":                 "response.create",
+		"model":                "gpt-5.4",
+		"instructions":         "You are helpful",
+		"input":                []interface{}{},
+		"previous_response_id": "resp-previous",
+		"generate":             true,
+		"client_metadata": map[string]string{
+			"x-codex-turn-metadata": `{"turn_id":"turn-1"}`,
+		},
+		"initiator": "user",
+		"stream":    true,
+	}
+
+	withUserInitiator, err := json.Marshal(base)
+	if err != nil {
+		t.Fatalf("failed to marshal request: %v", err)
+	}
+	base["initiator"] = "agent"
+	withAgentInitiator, err := json.Marshal(base)
+	if err != nil {
+		t.Fatalf("failed to marshal request: %v", err)
+	}
+
+	userRequest, err := parseResponsesWebSocketCreateRequest(withUserInitiator)
+	if err != nil {
+		t.Fatalf("failed to parse user-initiated request: %v", err)
+	}
+	agentRequest, err := parseResponsesWebSocketCreateRequest(withAgentInitiator)
+	if err != nil {
+		t.Fatalf("failed to parse agent-initiated request: %v", err)
+	}
+
+	if userRequest.signature() != agentRequest.signature() {
+		t.Fatalf("expected initiator not to affect websocket request signature, got %q vs %q", userRequest.signature(), agentRequest.signature())
+	}
+
+	body, err := userRequest.upstreamBody(nil)
+	if err != nil {
+		t.Fatalf("failed to build upstream body: %v", err)
+	}
+	var upstream map[string]json.RawMessage
+	if err := json.Unmarshal(body, &upstream); err != nil {
+		t.Fatalf("failed to decode upstream body: %v", err)
+	}
+	for _, key := range []string{"initiator", "client_metadata", "previous_response_id", "generate", "type"} {
+		if _, ok := upstream[key]; ok {
+			t.Fatalf("upstream request should not include websocket field %q", key)
+		}
+	}
+}
+
 func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 	var upstreamRequests atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +119,9 @@ func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 		}
 		if _, ok := body["client_metadata"]; ok {
 			t.Fatalf("upstream request should not include websocket client metadata")
+		}
+		if _, ok := body["initiator"]; ok {
+			t.Fatalf("upstream request should not include websocket initiator field")
 		}
 		if _, ok := body["previous_response_id"]; ok {
 			t.Fatalf("upstream request should not include websocket previous_response_id")
@@ -103,6 +159,7 @@ func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 		"ws_request_header_traceparent": "00-11111111111111111111111111111111-2222222222222222-01",
 		"x-codex-turn-metadata":         `{"turn_id":"turn-1"}`,
 	}
+	request["initiator"] = "user"
 	request["service_tier"] = "auto"
 
 	if err := conn.WriteJSON(request); err != nil {

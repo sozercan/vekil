@@ -217,6 +217,7 @@ Important:
 
 - This websocket bridge is proxy-owned and still forwards upstream over HTTP `/responses`.
 - It is separate from Azure OpenAI's native `/realtime` websocket and WebRTC APIs.
+- Each websocket session is serialized: one active turn is processed at a time. Vekil does not multiplex turns or implement Copilot-style request superseding. Closing the websocket ends the session; once Vekil observes the disconnect, it stops relaying and closes the upstream response body while the upstream request context remains governed by the proxy streaming timeout.
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
