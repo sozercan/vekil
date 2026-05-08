@@ -911,7 +911,7 @@ func TestHandleCompact_UsesStreamingUpstreamTimeout(t *testing.T) {
 	assertDeadlineApprox(t, <-deadlineCh, customTimeout)
 }
 
-func TestHandleResponses_LargeBodyStillRejected(t *testing.T) {
+func TestHandleResponses_LargeBodyAllowed(t *testing.T) {
 	var upstreamHits atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		upstreamHits.Add(1)
@@ -926,17 +926,12 @@ func TestHandleResponses_LargeBodyStillRejected(t *testing.T) {
 	handler.HandleResponses(w, req)
 
 	resp := w.Result()
-	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 413, got %d: %s", resp.StatusCode, body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
 	}
-	if upstreamHits.Load() != 0 {
-		t.Fatalf("expected oversized request to be rejected before upstream call, got %d upstream hits", upstreamHits.Load())
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-	if !bytes.Contains(body, []byte("request body too large")) {
-		t.Fatalf("expected 413 body to mention oversized request, got %s", body)
+	if upstreamHits.Load() != 1 {
+		t.Fatalf("expected oversized request to be forwarded upstream once, got %d upstream hits", upstreamHits.Load())
 	}
 }
 
@@ -1244,6 +1239,140 @@ func TestHandleCompact_FallsBackToChunkedCompactionOnUpstream413(t *testing.T) {
 	}
 	if got := decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent); got != "final merged summary" {
 		t.Errorf("expected encoded final merged summary, got %q", got)
+	}
+}
+
+func TestHandleCompact_UsesLearnedChunkTargetAfterPrior413(t *testing.T) {
+	const initialTarget = 256 << 10
+	const rejectAbove = initialTarget / 2
+
+	var oversizedPosts atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		if len(body) > rejectAbove {
+			oversizedPosts.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-learned-target","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary"}]}]}`))
+	})
+	handler.compactChunkBodyBytes = initialTarget
+
+	chunkText := strings.Repeat("a", 35<<10)
+	input := make([]interface{}, 0, 4)
+	for i := 0; i < 4; i++ {
+		input = append(input, map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": fmt.Sprintf("chunk %d: %s", i+1, chunkText)},
+			},
+		})
+	}
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": input,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal compact request: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		handler.HandleCompact(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("attempt %d: expected 200, got %d: %s", i+1, resp.StatusCode, body)
+		}
+		if i == 0 && oversizedPosts.Load() != 1 {
+			t.Fatalf("expected first request to learn after one oversized post, got %d", oversizedPosts.Load())
+		}
+		if i == 1 && oversizedPosts.Load() != 1 {
+			t.Fatalf("expected second request to reuse learned target without another oversized post, got %d", oversizedPosts.Load())
+		}
+	}
+}
+
+func TestCompactResponsesRequestDepth_ProactiveSplitDoesNotConsumeBudgetBeforePosting(t *testing.T) {
+	const targetBodySize = 64 << 10
+
+	input := make([]json.RawMessage, 0, 8)
+	for i := 0; i < 8; i++ {
+		message, err := compactTextInputRawMessage(fmt.Sprintf("item %d: %s", i+1, strings.Repeat("x", 12<<10)))
+		if err != nil {
+			t.Fatalf("build input message: %v", err)
+		}
+		input = append(input, message)
+	}
+	inputRaw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatalf("marshal input: %v", err)
+	}
+	requestFields := map[string]json.RawMessage{
+		"model": json.RawMessage(`"gpt-5.4"`),
+		"input": inputRaw,
+	}
+
+	body, err := marshalCompactResponsesRequest(requestFields, nil)
+	if err != nil {
+		t.Fatalf("marshal compact request: %v", err)
+	}
+	if len(body) <= targetBodySize {
+		t.Fatalf("test setup expected original body %d to exceed target %d", len(body), targetBodySize)
+	}
+
+	fallbackFields, _, err := compactFallbackRequestFieldsForBodySize(requestFields, targetBodySize)
+	if err != nil {
+		t.Fatalf("build fallback fields: %v", err)
+	}
+	chunks, _, _, err := splitCompactInputAsHistoricalChunksByBodySize(fallbackFields, input, targetBodySize)
+	if err != nil {
+		t.Fatalf("split input: %v", err)
+	}
+	if len(chunks) == 0 {
+		t.Fatal("test setup expected at least one chunk")
+	}
+	expectedAttempts := len(chunks)
+	if len(chunks) > 1 {
+		expectedAttempts++
+	}
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		if len(body) > targetBodySize {
+			t.Fatalf("proactive split should avoid posting original oversized body: got %d > %d", len(body), targetBodySize)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary"}]}]}`))
+	})
+
+	budget := newCompactBudget(expectedAttempts)
+	summary, resp, err := handler.compactResponsesRequestDepth(context.Background(), requestFields, nil, 0, targetBodySize, budget, true)
+	if err != nil {
+		t.Fatalf("expected proactive split to fit exact budget: %v", err)
+	}
+	if resp != nil {
+		t.Fatalf("expected successful summary, got response status %d", resp.StatusCode)
+	}
+	if summary != "summary" {
+		t.Fatalf("expected summary, got %q", summary)
+	}
+	if budget.attempts > expectedAttempts {
+		t.Fatalf("expected at most %d budgeted attempts, got %d", expectedAttempts, budget.attempts)
 	}
 }
 
@@ -2315,7 +2444,7 @@ func TestCompactResponsesRequestDepth_AllowsConfiguredTargetToReachFloor(t *test
 		_, _ = w.Write([]byte(`{"id":"resp","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"floor ok"}]}]}`))
 	})
 
-	summary, resp, err := handler.compactResponsesRequestDepth(context.Background(), requestFields, nil, 9, compactUpstreamChunkBodyFloor, newCompactBudget(2))
+	summary, resp, err := handler.compactResponsesRequestDepth(context.Background(), requestFields, nil, 9, compactUpstreamChunkBodyFloor, newCompactBudget(2), false)
 	if err != nil {
 		t.Fatalf("expected high-depth floor retry to proceed: %v", err)
 	}
@@ -3313,14 +3442,43 @@ func TestHandleResponses_RetriesCompacted413Replay(t *testing.T) {
 	}
 }
 
-func TestHandleResponses_DoesNotRetry413WithoutPreviousResponseID(t *testing.T) {
-	var upstreamRequests atomic.Int32
+func TestHandleResponses_RetriesCompacted413ReplayWithoutPreviousResponseID(t *testing.T) {
+	var upstreamRequestsMu sync.Mutex
+	upstreamRequests := make([]map[string]interface{}, 0, 3)
+	var normalRequests atomic.Int32
 
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		upstreamRequests.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusRequestEntityTooLarge)
-		_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+
+		upstreamRequestsMu.Lock()
+		upstreamRequests = append(upstreamRequests, body)
+		upstreamRequestsMu.Unlock()
+
+		if instructions, _ := body["instructions"].(string); strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"comp-413","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint summary after 413 without previous id"}]}]}`))
+			return
+		}
+
+		switch normalRequests.Add(1) {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+		case 2:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-413-retried","object":"response","status":"completed"}`))
+		default:
+			t.Fatalf("unexpected normal upstream request count %d", normalRequests.Load())
+		}
 	})
 	handler.responsesWS = ResponsesWebSocketConfig{
 		DisableAutoCompact:  true,
@@ -3351,6 +3509,99 @@ func TestHandleResponses_DoesNotRetry413WithoutPreviousResponseID(t *testing.T) 
 					{"type": "input_text", "text": "second turn"},
 				},
 			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "assistant",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "second answer"},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "latest turn"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to parse retried response: %v", err)
+	}
+	if result["id"] != "resp-413-retried" {
+		t.Fatalf("expected retried response id resp-413-retried, got %v", result["id"])
+	}
+
+	upstreamRequestsMu.Lock()
+	requests := append([]map[string]interface{}(nil), upstreamRequests...)
+	upstreamRequestsMu.Unlock()
+
+	if len(requests) != 3 {
+		t.Fatalf("expected 3 upstream requests (413 + compaction + retry), got %d", len(requests))
+	}
+	if _, ok := requests[2]["previous_response_id"]; ok {
+		t.Fatalf("retried request should not invent previous_response_id, got %v", requests[2]["previous_response_id"])
+	}
+
+	compactionInput := upstreamInputItems(t, requests[1])
+	if len(compactionInput) != 3 {
+		t.Fatalf("expected compaction request to summarize only the replay prefix, got %d items", len(compactionInput))
+	}
+	if got := requireMessageTextWithRole(t, compactionInput[0], "user"); got != "first turn" {
+		t.Fatalf("expected compaction request to preserve oldest user turn, got %q", got)
+	}
+	if got := requireMessageTextWithRole(t, compactionInput[2], "user"); got != "second turn" {
+		t.Fatalf("expected compaction request to stop before kept tail, got %q", got)
+	}
+
+	retriedInput := upstreamInputItems(t, requests[2])
+	if len(retriedInput) != 3 {
+		t.Fatalf("expected retried request to include compacted checkpoint plus tail, got %d", len(retriedInput))
+	}
+	if got := requireCompactionContextMessage(t, retriedInput[0]); !strings.Contains(got, "checkpoint summary after 413 without previous id") {
+		t.Fatalf("expected retried request to start with compacted checkpoint, got %q", got)
+	}
+	if got := requireMessageTextWithRole(t, retriedInput[1], "assistant"); got != "second answer" {
+		t.Fatalf("expected retried request to keep assistant tail item, got %q", got)
+	}
+	if got := requireMessageTextWithRole(t, retriedInput[2], "user"); got != "latest turn" {
+		t.Fatalf("expected retried request to keep latest user tail item, got %q", got)
+	}
+}
+
+func TestHandleResponses_Skips413CompactionForPureUserOnlyInput(t *testing.T) {
+	var upstreamRequests atomic.Int32
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+	})
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "Here is a huge current spec"}}},
+			map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "Implement it exactly"}}},
 		},
 	})
 	if err != nil {
@@ -3369,7 +3620,7 @@ func TestHandleResponses_DoesNotRetry413WithoutPreviousResponseID(t *testing.T) 
 		t.Fatalf("expected 413, got %d: %s", resp.StatusCode, body)
 	}
 	if upstreamRequests.Load() != 1 {
-		t.Fatalf("expected no retry without previous_response_id, got %d upstream requests", upstreamRequests.Load())
+		t.Fatalf("expected pure user-only input to be sent upstream once without compaction retry, got %d requests", upstreamRequests.Load())
 	}
 
 	body, _ := io.ReadAll(resp.Body)
@@ -3378,7 +3629,302 @@ func TestHandleResponses_DoesNotRetry413WithoutPreviousResponseID(t *testing.T) 
 	}
 }
 
-func TestHandleResponses_DoesNotRetry413WithinKeepTail(t *testing.T) {
+func TestHandleResponses_ReducesKeepTailWhenCompactedReplayStill413s(t *testing.T) {
+	var upstreamRequestsMu sync.Mutex
+	upstreamRequests := make([]map[string]interface{}, 0, 5)
+	var normalRequests atomic.Int32
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+
+		upstreamRequestsMu.Lock()
+		upstreamRequests = append(upstreamRequests, body)
+		upstreamRequestsMu.Unlock()
+
+		if instructions, _ := body["instructions"].(string); strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
+			input := upstreamInputItems(t, body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"comp-dynamic-tail","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary for %d items"}]}]}`, len(input))
+			return
+		}
+
+		switch normalRequests.Add(1) {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+		case 2:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"compacted replay still too large","code":"payload_too_large"}}`))
+		case 3:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-dynamic-tail-retried","object":"response","status":"completed"}`))
+		default:
+			t.Fatalf("unexpected normal upstream request count %d", normalRequests.Load())
+		}
+	})
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "first turn"}}},
+			map[string]interface{}{"type": "message", "role": "assistant", "content": []map[string]string{{"type": "input_text", "text": "first answer"}}},
+			map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "second turn"}}},
+			map[string]interface{}{"type": "message", "role": "assistant", "content": []map[string]string{{"type": "input_text", "text": "second answer"}}},
+			map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "latest turn"}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to parse retried response: %v", err)
+	}
+	if result["id"] != "resp-dynamic-tail-retried" {
+		t.Fatalf("expected retried response id resp-dynamic-tail-retried, got %v", result["id"])
+	}
+
+	upstreamRequestsMu.Lock()
+	requests := append([]map[string]interface{}(nil), upstreamRequests...)
+	upstreamRequestsMu.Unlock()
+
+	if len(requests) != 5 {
+		t.Fatalf("expected 5 upstream requests (413 + compact + 413 + compact + retry), got %d", len(requests))
+	}
+
+	firstCompactionInput := upstreamInputItems(t, requests[1])
+	if len(firstCompactionInput) != 1 {
+		t.Fatalf("expected first compaction to summarize one item after shrinking default keep-tail 12 to 4, got %d", len(firstCompactionInput))
+	}
+	firstRetriedInput := upstreamInputItems(t, requests[2])
+	if len(firstRetriedInput) != 5 {
+		t.Fatalf("expected first retry to keep checkpoint plus 4 tail items, got %d", len(firstRetriedInput))
+	}
+	if got := requireCompactionContextMessage(t, firstRetriedInput[0]); !strings.Contains(got, "summary for 1 items") {
+		t.Fatalf("expected first retry checkpoint for 1 item, got %q", got)
+	}
+
+	secondCompactionInput := upstreamInputItems(t, requests[3])
+	if len(secondCompactionInput) != 3 {
+		t.Fatalf("expected second compaction to reduce keep-tail to 2 and summarize three items, got %d", len(secondCompactionInput))
+	}
+	secondRetriedInput := upstreamInputItems(t, requests[4])
+	if len(secondRetriedInput) != 3 {
+		t.Fatalf("expected second retry to keep checkpoint plus 2 tail items, got %d", len(secondRetriedInput))
+	}
+	if got := requireCompactionContextMessage(t, secondRetriedInput[0]); !strings.Contains(got, "summary for 3 items") {
+		t.Fatalf("expected second retry checkpoint for 3 items, got %q", got)
+	}
+	if got := requireMessageTextWithRole(t, secondRetriedInput[1], "assistant"); got != "second answer" {
+		t.Fatalf("expected reduced retry to keep assistant tail item, got %q", got)
+	}
+	if got := requireMessageTextWithRole(t, secondRetriedInput[2], "user"); got != "latest turn" {
+		t.Fatalf("expected reduced retry to keep latest user tail item, got %q", got)
+	}
+}
+
+func TestIsLikelyResponsesReplay(t *testing.T) {
+	raw := func(v interface{}) json.RawMessage {
+		t.Helper()
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("failed to marshal raw message: %v", err)
+		}
+		return b
+	}
+
+	checkpoint, err := proxyCompactionContextRawMessage("prior checkpoint")
+	if err != nil {
+		t.Fatalf("failed to build compaction context: %v", err)
+	}
+
+	tests := []struct {
+		name               string
+		input              []json.RawMessage
+		previousResponseID string
+		headers            http.Header
+		want               bool
+	}{
+		{
+			name: "previous response id",
+			input: []json.RawMessage{
+				raw(map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "continue"}}}),
+			},
+			previousResponseID: "resp-1",
+			want:               true,
+		},
+		{
+			name: "assistant message marks replay",
+			input: []json.RawMessage{
+				raw(map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "first"}}}),
+				raw(map[string]interface{}{"type": "message", "role": "assistant", "content": []map[string]string{{"type": "output_text", "text": "answer"}}}),
+			},
+			want: true,
+		},
+		{
+			name: "tool output marks replay",
+			input: []json.RawMessage{
+				raw(map[string]interface{}{"type": "function_call_output", "call_id": "call-1", "output": "done"}),
+			},
+			want: true,
+		},
+		{
+			name: "proxy compaction checkpoint marks replay",
+			input: []json.RawMessage{
+				checkpoint,
+			},
+			want: true,
+		},
+		{
+			name: "codex header marks replay",
+			input: []json.RawMessage{
+				raw(map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "continue"}}}),
+			},
+			headers: http.Header{"X-Codex-Turn-State": []string{"state"}},
+			want:    true,
+		},
+		{
+			name: "pure user-only input is not replay-like",
+			input: []json.RawMessage{
+				raw(map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "current spec"}}}),
+				raw(map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "current ask"}}}),
+			},
+			want: false,
+		},
+		{
+			name: "developer instruction alone is not replay-like",
+			input: []json.RawMessage{
+				raw(map[string]interface{}{"type": "message", "role": "developer", "content": []map[string]string{{"type": "input_text", "text": "current instruction"}}}),
+				raw(map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "current ask"}}}),
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isLikelyResponsesReplay(tt.input, tt.previousResponseID, tt.headers); got != tt.want {
+				t.Fatalf("isLikelyResponsesReplay() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCompactedResponsesAlignedPrefixLen(t *testing.T) {
+	raw := func(v interface{}) json.RawMessage {
+		t.Helper()
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("failed to marshal raw message: %v", err)
+		}
+		return b
+	}
+	msg := func(role, text string) json.RawMessage {
+		return raw(map[string]interface{}{"type": "message", "role": role, "content": []map[string]string{{"type": "input_text", "text": text}}})
+	}
+	call := raw(map[string]interface{}{"type": "function_call", "call_id": "call-1", "name": "shell", "arguments": "{}"})
+	out := raw(map[string]interface{}{"type": "function_call_output", "call_id": "call-1", "output": "done"})
+
+	tests := []struct {
+		name     string
+		input    []json.RawMessage
+		keepTail int
+		want     int
+	}{
+		{
+			name:     "normal message boundary",
+			input:    []json.RawMessage{msg("user", "one"), msg("assistant", "two"), msg("user", "three")},
+			keepTail: 1,
+			want:     2,
+		},
+		{
+			name:     "tail starting on output includes call",
+			input:    []json.RawMessage{msg("user", "one"), call, out, msg("user", "latest")},
+			keepTail: 2,
+			want:     1,
+		},
+		{
+			name:     "tail after call includes call",
+			input:    []json.RawMessage{msg("user", "one"), msg("assistant", "two"), call, msg("user", "latest")},
+			keepTail: 1,
+			want:     2,
+		},
+		{
+			name:     "tool output chain walks backward",
+			input:    []json.RawMessage{msg("user", "one"), call, out, raw(map[string]interface{}{"type": "mcp_approval_response", "call_id": "call-1"}), msg("user", "latest")},
+			keepTail: 3,
+			want:     1,
+		},
+		{
+			name:     "single item preserves latest",
+			input:    []json.RawMessage{msg("user", "latest")},
+			keepTail: 12,
+			want:     0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := compactedResponsesAlignedPrefixLen(tt.input, tt.keepTail); got != tt.want {
+				t.Fatalf("expected prefix len %d, got %d", tt.want, got)
+			}
+		})
+	}
+}
+
+func TestCompactedResponsesRetryKeepTailSchedule(t *testing.T) {
+	tests := []struct {
+		name               string
+		inputItems         int
+		configuredKeepTail int
+		want               []int
+	}{
+		{name: "default tail larger than short replay", inputItems: 5, configuredKeepTail: 12, want: []int{4, 2, 1}},
+		{name: "configured tail halves", inputItems: 50, configuredKeepTail: 12, want: []int{12, 6, 3, 1}},
+		{name: "one item cannot preserve latest and compact prefix", inputItems: 1, configuredKeepTail: 12, want: nil},
+		{name: "disabled", inputItems: 5, configuredKeepTail: 0, want: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := compactedResponsesRetryKeepTailSchedule(tt.inputItems, tt.configuredKeepTail)
+			if len(got) != len(tt.want) {
+				t.Fatalf("expected schedule %v, got %v", tt.want, got)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("expected schedule %v, got %v", tt.want, got)
+				}
+			}
+		})
+	}
+}
+
+func TestHandleResponses_ReturnsOriginal413WhenReducedTailCompactionFails(t *testing.T) {
 	var upstreamRequests atomic.Int32
 
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -3427,8 +3973,8 @@ func TestHandleResponses_DoesNotRetry413WithinKeepTail(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 413, got %d: %s", resp.StatusCode, body)
 	}
-	if upstreamRequests.Load() != 1 {
-		t.Fatalf("expected no retry when replay already fits keep-tail window, got %d upstream requests", upstreamRequests.Load())
+	if upstreamRequests.Load() <= 1 {
+		t.Fatalf("expected reduced-tail compaction attempts after initial 413, got %d upstream requests", upstreamRequests.Load())
 	}
 
 	body, _ := io.ReadAll(resp.Body)

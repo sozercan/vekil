@@ -237,11 +237,72 @@ type ProxyHandler struct {
 	streamingUpstreamTimeout time.Duration
 	compactChunkBodyBytes    int
 	compactMaxAttempts       int
+	compactLearnedTargetsMu  sync.Mutex
+	compactLearnedTargets    map[compactLearnedTargetKey]compactLearnedTarget
 	log                      *logger.Logger
 	maxRetries               int
 	retryBaseDelay           time.Duration
 	models                   modelsCache
 	geminiCounts             geminiCountTokensCache
+}
+
+type compactLearnedTargetKey struct {
+	ProviderID   string
+	ProviderKind string
+	BaseURL      string
+	Model        string
+	Endpoint     string
+}
+
+type compactLearnedTarget struct {
+	TargetBytes int
+	UpdatedAt   time.Time
+}
+
+const compactLearnedTargetTTL = 30 * time.Minute
+
+func (h *ProxyHandler) learnedCompactTarget(key compactLearnedTargetKey, configuredTarget int) (int, bool) {
+	if h == nil || configuredTarget <= 0 || key.ProviderID == "" || key.Endpoint == "" {
+		return configuredTarget, false
+	}
+
+	now := time.Now()
+	h.compactLearnedTargetsMu.Lock()
+	defer h.compactLearnedTargetsMu.Unlock()
+
+	entry, ok := h.compactLearnedTargets[key]
+	if !ok {
+		return configuredTarget, false
+	}
+	if now.Sub(entry.UpdatedAt) > compactLearnedTargetTTL {
+		delete(h.compactLearnedTargets, key)
+		return configuredTarget, false
+	}
+	if entry.TargetBytes <= 0 || entry.TargetBytes >= configuredTarget {
+		return configuredTarget, false
+	}
+	return entry.TargetBytes, true
+}
+
+func (h *ProxyHandler) recordLearnedCompactTarget(key compactLearnedTargetKey, target int) bool {
+	if h == nil || target <= 0 || key.ProviderID == "" || key.Endpoint == "" {
+		return false
+	}
+	if target < compactUpstreamChunkBodyFloor {
+		target = compactUpstreamChunkBodyFloor
+	}
+
+	h.compactLearnedTargetsMu.Lock()
+	defer h.compactLearnedTargetsMu.Unlock()
+
+	if h.compactLearnedTargets == nil {
+		h.compactLearnedTargets = make(map[compactLearnedTargetKey]compactLearnedTarget, 4)
+	}
+	if existing, ok := h.compactLearnedTargets[key]; ok && existing.TargetBytes > 0 && existing.TargetBytes <= target && time.Since(existing.UpdatedAt) <= compactLearnedTargetTTL {
+		return false
+	}
+	h.compactLearnedTargets[key] = compactLearnedTarget{TargetBytes: target, UpdatedAt: time.Now()}
+	return true
 }
 
 // Option customizes ProxyHandler behavior.
