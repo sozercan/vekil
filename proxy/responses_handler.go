@@ -43,7 +43,7 @@ func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
 // HandleResponses handles POST /v1/responses by forwarding the request to
 // Copilot's responses endpoint with only auth headers injected.
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
-	bodyBytes, err := readBody(r)
+	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
 		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
@@ -491,10 +491,46 @@ func writeCompactResponse(w http.ResponseWriter, summaryText string) {
 
 func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header) (string, *http.Response, error) {
 	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
-	return h.compactResponsesRequestDepth(ctx, requestFields, extraHeaders, 0, h.effectiveCompactChunkBodyBytes(), budget)
+	return h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget)
 }
 
-func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int, targetBodySize int, budget *compactBudget) (string, *http.Response, error) {
+func (h *ProxyHandler) learnedCompactTargetForRequest(requestFields map[string]json.RawMessage, configuredTarget int) (int, bool) {
+	key, ok := h.compactLearnedTargetKeyForRequest(requestFields, "/responses")
+	if !ok {
+		return configuredTarget, false
+	}
+	return h.learnedCompactTarget(key, configuredTarget)
+}
+
+func (h *ProxyHandler) compactLearnedTargetKeyForRequest(requestFields map[string]json.RawMessage, endpoint string) (compactLearnedTargetKey, bool) {
+	model := rawJSONString(requestFields["model"])
+	provider, owner, known := h.resolveProviderModel(model, endpoint)
+	if provider == nil {
+		return compactLearnedTargetKey{}, false
+	}
+	publicModel := strings.TrimSpace(model)
+	if known && strings.TrimSpace(owner.publicID) != "" {
+		publicModel = strings.TrimSpace(owner.publicID)
+	}
+	return compactLearnedTargetKey{
+		ProviderID:   provider.id,
+		ProviderKind: string(provider.kind),
+		BaseURL:      provider.baseURL,
+		Model:        publicModel,
+		Endpoint:     endpoint,
+	}, true
+}
+
+func (h *ProxyHandler) compactResponsesRequestWithBudget(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, budget *compactBudget) (string, *http.Response, error) {
+	targetBodySize := h.effectiveCompactChunkBodyBytes()
+	learnedTarget, learned := h.learnedCompactTargetForRequest(requestFields, targetBodySize)
+	if learned {
+		targetBodySize = learnedTarget
+	}
+	return h.compactResponsesRequestDepth(ctx, requestFields, extraHeaders, 0, targetBodySize, budget, learned)
+}
+
+func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int, targetBodySize int, budget *compactBudget, proactiveChunk bool) (string, *http.Response, error) {
 	if !budget.consume() {
 		h.log.Info("compact upstream attempt budget exhausted",
 			logger.F("attempts", budget.attempts-1),
@@ -515,6 +551,19 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 	// chunk (which would double the real upstream POST count per logical
 	// compaction call).
 	bodyBytes = applyResolvedCompactModel(bodyBytes, budget)
+
+	if proactiveChunk && targetBodySize > 0 && len(bodyBytes) > targetBodySize {
+		h.log.Debug("using learned compact chunk target before upstream post",
+			logger.F("body_bytes", len(bodyBytes)),
+			logger.F("target_body_size", targetBodySize),
+			logger.F("depth", depth),
+		)
+		if summary, err := h.compactResponsesRequestInChunks(ctx, requestFields, extraHeaders, depth+1, targetBodySize, budget); err == nil {
+			return summary, nil, nil
+		} else {
+			h.log.Debug("learned compact chunk target pre-split failed; falling back to upstream post", logger.Err(err))
+		}
+	}
 
 	resp, err := h.postResponsesCompactWithFallback(ctx, bodyBytes, extraHeaders, budget)
 	if err != nil {
@@ -578,6 +627,14 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 	// outer fanout (if any) shrink to this value before they POST and burn
 	// their own discovery 413 at the larger size.
 	budget.recordLearnedTarget(nextTarget)
+	if key, ok := h.compactLearnedTargetKeyForRequest(requestFields, "/responses"); ok && h.recordLearnedCompactTarget(key, nextTarget) {
+		h.log.Debug("recorded learned compact chunk target after 413",
+			logger.F("provider_id", key.ProviderID),
+			logger.F("model", key.Model),
+			logger.F("endpoint", key.Endpoint),
+			logger.F("target_body_size", nextTarget),
+		)
+	}
 
 	summary, err := h.compactResponsesRequestInChunks(ctx, requestFields, extraHeaders, depth+1, nextTarget, budget)
 	if err != nil {
@@ -652,6 +709,9 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 	// 413 forces re-splitting) inherit prior shrinkage instead of replanning
 	// at the original too-large size.
 	targetBodySize = budget.adjustTarget(targetBodySize)
+	if learnedTarget, learned := h.learnedCompactTargetForRequest(requestFields, targetBodySize); learned {
+		targetBodySize = learnedTarget
+	}
 
 	originalInput, err := compactInputAsRawMessages(requestFields["input"])
 	if err != nil {
@@ -718,7 +778,7 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 			return "", err
 		}
 		chunkFields := copyResponsesRequestFieldsWithInput(fallbackFields, chunkInput)
-		summary, resp, err := h.compactResponsesRequestDepth(ctx, chunkFields, extraHeaders, depth, targetBodySize, budget)
+		summary, resp, err := h.compactResponsesRequestDepth(ctx, chunkFields, extraHeaders, depth, targetBodySize, budget, false)
 		if err != nil {
 			return "", err
 		}
@@ -1281,7 +1341,7 @@ func (h *ProxyHandler) mergeCompactionSummaries(ctx context.Context, requestFiel
 	}
 
 	mergeFields := copyResponsesRequestFieldsWithInput(requestFields, input)
-	summary, resp, err := h.compactResponsesRequestDepth(ctx, mergeFields, extraHeaders, depth, targetBodySize, budget)
+	summary, resp, err := h.compactResponsesRequestDepth(ctx, mergeFields, extraHeaders, depth, targetBodySize, budget, false)
 	if err != nil {
 		return "", err
 	}
@@ -1567,56 +1627,44 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, 
 
 	var requestFields map[string]json.RawMessage
 	if err := json.Unmarshal(bodyBytes, &requestFields); err != nil {
+		h.log.Debug("responses 413 compaction skipped", logger.F("reason", "invalid_request_json"), logger.Err(err))
 		return resp, nil
 	}
 
 	var previousResponseID string
-	if err := json.Unmarshal(requestFields["previous_response_id"], &previousResponseID); err != nil || strings.TrimSpace(previousResponseID) == "" {
-		return resp, nil
-	}
+	_ = json.Unmarshal(requestFields["previous_response_id"], &previousResponseID)
+	previousResponseID = strings.TrimSpace(previousResponseID)
 
 	var model string
 	if err := json.Unmarshal(requestFields["model"], &model); err != nil || strings.TrimSpace(model) == "" {
+		h.log.Debug("responses 413 compaction skipped", logger.F("reason", "missing_model"))
 		return resp, nil
 	}
+	model = strings.TrimSpace(model)
 
 	var input []json.RawMessage
 	if err := json.Unmarshal(requestFields["input"], &input); err != nil {
+		h.log.Debug("responses 413 compaction skipped", logger.F("reason", "input_not_array"), logger.Err(err))
+		return resp, nil
+	}
+	if !isLikelyResponsesReplay(input, previousResponseID, extraHeaders) {
+		h.log.Info("responses 413 compaction skipped",
+			logger.F("reason", "not_replay_like"),
+			logger.F("input_items", len(input)),
+			logger.F("previous_response_id_present", previousResponseID != ""),
+		)
 		return resp, nil
 	}
 
-	keepTail := h.responsesWebSocketConfig().AutoCompactKeepTail
-	if keepTail <= 0 || len(input) <= keepTail {
+	configuredKeepTail := h.responsesWebSocketConfig().AutoCompactKeepTail
+	if configuredKeepTail <= 0 {
+		h.log.Debug("responses 413 compaction skipped", logger.F("reason", "keep_tail_disabled"), logger.F("keep_tail", configuredKeepTail))
 		return resp, nil
 	}
 
-	prefixLen := len(input) - keepTail
-	summary, err := h.compactResponsesInput(ctx, model, input[:prefixLen], extraHeaders)
-	if err != nil {
-		h.log.Debug("responses 413 compaction failed", logger.Err(err))
-		return resp, nil
-	}
-
-	checkpoint, err := proxyCompactionContextRawMessage(summary)
-	if err != nil {
-		h.log.Debug("responses 413 compaction checkpoint build failed", logger.Err(err))
-		return resp, nil
-	}
-
-	compactedInput := make([]json.RawMessage, 0, keepTail+1)
-	compactedInput = append(compactedInput, checkpoint)
-	compactedInput = append(compactedInput, input[prefixLen:]...)
-
-	compactedInputRaw, err := json.Marshal(compactedInput)
-	if err != nil {
-		h.log.Debug("responses 413 compaction marshal failed", logger.Err(err))
-		return resp, nil
-	}
-	requestFields["input"] = compactedInputRaw
-
-	retryBody, err := json.Marshal(requestFields)
-	if err != nil {
-		h.log.Debug("responses 413 retry body marshal failed", logger.Err(err))
+	keepTailSchedule := compactedResponsesRetryKeepTailSchedule(len(input), configuredKeepTail)
+	if len(keepTailSchedule) == 0 {
+		h.log.Debug("responses 413 compaction skipped", logger.F("reason", "not_enough_input_items"), logger.F("input_items", len(input)), logger.F("keep_tail", configuredKeepTail))
 		return resp, nil
 	}
 
@@ -1626,27 +1674,308 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, 
 		return nil, err
 	}
 	_ = resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(respBody))
+	lastResp := cloneHTTPResponseWithBody(resp, respBody)
 
-	h.log.Info("retrying responses request with compacted history after 413",
-		logger.F("model", model),
-		logger.F("previous_response_id", previousResponseID),
-		logger.F("original_items", len(input)),
-		logger.F("compacted_items", len(compactedInput)),
-		logger.F("original_bytes", rawMessagesSize(input)),
-		logger.F("compacted_bytes", rawMessagesSize(compactedInput)),
-	)
+	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
+	lastAlignedKeepTail := 0
+	for attempt, keepTail := range keepTailSchedule {
+		prefixLen := compactedResponsesAlignedPrefixLen(input, keepTail)
+		alignedKeepTail := len(input) - prefixLen
+		lastAlignedKeepTail = alignedKeepTail
+		summary, err := h.compactResponsesInputWithBudget(ctx, model, input[:prefixLen], extraHeaders, budget)
+		if err != nil {
+			h.log.Debug("responses 413 compaction failed", logger.F("keep_tail", keepTail), logger.Err(err))
+			return lastResp, nil
+		}
 
-	retryResp, retryErr := h.postResponsesWithHeaders(ctx, retryBody, extraHeaders)
-	if retryErr != nil {
-		h.log.Debug("responses 413 retry request failed", logger.Err(retryErr))
-		return resp, nil
+		checkpoint, err := proxyCompactionContextRawMessage(summary)
+		if err != nil {
+			h.log.Debug("responses 413 compaction checkpoint build failed", logger.F("keep_tail", keepTail), logger.Err(err))
+			return lastResp, nil
+		}
+
+		compactedInput := make([]json.RawMessage, 0, alignedKeepTail+1)
+		compactedInput = append(compactedInput, checkpoint)
+		compactedInput = append(compactedInput, input[prefixLen:]...)
+
+		compactedInputRaw, err := json.Marshal(compactedInput)
+		if err != nil {
+			h.log.Debug("responses 413 compaction marshal failed", logger.F("keep_tail", keepTail), logger.Err(err))
+			return lastResp, nil
+		}
+		requestFields["input"] = compactedInputRaw
+
+		retryBody, err := json.Marshal(requestFields)
+		if err != nil {
+			h.log.Debug("responses 413 retry body marshal failed", logger.F("keep_tail", keepTail), logger.Err(err))
+			return lastResp, nil
+		}
+
+		fields := []logger.Field{
+			logger.F("model", model),
+			logger.F("original_items", len(input)),
+			logger.F("compacted_items", len(compactedInput)),
+			logger.F("original_bytes", rawMessagesSize(input)),
+			logger.F("compacted_bytes", rawMessagesSize(compactedInput)),
+			logger.F("keep_tail", keepTail),
+			logger.F("aligned_keep_tail", alignedKeepTail),
+			logger.F("configured_keep_tail", configuredKeepTail),
+			logger.F("tail_attempt", attempt+1),
+			logger.F("tail_attempts", len(keepTailSchedule)),
+		}
+		if previousResponseID != "" {
+			fields = append(fields, logger.F("previous_response_id", previousResponseID))
+		} else {
+			fields = append(fields, logger.F("previous_response_id_present", false))
+		}
+		h.log.Info("retrying responses request with compacted history after 413", fields...)
+
+		retryResp, retryErr := h.postResponsesWithHeaders(ctx, retryBody, extraHeaders)
+		if retryErr != nil {
+			h.log.Debug("responses 413 retry request failed", logger.F("keep_tail", keepTail), logger.Err(retryErr))
+			return lastResp, nil
+		}
+		if retryResp.StatusCode != http.StatusRequestEntityTooLarge {
+			return retryResp, nil
+		}
+
+		retryBodyBytes, truncated, readErr := readBodyWithCap(retryResp.Body, compactUpstreamErrorBodySize)
+		_ = retryResp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		lastResp = cloneHTTPResponseWithBody(retryResp, retryBodyBytes)
+		if truncated {
+			lastResp.Header.Del("Content-Length")
+		}
+
+		if attempt+1 < len(keepTailSchedule) {
+			h.log.Debug("responses 413 retry still too large; reducing keep tail",
+				logger.F("keep_tail", keepTail),
+				logger.F("next_keep_tail", keepTailSchedule[attempt+1]),
+				logger.F("tail_attempt", attempt+1),
+				logger.F("tail_attempts", len(keepTailSchedule)),
+			)
+		}
 	}
 
-	return retryResp, nil
+	lastKeepTail := lastAlignedKeepTail
+	if lastKeepTail == 0 && len(keepTailSchedule) > 0 {
+		lastKeepTail = keepTailSchedule[len(keepTailSchedule)-1]
+	}
+	h.log.Info("responses 413 fallback exhausted",
+		logger.F("model", model),
+		logger.F("input_items", len(input)),
+		logger.F("original_bytes", rawMessagesSize(input)),
+		logger.F("configured_keep_tail", configuredKeepTail),
+		logger.F("last_keep_tail", lastKeepTail),
+		logger.F("tail_attempts", len(keepTailSchedule)),
+		logger.F("compact_attempts_used", budget.attempts),
+		logger.F("compact_attempts_max", budget.max),
+	)
+	return lastResp, nil
+}
+
+func isLikelyResponsesReplay(input []json.RawMessage, previousResponseID string, extraHeaders http.Header) bool {
+	if strings.TrimSpace(previousResponseID) != "" {
+		return true
+	}
+	if hasResponsesReplayHeader(extraHeaders) {
+		return true
+	}
+	for _, item := range input {
+		if responsesInputItemHasReplayMarker(item) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasResponsesReplayHeader(headers http.Header) bool {
+	for _, name := range []string{
+		"X-Codex-Turn-State",
+		"X-Codex-Turn-Metadata",
+		"X-Codex-Parent-Thread-Id",
+		"X-Codex-Window-Id",
+	} {
+		for _, value := range headers.Values(name) {
+			if strings.TrimSpace(value) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func responsesInputItemHasReplayMarker(raw json.RawMessage) bool {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return false
+	}
+
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return false
+	}
+
+	if responsesInputItemIsProxyCompactionContext(raw) {
+		return true
+	}
+
+	itemType := rawJSONString(item["type"])
+	switch itemType {
+	case "compaction",
+		"function_call", "function_call_output",
+		"computer_call", "computer_call_output",
+		"local_shell_call", "local_shell_call_output",
+		"mcp_call", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response",
+		"code_interpreter_call", "image_generation_call", "web_search_call",
+		"reasoning":
+		return true
+	}
+
+	if itemType == "message" {
+		switch rawJSONString(item["role"]) {
+		case "assistant", "tool":
+			return true
+		}
+	}
+
+	for _, key := range []string{"call_id", "tool_call_id", "previous_response_id"} {
+		if rawJSONHasNonEmptyValue(item[key]) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func responsesInputItemIsProxyCompactionContext(raw json.RawMessage) bool {
+	var item interface{}
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return false
+	}
+	return isProxyCompactionContextMessage(item)
+}
+
+func rawJSONString(raw json.RawMessage) string {
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+func rawJSONHasNonEmptyValue(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return false
+	}
+	var value string
+	if err := json.Unmarshal(trimmed, &value); err == nil {
+		return strings.TrimSpace(value) != ""
+	}
+	return true
+}
+
+func compactedResponsesAlignedPrefixLen(input []json.RawMessage, keepTail int) int {
+	if len(input) <= 1 {
+		return 0
+	}
+	if keepTail < 1 {
+		keepTail = 1
+	}
+	if keepTail >= len(input) {
+		keepTail = len(input) - 1
+	}
+
+	start := len(input) - keepTail
+	for start > 0 && responsesInputItemIsToolLikeOutput(input[start]) {
+		start--
+	}
+	if start > 0 && responsesInputItemIsToolLikeCall(input[start-1]) {
+		start--
+	}
+	if start < 0 {
+		return 0
+	}
+	return start
+}
+
+func responsesInputItemIsToolLikeCall(raw json.RawMessage) bool {
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return false
+	}
+
+	switch rawJSONString(item["type"]) {
+	case "function_call",
+		"computer_call",
+		"local_shell_call",
+		"mcp_call", "mcp_list_tools", "mcp_approval_request",
+		"code_interpreter_call", "image_generation_call", "web_search_call":
+		return true
+	}
+
+	return rawJSONHasNonEmptyValue(item["call_id"]) || rawJSONHasNonEmptyValue(item["tool_call_id"])
+}
+
+func responsesInputItemIsToolLikeOutput(raw json.RawMessage) bool {
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return false
+	}
+
+	if rawJSONString(item["role"]) == "tool" {
+		return true
+	}
+
+	switch rawJSONString(item["type"]) {
+	case "function_call_output",
+		"computer_call_output",
+		"local_shell_call_output",
+		"mcp_approval_response":
+		return true
+	}
+	return false
+}
+
+func compactedResponsesRetryKeepTailSchedule(inputItems int, configuredKeepTail int) []int {
+	if inputItems <= 1 || configuredKeepTail <= 0 {
+		return nil
+	}
+
+	keepTail := configuredKeepTail
+	if keepTail >= inputItems {
+		keepTail = inputItems - 1
+	}
+	if keepTail < 1 {
+		keepTail = 1
+	}
+
+	schedule := make([]int, 0, 4)
+	for {
+		schedule = append(schedule, keepTail)
+		if keepTail == 1 {
+			break
+		}
+		next := keepTail / 2
+		if next < 1 {
+			next = 1
+		}
+		if next == keepTail {
+			break
+		}
+		keepTail = next
+	}
+	return schedule
 }
 
 func (h *ProxyHandler) compactResponsesInput(ctx context.Context, model string, input []json.RawMessage, extraHeaders http.Header) (string, error) {
+	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
+	return h.compactResponsesInputWithBudget(ctx, model, input, extraHeaders, budget)
+}
+
+func (h *ProxyHandler) compactResponsesInputWithBudget(ctx context.Context, model string, input []json.RawMessage, extraHeaders http.Header, budget *compactBudget) (string, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return "", fmt.Errorf("missing model for websocket compaction")
@@ -1665,7 +1994,7 @@ func (h *ProxyHandler) compactResponsesInput(ctx context.Context, model string, 
 		"model": modelRaw,
 		"input": inputRaw,
 	}
-	summary, resp, err := h.compactResponsesRequest(ctx, requestFields, extraHeaders)
+	summary, resp, err := h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget)
 	if err != nil {
 		return "", err
 	}
