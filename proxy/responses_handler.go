@@ -1892,6 +1892,7 @@ func compactedResponsesAlignedPrefixLen(input []json.RawMessage, keepTail int) i
 	for {
 		aligned := compactedResponsesAdjacentTailStart(input, start)
 		aligned = compactedResponsesCallIDAlignedTailStart(input, aligned)
+		aligned = compactedResponsesOpenToolCallAlignedTailStart(input, aligned)
 		if aligned >= start {
 			start = aligned
 			break
@@ -1935,6 +1936,64 @@ func compactedResponsesCallIDAlignedTailStart(input []json.RawMessage, start int
 		}
 	}
 	return earliest
+}
+
+// compactedResponsesOpenToolCallAlignedTailStart keeps pending client-output
+// calls raw when no matching output has appeared yet. WebSocket sessions can
+// compact immediately after a function_call response, before the client sends
+// function_call_output on the next frame; summarizing that call would orphan the
+// future output.
+func compactedResponsesOpenToolCallAlignedTailStart(input []json.RawMessage, start int) int {
+	if start <= 0 {
+		return 0
+	}
+
+	earliest := start
+	for callIndex := 0; callIndex < start && callIndex < len(input); callIndex++ {
+		callIDs := responsesInputItemPendingOutputCallIDs(input[callIndex])
+		if len(callIDs) == 0 {
+			continue
+		}
+		if responsesInputHasToolLikeOutputForAll(input, callIDs, callIndex+1) {
+			continue
+		}
+		if callIndex < earliest {
+			earliest = callIndex
+		}
+	}
+	return earliest
+}
+
+func responsesInputHasToolLikeOutputForAll(input []json.RawMessage, ids []string, start int) bool {
+	if len(ids) == 0 {
+		return true
+	}
+	matched := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			matched[id] = false
+		}
+	}
+	if len(matched) == 0 {
+		return true
+	}
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i < len(input); i++ {
+		for _, outputID := range responsesInputItemToolLikeOutputIDs(input[i]) {
+			if _, ok := matched[outputID]; ok {
+				matched[outputID] = true
+			}
+		}
+	}
+	for _, ok := range matched {
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func compactedResponsesMatchingToolCallIndex(input []json.RawMessage, id string, before int) int {
@@ -2012,6 +2071,42 @@ func responsesInputItemToolLikeOutputIDs(raw json.RawMessage) []string {
 		return nil
 	}
 	return responsesInputItemDirectCallIDsFromItem(item)
+}
+
+// responsesInputItemPendingOutputCallIDs returns IDs for calls that must stay
+// available until a later client-provided output item resolves them. Built-in
+// Responses tool calls that do not have client output items are intentionally
+// excluded so old web/search/code-interpreter items can still be compacted.
+func responsesInputItemPendingOutputCallIDs(raw json.RawMessage) []string {
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return nil
+	}
+	if responsesInputItemIsToolLikeOutput(raw) {
+		return nil
+	}
+
+	switch rawJSONString(item["type"]) {
+	case "function_call", "computer_call", "local_shell_call":
+		ids := responsesInputItemDirectCallIDsFromItem(item)
+		if len(ids) == 0 {
+			ids = appendUniqueNonEmptyID(ids, rawJSONString(item["id"]))
+		}
+		return ids
+	case "mcp_approval_request":
+		return appendUniqueNonEmptyID(nil, rawJSONString(item["id"]))
+	}
+
+	var toolCalls []map[string]json.RawMessage
+	if err := json.Unmarshal(item["tool_calls"], &toolCalls); err == nil {
+		var ids []string
+		for _, toolCall := range toolCalls {
+			ids = appendUniqueNonEmptyID(ids, rawJSONString(toolCall["id"]))
+		}
+		return ids
+	}
+
+	return nil
 }
 
 func responsesInputItemToolLikeCallIDs(raw json.RawMessage) []string {

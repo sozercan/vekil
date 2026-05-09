@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -621,6 +622,86 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 	}
 	if got := inputTextFromMessage(t, secondTurnInput[3]); got != "second turn" {
 		t.Fatalf("expected latest user turn to be preserved, got %q", got)
+	}
+}
+
+func TestResponsesWebSocketCompactHistoryKeepsToolPairsAcrossBoundary(t *testing.T) {
+	raw := func(v interface{}) json.RawMessage {
+		t.Helper()
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("failed to marshal raw message: %v", err)
+		}
+		return b
+	}
+	msg := func(role, text string) json.RawMessage {
+		return raw(map[string]interface{}{
+			"type":    "message",
+			"role":    role,
+			"content": []map[string]string{{"type": "input_text", "text": text}},
+		})
+	}
+
+	var compactInput []map[string]interface{}
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+		compactInput = upstreamInputItems(t, body)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"comp-tool-pair","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint summary"}]}]}`)
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		AutoCompactMaxItems: 3,
+		AutoCompactMaxBytes: 1 << 20,
+		AutoCompactKeepTail: 2,
+	}
+
+	session := &responsesWebSocketSession{
+		ctx: context.Background(),
+		historyItems: []json.RawMessage{
+			msg("user", "run a command"),
+			raw(map[string]interface{}{"type": "function_call", "call_id": "call-1", "name": "shell", "arguments": "{}"}),
+			msg("assistant", "thinking between call and output"),
+			raw(map[string]interface{}{"type": "function_call_output", "call_id": "call-1", "output": "done"}),
+			msg("assistant", "command finished"),
+		},
+	}
+	request := &responsesWebSocketCreateRequest{Model: "gpt-5.4"}
+
+	_, compacted, err := session.compactHistory(handler, context.Background(), request, false)
+	if err != nil {
+		t.Fatalf("compactHistory failed: %v", err)
+	}
+	if !compacted {
+		t.Fatal("expected websocket history to compact")
+	}
+
+	if len(compactInput) != 1 {
+		t.Fatalf("expected only pre-pair history to be compacted, got %d items: %#v", len(compactInput), compactInput)
+	}
+	if got := inputTextFromMessage(t, compactInput[0]); got != "run a command" {
+		t.Fatalf("expected compacted prefix to contain first user message, got %q", got)
+	}
+
+	compactedItems := decodeRawMessagesForTest(t, session.historyItems)
+	if len(compactedItems) != 5 {
+		t.Fatalf("expected checkpoint plus intact call/output tail, got %d items: %#v", len(compactedItems), compactedItems)
+	}
+	if got := requireMessageTextWithRole(t, compactedItems[0], "developer"); !strings.Contains(got, "checkpoint summary") {
+		t.Fatalf("expected checkpoint summary in compacted history, got %q", got)
+	}
+	if compactedItems[1]["type"] != "function_call" || compactedItems[1]["call_id"] != "call-1" {
+		t.Fatalf("expected retained function_call for call-1, got %#v", compactedItems[1])
+	}
+	if compactedItems[3]["type"] != "function_call_output" || compactedItems[3]["call_id"] != "call-1" {
+		t.Fatalf("expected retained function_call_output for call-1, got %#v", compactedItems[3])
 	}
 }
 
@@ -1695,6 +1776,17 @@ func upstreamInputItems(t *testing.T, body map[string]interface{}) []map[string]
 		items[idx] = item
 	}
 	return items
+}
+
+func decodeRawMessagesForTest(t *testing.T, items []json.RawMessage) []map[string]interface{} {
+	t.Helper()
+	decoded := make([]map[string]interface{}, len(items))
+	for idx, raw := range items {
+		if err := json.Unmarshal(raw, &decoded[idx]); err != nil {
+			t.Fatalf("failed to decode raw message %d: %v", idx, err)
+		}
+	}
+	return decoded
 }
 
 func inputTextFromMessage(t *testing.T, item map[string]interface{}) string {

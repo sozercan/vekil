@@ -3938,6 +3938,17 @@ func TestCompactedResponsesAlignedPrefixLen(t *testing.T) {
 			want:     1,
 		},
 		{
+			name: "pending function call remains available for future output",
+			input: []json.RawMessage{
+				msg("user", "one"),
+				call,
+				msg("assistant", "thinking one"),
+				msg("assistant", "thinking two"),
+			},
+			keepTail: 1,
+			want:     1,
+		},
+		{
 			name: "chat-style tool output preserves assistant tool call",
 			input: []json.RawMessage{
 				msg("user", "one"),
