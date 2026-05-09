@@ -522,6 +522,14 @@ func (h *ProxyHandler) compactLearnedTargetKeyForRequest(requestFields map[strin
 }
 
 func (h *ProxyHandler) compactResponsesRequestWithBudget(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, budget *compactBudget) (string, *http.Response, error) {
+	if rewrittenFields, rewriteCount := rewriteSyntheticCompactionRequestFields(requestFields); rewriteCount > 0 {
+		requestFields = rewrittenFields
+		h.log.Debug("rewrote compaction items",
+			logger.F("endpoint", "responses/compact/internal"),
+			logger.F("count", rewriteCount),
+		)
+	}
+
 	targetBodySize := h.effectiveCompactChunkBodyBytes()
 	learnedTarget, learned := h.learnedCompactTargetForRequest(requestFields, targetBodySize)
 	if learned {

@@ -625,6 +625,82 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 	}
 }
 
+func TestResponsesWebSocketCompactHistoryRewritesPriorSyntheticCheckpoint(t *testing.T) {
+	raw := func(v interface{}) json.RawMessage {
+		t.Helper()
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("failed to marshal raw message: %v", err)
+		}
+		return b
+	}
+	msg := func(role, text string) json.RawMessage {
+		return raw(map[string]interface{}{
+			"type":    "message",
+			"role":    role,
+			"content": []map[string]string{{"type": "input_text", "text": text}},
+		})
+	}
+
+	priorSummary := "prior proxy-owned checkpoint"
+	var compactInput []map[string]interface{}
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+		compactInput = upstreamInputItems(t, body)
+		for _, item := range compactInput {
+			if item["type"] == "compaction" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = fmt.Fprint(w, `{"error":{"message":"encrypted content could not be verified","code":"invalid_request_body"}}`)
+				return
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"comp-prior-checkpoint","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"merged checkpoint summary"}]}]}`)
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		AutoCompactMaxItems: 2,
+		AutoCompactMaxBytes: 1 << 20,
+		AutoCompactKeepTail: 1,
+	}
+
+	session := &responsesWebSocketSession{
+		ctx: context.Background(),
+		historyItems: []json.RawMessage{
+			raw(map[string]interface{}{"type": "compaction", "encrypted_content": encodeSyntheticCompaction(priorSummary)}),
+			msg("user", "after checkpoint"),
+			msg("assistant", "latest answer"),
+		},
+	}
+	request := &responsesWebSocketCreateRequest{Model: "gpt-5.4"}
+
+	_, compacted, err := session.compactHistory(handler, context.Background(), request, false)
+	if err != nil {
+		t.Fatalf("compactHistory failed: %v", err)
+	}
+	if !compacted {
+		t.Fatal("expected websocket history to compact")
+	}
+
+	if len(compactInput) != 2 {
+		t.Fatalf("expected prior checkpoint plus pre-tail message in compact request, got %d items: %#v", len(compactInput), compactInput)
+	}
+	if got := requireMessageTextWithRole(t, compactInput[0], "developer"); !strings.Contains(got, priorSummary) {
+		t.Fatalf("expected prior synthetic checkpoint to be rewritten before upstream compaction, got %q", got)
+	}
+	if got := inputTextFromMessage(t, compactInput[1]); got != "after checkpoint" {
+		t.Fatalf("expected pre-tail user message to be preserved, got %q", got)
+	}
+}
+
 func TestResponsesWebSocketCompactHistoryKeepsToolPairsAcrossBoundary(t *testing.T) {
 	raw := func(v interface{}) json.RawMessage {
 		t.Helper()
