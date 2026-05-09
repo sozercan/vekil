@@ -54,6 +54,35 @@ func rewriteSyntheticCompactionRequest(body []byte) ([]byte, int) {
 	return rewrittenBody, rewriteCount
 }
 
+func rewriteSyntheticCompactionRequestFields(requestFields map[string]json.RawMessage) (map[string]json.RawMessage, int) {
+	rawInput, ok := requestFields["input"]
+	if !ok {
+		return requestFields, 0
+	}
+
+	var input interface{}
+	if err := json.Unmarshal(rawInput, &input); err != nil {
+		return requestFields, 0
+	}
+
+	rewrittenInput, rewriteCount := rewriteSyntheticCompactionValue(input)
+	if rewriteCount == 0 {
+		return requestFields, 0
+	}
+
+	encodedInput, err := json.Marshal(rewrittenInput)
+	if err != nil {
+		return requestFields, 0
+	}
+
+	rewrittenFields := make(map[string]json.RawMessage, len(requestFields))
+	for key, value := range requestFields {
+		rewrittenFields[key] = value
+	}
+	rewrittenFields["input"] = encodedInput
+	return rewrittenFields, rewriteCount
+}
+
 // When a compacted checkpoint is restored without a remaining user turn, add a
 // small synthetic user prompt so the upstream model resumes the interrupted
 // task instead of replying with a generic "what should I work on next?".

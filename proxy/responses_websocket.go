@@ -548,7 +548,7 @@ func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.
 		return result, false, nil
 	}
 
-	prefixLen := len(s.historyItems) - cfg.AutoCompactKeepTail
+	prefixLen := compactedResponsesAlignedPrefixLen(s.historyItems, cfg.AutoCompactKeepTail)
 	if prefixLen <= 0 {
 		return result, false, nil
 	}

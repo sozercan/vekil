@@ -522,6 +522,14 @@ func (h *ProxyHandler) compactLearnedTargetKeyForRequest(requestFields map[strin
 }
 
 func (h *ProxyHandler) compactResponsesRequestWithBudget(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, budget *compactBudget) (string, *http.Response, error) {
+	if rewrittenFields, rewriteCount := rewriteSyntheticCompactionRequestFields(requestFields); rewriteCount > 0 {
+		requestFields = rewrittenFields
+		h.log.Debug("rewrote compaction items",
+			logger.F("endpoint", "responses/compact/internal"),
+			logger.F("count", rewriteCount),
+		)
+	}
+
 	targetBodySize := h.effectiveCompactChunkBodyBytes()
 	learnedTarget, learned := h.learnedCompactTargetForRequest(requestFields, targetBodySize)
 	if learned {
@@ -1889,6 +1897,26 @@ func compactedResponsesAlignedPrefixLen(input []json.RawMessage, keepTail int) i
 	}
 
 	start := len(input) - keepTail
+	for {
+		aligned := compactedResponsesAdjacentTailStart(input, start)
+		aligned = compactedResponsesCallIDAlignedTailStart(input, aligned)
+		aligned = compactedResponsesOpenToolCallAlignedTailStart(input, aligned)
+		if aligned >= start {
+			start = aligned
+			break
+		}
+		start = aligned
+		if start <= 0 {
+			return 0
+		}
+	}
+	if start < 0 {
+		return 0
+	}
+	return start
+}
+
+func compactedResponsesAdjacentTailStart(input []json.RawMessage, start int) int {
 	for start > 0 && responsesInputItemIsToolLikeOutput(input[start]) {
 		start--
 	}
@@ -1901,13 +1929,105 @@ func compactedResponsesAlignedPrefixLen(input []json.RawMessage, keepTail int) i
 	return start
 }
 
+func compactedResponsesCallIDAlignedTailStart(input []json.RawMessage, start int) int {
+	if start <= 0 {
+		return 0
+	}
+
+	earliest := start
+	latestCallIndexByID := make(map[string]int)
+	for itemIndex, raw := range input {
+		if itemIndex >= start {
+			for _, id := range responsesInputItemToolLikeOutputIDs(raw) {
+				if callIndex, ok := latestCallIndexByID[id]; ok && callIndex < earliest {
+					earliest = callIndex
+				}
+			}
+		}
+
+		for _, id := range responsesInputItemToolLikeCallIDs(raw) {
+			latestCallIndexByID[id] = itemIndex
+		}
+	}
+	return earliest
+}
+
+// compactedResponsesOpenToolCallAlignedTailStart keeps pending client-output
+// calls raw when no matching output has appeared yet. WebSocket sessions can
+// compact immediately after a function_call response, before the client sends
+// function_call_output on the next frame; summarizing that call would orphan the
+// future output.
+func compactedResponsesOpenToolCallAlignedTailStart(input []json.RawMessage, start int) int {
+	if start <= 0 {
+		return 0
+	}
+
+	earliest := start
+	for callIndex := 0; callIndex < start && callIndex < len(input); callIndex++ {
+		callIDs := responsesInputItemPendingOutputCallIDs(input[callIndex])
+		if len(callIDs) == 0 {
+			continue
+		}
+		if responsesInputHasToolLikeOutputForAll(input, callIDs, callIndex+1) {
+			continue
+		}
+		if callIndex < earliest {
+			earliest = callIndex
+		}
+	}
+	return earliest
+}
+
+func responsesInputHasToolLikeOutputForAll(input []json.RawMessage, ids []string, start int) bool {
+	if len(ids) == 0 {
+		return true
+	}
+	matched := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			matched[id] = false
+		}
+	}
+	if len(matched) == 0 {
+		return true
+	}
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i < len(input); i++ {
+		for _, outputID := range responsesInputItemToolLikeOutputIDs(input[i]) {
+			if _, ok := matched[outputID]; ok {
+				matched[outputID] = true
+			}
+		}
+	}
+	for _, ok := range matched {
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func responsesInputItemIsToolLikeCall(raw json.RawMessage) bool {
 	var item map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &item); err != nil {
 		return false
 	}
+	if responsesInputItemIsToolLikeOutput(raw) {
+		return false
+	}
 
-	switch rawJSONString(item["type"]) {
+	if responsesInputItemTypeIsToolLikeCall(rawJSONString(item["type"])) {
+		return true
+	}
+
+	return len(responsesInputItemToolLikeCallIDsFromItem(item)) > 0
+}
+
+func responsesInputItemTypeIsToolLikeCall(itemType string) bool {
+	switch itemType {
 	case "function_call",
 		"computer_call",
 		"local_shell_call",
@@ -1915,8 +2035,7 @@ func responsesInputItemIsToolLikeCall(raw json.RawMessage) bool {
 		"code_interpreter_call", "image_generation_call", "web_search_call":
 		return true
 	}
-
-	return rawJSONHasNonEmptyValue(item["call_id"]) || rawJSONHasNonEmptyValue(item["tool_call_id"])
+	return false
 }
 
 func responsesInputItemIsToolLikeOutput(raw json.RawMessage) bool {
@@ -1937,6 +2056,105 @@ func responsesInputItemIsToolLikeOutput(raw json.RawMessage) bool {
 		return true
 	}
 	return false
+}
+
+func responsesInputItemToolLikeOutputIDs(raw json.RawMessage) []string {
+	if !responsesInputItemIsToolLikeOutput(raw) {
+		return nil
+	}
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return nil
+	}
+	return responsesInputItemDirectCallIDsFromItem(item)
+}
+
+// responsesInputItemPendingOutputCallIDs returns IDs for calls that must stay
+// available until a later client-provided output item resolves them. Built-in
+// Responses tool calls that do not have client output items are intentionally
+// excluded so old web/search/code-interpreter items can still be compacted.
+func responsesInputItemPendingOutputCallIDs(raw json.RawMessage) []string {
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return nil
+	}
+	if responsesInputItemIsToolLikeOutput(raw) {
+		return nil
+	}
+
+	switch rawJSONString(item["type"]) {
+	case "function_call", "computer_call", "local_shell_call":
+		ids := responsesInputItemDirectCallIDsFromItem(item)
+		if len(ids) == 0 {
+			ids = appendUniqueNonEmptyID(ids, rawJSONString(item["id"]))
+		}
+		return ids
+	case "mcp_approval_request":
+		return appendUniqueNonEmptyID(nil, rawJSONString(item["id"]))
+	}
+
+	if rawJSONHasNonEmptyValue(item["tool_calls"]) {
+		var toolCalls []map[string]json.RawMessage
+		if err := json.Unmarshal(item["tool_calls"], &toolCalls); err == nil {
+			var ids []string
+			for _, toolCall := range toolCalls {
+				ids = appendUniqueNonEmptyID(ids, rawJSONString(toolCall["id"]))
+			}
+			return ids
+		}
+	}
+
+	return nil
+}
+
+func responsesInputItemToolLikeCallIDs(raw json.RawMessage) []string {
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return nil
+	}
+	if responsesInputItemIsToolLikeOutput(raw) {
+		return nil
+	}
+	return responsesInputItemToolLikeCallIDsFromItem(item)
+}
+
+func responsesInputItemToolLikeCallIDsFromItem(item map[string]json.RawMessage) []string {
+	ids := responsesInputItemDirectCallIDsFromItem(item)
+	if responsesInputItemTypeIsToolLikeCall(rawJSONString(item["type"])) {
+		ids = appendUniqueNonEmptyID(ids, rawJSONString(item["id"]))
+	}
+
+	if rawJSONHasNonEmptyValue(item["tool_calls"]) {
+		var toolCalls []map[string]json.RawMessage
+		if err := json.Unmarshal(item["tool_calls"], &toolCalls); err == nil {
+			for _, toolCall := range toolCalls {
+				ids = appendUniqueNonEmptyID(ids, rawJSONString(toolCall["id"]))
+			}
+		}
+	}
+
+	return ids
+}
+
+func responsesInputItemDirectCallIDsFromItem(item map[string]json.RawMessage) []string {
+	var ids []string
+	ids = appendUniqueNonEmptyID(ids, rawJSONString(item["call_id"]))
+	ids = appendUniqueNonEmptyID(ids, rawJSONString(item["tool_call_id"]))
+	ids = appendUniqueNonEmptyID(ids, rawJSONString(item["approval_request_id"]))
+	return ids
+}
+
+func appendUniqueNonEmptyID(ids []string, id string) []string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ids
+	}
+	for _, existing := range ids {
+		if existing == id {
+			return ids
+		}
+	}
+	return append(ids, id)
 }
 
 func compactedResponsesRetryKeepTailSchedule(inputItems int, configuredKeepTail int) []int {
