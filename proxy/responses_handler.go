@@ -1935,12 +1935,18 @@ func compactedResponsesCallIDAlignedTailStart(input []json.RawMessage, start int
 	}
 
 	earliest := start
-	for outputIndex := start; outputIndex < len(input); outputIndex++ {
-		for _, id := range responsesInputItemToolLikeOutputIDs(input[outputIndex]) {
-			callIndex := compactedResponsesMatchingToolCallIndex(input, id, outputIndex)
-			if callIndex >= 0 && callIndex < earliest {
-				earliest = callIndex
+	latestCallIndexByID := make(map[string]int)
+	for itemIndex, raw := range input {
+		if itemIndex >= start {
+			for _, id := range responsesInputItemToolLikeOutputIDs(raw) {
+				if callIndex, ok := latestCallIndexByID[id]; ok && callIndex < earliest {
+					earliest = callIndex
+				}
 			}
+		}
+
+		for _, id := range responsesInputItemToolLikeCallIDs(raw) {
+			latestCallIndexByID[id] = itemIndex
 		}
 	}
 	return earliest
@@ -2002,24 +2008,6 @@ func responsesInputHasToolLikeOutputForAll(input []json.RawMessage, ids []string
 		}
 	}
 	return true
-}
-
-func compactedResponsesMatchingToolCallIndex(input []json.RawMessage, id string, before int) int {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return -1
-	}
-	if before > len(input) {
-		before = len(input)
-	}
-	for i := before - 1; i >= 0; i-- {
-		for _, callID := range responsesInputItemToolLikeCallIDs(input[i]) {
-			if callID == id {
-				return i
-			}
-		}
-	}
-	return -1
 }
 
 func responsesInputItemIsToolLikeCall(raw json.RawMessage) bool {
@@ -2105,13 +2093,15 @@ func responsesInputItemPendingOutputCallIDs(raw json.RawMessage) []string {
 		return appendUniqueNonEmptyID(nil, rawJSONString(item["id"]))
 	}
 
-	var toolCalls []map[string]json.RawMessage
-	if err := json.Unmarshal(item["tool_calls"], &toolCalls); err == nil {
-		var ids []string
-		for _, toolCall := range toolCalls {
-			ids = appendUniqueNonEmptyID(ids, rawJSONString(toolCall["id"]))
+	if rawJSONHasNonEmptyValue(item["tool_calls"]) {
+		var toolCalls []map[string]json.RawMessage
+		if err := json.Unmarshal(item["tool_calls"], &toolCalls); err == nil {
+			var ids []string
+			for _, toolCall := range toolCalls {
+				ids = appendUniqueNonEmptyID(ids, rawJSONString(toolCall["id"]))
+			}
+			return ids
 		}
-		return ids
 	}
 
 	return nil
@@ -2134,10 +2124,12 @@ func responsesInputItemToolLikeCallIDsFromItem(item map[string]json.RawMessage) 
 		ids = appendUniqueNonEmptyID(ids, rawJSONString(item["id"]))
 	}
 
-	var toolCalls []map[string]json.RawMessage
-	if err := json.Unmarshal(item["tool_calls"], &toolCalls); err == nil {
-		for _, toolCall := range toolCalls {
-			ids = appendUniqueNonEmptyID(ids, rawJSONString(toolCall["id"]))
+	if rawJSONHasNonEmptyValue(item["tool_calls"]) {
+		var toolCalls []map[string]json.RawMessage
+		if err := json.Unmarshal(item["tool_calls"], &toolCalls); err == nil {
+			for _, toolCall := range toolCalls {
+				ids = appendUniqueNonEmptyID(ids, rawJSONString(toolCall["id"]))
+			}
 		}
 	}
 
