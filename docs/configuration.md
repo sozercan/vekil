@@ -223,7 +223,7 @@ Important behavior:
 - The feature, `command_rewrite`, and `output_reduce` are all disabled by default.
 - Shell matching defaults to the tool name `shell_command`.
 - `tools.shell_function_calls.enabled` defaults to `true` once `tool_optimizers.enabled: true` is set, unless you explicitly set it to `false`.
-- The default and currently supported shell command argument path is `/command`; other paths are reserved for future tool shapes and will not be extracted or replaced today.
+- The shell command argument path is configurable with `tools.shell_function_calls.command_arg_path`. It defaults to `/command`, and may be any valid JSON Pointer to a string field in the function-call arguments (for example `/cmd` for an `exec_command` tool or `/shell/cmd` for nested arguments).
 - `command_rewrite.streaming_mode` defaults to `disabled`. Command rewrites are applied only when Vekil inspects non-streaming Responses response bodies; websocket/streaming paths capture command context for later output reduction but do not rewrite commands today.
 - Optimizers are fail-open. External errors, timeouts, invalid JSON, unsupported provider config, or invalid replacements are ignored and the original payload is used.
 - Command replacements must be changed, non-empty after trimming, at most `32768` bytes, and contain no NUL, carriage-return, or newline characters.
@@ -245,6 +245,7 @@ tool_optimizers:
       names:
         - shell_command
       command_arg_path: /command
+      # For tools whose command lives somewhere else, set a JSON Pointer, e.g. /cmd.
   command_rewrite:
     enabled: true
     streaming_mode: disabled

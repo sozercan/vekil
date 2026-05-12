@@ -63,8 +63,20 @@ func (o *recordingToolOptimizer) snapshotReduceRequests() []ToolOutputReduceRequ
 }
 
 func configureRecordingToolOptimizer(handler *ProxyHandler, fake *recordingToolOptimizer) {
+	configureRecordingToolOptimizerWithShellFunctionCalls(handler, fake, []string{"shell_command"}, "/command")
+}
+
+func configureRecordingToolOptimizerWithShellFunctionCalls(handler *ProxyHandler, fake *recordingToolOptimizer, names []string, commandArgPath string) {
+	enabled := true
 	cfg := ToolOptimizersConfig{
 		Enabled: true,
+		Tools: ToolOptimizerToolsConfig{
+			ShellFunctionCalls: ToolOptimizerShellFunctionCallsConfig{
+				Enabled:        &enabled,
+				Names:          names,
+				CommandArgPath: commandArgPath,
+			},
+		},
 		CommandRewrite: ToolOptimizerRewriteConfig{
 			Enabled: true,
 		},
@@ -191,6 +203,131 @@ func TestHandleResponses_ToolOptimizerRewritesCommandAndReducesOutput(t *testing
 	}
 	if reduceRequests[0].Command != "rg foo big.log" {
 		t.Fatalf("expected reduce command to use rewritten command, got %q", reduceRequests[0].Command)
+	}
+	if reduceRequests[0].Output != "large output" {
+		t.Fatalf("expected reduce request to see original output, got %q", reduceRequests[0].Output)
+	}
+}
+
+func TestHandleResponses_ToolOptimizerRewritesExecCommandCmdArgPathAndReducesOutput(t *testing.T) {
+	fake := &recordingToolOptimizer{}
+
+	var mu sync.Mutex
+	var upstreamBodies []map[string]interface{}
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body := decodeRequestBodyForToolOptimizerTest(t, r)
+		mu.Lock()
+		upstreamBodies = append(upstreamBodies, body)
+		requestNumber := len(upstreamBodies)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch requestNumber {
+		case 1:
+			writeJSONForToolOptimizerTest(t, w, map[string]interface{}{
+				"id":     "resp-codex-tool-1",
+				"object": "response",
+				"status": "completed",
+				"output": []interface{}{
+					execCommandItemForToolOptimizerTest(t, "call-codex-tool-1", "grep foo big.log"),
+				},
+			})
+		default:
+			writeJSONForToolOptimizerTest(t, w, map[string]interface{}{
+				"id":     "resp-codex-tool-2",
+				"object": "response",
+				"status": "completed",
+				"output": []interface{}{},
+			})
+		}
+	})
+	configureRecordingToolOptimizerWithShellFunctionCalls(handler, fake, []string{"exec_command"}, "/cmd")
+
+	firstResp := postResponsesForToolOptimizerTest(t, handler, `{
+		"model": "gpt-4",
+		"input": "run a command",
+		"stream": false
+	}`)
+	defer firstResp.Body.Close()
+
+	if firstResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(firstResp.Body)
+		t.Fatalf("expected first response status 200, got %d: %s", firstResp.StatusCode, body)
+	}
+
+	firstPayload := decodeJSONBodyForToolOptimizerTest(t, firstResp.Body)
+	firstOutput := outputItemsForToolOptimizerTest(t, firstPayload)
+	if len(firstOutput) != 1 {
+		t.Fatalf("expected 1 first output item, got %d", len(firstOutput))
+	}
+	if gotName := firstOutput[0]["name"]; gotName != "exec_command" {
+		t.Fatalf("expected exec_command tool name, got %v", gotName)
+	}
+	if gotCommand := commandFromItemAtPathForToolOptimizerTest(t, firstOutput[0], "/cmd"); gotCommand != "rg foo big.log" {
+		t.Fatalf("expected rewritten /cmd command, got %q", gotCommand)
+	}
+	assertCommandArgumentAbsentForToolOptimizerTest(t, firstOutput[0])
+
+	secondResp := postResponsesForToolOptimizerTest(t, handler, `{
+		"model": "gpt-4",
+		"input": [
+			{
+				"type": "function_call_output",
+				"call_id": "call-codex-tool-1",
+				"output": "large output"
+			}
+		],
+		"stream": false
+	}`)
+	defer secondResp.Body.Close()
+
+	if secondResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(secondResp.Body)
+		t.Fatalf("expected second response status 200, got %d: %s", secondResp.StatusCode, body)
+	}
+
+	mu.Lock()
+	if len(upstreamBodies) != 2 {
+		t.Fatalf("expected 2 upstream requests, got %d", len(upstreamBodies))
+	}
+	secondUpstreamBody := upstreamBodies[1]
+	mu.Unlock()
+
+	items := upstreamInputItems(t, secondUpstreamBody)
+	foundReducedOutput := false
+	for _, item := range items {
+		if item["type"] == "function_call_output" && item["call_id"] == "call-codex-tool-1" {
+			foundReducedOutput = true
+			if got := item["output"]; got != "reduced output" {
+				t.Fatalf("expected reduced tool output upstream, got %v", got)
+			}
+		}
+	}
+	if !foundReducedOutput {
+		t.Fatalf("expected second upstream request to contain function_call_output")
+	}
+
+	rewriteRequests := fake.snapshotRewriteRequests()
+	if len(rewriteRequests) != 1 {
+		t.Fatalf("expected 1 rewrite request, got %d", len(rewriteRequests))
+	}
+	if rewriteRequests[0].ToolName != "exec_command" {
+		t.Fatalf("expected rewrite tool name exec_command, got %q", rewriteRequests[0].ToolName)
+	}
+	if rewriteRequests[0].Command != "grep foo big.log" {
+		t.Fatalf("expected rewrite command to see original /cmd command, got %q", rewriteRequests[0].Command)
+	}
+
+	reduceRequests := fake.snapshotReduceRequests()
+	if len(reduceRequests) != 1 {
+		t.Fatalf("expected 1 reduce request, got %d", len(reduceRequests))
+	}
+	if reduceRequests[0].ToolName != "exec_command" {
+		t.Fatalf("expected reduce tool name exec_command, got %q", reduceRequests[0].ToolName)
+	}
+	if reduceRequests[0].Command != "rg foo big.log" {
+		t.Fatalf("expected reduce command to use rewritten /cmd command, got %q", reduceRequests[0].Command)
 	}
 	if reduceRequests[0].Output != "large output" {
 		t.Fatalf("expected reduce request to see original output, got %q", reduceRequests[0].Output)
@@ -425,6 +562,158 @@ func TestHandleResponsesWebSocket_ToolOptimizerReducesOutputWithoutRewritingStre
 	var foundOutput bool
 	for _, item := range items {
 		if item["type"] == "function_call_output" && item["call_id"] == "call-tool-1" {
+			foundOutput = true
+			if got := item["output"]; got != "reduced output" {
+				t.Fatalf("expected reduced websocket tool output upstream, got %v", got)
+			}
+		}
+	}
+	if !foundOutput {
+		t.Fatalf("expected second upstream websocket request to contain function_call_output")
+	}
+}
+
+func TestHandleResponsesWebSocket_ToolOptimizerCapturesExecCommandCmdArgPathAndReducesOutput(t *testing.T) {
+	fake := &recordingToolOptimizer{}
+
+	var mu sync.Mutex
+	var upstreamBodies []map[string]interface{}
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body := decodeRequestBodyForToolOptimizerTest(t, r)
+		mu.Lock()
+		upstreamBodies = append(upstreamBodies, body)
+		requestNumber := len(upstreamBodies)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch requestNumber {
+		case 1:
+			writeResponsesSSEForToolOptimizerTest(t, w, "response.created", map[string]interface{}{
+				"type":     "response.created",
+				"response": map[string]interface{}{"id": "resp-ws-codex-tool-1"},
+			})
+			writeResponsesSSEForToolOptimizerTest(t, w, "response.output_item.done", map[string]interface{}{
+				"type": "response.output_item.done",
+				"item": execCommandItemForToolOptimizerTest(t, "call-ws-codex-tool-1", "grep foo big.log"),
+			})
+			writeResponsesSSEForToolOptimizerTest(t, w, "response.completed", map[string]interface{}{
+				"type": "response.completed",
+				"response": map[string]interface{}{
+					"id":    "resp-ws-codex-tool-1",
+					"usage": zeroResponsesUsage(),
+				},
+			})
+		default:
+			writeResponsesSSEForToolOptimizerTest(t, w, "response.created", map[string]interface{}{
+				"type":     "response.created",
+				"response": map[string]interface{}{"id": "resp-ws-codex-tool-2"},
+			})
+			writeResponsesSSEForToolOptimizerTest(t, w, "response.completed", map[string]interface{}{
+				"type": "response.completed",
+				"response": map[string]interface{}{
+					"id":    "resp-ws-codex-tool-2",
+					"usage": zeroResponsesUsage(),
+				},
+			})
+		}
+	})
+	configureRecordingToolOptimizerWithShellFunctionCalls(handler, fake, []string{"exec_command"}, "/cmd")
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	headers := http.Header{}
+	headers.Set("session_id", "sess-tool-ws-codex-1")
+	conn := mustDialResponsesWebSocket(t, server, headers)
+	defer func() { _ = conn.Close() }()
+
+	firstRequest := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "run command"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(firstRequest); err != nil {
+		t.Fatalf("failed to write first websocket request: %v", err)
+	}
+
+	created := mustReadWebSocketJSON(t, conn)
+	if created["type"] != "response.created" {
+		t.Fatalf("expected response.created, got %v", created["type"])
+	}
+	responseID := websocketResponseID(t, created)
+
+	output := mustReadWebSocketJSON(t, conn)
+	if output["type"] != "response.output_item.done" {
+		t.Fatalf("expected response.output_item.done, got %v", output["type"])
+	}
+	outputItem, ok := output["item"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected output item object, got %T", output["item"])
+	}
+	if gotName := outputItem["name"]; gotName != "exec_command" {
+		t.Fatalf("expected exec_command tool name, got %v", gotName)
+	}
+	if got := commandFromItemAtPathForToolOptimizerTest(t, outputItem, "/cmd"); got != "grep foo big.log" {
+		t.Fatalf("expected streamed /cmd command to remain original, got %q", got)
+	}
+	assertCommandArgumentAbsentForToolOptimizerTest(t, outputItem)
+
+	completed := mustReadWebSocketJSON(t, conn)
+	if completed["type"] != "response.completed" {
+		t.Fatalf("expected response.completed, got %v", completed["type"])
+	}
+
+	secondRequest := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type":    "function_call_output",
+			"call_id": "call-ws-codex-tool-1",
+			"output":  "large output",
+		},
+	})
+	secondRequest["previous_response_id"] = responseID
+
+	if err := conn.WriteJSON(secondRequest); err != nil {
+		t.Fatalf("failed to write second websocket request: %v", err)
+	}
+
+	secondCreated := mustReadWebSocketJSON(t, conn)
+	if secondCreated["type"] != "response.created" {
+		t.Fatalf("expected second response.created, got %v", secondCreated["type"])
+	}
+	secondCompleted := mustReadWebSocketJSON(t, conn)
+	if secondCompleted["type"] != "response.completed" {
+		t.Fatalf("expected second response.completed, got %v", secondCompleted["type"])
+	}
+
+	if rewriteRequests := fake.snapshotRewriteRequests(); len(rewriteRequests) != 0 {
+		t.Fatalf("expected no rewrite request for streamed websocket command, got %d", len(rewriteRequests))
+	}
+
+	reduceRequests := fake.snapshotReduceRequests()
+	if len(reduceRequests) != 1 {
+		t.Fatalf("expected 1 reduce request, got %d", len(reduceRequests))
+	}
+	if reduceRequests[0].ToolName != "exec_command" {
+		t.Fatalf("expected reduce tool name exec_command, got %q", reduceRequests[0].ToolName)
+	}
+	if reduceRequests[0].Command != "grep foo big.log" {
+		t.Fatalf("expected reduce request to use original streamed /cmd command, got %q", reduceRequests[0].Command)
+	}
+
+	mu.Lock()
+	if len(upstreamBodies) != 2 {
+		t.Fatalf("expected 2 upstream requests, got %d", len(upstreamBodies))
+	}
+	secondUpstreamBody := upstreamBodies[1]
+	mu.Unlock()
+
+	items := upstreamInputItems(t, secondUpstreamBody)
+	var foundOutput bool
+	for _, item := range items {
+		if item["type"] == "function_call_output" && item["call_id"] == "call-ws-codex-tool-1" {
 			foundOutput = true
 			if got := item["output"]; got != "reduced output" {
 				t.Fatalf("expected reduced websocket tool output upstream, got %v", got)
@@ -685,15 +974,25 @@ func writeResponsesSSEForToolOptimizerTest(t *testing.T, w io.Writer, event stri
 
 func shellCommandItemForToolOptimizerTest(t *testing.T, callID, command string) map[string]interface{} {
 	t.Helper()
+	return commandItemForToolOptimizerTest(t, "shell_command", callID, map[string]interface{}{"command": command})
+}
 
-	args, err := json.Marshal(map[string]string{"command": command})
+func execCommandItemForToolOptimizerTest(t *testing.T, callID, command string) map[string]interface{} {
+	t.Helper()
+	return commandItemForToolOptimizerTest(t, "exec_command", callID, map[string]interface{}{"cmd": command})
+}
+
+func commandItemForToolOptimizerTest(t *testing.T, toolName, callID string, arguments map[string]interface{}) map[string]interface{} {
+	t.Helper()
+
+	args, err := json.Marshal(arguments)
 	if err != nil {
 		t.Fatalf("failed to encode shell arguments: %v", err)
 	}
 
 	return map[string]interface{}{
 		"type":      "function_call",
-		"name":      "shell_command",
+		"name":      toolName,
 		"call_id":   callID,
 		"arguments": string(args),
 	}
@@ -720,6 +1019,26 @@ func outputItemsForToolOptimizerTest(t *testing.T, payload map[string]interface{
 
 func shellCommandFromItemForToolOptimizerTest(t *testing.T, item map[string]interface{}) string {
 	t.Helper()
+	return commandFromItemAtPathForToolOptimizerTest(t, item, "/command")
+}
+
+func commandFromItemAtPathForToolOptimizerTest(t *testing.T, item map[string]interface{}, path string) string {
+	t.Helper()
+
+	rawArgs, ok := item["arguments"].(string)
+	if !ok {
+		t.Fatalf("expected string arguments, got %T", item["arguments"])
+	}
+
+	command, ok := extractStringArgumentAtPath(rawArgs, path)
+	if !ok {
+		t.Fatalf("expected command string at %s in arguments %q", path, rawArgs)
+	}
+	return command
+}
+
+func assertCommandArgumentAbsentForToolOptimizerTest(t *testing.T, item map[string]interface{}) {
+	t.Helper()
 
 	rawArgs, ok := item["arguments"].(string)
 	if !ok {
@@ -730,10 +1049,7 @@ func shellCommandFromItemForToolOptimizerTest(t *testing.T, item map[string]inte
 	if err := json.Unmarshal([]byte(rawArgs), &args); err != nil {
 		t.Fatalf("failed to decode shell arguments %q: %v", rawArgs, err)
 	}
-
-	command, ok := args["command"].(string)
-	if !ok {
-		t.Fatalf("expected command string, got %T", args["command"])
+	if _, ok := args["command"]; ok {
+		t.Fatalf("expected Codex-style arguments to avoid legacy command key, got %q", rawArgs)
 	}
-	return command
 }

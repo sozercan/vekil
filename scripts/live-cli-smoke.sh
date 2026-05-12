@@ -26,6 +26,9 @@ PROXY_BASE_URL="http://${PROXY_HOST}:${PROXY_PORT}"
 START_PROXY="${START_PROXY:-1}"
 TMP_PARENT="${LIVE_CLI_SMOKE_TMP_PARENT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
 SMOKE_DIR="${LIVE_CLI_SMOKE_DIR:-$(mktemp -d "${TMP_PARENT%/}/live-cli-smoke.XXXXXX")}"
+if [[ "${SMOKE_DIR}" != /* ]]; then
+  SMOKE_DIR="${PWD}/${SMOKE_DIR}"
+fi
 PROXY_LOG="${SMOKE_DIR}/proxy.log"
 MODELS_JSON="${SMOKE_DIR}/models.json"
 PROMPT="Read left.txt and right.txt in the current directory and reply with exactly the two file contents joined by a vertical bar, with no spaces, no markdown, no commentary, and no extra text. Output only the final string."

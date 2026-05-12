@@ -107,11 +107,11 @@ func (h *ProxyHandler) maybeRewriteOrCaptureOpenAIChatToolCommands(ctx context.C
 		message := &resp.Choices[choiceIdx].Message
 		for callIdx := range message.ToolCalls {
 			call := &message.ToolCalls[callIdx]
-			if !manager.MatchShellToolName(call.Function.Name) || strings.TrimSpace(call.ID) == "" || manager.ShellCommandArgPath() != "/command" {
+			if !manager.MatchShellToolName(call.Function.Name) || strings.TrimSpace(call.ID) == "" {
 				continue
 			}
 
-			originalCommand, ok := extractCommandFromArguments(call.Function.Arguments)
+			originalCommand, ok := extractStringArgumentAtPath(call.Function.Arguments, manager.ShellCommandArgPath())
 			if !ok {
 				continue
 			}
@@ -125,7 +125,7 @@ func (h *ProxyHandler) maybeRewriteOrCaptureOpenAIChatToolCommands(ctx context.C
 					Command:  originalCommand,
 				})
 				if result.Changed {
-					newArguments, ok := replaceCommandInArguments(call.Function.Arguments, strings.TrimSpace(result.Command))
+					newArguments, ok := replaceStringArgumentAtPath(call.Function.Arguments, manager.ShellCommandArgPath(), strings.TrimSpace(result.Command))
 					if ok {
 						call.Function.Arguments = newArguments
 						rewrittenCommand = strings.TrimSpace(result.Command)
@@ -155,25 +155,6 @@ func (h *ProxyHandler) maybeRewriteOrCaptureOpenAIChatToolCommands(ctx context.C
 		}
 	}
 	return changedCount
-}
-
-func replaceCommandInArguments(argumentsJSON, replacement string) (string, bool) {
-	var args map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(argumentsJSON), &args); err != nil {
-		return argumentsJSON, false
-	}
-
-	replacementBytes, err := json.Marshal(replacement)
-	if err != nil {
-		return argumentsJSON, false
-	}
-	args["command"] = replacementBytes
-
-	newArguments, err := json.Marshal(args)
-	if err != nil {
-		return argumentsJSON, false
-	}
-	return string(newArguments), true
 }
 
 func (h *ProxyHandler) rewriteOpenAIChatRequestBodyWithToolOptimizers(ctx context.Context, bodyBytes []byte, store *ToolExecutionContextStore, scope string) []byte {
