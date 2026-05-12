@@ -209,6 +209,154 @@ Routing rules:
 
 Use the examples above as a starting point for your local providers config file. JSON and YAML use the same snake_case field names.
 
+## Tool Optimizers
+
+`tool_optimizers` is an optional top-level block in the JSON/YAML providers config, alongside `providers`. It is disabled by default, and leaving it unset preserves the normal passthrough behavior.
+
+Tool optimizers only apply to `/v1/responses` flows, including the proxy-owned `GET /v1/responses` websocket bridge. They currently target shell-style function calls and can run two independent stages:
+
+- `command_rewrite` rewrites matching shell function-call commands in non-streaming Responses responses before returning them to the client.
+- `output_reduce` reduces captured `function_call_output` payloads in later Responses requests after Vekil has seen the matching tool call in the same request/session scope.
+
+Important behavior:
+
+- The feature, `command_rewrite`, and `output_reduce` are all disabled by default.
+- Shell matching defaults to the tool name `shell_command`.
+- `tools.shell_function_calls.enabled` defaults to `true` once `tool_optimizers.enabled: true` is set, unless you explicitly set it to `false`.
+- The default and currently supported shell command argument path is `/command`; other paths are reserved for future tool shapes and will not be extracted or replaced today.
+- `command_rewrite.streaming_mode` defaults to `disabled`. Command rewrites are applied only when Vekil inspects non-streaming Responses response bodies; websocket/streaming paths capture command context for later output reduction but do not rewrite commands today.
+- Optimizers are fail-open. External errors, timeouts, invalid JSON, unsupported provider config, or invalid replacements are ignored and the original payload is used.
+- Command replacements must be changed, non-empty after trimming, at most `32768` bytes, and contain no NUL, carriage-return, or newline characters.
+- Output replacements must be changed and non-empty after trimming.
+
+Example:
+
+```yaml
+providers:
+  - id: copilot
+    type: copilot
+    default: true
+
+tool_optimizers:
+  enabled: true
+  tools:
+    shell_function_calls:
+      enabled: true
+      names:
+        - shell_command
+      command_arg_path: /command
+  command_rewrite:
+    enabled: true
+    streaming_mode: disabled
+    timeout_ms: 200
+  output_reduce:
+    enabled: true
+    timeout_ms: 500
+    min_input_bytes: 20000
+    max_input_bytes: 500000
+  providers:
+    - id: local-optimizer
+      type: exec_json
+      path: /usr/local/bin/vekil-tool-optimizer
+      args:
+        - --profile
+        - default
+      stages:
+        - command_rewrite
+        - output_reduce
+      max_stdout_bytes: 1048576
+      max_stderr_bytes: 65536
+```
+
+Defaults:
+
+| Setting | Default |
+|---------|---------|
+| `tool_optimizers.enabled` | `false` |
+| `tools.shell_function_calls.enabled` | `true` when tool optimizers are enabled and the field is omitted |
+| `tools.shell_function_calls.names` | `["shell_command"]` |
+| `tools.shell_function_calls.command_arg_path` | `/command` |
+| `command_rewrite.enabled` | `false` |
+| `command_rewrite.streaming_mode` | `disabled` |
+| `command_rewrite.timeout_ms` | `200` |
+| `output_reduce.enabled` | `false` |
+| `output_reduce.timeout_ms` | `500` |
+| `output_reduce.min_input_bytes` | `20000` |
+| `output_reduce.max_input_bytes` | `500000` |
+| `tool_optimizers.providers[].max_stdout_bytes` | `1048576` |
+| `tool_optimizers.providers[].max_stderr_bytes` | `65536` |
+
+Provider entries support these `type` values:
+
+- `exec_json` runs a local executable, sends one JSON request on stdin, and expects one JSON response on stdout. `path` is required.
+- `rtk_cli` runs the `rtk` command-line adapter. `path` defaults to `rtk`.
+- `noop` accepts config and never changes payloads; it is useful for tests and dry runs.
+
+Provider entries are enabled by default; set `enabled: false` to keep an entry in the file without using it. Each provider can set `stages`. If `stages` is omitted or empty, the provider is eligible for both `command_rewrite` and `output_reduce`; otherwise list only the stage names it should handle: `command_rewrite` and/or `output_reduce`. Providers run in config order, and the first valid changed result wins.
+
+### `exec_json` Provider Protocol
+
+`exec_json` requests and responses use `schema: "vekil.tool_optimizer.v1"`.
+
+Command rewrite request:
+
+```json
+{
+  "schema": "vekil.tool_optimizer.v1",
+  "operation": "rewrite_command",
+  "tool_name": "shell_command",
+  "call_id": "call_123",
+  "command": "go test ./...",
+  "metadata": {}
+}
+```
+
+Command rewrite response:
+
+```json
+{
+  "changed": true,
+  "command": "go test ./proxy/...",
+  "reason": "narrowed package"
+}
+```
+
+Output reduce request:
+
+```json
+{
+  "schema": "vekil.tool_optimizer.v1",
+  "operation": "reduce_output",
+  "tool_name": "shell_command",
+  "call_id": "call_123",
+  "command": "go test ./...",
+  "filter_hint": "go-test",
+  "output": "...",
+  "metadata": {}
+}
+```
+
+Output reduce response:
+
+```json
+{
+  "changed": true,
+  "output": "...reduced output...",
+  "reason": "kept failing tests"
+}
+```
+
+Set `changed: false`, omit the replacement field, or return an invalid replacement when the original command/output should pass through unchanged.
+
+### `rtk_cli` Provider
+
+`rtk_cli` defaults `path` to `rtk` and adapts optimizer calls to RTK commands:
+
+- Command rewrite runs `rtk hook check -- <command>` and treats non-empty stdout as the rewritten command.
+- Output reduction runs `rtk pipe`, passing the tool output on stdin. If Vekil resolved a supported hint, it adds `--filter <hint>`.
+
+Vekil's built-in hint resolver may emit `git-diff`, `git-status`, `pytest`, `cargo-test`, `go-test`, or `vitest`. The `rtk_cli` adapter accepts those hints plus `cargo`, `go-build`, `tsc`, `grep`, `rg`, `find`, `fd`, `git-log`, `mypy`, `ruff-check`, `ruff-format`, and `prettier`.
+
 ## WebSocket Session Tuning
 
 These settings affect the Codex-style `GET /v1/responses` websocket bridge.
