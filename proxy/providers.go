@@ -30,7 +30,8 @@ var openAICodexProviderEndpoints = []string{"/responses"}
 // ProvidersConfig configures optional non-Copilot upstream providers.
 // When empty, the proxy keeps its legacy zero-config Copilot behavior.
 type ProvidersConfig struct {
-	Providers []ProviderConfig `json:"providers" yaml:"providers"`
+	Providers      []ProviderConfig     `json:"providers" yaml:"providers"`
+	ToolOptimizers ToolOptimizersConfig `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
 }
 
 // ProviderConfig configures one upstream provider instance.

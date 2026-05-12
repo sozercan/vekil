@@ -233,6 +233,8 @@ type ProxyHandler struct {
 	copilotHeaders           CopilotHeaderConfig
 	providersConfig          ProvidersConfig
 	providersState           *providerSetup
+	toolOptimizers           *ToolOptimizerManager
+	toolContexts             *ToolExecutionContextStore
 	responsesWS              ResponsesWebSocketConfig
 	streamingUpstreamTimeout time.Duration
 	compactChunkBodyBytes    int
@@ -414,6 +416,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 			opt(h)
 		}
 	}
+	h.initializeToolOptimizers()
 	if err := h.initializeProviders(); err != nil {
 		return nil, err
 	}
