@@ -436,6 +436,192 @@ func TestHandleResponsesWebSocket_ToolOptimizerReducesOutputWithoutRewritingStre
 	}
 }
 
+func TestHandleOpenAIChatCompletions_ToolOptimizerReducesOutputWithGlobalFallback(t *testing.T) {
+	runOpenAIChatToolOptimizerReducesOutputTest(t, "")
+}
+
+func TestHandleOpenAIChatCompletions_ToolOptimizerReducesOutputWithHeaderScope(t *testing.T) {
+	runOpenAIChatToolOptimizerReducesOutputTest(t, "sess-chat-tool-1")
+}
+
+func runOpenAIChatToolOptimizerReducesOutputTest(t *testing.T, sessionID string) {
+	t.Helper()
+
+	fake := &recordingToolOptimizer{}
+
+	var mu sync.Mutex
+	var upstreamBodies []map[string]interface{}
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body := decodeRequestBodyForToolOptimizerTest(t, r)
+
+		mu.Lock()
+		upstreamBodies = append(upstreamBodies, body)
+		requestNumber := len(upstreamBodies)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch requestNumber {
+		case 1:
+			writeJSONForToolOptimizerTest(t, w, map[string]interface{}{
+				"id":      "chatcmpl-chat-tool-1",
+				"object":  "chat.completion",
+				"created": 1700000000,
+				"model":   "gpt-4",
+				"choices": []interface{}{
+					map[string]interface{}{
+						"index": 0,
+						"message": map[string]interface{}{
+							"role": "assistant",
+							"tool_calls": []interface{}{
+								map[string]interface{}{
+									"id":   "call-chat-1",
+									"type": "function",
+									"function": map[string]interface{}{
+										"name":      "shell_command",
+										"arguments": `{"command":"grep foo big.log"}`,
+									},
+								},
+							},
+						},
+						"finish_reason": "tool_calls",
+					},
+				},
+			})
+		default:
+			writeJSONForToolOptimizerTest(t, w, map[string]interface{}{
+				"id":      "chatcmpl-chat-tool-2",
+				"object":  "chat.completion",
+				"created": 1700000001,
+				"model":   "gpt-4",
+				"choices": []interface{}{
+					map[string]interface{}{
+						"index": 0,
+						"message": map[string]interface{}{
+							"role":    "assistant",
+							"content": "done",
+						},
+						"finish_reason": "stop",
+					},
+				},
+			})
+		}
+	})
+	configureRecordingToolOptimizer(handler, fake)
+
+	firstResp := postOpenAIChatForToolOptimizerTest(t, handler, `{
+		"model": "gpt-4",
+		"messages": [{"role": "user", "content": "run command"}],
+		"stream": false
+	}`, sessionID)
+	defer firstResp.Body.Close()
+
+	if firstResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(firstResp.Body)
+		t.Fatalf("expected first response status 200, got %d: %s", firstResp.StatusCode, body)
+	}
+
+	secondResp := postOpenAIChatForToolOptimizerTest(t, handler, `{
+		"model": "gpt-4",
+		"messages": [
+			{
+				"role": "assistant",
+				"tool_calls": [
+					{
+						"id": "call-chat-1",
+						"type": "function",
+						"function": {
+							"name": "shell_command",
+							"arguments": "{\"command\":\"grep foo big.log\"}"
+						}
+					}
+				]
+			},
+			{
+				"role": "tool",
+				"tool_call_id": "call-chat-1",
+				"content": "large output"
+			}
+		],
+		"stream": false
+	}`, sessionID)
+	defer secondResp.Body.Close()
+
+	if secondResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(secondResp.Body)
+		t.Fatalf("expected second response status 200, got %d: %s", secondResp.StatusCode, body)
+	}
+
+	mu.Lock()
+	if len(upstreamBodies) != 2 {
+		t.Fatalf("expected 2 upstream requests, got %d", len(upstreamBodies))
+	}
+	secondUpstreamBody := upstreamBodies[1]
+	mu.Unlock()
+
+	rawMessages, ok := secondUpstreamBody["messages"].([]interface{})
+	if !ok {
+		t.Fatalf("expected messages array, got %T", secondUpstreamBody["messages"])
+	}
+
+	foundToolMessage := false
+	for _, raw := range rawMessages {
+		msg, ok := raw.(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected message object, got %T", raw)
+		}
+		if msg["role"] != "tool" || msg["tool_call_id"] != "call-chat-1" {
+			continue
+		}
+		foundToolMessage = true
+		if got := msg["content"]; got != "reduced output" {
+			t.Fatalf("expected reduced tool output upstream, got %v", got)
+		}
+	}
+	if !foundToolMessage {
+		t.Fatalf("expected second upstream request to contain tool message")
+	}
+
+	if sessionID != "" {
+		if _, ok := handler.toolContexts.Get("session:"+sessionID, "call-chat-1"); !ok {
+			t.Fatalf("expected scoped tool context capture")
+		}
+	}
+
+	rewriteRequests := fake.snapshotRewriteRequests()
+	if len(rewriteRequests) != 1 {
+		t.Fatalf("expected 1 rewrite request, got %d", len(rewriteRequests))
+	}
+	if rewriteRequests[0].Command != "grep foo big.log" {
+		t.Fatalf("expected rewrite command to see original command, got %q", rewriteRequests[0].Command)
+	}
+
+	reduceRequests := fake.snapshotReduceRequests()
+	if len(reduceRequests) != 1 {
+		t.Fatalf("expected 1 reduce request, got %d", len(reduceRequests))
+	}
+	if reduceRequests[0].Command != "rg foo big.log" {
+		t.Fatalf("expected reduce command to use rewritten command, got %q", reduceRequests[0].Command)
+	}
+	if reduceRequests[0].Output != "large output" {
+		t.Fatalf("expected reduce request to see original output, got %q", reduceRequests[0].Output)
+	}
+}
+
+func postOpenAIChatForToolOptimizerTest(t *testing.T, handler *ProxyHandler, body string, sessionID string) *http.Response {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if sessionID != "" {
+		req.Header.Set("session_id", sessionID)
+	}
+
+	w := httptest.NewRecorder()
+	handler.HandleOpenAIChatCompletions(w, req)
+	return w.Result()
+}
+
 func postResponsesForToolOptimizerTest(t *testing.T, handler *ProxyHandler, body string) *http.Response {
 	t.Helper()
 

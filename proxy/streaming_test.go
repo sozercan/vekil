@@ -78,6 +78,144 @@ func TestStreamOpenAIPassthrough(t *testing.T) {
 	}
 }
 
+func TestStreamOpenAIPassthroughWithFinalResponse_CapturesStreamedToolCalls(t *testing.T) {
+	toolStop := "tool_calls"
+	idx := 0
+	chunk1 := models.OpenAIStreamChunk{
+		ID:      "chatcmpl-passthrough-tool",
+		Object:  "chat.completion.chunk",
+		Created: 123,
+		Model:   "gpt-4o",
+		Choices: []models.OpenAIStreamChoice{{
+			Index: 0,
+			Delta: models.OpenAIMessage{
+				Role: "assistant",
+				ToolCalls: []models.OpenAIToolCall{{
+					ID:    "call_shell_1",
+					Type:  "function",
+					Index: &idx,
+					Function: models.OpenAIFunctionCall{
+						Name:      "shell_command",
+						Arguments: `{"command":`,
+					},
+				}},
+			},
+		}},
+	}
+	chunk2 := models.OpenAIStreamChunk{
+		ID:      "chatcmpl-passthrough-tool",
+		Object:  "chat.completion.chunk",
+		Created: 123,
+		Model:   "gpt-4o",
+		Choices: []models.OpenAIStreamChoice{{
+			Index: 0,
+			Delta: models.OpenAIMessage{
+				ToolCalls: []models.OpenAIToolCall{{
+					Index: &idx,
+					Function: models.OpenAIFunctionCall{
+						Arguments: `"echo`,
+					},
+				}},
+			},
+		}},
+	}
+	chunk3 := models.OpenAIStreamChunk{
+		ID:      "chatcmpl-passthrough-tool",
+		Object:  "chat.completion.chunk",
+		Created: 123,
+		Model:   "gpt-4o",
+		Choices: []models.OpenAIStreamChoice{{
+			Index: 0,
+			Delta: models.OpenAIMessage{
+				ToolCalls: []models.OpenAIToolCall{{
+					Index: &idx,
+					Function: models.OpenAIFunctionCall{
+						Arguments: ` hi"}`,
+					},
+				}},
+			},
+		}},
+	}
+	chunk4 := models.OpenAIStreamChunk{
+		ID:      "chatcmpl-passthrough-tool",
+		Object:  "chat.completion.chunk",
+		Created: 123,
+		Model:   "gpt-4o",
+		Choices: []models.OpenAIStreamChoice{{
+			Index:        0,
+			Delta:        models.OpenAIMessage{},
+			FinishReason: &toolStop,
+		}},
+	}
+	chunk5 := models.OpenAIStreamChunk{
+		ID:      "chatcmpl-passthrough-tool",
+		Object:  "chat.completion.chunk",
+		Created: 123,
+		Model:   "gpt-4o",
+		Usage:   &models.OpenAIUsage{PromptTokens: 9, CompletionTokens: 4, TotalTokens: 13},
+	}
+
+	body := buildSSEStream(
+		mustMarshal(t, chunk1),
+		mustMarshal(t, chunk2),
+		mustMarshal(t, chunk3),
+		mustMarshal(t, chunk4),
+		mustMarshal(t, chunk5),
+		"[DONE]",
+	)
+
+	w := httptest.NewRecorder()
+	var final *models.OpenAIResponse
+	StreamOpenAIPassthroughWithFinalResponse(w, body, func(resp *models.OpenAIResponse) {
+		final = resp
+	})
+
+	if !strings.Contains(w.Body.String(), "data: [DONE]") {
+		t.Fatalf("passthrough output missing [DONE]:\n%s", w.Body.String())
+	}
+	if final == nil {
+		t.Fatal("final response callback was not invoked")
+	}
+	if final.ID != "chatcmpl-passthrough-tool" {
+		t.Errorf("final.ID = %q, want chatcmpl-passthrough-tool", final.ID)
+	}
+	if final.Object != "chat.completion" {
+		t.Errorf("final.Object = %q, want chat.completion", final.Object)
+	}
+	if final.Created != 123 {
+		t.Errorf("final.Created = %d, want 123", final.Created)
+	}
+	if final.Model != "gpt-4o" {
+		t.Errorf("final.Model = %q, want gpt-4o", final.Model)
+	}
+	if final.Usage == nil || final.Usage.TotalTokens != 13 {
+		t.Fatalf("final.Usage = %#v, want total tokens 13", final.Usage)
+	}
+	if len(final.Choices) != 1 {
+		t.Fatalf("len(final.Choices) = %d, want 1", len(final.Choices))
+	}
+	choice := final.Choices[0]
+	if choice.FinishReason == nil || *choice.FinishReason != "tool_calls" {
+		t.Fatalf("finish reason = %v, want tool_calls", choice.FinishReason)
+	}
+	if len(choice.Message.ToolCalls) != 1 {
+		t.Fatalf("len(tool_calls) = %d, want 1", len(choice.Message.ToolCalls))
+	}
+	toolCall := choice.Message.ToolCalls[0]
+	if toolCall.ID != "call_shell_1" {
+		t.Errorf("toolCall.ID = %q, want call_shell_1", toolCall.ID)
+	}
+	if toolCall.Type != "function" {
+		t.Errorf("toolCall.Type = %q, want function", toolCall.Type)
+	}
+	if toolCall.Function.Name != "shell_command" {
+		t.Errorf("toolCall.Function.Name = %q, want shell_command", toolCall.Function.Name)
+	}
+	if toolCall.Function.Arguments != `{"command":"echo hi"}` {
+		t.Errorf("toolCall.Function.Arguments = %q, want command JSON", toolCall.Function.Arguments)
+	}
+}
+
 func TestStreamOpenAIToAnthropic_TextOnly(t *testing.T) {
 	stop := "stop"
 	idx := 0
@@ -1088,6 +1226,142 @@ func TestToolChoiceNone(t *testing.T) {
 	}
 	if val != "none" {
 		t.Errorf("tool_choice = %q, want %q", val, "none")
+	}
+}
+
+func TestStreamOpenAIToAnthropicWithFinalResponse_CapturesStreamedToolCalls(t *testing.T) {
+	idx0 := 0
+	finishReason := "tool_calls"
+	chunks := []models.OpenAIStreamChunk{
+		{
+			ID:      "chatcmpl-tool-1",
+			Object:  "chat.completion.chunk",
+			Created: 1700000000,
+			Model:   "gpt-4",
+			Choices: []models.OpenAIStreamChoice{{
+				Index: 0,
+				Delta: models.OpenAIMessage{Role: "assistant"},
+			}},
+		},
+		{
+			ID:    "chatcmpl-tool-1",
+			Model: "gpt-4",
+			Choices: []models.OpenAIStreamChoice{{
+				Index: 0,
+				Delta: models.OpenAIMessage{
+					ToolCalls: []models.OpenAIToolCall{{
+						ID:    "call_shell_1",
+						Index: &idx0,
+						Type:  "function",
+						Function: models.OpenAIFunctionCall{
+							Name:      "shell_command",
+							Arguments: "",
+						},
+					}},
+				},
+			}},
+		},
+		{
+			ID:    "chatcmpl-tool-1",
+			Model: "gpt-4",
+			Choices: []models.OpenAIStreamChoice{{
+				Index: 0,
+				Delta: models.OpenAIMessage{
+					ToolCalls: []models.OpenAIToolCall{{
+						Index: &idx0,
+						Function: models.OpenAIFunctionCall{
+							Arguments: `{"command":"grep `,
+						},
+					}},
+				},
+			}},
+		},
+		{
+			ID:    "chatcmpl-tool-1",
+			Model: "gpt-4",
+			Choices: []models.OpenAIStreamChoice{{
+				Index: 0,
+				Delta: models.OpenAIMessage{
+					ToolCalls: []models.OpenAIToolCall{{
+						Index: &idx0,
+						Function: models.OpenAIFunctionCall{
+							Arguments: `foo big.log"}`,
+						},
+					}},
+				},
+			}},
+		},
+		{
+			ID:    "chatcmpl-tool-1",
+			Model: "gpt-4",
+			Choices: []models.OpenAIStreamChoice{{
+				Index:        0,
+				Delta:        models.OpenAIMessage{},
+				FinishReason: &finishReason,
+			}},
+			Usage: &models.OpenAIUsage{
+				PromptTokens:     12,
+				CompletionTokens: 8,
+				TotalTokens:      20,
+			},
+		},
+	}
+
+	body := buildSSEStream(
+		mustMarshal(t, chunks[0]),
+		mustMarshal(t, chunks[1]),
+		mustMarshal(t, chunks[2]),
+		mustMarshal(t, chunks[3]),
+		mustMarshal(t, chunks[4]),
+		"[DONE]",
+	)
+
+	var captured *models.OpenAIResponse
+	w := httptest.NewRecorder()
+	StreamOpenAIToAnthropicWithFinalResponse(w, body, "claude-sonnet-4", "msg_tool_1", func(resp *models.OpenAIResponse) {
+		captured = resp
+	})
+
+	if captured == nil {
+		t.Fatalf("expected final response callback")
+	}
+	if captured.ID != "chatcmpl-tool-1" {
+		t.Fatalf("ID = %q, want chatcmpl-tool-1", captured.ID)
+	}
+	if len(captured.Choices) != 1 {
+		t.Fatalf("expected 1 choice, got %d", len(captured.Choices))
+	}
+
+	choice := captured.Choices[0]
+	if choice.Message.Role != "assistant" {
+		t.Fatalf("message role = %q, want assistant", choice.Message.Role)
+	}
+	if choice.FinishReason == nil || *choice.FinishReason != "tool_calls" {
+		t.Fatalf("finish_reason = %v, want tool_calls", choice.FinishReason)
+	}
+	if len(choice.Message.ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(choice.Message.ToolCalls))
+	}
+
+	call := choice.Message.ToolCalls[0]
+	if call.ID != "call_shell_1" {
+		t.Fatalf("tool call id = %q, want call_shell_1", call.ID)
+	}
+	if call.Type != "function" {
+		t.Fatalf("tool call type = %q, want function", call.Type)
+	}
+	if call.Function.Name != "shell_command" {
+		t.Fatalf("function name = %q, want shell_command", call.Function.Name)
+	}
+	if call.Function.Arguments != `{"command":"grep foo big.log"}` {
+		t.Fatalf("function arguments = %q", call.Function.Arguments)
+	}
+
+	if captured.Usage == nil {
+		t.Fatalf("expected usage")
+	}
+	if captured.Usage.PromptTokens != 12 || captured.Usage.CompletionTokens != 8 || captured.Usage.TotalTokens != 20 {
+		t.Fatalf("usage = %+v, want prompt=12 completion=8 total=20", captured.Usage)
 	}
 }
 

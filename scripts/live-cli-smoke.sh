@@ -60,6 +60,18 @@ model_exists() {
   jq -e --arg model "$1" '.data[]? | select(.id == $model)' "${MODELS_JSON}" >/dev/null
 }
 
+model_supports_endpoint() {
+  local model="$1"
+  local endpoint="$2"
+
+  jq -e --arg model "${model}" --arg endpoint "${endpoint}" '
+    .data[]?
+    | select(.id == $model)
+    | (.supported_endpoints // [])
+    | index($endpoint)
+  ' "${MODELS_JSON}" >/dev/null
+}
+
 pick_model() {
   local family="$1"
   shift
@@ -77,14 +89,42 @@ pick_model() {
   die "unable to find a ${family} model from preferred list: $*"
 }
 
+pick_optional_gemini_model() {
+  local candidate
+
+  for candidate in "$@"; do
+    if model_exists "${candidate}" && model_supports_endpoint "${candidate}" "/chat/completions"; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  candidate="$(jq -r '
+    [
+      .data[]?
+      | select((.id | type) == "string")
+      | select(.id | startswith("gemini-"))
+      | select((.supported_endpoints // []) | index("/chat/completions"))
+      | .id
+    ][0] // ""
+  ' "${MODELS_JSON}")"
+  if [[ -n "${candidate}" ]]; then
+    printf '%s\n' "${candidate}"
+    return 0
+  fi
+
+  log "Skipping Gemini smoke: no Gemini model with /chat/completions support is listed by ${PROXY_BASE_URL}/v1/models."
+  return 0
+}
+
 write_case_files() {
   local case_dir="$1"
   local left_value="$2"
   local right_value="$3"
 
   mkdir -p "${case_dir}"
-  printf '%s\n' "${left_value}" > "${case_dir}/left.txt"
-  printf '%s\n' "${right_value}" > "${case_dir}/right.txt"
+  printf '%s' "${left_value}" > "${case_dir}/left.txt"
+  printf '%s' "${right_value}" > "${case_dir}/right.txt"
 }
 
 assert_exact_output() {
@@ -169,6 +209,7 @@ run_codex_smoke() {
 
   actual="$(read_normalized_output "${output_file}")"
   assert_exact_output "codex" "${expected}" "${actual}"
+  printf '%s' "${actual}" > "${output_file}"
 }
 
 run_claude_smoke() {
@@ -209,6 +250,7 @@ EOF
 
   actual="$(read_normalized_output "${output_file}")"
   assert_exact_output "claude" "${expected}" "${actual}"
+  printf '%s' "${actual}" > "${output_file}"
 }
 
 run_gemini_smoke() {
@@ -252,6 +294,7 @@ EOF
 
   actual="$(read_normalized_output "${output_file}")"
   assert_exact_output "gemini" "${expected}" "${actual}"
+  printf '%s' "${actual}" > "${output_file}"
 }
 
 main() {
@@ -259,7 +302,6 @@ main() {
   require_cmd jq
   require_cmd codex
   require_cmd claude
-  require_cmd gemini
 
   mkdir -p "${SMOKE_DIR}" "${SMOKE_DIR}/cases" "${SMOKE_DIR}/homes" "${SMOKE_DIR}/outputs"
 
@@ -274,18 +316,28 @@ main() {
 
   CODEX_MODEL="$(pick_model "Codex/OpenAI" gpt-5.4 gpt-5.3-codex gpt-5.2-codex gpt-5.1-codex gpt-5.1 gpt-5-mini gpt-4.1 gpt-4o)"
   CLAUDE_MODEL="$(pick_model "Claude" claude-sonnet-4.6 claude-sonnet-4.5 claude-sonnet-4 claude-opus-4.6)"
-  GEMINI_MODEL="$(pick_model "Gemini" gemini-3.1-pro-preview gemini-3-pro-preview gemini-2.5-pro gemini-3-flash-preview)"
+  GEMINI_MODEL="$(pick_optional_gemini_model gemini-3.1-pro-preview gemini-3-pro-preview gemini-2.5-pro gemini-3-flash-preview)"
+
+  if [[ -n "${GEMINI_MODEL}" ]]; then
+    require_cmd gemini
+  fi
 
   log "Selected models:"
   log "  codex:  ${CODEX_MODEL}"
   log "  claude: ${CLAUDE_MODEL}"
-  log "  gemini: ${GEMINI_MODEL}"
+  if [[ -n "${GEMINI_MODEL}" ]]; then
+    log "  gemini: ${GEMINI_MODEL}"
+  else
+    log "  gemini: skipped (no supported Gemini model listed)"
+  fi
 
   run_codex_smoke
   run_claude_smoke
-  run_gemini_smoke
+  if [[ -n "${GEMINI_MODEL}" ]]; then
+    run_gemini_smoke
+  fi
 
-  log "All live CLI smoke checks passed."
+  log "All enabled live CLI smoke checks passed."
   log "Artifacts: ${SMOKE_DIR}"
 }
 

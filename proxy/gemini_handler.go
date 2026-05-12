@@ -68,11 +68,13 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		logger.F("tools", len(req.Tools)),
 	)
 
+	scope := toolExecutionScopeFromHeaders(r.Header)
 	oaiReq, err := TranslateGeminiToOpenAI(req, pathModel, stream)
 	if err != nil {
 		h.writeGeminiProtocolError(w, err)
 		return
 	}
+	h.maybeReduceOpenAIChatToolOutputs(r.Context(), oaiReq, h.toolContexts, scope)
 
 	forceStream := !stream && len(oaiReq.Tools) > 0
 	if forceStream {
@@ -115,9 +117,12 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	}
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			StreamOpenAIToGemini(w, resp.Body)
+			StreamOpenAIToGeminiWithFinalResponse(w, resp.Body, func(oaiResp *models.OpenAIResponse) {
+				h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
+			})
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, true)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(oaiResp))
 		},
@@ -127,6 +132,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 			if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 				return err
 			}
+			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), &parsed, h.toolContexts, scope, true)
 
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(&parsed))
