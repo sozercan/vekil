@@ -500,32 +500,90 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 		return resp, nil
 	}
 
-	compaction, compacted, err := s.compactHistory(h, ctx, request, true)
+	cfg := h.responsesWebSocketConfig()
+	configuredKeepTail := cfg.AutoCompactKeepTail
+	if configuredKeepTail <= 0 || strings.TrimSpace(request.Model) == "" {
+		return resp, nil
+	}
+
+	originalHistory := cloneRawMessages(s.historyItems)
+	keepTailSchedule := compactedResponsesRetryKeepTailSchedule(len(originalHistory), configuredKeepTail)
+	if len(keepTailSchedule) == 0 {
+		return resp, nil
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		h.log.Debug("responses websocket 413 compaction failed",
-			logger.Err(err),
+		_ = resp.Body.Close()
+		return nil, err
+	}
+	_ = resp.Body.Close()
+	lastResp := cloneHTTPResponseWithBody(resp, respBody)
+
+	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
+	for attempt, keepTail := range keepTailSchedule {
+		compactedHistory, compaction, compacted, err := s.compactHistoryItemsWithKeepTail(h, ctx, request, originalHistory, keepTail, budget)
+		if err != nil {
+			h.log.Debug("responses websocket 413 compaction failed",
+				logger.Err(err),
+				logger.F("model", request.Model),
+				logger.F("previous_response_id", request.PreviousResponseID),
+				logger.F("history_items", len(originalHistory)),
+				logger.F("history_bytes", rawMessagesSize(originalHistory)),
+				logger.F("keep_tail", keepTail),
+			)
+			return lastResp, nil
+		}
+		if !compacted {
+			continue
+		}
+
+		s.historyItems = compactedHistory
+		h.log.Debug("responses websocket compacted oversized replay; retrying request",
 			logger.F("model", request.Model),
 			logger.F("previous_response_id", request.PreviousResponseID),
-			logger.F("history_items", len(s.historyItems)),
-			logger.F("history_bytes", rawMessagesSize(s.historyItems)),
+			logger.F("prior_items", compaction.fromItems),
+			logger.F("prior_bytes", compaction.fromBytes),
+			logger.F("new_items", compaction.toItems),
+			logger.F("new_bytes", compaction.toBytes),
+			logger.F("keep_tail", keepTail),
+			logger.F("tail_attempt", attempt+1),
+			logger.F("tail_attempts", len(keepTailSchedule)),
 		)
-		return resp, nil
-	}
-	if !compacted {
-		return resp, nil
+
+		retryResp, retryErr := s.postCreateRequestSegments(h, ctx, request, [][]json.RawMessage{s.historyItems, request.Input}, false)
+		if retryErr != nil {
+			h.log.Debug("responses websocket 413 retry request failed", logger.F("keep_tail", keepTail), logger.Err(retryErr))
+			return lastResp, nil
+		}
+		if retryResp == nil {
+			return lastResp, nil
+		}
+		if retryResp.StatusCode != http.StatusRequestEntityTooLarge {
+			return retryResp, nil
+		}
+
+		retryBody, truncated, readErr := readBodyWithCap(retryResp.Body, compactUpstreamErrorBodySize)
+		_ = retryResp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		lastResp = cloneHTTPResponseWithBody(retryResp, retryBody)
+		if truncated {
+			lastResp.Header.Del("Content-Length")
+		}
+
+		if attempt+1 < len(keepTailSchedule) {
+			h.log.Debug("responses websocket 413 retry still too large; reducing keep tail",
+				logger.F("keep_tail", keepTail),
+				logger.F("next_keep_tail", keepTailSchedule[attempt+1]),
+				logger.F("tail_attempt", attempt+1),
+				logger.F("tail_attempts", len(keepTailSchedule)),
+			)
+		}
 	}
 
-	h.log.Debug("responses websocket compacted oversized replay; retrying request",
-		logger.F("model", request.Model),
-		logger.F("previous_response_id", request.PreviousResponseID),
-		logger.F("prior_items", compaction.fromItems),
-		logger.F("prior_bytes", compaction.fromBytes),
-		logger.F("new_items", compaction.toItems),
-		logger.F("new_bytes", compaction.toBytes),
-	)
-
-	_ = resp.Body.Close()
-	return s.postCreateRequestSegments(h, ctx, request, [][]json.RawMessage{s.historyItems, request.Input}, false)
+	return lastResp, nil
 }
 
 func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, force bool) (responsesWebSocketHistoryCompaction, bool, error) {
@@ -548,24 +606,44 @@ func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.
 		return result, false, nil
 	}
 
-	prefixLen := compactedResponsesAlignedPrefixLen(s.historyItems, cfg.AutoCompactKeepTail)
-	if prefixLen <= 0 {
-		return result, false, nil
+	compacted, result, ok, err := s.compactHistoryItemsWithKeepTail(h, ctx, request, s.historyItems, cfg.AutoCompactKeepTail, nil)
+	if err != nil || !ok {
+		return result, ok, err
+	}
+	s.historyItems = compacted
+	return result, true, nil
+}
+
+func (s *responsesWebSocketSession) compactHistoryItemsWithKeepTail(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, history []json.RawMessage, keepTail int, budget *compactBudget) ([]json.RawMessage, responsesWebSocketHistoryCompaction, bool, error) {
+	var result responsesWebSocketHistoryCompaction
+	if keepTail <= 0 || strings.TrimSpace(request.Model) == "" {
+		return nil, result, false, nil
 	}
 
-	prefix := s.historyItems[:prefixLen]
-	tail := s.historyItems[prefixLen:]
-	result.fromItems = len(s.historyItems)
-	result.fromBytes = rawMessagesSize(s.historyItems)
+	prefixLen := compactedResponsesAlignedPrefixLen(history, keepTail)
+	if prefixLen <= 0 {
+		return nil, result, false, nil
+	}
 
-	summary, err := h.compactResponsesInput(ctx, request.Model, prefix, s.requestHeaders(request, false))
+	prefix := history[:prefixLen]
+	tail := history[prefixLen:]
+	result.fromItems = len(history)
+	result.fromBytes = rawMessagesSize(history)
+
+	var summary string
+	var err error
+	if budget == nil {
+		summary, err = h.compactResponsesInput(ctx, request.Model, prefix, s.requestHeaders(request, false))
+	} else {
+		summary, err = h.compactResponsesInputWithBudget(ctx, request.Model, prefix, s.requestHeaders(request, false), budget)
+	}
 	if err != nil {
-		return result, false, err
+		return nil, result, false, err
 	}
 
 	checkpoint, err := proxyCompactionContextRawMessage(summary)
 	if err != nil {
-		return result, false, err
+		return nil, result, false, err
 	}
 
 	compacted := make([]json.RawMessage, 0, 1+len(tail))
@@ -574,8 +652,7 @@ func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.
 
 	result.toItems = len(compacted)
 	result.toBytes = rawMessagesSize(compacted)
-	s.historyItems = compacted
-	return result, true, nil
+	return compacted, result, true, nil
 }
 
 func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *responsesWebSocketCreateRequest, responseID string, metrics responsesWebSocketRequestMetrics) {
