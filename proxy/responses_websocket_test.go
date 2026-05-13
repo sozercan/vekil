@@ -916,6 +916,71 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 	}
 }
 
+func TestResponsesWebSocketMaybeRetryCompactedCreateRequestCapsOriginal413Body(t *testing.T) {
+	var upstreamRequests atomic.Int32
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":{"message":"compaction failed"}}`)
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		DisableAutoCompact:  true,
+		AutoCompactKeepTail: 2,
+	}
+
+	largeBody := strings.Repeat("x", compactUpstreamErrorBodySize+1024)
+	resp := &http.Response{
+		StatusCode:    http.StatusRequestEntityTooLarge,
+		Header:        http.Header{"Content-Length": []string{fmt.Sprintf("%d", len(largeBody))}},
+		Body:          io.NopCloser(strings.NewReader(largeBody)),
+		ContentLength: int64(len(largeBody)),
+	}
+	session := &responsesWebSocketSession{
+		ctx: context.Background(),
+		historyItems: []json.RawMessage{
+			json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"first"}]}`),
+			json.RawMessage(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first answer"}]}`),
+			json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"second"}]}`),
+		},
+	}
+	request := &responsesWebSocketCreateRequest{
+		Model:              "gpt-5.4",
+		PreviousResponseID: "resp-prev",
+		Input: []json.RawMessage{
+			json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"latest"}]}`),
+		},
+	}
+
+	got, err := session.maybeRetryCompactedCreateRequest(handler, context.Background(), request, resp, true)
+	if err != nil {
+		t.Fatalf("maybeRetryCompactedCreateRequest returned error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected original response clone, got nil")
+	}
+	if got.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 response, got %d", got.StatusCode)
+	}
+	if upstreamRequests.Load() == 0 {
+		t.Fatal("expected compaction attempt after initial 413")
+	}
+	body, err := io.ReadAll(got.Body)
+	if err != nil {
+		t.Fatalf("failed to read cloned response body: %v", err)
+	}
+	if len(body) != compactUpstreamErrorBodySize {
+		t.Fatalf("expected cloned 413 body capped at %d bytes, got %d", compactUpstreamErrorBodySize, len(body))
+	}
+	if got.ContentLength != int64(compactUpstreamErrorBodySize) {
+		t.Fatalf("expected cloned ContentLength %d, got %d", compactUpstreamErrorBodySize, got.ContentLength)
+	}
+	if got.Header.Get("Content-Length") != "" {
+		t.Fatalf("expected stale Content-Length header to be removed, got %q", got.Header.Get("Content-Length"))
+	}
+}
+
 func TestHandleResponsesWebSocket_ReducesKeepTailWhenCompactedReplayStill413s(t *testing.T) {
 	var upstreamRequestsMu sync.Mutex
 	upstreamRequests := make([]map[string]interface{}, 0, 6)

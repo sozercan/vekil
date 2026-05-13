@@ -512,13 +512,20 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 		return resp, nil
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, truncated, err := readBodyWithCap(resp.Body, compactUpstreamErrorBodySize)
 	if err != nil {
 		_ = resp.Body.Close()
 		return nil, err
 	}
 	_ = resp.Body.Close()
 	lastResp := cloneHTTPResponseWithBody(resp, respBody)
+	if truncated {
+		lastResp.Header.Del("Content-Length")
+		h.log.Debug("truncated initial upstream 413 response body for websocket compact fallback",
+			logger.F("status", resp.StatusCode),
+			logger.F("max_bytes", compactUpstreamErrorBodySize),
+		)
+	}
 
 	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
 	for attempt, keepTail := range keepTailSchedule {
