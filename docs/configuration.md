@@ -213,10 +213,10 @@ Use the examples above as a starting point for your local providers config file.
 
 `tool_optimizers` is an optional top-level block in the JSON/YAML providers config, alongside `providers`. It is disabled by default, and leaving it unset preserves the normal passthrough behavior.
 
-Tool optimizers only apply to `/v1/responses` flows, including the proxy-owned `GET /v1/responses` websocket bridge. They currently target shell-style function calls and can run two independent stages:
+Tool optimizers apply to all API surfaces: `/v1/responses` (HTTP and proxy-owned websocket bridge), `/v1/chat/completions`, Anthropic `/v1/messages`, and Gemini endpoints. They currently target shell-style function calls and can run two independent stages:
 
-- `command_rewrite` rewrites matching shell function-call commands in non-streaming Responses responses before returning them to the client.
-- `output_reduce` reduces captured `function_call_output` payloads in later Responses requests after Vekil has seen the matching tool call in the same request/session scope.
+- `command_rewrite` rewrites matching shell function-call commands in non-streaming Responses responses before returning them to the client. Chat completions, Anthropic, and Gemini handlers capture tool calls for output reduction but do not rewrite commands today.
+- `output_reduce` reduces captured `function_call_output` (or equivalent tool result) payloads in later requests after Vekil has seen the matching tool call in the same request/session scope.
 
 Important behavior:
 

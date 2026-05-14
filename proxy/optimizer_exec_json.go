@@ -135,12 +135,13 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 	if b.limit <= 0 {
 		return b.buf.Write(p)
 	}
-	if int64(b.buf.Len()+len(p)) > b.limit {
-		remaining := int(b.limit) - b.buf.Len()
-		if remaining > 0 {
-			_, _ = b.buf.Write(p[:remaining])
-		}
+	remaining := int(b.limit) - b.buf.Len()
+	if remaining <= 0 {
 		return 0, io.ErrShortBuffer
+	}
+	if len(p) > remaining {
+		n, _ := b.buf.Write(p[:remaining])
+		return n, io.ErrShortBuffer
 	}
 	return b.buf.Write(p)
 }

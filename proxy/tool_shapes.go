@@ -122,7 +122,7 @@ func extractFunctionCallOutputItem(raw json.RawMessage) (toolOutputItem, bool) {
 	if err := json.Unmarshal(raw, &item); err != nil {
 		return toolOutputItem{}, false
 	}
-	if item.Type != "function_call_output" || strings.TrimSpace(item.CallID) == "" {
+	if (item.Type != "function_call_output" && item.Type != "local_shell_call_output") || strings.TrimSpace(item.CallID) == "" {
 		return toolOutputItem{}, false
 	}
 	return toolOutputItem{CallID: strings.TrimSpace(item.CallID), Output: item.Output}, true

@@ -2,7 +2,7 @@ package proxy
 
 import "strings"
 
-func ResolveFilterHint(command string, toolName string) string {
+func ResolveFilterHint(command string) string {
 	cmd := strings.TrimSpace(command)
 	cmdLower := strings.ToLower(cmd)
 	switch {

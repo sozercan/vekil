@@ -8,6 +8,7 @@ import (
 const (
 	defaultToolExecutionContextTTL        = 2 * time.Hour
 	defaultToolExecutionContextMaxEntries = 10000
+	maxToolExecutionContextExpireInterval = time.Minute
 )
 
 type ToolExecutionContext struct {
@@ -26,10 +27,11 @@ type toolExecutionContextKey struct {
 }
 
 type ToolExecutionContextStore struct {
-	mu         sync.Mutex
-	entries    map[toolExecutionContextKey]ToolExecutionContext
-	ttl        time.Duration
-	maxEntries int
+	mu           sync.Mutex
+	entries      map[toolExecutionContextKey]ToolExecutionContext
+	ttl          time.Duration
+	maxEntries   int
+	nextExpireAt time.Time
 }
 
 func NewToolExecutionContextStore() *ToolExecutionContextStore {
@@ -54,15 +56,16 @@ func (s *ToolExecutionContextStore) Put(scope string, ctx ToolExecutionContext) 
 	if s == nil || scope == "" || ctx.CallID == "" {
 		return
 	}
+	now := time.Now()
 	if ctx.CreatedAt.IsZero() {
-		ctx.CreatedAt = time.Now()
+		ctx.CreatedAt = now
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.entries == nil {
 		s.entries = make(map[toolExecutionContextKey]ToolExecutionContext)
 	}
-	s.expireLocked(time.Now())
+	s.maybeExpireLocked(now)
 	s.entries[toolExecutionContextKey{Scope: scope, CallID: ctx.CallID}] = ctx
 	s.enforceMaxEntriesLocked()
 }
@@ -95,6 +98,24 @@ func (s *ToolExecutionContextStore) Delete(scope, callID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.entries, toolExecutionContextKey{Scope: scope, CallID: callID})
+}
+
+func (s *ToolExecutionContextStore) maybeExpireLocked(now time.Time) {
+	if s.ttl <= 0 {
+		return
+	}
+	if !s.nextExpireAt.IsZero() && now.Before(s.nextExpireAt) {
+		return
+	}
+	s.expireLocked(now)
+	interval := s.ttl / 10
+	if interval <= 0 {
+		interval = s.ttl
+	}
+	if interval > maxToolExecutionContextExpireInterval {
+		interval = maxToolExecutionContextExpireInterval
+	}
+	s.nextExpireAt = now.Add(interval)
 }
 
 func (s *ToolExecutionContextStore) expireLocked(now time.Time) {

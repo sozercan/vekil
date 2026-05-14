@@ -136,9 +136,9 @@ func (h *ProxyHandler) maybeRewriteOrCaptureOpenAIChatToolCommands(ctx context.C
 			}
 
 			if store != nil {
-				filterHint := ResolveFilterHint(originalCommand, call.Function.Name)
+				filterHint := ResolveFilterHint(originalCommand)
 				if filterHint == "" && rewrittenCommand != originalCommand {
-					filterHint = ResolveFilterHint(rewrittenCommand, call.Function.Name)
+					filterHint = ResolveFilterHint(rewrittenCommand)
 				}
 				toolCtx := ToolExecutionContext{
 					CallID:           strings.TrimSpace(call.ID),

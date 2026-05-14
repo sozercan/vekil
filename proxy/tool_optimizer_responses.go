@@ -97,9 +97,9 @@ func (h *ProxyHandler) maybeRewriteOrCaptureToolCommandItem(ctx context.Context,
 	}
 
 	if store != nil && scope != "" {
-		filterHint := ResolveFilterHint(originalCommand, item.ToolName)
+		filterHint := ResolveFilterHint(originalCommand)
 		if filterHint == "" && rewrittenCommand != originalCommand {
-			filterHint = ResolveFilterHint(rewrittenCommand, item.ToolName)
+			filterHint = ResolveFilterHint(rewrittenCommand)
 		}
 		store.Put(scope, ToolExecutionContext{
 			CallID:           item.CallID,
@@ -131,6 +131,12 @@ func (h *ProxyHandler) maybeReduceResponsesToolOutputsInRequestBody(ctx context.
 	if err := json.Unmarshal(rawInput, &inputItems); err != nil {
 		return bodyBytes, 0
 	}
+	// First pass: capture any function_call items present in the input array
+	// so that replayed call+output pairs in the same request body are handled.
+	for _, rawItem := range inputItems {
+		h.maybeRewriteOrCaptureToolCommandItem(ctx, rawItem, store, scope, false)
+	}
+
 	changedCount := 0
 	for i, rawItem := range inputItems {
 		outputItem, ok := extractFunctionCallOutputItem(rawItem)
