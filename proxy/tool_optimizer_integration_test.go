@@ -209,6 +209,113 @@ func TestHandleResponses_ToolOptimizerRewritesCommandAndReducesOutput(t *testing
 	}
 }
 
+func TestHandleResponses_ToolOptimizerUsesPreviousResponseIDWhenClientRequestIDChanges(t *testing.T) {
+	fake := &recordingToolOptimizer{}
+
+	var mu sync.Mutex
+	var upstreamBodies []map[string]interface{}
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body := decodeRequestBodyForToolOptimizerTest(t, r)
+		mu.Lock()
+		upstreamBodies = append(upstreamBodies, body)
+		requestNumber := len(upstreamBodies)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch requestNumber {
+		case 1:
+			writeJSONForToolOptimizerTest(t, w, map[string]interface{}{
+				"id":     "resp-client-request-tool-1",
+				"object": "response",
+				"status": "completed",
+				"output": []interface{}{
+					shellCommandItemForToolOptimizerTest(t, "call-client-request-tool-1", "grep foo big.log"),
+				},
+			})
+		default:
+			writeJSONForToolOptimizerTest(t, w, map[string]interface{}{
+				"id":     "resp-client-request-tool-2",
+				"object": "response",
+				"status": "completed",
+				"output": []interface{}{},
+			})
+		}
+	})
+	configureRecordingToolOptimizer(handler, fake)
+
+	firstResp := postResponsesForToolOptimizerTestWithHeaders(t, handler, `{
+		"model": "gpt-4",
+		"input": "run a command",
+		"stream": false
+	}`, map[string]string{"X-Client-Request-Id": "client-request-1"})
+	defer firstResp.Body.Close()
+
+	if firstResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(firstResp.Body)
+		t.Fatalf("expected first response status 200, got %d: %s", firstResp.StatusCode, body)
+	}
+	firstPayload := decodeJSONBodyForToolOptimizerTest(t, firstResp.Body)
+	firstOutput := outputItemsForToolOptimizerTest(t, firstPayload)
+	if len(firstOutput) != 1 {
+		t.Fatalf("expected 1 first output item, got %d", len(firstOutput))
+	}
+	if gotCommand := shellCommandFromItemForToolOptimizerTest(t, firstOutput[0]); gotCommand != "rg foo big.log" {
+		t.Fatalf("expected rewritten command, got %q", gotCommand)
+	}
+
+	secondResp := postResponsesForToolOptimizerTestWithHeaders(t, handler, `{
+		"model": "gpt-4",
+		"previous_response_id": "resp-client-request-tool-1",
+		"input": [
+			{
+				"type": "function_call_output",
+				"call_id": "call-client-request-tool-1",
+				"output": "large output"
+			}
+		],
+		"stream": false
+	}`, map[string]string{"X-Client-Request-Id": "client-request-2"})
+	defer secondResp.Body.Close()
+
+	if secondResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(secondResp.Body)
+		t.Fatalf("expected second response status 200, got %d: %s", secondResp.StatusCode, body)
+	}
+
+	mu.Lock()
+	if len(upstreamBodies) != 2 {
+		t.Fatalf("expected 2 upstream requests, got %d", len(upstreamBodies))
+	}
+	secondUpstreamBody := upstreamBodies[1]
+	mu.Unlock()
+
+	items := upstreamInputItems(t, secondUpstreamBody)
+	foundReducedOutput := false
+	for _, item := range items {
+		if item["type"] == "function_call_output" && item["call_id"] == "call-client-request-tool-1" {
+			foundReducedOutput = true
+			if got := item["output"]; got != "reduced output" {
+				t.Fatalf("expected reduced tool output upstream, got %v", got)
+			}
+		}
+	}
+	if !foundReducedOutput {
+		t.Fatalf("expected second upstream request to contain function_call_output")
+	}
+
+	if rewriteRequests := fake.snapshotRewriteRequests(); len(rewriteRequests) != 1 {
+		t.Fatalf("expected 1 rewrite request, got %d", len(rewriteRequests))
+	}
+	reduceRequests := fake.snapshotReduceRequests()
+	if len(reduceRequests) != 1 {
+		t.Fatalf("expected 1 reduce request, got %d", len(reduceRequests))
+	}
+	if reduceRequests[0].Command != "rg foo big.log" {
+		t.Fatalf("expected reduce command to use rewritten command from previous response, got %q", reduceRequests[0].Command)
+	}
+}
+
 func TestHandleResponses_ToolOptimizerRewritesExecCommandCmdArgPathAndReducesOutput(t *testing.T) {
 	fake := &recordingToolOptimizer{}
 
@@ -475,11 +582,11 @@ func TestHandleResponses_ToolOptimizerCapturesStreamingCommandWithPreviousRespon
 	})
 	configureRecordingToolOptimizer(handler, fake)
 
-	firstResp := postResponsesForToolOptimizerTestWithSessionID(t, handler, `{
+	firstResp := postResponsesForToolOptimizerTestWithHeaders(t, handler, `{
 		"model": "gpt-4",
 		"input": "run a command",
 		"stream": true
-	}`, "")
+	}`, map[string]string{"X-Client-Request-Id": "stream-client-request-1"})
 	defer firstResp.Body.Close()
 
 	if firstResp.StatusCode != http.StatusOK {
@@ -494,7 +601,7 @@ func TestHandleResponses_ToolOptimizerCapturesStreamingCommandWithPreviousRespon
 		t.Fatalf("expected first streaming response to contain tool call, got %s", firstBody)
 	}
 
-	secondResp := postResponsesForToolOptimizerTestWithSessionID(t, handler, `{
+	secondResp := postResponsesForToolOptimizerTestWithHeaders(t, handler, `{
 		"model": "gpt-4",
 		"previous_response_id": "resp-stream-tool-1",
 		"input": [
@@ -505,7 +612,7 @@ func TestHandleResponses_ToolOptimizerCapturesStreamingCommandWithPreviousRespon
 			}
 		],
 		"stream": true
-	}`, "")
+	}`, map[string]string{"X-Client-Request-Id": "stream-client-request-2"})
 	defer secondResp.Body.Close()
 
 	if secondResp.StatusCode != http.StatusOK {
@@ -1196,10 +1303,22 @@ func postResponsesForToolOptimizerTest(t *testing.T, handler *ProxyHandler, body
 func postResponsesForToolOptimizerTestWithSessionID(t *testing.T, handler *ProxyHandler, body string, sessionID string) *http.Response {
 	t.Helper()
 
+	headers := map[string]string{}
+	if sessionID != "" {
+		headers["session_id"] = sessionID
+	}
+	return postResponsesForToolOptimizerTestWithHeaders(t, handler, body, headers)
+}
+
+func postResponsesForToolOptimizerTestWithHeaders(t *testing.T, handler *ProxyHandler, body string, headers map[string]string) *http.Response {
+	t.Helper()
+
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	if sessionID != "" {
-		req.Header.Set("session_id", sessionID)
+	for k, v := range headers {
+		if v != "" {
+			req.Header.Set(k, v)
+		}
 	}
 
 	w := httptest.NewRecorder()

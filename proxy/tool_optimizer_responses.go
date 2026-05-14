@@ -37,6 +37,27 @@ func toolExecutionScopeFromResponseID(responseID string) string {
 	return responsesToolExecutionScopePrefix + responseID
 }
 
+func isClientRequestToolExecutionScope(scope string) bool {
+	return strings.HasPrefix(strings.TrimSpace(scope), "client-request:")
+}
+
+func uniqueToolExecutionScopes(scopes ...string) []string {
+	seen := make(map[string]struct{}, len(scopes))
+	out := make([]string, 0, len(scopes))
+	for _, scope := range scopes {
+		scope = strings.TrimSpace(scope)
+		if scope == "" {
+			continue
+		}
+		if _, ok := seen[scope]; ok {
+			continue
+		}
+		seen[scope] = struct{}{}
+		out = append(out, scope)
+	}
+	return out
+}
+
 func toolExecutionScopeFromPreviousResponseID(bodyBytes []byte) string {
 	var partial struct {
 		PreviousResponseID string `json:"previous_response_id,omitempty"`
@@ -59,10 +80,15 @@ func toolExecutionScopeFromResponsePayload(payload map[string]json.RawMessage) s
 }
 
 func responsesRequestToolExecutionScope(headerScope string, bodyBytes []byte) string {
-	if scope := strings.TrimSpace(headerScope); scope != "" {
+	previousScope := toolExecutionScopeFromPreviousResponseID(bodyBytes)
+	scope := strings.TrimSpace(headerScope)
+	if isClientRequestToolExecutionScope(scope) && previousScope != "" {
+		return previousScope
+	}
+	if scope != "" {
 		return scope
 	}
-	return toolExecutionScopeFromPreviousResponseID(bodyBytes)
+	return previousScope
 }
 
 func newToolExecutionContext(item toolCommandItem, originalCommand, rewrittenCommand, rewriteProvider string) ToolExecutionContext {
@@ -98,13 +124,11 @@ func (h *ProxyHandler) maybeRewriteResponsesResponseBody(ctx context.Context, bo
 	if err := json.Unmarshal(rawOutput, &outputItems); err != nil {
 		return bodyBytes, false
 	}
-	captureScope := strings.TrimSpace(scope)
-	if captureScope == "" {
-		captureScope = toolExecutionScopeFromResponsePayload(payload)
-	}
+	responseScope := toolExecutionScopeFromResponsePayload(payload)
+	captureScopes := uniqueToolExecutionScopes(scope, responseScope)
 	changed := false
 	for i, rawItem := range outputItems {
-		newItem, itemChanged := h.maybeRewriteOrCaptureToolCommandItem(ctx, rawItem, store, captureScope, true)
+		newItem, itemChanged := h.maybeRewriteOrCaptureToolCommandItemInScopes(ctx, rawItem, store, captureScopes, true)
 		if itemChanged {
 			outputItems[i] = newItem
 			changed = true
@@ -126,6 +150,10 @@ func (h *ProxyHandler) maybeRewriteResponsesResponseBody(ctx context.Context, bo
 }
 
 func (h *ProxyHandler) maybeRewriteOrCaptureToolCommandItem(ctx context.Context, rawItem json.RawMessage, store *ToolExecutionContextStore, scope string, allowRewrite bool) (json.RawMessage, bool) {
+	return h.maybeRewriteOrCaptureToolCommandItemInScopes(ctx, rawItem, store, []string{scope}, allowRewrite)
+}
+
+func (h *ProxyHandler) maybeRewriteOrCaptureToolCommandItemInScopes(ctx context.Context, rawItem json.RawMessage, store *ToolExecutionContextStore, scopes []string, allowRewrite bool) (json.RawMessage, bool) {
 	manager := h.toolOptimizers
 	item, ok := extractShellFunctionCommandItem(rawItem, manager)
 	if !ok {
@@ -153,8 +181,11 @@ func (h *ProxyHandler) maybeRewriteOrCaptureToolCommandItem(ctx context.Context,
 		}
 	}
 
-	if store != nil && scope != "" {
-		store.Put(scope, newToolExecutionContext(item, originalCommand, rewrittenCommand, rewriteProvider))
+	if store != nil {
+		toolCtx := newToolExecutionContext(item, originalCommand, rewrittenCommand, rewriteProvider)
+		for _, scope := range uniqueToolExecutionScopes(scopes...) {
+			store.Put(scope, toolCtx)
+		}
 	}
 
 	return rawItem, changed

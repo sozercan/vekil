@@ -100,6 +100,23 @@ func StreamOpenAIPassthroughWithFinalResponse(
 	reader := bufio.NewReaderSize(body, openAIStreamScannerInitialBuffer)
 
 	sawDone := false
+	processLine := func(line string) {
+		data, ok := parseSSELine(strings.TrimRight(line, "\r\n"))
+		if !ok {
+			return
+		}
+		if data == "[DONE]" {
+			sawDone = true
+			return
+		}
+
+		var chunk models.OpenAIStreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			return
+		}
+		aggregator.addChunk(chunk)
+	}
+
 	for {
 		line, err := reader.ReadString('\n')
 		if len(line) > 0 {
@@ -109,6 +126,7 @@ func StreamOpenAIPassthroughWithFinalResponse(
 			if flusher != nil {
 				flusher.Flush()
 			}
+			processLine(line)
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -116,21 +134,6 @@ func StreamOpenAIPassthroughWithFinalResponse(
 			}
 			break
 		}
-
-		data, ok := parseSSELine(strings.TrimRight(line, "\r\n"))
-		if !ok {
-			continue
-		}
-		if data == "[DONE]" {
-			sawDone = true
-			continue
-		}
-
-		var chunk models.OpenAIStreamChunk
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue
-		}
-		aggregator.addChunk(chunk)
 	}
 
 	if !sawDone {

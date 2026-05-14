@@ -706,7 +706,7 @@ func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
 func (t *responsesFailureTap) maybeCaptureToolCommand(eventName string, event responsesWebSocketStreamEvent) {
 	switch eventName {
 	case "response.created", "response.completed":
-		if t.scope == "" && t.responseScope == "" {
+		if t.responseScope == "" {
 			t.responseScope = toolExecutionScopeFromResponseID(event.Response.ID)
 		}
 		return
@@ -718,14 +718,11 @@ func (t *responsesFailureTap) maybeCaptureToolCommand(eventName string, event re
 	if t.h == nil || len(event.Item) == 0 {
 		return
 	}
-	scope := t.scope
-	if scope == "" {
-		scope = t.responseScope
-	}
-	if scope == "" {
+	scopes := uniqueToolExecutionScopes(t.scope, t.responseScope)
+	if len(scopes) == 0 {
 		return
 	}
-	t.h.maybeRewriteOrCaptureToolCommandItem(t.ctx, event.Item, t.store, scope, false)
+	t.h.maybeRewriteOrCaptureToolCommandItemInScopes(t.ctx, event.Item, t.store, scopes, false)
 }
 
 func (t *responsesFailureTap) maybeLog(eventName string, event responsesWebSocketStreamEvent) {

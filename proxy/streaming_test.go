@@ -228,6 +228,24 @@ func TestStreamOpenAIPassthroughWithFinalResponse_CapturesStreamedToolCalls(t *t
 	}
 }
 
+func TestStreamOpenAIPassthroughWithFinalResponse_CapturesDoneWithoutTrailingNewline(t *testing.T) {
+	input := "data: [DONE]"
+	body := io.NopCloser(strings.NewReader(input))
+
+	w := httptest.NewRecorder()
+	var final *models.OpenAIResponse
+	StreamOpenAIPassthroughWithFinalResponse(w, body, func(resp *models.OpenAIResponse) {
+		final = resp
+	})
+
+	if got := w.Body.String(); got != input {
+		t.Fatalf("passthrough body changed: got %q, want %q", got, input)
+	}
+	if final == nil {
+		t.Fatal("final response callback was not invoked")
+	}
+}
+
 func TestStreamOpenAIToAnthropic_TextOnly(t *testing.T) {
 	stop := "stop"
 	idx := 0
