@@ -224,7 +224,9 @@ Important behavior:
 - Shell matching defaults to the tool name `shell_command`.
 - `tools.shell_function_calls.enabled` defaults to `true` once `tool_optimizers.enabled: true` is set, unless you explicitly set it to `false`.
 - The shell command argument path is configurable with `tools.shell_function_calls.command_arg_path`. It defaults to `/command`, and may be any valid JSON Pointer to a string field in the function-call arguments (for example `/cmd` for an `exec_command` tool or `/shell/cmd` for nested arguments).
-- `command_rewrite.streaming_mode` defaults to `disabled`. Command rewrites are applied only when Vekil inspects non-streaming Responses response bodies; websocket/streaming paths capture command context for later output reduction but do not rewrite commands today.
+- `command_rewrite.streaming_mode` defaults to `disabled`, which is the only supported value today. Command rewrites are applied only when Vekil inspects non-streaming Responses response bodies; websocket/streaming paths capture command context for later output reduction but do not rewrite commands today.
+- For `/v1/responses`, stable scope headers are preferred. Headerless clients can still correlate ordinary continuations through `previous_response_id`, and replay bodies that include a `function_call` before its output can be reduced within that same request.
+- For chat-style APIs, cross-request output reduction requires a stable scope header. Headerless chat requests are only reduced when the request replays the matching assistant `tool_calls` before the tool output in the same `messages` array; Vekil does not share chat tool-call context globally across conversations.
 - Optimizers are fail-open. External errors, timeouts, invalid JSON, unsupported provider config, or invalid replacements are ignored and the original payload is used.
 - Command replacements must be changed, non-empty after trimming, at most `32768` bytes, and contain no NUL, carriage-return, or newline characters.
 - Output replacements must be changed and non-empty after trimming.

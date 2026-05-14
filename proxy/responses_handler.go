@@ -52,9 +52,10 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = r.Body.Close() }()
 
 	extraHeaders := responsesExtraHeadersFromRequest(r)
-	toolScope := toolExecutionScopeFromHeaders(extraHeaders)
+	headerToolScope := toolExecutionScopeFromHeaders(extraHeaders)
+	requestToolScope := responsesRequestToolExecutionScope(headerToolScope, bodyBytes)
 
-	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizers(r.Context(), bodyBytes, "responses", true, h.toolContexts, toolScope)
+	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizers(r.Context(), bodyBytes, "responses", true, h.toolContexts, requestToolScope)
 
 	var partial struct {
 		Stream *bool `json:"stream,omitempty"`
@@ -98,11 +99,11 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	if isStreaming && resp.StatusCode == http.StatusOK {
 		model := extractRequestModel(bodyBytes)
-		peekAndForwardResponses(h, w, r, resp, upstreamCancel, model)
+		peekAndForwardResponses(h, w, r, resp, upstreamCancel, model, headerToolScope)
 		return
 	}
 
-	h.writeResponsesUpstreamResponse(w, resp, h.toolContexts, toolScope)
+	h.writeResponsesUpstreamResponse(w, resp, h.toolContexts, headerToolScope)
 }
 
 // compactPrompt is the system instruction used when the upstream does not

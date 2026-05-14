@@ -160,11 +160,11 @@ func (s *responsesPreparedStream) abort() {
 	s.abortFn()
 }
 
-func peekAndForwardResponses(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string) {
-	peekAndForwardResponsesWithConfig(h, w, r, resp, upstreamCancel, model, responsesPrecommitPeekTimeout, responsesPrecommitMaxPeekBytes)
+func peekAndForwardResponses(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, toolScope string) {
+	peekAndForwardResponsesWithConfig(h, w, r, resp, upstreamCancel, model, responsesPrecommitPeekTimeout, responsesPrecommitMaxPeekBytes, toolScope)
 }
 
-func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, peekTimeout time.Duration, maxPeekBytes int) {
+func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r *http.Request, resp *http.Response, upstreamCancel context.CancelFunc, model string, peekTimeout time.Duration, maxPeekBytes int, toolScope string) {
 	if upstreamCancel != nil {
 		defer upstreamCancel()
 	}
@@ -188,7 +188,11 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 	resp = prepared.commitResponse()
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(http.StatusOK)
-	streamResponsesPipeWithFailureLog(h, w, resp.Body, resp.Header)
+	var store *ToolExecutionContextStore
+	if h != nil {
+		store = h.toolContexts
+	}
+	streamResponsesPipeWithFailureLog(h, w, resp.Body, resp.Header, r.Context(), store, toolScope)
 }
 
 func prepareResponsesStreamAttempt(waitCtx, streamCtx context.Context, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
@@ -452,7 +456,7 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 	return "", ""
 }
 
-func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header) {
+func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header, ctx context.Context, store *ToolExecutionContextStore, scope string) {
 	if closer, ok := r.(io.Closer); ok {
 		defer func() { _ = closer.Close() }()
 	}
@@ -462,7 +466,7 @@ func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r
 		fw.flusher = f
 	}
 
-	tap := newResponsesFailureTap(h, upstreamHeaders)
+	tap := newResponsesFailureTap(h, upstreamHeaders, ctx, store, scope)
 	_, _ = io.Copy(fw, io.TeeReader(r, tap))
 }
 
@@ -638,13 +642,23 @@ func nextResponsesSSEMessage(buf []byte, allowBOM bool) (responsesSSEMessage, in
 type responsesFailureTap struct {
 	h               *ProxyHandler
 	upstreamHeaders http.Header
+	ctx             context.Context
+	store           *ToolExecutionContextStore
+	scope           string
+	responseScope   string
 	parser          responsesSSEParser
 }
 
-func newResponsesFailureTap(h *ProxyHandler, upstreamHeaders http.Header) *responsesFailureTap {
+func newResponsesFailureTap(h *ProxyHandler, upstreamHeaders http.Header, ctx context.Context, store *ToolExecutionContextStore, scope string) *responsesFailureTap {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return &responsesFailureTap{
 		h:               h,
 		upstreamHeaders: upstreamHeaders,
+		ctx:             ctx,
+		store:           store,
+		scope:           strings.TrimSpace(scope),
 		parser:          responsesSSEParser{allowBOM: true},
 	}
 }
@@ -656,7 +670,7 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 		if !ok {
 			break
 		}
-		t.maybeLog(msg)
+		t.maybeProcess(msg)
 	}
 	if len(t.parser.pending) > responsesFailureTapMaxBuffer {
 		t.parser.pending = nil
@@ -665,9 +679,14 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (t *responsesFailureTap) maybeLog(msg responsesSSEMessage) {
+func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
 	eventName := strings.TrimSpace(msg.event)
-	if eventName != "response.failed" && eventName != "response.incomplete" && eventName != "" {
+	if eventName != "" &&
+		eventName != "response.created" &&
+		eventName != "response.completed" &&
+		eventName != "response.output_item.done" &&
+		eventName != "response.failed" &&
+		eventName != "response.incomplete" {
 		return
 	}
 
@@ -679,6 +698,39 @@ func (t *responsesFailureTap) maybeLog(msg responsesSSEMessage) {
 	eventType := strings.TrimSpace(event.Type)
 	if eventName == "" {
 		eventName = eventType
+	}
+	t.maybeCaptureToolCommand(eventName, event)
+	t.maybeLog(eventName, event)
+}
+
+func (t *responsesFailureTap) maybeCaptureToolCommand(eventName string, event responsesWebSocketStreamEvent) {
+	switch eventName {
+	case "response.created", "response.completed":
+		if t.scope == "" && t.responseScope == "" {
+			t.responseScope = toolExecutionScopeFromResponseID(event.Response.ID)
+		}
+		return
+	case "response.output_item.done":
+	default:
+		return
+	}
+
+	if t.h == nil || len(event.Item) == 0 {
+		return
+	}
+	scope := t.scope
+	if scope == "" {
+		scope = t.responseScope
+	}
+	if scope == "" {
+		return
+	}
+	t.h.maybeRewriteOrCaptureToolCommandItem(t.ctx, event.Item, t.store, scope, false)
+}
+
+func (t *responsesFailureTap) maybeLog(eventName string, event responsesWebSocketStreamEvent) {
+	if t.h == nil {
+		return
 	}
 	if eventName != "response.failed" && eventName != "response.incomplete" {
 		return

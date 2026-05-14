@@ -9,6 +9,8 @@ import (
 	"github.com/sozercan/vekil/logger"
 )
 
+const responsesToolExecutionScopePrefix = "response:"
+
 func toolExecutionScopeFromHeaders(headers http.Header) string {
 	if headers == nil {
 		return ""
@@ -25,6 +27,57 @@ func toolExecutionScopeFromHeaders(headers http.Header) string {
 		return "client-request:" + clientRequestID
 	}
 	return ""
+}
+
+func toolExecutionScopeFromResponseID(responseID string) string {
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return ""
+	}
+	return responsesToolExecutionScopePrefix + responseID
+}
+
+func toolExecutionScopeFromPreviousResponseID(bodyBytes []byte) string {
+	var partial struct {
+		PreviousResponseID string `json:"previous_response_id,omitempty"`
+	}
+	if err := json.Unmarshal(bodyBytes, &partial); err != nil {
+		return ""
+	}
+	return toolExecutionScopeFromResponseID(partial.PreviousResponseID)
+}
+
+func toolExecutionScopeFromResponsePayload(payload map[string]json.RawMessage) string {
+	if payload == nil {
+		return ""
+	}
+	var responseID string
+	if err := json.Unmarshal(payload["id"], &responseID); err != nil {
+		return ""
+	}
+	return toolExecutionScopeFromResponseID(responseID)
+}
+
+func responsesRequestToolExecutionScope(headerScope string, bodyBytes []byte) string {
+	if scope := strings.TrimSpace(headerScope); scope != "" {
+		return scope
+	}
+	return toolExecutionScopeFromPreviousResponseID(bodyBytes)
+}
+
+func newToolExecutionContext(item toolCommandItem, originalCommand, rewrittenCommand, rewriteProvider string) ToolExecutionContext {
+	filterHint := ResolveFilterHint(originalCommand)
+	if filterHint == "" && rewrittenCommand != originalCommand {
+		filterHint = ResolveFilterHint(rewrittenCommand)
+	}
+	return ToolExecutionContext{
+		CallID:           item.CallID,
+		ToolName:         item.ToolName,
+		OriginalCommand:  originalCommand,
+		RewrittenCommand: rewrittenCommand,
+		RewriteProvider:  rewriteProvider,
+		FilterHint:       filterHint,
+	}
 }
 
 func (h *ProxyHandler) maybeRewriteResponsesResponseBody(ctx context.Context, bodyBytes []byte, store *ToolExecutionContextStore, scope string) ([]byte, bool) {
@@ -45,9 +98,13 @@ func (h *ProxyHandler) maybeRewriteResponsesResponseBody(ctx context.Context, bo
 	if err := json.Unmarshal(rawOutput, &outputItems); err != nil {
 		return bodyBytes, false
 	}
+	captureScope := strings.TrimSpace(scope)
+	if captureScope == "" {
+		captureScope = toolExecutionScopeFromResponsePayload(payload)
+	}
 	changed := false
 	for i, rawItem := range outputItems {
-		newItem, itemChanged := h.maybeRewriteOrCaptureToolCommandItem(ctx, rawItem, store, scope, true)
+		newItem, itemChanged := h.maybeRewriteOrCaptureToolCommandItem(ctx, rawItem, store, captureScope, true)
 		if itemChanged {
 			outputItems[i] = newItem
 			changed = true
@@ -97,18 +154,7 @@ func (h *ProxyHandler) maybeRewriteOrCaptureToolCommandItem(ctx context.Context,
 	}
 
 	if store != nil && scope != "" {
-		filterHint := ResolveFilterHint(originalCommand)
-		if filterHint == "" && rewrittenCommand != originalCommand {
-			filterHint = ResolveFilterHint(rewrittenCommand)
-		}
-		store.Put(scope, ToolExecutionContext{
-			CallID:           item.CallID,
-			ToolName:         item.ToolName,
-			OriginalCommand:  originalCommand,
-			RewrittenCommand: rewrittenCommand,
-			RewriteProvider:  rewriteProvider,
-			FilterHint:       filterHint,
-		})
+		store.Put(scope, newToolExecutionContext(item, originalCommand, rewrittenCommand, rewriteProvider))
 	}
 
 	return rawItem, changed
@@ -116,7 +162,7 @@ func (h *ProxyHandler) maybeRewriteOrCaptureToolCommandItem(ctx context.Context,
 
 func (h *ProxyHandler) maybeReduceResponsesToolOutputsInRequestBody(ctx context.Context, bodyBytes []byte, store *ToolExecutionContextStore, scope string) ([]byte, int) {
 	manager := h.toolOptimizers
-	if manager == nil || !manager.OutputReduceEnabled() || store == nil || scope == "" {
+	if manager == nil || !manager.OutputReduceEnabled() {
 		return bodyBytes, 0
 	}
 	var payload map[string]json.RawMessage
@@ -131,20 +177,34 @@ func (h *ProxyHandler) maybeReduceResponsesToolOutputsInRequestBody(ctx context.
 	if err := json.Unmarshal(rawInput, &inputItems); err != nil {
 		return bodyBytes, 0
 	}
-	// First pass: capture any function_call items present in the input array
-	// so that replayed call+output pairs in the same request body are handled.
-	for _, rawItem := range inputItems {
-		h.maybeRewriteOrCaptureToolCommandItem(ctx, rawItem, store, scope, false)
-	}
 
+	localContexts := make(map[string]ToolExecutionContext)
 	changedCount := 0
 	for i, rawItem := range inputItems {
+		if commandItem, ok := extractShellFunctionCommandItem(rawItem, manager); ok {
+			toolCtx := newToolExecutionContext(commandItem, commandItem.Command, commandItem.Command, "")
+			localContexts[commandItem.CallID] = toolCtx
+			if store != nil && scope != "" {
+				if _, exists := store.Get(scope, toolCtx.CallID); !exists {
+					store.Put(scope, toolCtx)
+				}
+			}
+			continue
+		}
+
 		outputItem, ok := extractFunctionCallOutputItem(rawItem)
 		if !ok {
 			continue
 		}
-		toolCtx, ok := store.Get(scope, outputItem.CallID)
-		if !ok {
+		var toolCtx ToolExecutionContext
+		var foundContext bool
+		if store != nil && scope != "" {
+			toolCtx, foundContext = store.Get(scope, outputItem.CallID)
+		}
+		if !foundContext {
+			toolCtx, foundContext = localContexts[outputItem.CallID]
+		}
+		if !foundContext {
 			continue
 		}
 		command := firstNonEmpty(toolCtx.RewrittenCommand, toolCtx.OriginalCommand)

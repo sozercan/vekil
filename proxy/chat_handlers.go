@@ -172,9 +172,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 				resp.Body,
 				req.Model,
 				"msg_"+uuid.New().String(),
-				func(oaiResp *models.OpenAIResponse) {
-					h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
-				},
+				h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope),
 			)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
@@ -226,9 +224,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
 			copyPassthroughHeaders(w.Header(), resp.Header)
-			StreamOpenAIPassthroughWithFinalResponse(w, resp.Body, func(oaiResp *models.OpenAIResponse) {
-				h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
-			})
+			StreamOpenAIPassthroughWithFinalResponse(w, resp.Body, h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope))
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, true)

@@ -91,33 +91,38 @@ func StreamOpenAIPassthroughWithFinalResponse(
 		flusher = f
 	}
 
-	var aggregator *openAIResponseAggregator
-	if onFinalResponse != nil {
-		aggregator = newOpenAIResponseAggregator()
+	if onFinalResponse == nil {
+		_, _ = io.Copy(&flushWriter{w: w, flusher: flusher}, body)
+		return
 	}
 
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, openAIStreamScannerInitialBuffer), openAIStreamScannerMaxBuffer)
+	aggregator := newOpenAIResponseAggregator()
+	reader := bufio.NewReaderSize(body, openAIStreamScannerInitialBuffer)
 
 	sawDone := false
-	for scanner.Scan() {
-		line := scanner.Text()
-		if _, err := io.WriteString(w, line+"\n"); err != nil {
-			return
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			if _, writeErr := io.WriteString(w, line); writeErr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
 		}
-		if flusher != nil {
-			flusher.Flush()
+		if err != nil {
+			if err != io.EOF {
+				return
+			}
+			break
 		}
 
-		data, ok := parseSSELine(line)
+		data, ok := parseSSELine(strings.TrimRight(line, "\r\n"))
 		if !ok {
 			continue
 		}
 		if data == "[DONE]" {
 			sawDone = true
-			continue
-		}
-		if aggregator == nil {
 			continue
 		}
 
@@ -128,7 +133,7 @@ func StreamOpenAIPassthroughWithFinalResponse(
 		aggregator.addChunk(chunk)
 	}
 
-	if scanner.Err() != nil || !sawDone || onFinalResponse == nil {
+	if !sawDone {
 		return
 	}
 	onFinalResponse(aggregator.buildResponse())

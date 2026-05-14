@@ -78,6 +78,18 @@ func TestStreamOpenAIPassthrough(t *testing.T) {
 	}
 }
 
+func TestStreamOpenAIPassthrough_PreservesOversizedSSELine(t *testing.T) {
+	input := "data: " + oversizedSSEPayload() + "\n\ndata: [DONE]\n\n"
+	body := io.NopCloser(strings.NewReader(input))
+
+	w := httptest.NewRecorder()
+	StreamOpenAIPassthrough(w, body)
+
+	if got := w.Body.String(); got != input {
+		t.Fatalf("passthrough body changed: got %d bytes, want %d bytes", len(got), len(input))
+	}
+}
+
 func TestStreamOpenAIPassthroughWithFinalResponse_CapturesStreamedToolCalls(t *testing.T) {
 	toolStop := "tool_calls"
 	idx := 0

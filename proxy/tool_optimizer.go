@@ -87,13 +87,6 @@ func (m *ToolOptimizerManager) ShouldInspectNonStreamingResponses() bool {
 	return m != nil && m.cfg.Enabled && (m.cfg.CommandRewrite.Enabled || m.cfg.OutputReduce.Enabled)
 }
 
-func (m *ToolOptimizerManager) StreamingCommandRewriteEnabled() bool {
-	if !m.CommandRewriteEnabled() {
-		return false
-	}
-	return !strings.EqualFold(strings.TrimSpace(m.cfg.CommandRewrite.StreamingMode), defaultToolOptimizerStreamingModeDisabled)
-}
-
 func (m *ToolOptimizerManager) ShellFunctionCallsEnabled() bool {
 	return m != nil && m.cfg.Enabled && m.cfg.Tools.ShellFunctionCalls.enabled()
 }

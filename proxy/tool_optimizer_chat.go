@@ -13,17 +13,12 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-const openAIChatGlobalToolExecutionScope = "__openai_chat_tool_calls__"
-
 func openAIChatToolExecutionCaptureScopes(scope string) []string {
 	normalizedScope := strings.TrimSpace(scope)
 	if normalizedScope == "" {
-		return []string{openAIChatGlobalToolExecutionScope}
+		return nil
 	}
-	if normalizedScope == openAIChatGlobalToolExecutionScope {
-		return []string{normalizedScope}
-	}
-	return []string{normalizedScope, openAIChatGlobalToolExecutionScope}
+	return []string{normalizedScope}
 }
 
 func openAIChatToolExecutionLookupScopes(scope string) []string {
@@ -32,13 +27,17 @@ func openAIChatToolExecutionLookupScopes(scope string) []string {
 
 func (h *ProxyHandler) maybeReduceOpenAIChatToolOutputs(ctx context.Context, req *models.OpenAIRequest, store *ToolExecutionContextStore, scope string) int {
 	manager := h.toolOptimizers
-	if manager == nil || !manager.OutputReduceEnabled() || req == nil || store == nil {
+	if manager == nil || !manager.OutputReduceEnabled() || req == nil {
 		return 0
 	}
 
 	changedCount := 0
+	localContexts := make(map[string]ToolExecutionContext)
 	for i := range req.Messages {
 		msg := &req.Messages[i]
+		for _, toolCall := range msg.ToolCalls {
+			h.captureOpenAIChatToolCallContext(toolCall, localContexts, store, scope)
+		}
 		if msg.Role != "tool" || strings.TrimSpace(msg.ToolCallID) == "" {
 			continue
 		}
@@ -49,6 +48,11 @@ func (h *ProxyHandler) maybeReduceOpenAIChatToolOutputs(ctx context.Context, req
 		}
 
 		reduced, ok := h.reduceOpenAIChatToolOutput(ctx, msg.ToolCallID, output, store, scope)
+		if !ok {
+			if toolCtx, hasLocalContext := localContexts[strings.TrimSpace(msg.ToolCallID)]; hasLocalContext {
+				reduced, ok = h.reduceOpenAIChatToolOutputWithContext(ctx, msg.ToolCallID, output, toolCtx)
+			}
+		}
 		if !ok {
 			continue
 		}
@@ -61,6 +65,26 @@ func (h *ProxyHandler) maybeReduceOpenAIChatToolOutputs(ctx context.Context, req
 		changedCount++
 	}
 	return changedCount
+}
+
+func (h *ProxyHandler) reduceOpenAIChatToolOutputWithContext(ctx context.Context, callID, output string, toolCtx ToolExecutionContext) (string, bool) {
+	manager := h.toolOptimizers
+	if manager == nil || !manager.OutputReduceEnabled() || strings.TrimSpace(callID) == "" {
+		return output, false
+	}
+
+	command := firstNonEmpty(toolCtx.RewrittenCommand, toolCtx.OriginalCommand)
+	result := manager.ReduceOutput(ctx, ToolOutputReduceRequest{
+		ToolName:   toolCtx.ToolName,
+		CallID:     strings.TrimSpace(callID),
+		Command:    command,
+		FilterHint: toolCtx.FilterHint,
+		Output:     output,
+	})
+	if !result.Changed {
+		return output, false
+	}
+	return result.Output, true
 }
 
 func (h *ProxyHandler) reduceOpenAIChatToolOutput(ctx context.Context, callID, output string, store *ToolExecutionContextStore, scope string) (string, bool) {
@@ -82,18 +106,7 @@ func (h *ProxyHandler) reduceOpenAIChatToolOutput(ctx context.Context, callID, o
 		return output, false
 	}
 
-	command := firstNonEmpty(toolCtx.RewrittenCommand, toolCtx.OriginalCommand)
-	result := manager.ReduceOutput(ctx, ToolOutputReduceRequest{
-		ToolName:   toolCtx.ToolName,
-		CallID:     strings.TrimSpace(callID),
-		Command:    command,
-		FilterHint: toolCtx.FilterHint,
-		Output:     output,
-	})
-	if !result.Changed {
-		return output, false
-	}
-	return result.Output, true
+	return h.reduceOpenAIChatToolOutputWithContext(ctx, callID, output, toolCtx)
 }
 
 func (h *ProxyHandler) maybeRewriteOrCaptureOpenAIChatToolCommands(ctx context.Context, resp *models.OpenAIResponse, store *ToolExecutionContextStore, scope string, allowRewrite bool) int {
@@ -136,18 +149,11 @@ func (h *ProxyHandler) maybeRewriteOrCaptureOpenAIChatToolCommands(ctx context.C
 			}
 
 			if store != nil {
-				filterHint := ResolveFilterHint(originalCommand)
-				if filterHint == "" && rewrittenCommand != originalCommand {
-					filterHint = ResolveFilterHint(rewrittenCommand)
-				}
-				toolCtx := ToolExecutionContext{
-					CallID:           strings.TrimSpace(call.ID),
-					ToolName:         strings.TrimSpace(call.Function.Name),
-					OriginalCommand:  originalCommand,
-					RewrittenCommand: rewrittenCommand,
-					RewriteProvider:  rewriteProvider,
-					FilterHint:       filterHint,
-				}
+				toolCtx := newToolExecutionContext(toolCommandItem{
+					ToolName: strings.TrimSpace(call.Function.Name),
+					CallID:   strings.TrimSpace(call.ID),
+					Command:  originalCommand,
+				}, originalCommand, rewrittenCommand, rewriteProvider)
 				for _, captureScope := range openAIChatToolExecutionCaptureScopes(scope) {
 					store.Put(captureScope, toolCtx)
 				}
@@ -157,9 +163,48 @@ func (h *ProxyHandler) maybeRewriteOrCaptureOpenAIChatToolCommands(ctx context.C
 	return changedCount
 }
 
+func (h *ProxyHandler) captureOpenAIChatToolCallContext(call models.OpenAIToolCall, localContexts map[string]ToolExecutionContext, store *ToolExecutionContextStore, scope string) {
+	manager := h.toolOptimizers
+	if manager == nil || !manager.OutputReduceEnabled() || strings.TrimSpace(call.ID) == "" || !manager.MatchShellToolName(call.Function.Name) {
+		return
+	}
+
+	originalCommand, ok := extractStringArgumentAtPath(call.Function.Arguments, manager.ShellCommandArgPath())
+	if !ok {
+		return
+	}
+
+	toolCtx := newToolExecutionContext(toolCommandItem{
+		ToolName: strings.TrimSpace(call.Function.Name),
+		CallID:   strings.TrimSpace(call.ID),
+		Command:  originalCommand,
+	}, originalCommand, originalCommand, "")
+
+	if localContexts != nil {
+		localContexts[toolCtx.CallID] = toolCtx
+	}
+	if store == nil {
+		return
+	}
+	for _, captureScope := range openAIChatToolExecutionCaptureScopes(scope) {
+		if _, exists := store.Get(captureScope, toolCtx.CallID); !exists {
+			store.Put(captureScope, toolCtx)
+		}
+	}
+}
+
+func (h *ProxyHandler) openAIChatStreamFinalResponseCallback(ctx context.Context, store *ToolExecutionContextStore, scope string) func(*models.OpenAIResponse) {
+	if h == nil || h.toolOptimizers == nil || !h.toolOptimizers.OutputReduceEnabled() || store == nil || strings.TrimSpace(scope) == "" {
+		return nil
+	}
+	return func(oaiResp *models.OpenAIResponse) {
+		h.maybeRewriteOrCaptureOpenAIChatToolCommands(ctx, oaiResp, store, scope, false)
+	}
+}
+
 func (h *ProxyHandler) rewriteOpenAIChatRequestBodyWithToolOptimizers(ctx context.Context, bodyBytes []byte, store *ToolExecutionContextStore, scope string) []byte {
 	manager := h.toolOptimizers
-	if manager == nil || !manager.OutputReduceEnabled() || store == nil {
+	if manager == nil || !manager.OutputReduceEnabled() {
 		return bodyBytes
 	}
 
@@ -179,14 +224,14 @@ func (h *ProxyHandler) rewriteOpenAIChatRequestBodyWithToolOptimizers(ctx contex
 	}
 
 	changedCount := 0
+	localContexts := make(map[string]ToolExecutionContext)
 	for i, rawMessage := range messages {
-		var msg struct {
-			Role       string          `json:"role"`
-			ToolCallID string          `json:"tool_call_id"`
-			Content    json.RawMessage `json:"content"`
-		}
+		var msg models.OpenAIMessage
 		if err := json.Unmarshal(rawMessage, &msg); err != nil {
 			continue
+		}
+		for _, toolCall := range msg.ToolCalls {
+			h.captureOpenAIChatToolCallContext(toolCall, localContexts, store, scope)
 		}
 		if msg.Role != "tool" || strings.TrimSpace(msg.ToolCallID) == "" {
 			continue
@@ -198,6 +243,11 @@ func (h *ProxyHandler) rewriteOpenAIChatRequestBodyWithToolOptimizers(ctx contex
 		}
 
 		reduced, ok := h.reduceOpenAIChatToolOutput(ctx, msg.ToolCallID, output, store, scope)
+		if !ok {
+			if toolCtx, hasLocalContext := localContexts[strings.TrimSpace(msg.ToolCallID)]; hasLocalContext {
+				reduced, ok = h.reduceOpenAIChatToolOutputWithContext(ctx, msg.ToolCallID, output, toolCtx)
+			}
+		}
 		if !ok {
 			continue
 		}
