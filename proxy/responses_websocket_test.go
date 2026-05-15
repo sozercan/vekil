@@ -916,6 +916,228 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 	}
 }
 
+func TestResponsesWebSocketMaybeRetryCompactedCreateRequestCapsOriginal413Body(t *testing.T) {
+	var upstreamRequests atomic.Int32
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":{"message":"compaction failed"}}`)
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		DisableAutoCompact:  true,
+		AutoCompactKeepTail: 2,
+	}
+
+	largeBody := strings.Repeat("x", compactUpstreamErrorBodySize+1024)
+	resp := &http.Response{
+		StatusCode:    http.StatusRequestEntityTooLarge,
+		Header:        http.Header{"Content-Length": []string{fmt.Sprintf("%d", len(largeBody))}},
+		Body:          io.NopCloser(strings.NewReader(largeBody)),
+		ContentLength: int64(len(largeBody)),
+	}
+	session := &responsesWebSocketSession{
+		ctx: context.Background(),
+		historyItems: []json.RawMessage{
+			json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"first"}]}`),
+			json.RawMessage(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first answer"}]}`),
+			json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"second"}]}`),
+		},
+	}
+	request := &responsesWebSocketCreateRequest{
+		Model:              "gpt-5.4",
+		PreviousResponseID: "resp-prev",
+		Input: []json.RawMessage{
+			json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"latest"}]}`),
+		},
+	}
+
+	got, err := session.maybeRetryCompactedCreateRequest(handler, context.Background(), request, resp, true)
+	if err != nil {
+		t.Fatalf("maybeRetryCompactedCreateRequest returned error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected original response clone, got nil")
+	}
+	if got.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 response, got %d", got.StatusCode)
+	}
+	if upstreamRequests.Load() == 0 {
+		t.Fatal("expected compaction attempt after initial 413")
+	}
+	body, err := io.ReadAll(got.Body)
+	if err != nil {
+		t.Fatalf("failed to read cloned response body: %v", err)
+	}
+	if len(body) != compactUpstreamErrorBodySize {
+		t.Fatalf("expected cloned 413 body capped at %d bytes, got %d", compactUpstreamErrorBodySize, len(body))
+	}
+	if got.ContentLength != int64(compactUpstreamErrorBodySize) {
+		t.Fatalf("expected cloned ContentLength %d, got %d", compactUpstreamErrorBodySize, got.ContentLength)
+	}
+	if got.Header.Get("Content-Length") != "" {
+		t.Fatalf("expected stale Content-Length header to be removed, got %q", got.Header.Get("Content-Length"))
+	}
+}
+
+func TestHandleResponsesWebSocket_ReducesKeepTailWhenCompactedReplayStill413s(t *testing.T) {
+	var upstreamRequestsMu sync.Mutex
+	upstreamRequests := make([]map[string]interface{}, 0, 6)
+	var normalRequests atomic.Int32
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+		upstreamRequestsMu.Lock()
+		upstreamRequests = append(upstreamRequests, body)
+		upstreamRequestsMu.Unlock()
+
+		if instructions, _ := body["instructions"].(string); strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
+			input := upstreamInputItems(t, body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"comp-dynamic-tail-ws","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ws summary for %d items"}]}]}`, len(input))
+			return
+		}
+
+		requestNumber := normalRequests.Add(1)
+		switch requestNumber {
+		case 1:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-1\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"}]}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-2\",\"content\":[{\"type\":\"output_text\",\"text\":\"second\"}]}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-3\",\"content\":[{\"type\":\"output_text\",\"text\":\"third\"}]}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		case 2:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = fmt.Fprint(w, `{"error":{"message":"failed to parse request","code":"payload_too_large"}}`)
+		case 3:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = fmt.Fprint(w, `{"error":{"message":"compacted replay still too large","code":"payload_too_large"}}`)
+		case 4:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		default:
+			t.Fatalf("unexpected normal upstream request count %d", requestNumber)
+		}
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		DisableAutoCompact:  true,
+		AutoCompactKeepTail: 2,
+	}
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	first := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "first turn"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(first); err != nil {
+		t.Fatalf("failed to write first request: %v", err)
+	}
+
+	firstCreated := mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+
+	second := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "second turn"},
+			},
+		},
+	})
+	second["previous_response_id"] = websocketResponseID(t, firstCreated)
+	if err := conn.WriteJSON(second); err != nil {
+		t.Fatalf("failed to write second request: %v", err)
+	}
+
+	created := mustReadWebSocketJSON(t, conn)
+	completed := mustReadWebSocketJSON(t, conn)
+	if created["type"] != "response.created" {
+		t.Fatalf("expected retried response.created event, got %v", created["type"])
+	}
+	if completed["type"] != "response.completed" {
+		t.Fatalf("expected retried response.completed event, got %v", completed["type"])
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	requests := snapshotResponsesWebSocketRequests(&upstreamRequestsMu, upstreamRequests)
+	for len(requests) < 6 {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected 6 upstream requests (turn + 413 + compact + 413 + compact + retry), got %d", len(requests))
+		}
+		time.Sleep(10 * time.Millisecond)
+		requests = snapshotResponsesWebSocketRequests(&upstreamRequestsMu, upstreamRequests)
+	}
+	if len(requests) != 6 {
+		t.Fatalf("expected exactly 6 upstream requests (turn + 413 + compact + 413 + compact + retry), got %d", len(requests))
+	}
+
+	initialReplayInput := upstreamInputItems(t, requests[1])
+	if len(initialReplayInput) != 5 {
+		t.Fatalf("expected oversized replay to include full history plus latest input, got %d items", len(initialReplayInput))
+	}
+	if got := inputTextFromMessage(t, initialReplayInput[0]); got != "first turn" {
+		t.Fatalf("expected oversized replay to start with original user turn, got %q", got)
+	}
+
+	firstCompactionInput := upstreamInputItems(t, requests[2])
+	if len(firstCompactionInput) != 2 {
+		t.Fatalf("expected first compaction to summarize two items with keep-tail 2, got %d", len(firstCompactionInput))
+	}
+	firstRetriedInput := upstreamInputItems(t, requests[3])
+	if len(firstRetriedInput) != 4 {
+		t.Fatalf("expected first retry to keep checkpoint plus 2 history tail items plus latest input, got %d", len(firstRetriedInput))
+	}
+	if got := requireMessageTextWithRole(t, firstRetriedInput[0], "developer"); !strings.Contains(got, "ws summary for 2 items") {
+		t.Fatalf("expected first retry checkpoint for two-item summary, got %q", got)
+	}
+
+	secondCompactionInput := upstreamInputItems(t, requests[4])
+	if len(secondCompactionInput) != 3 {
+		t.Fatalf("expected second compaction to reduce keep-tail to 1 and summarize three items, got %d", len(secondCompactionInput))
+	}
+	secondRetriedInput := upstreamInputItems(t, requests[5])
+	if len(secondRetriedInput) != 3 {
+		t.Fatalf("expected second retry to keep checkpoint plus one history tail item plus latest input, got %d", len(secondRetriedInput))
+	}
+	if got := requireMessageTextWithRole(t, secondRetriedInput[0], "developer"); !strings.Contains(got, "ws summary for 3 items") {
+		t.Fatalf("expected second retry checkpoint for three-item summary, got %q", got)
+	}
+	if secondRetriedInput[1]["role"] != "assistant" {
+		t.Fatalf("expected reduced retry to keep assistant tail item, got %#v", secondRetriedInput[1])
+	}
+	if got := inputTextFromMessage(t, secondRetriedInput[1]); got != "third" {
+		t.Fatalf("expected reduced retry to keep newest assistant tail item, got %q", got)
+	}
+	if got := inputTextFromMessage(t, secondRetriedInput[2]); got != "second turn" {
+		t.Fatalf("expected reduced retry to preserve latest user turn, got %q", got)
+	}
+}
+
 func TestHandleResponsesWebSocket_TurnStateDeltaReplayUsesOnlyCurrentInputAndIgnoresClientTurnStateHeader(t *testing.T) {
 	var upstreamRequestsMu sync.Mutex
 	upstreamRequests := make([]map[string]interface{}, 0, 2)
