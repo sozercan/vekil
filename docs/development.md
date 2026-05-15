@@ -14,11 +14,14 @@ make docker-build
 
 ```bash
 go test ./... -count=1
+make compaction-lab    # fast in-process compaction regression harness
 make test-app          # macOS only; builds and verifies Vekil.app
 scripts/macos-app-smoke.sh  # macOS only; build + launch smoke for Vekil.app
 go test ./proxy/ -run TestHandle -v
 go test ./proxy/ -run TestMapStopReason/stop -v
 ```
+
+`cmd/compaction-lab` starts an in-process proxy and fake `/responses` upstream, then exercises the compact-response shape, opaque compaction replay, remote compaction v2 trigger handling, and websocket `response.processed` control frames. It is intended as a quick deterministic check for compaction regressions before running live Copilot smoke tests.
 
 ## Benchmarks
 
@@ -62,7 +65,7 @@ The repository also includes a manual `Live Copilot Smoke` workflow in [`.github
 
 It builds the proxy, runs [`scripts/live-compact-smoke.sh`](../scripts/live-compact-smoke.sh), installs Codex, Claude Code, and Gemini CLI on a GitHub-hosted runner, and then runs [`scripts/live-cli-smoke.sh`](../scripts/live-cli-smoke.sh).
 
-The compaction smoke script starts the proxy with a non-interactive GitHub token, waits for `/readyz`, selects a currently available OpenAI/Codex model from `/v1/models`, posts to `/v1/responses/compact`, verifies that the response contains both a summary message and a non-empty compaction item, and replays that compaction item through `/v1/responses`.
+The compaction smoke script starts the proxy with a non-interactive GitHub token, waits for `/readyz`, selects a currently available OpenAI/Codex model from `/v1/models`, posts to `/v1/responses/compact`, verifies that the response contains a non-empty compaction item, and replays that compaction item through `/v1/responses`.
 
 The CLI smoke script starts the proxy with the same token pattern, waits for `/readyz`, selects currently available OpenAI, Anthropic, and Gemini models from `/v1/models`, and runs one file-reading headless check per CLI using isolated temp-home config directories.
 

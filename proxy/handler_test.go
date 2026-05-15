@@ -768,11 +768,14 @@ func TestHandleResponses_RoutesConfiguredAzureModelAndPreservesPriorityServiceTi
 }
 
 func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
-	var gotOpenAIBeta, gotSessionID, gotClientRequestID string
+	var gotOpenAIBeta, gotLegacySessionID, gotSessionID, gotThreadID, gotClientRequestID, gotInstallationID string
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		gotOpenAIBeta = r.Header.Get("OpenAI-Beta")
-		gotSessionID = r.Header.Get("session_id")
+		gotLegacySessionID = r.Header.Get("session_id")
+		gotSessionID = r.Header.Get("session-id")
+		gotThreadID = r.Header.Get("thread-id")
 		gotClientRequestID = r.Header.Get("X-Client-Request-Id")
+		gotInstallationID = r.Header.Get("X-Codex-Installation-Id")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp-headers","object":"response","status":"completed"}`))
 	})
@@ -781,7 +784,10 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("OpenAI-Beta", "responses_websockets=2026-02-06")
 	req.Header.Set("session_id", "sess-abc-123")
+	req.Header.Set("session-id", "sess-hyphen-123")
+	req.Header.Set("thread-id", "thread-abc-123")
 	req.Header.Set("X-Client-Request-Id", "client-req-456")
+	req.Header.Set("X-Codex-Installation-Id", "install-789")
 	w := httptest.NewRecorder()
 
 	handler.HandleResponses(w, req)
@@ -795,11 +801,20 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	if gotOpenAIBeta != "responses_websockets=2026-02-06" {
 		t.Fatalf("expected OpenAI-Beta to be forwarded, got %q", gotOpenAIBeta)
 	}
-	if gotSessionID != "sess-abc-123" {
-		t.Fatalf("expected session_id to be forwarded, got %q", gotSessionID)
+	if gotLegacySessionID != "sess-abc-123" {
+		t.Fatalf("expected session_id to be forwarded, got %q", gotLegacySessionID)
+	}
+	if gotSessionID != "sess-hyphen-123" {
+		t.Fatalf("expected session-id to be forwarded, got %q", gotSessionID)
+	}
+	if gotThreadID != "thread-abc-123" {
+		t.Fatalf("expected thread-id to be forwarded, got %q", gotThreadID)
 	}
 	if gotClientRequestID != "client-req-456" {
 		t.Fatalf("expected X-Client-Request-Id to be forwarded, got %q", gotClientRequestID)
+	}
+	if gotInstallationID != "install-789" {
+		t.Fatalf("expected X-Codex-Installation-Id to be forwarded, got %q", gotInstallationID)
 	}
 }
 
@@ -1015,19 +1030,19 @@ func TestHandleCompact(t *testing.T) {
 		t.Fatalf("failed to parse response: %v", err)
 	}
 	if len(result.Output) != 2 {
-		t.Fatalf("expected 2 output items (message + compaction), got %d", len(result.Output))
+		t.Fatalf("expected retained message plus compaction item, got %d output items", len(result.Output))
 	}
-	// First item: assistant message with summary
+	// First item: retained original user message.
 	if result.Output[0].Type != "message" {
 		t.Errorf("expected first item type message, got %q", result.Output[0].Type)
 	}
-	if result.Output[0].Role != "assistant" {
-		t.Errorf("expected role assistant, got %q", result.Output[0].Role)
+	if result.Output[0].Role != "user" {
+		t.Errorf("expected role user, got %q", result.Output[0].Role)
 	}
-	if len(result.Output[0].Content) == 0 || result.Output[0].Content[0].Text != "compacted summary of conversation" {
-		t.Errorf("expected summary text in message content, got %+v", result.Output[0].Content)
+	if len(result.Output[0].Content) == 0 || result.Output[0].Content[0].Text != "Hello" {
+		t.Errorf("expected retained user text in message content, got %+v", result.Output[0].Content)
 	}
-	// Second item: compaction with encrypted_content
+	// Second item: compaction with encrypted_content.
 	if result.Output[1].Type != "compaction" {
 		t.Errorf("expected second item type compaction, got %q", result.Output[1].Type)
 	}
@@ -1215,30 +1230,9 @@ func TestHandleCompact_FallsBackToChunkedCompactionOnUpstream413(t *testing.T) {
 	}
 
 	body, _ := io.ReadAll(resp.Body)
-	var result struct {
-		Output []struct {
-			Type             string `json:"type"`
-			EncryptedContent string `json:"encrypted_content"`
-			Content          []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"output"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		t.Fatalf("failed to parse compact response: %v", err)
-	}
-	if len(result.Output) != 2 {
-		t.Fatalf("expected 2 output items, got %d", len(result.Output))
-	}
-	if result.Output[0].Type != "message" || len(result.Output[0].Content) == 0 || result.Output[0].Content[0].Text != "final merged summary" {
-		t.Fatalf("expected final merged summary message, got %+v", result.Output[0])
-	}
-	if result.Output[1].Type != "compaction" {
-		t.Fatalf("expected compaction item, got %+v", result.Output[1])
-	}
-	if got := decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent); got != "final merged summary" {
-		t.Errorf("expected encoded final merged summary, got %q", got)
+	_, gotCompaction := requireCompactResponseSummaryForTest(t, body)
+	if gotCompaction != "final merged summary" {
+		t.Errorf("expected encoded final merged summary, got %q", gotCompaction)
 	}
 }
 
@@ -1692,24 +1686,9 @@ func TestHandleCompact_FallsBackToChunkedCompactionForStringInputOnUpstream413(t
 	}
 
 	body, _ := io.ReadAll(resp.Body)
-	var result struct {
-		Output []struct {
-			Type             string `json:"type"`
-			EncryptedContent string `json:"encrypted_content"`
-			Content          []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"output"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		t.Fatalf("failed to parse compact response: %v", err)
-	}
-	if len(result.Output) != 2 || result.Output[0].Content[0].Text != "final merged string summary" {
-		t.Fatalf("expected final merged compact response, got %+v", result.Output)
-	}
-	if got := decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent); got != "final merged string summary" {
-		t.Fatalf("expected encoded final merged summary, got %q", got)
+	_, gotCompaction := requireCompactResponseSummaryForTest(t, body)
+	if gotCompaction != "final merged string summary" {
+		t.Fatalf("expected encoded final merged summary, got %q", gotCompaction)
 	}
 }
 
@@ -2884,33 +2863,15 @@ func TestHandleCompact_StripsInlineRenderMarkers(t *testing.T) {
 	}
 
 	body, _ := io.ReadAll(resp.Body)
-	var result struct {
-		Output []struct {
-			Type             string `json:"type"`
-			EncryptedContent string `json:"encrypted_content"`
-			Content          []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"output"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		t.Fatalf("failed to parse response: %v", err)
-	}
-	if len(result.Output) != 2 {
-		t.Fatalf("expected 2 output items, got %d", len(result.Output))
-	}
-
-	gotText := result.Output[0].Content[0].Text
+	gotText, gotCompaction := requireCompactResponseSummaryForTest(t, body)
 	if strings.Contains(gotText, "") || strings.Contains(gotText, "") {
-		t.Fatalf("expected summary text to be sanitized, got %q", gotText)
+		t.Fatalf("expected compaction text to be sanitized, got %q", gotText)
 	}
 	if gotText != "Keep the passthrough tests." {
 		t.Errorf("summary text = %q, want %q", gotText, "Keep the passthrough tests.")
 	}
-
-	if got := decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent); got != "Keep the passthrough tests." {
-		t.Errorf("encoded compaction summary = %q, want %q", got, "Keep the passthrough tests.")
+	if gotCompaction != "Keep the passthrough tests." {
+		t.Errorf("encoded compaction summary = %q, want %q", gotCompaction, "Keep the passthrough tests.")
 	}
 }
 
@@ -2950,26 +2911,9 @@ func TestHandleCompact_ReplacesInstructions(t *testing.T) {
 	}
 
 	body, _ := io.ReadAll(w.Result().Body)
-	var result struct {
-		Output []struct {
-			Type             string `json:"type"`
-			EncryptedContent string `json:"encrypted_content"`
-		} `json:"output"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		t.Fatalf("failed to parse compact response: %v", err)
-	}
-	if len(result.Output) != 2 {
-		t.Fatalf("expected 2 output items, got %d", len(result.Output))
-	}
-	if result.Output[0].Type != "message" {
-		t.Errorf("expected first item type message, got %q", result.Output[0].Type)
-	}
-	if result.Output[1].Type != "compaction" {
-		t.Errorf("expected second item type compaction, got %q", result.Output[1].Type)
-	}
-	if got := decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent); got != "custom summary" {
-		t.Errorf("expected encoded custom summary, got %q", got)
+	_, gotCompaction := requireCompactResponseSummaryForTest(t, body)
+	if gotCompaction != "custom summary" {
+		t.Errorf("expected encoded custom summary, got %q", gotCompaction)
 	}
 }
 
@@ -3039,27 +2983,9 @@ func TestHandleCompact_FallsBackWhenModelUnsupported(t *testing.T) {
 	}
 
 	body, _ := io.ReadAll(resp.Body)
-	var result struct {
-		Output []struct {
-			Type             string `json:"type"`
-			EncryptedContent string `json:"encrypted_content"`
-			Content          []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"output"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		t.Fatalf("failed to parse compact response: %v", err)
-	}
-	if len(result.Output) != 2 {
-		t.Fatalf("expected 2 output items, got %d", len(result.Output))
-	}
-	if len(result.Output[0].Content) == 0 || result.Output[0].Content[0].Text != "fallback summary" {
-		t.Fatalf("expected fallback summary in first output item, got %+v", result.Output[0].Content)
-	}
-	if got := decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent); got != "fallback summary" {
-		t.Fatalf("expected encoded fallback summary, got %q", got)
+	_, gotCompaction := requireCompactResponseSummaryForTest(t, body)
+	if gotCompaction != "fallback summary" {
+		t.Fatalf("expected encoded fallback summary, got %q", gotCompaction)
 	}
 }
 
@@ -3195,7 +3121,7 @@ func TestHandleResponses_RewritesLegacyPlaintextCompaction(t *testing.T) {
 
 		contextText := requireCompactionContextMessage(t, input[0])
 		if !strings.Contains(contextText, legacySummary) {
-			t.Errorf("expected legacy summary to be rewritten, got %q", contextText)
+			t.Errorf("expected legacy plaintext summary to be rewritten, got %q", contextText)
 		}
 		resumePrompt := requireMessageTextWithRole(t, input[1], "user")
 		if !strings.Contains(resumePrompt, "Continue from the checkpoint above and resume the interrupted task") {
@@ -4256,16 +4182,15 @@ func requireCompactResponseSummaryForTest(t *testing.T, body []byte) (string, st
 	if err := json.Unmarshal(body, &result); err != nil {
 		t.Fatalf("failed to parse compact response: %v", err)
 	}
-	if len(result.Output) != 2 {
-		t.Fatalf("expected 2 output items, got %d", len(result.Output))
+	for _, item := range result.Output {
+		if item.Type != "compaction" {
+			continue
+		}
+		decoded := decodeCompactionSummaryForTest(t, item.EncryptedContent)
+		return decoded, decoded
 	}
-	if result.Output[0].Type != "message" || len(result.Output[0].Content) == 0 || result.Output[0].Content[0].Type != "output_text" {
-		t.Fatalf("expected compact response summary message, got %+v", result.Output[0])
-	}
-	if result.Output[1].Type != "compaction" {
-		t.Fatalf("expected compact response compaction item, got %+v", result.Output[1])
-	}
-	return result.Output[0].Content[0].Text, decodeCompactionSummaryForTest(t, result.Output[1].EncryptedContent)
+	t.Fatalf("expected compact response compaction item, got %+v", result.Output)
+	return "", ""
 }
 
 func requireCompactionContextMessage(t *testing.T, raw interface{}) string {
@@ -4362,8 +4287,14 @@ func makeOversizedMemorySummarizeRequestBody(t testing.TB) []byte {
 
 func TestRewriteSyntheticCompactionRequest(t *testing.T) {
 	syntheticSummary := "Synthetic checkpoint summary"
-	legacySummary := "Legacy plaintext summary from an older proxy run."
+	legacySyntheticSummary := "Legacy synthetic checkpoint summary"
+	legacyPlaintextSummary := "Legacy plaintext summary from an older proxy run."
 	opaqueToken := strings.Repeat("Abc123_-", 8)
+	opaqueTokenWithProviderChars := "opaque+server/token/with/slashes=="
+	legacyPayload, err := json.Marshal(syntheticCompactionPayload{Summary: legacySyntheticSummary})
+	if err != nil {
+		t.Fatalf("marshal legacy payload: %v", err)
+	}
 
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
@@ -4374,11 +4305,19 @@ func TestRewriteSyntheticCompactionRequest(t *testing.T) {
 			},
 			map[string]interface{}{
 				"type":              "compaction",
-				"encrypted_content": legacySummary,
+				"encrypted_content": legacySyntheticCompactionPrefix + base64.RawURLEncoding.EncodeToString(legacyPayload),
+			},
+			map[string]interface{}{
+				"type":              "compaction",
+				"encrypted_content": legacyPlaintextSummary,
 			},
 			map[string]interface{}{
 				"type":              "compaction",
 				"encrypted_content": opaqueToken,
+			},
+			map[string]interface{}{
+				"type":              "compaction",
+				"encrypted_content": opaqueTokenWithProviderChars,
 			},
 		},
 	})
@@ -4387,8 +4326,8 @@ func TestRewriteSyntheticCompactionRequest(t *testing.T) {
 	}
 
 	rewritten, rewriteCount := rewriteSyntheticCompactionRequest(reqBody)
-	if rewriteCount != 2 {
-		t.Fatalf("expected 2 rewritten compaction items, got %d", rewriteCount)
+	if rewriteCount != 3 {
+		t.Fatalf("expected 3 rewritten compaction items, got %d", rewriteCount)
 	}
 
 	var req map[string]interface{}
@@ -4397,23 +4336,172 @@ func TestRewriteSyntheticCompactionRequest(t *testing.T) {
 	}
 
 	input, ok := req["input"].([]interface{})
-	if !ok || len(input) != 3 {
-		t.Fatalf("expected 3 input items, got %#v", req["input"])
+	if !ok || len(input) != 5 {
+		t.Fatalf("expected 5 input items, got %#v", req["input"])
 	}
 
 	if got := requireCompactionContextMessage(t, input[0]); !strings.Contains(got, syntheticSummary) {
 		t.Errorf("expected synthetic summary to be rewritten, got %q", got)
 	}
-	if got := requireCompactionContextMessage(t, input[1]); !strings.Contains(got, legacySummary) {
-		t.Errorf("expected legacy summary to be rewritten, got %q", got)
+	if got := requireCompactionContextMessage(t, input[1]); !strings.Contains(got, legacySyntheticSummary) {
+		t.Errorf("expected legacy synthetic summary to be rewritten, got %q", got)
+	}
+	if got := requireCompactionContextMessage(t, input[2]); !strings.Contains(got, legacyPlaintextSummary) {
+		t.Errorf("expected legacy plaintext summary to be rewritten, got %q", got)
 	}
 
-	item, ok := input[2].(map[string]interface{})
-	if !ok {
-		t.Fatalf("expected opaque item object, got %#v", input[2])
+	for i, want := range map[int]string{3: opaqueToken, 4: opaqueTokenWithProviderChars} {
+		item, ok := input[i].(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected opaque item object, got %#v", input[i])
+		}
+		if item["type"] != "compaction" {
+			t.Fatalf("expected unknown token to remain a compaction item, got %#v", item)
+		}
+		if item["encrypted_content"] != want {
+			t.Fatalf("expected unknown token %q to be preserved, got %#v", want, item["encrypted_content"])
+		}
 	}
-	if item["type"] != "compaction" {
-		t.Fatalf("expected opaque token to remain a compaction item, got %#v", item)
+}
+
+func TestRewriteSyntheticCompactionRequest_LaterUserInstructionTakesPrecedence(t *testing.T) {
+	summary := "Previous task: update proxy/tool_optimizer_responses_test.go and report done."
+	latestUserInstruction := "go through all the github code review comments in #116"
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type":              "compaction",
+				"encrypted_content": encodeSyntheticCompaction(summary),
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": latestUserInstruction},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	rewritten, rewriteCount := rewriteSyntheticCompactionRequest(reqBody)
+	if rewriteCount != 1 {
+		t.Fatalf("expected 1 rewritten compaction item, got %d", rewriteCount)
+	}
+	rewritten, injected := injectSyntheticCompactionResumePrompt(rewritten)
+	if injected {
+		t.Fatal("expected resume prompt injection to be skipped when a later user instruction exists")
+	}
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(rewritten, &req); err != nil {
+		t.Fatalf("failed to parse rewritten request: %v", err)
+	}
+
+	input, ok := req["input"].([]interface{})
+	if !ok || len(input) != 2 {
+		t.Fatalf("expected 2 input items, got %#v", req["input"])
+	}
+
+	contextText := requireCompactionContextMessage(t, input[0])
+	if !strings.Contains(contextText, "Messages after this checkpoint are the active request and take precedence") {
+		t.Fatalf("expected checkpoint to defer to later user instructions, got %q", contextText)
+	}
+	if strings.Contains(contextText, "Continue the same task immediately") {
+		t.Fatalf("checkpoint must not force stale work ahead of a later user instruction, got %q", contextText)
+	}
+	if got := requireMessageTextWithRole(t, input[1], "user"); got != latestUserInstruction {
+		t.Fatalf("expected latest user instruction to be preserved, got %q", got)
+	}
+}
+
+func TestRewriteSyntheticCompactionRequest_CodexPostCompactionOrdering(t *testing.T) {
+	summary := "Prior compacted work said to finish the old smoke-test task."
+	latestUserInstruction := "USER_THREE"
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "USER_ONE"},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "USER_TWO"},
+				},
+			},
+			map[string]interface{}{
+				"type":              "compaction",
+				"encrypted_content": encodeSyntheticCompaction(summary),
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "developer",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "<PERMISSIONS_INSTRUCTIONS>"},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>"},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": latestUserInstruction},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	rewritten, rewriteCount := rewriteSyntheticCompactionRequest(reqBody)
+	if rewriteCount != 1 {
+		t.Fatalf("expected 1 rewritten compaction item, got %d", rewriteCount)
+	}
+	rewritten, injected := injectSyntheticCompactionResumePrompt(rewritten)
+	if injected {
+		t.Fatal("expected resume prompt injection to be skipped when Codex includes a later user instruction")
+	}
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(rewritten, &req); err != nil {
+		t.Fatalf("failed to parse rewritten request: %v", err)
+	}
+
+	input, ok := req["input"].([]interface{})
+	if !ok || len(input) != 6 {
+		t.Fatalf("expected 6 input items, got %#v", req["input"])
+	}
+	if got := requireMessageTextWithRole(t, input[0], "user"); got != "USER_ONE" {
+		t.Fatalf("expected historical user one to be preserved, got %q", got)
+	}
+	contextText := requireMessageTextWithRole(t, input[2], "developer")
+	if !strings.Contains(contextText, "Messages after this checkpoint are the active request and take precedence") {
+		t.Fatalf("expected checkpoint to defer to Codex's later request items, got %q", contextText)
+	}
+	if strings.Contains(contextText, "Continue the same task immediately") {
+		t.Fatalf("checkpoint must not force stale work ahead of later Codex request items, got %q", contextText)
+	}
+	if got := requireMessageTextWithRole(t, input[3], "developer"); got != "<PERMISSIONS_INSTRUCTIONS>" {
+		t.Fatalf("expected later developer instructions to be preserved, got %q", got)
+	}
+	if got := requireMessageTextWithRole(t, input[5], "user"); got != latestUserInstruction {
+		t.Fatalf("expected latest user instruction to be preserved, got %q", got)
 	}
 }
 
@@ -4530,14 +4618,19 @@ func TestExtractSyntheticOrLegacyCompactionSummary(t *testing.T) {
 		t.Fatalf("expected legacy synthetic summary round-trip, got %q ok=%v", got, ok)
 	}
 
-	legacySummary := "The issue is partially fixed."
-	if got, ok := extractSyntheticOrLegacyCompactionSummary(legacySummary); !ok || got != legacySummary {
-		t.Fatalf("expected legacy summary salvage, got %q ok=%v", got, ok)
+	legacyPlaintextSummary := "The issue is partially fixed."
+	if got, ok := extractSyntheticOrLegacyCompactionSummary(legacyPlaintextSummary); !ok || got != legacyPlaintextSummary {
+		t.Fatalf("expected legacy plaintext summary to be recovered, got %q ok=%v", got, ok)
 	}
 
 	opaqueToken := strings.Repeat("Abc123_-", 8)
 	if got, ok := extractSyntheticOrLegacyCompactionSummary(opaqueToken); ok {
 		t.Fatalf("expected opaque token to pass through unchanged, got %q", got)
+	}
+
+	opaqueTokenWithProviderChars := "opaque+server/token/with/slashes=="
+	if got, ok := extractSyntheticOrLegacyCompactionSummary(opaqueTokenWithProviderChars); ok {
+		t.Fatalf("expected provider opaque token to pass through unchanged, got %q", got)
 	}
 }
 

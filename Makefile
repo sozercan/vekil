@@ -15,7 +15,7 @@ SPARKLE_DOWNLOAD_URL := https://github.com/sparkle-project/Sparkle/releases/down
 SPARKLE_FEED_URL ?= https://github.com/sozercan/vekil/releases/latest/download/appcast.xml
 SPARKLE_PUBLIC_ED_KEY ?=
 
-.PHONY: build build-app build-tray-linux test-app test vet lint clean docker-build
+.PHONY: build build-app build-tray-linux test-app test compaction-lab vet lint clean docker-build
 
 build:
 	go build -ldflags="$(LDFLAGS)" -o $(BINARY) .
@@ -98,6 +98,9 @@ build-tray-linux:
 
 test:
 	go test ./... -count=1
+
+compaction-lab:
+	go run ./cmd/compaction-lab
 
 vet:
 	go vet ./...

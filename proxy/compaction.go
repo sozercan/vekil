@@ -253,35 +253,20 @@ func extractSyntheticOrLegacyCompactionSummary(encryptedContent string) (string,
 		}
 		return payload.Summary, true
 	}
-
-	// Legacy fallback: older proxy versions wrote plaintext summaries directly
-	// into encrypted_content. Real upstream tokens are opaque, space-free blobs.
-	if encryptedContent != "" && (!looksOpaqueCompactionToken(encryptedContent) || strings.ContainsAny(encryptedContent, " \t\r\n")) {
+	if isLikelyLegacyPlaintextCompactionSummary(encryptedContent) {
 		return encryptedContent, true
 	}
 	return "", false
 }
 
-func looksOpaqueCompactionToken(token string) bool {
-	if len(token) < 32 {
-		return false
-	}
-	for _, r := range token {
-		switch {
-		case r >= 'a' && r <= 'z':
-		case r >= 'A' && r <= 'Z':
-		case r >= '0' && r <= '9':
-		case r == '-', r == '_', r == '=', r == '.':
-		default:
-			return false
-		}
-	}
-	return true
+func isLikelyLegacyPlaintextCompactionSummary(encryptedContent string) bool {
+	encryptedContent = strings.TrimSpace(encryptedContent)
+	return encryptedContent != "" && strings.ContainsAny(encryptedContent, " \t\r\n")
 }
 
 func proxyCompactionContextMessage(summary string) map[string]interface{} {
 	summary = sanitizeProxySummaryText(summary)
-	text := proxyCompactionContextIntro + " This checkpoint is the active working state for the same conversation, not passive background history.\n\nResume behavior:\n- Continue the same task immediately from this checkpoint.\n- Treat the checkpoint as authoritative for prior progress, constraints, and next steps.\n- Do not ask the user what to work on next unless the checkpoint explicitly says the assistant was blocked waiting for user input or that the task is complete.\n\nCheckpoint summary:\n" + summary
+	text := proxyCompactionContextIntro + " This checkpoint summarizes earlier conversation state for continuity; it is not a new user request.\n\nCheckpoint handling:\n- Use the summary for prior facts, constraints, decisions, files, and unfinished work.\n- Messages after this checkpoint are the active request and take precedence over any next steps or conclusions in the checkpoint.\n- Continue work from the checkpoint only when no later user message gives a different instruction; if a synthetic resume prompt follows, follow that prompt.\n\nCheckpoint summary:\n" + summary
 	return map[string]interface{}{
 		"type": "message",
 		"role": "developer",
