@@ -18,6 +18,15 @@ func TestCompactionContract_CompactEndpointReturnsCodexCompatibleHistory(t *test
 		if r.URL.Path != "/responses" {
 			t.Fatalf("expected compact fallback to call /responses, got %q", r.URL.Path)
 		}
+		if got := r.Header.Get("session-id"); got != "sess-compact" {
+			t.Fatalf("expected compact request to forward session-id, got %q", got)
+		}
+		if got := r.Header.Get("thread-id"); got != "thread-compact" {
+			t.Fatalf("expected compact request to forward thread-id, got %q", got)
+		}
+		if got := r.Header.Get("X-Codex-Installation-Id"); got != "install-compact" {
+			t.Fatalf("expected compact request to forward installation id, got %q", got)
+		}
 		body := decodeJSONBodyForContract(t, r.Body)
 		if !strings.Contains(rawJSONToStringForContract(t, body["instructions"]), "CONTEXT CHECKPOINT COMPACTION") {
 			t.Fatalf("expected compact prompt instructions, got %s", body["instructions"])
@@ -36,6 +45,9 @@ func TestCompactionContract_CompactEndpointReturnsCodexCompatibleHistory(t *test
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("session-id", "sess-compact")
+	req.Header.Set("thread-id", "thread-compact")
+	req.Header.Set("X-Codex-Installation-Id", "install-compact")
 	w := httptest.NewRecorder()
 
 	handler.HandleCompact(w, req)

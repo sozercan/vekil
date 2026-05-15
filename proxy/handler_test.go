@@ -768,11 +768,14 @@ func TestHandleResponses_RoutesConfiguredAzureModelAndPreservesPriorityServiceTi
 }
 
 func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
-	var gotOpenAIBeta, gotSessionID, gotClientRequestID string
+	var gotOpenAIBeta, gotLegacySessionID, gotSessionID, gotThreadID, gotClientRequestID, gotInstallationID string
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		gotOpenAIBeta = r.Header.Get("OpenAI-Beta")
-		gotSessionID = r.Header.Get("session_id")
+		gotLegacySessionID = r.Header.Get("session_id")
+		gotSessionID = r.Header.Get("session-id")
+		gotThreadID = r.Header.Get("thread-id")
 		gotClientRequestID = r.Header.Get("X-Client-Request-Id")
+		gotInstallationID = r.Header.Get("X-Codex-Installation-Id")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp-headers","object":"response","status":"completed"}`))
 	})
@@ -781,7 +784,10 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("OpenAI-Beta", "responses_websockets=2026-02-06")
 	req.Header.Set("session_id", "sess-abc-123")
+	req.Header.Set("session-id", "sess-hyphen-123")
+	req.Header.Set("thread-id", "thread-abc-123")
 	req.Header.Set("X-Client-Request-Id", "client-req-456")
+	req.Header.Set("X-Codex-Installation-Id", "install-789")
 	w := httptest.NewRecorder()
 
 	handler.HandleResponses(w, req)
@@ -795,11 +801,20 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	if gotOpenAIBeta != "responses_websockets=2026-02-06" {
 		t.Fatalf("expected OpenAI-Beta to be forwarded, got %q", gotOpenAIBeta)
 	}
-	if gotSessionID != "sess-abc-123" {
-		t.Fatalf("expected session_id to be forwarded, got %q", gotSessionID)
+	if gotLegacySessionID != "sess-abc-123" {
+		t.Fatalf("expected session_id to be forwarded, got %q", gotLegacySessionID)
+	}
+	if gotSessionID != "sess-hyphen-123" {
+		t.Fatalf("expected session-id to be forwarded, got %q", gotSessionID)
+	}
+	if gotThreadID != "thread-abc-123" {
+		t.Fatalf("expected thread-id to be forwarded, got %q", gotThreadID)
 	}
 	if gotClientRequestID != "client-req-456" {
 		t.Fatalf("expected X-Client-Request-Id to be forwarded, got %q", gotClientRequestID)
+	}
+	if gotInstallationID != "install-789" {
+		t.Fatalf("expected X-Codex-Installation-Id to be forwarded, got %q", gotInstallationID)
 	}
 }
 

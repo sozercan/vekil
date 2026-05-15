@@ -1995,10 +1995,13 @@ func TestHandleResponsesWebSocket_ForwardsOpenAIBetaHeader(t *testing.T) {
 }
 
 func TestHandleResponsesWebSocket_ForwardsSessionAndClientRequestHeaders(t *testing.T) {
-	var gotSessionID, gotClientRequestID string
+	var gotLegacySessionID, gotSessionID, gotThreadID, gotClientRequestID, gotInstallationID string
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		gotSessionID = r.Header.Get("session_id")
+		gotLegacySessionID = r.Header.Get("session_id")
+		gotSessionID = r.Header.Get("session-id")
+		gotThreadID = r.Header.Get("thread-id")
 		gotClientRequestID = r.Header.Get("X-Client-Request-Id")
+		gotInstallationID = r.Header.Get("X-Codex-Installation-Id")
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-sess\"}}\n\n")
 		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-sess\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
@@ -2006,8 +2009,11 @@ func TestHandleResponsesWebSocket_ForwardsSessionAndClientRequestHeaders(t *test
 
 	server := startResponsesWebSocketProxyServer(t, handler)
 	conn := mustDialResponsesWebSocket(t, server, http.Header{
-		"session_id":          []string{"conv-123"},
-		"X-Client-Request-Id": []string{"req-456"},
+		"session_id":              []string{"conv-legacy-123"},
+		"session-id":              []string{"conv-123"},
+		"thread-id":               []string{"thread-123"},
+		"X-Client-Request-Id":     []string{"req-456"},
+		"X-Codex-Installation-Id": []string{"install-789"},
 	})
 	defer func() { _ = conn.Close() }()
 
@@ -2027,11 +2033,20 @@ func TestHandleResponsesWebSocket_ForwardsSessionAndClientRequestHeaders(t *test
 	_ = mustReadWebSocketJSON(t, conn) // response.created
 	_ = mustReadWebSocketJSON(t, conn) // response.completed
 
+	if gotLegacySessionID != "conv-legacy-123" {
+		t.Fatalf("expected session_id to be forwarded upstream, got %q", gotLegacySessionID)
+	}
 	if gotSessionID != "conv-123" {
-		t.Fatalf("expected session_id to be forwarded upstream, got %q", gotSessionID)
+		t.Fatalf("expected session-id to be forwarded upstream, got %q", gotSessionID)
+	}
+	if gotThreadID != "thread-123" {
+		t.Fatalf("expected thread-id to be forwarded upstream, got %q", gotThreadID)
 	}
 	if gotClientRequestID != "req-456" {
 		t.Fatalf("expected X-Client-Request-Id to be forwarded upstream, got %q", gotClientRequestID)
+	}
+	if gotInstallationID != "install-789" {
+		t.Fatalf("expected X-Codex-Installation-Id to be forwarded upstream, got %q", gotInstallationID)
 	}
 }
 

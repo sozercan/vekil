@@ -198,7 +198,7 @@ func parseResponsesWebSocketFrameType(payload []byte) (string, error) {
 
 func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *responsesWebSocketSession {
 	baseHeaders := make(http.Header)
-	for _, name := range []string{"X-Codex-Beta-Features", "X-Codex-Turn-Metadata", "OpenAI-Beta", "session_id", "X-Client-Request-Id", "X-OpenAI-Subagent"} {
+	for _, name := range []string{"X-Codex-Beta-Features", "X-Codex-Turn-Metadata", "OpenAI-Beta", "session_id", "session-id", "thread-id", "X-Client-Request-Id", "X-Codex-Installation-Id", "X-OpenAI-Subagent"} {
 		for _, value := range r.Header.Values(name) {
 			baseHeaders.Add(name, value)
 		}
