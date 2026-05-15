@@ -4324,7 +4324,7 @@ func TestRewriteSyntheticCompactionRequest(t *testing.T) {
 
 	input, ok := req["input"].([]interface{})
 	if !ok || len(input) != 5 {
-		t.Fatalf("expected 3 input items, got %#v", req["input"])
+		t.Fatalf("expected 5 input items, got %#v", req["input"])
 	}
 
 	if got := requireCompactionContextMessage(t, input[0]); !strings.Contains(got, syntheticSummary) {
