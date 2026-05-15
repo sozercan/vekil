@@ -1259,23 +1259,16 @@ func runOpenAIChatToolOptimizerReducesOutputTest(t *testing.T, sessionID string)
 	}
 
 	rewriteRequests := fake.snapshotRewriteRequests()
-	if len(rewriteRequests) != 1 {
-		t.Fatalf("expected 1 rewrite request, got %d", len(rewriteRequests))
-	}
-	if rewriteRequests[0].Command != "grep foo big.log" {
-		t.Fatalf("expected rewrite command to see original command, got %q", rewriteRequests[0].Command)
+	if len(rewriteRequests) != 0 {
+		t.Fatalf("expected no rewrite requests for chat response capture, got %d", len(rewriteRequests))
 	}
 
 	reduceRequests := fake.snapshotReduceRequests()
 	if len(reduceRequests) != 1 {
 		t.Fatalf("expected 1 reduce request, got %d", len(reduceRequests))
 	}
-	wantReduceCommand := "grep foo big.log"
-	if sessionID != "" {
-		wantReduceCommand = "rg foo big.log"
-	}
-	if reduceRequests[0].Command != wantReduceCommand {
-		t.Fatalf("expected reduce command %q, got %q", wantReduceCommand, reduceRequests[0].Command)
+	if reduceRequests[0].Command != "grep foo big.log" {
+		t.Fatalf("expected reduce command to remain original, got %q", reduceRequests[0].Command)
 	}
 	if reduceRequests[0].Output != "large output" {
 		t.Fatalf("expected reduce request to see original output, got %q", reduceRequests[0].Output)

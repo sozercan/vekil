@@ -181,7 +181,7 @@ func validCommandReplacement(original, replacement string) bool {
 	if len(replacement) > maxOptimizedCommandBytes {
 		return false
 	}
-	if strings.ContainsAny(replacement, "\x00\r\n") {
+	if strings.Contains(replacement, "\x00") {
 		return false
 	}
 	return true

@@ -32,10 +32,21 @@ func extractShellFunctionCommand(item map[string]json.RawMessage, manager *ToolO
 	}
 
 	var itemType string
-	if err := json.Unmarshal(item["type"], &itemType); err != nil || itemType != "function_call" {
+	if err := json.Unmarshal(item["type"], &itemType); err != nil {
 		return toolCommandItem{}, false
 	}
 
+	switch itemType {
+	case "function_call":
+		return extractConfiguredShellFunctionCommand(item, manager)
+	case "local_shell_call":
+		return extractLocalShellFunctionCommand(item)
+	default:
+		return toolCommandItem{}, false
+	}
+}
+
+func extractConfiguredShellFunctionCommand(item map[string]json.RawMessage, manager *ToolOptimizerManager) (toolCommandItem, bool) {
 	var toolName string
 	if err := json.Unmarshal(item["name"], &toolName); err != nil || !manager.MatchShellToolName(toolName) {
 		return toolCommandItem{}, false
@@ -62,6 +73,115 @@ func extractShellFunctionCommand(item map[string]json.RawMessage, manager *ToolO
 		Command:   command,
 		Arguments: arguments,
 	}, true
+}
+
+func extractLocalShellFunctionCommand(item map[string]json.RawMessage) (toolCommandItem, bool) {
+	callID, ok := extractNonEmptyJSONStringField(item, "call_id")
+	if !ok {
+		callID, ok = extractNonEmptyJSONStringField(item, "id")
+	}
+	if !ok {
+		return toolCommandItem{}, false
+	}
+
+	command, ok := extractLocalShellCommand(item)
+	if !ok {
+		return toolCommandItem{}, false
+	}
+
+	toolName, ok := extractNonEmptyJSONStringField(item, "name")
+	if !ok {
+		toolName = "local_shell_call"
+	}
+
+	arguments := ""
+	if rawArguments, ok := item["arguments"]; ok {
+		arguments = strings.TrimSpace(string(rawArguments))
+		var decoded string
+		if err := json.Unmarshal(rawArguments, &decoded); err == nil {
+			arguments = decoded
+		}
+	}
+
+	return toolCommandItem{
+		ToolName:  strings.TrimSpace(toolName),
+		CallID:    strings.TrimSpace(callID),
+		Command:   command,
+		Arguments: arguments,
+	}, true
+}
+
+func extractLocalShellCommand(item map[string]json.RawMessage) (string, bool) {
+	if command, ok := extractNonEmptyJSONStringField(item, "command"); ok {
+		return command, true
+	}
+	if command, ok := extractNonEmptyJSONStringField(item, "cmd"); ok {
+		return command, true
+	}
+	if rawArguments, ok := item["arguments"]; ok {
+		if command, ok := extractLocalShellCommandFromArguments(rawArguments); ok {
+			return command, true
+		}
+	}
+	if command, ok := extractNestedJSONStringField(item, "action", "command"); ok {
+		return command, true
+	}
+	return "", false
+}
+
+func extractLocalShellCommandFromArguments(raw json.RawMessage) (string, bool) {
+	var arguments string
+	if err := json.Unmarshal(raw, &arguments); err == nil {
+		if command, ok := extractStringArgumentAtPath(arguments, "/command"); ok {
+			return command, true
+		}
+		if command, ok := extractStringArgumentAtPath(arguments, "/cmd"); ok {
+			return command, true
+		}
+		if strings.TrimSpace(arguments) != "" {
+			return arguments, true
+		}
+		return "", false
+	}
+
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return "", false
+	}
+	if command, ok := extractNonEmptyJSONStringField(object, "command"); ok {
+		return command, true
+	}
+	if command, ok := extractNonEmptyJSONStringField(object, "cmd"); ok {
+		return command, true
+	}
+	if command, ok := extractNestedJSONStringField(object, "action", "command"); ok {
+		return command, true
+	}
+	return "", false
+}
+
+func extractNonEmptyJSONStringField(item map[string]json.RawMessage, key string) (string, bool) {
+	raw, ok := item[key]
+	if !ok {
+		return "", false
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil || strings.TrimSpace(value) == "" {
+		return "", false
+	}
+	return value, true
+}
+
+func extractNestedJSONStringField(item map[string]json.RawMessage, objectKey, stringKey string) (string, bool) {
+	raw, ok := item[objectKey]
+	if !ok {
+		return "", false
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return "", false
+	}
+	return extractNonEmptyJSONStringField(object, stringKey)
 }
 
 func extractCommandFromArguments(argumentsJSON string) (string, bool) {
@@ -114,18 +234,43 @@ func replaceCommandInArguments(argumentsJSON, replacement string) (string, bool)
 }
 
 func extractFunctionCallOutputItem(raw json.RawMessage) (toolOutputItem, bool) {
-	var item struct {
-		Type   string `json:"type"`
-		CallID string `json:"call_id"`
-		Output string `json:"output"`
-	}
+	var item map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &item); err != nil {
 		return toolOutputItem{}, false
 	}
-	if (item.Type != "function_call_output" && item.Type != "local_shell_call_output") || strings.TrimSpace(item.CallID) == "" {
+	itemType, ok := extractNonEmptyJSONStringField(item, "type")
+	if !ok || (itemType != "function_call_output" && itemType != "local_shell_call_output") {
 		return toolOutputItem{}, false
 	}
-	return toolOutputItem{CallID: strings.TrimSpace(item.CallID), Output: item.Output}, true
+	callID, ok := extractNonEmptyJSONStringField(item, "call_id")
+	if !ok {
+		return toolOutputItem{}, false
+	}
+	rawOutput, ok := item["output"]
+	if !ok {
+		return toolOutputItem{}, false
+	}
+	output, ok := extractToolOutput(rawOutput)
+	if !ok {
+		return toolOutputItem{}, false
+	}
+	return toolOutputItem{CallID: strings.TrimSpace(callID), Output: output}, true
+}
+
+func extractToolOutput(raw json.RawMessage) (string, bool) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return "", false
+	}
+	if trimmed == "null" {
+		return trimmed, true
+	}
+
+	var output string
+	if err := json.Unmarshal(raw, &output); err == nil {
+		return output, true
+	}
+	return trimmed, true
 }
 
 func replaceFunctionCallOutput(raw json.RawMessage, replacement string) (json.RawMessage, bool) {

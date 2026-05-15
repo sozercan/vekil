@@ -312,7 +312,7 @@ func (h *ProxyHandler) maybeWriteOptimizedOpenAIChatPassthrough(ctx context.Cont
 		return nil
 	}
 
-	changedCount := h.maybeRewriteOrCaptureOpenAIChatToolCommands(ctx, &parsed, store, scope, true)
+	changedCount := h.maybeRewriteOrCaptureOpenAIChatToolCommands(ctx, &parsed, store, scope, false)
 	out := bodyBytes
 	if changedCount > 0 {
 		if rewritten, err := json.Marshal(&parsed); err == nil {

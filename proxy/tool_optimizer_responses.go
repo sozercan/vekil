@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 
@@ -106,6 +108,111 @@ func newToolExecutionContext(item toolCommandItem, originalCommand, rewrittenCom
 	}
 }
 
+func replaceTopLevelRawJSONField(bodyBytes []byte, field string, replacement json.RawMessage) ([]byte, bool) {
+	field = strings.TrimSpace(field)
+	if field == "" {
+		return bodyBytes, false
+	}
+	replacement = bytes.TrimSpace(replacement)
+	if len(replacement) == 0 || !json.Valid(replacement) {
+		return bodyBytes, false
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(bodyBytes))
+	decoder.UseNumber()
+	token, err := decoder.Token()
+	if err != nil {
+		return bodyBytes, false
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return bodyBytes, false
+	}
+
+	var out bytes.Buffer
+	out.Grow(len(bodyBytes) + len(replacement))
+	lastCopyOffset := 0
+	replaced := false
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return bodyBytes, false
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return bodyBytes, false
+		}
+
+		valueStart, ok := topLevelJSONFieldValueStart(bodyBytes, int(decoder.InputOffset()))
+		if !ok {
+			return bodyBytes, false
+		}
+
+		var rawValue json.RawMessage
+		if err := decoder.Decode(&rawValue); err != nil {
+			return bodyBytes, false
+		}
+		valueEnd := int(decoder.InputOffset())
+		if valueEnd < valueStart || valueEnd > len(bodyBytes) {
+			return bodyBytes, false
+		}
+
+		if key != field {
+			continue
+		}
+		out.Write(bodyBytes[lastCopyOffset:valueStart])
+		out.Write(replacement)
+		lastCopyOffset = valueEnd
+		replaced = true
+	}
+
+	endToken, err := decoder.Token()
+	if err != nil {
+		return bodyBytes, false
+	}
+	if delim, ok := endToken.(json.Delim); !ok || delim != '}' {
+		return bodyBytes, false
+	}
+	if trailingToken, err := decoder.Token(); err != io.EOF {
+		_ = trailingToken
+		return bodyBytes, false
+	}
+	if !replaced {
+		return bodyBytes, false
+	}
+	out.Write(bodyBytes[lastCopyOffset:])
+	return out.Bytes(), true
+}
+
+func topLevelJSONFieldValueStart(bodyBytes []byte, offset int) (int, bool) {
+	if offset < 0 || offset >= len(bodyBytes) {
+		return 0, false
+	}
+	i := offset
+	for i < len(bodyBytes) && isJSONWhitespace(bodyBytes[i]) {
+		i++
+	}
+	if i >= len(bodyBytes) || bodyBytes[i] != ':' {
+		return 0, false
+	}
+	i++
+	for i < len(bodyBytes) && isJSONWhitespace(bodyBytes[i]) {
+		i++
+	}
+	if i >= len(bodyBytes) {
+		return 0, false
+	}
+	return i, true
+}
+
+func isJSONWhitespace(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r':
+		return true
+	default:
+		return false
+	}
+}
+
 func (h *ProxyHandler) maybeRewriteResponsesResponseBody(ctx context.Context, bodyBytes []byte, store *ToolExecutionContextStore, scope string) ([]byte, bool) {
 	manager := h.toolOptimizers
 	if manager == nil || !manager.ShouldInspectNonStreamingResponses() {
@@ -141,9 +248,8 @@ func (h *ProxyHandler) maybeRewriteResponsesResponseBody(ctx context.Context, bo
 	if err != nil {
 		return bodyBytes, false
 	}
-	payload["output"] = newOutput
-	rewritten, err := json.Marshal(payload)
-	if err != nil {
+	rewritten, ok := replaceTopLevelRawJSONField(bodyBytes, "output", newOutput)
+	if !ok {
 		return bodyBytes, false
 	}
 	return rewritten, true
@@ -263,9 +369,8 @@ func (h *ProxyHandler) maybeReduceResponsesToolOutputsInRequestBody(ctx context.
 	if err != nil {
 		return bodyBytes, 0
 	}
-	payload["input"] = newInput
-	rewritten, err := json.Marshal(payload)
-	if err != nil {
+	rewritten, ok := replaceTopLevelRawJSONField(bodyBytes, "input", newInput)
+	if !ok {
 		return bodyBytes, 0
 	}
 	return rewritten, changedCount

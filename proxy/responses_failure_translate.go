@@ -192,7 +192,7 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 	if h != nil {
 		store = h.toolContexts
 	}
-	streamResponsesPipeWithFailureLog(h, w, resp.Body, resp.Header, r.Context(), store, toolScope)
+	streamResponsesPipeWithFailureLog(h, r.Context(), w, resp.Body, resp.Header, store, toolScope)
 }
 
 func prepareResponsesStreamAttempt(waitCtx, streamCtx context.Context, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
@@ -456,7 +456,7 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 	return "", ""
 }
 
-func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header, ctx context.Context, store *ToolExecutionContextStore, scope string) {
+func streamResponsesPipeWithFailureLog(h *ProxyHandler, ctx context.Context, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header, store *ToolExecutionContextStore, scope string) {
 	if closer, ok := r.(io.Closer); ok {
 		defer func() { _ = closer.Close() }()
 	}
@@ -466,7 +466,7 @@ func streamResponsesPipeWithFailureLog(h *ProxyHandler, w http.ResponseWriter, r
 		fw.flusher = f
 	}
 
-	tap := newResponsesFailureTap(h, upstreamHeaders, ctx, store, scope)
+	tap := newResponsesFailureTap(h, ctx, upstreamHeaders, store, scope)
 	_, _ = io.Copy(fw, io.TeeReader(r, tap))
 }
 
@@ -649,7 +649,7 @@ type responsesFailureTap struct {
 	parser          responsesSSEParser
 }
 
-func newResponsesFailureTap(h *ProxyHandler, upstreamHeaders http.Header, ctx context.Context, store *ToolExecutionContextStore, scope string) *responsesFailureTap {
+func newResponsesFailureTap(h *ProxyHandler, ctx context.Context, upstreamHeaders http.Header, store *ToolExecutionContextStore, scope string) *responsesFailureTap {
 	if ctx == nil {
 		ctx = context.Background()
 	}

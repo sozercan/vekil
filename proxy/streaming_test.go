@@ -246,6 +246,72 @@ func TestStreamOpenAIPassthroughWithFinalResponse_CapturesDoneWithoutTrailingNew
 	}
 }
 
+func TestStreamOpenAIPassthroughWithFinalResponse_CapturesMultiLineDataEvent(t *testing.T) {
+	input := "event: chat.completion.chunk\n" +
+		"data: {\"id\":\"chatcmpl-multiline\",\"object\":\"chat.completion.chunk\",\n" +
+		"data: \"created\":123,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"}}]}\n\n" +
+		"data:[DONE]"
+	body := io.NopCloser(strings.NewReader(input))
+
+	w := httptest.NewRecorder()
+	var final *models.OpenAIResponse
+	StreamOpenAIPassthroughWithFinalResponse(w, body, func(resp *models.OpenAIResponse) {
+		final = resp
+	})
+
+	if got := w.Body.String(); got != input {
+		t.Fatalf("passthrough body changed: got %q, want %q", got, input)
+	}
+	if final == nil {
+		t.Fatal("final response callback was not invoked")
+	}
+	if final.ID != "chatcmpl-multiline" {
+		t.Fatalf("final.ID = %q, want chatcmpl-multiline", final.ID)
+	}
+	if len(final.Choices) != 1 {
+		t.Fatalf("len(final.Choices) = %d, want 1", len(final.Choices))
+	}
+	var content string
+	if err := json.Unmarshal(final.Choices[0].Message.Content, &content); err != nil {
+		t.Fatalf("unmarshal final content: %v", err)
+	}
+	if content != "Hello" {
+		t.Fatalf("final content = %q, want Hello", content)
+	}
+}
+
+func TestConsumeOpenAIStreamChunks_MultiLineDataEvent(t *testing.T) {
+	input := ": upstream comment\n" +
+		"data: {\"id\":\"chatcmpl-reader\",\"object\":\"chat.completion.chunk\",\n" +
+		"data: \"created\":456,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"}}]}\n\n" +
+		"data:[DONE]"
+
+	var chunks []models.OpenAIStreamChunk
+	sawDone, err := consumeOpenAIStreamChunks(strings.NewReader(input), func(chunk models.OpenAIStreamChunk) bool {
+		chunks = append(chunks, chunk)
+		return true
+	})
+	if err != nil {
+		t.Fatalf("consumeOpenAIStreamChunks returned error: %v", err)
+	}
+	if !sawDone {
+		t.Fatal("consumeOpenAIStreamChunks did not report [DONE]")
+	}
+	if len(chunks) != 1 {
+		t.Fatalf("len(chunks) = %d, want 1", len(chunks))
+	}
+	if chunks[0].ID != "chatcmpl-reader" || chunks[0].Created != 456 {
+		t.Fatalf("chunk = %#v, want multiline reader chunk", chunks[0])
+	}
+	var content string
+	if err := json.Unmarshal(chunks[0].Choices[0].Delta.Content, &content); err != nil {
+		t.Fatalf("unmarshal chunk content: %v", err)
+	}
+	if content != "Hi" {
+		t.Fatalf("chunk content = %q, want Hi", content)
+	}
+}
+
 func TestStreamOpenAIToAnthropic_TextOnly(t *testing.T) {
 	stop := "stop"
 	idx := 0

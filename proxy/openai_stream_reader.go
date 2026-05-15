@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/sozercan/vekil/models"
 )
@@ -14,29 +15,63 @@ const (
 	openAIStreamScannerMaxBuffer     = 1024 * 1024
 )
 
+type sseDataAccumulator struct {
+	dataLines []string
+}
+
+func (a *sseDataAccumulator) consumeLine(line string, onData func(string) bool) bool {
+	line = strings.TrimRight(line, "\r\n")
+	if line == "" {
+		return a.dispatch(onData)
+	}
+
+	data, ok := parseSSELine(line)
+	if !ok {
+		return true
+	}
+	a.dataLines = append(a.dataLines, data)
+	return true
+}
+
+func (a *sseDataAccumulator) dispatch(onData func(string) bool) bool {
+	if len(a.dataLines) == 0 {
+		return true
+	}
+	data := strings.Join(a.dataLines, "\n")
+	a.dataLines = a.dataLines[:0]
+	if onData == nil {
+		return true
+	}
+	return onData(data)
+}
+
 // consumeOpenAIStreamChunks scans an upstream OpenAI SSE stream, ignores
-// non-data lines and malformed JSON chunks, and reports whether the stream
-// terminated with the expected [DONE] sentinel.
+// non-data events and malformed JSON chunks, and reports whether the stream
+// terminated with the expected [DONE] sentinel. Multi-line SSE data fields are
+// joined according to the SSE event model before JSON decoding.
 func consumeOpenAIStreamChunks(r io.Reader, onChunk func(models.OpenAIStreamChunk) bool) (bool, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, openAIStreamScannerInitialBuffer), openAIStreamScannerMaxBuffer)
 
-	for scanner.Scan() {
-		data, ok := parseSSELine(scanner.Text())
-		if !ok {
-			continue
-		}
+	sawDone := false
+	var accumulator sseDataAccumulator
+	processData := func(data string) bool {
 		if data == "[DONE]" {
-			return true, nil
+			sawDone = true
+			return false
 		}
 
 		var chunk models.OpenAIStreamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue
+			return true
 		}
 
-		if onChunk != nil && !onChunk(chunk) {
-			return false, nil
+		return onChunk == nil || onChunk(chunk)
+	}
+
+	for scanner.Scan() {
+		if !accumulator.consumeLine(scanner.Text(), processData) {
+			return sawDone, nil
 		}
 	}
 
@@ -44,5 +79,9 @@ func consumeOpenAIStreamChunks(r io.Reader, onChunk func(models.OpenAIStreamChun
 		return false, fmt.Errorf("reading SSE stream: %w", err)
 	}
 
-	return false, nil
+	if !accumulator.dispatch(processData) {
+		return sawDone, nil
+	}
+
+	return sawDone, nil
 }

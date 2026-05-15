@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -133,17 +134,27 @@ func (s *ToolExecutionContextStore) enforceMaxEntriesLocked() {
 	if s.maxEntries <= 0 || len(s.entries) <= s.maxEntries {
 		return
 	}
-	for len(s.entries) > s.maxEntries {
-		var oldestKey toolExecutionContextKey
-		var oldest time.Time
-		first := true
-		for key, ctx := range s.entries {
-			if first || ctx.CreatedAt.Before(oldest) {
-				first = false
-				oldest = ctx.CreatedAt
-				oldestKey = key
+
+	type entry struct {
+		key       toolExecutionContextKey
+		createdAt time.Time
+	}
+	entries := make([]entry, 0, len(s.entries))
+	for key, ctx := range s.entries {
+		entries = append(entries, entry{key: key, createdAt: ctx.CreatedAt})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].createdAt.Equal(entries[j].createdAt) {
+			if entries[i].key.Scope == entries[j].key.Scope {
+				return entries[i].key.CallID < entries[j].key.CallID
 			}
+			return entries[i].key.Scope < entries[j].key.Scope
 		}
-		delete(s.entries, oldestKey)
+		return entries[i].createdAt.Before(entries[j].createdAt)
+	})
+
+	removeCount := len(entries) - s.maxEntries
+	for i := 0; i < removeCount; i++ {
+		delete(s.entries, entries[i].key)
 	}
 }

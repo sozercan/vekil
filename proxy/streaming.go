@@ -44,10 +44,14 @@ func writeSSEEvent(w http.ResponseWriter, eventType string, data interface{}) er
 }
 
 func parseSSELine(line string) (string, bool) {
-	if strings.HasPrefix(line, "data: ") {
-		return line[6:], true
+	if !strings.HasPrefix(line, "data:") {
+		return "", false
 	}
-	return "", false
+	data := strings.TrimPrefix(line, "data:")
+	if strings.HasPrefix(data, " ") {
+		data = strings.TrimPrefix(data, " ")
+	}
+	return data, true
 }
 
 func setSSEHeaders(w http.ResponseWriter) {
@@ -100,21 +104,19 @@ func StreamOpenAIPassthroughWithFinalResponse(
 	reader := bufio.NewReaderSize(body, openAIStreamScannerInitialBuffer)
 
 	sawDone := false
-	processLine := func(line string) {
-		data, ok := parseSSELine(strings.TrimRight(line, "\r\n"))
-		if !ok {
-			return
-		}
+	var accumulator sseDataAccumulator
+	processData := func(data string) bool {
 		if data == "[DONE]" {
 			sawDone = true
-			return
+			return true
 		}
 
 		var chunk models.OpenAIStreamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			return
+			return true
 		}
 		aggregator.addChunk(chunk)
+		return true
 	}
 
 	for {
@@ -126,7 +128,7 @@ func StreamOpenAIPassthroughWithFinalResponse(
 			if flusher != nil {
 				flusher.Flush()
 			}
-			processLine(line)
+			accumulator.consumeLine(line, processData)
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -136,6 +138,7 @@ func StreamOpenAIPassthroughWithFinalResponse(
 		}
 	}
 
+	accumulator.dispatch(processData)
 	if !sawDone {
 		return
 	}

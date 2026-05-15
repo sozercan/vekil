@@ -1,6 +1,11 @@
 package proxy
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
 
 const (
 	toolOptimizerStageCommandRewrite = "command_rewrite"
@@ -46,6 +51,10 @@ type ToolOptimizerOutputConfig struct {
 	TimeoutMS     int  `json:"timeout_ms,omitempty" yaml:"timeout_ms,omitempty"`
 	MinInputBytes int  `json:"min_input_bytes,omitempty" yaml:"min_input_bytes,omitempty"`
 	MaxInputBytes int  `json:"max_input_bytes,omitempty" yaml:"max_input_bytes,omitempty"`
+
+	timeoutMSSet     bool
+	minInputBytesSet bool
+	maxInputBytesSet bool
 }
 
 type ToolOptimizerProviderConfig struct {
@@ -57,6 +66,52 @@ type ToolOptimizerProviderConfig struct {
 	Stages         []string `json:"stages,omitempty" yaml:"stages,omitempty"`
 	MaxStdoutBytes int      `json:"max_stdout_bytes,omitempty" yaml:"max_stdout_bytes,omitempty"`
 	MaxStderrBytes int      `json:"max_stderr_bytes,omitempty" yaml:"max_stderr_bytes,omitempty"`
+}
+type toolOptimizerOutputConfigFields struct {
+	Enabled       bool `json:"enabled" yaml:"enabled"`
+	TimeoutMS     *int `json:"timeout_ms" yaml:"timeout_ms"`
+	MinInputBytes *int `json:"min_input_bytes" yaml:"min_input_bytes"`
+	MaxInputBytes *int `json:"max_input_bytes" yaml:"max_input_bytes"`
+}
+
+func (c *ToolOptimizerOutputConfig) UnmarshalJSON(data []byte) error {
+	var fields toolOptimizerOutputConfigFields
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	c.applyDecodedFields(fields)
+	return nil
+}
+
+func (c *ToolOptimizerOutputConfig) UnmarshalYAML(value *yaml.Node) error {
+	var fields toolOptimizerOutputConfigFields
+	if err := value.Decode(&fields); err != nil {
+		return err
+	}
+	c.applyDecodedFields(fields)
+	return nil
+}
+
+func (c *ToolOptimizerOutputConfig) applyDecodedFields(fields toolOptimizerOutputConfigFields) {
+	c.Enabled = fields.Enabled
+	c.TimeoutMS = 0
+	c.MinInputBytes = 0
+	c.MaxInputBytes = 0
+	c.timeoutMSSet = false
+	c.minInputBytesSet = false
+	c.maxInputBytesSet = false
+	if fields.TimeoutMS != nil {
+		c.TimeoutMS = *fields.TimeoutMS
+		c.timeoutMSSet = true
+	}
+	if fields.MinInputBytes != nil {
+		c.MinInputBytes = *fields.MinInputBytes
+		c.minInputBytesSet = true
+	}
+	if fields.MaxInputBytes != nil {
+		c.MaxInputBytes = *fields.MaxInputBytes
+		c.maxInputBytesSet = true
+	}
 }
 
 func defaultToolOptimizersConfig() ToolOptimizersConfig {
@@ -98,13 +153,22 @@ func (c ToolOptimizersConfig) withDefaults() ToolOptimizersConfig {
 	}
 
 	defaults.OutputReduce.Enabled = c.OutputReduce.Enabled
-	if c.OutputReduce.TimeoutMS > 0 {
+	if c.OutputReduce.timeoutMSSet {
+		defaults.OutputReduce.TimeoutMS = c.OutputReduce.TimeoutMS
+		defaults.OutputReduce.timeoutMSSet = true
+	} else if c.OutputReduce.TimeoutMS > 0 {
 		defaults.OutputReduce.TimeoutMS = c.OutputReduce.TimeoutMS
 	}
-	if c.OutputReduce.MinInputBytes > 0 {
+	if c.OutputReduce.minInputBytesSet {
+		defaults.OutputReduce.MinInputBytes = c.OutputReduce.MinInputBytes
+		defaults.OutputReduce.minInputBytesSet = true
+	} else if c.OutputReduce.MinInputBytes > 0 {
 		defaults.OutputReduce.MinInputBytes = c.OutputReduce.MinInputBytes
 	}
-	if c.OutputReduce.MaxInputBytes > 0 {
+	if c.OutputReduce.maxInputBytesSet {
+		defaults.OutputReduce.MaxInputBytes = c.OutputReduce.MaxInputBytes
+		defaults.OutputReduce.maxInputBytesSet = true
+	} else if c.OutputReduce.MaxInputBytes > 0 {
 		defaults.OutputReduce.MaxInputBytes = c.OutputReduce.MaxInputBytes
 	}
 
