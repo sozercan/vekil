@@ -113,6 +113,26 @@ func (p responsesWebSocketRequestPlan) upstreamSegments() [][]json.RawMessage {
 	return p.fullReplaySegments
 }
 
+func (p responsesWebSocketRequestPlan) historyUpdateInput() (bool, []json.RawMessage) {
+	if p.hasCompactionTrigger() {
+		return true, nil
+	}
+	return p.resetHistory, p.currentInput
+}
+
+func (p responsesWebSocketRequestPlan) hasCompactionTrigger() bool {
+	return responsesInputContainsCompactionTrigger(p.currentInput)
+}
+
+func responsesInputContainsCompactionTrigger(input []json.RawMessage) bool {
+	for _, raw := range input {
+		if responsesInputItemType(raw) == "compaction_trigger" {
+			return true
+		}
+	}
+	return false
+}
+
 // HandleResponsesWebSocket handles GET /v1/responses websocket upgrades used
 // by Codex. Each websocket request is translated into a normal upstream
 // streaming /responses HTTP request and the SSE data payloads are forwarded back
@@ -291,7 +311,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 
 	if request.Generate != nil && !*request.Generate {
 		responseID := "vekil-ws-" + uuid.NewString()
-		s.rememberResponse(plan.resetHistory, responseID, plan.signature, plan.currentInput, nil)
+		if plan.hasCompactionTrigger() {
+			s.turnState = ""
+		}
+		resetHistory, historyInput := plan.historyUpdateInput()
+		s.rememberResponse(resetHistory, responseID, plan.signature, historyInput, nil)
 		s.logRequestMetrics(h, request, responseID, metrics)
 		if err := s.writeJSON(map[string]interface{}{
 			"type": "response.created",
@@ -362,7 +386,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return err
 	}
 
-	s.rememberResponse(plan.resetHistory, responseID, plan.signature, plan.currentInput, outputItems)
+	resetHistory, historyInput := plan.historyUpdateInput()
+	if plan.hasCompactionTrigger() {
+		s.turnState = ""
+	}
+	s.rememberResponse(resetHistory, responseID, plan.signature, historyInput, outputItems)
 	metrics = s.maybeAutoCompactHistory(h, request, metrics)
 	s.logRequestMetrics(h, request, responseID, metrics)
 	return nil
@@ -387,7 +415,7 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 
 	plan.fullReplaySegments = [][]json.RawMessage{s.historyItems, request.Input}
 	cfg := h.responsesWebSocketConfig()
-	plan.useTurnStateDelta = cfg.TurnStateDelta && s.turnState != ""
+	plan.useTurnStateDelta = cfg.TurnStateDelta && s.turnState != "" && !plan.hasCompactionTrigger()
 	return plan, nil
 }
 

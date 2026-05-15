@@ -2308,7 +2308,7 @@ func compactTriggerRequestFields(bodyBytes []byte) (map[string]json.RawMessage, 
 
 	compactFields := copyResponsesRequestFields(requestFields)
 	compactFields["input"] = compactInputRaw
-	for _, field := range []string{"stream", "previous_response_id", "type", "generate", "client_metadata", "initiator"} {
+	for _, field := range []string{"stream", "type", "generate", "client_metadata", "initiator"} {
 		delete(compactFields, field)
 	}
 	return compactFields, true, nil

@@ -31,21 +31,24 @@ type fakeUpstream struct {
 }
 
 type upstreamRequest struct {
-	Path string
-	Body map[string]json.RawMessage
+	Path   string
+	Header http.Header
+	Body   map[string]json.RawMessage
 }
 
 func main() {
-	scenarioFlag := flag.String("scenario", "all", "scenario to run: all, compact-shape, unknown-token, remote-compaction-v2, websocket-response-processed")
+	scenarioFlag := flag.String("scenario", "all", "scenario to run: all, compact-shape, unknown-token, remote-compaction-v2, remote-compaction-v2-previous-response, websocket-response-processed, websocket-remote-compaction-followup")
 	flag.Parse()
 
 	scenarios := map[string]labScenario{
-		"compact-shape":                runCompactShapeScenario,
-		"unknown-token":                runUnknownTokenScenario,
-		"remote-compaction-v2":         runRemoteCompactionV2Scenario,
-		"websocket-response-processed": runWebSocketResponseProcessedScenario,
+		"compact-shape":                          runCompactShapeScenario,
+		"unknown-token":                          runUnknownTokenScenario,
+		"remote-compaction-v2":                   runRemoteCompactionV2Scenario,
+		"remote-compaction-v2-previous-response": runRemoteCompactionV2PreviousResponseScenario,
+		"websocket-response-processed":           runWebSocketResponseProcessedScenario,
+		"websocket-remote-compaction-followup":   runWebSocketRemoteCompactionFollowUpScenario,
 	}
-	order := []string{"compact-shape", "unknown-token", "remote-compaction-v2", "websocket-response-processed"}
+	order := []string{"compact-shape", "unknown-token", "remote-compaction-v2", "remote-compaction-v2-previous-response", "websocket-response-processed", "websocket-remote-compaction-followup"}
 	selected, err := selectedScenarios(*scenarioFlag, order, scenarios)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -243,6 +246,50 @@ func runRemoteCompactionV2Scenario(ctx context.Context) error {
 	return nil
 }
 
+func runRemoteCompactionV2PreviousResponseScenario(ctx context.Context) error {
+	env, err := newLabEnv()
+	if err != nil {
+		return err
+	}
+	defer env.close()
+
+	body := map[string]interface{}{
+		"model":                "gpt-5.4",
+		"previous_response_id": "resp-prev",
+		"input":                []interface{}{map[string]interface{}{"type": "compaction_trigger"}},
+		"stream":               true,
+	}
+	headers := http.Header{"X-Codex-Beta-Features": []string{"remote_compaction_v2"}}
+	respBody, err := postJSON(ctx, env.proxyURL+"/v1/responses", headers, body)
+	if err != nil {
+		return err
+	}
+
+	events, err := parseSSEData(bytes.NewReader(respBody))
+	if err != nil {
+		return err
+	}
+	if !hasCompactionOutput(events) {
+		return fmt.Errorf("expected remote compaction v2 previous-response SSE to contain a compaction output item, got %#v", events)
+	}
+
+	requests := env.upstream.snapshot()
+	if len(requests) != 1 {
+		return fmt.Errorf("expected one compact upstream request, got %d", len(requests))
+	}
+	if got := rawJSONToString(requests[0].Body["previous_response_id"]); got != "resp-prev" {
+		return fmt.Errorf("expected compact fallback to preserve previous_response_id, got %q", got)
+	}
+	input, err := rawJSONArray(requests[0].Body["input"])
+	if err != nil {
+		return err
+	}
+	if len(input) != 0 {
+		return fmt.Errorf("expected compact fallback to strip only the trigger from delta input, got %s", requests[0].Body["input"])
+	}
+	return nil
+}
+
 func runWebSocketResponseProcessedScenario(ctx context.Context) error {
 	env, err := newLabEnv()
 	if err != nil {
@@ -296,6 +343,125 @@ func runWebSocketResponseProcessedScenario(ctx context.Context) error {
 	return nil
 }
 
+func runWebSocketRemoteCompactionFollowUpScenario(ctx context.Context) error {
+	env, err := newLabEnv()
+	if err != nil {
+		return err
+	}
+	defer env.close()
+
+	dialer := websocket.Dialer{}
+	conn, _, err := dialer.DialContext(ctx, env.wsURL()+"/v1/responses", nil)
+	if err != nil {
+		return fmt.Errorf("dial websocket: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err := writeWebSocketJSON(ctx, conn, responseCreateFrame("first")); err != nil {
+		return err
+	}
+	firstCreated, err := readWebSocketJSON(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if _, err := readWebSocketJSON(ctx, conn); err != nil {
+		return err
+	}
+	firstID, err := websocketResponseID(firstCreated)
+	if err != nil {
+		return err
+	}
+
+	compact := responseCreateFrameWithInput([]interface{}{map[string]interface{}{"type": "compaction_trigger"}})
+	compact["previous_response_id"] = firstID
+	if err := writeWebSocketJSON(ctx, conn, compact); err != nil {
+		return err
+	}
+	if _, err := readWebSocketJSON(ctx, conn); err != nil {
+		return err
+	}
+	compactionOutput, err := readWebSocketJSON(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if compactionOutput["type"] != "response.output_item.done" {
+		return fmt.Errorf("expected compaction output item, got %v", compactionOutput["type"])
+	}
+	compactCompleted, err := readWebSocketJSON(ctx, conn)
+	if err != nil {
+		return err
+	}
+	compactionID, err := websocketResponseID(compactCompleted)
+	if err != nil {
+		return err
+	}
+
+	if err := writeWebSocketJSON(ctx, conn, map[string]interface{}{"type": "response.processed", "response_id": compactionID}); err != nil {
+		return err
+	}
+	followUp := responseCreateFrame("after")
+	followUp["previous_response_id"] = compactionID
+	if err := writeWebSocketJSON(ctx, conn, followUp); err != nil {
+		return err
+	}
+	followUpCreated, err := readWebSocketJSON(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if followUpCreated["type"] != "response.created" {
+		return fmt.Errorf("expected normal follow-up response.created, got %v", followUpCreated["type"])
+	}
+	followUpCompleted, err := readWebSocketJSON(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if followUpCompleted["type"] != "response.completed" {
+		return fmt.Errorf("expected normal follow-up response.completed, got %v", followUpCompleted["type"])
+	}
+
+	requests := env.upstream.snapshot()
+	if len(requests) != 3 {
+		return fmt.Errorf("expected first turn, compaction, and normal follow-up upstream requests; got %d", len(requests))
+	}
+	if got := requests[1].Header.Get("X-Codex-Turn-State"); got != "" {
+		return fmt.Errorf("compaction request used turn-state delta instead of full history: %q", got)
+	}
+	if got := requests[2].Header.Get("X-Codex-Turn-State"); got != "" {
+		return fmt.Errorf("follow-up request used stale turn state after synthetic compaction: %q", got)
+	}
+	if strings.Contains(rawJSONToString(requests[2].Body["instructions"]), "CONTEXT CHECKPOINT COMPACTION") {
+		return fmt.Errorf("follow-up request repeated compaction instead of normal response: %s", requests[2].Body["input"])
+	}
+	compactInput, err := rawJSONArray(requests[1].Body["input"])
+	if err != nil {
+		return err
+	}
+	compactInputBytes, err := json.Marshal(compactInput)
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(string(compactInputBytes), "first") {
+		return fmt.Errorf("compaction request did not include full prior websocket history: %s", requests[1].Body["input"])
+	}
+	input, err := rawJSONArray(requests[2].Body["input"])
+	if err != nil {
+		return err
+	}
+	if len(input) != 2 {
+		return fmt.Errorf("expected follow-up replay to contain compaction plus new user message, got %d: %s", len(input), requests[2].Body["input"])
+	}
+	if got := itemType(input[0]); got != "message" || itemRole(input[0]) != "developer" || !strings.Contains(string(input[0]), "lab checkpoint summary") {
+		return fmt.Errorf("expected follow-up replay to start with developer checkpoint, got %s", input[0])
+	}
+	if got := itemType(input[1]); got == "compaction_trigger" {
+		return fmt.Errorf("follow-up replay included stale compaction_trigger: %s", requests[2].Body["input"])
+	}
+	if itemRole(input[1]) != "user" || !strings.Contains(string(input[1]), "after") {
+		return fmt.Errorf("expected follow-up replay to include latest user message, got %s", input[1])
+	}
+	return nil
+}
+
 type labEnv struct {
 	proxyURL string
 	close    func()
@@ -310,7 +476,7 @@ func newLabEnv() (*labEnv, error) {
 		auth.NewTestAuthenticator("lab-token"),
 		logger.New(logger.LevelError),
 		proxy.WithCopilotBaseURL(upstream.URL),
-		proxy.WithResponsesWebSocketConfig(proxy.ResponsesWebSocketConfig{DisableAutoCompact: true}),
+		proxy.WithResponsesWebSocketConfig(proxy.ResponsesWebSocketConfig{TurnStateDelta: true, DisableAutoCompact: true}),
 	)
 	if err != nil {
 		upstream.Close()
@@ -360,7 +526,7 @@ func (f *fakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	f.mu.Lock()
-	f.requests = append(f.requests, upstreamRequest{Path: r.URL.Path, Body: body})
+	f.requests = append(f.requests, upstreamRequest{Path: r.URL.Path, Header: r.Header.Clone(), Body: body})
 	requestNumber := len(f.requests)
 	f.mu.Unlock()
 
@@ -373,6 +539,7 @@ func (f *fakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	stream := rawJSONToBool(body["stream"])
 	if stream {
 		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Codex-Turn-State", fmt.Sprintf("turn-state-%d", requestNumber))
 		_, _ = fmt.Fprintf(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-%d\"}}\n\n", requestNumber)
 		_, _ = fmt.Fprintf(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-%d\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n", requestNumber)
 		return
@@ -457,11 +624,15 @@ func readWebSocketJSON(ctx context.Context, conn *websocket.Conn) (map[string]in
 }
 
 func responseCreateFrame(text string) map[string]interface{} {
+	return responseCreateFrameWithInput([]interface{}{messageItem("user", text)})
+}
+
+func responseCreateFrameWithInput(input []interface{}) map[string]interface{} {
 	return map[string]interface{}{
 		"type":                "response.create",
 		"model":               "gpt-5.4",
 		"instructions":        "You are helpful",
-		"input":               []interface{}{messageItem("user", text)},
+		"input":               input,
 		"tools":               []interface{}{},
 		"tool_choice":         "auto",
 		"parallel_tool_calls": true,
@@ -469,6 +640,18 @@ func responseCreateFrame(text string) map[string]interface{} {
 		"stream":              true,
 		"include":             []string{},
 	}
+}
+
+func websocketResponseID(payload map[string]interface{}) (string, error) {
+	response, ok := payload["response"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("websocket payload missing response object: %#v", payload)
+	}
+	id, ok := response["id"].(string)
+	if !ok || strings.TrimSpace(id) == "" {
+		return "", fmt.Errorf("websocket payload missing response id: %#v", payload)
+	}
+	return id, nil
 }
 
 func messageItem(role, text string) map[string]interface{} {
