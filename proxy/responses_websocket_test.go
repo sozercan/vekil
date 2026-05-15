@@ -185,6 +185,67 @@ func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 	}
 }
 
+func TestHandleResponsesWebSocket_IgnoresResponseProcessedControlFrame(t *testing.T) {
+	var upstreamRequests atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		requestNumber := upstreamRequests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-%d\"}}\n\n", requestNumber)
+		_, _ = fmt.Fprintf(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-%d\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n", requestNumber)
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	first := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(first); err != nil {
+		t.Fatalf("failed to write first websocket request: %v", err)
+	}
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+
+	if err := conn.WriteJSON(map[string]interface{}{
+		"type":        "response.processed",
+		"response_id": "resp-1",
+	}); err != nil {
+		t.Fatalf("failed to write response.processed websocket request: %v", err)
+	}
+
+	second := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "second"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(second); err != nil {
+		t.Fatalf("failed to write second websocket request after response.processed: %v", err)
+	}
+	secondCreated := mustReadWebSocketJSON(t, conn)
+	if secondCreated["type"] != "response.created" {
+		t.Fatalf("expected response.created after response.processed, got %v", secondCreated["type"])
+	}
+	secondCompleted := mustReadWebSocketJSON(t, conn)
+	if secondCompleted["type"] != "response.completed" {
+		t.Fatalf("expected response.completed after response.processed, got %v", secondCompleted["type"])
+	}
+
+	if got := upstreamRequests.Load(); got != 2 {
+		t.Fatalf("expected response.processed not to create upstream request; got %d upstream requests", got)
+	}
+}
+
 func TestHandleResponsesWebSocket_RoutesConfiguredAzureModelAndPreservesPriorityServiceTier(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 

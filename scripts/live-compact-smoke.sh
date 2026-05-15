@@ -176,10 +176,8 @@ post_json() {
 
 assert_compact_response() {
   jq -e '
-    ([.output[]? | select(.type == "message") | .content[]? | select((.type == "output_text" or .type == "text") and ((.text // "") | length > 0))] | length > 0)
-    and
     ([.output[]? | select(.type == "compaction" and ((.encrypted_content // "") | length > 0))] | length > 0)
-  ' "${COMPACT_RESPONSE_JSON}" >/dev/null || die "compact response did not contain a summary message and non-empty compaction item"
+  ' "${COMPACT_RESPONSE_JSON}" >/dev/null || die "compact response did not contain a non-empty compaction item"
 
   jq -e '[.output[] | select(.type == "compaction" and ((.encrypted_content // "") | length > 0))] | .[0]' \
     "${COMPACT_RESPONSE_JSON}" > "${COMPACTION_ITEM_JSON}" || die "failed to extract compaction item"

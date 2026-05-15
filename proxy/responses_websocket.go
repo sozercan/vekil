@@ -144,6 +144,15 @@ func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.R
 			return
 		}
 
+		frameType, err := parseResponsesWebSocketFrameType(payload)
+		if err != nil {
+			session.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
+			return
+		}
+		if frameType == "response.processed" {
+			continue
+		}
+
 		request, err := parseResponsesWebSocketCreateRequest(payload)
 		if err != nil {
 			session.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
@@ -155,6 +164,16 @@ func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.R
 			return
 		}
 	}
+}
+
+func parseResponsesWebSocketFrameType(payload []byte) (string, error) {
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return "", fmt.Errorf("invalid JSON in websocket request")
+	}
+	return envelope.Type, nil
 }
 
 func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *responsesWebSocketSession {
@@ -415,7 +434,11 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 		return nil, err
 	}
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/websocket", true)
-	return h.postResponsesWithHeaders(ctx, bodyBytes, s.requestHeaders(request, includeTurnState))
+	headers := s.requestHeaders(request, includeTurnState)
+	if compactionResp, handled, err := h.maybeBuildResponsesCompactionTriggerResponse(ctx, bodyBytes, headers, true); handled || err != nil {
+		return compactionResp, err
+	}
+	return h.postResponsesWithHeaders(ctx, bodyBytes, headers)
 }
 
 func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCreateRequest, includeTurnState bool) http.Header {

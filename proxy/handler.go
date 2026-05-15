@@ -326,10 +326,16 @@ func WithProvidersConfig(cfg ProvidersConfig) Option {
 	}
 }
 
-func withCopilotBaseURLForTest(baseURL string) Option {
+// WithCopilotBaseURL overrides the legacy single-upstream Copilot base URL.
+// It is primarily useful for local contract tests and diagnostic harnesses.
+func WithCopilotBaseURL(baseURL string) Option {
 	return func(h *ProxyHandler) {
 		h.copilotURL = strings.TrimRight(baseURL, "/")
 	}
+}
+
+func withCopilotBaseURLForTest(baseURL string) Option {
+	return WithCopilotBaseURL(baseURL)
 }
 
 // WithResponsesWebSocketConfig overrides websocket-session state behavior for
