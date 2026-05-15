@@ -3090,8 +3090,8 @@ func TestHandleResponses_RewritesSyntheticCompaction_StripsInlineRenderMarkers(t
 	}
 }
 
-func TestHandleResponses_PreservesUnknownPlaintextCompaction(t *testing.T) {
-	unknownToken := "The previous work fixed auth refresh but left retry handling open."
+func TestHandleResponses_RewritesLegacyPlaintextCompaction(t *testing.T) {
+	legacySummary := "The previous work fixed auth refresh but left retry handling open."
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		var req map[string]interface{}
@@ -3100,19 +3100,17 @@ func TestHandleResponses_PreservesUnknownPlaintextCompaction(t *testing.T) {
 		}
 
 		input, ok := req["input"].([]interface{})
-		if !ok || len(input) != 1 {
-			t.Fatalf("expected 1 input item, got %#v", req["input"])
+		if !ok || len(input) != 2 {
+			t.Fatalf("expected 2 input items, got %#v", req["input"])
 		}
 
-		item, ok := input[0].(map[string]interface{})
-		if !ok {
-			t.Fatalf("expected compaction item object, got %#v", input[0])
+		contextText := requireCompactionContextMessage(t, input[0])
+		if !strings.Contains(contextText, legacySummary) {
+			t.Errorf("expected legacy plaintext summary to be rewritten, got %q", contextText)
 		}
-		if item["type"] != "compaction" {
-			t.Fatalf("expected unknown plaintext token to pass through as compaction, got %#v", item)
-		}
-		if item["encrypted_content"] != unknownToken {
-			t.Errorf("expected unknown plaintext token to be preserved, got %v", item["encrypted_content"])
+		resumePrompt := requireMessageTextWithRole(t, input[1], "user")
+		if !strings.Contains(resumePrompt, "Continue from the checkpoint above and resume the interrupted task") {
+			t.Errorf("expected resume prompt to be appended, got %q", resumePrompt)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -3124,7 +3122,7 @@ func TestHandleResponses_PreservesUnknownPlaintextCompaction(t *testing.T) {
 		"input": []interface{}{
 			map[string]interface{}{
 				"type":              "compaction",
-				"encrypted_content": unknownToken,
+				"encrypted_content": legacySummary,
 			},
 		},
 	})
@@ -4275,7 +4273,7 @@ func makeOversizedMemorySummarizeRequestBody(t testing.TB) []byte {
 func TestRewriteSyntheticCompactionRequest(t *testing.T) {
 	syntheticSummary := "Synthetic checkpoint summary"
 	legacySyntheticSummary := "Legacy synthetic checkpoint summary"
-	unknownPlaintextToken := "Legacy plaintext summary from an older proxy run."
+	legacyPlaintextSummary := "Legacy plaintext summary from an older proxy run."
 	opaqueToken := strings.Repeat("Abc123_-", 8)
 	opaqueTokenWithProviderChars := "opaque+server/token/with/slashes=="
 	legacyPayload, err := json.Marshal(syntheticCompactionPayload{Summary: legacySyntheticSummary})
@@ -4296,7 +4294,7 @@ func TestRewriteSyntheticCompactionRequest(t *testing.T) {
 			},
 			map[string]interface{}{
 				"type":              "compaction",
-				"encrypted_content": unknownPlaintextToken,
+				"encrypted_content": legacyPlaintextSummary,
 			},
 			map[string]interface{}{
 				"type":              "compaction",
@@ -4313,8 +4311,8 @@ func TestRewriteSyntheticCompactionRequest(t *testing.T) {
 	}
 
 	rewritten, rewriteCount := rewriteSyntheticCompactionRequest(reqBody)
-	if rewriteCount != 2 {
-		t.Fatalf("expected 2 rewritten compaction items, got %d", rewriteCount)
+	if rewriteCount != 3 {
+		t.Fatalf("expected 3 rewritten compaction items, got %d", rewriteCount)
 	}
 
 	var req map[string]interface{}
@@ -4333,8 +4331,11 @@ func TestRewriteSyntheticCompactionRequest(t *testing.T) {
 	if got := requireCompactionContextMessage(t, input[1]); !strings.Contains(got, legacySyntheticSummary) {
 		t.Errorf("expected legacy synthetic summary to be rewritten, got %q", got)
 	}
+	if got := requireCompactionContextMessage(t, input[2]); !strings.Contains(got, legacyPlaintextSummary) {
+		t.Errorf("expected legacy plaintext summary to be rewritten, got %q", got)
+	}
 
-	for i, want := range map[int]string{2: unknownPlaintextToken, 3: opaqueToken, 4: opaqueTokenWithProviderChars} {
+	for i, want := range map[int]string{3: opaqueToken, 4: opaqueTokenWithProviderChars} {
 		item, ok := input[i].(map[string]interface{})
 		if !ok {
 			t.Fatalf("expected opaque item object, got %#v", input[i])
@@ -4602,14 +4603,19 @@ func TestExtractSyntheticOrLegacyCompactionSummary(t *testing.T) {
 		t.Fatalf("expected legacy synthetic summary round-trip, got %q ok=%v", got, ok)
 	}
 
-	unknownToken := "The issue is partially fixed."
-	if got, ok := extractSyntheticOrLegacyCompactionSummary(unknownToken); ok {
-		t.Fatalf("expected unknown compaction token to pass through unchanged, got %q", got)
+	legacyPlaintextSummary := "The issue is partially fixed."
+	if got, ok := extractSyntheticOrLegacyCompactionSummary(legacyPlaintextSummary); !ok || got != legacyPlaintextSummary {
+		t.Fatalf("expected legacy plaintext summary to be recovered, got %q ok=%v", got, ok)
 	}
 
 	opaqueToken := strings.Repeat("Abc123_-", 8)
 	if got, ok := extractSyntheticOrLegacyCompactionSummary(opaqueToken); ok {
 		t.Fatalf("expected opaque token to pass through unchanged, got %q", got)
+	}
+
+	opaqueTokenWithProviderChars := "opaque+server/token/with/slashes=="
+	if got, ok := extractSyntheticOrLegacyCompactionSummary(opaqueTokenWithProviderChars); ok {
+		t.Fatalf("expected provider opaque token to pass through unchanged, got %q", got)
 	}
 }
 

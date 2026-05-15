@@ -253,7 +253,15 @@ func extractSyntheticOrLegacyCompactionSummary(encryptedContent string) (string,
 		}
 		return payload.Summary, true
 	}
+	if isLikelyLegacyPlaintextCompactionSummary(encryptedContent) {
+		return encryptedContent, true
+	}
 	return "", false
+}
+
+func isLikelyLegacyPlaintextCompactionSummary(encryptedContent string) bool {
+	encryptedContent = strings.TrimSpace(encryptedContent)
+	return encryptedContent != "" && strings.ContainsAny(encryptedContent, " \t\r\n")
 }
 
 func proxyCompactionContextMessage(summary string) map[string]interface{} {
