@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -227,12 +228,12 @@ func TestCompactionContract_RemoteCompactionV2PreservesPreviousResponseID(t *tes
 }
 
 func TestCompactionContract_WebSocketResponseProcessedIsControlOnly(t *testing.T) {
-	var upstreamRequests int
+	var upstreamRequests atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		upstreamRequests++
+		requestNumber := upstreamRequests.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprintf(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-%d\"}}\n\n", upstreamRequests)
-		_, _ = fmt.Fprintf(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-%d\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n", upstreamRequests)
+		_, _ = fmt.Fprintf(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-%d\"}}\n\n", requestNumber)
+		_, _ = fmt.Fprintf(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-%d\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n", requestNumber)
 	})
 
 	server := startResponsesWebSocketProxyServer(t, handler)
@@ -254,8 +255,8 @@ func TestCompactionContract_WebSocketResponseProcessedIsControlOnly(t *testing.T
 	_ = mustReadWebSocketJSON(t, conn)
 	_ = mustReadWebSocketJSON(t, conn)
 
-	if upstreamRequests != 2 {
-		t.Fatalf("expected response.processed not to create an upstream request, got %d", upstreamRequests)
+	if got := upstreamRequests.Load(); got != 2 {
+		t.Fatalf("expected response.processed not to create an upstream request, got %d", got)
 	}
 }
 
