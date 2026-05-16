@@ -1,6 +1,9 @@
 package proxy
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestValidCommandReplacementAllowsInternalNewlinesAndCarriageReturns(t *testing.T) {
 	if !validCommandReplacement("grep foo big.log", "printf 'foo\\nbar'\nrg foo big.log") {
@@ -20,6 +23,7 @@ func TestValidCommandReplacementRejectsUnsafeOrNoopValues(t *testing.T) {
 		{name: "nul", original: "grep foo big.log", replacement: "rg foo\x00 big.log"},
 		{name: "trim empty", original: "grep foo big.log", replacement: " \t\n"},
 		{name: "unchanged", original: "grep foo big.log", replacement: "  grep foo big.log\n"},
+		{name: "too large", original: "echo original", replacement: strings.Repeat("x", maxOptimizedCommandBytes+1)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -27,5 +31,12 @@ func TestValidCommandReplacementRejectsUnsafeOrNoopValues(t *testing.T) {
 				t.Fatalf("expected replacement %q to be invalid", tt.replacement)
 			}
 		})
+	}
+}
+
+func TestValidCommandReplacementAllowsMaxSizedReplacement(t *testing.T) {
+	replacement := strings.Repeat("x", maxOptimizedCommandBytes)
+	if !validCommandReplacement("echo original", replacement) {
+		t.Fatalf("expected %d-byte replacement to be valid", maxOptimizedCommandBytes)
 	}
 }

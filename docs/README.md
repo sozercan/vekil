@@ -7,7 +7,7 @@ This folder is intentionally split into small, single-purpose files so humans an
 | File | Scope | Update When |
 |------|-------|-------------|
 | [`getting-started.md`](getting-started.md) | install, run, first authentication, deployment entry points | startup flow or distribution changes |
-| [`configuration.md`](configuration.md) | CLI flags, env vars, provider routing, websocket tuning | flags, defaults, providers, or runtime knobs change |
+| [`configuration.md`](configuration.md) | CLI flags, env vars, provider routing, tool optimizers, websocket tuning | flags, defaults, providers, tool optimizer behavior, or runtime knobs change |
 | [`clients.md`](clients.md) | copy-paste client examples | onboarding snippets or client compatibility changes |
 | [`api.md`](api.md) | endpoint behavior and compatibility notes | request/response semantics change |
 | [`architecture.md`](architecture.md) | package responsibilities and data flow | implementation boundaries or design decisions change |

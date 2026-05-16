@@ -228,35 +228,33 @@ Important behavior:
 - For `/v1/responses`, stable scope headers are preferred. Headerless clients can still correlate ordinary continuations through `previous_response_id`, and replay bodies that include a `function_call` before its output can be reduced within that same request.
 - For chat-style APIs, cross-request output reduction requires a stable scope header. Headerless chat requests are only reduced when the request replays the matching assistant `tool_calls` before the tool output in the same `messages` array; Vekil does not share chat tool-call context globally across conversations.
 - Optimizers are fail-open. External errors, timeouts, invalid JSON, unsupported provider config, or invalid replacements are ignored and the original payload is used.
-- Command replacements must be changed, non-empty after trimming, at most `32768` bytes, and contain no NUL, carriage-return, or newline characters.
+- Command replacements must be changed, non-empty after trimming, at most `32768` bytes, and contain no NUL characters. Internal newlines and carriage returns are allowed for multi-line shell snippets.
 - Output replacements must be changed and non-empty after trimming.
 
-Example:
+Recommended RTK example:
 
 ```yaml
-providers:
-  - id: copilot
-    type: copilot
-    default: true
-
 tool_optimizers:
   enabled: true
-  tools:
-    shell_function_calls:
-      enabled: true
-      names:
-        - shell_command
-      command_arg_path: /command
-      # For tools whose command lives somewhere else, set a JSON Pointer, e.g. /cmd.
   command_rewrite:
     enabled: true
-    streaming_mode: disabled
-    timeout_ms: 200
   output_reduce:
     enabled: true
-    timeout_ms: 500
-    min_input_bytes: 20000
-    max_input_bytes: 500000
+  providers:
+    - type: rtk_cli
+```
+
+With this config, Vekil asks RTK to rewrite shell commands and reduce shell output where supported. The minimal `rtk_cli` provider relies on two defaults: `path` defaults to `rtk`, and omitted `stages` means the provider is eligible for both `command_rewrite` and `output_reduce`. For example, depending on RTK policy, command rewrite may replace common shell commands with RTK-aware equivalents such as `rtk ls`, `rtk read`, or `rtk grep`.
+
+Advanced custom optimizer example:
+
+```yaml
+tool_optimizers:
+  enabled: true
+  command_rewrite:
+    enabled: true
+  output_reduce:
+    enabled: true
   providers:
     - id: local-optimizer
       type: exec_json
@@ -267,8 +265,6 @@ tool_optimizers:
       stages:
         - command_rewrite
         - output_reduce
-      max_stdout_bytes: 1048576
-      max_stderr_bytes: 65536
 ```
 
 Defaults:
@@ -286,13 +282,15 @@ Defaults:
 | `output_reduce.timeout_ms` | `500` |
 | `output_reduce.min_input_bytes` | `20000` |
 | `output_reduce.max_input_bytes` | `500000` |
+| `tool_optimizers.providers[].stages` | both `command_rewrite` and `output_reduce` when omitted or empty |
+| `tool_optimizers.providers[].path` (`rtk_cli`) | `rtk` |
 | `tool_optimizers.providers[].max_stdout_bytes` | `1048576` |
 | `tool_optimizers.providers[].max_stderr_bytes` | `65536` |
 
 Provider entries support these `type` values:
 
-- `exec_json` runs a local executable, sends one JSON request on stdin, and expects one JSON response on stdout. `path` is required.
-- `rtk_cli` runs the `rtk` command-line adapter. `path` defaults to `rtk`.
+- `rtk_cli` runs the RTK command-line adapter and is the recommended local optimizer path. `path` defaults to `rtk`.
+- `exec_json` is an advanced/custom protocol that runs a local executable, sends one JSON request on stdin, and expects one JSON response on stdout. `path` is required.
 - `noop` accepts config and never changes payloads; it is useful for tests and dry runs.
 
 Provider entries are enabled by default; set `enabled: false` to keep an entry in the file without using it. Each provider can set `stages`. If `stages` is omitted or empty, the provider is eligible for both `command_rewrite` and `output_reduce`; otherwise list only the stage names it should handle: `command_rewrite` and/or `output_reduce`. Providers run in config order, and the first valid changed result wins.
