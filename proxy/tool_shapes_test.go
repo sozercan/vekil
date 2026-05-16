@@ -1,6 +1,9 @@
 package proxy
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestToolShapesExtractStringArgumentAtConfiguredJSONPointer(t *testing.T) {
 	tests := []struct {
@@ -146,6 +149,20 @@ func TestToolShapesExtractLocalShellCallCommand(t *testing.T) {
 			wantCallID:   "call-local-5",
 			wantCommand:  "grep foo big.log",
 		},
+		{
+			name:         "action argv command",
+			raw:          `{"type":"local_shell_call","call_id":"call-local-6","action":{"command":["grep","foo bar","big.log"]}}`,
+			wantToolName: "local_shell_call",
+			wantCallID:   "call-local-6",
+			wantCommand:  "grep 'foo bar' big.log",
+		},
+		{
+			name:         "arguments nested argv command",
+			raw:          `{"type":"local_shell_call","call_id":"call-local-7","arguments":{"action":{"command":["bash","-lc","grep foo big.log"]}}}`,
+			wantToolName: "local_shell_call",
+			wantCallID:   "call-local-7",
+			wantCommand:  "bash -lc 'grep foo big.log'",
+		},
 	}
 
 	for _, tt := range tests {
@@ -164,6 +181,112 @@ func TestToolShapesExtractLocalShellCallCommand(t *testing.T) {
 				t.Fatalf("Command = %q, want %q", got.Command, tt.wantCommand)
 			}
 		})
+	}
+}
+
+func TestToolShapesReplaceLocalShellCallCommandFields(t *testing.T) {
+	manager := toolShapesTestManager()
+	const replacement = "rg foo big.log"
+	tests := []struct {
+		name   string
+		raw    string
+		verify func(*testing.T, map[string]json.RawMessage)
+	}{
+		{
+			name: "top-level command",
+			raw:  `{"type":"local_shell_call","call_id":"call-local-1","command":"grep foo big.log"}`,
+			verify: func(t *testing.T, item map[string]json.RawMessage) {
+				requireRawJSONString(t, item["command"], replacement)
+			},
+		},
+		{
+			name: "top-level cmd",
+			raw:  `{"type":"local_shell_call","call_id":"call-local-2","cmd":"grep foo big.log"}`,
+			verify: func(t *testing.T, item map[string]json.RawMessage) {
+				requireRawJSONString(t, item["cmd"], replacement)
+			},
+		},
+		{
+			name: "arguments object command",
+			raw:  `{"type":"local_shell_call","call_id":"call-local-3","arguments":{"command":"grep foo big.log"}}`,
+			verify: func(t *testing.T, item map[string]json.RawMessage) {
+				var arguments map[string]json.RawMessage
+				if err := json.Unmarshal(item["arguments"], &arguments); err != nil {
+					t.Fatalf("decode arguments object: %v", err)
+				}
+				requireRawJSONString(t, arguments["command"], replacement)
+			},
+		},
+		{
+			name: "arguments JSON string cmd",
+			raw:  `{"type":"local_shell_call","call_id":"call-local-4","arguments":"{\"cmd\":\"grep foo big.log\"}"}`,
+			verify: func(t *testing.T, item map[string]json.RawMessage) {
+				var arguments string
+				if err := json.Unmarshal(item["arguments"], &arguments); err != nil {
+					t.Fatalf("decode arguments string: %v", err)
+				}
+				got, ok := extractStringArgumentAtPath(arguments, "/cmd")
+				if !ok || got != replacement {
+					t.Fatalf("arguments cmd = %q found=%v, want %q in %s", got, ok, replacement, arguments)
+				}
+			},
+		},
+		{
+			name: "plain arguments string",
+			raw:  `{"type":"local_shell_call","call_id":"call-local-5","arguments":"grep foo big.log"}`,
+			verify: func(t *testing.T, item map[string]json.RawMessage) {
+				requireRawJSONString(t, item["arguments"], replacement)
+			},
+		},
+		{
+			name: "action command",
+			raw:  `{"type":"local_shell_call","call_id":"call-local-6","action":{"command":"grep foo big.log"}}`,
+			verify: func(t *testing.T, item map[string]json.RawMessage) {
+				var action map[string]json.RawMessage
+				if err := json.Unmarshal(item["action"], &action); err != nil {
+					t.Fatalf("decode action object: %v", err)
+				}
+				requireRawJSONString(t, action["command"], replacement)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			newRaw, ok := replaceShellFunctionCommand([]byte(tt.raw), replacement, manager)
+			if !ok {
+				t.Fatalf("expected local shell command replacement to succeed")
+			}
+			var item map[string]json.RawMessage
+			if err := json.Unmarshal(newRaw, &item); err != nil {
+				t.Fatalf("decode rewritten item: %v", err)
+			}
+			tt.verify(t, item)
+
+			commandItem, ok := extractShellFunctionCommandItem(newRaw, manager)
+			if !ok {
+				t.Fatalf("expected rewritten command to remain extractable")
+			}
+			if commandItem.Command != replacement {
+				t.Fatalf("rewritten command = %q, want %q", commandItem.Command, replacement)
+			}
+		})
+	}
+}
+
+func TestToolShapesDoesNotRewriteLocalShellArgvArray(t *testing.T) {
+	manager := toolShapesTestManager()
+	raw := []byte(`{"type":"local_shell_call","call_id":"call-local-1","action":{"command":["grep","foo bar","big.log"]}}`)
+	if _, ok := replaceShellFunctionCommand(raw, "rg foo big.log", manager); ok {
+		t.Fatalf("expected argv array command replacement to fail without changing the schema")
+	}
+
+	commandItem, ok := extractShellFunctionCommandItem(raw, manager)
+	if !ok {
+		t.Fatalf("expected argv array command to remain extractable")
+	}
+	if commandItem.Command != "grep 'foo bar' big.log" {
+		t.Fatalf("command = %q, want %q", commandItem.Command, "grep 'foo bar' big.log")
 	}
 }
 
@@ -194,6 +317,17 @@ func TestToolShapesExtractFunctionCallOutputNonStringValues(t *testing.T) {
 				t.Fatalf("Output = %q, want %q", got.Output, tt.want)
 			}
 		})
+	}
+}
+
+func requireRawJSONString(t *testing.T, raw json.RawMessage, want string) {
+	t.Helper()
+	var got string
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode string field: %v", err)
+	}
+	if got != want {
+		t.Fatalf("string field = %q, want %q", got, want)
 	}
 }
 

@@ -335,11 +335,9 @@ func (h *ProxyHandler) maybeReduceResponsesToolOutputsInRequestBody(ctx context.
 		}
 		var toolCtx ToolExecutionContext
 		var foundContext bool
-		if store != nil && scope != "" {
+		toolCtx, foundContext = localContexts[outputItem.CallID]
+		if !foundContext && store != nil && scope != "" {
 			toolCtx, foundContext = store.Get(scope, outputItem.CallID)
-		}
-		if !foundContext {
-			toolCtx, foundContext = localContexts[outputItem.CallID]
 		}
 		if !foundContext {
 			continue

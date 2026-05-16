@@ -1,7 +1,7 @@
 package proxy
 
 import (
-	"sort"
+	"container/list"
 	"sync"
 	"time"
 )
@@ -27,9 +27,15 @@ type toolExecutionContextKey struct {
 	CallID string
 }
 
+type toolExecutionContextEntry struct {
+	ctx     ToolExecutionContext
+	element *list.Element
+}
+
 type ToolExecutionContextStore struct {
 	mu           sync.Mutex
-	entries      map[toolExecutionContextKey]ToolExecutionContext
+	entries      map[toolExecutionContextKey]*toolExecutionContextEntry
+	order        *list.List
 	ttl          time.Duration
 	maxEntries   int
 	nextExpireAt time.Time
@@ -47,7 +53,8 @@ func NewToolExecutionContextStoreWithLimits(ttl time.Duration, maxEntries int) *
 		maxEntries = defaultToolExecutionContextMaxEntries
 	}
 	return &ToolExecutionContextStore{
-		entries:    make(map[toolExecutionContextKey]ToolExecutionContext),
+		entries:    make(map[toolExecutionContextKey]*toolExecutionContextEntry),
+		order:      list.New(),
 		ttl:        ttl,
 		maxEntries: maxEntries,
 	}
@@ -63,11 +70,21 @@ func (s *ToolExecutionContextStore) Put(scope string, ctx ToolExecutionContext) 
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.entries == nil {
-		s.entries = make(map[toolExecutionContextKey]ToolExecutionContext)
-	}
+	s.ensureInitializedLocked()
 	s.maybeExpireLocked(now)
-	s.entries[toolExecutionContextKey{Scope: scope, CallID: ctx.CallID}] = ctx
+	key := toolExecutionContextKey{Scope: scope, CallID: ctx.CallID}
+	if existing, ok := s.entries[key]; ok {
+		if existing.element != nil {
+			s.order.Remove(existing.element)
+		}
+		existing.ctx = ctx
+		existing.element = s.order.PushBack(key)
+	} else {
+		s.entries[key] = &toolExecutionContextEntry{
+			ctx:     ctx,
+			element: s.order.PushBack(key),
+		}
+	}
 	s.enforceMaxEntriesLocked()
 }
 
@@ -81,12 +98,13 @@ func (s *ToolExecutionContextStore) Get(scope, callID string) (ToolExecutionCont
 		return ToolExecutionContext{}, false
 	}
 	key := toolExecutionContextKey{Scope: scope, CallID: callID}
-	ctx, ok := s.entries[key]
+	entry, ok := s.entries[key]
 	if !ok {
 		return ToolExecutionContext{}, false
 	}
+	ctx := entry.ctx
 	if s.ttl > 0 && time.Since(ctx.CreatedAt) > s.ttl {
-		delete(s.entries, key)
+		s.removeEntryLocked(key)
 		return ToolExecutionContext{}, false
 	}
 	return ctx, true
@@ -98,7 +116,37 @@ func (s *ToolExecutionContextStore) Delete(scope, callID string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.entries, toolExecutionContextKey{Scope: scope, CallID: callID})
+	s.removeEntryLocked(toolExecutionContextKey{Scope: scope, CallID: callID})
+}
+
+func (s *ToolExecutionContextStore) ensureInitializedLocked() {
+	if s.entries == nil {
+		s.entries = make(map[toolExecutionContextKey]*toolExecutionContextEntry)
+	}
+	if s.order == nil {
+		s.order = list.New()
+		for key, entry := range s.entries {
+			if entry == nil {
+				delete(s.entries, key)
+				continue
+			}
+			entry.element = s.order.PushBack(key)
+		}
+	}
+}
+
+func (s *ToolExecutionContextStore) removeEntryLocked(key toolExecutionContextKey) {
+	if s.entries == nil {
+		return
+	}
+	entry, ok := s.entries[key]
+	if !ok {
+		return
+	}
+	delete(s.entries, key)
+	if s.order != nil && entry != nil && entry.element != nil {
+		s.order.Remove(entry.element)
+	}
 }
 
 func (s *ToolExecutionContextStore) maybeExpireLocked(now time.Time) {
@@ -123,9 +171,9 @@ func (s *ToolExecutionContextStore) expireLocked(now time.Time) {
 	if s.ttl <= 0 {
 		return
 	}
-	for key, ctx := range s.entries {
-		if now.Sub(ctx.CreatedAt) > s.ttl {
-			delete(s.entries, key)
+	for key, entry := range s.entries {
+		if entry == nil || now.Sub(entry.ctx.CreatedAt) > s.ttl {
+			s.removeEntryLocked(key)
 		}
 	}
 }
@@ -134,27 +182,21 @@ func (s *ToolExecutionContextStore) enforceMaxEntriesLocked() {
 	if s.maxEntries <= 0 || len(s.entries) <= s.maxEntries {
 		return
 	}
-
-	type entry struct {
-		key       toolExecutionContextKey
-		createdAt time.Time
-	}
-	entries := make([]entry, 0, len(s.entries))
-	for key, ctx := range s.entries {
-		entries = append(entries, entry{key: key, createdAt: ctx.CreatedAt})
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].createdAt.Equal(entries[j].createdAt) {
-			if entries[i].key.Scope == entries[j].key.Scope {
-				return entries[i].key.CallID < entries[j].key.CallID
+	s.ensureInitializedLocked()
+	for len(s.entries) > s.maxEntries {
+		front := s.order.Front()
+		if front == nil {
+			for key := range s.entries {
+				delete(s.entries, key)
+				break
 			}
-			return entries[i].key.Scope < entries[j].key.Scope
+			continue
 		}
-		return entries[i].createdAt.Before(entries[j].createdAt)
-	})
-
-	removeCount := len(entries) - s.maxEntries
-	for i := 0; i < removeCount; i++ {
-		delete(s.entries, entries[i].key)
+		key, ok := front.Value.(toolExecutionContextKey)
+		s.order.Remove(front)
+		if !ok {
+			continue
+		}
+		delete(s.entries, key)
 	}
 }

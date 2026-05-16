@@ -112,10 +112,10 @@ func extractLocalShellFunctionCommand(item map[string]json.RawMessage) (toolComm
 }
 
 func extractLocalShellCommand(item map[string]json.RawMessage) (string, bool) {
-	if command, ok := extractNonEmptyJSONStringField(item, "command"); ok {
+	if command, ok := extractShellCommandJSONField(item, "command"); ok {
 		return command, true
 	}
-	if command, ok := extractNonEmptyJSONStringField(item, "cmd"); ok {
+	if command, ok := extractShellCommandJSONField(item, "cmd"); ok {
 		return command, true
 	}
 	if rawArguments, ok := item["arguments"]; ok {
@@ -132,10 +132,13 @@ func extractLocalShellCommand(item map[string]json.RawMessage) (string, bool) {
 func extractLocalShellCommandFromArguments(raw json.RawMessage) (string, bool) {
 	var arguments string
 	if err := json.Unmarshal(raw, &arguments); err == nil {
-		if command, ok := extractStringArgumentAtPath(arguments, "/command"); ok {
+		if command, ok := extractShellCommandArgumentAtPath(arguments, "/command"); ok {
 			return command, true
 		}
-		if command, ok := extractStringArgumentAtPath(arguments, "/cmd"); ok {
+		if command, ok := extractShellCommandArgumentAtPath(arguments, "/cmd"); ok {
+			return command, true
+		}
+		if command, ok := extractShellCommandArgumentAtPath(arguments, "/action/command"); ok {
 			return command, true
 		}
 		if strings.TrimSpace(arguments) != "" {
@@ -148,10 +151,10 @@ func extractLocalShellCommandFromArguments(raw json.RawMessage) (string, bool) {
 	if err := json.Unmarshal(raw, &object); err != nil {
 		return "", false
 	}
-	if command, ok := extractNonEmptyJSONStringField(object, "command"); ok {
+	if command, ok := extractShellCommandJSONField(object, "command"); ok {
 		return command, true
 	}
-	if command, ok := extractNonEmptyJSONStringField(object, "cmd"); ok {
+	if command, ok := extractShellCommandJSONField(object, "cmd"); ok {
 		return command, true
 	}
 	if command, ok := extractNestedJSONStringField(object, "action", "command"); ok {
@@ -172,6 +175,31 @@ func extractNonEmptyJSONStringField(item map[string]json.RawMessage, key string)
 	return value, true
 }
 
+func extractShellCommandJSONField(item map[string]json.RawMessage, key string) (string, bool) {
+	raw, ok := item[key]
+	if !ok {
+		return "", false
+	}
+	return extractShellCommandJSONValue(raw)
+}
+
+func extractShellCommandJSONValue(raw json.RawMessage) (string, bool) {
+	var value string
+	if err := json.Unmarshal(raw, &value); err == nil {
+		if strings.TrimSpace(value) == "" {
+			return "", false
+		}
+		return value, true
+	}
+
+	var argv []string
+	if err := json.Unmarshal(raw, &argv); err == nil {
+		return shellQuoteCommandArgs(argv)
+	}
+
+	return "", false
+}
+
 func extractNestedJSONStringField(item map[string]json.RawMessage, objectKey, stringKey string) (string, bool) {
 	raw, ok := item[objectKey]
 	if !ok {
@@ -181,7 +209,7 @@ func extractNestedJSONStringField(item map[string]json.RawMessage, objectKey, st
 	if err := json.Unmarshal(raw, &object); err != nil {
 		return "", false
 	}
-	return extractNonEmptyJSONStringField(object, stringKey)
+	return extractShellCommandJSONField(object, stringKey)
 }
 
 func extractCommandFromArguments(argumentsJSON string) (string, bool) {
@@ -193,12 +221,34 @@ func replaceShellFunctionCommand(raw json.RawMessage, replacement string, manage
 	if err := json.Unmarshal(raw, &item); err != nil {
 		return raw, false
 	}
-	if _, ok := extractShellFunctionCommand(item, manager); !ok {
+
+	var itemType string
+	if err := json.Unmarshal(item["type"], &itemType); err != nil {
 		return raw, false
 	}
-	if !replaceShellFunctionCommandArguments(item, manager, replacement) {
+
+	switch itemType {
+	case "function_call":
+		if _, ok := extractConfiguredShellFunctionCommand(item, manager); !ok {
+			return raw, false
+		}
+		if !replaceShellFunctionCommandArguments(item, manager, replacement) {
+			return raw, false
+		}
+	case "local_shell_call":
+		if manager == nil || !manager.ShellFunctionCallsEnabled() {
+			return raw, false
+		}
+		if _, ok := extractLocalShellFunctionCommand(item); !ok {
+			return raw, false
+		}
+		if !replaceLocalShellFunctionCommand(item, replacement) {
+			return raw, false
+		}
+	default:
 		return raw, false
 	}
+
 	newItem, err := json.Marshal(item)
 	if err != nil {
 		return raw, false
@@ -222,6 +272,147 @@ func replaceShellFunctionCommandArguments(item map[string]json.RawMessage, manag
 	}
 
 	encoded, err := json.Marshal(newArguments)
+	if err != nil {
+		return false
+	}
+	item["arguments"] = encoded
+	return true
+}
+
+func replaceLocalShellFunctionCommand(item map[string]json.RawMessage, replacement string) bool {
+	if replaced, matched := replaceJSONStringCommandField(item, "command", replacement); matched {
+		return replaced
+	}
+	if replaced, matched := replaceJSONStringCommandField(item, "cmd", replacement); matched {
+		return replaced
+	}
+	if replaced, matched := replaceLocalShellCommandInArguments(item, replacement); matched {
+		return replaced
+	}
+	if replaced, matched := replaceNestedJSONStringCommandField(item, "action", "command", replacement); matched {
+		return replaced
+	}
+	return false
+}
+
+func replaceJSONStringCommandField(item map[string]json.RawMessage, key, replacement string) (bool, bool) {
+	raw, ok := item[key]
+	if !ok {
+		return false, false
+	}
+	if _, ok := extractShellCommandJSONValue(raw); !ok {
+		return false, false
+	}
+
+	var existing string
+	if err := json.Unmarshal(raw, &existing); err != nil {
+		return false, true
+	}
+	if strings.TrimSpace(existing) == "" {
+		return false, false
+	}
+
+	encoded, err := json.Marshal(replacement)
+	if err != nil {
+		return false, true
+	}
+	item[key] = encoded
+	return true, true
+}
+
+func replaceNestedJSONStringCommandField(item map[string]json.RawMessage, objectKey, stringKey, replacement string) (bool, bool) {
+	raw, ok := item[objectKey]
+	if !ok {
+		return false, false
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return false, false
+	}
+	replaced, matched := replaceJSONStringCommandField(object, stringKey, replacement)
+	if !matched {
+		return false, false
+	}
+	if !replaced {
+		return false, true
+	}
+
+	encoded, err := json.Marshal(object)
+	if err != nil {
+		return false, true
+	}
+	item[objectKey] = encoded
+	return true, true
+}
+
+func replaceLocalShellCommandInArguments(item map[string]json.RawMessage, replacement string) (bool, bool) {
+	raw, ok := item["arguments"]
+	if !ok {
+		return false, false
+	}
+
+	var arguments string
+	if err := json.Unmarshal(raw, &arguments); err == nil {
+		if _, ok := extractShellCommandArgumentAtPath(arguments, "/command"); ok {
+			return replaceLocalShellStringArguments(item, arguments, "/command", replacement), true
+		}
+		if _, ok := extractShellCommandArgumentAtPath(arguments, "/cmd"); ok {
+			return replaceLocalShellStringArguments(item, arguments, "/cmd", replacement), true
+		}
+		if _, ok := extractShellCommandArgumentAtPath(arguments, "/action/command"); ok {
+			return replaceLocalShellStringArguments(item, arguments, "/action/command", replacement), true
+		}
+		if strings.TrimSpace(arguments) == "" {
+			return false, false
+		}
+		encoded, err := json.Marshal(replacement)
+		if err != nil {
+			return false, true
+		}
+		item["arguments"] = encoded
+		return true, true
+	}
+
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return false, false
+	}
+	if replaced, matched := replaceJSONStringCommandField(object, "command", replacement); matched {
+		if !replaced {
+			return false, true
+		}
+		return replaceLocalShellRawArguments(item, object), true
+	}
+	if replaced, matched := replaceJSONStringCommandField(object, "cmd", replacement); matched {
+		if !replaced {
+			return false, true
+		}
+		return replaceLocalShellRawArguments(item, object), true
+	}
+	if replaced, matched := replaceNestedJSONStringCommandField(object, "action", "command", replacement); matched {
+		if !replaced {
+			return false, true
+		}
+		return replaceLocalShellRawArguments(item, object), true
+	}
+	return false, false
+}
+
+func replaceLocalShellStringArguments(item map[string]json.RawMessage, arguments, pointer, replacement string) bool {
+	newArguments, ok := replaceStringArgumentAtPath(arguments, pointer, replacement)
+	if !ok {
+		return false
+	}
+	encoded, err := json.Marshal(newArguments)
+	if err != nil {
+		return false
+	}
+	item["arguments"] = encoded
+	return true
+}
+
+func replaceLocalShellRawArguments(item map[string]json.RawMessage, object map[string]json.RawMessage) bool {
+	encoded, err := json.Marshal(object)
 	if err != nil {
 		return false
 	}
@@ -291,16 +482,37 @@ func replaceFunctionCallOutput(raw json.RawMessage, replacement string) (json.Ra
 }
 
 func extractStringArgumentAtPath(argumentsJSON, pointer string) (string, bool) {
+	current, ok := extractArgumentAtPath(argumentsJSON, pointer)
+	if !ok {
+		return "", false
+	}
+
+	command, ok := current.(string)
+	if !ok {
+		return "", false
+	}
+	return command, true
+}
+
+func extractShellCommandArgumentAtPath(argumentsJSON, pointer string) (string, bool) {
+	current, ok := extractArgumentAtPath(argumentsJSON, pointer)
+	if !ok {
+		return "", false
+	}
+	return formatShellCommandValue(current)
+}
+
+func extractArgumentAtPath(argumentsJSON, pointer string) (interface{}, bool) {
 	segments, ok := parseToolOptimizerJSONPointer(pointer)
 	if !ok || len(segments) == 0 {
-		return "", false
+		return nil, false
 	}
 
 	var value interface{}
 	decoder := json.NewDecoder(strings.NewReader(argumentsJSON))
 	decoder.UseNumber()
 	if err := decoder.Decode(&value); err != nil {
-		return "", false
+		return nil, false
 	}
 
 	current := value
@@ -309,25 +521,20 @@ func extractStringArgumentAtPath(argumentsJSON, pointer string) (string, bool) {
 		case map[string]interface{}:
 			next, ok := typed[segment]
 			if !ok {
-				return "", false
+				return nil, false
 			}
 			current = next
 		case []interface{}:
 			idx, ok := parseJSONPointerArrayIndex(segment, len(typed))
 			if !ok {
-				return "", false
+				return nil, false
 			}
 			current = typed[idx]
 		default:
-			return "", false
+			return nil, false
 		}
 	}
-
-	command, ok := current.(string)
-	if !ok {
-		return "", false
-	}
-	return command, true
+	return current, true
 }
 
 func replaceStringArgumentAtPath(argumentsJSON, pointer, replacement string) (string, bool) {
@@ -448,4 +655,72 @@ func setStringAtJSONPointer(value interface{}, segments []string, replacement st
 		}
 	}
 	return false
+}
+
+func formatShellCommandValue(value interface{}) (string, bool) {
+	switch typed := value.(type) {
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return "", false
+		}
+		return typed, true
+	case []interface{}:
+		args := make([]string, 0, len(typed))
+		for _, raw := range typed {
+			arg, ok := raw.(string)
+			if !ok {
+				return "", false
+			}
+			args = append(args, arg)
+		}
+		return shellQuoteCommandArgs(args)
+	default:
+		return "", false
+	}
+}
+
+func shellQuoteCommandArgs(args []string) (string, bool) {
+	if len(args) == 0 {
+		return "", false
+	}
+	quoted := make([]string, 0, len(args))
+	for _, arg := range args {
+		quoted = append(quoted, shellQuoteCommandArg(arg))
+	}
+	command := strings.TrimSpace(strings.Join(quoted, " "))
+	if command == "" {
+		return "", false
+	}
+	return command, true
+}
+
+func shellQuoteCommandArg(arg string) string {
+	if arg == "" {
+		return "''"
+	}
+	if isSafeShellToken(arg) {
+		return arg
+	}
+	return "'" + strings.ReplaceAll(arg, "'", "'\"'\"'") + "'"
+}
+
+func isSafeShellToken(arg string) bool {
+	for _, r := range arg {
+		if r >= 'a' && r <= 'z' {
+			continue
+		}
+		if r >= 'A' && r <= 'Z' {
+			continue
+		}
+		if r >= '0' && r <= '9' {
+			continue
+		}
+		switch r {
+		case '_', '@', '%', '+', '=', ':', ',', '.', '-':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }

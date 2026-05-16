@@ -122,12 +122,16 @@ pick_optional_gemini_model() {
 
 write_case_files() {
   local case_dir="$1"
-  local left_value="$2"
-  local right_value="$3"
+  local client="$2"
+  local fixture_name
+  fixture_name="$(printf '%s' "${client}" | tr '[:lower:]' '[:upper:]')"
+  local left_value="ZX_${fixture_name}_LEFT"
+  local right_value="ZX_${fixture_name}_RIGHT"
 
   mkdir -p "${case_dir}"
   printf '%s' "${left_value}" > "${case_dir}/left.txt"
   printf '%s' "${right_value}" > "${case_dir}/right.txt"
+  printf '%s|%s' "${left_value}" "${right_value}"
 }
 
 assert_exact_output() {
@@ -188,12 +192,10 @@ run_codex_smoke() {
   local case_dir="${SMOKE_DIR}/cases/codex"
   local home_dir="${SMOKE_DIR}/homes/codex-home"
   local output_file="${SMOKE_DIR}/outputs/codex.txt"
-  local left_value="ZX_COD_41A"
-  local right_value="ZX_COD_88B"
-  local expected="${left_value}|${right_value}"
+  local expected
   local actual
 
-  write_case_files "${case_dir}" "${left_value}" "${right_value}"
+  expected="$(write_case_files "${case_dir}" "codex")"
   mkdir -p "${home_dir}/.codex"
   printf 'model = "%s"\nopenai_base_url = "%s"\n' "${CODEX_MODEL}" "${PROXY_BASE_URL}/v1" > "${home_dir}/.codex/config.toml"
 
@@ -219,12 +221,10 @@ run_claude_smoke() {
   local case_dir="${SMOKE_DIR}/cases/claude"
   local home_dir="${SMOKE_DIR}/homes/claude-home"
   local output_file="${SMOKE_DIR}/outputs/claude.txt"
-  local left_value="ZX_CLA_17Q"
-  local right_value="ZX_CLA_52R"
-  local expected="${left_value}|${right_value}"
+  local expected
   local actual
 
-  write_case_files "${case_dir}" "${left_value}" "${right_value}"
+  expected="$(write_case_files "${case_dir}" "claude")"
   mkdir -p "${home_dir}/.claude"
   cat > "${home_dir}/.claude/settings.json" <<EOF
 {
@@ -260,12 +260,10 @@ run_gemini_smoke() {
   local case_dir="${SMOKE_DIR}/cases/gemini"
   local home_dir="${SMOKE_DIR}/homes/gemini-home"
   local output_file="${SMOKE_DIR}/outputs/gemini.txt"
-  local left_value="ZX_GEM_73M"
-  local right_value="ZX_GEM_94N"
-  local expected="${left_value}|${right_value}"
+  local expected
   local actual
 
-  write_case_files "${case_dir}" "${left_value}" "${right_value}"
+  expected="$(write_case_files "${case_dir}" "gemini")"
   mkdir -p "${home_dir}/.gemini/tmp"
   printf '{"projects":{}}\n' > "${home_dir}/.gemini/projects.json"
   cat > "${home_dir}/.gemini/settings.json" <<EOF
