@@ -301,7 +301,6 @@ func TestToolShapesExtractFunctionCallOutputNonStringValues(t *testing.T) {
 		{name: "array", raw: `{"type":"function_call_output","call_id":"call-1","output":["a","b"]}`, want: `["a","b"]`},
 		{name: "number", raw: `{"type":"function_call_output","call_id":"call-1","output":42}`, want: `42`},
 		{name: "bool", raw: `{"type":"function_call_output","call_id":"call-1","output":true}`, want: `true`},
-		{name: "null", raw: `{"type":"function_call_output","call_id":"call-1","output":null}`, want: `null`},
 	}
 
 	for _, tt := range tests {
@@ -317,6 +316,12 @@ func TestToolShapesExtractFunctionCallOutputNonStringValues(t *testing.T) {
 				t.Fatalf("Output = %q, want %q", got.Output, tt.want)
 			}
 		})
+	}
+}
+
+func TestToolShapesExtractFunctionCallOutputSkipsNullOutput(t *testing.T) {
+	if got, ok := extractFunctionCallOutputItem([]byte(`{"type":"function_call_output","call_id":"call-1","output":null}`)); ok {
+		t.Fatalf("expected null output to be skipped, got %+v", got)
 	}
 }
 

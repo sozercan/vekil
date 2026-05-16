@@ -119,6 +119,9 @@ func (e *execJSONToolOptimizer) call(ctx context.Context, req execJSONToolOptimi
 	if err := cmd.Run(); err != nil {
 		return execJSONToolOptimizerResponse{}, err
 	}
+	if stdout.Truncated() || stderr.Truncated() {
+		return execJSONToolOptimizerResponse{}, io.ErrShortBuffer
+	}
 	var resp execJSONToolOptimizerResponse
 	if err := json.Unmarshal(stdout.Bytes(), &resp); err != nil {
 		return execJSONToolOptimizerResponse{}, err
@@ -127,8 +130,9 @@ func (e *execJSONToolOptimizer) call(ctx context.Context, req execJSONToolOptimi
 }
 
 type limitedBuffer struct {
-	buf   bytes.Buffer
-	limit int64
+	buf       bytes.Buffer
+	limit     int64
+	truncated bool
 }
 
 func (b *limitedBuffer) Write(p []byte) (int, error) {
@@ -137,13 +141,19 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 	}
 	remaining := int(b.limit) - b.buf.Len()
 	if remaining <= 0 {
-		return 0, io.ErrShortBuffer
+		b.truncated = true
+		return len(p), nil
 	}
 	if len(p) > remaining {
-		n, _ := b.buf.Write(p[:remaining])
-		return n, io.ErrShortBuffer
+		_, _ = b.buf.Write(p[:remaining])
+		b.truncated = true
+		return len(p), nil
 	}
 	return b.buf.Write(p)
+}
+
+func (b *limitedBuffer) Truncated() bool {
+	return b != nil && b.truncated
 }
 
 func (b *limitedBuffer) Bytes() []byte {

@@ -42,8 +42,8 @@ func (h *ProxyHandler) maybeReduceOpenAIChatToolOutputs(ctx context.Context, req
 			continue
 		}
 
-		var output string
-		if err := json.Unmarshal(msg.Content, &output); err != nil {
+		output, ok := extractToolOutput(msg.Content)
+		if !ok {
 			continue
 		}
 
@@ -239,8 +239,8 @@ func (h *ProxyHandler) rewriteOpenAIChatRequestBodyWithToolOptimizers(ctx contex
 			continue
 		}
 
-		var output string
-		if err := json.Unmarshal(msg.Content, &output); err != nil {
+		output, ok := extractToolOutput(msg.Content)
+		if !ok {
 			continue
 		}
 
@@ -283,10 +283,9 @@ func (h *ProxyHandler) rewriteOpenAIChatRequestBodyWithToolOptimizers(ctx contex
 	if err != nil {
 		return bodyBytes
 	}
-	payload["messages"] = newMessages
 
-	rewritten, err := json.Marshal(payload)
-	if err != nil {
+	rewritten, ok := replaceTopLevelRawJSONField(bodyBytes, "messages", newMessages)
+	if !ok {
 		return bodyBytes
 	}
 	h.log.Debug("reduced openai chat tool outputs", logger.F("count", changedCount))

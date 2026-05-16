@@ -102,6 +102,9 @@ pick_optional_gemini_model() {
     fi
   done
 
+  # The Gemini CLI hits Gemini-native proxy routes, but Vekil translates
+  # those requests to upstream OpenAI chat completions internally, so the
+  # selected model must advertise /chat/completions support.
   candidate="$(jq -r '
     [
       .data[]?

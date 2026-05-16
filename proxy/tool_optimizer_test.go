@@ -52,6 +52,36 @@ func TestToolOptimizerOutputReduceExplicitZeroTimeoutDisablesDeadline(t *testing
 	}
 }
 
+func TestLimitedBufferDiscardsAfterLimitWithoutShortWrite(t *testing.T) {
+	var buf limitedBuffer
+	buf.limit = 3
+
+	n, err := buf.Write([]byte("abcde"))
+	if err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+	if n != 5 {
+		t.Fatalf("Write n = %d, want 5", n)
+	}
+	if got := string(buf.Bytes()); got != "abc" {
+		t.Fatalf("buffer = %q, want abc", got)
+	}
+	if !buf.Truncated() {
+		t.Fatalf("expected buffer to record truncation")
+	}
+
+	n, err = buf.Write([]byte("fgh"))
+	if err != nil {
+		t.Fatalf("second Write returned error: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("second Write n = %d, want 3", n)
+	}
+	if got := string(buf.Bytes()); got != "abc" {
+		t.Fatalf("buffer after discard = %q, want abc", got)
+	}
+}
+
 func TestValidCommandReplacementAllowsInternalNewlinesAndCarriageReturns(t *testing.T) {
 	if !validCommandReplacement("grep foo big.log", "printf 'foo\\nbar'\nrg foo big.log") {
 		t.Fatalf("expected replacement with internal newline to be valid")

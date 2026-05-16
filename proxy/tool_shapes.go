@@ -31,8 +31,12 @@ func extractShellFunctionCommand(item map[string]json.RawMessage, manager *ToolO
 		return toolCommandItem{}, false
 	}
 
+	rawType, ok := item["type"]
+	if !ok {
+		return toolCommandItem{}, false
+	}
 	var itemType string
-	if err := json.Unmarshal(item["type"], &itemType); err != nil {
+	if err := json.Unmarshal(rawType, &itemType); err != nil {
 		return toolCommandItem{}, false
 	}
 
@@ -218,8 +222,12 @@ func replaceShellFunctionCommand(raw json.RawMessage, replacement string, manage
 		return raw, false
 	}
 
+	rawType, ok := item["type"]
+	if !ok {
+		return raw, false
+	}
 	var itemType string
-	if err := json.Unmarshal(item["type"], &itemType); err != nil {
+	if err := json.Unmarshal(rawType, &itemType); err != nil {
 		return raw, false
 	}
 
@@ -446,7 +454,7 @@ func extractToolOutput(raw json.RawMessage) (string, bool) {
 		return "", false
 	}
 	if trimmed == "null" {
-		return trimmed, true
+		return "", false
 	}
 
 	var output string

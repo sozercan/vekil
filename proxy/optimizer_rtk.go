@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"io"
 	"os/exec"
 	"strings"
 )
@@ -88,6 +89,9 @@ func (r *rtkToolOptimizer) run(cmd *exec.Cmd, stdin string) ([]byte, error) {
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return nil, err
+	}
+	if stdout.Truncated() || stderr.Truncated() {
+		return nil, io.ErrShortBuffer
 	}
 	return stdout.Bytes(), nil
 }
