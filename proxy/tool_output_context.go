@@ -124,6 +124,10 @@ func (s *ToolExecutionContextStore) ensureInitializedLocked() {
 		s.entries = make(map[toolExecutionContextKey]*toolExecutionContextEntry)
 	}
 	if s.order == nil {
+		// This only recovers zero-value/corrupted stores; normal construction keeps
+		// order non-nil for the lifetime of the store. If entries already exist,
+		// rebuilding from the map is acceptable as best-effort recovery because the
+		// original insertion order is no longer available.
 		s.order = list.New()
 		for key, entry := range s.entries {
 			if entry == nil {

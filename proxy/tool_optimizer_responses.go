@@ -159,6 +159,9 @@ func replaceTopLevelRawJSONField(bodyBytes []byte, field string, replacement jso
 		if key != field {
 			continue
 		}
+		// Duplicate top-level keys are not a valid Responses shape, but if
+		// one appears, rewrite every occurrence so downstream first-key/last-key
+		// parser differences cannot observe a stale value.
 		out.Write(bodyBytes[lastCopyOffset:valueStart])
 		out.Write(replacement)
 		lastCopyOffset = valueEnd

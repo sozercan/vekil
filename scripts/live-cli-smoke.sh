@@ -129,6 +129,8 @@ write_case_files() {
   local right_value="ZX_${fixture_name}_RIGHT"
 
   mkdir -p "${case_dir}"
+  # Keep fixtures newline-free so exact-output assertions compare only the
+  # requested payload, not editor-added file terminators.
   printf '%s' "${left_value}" > "${case_dir}/left.txt"
   printf '%s' "${right_value}" > "${case_dir}/right.txt"
   printf '%s|%s' "${left_value}" "${right_value}"

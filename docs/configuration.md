@@ -228,6 +228,7 @@ Important behavior:
 - For `/v1/responses`, stable scope headers are preferred. Headerless clients can still correlate ordinary continuations through `previous_response_id`, and replay bodies that include a `function_call` before its output can be reduced within that same request.
 - For chat-style APIs, cross-request output reduction requires a stable scope header. Headerless chat requests are only reduced when the request replays the matching assistant `tool_calls` before the tool output in the same `messages` array; Vekil does not share chat tool-call context globally across conversations.
 - Optimizers are fail-open. External errors, timeouts, invalid JSON, unsupported provider config, or invalid replacements are ignored and the original payload is used.
+- `output_reduce.timeout_ms: 0` disables the per-provider optimizer timeout while still honoring the surrounding request context. `output_reduce.min_input_bytes: 0` disables the minimum-size gate, and `output_reduce.max_input_bytes: 0` disables the maximum-size gate.
 - Command replacements must be changed, non-empty after trimming, at most `32768` bytes, and contain no NUL characters. Internal newlines and carriage returns are allowed for multi-line shell snippets.
 - Output replacements must be changed and non-empty after trimming.
 

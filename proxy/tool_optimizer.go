@@ -118,7 +118,7 @@ func (m *ToolOptimizerManager) RewriteCommand(ctx context.Context, req ToolComma
 		if provider.optimizer == nil || !provider.commandRewrite {
 			continue
 		}
-		callCtx, cancel := context.WithTimeout(ctx, time.Duration(m.cfg.CommandRewrite.TimeoutMS)*time.Millisecond)
+		callCtx, cancel := optimizerCallContext(ctx, m.cfg.CommandRewrite.TimeoutMS)
 		result, err := provider.optimizer.RewriteCommand(callCtx, req)
 		cancel()
 		if err != nil || !result.Changed {
@@ -144,7 +144,7 @@ func (m *ToolOptimizerManager) ReduceOutput(ctx context.Context, req ToolOutputR
 		if provider.optimizer == nil || !provider.outputReduce {
 			continue
 		}
-		callCtx, cancel := context.WithTimeout(ctx, time.Duration(m.cfg.OutputReduce.TimeoutMS)*time.Millisecond)
+		callCtx, cancel := optimizerCallContext(ctx, m.cfg.OutputReduce.TimeoutMS)
 		result, err := provider.optimizer.ReduceOutput(callCtx, req)
 		cancel()
 		if err != nil || !result.Changed {
@@ -171,6 +171,16 @@ func (m *ToolOptimizerManager) outputWithinConfiguredThresholds(output string) b
 		return false
 	}
 	return size > 0
+}
+
+func optimizerCallContext(parent context.Context, timeoutMS int) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if timeoutMS <= 0 {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, time.Duration(timeoutMS)*time.Millisecond)
 }
 
 func validCommandReplacement(original, replacement string) bool {

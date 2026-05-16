@@ -212,10 +212,6 @@ func extractNestedJSONStringField(item map[string]json.RawMessage, objectKey, st
 	return extractShellCommandJSONField(object, stringKey)
 }
 
-func extractCommandFromArguments(argumentsJSON string) (string, bool) {
-	return extractStringArgumentAtPath(argumentsJSON, "/command")
-}
-
 func replaceShellFunctionCommand(raw json.RawMessage, replacement string, manager *ToolOptimizerManager) (json.RawMessage, bool) {
 	var item map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &item); err != nil {
@@ -418,10 +414,6 @@ func replaceLocalShellRawArguments(item map[string]json.RawMessage, object map[s
 	}
 	item["arguments"] = encoded
 	return true
-}
-
-func replaceCommandInArguments(argumentsJSON, replacement string) (string, bool) {
-	return replaceStringArgumentAtPath(argumentsJSON, "/command", replacement)
 }
 
 func extractFunctionCallOutputItem(raw json.RawMessage) (toolOutputItem, bool) {

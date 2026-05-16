@@ -1,9 +1,56 @@
 package proxy
 
 import (
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 )
+
+type contextCheckingToolOptimizer struct {
+	reduceCtxErr      error
+	reduceHasDeadline bool
+}
+
+func (o *contextCheckingToolOptimizer) ID() string { return "context-checking" }
+
+func (o *contextCheckingToolOptimizer) RewriteCommand(context.Context, ToolCommandRewriteRequest) (ToolCommandRewriteResult, error) {
+	return ToolCommandRewriteResult{}, nil
+}
+
+func (o *contextCheckingToolOptimizer) ReduceOutput(ctx context.Context, _ ToolOutputReduceRequest) (ToolOutputReduceResult, error) {
+	o.reduceCtxErr = ctx.Err()
+	_, o.reduceHasDeadline = ctx.Deadline()
+	return ToolOutputReduceResult{Changed: true, Output: "reduced"}, nil
+}
+
+func TestToolOptimizerOutputReduceExplicitZeroTimeoutDisablesDeadline(t *testing.T) {
+	optimizer := &contextCheckingToolOptimizer{}
+	var cfg ToolOptimizersConfig
+	if err := json.Unmarshal([]byte(`{
+		"enabled": true,
+		"output_reduce": {
+			"enabled": true,
+			"timeout_ms": 0,
+			"min_input_bytes": 0,
+			"max_input_bytes": 0
+		}
+	}`), &cfg); err != nil {
+		t.Fatalf("unmarshal config: %v", err)
+	}
+	manager := NewToolOptimizerManager(cfg, []stagedToolOptimizer{{optimizer: optimizer, outputReduce: true}})
+
+	result := manager.ReduceOutput(context.Background(), ToolOutputReduceRequest{Command: "cat big.log", Output: "large output"})
+	if !result.Changed || result.Output != "reduced" {
+		t.Fatalf("ReduceOutput result = %+v, want changed reduced output", result)
+	}
+	if optimizer.reduceCtxErr != nil {
+		t.Fatalf("optimizer context error = %v, want nil", optimizer.reduceCtxErr)
+	}
+	if optimizer.reduceHasDeadline {
+		t.Fatalf("optimizer context unexpectedly had a deadline")
+	}
+}
 
 func TestValidCommandReplacementAllowsInternalNewlinesAndCarriageReturns(t *testing.T) {
 	if !validCommandReplacement("grep foo big.log", "printf 'foo\\nbar'\nrg foo big.log") {

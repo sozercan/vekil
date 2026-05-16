@@ -36,6 +36,20 @@ func TestToolOptimizerResponsesReplaceTopLevelRawJSONFieldPreservesOrderAndRawVa
 	}
 }
 
+func TestToolOptimizerResponsesReplaceTopLevelRawJSONFieldReplacesDuplicateFields(t *testing.T) {
+	body := []byte(`{"input":[1],"model":"gpt-4.1","input":[2]}`)
+
+	got, ok := replaceTopLevelRawJSONField(body, "input", json.RawMessage(`[3]`))
+	if !ok {
+		t.Fatalf("replaceTopLevelRawJSONField returned ok=false")
+	}
+
+	want := `{"input":[3],"model":"gpt-4.1","input":[3]}`
+	if string(got) != want {
+		t.Fatalf("rewritten body mismatch\ngot:  %s\nwant: %s", got, want)
+	}
+}
+
 func TestToolOptimizerResponsesReplaceTopLevelRawJSONFieldRejectsMissingOrInvalidInputs(t *testing.T) {
 	body := []byte(`{"input":[1]}`)
 
