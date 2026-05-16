@@ -47,11 +47,13 @@ func (h *ProxyHandler) maybeReduceOpenAIChatToolOutputs(ctx context.Context, req
 			continue
 		}
 
-		reduced, ok := h.reduceOpenAIChatToolOutput(ctx, msg.ToolCallID, output, store, scope)
+		callID := strings.TrimSpace(msg.ToolCallID)
+		reduced, ok := output, false
+		if toolCtx, hasLocalContext := localContexts[callID]; hasLocalContext {
+			reduced, ok = h.reduceOpenAIChatToolOutputWithContext(ctx, callID, output, toolCtx)
+		}
 		if !ok {
-			if toolCtx, hasLocalContext := localContexts[strings.TrimSpace(msg.ToolCallID)]; hasLocalContext {
-				reduced, ok = h.reduceOpenAIChatToolOutputWithContext(ctx, msg.ToolCallID, output, toolCtx)
-			}
+			reduced, ok = h.reduceOpenAIChatToolOutput(ctx, callID, output, store, scope)
 		}
 		if !ok {
 			continue
@@ -242,11 +244,13 @@ func (h *ProxyHandler) rewriteOpenAIChatRequestBodyWithToolOptimizers(ctx contex
 			continue
 		}
 
-		reduced, ok := h.reduceOpenAIChatToolOutput(ctx, msg.ToolCallID, output, store, scope)
+		callID := strings.TrimSpace(msg.ToolCallID)
+		reduced, ok := output, false
+		if toolCtx, hasLocalContext := localContexts[callID]; hasLocalContext {
+			reduced, ok = h.reduceOpenAIChatToolOutputWithContext(ctx, callID, output, toolCtx)
+		}
 		if !ok {
-			if toolCtx, hasLocalContext := localContexts[strings.TrimSpace(msg.ToolCallID)]; hasLocalContext {
-				reduced, ok = h.reduceOpenAIChatToolOutputWithContext(ctx, msg.ToolCallID, output, toolCtx)
-			}
+			reduced, ok = h.reduceOpenAIChatToolOutput(ctx, callID, output, store, scope)
 		}
 		if !ok {
 			continue
