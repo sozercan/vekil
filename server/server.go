@@ -58,6 +58,12 @@ func WithCompactUpstreamChunkBytes(bytes int) Option {
 	return WithProxyOptions(proxy.WithCompactUpstreamChunkBytes(bytes))
 }
 
+// WithCompactUpstreamChunkConcurrency overrides the maximum number of sibling
+// compact chunks sent concurrently after the first chunk succeeds.
+func WithCompactUpstreamChunkConcurrency(concurrency int) Option {
+	return WithProxyOptions(proxy.WithCompactUpstreamChunkConcurrency(concurrency))
+}
+
 // WithCompactUpstreamMaxAttempts caps the total logical compaction calls the
 // /v1/responses/compact 413 fallback may perform per inbound request. Logical
 // calls can produce extra real upstream POSTs through model fallback or the

@@ -236,8 +236,12 @@ type ProxyHandler struct {
 	responsesWS              ResponsesWebSocketConfig
 	streamingUpstreamTimeout time.Duration
 	compactChunkBodyBytes    int
+	compactChunkConfigured   bool
+	compactChunkConcurrency  int
 	compactMaxAttempts       int
 	compactLearnedTargetsMu  sync.Mutex
+	compactInflightMu        sync.Mutex
+	compactInflight          map[string]*compactInflightCall
 	compactLearnedTargets    map[compactLearnedTargetKey]compactLearnedTarget
 	log                      *logger.Logger
 	maxRetries               int
@@ -375,6 +379,18 @@ func WithCompactUpstreamChunkBytes(bytes int) Option {
 	return func(h *ProxyHandler) {
 		if bytes > 0 {
 			h.compactChunkBodyBytes = bytes
+			h.compactChunkConfigured = true
+		}
+	}
+}
+
+// WithCompactUpstreamChunkConcurrency overrides the maximum number of sibling
+// compact chunks sent concurrently after the first chunk succeeds at the current
+// target. Non-positive values fall back to the default.
+func WithCompactUpstreamChunkConcurrency(concurrency int) Option {
+	return func(h *ProxyHandler) {
+		if concurrency > 0 {
+			h.compactChunkConcurrency = concurrency
 		}
 	}
 }
@@ -449,6 +465,23 @@ func (h *ProxyHandler) effectiveCompactChunkBodyBytes() int {
 		return compactUpstreamChunkBodySize
 	}
 	return h.compactChunkBodyBytes
+}
+
+func (h *ProxyHandler) compactProactiveChunkingEnabled() bool {
+	return h != nil && h.compactChunkConfigured && h.effectiveCompactChunkBodyBytes() < compactUpstreamChunkBodySize
+}
+
+// DefaultCompactUpstreamChunkConcurrency returns the default max parallelism for
+// sibling chunk compaction calls after the first chunk succeeds.
+func DefaultCompactUpstreamChunkConcurrency() int {
+	return compactUpstreamChunkConcurrency
+}
+
+func (h *ProxyHandler) effectiveCompactChunkConcurrency() int {
+	if h == nil || h.compactChunkConcurrency <= 0 {
+		return compactUpstreamChunkConcurrency
+	}
+	return h.compactChunkConcurrency
 }
 
 // DefaultCompactUpstreamMaxAttempts returns the default upstream attempt cap
