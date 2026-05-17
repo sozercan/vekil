@@ -83,6 +83,69 @@ func rewriteSyntheticCompactionRequestFields(requestFields map[string]json.RawMe
 	return rewrittenFields, rewriteCount
 }
 
+func sanitizeContextCompactionRequest(body []byte) ([]byte, int) {
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body, 0
+	}
+
+	rawInput, ok := req["input"]
+	if !ok {
+		return body, 0
+	}
+
+	var input interface{}
+	if err := json.Unmarshal(rawInput, &input); err != nil {
+		return body, 0
+	}
+
+	sanitizedInput, sanitizeCount := sanitizeContextCompactionValue(input)
+	if sanitizeCount == 0 {
+		return body, 0
+	}
+
+	encodedInput, err := json.Marshal(sanitizedInput)
+	if err != nil {
+		return body, 0
+	}
+	req["input"] = encodedInput
+
+	sanitizedBody, err := json.Marshal(req)
+	if err != nil {
+		return body, 0
+	}
+	return sanitizedBody, sanitizeCount
+}
+
+func sanitizeContextCompactionRequestFields(requestFields map[string]json.RawMessage) (map[string]json.RawMessage, int) {
+	rawInput, ok := requestFields["input"]
+	if !ok {
+		return requestFields, 0
+	}
+
+	var input interface{}
+	if err := json.Unmarshal(rawInput, &input); err != nil {
+		return requestFields, 0
+	}
+
+	sanitizedInput, sanitizeCount := sanitizeContextCompactionValue(input)
+	if sanitizeCount == 0 {
+		return requestFields, 0
+	}
+
+	encodedInput, err := json.Marshal(sanitizedInput)
+	if err != nil {
+		return requestFields, 0
+	}
+
+	sanitizedFields := make(map[string]json.RawMessage, len(requestFields))
+	for key, value := range requestFields {
+		sanitizedFields[key] = value
+	}
+	sanitizedFields["input"] = encodedInput
+	return sanitizedFields, sanitizeCount
+}
+
 // When a compacted checkpoint is restored without a remaining user turn, add a
 // small synthetic user prompt so the upstream model resumes the interrupted
 // task instead of replying with a generic "what should I work on next?".
@@ -176,6 +239,105 @@ func rewriteSyntheticCompactionValue(v interface{}) (interface{}, int) {
 	default:
 		return v, 0
 	}
+}
+
+func sanitizeContextCompactionValue(v interface{}) (interface{}, int) {
+	switch typed := v.(type) {
+	case []interface{}:
+		sanitized := make([]interface{}, 0, len(typed))
+		total := 0
+		for _, item := range typed {
+			next, count := sanitizeContextCompactionValue(item)
+			total += count
+			sanitized = append(sanitized, next)
+		}
+		return sanitized, total
+
+	case map[string]interface{}:
+		if itemType, _ := typed["type"].(string); itemType == "context_compaction" {
+			if summary, ok := extractContextCompactionSummary(typed); ok {
+				return proxyCompactionContextMessage(summary), 1
+			}
+			return v, 0
+		}
+
+		sanitized := make(map[string]interface{}, len(typed))
+		total := 0
+		for key, value := range typed {
+			next, count := sanitizeContextCompactionValue(value)
+			total += count
+			sanitized[key] = next
+		}
+		return sanitized, total
+	default:
+		return v, 0
+	}
+}
+
+var contextCompactionSummaryFields = []string{"summary", "text", "content", "checkpoint_summary", "checkpoint", "encrypted_content"}
+
+func extractContextCompactionSummary(item map[string]interface{}) (string, bool) {
+	return extractContextCompactionSummaryFromObject(item)
+}
+
+func extractContextCompactionSummaryValue(v interface{}) (string, bool) {
+	switch typed := v.(type) {
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return "", false
+		}
+		return typed, true
+	case []interface{}:
+		return extractContextCompactionSummaryFromArray(typed)
+	case map[string]interface{}:
+		return extractContextCompactionSummaryFromObject(typed)
+	default:
+		return "", false
+	}
+}
+
+func extractContextCompactionSummaryFromArray(items []interface{}) (string, bool) {
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		part, ok := extractContextCompactionSummaryValue(item)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		parts = append(parts, part)
+	}
+	summary := strings.TrimSpace(strings.Join(parts, "\n"))
+	if summary == "" {
+		return "", false
+	}
+	return summary, true
+}
+
+func extractContextCompactionSummaryFromObject(item map[string]interface{}) (string, bool) {
+	for _, field := range contextCompactionSummaryFields {
+		value, ok := item[field]
+		if !ok {
+			continue
+		}
+
+		if field == "encrypted_content" {
+			encryptedContent, _ := value.(string)
+			if encryptedContent == "" {
+				continue
+			}
+			if summary, ok := extractSyntheticOrLegacyCompactionSummary(encryptedContent); ok && strings.TrimSpace(summary) != "" {
+				return summary, true
+			}
+			continue
+		}
+
+		if summary, ok := extractContextCompactionSummaryValue(value); ok {
+			return summary, true
+		}
+	}
+	return "", false
 }
 
 func inputHasMessageRole(v interface{}, role string) bool {

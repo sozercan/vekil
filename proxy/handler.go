@@ -53,9 +53,9 @@ const (
 	defaultCopilotIntegrationID       = "vscode-chat"
 	defaultCopilotGitHubAPIVersion    = "2025-05-01"
 	defaultCopilotOpenAIIntent        = "conversation-panel"
-	defaultResponsesWSCompactMaxItems = 48
-	defaultResponsesWSCompactMaxBytes = 256 << 10
-	defaultResponsesWSCompactKeepTail = 12
+	defaultResponsesWSCompactMaxItems = 8
+	defaultResponsesWSCompactMaxBytes = 32 << 10
+	defaultResponsesWSCompactKeepTail = 4
 )
 
 var preferredResponsesFallbackModels = []string{

@@ -725,6 +725,14 @@ func (h *ProxyHandler) compactLearnedTargetKeyForRequest(requestFields map[strin
 }
 
 func (h *ProxyHandler) compactResponsesRequestWithBudget(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, budget *compactBudget) (string, *http.Response, error) {
+	if rewrittenFields, rewriteCount := sanitizeContextCompactionRequestFields(requestFields); rewriteCount > 0 {
+		requestFields = rewrittenFields
+		h.log.Debug("sanitized context compaction items before upstream compact request",
+			logger.F("endpoint", "responses/compact/internal"),
+			logger.F("count", rewriteCount),
+		)
+	}
+
 	if rewrittenFields, rewriteCount := rewriteSyntheticCompactionRequestFields(requestFields); rewriteCount > 0 {
 		requestFields = rewrittenFields
 		h.log.Debug("rewrote compaction items",
@@ -1700,24 +1708,39 @@ func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint st
 		)
 	}
 
+	contextCompactionRewriteCount := 0
+	if rewrittenBody, rewriteCount := sanitizeContextCompactionRequest(bodyBytes); rewriteCount > 0 {
+		bodyBytes = rewrittenBody
+		contextCompactionRewriteCount = rewriteCount
+	}
+
+	syntheticCompactionRewriteCount := 0
 	if rewrittenBody, rewriteCount := rewriteSyntheticCompactionRequest(bodyBytes); rewriteCount > 0 {
 		bodyBytes = rewrittenBody
-		resumePromptInjected := false
-		if injectResumePrompt {
-			if resumedBody, injected := injectSyntheticCompactionResumePrompt(bodyBytes); injected {
-				bodyBytes = resumedBody
-				resumePromptInjected = true
-			}
-		}
+		syntheticCompactionRewriteCount = rewriteCount
+	}
 
-		fields := []logger.Field{
+	resumePromptInjected := false
+	if injectResumePrompt && contextCompactionRewriteCount+syntheticCompactionRewriteCount > 0 {
+		if rewrittenBody, injected := injectSyntheticCompactionResumePrompt(bodyBytes); injected {
+			bodyBytes = rewrittenBody
+			resumePromptInjected = true
+		}
+	}
+
+	if contextCompactionRewriteCount > 0 {
+		h.log.Debug("sanitized context compaction items before upstream responses request",
 			logger.F("endpoint", endpoint),
-			logger.F("count", rewriteCount),
-		}
-		if injectResumePrompt {
-			fields = append(fields, logger.F("resume_prompt_injected", resumePromptInjected))
-		}
-		h.log.Debug("rewrote compaction items", fields...)
+			logger.F("count", contextCompactionRewriteCount),
+			logger.F("resume_prompt_injected", resumePromptInjected),
+		)
+	}
+	if syntheticCompactionRewriteCount > 0 {
+		h.log.Debug("rewrote compaction items",
+			logger.F("endpoint", endpoint),
+			logger.F("count", syntheticCompactionRewriteCount),
+			logger.F("resume_prompt_injected", resumePromptInjected),
+		)
 	}
 
 	return bodyBytes
@@ -2132,7 +2155,7 @@ func responsesInputItemHasReplayMarker(raw json.RawMessage) bool {
 
 	itemType := rawJSONString(item["type"])
 	switch itemType {
-	case "compaction",
+	case "compaction", "context_compaction",
 		"function_call", "function_call_output",
 		"computer_call", "computer_call_output",
 		"local_shell_call", "local_shell_call_output",

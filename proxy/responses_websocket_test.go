@@ -686,6 +686,36 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 	}
 }
 
+func TestResponsesWebSocketDefaultAutoCompactCoversObservedPressure(t *testing.T) {
+	cfg := DefaultResponsesWebSocketConfig()
+	if cfg.AutoCompactKeepTail >= 10 {
+		t.Fatalf("default keep-tail %d would block compaction for the observed 10-item pressure case", cfg.AutoCompactKeepTail)
+	}
+
+	items := make([]json.RawMessage, 0, 10)
+	for i := 0; i < 10; i++ {
+		raw, err := json.Marshal(map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{{
+				"type": "input_text",
+				"text": fmt.Sprintf("pressure item %02d %s", i, strings.Repeat("x", 3500)),
+			}},
+		})
+		if err != nil {
+			t.Fatalf("failed to marshal history item: %v", err)
+		}
+		items = append(items, raw)
+	}
+
+	if got := rawMessagesSize(items); got <= 34275 {
+		t.Fatalf("test fixture should exceed the observed 34,275 byte history pressure case, got %d bytes", got)
+	}
+	if !responsesWebSocketHistoryExceedsThreshold(items, cfg) {
+		t.Fatalf("default websocket auto-compaction should trigger for 10 items / %d raw bytes: %#v", rawMessagesSize(items), cfg)
+	}
+}
+
 func TestResponsesWebSocketCompactHistoryRewritesPriorSyntheticCheckpoint(t *testing.T) {
 	raw := func(v interface{}) json.RawMessage {
 		t.Helper()
