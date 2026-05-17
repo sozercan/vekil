@@ -1051,6 +1051,167 @@ func TestHandleCompact(t *testing.T) {
 	}
 }
 
+func TestHandleCompact_DeduplicatesConcurrentIdenticalRequests(t *testing.T) {
+	const callers = 8
+
+	var upstreamCalls atomic.Int32
+	upstreamStarted := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if call := upstreamCalls.Add(1); call == 1 {
+			close(upstreamStarted)
+		}
+		<-releaseUpstream
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-compact-dedup","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"shared compact summary"}]}]}`))
+	})
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "compact this shared history"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	statuses := make([]int, callers)
+	bodies := make([][]byte, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			handler.HandleCompact(w, req)
+
+			resp := w.Result()
+			statuses[i] = resp.StatusCode
+			bodies[i], _ = io.ReadAll(resp.Body)
+		}(i)
+	}
+
+	close(start)
+	<-upstreamStarted
+	waitForCompactInflightWaiters(t, handler, callers-1)
+	close(releaseUpstream)
+	wg.Wait()
+
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("expected one upstream compact call for identical in-flight requests, got %d", upstreamCalls.Load())
+	}
+	for i := range statuses {
+		if statuses[i] != http.StatusOK {
+			t.Fatalf("caller %d expected 200, got %d: %s", i, statuses[i], bodies[i])
+		}
+		summary, encryptedSummary := requireCompactResponseSummaryForTest(t, bodies[i])
+		if summary != "shared compact summary" || encryptedSummary != "shared compact summary" {
+			t.Fatalf("caller %d expected shared compact summary, got summary=%q encrypted=%q", i, summary, encryptedSummary)
+		}
+	}
+}
+
+func TestHandleCompact_CapsInflightErrorBodyReplay(t *testing.T) {
+	const callers = 2
+
+	largeBody := strings.Repeat("x", compactUpstreamErrorBodySize+1024)
+	var upstreamCalls atomic.Int32
+	upstreamStarted := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if call := upstreamCalls.Add(1); call == 1 {
+			close(upstreamStarted)
+		}
+		<-releaseUpstream
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(largeBody)))
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, largeBody)
+	})
+
+	reqBody := []byte(`{"model":"gpt-5.4","input":"compact error replay"}`)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	statuses := make([]int, callers)
+	contentLengths := make([]string, callers)
+	bodies := make([][]byte, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			handler.HandleCompact(w, req)
+
+			resp := w.Result()
+			statuses[i] = resp.StatusCode
+			contentLengths[i] = resp.Header.Get("Content-Length")
+			bodies[i], _ = io.ReadAll(resp.Body)
+		}(i)
+	}
+
+	close(start)
+	<-upstreamStarted
+	waitForCompactInflightWaiters(t, handler, callers-1)
+	close(releaseUpstream)
+	wg.Wait()
+
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("expected one upstream compact call for identical in-flight error requests, got %d", upstreamCalls.Load())
+	}
+	for i := range statuses {
+		if statuses[i] != http.StatusInternalServerError {
+			t.Fatalf("caller %d expected 500, got %d", i, statuses[i])
+		}
+		if len(bodies[i]) != compactUpstreamErrorBodySize {
+			t.Fatalf("caller %d expected capped body length %d, got %d", i, compactUpstreamErrorBodySize, len(bodies[i]))
+		}
+		if contentLengths[i] != "" {
+			t.Fatalf("caller %d expected stale Content-Length to be cleared, got %q", i, contentLengths[i])
+		}
+	}
+}
+
+func waitForCompactInflightWaiters(t *testing.T, handler *ProxyHandler, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got := 0
+		handler.compactInflightMu.Lock()
+		for _, call := range handler.compactInflight {
+			got += int(call.waiters.Load())
+		}
+		handler.compactInflightMu.Unlock()
+		if got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	handler.compactInflightMu.Lock()
+	got := 0
+	for _, call := range handler.compactInflight {
+		got += int(call.waiters.Load())
+	}
+	handler.compactInflightMu.Unlock()
+	t.Fatalf("timed out waiting for %d in-flight compact waiters, got %d", want, got)
+}
+
 func TestHandleCompact_LargeBodyAllowed(t *testing.T) {
 	var upstreamHits atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1367,6 +1528,188 @@ func TestCompactResponsesRequestDepth_ProactiveSplitDoesNotConsumeBudgetBeforePo
 	}
 	if budget.attempts > expectedAttempts {
 		t.Fatalf("expected at most %d budgeted attempts, got %d", expectedAttempts, budget.attempts)
+	}
+}
+
+func TestCompactResponsesRequestInChunks_RespectsChunkConcurrency(t *testing.T) {
+	const (
+		targetBodySize = 96 << 10
+		concurrency    = 2
+	)
+
+	texts := make([]string, 0, 7)
+	for i := 0; i < 7; i++ {
+		texts = append(texts, fmt.Sprintf("item %d: %s", i+1, strings.Repeat("x", 60<<10)))
+	}
+	requestFields, chunks := compactChunkTestRequestFields(t, targetBodySize, texts)
+	if len(chunks) < 5 {
+		t.Fatalf("test setup expected at least 5 chunks, got %d", len(chunks))
+	}
+
+	var activeChunks atomic.Int32
+	var maxActiveChunks atomic.Int32
+	var chunkCalls atomic.Int32
+	var mergeCalls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		input := upstreamInputItems(t, req)
+		if len(input) > 0 {
+			text := requireMessageTextWithRole(t, input[0], "user")
+			if strings.HasPrefix(text, "Partial checkpoint summary") {
+				mergeCalls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"resp-merge","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"merged summary"}]}]}`))
+				return
+			}
+		}
+
+		current := activeChunks.Add(1)
+		recordMaxInt32(&maxActiveChunks, current)
+		if current > concurrency {
+			t.Errorf("active chunk requests = %d, want <= %d", current, concurrency)
+		}
+		time.Sleep(25 * time.Millisecond)
+		activeChunks.Add(-1)
+		call := chunkCalls.Add(1)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"resp-chunk-%d","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"chunk summary %d"}]}]}`, call, call)
+	})
+	handler.compactChunkConcurrency = concurrency
+
+	budget := newCompactBudget(len(chunks) + 2)
+	summary, err := handler.compactResponsesRequestInChunks(context.Background(), requestFields, nil, 0, targetBodySize, budget)
+	if err != nil {
+		t.Fatalf("compact chunk request failed: %v", err)
+	}
+	if summary != "merged summary" {
+		t.Fatalf("expected merged summary, got %q", summary)
+	}
+	if got := chunkCalls.Load(); got != int32(len(chunks)) {
+		t.Fatalf("expected %d chunk calls, got %d", len(chunks), got)
+	}
+	if mergeCalls.Load() != 1 {
+		t.Fatalf("expected one merge call, got %d", mergeCalls.Load())
+	}
+	if got := maxActiveChunks.Load(); got != concurrency {
+		t.Fatalf("expected max active chunk requests %d, got %d", concurrency, got)
+	}
+}
+
+func TestCompactResponsesRequestInChunks_CancelsFanoutOnFirstError(t *testing.T) {
+	const (
+		targetBodySize = 96 << 10
+		concurrency    = 2
+	)
+
+	texts := make([]string, 0, 7)
+	for i := 0; i < 7; i++ {
+		texts = append(texts, fmt.Sprintf("item %d: %s", i+1, strings.Repeat("y", 60<<10)))
+	}
+	requestFields, chunks := compactChunkTestRequestFields(t, targetBodySize, texts)
+	if len(chunks) < 5 {
+		t.Fatalf("test setup expected at least 5 chunks, got %d", len(chunks))
+	}
+
+	var chunkCalls atomic.Int32
+	var mergeCalls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		input := upstreamInputItems(t, req)
+		if len(input) > 0 {
+			text := requireMessageTextWithRole(t, input[0], "user")
+			if strings.HasPrefix(text, "Partial checkpoint summary") {
+				mergeCalls.Add(1)
+				t.Fatal("merge should not run after a chunk fanout error")
+			}
+		}
+
+		call := chunkCalls.Add(1)
+		if call == 2 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"message":"chunk failed"}}`))
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"resp-chunk-%d","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"chunk summary %d"}]}]}`, call, call)
+	})
+	handler.compactChunkConcurrency = concurrency
+
+	budget := newCompactBudget(len(chunks) + 2)
+	summary, err := handler.compactResponsesRequestInChunks(context.Background(), requestFields, nil, 0, targetBodySize, budget)
+	if err == nil {
+		t.Fatalf("expected fanout error, got summary %q", summary)
+	}
+	if !strings.Contains(err.Error(), "returned 500") {
+		t.Fatalf("expected chunk 500 error, got %v", err)
+	}
+	if mergeCalls.Load() != 0 {
+		t.Fatalf("expected no merge calls after fanout error, got %d", mergeCalls.Load())
+	}
+	if got := chunkCalls.Load(); got >= int32(len(chunks)) {
+		t.Fatalf("expected cancellation to stop before all %d chunks ran, got %d chunk calls", len(chunks), got)
+	}
+}
+
+func TestCompactResponsesRequestInChunks_ResplitsUnsentFanoutAfterLearnedTarget(t *testing.T) {
+	const targetBodySize = 160 << 10
+	rejectAbove := targetBodySize / 2
+
+	texts := []string{
+		"first: " + strings.Repeat("a", 72<<10),
+		"second: " + strings.Repeat("b", 100<<10),
+		"third: " + strings.Repeat("c", 100<<10),
+		"fourth: " + strings.Repeat("d", 100<<10),
+	}
+	requestFields, chunks := compactChunkTestRequestFields(t, targetBodySize, texts)
+	if len(chunks) != len(texts) {
+		t.Fatalf("test setup expected one item per chunk, got %d chunks for %d items", len(chunks), len(texts))
+	}
+
+	var oversizedPosts atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		if len(body) > rejectAbove {
+			oversizedPosts.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary"}]}]}`))
+	})
+	handler.compactChunkConcurrency = 1
+
+	budget := newCompactBudget(32)
+	summary, err := handler.compactResponsesRequestInChunks(context.Background(), requestFields, nil, 0, targetBodySize, budget)
+	if err != nil {
+		t.Fatalf("compact chunk request failed: %v", err)
+	}
+	if summary != "summary" {
+		t.Fatalf("expected summary, got %q", summary)
+	}
+	if got := oversizedPosts.Load(); got != 1 {
+		t.Fatalf("expected only the first over-cap sibling to discover the smaller target, got %d oversized posts", got)
 	}
 }
 
@@ -4193,6 +4536,45 @@ func requireCompactResponseSummaryForTest(t *testing.T, body []byte) (string, st
 	return "", ""
 }
 
+func compactChunkTestRequestFields(t *testing.T, targetBodySize int, texts []string) (map[string]json.RawMessage, [][]json.RawMessage) {
+	t.Helper()
+
+	input := make([]json.RawMessage, 0, len(texts))
+	for _, text := range texts {
+		message, err := compactTextInputRawMessage(text)
+		if err != nil {
+			t.Fatalf("build input message: %v", err)
+		}
+		input = append(input, message)
+	}
+	inputRaw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatalf("marshal input: %v", err)
+	}
+	requestFields := map[string]json.RawMessage{
+		"model": json.RawMessage(`"gpt-5.4"`),
+		"input": inputRaw,
+	}
+	fallbackFields, _, err := compactFallbackRequestFieldsForBodySize(requestFields, targetBodySize)
+	if err != nil {
+		t.Fatalf("build compact fallback fields: %v", err)
+	}
+	chunks, _, _, err := splitCompactInputAsHistoricalChunksByBodySize(fallbackFields, input, targetBodySize)
+	if err != nil {
+		t.Fatalf("split compact input: %v", err)
+	}
+	return requestFields, chunks
+}
+
+func recordMaxInt32(max *atomic.Int32, value int32) {
+	for {
+		current := max.Load()
+		if value <= current || max.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
 func requireCompactionContextMessage(t *testing.T, raw interface{}) string {
 	t.Helper()
 	return requireMessageTextWithRole(t, raw, "developer")
@@ -6219,6 +6601,86 @@ func TestHandleModels(t *testing.T) {
 		}
 	})
 
+	t.Run("maps Copilot prompt cap to Codex context window", func(t *testing.T) {
+		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/models" {
+				t.Errorf("expected path /models, got %s", r.URL.Path)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.1-codex-max","object":"model","created":0,"owned_by":"github-copilot","supported_endpoints":["/responses"],"capabilities":{"supports":{"parallel_tool_calls":true,"vision":true,"reasoning_effort":["medium"]},"limits":{"max_context_window_tokens":400000,"max_prompt_tokens":128000,"max_output_tokens":128000}},"model_picker_enabled":true,"model_picker_category":"powerful","name":"GPT-5.1-Codex-Max"}]}`))
+		})
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+
+		h.HandleModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.StatusCode)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		var result struct {
+			Models []struct {
+				Slug             string `json:"slug"`
+				ContextWindow    *int64 `json:"context_window,omitempty"`
+				MaxContextWindow *int64 `json:"max_context_window,omitempty"`
+			} `json:"models"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(result.Models) != 1 {
+			t.Fatalf("expected 1 model, got %d", len(result.Models))
+		}
+		model := result.Models[0]
+		if model.Slug != "gpt-5.1-codex-max" {
+			t.Fatalf("slug = %q, want gpt-5.1-codex-max", model.Slug)
+		}
+		if model.ContextWindow == nil || *model.ContextWindow != 128000 {
+			t.Fatalf("context_window = %v, want prompt cap 128000", model.ContextWindow)
+		}
+		if model.MaxContextWindow == nil || *model.MaxContextWindow != 400000 {
+			t.Fatalf("max_context_window = %v, want total context 400000", model.MaxContextWindow)
+		}
+	})
+
+	t.Run("falls back to Copilot total window when prompt cap is absent", func(t *testing.T) {
+		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.4","object":"model","created":0,"owned_by":"github-copilot","supported_endpoints":["/responses"],"capabilities":{"supports":{"parallel_tool_calls":true,"vision":true,"reasoning_effort":["medium"]},"limits":{"max_context_window_tokens":400000}},"model_picker_enabled":true,"model_picker_category":"powerful","name":"GPT-5.4"}]}`))
+		})
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+
+		h.HandleModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.StatusCode)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		var result struct {
+			Models []struct {
+				ContextWindow    *int64 `json:"context_window,omitempty"`
+				MaxContextWindow *int64 `json:"max_context_window,omitempty"`
+			} `json:"models"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(result.Models) != 1 {
+			t.Fatalf("expected 1 model, got %d", len(result.Models))
+		}
+		if result.Models[0].ContextWindow == nil || *result.Models[0].ContextWindow != 400000 {
+			t.Fatalf("context_window = %v, want fallback total context 400000", result.Models[0].ContextWindow)
+		}
+		if result.Models[0].MaxContextWindow == nil || *result.Models[0].MaxContextWindow != 400000 {
+			t.Fatalf("max_context_window = %v, want total context 400000", result.Models[0].MaxContextWindow)
+		}
+	})
+
 	t.Run("upstream error is forwarded", func(t *testing.T) {
 		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -6953,6 +7415,130 @@ func TestHandleModels_CodexContractFixture(t *testing.T) {
 	}
 	if len(claude.SupportedReasoningLevels) != 0 {
 		t.Errorf("claude-sonnet-4.5 supported_reasoning_levels = %d, want 0", len(claude.SupportedReasoningLevels))
+	}
+}
+
+func TestTransformModelsResponsePreservesCodexContextMetadata(t *testing.T) {
+	contextWindow := int64(272000)
+	maxContextWindow := int64(1000000)
+	autoCompactTokenLimit := int64(244800)
+	effectiveContextWindowPercent := int64(90)
+
+	body := []byte(`{"object":"list","data":[{"id":"gpt-5.4","object":"model","created":0,"owned_by":"codex","supported_endpoints":["/responses"],"capabilities":{"supports":{"parallel_tool_calls":true,"vision":true,"reasoning_effort":["medium"]},"limits":{"max_context_window_tokens":400000}},"model_picker_enabled":true,"model_picker_category":"powerful","name":"GPT-5.4","context_window":272000,"max_context_window":1000000,"auto_compact_token_limit":244800,"effective_context_window_percent":90}]}`)
+
+	var result struct {
+		Models []struct {
+			Slug                          string `json:"slug"`
+			ContextWindow                 *int64 `json:"context_window,omitempty"`
+			MaxContextWindow              *int64 `json:"max_context_window,omitempty"`
+			AutoCompactTokenLimit         *int64 `json:"auto_compact_token_limit,omitempty"`
+			EffectiveContextWindowPercent int64  `json:"effective_context_window_percent"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(transformModelsResponse(body), &result); err != nil {
+		t.Fatalf("decode transformed models response: %v", err)
+	}
+	if len(result.Models) != 1 {
+		t.Fatalf("expected 1 model entry, got %d", len(result.Models))
+	}
+	model := result.Models[0]
+	if model.Slug != "gpt-5.4" {
+		t.Fatalf("expected slug gpt-5.4, got %q", model.Slug)
+	}
+	if model.ContextWindow == nil || *model.ContextWindow != contextWindow {
+		t.Fatalf("context_window = %v, want %d", model.ContextWindow, contextWindow)
+	}
+	if model.MaxContextWindow == nil || *model.MaxContextWindow != maxContextWindow {
+		t.Fatalf("max_context_window = %v, want %d", model.MaxContextWindow, maxContextWindow)
+	}
+	if model.AutoCompactTokenLimit == nil || *model.AutoCompactTokenLimit != autoCompactTokenLimit {
+		t.Fatalf("auto_compact_token_limit = %v, want %d", model.AutoCompactTokenLimit, autoCompactTokenLimit)
+	}
+	if model.EffectiveContextWindowPercent != effectiveContextWindowPercent {
+		t.Fatalf("effective_context_window_percent = %d, want %d", model.EffectiveContextWindowPercent, effectiveContextWindowPercent)
+	}
+}
+
+func TestHandleModels_OpenAICodexPreservesContextMetadata(t *testing.T) {
+	codexHome := t.TempDir()
+	writeTestOpenAICodexAuth(t, codexHome, testOpenAICodexTokens(t, time.Now().Add(time.Hour), "acct-123", false, "refresh-token"))
+	t.Setenv("CODEX_HOME", codexHome)
+
+	codexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/models" {
+			t.Fatalf("expected /models lookup, got %s", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"models":[{"slug":"gpt-5.4","display_name":"GPT-5.4","visibility":"list","supported_in_api":true,"supported_reasoning_levels":[{"effort":"medium"}],"supports_parallel_tool_calls":true,"context_window":272000,"max_context_window":1000000,"auto_compact_token_limit":244800,"effective_context_window_percent":90,"input_modalities":["text","image"],"priority":0}]}`))
+	}))
+	defer codexServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:            "codex",
+				Type:          "openai-codex",
+				BaseURL:       codexServer.URL,
+				Default:       true,
+				IncludeModels: []string{"gpt-5.4"},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	handler.HandleModels(w, req)
+
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Data []struct {
+			ID           string `json:"id"`
+			Capabilities struct {
+				Limits struct {
+					MaxContextWindowTokens int64 `json:"max_context_window_tokens"`
+				} `json:"limits"`
+			} `json:"capabilities"`
+		} `json:"data"`
+		Models []struct {
+			Slug                          string `json:"slug"`
+			ContextWindow                 *int64 `json:"context_window,omitempty"`
+			MaxContextWindow              *int64 `json:"max_context_window,omitempty"`
+			AutoCompactTokenLimit         *int64 `json:"auto_compact_token_limit,omitempty"`
+			EffectiveContextWindowPercent int64  `json:"effective_context_window_percent"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(result.Data) != 1 || len(result.Models) != 1 {
+		t.Fatalf("expected one model, got data=%d models=%d", len(result.Data), len(result.Models))
+	}
+	if result.Data[0].Capabilities.Limits.MaxContextWindowTokens != 1000000 {
+		t.Fatalf("max_context_window_tokens = %d, want 1000000", result.Data[0].Capabilities.Limits.MaxContextWindowTokens)
+	}
+	model := result.Models[0]
+	if model.ContextWindow == nil || *model.ContextWindow != 272000 {
+		t.Fatalf("context_window = %v, want 272000", model.ContextWindow)
+	}
+	if model.MaxContextWindow == nil || *model.MaxContextWindow != 1000000 {
+		t.Fatalf("max_context_window = %v, want 1000000", model.MaxContextWindow)
+	}
+	if model.AutoCompactTokenLimit == nil || *model.AutoCompactTokenLimit != 244800 {
+		t.Fatalf("auto_compact_token_limit = %v, want 244800", model.AutoCompactTokenLimit)
+	}
+	if model.EffectiveContextWindowPercent != 90 {
+		t.Fatalf("effective_context_window_percent = %d, want 90", model.EffectiveContextWindowPercent)
 	}
 }
 

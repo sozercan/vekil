@@ -377,6 +377,172 @@ func TestCompactionContract_WebSocketRemoteCompactionFollowUpUsesCompactionHisto
 	}
 }
 
+func TestCompactionContract_ResponsesSanitizesContextCompaction(t *testing.T) {
+	const summary = "context checkpoint summary from codex"
+	const upstreamOpaqueToken = "opaque+server/context/token=="
+	var upstreamInput []json.RawMessage
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body := decodeJSONBodyForContract(t, r.Body)
+		upstreamInput = rawJSONArrayForContract(t, body["input"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-context-compaction","object":"response","status":"completed","output":[]}`))
+	})
+
+	reqBody := mustMarshalContractJSON(t, map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type":    "context_compaction",
+				"summary": summary,
+			},
+			map[string]interface{}{
+				"type":              "context_compaction",
+				"encrypted_content": upstreamOpaqueToken,
+			},
+			messageItemForContract("user", "continue after checkpoint"),
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if len(upstreamInput) != 3 {
+		t.Fatalf("expected three upstream input items, got %d: %s", len(upstreamInput), upstreamInput)
+	}
+	if got := contractMessageText(t, upstreamInput[0], "developer"); !strings.Contains(got, summary) {
+		t.Fatalf("expected context_compaction summary to become developer checkpoint, got %q", got)
+	}
+
+	opaque := rawJSONObjectForContract(t, upstreamInput[1])
+	if got := rawJSONToStringForContract(t, opaque["type"]); got != "context_compaction" {
+		t.Fatalf("expected opaque context_compaction to be preserved, got %s", upstreamInput[1])
+	}
+	if got := rawJSONToStringForContract(t, opaque["encrypted_content"]); got != upstreamOpaqueToken {
+		t.Fatalf("expected opaque context_compaction token to be preserved, got %q", got)
+	}
+
+	if got := contractMessageText(t, upstreamInput[2], "user"); got != "continue after checkpoint" {
+		t.Fatalf("expected later user message to be preserved, got %q", got)
+	}
+}
+
+func TestCompactionContract_CompactEndpointSanitizesContextCompaction(t *testing.T) {
+	const summary = "compact endpoint checkpoint summary"
+	var upstreamInput []json.RawMessage
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("expected compact fallback to call /responses, got %q", r.URL.Path)
+		}
+		body := decodeJSONBodyForContract(t, r.Body)
+		upstreamInput = rawJSONArrayForContract(t, body["input"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-context-compact","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"new compact summary"}]}]}`))
+	})
+
+	reqBody := mustMarshalContractJSON(t, map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "context_compaction",
+				"content": []interface{}{
+					map[string]interface{}{
+						"type": "input_text",
+						"text": summary,
+					},
+				},
+			},
+			messageItemForContract("user", "compact this follow-up"),
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if len(upstreamInput) != 2 {
+		t.Fatalf("expected sanitized checkpoint plus user message upstream, got %d: %s", len(upstreamInput), upstreamInput)
+	}
+	if got := contractMessageText(t, upstreamInput[0], "developer"); !strings.Contains(got, summary) {
+		t.Fatalf("expected context_compaction summary to become developer checkpoint, got %q", got)
+	}
+	if got := contractMessageText(t, upstreamInput[1], "user"); got != "compact this follow-up" {
+		t.Fatalf("expected compact request user message to be preserved, got %q", got)
+	}
+}
+
+func TestCompactionContract_WebSocketSanitizesContextCompaction(t *testing.T) {
+	const summary = "websocket checkpoint summary"
+	var mu sync.Mutex
+	var upstreamRequest map[string]interface{}
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+		mu.Lock()
+		upstreamRequest = body
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-ws-context\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-ws-context\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	req := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type":               "context_compaction",
+			"checkpoint_summary": summary,
+		},
+		messageItemForContract("user", "after websocket checkpoint"),
+	})
+	if err := conn.WriteJSON(req); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+
+	mu.Lock()
+	body := upstreamRequest
+	mu.Unlock()
+	if body == nil {
+		t.Fatal("expected upstream websocket proxy request")
+	}
+	input := upstreamInputItems(t, body)
+	if len(input) != 2 {
+		t.Fatalf("expected sanitized checkpoint plus user message upstream, got %d: %#v", len(input), input)
+	}
+	if got := requireMessageTextWithRole(t, input[0], "developer"); !strings.Contains(got, summary) {
+		t.Fatalf("expected websocket context_compaction summary to become developer checkpoint, got %q", got)
+	}
+	if got := requireMessageTextWithRole(t, input[1], "user"); got != "after websocket checkpoint" {
+		t.Fatalf("expected websocket user message to be preserved, got %q", got)
+	}
+}
+
 func messageItemForContract(role, text string) map[string]interface{} {
 	contentType := "input_text"
 	if role == "assistant" {

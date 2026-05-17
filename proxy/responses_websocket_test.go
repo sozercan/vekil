@@ -185,6 +185,74 @@ func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 	}
 }
 
+func TestHandleResponsesWebSocket_ForwardsCompletedUsage(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-usage\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-usage\",\"usage\":{\"input_tokens\":1234,\"input_tokens_details\":{\"cached_tokens\":456},\"output_tokens\":78,\"output_tokens_details\":{\"reasoning_tokens\":9},\"total_tokens\":1312}}}\n\n")
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+
+	created := mustReadWebSocketJSON(t, conn)
+	if created["type"] != "response.created" {
+		t.Fatalf("expected first event to be response.created, got %v", created["type"])
+	}
+	completed := mustReadWebSocketJSON(t, conn)
+	if completed["type"] != "response.completed" {
+		t.Fatalf("expected second event to be response.completed, got %v", completed["type"])
+	}
+
+	response, ok := completed["response"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("response payload missing or wrong type: %#v", completed["response"])
+	}
+	usage, ok := response["usage"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("usage payload missing or wrong type: %#v", response["usage"])
+	}
+	assertUsageNumber := func(field string, want float64) {
+		t.Helper()
+		got, ok := usage[field].(float64)
+		if !ok || got != want {
+			t.Fatalf("%s = %#v, want %.0f", field, usage[field], want)
+		}
+	}
+	assertUsageNumber("input_tokens", 1234)
+	assertUsageNumber("output_tokens", 78)
+	assertUsageNumber("total_tokens", 1312)
+
+	inputDetails, ok := usage["input_tokens_details"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("input_tokens_details missing or wrong type: %#v", usage["input_tokens_details"])
+	}
+	if got, ok := inputDetails["cached_tokens"].(float64); !ok || got != 456 {
+		t.Fatalf("cached_tokens = %#v, want 456", inputDetails["cached_tokens"])
+	}
+	outputDetails, ok := usage["output_tokens_details"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("output_tokens_details missing or wrong type: %#v", usage["output_tokens_details"])
+	}
+	if got, ok := outputDetails["reasoning_tokens"].(float64); !ok || got != 9 {
+		t.Fatalf("reasoning_tokens = %#v, want 9", outputDetails["reasoning_tokens"])
+	}
+}
+
 func TestHandleResponsesWebSocket_IgnoresResponseProcessedControlFrame(t *testing.T) {
 	var upstreamRequests atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -686,6 +754,154 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 	}
 }
 
+func TestResponsesWebSocketDefaultAutoCompactCoversObservedPressure(t *testing.T) {
+	cfg := DefaultResponsesWebSocketConfig()
+	if cfg.AutoCompactKeepTail >= 10 {
+		t.Fatalf("default keep-tail %d would block compaction for the observed 10-item pressure case", cfg.AutoCompactKeepTail)
+	}
+
+	items := make([]json.RawMessage, 0, 10)
+	for i := 0; i < 10; i++ {
+		raw, err := json.Marshal(map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{{
+				"type": "input_text",
+				"text": fmt.Sprintf("pressure item %02d %s", i, strings.Repeat("x", 3500)),
+			}},
+		})
+		if err != nil {
+			t.Fatalf("failed to marshal history item: %v", err)
+		}
+		items = append(items, raw)
+	}
+
+	if got := rawMessagesSize(items); got <= 34275 {
+		t.Fatalf("test fixture should exceed the observed 34,275 byte history pressure case, got %d bytes", got)
+	}
+	if !responsesWebSocketHistoryExceedsThreshold(items, cfg) {
+		t.Fatalf("default websocket auto-compaction should trigger for 10 items / %d raw bytes: %#v", rawMessagesSize(items), cfg)
+	}
+}
+
+func TestResponsesWebSocketHistoryItemThresholdRequiresReducibleHistory(t *testing.T) {
+	items := make([]json.RawMessage, 0, 5)
+	for i := 0; i < 5; i++ {
+		raw, err := json.Marshal(map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{{
+				"type": "input_text",
+				"text": fmt.Sprintf("item %d", i),
+			}},
+		})
+		if err != nil {
+			t.Fatalf("failed to marshal history item: %v", err)
+		}
+		items = append(items, raw)
+	}
+
+	cfg := ResponsesWebSocketConfig{
+		AutoCompactMaxItems: 3,
+		AutoCompactMaxBytes: 1 << 20,
+		AutoCompactKeepTail: 4,
+	}
+	if responsesWebSocketHistoryExceedsThreshold(items, cfg) {
+		t.Fatal("item-count threshold should not trigger when compaction cannot reduce history item count")
+	}
+
+	cfg.AutoCompactMaxBytes = 1
+	if !responsesWebSocketHistoryExceedsThreshold(items, cfg) {
+		t.Fatal("byte threshold should still trigger for short histories that cannot reduce item count")
+	}
+
+	cfg.AutoCompactMaxBytes = 1 << 20
+	cfg.AutoCompactKeepTail = 2
+	if !responsesWebSocketHistoryExceedsThreshold(items, cfg) {
+		t.Fatal("item-count threshold should trigger when compaction can reduce history item count")
+	}
+}
+
+func TestResponsesWebSocketAutoCompactsShortBytePressureHistory(t *testing.T) {
+	raw := func(v interface{}) json.RawMessage {
+		t.Helper()
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("failed to marshal raw message: %v", err)
+		}
+		return b
+	}
+	msg := func(role, text string) json.RawMessage {
+		contentType := "input_text"
+		if role == "assistant" {
+			contentType = "output_text"
+		}
+		return raw(map[string]interface{}{
+			"type":    "message",
+			"role":    role,
+			"content": []map[string]string{{"type": contentType, "text": text}},
+		})
+	}
+
+	var compactInput []map[string]interface{}
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+		compactInput = upstreamInputItems(t, body)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"comp-short-byte-pressure","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"short byte pressure checkpoint"}]}]}`)
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		AutoCompactMaxItems: 99,
+		AutoCompactMaxBytes: 1024,
+		AutoCompactKeepTail: 4,
+	}
+
+	session := &responsesWebSocketSession{
+		ctx: context.Background(),
+		historyItems: []json.RawMessage{
+			msg("user", strings.Repeat("x", 2048)),
+			msg("assistant", "latest answer"),
+		},
+	}
+	request := &responsesWebSocketCreateRequest{Model: "gpt-5.4"}
+
+	if !responsesWebSocketHistoryExceedsThreshold(session.historyItems, handler.responsesWS) {
+		t.Fatalf("expected short history to exceed byte threshold despite keep-tail being larger than item count")
+	}
+	_, compacted, err := session.compactHistory(handler, context.Background(), request, false)
+	if err != nil {
+		t.Fatalf("compactHistory failed: %v", err)
+	}
+	if !compacted {
+		t.Fatal("expected websocket history to compact under byte pressure")
+	}
+	if len(compactInput) != 1 {
+		t.Fatalf("expected compaction request to summarize the oversized prefix, got %d items: %#v", len(compactInput), compactInput)
+	}
+
+	compactedItems := decodeRawMessagesForTest(t, session.historyItems)
+	if len(compactedItems) != 2 {
+		t.Fatalf("expected checkpoint plus latest answer, got %d items: %#v", len(compactedItems), compactedItems)
+	}
+	if got := requireMessageTextWithRole(t, compactedItems[0], "developer"); !strings.Contains(got, "short byte pressure checkpoint") {
+		t.Fatalf("expected checkpoint summary in compacted history, got %q", got)
+	}
+	if compactedItems[1]["type"] != "message" || compactedItems[1]["role"] != "assistant" {
+		t.Fatalf("expected latest assistant answer tail to be retained, got %#v", compactedItems[1])
+	}
+	if got := inputTextFromMessage(t, compactedItems[1]); got != "latest answer" {
+		t.Fatalf("expected latest answer tail to be retained, got %q", got)
+	}
+}
+
 func TestResponsesWebSocketCompactHistoryRewritesPriorSyntheticCheckpoint(t *testing.T) {
 	raw := func(v interface{}) json.RawMessage {
 		t.Helper()
@@ -794,21 +1010,21 @@ func TestResponsesWebSocketCompactHistoryKeepsToolPairsAcrossBoundary(t *testing
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprint(w, `{"id":"comp-tool-pair","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint summary"}]}]}`)
 	})
+	historyItems := []json.RawMessage{
+		msg("user", "run a command"),
+		raw(map[string]interface{}{"type": "function_call", "call_id": "call-1", "name": "shell", "arguments": "{}"}),
+		msg("assistant", "thinking between call and output"),
+		raw(map[string]interface{}{"type": "function_call_output", "call_id": "call-1", "output": "done"}),
+		msg("assistant", "command finished"),
+	}
 	handler.responsesWS = ResponsesWebSocketConfig{
 		AutoCompactMaxItems: 3,
-		AutoCompactMaxBytes: 1 << 20,
+		AutoCompactMaxBytes: rawMessagesSize(historyItems) - 1,
 		AutoCompactKeepTail: 2,
 	}
-
 	session := &responsesWebSocketSession{
-		ctx: context.Background(),
-		historyItems: []json.RawMessage{
-			msg("user", "run a command"),
-			raw(map[string]interface{}{"type": "function_call", "call_id": "call-1", "name": "shell", "arguments": "{}"}),
-			msg("assistant", "thinking between call and output"),
-			raw(map[string]interface{}{"type": "function_call_output", "call_id": "call-1", "output": "done"}),
-			msg("assistant", "command finished"),
-		},
+		ctx:          context.Background(),
+		historyItems: historyItems,
 	}
 	request := &responsesWebSocketCreateRequest{Model: "gpt-5.4"}
 
@@ -839,6 +1055,94 @@ func TestResponsesWebSocketCompactHistoryKeepsToolPairsAcrossBoundary(t *testing
 	}
 	if compactedItems[3]["type"] != "function_call_output" || compactedItems[3]["call_id"] != "call-1" {
 		t.Fatalf("expected retained function_call_output for call-1, got %#v", compactedItems[3])
+	}
+}
+
+func TestResponsesWebSocketAutoCompactReducesTailWhenToolOutputDominatesBytes(t *testing.T) {
+	raw := func(v interface{}) json.RawMessage {
+		t.Helper()
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("failed to marshal raw message: %v", err)
+		}
+		return b
+	}
+	msg := func(role, text string) json.RawMessage {
+		contentType := "input_text"
+		if role == "assistant" {
+			contentType = "output_text"
+		}
+		return raw(map[string]interface{}{
+			"type":    "message",
+			"role":    role,
+			"content": []map[string]string{{"type": contentType, "text": text}},
+		})
+	}
+
+	var compactInput []map[string]interface{}
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+		compactInput = upstreamInputItems(t, body)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"comp-tool-output-pressure","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"tool output checkpoint"}]}]}`)
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		AutoCompactMaxItems: 99,
+		AutoCompactMaxBytes: 32 << 10,
+		AutoCompactKeepTail: 4,
+	}
+
+	session := &responsesWebSocketSession{
+		ctx: context.Background(),
+		historyItems: []json.RawMessage{
+			msg("user", "seed"),
+			raw(map[string]interface{}{"type": "function_call", "call_id": "call-pressure-1", "name": "shell_command", "arguments": `{"command":"cat huge.log"}`}),
+			raw(map[string]interface{}{"type": "function_call_output", "call_id": "call-pressure-1", "output": strings.Repeat("tool-output-line\n", 5000)}),
+			msg("assistant", "tool output captured"),
+			msg("user", "latest question"),
+			msg("assistant", "latest answer"),
+		},
+	}
+	originalBytes := rawMessagesSize(session.historyItems)
+	request := &responsesWebSocketCreateRequest{Model: "gpt-5.4"}
+
+	_, compacted, err := session.compactHistory(handler, context.Background(), request, false)
+	if err != nil {
+		t.Fatalf("compactHistory failed: %v", err)
+	}
+	if !compacted {
+		t.Fatal("expected websocket history to compact")
+	}
+	if len(compactInput) != 4 {
+		t.Fatalf("expected auto-compaction to shrink tail and summarize the tool-output pair, got %d compact input items: %#v", len(compactInput), compactInput)
+	}
+	if compactInput[1]["type"] != "function_call" || compactInput[2]["type"] != "function_call_output" {
+		t.Fatalf("expected compact input to include intact tool call/output pair, got %#v", compactInput)
+	}
+	if got := rawMessagesSize(session.historyItems); got >= originalBytes {
+		t.Fatalf("expected compacted history to reduce bytes below %d, got %d", originalBytes, got)
+	}
+
+	compactedItems := decodeRawMessagesForTest(t, session.historyItems)
+	if len(compactedItems) != 3 {
+		t.Fatalf("expected checkpoint plus latest user/assistant tail, got %d items: %#v", len(compactedItems), compactedItems)
+	}
+	if got := requireMessageTextWithRole(t, compactedItems[0], "developer"); !strings.Contains(got, "tool output checkpoint") {
+		t.Fatalf("expected checkpoint summary in compacted history, got %q", got)
+	}
+	if got := inputTextFromMessage(t, compactedItems[1]); got != "latest question" {
+		t.Fatalf("expected latest question tail to be retained, got %q", got)
+	}
+	if got := inputTextFromMessage(t, compactedItems[2]); got != "latest answer" {
+		t.Fatalf("expected latest answer tail to be retained, got %q", got)
 	}
 }
 

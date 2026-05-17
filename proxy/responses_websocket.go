@@ -668,12 +668,39 @@ func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.
 		return result, false, nil
 	}
 
-	compacted, result, ok, err := s.compactHistoryItemsWithKeepTail(h, ctx, request, s.historyItems, cfg.AutoCompactKeepTail, nil)
+	keepTail := cfg.AutoCompactKeepTail
+	if !force {
+		keepTail = responsesWebSocketAutoCompactKeepTail(s.historyItems, cfg)
+	}
+
+	compacted, result, ok, err := s.compactHistoryItemsWithKeepTail(h, ctx, request, s.historyItems, keepTail, nil)
 	if err != nil || !ok {
 		return result, ok, err
 	}
 	s.historyItems = compacted
 	return result, true, nil
+}
+
+func responsesWebSocketAutoCompactKeepTail(items []json.RawMessage, cfg ResponsesWebSocketConfig) int {
+	if cfg.AutoCompactKeepTail <= 0 || cfg.AutoCompactMaxBytes <= 0 {
+		return cfg.AutoCompactKeepTail
+	}
+
+	schedule := compactedResponsesRetryKeepTailSchedule(len(items), cfg.AutoCompactKeepTail)
+	if len(schedule) == 0 {
+		return cfg.AutoCompactKeepTail
+	}
+
+	for _, keepTail := range schedule {
+		prefixLen := compactedResponsesAlignedPrefixLen(items, keepTail)
+		if prefixLen <= 0 {
+			continue
+		}
+		if rawMessagesSize(items[prefixLen:]) < cfg.AutoCompactMaxBytes {
+			return keepTail
+		}
+	}
+	return schedule[len(schedule)-1]
 }
 
 func (s *responsesWebSocketSession) compactHistoryItemsWithKeepTail(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, history []json.RawMessage, keepTail int, budget *compactBudget) ([]json.RawMessage, responsesWebSocketHistoryCompaction, bool, error) {
@@ -1014,16 +1041,20 @@ func responsesWebSocketMetadataHeaders(headers http.Header) map[string]interface
 }
 
 func responsesWebSocketHistoryExceedsThreshold(items []json.RawMessage, cfg ResponsesWebSocketConfig) bool {
-	if len(items) <= cfg.AutoCompactKeepTail {
+	if len(items) <= 1 {
 		return false
 	}
-	if cfg.AutoCompactMaxItems > 0 && len(items) > cfg.AutoCompactMaxItems {
+	if cfg.AutoCompactMaxItems > 0 && len(items) > cfg.AutoCompactMaxItems && responsesWebSocketHistoryCanReduceItemCount(items, cfg.AutoCompactKeepTail) {
 		return true
 	}
 	if cfg.AutoCompactMaxBytes > 0 && rawMessagesSize(items) > cfg.AutoCompactMaxBytes {
 		return true
 	}
 	return false
+}
+
+func responsesWebSocketHistoryCanReduceItemCount(items []json.RawMessage, keepTail int) bool {
+	return compactedResponsesAlignedPrefixLen(items, keepTail) > 1
 }
 
 func rawMessagesSize(items []json.RawMessage) int {
