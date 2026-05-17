@@ -1085,6 +1085,132 @@ func TestHandleOpenAIChatCompletions_ToolOptimizerDoesNotUseGlobalFallback(t *te
 	}
 }
 
+func TestHandleOpenAIChatCompletions_ToolOptimizerIgnoresClientRequestIDScope(t *testing.T) {
+	fake := &recordingToolOptimizer{}
+
+	var mu sync.Mutex
+	var upstreamBodies []map[string]interface{}
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body := decodeRequestBodyForToolOptimizerTest(t, r)
+
+		mu.Lock()
+		upstreamBodies = append(upstreamBodies, body)
+		requestNumber := len(upstreamBodies)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch requestNumber {
+		case 1:
+			writeJSONForToolOptimizerTest(t, w, map[string]interface{}{
+				"id":      "chatcmpl-chat-client-request-1",
+				"object":  "chat.completion",
+				"created": 1700000000,
+				"model":   "gpt-4",
+				"choices": []interface{}{
+					map[string]interface{}{
+						"index": 0,
+						"message": map[string]interface{}{
+							"role": "assistant",
+							"tool_calls": []interface{}{
+								map[string]interface{}{
+									"id":   "call-chat-client-request-1",
+									"type": "function",
+									"function": map[string]interface{}{
+										"name":      "shell_command",
+										"arguments": `{"command":"grep foo big.log"}`,
+									},
+								},
+							},
+						},
+						"finish_reason": "tool_calls",
+					},
+				},
+			})
+		default:
+			writeJSONForToolOptimizerTest(t, w, map[string]interface{}{
+				"id":      "chatcmpl-chat-client-request-2",
+				"object":  "chat.completion",
+				"created": 1700000001,
+				"model":   "gpt-4",
+				"choices": []interface{}{
+					map[string]interface{}{
+						"index": 0,
+						"message": map[string]interface{}{
+							"role":    "assistant",
+							"content": "done",
+						},
+						"finish_reason": "stop",
+					},
+				},
+			})
+		}
+	})
+	configureRecordingToolOptimizer(handler, fake)
+
+	headers := map[string]string{"X-Client-Request-Id": "req-chat-tool-1"}
+	firstResp := postOpenAIChatForToolOptimizerTestWithHeaders(t, handler, `{
+		"model": "gpt-4",
+		"messages": [{"role": "user", "content": "run command"}],
+		"stream": false
+	}`, headers)
+	defer firstResp.Body.Close()
+	if firstResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(firstResp.Body)
+		t.Fatalf("expected first response status 200, got %d: %s", firstResp.StatusCode, body)
+	}
+
+	secondResp := postOpenAIChatForToolOptimizerTestWithHeaders(t, handler, `{
+		"model": "gpt-4",
+		"messages": [
+			{
+				"role": "tool",
+				"tool_call_id": "call-chat-client-request-1",
+				"content": "large output"
+			}
+		],
+		"stream": false
+	}`, headers)
+	defer secondResp.Body.Close()
+	if secondResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(secondResp.Body)
+		t.Fatalf("expected second response status 200, got %d: %s", secondResp.StatusCode, body)
+	}
+
+	mu.Lock()
+	if len(upstreamBodies) != 2 {
+		t.Fatalf("expected 2 upstream requests, got %d", len(upstreamBodies))
+	}
+	secondUpstreamBody := upstreamBodies[1]
+	mu.Unlock()
+
+	rawMessages, ok := secondUpstreamBody["messages"].([]interface{})
+	if !ok {
+		t.Fatalf("expected messages array, got %T", secondUpstreamBody["messages"])
+	}
+	foundToolMessage := false
+	for _, raw := range rawMessages {
+		msg, ok := raw.(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected message object, got %T", raw)
+		}
+		if msg["role"] != "tool" || msg["tool_call_id"] != "call-chat-client-request-1" {
+			continue
+		}
+		foundToolMessage = true
+		if got := msg["content"]; got != "large output" {
+			t.Fatalf("expected X-Client-Request-Id scoped tool output to remain original, got %v", got)
+		}
+	}
+	if !foundToolMessage {
+		t.Fatalf("expected second upstream request to contain tool message")
+	}
+
+	if reduceRequests := fake.snapshotReduceRequests(); len(reduceRequests) != 0 {
+		t.Fatalf("expected no reduce request for X-Client-Request-Id-only chat scope, got %d", len(reduceRequests))
+	}
+}
+
 func TestHandleOpenAIChatCompletions_DefaultOffStreamingPreservesOversizedSSE(t *testing.T) {
 	input := "data: " + oversizedSSEPayload() + "\n\ndata: [DONE]\n\n"
 
@@ -1277,11 +1403,22 @@ func runOpenAIChatToolOptimizerReducesOutputTest(t *testing.T, sessionID string)
 
 func postOpenAIChatForToolOptimizerTest(t *testing.T, handler *ProxyHandler, body string, sessionID string) *http.Response {
 	t.Helper()
+	headers := map[string]string{}
+	if sessionID != "" {
+		headers["session_id"] = sessionID
+	}
+	return postOpenAIChatForToolOptimizerTestWithHeaders(t, handler, body, headers)
+}
+
+func postOpenAIChatForToolOptimizerTestWithHeaders(t *testing.T, handler *ProxyHandler, body string, headers map[string]string) *http.Response {
+	t.Helper()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	if sessionID != "" {
-		req.Header.Set("session_id", sessionID)
+	for k, v := range headers {
+		if v != "" {
+			req.Header.Set(k, v)
+		}
 	}
 
 	w := httptest.NewRecorder()

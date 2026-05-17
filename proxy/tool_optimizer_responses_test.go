@@ -3,9 +3,22 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"testing"
 	"time"
 )
+
+func TestChatToolExecutionScopeFromHeadersIgnoresClientRequestID(t *testing.T) {
+	headers := make(http.Header)
+	headers.Set("X-Client-Request-Id", "req-1")
+	if scope := chatToolExecutionScopeFromHeaders(headers); scope != "" {
+		t.Fatalf("chat scope for client request id = %q, want empty", scope)
+	}
+	headers.Set("session_id", "sess-1")
+	if scope := chatToolExecutionScopeFromHeaders(headers); scope != "session:sess-1" {
+		t.Fatalf("chat scope with stable session = %q, want session:sess-1", scope)
+	}
+}
 
 func TestToolOptimizerResponsesReplaceTopLevelRawJSONFieldPreservesOrderAndRawValues(t *testing.T) {
 	body := []byte(`{

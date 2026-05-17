@@ -125,7 +125,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		logger.F("tools", len(req.Tools)),
 	)
 
-	scope := toolExecutionScopeFromHeaders(r.Header)
+	scope := chatToolExecutionScopeFromHeaders(r.Header)
 	oaiBody, mode, err := prepareAnthropicChatCompletionsRequest(&req)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("translation error: %v", err))
@@ -198,7 +198,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 	defer func() { _ = r.Body.Close() }()
 
-	scope := toolExecutionScopeFromHeaders(r.Header)
+	scope := chatToolExecutionScopeFromHeaders(r.Header)
 	bodyBytes, mode := prepareOpenAIChatCompletionsRequest(bodyBytes)
 	bodyBytes = h.rewriteOpenAIChatRequestBodyWithToolOptimizers(r.Context(), bodyBytes, h.toolContexts, scope)
 

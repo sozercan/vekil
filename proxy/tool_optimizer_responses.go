@@ -31,6 +31,14 @@ func toolExecutionScopeFromHeaders(headers http.Header) string {
 	return ""
 }
 
+func chatToolExecutionScopeFromHeaders(headers http.Header) string {
+	scope := toolExecutionScopeFromHeaders(headers)
+	if isClientRequestToolExecutionScope(scope) {
+		return ""
+	}
+	return scope
+}
+
 func toolExecutionScopeFromResponseID(responseID string) string {
 	responseID = strings.TrimSpace(responseID)
 	if responseID == "" {

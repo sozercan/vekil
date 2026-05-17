@@ -68,7 +68,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		logger.F("tools", len(req.Tools)),
 	)
 
-	scope := toolExecutionScopeFromHeaders(r.Header)
+	scope := chatToolExecutionScopeFromHeaders(r.Header)
 	oaiReq, err := TranslateGeminiToOpenAI(req, pathModel, stream)
 	if err != nil {
 		h.writeGeminiProtocolError(w, err)
