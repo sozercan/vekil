@@ -25,6 +25,7 @@ func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
 
 	for _, name := range []string{
 		"X-OpenAI-Subagent",
+		"X-OpenAI-Memgen-Request",
 		"OpenAI-Beta",
 		"session_id",
 		"session-id",
@@ -32,10 +33,15 @@ func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
 		"X-Client-Request-Id",
 		"X-Codex-Installation-Id",
 		"X-Codex-Beta-Features",
+		"X-Codex-Inference-Call-Id",
 		"X-Codex-Turn-State",
 		"X-Codex-Turn-Metadata",
 		"X-Codex-Parent-Thread-Id",
 		"X-Codex-Window-Id",
+		"X-OAI-Attestation",
+		"X-ResponsesAPI-Include-Timing-Metrics",
+		"Traceparent",
+		"Tracestate",
 	} {
 		for _, value := range r.Header.Values(name) {
 			if trimmed := strings.TrimSpace(value); trimmed != "" {

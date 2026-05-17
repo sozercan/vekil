@@ -200,7 +200,25 @@ func parseResponsesWebSocketFrameType(payload []byte) (string, error) {
 
 func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *responsesWebSocketSession {
 	baseHeaders := make(http.Header)
-	for _, name := range []string{"X-Codex-Beta-Features", "X-Codex-Turn-Metadata", "OpenAI-Beta", "session_id", "session-id", "thread-id", "X-Client-Request-Id", "X-Codex-Installation-Id", "X-OpenAI-Subagent"} {
+	for _, name := range []string{
+		"X-Codex-Beta-Features",
+		"X-Codex-Turn-Metadata",
+		"OpenAI-Beta",
+		"session_id",
+		"session-id",
+		"thread-id",
+		"X-Client-Request-Id",
+		"X-Codex-Installation-Id",
+		"X-Codex-Inference-Call-Id",
+		"X-Codex-Parent-Thread-Id",
+		"X-Codex-Window-Id",
+		"X-OAI-Attestation",
+		"X-OpenAI-Memgen-Request",
+		"X-OpenAI-Subagent",
+		"X-ResponsesAPI-Include-Timing-Metrics",
+		"Traceparent",
+		"Tracestate",
+	} {
 		for _, value := range r.Header.Values(name) {
 			baseHeaders.Add(name, value)
 		}
@@ -483,9 +501,12 @@ func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCr
 			continue
 		}
 
+		if name := responsesWebSocketMetadataHeaderName(key); name != "" {
+			headers.Set(name, trimmed)
+			continue
+		}
+
 		switch {
-		case strings.EqualFold(key, "x-codex-turn-metadata"):
-			headers.Set("X-Codex-Turn-Metadata", trimmed)
 		case strings.HasPrefix(key, responsesWebSocketRequestHeaderPrefix):
 			name := strings.TrimSpace(strings.TrimPrefix(key, responsesWebSocketRequestHeaderPrefix))
 			if name != "" && !strings.EqualFold(name, "X-Codex-Turn-State") {
@@ -499,6 +520,33 @@ func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCr
 	}
 
 	return headers
+}
+
+func responsesWebSocketMetadataHeaderName(key string) string {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "x-codex-installation-id":
+		return "X-Codex-Installation-Id"
+	case "x-codex-inference-call-id":
+		return "X-Codex-Inference-Call-Id"
+	case "x-codex-parent-thread-id":
+		return "X-Codex-Parent-Thread-Id"
+	case "x-codex-turn-metadata":
+		return "X-Codex-Turn-Metadata"
+	case "x-codex-window-id":
+		return "X-Codex-Window-Id"
+	case "x-codex-ws-stream-request-start-ms":
+		return "X-Codex-WS-Stream-Request-Start-Ms"
+	case "x-oai-attestation":
+		return "X-OAI-Attestation"
+	case "x-openai-memgen-request":
+		return "X-OpenAI-Memgen-Request"
+	case "x-openai-subagent":
+		return "X-OpenAI-Subagent"
+	case "x-responsesapi-include-timing-metrics":
+		return "X-ResponsesAPI-Include-Timing-Metrics"
+	default:
+		return ""
+	}
 }
 
 func (s *responsesWebSocketSession) updateTurnState(headers http.Header) {
