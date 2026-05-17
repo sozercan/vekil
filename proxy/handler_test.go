@@ -769,6 +769,8 @@ func TestHandleResponses_RoutesConfiguredAzureModelAndPreservesPriorityServiceTi
 
 func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	var gotOpenAIBeta, gotLegacySessionID, gotSessionID, gotThreadID, gotClientRequestID, gotInstallationID string
+	var gotInferenceCallID, gotTurnMetadata, gotParentThreadID, gotWindowID, gotSubagent, gotMemgen string
+	var gotAttestation, gotTimingMetrics, gotTraceparent, gotTracestate string
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		gotOpenAIBeta = r.Header.Get("OpenAI-Beta")
 		gotLegacySessionID = r.Header.Get("session_id")
@@ -776,6 +778,16 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 		gotThreadID = r.Header.Get("thread-id")
 		gotClientRequestID = r.Header.Get("X-Client-Request-Id")
 		gotInstallationID = r.Header.Get("X-Codex-Installation-Id")
+		gotInferenceCallID = r.Header.Get("X-Codex-Inference-Call-Id")
+		gotTurnMetadata = r.Header.Get("X-Codex-Turn-Metadata")
+		gotParentThreadID = r.Header.Get("X-Codex-Parent-Thread-Id")
+		gotWindowID = r.Header.Get("X-Codex-Window-Id")
+		gotSubagent = r.Header.Get("X-OpenAI-Subagent")
+		gotMemgen = r.Header.Get("X-OpenAI-Memgen-Request")
+		gotAttestation = r.Header.Get("X-OAI-Attestation")
+		gotTimingMetrics = r.Header.Get("X-ResponsesAPI-Include-Timing-Metrics")
+		gotTraceparent = r.Header.Get("Traceparent")
+		gotTracestate = r.Header.Get("Tracestate")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp-headers","object":"response","status":"completed"}`))
 	})
@@ -788,6 +800,16 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	req.Header.Set("thread-id", "thread-abc-123")
 	req.Header.Set("X-Client-Request-Id", "client-req-456")
 	req.Header.Set("X-Codex-Installation-Id", "install-789")
+	req.Header.Set("X-Codex-Inference-Call-Id", "inference-123")
+	req.Header.Set("X-Codex-Turn-Metadata", `{"turn_id":"turn-1"}`)
+	req.Header.Set("X-Codex-Parent-Thread-Id", "parent-123")
+	req.Header.Set("X-Codex-Window-Id", "thread-abc-123:2")
+	req.Header.Set("X-OpenAI-Subagent", "collab_spawn")
+	req.Header.Set("X-OpenAI-Memgen-Request", "true")
+	req.Header.Set("X-OAI-Attestation", "attestation-token")
+	req.Header.Set("X-ResponsesAPI-Include-Timing-Metrics", "true")
+	req.Header.Set("Traceparent", "00-11111111111111111111111111111111-2222222222222222-01")
+	req.Header.Set("Tracestate", "vendor=value")
 	w := httptest.NewRecorder()
 
 	handler.HandleResponses(w, req)
@@ -815,6 +837,36 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	}
 	if gotInstallationID != "install-789" {
 		t.Fatalf("expected X-Codex-Installation-Id to be forwarded, got %q", gotInstallationID)
+	}
+	if gotInferenceCallID != "inference-123" {
+		t.Fatalf("expected X-Codex-Inference-Call-Id to be forwarded, got %q", gotInferenceCallID)
+	}
+	if gotTurnMetadata != `{"turn_id":"turn-1"}` {
+		t.Fatalf("expected X-Codex-Turn-Metadata to be forwarded, got %q", gotTurnMetadata)
+	}
+	if gotParentThreadID != "parent-123" {
+		t.Fatalf("expected X-Codex-Parent-Thread-Id to be forwarded, got %q", gotParentThreadID)
+	}
+	if gotWindowID != "thread-abc-123:2" {
+		t.Fatalf("expected X-Codex-Window-Id to be forwarded, got %q", gotWindowID)
+	}
+	if gotSubagent != "collab_spawn" {
+		t.Fatalf("expected X-OpenAI-Subagent to be forwarded, got %q", gotSubagent)
+	}
+	if gotMemgen != "true" {
+		t.Fatalf("expected X-OpenAI-Memgen-Request to be forwarded, got %q", gotMemgen)
+	}
+	if gotAttestation != "attestation-token" {
+		t.Fatalf("expected X-OAI-Attestation to be forwarded, got %q", gotAttestation)
+	}
+	if gotTimingMetrics != "true" {
+		t.Fatalf("expected X-ResponsesAPI-Include-Timing-Metrics to be forwarded, got %q", gotTimingMetrics)
+	}
+	if gotTraceparent != "00-11111111111111111111111111111111-2222222222222222-01" {
+		t.Fatalf("expected Traceparent to be forwarded, got %q", gotTraceparent)
+	}
+	if gotTracestate != "vendor=value" {
+		t.Fatalf("expected Tracestate to be forwarded, got %q", gotTracestate)
 	}
 }
 
