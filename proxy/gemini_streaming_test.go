@@ -225,6 +225,140 @@ func TestStreamOpenAIToGeminiToolCalls(t *testing.T) {
 	}
 }
 
+func TestStreamOpenAIToGeminiWithFinalResponse_CapturesStreamedToolCalls(t *testing.T) {
+	toolStop := "tool_calls"
+	idx := 0
+	chunk1 := models.OpenAIStreamChunk{
+		ID:      "chatcmpl-gemini-tool-final",
+		Created: 456,
+		Model:   "gemini-2.5-pro",
+		Choices: []models.OpenAIStreamChoice{{
+			Index: 0,
+			Delta: models.OpenAIMessage{
+				Role: "assistant",
+				ToolCalls: []models.OpenAIToolCall{{
+					ID:    "call_weather_1",
+					Type:  "function",
+					Index: &idx,
+					Function: models.OpenAIFunctionCall{
+						Name:      "lookup_weather",
+						Arguments: `{"city":"Pa`,
+					},
+				}},
+			},
+		}},
+	}
+	chunk2 := models.OpenAIStreamChunk{
+		ID:      "chatcmpl-gemini-tool-final",
+		Created: 456,
+		Model:   "gemini-2.5-pro",
+		Choices: []models.OpenAIStreamChoice{{
+			Index: 0,
+			Delta: models.OpenAIMessage{
+				ToolCalls: []models.OpenAIToolCall{{
+					Index: &idx,
+					Function: models.OpenAIFunctionCall{
+						Arguments: `ris","unit":"c`,
+					},
+				}},
+			},
+		}},
+	}
+	chunk3 := models.OpenAIStreamChunk{
+		ID:      "chatcmpl-gemini-tool-final",
+		Created: 456,
+		Model:   "gemini-2.5-pro",
+		Choices: []models.OpenAIStreamChoice{{
+			Index: 0,
+			Delta: models.OpenAIMessage{
+				ToolCalls: []models.OpenAIToolCall{{
+					Index: &idx,
+					Function: models.OpenAIFunctionCall{
+						Arguments: `elsius"}`,
+					},
+				}},
+			},
+		}},
+	}
+	chunk4 := models.OpenAIStreamChunk{
+		ID:      "chatcmpl-gemini-tool-final",
+		Created: 456,
+		Model:   "gemini-2.5-pro",
+		Choices: []models.OpenAIStreamChoice{{
+			Index:        0,
+			Delta:        models.OpenAIMessage{},
+			FinishReason: &toolStop,
+		}},
+	}
+	chunk5 := models.OpenAIStreamChunk{
+		ID:      "chatcmpl-gemini-tool-final",
+		Created: 456,
+		Model:   "gemini-2.5-pro",
+		Usage:   &models.OpenAIUsage{PromptTokens: 8, CompletionTokens: 3, TotalTokens: 11},
+	}
+
+	body := buildSSEStream(
+		mustMarshal(t, chunk1),
+		mustMarshal(t, chunk2),
+		mustMarshal(t, chunk3),
+		mustMarshal(t, chunk4),
+		mustMarshal(t, chunk5),
+		"[DONE]",
+	)
+
+	w := httptest.NewRecorder()
+	var final *models.OpenAIResponse
+	StreamOpenAIToGeminiWithFinalResponse(w, body, func(resp *models.OpenAIResponse) {
+		final = resp
+	})
+
+	frames := parseGeminiSSEFrames(w.Body.String())
+	if len(frames) != 2 {
+		t.Fatalf("len(frames) = %d, want 2\nraw:\n%s", len(frames), w.Body.String())
+	}
+
+	var functionCallFrame models.GeminiGenerateContentResponse
+	if err := json.Unmarshal([]byte(frames[0]), &functionCallFrame); err != nil {
+		t.Fatalf("unmarshal function call frame: %v", err)
+	}
+	if functionCallFrame.Candidates[0].Content.Parts[0].FunctionCall == nil {
+		t.Fatalf("first frame = %#v, want functionCall", functionCallFrame)
+	}
+
+	if final == nil {
+		t.Fatal("final response callback was not invoked")
+	}
+	if final.ID != "chatcmpl-gemini-tool-final" {
+		t.Errorf("final.ID = %q, want chatcmpl-gemini-tool-final", final.ID)
+	}
+	if final.Created != 456 {
+		t.Errorf("final.Created = %d, want 456", final.Created)
+	}
+	if final.Usage == nil || final.Usage.TotalTokens != 11 {
+		t.Fatalf("final.Usage = %#v, want total tokens 11", final.Usage)
+	}
+	if len(final.Choices) != 1 {
+		t.Fatalf("len(final.Choices) = %d, want 1", len(final.Choices))
+	}
+	choice := final.Choices[0]
+	if choice.FinishReason == nil || *choice.FinishReason != "tool_calls" {
+		t.Fatalf("finish reason = %v, want tool_calls", choice.FinishReason)
+	}
+	if len(choice.Message.ToolCalls) != 1 {
+		t.Fatalf("len(tool_calls) = %d, want 1", len(choice.Message.ToolCalls))
+	}
+	toolCall := choice.Message.ToolCalls[0]
+	if toolCall.ID != "call_weather_1" {
+		t.Errorf("toolCall.ID = %q, want call_weather_1", toolCall.ID)
+	}
+	if toolCall.Function.Name != "lookup_weather" {
+		t.Errorf("toolCall.Function.Name = %q, want lookup_weather", toolCall.Function.Name)
+	}
+	if toolCall.Function.Arguments != `{"city":"Paris","unit":"celsius"}` {
+		t.Errorf("toolCall.Function.Arguments = %q, want combined JSON arguments", toolCall.Function.Arguments)
+	}
+}
+
 func TestStreamOpenAIToGeminiToolCallWithoutArgumentsFlushesEmptyObject(t *testing.T) {
 	toolStop := "tool_calls"
 	idx := 0

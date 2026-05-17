@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -43,10 +44,12 @@ func writeSSEEvent(w http.ResponseWriter, eventType string, data interface{}) er
 }
 
 func parseSSELine(line string) (string, bool) {
-	if strings.HasPrefix(line, "data: ") {
-		return line[6:], true
+	if !strings.HasPrefix(line, "data:") {
+		return "", false
 	}
-	return "", false
+	data := strings.TrimPrefix(line, "data:")
+	data = strings.TrimPrefix(data, " ")
+	return data, true
 }
 
 func setSSEHeaders(w http.ResponseWriter) {
@@ -69,22 +72,92 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// StreamOpenAIPassthrough streams OpenAI SSE bytes directly to the client with no parsing.
+// StreamOpenAIPassthrough streams OpenAI SSE bytes directly to the client.
 func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
+	StreamOpenAIPassthroughWithFinalResponse(w, body, nil)
+}
+
+// StreamOpenAIPassthroughWithFinalResponse streams OpenAI SSE lines to the
+// client and optionally invokes onFinalResponse with the complete aggregated
+// OpenAI response after the upstream stream terminates successfully with [DONE].
+func StreamOpenAIPassthroughWithFinalResponse(
+	w http.ResponseWriter,
+	body io.ReadCloser,
+	onFinalResponse func(*models.OpenAIResponse),
+) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
-	fw := &flushWriter{w: w}
+	var flusher http.Flusher
 	if f, ok := w.(http.Flusher); ok {
-		fw.flusher = f
+		flusher = f
 	}
-	// Errors here (client disconnect, upstream drop) are unrecoverable for SSE
-	// since headers have already been sent. The client must handle truncated streams.
-	_, _ = io.Copy(fw, body)
+
+	if onFinalResponse == nil {
+		_, _ = io.Copy(&flushWriter{w: w, flusher: flusher}, body)
+		return
+	}
+
+	aggregator := newOpenAIResponseAggregator()
+	reader := bufio.NewReaderSize(body, openAIStreamScannerInitialBuffer)
+
+	sawDone := false
+	var accumulator sseDataAccumulator
+	processData := func(data string) bool {
+		if data == "[DONE]" {
+			sawDone = true
+			return true
+		}
+
+		var chunk models.OpenAIStreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			return true
+		}
+		aggregator.addChunk(chunk)
+		return true
+	}
+
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			if _, writeErr := io.WriteString(w, line); writeErr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			accumulator.consumeLine(line, processData)
+		}
+		if err != nil {
+			if err != io.EOF {
+				return
+			}
+			break
+		}
+	}
+
+	accumulator.dispatch(processData)
+	if !sawDone {
+		return
+	}
+	onFinalResponse(aggregator.buildResponse())
 }
 
 // StreamOpenAIToAnthropic translates an OpenAI SSE stream into Anthropic SSE format.
 func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model string, requestID string) {
+	StreamOpenAIToAnthropicWithFinalResponse(w, body, model, requestID, nil)
+}
+
+// StreamOpenAIToAnthropicWithFinalResponse translates an OpenAI SSE stream into
+// Anthropic SSE format and optionally invokes onFinalResponse with the complete
+// aggregated OpenAI response after the translated stream finishes successfully.
+func StreamOpenAIToAnthropicWithFinalResponse(
+	w http.ResponseWriter,
+	body io.ReadCloser,
+	model string,
+	requestID string,
+	onFinalResponse func(*models.OpenAIResponse),
+) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
@@ -93,12 +166,28 @@ func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model st
 		return
 	}
 
-	sawDone, err := consumeOpenAIStreamChunks(body, state.consumeChunk)
+	var aggregator *openAIResponseAggregator
+	if onFinalResponse != nil {
+		aggregator = newOpenAIResponseAggregator()
+	}
+
+	sawDone, err := consumeOpenAIStreamChunks(body, func(chunk models.OpenAIStreamChunk) bool {
+		if aggregator != nil {
+			aggregator.addChunk(chunk)
+		}
+		return state.consumeChunk(chunk)
+	})
 	if err != nil || !sawDone {
 		return
 	}
 
-	_ = state.finish()
+	if !state.finish() {
+		return
+	}
+
+	if onFinalResponse != nil {
+		onFinalResponse(aggregator.buildResponse())
+	}
 }
 
 // aggregateStreamToResponse collects an OpenAI SSE stream into a complete

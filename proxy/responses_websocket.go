@@ -79,6 +79,8 @@ type responsesWebSocketSession struct {
 	lastResponseID string
 	lastSignature  string
 	historyItems   []json.RawMessage
+	toolContexts   *ToolExecutionContextStore
+	toolScope      string
 }
 
 type responsesWebSocketRequestPlan struct {
@@ -205,10 +207,12 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 	}
 
 	return &responsesWebSocketSession{
-		conn:        conn,
-		ctx:         r.Context(),
-		baseHeaders: baseHeaders,
-		turnState:   strings.TrimSpace(r.Header.Get("X-Codex-Turn-State")),
+		conn:         conn,
+		ctx:          r.Context(),
+		baseHeaders:  baseHeaders,
+		turnState:    strings.TrimSpace(r.Header.Get("X-Codex-Turn-State")),
+		toolContexts: NewToolExecutionContextStore(),
+		toolScope:    "responses-ws:" + uuid.NewString(),
 	}
 }
 
@@ -377,7 +381,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return fmt.Errorf("upstream websocket bridge status %d", resp.StatusCode)
 	}
 
-	responseID, outputItems, err := s.streamUpstreamResponse(resp.Body, resp.Header)
+	responseID, outputItems, err := s.streamUpstreamResponse(h, resp.Body, resp.Header)
 	if err != nil {
 		if errors.Is(err, errStreamFailedUpstream) {
 			return nil
@@ -461,7 +465,7 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 	if err != nil {
 		return nil, err
 	}
-	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/websocket", true)
+	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizers(ctx, bodyBytes, "responses/websocket", true, s.toolContexts, s.toolScope)
 	headers := s.requestHeaders(request, includeTurnState)
 	if compactionResp, handled, err := h.maybeBuildResponsesCompactionTriggerResponse(ctx, bodyBytes, headers, true); handled || err != nil {
 		return compactionResp, err
@@ -730,7 +734,7 @@ func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *
 	)
 }
 
-func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, headers http.Header) (string, []json.RawMessage, error) {
+func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body io.Reader, headers http.Header) (string, []json.RawMessage, error) {
 	// Emit a synthetic metadata event so WebSocket clients can discover the
 	// actual model used. The Codex CLI parses openai-model from
 	// codex.response.metadata frames via response_model().
@@ -778,6 +782,9 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(body io.Reader, heade
 			}
 		case "response.output_item.done":
 			if len(event.Item) > 0 {
+				if h != nil {
+					h.maybeRewriteOrCaptureToolCommandItem(s.ctx, event.Item, s.toolContexts, s.toolScope, false)
+				}
 				outputItems = append(outputItems, cloneRawMessage(event.Item))
 			}
 		case "response.completed":

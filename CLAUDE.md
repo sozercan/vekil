@@ -29,7 +29,7 @@ Documentation is intentionally split under `docs/` into small, single-purpose fi
 | `README.md` | Short landing page only |
 | `docs/README.md` | Documentation index and doc map |
 | `docs/getting-started.md` | install, run, first auth, deployment entry points |
-| `docs/configuration.md` | flags, env vars, provider routing, websocket tuning |
+| `docs/configuration.md` | flags, env vars, provider routing, tool optimizers, websocket tuning |
 | `docs/clients.md` | copy-paste client examples |
 | `docs/api.md` | endpoint behavior and compatibility notes |
 | `docs/architecture.md` | package boundaries and design notes |
@@ -51,6 +51,7 @@ Documentation update rules:
 | `auth/` | GitHub OAuth device code flow and Copilot token caching/refresh (`sync.RWMutex` + double-check) |
 | `proxy/chat_handlers.go` | Anthropic and OpenAI chat handlers, including forced-streaming aggregation for tool calls |
 | `proxy/responses_handler.go` | OpenAI Responses passthrough plus Codex compatibility endpoints (`/v1/responses/compact`, `/v1/memories/trace_summarize`) |
+| `proxy/tool_optimizer*.go`, `proxy/optimizer_*.go` | Optional `/v1/responses` tool optimizer configuration and provider adapters for shell command rewrite/output reduction |
 | `proxy/handler.go` | Shared proxy plumbing: health/ready/models handlers, request-body decoding, provider-aware model catalogs, provider headers, caches |
 | `proxy/providers.go` | JSON/YAML provider config loading, model ownership, Azure metadata overlay, endpoint allowlists, and routing state |
 | `proxy/upstream_http.go` | Provider selection, public→upstream model rewriting, and provider-specific upstream HTTP dispatch |
@@ -79,6 +80,7 @@ Documentation update rules:
 - **Azure support is OpenAI-compatible provider routing, not a separate public surface**: Azure deployment names stay internal to provider config, and Azure `/models` probing is only a best-effort metadata overlay for configured models.
 - **OpenAI Codex support is file-auth-backed provider routing**: Codex models use the CLI ChatGPT auth file, dynamic `/models` discovery, and `/responses`-only routing.
 - **Proxy websocket bridging is not upstream realtime**: `GET /v1/responses` remains a proxy-owned websocket transport over upstream HTTP `/responses`. Do not describe it as native Azure websocket or `/realtime` support.
+- **Tool optimizers are opt-in and fail-open**: keep them disabled by default. External optimizer errors, timeouts, invalid JSON, or invalid replacements must fall back to the original payload and preserve default passthrough behavior.
 - **Minimal dependencies**: Keep third-party deps minimal. Current direct non-stdlib dependencies used in production code include `github.com/pkg/browser`, `fyne.io/systray`, `github.com/godbus/dbus/v5`, `github.com/google/uuid`, `github.com/gorilla/websocket`, `github.com/klauspost/compress`, and `gopkg.in/yaml.v3`.
 - **Distroless container**: Single static binary, `CGO_ENABLED=0`.
 
