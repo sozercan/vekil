@@ -10,6 +10,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/sozercan/vekil/logger"
 )
 
@@ -20,7 +21,10 @@ func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
 		"X-OpenAI-Subagent",
 		"OpenAI-Beta",
 		"session_id",
+		"session-id",
+		"thread-id",
 		"X-Client-Request-Id",
+		"X-Codex-Installation-Id",
 		"X-Codex-Beta-Features",
 		"X-Codex-Turn-State",
 		"X-Codex-Turn-Metadata",
@@ -65,6 +69,21 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(isStreaming)
 	defer upstreamCancel()
+
+	if compactionResp, handled, err := h.maybeBuildResponsesCompactionTriggerResponse(upstreamCtx, bodyBytes, extraHeaders, isStreaming); handled || err != nil {
+		if err != nil {
+			statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+			h.log.Error("upstream request failed", logger.F("endpoint", "responses/compaction_trigger"), logger.Err(err))
+			if statusCode == http.StatusBadRequest {
+				writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+				return
+			}
+			writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
+			return
+		}
+		writeUpstreamResponse(w, compactionResp)
+		return
+	}
 
 	resp, err := h.postResponsesWithHeaders(upstreamCtx, bodyBytes, extraHeaders)
 	if err != nil {
@@ -227,18 +246,18 @@ func (b *compactBudget) recordResolvedModel(model string) {
 	}
 }
 
-const compactPrompt = `You are performing a CONTEXT CHECKPOINT COMPACTION for an interrupted coding-agent session. Create a handoff summary for another LLM that must continue the same task seamlessly.
+const compactPrompt = `You are performing a CONTEXT CHECKPOINT COMPACTION for a coding-agent session. Create a handoff summary of earlier conversation state for a future assistant.
 
-Write the summary so the next assistant can resume work without asking the user to restate the task.
+Write the summary so the next assistant has continuity without treating this checkpoint as the newest user request.
 
 Include:
 - Current objective and task status: IN_PROGRESS, BLOCKED_ON_USER, or COMPLETE
 - Completed work and key decisions already made
 - The last concrete action taken and any important intermediate results
-- The next exact step the next assistant should take first
+- Known unfinished work or next step, if the compacted history clearly shows one
 - Critical context, constraints, user preferences, files, commands, errors, or references needed to continue
 
-Be concise, structured, and action-oriented. Do not chat with the user. Do not ask follow-up questions unless the task status is BLOCKED_ON_USER.`
+Be concise, structured, and factual. Do not chat with the user. Do not ask follow-up questions unless the task status is BLOCKED_ON_USER.`
 
 // HandleCompact handles POST /v1/responses/compact by forwarding the request
 // to the upstream /responses endpoint with a compaction system prompt injected.
@@ -254,6 +273,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = r.Body.Close() }()
 
+	retainedOutput := retainedCompactResponseMessages(bodyBytes)
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/compact", false)
 
 	var body map[string]json.RawMessage
@@ -290,7 +310,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeCompactResponse(w, summaryText)
+	writeCompactResponse(w, summaryText, retainedOutput)
 }
 
 // memorySummarizePrompt is the system instruction used to summarize conversation
@@ -460,31 +480,50 @@ func extractResponsesOutputText(body []byte) (string, error) {
 	return sanitizeProxySummaryText(sb.String()), nil
 }
 
-func writeCompactResponse(w http.ResponseWriter, summaryText string) {
-	type contentPart struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
+func retainedCompactResponseMessages(body []byte) []json.RawMessage {
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil
 	}
-	type outputItem struct {
-		Type             string        `json:"type"`
-		Role             string        `json:"role,omitempty"`
-		Content          []contentPart `json:"content,omitempty"`
-		EncryptedContent string        `json:"encrypted_content,omitempty"`
+	rawInput, ok := req["input"]
+	if !ok {
+		return nil
 	}
+	var input []json.RawMessage
+	if err := json.Unmarshal(rawInput, &input); err != nil {
+		return nil
+	}
+	retained := make([]json.RawMessage, 0, len(input))
+	for _, raw := range input {
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		if rawJSONString(item["type"]) != "message" {
+			continue
+		}
+		switch rawJSONString(item["role"]) {
+		case "system", "developer", "user":
+			retained = append(retained, cloneRawMessage(raw))
+		}
+	}
+	return retained
+}
+
+func writeCompactResponse(w http.ResponseWriter, summaryText string, retainedOutput []json.RawMessage) {
+	compactionItem, _ := json.Marshal(map[string]string{
+		"type":              "compaction",
+		"encrypted_content": encodeSyntheticCompaction(summaryText),
+	})
+
+	output := make([]json.RawMessage, 0, len(retainedOutput)+1)
+	output = append(output, retainedOutput...)
+	output = append(output, json.RawMessage(compactionItem))
+
 	compactResp := struct {
-		Output []outputItem `json:"output"`
+		Output []json.RawMessage `json:"output"`
 	}{
-		Output: []outputItem{
-			{
-				Type:    "message",
-				Role:    "assistant",
-				Content: []contentPart{{Type: "output_text", Text: summaryText}},
-			},
-			{
-				Type:             "compaction",
-				EncryptedContent: encodeSyntheticCompaction(summaryText),
-			},
-		},
+		Output: output,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -2224,6 +2263,126 @@ func (h *ProxyHandler) compactResponsesInputWithBudget(ctx context.Context, mode
 		return "", fmt.Errorf("compaction request returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return summary, nil
+}
+
+func (h *ProxyHandler) maybeBuildResponsesCompactionTriggerResponse(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, stream bool) (*http.Response, bool, error) {
+	requestFields, ok, err := compactTriggerRequestFields(bodyBytes)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+
+	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
+	summary, resp, err := h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget)
+	if err != nil {
+		return nil, true, err
+	}
+	if resp != nil {
+		return resp, true, nil
+	}
+
+	return syntheticCompactionTriggerResponse(summary, stream), true, nil
+}
+
+func compactTriggerRequestFields(bodyBytes []byte) (map[string]json.RawMessage, bool, error) {
+	var requestFields map[string]json.RawMessage
+	if err := json.Unmarshal(bodyBytes, &requestFields); err != nil {
+		return nil, false, nil
+	}
+
+	var input []json.RawMessage
+	if err := json.Unmarshal(requestFields["input"], &input); err != nil {
+		return nil, false, nil
+	}
+
+	triggerIndex := -1
+	for i, raw := range input {
+		if responsesInputItemType(raw) == "compaction_trigger" {
+			triggerIndex = i
+			break
+		}
+	}
+	if triggerIndex == -1 {
+		return nil, false, nil
+	}
+
+	compactInput := cloneRawMessages(input[:triggerIndex])
+	compactInputRaw, err := json.Marshal(compactInput)
+	if err != nil {
+		return nil, true, err
+	}
+
+	compactFields := copyResponsesRequestFields(requestFields)
+	compactFields["input"] = compactInputRaw
+	for _, field := range []string{"stream", "type", "generate", "client_metadata", "initiator"} {
+		delete(compactFields, field)
+	}
+	return compactFields, true, nil
+}
+
+func responsesInputItemType(raw json.RawMessage) string {
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return ""
+	}
+	return rawJSONString(item["type"])
+}
+
+func syntheticCompactionTriggerResponse(summary string, stream bool) *http.Response {
+	responseID := "resp-vekil-compact-" + uuid.NewString()
+	compactionItem := map[string]string{
+		"type":              "compaction",
+		"encrypted_content": encodeSyntheticCompaction(summary),
+	}
+
+	headers := make(http.Header)
+	if stream {
+		headers.Set("Content-Type", "text/event-stream")
+		var body bytes.Buffer
+		writeResponsesSSEData(&body, map[string]interface{}{
+			"type": "response.created",
+			"response": map[string]interface{}{
+				"id": responseID,
+			},
+		})
+		writeResponsesSSEData(&body, map[string]interface{}{
+			"type": "response.output_item.done",
+			"item": compactionItem,
+		})
+		writeResponsesSSEData(&body, map[string]interface{}{
+			"type": "response.completed",
+			"response": map[string]interface{}{
+				"id":    responseID,
+				"usage": zeroResponsesUsage(),
+			},
+		})
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     headers,
+			Body:       io.NopCloser(bytes.NewReader(body.Bytes())),
+		}
+	}
+
+	headers.Set("Content-Type", "application/json")
+	body, _ := json.Marshal(map[string]interface{}{
+		"id":     responseID,
+		"object": "response",
+		"status": "completed",
+		"output": []interface{}{compactionItem},
+		"usage":  zeroResponsesUsage(),
+	})
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     headers,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}
+}
+
+func writeResponsesSSEData(w io.Writer, payload interface{}) {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	_, _ = fmt.Fprintf(w, "data: %s\n\n", encoded)
 }
 
 func isCompactPromptTooLargeError(statusCode int, body []byte) bool {

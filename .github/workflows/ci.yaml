@@ -37,6 +37,9 @@ jobs:
       - name: Test
         run: make test
 
+      - name: Compaction lab
+        run: make compaction-lab
+
   build:
     runs-on: ubuntu-latest
     steps:
