@@ -769,7 +769,7 @@ func TestHandleResponses_RoutesConfiguredAzureModelAndPreservesPriorityServiceTi
 
 func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	var gotOpenAIBeta, gotLegacySessionID, gotSessionID, gotThreadID, gotClientRequestID, gotInstallationID string
-	var gotInferenceCallID, gotTurnMetadata, gotParentThreadID, gotWindowID, gotSubagent string
+	var gotInferenceCallID, gotTurnMetadata, gotParentThreadID, gotWindowID, gotSubagent, gotMemgen string
 	var gotAttestation, gotTimingMetrics, gotTraceparent, gotTracestate string
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		gotOpenAIBeta = r.Header.Get("OpenAI-Beta")
@@ -783,6 +783,7 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 		gotParentThreadID = r.Header.Get("X-Codex-Parent-Thread-Id")
 		gotWindowID = r.Header.Get("X-Codex-Window-Id")
 		gotSubagent = r.Header.Get("X-OpenAI-Subagent")
+		gotMemgen = r.Header.Get("X-OpenAI-Memgen-Request")
 		gotAttestation = r.Header.Get("X-OAI-Attestation")
 		gotTimingMetrics = r.Header.Get("X-ResponsesAPI-Include-Timing-Metrics")
 		gotTraceparent = r.Header.Get("Traceparent")
@@ -804,6 +805,7 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	req.Header.Set("X-Codex-Parent-Thread-Id", "parent-123")
 	req.Header.Set("X-Codex-Window-Id", "thread-abc-123:2")
 	req.Header.Set("X-OpenAI-Subagent", "collab_spawn")
+	req.Header.Set("X-OpenAI-Memgen-Request", "true")
 	req.Header.Set("X-OAI-Attestation", "attestation-token")
 	req.Header.Set("X-ResponsesAPI-Include-Timing-Metrics", "true")
 	req.Header.Set("Traceparent", "00-11111111111111111111111111111111-2222222222222222-01")
@@ -850,6 +852,9 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	}
 	if gotSubagent != "collab_spawn" {
 		t.Fatalf("expected X-OpenAI-Subagent to be forwarded, got %q", gotSubagent)
+	}
+	if gotMemgen != "true" {
+		t.Fatalf("expected X-OpenAI-Memgen-Request to be forwarded, got %q", gotMemgen)
 	}
 	if gotAttestation != "attestation-token" {
 		t.Fatalf("expected X-OAI-Attestation to be forwarded, got %q", gotAttestation)

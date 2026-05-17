@@ -121,6 +121,9 @@ func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 		if got := r.Header.Get("X-OpenAI-Subagent"); got != "collab_spawn" {
 			t.Fatalf("expected subagent header to be forwarded, got %q", got)
 		}
+		if got := r.Header.Get("X-OpenAI-Memgen-Request"); got != "true" {
+			t.Fatalf("expected memgen header to be forwarded, got %q", got)
+		}
 		if got := r.Header.Get("X-ResponsesAPI-Include-Timing-Metrics"); got != "true" {
 			t.Fatalf("expected timing metrics header to be forwarded, got %q", got)
 		}
@@ -187,6 +190,7 @@ func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 		"x-codex-window-id":                         "thread-1:3",
 		"x-codex-parent-thread-id":                  "parent-thread-1",
 		"x-openai-subagent":                         "collab_spawn",
+		"x-openai-memgen-request":                   "true",
 		"x-responsesapi-include-timing-metrics":     "true",
 		"x-codex-ws-stream-request-start-ms":        "1738888888123",
 		"ws_request_header_x-codex-turn-state":      "client-state-should-not-forward",
@@ -2332,7 +2336,7 @@ func TestHandleResponsesWebSocket_ForwardsOpenAIBetaHeader(t *testing.T) {
 
 func TestHandleResponsesWebSocket_ForwardsSessionAndClientRequestHeaders(t *testing.T) {
 	var gotLegacySessionID, gotSessionID, gotThreadID, gotClientRequestID, gotInstallationID string
-	var gotInferenceCallID, gotParentThreadID, gotWindowID, gotSubagent, gotAttestation, gotTimingMetrics string
+	var gotInferenceCallID, gotParentThreadID, gotWindowID, gotSubagent, gotMemgen, gotAttestation, gotTimingMetrics string
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		gotLegacySessionID = r.Header.Get("session_id")
 		gotSessionID = r.Header.Get("session-id")
@@ -2343,6 +2347,7 @@ func TestHandleResponsesWebSocket_ForwardsSessionAndClientRequestHeaders(t *test
 		gotParentThreadID = r.Header.Get("X-Codex-Parent-Thread-Id")
 		gotWindowID = r.Header.Get("X-Codex-Window-Id")
 		gotSubagent = r.Header.Get("X-OpenAI-Subagent")
+		gotMemgen = r.Header.Get("X-OpenAI-Memgen-Request")
 		gotAttestation = r.Header.Get("X-OAI-Attestation")
 		gotTimingMetrics = r.Header.Get("X-ResponsesAPI-Include-Timing-Metrics")
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -2361,6 +2366,7 @@ func TestHandleResponsesWebSocket_ForwardsSessionAndClientRequestHeaders(t *test
 		"X-Codex-Parent-Thread-Id":              []string{"parent-123"},
 		"X-Codex-Window-Id":                     []string{"thread-123:4"},
 		"X-OpenAI-Subagent":                     []string{"collab_spawn"},
+		"X-OpenAI-Memgen-Request":               []string{"true"},
 		"X-OAI-Attestation":                     []string{"attestation-token"},
 		"X-ResponsesAPI-Include-Timing-Metrics": []string{"true"},
 	})
@@ -2408,6 +2414,9 @@ func TestHandleResponsesWebSocket_ForwardsSessionAndClientRequestHeaders(t *test
 	}
 	if gotSubagent != "collab_spawn" {
 		t.Fatalf("expected X-OpenAI-Subagent to be forwarded upstream, got %q", gotSubagent)
+	}
+	if gotMemgen != "true" {
+		t.Fatalf("expected X-OpenAI-Memgen-Request to be forwarded upstream, got %q", gotMemgen)
 	}
 	if gotAttestation != "attestation-token" {
 		t.Fatalf("expected X-OAI-Attestation to be forwarded upstream, got %q", gotAttestation)
