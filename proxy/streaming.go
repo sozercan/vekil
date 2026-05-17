@@ -48,9 +48,7 @@ func parseSSELine(line string) (string, bool) {
 		return "", false
 	}
 	data := strings.TrimPrefix(line, "data:")
-	if strings.HasPrefix(data, " ") {
-		data = strings.TrimPrefix(data, " ")
-	}
+	data = strings.TrimPrefix(data, " ")
 	return data, true
 }
 

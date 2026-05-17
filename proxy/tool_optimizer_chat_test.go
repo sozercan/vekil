@@ -187,7 +187,7 @@ func TestOpenAIChatToolOptimizerRawRequestPreservesTopLevelOrder(t *testing.T) {
 	if zIndex < 0 || messagesIndex < 0 || aIndex < 0 {
 		t.Fatalf("rewritten body missing expected top-level fields: %s", rewrittenText)
 	}
-	if !(zIndex < messagesIndex && messagesIndex < aIndex) {
+	if zIndex >= messagesIndex || messagesIndex >= aIndex {
 		t.Fatalf("top-level order changed in rewritten body: %s", rewrittenText)
 	}
 }

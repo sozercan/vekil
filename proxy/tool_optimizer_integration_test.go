@@ -133,7 +133,7 @@ func TestHandleResponses_ToolOptimizerRewritesCommandAndReducesOutput(t *testing
 		"input": "run a command",
 		"stream": false
 	}`)
-	defer firstResp.Body.Close()
+	defer func() { _ = firstResp.Body.Close() }()
 
 	if firstResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(firstResp.Body)
@@ -161,7 +161,7 @@ func TestHandleResponses_ToolOptimizerRewritesCommandAndReducesOutput(t *testing
 		],
 		"stream": false
 	}`)
-	defer secondResp.Body.Close()
+	defer func() { _ = secondResp.Body.Close() }()
 
 	if secondResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(secondResp.Body)
@@ -249,7 +249,7 @@ func TestHandleResponses_ToolOptimizerUsesPreviousResponseIDWhenClientRequestIDC
 		"input": "run a command",
 		"stream": false
 	}`, map[string]string{"X-Client-Request-Id": "client-request-1"})
-	defer firstResp.Body.Close()
+	defer func() { _ = firstResp.Body.Close() }()
 
 	if firstResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(firstResp.Body)
@@ -276,7 +276,7 @@ func TestHandleResponses_ToolOptimizerUsesPreviousResponseIDWhenClientRequestIDC
 		],
 		"stream": false
 	}`, map[string]string{"X-Client-Request-Id": "client-request-2"})
-	defer secondResp.Body.Close()
+	defer func() { _ = secondResp.Body.Close() }()
 
 	if secondResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(secondResp.Body)
@@ -356,7 +356,7 @@ func TestHandleResponses_ToolOptimizerRewritesExecCommandCmdArgPathAndReducesOut
 		"input": "run a command",
 		"stream": false
 	}`)
-	defer firstResp.Body.Close()
+	defer func() { _ = firstResp.Body.Close() }()
 
 	if firstResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(firstResp.Body)
@@ -387,7 +387,7 @@ func TestHandleResponses_ToolOptimizerRewritesExecCommandCmdArgPathAndReducesOut
 		],
 		"stream": false
 	}`)
-	defer secondResp.Body.Close()
+	defer func() { _ = secondResp.Body.Close() }()
 
 	if secondResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(secondResp.Body)
@@ -478,7 +478,7 @@ func TestHandleResponses_ToolOptimizerDefaultOffPassesThrough(t *testing.T) {
 		"input": "run a command",
 		"stream": false
 	}`)
-	defer firstResp.Body.Close()
+	defer func() { _ = firstResp.Body.Close() }()
 
 	if firstResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(firstResp.Body)
@@ -506,7 +506,7 @@ func TestHandleResponses_ToolOptimizerDefaultOffPassesThrough(t *testing.T) {
 		],
 		"stream": false
 	}`)
-	defer secondResp.Body.Close()
+	defer func() { _ = secondResp.Body.Close() }()
 
 	if secondResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(secondResp.Body)
@@ -587,7 +587,7 @@ func TestHandleResponses_ToolOptimizerCapturesStreamingCommandWithPreviousRespon
 		"input": "run a command",
 		"stream": true
 	}`, map[string]string{"X-Client-Request-Id": "stream-client-request-1"})
-	defer firstResp.Body.Close()
+	defer func() { _ = firstResp.Body.Close() }()
 
 	if firstResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(firstResp.Body)
@@ -613,7 +613,7 @@ func TestHandleResponses_ToolOptimizerCapturesStreamingCommandWithPreviousRespon
 		],
 		"stream": true
 	}`, map[string]string{"X-Client-Request-Id": "stream-client-request-2"})
-	defer secondResp.Body.Close()
+	defer func() { _ = secondResp.Body.Close() }()
 
 	if secondResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(secondResp.Body)
@@ -1028,7 +1028,7 @@ func TestHandleOpenAIChatCompletions_ToolOptimizerDoesNotUseGlobalFallback(t *te
 		"messages": [{"role": "user", "content": "run command"}],
 		"stream": false
 	}`, "")
-	defer firstResp.Body.Close()
+	defer func() { _ = firstResp.Body.Close() }()
 	if firstResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(firstResp.Body)
 		t.Fatalf("expected first response status 200, got %d: %s", firstResp.StatusCode, body)
@@ -1045,7 +1045,7 @@ func TestHandleOpenAIChatCompletions_ToolOptimizerDoesNotUseGlobalFallback(t *te
 		],
 		"stream": false
 	}`, "")
-	defer secondResp.Body.Close()
+	defer func() { _ = secondResp.Body.Close() }()
 	if secondResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(secondResp.Body)
 		t.Fatalf("expected second response status 200, got %d: %s", secondResp.StatusCode, body)
@@ -1154,7 +1154,7 @@ func TestHandleOpenAIChatCompletions_ToolOptimizerIgnoresClientRequestIDScope(t 
 		"messages": [{"role": "user", "content": "run command"}],
 		"stream": false
 	}`, headers)
-	defer firstResp.Body.Close()
+	defer func() { _ = firstResp.Body.Close() }()
 	if firstResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(firstResp.Body)
 		t.Fatalf("expected first response status 200, got %d: %s", firstResp.StatusCode, body)
@@ -1171,7 +1171,7 @@ func TestHandleOpenAIChatCompletions_ToolOptimizerIgnoresClientRequestIDScope(t 
 		],
 		"stream": false
 	}`, headers)
-	defer secondResp.Body.Close()
+	defer func() { _ = secondResp.Body.Close() }()
 	if secondResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(secondResp.Body)
 		t.Fatalf("expected second response status 200, got %d: %s", secondResp.StatusCode, body)
@@ -1225,7 +1225,7 @@ func TestHandleOpenAIChatCompletions_DefaultOffStreamingPreservesOversizedSSE(t 
 		"messages": [{"role": "user", "content": "stream"}],
 		"stream": true
 	}`, "")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -1310,7 +1310,7 @@ func runOpenAIChatToolOptimizerReducesOutputTest(t *testing.T, sessionID string)
 		"messages": [{"role": "user", "content": "run command"}],
 		"stream": false
 	}`, sessionID)
-	defer firstResp.Body.Close()
+	defer func() { _ = firstResp.Body.Close() }()
 
 	if firstResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(firstResp.Body)
@@ -1341,7 +1341,7 @@ func runOpenAIChatToolOptimizerReducesOutputTest(t *testing.T, sessionID string)
 		],
 		"stream": false
 	}`, sessionID)
-	defer secondResp.Body.Close()
+	defer func() { _ = secondResp.Body.Close() }()
 
 	if secondResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(secondResp.Body)
