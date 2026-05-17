@@ -1105,7 +1105,7 @@ func TestHandleCompact_DeduplicatesConcurrentIdenticalRequests(t *testing.T) {
 
 	close(start)
 	<-upstreamStarted
-	time.Sleep(25 * time.Millisecond)
+	waitForCompactInflightWaiters(t, handler, callers-1)
 	close(releaseUpstream)
 	wg.Wait()
 
@@ -1167,7 +1167,7 @@ func TestHandleCompact_CapsInflightErrorBodyReplay(t *testing.T) {
 
 	close(start)
 	<-upstreamStarted
-	time.Sleep(25 * time.Millisecond)
+	waitForCompactInflightWaiters(t, handler, callers-1)
 	close(releaseUpstream)
 	wg.Wait()
 
@@ -1185,6 +1185,31 @@ func TestHandleCompact_CapsInflightErrorBodyReplay(t *testing.T) {
 			t.Fatalf("caller %d expected stale Content-Length to be cleared, got %q", i, contentLengths[i])
 		}
 	}
+}
+
+func waitForCompactInflightWaiters(t *testing.T, handler *ProxyHandler, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got := 0
+		handler.compactInflightMu.Lock()
+		for _, call := range handler.compactInflight {
+			got += int(call.waiters.Load())
+		}
+		handler.compactInflightMu.Unlock()
+		if got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	handler.compactInflightMu.Lock()
+	got := 0
+	for _, call := range handler.compactInflight {
+		got += int(call.waiters.Load())
+	}
+	handler.compactInflightMu.Unlock()
+	t.Fatalf("timed out waiting for %d in-flight compact waiters, got %d", want, got)
 }
 
 func TestHandleCompact_LargeBodyAllowed(t *testing.T) {

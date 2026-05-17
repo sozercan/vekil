@@ -784,6 +784,44 @@ func TestResponsesWebSocketDefaultAutoCompactCoversObservedPressure(t *testing.T
 	}
 }
 
+func TestResponsesWebSocketHistoryItemThresholdRequiresReducibleHistory(t *testing.T) {
+	items := make([]json.RawMessage, 0, 5)
+	for i := 0; i < 5; i++ {
+		raw, err := json.Marshal(map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{{
+				"type": "input_text",
+				"text": fmt.Sprintf("item %d", i),
+			}},
+		})
+		if err != nil {
+			t.Fatalf("failed to marshal history item: %v", err)
+		}
+		items = append(items, raw)
+	}
+
+	cfg := ResponsesWebSocketConfig{
+		AutoCompactMaxItems: 3,
+		AutoCompactMaxBytes: 1 << 20,
+		AutoCompactKeepTail: 4,
+	}
+	if responsesWebSocketHistoryExceedsThreshold(items, cfg) {
+		t.Fatal("item-count threshold should not trigger when compaction cannot reduce history item count")
+	}
+
+	cfg.AutoCompactMaxBytes = 1
+	if !responsesWebSocketHistoryExceedsThreshold(items, cfg) {
+		t.Fatal("byte threshold should still trigger for short histories that cannot reduce item count")
+	}
+
+	cfg.AutoCompactMaxBytes = 1 << 20
+	cfg.AutoCompactKeepTail = 2
+	if !responsesWebSocketHistoryExceedsThreshold(items, cfg) {
+		t.Fatal("item-count threshold should trigger when compaction can reduce history item count")
+	}
+}
+
 func TestResponsesWebSocketAutoCompactsShortBytePressureHistory(t *testing.T) {
 	raw := func(v interface{}) json.RawMessage {
 		t.Helper()
@@ -972,21 +1010,21 @@ func TestResponsesWebSocketCompactHistoryKeepsToolPairsAcrossBoundary(t *testing
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprint(w, `{"id":"comp-tool-pair","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint summary"}]}]}`)
 	})
+	historyItems := []json.RawMessage{
+		msg("user", "run a command"),
+		raw(map[string]interface{}{"type": "function_call", "call_id": "call-1", "name": "shell", "arguments": "{}"}),
+		msg("assistant", "thinking between call and output"),
+		raw(map[string]interface{}{"type": "function_call_output", "call_id": "call-1", "output": "done"}),
+		msg("assistant", "command finished"),
+	}
 	handler.responsesWS = ResponsesWebSocketConfig{
 		AutoCompactMaxItems: 3,
-		AutoCompactMaxBytes: 1 << 20,
+		AutoCompactMaxBytes: rawMessagesSize(historyItems) - 1,
 		AutoCompactKeepTail: 2,
 	}
-
 	session := &responsesWebSocketSession{
-		ctx: context.Background(),
-		historyItems: []json.RawMessage{
-			msg("user", "run a command"),
-			raw(map[string]interface{}{"type": "function_call", "call_id": "call-1", "name": "shell", "arguments": "{}"}),
-			msg("assistant", "thinking between call and output"),
-			raw(map[string]interface{}{"type": "function_call_output", "call_id": "call-1", "output": "done"}),
-			msg("assistant", "command finished"),
-		},
+		ctx:          context.Background(),
+		historyItems: historyItems,
 	}
 	request := &responsesWebSocketCreateRequest{Model: "gpt-5.4"}
 

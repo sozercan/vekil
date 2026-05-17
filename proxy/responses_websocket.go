@@ -1044,13 +1044,17 @@ func responsesWebSocketHistoryExceedsThreshold(items []json.RawMessage, cfg Resp
 	if len(items) <= 1 {
 		return false
 	}
-	if cfg.AutoCompactMaxItems > 0 && len(items) > cfg.AutoCompactMaxItems {
+	if cfg.AutoCompactMaxItems > 0 && len(items) > cfg.AutoCompactMaxItems && responsesWebSocketHistoryCanReduceItemCount(items, cfg.AutoCompactKeepTail) {
 		return true
 	}
 	if cfg.AutoCompactMaxBytes > 0 && rawMessagesSize(items) > cfg.AutoCompactMaxBytes {
 		return true
 	}
 	return false
+}
+
+func responsesWebSocketHistoryCanReduceItemCount(items []json.RawMessage, keepTail int) bool {
+	return compactedResponsesAlignedPrefixLen(items, keepTail) > 1
 }
 
 func rawMessagesSize(items []json.RawMessage) int {

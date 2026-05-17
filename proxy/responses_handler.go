@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -586,8 +587,9 @@ func writeCompactResponse(w http.ResponseWriter, summaryText string, retainedOut
 }
 
 type compactInflightCall struct {
-	done   chan struct{}
-	result compactInflightResult
+	done    chan struct{}
+	result  compactInflightResult
+	waiters atomic.Int32
 }
 
 type compactInflightResult struct {
@@ -681,6 +683,8 @@ func waitCompactInflight(ctx context.Context, call *compactInflightCall) (string
 	if call == nil {
 		return "", nil, context.Canceled
 	}
+	call.waiters.Add(1)
+	defer call.waiters.Add(-1)
 	select {
 	case <-call.done:
 		return call.result.clone()
