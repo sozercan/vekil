@@ -1051,6 +1051,142 @@ func TestHandleCompact(t *testing.T) {
 	}
 }
 
+func TestHandleCompact_DeduplicatesConcurrentIdenticalRequests(t *testing.T) {
+	const callers = 8
+
+	var upstreamCalls atomic.Int32
+	upstreamStarted := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if call := upstreamCalls.Add(1); call == 1 {
+			close(upstreamStarted)
+		}
+		<-releaseUpstream
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-compact-dedup","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"shared compact summary"}]}]}`))
+	})
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "compact this shared history"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	statuses := make([]int, callers)
+	bodies := make([][]byte, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			handler.HandleCompact(w, req)
+
+			resp := w.Result()
+			statuses[i] = resp.StatusCode
+			bodies[i], _ = io.ReadAll(resp.Body)
+		}(i)
+	}
+
+	close(start)
+	<-upstreamStarted
+	time.Sleep(25 * time.Millisecond)
+	close(releaseUpstream)
+	wg.Wait()
+
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("expected one upstream compact call for identical in-flight requests, got %d", upstreamCalls.Load())
+	}
+	for i := range statuses {
+		if statuses[i] != http.StatusOK {
+			t.Fatalf("caller %d expected 200, got %d: %s", i, statuses[i], bodies[i])
+		}
+		summary, encryptedSummary := requireCompactResponseSummaryForTest(t, bodies[i])
+		if summary != "shared compact summary" || encryptedSummary != "shared compact summary" {
+			t.Fatalf("caller %d expected shared compact summary, got summary=%q encrypted=%q", i, summary, encryptedSummary)
+		}
+	}
+}
+
+func TestHandleCompact_CapsInflightErrorBodyReplay(t *testing.T) {
+	const callers = 2
+
+	largeBody := strings.Repeat("x", compactUpstreamErrorBodySize+1024)
+	var upstreamCalls atomic.Int32
+	upstreamStarted := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if call := upstreamCalls.Add(1); call == 1 {
+			close(upstreamStarted)
+		}
+		<-releaseUpstream
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(largeBody)))
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, largeBody)
+	})
+
+	reqBody := []byte(`{"model":"gpt-5.4","input":"compact error replay"}`)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	statuses := make([]int, callers)
+	contentLengths := make([]string, callers)
+	bodies := make([][]byte, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			handler.HandleCompact(w, req)
+
+			resp := w.Result()
+			statuses[i] = resp.StatusCode
+			contentLengths[i] = resp.Header.Get("Content-Length")
+			bodies[i], _ = io.ReadAll(resp.Body)
+		}(i)
+	}
+
+	close(start)
+	<-upstreamStarted
+	time.Sleep(25 * time.Millisecond)
+	close(releaseUpstream)
+	wg.Wait()
+
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("expected one upstream compact call for identical in-flight error requests, got %d", upstreamCalls.Load())
+	}
+	for i := range statuses {
+		if statuses[i] != http.StatusInternalServerError {
+			t.Fatalf("caller %d expected 500, got %d", i, statuses[i])
+		}
+		if len(bodies[i]) != compactUpstreamErrorBodySize {
+			t.Fatalf("caller %d expected capped body length %d, got %d", i, compactUpstreamErrorBodySize, len(bodies[i]))
+		}
+		if contentLengths[i] != "" {
+			t.Fatalf("caller %d expected stale Content-Length to be cleared, got %q", i, contentLengths[i])
+		}
+	}
+}
+
 func TestHandleCompact_LargeBodyAllowed(t *testing.T) {
 	var upstreamHits atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1367,6 +1503,188 @@ func TestCompactResponsesRequestDepth_ProactiveSplitDoesNotConsumeBudgetBeforePo
 	}
 	if budget.attempts > expectedAttempts {
 		t.Fatalf("expected at most %d budgeted attempts, got %d", expectedAttempts, budget.attempts)
+	}
+}
+
+func TestCompactResponsesRequestInChunks_RespectsChunkConcurrency(t *testing.T) {
+	const (
+		targetBodySize = 96 << 10
+		concurrency    = 2
+	)
+
+	texts := make([]string, 0, 7)
+	for i := 0; i < 7; i++ {
+		texts = append(texts, fmt.Sprintf("item %d: %s", i+1, strings.Repeat("x", 60<<10)))
+	}
+	requestFields, chunks := compactChunkTestRequestFields(t, targetBodySize, texts)
+	if len(chunks) < 5 {
+		t.Fatalf("test setup expected at least 5 chunks, got %d", len(chunks))
+	}
+
+	var activeChunks atomic.Int32
+	var maxActiveChunks atomic.Int32
+	var chunkCalls atomic.Int32
+	var mergeCalls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		input := upstreamInputItems(t, req)
+		if len(input) > 0 {
+			text := requireMessageTextWithRole(t, input[0], "user")
+			if strings.HasPrefix(text, "Partial checkpoint summary") {
+				mergeCalls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"resp-merge","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"merged summary"}]}]}`))
+				return
+			}
+		}
+
+		current := activeChunks.Add(1)
+		recordMaxInt32(&maxActiveChunks, current)
+		if current > concurrency {
+			t.Errorf("active chunk requests = %d, want <= %d", current, concurrency)
+		}
+		time.Sleep(25 * time.Millisecond)
+		activeChunks.Add(-1)
+		call := chunkCalls.Add(1)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"resp-chunk-%d","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"chunk summary %d"}]}]}`, call, call)
+	})
+	handler.compactChunkConcurrency = concurrency
+
+	budget := newCompactBudget(len(chunks) + 2)
+	summary, err := handler.compactResponsesRequestInChunks(context.Background(), requestFields, nil, 0, targetBodySize, budget)
+	if err != nil {
+		t.Fatalf("compact chunk request failed: %v", err)
+	}
+	if summary != "merged summary" {
+		t.Fatalf("expected merged summary, got %q", summary)
+	}
+	if got := chunkCalls.Load(); got != int32(len(chunks)) {
+		t.Fatalf("expected %d chunk calls, got %d", len(chunks), got)
+	}
+	if mergeCalls.Load() != 1 {
+		t.Fatalf("expected one merge call, got %d", mergeCalls.Load())
+	}
+	if got := maxActiveChunks.Load(); got != concurrency {
+		t.Fatalf("expected max active chunk requests %d, got %d", concurrency, got)
+	}
+}
+
+func TestCompactResponsesRequestInChunks_CancelsFanoutOnFirstError(t *testing.T) {
+	const (
+		targetBodySize = 96 << 10
+		concurrency    = 2
+	)
+
+	texts := make([]string, 0, 7)
+	for i := 0; i < 7; i++ {
+		texts = append(texts, fmt.Sprintf("item %d: %s", i+1, strings.Repeat("y", 60<<10)))
+	}
+	requestFields, chunks := compactChunkTestRequestFields(t, targetBodySize, texts)
+	if len(chunks) < 5 {
+		t.Fatalf("test setup expected at least 5 chunks, got %d", len(chunks))
+	}
+
+	var chunkCalls atomic.Int32
+	var mergeCalls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		var req map[string]interface{}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		input := upstreamInputItems(t, req)
+		if len(input) > 0 {
+			text := requireMessageTextWithRole(t, input[0], "user")
+			if strings.HasPrefix(text, "Partial checkpoint summary") {
+				mergeCalls.Add(1)
+				t.Fatal("merge should not run after a chunk fanout error")
+			}
+		}
+
+		call := chunkCalls.Add(1)
+		if call == 2 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"message":"chunk failed"}}`))
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"resp-chunk-%d","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"chunk summary %d"}]}]}`, call, call)
+	})
+	handler.compactChunkConcurrency = concurrency
+
+	budget := newCompactBudget(len(chunks) + 2)
+	summary, err := handler.compactResponsesRequestInChunks(context.Background(), requestFields, nil, 0, targetBodySize, budget)
+	if err == nil {
+		t.Fatalf("expected fanout error, got summary %q", summary)
+	}
+	if !strings.Contains(err.Error(), "returned 500") {
+		t.Fatalf("expected chunk 500 error, got %v", err)
+	}
+	if mergeCalls.Load() != 0 {
+		t.Fatalf("expected no merge calls after fanout error, got %d", mergeCalls.Load())
+	}
+	if got := chunkCalls.Load(); got >= int32(len(chunks)) {
+		t.Fatalf("expected cancellation to stop before all %d chunks ran, got %d chunk calls", len(chunks), got)
+	}
+}
+
+func TestCompactResponsesRequestInChunks_ResplitsUnsentFanoutAfterLearnedTarget(t *testing.T) {
+	const targetBodySize = 160 << 10
+	rejectAbove := targetBodySize / 2
+
+	texts := []string{
+		"first: " + strings.Repeat("a", 72<<10),
+		"second: " + strings.Repeat("b", 100<<10),
+		"third: " + strings.Repeat("c", 100<<10),
+		"fourth: " + strings.Repeat("d", 100<<10),
+	}
+	requestFields, chunks := compactChunkTestRequestFields(t, targetBodySize, texts)
+	if len(chunks) != len(texts) {
+		t.Fatalf("test setup expected one item per chunk, got %d chunks for %d items", len(chunks), len(texts))
+	}
+
+	var oversizedPosts atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		if len(body) > rejectAbove {
+			oversizedPosts.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":{"message":"failed to parse request","code":"payload_too_large"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary"}]}]}`))
+	})
+	handler.compactChunkConcurrency = 1
+
+	budget := newCompactBudget(32)
+	summary, err := handler.compactResponsesRequestInChunks(context.Background(), requestFields, nil, 0, targetBodySize, budget)
+	if err != nil {
+		t.Fatalf("compact chunk request failed: %v", err)
+	}
+	if summary != "summary" {
+		t.Fatalf("expected summary, got %q", summary)
+	}
+	if got := oversizedPosts.Load(); got != 1 {
+		t.Fatalf("expected only the first over-cap sibling to discover the smaller target, got %d oversized posts", got)
 	}
 }
 
@@ -4191,6 +4509,45 @@ func requireCompactResponseSummaryForTest(t *testing.T, body []byte) (string, st
 	}
 	t.Fatalf("expected compact response compaction item, got %+v", result.Output)
 	return "", ""
+}
+
+func compactChunkTestRequestFields(t *testing.T, targetBodySize int, texts []string) (map[string]json.RawMessage, [][]json.RawMessage) {
+	t.Helper()
+
+	input := make([]json.RawMessage, 0, len(texts))
+	for _, text := range texts {
+		message, err := compactTextInputRawMessage(text)
+		if err != nil {
+			t.Fatalf("build input message: %v", err)
+		}
+		input = append(input, message)
+	}
+	inputRaw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatalf("marshal input: %v", err)
+	}
+	requestFields := map[string]json.RawMessage{
+		"model": json.RawMessage(`"gpt-5.4"`),
+		"input": inputRaw,
+	}
+	fallbackFields, _, err := compactFallbackRequestFieldsForBodySize(requestFields, targetBodySize)
+	if err != nil {
+		t.Fatalf("build compact fallback fields: %v", err)
+	}
+	chunks, _, _, err := splitCompactInputAsHistoricalChunksByBodySize(fallbackFields, input, targetBodySize)
+	if err != nil {
+		t.Fatalf("split compact input: %v", err)
+	}
+	return requestFields, chunks
+}
+
+func recordMaxInt32(max *atomic.Int32, value int32) {
+	for {
+		current := max.Load()
+		if value <= current || max.CompareAndSwap(current, value) {
+			return
+		}
+	}
 }
 
 func requireCompactionContextMessage(t *testing.T, raw interface{}) string {

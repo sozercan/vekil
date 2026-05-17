@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -601,19 +602,44 @@ func (r compactInflightResult) clone() (string, *http.Response, error) {
 }
 
 func compactInflightKey(requestFields map[string]json.RawMessage, extraHeaders http.Header) (string, bool) {
-	payload := struct {
-		Request map[string]json.RawMessage `json:"request"`
-		Headers http.Header                `json:"headers,omitempty"`
-	}{
-		Request: requestFields,
-		Headers: extraHeaders,
+	h := sha256.New()
+	writeCompactInflightKeyPart(h, []byte("request"))
+	writeCompactInflightKeyRawMap(h, requestFields)
+	writeCompactInflightKeyPart(h, []byte("headers"))
+	writeCompactInflightKeyHeaders(h, extraHeaders)
+	return hex.EncodeToString(h.Sum(nil)), true
+}
+
+func writeCompactInflightKeyRawMap(w io.Writer, values map[string]json.RawMessage) {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
 	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return "", false
+	sort.Strings(keys)
+	for _, key := range keys {
+		writeCompactInflightKeyPart(w, []byte(key))
+		writeCompactInflightKeyPart(w, values[key])
 	}
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:]), true
+}
+
+func writeCompactInflightKeyHeaders(w io.Writer, headers http.Header) {
+	keys := make([]string, 0, len(headers))
+	for key := range headers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		writeCompactInflightKeyPart(w, []byte(key))
+		for _, value := range headers.Values(key) {
+			writeCompactInflightKeyPart(w, []byte(value))
+		}
+	}
+}
+
+func writeCompactInflightKeyPart(w io.Writer, value []byte) {
+	_, _ = fmt.Fprintf(w, "%d:", len(value))
+	_, _ = w.Write(value)
+	_, _ = w.Write([]byte{0})
 }
 
 func (h *ProxyHandler) beginCompactInflight(key string) (*compactInflightCall, bool) {
@@ -679,7 +705,7 @@ func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestField
 	summary, resp, err := h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget)
 	result := compactInflightResult{summary: summary, err: err}
 	if resp != nil {
-		respBody, readErr := io.ReadAll(resp.Body)
+		respBody, truncated, readErr := readBodyWithCap(resp.Body, compactUpstreamErrorBodySize)
 		_ = resp.Body.Close()
 		if readErr != nil {
 			if err == nil {
@@ -691,6 +717,14 @@ func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestField
 			result.resp = cloneHTTPResponseWithBody(resp, respBody)
 			result.respBody = respBody
 			resp = cloneHTTPResponseWithBody(resp, respBody)
+			if truncated {
+				result.resp.Header.Del("Content-Length")
+				resp.Header.Del("Content-Length")
+				h.log.Debug("truncated upstream compact response body for in-flight replay",
+					logger.F("status", resp.StatusCode),
+					logger.F("max_bytes", compactUpstreamErrorBodySize),
+				)
+			}
 		}
 	}
 	h.finishCompactInflight(key, call, result)
@@ -1078,6 +1112,8 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 
 		jobs := make(chan int)
 		errCh := make(chan error, 1)
+		learnedTargetCh := make(chan struct{})
+		var learnedTargetOnce sync.Once
 		var wg sync.WaitGroup
 		for worker := 0; worker < concurrency; worker++ {
 			wg.Add(1)
@@ -1097,16 +1133,26 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 						return
 					}
 					summaries[i] = summary
+					if learnedTarget := budget.learnedTargetValue(); learnedTarget > 0 && learnedTarget < targetBodySize {
+						learnedTargetOnce.Do(func() { close(learnedTargetCh) })
+					}
 				}
 			}()
 		}
 
+		sentThrough := 0
 	sendLoop:
 		for i := 1; i < len(chunks); i++ {
+			if learnedTarget := budget.learnedTargetValue(); learnedTarget > 0 && learnedTarget < targetBodySize {
+				break sendLoop
+			}
 			select {
 			case <-fanoutCtx.Done():
 				break sendLoop
+			case <-learnedTargetCh:
+				break sendLoop
 			case jobs <- i:
+				sentThrough = i
 			}
 		}
 		close(jobs)
@@ -1122,6 +1168,24 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 		}
 		if ctx.Err() != nil {
 			return "", ctx.Err()
+		}
+
+		learnedTarget := budget.learnedTargetValue()
+		if learnedTarget > 0 && learnedTarget < targetBodySize && sentThrough+1 < len(chunks) {
+			remaining := flattenCompactChunks(chunks[sentThrough+1:])
+			remainingFields := copyResponsesRequestFieldsWithInput(fallbackFields, remaining)
+			h.log.Info("re-splitting remaining compact chunks at learned smaller target after fanout",
+				logger.F("learned_target", learnedTarget),
+				logger.F("prior_target", targetBodySize),
+				logger.F("completed_chunks", sentThrough+1),
+				logger.F("remaining_chunks", len(chunks)-sentThrough-1),
+			)
+			tail, err := h.compactResponsesRequestInChunks(ctx, remainingFields, extraHeaders, depth, learnedTarget, budget)
+			if err != nil {
+				return "", err
+			}
+			summaries = append(summaries[:sentThrough+1], tail)
+			return h.mergeCompactionSummaries(ctx, fallbackFields, summaries, extraHeaders, depth, targetBodySize, budget)
 		}
 	}
 
