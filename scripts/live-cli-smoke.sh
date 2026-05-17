@@ -26,6 +26,9 @@ PROXY_BASE_URL="http://${PROXY_HOST}:${PROXY_PORT}"
 START_PROXY="${START_PROXY:-1}"
 TMP_PARENT="${LIVE_CLI_SMOKE_TMP_PARENT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
 SMOKE_DIR="${LIVE_CLI_SMOKE_DIR:-$(mktemp -d "${TMP_PARENT%/}/live-cli-smoke.XXXXXX")}"
+if [[ "${SMOKE_DIR}" != /* ]]; then
+  SMOKE_DIR="${PWD}/${SMOKE_DIR}"
+fi
 PROXY_LOG="${SMOKE_DIR}/proxy.log"
 MODELS_JSON="${SMOKE_DIR}/models.json"
 PROMPT="Read left.txt and right.txt in the current directory and reply with exactly the two file contents joined by a vertical bar, with no spaces, no markdown, no commentary, and no extra text. Output only the final string."
@@ -60,6 +63,18 @@ model_exists() {
   jq -e --arg model "$1" '.data[]? | select(.id == $model)' "${MODELS_JSON}" >/dev/null
 }
 
+model_supports_endpoint() {
+  local model="$1"
+  local endpoint="$2"
+
+  jq -e --arg model "${model}" --arg endpoint "${endpoint}" '
+    .data[]?
+    | select(.id == $model)
+    | (.supported_endpoints // [])
+    | index($endpoint)
+  ' "${MODELS_JSON}" >/dev/null
+}
+
 pick_model() {
   local family="$1"
   shift
@@ -77,14 +92,51 @@ pick_model() {
   die "unable to find a ${family} model from preferred list: $*"
 }
 
+pick_optional_gemini_model() {
+  local candidate
+
+  for candidate in "$@"; do
+    if model_exists "${candidate}" && model_supports_endpoint "${candidate}" "/chat/completions"; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  # The Gemini CLI hits Gemini-native proxy routes, but Vekil translates
+  # those requests to upstream OpenAI chat completions internally, so the
+  # selected model must advertise /chat/completions support.
+  candidate="$(jq -r '
+    [
+      .data[]?
+      | select((.id | type) == "string")
+      | select(.id | startswith("gemini-"))
+      | select((.supported_endpoints // []) | index("/chat/completions"))
+      | .id
+    ][0] // ""
+  ' "${MODELS_JSON}")"
+  if [[ -n "${candidate}" ]]; then
+    printf '%s\n' "${candidate}"
+    return 0
+  fi
+
+  log "Skipping Gemini smoke: no Gemini model with /chat/completions support is listed by ${PROXY_BASE_URL}/v1/models."
+  return 0
+}
+
 write_case_files() {
   local case_dir="$1"
-  local left_value="$2"
-  local right_value="$3"
+  local client="$2"
+  local fixture_name
+  fixture_name="$(printf '%s' "${client}" | tr '[:lower:]' '[:upper:]')"
+  local left_value="ZX_${fixture_name}_LEFT"
+  local right_value="ZX_${fixture_name}_RIGHT"
 
   mkdir -p "${case_dir}"
-  printf '%s\n' "${left_value}" > "${case_dir}/left.txt"
-  printf '%s\n' "${right_value}" > "${case_dir}/right.txt"
+  # Keep fixtures newline-free so exact-output assertions compare only the
+  # requested payload, not editor-added file terminators.
+  printf '%s' "${left_value}" > "${case_dir}/left.txt"
+  printf '%s' "${right_value}" > "${case_dir}/right.txt"
+  printf '%s|%s' "${left_value}" "${right_value}"
 }
 
 assert_exact_output() {
@@ -145,12 +197,10 @@ run_codex_smoke() {
   local case_dir="${SMOKE_DIR}/cases/codex"
   local home_dir="${SMOKE_DIR}/homes/codex-home"
   local output_file="${SMOKE_DIR}/outputs/codex.txt"
-  local left_value="ZX_COD_41A"
-  local right_value="ZX_COD_88B"
-  local expected="${left_value}|${right_value}"
+  local expected
   local actual
 
-  write_case_files "${case_dir}" "${left_value}" "${right_value}"
+  expected="$(write_case_files "${case_dir}" "codex")"
   mkdir -p "${home_dir}/.codex"
   printf 'model = "%s"\nopenai_base_url = "%s"\n' "${CODEX_MODEL}" "${PROXY_BASE_URL}/v1" > "${home_dir}/.codex/config.toml"
 
@@ -169,18 +219,17 @@ run_codex_smoke() {
 
   actual="$(read_normalized_output "${output_file}")"
   assert_exact_output "codex" "${expected}" "${actual}"
+  printf '%s' "${actual}" > "${output_file}"
 }
 
 run_claude_smoke() {
   local case_dir="${SMOKE_DIR}/cases/claude"
   local home_dir="${SMOKE_DIR}/homes/claude-home"
   local output_file="${SMOKE_DIR}/outputs/claude.txt"
-  local left_value="ZX_CLA_17Q"
-  local right_value="ZX_CLA_52R"
-  local expected="${left_value}|${right_value}"
+  local expected
   local actual
 
-  write_case_files "${case_dir}" "${left_value}" "${right_value}"
+  expected="$(write_case_files "${case_dir}" "claude")"
   mkdir -p "${home_dir}/.claude"
   cat > "${home_dir}/.claude/settings.json" <<EOF
 {
@@ -209,18 +258,17 @@ EOF
 
   actual="$(read_normalized_output "${output_file}")"
   assert_exact_output "claude" "${expected}" "${actual}"
+  printf '%s' "${actual}" > "${output_file}"
 }
 
 run_gemini_smoke() {
   local case_dir="${SMOKE_DIR}/cases/gemini"
   local home_dir="${SMOKE_DIR}/homes/gemini-home"
   local output_file="${SMOKE_DIR}/outputs/gemini.txt"
-  local left_value="ZX_GEM_73M"
-  local right_value="ZX_GEM_94N"
-  local expected="${left_value}|${right_value}"
+  local expected
   local actual
 
-  write_case_files "${case_dir}" "${left_value}" "${right_value}"
+  expected="$(write_case_files "${case_dir}" "gemini")"
   mkdir -p "${home_dir}/.gemini/tmp"
   printf '{"projects":{}}\n' > "${home_dir}/.gemini/projects.json"
   cat > "${home_dir}/.gemini/settings.json" <<EOF
@@ -252,6 +300,7 @@ EOF
 
   actual="$(read_normalized_output "${output_file}")"
   assert_exact_output "gemini" "${expected}" "${actual}"
+  printf '%s' "${actual}" > "${output_file}"
 }
 
 main() {
@@ -259,7 +308,6 @@ main() {
   require_cmd jq
   require_cmd codex
   require_cmd claude
-  require_cmd gemini
 
   mkdir -p "${SMOKE_DIR}" "${SMOKE_DIR}/cases" "${SMOKE_DIR}/homes" "${SMOKE_DIR}/outputs"
 
@@ -274,18 +322,28 @@ main() {
 
   CODEX_MODEL="$(pick_model "Codex/OpenAI" gpt-5.4 gpt-5.3-codex gpt-5.2-codex gpt-5.1-codex gpt-5.1 gpt-5-mini gpt-4.1 gpt-4o)"
   CLAUDE_MODEL="$(pick_model "Claude" claude-sonnet-4.6 claude-sonnet-4.5 claude-sonnet-4 claude-opus-4.6)"
-  GEMINI_MODEL="$(pick_model "Gemini" gemini-3.1-pro-preview gemini-3-pro-preview gemini-2.5-pro gemini-3-flash-preview)"
+  GEMINI_MODEL="$(pick_optional_gemini_model gemini-3.1-pro-preview gemini-3-pro-preview gemini-2.5-pro gemini-3-flash-preview)"
+
+  if [[ -n "${GEMINI_MODEL}" ]]; then
+    require_cmd gemini
+  fi
 
   log "Selected models:"
   log "  codex:  ${CODEX_MODEL}"
   log "  claude: ${CLAUDE_MODEL}"
-  log "  gemini: ${GEMINI_MODEL}"
+  if [[ -n "${GEMINI_MODEL}" ]]; then
+    log "  gemini: ${GEMINI_MODEL}"
+  else
+    log "  gemini: skipped (no supported Gemini model listed)"
+  fi
 
   run_codex_smoke
   run_claude_smoke
-  run_gemini_smoke
+  if [[ -n "${GEMINI_MODEL}" ]]; then
+    run_gemini_smoke
+  fi
 
-  log "All live CLI smoke checks passed."
+  log "All enabled live CLI smoke checks passed."
   log "Artifacts: ${SMOKE_DIR}"
 }
 

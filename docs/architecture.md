@@ -27,7 +27,7 @@
 |---------|---------------|
 | `main` | CLI flags, HTTP server setup, graceful shutdown |
 | `auth/` | GitHub OAuth device code flow, Copilot token exchange, disk caching, auto-refresh |
-| `proxy/` | HTTP handlers, provider routing, Anthropic/OpenAI and Gemini/OpenAI translation, Responses compatibility, SSE streaming, retry logic, and provider-specific request/auth helpers outside GitHub OAuth |
+| `proxy/` | HTTP handlers, provider routing, Anthropic/OpenAI and Gemini/OpenAI translation, Responses compatibility, optional tool optimizer hooks, SSE streaming, retry logic, and provider-specific request/auth helpers outside GitHub OAuth |
 | `models/` | Request and response type definitions only |
 | `logger/` | Structured JSON logging |
 | `server/` | Reusable HTTP server lifecycle |
@@ -43,6 +43,7 @@
 - OpenAI Chat Completions is near-zero-copy except where forced streaming is needed for tool reliability.
 - OpenAI Responses compatibility is partly proxy-owned, especially for Codex compaction and websocket bridging.
 - The Codex websocket bridge is transport adaptation over upstream HTTP `/responses`, not a claim that the selected provider has native websocket or realtime support.
+- Tool optimizers are opt-in and fail-open. They must remain disabled by default and must not change default passthrough behavior when unconfigured or when an external optimizer fails.
 - Azure OpenAI support is implemented as an OpenAI-compatible provider behind the existing proxy surface; Azure deployment names are internal to provider config.
 - OpenAI Codex subscription support is a Responses-only dynamic provider backed by Codex CLI ChatGPT credentials.
 - Production dependencies stay minimal.

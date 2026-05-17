@@ -44,16 +44,41 @@ func writeGeminiSSEData(w http.ResponseWriter, data interface{}) error {
 // StreamOpenAIToGemini translates upstream OpenAI SSE into Gemini-style
 // data-only SSE frames.
 func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
+	StreamOpenAIToGeminiWithFinalResponse(w, body, nil)
+}
+
+// StreamOpenAIToGeminiWithFinalResponse translates upstream OpenAI SSE into
+// Gemini-style data-only SSE frames and optionally invokes onFinalResponse with
+// the complete aggregated OpenAI response after the translated stream finishes
+// successfully.
+func StreamOpenAIToGeminiWithFinalResponse(
+	w http.ResponseWriter,
+	body io.ReadCloser,
+	onFinalResponse func(*models.OpenAIResponse),
+) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
 	state := newGeminiStreamState(w)
-	sawDone, err := consumeOpenAIStreamChunks(body, state.consumeChunk)
+	var aggregator *openAIResponseAggregator
+	if onFinalResponse != nil {
+		aggregator = newOpenAIResponseAggregator()
+	}
+
+	sawDone, err := consumeOpenAIStreamChunks(body, func(chunk models.OpenAIStreamChunk) bool {
+		if aggregator != nil {
+			aggregator.addChunk(chunk)
+		}
+		return state.consumeChunk(chunk)
+	})
 	if err != nil || !sawDone {
 		return
 	}
 
-	_ = state.finish()
+	if !state.finish() || onFinalResponse == nil {
+		return
+	}
+	onFinalResponse(aggregator.buildResponse())
 }
 
 type geminiStreamState struct {
