@@ -716,6 +716,86 @@ func TestResponsesWebSocketDefaultAutoCompactCoversObservedPressure(t *testing.T
 	}
 }
 
+func TestResponsesWebSocketAutoCompactsShortBytePressureHistory(t *testing.T) {
+	raw := func(v interface{}) json.RawMessage {
+		t.Helper()
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("failed to marshal raw message: %v", err)
+		}
+		return b
+	}
+	msg := func(role, text string) json.RawMessage {
+		contentType := "input_text"
+		if role == "assistant" {
+			contentType = "output_text"
+		}
+		return raw(map[string]interface{}{
+			"type":    "message",
+			"role":    role,
+			"content": []map[string]string{{"type": contentType, "text": text}},
+		})
+	}
+
+	var compactInput []map[string]interface{}
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+		compactInput = upstreamInputItems(t, body)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"comp-short-byte-pressure","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"short byte pressure checkpoint"}]}]}`)
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		AutoCompactMaxItems: 99,
+		AutoCompactMaxBytes: 1024,
+		AutoCompactKeepTail: 4,
+	}
+
+	session := &responsesWebSocketSession{
+		ctx: context.Background(),
+		historyItems: []json.RawMessage{
+			msg("user", strings.Repeat("x", 2048)),
+			msg("assistant", "latest answer"),
+		},
+	}
+	request := &responsesWebSocketCreateRequest{Model: "gpt-5.4"}
+
+	if !responsesWebSocketHistoryExceedsThreshold(session.historyItems, handler.responsesWS) {
+		t.Fatalf("expected short history to exceed byte threshold despite keep-tail being larger than item count")
+	}
+	_, compacted, err := session.compactHistory(handler, context.Background(), request, false)
+	if err != nil {
+		t.Fatalf("compactHistory failed: %v", err)
+	}
+	if !compacted {
+		t.Fatal("expected websocket history to compact under byte pressure")
+	}
+	if len(compactInput) != 1 {
+		t.Fatalf("expected compaction request to summarize the oversized prefix, got %d items: %#v", len(compactInput), compactInput)
+	}
+
+	compactedItems := decodeRawMessagesForTest(t, session.historyItems)
+	if len(compactedItems) != 2 {
+		t.Fatalf("expected checkpoint plus latest answer, got %d items: %#v", len(compactedItems), compactedItems)
+	}
+	if got := requireMessageTextWithRole(t, compactedItems[0], "developer"); !strings.Contains(got, "short byte pressure checkpoint") {
+		t.Fatalf("expected checkpoint summary in compacted history, got %q", got)
+	}
+	if compactedItems[1]["type"] != "message" || compactedItems[1]["role"] != "assistant" {
+		t.Fatalf("expected latest assistant answer tail to be retained, got %#v", compactedItems[1])
+	}
+	if got := inputTextFromMessage(t, compactedItems[1]); got != "latest answer" {
+		t.Fatalf("expected latest answer tail to be retained, got %q", got)
+	}
+}
+
 func TestResponsesWebSocketCompactHistoryRewritesPriorSyntheticCheckpoint(t *testing.T) {
 	raw := func(v interface{}) json.RawMessage {
 		t.Helper()

@@ -1014,7 +1014,7 @@ func responsesWebSocketMetadataHeaders(headers http.Header) map[string]interface
 }
 
 func responsesWebSocketHistoryExceedsThreshold(items []json.RawMessage, cfg ResponsesWebSocketConfig) bool {
-	if len(items) <= cfg.AutoCompactKeepTail {
+	if len(items) <= 1 {
 		return false
 	}
 	if cfg.AutoCompactMaxItems > 0 && len(items) > cfg.AutoCompactMaxItems {
