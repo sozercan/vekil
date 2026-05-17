@@ -6576,6 +6576,86 @@ func TestHandleModels(t *testing.T) {
 		}
 	})
 
+	t.Run("maps Copilot prompt cap to Codex context window", func(t *testing.T) {
+		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/models" {
+				t.Errorf("expected path /models, got %s", r.URL.Path)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.1-codex-max","object":"model","created":0,"owned_by":"github-copilot","supported_endpoints":["/responses"],"capabilities":{"supports":{"parallel_tool_calls":true,"vision":true,"reasoning_effort":["medium"]},"limits":{"max_context_window_tokens":400000,"max_prompt_tokens":128000,"max_output_tokens":128000}},"model_picker_enabled":true,"model_picker_category":"powerful","name":"GPT-5.1-Codex-Max"}]}`))
+		})
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+
+		h.HandleModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.StatusCode)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		var result struct {
+			Models []struct {
+				Slug             string `json:"slug"`
+				ContextWindow    *int64 `json:"context_window,omitempty"`
+				MaxContextWindow *int64 `json:"max_context_window,omitempty"`
+			} `json:"models"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(result.Models) != 1 {
+			t.Fatalf("expected 1 model, got %d", len(result.Models))
+		}
+		model := result.Models[0]
+		if model.Slug != "gpt-5.1-codex-max" {
+			t.Fatalf("slug = %q, want gpt-5.1-codex-max", model.Slug)
+		}
+		if model.ContextWindow == nil || *model.ContextWindow != 128000 {
+			t.Fatalf("context_window = %v, want prompt cap 128000", model.ContextWindow)
+		}
+		if model.MaxContextWindow == nil || *model.MaxContextWindow != 400000 {
+			t.Fatalf("max_context_window = %v, want total context 400000", model.MaxContextWindow)
+		}
+	})
+
+	t.Run("falls back to Copilot total window when prompt cap is absent", func(t *testing.T) {
+		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.4","object":"model","created":0,"owned_by":"github-copilot","supported_endpoints":["/responses"],"capabilities":{"supports":{"parallel_tool_calls":true,"vision":true,"reasoning_effort":["medium"]},"limits":{"max_context_window_tokens":400000}},"model_picker_enabled":true,"model_picker_category":"powerful","name":"GPT-5.4"}]}`))
+		})
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+
+		h.HandleModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.StatusCode)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		var result struct {
+			Models []struct {
+				ContextWindow    *int64 `json:"context_window,omitempty"`
+				MaxContextWindow *int64 `json:"max_context_window,omitempty"`
+			} `json:"models"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(result.Models) != 1 {
+			t.Fatalf("expected 1 model, got %d", len(result.Models))
+		}
+		if result.Models[0].ContextWindow == nil || *result.Models[0].ContextWindow != 400000 {
+			t.Fatalf("context_window = %v, want fallback total context 400000", result.Models[0].ContextWindow)
+		}
+		if result.Models[0].MaxContextWindow == nil || *result.Models[0].MaxContextWindow != 400000 {
+			t.Fatalf("max_context_window = %v, want total context 400000", result.Models[0].MaxContextWindow)
+		}
+	})
+
 	t.Run("upstream error is forwarded", func(t *testing.T) {
 		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -7310,6 +7390,130 @@ func TestHandleModels_CodexContractFixture(t *testing.T) {
 	}
 	if len(claude.SupportedReasoningLevels) != 0 {
 		t.Errorf("claude-sonnet-4.5 supported_reasoning_levels = %d, want 0", len(claude.SupportedReasoningLevels))
+	}
+}
+
+func TestTransformModelsResponsePreservesCodexContextMetadata(t *testing.T) {
+	contextWindow := int64(272000)
+	maxContextWindow := int64(1000000)
+	autoCompactTokenLimit := int64(244800)
+	effectiveContextWindowPercent := int64(90)
+
+	body := []byte(`{"object":"list","data":[{"id":"gpt-5.4","object":"model","created":0,"owned_by":"codex","supported_endpoints":["/responses"],"capabilities":{"supports":{"parallel_tool_calls":true,"vision":true,"reasoning_effort":["medium"]},"limits":{"max_context_window_tokens":400000}},"model_picker_enabled":true,"model_picker_category":"powerful","name":"GPT-5.4","context_window":272000,"max_context_window":1000000,"auto_compact_token_limit":244800,"effective_context_window_percent":90}]}`)
+
+	var result struct {
+		Models []struct {
+			Slug                          string `json:"slug"`
+			ContextWindow                 *int64 `json:"context_window,omitempty"`
+			MaxContextWindow              *int64 `json:"max_context_window,omitempty"`
+			AutoCompactTokenLimit         *int64 `json:"auto_compact_token_limit,omitempty"`
+			EffectiveContextWindowPercent int64  `json:"effective_context_window_percent"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(transformModelsResponse(body), &result); err != nil {
+		t.Fatalf("decode transformed models response: %v", err)
+	}
+	if len(result.Models) != 1 {
+		t.Fatalf("expected 1 model entry, got %d", len(result.Models))
+	}
+	model := result.Models[0]
+	if model.Slug != "gpt-5.4" {
+		t.Fatalf("expected slug gpt-5.4, got %q", model.Slug)
+	}
+	if model.ContextWindow == nil || *model.ContextWindow != contextWindow {
+		t.Fatalf("context_window = %v, want %d", model.ContextWindow, contextWindow)
+	}
+	if model.MaxContextWindow == nil || *model.MaxContextWindow != maxContextWindow {
+		t.Fatalf("max_context_window = %v, want %d", model.MaxContextWindow, maxContextWindow)
+	}
+	if model.AutoCompactTokenLimit == nil || *model.AutoCompactTokenLimit != autoCompactTokenLimit {
+		t.Fatalf("auto_compact_token_limit = %v, want %d", model.AutoCompactTokenLimit, autoCompactTokenLimit)
+	}
+	if model.EffectiveContextWindowPercent != effectiveContextWindowPercent {
+		t.Fatalf("effective_context_window_percent = %d, want %d", model.EffectiveContextWindowPercent, effectiveContextWindowPercent)
+	}
+}
+
+func TestHandleModels_OpenAICodexPreservesContextMetadata(t *testing.T) {
+	codexHome := t.TempDir()
+	writeTestOpenAICodexAuth(t, codexHome, testOpenAICodexTokens(t, time.Now().Add(time.Hour), "acct-123", false, "refresh-token"))
+	t.Setenv("CODEX_HOME", codexHome)
+
+	codexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/models" {
+			t.Fatalf("expected /models lookup, got %s", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"models":[{"slug":"gpt-5.4","display_name":"GPT-5.4","visibility":"list","supported_in_api":true,"supported_reasoning_levels":[{"effort":"medium"}],"supports_parallel_tool_calls":true,"context_window":272000,"max_context_window":1000000,"auto_compact_token_limit":244800,"effective_context_window_percent":90,"input_modalities":["text","image"],"priority":0}]}`))
+	}))
+	defer codexServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:            "codex",
+				Type:          "openai-codex",
+				BaseURL:       codexServer.URL,
+				Default:       true,
+				IncludeModels: []string{"gpt-5.4"},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	handler.HandleModels(w, req)
+
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Data []struct {
+			ID           string `json:"id"`
+			Capabilities struct {
+				Limits struct {
+					MaxContextWindowTokens int64 `json:"max_context_window_tokens"`
+				} `json:"limits"`
+			} `json:"capabilities"`
+		} `json:"data"`
+		Models []struct {
+			Slug                          string `json:"slug"`
+			ContextWindow                 *int64 `json:"context_window,omitempty"`
+			MaxContextWindow              *int64 `json:"max_context_window,omitempty"`
+			AutoCompactTokenLimit         *int64 `json:"auto_compact_token_limit,omitempty"`
+			EffectiveContextWindowPercent int64  `json:"effective_context_window_percent"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(result.Data) != 1 || len(result.Models) != 1 {
+		t.Fatalf("expected one model, got data=%d models=%d", len(result.Data), len(result.Models))
+	}
+	if result.Data[0].Capabilities.Limits.MaxContextWindowTokens != 1000000 {
+		t.Fatalf("max_context_window_tokens = %d, want 1000000", result.Data[0].Capabilities.Limits.MaxContextWindowTokens)
+	}
+	model := result.Models[0]
+	if model.ContextWindow == nil || *model.ContextWindow != 272000 {
+		t.Fatalf("context_window = %v, want 272000", model.ContextWindow)
+	}
+	if model.MaxContextWindow == nil || *model.MaxContextWindow != 1000000 {
+		t.Fatalf("max_context_window = %v, want 1000000", model.MaxContextWindow)
+	}
+	if model.AutoCompactTokenLimit == nil || *model.AutoCompactTokenLimit != 244800 {
+		t.Fatalf("auto_compact_token_limit = %v, want 244800", model.AutoCompactTokenLimit)
+	}
+	if model.EffectiveContextWindowPercent != 90 {
+		t.Fatalf("effective_context_window_percent = %d, want 90", model.EffectiveContextWindowPercent)
 	}
 }
 

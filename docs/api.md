@@ -22,6 +22,8 @@ Model normalization:
 
 The proxy builds a merged model catalog across the active providers. It preserves the OpenAI-style `data` payload and also adds a Codex-compatible top-level `models` array.
 
+For Copilot-served models, the Codex-compatible `models` metadata uses Copilot's prompt limit as `context_window` and preserves the total context limit as `max_context_window`, so Codex-style clients calculate context remaining from the usable prompt budget.
+
 ```bash
 curl http://localhost:1337/v1/models
 ```

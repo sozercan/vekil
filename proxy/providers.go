@@ -120,7 +120,10 @@ type openAICodexModelPayload struct {
 	SupportsImageDetailOriginal bool                         `json:"supports_image_detail_original"`
 	SupportsReasoningSummaries  bool                         `json:"supports_reasoning_summaries"`
 	SupportVerbosity            bool                         `json:"support_verbosity"`
-	ContextWindow               int64                        `json:"context_window"`
+	ContextWindow               *int64                       `json:"context_window,omitempty"`
+	MaxContextWindow            *int64                       `json:"max_context_window,omitempty"`
+	AutoCompactTokenLimit       *int64                       `json:"auto_compact_token_limit,omitempty"`
+	EffectiveContextWindowPct   int64                        `json:"effective_context_window_percent,omitempty"`
 	InputModalities             []string                     `json:"input_modalities"`
 	ExperimentalSupportedTools  []string                     `json:"experimental_supported_tools"`
 	BaseInstructions            string                       `json:"base_instructions"`
@@ -1409,6 +1412,14 @@ func synthesizeOpenAICodexModelRaw(providerID string, parsed openAICodexModelPay
 		modelPickerCategory = "lightweight"
 	}
 
+	var maxContextWindowTokens int64
+	switch {
+	case parsed.MaxContextWindow != nil && *parsed.MaxContextWindow > 0:
+		maxContextWindowTokens = *parsed.MaxContextWindow
+	case parsed.ContextWindow != nil && *parsed.ContextWindow > 0:
+		maxContextWindowTokens = *parsed.ContextWindow
+	}
+
 	payload := map[string]interface{}{
 		"id":                    parsed.Slug,
 		"object":                "model",
@@ -1420,7 +1431,7 @@ func synthesizeOpenAICodexModelRaw(providerID string, parsed openAICodexModelPay
 		"model_picker_category": modelPickerCategory,
 		"capabilities": map[string]interface{}{
 			"limits": map[string]interface{}{
-				"max_context_window_tokens": parsed.ContextWindow,
+				"max_context_window_tokens": maxContextWindowTokens,
 			},
 			"supports": map[string]interface{}{
 				"parallel_tool_calls": parsed.SupportsParallelToolCalls,
@@ -1438,12 +1449,23 @@ func synthesizeOpenAICodexModelRaw(providerID string, parsed openAICodexModelPay
 		"support_verbosity":              parsed.SupportVerbosity,
 		"supports_parallel_tool_calls":   parsed.SupportsParallelToolCalls,
 		"supports_image_detail_original": parsed.SupportsImageDetailOriginal,
-		"context_window":                 parsed.ContextWindow,
 		"input_modalities":               parsed.InputModalities,
 		"experimental_supported_tools":   parsed.ExperimentalSupportedTools,
 		"base_instructions":              parsed.BaseInstructions,
 		"shell_type":                     parsed.ShellType,
 		"default_reasoning_level":        strings.TrimSpace(parsed.DefaultReasoningLevel),
+	}
+	if parsed.ContextWindow != nil {
+		payload["context_window"] = *parsed.ContextWindow
+	}
+	if parsed.MaxContextWindow != nil {
+		payload["max_context_window"] = *parsed.MaxContextWindow
+	}
+	if parsed.AutoCompactTokenLimit != nil {
+		payload["auto_compact_token_limit"] = *parsed.AutoCompactTokenLimit
+	}
+	if parsed.EffectiveContextWindowPct > 0 {
+		payload["effective_context_window_percent"] = parsed.EffectiveContextWindowPct
 	}
 
 	raw, err := json.Marshal(payload)

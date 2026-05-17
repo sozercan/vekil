@@ -966,8 +966,27 @@ func transformModelsResponse(body []byte) []byte {
 		SupportsParallelToolCalls   bool              `json:"supports_parallel_tool_calls"`
 		SupportsImageDetailOriginal bool              `json:"supports_image_detail_original"`
 		ContextWindow               *int64            `json:"context_window,omitempty"`
+		MaxContextWindow            *int64            `json:"max_context_window,omitempty"`
+		AutoCompactTokenLimit       *int64            `json:"auto_compact_token_limit,omitempty"`
+		EffectiveContextWindowPct   int64             `json:"effective_context_window_percent"`
 		ExperimentalSupportedTools  []string          `json:"experimental_supported_tools"`
 		InputModalities             []string          `json:"input_modalities"`
+	}
+
+	positivePtr := func(value int64) *int64 {
+		if value <= 0 {
+			return nil
+		}
+		v := value
+		return &v
+	}
+	firstPositivePtr := func(values ...int64) *int64 {
+		for _, value := range values {
+			if ptr := positivePtr(value); ptr != nil {
+				return ptr
+			}
+		}
+		return nil
 	}
 
 	codexModels := make([]codexModel, 0, len(upstream.Data))
@@ -979,6 +998,11 @@ func transformModelsResponse(body []byte) []byte {
 			Capabilities       struct {
 				Limits struct {
 					MaxContextWindowTokens int64 `json:"max_context_window_tokens"`
+					ContextWindow          int64 `json:"context_window"`
+					ContextWindowTokens    int64 `json:"context_window_tokens"`
+					MaxPromptTokens        int64 `json:"max_prompt_tokens"`
+					MaxPrompt              int64 `json:"max_prompt"`
+					MaxInputTokens         int64 `json:"max_input_tokens"`
 				} `json:"limits"`
 				Supports struct {
 					ParallelToolCalls bool     `json:"parallel_tool_calls"`
@@ -987,8 +1011,12 @@ func transformModelsResponse(body []byte) []byte {
 					ToolCalls         bool     `json:"tool_calls"`
 				} `json:"supports"`
 			} `json:"capabilities"`
-			ModelPickerEnabled  bool   `json:"model_picker_enabled"`
-			ModelPickerCategory string `json:"model_picker_category"`
+			ModelPickerEnabled        bool   `json:"model_picker_enabled"`
+			ModelPickerCategory       string `json:"model_picker_category"`
+			ContextWindow             *int64 `json:"context_window,omitempty"`
+			MaxContextWindow          *int64 `json:"max_context_window,omitempty"`
+			AutoCompactTokenLimit     *int64 `json:"auto_compact_token_limit,omitempty"`
+			EffectiveContextWindowPct *int64 `json:"effective_context_window_percent,omitempty"`
 		}
 		if err := json.Unmarshal(raw, &m); err != nil {
 			continue
@@ -1020,10 +1048,34 @@ func transformModelsResponse(body []byte) []byte {
 			defaultReasoning = &defaultLevel
 		}
 
-		var ctxWindow *int64
-		if m.Capabilities.Limits.MaxContextWindowTokens > 0 {
-			v := m.Capabilities.Limits.MaxContextWindowTokens
-			ctxWindow = &v
+		promptWindow := firstPositivePtr(
+			m.Capabilities.Limits.MaxPromptTokens,
+			m.Capabilities.Limits.MaxPrompt,
+			m.Capabilities.Limits.MaxInputTokens,
+		)
+		totalWindow := firstPositivePtr(
+			m.Capabilities.Limits.MaxContextWindowTokens,
+			m.Capabilities.Limits.ContextWindow,
+			m.Capabilities.Limits.ContextWindowTokens,
+		)
+
+		ctxWindow := m.ContextWindow
+		if ctxWindow == nil {
+			ctxWindow = promptWindow
+		}
+		if ctxWindow == nil {
+			ctxWindow = totalWindow
+		}
+		maxContextWindow := m.MaxContextWindow
+		if maxContextWindow == nil {
+			maxContextWindow = totalWindow
+		}
+		if maxContextWindow == nil {
+			maxContextWindow = ctxWindow
+		}
+		effectiveContextWindowPct := int64(95)
+		if m.EffectiveContextWindowPct != nil && *m.EffectiveContextWindowPct > 0 {
+			effectiveContextWindowPct = *m.EffectiveContextWindowPct
 		}
 
 		modalities := []string{"text"}
@@ -1058,6 +1110,9 @@ func transformModelsResponse(body []byte) []byte {
 			SupportsParallelToolCalls:   m.Capabilities.Supports.ParallelToolCalls,
 			SupportsImageDetailOriginal: false,
 			ContextWindow:               ctxWindow,
+			MaxContextWindow:            maxContextWindow,
+			AutoCompactTokenLimit:       m.AutoCompactTokenLimit,
+			EffectiveContextWindowPct:   effectiveContextWindowPct,
 			ExperimentalSupportedTools:  []string{},
 			InputModalities:             modalities,
 		}
