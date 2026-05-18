@@ -1,164 +1,57 @@
 # API Reference
 
+Concise endpoint map for Vekil's public API surface. Provider routing is always by public `model` ID; provider-specific upstream model/deployment names stay internal to the proxy. See [Provider Routing](provider-routing.md) for ownership rules and endpoint allowlists.
+
 ## `POST /v1/messages` (Anthropic)
 
 Anthropic Messages compatibility for the supported content and tool subset. Requests are translated to OpenAI Chat Completions, routed through the provider that owns the selected public model, and translated back to Anthropic.
 
-Supported features:
+Supported features include text/image/tool-use content blocks, system messages, tool choice, stop sequences, extended thinking via `thinking.type: "enabled"`, and streaming Anthropic SSE event translation.
 
-- text, image-input, and tool-use content blocks
-- system messages as string or content block array
-- tool definitions and tool choice: `auto`, `any`, `tool`
-- stop sequences
-- extended thinking via `thinking.type: "enabled"`
-- streaming Anthropic SSE event translation
-
-Model normalization:
-
-- dated suffixes are stripped automatically, for example `claude-sonnet-4-20250514`
-- hyphenated version numbers are mapped to dotted form, for example `claude-sonnet-4-5` to `claude-sonnet-4.5`
+Model normalization strips dated suffixes such as `claude-sonnet-4-20250514` and maps hyphenated version numbers to dotted form, for example `claude-sonnet-4-5` to `claude-sonnet-4.5`.
 
 ## `GET /v1/models`
 
-The proxy builds a merged model catalog across the active providers. It preserves the OpenAI-style `data` payload and also adds a Codex-compatible top-level `models` array.
-
-For Copilot-served models, the Codex-compatible `models` metadata uses Copilot's prompt limit as `context_window` and preserves the total context limit as `max_context_window`, so Codex-style clients calculate context remaining from the usable prompt budget.
+The proxy builds a merged catalog across active providers. It preserves OpenAI-style `data` and also adds a Codex-compatible top-level `models` array.
 
 ```bash
 curl http://localhost:1337/v1/models
 ```
 
-When multiple providers are configured:
+When multiple providers are configured, each public model ID must have one owner. Dynamic providers can be narrowed with `include_models` or `exclude_models`; static providers such as Azure OpenAI can expose a deployment under a different public ID while the proxy rewrites the upstream `model` field.
 
-- public model IDs stay unprefixed, for example `gpt-5.4`
-- each public ID must be owned by exactly one provider
-- startup fails if providers collide on the same model ID
-- dynamic providers such as Copilot or OpenAI Codex can be narrowed with `include_models` or `exclude_models`
-- static providers such as Azure OpenAI can expose a deployment under a different public ID while the proxy rewrites the upstream `model` field
+The exact catalog depends on configured providers and current upstream availability. Query `/v1/models` in your deployment instead of hard-coding one global model list.
 
-The exact catalog depends on your configured providers and current upstream availability. Query `/v1/models` in your own deployment instead of hard-coding one global model list.
-
-## `POST /v1beta/models/{model}:generateContent`, `POST /v1/models/{model}:generateContent`, and `POST /models/{model}:generateContent` (Gemini)
+## Gemini Compatibility Endpoints
 
 The proxy accepts all three Gemini route prefixes: `/v1beta/models/{model}:...`, `/v1/models/{model}:...`, and `/models/{model}:...`.
 
-Gemini is implemented as a translation layer, not a zero-copy passthrough layer. Gemini requests are translated to OpenAI Chat Completions, routed through the provider that owns the selected public model, and translated back into Gemini responses.
+Supported operations:
 
-The decoder accepts both standard Gemini camelCase fields and LiteLLM-style snake_case aliases such as `system_instruction`, `function_declarations`, `inline_data`, `max_output_tokens`, and `response_json_schema`.
+- `generateContent`
+- `streamGenerateContent`
+- `countTokens`
 
-Supported subset:
-
-- `systemInstruction.parts[].text`
-- `contents[].parts[].text`
-- `contents[].parts[].inlineData` for `image/*`
-- `contents[].parts[].functionCall`
-- `contents[].parts[].functionResponse`
-- `tools[].functionDeclarations` with `parameters` or `parametersJsonSchema`
-- `toolConfig.functionCallingConfig`
-- `generationConfig.temperature`, `topP`, `maxOutputTokens`, `stopSequences`
-- `generationConfig.responseMimeType`, `responseSchema`, `responseJsonSchema`
-- `generationConfig.presencePenalty`, `frequencyPenalty`, `seed`
-
-Accepted but ignored because upstream has no equivalent:
-
-- `generationConfig.topK`
-- `generationConfig.thinkingConfig`
-
-Explicit `501 UNIMPLEMENTED` cases include:
-
-- `generationConfig.candidateCount != 1`
-- `generationConfig.responseModalities`
-- `generationConfig.speechConfig`
-- `generationConfig.imageConfig`
-- `generationConfig.mediaResolution`
-- `generationConfig.responseLogprobs`
-- `generationConfig.logprobs`
-- `cachedContent`
-- `safetySettings`
-- multimodal `functionResponse.parts`
-- Gemini built-in tools such as `googleSearch`, `urlContext`, `codeExecution`, `googleMaps`, `computerUse`, and `enterpriseWebSearch`
-- non-image `inlineData`, `fileData`, and other non-text/media parts
-
-Validation failures (`400 INVALID_ARGUMENT`) include path/body model mismatches, malformed content parts, invalid function-call history, and unmatched `functionResponse` parts.
-
-## `POST /v1beta/models/{model}:streamGenerateContent`, `POST /v1/models/{model}:streamGenerateContent`, and `POST /models/{model}:streamGenerateContent` (Gemini)
-
-`streamGenerateContent` uses the same request body, translation rules, and validation behavior as `generateContent`, but returns data-only SSE frames instead of a single JSON response.
-
-Streaming behavior:
-
-- each SSE `data:` frame contains a partial Gemini `GenerateContentResponse` payload
-- text deltas are emitted as Gemini `candidates[].content.parts[].text` parts
-- tool calls are buffered until the proxy has valid JSON arguments, then emitted as Gemini `functionCall` parts
-- a final frame can include Gemini `finishReason` and `usageMetadata`
-
-Use `curl -N` or another SSE-capable client so streamed frames are not buffered locally.
-
-## `POST /v1beta/models/{model}:countTokens`, `POST /v1/models/{model}:countTokens`, and `POST /models/{model}:countTokens` (Gemini)
-
-`countTokens` uses the same accepted route prefixes as the other Gemini compatibility routes. It normalizes the Gemini request into the same prompt/tool payload used by `generateContent`, performs a minimal upstream `/chat/completions` probe, and returns `usage.prompt_tokens` as Gemini `totalTokens`. Normalized requests are cached for 60 seconds.
+Gemini compatibility is a translation layer over OpenAI Chat Completions. See [Gemini Compatibility](gemini.md) for supported fields, ignored fields, explicit `501 UNIMPLEMENTED` cases, validation behavior, and streaming details.
 
 ## `POST /v1/chat/completions` (OpenAI)
 
 Near zero-copy passthrough for requests without tools. When tools are present, the proxy injects `parallel_tool_calls: true`, forces upstream streaming for reliable parallel tool calls, and aggregates the result back to non-streaming JSON.
 
-When provider routing is configured, the request is routed by the public `model` ID. If the selected provider uses a different upstream model or deployment name, the proxy rewrites the outgoing `model` field before forwarding.
+The proxy enforces the selected model's configured endpoint allowlist before forwarding. If a model is `/responses`-only, `POST /v1/chat/completions` fails fast with `400` instead of probing an unsupported upstream route.
 
-The proxy also enforces the model's configured `supported_endpoints` before forwarding. If a model is exposed as `/responses`-only, `POST /v1/chat/completions` fails fast with `400` instead of probing an unsupported upstream route. The Azure `gpt-5.4-pro` example configuration and OpenAI Codex subscription models are set up this way.
+## Responses Compatibility Endpoints
 
-## `POST /v1/responses` and `GET /v1/responses` (OpenAI)
+Supported OpenAI/Codex-style routes:
 
-`POST /v1/responses` is a near zero-copy passthrough for the OpenAI Responses API. Proxy-owned synthetic compaction items are expanded back into normal context before forwarding so resumed Codex sessions continue through the standard `/v1/responses` path.
+- `POST /v1/responses` — near zero-copy Responses passthrough with proxy-owned compaction item expansion.
+- `GET /v1/responses` — optional Codex-style websocket bridge when `--responses-ws-enabled` or `RESPONSES_WS_ENABLED=true` is set.
+- `POST /v1/responses/compact` — compatibility shim that rewrites compact requests into upstream `/responses` calls and returns a proxy-owned opaque compaction item.
+- `POST /v1/memories/trace_summarize` — compatibility shim for trace and memory summaries.
 
-`POST /v1/responses` requests are accepted up to `64 MiB` so oversized session replays can reach the proxy-owned compaction fallback instead of failing at the default request-body limit. If upstream rejects a replay-like request with `413 Payload Too Large`, the proxy can compact the older prefix of an array `input` and retry the request with one proxy-owned checkpoint plus the most recent tail items. A request is treated as replay-like only when the body contains prior transcript evidence such as assistant/tool output items or a proxy-owned compaction checkpoint; `previous_response_id` and Codex turn/window headers alone do not trigger summarization. The fallback starts by preserving the configured tail, aligns the tail boundary so tool/function call-output pairs are not split across the checkpoint, and under `413` pressure dynamically halves the preserved tail (`12 -> 6 -> 3 -> 1`, or `len(input)-1` first for shorter replays) and retries until the compacted replay fits or only the latest item remains. The compaction calls share the same attempt budget and chunking controls as `/v1/responses/compact` (`--compact-upstream-chunk-bytes` and `--compact-upstream-max-attempts`). When a provider/model returns `413` for a compaction body, the proxy remembers the smaller target in memory for 30 minutes and starts later compaction fallbacks for that provider/model at the learned target, while the normal no-413 `/v1/responses` fast path remains unchanged.
+Responses requests are routed by public `model` ID. Unsupported-model fallbacks stay within the selected provider; the proxy does not silently switch providers. For responses-only Azure deployments, `POST /v1/responses` is the canonical inference path.
 
-Like chat completions, Responses requests are routed by the public `model` ID. Fallback retries for unsupported `/responses` models stay within the selected provider; the proxy does not silently switch providers.
-
-For responses-only Azure deployments such as the `gpt-5.4-pro` example configuration, this is the canonical inference path.
-
-Streaming Responses requests preserve upstream headers and are otherwise passed through directly. One narrow exception exists for `POST /v1/responses` with `stream: true`: if the first semantic SSE event is an immediate transient `response.failed` admission error such as `too_many_requests`, `model_overloaded`, `bad_gateway`, or `gateway_timeout`, the proxy translates that pre-commit failure into a normal HTTP error before flushing `200 OK`. All other streaming failures stay passthrough SSE.
-
-`GET /v1/responses` can upgrade to a websocket bridge for Codex-style clients when `--responses-ws-enabled` or `RESPONSES_WS_ENABLED=true` is set. The proxy:
-
-- accepts `response.create` frames, including websocket-only top-level fields such as `client_metadata` and `initiator`
-- uses supported `client_metadata` values to derive request headers, then strips websocket-only metadata before forwarding upstream
-- handles warmup and incremental follow-up requests locally
-- forwards the active turn to upstream HTTP `/responses`
-- relays streamed JSON events back as websocket text frames
-
-Websocket bridge behavior:
-
-- each websocket session is serialized: one active turn is processed at a time
-- Vekil does not multiplex turns or implement Copilot-style request superseding
-- closing the websocket ends the session; once Vekil observes the disconnect, it stops relaying and closes the upstream response body
-- upstream requests use the proxy streaming timeout rather than websocket/client-disconnect cancellation
-- history is stored append-only in memory
-- long sessions are auto-compacted into one proxy-owned checkpoint plus a recent tail
-- optional turn-state delta replay can be enabled with `--responses-ws-turn-state-delta`
-- if upstream rejects delta replay, the proxy automatically falls back to full replay
-- if the first streamed upstream event is a transient `response.failed` admission error, the bridge sends a wrapped websocket error frame instead of relaying the raw `response.failed` event
-
-This websocket bridge is a proxy transport adaptation layered over upstream HTTP `/responses`. It is not the same feature as provider-native websocket or realtime APIs such as Azure `/realtime`.
-
-See [configuration.md](configuration.md) for tuning flags.
-
-## `POST /v1/responses/compact`
-
-Compatibility shim for environments expecting `/responses/compact`. The proxy rewrites the request into a normal upstream `/responses` call with a compaction prompt, then returns:
-
-- retained `system`, `developer`, and `user` messages from the original compact request
-- one proxy-owned opaque `compaction` item whose `encrypted_content` can later be sent back to `/v1/responses` or `/v1/responses/compact`
-
-Requests to this endpoint are accepted up to `64 MiB` so large session histories can be compacted without tripping the default request-body limit. If the upstream `/responses` call still rejects the compact payload with `413 Payload Too Large`, the proxy retries by compacting the input in chunks, including splitting oversized individual input items or string inputs into synthetic historical-context chunks before merging the partial summaries into one final checkpoint. During this fallback only, oversized fixed fields such as large `tools` arrays or `text` schemas may be omitted from retry requests when needed to stay under upstream payload limits. The chunk target body size starts at `4 MiB` (sized below the empirically observed Copilot `/responses` cap of `5 MiB`; configurable via `--compact-upstream-chunk-bytes` / `COMPACT_UPSTREAM_CHUNK_BYTES`) and is halved on each recursive `413` (and eagerly halved when a sub-target body is itself rejected) down to a `64 KiB` floor; once the floor is reached the original `413` is returned to the caller. Total logical compaction calls across the chunk fanout are capped by `--compact-upstream-max-attempts` / `COMPACT_UPSTREAM_MAX_ATTEMPTS` (default `48`, sized to the 64 MiB inbound ceiling with one round of recursive halving) to bound per-request cost; each logical call may add one extra HTTP POST when the configured model is unsupported (model-fallback) and is also subject to the shared transport-retry policy on transient upstream failures, so this cap is a fanout safety net rather than a precise HTTP-POST limit. Once the proxy has resolved a fallback model on the first chunk, subsequent chunks reuse it directly and skip the model-fallback probe. Budget exhaustion surfaces the original `413`. If the inbound request has `input:[]` and the upstream still rejects it, the original `413` is returned rather than a fabricated empty checkpoint.
-
-If the requested model does not support the upstream Responses API, the proxy retries against a compatible fallback model discovered from `/models`.
-That fallback stays within the selected provider; the proxy does not silently switch providers.
-
-## `POST /v1/memories/trace_summarize`
-
-Compatibility shim that summarizes one or more traces into `{trace_summary, memory_summary}` objects using the upstream `/responses` endpoint plus a JSON-only summarization prompt.
-
-Requests to this endpoint are accepted up to `64 MiB` so larger trace bundles can be summarized in a single call.
+See [OpenAI Responses Compatibility](responses.md) for compaction, oversized replay, transient streaming failure, websocket semantics, and compatibility-shim details. See [Responses WebSocket Bridge](responses-websocket.md) for websocket tuning flags.
 
 ## `GET /healthz`
 

@@ -7,9 +7,14 @@ This folder is intentionally split into small, single-purpose files so humans an
 | File | Scope | Update When |
 |------|-------|-------------|
 | [`getting-started.md`](getting-started.md) | install, run, first authentication, deployment entry points | startup flow or distribution changes |
-| [`configuration.md`](configuration.md) | CLI flags, env vars, provider routing, tool optimizers, websocket tuning | flags, defaults, providers, tool optimizer behavior, or runtime knobs change |
+| [`configuration.md`](configuration.md) | configuration map, generic CLI flags/env vars, and Copilot header overrides | generic flags, env vars, or Copilot header defaults change |
+| [`provider-routing.md`](provider-routing.md) | provider auth, JSON/YAML routing examples, model ownership, endpoint allowlists | providers, routing behavior, auth, or model metadata changes |
+| [`tool-optimizers.md`](tool-optimizers.md) | optional shell command rewrite and tool-output reduction config | optimizer config or behavior changes |
+| [`responses-websocket.md`](responses-websocket.md) | Codex-style `GET /v1/responses` websocket bridge tuning | websocket bridge, auto-compaction, or compact retry knobs change |
 | [`clients.md`](clients.md) | copy-paste client examples | onboarding snippets or client compatibility changes |
-| [`api.md`](api.md) | endpoint behavior and compatibility notes | request/response semantics change |
+| [`api.md`](api.md) | concise endpoint map and compatibility links | public routes are added, removed, or renamed |
+| [`gemini.md`](gemini.md) | Gemini translation compatibility details | Gemini request/response translation behavior changes |
+| [`responses.md`](responses.md) | OpenAI Responses, compact, and memory shim details | Responses passthrough, compaction, or shim behavior changes |
 | [`architecture.md`](architecture.md) | package responsibilities and data flow | implementation boundaries or design decisions change |
 | [`menubar.md`](menubar.md) | macOS/Linux tray app usage | tray behavior or packaging changes |
 | [`development.md`](development.md) | build, test, benchmark, and CI workflows | local dev or CI commands change |

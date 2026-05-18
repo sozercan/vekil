@@ -1,24 +1,20 @@
 # macOS/Linux Tray App
 
-The repo includes a tray app for running the proxy without keeping a terminal open. It supports macOS and Linux. Published macOS app bundles also include Sparkle-based update checks.
+The tray app runs Vekil without a terminal. It supports macOS and Linux; published macOS app bundles also include Sparkle update checks.
 
-## Download And Run
-
-Install the macOS tray app from Homebrew:
+## macOS Install
 
 ```bash
 brew install --cask sozercan/repo/vekil
 ```
 
-> **Note:** The app is not Developer ID signed.
-> Clear extended attributes, including quarantine, with:
-> ```bash
-> xattr -cr /Applications/Vekil.app
-> ```
+The app is not Developer ID signed. If macOS quarantines it, run:
 
-Or download `vekil-macos-arm64.zip` from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest), unzip it, and open `Vekil.app`.
+```bash
+xattr -cr /Applications/Vekil.app
+```
 
-The published app bundle is currently available for Apple Silicon (`arm64`). On Intel Macs, build the app from source instead.
+You can also download `vekil-macos-arm64.zip` from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest), unzip it, and open `Vekil.app`. Published app bundles are currently Apple Silicon (`arm64`) only; build from source on Intel Macs.
 
 ## Build From Source
 
@@ -27,96 +23,59 @@ make build-app
 open "Vekil.app"
 ```
 
-`make build-app` downloads Sparkle 2.9.0 into `.build/sparkle/`, builds the macOS tray app with the `sparkle` build tag, embeds `Sparkle.framework`, and ad-hoc signs the finished app bundle.
-
-If `SPARKLE_PUBLIC_ED_KEY` is not set, the app still builds, but `Check for Updates…` is disabled because Sparkle cannot start without a public EdDSA key.
-
-To build a locally update-enabled app:
+`make build-app` downloads Sparkle, builds with the `sparkle` tag, embeds `Sparkle.framework`, and ad-hoc signs the bundle. Without `SPARKLE_PUBLIC_ED_KEY`, the app still builds but disables `Check for Updates…`.
 
 ```bash
 SPARKLE_PUBLIC_ED_KEY=your_public_key make build-app
-open "Vekil.app"
 ```
 
-## Features
+Release asset and updater-secret details live in [Development](development.md#release).
 
-- start/stop toggle from the tray menu
-- status icon: white robot when running, gray when stopped
-- current app version shown in the menu
-- choose and persist a `providers-config` JSON or YAML file from the menu
-- `GitHub Auth` submenu with current status and actions for `Sign In with GitHub`, `Use GitHub CLI Account`, and `Sign Out`
-- optional LaunchAgent integration for launch at login
-- tooltip showing running/stopped state and port
-- `Check for Updates…` in packaged macOS app builds
+## Menu Features
 
-## Authentication
+- start/stop the proxy
+- status icon and tooltip for running/stopped state
+- current app version
+- choose and persist a providers config file
+- return to default Copilot routing
+- GitHub auth actions: sign in, use GitHub CLI account, sign out
+- optional launch-at-login integration
+- Sparkle `Check for Updates…` in packaged macOS builds
 
-The tray menu shows a `GitHub Auth` parent item whose title reports the current auth state. Its submenu contains explicit actions:
+## Authentication And Providers
 
-- `Sign In with GitHub` starts Vekil's browser/device-code flow and stores Vekil-managed credentials in `~/.config/vekil/`.
-- `Use GitHub CLI Account` opts in to the account already authenticated by `gh auth login`. Vekil uses `gh auth token --hostname github.com` for Copilot access and keeps that token in memory only; it does not copy the GitHub CLI token into Vekil's `access-token` or `api-key.json` caches.
-- `Sign Out` clears Vekil's cached credentials, disables GitHub CLI auto sign-in, and records a signed-out state. The app will not silently fall back to GitHub CLI again until you choose `Use GitHub CLI Account` or run `vekil login --github-cli` / `vekil login --gh`.
+The `GitHub Auth` submenu exposes the same auth choices as the CLI:
 
-When the active providers config uses Copilot, start-up needs one of those GitHub auth sources or an explicit `COPILOT_GITHUB_TOKEN`. If auth is missing or expired, the app asks you to open `GitHub Auth` and choose `Sign In with GitHub` or `Use GitHub CLI Account` instead of starting a sign-in flow automatically.
+- `Sign In with GitHub` uses Vekil-managed browser/device-code auth.
+- `Use GitHub CLI Account` opts into the account from `gh auth login` and keeps the token in memory only.
+- `Sign Out` clears Vekil's cached credentials and disables silent GitHub CLI reuse until you opt back in.
 
-Provider-only configs that omit Copilot do not require GitHub auth; the proxy can keep running after `Sign Out` in that mode.
+Copilot-backed configs require GitHub auth or `COPILOT_GITHUB_TOKEN`. Provider-only configs that omit Copilot do not require GitHub auth and can keep running after sign-out. See [Provider Routing](provider-routing.md) for provider-specific auth details.
 
-## Providers Config
+Use `Choose Providers Config…` to select the same JSON/YAML file you would pass with `--providers-config`. The app saves the selected path for future launches and launch-at-login starts. `Use Default Copilot Routing` clears the saved path.
 
-Use `Choose Providers Config…` from the tray menu to select the same JSON or YAML file you would pass to the CLI with `--providers-config`.
+## Linux Tray
 
-- The app saves the selected path in its local app config so it is reused on the next launch and when started at login.
-- `Use Default Copilot Routing` clears the saved path and returns to zero-config startup, which currently uses the built-in Copilot provider.
-- If the selected config does not include a Copilot provider, the app no longer requires GitHub sign-in before starting the proxy.
-- Provider-specific extra state still comes from the normal locations, for example `~/.codex/auth.json` for `type: "openai-codex"`.
-
-## Release Assets
-
-The release workflow publishes two macOS updater assets:
-
-- `vekil-macos-arm64.zip`
-- `appcast.xml`
-
-It signs the appcast with `SPARKLE_PRIVATE_ED_KEY`, so repository releases need both `SPARKLE_PUBLIC_ED_KEY` and `SPARKLE_PRIVATE_ED_KEY` secrets configured.
-
-## Linux System Tray
-
-The same tray app runs on Linux using the DBus StatusNotifierItem protocol (supported by Waybar, KDE Plasma, GNOME with the AppIndicator extension, and others).
-
-### Build
+The same tray app runs on Linux using the DBus StatusNotifierItem protocol, supported by Waybar, KDE Plasma, GNOME with the AppIndicator extension, and others.
 
 ```bash
 make build-tray-linux
 ./vekil-tray
 ```
 
-No CGO or external libraries are required. To cross-compile for a different architecture:
+Cross-compile by setting `GOARCH`, for example:
 
 ```bash
 GOARCH=arm64 make build-tray-linux
 ```
 
-### Features
+Linux supports the same start/stop, status, auth, provider-config, and XDG autostart features as macOS. `Check for Updates…` is macOS-only.
 
-Same as macOS:
-
-- start/stop toggle from the tray
-- status icon: white robot when running, gray when stopped
-- current app version shown in the menu
-- optional XDG autostart for launch at login (`~/.config/autostart/vekil.desktop`)
-- tooltip showing running/stopped state and port
-
-The `Check for Updates...` menu item is not available on Linux.
-
-### Optional Dependencies
-
-Dialogs, notifications, and the sign-in flow use DBus (`org.freedesktop.Notifications`) directly -- no external tools are required when a notification daemon is running (GNOME, KDE, dunst, mako, swaync, etc.). If `zenity` or `kdialog` is installed, those are preferred for richer dialog windows.
-
-The clipboard and URL opening still require external tools:
+Dialogs, notifications, and sign-in use DBus directly when possible. Optional helpers improve desktop integration:
 
 | Feature | Packages |
 |---------|----------|
-| Dialogs | Built-in via DBus; optionally `zenity` (GTK) or `kdialog` (KDE) for richer UI |
-| Clipboard | `wl-clipboard` (Wayland), `xclip`, or `xsel` (X11) |
-| Open URLs | `xdg-open` (usually pre-installed via `xdg-utils`) |
-| Notifications | Built-in via DBus; falls back to `notify-send` |
+| Dialogs | `zenity` or `kdialog` for richer dialogs |
+| Clipboard | `wl-clipboard`, `xclip`, or `xsel` |
+| Open URLs | `xdg-open` |
+| Notifications | DBus notification daemon; `notify-send` fallback |
