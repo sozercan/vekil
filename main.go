@@ -237,7 +237,7 @@ type serveFlags struct {
 func registerServeFlags(fs *flag.FlagSet) serveFlags {
 	return serveFlags{
 		port:                            fs.String("port", getEnv("PORT", "1337"), "Listen port"),
-		host:                            fs.String("host", getEnv("HOST", "0.0.0.0"), "Listen host"),
+		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),

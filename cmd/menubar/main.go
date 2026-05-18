@@ -181,7 +181,7 @@ func startProxy() {
 	nextSrv, err := server.New(
 		authenticator,
 		log,
-		"0.0.0.0",
+		"127.0.0.1",
 		"1337",
 		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
 	)

@@ -8,5 +8,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /vekil .
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /vekil /vekil
+ENV HOST=0.0.0.0
 EXPOSE 1337
 ENTRYPOINT ["/vekil"]
