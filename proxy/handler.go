@@ -540,10 +540,6 @@ func clearCopilotHeaders(headers http.Header) {
 	}
 }
 
-func (h *ProxyHandler) setCopilotHeaders(req *http.Request, token string) {
-	setCopilotHeadersWithConfig(req, token, h.copilotHeaders)
-}
-
 func copilotEndpointUsesDefaultOpenAIIntent(endpoint string) bool {
 	switch strings.TrimSpace(endpoint) {
 	case "/chat/completions", "/responses":
