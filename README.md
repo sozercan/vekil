@@ -22,7 +22,7 @@ Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Az
 - **Gemini API** — Generate Content, Stream Generate Content, and Count Tokens
 - **OpenAI Chat Completions** and **Responses** APIs, including optional Codex websocket bridging
 - **Multi-provider routing** across GitHub Copilot, Azure OpenAI, and OpenAI Codex
-- **Optional tool optimizers** for opt-in shell command rewrites and tool-output reduction across supported API surfaces; see [Configuration](docs/configuration.md)
+- **Optional tool optimizers** for opt-in shell command rewrites and tool-output reduction across supported API surfaces; see [Tool Optimizers](docs/tool-optimizers.md)
 - **Codex compatibility shims** for compaction and memory summarization
 - **Streaming**, tool use, parallel tool calls, compressed request bodies, and auth/token caching
 
@@ -51,21 +51,24 @@ For explicit provider routing, start the proxy with `--providers-config /path/to
 - **Copilot** — `vekil login` uses Vekil-managed GitHub device-code sign-in; first proxy startup starts the same flow when needed. To use your current GitHub CLI account instead, opt in with `vekil login --github-cli` (or `--gh`). `vekil logout` clears cached auth and disables future silent `gh` reuse until you opt in again. `COPILOT_GITHUB_TOKEN` remains the explicit non-interactive override.
 - **OpenAI Codex** — requires `codex login` so `~/.codex/auth.json` exists. In Docker, mount your Codex home into `CODEX_HOME` (default `/home/nonroot/.codex`).
 
-For full configuration and routing details, see [Getting Started](docs/getting-started.md) and [Configuration](docs/configuration.md).
+For full setup details, see [Getting Started](docs/getting-started.md), [Configuration](docs/configuration.md), and [Provider Routing](docs/provider-routing.md).
 
 ## Docs
 
-Full documentation lives under [`docs/`](docs/README.md):
+Documentation lives under [`docs/`](docs/README.md); start with these:
 
-|                                            |                                     |
-| ------------------------------------------ | ----------------------------------- |
-| [Getting Started](docs/getting-started.md) | Install, run, first auth            |
-| [Configuration](docs/configuration.md)     | Flags, env vars, provider routing   |
-| [Client Examples](docs/clients.md)         | Copy-paste snippets per client      |
-| [API Reference](docs/api.md)               | Endpoint behavior and compatibility |
-| [Architecture](docs/architecture.md)       | Package layout and design notes     |
-| [Tray App](docs/menubar.md)                | macOS/Linux menubar usage           |
-| [Development](docs/development.md)         | Build, test, benchmarks, CI         |
+|                                                              |                                     |
+| ------------------------------------------------------------ | ----------------------------------- |
+| [Getting Started](docs/getting-started.md)                   | Install, run, first auth            |
+| [Configuration](docs/configuration.md)                       | Config map and generic flags        |
+| [Provider Routing](docs/provider-routing.md)                 | Provider auth and model ownership   |
+| [Tool Optimizers](docs/tool-optimizers.md)                   | Shell rewrite/output reduction      |
+| [Responses WebSocket](docs/responses-websocket.md)           | Websocket bridge tuning             |
+| [Client Examples](docs/clients.md)                           | Copy-paste snippets per client      |
+| [API Reference](docs/api.md)                                 | Endpoint behavior and compatibility |
+| [Architecture](docs/architecture.md)                         | Package layout and design notes     |
+| [Tray App](docs/menubar.md)                                  | macOS/Linux menubar usage           |
+| [Development](docs/development.md)                           | Build, test, benchmarks, CI         |
 
 ## Client Examples
 

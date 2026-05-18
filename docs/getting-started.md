@@ -2,30 +2,23 @@
 
 Vekil commonly runs in one of two modes:
 
-- **Zero-config mode**: start the proxy with no `--providers-config`; it uses the built-in GitHub Copilot upstream.
+- **Zero-config mode**: no `--providers-config`; uses the built-in GitHub Copilot upstream.
 - **Explicit provider routing**: pass `--providers-config` to expose any mix of `copilot`, `azure-openai`, and `openai-codex` providers behind the same local API surface.
 
-## Download From GitHub Releases
+## Install Or Build
 
-Download the latest binary for your platform from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest).
+Download a binary from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest). Release binaries are published for Linux, macOS, and Windows on `amd64` and `arm64`.
 
-Published binaries are available for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`. Windows release assets are published as `.exe` binaries. After downloading, make the binary executable if needed and run it locally.
-
-On Apple Silicon Macs, you can use the native macOS tray app:
+On Apple Silicon Macs, you can also install the tray app:
 
 ```bash
 brew install --cask sozercan/repo/vekil
+xattr -cr /Applications/Vekil.app  # only if macOS quarantine blocks launch
 ```
 
-> **Note:** The app is not signed.
-> Clear extended attributes, including quarantine, with:
-> ```bash
-> xattr -cr /Applications/Vekil.app
-> ```
+For tray app details, see [macOS/Linux Tray App](menubar.md).
 
-GitHub Releases also includes a `vekil-macos-arm64.zip` tray app bundle if you prefer a manual download.
-
-## Build From Source
+Build from source:
 
 ```bash
 go build -o vekil .
@@ -34,51 +27,35 @@ go build -o vekil .
 
 ## Docker
 
-Base container run:
+Base run:
 
 ```bash
-docker pull ghcr.io/sozercan/vekil:latest
 docker run -p 1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   ghcr.io/sozercan/vekil:latest
 ```
 
-The container image sets `HOST=0.0.0.0` so Docker port publishing can reach the proxy. Native binary and tray-app runs default to `127.0.0.1`; set `HOST=0.0.0.0` or pass `--host 0.0.0.0` only when you intentionally need a network-reachable listener.
+The image sets `HOST=0.0.0.0` so published Docker ports work. Native binary and tray-app runs default to `127.0.0.1`; bind to `0.0.0.0` only when you intentionally need network access.
 
-If you use explicit provider routing, mount your JSON or YAML config file and pass `--providers-config`:
-
-```bash
-docker run -p 1337:1337 \
-  -v ~/.config/vekil:/home/nonroot/.config/vekil \
-  -v /path/to/providers.json:/config/providers.json:ro \
-  ghcr.io/sozercan/vekil:latest \
-  --providers-config /config/providers.json
-```
-
-If your provider config includes `type: "openai-codex"`, also mount the Codex home read-only so the proxy can read `auth.json`:
+With explicit provider routing:
 
 ```bash
 docker run -p 1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
-  -v ~/.codex:/home/nonroot/.codex:ro \
-  -v /path/to/providers.json:/config/providers.json:ro \
+  -v /path/to/providers.yaml:/config/providers.yaml:ro \
   ghcr.io/sozercan/vekil:latest \
-  --providers-config /config/providers.json
+  --providers-config /config/providers.yaml
 ```
 
-If you customize `CODEX_HOME`, remember that the container reads the container-side path, not your host path. Mount your host Codex directory to the same path you set in `CODEX_HOME`, for example:
+If the config includes `type: "openai-codex"`, also mount the Codex home read-only:
 
 ```bash
-docker run -p 1337:1337 \
-  -e CODEX_HOME=/codex-home \
-  -v ~/.config/vekil:/home/nonroot/.config/vekil \
-  -v /path/to/custom-codex-home:/codex-home:ro \
-  -v /path/to/providers.json:/config/providers.json:ro \
-  ghcr.io/sozercan/vekil:latest \
-  --providers-config /config/providers.json
+-v ~/.codex:/home/nonroot/.codex:ro
 ```
 
-To build a local image instead of pulling GHCR:
+If you customize `CODEX_HOME`, set the container-side path and mount your host directory there. The published image supports `linux/amd64` and `linux/arm64`.
+
+Build a local image:
 
 ```bash
 docker build -t vekil .
@@ -86,10 +63,6 @@ docker run -p 1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   vekil
 ```
-
-The same extra mounts and `--providers-config` flag shown above also apply to a locally built image.
-
-The published image supports `linux/amd64` and `linux/arm64`.
 
 ## Kubernetes
 
@@ -101,47 +74,29 @@ kubectl apply -f k8s/vekil.yaml
 
 ## First Run And Authentication
 
-Startup behavior depends on the providers that are active in your deployment.
+Startup behavior depends on active providers. For the full auth matrix, see [Provider Authentication](provider-routing.md#provider-authentication).
 
 ### GitHub Copilot
 
-If you are using zero-config startup or an explicit `type: "copilot"` provider, the proxy first looks for GitHub authentication in this order:
+Zero-config startup and explicit `type: "copilot"` providers need GitHub Copilot auth. The proxy checks, in order:
 
-1. `COPILOT_GITHUB_TOKEN` when set explicitly for CI or another non-interactive environment.
-2. Vekil's cached GitHub access token in `~/.config/vekil/`.
-3. An authenticated GitHub CLI via `gh auth token --hostname github.com`, but only after you explicitly opt in with `vekil login --github-cli` or `vekil login --gh`.
+1. explicit `COPILOT_GITHUB_TOKEN`
+2. Vekil-managed cached credentials in `~/.config/vekil/`
+3. GitHub CLI auth, but only after `vekil login --github-cli` or `vekil login --gh`
 
-If none of those sources is available, Vekil starts GitHub's device-code flow on first run:
-
-1. Visit the URL shown in the terminal.
-2. Enter the one-time code.
-3. Authorize the application.
-
-You can also run `vekil login` ahead of time to start the same device-code flow. If an existing Vekil login is still refreshable, `vekil login` reuses it and prints `Already logged in.`; use `vekil login --force` to skip that refresh check and force a new device-code sign-in.
-
-To use the account that is already authenticated with the GitHub CLI, run `vekil login --github-cli` or the shorter `vekil login --gh`. This records an explicit preference to use `gh` for future Copilot access. Vekil uses the GitHub CLI token in memory only and does not copy it into Vekil's `access-token` or `api-key.json` caches.
-
-Device-code sign-in caches Vekil-managed tokens in `~/.config/vekil/` and refreshes them automatically before expiry. GitHub CLI-backed sign-in records only the explicit `gh` opt-in preference on disk; each process asks `gh` for the token and keeps it in memory only.
-
-Signing out with `vekil logout` clears Vekil's cached credentials, disables GitHub CLI auto sign-in, and records a signed-out state so Vekil will not automatically borrow GitHub CLI credentials again. Run `vekil login --github-cli` to opt back into GitHub CLI auth, sign in with the device-code flow to use Vekil-managed OAuth, or set `COPILOT_GITHUB_TOKEN` explicitly for a non-interactive session.
-
-If `HTTP_PROXY` or `HTTPS_PROXY` points at a local loopback proxy that is not running, the auth flow automatically retries GitHub requests directly.
+If none are available, first startup starts GitHub's device-code flow. You can also run `vekil login` ahead of time, `vekil login --force` for a fresh device-code sign-in, or `vekil logout` to clear Vekil-managed auth and disable silent GitHub CLI reuse.
 
 ### Azure OpenAI
 
-Azure OpenAI credentials are configured per provider entry, usually with `api_key` or `api_key_env` in the providers config file. There is no separate interactive login flow in the proxy.
+Configure Azure credentials in the provider entry with `api_key` or `api_key_env`. There is no interactive Azure login flow.
 
 ### OpenAI Codex
 
-When your providers config includes `type: "openai-codex"`, first sign in with the OpenAI Codex CLI using ChatGPT auth so `~/.codex/auth.json` exists. The proxy reads that file directly and refreshes the access token as needed.
+Run `codex login` first so `~/.codex/auth.json` exists. Set `CODEX_HOME` if your Codex home lives elsewhere. API-key auth and OS keychain-backed credentials are not read by the proxy.
 
-Codex API-key auth and OS keychain-backed credentials are not read by the proxy. If your Codex home is not `~/.codex`, set `CODEX_HOME` before starting the proxy. In Docker, `CODEX_HOME` is resolved inside the container, so your bind mount target must match the in-container `CODEX_HOME` path.
-
-If your provider config does not include Copilot, startup skips GitHub authentication entirely. See [configuration.md](configuration.md) for provider routing examples and provider-specific knobs.
+If your provider config omits Copilot, startup skips GitHub authentication entirely.
 
 ## Verify The Proxy Is Up
-
-After the proxy is running and any first-run authentication has completed, check the basic health and model endpoints:
 
 ```bash
 curl http://localhost:1337/healthz
@@ -149,8 +104,6 @@ curl http://localhost:1337/readyz
 curl http://localhost:1337/v1/models
 ```
 
-What each endpoint tells you:
-
-- `/healthz` confirms the process is listening and serving HTTP. It should return `{"status":"ok"}`.
-- `/readyz` verifies the proxy can authenticate to and probe the configured upstream providers. It should return `{"status":"ready"}`; `503` usually means auth or upstream reachability still needs attention.
-- `/v1/models` shows the merged public model catalog that clients will see. Use it to confirm the models you expect are actually exposed before testing a client.
+- `/healthz` confirms the process is serving HTTP.
+- `/readyz` verifies provider auth and upstream probes.
+- `/v1/models` shows the merged public model catalog clients will see.

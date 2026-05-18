@@ -29,9 +29,14 @@ Documentation is intentionally split under `docs/` into small, single-purpose fi
 | `README.md` | Short landing page only |
 | `docs/README.md` | Documentation index and doc map |
 | `docs/getting-started.md` | install, run, first auth, deployment entry points |
-| `docs/configuration.md` | flags, env vars, provider routing, tool optimizers, websocket tuning |
+| `docs/configuration.md` | configuration map, generic flags/env vars, Copilot header overrides |
+| `docs/provider-routing.md` | provider auth, JSON/YAML routing, model ownership, endpoint allowlists |
+| `docs/tool-optimizers.md` | optional shell command rewrite and tool-output reduction config |
+| `docs/responses-websocket.md` | Codex-style websocket bridge tuning and compaction knobs |
 | `docs/clients.md` | copy-paste client examples |
-| `docs/api.md` | endpoint behavior and compatibility notes |
+| `docs/api.md` | concise endpoint map and compatibility links |
+| `docs/gemini.md` | Gemini translation compatibility details |
+| `docs/responses.md` | OpenAI Responses, compact, and memory shim details |
 | `docs/architecture.md` | package boundaries and design notes |
 | `docs/menubar.md` | macOS/Linux tray app usage |
 | `docs/development.md` | build, test, benchmark, CI |
