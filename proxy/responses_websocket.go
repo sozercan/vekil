@@ -76,6 +76,7 @@ type responsesWebSocketSession struct {
 	ctx            context.Context
 	baseHeaders    http.Header
 	turnState      string
+	turnMetadata   string
 	lastResponseID string
 	lastSignature  string
 	historyItems   []json.RawMessage
@@ -140,6 +141,13 @@ func responsesInputContainsCompactionTrigger(input []json.RawMessage) bool {
 // streaming /responses HTTP request and the SSE data payloads are forwarded back
 // as websocket text frames.
 func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
+	if !h.responsesWebSocketConfig().Enabled {
+		w.Header().Set("Connection", "Upgrade")
+		w.Header().Set("Upgrade", "websocket")
+		http.Error(w, http.StatusText(http.StatusUpgradeRequired), http.StatusUpgradeRequired)
+		return
+	}
+
 	if !websocket.IsWebSocketUpgrade(r) {
 		w.Header().Set("Connection", "Upgrade")
 		w.Header().Set("Upgrade", "websocket")
@@ -202,7 +210,6 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 	baseHeaders := make(http.Header)
 	for _, name := range []string{
 		"X-Codex-Beta-Features",
-		"X-Codex-Turn-Metadata",
 		"OpenAI-Beta",
 		"session_id",
 		"session-id",
@@ -225,10 +232,12 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 	}
 
 	return &responsesWebSocketSession{
-		conn:         conn,
-		ctx:          r.Context(),
-		baseHeaders:  baseHeaders,
-		turnState:    strings.TrimSpace(r.Header.Get("X-Codex-Turn-State")),
+		conn:        conn,
+		ctx:         r.Context(),
+		baseHeaders: baseHeaders,
+		// Codex treats X-Codex-Turn-State as server-issued, turn-scoped
+		// sticky-routing state. This bridge only trusts state it received from
+		// upstream during this proxy-owned websocket session.
 		toolContexts: NewToolExecutionContextStore(),
 		toolScope:    "responses-ws:" + uuid.NewString(),
 	}
@@ -324,6 +333,11 @@ func (r *responsesWebSocketCreateRequest) upstreamBody(inputSegments ...[]json.R
 }
 
 func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) error {
+	s.syncTurnMetadata(request)
+	if request.PreviousResponseID == "" {
+		s.turnState = ""
+	}
+
 	plan, err := s.planRequest(h, request)
 	if err != nil {
 		s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
@@ -520,6 +534,39 @@ func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCr
 	}
 
 	return headers
+}
+
+func (s *responsesWebSocketSession) syncTurnMetadata(request *responsesWebSocketCreateRequest) {
+	turnMetadata := strings.TrimSpace(s.requestHeaders(request, false).Get("X-Codex-Turn-Metadata"))
+	turnKey := responsesWebSocketTurnMetadataKey(turnMetadata)
+	if turnKey == s.turnMetadata {
+		return
+	}
+	if s.turnState != "" {
+		s.turnState = ""
+	}
+	s.turnMetadata = turnKey
+}
+
+func responsesWebSocketTurnMetadataKey(turnMetadata string) string {
+	turnMetadata = strings.TrimSpace(turnMetadata)
+	if turnMetadata == "" {
+		return ""
+	}
+
+	var metadata map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(turnMetadata), &metadata); err == nil {
+		var turnID string
+		if rawTurnID, ok := metadata["turn_id"]; ok && json.Unmarshal(rawTurnID, &turnID) == nil {
+			if turnID = strings.TrimSpace(turnID); turnID != "" {
+				// Codex can enrich turn metadata during a turn while keeping
+				// the turn_id stable; only a different turn_id resets state.
+				return "turn_id:" + turnID
+			}
+		}
+	}
+
+	return "metadata:" + turnMetadata
 }
 
 func responsesWebSocketMetadataHeaderName(key string) string {

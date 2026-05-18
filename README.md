@@ -20,7 +20,7 @@ Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Az
 
 - **Anthropic Messages API** — drop-in compatible with Claude clients
 - **Gemini API** — Generate Content, Stream Generate Content, and Count Tokens
-- **OpenAI Chat Completions** and **Responses** APIs, including Codex websocket bridging
+- **OpenAI Chat Completions** and **Responses** APIs, including optional Codex websocket bridging
 - **Multi-provider routing** across GitHub Copilot, Azure OpenAI, and OpenAI Codex
 - **Optional tool optimizers** for opt-in shell command rewrites and tool-output reduction across supported API surfaces; see [Configuration](docs/configuration.md)
 - **Codex compatibility shims** for compaction and memory summarization

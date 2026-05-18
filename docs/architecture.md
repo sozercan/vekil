@@ -41,8 +41,8 @@
 - Provider endpoint support is explicit. `models[].endpoints` is an allowlist, so do not expose `/chat/completions` or other routes for a provider/model until that upstream capability is verified.
 - Gemini is a translation path like Anthropic, not a passthrough path.
 - OpenAI Chat Completions is near-zero-copy except where forced streaming is needed for tool reliability.
-- OpenAI Responses compatibility is partly proxy-owned, especially for Codex compaction and websocket bridging.
-- The Codex websocket bridge is transport adaptation over upstream HTTP `/responses`, not a claim that the selected provider has native websocket or realtime support.
+- OpenAI Responses compatibility is partly proxy-owned, especially for Codex compaction and optional websocket bridging.
+- The Codex websocket bridge is transport adaptation over upstream HTTP `/responses`, not a claim that the selected provider has native websocket or realtime support; it is disabled by default and must be enabled explicitly.
 - Tool optimizers are opt-in and fail-open. They must remain disabled by default and must not change default passthrough behavior when unconfigured or when an external optimizer fails.
 - Azure OpenAI support is implemented as an OpenAI-compatible provider behind the existing proxy surface; Azure deployment names are internal to provider config.
 - OpenAI Codex subscription support is a Responses-only dynamic provider backed by Codex CLI ChatGPT credentials.

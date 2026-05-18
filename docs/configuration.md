@@ -364,7 +364,7 @@ Vekil's built-in hint resolver may emit `git-diff`, `git-status`, `pytest`, `car
 
 ## WebSocket Session Tuning
 
-These settings affect the Codex-style `GET /v1/responses` websocket bridge.
+These settings affect the Codex-style `GET /v1/responses` websocket bridge. The bridge is disabled by default; when disabled, websocket upgrade attempts receive `426 Upgrade Required` so Codex-style clients can fall back to HTTP `/v1/responses`.
 
 Important:
 
@@ -374,6 +374,7 @@ Important:
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
+| `--responses-ws-enabled` | `RESPONSES_WS_ENABLED` | `false` | Enable the proxy-owned Codex websocket bridge on `GET /v1/responses` |
 | `--responses-ws-turn-state-delta` | `RESPONSES_WS_TURN_STATE_DELTA` | `false` | Experimental: if upstream returns `X-Codex-Turn-State`, try replaying only the newest delta input on the next turn |
 | `--responses-ws-disable-auto-compact` | `RESPONSES_WS_DISABLE_AUTO_COMPACT` | `false` | Disable automatic session-history compaction |
 | `--responses-ws-auto-compact-max-items` | `RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS` | `8` | Auto-compact when history item count exceeds this threshold |
@@ -388,6 +389,7 @@ Important:
 ```bash
 ./vekil \
   --log-level debug \
+  --responses-ws-enabled \
   --responses-ws-turn-state-delta \
   --responses-ws-auto-compact-max-items 64 \
   --responses-ws-auto-compact-max-bytes 524288 \

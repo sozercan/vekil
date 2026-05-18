@@ -242,6 +242,7 @@ func benchmarkResponsesSessionWSSLongHistoryFollowup(b *testing.B, enableDelta b
 		writeBenchmarkResponsesStream(b, w, turnState)
 	})
 	handler.responsesWS = ResponsesWebSocketConfig{
+		Enabled:            true,
 		TurnStateDelta:     enableDelta,
 		DisableAutoCompact: true,
 	}
@@ -328,6 +329,8 @@ func newResponsesTransportBenchmarkEnv(b *testing.B) responsesTransportBenchmark
 
 func newResponsesTransportBenchmarkEnvWithHandler(b *testing.B, handler *ProxyHandler) responsesTransportBenchmarkEnv {
 	b.Helper()
+
+	handler.responsesWS.Enabled = true
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/responses", handler.HandleResponses)

@@ -165,6 +165,29 @@ func TestServeFlagsCopilotHeaderCLIOverridesEnv(t *testing.T) {
 	}
 }
 
+func TestServeFlagsResponsesWebSocketDisabledByDefault(t *testing.T) {
+	serve := parseServeFlagsForTest(t)
+	cfg := serve.responsesWebSocketConfig()
+
+	if cfg.Enabled {
+		t.Fatal("responses websocket bridge should be disabled by default")
+	}
+}
+
+func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
+	t.Setenv("RESPONSES_WS_ENABLED", "true")
+
+	envServe := parseServeFlagsForTest(t)
+	if !envServe.responsesWebSocketConfig().Enabled {
+		t.Fatal("RESPONSES_WS_ENABLED=true should enable responses websocket bridge")
+	}
+
+	cliServe := parseServeFlagsForTest(t, "--responses-ws-enabled=false")
+	if cliServe.responsesWebSocketConfig().Enabled {
+		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string

@@ -19,13 +19,39 @@ import (
 )
 
 func TestHandleResponsesWebSocket_UpgradeRequiredWithoutUpgradeHeaders(t *testing.T) {
-	handler := &ProxyHandler{}
+	handler := &ProxyHandler{responsesWS: ResponsesWebSocketConfig{Enabled: true}}
 	req := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
 	w := httptest.NewRecorder()
 
 	handler.HandleResponsesWebSocket(w, req)
 
 	resp := w.Result()
+	if resp.StatusCode != http.StatusUpgradeRequired {
+		t.Fatalf("expected 426, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("Upgrade") != "websocket" {
+		t.Fatalf("expected Upgrade header to be websocket, got %q", resp.Header.Get("Upgrade"))
+	}
+}
+
+func TestHandleResponsesWebSocket_DisabledByDefaultReturnsUpgradeRequired(t *testing.T) {
+	handler := &ProxyHandler{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, resp, err := websocket.DefaultDialer.Dial(url, nil)
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if err == nil {
+		t.Fatal("expected websocket dial to fail when bridge is disabled")
+	}
+	if resp == nil {
+		t.Fatalf("expected HTTP response for disabled websocket bridge: %v", err)
+	}
 	if resp.StatusCode != http.StatusUpgradeRequired {
 		t.Fatalf("expected 426, got %d", resp.StatusCode)
 	}
@@ -218,6 +244,56 @@ func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 
 	if got := upstreamRequests.Load(); got != 1 {
 		t.Fatalf("expected 1 upstream request, got %d", got)
+	}
+}
+
+func TestHandleResponsesWebSocket_ForwardsCustomTurnMetadataFields(t *testing.T) {
+	turnMetadata := `{"turn_id":"turn-123","fiber_run_id":"fiber-123","origin":"app-server"}`
+	var gotTurnMetadata string
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		gotTurnMetadata = r.Header.Get("X-Codex-Turn-Metadata")
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	request["client_metadata"] = map[string]string{
+		"x-codex-turn-metadata": turnMetadata,
+	}
+
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(gotTurnMetadata), &parsed); err != nil {
+		t.Fatalf("expected forwarded turn metadata to be valid JSON, got %q: %v", gotTurnMetadata, err)
+	}
+	if parsed["turn_id"] != "turn-123" {
+		t.Fatalf("expected turn_id to be preserved, got %q", parsed["turn_id"])
+	}
+	if parsed["fiber_run_id"] != "fiber-123" {
+		t.Fatalf("expected custom fiber_run_id to be preserved, got %q", parsed["fiber_run_id"])
+	}
+	if parsed["origin"] != "app-server" {
+		t.Fatalf("expected custom origin to be preserved, got %q", parsed["origin"])
 	}
 }
 
@@ -1640,6 +1716,488 @@ func TestHandleResponsesWebSocket_TurnStateDeltaReplayUsesOnlyCurrentInputAndIgn
 	}
 }
 
+func TestHandleResponsesWebSocket_TurnStateDeltaIgnoresUpgradeTurnStateBeforeUpstreamState(t *testing.T) {
+	var upstreamRequestsMu sync.Mutex
+	upstreamRequests := make([]map[string]interface{}, 0, 1)
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Codex-Turn-State"); got != "" {
+			t.Fatalf("expected stale upgrade turn state not to be forwarded, got %q", got)
+		}
+
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+		upstreamRequestsMu.Lock()
+		upstreamRequests = append(upstreamRequests, body)
+		upstreamRequestsMu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		TurnStateDelta:     true,
+		DisableAutoCompact: true,
+	}
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, http.Header{
+		"X-Codex-Turn-State": []string{"stale-upgrade-turn-state"},
+	})
+	defer func() { _ = conn.Close() }()
+
+	warmup := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "warmup from this workspace"},
+			},
+		},
+	})
+	warmup["generate"] = false
+	if err := conn.WriteJSON(warmup); err != nil {
+		t.Fatalf("failed to write warmup request: %v", err)
+	}
+
+	warmupCreated := mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+
+	followUp := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "follow up"},
+			},
+		},
+	})
+	followUp["previous_response_id"] = websocketResponseID(t, warmupCreated)
+	if err := conn.WriteJSON(followUp); err != nil {
+		t.Fatalf("failed to write follow-up request: %v", err)
+	}
+
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+
+	requests := snapshotResponsesWebSocketRequests(&upstreamRequestsMu, upstreamRequests)
+	if len(requests) != 1 {
+		t.Fatalf("expected exactly one upstream request after local warmup, got %d", len(requests))
+	}
+
+	input := upstreamInputItems(t, requests[0])
+	if len(input) != 2 {
+		t.Fatalf("expected full replay after local warmup, got %d input items", len(input))
+	}
+	if got := inputTextFromMessage(t, input[0]); got != "warmup from this workspace" {
+		t.Fatalf("expected replay to include local warmup from this workspace, got %q", got)
+	}
+	if got := inputTextFromMessage(t, input[1]); got != "follow up" {
+		t.Fatalf("expected replay to include follow-up, got %q", got)
+	}
+}
+
+func TestHandleResponsesWebSocket_TurnStateDeltaClearsForRootLocalWarmup(t *testing.T) {
+	var upstreamRequestsMu sync.Mutex
+	upstreamRequests := make([]map[string]interface{}, 0, 2)
+	upstreamTurnStates := make([]string, 0, 2)
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+
+		upstreamRequestsMu.Lock()
+		upstreamRequests = append(upstreamRequests, body)
+		upstreamTurnStates = append(upstreamTurnStates, r.Header.Get("X-Codex-Turn-State"))
+		requestCount := len(upstreamRequests)
+		upstreamRequestsMu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch requestCount {
+		case 1:
+			w.Header().Set("X-Codex-Turn-State", "turn-state-1")
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		case 2:
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		default:
+			t.Fatalf("unexpected upstream request count %d", requestCount)
+		}
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		TurnStateDelta:     true,
+		DisableAutoCompact: true,
+	}
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	first := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "previous root"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(first); err != nil {
+		t.Fatalf("failed to write first request: %v", err)
+	}
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+
+	warmup := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "new root warmup"},
+			},
+		},
+	})
+	warmup["generate"] = false
+	if err := conn.WriteJSON(warmup); err != nil {
+		t.Fatalf("failed to write root warmup request: %v", err)
+	}
+	warmupCreated := mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+
+	followUp := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "follow up"},
+			},
+		},
+	})
+	followUp["previous_response_id"] = websocketResponseID(t, warmupCreated)
+	if err := conn.WriteJSON(followUp); err != nil {
+		t.Fatalf("failed to write follow-up request: %v", err)
+	}
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+
+	requests := snapshotResponsesWebSocketRequests(&upstreamRequestsMu, upstreamRequests)
+	if len(requests) != 2 {
+		t.Fatalf("expected 2 upstream requests, got %d", len(requests))
+	}
+
+	upstreamRequestsMu.Lock()
+	turnStates := append([]string(nil), upstreamTurnStates...)
+	upstreamRequestsMu.Unlock()
+	if turnStates[0] != "" {
+		t.Fatalf("expected first root request to omit turn state, got %q", turnStates[0])
+	}
+	if turnStates[1] != "" {
+		t.Fatalf("expected follow-up after root warmup to clear previous turn state, got %q", turnStates[1])
+	}
+
+	followUpInput := upstreamInputItems(t, requests[1])
+	if len(followUpInput) != 2 {
+		t.Fatalf("expected full replay after root warmup, got %d input items", len(followUpInput))
+	}
+	if got := inputTextFromMessage(t, followUpInput[0]); got != "new root warmup" {
+		t.Fatalf("expected replay to include root warmup, got %q", got)
+	}
+	if got := inputTextFromMessage(t, followUpInput[1]); got != "follow up" {
+		t.Fatalf("expected replay to include follow-up, got %q", got)
+	}
+}
+
+func TestHandleResponsesWebSocket_IgnoresUpgradeTurnMetadataWithoutCreateMetadata(t *testing.T) {
+	var upstreamRequests atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests.Add(1)
+		if got := r.Header.Get("X-Codex-Turn-Metadata"); got != "" {
+			t.Fatalf("expected stale upgrade turn metadata not to be forwarded, got %q", got)
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, http.Header{
+		"X-Codex-Turn-Metadata": []string{`{"turn_id":"stale-turn","workspaces":{"/wrong/repo":{"has_changes":true}}}`},
+	})
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "current workspace request"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write request: %v", err)
+	}
+
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+
+	if got := upstreamRequests.Load(); got != 1 {
+		t.Fatalf("expected 1 upstream request, got %d", got)
+	}
+}
+
+func TestHandleResponsesWebSocket_TurnStateDeltaClearsWhenTurnMetadataChanges(t *testing.T) {
+	var upstreamRequestsMu sync.Mutex
+	upstreamRequests := make([]map[string]interface{}, 0, 2)
+	upstreamTurnStates := make([]string, 0, 2)
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+
+		upstreamRequestsMu.Lock()
+		upstreamRequests = append(upstreamRequests, body)
+		upstreamTurnStates = append(upstreamTurnStates, r.Header.Get("X-Codex-Turn-State"))
+		requestCount := len(upstreamRequests)
+		upstreamRequestsMu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch requestCount {
+		case 1:
+			w.Header().Set("X-Codex-Turn-State", "turn-state-1")
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-1\",\"content\":[{\"type\":\"output_text\",\"text\":\"first output\"}]}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		case 2:
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		default:
+			t.Fatalf("unexpected upstream request count %d", requestCount)
+		}
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		TurnStateDelta:     true,
+		DisableAutoCompact: true,
+	}
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	first := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "first turn"},
+			},
+		},
+	})
+	first["client_metadata"] = map[string]string{
+		"x-codex-turn-metadata": `{"turn_id":"turn-1"}`,
+	}
+	if err := conn.WriteJSON(first); err != nil {
+		t.Fatalf("failed to write first request: %v", err)
+	}
+
+	firstCreated := mustReadWebSocketJSONSkipMetadata(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+
+	second := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "second turn"},
+			},
+		},
+	})
+	second["previous_response_id"] = websocketResponseID(t, firstCreated)
+	second["client_metadata"] = map[string]string{
+		"x-codex-turn-metadata": `{"turn_id":"turn-2"}`,
+	}
+	if err := conn.WriteJSON(second); err != nil {
+		t.Fatalf("failed to write second request: %v", err)
+	}
+
+	_ = mustReadWebSocketJSONSkipMetadata(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+
+	requests := snapshotResponsesWebSocketRequests(&upstreamRequestsMu, upstreamRequests)
+	if len(requests) != 2 {
+		t.Fatalf("expected 2 upstream requests, got %d", len(requests))
+	}
+
+	upstreamRequestsMu.Lock()
+	turnStates := append([]string(nil), upstreamTurnStates...)
+	upstreamRequestsMu.Unlock()
+	if len(turnStates) != 2 {
+		t.Fatalf("expected 2 recorded turn-state headers, got %d", len(turnStates))
+	}
+	if turnStates[0] != "" {
+		t.Fatalf("expected first request to omit turn state, got %q", turnStates[0])
+	}
+	if turnStates[1] != "" {
+		t.Fatalf("expected second turn to clear previous turn state, got %q", turnStates[1])
+	}
+
+	secondInput := upstreamInputItems(t, requests[1])
+	if len(secondInput) != 3 {
+		t.Fatalf("expected changed turn metadata to force full replay, got %d items", len(secondInput))
+	}
+	if got := inputTextFromMessage(t, secondInput[0]); got != "first turn" {
+		t.Fatalf("expected replay to include first turn input, got %q", got)
+	}
+	if got := inputTextFromMessage(t, secondInput[1]); got != "first output" {
+		t.Fatalf("expected replay to include first turn output, got %q", got)
+	}
+	if got := inputTextFromMessage(t, secondInput[2]); got != "second turn" {
+		t.Fatalf("expected replay to include second turn input, got %q", got)
+	}
+}
+
+func TestHandleResponsesWebSocket_TurnStateDeltaKeepsStateWhenTurnMetadataEnrichesSameTurn(t *testing.T) {
+	var upstreamRequestsMu sync.Mutex
+	upstreamRequests := make([]map[string]interface{}, 0, 2)
+	upstreamTurnStates := make([]string, 0, 2)
+	upstreamTurnMetadata := make([]string, 0, 2)
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+
+		upstreamRequestsMu.Lock()
+		upstreamRequests = append(upstreamRequests, body)
+		upstreamTurnStates = append(upstreamTurnStates, r.Header.Get("X-Codex-Turn-State"))
+		upstreamTurnMetadata = append(upstreamTurnMetadata, r.Header.Get("X-Codex-Turn-Metadata"))
+		requestCount := len(upstreamRequests)
+		upstreamRequestsMu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch requestCount {
+		case 1:
+			w.Header().Set("X-Codex-Turn-State", "turn-state-1")
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-1\",\"content\":[{\"type\":\"output_text\",\"text\":\"first output\"}]}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		case 2:
+			if got := r.Header.Get("X-Codex-Turn-State"); got != "turn-state-1" {
+				t.Fatalf("expected enriched same-turn metadata to keep turn state, got %q", got)
+			}
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		default:
+			t.Fatalf("unexpected upstream request count %d", requestCount)
+		}
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		TurnStateDelta:     true,
+		DisableAutoCompact: true,
+	}
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	firstMetadata := `{"turn_id":"turn-1","thread_source":"user","sandbox":"workspace-write"}`
+	first := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "first turn"},
+			},
+		},
+	})
+	first["client_metadata"] = map[string]string{
+		"x-codex-turn-metadata": firstMetadata,
+	}
+	if err := conn.WriteJSON(first); err != nil {
+		t.Fatalf("failed to write first request: %v", err)
+	}
+
+	firstCreated := mustReadWebSocketJSONSkipMetadata(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+
+	enrichedMetadata := `{"turn_id":"turn-1","thread_source":"user","sandbox":"workspace-write","workspaces":[{"root_path":"/tmp/repo","latest_git_commit_hash":"abc123","associated_remote_urls":["git@github.com:openai/codex.git"],"has_changes":true}]}`
+	second := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "follow up"},
+			},
+		},
+	})
+	second["previous_response_id"] = websocketResponseID(t, firstCreated)
+	second["client_metadata"] = map[string]string{
+		"x-codex-turn-metadata": enrichedMetadata,
+	}
+	if err := conn.WriteJSON(second); err != nil {
+		t.Fatalf("failed to write second request: %v", err)
+	}
+
+	_ = mustReadWebSocketJSONSkipMetadata(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+
+	requests := snapshotResponsesWebSocketRequests(&upstreamRequestsMu, upstreamRequests)
+	if len(requests) != 2 {
+		t.Fatalf("expected 2 upstream requests, got %d", len(requests))
+	}
+
+	upstreamRequestsMu.Lock()
+	turnStates := append([]string(nil), upstreamTurnStates...)
+	turnMetadata := append([]string(nil), upstreamTurnMetadata...)
+	upstreamRequestsMu.Unlock()
+	if len(turnStates) != 2 {
+		t.Fatalf("expected 2 recorded turn-state headers, got %d", len(turnStates))
+	}
+	if turnStates[0] != "" {
+		t.Fatalf("expected first request to omit turn state, got %q", turnStates[0])
+	}
+	if turnStates[1] != "turn-state-1" {
+		t.Fatalf("expected second request to keep turn state, got %q", turnStates[1])
+	}
+	if turnMetadata[0] != firstMetadata {
+		t.Fatalf("expected first request metadata %q, got %q", firstMetadata, turnMetadata[0])
+	}
+	if turnMetadata[1] != enrichedMetadata {
+		t.Fatalf("expected second request metadata %q, got %q", enrichedMetadata, turnMetadata[1])
+	}
+
+	secondInput := upstreamInputItems(t, requests[1])
+	if len(secondInput) != 1 {
+		t.Fatalf("expected same-turn metadata enrichment to keep delta replay, got %d input items", len(secondInput))
+	}
+	if got := inputTextFromMessage(t, secondInput[0]); got != "follow up" {
+		t.Fatalf("expected delta replay to include only follow-up input, got %q", got)
+	}
+}
+
 func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing.T) {
 	var upstreamRequestsMu sync.Mutex
 	upstreamRequests := make([]map[string]interface{}, 0, 3)
@@ -2428,6 +2986,7 @@ func TestHandleResponsesWebSocket_ForwardsSessionAndClientRequestHeaders(t *test
 
 func startResponsesWebSocketProxyServer(t *testing.T, handler *ProxyHandler) *httptest.Server {
 	t.Helper()
+	handler.responsesWS.Enabled = true
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
 	server := httptest.NewServer(mux)

@@ -56,6 +56,18 @@ func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
 	return headers
 }
 
+func responsesUpstreamHeaders(extraHeaders http.Header, stream bool) http.Header {
+	if !stream {
+		return extraHeaders
+	}
+	headers := extraHeaders.Clone()
+	if headers == nil {
+		headers = make(http.Header, 1)
+	}
+	headers.Set("Accept", "text/event-stream")
+	return headers
+}
+
 // HandleResponses handles POST /v1/responses by forwarding the request to
 // Copilot's responses endpoint with only auth headers injected.
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
@@ -78,6 +90,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(bodyBytes, &partial)
 	isStreaming := partial.Stream != nil && *partial.Stream
+	upstreamHeaders := responsesUpstreamHeaders(extraHeaders, isStreaming)
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(isStreaming)
 	defer upstreamCancel()
@@ -97,7 +110,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := h.postResponsesWithHeaders(upstreamCtx, bodyBytes, extraHeaders)
+	resp, err := h.postResponsesWithHeaders(upstreamCtx, bodyBytes, upstreamHeaders)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "responses"), logger.Err(err))
@@ -112,7 +125,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
 		return
 	}
-	resp, err = h.maybeRetryCompactedResponsesRequest(upstreamCtx, bodyBytes, extraHeaders, resp)
+	resp, err = h.maybeRetryCompactedResponsesRequest(upstreamCtx, bodyBytes, extraHeaders, upstreamHeaders, resp)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "responses"), logger.Err(err))
@@ -2025,7 +2038,7 @@ func applyResolvedCompactModel(bodyBytes []byte, budget *compactBudget) []byte {
 	return rewritten
 }
 
-func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, resp *http.Response) (*http.Response, error) {
+func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, bodyBytes []byte, extraHeaders, upstreamHeaders http.Header, resp *http.Response) (*http.Response, error) {
 	if resp == nil || resp.StatusCode != http.StatusRequestEntityTooLarge {
 		return resp, nil
 	}
@@ -2052,7 +2065,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, 
 		h.log.Debug("responses 413 compaction skipped", logger.F("reason", "input_not_array"), logger.Err(err))
 		return resp, nil
 	}
-	if !isLikelyResponsesReplay(input, previousResponseID, extraHeaders) {
+	if !isLikelyResponsesReplay(input) {
 		h.log.Info("responses 413 compaction skipped",
 			logger.F("reason", "not_replay_like"),
 			logger.F("input_items", len(input)),
@@ -2135,7 +2148,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, 
 		}
 		h.log.Info("retrying responses request with compacted history after 413", fields...)
 
-		retryResp, retryErr := h.postResponsesWithHeaders(ctx, retryBody, extraHeaders)
+		retryResp, retryErr := h.postResponsesWithHeaders(ctx, retryBody, upstreamHeaders)
 		if retryErr != nil {
 			h.log.Debug("responses 413 retry request failed", logger.F("keep_tail", keepTail), logger.Err(retryErr))
 			return lastResp, nil
@@ -2182,32 +2195,13 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, 
 	return lastResp, nil
 }
 
-func isLikelyResponsesReplay(input []json.RawMessage, previousResponseID string, extraHeaders http.Header) bool {
-	if strings.TrimSpace(previousResponseID) != "" {
-		return true
-	}
-	if hasResponsesReplayHeader(extraHeaders) {
-		return true
-	}
+func isLikelyResponsesReplay(input []json.RawMessage) bool {
+	// Headers and previous_response_id can be present on delta/current requests.
+	// Only compact after 413 when the body itself contains prior transcript
+	// evidence; otherwise a large current user payload could be summarized away.
 	for _, item := range input {
 		if responsesInputItemHasReplayMarker(item) {
 			return true
-		}
-	}
-	return false
-}
-
-func hasResponsesReplayHeader(headers http.Header) bool {
-	for _, name := range []string{
-		"X-Codex-Turn-State",
-		"X-Codex-Turn-Metadata",
-		"X-Codex-Parent-Thread-Id",
-		"X-Codex-Window-Id",
-	} {
-		for _, value := range headers.Values(name) {
-			if strings.TrimSpace(value) != "" {
-				return true
-			}
 		}
 	}
 	return false

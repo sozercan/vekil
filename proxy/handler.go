@@ -119,6 +119,7 @@ type CopilotHeaderProfilesConfig struct {
 // ResponsesWebSocketConfig controls websocket-session state management for
 // Codex-style GET /v1/responses clients.
 type ResponsesWebSocketConfig struct {
+	Enabled             bool
 	TurnStateDelta      bool
 	DisableAutoCompact  bool
 	AutoCompactMaxItems int
@@ -139,6 +140,7 @@ func DefaultCopilotHeaderConfig() CopilotHeaderConfig {
 
 func DefaultResponsesWebSocketConfig() ResponsesWebSocketConfig {
 	return ResponsesWebSocketConfig{
+		Enabled:             false,
 		AutoCompactMaxItems: defaultResponsesWSCompactMaxItems,
 		AutoCompactMaxBytes: defaultResponsesWSCompactMaxBytes,
 		AutoCompactKeepTail: defaultResponsesWSCompactKeepTail,
@@ -536,10 +538,6 @@ func clearCopilotHeaders(headers http.Header) {
 	} {
 		headers.Del(header)
 	}
-}
-
-func (h *ProxyHandler) setCopilotHeaders(req *http.Request, token string) {
-	setCopilotHeadersWithConfig(req, token, h.copilotHeaders)
 }
 
 func copilotEndpointUsesDefaultOpenAIIntent(endpoint string) bool {
