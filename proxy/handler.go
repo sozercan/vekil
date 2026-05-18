@@ -119,6 +119,7 @@ type CopilotHeaderProfilesConfig struct {
 // ResponsesWebSocketConfig controls websocket-session state management for
 // Codex-style GET /v1/responses clients.
 type ResponsesWebSocketConfig struct {
+	Enabled             bool
 	TurnStateDelta      bool
 	DisableAutoCompact  bool
 	AutoCompactMaxItems int
@@ -139,6 +140,7 @@ func DefaultCopilotHeaderConfig() CopilotHeaderConfig {
 
 func DefaultResponsesWebSocketConfig() ResponsesWebSocketConfig {
 	return ResponsesWebSocketConfig{
+		Enabled:             false,
 		AutoCompactMaxItems: defaultResponsesWSCompactMaxItems,
 		AutoCompactMaxBytes: defaultResponsesWSCompactMaxBytes,
 		AutoCompactKeepTail: defaultResponsesWSCompactKeepTail,

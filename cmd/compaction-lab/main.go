@@ -476,7 +476,11 @@ func newLabEnv() (*labEnv, error) {
 		auth.NewTestAuthenticator("lab-token"),
 		logger.New(logger.LevelError),
 		proxy.WithCopilotBaseURL(upstream.URL),
-		proxy.WithResponsesWebSocketConfig(proxy.ResponsesWebSocketConfig{TurnStateDelta: true, DisableAutoCompact: true}),
+		proxy.WithResponsesWebSocketConfig(proxy.ResponsesWebSocketConfig{
+			Enabled:            true,
+			TurnStateDelta:     true,
+			DisableAutoCompact: true,
+		}),
 	)
 	if err != nil {
 		upstream.Close()

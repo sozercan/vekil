@@ -769,7 +769,7 @@ func TestHandleResponses_RoutesConfiguredAzureModelAndPreservesPriorityServiceTi
 
 func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	var gotOpenAIBeta, gotLegacySessionID, gotSessionID, gotThreadID, gotClientRequestID, gotInstallationID string
-	var gotInferenceCallID, gotTurnMetadata, gotParentThreadID, gotWindowID, gotSubagent, gotMemgen string
+	var gotInferenceCallID, gotTurnState, gotTurnMetadata, gotParentThreadID, gotWindowID, gotSubagent, gotMemgen string
 	var gotAttestation, gotTimingMetrics, gotTraceparent, gotTracestate string
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		gotOpenAIBeta = r.Header.Get("OpenAI-Beta")
@@ -779,6 +779,7 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 		gotClientRequestID = r.Header.Get("X-Client-Request-Id")
 		gotInstallationID = r.Header.Get("X-Codex-Installation-Id")
 		gotInferenceCallID = r.Header.Get("X-Codex-Inference-Call-Id")
+		gotTurnState = r.Header.Get("X-Codex-Turn-State")
 		gotTurnMetadata = r.Header.Get("X-Codex-Turn-Metadata")
 		gotParentThreadID = r.Header.Get("X-Codex-Parent-Thread-Id")
 		gotWindowID = r.Header.Get("X-Codex-Window-Id")
@@ -801,6 +802,7 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	req.Header.Set("X-Client-Request-Id", "client-req-456")
 	req.Header.Set("X-Codex-Installation-Id", "install-789")
 	req.Header.Set("X-Codex-Inference-Call-Id", "inference-123")
+	req.Header.Set("X-Codex-Turn-State", "turn-state-123")
 	req.Header.Set("X-Codex-Turn-Metadata", `{"turn_id":"turn-1"}`)
 	req.Header.Set("X-Codex-Parent-Thread-Id", "parent-123")
 	req.Header.Set("X-Codex-Window-Id", "thread-abc-123:2")
@@ -840,6 +842,9 @@ func TestHandleResponses_ForwardsCodexClientHeaders(t *testing.T) {
 	}
 	if gotInferenceCallID != "inference-123" {
 		t.Fatalf("expected X-Codex-Inference-Call-Id to be forwarded, got %q", gotInferenceCallID)
+	}
+	if gotTurnState != "turn-state-123" {
+		t.Fatalf("expected X-Codex-Turn-State to be forwarded, got %q", gotTurnState)
 	}
 	if gotTurnMetadata != `{"turn_id":"turn-1"}` {
 		t.Fatalf("expected X-Codex-Turn-Metadata to be forwarded, got %q", gotTurnMetadata)
@@ -3919,7 +3924,8 @@ func TestHandleResponses_Skips413CompactionForPureUserOnlyInput(t *testing.T) {
 	})
 
 	reqBody, err := json.Marshal(map[string]interface{}{
-		"model": "gpt-5.4",
+		"model":                "gpt-5.4",
+		"previous_response_id": "resp-prev-current",
 		"input": []interface{}{
 			map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "Here is a huge current spec"}}},
 			map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "Implement it exactly"}}},
@@ -3931,6 +3937,10 @@ func TestHandleResponses_Skips413CompactionForPureUserOnlyInput(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Codex-Turn-Metadata", `{"turn_id":"turn-first","turn_started_at_unix_ms":1760000000000}`)
+	req.Header.Set("X-Codex-Window-Id", "thread-first:0")
+	req.Header.Set("X-Codex-Parent-Thread-Id", "parent-first")
+	req.Header.Set("X-Codex-Turn-State", "state-from-prior-request")
 	w := httptest.NewRecorder()
 
 	handler.HandleResponses(w, req)
@@ -4084,20 +4094,10 @@ func TestIsLikelyResponsesReplay(t *testing.T) {
 	}
 
 	tests := []struct {
-		name               string
-		input              []json.RawMessage
-		previousResponseID string
-		headers            http.Header
-		want               bool
+		name  string
+		input []json.RawMessage
+		want  bool
 	}{
-		{
-			name: "previous response id",
-			input: []json.RawMessage{
-				raw(map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "continue"}}}),
-			},
-			previousResponseID: "resp-1",
-			want:               true,
-		},
 		{
 			name: "assistant message marks replay",
 			input: []json.RawMessage{
@@ -4121,14 +4121,6 @@ func TestIsLikelyResponsesReplay(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "codex header marks replay",
-			input: []json.RawMessage{
-				raw(map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "continue"}}}),
-			},
-			headers: http.Header{"X-Codex-Turn-State": []string{"state"}},
-			want:    true,
-		},
-		{
 			name: "pure user-only input is not replay-like",
 			input: []json.RawMessage{
 				raw(map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "current spec"}}}),
@@ -4148,7 +4140,7 @@ func TestIsLikelyResponsesReplay(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isLikelyResponsesReplay(tt.input, tt.previousResponseID, tt.headers); got != tt.want {
+			if got := isLikelyResponsesReplay(tt.input); got != tt.want {
 				t.Fatalf("isLikelyResponsesReplay() = %v, want %v", got, tt.want)
 			}
 		})
@@ -7845,6 +7837,9 @@ func TestOpenAIResponsesStreaming(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/responses" {
 			t.Errorf("expected path /responses, got %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Accept"); got != "text/event-stream" {
+			t.Fatalf("expected streaming responses request to send Accept text/event-stream, got %q", got)
 		}
 		body, _ := io.ReadAll(r.Body)
 		var upstreamReq map[string]json.RawMessage
