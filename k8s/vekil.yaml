@@ -19,6 +19,8 @@ spec:
           ports:
             - containerPort: 1337
           env:
+            - name: HOST
+              value: "0.0.0.0"
             - name: PORT
               value: "1337"
             - name: TOKEN_DIR

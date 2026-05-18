@@ -43,6 +43,8 @@ docker run -p 1337:1337 \
   ghcr.io/sozercan/vekil:latest
 ```
 
+The container image sets `HOST=0.0.0.0` so Docker port publishing can reach the proxy. Native binary and tray-app runs default to `127.0.0.1`; set `HOST=0.0.0.0` or pass `--host 0.0.0.0` only when you intentionally need a network-reachable listener.
+
 If you use explicit provider routing, mount your JSON or YAML config file and pass `--providers-config`:
 
 ```bash
