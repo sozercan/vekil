@@ -10,7 +10,7 @@ Vekil supports two runtime patterns:
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--port` | `PORT` | `1337` | Listen port |
-| `--host` | `HOST` | `0.0.0.0` | Listen host |
+| `--host` | `HOST` | `127.0.0.1` | Listen host |
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
