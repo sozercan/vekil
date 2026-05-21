@@ -212,6 +212,7 @@ func runLogout(args []string) {
 
 type serveFlags struct {
 	port                            *string
+	quiet                           *bool
 	host                            *string
 	tokenDir                        *string
 	providersConfigPath             *string
@@ -237,6 +238,7 @@ type serveFlags struct {
 func registerServeFlags(fs *flag.FlagSet) serveFlags {
 	return serveFlags{
 		port:                            fs.String("port", getEnv("PORT", "1337"), "Listen port"),
+		quiet:                           fs.Bool("quiet", false, "Suppress non-error output"),
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
@@ -282,11 +284,18 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 	}
 }
 
+func (f serveFlags) loggerLevel() logger.Level {
+	if f.quiet != nil && *f.quiet {
+		return logger.LevelError
+	}
+	return logger.ParseLevel(*f.logLevel)
+}
+
 func runServe() {
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+	log := logger.New(serve.loggerLevel())
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {

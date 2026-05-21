@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -185,6 +186,41 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	cliServe := parseServeFlagsForTest(t, "--responses-ws-enabled=false")
 	if cliServe.responsesWebSocketConfig().Enabled {
 		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
+	}
+}
+
+func TestServeFlagsQuietSuppressesInfoLogs(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet", "--log-level", "debug")
+	if got := serve.loggerLevel(); got != logger.LevelError {
+		t.Fatalf("loggerLevel() = %v, want %v", got, logger.LevelError)
+	}
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+	defer func() {
+		os.Stderr = oldStderr
+	}()
+
+	log := logger.New(serve.loggerLevel())
+	log.Info("suppressed info")
+	log.Error("visible error")
+
+	_ = w.Close()
+
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	output := buf.String()
+	if strings.Contains(output, "suppressed info") {
+		t.Fatalf("quiet logger emitted info log: %q", output)
+	}
+	if !strings.Contains(output, "visible error") {
+		t.Fatalf("quiet logger did not emit error log: %q", output)
 	}
 }
 
