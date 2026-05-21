@@ -3,16 +3,18 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sozercan/vekil/auth"
-	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -102,15 +104,15 @@ func TestGetEnvWarnsOnInvalidValue(t *testing.T) {
 	const envKey = "TEST_WARN_VAR"
 
 	// Capture stderr to verify warning is emitted.
-	old := os.Stderr
+	oldWriter := envWarningWriter
 	r, w, _ := os.Pipe()
-	os.Stderr = w
+	envWarningWriter = w
 
 	t.Setenv(envKey, "not-a-bool")
 	getEnvBool(envKey, false)
 
 	_ = w.Close()
-	os.Stderr = old
+	envWarningWriter = oldWriter
 
 	var buf bytes.Buffer
 	_, _ = buf.ReadFrom(r)
@@ -190,19 +192,46 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 }
 
 func TestServeFlagsQuietSuppressesNonErrorOutput(t *testing.T) {
-	serve := parseServeFlagsForTest(t, "--quiet", "--log-level", "debug")
-
-	output := captureStderr(t, func() {
-		log := logger.New(serve.loggerLevel())
-		log.Info("suppressed info")
-		log.Error("kept error")
-	})
-
-	if strings.Contains(output, "suppressed info") {
-		t.Fatalf("quiet logger should suppress info output, got %q", output)
+	if os.Getenv("VEKIL_HELPER_QUIET_SERVE") == "1" {
+		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+		os.Args = []string{
+			"vekil",
+			"--quiet",
+			"--providers-config",
+			filepath.Join(t.TempDir(), "missing-providers.yaml"),
+		}
+		main()
+		return
 	}
-	if !strings.Contains(output, "kept error") {
-		t.Fatalf("quiet logger should keep error output, got %q", output)
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestServeFlagsQuietSuppressesNonErrorOutput$")
+	cmd.Env = append(os.Environ(),
+		"VEKIL_HELPER_QUIET_SERVE=1",
+		"RESPONSES_WS_ENABLED=not-a-bool",
+	)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected subprocess exit error, got %v", err)
+	}
+	if exitErr.ExitCode() == 0 {
+		t.Fatal("expected subprocess to fail when providers config is missing")
+	}
+
+	output := stderr.String()
+	if strings.Contains(output, `warning: ignoring invalid RESPONSES_WS_ENABLED="not-a-bool"`) {
+		t.Fatalf("quiet serve should suppress non-error warning output, got %q", output)
+	}
+	if !strings.Contains(output, "failed to load providers config") {
+		t.Fatalf("quiet serve should keep error output, got %q", output)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("expected no stdout output, got %q", stdout.String())
 	}
 }
 

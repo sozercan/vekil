@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -291,7 +292,35 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 	}
 }
 
+var envWarningWriter io.Writer = os.Stderr
+
+func quietRequested(args []string) bool {
+	for _, arg := range args {
+		switch {
+		case arg == "--":
+			return false
+		case arg == "--quiet" || arg == "-quiet":
+			return true
+		case strings.HasPrefix(arg, "--quiet="):
+			v, err := strconv.ParseBool(strings.TrimPrefix(arg, "--quiet="))
+			return err == nil && v
+		case strings.HasPrefix(arg, "-quiet="):
+			v, err := strconv.ParseBool(strings.TrimPrefix(arg, "-quiet="))
+			return err == nil && v
+		}
+	}
+	return false
+}
+
 func runServe() {
+	previousEnvWarningWriter := envWarningWriter
+	if quietRequested(os.Args[1:]) {
+		envWarningWriter = io.Discard
+	}
+	defer func() {
+		envWarningWriter = previousEnvWarningWriter
+	}()
+
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
 
@@ -365,7 +394,7 @@ func getEnvBool(key string, fallback bool) bool {
 	}
 	parsed, err := strconv.ParseBool(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
+		_, _ = fmt.Fprintf(envWarningWriter, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -378,7 +407,7 @@ func getEnvInt(key string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
+		_, _ = fmt.Fprintf(envWarningWriter, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -391,7 +420,7 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	}
 	parsed, err := time.ParseDuration(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
+		_, _ = fmt.Fprintf(envWarningWriter, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
