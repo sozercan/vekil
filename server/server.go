@@ -100,11 +100,14 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)
 
+	metrics := &metrics{}
+	mux.HandleFunc("GET /metrics", metrics.handle)
+
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{
 		httpServer: &http.Server{
 			Addr:         addr,
-			Handler:      mux,
+			Handler:      metrics.wrap(mux),
 			ReadTimeout:  30 * time.Second,
 			WriteTimeout: handler.ServerWriteTimeout(),
 			IdleTimeout:  120 * time.Second,
