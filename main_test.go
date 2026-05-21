@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -185,6 +187,47 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	cliServe := parseServeFlagsForTest(t, "--responses-ws-enabled=false")
 	if cliServe.responsesWebSocketConfig().Enabled {
 		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
+	}
+}
+
+func TestServeFlagsQuietSuppressesNonErrorOutput(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet", "--log-level", "debug")
+
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	os.Stderr = w
+	defer func() {
+		os.Stderr = old
+	}()
+
+	log := logger.New(serve.loggerLevel())
+	log.Info("suppressed info")
+	log.Error("visible error")
+
+	_ = w.Close()
+
+	var output bytes.Buffer
+	if _, err := io.Copy(&output, r); err != nil {
+		t.Fatalf("io.Copy() error = %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("log lines = %d, want 1; output=%q", len(lines), output.String())
+	}
+
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v; line=%q", err, lines[0])
+	}
+	if got := entry["level"]; got != "error" {
+		t.Fatalf("logged level = %v, want error", got)
+	}
+	if got := entry["msg"]; got != "visible error" {
+		t.Fatalf("logged msg = %v, want visible error", got)
 	}
 }
 
