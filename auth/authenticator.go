@@ -36,7 +36,9 @@ var accessTokenEnvVars = []string{
 }
 
 var (
-	githubCLITokenTimeout = 5 * time.Second
+	githubCLITokenTimeout           = 5 * time.Second
+	deviceCodeOutput      io.Writer = os.Stderr
+	deviceCodeOutputMu    sync.RWMutex
 
 	githubCLICommonPaths = []string{
 		"/opt/homebrew/bin/gh",
@@ -52,6 +54,31 @@ var (
 	// but can no longer be exchanged for a Copilot token.
 	ErrInvalidAccessToken = errors.New("invalid access token")
 )
+
+// SetDeviceCodeOutput overrides where non-error device-code prompts are
+// written. It returns a restore function for scoped use.
+func SetDeviceCodeOutput(w io.Writer) func() {
+	if w == nil {
+		w = io.Discard
+	}
+
+	deviceCodeOutputMu.Lock()
+	prev := deviceCodeOutput
+	deviceCodeOutput = w
+	deviceCodeOutputMu.Unlock()
+
+	return func() {
+		deviceCodeOutputMu.Lock()
+		deviceCodeOutput = prev
+		deviceCodeOutputMu.Unlock()
+	}
+}
+
+func currentDeviceCodeOutput() io.Writer {
+	deviceCodeOutputMu.RLock()
+	defer deviceCodeOutputMu.RUnlock()
+	return deviceCodeOutput
+}
 
 // Authenticator manages GitHub OAuth and Copilot API tokens.
 // It handles the device code flow, token caching to disk, and automatic
@@ -515,7 +542,7 @@ func (a *Authenticator) deviceCodeFlow(ctx context.Context) error {
 		return err
 	}
 
-	_, _ = fmt.Fprintf(os.Stderr, "Please visit %s and enter code: %s\n", dcResp.VerificationURI, dcResp.UserCode)
+	_, _ = fmt.Fprintf(currentDeviceCodeOutput(), "Please visit %s and enter code: %s\n", dcResp.VerificationURI, dcResp.UserCode)
 
 	return a.pollForAuthorization(ctx, dcResp)
 }

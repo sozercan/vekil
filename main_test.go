@@ -230,6 +230,41 @@ func TestServeFlagsQuietSuppressesNonErrorOutput(t *testing.T) {
 	}
 }
 
+func TestConfigureServeNonErrorOutputQuietSuppressesServeWarnings(t *testing.T) {
+	const envKey = "RESPONSES_WS_ENABLED"
+	t.Setenv(envKey, "notabool")
+
+	var normal bytes.Buffer
+	restore := setServeNonErrorOutput(&normal)
+	_ = getEnvBool(envKey, false)
+	restore()
+
+	want := fmt.Sprintf("warning: ignoring invalid %s=%q", envKey, "notabool")
+	if got := normal.String(); !strings.Contains(got, want) {
+		t.Fatalf("normal output missing warning %q: %q", want, got)
+	}
+
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe(): %v", err)
+	}
+	os.Stderr = w
+
+	restore = configureServeNonErrorOutput([]string{"--quiet"})
+	_ = getEnvBool(envKey, false)
+	restore()
+
+	_ = w.Close()
+	os.Stderr = old
+
+	var quiet bytes.Buffer
+	_, _ = quiet.ReadFrom(r)
+	if got := quiet.String(); got != "" {
+		t.Fatalf("quiet output should suppress serve warning: %q", got)
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string

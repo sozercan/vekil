@@ -1,15 +1,18 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1429,5 +1432,62 @@ func TestRefreshToken_AutoDeviceFlowReturnsTransientRefreshError(t *testing.T) {
 	}
 	if got := err.Error(); got != "copilot token request failed with status 502: gateway unavailable" {
 		t.Fatalf("unexpected error: %q", got)
+	}
+}
+
+func TestSetDeviceCodeOutputSuppressesPrompt(t *testing.T) {
+	a := &Authenticator{
+		client: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.String() != deviceCodeURL {
+					t.Fatalf("unexpected request URL: %s", req.URL.String())
+				}
+
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body: io.NopCloser(strings.NewReader(
+						`{"device_code":"dc_test","user_code":"ABCD-1234","verification_uri":"https://github.com/login/device","expires_in":0,"interval":0}`,
+					)),
+				}, nil
+			}),
+		},
+	}
+
+	run := func(quiet bool) string {
+		t.Helper()
+
+		old := os.Stderr
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe(): %v", err)
+		}
+		os.Stderr = w
+
+		output := io.Writer(os.Stderr)
+		if quiet {
+			output = io.Discard
+		}
+		restore := SetDeviceCodeOutput(output)
+		err = a.deviceCodeFlow(context.Background())
+		restore()
+		if err == nil || !strings.Contains(err.Error(), "device code flow timed out") {
+			t.Fatalf("deviceCodeFlow() error = %v, want timeout", err)
+		}
+
+		_ = w.Close()
+		os.Stderr = old
+
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(r)
+		return buf.String()
+	}
+
+	if got := run(false); !strings.Contains(got, "Please visit https://github.com/login/device and enter code: ABCD-1234") {
+		t.Fatalf("normal output missing device-code prompt: %q", got)
+	}
+
+	if got := run(true); got != "" {
+		t.Fatalf("quiet output should suppress device-code prompt: %q", got)
 	}
 }

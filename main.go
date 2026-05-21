@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,6 +20,8 @@ import (
 )
 
 type cliCommand int
+
+var serveNonErrorOutput io.Writer = os.Stderr
 
 const (
 	cliCommandServe cliCommand = iota
@@ -293,6 +296,9 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 }
 
 func runServe() {
+	restoreOutput := configureServeNonErrorOutput(os.Args[1:])
+	defer restoreOutput()
+
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
 
@@ -352,6 +358,54 @@ func runServe() {
 	log.Info("server stopped")
 }
 
+func configureServeNonErrorOutput(args []string) func() {
+	output := io.Writer(os.Stderr)
+	if serveQuietRequested(args) {
+		output = io.Discard
+	}
+
+	restoreServeOutput := setServeNonErrorOutput(output)
+	restoreAuthOutput := auth.SetDeviceCodeOutput(output)
+
+	return func() {
+		restoreAuthOutput()
+		restoreServeOutput()
+	}
+}
+
+func serveQuietRequested(args []string) bool {
+	for _, arg := range args {
+		switch arg {
+		case "--quiet", "-quiet":
+			return true
+		}
+
+		if strings.HasPrefix(arg, "--quiet=") || strings.HasPrefix(arg, "-quiet=") {
+			_, value, found := strings.Cut(arg, "=")
+			if !found {
+				continue
+			}
+			parsed, err := strconv.ParseBool(value)
+			return err == nil && parsed
+		}
+	}
+
+	return false
+}
+
+func setServeNonErrorOutput(w io.Writer) func() {
+	if w == nil {
+		w = io.Discard
+	}
+
+	prev := serveNonErrorOutput
+	serveNonErrorOutput = w
+
+	return func() {
+		serveNonErrorOutput = prev
+	}
+}
+
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -366,7 +420,7 @@ func getEnvBool(key string, fallback bool) bool {
 	}
 	parsed, err := strconv.ParseBool(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
+		_, _ = fmt.Fprintf(serveNonErrorOutput, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -379,7 +433,7 @@ func getEnvInt(key string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
+		_, _ = fmt.Fprintf(serveNonErrorOutput, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -392,7 +446,7 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	}
 	parsed, err := time.ParseDuration(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
+		_, _ = fmt.Fprintf(serveNonErrorOutput, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
