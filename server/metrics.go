@@ -18,7 +18,7 @@ type metrics struct {
 
 func (m *metrics) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/metrics" {
+		if isUntrackedMetricsPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -49,4 +49,13 @@ func (m *metrics) handle(w http.ResponseWriter, _ *http.Request) {
 		requestsInflightMetricName,
 		m.requestsInflight.Load(),
 	)
+}
+
+func isUntrackedMetricsPath(path string) bool {
+	switch path {
+	case "/healthz", "/readyz", "/metrics":
+		return true
+	default:
+		return false
+	}
 }

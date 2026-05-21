@@ -130,12 +130,41 @@ func TestNew_ExposesMetrics(t *testing.T) {
 	body := metricsRec.Body.String()
 	for _, want := range []string{
 		"# TYPE vekil_http_requests_total counter",
-		"vekil_http_requests_total 1",
+		"vekil_http_requests_total 0",
 		"# TYPE vekil_http_inflight_requests gauge",
 		"vekil_http_inflight_requests 0",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("GET /metrics body missing %q:\n%s", want, body)
 		}
+	}
+}
+
+func TestMetrics_ExcludesHealthAndMetricsEndpoints(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	for _, path := range []string{"/healthz", "/readyz", "/metrics"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		srv.httpServer.Handler.ServeHTTP(rec, req)
+		if rec.Code == 0 {
+			t.Fatalf("GET %s returned no status", path)
+		}
+	}
+
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsRec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(metricsRec, metricsReq)
+
+	if body := metricsRec.Body.String(); !strings.Contains(body, "vekil_http_requests_total 0") {
+		t.Fatalf("GET /metrics body missing zero request count after excluded endpoints:\n%s", body)
 	}
 }
