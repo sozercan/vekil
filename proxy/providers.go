@@ -20,16 +20,44 @@ type providerType string
 type providerAuthMode string
 
 const (
-	providerTypeCopilot     providerType = "copilot"
-	providerTypeAzureOpenAI providerType = "azure-openai"
-	providerTypeOpenAICodex providerType = "openai-codex"
+	providerTypeCopilot             providerType = "copilot"
+	providerTypeAzureOpenAI         providerType = "azure-openai"
+	providerTypeOpenAICodex         providerType = "openai-codex"
+	providerTypeOpenAICompatible    providerType = "openai-compatible"
+	providerTypeAnthropicCompatible providerType = "anthropic-compatible"
 
 	providerAuthModeAPIKey        providerAuthMode = "api_key"
 	providerAuthModeAzureIdentity providerAuthMode = "azure_identity"
 )
 
-var defaultStaticProviderEndpoints = []string{"/chat/completions", "/responses"}
-var openAICodexProviderEndpoints = []string{"/responses"}
+type providerAuthType string
+
+const (
+	providerAuthTypeBearer       providerAuthType = "bearer"
+	providerAuthTypeAPIKeyHeader providerAuthType = "api-key-header"
+	providerAuthTypeNone         providerAuthType = "none"
+)
+
+type providerModelDiscovery string
+
+const (
+	providerModelDiscoveryStatic          providerModelDiscovery = "static"
+	providerModelDiscoveryOpenAI          providerModelDiscovery = "openai"
+	providerModelDiscoveryOllama          providerModelDiscovery = "ollama"
+	providerModelDiscoveryOpenRouterTools providerModelDiscovery = "openrouter-tools"
+)
+
+const (
+	providerEndpointChatCompletions = "/chat/completions"
+	providerEndpointResponses       = "/responses"
+	providerEndpointMessages        = "/v1/messages"
+	providerEndpointModels          = "/models"
+)
+
+var defaultStaticProviderEndpoints = []string{providerEndpointChatCompletions, providerEndpointResponses}
+var defaultOpenAICompatibleProviderEndpoints = []string{providerEndpointChatCompletions}
+var defaultAnthropicCompatibleProviderEndpoints = []string{providerEndpointMessages}
+var openAICodexProviderEndpoints = []string{providerEndpointResponses}
 
 // ProvidersConfig configures optional non-Copilot upstream providers.
 // When empty, the proxy keeps its legacy zero-config Copilot behavior.
@@ -40,19 +68,28 @@ type ProvidersConfig struct {
 
 // ProviderConfig configures one upstream provider instance.
 type ProviderConfig struct {
-	ID            string                      `json:"id" yaml:"id"`
-	Type          string                      `json:"type" yaml:"type"`
-	Default       bool                        `json:"default,omitempty" yaml:"default,omitempty"`
-	IncludeModels []string                    `json:"include_models,omitempty" yaml:"include_models,omitempty"`
-	ExcludeModels []string                    `json:"exclude_models,omitempty" yaml:"exclude_models,omitempty"`
-	BaseURL       string                      `json:"base_url,omitempty" yaml:"base_url,omitempty"`
-	AuthMode      string                      `json:"auth_mode,omitempty" yaml:"auth_mode,omitempty"`
-	APIKey        string                      `json:"api_key,omitempty" yaml:"api_key,omitempty"`
-	APIKeyEnv     string                      `json:"api_key_env,omitempty" yaml:"api_key_env,omitempty"`
-	APIVersion    string                      `json:"api_version,omitempty" yaml:"api_version,omitempty"`
-	TokenScope    string                      `json:"token_scope,omitempty" yaml:"token_scope,omitempty"`
-	Headers       CopilotHeaderProfilesConfig `json:"headers,omitempty" yaml:"headers,omitempty"`
-	Models        []ProviderModelConfig       `json:"models,omitempty" yaml:"models,omitempty"`
+	ID                  string                      `json:"id" yaml:"id"`
+	Type                string                      `json:"type" yaml:"type"`
+	Default             bool                        `json:"default,omitempty" yaml:"default,omitempty"`
+	IncludeModels       []string                    `json:"include_models,omitempty" yaml:"include_models,omitempty"`
+	ExcludeModels       []string                    `json:"exclude_models,omitempty" yaml:"exclude_models,omitempty"`
+	BaseURL             string                      `json:"base_url,omitempty" yaml:"base_url,omitempty"`
+	AuthMode            string                      `json:"auth_mode,omitempty" yaml:"auth_mode,omitempty"`
+	APIKey              string                      `json:"api_key,omitempty" yaml:"api_key,omitempty"`
+	APIKeyEnv           string                      `json:"api_key_env,omitempty" yaml:"api_key_env,omitempty"`
+	APIVersion          string                      `json:"api_version,omitempty" yaml:"api_version,omitempty"`
+	TokenScope          string                      `json:"token_scope,omitempty" yaml:"token_scope,omitempty"`
+	AuthType            string                      `json:"auth_type,omitempty" yaml:"auth_type,omitempty"`
+	AuthHeader          string                      `json:"auth_header,omitempty" yaml:"auth_header,omitempty"`
+	AuthPrefix          string                      `json:"auth_prefix,omitempty" yaml:"auth_prefix,omitempty"`
+	ExtraHeaders        map[string]string           `json:"extra_headers,omitempty" yaml:"extra_headers,omitempty"`
+	ChatCompletionsPath string                      `json:"chat_completions_path,omitempty" yaml:"chat_completions_path,omitempty"`
+	ResponsesPath       string                      `json:"responses_path,omitempty" yaml:"responses_path,omitempty"`
+	MessagesPath        string                      `json:"messages_path,omitempty" yaml:"messages_path,omitempty"`
+	ModelsPath          string                      `json:"models_path,omitempty" yaml:"models_path,omitempty"`
+	ModelDiscovery      string                      `json:"model_discovery,omitempty" yaml:"model_discovery,omitempty"`
+	Headers             CopilotHeaderProfilesConfig `json:"headers,omitempty" yaml:"headers,omitempty"`
+	Models              []ProviderModelConfig       `json:"models,omitempty" yaml:"models,omitempty"`
 }
 
 // ProviderModelConfig maps a public model ID exposed by this proxy to the
@@ -80,6 +117,12 @@ type providerRuntime struct {
 	apiVersion     string
 	tokenScope     string
 	azureToken     azureTokenSource
+	authType       providerAuthType
+	authHeader     string
+	authPrefix     string
+	extraHeaders   http.Header
+	paths          providerEndpointPaths
+	modelDiscovery providerModelDiscovery
 	includeModels  map[string]struct{}
 	excludeModels  map[string]struct{}
 	staticModels   map[string]providerModel
@@ -87,6 +130,13 @@ type providerRuntime struct {
 	staticOrder    []string
 	codexAuth      *openAICodexAuth
 	headerProfiles CopilotHeaderProfilesConfig
+}
+
+type providerEndpointPaths struct {
+	chatCompletions string
+	responses       string
+	messages        string
+	models          string
 }
 
 type providerModel struct {
@@ -223,6 +273,7 @@ func defaultProviderSetup(h *ProxyHandler) *providerSetup {
 				kind:          providerTypeCopilot,
 				isDefault:     true,
 				baseURL:       strings.TrimRight(h.copilotURL, "/"),
+				paths:         defaultProviderEndpointPaths(providerTypeCopilot),
 				includeModels: map[string]struct{}{},
 				excludeModels: map[string]struct{}{},
 				staticModels:  map[string]providerModel{},
@@ -459,19 +510,21 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 
 	kind := providerType(strings.TrimSpace(cfg.Type))
 	switch kind {
-	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICodex:
+	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICodex, providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 	default:
 		return nil, fmt.Errorf("provider %q has unsupported type %q", id, cfg.Type)
 	}
 
 	runtime := &providerRuntime{
-		id:            id,
-		kind:          kind,
-		isDefault:     cfg.Default,
-		includeModels: make(map[string]struct{}, len(cfg.IncludeModels)),
-		excludeModels: make(map[string]struct{}, len(cfg.ExcludeModels)),
-		staticModels:  make(map[string]providerModel, len(cfg.Models)),
-		staticConfigs: make(map[string]ProviderModelConfig, len(cfg.Models)),
+		id:             id,
+		kind:           kind,
+		isDefault:      cfg.Default,
+		paths:          defaultProviderEndpointPaths(kind),
+		modelDiscovery: providerModelDiscoveryStatic,
+		includeModels:  make(map[string]struct{}, len(cfg.IncludeModels)),
+		excludeModels:  make(map[string]struct{}, len(cfg.ExcludeModels)),
+		staticModels:   make(map[string]providerModel, len(cfg.Models)),
+		staticConfigs:  make(map[string]ProviderModelConfig, len(cfg.Models)),
 	}
 
 	for _, included := range cfg.IncludeModels {
@@ -548,20 +601,8 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		if len(cfg.Models) == 0 {
 			return nil, fmt.Errorf("provider %q must configure at least one model", id)
 		}
-		for _, modelCfg := range cfg.Models {
-			model, err := buildStaticProviderModel(id, modelCfg)
-			if err != nil {
-				return nil, err
-			}
-			if !runtime.allowsModel(model.publicID) {
-				continue
-			}
-			if _, exists := runtime.staticModels[model.publicID]; exists {
-				return nil, fmt.Errorf("provider %q configures model %q more than once", id, model.publicID)
-			}
-			runtime.staticModels[model.publicID] = model
-			runtime.staticConfigs[model.publicID] = normalizeProviderModelConfig(modelCfg)
-			runtime.staticOrder = append(runtime.staticOrder, model.publicID)
+		if err := addStaticProviderModels(runtime, cfg.Models, defaultStaticEndpointsForProvider(kind)); err != nil {
+			return nil, err
 		}
 	case providerTypeOpenAICodex:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
@@ -577,9 +618,232 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		}
 		runtime.baseURL = baseURL
 		runtime.codexAuth = codexAuth
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+		if baseURL == "" {
+			return nil, fmt.Errorf("provider %q must set base_url", id)
+		}
+		if err := validateGenericProviderBaseURL(id, string(kind), baseURL); err != nil {
+			return nil, err
+		}
+		paths, err := configuredProviderEndpointPaths(kind, cfg)
+		if err != nil {
+			return nil, err
+		}
+		authType, authHeader, authPrefix, apiKey, err := configuredGenericProviderAuth(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("provider %q: %w", id, err)
+		}
+		extraHeaders, err := configuredProviderExtraHeaders(cfg.ExtraHeaders)
+		if err != nil {
+			return nil, fmt.Errorf("provider %q: %w", id, err)
+		}
+		modelDiscovery, err := configuredProviderModelDiscovery(kind, cfg.ModelDiscovery)
+		if err != nil {
+			return nil, fmt.Errorf("provider %q: %w", id, err)
+		}
+
+		runtime.baseURL = baseURL
+		runtime.paths = paths
+		runtime.authType = authType
+		runtime.authHeader = authHeader
+		runtime.authPrefix = authPrefix
+		runtime.apiKey = apiKey
+		runtime.extraHeaders = extraHeaders
+		runtime.modelDiscovery = modelDiscovery
+
+		if modelDiscovery == providerModelDiscoveryStatic && len(cfg.Models) == 0 {
+			return nil, fmt.Errorf("provider %q must configure at least one model when model_discovery is static", id)
+		}
+		if err := addStaticProviderModels(runtime, cfg.Models, defaultStaticEndpointsForProvider(kind)); err != nil {
+			return nil, err
+		}
 	}
 
 	return runtime, nil
+}
+
+func addStaticProviderModels(runtime *providerRuntime, models []ProviderModelConfig, defaultEndpoints []string) error {
+	if runtime == nil {
+		return fmt.Errorf("provider runtime is required")
+	}
+	for _, modelCfg := range models {
+		model, err := buildStaticProviderModel(runtime.id, modelCfg, defaultEndpoints)
+		if err != nil {
+			return err
+		}
+		if !runtime.allowsModel(model.publicID) {
+			continue
+		}
+		if _, exists := runtime.staticModels[model.publicID]; exists {
+			return fmt.Errorf("provider %q configures model %q more than once", runtime.id, model.publicID)
+		}
+		runtime.staticModels[model.publicID] = model
+		runtime.staticConfigs[model.publicID] = normalizeProviderModelConfig(modelCfg)
+		runtime.staticOrder = append(runtime.staticOrder, model.publicID)
+	}
+	return nil
+}
+
+func defaultStaticEndpointsForProvider(kind providerType) []string {
+	switch kind {
+	case providerTypeOpenAICompatible:
+		return defaultOpenAICompatibleProviderEndpoints
+	case providerTypeAnthropicCompatible:
+		return defaultAnthropicCompatibleProviderEndpoints
+	default:
+		return defaultStaticProviderEndpoints
+	}
+}
+
+func defaultProviderEndpointPaths(kind providerType) providerEndpointPaths {
+	paths := providerEndpointPaths{
+		chatCompletions: providerEndpointChatCompletions,
+		responses:       providerEndpointResponses,
+		messages:        providerEndpointMessages,
+		models:          providerEndpointModels,
+	}
+	if kind == providerTypeOpenAICodex {
+		paths.chatCompletions = ""
+		paths.messages = ""
+	}
+	return paths
+}
+
+func configuredProviderEndpointPaths(kind providerType, cfg ProviderConfig) (providerEndpointPaths, error) {
+	paths := defaultProviderEndpointPaths(kind)
+
+	var err error
+	if paths.chatCompletions, err = normalizeProviderPath(cfg.ChatCompletionsPath, paths.chatCompletions, "chat_completions_path"); err != nil {
+		return providerEndpointPaths{}, err
+	}
+	if paths.responses, err = normalizeProviderPath(cfg.ResponsesPath, paths.responses, "responses_path"); err != nil {
+		return providerEndpointPaths{}, err
+	}
+	if paths.messages, err = normalizeProviderPath(cfg.MessagesPath, paths.messages, "messages_path"); err != nil {
+		return providerEndpointPaths{}, err
+	}
+	if paths.models, err = normalizeProviderPath(cfg.ModelsPath, paths.models, "models_path"); err != nil {
+		return providerEndpointPaths{}, err
+	}
+	return paths, nil
+}
+
+func normalizeProviderPath(configured, fallback, field string) (string, error) {
+	path := strings.TrimSpace(configured)
+	if path == "" {
+		return fallback, nil
+	}
+	if !strings.HasPrefix(path, "/") || strings.ContainsAny(path, "?#") {
+		return "", fmt.Errorf("%s must be an absolute path with no query string or fragment", field)
+	}
+	return path, nil
+}
+
+func configuredGenericProviderAuth(cfg ProviderConfig) (providerAuthType, string, string, string, error) {
+	apiKey := strings.TrimSpace(cfg.APIKey)
+	if apiKey == "" && strings.TrimSpace(cfg.APIKeyEnv) != "" {
+		apiKey = strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.APIKeyEnv)))
+	}
+
+	authType := providerAuthType(strings.TrimSpace(cfg.AuthType))
+	if authType == "" {
+		if apiKey == "" {
+			authType = providerAuthTypeNone
+		} else {
+			authType = providerAuthTypeBearer
+		}
+	}
+
+	authHeader := strings.TrimSpace(cfg.AuthHeader)
+	authPrefix := strings.TrimSpace(cfg.AuthPrefix)
+
+	switch authType {
+	case providerAuthTypeNone:
+		return authType, "", "", apiKey, nil
+	case providerAuthTypeBearer:
+		if apiKey == "" {
+			return "", "", "", "", fmt.Errorf("auth_type bearer requires api_key or api_key_env")
+		}
+		if authHeader == "" {
+			authHeader = "Authorization"
+		}
+		if authPrefix == "" {
+			authPrefix = "Bearer"
+		}
+	case providerAuthTypeAPIKeyHeader:
+		if apiKey == "" {
+			return "", "", "", "", fmt.Errorf("auth_type api-key-header requires api_key or api_key_env")
+		}
+		if authHeader == "" {
+			return "", "", "", "", fmt.Errorf("auth_type api-key-header requires auth_header")
+		}
+	default:
+		return "", "", "", "", fmt.Errorf("unsupported auth_type %q", cfg.AuthType)
+	}
+
+	if !validProviderHeaderName(authHeader) {
+		return "", "", "", "", fmt.Errorf("auth_header %q is invalid", authHeader)
+	}
+	return authType, http.CanonicalHeaderKey(authHeader), authPrefix, apiKey, nil
+}
+
+func configuredProviderExtraHeaders(configured map[string]string) (http.Header, error) {
+	if len(configured) == 0 {
+		return nil, nil
+	}
+	headers := make(http.Header, len(configured))
+	for name, value := range configured {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if !validProviderHeaderName(name) {
+			return nil, fmt.Errorf("extra_headers contains invalid header %q", name)
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		headers.Set(http.CanonicalHeaderKey(name), value)
+	}
+	if len(headers) == 0 {
+		return nil, nil
+	}
+	return headers, nil
+}
+
+func validProviderHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case strings.ContainsRune("!#$%&'*+-.^_`|~", r):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func configuredProviderModelDiscovery(kind providerType, configured string) (providerModelDiscovery, error) {
+	discovery := providerModelDiscovery(strings.TrimSpace(configured))
+	if discovery == "" {
+		return providerModelDiscoveryStatic, nil
+	}
+	switch discovery {
+	case providerModelDiscoveryStatic, providerModelDiscoveryOpenAI, providerModelDiscoveryOllama, providerModelDiscoveryOpenRouterTools:
+	default:
+		return "", fmt.Errorf("unsupported model_discovery %q", configured)
+	}
+	if kind == providerTypeAnthropicCompatible && discovery == providerModelDiscoveryOllama {
+		return "", fmt.Errorf("model_discovery ollama is only supported for openai-compatible providers")
+	}
+	return discovery, nil
 }
 
 func filterProviderModels(provider *providerRuntime, models []providerModel) []providerModel {
@@ -624,7 +888,14 @@ func providerUsesDynamicModels(provider *providerRuntime) bool {
 	if provider == nil {
 		return false
 	}
-	return provider.kind == providerTypeCopilot || provider.kind == providerTypeOpenAICodex
+	switch provider.kind {
+	case providerTypeCopilot, providerTypeOpenAICodex:
+		return true
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+		return provider.modelDiscovery != providerModelDiscoveryStatic
+	default:
+		return false
+	}
 }
 
 func (p *providerRuntime) allowsModel(model string) bool {
@@ -662,7 +933,7 @@ func providerModelCollisionError(publicID, existingProviderID, incomingProviderI
 	)
 }
 
-func buildStaticProviderModel(providerID string, cfg ProviderModelConfig) (providerModel, error) {
+func buildStaticProviderModel(providerID string, cfg ProviderModelConfig, defaultEndpoints []string) (providerModel, error) {
 	publicID := strings.TrimSpace(cfg.PublicID)
 	if publicID == "" {
 		return providerModel{}, fmt.Errorf("provider %q contains a model without public_id", providerID)
@@ -678,7 +949,7 @@ func buildStaticProviderModel(providerID string, cfg ProviderModelConfig) (provi
 		name = publicID
 	}
 
-	endpoints := normalizeProviderEndpoints(cfg.Endpoints)
+	endpoints := normalizeProviderEndpoints(cfg.Endpoints, defaultEndpoints)
 	raw, err := synthesizeProviderModelRaw(providerID, publicID, name, endpoints, cfg)
 	if err != nil {
 		return providerModel{}, err
@@ -707,9 +978,9 @@ func normalizeProviderModelConfig(cfg ProviderModelConfig) ProviderModelConfig {
 	return cfg
 }
 
-func normalizeProviderEndpoints(endpoints []string) []string {
+func normalizeProviderEndpoints(endpoints []string, defaultEndpoints []string) []string {
 	if len(endpoints) == 0 {
-		return append([]string(nil), defaultStaticProviderEndpoints...)
+		return append([]string(nil), defaultEndpoints...)
 	}
 
 	normalized := make([]string, 0, len(endpoints))
@@ -726,7 +997,7 @@ func normalizeProviderEndpoints(endpoints []string) []string {
 		normalized = append(normalized, endpoint)
 	}
 	if len(normalized) == 0 {
-		return append([]string(nil), defaultStaticProviderEndpoints...)
+		return append([]string(nil), defaultEndpoints...)
 	}
 	return normalized
 }
@@ -858,11 +1129,40 @@ func (h *ProxyHandler) providerRequestURL(provider *providerRuntime, path string
 	}
 
 	baseURL := strings.TrimRight(provider.baseURL, "/")
-	fullURL := baseURL + path
+	upstreamPath := provider.upstreamPath(path)
+	if upstreamPath == "" {
+		return "", fmt.Errorf("provider %q has no upstream path configured for %s", provider.id, path)
+	}
+	fullURL := baseURL + upstreamPath
 	if provider.kind != providerTypeAzureOpenAI || provider.apiVersion == "" || classifyAzureBaseURL(baseURL) == azureBaseURLKindOpenAIV1 {
 		return appendRawQuery(fullURL, extraQuery), nil
 	}
 	return appendRawQuery(fullURL, appendQuery("api-version="+url.QueryEscape(provider.apiVersion), extraQuery)), nil
+}
+
+func (p *providerRuntime) upstreamPath(endpoint string) string {
+	if p == nil {
+		return endpoint
+	}
+	switch strings.TrimSpace(endpoint) {
+	case providerEndpointChatCompletions:
+		if p.paths.chatCompletions != "" {
+			return p.paths.chatCompletions
+		}
+	case providerEndpointResponses:
+		if p.paths.responses != "" {
+			return p.paths.responses
+		}
+	case providerEndpointMessages:
+		if p.paths.messages != "" {
+			return p.paths.messages
+		}
+	case providerEndpointModels:
+		if p.paths.models != "" {
+			return p.paths.models
+		}
+	}
+	return endpoint
 }
 
 func classifyAzureBaseURL(baseURL string) azureBaseURLKind {
@@ -980,10 +1280,42 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 			req.Header.Set("X-OpenAI-Fedramp", "true")
 		}
 		req.Header.Set("Content-Type", "application/json")
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+		clearCopilotHeaders(req.Header)
+		mergeHeaderValues(req.Header, provider.extraHeaders)
+		if err := applyGenericProviderAuth(req, provider); err != nil {
+			return err
+		}
+		if req.Method != http.MethodGet {
+			req.Header.Set("Content-Type", "application/json")
+		}
 	default:
 		return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("unsupported provider type %q", provider.kind)}
 	}
 	return nil
+}
+
+func applyGenericProviderAuth(req *http.Request, provider *providerRuntime) error {
+	switch provider.authType {
+	case providerAuthTypeNone, "":
+		return nil
+	case providerAuthTypeBearer, providerAuthTypeAPIKeyHeader:
+		if strings.TrimSpace(provider.apiKey) == "" {
+			return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no API key configured", provider.id)}
+		}
+		header := strings.TrimSpace(provider.authHeader)
+		if header == "" {
+			return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no auth header configured", provider.id)}
+		}
+		value := provider.apiKey
+		if prefix := strings.TrimSpace(provider.authPrefix); prefix != "" {
+			value = prefix + " " + value
+		}
+		req.Header.Set(header, value)
+		return nil
+	default:
+		return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("unsupported auth type %q", provider.authType)}
+	}
 }
 
 func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string) (*http.Request, error) {
@@ -1140,6 +1472,58 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 			return providerModelsFetchResult{}, err
 		}
 		result.models = models
+		return result, nil
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+		if provider.modelDiscovery == providerModelDiscoveryStatic {
+			return providerModelsFetchResult{models: orderedStaticProviderModels(provider)}, nil
+		}
+
+		resp, err := h.doWithRetry(func() (*http.Request, error) {
+			req, err := h.newProviderJSONRequest(ctx, provider, http.MethodGet, providerEndpointModels, nil, nil, rawQuery)
+			if err != nil {
+				return nil, err
+			}
+			if strings.TrimSpace(ifNoneMatch) != "" {
+				req.Header.Set("If-None-Match", ifNoneMatch)
+			}
+			return req, nil
+		})
+		if err != nil {
+			return providerModelsFetchResult{}, err
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		result := providerModelsFetchResult{etag: resp.Header.Get("ETag")}
+		if resp.StatusCode == http.StatusNotModified {
+			result.notModified = true
+			return result, nil
+		}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			return providerModelsFetchResult{}, &providerRequestError{
+				statusCode: resp.StatusCode,
+				err:        fmt.Errorf("unexpected /models status %d: %s", resp.StatusCode, string(body)),
+			}
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return providerModelsFetchResult{}, err
+		}
+
+		var models []providerModel
+		switch provider.modelDiscovery {
+		case providerModelDiscoveryOpenAI, providerModelDiscoveryOpenRouterTools:
+			models, err = decodeProviderModelsFromBody(provider, body)
+		case providerModelDiscoveryOllama:
+			models, err = decodeOllamaModelsFromBody(provider, body)
+		default:
+			err = fmt.Errorf("unsupported model discovery %q", provider.modelDiscovery)
+		}
+		if err != nil {
+			return providerModelsFetchResult{}, err
+		}
+		result.models = mergeDiscoveredProviderModelsWithStaticConfig(provider, models)
 		return result, nil
 	default:
 		return providerModelsFetchResult{}, fmt.Errorf("unsupported provider type %q", provider.kind)
@@ -1347,7 +1731,10 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 	for _, raw := range upstream.Data {
 		var parsed struct {
 			ID                 string   `json:"id"`
+			Name               string   `json:"name"`
 			SupportedEndpoints []string `json:"supported_endpoints"`
+			SupportedParams    []string `json:"supported_parameters"`
+			ContextLength      int64    `json:"context_length"`
 			Policy             struct {
 				State string `json:"state"`
 			} `json:"policy"`
@@ -1362,8 +1749,14 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 		if !provider.allowsModel(publicID) {
 			continue
 		}
+		if provider.modelDiscovery == providerModelDiscoveryOpenRouterTools && !openRouterModelSupportsTools(parsed.SupportedParams) {
+			continue
+		}
 
 		supportedEndpoints := normalizeDynamicProviderEndpoints(parsed.SupportedEndpoints)
+		if len(supportedEndpoints) == 0 {
+			supportedEndpoints = defaultDynamicProviderEndpoints(provider)
+		}
 		disabled := strings.EqualFold(parsed.Policy.State, "disabled")
 		if index, duplicate := indexByID[publicID]; duplicate {
 			merged := models[index]
@@ -1386,6 +1779,118 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			supportedEndpoints: supportedEndpoints,
 			disabled:           disabled,
 			raw:                mergeProviderModelRaw(raw, supportedEndpoints),
+		})
+	}
+
+	return models, nil
+}
+
+func openRouterModelSupportsTools(supportedParams []string) bool {
+	for _, param := range supportedParams {
+		switch strings.TrimSpace(param) {
+		case "tools", "tool_choice":
+			return true
+		}
+	}
+	return false
+}
+
+func defaultDynamicProviderEndpoints(provider *providerRuntime) []string {
+	if provider == nil {
+		return nil
+	}
+	switch provider.kind {
+	case providerTypeOpenAICompatible:
+		return append([]string(nil), defaultOpenAICompatibleProviderEndpoints...)
+	case providerTypeAnthropicCompatible:
+		return append([]string(nil), defaultAnthropicCompatibleProviderEndpoints...)
+	default:
+		return nil
+	}
+}
+
+func mergeDiscoveredProviderModelsWithStaticConfig(provider *providerRuntime, discovered []providerModel) []providerModel {
+	if provider == nil || len(discovered) == 0 || len(provider.staticConfigs) == 0 {
+		return discovered
+	}
+
+	merged := make([]providerModel, 0, len(discovered))
+	for _, model := range discovered {
+		cfg, ok := provider.staticConfigs[model.publicID]
+		if !ok {
+			merged = append(merged, model)
+			continue
+		}
+
+		staticModel, err := buildStaticProviderModel(provider.id, cfg, defaultStaticEndpointsForProvider(provider.kind))
+		if err != nil {
+			merged = append(merged, model)
+			continue
+		}
+		staticModel.disabled = model.disabled
+		staticModel.raw, err = mergeProviderModelMetadataOverlayRaw(staticModel.raw, model.raw, cfg)
+		if err != nil {
+			staticModel.raw = mergeProviderModelRaw(staticModel.raw, staticModel.supportedEndpoints)
+		}
+		merged = append(merged, staticModel)
+	}
+	return merged
+}
+
+func decodeOllamaModelsFromBody(provider *providerRuntime, body []byte) ([]providerModel, error) {
+	if provider == nil {
+		return nil, fmt.Errorf("provider is required")
+	}
+
+	var upstream struct {
+		Models []json.RawMessage `json:"models"`
+	}
+	if err := json.Unmarshal(body, &upstream); err != nil {
+		return nil, err
+	}
+
+	defaultEndpoints := defaultDynamicProviderEndpoints(provider)
+	models := make([]providerModel, 0, len(upstream.Models))
+	seen := make(map[string]struct{}, len(upstream.Models))
+	for _, raw := range upstream.Models {
+		var parsed struct {
+			Name  string `json:"name"`
+			Model string `json:"model"`
+		}
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			continue
+		}
+		publicID := strings.TrimSpace(parsed.Name)
+		if publicID == "" {
+			publicID = strings.TrimSpace(parsed.Model)
+		}
+		if publicID == "" {
+			continue
+		}
+		if _, duplicate := seen[publicID]; duplicate {
+			continue
+		}
+		if !provider.allowsModel(publicID) {
+			continue
+		}
+
+		cfg := ProviderModelConfig{
+			PublicID:  publicID,
+			Name:      publicID,
+			Endpoints: defaultEndpoints,
+		}
+		modelRaw, err := synthesizeProviderModelRaw(provider.id, publicID, publicID, defaultEndpoints, cfg)
+		if err != nil {
+			return nil, err
+		}
+
+		seen[publicID] = struct{}{}
+		models = append(models, providerModel{
+			publicID:           publicID,
+			upstreamModel:      publicID,
+			providerID:         provider.id,
+			supportedEndpoints: append([]string(nil), defaultEndpoints...),
+			raw:                modelRaw,
 		})
 	}
 

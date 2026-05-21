@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/sozercan/vekil/logger"
@@ -72,6 +73,53 @@ func prepareAnthropicChatCompletionsRequest(req *models.AnthropicRequest) ([]byt
 	return body, mode, nil
 }
 
+func anthropicExtraHeadersFromRequest(r *http.Request) http.Header {
+	var headers http.Header
+	for _, name := range []string{
+		"Anthropic-Version",
+		"Anthropic-Beta",
+		"Anthropic-Dangerous-Direct-Browser-Access",
+	} {
+		for _, value := range r.Header.Values(name) {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				if headers == nil {
+					headers = make(http.Header, 2)
+				}
+				headers.Add(name, trimmed)
+			}
+		}
+	}
+	return headers
+}
+
+func (h *ProxyHandler) shouldForwardAnthropicMessagesDirect(model string) bool {
+	provider, _, _ := h.resolveProviderModel(model, providerEndpointMessages)
+	return provider != nil && provider.kind == providerTypeAnthropicCompatible
+}
+
+func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *http.Request, body []byte, req *models.AnthropicRequest) {
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(req != nil && req.Stream)
+	defer upstreamCancel()
+
+	resp, err := h.postAnthropicMessages(upstreamCtx, body, anthropicExtraHeadersFromRequest(r))
+	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		h.log.Error("upstream request failed", logger.F("endpoint", "anthropic"), logger.Err(err))
+		if statusCode == http.StatusBadRequest {
+			writeAnthropicError(w, statusCode, "invalid_request_error", err.Error())
+			return
+		}
+		if statusCode == http.StatusInternalServerError {
+			writeAnthropicError(w, statusCode, "api_error", "authentication failed")
+			return
+		}
+		writeAnthropicError(w, statusCode, "api_error", "upstream request failed")
+		return
+	}
+
+	writeUpstreamResponse(w, resp)
+}
+
 func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp *http.Response, mode chatCompletionsMode, handlers chatCompletionsResponseHandlers) error {
 	if resp.StatusCode == http.StatusOK && mode.clientRequestedStream {
 		if handlers.stream == nil {
@@ -124,6 +172,11 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		logger.F("messages", len(req.Messages)),
 		logger.F("tools", len(req.Tools)),
 	)
+
+	if h.shouldForwardAnthropicMessagesDirect(req.Model) {
+		h.forwardAnthropicMessagesDirect(w, r, body, &req)
+		return
+	}
 
 	scope := chatToolExecutionScopeFromHeaders(r.Header)
 	oaiBody, mode, err := prepareAnthropicChatCompletionsRequest(&req)

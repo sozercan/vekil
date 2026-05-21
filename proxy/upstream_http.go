@@ -135,6 +135,12 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 			err:        fmt.Errorf("model %q does not support %s", model, endpoint),
 		}
 	}
+	if !known && !providerAllowsUnknownModelEndpoint(provider, endpoint) {
+		return nil, nil, &providerRequestError{
+			statusCode: http.StatusBadRequest,
+			err:        fmt.Errorf("model %q does not support %s", model, endpoint),
+		}
+	}
 
 	rewrittenBody, _, err := rewriteRequestModelForProvider(body, owner.upstreamModel)
 	if err != nil {
@@ -147,10 +153,30 @@ func providerSupportsEndpoint(provider *providerRuntime, endpoint string) bool {
 	if provider == nil {
 		return false
 	}
-	if provider.kind == providerTypeOpenAICodex {
+	switch provider.kind {
+	case providerTypeOpenAICodex:
 		return supportsEndpoint(openAICodexProviderEndpoints, endpoint)
+	case providerTypeOpenAICompatible:
+		return endpoint == providerEndpointChatCompletions || endpoint == providerEndpointResponses
+	case providerTypeAnthropicCompatible:
+		return endpoint == providerEndpointMessages
+	default:
+		return true
 	}
-	return true
+}
+
+func providerAllowsUnknownModelEndpoint(provider *providerRuntime, endpoint string) bool {
+	if provider == nil {
+		return false
+	}
+	switch provider.kind {
+	case providerTypeOpenAICompatible:
+		return endpoint == providerEndpointChatCompletions
+	case providerTypeAnthropicCompatible:
+		return endpoint == providerEndpointMessages
+	default:
+		return true
+	}
 }
 
 func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body []byte) (*http.Response, error) {
@@ -173,11 +199,15 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
-	return h.postJSONEndpoint(ctx, "/chat/completions", body)
+	return h.postJSONEndpoint(ctx, providerEndpointChatCompletions, body)
 }
 
 func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	return h.postJSONEndpointWithHeaders(ctx, "/responses", body, extraHeaders)
+	return h.postJSONEndpointWithHeaders(ctx, providerEndpointResponses, body, extraHeaders)
+}
+
+func (h *ProxyHandler) postAnthropicMessages(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
+	return h.postJSONEndpointWithHeaders(ctx, providerEndpointMessages, body, extraHeaders)
 }
 
 func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {

@@ -1,6 +1,6 @@
 # Documentation Index
 
-This folder is intentionally split into small, single-purpose files so humans and coding agents can load only the topic they need. It covers both provider-agnostic proxy behavior and provider-specific notes for GitHub Copilot, Azure OpenAI, and OpenAI Codex.
+This folder is intentionally split into small, single-purpose files so humans and coding agents can load only the topic they need. It covers both provider-agnostic proxy behavior and provider-specific notes for GitHub Copilot, Azure OpenAI, OpenAI Codex, and generic compatible providers.
 
 ## Doc Map
 

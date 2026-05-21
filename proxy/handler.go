@@ -725,6 +725,12 @@ func (h *ProxyHandler) newProviderProbeRequest(ctx context.Context, provider *pr
 			return nil, fmt.Errorf("failed to create provider %q probe request: %w", provider.id, err)
 		}
 		return req, nil
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodGet, providerEndpointModels, nil, nil, "")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create provider %q probe request: %w", provider.id, err)
+		}
+		return req, nil
 	default:
 		return nil, fmt.Errorf("unsupported provider type %q", provider.kind)
 	}
