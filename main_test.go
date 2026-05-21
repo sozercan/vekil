@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -188,6 +189,23 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	}
 }
 
+func TestServeFlagsQuietSuppressesNonErrorOutput(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet", "--log-level", "debug")
+
+	output := captureStderr(t, func() {
+		log := logger.New(serve.loggerLevel())
+		log.Info("suppressed info")
+		log.Error("kept error")
+	})
+
+	if strings.Contains(output, "suppressed info") {
+		t.Fatalf("quiet logger should suppress info output, got %q", output)
+	}
+	if !strings.Contains(output, "kept error") {
+		t.Fatalf("quiet logger should keep error output, got %q", output)
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -356,6 +374,27 @@ func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
 			t.Fatalf("stderr missing %q, got %q", want, output)
 		}
 	}
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+	defer func() {
+		os.Stderr = old
+	}()
+
+	fn()
+
+	_ = w.Close()
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	return buf.String()
 }
 
 type fakeLoginAuthenticator struct {
