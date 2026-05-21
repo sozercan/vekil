@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -374,23 +373,17 @@ func configureServeNonErrorOutput(args []string) func() {
 }
 
 func serveQuietRequested(args []string) bool {
-	for _, arg := range args {
-		switch arg {
-		case "--quiet", "-quiet":
-			return true
-		}
+	restoreOutput := setServeNonErrorOutput(io.Discard)
+	defer restoreOutput()
 
-		if strings.HasPrefix(arg, "--quiet=") || strings.HasPrefix(arg, "-quiet=") {
-			_, value, found := strings.Cut(arg, "=")
-			if !found {
-				continue
-			}
-			parsed, err := strconv.ParseBool(value)
-			return err == nil && parsed
-		}
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	serve := registerServeFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return false
 	}
 
-	return false
+	return *serve.quiet
 }
 
 func serveNonErrorWriter() io.Writer {

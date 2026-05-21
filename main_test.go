@@ -233,35 +233,51 @@ func TestServeFlagsQuietSuppressesNonErrorOutput(t *testing.T) {
 func TestConfigureServeNonErrorOutputQuietSuppressesServeWarnings(t *testing.T) {
 	const envKey = "RESPONSES_WS_ENABLED"
 	t.Setenv(envKey, "notabool")
-
-	var normal bytes.Buffer
-	restore := setServeNonErrorOutput(&normal)
-	_ = getEnvBool(envKey, false)
-	restore()
-
 	want := fmt.Sprintf("warning: ignoring invalid %s=%q", envKey, "notabool")
-	if got := normal.String(); !strings.Contains(got, want) {
-		t.Fatalf("normal output missing warning %q: %q", want, got)
+
+	tests := []struct {
+		name           string
+		args           []string
+		wantSuppressed bool
+	}{
+		{name: "default output preserved"},
+		{name: "quiet suppresses warning", args: []string{"--quiet"}, wantSuppressed: true},
+		{name: "last quiet flag wins", args: []string{"--quiet=false", "--quiet"}, wantSuppressed: true},
+		{name: "last quiet false preserves warning", args: []string{"--quiet", "--quiet=false"}},
+		{name: "double dash stops quiet parsing", args: []string{"--", "--quiet"}},
 	}
 
-	old := os.Stderr
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe(): %v", err)
-	}
-	os.Stderr = w
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			old := os.Stderr
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("os.Pipe(): %v", err)
+			}
+			os.Stderr = w
 
-	restore = configureServeNonErrorOutput([]string{"--quiet"})
-	_ = getEnvBool(envKey, false)
-	restore()
+			restore := configureServeNonErrorOutput(tc.args)
+			_ = getEnvBool(envKey, false)
+			restore()
 
-	_ = w.Close()
-	os.Stderr = old
+			_ = w.Close()
+			os.Stderr = old
 
-	var quiet bytes.Buffer
-	_, _ = quiet.ReadFrom(r)
-	if got := quiet.String(); got != "" {
-		t.Fatalf("quiet output should suppress serve warning: %q", got)
+			var buf bytes.Buffer
+			_, _ = buf.ReadFrom(r)
+			got := buf.String()
+
+			if tc.wantSuppressed {
+				if got != "" {
+					t.Fatalf("warning should be suppressed: %q", got)
+				}
+				return
+			}
+
+			if !strings.Contains(got, want) {
+				t.Fatalf("warning missing %q: %q", want, got)
+			}
+		})
 	}
 }
 
