@@ -86,19 +86,24 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 		return nil, err
 	}
 
+	baseMux := http.NewServeMux()
+	baseMux.HandleFunc("POST /v1/messages", handler.HandleAnthropicMessages)
+	baseMux.HandleFunc("POST /v1/chat/completions", handler.HandleOpenAIChatCompletions)
+	baseMux.HandleFunc("POST /v1beta/models/", handler.HandleGeminiModels)
+	baseMux.HandleFunc("POST /v1/models/", handler.HandleGeminiModels)
+	baseMux.HandleFunc("POST /models/", handler.HandleGeminiModels)
+	baseMux.HandleFunc("POST /v1/responses/compact", handler.HandleCompact)
+	baseMux.HandleFunc("POST /v1/responses", handler.HandleResponses)
+	baseMux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
+	baseMux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
+	baseMux.HandleFunc("GET /healthz", handler.HandleHealthz)
+	baseMux.HandleFunc("GET /readyz", handler.HandleReadyz)
+	baseMux.HandleFunc("GET /v1/models", handler.HandleModels)
+
+	metrics := &serverMetrics{}
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/messages", handler.HandleAnthropicMessages)
-	mux.HandleFunc("POST /v1/chat/completions", handler.HandleOpenAIChatCompletions)
-	mux.HandleFunc("POST /v1beta/models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /v1/models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /v1/responses/compact", handler.HandleCompact)
-	mux.HandleFunc("POST /v1/responses", handler.HandleResponses)
-	mux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
-	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
-	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
-	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
-	mux.HandleFunc("GET /v1/models", handler.HandleModels)
+	mux.HandleFunc("GET /metrics", metrics.serveHTTP)
+	mux.Handle("/", metrics.instrument(baseMux))
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{
