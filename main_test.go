@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -185,6 +186,47 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	cliServe := parseServeFlagsForTest(t, "--responses-ws-enabled=false")
 	if cliServe.responsesWebSocketConfig().Enabled {
 		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
+	}
+}
+
+func TestServeFlagsQuietSuppressesNonErrorOutput(t *testing.T) {
+	run := func(args ...string) string {
+		t.Helper()
+		serve := parseServeFlagsForTest(t, args...)
+
+		old := os.Stderr
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe(): %v", err)
+		}
+		os.Stderr = w
+
+		log := logger.New(serve.loggerLevel())
+		log.Info("info should be hidden only when quiet")
+		log.Error("error should still be shown")
+
+		_ = w.Close()
+		os.Stderr = old
+
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(r)
+		return buf.String()
+	}
+
+	normalOutput := run()
+	if !strings.Contains(normalOutput, `"msg":"info should be hidden only when quiet"`) {
+		t.Fatalf("normal output missing info log: %q", normalOutput)
+	}
+	if !strings.Contains(normalOutput, `"msg":"error should still be shown"`) {
+		t.Fatalf("normal output missing error log: %q", normalOutput)
+	}
+
+	quietOutput := run("--quiet")
+	if strings.Contains(quietOutput, `"msg":"info should be hidden only when quiet"`) {
+		t.Fatalf("quiet output should suppress info log: %q", quietOutput)
+	}
+	if !strings.Contains(quietOutput, `"msg":"error should still be shown"`) {
+		t.Fatalf("quiet output missing error log: %q", quietOutput)
 	}
 }
 

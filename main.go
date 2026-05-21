@@ -215,6 +215,7 @@ type serveFlags struct {
 	host                            *string
 	tokenDir                        *string
 	providersConfigPath             *string
+	quiet                           *bool
 	logLevel                        *string
 	streamingUpstreamTimeout        *time.Duration
 	copilotEditorVersion            *string
@@ -240,6 +241,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
+		quiet:                           fs.Bool("quiet", false, "Suppress non-error output"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
 		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
@@ -258,6 +260,14 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		compactUpstreamChunkConcurrency: fs.Int("compact-upstream-chunk-concurrency", getEnvInt("COMPACT_UPSTREAM_CHUNK_CONCURRENCY", proxy.DefaultCompactUpstreamChunkConcurrency()), "Maximum sibling chunk compaction calls to run concurrently after the first chunk succeeds"),
 		compactUpstreamMaxAttempts:      fs.Int("compact-upstream-max-attempts", getEnvInt("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts()), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy"),
 	}
+}
+
+func (f serveFlags) loggerLevel() logger.Level {
+	level := logger.ParseLevel(*f.logLevel)
+	if *f.quiet && level < logger.LevelError {
+		return logger.LevelError
+	}
+	return level
 }
 
 func (f serveFlags) copilotHeaderConfig() proxy.CopilotHeaderConfig {
@@ -286,7 +296,7 @@ func runServe() {
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+	log := logger.New(serve.loggerLevel())
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
