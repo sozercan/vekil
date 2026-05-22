@@ -22,6 +22,7 @@ Vekil supports two runtime patterns:
 | `--host` | `HOST` | `127.0.0.1` | Listen host |
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
+| `--quiet` | — | `false` | Suppress non-error log output; overrides `--log-level` for normal startup and shutdown messages |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 
