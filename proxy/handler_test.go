@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1680,6 +1681,9 @@ func TestCompactResponsesRequestInChunks_CancelsFanoutOnFirstError(t *testing.T)
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) || r.Context().Err() != nil {
+				return
+			}
 			t.Fatalf("read upstream body: %v", err)
 		}
 		var req map[string]interface{}
