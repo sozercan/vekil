@@ -358,6 +358,46 @@ func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
 	}
 }
 
+func TestRunLoginQuietSuppressesNonErrorOutputButNotErrors(t *testing.T) {
+	t.Run("success output suppressed", func(t *testing.T) {
+		var stderr bytes.Buffer
+
+		code := runLoginWithDeps([]string{"--gh", "--quiet"}, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return &fakeLoginAuthenticator{}, nil
+			},
+		})
+
+		if code != 0 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 0", code)
+		}
+		if got := stderr.String(); got != "" {
+			t.Fatalf("stderr = %q, want empty output", got)
+		}
+	})
+
+	t.Run("error output preserved", func(t *testing.T) {
+		var stderr bytes.Buffer
+
+		code := runLoginWithDeps([]string{"--gh", "--quiet"}, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return &fakeLoginAuthenticator{
+					signInWithGitHubCLIErr: fmt.Errorf("boom"),
+				}, nil
+			},
+		})
+
+		if code != 1 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 1", code)
+		}
+		if got := stderr.String(); !strings.Contains(got, "error signing in with GitHub CLI: boom") {
+			t.Fatalf("stderr missing error output, got %q", got)
+		}
+	})
+}
+
 type fakeLoginAuthenticator struct {
 	signInWithGitHubCLICalls int
 	signInWithGitHubCLIErr   error
