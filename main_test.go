@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -188,6 +189,37 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	}
 }
 
+func TestServeFlagsQuietSuppressesInfoLogs(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet")
+
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe(): %v", err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() {
+		os.Stderr = old
+	})
+
+	log := logger.New(serve.loggerLevel())
+	log.Info("info message should be suppressed")
+	log.Error("error message should remain")
+
+	_ = w.Close()
+
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	output := buf.String()
+
+	if strings.Contains(output, `"level":"info"`) {
+		t.Fatalf("quiet output unexpectedly included info log: %q", output)
+	}
+	if !strings.Contains(output, `"level":"error"`) {
+		t.Fatalf("quiet output missing error log: %q", output)
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -355,6 +387,36 @@ func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
 		if !strings.Contains(output, want) {
 			t.Fatalf("stderr missing %q, got %q", want, output)
 		}
+	}
+}
+
+func TestRunLoginQuietSuppressesNonErrorOutput(t *testing.T) {
+	var stderr bytes.Buffer
+	fake := &fakeLoginAuthenticator{
+		deviceCodeResponse: &auth.DeviceCodeResponse{
+			DeviceCode:      "device-code",
+			UserCode:        "ABCD-EFGH",
+			VerificationURI: "https://github.com/login/device",
+			Interval:        1,
+		},
+	}
+
+	code := runLoginWithDeps([]string{"--force", "--quiet"}, loginDeps{
+		stderr: &stderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return fake, nil
+		},
+		openURL: func(string) error { return nil },
+	})
+
+	if code != 0 {
+		t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if fake.requestDeviceCodeCalls != 1 || fake.pollForAuthorizationCalls != 1 {
+		t.Fatalf("unexpected auth flow calls: request=%d poll=%d", fake.requestDeviceCodeCalls, fake.pollForAuthorizationCalls)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty output in quiet mode", got)
 	}
 }
 
