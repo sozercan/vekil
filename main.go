@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -148,7 +149,7 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		_, _ = fmt.Fprintf(deps.stderr, "Enter code: %s\n", dcResp.UserCode)
 	}
 
-	if err := deps.openURL(dcResp.VerificationURI); err != nil && !opts.quiet {
+	if err := deps.openURL(dcResp.VerificationURI); err != nil {
 		_, _ = fmt.Fprintf(deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
 	}
 
@@ -299,7 +300,10 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 }
 
 func runServe() {
-	serve := registerServeFlags(flag.CommandLine)
+	var serve serveFlags
+	withEnvWarningsSuppressed(serveQuietRequested(os.Args[1:]), func() {
+		serve = registerServeFlags(flag.CommandLine)
+	})
 	flag.Parse()
 
 	logLevel := logger.ParseLevel(*serve.logLevel)
@@ -369,6 +373,44 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
+var suppressEnvWarnings bool
+
+func withEnvWarningsSuppressed(suppress bool, fn func()) {
+	prev := suppressEnvWarnings
+	suppressEnvWarnings = suppress
+	defer func() {
+		suppressEnvWarnings = prev
+	}()
+	fn()
+}
+
+func serveQuietRequested(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--quiet", "-quiet":
+			if i+1 >= len(args) {
+				return true
+			}
+			if v, err := strconv.ParseBool(args[i+1]); err == nil {
+				return v
+			}
+			return true
+		default:
+			if value, ok := strings.CutPrefix(args[i], "--quiet="); ok {
+				if parsed, err := strconv.ParseBool(value); err == nil {
+					return parsed
+				}
+			}
+			if value, ok := strings.CutPrefix(args[i], "-quiet="); ok {
+				if parsed, err := strconv.ParseBool(value); err == nil {
+					return parsed
+				}
+			}
+		}
+	}
+	return false
+}
+
 func getEnvBool(key string, fallback bool) bool {
 	v := getEnv(key, "")
 	if v == "" {
@@ -376,7 +418,9 @@ func getEnvBool(key string, fallback bool) bool {
 	}
 	parsed, err := strconv.ParseBool(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
+		if !suppressEnvWarnings {
+			_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
+		}
 		return fallback
 	}
 	return parsed
@@ -389,7 +433,9 @@ func getEnvInt(key string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
+		if !suppressEnvWarnings {
+			_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
+		}
 		return fallback
 	}
 	return parsed
@@ -402,7 +448,9 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	}
 	parsed, err := time.ParseDuration(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
+		if !suppressEnvWarnings {
+			_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
+		}
 		return fallback
 	}
 	return parsed

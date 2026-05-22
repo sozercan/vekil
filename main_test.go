@@ -125,11 +125,37 @@ func parseServeFlagsForTest(t *testing.T, args ...string) serveFlags {
 	t.Helper()
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	serve := registerServeFlags(fs)
+	var serve serveFlags
+	withEnvWarningsSuppressed(serveQuietRequested(args), func() {
+		serve = registerServeFlags(fs)
+	})
 	if err := fs.Parse(args); err != nil {
 		t.Fatalf("parse serve flags: %v", err)
 	}
 	return serve
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe(): %v", err)
+	}
+	os.Stderr = w
+	defer func() {
+		os.Stderr = old
+	}()
+
+	fn()
+
+	_ = w.Close()
+
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	_ = r.Close()
+	return buf.String()
 }
 
 func TestServeFlagsCopilotHeaderEnvDefaults(t *testing.T) {
@@ -185,6 +211,18 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	cliServe := parseServeFlagsForTest(t, "--responses-ws-enabled=false")
 	if cliServe.responsesWebSocketConfig().Enabled {
 		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
+	}
+}
+
+func TestServeQuietSuppressesEnvWarningsDuringFlagRegistration(t *testing.T) {
+	t.Setenv("RESPONSES_WS_ENABLED", "not-a-bool")
+
+	output := captureStderr(t, func() {
+		_ = parseServeFlagsForTest(t, "--quiet")
+	})
+
+	if output != "" {
+		t.Fatalf("stderr = %q, want empty output", output)
 	}
 }
 
@@ -394,6 +432,40 @@ func TestRunLoginQuietSuppressesNonErrorOutputButNotErrors(t *testing.T) {
 		}
 		if got := stderr.String(); !strings.Contains(got, "error signing in with GitHub CLI: boom") {
 			t.Fatalf("stderr missing error output, got %q", got)
+		}
+	})
+
+	t.Run("browser failure output preserved in quiet mode", func(t *testing.T) {
+		var stderr bytes.Buffer
+
+		code := runLoginWithDeps([]string{"--force", "--quiet"}, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return &fakeLoginAuthenticator{
+					deviceCodeResponse: &auth.DeviceCodeResponse{
+						DeviceCode:      "device-code",
+						UserCode:        "ABCD-EFGH",
+						VerificationURI: "https://github.com/login/device",
+						Interval:        1,
+					},
+				}, nil
+			},
+			openURL: func(string) error {
+				return fmt.Errorf("open failed")
+			},
+		})
+
+		if code != 0 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 0", code)
+		}
+		output := stderr.String()
+		if !strings.Contains(output, "Could not open browser automatically, please visit the URL above.") {
+			t.Fatalf("stderr missing browser failure output, got %q", output)
+		}
+		for _, want := range []string{"Opening browser to", "Enter code:", "Login successful."} {
+			if strings.Contains(output, want) {
+				t.Fatalf("stderr unexpectedly contains %q: %q", want, output)
+			}
 		}
 	})
 }
