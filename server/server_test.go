@@ -119,14 +119,20 @@ func TestNew_ExposesMetricsEndpoint(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GET /healthz failed: %v", err)
 		}
-		_ = resp.Body.Close()
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("closing /healthz response body failed: %v", err)
+		}
 	}
 
 	resp, err := http.Get(ts.URL + "/metrics")
 	if err != nil {
 		t.Fatalf("GET /metrics failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("closing /metrics response body failed: %v", err)
+		}
+	}()
 
 	if got, want := resp.StatusCode, http.StatusOK; got != want {
 		t.Fatalf("GET /metrics status = %d, want %d", got, want)
