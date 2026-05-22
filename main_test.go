@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -185,6 +187,25 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	cliServe := parseServeFlagsForTest(t, "--responses-ws-enabled=false")
 	if cliServe.responsesWebSocketConfig().Enabled {
 		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
+	}
+}
+
+func TestServeQuietSuppressesInfoButKeepsErrors(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet")
+
+	var stderr bytes.Buffer
+	log := logger.NewWithWriter(serve.effectiveLogLevel(), &stderr)
+	log.Info("authenticated successfully")
+	log.Error("authentication failed", logger.Err(errors.New("boom")))
+
+	output := stderr.String()
+	if strings.Contains(output, "authenticated successfully") {
+		t.Fatalf("quiet logger should suppress info output, got %q", output)
+	}
+	for _, want := range []string{`"level":"error"`, "authentication failed", "boom"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("quiet logger output missing %q, got %q", want, output)
+		}
 	}
 }
 

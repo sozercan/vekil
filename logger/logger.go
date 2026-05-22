@@ -4,6 +4,7 @@ package logger
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -41,12 +42,22 @@ func ParseLevel(s string) Level {
 // Logger writes structured JSON log entries to stderr.
 type Logger struct {
 	level Level
+	out   io.Writer
 	mu    sync.Mutex
 }
 
 // New creates a Logger that emits messages at or above the given level.
 func New(level Level) *Logger {
-	return &Logger{level: level}
+	return NewWithWriter(level, os.Stderr)
+}
+
+// NewWithWriter creates a Logger that emits messages at or above the given level
+// to the provided writer.
+func NewWithWriter(level Level, out io.Writer) *Logger {
+	if out == nil {
+		out = io.Discard
+	}
+	return &Logger{level: level, out: out}
 }
 
 func (l *Logger) log(level Level, msg string, fields map[string]interface{}) {
@@ -64,7 +75,7 @@ func (l *Logger) log(level Level, msg string, fields map[string]interface{}) {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	_ = json.NewEncoder(os.Stderr).Encode(e)
+	_ = json.NewEncoder(l.out).Encode(e)
 }
 
 // Debug logs a message at debug level.
