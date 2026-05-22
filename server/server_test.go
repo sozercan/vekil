@@ -1,7 +1,10 @@
 package server
 
 import (
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -94,5 +97,53 @@ func TestNew_DerivesWriteTimeoutFromConfiguredProxyHandler(t *testing.T) {
 				t.Fatalf("WriteTimeout = %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+func TestNew_ExposesMetricsEndpoint(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	ts := httptest.NewServer(srv.httpServer.Handler)
+	defer ts.Close()
+
+	for i := 0; i < 2; i++ {
+		resp, err := http.Get(ts.URL + "/healthz")
+		if err != nil {
+			t.Fatalf("GET /healthz failed: %v", err)
+		}
+		_ = resp.Body.Close()
+	}
+
+	resp, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got, want := resp.StatusCode, http.StatusOK; got != want {
+		t.Fatalf("GET /metrics status = %d, want %d", got, want)
+	}
+	if got, want := resp.Header.Get("Content-Type"), metricsContentType; got != want {
+		t.Fatalf("Content-Type = %q, want %q", got, want)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read /metrics body: %v", err)
+	}
+	metrics := string(body)
+	if !strings.Contains(metrics, "vekil_http_requests_total 2") {
+		t.Fatalf("expected request counter in metrics body, got %q", metrics)
+	}
+	if !strings.Contains(metrics, "vekil_http_in_flight_requests 0") {
+		t.Fatalf("expected in-flight gauge in metrics body, got %q", metrics)
 	}
 }
