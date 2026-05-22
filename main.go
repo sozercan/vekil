@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -59,6 +60,7 @@ type loginOptions struct {
 	tokenDir     string
 	useGitHubCLI bool
 	force        bool
+	quiet        bool
 }
 
 var errConflictingLoginFlags = fmt.Errorf("--github-cli/--gh cannot be used with --force")
@@ -118,13 +120,13 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 			_, _ = fmt.Fprintf(deps.stderr, "error signing in with GitHub CLI: %v\n", err)
 			return 1
 		}
-		_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+		writeNonErrorLine(deps.stderr, opts.quiet, "Login successful.")
 		return 0
 	}
 
 	if !opts.force {
 		if _, err := authenticator.RefreshTokenNonInteractive(ctx); err == nil {
-			_, _ = fmt.Fprintln(deps.stderr, "Already logged in.")
+			writeNonErrorLine(deps.stderr, opts.quiet, "Already logged in.")
 			return 0
 		} else if !auth.IsInteractiveLoginRequired(err) {
 			_, _ = fmt.Fprintf(deps.stderr, "error refreshing existing login: %v\n", err)
@@ -138,11 +140,11 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintf(deps.stderr, "Opening browser to %s\n", dcResp.VerificationURI)
-	_, _ = fmt.Fprintf(deps.stderr, "Enter code: %s\n", dcResp.UserCode)
+	writeNonErrorf(deps.stderr, opts.quiet, "Opening browser to %s\n", dcResp.VerificationURI)
+	writeNonErrorf(deps.stderr, opts.quiet, "Enter code: %s\n", dcResp.UserCode)
 
 	if err := deps.openURL(dcResp.VerificationURI); err != nil {
-		_, _ = fmt.Fprintf(deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
+		writeNonErrorLine(deps.stderr, opts.quiet, "Could not open browser automatically, please visit the URL above.")
 	}
 
 	if err := authenticator.PollForAuthorization(ctx, dcResp); err != nil {
@@ -150,7 +152,7 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+	writeNonErrorLine(deps.stderr, opts.quiet, "Login successful.")
 	return 0
 }
 
@@ -178,6 +180,7 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 	githubCLI := fs.Bool("github-cli", false, "Sign in using the currently authenticated GitHub CLI account")
 	gh := fs.Bool("gh", false, "Alias for --github-cli")
 	force := fs.Bool("force", false, "Force the interactive GitHub device-code flow")
+	quiet := fs.Bool("quiet", false, "Suppress non-error output")
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
@@ -185,6 +188,7 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 	opts.tokenDir = *tokenDir
 	opts.useGitHubCLI = *githubCLI || *gh
 	opts.force = *force
+	opts.quiet = *quiet
 	if opts.useGitHubCLI && opts.force {
 		return opts, errConflictingLoginFlags
 	}
@@ -194,6 +198,7 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 func runLogout(args []string) {
 	fs := flag.NewFlagSet("logout", flag.ExitOnError)
 	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
+	quiet := fs.Bool("quiet", false, "Suppress non-error output")
 	fs.Parse(args) //nolint:errcheck
 
 	authenticator, err := auth.NewAuthenticator(*tokenDir)
@@ -207,7 +212,7 @@ func runLogout(args []string) {
 		os.Exit(1)
 	}
 
-	_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
+	writeNonErrorLine(os.Stderr, *quiet, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
 }
 
 type serveFlags struct {
@@ -216,6 +221,7 @@ type serveFlags struct {
 	tokenDir                        *string
 	providersConfigPath             *string
 	logLevel                        *string
+	quiet                           *bool
 	streamingUpstreamTimeout        *time.Duration
 	copilotEditorVersion            *string
 	copilotPluginVersion            *string
@@ -234,30 +240,39 @@ type serveFlags struct {
 	compactUpstreamMaxAttempts      *int
 }
 
-func registerServeFlags(fs *flag.FlagSet) serveFlags {
+func registerServeFlags(fs *flag.FlagSet, warningWriter io.Writer) serveFlags {
 	return serveFlags{
 		port:                            fs.String("port", getEnv("PORT", "1337"), "Listen port"),
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
-		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
+		quiet:                           fs.Bool("quiet", false, "Suppress non-error output"),
+		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDurationWithWriter("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout(), warningWriter), "Timeout for streaming upstream inference requests"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
 		copilotPluginVersion:            fs.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header"),
 		copilotUserAgent:                fs.String("copilot-user-agent", getEnv("COPILOT_USER_AGENT", ""), "Upstream Copilot user-agent header"),
 		copilotIntegrationID:            fs.String("copilot-integration-id", getEnv("COPILOT_INTEGRATION_ID", ""), "Upstream Copilot copilot-integration-id header"),
 		copilotGitHubAPIVersion:         fs.String("copilot-github-api-version", getEnv("COPILOT_GITHUB_API_VERSION", ""), "Upstream Copilot x-github-api-version header"),
 		copilotOpenAIIntent:             fs.String("copilot-openai-intent", getEnv("COPILOT_OPENAI_INTENT", ""), "Upstream Copilot openai-intent header"),
-		responsesWSEnabled:              fs.Bool("responses-ws-enabled", getEnvBool("RESPONSES_WS_ENABLED", false), "Enable proxy-owned Codex websocket bridge on GET /v1/responses"),
-		responsesWSTurnStateDelta:       fs.Bool("responses-ws-turn-state-delta", getEnvBool("RESPONSES_WS_TURN_STATE_DELTA", false), "Attempt delta-only replay when upstream returns X-Codex-Turn-State"),
-		responsesWSDisableAutoCompact:   fs.Bool("responses-ws-disable-auto-compact", getEnvBool("RESPONSES_WS_DISABLE_AUTO_COMPACT", false), "Disable automatic websocket-session history compaction"),
-		responsesWSCompactMaxItems:      fs.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items"),
-		responsesWSCompactMaxBytes:      fs.Int("responses-ws-auto-compact-max-bytes", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes), "Auto-compact websocket session history after this many raw bytes"),
-		responsesWSCompactKeepTail:      fs.Int("responses-ws-auto-compact-keep-tail", getEnvInt("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail), "When auto-compacting websocket history, keep this many most recent items verbatim"),
-		compactUpstreamChunkBytes:       fs.Int("compact-upstream-chunk-bytes", getEnvInt("COMPACT_UPSTREAM_CHUNK_BYTES", proxy.DefaultCompactUpstreamChunkBytes()), "Target body size (bytes) for chunked /v1/responses/compact retries after an upstream 413; halved on each recursive 413 down to a 64 KiB floor"),
-		compactUpstreamChunkConcurrency: fs.Int("compact-upstream-chunk-concurrency", getEnvInt("COMPACT_UPSTREAM_CHUNK_CONCURRENCY", proxy.DefaultCompactUpstreamChunkConcurrency()), "Maximum sibling chunk compaction calls to run concurrently after the first chunk succeeds"),
-		compactUpstreamMaxAttempts:      fs.Int("compact-upstream-max-attempts", getEnvInt("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts()), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy"),
+		responsesWSEnabled:              fs.Bool("responses-ws-enabled", getEnvBoolWithWriter("RESPONSES_WS_ENABLED", false, warningWriter), "Enable proxy-owned Codex websocket bridge on GET /v1/responses"),
+		responsesWSTurnStateDelta:       fs.Bool("responses-ws-turn-state-delta", getEnvBoolWithWriter("RESPONSES_WS_TURN_STATE_DELTA", false, warningWriter), "Attempt delta-only replay when upstream returns X-Codex-Turn-State"),
+		responsesWSDisableAutoCompact:   fs.Bool("responses-ws-disable-auto-compact", getEnvBoolWithWriter("RESPONSES_WS_DISABLE_AUTO_COMPACT", false, warningWriter), "Disable automatic websocket-session history compaction"),
+		responsesWSCompactMaxItems:      fs.Int("responses-ws-auto-compact-max-items", getEnvIntWithWriter("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems, warningWriter), "Auto-compact websocket session history after this many items"),
+		responsesWSCompactMaxBytes:      fs.Int("responses-ws-auto-compact-max-bytes", getEnvIntWithWriter("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes, warningWriter), "Auto-compact websocket session history after this many raw bytes"),
+		responsesWSCompactKeepTail:      fs.Int("responses-ws-auto-compact-keep-tail", getEnvIntWithWriter("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail, warningWriter), "When auto-compacting websocket history, keep this many most recent items verbatim"),
+		compactUpstreamChunkBytes:       fs.Int("compact-upstream-chunk-bytes", getEnvIntWithWriter("COMPACT_UPSTREAM_CHUNK_BYTES", proxy.DefaultCompactUpstreamChunkBytes(), warningWriter), "Target body size (bytes) for chunked /v1/responses/compact retries after an upstream 413; halved on each recursive 413 down to a 64 KiB floor"),
+		compactUpstreamChunkConcurrency: fs.Int("compact-upstream-chunk-concurrency", getEnvIntWithWriter("COMPACT_UPSTREAM_CHUNK_CONCURRENCY", proxy.DefaultCompactUpstreamChunkConcurrency(), warningWriter), "Maximum sibling chunk compaction calls to run concurrently after the first chunk succeeds"),
+		compactUpstreamMaxAttempts:      fs.Int("compact-upstream-max-attempts", getEnvIntWithWriter("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts(), warningWriter), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy"),
 	}
+}
+
+func (f serveFlags) effectiveLogLevel() logger.Level {
+	level := logger.ParseLevel(*f.logLevel)
+	if f.quiet != nil && *f.quiet && level < logger.LevelError {
+		return logger.LevelError
+	}
+	return level
 }
 
 func (f serveFlags) copilotHeaderConfig() proxy.CopilotHeaderConfig {
@@ -283,10 +298,10 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 }
 
 func runServe() {
-	serve := registerServeFlags(flag.CommandLine)
+	serve := registerServeFlags(flag.CommandLine, warningWriterForArgs(os.Args[1:]))
 	flag.Parse()
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+	log := logger.New(serve.effectiveLogLevel())
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
@@ -350,40 +365,86 @@ func getEnv(key, fallback string) string {
 }
 
 func getEnvBool(key string, fallback bool) bool {
+	return getEnvBoolWithWriter(key, fallback, os.Stderr)
+}
+
+func getEnvBoolWithWriter(key string, fallback bool, stderr io.Writer) bool {
 	v := getEnv(key, "")
 	if v == "" {
 		return fallback
 	}
 	parsed, err := strconv.ParseBool(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
+		writeNonErrorf(stderr, false, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
 }
 
 func getEnvInt(key string, fallback int) int {
+	return getEnvIntWithWriter(key, fallback, os.Stderr)
+}
+
+func getEnvIntWithWriter(key string, fallback int, stderr io.Writer) int {
 	v := getEnv(key, "")
 	if v == "" {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
+		writeNonErrorf(stderr, false, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
 }
 
 func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	return getEnvDurationWithWriter(key, fallback, os.Stderr)
+}
+
+func getEnvDurationWithWriter(key string, fallback time.Duration, stderr io.Writer) time.Duration {
 	v := getEnv(key, "")
 	if v == "" {
 		return fallback
 	}
 	parsed, err := time.ParseDuration(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
+		writeNonErrorf(stderr, false, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
+}
+
+func warningWriterForArgs(args []string) io.Writer {
+	if quietFlagRequested(args) {
+		return io.Discard
+	}
+	return os.Stderr
+}
+
+func quietFlagRequested(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		if arg == "--quiet" {
+			return true
+		}
+		if strings.HasPrefix(arg, "--quiet=") {
+			parsed, err := strconv.ParseBool(strings.TrimPrefix(arg, "--quiet="))
+			return err == nil && parsed
+		}
+	}
+	return false
+}
+
+func writeNonErrorLine(w io.Writer, quiet bool, msg string) {
+	writeNonErrorf(w, quiet, "%s\n", msg)
+}
+
+func writeNonErrorf(w io.Writer, quiet bool, format string, args ...interface{}) {
+	if quiet || w == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(w, format, args...)
 }

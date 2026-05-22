@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -125,7 +126,7 @@ func parseServeFlagsForTest(t *testing.T, args ...string) serveFlags {
 	t.Helper()
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	serve := registerServeFlags(fs)
+	serve := registerServeFlags(fs, io.Discard)
 	if err := fs.Parse(args); err != nil {
 		t.Fatalf("parse serve flags: %v", err)
 	}
@@ -185,6 +186,13 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	cliServe := parseServeFlagsForTest(t, "--responses-ws-enabled=false")
 	if cliServe.responsesWebSocketConfig().Enabled {
 		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
+	}
+}
+
+func TestServeFlagsQuietRaisesEffectiveLogLevelToError(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--log-level=debug", "--quiet")
+	if got := serve.effectiveLogLevel(); got != logger.LevelError {
+		t.Fatalf("effectiveLogLevel() = %v, want %v", got, logger.LevelError)
 	}
 }
 
@@ -356,6 +364,46 @@ func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
 			t.Fatalf("stderr missing %q, got %q", want, output)
 		}
 	}
+}
+
+func TestRunLoginQuietSuppressesSuccessButPreservesErrors(t *testing.T) {
+	t.Run("success output suppressed", func(t *testing.T) {
+		var stderr bytes.Buffer
+		fake := &fakeLoginAuthenticator{}
+
+		code := runLoginWithDeps([]string{"--quiet", "--gh"}, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return fake, nil
+			},
+		})
+
+		if code != 0 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 0", code)
+		}
+		if got := stderr.String(); got != "" {
+			t.Fatalf("quiet login wrote %q, want empty output", got)
+		}
+	})
+
+	t.Run("error output preserved", func(t *testing.T) {
+		var stderr bytes.Buffer
+		fake := &fakeLoginAuthenticator{signInWithGitHubCLIErr: fmt.Errorf("boom")}
+
+		code := runLoginWithDeps([]string{"--quiet", "--gh"}, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return fake, nil
+			},
+		})
+
+		if code != 1 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 1", code)
+		}
+		if got := stderr.String(); !strings.Contains(got, "error signing in with GitHub CLI: boom") {
+			t.Fatalf("stderr missing error output, got %q", got)
+		}
+	})
 }
 
 type fakeLoginAuthenticator struct {
