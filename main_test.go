@@ -126,7 +126,7 @@ func parseServeFlagsForTest(t *testing.T, args ...string) serveFlags {
 	t.Helper()
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	serve := registerServeFlags(fs)
+	serve := registerServeFlags(fs, args)
 	if err := fs.Parse(args); err != nil {
 		t.Fatalf("parse serve flags: %v", err)
 	}
@@ -217,6 +217,32 @@ func TestServeFlagsQuietSuppressesInfoLogs(t *testing.T) {
 	}
 	if !strings.Contains(output, `"level":"error"`) {
 		t.Fatalf("quiet output missing error log: %q", output)
+	}
+}
+
+func TestRegisterServeFlagsQuietSuppressesInvalidEnvWarnings(t *testing.T) {
+	t.Setenv("RESPONSES_WS_ENABLED", "bogus")
+
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe(): %v", err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() {
+		os.Stderr = old
+	})
+
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	registerServeFlags(fs, []string{"--quiet", "--help"})
+
+	_ = w.Close()
+
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	if output := buf.String(); output != "" {
+		t.Fatalf("registerServeFlags() output = %q, want empty stderr in quiet mode", output)
 	}
 }
 
