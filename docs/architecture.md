@@ -11,7 +11,8 @@
 │  /models/... ──┤                                   │             │
 │  /v1/chat/... ─┤                                   ├─► Copilot   │
 │  /v1/responses ┘                                   ├─► Azure     │
-│                                                      └─► Codex   │
+│                                                      ├─► Codex   │
+│                                                      └─► Generic │
 │                                                                  │
 │  /v1/responses/compact ─┐                                        │
 │  /v1/memories/... ──────┴─► Proxy-owned Responses compatibility  │
@@ -45,5 +46,6 @@
 - The Codex websocket bridge is transport adaptation over upstream HTTP `/responses`, not a claim that the selected provider has native websocket or realtime support; it is disabled by default and must be enabled explicitly.
 - Tool optimizers are opt-in and fail-open. They must remain disabled by default and must not change default passthrough behavior when unconfigured or when an external optimizer fails.
 - Azure OpenAI support is implemented as an OpenAI-compatible provider behind the existing proxy surface; Azure deployment names are internal to provider config.
+- Generic provider support is config-driven. `openai-compatible` providers use OpenAI Chat Completions and optional Responses paths, while `anthropic-compatible` providers directly forward native Anthropic Messages requests.
 - OpenAI Codex subscription support is a Responses-only dynamic provider backed by Codex CLI ChatGPT credentials.
 - Production dependencies stay minimal.

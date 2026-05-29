@@ -4,7 +4,7 @@ Concise endpoint map for Vekil's public API surface. Provider routing is always 
 
 ## `POST /v1/messages` (Anthropic)
 
-Anthropic Messages compatibility for the supported content and tool subset. Requests are translated to OpenAI Chat Completions, routed through the provider that owns the selected public model, and translated back to Anthropic.
+Anthropic Messages compatibility for the supported content and tool subset. Requests are usually translated to OpenAI Chat Completions, routed through the provider that owns the selected public model, and translated back to Anthropic. For `anthropic-compatible` providers, the proxy directly forwards Messages requests to the configured `messages_path`.
 
 Supported features include text/image/tool-use content blocks, system messages, tool choice, stop sequences, extended thinking via `thinking.type: "enabled"`, and streaming Anthropic SSE event translation.
 

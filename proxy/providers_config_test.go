@@ -361,6 +361,194 @@ func TestLoadProvidersConfigFileCopilotHeaderProfiles(t *testing.T) {
 	}
 }
 
+func TestBuildProvidersGenericOpenAICompatibleConfig(t *testing.T) {
+	t.Setenv("TEST_GENERIC_API_KEY", "generic-key")
+
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	providers, _, defaultProviderID, err := handler.buildProviders(ProvidersConfig{
+		Providers: []ProviderConfig{{
+			ID:                  "local-openai",
+			Type:                "openai-compatible",
+			Default:             true,
+			BaseURL:             "http://localhost:1234",
+			APIKeyEnv:           "TEST_GENERIC_API_KEY",
+			AuthType:            "api-key-header",
+			AuthHeader:          "X-API-Key",
+			AuthPrefix:          "Token",
+			ExtraHeaders:        map[string]string{"X-Provider": "local"},
+			ChatCompletionsPath: "/v1/chat/completions",
+			ResponsesPath:       "/v1/responses",
+			ModelsPath:          "/api/tags",
+			ModelDiscovery:      "ollama",
+			Models: []ProviderModelConfig{{
+				PublicID:   "local-chat",
+				Deployment: "llama3.2:latest",
+				Name:       "Local Chat",
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+	if defaultProviderID != "local-openai" {
+		t.Fatalf("default provider = %q, want local-openai", defaultProviderID)
+	}
+
+	provider := providers["local-openai"]
+	if provider == nil {
+		t.Fatal("expected local-openai provider")
+	}
+	if provider.kind != providerTypeOpenAICompatible {
+		t.Fatalf("provider.kind = %q, want %q", provider.kind, providerTypeOpenAICompatible)
+	}
+	if provider.authType != providerAuthTypeAPIKeyHeader {
+		t.Fatalf("authType = %q, want api-key-header", provider.authType)
+	}
+	if provider.authHeader != "X-Api-Key" {
+		t.Fatalf("authHeader = %q, want X-Api-Key", provider.authHeader)
+	}
+	if provider.authPrefix != "Token" {
+		t.Fatalf("authPrefix = %q, want Token", provider.authPrefix)
+	}
+	if provider.apiKey != "generic-key" {
+		t.Fatalf("apiKey = %q, want generic-key", provider.apiKey)
+	}
+	if got := provider.extraHeaders.Get("X-Provider"); got != "local" {
+		t.Fatalf("extra header X-Provider = %q, want local", got)
+	}
+	if provider.paths.chatCompletions != "/v1/chat/completions" || provider.paths.responses != "/v1/responses" || provider.paths.models != "/api/tags" {
+		t.Fatalf("paths = %+v, want configured generic paths", provider.paths)
+	}
+	if provider.modelDiscovery != providerModelDiscoveryOllama {
+		t.Fatalf("modelDiscovery = %q, want ollama", provider.modelDiscovery)
+	}
+
+	model := provider.staticModels["local-chat"]
+	if model.publicID != "local-chat" || model.upstreamModel != "llama3.2:latest" {
+		t.Fatalf("static model = %+v, want public local-chat mapped to llama3.2:latest", model)
+	}
+	if !reflect.DeepEqual(model.supportedEndpoints, []string{"/chat/completions"}) {
+		t.Fatalf("default openai-compatible endpoints = %v, want [/chat/completions]", model.supportedEndpoints)
+	}
+}
+
+func TestBuildProvidersGenericAnthropicCompatibleConfig(t *testing.T) {
+	t.Parallel()
+
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	providers, _, _, err := handler.buildProviders(ProvidersConfig{
+		Providers: []ProviderConfig{{
+			ID:             "anthropic-native",
+			Type:           "anthropic-compatible",
+			Default:        true,
+			BaseURL:        "https://anthropic-compatible.example.com",
+			AuthType:       "none",
+			MessagesPath:   "/messages",
+			ModelDiscovery: "static",
+			Models: []ProviderModelConfig{{
+				PublicID: "claude-local",
+				Name:     "Claude Local",
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+
+	provider := providers["anthropic-native"]
+	if provider == nil {
+		t.Fatal("expected anthropic-native provider")
+	}
+	if provider.authType != providerAuthTypeNone {
+		t.Fatalf("authType = %q, want none", provider.authType)
+	}
+	if provider.paths.messages != "/messages" {
+		t.Fatalf("messages path = %q, want /messages", provider.paths.messages)
+	}
+	model := provider.staticModels["claude-local"]
+	if !reflect.DeepEqual(model.supportedEndpoints, []string{"/v1/messages"}) {
+		t.Fatalf("default anthropic-compatible endpoints = %v, want [/v1/messages]", model.supportedEndpoints)
+	}
+}
+
+func TestBuildProvidersGenericValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		cfg  ProviderConfig
+		want string
+	}{
+		{
+			name: "static requires models",
+			cfg: ProviderConfig{
+				ID:      "local",
+				Type:    "openai-compatible",
+				BaseURL: "http://localhost:1234",
+			},
+			want: "must configure at least one model",
+		},
+		{
+			name: "api key header requires header",
+			cfg: ProviderConfig{
+				ID:       "local",
+				Type:     "openai-compatible",
+				BaseURL:  "http://localhost:1234",
+				APIKey:   "key",
+				AuthType: "api-key-header",
+				Models:   []ProviderModelConfig{{PublicID: "m"}},
+			},
+			want: "requires auth_header",
+		},
+		{
+			name: "configured api key env must be set",
+			cfg: ProviderConfig{
+				ID:        "local",
+				Type:      "openai-compatible",
+				BaseURL:   "http://localhost:1234",
+				APIKeyEnv: "VEKIL_TEST_MISSING_GENERIC_API_KEY",
+				Models:    []ProviderModelConfig{{PublicID: "m"}},
+			},
+			want: "api_key_env",
+		},
+		{
+			name: "path rejects query",
+			cfg: ProviderConfig{
+				ID:                  "local",
+				Type:                "openai-compatible",
+				BaseURL:             "http://localhost:1234",
+				ChatCompletionsPath: "/v1/chat/completions?debug=true",
+				Models:              []ProviderModelConfig{{PublicID: "m"}},
+			},
+			want: "no query string or fragment",
+		},
+		{
+			name: "bad discovery",
+			cfg: ProviderConfig{
+				ID:             "local",
+				Type:           "openai-compatible",
+				BaseURL:        "http://localhost:1234",
+				ModelDiscovery: "made-up",
+				Models:         []ProviderModelConfig{{PublicID: "m"}},
+			},
+			want: "unsupported model_discovery",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+			_, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{tt.cfg}})
+			if err == nil {
+				t.Fatalf("buildProviders() error = nil, want %q", tt.want)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("buildProviders() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestLoadProvidersConfigFileRejectsEmptyBody(t *testing.T) {
 	t.Parallel()
 

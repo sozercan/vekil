@@ -1,6 +1,6 @@
 # Provider Routing and Authentication
 
-Use this file when editing provider credentials, model ownership, JSON/YAML provider configs, provider header profiles, or provider-specific model metadata. For global flags and env vars, see [Configuration](configuration.md).
+Use this file when editing provider credentials, model ownership, JSON/YAML provider configs, provider header profiles, or provider-specific model metadata. For where to obtain provider keys, see [Provider API Keys](provider-api-keys.md). For global flags and env vars, see [Configuration](configuration.md).
 
 ## Provider Authentication
 
@@ -31,9 +31,20 @@ For Entra auth, `token_scope` is optional and defaults to `https://ai.azure.com/
 
 Vekil does not run `az login` for you. For local development, sign in with Azure CLI or another credential supported by `DefaultAzureCredential`; in hosted environments, use managed identity, workload identity, or environment credentials. The signed-in principal needs the required Azure RBAC role, for example Cognitive Services OpenAI User on the target resource.
 
+### Generic Providers
+
+`openai-compatible` and `anthropic-compatible` providers use the generic auth fields:
+
+- `auth_type: bearer` sends `Authorization: Bearer <key>` by default.
+- `auth_type: api-key-header` sends the key through `auth_header`, with optional `auth_prefix`.
+- `auth_type: none` sends no auth header, useful for local providers.
+- `extra_headers` adds fixed provider headers after client Copilot-identifying headers are stripped.
+
+When `auth_type` is omitted, Vekil uses `bearer` if `api_key` or `api_key_env` is set, otherwise `none`. If `api_key_env` is configured, the referenced environment variable must be set and non-empty at startup.
+
 ## Provider Routing
 
-Use `--providers-config` when you want explicit ownership of public model IDs across providers such as GitHub Copilot, Azure OpenAI, and OpenAI Codex. Provider config files can be JSON (`.json`) or YAML (`.yaml`/`.yml`).
+Use `--providers-config` when you want explicit ownership of public model IDs across providers such as GitHub Copilot, Azure OpenAI, OpenAI Codex, or generic OpenAI-compatible and Anthropic-compatible upstreams. Provider config files can be JSON (`.json`) or YAML (`.yaml`/`.yml`).
 
 You can run Azure-only or Codex-only configs, or mix those providers with Copilot behind the same local endpoint.
 
@@ -109,6 +120,120 @@ providers:
 
 JSON configs use the same snake_case field names as YAML.
 
+### Generic Provider Behavior
+
+OpenAI-compatible providers route `POST /v1/chat/completions` to `chat_completions_path`. Anthropic `POST /v1/messages` requests for these models are translated through the existing OpenAI Chat Completions adapter. `POST /v1/responses` is never inferred; add `/responses` to a model only after validating the upstream model and path.
+
+Anthropic-compatible providers directly forward Anthropic `POST /v1/messages` to `messages_path`. They do not serve OpenAI Chat Completions or Responses routes.
+
+`model_discovery` can be `static`, `openai`, `ollama`, or `openrouter-tools`. OpenAI discovery reads an OpenAI-style `data` array. Ollama discovery reads `/api/tags`. OpenRouter-tools discovery reads an OpenAI/OpenRouter-style `data` array and exposes only models that advertise tool parameters.
+
+### Generic Provider Field Reference
+
+| Field | Applies To | Purpose |
+|-------|------------|---------|
+| `type` | all providers | Use `openai-compatible` or `anthropic-compatible` for generic providers. |
+| `base_url` | generic providers | Upstream origin and any fixed API prefix. The proxy appends only the configured path field. |
+| `api_key`, `api_key_env` | generic providers | Static credential value or the name of any environment variable you choose. |
+| `auth_type` | generic providers | `bearer`, `api-key-header`, or `none`. Defaults to `bearer` when a key is present, otherwise `none`. |
+| `auth_header`, `auth_prefix` | generic providers | Header name and optional prefix for `api-key-header`, or overrides for bearer auth. |
+| `extra_headers` | generic providers | Fixed headers to add to every upstream request after client Copilot headers are stripped. |
+| `chat_completions_path` | `openai-compatible` | Upstream path for public `POST /v1/chat/completions`. Defaults to `/chat/completions`. |
+| `responses_path` | `openai-compatible` | Upstream path for public `POST /v1/responses`. Defaults to `/responses`; models must still opt in with `/responses`. |
+| `messages_path` | `anthropic-compatible` | Upstream path for public `POST /v1/messages`. Defaults to `/v1/messages`. |
+| `models_path` | generic providers | Upstream path for dynamic model discovery and readiness probes. Defaults to `/models`. |
+| `model_discovery` | generic providers | `static`, `openai`, `ollama`, or `openrouter-tools`. |
+| `models[].endpoints` | all static models | Public endpoint allowlist. This remains the source of truth for what Vekil advertises and routes. |
+
+### Generic Provider Cookbook
+
+Chat-only OpenAI-compatible hosted providers, including NVIDIA NIM and Kimi, should expose only `/chat/completions` unless you have validated `/responses` for that exact model:
+
+```yaml
+providers:
+  - id: hosted-chat
+    type: openai-compatible
+    default: true
+    base_url: https://provider.example.com/v1
+    api_key_env: PROVIDER_API_KEY
+    models:
+      - public_id: provider-chat-model
+        deployment: upstream-chat-model
+        endpoints:
+          - /chat/completions
+```
+
+LM Studio, llama.cpp, and AIKit usually fit the same shape with local auth disabled:
+
+```yaml
+providers:
+  - id: local-openai
+    type: openai-compatible
+    default: true
+    base_url: http://localhost:1234/v1
+    auth_type: none
+    models:
+      - public_id: local-chat
+        deployment: local-model
+        endpoints:
+          - /chat/completions
+```
+
+For AIKit's default quick-start port, use `base_url: http://localhost:8080/v1` and set `deployment` to the model name served by the image, such as `llama-3.1-8b-instruct`.
+
+Z.ai-style OpenAI-compatible providers can use the same config, but set `base_url` exactly to the upstream API base documented by the provider. Do not append `/v1` unless the provider's OpenAI-compatible base URL includes it.
+
+Ollama can use `/api/tags` discovery and OpenAI-compatible chat routing:
+
+```yaml
+providers:
+  - id: ollama
+    type: openai-compatible
+    default: true
+    base_url: http://localhost:11434
+    auth_type: none
+    model_discovery: ollama
+    models_path: /api/tags
+    chat_completions_path: /v1/chat/completions
+```
+
+OpenAI-compatible providers with validated Responses support, including OpenCode Zen/Go models documented for Responses, should opt in per model:
+
+```yaml
+providers:
+  - id: responses-provider
+    type: openai-compatible
+    default: true
+    base_url: https://provider.example.com/v1
+    api_key_env: PROVIDER_API_KEY
+    models:
+      - public_id: responses-model
+        deployment: upstream-responses-model
+        endpoints:
+          - /responses
+```
+
+Anthropic-compatible providers with native Messages support, including Wafer, OpenRouter, and DeepSeek-style Messages endpoints, should not advertise OpenAI routes:
+
+```yaml
+providers:
+  - id: native-messages
+    type: anthropic-compatible
+    default: true
+    base_url: https://provider.example.com
+    api_key_env: PROVIDER_API_KEY
+    auth_type: api-key-header
+    auth_header: x-api-key
+    messages_path: /v1/messages
+    models:
+      - public_id: claude-compatible
+        deployment: upstream-messages-model
+        endpoints:
+          - /v1/messages
+```
+
+If LM Studio, llama.cpp, or Ollama exposes a native Anthropic Messages endpoint in your local setup, configure it as a separate `anthropic-compatible` provider with `messages_path`. Do not rely on `openai-compatible` to direct-forward Messages; that type translates Anthropic requests through Chat Completions.
+
 ### Copilot Provider Header Profiles
 
 `type: copilot` providers can define a `headers` block with a provider-wide `default` profile and endpoint-specific `chat_completions` and `responses` profiles. Endpoint-specific values override `headers.default`, which overrides the global Copilot header flags/environment variables, which then fall back to the built-in defaults. Omitted fields inherit from the lower-precedence profile. The built-in `openai-intent: conversation-panel` fallback is endpoint-aware: it is applied to upstream `/chat/completions` and `/responses` calls, while upstream `/models` calls send `openai-intent` only when you configure it explicitly through `--copilot-openai-intent`, `COPILOT_OPENAI_INTENT`, or a provider header profile.
@@ -143,6 +268,9 @@ Routing rules:
 - OpenAI Codex discovers models dynamically from its upstream `/models` endpoint and exposes only models that are listed and supported in the API.
 - OpenAI Codex models are `/responses`-only. The proxy rejects `/chat/completions` for those models instead of probing an unsupported route.
 - Azure `auth_mode` is optional and defaults to `api_key`. Supported values are `api_key` and `azure_identity`.
+- `openai-compatible` models default to `/chat/completions` when `models[].endpoints` is omitted. Add `/responses` only for models you have validated on `responses_path`.
+- `anthropic-compatible` models default to `/v1/messages` when `models[].endpoints` is omitted. OpenAI Chat Completions and Responses requests for those models fail fast.
+- Generic path fields are `chat_completions_path`, `responses_path`, `messages_path`, and `models_path`. They are paths relative to `base_url`, with no query string or fragment.
 - Azure `base_url` must be an absolute URL whose path ends with either the OpenAI-compatible `/openai/v1` path or the legacy `/openai` path, with no query string or fragment.
 - Microsoft Foundry inference URLs ending in `/models` are not supported in `type: "azure-openai"` configs. Use the corresponding OpenAI-compatible `.../openai/v1` endpoint instead.
 - For `/openai/v1` base URLs, omit `api_version`; the proxy calls `/chat/completions`, `/responses`, and `/models` directly with no `api-version` query string.

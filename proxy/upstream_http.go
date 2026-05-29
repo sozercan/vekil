@@ -119,7 +119,11 @@ func mergeHeaderValues(dst, src http.Header) {
 
 func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*providerRuntime, []byte, error) {
 	model := extractRequestModel(body)
-	provider, owner, known := h.resolveProviderModel(model, endpoint)
+	lookupModel := model
+	if endpoint == providerEndpointMessages {
+		lookupModel = NormalizeModelName(model)
+	}
+	provider, owner, known := h.resolveProviderModel(lookupModel, endpoint)
 	if provider == nil {
 		return nil, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no provider available for endpoint %s", endpoint)}
 	}
@@ -130,6 +134,12 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 		}
 	}
 	if known && !providerModelSupportsEndpoint(owner, endpoint) {
+		return nil, nil, &providerRequestError{
+			statusCode: http.StatusBadRequest,
+			err:        fmt.Errorf("model %q does not support %s", model, endpoint),
+		}
+	}
+	if !known && !providerAllowsUnknownModelEndpoint(provider, endpoint) {
 		return nil, nil, &providerRequestError{
 			statusCode: http.StatusBadRequest,
 			err:        fmt.Errorf("model %q does not support %s", model, endpoint),
@@ -147,10 +157,30 @@ func providerSupportsEndpoint(provider *providerRuntime, endpoint string) bool {
 	if provider == nil {
 		return false
 	}
-	if provider.kind == providerTypeOpenAICodex {
+	switch provider.kind {
+	case providerTypeOpenAICodex:
 		return supportsEndpoint(openAICodexProviderEndpoints, endpoint)
+	case providerTypeOpenAICompatible:
+		return endpoint == providerEndpointChatCompletions || endpoint == providerEndpointResponses
+	case providerTypeAnthropicCompatible:
+		return endpoint == providerEndpointMessages
+	default:
+		return true
 	}
-	return true
+}
+
+func providerAllowsUnknownModelEndpoint(provider *providerRuntime, endpoint string) bool {
+	if provider == nil {
+		return false
+	}
+	switch provider.kind {
+	case providerTypeOpenAICompatible:
+		return providerUsesDynamicModels(provider) && endpoint == providerEndpointChatCompletions
+	case providerTypeAnthropicCompatible:
+		return providerUsesDynamicModels(provider) && endpoint == providerEndpointMessages
+	default:
+		return true
+	}
 }
 
 func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body []byte) (*http.Response, error) {
@@ -173,11 +203,15 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
-	return h.postJSONEndpoint(ctx, "/chat/completions", body)
+	return h.postJSONEndpoint(ctx, providerEndpointChatCompletions, body)
 }
 
 func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	return h.postJSONEndpointWithHeaders(ctx, "/responses", body, extraHeaders)
+	return h.postJSONEndpointWithHeaders(ctx, providerEndpointResponses, body, extraHeaders)
+}
+
+func (h *ProxyHandler) postAnthropicMessages(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
+	return h.postJSONEndpointWithHeaders(ctx, providerEndpointMessages, body, extraHeaders)
 }
 
 func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
@@ -185,4 +219,85 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func writeDirectAnthropicJSONResponse(w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) error {
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	rewritten, changed := rewriteAnthropicResponseModelJSON(body, publicModel, upstreamModel)
+
+	copyPassthroughHeaders(w.Header(), resp.Header)
+	if changed {
+		w.Header().Del("Content-Length")
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(rewritten)
+	return nil
+}
+
+func writeDirectAnthropicStreamResponse(w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) {
+	defer func() { _ = resp.Body.Close() }()
+
+	copyPassthroughHeaders(w.Header(), resp.Header)
+	w.Header().Del("Content-Length")
+	setSSEHeaders(w)
+	w.WriteHeader(resp.StatusCode)
+	streamAnthropicPassthroughBody(w, resp.Body, publicModel, upstreamModel)
+}
+
+func rewriteAnthropicResponseModelJSON(body []byte, publicModel, upstreamModel string) ([]byte, bool) {
+	publicModel = strings.TrimSpace(publicModel)
+	upstreamModel = strings.TrimSpace(upstreamModel)
+	if publicModel == "" || publicModel == upstreamModel {
+		return body, false
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body, false
+	}
+
+	changed := rewriteAnthropicModelFields(payload, publicModel)
+	if !changed {
+		return body, false
+	}
+
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return body, false
+	}
+	return rewritten, true
+}
+
+func rewriteAnthropicModelFields(payload map[string]json.RawMessage, publicModel string) bool {
+	if len(payload) == 0 || strings.TrimSpace(publicModel) == "" {
+		return false
+	}
+
+	changed := false
+	if rawJSONString(payload["model"]) != "" {
+		rawModel, err := json.Marshal(publicModel)
+		if err == nil {
+			payload["model"] = rawModel
+			changed = true
+		}
+	}
+
+	var message map[string]json.RawMessage
+	if err := json.Unmarshal(payload["message"], &message); err == nil && len(message) > 0 && rawJSONString(message["model"]) != "" {
+		rawModel, err := json.Marshal(publicModel)
+		if err == nil {
+			message["model"] = rawModel
+			if rawMessage, err := json.Marshal(message); err == nil {
+				payload["message"] = rawMessage
+				changed = true
+			}
+		}
+	}
+
+	return changed
 }
