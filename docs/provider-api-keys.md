@@ -7,7 +7,7 @@ Provider portals, free tiers, and model catalogs change frequently. Treat the li
 ## Key Handling
 
 - Prefer `api_key_env` over inline `api_key` for any config you might commit or share.
-- Use a separate environment variable per provider, such as `NVIDIA_NIM_API_KEY` or `OPENROUTER_API_KEY`.
+- Use any environment variable name you want; it only needs to match the provider's `api_key_env` value.
 - Use `auth_type: none` only for local providers or a trusted private upstream.
 - Keep `models[].endpoints` limited to routes you have validated for that model. Vekil does not infer `/responses` from OpenAI compatibility.
 - Do not paste provider keys into client configs. Clients point at Vekil with dummy local keys; Vekil holds the upstream provider credentials.
@@ -22,19 +22,19 @@ Provider portals, free tiers, and model catalogs change frequently. Treat the li
 
 ## Generic Provider Key Pages
 
-| Provider | Key Page | Typical Vekil Type | Key Env Var | Notes |
-|----------|----------|--------------------|-------------|-------|
-| NVIDIA NIM | [build.nvidia.com/settings/api-keys](https://build.nvidia.com/settings/api-keys) | `openai-compatible` | `NVIDIA_NIM_API_KEY` | Use `/chat/completions`; add `/responses` only for a validated model. |
-| Kimi / Moonshot | [platform.moonshot.ai/console/api-keys](https://platform.moonshot.ai/console/api-keys) | `openai-compatible` | `KIMI_API_KEY` | Configure `base_url` exactly as Moonshot documents for the API you use. |
-| OpenCode Zen / Go | [opencode.ai/auth](https://opencode.ai/auth) | `openai-compatible` | `OPENCODE_API_KEY` | Prefer `/responses` for models documented for Responses; keep chat separate unless validated. |
-| Z.ai | [z.ai/manage-apikey/apikey-list](https://z.ai/manage-apikey/apikey-list) | `openai-compatible` | `ZAI_API_KEY` | Do not append `/v1` unless that is part of the documented API base. |
-| OpenRouter | [openrouter.ai/keys](https://openrouter.ai/keys) | `anthropic-compatible` or `openai-compatible` | `OPENROUTER_API_KEY` | Pick the provider type that matches the upstream endpoint you configure. |
-| DeepSeek | [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) | `anthropic-compatible` or `openai-compatible` | `DEEPSEEK_API_KEY` | Match `type` and paths to the endpoint family you intend to use. |
-| Wafer | [wafer.ai](https://www.wafer.ai/) | `anthropic-compatible` | `WAFER_API_KEY` | Use its native Messages endpoint when configuring direct Anthropic routing. |
-| Google AI Studio | [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey) | `openai-compatible` | `GEMINI_API_KEY` | Use Google's OpenAI-compatible API base when configuring this as a generic provider. |
-| Mistral La Plateforme | [console.mistral.ai](https://console.mistral.ai/) | `openai-compatible` | `MISTRAL_API_KEY` | Use the OpenAI-compatible API base documented by Mistral. |
-| Groq | [console.groq.com/keys](https://console.groq.com/keys) | `openai-compatible` | `GROQ_API_KEY` | Some models reject unsupported request fields; validate with a small request first. |
-| Cerebras Cloud | [cloud.cerebras.ai](https://cloud.cerebras.ai/) | `openai-compatible` | `CEREBRAS_API_KEY` | Use the OpenAI-compatible API base from Cerebras docs. |
+| Provider | Key Page | Typical Vekil Type | Notes |
+|----------|----------|--------------------|-------|
+| NVIDIA NIM | [build.nvidia.com/settings/api-keys](https://build.nvidia.com/settings/api-keys) | `openai-compatible` | Use `/chat/completions`; add `/responses` only for a validated model. |
+| Kimi / Moonshot | [platform.moonshot.ai/console/api-keys](https://platform.moonshot.ai/console/api-keys) | `openai-compatible` | Configure `base_url` exactly as Moonshot documents for the API you use. |
+| OpenCode Zen / Go | [opencode.ai/auth](https://opencode.ai/auth) | `openai-compatible` | Prefer `/responses` for models documented for Responses; keep chat separate unless validated. |
+| Z.ai | [z.ai/manage-apikey/apikey-list](https://z.ai/manage-apikey/apikey-list) | `openai-compatible` | Do not append `/v1` unless that is part of the documented API base. |
+| OpenRouter | [openrouter.ai/keys](https://openrouter.ai/keys) | `anthropic-compatible` or `openai-compatible` | Pick the provider type that matches the upstream endpoint you configure. |
+| DeepSeek | [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) | `anthropic-compatible` or `openai-compatible` | Match `type` and paths to the endpoint family you intend to use. |
+| Wafer | [wafer.ai](https://www.wafer.ai/) | `anthropic-compatible` | Use its native Messages endpoint when configuring direct Anthropic routing. |
+| Google AI Studio | [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey) | `openai-compatible` | Use Google's OpenAI-compatible API base when configuring this as a generic provider. |
+| Mistral La Plateforme | [console.mistral.ai](https://console.mistral.ai/) | `openai-compatible` | Use the OpenAI-compatible API base documented by Mistral. |
+| Groq | [console.groq.com/keys](https://console.groq.com/keys) | `openai-compatible` | Some models reject unsupported request fields; validate with a small request first. |
+| Cerebras Cloud | [cloud.cerebras.ai](https://cloud.cerebras.ai/) | `openai-compatible` | Use the OpenAI-compatible API base from Cerebras docs. |
 
 ## Local Providers Without API Keys
 
@@ -47,7 +47,7 @@ Provider portals, free tiers, and model catalogs change frequently. Treat the li
 
 ## Config Field Checklist
 
-After creating a key, add it to your environment and reference it from the provider config:
+After creating a key, add it to your environment under any name you choose and reference that same name from the provider config:
 
 ```bash
 export PROVIDER_API_KEY=sk-...
