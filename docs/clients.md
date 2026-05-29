@@ -18,6 +18,17 @@ env OPENAI_API_KEY=dummy \
   codex exec --skip-git-repo-check -m gpt-5.5 "Reply with exactly PROXY_OK"
 ```
 
+## GitHub Copilot CLI
+
+```bash
+env COPILOT_PROVIDER_BASE_URL=http://localhost:1337/v1 \
+  COPILOT_PROVIDER_TYPE=openai \
+  COPILOT_PROVIDER_WIRE_API=responses \
+  COPILOT_MODEL=gpt-5.5 \
+  COPILOT_OFFLINE=true \
+  copilot -p "Reply with exactly PROXY_OK" -s
+```
+
 ## Gemini CLI
 
 ```bash
