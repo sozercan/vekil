@@ -136,24 +136,36 @@ func parseServeFlagsForTest(t *testing.T, args ...string) serveFlags {
 func TestServeFlagsQuietSuppressesWarningsAndForcesErrorLogLevel(t *testing.T) {
 	const envKey = "RESPONSES_WS_ENABLED"
 
-	t.Setenv(envKey, "not-a-bool")
-
-	var stderr bytes.Buffer
-	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	serve := registerServeFlagsWithWarningWriter(fs, serveFlagWarningWriter([]string{"--quiet"}, &stderr))
-	if err := fs.Parse([]string{"--quiet"}); err != nil {
-		t.Fatalf("parse serve flags: %v", err)
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "bare quiet", args: []string{"--quiet"}},
+		{name: "explicit true", args: []string{"--quiet=1"}},
 	}
 
-	if got := stderr.String(); got != "" {
-		t.Fatalf("expected quiet mode to suppress warnings, got %q", got)
-	}
-	if serve.quiet == nil || !*serve.quiet {
-		t.Fatal("quiet flag was not enabled")
-	}
-	if got := serve.effectiveLogLevel(); got != logger.LevelError {
-		t.Fatalf("effectiveLogLevel() = %v, want %v", got, logger.LevelError)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(envKey, "not-a-bool")
+
+			var stderr bytes.Buffer
+			fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			serve := registerServeFlagsWithWarningWriter(fs, serveFlagWarningWriter(tc.args, &stderr))
+			if err := fs.Parse(tc.args); err != nil {
+				t.Fatalf("parse serve flags: %v", err)
+			}
+
+			if got := stderr.String(); got != "" {
+				t.Fatalf("expected quiet mode to suppress warnings, got %q", got)
+			}
+			if serve.quiet == nil || !*serve.quiet {
+				t.Fatal("quiet flag was not enabled")
+			}
+			if got := serve.effectiveLogLevel(); got != logger.LevelError {
+				t.Fatalf("effectiveLogLevel() = %v, want %v", got, logger.LevelError)
+			}
+		})
 	}
 }
 

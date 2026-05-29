@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -423,13 +424,23 @@ func serveFlagWarningWriter(args []string, stderr io.Writer) io.Writer {
 func quietRequested(args []string) bool {
 	quiet := false
 	for _, arg := range args {
-		switch arg {
-		case "-quiet", "--quiet":
+		if arg == "-quiet" || arg == "--quiet" {
 			quiet = true
-		case "-quiet=false", "--quiet=false":
-			quiet = false
-		case "-quiet=true", "--quiet=true":
-			quiet = true
+			continue
+		}
+
+		var value string
+		switch {
+		case strings.HasPrefix(arg, "-quiet="):
+			value = strings.TrimPrefix(arg, "-quiet=")
+		case strings.HasPrefix(arg, "--quiet="):
+			value = strings.TrimPrefix(arg, "--quiet=")
+		default:
+			continue
+		}
+
+		if parsed, err := strconv.ParseBool(value); err == nil {
+			quiet = parsed
 		}
 	}
 	return quiet
