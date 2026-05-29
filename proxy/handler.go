@@ -673,6 +673,10 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ProxyHandler) checkProviderReady(ctx context.Context, provider *providerRuntime) error {
+	if providerSkipsReadyzProbe(provider) {
+		return nil
+	}
+
 	req, err := h.newProviderProbeRequest(ctx, provider)
 	if err != nil {
 		return err
@@ -694,6 +698,18 @@ func (h *ProxyHandler) checkProviderReady(ctx context.Context, provider *provide
 	}
 
 	return nil
+}
+
+func providerSkipsReadyzProbe(provider *providerRuntime) bool {
+	if provider == nil {
+		return false
+	}
+	switch provider.kind {
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+		return provider.modelDiscovery == providerModelDiscoveryStatic
+	default:
+		return false
+	}
 }
 
 func (h *ProxyHandler) newProviderProbeRequest(ctx context.Context, provider *providerRuntime) (*http.Request, error) {
@@ -880,9 +896,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 				continue
 			}
 			allDynamicProvidersUnchanged = false
-			if len(setup.providers) > 1 {
-				refreshedDynamicModels[provider.id] = models
-			}
+			refreshedDynamicModels[provider.id] = models
 			if result.etag != "" {
 				mergedETag = result.etag
 			}

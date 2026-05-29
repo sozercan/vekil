@@ -134,7 +134,7 @@ Anthropic-compatible providers directly forward Anthropic `POST /v1/messages` to
 |-------|------------|---------|
 | `type` | all providers | Use `openai-compatible` or `anthropic-compatible` for generic providers. |
 | `base_url` | generic providers | Upstream origin and any fixed API prefix. The proxy appends only the configured path field. |
-| `api_key`, `api_key_env` | generic providers | Static credential value or environment variable name. |
+| `api_key`, `api_key_env` | generic providers | Static credential value or the name of any environment variable you choose. |
 | `auth_type` | generic providers | `bearer`, `api-key-header`, or `none`. Defaults to `bearer` when a key is present, otherwise `none`. |
 | `auth_header`, `auth_prefix` | generic providers | Header name and optional prefix for `api-key-header`, or overrides for bearer auth. |
 | `extra_headers` | generic providers | Fixed headers to add to every upstream request after client Copilot headers are stripped. |

@@ -98,7 +98,10 @@ func (h *ProxyHandler) shouldForwardAnthropicMessagesDirect(model string) bool {
 }
 
 func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *http.Request, body []byte, req *models.AnthropicRequest) {
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(req != nil && req.Stream)
+	streaming := req != nil && req.Stream
+	publicModel, upstreamModel := h.directAnthropicResponseModels(req)
+
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(streaming)
 	defer upstreamCancel()
 
 	resp, err := h.postAnthropicMessages(upstreamCtx, body, anthropicExtraHeadersFromRequest(r))
@@ -117,7 +120,38 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 		return
 	}
 
+	if resp.StatusCode == http.StatusOK && streaming {
+		writeDirectAnthropicStreamResponse(w, resp, publicModel, upstreamModel)
+		return
+	}
+	if resp.StatusCode == http.StatusOK {
+		if err := writeDirectAnthropicJSONResponse(w, resp, publicModel, upstreamModel); err != nil {
+			h.log.Error("upstream response rewrite failed", logger.F("endpoint", "anthropic"), logger.Err(err))
+			writeAnthropicError(w, http.StatusBadGateway, "api_error", "failed to read upstream response")
+		}
+		return
+	}
+
 	writeUpstreamResponse(w, resp)
+}
+
+func (h *ProxyHandler) directAnthropicResponseModels(req *models.AnthropicRequest) (string, string) {
+	if req == nil {
+		return "", ""
+	}
+	publicModel := strings.TrimSpace(req.Model)
+	upstreamModel := publicModel
+	_, owner, known := h.resolveProviderModel(req.Model, providerEndpointMessages)
+	if !known {
+		return publicModel, upstreamModel
+	}
+	if owner.publicID != "" {
+		publicModel = owner.publicID
+	}
+	if owner.upstreamModel != "" {
+		upstreamModel = owner.upstreamModel
+	}
+	return publicModel, upstreamModel
 }
 
 func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp *http.Response, mode chatCompletionsMode, handlers chatCompletionsResponseHandlers) error {

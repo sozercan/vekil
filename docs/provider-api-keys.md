@@ -8,6 +8,7 @@ Provider portals, free tiers, and model catalogs change frequently. Treat the li
 
 - Prefer `api_key_env` over inline `api_key` for any config you might commit or share.
 - Use any environment variable name you want; it only needs to match the provider's `api_key_env` value.
+- Names like `AZURE_OPENAI_API_KEY` or `PROVIDER_API_KEY` in examples are placeholders, not names Vekil treats specially.
 - Use `auth_type: none` only for local providers or a trusted private upstream.
 - Keep `models[].endpoints` limited to routes you have validated for that model. Vekil does not infer `/responses` from OpenAI compatibility.
 - Do not paste provider keys into client configs. Clients point at Vekil with dummy local keys; Vekil holds the upstream provider credentials.
@@ -17,7 +18,7 @@ Provider portals, free tiers, and model catalogs change frequently. Treat the li
 | Provider | How To Authenticate | Vekil Config |
 |----------|---------------------|--------------|
 | GitHub Copilot | Run `vekil login`, opt into GitHub CLI auth with `vekil login --github-cli`, or set `COPILOT_GITHUB_TOKEN` for non-interactive runs. | `type: copilot` |
-| Azure OpenAI | Create an Azure OpenAI resource/deployment in the Azure Portal or Azure AI Foundry, then copy a resource key. | `type: azure-openai`, `api_key_env: AZURE_OPENAI_API_KEY` |
+| Azure OpenAI | Create an Azure OpenAI resource/deployment in the Azure Portal or Azure AI Foundry, then copy a resource key. | `type: azure-openai`, `api_key_env: <the env var name you exported>` |
 | OpenAI Codex | Run `codex login` so `~/.codex/auth.json` exists. API keys are not used for this provider. | `type: openai-codex` |
 
 ## Generic Provider Key Pages
@@ -47,7 +48,7 @@ Provider portals, free tiers, and model catalogs change frequently. Treat the li
 
 ## Config Field Checklist
 
-After creating a key, add it to your environment under any name you choose and reference that same name from the provider config:
+After creating a key, add it to your environment under any name you choose and reference that exact name from the provider config:
 
 ```bash
 export PROVIDER_API_KEY=sk-...

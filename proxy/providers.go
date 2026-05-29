@@ -805,7 +805,7 @@ func configuredProviderExtraHeaders(configured map[string]string) (http.Header, 
 		if value == "" {
 			continue
 		}
-		headers.Set(http.CanonicalHeaderKey(name), value)
+		headers.Set(name, value)
 	}
 	if len(headers) == 0 {
 		return nil, nil
@@ -1816,25 +1816,44 @@ func mergeDiscoveredProviderModelsWithStaticConfig(provider *providerRuntime, di
 
 	merged := make([]providerModel, 0, len(discovered))
 	for _, model := range discovered {
-		cfg, ok := provider.staticConfigs[model.publicID]
-		if !ok {
+		configs := staticConfigsForDiscoveredProviderModel(provider, model)
+		if len(configs) == 0 {
 			merged = append(merged, model)
 			continue
 		}
 
-		staticModel, err := buildStaticProviderModel(provider.id, cfg, defaultStaticEndpointsForProvider(provider.kind))
-		if err != nil {
-			merged = append(merged, model)
-			continue
+		for _, cfg := range configs {
+			staticModel, err := buildStaticProviderModel(provider.id, cfg, defaultStaticEndpointsForProvider(provider.kind))
+			if err != nil {
+				continue
+			}
+			staticModel.disabled = model.disabled
+			staticModel.raw, err = mergeProviderModelMetadataOverlayRaw(staticModel.raw, model.raw, cfg)
+			if err != nil {
+				staticModel.raw = mergeProviderModelRaw(staticModel.raw, staticModel.supportedEndpoints)
+			}
+			merged = append(merged, staticModel)
 		}
-		staticModel.disabled = model.disabled
-		staticModel.raw, err = mergeProviderModelMetadataOverlayRaw(staticModel.raw, model.raw, cfg)
-		if err != nil {
-			staticModel.raw = mergeProviderModelRaw(staticModel.raw, staticModel.supportedEndpoints)
-		}
-		merged = append(merged, staticModel)
 	}
 	return merged
+}
+
+func staticConfigsForDiscoveredProviderModel(provider *providerRuntime, model providerModel) []ProviderModelConfig {
+	if provider == nil || len(provider.staticOrder) == 0 {
+		return nil
+	}
+
+	configs := make([]ProviderModelConfig, 0, 1)
+	for _, publicID := range provider.staticOrder {
+		cfg, ok := provider.staticConfigs[publicID]
+		if !ok {
+			continue
+		}
+		if publicID == model.publicID || strings.TrimSpace(cfg.Deployment) == model.publicID {
+			configs = append(configs, cfg)
+		}
+	}
+	return configs
 }
 
 func decodeOllamaModelsFromBody(provider *providerRuntime, body []byte) ([]providerModel, error) {

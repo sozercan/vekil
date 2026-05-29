@@ -171,9 +171,9 @@ func providerAllowsUnknownModelEndpoint(provider *providerRuntime, endpoint stri
 	}
 	switch provider.kind {
 	case providerTypeOpenAICompatible:
-		return endpoint == providerEndpointChatCompletions
+		return providerUsesDynamicModels(provider) && endpoint == providerEndpointChatCompletions
 	case providerTypeAnthropicCompatible:
-		return endpoint == providerEndpointMessages
+		return providerUsesDynamicModels(provider) && endpoint == providerEndpointMessages
 	default:
 		return true
 	}
@@ -215,4 +215,85 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func writeDirectAnthropicJSONResponse(w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) error {
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	rewritten, changed := rewriteAnthropicResponseModelJSON(body, publicModel, upstreamModel)
+
+	copyPassthroughHeaders(w.Header(), resp.Header)
+	if changed {
+		w.Header().Del("Content-Length")
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(rewritten)
+	return nil
+}
+
+func writeDirectAnthropicStreamResponse(w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) {
+	defer func() { _ = resp.Body.Close() }()
+
+	copyPassthroughHeaders(w.Header(), resp.Header)
+	w.Header().Del("Content-Length")
+	setSSEHeaders(w)
+	w.WriteHeader(resp.StatusCode)
+	streamAnthropicPassthroughBody(w, resp.Body, publicModel, upstreamModel)
+}
+
+func rewriteAnthropicResponseModelJSON(body []byte, publicModel, upstreamModel string) ([]byte, bool) {
+	publicModel = strings.TrimSpace(publicModel)
+	upstreamModel = strings.TrimSpace(upstreamModel)
+	if publicModel == "" || publicModel == upstreamModel {
+		return body, false
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body, false
+	}
+
+	changed := rewriteAnthropicModelFields(payload, publicModel)
+	if !changed {
+		return body, false
+	}
+
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return body, false
+	}
+	return rewritten, true
+}
+
+func rewriteAnthropicModelFields(payload map[string]json.RawMessage, publicModel string) bool {
+	if len(payload) == 0 || strings.TrimSpace(publicModel) == "" {
+		return false
+	}
+
+	changed := false
+	if rawJSONString(payload["model"]) != "" {
+		rawModel, err := json.Marshal(publicModel)
+		if err == nil {
+			payload["model"] = rawModel
+			changed = true
+		}
+	}
+
+	var message map[string]json.RawMessage
+	if err := json.Unmarshal(payload["message"], &message); err == nil && len(message) > 0 && rawJSONString(message["model"]) != "" {
+		rawModel, err := json.Marshal(publicModel)
+		if err == nil {
+			message["model"] = rawModel
+			if rawMessage, err := json.Marshal(message); err == nil {
+				payload["message"] = rawMessage
+				changed = true
+			}
+		}
+	}
+
+	return changed
 }

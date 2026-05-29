@@ -243,6 +243,49 @@ func TestHandleReadyz(t *testing.T) {
 		}
 	})
 
+	t.Run("static generic provider does not require models probe", func(t *testing.T) {
+		var probeHits atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			probeHits.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer upstream.Close()
+
+		h, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.New(logger.LevelInfo),
+			WithProvidersConfig(ProvidersConfig{
+				Providers: []ProviderConfig{{
+					ID:       "local",
+					Type:     "openai-compatible",
+					Default:  true,
+					BaseURL:  upstream.URL,
+					AuthType: "none",
+					Models: []ProviderModelConfig{{
+						PublicID:  "local-public",
+						Endpoints: []string{"/chat/completions"},
+					}},
+				}},
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler returned error: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		w := httptest.NewRecorder()
+		h.HandleReadyz(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+		}
+		if got := probeHits.Load(); got != 0 {
+			t.Fatalf("expected no upstream probe, got %d hits", got)
+		}
+	})
+
 	t.Run("canceled request does not rewrite readiness status", func(t *testing.T) {
 		var probeHits atomic.Int32
 		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -5863,6 +5906,9 @@ func TestHandleAnthropicMessages_DirectGenericAnthropicCompatibleProvider(t *tes
 	if anthropicResp.ID != "msg-direct" || len(anthropicResp.Content) != 1 || anthropicResp.Content[0].Text == nil || *anthropicResp.Content[0].Text != "direct" {
 		t.Fatalf("unexpected direct Anthropic response: %+v", anthropicResp)
 	}
+	if anthropicResp.Model != "claude-public" {
+		t.Fatalf("direct Anthropic response model = %q, want public alias", anthropicResp.Model)
+	}
 }
 
 func TestHandleAnthropicMessages_DirectGenericAnthropicCompatibleProviderStreamsSSE(t *testing.T) {
@@ -5927,6 +5973,63 @@ func TestHandleAnthropicMessages_DirectGenericAnthropicCompatibleProviderStreams
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), "stream-direct") {
 		t.Fatalf("expected direct SSE body to pass through, got %q", body)
+	}
+	if !strings.Contains(string(body), `"model":"claude-public"`) {
+		t.Fatalf("expected direct SSE model to be rewritten to public alias, got %q", body)
+	}
+	if strings.Contains(string(body), `"model":"claude-upstream"`) {
+		t.Fatalf("direct SSE leaked upstream model: %q", body)
+	}
+	if !w.Flushed {
+		t.Fatal("expected direct SSE response to flush")
+	}
+}
+
+func TestHandleOpenAIChatCompletions_RejectsUnknownStaticGenericModel(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:       "local",
+				Type:     "openai-compatible",
+				Default:  true,
+				BaseURL:  upstream.URL,
+				AuthType: "none",
+				Models: []ProviderModelConfig{{
+					PublicID:  "local-public",
+					Endpoints: []string{"/chat/completions"},
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model": "other",
+		"messages": [{"role": "user", "content": "Hello"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, body)
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("expected unknown static model to be rejected before upstream, got %d hits", got)
 	}
 }
 
@@ -6010,6 +6113,222 @@ func TestHandleModels_GenericOpenAICompatibleEndpointVisibility(t *testing.T) {
 	}
 	if got := codexBySlug["responses-capable"]; got.Visibility != "list" || !got.SupportedInAPI {
 		t.Fatalf("responses-capable Codex metadata = %+v, want listed and supported", got)
+	}
+}
+
+func TestHandleResponses_AllowsDiscoveredDynamicGenericResponsesModel(t *testing.T) {
+	var responsesHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"dynamic-responses","object":"model","supported_endpoints":["/responses"],"name":"Dynamic Responses"}]}`))
+		case "/responses":
+			responsesHits.Add(1)
+			var upstreamReq map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+				t.Fatalf("decode upstream request: %v", err)
+			}
+			if got := rawJSONString(upstreamReq["model"]); got != "dynamic-responses" {
+				t.Fatalf("upstream model = %q, want dynamic-responses", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-dynamic","object":"response","status":"completed","model":"dynamic-responses","output":[]}`))
+		default:
+			t.Fatalf("unexpected upstream path %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:             "dynamic",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        upstream.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	modelsReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	modelsW := httptest.NewRecorder()
+	handler.HandleModels(modelsW, modelsReq)
+	if resp := modelsW.Result(); resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected models 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model": "dynamic-responses",
+		"input": "Hello"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if got := responsesHits.Load(); got != 1 {
+		t.Fatalf("expected one responses hit, got %d", got)
+	}
+}
+
+func TestHandleModels_GenericDynamicDiscoveryMatchesStaticAliasByDeployment(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			t.Fatalf("unexpected upstream path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"upstream-model","object":"model","supported_endpoints":["/chat/completions","/responses"],"name":"Upstream Model"}]}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:             "dynamic",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        upstream.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+				Models: []ProviderModelConfig{{
+					PublicID:   "public-alias",
+					Deployment: "upstream-model",
+					Endpoints:  []string{"/responses"},
+					Name:       "Public Alias",
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	handler.HandleModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Data []struct {
+			ID                 string   `json:"id"`
+			Name               string   `json:"name"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	if len(result.Data) != 1 {
+		t.Fatalf("models count = %d, want 1: %+v", len(result.Data), result.Data)
+	}
+	if result.Data[0].ID != "public-alias" {
+		t.Fatalf("model id = %q, want public-alias", result.Data[0].ID)
+	}
+	if result.Data[0].Name != "Public Alias" {
+		t.Fatalf("model name = %q, want Public Alias", result.Data[0].Name)
+	}
+	if !reflect.DeepEqual(result.Data[0].SupportedEndpoints, []string{"/responses"}) {
+		t.Fatalf("supported endpoints = %v, want [/responses]", result.Data[0].SupportedEndpoints)
+	}
+}
+
+func TestHandleModels_GenericDynamicDiscoveryExpandsDeploymentAliases(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			t.Fatalf("unexpected upstream path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"upstream-model","object":"model","supported_endpoints":["/chat/completions","/responses"],"name":"Upstream Model"}]}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:             "dynamic",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        upstream.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+				Models: []ProviderModelConfig{
+					{
+						PublicID:   "public-chat",
+						Deployment: "upstream-model",
+						Endpoints:  []string{"/chat/completions"},
+						Name:       "Public Chat",
+					},
+					{
+						PublicID:   "public-responses",
+						Deployment: "upstream-model",
+						Endpoints:  []string{"/responses"},
+						Name:       "Public Responses",
+					},
+				},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	handler.HandleModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Data []struct {
+			ID                 string   `json:"id"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+
+	endpointsByID := make(map[string][]string, len(result.Data))
+	for _, model := range result.Data {
+		endpointsByID[model.ID] = model.SupportedEndpoints
+	}
+	if len(endpointsByID) != 2 {
+		t.Fatalf("models = %+v, want two public aliases", result.Data)
+	}
+	if !reflect.DeepEqual(endpointsByID["public-chat"], []string{"/chat/completions"}) {
+		t.Fatalf("public-chat endpoints = %v, want [/chat/completions]", endpointsByID["public-chat"])
+	}
+	if !reflect.DeepEqual(endpointsByID["public-responses"], []string{"/responses"}) {
+		t.Fatalf("public-responses endpoints = %v, want [/responses]", endpointsByID["public-responses"])
+	}
+	if _, exists := endpointsByID["upstream-model"]; exists {
+		t.Fatalf("upstream model should be replaced by configured public aliases")
 	}
 }
 
