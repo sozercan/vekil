@@ -119,7 +119,11 @@ func mergeHeaderValues(dst, src http.Header) {
 
 func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*providerRuntime, []byte, error) {
 	model := extractRequestModel(body)
-	provider, owner, known := h.resolveProviderModel(model, endpoint)
+	lookupModel := model
+	if endpoint == providerEndpointMessages {
+		lookupModel = NormalizeModelName(model)
+	}
+	provider, owner, known := h.resolveProviderModel(lookupModel, endpoint)
 	if provider == nil {
 		return nil, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no provider available for endpoint %s", endpoint)}
 	}

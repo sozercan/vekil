@@ -5985,6 +5985,88 @@ func TestHandleAnthropicMessages_DirectGenericAnthropicCompatibleProviderStreams
 	}
 }
 
+func TestHandleAnthropicMessages_DirectGenericAnthropicCompatibleProviderNormalizesModelAlias(t *testing.T) {
+	var openAIHits atomic.Int32
+	openAIUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		openAIHits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer openAIUpstream.Close()
+
+	anthropicUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var upstreamReq models.AnthropicRequest
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamReq.Model != "claude-upstream" {
+			t.Fatalf("upstream model = %q, want claude-upstream", upstreamReq.Model)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg-normalized","type":"message","role":"assistant","model":"claude-upstream","content":[{"type":"text","text":"normalized"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer anthropicUpstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{
+					ID:       "openai-default",
+					Type:     "openai-compatible",
+					Default:  true,
+					BaseURL:  openAIUpstream.URL,
+					AuthType: "none",
+					Models: []ProviderModelConfig{{
+						PublicID:  "gpt-default",
+						Endpoints: []string{"/chat/completions"},
+					}},
+				},
+				{
+					ID:       "native",
+					Type:     "anthropic-compatible",
+					BaseURL:  anthropicUpstream.URL,
+					AuthType: "none",
+					Models: []ProviderModelConfig{{
+						PublicID:   "claude-sonnet-4.5",
+						Deployment: "claude-upstream",
+					}},
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model": "claude-sonnet-4-5",
+		"max_tokens": 64,
+		"messages": [{"role": "user", "content": "Hello"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var anthropicResp models.AnthropicResponse
+	if err := json.NewDecoder(resp.Body).Decode(&anthropicResp); err != nil {
+		t.Fatalf("decode Anthropic response: %v", err)
+	}
+	if anthropicResp.Model != "claude-sonnet-4.5" {
+		t.Fatalf("response model = %q, want normalized public alias", anthropicResp.Model)
+	}
+	if got := openAIHits.Load(); got != 0 {
+		t.Fatalf("expected normalized Anthropic model to route direct, got %d OpenAI hits", got)
+	}
+}
+
 func TestHandleOpenAIChatCompletions_RejectsUnknownStaticGenericModel(t *testing.T) {
 	var upstreamHits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -6408,7 +6490,7 @@ func TestHandleModels_GenericOpenRouterToolsDiscoveryFiltersToolModels(t *testin
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[
-			{"id":"tool-capable","name":"Tool Capable","supported_parameters":["tools","tool_choice"]},
+			{"id":"tool-capable","name":"Tool Capable","supported_parameters":["tools","tool_choice"],"supported_endpoints":["/chat/completions"]},
 			{"id":"plain-chat","name":"Plain Chat","supported_parameters":["temperature"]}
 		]}`))
 	}))

@@ -501,6 +501,17 @@ func TestBuildProvidersGenericValidation(t *testing.T) {
 			want: "requires auth_header",
 		},
 		{
+			name: "configured api key env must be set",
+			cfg: ProviderConfig{
+				ID:        "local",
+				Type:      "openai-compatible",
+				BaseURL:   "http://localhost:1234",
+				APIKeyEnv: "VEKIL_TEST_MISSING_GENERIC_API_KEY",
+				Models:    []ProviderModelConfig{{PublicID: "m"}},
+			},
+			want: "api_key_env",
+		},
+		{
 			name: "path rejects query",
 			cfg: ProviderConfig{
 				ID:                  "local",

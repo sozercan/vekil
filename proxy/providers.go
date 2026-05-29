@@ -742,8 +742,12 @@ func normalizeProviderPath(configured, fallback, field string) (string, error) {
 
 func configuredGenericProviderAuth(cfg ProviderConfig) (providerAuthType, string, string, string, error) {
 	apiKey := strings.TrimSpace(cfg.APIKey)
-	if apiKey == "" && strings.TrimSpace(cfg.APIKeyEnv) != "" {
-		apiKey = strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.APIKeyEnv)))
+	apiKeyEnv := strings.TrimSpace(cfg.APIKeyEnv)
+	if apiKey == "" && apiKeyEnv != "" {
+		apiKey = strings.TrimSpace(os.Getenv(apiKeyEnv))
+		if apiKey == "" {
+			return "", "", "", "", fmt.Errorf("api_key_env %q is not set or is empty", apiKeyEnv)
+		}
 	}
 
 	authType := providerAuthType(strings.TrimSpace(cfg.AuthType))
@@ -1753,7 +1757,7 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			continue
 		}
 
-		supportedEndpoints := normalizeDynamicProviderEndpoints(parsed.SupportedEndpoints)
+		supportedEndpoints := normalizeDynamicProviderEndpoints(provider, parsed.SupportedEndpoints)
 		if len(supportedEndpoints) == 0 {
 			supportedEndpoints = defaultDynamicProviderEndpoints(provider)
 		}
@@ -2083,7 +2087,7 @@ func rawQueryHasParam(rawQuery, name string) bool {
 	return ok
 }
 
-func normalizeDynamicProviderEndpoints(endpoints []string) []string {
+func normalizeDynamicProviderEndpoints(provider *providerRuntime, endpoints []string) []string {
 	if len(endpoints) == 0 {
 		return nil
 	}
@@ -2093,6 +2097,9 @@ func normalizeDynamicProviderEndpoints(endpoints []string) []string {
 	for _, endpoint := range endpoints {
 		endpoint = strings.TrimSpace(endpoint)
 		if endpoint == "" {
+			continue
+		}
+		if provider != nil && provider.kind == providerTypeAnthropicCompatible && endpoint != providerEndpointMessages {
 			continue
 		}
 		if _, exists := seen[endpoint]; exists {

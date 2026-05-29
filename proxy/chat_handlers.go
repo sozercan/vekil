@@ -93,7 +93,7 @@ func anthropicExtraHeadersFromRequest(r *http.Request) http.Header {
 }
 
 func (h *ProxyHandler) shouldForwardAnthropicMessagesDirect(model string) bool {
-	provider, _, _ := h.resolveProviderModel(model, providerEndpointMessages)
+	provider, _, _ := h.resolveProviderModel(NormalizeModelName(model), providerEndpointMessages)
 	return provider != nil && provider.kind == providerTypeAnthropicCompatible
 }
 
@@ -141,7 +141,7 @@ func (h *ProxyHandler) directAnthropicResponseModels(req *models.AnthropicReques
 	}
 	publicModel := strings.TrimSpace(req.Model)
 	upstreamModel := publicModel
-	_, owner, known := h.resolveProviderModel(req.Model, providerEndpointMessages)
+	_, owner, known := h.resolveProviderModel(NormalizeModelName(req.Model), providerEndpointMessages)
 	if !known {
 		return publicModel, upstreamModel
 	}

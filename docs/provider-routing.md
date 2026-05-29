@@ -40,7 +40,7 @@ Vekil does not run `az login` for you. For local development, sign in with Azure
 - `auth_type: none` sends no auth header, useful for local providers.
 - `extra_headers` adds fixed provider headers after client Copilot-identifying headers are stripped.
 
-When `auth_type` is omitted, Vekil uses `bearer` if `api_key` or `api_key_env` is set, otherwise `none`.
+When `auth_type` is omitted, Vekil uses `bearer` if `api_key` or `api_key_env` is set, otherwise `none`. If `api_key_env` is configured, the referenced environment variable must be set and non-empty at startup.
 
 ## Provider Routing
 

@@ -9,6 +9,7 @@ Provider portals, free tiers, and model catalogs change frequently. Treat the li
 - Prefer `api_key_env` over inline `api_key` for any config you might commit or share.
 - Use any environment variable name you want; it only needs to match the provider's `api_key_env` value.
 - Names like `AZURE_OPENAI_API_KEY` or `PROVIDER_API_KEY` in examples are placeholders, not names Vekil treats specially.
+- If `api_key_env` is set in config, that environment variable must be set and non-empty before Vekil starts.
 - Use `auth_type: none` only for local providers or a trusted private upstream.
 - Keep `models[].endpoints` limited to routes you have validated for that model. Vekil does not infer `/responses` from OpenAI compatibility.
 - Do not paste provider keys into client configs. Clients point at Vekil with dummy local keys; Vekil holds the upstream provider credentials.
