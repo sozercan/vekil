@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -215,6 +216,7 @@ type serveFlags struct {
 	host                            *string
 	tokenDir                        *string
 	providersConfigPath             *string
+	quiet                           *bool
 	logLevel                        *string
 	streamingUpstreamTimeout        *time.Duration
 	copilotEditorVersion            *string
@@ -240,6 +242,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
+		quiet:                           fs.Bool("quiet", getEnvBool("QUIET", false), "Suppress non-error output"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
 		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
@@ -282,11 +285,19 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 	}
 }
 
+func (f serveFlags) loggerLevel() logger.Level {
+	level := logger.ParseLevel(*f.logLevel)
+	if *f.quiet && level < logger.LevelError {
+		return logger.LevelError
+	}
+	return level
+}
+
 func runServe() {
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+	log := logger.New(serve.loggerLevel())
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
@@ -356,7 +367,7 @@ func getEnvBool(key string, fallback bool) bool {
 	}
 	parsed, err := strconv.ParseBool(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
+		warnf("warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -369,7 +380,7 @@ func getEnvInt(key string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
+		warnf("warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -382,8 +393,39 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	}
 	parsed, err := time.ParseDuration(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
+		warnf("warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
+}
+
+func warnf(format string, args ...interface{}) {
+	if quietRequested(os.Args[1:]) {
+		return
+	}
+	_, _ = fmt.Fprintf(os.Stderr, format, args...)
+}
+
+func quietRequested(args []string) bool {
+	if v := strings.TrimSpace(os.Getenv("QUIET")); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil && parsed {
+			return true
+		}
+	}
+
+	for _, arg := range args {
+		switch arg {
+		case "--":
+			return false
+		case "--quiet":
+			return true
+		}
+
+		if value, ok := strings.CutPrefix(arg, "--quiet="); ok {
+			parsed, err := strconv.ParseBool(value)
+			return err == nil && parsed
+		}
+	}
+
+	return false
 }
