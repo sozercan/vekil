@@ -224,6 +224,15 @@ func TestServeFlagsQuietSuppressesNonErrorLogs(t *testing.T) {
 	}
 }
 
+func TestServeFlagsQuietIgnoresGenericQUIETEnv(t *testing.T) {
+	t.Setenv("QUIET", "true")
+
+	serve := parseServeFlagsForTest(t, "--log-level", "debug")
+	if got := serve.loggerLevel(); got != logger.LevelDebug {
+		t.Fatalf("loggerLevel() = %v, want %v", got, logger.LevelDebug)
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string

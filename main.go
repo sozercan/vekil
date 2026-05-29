@@ -242,7 +242,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
-		quiet:                           fs.Bool("quiet", getEnvBool("QUIET", false), "Suppress non-error output"),
+		quiet:                           fs.Bool("quiet", false, "Suppress non-error output"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
 		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
@@ -407,12 +407,6 @@ func warnf(format string, args ...interface{}) {
 }
 
 func quietRequested(args []string) bool {
-	if v := strings.TrimSpace(os.Getenv("QUIET")); v != "" {
-		if parsed, err := strconv.ParseBool(v); err == nil && parsed {
-			return true
-		}
-	}
-
 	for _, arg := range args {
 		switch arg {
 		case "--":
