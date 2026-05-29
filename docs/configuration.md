@@ -11,6 +11,7 @@ Vekil supports two runtime patterns:
 |------|-----|
 | Runtime flags, env vars, and Copilot header overrides | This file |
 | Provider auth, JSON/YAML routing examples, model ownership, and provider metadata | [Provider Routing](provider-routing.md) |
+| Provider console links and API-key setup patterns | [Provider API Keys](provider-api-keys.md) |
 | Optional shell command rewrite and tool-output reduction config | [Tool Optimizers](tool-optimizers.md) |
 | Codex-style `GET /v1/responses` websocket bridge and compaction tuning | [Responses WebSocket Bridge](responses-websocket.md) |
 
@@ -45,6 +46,7 @@ These overrides only affect Copilot-backed upstream requests. For provider-level
 Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership of public model IDs across providers. Provider config files can be JSON (`.json`) or YAML (`.yaml`/`.yml`).
 
 - See [Provider Routing](provider-routing.md) for auth notes, generic-compatible provider fields, provider examples, routing rules, endpoint allowlists, and model metadata.
+- See [Provider API Keys](provider-api-keys.md) for provider console links and key-to-config mapping.
 - See [Tool Optimizers](tool-optimizers.md) for the optional `tool_optimizers` block that can live alongside `providers` in the same config file.
 
 ## Responses WebSocket Bridge

@@ -1,6 +1,6 @@
 # Provider Routing and Authentication
 
-Use this file when editing provider credentials, model ownership, JSON/YAML provider configs, provider header profiles, or provider-specific model metadata. For global flags and env vars, see [Configuration](configuration.md).
+Use this file when editing provider credentials, model ownership, JSON/YAML provider configs, provider header profiles, or provider-specific model metadata. For where to obtain provider keys, see [Provider API Keys](provider-api-keys.md). For global flags and env vars, see [Configuration](configuration.md).
 
 ## Provider Authentication
 

@@ -9,6 +9,7 @@ This folder is intentionally split into small, single-purpose files so humans an
 | [`getting-started.md`](getting-started.md) | install, run, first authentication, deployment entry points | startup flow or distribution changes |
 | [`configuration.md`](configuration.md) | configuration map, generic CLI flags/env vars, and Copilot header overrides | generic flags, env vars, or Copilot header defaults change |
 | [`provider-routing.md`](provider-routing.md) | provider auth, JSON/YAML routing examples, model ownership, endpoint allowlists | providers, routing behavior, auth, or model metadata changes |
+| [`provider-api-keys.md`](provider-api-keys.md) | where to get provider API keys and how to map them into providers config | provider signup/key URLs or auth field guidance changes |
 | [`tool-optimizers.md`](tool-optimizers.md) | optional shell command rewrite and tool-output reduction config | optimizer config or behavior changes |
 | [`responses-websocket.md`](responses-websocket.md) | Codex-style `GET /v1/responses` websocket bridge tuning | websocket bridge, auto-compaction, or compact retry knobs change |
 | [`clients.md`](clients.md) | copy-paste client examples | onboarding snippets or client compatibility changes |

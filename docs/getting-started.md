@@ -74,7 +74,7 @@ kubectl apply -f k8s/vekil.yaml
 
 ## First Run And Authentication
 
-Startup behavior depends on active providers. For the full auth matrix, see [Provider Authentication](provider-routing.md#provider-authentication).
+Startup behavior depends on active providers. For the full auth matrix, see [Provider Authentication](provider-routing.md#provider-authentication). For provider console links and key setup patterns, see [Provider API Keys](provider-api-keys.md).
 
 ### GitHub Copilot
 

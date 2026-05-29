@@ -64,6 +64,7 @@ Documentation lives under [`docs/`](docs/README.md); start with these:
 | [Getting Started](docs/getting-started.md)                   | Install, run, first auth            |
 | [Configuration](docs/configuration.md)                       | Config map and generic flags        |
 | [Provider Routing](docs/provider-routing.md)                 | Provider auth and model ownership   |
+| [Provider API Keys](docs/provider-api-keys.md)               | Where to get provider keys          |
 | [Tool Optimizers](docs/tool-optimizers.md)                   | Shell rewrite/output reduction      |
 | [Responses WebSocket](docs/responses-websocket.md)           | Websocket bridge tuning             |
 | [Client Examples](docs/clients.md)                           | Copy-paste snippets per client      |
