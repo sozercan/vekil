@@ -163,7 +163,7 @@ providers:
           - /chat/completions
 ```
 
-LM Studio and llama.cpp usually fit the same shape with local auth disabled:
+LM Studio, llama.cpp, and AIKit usually fit the same shape with local auth disabled:
 
 ```yaml
 providers:
@@ -178,6 +178,8 @@ providers:
         endpoints:
           - /chat/completions
 ```
+
+For AIKit's default quick-start port, use `base_url: http://localhost:8080/v1` and set `deployment` to the model name served by the image, such as `llama-3.1-8b-instruct`.
 
 Z.ai-style OpenAI-compatible providers can use the same config, but set `base_url` exactly to the upstream API base documented by the provider. Do not append `/v1` unless the provider's OpenAI-compatible base URL includes it.
 

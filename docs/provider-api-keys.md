@@ -42,6 +42,7 @@ Provider portals, free tiers, and model catalogs change frequently. Treat the li
 |----------|-------------|--------------|
 | LM Studio | `http://localhost:1234/v1` | `type: openai-compatible`, `auth_type: none` |
 | llama.cpp server | commonly `http://localhost:8080/v1` | `type: openai-compatible`, `auth_type: none` |
+| AIKit | `http://localhost:8080/v1` | `type: openai-compatible`, `auth_type: none` |
 | Ollama | `http://localhost:11434` | `type: openai-compatible`, `auth_type: none`, `model_discovery: ollama`, `models_path: /api/tags`, `chat_completions_path: /v1/chat/completions` |
 
 ## Config Field Checklist
