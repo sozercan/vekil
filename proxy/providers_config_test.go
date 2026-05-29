@@ -699,3 +699,210 @@ func TestBuildProvidersAzureMalformedBaseURLRejected(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadProvidersConfigFileAzureIdentityAuth(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name      string
+		ext       string
+		body      string
+		wantScope string
+	}{
+		{
+			name: "JSON",
+			ext:  ".json",
+			body: `{
+  "providers": [{
+    "id": "foundry",
+    "type": "azure-openai",
+    "auth_mode": "azure_identity",
+    "token_scope": "https://custom.example/.default",
+    "base_url": "https://example.services.ai.azure.com/api/projects/project/openai/v1",
+    "models": [{"public_id":"gpt-5.4","deployment":"gpt-5.4","endpoints":["/responses"]}]
+  }]
+}`,
+			wantScope: "https://custom.example/.default",
+		},
+		{
+			name: "YAML",
+			ext:  ".yaml",
+			body: `providers:
+  - id: foundry
+    type: azure-openai
+    auth_mode: azure_identity
+    token_scope: https://custom.example/.default
+    base_url: https://example.services.ai.azure.com/api/projects/project/openai/v1
+    models:
+      - public_id: gpt-5.4
+        deployment: gpt-5.4
+        endpoints:
+          - /responses
+`,
+			wantScope: "https://custom.example/.default",
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			providersPath := filepath.Join(t.TempDir(), "providers"+tc.ext)
+			if err := os.WriteFile(providersPath, []byte(tc.body), 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+
+			cfg, err := LoadProvidersConfigFile(providersPath)
+			if err != nil {
+				t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+			}
+			providerCfg := cfg.Providers[0]
+			if providerCfg.AuthMode != "azure_identity" {
+				t.Fatalf("auth_mode = %q, want azure_identity", providerCfg.AuthMode)
+			}
+			if providerCfg.TokenScope != tc.wantScope {
+				t.Fatalf("token_scope = %q, want %q", providerCfg.TokenScope, tc.wantScope)
+			}
+
+			factory := &recordingAzureIdentityFactory{source: &staticAzureTokenSource{token: "entra-token"}}
+			handler := &ProxyHandler{
+				copilotURL:                      "https://copilot.example.com",
+				azureIdentityTokenSourceFactory: factory.factory,
+			}
+			providers, _, defaultProviderID, err := handler.buildProviders(cfg)
+			if err != nil {
+				t.Fatalf("buildProviders() error = %v", err)
+			}
+			if defaultProviderID != "foundry" {
+				t.Fatalf("default provider = %q, want foundry", defaultProviderID)
+			}
+			provider := providers["foundry"]
+			if provider == nil {
+				t.Fatal("expected foundry provider to be built")
+			}
+			if provider.authMode != providerAuthModeAzureIdentity {
+				t.Fatalf("provider.authMode = %q, want azure_identity", provider.authMode)
+			}
+			if provider.tokenScope != tc.wantScope || factory.scope != tc.wantScope {
+				t.Fatalf("token scopes = provider %q factory %q, want %q", provider.tokenScope, factory.scope, tc.wantScope)
+			}
+			if provider.apiKey != "" {
+				t.Fatalf("provider.apiKey = %q, want empty for Azure identity", provider.apiKey)
+			}
+			if provider.azureToken == nil {
+				t.Fatal("provider.azureToken = nil, want configured token source")
+			}
+			if factory.calls.Load() != 1 {
+				t.Fatalf("Azure identity factory calls = %d, want 1", factory.calls.Load())
+			}
+		})
+	}
+}
+
+func TestBuildProvidersAzureIdentityDefaultScope(t *testing.T) {
+	t.Parallel()
+
+	factory := &recordingAzureIdentityFactory{source: &staticAzureTokenSource{token: "entra-token"}}
+	handler := &ProxyHandler{
+		copilotURL:                      "https://copilot.example.com",
+		azureIdentityTokenSourceFactory: factory.factory,
+	}
+	providers, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
+		ID:       "foundry",
+		Type:     "azure-openai",
+		BaseURL:  "https://example.services.ai.azure.com/api/projects/project/openai/v1",
+		AuthMode: "azure_identity",
+		Models: []ProviderModelConfig{{
+			PublicID: "gpt-5.4",
+		}},
+	}}})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+	provider := providers["foundry"]
+	if provider == nil {
+		t.Fatal("expected foundry provider to be built")
+	}
+	if provider.tokenScope != defaultAzureIdentityTokenScope {
+		t.Fatalf("provider.tokenScope = %q, want %q", provider.tokenScope, defaultAzureIdentityTokenScope)
+	}
+	if factory.scope != defaultAzureIdentityTokenScope {
+		t.Fatalf("factory scope = %q, want %q", factory.scope, defaultAzureIdentityTokenScope)
+	}
+}
+
+func TestBuildProvidersAzureAuthModeValidation(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name    string
+		cfg     ProviderConfig
+		wantErr string
+	}{
+		{
+			name: "unknown auth mode",
+			cfg: ProviderConfig{
+				AuthMode: "managed_identity",
+			},
+			wantErr: "unsupported auth_mode",
+		},
+		{
+			name: "azure identity rejects api key",
+			cfg: ProviderConfig{
+				AuthMode: "azure_identity",
+				APIKey:   "key",
+			},
+			wantErr: "cannot be combined with api_key or api_key_env",
+		},
+		{
+			name: "azure identity rejects api key env",
+			cfg: ProviderConfig{
+				AuthMode:  "azure_identity",
+				APIKeyEnv: "AZURE_OPENAI_API_KEY",
+			},
+			wantErr: "cannot be combined with api_key or api_key_env",
+		},
+		{
+			name: "api key mode rejects token scope",
+			cfg: ProviderConfig{
+				AuthMode:   "api_key",
+				APIKey:     "key",
+				TokenScope: "https://ai.azure.com/.default",
+			},
+			wantErr: "token_scope is only valid",
+		},
+		{
+			name:    "api key mode still requires key",
+			cfg:     ProviderConfig{},
+			wantErr: "must set api_key or api_key_env",
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := tc.cfg
+			cfg.ID = "azure"
+			cfg.Type = "azure-openai"
+			cfg.BaseURL = "https://example.openai.azure.com/openai/v1"
+			cfg.Models = []ProviderModelConfig{{PublicID: "gpt-5.4"}}
+
+			handler := &ProxyHandler{
+				copilotURL: "https://copilot.example.com",
+				azureIdentityTokenSourceFactory: func(string, string) (azureTokenSource, error) {
+					return &staticAzureTokenSource{token: "entra-token"}, nil
+				},
+			}
+			_, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{cfg}})
+			if err == nil {
+				t.Fatal("buildProviders() error = nil, want validation error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("buildProviders() error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}

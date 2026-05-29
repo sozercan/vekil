@@ -17,11 +17,15 @@ import (
 )
 
 type providerType string
+type providerAuthMode string
 
 const (
 	providerTypeCopilot     providerType = "copilot"
 	providerTypeAzureOpenAI providerType = "azure-openai"
 	providerTypeOpenAICodex providerType = "openai-codex"
+
+	providerAuthModeAPIKey        providerAuthMode = "api_key"
+	providerAuthModeAzureIdentity providerAuthMode = "azure_identity"
 )
 
 var defaultStaticProviderEndpoints = []string{"/chat/completions", "/responses"}
@@ -42,9 +46,11 @@ type ProviderConfig struct {
 	IncludeModels []string                    `json:"include_models,omitempty" yaml:"include_models,omitempty"`
 	ExcludeModels []string                    `json:"exclude_models,omitempty" yaml:"exclude_models,omitempty"`
 	BaseURL       string                      `json:"base_url,omitempty" yaml:"base_url,omitempty"`
+	AuthMode      string                      `json:"auth_mode,omitempty" yaml:"auth_mode,omitempty"`
 	APIKey        string                      `json:"api_key,omitempty" yaml:"api_key,omitempty"`
 	APIKeyEnv     string                      `json:"api_key_env,omitempty" yaml:"api_key_env,omitempty"`
 	APIVersion    string                      `json:"api_version,omitempty" yaml:"api_version,omitempty"`
+	TokenScope    string                      `json:"token_scope,omitempty" yaml:"token_scope,omitempty"`
 	Headers       CopilotHeaderProfilesConfig `json:"headers,omitempty" yaml:"headers,omitempty"`
 	Models        []ProviderModelConfig       `json:"models,omitempty" yaml:"models,omitempty"`
 }
@@ -69,8 +75,11 @@ type providerRuntime struct {
 	kind           providerType
 	isDefault      bool
 	baseURL        string
+	authMode       providerAuthMode
 	apiKey         string
 	apiVersion     string
+	tokenScope     string
+	azureToken     azureTokenSource
 	includeModels  map[string]struct{}
 	excludeModels  map[string]struct{}
 	staticModels   map[string]providerModel
@@ -390,7 +399,7 @@ func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*provider
 	copilotProviders := 0
 
 	for _, raw := range cfg.Providers {
-		provider, err := buildProviderRuntime(raw, h.copilotURL)
+		provider, err := buildProviderRuntime(raw, h.copilotURL, h.azureIdentityTokenSourceFactory)
 		if err != nil {
 			return nil, nil, "", err
 		}
@@ -442,7 +451,7 @@ func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*provider
 	return providers, providerOrder, defaultProviderID, nil
 }
 
-func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string) (*providerRuntime, error) {
+func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIdentityFactory azureIdentityTokenSourceFactory) (*providerRuntime, error) {
 	id := strings.TrimSpace(cfg.ID)
 	if id == "" {
 		return nil, fmt.Errorf("provider id is required")
@@ -491,18 +500,50 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string) (*provid
 		switch classifyAzureBaseURL(baseURL) {
 		case azureBaseURLKindOpenAIV1, azureBaseURLKindLegacyOpenAI:
 		case azureBaseURLKindModels:
-			return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: Azure AI Foundry /models inference endpoints are not supported; use the OpenAI-compatible endpoint ending in /openai/v1 instead", id, baseURL)
+			return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: Microsoft Foundry /models inference endpoints are not supported; use the OpenAI-compatible endpoint ending in /openai/v1 instead", id, baseURL)
 		default:
 			return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: expected an absolute URL whose path ends in /openai/v1 or /openai, with no query string or fragment", id, baseURL)
 		}
 		runtime.baseURL = baseURL
 		runtime.apiVersion = strings.TrimSpace(cfg.APIVersion)
-		runtime.apiKey = strings.TrimSpace(cfg.APIKey)
-		if runtime.apiKey == "" && strings.TrimSpace(cfg.APIKeyEnv) != "" {
-			runtime.apiKey = strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.APIKeyEnv)))
+
+		authMode := providerAuthMode(strings.TrimSpace(cfg.AuthMode))
+		if authMode == "" {
+			authMode = providerAuthModeAPIKey
 		}
-		if runtime.apiKey == "" {
-			return nil, fmt.Errorf("provider %q must set api_key or api_key_env", id)
+		switch authMode {
+		case providerAuthModeAPIKey:
+			if strings.TrimSpace(cfg.TokenScope) != "" {
+				return nil, fmt.Errorf("provider %q token_scope is only valid with auth_mode %q", id, providerAuthModeAzureIdentity)
+			}
+			runtime.authMode = providerAuthModeAPIKey
+			runtime.apiKey = strings.TrimSpace(cfg.APIKey)
+			if runtime.apiKey == "" && strings.TrimSpace(cfg.APIKeyEnv) != "" {
+				runtime.apiKey = strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.APIKeyEnv)))
+			}
+			if runtime.apiKey == "" {
+				return nil, fmt.Errorf("provider %q must set api_key or api_key_env", id)
+			}
+		case providerAuthModeAzureIdentity:
+			if strings.TrimSpace(cfg.APIKey) != "" || strings.TrimSpace(cfg.APIKeyEnv) != "" {
+				return nil, fmt.Errorf("provider %q auth_mode %q cannot be combined with api_key or api_key_env", id, providerAuthModeAzureIdentity)
+			}
+			tokenScope := strings.TrimSpace(cfg.TokenScope)
+			if tokenScope == "" {
+				tokenScope = defaultAzureIdentityTokenScope
+			}
+			if azureIdentityFactory == nil {
+				azureIdentityFactory = newDefaultAzureIdentityTokenSource
+			}
+			tokenSource, err := azureIdentityFactory(id, tokenScope)
+			if err != nil {
+				return nil, err
+			}
+			runtime.authMode = providerAuthModeAzureIdentity
+			runtime.tokenScope = tokenScope
+			runtime.azureToken = tokenSource
+		default:
+			return nil, fmt.Errorf("provider %q has unsupported auth_mode %q", id, cfg.AuthMode)
 		}
 		if len(cfg.Models) == 0 {
 			return nil, fmt.Errorf("provider %q must configure at least one model", id)
@@ -603,6 +644,13 @@ func (p *providerRuntime) allowsModel(model string) bool {
 		return false
 	}
 	return true
+}
+
+func (p *providerRuntime) azureAuthMode() providerAuthMode {
+	if p == nil || p.authMode == "" {
+		return providerAuthModeAPIKey
+	}
+	return p.authMode
 }
 
 func providerModelCollisionError(publicID, existingProviderID, incomingProviderID string) error {
@@ -898,7 +946,22 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 		h.setCopilotHeadersForProvider(req, token, provider, endpoint)
 	case providerTypeAzureOpenAI:
 		clearCopilotHeaders(req.Header)
-		req.Header.Set("api-key", provider.apiKey)
+		req.Header.Del("api-key")
+		switch provider.azureAuthMode() {
+		case providerAuthModeAPIKey:
+			req.Header.Set("api-key", provider.apiKey)
+		case providerAuthModeAzureIdentity:
+			if provider.azureToken == nil {
+				return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no Azure identity token source configured", provider.id)}
+			}
+			token, err := provider.azureToken.AccessToken(req.Context())
+			if err != nil {
+				return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q Azure identity auth failed: %w", provider.id, err)}
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+		default:
+			return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has unsupported auth mode %q", provider.id, provider.authMode)}
+		}
 		req.Header.Set("Content-Type", "application/json")
 	case providerTypeOpenAICodex:
 		clearCopilotHeaders(req.Header)

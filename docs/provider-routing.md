@@ -20,9 +20,16 @@ OpenAI Codex uses the ChatGPT/Codex CLI credentials in `~/.codex/auth.json` by d
 
 OpenAI Codex requires file-based ChatGPT auth from `codex login`; API-key auth and OS keychain-backed credentials are not read by the proxy.
 
-### Azure OpenAI
+### Azure OpenAI and Microsoft Foundry
 
-Azure OpenAI credentials are configured in the provider entry, using either `api_key` or `api_key_env`.
+Azure providers support two auth modes:
+
+- **API key auth**: omit `auth_mode` or set `auth_mode: api_key`, then configure either `api_key` or `api_key_env`. This preserves the existing behavior and sends Azure's `api-key` header upstream.
+- **Microsoft Entra auth**: set `auth_mode: azure_identity`. Vekil uses the Azure SDK `DefaultAzureCredential` chain, sends `Authorization: Bearer <token>`, and does not send an `api-key` header. Do not configure `api_key` or `api_key_env` in this mode.
+
+For Entra auth, `token_scope` is optional and defaults to `https://ai.azure.com/.default`, which is appropriate for Microsoft Foundry OpenAI-compatible endpoints. Override it if your resource requires a different Azure audience, such as `https://cognitiveservices.azure.com/.default` for classic Azure OpenAI deployments.
+
+Vekil does not run `az login` for you. For local development, sign in with Azure CLI or another credential supported by `DefaultAzureCredential`; in hosted environments, use managed identity, workload identity, or environment credentials. The signed-in principal needs the required Azure RBAC role, for example Cognitive Services OpenAI User on the target resource.
 
 ## Provider Routing
 
@@ -45,6 +52,25 @@ providers:
         endpoints:
           - /responses
         name: GPT-5.4 Pro
+```
+
+### Microsoft Foundry Entra Example
+
+```yaml
+providers:
+  - id: foundry
+    type: azure-openai
+    default: true
+    auth_mode: azure_identity
+    # Optional; defaults to https://ai.azure.com/.default
+    token_scope: https://ai.azure.com/.default
+    base_url: https://myresource.services.ai.azure.com/api/projects/myproject/openai/v1
+    models:
+      - public_id: gpt-5.4
+        deployment: gpt-5.4
+        endpoints:
+          - /responses
+        name: GPT-5.4
 ```
 
 ### Copilot + Azure Example
@@ -116,8 +142,9 @@ Routing rules:
 - Azure `models[]` remains the routing source of truth. The proxy does not autodiscover new Azure deployments for inference.
 - OpenAI Codex discovers models dynamically from its upstream `/models` endpoint and exposes only models that are listed and supported in the API.
 - OpenAI Codex models are `/responses`-only. The proxy rejects `/chat/completions` for those models instead of probing an unsupported route.
+- Azure `auth_mode` is optional and defaults to `api_key`. Supported values are `api_key` and `azure_identity`.
 - Azure `base_url` must be an absolute URL whose path ends with either the OpenAI-compatible `/openai/v1` path or the legacy `/openai` path, with no query string or fragment.
-- Azure AI Foundry inference URLs ending in `/models` are not supported in `type: "azure-openai"` configs. Use the corresponding OpenAI-compatible `.../openai/v1` endpoint instead.
+- Microsoft Foundry inference URLs ending in `/models` are not supported in `type: "azure-openai"` configs. Use the corresponding OpenAI-compatible `.../openai/v1` endpoint instead.
 - For `/openai/v1` base URLs, omit `api_version`; the proxy calls `/chat/completions`, `/responses`, and `/models` directly with no `api-version` query string.
 - For legacy `/openai` base URLs, set `api_version`; the proxy appends `api-version=...` to upstream requests.
 - Public model IDs are global across all providers. Startup fails if two providers expose the same ID.

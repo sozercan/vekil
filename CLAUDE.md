@@ -82,11 +82,11 @@ Documentation update rules:
 - **Responses compatibility is proxy-owned**: `/v1/responses/compact` and `/v1/memories/trace_summarize` are compatibility shims implemented on top of the upstream `/responses` API. Preserve this behavior for Codex-style clients.
 - **OpenAI passthrough is near-zero-copy, not literal zero-copy**: chat completions may inject `parallel_tool_calls` and force streaming; `/v1/responses` may rewrite proxy-owned compaction items before forwarding.
 - **Provider endpoint support is explicit**: `models[].endpoints` is an allowlist. Do not advertise `/chat/completions` or other routes for a provider/model unless that upstream capability has been verified. The Azure `gpt-5.4-pro` example configuration is `/responses`-only.
-- **Azure support is OpenAI-compatible provider routing, not a separate public surface**: Azure deployment names stay internal to provider config, and Azure `/models` probing is only a best-effort metadata overlay for configured models.
+- **Azure support is OpenAI-compatible provider routing, not a separate public surface**: Azure deployment names stay internal to provider config, Azure auth is provider-configured as either API-key or SDK-backed Entra auth, and Azure `/models` probing is only a best-effort metadata overlay for configured models.
 - **OpenAI Codex support is file-auth-backed provider routing**: Codex models use the CLI ChatGPT auth file, dynamic `/models` discovery, and `/responses`-only routing.
 - **Proxy websocket bridging is not upstream realtime**: `GET /v1/responses` remains a proxy-owned websocket transport over upstream HTTP `/responses`. Do not describe it as native Azure websocket or `/realtime` support.
 - **Tool optimizers are opt-in and fail-open**: keep them disabled by default. External optimizer errors, timeouts, invalid JSON, or invalid replacements must fall back to the original payload and preserve default passthrough behavior.
-- **Minimal dependencies**: Keep third-party deps minimal. Current direct non-stdlib dependencies used in production code include `github.com/pkg/browser`, `fyne.io/systray`, `github.com/godbus/dbus/v5`, `github.com/google/uuid`, `github.com/gorilla/websocket`, `github.com/klauspost/compress`, and `gopkg.in/yaml.v3`.
+- **Minimal dependencies**: Keep third-party deps minimal and justify new production dependencies by the feature boundary they support.
 - **Distroless container**: Single static binary, `CGO_ENABLED=0`.
 
 ## Code Conventions

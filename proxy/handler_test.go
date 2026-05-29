@@ -8644,3 +8644,321 @@ func TestHandleOpenAIChatCompletions_InvalidGzipBodyReturnsBadRequest(t *testing
 		t.Errorf("error.type = %v, want invalid_request_error", errResp["error"]["type"])
 	}
 }
+
+func TestNewProviderJSONRequest_StripsClientHeadersForAzureIdentity(t *testing.T) {
+	tokenSource := &staticAzureTokenSource{token: "entra-token"}
+	handler := &ProxyHandler{}
+	provider := &providerRuntime{
+		id:         "foundry",
+		kind:       providerTypeAzureOpenAI,
+		baseURL:    "https://foundry.example.test/openai/v1",
+		authMode:   providerAuthModeAzureIdentity,
+		azureToken: tokenSource,
+	}
+
+	req, err := handler.newProviderJSONRequest(
+		context.Background(),
+		provider,
+		http.MethodPost,
+		"/responses",
+		[]byte(`{"model":"gpt-test"}`),
+		http.Header{
+			"Authorization":          []string{"Bearer client-copilot-token"},
+			"api-key":                []string{"client-api-key"},
+			"editor-version":         []string{"client-editor"},
+			"editor-plugin-version":  []string{"client-plugin"},
+			"user-agent":             []string{"client-agent"},
+			"copilot-integration-id": []string{"client-integration"},
+			"x-github-api-version":   []string{"client-api"},
+			"x-request-id":           []string{"client-request-id"},
+			"openai-intent":          []string{"client-intent"},
+			"Traceparent":            []string{"00-11111111111111111111111111111111-2222222222222222-01"},
+		},
+		"",
+	)
+	if err != nil {
+		t.Fatalf("newProviderJSONRequest() error = %v", err)
+	}
+
+	if got := req.Header.Get("Authorization"); got != "Bearer entra-token" {
+		t.Fatalf("Authorization = %q, want Azure identity bearer token", got)
+	}
+	if got := req.Header.Get("api-key"); got != "" {
+		t.Fatalf("api-key = %q, want omitted for Azure identity", got)
+	}
+	for _, header := range []string{"editor-version", "editor-plugin-version", "user-agent", "copilot-integration-id", "x-github-api-version", "x-request-id", "openai-intent"} {
+		if got := req.Header.Get(header); got != "" {
+			t.Fatalf("%s = %q, want stripped for Azure", header, got)
+		}
+	}
+	if got := req.Header.Get("Traceparent"); got != "00-11111111111111111111111111111111-2222222222222222-01" {
+		t.Fatalf("Traceparent = %q, want passthrough trace header", got)
+	}
+	if tokenSource.calls.Load() != 1 {
+		t.Fatalf("token source calls = %d, want 1", tokenSource.calls.Load())
+	}
+}
+
+func TestHandleReadyz_AzureIdentityProvider(t *testing.T) {
+	tokenSource := &staticAzureTokenSource{token: "readyz-entra-token"}
+
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/openai/v1/models" {
+			t.Fatalf("expected Azure readiness path /openai/v1/models, got %s", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer readyz-entra-token" {
+			t.Fatalf("expected Azure identity Authorization header, got %q", got)
+		}
+		if got := r.Header.Get("api-key"); got != "" {
+			t.Fatalf("expected no api-key header, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer azureServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "foundry",
+			Type:     "azure-openai",
+			Default:  true,
+			BaseURL:  azureServer.URL + "/openai/v1",
+			AuthMode: "azure_identity",
+			Models: []ProviderModelConfig{{
+				PublicID:  "gpt-5.4",
+				Endpoints: []string{"/responses"},
+			}},
+		}}}),
+		withAzureIdentityTokenSourceFactoryForTest(func(providerID, scope string) (azureTokenSource, error) {
+			if providerID != "foundry" {
+				t.Fatalf("providerID = %q, want foundry", providerID)
+			}
+			if scope != defaultAzureIdentityTokenScope {
+				t.Fatalf("scope = %q, want %q", scope, defaultAzureIdentityTokenScope)
+			}
+			return tokenSource, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	handler.HandleReadyz(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if tokenSource.calls.Load() != 1 {
+		t.Fatalf("token source calls = %d, want 1", tokenSource.calls.Load())
+	}
+}
+
+func TestHandleModels_AzureIdentityProviderUsesBearerForOverlay(t *testing.T) {
+	tokenSource := &staticAzureTokenSource{token: "models-entra-token"}
+	var overlayHits atomic.Int32
+
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		overlayHits.Add(1)
+		if got := r.URL.Path; got != "/openai/v1/models" {
+			t.Fatalf("expected Azure models path /openai/v1/models, got %s", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer models-entra-token" {
+			t.Fatalf("expected Azure identity Authorization header, got %q", got)
+		}
+		if got := r.Header.Get("api-key"); got != "" {
+			t.Fatalf("expected no api-key header, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.4","object":"model","owned_by":"azure"}]}`))
+	}))
+	defer azureServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "foundry",
+			Type:     "azure-openai",
+			Default:  true,
+			BaseURL:  azureServer.URL + "/openai/v1",
+			AuthMode: "azure_identity",
+			Models: []ProviderModelConfig{{
+				PublicID:  "gpt-5.4",
+				Endpoints: []string{"/responses"},
+			}},
+		}}}),
+		withAzureIdentityTokenSourceFactoryForTest(func(string, string) (azureTokenSource, error) {
+			return tokenSource, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	handler.HandleModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if overlayHits.Load() != 1 {
+		t.Fatalf("overlay hits = %d, want 1", overlayHits.Load())
+	}
+}
+
+func TestHandleResponses_RoutesConfiguredAzureIdentityProvider(t *testing.T) {
+	tokenSource := &staticAzureTokenSource{token: "responses-entra-token"}
+
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/openai/v1/responses" {
+			t.Fatalf("expected Azure path /openai/v1/responses, got %s", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer responses-entra-token" {
+			t.Fatalf("expected Azure identity Authorization header, got %q", got)
+		}
+		if got := r.Header.Get("api-key"); got != "" {
+			t.Fatalf("expected no api-key header, got %q", got)
+		}
+
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream request body: %v", err)
+		}
+		var upstreamReq map[string]json.RawMessage
+		if err := json.Unmarshal(bodyBytes, &upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		var model string
+		if err := json.Unmarshal(upstreamReq["model"], &model); err != nil {
+			t.Fatalf("decode upstream model: %v", err)
+		}
+		if model != "gpt-5-4-prod" {
+			t.Fatalf("expected Azure deployment gpt-5-4-prod, got %q", model)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-azure","object":"response","status":"completed","model":"gpt-5-4-prod","output":[]}`))
+	}))
+	defer azureServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "foundry",
+			Type:     "azure-openai",
+			Default:  true,
+			BaseURL:  azureServer.URL + "/openai/v1",
+			AuthMode: "azure_identity",
+			Models: []ProviderModelConfig{{
+				PublicID:   "gpt-5-public",
+				Deployment: "gpt-5-4-prod",
+				Endpoints:  []string{"/responses"},
+			}},
+		}}}),
+		withAzureIdentityTokenSourceFactoryForTest(func(string, string) (azureTokenSource, error) {
+			return tokenSource, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model": "gpt-5-public",
+		"input": "Hello"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestHandleOpenAIChatCompletions_RoutesConfiguredAzureIdentityProvider(t *testing.T) {
+	tokenSource := &staticAzureTokenSource{token: "chat-entra-token"}
+
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/openai/v1/chat/completions" {
+			t.Fatalf("expected Azure path /openai/v1/chat/completions, got %s", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer chat-entra-token" {
+			t.Fatalf("expected Azure identity Authorization header, got %q", got)
+		}
+		if got := r.Header.Get("api-key"); got != "" {
+			t.Fatalf("expected no api-key header, got %q", got)
+		}
+
+		var upstreamReq models.OpenAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamReq.Model != "gpt-5-4-prod" {
+			t.Fatalf("expected Azure deployment gpt-5-4-prod, got %q", upstreamReq.Model)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+			ID:     "chatcmpl-azure-identity",
+			Object: "chat.completion",
+			Choices: []models.OpenAIChoice{{
+				Index: 0,
+				Message: models.OpenAIMessage{
+					Role:    "assistant",
+					Content: json.RawMessage(`"Hi"`),
+				},
+			}},
+		})
+	}))
+	defer azureServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "foundry",
+			Type:     "azure-openai",
+			Default:  true,
+			BaseURL:  azureServer.URL + "/openai/v1",
+			AuthMode: "azure_identity",
+			Models: []ProviderModelConfig{{
+				PublicID:   "gpt-5-public",
+				Deployment: "gpt-5-4-prod",
+				Endpoints:  []string{"/chat/completions"},
+			}},
+		}}}),
+		withAzureIdentityTokenSourceFactoryForTest(func(string, string) (azureTokenSource, error) {
+			return tokenSource, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model": "gpt-5-public",
+		"messages": [{"role": "user", "content": "Hello"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+}
