@@ -215,6 +215,7 @@ type serveFlags struct {
 	host                            *string
 	tokenDir                        *string
 	providersConfigPath             *string
+	quiet                           *bool
 	logLevel                        *string
 	streamingUpstreamTimeout        *time.Duration
 	copilotEditorVersion            *string
@@ -235,28 +236,33 @@ type serveFlags struct {
 }
 
 func registerServeFlags(fs *flag.FlagSet) serveFlags {
+	return registerServeFlagsWithWarningWriter(fs, os.Stderr)
+}
+
+func registerServeFlagsWithWarningWriter(fs *flag.FlagSet, warningWriter io.Writer) serveFlags {
 	return serveFlags{
 		port:                            fs.String("port", getEnv("PORT", "1337"), "Listen port"),
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
+		quiet:                           fs.Bool("quiet", false, "Suppress non-error output"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
-		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
+		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDurationWithWarningWriter("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout(), warningWriter), "Timeout for streaming upstream inference requests"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
 		copilotPluginVersion:            fs.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header"),
 		copilotUserAgent:                fs.String("copilot-user-agent", getEnv("COPILOT_USER_AGENT", ""), "Upstream Copilot user-agent header"),
 		copilotIntegrationID:            fs.String("copilot-integration-id", getEnv("COPILOT_INTEGRATION_ID", ""), "Upstream Copilot copilot-integration-id header"),
 		copilotGitHubAPIVersion:         fs.String("copilot-github-api-version", getEnv("COPILOT_GITHUB_API_VERSION", ""), "Upstream Copilot x-github-api-version header"),
 		copilotOpenAIIntent:             fs.String("copilot-openai-intent", getEnv("COPILOT_OPENAI_INTENT", ""), "Upstream Copilot openai-intent header"),
-		responsesWSEnabled:              fs.Bool("responses-ws-enabled", getEnvBool("RESPONSES_WS_ENABLED", false), "Enable proxy-owned Codex websocket bridge on GET /v1/responses"),
-		responsesWSTurnStateDelta:       fs.Bool("responses-ws-turn-state-delta", getEnvBool("RESPONSES_WS_TURN_STATE_DELTA", false), "Attempt delta-only replay when upstream returns X-Codex-Turn-State"),
-		responsesWSDisableAutoCompact:   fs.Bool("responses-ws-disable-auto-compact", getEnvBool("RESPONSES_WS_DISABLE_AUTO_COMPACT", false), "Disable automatic websocket-session history compaction"),
-		responsesWSCompactMaxItems:      fs.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items"),
-		responsesWSCompactMaxBytes:      fs.Int("responses-ws-auto-compact-max-bytes", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes), "Auto-compact websocket session history after this many raw bytes"),
-		responsesWSCompactKeepTail:      fs.Int("responses-ws-auto-compact-keep-tail", getEnvInt("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail), "When auto-compacting websocket history, keep this many most recent items verbatim"),
-		compactUpstreamChunkBytes:       fs.Int("compact-upstream-chunk-bytes", getEnvInt("COMPACT_UPSTREAM_CHUNK_BYTES", proxy.DefaultCompactUpstreamChunkBytes()), "Target body size (bytes) for chunked /v1/responses/compact retries after an upstream 413; halved on each recursive 413 down to a 64 KiB floor"),
-		compactUpstreamChunkConcurrency: fs.Int("compact-upstream-chunk-concurrency", getEnvInt("COMPACT_UPSTREAM_CHUNK_CONCURRENCY", proxy.DefaultCompactUpstreamChunkConcurrency()), "Maximum sibling chunk compaction calls to run concurrently after the first chunk succeeds"),
-		compactUpstreamMaxAttempts:      fs.Int("compact-upstream-max-attempts", getEnvInt("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts()), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy"),
+		responsesWSEnabled:              fs.Bool("responses-ws-enabled", getEnvBoolWithWarningWriter("RESPONSES_WS_ENABLED", false, warningWriter), "Enable proxy-owned Codex websocket bridge on GET /v1/responses"),
+		responsesWSTurnStateDelta:       fs.Bool("responses-ws-turn-state-delta", getEnvBoolWithWarningWriter("RESPONSES_WS_TURN_STATE_DELTA", false, warningWriter), "Attempt delta-only replay when upstream returns X-Codex-Turn-State"),
+		responsesWSDisableAutoCompact:   fs.Bool("responses-ws-disable-auto-compact", getEnvBoolWithWarningWriter("RESPONSES_WS_DISABLE_AUTO_COMPACT", false, warningWriter), "Disable automatic websocket-session history compaction"),
+		responsesWSCompactMaxItems:      fs.Int("responses-ws-auto-compact-max-items", getEnvIntWithWarningWriter("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems, warningWriter), "Auto-compact websocket session history after this many items"),
+		responsesWSCompactMaxBytes:      fs.Int("responses-ws-auto-compact-max-bytes", getEnvIntWithWarningWriter("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes, warningWriter), "Auto-compact websocket session history after this many raw bytes"),
+		responsesWSCompactKeepTail:      fs.Int("responses-ws-auto-compact-keep-tail", getEnvIntWithWarningWriter("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail, warningWriter), "When auto-compacting websocket history, keep this many most recent items verbatim"),
+		compactUpstreamChunkBytes:       fs.Int("compact-upstream-chunk-bytes", getEnvIntWithWarningWriter("COMPACT_UPSTREAM_CHUNK_BYTES", proxy.DefaultCompactUpstreamChunkBytes(), warningWriter), "Target body size (bytes) for chunked /v1/responses/compact retries after an upstream 413; halved on each recursive 413 down to a 64 KiB floor"),
+		compactUpstreamChunkConcurrency: fs.Int("compact-upstream-chunk-concurrency", getEnvIntWithWarningWriter("COMPACT_UPSTREAM_CHUNK_CONCURRENCY", proxy.DefaultCompactUpstreamChunkConcurrency(), warningWriter), "Maximum sibling chunk compaction calls to run concurrently after the first chunk succeeds"),
+		compactUpstreamMaxAttempts:      fs.Int("compact-upstream-max-attempts", getEnvIntWithWarningWriter("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts(), warningWriter), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy"),
 	}
 }
 
@@ -282,11 +288,18 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 	}
 }
 
+func (f serveFlags) effectiveLogLevel() logger.Level {
+	if f.quiet != nil && *f.quiet {
+		return logger.LevelError
+	}
+	return logger.ParseLevel(*f.logLevel)
+}
+
 func runServe() {
-	serve := registerServeFlags(flag.CommandLine)
+	serve := registerServeFlagsWithWarningWriter(flag.CommandLine, serveFlagWarningWriter(os.Args[1:], os.Stderr))
 	flag.Parse()
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+	log := logger.New(serve.effectiveLogLevel())
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
@@ -350,40 +363,81 @@ func getEnv(key, fallback string) string {
 }
 
 func getEnvBool(key string, fallback bool) bool {
+	return getEnvBoolWithWarningWriter(key, fallback, os.Stderr)
+}
+
+func getEnvBoolWithWarningWriter(key string, fallback bool, warningWriter io.Writer) bool {
 	v := getEnv(key, "")
 	if v == "" {
 		return fallback
 	}
 	parsed, err := strconv.ParseBool(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
+		_, _ = fmt.Fprintf(warningWriterOrDiscard(warningWriter), "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
 }
 
 func getEnvInt(key string, fallback int) int {
+	return getEnvIntWithWarningWriter(key, fallback, os.Stderr)
+}
+
+func getEnvIntWithWarningWriter(key string, fallback int, warningWriter io.Writer) int {
 	v := getEnv(key, "")
 	if v == "" {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
+		_, _ = fmt.Fprintf(warningWriterOrDiscard(warningWriter), "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
 }
 
 func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	return getEnvDurationWithWarningWriter(key, fallback, os.Stderr)
+}
+
+func getEnvDurationWithWarningWriter(key string, fallback time.Duration, warningWriter io.Writer) time.Duration {
 	v := getEnv(key, "")
 	if v == "" {
 		return fallback
 	}
 	parsed, err := time.ParseDuration(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
+		_, _ = fmt.Fprintf(warningWriterOrDiscard(warningWriter), "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
+}
+
+func serveFlagWarningWriter(args []string, stderr io.Writer) io.Writer {
+	if quietRequested(args) {
+		return io.Discard
+	}
+	return warningWriterOrDiscard(stderr)
+}
+
+func quietRequested(args []string) bool {
+	quiet := false
+	for _, arg := range args {
+		switch arg {
+		case "-quiet", "--quiet":
+			quiet = true
+		case "-quiet=false", "--quiet=false":
+			quiet = false
+		case "-quiet=true", "--quiet=true":
+			quiet = true
+		}
+	}
+	return quiet
+}
+
+func warningWriterOrDiscard(w io.Writer) io.Writer {
+	if w == nil {
+		return io.Discard
+	}
+	return w
 }

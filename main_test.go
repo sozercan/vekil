@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -125,11 +126,35 @@ func parseServeFlagsForTest(t *testing.T, args ...string) serveFlags {
 	t.Helper()
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	serve := registerServeFlags(fs)
+	serve := registerServeFlagsWithWarningWriter(fs, serveFlagWarningWriter(args, io.Discard))
 	if err := fs.Parse(args); err != nil {
 		t.Fatalf("parse serve flags: %v", err)
 	}
 	return serve
+}
+
+func TestServeFlagsQuietSuppressesWarningsAndForcesErrorLogLevel(t *testing.T) {
+	const envKey = "RESPONSES_WS_ENABLED"
+
+	t.Setenv(envKey, "not-a-bool")
+
+	var stderr bytes.Buffer
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	serve := registerServeFlagsWithWarningWriter(fs, serveFlagWarningWriter([]string{"--quiet"}, &stderr))
+	if err := fs.Parse([]string{"--quiet"}); err != nil {
+		t.Fatalf("parse serve flags: %v", err)
+	}
+
+	if got := stderr.String(); got != "" {
+		t.Fatalf("expected quiet mode to suppress warnings, got %q", got)
+	}
+	if serve.quiet == nil || !*serve.quiet {
+		t.Fatal("quiet flag was not enabled")
+	}
+	if got := serve.effectiveLogLevel(); got != logger.LevelError {
+		t.Fatalf("effectiveLogLevel() = %v, want %v", got, logger.LevelError)
+	}
 }
 
 func TestServeFlagsCopilotHeaderEnvDefaults(t *testing.T) {
