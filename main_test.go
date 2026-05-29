@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -188,6 +189,40 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	}
 }
 
+func TestServeFlagsQuietSuppressesInfoLogs(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet")
+	if !*serve.quiet {
+		t.Fatal("--quiet should enable quiet mode")
+	}
+
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	os.Stderr = w
+	defer func() {
+		os.Stderr = old
+	}()
+
+	log := logger.New(serve.loggerLevel())
+	log.Info("info suppressed")
+	log.Error("error preserved")
+
+	_ = w.Close()
+
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	output := buf.String()
+
+	if strings.Contains(output, "info suppressed") {
+		t.Fatalf("quiet output unexpectedly contained info log: %q", output)
+	}
+	if !strings.Contains(output, "error preserved") {
+		t.Fatalf("quiet output missing error log: %q", output)
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -355,6 +390,28 @@ func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
 		if !strings.Contains(output, want) {
 			t.Fatalf("stderr missing %q, got %q", want, output)
 		}
+	}
+}
+
+func TestRunLoginQuietSuppressesSuccessOutput(t *testing.T) {
+	var stderr bytes.Buffer
+	fake := &fakeLoginAuthenticator{}
+
+	code := runLoginWithDeps([]string{"--gh", "--quiet"}, loginDeps{
+		stderr: &stderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return fake, nil
+		},
+	})
+
+	if code != 0 {
+		t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if fake.signInWithGitHubCLICalls != 1 {
+		t.Fatalf("SignInWithGitHubCLI calls = %d, want 1", fake.signInWithGitHubCLICalls)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("quiet login stderr = %q, want empty", got)
 	}
 }
 
