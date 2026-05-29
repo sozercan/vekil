@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -188,6 +189,18 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	}
 }
 
+func TestServeFlagsQuietForcesErrorLogLevel(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet")
+	if got := serve.loggerLevel(); got != logger.LevelError {
+		t.Fatalf("loggerLevel() with --quiet = %v, want %v", got, logger.LevelError)
+	}
+
+	serve = parseServeFlagsForTest(t, "--quiet", "--log-level", "error")
+	if got := serve.loggerLevel(); got != logger.LevelError {
+		t.Fatalf("loggerLevel() with --quiet --log-level=error = %v, want %v", got, logger.LevelError)
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -247,7 +260,7 @@ func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 			}
 
 			output := stderr.String()
-			for _, want := range []string{"github-cli", "gh", "force"} {
+			for _, want := range []string{"github-cli", "gh", "force", "quiet"} {
 				if !strings.Contains(output, want) {
 					t.Fatalf("help output missing %q:\n%s", want, output)
 				}
@@ -355,6 +368,28 @@ func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
 		if !strings.Contains(output, want) {
 			t.Fatalf("stderr missing %q, got %q", want, output)
 		}
+	}
+}
+
+func TestRunLoginQuietSuppressesNonErrorOutput(t *testing.T) {
+	var stderr bytes.Buffer
+	fake := &fakeLoginAuthenticator{}
+
+	code := runLoginWithDeps([]string{"--gh", "--quiet"}, loginDeps{
+		stderr: &stderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return fake, nil
+		},
+	})
+
+	if code != 0 {
+		t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if fake.signInWithGitHubCLICalls != 1 {
+		t.Fatalf("SignInWithGitHubCLI calls = %d, want 1", fake.signInWithGitHubCLICalls)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty output", got)
 	}
 }
 
