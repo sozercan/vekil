@@ -13,6 +13,7 @@ import (
 const (
 	upstreamErrorDetailMaxChars     = 1024
 	upstreamErrorDetailMaxBodyBytes = 4096
+	upstreamErrorDetailDrainBytes   = 64 * 1024
 )
 
 func formatUpstreamErrorMessage(statusCode int, body []byte) string {
@@ -129,8 +130,10 @@ func sanitizeUpstreamErrorText(value string) string {
 	if len(runes) <= upstreamErrorDetailMaxChars {
 		return value
 	}
-	if upstreamErrorDetailMaxChars <= len("…") {
+	ellipsis := "…"
+	ellipsisRunes := utf8.RuneCountInString(ellipsis)
+	if upstreamErrorDetailMaxChars <= ellipsisRunes {
 		return string(runes[:upstreamErrorDetailMaxChars])
 	}
-	return string(runes[:upstreamErrorDetailMaxChars-len("…")]) + "…"
+	return string(runes[:upstreamErrorDetailMaxChars-ellipsisRunes]) + ellipsis
 }

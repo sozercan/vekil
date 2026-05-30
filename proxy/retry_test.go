@@ -3,8 +3,11 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -241,6 +244,115 @@ func TestDoWithRetry_RespectsRetryAfter(t *testing.T) {
 	// Retry-After: 1 means at least 1 second of delay.
 	if elapsed < 900*time.Millisecond {
 		t.Errorf("expected at least ~1s delay from Retry-After, got %v", elapsed)
+	}
+}
+
+func TestReadRetryableUpstreamErrorBodyDrainsAfterBoundedCapture(t *testing.T) {
+	body := strings.Repeat("a", upstreamErrorDetailMaxBodyBytes+123)
+	reader := newRetryBodyReadCloser(body)
+
+	got := readRetryableUpstreamErrorBody(reader)
+	waitForRetryBodyClose(t, reader.closed)
+
+	if string(got) != body[:upstreamErrorDetailMaxBodyBytes] {
+		t.Fatalf("captured body = %q, want first %d bytes", string(got), upstreamErrorDetailMaxBodyBytes)
+	}
+	if unread := reader.Len(); unread != 0 {
+		t.Fatalf("expected response body to be drained to EOF, %d bytes unread", unread)
+	}
+}
+
+func TestReadRetryableUpstreamErrorBodyCapsDrainAfterCapture(t *testing.T) {
+	body := strings.Repeat("a", upstreamErrorDetailMaxBodyBytes+upstreamErrorDetailDrainBytes+123)
+	reader := newRetryBodyReadCloser(body)
+
+	got := readRetryableUpstreamErrorBody(reader)
+	waitForRetryBodyClose(t, reader.closed)
+
+	if string(got) != body[:upstreamErrorDetailMaxBodyBytes] {
+		t.Fatalf("captured body = %q, want first %d bytes", string(got), upstreamErrorDetailMaxBodyBytes)
+	}
+	if unread := reader.Len(); unread != 123 {
+		t.Fatalf("unread bytes after bounded drain = %d, want 123", unread)
+	}
+}
+
+func TestReadRetryableUpstreamErrorBodyDoesNotWaitForStalledDrain(t *testing.T) {
+	reader := newBlockingRetryBodyReadCloser(upstreamErrorDetailMaxBodyBytes)
+
+	start := time.Now()
+	got := readRetryableUpstreamErrorBody(reader)
+	elapsed := time.Since(start)
+
+	if len(got) != upstreamErrorDetailMaxBodyBytes {
+		t.Fatalf("captured body length = %d, want %d", len(got), upstreamErrorDetailMaxBodyBytes)
+	}
+	if elapsed >= upstreamErrorDetailDrainTimeout {
+		t.Fatalf("readRetryableUpstreamErrorBody elapsed = %v, want less than drain timeout %v", elapsed, upstreamErrorDetailDrainTimeout)
+	}
+	select {
+	case <-reader.closed:
+		t.Fatal("expected stalled drain to close asynchronously after timeout, not before return")
+	default:
+	}
+	waitForRetryBodyClose(t, reader.closed)
+}
+
+type retryBodyReadCloser struct {
+	*strings.Reader
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func newRetryBodyReadCloser(body string) *retryBodyReadCloser {
+	return &retryBodyReadCloser{
+		Reader: strings.NewReader(body),
+		closed: make(chan struct{}),
+	}
+}
+
+func (r *retryBodyReadCloser) Close() error {
+	r.closeOnce.Do(func() { close(r.closed) })
+	return nil
+}
+
+type blockingRetryBodyReadCloser struct {
+	remaining int
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func newBlockingRetryBodyReadCloser(prefixBytes int) *blockingRetryBodyReadCloser {
+	return &blockingRetryBodyReadCloser{
+		remaining: prefixBytes,
+		closed:    make(chan struct{}),
+	}
+}
+
+func (r *blockingRetryBodyReadCloser) Read(p []byte) (int, error) {
+	if r.remaining > 0 {
+		n := min(len(p), r.remaining)
+		for i := range n {
+			p[i] = 'a'
+		}
+		r.remaining -= n
+		return n, nil
+	}
+	<-r.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (r *blockingRetryBodyReadCloser) Close() error {
+	r.closeOnce.Do(func() { close(r.closed) })
+	return nil
+}
+
+func waitForRetryBodyClose(t *testing.T, closed <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-closed:
+	case <-time.After(upstreamErrorDetailDrainTimeout + time.Second):
+		t.Fatal("timed out waiting for response body to close")
 	}
 }
 

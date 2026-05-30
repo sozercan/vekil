@@ -6,8 +6,11 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 )
+
+const upstreamErrorDetailDrainTimeout = 250 * time.Millisecond
 
 // retryable returns true for status codes that warrant a retry.
 func retryable(statusCode int) bool {
@@ -140,7 +143,24 @@ func readRetryableUpstreamErrorBody(body io.ReadCloser) []byte {
 	if body == nil {
 		return nil
 	}
-	defer func() { _ = body.Close() }()
 	bodyBytes, _ := io.ReadAll(io.LimitReader(body, upstreamErrorDetailMaxBodyBytes))
+	drainRetryableUpstreamErrorBody(body)
 	return bodyBytes
+}
+
+func drainRetryableUpstreamErrorBody(body io.ReadCloser) {
+	// Drain a bounded remainder after the bounded capture. This preserves
+	// connection reuse for normal upstream error bodies without letting a huge or
+	// stalled body delay returning the synthesized error indefinitely.
+	go func() {
+		var closeOnce sync.Once
+		closeBody := func() {
+			closeOnce.Do(func() { _ = body.Close() })
+		}
+
+		timer := time.AfterFunc(upstreamErrorDetailDrainTimeout, closeBody)
+		_, _ = io.Copy(io.Discard, io.LimitReader(body, upstreamErrorDetailDrainBytes))
+		_ = timer.Stop()
+		closeBody()
+	}()
 }
