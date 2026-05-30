@@ -85,12 +85,16 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		}
 
 		retryAfterHeader := resp.Header.Get("Retry-After")
-
-		// Drain and close body before retry to allow connection reuse.
-		drainAndClose(resp.Body)
-		lastErr = &upstreamError{statusCode: resp.StatusCode}
+		upstreamErr := &upstreamError{
+			statusCode: resp.StatusCode,
+			retryAfter: retryAfterHeader,
+			headers:    resp.Header.Clone(),
+		}
+		lastErr = upstreamErr
 
 		if attempt < maxRetries-1 {
+			// Drain and close body before retry to allow connection reuse.
+			drainAndClose(resp.Body)
 			delay := backoff(retryDelay, attempt)
 			if ra, ok := parseRetryAfter(retryAfterHeader); ok && ra > delay {
 				delay = ra
@@ -98,6 +102,8 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 			if ctxErr := sleepWithContext(req.Context(), delay); ctxErr != nil {
 				return nil, ctxErr
 			}
+		} else {
+			upstreamErr.body = readRetryableUpstreamErrorBody(resp.Body)
 		}
 	}
 	return nil, lastErr
@@ -118,8 +124,23 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 
 type upstreamError struct {
 	statusCode int
+	body       []byte
+	retryAfter string
+	headers    http.Header
 }
 
 func (e *upstreamError) Error() string {
-	return http.StatusText(e.statusCode)
+	if e == nil {
+		return ""
+	}
+	return formatUpstreamErrorMessage(e.statusCode, e.body)
+}
+
+func readRetryableUpstreamErrorBody(body io.ReadCloser) []byte {
+	if body == nil {
+		return nil
+	}
+	defer func() { _ = body.Close() }()
+	bodyBytes, _ := io.ReadAll(io.LimitReader(body, upstreamErrorDetailMaxBodyBytes))
+	return bodyBytes
 }

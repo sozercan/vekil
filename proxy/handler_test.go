@@ -562,8 +562,9 @@ func TestHandleAnthropicMessagesInvalidJSON(t *testing.T) {
 
 func TestHandleAnthropicUpstreamError(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"error": "internal server error"}`))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"tool schema is invalid","type":"invalid_request_error","param":"tools.0","code":"invalid_tool_schema"}}`))
 	})
 
 	anthropicReq := `{
@@ -578,8 +579,8 @@ func TestHandleAnthropicUpstreamError(t *testing.T) {
 	handler.HandleAnthropicMessages(w, req)
 
 	resp := w.Result()
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("expected 500, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
 
 	var errResp models.AnthropicError
@@ -589,6 +590,11 @@ func TestHandleAnthropicUpstreamError(t *testing.T) {
 	}
 	if errResp.Error.Type != "api_error" {
 		t.Errorf("expected error type api_error, got %q", errResp.Error.Type)
+	}
+	for _, want := range []string{"upstream error (400)", "tool schema is invalid", "type=invalid_request_error", "param=tools.0", "code=invalid_tool_schema"} {
+		if !strings.Contains(errResp.Error.Message, want) {
+			t.Errorf("message = %q, want %q", errResp.Error.Message, want)
+		}
 	}
 }
 
@@ -8857,6 +8863,46 @@ func TestOpenAIChatCompletionsUpstreamErrorPassthrough(t *testing.T) {
 	}
 	if errResp["error"]["type"] != "invalid_request_error" {
 		t.Errorf("error.type = %v, want invalid_request_error", errResp["error"]["type"])
+	}
+}
+
+func TestOpenAIChatCompletionsRetryableUpstreamErrorIncludesDetail(t *testing.T) {
+	var calls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Request-Id", fmt.Sprintf("req-%d", n))
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limit exceeded","type":"rate_limit_error","param":"model","code":"too_many_requests"}}`))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", resp.StatusCode)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("expected 3 upstream attempts, got %d", calls.Load())
+	}
+	if got := resp.Header.Get("X-Request-Id"); got != "req-3" {
+		t.Fatalf("X-Request-Id = %q, want req-3", got)
+	}
+
+	var errResp map[string]map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+		t.Fatalf("failed to parse error: %v", err)
+	}
+	message, _ := errResp["error"]["message"].(string)
+	for _, want := range []string{"upstream error (429)", "rate limit exceeded", "type=rate_limit_error", "param=model", "code=too_many_requests"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("message = %q, want %q", message, want)
+		}
 	}
 }
 

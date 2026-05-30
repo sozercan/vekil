@@ -116,7 +116,7 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 			writeAnthropicError(w, statusCode, "api_error", "authentication failed")
 			return
 		}
-		writeAnthropicError(w, statusCode, "api_error", "upstream request failed")
+		writeAnthropicError(w, statusCode, "api_error", formatUpstreamRequestFailure(err, "upstream request failed"))
 		return
 	}
 
@@ -235,7 +235,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			writeAnthropicError(w, statusCode, "api_error", "authentication failed")
 			return
 		}
-		writeAnthropicError(w, statusCode, "api_error", "upstream request failed")
+		writeAnthropicError(w, statusCode, "api_error", formatUpstreamRequestFailure(err, "upstream request failed"))
 		return
 	}
 
@@ -248,7 +248,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			logger.F("body", string(errBody)),
 			logger.F("request_bytes", len(oaiBody)),
 		)
-		writeAnthropicError(w, resp.StatusCode, "api_error", fmt.Sprintf("upstream error (%d)", resp.StatusCode))
+		writeAnthropicError(w, resp.StatusCode, "api_error", formatUpstreamErrorMessage(resp.StatusCode, errBody))
 		return
 	}
 
@@ -304,7 +304,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
 			return
 		}
-		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
+		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
 		return
 	}
 

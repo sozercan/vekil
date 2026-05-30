@@ -103,7 +103,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
 				return
 			}
-			writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
+			writeOpenAIUpstreamRequestFailure(w, statusCode, err)
 			return
 		}
 		writeUpstreamResponse(w, compactionResp)
@@ -122,7 +122,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
 			return
 		}
-		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
+		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
 		return
 	}
 	resp, err = h.maybeRetryCompactedResponsesRequest(upstreamCtx, bodyBytes, extraHeaders, upstreamHeaders, resp)
@@ -137,7 +137,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
 			return
 		}
-		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
+		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
 		return
 	}
 
@@ -372,7 +372,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
 			return
 		}
-		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
+		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
 		return
 	}
 	if resp != nil {
@@ -457,7 +457,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
 			return
 		}
-		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
+		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()

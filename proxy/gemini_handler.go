@@ -107,7 +107,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 			logger.F("body", string(errBody)),
 			logger.F("request_bytes", len(oaiBody)),
 		)
-		writeGeminiError(w, resp.StatusCode, mapGeminiUpstreamStatus(resp.StatusCode), fmt.Sprintf("upstream error (%d)", resp.StatusCode))
+		writeGeminiError(w, resp.StatusCode, mapGeminiUpstreamStatus(resp.StatusCode), formatUpstreamErrorMessage(resp.StatusCode, errBody))
 		return
 	}
 
@@ -324,7 +324,7 @@ func (h *ProxyHandler) decodeGeminiProbeResponse(resp *http.Response) (*models.O
 		return nil, false, &geminiProtocolError{
 			statusCode: resp.StatusCode,
 			status:     mapGeminiUpstreamStatus(resp.StatusCode),
-			message:    fmt.Sprintf("upstream error (%d)", resp.StatusCode),
+			message:    formatUpstreamErrorMessage(resp.StatusCode, errBody),
 		}
 	}
 

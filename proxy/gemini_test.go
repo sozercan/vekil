@@ -2269,7 +2269,7 @@ func TestHandleGeminiModelsErrors(t *testing.T) {
 		handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":{"message":"bad upstream request"}}`))
+			_, _ = w.Write([]byte(`{"error":{"message":"bad upstream request","type":"invalid_request_error","param":"messages","code":"context_length_exceeded"}}`))
 		})
 
 		reqBody := `{
@@ -2293,8 +2293,10 @@ func TestHandleGeminiModelsErrors(t *testing.T) {
 		if errResp.Error.Status != "INVALID_ARGUMENT" {
 			t.Errorf("status = %q, want INVALID_ARGUMENT", errResp.Error.Status)
 		}
-		if !strings.Contains(errResp.Error.Message, "upstream error (400)") {
-			t.Errorf("message = %q, want upstream 400 detail", errResp.Error.Message)
+		for _, want := range []string{"upstream error (400)", "bad upstream request", "type=invalid_request_error", "param=messages", "code=context_length_exceeded"} {
+			if !strings.Contains(errResp.Error.Message, want) {
+				t.Errorf("message = %q, want %q", errResp.Error.Message, want)
+			}
 		}
 	})
 
