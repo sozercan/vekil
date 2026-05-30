@@ -87,6 +87,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/messages/count_tokens", handler.HandleAnthropicMessagesCountTokens)
 	mux.HandleFunc("POST /v1/messages", handler.HandleAnthropicMessages)
 	mux.HandleFunc("POST /v1/chat/completions", handler.HandleOpenAIChatCompletions)
 	mux.HandleFunc("POST /v1beta/models/", handler.HandleGeminiModels)

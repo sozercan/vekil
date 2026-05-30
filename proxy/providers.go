@@ -51,6 +51,7 @@ const (
 	providerEndpointChatCompletions = "/chat/completions"
 	providerEndpointResponses       = "/responses"
 	providerEndpointMessages        = "/v1/messages"
+	providerEndpointMessagesCount   = "/v1/messages/count_tokens"
 	providerEndpointModels          = "/models"
 )
 
@@ -1160,6 +1161,10 @@ func (p *providerRuntime) upstreamPath(endpoint string) string {
 	case providerEndpointMessages:
 		if p.paths.messages != "" {
 			return p.paths.messages
+		}
+	case providerEndpointMessagesCount:
+		if p.paths.messages != "" {
+			return strings.TrimRight(p.paths.messages, "/") + "/count_tokens"
 		}
 	case providerEndpointModels:
 		if p.paths.models != "" {
