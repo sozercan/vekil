@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -188,6 +189,34 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	}
 }
 
+func TestServeQuietFlagSuppressesNonErrorLoggerOutput(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet", "--log-level", "debug")
+	if serve.effectiveLogLevel() != logger.LevelError {
+		t.Fatalf("effectiveLogLevel() = %v, want %v", serve.effectiveLogLevel(), logger.LevelError)
+	}
+
+	output := captureStderr(t, func() {
+		log := logger.New(serve.effectiveLogLevel())
+		log.Debug("debug output")
+		log.Info("non-error output")
+		log.Error("error output")
+	})
+
+	if strings.Contains(output, "debug output") || strings.Contains(output, "non-error output") {
+		t.Fatalf("quiet logger emitted non-error output: %q", output)
+	}
+	if !strings.Contains(output, "error output") {
+		t.Fatalf("quiet logger suppressed error output: %q", output)
+	}
+}
+
+func TestServeQuietShortFlag(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "-q")
+	if serve.quiet == nil || !*serve.quiet {
+		t.Fatal("-q should enable quiet mode")
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -205,6 +234,11 @@ func TestCommandFromArgs(t *testing.T) {
 			want: cliCommandLogin,
 		},
 		{
+			name: "root quiet before login still dispatches",
+			args: []string{"vekil", "--quiet", "login"},
+			want: cliCommandLogin,
+		},
+		{
 			name: "logout subcommand dispatches",
 			args: []string{"vekil", "logout"},
 			want: cliCommandLogout,
@@ -212,6 +246,11 @@ func TestCommandFromArgs(t *testing.T) {
 		{
 			name: "unknown subcommand falls back to serve",
 			args: []string{"vekil", "serve"},
+			want: cliCommandServe,
+		},
+		{
+			name: "flag value named login remains serve",
+			args: []string{"vekil", "--providers-config", "login"},
 			want: cliCommandServe,
 		},
 	}
@@ -225,13 +264,26 @@ func TestCommandFromArgs(t *testing.T) {
 	}
 }
 
+func TestParseInvocationRootQuietAppliesToSubcommand(t *testing.T) {
+	invocation := parseInvocation([]string{"vekil", "-q", "login", "--github-cli"})
+	if invocation.command != cliCommandLogin {
+		t.Fatalf("command = %v, want %v", invocation.command, cliCommandLogin)
+	}
+	if !invocation.quiet {
+		t.Fatal("quiet = false, want true")
+	}
+	if got, want := strings.Join(invocation.args, " "), "--github-cli"; got != want {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
 func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 	for _, helpArg := range []string{"-h", "--help"} {
 		t.Run(helpArg, func(t *testing.T) {
 			var stderr bytes.Buffer
 			constructed := false
 
-			code := runLoginWithDeps([]string{helpArg}, loginDeps{
+			code := runLoginWithDeps([]string{helpArg}, false, loginDeps{
 				stderr: &stderr,
 				newAuthenticator: func(string) (loginAuthenticator, error) {
 					constructed = true
@@ -256,11 +308,51 @@ func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 	}
 }
 
+func TestRunLoginQuietSuppressesSuccessButPreservesErrors(t *testing.T) {
+	t.Run("suppresses success output", func(t *testing.T) {
+		var stderr bytes.Buffer
+		fake := &fakeLoginAuthenticator{}
+
+		code := runLoginWithDeps([]string{"--github-cli", "--quiet"}, false, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return fake, nil
+			},
+		})
+
+		if code != 0 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+		}
+		if got := stderr.String(); got != "" {
+			t.Fatalf("quiet login emitted non-error output %q", got)
+		}
+	})
+
+	t.Run("preserves error output", func(t *testing.T) {
+		var stderr bytes.Buffer
+		fake := &fakeLoginAuthenticator{signInWithGitHubCLIErr: fmt.Errorf("boom")}
+
+		code := runLoginWithDeps([]string{"--github-cli", "--quiet"}, false, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return fake, nil
+			},
+		})
+
+		if code != 1 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 1", code)
+		}
+		if got := stderr.String(); !strings.Contains(got, "error signing in with GitHub CLI: boom") {
+			t.Fatalf("quiet login suppressed error output, got %q", got)
+		}
+	})
+}
+
 func TestRunLoginRejectsGitHubCLIWithForceBeforeAuthConstruction(t *testing.T) {
 	var stderr bytes.Buffer
 	constructed := false
 
-	code := runLoginWithDeps([]string{"--github-cli", "--force"}, loginDeps{
+	code := runLoginWithDeps([]string{"--github-cli", "--force"}, false, loginDeps{
 		stderr: &stderr,
 		newAuthenticator: func(string) (loginAuthenticator, error) {
 			constructed = true
@@ -284,7 +376,7 @@ func TestRunLoginGHAliasUsesGitHubCLI(t *testing.T) {
 	fake := &fakeLoginAuthenticator{}
 	var gotTokenDir string
 
-	code := runLoginWithDeps([]string{"--gh", "--token-dir", "/tmp/vekil-test-tokens"}, loginDeps{
+	code := runLoginWithDeps([]string{"--gh", "--token-dir", "/tmp/vekil-test-tokens"}, false, loginDeps{
 		stderr: &stderr,
 		newAuthenticator: func(tokenDir string) (loginAuthenticator, error) {
 			gotTokenDir = tokenDir
@@ -321,7 +413,7 @@ func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
 	}
 	var openedURL string
 
-	code := runLoginWithDeps([]string{"--force"}, loginDeps{
+	code := runLoginWithDeps([]string{"--force"}, false, loginDeps{
 		stderr: &stderr,
 		newAuthenticator: func(string) (loginAuthenticator, error) {
 			return fake, nil
@@ -356,6 +448,33 @@ func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
 			t.Fatalf("stderr missing %q, got %q", want, output)
 		}
 	}
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stderr pipe: %v", err)
+	}
+	os.Stderr = w
+	defer func() {
+		os.Stderr = old
+	}()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close stderr pipe: %v", err)
+	}
+	os.Stderr = old
+
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("read stderr pipe: %v", err)
+	}
+	return buf.String()
 }
 
 type fakeLoginAuthenticator struct {
