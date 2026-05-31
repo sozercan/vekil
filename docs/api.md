@@ -10,6 +10,12 @@ Supported features include text/image/tool-use content blocks, system messages, 
 
 Model normalization strips dated suffixes such as `claude-sonnet-4-20250514` and maps hyphenated version numbers to dotted form, for example `claude-sonnet-4-5` to `claude-sonnet-4.5`.
 
+## `POST /v1/messages/count_tokens` (Anthropic)
+
+Anthropic count-tokens compatibility for clients such as Claude Code. For OpenAI-compatible upstreams, Vekil translates the Messages request to Chat Completions, sends a minimal one-token probe, and returns `usage.prompt_tokens` as Anthropic `input_tokens`. For `anthropic-compatible` providers, the proxy directly forwards count-tokens requests to `{messages_path}/count_tokens`.
+
+The endpoint is a compatibility probe rather than a native tokenizer. It may make a small upstream inference request, and counts follow the owning provider's reported prompt-token usage.
+
 ## `GET /v1/models`
 
 The proxy builds a merged catalog across active providers. It preserves OpenAI-style `data` and also adds a Codex-compatible top-level `models` array.

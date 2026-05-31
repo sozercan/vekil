@@ -466,6 +466,196 @@ func TestHandleAnthropicMessages(t *testing.T) {
 	}
 }
 
+func TestHandleAnthropicMessagesCountTokens(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("expected path /chat/completions, got %q", r.URL.Path)
+		}
+
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("failed to parse upstream request: %v", err)
+		}
+		if oaiReq.Model != "claude-sonnet-4" {
+			t.Fatalf("model = %q, want claude-sonnet-4", oaiReq.Model)
+		}
+		if oaiReq.Stream == nil || *oaiReq.Stream {
+			t.Fatalf("stream = %v, want false", oaiReq.Stream)
+		}
+		if oaiReq.StreamOptions != nil {
+			t.Fatalf("stream_options = %#v, want nil", oaiReq.StreamOptions)
+		}
+		if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != 1 {
+			t.Fatalf("max_completion_tokens = %v, want 1", oaiReq.MaxCompletionTokens)
+		}
+		if oaiReq.MaxTokens != nil {
+			t.Fatalf("max_tokens = %v, want nil", oaiReq.MaxTokens)
+		}
+		if len(oaiReq.Tools) != 1 || oaiReq.Tools[0].Function.Name != "lookup" {
+			t.Fatalf("tools = %#v, want translated lookup tool", oaiReq.Tools)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-count","object":"chat.completion","created":1,"model":"claude-sonnet-4","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"length"}],"usage":{"prompt_tokens":123,"completion_tokens":1,"total_tokens":124}}`))
+	})
+
+	countReq := `{
+		"model": "claude-sonnet-4",
+		"messages": [{"role": "user", "content": "Count this"}],
+		"tools": [{"name": "lookup", "description": "Lookup", "input_schema": {"type": "object"}}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(countReq))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessagesCountTokens(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var countResp models.AnthropicCountTokensResponse
+	if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+		t.Fatalf("decode count_tokens response: %v", err)
+	}
+	if countResp.InputTokens != 123 {
+		t.Fatalf("input_tokens = %d, want 123", countResp.InputTokens)
+	}
+}
+
+func TestHandleAnthropicMessagesCountTokensFallbacksToMaxTokens(t *testing.T) {
+	var attempts int
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("failed to parse upstream request: %v", err)
+		}
+
+		switch attempts {
+		case 1:
+			if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != 1 || oaiReq.MaxTokens != nil {
+				t.Fatalf("first probe max fields = max_completion_tokens:%v max_tokens:%v", oaiReq.MaxCompletionTokens, oaiReq.MaxTokens)
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"unsupported field max_completion_tokens"}}`))
+		case 2:
+			if oaiReq.MaxCompletionTokens != nil || oaiReq.MaxTokens == nil || *oaiReq.MaxTokens != 1 {
+				t.Fatalf("fallback probe max fields = max_completion_tokens:%v max_tokens:%v", oaiReq.MaxCompletionTokens, oaiReq.MaxTokens)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-count","object":"chat.completion","created":1,"model":"claude-sonnet-4","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"length"}],"usage":{"prompt_tokens":77,"completion_tokens":1,"total_tokens":78}}`))
+		default:
+			t.Fatalf("unexpected attempt %d", attempts)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(`{
+		"model": "claude-sonnet-4",
+		"messages": [{"role": "user", "content": "Count this"}]
+	}`))
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessagesCountTokens(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var countResp models.AnthropicCountTokensResponse
+	if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+		t.Fatalf("decode count_tokens response: %v", err)
+	}
+	if countResp.InputTokens != 77 {
+		t.Fatalf("input_tokens = %d, want 77", countResp.InputTokens)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProvider(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/native/messages/count_tokens" {
+			t.Fatalf("expected native count_tokens path /native/messages/count_tokens, got %s", got)
+		}
+		if got := r.Header.Get("X-API-Key"); got != "anthropic-key" {
+			t.Fatalf("expected X-API-Key auth, got %q", got)
+		}
+		if got := r.Header.Get("Anthropic-Version"); got != "2023-06-01" {
+			t.Fatalf("expected Anthropic-Version forwarded, got %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Fatalf("expected client Authorization stripped, got %q", got)
+		}
+
+		var upstreamReq models.AnthropicRequest
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamReq.Model != "claude-upstream" {
+			t.Fatalf("upstream model = %q, want claude-upstream", upstreamReq.Model)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"input_tokens":42}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:           "native",
+				Type:         "anthropic-compatible",
+				Default:      true,
+				BaseURL:      upstream.URL,
+				APIKey:       "anthropic-key",
+				AuthType:     "api-key-header",
+				AuthHeader:   "X-API-Key",
+				MessagesPath: "/native/messages",
+				Models: []ProviderModelConfig{{
+					PublicID:   "claude-public",
+					Deployment: "claude-upstream",
+					Endpoints:  []string{"/v1/messages"},
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(`{
+		"model": "claude-public",
+		"messages": [{"role": "user", "content": "Count this"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer client-token")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessagesCountTokens(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var countResp models.AnthropicCountTokensResponse
+	if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+		t.Fatalf("decode count_tokens response: %v", err)
+	}
+	if countResp.InputTokens != 42 {
+		t.Fatalf("input_tokens = %d, want 42", countResp.InputTokens)
+	}
+}
+
 func TestHandleAnthropicMessages_ImageBlocksForwarded(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		var oaiReq models.OpenAIRequest

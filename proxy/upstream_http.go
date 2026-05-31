@@ -214,6 +214,27 @@ func (h *ProxyHandler) postAnthropicMessages(ctx context.Context, body []byte, e
 	return h.postJSONEndpointWithHeaders(ctx, providerEndpointMessages, body, extraHeaders)
 }
 
+func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
+	provider, rewrittenBody, err := h.resolveProviderRequest(body, providerEndpointMessages)
+	if err != nil {
+		return nil, err
+	}
+	if provider.kind != providerTypeAnthropicCompatible {
+		return nil, &providerRequestError{
+			statusCode: http.StatusBadRequest,
+			err:        fmt.Errorf("provider %q does not support %s", provider.id, providerEndpointMessagesCount),
+		}
+	}
+
+	return h.doWithRetry(func() (*http.Request, error) {
+		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, providerEndpointMessagesCount, rewrittenBody, extraHeaders, "")
+		if err != nil {
+			return nil, err
+		}
+		return req, nil
+	})
+}
+
 func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
 	defer func() { _ = resp.Body.Close() }()
 	copyPassthroughHeaders(w.Header(), resp.Header)
