@@ -819,7 +819,7 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
 			return
 		}
-		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
+		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
 		return
 	}
 
