@@ -3,7 +3,7 @@
 Vekil commonly runs in one of two modes:
 
 - **Zero-config mode**: no `--providers-config`; uses the built-in GitHub Copilot upstream.
-- **Explicit provider routing**: pass `--providers-config` to expose any mix of `copilot`, `azure-openai`, and `openai-codex` providers behind the same local API surface.
+- **Explicit provider routing**: pass `--providers-config` to expose any mix of `copilot`, `azure-openai`, `openai-codex`, `openai-compatible`, and `anthropic-compatible` providers behind the same local API surface.
 
 ## Install Or Build
 
@@ -74,7 +74,7 @@ kubectl apply -f k8s/vekil.yaml
 
 ## First Run And Authentication
 
-Startup behavior depends on active providers. For the full auth matrix, see [Provider Authentication](provider-routing.md#provider-authentication).
+Startup behavior depends on active providers. For the full auth matrix, see [Provider Authentication](provider-routing.md#provider-authentication). For provider console links and key setup patterns, see [Provider API Keys](provider-api-keys.md).
 
 ### GitHub Copilot
 
@@ -86,13 +86,17 @@ Zero-config startup and explicit `type: "copilot"` providers need GitHub Copilot
 
 If none are available, first startup starts GitHub's device-code flow. You can also run `vekil login` ahead of time, `vekil login --force` for a fresh device-code sign-in, or `vekil logout` to clear Vekil-managed auth and disable silent GitHub CLI reuse.
 
-### Azure OpenAI
+### Azure OpenAI and Microsoft Foundry
 
-Configure Azure credentials in the provider entry with `api_key` or `api_key_env`. There is no interactive Azure login flow.
+Configure Azure credentials in the provider entry. Use `api_key`/`api_key_env` for key auth, or set `auth_mode: azure_identity` to use Microsoft Entra auth through the Azure SDK `DefaultAzureCredential` chain. Vekil does not run `az login` itself; for local SDK auth, sign in with Azure CLI or another supported Azure credential before starting the proxy.
 
 ### OpenAI Codex
 
 Run `codex login` first so `~/.codex/auth.json` exists. Set `CODEX_HOME` if your Codex home lives elsewhere. API-key auth and OS keychain-backed credentials are not read by the proxy.
+
+### Generic Compatible Providers
+
+Generic `openai-compatible` and `anthropic-compatible` providers use the auth fields in the providers config. Use `auth_type: none` for local services, or set `api_key_env` with `auth_type: bearer` or `auth_type: api-key-header` for hosted services. There is no interactive login flow.
 
 If your provider config omits Copilot, startup skips GitHub authentication entirely.
 

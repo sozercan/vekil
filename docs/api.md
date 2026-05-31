@@ -4,11 +4,17 @@ Concise endpoint map for Vekil's public API surface. Provider routing is always 
 
 ## `POST /v1/messages` (Anthropic)
 
-Anthropic Messages compatibility for the supported content and tool subset. Requests are translated to OpenAI Chat Completions, routed through the provider that owns the selected public model, and translated back to Anthropic.
+Anthropic Messages compatibility for the supported content and tool subset. Requests are usually translated to OpenAI Chat Completions, routed through the provider that owns the selected public model, and translated back to Anthropic. For `anthropic-compatible` providers, the proxy directly forwards Messages requests to the configured `messages_path`.
 
 Supported features include text/image/tool-use content blocks, system messages, tool choice, stop sequences, extended thinking via `thinking.type: "enabled"`, and streaming Anthropic SSE event translation.
 
 Model normalization strips dated suffixes such as `claude-sonnet-4-20250514` and maps hyphenated version numbers to dotted form, for example `claude-sonnet-4-5` to `claude-sonnet-4.5`.
+
+## `POST /v1/messages/count_tokens` (Anthropic)
+
+Anthropic count-tokens compatibility for clients such as Claude Code. For OpenAI-compatible upstreams, Vekil translates the Messages request to Chat Completions, sends a minimal one-token probe, and returns `usage.prompt_tokens` as Anthropic `input_tokens`. For `anthropic-compatible` providers, the proxy directly forwards count-tokens requests to `{messages_path}/count_tokens`.
+
+The endpoint is a compatibility probe rather than a native tokenizer. It may make a small upstream inference request, and counts follow the owning provider's reported prompt-token usage.
 
 ## `GET /v1/models`
 

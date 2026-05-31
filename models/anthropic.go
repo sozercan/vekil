@@ -95,6 +95,12 @@ type AnthropicUsage struct {
 	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
 }
 
+// AnthropicCountTokensResponse is the response from the Anthropic
+// Messages count_tokens endpoint.
+type AnthropicCountTokensResponse struct {
+	InputTokens int `json:"input_tokens"`
+}
+
 // AnthropicStreamEvent is a single SSE event in an Anthropic streaming response.
 type AnthropicStreamEvent struct {
 	Type         string             `json:"type"`

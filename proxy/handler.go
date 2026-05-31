@@ -229,29 +229,30 @@ func (c ResponsesWebSocketConfig) autoCompactEnabled() bool {
 
 // ProxyHandler holds dependencies for all HTTP handlers.
 type ProxyHandler struct {
-	auth                     *auth.Authenticator
-	client                   *http.Client
-	copilotURL               string
-	copilotHeaders           CopilotHeaderConfig
-	providersConfig          ProvidersConfig
-	providersState           *providerSetup
-	toolOptimizers           *ToolOptimizerManager
-	toolContexts             *ToolExecutionContextStore
-	responsesWS              ResponsesWebSocketConfig
-	streamingUpstreamTimeout time.Duration
-	compactChunkBodyBytes    int
-	compactChunkConfigured   bool
-	compactChunkConcurrency  int
-	compactMaxAttempts       int
-	compactLearnedTargetsMu  sync.Mutex
-	compactInflightMu        sync.Mutex
-	compactInflight          map[string]*compactInflightCall
-	compactLearnedTargets    map[compactLearnedTargetKey]compactLearnedTarget
-	log                      *logger.Logger
-	maxRetries               int
-	retryBaseDelay           time.Duration
-	models                   modelsCache
-	geminiCounts             geminiCountTokensCache
+	auth                            *auth.Authenticator
+	client                          *http.Client
+	copilotURL                      string
+	copilotHeaders                  CopilotHeaderConfig
+	providersConfig                 ProvidersConfig
+	providersState                  *providerSetup
+	azureIdentityTokenSourceFactory azureIdentityTokenSourceFactory
+	toolOptimizers                  *ToolOptimizerManager
+	toolContexts                    *ToolExecutionContextStore
+	responsesWS                     ResponsesWebSocketConfig
+	streamingUpstreamTimeout        time.Duration
+	compactChunkBodyBytes           int
+	compactChunkConfigured          bool
+	compactChunkConcurrency         int
+	compactMaxAttempts              int
+	compactLearnedTargetsMu         sync.Mutex
+	compactInflightMu               sync.Mutex
+	compactInflight                 map[string]*compactInflightCall
+	compactLearnedTargets           map[compactLearnedTargetKey]compactLearnedTarget
+	log                             *logger.Logger
+	maxRetries                      int
+	retryBaseDelay                  time.Duration
+	models                          modelsCache
+	geminiCounts                    geminiCountTokensCache
 }
 
 type compactLearnedTargetKey struct {
@@ -430,10 +431,11 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		// Keep global Copilot header overrides empty by default. Header application
 		// fills built-in defaults per endpoint, and /models must not inherit the
 		// built-in openai-intent value.
-		copilotHeaders:           CopilotHeaderConfig{},
-		responsesWS:              DefaultResponsesWebSocketConfig(),
-		streamingUpstreamTimeout: streamingUpstreamTimeout,
-		log:                      log,
+		copilotHeaders:                  CopilotHeaderConfig{},
+		azureIdentityTokenSourceFactory: newDefaultAzureIdentityTokenSource,
+		responsesWS:                     DefaultResponsesWebSocketConfig(),
+		streamingUpstreamTimeout:        streamingUpstreamTimeout,
+		log:                             log,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -671,6 +673,10 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ProxyHandler) checkProviderReady(ctx context.Context, provider *providerRuntime) error {
+	if providerSkipsReadyzProbe(provider) {
+		return nil
+	}
+
 	req, err := h.newProviderProbeRequest(ctx, provider)
 	if err != nil {
 		return err
@@ -694,6 +700,18 @@ func (h *ProxyHandler) checkProviderReady(ctx context.Context, provider *provide
 	return nil
 }
 
+func providerSkipsReadyzProbe(provider *providerRuntime) bool {
+	if provider == nil {
+		return false
+	}
+	switch provider.kind {
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+		return provider.modelDiscovery == providerModelDiscoveryStatic
+	default:
+		return false
+	}
+}
+
 func (h *ProxyHandler) newProviderProbeRequest(ctx context.Context, provider *providerRuntime) (*http.Request, error) {
 	if provider == nil {
 		return nil, fmt.Errorf("provider is required")
@@ -712,19 +730,19 @@ func (h *ProxyHandler) newProviderProbeRequest(ctx context.Context, provider *pr
 		h.setCopilotHeadersForProvider(req, token, provider, "/models")
 		return req, nil
 	case providerTypeAzureOpenAI:
-		fullURL, err := h.providerRequestURL(provider, "/models", "")
+		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodGet, "/models", nil, nil, "")
 		if err != nil {
-			return nil, fmt.Errorf("failed to build provider %q probe URL: %w", provider.id, err)
+			return nil, fmt.Errorf("failed to create provider %q probe request: %w", provider.id, err)
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create upstream probe request: %w", err)
-		}
-		req.Header.Set("api-key", provider.apiKey)
-		req.Header.Set("Content-Type", "application/json")
 		return req, nil
 	case providerTypeOpenAICodex:
 		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodGet, "/models", nil, nil, openAICodexModelsRawQuery(""))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create provider %q probe request: %w", provider.id, err)
+		}
+		return req, nil
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodGet, providerEndpointModels, nil, nil, "")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create provider %q probe request: %w", provider.id, err)
 		}
@@ -801,7 +819,7 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
 			return
 		}
-		writeOpenAIError(w, statusCode, "upstream request failed", "server_error")
+		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
 		return
 	}
 
@@ -878,9 +896,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 				continue
 			}
 			allDynamicProvidersUnchanged = false
-			if len(setup.providers) > 1 {
-				refreshedDynamicModels[provider.id] = models
-			}
+			refreshedDynamicModels[provider.id] = models
 			if result.etag != "" {
 				mergedETag = result.etag
 			}

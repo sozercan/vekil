@@ -143,6 +143,75 @@ func StreamOpenAIPassthroughWithFinalResponse(
 	onFinalResponse(aggregator.buildResponse())
 }
 
+func streamAnthropicPassthroughBody(w http.ResponseWriter, body io.Reader, publicModel, upstreamModel string) {
+	publicModel = strings.TrimSpace(publicModel)
+	upstreamModel = strings.TrimSpace(upstreamModel)
+
+	var flusher http.Flusher
+	if f, ok := w.(http.Flusher); ok {
+		flusher = f
+	}
+
+	if publicModel == "" || publicModel == upstreamModel {
+		_, _ = io.Copy(&flushWriter{w: w, flusher: flusher}, body)
+		return
+	}
+
+	reader := bufio.NewReaderSize(body, openAIStreamScannerInitialBuffer)
+	frame := make([]string, 0, 4)
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			frame = append(frame, line)
+			if strings.TrimRight(line, "\r\n") == "" {
+				writeAnthropicSSEFrame(w, frame, publicModel)
+				if flusher != nil {
+					flusher.Flush()
+				}
+				frame = frame[:0]
+			}
+		}
+		if err != nil {
+			if len(frame) > 0 {
+				writeAnthropicSSEFrame(w, frame, publicModel)
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			return
+		}
+	}
+}
+
+func writeAnthropicSSEFrame(w io.Writer, frame []string, publicModel string) {
+	for _, line := range frame {
+		content, ending := splitSSELineEnding(line)
+		data, ok := parseSSELine(content)
+		if !ok {
+			_, _ = io.WriteString(w, line)
+			continue
+		}
+
+		rewritten, changed := rewriteAnthropicResponseModelJSON([]byte(data), publicModel, "")
+		if !changed {
+			_, _ = io.WriteString(w, line)
+			continue
+		}
+		_, _ = fmt.Fprintf(w, "data: %s%s", rewritten, ending)
+	}
+}
+
+func splitSSELineEnding(line string) (string, string) {
+	switch {
+	case strings.HasSuffix(line, "\r\n"):
+		return strings.TrimSuffix(line, "\r\n"), "\r\n"
+	case strings.HasSuffix(line, "\n"):
+		return strings.TrimSuffix(line, "\n"), "\n"
+	default:
+		return line, ""
+	}
+}
+
 // StreamOpenAIToAnthropic translates an OpenAI SSE stream into Anthropic SSE format.
 func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model string, requestID string) {
 	StreamOpenAIToAnthropicWithFinalResponse(w, body, model, requestID, nil)

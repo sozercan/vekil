@@ -10,7 +10,7 @@
 
 ---
 
-Vekil is a Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs behind one local endpoint. Run it in zero-config mode against GitHub Copilot, or route selected models to providers like Azure OpenAI and OpenAI Codex. The client-facing API surface stays the same while model ownership is configured behind the proxy.
+Vekil is a Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs behind one local endpoint. Run it in zero-config mode against GitHub Copilot, or route selected models to providers like Azure OpenAI, OpenAI Codex, and generic OpenAI-compatible or Anthropic-compatible upstreams. The client-facing API surface stays the same while model ownership is configured behind the proxy.
 
 ## Why Vekil?
 
@@ -21,7 +21,7 @@ Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Az
 - **Anthropic Messages API** — drop-in compatible with Claude clients
 - **Gemini API** — Generate Content, Stream Generate Content, and Count Tokens
 - **OpenAI Chat Completions** and **Responses** APIs, including optional Codex websocket bridging
-- **Multi-provider routing** across GitHub Copilot, Azure OpenAI, and OpenAI Codex
+- **Multi-provider routing** across GitHub Copilot, Azure OpenAI, OpenAI Codex, and generic compatible providers
 - **Optional tool optimizers** for opt-in shell command rewrites and tool-output reduction across supported API surfaces; see [Tool Optimizers](docs/tool-optimizers.md)
 - **Codex compatibility shims** for compaction and memory summarization
 - **Streaming**, tool use, parallel tool calls, compressed request bodies, and auth/token caching
@@ -49,7 +49,9 @@ For explicit provider routing, start the proxy with `--providers-config /path/to
 **First-run auth** depends on your providers:
 
 - **Copilot** — `vekil login` uses Vekil-managed GitHub device-code sign-in; first proxy startup starts the same flow when needed. To use your current GitHub CLI account instead, opt in with `vekil login --github-cli` (or `--gh`). `vekil logout` clears cached auth and disables future silent `gh` reuse until you opt in again. `COPILOT_GITHUB_TOKEN` remains the explicit non-interactive override.
+- **Azure OpenAI and generic hosted providers** — use `api_key` or `api_key_env` in your provider config.
 - **OpenAI Codex** — requires `codex login` so `~/.codex/auth.json` exists. In Docker, mount your Codex home into `CODEX_HOME` (default `/home/nonroot/.codex`).
+- **Local generic providers** — use `auth_type: none`.
 
 For full setup details, see [Getting Started](docs/getting-started.md), [Configuration](docs/configuration.md), and [Provider Routing](docs/provider-routing.md).
 
@@ -62,6 +64,7 @@ Documentation lives under [`docs/`](docs/README.md); start with these:
 | [Getting Started](docs/getting-started.md)                   | Install, run, first auth            |
 | [Configuration](docs/configuration.md)                       | Config map and generic flags        |
 | [Provider Routing](docs/provider-routing.md)                 | Provider auth and model ownership   |
+| [Provider API Keys](docs/provider-api-keys.md)               | Where to get provider keys          |
 | [Tool Optimizers](docs/tool-optimizers.md)                   | Shell rewrite/output reduction      |
 | [Responses WebSocket](docs/responses-websocket.md)           | Websocket bridge tuning             |
 | [Client Examples](docs/clients.md)                           | Copy-paste snippets per client      |
@@ -88,6 +91,17 @@ env ANTHROPIC_BASE_URL=http://localhost:1337 \
 env OPENAI_API_KEY=dummy \
   OPENAI_BASE_URL=http://localhost:1337/v1 \
   codex exec --skip-git-repo-check -m gpt-5.5 "Reply with exactly PROXY_OK"
+```
+
+### GitHub Copilot CLI
+
+```bash
+env COPILOT_PROVIDER_BASE_URL=http://localhost:1337/v1 \
+  COPILOT_PROVIDER_TYPE=openai \
+  COPILOT_PROVIDER_WIRE_API=responses \
+  COPILOT_MODEL=gpt-5.5 \
+  COPILOT_OFFLINE=true \
+  copilot -p "Reply with exactly PROXY_OK" -s
 ```
 
 ### Gemini CLI

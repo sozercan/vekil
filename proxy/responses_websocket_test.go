@@ -537,6 +537,102 @@ func TestHandleResponsesWebSocket_RoutesConfiguredAzureModelAndPreservesPriority
 	}
 }
 
+func TestHandleResponsesWebSocket_RoutesConfiguredAzureIdentityProvider(t *testing.T) {
+	tokenSource := &staticAzureTokenSource{token: "ws-entra-token"}
+	var upstreamRequests atomic.Int32
+
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests.Add(1)
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected POST, got %s", r.Method)
+		}
+		if got := r.URL.Path; got != "/openai/v1/responses" {
+			t.Fatalf("expected Azure path /openai/v1/responses, got %s", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer ws-entra-token" {
+			t.Fatalf("expected Azure identity Authorization header, got %q", got)
+		}
+		if got := r.Header.Get("api-key"); got != "" {
+			t.Fatalf("expected no api-key header, got %q", got)
+		}
+
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+		var model string
+		if err := json.Unmarshal(body["model"], &model); err != nil {
+			t.Fatalf("failed to decode upstream model: %v", err)
+		}
+		if model != "gpt-5-4-prod" {
+			t.Fatalf("expected Azure deployment model gpt-5-4-prod, got %q", model)
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-azure-identity-ws\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-azure-identity-ws\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+	}))
+	defer azureServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "foundry",
+			Type:     "azure-openai",
+			Default:  true,
+			BaseURL:  azureServer.URL + "/openai/v1",
+			AuthMode: "azure_identity",
+			Models: []ProviderModelConfig{{
+				PublicID:   "gpt-5-public",
+				Deployment: "gpt-5-4-prod",
+				Endpoints:  []string{"/responses"},
+			}},
+		}}}),
+		withAzureIdentityTokenSourceFactoryForTest(func(string, string) (azureTokenSource, error) {
+			return tokenSource, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	request["model"] = "gpt-5-public"
+
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+
+	created := mustReadWebSocketJSON(t, conn)
+	if created["type"] != "response.created" {
+		t.Fatalf("expected first event to be response.created, got %v", created["type"])
+	}
+	completed := mustReadWebSocketJSON(t, conn)
+	if completed["type"] != "response.completed" {
+		t.Fatalf("expected second event to be response.completed, got %v", completed["type"])
+	}
+	if got := upstreamRequests.Load(); got != 1 {
+		t.Fatalf("expected 1 upstream request, got %d", got)
+	}
+}
+
 func TestHandleResponsesWebSocket_CreateRequestUsesStreamingUpstreamTimeout(t *testing.T) {
 	deadlineCh := make(chan time.Duration, 1)
 	handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {

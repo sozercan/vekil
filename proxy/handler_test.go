@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -242,6 +243,49 @@ func TestHandleReadyz(t *testing.T) {
 		}
 	})
 
+	t.Run("static generic provider does not require models probe", func(t *testing.T) {
+		var probeHits atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			probeHits.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer upstream.Close()
+
+		h, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.New(logger.LevelInfo),
+			WithProvidersConfig(ProvidersConfig{
+				Providers: []ProviderConfig{{
+					ID:       "local",
+					Type:     "openai-compatible",
+					Default:  true,
+					BaseURL:  upstream.URL,
+					AuthType: "none",
+					Models: []ProviderModelConfig{{
+						PublicID:  "local-public",
+						Endpoints: []string{"/chat/completions"},
+					}},
+				}},
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler returned error: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		w := httptest.NewRecorder()
+		h.HandleReadyz(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+		}
+		if got := probeHits.Load(); got != 0 {
+			t.Fatalf("expected no upstream probe, got %d hits", got)
+		}
+	})
+
 	t.Run("canceled request does not rewrite readiness status", func(t *testing.T) {
 		var probeHits atomic.Int32
 		h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -422,6 +466,196 @@ func TestHandleAnthropicMessages(t *testing.T) {
 	}
 }
 
+func TestHandleAnthropicMessagesCountTokens(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("expected path /chat/completions, got %q", r.URL.Path)
+		}
+
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("failed to parse upstream request: %v", err)
+		}
+		if oaiReq.Model != "claude-sonnet-4" {
+			t.Fatalf("model = %q, want claude-sonnet-4", oaiReq.Model)
+		}
+		if oaiReq.Stream == nil || *oaiReq.Stream {
+			t.Fatalf("stream = %v, want false", oaiReq.Stream)
+		}
+		if oaiReq.StreamOptions != nil {
+			t.Fatalf("stream_options = %#v, want nil", oaiReq.StreamOptions)
+		}
+		if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != 1 {
+			t.Fatalf("max_completion_tokens = %v, want 1", oaiReq.MaxCompletionTokens)
+		}
+		if oaiReq.MaxTokens != nil {
+			t.Fatalf("max_tokens = %v, want nil", oaiReq.MaxTokens)
+		}
+		if len(oaiReq.Tools) != 1 || oaiReq.Tools[0].Function.Name != "lookup" {
+			t.Fatalf("tools = %#v, want translated lookup tool", oaiReq.Tools)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-count","object":"chat.completion","created":1,"model":"claude-sonnet-4","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"length"}],"usage":{"prompt_tokens":123,"completion_tokens":1,"total_tokens":124}}`))
+	})
+
+	countReq := `{
+		"model": "claude-sonnet-4",
+		"messages": [{"role": "user", "content": "Count this"}],
+		"tools": [{"name": "lookup", "description": "Lookup", "input_schema": {"type": "object"}}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(countReq))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessagesCountTokens(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var countResp models.AnthropicCountTokensResponse
+	if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+		t.Fatalf("decode count_tokens response: %v", err)
+	}
+	if countResp.InputTokens != 123 {
+		t.Fatalf("input_tokens = %d, want 123", countResp.InputTokens)
+	}
+}
+
+func TestHandleAnthropicMessagesCountTokensFallbacksToMaxTokens(t *testing.T) {
+	var attempts int
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("failed to parse upstream request: %v", err)
+		}
+
+		switch attempts {
+		case 1:
+			if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != 1 || oaiReq.MaxTokens != nil {
+				t.Fatalf("first probe max fields = max_completion_tokens:%v max_tokens:%v", oaiReq.MaxCompletionTokens, oaiReq.MaxTokens)
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"unsupported field max_completion_tokens"}}`))
+		case 2:
+			if oaiReq.MaxCompletionTokens != nil || oaiReq.MaxTokens == nil || *oaiReq.MaxTokens != 1 {
+				t.Fatalf("fallback probe max fields = max_completion_tokens:%v max_tokens:%v", oaiReq.MaxCompletionTokens, oaiReq.MaxTokens)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-count","object":"chat.completion","created":1,"model":"claude-sonnet-4","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"length"}],"usage":{"prompt_tokens":77,"completion_tokens":1,"total_tokens":78}}`))
+		default:
+			t.Fatalf("unexpected attempt %d", attempts)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(`{
+		"model": "claude-sonnet-4",
+		"messages": [{"role": "user", "content": "Count this"}]
+	}`))
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessagesCountTokens(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var countResp models.AnthropicCountTokensResponse
+	if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+		t.Fatalf("decode count_tokens response: %v", err)
+	}
+	if countResp.InputTokens != 77 {
+		t.Fatalf("input_tokens = %d, want 77", countResp.InputTokens)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProvider(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/native/messages/count_tokens" {
+			t.Fatalf("expected native count_tokens path /native/messages/count_tokens, got %s", got)
+		}
+		if got := r.Header.Get("X-API-Key"); got != "anthropic-key" {
+			t.Fatalf("expected X-API-Key auth, got %q", got)
+		}
+		if got := r.Header.Get("Anthropic-Version"); got != "2023-06-01" {
+			t.Fatalf("expected Anthropic-Version forwarded, got %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Fatalf("expected client Authorization stripped, got %q", got)
+		}
+
+		var upstreamReq models.AnthropicRequest
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamReq.Model != "claude-upstream" {
+			t.Fatalf("upstream model = %q, want claude-upstream", upstreamReq.Model)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"input_tokens":42}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:           "native",
+				Type:         "anthropic-compatible",
+				Default:      true,
+				BaseURL:      upstream.URL,
+				APIKey:       "anthropic-key",
+				AuthType:     "api-key-header",
+				AuthHeader:   "X-API-Key",
+				MessagesPath: "/native/messages",
+				Models: []ProviderModelConfig{{
+					PublicID:   "claude-public",
+					Deployment: "claude-upstream",
+					Endpoints:  []string{"/v1/messages"},
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(`{
+		"model": "claude-public",
+		"messages": [{"role": "user", "content": "Count this"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer client-token")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessagesCountTokens(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var countResp models.AnthropicCountTokensResponse
+	if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+		t.Fatalf("decode count_tokens response: %v", err)
+	}
+	if countResp.InputTokens != 42 {
+		t.Fatalf("input_tokens = %d, want 42", countResp.InputTokens)
+	}
+}
+
 func TestHandleAnthropicMessages_ImageBlocksForwarded(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		var oaiReq models.OpenAIRequest
@@ -518,8 +752,9 @@ func TestHandleAnthropicMessagesInvalidJSON(t *testing.T) {
 
 func TestHandleAnthropicUpstreamError(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"error": "internal server error"}`))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"tool schema is invalid","type":"invalid_request_error","param":"tools.0","code":"invalid_tool_schema"}}`))
 	})
 
 	anthropicReq := `{
@@ -534,8 +769,8 @@ func TestHandleAnthropicUpstreamError(t *testing.T) {
 	handler.HandleAnthropicMessages(w, req)
 
 	resp := w.Result()
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("expected 500, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
 
 	var errResp models.AnthropicError
@@ -545,6 +780,11 @@ func TestHandleAnthropicUpstreamError(t *testing.T) {
 	}
 	if errResp.Error.Type != "api_error" {
 		t.Errorf("expected error type api_error, got %q", errResp.Error.Type)
+	}
+	for _, want := range []string{"upstream error (400)", "tool schema is invalid", "type=invalid_request_error", "param=tools.0", "code=invalid_tool_schema"} {
+		if !strings.Contains(errResp.Error.Message, want) {
+			t.Errorf("message = %q, want %q", errResp.Error.Message, want)
+		}
 	}
 }
 
@@ -5633,6 +5873,874 @@ func TestHandleOpenAIChatCompletions_RoutesConfiguredAzureModel(t *testing.T) {
 	}
 }
 
+func TestHandleOpenAIChatCompletions_RoutesGenericOpenAICompatibleModel(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/v1/chat/completions" {
+			t.Fatalf("expected generic chat path /v1/chat/completions, got %s", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer generic-key" {
+			t.Fatalf("expected generic bearer auth, got %q", got)
+		}
+		if got := r.Header.Get("X-Provider"); got != "local" {
+			t.Fatalf("expected configured X-Provider header, got %q", got)
+		}
+		if got := r.Header.Get("editor-version"); got != "" {
+			t.Fatalf("expected Copilot headers stripped, got editor-version %q", got)
+		}
+
+		var upstreamReq models.OpenAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamReq.Model != "local-upstream" {
+			t.Fatalf("upstream model = %q, want local-upstream", upstreamReq.Model)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+			ID:     "chatcmpl-generic",
+			Object: "chat.completion",
+			Choices: []models.OpenAIChoice{{
+				Index: 0,
+				Message: models.OpenAIMessage{
+					Role:    "assistant",
+					Content: json.RawMessage(`"Hi from generic"`),
+				},
+			}},
+		})
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:                  "local",
+				Type:                "openai-compatible",
+				Default:             true,
+				BaseURL:             upstream.URL,
+				APIKey:              "generic-key",
+				ExtraHeaders:        map[string]string{"X-Provider": "local"},
+				ChatCompletionsPath: "/v1/chat/completions",
+				Models: []ProviderModelConfig{{
+					PublicID:   "local-public",
+					Deployment: "local-upstream",
+					Endpoints:  []string{"/chat/completions"},
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model": "local-public",
+		"messages": [{"role": "user", "content": "Hello"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var oaiResp models.OpenAIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&oaiResp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(oaiResp.Choices) != 1 || string(oaiResp.Choices[0].Message.Content) != `"Hi from generic"` {
+		t.Fatalf("unexpected response body: %+v", oaiResp)
+	}
+}
+
+func TestHandleAnthropicMessages_UsesOpenAITranslationForGenericOpenAICompatibleProvider(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/chat/completions" {
+			t.Fatalf("expected translated Anthropic request to hit /chat/completions, got %s", got)
+		}
+		var upstreamReq models.OpenAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamReq.Model != "local-upstream" {
+			t.Fatalf("upstream model = %q, want local-upstream", upstreamReq.Model)
+		}
+		if len(upstreamReq.Messages) == 0 || upstreamReq.Messages[len(upstreamReq.Messages)-1].Role != "user" {
+			t.Fatalf("expected translated user message, got %+v", upstreamReq.Messages)
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"id\":\"chunk-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello via translation\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:      "local",
+				Type:    "openai-compatible",
+				Default: true,
+				BaseURL: upstream.URL,
+				Models: []ProviderModelConfig{{
+					PublicID:   "local-public",
+					Deployment: "local-upstream",
+					Endpoints:  []string{"/chat/completions"},
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model": "local-public",
+		"max_tokens": 64,
+		"messages": [{"role": "user", "content": "Hello"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var anthropicResp models.AnthropicResponse
+	if err := json.NewDecoder(resp.Body).Decode(&anthropicResp); err != nil {
+		t.Fatalf("decode Anthropic response: %v", err)
+	}
+	if len(anthropicResp.Content) != 1 || anthropicResp.Content[0].Text == nil || *anthropicResp.Content[0].Text != "Hello via translation" {
+		t.Fatalf("unexpected Anthropic response: %+v", anthropicResp)
+	}
+}
+
+func TestHandleAnthropicMessages_DirectGenericAnthropicCompatibleProvider(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/native/messages" {
+			t.Fatalf("expected native messages path /native/messages, got %s", got)
+		}
+		if got := r.Header.Get("X-API-Key"); got != "anthropic-key" {
+			t.Fatalf("expected X-API-Key auth, got %q", got)
+		}
+		if got := r.Header.Get("Anthropic-Version"); got != "2023-06-01" {
+			t.Fatalf("expected Anthropic-Version forwarded, got %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Fatalf("expected client Authorization stripped, got %q", got)
+		}
+
+		var upstreamReq models.AnthropicRequest
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamReq.Model != "claude-upstream" {
+			t.Fatalf("upstream model = %q, want claude-upstream", upstreamReq.Model)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg-direct","type":"message","role":"assistant","model":"claude-upstream","content":[{"type":"text","text":"direct"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:           "native",
+				Type:         "anthropic-compatible",
+				Default:      true,
+				BaseURL:      upstream.URL,
+				APIKey:       "anthropic-key",
+				AuthType:     "api-key-header",
+				AuthHeader:   "X-API-Key",
+				MessagesPath: "/native/messages",
+				Models: []ProviderModelConfig{{
+					PublicID:   "claude-public",
+					Deployment: "claude-upstream",
+					Endpoints:  []string{"/v1/messages"},
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model": "claude-public",
+		"max_tokens": 64,
+		"messages": [{"role": "user", "content": "Hello"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer client-token")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var anthropicResp models.AnthropicResponse
+	if err := json.NewDecoder(resp.Body).Decode(&anthropicResp); err != nil {
+		t.Fatalf("decode Anthropic response: %v", err)
+	}
+	if anthropicResp.ID != "msg-direct" || len(anthropicResp.Content) != 1 || anthropicResp.Content[0].Text == nil || *anthropicResp.Content[0].Text != "direct" {
+		t.Fatalf("unexpected direct Anthropic response: %+v", anthropicResp)
+	}
+	if anthropicResp.Model != "claude-public" {
+		t.Fatalf("direct Anthropic response model = %q, want public alias", anthropicResp.Model)
+	}
+}
+
+func TestHandleAnthropicMessages_DirectGenericAnthropicCompatibleProviderStreamsSSE(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/v1/messages" {
+			t.Fatalf("expected default native messages path /v1/messages, got %s", got)
+		}
+		var upstreamReq models.AnthropicRequest
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if !upstreamReq.Stream {
+			t.Fatal("expected stream=true to be forwarded")
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-upstream\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"))
+		_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"stream-direct\"}}\n\n"))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:       "native",
+				Type:     "anthropic-compatible",
+				Default:  true,
+				BaseURL:  upstream.URL,
+				AuthType: "none",
+				Models: []ProviderModelConfig{{
+					PublicID:   "claude-public",
+					Deployment: "claude-upstream",
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model": "claude-public",
+		"max_tokens": 64,
+		"stream": true,
+		"messages": [{"role": "user", "content": "Hello"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "stream-direct") {
+		t.Fatalf("expected direct SSE body to pass through, got %q", body)
+	}
+	if !strings.Contains(string(body), `"model":"claude-public"`) {
+		t.Fatalf("expected direct SSE model to be rewritten to public alias, got %q", body)
+	}
+	if strings.Contains(string(body), `"model":"claude-upstream"`) {
+		t.Fatalf("direct SSE leaked upstream model: %q", body)
+	}
+	if !w.Flushed {
+		t.Fatal("expected direct SSE response to flush")
+	}
+}
+
+func TestHandleAnthropicMessages_DirectGenericAnthropicCompatibleProviderNormalizesModelAlias(t *testing.T) {
+	var openAIHits atomic.Int32
+	openAIUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		openAIHits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer openAIUpstream.Close()
+
+	anthropicUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var upstreamReq models.AnthropicRequest
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamReq.Model != "claude-upstream" {
+			t.Fatalf("upstream model = %q, want claude-upstream", upstreamReq.Model)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg-normalized","type":"message","role":"assistant","model":"claude-upstream","content":[{"type":"text","text":"normalized"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer anthropicUpstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{
+					ID:       "openai-default",
+					Type:     "openai-compatible",
+					Default:  true,
+					BaseURL:  openAIUpstream.URL,
+					AuthType: "none",
+					Models: []ProviderModelConfig{{
+						PublicID:  "gpt-default",
+						Endpoints: []string{"/chat/completions"},
+					}},
+				},
+				{
+					ID:       "native",
+					Type:     "anthropic-compatible",
+					BaseURL:  anthropicUpstream.URL,
+					AuthType: "none",
+					Models: []ProviderModelConfig{{
+						PublicID:   "claude-sonnet-4.5",
+						Deployment: "claude-upstream",
+					}},
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model": "claude-sonnet-4-5",
+		"max_tokens": 64,
+		"messages": [{"role": "user", "content": "Hello"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var anthropicResp models.AnthropicResponse
+	if err := json.NewDecoder(resp.Body).Decode(&anthropicResp); err != nil {
+		t.Fatalf("decode Anthropic response: %v", err)
+	}
+	if anthropicResp.Model != "claude-sonnet-4.5" {
+		t.Fatalf("response model = %q, want normalized public alias", anthropicResp.Model)
+	}
+	if got := openAIHits.Load(); got != 0 {
+		t.Fatalf("expected normalized Anthropic model to route direct, got %d OpenAI hits", got)
+	}
+}
+
+func TestHandleOpenAIChatCompletions_RejectsUnknownStaticGenericModel(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:       "local",
+				Type:     "openai-compatible",
+				Default:  true,
+				BaseURL:  upstream.URL,
+				AuthType: "none",
+				Models: []ProviderModelConfig{{
+					PublicID:  "local-public",
+					Endpoints: []string{"/chat/completions"},
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model": "other",
+		"messages": [{"role": "user", "content": "Hello"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, body)
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("expected unknown static model to be rejected before upstream, got %d hits", got)
+	}
+}
+
+func TestHandleModels_GenericOpenAICompatibleEndpointVisibility(t *testing.T) {
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:       "local",
+				Type:     "openai-compatible",
+				Default:  true,
+				BaseURL:  "http://localhost:1234",
+				AuthType: "none",
+				Models: []ProviderModelConfig{
+					{
+						PublicID: "chat-only",
+						Name:     "Chat Only",
+					},
+					{
+						PublicID:  "responses-capable",
+						Name:      "Responses Capable",
+						Endpoints: []string{"/chat/completions", "/responses"},
+					},
+				},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	handler.HandleModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Data []struct {
+			ID                 string   `json:"id"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
+		} `json:"data"`
+		Models []struct {
+			Slug           string `json:"slug"`
+			Visibility     string `json:"visibility"`
+			SupportedInAPI bool   `json:"supported_in_api"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+
+	endpointsByID := make(map[string][]string)
+	for _, model := range result.Data {
+		endpointsByID[model.ID] = model.SupportedEndpoints
+	}
+	if !reflect.DeepEqual(endpointsByID["chat-only"], []string{"/chat/completions"}) {
+		t.Fatalf("chat-only endpoints = %v, want [/chat/completions]", endpointsByID["chat-only"])
+	}
+	if endpoints := endpointsByID["responses-capable"]; !supportsEndpoint(endpoints, "/responses") {
+		t.Fatalf("responses-capable endpoints = %v, want /responses support", endpoints)
+	}
+
+	codexBySlug := make(map[string]struct {
+		Visibility     string
+		SupportedInAPI bool
+	})
+	for _, model := range result.Models {
+		codexBySlug[model.Slug] = struct {
+			Visibility     string
+			SupportedInAPI bool
+		}{Visibility: model.Visibility, SupportedInAPI: model.SupportedInAPI}
+	}
+	if got := codexBySlug["chat-only"]; got.Visibility != "hide" || got.SupportedInAPI {
+		t.Fatalf("chat-only Codex metadata = %+v, want hidden and unsupported", got)
+	}
+	if got := codexBySlug["responses-capable"]; got.Visibility != "list" || !got.SupportedInAPI {
+		t.Fatalf("responses-capable Codex metadata = %+v, want listed and supported", got)
+	}
+}
+
+func TestHandleResponses_AllowsDiscoveredDynamicGenericResponsesModel(t *testing.T) {
+	var responsesHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"dynamic-responses","object":"model","supported_endpoints":["/responses"],"name":"Dynamic Responses"}]}`))
+		case "/responses":
+			responsesHits.Add(1)
+			var upstreamReq map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+				t.Fatalf("decode upstream request: %v", err)
+			}
+			if got := rawJSONString(upstreamReq["model"]); got != "dynamic-responses" {
+				t.Fatalf("upstream model = %q, want dynamic-responses", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-dynamic","object":"response","status":"completed","model":"dynamic-responses","output":[]}`))
+		default:
+			t.Fatalf("unexpected upstream path %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:             "dynamic",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        upstream.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	modelsReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	modelsW := httptest.NewRecorder()
+	handler.HandleModels(modelsW, modelsReq)
+	if resp := modelsW.Result(); resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected models 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model": "dynamic-responses",
+		"input": "Hello"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if got := responsesHits.Load(); got != 1 {
+		t.Fatalf("expected one responses hit, got %d", got)
+	}
+}
+
+func TestHandleModels_GenericDynamicDiscoveryMatchesStaticAliasByDeployment(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			t.Fatalf("unexpected upstream path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"upstream-model","object":"model","supported_endpoints":["/chat/completions","/responses"],"name":"Upstream Model"}]}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:             "dynamic",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        upstream.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+				Models: []ProviderModelConfig{{
+					PublicID:   "public-alias",
+					Deployment: "upstream-model",
+					Endpoints:  []string{"/responses"},
+					Name:       "Public Alias",
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	handler.HandleModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Data []struct {
+			ID                 string   `json:"id"`
+			Name               string   `json:"name"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	if len(result.Data) != 1 {
+		t.Fatalf("models count = %d, want 1: %+v", len(result.Data), result.Data)
+	}
+	if result.Data[0].ID != "public-alias" {
+		t.Fatalf("model id = %q, want public-alias", result.Data[0].ID)
+	}
+	if result.Data[0].Name != "Public Alias" {
+		t.Fatalf("model name = %q, want Public Alias", result.Data[0].Name)
+	}
+	if !reflect.DeepEqual(result.Data[0].SupportedEndpoints, []string{"/responses"}) {
+		t.Fatalf("supported endpoints = %v, want [/responses]", result.Data[0].SupportedEndpoints)
+	}
+}
+
+func TestHandleModels_GenericDynamicDiscoveryExpandsDeploymentAliases(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			t.Fatalf("unexpected upstream path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"upstream-model","object":"model","supported_endpoints":["/chat/completions","/responses"],"name":"Upstream Model"}]}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:             "dynamic",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        upstream.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+				Models: []ProviderModelConfig{
+					{
+						PublicID:   "public-chat",
+						Deployment: "upstream-model",
+						Endpoints:  []string{"/chat/completions"},
+						Name:       "Public Chat",
+					},
+					{
+						PublicID:   "public-responses",
+						Deployment: "upstream-model",
+						Endpoints:  []string{"/responses"},
+						Name:       "Public Responses",
+					},
+				},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	handler.HandleModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Data []struct {
+			ID                 string   `json:"id"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+
+	endpointsByID := make(map[string][]string, len(result.Data))
+	for _, model := range result.Data {
+		endpointsByID[model.ID] = model.SupportedEndpoints
+	}
+	if len(endpointsByID) != 2 {
+		t.Fatalf("models = %+v, want two public aliases", result.Data)
+	}
+	if !reflect.DeepEqual(endpointsByID["public-chat"], []string{"/chat/completions"}) {
+		t.Fatalf("public-chat endpoints = %v, want [/chat/completions]", endpointsByID["public-chat"])
+	}
+	if !reflect.DeepEqual(endpointsByID["public-responses"], []string{"/responses"}) {
+		t.Fatalf("public-responses endpoints = %v, want [/responses]", endpointsByID["public-responses"])
+	}
+	if _, exists := endpointsByID["upstream-model"]; exists {
+		t.Fatalf("upstream model should be replaced by configured public aliases")
+	}
+}
+
+func TestHandleModels_GenericOllamaDiscoveryUsesConfiguredPath(t *testing.T) {
+	var modelsCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		modelsCalls.Add(1)
+		if got := r.URL.Path; got != "/api/tags" {
+			t.Fatalf("expected Ollama models path /api/tags, got %s", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Fatalf("expected no auth header for auth_type none, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"models":[{"name":"llama3.2:latest"},{"model":"qwen2.5-coder:latest"}]}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:                  "ollama",
+				Type:                "openai-compatible",
+				Default:             true,
+				BaseURL:             upstream.URL,
+				AuthType:            "none",
+				ModelDiscovery:      "ollama",
+				ModelsPath:          "/api/tags",
+				ChatCompletionsPath: "/v1/chat/completions",
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	handler.HandleModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if got := modelsCalls.Load(); got != 1 {
+		t.Fatalf("expected one Ollama models call, got %d", got)
+	}
+
+	var result struct {
+		Data []struct {
+			ID                 string   `json:"id"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	ids := map[string][]string{}
+	for _, model := range result.Data {
+		ids[model.ID] = model.SupportedEndpoints
+	}
+	if !reflect.DeepEqual(ids["llama3.2:latest"], []string{"/chat/completions"}) {
+		t.Fatalf("llama endpoints = %v, want [/chat/completions]", ids["llama3.2:latest"])
+	}
+	if !reflect.DeepEqual(ids["qwen2.5-coder:latest"], []string{"/chat/completions"}) {
+		t.Fatalf("qwen endpoints = %v, want [/chat/completions]", ids["qwen2.5-coder:latest"])
+	}
+}
+
+func TestHandleModels_GenericOpenRouterToolsDiscoveryFiltersToolModels(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/api/v1/models" {
+			t.Fatalf("expected OpenRouter models path /api/v1/models, got %s", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[
+			{"id":"tool-capable","name":"Tool Capable","supported_parameters":["tools","tool_choice"],"supported_endpoints":["/chat/completions"]},
+			{"id":"plain-chat","name":"Plain Chat","supported_parameters":["temperature"]}
+		]}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:             "openrouter",
+				Type:           "anthropic-compatible",
+				Default:        true,
+				BaseURL:        upstream.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openrouter-tools",
+				ModelsPath:     "/api/v1/models",
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	handler.HandleModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Data []struct {
+			ID                 string   `json:"id"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	if len(result.Data) != 1 {
+		t.Fatalf("models count = %d, want only tool-capable model: %+v", len(result.Data), result.Data)
+	}
+	if result.Data[0].ID != "tool-capable" {
+		t.Fatalf("model id = %q, want tool-capable", result.Data[0].ID)
+	}
+	if !reflect.DeepEqual(result.Data[0].SupportedEndpoints, []string{"/v1/messages"}) {
+		t.Fatalf("supported endpoints = %v, want [/v1/messages]", result.Data[0].SupportedEndpoints)
+	}
+}
+
 func TestHandleOpenAIChatCompletions_RejectsConfiguredAzureModelWithoutChatSupport(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 
@@ -7948,6 +9056,46 @@ func TestOpenAIChatCompletionsUpstreamErrorPassthrough(t *testing.T) {
 	}
 }
 
+func TestOpenAIChatCompletionsRetryableUpstreamErrorIncludesDetail(t *testing.T) {
+	var calls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Request-Id", fmt.Sprintf("req-%d", n))
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limit exceeded","type":"rate_limit_error","param":"model","code":"too_many_requests"}}`))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", resp.StatusCode)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("expected 3 upstream attempts, got %d", calls.Load())
+	}
+	if got := resp.Header.Get("X-Request-Id"); got != "req-3" {
+		t.Fatalf("X-Request-Id = %q, want req-3", got)
+	}
+
+	var errResp map[string]map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+		t.Fatalf("failed to parse error: %v", err)
+	}
+	message, _ := errResp["error"]["message"].(string)
+	for _, want := range []string{"upstream error (429)", "rate limit exceeded", "type=rate_limit_error", "param=model", "code=too_many_requests"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("message = %q, want %q", message, want)
+		}
+	}
+}
+
 // TestOpenAIChatCompletionsResponseShape validates a non-streaming response
 // has the correct OpenAI Chat Completions response structure.
 func TestOpenAIChatCompletionsResponseShape(t *testing.T) {
@@ -8642,5 +9790,323 @@ func TestHandleOpenAIChatCompletions_InvalidGzipBodyReturnsBadRequest(t *testing
 	}
 	if errResp["error"]["type"] != "invalid_request_error" {
 		t.Errorf("error.type = %v, want invalid_request_error", errResp["error"]["type"])
+	}
+}
+
+func TestNewProviderJSONRequest_StripsClientHeadersForAzureIdentity(t *testing.T) {
+	tokenSource := &staticAzureTokenSource{token: "entra-token"}
+	handler := &ProxyHandler{}
+	provider := &providerRuntime{
+		id:         "foundry",
+		kind:       providerTypeAzureOpenAI,
+		baseURL:    "https://foundry.example.test/openai/v1",
+		authMode:   providerAuthModeAzureIdentity,
+		azureToken: tokenSource,
+	}
+
+	req, err := handler.newProviderJSONRequest(
+		context.Background(),
+		provider,
+		http.MethodPost,
+		"/responses",
+		[]byte(`{"model":"gpt-test"}`),
+		http.Header{
+			"Authorization":          []string{"Bearer client-copilot-token"},
+			"api-key":                []string{"client-api-key"},
+			"editor-version":         []string{"client-editor"},
+			"editor-plugin-version":  []string{"client-plugin"},
+			"user-agent":             []string{"client-agent"},
+			"copilot-integration-id": []string{"client-integration"},
+			"x-github-api-version":   []string{"client-api"},
+			"x-request-id":           []string{"client-request-id"},
+			"openai-intent":          []string{"client-intent"},
+			"Traceparent":            []string{"00-11111111111111111111111111111111-2222222222222222-01"},
+		},
+		"",
+	)
+	if err != nil {
+		t.Fatalf("newProviderJSONRequest() error = %v", err)
+	}
+
+	if got := req.Header.Get("Authorization"); got != "Bearer entra-token" {
+		t.Fatalf("Authorization = %q, want Azure identity bearer token", got)
+	}
+	if got := req.Header.Get("api-key"); got != "" {
+		t.Fatalf("api-key = %q, want omitted for Azure identity", got)
+	}
+	for _, header := range []string{"editor-version", "editor-plugin-version", "user-agent", "copilot-integration-id", "x-github-api-version", "x-request-id", "openai-intent"} {
+		if got := req.Header.Get(header); got != "" {
+			t.Fatalf("%s = %q, want stripped for Azure", header, got)
+		}
+	}
+	if got := req.Header.Get("Traceparent"); got != "00-11111111111111111111111111111111-2222222222222222-01" {
+		t.Fatalf("Traceparent = %q, want passthrough trace header", got)
+	}
+	if tokenSource.calls.Load() != 1 {
+		t.Fatalf("token source calls = %d, want 1", tokenSource.calls.Load())
+	}
+}
+
+func TestHandleReadyz_AzureIdentityProvider(t *testing.T) {
+	tokenSource := &staticAzureTokenSource{token: "readyz-entra-token"}
+
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/openai/v1/models" {
+			t.Fatalf("expected Azure readiness path /openai/v1/models, got %s", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer readyz-entra-token" {
+			t.Fatalf("expected Azure identity Authorization header, got %q", got)
+		}
+		if got := r.Header.Get("api-key"); got != "" {
+			t.Fatalf("expected no api-key header, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer azureServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "foundry",
+			Type:     "azure-openai",
+			Default:  true,
+			BaseURL:  azureServer.URL + "/openai/v1",
+			AuthMode: "azure_identity",
+			Models: []ProviderModelConfig{{
+				PublicID:  "gpt-5.4",
+				Endpoints: []string{"/responses"},
+			}},
+		}}}),
+		withAzureIdentityTokenSourceFactoryForTest(func(providerID, scope string) (azureTokenSource, error) {
+			if providerID != "foundry" {
+				t.Fatalf("providerID = %q, want foundry", providerID)
+			}
+			if scope != defaultAzureIdentityTokenScope {
+				t.Fatalf("scope = %q, want %q", scope, defaultAzureIdentityTokenScope)
+			}
+			return tokenSource, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	handler.HandleReadyz(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if tokenSource.calls.Load() != 1 {
+		t.Fatalf("token source calls = %d, want 1", tokenSource.calls.Load())
+	}
+}
+
+func TestHandleModels_AzureIdentityProviderUsesBearerForOverlay(t *testing.T) {
+	tokenSource := &staticAzureTokenSource{token: "models-entra-token"}
+	var overlayHits atomic.Int32
+
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		overlayHits.Add(1)
+		if got := r.URL.Path; got != "/openai/v1/models" {
+			t.Fatalf("expected Azure models path /openai/v1/models, got %s", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer models-entra-token" {
+			t.Fatalf("expected Azure identity Authorization header, got %q", got)
+		}
+		if got := r.Header.Get("api-key"); got != "" {
+			t.Fatalf("expected no api-key header, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.4","object":"model","owned_by":"azure"}]}`))
+	}))
+	defer azureServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "foundry",
+			Type:     "azure-openai",
+			Default:  true,
+			BaseURL:  azureServer.URL + "/openai/v1",
+			AuthMode: "azure_identity",
+			Models: []ProviderModelConfig{{
+				PublicID:  "gpt-5.4",
+				Endpoints: []string{"/responses"},
+			}},
+		}}}),
+		withAzureIdentityTokenSourceFactoryForTest(func(string, string) (azureTokenSource, error) {
+			return tokenSource, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	handler.HandleModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if overlayHits.Load() != 1 {
+		t.Fatalf("overlay hits = %d, want 1", overlayHits.Load())
+	}
+}
+
+func TestHandleResponses_RoutesConfiguredAzureIdentityProvider(t *testing.T) {
+	tokenSource := &staticAzureTokenSource{token: "responses-entra-token"}
+
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/openai/v1/responses" {
+			t.Fatalf("expected Azure path /openai/v1/responses, got %s", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer responses-entra-token" {
+			t.Fatalf("expected Azure identity Authorization header, got %q", got)
+		}
+		if got := r.Header.Get("api-key"); got != "" {
+			t.Fatalf("expected no api-key header, got %q", got)
+		}
+
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream request body: %v", err)
+		}
+		var upstreamReq map[string]json.RawMessage
+		if err := json.Unmarshal(bodyBytes, &upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		var model string
+		if err := json.Unmarshal(upstreamReq["model"], &model); err != nil {
+			t.Fatalf("decode upstream model: %v", err)
+		}
+		if model != "gpt-5-4-prod" {
+			t.Fatalf("expected Azure deployment gpt-5-4-prod, got %q", model)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-azure","object":"response","status":"completed","model":"gpt-5-4-prod","output":[]}`))
+	}))
+	defer azureServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "foundry",
+			Type:     "azure-openai",
+			Default:  true,
+			BaseURL:  azureServer.URL + "/openai/v1",
+			AuthMode: "azure_identity",
+			Models: []ProviderModelConfig{{
+				PublicID:   "gpt-5-public",
+				Deployment: "gpt-5-4-prod",
+				Endpoints:  []string{"/responses"},
+			}},
+		}}}),
+		withAzureIdentityTokenSourceFactoryForTest(func(string, string) (azureTokenSource, error) {
+			return tokenSource, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model": "gpt-5-public",
+		"input": "Hello"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestHandleOpenAIChatCompletions_RoutesConfiguredAzureIdentityProvider(t *testing.T) {
+	tokenSource := &staticAzureTokenSource{token: "chat-entra-token"}
+
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/openai/v1/chat/completions" {
+			t.Fatalf("expected Azure path /openai/v1/chat/completions, got %s", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer chat-entra-token" {
+			t.Fatalf("expected Azure identity Authorization header, got %q", got)
+		}
+		if got := r.Header.Get("api-key"); got != "" {
+			t.Fatalf("expected no api-key header, got %q", got)
+		}
+
+		var upstreamReq models.OpenAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamReq.Model != "gpt-5-4-prod" {
+			t.Fatalf("expected Azure deployment gpt-5-4-prod, got %q", upstreamReq.Model)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+			ID:     "chatcmpl-azure-identity",
+			Object: "chat.completion",
+			Choices: []models.OpenAIChoice{{
+				Index: 0,
+				Message: models.OpenAIMessage{
+					Role:    "assistant",
+					Content: json.RawMessage(`"Hi"`),
+				},
+			}},
+		})
+	}))
+	defer azureServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "foundry",
+			Type:     "azure-openai",
+			Default:  true,
+			BaseURL:  azureServer.URL + "/openai/v1",
+			AuthMode: "azure_identity",
+			Models: []ProviderModelConfig{{
+				PublicID:   "gpt-5-public",
+				Deployment: "gpt-5-4-prod",
+				Endpoints:  []string{"/chat/completions"},
+			}},
+		}}}),
+		withAzureIdentityTokenSourceFactoryForTest(func(string, string) (azureTokenSource, error) {
+			return tokenSource, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model": "gpt-5-public",
+		"messages": [{"role": "user", "content": "Hello"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
 	}
 }

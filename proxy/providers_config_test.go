@@ -361,6 +361,194 @@ func TestLoadProvidersConfigFileCopilotHeaderProfiles(t *testing.T) {
 	}
 }
 
+func TestBuildProvidersGenericOpenAICompatibleConfig(t *testing.T) {
+	t.Setenv("TEST_GENERIC_API_KEY", "generic-key")
+
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	providers, _, defaultProviderID, err := handler.buildProviders(ProvidersConfig{
+		Providers: []ProviderConfig{{
+			ID:                  "local-openai",
+			Type:                "openai-compatible",
+			Default:             true,
+			BaseURL:             "http://localhost:1234",
+			APIKeyEnv:           "TEST_GENERIC_API_KEY",
+			AuthType:            "api-key-header",
+			AuthHeader:          "X-API-Key",
+			AuthPrefix:          "Token",
+			ExtraHeaders:        map[string]string{"X-Provider": "local"},
+			ChatCompletionsPath: "/v1/chat/completions",
+			ResponsesPath:       "/v1/responses",
+			ModelsPath:          "/api/tags",
+			ModelDiscovery:      "ollama",
+			Models: []ProviderModelConfig{{
+				PublicID:   "local-chat",
+				Deployment: "llama3.2:latest",
+				Name:       "Local Chat",
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+	if defaultProviderID != "local-openai" {
+		t.Fatalf("default provider = %q, want local-openai", defaultProviderID)
+	}
+
+	provider := providers["local-openai"]
+	if provider == nil {
+		t.Fatal("expected local-openai provider")
+	}
+	if provider.kind != providerTypeOpenAICompatible {
+		t.Fatalf("provider.kind = %q, want %q", provider.kind, providerTypeOpenAICompatible)
+	}
+	if provider.authType != providerAuthTypeAPIKeyHeader {
+		t.Fatalf("authType = %q, want api-key-header", provider.authType)
+	}
+	if provider.authHeader != "X-Api-Key" {
+		t.Fatalf("authHeader = %q, want X-Api-Key", provider.authHeader)
+	}
+	if provider.authPrefix != "Token" {
+		t.Fatalf("authPrefix = %q, want Token", provider.authPrefix)
+	}
+	if provider.apiKey != "generic-key" {
+		t.Fatalf("apiKey = %q, want generic-key", provider.apiKey)
+	}
+	if got := provider.extraHeaders.Get("X-Provider"); got != "local" {
+		t.Fatalf("extra header X-Provider = %q, want local", got)
+	}
+	if provider.paths.chatCompletions != "/v1/chat/completions" || provider.paths.responses != "/v1/responses" || provider.paths.models != "/api/tags" {
+		t.Fatalf("paths = %+v, want configured generic paths", provider.paths)
+	}
+	if provider.modelDiscovery != providerModelDiscoveryOllama {
+		t.Fatalf("modelDiscovery = %q, want ollama", provider.modelDiscovery)
+	}
+
+	model := provider.staticModels["local-chat"]
+	if model.publicID != "local-chat" || model.upstreamModel != "llama3.2:latest" {
+		t.Fatalf("static model = %+v, want public local-chat mapped to llama3.2:latest", model)
+	}
+	if !reflect.DeepEqual(model.supportedEndpoints, []string{"/chat/completions"}) {
+		t.Fatalf("default openai-compatible endpoints = %v, want [/chat/completions]", model.supportedEndpoints)
+	}
+}
+
+func TestBuildProvidersGenericAnthropicCompatibleConfig(t *testing.T) {
+	t.Parallel()
+
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	providers, _, _, err := handler.buildProviders(ProvidersConfig{
+		Providers: []ProviderConfig{{
+			ID:             "anthropic-native",
+			Type:           "anthropic-compatible",
+			Default:        true,
+			BaseURL:        "https://anthropic-compatible.example.com",
+			AuthType:       "none",
+			MessagesPath:   "/messages",
+			ModelDiscovery: "static",
+			Models: []ProviderModelConfig{{
+				PublicID: "claude-local",
+				Name:     "Claude Local",
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+
+	provider := providers["anthropic-native"]
+	if provider == nil {
+		t.Fatal("expected anthropic-native provider")
+	}
+	if provider.authType != providerAuthTypeNone {
+		t.Fatalf("authType = %q, want none", provider.authType)
+	}
+	if provider.paths.messages != "/messages" {
+		t.Fatalf("messages path = %q, want /messages", provider.paths.messages)
+	}
+	model := provider.staticModels["claude-local"]
+	if !reflect.DeepEqual(model.supportedEndpoints, []string{"/v1/messages"}) {
+		t.Fatalf("default anthropic-compatible endpoints = %v, want [/v1/messages]", model.supportedEndpoints)
+	}
+}
+
+func TestBuildProvidersGenericValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		cfg  ProviderConfig
+		want string
+	}{
+		{
+			name: "static requires models",
+			cfg: ProviderConfig{
+				ID:      "local",
+				Type:    "openai-compatible",
+				BaseURL: "http://localhost:1234",
+			},
+			want: "must configure at least one model",
+		},
+		{
+			name: "api key header requires header",
+			cfg: ProviderConfig{
+				ID:       "local",
+				Type:     "openai-compatible",
+				BaseURL:  "http://localhost:1234",
+				APIKey:   "key",
+				AuthType: "api-key-header",
+				Models:   []ProviderModelConfig{{PublicID: "m"}},
+			},
+			want: "requires auth_header",
+		},
+		{
+			name: "configured api key env must be set",
+			cfg: ProviderConfig{
+				ID:        "local",
+				Type:      "openai-compatible",
+				BaseURL:   "http://localhost:1234",
+				APIKeyEnv: "VEKIL_TEST_MISSING_GENERIC_API_KEY",
+				Models:    []ProviderModelConfig{{PublicID: "m"}},
+			},
+			want: "api_key_env",
+		},
+		{
+			name: "path rejects query",
+			cfg: ProviderConfig{
+				ID:                  "local",
+				Type:                "openai-compatible",
+				BaseURL:             "http://localhost:1234",
+				ChatCompletionsPath: "/v1/chat/completions?debug=true",
+				Models:              []ProviderModelConfig{{PublicID: "m"}},
+			},
+			want: "no query string or fragment",
+		},
+		{
+			name: "bad discovery",
+			cfg: ProviderConfig{
+				ID:             "local",
+				Type:           "openai-compatible",
+				BaseURL:        "http://localhost:1234",
+				ModelDiscovery: "made-up",
+				Models:         []ProviderModelConfig{{PublicID: "m"}},
+			},
+			want: "unsupported model_discovery",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+			_, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{tt.cfg}})
+			if err == nil {
+				t.Fatalf("buildProviders() error = nil, want %q", tt.want)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("buildProviders() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestLoadProvidersConfigFileRejectsEmptyBody(t *testing.T) {
 	t.Parallel()
 
@@ -695,6 +883,213 @@ func TestBuildProvidersAzureMalformedBaseURLRejected(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "no query string or fragment") {
 				t.Fatalf("buildProviders() error = %v, want query/fragment guidance", err)
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileAzureIdentityAuth(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name      string
+		ext       string
+		body      string
+		wantScope string
+	}{
+		{
+			name: "JSON",
+			ext:  ".json",
+			body: `{
+  "providers": [{
+    "id": "foundry",
+    "type": "azure-openai",
+    "auth_mode": "azure_identity",
+    "token_scope": "https://custom.example/.default",
+    "base_url": "https://example.services.ai.azure.com/api/projects/project/openai/v1",
+    "models": [{"public_id":"gpt-5.4","deployment":"gpt-5.4","endpoints":["/responses"]}]
+  }]
+}`,
+			wantScope: "https://custom.example/.default",
+		},
+		{
+			name: "YAML",
+			ext:  ".yaml",
+			body: `providers:
+  - id: foundry
+    type: azure-openai
+    auth_mode: azure_identity
+    token_scope: https://custom.example/.default
+    base_url: https://example.services.ai.azure.com/api/projects/project/openai/v1
+    models:
+      - public_id: gpt-5.4
+        deployment: gpt-5.4
+        endpoints:
+          - /responses
+`,
+			wantScope: "https://custom.example/.default",
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			providersPath := filepath.Join(t.TempDir(), "providers"+tc.ext)
+			if err := os.WriteFile(providersPath, []byte(tc.body), 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+
+			cfg, err := LoadProvidersConfigFile(providersPath)
+			if err != nil {
+				t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+			}
+			providerCfg := cfg.Providers[0]
+			if providerCfg.AuthMode != "azure_identity" {
+				t.Fatalf("auth_mode = %q, want azure_identity", providerCfg.AuthMode)
+			}
+			if providerCfg.TokenScope != tc.wantScope {
+				t.Fatalf("token_scope = %q, want %q", providerCfg.TokenScope, tc.wantScope)
+			}
+
+			factory := &recordingAzureIdentityFactory{source: &staticAzureTokenSource{token: "entra-token"}}
+			handler := &ProxyHandler{
+				copilotURL:                      "https://copilot.example.com",
+				azureIdentityTokenSourceFactory: factory.factory,
+			}
+			providers, _, defaultProviderID, err := handler.buildProviders(cfg)
+			if err != nil {
+				t.Fatalf("buildProviders() error = %v", err)
+			}
+			if defaultProviderID != "foundry" {
+				t.Fatalf("default provider = %q, want foundry", defaultProviderID)
+			}
+			provider := providers["foundry"]
+			if provider == nil {
+				t.Fatal("expected foundry provider to be built")
+			}
+			if provider.authMode != providerAuthModeAzureIdentity {
+				t.Fatalf("provider.authMode = %q, want azure_identity", provider.authMode)
+			}
+			if provider.tokenScope != tc.wantScope || factory.scope != tc.wantScope {
+				t.Fatalf("token scopes = provider %q factory %q, want %q", provider.tokenScope, factory.scope, tc.wantScope)
+			}
+			if provider.apiKey != "" {
+				t.Fatalf("provider.apiKey = %q, want empty for Azure identity", provider.apiKey)
+			}
+			if provider.azureToken == nil {
+				t.Fatal("provider.azureToken = nil, want configured token source")
+			}
+			if factory.calls.Load() != 1 {
+				t.Fatalf("Azure identity factory calls = %d, want 1", factory.calls.Load())
+			}
+		})
+	}
+}
+
+func TestBuildProvidersAzureIdentityDefaultScope(t *testing.T) {
+	t.Parallel()
+
+	factory := &recordingAzureIdentityFactory{source: &staticAzureTokenSource{token: "entra-token"}}
+	handler := &ProxyHandler{
+		copilotURL:                      "https://copilot.example.com",
+		azureIdentityTokenSourceFactory: factory.factory,
+	}
+	providers, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
+		ID:       "foundry",
+		Type:     "azure-openai",
+		BaseURL:  "https://example.services.ai.azure.com/api/projects/project/openai/v1",
+		AuthMode: "azure_identity",
+		Models: []ProviderModelConfig{{
+			PublicID: "gpt-5.4",
+		}},
+	}}})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+	provider := providers["foundry"]
+	if provider == nil {
+		t.Fatal("expected foundry provider to be built")
+	}
+	if provider.tokenScope != defaultAzureIdentityTokenScope {
+		t.Fatalf("provider.tokenScope = %q, want %q", provider.tokenScope, defaultAzureIdentityTokenScope)
+	}
+	if factory.scope != defaultAzureIdentityTokenScope {
+		t.Fatalf("factory scope = %q, want %q", factory.scope, defaultAzureIdentityTokenScope)
+	}
+}
+
+func TestBuildProvidersAzureAuthModeValidation(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name    string
+		cfg     ProviderConfig
+		wantErr string
+	}{
+		{
+			name: "unknown auth mode",
+			cfg: ProviderConfig{
+				AuthMode: "managed_identity",
+			},
+			wantErr: "unsupported auth_mode",
+		},
+		{
+			name: "azure identity rejects api key",
+			cfg: ProviderConfig{
+				AuthMode: "azure_identity",
+				APIKey:   "key",
+			},
+			wantErr: "cannot be combined with api_key or api_key_env",
+		},
+		{
+			name: "azure identity rejects api key env",
+			cfg: ProviderConfig{
+				AuthMode:  "azure_identity",
+				APIKeyEnv: "AZURE_OPENAI_API_KEY",
+			},
+			wantErr: "cannot be combined with api_key or api_key_env",
+		},
+		{
+			name: "api key mode rejects token scope",
+			cfg: ProviderConfig{
+				AuthMode:   "api_key",
+				APIKey:     "key",
+				TokenScope: "https://ai.azure.com/.default",
+			},
+			wantErr: "token_scope is only valid",
+		},
+		{
+			name:    "api key mode still requires key",
+			cfg:     ProviderConfig{},
+			wantErr: "must set api_key or api_key_env",
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := tc.cfg
+			cfg.ID = "azure"
+			cfg.Type = "azure-openai"
+			cfg.BaseURL = "https://example.openai.azure.com/openai/v1"
+			cfg.Models = []ProviderModelConfig{{PublicID: "gpt-5.4"}}
+
+			handler := &ProxyHandler{
+				copilotURL: "https://copilot.example.com",
+				azureIdentityTokenSourceFactory: func(string, string) (azureTokenSource, error) {
+					return &staticAzureTokenSource{token: "entra-token"}, nil
+				},
+			}
+			_, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{cfg}})
+			if err == nil {
+				t.Fatal("buildProviders() error = nil, want validation error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("buildProviders() error = %v, want %q", err, tc.wantErr)
 			}
 		})
 	}
