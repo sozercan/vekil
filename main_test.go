@@ -188,6 +188,14 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	}
 }
 
+func TestServeFlagsQuietCanBeEnabled(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet")
+
+	if !*serve.quiet {
+		t.Fatal("--quiet should enable quiet mode")
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -247,7 +255,7 @@ func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 			}
 
 			output := stderr.String()
-			for _, want := range []string{"github-cli", "gh", "force"} {
+			for _, want := range []string{"github-cli", "gh", "force", "quiet"} {
 				if !strings.Contains(output, want) {
 					t.Fatalf("help output missing %q:\n%s", want, output)
 				}
@@ -280,11 +288,13 @@ func TestRunLoginRejectsGitHubCLIWithForceBeforeAuthConstruction(t *testing.T) {
 }
 
 func TestRunLoginGHAliasUsesGitHubCLI(t *testing.T) {
+	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	fake := &fakeLoginAuthenticator{}
 	var gotTokenDir string
 
 	code := runLoginWithDeps([]string{"--gh", "--token-dir", "/tmp/vekil-test-tokens"}, loginDeps{
+		stdout: &stdout,
 		stderr: &stderr,
 		newAuthenticator: func(tokenDir string) (loginAuthenticator, error) {
 			gotTokenDir = tokenDir
@@ -304,12 +314,16 @@ func TestRunLoginGHAliasUsesGitHubCLI(t *testing.T) {
 	if fake.refreshCalls != 0 || fake.requestDeviceCodeCalls != 0 || fake.pollForAuthorizationCalls != 0 {
 		t.Fatalf("unexpected auth flow calls: refresh=%d request=%d poll=%d", fake.refreshCalls, fake.requestDeviceCodeCalls, fake.pollForAuthorizationCalls)
 	}
-	if got := stderr.String(); !strings.Contains(got, "Login successful.") {
-		t.Fatalf("stderr missing success message, got %q", got)
+	if got := stdout.String(); !strings.Contains(got, "Login successful.") {
+		t.Fatalf("stdout missing success message, got %q", got)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty", got)
 	}
 }
 
 func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
+	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	fake := &fakeLoginAuthenticator{
 		deviceCodeResponse: &auth.DeviceCodeResponse{
@@ -322,6 +336,7 @@ func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
 	var openedURL string
 
 	code := runLoginWithDeps([]string{"--force"}, loginDeps{
+		stdout: &stdout,
 		stderr: &stderr,
 		newAuthenticator: func(string) (loginAuthenticator, error) {
 			return fake, nil
@@ -350,11 +365,77 @@ func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
 	if openedURL != fake.deviceCodeResponse.VerificationURI {
 		t.Fatalf("opened URL = %q, want %q", openedURL, fake.deviceCodeResponse.VerificationURI)
 	}
-	output := stderr.String()
+	output := stdout.String()
 	for _, want := range []string{"Opening browser to https://github.com/login/device", "Enter code: ABCD-EFGH", "Login successful."} {
 		if !strings.Contains(output, want) {
-			t.Fatalf("stderr missing %q, got %q", want, output)
+			t.Fatalf("stdout missing %q, got %q", want, output)
 		}
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty", got)
+	}
+}
+
+func TestRunLoginQuietSuppressesNonErrorOutput(t *testing.T) {
+	var normalStdout bytes.Buffer
+	var normalStderr bytes.Buffer
+	code := runLoginWithDeps([]string{"--github-cli"}, loginDeps{
+		stdout: &normalStdout,
+		stderr: &normalStderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return &fakeLoginAuthenticator{}, nil
+		},
+	})
+	if code != 0 {
+		t.Fatalf("runLoginWithDeps() without quiet code = %d, want 0; stderr=%q", code, normalStderr.String())
+	}
+	if got := normalStdout.String(); !strings.Contains(got, "Login successful.") {
+		t.Fatalf("stdout without quiet missing success message, got %q", got)
+	}
+	if got := normalStderr.String(); got != "" {
+		t.Fatalf("stderr without quiet = %q, want empty", got)
+	}
+
+	var quietStdout bytes.Buffer
+	var quietStderr bytes.Buffer
+	code = runLoginWithDeps([]string{"--quiet", "--github-cli"}, loginDeps{
+		stdout: &quietStdout,
+		stderr: &quietStderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return &fakeLoginAuthenticator{}, nil
+		},
+	})
+	if code != 0 {
+		t.Fatalf("runLoginWithDeps() with quiet code = %d, want 0; stderr=%q", code, quietStderr.String())
+	}
+	if got := quietStdout.String(); got != "" {
+		t.Fatalf("stdout = %q, want empty", got)
+	}
+	if got := quietStderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty", got)
+	}
+}
+
+func TestRunLoginQuietStillWritesErrorsToStderr(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	code := runLoginWithDeps([]string{"--quiet", "--github-cli"}, loginDeps{
+		stdout: &stdout,
+		stderr: &stderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return &fakeLoginAuthenticator{signInWithGitHubCLIErr: fmt.Errorf("boom")}, nil
+		},
+	})
+
+	if code != 1 {
+		t.Fatalf("runLoginWithDeps() code = %d, want 1", code)
+	}
+	if got := stdout.String(); got != "" {
+		t.Fatalf("stdout = %q, want empty", got)
+	}
+	if got := stderr.String(); !strings.Contains(got, "error signing in with GitHub CLI: boom") {
+		t.Fatalf("stderr missing error, got %q", got)
 	}
 }
 
