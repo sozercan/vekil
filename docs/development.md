@@ -42,6 +42,19 @@ make lint
 
 GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs lint, tests, build, vet, and e2e validation before merge.
 
+Safe Dependabot updates are handled by [`.github/workflows/dependabot-auto-merge.yaml`](../.github/workflows/dependabot-auto-merge.yaml). It listens for Dependabot pull request lifecycle events, skips drafts, skips pull requests with requested changes, skips major updates, and only auto-approves plus enables auto-merge for semver patch/minor updates from eligible package ecosystems. Grouped Dependabot pull requests are eligible only when `dependabot/fetch-metadata` reports the highest update type as patch or minor.
+
+The auto-merge workflow intentionally skips the `github-actions` and `docker` package ecosystems so workflow/container updates still receive manual review.
+
+For that workflow to work, configure these repository settings and variable:
+
+- enable auto-merge in repository settings
+- allow workflow `GITHUB_TOKEN` write permissions for Dependabot pull request runs
+- allow GitHub Actions to create and approve pull requests in Actions settings
+- set the repository variable `DEPENDABOT_AUTO_MERGE_METHOD` to the explicit merge method to use: `merge`, `rebase`, or `squash`
+
+The configured merge method must also be enabled for the repository; otherwise `gh pr merge --auto` cannot enable auto-merge.
+
 The macOS tray app has its own workflow in [`.github/workflows/macos-app.yaml`](../.github/workflows/macos-app.yaml). It runs `scripts/macos-app-smoke.sh` on a macOS runner, which builds `Vekil.app`, validates the bundle contents, launches the app through Launch Services, verifies it stays up, and then quits it cleanly.
 
 ## Release
