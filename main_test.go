@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -188,6 +189,18 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	}
 }
 
+func TestServeFlagsQuietDefaultAndOverride(t *testing.T) {
+	defaultServe := parseServeFlagsForTest(t)
+	if *defaultServe.quiet {
+		t.Fatal("quiet should be disabled by default")
+	}
+
+	quietServe := parseServeFlagsForTest(t, "--quiet")
+	if !*quietServe.quiet {
+		t.Fatal("--quiet should enable quiet mode")
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -220,6 +233,52 @@ func TestCommandFromArgs(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := commandFromArgs(tc.args); got != tc.want {
 				t.Fatalf("commandFromArgs(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExtractGlobalOptionsQuiet(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		wantQuiet bool
+		wantArgs  []string
+	}{
+		{
+			name:      "quiet before subcommand",
+			args:      []string{"vekil", "--quiet", "login"},
+			wantQuiet: true,
+			wantArgs:  []string{"vekil", "login"},
+		},
+		{
+			name:      "quiet after subcommand",
+			args:      []string{"vekil", "login", "--quiet"},
+			wantQuiet: true,
+			wantArgs:  []string{"vekil", "login"},
+		},
+		{
+			name:      "quiet false leaves disabled",
+			args:      []string{"vekil", "--quiet=false", "login"},
+			wantQuiet: false,
+			wantArgs:  []string{"vekil", "login"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, args, err := extractGlobalOptions(tc.args)
+			if err != nil {
+				t.Fatalf("extractGlobalOptions() error = %v", err)
+			}
+			if got.quiet != tc.wantQuiet {
+				t.Fatalf("extractGlobalOptions() quiet = %v, want %v", got.quiet, tc.wantQuiet)
+			}
+			if strings.Join(args, "\x00") != strings.Join(tc.wantArgs, "\x00") {
+				t.Fatalf("extractGlobalOptions() args = %v, want %v", args, tc.wantArgs)
+			}
+			if commandFromArgs(args) != cliCommandLogin {
+				t.Fatalf("commandFromArgs(%v) did not dispatch login", args)
 			}
 		})
 	}
@@ -307,6 +366,62 @@ func TestRunLoginGHAliasUsesGitHubCLI(t *testing.T) {
 	if got := stderr.String(); !strings.Contains(got, "Login successful.") {
 		t.Fatalf("stderr missing success message, got %q", got)
 	}
+}
+
+func TestRunLoginQuietSuppressesNormalOutputButPreservesErrors(t *testing.T) {
+	t.Run("normal output visible by default", func(t *testing.T) {
+		var stderr bytes.Buffer
+
+		code := runLoginWithDeps([]string{"--github-cli"}, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return &fakeLoginAuthenticator{}, nil
+			},
+		})
+
+		if code != 0 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+		}
+		if got := stderr.String(); !strings.Contains(got, "Login successful.") {
+			t.Fatalf("stderr missing normal output, got %q", got)
+		}
+	})
+
+	t.Run("quiet suppresses normal output", func(t *testing.T) {
+		var stderr bytes.Buffer
+
+		code := runLoginWithDeps([]string{"--quiet", "--github-cli"}, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return &fakeLoginAuthenticator{}, nil
+			},
+		})
+
+		if code != 0 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+		}
+		if got := stderr.String(); got != "" {
+			t.Fatalf("quiet stderr = %q, want empty", got)
+		}
+	})
+
+	t.Run("quiet preserves errors", func(t *testing.T) {
+		var stderr bytes.Buffer
+
+		code := runLoginWithDeps([]string{"--quiet", "--github-cli"}, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return &fakeLoginAuthenticator{signInWithGitHubCLIErr: errors.New("gh unavailable")}, nil
+			},
+		})
+
+		if code != 1 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 1", code)
+		}
+		if got := stderr.String(); !strings.Contains(got, "error signing in with GitHub CLI: gh unavailable") {
+			t.Fatalf("quiet stderr missing error, got %q", got)
+		}
+	})
 }
 
 func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {

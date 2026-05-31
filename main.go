@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,17 +28,71 @@ const (
 )
 
 func main() {
+	global, args, err := extractGlobalOptions(os.Args)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
+
 	// Dispatch subcommands before falling through to the default server mode.
-	switch commandFromArgs(os.Args) {
+	switch commandFromArgs(args) {
 	case cliCommandLogin:
-		runLogin(os.Args[2:])
+		runLogin(args[2:], global)
 		return
 	case cliCommandLogout:
-		runLogout(os.Args[2:])
+		runLogout(args[2:], global)
 		return
 	}
 
-	runServe()
+	runServe(args[1:], global)
+}
+
+type cliOptions struct {
+	quiet bool
+}
+
+const quietFlagHelp = "suppress non-error output"
+
+func registerQuietFlag(fs *flag.FlagSet) *bool {
+	return fs.Bool("quiet", false, quietFlagHelp)
+}
+
+func extractGlobalOptions(args []string) (cliOptions, []string, error) {
+	if len(args) == 0 {
+		return cliOptions{}, nil, nil
+	}
+
+	global := cliOptions{}
+	filtered := make([]string, 0, len(args))
+	filtered = append(filtered, args[0])
+
+	for _, arg := range args[1:] {
+		switch {
+		case arg == "--quiet":
+			global.quiet = true
+		case strings.HasPrefix(arg, "--quiet="):
+			value := strings.TrimPrefix(arg, "--quiet=")
+			quiet, err := strconv.ParseBool(value)
+			if err != nil {
+				return cliOptions{}, nil, fmt.Errorf("invalid value %q for --quiet: expected bool", value)
+			}
+			global.quiet = quiet
+		default:
+			filtered = append(filtered, arg)
+		}
+	}
+
+	return global, filtered, nil
+}
+
+func withGlobalOptions(args []string, global cliOptions) []string {
+	if !global.quiet {
+		return args
+	}
+	merged := make([]string, 0, len(args)+1)
+	merged = append(merged, "--quiet")
+	merged = append(merged, args...)
+	return merged
 }
 
 func commandFromArgs(args []string) cliCommand {
@@ -59,6 +114,7 @@ type loginOptions struct {
 	tokenDir     string
 	useGitHubCLI bool
 	force        bool
+	quiet        bool
 }
 
 var errConflictingLoginFlags = fmt.Errorf("--github-cli/--gh cannot be used with --force")
@@ -72,12 +128,13 @@ type loginAuthenticator interface {
 
 type loginDeps struct {
 	stderr           io.Writer
+	output           io.Writer
 	newAuthenticator func(string) (loginAuthenticator, error)
 	openURL          func(string) error
 }
 
-func runLogin(args []string) {
-	if code := runLoginWithDeps(args, defaultLoginDeps()); code != 0 {
+func runLogin(args []string, global cliOptions) {
+	if code := runLoginWithDeps(withGlobalOptions(args, global), defaultLoginDeps()); code != 0 {
 		os.Exit(code)
 	}
 }
@@ -85,6 +142,7 @@ func runLogin(args []string) {
 func defaultLoginDeps() loginDeps {
 	return loginDeps{
 		stderr: os.Stderr,
+		output: os.Stderr,
 		newAuthenticator: func(tokenDir string) (loginAuthenticator, error) {
 			return auth.NewAuthenticator(tokenDir)
 		},
@@ -112,19 +170,24 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		return 1
 	}
 
+	output := deps.output
+	if opts.quiet {
+		output = io.Discard
+	}
+
 	ctx := context.Background()
 	if opts.useGitHubCLI {
 		if err := authenticator.SignInWithGitHubCLI(ctx); err != nil {
 			_, _ = fmt.Fprintf(deps.stderr, "error signing in with GitHub CLI: %v\n", err)
 			return 1
 		}
-		_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+		_, _ = fmt.Fprintln(output, "Login successful.")
 		return 0
 	}
 
 	if !opts.force {
 		if _, err := authenticator.RefreshTokenNonInteractive(ctx); err == nil {
-			_, _ = fmt.Fprintln(deps.stderr, "Already logged in.")
+			_, _ = fmt.Fprintln(output, "Already logged in.")
 			return 0
 		} else if !auth.IsInteractiveLoginRequired(err) {
 			_, _ = fmt.Fprintf(deps.stderr, "error refreshing existing login: %v\n", err)
@@ -138,11 +201,11 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintf(deps.stderr, "Opening browser to %s\n", dcResp.VerificationURI)
-	_, _ = fmt.Fprintf(deps.stderr, "Enter code: %s\n", dcResp.UserCode)
+	_, _ = fmt.Fprintf(output, "Opening browser to %s\n", dcResp.VerificationURI)
+	_, _ = fmt.Fprintf(output, "Enter code: %s\n", dcResp.UserCode)
 
 	if err := deps.openURL(dcResp.VerificationURI); err != nil {
-		_, _ = fmt.Fprintf(deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
+		_, _ = fmt.Fprintf(output, "Could not open browser automatically, please visit the URL above.\n")
 	}
 
 	if err := authenticator.PollForAuthorization(ctx, dcResp); err != nil {
@@ -150,13 +213,16 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+	_, _ = fmt.Fprintln(output, "Login successful.")
 	return 0
 }
 
 func normalizeLoginDeps(deps loginDeps) loginDeps {
 	if deps.stderr == nil {
 		deps.stderr = io.Discard
+	}
+	if deps.output == nil {
+		deps.output = deps.stderr
 	}
 	if deps.newAuthenticator == nil {
 		deps.newAuthenticator = defaultLoginDeps().newAuthenticator
@@ -178,6 +244,7 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 	githubCLI := fs.Bool("github-cli", false, "Sign in using the currently authenticated GitHub CLI account")
 	gh := fs.Bool("gh", false, "Alias for --github-cli")
 	force := fs.Bool("force", false, "Force the interactive GitHub device-code flow")
+	quiet := registerQuietFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
@@ -185,16 +252,18 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 	opts.tokenDir = *tokenDir
 	opts.useGitHubCLI = *githubCLI || *gh
 	opts.force = *force
+	opts.quiet = *quiet
 	if opts.useGitHubCLI && opts.force {
 		return opts, errConflictingLoginFlags
 	}
 	return opts, nil
 }
 
-func runLogout(args []string) {
+func runLogout(args []string, global cliOptions) {
 	fs := flag.NewFlagSet("logout", flag.ExitOnError)
 	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
-	fs.Parse(args) //nolint:errcheck
+	quiet := registerQuietFlag(fs)
+	fs.Parse(withGlobalOptions(args, global)) //nolint:errcheck
 
 	authenticator, err := auth.NewAuthenticator(*tokenDir)
 	if err != nil {
@@ -207,7 +276,9 @@ func runLogout(args []string) {
 		os.Exit(1)
 	}
 
-	_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
+	if !*quiet {
+		_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
+	}
 }
 
 type serveFlags struct {
@@ -232,6 +303,7 @@ type serveFlags struct {
 	compactUpstreamChunkBytes       *int
 	compactUpstreamChunkConcurrency *int
 	compactUpstreamMaxAttempts      *int
+	quiet                           *bool
 }
 
 func registerServeFlags(fs *flag.FlagSet) serveFlags {
@@ -257,6 +329,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		compactUpstreamChunkBytes:       fs.Int("compact-upstream-chunk-bytes", getEnvInt("COMPACT_UPSTREAM_CHUNK_BYTES", proxy.DefaultCompactUpstreamChunkBytes()), "Target body size (bytes) for chunked /v1/responses/compact retries after an upstream 413; halved on each recursive 413 down to a 64 KiB floor"),
 		compactUpstreamChunkConcurrency: fs.Int("compact-upstream-chunk-concurrency", getEnvInt("COMPACT_UPSTREAM_CHUNK_CONCURRENCY", proxy.DefaultCompactUpstreamChunkConcurrency()), "Maximum sibling chunk compaction calls to run concurrently after the first chunk succeeds"),
 		compactUpstreamMaxAttempts:      fs.Int("compact-upstream-max-attempts", getEnvInt("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts()), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy"),
+		quiet:                           registerQuietFlag(fs),
 	}
 }
 
@@ -282,11 +355,15 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 	}
 }
 
-func runServe() {
+func runServe(args []string, global cliOptions) {
 	serve := registerServeFlags(flag.CommandLine)
-	flag.Parse()
+	flag.CommandLine.Parse(withGlobalOptions(args, global)) //nolint:errcheck
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+	logLevel := logger.ParseLevel(*serve.logLevel)
+	if *serve.quiet {
+		logLevel = logger.LevelError
+	}
+	log := logger.New(logLevel)
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
