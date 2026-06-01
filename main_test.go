@@ -14,6 +14,15 @@ import (
 	"github.com/sozercan/vekil/auth"
 )
 
+func setQuietOutputForTest(t *testing.T, quiet bool) {
+	t.Helper()
+	prev := quietOutput
+	setQuietOutput(quiet)
+	t.Cleanup(func() {
+		setQuietOutput(prev)
+	})
+}
+
 func TestGetEnvDuration(t *testing.T) {
 	const envKey = "TEST_STREAMING_UPSTREAM_TIMEOUT"
 	const fallback = 5 * time.Minute
@@ -188,6 +197,18 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	}
 }
 
+func TestServeFlagsQuietAliases(t *testing.T) {
+	longFlag := parseServeFlagsForTest(t, "--quiet")
+	if !*longFlag.quiet {
+		t.Fatal("--quiet should set quiet")
+	}
+
+	shortFlag := parseServeFlagsForTest(t, "-q")
+	if !*shortFlag.quietShort {
+		t.Fatal("-q should set quiet alias")
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -220,6 +241,52 @@ func TestCommandFromArgs(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := commandFromArgs(tc.args); got != tc.want {
 				t.Fatalf("commandFromArgs(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExtractQuietFlag(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantQuiet  bool
+		wantRemain []string
+	}{
+		{
+			name:       "no quiet flag",
+			args:       []string{"vekil", "login"},
+			wantQuiet:  false,
+			wantRemain: []string{"vekil", "login"},
+		},
+		{
+			name:       "long quiet before command",
+			args:       []string{"vekil", "--quiet", "login"},
+			wantQuiet:  true,
+			wantRemain: []string{"vekil", "login"},
+		},
+		{
+			name:       "short quiet after command",
+			args:       []string{"vekil", "login", "-q"},
+			wantQuiet:  true,
+			wantRemain: []string{"vekil", "login"},
+		},
+		{
+			name:       "quiet explicit false",
+			args:       []string{"vekil", "--quiet=false", "login"},
+			wantQuiet:  false,
+			wantRemain: []string{"vekil", "login"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotQuiet, gotRemain := extractQuietFlag(tc.args)
+			if gotQuiet != tc.wantQuiet {
+				t.Fatalf("extractQuietFlag(%v) quiet=%v, want %v", tc.args, gotQuiet, tc.wantQuiet)
+			}
+			if strings.Join(gotRemain, "\x00") != strings.Join(tc.wantRemain, "\x00") {
+				t.Fatalf("extractQuietFlag(%v) args=%v, want %v", tc.args, gotRemain, tc.wantRemain)
 			}
 		})
 	}
@@ -280,6 +347,8 @@ func TestRunLoginRejectsGitHubCLIWithForceBeforeAuthConstruction(t *testing.T) {
 }
 
 func TestRunLoginGHAliasUsesGitHubCLI(t *testing.T) {
+	setQuietOutputForTest(t, false)
+
 	var stderr bytes.Buffer
 	fake := &fakeLoginAuthenticator{}
 	var gotTokenDir string
@@ -306,6 +375,30 @@ func TestRunLoginGHAliasUsesGitHubCLI(t *testing.T) {
 	}
 	if got := stderr.String(); !strings.Contains(got, "Login successful.") {
 		t.Fatalf("stderr missing success message, got %q", got)
+	}
+}
+
+func TestRunLoginGHAliasQuietSuppressesSuccessOutput(t *testing.T) {
+	setQuietOutputForTest(t, true)
+
+	var stderr bytes.Buffer
+	fake := &fakeLoginAuthenticator{}
+
+	code := runLoginWithDeps([]string{"--gh"}, loginDeps{
+		stderr: &stderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return fake, nil
+		},
+	})
+
+	if code != 0 {
+		t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if fake.signInWithGitHubCLICalls != 1 {
+		t.Fatalf("SignInWithGitHubCLI calls = %d, want 1", fake.signInWithGitHubCLICalls)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("quiet login should suppress non-error output, got %q", got)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,14 +27,19 @@ const (
 	cliCommandLogout
 )
 
+var quietOutput bool
+
 func main() {
+	quiet, args := extractQuietFlag(os.Args)
+	setQuietOutput(quiet)
+
 	// Dispatch subcommands before falling through to the default server mode.
-	switch commandFromArgs(os.Args) {
+	switch commandFromArgs(args) {
 	case cliCommandLogin:
-		runLogin(os.Args[2:])
+		runLogin(args[2:])
 		return
 	case cliCommandLogout:
-		runLogout(os.Args[2:])
+		runLogout(args[2:])
 		return
 	}
 
@@ -53,6 +59,51 @@ func commandFromArgs(args []string) cliCommand {
 	default:
 		return cliCommandServe
 	}
+}
+
+func extractQuietFlag(args []string) (bool, []string) {
+	if len(args) == 0 {
+		return false, nil
+	}
+
+	filtered := make([]string, 0, len(args))
+	filtered = append(filtered, args[0])
+
+	quiet := false
+	for _, arg := range args[1:] {
+		switch {
+		case arg == "--quiet" || arg == "-q":
+			quiet = true
+		case strings.HasPrefix(arg, "--quiet="):
+			v, err := strconv.ParseBool(strings.TrimPrefix(arg, "--quiet="))
+			if err != nil {
+				filtered = append(filtered, arg)
+				continue
+			}
+			quiet = v
+		default:
+			filtered = append(filtered, arg)
+		}
+	}
+	return quiet, filtered
+}
+
+func setQuietOutput(quiet bool) {
+	quietOutput = quiet
+}
+
+func writeNonErrorf(w io.Writer, format string, args ...interface{}) {
+	if quietOutput {
+		return
+	}
+	_, _ = fmt.Fprintf(w, format, args...)
+}
+
+func writeNonErrorln(w io.Writer, args ...interface{}) {
+	if quietOutput {
+		return
+	}
+	_, _ = fmt.Fprintln(w, args...)
 }
 
 type loginOptions struct {
@@ -118,13 +169,13 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 			_, _ = fmt.Fprintf(deps.stderr, "error signing in with GitHub CLI: %v\n", err)
 			return 1
 		}
-		_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+		writeNonErrorln(deps.stderr, "Login successful.")
 		return 0
 	}
 
 	if !opts.force {
 		if _, err := authenticator.RefreshTokenNonInteractive(ctx); err == nil {
-			_, _ = fmt.Fprintln(deps.stderr, "Already logged in.")
+			writeNonErrorln(deps.stderr, "Already logged in.")
 			return 0
 		} else if !auth.IsInteractiveLoginRequired(err) {
 			_, _ = fmt.Fprintf(deps.stderr, "error refreshing existing login: %v\n", err)
@@ -138,8 +189,8 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintf(deps.stderr, "Opening browser to %s\n", dcResp.VerificationURI)
-	_, _ = fmt.Fprintf(deps.stderr, "Enter code: %s\n", dcResp.UserCode)
+	writeNonErrorf(deps.stderr, "Opening browser to %s\n", dcResp.VerificationURI)
+	writeNonErrorf(deps.stderr, "Enter code: %s\n", dcResp.UserCode)
 
 	if err := deps.openURL(dcResp.VerificationURI); err != nil {
 		_, _ = fmt.Fprintf(deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
@@ -150,7 +201,7 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+	writeNonErrorln(deps.stderr, "Login successful.")
 	return 0
 }
 
@@ -207,7 +258,7 @@ func runLogout(args []string) {
 		os.Exit(1)
 	}
 
-	_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
+	writeNonErrorln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
 }
 
 type serveFlags struct {
@@ -216,6 +267,8 @@ type serveFlags struct {
 	tokenDir                        *string
 	providersConfigPath             *string
 	logLevel                        *string
+	quiet                           *bool
+	quietShort                      *bool
 	streamingUpstreamTimeout        *time.Duration
 	copilotEditorVersion            *string
 	copilotPluginVersion            *string
@@ -241,6 +294,8 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
+		quiet:                           fs.Bool("quiet", false, "Suppress non-error output"),
+		quietShort:                      fs.Bool("q", false, "Alias for --quiet"),
 		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
 		copilotPluginVersion:            fs.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header"),
@@ -285,8 +340,13 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 func runServe() {
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
+	setQuietOutput(*serve.quiet || *serve.quietShort)
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+	logLevel := logger.ParseLevel(*serve.logLevel)
+	if quietOutput && logLevel < logger.LevelError {
+		logLevel = logger.LevelError
+	}
+	log := logger.New(logLevel)
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
@@ -356,7 +416,7 @@ func getEnvBool(key string, fallback bool) bool {
 	}
 	parsed, err := strconv.ParseBool(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
+		writeNonErrorf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -369,7 +429,7 @@ func getEnvInt(key string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
+		writeNonErrorf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -382,7 +442,7 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	}
 	parsed, err := time.ParseDuration(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
+		writeNonErrorf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
