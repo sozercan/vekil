@@ -216,6 +216,7 @@ type serveFlags struct {
 	tokenDir                        *string
 	providersConfigPath             *string
 	logLevel                        *string
+	quiet                           *bool
 	streamingUpstreamTimeout        *time.Duration
 	copilotEditorVersion            *string
 	copilotPluginVersion            *string
@@ -241,6 +242,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
+		quiet:                           fs.Bool("quiet", getEnvBool("QUIET", false), "Suppress non-error log output"),
 		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
 		copilotPluginVersion:            fs.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header"),
@@ -283,10 +285,19 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 }
 
 func runServe() {
-	serve := registerServeFlags(flag.CommandLine)
-	flag.Parse()
+	runServeWithArgs(os.Args[1:])
+}
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+func runServeWithArgs(args []string) {
+	fs := flag.NewFlagSet("vekil", flag.ExitOnError)
+	serve := registerServeFlags(fs)
+	fs.Parse(args) //nolint:errcheck
+
+	logLevel := logger.ParseLevel(*serve.logLevel)
+	if *serve.quiet {
+		logLevel = logger.LevelError
+	}
+	log := logger.New(logLevel)
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {

@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -185,6 +187,49 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	cliServe := parseServeFlagsForTest(t, "--responses-ws-enabled=false")
 	if cliServe.responsesWebSocketConfig().Enabled {
 		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
+	}
+}
+
+func TestServeFlagsQuietCanBeEnabled(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet")
+	if !*serve.quiet {
+		t.Fatal("--quiet should enable quiet mode")
+	}
+}
+
+func TestQuietFlagSuppressesNonErrorOutput(t *testing.T) {
+	cfgPath := writeProvidersConfigForTest(t)
+
+	stdout, stderr, err := runServeSubprocess(t, []string{
+		"--quiet",
+		"--host", "127.0.0.1",
+		"--port", "0",
+		"--providers-config", cfgPath,
+	}, true)
+	if err != nil {
+		t.Fatalf("quiet subprocess failed: %v\nstderr=%s", err, stderr)
+	}
+	if strings.TrimSpace(stdout) != "" {
+		t.Fatalf("stdout should be empty in quiet mode, got %q", stdout)
+	}
+	if strings.Contains(stderr, `"level":"info"`) {
+		t.Fatalf("quiet mode should suppress info logs, got %q", stderr)
+	}
+}
+
+func TestQuietFlagStillEmitsErrors(t *testing.T) {
+	_, stderr, err := runServeSubprocess(t, []string{
+		"--quiet",
+		"--providers-config", "/tmp/this-file-should-not-exist-vekil.json",
+	}, false)
+	if err == nil {
+		t.Fatal("expected subprocess to fail with invalid providers config")
+	}
+	if !strings.Contains(stderr, `"level":"fatal"`) {
+		t.Fatalf("expected fatal log output when run fails, got %q", stderr)
+	}
+	if !strings.Contains(stderr, "failed to load providers config") {
+		t.Fatalf("expected providers config error in stderr, got %q", stderr)
 	}
 }
 
@@ -402,4 +447,75 @@ func (f *fakeLoginAuthenticator) PollForAuthorization(_ context.Context, dcResp 
 	f.pollForAuthorizationCalls++
 	f.polledDeviceCode = dcResp
 	return f.pollForAuthorizationErr
+}
+
+func TestRunServeHelperProcess(t *testing.T) {
+	if os.Getenv("VEKIL_HELPER_PROCESS") != "1" {
+		return
+	}
+
+	args := os.Args
+	sep := -1
+	for i, arg := range args {
+		if arg == "--" {
+			sep = i
+			break
+		}
+	}
+	if sep == -1 || sep+1 >= len(args) {
+		_, _ = fmt.Fprintln(os.Stderr, "missing helper args")
+		os.Exit(2)
+	}
+
+	runServeWithArgs(args[sep+1:])
+	os.Exit(0)
+}
+
+func runServeSubprocess(t *testing.T, args []string, stopAfterStart bool) (string, string, error) {
+	t.Helper()
+
+	cmdArgs := append([]string{"-test.run=TestRunServeHelperProcess", "--"}, args...)
+	cmd := exec.Command(os.Args[0], cmdArgs...)
+	cmd.Env = append(os.Environ(), "VEKIL_HELPER_PROCESS=1")
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start helper subprocess: %v", err)
+	}
+
+	if stopAfterStart {
+		time.Sleep(300 * time.Millisecond)
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+	}
+
+	err := cmd.Wait()
+	return stdout.String(), stderr.String(), err
+}
+
+func writeProvidersConfigForTest(t *testing.T) string {
+	t.Helper()
+	path := t.TempDir() + "/providers.json"
+	body := `{
+  "providers": [
+    {
+      "id": "test-openai",
+      "type": "openai-compatible",
+      "base_url": "https://example.com",
+      "models": [
+        {
+          "public_id": "gpt-test",
+          "deployment": "gpt-test"
+        }
+      ]
+    }
+  ]
+}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write providers config: %v", err)
+	}
+	return path
 }
