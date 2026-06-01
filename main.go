@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -217,7 +218,6 @@ type serveFlags struct {
 	providersConfigPath             *string
 	logLevel                        *string
 	quiet                           *bool
-	quietShort                      *bool
 	streamingUpstreamTimeout        *time.Duration
 	copilotEditorVersion            *string
 	copilotPluginVersion            *string
@@ -236,15 +236,20 @@ type serveFlags struct {
 	compactUpstreamMaxAttempts      *int
 }
 
+var suppressEnvWarnings bool
+
 func registerServeFlags(fs *flag.FlagSet) serveFlags {
+	var quiet bool
+	fs.BoolVar(&quiet, "quiet", false, "Suppress non-error output")
+	fs.BoolVar(&quiet, "q", false, "Alias for --quiet")
+
 	return serveFlags{
 		port:                            fs.String("port", getEnv("PORT", "1337"), "Listen port"),
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
-		quiet:                           fs.Bool("quiet", false, "Suppress non-error output"),
-		quietShort:                      fs.Bool("q", false, "Alias for --quiet"),
+		quiet:                           &quiet,
 		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
 		copilotPluginVersion:            fs.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header"),
@@ -265,7 +270,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 }
 
 func (f serveFlags) logLevelSetting() logger.Level {
-	if *f.quiet || *f.quietShort {
+	if *f.quiet {
 		return logger.LevelError
 	}
 	return logger.ParseLevel(*f.logLevel)
@@ -294,6 +299,7 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 }
 
 func runServe() {
+	suppressEnvWarnings = argsContainQuietFlag(os.Args[1:])
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
 
@@ -353,6 +359,18 @@ func runServe() {
 	log.Info("server stopped")
 }
 
+func argsContainQuietFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		if arg == "--quiet" || arg == "-q" || strings.HasPrefix(arg, "--quiet=") || strings.HasPrefix(arg, "-q=") {
+			return true
+		}
+	}
+	return false
+}
+
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -367,7 +385,7 @@ func getEnvBool(key string, fallback bool) bool {
 	}
 	parsed, err := strconv.ParseBool(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
+		envWarningf("warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -380,7 +398,7 @@ func getEnvInt(key string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
+		envWarningf("warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -393,8 +411,15 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	}
 	parsed, err := time.ParseDuration(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
+		envWarningf("warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
+}
+
+func envWarningf(format string, args ...any) {
+	if suppressEnvWarnings {
+		return
+	}
+	_, _ = fmt.Fprintf(os.Stderr, format, args...)
 }

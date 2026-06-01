@@ -100,6 +100,9 @@ func TestGetEnvInt(t *testing.T) {
 
 func TestGetEnvWarnsOnInvalidValue(t *testing.T) {
 	const envKey = "TEST_WARN_VAR"
+	previous := suppressEnvWarnings
+	suppressEnvWarnings = false
+	t.Cleanup(func() { suppressEnvWarnings = previous })
 
 	// Capture stderr to verify warning is emitted.
 	old := os.Stderr
@@ -237,6 +240,44 @@ func TestServeFlagsQuietSuppressesNonErrorLogs(t *testing.T) {
 			}
 			if gotError := strings.Contains(output, `"msg":"error message"`); gotError != tc.wantError {
 				t.Fatalf("error output presence = %v, want %v; output=%q", gotError, tc.wantError, output)
+			}
+		})
+	}
+}
+
+func TestServeFlagsQuietAndShortQuietShareSameValue(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "--quiet sets -q value",
+			args: []string{"--quiet"},
+		},
+		{
+			name: "-q sets --quiet value",
+			args: []string{"-q"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			serve := registerServeFlags(fs)
+
+			if err := fs.Parse(tc.args); err != nil {
+				t.Fatalf("parse serve flags: %v", err)
+			}
+
+			if !*serve.quiet {
+				t.Fatalf("serve.quiet = false, want true")
+			}
+			if got := fs.Lookup("quiet").Value.String(); got != "true" {
+				t.Fatalf("quiet flag value = %q, want true", got)
+			}
+			if got := fs.Lookup("q").Value.String(); got != "true" {
+				t.Fatalf("q flag value = %q, want true", got)
 			}
 		})
 	}
