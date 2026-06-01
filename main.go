@@ -69,6 +69,11 @@ type loginOptions struct {
 	quiet        bool
 }
 
+type logoutOptions struct {
+	tokenDir string
+	quiet    bool
+}
+
 var errConflictingLoginFlags = fmt.Errorf("--github-cli/--gh cannot be used with --force")
 
 type loginAuthenticator interface {
@@ -82,6 +87,15 @@ type loginDeps struct {
 	stderr           io.Writer
 	newAuthenticator func(string) (loginAuthenticator, error)
 	openURL          func(string) error
+}
+
+type logoutAuthenticator interface {
+	SignOut() error
+}
+
+type logoutDeps struct {
+	stderr           io.Writer
+	newAuthenticator func(string) (logoutAuthenticator, error)
 }
 
 func runLogin(args []string, globalQuiet bool) {
@@ -214,26 +228,76 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 }
 
 func runLogout(args []string, globalQuiet bool) {
-	fs := flag.NewFlagSet("logout", flag.ExitOnError)
-	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
-	quiet := fs.Bool("quiet", false, "Suppress non-error output")
-	q := fs.Bool("q", false, "Alias for --quiet")
-	fs.Parse(args) //nolint:errcheck
+	if code := runLogoutWithDeps(args, defaultLogoutDeps(), globalQuiet); code != 0 {
+		os.Exit(code)
+	}
+}
 
-	authenticator, err := auth.NewAuthenticator(*tokenDir)
+func defaultLogoutDeps() logoutDeps {
+	return logoutDeps{
+		stderr: os.Stderr,
+		newAuthenticator: func(tokenDir string) (logoutAuthenticator, error) {
+			return auth.NewAuthenticator(tokenDir)
+		},
+	}
+}
+
+func runLogoutWithDeps(args []string, deps logoutDeps, globalQuiet bool) int {
+	deps = normalizeLogoutDeps(deps)
+
+	opts, err := parseLogoutOptions(args, deps.stderr)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+
+	authenticator, err := deps.newAuthenticator(opts.tokenDir)
+	if err != nil {
+		_, _ = fmt.Fprintf(deps.stderr, "error: %v\n", err)
+		return 1
 	}
 
 	if err := authenticator.SignOut(); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		_, _ = fmt.Fprintf(deps.stderr, "error: %v\n", err)
+		return 1
 	}
 
-	if !(globalQuiet || *quiet || *q) {
-		_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
+	if !(globalQuiet || opts.quiet) {
+		_, _ = fmt.Fprintln(deps.stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
 	}
+
+	return 0
+}
+
+func normalizeLogoutDeps(deps logoutDeps) logoutDeps {
+	if deps.stderr == nil {
+		deps.stderr = io.Discard
+	}
+	if deps.newAuthenticator == nil {
+		deps.newAuthenticator = defaultLogoutDeps().newAuthenticator
+	}
+	return deps
+}
+
+func parseLogoutOptions(args []string, stderr io.Writer) (logoutOptions, error) {
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	opts := logoutOptions{}
+	fs := flag.NewFlagSet("logout", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
+	quiet := fs.Bool("quiet", false, "Suppress non-error output")
+	q := fs.Bool("q", false, "Alias for --quiet")
+	if err := fs.Parse(args); err != nil {
+		return opts, err
+	}
+
+	opts.tokenDir = *tokenDir
+	opts.quiet = *quiet || *q
+	return opts, nil
 }
 
 type serveFlags struct {
@@ -262,7 +326,7 @@ type serveFlags struct {
 	compactUpstreamMaxAttempts      *int
 }
 
-func registerServeFlags(fs *flag.FlagSet) serveFlags {
+func registerServeFlags(fs *flag.FlagSet, quiet bool) serveFlags {
 	return serveFlags{
 		quiet:                           fs.Bool("quiet", false, "Suppress non-error output"),
 		quietShort:                      fs.Bool("q", false, "Alias for --quiet"),
@@ -271,22 +335,22 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
-		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
+		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDurationWithQuiet("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout(), quiet), "Timeout for streaming upstream inference requests"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
 		copilotPluginVersion:            fs.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header"),
 		copilotUserAgent:                fs.String("copilot-user-agent", getEnv("COPILOT_USER_AGENT", ""), "Upstream Copilot user-agent header"),
 		copilotIntegrationID:            fs.String("copilot-integration-id", getEnv("COPILOT_INTEGRATION_ID", ""), "Upstream Copilot copilot-integration-id header"),
 		copilotGitHubAPIVersion:         fs.String("copilot-github-api-version", getEnv("COPILOT_GITHUB_API_VERSION", ""), "Upstream Copilot x-github-api-version header"),
 		copilotOpenAIIntent:             fs.String("copilot-openai-intent", getEnv("COPILOT_OPENAI_INTENT", ""), "Upstream Copilot openai-intent header"),
-		responsesWSEnabled:              fs.Bool("responses-ws-enabled", getEnvBool("RESPONSES_WS_ENABLED", false), "Enable proxy-owned Codex websocket bridge on GET /v1/responses"),
-		responsesWSTurnStateDelta:       fs.Bool("responses-ws-turn-state-delta", getEnvBool("RESPONSES_WS_TURN_STATE_DELTA", false), "Attempt delta-only replay when upstream returns X-Codex-Turn-State"),
-		responsesWSDisableAutoCompact:   fs.Bool("responses-ws-disable-auto-compact", getEnvBool("RESPONSES_WS_DISABLE_AUTO_COMPACT", false), "Disable automatic websocket-session history compaction"),
-		responsesWSCompactMaxItems:      fs.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items"),
-		responsesWSCompactMaxBytes:      fs.Int("responses-ws-auto-compact-max-bytes", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes), "Auto-compact websocket session history after this many raw bytes"),
-		responsesWSCompactKeepTail:      fs.Int("responses-ws-auto-compact-keep-tail", getEnvInt("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail), "When auto-compacting websocket history, keep this many most recent items verbatim"),
-		compactUpstreamChunkBytes:       fs.Int("compact-upstream-chunk-bytes", getEnvInt("COMPACT_UPSTREAM_CHUNK_BYTES", proxy.DefaultCompactUpstreamChunkBytes()), "Target body size (bytes) for chunked /v1/responses/compact retries after an upstream 413; halved on each recursive 413 down to a 64 KiB floor"),
-		compactUpstreamChunkConcurrency: fs.Int("compact-upstream-chunk-concurrency", getEnvInt("COMPACT_UPSTREAM_CHUNK_CONCURRENCY", proxy.DefaultCompactUpstreamChunkConcurrency()), "Maximum sibling chunk compaction calls to run concurrently after the first chunk succeeds"),
-		compactUpstreamMaxAttempts:      fs.Int("compact-upstream-max-attempts", getEnvInt("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts()), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy"),
+		responsesWSEnabled:              fs.Bool("responses-ws-enabled", getEnvBoolWithQuiet("RESPONSES_WS_ENABLED", false, quiet), "Enable proxy-owned Codex websocket bridge on GET /v1/responses"),
+		responsesWSTurnStateDelta:       fs.Bool("responses-ws-turn-state-delta", getEnvBoolWithQuiet("RESPONSES_WS_TURN_STATE_DELTA", false, quiet), "Attempt delta-only replay when upstream returns X-Codex-Turn-State"),
+		responsesWSDisableAutoCompact:   fs.Bool("responses-ws-disable-auto-compact", getEnvBoolWithQuiet("RESPONSES_WS_DISABLE_AUTO_COMPACT", false, quiet), "Disable automatic websocket-session history compaction"),
+		responsesWSCompactMaxItems:      fs.Int("responses-ws-auto-compact-max-items", getEnvIntWithQuiet("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems, quiet), "Auto-compact websocket session history after this many items"),
+		responsesWSCompactMaxBytes:      fs.Int("responses-ws-auto-compact-max-bytes", getEnvIntWithQuiet("RESPONSES_WS_AUTO_COMPACT_MAX_BYTES", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxBytes, quiet), "Auto-compact websocket session history after this many raw bytes"),
+		responsesWSCompactKeepTail:      fs.Int("responses-ws-auto-compact-keep-tail", getEnvIntWithQuiet("RESPONSES_WS_AUTO_COMPACT_KEEP_TAIL", proxy.DefaultResponsesWebSocketConfig().AutoCompactKeepTail, quiet), "When auto-compacting websocket history, keep this many most recent items verbatim"),
+		compactUpstreamChunkBytes:       fs.Int("compact-upstream-chunk-bytes", getEnvIntWithQuiet("COMPACT_UPSTREAM_CHUNK_BYTES", proxy.DefaultCompactUpstreamChunkBytes(), quiet), "Target body size (bytes) for chunked /v1/responses/compact retries after an upstream 413; halved on each recursive 413 down to a 64 KiB floor"),
+		compactUpstreamChunkConcurrency: fs.Int("compact-upstream-chunk-concurrency", getEnvIntWithQuiet("COMPACT_UPSTREAM_CHUNK_CONCURRENCY", proxy.DefaultCompactUpstreamChunkConcurrency(), quiet), "Maximum sibling chunk compaction calls to run concurrently after the first chunk succeeds"),
+		compactUpstreamMaxAttempts:      fs.Int("compact-upstream-max-attempts", getEnvIntWithQuiet("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts(), quiet), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy"),
 	}
 }
 
@@ -318,13 +382,10 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 
 func runServe(args []string, globalQuiet bool) {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-	serve := registerServeFlags(fs)
+	serve := registerServeFlags(fs, globalQuiet)
 	fs.Parse(args) //nolint:errcheck
 
-	logLevel := logger.ParseLevel(*serve.logLevel)
-	if serve.quietEnabled(globalQuiet) && logLevel < logger.LevelError {
-		logLevel = logger.LevelError
-	}
+	logLevel := effectiveServeLogLevel(logger.ParseLevel(*serve.logLevel), serve.quietEnabled(globalQuiet))
 	log := logger.New(logLevel)
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
@@ -381,6 +442,13 @@ func runServe(args []string, globalQuiet bool) {
 	log.Info("server stopped")
 }
 
+func effectiveServeLogLevel(level logger.Level, quiet bool) logger.Level {
+	if quiet && level < logger.LevelError {
+		return logger.LevelError
+	}
+	return level
+}
+
 func extractGlobalQuietFlag(args []string) (bool, []string, error) {
 	if len(args) == 0 {
 		return false, args, nil
@@ -424,39 +492,57 @@ func getEnv(key, fallback string) string {
 }
 
 func getEnvBool(key string, fallback bool) bool {
+	return getEnvBoolWithQuiet(key, fallback, false)
+}
+
+func getEnvBoolWithQuiet(key string, fallback bool, quiet bool) bool {
 	v := getEnv(key, "")
 	if v == "" {
 		return fallback
 	}
 	parsed, err := strconv.ParseBool(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
+		if !quiet {
+			_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
+		}
 		return fallback
 	}
 	return parsed
 }
 
 func getEnvInt(key string, fallback int) int {
+	return getEnvIntWithQuiet(key, fallback, false)
+}
+
+func getEnvIntWithQuiet(key string, fallback int, quiet bool) int {
 	v := getEnv(key, "")
 	if v == "" {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
+		if !quiet {
+			_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
+		}
 		return fallback
 	}
 	return parsed
 }
 
 func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	return getEnvDurationWithQuiet(key, fallback, false)
+}
+
+func getEnvDurationWithQuiet(key string, fallback time.Duration, quiet bool) time.Duration {
 	v := getEnv(key, "")
 	if v == "" {
 		return fallback
 	}
 	parsed, err := time.ParseDuration(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
+		if !quiet {
+			_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
+		}
 		return fallback
 	}
 	return parsed

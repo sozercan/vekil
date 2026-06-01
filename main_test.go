@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -121,11 +122,33 @@ func TestGetEnvWarnsOnInvalidValue(t *testing.T) {
 	}
 }
 
+func TestRegisterServeFlagsQuietSuppressesEnvWarnings(t *testing.T) {
+	const envKey = "RESPONSES_WS_ENABLED"
+	t.Setenv(envKey, "not-a-bool")
+
+	old := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	_ = registerServeFlags(fs, true)
+
+	_ = w.Close()
+	os.Stderr = old
+
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	if got := buf.String(); got != "" {
+		t.Fatalf("expected no stderr output in quiet mode, got %q", got)
+	}
+}
+
 func parseServeFlagsForTest(t *testing.T, args ...string) serveFlags {
 	t.Helper()
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	serve := registerServeFlags(fs)
+	serve := registerServeFlags(fs, false)
 	if err := fs.Parse(args); err != nil {
 		t.Fatalf("parse serve flags: %v", err)
 	}
@@ -388,6 +411,93 @@ func TestRunLoginQuietSuppressesNonErrorOutput(t *testing.T) {
 	}
 }
 
+func TestRunLoginQuietStillPrintsErrors(t *testing.T) {
+	var stderr bytes.Buffer
+
+	code := runLoginWithDeps([]string{"--quiet"}, loginDeps{
+		stderr: &stderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return nil, fmt.Errorf("boom")
+		},
+	}, false)
+
+	if code != 1 {
+		t.Fatalf("runLoginWithDeps(--quiet) code = %d, want 1", code)
+	}
+	if got := stderr.String(); !strings.Contains(got, "error: boom") {
+		t.Fatalf("stderr missing error output, got %q", got)
+	}
+}
+
+func TestRunLogoutQuietSuppressesSuccessOutput(t *testing.T) {
+	var normalStderr bytes.Buffer
+	if code := runLogoutWithDeps(nil, logoutDeps{
+		stderr: &normalStderr,
+		newAuthenticator: func(string) (logoutAuthenticator, error) {
+			return &fakeLogoutAuthenticator{}, nil
+		},
+	}, false); code != 0 {
+		t.Fatalf("runLogoutWithDeps() code = %d, want 0", code)
+	}
+	if got := normalStderr.String(); !strings.Contains(got, "Logged out.") {
+		t.Fatalf("expected normal output to contain logout message, got %q", got)
+	}
+
+	var quietStderr bytes.Buffer
+	if code := runLogoutWithDeps([]string{"--quiet"}, logoutDeps{
+		stderr: &quietStderr,
+		newAuthenticator: func(string) (logoutAuthenticator, error) {
+			return &fakeLogoutAuthenticator{}, nil
+		},
+	}, false); code != 0 {
+		t.Fatalf("runLogoutWithDeps(--quiet) code = %d, want 0", code)
+	}
+	if got := quietStderr.String(); got != "" {
+		t.Fatalf("expected quiet output to be empty, got %q", got)
+	}
+}
+
+func TestRunLogoutQuietStillPrintsErrors(t *testing.T) {
+	var stderr bytes.Buffer
+
+	code := runLogoutWithDeps([]string{"--quiet"}, logoutDeps{
+		stderr: &stderr,
+		newAuthenticator: func(string) (logoutAuthenticator, error) {
+			return &fakeLogoutAuthenticator{signOutErr: fmt.Errorf("logout failed")}, nil
+		},
+	}, false)
+
+	if code != 1 {
+		t.Fatalf("runLogoutWithDeps(--quiet) code = %d, want 1", code)
+	}
+	if got := stderr.String(); !strings.Contains(got, "error: logout failed") {
+		t.Fatalf("stderr missing error output, got %q", got)
+	}
+}
+
+func TestEffectiveServeLogLevelQuietSuppression(t *testing.T) {
+	tests := []struct {
+		name  string
+		level string
+		quiet bool
+		want  string
+	}{
+		{name: "info upgraded to error when quiet", level: "info", quiet: true, want: "error"},
+		{name: "debug upgraded to error when quiet", level: "debug", quiet: true, want: "error"},
+		{name: "error remains error when quiet", level: "error", quiet: true, want: "error"},
+		{name: "info stays info when not quiet", level: "info", quiet: false, want: "info"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := effectiveServeLogLevel(logger.ParseLevel(tc.level), tc.quiet)
+			if got != logger.ParseLevel(tc.want) {
+				t.Fatalf("effectiveServeLogLevel(%q, quiet=%v) = %v, want %v", tc.level, tc.quiet, got, logger.ParseLevel(tc.want))
+			}
+		})
+	}
+}
+
 func TestExtractGlobalQuietFlag(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -487,4 +597,12 @@ func (f *fakeLoginAuthenticator) PollForAuthorization(_ context.Context, dcResp 
 	f.pollForAuthorizationCalls++
 	f.polledDeviceCode = dcResp
 	return f.pollForAuthorizationErr
+}
+
+type fakeLogoutAuthenticator struct {
+	signOutErr error
+}
+
+func (f *fakeLogoutAuthenticator) SignOut() error {
+	return f.signOutErr
 }
