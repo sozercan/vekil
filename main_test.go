@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -185,6 +186,59 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	cliServe := parseServeFlagsForTest(t, "--responses-ws-enabled=false")
 	if cliServe.responsesWebSocketConfig().Enabled {
 		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
+	}
+}
+
+func TestServeFlagsQuietSuppressesNonErrorLogs(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		wantInfo  bool
+		wantError bool
+		wantLevel logger.Level
+	}{
+		{
+			name:      "default includes info and error",
+			wantInfo:  true,
+			wantError: true,
+			wantLevel: logger.LevelInfo,
+		},
+		{
+			name:      "quiet suppresses info but keeps error",
+			args:      []string{"--quiet"},
+			wantInfo:  false,
+			wantError: true,
+			wantLevel: logger.LevelError,
+		},
+		{
+			name:      "short quiet suppresses info but keeps error",
+			args:      []string{"-q"},
+			wantInfo:  false,
+			wantError: true,
+			wantLevel: logger.LevelError,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			serve := parseServeFlagsForTest(t, tc.args...)
+			if got := serve.logLevelSetting(); got != tc.wantLevel {
+				t.Fatalf("logLevelSetting() = %v, want %v", got, tc.wantLevel)
+			}
+
+			log := logger.New(serve.logLevelSetting())
+			output := captureStderr(t, func() {
+				log.Info("info message")
+				log.Error("error message")
+			})
+
+			if gotInfo := strings.Contains(output, `"msg":"info message"`); gotInfo != tc.wantInfo {
+				t.Fatalf("info output presence = %v, want %v; output=%q", gotInfo, tc.wantInfo, output)
+			}
+			if gotError := strings.Contains(output, `"msg":"error message"`); gotError != tc.wantError {
+				t.Fatalf("error output presence = %v, want %v; output=%q", gotError, tc.wantError, output)
+			}
+		})
 	}
 }
 
@@ -402,4 +456,25 @@ func (f *fakeLoginAuthenticator) PollForAuthorization(_ context.Context, dcResp 
 	f.pollForAuthorizationCalls++
 	f.polledDeviceCode = dcResp
 	return f.pollForAuthorizationErr
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe(): %v", err)
+	}
+	os.Stderr = w
+
+	fn()
+
+	_ = w.Close()
+	os.Stderr = old
+
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	_ = r.Close()
+	return buf.String()
 }
