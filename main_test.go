@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -444,6 +445,126 @@ func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
 	}
 }
 
+func TestRunLoginQuietStillShowsInteractiveDeviceCodePrompt(t *testing.T) {
+	var stderr bytes.Buffer
+	fake := &fakeLoginAuthenticator{
+		refreshErr: auth.ErrNotAuthenticated,
+		deviceCodeResponse: &auth.DeviceCodeResponse{
+			DeviceCode:      "device-code",
+			UserCode:        "ABCD-EFGH",
+			VerificationURI: "https://github.com/login/device",
+			Interval:        1,
+		},
+	}
+
+	code := runLoginWithDeps(nil, loginDeps{
+		stderr: &stderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return fake, nil
+		},
+		openURL: func(string) error {
+			return fmt.Errorf("no browser")
+		},
+	}, globalOptions{quiet: true})
+
+	if code != 0 {
+		t.Fatalf("runLoginWithDeps() code = %d, want 0", code)
+	}
+	output := stderr.String()
+	for _, want := range []string{
+		"Opening browser to https://github.com/login/device",
+		"Enter code: ABCD-EFGH",
+		"Could not open browser automatically, please visit the URL above.",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("stderr missing %q, got %q", want, output)
+		}
+	}
+	if strings.Contains(output, "Login successful.") {
+		t.Fatalf("expected quiet mode to suppress success message, got %q", output)
+	}
+}
+
+func TestRunLogoutQuietSuppressesNonErrorOutput(t *testing.T) {
+	t.Run("success quiet has no output", func(t *testing.T) {
+		var stderr bytes.Buffer
+		fake := &fakeLogoutAuthenticator{}
+
+		code := runLogoutWithDeps(nil, logoutDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (logoutAuthenticator, error) {
+				return fake, nil
+			},
+		}, globalOptions{quiet: true})
+
+		if code != 0 {
+			t.Fatalf("runLogoutWithDeps() code = %d, want 0", code)
+		}
+		if fake.signOutCalls != 1 {
+			t.Fatalf("SignOut calls = %d, want 1", fake.signOutCalls)
+		}
+		if got := stderr.String(); got != "" {
+			t.Fatalf("expected quiet logout output to be empty, got %q", got)
+		}
+	})
+
+	t.Run("failure still prints errors", func(t *testing.T) {
+		var stderr bytes.Buffer
+		fake := &fakeLogoutAuthenticator{signOutErr: fmt.Errorf("boom")}
+
+		code := runLogoutWithDeps(nil, logoutDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (logoutAuthenticator, error) {
+				return fake, nil
+			},
+		}, globalOptions{quiet: true})
+
+		if code != 1 {
+			t.Fatalf("runLogoutWithDeps() code = %d, want 1", code)
+		}
+		if !strings.Contains(stderr.String(), "error: boom") {
+			t.Fatalf("expected quiet logout to keep error output, got %q", stderr.String())
+		}
+	})
+}
+
+func TestRunServeQuietClampsLogLevel(t *testing.T) {
+	tests := []struct {
+		name     string
+		logLevel string
+		quiet    bool
+		want     logger.Level
+	}{
+		{
+			name:     "quiet clamps info to error",
+			logLevel: "info",
+			quiet:    true,
+			want:     logger.LevelError,
+		},
+		{
+			name:     "quiet keeps error",
+			logLevel: "error",
+			quiet:    true,
+			want:     logger.LevelError,
+		},
+		{
+			name:     "non quiet preserves default info",
+			logLevel: "info",
+			quiet:    false,
+			want:     logger.LevelInfo,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveServeLogLevel(tc.logLevel, tc.quiet)
+			if got != tc.want {
+				t.Fatalf("resolveServeLogLevel(%q, %v) = %v, want %v", tc.logLevel, tc.quiet, got, tc.want)
+			}
+		})
+	}
+}
+
 type fakeLoginAuthenticator struct {
 	signInWithGitHubCLICalls int
 	signInWithGitHubCLIErr   error
@@ -459,6 +580,16 @@ type fakeLoginAuthenticator struct {
 	pollForAuthorizationCalls int
 	polledDeviceCode          *auth.DeviceCodeResponse
 	pollForAuthorizationErr   error
+}
+
+type fakeLogoutAuthenticator struct {
+	signOutCalls int
+	signOutErr   error
+}
+
+func (f *fakeLogoutAuthenticator) SignOut() error {
+	f.signOutCalls++
+	return f.signOutErr
 }
 
 func (f *fakeLoginAuthenticator) SignInWithGitHubCLI(context.Context) error {

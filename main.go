@@ -204,8 +204,8 @@ func runLoginWithDeps(args []string, deps loginDeps, global globalOptions) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintf(nonErrorOutput, "Opening browser to %s\n", dcResp.VerificationURI)
-	_, _ = fmt.Fprintf(nonErrorOutput, "Enter code: %s\n", dcResp.UserCode)
+	_, _ = fmt.Fprintf(deps.stderr, "Opening browser to %s\n", dcResp.VerificationURI)
+	_, _ = fmt.Fprintf(deps.stderr, "Enter code: %s\n", dcResp.UserCode)
 
 	if err := deps.openURL(dcResp.VerificationURI); err != nil {
 		_, _ = fmt.Fprintf(deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
@@ -258,24 +258,59 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 }
 
 func runLogout(args []string, global globalOptions) {
+	if code := runLogoutWithDeps(args, logoutDeps{
+		stderr: os.Stderr,
+		newAuthenticator: func(tokenDir string) (logoutAuthenticator, error) {
+			return auth.NewAuthenticator(tokenDir)
+		},
+	}, global); code != 0 {
+		os.Exit(code)
+	}
+}
+
+type logoutAuthenticator interface {
+	SignOut() error
+}
+
+type logoutDeps struct {
+	stderr           io.Writer
+	newAuthenticator func(string) (logoutAuthenticator, error)
+}
+
+func runLogoutWithDeps(args []string, deps logoutDeps, global globalOptions) int {
+	deps = normalizeLogoutDeps(deps)
+
 	fs := flag.NewFlagSet("logout", flag.ExitOnError)
 	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
 	fs.Parse(args) //nolint:errcheck
 
-	authenticator, err := auth.NewAuthenticator(*tokenDir)
+	authenticator, err := deps.newAuthenticator(*tokenDir)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		_, _ = fmt.Fprintf(deps.stderr, "error: %v\n", err)
+		return 1
 	}
 
 	if err := authenticator.SignOut(); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		_, _ = fmt.Fprintf(deps.stderr, "error: %v\n", err)
+		return 1
 	}
 
 	if !global.quiet {
-		_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
+		_, _ = fmt.Fprintln(deps.stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
 	}
+	return 0
+}
+
+func normalizeLogoutDeps(deps logoutDeps) logoutDeps {
+	if deps.stderr == nil {
+		deps.stderr = io.Discard
+	}
+	if deps.newAuthenticator == nil {
+		deps.newAuthenticator = func(tokenDir string) (logoutAuthenticator, error) {
+			return auth.NewAuthenticator(tokenDir)
+		}
+	}
+	return deps
 }
 
 type serveFlags struct {
@@ -355,10 +390,7 @@ func runServe(args []string, global globalOptions) {
 	serve := registerServeFlags(fs)
 	fs.Parse(args) //nolint:errcheck
 
-	logLevel := logger.ParseLevel(*serve.logLevel)
-	if global.quiet && logLevel < logger.LevelError {
-		logLevel = logger.LevelError
-	}
+	logLevel := resolveServeLogLevel(*serve.logLevel, global.quiet)
 	log := logger.New(logLevel)
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
@@ -413,6 +445,14 @@ func runServe(args []string, global globalOptions) {
 		log.Fatal("shutdown error", logger.Err(err))
 	}
 	log.Info("server stopped")
+}
+
+func resolveServeLogLevel(logLevel string, quiet bool) logger.Level {
+	parsed := logger.ParseLevel(logLevel)
+	if quiet && parsed < logger.LevelError {
+		return logger.LevelError
+	}
+	return parsed
 }
 
 func getEnv(key, fallback string) string {
