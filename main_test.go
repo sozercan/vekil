@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -185,6 +186,13 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	cliServe := parseServeFlagsForTest(t, "--responses-ws-enabled=false")
 	if cliServe.responsesWebSocketConfig().Enabled {
 		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
+	}
+}
+
+func TestServeFlagsQuietSuppressesNonErrorLogging(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--log-level", "debug", "--quiet")
+	if got := serve.loggerLevel(); got != logger.LevelError {
+		t.Fatalf("loggerLevel() = %v, want %v when --quiet is set", got, logger.LevelError)
 	}
 }
 

@@ -215,6 +215,7 @@ type serveFlags struct {
 	host                            *string
 	tokenDir                        *string
 	providersConfigPath             *string
+	quiet                           *bool
 	logLevel                        *string
 	streamingUpstreamTimeout        *time.Duration
 	copilotEditorVersion            *string
@@ -240,6 +241,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
+		quiet:                           fs.Bool("quiet", getEnvBool("QUIET", false), "Suppress non-error output"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
 		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
@@ -282,11 +284,18 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 	}
 }
 
+func (f serveFlags) loggerLevel() logger.Level {
+	if *f.quiet {
+		return logger.LevelError
+	}
+	return logger.ParseLevel(*f.logLevel)
+}
+
 func runServe() {
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+	log := logger.New(serve.loggerLevel())
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
