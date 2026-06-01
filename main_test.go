@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -185,6 +186,45 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	cliServe := parseServeFlagsForTest(t, "--responses-ws-enabled=false")
 	if cliServe.responsesWebSocketConfig().Enabled {
 		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
+	}
+}
+
+func TestServeFlagsQuietDefaultsToFalse(t *testing.T) {
+	serve := parseServeFlagsForTest(t)
+	if *serve.quiet {
+		t.Fatal("quiet should default to false")
+	}
+	if got := serve.loggerLevel(); got != logger.LevelInfo {
+		t.Fatalf("loggerLevel() = %v, want %v", got, logger.LevelInfo)
+	}
+}
+
+func TestServeFlagsQuietFromEnv(t *testing.T) {
+	t.Setenv("QUIET", "true")
+	serve := parseServeFlagsForTest(t)
+	if !*serve.quiet {
+		t.Fatal("QUIET=true should set quiet mode")
+	}
+	if got := serve.loggerLevel(); got != logger.LevelError {
+		t.Fatalf("loggerLevel() = %v, want %v", got, logger.LevelError)
+	}
+}
+
+func TestServeFlagsQuietCLIOverridesEnv(t *testing.T) {
+	t.Setenv("QUIET", "true")
+	serve := parseServeFlagsForTest(t, "--quiet=false", "--log-level=debug")
+	if *serve.quiet {
+		t.Fatal("--quiet=false should override QUIET=true")
+	}
+	if got := serve.loggerLevel(); got != logger.LevelDebug {
+		t.Fatalf("loggerLevel() = %v, want %v", got, logger.LevelDebug)
+	}
+}
+
+func TestServeFlagsQuietOverridesExplicitLogLevel(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet", "--log-level=debug")
+	if got := serve.loggerLevel(); got != logger.LevelError {
+		t.Fatalf("loggerLevel() = %v, want %v", got, logger.LevelError)
 	}
 }
 
