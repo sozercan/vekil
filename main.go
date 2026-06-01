@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,13 +28,26 @@ const (
 )
 
 func main() {
+	globalOpts, filteredArgs, err := parseGlobalOptions(os.Args)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
+	os.Args = filteredArgs
+	if globalOpts.quiet {
+		if _, err := suppressStdout(); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "error: failed to enable quiet mode: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	// Dispatch subcommands before falling through to the default server mode.
-	switch commandFromArgs(os.Args) {
+	switch commandFromArgs(filteredArgs) {
 	case cliCommandLogin:
-		runLogin(os.Args[2:])
+		runLogin(filteredArgs[2:])
 		return
 	case cliCommandLogout:
-		runLogout(os.Args[2:])
+		runLogout(filteredArgs[2:])
 		return
 	}
 
@@ -53,6 +67,45 @@ func commandFromArgs(args []string) cliCommand {
 	default:
 		return cliCommandServe
 	}
+}
+
+type globalOptions struct {
+	quiet bool
+}
+
+func parseGlobalOptions(args []string) (globalOptions, []string, error) {
+	opts := globalOptions{}
+	if len(args) == 0 {
+		return opts, args, nil
+	}
+
+	filteredArgs := make([]string, 0, len(args))
+	filteredArgs = append(filteredArgs, args[0])
+	for _, arg := range args[1:] {
+		switch {
+		case arg == "--quiet":
+			opts.quiet = true
+		case strings.HasPrefix(arg, "--quiet="):
+			parsed, err := strconv.ParseBool(strings.TrimPrefix(arg, "--quiet="))
+			if err != nil {
+				return opts, nil, fmt.Errorf("invalid value for --quiet: %w", err)
+			}
+			opts.quiet = parsed
+		default:
+			filteredArgs = append(filteredArgs, arg)
+		}
+	}
+
+	return opts, filteredArgs, nil
+}
+
+func suppressStdout() (*os.File, error) {
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	os.Stdout = devNull
+	return devNull, nil
 }
 
 type loginOptions struct {
@@ -211,6 +264,7 @@ func runLogout(args []string) {
 }
 
 type serveFlags struct {
+	quiet                           *bool
 	port                            *string
 	host                            *string
 	tokenDir                        *string
@@ -236,6 +290,7 @@ type serveFlags struct {
 
 func registerServeFlags(fs *flag.FlagSet) serveFlags {
 	return serveFlags{
+		quiet:                           fs.Bool("quiet", false, "Suppress non-error stdout output"),
 		port:                            fs.String("port", getEnv("PORT", "1337"), "Listen port"),
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),

@@ -225,6 +225,114 @@ func TestCommandFromArgs(t *testing.T) {
 	}
 }
 
+func TestParseGlobalOptions(t *testing.T) {
+	tests := []struct {
+		name         string
+		args         []string
+		wantQuiet    bool
+		wantFiltered []string
+		wantErr      bool
+	}{
+		{
+			name:         "quiet before subcommand",
+			args:         []string{"vekil", "--quiet", "login", "--token-dir", "/tmp/tokens"},
+			wantQuiet:    true,
+			wantFiltered: []string{"vekil", "login", "--token-dir", "/tmp/tokens"},
+		},
+		{
+			name:         "quiet after subcommand",
+			args:         []string{"vekil", "login", "--quiet"},
+			wantQuiet:    true,
+			wantFiltered: []string{"vekil", "login"},
+		},
+		{
+			name:         "quiet false keeps output enabled",
+			args:         []string{"vekil", "--quiet=false", "logout"},
+			wantQuiet:    false,
+			wantFiltered: []string{"vekil", "logout"},
+		},
+		{
+			name:    "invalid quiet value errors",
+			args:    []string{"vekil", "--quiet=wat"},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts, filtered, err := parseGlobalOptions(tc.args)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("parseGlobalOptions() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseGlobalOptions() error = %v", err)
+			}
+			if opts.quiet != tc.wantQuiet {
+				t.Fatalf("quiet = %v, want %v", opts.quiet, tc.wantQuiet)
+			}
+			if strings.Join(filtered, "\x00") != strings.Join(tc.wantFiltered, "\x00") {
+				t.Fatalf("filtered args = %v, want %v", filtered, tc.wantFiltered)
+			}
+		})
+	}
+}
+
+func TestSuppressStdout(t *testing.T) {
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	os.Stdout = w
+	t.Cleanup(func() {
+		_ = w.Close()
+		_ = r.Close()
+		os.Stdout = oldStdout
+	})
+
+	devNull, err := suppressStdout()
+	if err != nil {
+		t.Fatalf("suppressStdout() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = devNull.Close()
+	})
+
+	_, _ = fmt.Fprintln(os.Stdout, "this should be suppressed")
+	_ = w.Close()
+
+	var output bytes.Buffer
+	_, _ = output.ReadFrom(r)
+	if output.Len() != 0 {
+		t.Fatalf("expected no stdout output after suppressStdout, got %q", output.String())
+	}
+}
+
+func TestStdoutNotSuppressedByDefault(t *testing.T) {
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	os.Stdout = w
+
+	_, _ = fmt.Fprintln(os.Stdout, "this should be visible")
+	_ = w.Close()
+	os.Stdout = oldStdout
+	t.Cleanup(func() {
+		_ = r.Close()
+	})
+
+	var output bytes.Buffer
+	_, _ = output.ReadFrom(r)
+	if !strings.Contains(output.String(), "this should be visible") {
+		t.Fatalf("expected stdout output to be visible, got %q", output.String())
+	}
+}
+
 func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 	for _, helpArg := range []string{"-h", "--help"} {
 		t.Run(helpArg, func(t *testing.T) {
