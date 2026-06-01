@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -185,6 +186,39 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	cliServe := parseServeFlagsForTest(t, "--responses-ws-enabled=false")
 	if cliServe.responsesWebSocketConfig().Enabled {
 		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
+	}
+}
+
+func TestServeQuietSuppressesInfoButNotErrors(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet", "--log-level", "debug")
+	log := logger.New(effectiveServeLogLevel(logger.ParseLevel(*serve.logLevel), *serve.quiet))
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() {
+		os.Stderr = oldStderr
+		_ = r.Close()
+		_ = w.Close()
+	})
+
+	log.Info("quiet-info-should-not-print")
+	log.Error("quiet-error-should-print")
+
+	_ = w.Close()
+	os.Stderr = oldStderr
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	output := buf.String()
+	if strings.Contains(output, "quiet-info-should-not-print") {
+		t.Fatalf("quiet mode should suppress info logs, got output %q", output)
+	}
+	if !strings.Contains(output, "quiet-error-should-print") {
+		t.Fatalf("quiet mode should keep error logs, got output %q", output)
 	}
 }
 
