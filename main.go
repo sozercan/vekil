@@ -26,6 +26,8 @@ const (
 	cliCommandLogout
 )
 
+var suppressEnvWarnings bool
+
 func main() {
 	if code := runCLI(os.Args); code != 0 {
 		os.Exit(code)
@@ -67,6 +69,8 @@ func runCLIWithDeps(args []string, deps cliDeps) int {
 		_, _ = fmt.Fprintf(deps.stderr, "error: %v\n", err)
 		return 2
 	}
+	restoreEnvWarningSetting := setSuppressEnvWarnings(quiet)
+	defer restoreEnvWarningSetting()
 
 	// Dispatch subcommands before falling through to the default server mode.
 	switch commandFromArgs(filteredArgs) {
@@ -99,18 +103,29 @@ func normalizeCLIDeps(deps cliDeps) cliDeps {
 func stripGlobalQuietFlags(args []string) ([]string, bool, error) {
 	filtered := make([]string, 0, len(args))
 	quiet := false
+	beforeSubcommand := true
 
-	for _, arg := range args {
-		switch arg {
-		case "--quiet", "-quiet", "--q", "-q":
-			quiet = true
+	for idx, arg := range args {
+		if idx == 0 {
+			filtered = append(filtered, arg)
 			continue
-		case "--quiet=true", "-quiet=true", "--q=true", "-q=true":
-			quiet = true
-			continue
-		case "--quiet=false", "-quiet=false", "--q=false", "-q=false":
-			quiet = false
-			continue
+		}
+
+		if beforeSubcommand {
+			switch arg {
+			case "--quiet", "-quiet", "--q", "-q":
+				quiet = true
+				continue
+			case "--quiet=true", "-quiet=true", "--q=true", "-q=true":
+				quiet = true
+				continue
+			case "--quiet=false", "-quiet=false", "--q=false", "-q=false":
+				quiet = false
+				continue
+			}
+			if arg == "--" || len(arg) == 0 || arg[0] != '-' {
+				beforeSubcommand = false
+			}
 		}
 
 		filtered = append(filtered, arg)
@@ -156,12 +171,6 @@ type loginDeps struct {
 	stderr           io.Writer
 	newAuthenticator func(string) (loginAuthenticator, error)
 	openURL          func(string) error
-}
-
-func runLogin(args []string, quiet bool) {
-	if code := runLoginWithDeps(args, defaultLoginDeps(), quiet); code != 0 {
-		os.Exit(code)
-	}
 }
 
 func defaultLoginDeps() loginDeps {
@@ -299,12 +308,6 @@ func normalizeLogoutDeps(deps logoutDeps) logoutDeps {
 		deps.newAuthenticator = defaultLogoutDeps().newAuthenticator
 	}
 	return deps
-}
-
-func runLogout(args []string, quiet bool) {
-	if code := runLogoutWithDeps(args, defaultLogoutDeps(), quiet); code != 0 {
-		os.Exit(code)
-	}
 }
 
 func runLogoutWithDeps(args []string, deps logoutDeps, quiet bool) int {
@@ -501,7 +504,7 @@ func getEnvBool(key string, fallback bool) bool {
 	}
 	parsed, err := strconv.ParseBool(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
+		_, _ = fmt.Fprintf(envWarningWriter(), "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -514,7 +517,7 @@ func getEnvInt(key string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
+		_, _ = fmt.Fprintf(envWarningWriter(), "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -527,8 +530,23 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	}
 	parsed, err := time.ParseDuration(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
+		_, _ = fmt.Fprintf(envWarningWriter(), "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
+}
+
+func setSuppressEnvWarnings(suppress bool) func() {
+	previous := suppressEnvWarnings
+	suppressEnvWarnings = suppress
+	return func() {
+		suppressEnvWarnings = previous
+	}
+}
+
+func envWarningWriter() io.Writer {
+	if suppressEnvWarnings {
+		return io.Discard
+	}
+	return os.Stderr
 }

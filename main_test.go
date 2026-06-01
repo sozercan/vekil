@@ -99,6 +99,8 @@ func TestGetEnvInt(t *testing.T) {
 
 func TestGetEnvWarnsOnInvalidValue(t *testing.T) {
 	const envKey = "TEST_WARN_VAR"
+	restore := setSuppressEnvWarnings(false)
+	defer restore()
 
 	// Capture stderr to verify warning is emitted.
 	old := os.Stderr
@@ -226,15 +228,51 @@ func TestCommandFromArgs(t *testing.T) {
 }
 
 func TestStripGlobalQuietFlags(t *testing.T) {
-	filtered, quiet, err := stripGlobalQuietFlags([]string{"vekil", "--quiet", "login", "--gh"})
-	if err != nil {
-		t.Fatalf("stripGlobalQuietFlags() error = %v", err)
+	tests := []struct {
+		name         string
+		args         []string
+		wantQuiet    bool
+		wantFiltered []string
+	}{
+		{
+			name:         "long form true is stripped",
+			args:         []string{"vekil", "--quiet=true", "login", "--gh"},
+			wantQuiet:    true,
+			wantFiltered: []string{"vekil", "login", "--gh"},
+		},
+		{
+			name:         "long form false is stripped",
+			args:         []string{"vekil", "--quiet=false", "login"},
+			wantQuiet:    false,
+			wantFiltered: []string{"vekil", "login"},
+		},
+		{
+			name:         "short form is stripped",
+			args:         []string{"vekil", "-q", "logout"},
+			wantQuiet:    true,
+			wantFiltered: []string{"vekil", "logout"},
+		},
+		{
+			name:         "quiet-looking args after subcommand are preserved",
+			args:         []string{"vekil", "login", "--quiet=false", "-q"},
+			wantQuiet:    false,
+			wantFiltered: []string{"vekil", "login", "--quiet=false", "-q"},
+		},
 	}
-	if !quiet {
-		t.Fatal("quiet = false, want true")
-	}
-	if got, want := strings.Join(filtered, " "), "vekil login --gh"; got != want {
-		t.Fatalf("filtered args = %q, want %q", got, want)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			filtered, quiet, err := stripGlobalQuietFlags(tc.args)
+			if err != nil {
+				t.Fatalf("stripGlobalQuietFlags() error = %v", err)
+			}
+			if quiet != tc.wantQuiet {
+				t.Fatalf("quiet = %v, want %v", quiet, tc.wantQuiet)
+			}
+			if got, want := strings.Join(filtered, " "), strings.Join(tc.wantFiltered, " "); got != want {
+				t.Fatalf("filtered args = %q, want %q", got, want)
+			}
+		})
 	}
 }
 
@@ -316,6 +354,131 @@ func TestRunCLIWithQuietSuppressesLoginInfoButKeepsErrors(t *testing.T) {
 		}
 		if got := stderr.String(); !strings.Contains(got, "error signing in with GitHub CLI: boom") {
 			t.Fatalf("stderr missing error, got %q", got)
+		}
+	})
+}
+
+func TestRunCLIWithQuietAffectsServeAndLogoutPaths(t *testing.T) {
+	t.Run("short quiet form reaches serve", func(t *testing.T) {
+		code := runCLIWithDeps([]string{"vekil", "-q", "--port", "1444"}, cliDeps{
+			stderr: io.Discard,
+			runServe: func(args []string, quiet bool) int {
+				if !quiet {
+					t.Fatal("quiet = false, want true")
+				}
+				if got, want := strings.Join(args, " "), "--port 1444"; got != want {
+					t.Fatalf("serve args = %q, want %q", got, want)
+				}
+				return 0
+			},
+			runLogin: func([]string, bool) int {
+				t.Fatal("unexpected login dispatch")
+				return 1
+			},
+			runLogout: func([]string, bool) int {
+				t.Fatal("unexpected logout dispatch")
+				return 1
+			},
+		})
+		if code != 0 {
+			t.Fatalf("runCLIWithDeps() code = %d, want 0", code)
+		}
+	})
+
+	t.Run("quiet false reaches logout unchanged", func(t *testing.T) {
+		code := runCLIWithDeps([]string{"vekil", "--quiet=false", "logout"}, cliDeps{
+			stderr: io.Discard,
+			runServe: func([]string, bool) int {
+				t.Fatal("unexpected serve dispatch")
+				return 1
+			},
+			runLogin: func([]string, bool) int {
+				t.Fatal("unexpected login dispatch")
+				return 1
+			},
+			runLogout: func(args []string, quiet bool) int {
+				if quiet {
+					t.Fatal("quiet = true, want false")
+				}
+				if len(args) != 0 {
+					t.Fatalf("logout args = %v, want empty", args)
+				}
+				return 0
+			},
+		})
+		if code != 0 {
+			t.Fatalf("runCLIWithDeps() code = %d, want 0", code)
+		}
+	})
+}
+
+func TestRunCLIWithQuietSuppressesEnvWarnings(t *testing.T) {
+	const envKey = "TEST_CLI_QUIET_ENV_BOOL"
+	t.Setenv(envKey, "not-a-bool")
+
+	t.Run("quiet suppresses warnings", func(t *testing.T) {
+		old := os.Stderr
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe() error = %v", err)
+		}
+		os.Stderr = w
+		t.Cleanup(func() {
+			os.Stderr = old
+			_ = r.Close()
+		})
+
+		code := runCLIWithDeps([]string{"vekil", "--quiet"}, cliDeps{
+			stderr: io.Discard,
+			runServe: func([]string, bool) int {
+				_ = getEnvBool(envKey, false)
+				return 0
+			},
+			runLogin:  func([]string, bool) int { return 0 },
+			runLogout: func([]string, bool) int { return 0 },
+		})
+		if code != 0 {
+			t.Fatalf("runCLIWithDeps() code = %d, want 0", code)
+		}
+
+		_ = w.Close()
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(r)
+		if got := buf.String(); got != "" {
+			t.Fatalf("stderr = %q, want empty", got)
+		}
+	})
+
+	t.Run("non-quiet keeps warnings", func(t *testing.T) {
+		old := os.Stderr
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe() error = %v", err)
+		}
+		os.Stderr = w
+		t.Cleanup(func() {
+			os.Stderr = old
+			_ = r.Close()
+		})
+
+		code := runCLIWithDeps([]string{"vekil"}, cliDeps{
+			stderr: io.Discard,
+			runServe: func([]string, bool) int {
+				_ = getEnvBool(envKey, false)
+				return 0
+			},
+			runLogin:  func([]string, bool) int { return 0 },
+			runLogout: func([]string, bool) int { return 0 },
+		})
+		if code != 0 {
+			t.Fatalf("runCLIWithDeps() code = %d, want 0", code)
+		}
+
+		_ = w.Close()
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(r)
+		if got := buf.String(); !strings.Contains(got, "warning: ignoring invalid "+envKey) {
+			t.Fatalf("stderr missing warning, got %q", got)
 		}
 	})
 }
