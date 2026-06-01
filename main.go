@@ -32,7 +32,7 @@ type globalOptions struct {
 }
 
 func main() {
-	global, args, err := parseGlobalOptions(os.Args, os.Stderr)
+	global, args, err := parseGlobalOptions(os.Args)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(2)
@@ -66,11 +66,7 @@ func commandFromArgs(args []string) cliCommand {
 	}
 }
 
-func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []string, error) {
-	if stderr == nil {
-		stderr = io.Discard
-	}
-
+func parseGlobalOptions(args []string) (globalOptions, []string, error) {
 	opts := globalOptions{}
 	if len(args) == 0 {
 		return opts, args, nil

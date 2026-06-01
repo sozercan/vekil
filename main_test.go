@@ -255,7 +255,7 @@ func TestParseGlobalOptionsQuiet(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			opts, gotArgs, err := parseGlobalOptions(tc.args, io.Discard)
+			opts, gotArgs, err := parseGlobalOptions(tc.args)
 			if err != nil {
 				t.Fatalf("parseGlobalOptions() error = %v", err)
 			}
