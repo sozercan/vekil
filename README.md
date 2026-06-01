@@ -45,6 +45,7 @@ brew install --cask sozercan/repo/vekil
 > The app is not signed. Clear quarantine with `xattr -cr /Applications/Vekil.app`. Manual `vekil-macos-arm64.zip` downloads are also on [Releases](https://github.com/sozercan/vekil/releases/latest). See [Tray App (macOS/Linux)](docs/menubar.md).
 
 For explicit provider routing, start the proxy with `--providers-config /path/to/providers.{json,yaml}`.
+Use `--quiet` (or `-q`) to suppress non-error CLI output.
 
 **First-run auth** depends on your providers:
 

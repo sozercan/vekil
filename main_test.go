@@ -225,6 +225,16 @@ func TestCommandFromArgs(t *testing.T) {
 	}
 }
 
+func TestStripGlobalQuietFlag(t *testing.T) {
+	args, quiet := stripGlobalQuietFlag([]string{"vekil", "--quiet", "login", "--gh"})
+	if !quiet {
+		t.Fatal("quiet should be true when --quiet is provided")
+	}
+	if got, want := strings.Join(args, " "), "vekil login --gh"; got != want {
+		t.Fatalf("stripGlobalQuietFlag() args = %q, want %q", got, want)
+	}
+}
+
 func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 	for _, helpArg := range []string{"-h", "--help"} {
 		t.Run(helpArg, func(t *testing.T) {
@@ -355,6 +365,32 @@ func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
 		if !strings.Contains(output, want) {
 			t.Fatalf("stderr missing %q, got %q", want, output)
 		}
+	}
+}
+
+func TestRunLoginQuietSuppressesInformationalOutput(t *testing.T) {
+	prevQuiet := cliQuiet
+	cliQuiet = true
+	t.Cleanup(func() { cliQuiet = prevQuiet })
+
+	var stderr bytes.Buffer
+	fake := &fakeLoginAuthenticator{}
+
+	code := runLoginWithDeps([]string{"--gh"}, loginDeps{
+		stderr: &stderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return fake, nil
+		},
+	})
+
+	if code != 0 {
+		t.Fatalf("runLoginWithDeps() code = %d, want 0", code)
+	}
+	if fake.signInWithGitHubCLICalls != 1 {
+		t.Fatalf("SignInWithGitHubCLI calls = %d, want 1", fake.signInWithGitHubCLICalls)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("quiet login should suppress non-error output, got %q", got)
 	}
 }
 
