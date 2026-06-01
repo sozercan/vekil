@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,18 +27,27 @@ const (
 	cliCommandLogout
 )
 
+var cliQuiet bool
+
 func main() {
+	args, quiet, err := parseRootOptions(os.Args)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
+	cliQuiet = quiet
+
 	// Dispatch subcommands before falling through to the default server mode.
-	switch commandFromArgs(os.Args) {
+	switch commandFromArgs(args) {
 	case cliCommandLogin:
-		runLogin(os.Args[2:])
+		runLogin(args[2:])
 		return
 	case cliCommandLogout:
-		runLogout(os.Args[2:])
+		runLogout(args[2:])
 		return
 	}
 
-	runServe()
+	runServe(args[1:])
 }
 
 func commandFromArgs(args []string) cliCommand {
@@ -59,6 +69,7 @@ type loginOptions struct {
 	tokenDir     string
 	useGitHubCLI bool
 	force        bool
+	quiet        bool
 }
 
 var errConflictingLoginFlags = fmt.Errorf("--github-cli/--gh cannot be used with --force")
@@ -105,6 +116,7 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		}
 		return 2
 	}
+	cliQuiet = opts.quiet
 
 	authenticator, err := deps.newAuthenticator(opts.tokenDir)
 	if err != nil {
@@ -118,13 +130,13 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 			_, _ = fmt.Fprintf(deps.stderr, "error signing in with GitHub CLI: %v\n", err)
 			return 1
 		}
-		_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+		outln(deps.stderr, "Login successful.")
 		return 0
 	}
 
 	if !opts.force {
 		if _, err := authenticator.RefreshTokenNonInteractive(ctx); err == nil {
-			_, _ = fmt.Fprintln(deps.stderr, "Already logged in.")
+			outln(deps.stderr, "Already logged in.")
 			return 0
 		} else if !auth.IsInteractiveLoginRequired(err) {
 			_, _ = fmt.Fprintf(deps.stderr, "error refreshing existing login: %v\n", err)
@@ -138,11 +150,11 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintf(deps.stderr, "Opening browser to %s\n", dcResp.VerificationURI)
-	_, _ = fmt.Fprintf(deps.stderr, "Enter code: %s\n", dcResp.UserCode)
+	outf(deps.stderr, "Opening browser to %s\n", dcResp.VerificationURI)
+	outf(deps.stderr, "Enter code: %s\n", dcResp.UserCode)
 
 	if err := deps.openURL(dcResp.VerificationURI); err != nil {
-		_, _ = fmt.Fprintf(deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
+		outf(deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
 	}
 
 	if err := authenticator.PollForAuthorization(ctx, dcResp); err != nil {
@@ -150,7 +162,7 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+	outln(deps.stderr, "Login successful.")
 	return 0
 }
 
@@ -178,6 +190,7 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 	githubCLI := fs.Bool("github-cli", false, "Sign in using the currently authenticated GitHub CLI account")
 	gh := fs.Bool("gh", false, "Alias for --github-cli")
 	force := fs.Bool("force", false, "Force the interactive GitHub device-code flow")
+	quiet := registerQuietFlag(fs, cliQuiet)
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
@@ -185,6 +198,7 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 	opts.tokenDir = *tokenDir
 	opts.useGitHubCLI = *githubCLI || *gh
 	opts.force = *force
+	opts.quiet = *quiet
 	if opts.useGitHubCLI && opts.force {
 		return opts, errConflictingLoginFlags
 	}
@@ -194,7 +208,9 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 func runLogout(args []string) {
 	fs := flag.NewFlagSet("logout", flag.ExitOnError)
 	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
+	quiet := registerQuietFlag(fs, cliQuiet)
 	fs.Parse(args) //nolint:errcheck
+	cliQuiet = *quiet
 
 	authenticator, err := auth.NewAuthenticator(*tokenDir)
 	if err != nil {
@@ -207,7 +223,7 @@ func runLogout(args []string) {
 		os.Exit(1)
 	}
 
-	_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
+	outln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
 }
 
 type serveFlags struct {
@@ -215,6 +231,7 @@ type serveFlags struct {
 	host                            *string
 	tokenDir                        *string
 	providersConfigPath             *string
+	quiet                           *bool
 	logLevel                        *string
 	streamingUpstreamTimeout        *time.Duration
 	copilotEditorVersion            *string
@@ -240,6 +257,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
+		quiet:                           registerQuietFlag(fs, cliQuiet),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
 		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
@@ -282,11 +300,17 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 	}
 }
 
-func runServe() {
-	serve := registerServeFlags(flag.CommandLine)
-	flag.Parse()
+func runServe(args []string) {
+	fs := flag.NewFlagSet("vekil", flag.ExitOnError)
+	serve := registerServeFlags(fs)
+	fs.Parse(args) //nolint:errcheck
+	cliQuiet = *serve.quiet
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+	level := logger.ParseLevel(*serve.logLevel)
+	if cliQuiet {
+		level = logger.LevelError
+	}
+	log := logger.New(level)
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
@@ -356,7 +380,7 @@ func getEnvBool(key string, fallback bool) bool {
 	}
 	parsed, err := strconv.ParseBool(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
+		outf(os.Stderr, "warning: ignoring invalid %s=%q (expected bool), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -369,7 +393,7 @@ func getEnvInt(key string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
+		outf(os.Stderr, "warning: ignoring invalid %s=%q (expected integer), using default %d\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
@@ -382,8 +406,68 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	}
 	parsed, err := time.ParseDuration(v)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
+		outf(os.Stderr, "warning: ignoring invalid %s=%q (expected duration like 5m), using default %v\n", key, v, fallback)
 		return fallback
 	}
 	return parsed
+}
+
+func parseRootOptions(args []string) ([]string, bool, error) {
+	if len(args) == 0 {
+		return nil, false, nil
+	}
+
+	filtered := make([]string, 0, len(args))
+	filtered = append(filtered, args[0])
+	quiet := false
+	i := 1
+	for i < len(args) {
+		arg := args[i]
+		switch {
+		case arg == "--":
+			filtered = append(filtered, args[i:]...)
+			return filtered, quiet, nil
+		case arg == "--quiet" || arg == "-q":
+			quiet = true
+			i++
+		case strings.HasPrefix(arg, "--quiet="):
+			parsed, err := strconv.ParseBool(strings.TrimPrefix(arg, "--quiet="))
+			if err != nil {
+				return nil, false, fmt.Errorf("invalid --quiet value %q", strings.TrimPrefix(arg, "--quiet="))
+			}
+			quiet = parsed
+			i++
+		case strings.HasPrefix(arg, "-q="):
+			parsed, err := strconv.ParseBool(strings.TrimPrefix(arg, "-q="))
+			if err != nil {
+				return nil, false, fmt.Errorf("invalid -q value %q", strings.TrimPrefix(arg, "-q="))
+			}
+			quiet = parsed
+			i++
+		default:
+			filtered = append(filtered, args[i:]...)
+			return filtered, quiet, nil
+		}
+	}
+	return filtered, quiet, nil
+}
+
+func registerQuietFlag(fs *flag.FlagSet, defaultValue bool) *bool {
+	quiet := fs.Bool("quiet", defaultValue, "Suppress non-error CLI output")
+	fs.BoolVar(quiet, "q", defaultValue, "Alias for --quiet")
+	return quiet
+}
+
+func outf(w io.Writer, format string, args ...interface{}) {
+	if cliQuiet {
+		return
+	}
+	_, _ = fmt.Fprintf(w, format, args...)
+}
+
+func outln(w io.Writer, args ...interface{}) {
+	if cliQuiet {
+		return
+	}
+	_, _ = fmt.Fprintln(w, args...)
 }

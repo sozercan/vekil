@@ -225,6 +225,67 @@ func TestCommandFromArgs(t *testing.T) {
 	}
 }
 
+func TestParseRootOptions(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		wantArgs  []string
+		wantQuiet bool
+		wantErr   string
+	}{
+		{
+			name:      "no root flag",
+			args:      []string{"vekil", "login"},
+			wantArgs:  []string{"vekil", "login"},
+			wantQuiet: false,
+		},
+		{
+			name:      "leading quiet before subcommand",
+			args:      []string{"vekil", "--quiet", "login"},
+			wantArgs:  []string{"vekil", "login"},
+			wantQuiet: true,
+		},
+		{
+			name:      "short quiet with explicit false",
+			args:      []string{"vekil", "-q=false", "login"},
+			wantArgs:  []string{"vekil", "login"},
+			wantQuiet: false,
+		},
+		{
+			name:    "invalid quiet value",
+			args:    []string{"vekil", "--quiet=nope", "login"},
+			wantErr: "invalid --quiet value",
+		},
+		{
+			name:      "serve flags untouched",
+			args:      []string{"vekil", "--port", "8080"},
+			wantArgs:  []string{"vekil", "--port", "8080"},
+			wantQuiet: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotArgs, gotQuiet, err := parseRootOptions(tc.args)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("parseRootOptions() err = %v, want substring %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseRootOptions() err = %v", err)
+			}
+			if gotQuiet != tc.wantQuiet {
+				t.Fatalf("quiet = %v, want %v", gotQuiet, tc.wantQuiet)
+			}
+			if strings.Join(gotArgs, "\x00") != strings.Join(tc.wantArgs, "\x00") {
+				t.Fatalf("args = %v, want %v", gotArgs, tc.wantArgs)
+			}
+		})
+	}
+}
+
 func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 	for _, helpArg := range []string{"-h", "--help"} {
 		t.Run(helpArg, func(t *testing.T) {
@@ -254,6 +315,49 @@ func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRunLoginQuietSuppressesNonErrorOutput(t *testing.T) {
+	origQuiet := cliQuiet
+	t.Cleanup(func() {
+		cliQuiet = origQuiet
+	})
+
+	t.Run("default emits success output", func(t *testing.T) {
+		cliQuiet = false
+
+		var stderr bytes.Buffer
+		code := runLoginWithDeps([]string{"--gh"}, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return &fakeLoginAuthenticator{}, nil
+			},
+		})
+		if code != 0 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 0", code)
+		}
+		if got := stderr.String(); !strings.Contains(got, "Login successful.") {
+			t.Fatalf("expected success output, got %q", got)
+		}
+	})
+
+	t.Run("quiet suppresses success output", func(t *testing.T) {
+		cliQuiet = false
+
+		var stderr bytes.Buffer
+		code := runLoginWithDeps([]string{"--gh", "--quiet"}, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return &fakeLoginAuthenticator{}, nil
+			},
+		})
+		if code != 0 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 0", code)
+		}
+		if got := stderr.String(); got != "" {
+			t.Fatalf("expected quiet output, got %q", got)
+		}
+	})
 }
 
 func TestRunLoginRejectsGitHubCLIWithForceBeforeAuthConstruction(t *testing.T) {
