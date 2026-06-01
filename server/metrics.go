@@ -1,8 +1,9 @@
 package server
 
 import (
-	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 	"sync/atomic"
 )
 
@@ -32,6 +33,10 @@ func (m *metrics) instrument(next http.Handler) http.Handler {
 func (m *metrics) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 
-	_, _ = fmt.Fprintf(w, "# TYPE vekil_http_requests_total counter\nvekil_http_requests_total %d\n", m.requestsTotal.Load())
-	_, _ = fmt.Fprintf(w, "# TYPE vekil_http_inflight_requests gauge\nvekil_http_inflight_requests %d\n", m.inflightRequest.Load())
+	_, _ = io.WriteString(w, "# TYPE vekil_http_requests_total counter\nvekil_http_requests_total ")
+	_, _ = io.WriteString(w, strconv.FormatUint(m.requestsTotal.Load(), 10))
+	_, _ = io.WriteString(w, "\n")
+	_, _ = io.WriteString(w, "# TYPE vekil_http_inflight_requests gauge\nvekil_http_inflight_requests ")
+	_, _ = io.WriteString(w, strconv.FormatInt(m.inflightRequest.Load(), 10))
+	_, _ = io.WriteString(w, "\n")
 }
