@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,17 +28,23 @@ const (
 )
 
 func main() {
+	quiet, args, err := extractGlobalQuietFlag(os.Args)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
+
 	// Dispatch subcommands before falling through to the default server mode.
-	switch commandFromArgs(os.Args) {
+	switch commandFromArgs(args) {
 	case cliCommandLogin:
-		runLogin(os.Args[2:])
+		runLogin(args[2:], quiet)
 		return
 	case cliCommandLogout:
-		runLogout(os.Args[2:])
+		runLogout(args[2:], quiet)
 		return
 	}
 
-	runServe()
+	runServe(args[1:], quiet)
 }
 
 func commandFromArgs(args []string) cliCommand {
@@ -59,6 +66,7 @@ type loginOptions struct {
 	tokenDir     string
 	useGitHubCLI bool
 	force        bool
+	quiet        bool
 }
 
 var errConflictingLoginFlags = fmt.Errorf("--github-cli/--gh cannot be used with --force")
@@ -76,8 +84,8 @@ type loginDeps struct {
 	openURL          func(string) error
 }
 
-func runLogin(args []string) {
-	if code := runLoginWithDeps(args, defaultLoginDeps()); code != 0 {
+func runLogin(args []string, globalQuiet bool) {
+	if code := runLoginWithDeps(args, defaultLoginDeps(), globalQuiet); code != 0 {
 		os.Exit(code)
 	}
 }
@@ -92,7 +100,7 @@ func defaultLoginDeps() loginDeps {
 	}
 }
 
-func runLoginWithDeps(args []string, deps loginDeps) int {
+func runLoginWithDeps(args []string, deps loginDeps, globalQuiet bool) int {
 	deps = normalizeLoginDeps(deps)
 
 	opts, err := parseLoginOptions(args, deps.stderr)
@@ -105,6 +113,7 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		}
 		return 2
 	}
+	quiet := globalQuiet || opts.quiet
 
 	authenticator, err := deps.newAuthenticator(opts.tokenDir)
 	if err != nil {
@@ -118,13 +127,17 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 			_, _ = fmt.Fprintf(deps.stderr, "error signing in with GitHub CLI: %v\n", err)
 			return 1
 		}
-		_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+		if !quiet {
+			_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+		}
 		return 0
 	}
 
 	if !opts.force {
 		if _, err := authenticator.RefreshTokenNonInteractive(ctx); err == nil {
-			_, _ = fmt.Fprintln(deps.stderr, "Already logged in.")
+			if !quiet {
+				_, _ = fmt.Fprintln(deps.stderr, "Already logged in.")
+			}
 			return 0
 		} else if !auth.IsInteractiveLoginRequired(err) {
 			_, _ = fmt.Fprintf(deps.stderr, "error refreshing existing login: %v\n", err)
@@ -138,11 +151,15 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintf(deps.stderr, "Opening browser to %s\n", dcResp.VerificationURI)
-	_, _ = fmt.Fprintf(deps.stderr, "Enter code: %s\n", dcResp.UserCode)
+	if !quiet {
+		_, _ = fmt.Fprintf(deps.stderr, "Opening browser to %s\n", dcResp.VerificationURI)
+		_, _ = fmt.Fprintf(deps.stderr, "Enter code: %s\n", dcResp.UserCode)
+	}
 
 	if err := deps.openURL(dcResp.VerificationURI); err != nil {
-		_, _ = fmt.Fprintf(deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
+		if !quiet {
+			_, _ = fmt.Fprintf(deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
+		}
 	}
 
 	if err := authenticator.PollForAuthorization(ctx, dcResp); err != nil {
@@ -150,7 +167,9 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+	if !quiet {
+		_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+	}
 	return 0
 }
 
@@ -178,6 +197,8 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 	githubCLI := fs.Bool("github-cli", false, "Sign in using the currently authenticated GitHub CLI account")
 	gh := fs.Bool("gh", false, "Alias for --github-cli")
 	force := fs.Bool("force", false, "Force the interactive GitHub device-code flow")
+	quiet := fs.Bool("quiet", false, "Suppress non-error output")
+	q := fs.Bool("q", false, "Alias for --quiet")
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
@@ -185,15 +206,18 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 	opts.tokenDir = *tokenDir
 	opts.useGitHubCLI = *githubCLI || *gh
 	opts.force = *force
+	opts.quiet = *quiet || *q
 	if opts.useGitHubCLI && opts.force {
 		return opts, errConflictingLoginFlags
 	}
 	return opts, nil
 }
 
-func runLogout(args []string) {
+func runLogout(args []string, globalQuiet bool) {
 	fs := flag.NewFlagSet("logout", flag.ExitOnError)
 	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
+	quiet := fs.Bool("quiet", false, "Suppress non-error output")
+	q := fs.Bool("q", false, "Alias for --quiet")
 	fs.Parse(args) //nolint:errcheck
 
 	authenticator, err := auth.NewAuthenticator(*tokenDir)
@@ -207,10 +231,14 @@ func runLogout(args []string) {
 		os.Exit(1)
 	}
 
-	_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
+	if !(globalQuiet || *quiet || *q) {
+		_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
+	}
 }
 
 type serveFlags struct {
+	quiet                           *bool
+	quietShort                      *bool
 	port                            *string
 	host                            *string
 	tokenDir                        *string
@@ -236,6 +264,8 @@ type serveFlags struct {
 
 func registerServeFlags(fs *flag.FlagSet) serveFlags {
 	return serveFlags{
+		quiet:                           fs.Bool("quiet", false, "Suppress non-error output"),
+		quietShort:                      fs.Bool("q", false, "Alias for --quiet"),
 		port:                            fs.String("port", getEnv("PORT", "1337"), "Listen port"),
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
@@ -260,6 +290,10 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 	}
 }
 
+func (f serveFlags) quietEnabled(globalQuiet bool) bool {
+	return globalQuiet || *f.quiet || *f.quietShort
+}
+
 func (f serveFlags) copilotHeaderConfig() proxy.CopilotHeaderConfig {
 	return proxy.CopilotHeaderConfig{
 		EditorVersion:       *f.copilotEditorVersion,
@@ -282,11 +316,16 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 	}
 }
 
-func runServe() {
-	serve := registerServeFlags(flag.CommandLine)
-	flag.Parse()
+func runServe(args []string, globalQuiet bool) {
+	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	serve := registerServeFlags(fs)
+	fs.Parse(args) //nolint:errcheck
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+	logLevel := logger.ParseLevel(*serve.logLevel)
+	if serve.quietEnabled(globalQuiet) && logLevel < logger.LevelError {
+		logLevel = logger.LevelError
+	}
+	log := logger.New(logLevel)
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
@@ -340,6 +379,41 @@ func runServe() {
 		log.Fatal("shutdown error", logger.Err(err))
 	}
 	log.Info("server stopped")
+}
+
+func extractGlobalQuietFlag(args []string) (bool, []string, error) {
+	if len(args) == 0 {
+		return false, args, nil
+	}
+
+	quiet := false
+	filtered := make([]string, 0, len(args))
+	filtered = append(filtered, args[0])
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--":
+			filtered = append(filtered, args[i:]...)
+			return quiet, filtered, nil
+		case arg == "--quiet", arg == "-q":
+			quiet = true
+		case strings.HasPrefix(arg, "--quiet="):
+			parsed, err := strconv.ParseBool(strings.TrimPrefix(arg, "--quiet="))
+			if err != nil {
+				return false, nil, fmt.Errorf("invalid value for --quiet: %q", strings.TrimPrefix(arg, "--quiet="))
+			}
+			quiet = parsed
+		case strings.HasPrefix(arg, "-q="):
+			parsed, err := strconv.ParseBool(strings.TrimPrefix(arg, "-q="))
+			if err != nil {
+				return false, nil, fmt.Errorf("invalid value for --quiet: %q", strings.TrimPrefix(arg, "-q="))
+			}
+			quiet = parsed
+		default:
+			filtered = append(filtered, arg)
+		}
+	}
+	return quiet, filtered, nil
 }
 
 func getEnv(key, fallback string) string {
