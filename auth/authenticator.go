@@ -62,6 +62,7 @@ type Authenticator struct {
 	copilotToken   string
 	tokenExpiry    time.Time
 	mu             sync.RWMutex
+	interactiveOut io.Writer
 	client         *http.Client
 	directClient   *http.Client
 	copilotBaseURL string // overridable for tests; defaults to https://api.github.com
@@ -157,10 +158,23 @@ func NewAuthenticator(tokenDir string) (*Authenticator, error) {
 	}
 
 	return &Authenticator{
-		tokenDir:     tokenDir,
-		client:       newAuthHTTPClient(30*time.Second, true),
-		directClient: newAuthHTTPClient(30*time.Second, false),
+		tokenDir:       tokenDir,
+		interactiveOut: os.Stderr,
+		client:         newAuthHTTPClient(30*time.Second, true),
+		directClient:   newAuthHTTPClient(30*time.Second, false),
 	}, nil
+}
+
+// SetInteractiveOutput sets where interactive device-code prompts are written.
+// A nil writer disables prompt output.
+func (a *Authenticator) SetInteractiveOutput(w io.Writer) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if w == nil {
+		a.interactiveOut = io.Discard
+		return
+	}
+	a.interactiveOut = w
 }
 
 // IsSignedIn reports whether the authenticator has a usable or explicitly
@@ -515,7 +529,11 @@ func (a *Authenticator) deviceCodeFlow(ctx context.Context) error {
 		return err
 	}
 
-	_, _ = fmt.Fprintf(os.Stderr, "Please visit %s and enter code: %s\n", dcResp.VerificationURI, dcResp.UserCode)
+	out := a.interactiveOut
+	if out == nil {
+		out = io.Discard
+	}
+	_, _ = fmt.Fprintf(out, "Please visit %s and enter code: %s\n", dcResp.VerificationURI, dcResp.UserCode)
 
 	return a.pollForAuthorization(ctx, dcResp)
 }

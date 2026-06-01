@@ -27,17 +27,99 @@ const (
 )
 
 func main() {
-	// Dispatch subcommands before falling through to the default server mode.
-	switch commandFromArgs(os.Args) {
-	case cliCommandLogin:
-		runLogin(os.Args[2:])
-		return
-	case cliCommandLogout:
-		runLogout(os.Args[2:])
-		return
+	if code := runCLI(os.Args); code != 0 {
+		os.Exit(code)
+	}
+}
+
+func runCLI(args []string) int {
+	return runCLIWithDeps(args, defaultCLIDeps())
+}
+
+type cliDeps struct {
+	stderr    io.Writer
+	runServe  func([]string, bool) int
+	runLogin  func([]string, bool) int
+	runLogout func([]string, bool) int
+}
+
+func defaultCLIDeps() cliDeps {
+	return cliDeps{
+		stderr: os.Stderr,
+		runServe: func(args []string, quiet bool) int {
+			runServe(args, quiet)
+			return 0
+		},
+		runLogin: func(args []string, quiet bool) int {
+			return runLoginWithDeps(args, defaultLoginDeps(), quiet)
+		},
+		runLogout: func(args []string, quiet bool) int {
+			return runLogoutWithDeps(args, defaultLogoutDeps(), quiet)
+		},
+	}
+}
+
+func runCLIWithDeps(args []string, deps cliDeps) int {
+	deps = normalizeCLIDeps(deps)
+
+	filteredArgs, quiet, err := stripGlobalQuietFlags(args)
+	if err != nil {
+		_, _ = fmt.Fprintf(deps.stderr, "error: %v\n", err)
+		return 2
 	}
 
-	runServe()
+	// Dispatch subcommands before falling through to the default server mode.
+	switch commandFromArgs(filteredArgs) {
+	case cliCommandLogin:
+		return deps.runLogin(filteredArgs[2:], quiet)
+	case cliCommandLogout:
+		return deps.runLogout(filteredArgs[2:], quiet)
+	default:
+		return deps.runServe(filteredArgs[1:], quiet)
+	}
+}
+
+func normalizeCLIDeps(deps cliDeps) cliDeps {
+	defaults := defaultCLIDeps()
+	if deps.stderr == nil {
+		deps.stderr = defaults.stderr
+	}
+	if deps.runServe == nil {
+		deps.runServe = defaults.runServe
+	}
+	if deps.runLogin == nil {
+		deps.runLogin = defaults.runLogin
+	}
+	if deps.runLogout == nil {
+		deps.runLogout = defaults.runLogout
+	}
+	return deps
+}
+
+func stripGlobalQuietFlags(args []string) ([]string, bool, error) {
+	filtered := make([]string, 0, len(args))
+	quiet := false
+
+	for _, arg := range args {
+		switch arg {
+		case "--quiet", "-quiet", "--q", "-q":
+			quiet = true
+			continue
+		case "--quiet=true", "-quiet=true", "--q=true", "-q=true":
+			quiet = true
+			continue
+		case "--quiet=false", "-quiet=false", "--q=false", "-q=false":
+			quiet = false
+			continue
+		}
+
+		filtered = append(filtered, arg)
+	}
+
+	if len(filtered) == 0 {
+		return nil, false, fmt.Errorf("invalid arguments")
+	}
+	return filtered, quiet, nil
 }
 
 func commandFromArgs(args []string) cliCommand {
@@ -76,8 +158,8 @@ type loginDeps struct {
 	openURL          func(string) error
 }
 
-func runLogin(args []string) {
-	if code := runLoginWithDeps(args, defaultLoginDeps()); code != 0 {
+func runLogin(args []string, quiet bool) {
+	if code := runLoginWithDeps(args, defaultLoginDeps(), quiet); code != 0 {
 		os.Exit(code)
 	}
 }
@@ -92,8 +174,12 @@ func defaultLoginDeps() loginDeps {
 	}
 }
 
-func runLoginWithDeps(args []string, deps loginDeps) int {
+func runLoginWithDeps(args []string, deps loginDeps, quiet bool) int {
 	deps = normalizeLoginDeps(deps)
+	infoOut := deps.stderr
+	if quiet {
+		infoOut = io.Discard
+	}
 
 	opts, err := parseLoginOptions(args, deps.stderr)
 	if err != nil {
@@ -118,13 +204,13 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 			_, _ = fmt.Fprintf(deps.stderr, "error signing in with GitHub CLI: %v\n", err)
 			return 1
 		}
-		_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+		_, _ = fmt.Fprintln(infoOut, "Login successful.")
 		return 0
 	}
 
 	if !opts.force {
 		if _, err := authenticator.RefreshTokenNonInteractive(ctx); err == nil {
-			_, _ = fmt.Fprintln(deps.stderr, "Already logged in.")
+			_, _ = fmt.Fprintln(infoOut, "Already logged in.")
 			return 0
 		} else if !auth.IsInteractiveLoginRequired(err) {
 			_, _ = fmt.Fprintf(deps.stderr, "error refreshing existing login: %v\n", err)
@@ -138,11 +224,11 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintf(deps.stderr, "Opening browser to %s\n", dcResp.VerificationURI)
-	_, _ = fmt.Fprintf(deps.stderr, "Enter code: %s\n", dcResp.UserCode)
+	_, _ = fmt.Fprintf(infoOut, "Opening browser to %s\n", dcResp.VerificationURI)
+	_, _ = fmt.Fprintf(infoOut, "Enter code: %s\n", dcResp.UserCode)
 
 	if err := deps.openURL(dcResp.VerificationURI); err != nil {
-		_, _ = fmt.Fprintf(deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
+		_, _ = fmt.Fprintf(infoOut, "Could not open browser automatically, please visit the URL above.\n")
 	}
 
 	if err := authenticator.PollForAuthorization(ctx, dcResp); err != nil {
@@ -150,7 +236,7 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+	_, _ = fmt.Fprintln(infoOut, "Login successful.")
 	return 0
 }
 
@@ -191,26 +277,70 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 	return opts, nil
 }
 
-func runLogout(args []string) {
-	fs := flag.NewFlagSet("logout", flag.ExitOnError)
-	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
-	fs.Parse(args) //nolint:errcheck
+type logoutDeps struct {
+	stderr           io.Writer
+	newAuthenticator func(string) (*auth.Authenticator, error)
+}
 
-	authenticator, err := auth.NewAuthenticator(*tokenDir)
+func defaultLogoutDeps() logoutDeps {
+	return logoutDeps{
+		stderr: os.Stderr,
+		newAuthenticator: func(tokenDir string) (*auth.Authenticator, error) {
+			return auth.NewAuthenticator(tokenDir)
+		},
+	}
+}
+
+func normalizeLogoutDeps(deps logoutDeps) logoutDeps {
+	if deps.stderr == nil {
+		deps.stderr = io.Discard
+	}
+	if deps.newAuthenticator == nil {
+		deps.newAuthenticator = defaultLogoutDeps().newAuthenticator
+	}
+	return deps
+}
+
+func runLogout(args []string, quiet bool) {
+	if code := runLogoutWithDeps(args, defaultLogoutDeps(), quiet); code != 0 {
+		os.Exit(code)
+	}
+}
+
+func runLogoutWithDeps(args []string, deps logoutDeps, quiet bool) int {
+	deps = normalizeLogoutDeps(deps)
+	infoOut := deps.stderr
+	if quiet {
+		infoOut = io.Discard
+	}
+
+	fs := flag.NewFlagSet("logout", flag.ContinueOnError)
+	fs.SetOutput(deps.stderr)
+	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+
+	authenticator, err := deps.newAuthenticator(*tokenDir)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		_, _ = fmt.Fprintf(deps.stderr, "error: %v\n", err)
+		return 1
 	}
 
 	if err := authenticator.SignOut(); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		_, _ = fmt.Fprintf(deps.stderr, "error: %v\n", err)
+		return 1
 	}
 
-	_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
+	_, _ = fmt.Fprintln(infoOut, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
+	return 0
 }
 
 type serveFlags struct {
+	quiet                           *bool
 	port                            *string
 	host                            *string
 	tokenDir                        *string
@@ -235,7 +365,12 @@ type serveFlags struct {
 }
 
 func registerServeFlags(fs *flag.FlagSet) serveFlags {
+	quiet := false
+	fs.BoolVar(&quiet, "quiet", false, "Suppress non-error CLI output")
+	fs.BoolVar(&quiet, "q", false, "Alias for --quiet")
+
 	return serveFlags{
+		quiet:                           &quiet,
 		port:                            fs.String("port", getEnv("PORT", "1337"), "Listen port"),
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
@@ -282,15 +417,25 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 	}
 }
 
-func runServe() {
-	serve := registerServeFlags(flag.CommandLine)
-	flag.Parse()
+func runServe(args []string, quiet bool) {
+	fs := flag.NewFlagSet("vekil", flag.ExitOnError)
+	serve := registerServeFlags(fs)
+	fs.Parse(args) //nolint:errcheck
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+	quiet = quiet || *serve.quiet
+
+	logLevel := logger.ParseLevel(*serve.logLevel)
+	if quiet && logLevel < logger.LevelError {
+		logLevel = logger.LevelError
+	}
+	log := logger.New(logLevel)
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
 		log.Fatal("failed to initialize authenticator", logger.Err(err))
+	}
+	if quiet {
+		authenticator.SetInteractiveOutput(io.Discard)
 	}
 
 	providersCfg, err := proxy.LoadProvidersConfigFile(*serve.providersConfigPath)

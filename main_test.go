@@ -225,6 +225,101 @@ func TestCommandFromArgs(t *testing.T) {
 	}
 }
 
+func TestStripGlobalQuietFlags(t *testing.T) {
+	filtered, quiet, err := stripGlobalQuietFlags([]string{"vekil", "--quiet", "login", "--gh"})
+	if err != nil {
+		t.Fatalf("stripGlobalQuietFlags() error = %v", err)
+	}
+	if !quiet {
+		t.Fatal("quiet = false, want true")
+	}
+	if got, want := strings.Join(filtered, " "), "vekil login --gh"; got != want {
+		t.Fatalf("filtered args = %q, want %q", got, want)
+	}
+}
+
+func TestRunCLIWithQuietSuppressesLoginInfoButKeepsErrors(t *testing.T) {
+	t.Run("suppresses success output", func(t *testing.T) {
+		var stderr bytes.Buffer
+		fake := &fakeLoginAuthenticator{}
+		oldStdout := os.Stdout
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe() error = %v", err)
+		}
+		os.Stdout = w
+		t.Cleanup(func() {
+			os.Stdout = oldStdout
+			_ = r.Close()
+		})
+
+		code := runCLIWithDeps([]string{"vekil", "--quiet", "login", "--gh"}, cliDeps{
+			stderr: &stderr,
+			runServe: func([]string, bool) int {
+				t.Fatal("unexpected serve dispatch")
+				return 1
+			},
+			runLogout: func([]string, bool) int {
+				t.Fatal("unexpected logout dispatch")
+				return 1
+			},
+			runLogin: func(args []string, quiet bool) int {
+				return runLoginWithDeps(args, loginDeps{
+					stderr: &stderr,
+					newAuthenticator: func(string) (loginAuthenticator, error) {
+						return fake, nil
+					},
+				}, quiet)
+			},
+		})
+		if code != 0 {
+			t.Fatalf("runCLIWithDeps() code = %d, want 0", code)
+		}
+		_ = w.Close()
+		var stdout bytes.Buffer
+		_, _ = stdout.ReadFrom(r)
+		if got := stdout.String(); got != "" {
+			t.Fatalf("stdout = %q, want empty", got)
+		}
+		if got := stderr.String(); got != "" {
+			t.Fatalf("stderr = %q, want empty", got)
+		}
+	})
+
+	t.Run("keeps error output", func(t *testing.T) {
+		var stderr bytes.Buffer
+		fake := &fakeLoginAuthenticator{
+			signInWithGitHubCLIErr: fmt.Errorf("boom"),
+		}
+
+		code := runCLIWithDeps([]string{"vekil", "--quiet", "login", "--gh"}, cliDeps{
+			stderr: &stderr,
+			runServe: func([]string, bool) int {
+				t.Fatal("unexpected serve dispatch")
+				return 1
+			},
+			runLogout: func([]string, bool) int {
+				t.Fatal("unexpected logout dispatch")
+				return 1
+			},
+			runLogin: func(args []string, quiet bool) int {
+				return runLoginWithDeps(args, loginDeps{
+					stderr: &stderr,
+					newAuthenticator: func(string) (loginAuthenticator, error) {
+						return fake, nil
+					},
+				}, quiet)
+			},
+		})
+		if code != 1 {
+			t.Fatalf("runCLIWithDeps() code = %d, want 1", code)
+		}
+		if got := stderr.String(); !strings.Contains(got, "error signing in with GitHub CLI: boom") {
+			t.Fatalf("stderr missing error, got %q", got)
+		}
+	})
+}
+
 func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 	for _, helpArg := range []string{"-h", "--help"} {
 		t.Run(helpArg, func(t *testing.T) {
@@ -237,7 +332,7 @@ func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 					constructed = true
 					return &fakeLoginAuthenticator{}, nil
 				},
-			})
+			}, false)
 
 			if code != 0 {
 				t.Fatalf("runLoginWithDeps(%q) code = %d, want 0", helpArg, code)
@@ -266,7 +361,7 @@ func TestRunLoginRejectsGitHubCLIWithForceBeforeAuthConstruction(t *testing.T) {
 			constructed = true
 			return &fakeLoginAuthenticator{}, nil
 		},
-	})
+	}, false)
 
 	if code != 2 {
 		t.Fatalf("runLoginWithDeps() code = %d, want 2", code)
@@ -290,7 +385,7 @@ func TestRunLoginGHAliasUsesGitHubCLI(t *testing.T) {
 			gotTokenDir = tokenDir
 			return fake, nil
 		},
-	})
+	}, false)
 
 	if code != 0 {
 		t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
@@ -330,7 +425,7 @@ func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
 			openedURL = url
 			return nil
 		},
-	})
+	}, false)
 
 	if code != 0 {
 		t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
