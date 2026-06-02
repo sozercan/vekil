@@ -100,16 +100,18 @@ func TestGetEnvInt(t *testing.T) {
 func TestGetEnvWarnsOnInvalidValue(t *testing.T) {
 	const envKey = "TEST_WARN_VAR"
 
-	// Capture stderr to verify warning is emitted.
-	old := os.Stderr
+	// Capture warning writer to verify warning is emitted.
+	oldWarningWriter := envWarningWriter
+	defer func() {
+		envWarningWriter = oldWarningWriter
+	}()
 	r, w, _ := os.Pipe()
-	os.Stderr = w
+	envWarningWriter = w
 
 	t.Setenv(envKey, "not-a-bool")
 	getEnvBool(envKey, false)
 
 	_ = w.Close()
-	os.Stderr = old
 
 	var buf bytes.Buffer
 	_, _ = buf.ReadFrom(r)
@@ -228,10 +230,12 @@ func TestCommandFromArgs(t *testing.T) {
 func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 	for _, helpArg := range []string{"-h", "--help"} {
 		t.Run(helpArg, func(t *testing.T) {
+			var stdout bytes.Buffer
 			var stderr bytes.Buffer
 			constructed := false
 
 			code := runLoginWithDeps([]string{helpArg}, loginDeps{
+				stdout: &stdout,
 				stderr: &stderr,
 				newAuthenticator: func(string) (loginAuthenticator, error) {
 					constructed = true
@@ -246,7 +250,7 @@ func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 				t.Fatalf("help constructed an authenticator")
 			}
 
-			output := stderr.String()
+			output := stdout.String()
 			for _, want := range []string{"github-cli", "gh", "force"} {
 				if !strings.Contains(output, want) {
 					t.Fatalf("help output missing %q:\n%s", want, output)
@@ -257,10 +261,12 @@ func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 }
 
 func TestRunLoginRejectsGitHubCLIWithForceBeforeAuthConstruction(t *testing.T) {
+	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	constructed := false
 
 	code := runLoginWithDeps([]string{"--github-cli", "--force"}, loginDeps{
+		stdout: &stdout,
 		stderr: &stderr,
 		newAuthenticator: func(string) (loginAuthenticator, error) {
 			constructed = true
@@ -280,11 +286,13 @@ func TestRunLoginRejectsGitHubCLIWithForceBeforeAuthConstruction(t *testing.T) {
 }
 
 func TestRunLoginGHAliasUsesGitHubCLI(t *testing.T) {
+	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	fake := &fakeLoginAuthenticator{}
 	var gotTokenDir string
 
 	code := runLoginWithDeps([]string{"--gh", "--token-dir", "/tmp/vekil-test-tokens"}, loginDeps{
+		stdout: &stdout,
 		stderr: &stderr,
 		newAuthenticator: func(tokenDir string) (loginAuthenticator, error) {
 			gotTokenDir = tokenDir
@@ -304,12 +312,13 @@ func TestRunLoginGHAliasUsesGitHubCLI(t *testing.T) {
 	if fake.refreshCalls != 0 || fake.requestDeviceCodeCalls != 0 || fake.pollForAuthorizationCalls != 0 {
 		t.Fatalf("unexpected auth flow calls: refresh=%d request=%d poll=%d", fake.refreshCalls, fake.requestDeviceCodeCalls, fake.pollForAuthorizationCalls)
 	}
-	if got := stderr.String(); !strings.Contains(got, "Login successful.") {
-		t.Fatalf("stderr missing success message, got %q", got)
+	if got := stdout.String(); !strings.Contains(got, "Login successful.") {
+		t.Fatalf("stdout missing success message, got %q", got)
 	}
 }
 
 func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
+	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	fake := &fakeLoginAuthenticator{
 		deviceCodeResponse: &auth.DeviceCodeResponse{
@@ -322,6 +331,7 @@ func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
 	var openedURL string
 
 	code := runLoginWithDeps([]string{"--force"}, loginDeps{
+		stdout: &stdout,
 		stderr: &stderr,
 		newAuthenticator: func(string) (loginAuthenticator, error) {
 			return fake, nil
@@ -350,11 +360,73 @@ func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
 	if openedURL != fake.deviceCodeResponse.VerificationURI {
 		t.Fatalf("opened URL = %q, want %q", openedURL, fake.deviceCodeResponse.VerificationURI)
 	}
-	output := stderr.String()
+	output := stdout.String()
 	for _, want := range []string{"Opening browser to https://github.com/login/device", "Enter code: ABCD-EFGH", "Login successful."} {
 		if !strings.Contains(output, want) {
-			t.Fatalf("stderr missing %q, got %q", want, output)
+			t.Fatalf("stdout missing %q, got %q", want, output)
 		}
+	}
+}
+
+func TestParseGlobalFlags(t *testing.T) {
+	quiet, filtered, err := parseGlobalFlags([]string{"vekil", "--quiet", "login", "--gh"})
+	if err != nil {
+		t.Fatalf("parseGlobalFlags() error = %v", err)
+	}
+	if !quiet {
+		t.Fatal("quiet should be enabled")
+	}
+	got := strings.Join(filtered, " ")
+	want := "vekil login --gh"
+	if got != want {
+		t.Fatalf("filtered args = %q, want %q", got, want)
+	}
+}
+
+func TestQuietSuppressesLoginStdout(t *testing.T) {
+	fake := &fakeLoginAuthenticator{}
+	makeDeps := func(stdout io.Writer) loginDeps {
+		return loginDeps{
+			stdout: stdout,
+			stderr: io.Discard,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return fake, nil
+			},
+		}
+	}
+
+	quiet, filtered, err := parseGlobalFlags([]string{"vekil", "login", "--gh"})
+	if err != nil {
+		t.Fatalf("parseGlobalFlags() error = %v", err)
+	}
+	if quiet {
+		t.Fatal("quiet should be disabled")
+	}
+	var normalOut bytes.Buffer
+	if code := runLoginWithDeps(filtered[2:], makeDeps(&normalOut)); code != 0 {
+		t.Fatalf("runLoginWithDeps() code = %d, want 0", code)
+	}
+	if normalOut.Len() == 0 {
+		t.Fatal("expected stdout output without --quiet")
+	}
+
+	quiet, filtered, err = parseGlobalFlags([]string{"vekil", "--quiet", "login", "--gh"})
+	if err != nil {
+		t.Fatalf("parseGlobalFlags() error = %v", err)
+	}
+	if !quiet {
+		t.Fatal("quiet should be enabled")
+	}
+	var quietOut bytes.Buffer
+	deps := makeDeps(&quietOut)
+	if quiet {
+		deps.stdout = io.Discard
+	}
+	if code := runLoginWithDeps(filtered[2:], deps); code != 0 {
+		t.Fatalf("runLoginWithDeps() code = %d, want 0", code)
+	}
+	if quietOut.Len() != 0 {
+		t.Fatalf("expected no stdout output with --quiet, got %q", quietOut.String())
 	}
 }
 
