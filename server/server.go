@@ -86,20 +86,26 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 		return nil, err
 	}
 
+	metrics := &httpMetrics{}
+
+	appMux := http.NewServeMux()
+	appMux.HandleFunc("POST /v1/messages/count_tokens", handler.HandleAnthropicMessagesCountTokens)
+	appMux.HandleFunc("POST /v1/messages", handler.HandleAnthropicMessages)
+	appMux.HandleFunc("POST /v1/chat/completions", handler.HandleOpenAIChatCompletions)
+	appMux.HandleFunc("POST /v1beta/models/", handler.HandleGeminiModels)
+	appMux.HandleFunc("POST /v1/models/", handler.HandleGeminiModels)
+	appMux.HandleFunc("POST /models/", handler.HandleGeminiModels)
+	appMux.HandleFunc("POST /v1/responses/compact", handler.HandleCompact)
+	appMux.HandleFunc("POST /v1/responses", handler.HandleResponses)
+	appMux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
+	appMux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
+	appMux.HandleFunc("GET /healthz", handler.HandleHealthz)
+	appMux.HandleFunc("GET /readyz", handler.HandleReadyz)
+	appMux.HandleFunc("GET /v1/models", handler.HandleModels)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/messages/count_tokens", handler.HandleAnthropicMessagesCountTokens)
-	mux.HandleFunc("POST /v1/messages", handler.HandleAnthropicMessages)
-	mux.HandleFunc("POST /v1/chat/completions", handler.HandleOpenAIChatCompletions)
-	mux.HandleFunc("POST /v1beta/models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /v1/models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /models/", handler.HandleGeminiModels)
-	mux.HandleFunc("POST /v1/responses/compact", handler.HandleCompact)
-	mux.HandleFunc("POST /v1/responses", handler.HandleResponses)
-	mux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
-	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
-	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
-	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
-	mux.HandleFunc("GET /v1/models", handler.HandleModels)
+	mux.Handle("GET /metrics", metrics.handler())
+	mux.Handle("/", metrics.middleware(appMux))
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{
