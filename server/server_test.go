@@ -2,6 +2,8 @@ package server
 
 import (
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -41,6 +43,42 @@ func TestStart_ReturnsErrorWhenPortInUse(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "address already in use") {
 		t.Fatalf("expected address-in-use error, got %v", err)
+	}
+}
+
+func TestNew_MountsMetricsEndpoint(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	healthReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	healthRes := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(healthRes, healthReq)
+	if healthRes.Code != http.StatusOK {
+		t.Fatalf("healthz status = %d, want %d", healthRes.Code, http.StatusOK)
+	}
+
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsRes := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(metricsRes, metricsReq)
+	if metricsRes.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, want %d", metricsRes.Code, http.StatusOK)
+	}
+	if got := metricsRes.Header().Get("Content-Type"); got != "text/plain; version=0.0.4; charset=utf-8" {
+		t.Fatalf("metrics content type = %q", got)
+	}
+	body := metricsRes.Body.String()
+	if !strings.Contains(body, "vekil_http_requests_total 1") {
+		t.Fatalf("metrics body missing request counter: %s", body)
+	}
+	if !strings.Contains(body, "vekil_http_in_flight_requests 0") {
+		t.Fatalf("metrics body missing in-flight gauge: %s", body)
 	}
 }
 
