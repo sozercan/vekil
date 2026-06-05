@@ -2,6 +2,8 @@ package server
 
 import (
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -94,5 +96,40 @@ func TestNew_DerivesWriteTimeoutFromConfiguredProxyHandler(t *testing.T) {
 				t.Fatalf("WriteTimeout = %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+func TestNew_MountsMetricsEndpoint(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	healthzReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	healthzRec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(healthzRec, healthzReq)
+	if healthzRec.Code != http.StatusOK {
+		t.Fatalf("GET /healthz status = %d, want %d", healthzRec.Code, http.StatusOK)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /metrics status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "vekil_http_requests_total 2") {
+		t.Fatalf("expected request counter in metrics body, got %q", body)
+	}
+	if !strings.Contains(body, "vekil_http_requests_in_flight 1") {
+		t.Fatalf("expected in-flight gauge in metrics body, got %q", body)
 	}
 }
