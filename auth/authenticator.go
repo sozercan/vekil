@@ -72,6 +72,9 @@ type Authenticator struct {
 	// are expected to drive the flow themselves via RequestDeviceCode /
 	// PollForAuthorization.
 	DisableAutoDeviceFlow bool
+
+	// Quiet suppresses non-error output from automatic interactive auth flows.
+	Quiet bool
 }
 
 // DeviceCodeResponse is the response from GitHub's device code endpoint.
@@ -515,7 +518,9 @@ func (a *Authenticator) deviceCodeFlow(ctx context.Context) error {
 		return err
 	}
 
-	_, _ = fmt.Fprintf(os.Stderr, "Please visit %s and enter code: %s\n", dcResp.VerificationURI, dcResp.UserCode)
+	if !a.Quiet {
+		_, _ = fmt.Fprintf(os.Stderr, "Please visit %s and enter code: %s\n", dcResp.VerificationURI, dcResp.UserCode)
+	}
 
 	return a.pollForAuthorization(ctx, dcResp)
 }
