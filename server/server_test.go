@@ -1,7 +1,10 @@
 package server
 
 import (
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -94,5 +97,47 @@ func TestNew_DerivesWriteTimeoutFromConfiguredProxyHandler(t *testing.T) {
 				t.Fatalf("WriteTimeout = %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+func TestMetricsEndpointTracksRequests(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	healthReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	healthResp := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(healthResp, healthReq)
+	if healthResp.Code != http.StatusOK {
+		t.Fatalf("healthz status = %d, want %d", healthResp.Code, http.StatusOK)
+	}
+
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsResp := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(metricsResp, metricsReq)
+
+	if metricsResp.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, want %d", metricsResp.Code, http.StatusOK)
+	}
+	if got := metricsResp.Header().Get("Content-Type"); got != "text/plain; version=0.0.4; charset=utf-8" {
+		t.Fatalf("metrics content type = %q, want Prometheus text format", got)
+	}
+
+	body, err := io.ReadAll(metricsResp.Result().Body)
+	if err != nil {
+		t.Fatalf("failed to read metrics body: %v", err)
+	}
+	text := string(body)
+	if !strings.Contains(text, "vekil_http_requests_total 1\n") {
+		t.Fatalf("metrics body missing request counter:\n%s", text)
+	}
+	if !strings.Contains(text, "vekil_http_in_flight_requests 0\n") {
+		t.Fatalf("metrics body missing in-flight gauge:\n%s", text)
 	}
 }
