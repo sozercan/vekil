@@ -9,6 +9,7 @@ APP_CGO_LDFLAGS = -F$(abspath $(SPARKLE_UNPACK_DIR)) -Wl,-rpath,@executable_path
 SPARKLE_VERSION := 2.9.0
 SPARKLE_BUILD_DIR := .build/sparkle
 SPARKLE_ARCHIVE := $(SPARKLE_BUILD_DIR)/Sparkle-$(SPARKLE_VERSION).tar.xz
+SPARKLE_ARCHIVE_SHA256 := 01e0f0ebf6614061ea816d414de50f937d64ffa6822ad572243031ca3676fe19
 SPARKLE_UNPACK_DIR := $(SPARKLE_BUILD_DIR)/unpacked
 SPARKLE_FRAMEWORK := $(SPARKLE_UNPACK_DIR)/Sparkle.framework
 SPARKLE_DOWNLOAD_URL := https://github.com/sparkle-project/Sparkle/releases/download/$(SPARKLE_VERSION)/Sparkle-$(SPARKLE_VERSION).tar.xz
@@ -23,8 +24,10 @@ build:
 $(SPARKLE_ARCHIVE):
 	@mkdir -p "$(SPARKLE_BUILD_DIR)"
 	curl -fL "$(SPARKLE_DOWNLOAD_URL)" -o "$(SPARKLE_ARCHIVE)"
+	printf '%s  %s\n' "$(SPARKLE_ARCHIVE_SHA256)" "$(SPARKLE_ARCHIVE)" | shasum -a 256 -c -
 
 $(SPARKLE_FRAMEWORK): $(SPARKLE_ARCHIVE)
+	printf '%s  %s\n' "$(SPARKLE_ARCHIVE_SHA256)" "$(SPARKLE_ARCHIVE)" | shasum -a 256 -c -
 	@rm -rf "$(SPARKLE_UNPACK_DIR)"
 	@mkdir -p "$(SPARKLE_UNPACK_DIR)"
 	tar -xf "$(SPARKLE_ARCHIVE)" -C "$(SPARKLE_UNPACK_DIR)"
