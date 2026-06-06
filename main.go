@@ -218,7 +218,7 @@ func runLogout(args []string) {
 		os.Exit(1)
 	}
 
-	if !(*quiet || *q) {
+	if !*quiet && !*q {
 		_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
 	}
 }
