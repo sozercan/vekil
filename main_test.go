@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -188,6 +189,25 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	}
 }
 
+func TestServeFlagsQuietCanBeEnabled(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet")
+	if !*serve.quiet {
+		t.Fatal("--quiet should enable quiet mode")
+	}
+}
+
+func TestEffectiveServeLogLevelQuietSuppressesInfo(t *testing.T) {
+	if got := effectiveServeLogLevel(logger.ParseLevel("info"), true); got != logger.LevelError {
+		t.Fatalf("effectiveServeLogLevel(info, true) = %v, want %v", got, logger.LevelError)
+	}
+	if got := effectiveServeLogLevel(logger.ParseLevel("error"), true); got != logger.LevelError {
+		t.Fatalf("effectiveServeLogLevel(error, true) = %v, want %v", got, logger.LevelError)
+	}
+	if got := effectiveServeLogLevel(logger.ParseLevel("debug"), false); got != logger.LevelDebug {
+		t.Fatalf("effectiveServeLogLevel(debug, false) = %v, want %v", got, logger.LevelDebug)
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -247,7 +267,7 @@ func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 			}
 
 			output := stderr.String()
-			for _, want := range []string{"github-cli", "gh", "force"} {
+			for _, want := range []string{"github-cli", "gh", "force", "quiet"} {
 				if !strings.Contains(output, want) {
 					t.Fatalf("help output missing %q:\n%s", want, output)
 				}
@@ -306,6 +326,65 @@ func TestRunLoginGHAliasUsesGitHubCLI(t *testing.T) {
 	}
 	if got := stderr.String(); !strings.Contains(got, "Login successful.") {
 		t.Fatalf("stderr missing success message, got %q", got)
+	}
+}
+
+func TestRunLoginQuietSuppressesInformationalOutput(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantOutput bool
+	}{
+		{
+			name:       "default emits informational output",
+			args:       []string{"--gh"},
+			wantOutput: true,
+		},
+		{
+			name:       "quiet suppresses informational output",
+			args:       []string{"--gh", "--quiet"},
+			wantOutput: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			fake := &fakeLoginAuthenticator{}
+
+			code := runLoginWithDeps(tc.args, loginDeps{
+				stderr: &stderr,
+				newAuthenticator: func(string) (loginAuthenticator, error) {
+					return fake, nil
+				},
+			})
+
+			if code != 0 {
+				t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+			}
+			gotOutput := strings.Contains(stderr.String(), "Login successful.")
+			if gotOutput != tc.wantOutput {
+				t.Fatalf("Login successful output present = %v, want %v; stderr=%q", gotOutput, tc.wantOutput, stderr.String())
+			}
+		})
+	}
+}
+
+func TestRunLoginQuietStillEmitsErrors(t *testing.T) {
+	var stderr bytes.Buffer
+
+	code := runLoginWithDeps([]string{"--gh", "--quiet"}, loginDeps{
+		stderr: &stderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return &fakeLoginAuthenticator{signInWithGitHubCLIErr: fmt.Errorf("boom")}, nil
+		},
+	})
+
+	if code != 1 {
+		t.Fatalf("runLoginWithDeps() code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "error signing in with GitHub CLI: boom") {
+		t.Fatalf("stderr missing error output, got %q", stderr.String())
 	}
 }
 
