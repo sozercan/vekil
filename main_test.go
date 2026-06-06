@@ -188,6 +188,13 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	}
 }
 
+func TestServeFlagsQuietCanBeSet(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet")
+	if !*serve.quiet {
+		t.Fatal("--quiet should set serve quiet flag")
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -306,6 +313,46 @@ func TestRunLoginGHAliasUsesGitHubCLI(t *testing.T) {
 	}
 	if got := stderr.String(); !strings.Contains(got, "Login successful.") {
 		t.Fatalf("stderr missing success message, got %q", got)
+	}
+}
+
+func TestRunLoginQuietSuppressesNonErrorOutput(t *testing.T) {
+	var stderr bytes.Buffer
+	fake := &fakeLoginAuthenticator{}
+
+	code := runLoginWithDeps([]string{"--github-cli", "--quiet"}, loginDeps{
+		stderr: &stderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return fake, nil
+		},
+	})
+
+	if code != 0 {
+		t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("--quiet should suppress non-error login output, got %q", got)
+	}
+}
+
+func TestRunLoginQuietDoesNotSuppressErrors(t *testing.T) {
+	var stderr bytes.Buffer
+	fake := &fakeLoginAuthenticator{
+		signInWithGitHubCLIErr: fmt.Errorf("gh failed"),
+	}
+
+	code := runLoginWithDeps([]string{"--github-cli", "--quiet"}, loginDeps{
+		stderr: &stderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return fake, nil
+		},
+	})
+
+	if code != 1 {
+		t.Fatalf("runLoginWithDeps() code = %d, want 1", code)
+	}
+	if got := stderr.String(); !strings.Contains(got, "error signing in with GitHub CLI: gh failed") {
+		t.Fatalf("--quiet should not suppress errors, got %q", got)
 	}
 }
 

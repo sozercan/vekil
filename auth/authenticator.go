@@ -66,6 +66,7 @@ type Authenticator struct {
 	directClient   *http.Client
 	copilotBaseURL string // overridable for tests; defaults to https://api.github.com
 	githubCLIPath  string // optional override for tests; defaults to gh lookup/common paths
+	output         io.Writer
 
 	// DisableAutoDeviceFlow prevents refreshToken from falling through to the
 	// interactive device-code flow. When true, callers (e.g. the menubar app)
@@ -160,7 +161,23 @@ func NewAuthenticator(tokenDir string) (*Authenticator, error) {
 		tokenDir:     tokenDir,
 		client:       newAuthHTTPClient(30*time.Second, true),
 		directClient: newAuthHTTPClient(30*time.Second, false),
+		output:       os.Stderr,
 	}, nil
+}
+
+// SetOutput configures where non-error interactive auth messages are written.
+func (a *Authenticator) SetOutput(w io.Writer) {
+	if w == nil {
+		w = io.Discard
+	}
+	a.output = w
+}
+
+func (a *Authenticator) outputWriter() io.Writer {
+	if a.output == nil {
+		return os.Stderr
+	}
+	return a.output
 }
 
 // IsSignedIn reports whether the authenticator has a usable or explicitly
@@ -515,7 +532,7 @@ func (a *Authenticator) deviceCodeFlow(ctx context.Context) error {
 		return err
 	}
 
-	_, _ = fmt.Fprintf(os.Stderr, "Please visit %s and enter code: %s\n", dcResp.VerificationURI, dcResp.UserCode)
+	_, _ = fmt.Fprintf(a.outputWriter(), "Please visit %s and enter code: %s\n", dcResp.VerificationURI, dcResp.UserCode)
 
 	return a.pollForAuthorization(ctx, dcResp)
 }
