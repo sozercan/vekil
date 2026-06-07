@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -130,6 +131,57 @@ func parseServeFlagsForTest(t *testing.T, args ...string) serveFlags {
 		t.Fatalf("parse serve flags: %v", err)
 	}
 	return serve
+}
+
+func TestEffectiveLogLevel(t *testing.T) {
+	tests := []struct {
+		name     string
+		logLevel string
+		quiet    bool
+		want     logger.Level
+	}{
+		{name: "info", logLevel: "info", quiet: false, want: logger.LevelInfo},
+		{name: "debug", logLevel: "debug", quiet: false, want: logger.LevelDebug},
+		{name: "error", logLevel: "error", quiet: false, want: logger.LevelError},
+		{name: "quiet overrides debug", logLevel: "debug", quiet: true, want: logger.LevelError},
+		{name: "quiet overrides info", logLevel: "info", quiet: true, want: logger.LevelError},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := effectiveLogLevel(tc.logLevel, tc.quiet); got != tc.want {
+				t.Fatalf("effectiveLogLevel(%q, %v) = %v, want %v", tc.logLevel, tc.quiet, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestServeFlagsQuiet(t *testing.T) {
+	t.Setenv("QUIET", "")
+
+	defaultServe := parseServeFlagsForTest(t)
+	if *defaultServe.quiet {
+		t.Fatal("quiet should be disabled by default")
+	}
+
+	cliServe := parseServeFlagsForTest(t, "--quiet")
+	if !*cliServe.quiet {
+		t.Fatal("--quiet should enable quiet mode")
+	}
+}
+
+func TestServeFlagsQuietEnvDefault(t *testing.T) {
+	t.Setenv("QUIET", "true")
+
+	envServe := parseServeFlagsForTest(t)
+	if !*envServe.quiet {
+		t.Fatal("QUIET=true should enable quiet mode")
+	}
+
+	cliServe := parseServeFlagsForTest(t, "--quiet=false")
+	if *cliServe.quiet {
+		t.Fatal("--quiet=false should override QUIET=true")
+	}
 }
 
 func TestServeFlagsCopilotHeaderEnvDefaults(t *testing.T) {
