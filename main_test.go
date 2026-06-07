@@ -247,7 +247,7 @@ func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 			}
 
 			output := stderr.String()
-			for _, want := range []string{"github-cli", "gh", "force"} {
+			for _, want := range []string{"github-cli", "gh", "force", "quiet"} {
 				if !strings.Contains(output, want) {
 					t.Fatalf("help output missing %q:\n%s", want, output)
 				}
@@ -307,6 +307,68 @@ func TestRunLoginGHAliasUsesGitHubCLI(t *testing.T) {
 	if got := stderr.String(); !strings.Contains(got, "Login successful.") {
 		t.Fatalf("stderr missing success message, got %q", got)
 	}
+}
+
+func TestRunLoginQuietSuppressesNonErrorOutput(t *testing.T) {
+	t.Run("success output is suppressed", func(t *testing.T) {
+		var stderr bytes.Buffer
+		fake := &fakeLoginAuthenticator{}
+
+		code := runLoginWithDeps([]string{"--github-cli", "--quiet"}, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return fake, nil
+			},
+		})
+
+		if code != 0 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+		}
+		if fake.signInWithGitHubCLICalls != 1 {
+			t.Fatalf("SignInWithGitHubCLI calls = %d, want 1", fake.signInWithGitHubCLICalls)
+		}
+		if got := stderr.String(); got != "" {
+			t.Fatalf("quiet login emitted non-error output %q", got)
+		}
+	})
+
+	t.Run("normal success output remains by default", func(t *testing.T) {
+		var stderr bytes.Buffer
+		fake := &fakeLoginAuthenticator{}
+
+		code := runLoginWithDeps([]string{"--github-cli"}, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return fake, nil
+			},
+		})
+
+		if code != 0 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+		}
+		if got := stderr.String(); !strings.Contains(got, "Login successful.") {
+			t.Fatalf("stderr missing success message, got %q", got)
+		}
+	})
+
+	t.Run("errors remain visible", func(t *testing.T) {
+		var stderr bytes.Buffer
+		fake := &fakeLoginAuthenticator{signInWithGitHubCLIErr: fmt.Errorf("gh auth failed")}
+
+		code := runLoginWithDeps([]string{"--github-cli", "--quiet"}, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return fake, nil
+			},
+		})
+
+		if code != 1 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 1", code)
+		}
+		if got := stderr.String(); !strings.Contains(got, "error signing in with GitHub CLI: gh auth failed") {
+			t.Fatalf("quiet login did not emit error, got %q", got)
+		}
+	})
 }
 
 func TestRunLoginForceSkipsRefreshAndStartsDeviceFlow(t *testing.T) {
