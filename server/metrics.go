@@ -1,8 +1,8 @@
 package server
 
 import (
-	"fmt"
 	"net/http"
+	"strconv"
 	"sync/atomic"
 )
 
@@ -23,10 +23,10 @@ func (m *metrics) instrument(next http.Handler) http.Handler {
 
 func (m *metrics) handle(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	_, _ = fmt.Fprintf(w, "# HELP vekil_http_requests_total Total HTTP requests handled by Vekil.\n")
-	_, _ = fmt.Fprintf(w, "# TYPE vekil_http_requests_total counter\n")
-	_, _ = fmt.Fprintf(w, "vekil_http_requests_total %d\n", atomic.LoadUint64(&m.requestsTotal))
-	_, _ = fmt.Fprintf(w, "# HELP vekil_http_in_flight_requests HTTP requests currently being handled by Vekil.\n")
-	_, _ = fmt.Fprintf(w, "# TYPE vekil_http_in_flight_requests gauge\n")
-	_, _ = fmt.Fprintf(w, "vekil_http_in_flight_requests %d\n", atomic.LoadInt64(&m.inFlight))
+	_, _ = w.Write([]byte("# HELP vekil_http_requests_total Total HTTP requests handled by Vekil.\n"))
+	_, _ = w.Write([]byte("# TYPE vekil_http_requests_total counter\n"))
+	_, _ = w.Write([]byte("vekil_http_requests_total " + strconv.FormatUint(atomic.LoadUint64(&m.requestsTotal), 10) + "\n"))
+	_, _ = w.Write([]byte("# HELP vekil_http_in_flight_requests HTTP requests currently being handled by Vekil.\n"))
+	_, _ = w.Write([]byte("# TYPE vekil_http_in_flight_requests gauge\n"))
+	_, _ = w.Write([]byte("vekil_http_in_flight_requests " + strconv.FormatInt(atomic.LoadInt64(&m.inFlight), 10) + "\n"))
 }
