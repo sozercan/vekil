@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -188,6 +189,14 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	}
 }
 
+func TestServeFlagsQuietCanBeEnabled(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet")
+
+	if !*serve.quiet {
+		t.Fatal("--quiet should enable quiet mode")
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -225,6 +234,17 @@ func TestCommandFromArgs(t *testing.T) {
 	}
 }
 
+func TestExtractGlobalQuiet(t *testing.T) {
+	args, quiet := extractGlobalQuiet([]string{"vekil", "--quiet", "login"})
+
+	if !quiet {
+		t.Fatal("extractGlobalQuiet quiet = false, want true")
+	}
+	if got := strings.Join(args, " "); got != "vekil login" {
+		t.Fatalf("extractGlobalQuiet args = %q, want %q", got, "vekil login")
+	}
+}
+
 func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 	for _, helpArg := range []string{"-h", "--help"} {
 		t.Run(helpArg, func(t *testing.T) {
@@ -247,7 +267,7 @@ func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 			}
 
 			output := stderr.String()
-			for _, want := range []string{"github-cli", "gh", "force"} {
+			for _, want := range []string{"github-cli", "gh", "force", "quiet"} {
 				if !strings.Contains(output, want) {
 					t.Fatalf("help output missing %q:\n%s", want, output)
 				}
@@ -306,6 +326,46 @@ func TestRunLoginGHAliasUsesGitHubCLI(t *testing.T) {
 	}
 	if got := stderr.String(); !strings.Contains(got, "Login successful.") {
 		t.Fatalf("stderr missing success message, got %q", got)
+	}
+}
+
+func TestRunLoginQuietSuppressesSuccessOutput(t *testing.T) {
+	var stderr bytes.Buffer
+	fake := &fakeLoginAuthenticator{}
+
+	code := runLoginWithDeps([]string{"--quiet", "--github-cli"}, loginDeps{
+		stderr: &stderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return fake, nil
+		},
+	})
+
+	if code != 0 {
+		t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("quiet login wrote non-error output %q, want empty", got)
+	}
+}
+
+func TestRunLoginQuietPreservesErrorOutput(t *testing.T) {
+	var stderr bytes.Buffer
+	fake := &fakeLoginAuthenticator{
+		signInWithGitHubCLIErr: errors.New("boom"),
+	}
+
+	code := runLoginWithDeps([]string{"--quiet", "--github-cli"}, loginDeps{
+		stderr: &stderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return fake, nil
+		},
+	})
+
+	if code != 1 {
+		t.Fatalf("runLoginWithDeps() code = %d, want 1", code)
+	}
+	if got := stderr.String(); !strings.Contains(got, "error signing in with GitHub CLI: boom") {
+		t.Fatalf("quiet login suppressed error output, got %q", got)
 	}
 }
 
