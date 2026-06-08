@@ -273,7 +273,8 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		h.log.Error("upstream error",
 			logger.F("endpoint", "anthropic"),
 			logger.F("status", resp.StatusCode),
-			logger.F("body", string(errBody)),
+			logger.F("error_summary", summarizeUpstreamErrorBody(errBody)),
+			logger.F("response_bytes", len(errBody)),
 			logger.F("request_bytes", len(oaiBody)),
 		)
 		writeAnthropicError(w, resp.StatusCode, "api_error", formatUpstreamErrorMessage(resp.StatusCode, errBody))

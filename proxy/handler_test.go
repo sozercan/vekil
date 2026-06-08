@@ -788,6 +788,47 @@ func TestHandleAnthropicUpstreamError(t *testing.T) {
 	}
 }
 
+func TestHandleAnthropicUpstreamErrorLogOmitsRawBody(t *testing.T) {
+	const sensitive = "super-secret-prompt"
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprintf(w, `{"error":{"message":"bad request","type":"invalid_request_error"},"prompt":%q}`, sensitive)
+	})
+
+	oldStderr := os.Stderr
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = writePipe
+	defer func() {
+		os.Stderr = oldStderr
+		_ = readPipe.Close()
+	}()
+
+	anthropicReq := `{
+		"model": "claude-sonnet-4",
+		"max_tokens": 1024,
+		"messages": [{"role": "user", "content": "Hello"}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(anthropicReq))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	_ = writePipe.Close()
+	os.Stderr = oldStderr
+	logs, _ := io.ReadAll(readPipe)
+	if strings.Contains(string(logs), sensitive) {
+		t.Fatalf("upstream error log included raw response body: %s", logs)
+	}
+	if !strings.Contains(string(logs), "error_summary") || !strings.Contains(string(logs), "response_bytes") {
+		t.Fatalf("upstream error log missing sanitized metadata: %s", logs)
+	}
+}
+
 func TestHandleOpenAIChatCompletions(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/chat/completions" {
