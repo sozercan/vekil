@@ -1,7 +1,10 @@
 package server
 
 import (
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -11,6 +14,38 @@ import (
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
 )
+
+func TestMetricsEndpointReportsRequestCountAndInFlight(t *testing.T) {
+	srv, err := New(auth.NewTestAuthenticator("test-token"), logger.New(logger.ParseLevel("error")), "127.0.0.1", "0")
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	srv.httpServer.Handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/healthz", nil))
+
+	w := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
+		t.Fatalf("expected text/plain content type, got %q", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+	for _, want := range []string{
+		"# TYPE vekil_http_requests_total counter\n",
+		"vekil_http_requests_total 2\n",
+		"# TYPE vekil_http_requests_in_flight gauge\n",
+		"vekil_http_requests_in_flight 1\n",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("metrics body missing %q; got:\n%s", want, text)
+		}
+	}
+}
 
 func TestStart_ReturnsErrorWhenPortInUse(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

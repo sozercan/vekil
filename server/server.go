@@ -86,6 +86,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 		return nil, err
 	}
 
+	metrics := &metrics{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/messages/count_tokens", handler.HandleAnthropicMessagesCountTokens)
 	mux.HandleFunc("POST /v1/messages", handler.HandleAnthropicMessages)
@@ -98,6 +99,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
 	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
+	mux.HandleFunc("GET /metrics", metrics.handle)
 	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)
 
@@ -105,7 +107,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	return &Server{
 		httpServer: &http.Server{
 			Addr:         addr,
-			Handler:      mux,
+			Handler:      metrics.wrap(mux),
 			ReadTimeout:  30 * time.Second,
 			WriteTimeout: handler.ServerWriteTimeout(),
 			IdleTimeout:  120 * time.Second,
