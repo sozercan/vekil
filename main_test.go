@@ -321,6 +321,41 @@ func TestRunLoginQuietSuppressesNonErrorOutput(t *testing.T) {
 			t.Fatalf("stderr missing error output, got %q", got)
 		}
 	})
+
+	t.Run("quiet reports browser open failure with fallback code", func(t *testing.T) {
+		var stderr bytes.Buffer
+		wantErr := errors.New("open failed")
+
+		code := runLoginWithDeps([]string{"--force", "--quiet"}, loginDeps{
+			stderr: &stderr,
+			newAuthenticator: func(string) (loginAuthenticator, error) {
+				return &fakeLoginAuthenticator{
+					deviceCodeResponse: &auth.DeviceCodeResponse{
+						DeviceCode:      "device-code",
+						UserCode:        "ABCD-EFGH",
+						VerificationURI: "https://github.com/login/device",
+						Interval:        1,
+					},
+				}, nil
+			},
+			openURL: func(string) error {
+				return wantErr
+			},
+		})
+
+		if code != 0 {
+			t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+		}
+		output := stderr.String()
+		for _, want := range []string{wantErr.Error(), "https://github.com/login/device", "ABCD-EFGH"} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("stderr missing %q, got %q", want, output)
+			}
+		}
+		if strings.Contains(output, "Login successful.") {
+			t.Fatalf("quiet login wrote success output %q", output)
+		}
+	})
 }
 
 func TestRunLoginRejectsGitHubCLIWithForceBeforeAuthConstruction(t *testing.T) {

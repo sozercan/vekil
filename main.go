@@ -148,8 +148,18 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		_, _ = fmt.Fprintf(deps.stderr, "Enter code: %s\n", dcResp.UserCode)
 	}
 
-	if err := deps.openURL(dcResp.VerificationURI); err != nil && !opts.quiet {
-		_, _ = fmt.Fprintf(deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
+	if err := deps.openURL(dcResp.VerificationURI); err != nil {
+		if opts.quiet {
+			_, _ = fmt.Fprintf(
+				deps.stderr,
+				"Could not open browser automatically: %v\nPlease visit: %s\nEnter code: %s\n",
+				err,
+				dcResp.VerificationURI,
+				dcResp.UserCode,
+			)
+		} else {
+			_, _ = fmt.Fprintf(deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
+		}
 	}
 
 	if err := authenticator.PollForAuthorization(ctx, dcResp); err != nil {
