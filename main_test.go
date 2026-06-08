@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -185,6 +186,56 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	cliServe := parseServeFlagsForTest(t, "--responses-ws-enabled=false")
 	if cliServe.responsesWebSocketConfig().Enabled {
 		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
+	}
+}
+
+func TestServeFlagsQuiet(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		envQuiet string
+		want     logger.Level
+		wantFlag bool
+	}{
+		{
+			name:     "default uses info",
+			want:     logger.ParseLevel("info"),
+			wantFlag: false,
+		},
+		{
+			name:     "quiet raises threshold to error",
+			args:     []string{"--quiet"},
+			want:     logger.LevelError,
+			wantFlag: true,
+		},
+		{
+			name:     "quiet wins over debug log level",
+			args:     []string{"--quiet", "--log-level", "debug"},
+			want:     logger.LevelError,
+			wantFlag: true,
+		},
+		{
+			name:     "env quiet default",
+			envQuiet: "true",
+			want:     logger.LevelError,
+			wantFlag: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.envQuiet != "" {
+				t.Setenv("QUIET", tc.envQuiet)
+			}
+
+			serve := parseServeFlagsForTest(t, tc.args...)
+			if got := serve.effectiveLogLevel(); got != tc.want {
+				t.Fatalf("effectiveLogLevel() = %v, want %v", got, tc.want)
+			}
+			if got := *serve.quiet; got != tc.wantFlag {
+				t.Fatalf("quiet = %v, want %v", got, tc.wantFlag)
+			}
+		})
 	}
 }
 
