@@ -1,8 +1,8 @@
 package server
 
 import (
-	"fmt"
 	"net/http"
+	"strconv"
 	"sync/atomic"
 )
 
@@ -21,10 +21,12 @@ func (m *metrics) wrap(next http.Handler) http.Handler {
 	})
 }
 
-func (m *metrics) handle(w http.ResponseWriter, r *http.Request) {
+func (m *metrics) handle(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	_, _ = fmt.Fprintf(w, "# TYPE vekil_http_requests_total counter\n")
-	_, _ = fmt.Fprintf(w, "vekil_http_requests_total %d\n", atomic.LoadUint64(&m.requestsTotal))
-	_, _ = fmt.Fprintf(w, "# TYPE vekil_http_requests_in_flight gauge\n")
-	_, _ = fmt.Fprintf(w, "vekil_http_requests_in_flight %d\n", atomic.LoadInt64(&m.inFlight))
+	_, _ = w.Write([]byte(
+		"# TYPE vekil_http_requests_total counter\n" +
+			"vekil_http_requests_total " + strconv.FormatUint(atomic.LoadUint64(&m.requestsTotal), 10) + "\n" +
+			"# TYPE vekil_http_requests_in_flight gauge\n" +
+			"vekil_http_requests_in_flight " + strconv.FormatInt(atomic.LoadInt64(&m.inFlight), 10) + "\n",
+	))
 }
