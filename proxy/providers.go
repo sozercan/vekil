@@ -55,9 +55,6 @@ const (
 	providerEndpointModels          = "/models"
 )
 
-var defaultStaticProviderEndpoints = []string{providerEndpointChatCompletions, providerEndpointResponses}
-var defaultOpenAICompatibleProviderEndpoints = []string{providerEndpointChatCompletions}
-var defaultAnthropicCompatibleProviderEndpoints = []string{providerEndpointMessages}
 var openAICodexProviderEndpoints = []string{providerEndpointResponses}
 
 // ProvidersConfig configures optional non-Copilot upstream providers.
@@ -274,7 +271,7 @@ func defaultProviderSetup(h *ProxyHandler) *providerSetup {
 				kind:          providerTypeCopilot,
 				isDefault:     true,
 				baseURL:       strings.TrimRight(h.copilotURL, "/"),
-				paths:         defaultProviderEndpointPaths(providerTypeCopilot),
+				paths:         providerEndpointPolicyFor(providerTypeCopilot).defaultEndpointPaths(),
 				includeModels: map[string]struct{}{},
 				excludeModels: map[string]struct{}{},
 				staticModels:  map[string]providerModel{},
@@ -520,7 +517,7 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		id:             id,
 		kind:           kind,
 		isDefault:      cfg.Default,
-		paths:          defaultProviderEndpointPaths(kind),
+		paths:          providerEndpointPolicyFor(kind).defaultEndpointPaths(),
 		modelDiscovery: providerModelDiscoveryStatic,
 		includeModels:  make(map[string]struct{}, len(cfg.IncludeModels)),
 		excludeModels:  make(map[string]struct{}, len(cfg.ExcludeModels)),
@@ -602,7 +599,7 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		if len(cfg.Models) == 0 {
 			return nil, fmt.Errorf("provider %q must configure at least one model", id)
 		}
-		if err := addStaticProviderModels(runtime, cfg.Models, defaultStaticEndpointsForProvider(kind)); err != nil {
+		if err := addStaticProviderModels(runtime, cfg.Models, runtime.defaultStaticModelEndpoints()); err != nil {
 			return nil, err
 		}
 	case providerTypeOpenAICodex:
@@ -656,7 +653,7 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		if modelDiscovery == providerModelDiscoveryStatic && len(cfg.Models) == 0 {
 			return nil, fmt.Errorf("provider %q must configure at least one model when model_discovery is static", id)
 		}
-		if err := addStaticProviderModels(runtime, cfg.Models, defaultStaticEndpointsForProvider(kind)); err != nil {
+		if err := addStaticProviderModels(runtime, cfg.Models, runtime.defaultStaticModelEndpoints()); err != nil {
 			return nil, err
 		}
 	}
@@ -686,33 +683,8 @@ func addStaticProviderModels(runtime *providerRuntime, models []ProviderModelCon
 	return nil
 }
 
-func defaultStaticEndpointsForProvider(kind providerType) []string {
-	switch kind {
-	case providerTypeOpenAICompatible:
-		return defaultOpenAICompatibleProviderEndpoints
-	case providerTypeAnthropicCompatible:
-		return defaultAnthropicCompatibleProviderEndpoints
-	default:
-		return defaultStaticProviderEndpoints
-	}
-}
-
-func defaultProviderEndpointPaths(kind providerType) providerEndpointPaths {
-	paths := providerEndpointPaths{
-		chatCompletions: providerEndpointChatCompletions,
-		responses:       providerEndpointResponses,
-		messages:        providerEndpointMessages,
-		models:          providerEndpointModels,
-	}
-	if kind == providerTypeOpenAICodex {
-		paths.chatCompletions = ""
-		paths.messages = ""
-	}
-	return paths
-}
-
 func configuredProviderEndpointPaths(kind providerType, cfg ProviderConfig) (providerEndpointPaths, error) {
-	paths := defaultProviderEndpointPaths(kind)
+	paths := providerEndpointPolicyFor(kind).defaultEndpointPaths()
 
 	var err error
 	if paths.chatCompletions, err = normalizeProviderPath(cfg.ChatCompletionsPath, paths.chatCompletions, "chat_completions_path"); err != nil {
@@ -1764,7 +1736,7 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 
 		supportedEndpoints := normalizeDynamicProviderEndpoints(provider, parsed.SupportedEndpoints)
 		if len(supportedEndpoints) == 0 {
-			supportedEndpoints = defaultDynamicProviderEndpoints(provider)
+			supportedEndpoints = provider.defaultDynamicModelEndpoints()
 		}
 		disabled := strings.EqualFold(parsed.Policy.State, "disabled")
 		if index, duplicate := indexByID[publicID]; duplicate {
@@ -1804,20 +1776,6 @@ func openRouterModelSupportsTools(supportedParams []string) bool {
 	return false
 }
 
-func defaultDynamicProviderEndpoints(provider *providerRuntime) []string {
-	if provider == nil {
-		return nil
-	}
-	switch provider.kind {
-	case providerTypeOpenAICompatible:
-		return append([]string(nil), defaultOpenAICompatibleProviderEndpoints...)
-	case providerTypeAnthropicCompatible:
-		return append([]string(nil), defaultAnthropicCompatibleProviderEndpoints...)
-	default:
-		return nil
-	}
-}
-
 func mergeDiscoveredProviderModelsWithStaticConfig(provider *providerRuntime, discovered []providerModel) []providerModel {
 	if provider == nil || len(discovered) == 0 || len(provider.staticConfigs) == 0 {
 		return discovered
@@ -1832,7 +1790,7 @@ func mergeDiscoveredProviderModelsWithStaticConfig(provider *providerRuntime, di
 		}
 
 		for _, cfg := range configs {
-			staticModel, err := buildStaticProviderModel(provider.id, cfg, defaultStaticEndpointsForProvider(provider.kind))
+			staticModel, err := buildStaticProviderModel(provider.id, cfg, provider.defaultStaticModelEndpoints())
 			if err != nil {
 				continue
 			}
@@ -1877,7 +1835,7 @@ func decodeOllamaModelsFromBody(provider *providerRuntime, body []byte) ([]provi
 		return nil, err
 	}
 
-	defaultEndpoints := defaultDynamicProviderEndpoints(provider)
+	defaultEndpoints := provider.defaultDynamicModelEndpoints()
 	models := make([]providerModel, 0, len(upstream.Models))
 	seen := make(map[string]struct{}, len(upstream.Models))
 	for _, raw := range upstream.Models {
@@ -2104,7 +2062,7 @@ func normalizeDynamicProviderEndpoints(provider *providerRuntime, endpoints []st
 		if endpoint == "" {
 			continue
 		}
-		if provider != nil && provider.kind == providerTypeAnthropicCompatible && endpoint != providerEndpointMessages {
+		if provider != nil && !provider.acceptsDiscoveredModelEndpoint(endpoint) {
 			continue
 		}
 		if _, exists := seen[endpoint]; exists {
