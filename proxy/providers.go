@@ -314,6 +314,27 @@ func (ps *providerSetup) lookupModel(model string) (providerModel, bool) {
 	return pm, ok
 }
 
+func (ps *providerSetup) addProviderModels(providerID string, models []providerModel) error {
+	if ps == nil {
+		return nil
+	}
+
+	provider := ps.providerByID(providerID)
+	models = filterProviderModels(provider, models)
+
+	ps.modelsMu.Lock()
+	defer ps.modelsMu.Unlock()
+
+	return mergeProviderModels(ps.models, models)
+}
+
+func (ps *providerSetup) addStaticProviderModels(providerID string) error {
+	if ps == nil {
+		return nil
+	}
+	return ps.addProviderModels(providerID, orderedStaticProviderModels(ps.providerByID(providerID)))
+}
+
 func (ps *providerSetup) replaceProviderModels(providerID string, models []providerModel) error {
 	if ps == nil {
 		return nil
@@ -333,14 +354,24 @@ func (ps *providerSetup) replaceProviderModels(providerID string, models []provi
 		next[publicID] = model
 	}
 
-	for _, model := range models {
-		if existing, exists := next[model.publicID]; exists && existing.providerID != model.providerID {
-			return providerModelCollisionError(model.publicID, existing.providerID, model.providerID)
-		}
-		next[model.publicID] = model
+	if err := mergeProviderModels(next, models); err != nil {
+		return err
 	}
 
 	ps.models = next
+	return nil
+}
+
+func mergeProviderModels(dst map[string]providerModel, models []providerModel) error {
+	for _, model := range models {
+		if existing, exists := dst[model.publicID]; exists {
+			if existing.providerID == model.providerID {
+				continue
+			}
+			return providerModelCollisionError(model.publicID, existing.providerID, model.providerID)
+		}
+		dst[model.publicID] = model
+	}
 	return nil
 }
 
@@ -390,15 +421,9 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 	needsDynamicModelValidation := len(providers) > 1 && hasDynamicProvider(providers)
 
 	if !needsDynamicModelValidation {
-		for _, provider := range providers {
-			for _, model := range filterProviderModels(provider, orderedStaticProviderModels(provider)) {
-				if existing, exists := setup.models[model.publicID]; exists {
-					if existing.providerID == model.providerID {
-						continue
-					}
-					return nil, providerModelCollisionError(model.publicID, existing.providerID, model.providerID)
-				}
-				setup.models[model.publicID] = model
+		for _, providerID := range providerOrder {
+			if err := setup.addStaticProviderModels(providerID); err != nil {
+				return nil, err
 			}
 		}
 		return setup, nil
@@ -414,11 +439,8 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 	for _, providerID := range providerOrder {
 		provider := providers[providerID]
 		if !providerUsesDynamicModels(provider) {
-			for _, model := range filterProviderModels(provider, orderedStaticProviderModels(provider)) {
-				if existing, exists := setup.models[model.publicID]; exists {
-					return nil, providerModelCollisionError(model.publicID, existing.providerID, model.providerID)
-				}
-				setup.models[model.publicID] = model
+			if err := setup.addStaticProviderModels(providerID); err != nil {
+				return nil, err
 			}
 			continue
 		}
@@ -427,14 +449,8 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 		if err != nil {
 			return nil, fmt.Errorf("load models for provider %q: %w", provider.id, err)
 		}
-		for _, model := range filterProviderModels(provider, result.models) {
-			if existing, exists := setup.models[model.publicID]; exists {
-				if existing.providerID == model.providerID {
-					continue
-				}
-				return nil, providerModelCollisionError(model.publicID, existing.providerID, model.providerID)
-			}
-			setup.models[model.publicID] = model
+		if err := setup.addProviderModels(providerID, result.models); err != nil {
+			return nil, err
 		}
 	}
 
