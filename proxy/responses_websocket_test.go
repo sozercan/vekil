@@ -3210,3 +3210,66 @@ func inputTextFromMessage(t *testing.T, item map[string]interface{}) string {
 	}
 	return text
 }
+
+func TestResponsesWebSocketRememberPlannedResponseAppendsInputAndOutput(t *testing.T) {
+	t.Parallel()
+
+	session := &responsesWebSocketSession{
+		turnState:    "turn-state-1",
+		historyItems: []json.RawMessage{json.RawMessage(`{"type":"message","id":"old"}`)},
+	}
+	plan := responsesWebSocketRequestPlan{
+		signature:    "sig-1",
+		currentInput: []json.RawMessage{json.RawMessage(`{"type":"message","id":"new"}`)},
+	}
+	outputItems := []json.RawMessage{json.RawMessage(`{"type":"message","id":"out"}`)}
+
+	session.rememberPlannedResponse(plan, "resp-1", outputItems)
+
+	if session.turnState != "turn-state-1" {
+		t.Fatalf("turnState = %q, want preserved turn-state-1", session.turnState)
+	}
+	if session.lastResponseID != "resp-1" {
+		t.Fatalf("lastResponseID = %q, want resp-1", session.lastResponseID)
+	}
+	if session.lastSignature != "sig-1" {
+		t.Fatalf("lastSignature = %q, want sig-1", session.lastSignature)
+	}
+	if got, want := len(session.historyItems), 3; got != want {
+		t.Fatalf("history item count = %d, want %d", got, want)
+	}
+	if string(session.historyItems[1]) != string(plan.currentInput[0]) {
+		t.Fatalf("history current input = %s, want %s", session.historyItems[1], plan.currentInput[0])
+	}
+	if string(session.historyItems[2]) != string(outputItems[0]) {
+		t.Fatalf("history output = %s, want %s", session.historyItems[2], outputItems[0])
+	}
+}
+
+func TestResponsesWebSocketRememberPlannedResponseResetsCompactionTrigger(t *testing.T) {
+	t.Parallel()
+
+	session := &responsesWebSocketSession{
+		turnState:    "turn-state-1",
+		historyItems: []json.RawMessage{json.RawMessage(`{"type":"message","id":"old"}`)},
+	}
+	plan := responsesWebSocketRequestPlan{
+		signature:    "sig-compact",
+		currentInput: []json.RawMessage{json.RawMessage(`{"type":"compaction_trigger"}`)},
+	}
+
+	session.rememberPlannedResponse(plan, "resp-compact", nil)
+
+	if session.turnState != "" {
+		t.Fatalf("turnState = %q, want cleared", session.turnState)
+	}
+	if session.lastResponseID != "resp-compact" {
+		t.Fatalf("lastResponseID = %q, want resp-compact", session.lastResponseID)
+	}
+	if session.lastSignature != "sig-compact" {
+		t.Fatalf("lastSignature = %q, want sig-compact", session.lastSignature)
+	}
+	if len(session.historyItems) != 0 {
+		t.Fatalf("historyItems = %s, want reset empty history", session.historyItems)
+	}
+}
