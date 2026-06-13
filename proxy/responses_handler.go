@@ -68,6 +68,61 @@ func responsesUpstreamHeaders(extraHeaders http.Header, stream bool) http.Header
 	return headers
 }
 
+type preparedResponsesRequest struct {
+	body            []byte
+	extraHeaders    http.Header
+	upstreamHeaders http.Header
+	headerToolScope string
+	streaming       bool
+}
+
+func (h *ProxyHandler) prepareResponsesRequest(ctx context.Context, r *http.Request, bodyBytes []byte) preparedResponsesRequest {
+	extraHeaders := responsesExtraHeadersFromRequest(r)
+	headerToolScope := toolExecutionScopeFromHeaders(extraHeaders)
+	requestToolScope := responsesRequestToolExecutionScope(headerToolScope, bodyBytes)
+
+	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizers(ctx, bodyBytes, "responses", true, h.toolContexts, requestToolScope)
+	streaming := responsesRequestStreams(bodyBytes)
+
+	return preparedResponsesRequest{
+		body:            bodyBytes,
+		extraHeaders:    extraHeaders,
+		upstreamHeaders: responsesUpstreamHeaders(extraHeaders, streaming),
+		headerToolScope: headerToolScope,
+		streaming:       streaming,
+	}
+}
+
+func responsesRequestStreams(bodyBytes []byte) bool {
+	var partial struct {
+		Stream *bool `json:"stream,omitempty"`
+	}
+	_ = json.Unmarshal(bodyBytes, &partial)
+	return partial.Stream != nil && *partial.Stream
+}
+
+func (h *ProxyHandler) postPreparedResponsesRequest(ctx context.Context, req preparedResponsesRequest) (*http.Response, error) {
+	resp, err := h.postResponsesWithHeaders(ctx, req.body, req.upstreamHeaders)
+	if err != nil {
+		return nil, err
+	}
+	return h.maybeRetryCompactedResponsesRequest(ctx, req.body, req.extraHeaders, req.upstreamHeaders, resp)
+}
+
+func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWriter, endpoint string, err error) {
+	statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+	h.log.Error("upstream request failed", logger.F("endpoint", endpoint), logger.Err(err))
+	if statusCode == http.StatusBadRequest {
+		writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+		return
+	}
+	if statusCode == http.StatusInternalServerError {
+		writeOpenAIError(w, statusCode, "authentication failed", "server_error")
+		return
+	}
+	writeOpenAIUpstreamRequestFailure(w, statusCode, err)
+}
+
 // HandleResponses handles POST /v1/responses by forwarding the request to
 // Copilot's responses endpoint with only auth headers injected.
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
@@ -79,23 +134,12 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = r.Body.Close() }()
 
-	extraHeaders := responsesExtraHeadersFromRequest(r)
-	headerToolScope := toolExecutionScopeFromHeaders(extraHeaders)
-	requestToolScope := responsesRequestToolExecutionScope(headerToolScope, bodyBytes)
+	prepared := h.prepareResponsesRequest(r.Context(), r, bodyBytes)
 
-	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizers(r.Context(), bodyBytes, "responses", true, h.toolContexts, requestToolScope)
-
-	var partial struct {
-		Stream *bool `json:"stream,omitempty"`
-	}
-	_ = json.Unmarshal(bodyBytes, &partial)
-	isStreaming := partial.Stream != nil && *partial.Stream
-	upstreamHeaders := responsesUpstreamHeaders(extraHeaders, isStreaming)
-
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(isStreaming)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(prepared.streaming)
 	defer upstreamCancel()
 
-	if compactionResp, handled, err := h.maybeBuildResponsesCompactionTriggerResponse(upstreamCtx, bodyBytes, extraHeaders, isStreaming); handled || err != nil {
+	if compactionResp, handled, err := h.maybeBuildResponsesCompactionTriggerResponse(upstreamCtx, prepared.body, prepared.extraHeaders, prepared.streaming); handled || err != nil {
 		if err != nil {
 			statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 			h.log.Error("upstream request failed", logger.F("endpoint", "responses/compaction_trigger"), logger.Err(err))
@@ -110,44 +154,19 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := h.postResponsesWithHeaders(upstreamCtx, bodyBytes, upstreamHeaders)
+	resp, err := h.postPreparedResponsesRequest(upstreamCtx, prepared)
 	if err != nil {
-		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
-		h.log.Error("upstream request failed", logger.F("endpoint", "responses"), logger.Err(err))
-		if statusCode == http.StatusBadRequest {
-			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
-			return
-		}
-		if statusCode == http.StatusInternalServerError {
-			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
-			return
-		}
-		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
-		return
-	}
-	resp, err = h.maybeRetryCompactedResponsesRequest(upstreamCtx, bodyBytes, extraHeaders, upstreamHeaders, resp)
-	if err != nil {
-		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
-		h.log.Error("upstream request failed", logger.F("endpoint", "responses"), logger.Err(err))
-		if statusCode == http.StatusBadRequest {
-			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
-			return
-		}
-		if statusCode == http.StatusInternalServerError {
-			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
-			return
-		}
-		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
+		h.writeResponsesUpstreamRequestFailure(w, "responses", err)
 		return
 	}
 
-	if isStreaming && resp.StatusCode == http.StatusOK {
-		model := extractRequestModel(bodyBytes)
-		peekAndForwardResponses(h, w, r, resp, upstreamCancel, model, headerToolScope)
+	if prepared.streaming && resp.StatusCode == http.StatusOK {
+		model := extractRequestModel(prepared.body)
+		peekAndForwardResponses(h, w, r, resp, upstreamCancel, model, prepared.headerToolScope)
 		return
 	}
 
-	h.writeResponsesUpstreamResponse(w, resp, h.toolContexts, headerToolScope)
+	h.writeResponsesUpstreamResponse(w, resp, h.toolContexts, prepared.headerToolScope)
 }
 
 // compactPrompt is the system instruction used when the upstream does not
