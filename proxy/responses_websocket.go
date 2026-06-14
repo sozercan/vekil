@@ -347,11 +347,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 
 	if request.Generate != nil && !*request.Generate {
 		responseID := "vekil-ws-" + uuid.NewString()
-		if plan.hasCompactionTrigger() {
-			s.turnState = ""
-		}
-		resetHistory, historyInput := plan.historyUpdateInput()
-		s.rememberResponse(resetHistory, responseID, plan.signature, historyInput, nil)
+		s.rememberPlannedResponse(plan, responseID, nil)
 		s.logRequestMetrics(h, request, responseID, metrics)
 		if err := s.writeJSON(map[string]interface{}{
 			"type": "response.created",
@@ -422,11 +418,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return err
 	}
 
-	resetHistory, historyInput := plan.historyUpdateInput()
-	if plan.hasCompactionTrigger() {
-		s.turnState = ""
-	}
-	s.rememberResponse(resetHistory, responseID, plan.signature, historyInput, outputItems)
+	s.rememberPlannedResponse(plan, responseID, outputItems)
 	metrics = s.maybeAutoCompactHistory(h, request, metrics)
 	s.logRequestMetrics(h, request, responseID, metrics)
 	return nil
@@ -610,6 +602,14 @@ func (s *responsesWebSocketSession) rememberResponse(resetHistory bool, response
 	}
 	s.historyItems = append(s.historyItems, currentInput...)
 	s.historyItems = append(s.historyItems, outputItems...)
+}
+
+func (s *responsesWebSocketSession) rememberPlannedResponse(plan responsesWebSocketRequestPlan, responseID string, outputItems []json.RawMessage) {
+	if plan.hasCompactionTrigger() {
+		s.turnState = ""
+	}
+	resetHistory, historyInput := plan.historyUpdateInput()
+	s.rememberResponse(resetHistory, responseID, plan.signature, historyInput, outputItems)
 }
 
 func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, request *responsesWebSocketCreateRequest, metrics responsesWebSocketRequestMetrics) responsesWebSocketRequestMetrics {

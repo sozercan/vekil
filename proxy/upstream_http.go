@@ -127,7 +127,7 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 	if provider == nil {
 		return nil, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no provider available for endpoint %s", endpoint)}
 	}
-	if !providerSupportsEndpoint(provider, endpoint) {
+	if !provider.supportsEndpoint(endpoint) {
 		return nil, nil, &providerRequestError{
 			statusCode: http.StatusBadRequest,
 			err:        fmt.Errorf("provider %q does not support %s", provider.id, endpoint),
@@ -139,7 +139,7 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 			err:        fmt.Errorf("model %q does not support %s", model, endpoint),
 		}
 	}
-	if !known && !providerAllowsUnknownModelEndpoint(provider, endpoint) {
+	if !known && !provider.allowsUnknownModelEndpoint(endpoint) {
 		return nil, nil, &providerRequestError{
 			statusCode: http.StatusBadRequest,
 			err:        fmt.Errorf("model %q does not support %s", model, endpoint),
@@ -151,36 +151,6 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 		return nil, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
 	return provider, rewrittenBody, nil
-}
-
-func providerSupportsEndpoint(provider *providerRuntime, endpoint string) bool {
-	if provider == nil {
-		return false
-	}
-	switch provider.kind {
-	case providerTypeOpenAICodex:
-		return supportsEndpoint(openAICodexProviderEndpoints, endpoint)
-	case providerTypeOpenAICompatible:
-		return endpoint == providerEndpointChatCompletions || endpoint == providerEndpointResponses
-	case providerTypeAnthropicCompatible:
-		return endpoint == providerEndpointMessages
-	default:
-		return true
-	}
-}
-
-func providerAllowsUnknownModelEndpoint(provider *providerRuntime, endpoint string) bool {
-	if provider == nil {
-		return false
-	}
-	switch provider.kind {
-	case providerTypeOpenAICompatible:
-		return providerUsesDynamicModels(provider) && endpoint == providerEndpointChatCompletions
-	case providerTypeAnthropicCompatible:
-		return providerUsesDynamicModels(provider) && endpoint == providerEndpointMessages
-	default:
-		return true
-	}
 }
 
 func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body []byte) (*http.Response, error) {
