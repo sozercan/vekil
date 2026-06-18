@@ -85,7 +85,7 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 	}
 
 	// Parallel tool calls
-	if len(oaiReq.Tools) > 0 {
+	if len(oaiReq.Tools) > 0 && (req.ToolChoice == nil || !strings.EqualFold(strings.TrimSpace(req.ToolChoice.Type), "none")) {
 		parallelToolCalls := true
 		if req.ToolChoice != nil && req.ToolChoice.DisableParallelToolUse != nil && *req.ToolChoice.DisableParallelToolUse {
 			parallelToolCalls = false
@@ -188,12 +188,16 @@ func translateMessage(msg models.AnthropicMessage) ([]models.OpenAIMessage, erro
 			multimodalParts = append(multimodalParts, *part)
 
 		case "tool_use":
+			arguments := block.Input
+			if !json.Valid(arguments) {
+				arguments = json.RawMessage(`{}`)
+			}
 			toolCalls = append(toolCalls, models.OpenAIToolCall{
 				ID:   block.ID,
 				Type: "function",
 				Function: models.OpenAIFunctionCall{
 					Name:      block.Name,
-					Arguments: string(block.Input),
+					Arguments: string(arguments),
 				},
 			})
 
@@ -357,12 +361,31 @@ func MapStopReason(finishReason *string) string {
 		return "end_turn"
 	case "length":
 		return "max_tokens"
-	case "tool_calls":
+	case "tool_calls", "function_call":
 		return "tool_use"
 	case "content_filter":
 		return "end_turn"
 	default:
 		return "end_turn"
+	}
+}
+
+func openAIUsageToAnthropicUsage(usage *models.OpenAIUsage) models.AnthropicUsage {
+	if usage == nil {
+		return models.AnthropicUsage{}
+	}
+	cachedTokens := 0
+	if usage.PromptTokensDetails != nil && usage.PromptTokensDetails.CachedTokens > 0 {
+		cachedTokens = usage.PromptTokensDetails.CachedTokens
+	}
+	inputTokens := usage.PromptTokens - cachedTokens
+	if inputTokens < 0 {
+		inputTokens = 0
+	}
+	return models.AnthropicUsage{
+		InputTokens:          inputTokens,
+		CacheReadInputTokens: cachedTokens,
+		OutputTokens:         usage.CompletionTokens,
 	}
 }
 
@@ -425,10 +448,7 @@ func TranslateOpenAIToAnthropic(resp *models.OpenAIResponse, model string) *mode
 	}
 
 	if resp.Usage != nil {
-		result.Usage = models.AnthropicUsage{
-			InputTokens:  resp.Usage.PromptTokens,
-			OutputTokens: resp.Usage.CompletionTokens,
-		}
+		result.Usage = openAIUsageToAnthropicUsage(resp.Usage)
 	}
 
 	return result

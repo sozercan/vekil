@@ -94,3 +94,21 @@ To use it:
 This workflow is intentionally separate from the normal CI workflow so pull requests and forked builds remain deterministic and do not depend on live provider credentials.
 
 You can also run the same smoke scripts locally after building `vekil`; the CLI smoke script additionally requires those three CLIs to be installed.
+
+## Extending vekil
+
+### Add a tool optimizer provider
+
+- Add a new `type` case in `newToolOptimizerFromConfig` and a constructor in `proxy/`.
+- Keep optimizers opt-in and disabled by default.
+- Fail open: errors, timeouts, invalid JSON, or invalid replacements must preserve the original payload.
+- Add config validation and tests for the new provider type.
+- See [`tool-optimizers.md`](tool-optimizers.md) for the config protocols (`rtk_cli`, `exec_json`, and `noop`).
+
+### Add or extend a provider type
+
+- Register the provider kind in `proxy/providers.go` and its endpoint policy in `proxy/provider_endpoint_policy.go`.
+- Keep upstream deployment names internal to provider config; public model IDs remain global.
+- Treat `models[].endpoints` as a verified allowlist. Do not advertise routes that have not been tested for that provider/model.
+- Preserve startup failure on public-model-ID collisions.
+- Cross-link config examples in [`provider-routing.md`](provider-routing.md) instead of duplicating YAML here.

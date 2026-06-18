@@ -22,24 +22,7 @@ Run session benchmark: `go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesSes
 
 ## Documentation
 
-Documentation is intentionally split under `docs/` into small, single-purpose files:
-
-| File | Scope |
-|------|-------|
-| `README.md` | Short landing page only |
-| `docs/README.md` | Documentation index and doc map |
-| `docs/getting-started.md` | install, run, first auth, deployment entry points |
-| `docs/configuration.md` | configuration map, generic flags/env vars, Copilot header overrides |
-| `docs/provider-routing.md` | provider auth, JSON/YAML routing, model ownership, endpoint allowlists |
-| `docs/tool-optimizers.md` | optional shell command rewrite and tool-output reduction config |
-| `docs/responses-websocket.md` | Codex-style websocket bridge tuning and compaction knobs |
-| `docs/clients.md` | copy-paste client examples |
-| `docs/api.md` | concise endpoint map and compatibility links |
-| `docs/gemini.md` | Gemini translation compatibility details |
-| `docs/responses.md` | OpenAI Responses, compact, and memory shim details |
-| `docs/architecture.md` | package boundaries and design notes |
-| `docs/menubar.md` | macOS/Linux tray app usage |
-| `docs/development.md` | build, test, benchmark, CI |
+Per-doc scope and update triggers live in `docs/README.md` (the authoritative doc map). Keep that file indexed whenever docs are added, removed, or behavior changes.
 
 Documentation update rules:
 
@@ -50,27 +33,17 @@ Documentation update rules:
 
 ## Architecture
 
-| Package | Purpose |
-|---------|---------|
-| `main.go` | CLI entry, flags (including JSON/YAML providers config), signal handling |
-| `auth/` | GitHub OAuth device code flow and Copilot token caching/refresh (`sync.RWMutex` + double-check) |
-| `proxy/chat_handlers.go` | Anthropic and OpenAI chat handlers, including forced-streaming aggregation for tool calls |
-| `proxy/responses_handler.go` | OpenAI Responses passthrough plus Codex compatibility endpoints (`/v1/responses/compact`, `/v1/memories/trace_summarize`) |
-| `proxy/tool_optimizer*.go`, `proxy/optimizer_*.go` | Optional `/v1/responses` tool optimizer configuration and provider adapters for shell command rewrite/output reduction |
-| `proxy/handler.go` | Shared proxy plumbing: health/ready/models handlers, request-body decoding, provider-aware model catalogs, provider headers, caches |
-| `proxy/providers.go` | JSON/YAML provider config loading, model ownership, Azure metadata overlay, endpoint allowlists, and routing state |
-| `proxy/upstream_http.go` | Provider selection, public→upstream model rewriting, and provider-specific upstream HTTP dispatch |
-| `proxy/openai_codex_auth.go` | OpenAI Codex CLI auth.json loading, refresh, and request credentials |
-| `proxy/gemini_handler.go` | Gemini-native HTTP handlers and countTokens probe flow |
-| `proxy/gemini.go` | Gemini↔OpenAI request/response translation and validation |
-| `proxy/gemini_streaming.go` | OpenAI SSE → Gemini SSE translation |
-| `proxy/translator.go` | Bidirectional Anthropic↔OpenAI request/response translation |
-| `proxy/streaming.go` | SSE stream translation (OpenAI→Anthropic events) and aggregation |
-| `proxy/retry.go` | Exponential backoff on 429/502/503/504 |
-| `models/` | Data-only structs for Anthropic and OpenAI API types (no logic) |
-| `logger/` | Structured JSON logger to stderr |
-| `server/` | HTTP server lifecycle (`Start`/`Stop`/`IsRunning`) |
-| `cmd/menubar/` | tray app binary |
+| Area | Purpose |
+|------|---------|
+| `main.go`, `server/`, `auth/`, `logger/`, `models/`, `cmd/menubar/` | CLI/server lifecycle, GitHub auth, structured logging, data-only API structs, tray app |
+| `proxy/chat_handlers.go`, `proxy/translator.go`, `proxy/streaming.go`, `proxy/openai_stream_reader.go` | Anthropic/OpenAI chat translation, forced-stream aggregation, SSE translation and passthrough |
+| `proxy/gemini*.go` | Gemini-native handlers plus Gemini↔OpenAI request/response and streaming translation |
+| `proxy/providers.go`, `proxy/provider_endpoint_policy.go`, `proxy/upstream_http.go`, `proxy/openai_codex_auth.go`, `proxy/azure_identity_auth.go` | Provider config, model ownership, endpoint allowlists, model rewrite, provider auth, upstream request construction |
+| `proxy/responses_handler.go`, `proxy/responses_websocket.go`, `proxy/responses_failure_translate.go`, `proxy/compaction.go` | OpenAI Responses passthrough, compact/memory shims, proxy-owned websocket bridge, compaction/replay behavior, Responses failure translation |
+| `proxy/tool_optimizer*.go`, `proxy/optimizer_*.go`, `proxy/tool_output_context.go`, `proxy/tool_shapes.go`, `proxy/filter_hint.go` | Optional fail-open tool command/output optimizers and tool-shape/context helpers |
+| `proxy/retry.go`, `proxy/upstream_error_detail.go`, shared helpers in `proxy/handler.go` | Retry/backoff, upstream error summaries, request body limits, headers, health/ready/models handlers, caches |
+
+New `proxy/*.go` files should join one of these responsibility clusters. Add a new row only when a genuinely new responsibility appears.
 
 ## Key Design Decisions
 

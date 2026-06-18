@@ -778,8 +778,8 @@ func TestHandleAnthropicUpstreamError(t *testing.T) {
 	if err := json.Unmarshal(body, &errResp); err != nil {
 		t.Fatalf("failed to parse error response: %v", err)
 	}
-	if errResp.Error.Type != "api_error" {
-		t.Errorf("expected error type api_error, got %q", errResp.Error.Type)
+	if errResp.Error.Type != "invalid_request_error" {
+		t.Errorf("expected error type invalid_request_error, got %q", errResp.Error.Type)
 	}
 	for _, want := range []string{"upstream error (400)", "tool schema is invalid", "type=invalid_request_error", "param=tools.0", "code=invalid_tool_schema"} {
 		if !strings.Contains(errResp.Error.Message, want) {
@@ -6749,11 +6749,12 @@ func TestHandleOpenAIChatCompletions_RejectsConfiguredAzureModelWithoutChatSuppo
 		logger.New(logger.LevelInfo),
 		WithProvidersConfig(ProvidersConfig{
 			Providers: []ProviderConfig{{
-				ID:        "azure",
-				Type:      "azure-openai",
-				Default:   true,
-				BaseURL:   "https://example.openai.azure.com/openai",
-				APIKeyEnv: "TEST_AZURE_API_KEY",
+				ID:         "azure",
+				Type:       "azure-openai",
+				Default:    true,
+				BaseURL:    "https://example.openai.azure.com/openai",
+				APIVersion: "2025-04-01-preview",
+				APIKeyEnv:  "TEST_AZURE_API_KEY",
 				Models: []ProviderModelConfig{{
 					PublicID:   "gpt-5.4-pro",
 					Deployment: "gpt-5.4-pro",
@@ -6803,11 +6804,12 @@ func TestHandleResponses_RejectsConfiguredAzureModelWithoutResponsesSupport(t *t
 		logger.New(logger.LevelInfo),
 		WithProvidersConfig(ProvidersConfig{
 			Providers: []ProviderConfig{{
-				ID:        "azure",
-				Type:      "azure-openai",
-				Default:   true,
-				BaseURL:   "https://example.openai.azure.com/openai",
-				APIKeyEnv: "TEST_AZURE_API_KEY",
+				ID:         "azure",
+				Type:       "azure-openai",
+				Default:    true,
+				BaseURL:    "https://example.openai.azure.com/openai",
+				APIVersion: "2025-04-01-preview",
+				APIKeyEnv:  "TEST_AZURE_API_KEY",
 				Models: []ProviderModelConfig{{
 					PublicID:   "gpt-5.4-pro",
 					Deployment: "gpt-5.4-pro",
@@ -7008,10 +7010,11 @@ func TestNewProxyHandler_FailsWhenProvidersSharePlainModelID(t *testing.T) {
 					Default: true,
 				},
 				{
-					ID:        "azure",
-					Type:      "azure-openai",
-					BaseURL:   "https://example.openai.azure.com/openai/v1",
-					APIKeyEnv: "TEST_AZURE_API_KEY",
+					ID:         "azure",
+					Type:       "azure-openai",
+					BaseURL:    "https://example.openai.azure.com/openai/v1",
+					APIVersion: "2025-04-01-preview",
+					APIKeyEnv:  "TEST_AZURE_API_KEY",
 					Models: []ProviderModelConfig{{
 						PublicID:   "gpt-5.4",
 						Deployment: "gpt-5-4-prod",
@@ -7060,11 +7063,12 @@ func TestNewProxyHandler_FailsWhenOpenAICodexModelCollidesWithAzure(t *testing.T
 					BaseURL: codexServer.URL,
 				},
 				{
-					ID:        "azure",
-					Type:      "azure-openai",
-					Default:   true,
-					BaseURL:   "https://example.openai.azure.com/openai/v1",
-					APIKeyEnv: "TEST_AZURE_API_KEY",
+					ID:         "azure",
+					Type:       "azure-openai",
+					Default:    true,
+					BaseURL:    "https://example.openai.azure.com/openai/v1",
+					APIVersion: "2025-04-01-preview",
+					APIKeyEnv:  "TEST_AZURE_API_KEY",
 					Models: []ProviderModelConfig{{
 						PublicID:   "gpt-5.4",
 						Deployment: "gpt-5-4-prod",
@@ -7355,10 +7359,11 @@ func TestNewProxyHandler_AllowsDuplicateModelIDsWithinSameProvider(t *testing.T)
 					Default: true,
 				},
 				{
-					ID:        "azure",
-					Type:      "azure-openai",
-					BaseURL:   "https://example.openai.azure.com/openai/v1",
-					APIKeyEnv: "TEST_AZURE_API_KEY",
+					ID:         "azure",
+					Type:       "azure-openai",
+					BaseURL:    "https://example.openai.azure.com/openai/v1",
+					APIVersion: "2025-04-01-preview",
+					APIKeyEnv:  "TEST_AZURE_API_KEY",
 					Models: []ProviderModelConfig{{
 						PublicID:   "gpt-5.4-pro",
 						Deployment: "gpt-5-4-pro",
@@ -7441,10 +7446,11 @@ func TestHandleResponses_AllowsMergedDuplicateDynamicProviderEndpoints(t *testin
 					Default: true,
 				},
 				{
-					ID:        "azure",
-					Type:      "azure-openai",
-					BaseURL:   "https://example.openai.azure.com/openai/v1",
-					APIKeyEnv: "TEST_AZURE_API_KEY",
+					ID:         "azure",
+					Type:       "azure-openai",
+					BaseURL:    "https://example.openai.azure.com/openai/v1",
+					APIVersion: "2025-04-01-preview",
+					APIKeyEnv:  "TEST_AZURE_API_KEY",
 					Models: []ProviderModelConfig{{
 						PublicID:   "gpt-5.4-pro",
 						Deployment: "gpt-5-4-pro",
@@ -10108,5 +10114,127 @@ func TestHandleOpenAIChatCompletions_RoutesConfiguredAzureIdentityProvider(t *te
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestProviderResolutionFailuresSurfaceRealCauseAcrossPublicSurfaces(t *testing.T) {
+	handler := &ProxyHandler{
+		auth:       auth.NewTestAuthenticator("test-token"),
+		log:        logger.New(logger.LevelError),
+		copilotURL: "http://upstream.test",
+		providersState: &providerSetup{
+			providers:         map[string]*providerRuntime{},
+			providerOrder:     nil,
+			defaultProviderID: "missing",
+			models:            map[string]providerModel{},
+		},
+	}
+
+	tests := []struct {
+		name        string
+		path        string
+		body        string
+		handle      func(http.ResponseWriter, *http.Request)
+		wantMessage string
+		anthropic   bool
+	}{
+		{
+			name:        "openai chat",
+			path:        "/v1/chat/completions",
+			body:        `{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`,
+			handle:      handler.HandleOpenAIChatCompletions,
+			wantMessage: "no provider available for endpoint /chat/completions",
+		},
+		{
+			name:        "anthropic messages",
+			path:        "/v1/messages",
+			body:        `{"model":"claude-sonnet-4","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`,
+			handle:      handler.HandleAnthropicMessages,
+			wantMessage: "no provider available for endpoint /chat/completions",
+			anthropic:   true,
+		},
+		{
+			name:        "responses",
+			path:        "/v1/responses",
+			body:        `{"model":"gpt-5","input":"hi"}`,
+			handle:      handler.HandleResponses,
+			wantMessage: "no provider available for endpoint /responses",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			tt.handle(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != http.StatusInternalServerError {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("StatusCode = %d, want 500: %s", resp.StatusCode, string(body))
+			}
+			body, _ := io.ReadAll(resp.Body)
+			if !strings.Contains(string(body), tt.wantMessage) {
+				t.Fatalf("response body = %s, want real provider error %q", string(body), tt.wantMessage)
+			}
+			for _, forbidden := range []string{"authentication failed", "upstream request failed"} {
+				if strings.Contains(string(body), forbidden) {
+					t.Fatalf("response body = %s, should not contain generic message %q", string(body), forbidden)
+				}
+			}
+		})
+	}
+}
+
+func TestStripUnsupportedResponsesRequestFields_RemovesSamplingForCodexOnly(t *testing.T) {
+	body := []byte(`{"model":"gpt-5-codex","input":"hi","top_p":0.9,"temperature":0.2}`)
+
+	codex := &providerRuntime{kind: providerTypeOpenAICodex}
+	rewritten, fields := stripUnsupportedResponsesRequestFields(body, codex)
+	if !reflect.DeepEqual(fields, []string{"top_p", "temperature"}) {
+		t.Fatalf("stripped fields = %#v, want top_p and temperature", fields)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(rewritten, &payload); err != nil {
+		t.Fatalf("unmarshal rewritten body: %v", err)
+	}
+	if _, ok := payload["top_p"]; ok {
+		t.Fatalf("top_p was not stripped: %s", rewritten)
+	}
+	if _, ok := payload["temperature"]; ok {
+		t.Fatalf("temperature was not stripped: %s", rewritten)
+	}
+
+	copilot := &providerRuntime{kind: providerTypeCopilot}
+	rewritten, fields = stripUnsupportedResponsesRequestFields(body, copilot)
+	if len(fields) != 0 {
+		t.Fatalf("copilot stripped fields = %#v, want none", fields)
+	}
+	if string(rewritten) != string(body) {
+		t.Fatalf("copilot body changed: got %s want %s", rewritten, body)
+	}
+}
+
+func TestSyntheticResponsesStoreFalseOnlyForProxyBuiltRequests(t *testing.T) {
+	handler := &ProxyHandler{copilotURL: "https://api.githubcopilot.com"}
+	fields := map[string]json.RawMessage{
+		"model": json.RawMessage(`"gpt-5"`),
+		"input": json.RawMessage(`"hi"`),
+	}
+
+	handler.setSyntheticResponsesStoreFalse(fields)
+	if got := strings.TrimSpace(string(fields["store"])); got != "false" {
+		t.Fatalf("synthetic store = %q, want false", got)
+	}
+
+	passthrough := handler.rewriteResponsesRequestBody([]byte(`{"model":"gpt-5","input":"hi"}`), "responses", true)
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(passthrough, &payload); err != nil {
+		t.Fatalf("unmarshal passthrough body: %v", err)
+	}
+	if _, ok := payload["store"]; ok {
+		t.Fatalf("passthrough rewrite unexpectedly added store: %s", passthrough)
 	}
 }

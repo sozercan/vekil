@@ -22,6 +22,7 @@ import (
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
+	"golang.org/x/net/http2"
 )
 
 const (
@@ -239,6 +240,9 @@ type ProxyHandler struct {
 	toolOptimizers                  *ToolOptimizerManager
 	toolContexts                    *ToolExecutionContextStore
 	responsesWS                     ResponsesWebSocketConfig
+	responsesWSSessionsMu           sync.Mutex
+	responsesWSSessions             map[*responsesWebSocketSession]struct{}
+	responsesWSDraining             bool
 	streamingUpstreamTimeout        time.Duration
 	compactChunkBodyBytes           int
 	compactChunkConfigured          bool
@@ -413,19 +417,39 @@ func WithCompactUpstreamMaxAttempts(max int) Option {
 	}
 }
 
+func newInferenceTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 100
+	transport.MaxIdleConnsPerHost = 100
+	transport.IdleConnTimeout = 55 * time.Second
+	transport.ForceAttemptHTTP2 = true
+
+	tlsConfig := transport.TLSClientConfig
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{}
+	} else {
+		tlsConfig = tlsConfig.Clone()
+	}
+	tlsConfig.MinVersion = tls.VersionTLS12
+	if tlsConfig.ClientSessionCache == nil {
+		tlsConfig.ClientSessionCache = tls.NewLRUClientSessionCache(0)
+	}
+	transport.TLSClientConfig = tlsConfig
+
+	if h2Transport, err := http2.ConfigureTransports(transport); err == nil {
+		h2Transport.ReadIdleTimeout = 30 * time.Second
+		h2Transport.PingTimeout = 15 * time.Second
+	}
+
+	return transport
+}
+
 // NewProxyHandler creates a ProxyHandler with connection pooling and HTTP/2.
 func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) (*ProxyHandler, error) {
 	h := &ProxyHandler{
 		auth: a,
 		client: &http.Client{
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
-				TLSHandshakeTimeout: 10 * time.Second,
-				ForceAttemptHTTP2:   true,
-				TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
-			},
+			Transport: newInferenceTransport(),
 		},
 		copilotURL: "https://api.githubcopilot.com",
 		// Keep global Copilot header overrides empty by default. Header application
@@ -815,10 +839,6 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
-		if statusCode == http.StatusInternalServerError {
-			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
-			return
-		}
 		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
 		return
 	}
@@ -1175,29 +1195,75 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, message str
 	})
 }
 
+var upstreamRequestIDHeaderNames = []string{"X-Request-Id", "X-Azure-Request-Id", "Openai-Request-Id"}
+
+// UpstreamRequestID returns the first recognized upstream request id from headers.
+func UpstreamRequestID(headers http.Header) string {
+	for _, name := range upstreamRequestIDHeaderNames {
+		if value := headers.Get(name); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func writeOpenAIErrorWithRetryAfter(w http.ResponseWriter, status int, message, errType, retryAfter string, upstreamHeaders http.Header) {
+	writeOpenAIErrorWithRetryAfterDetails(w, status, message, errType, retryAfter, upstreamHeaders, "", "")
+}
+
+func writeOpenAIErrorWithRetryAfterDetails(w http.ResponseWriter, status int, message, errType, retryAfter string, upstreamHeaders http.Header, param, code string) {
 	w.Header().Set("Content-Type", "application/json")
 	if retryAfter != "" {
 		w.Header().Set("Retry-After", retryAfter)
 	}
-	for _, name := range []string{"X-Request-Id", "X-Azure-Request-Id", "Openai-Request-Id"} {
+	for _, name := range upstreamRequestIDHeaderNames {
 		for _, value := range headerValuesCI(upstreamHeaders, name) {
 			w.Header().Add(name, value)
 		}
+	}
+	var paramValue interface{}
+	if strings.TrimSpace(param) != "" {
+		paramValue = strings.TrimSpace(param)
+	}
+	var codeValue interface{}
+	if strings.TrimSpace(code) != "" {
+		codeValue = strings.TrimSpace(code)
 	}
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": map[string]interface{}{
 			"message": message,
 			"type":    errType,
-			"param":   nil,
-			"code":    nil,
+			"param":   paramValue,
+			"code":    codeValue,
 		},
 	})
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, message, errType string) {
 	writeOpenAIErrorWithRetryAfter(w, status, message, errType, "", nil)
+}
+
+func writeOpenAIRequestBodyError(w http.ResponseWriter, status int, err error) {
+	message := err.Error()
+	code := ""
+	if status == http.StatusRequestEntityTooLarge {
+		code = "request_too_large"
+	}
+	writeOpenAIErrorWithDetails(w, status, message, "invalid_request_error", "", code)
+}
+
+func jsonDecodeErrorDetails(err error, fallback string) (string, string) {
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) && strings.TrimSpace(typeErr.Field) != "" {
+		field := strings.TrimSpace(typeErr.Field)
+		return fmt.Sprintf("invalid value for field %q: expected %s", field, typeErr.Type), field
+	}
+	return fallback, ""
+}
+
+func writeOpenAIErrorWithDetails(w http.ResponseWriter, status int, message, errType, param, code string) {
+	writeOpenAIErrorWithRetryAfterDetails(w, status, message, errType, "", nil, param, code)
 }
 
 // readBody reads the request body up to maxRequestBodySize. If the body exceeds

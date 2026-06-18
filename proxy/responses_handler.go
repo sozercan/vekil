@@ -116,10 +116,6 @@ func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWrite
 		writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
 		return
 	}
-	if statusCode == http.StatusInternalServerError {
-		writeOpenAIError(w, statusCode, "authentication failed", "server_error")
-		return
-	}
 	writeOpenAIUpstreamRequestFailure(w, statusCode, err)
 }
 
@@ -129,12 +125,13 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
-		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
+		writeOpenAIRequestBodyError(w, status, err)
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
 
 	prepared := h.prepareResponsesRequest(r.Context(), r, bodyBytes)
+	h.observeRequestSummary(r.Context(), "responses", extractRequestModel(prepared.body), prepared.streaming, providerEndpointResponses)
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(prepared.streaming)
 	defer upstreamCancel()
@@ -159,6 +156,8 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		h.writeResponsesUpstreamRequestFailure(w, "responses", err)
 		return
 	}
+
+	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	if prepared.streaming && resp.StatusCode == http.StatusOK {
 		model := extractRequestModel(prepared.body)
@@ -236,6 +235,60 @@ type compactBudget struct {
 	max           int
 	learnedTarget int
 	resolvedModel string
+	usage         responsesUsageTotals
+}
+
+type responsesUsageTotals struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+	TotalTokens  int `json:"total_tokens"`
+}
+
+func (b *compactBudget) addResponsesUsage(body []byte) {
+	if b == nil {
+		return
+	}
+	usage := extractResponsesUsageTotals(body)
+	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.usage.InputTokens += usage.InputTokens
+	b.usage.OutputTokens += usage.OutputTokens
+	b.usage.TotalTokens += usage.TotalTokens
+}
+
+func (b *compactBudget) responsesUsage() map[string]interface{} {
+	if b == nil {
+		return zeroResponsesUsage()
+	}
+	b.mu.Lock()
+	usage := b.usage
+	b.mu.Unlock()
+	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
+		return zeroResponsesUsage()
+	}
+	if usage.TotalTokens == 0 {
+		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+	}
+	return map[string]interface{}{
+		"input_tokens":          usage.InputTokens,
+		"input_tokens_details":  nil,
+		"output_tokens":         usage.OutputTokens,
+		"output_tokens_details": nil,
+		"total_tokens":          usage.TotalTokens,
+	}
+}
+
+func extractResponsesUsageTotals(body []byte) responsesUsageTotals {
+	var envelope struct {
+		Usage responsesUsageTotals `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &envelope); err == nil {
+		return envelope.Usage
+	}
+	return responsesUsageTotals{}
 }
 
 func newCompactBudget(max int) *compactBudget {
@@ -362,7 +415,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
-		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
+		writeOpenAIRequestBodyError(w, status, err)
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
@@ -385,10 +438,6 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("upstream request failed", logger.F("endpoint", "compact"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
 			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
-			return
-		}
-		if statusCode == http.StatusInternalServerError {
-			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
 			return
 		}
 		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
@@ -425,7 +474,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
 		status := readBodyStatusCode(err)
-		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
+		writeOpenAIRequestBodyError(w, status, err)
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
@@ -436,9 +485,12 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		Reasoning json.RawMessage   `json:"reasoning,omitempty"`
 	}
 	if err := json.Unmarshal(bodyBytes, &memReq); err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
+		message, param := jsonDecodeErrorDetails(err, "invalid JSON in request body")
+		writeOpenAIErrorWithDetails(w, http.StatusBadRequest, message, "invalid_request_error", param, "")
 		return
 	}
+
+	h.observeRequestSummary(r.Context(), "memory_summarize", memReq.Model, false, providerEndpointResponses)
 
 	tracesJSON, _ := json.Marshal(memReq.Traces)
 	userContent := "Summarize the following session traces:\n\n" + string(tracesJSON)
@@ -456,6 +508,9 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 			},
 		},
 	}
+	if h.shouldSetSyntheticResponsesStoreFalse(memReq.Model) {
+		responsesReq["store"] = false
+	}
 	if len(memReq.Reasoning) > 0 && string(memReq.Reasoning) != "null" {
 		responsesReq["reasoning"] = json.RawMessage(memReq.Reasoning)
 	}
@@ -470,10 +525,6 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		h.log.Error("upstream request failed", logger.F("endpoint", "memory_summarize"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
 			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
-			return
-		}
-		if statusCode == http.StatusInternalServerError {
-			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
 			return
 		}
 		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
@@ -622,6 +673,26 @@ func writeCompactResponse(w http.ResponseWriter, summaryText string, retainedOut
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(compactResp)
+}
+
+func (h *ProxyHandler) setSyntheticResponsesStoreFalse(requestFields map[string]json.RawMessage) {
+	if requestFields == nil || !h.shouldSetSyntheticResponsesStoreFalse(rawJSONString(requestFields["model"])) {
+		return
+	}
+	requestFields["store"] = json.RawMessage("false")
+}
+
+func (h *ProxyHandler) shouldSetSyntheticResponsesStoreFalse(model string) bool {
+	provider, _, _ := h.resolveProviderModel(strings.TrimSpace(model), providerEndpointResponses)
+	if provider == nil {
+		return false
+	}
+	switch provider.kind {
+	case providerTypeCopilot, providerTypeOpenAICodex, providerTypeOpenAICompatible, providerTypeAzureOpenAI:
+		return true
+	default:
+		return false
+	}
 }
 
 type compactInflightCall struct {
@@ -817,6 +888,7 @@ func (h *ProxyHandler) compactResponsesRequestWithBudget(ctx context.Context, re
 		)
 	}
 
+	h.setSyntheticResponsesStoreFalse(requestFields)
 	targetBodySize := h.effectiveCompactChunkBodyBytes()
 	learnedTarget, learned := h.learnedCompactTargetForRequest(requestFields, targetBodySize)
 	if learned {
@@ -873,6 +945,7 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 		if err != nil {
 			return "", nil, err
 		}
+		budget.addResponsesUsage(respBody)
 		summary, err := extractResponsesOutputText(respBody)
 		if err != nil {
 			return "", nil, err
@@ -1858,7 +1931,8 @@ func stripUnsupportedResponsesRequestFields(bodyBytes []byte, provider *provider
 	}
 
 	unsupportedToolTypes := unsupportedResponsesToolTypes(provider)
-	if len(unsupportedToolTypes) == 0 {
+	unsupportedSamplingFields := unsupportedResponsesSamplingFields(provider)
+	if len(unsupportedToolTypes) == 0 && len(unsupportedSamplingFields) == 0 {
 		return bodyBytes, nil
 	}
 
@@ -1867,44 +1941,51 @@ func stripUnsupportedResponsesRequestFields(bodyBytes []byte, provider *provider
 		return bodyBytes, nil
 	}
 
-	rawTools, ok := payload["tools"]
-	if !ok {
-		return bodyBytes, nil
-	}
-
-	var tools []json.RawMessage
-	if err := json.Unmarshal(rawTools, &tools); err != nil {
-		return bodyBytes, nil
-	}
-
-	filteredTools := make([]json.RawMessage, 0, len(tools))
-	strippedFields := make([]string, 0, len(tools)+1)
-	strippedToolTypes := make(map[string]struct{})
-	for i, rawTool := range tools {
-		toolType := responsesToolType(rawTool)
-		if _, unsupported := unsupportedToolTypes[toolType]; unsupported {
-			strippedFields = append(strippedFields, fmt.Sprintf("tools[%d]", i))
-			strippedToolTypes[toolType] = struct{}{}
-			continue
+	strippedFields := make([]string, 0, len(unsupportedSamplingFields)+1)
+	for _, field := range unsupportedSamplingFields {
+		if _, ok := payload[field]; ok {
+			delete(payload, field)
+			strippedFields = append(strippedFields, field)
 		}
-		filteredTools = append(filteredTools, rawTool)
+	}
+
+	if len(unsupportedToolTypes) > 0 {
+		rawTools, ok := payload["tools"]
+		if ok {
+			var tools []json.RawMessage
+			if err := json.Unmarshal(rawTools, &tools); err == nil {
+				filteredTools := make([]json.RawMessage, 0, len(tools))
+				strippedToolTypes := make(map[string]struct{})
+				for i, rawTool := range tools {
+					toolType := responsesToolType(rawTool)
+					if _, unsupported := unsupportedToolTypes[toolType]; unsupported {
+						strippedFields = append(strippedFields, fmt.Sprintf("tools[%d]", i))
+						strippedToolTypes[toolType] = struct{}{}
+						continue
+					}
+					filteredTools = append(filteredTools, rawTool)
+				}
+
+				if len(strippedToolTypes) > 0 {
+					rewrittenTools, err := json.Marshal(filteredTools)
+					if err != nil {
+						return bodyBytes, nil
+					}
+					payload["tools"] = rewrittenTools
+
+					if rawToolChoice, ok := payload["tool_choice"]; ok {
+						if _, stripped := stripUnsupportedResponsesToolChoice(rawToolChoice, len(filteredTools) == 0, strippedToolTypes); stripped {
+							delete(payload, "tool_choice")
+							strippedFields = append(strippedFields, "tool_choice")
+						}
+					}
+				}
+			}
+		}
 	}
 
 	if len(strippedFields) == 0 {
 		return bodyBytes, nil
-	}
-
-	rewrittenTools, err := json.Marshal(filteredTools)
-	if err != nil {
-		return bodyBytes, nil
-	}
-	payload["tools"] = rewrittenTools
-
-	if rawToolChoice, ok := payload["tool_choice"]; ok {
-		if _, stripped := stripUnsupportedResponsesToolChoice(rawToolChoice, len(filteredTools) == 0, strippedToolTypes); stripped {
-			delete(payload, "tool_choice")
-			strippedFields = append(strippedFields, "tool_choice")
-		}
 	}
 
 	rewrittenBody, err := json.Marshal(payload)
@@ -1913,6 +1994,16 @@ func stripUnsupportedResponsesRequestFields(bodyBytes []byte, provider *provider
 	}
 
 	return rewrittenBody, strippedFields
+}
+
+func unsupportedResponsesSamplingFields(provider *providerRuntime) []string {
+	if provider == nil {
+		return nil
+	}
+	if provider.kind == providerTypeOpenAICodex {
+		return []string{"top_p", "temperature"}
+	}
+	return nil
 }
 
 func unsupportedResponsesToolTypes(provider *providerRuntime) map[string]struct{} {
@@ -2008,6 +2099,7 @@ func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Conte
 	if !changed {
 		return resp, "", nil
 	}
+	fallbackBody = sanitizeResponsesModelFallbackBody(fallbackBody)
 
 	h.log.Info("retrying responses request with fallback model",
 		logger.F("requested_model", requestedModel),
@@ -2041,20 +2133,66 @@ func (h *ProxyHandler) postResponsesCompactWithFallback(ctx context.Context, bod
 // applyResolvedCompactModel rewrites bodyBytes' "model" field to the budget's
 // resolved fallback model when one has been recorded. Failures fall back to
 // the original body so a malformed request still gets the prior fallback path.
+func sanitizeResponsesModelFallbackBody(body []byte) []byte {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	delete(payload, "previous_response_id")
+
+	var input []json.RawMessage
+	if err := json.Unmarshal(payload["input"], &input); err == nil {
+		sanitized := make([]json.RawMessage, 0, len(input))
+		for _, raw := range input {
+			var item map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &item); err != nil {
+				sanitized = append(sanitized, raw)
+				continue
+			}
+			if rawJSONString(item["type"]) == "reasoning" {
+				continue
+			}
+			var asInterface interface{}
+			_ = json.Unmarshal(raw, &asInterface)
+			if !isProxyCompactionContextMessage(asInterface) {
+				delete(item, "encrypted_content")
+			}
+			rewritten, err := json.Marshal(item)
+			if err != nil {
+				sanitized = append(sanitized, raw)
+				continue
+			}
+			sanitized = append(sanitized, rewritten)
+		}
+		if rewrittenInput, err := json.Marshal(sanitized); err == nil {
+			payload["input"] = rewrittenInput
+		}
+	}
+
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return rewritten
+}
+
 func applyResolvedCompactModel(bodyBytes []byte, budget *compactBudget) []byte {
 	resolvedModel := budget.resolvedModelValue()
 	if resolvedModel == "" {
 		return bodyBytes
 	}
 	current := extractResponsesRequestModel(bodyBytes)
-	if current == "" || current == resolvedModel {
+	if current == "" {
 		return bodyBytes
+	}
+	if current == resolvedModel {
+		return sanitizeResponsesModelFallbackBody(bodyBytes)
 	}
 	rewritten, changed, err := rewriteResponsesRequestModel(bodyBytes, resolvedModel)
 	if err != nil || !changed {
 		return bodyBytes
 	}
-	return rewritten
+	return sanitizeResponsesModelFallbackBody(rewritten)
 }
 
 func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, bodyBytes []byte, extraHeaders, upstreamHeaders http.Header, resp *http.Response) (*http.Response, error) {
@@ -2650,7 +2788,7 @@ func (h *ProxyHandler) maybeBuildResponsesCompactionTriggerResponse(ctx context.
 		return resp, true, nil
 	}
 
-	return syntheticCompactionTriggerResponse(summary, stream), true, nil
+	return syntheticCompactionTriggerResponse(summary, stream, budget.responsesUsage()), true, nil
 }
 
 func compactTriggerRequestFields(bodyBytes []byte) (map[string]json.RawMessage, bool, error) {
@@ -2697,7 +2835,10 @@ func responsesInputItemType(raw json.RawMessage) string {
 	return rawJSONString(item["type"])
 }
 
-func syntheticCompactionTriggerResponse(summary string, stream bool) *http.Response {
+func syntheticCompactionTriggerResponse(summary string, stream bool, usage map[string]interface{}) *http.Response {
+	if usage == nil {
+		usage = zeroResponsesUsage()
+	}
 	responseID := "resp-vekil-compact-" + uuid.NewString()
 	compactionItem := map[string]string{
 		"type":              "compaction",
@@ -2722,7 +2863,7 @@ func syntheticCompactionTriggerResponse(summary string, stream bool) *http.Respo
 			"type": "response.completed",
 			"response": map[string]interface{}{
 				"id":    responseID,
-				"usage": zeroResponsesUsage(),
+				"usage": usage,
 			},
 		})
 		return &http.Response{
@@ -2738,7 +2879,7 @@ func syntheticCompactionTriggerResponse(summary string, stream bool) *http.Respo
 		"object": "response",
 		"status": "completed",
 		"output": []interface{}{compactionItem},
-		"usage":  zeroResponsesUsage(),
+		"usage":  usage,
 	})
 	return &http.Response{
 		StatusCode: http.StatusOK,

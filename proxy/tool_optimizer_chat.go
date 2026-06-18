@@ -196,11 +196,24 @@ func (h *ProxyHandler) captureOpenAIChatToolCallContext(call models.OpenAIToolCa
 }
 
 func (h *ProxyHandler) openAIChatStreamFinalResponseCallback(ctx context.Context, store *ToolExecutionContextStore, scope string) func(*models.OpenAIResponse) {
-	if h == nil || h.toolOptimizers == nil || !h.toolOptimizers.OutputReduceEnabled() || store == nil || strings.TrimSpace(scope) == "" {
+	shouldCaptureTools := h != nil && h.toolOptimizers != nil && h.toolOptimizers.OutputReduceEnabled() && store != nil && strings.TrimSpace(scope) != ""
+	if !shouldCaptureTools {
 		return nil
 	}
 	return func(oaiResp *models.OpenAIResponse) {
+		if oaiResp != nil {
+			observeOpenAIUsage(ctx, oaiResp.Usage)
+		}
 		h.maybeRewriteOrCaptureOpenAIChatToolCommands(ctx, oaiResp, store, scope, false)
+	}
+}
+
+func openAIChatStreamUsageCallback(ctx context.Context) func(*models.OpenAIUsage) {
+	if RequestSummaryFromContext(ctx) == nil {
+		return nil
+	}
+	return func(usage *models.OpenAIUsage) {
+		observeOpenAIUsage(ctx, usage)
 	}
 }
 

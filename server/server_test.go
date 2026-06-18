@@ -1,7 +1,12 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -94,5 +99,74 @@ func TestNew_DerivesWriteTimeoutFromConfiguredProxyHandler(t *testing.T) {
 				t.Fatalf("WriteTimeout = %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+func TestRequestLogIncludesSummaryUsageAndUpstreamRequestID(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("upstream path = %q, want /chat/completions", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Request-Id", "req-upstream-123")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-1\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-1\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelInfo, &logs),
+		"127.0.0.1",
+		"0",
+		WithProxyOptions(proxy.WithCopilotBaseURL(upstream.URL)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	body := `{"model":"gpt-5","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, string(body))
+	}
+
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("log lines = %d, want 1: %q", len(lines), logs.String())
+	}
+	var entry map[string]interface{}
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("unmarshal log entry: %v", err)
+	}
+	want := map[string]interface{}{
+		"msg":                 "request completed",
+		"method":              "POST",
+		"path":                "/v1/chat/completions",
+		"endpoint":            "openai_chat",
+		"model":               "gpt-5",
+		"provider":            "copilot",
+		"provider_kind":       "copilot",
+		"stream":              false,
+		"upstream_request_id": "req-upstream-123",
+	}
+	for key, expected := range want {
+		if got := entry[key]; got != expected {
+			t.Fatalf("log[%s] = %#v, want %#v in %#v", key, got, expected, entry)
+		}
+	}
+	for key, expected := range map[string]float64{"status": 200, "prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15} {
+		if got, ok := entry[key].(float64); !ok || got != expected {
+			t.Fatalf("log[%s] = %#v, want %v in %#v", key, entry[key], expected, entry)
+		}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -84,6 +85,7 @@ func StreamOpenAIPassthroughWithFinalResponse(
 	w http.ResponseWriter,
 	body io.ReadCloser,
 	onFinalResponse func(*models.OpenAIResponse),
+	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
@@ -93,17 +95,21 @@ func StreamOpenAIPassthroughWithFinalResponse(
 		flusher = f
 	}
 
-	if onFinalResponse == nil {
+	onUsage := firstOpenAIUsageCallback(onUsageCallbacks)
+	if onFinalResponse == nil && onUsage == nil {
 		_, _ = io.Copy(&flushWriter{w: w, flusher: flusher}, body)
 		return
 	}
 
-	aggregator := newOpenAIResponseAggregator()
+	var aggregator *openAIResponseAggregator
+	if onFinalResponse != nil {
+		aggregator = newOpenAIResponseAggregator()
+	}
 	reader := bufio.NewReaderSize(body, openAIStreamScannerInitialBuffer)
 
 	sawDone := false
 	var accumulator sseDataAccumulator
-	processData := func(data string) bool {
+	processData := func(_ string, data string) bool {
 		if data == "[DONE]" {
 			sawDone = true
 			return true
@@ -118,7 +124,7 @@ func StreamOpenAIPassthroughWithFinalResponse(
 	}
 
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := readOpenAISSELine(reader)
 		if len(line) > 0 {
 			if _, writeErr := io.WriteString(w, line); writeErr != nil {
 				return
@@ -137,10 +143,19 @@ func StreamOpenAIPassthroughWithFinalResponse(
 	}
 
 	accumulator.dispatch(processData)
-	if !sawDone {
+	if !sawDone || onFinalResponse == nil || aggregator == nil {
 		return
 	}
 	onFinalResponse(aggregator.buildResponse())
+}
+
+func firstOpenAIUsageCallback(callbacks []func(*models.OpenAIUsage)) func(*models.OpenAIUsage) {
+	for _, callback := range callbacks {
+		if callback != nil {
+			return callback
+		}
+	}
+	return nil
 }
 
 func streamAnthropicPassthroughBody(w http.ResponseWriter, body io.Reader, publicModel, upstreamModel string) {
@@ -160,7 +175,7 @@ func streamAnthropicPassthroughBody(w http.ResponseWriter, body io.Reader, publi
 	reader := bufio.NewReaderSize(body, openAIStreamScannerInitialBuffer)
 	frame := make([]string, 0, 4)
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := readOpenAISSELine(reader)
 		if len(line) > 0 {
 			frame = append(frame, line)
 			if strings.TrimRight(line, "\r\n") == "" {
@@ -226,6 +241,7 @@ func StreamOpenAIToAnthropicWithFinalResponse(
 	model string,
 	requestID string,
 	onFinalResponse func(*models.OpenAIResponse),
+	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
@@ -239,14 +255,33 @@ func StreamOpenAIToAnthropicWithFinalResponse(
 	if onFinalResponse != nil {
 		aggregator = newOpenAIResponseAggregator()
 	}
+	onUsage := firstOpenAIUsageCallback(onUsageCallbacks)
 
 	sawDone, err := consumeOpenAIStreamChunks(body, func(chunk models.OpenAIStreamChunk) bool {
+		if onUsage != nil && chunk.Usage != nil {
+			onUsage(chunk.Usage)
+		}
 		if aggregator != nil {
-			aggregator.addChunk(chunk)
+			if aggregator != nil {
+				aggregator.addChunk(chunk)
+			}
+			if onUsage != nil && chunk.Usage != nil {
+				onUsage(chunk.Usage)
+			}
 		}
 		return state.consumeChunk(chunk)
 	})
-	if err != nil || !sawDone {
+	if err != nil {
+		var streamErr *openAIStreamError
+		if errors.As(err, &streamErr) {
+			state.emitError(streamErr.Error())
+			return
+		}
+		state.emitError(fmt.Sprintf("upstream stream read failed: %v", err))
+		return
+	}
+	if !sawDone {
+		state.emitError("upstream stream ended before [DONE]")
 		return
 	}
 
@@ -320,6 +355,20 @@ func (s *anthropicStreamState) start() bool {
 
 func (s *anthropicStreamState) emit(eventType string, data interface{}) bool {
 	return writeSSEEvent(s.w, eventType, data) == nil
+}
+
+func (s *anthropicStreamState) emitError(message string) bool {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "upstream stream ended unexpectedly"
+	}
+	return s.emit("error", map[string]interface{}{
+		"type": "error",
+		"error": map[string]string{
+			"type":    "api_error",
+			"message": message,
+		},
+	})
 }
 
 func (s *anthropicStreamState) consumeChunk(chunk models.OpenAIStreamChunk) bool {
@@ -515,10 +564,8 @@ func (s *anthropicStreamState) finish() bool {
 		Delta: delta,
 	}
 	if s.storedUsage != nil {
-		event.Usage = &models.AnthropicUsage{
-			InputTokens:  s.storedUsage.PromptTokens,
-			OutputTokens: s.storedUsage.CompletionTokens,
-		}
+		usage := openAIUsageToAnthropicUsage(s.storedUsage)
+		event.Usage = &usage
 	}
 
 	if !s.emit("message_delta", event) {
@@ -673,16 +720,5 @@ func (a *openAIResponseAggregator) buildMessage(choice *aggregatedOpenAIChoice) 
 }
 
 func convertFinishReason(reason string) string {
-	switch reason {
-	case "stop":
-		return "end_turn"
-	case "tool_calls":
-		return "tool_use"
-	case "length":
-		return "max_tokens"
-	case "content_filter":
-		return "end_turn"
-	default:
-		return reason
-	}
+	return MapStopReason(&reason)
 }

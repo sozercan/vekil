@@ -58,4 +58,8 @@ Use `curl -N` or another SSE-capable client so streamed frames are not buffered 
 
 ## `POST /v1beta/models/{model}:countTokens`, `POST /v1/models/{model}:countTokens`, and `POST /models/{model}:countTokens` (Gemini)
 
-`countTokens` uses the same accepted route prefixes as the other Gemini compatibility routes. It normalizes the Gemini request into the same prompt/tool payload used by `generateContent`, performs a minimal upstream `/chat/completions` probe, and returns `usage.prompt_tokens` as Gemini `totalTokens`. Normalized requests are cached for 60 seconds.
+`countTokens` uses the same accepted route prefixes as the other Gemini compatibility routes. It normalizes the Gemini request into the same prompt/tool payload used by `generateContent`, performs a minimal upstream `/chat/completions` probe, and returns `usage.prompt_tokens` as Gemini `totalTokens`. Normalized successful requests are cached for 60 seconds. If the probe hits a transient transport error, 429, 5xx, or a 200 response with missing usage, the proxy returns a dependency-free local token estimate instead of failing the counting request. It still surfaces permanent client/configuration failures such as 400, 401, and 403 without estimating.
+
+### Function calling `VALIDATED` mode
+
+Gemini `functionCallingConfig.mode: "VALIDATED"` is accepted and translated to OpenAI `tool_choice: "auto"`. OpenAI Chat Completions has no equivalent schema-validation-guarantee tier, so this is a lossy compatibility mapping: the model may decide whether to call a tool, but any Gemini-specific validation guarantee is not preserved by the OpenAI-shaped upstream request.
