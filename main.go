@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,12 +29,13 @@ const (
 
 func main() {
 	// Dispatch subcommands before falling through to the default server mode.
-	switch commandFromArgs(os.Args) {
+	command, commandArgs := commandAndArgsFromArgs(os.Args)
+	switch command {
 	case cliCommandLogin:
-		runLogin(os.Args[2:])
+		runLogin(commandArgs)
 		return
 	case cliCommandLogout:
-		runLogout(os.Args[2:])
+		runLogout(commandArgs)
 		return
 	}
 
@@ -41,24 +43,47 @@ func main() {
 }
 
 func commandFromArgs(args []string) cliCommand {
+	command, _ := commandAndArgsFromArgs(args)
+	return command
+}
+
+func commandAndArgsFromArgs(args []string) (cliCommand, []string) {
 	if len(args) < 2 {
-		return cliCommandServe
+		return cliCommandServe, nil
 	}
 
-	switch args[1] {
-	case "login":
-		return cliCommandLogin
-	case "logout":
-		return cliCommandLogout
-	default:
-		return cliCommandServe
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "login":
+			return cliCommandLogin, subcommandArgs(args, i)
+		case "logout":
+			return cliCommandLogout, subcommandArgs(args, i)
+		}
+
+		if !isGlobalFlagArg(args[i]) {
+			return cliCommandServe, args[1:]
+		}
 	}
+
+	return cliCommandServe, args[1:]
+}
+
+func subcommandArgs(args []string, commandIndex int) []string {
+	commandArgs := make([]string, 0, len(args)-2)
+	commandArgs = append(commandArgs, args[1:commandIndex]...)
+	commandArgs = append(commandArgs, args[commandIndex+1:]...)
+	return commandArgs
+}
+
+func isGlobalFlagArg(arg string) bool {
+	return arg == "--quiet" || strings.HasPrefix(arg, "--quiet=")
 }
 
 type loginOptions struct {
 	tokenDir     string
 	useGitHubCLI bool
 	force        bool
+	quiet        bool
 }
 
 var errConflictingLoginFlags = fmt.Errorf("--github-cli/--gh cannot be used with --force")
@@ -118,13 +143,13 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 			_, _ = fmt.Fprintf(deps.stderr, "error signing in with GitHub CLI: %v\n", err)
 			return 1
 		}
-		_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+		writeStatus(opts.quiet, deps.stderr, "Login successful.\n")
 		return 0
 	}
 
 	if !opts.force {
 		if _, err := authenticator.RefreshTokenNonInteractive(ctx); err == nil {
-			_, _ = fmt.Fprintln(deps.stderr, "Already logged in.")
+			writeStatus(opts.quiet, deps.stderr, "Already logged in.\n")
 			return 0
 		} else if !auth.IsInteractiveLoginRequired(err) {
 			_, _ = fmt.Fprintf(deps.stderr, "error refreshing existing login: %v\n", err)
@@ -138,11 +163,11 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintf(deps.stderr, "Opening browser to %s\n", dcResp.VerificationURI)
-	_, _ = fmt.Fprintf(deps.stderr, "Enter code: %s\n", dcResp.UserCode)
+	writeStatus(opts.quiet, deps.stderr, "Opening browser to %s\n", dcResp.VerificationURI)
+	writeStatus(opts.quiet, deps.stderr, "Enter code: %s\n", dcResp.UserCode)
 
 	if err := deps.openURL(dcResp.VerificationURI); err != nil {
-		_, _ = fmt.Fprintf(deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
+		writeStatus(opts.quiet, deps.stderr, "Could not open browser automatically, please visit the URL above.\n")
 	}
 
 	if err := authenticator.PollForAuthorization(ctx, dcResp); err != nil {
@@ -150,7 +175,7 @@ func runLoginWithDeps(args []string, deps loginDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintln(deps.stderr, "Login successful.")
+	writeStatus(opts.quiet, deps.stderr, "Login successful.\n")
 	return 0
 }
 
@@ -178,6 +203,7 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 	githubCLI := fs.Bool("github-cli", false, "Sign in using the currently authenticated GitHub CLI account")
 	gh := fs.Bool("gh", false, "Alias for --github-cli")
 	force := fs.Bool("force", false, "Force the interactive GitHub device-code flow")
+	quiet := registerQuietFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
@@ -185,6 +211,7 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 	opts.tokenDir = *tokenDir
 	opts.useGitHubCLI = *githubCLI || *gh
 	opts.force = *force
+	opts.quiet = *quiet
 	if opts.useGitHubCLI && opts.force {
 		return opts, errConflictingLoginFlags
 	}
@@ -194,6 +221,7 @@ func parseLoginOptions(args []string, stderr io.Writer) (loginOptions, error) {
 func runLogout(args []string) {
 	fs := flag.NewFlagSet("logout", flag.ExitOnError)
 	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
+	quiet := registerQuietFlag(fs)
 	fs.Parse(args) //nolint:errcheck
 
 	authenticator, err := auth.NewAuthenticator(*tokenDir)
@@ -207,7 +235,18 @@ func runLogout(args []string) {
 		os.Exit(1)
 	}
 
-	_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
+	writeStatus(*quiet, os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.\n")
+}
+
+func registerQuietFlag(fs *flag.FlagSet) *bool {
+	return fs.Bool("quiet", false, "Suppress non-error output")
+}
+
+func writeStatus(quiet bool, w io.Writer, format string, args ...interface{}) {
+	if quiet {
+		return
+	}
+	_, _ = fmt.Fprintf(w, format, args...)
 }
 
 type serveFlags struct {
@@ -232,6 +271,7 @@ type serveFlags struct {
 	compactUpstreamChunkBytes       *int
 	compactUpstreamChunkConcurrency *int
 	compactUpstreamMaxAttempts      *int
+	quiet                           *bool
 }
 
 func registerServeFlags(fs *flag.FlagSet) serveFlags {
@@ -257,6 +297,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		compactUpstreamChunkBytes:       fs.Int("compact-upstream-chunk-bytes", getEnvInt("COMPACT_UPSTREAM_CHUNK_BYTES", proxy.DefaultCompactUpstreamChunkBytes()), "Target body size (bytes) for chunked /v1/responses/compact retries after an upstream 413; halved on each recursive 413 down to a 64 KiB floor"),
 		compactUpstreamChunkConcurrency: fs.Int("compact-upstream-chunk-concurrency", getEnvInt("COMPACT_UPSTREAM_CHUNK_CONCURRENCY", proxy.DefaultCompactUpstreamChunkConcurrency()), "Maximum sibling chunk compaction calls to run concurrently after the first chunk succeeds"),
 		compactUpstreamMaxAttempts:      fs.Int("compact-upstream-max-attempts", getEnvInt("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts()), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy"),
+		quiet:                           registerQuietFlag(fs),
 	}
 }
 
@@ -286,7 +327,11 @@ func runServe() {
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+	logLevel := logger.ParseLevel(*serve.logLevel)
+	if *serve.quiet && logLevel < logger.LevelError {
+		logLevel = logger.LevelError
+	}
+	log := logger.New(logLevel)
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
@@ -301,7 +346,13 @@ func runServe() {
 	if providersCfg.UsesCopilot() {
 		log.Info("authenticating with GitHub Copilot...")
 		ctx := context.Background()
-		if _, err := authenticator.GetToken(ctx); err != nil {
+		var err error
+		if *serve.quiet {
+			_, err = authenticator.GetTokenNonInteractive(ctx)
+		} else {
+			_, err = authenticator.GetToken(ctx)
+		}
+		if err != nil {
 			log.Fatal("authentication failed", logger.Err(err))
 		}
 		log.Info("authenticated successfully")

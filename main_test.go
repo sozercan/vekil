@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -188,6 +189,13 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	}
 }
 
+func TestServeFlagsQuietCanBeEnabled(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--quiet")
+	if !*serve.quiet {
+		t.Fatal("--quiet should enable quiet mode")
+	}
+}
+
 func TestCommandFromArgs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -214,6 +222,11 @@ func TestCommandFromArgs(t *testing.T) {
 			args: []string{"vekil", "serve"},
 			want: cliCommandServe,
 		},
+		{
+			name: "global quiet before login still dispatches",
+			args: []string{"vekil", "--quiet", "login"},
+			want: cliCommandLogin,
+		},
 	}
 
 	for _, tc := range tests {
@@ -222,6 +235,76 @@ func TestCommandFromArgs(t *testing.T) {
 				t.Fatalf("commandFromArgs(%v) = %v, want %v", tc.args, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestCommandAndArgsFromArgsPassesGlobalQuietToSubcommand(t *testing.T) {
+	command, args := commandAndArgsFromArgs([]string{"vekil", "--quiet", "login", "--gh"})
+	if command != cliCommandLogin {
+		t.Fatalf("command = %v, want %v", command, cliCommandLogin)
+	}
+	want := []string{"--quiet", "--gh"}
+	if strings.Join(args, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("args = %v, want %v", args, want)
+	}
+}
+
+func TestRunLoginQuietSuppressesSuccessOutput(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantOutput bool
+	}{
+		{
+			name:       "default emits success output",
+			args:       []string{"--gh"},
+			wantOutput: true,
+		},
+		{
+			name:       "quiet suppresses success output",
+			args:       []string{"--quiet", "--gh"},
+			wantOutput: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+
+			code := runLoginWithDeps(tc.args, loginDeps{
+				stderr: &stderr,
+				newAuthenticator: func(string) (loginAuthenticator, error) {
+					return &fakeLoginAuthenticator{}, nil
+				},
+			})
+
+			if code != 0 {
+				t.Fatalf("runLoginWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+			}
+
+			gotOutput := strings.Contains(stderr.String(), "Login successful.")
+			if gotOutput != tc.wantOutput {
+				t.Fatalf("success output present = %v, want %v; stderr=%q", gotOutput, tc.wantOutput, stderr.String())
+			}
+		})
+	}
+}
+
+func TestRunLoginQuietDoesNotSuppressErrors(t *testing.T) {
+	var stderr bytes.Buffer
+
+	code := runLoginWithDeps([]string{"--quiet", "--gh"}, loginDeps{
+		stderr: &stderr,
+		newAuthenticator: func(string) (loginAuthenticator, error) {
+			return &fakeLoginAuthenticator{signInWithGitHubCLIErr: errors.New("boom")}, nil
+		},
+	})
+
+	if code == 0 {
+		t.Fatalf("runLoginWithDeps() code = 0, want non-zero")
+	}
+	if got := stderr.String(); !strings.Contains(got, "error signing in with GitHub CLI: boom") {
+		t.Fatalf("stderr missing error, got %q", got)
 	}
 }
 
