@@ -360,12 +360,19 @@ ATTEMPT_STATUS=""
 zen_canary() {
   local model="$1"
   local body="${SMOKE_DIR}/canary-${model//[^a-zA-Z0-9_.-]/_}.json"
+  local request="${SMOKE_DIR}/canary-req-${model//[^a-zA-Z0-9_.-]/_}.json"
   local code errmsg
+
+  # Build the request body with jq so model IDs are always valid JSON (matches
+  # probe_model in live-zen-smoke.sh and live-compact-smoke.sh).
+  jq -n --arg model "${model}" \
+    '{model: $model, max_tokens: 16, messages: [{role: "user", content: "ping"}]}' \
+    > "${request}" || { printf 'SKIP request-build-error\n'; return; }
 
   code="$(curl -s -o "${body}" -w '%{http_code}' --max-time 60 \
     -X POST "${PROXY_BASE_URL}/v1/chat/completions" \
     -H 'content-type: application/json' \
-    -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":16}" \
+    --data-binary "@${request}" \
     2>/dev/null)" || { printf 'SKIP transport-error\n'; return; }
 
   errmsg="$(jq -r '.error.message? // empty' "${body}" 2>/dev/null || true)"
