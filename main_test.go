@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -185,6 +186,78 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	cliServe := parseServeFlagsForTest(t, "--responses-ws-enabled=false")
 	if cliServe.responsesWebSocketConfig().Enabled {
 		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
+	}
+}
+
+func TestQuietFlag(t *testing.T) {
+	flagTests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{
+			name: "default false",
+			want: false,
+		},
+		{
+			name: "flag sets true",
+			args: []string{"-quiet"},
+			want: true,
+		},
+	}
+
+	for _, tc := range flagTests {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			serve := registerServeFlags(fs)
+			if err := fs.Parse(tc.args); err != nil {
+				t.Fatalf("parse serve flags: %v", err)
+			}
+			if got := *serve.quiet; got != tc.want {
+				t.Fatalf("quiet = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	levelTests := []struct {
+		name     string
+		quiet    bool
+		logLevel string
+		want     logger.Level
+	}{
+		{
+			name:     "quiet wins over info",
+			quiet:    true,
+			logLevel: "info",
+			want:     logger.LevelError,
+		},
+		{
+			name:     "quiet wins over debug",
+			quiet:    true,
+			logLevel: "debug",
+			want:     logger.LevelError,
+		},
+		{
+			name:     "info without quiet",
+			quiet:    false,
+			logLevel: "info",
+			want:     logger.LevelInfo,
+		},
+		{
+			name:     "debug without quiet",
+			quiet:    false,
+			logLevel: "debug",
+			want:     logger.LevelDebug,
+		},
+	}
+
+	for _, tc := range levelTests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveLogLevel(tc.quiet, tc.logLevel); got != tc.want {
+				t.Fatalf("resolveLogLevel(%v, %q) = %v, want %v", tc.quiet, tc.logLevel, got, tc.want)
+			}
+		})
 	}
 }
 
