@@ -101,41 +101,64 @@ fetch_models() {
 }
 
 # Probe one model. Echoes one of: OK | SKIP | FAIL  plus a short reason.
+#
+# The Zen free tier is rotating and rate-limited, so only a genuine proxy-side
+# fault is a hard FAIL. Upstream conditions (promo ended, 401/403, rate-limit
+# 429, 5xx, transport error) are SKIP, consistent with the contract that the
+# check passes as long as at least one free model responds.
 probe_model() {
   local model="$1"
   local body_file="${SMOKE_DIR}/resp-${model//[^a-zA-Z0-9_.-]/_}.json"
+  local request_file="${SMOKE_DIR}/req-${model//[^a-zA-Z0-9_.-]/_}.json"
   local code
+
+  # Build the request body with jq so model IDs are always valid JSON (matches
+  # the --arg pattern used in live-compact-smoke.sh).
+  jq -n --arg model "${model}" --arg prompt "${PROMPT}" \
+    '{model: $model, max_tokens: 64, messages: [{role: "user", content: $prompt}]}' \
+    > "${request_file}" || { printf 'FAIL request-build-error\n'; return; }
 
   code="$(curl -s -o "${body_file}" -w '%{http_code}' --max-time 90 \
     -X POST "${PROXY_BASE_URL}/v1/chat/completions" \
     -H 'content-type: application/json' \
-    -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"${PROMPT}\"}],\"max_tokens\":64}" \
-    2>/dev/null)" || { printf 'FAIL transport-error\n'; return; }
+    --data-binary "@${request_file}" \
+    2>/dev/null)" || { printf 'SKIP transport-error\n'; return; }
 
-  # Promo-ended free models come back as an error body (observed HTTP 401) whose
-  # message contains "promotion has ended". Treat that as an upstream rotation
-  # SKIP rather than a proxy failure.
   local errmsg
   errmsg="$(jq -r '.error.message? // empty' "${body_file}" 2>/dev/null || true)"
-  if printf '%s' "${errmsg}" | grep -qi 'promotion has ended'; then
+
+  # Promo-ended free models come back as an error body (observed HTTP 401) whose
+  # message contains "promotion has ended". Upstream rotation, not a proxy fault.
+  if printf '%s' "${errmsg}" | grep -qiE 'promotion has ended|not supported for format'; then
     printf 'SKIP promo-ended\n'
     return
   fi
 
-  if [[ "${code}" != "200" ]]; then
-    printf 'FAIL http-%s %s\n' "${code}" "${errmsg:0:80}"
+  # Proxy-generated faults (allowlist/unknown model) are real failures.
+  if printf '%s' "${errmsg}" | grep -qiE 'does not support /|unknown model|no upstream'; then
+    printf 'FAIL proxy:%s\n' "${errmsg:0:70}"
     return
   fi
 
-  if jq -e '.choices[0].message' "${body_file}" >/dev/null 2>&1; then
-    local echoed finish
-    echoed="$(jq -r '.model // "?"' "${body_file}")"
-    finish="$(jq -r '.choices[0].finish_reason // "?"' "${body_file}")"
-    printf 'OK echo=%s finish=%s\n' "${echoed}" "${finish}"
+  if [[ "${code}" == "200" ]]; then
+    if jq -e '.choices[0].message' "${body_file}" >/dev/null 2>&1; then
+      local echoed finish
+      echoed="$(jq -r '.model // "?"' "${body_file}")"
+      finish="$(jq -r '.choices[0].finish_reason // "?"' "${body_file}")"
+      printf 'OK echo=%s finish=%s\n' "${echoed}" "${finish}"
+      return
+    fi
+    printf 'FAIL bad-shape\n'
     return
   fi
 
-  printf 'FAIL bad-shape\n'
+  case "${code}" in
+    # Proxy emits 400 for its own bad-request/allowlist rejections -> real fault.
+    400) printf 'FAIL http-400 %s\n' "${errmsg:0:70}" ;;
+    # Upstream auth / rate-limit / server errors -> shared-tier conditions, skip.
+    401|403|429|5*) printf 'SKIP http-%s %s\n' "${code}" "${errmsg:0:60}" ;;
+    *) printf 'SKIP http-%s %s\n' "${code}" "${errmsg:0:60}" ;;
+  esac
 }
 
 main() {
@@ -171,7 +194,7 @@ main() {
     printf '%-5s %-26s %s\n' "${status}" "${model}" "${result#* }" >&2
   done <<< "${models}"
 
-  log "Summary: ${ok} ok, ${skipped} skipped (promo ended), ${failed} failed, of ${total} listed."
+  log "Summary: ${ok} ok, ${skipped} skipped (rotated/rate-limited/unreachable), ${failed} failed, of ${total} listed."
 
   if [[ "${failed}" -gt 0 ]]; then
     die "${failed} model(s) failed through the proxy (see ${SMOKE_DIR})."

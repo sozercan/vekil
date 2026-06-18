@@ -106,7 +106,7 @@ SMOKE_PROVIDER=zen PROXY_PORT=8899 PROVIDERS_CONFIG=examples/opencode-zen-free.y
 
 ## Live Copilot Smoke setup
 
-To use it:
+To use the `Live Copilot Smoke` workflow:
 
 1. Create a GitHub token for a user that has GitHub Copilot access.
 2. Grant that token the `Copilot Requests` permission.
