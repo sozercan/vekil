@@ -116,3 +116,4 @@ env GEMINI_API_KEY=dummy \
   gemini -m gemini-2.5-pro -p "Reply with exactly PROXY_OK" -o json
 ```
 <!-- orka substrate demo: cold gVisor workspace -->
+<!-- orka substrate demo: warm reuse, no cold start -->
