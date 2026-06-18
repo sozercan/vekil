@@ -23,6 +23,13 @@
 # HTTP 400, so making this the default catch-all only risks routing unknown
 # models to a revocable trial gateway.
 #
+# Endpoint allowlists are per model. /responses is verified working upstream for
+# deepseek-v4-flash-free, north-mini-code-free, and nemotron-3-ultra-free; the
+# others are advertised as /chat/completions only (big-pickle returns HTTP 401
+# "not supported for format openai" on /responses). Note: the GitHub Copilot CLI
+# and Codex CLI use /responses with built-in tools that Zen free upstreams may
+# reject; use COPILOT_PROVIDER_WIRE_API=completions for the Copilot CLI.
+#
 # For the full (paid) Zen catalog or higher limits, sign in at
 # https://opencode.ai/auth and swap `api_key: public` for
 # `api_key_env: OPENCODE_API_KEY` (still a static key, still no refresh).
@@ -45,12 +52,15 @@ providers:
       - public_id: deepseek-v4-flash-free
         endpoints:
           - /chat/completions
+          - /responses
       - public_id: mimo-v2.5-free
         endpoints:
           - /chat/completions
       - public_id: nemotron-3-ultra-free    # NVIDIA API Trial Terms; no confidential data
         endpoints:
           - /chat/completions
+          - /responses
       - public_id: north-mini-code-free      # Cohere Terms; no confidential data
         endpoints:
           - /chat/completions
+          - /responses
