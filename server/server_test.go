@@ -1,7 +1,10 @@
 package server
 
 import (
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -94,5 +97,43 @@ func TestNew_DerivesWriteTimeoutFromConfiguredProxyHandler(t *testing.T) {
 				t.Fatalf("WriteTimeout = %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+func TestMetricsEndpointReportsRequestsAndInFlight(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.Contains(got, "text/plain") {
+		t.Fatalf("expected text/plain content type, got %q", got)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+	for _, want := range []string{
+		"# TYPE vekil_http_requests_total counter\n",
+		"vekil_http_requests_total 1\n",
+		"# TYPE vekil_http_in_flight_requests gauge\n",
+		"vekil_http_in_flight_requests 1\n",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected metrics body to contain %q, got:\n%s", want, text)
+		}
 	}
 }
