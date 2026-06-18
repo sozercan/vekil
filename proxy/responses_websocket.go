@@ -93,6 +93,7 @@ type responsesWebSocketSession struct {
 	doneOnce       sync.Once
 	inflightMu     sync.Mutex
 	inflightCancel context.CancelFunc
+	inflightGen    uint64
 }
 
 type responsesWebSocketRequestPlan struct {
@@ -326,22 +327,33 @@ func (s *responsesWebSocketSession) sendGoingAwayWithDeadline(deadline time.Time
 	s.closeDone()
 }
 
-func (s *responsesWebSocketSession) setInflightCancel(cancel context.CancelFunc) {
+// setInflightCancel records the cancel func for the current in-flight upstream
+// call and returns a generation token. The token must be passed to
+// clearInflightCancel so that only the matching cancel is cleared: nested or
+// subsequent in-flight calls (e.g. auto-compaction inside a create request)
+// bump the generation, and a stale clear is then a no-op rather than nilling
+// out a newer cancel. (context.CancelFunc values are not comparable, so the
+// generation token stands in for identity.)
+func (s *responsesWebSocketSession) setInflightCancel(cancel context.CancelFunc) uint64 {
 	if s == nil || cancel == nil {
-		return
+		return 0
 	}
 	s.inflightMu.Lock()
 	defer s.inflightMu.Unlock()
+	s.inflightGen++
 	s.inflightCancel = cancel
+	return s.inflightGen
 }
 
-func (s *responsesWebSocketSession) clearInflightCancel(context.CancelFunc) {
-	if s == nil {
+func (s *responsesWebSocketSession) clearInflightCancel(gen uint64) {
+	if s == nil || gen == 0 {
 		return
 	}
 	s.inflightMu.Lock()
 	defer s.inflightMu.Unlock()
-	s.inflightCancel = nil
+	if s.inflightGen == gen {
+		s.inflightCancel = nil
+	}
 }
 
 func (s *responsesWebSocketSession) cancelInflight() {
@@ -528,9 +540,9 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	}
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
-	s.setInflightCancel(upstreamCancel)
+	inflightGen := s.setInflightCancel(upstreamCancel)
 	defer func() {
-		s.clearInflightCancel(upstreamCancel)
+		s.clearInflightCancel(inflightGen)
 		upstreamCancel()
 	}()
 
@@ -779,9 +791,9 @@ func (s *responsesWebSocketSession) rememberPlannedResponse(plan responsesWebSoc
 
 func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, request *responsesWebSocketCreateRequest, metrics responsesWebSocketRequestMetrics) responsesWebSocketRequestMetrics {
 	ctx, cancel := h.newInferenceUpstreamContext(true)
-	s.setInflightCancel(cancel)
+	inflightGen := s.setInflightCancel(cancel)
 	defer func() {
-		s.clearInflightCancel(cancel)
+		s.clearInflightCancel(inflightGen)
 		cancel()
 	}()
 

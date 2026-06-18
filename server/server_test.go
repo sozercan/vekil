@@ -170,3 +170,93 @@ func TestRequestLogIncludesSummaryUsageAndUpstreamRequestID(t *testing.T) {
 		}
 	}
 }
+
+// TestStreamingChatCompletionsPassthroughThroughServer drives a streaming
+// POST /v1/chat/completions request through the full server stack (so
+// withRequestLog attaches a RequestSummary and the usage callback is non-nil)
+// with tool optimizers disabled. This exercises StreamOpenAIPassthroughWithFinalResponse
+// on its default-config path, where onFinalResponse is nil but onUsage is not.
+// Before the nil-aggregator guard this panicked on the first SSE chunk; this
+// test also asserts the streamed body is forwarded verbatim with a [DONE]
+// sentinel and that streaming usage is recorded in the request log.
+func TestStreamingChatCompletionsPassthroughThroughServer(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("upstream path = %q, want /chat/completions", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Request-Id", "req-stream-456")
+		flusher, _ := w.(http.Flusher)
+		writeChunk := func(s string) {
+			_, _ = io.WriteString(w, s)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		writeChunk("data: {\"id\":\"chatcmpl-2\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n\n")
+		writeChunk("data: {\"id\":\"chatcmpl-2\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\n\n")
+		writeChunk("data: {\"id\":\"chatcmpl-2\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\n")
+		writeChunk("data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelInfo, &logs),
+		"127.0.0.1",
+		"0",
+		WithProxyOptions(proxy.WithCopilotBaseURL(upstream.URL)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	body := `{"model":"gpt-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		got, _ := io.ReadAll(resp.Body)
+		t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, string(got))
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	streamed, _ := io.ReadAll(resp.Body)
+	got := string(streamed)
+	// The passthrough must forward every upstream chunk verbatim, including
+	// the terminal [DONE] sentinel, without truncation or panic.
+	for _, want := range []string{"\"content\":\"Hel\"", "\"content\":\"lo\"", "\"finish_reason\":\"stop\"", "data: [DONE]"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("streamed body missing %q; got:\n%s", want, got)
+		}
+	}
+
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("log lines = %d, want 1: %q", len(lines), logs.String())
+	}
+	var entry map[string]interface{}
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("unmarshal log entry: %v", err)
+	}
+	if got, ok := entry["stream"].(bool); !ok || !got {
+		t.Fatalf("log[stream] = %#v, want true", entry["stream"])
+	}
+	// Usage must be observed via the streaming onUsage callback (regression:
+	// the callback was previously wired but never invoked, so these were absent).
+	for key, expected := range map[string]float64{"status": 200, "prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9} {
+		if got, ok := entry[key].(float64); !ok || got != expected {
+			t.Fatalf("log[%s] = %#v, want %v in %#v", key, entry[key], expected, entry)
+		}
+	}
+	if got := entry["upstream_request_id"]; got != "req-stream-456" {
+		t.Fatalf("log[upstream_request_id] = %#v, want req-stream-456", got)
+	}
+}

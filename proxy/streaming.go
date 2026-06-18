@@ -119,7 +119,12 @@ func StreamOpenAIPassthroughWithFinalResponse(
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			return true
 		}
-		aggregator.addChunk(chunk)
+		if onUsage != nil && chunk.Usage != nil {
+			onUsage(chunk.Usage)
+		}
+		if aggregator != nil {
+			aggregator.addChunk(chunk)
+		}
 		return true
 	}
 
@@ -262,12 +267,7 @@ func StreamOpenAIToAnthropicWithFinalResponse(
 			onUsage(chunk.Usage)
 		}
 		if aggregator != nil {
-			if aggregator != nil {
-				aggregator.addChunk(chunk)
-			}
-			if onUsage != nil && chunk.Usage != nil {
-				onUsage(chunk.Usage)
-			}
+			aggregator.addChunk(chunk)
 		}
 		return state.consumeChunk(chunk)
 	})
