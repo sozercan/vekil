@@ -84,6 +84,8 @@ The CLI smoke script starts the proxy with the same token pattern, waits for `/r
 
 This workflow is intentionally provider-specific: it exercises a live Copilot-backed deployment because zero-config startup is the simplest upstream path to run in GitHub Actions. It is useful as a real integration smoke test, but it is not the complete provider matrix for Azure OpenAI, OpenAI Codex, or generic compatible provider configs.
 
+For a credential-free generic-provider check, [`scripts/live-zen-smoke.sh`](../scripts/live-zen-smoke.sh) starts the proxy on a non-default port with [`examples/opencode-zen-free.yaml`](../examples/opencode-zen-free.yaml), waits for `/readyz`, and sends one tiny chat completion per OpenCode Zen free model. It only needs `curl` and `jq`. Because the Zen free set rotates, the script treats a promo-ended model as a skip and passes as long as at least one free model still responds; only a proxy-side fault is a hard failure.
+
 To use it:
 
 1. Create a GitHub token for a user that has GitHub Copilot access.

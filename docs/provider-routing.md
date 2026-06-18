@@ -213,6 +213,37 @@ providers:
           - /responses
 ```
 
+#### OpenCode Zen Free Tier
+
+OpenCode Zen is an OpenAI-compatible gateway at `https://opencode.ai/zen/v1`. Its free models can be reached anonymously with the literal sentinel key `public` (the same value the opencode client sends when no real key is configured). No signup, OAuth, or token refresh is involved, so this maps directly onto an `openai-compatible` provider with `auth_type: bearer` and `api_key: public`. A ready-to-run config is in [`examples/opencode-zen-free.yaml`](../examples/opencode-zen-free.yaml):
+
+```yaml
+providers:
+  - id: opencode-zen
+    type: openai-compatible
+    base_url: https://opencode.ai/zen/v1
+    auth_type: bearer
+    api_key: public                  # shared anonymous sentinel, not a secret
+    model_discovery: static
+    models:
+      - public_id: deepseek-v4-flash-free
+        endpoints:
+          - /chat/completions
+      - public_id: big-pickle
+        endpoints:
+          - /chat/completions
+```
+
+Operational notes for the free tier:
+
+- Use `model_discovery: static`, not `openai`. Dynamic discovery lists the full Zen catalog, including paid models that reject the `public` key with `401`, and there is no cost-based filter (only `include_models`/`exclude_models`). Static discovery also skips the upstream readiness probe.
+- Do not set `default: true`. Under static discovery, unlisted models return `400`, so making this the catch-all only risks routing unknown models to a revocable trial gateway.
+- The free set rotates and individual promotions end without notice. When a promo ends, that model returns an error body (observed as `401`) such as `Free promotion has ended for <model>`. Re-check the live set before relying on it: `curl -s https://opencode.ai/zen/v1/models -H 'authorization: Bearer public'`.
+- `public` is a shared anonymous credential, rate-limited server-side per IP. It suits personal, low-volume use, not fan-out or automation.
+- Free models are not zero-retention ("collected data may be used to improve the model"). `north-mini-code-free` (Cohere) and `nemotron-3-ultra-free` (NVIDIA) add "trial use only / do not submit confidential data" terms. Do not route proprietary or sensitive prompts through them.
+
+For the full (paid) Zen catalog or higher limits, sign in at [opencode.ai/auth](https://opencode.ai/auth) and swap `api_key: public` for `api_key_env: OPENCODE_API_KEY` (still a static key, still no refresh). Validate the free tier end to end with [`scripts/live-zen-smoke.sh`](../scripts/live-zen-smoke.sh).
+
 Anthropic-compatible providers with native Messages support, including Wafer, OpenRouter, and DeepSeek-style Messages endpoints, should not advertise OpenAI routes:
 
 ```yaml

@@ -28,7 +28,7 @@ Provider portals, free tiers, and model catalogs change frequently. Treat the li
 |----------|----------|--------------------|-------|
 | NVIDIA NIM | [build.nvidia.com/settings/api-keys](https://build.nvidia.com/settings/api-keys) | `openai-compatible` | Use `/chat/completions`; add `/responses` only for a validated model. |
 | Kimi / Moonshot | [platform.moonshot.ai/console/api-keys](https://platform.moonshot.ai/console/api-keys) | `openai-compatible` | Configure `base_url` exactly as Moonshot documents for the API you use. |
-| OpenCode Zen / Go | [opencode.ai/auth](https://opencode.ai/auth) | `openai-compatible` | Prefer `/responses` for models documented for Responses; keep chat separate unless validated. |
+| OpenCode Zen / Go | [opencode.ai/auth](https://opencode.ai/auth) | `openai-compatible` | Prefer `/responses` for models documented for Responses; keep chat separate unless validated. Free models work anonymously with `api_key: public`; see [Provider Routing](provider-routing.md#opencode-zen-free-tier). |
 | Z.ai | [z.ai/manage-apikey/apikey-list](https://z.ai/manage-apikey/apikey-list) | `openai-compatible` | Do not append `/v1` unless that is part of the documented API base. |
 | OpenRouter | [openrouter.ai/keys](https://openrouter.ai/keys) | `anthropic-compatible` or `openai-compatible` | Pick the provider type that matches the upstream endpoint you configure. |
 | DeepSeek | [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) | `anthropic-compatible` or `openai-compatible` | Match `type` and paths to the endpoint family you intend to use. |
