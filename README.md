@@ -16,6 +16,8 @@ Vekil is a Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatibl
 
 Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Azure OpenAI, or send Gemini-CLI traffic through any OpenAI-compatible upstream — all without touching client config. Swap providers behind the proxy; your tools never notice.
 
+> **Looking for free models?** Vekil can route to OpenCode Zen's free tier with no signup — [see how](docs/provider-routing.md#opencode-zen-free-tier). It is a shared, rate-limited trial tier (models rotate; not for sensitive prompts).
+
 ## Features
 
 - **Anthropic Messages API** — drop-in compatible with Claude clients
