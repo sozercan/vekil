@@ -102,6 +102,7 @@ type ProviderModelConfig struct {
 	ReasoningEffort     []string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
 	Vision              *bool    `json:"vision,omitempty" yaml:"vision,omitempty"`
 	ParallelToolCalls   *bool    `json:"parallel_tool_calls,omitempty" yaml:"parallel_tool_calls,omitempty"`
+	DropSamplingParams  *bool    `json:"drop_sampling_params,omitempty" yaml:"drop_sampling_params,omitempty"`
 	ContextWindow       *int64   `json:"context_window,omitempty" yaml:"context_window,omitempty"`
 }
 
@@ -142,6 +143,8 @@ type providerModel struct {
 	upstreamModel      string
 	providerID         string
 	supportedEndpoints []string
+	parallelToolCalls  *bool
+	dropSamplingParams bool
 	disabled           bool
 	raw                json.RawMessage
 }
@@ -197,6 +200,7 @@ type azureBaseURLKind int
 
 const (
 	azureBaseURLKindInvalid azureBaseURLKind = iota
+	azureBaseURLKindResourceRoot
 	azureBaseURLKindLegacyOpenAI
 	azureBaseURLKindOpenAIV1
 	azureBaseURLKindModels
@@ -564,15 +568,19 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		if baseURL == "" {
 			return nil, fmt.Errorf("provider %q must set base_url", id)
 		}
-		switch classifyAzureBaseURL(baseURL) {
-		case azureBaseURLKindOpenAIV1, azureBaseURLKindLegacyOpenAI:
+		baseKind := classifyAzureBaseURL(baseURL)
+		switch baseKind {
+		case azureBaseURLKindOpenAIV1, azureBaseURLKindLegacyOpenAI, azureBaseURLKindResourceRoot:
 		case azureBaseURLKindModels:
 			return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: Microsoft Foundry /models inference endpoints are not supported; use the OpenAI-compatible endpoint ending in /openai/v1 instead", id, baseURL)
 		default:
-			return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: expected an absolute URL whose path ends in /openai/v1 or /openai, with no query string or fragment", id, baseURL)
+			return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: expected an absolute URL whose path ends in /openai/v1 or /openai, or is the Azure OpenAI resource root, with no query string or fragment", id, baseURL)
 		}
 		runtime.baseURL = baseURL
 		runtime.apiVersion = strings.TrimSpace(cfg.APIVersion)
+		if runtime.apiVersion == "" && baseKind != azureBaseURLKindOpenAIV1 {
+			return nil, fmt.Errorf("provider %q api_version is required for Azure base_url %q unless the path ends in /openai/v1", id, baseURL)
+		}
 
 		authMode := providerAuthMode(strings.TrimSpace(cfg.AuthMode))
 		if authMode == "" {
@@ -942,7 +950,10 @@ func buildStaticProviderModel(providerID string, cfg ProviderModelConfig, defaul
 		name = publicID
 	}
 
-	endpoints := normalizeProviderEndpoints(cfg.Endpoints, defaultEndpoints)
+	endpoints, err := normalizeProviderEndpoints(cfg.Endpoints, defaultEndpoints)
+	if err != nil {
+		return providerModel{}, fmt.Errorf("provider %q model %q: %w", providerID, publicID, err)
+	}
 	raw, err := synthesizeProviderModelRaw(providerID, publicID, name, endpoints, cfg)
 	if err != nil {
 		return providerModel{}, err
@@ -953,6 +964,8 @@ func buildStaticProviderModel(providerID string, cfg ProviderModelConfig, defaul
 		upstreamModel:      upstreamModel,
 		providerID:         providerID,
 		supportedEndpoints: endpoints,
+		parallelToolCalls:  cloneBoolPtr(cfg.ParallelToolCalls),
+		dropSamplingParams: cfg.DropSamplingParams != nil && *cfg.DropSamplingParams,
 		raw:                raw,
 	}, nil
 }
@@ -971,9 +984,9 @@ func normalizeProviderModelConfig(cfg ProviderModelConfig) ProviderModelConfig {
 	return cfg
 }
 
-func normalizeProviderEndpoints(endpoints []string, defaultEndpoints []string) []string {
+func normalizeProviderEndpoints(endpoints []string, defaultEndpoints []string) ([]string, error) {
 	if len(endpoints) == 0 {
-		return append([]string(nil), defaultEndpoints...)
+		return append([]string(nil), defaultEndpoints...), nil
 	}
 
 	normalized := make([]string, 0, len(endpoints))
@@ -983,6 +996,9 @@ func normalizeProviderEndpoints(endpoints []string, defaultEndpoints []string) [
 		if endpoint == "" {
 			continue
 		}
+		if !knownProviderEndpoint(endpoint) {
+			return nil, fmt.Errorf("unsupported endpoint %q", endpoint)
+		}
 		if _, ok := seen[endpoint]; ok {
 			continue
 		}
@@ -990,9 +1006,26 @@ func normalizeProviderEndpoints(endpoints []string, defaultEndpoints []string) [
 		normalized = append(normalized, endpoint)
 	}
 	if len(normalized) == 0 {
-		return append([]string(nil), defaultEndpoints...)
+		return append([]string(nil), defaultEndpoints...), nil
 	}
-	return normalized
+	return normalized, nil
+}
+
+func knownProviderEndpoint(endpoint string) bool {
+	switch endpoint {
+	case providerEndpointChatCompletions, providerEndpointResponses, providerEndpointMessages:
+		return true
+	default:
+		return false
+	}
+}
+
+func cloneBoolPtr(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func synthesizeProviderModelRaw(providerID, publicID, name string, endpoints []string, cfg ProviderModelConfig) (json.RawMessage, error) {
@@ -1116,7 +1149,7 @@ func rewriteRequestModelForProvider(body []byte, upstreamModel string) ([]byte, 
 	return rewriteResponsesRequestModel(body, upstreamModel)
 }
 
-func (h *ProxyHandler) providerRequestURL(provider *providerRuntime, path string, extraQuery string) (string, error) {
+func (h *ProxyHandler) providerRequestURL(provider *providerRuntime, path string, extraQuery string, owners ...providerModel) (string, error) {
 	if provider == nil {
 		return "", fmt.Errorf("provider is required")
 	}
@@ -1126,11 +1159,50 @@ func (h *ProxyHandler) providerRequestURL(provider *providerRuntime, path string
 	if upstreamPath == "" {
 		return "", fmt.Errorf("provider %q has no upstream path configured for %s", provider.id, path)
 	}
+
+	baseKind := classifyAzureBaseURL(baseURL)
+	if provider.kind == providerTypeAzureOpenAI && provider.apiVersion != "" && baseKind != azureBaseURLKindOpenAIV1 {
+		if path == providerEndpointChatCompletions && !strings.HasPrefix(strings.TrimPrefix(upstreamPath, "/"), "deployments/") {
+			owner := providerModel{}
+			if len(owners) > 0 {
+				owner = owners[0]
+			}
+			deployment := strings.TrimSpace(owner.upstreamModel)
+			if deployment == "" {
+				deployment = strings.TrimSpace(owner.publicID)
+			}
+			if deployment == "" {
+				return "", fmt.Errorf("provider %q has no Azure deployment configured for %s", provider.id, path)
+			}
+			operation := strings.TrimPrefix(upstreamPath, "/")
+			fullURL := azureClassicOpenAIBaseURL(baseURL, baseKind) + "/deployments/" + url.PathEscape(deployment) + "/" + operation
+			return appendRawQuery(fullURL, appendQuery("api-version="+url.QueryEscape(provider.apiVersion), extraQuery)), nil
+		}
+		fullURL := azureClassicOpenAIBaseURL(baseURL, baseKind) + upstreamPath
+		return appendRawQuery(fullURL, appendQuery("api-version="+url.QueryEscape(provider.apiVersion), extraQuery)), nil
+	}
+
 	fullURL := baseURL + upstreamPath
-	if provider.kind != providerTypeAzureOpenAI || provider.apiVersion == "" || classifyAzureBaseURL(baseURL) == azureBaseURLKindOpenAIV1 {
+	if provider.kind != providerTypeAzureOpenAI || provider.apiVersion == "" || baseKind == azureBaseURLKindOpenAIV1 {
 		return appendRawQuery(fullURL, extraQuery), nil
 	}
 	return appendRawQuery(fullURL, appendQuery("api-version="+url.QueryEscape(provider.apiVersion), extraQuery)), nil
+}
+
+func azureClassicOpenAIBaseURL(baseURL string, baseKind azureBaseURLKind) string {
+	baseURL = strings.TrimRight(baseURL, "/")
+	if baseKind == azureBaseURLKindResourceRoot {
+		return baseURL + "/openai"
+	}
+	return baseURL
+}
+
+func providerUsesAzureClassicDeploymentPath(provider *providerRuntime, endpoint string) bool {
+	if provider == nil || provider.kind != providerTypeAzureOpenAI || endpoint != providerEndpointChatCompletions {
+		return false
+	}
+	baseKind := classifyAzureBaseURL(provider.baseURL)
+	return baseKind == azureBaseURLKindLegacyOpenAI || baseKind == azureBaseURLKindResourceRoot
 }
 
 func (p *providerRuntime) upstreamPath(endpoint string) string {
@@ -1178,6 +1250,8 @@ func classifyAzureBaseURL(baseURL string) azureBaseURLKind {
 
 	path := strings.TrimRight(parsed.Path, "/")
 	switch {
+	case path == "":
+		return azureBaseURLKindResourceRoot
 	case strings.HasSuffix(path, "/openai/v1"):
 		return azureBaseURLKindOpenAIV1
 	case strings.HasSuffix(path, "/openai"):
@@ -1243,6 +1317,7 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 		h.setCopilotHeadersForProvider(req, token, provider, endpoint)
 	case providerTypeAzureOpenAI:
 		clearCopilotHeaders(req.Header)
+		mergeHeaderValues(req.Header, provider.extraHeaders)
 		req.Header.Del("api-key")
 		switch provider.azureAuthMode() {
 		case providerAuthModeAPIKey:
@@ -1315,8 +1390,8 @@ func applyGenericProviderAuth(req *http.Request, provider *providerRuntime) erro
 	}
 }
 
-func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string) (*http.Request, error) {
-	fullURL, err := h.providerRequestURL(provider, path, extraQuery)
+func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
+	fullURL, err := h.providerRequestURL(provider, path, extraQuery, owners...)
 	if err != nil {
 		return nil, err
 	}
@@ -1774,12 +1849,27 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			upstreamModel:      publicID,
 			providerID:         provider.id,
 			supportedEndpoints: supportedEndpoints,
+			parallelToolCalls:  providerModelParallelToolCallsFromRaw(raw),
 			disabled:           disabled,
 			raw:                mergeProviderModelRaw(raw, supportedEndpoints),
 		})
 	}
 
 	return models, nil
+}
+
+func providerModelParallelToolCallsFromRaw(raw json.RawMessage) *bool {
+	var parsed struct {
+		Capabilities struct {
+			Supports struct {
+				ParallelToolCalls *bool `json:"parallel_tool_calls"`
+			} `json:"supports"`
+		} `json:"capabilities"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil
+	}
+	return cloneBoolPtr(parsed.Capabilities.Supports.ParallelToolCalls)
 }
 
 func openRouterModelSupportsTools(supportedParams []string) bool {
@@ -1945,6 +2035,7 @@ func decodeOpenAICodexModelsFromBody(provider *providerRuntime, body []byte) ([]
 			upstreamModel:      publicID,
 			providerID:         provider.id,
 			supportedEndpoints: append([]string(nil), openAICodexProviderEndpoints...),
+			parallelToolCalls:  cloneBoolPtr(&parsed.SupportsParallelToolCalls),
 			raw:                modelRaw,
 		})
 	}

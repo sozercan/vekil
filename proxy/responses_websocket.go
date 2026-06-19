@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -19,6 +21,11 @@ import (
 )
 
 const responsesWebSocketRequestHeaderPrefix = "ws_request_header_"
+
+var (
+	responsesWebSocketWriteWait  = 10 * time.Second
+	responsesWebSocketPingPeriod = 30 * time.Second
+)
 
 // errStreamFailedUpstream is a sentinel error indicating the upstream stream
 // ended with response.failed or response.incomplete after forwarding the
@@ -82,6 +89,11 @@ type responsesWebSocketSession struct {
 	historyItems   []json.RawMessage
 	toolContexts   *ToolExecutionContextStore
 	toolScope      string
+	done           chan struct{}
+	doneOnce       sync.Once
+	inflightMu     sync.Mutex
+	inflightCancel context.CancelFunc
+	inflightGen    uint64
 }
 
 type responsesWebSocketRequestPlan struct {
@@ -154,6 +166,10 @@ func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.R
 		http.Error(w, http.StatusText(http.StatusUpgradeRequired), http.StatusUpgradeRequired)
 		return
 	}
+	if h.responsesWebSocketIsDraining() {
+		http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+		return
+	}
 
 	conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -163,6 +179,13 @@ func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.R
 
 	conn.SetReadLimit(maxRequestBodySize)
 	session := newResponsesWebSocketSession(conn, r)
+	session.startPingLoop()
+	if !h.registerResponsesWebSocketSession(session) {
+		session.sendGoingAwayWithDeadline(time.Now().Add(responsesWebSocketWriteWait))
+		return
+	}
+	defer h.unregisterResponsesWebSocketSession(session)
+	defer session.closeDone()
 
 	for {
 		messageType, payload, err := conn.ReadMessage()
@@ -171,13 +194,13 @@ func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.R
 		}
 		if messageType != websocket.TextMessage {
 			session.sendWrappedError(http.StatusBadRequest, "responses websocket only accepts text frames", "invalid_request_error", nil)
-			return
+			continue
 		}
 
 		frameType, err := parseResponsesWebSocketFrameType(payload)
 		if err != nil {
 			session.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
-			return
+			continue
 		}
 		if frameType == "response.processed" {
 			continue
@@ -186,13 +209,162 @@ func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.R
 		request, err := parseResponsesWebSocketCreateRequest(payload)
 		if err != nil {
 			session.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
-			return
+			continue
 		}
 
 		if err := session.handleCreateRequest(h, request); err != nil {
 			h.log.Debug("responses websocket request failed", logger.Err(err))
-			return
+			continue
 		}
+	}
+}
+
+func (h *ProxyHandler) registerResponsesWebSocketSession(session *responsesWebSocketSession) bool {
+	if h == nil || session == nil {
+		return false
+	}
+	h.responsesWSSessionsMu.Lock()
+	defer h.responsesWSSessionsMu.Unlock()
+	if h.responsesWSDraining {
+		return false
+	}
+	if h.responsesWSSessions == nil {
+		h.responsesWSSessions = make(map[*responsesWebSocketSession]struct{})
+	}
+	h.responsesWSSessions[session] = struct{}{}
+	return true
+}
+
+func (h *ProxyHandler) unregisterResponsesWebSocketSession(session *responsesWebSocketSession) {
+	if h == nil || session == nil {
+		return
+	}
+	h.responsesWSSessionsMu.Lock()
+	defer h.responsesWSSessionsMu.Unlock()
+	delete(h.responsesWSSessions, session)
+}
+
+func (h *ProxyHandler) responsesWebSocketIsDraining() bool {
+	if h == nil {
+		return true
+	}
+	h.responsesWSSessionsMu.Lock()
+	defer h.responsesWSSessionsMu.Unlock()
+	return h.responsesWSDraining
+}
+
+func (h *ProxyHandler) ShutdownWebSocketSessions(ctx context.Context) {
+	if h == nil {
+		return
+	}
+	h.responsesWSSessionsMu.Lock()
+	h.responsesWSDraining = true
+	sessions := make([]*responsesWebSocketSession, 0, len(h.responsesWSSessions))
+	for session := range h.responsesWSSessions {
+		sessions = append(sessions, session)
+	}
+	h.responsesWSSessionsMu.Unlock()
+
+	for _, session := range sessions {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		session.sendGoingAwayWithDeadline(responsesWebSocketShutdownCloseDeadline(ctx))
+	}
+}
+
+func (s *responsesWebSocketSession) closeDone() {
+	if s == nil || s.done == nil {
+		return
+	}
+	s.doneOnce.Do(func() { close(s.done) })
+}
+
+func (s *responsesWebSocketSession) startPingLoop() {
+	if s == nil || s.conn == nil || responsesWebSocketPingPeriod <= 0 {
+		return
+	}
+	ticker := time.NewTicker(responsesWebSocketPingPeriod)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				deadline := time.Now().Add(responsesWebSocketWriteWait)
+				if err := s.conn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+					s.cancelInflight()
+					_ = s.conn.Close()
+					s.closeDone()
+					return
+				}
+			case <-s.done:
+				return
+			}
+		}
+	}()
+}
+
+func responsesWebSocketShutdownCloseDeadline(ctx context.Context) time.Time {
+	deadline := time.Now().Add(responsesWebSocketWriteWait)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		return ctxDeadline
+	}
+	return deadline
+}
+
+func (s *responsesWebSocketSession) sendGoingAwayWithDeadline(deadline time.Time) {
+	if s == nil || s.conn == nil {
+		return
+	}
+	s.cancelInflight()
+	if deadline.IsZero() {
+		deadline = time.Now().Add(responsesWebSocketWriteWait)
+	}
+	_ = s.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "server shutting down"), deadline)
+	_ = s.conn.Close()
+	s.closeDone()
+}
+
+// setInflightCancel records the cancel func for the current in-flight upstream
+// call and returns a generation token. The token must be passed to
+// clearInflightCancel so that only the matching cancel is cleared: nested or
+// subsequent in-flight calls (e.g. auto-compaction inside a create request)
+// bump the generation, and a stale clear is then a no-op rather than nilling
+// out a newer cancel. (context.CancelFunc values are not comparable, so the
+// generation token stands in for identity.)
+func (s *responsesWebSocketSession) setInflightCancel(cancel context.CancelFunc) uint64 {
+	if s == nil || cancel == nil {
+		return 0
+	}
+	s.inflightMu.Lock()
+	defer s.inflightMu.Unlock()
+	s.inflightGen++
+	s.inflightCancel = cancel
+	return s.inflightGen
+}
+
+func (s *responsesWebSocketSession) clearInflightCancel(gen uint64) {
+	if s == nil || gen == 0 {
+		return
+	}
+	s.inflightMu.Lock()
+	defer s.inflightMu.Unlock()
+	if s.inflightGen == gen {
+		s.inflightCancel = nil
+	}
+}
+
+func (s *responsesWebSocketSession) cancelInflight() {
+	if s == nil {
+		return
+	}
+	s.inflightMu.Lock()
+	cancel := s.inflightCancel
+	s.inflightMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -240,6 +412,7 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 		// upstream during this proxy-owned websocket session.
 		toolContexts: NewToolExecutionContextStore(),
 		toolScope:    "responses-ws:" + uuid.NewString(),
+		done:         make(chan struct{}),
 	}
 }
 
@@ -367,7 +540,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	}
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
-	defer upstreamCancel()
+	inflightGen := s.setInflightCancel(upstreamCancel)
+	defer func() {
+		s.clearInflightCancel(inflightGen)
+		upstreamCancel()
+	}()
 
 	resp, translated, translatedHeaders, err := h.prepareResponsesStream(s.ctx, upstreamCtx, request.Model, func() (*http.Response, error) {
 		attemptPlan, err := s.planRequest(h, request)
@@ -614,7 +791,11 @@ func (s *responsesWebSocketSession) rememberPlannedResponse(plan responsesWebSoc
 
 func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, request *responsesWebSocketCreateRequest, metrics responsesWebSocketRequestMetrics) responsesWebSocketRequestMetrics {
 	ctx, cancel := h.newInferenceUpstreamContext(true)
-	defer cancel()
+	inflightGen := s.setInflightCancel(cancel)
+	defer func() {
+		s.clearInflightCancel(inflightGen)
+		cancel()
+	}()
 
 	compaction, compacted, err := s.compactHistory(h, ctx, request, false)
 	if err != nil {
@@ -889,6 +1070,7 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 			}
 		}
 
+		_ = s.conn.SetWriteDeadline(time.Now().Add(responsesWebSocketWriteWait))
 		if err := s.conn.WriteMessage(websocket.TextMessage, []byte(data)); err != nil {
 			return err
 		}
@@ -944,6 +1126,7 @@ func (s *responsesWebSocketSession) writeJSON(payload interface{}) error {
 	if err != nil {
 		return err
 	}
+	_ = s.conn.SetWriteDeadline(time.Now().Add(responsesWebSocketWriteWait))
 	return s.conn.WriteMessage(websocket.TextMessage, encoded)
 }
 

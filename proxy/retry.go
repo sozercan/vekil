@@ -2,23 +2,42 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/sozercan/vekil/logger"
 )
 
-const upstreamErrorDetailDrainTimeout = 250 * time.Millisecond
+const (
+	upstreamErrorDetailDrainTimeout = 250 * time.Millisecond
+	maxRetryBackoff                 = 30 * time.Second
+	maxRetryAfter                   = 5 * time.Minute
+)
 
 // retryable returns true for status codes that warrant a retry.
 func retryable(statusCode int) bool {
 	switch statusCode {
-	case http.StatusTooManyRequests,
+	case http.StatusRequestTimeout,
+		http.StatusTooManyRequests,
 		http.StatusBadGateway,
 		http.StatusServiceUnavailable,
-		http.StatusGatewayTimeout:
+		http.StatusGatewayTimeout,
+		529, // Anthropic overloaded_error
+		520, // Cloudflare: web server returned an unknown error
+		521, // Cloudflare: web server is down
+		522, // Cloudflare: connection timed out
+		523, // Cloudflare: origin is unreachable
+		524, // Cloudflare: a timeout occurred
+		530: // Cloudflare: origin DNS / origin error
 		return true
 	}
 	return false
@@ -26,23 +45,62 @@ func retryable(statusCode int) bool {
 
 // backoff returns the delay for the given attempt (0-indexed) with jitter.
 func backoff(base time.Duration, attempt int) time.Duration {
-	delay := base << uint(attempt)
-	jitter := time.Duration(rand.Int64N(int64(delay / 4)))
-	return delay + jitter
+	if base <= 0 {
+		base = time.Nanosecond
+	}
+	if attempt < 0 {
+		attempt = 0
+	}
+
+	delay := base
+	for range attempt {
+		if delay >= maxRetryBackoff || delay > maxRetryBackoff/2 {
+			delay = maxRetryBackoff
+			break
+		}
+		delay *= 2
+	}
+	if delay > maxRetryBackoff {
+		delay = maxRetryBackoff
+	}
+
+	jitterBound := delay / 4
+	if jitterBound <= 0 {
+		return delay
+	}
+	return delay + time.Duration(rand.Int64N(int64(jitterBound)))
 }
 
 // parseRetryAfter extracts a delay from a Retry-After header value.
-// It supports both delay-seconds ("120") and is intentionally simple —
-// HTTP-date values are ignored and fall back to the caller's default.
+// It supports both delay-seconds ("120") and HTTP-date values.
 func parseRetryAfter(value string) (time.Duration, bool) {
 	if value == "" {
 		return 0, false
 	}
 	seconds, err := strconv.Atoi(value)
-	if err != nil || seconds <= 0 {
+	if err == nil {
+		if seconds <= 0 {
+			return 0, false
+		}
+		return clampRetryAfter(time.Duration(seconds) * time.Second), true
+	}
+
+	retryAt, err := http.ParseTime(value)
+	if err != nil {
 		return 0, false
 	}
-	return time.Duration(seconds) * time.Second, true
+	delay := time.Until(retryAt)
+	if delay <= 0 {
+		return 0, false
+	}
+	return clampRetryAfter(delay), true
+}
+
+func clampRetryAfter(delay time.Duration) time.Duration {
+	if delay > maxRetryAfter {
+		return maxRetryAfter
+	}
+	return delay
 }
 
 // drainAndClose discards up to 4 KB from the body before closing it so that
@@ -75,8 +133,13 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		resp, err := h.client.Do(req)
 		if err != nil {
 			lastErr = err
+			if permanentTransportError(err) {
+				return nil, err
+			}
 			if attempt < maxRetries-1 {
-				if ctxErr := sleepWithContext(req.Context(), backoff(retryDelay, attempt)); ctxErr != nil {
+				delay := backoff(retryDelay, attempt)
+				h.logRetryAttempt(attempt, 0, "", delay, err)
+				if ctxErr := sleepWithContext(req.Context(), delay); ctxErr != nil {
 					return nil, ctxErr
 				}
 			}
@@ -102,6 +165,7 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 			if ra, ok := parseRetryAfter(retryAfterHeader); ok && ra > delay {
 				delay = ra
 			}
+			h.logRetryAttempt(attempt, resp.StatusCode, retryAfterHeader, delay, nil)
 			if ctxErr := sleepWithContext(req.Context(), delay); ctxErr != nil {
 				return nil, ctxErr
 			}
@@ -110,6 +174,56 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		}
 	}
 	return nil, lastErr
+}
+
+func (h *ProxyHandler) logRetryAttempt(attempt int, status int, retryAfter string, delay time.Duration, err error) {
+	if h == nil || h.log == nil {
+		return
+	}
+	fields := []logger.Field{
+		logger.F("attempt", attempt),
+		logger.F("delay", delay.String()),
+	}
+	if status != 0 {
+		fields = append(fields, logger.F("status", status))
+	}
+	if retryAfter != "" {
+		fields = append(fields, logger.F("retry_after", retryAfter))
+	}
+	if err != nil {
+		fields = append(fields, logger.Err(err))
+	}
+	h.log.Debug("retrying upstream request", fields...)
+}
+
+func permanentTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var certVerifyErr *tls.CertificateVerificationError
+	if errors.As(err, &certVerifyErr) {
+		return true
+	}
+	var unknownAuthorityErr x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuthorityErr) {
+		return true
+	}
+	var hostnameErr x509.HostnameError
+	if errors.As(err, &hostnameErr) {
+		return true
+	}
+	var certInvalidErr x509.CertificateInvalidError
+	if errors.As(err, &certInvalidErr) {
+		return true
+	}
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+		return true
+	}
+
+	return strings.Contains(strings.ToLower(err.Error()), "unsupported protocol scheme")
 }
 
 // sleepWithContext blocks for the given duration or until the context is done,

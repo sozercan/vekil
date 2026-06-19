@@ -117,7 +117,7 @@ func mergeHeaderValues(dst, src http.Header) {
 	}
 }
 
-func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*providerRuntime, []byte, error) {
+func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*providerRuntime, providerModel, []byte, error) {
 	model := extractRequestModel(body)
 	lookupModel := model
 	if endpoint == providerEndpointMessages {
@@ -125,32 +125,70 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 	}
 	provider, owner, known := h.resolveProviderModel(lookupModel, endpoint)
 	if provider == nil {
-		return nil, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no provider available for endpoint %s", endpoint)}
+		return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no provider available for endpoint %s", endpoint)}
 	}
 	if !provider.supportsEndpoint(endpoint) {
-		return nil, nil, &providerRequestError{
+		return nil, providerModel{}, nil, &providerRequestError{
 			statusCode: http.StatusBadRequest,
 			err:        fmt.Errorf("provider %q does not support %s", provider.id, endpoint),
 		}
 	}
 	if known && !providerModelSupportsEndpoint(owner, endpoint) {
-		return nil, nil, &providerRequestError{
+		return nil, providerModel{}, nil, &providerRequestError{
 			statusCode: http.StatusBadRequest,
 			err:        fmt.Errorf("model %q does not support %s", model, endpoint),
 		}
 	}
 	if !known && !provider.allowsUnknownModelEndpoint(endpoint) {
-		return nil, nil, &providerRequestError{
+		return nil, providerModel{}, nil, &providerRequestError{
 			statusCode: http.StatusBadRequest,
 			err:        fmt.Errorf("model %q does not support %s", model, endpoint),
 		}
 	}
 
-	rewrittenBody, _, err := rewriteRequestModelForProvider(body, owner.upstreamModel)
-	if err != nil {
-		return nil, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+	rewrittenBody := body
+	if !providerUsesAzureClassicDeploymentPath(provider, endpoint) {
+		var err error
+		rewrittenBody, _, err = rewriteRequestModelForProvider(body, owner.upstreamModel)
+		if err != nil {
+			return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+		}
 	}
-	return provider, rewrittenBody, nil
+	rewrittenBody = applyProviderModelRequestPolicy(rewrittenBody, owner)
+	return provider, owner, rewrittenBody, nil
+}
+
+func applyProviderModelRequestPolicy(body []byte, owner providerModel) []byte {
+	if !owner.dropSamplingParams && (owner.parallelToolCalls == nil || *owner.parallelToolCalls) {
+		return body
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	changed := false
+	if owner.dropSamplingParams {
+		for _, field := range []string{"temperature", "top_p"} {
+			if _, ok := payload[field]; ok {
+				delete(payload, field)
+				changed = true
+			}
+		}
+	}
+	if owner.parallelToolCalls != nil && !*owner.parallelToolCalls {
+		if _, ok := payload["parallel_tool_calls"]; ok {
+			delete(payload, "parallel_tool_calls")
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return rewritten
 }
 
 func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body []byte) (*http.Response, error) {
@@ -158,13 +196,13 @@ func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body [
 }
 
 func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	provider, rewrittenBody, err := h.resolveProviderRequest(body, path)
+	provider, owner, rewrittenBody, err := h.resolveProviderRequest(body, path)
 	if err != nil {
 		return nil, err
 	}
 
 	return h.doWithRetry(func() (*http.Request, error) {
-		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "")
+		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "", owner)
 		if err != nil {
 			return nil, err
 		}
@@ -185,7 +223,7 @@ func (h *ProxyHandler) postAnthropicMessages(ctx context.Context, body []byte, e
 }
 
 func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	provider, rewrittenBody, err := h.resolveProviderRequest(body, providerEndpointMessages)
+	provider, owner, rewrittenBody, err := h.resolveProviderRequest(body, providerEndpointMessages)
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +235,7 @@ func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, bod
 	}
 
 	return h.doWithRetry(func() (*http.Request, error) {
-		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, providerEndpointMessagesCount, rewrittenBody, extraHeaders, "")
+		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, providerEndpointMessagesCount, rewrittenBody, extraHeaders, "", owner)
 		if err != nil {
 			return nil, err
 		}

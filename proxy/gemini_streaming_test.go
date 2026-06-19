@@ -465,8 +465,8 @@ func TestStreamOpenAIToGemini_NoTailWithoutDone(t *testing.T) {
 	StreamOpenAIToGemini(w, body)
 
 	frames := parseGeminiSSEFrames(w.Body.String())
-	if len(frames) != 1 {
-		t.Fatalf("len(frames) = %d, want 1\nraw:\n%s", len(frames), w.Body.String())
+	if len(frames) != 2 {
+		t.Fatalf("len(frames) = %d, want 2\nraw:\n%s", len(frames), w.Body.String())
 	}
 
 	var first models.GeminiGenerateContentResponse
@@ -478,5 +478,12 @@ func TestStreamOpenAIToGemini_NoTailWithoutDone(t *testing.T) {
 	}
 	if len(first.Candidates) == 0 || first.Candidates[0].FinishReason != "" {
 		t.Fatalf("unexpected finish reason in non-terminal frame: %#v", first.Candidates)
+	}
+	var errFrame models.GeminiErrorResponse
+	if err := json.Unmarshal([]byte(frames[1]), &errFrame); err != nil {
+		t.Fatalf("unmarshal error frame: %v", err)
+	}
+	if errFrame.Error.Message == "" {
+		t.Fatalf("expected truncation error frame, got %#v", errFrame)
 	}
 }

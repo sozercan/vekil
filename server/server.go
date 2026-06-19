@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net"
@@ -15,9 +16,10 @@ import (
 
 // Server encapsulates the HTTP server lifecycle.
 type Server struct {
-	httpServer *http.Server
-	log        *logger.Logger
-	running    atomic.Bool
+	httpServer   *http.Server
+	proxyHandler *proxy.ProxyHandler
+	log          *logger.Logger
+	running      atomic.Bool
 }
 
 type options struct {
@@ -72,6 +74,91 @@ func WithCompactUpstreamMaxAttempts(max int) Option {
 	return WithProxyOptions(proxy.WithCompactUpstreamMaxAttempts(max))
 }
 
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (r *responseRecorder) WriteHeader(status int) {
+	if r.status != 0 {
+		return
+	}
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *responseRecorder) Write(p []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	n, err := r.ResponseWriter.Write(p)
+	r.bytes += int64(n)
+	return n, err
+}
+
+func (r *responseRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (r *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+	conn, rw, err := h.Hijack()
+	if err != nil {
+		return nil, nil, err
+	}
+	if r.status == 0 {
+		r.status = http.StatusSwitchingProtocols
+	}
+	return conn, rw, nil
+}
+
+func (r *responseRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+
+func withRequestLog(next http.Handler, log *logger.Logger) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		recorder := &responseRecorder{ResponseWriter: w}
+		ctx, summary := proxy.WithRequestSummary(r.Context())
+		next.ServeHTTP(recorder, r.WithContext(ctx))
+		status := recorder.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		if log != nil {
+			fields := []logger.Field{
+				logger.F("method", r.Method),
+				logger.F("path", r.URL.Path),
+				logger.F("status", status),
+				logger.F("bytes", recorder.bytes),
+				logger.F("duration_ms", time.Since(start).Milliseconds()),
+			}
+			if requestID := proxy.UpstreamRequestID(recorder.Header()); requestID != "" {
+				summaryFields := summary.LoggerFields()
+				alreadyCaptured := false
+				for _, field := range summaryFields {
+					if field.Key == "upstream_request_id" {
+						alreadyCaptured = true
+						break
+					}
+				}
+				if !alreadyCaptured {
+					fields = append(fields, logger.F("upstream_request_id", requestID))
+				}
+			}
+			fields = append(fields, summary.LoggerFields()...)
+			log.Info("request completed", fields...)
+		}
+	})
+}
+
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
 	cfg := options{}
@@ -105,12 +192,13 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	return &Server{
 		httpServer: &http.Server{
 			Addr:         addr,
-			Handler:      mux,
+			Handler:      withRequestLog(mux, log),
 			ReadTimeout:  30 * time.Second,
 			WriteTimeout: handler.ServerWriteTimeout(),
 			IdleTimeout:  120 * time.Second,
 		},
-		log: log,
+		proxyHandler: handler,
+		log:          log,
 	}, nil
 }
 
@@ -137,6 +225,9 @@ func (s *Server) Start() error {
 
 // Stop performs a graceful shutdown of the server.
 func (s *Server) Stop(ctx context.Context) error {
+	if s.proxyHandler != nil {
+		s.proxyHandler.ShutdownWebSocketSessions(ctx)
+	}
 	err := s.httpServer.Shutdown(ctx)
 	s.running.Store(false)
 	return err

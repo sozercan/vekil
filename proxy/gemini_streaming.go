@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -55,6 +56,7 @@ func StreamOpenAIToGeminiWithFinalResponse(
 	w http.ResponseWriter,
 	body io.ReadCloser,
 	onFinalResponse func(*models.OpenAIResponse),
+	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
@@ -64,14 +66,28 @@ func StreamOpenAIToGeminiWithFinalResponse(
 	if onFinalResponse != nil {
 		aggregator = newOpenAIResponseAggregator()
 	}
+	onUsage := firstOpenAIUsageCallback(onUsageCallbacks)
 
 	sawDone, err := consumeOpenAIStreamChunks(body, func(chunk models.OpenAIStreamChunk) bool {
+		if onUsage != nil && chunk.Usage != nil {
+			onUsage(chunk.Usage)
+		}
 		if aggregator != nil {
 			aggregator.addChunk(chunk)
 		}
 		return state.consumeChunk(chunk)
 	})
-	if err != nil || !sawDone {
+	if err != nil {
+		var streamErr *openAIStreamError
+		if errors.As(err, &streamErr) {
+			state.writeError(streamErr.Error())
+			return
+		}
+		state.writeError(fmt.Sprintf("upstream stream read failed: %v", err))
+		return
+	}
+	if !sawDone {
+		state.writeError("upstream stream ended before [DONE]")
 		return
 	}
 
@@ -296,4 +312,18 @@ func (s *geminiStreamState) writeTail() bool {
 
 func (s *geminiStreamState) writeData(data interface{}) bool {
 	return writeGeminiSSEData(s.w, data) == nil
+}
+
+func (s *geminiStreamState) writeError(message string) bool {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "upstream stream ended unexpectedly"
+	}
+	return s.writeData(models.GeminiErrorResponse{
+		Error: models.GeminiError{
+			Code:    http.StatusBadGateway,
+			Message: message,
+			Status:  "UNAVAILABLE",
+		},
+	})
 }

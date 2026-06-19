@@ -3273,3 +3273,52 @@ func TestResponsesWebSocketRememberPlannedResponseResetsCompactionTrigger(t *tes
 		t.Fatalf("historyItems = %s, want reset empty history", session.historyItems)
 	}
 }
+
+func TestHandleResponsesWebSocket_SendsPingAndAcceptsPong(t *testing.T) {
+	oldWriteWait := responsesWebSocketWriteWait
+	oldPingPeriod := responsesWebSocketPingPeriod
+	responsesWebSocketWriteWait = 50 * time.Millisecond
+	responsesWebSocketPingPeriod = 10 * time.Millisecond
+	t.Cleanup(func() {
+		responsesWebSocketWriteWait = oldWriteWait
+		responsesWebSocketPingPeriod = oldPingPeriod
+	})
+
+	handler := &ProxyHandler{log: logger.New(logger.LevelError), responsesWS: ResponsesWebSocketConfig{Enabled: true}}
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	pinged := make(chan struct{})
+	var once sync.Once
+	conn.SetPingHandler(func(appData string) error {
+		once.Do(func() { close(pinged) })
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
+	})
+
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		for {
+			if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				return
+			}
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-pinged:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for websocket ping")
+	}
+
+	_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "done"), time.Now().Add(time.Second))
+	select {
+	case <-readDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for websocket reader to finish")
+	}
+}

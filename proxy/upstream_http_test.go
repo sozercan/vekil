@@ -1,9 +1,12 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -84,7 +87,7 @@ func TestExtractRequestModel(t *testing.T) {
 func TestResolveProviderRequest_RewritesConfiguredResponsesModelToProviderDeployment(t *testing.T) {
 	handler := newProviderRoutingTestHandler(t, []string{"/responses"})
 
-	provider, rewrittenBody, err := handler.resolveProviderRequest([]byte(`{"model":"gpt-5-public","input":"hello"}`), "/responses")
+	provider, _, rewrittenBody, err := handler.resolveProviderRequest([]byte(`{"model":"gpt-5-public","input":"hello"}`), "/responses")
 	if err != nil {
 		t.Fatalf("resolveProviderRequest() error = %v", err)
 	}
@@ -112,7 +115,7 @@ func TestResolveProviderRequest_RewritesConfiguredResponsesModelToProviderDeploy
 func TestResolveProviderRequest_RejectsKnownModelWithoutEndpointSupport(t *testing.T) {
 	handler := newProviderRoutingTestHandler(t, []string{"/responses"})
 
-	provider, rewrittenBody, err := handler.resolveProviderRequest([]byte(`{"model":"gpt-5-public","messages":[{"role":"user","content":"hello"}]}`), "/chat/completions")
+	provider, _, rewrittenBody, err := handler.resolveProviderRequest([]byte(`{"model":"gpt-5-public","messages":[{"role":"user","content":"hello"}]}`), "/chat/completions")
 	if err == nil {
 		t.Fatal("resolveProviderRequest() error = nil, want unsupported endpoint error")
 	}
@@ -140,7 +143,7 @@ func TestResponsesRequestRewriting_StripsUnsupportedImageGenerationToolForAzure(
 	originalBody := []byte(`{"model":"gpt-5-public","input":"hello","tools":[{"type":"function","name":"lookup_weather","description":"Lookup the weather","parameters":{"type":"object","properties":{}}},{"type":"image_generation"}],"tool_choice":"auto"}`)
 
 	rewrittenForResponses := handler.rewriteResponsesRequestBody(originalBody, "responses", true)
-	provider, rewrittenBody, err := handler.resolveProviderRequest(rewrittenForResponses, "/responses")
+	provider, _, rewrittenBody, err := handler.resolveProviderRequest(rewrittenForResponses, "/responses")
 	if err != nil {
 		t.Fatalf("resolveProviderRequest() error = %v", err)
 	}
@@ -184,7 +187,7 @@ func TestResponsesRequestRewriting_StripsUnsupportedImageGenerationToolForDefaul
 	originalBody := []byte(`{"model":"gpt-5.4","input":"hello","tools":[{"type":"image_generation"}],"tool_choice":"required"}`)
 
 	rewrittenForResponses := handler.rewriteResponsesRequestBody(originalBody, "responses", true)
-	provider, rewrittenBody, err := handler.resolveProviderRequest(rewrittenForResponses, "/responses")
+	provider, _, rewrittenBody, err := handler.resolveProviderRequest(rewrittenForResponses, "/responses")
 	if err != nil {
 		t.Fatalf("resolveProviderRequest() error = %v", err)
 	}
@@ -216,7 +219,7 @@ func TestResponsesRequestRewriting_StripsUnsupportedImageGenerationToolChoiceFor
 	originalBody := []byte(`{"model":"gpt-5-public","input":"hello","tools":[{"type":"function","name":"lookup_weather","description":"Lookup the weather","parameters":{"type":"object","properties":{}}},{"type":"image_generation"}],"tool_choice":{"type":"image_generation"}}`)
 
 	rewrittenForResponses := handler.rewriteResponsesRequestBody(originalBody, "responses", true)
-	provider, rewrittenBody, err := handler.resolveProviderRequest(rewrittenForResponses, "/responses")
+	provider, _, rewrittenBody, err := handler.resolveProviderRequest(rewrittenForResponses, "/responses")
 	if err != nil {
 		t.Fatalf("resolveProviderRequest() error = %v", err)
 	}
@@ -306,5 +309,67 @@ func TestRewriteRequestModelForProvider_RewritesGenericJSONModelAndNoopsWhenUnch
 	}
 	if string(unchangedBody) != string(rewrittenBody) {
 		t.Fatalf("rewriteRequestModelForProvider(already mapped) body changed: got %s want %s", unchangedBody, rewrittenBody)
+	}
+}
+
+func TestPostChatCompletions_UsesAzureClassicDeploymentURLAndKeepsPublicBodyModel(t *testing.T) {
+	var sawRequest bool
+	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawRequest = true
+		if got, want := r.URL.Path, "/openai/deployments/gpt-5-4-prod/chat/completions"; got != want {
+			t.Fatalf("upstream path = %q, want %q", got, want)
+		}
+		if got, want := r.URL.Query().Get("api-version"), "2025-04-01-preview"; got != want {
+			t.Fatalf("api-version = %q, want %q", got, want)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		var payload map[string]json.RawMessage
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("unmarshal upstream body: %v", err)
+		}
+		if got := rawJSONString(payload["model"]); got != "gpt-5-public" {
+			t.Fatalf("upstream body model = %q, want public model to remain unchanged", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-test","choices":[]}`))
+	}))
+	defer azureServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:         "azure",
+				Type:       "azure-openai",
+				Default:    true,
+				BaseURL:    azureServer.URL + "/openai",
+				APIVersion: "2025-04-01-preview",
+				APIKey:     "azure-test-key",
+				Models: []ProviderModelConfig{{
+					PublicID:   "gpt-5-public",
+					Deployment: "gpt-5-4-prod",
+					Endpoints:  []string{providerEndpointChatCompletions},
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+
+	resp, err := handler.postChatCompletions(context.Background(), []byte(`{"model":"gpt-5-public","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("postChatCompletions() error = %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want 200", resp.StatusCode)
+	}
+	if !sawRequest {
+		t.Fatal("upstream server was not called")
 	}
 }

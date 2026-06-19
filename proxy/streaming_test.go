@@ -19,7 +19,7 @@ func buildSSEStream(chunks ...string) io.ReadCloser {
 }
 
 func oversizedSSEPayload() string {
-	return strings.Repeat("x", openAIStreamScannerMaxBuffer+32)
+	return strings.Repeat("x", 1024*1024+32)
 }
 
 type sseEvent struct {
@@ -944,7 +944,8 @@ func TestConvertFinishReason(t *testing.T) {
 		{"length", "length", "max_tokens"},
 		{"tool_calls", "tool_calls", "tool_use"},
 		{"content_filter", "content_filter", "end_turn"},
-		{"unknown", "unknown_reason", "unknown_reason"},
+		{"function_call", "function_call", "tool_use"},
+		{"unknown", "unknown_reason", "end_turn"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1656,12 +1657,12 @@ func TestAggregateStreamToResponse_ErrorsOnScannerFailure(t *testing.T) {
 		"[DONE]",
 	)
 
-	if _, err := aggregateStreamToResponse(body); err == nil {
-		t.Fatal("expected error on scanner failure")
+	if _, err := aggregateStreamToResponse(body); err != nil {
+		t.Fatalf("unexpected error after oversized non-JSON SSE data: %v", err)
 	}
 }
 
-func TestStreamOpenAIToAnthropic_NoSuccessTailOnScannerFailure(t *testing.T) {
+func TestStreamOpenAIToAnthropic_ContinuesAfterOversizedNonJSONData(t *testing.T) {
 	body := buildSSEStream(
 		`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"}}]}`,
 		oversizedSSEPayload(),
@@ -1672,9 +1673,53 @@ func TestStreamOpenAIToAnthropic_NoSuccessTailOnScannerFailure(t *testing.T) {
 	StreamOpenAIToAnthropic(w, body, "claude-sonnet-4", "req-scan-fail")
 
 	events := parseSSEEvents(w.Body.String())
+	foundStop := false
 	for _, evt := range events {
-		if evt.Event == "message_delta" || evt.Event == "message_stop" {
-			t.Fatalf("unexpected terminal success event %q after scanner failure\nraw:\n%s", evt.Event, w.Body.String())
+		if evt.Event == "message_stop" {
+			foundStop = true
 		}
+	}
+	if !foundStop {
+		t.Fatalf("expected stream to continue to message_stop after oversized non-JSON data\nraw:\n%s", w.Body.String())
+	}
+}
+
+func TestStreamOpenAIToAnthropic_TruncatedStreamEmitsErrorWithoutMessageStop(t *testing.T) {
+	body := buildSSEStream(`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"partial"}}]}`)
+	w := httptest.NewRecorder()
+
+	StreamOpenAIToAnthropic(w, body, "claude-sonnet-4", "req-truncated")
+
+	events := parseSSEEvents(w.Body.String())
+	foundError := false
+	for _, evt := range events {
+		if evt.Event == "message_stop" {
+			t.Fatalf("unexpected message_stop for truncated stream\nraw:\n%s", w.Body.String())
+		}
+		if evt.Event == "error" {
+			foundError = true
+			if !strings.Contains(evt.Data, "upstream stream ended before [DONE]") {
+				t.Fatalf("error event data = %s, want truncation message", evt.Data)
+			}
+		}
+	}
+	if !foundError {
+		t.Fatalf("missing error event for truncated stream\nraw:\n%s", w.Body.String())
+	}
+}
+
+func TestConsumeOpenAIStreamChunks_ErrorsOnOverLimitSSELine(t *testing.T) {
+	largeMalformed := strings.Repeat("x", openAIStreamScannerMaxBuffer+32)
+	body := buildSSEStream(
+		`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"ok"}}]}`,
+		largeMalformed,
+		"[DONE]",
+	)
+	_, err := aggregateStreamToResponse(body)
+	if err == nil {
+		t.Fatal("expected error for over-limit SSE line")
+	}
+	if !strings.Contains(err.Error(), "SSE line exceeds") {
+		t.Fatalf("error = %v, want SSE line limit", err)
 	}
 }

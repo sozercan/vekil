@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"unicode/utf8"
 )
@@ -28,6 +29,12 @@ func formatUpstreamRequestFailure(err error, fallback string) string {
 	var upstreamErr *upstreamError
 	if errors.As(err, &upstreamErr) {
 		return upstreamErr.Error()
+	}
+	var providerErr *providerRequestError
+	if errors.As(err, &providerErr) {
+		if detail := sanitizeUpstreamErrorText(providerErr.Error()); detail != "" {
+			return detail
+		}
 	}
 	return fallback
 }
@@ -97,12 +104,13 @@ func summarizeJSONErrorValue(raw json.RawMessage) string {
 		}
 	}
 
-	attrs := make([]string, 0, 4)
+	attrs := make([]string, 0, 6)
 	for _, key := range []string{"type", "code", "param", "status"} {
 		if value := rawJSONErrorString(obj[key]); value != "" {
 			attrs = append(attrs, key+"="+value)
 		}
 	}
+	attrs = append(attrs, summarizeJSONInnerError(obj["innererror"])...)
 
 	if message == "" {
 		return strings.Join(attrs, ", ")
@@ -111,6 +119,55 @@ func summarizeJSONErrorValue(raw json.RawMessage) string {
 		return message
 	}
 	return message + " (" + strings.Join(attrs, ", ") + ")"
+}
+
+func summarizeJSONInnerError(raw json.RawMessage) []string {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	var inner map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &inner); err != nil {
+		return nil
+	}
+	attrs := make([]string, 0, 2)
+	if code := rawJSONErrorString(inner["code"]); code != "" {
+		attrs = append(attrs, "innererror.code="+code)
+	}
+	if filtered := summarizeContentFilterResult(inner["content_filter_result"]); filtered != "" {
+		attrs = append(attrs, "content_filter="+filtered)
+	}
+	return attrs
+}
+
+func summarizeContentFilterResult(raw json.RawMessage) string {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return ""
+	}
+	var categories map[string]struct {
+		Filtered bool   `json:"filtered"`
+		Severity string `json:"severity"`
+	}
+	if err := json.Unmarshal(raw, &categories); err != nil {
+		return ""
+	}
+	parts := make([]string, 0, len(categories))
+	for category, result := range categories {
+		if !result.Filtered {
+			continue
+		}
+		category = sanitizeUpstreamErrorText(category)
+		severity := sanitizeUpstreamErrorText(result.Severity)
+		if category == "" {
+			continue
+		}
+		if severity != "" {
+			parts = append(parts, category+"="+severity)
+		} else {
+			parts = append(parts, category)
+		}
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ";")
 }
 
 func rawJSONErrorString(raw json.RawMessage) string {

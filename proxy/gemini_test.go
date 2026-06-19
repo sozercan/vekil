@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2493,4 +2494,122 @@ func TestHandleGeminiModelsErrors(t *testing.T) {
 
 func floatPtr(v float64) *float64 {
 	return &v
+}
+
+func TestHandleGeminiModelsCountTokensEstimatesOnTransientFailures(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+	}{
+		{name: "rate limit", status: http.StatusTooManyRequests},
+		{name: "server error", status: http.StatusServiceUnavailable},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(`{"error":{"message":"temporary"}}`))
+			})
+
+			req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:countTokens", strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"Count this transient fallback request"}]}]}`))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			handler.HandleGeminiModels(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("StatusCode = %d, want 200 estimate: %s", resp.StatusCode, string(body))
+			}
+			var countResp models.GeminiCountTokensResponse
+			if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if countResp.TotalTokens <= 0 {
+				t.Fatalf("TotalTokens = %d, want positive estimate", countResp.TotalTokens)
+			}
+			if calls.Load() == 0 {
+				t.Fatal("upstream was not called")
+			}
+		})
+	}
+}
+
+func TestHandleGeminiModelsCountTokensEstimatesOnTransportError(t *testing.T) {
+	var calls atomic.Int32
+	handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return nil, io.ErrUnexpectedEOF
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:countTokens", strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"Count this after a transport failure"}]}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleGeminiModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("StatusCode = %d, want 200 estimate: %s", resp.StatusCode, string(body))
+	}
+	var countResp models.GeminiCountTokensResponse
+	if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if countResp.TotalTokens <= 0 {
+		t.Fatalf("TotalTokens = %d, want positive estimate", countResp.TotalTokens)
+	}
+	if calls.Load() == 0 {
+		t.Fatal("transport was not called")
+	}
+}
+
+func TestHandleGeminiModelsCountTokensDoesNotEstimatePermanentUpstreamErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+	}{
+		{name: "bad request", status: http.StatusBadRequest},
+		{name: "unauthorized", status: http.StatusUnauthorized},
+		{name: "forbidden", status: http.StatusForbidden},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				call := calls.Add(1)
+				// The first 400 probes max_completion_tokens compatibility and may fall back
+				// to max_tokens. Keep returning 400 to verify the final client/config error
+				// is surfaced rather than converted into an estimate.
+				_ = call
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(`{"error":{"message":"permanent"}}`))
+			})
+
+			req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:countTokens", strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"Count this permanent failure"}]}]}`))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			handler.HandleGeminiModels(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != tt.status {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("StatusCode = %d, want %d: %s", resp.StatusCode, tt.status, string(body))
+			}
+			var errResp models.GeminiErrorResponse
+			if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if errResp.Error.Message == "" {
+				t.Fatalf("expected real error response, got %#v", errResp)
+			}
+		})
+	}
 }

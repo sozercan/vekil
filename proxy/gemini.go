@@ -415,7 +415,7 @@ func TranslateGeminiToOpenAI(req *models.GeminiGenerateContentRequest, pathModel
 		oaiReq.Tools = filterGeminiAllowedTools(oaiReq.Tools, req.ToolConfig.FunctionCallingConfig)
 	}
 
-	if len(oaiReq.Tools) > 0 {
+	if len(oaiReq.Tools) > 0 && !openAIToolChoiceIsNone(oaiReq.ToolChoice) {
 		parallelToolCalls := true
 		oaiReq.ParallelToolCalls = &parallelToolCalls
 	}
@@ -774,7 +774,7 @@ func translateGeminiToolChoice(config *models.GeminiFunctionCallingConfig, decla
 	}
 
 	mode := strings.ToUpper(strings.TrimSpace(config.Mode))
-	if len(config.AllowedFunctionNames) == 1 && mode != "NONE" {
+	if len(config.AllowedFunctionNames) == 1 && mode != "NONE" && mode != "VALIDATED" {
 		return json.Marshal(map[string]interface{}{
 			"type": "function",
 			"function": map[string]string{
@@ -784,7 +784,7 @@ func translateGeminiToolChoice(config *models.GeminiFunctionCallingConfig, decla
 	}
 
 	switch mode {
-	case "", "AUTO":
+	case "", "AUTO", "VALIDATED":
 		return json.Marshal("auto")
 	case "NONE":
 		return json.Marshal("none")

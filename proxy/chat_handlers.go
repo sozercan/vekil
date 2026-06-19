@@ -73,6 +73,29 @@ func prepareAnthropicChatCompletionsRequest(req *models.AnthropicRequest) ([]byt
 	return body, mode, nil
 }
 
+func mapAnthropicUpstreamStatus(statusCode int) string {
+	switch statusCode {
+	case http.StatusBadRequest:
+		return "invalid_request_error"
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusRequestEntityTooLarge:
+		return "request_too_large"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case http.StatusServiceUnavailable, 529:
+		return "overloaded_error"
+	case http.StatusInternalServerError:
+		return "api_error"
+	default:
+		return "api_error"
+	}
+}
+
 func anthropicExtraHeadersFromRequest(r *http.Request) http.Header {
 	var headers http.Header
 	for _, name := range []string{
@@ -117,11 +140,7 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 			writeAnthropicError(w, statusCode, "invalid_request_error", err.Error())
 			return
 		}
-		if statusCode == http.StatusInternalServerError {
-			writeAnthropicError(w, statusCode, "api_error", "authentication failed")
-			return
-		}
-		writeAnthropicError(w, statusCode, "api_error", formatUpstreamRequestFailure(err, "upstream request failed"))
+		writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), formatUpstreamRequestFailure(err, "upstream request failed"))
 		return
 	}
 
@@ -152,11 +171,7 @@ func (h *ProxyHandler) forwardAnthropicCountTokensDirect(w http.ResponseWriter, 
 			writeAnthropicError(w, statusCode, "invalid_request_error", err.Error())
 			return
 		}
-		if statusCode == http.StatusInternalServerError {
-			writeAnthropicError(w, statusCode, "api_error", "authentication failed")
-			return
-		}
-		writeAnthropicError(w, statusCode, "api_error", "upstream request failed")
+		writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), formatUpstreamRequestFailure(err, "upstream request failed"))
 		return
 	}
 
@@ -217,14 +232,15 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	body, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
-		writeAnthropicError(w, status, "invalid_request_error", err.Error())
+		writeAnthropicError(w, status, mapAnthropicUpstreamStatus(status), err.Error())
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
 
 	var req models.AnthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON in request body")
+		message, _ := jsonDecodeErrorDetails(err, "invalid JSON in request body")
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", message)
 		return
 	}
 
@@ -235,7 +251,14 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		logger.F("tools", len(req.Tools)),
 	)
 
-	if h.shouldForwardAnthropicMessagesDirect(req.Model) {
+	directAnthropic := h.shouldForwardAnthropicMessagesDirect(req.Model)
+	providerEndpoint := providerEndpointChatCompletions
+	if directAnthropic {
+		providerEndpoint = providerEndpointMessages
+	}
+	h.observeRequestSummary(r.Context(), "anthropic", req.Model, req.Stream, providerEndpoint)
+
+	if directAnthropic {
 		h.forwardAnthropicMessagesDirect(w, r, body, &req)
 		return
 	}
@@ -259,24 +282,24 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			writeAnthropicError(w, statusCode, "invalid_request_error", err.Error())
 			return
 		}
-		if statusCode == http.StatusInternalServerError {
-			writeAnthropicError(w, statusCode, "api_error", "authentication failed")
-			return
-		}
-		writeAnthropicError(w, statusCode, "api_error", formatUpstreamRequestFailure(err, "upstream request failed"))
+		writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), formatUpstreamRequestFailure(err, "upstream request failed"))
 		return
 	}
+
+	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	if resp.StatusCode != http.StatusOK {
 		defer func() { _ = resp.Body.Close() }()
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
 		h.log.Error("upstream error",
 			logger.F("endpoint", "anthropic"),
 			logger.F("status", resp.StatusCode),
-			logger.F("body", string(errBody)),
+			logger.F("detail", detail),
 			logger.F("request_bytes", len(oaiBody)),
 		)
-		writeAnthropicError(w, resp.StatusCode, "api_error", formatUpstreamErrorMessage(resp.StatusCode, errBody))
+		h.log.Debug("upstream error body", logger.F("endpoint", "anthropic"), logger.F("status", resp.StatusCode), logger.F("body", string(errBody)))
+		writeAnthropicError(w, resp.StatusCode, mapAnthropicUpstreamStatus(resp.StatusCode), detail)
 		return
 	}
 
@@ -291,6 +314,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			observeOpenAIUsage(r.Context(), oaiResp.Usage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
 			anthropicResp := TranslateOpenAIToAnthropic(oaiResp, req.Model)
 			w.Header().Set("Content-Type", "application/json")
@@ -310,18 +334,26 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 	body, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
-		writeAnthropicError(w, status, "invalid_request_error", err.Error())
+		writeAnthropicError(w, status, mapAnthropicUpstreamStatus(status), err.Error())
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
 
 	var req models.AnthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON in request body")
+		message, _ := jsonDecodeErrorDetails(err, "invalid JSON in request body")
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", message)
 		return
 	}
 
-	if h.shouldForwardAnthropicCountTokensDirect(req.Model) {
+	directAnthropic := h.shouldForwardAnthropicCountTokensDirect(req.Model)
+	providerEndpoint := providerEndpointChatCompletions
+	if directAnthropic {
+		providerEndpoint = providerEndpointMessages
+	}
+	h.observeRequestSummary(r.Context(), "anthropic_count_tokens", req.Model, false, providerEndpoint)
+
+	if directAnthropic {
 		h.forwardAnthropicCountTokensDirect(w, r, body)
 		return
 	}
@@ -340,7 +372,7 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 			writeAnthropicError(w, statusCode, "invalid_request_error", err.Error())
 			return
 		}
-		writeAnthropicError(w, statusCode, "api_error", "upstream request failed")
+		writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), formatUpstreamRequestFailure(err, "upstream request failed"))
 		return
 	}
 
@@ -430,8 +462,10 @@ func (h *ProxyHandler) decodeAnthropicCountTokensProbeResponse(resp *http.Respon
 
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		h.log.Error("upstream error", logger.F("endpoint", "anthropic_count_tokens"), logger.F("status", resp.StatusCode), logger.F("body", string(errBody)))
-		return nil, &upstreamError{statusCode: resp.StatusCode}
+		detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
+		h.log.Error("upstream error", logger.F("endpoint", "anthropic_count_tokens"), logger.F("status", resp.StatusCode), logger.F("detail", detail))
+		h.log.Debug("upstream error body", logger.F("endpoint", "anthropic_count_tokens"), logger.F("status", resp.StatusCode), logger.F("body", string(errBody)))
+		return nil, &upstreamError{statusCode: resp.StatusCode, body: errBody}
 	}
 
 	var oaiResp models.OpenAIResponse
@@ -448,13 +482,20 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	bodyBytes, err := readBody(r)
 	if err != nil {
 		status := readBodyStatusCode(err)
-		writeOpenAIError(w, status, err.Error(), "invalid_request_error")
+		writeOpenAIRequestBodyError(w, status, err)
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
 
+	if message, param, ok := validateOpenAIChatRequest(bodyBytes); ok {
+		writeOpenAIErrorWithDetails(w, http.StatusBadRequest, message, "invalid_request_error", param, "")
+		return
+	}
+
+	requestedModel := extractRequestModel(bodyBytes)
 	scope := chatToolExecutionScopeFromHeaders(r.Header)
 	bodyBytes, mode := prepareOpenAIChatCompletionsRequest(bodyBytes)
+	h.observeRequestSummary(r.Context(), "openai_chat", requestedModel, mode.clientRequestedStream, providerEndpointChatCompletions)
 	bodyBytes = h.rewriteOpenAIChatRequestBodyWithToolOptimizers(r.Context(), bodyBytes, h.toolContexts, scope)
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
@@ -468,20 +509,19 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
 			return
 		}
-		if statusCode == http.StatusInternalServerError {
-			writeOpenAIError(w, statusCode, "authentication failed", "server_error")
-			return
-		}
 		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
 		return
 	}
 
+	observeUpstreamHeaders(r.Context(), resp.Header)
+
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
 			copyPassthroughHeaders(w.Header(), resp.Header)
-			StreamOpenAIPassthroughWithFinalResponse(w, resp.Body, h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope))
+			StreamOpenAIPassthroughWithFinalResponse(w, resp.Body, h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope), openAIChatStreamUsageCallback(r.Context()))
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			observeOpenAIUsage(r.Context(), oaiResp.Usage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(oaiResp)
@@ -493,6 +533,65 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "failed to aggregate upstream response", "server_error")
 	}
+}
+
+func validateOpenAIChatRequest(body []byte) (string, string, bool) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", "", false
+	}
+	if rawMessages, ok := payload["messages"]; !ok || !rawJSONHasNonEmptyArray(rawMessages) {
+		return "messages must be a non-empty array", "messages", true
+	}
+	if rawToolChoice, ok := payload["tool_choice"]; ok && openAIToolChoiceRequiresTools(rawToolChoice) && !hasNonEmptyTools(payload["tools"]) {
+		return "tool_choice requires non-empty tools", "tool_choice", true
+	}
+	if rawResponseFormat, ok := payload["response_format"]; ok && responseFormatMissingJSONSchema(rawResponseFormat) {
+		return "response_format json_schema requires json_schema.schema", "response_format.json_schema.schema", true
+	}
+	return "", "", false
+}
+
+func rawJSONHasNonEmptyArray(raw json.RawMessage) bool {
+	var values []json.RawMessage
+	return json.Unmarshal(raw, &values) == nil && len(values) > 0
+}
+
+func openAIToolChoiceRequiresTools(raw json.RawMessage) bool {
+	var choice string
+	if err := json.Unmarshal(raw, &choice); err == nil {
+		choice = strings.TrimSpace(choice)
+		return choice == "required"
+	}
+	var object struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return false
+	}
+	switch strings.TrimSpace(object.Type) {
+	case "required", "function":
+		return true
+	default:
+		return false
+	}
+}
+
+func responseFormatMissingJSONSchema(raw json.RawMessage) bool {
+	var format struct {
+		Type       string          `json:"type"`
+		JSONSchema json.RawMessage `json:"json_schema"`
+	}
+	if err := json.Unmarshal(raw, &format); err != nil || strings.TrimSpace(format.Type) != "json_schema" {
+		return false
+	}
+	var schema struct {
+		Schema json.RawMessage `json:"schema"`
+	}
+	if err := json.Unmarshal(format.JSONSchema, &schema); err != nil {
+		return true
+	}
+	return len(bytes.TrimSpace(schema.Schema)) == 0 || string(bytes.TrimSpace(schema.Schema)) == "null"
 }
 
 func hasNonEmptyTools(raw json.RawMessage) bool {
@@ -519,6 +618,9 @@ func injectParallelToolCalls(body []byte) []byte {
 	if !hasTools || !hasNonEmptyTools(tools) {
 		return body
 	}
+	if rawToolChoice, ok := m["tool_choice"]; ok && openAIToolChoiceIsNone(rawToolChoice) {
+		return body
+	}
 	if _, hasPTC := m["parallel_tool_calls"]; hasPTC {
 		return body
 	}
@@ -528,6 +630,20 @@ func injectParallelToolCalls(body []byte) []byte {
 		return body
 	}
 	return result
+}
+
+func openAIToolChoiceIsNone(raw json.RawMessage) bool {
+	var choice string
+	if err := json.Unmarshal(raw, &choice); err == nil {
+		return strings.EqualFold(strings.TrimSpace(choice), "none")
+	}
+	var object struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &object); err == nil {
+		return strings.EqualFold(strings.TrimSpace(object.Type), "none")
+	}
+	return false
 }
 
 // injectForceStream adds stream: true and stream_options to a request body

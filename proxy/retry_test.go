@@ -86,6 +86,42 @@ func TestDoWithRetry_RetriesOnServerError(t *testing.T) {
 	}
 }
 
+func TestDoWithRetry_RetriesAnthropicOverloaded529(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if n == 1 {
+			w.WriteHeader(529)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	h := &ProxyHandler{
+		auth:           auth.NewTestAuthenticator("tok"),
+		client:         server.Client(),
+		copilotURL:     server.URL,
+		log:            logger.New(logger.LevelError),
+		retryBaseDelay: 1 * time.Millisecond,
+	}
+
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		return http.NewRequest(http.MethodPost, server.URL+"/test", nil)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want 200", resp.StatusCode)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls = %d, want 2", calls.Load())
+	}
+}
+
 func TestDoWithRetry_ExhaustsRetries(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -153,10 +189,19 @@ func TestRetryable(t *testing.T) {
 		{http.StatusOK, false},
 		{http.StatusBadRequest, false},
 		{http.StatusUnauthorized, false},
+		{http.StatusRequestTimeout, true},
 		{http.StatusTooManyRequests, true},
+		{http.StatusInternalServerError, false},
 		{http.StatusBadGateway, true},
 		{http.StatusServiceUnavailable, true},
 		{http.StatusGatewayTimeout, true},
+		{520, true},
+		{521, true},
+		{522, true},
+		{523, true},
+		{524, true},
+		{529, true},
+		{530, true},
 	}
 
 	for _, tt := range tests {
@@ -368,7 +413,7 @@ func TestParseRetryAfter(t *testing.T) {
 		{"abc", 0, false},
 		{"5", 5 * time.Second, true},
 		{"120", 120 * time.Second, true},
-		// HTTP-date is intentionally not supported.
+		{"999999", maxRetryAfter, true},
 		{"Wed, 21 Oct 2015 07:28:00 GMT", 0, false},
 	}
 
@@ -379,5 +424,31 @@ func TestParseRetryAfter(t *testing.T) {
 				t.Errorf("parseRetryAfter(%q) = (%v, %v), want (%v, %v)", tt.value, dur, ok, tt.wantDur, tt.wantOK)
 			}
 		})
+	}
+}
+
+func TestParseRetryAfter_HTTPDateAndClamp(t *testing.T) {
+	future := time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat)
+	dur, ok := parseRetryAfter(future)
+	if !ok {
+		t.Fatalf("parseRetryAfter(future HTTP-date) ok = false, want true")
+	}
+	if dur <= 0 || dur > 3*time.Second {
+		t.Fatalf("future HTTP-date duration = %v, want a small positive duration", dur)
+	}
+
+	farFuture := time.Now().Add(24 * time.Hour).UTC().Format(http.TimeFormat)
+	dur, ok = parseRetryAfter(farFuture)
+	if !ok || dur != maxRetryAfter {
+		t.Fatalf("far future duration = (%v, %v), want (%v, true)", dur, ok, maxRetryAfter)
+	}
+}
+
+func TestBackoffGuardsZeroBaseAndLargeAttempt(t *testing.T) {
+	if got := backoff(0, -10); got <= 0 {
+		t.Fatalf("backoff(0, -10) = %v, want positive duration", got)
+	}
+	if got := backoff(time.Second, 1000); got < maxRetryBackoff || got >= maxRetryBackoff+maxRetryBackoff/4 {
+		t.Fatalf("backoff(time.Second, 1000) = %v, want capped delay plus bounded jitter", got)
 	}
 }
