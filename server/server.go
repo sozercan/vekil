@@ -202,6 +202,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /dashboard/{asset}", handler.HandleDashboardAsset)
 	mux.HandleFunc("POST /dashboard/insight", handler.HandleDashboardInsight)
 	mux.HandleFunc("GET /stats.json", handler.HandleStatsJSON)
+	mux.HandleFunc("GET /favicon.ico", handler.HandleFavicon)
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{

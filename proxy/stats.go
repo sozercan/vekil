@@ -117,11 +117,12 @@ type secondBucket struct {
 }
 
 type breakdownCounter struct {
-	requests int64
-	tokens   int64
-	errors   int64
-	durMs    int64 // sum of request durations in ms, for avg latency
-	kind     string
+	requests   int64
+	tokens     int64
+	errors     int64
+	durMs      int64 // sum of request durations in ms, for avg latency
+	durSamples int64 // count of requests that contributed a duration (non-stream)
+	kind       string
 }
 
 // statsCollector aggregates per-request traffic in memory for the dashboard.
@@ -245,11 +246,18 @@ func (c *statsCollector) record(summary *RequestSummary, status int, userAgent s
 	c.totals.CachedTokens += int64(d.cached)
 	c.totals.ReasoningTokens += int64(d.reasoning)
 
-	// Bounded latency reservoir (overwrite oldest once full).
-	c.latencies[c.latencyIdx] = durMs
-	c.latencyIdx = (c.latencyIdx + 1) % len(c.latencies)
-	if c.latencyCount < len(c.latencies) {
-		c.latencyCount++
+	// Latency: only non-streaming requests carry a meaningful end-to-end
+	// duration. A streamed response (SSE chat, or a GET /v1/responses websocket
+	// session) has a wall-clock time dominated by how long the client kept the
+	// connection open, which would poison the percentiles and per-key averages.
+	measureLatency := !d.stream
+	if measureLatency {
+		// Bounded latency reservoir (overwrite oldest once full).
+		c.latencies[c.latencyIdx] = durMs
+		c.latencyIdx = (c.latencyIdx + 1) % len(c.latencies)
+		if c.latencyCount < len(c.latencies) {
+			c.latencyCount++
+		}
 	}
 
 	c.status[statusClass(status)]++
@@ -259,13 +267,13 @@ func (c *statsCollector) record(summary *RequestSummary, status int, userAgent s
 	}
 
 	if d.model != "" {
-		addBreakdown(c.byModel, capKeyForCounter(c.byModel, d.model), int64(d.total), "", isErr, durMs)
+		addBreakdown(c.byModel, capKey(c.byModel, d.model), int64(d.total), "", isErr, durMs, measureLatency)
 	}
 	if d.provider != "" {
 		// Providers are configured, not client-controlled, so no cap needed.
-		addBreakdown(c.byProvider, d.provider, int64(d.total), d.kind, isErr, durMs)
+		addBreakdown(c.byProvider, d.provider, int64(d.total), d.kind, isErr, durMs, measureLatency)
 	}
-	addBreakdown(c.byAgent, capKeyForCounter(c.byAgent, agent), int64(d.total), "", isErr, durMs)
+	addBreakdown(c.byAgent, capKey(c.byAgent, agent), int64(d.total), "", isErr, durMs, measureLatency)
 
 	// Append to the recent-requests drill-down ring (newest overwrites oldest).
 	c.recent[c.recentIdx] = recentRequest{
@@ -285,20 +293,10 @@ func (c *statsCollector) record(summary *RequestSummary, status int, userAgent s
 	}
 }
 
-// capKey folds an overflow key into the "other" bucket once a map of plain
-// counters reaches the cardinality cap. Existing keys always pass through.
-func capKey(m map[string]int64, key string) string {
-	if _, ok := m[key]; ok {
-		return key
-	}
-	if len(m) >= statsMaxKeys {
-		return statsOtherKey
-	}
-	return key
-}
-
-// capKeyForCounter is capKey for the breakdownCounter maps.
-func capKeyForCounter(m map[string]*breakdownCounter, key string) string {
+// capKey folds an overflow key into the "other" bucket once a map reaches the
+// cardinality cap. Existing keys always pass through, so a bounded set of
+// distinct keys is never disturbed.
+func capKey[V any](m map[string]V, key string) string {
 	if _, ok := m[key]; ok {
 		return key
 	}
@@ -388,6 +386,9 @@ func retriesRows(m map[int]int64) []statsErrorRow {
 		}
 		return out[i].Label < out[j].Label
 	})
+	if len(out) > statsTopN {
+		out = out[:statsTopN]
+	}
 	return out
 }
 
@@ -489,7 +490,7 @@ func statusClass(status int) string {
 	}
 }
 
-func addBreakdown(m map[string]*breakdownCounter, key string, tokens int64, kind string, isErr bool, durMs int64) {
+func addBreakdown(m map[string]*breakdownCounter, key string, tokens int64, kind string, isErr bool, durMs int64, measureLatency bool) {
 	e := m[key]
 	if e == nil {
 		e = &breakdownCounter{}
@@ -497,7 +498,10 @@ func addBreakdown(m map[string]*breakdownCounter, key string, tokens int64, kind
 	}
 	e.requests++
 	e.tokens += tokens
-	e.durMs += durMs
+	if measureLatency {
+		e.durMs += durMs
+		e.durSamples++
+	}
 	if isErr {
 		e.errors++
 	}
@@ -516,8 +520,8 @@ func topBreakdowns(m map[string]*breakdownCounter, kind string) []statsBreakdown
 	out := make([]statsBreakdown, 0, len(m))
 	for key, e := range m {
 		b := statsBreakdown{Requests: e.requests, Tokens: e.tokens, Errors: e.errors}
-		if e.requests > 0 {
-			b.AvgMs = e.durMs / e.requests
+		if e.durSamples > 0 {
+			b.AvgMs = e.durMs / e.durSamples
 		}
 		switch kind {
 		case breakdownKindModel:
@@ -564,6 +568,7 @@ type summaryStats struct {
 	kind       string
 	endpoint   string
 	upstreamID string
+	stream     bool
 	prompt     int
 	completion int
 	total      int
@@ -583,6 +588,7 @@ func readSummaryForStats(summary *RequestSummary) summaryStats {
 	d.kind = summary.providerKind
 	d.endpoint = summary.endpoint
 	d.upstreamID = summary.upstreamRequestID
+	d.stream = summary.stream
 	if summary.promptTokens != nil {
 		d.prompt = *summary.promptTokens
 	}
@@ -643,7 +649,7 @@ func classifyAgent(userAgent string) string {
 // excluded from traffic stats so the dashboard does not measure itself.
 func isObservabilityPath(path string) bool {
 	switch path {
-	case "/healthz", "/readyz", "/stats.json", "/dashboard":
+	case "/healthz", "/readyz", "/stats.json", "/dashboard", "/favicon.ico":
 		return true
 	}
 	return strings.HasPrefix(path, "/dashboard/")
@@ -697,6 +703,14 @@ func (h *ProxyHandler) HandleStatsJSON(w http.ResponseWriter, r *http.Request) {
 // HandleDashboard handles GET /dashboard and serves the embedded dashboard page.
 func (h *ProxyHandler) HandleDashboard(w http.ResponseWriter, r *http.Request) {
 	serveDashboardFile(w, "dashboard/dashboard.html", "text/html; charset=utf-8", false)
+}
+
+// HandleFavicon answers GET /favicon.ico with 204 No Content so a browser
+// opening the dashboard does not generate a 404 (it is also excluded from
+// traffic stats via isObservabilityPath).
+func (h *ProxyHandler) HandleFavicon(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // HandleDashboardAsset serves the embedded, vendored dashboard assets (uPlot).

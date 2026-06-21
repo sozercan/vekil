@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/sozercan/vekil/models"
@@ -64,6 +65,40 @@ func TestPrepareOpenAIChatCompletionsRequest_EmptyToolsRemainNonStreaming(t *tes
 	}
 	if _, ok := req["parallel_tool_calls"]; ok {
 		t.Fatal("parallel_tool_calls present, want omitted")
+	}
+}
+
+func TestPrepareOpenAIChatCompletionsRequest_ClientStreamGetsIncludeUsage(t *testing.T) {
+	input := []byte(`{"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+
+	prepared, mode := prepareOpenAIChatCompletionsRequest(input)
+	if !mode.clientRequestedStream {
+		t.Fatal("clientRequestedStream = false, want true")
+	}
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(prepared, &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	so, ok := req["stream_options"]
+	if !ok {
+		t.Fatal("stream_options not injected for client stream")
+	}
+	if !strings.Contains(string(so), `"include_usage":true`) {
+		t.Fatalf("include_usage not set: %s", so)
+	}
+}
+
+func TestPrepareOpenAIChatCompletionsRequest_ClientStreamOptionsPreserved(t *testing.T) {
+	// Client already set stream_options — we must not clobber it.
+	input := []byte(`{"model":"gpt-4.1","stream":true,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"hi"}]}`)
+
+	prepared, _ := prepareOpenAIChatCompletionsRequest(input)
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(prepared, &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !strings.Contains(string(req["stream_options"]), `"include_usage":false`) {
+		t.Fatalf("client stream_options was overwritten: %s", req["stream_options"])
 	}
 }
 

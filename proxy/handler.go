@@ -474,7 +474,32 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 	if err := h.initializeProviders(); err != nil {
 		return nil, err
 	}
+	h.validateInsightModel()
 	return h, nil
+}
+
+// validateInsightModel logs a non-fatal warning when the configured dashboard
+// insight model cannot be reached over /chat/completions (the path the insight
+// endpoint uses). This surfaces a misconfiguration — e.g. pointing insight_model
+// at a /responses-only provider such as Codex or an Azure responses deployment —
+// at startup instead of silently failing on the first click.
+func (h *ProxyHandler) validateInsightModel() {
+	model := strings.TrimSpace(h.providersConfig.InsightModel)
+	if model == "" || h.log == nil {
+		return
+	}
+	provider, owner, known := h.resolveProviderModel(model, providerEndpointChatCompletions)
+	switch {
+	case provider == nil:
+		h.log.Info("dashboard insight_model is not served by any configured provider; insights will not work",
+			logger.F("insight_model", model))
+	case !provider.supportsEndpoint(providerEndpointChatCompletions):
+		h.log.Info("dashboard insight_model provider does not support /chat/completions; insights will not work",
+			logger.F("insight_model", model), logger.F("provider", provider.id))
+	case known && !providerModelSupportsEndpoint(owner, providerEndpointChatCompletions):
+		h.log.Info("dashboard insight_model is /responses-only and cannot be reached via /chat/completions; insights will not work",
+			logger.F("insight_model", model), logger.F("provider", provider.id))
+	}
 }
 
 func (h *ProxyHandler) responsesWebSocketConfig() ResponsesWebSocketConfig {

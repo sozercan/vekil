@@ -46,6 +46,9 @@ func prepareOpenAIChatCompletionsRequest(body []byte) ([]byte, chatCompletionsMo
 	body = injectParallelToolCalls(body)
 	if mode.forceUpstreamStream {
 		body = injectForceStream(body)
+	} else if mode.clientRequestedStream {
+		// Ask upstream for a usage chunk so streamed traffic records tokens.
+		body = ensureStreamUsage(body)
 	}
 	return body, mode
 }
@@ -654,6 +657,28 @@ func injectForceStream(body []byte) []byte {
 		return body
 	}
 	m["stream"] = json.RawMessage("true")
+	m["stream_options"] = json.RawMessage(`{"include_usage":true}`)
+	result, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return result
+}
+
+// ensureStreamUsage asks the upstream to emit a final usage chunk on a
+// client-requested stream by setting stream_options.include_usage. Without it,
+// many upstreams omit token usage from streamed responses and the proxy records
+// zero tokens. It is merge-safe: if the client already supplied stream_options,
+// their choice is left untouched (they may have deliberately set include_usage
+// false or other options).
+func ensureStreamUsage(body []byte) []byte {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	if _, ok := m["stream_options"]; ok {
+		return body
+	}
 	m["stream_options"] = json.RawMessage(`{"include_usage":true}`)
 	result, err := json.Marshal(m)
 	if err != nil {

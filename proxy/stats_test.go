@@ -460,11 +460,51 @@ func TestTracksRequest(t *testing.T) {
 			t.Errorf("expected %s to be tracked", p)
 		}
 	}
-	skipped := []string{"/healthz", "/readyz", "/stats.json", "/dashboard", "/dashboard/uPlot.min.js"}
+	skipped := []string{"/healthz", "/readyz", "/stats.json", "/dashboard", "/dashboard/uPlot.min.js", "/favicon.ico"}
 	for _, p := range skipped {
 		if h.TracksRequest(p) {
 			t.Errorf("expected %s to be skipped", p)
 		}
+	}
+}
+
+// TestStatsCollectorStreamExcludedFromLatency verifies that streaming requests
+// (whose wall-clock is dominated by how long the client held the connection)
+// do not pollute the latency percentiles or per-breakdown average latency.
+func TestStatsCollectorStreamExcludedFromLatency(t *testing.T) {
+	c := newStatsCollector()
+	fixed := time.Unix(1_700_000_000, 0)
+	c.now = func() time.Time { return fixed }
+
+	streamSummary := func(model string) *RequestSummary {
+		s := &RequestSummary{}
+		s.setRoute("/v1/chat/completions", model, true) // stream = true
+		s.setProvider("copilot", "copilot")
+		return s
+	}
+	nonStream := func(model string) *RequestSummary {
+		s := &RequestSummary{}
+		s.setRoute("/v1/chat/completions", model, false)
+		s.setProvider("copilot", "copilot")
+		return s
+	}
+
+	// One fast non-stream request and one 10-minute stream on the same model.
+	c.record(nonStream("m"), 200, "curl/8", 50*time.Millisecond)
+	c.record(streamSummary("m"), 200, "curl/8", 10*time.Minute)
+
+	snap := c.snapshot()
+	// Percentiles must reflect only the 50ms sample, not the 600000ms stream.
+	if snap.Totals.LatencyP95 > 100 {
+		t.Fatalf("stream duration leaked into p95: got %d ms (want ~50)", snap.Totals.LatencyP95)
+	}
+	// Per-model avg should also exclude the stream sample.
+	if len(snap.ByModel) != 1 || snap.ByModel[0].AvgMs > 100 {
+		t.Fatalf("stream duration leaked into per-model avg_ms: %+v", snap.ByModel)
+	}
+	// But both requests are still counted.
+	if snap.ByModel[0].Requests != 2 {
+		t.Fatalf("expected both requests counted, got %d", snap.ByModel[0].Requests)
 	}
 }
 

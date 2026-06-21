@@ -296,7 +296,6 @@ func sniffOpenAIUsage(body []byte) *models.OpenAIUsage {
 	return parsed.Usage
 }
 
-
 func writeDirectAnthropicJSONResponse(w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) error {
 	defer func() { _ = resp.Body.Close() }()
 

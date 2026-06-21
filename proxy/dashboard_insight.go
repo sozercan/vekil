@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -117,13 +116,14 @@ func (h *ProxyHandler) HandleDashboardInsight(w http.ResponseWriter, r *http.Req
 
 	// Rate-limit: at most one generation in progress, and a cooldown between
 	// completed generations. This bounds token spend even against direct or
-	// scripted POSTs, independent of the front-end's button-disable.
+	// scripted POSTs, independent of the front-end's button-disable. The gate is
+	// released by the worker goroutine below when the call actually finishes, not
+	// on the timeout path — so a slow model can't be bypassed by a second click.
 	gate := h.insightGateFor()
 	if ok, reason := gate.tryAcquire(); !ok {
 		writeInsightError(w, reason)
 		return
 	}
-	defer gate.release()
 
 	// The dashboard posts the narrative it is already showing so the model can
 	// avoid repeating it. Body is optional; ignore parse errors.
@@ -148,40 +148,54 @@ func (h *ProxyHandler) HandleDashboardInsight(w http.ResponseWriter, r *http.Req
 		MaxTokens: &maxTokens,
 	})
 	if err != nil {
+		gate.release()
 		writeInsightError(w, "failed to build insight request")
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), insightUpstreamTimeout)
-	defer cancel()
-
-	// Call our own chat-completions handler in-process. This reuses provider
-	// routing, auth, and model rewriting, and — because it does not pass through
-	// the server's stats middleware — is excluded from traffic stats, so the
-	// dashboard does not measure its own insight calls.
-	innerReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", bytes.NewReader(reqBody))
+	innerReq, err := http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(reqBody))
 	if err != nil {
+		gate.release()
 		writeInsightError(w, "failed to build insight request")
 		return
 	}
 	innerReq.Header.Set("Content-Type", "application/json")
 	innerReq.Header.Set("User-Agent", "vekil-dashboard-insight")
 
-	rec := newCaptureResponseWriter()
-	h.HandleOpenAIChatCompletions(rec, innerReq)
-
-	if rec.status != http.StatusOK {
-		writeInsightError(w, fmt.Sprintf("insight model returned %d", rec.status))
-		return
+	// Run the in-process chat call on its own goroutine and bound the wait with
+	// insightUpstreamTimeout. The inner handler builds its own upstream context
+	// (it does not honor a request context), so a select here is what actually
+	// enforces the deadline. The gate is released when the worker completes,
+	// whether or not we have already returned a timeout to the client.
+	type insightResult struct {
+		text   string
+		status int
 	}
+	done := make(chan insightResult, 1)
+	go func() {
+		defer gate.release()
+		rec := newCaptureResponseWriter()
+		h.HandleOpenAIChatCompletions(rec, innerReq)
+		done <- insightResult{text: extractOpenAIReplyText(rec.body.Bytes()), status: rec.status}
+	}()
 
-	text := extractOpenAIReplyText(rec.body.Bytes())
-	if text == "" {
-		writeInsightError(w, "insight model returned no text")
-		return
+	select {
+	case res := <-done:
+		if res.status != http.StatusOK {
+			writeInsightError(w, fmt.Sprintf("insight model returned %d", res.status))
+			return
+		}
+		if res.text == "" {
+			writeInsightError(w, "insight model returned no text")
+			return
+		}
+		_ = json.NewEncoder(w).Encode(insightResponse{Insight: res.text, Model: model})
+	case <-time.After(insightUpstreamTimeout):
+		// The worker keeps running and will release the gate when it finishes.
+		writeInsightError(w, "insight timed out")
+	case <-r.Context().Done():
+		writeInsightError(w, "request cancelled")
 	}
-
-	_ = json.NewEncoder(w).Encode(insightResponse{Insight: text, Model: model})
 }
 
 func writeInsightError(w http.ResponseWriter, msg string) {
@@ -244,7 +258,7 @@ func buildInsightPrompt(snap statsSnapshot, shown string) string {
 
 	if shown != "" {
 		b.WriteString("ALREADY_SHOWN_TO_USER (do not repeat this — add to it):\n")
-		b.WriteString("  " + shown + "\n\n")
+		b.WriteString("  " + sanitizeLabel(shown) + "\n\n")
 	}
 
 	b.WriteString("SNAPSHOT:\n")
@@ -272,33 +286,58 @@ func buildInsightPrompt(snap statsSnapshot, shown string) string {
 	}
 
 	// Per-model share and error rate — where concentration actually lives.
+	// Labels (model/agent/provider) can derive from client-controlled input
+	// (request `model` field, User-Agent), so sanitize them before they enter
+	// the prompt to prevent newline/control-char prompt injection.
 	b.WriteString("top_models (share_pct = % of all requests):\n")
 	for _, m := range topN(snap.ByModel, 5) {
 		fmt.Fprintf(&b, "  - %s: requests=%d share_pct=%.0f tokens=%d errors=%d error_rate_pct=%.1f avg_ms=%d\n",
-			m.Model, m.Requests, pct(m.Requests, t.Requests), m.Tokens, m.Errors, pct(m.Errors, m.Requests), m.AvgMs)
+			sanitizeLabel(m.Model), m.Requests, pct(m.Requests, t.Requests), m.Tokens, m.Errors, pct(m.Errors, m.Requests), m.AvgMs)
 	}
 	b.WriteString("top_agents:\n")
 	for _, a := range topN(snap.ByAgent, 5) {
-		fmt.Fprintf(&b, "  - %s: requests=%d share_pct=%.0f tokens=%d\n", a.Agent, a.Requests, pct(a.Requests, t.Requests), a.Tokens)
+		fmt.Fprintf(&b, "  - %s: requests=%d share_pct=%.0f tokens=%d\n", sanitizeLabel(a.Agent), a.Requests, pct(a.Requests, t.Requests), a.Tokens)
 	}
 	b.WriteString("providers:\n")
 	for _, p := range snap.ByProvider {
 		fmt.Fprintf(&b, "  - %s (%s): requests=%d tokens=%d errors=%d error_rate_pct=%.1f\n",
-			p.Provider, p.Kind, p.Requests, p.Tokens, p.Errors, pct(p.Errors, p.Requests))
+			sanitizeLabel(p.Provider), sanitizeLabel(p.Kind), p.Requests, p.Tokens, p.Errors, pct(p.Errors, p.Requests))
 	}
 	if len(snap.StatusCodes) > 0 {
 		b.WriteString("error_status_codes:\n")
 		for _, e := range snap.StatusCodes {
-			fmt.Fprintf(&b, "  - %s: %d\n", e.Label, e.Count)
+			fmt.Fprintf(&b, "  - %s: %d\n", sanitizeLabel(e.Label), e.Count)
 		}
 	}
 	if len(snap.Errors) > 0 {
 		b.WriteString("errors_by_target:\n")
 		for _, e := range snap.Errors {
-			fmt.Fprintf(&b, "  - %s: %d\n", e.Label, e.Count)
+			fmt.Fprintf(&b, "  - %s: %d\n", sanitizeLabel(e.Label), e.Count)
 		}
 	}
 	return b.String()
+}
+
+// sanitizeLabel strips newlines and other control characters from a label and
+// caps its length, so client-controlled values (model names, User-Agent-derived
+// agent labels) folded into the insight prompt cannot inject new lines or
+// instructions into it.
+func sanitizeLabel(s string) string {
+	const maxLen = 80
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
+		}
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+	s = strings.TrimSpace(s)
+	if len(s) > maxLen {
+		s = s[:maxLen] + "…"
+	}
+	return s
 }
 
 func pct(part, whole int64) float64 {
