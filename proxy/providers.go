@@ -62,6 +62,11 @@ var openAICodexProviderEndpoints = []string{providerEndpointResponses}
 type ProvidersConfig struct {
 	Providers      []ProviderConfig     `json:"providers" yaml:"providers"`
 	ToolOptimizers ToolOptimizersConfig `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
+	// InsightModel is the public model ID the dashboard uses to generate
+	// natural-language traffic insights on demand. Empty disables the feature
+	// (the dashboard's "Generate insights" button is hidden). The model must be
+	// one served by the configured providers.
+	InsightModel string `json:"insight_model,omitempty" yaml:"insight_model,omitempty"`
 }
 
 // ProviderConfig configures one upstream provider instance.

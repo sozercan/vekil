@@ -48,6 +48,7 @@ Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership 
 - See [Provider Routing](provider-routing.md) for auth notes, generic-compatible provider fields, provider examples, routing rules, endpoint allowlists, and model metadata.
 - See [Provider API Keys](provider-api-keys.md) for provider console links and key-to-config mapping.
 - See [Tool Optimizers](tool-optimizers.md) for the optional `tool_optimizers` block that can live alongside `providers` in the same config file.
+- Set the optional top-level `insight_model` key to a public model ID the config serves to enable the dashboard's AI insights button. See [Traffic Dashboard](dashboard.md#ai-insights-optional).
 
 ## Responses WebSocket Bridge
 

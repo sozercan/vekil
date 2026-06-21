@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/sozercan/vekil/models"
 )
 
 func (h *ProxyHandler) newInferenceUpstreamContext(streaming bool) (context.Context, context.CancelFunc) {
@@ -249,6 +251,51 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }
+
+// writeOpenAIPassthroughObservingUsage writes a non-streaming OpenAI chat
+// response to the client byte-for-byte while sniffing usage tokens for traffic
+// stats. It preserves the near-zero-copy contract: the original body bytes and
+// headers (including Content-Length) are sent unchanged; only a best-effort
+// usage parse is layered on top, and any parse failure is silently ignored.
+func (h *ProxyHandler) writeOpenAIPassthroughObservingUsage(ctx context.Context, w http.ResponseWriter, resp *http.Response) {
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		copyPassthroughHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+		return
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		copyPassthroughHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(body)
+		return
+	}
+
+	observeOpenAIUsage(ctx, sniffOpenAIUsage(body))
+
+	copyPassthroughHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(body)
+}
+
+// sniffOpenAIUsage extracts the usage block from a non-streaming OpenAI chat
+// completion body without disturbing the rest of the payload. It returns nil
+// when the body is not valid JSON or carries no usage, so callers can pass the
+// result straight to observeOpenAIUsage.
+func sniffOpenAIUsage(body []byte) *models.OpenAIUsage {
+	var parsed struct {
+		Usage *models.OpenAIUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil
+	}
+	return parsed.Usage
+}
+
 
 func writeDirectAnthropicJSONResponse(w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) error {
 	defer func() { _ = resp.Body.Close() }()

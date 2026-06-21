@@ -257,6 +257,9 @@ type ProxyHandler struct {
 	retryBaseDelay                  time.Duration
 	models                          modelsCache
 	geminiCounts                    geminiCountTokensCache
+	stats                           *statsCollector
+	insightGate                     *insightGate
+	insightGateOnce                 sync.Once
 }
 
 type compactLearnedTargetKey struct {
@@ -460,6 +463,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		responsesWS:                     DefaultResponsesWebSocketConfig(),
 		streamingUpstreamTimeout:        streamingUpstreamTimeout,
 		log:                             log,
+		stats:                           newStatsCollector(),
 	}
 	for _, opt := range opts {
 		if opt != nil {

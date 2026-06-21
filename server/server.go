@@ -122,15 +122,26 @@ func (r *responseRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
 
-func withRequestLog(next http.Handler, log *logger.Logger) http.Handler {
+func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		recorder := &responseRecorder{ResponseWriter: w}
 		ctx, summary := proxy.WithRequestSummary(r.Context())
+
+		tracked := handler != nil && handler.TracksRequest(r.URL.Path)
+		if tracked {
+			handler.IncInflight()
+			defer handler.DecInflight()
+		}
+
 		next.ServeHTTP(recorder, r.WithContext(ctx))
 		status := recorder.status
 		if status == 0 {
 			status = http.StatusOK
+		}
+		elapsed := time.Since(start)
+		if tracked {
+			handler.RecordRequest(summary, status, r.Header.Get("User-Agent"), elapsed)
 		}
 		if log != nil {
 			fields := []logger.Field{
@@ -138,7 +149,7 @@ func withRequestLog(next http.Handler, log *logger.Logger) http.Handler {
 				logger.F("path", r.URL.Path),
 				logger.F("status", status),
 				logger.F("bytes", recorder.bytes),
-				logger.F("duration_ms", time.Since(start).Milliseconds()),
+				logger.F("duration_ms", elapsed.Milliseconds()),
 			}
 			if requestID := proxy.UpstreamRequestID(recorder.Header()); requestID != "" {
 				summaryFields := summary.LoggerFields()
@@ -187,12 +198,16 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
 	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)
+	mux.HandleFunc("GET /dashboard", handler.HandleDashboard)
+	mux.HandleFunc("GET /dashboard/{asset}", handler.HandleDashboardAsset)
+	mux.HandleFunc("POST /dashboard/insight", handler.HandleDashboardInsight)
+	mux.HandleFunc("GET /stats.json", handler.HandleStatsJSON)
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{
 		httpServer: &http.Server{
 			Addr:         addr,
-			Handler:      withRequestLog(mux, log),
+			Handler:      withRequestLog(mux, log, handler),
 			ReadTimeout:  30 * time.Second,
 			WriteTimeout: handler.ServerWriteTimeout(),
 			IdleTimeout:  120 * time.Second,

@@ -307,7 +307,7 @@ func (h *ProxyHandler) rewriteOpenAIChatRequestBodyWithToolOptimizers(ctx contex
 
 func (h *ProxyHandler) maybeWriteOptimizedOpenAIChatPassthrough(ctx context.Context, w http.ResponseWriter, resp *http.Response, store *ToolExecutionContextStore, scope string) error {
 	if h == nil || h.toolOptimizers == nil || !h.toolOptimizers.ShouldInspectNonStreamingResponses() || resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK {
-		writeUpstreamResponse(w, resp)
+		h.writeOpenAIPassthroughObservingUsage(ctx, w, resp)
 		return nil
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -328,6 +328,7 @@ func (h *ProxyHandler) maybeWriteOptimizedOpenAIChatPassthrough(ctx context.Cont
 		return nil
 	}
 
+	observeOpenAIUsage(ctx, parsed.Usage)
 	changedCount := h.maybeRewriteOrCaptureOpenAIChatToolCommands(ctx, &parsed, store, scope, false)
 	out := bodyBytes
 	if changedCount > 0 {

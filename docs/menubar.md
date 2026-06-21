@@ -35,6 +35,7 @@ Release asset and updater-secret details live in [Development](development.md#re
 
 - start/stop the proxy
 - status icon and tooltip for running/stopped state
+- **Open Dashboard** — opens the live [traffic dashboard](dashboard.md) in your browser (enabled while Vekil is running)
 - current app version
 - choose and persist a providers config file
 - return to default Copilot routing

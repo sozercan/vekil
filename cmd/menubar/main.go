@@ -17,6 +17,15 @@ import (
 
 var log = logger.New(logger.ParseLevel("info"))
 
+const (
+	proxyHost = "127.0.0.1"
+	proxyPort = "1337"
+)
+
+func dashboardURL() string {
+	return fmt.Sprintf("http://%s:%s/dashboard", proxyHost, proxyPort)
+}
+
 var (
 	srv           *server.Server
 	authenticator *auth.Authenticator
@@ -24,6 +33,7 @@ var (
 	// Menu items kept at package level so helpers can update them.
 	mAuthMenu        *systray.MenuItem
 	mToggle          *systray.MenuItem
+	mDashboard       *systray.MenuItem
 	mSignInGitHub    *systray.MenuItem
 	mUseGitHubCLI    *systray.MenuItem
 	mSignOut         *systray.MenuItem
@@ -77,6 +87,7 @@ func onReady() {
 	systray.AddSeparator()
 
 	mToggle = systray.AddMenuItem("Start Vekil", "Start or stop Vekil")
+	mDashboard = systray.AddMenuItem("Open Dashboard", "Open the live traffic dashboard in your browser")
 	systray.AddSeparator()
 
 	mLaunch := systray.AddMenuItemCheckbox("Launch at Login", "Launch at Login", false)
@@ -119,6 +130,8 @@ func onReady() {
 				} else {
 					startProxy()
 				}
+			case <-mDashboard.ClickedCh:
+				openDashboard()
 			case <-mProvidersChoose.ClickedCh:
 				selectProvidersConfig()
 			case <-mProvidersClear.ClickedCh:
@@ -181,8 +194,8 @@ func startProxy() {
 	nextSrv, err := server.New(
 		authenticator,
 		log,
-		"127.0.0.1",
-		"1337",
+		proxyHost,
+		proxyPort,
 		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
 	)
 	if err != nil {
@@ -200,6 +213,9 @@ func startProxy() {
 	mToggle.SetTitle("Stop Vekil")
 	systray.SetIcon(iconOn)
 	systray.SetTooltip("Vekil - Running on :1337")
+	if mDashboard != nil {
+		mDashboard.Enable()
+	}
 	log.Info("proxy started")
 }
 
@@ -214,7 +230,21 @@ func stopProxy() {
 	mToggle.SetTitle("Start Vekil")
 	systray.SetIcon(iconOff)
 	systray.SetTooltip("Vekil - Stopped")
+	if mDashboard != nil {
+		mDashboard.Disable()
+	}
 	log.Info("proxy stopped")
+}
+
+// openDashboard opens the live traffic dashboard in the default browser. It is a
+// convenience shortcut; the dashboard is served by the proxy itself and is also
+// reachable directly at the dashboard URL.
+func openDashboard() {
+	if srv == nil || !srv.IsRunning() {
+		showErrorDialog("Vekil Not Running", "Start Vekil before opening the dashboard.")
+		return
+	}
+	openURL(dashboardURL())
 }
 
 // signInWithGitHub drives the interactive GitHub device-code flow via native macOS
@@ -404,6 +434,13 @@ func refreshSessionUI() {
 	refreshAuthMenu(status)
 
 	running := srv != nil && srv.IsRunning()
+	if mDashboard != nil {
+		if running {
+			mDashboard.Enable()
+		} else {
+			mDashboard.Disable()
+		}
+	}
 	switch {
 	case providersConfigErr != nil:
 		mToggle.Disable()

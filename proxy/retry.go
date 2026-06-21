@@ -177,6 +177,9 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 }
 
 func (h *ProxyHandler) logRetryAttempt(attempt int, status int, retryAfter string, delay time.Duration, err error) {
+	if h != nil && h.stats != nil {
+		h.stats.incRetry(status)
+	}
 	if h == nil || h.log == nil {
 		return
 	}

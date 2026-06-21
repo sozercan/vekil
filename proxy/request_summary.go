@@ -27,6 +27,8 @@ type RequestSummary struct {
 	promptTokens      *int
 	completionTokens  *int
 	totalTokens       *int
+	cachedTokens      *int
+	reasoningTokens   *int
 }
 
 // WithRequestSummary attaches a mutable request summary to ctx and returns both
@@ -105,6 +107,12 @@ func (s *RequestSummary) setOpenAIUsage(usage *models.OpenAIUsage) {
 	s.promptTokens = summaryIntPtr(usage.PromptTokens)
 	s.completionTokens = summaryIntPtr(usage.CompletionTokens)
 	s.totalTokens = summaryIntPtr(usage.TotalTokens)
+	if usage.PromptTokensDetails != nil {
+		s.cachedTokens = summaryIntPtr(usage.PromptTokensDetails.CachedTokens)
+	}
+	if usage.CompletionTokensDetails != nil {
+		s.reasoningTokens = summaryIntPtr(usage.CompletionTokensDetails.ReasoningTokens)
+	}
 }
 
 func summaryIntPtr(v int) *int { return &v }
