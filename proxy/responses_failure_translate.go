@@ -741,6 +741,13 @@ func (t *responsesFailureTap) maybeLog(eventName string, event responsesWebSocke
 		return
 	}
 
+	// The HTTP 200 was already committed before this post-commit failure event,
+	// so the stats middleware would otherwise record the turn as a success.
+	// Record an out-of-band failure status on the request summary so the
+	// dashboard reflects the failure, mirroring how the websocket bridge maps the
+	// same response.failed/incomplete into an errored turn.
+	observeResponseFailureStatus(t.ctx, http.StatusBadGateway)
+
 	fields := []logger.Field{
 		logger.F("endpoint", "responses_stream_failure"),
 		logger.F("event_type", eventName),

@@ -177,9 +177,14 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 }
 
 func (h *ProxyHandler) logRetryAttempt(ctx context.Context, attempt int, status int, retryAfter string, delay time.Duration, err error) {
-	// Skip retry accounting for the in-process insight call, which is
-	// self-excluded from traffic stats.
-	if h != nil && h.stats != nil && !isInsightRequest(ctx) {
+	// Count a retry only when it was made on behalf of a tracked inference
+	// request. The upstream request context carries the retry-stats marker iff
+	// the middleware set it for a tracked route and newInferenceUpstreamContext
+	// propagated it; non-tracked callers (the in-process /dashboard/insight call,
+	// the GET /v1/models catalog fetch, count-token probes, the proxy shims)
+	// build their upstream context without the marker, so their retries are not
+	// folded into the dashboard's retry stats.
+	if h != nil && h.stats != nil && isRetryStatsTracked(ctx) {
 		h.stats.incRetry(status)
 	}
 	if h == nil || h.log == nil {

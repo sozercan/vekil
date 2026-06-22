@@ -101,3 +101,64 @@ func observeAnthropicUsageBody(ctx context.Context, body []byte) {
 	}
 	observeOpenAIUsage(ctx, usage)
 }
+
+// anthropicStreamUsageAccumulator collects token usage from an Anthropic
+// Messages SSE stream so the direct anthropic-compatible streaming passthrough
+// can record it (that path only re-frames SSE and otherwise never converts
+// Anthropic usage into the chat-shaped fields the dashboard reads). Anthropic
+// reports input tokens (and cache-read) on the message_start event and the
+// running output-token total on each message_delta event; the last value seen
+// wins. Call observe(frameData) for each SSE data payload, then flush(ctx) once
+// at stream end.
+type anthropicStreamUsageAccumulator struct {
+	input      int
+	output     int
+	cacheRead  int
+	haveInput  bool
+	haveOutput bool
+}
+
+func (a *anthropicStreamUsageAccumulator) observe(data []byte) {
+	var event struct {
+		Type    string `json:"type"`
+		Message *struct {
+			Usage *models.AnthropicUsage `json:"usage"`
+		} `json:"message"`
+		Usage *models.AnthropicUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(data, &event); err != nil {
+		return
+	}
+	switch event.Type {
+	case "message_start":
+		if event.Message != nil && event.Message.Usage != nil {
+			a.input = event.Message.Usage.InputTokens
+			a.cacheRead = event.Message.Usage.CacheReadInputTokens
+			a.haveInput = true
+			if event.Message.Usage.OutputTokens > 0 {
+				a.output = event.Message.Usage.OutputTokens
+				a.haveOutput = true
+			}
+		}
+	case "message_delta":
+		if event.Usage != nil && event.Usage.OutputTokens > 0 {
+			a.output = event.Usage.OutputTokens
+			a.haveOutput = true
+		}
+	}
+}
+
+func (a *anthropicStreamUsageAccumulator) flush(ctx context.Context) {
+	if !a.haveInput && !a.haveOutput {
+		return
+	}
+	usage := &models.OpenAIUsage{
+		PromptTokens:     a.input,
+		CompletionTokens: a.output,
+		TotalTokens:      a.input + a.output,
+	}
+	if a.cacheRead > 0 {
+		usage.PromptTokensDetails = &models.OpenAIPromptTokensDetails{CachedTokens: a.cacheRead}
+	}
+	observeOpenAIUsage(ctx, usage)
+}

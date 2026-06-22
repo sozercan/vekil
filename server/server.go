@@ -134,14 +134,31 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 			defer handler.DecInflight()
 		}
 
+		// Mark the request context so upstream retries made on behalf of a tracked
+		// inference request are counted in retry stats. The mark must be set here
+		// (not derived inside the upstream call) because newInferenceUpstreamContext
+		// rebuilds the upstream context from context.Background(); only an
+		// explicitly-propagated positive marker survives that.
+		if handler != nil {
+			ctx = handler.MarkRetryStatsTrackedIfInference(ctx, r.Method, r.URL.Path)
+		}
+
 		next.ServeHTTP(recorder, r.WithContext(ctx))
 		status := recorder.status
 		if status == 0 {
 			status = http.StatusOK
 		}
+		// A streamed response can fail after its 200 header was committed (e.g. a
+		// /responses turn that emits response.failed/incomplete). The handler
+		// records that out-of-band on the summary; prefer it for stats so the
+		// dashboard does not count a post-commit failure as a success.
+		statsStatus := status
+		if failure := summary.FailureStatus(); failure != 0 {
+			statsStatus = failure
+		}
 		elapsed := time.Since(start)
 		if tracked {
-			handler.RecordRequest(summary, status, r.Header.Get("User-Agent"), elapsed)
+			handler.RecordRequest(summary, statsStatus, r.Header.Get("User-Agent"), elapsed)
 		}
 		if log != nil {
 			fields := []logger.Field{

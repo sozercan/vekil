@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,23 +12,6 @@ import (
 
 	"github.com/sozercan/vekil/models"
 )
-
-// insightRequestContextKey marks the in-process /dashboard/insight chat call so
-// its retries are not counted in traffic stats (the insight path is documented
-// as self-excluded from the dashboard's own metrics).
-type insightRequestContextKey struct{}
-
-func markInsightRequest(ctx context.Context) context.Context {
-	return context.WithValue(ctx, insightRequestContextKey{}, true)
-}
-
-func isInsightRequest(ctx context.Context) bool {
-	if ctx == nil {
-		return false
-	}
-	v, _ := ctx.Value(insightRequestContextKey{}).(bool)
-	return v
-}
 
 const (
 	// insightUpstreamTimeout bounds the on-demand insight generation call.
@@ -190,7 +172,6 @@ func (h *ProxyHandler) HandleDashboardInsight(w http.ResponseWriter, r *http.Req
 		writeInsightError(w, "failed to build insight request")
 		return
 	}
-	innerReq = innerReq.WithContext(markInsightRequest(innerReq.Context()))
 	innerReq.Header.Set("Content-Type", "application/json")
 	innerReq.Header.Set("User-Agent", "vekil-dashboard-insight")
 

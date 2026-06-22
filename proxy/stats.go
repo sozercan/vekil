@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"net/http"
@@ -803,6 +804,46 @@ func isInferenceRoute(method, path string) bool {
 	default:
 		return false
 	}
+}
+
+// retryStatsTrackedContextKey marks a context that belongs to a tracked
+// inference request, so upstream retries made on its behalf are counted in the
+// dashboard's retry stats. It is a positive allow-marker rather than an
+// exclusion marker because the upstream request context is rebuilt from
+// context.Background() (newInferenceUpstreamContext), which strips inherited
+// values — an "is this excluded?" marker set on the inbound request context
+// would simply be lost. The middleware sets it only when TracksRequest is true,
+// and newInferenceUpstreamContext copies it onto the upstream context, so
+// retries from non-tracked callers (the in-process /dashboard/insight call, the
+// GET /v1/models catalog fetch, count-token probes, and the proxy shims) carry
+// no marker and are not counted.
+type retryStatsTrackedContextKey struct{}
+
+func markRetryStatsTracked(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.WithValue(context.Background(), retryStatsTrackedContextKey{}, true)
+	}
+	return context.WithValue(ctx, retryStatsTrackedContextKey{}, true)
+}
+
+func isRetryStatsTracked(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(retryStatsTrackedContextKey{}).(bool)
+	return v
+}
+
+// MarkRetryStatsTrackedIfInference returns a context carrying the retry-stats
+// marker when method+path is a tracked inference route, otherwise the context
+// unchanged. The server middleware calls this on the inbound request context so
+// the marker propagates (via newInferenceUpstreamContext) to the upstream
+// request whose retries should be counted.
+func (h *ProxyHandler) MarkRetryStatsTrackedIfInference(ctx context.Context, method, path string) context.Context {
+	if h == nil || h.stats == nil || !isInferenceRoute(method, path) {
+		return ctx
+	}
+	return markRetryStatsTracked(ctx)
 }
 
 // TracksRequest reports whether requests for the given method+path should be

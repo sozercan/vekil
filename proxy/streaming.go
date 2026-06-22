@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -231,7 +232,7 @@ func firstOpenAIUsageCallback(callbacks []func(*models.OpenAIUsage)) func(*model
 	return nil
 }
 
-func streamAnthropicPassthroughBody(w http.ResponseWriter, body io.Reader, publicModel, upstreamModel string) {
+func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, body io.Reader, publicModel, upstreamModel string) {
 	publicModel = strings.TrimSpace(publicModel)
 	upstreamModel = strings.TrimSpace(upstreamModel)
 
@@ -240,33 +241,95 @@ func streamAnthropicPassthroughBody(w http.ResponseWriter, body io.Reader, publi
 		flusher = f
 	}
 
+	// Tap each SSE frame for Anthropic usage so direct-routed streaming traffic
+	// records tokens. The tap never alters the bytes written to the client.
+	usage := &anthropicStreamUsageAccumulator{}
+	defer usage.flush(ctx)
+
 	if publicModel == "" || publicModel == upstreamModel {
-		_, _ = io.Copy(&flushWriter{w: w, flusher: flusher}, body)
+		// No model rewrite: preserve the original byte-exact, unbounded passthrough
+		// (io.Copy handles SSE lines of any size) while teeing the bytes through a
+		// best-effort usage sniffer. The sniffer skips lines it cannot buffer, so
+		// an oversized line degrades usage capture for that turn rather than
+		// truncating the client stream.
+		sniffer := newAnthropicUsageSniffWriter(usage)
+		_, _ = io.Copy(&flushWriter{w: w, flusher: flusher}, io.TeeReader(body, sniffer))
 		return
 	}
 
 	reader := bufio.NewReaderSize(body, openAIStreamScannerInitialBuffer)
 	frame := make([]string, 0, 4)
+	emit := func() {
+		if len(frame) == 0 {
+			return
+		}
+		observeAnthropicFrameUsage(usage, frame)
+		writeAnthropicSSEFrame(w, frame, publicModel)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		frame = frame[:0]
+	}
 	for {
 		line, err := readOpenAISSELine(reader)
 		if len(line) > 0 {
 			frame = append(frame, line)
 			if strings.TrimRight(line, "\r\n") == "" {
-				writeAnthropicSSEFrame(w, frame, publicModel)
-				if flusher != nil {
-					flusher.Flush()
-				}
-				frame = frame[:0]
+				emit()
 			}
 		}
 		if err != nil {
-			if len(frame) > 0 {
-				writeAnthropicSSEFrame(w, frame, publicModel)
-				if flusher != nil {
-					flusher.Flush()
+			emit()
+			return
+		}
+	}
+}
+
+// anthropicUsageSniffWriter scans an Anthropic SSE byte stream for usage as it
+// is copied to the client. It buffers a single SSE line at a time and, on each
+// complete data line, feeds the payload to the accumulator. A line longer than
+// the buffer cap is skipped (its usage, if any, is not recorded) so the sniffer
+// never affects the client copy or grows unbounded.
+type anthropicUsageSniffWriter struct {
+	acc      *anthropicStreamUsageAccumulator
+	line     []byte
+	overflow bool
+}
+
+func newAnthropicUsageSniffWriter(acc *anthropicStreamUsageAccumulator) *anthropicUsageSniffWriter {
+	return &anthropicUsageSniffWriter{acc: acc, line: make([]byte, 0, 512)}
+}
+
+func (s *anthropicUsageSniffWriter) Write(p []byte) (int, error) {
+	for _, b := range p {
+		if b == '\n' {
+			if !s.overflow {
+				if data, ok := parseSSELine(strings.TrimRight(string(s.line), "\r")); ok {
+					s.acc.observe([]byte(data))
 				}
 			}
-			return
+			s.line = s.line[:0]
+			s.overflow = false
+			continue
+		}
+		if len(s.line) >= openAIStreamScannerMaxBuffer {
+			// Pathological oversized line: stop buffering it, skip its usage.
+			s.overflow = true
+			s.line = s.line[:0]
+			continue
+		}
+		s.line = append(s.line, b)
+	}
+	return len(p), nil
+}
+
+// observeAnthropicFrameUsage feeds the data payload of an SSE frame (its
+// "data:" lines, joined) to the Anthropic usage accumulator.
+func observeAnthropicFrameUsage(acc *anthropicStreamUsageAccumulator, frame []string) {
+	for _, line := range frame {
+		content, _ := splitSSELineEnding(line)
+		if data, ok := parseSSELine(content); ok {
+			acc.observe([]byte(data))
 		}
 	}
 }

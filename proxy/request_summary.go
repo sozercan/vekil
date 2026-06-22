@@ -29,6 +29,12 @@ type RequestSummary struct {
 	totalTokens       *int
 	cachedTokens      *int
 	reasoningTokens   *int
+	// failureStatus, when non-zero, is an error status the handler observed
+	// out-of-band after the HTTP response status was already committed — e.g. a
+	// streaming /responses turn that emits response.failed/incomplete after the
+	// 200 header was sent. The stats middleware prefers it over the recorded HTTP
+	// status so post-commit failures are not counted as successes.
+	failureStatus int
 }
 
 // WithRequestSummary attaches a mutable request summary to ctx and returns both
@@ -116,6 +122,38 @@ func (s *RequestSummary) setOpenAIUsage(usage *models.OpenAIUsage) {
 }
 
 func summaryIntPtr(v int) *int { return &v }
+
+// setFailureStatus records an out-of-band failure status (first one wins) for a
+// request whose HTTP status was already committed before the failure was known.
+func (s *RequestSummary) setFailureStatus(status int) {
+	if s == nil || status == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failureStatus == 0 {
+		s.failureStatus = status
+	}
+}
+
+// FailureStatus returns the out-of-band failure status, or 0 if none. The stats
+// middleware prefers a non-zero value over the committed HTTP status.
+func (s *RequestSummary) FailureStatus() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failureStatus
+}
+
+// observeResponseFailureStatus records an out-of-band failure status onto the
+// request summary attached to ctx, if any.
+func observeResponseFailureStatus(ctx context.Context, status int) {
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		summary.setFailureStatus(status)
+	}
+}
 
 // LoggerFields returns the structured fields populated for this request.
 func (s *RequestSummary) LoggerFields() []logger.Field {

@@ -569,6 +569,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			code = strings.TrimSpace(translated.failure.Response.Error.Code)
 		}
 		s.sendWrappedError(translated.status, translated.message, code, translatedHeaders)
+		// A precommit translated failure (e.g. unsupported-model or rate-limit
+		// surfaced before the stream is handed off) is still a failed turn; count
+		// it so it appears in the dashboard error stats and recent log, matching
+		// the non-200 and stream-error branches below.
+		s.recordTurnStats(h, request.Model, translated.status, responsesUsage{})
 		return nil
 	}
 	if resp == nil {
@@ -693,7 +698,10 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 	}
 	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizers(ctx, bodyBytes, "responses/websocket", true, s.toolContexts, s.toolScope)
 	headers := s.requestHeaders(request, includeTurnState)
-	if compactionResp, handled, err := h.maybeBuildResponsesCompactionTriggerResponse(ctx, bodyBytes, headers, true); handled || err != nil {
+	// The websocket bridge records each turn's usage downstream from the streamed
+	// response body (recordTurnStats), so the per-turn usage total returned here
+	// is not observed separately — discard it.
+	if compactionResp, handled, _, err := h.maybeBuildResponsesCompactionTriggerResponse(ctx, bodyBytes, headers, true); handled || err != nil {
 		return compactionResp, err
 	}
 	return h.postResponsesWithHeaders(ctx, bodyBytes, headers)

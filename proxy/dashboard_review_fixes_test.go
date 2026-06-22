@@ -78,23 +78,70 @@ func TestHandleDashboardInsightRejectsCrossSite(t *testing.T) {
 	}
 }
 
-// TestLogRetryAttemptExcludesInsightRequests covers that retries on the
-// in-process /dashboard/insight call are not counted in the dashboard's own
-// retry stats (the insight path is self-excluded), while ordinary requests are.
-func TestLogRetryAttemptExcludesInsightRequests(t *testing.T) {
+// TestLogRetryAttemptCountsOnlyTrackedRequests covers that retry accounting is
+// gated to tracked inference requests via the positive retry-stats context
+// marker: a marked (tracked) context counts, an unmarked one (insight call,
+// model-catalog fetch, count-token probe, proxy shim) does not. The marker is a
+// positive allow-signal rather than an exclusion signal because the upstream
+// request context is rebuilt from context.Background(), which strips any
+// exclusion marker set on the inbound request.
+func TestLogRetryAttemptCountsOnlyTrackedRequests(t *testing.T) {
 	h := &ProxyHandler{stats: newStatsCollector()}
 
-	// Ordinary request context → counted.
+	// Unmarked context (non-tracked caller) → not counted.
 	h.logRetryAttempt(context.Background(), 0, 503, "", 0, nil)
-	if got := h.stats.snapshot().Retries; got != 1 {
-		t.Fatalf("ordinary retry not counted: got %d want 1", got)
+	if got := h.stats.snapshot().Retries; got != 0 {
+		t.Fatalf("unmarked retry should not be counted: got %d want 0", got)
 	}
 
-	// Insight-marked context → not counted.
-	insightCtx := markInsightRequest(context.Background())
-	h.logRetryAttempt(insightCtx, 0, 503, "", 0, nil)
+	// Tracked-marked context → counted.
+	trackedCtx := markRetryStatsTracked(context.Background())
+	h.logRetryAttempt(trackedCtx, 0, 503, "", 0, nil)
 	if got := h.stats.snapshot().Retries; got != 1 {
-		t.Fatalf("insight retry should be excluded: retries went to %d want 1", got)
+		t.Fatalf("tracked retry not counted: got %d want 1", got)
+	}
+}
+
+// TestNewInferenceUpstreamContextPropagatesTrackedMarker covers that the upstream
+// context inherits the retry-stats marker from a tracked inbound context (so
+// retries are counted) but not from an unmarked one (so insight / catalog /
+// probe retries stay uncounted) — the background root would otherwise strip it.
+func TestNewInferenceUpstreamContextPropagatesTrackedMarker(t *testing.T) {
+	h := &ProxyHandler{}
+
+	tracked := markRetryStatsTracked(context.Background())
+	up, cancel := h.newInferenceUpstreamContextFrom(tracked, false)
+	defer cancel()
+	if !isRetryStatsTracked(up) {
+		t.Fatal("tracked marker should propagate to the upstream context")
+	}
+
+	up2, cancel2 := h.newInferenceUpstreamContextFrom(context.Background(), false)
+	defer cancel2()
+	if isRetryStatsTracked(up2) {
+		t.Fatal("unmarked inbound context must not yield a tracked upstream context")
+	}
+
+	// The legacy no-arg constructor never marks (used by non-tracked probes).
+	up3, cancel3 := h.newInferenceUpstreamContext(false)
+	defer cancel3()
+	if isRetryStatsTracked(up3) {
+		t.Fatal("newInferenceUpstreamContext must not mark tracked")
+	}
+}
+
+// TestMarkRetryStatsTrackedIfInference covers that only inference routes acquire
+// the marker through the middleware helper.
+func TestMarkRetryStatsTrackedIfInference(t *testing.T) {
+	h := &ProxyHandler{stats: newStatsCollector()}
+	if ctx := h.MarkRetryStatsTrackedIfInference(context.Background(), http.MethodPost, "/v1/chat/completions"); !isRetryStatsTracked(ctx) {
+		t.Fatal("inference route should be marked tracked")
+	}
+	if ctx := h.MarkRetryStatsTrackedIfInference(context.Background(), http.MethodGet, "/v1/models"); isRetryStatsTracked(ctx) {
+		t.Fatal("GET /v1/models must not be marked tracked")
+	}
+	if ctx := h.MarkRetryStatsTrackedIfInference(context.Background(), http.MethodPost, "/v1/messages/count_tokens"); isRetryStatsTracked(ctx) {
+		t.Fatal("count_tokens must not be marked tracked")
 	}
 }
 
@@ -229,5 +276,123 @@ func TestStreamOpenAIToGeminiCapturesUsage(t *testing.T) {
 	})
 	if captured == nil || captured.TotalTokens != 9 {
 		t.Fatalf("gemini stream usage callback = %#v, want total 9", captured)
+	}
+}
+
+// TestAnthropicStreamUsageAccumulator covers usage capture from an Anthropic
+// Messages SSE stream (finding: direct-Anthropic streaming recorded zero
+// tokens). Input/cache-read come from message_start; the running output total
+// comes from the last message_delta.
+func TestAnthropicStreamUsageAccumulator(t *testing.T) {
+	acc := &anthropicStreamUsageAccumulator{}
+	acc.observe([]byte(`{"type":"message_start","message":{"usage":{"input_tokens":120,"cache_read_input_tokens":30,"output_tokens":1}}}`))
+	acc.observe([]byte(`{"type":"content_block_delta","delta":{"text":"hi"}}`))
+	acc.observe([]byte(`{"type":"message_delta","usage":{"output_tokens":7}}`))
+	acc.observe([]byte(`{"type":"message_delta","usage":{"output_tokens":42}}`)) // last wins
+
+	ctx, summary := WithRequestSummary(context.Background())
+	acc.flush(ctx)
+
+	if summary.promptTokens == nil || *summary.promptTokens != 120 {
+		t.Fatalf("promptTokens = %v want 120", summary.promptTokens)
+	}
+	if summary.completionTokens == nil || *summary.completionTokens != 42 {
+		t.Fatalf("completionTokens = %v want 42 (last message_delta wins)", summary.completionTokens)
+	}
+	if summary.totalTokens == nil || *summary.totalTokens != 162 {
+		t.Fatalf("totalTokens = %v want 162", summary.totalTokens)
+	}
+	if summary.cachedTokens == nil || *summary.cachedTokens != 30 {
+		t.Fatalf("cachedTokens = %v want 30", summary.cachedTokens)
+	}
+}
+
+// TestStreamAnthropicPassthroughObservesUsageOnFastPath covers that usage is
+// captured even on the byte-exact no-rewrite path (publicModel == upstreamModel),
+// and that the streamed bytes are unchanged.
+func TestStreamAnthropicPassthroughObservesUsageOnFastPath(t *testing.T) {
+	stream := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":50,"output_tokens":1}}}` + "\n\n" +
+		"event: message_delta\n" +
+		`data: {"type":"message_delta","usage":{"output_tokens":9}}` + "\n\n"
+
+	ctx, summary := WithRequestSummary(context.Background())
+	w := httptest.NewRecorder()
+	// publicModel == upstreamModel => no rewrite, byte-exact fast path.
+	streamAnthropicPassthroughBody(ctx, w, strings.NewReader(stream), "claude-x", "claude-x")
+
+	if got := w.Body.String(); got != stream {
+		t.Fatalf("fast-path bytes changed:\n got=%q\nwant=%q", got, stream)
+	}
+	if summary.totalTokens == nil || *summary.totalTokens != 59 {
+		t.Fatalf("totalTokens = %v want 59 (usage observed on fast path)", summary.totalTokens)
+	}
+}
+
+// TestCompactBudgetUsageTotals covers the accessor used to record
+// compaction-trigger usage onto the request summary (finding: compaction-trigger
+// turns recorded zero tokens).
+func TestCompactBudgetUsageTotals(t *testing.T) {
+	b := newCompactBudget(3)
+	b.addResponsesUsage([]byte(`{"usage":{"input_tokens":100,"output_tokens":40,"total_tokens":140}}`))
+	b.addResponsesUsage([]byte(`{"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`))
+
+	u := b.usageTotals()
+	if u.InputTokens != 110 || u.OutputTokens != 45 || u.TotalTokens != 155 {
+		t.Fatalf("usageTotals = %+v want input=110 output=45 total=155", u)
+	}
+
+	// Observe onto a summary to confirm it maps onto the chat-shaped fields.
+	ctx, summary := WithRequestSummary(context.Background())
+	observeResponsesUsage(ctx, u)
+	if summary.totalTokens == nil || *summary.totalTokens != 155 {
+		t.Fatalf("observed totalTokens = %v want 155", summary.totalTokens)
+	}
+}
+
+// TestRequestSummaryFailureStatus covers the out-of-band failure status used to
+// record post-commit streaming failures (finding: response.failed/incomplete
+// after a committed 200 was counted as success).
+func TestRequestSummaryFailureStatus(t *testing.T) {
+	ctx, summary := WithRequestSummary(context.Background())
+	if summary.FailureStatus() != 0 {
+		t.Fatal("fresh summary should have no failure status")
+	}
+	observeResponseFailureStatus(ctx, http.StatusBadGateway)
+	if summary.FailureStatus() != http.StatusBadGateway {
+		t.Fatalf("FailureStatus = %d want 502", summary.FailureStatus())
+	}
+	// First one wins; a later status does not overwrite.
+	observeResponseFailureStatus(ctx, http.StatusInternalServerError)
+	if summary.FailureStatus() != http.StatusBadGateway {
+		t.Fatalf("FailureStatus changed to %d, want first-wins 502", summary.FailureStatus())
+	}
+	// Zero is ignored.
+	ctx2, summary2 := WithRequestSummary(context.Background())
+	observeResponseFailureStatus(ctx2, 0)
+	if summary2.FailureStatus() != 0 {
+		t.Fatal("zero status should be ignored")
+	}
+}
+
+// TestStreamAnthropicPassthroughFastPathPreservesOversizedLine guards against a
+// regression: the byte-exact no-rewrite path must stream an SSE line larger than
+// the usage-sniffer's buffer cap unchanged (usage capture degrades, the client
+// copy does not truncate).
+func TestStreamAnthropicPassthroughFastPathPreservesOversizedLine(t *testing.T) {
+	huge := strings.Repeat("x", openAIStreamScannerMaxBuffer+4096)
+	stream := "data: " + huge + "\n\n" +
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":2}}}` + "\n\n"
+
+	ctx, summary := WithRequestSummary(context.Background())
+	w := httptest.NewRecorder()
+	streamAnthropicPassthroughBody(ctx, w, strings.NewReader(stream), "claude-x", "claude-x")
+
+	if got := w.Body.String(); got != stream {
+		t.Fatalf("oversized line not preserved on fast path: got %d bytes want %d", len(got), len(stream))
+	}
+	// Usage from the normal-sized frame after the oversized one is still captured.
+	if summary.totalTokens == nil || *summary.totalTokens != 7 {
+		t.Fatalf("totalTokens = %v want 7 (usage after oversized line still sniffed)", summary.totalTokens)
 	}
 }

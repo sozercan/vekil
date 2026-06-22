@@ -133,10 +133,10 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	prepared := h.prepareResponsesRequest(r.Context(), r, bodyBytes)
 	h.observeRequestSummary(r.Context(), "responses", extractRequestModel(prepared.body), prepared.streaming, providerEndpointResponses)
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(prepared.streaming)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), prepared.streaming)
 	defer upstreamCancel()
 
-	if compactionResp, handled, err := h.maybeBuildResponsesCompactionTriggerResponse(upstreamCtx, prepared.body, prepared.extraHeaders, prepared.streaming); handled || err != nil {
+	if compactionResp, handled, compactionUsage, err := h.maybeBuildResponsesCompactionTriggerResponse(upstreamCtx, prepared.body, prepared.extraHeaders, prepared.streaming); handled || err != nil {
 		if err != nil {
 			statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 			h.log.Error("upstream request failed", logger.F("endpoint", "responses/compaction_trigger"), logger.Err(err))
@@ -147,6 +147,11 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIUpstreamRequestFailure(w, statusCode, err)
 			return
 		}
+		// The compaction-trigger turn spends upstream /responses tokens across its
+		// internal compaction calls, but returns a synthetic response that bypasses
+		// the usage-observing passthrough below. Record the aggregate usage onto the
+		// inbound request summary so the dashboard does not count it as zero tokens.
+		observeResponsesUsage(r.Context(), compactionUsage)
 		writeUpstreamResponse(w, compactionResp)
 		return
 	}
@@ -278,6 +283,28 @@ func (b *compactBudget) responsesUsage() map[string]interface{} {
 		"output_tokens":         usage.OutputTokens,
 		"output_tokens_details": nil,
 		"total_tokens":          usage.TotalTokens,
+	}
+}
+
+// usageTotals returns the aggregate token usage accumulated across this
+// budget's upstream /responses calls, in the Responses usage shape, so callers
+// can record it onto the request summary (the compaction-trigger path returns a
+// synthetic response and never flows through the usage-observing passthrough).
+func (b *compactBudget) usageTotals() responsesUsage {
+	if b == nil {
+		return responsesUsage{}
+	}
+	b.mu.Lock()
+	usage := b.usage
+	b.mu.Unlock()
+	total := usage.TotalTokens
+	if total == 0 {
+		total = usage.InputTokens + usage.OutputTokens
+	}
+	return responsesUsage{
+		InputTokens:  usage.InputTokens,
+		OutputTokens: usage.OutputTokens,
+		TotalTokens:  total,
 	}
 }
 
@@ -2773,22 +2800,22 @@ func (h *ProxyHandler) compactResponsesInputWithBudget(ctx context.Context, mode
 	return summary, nil
 }
 
-func (h *ProxyHandler) maybeBuildResponsesCompactionTriggerResponse(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, stream bool) (*http.Response, bool, error) {
+func (h *ProxyHandler) maybeBuildResponsesCompactionTriggerResponse(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, stream bool) (*http.Response, bool, responsesUsage, error) {
 	requestFields, ok, err := compactTriggerRequestFields(bodyBytes)
 	if err != nil || !ok {
-		return nil, ok, err
+		return nil, ok, responsesUsage{}, err
 	}
 
 	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
 	summary, resp, err := h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget)
 	if err != nil {
-		return nil, true, err
+		return nil, true, responsesUsage{}, err
 	}
 	if resp != nil {
-		return resp, true, nil
+		return resp, true, budget.usageTotals(), nil
 	}
 
-	return syntheticCompactionTriggerResponse(summary, stream, budget.responsesUsage()), true, nil
+	return syntheticCompactionTriggerResponse(summary, stream, budget.responsesUsage()), true, budget.usageTotals(), nil
 }
 
 func compactTriggerRequestFields(bodyBytes []byte) (map[string]json.RawMessage, bool, error) {

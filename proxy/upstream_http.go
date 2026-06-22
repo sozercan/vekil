@@ -14,13 +14,30 @@ import (
 )
 
 func (h *ProxyHandler) newInferenceUpstreamContext(streaming bool) (context.Context, context.CancelFunc) {
+	return h.newInferenceUpstreamContextFrom(context.Background(), streaming)
+}
+
+// newInferenceUpstreamContextFrom builds the upstream request context the same
+// way as newInferenceUpstreamContext (background-rooted with a timeout, so a
+// client disconnect does not cancel the upstream call) but copies the
+// retry-stats tracked marker from the inbound request context when present. The
+// background root deliberately strips inherited values, so this explicit copy is
+// what lets a tracked inference request's upstream retries be counted while
+// non-tracked callers (insight, model-catalog fetch, count-token probes) stay
+// uncounted. Pass the inbound r.Context(); a context without the marker (e.g.
+// context.Background()) yields an untracked upstream context.
+func (h *ProxyHandler) newInferenceUpstreamContextFrom(inbound context.Context, streaming bool) (context.Context, context.CancelFunc) {
 	// Use background context with timeout to avoid cancellation from client
 	// disconnects while still preventing goroutine leaks on upstream hangs.
 	timeout := upstreamTimeout
 	if streaming {
 		timeout = h.effectiveStreamingUpstreamTimeout()
 	}
-	return context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	if isRetryStatsTracked(inbound) {
+		ctx = markRetryStatsTracked(ctx)
+	}
+	return ctx, cancel
 }
 
 func upstreamStatusCode(err error, fallback int) int {
@@ -352,14 +369,14 @@ func writeDirectAnthropicJSONResponse(ctx context.Context, w http.ResponseWriter
 	return nil
 }
 
-func writeDirectAnthropicStreamResponse(w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) {
+func writeDirectAnthropicStreamResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) {
 	defer func() { _ = resp.Body.Close() }()
 
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.Header().Del("Content-Length")
 	setSSEHeaders(w)
 	w.WriteHeader(resp.StatusCode)
-	streamAnthropicPassthroughBody(w, resp.Body, publicModel, upstreamModel)
+	streamAnthropicPassthroughBody(ctx, w, resp.Body, publicModel, upstreamModel)
 }
 
 func rewriteAnthropicResponseModelJSON(body []byte, publicModel, upstreamModel string) ([]byte, bool) {
