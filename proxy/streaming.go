@@ -123,6 +123,12 @@ func streamOpenAIPassthrough(
 ) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
+	// This is a streamed SSE response, so any upstream Content-Length copied by
+	// the caller (via copyPassthroughHeaders) is wrong — and definitely wrong on
+	// the drop-injected-usage path, which writes fewer bytes than the upstream
+	// advertised. Drop it so clients read until EOF instead of hanging on or
+	// truncating at a stale length.
+	w.Header().Del("Content-Length")
 
 	var flusher http.Flusher
 	if f, ok := w.(http.Flusher); ok {

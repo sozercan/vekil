@@ -770,22 +770,33 @@ func boundStatLabel(s string) string {
 // /v1/responses websocket upgrade, health/observability probes, and unmatched
 // (404) paths — are excluded by construction rather than by enumerating things
 // to skip. The websocket bridge records each turn directly via
-// RecordResponsesTurn instead of through the middleware. Keep this in sync with
+// RecordResponsesTurn instead of through the middleware.
+//
+// Deliberately excluded even though they are registered routes: token-counting
+// probes (POST /v1/messages/count_tokens, Gemini :countTokens) are non-
+// generating sizing calls that are frequently served from cache or a local
+// estimate with no upstream spend, and the proxy-owned compatibility shims
+// (POST /v1/responses/compact, /v1/memories/trace_summarize) do not surface a
+// single per-request model completion. Tracking any of these would add
+// zero-token requests (and, for count_tokens, latency samples) that skew the
+// dashboard's average-tokens/request and latency metrics. Keep this in sync with
 // the inference routes registered in server/server.go.
 func isInferenceRoute(method, path string) bool {
 	switch method {
 	case http.MethodPost:
 		switch path {
 		case "/v1/messages",
-			"/v1/messages/count_tokens",
 			"/v1/chat/completions",
-			"/v1/responses",
-			"/v1/responses/compact",
-			"/v1/memories/trace_summarize":
+			"/v1/responses":
 			return true
 		}
-		// Gemini generateContent routes are registered as path prefixes
-		// (the model id and :generateContent verb follow).
+		// Gemini routes are registered as path prefixes ({model}:{action}).
+		// Track the generating verbs but not the :countTokens sizing probe; the
+		// action is the suffix after the last colon (parseGeminiPath), and
+		// r.URL.Path carries no query string, so a suffix match is exact.
+		if strings.HasSuffix(path, ":countTokens") {
+			return false
+		}
 		return strings.HasPrefix(path, "/v1beta/models/") ||
 			strings.HasPrefix(path, "/v1/models/") ||
 			strings.HasPrefix(path, "/models/")

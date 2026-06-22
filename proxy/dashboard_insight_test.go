@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
@@ -117,6 +118,22 @@ func TestSanitizeLabel(t *testing.T) {
 	long := strings.Repeat("x", 200)
 	if got := sanitizeLabel(long); len([]rune(got)) > 82 { // 80 + ellipsis margin
 		t.Errorf("sanitizeLabel did not cap length: got %d runes", len([]rune(got)))
+	}
+
+	// Multi-byte UTF-8 must be truncated on a rune boundary, never mid-rune, so
+	// the result is always valid UTF-8 (the client-posted `shown` narrative is
+	// not rune-bounded before reaching here). Each "世" is 3 bytes; 100 of them
+	// is 300 bytes — a naive byte slice at 80 would split a rune.
+	multibyte := strings.Repeat("世", 100)
+	got := sanitizeLabel(multibyte)
+	if !utf8.ValidString(got) {
+		t.Fatalf("sanitizeLabel produced invalid UTF-8 for multi-byte input: %q", got)
+	}
+	if r := []rune(got); len(r) != 81 { // 80 runes + ellipsis
+		t.Fatalf("sanitizeLabel multi-byte cap = %d runes, want 81", len(r))
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Fatalf("expected ellipsis suffix, got %q", got)
 	}
 }
 

@@ -352,8 +352,10 @@ func buildInsightPrompt(snap statsSnapshot, shown string) string {
 
 // sanitizeLabel strips newlines and other control characters from a label and
 // caps its length, so client-controlled values (model names, User-Agent-derived
-// agent labels) folded into the insight prompt cannot inject new lines or
-// instructions into it.
+// agent labels, the client-posted `shown` narrative) folded into the insight
+// prompt cannot inject new lines or instructions into it. The length cap is
+// measured and applied in runes so a multi-byte UTF-8 sequence is never split
+// mid-rune (which would emit invalid UTF-8 before the ellipsis).
 func sanitizeLabel(s string) string {
 	const maxLen = 80
 	s = strings.Map(func(r rune) rune {
@@ -366,8 +368,8 @@ func sanitizeLabel(s string) string {
 		return r
 	}, s)
 	s = strings.TrimSpace(s)
-	if len(s) > maxLen {
-		s = s[:maxLen] + "…"
+	if r := []rune(s); len(r) > maxLen {
+		s = string(r[:maxLen]) + "…"
 	}
 	return s
 }

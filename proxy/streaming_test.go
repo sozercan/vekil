@@ -157,6 +157,22 @@ func TestStreamOpenAIPassthroughDroppingInjectedUsage_KeepsUsageWithChoices(t *t
 	}
 }
 
+func TestStreamOpenAIPassthroughDropsContentLength(t *testing.T) {
+	// Streamed SSE must not carry a fixed Content-Length: the dropping path writes
+	// fewer bytes than the upstream advertised, and even the plain path is a
+	// chunked stream. Simulate the caller having copied an upstream Content-Length
+	// onto the response, then assert the passthrough strips it.
+	body := buildSSEStream(`{"choices":[{"delta":{"content":"hi"}}]}`, "[DONE]")
+	w := httptest.NewRecorder()
+	w.Header().Set("Content-Length", "9999")
+
+	StreamOpenAIPassthroughDroppingInjectedUsage(w, body, nil, func(*models.OpenAIUsage) {})
+
+	if cl := w.Header().Get("Content-Length"); cl != "" {
+		t.Fatalf("Content-Length should be stripped on a streamed SSE response, got %q", cl)
+	}
+}
+
 func TestStreamOpenAIPassthroughWithFinalResponse_PreservesOversizedSSELine(t *testing.T) {
 	input := "data: " + oversizedSSEPayload() + "\n\ndata: [DONE]\n\n"
 	body := io.NopCloser(strings.NewReader(input))

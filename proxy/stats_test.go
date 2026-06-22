@@ -497,13 +497,13 @@ func TestHandleDashboardAsset(t *testing.T) {
 
 func TestTracksRequest(t *testing.T) {
 	h := &ProxyHandler{stats: newStatsCollector()}
-	tracked := []string{"/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens", "/v1/responses", "/v1/responses/compact", "/v1/memories/trace_summarize"}
+	tracked := []string{"/v1/chat/completions", "/v1/messages", "/v1/responses"}
 	for _, p := range tracked {
 		if !h.TracksRequest(http.MethodPost, p) {
 			t.Errorf("expected POST %s to be tracked", p)
 		}
 	}
-	// Gemini generateContent routes are prefix-registered; track them.
+	// Gemini generate verbs are prefix-registered; track them.
 	geminiPrefixes := []string{"/v1beta/models/gemini-2.5-pro:generateContent", "/v1/models/gemini-2.5-pro:streamGenerateContent", "/models/gemini-2.5-pro:generateContent"}
 	for _, p := range geminiPrefixes {
 		if !h.TracksRequest(http.MethodPost, p) {
@@ -514,6 +514,24 @@ func TestTracksRequest(t *testing.T) {
 	for _, p := range skipped {
 		if h.TracksRequest(http.MethodGet, p) {
 			t.Errorf("expected %s to be skipped", p)
+		}
+	}
+	// Token-counting probes and proxy-owned shims are non-generating or have no
+	// single per-request completion, so they are excluded from LLM-usage stats
+	// even though they are registered POST routes (tracking them would add
+	// zero-token requests that skew avg-tokens/request and latency).
+	nonInference := []string{"/v1/messages/count_tokens", "/v1/responses/compact", "/v1/memories/trace_summarize"}
+	for _, p := range nonInference {
+		if h.TracksRequest(http.MethodPost, p) {
+			t.Errorf("expected POST %s (non-generating / shim) to be skipped", p)
+		}
+	}
+	// Gemini :countTokens is the sizing probe — skipped — while the generate
+	// verbs above stay tracked, even though all three share the same path prefix.
+	geminiCount := []string{"/v1beta/models/gemini-2.5-pro:countTokens", "/v1/models/gemini-2.5-pro:countTokens", "/models/gemini-2.5-pro:countTokens"}
+	for _, p := range geminiCount {
+		if h.TracksRequest(http.MethodPost, p) {
+			t.Errorf("expected POST %s (gemini countTokens) to be skipped", p)
 		}
 	}
 	// GET /v1/models (catalog refresh) is not inference traffic — excluded so it
