@@ -400,15 +400,20 @@ func (h *ProxyHandler) initializeProviders() error {
 		return nil
 	}
 
-	setup, err := h.buildConfiguredProviderSetup(context.Background(), h.providersConfig)
+	setup, err := h.buildConfiguredProviderSetupWithDynamicValidation(context.Background(), h.providersConfig, !h.deferDynamicProviderModelRefresh)
 	if err != nil {
 		return err
 	}
 	h.providersState = setup
+	h.dynamicProviderValidationPending.Store(h.deferDynamicProviderModelRefresh && len(setup.providers) > 1 && hasDynamicProvider(setup.providers))
 	return nil
 }
 
 func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg ProvidersConfig) (*providerSetup, error) {
+	return h.buildConfiguredProviderSetupWithDynamicValidation(ctx, cfg, true)
+}
+
+func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx context.Context, cfg ProvidersConfig, validateDynamicModels bool) (*providerSetup, error) {
 	providers, providerOrder, defaultProviderID, err := h.buildProviders(cfg)
 	if err != nil {
 		return nil, err
@@ -424,7 +429,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 
 	needsDynamicModelValidation := len(providers) > 1 && hasDynamicProvider(providers)
 
-	if !needsDynamicModelValidation {
+	if !needsDynamicModelValidation || !validateDynamicModels {
 		for _, providerID := range providerOrder {
 			if err := setup.addStaticProviderModels(providerID); err != nil {
 				return nil, err
@@ -459,6 +464,38 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 	}
 
 	return setup, nil
+}
+
+// ValidateDynamicProviderModels loads dynamic provider catalogs into an already
+// initialized provider setup. It is safe to call after the HTTP listener is up:
+// model-map updates are applied through providerSetup's locked replacement path.
+func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error {
+	setup := h.providerSetup()
+	if setup == nil || !setup.hasConfiguredState || len(setup.providers) <= 1 || !hasDynamicProvider(setup.providers) {
+		h.dynamicProviderValidationPending.Store(false)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, modelsUpstreamTimeout)
+	defer cancel()
+
+	for _, providerID := range setup.providerOrder {
+		provider := setup.providerByID(providerID)
+		if !providerUsesDynamicModels(provider) {
+			continue
+		}
+
+		result, err := h.fetchProviderModels(ctx, provider, "", "")
+		if err != nil {
+			return fmt.Errorf("load models for provider %q: %w", provider.id, err)
+		}
+		if err := setup.replaceProviderModels(providerID, result.models); err != nil {
+			return err
+		}
+	}
+
+	h.dynamicProviderValidationPending.Store(false)
+	return nil
 }
 
 func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*providerRuntime, []string, string, error) {

@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -230,33 +231,36 @@ func (c ResponsesWebSocketConfig) autoCompactEnabled() bool {
 
 // ProxyHandler holds dependencies for all HTTP handlers.
 type ProxyHandler struct {
-	auth                            *auth.Authenticator
-	client                          *http.Client
-	copilotURL                      string
-	copilotHeaders                  CopilotHeaderConfig
-	providersConfig                 ProvidersConfig
-	providersState                  *providerSetup
-	azureIdentityTokenSourceFactory azureIdentityTokenSourceFactory
-	toolOptimizers                  *ToolOptimizerManager
-	toolContexts                    *ToolExecutionContextStore
-	responsesWS                     ResponsesWebSocketConfig
-	responsesWSSessionsMu           sync.Mutex
-	responsesWSSessions             map[*responsesWebSocketSession]struct{}
-	responsesWSDraining             bool
-	streamingUpstreamTimeout        time.Duration
-	compactChunkBodyBytes           int
-	compactChunkConfigured          bool
-	compactChunkConcurrency         int
-	compactMaxAttempts              int
-	compactLearnedTargetsMu         sync.Mutex
-	compactInflightMu               sync.Mutex
-	compactInflight                 map[string]*compactInflightCall
-	compactLearnedTargets           map[compactLearnedTargetKey]compactLearnedTarget
-	log                             *logger.Logger
-	maxRetries                      int
-	retryBaseDelay                  time.Duration
-	models                          modelsCache
-	geminiCounts                    geminiCountTokensCache
+	auth                             *auth.Authenticator
+	client                           *http.Client
+	copilotURL                       string
+	copilotHeaders                   CopilotHeaderConfig
+	providersConfig                  ProvidersConfig
+	providersState                   *providerSetup
+	deferDynamicProviderModelRefresh bool
+	startupAuthenticationPending     atomic.Bool
+	dynamicProviderValidationPending atomic.Bool
+	azureIdentityTokenSourceFactory  azureIdentityTokenSourceFactory
+	toolOptimizers                   *ToolOptimizerManager
+	toolContexts                     *ToolExecutionContextStore
+	responsesWS                      ResponsesWebSocketConfig
+	responsesWSSessionsMu            sync.Mutex
+	responsesWSSessions              map[*responsesWebSocketSession]struct{}
+	responsesWSDraining              bool
+	streamingUpstreamTimeout         time.Duration
+	compactChunkBodyBytes            int
+	compactChunkConfigured           bool
+	compactChunkConcurrency          int
+	compactMaxAttempts               int
+	compactLearnedTargetsMu          sync.Mutex
+	compactInflightMu                sync.Mutex
+	compactInflight                  map[string]*compactInflightCall
+	compactLearnedTargets            map[compactLearnedTargetKey]compactLearnedTarget
+	log                              *logger.Logger
+	maxRetries                       int
+	retryBaseDelay                   time.Duration
+	models                           modelsCache
+	geminiCounts                     geminiCountTokensCache
 }
 
 type compactLearnedTargetKey struct {
@@ -336,6 +340,15 @@ func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
 func WithProvidersConfig(cfg ProvidersConfig) Option {
 	return func(h *ProxyHandler) {
 		h.providersConfig = cfg
+	}
+}
+
+// WithDeferredDynamicProviderModelValidation skips startup-time dynamic model
+// discovery. Call ValidateDynamicProviderModels after any required interactive
+// auth has completed to preserve collision checks without blocking liveness.
+func WithDeferredDynamicProviderModelValidation(deferValidation bool) Option {
+	return func(h *ProxyHandler) {
+		h.deferDynamicProviderModelRefresh = deferValidation
 	}
 }
 
@@ -677,6 +690,14 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 	if err := ctx.Err(); err != nil {
 		return
 	}
+	if h.startupAuthenticationPending.Load() {
+		writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", "startup authentication pending")
+		return
+	}
+	if h.dynamicProviderValidationPending.Load() {
+		writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", "provider model validation pending")
+		return
+	}
 
 	setup := h.providerSetup()
 	for _, providerID := range setup.providerOrder {
@@ -790,6 +811,20 @@ func shouldSuppressReadyzResponse(parent context.Context, err error) bool {
 	// Only suppress deadline errors when the caller's context already timed out.
 	// The proxy's own readiness timeout should still surface as not_ready.
 	return parent.Err() != nil
+}
+
+func (h *ProxyHandler) SetStartupAuthenticationPending(pending bool) {
+	if h != nil {
+		h.startupAuthenticationPending.Store(pending)
+	}
+}
+
+func (h *ProxyHandler) StartupAuthenticationPending() bool {
+	return h != nil && h.startupAuthenticationPending.Load()
+}
+
+func (h *ProxyHandler) DynamicProviderValidationPending() bool {
+	return h != nil && h.dynamicProviderValidationPending.Load()
 }
 
 func writeReadyzStatus(w http.ResponseWriter, statusCode int, status string, errMessage string) {

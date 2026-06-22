@@ -186,6 +186,84 @@ func TestGetToken_ConcurrentAccess(t *testing.T) {
 	}
 }
 
+func TestGetTokenNonInteractiveReturnsWhileDeviceFlowPending(t *testing.T) {
+	deviceCodeRequested := make(chan struct{})
+	var closeDeviceCodeRequested sync.Once
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login/device/code":
+			closeDeviceCodeRequested.Do(func() { close(deviceCodeRequested) })
+			_ = json.NewEncoder(w).Encode(DeviceCodeResponse{
+				DeviceCode:      "dc_pending",
+				UserCode:        "PEND-1234",
+				VerificationURI: "https://github.com/login/device",
+				ExpiresIn:       60,
+				Interval:        1,
+			})
+		case "/login/oauth/access_token":
+			_ = json.NewEncoder(w).Encode(AccessTokenResponse{Error: "authorization_pending"})
+		case "/copilot_internal/v2/token":
+			t.Fatalf("unexpected Copilot token exchange before authorization")
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	a := &Authenticator{
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+		tokenDir:       t.TempDir(),
+		githubCLIPath:  missingGitHubCLIPath(t),
+	}
+	a.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		rewritten, _ := url.Parse(server.URL + req.URL.Path)
+		rewritten.RawQuery = req.URL.RawQuery
+		req.URL = rewritten
+		return http.DefaultTransport.RoundTrip(req)
+	})
+
+	interactiveCtx, cancelInteractive := context.WithCancel(context.Background())
+	defer cancelInteractive()
+	interactiveDone := make(chan error, 1)
+	go func() {
+		_, err := a.GetToken(interactiveCtx)
+		interactiveDone <- err
+	}()
+
+	select {
+	case <-deviceCodeRequested:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for device-code flow to start")
+	}
+
+	nonInteractiveDone := make(chan error, 1)
+	go func() {
+		_, err := a.GetTokenNonInteractive(context.Background())
+		nonInteractiveDone <- err
+	}()
+
+	select {
+	case err := <-nonInteractiveDone:
+		if !errors.Is(err, ErrNotAuthenticated) {
+			t.Fatalf("GetTokenNonInteractive error = %v, want ErrNotAuthenticated", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("GetTokenNonInteractive blocked behind the pending device-code login")
+	}
+
+	cancelInteractive()
+	select {
+	case err := <-interactiveDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("interactive GetToken error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for interactive GetToken to exit")
+	}
+}
+
 func TestExchangeForCopilotToken(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "token test-access" {
@@ -786,6 +864,33 @@ func TestStatus_ReportsAuthSources(t *testing.T) {
 			t.Fatalf("expected signed-out status, got %+v", status)
 		}
 	})
+}
+
+func TestSignOutWaitsForPendingDeviceAuthorization(t *testing.T) {
+	a := &Authenticator{tokenDir: t.TempDir()}
+	a.deviceFlowMu.Lock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- a.SignOut()
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("SignOut returned while device flow was still active: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	a.deviceFlowMu.Unlock()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SignOut returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for SignOut after device flow released")
+	}
 }
 
 func TestPollForAuthorization_Success(t *testing.T) {
