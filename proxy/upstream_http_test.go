@@ -373,3 +373,69 @@ func TestPostChatCompletions_UsesAzureClassicDeploymentURLAndKeepsPublicBodyMode
 		t.Fatal("upstream server was not called")
 	}
 }
+
+// fakeBodyResponse builds a minimal 200 *http.Response whose body is the given
+// bytes, for exercising the passthrough/usage-sniff helpers directly.
+func fakeBodyResponse(body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func TestWriteOpenAIPassthroughObservingUsage_SniffsWithinCap(t *testing.T) {
+	h := &ProxyHandler{}
+	ctx, summary := WithRequestSummary(context.Background())
+	body := `{"choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15}}`
+
+	w := httptest.NewRecorder()
+	h.writeOpenAIPassthroughObservingUsage(ctx, w, fakeBodyResponse(body))
+
+	if got := w.Body.String(); got != body {
+		t.Fatalf("body changed:\n got: %s\nwant: %s", got, body)
+	}
+	if summary.totalTokens == nil || *summary.totalTokens != 15 {
+		t.Fatalf("totalTokens = %v, want 15", summary.totalTokens)
+	}
+	if summary.promptTokens == nil || *summary.promptTokens != 11 {
+		t.Fatalf("promptTokens = %v, want 11", summary.promptTokens)
+	}
+}
+
+func TestWriteOpenAIPassthroughObservingUsage_OversizedStreamsThroughIntact(t *testing.T) {
+	h := &ProxyHandler{}
+	ctx, summary := WithRequestSummary(context.Background())
+	// A body larger than the sniff cap: usage is skipped (fail-open) but every
+	// byte must still reach the client unchanged.
+	filler := strings.Repeat("x", usageSniffMaxBuffer+1024)
+	body := `{"padding":"` + filler + `","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
+
+	w := httptest.NewRecorder()
+	h.writeOpenAIPassthroughObservingUsage(ctx, w, fakeBodyResponse(body))
+
+	if got := w.Body.String(); got != body {
+		t.Fatalf("oversized body not streamed through intact: got %d bytes, want %d", len(got), len(body))
+	}
+	// Usage parse is skipped for oversized bodies.
+	if summary.totalTokens != nil {
+		t.Fatalf("totalTokens = %v, want nil (usage skipped for oversized body)", *summary.totalTokens)
+	}
+}
+
+func TestWriteOpenAIPassthroughObservingUsage_Non200PlainCopy(t *testing.T) {
+	h := &ProxyHandler{}
+	ctx, summary := WithRequestSummary(context.Background())
+	resp := fakeBodyResponse(`{"error":"boom"}`)
+	resp.StatusCode = http.StatusTooManyRequests
+
+	w := httptest.NewRecorder()
+	h.writeOpenAIPassthroughObservingUsage(ctx, w, resp)
+
+	if w.Result().StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", w.Result().StatusCode)
+	}
+	if summary.totalTokens != nil {
+		t.Fatal("usage should not be observed on a non-200 response")
+	}
+}

@@ -16,6 +16,11 @@ import (
 type chatCompletionsMode struct {
 	clientRequestedStream bool
 	forceUpstreamStream   bool
+	// injectedClientStreamUsage is true when the proxy added
+	// stream_options.include_usage to a client-requested stream that did not opt
+	// in. On the verbatim OpenAI passthrough the resulting upstream usage-only
+	// chunk must be dropped from the client stream (it never requested it).
+	injectedClientStreamUsage bool
 }
 
 type chatCompletionsResponseHandlers struct {
@@ -48,7 +53,13 @@ func prepareOpenAIChatCompletionsRequest(body []byte) ([]byte, chatCompletionsMo
 		body = injectForceStream(body)
 	} else if mode.clientRequestedStream {
 		// Ask upstream for a usage chunk so streamed traffic records tokens.
-		body = ensureStreamUsage(body)
+		// Record whether we actually injected it (the client supplied no
+		// stream_options): if so, the resulting upstream usage-only chunk is
+		// dropped from the verbatim passthrough so the client does not receive a
+		// terminal chunk it never opted into.
+		var injected bool
+		body, injected = ensureStreamUsage(body)
+		mode.injectedClientStreamUsage = injected
 	}
 	return body, mode
 }
@@ -63,9 +74,15 @@ func prepareAnthropicChatCompletionsRequest(req *models.AnthropicRequest) ([]byt
 		clientRequestedStream: req.Stream,
 		forceUpstreamStream:   !req.Stream,
 	}
-	if mode.forceUpstreamStream {
-		stream := true
-		oaiReq.Stream = &stream
+	if mode.forceUpstreamStream || mode.clientRequestedStream {
+		// Force-streamed or client-streamed: ask upstream for a usage chunk so
+		// the request records tokens. For force-stream we also set stream:true;
+		// for a client stream the request already streams, we only add the
+		// usage option.
+		if mode.forceUpstreamStream {
+			stream := true
+			oaiReq.Stream = &stream
+		}
 		oaiReq.StreamOptions = &models.StreamOptions{IncludeUsage: true}
 	}
 
@@ -152,7 +169,7 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 		return
 	}
 	if resp.StatusCode == http.StatusOK {
-		if err := writeDirectAnthropicJSONResponse(w, resp, publicModel, upstreamModel); err != nil {
+		if err := writeDirectAnthropicJSONResponse(r.Context(), w, resp, publicModel, upstreamModel); err != nil {
 			h.log.Error("upstream response rewrite failed", logger.F("endpoint", "anthropic"), logger.Err(err))
 			writeAnthropicError(w, http.StatusBadGateway, "api_error", "failed to read upstream response")
 		}
@@ -314,6 +331,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 				req.Model,
 				"msg_"+uuid.New().String(),
 				h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope),
+				openAIChatStreamUsageCallback(r.Context()),
 			)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
@@ -521,7 +539,15 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
 			copyPassthroughHeaders(w.Header(), resp.Header)
-			StreamOpenAIPassthroughWithFinalResponse(w, resp.Body, h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope), openAIChatStreamUsageCallback(r.Context()))
+			finalResponse := h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope)
+			usage := openAIChatStreamUsageCallback(r.Context())
+			if mode.injectedClientStreamUsage {
+				// The proxy added include_usage; drop the upstream usage-only
+				// chunk so the client stream matches what it requested.
+				StreamOpenAIPassthroughDroppingInjectedUsage(w, resp.Body, finalResponse, usage)
+				return
+			}
+			StreamOpenAIPassthroughWithFinalResponse(w, resp.Body, finalResponse, usage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
@@ -670,19 +696,22 @@ func injectForceStream(body []byte) []byte {
 // many upstreams omit token usage from streamed responses and the proxy records
 // zero tokens. It is merge-safe: if the client already supplied stream_options,
 // their choice is left untouched (they may have deliberately set include_usage
-// false or other options).
-func ensureStreamUsage(body []byte) []byte {
+// false or other options). The bool result reports whether include_usage was
+// actually injected (true only when the client supplied no stream_options), so
+// the caller can drop the resulting upstream usage-only chunk from a verbatim
+// passthrough the client never opted into.
+func ensureStreamUsage(body []byte) ([]byte, bool) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {
-		return body
+		return body, false
 	}
 	if _, ok := m["stream_options"]; ok {
-		return body
+		return body, false
 	}
 	m["stream_options"] = json.RawMessage(`{"include_usage":true}`)
 	result, err := json.Marshal(m)
 	if err != nil {
-		return body
+		return body, false
 	}
-	return result
+	return result, true
 }

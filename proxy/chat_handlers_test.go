@@ -86,19 +86,25 @@ func TestPrepareOpenAIChatCompletionsRequest_ClientStreamGetsIncludeUsage(t *tes
 	if !strings.Contains(string(so), `"include_usage":true`) {
 		t.Fatalf("include_usage not set: %s", so)
 	}
+	if !mode.injectedClientStreamUsage {
+		t.Fatal("injectedClientStreamUsage = false, want true when proxy injects include_usage")
+	}
 }
 
 func TestPrepareOpenAIChatCompletionsRequest_ClientStreamOptionsPreserved(t *testing.T) {
 	// Client already set stream_options — we must not clobber it.
 	input := []byte(`{"model":"gpt-4.1","stream":true,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"hi"}]}`)
 
-	prepared, _ := prepareOpenAIChatCompletionsRequest(input)
+	prepared, mode := prepareOpenAIChatCompletionsRequest(input)
 	var req map[string]json.RawMessage
 	if err := json.Unmarshal(prepared, &req); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if !strings.Contains(string(req["stream_options"]), `"include_usage":false`) {
 		t.Fatalf("client stream_options was overwritten: %s", req["stream_options"])
+	}
+	if mode.injectedClientStreamUsage {
+		t.Fatal("injectedClientStreamUsage = true, want false when client supplied stream_options")
 	}
 }
 

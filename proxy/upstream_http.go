@@ -257,7 +257,32 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
 // stats. It preserves the near-zero-copy contract: the original body bytes and
 // headers (including Content-Length) are sent unchanged; only a best-effort
 // usage parse is layered on top, and any parse failure is silently ignored.
+// Memory is bounded: bodies larger than usageSniffMaxBuffer stream through
+// without a usage parse rather than being buffered whole (see
+// writePassthroughSniffingUsage).
 func (h *ProxyHandler) writeOpenAIPassthroughObservingUsage(ctx context.Context, w http.ResponseWriter, resp *http.Response) {
+	writePassthroughSniffingUsage(w, resp, func(body []byte) {
+		observeOpenAIUsage(ctx, sniffOpenAIUsage(body))
+	})
+}
+
+// usageSniffMaxBuffer bounds how much of a non-streaming upstream response the
+// proxy buffers in memory solely to parse its usage block for traffic stats.
+// Real LLM JSON responses — even very large completions — sit well under this,
+// so usage is captured for all realistic traffic; the cap only prevents a
+// single pathological multi-megabyte body (or many concurrent ones) from being
+// buffered whole. Oversized bodies stream through with usage stats skipped.
+const usageSniffMaxBuffer = 4 << 20 // 4 MiB
+
+// writePassthroughSniffingUsage writes a non-streaming upstream response to the
+// client while buffering at most usageSniffMaxBuffer bytes to sniff usage via
+// the supplied parse callback. A body that fits the cap is buffered, parsed, and
+// written back byte-for-byte (headers, including Content-Length, untouched). A
+// body that exceeds the cap is not buffered whole: the bounded prefix is written
+// and the remainder is streamed through with io.Copy, so proxy memory stays
+// bounded at the cost of skipping usage stats for that one oversized response
+// (fail-open). Non-200 responses and read errors fall back to a plain copy.
+func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, sniff func([]byte)) {
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
@@ -267,19 +292,29 @@ func (h *ProxyHandler) writeOpenAIPassthroughObservingUsage(ctx context.Context,
 		return
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// Read one byte past the cap so we can tell a full body from an oversized one.
+	prefix, err := io.ReadAll(io.LimitReader(resp.Body, usageSniffMaxBuffer+1))
+	copyPassthroughHeaders(w.Header(), resp.Header)
 	if err != nil {
-		copyPassthroughHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(body)
+		_, _ = w.Write(prefix)
 		return
 	}
 
-	observeOpenAIUsage(ctx, sniffOpenAIUsage(body))
+	if len(prefix) <= usageSniffMaxBuffer {
+		// Whole body fits: parse usage, then write the same bytes unchanged.
+		sniff(prefix)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(prefix)
+		return
+	}
 
-	copyPassthroughHeaders(w.Header(), resp.Header)
+	// Oversized: skip the usage parse and stream prefix + remainder so memory
+	// stays bounded. Total bytes written equal the full body, so any
+	// Content-Length header copied above remains correct.
 	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(body)
+	_, _ = w.Write(prefix)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 // sniffOpenAIUsage extracts the usage block from a non-streaming OpenAI chat
@@ -296,12 +331,15 @@ func sniffOpenAIUsage(body []byte) *models.OpenAIUsage {
 	return parsed.Usage
 }
 
-func writeDirectAnthropicJSONResponse(w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) error {
+func writeDirectAnthropicJSONResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) error {
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
+	}
+	if resp.StatusCode == http.StatusOK {
+		observeAnthropicUsageBody(ctx, body)
 	}
 	rewritten, changed := rewriteAnthropicResponseModelJSON(body, publicModel, upstreamModel)
 

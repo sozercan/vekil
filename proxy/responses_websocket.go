@@ -586,32 +586,44 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		}
 		message, code := extractResponsesWebSocketError(resp.StatusCode, respBody)
 		s.sendWrappedError(resp.StatusCode, message, code, resp.Header)
+		s.recordTurnStats(h, request.Model, resp.StatusCode, responsesUsage{})
 		return fmt.Errorf("upstream websocket bridge status %d", resp.StatusCode)
 	}
 
 	responseID, outputItems, turnUsage, err := s.streamUpstreamResponse(h, resp.Body, resp.Header)
 	if err != nil {
 		if errors.Is(err, errStreamFailedUpstream) {
+			// The upstream sent response.failed/incomplete; count it as an errored
+			// turn so it shows in the dashboard's error stats and recent log.
+			s.recordTurnStats(h, request.Model, http.StatusBadGateway, responsesUsage{})
 			return nil
 		}
 		s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil)
+		s.recordTurnStats(h, request.Model, http.StatusBadGateway, responsesUsage{})
 		return err
 	}
 
-	// Record this bridge turn into traffic stats. The bridge does not flow
-	// through the HTTP request middleware, so it is recorded directly. Every
+	// Record this successful bridge turn into traffic stats. The bridge does not
+	// flow through the HTTP request middleware, so it is recorded directly. Every
 	// completed turn is counted (with whatever usage it carried, possibly zero),
 	// matching the HTTP path's request accounting.
-	providerID, providerKind := "", ""
-	if provider, _, _ := h.resolveProviderModel(request.Model, providerEndpointResponses); provider != nil {
-		providerID, providerKind = provider.id, string(provider.kind)
-	}
-	h.RecordResponsesTurn(request.Model, providerID, providerKind, classifyAgent(s.userAgent), turnUsage)
+	s.recordTurnStats(h, request.Model, http.StatusOK, turnUsage)
 
 	s.rememberPlannedResponse(plan, responseID, outputItems)
 	metrics = s.maybeAutoCompactHistory(h, request, metrics)
 	s.logRequestMetrics(h, request, responseID, metrics)
 	return nil
+}
+
+// recordTurnStats records one websocket-bridge turn into traffic stats,
+// resolving the provider for attribution. status is the turn outcome (200 for a
+// completed turn, an error status for a failed one).
+func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model string, status int, usage responsesUsage) {
+	providerID, providerKind := "", ""
+	if provider, _, _ := h.resolveProviderModel(model, providerEndpointResponses); provider != nil {
+		providerID, providerKind = provider.id, string(provider.kind)
+	}
+	h.RecordResponsesTurn(model, providerID, providerKind, classifyAgent(s.userAgent), status, usage)
 }
 
 func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) (responsesWebSocketRequestPlan, error) {

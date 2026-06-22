@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -295,6 +296,48 @@ func TestStatsCollectorBreakdowns(t *testing.T) {
 	}
 }
 
+func TestTopBreakdownsPreservesAlternateSortRows(t *testing.T) {
+	// statsBreakdownRows+ heavy hitters by requests, plus one low-request model
+	// that holds all the errors and one that is by far the slowest. The dashboard
+	// re-sorts these rows client-side by errors/latency, so both outliers must
+	// survive truncation even though they rank low by request count.
+	m := make(map[string]*breakdownCounter)
+	for i := 0; i < statsBreakdownRows+5; i++ {
+		m[fmt.Sprintf("busy-%02d", i)] = &breakdownCounter{
+			requests: int64(1000 - i), // all rank above the outliers by requests
+			tokens:   int64(1000 - i),
+		}
+	}
+	// Low request count → ranked well outside the top-N by requests.
+	m["rare-but-broken"] = &breakdownCounter{requests: 1, tokens: 1, errors: 999}
+	m["rare-but-slow"] = &breakdownCounter{requests: 1, tokens: 1, durMs: 9_000_000, durSamples: 1}
+
+	rows := topBreakdowns(m, breakdownKindModel)
+
+	find := func(label string) *statsBreakdown {
+		for i := range rows {
+			if rows[i].Model == label {
+				return &rows[i]
+			}
+		}
+		return nil
+	}
+	if find("rare-but-broken") == nil {
+		t.Fatal("high-error model outside top-by-requests was dropped; client error sort would miss it")
+	}
+	slow := find("rare-but-slow")
+	if slow == nil {
+		t.Fatal("slowest model outside top-by-requests was dropped; client latency sort would miss it")
+	}
+	if slow.AvgMs != 9_000_000 {
+		t.Fatalf("slow model avg ms: got %d want 9000000", slow.AvgMs)
+	}
+	// Default order is still requests-desc (the busiest model leads).
+	if rows[0].Model != "busy-00" {
+		t.Fatalf("default order should be requests-desc, got leader %q", rows[0].Model)
+	}
+}
+
 func TestClassifyAgent(t *testing.T) {
 	tests := []struct {
 		ua   string
@@ -454,10 +497,17 @@ func TestHandleDashboardAsset(t *testing.T) {
 
 func TestTracksRequest(t *testing.T) {
 	h := &ProxyHandler{stats: newStatsCollector()}
-	tracked := []string{"/v1/chat/completions", "/v1/messages", "/v1/responses"}
+	tracked := []string{"/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens", "/v1/responses", "/v1/responses/compact", "/v1/memories/trace_summarize"}
 	for _, p := range tracked {
 		if !h.TracksRequest(http.MethodPost, p) {
 			t.Errorf("expected POST %s to be tracked", p)
+		}
+	}
+	// Gemini generateContent routes are prefix-registered; track them.
+	geminiPrefixes := []string{"/v1beta/models/gemini-2.5-pro:generateContent", "/v1/models/gemini-2.5-pro:streamGenerateContent", "/models/gemini-2.5-pro:generateContent"}
+	for _, p := range geminiPrefixes {
+		if !h.TracksRequest(http.MethodPost, p) {
+			t.Errorf("expected POST %s (gemini) to be tracked", p)
 		}
 	}
 	skipped := []string{"/healthz", "/readyz", "/stats.json", "/dashboard", "/dashboard/uPlot.min.js", "/favicon.ico"}
@@ -466,13 +516,22 @@ func TestTracksRequest(t *testing.T) {
 			t.Errorf("expected %s to be skipped", p)
 		}
 	}
-	// GET /v1/responses is the websocket-bridge upgrade — excluded so it doesn't
-	// pin inflight or poison latency; POST /v1/responses stays tracked.
+	// GET /v1/models (catalog refresh) is not inference traffic — excluded so it
+	// doesn't skew latency/avg-tokens. GET /v1/responses is the websocket-bridge
+	// upgrade — excluded so it doesn't pin inflight or poison latency; POST
+	// /v1/responses stays tracked.
+	if h.TracksRequest(http.MethodGet, "/v1/models") {
+		t.Error("expected GET /v1/models (catalog) to be skipped")
+	}
 	if h.TracksRequest(http.MethodGet, "/v1/responses") {
 		t.Error("expected GET /v1/responses (websocket) to be skipped")
 	}
 	if !h.TracksRequest(http.MethodPost, "/v1/responses") {
 		t.Error("expected POST /v1/responses to be tracked")
+	}
+	// Unmatched/typoed paths (which the mux 404s) must not be folded into stats.
+	if h.TracksRequest(http.MethodPost, "/v1/typo") || h.TracksRequest(http.MethodGet, "/totally/unknown") {
+		t.Error("expected unmatched paths to be skipped")
 	}
 }
 

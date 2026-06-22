@@ -81,6 +81,12 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	if forceStream {
 		streamFlag := true
 		oaiReq.Stream = &streamFlag
+	}
+	if forceStream || stream {
+		// Force-streamed or client-streamed: request a usage chunk so the
+		// request records tokens (the usage callback on the stream branch reads
+		// it). The translated Gemini stream consumes the OpenAI usage chunk, so
+		// it is not forwarded raw to the client.
 		oaiReq.StreamOptions = &models.StreamOptions{IncludeUsage: true}
 	}
 
@@ -122,7 +128,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	}
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			StreamOpenAIToGeminiWithFinalResponse(w, resp.Body, h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope))
+			StreamOpenAIToGeminiWithFinalResponse(w, resp.Body, h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope), openAIChatStreamUsageCallback(r.Context()))
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)

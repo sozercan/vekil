@@ -46,6 +46,8 @@ Near zero-copy passthrough for requests without tools. When tools are present, t
 
 The proxy enforces the selected model's configured endpoint allowlist before forwarding. If a model is `/responses`-only, `POST /v1/chat/completions` fails fast with `400` instead of probing an unsupported upstream route.
 
+For client-requested streams that omit `stream_options`, the proxy asks the upstream for a final usage chunk (`stream_options.include_usage`) so streamed traffic still records token totals in the dashboard. That injected usage-only chunk is consumed internally and **not** forwarded to the client, so the streamed SSE the client sees is unchanged from a standard OpenAI stream (no extra `choices: []` terminal chunk). If the client supplied its own `stream_options`, its choice is preserved untouched.
+
 ## Responses Compatibility Endpoints
 
 Supported OpenAI/Codex-style routes:

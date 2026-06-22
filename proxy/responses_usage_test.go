@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"net/http"
 	"testing"
 )
 
@@ -75,7 +76,7 @@ func TestRecordResponsesTurn(t *testing.T) {
 	u.InputTokensDetails.CachedTokens = 20
 	u.OutputTokensDetails.ReasoningTokens = 10
 
-	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", u)
+	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 200, u)
 
 	snap := c.snapshot()
 	if snap.Totals.Requests != 1 {
@@ -102,12 +103,37 @@ func TestRecordResponsesTurn(t *testing.T) {
 	}
 	// A zero-usage turn is still counted as a request (matching the HTTP path),
 	// just with zero tokens.
-	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", responsesUsage{})
+	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 200, responsesUsage{})
 	after := c.snapshot()
 	if after.Totals.Requests != 2 {
 		t.Fatalf("zero-usage turn should still be counted: got %d requests want 2", after.Totals.Requests)
 	}
 	if after.Totals.TotalTokens != 150 {
 		t.Fatalf("zero-usage turn should add no tokens: got %d want 150", after.Totals.TotalTokens)
+	}
+}
+
+// TestRecordResponsesTurnCountsFailures covers that a websocket-bridge turn that
+// failed before producing usage (e.g. upstream response.failed → 502) is still
+// recorded, and lands in the error counts so the dashboard reflects it.
+func TestRecordResponsesTurnCountsFailures(t *testing.T) {
+	c := newStatsCollector()
+	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", http.StatusBadGateway, responsesUsage{})
+
+	snap := c.snapshot()
+	if snap.Totals.Requests != 1 {
+		t.Fatalf("failed turn should be counted as a request: got %d want 1", snap.Totals.Requests)
+	}
+	if snap.Totals.Errors != 1 {
+		t.Fatalf("failed turn should be counted as an error: got %d want 1", snap.Totals.Errors)
+	}
+	if snap.Status["5xx"] != 1 {
+		t.Fatalf("failed turn should land in 5xx status class: got %+v", snap.Status)
+	}
+	// Default status 0 is treated as a successful (200) turn, not an error.
+	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 0, responsesUsage{})
+	snap2 := c.snapshot()
+	if snap2.Totals.Errors != 1 {
+		t.Fatalf("status 0 should default to success, errors stayed: got %d want 1", snap2.Totals.Errors)
 	}
 }

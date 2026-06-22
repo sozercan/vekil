@@ -87,6 +87,40 @@ func StreamOpenAIPassthroughWithFinalResponse(
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
+	streamOpenAIPassthrough(w, body, false, onFinalResponse, onUsageCallbacks...)
+}
+
+// StreamOpenAIPassthroughDroppingInjectedUsage behaves like
+// StreamOpenAIPassthroughWithFinalResponse but omits the upstream's final
+// usage-only chunk (empty choices + non-nil usage) from the client stream while
+// still feeding that usage to the callbacks. It is used when the proxy injected
+// stream_options.include_usage on a client stream that did not opt in, so token
+// stats are captured without forwarding a terminal chunk the client never
+// requested (clients indexing choices[0] on every chunk would otherwise break).
+func StreamOpenAIPassthroughDroppingInjectedUsage(
+	w http.ResponseWriter,
+	body io.ReadCloser,
+	onFinalResponse func(*models.OpenAIResponse),
+	onUsageCallbacks ...func(*models.OpenAIUsage),
+) {
+	streamOpenAIPassthrough(w, body, true, onFinalResponse, onUsageCallbacks...)
+}
+
+// streamOpenAIPassthrough forwards an upstream OpenAI SSE stream to the client.
+// It buffers each SSE event (its raw lines up to and including the terminating
+// blank line) and flushes the event as a unit once complete; SSE clients do not
+// dispatch an event before its blank-line terminator, so this is byte-identical
+// to a line-immediate copy for the client. Buffering by event is what lets the
+// dropInjectedUsage path decide whether to emit an event after parsing it: when
+// set, a usage-only chunk (empty choices + usage) is fed to the usage/final
+// callbacks but not written to the client.
+func streamOpenAIPassthrough(
+	w http.ResponseWriter,
+	body io.ReadCloser,
+	dropInjectedUsage bool,
+	onFinalResponse func(*models.OpenAIResponse),
+	onUsageCallbacks ...func(*models.OpenAIUsage),
+) {
 	defer func() { _ = body.Close() }()
 	setSSEHeaders(w)
 
@@ -108,7 +142,9 @@ func StreamOpenAIPassthroughWithFinalResponse(
 	reader := bufio.NewReaderSize(body, openAIStreamScannerInitialBuffer)
 
 	sawDone := false
+	dropCurrent := false
 	var accumulator sseDataAccumulator
+	pending := make([]string, 0, 4)
 	processData := func(_ string, data string) bool {
 		if data == "[DONE]" {
 			sawDone = true
@@ -119,8 +155,13 @@ func StreamOpenAIPassthroughWithFinalResponse(
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			return true
 		}
-		if onUsage != nil && chunk.Usage != nil {
-			onUsage(chunk.Usage)
+		if chunk.Usage != nil {
+			if onUsage != nil {
+				onUsage(chunk.Usage)
+			}
+			if dropInjectedUsage && len(chunk.Choices) == 0 {
+				dropCurrent = true
+			}
 		}
 		if aggregator != nil {
 			aggregator.addChunk(chunk)
@@ -128,16 +169,34 @@ func StreamOpenAIPassthroughWithFinalResponse(
 		return true
 	}
 
+	flushEvent := func() bool {
+		defer func() {
+			pending = pending[:0]
+			dropCurrent = false
+		}()
+		if dropCurrent {
+			return true
+		}
+		for _, l := range pending {
+			if _, err := io.WriteString(w, l); err != nil {
+				return false
+			}
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return true
+	}
+
 	for {
 		line, err := readOpenAISSELine(reader)
 		if len(line) > 0 {
-			if _, writeErr := io.WriteString(w, line); writeErr != nil {
+			pending = append(pending, line)
+			isBoundary := strings.TrimRight(line, "\r\n") == ""
+			accumulator.consumeLine(line, processData)
+			if isBoundary && !flushEvent() {
 				return
 			}
-			if flusher != nil {
-				flusher.Flush()
-			}
-			accumulator.consumeLine(line, processData)
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -148,6 +207,9 @@ func StreamOpenAIPassthroughWithFinalResponse(
 	}
 
 	accumulator.dispatch(processData)
+	if !flushEvent() {
+		return
+	}
 	if !sawDone || onFinalResponse == nil || aggregator == nil {
 		return
 	}

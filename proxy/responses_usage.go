@@ -73,3 +73,31 @@ func observeResponsesUsage(ctx context.Context, usage responsesUsage) {
 	}
 	observeOpenAIUsage(ctx, usage.toOpenAIUsage())
 }
+
+// observeAnthropicUsageBody parses the usage block from a non-streaming
+// Anthropic Messages response body and records it onto the per-request
+// RequestSummary. Used by the direct anthropic-compatible passthrough, which
+// otherwise never converts Anthropic's input_tokens/output_tokens into the
+// chat-shaped token fields the dashboard reads. Cache-read tokens map to the
+// cached-prompt detail; Anthropic does not report a separate reasoning count.
+func observeAnthropicUsageBody(ctx context.Context, body []byte) {
+	var parsed struct {
+		Usage models.AnthropicUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return
+	}
+	u := parsed.Usage
+	if u.InputTokens == 0 && u.OutputTokens == 0 {
+		return
+	}
+	usage := &models.OpenAIUsage{
+		PromptTokens:     u.InputTokens,
+		CompletionTokens: u.OutputTokens,
+		TotalTokens:      u.InputTokens + u.OutputTokens,
+	}
+	if u.CacheReadInputTokens > 0 {
+		usage.PromptTokensDetails = &models.OpenAIPromptTokensDetails{CachedTokens: u.CacheReadInputTokens}
+	}
+	observeOpenAIUsage(ctx, usage)
+}

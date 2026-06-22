@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,23 @@ import (
 
 	"github.com/sozercan/vekil/models"
 )
+
+// insightRequestContextKey marks the in-process /dashboard/insight chat call so
+// its retries are not counted in traffic stats (the insight path is documented
+// as self-excluded from the dashboard's own metrics).
+type insightRequestContextKey struct{}
+
+func markInsightRequest(ctx context.Context) context.Context {
+	return context.WithValue(ctx, insightRequestContextKey{}, true)
+}
+
+func isInsightRequest(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(insightRequestContextKey{}).(bool)
+	return v
+}
 
 const (
 	// insightUpstreamTimeout bounds the on-demand insight generation call.
@@ -114,6 +132,19 @@ func (h *ProxyHandler) HandleDashboardInsight(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// CSRF guard: this endpoint spends tokens, so reject cross-site browser
+	// requests. Browsers send Sec-Fetch-Site on every fetch and it cannot be
+	// forged by page script; we allow same-origin/same-site (the dashboard) and
+	// "none" (address-bar / non-fetch), and allow an absent header (non-browser
+	// tools like curl). A cross-site or cross-origin page is rejected.
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "same-origin", "same-site", "none":
+		// allowed
+	default:
+		writeInsightError(w, "cross-site insight requests are not allowed")
+		return
+	}
+
 	// Rate-limit: at most one generation in progress, and a cooldown between
 	// completed generations. This bounds token spend even against direct or
 	// scripted POSTs, independent of the front-end's button-disable. The gate is
@@ -159,6 +190,7 @@ func (h *ProxyHandler) HandleDashboardInsight(w http.ResponseWriter, r *http.Req
 		writeInsightError(w, "failed to build insight request")
 		return
 	}
+	innerReq = innerReq.WithContext(markInsightRequest(innerReq.Context()))
 	innerReq.Header.Set("Content-Type", "application/json")
 	innerReq.Header.Set("User-Agent", "vekil-dashboard-insight")
 

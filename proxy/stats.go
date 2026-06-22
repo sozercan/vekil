@@ -224,20 +224,20 @@ func (c *statsCollector) record(summary *RequestSummary, status int, userAgent s
 	c.recordLocked(d, agent, status, durMs)
 }
 
-// recordResponsesTurn folds one completed /v1/responses websocket-bridge turn
-// into the aggregates. The bridge does not flow through the HTTP request
-// middleware (one upgrade serves many turns), so usage is recorded here
-// directly. A turn is always a successful streamed exchange (failures are sent
-// to the client and not recorded here), so it carries no latency sample. Every
-// completed turn is counted as a request even if its usage is zero/absent, so
-// the request count matches the HTTP path (which never gates on token totals).
-func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, usage responsesUsage) {
+// recordResponsesTurn folds one /v1/responses websocket-bridge turn into the
+// aggregates. The bridge does not flow through the HTTP request middleware (one
+// upgrade serves many turns), so turns are recorded here directly. status is the
+// turn outcome (200 for a completed turn, or an upstream error status for a
+// failed/non-200 turn) so failures show up in error counts and the recent log.
+// Streamed turns carry no latency sample. Every turn is counted as a request
+// even with zero/absent usage, matching the HTTP path.
+func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage) {
 	total := usage.TotalTokens
 	if total == 0 {
 		total = usage.InputTokens + usage.OutputTokens
 	}
 	d := summaryStats{
-		model:      model,
+		model:      boundStatLabel(model),
 		provider:   provider,
 		kind:       kind,
 		endpoint:   "responses_ws",
@@ -252,10 +252,13 @@ func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel s
 	if agent == "" {
 		agent = "unknown"
 	}
+	if status == 0 {
+		status = http.StatusOK
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.recordLocked(d, agent, http.StatusOK, 0)
+	c.recordLocked(d, agent, status, 0)
 }
 
 // recordLocked folds one already-resolved request/turn into the aggregates.
@@ -574,6 +577,22 @@ func topBreakdowns(m map[string]*breakdownCounter, kind string) []statsBreakdown
 		}
 		out = append(out, b)
 	}
+	sortBreakdownsByRequests(out)
+	if len(out) <= statsBreakdownRows {
+		return out
+	}
+	// The dashboard re-sorts and filters these rows client-side by errors,
+	// latency, and tokens — not just requests. Truncating to the top-N by
+	// requests alone would drop a low-volume model that holds all the errors, or
+	// the slowest model, from those alternate views. Keep the union of the top-N
+	// by each sort dimension the client offers so every client-side sort sees its
+	// rows, while still bounding the response size.
+	return unionTopBreakdowns(out, statsBreakdownRows)
+}
+
+// sortBreakdownsByRequests orders rows by requests desc, then tokens desc, then
+// label asc, the default order the dashboard shows and a stable tiebreak.
+func sortBreakdownsByRequests(out []statsBreakdown) {
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Requests != out[j].Requests {
 			return out[i].Requests > out[j].Requests
@@ -583,10 +602,49 @@ func topBreakdowns(m map[string]*breakdownCounter, kind string) []statsBreakdown
 		}
 		return breakdownLabel(out[i]) < breakdownLabel(out[j])
 	})
-	if len(out) > statsBreakdownRows {
-		out = out[:statsBreakdownRows]
+}
+
+// unionTopBreakdowns returns the union of the top-n rows by each metric the
+// dashboard can sort by (requests, tokens, errors, latency). The result is
+// deduplicated by label and ordered by the default requests-desc sort, so it is
+// at most 4*n rows but usually far fewer (the same heavy hitters top multiple
+// metrics). Rows with a zero value for a metric never enter that metric's top
+// set, so error/latency dimensions only contribute rows that actually have
+// errors/latency.
+func unionTopBreakdowns(rows []statsBreakdown, n int) []statsBreakdown {
+	if n <= 0 || len(rows) == 0 {
+		return nil
 	}
-	return out
+	metrics := []func(statsBreakdown) int64{
+		func(b statsBreakdown) int64 { return b.Requests },
+		func(b statsBreakdown) int64 { return b.Tokens },
+		func(b statsBreakdown) int64 { return b.Errors },
+		func(b statsBreakdown) int64 { return b.AvgMs },
+	}
+	keep := make(map[string]struct{}, n)
+	ordered := make([]statsBreakdown, len(rows))
+	copy(ordered, rows)
+	for _, metric := range metrics {
+		sort.SliceStable(ordered, func(i, j int) bool { return metric(ordered[i]) > metric(ordered[j]) })
+		added := 0
+		for _, r := range ordered {
+			if added >= n {
+				break
+			}
+			if metric(r) == 0 {
+				break // sorted desc: no further nonzero rows for this metric
+			}
+			keep[breakdownLabel(r)] = struct{}{}
+			added++
+		}
+	}
+	result := make([]statsBreakdown, 0, len(keep))
+	for _, r := range rows { // rows is already in requests-desc order
+		if _, ok := keep[breakdownLabel(r)]; ok {
+			result = append(result, r)
+		}
+	}
+	return result
 }
 
 func breakdownLabel(b statsBreakdown) string {
@@ -623,7 +681,11 @@ func readSummaryForStats(summary *RequestSummary) summaryStats {
 	}
 	summary.mu.Lock()
 	defer summary.mu.Unlock()
-	d.model = summary.model
+	// model comes from the client request body; bound its length so a client
+	// sending huge distinct model strings cannot bloat the breakdown/recent
+	// stats (the cardinality cap limits count, not size). provider/kind are
+	// configured server-side, so they are trusted.
+	d.model = boundStatLabel(summary.model)
 	d.provider = summary.provider
 	d.kind = summary.providerKind
 	d.endpoint = summary.endpoint
@@ -681,34 +743,70 @@ func classifyAgent(userAgent string) string {
 	if token == "" {
 		return "unknown"
 	}
-	return token
+	return boundStatLabel(token)
 }
 
-// isObservabilityPath reports whether a request path is proxy infrastructure
-// (the dashboard, its assets, the stats feed, and health probes) that must be
-// excluded from traffic stats so the dashboard does not measure itself.
-func isObservabilityPath(path string) bool {
-	switch path {
-	case "/healthz", "/readyz", "/stats.json", "/dashboard", "/favicon.ico":
-		return true
+// statLabelMaxLen bounds the length of a client-controlled stats label (model
+// name, agent token) so a client cannot retain very large strings in the
+// breakdown/recent stats and have them served back via /stats.json.
+const statLabelMaxLen = 64
+
+// boundStatLabel truncates an over-long label to statLabelMaxLen runes.
+func boundStatLabel(s string) string {
+	if len(s) <= statLabelMaxLen {
+		return s
 	}
-	return strings.HasPrefix(path, "/dashboard/")
+	r := []rune(s)
+	if len(r) <= statLabelMaxLen {
+		return s
+	}
+	return string(r[:statLabelMaxLen]) + "…"
+}
+
+// isInferenceRoute reports whether method+path is one of the inference /
+// compatibility endpoints whose traffic belongs in the dashboard's LLM-usage
+// metrics. It is an allowlist matched against the server's registered routes, so
+// non-inference requests — GET /v1/models catalog refreshes, the GET
+// /v1/responses websocket upgrade, health/observability probes, and unmatched
+// (404) paths — are excluded by construction rather than by enumerating things
+// to skip. The websocket bridge records each turn directly via
+// RecordResponsesTurn instead of through the middleware. Keep this in sync with
+// the inference routes registered in server/server.go.
+func isInferenceRoute(method, path string) bool {
+	switch method {
+	case http.MethodPost:
+		switch path {
+		case "/v1/messages",
+			"/v1/messages/count_tokens",
+			"/v1/chat/completions",
+			"/v1/responses",
+			"/v1/responses/compact",
+			"/v1/memories/trace_summarize":
+			return true
+		}
+		// Gemini generateContent routes are registered as path prefixes
+		// (the model id and :generateContent verb follow).
+		return strings.HasPrefix(path, "/v1beta/models/") ||
+			strings.HasPrefix(path, "/v1/models/") ||
+			strings.HasPrefix(path, "/models/")
+	default:
+		return false
+	}
 }
 
 // TracksRequest reports whether requests for the given method+path should be
 // recorded in traffic stats. The server middleware uses this to gate inflight +
-// record. GET /v1/responses (the proxy-owned websocket bridge upgrade) is
-// excluded: it is one long-lived connection serving many turns, so recording it
-// as a single request would pin the in-flight gauge and feed a minutes-long
-// latency sample. The bridge records each turn's usage directly instead.
+// record. Only inference/compatibility endpoints are tracked (see
+// isInferenceRoute): non-inference traffic such as GET /v1/models, the GET
+// /v1/responses websocket upgrade (one long-lived connection serving many turns,
+// recorded per-turn elsewhere), observability probes, and unmatched 404 paths
+// are excluded so they do not skew request rate, latency percentiles, or average
+// tokens/request.
 func (h *ProxyHandler) TracksRequest(method, path string) bool {
 	if h == nil || h.stats == nil {
 		return false
 	}
-	if method == http.MethodGet && path == "/v1/responses" {
-		return false
-	}
-	return !isObservabilityPath(path)
+	return isInferenceRoute(method, path)
 }
 
 // IncInflight increments the live in-flight request gauge.
@@ -733,14 +831,15 @@ func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAg
 	h.stats.record(summary, status, userAgent, dur)
 }
 
-// RecordResponsesTurn folds one completed /v1/responses websocket-bridge turn
-// into the traffic stats. The bridge does not flow through the HTTP request
-// middleware, so its token usage is recorded directly here.
-func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel string, usage responsesUsage) {
+// RecordResponsesTurn folds one /v1/responses websocket-bridge turn into the
+// traffic stats. The bridge does not flow through the HTTP request middleware,
+// so turns are recorded directly here. status is the turn outcome so failed
+// turns appear in error counts.
+func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage) {
 	if h == nil || h.stats == nil {
 		return
 	}
-	h.stats.recordResponsesTurn(model, provider, kind, agentLabel, usage)
+	h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage)
 }
 
 // HandleStatsJSON handles GET /stats.json with the current traffic snapshot.
@@ -763,8 +862,8 @@ func (h *ProxyHandler) HandleDashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleFavicon answers GET /favicon.ico with 204 No Content so a browser
-// opening the dashboard does not generate a 404 (it is also excluded from
-// traffic stats via isObservabilityPath).
+// opening the dashboard does not generate a 404 (GET /favicon.ico is not an
+// inference route, so it is also excluded from traffic stats).
 func (h *ProxyHandler) HandleFavicon(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.WriteHeader(http.StatusNoContent)

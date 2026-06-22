@@ -90,6 +90,73 @@ func TestStreamOpenAIPassthrough_PreservesOversizedSSELine(t *testing.T) {
 	}
 }
 
+func TestStreamOpenAIPassthroughDroppingInjectedUsage(t *testing.T) {
+	content := models.OpenAIStreamChunk{
+		ID:      "chatcmpl-drop",
+		Object:  "chat.completion.chunk",
+		Model:   "gpt-4o",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{Content: json.RawMessage(`"hi"`)}}},
+	}
+	usageOnly := models.OpenAIStreamChunk{
+		ID:     "chatcmpl-drop",
+		Object: "chat.completion.chunk",
+		Model:  "gpt-4o",
+		Usage:  &models.OpenAIUsage{PromptTokens: 7, CompletionTokens: 3, TotalTokens: 10},
+	}
+	body := buildSSEStream(mustMarshal(t, content), mustMarshal(t, usageOnly), "[DONE]")
+
+	w := httptest.NewRecorder()
+	var captured *models.OpenAIUsage
+	StreamOpenAIPassthroughDroppingInjectedUsage(w, body, nil, func(u *models.OpenAIUsage) {
+		captured = u
+	})
+
+	out := w.Body.String()
+	// Content chunk and [DONE] are still forwarded verbatim.
+	if !strings.Contains(out, `"content":"hi"`) {
+		t.Fatalf("content chunk missing from output:\n%s", out)
+	}
+	if !strings.Contains(out, "data: [DONE]") {
+		t.Fatalf("[DONE] missing from output:\n%s", out)
+	}
+	// The injected usage-only chunk must NOT reach the client.
+	if strings.Contains(out, `"total_tokens":10`) || strings.Contains(out, `"usage"`) {
+		t.Fatalf("usage-only chunk leaked to client:\n%s", out)
+	}
+	// But usage must still be captured for stats.
+	if captured == nil || captured.TotalTokens != 10 {
+		t.Fatalf("usage callback = %#v, want total tokens 10", captured)
+	}
+}
+
+func TestStreamOpenAIPassthroughDroppingInjectedUsage_KeepsUsageWithChoices(t *testing.T) {
+	// A chunk that carries usage AND choices is a normal content chunk (some
+	// upstreams attach usage to the final content delta); it must be forwarded,
+	// only the empty-choices usage-only chunk is dropped.
+	withChoices := models.OpenAIStreamChunk{
+		ID:      "chatcmpl-keep",
+		Object:  "chat.completion.chunk",
+		Model:   "gpt-4o",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{Content: json.RawMessage(`"done"`)}}},
+		Usage:   &models.OpenAIUsage{PromptTokens: 5, CompletionTokens: 2, TotalTokens: 7},
+	}
+	body := buildSSEStream(mustMarshal(t, withChoices), "[DONE]")
+
+	w := httptest.NewRecorder()
+	var captured *models.OpenAIUsage
+	StreamOpenAIPassthroughDroppingInjectedUsage(w, body, nil, func(u *models.OpenAIUsage) {
+		captured = u
+	})
+
+	out := w.Body.String()
+	if !strings.Contains(out, `"content":"done"`) || !strings.Contains(out, `"total_tokens":7`) {
+		t.Fatalf("content+usage chunk should be forwarded verbatim:\n%s", out)
+	}
+	if captured == nil || captured.TotalTokens != 7 {
+		t.Fatalf("usage callback = %#v, want total tokens 7", captured)
+	}
+}
+
 func TestStreamOpenAIPassthroughWithFinalResponse_PreservesOversizedSSELine(t *testing.T) {
 	input := "data: " + oversizedSSEPayload() + "\n\ndata: [DONE]\n\n"
 	body := io.NopCloser(strings.NewReader(input))

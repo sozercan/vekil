@@ -138,7 +138,7 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 			}
 			if attempt < maxRetries-1 {
 				delay := backoff(retryDelay, attempt)
-				h.logRetryAttempt(attempt, 0, "", delay, err)
+				h.logRetryAttempt(req.Context(), attempt, 0, "", delay, err)
 				if ctxErr := sleepWithContext(req.Context(), delay); ctxErr != nil {
 					return nil, ctxErr
 				}
@@ -165,7 +165,7 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 			if ra, ok := parseRetryAfter(retryAfterHeader); ok && ra > delay {
 				delay = ra
 			}
-			h.logRetryAttempt(attempt, resp.StatusCode, retryAfterHeader, delay, nil)
+			h.logRetryAttempt(req.Context(), attempt, resp.StatusCode, retryAfterHeader, delay, nil)
 			if ctxErr := sleepWithContext(req.Context(), delay); ctxErr != nil {
 				return nil, ctxErr
 			}
@@ -176,8 +176,10 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 	return nil, lastErr
 }
 
-func (h *ProxyHandler) logRetryAttempt(attempt int, status int, retryAfter string, delay time.Duration, err error) {
-	if h != nil && h.stats != nil {
+func (h *ProxyHandler) logRetryAttempt(ctx context.Context, attempt int, status int, retryAfter string, delay time.Duration, err error) {
+	// Skip retry accounting for the in-process insight call, which is
+	// self-excluded from traffic stats.
+	if h != nil && h.stats != nil && !isInsightRequest(ctx) {
 		h.stats.incRetry(status)
 	}
 	if h == nil || h.log == nil {
