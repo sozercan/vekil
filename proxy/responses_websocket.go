@@ -598,15 +598,15 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return err
 	}
 
-	// Record this bridge turn's token usage into traffic stats. The bridge does
-	// not flow through the HTTP request middleware, so it is recorded directly.
-	if !turnUsage.isZero() {
-		providerID, providerKind := "", ""
-		if provider, _, _ := h.resolveProviderModel(request.Model, providerEndpointResponses); provider != nil {
-			providerID, providerKind = provider.id, string(provider.kind)
-		}
-		h.RecordResponsesTurn(request.Model, providerID, providerKind, classifyAgent(s.userAgent), turnUsage)
+	// Record this bridge turn into traffic stats. The bridge does not flow
+	// through the HTTP request middleware, so it is recorded directly. Every
+	// completed turn is counted (with whatever usage it carried, possibly zero),
+	// matching the HTTP path's request accounting.
+	providerID, providerKind := "", ""
+	if provider, _, _ := h.resolveProviderModel(request.Model, providerEndpointResponses); provider != nil {
+		providerID, providerKind = provider.id, string(provider.kind)
 	}
+	h.RecordResponsesTurn(request.Model, providerID, providerKind, classifyAgent(s.userAgent), turnUsage)
 
 	s.rememberPlannedResponse(plan, responseID, outputItems)
 	metrics = s.maybeAutoCompactHistory(h, request, metrics)

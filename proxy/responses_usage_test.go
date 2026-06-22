@@ -100,9 +100,14 @@ func TestRecordResponsesTurn(t *testing.T) {
 	if len(snap.ByProvider) != 1 || snap.ByProvider[0].Provider != "codex" {
 		t.Fatalf("by_provider: %+v", snap.ByProvider)
 	}
-	// A zero-usage turn records nothing.
+	// A zero-usage turn is still counted as a request (matching the HTTP path),
+	// just with zero tokens.
 	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", responsesUsage{})
-	if c.snapshot().Totals.Requests != 1 {
-		t.Fatalf("zero-usage turn should not be recorded")
+	after := c.snapshot()
+	if after.Totals.Requests != 2 {
+		t.Fatalf("zero-usage turn should still be counted: got %d requests want 2", after.Totals.Requests)
+	}
+	if after.Totals.TotalTokens != 150 {
+		t.Fatalf("zero-usage turn should add no tokens: got %d want 150", after.Totals.TotalTokens)
 	}
 }

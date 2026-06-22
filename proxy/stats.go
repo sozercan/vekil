@@ -228,11 +228,10 @@ func (c *statsCollector) record(summary *RequestSummary, status int, userAgent s
 // into the aggregates. The bridge does not flow through the HTTP request
 // middleware (one upgrade serves many turns), so usage is recorded here
 // directly. A turn is always a successful streamed exchange (failures are sent
-// to the client and not recorded here), so it carries no latency sample.
+// to the client and not recorded here), so it carries no latency sample. Every
+// completed turn is counted as a request even if its usage is zero/absent, so
+// the request count matches the HTTP path (which never gates on token totals).
 func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, usage responsesUsage) {
-	if usage.isZero() {
-		return
-	}
 	total := usage.TotalTokens
 	if total == 0 {
 		total = usage.InputTokens + usage.OutputTokens
