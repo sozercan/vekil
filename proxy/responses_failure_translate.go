@@ -462,6 +462,17 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 	return "", ""
 }
 
+// isClientWriteError reports whether an io.Copy error originated from writing to
+// the client (the flushWriter destination) rather than from reading the upstream
+// source. A client-side write error (the client disconnected) is not an upstream
+// failure and must not be recorded as one.
+func isClientWriteError(fw *flushWriter, err error) bool {
+	if fw == nil || err == nil {
+		return false
+	}
+	return fw.writeErr != nil
+}
+
 func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header, store *ToolExecutionContextStore, scope string) {
 	if closer, ok := r.(io.Closer); ok {
 		defer func() { _ = closer.Close() }()
@@ -476,10 +487,14 @@ func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w h
 	if _, err := io.Copy(fw, io.TeeReader(r, tap)); err != nil {
 		// The HTTP 200 was already committed, so the client receives a truncated
 		// stream when the upstream SSE connection resets or the pipe closes with
-		// an error before a response.failed/incomplete event. Record an out-of-band
-		// failure status so the dashboard does not count the broken stream as a
-		// success (the tap's maybeLog handles the explicit-failure-event case).
-		observeResponseFailureStatus(ctx, http.StatusBadGateway)
+		// an error before a response.failed/incomplete event. Only record an
+		// upstream failure for an actual upstream/transport error — a client
+		// disconnect or cancellation (ctx cancelled, or a write error forwarding
+		// to a gone client) is not an upstream failure and must not pollute the
+		// dashboard error rate.
+		if ctx.Err() == nil && !isClientWriteError(fw, err) {
+			observeResponseFailureStatus(ctx, http.StatusBadGateway)
+		}
 		if h != nil && h.log != nil {
 			h.log.Debug("responses stream copy failed after commit", logger.Err(err))
 		}

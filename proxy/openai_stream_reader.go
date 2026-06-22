@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -59,13 +60,24 @@ func parseSSEEventLine(line string) (string, bool) {
 	return strings.TrimSpace(eventType), true
 }
 
+// errOpenAISSELineTooLong is returned by readOpenAISSELine when a single SSE
+// line exceeds openAIStreamScannerMaxBuffer. The accumulated bytes read so far
+// are returned alongside the error so a forwarding caller can write them to the
+// client and fall back to raw passthrough of the remainder (the bytes are valid,
+// just too large to buffer for parsing) rather than treating it as a failure.
+var errOpenAISSELineTooLong = errors.New("SSE line exceeds maximum buffer")
+
 func readOpenAISSELine(reader *bufio.Reader) (string, error) {
 	var line strings.Builder
 	for {
 		fragment, err := reader.ReadSlice('\n')
 		if len(fragment) > 0 {
 			if line.Len()+len(fragment) > openAIStreamScannerMaxBuffer {
-				return "", fmt.Errorf("SSE line exceeds %d bytes", openAIStreamScannerMaxBuffer)
+				// Return what we have so the caller can still forward it; the rest of
+				// this line remains in the reader and is drained by the caller's raw
+				// fallback copy.
+				line.Write(fragment)
+				return line.String(), errOpenAISSELineTooLong
 			}
 			line.Write(fragment)
 		}

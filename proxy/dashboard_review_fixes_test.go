@@ -703,3 +703,97 @@ func TestTranslatedStreamsFireOnErrorForUpstreamError(t *testing.T) {
 		}
 	})
 }
+
+// errAfterReader yields data once, then a non-EOF error (simulating an upstream
+// connection reset mid-stream).
+type errAfterReader struct {
+	data []byte
+	done bool
+}
+
+func (e *errAfterReader) Read(p []byte) (int, error) {
+	if !e.done {
+		e.done = true
+		return copy(p, e.data), nil
+	}
+	return 0, io.ErrUnexpectedEOF
+}
+
+func (e *errAfterReader) Close() error { return nil }
+
+// TestStreamOpenAIChatPassthroughMarksTransportError covers round-8 [0]: an
+// upstream read error (connection reset) after the 200 was committed fires
+// onError so the chat request is recorded as a failure, not a 2xx success.
+func TestStreamOpenAIChatPassthroughMarksTransportError(t *testing.T) {
+	body := &errAfterReader{data: []byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")}
+	w := httptest.NewRecorder()
+	errored := false
+	StreamOpenAIChatPassthrough(w, body, false, func() { errored = true }, nil, func(*models.OpenAIUsage) {})
+	if !errored {
+		t.Fatal("expected onError to fire on a mid-stream transport error")
+	}
+}
+
+// TestStreamOpenAIChatPassthroughMarksPrematureEnd covers round-8 [0]: a stream
+// that ends (EOF) without a [DONE] sentinel fires onError.
+func TestStreamOpenAIChatPassthroughMarksPrematureEnd(t *testing.T) {
+	body := io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")) // no [DONE]
+	w := httptest.NewRecorder()
+	errored := false
+	StreamOpenAIChatPassthrough(w, body, false, func() { errored = true }, nil, func(*models.OpenAIUsage) {})
+	if !errored {
+		t.Fatal("expected onError to fire when the stream ends before [DONE]")
+	}
+}
+
+// TestStreamOpenAIChatPassthroughFailsOpenOnOversizedLine covers round-8 [1]: a
+// valid SSE line larger than the parse buffer must still be forwarded to the
+// client (fall back to raw copy) and must NOT be treated as a failure.
+func TestStreamOpenAIChatPassthroughFailsOpenOnOversizedLine(t *testing.T) {
+	huge := strings.Repeat("x", openAIStreamScannerMaxBuffer+4096)
+	// A normal chunk, then an oversized line, then [DONE].
+	stream := "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n" +
+		"data: " + huge + "\n\n" +
+		"data: [DONE]\n\n"
+	body := io.NopCloser(strings.NewReader(stream))
+	w := httptest.NewRecorder()
+	errored := false
+	StreamOpenAIChatPassthrough(w, body, false, func() { errored = true }, nil, func(*models.OpenAIUsage) {})
+
+	if errored {
+		t.Fatal("oversized line is not a failure; onError must not fire")
+	}
+	out := w.Body.String()
+	if !strings.Contains(out, huge) {
+		t.Fatal("oversized line must still be forwarded to the client (fail-open raw copy)")
+	}
+	if !strings.Contains(out, "data: [DONE]") {
+		t.Fatal("remainder after the oversized line must still be forwarded")
+	}
+}
+
+// TestStreamResponsesPipeIgnoresClientWriteError covers round-8 [2]: a client
+// disconnect (write error to the gone client) after the 200 commit must NOT be
+// recorded as a 502 upstream failure.
+func TestStreamResponsesPipeIgnoresClientWriteError(t *testing.T) {
+	ctx, summary := WithRequestSummary(context.Background())
+	// Upstream sends data fine; the client writer fails (disconnected).
+	r := io.NopCloser(strings.NewReader("event: response.created\ndata: {\"type\":\"response.created\"}\n\n"))
+	w := &failingResponseWriter{header: http.Header{}}
+
+	streamResponsesPipeWithFailureLog(ctx, &ProxyHandler{log: logger.New(logger.LevelError)}, w, r, nil, nil, "")
+
+	if summary.FailureStatus() != 0 {
+		t.Fatalf("client write error must not be recorded as an upstream failure, got status %d", summary.FailureStatus())
+	}
+}
+
+// failingResponseWriter is an http.ResponseWriter whose Write always fails,
+// simulating a disconnected client.
+type failingResponseWriter struct {
+	header http.Header
+}
+
+func (f *failingResponseWriter) Header() http.Header       { return f.header }
+func (f *failingResponseWriter) WriteHeader(int)           {}
+func (f *failingResponseWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }

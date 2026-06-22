@@ -62,13 +62,21 @@ func setSSEHeaders(w http.ResponseWriter) {
 
 // flushWriter wraps an http.ResponseWriter and flushes after every Write.
 type flushWriter struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
+	w        http.ResponseWriter
+	flusher  http.Flusher
+	writeErr error
 }
 
 func (fw *flushWriter) Write(p []byte) (int, error) {
 	n, err := fw.w.Write(p)
-	if err == nil && fw.flusher != nil {
+	if err != nil {
+		// Record that the failure came from writing to the client (e.g. the client
+		// disconnected) so callers can distinguish a client-side error from an
+		// upstream/source read error on an io.Copy.
+		fw.writeErr = err
+		return n, err
+	}
+	if fw.flusher != nil {
 		fw.flusher.Flush()
 	}
 	return n, err
@@ -225,6 +233,26 @@ func streamOpenAIPassthrough(
 
 	for {
 		line, err := readOpenAISSELine(reader)
+		if errors.Is(err, errOpenAISSELineTooLong) {
+			// A single SSE line exceeded the parse buffer (e.g. a very large
+			// tool-call argument). The returned bytes are valid but the line is
+			// truncated for parsing, so flush everything buffered for this event
+			// plus the partial line, then fall back to a raw copy of the remainder.
+			// This keeps the client stream intact; it is not a failure.
+			for _, l := range pending {
+				if _, werr := io.WriteString(w, l); werr != nil {
+					return
+				}
+			}
+			if _, werr := io.WriteString(w, line); werr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			_, _ = io.Copy(&flushWriter{w: w, flusher: flusher}, reader)
+			return
+		}
 		if len(line) > 0 {
 			pending = append(pending, line)
 			isBoundary := strings.TrimRight(line, "\r\n") == ""
@@ -234,10 +262,15 @@ func streamOpenAIPassthrough(
 			}
 		}
 		if err != nil {
-			if err != io.EOF {
-				return
+			if err == io.EOF {
+				break
 			}
-			break
+			// Any other non-EOF read error after the 200 was committed is a broken
+			// stream (upstream reset / transport error); surface it as a failure.
+			if onError != nil {
+				onError()
+			}
+			return
 		}
 	}
 
@@ -245,7 +278,15 @@ func streamOpenAIPassthrough(
 	if !flushEvent() {
 		return
 	}
-	if !sawDone || onFinalResponse == nil || aggregator == nil {
+	if !sawDone {
+		// The stream ended (EOF) without a [DONE] sentinel: the upstream closed
+		// the connection prematurely, so the client received a truncated stream.
+		if onError != nil {
+			onError()
+		}
+		return
+	}
+	if onFinalResponse == nil || aggregator == nil {
 		return
 	}
 	onFinalResponse(aggregator.buildResponse())
