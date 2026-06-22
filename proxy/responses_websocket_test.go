@@ -1392,7 +1392,7 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 
 		if instructions, _ := body["instructions"].(string); strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprint(w, `{"id":"comp-413","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint summary after 413"}]}]}`)
+			_, _ = fmt.Fprint(w, `{"id":"comp-413","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint summary after 413"}]}],"usage":{"input_tokens":700,"output_tokens":90,"total_tokens":790}}`)
 			return
 		}
 
@@ -1421,6 +1421,7 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 		DisableAutoCompact:  true,
 		AutoCompactKeepTail: 2,
 	}
+	handler.stats = newStatsCollector()
 
 	server := startResponsesWebSocketProxyServer(t, handler)
 	conn := mustDialResponsesWebSocket(t, server, nil)
@@ -1503,6 +1504,18 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 	}
 	if got := inputTextFromMessage(t, retriedInput[3]); got != "second turn" {
 		t.Fatalf("expected retried request to keep latest user turn, got %q", got)
+	}
+
+	// The 413 oversized-replay fallback spends upstream /responses tokens on its
+	// internal compaction call; assert that spend is recorded into stats as its own
+	// turn (round-6: 413-fallback sessions must not underreport). The compaction
+	// upstream reports 700+90 tokens.
+	deadlineStats := time.Now().Add(2 * time.Second)
+	for handler.stats.snapshot().Totals.TotalTokens < 790 {
+		if time.Now().After(deadlineStats) {
+			t.Fatalf("expected 413 compaction usage (>=790 tokens) in stats, got %d", handler.stats.snapshot().Totals.TotalTokens)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

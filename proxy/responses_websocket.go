@@ -934,6 +934,17 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 	}
 
 	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
+	// The 413 oversized-replay fallback spends upstream /responses tokens on
+	// internal compaction calls (accumulated into budget) before retrying the
+	// turn. That spend does not flow through the stats middleware, and the retry
+	// turn's own usage is recorded separately downstream, so record the
+	// compaction usage here as its own turn on every exit path — matching the
+	// auto-compaction path — so 413-fallback sessions do not underreport spend.
+	defer func() {
+		if compactionUsage := budget.usageTotals(); !compactionUsage.isZero() {
+			s.recordTurnStats(h, request.Model, http.StatusOK, compactionUsage)
+		}
+	}()
 	for attempt, keepTail := range keepTailSchedule {
 		compactedHistory, compaction, compacted, err := s.compactHistoryItemsWithKeepTail(h, ctx, request, originalHistory, keepTail, budget)
 		if err != nil {

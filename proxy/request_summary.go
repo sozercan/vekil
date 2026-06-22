@@ -29,6 +29,14 @@ type RequestSummary struct {
 	totalTokens       *int
 	cachedTokens      *int
 	reasoningTokens   *int
+	// extraPromptTokens / extraCompletionTokens accumulate out-of-band token
+	// spend that is separate from the turn's own reported usage — e.g. an
+	// internal /responses compaction call made while serving a 413 oversized-
+	// replay fallback. The turn usage (setOpenAIUsage) overwrites, so this extra
+	// spend is kept additively and folded into the totals by readSummaryForStats
+	// rather than being clobbered by the final turn's usage.
+	extraPromptTokens     int
+	extraCompletionTokens int
 	// failureStatus, when non-zero, is an error status the handler observed
 	// out-of-band after the HTTP response status was already committed — e.g. a
 	// streaming /responses turn that emits response.failed/incomplete after the
@@ -147,11 +155,36 @@ func (s *RequestSummary) FailureStatus() int {
 	return s.failureStatus
 }
 
+// addInternalUsage accumulates out-of-band token spend (e.g. an internal
+// compaction call) that is separate from the turn's own reported usage, so it is
+// not clobbered when setOpenAIUsage overwrites the turn usage. It is additive.
+func (s *RequestSummary) addInternalUsage(promptTokens, completionTokens int) {
+	if s == nil || (promptTokens == 0 && completionTokens == 0) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.extraPromptTokens += promptTokens
+	s.extraCompletionTokens += completionTokens
+}
+
 // observeResponseFailureStatus records an out-of-band failure status onto the
 // request summary attached to ctx, if any.
 func observeResponseFailureStatus(ctx context.Context, status int) {
 	if summary := RequestSummaryFromContext(ctx); summary != nil {
 		summary.setFailureStatus(status)
+	}
+}
+
+// observeInternalResponsesUsage accumulates out-of-band /responses token spend
+// (e.g. an internal compaction call) onto the request summary attached to ctx,
+// if any, so it is counted in addition to the turn's own usage.
+func observeInternalResponsesUsage(ctx context.Context, usage responsesUsage) {
+	if usage.isZero() {
+		return
+	}
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		summary.addInternalUsage(usage.InputTokens, usage.OutputTokens)
 	}
 }
 

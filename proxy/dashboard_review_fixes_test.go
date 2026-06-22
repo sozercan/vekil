@@ -480,3 +480,42 @@ func TestResponsesWebSocketStreamFailureDetailsStatus(t *testing.T) {
 		})
 	}
 }
+
+// TestObserveInternalResponsesUsageAddsToTurnUsage covers that out-of-band
+// internal /responses spend (e.g. a 413-fallback compaction call) is folded into
+// the stats totals additively, on top of the turn's own usage, rather than being
+// clobbered by setOpenAIUsage's overwrite (round-6).
+func TestObserveInternalResponsesUsageAddsToTurnUsage(t *testing.T) {
+	c := newStatsCollector()
+	ctx, summary := WithRequestSummary(context.Background())
+	summary.setRoute("/v1/responses", "gpt-5.4", false)
+	summary.setProvider("codex", "openai-codex")
+
+	// Internal compaction spend recorded first...
+	observeInternalResponsesUsage(ctx, responsesUsage{InputTokens: 700, OutputTokens: 90, TotalTokens: 790})
+	// ...then the turn's own usage overwrites the base usage fields.
+	observeResponsesUsage(ctx, responsesUsage{InputTokens: 100, OutputTokens: 20, TotalTokens: 120})
+
+	c.record(summary, 200, "Codex CLI", 0)
+	snap := c.snapshot()
+	// totals = turn (100+20) + internal (700+90) = 910
+	if snap.Totals.TotalTokens != 910 {
+		t.Fatalf("total tokens = %d want 910 (turn 120 + internal 790)", snap.Totals.TotalTokens)
+	}
+	if snap.Totals.PromptTokens != 800 {
+		t.Fatalf("prompt tokens = %d want 800 (turn 100 + internal 700)", snap.Totals.PromptTokens)
+	}
+	if snap.Totals.CompletionTokens != 110 {
+		t.Fatalf("completion tokens = %d want 110 (turn 20 + internal 90)", snap.Totals.CompletionTokens)
+	}
+}
+
+// TestObserveInternalResponsesUsageIgnoresZero covers that a zero internal usage
+// is a no-op (no spurious accumulation).
+func TestObserveInternalResponsesUsageIgnoresZero(t *testing.T) {
+	ctx, summary := WithRequestSummary(context.Background())
+	observeInternalResponsesUsage(ctx, responsesUsage{})
+	if summary.extraPromptTokens != 0 || summary.extraCompletionTokens != 0 {
+		t.Fatalf("zero internal usage should not accumulate: prompt=%d completion=%d", summary.extraPromptTokens, summary.extraCompletionTokens)
+	}
+}

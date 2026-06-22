@@ -101,12 +101,12 @@ func responsesRequestStreams(bodyBytes []byte) bool {
 	return partial.Stream != nil && *partial.Stream
 }
 
-func (h *ProxyHandler) postPreparedResponsesRequest(ctx context.Context, req preparedResponsesRequest) (*http.Response, error) {
+func (h *ProxyHandler) postPreparedResponsesRequest(ctx, observeCtx context.Context, req preparedResponsesRequest) (*http.Response, error) {
 	resp, err := h.postResponsesWithHeaders(ctx, req.body, req.upstreamHeaders)
 	if err != nil {
 		return nil, err
 	}
-	return h.maybeRetryCompactedResponsesRequest(ctx, req.body, req.extraHeaders, req.upstreamHeaders, resp)
+	return h.maybeRetryCompactedResponsesRequest(ctx, observeCtx, req.body, req.extraHeaders, req.upstreamHeaders, resp)
 }
 
 func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWriter, endpoint string, err error) {
@@ -156,7 +156,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := h.postPreparedResponsesRequest(upstreamCtx, prepared)
+	resp, err := h.postPreparedResponsesRequest(upstreamCtx, r.Context(), prepared)
 	if err != nil {
 		h.writeResponsesUpstreamRequestFailure(w, "responses", err)
 		return
@@ -2222,7 +2222,7 @@ func applyResolvedCompactModel(bodyBytes []byte, budget *compactBudget) []byte {
 	return sanitizeResponsesModelFallbackBody(rewritten)
 }
 
-func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, bodyBytes []byte, extraHeaders, upstreamHeaders http.Header, resp *http.Response) (*http.Response, error) {
+func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx context.Context, bodyBytes []byte, extraHeaders, upstreamHeaders http.Header, resp *http.Response) (*http.Response, error) {
 	if resp == nil || resp.StatusCode != http.StatusRequestEntityTooLarge {
 		return resp, nil
 	}
@@ -2279,6 +2279,15 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx context.Context, 
 	lastResp := cloneHTTPResponseWithBody(resp, respBody)
 
 	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
+	// The 413 oversized-replay fallback spends upstream /responses tokens on
+	// internal compaction calls (accumulated into budget) before retrying. That
+	// spend is separate from the retry turn's own usage (which the passthrough
+	// observes onto the same summary, overwriting), so record it additively on
+	// the inbound request summary so a 413-fallback request does not underreport
+	// total token spend.
+	defer func() {
+		observeInternalResponsesUsage(observeCtx, budget.usageTotals())
+	}()
 	lastAlignedKeepTail := 0
 	for attempt, keepTail := range keepTailSchedule {
 		prefixLen := compactedResponsesAlignedPrefixLen(input, keepTail)

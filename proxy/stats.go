@@ -704,6 +704,14 @@ func readSummaryForStats(summary *RequestSummary) summaryStats {
 	if d.total == 0 {
 		d.total = d.prompt + d.completion
 	}
+	// Fold in out-of-band internal spend (e.g. a 413-fallback compaction call)
+	// that is tracked separately from the turn usage so it is not clobbered by
+	// the final turn's setOpenAIUsage overwrite.
+	if summary.extraPromptTokens != 0 || summary.extraCompletionTokens != 0 {
+		d.prompt += summary.extraPromptTokens
+		d.completion += summary.extraCompletionTokens
+		d.total += summary.extraPromptTokens + summary.extraCompletionTokens
+	}
 	if summary.cachedTokens != nil {
 		d.cached = *summary.cachedTokens
 	}
