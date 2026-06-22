@@ -128,7 +128,7 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 		recorder := &responseRecorder{ResponseWriter: w}
 		ctx, summary := proxy.WithRequestSummary(r.Context())
 
-		tracked := handler != nil && handler.TracksRequest(r.URL.Path)
+		tracked := handler != nil && handler.TracksRequest(r.Method, r.URL.Path)
 		if tracked {
 			handler.IncInflight()
 			defer handler.DecInflight()

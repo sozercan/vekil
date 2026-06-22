@@ -52,6 +52,8 @@ Notes:
 
 Metrics are aggregated in memory in the proxy and reset when the process restarts; nothing is persisted. The dashboard's own requests (`/dashboard`, its assets, `/stats.json`, `/dashboard/insight`) and the `/healthz` and `/readyz` probes are excluded from the stats so the dashboard does not measure itself.
 
+Token usage is captured across all inference surfaces: OpenAI chat completions (streaming and non-streaming), Anthropic messages, Gemini, and the OpenAI Responses API used by Codex — including the proxy-owned `GET /v1/responses` websocket bridge, where each turn's usage is recorded as it completes. The Responses `input_tokens`/`output_tokens` shape (with cached and reasoning details) is mapped onto the same prompt/completion fields as chat. The long-lived `GET /v1/responses` websocket connection itself is not counted as a request (it would otherwise pin the in-flight gauge and skew latency); its individual turns are.
+
 `GET /stats.json` returns a snapshot:
 
 ```json

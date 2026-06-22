@@ -165,7 +165,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.writeResponsesUpstreamResponse(w, resp, h.toolContexts, prepared.headerToolScope)
+	h.writeResponsesUpstreamResponse(r.Context(), w, resp, h.toolContexts, prepared.headerToolScope)
 }
 
 // compactPrompt is the system instruction used when the upstream does not

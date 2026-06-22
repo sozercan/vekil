@@ -699,6 +699,14 @@ func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
 	if eventName == "" {
 		eventName = eventType
 	}
+	if eventName == "response.completed" {
+		// Record token usage from the terminal event. This is best-effort: a
+		// response.completed larger than responsesFailureTapMaxBuffer is dropped
+		// by the tap before its delimiter, in which case usage is simply not
+		// recorded for that turn (it degrades to zero rather than erroring). The
+		// usage payload is small in practice (~hundreds of bytes).
+		observeResponsesUsage(t.ctx, event.Response.Usage)
+	}
 	t.maybeCaptureToolCommand(eventName, event)
 	t.maybeLog(eventName, event)
 }

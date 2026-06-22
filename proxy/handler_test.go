@@ -909,6 +909,43 @@ func TestHandleResponses(t *testing.T) {
 	}
 }
 
+// TestHandleResponsesRecordsUsage verifies the non-streaming POST /v1/responses
+// path observes token usage into the per-request RequestSummary (so the traffic
+// dashboard records Codex /responses traffic instead of zeros).
+func TestHandleResponsesRecordsUsage(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed",` +
+			`"usage":{"input_tokens":300,"output_tokens":120,"total_tokens":420,` +
+			`"input_tokens_details":{"cached_tokens":90},"output_tokens_details":{"reasoning_tokens":40}}}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses",
+		strings.NewReader(`{"model":"gpt-4","input":"Hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx, summary := WithRequestSummary(req.Context())
+	req = req.WithContext(ctx)
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	if w.Result().StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d want 200", w.Result().StatusCode)
+	}
+	d := readSummaryForStats(summary)
+	if d.prompt != 300 || d.completion != 120 || d.total != 420 {
+		t.Fatalf("usage not recorded: prompt=%d completion=%d total=%d", d.prompt, d.completion, d.total)
+	}
+	if d.cached != 90 || d.reasoning != 40 {
+		t.Fatalf("detail usage not recorded: cached=%d reasoning=%d", d.cached, d.reasoning)
+	}
+	// The response body must still carry the upstream usage block unchanged.
+	body, _ := io.ReadAll(w.Result().Body)
+	if !strings.Contains(string(body), `"input_tokens":300`) {
+		t.Fatalf("response body altered: %s", body)
+	}
+}
+
 func TestHandleResponses_RoutesConfiguredAzureModelAndPreservesPriorityServiceTier(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 

@@ -64,6 +64,7 @@ type responsesWebSocketStreamEvent struct {
 		ID                string                                    `json:"id"`
 		Error             responsesWebSocketStreamError             `json:"error"`
 		IncompleteDetails responsesWebSocketStreamIncompleteDetails `json:"incomplete_details"`
+		Usage             responsesUsage                            `json:"usage"`
 	} `json:"response,omitempty"`
 	Item json.RawMessage `json:"item,omitempty"`
 }
@@ -82,6 +83,7 @@ type responsesWebSocketSession struct {
 	conn           *websocket.Conn
 	ctx            context.Context
 	baseHeaders    http.Header
+	userAgent      string
 	turnState      string
 	turnMetadata   string
 	lastResponseID string
@@ -407,6 +409,7 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 		conn:        conn,
 		ctx:         r.Context(),
 		baseHeaders: baseHeaders,
+		userAgent:   r.Header.Get("User-Agent"),
 		// Codex treats X-Codex-Turn-State as server-issued, turn-scoped
 		// sticky-routing state. This bridge only trusts state it received from
 		// upstream during this proxy-owned websocket session.
@@ -586,13 +589,23 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return fmt.Errorf("upstream websocket bridge status %d", resp.StatusCode)
 	}
 
-	responseID, outputItems, err := s.streamUpstreamResponse(h, resp.Body, resp.Header)
+	responseID, outputItems, turnUsage, err := s.streamUpstreamResponse(h, resp.Body, resp.Header)
 	if err != nil {
 		if errors.Is(err, errStreamFailedUpstream) {
 			return nil
 		}
 		s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil)
 		return err
+	}
+
+	// Record this bridge turn's token usage into traffic stats. The bridge does
+	// not flow through the HTTP request middleware, so it is recorded directly.
+	if !turnUsage.isZero() {
+		providerID, providerKind := "", ""
+		if provider, _, _ := h.resolveProviderModel(request.Model, providerEndpointResponses); provider != nil {
+			providerID, providerKind = provider.id, string(provider.kind)
+		}
+		h.RecordResponsesTurn(request.Model, providerID, providerKind, classifyAgent(s.userAgent), turnUsage)
 	}
 
 	s.rememberPlannedResponse(plan, responseID, outputItems)
@@ -1037,7 +1050,7 @@ func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *
 	)
 }
 
-func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body io.Reader, headers http.Header) (string, []json.RawMessage, error) {
+func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body io.Reader, headers http.Header) (string, []json.RawMessage, responsesUsage, error) {
 	// Emit a synthetic metadata event so WebSocket clients can discover the
 	// actual model used. The Codex CLI parses openai-model from
 	// codex.response.metadata frames via response_model().
@@ -1050,6 +1063,7 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 
 	var responseID string
 	var outputItems []json.RawMessage
+	var turnUsage responsesUsage
 	sawCompleted := false
 	sawSemanticEvent := false
 
@@ -1096,6 +1110,9 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 			if event.Response.ID != "" {
 				responseID = event.Response.ID
 			}
+			if !event.Response.Usage.isZero() {
+				turnUsage = event.Response.Usage
+			}
 		case "response.failed", "response.incomplete":
 			s.sendUpstreamStreamFailure(event, headers)
 			// Return the sentinel immediately to break out of the SSE
@@ -1107,18 +1124,18 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 
 		return nil
 	}); err != nil && !errors.Is(err, errStreamFailedUpstream) {
-		return "", nil, err
+		return "", nil, responsesUsage{}, err
 	} else if errors.Is(err, errStreamFailedUpstream) {
-		return "", nil, errStreamFailedUpstream
+		return "", nil, responsesUsage{}, errStreamFailedUpstream
 	}
 
 	if sawCompleted {
 		if responseID == "" {
-			return "", nil, fmt.Errorf("response.completed missing response id")
+			return "", nil, responsesUsage{}, fmt.Errorf("response.completed missing response id")
 		}
-		return responseID, outputItems, nil
+		return responseID, outputItems, turnUsage, nil
 	}
-	return "", nil, fmt.Errorf("stream ended before response.completed")
+	return "", nil, responsesUsage{}, fmt.Errorf("stream ended before response.completed")
 }
 
 func (s *responsesWebSocketSession) writeJSON(payload interface{}) error {

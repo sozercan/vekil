@@ -456,15 +456,23 @@ func TestTracksRequest(t *testing.T) {
 	h := &ProxyHandler{stats: newStatsCollector()}
 	tracked := []string{"/v1/chat/completions", "/v1/messages", "/v1/responses"}
 	for _, p := range tracked {
-		if !h.TracksRequest(p) {
-			t.Errorf("expected %s to be tracked", p)
+		if !h.TracksRequest(http.MethodPost, p) {
+			t.Errorf("expected POST %s to be tracked", p)
 		}
 	}
 	skipped := []string{"/healthz", "/readyz", "/stats.json", "/dashboard", "/dashboard/uPlot.min.js", "/favicon.ico"}
 	for _, p := range skipped {
-		if h.TracksRequest(p) {
+		if h.TracksRequest(http.MethodGet, p) {
 			t.Errorf("expected %s to be skipped", p)
 		}
+	}
+	// GET /v1/responses is the websocket-bridge upgrade — excluded so it doesn't
+	// pin inflight or poison latency; POST /v1/responses stays tracked.
+	if h.TracksRequest(http.MethodGet, "/v1/responses") {
+		t.Error("expected GET /v1/responses (websocket) to be skipped")
+	}
+	if !h.TracksRequest(http.MethodPost, "/v1/responses") {
+		t.Error("expected POST /v1/responses to be tracked")
 	}
 }
 

@@ -213,16 +213,57 @@ func (c *statsCollector) incRetry(status int) {
 	c.mu.Unlock()
 }
 
-// record folds one completed request into the aggregates.
+// record folds one completed HTTP request into the aggregates.
 func (c *statsCollector) record(summary *RequestSummary, status int, userAgent string, dur time.Duration) {
 	d := readSummaryForStats(summary)
 	agent := classifyAgent(userAgent)
-	sec := c.now().Unix()
-	isErr := status >= http.StatusBadRequest
 	durMs := dur.Milliseconds()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.recordLocked(d, agent, status, durMs)
+}
+
+// recordResponsesTurn folds one completed /v1/responses websocket-bridge turn
+// into the aggregates. The bridge does not flow through the HTTP request
+// middleware (one upgrade serves many turns), so usage is recorded here
+// directly. A turn is always a successful streamed exchange (failures are sent
+// to the client and not recorded here), so it carries no latency sample.
+func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, usage responsesUsage) {
+	if usage.isZero() {
+		return
+	}
+	total := usage.TotalTokens
+	if total == 0 {
+		total = usage.InputTokens + usage.OutputTokens
+	}
+	d := summaryStats{
+		model:      model,
+		provider:   provider,
+		kind:       kind,
+		endpoint:   "responses_ws",
+		stream:     true, // streamed: excluded from latency
+		prompt:     usage.InputTokens,
+		completion: usage.OutputTokens,
+		total:      total,
+		cached:     usage.InputTokensDetails.CachedTokens,
+		reasoning:  usage.OutputTokensDetails.ReasoningTokens,
+	}
+	agent := agentLabel
+	if agent == "" {
+		agent = "unknown"
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.recordLocked(d, agent, http.StatusOK, 0)
+}
+
+// recordLocked folds one already-resolved request/turn into the aggregates.
+// Caller must hold c.mu. agent is the already-classified label.
+func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, durMs int64) {
+	sec := c.now().Unix()
+	isErr := status >= http.StatusBadRequest
 
 	idx := ringIndex(sec, len(c.ring))
 	b := &c.ring[idx]
@@ -655,10 +696,17 @@ func isObservabilityPath(path string) bool {
 	return strings.HasPrefix(path, "/dashboard/")
 }
 
-// TracksRequest reports whether requests for the given path should be recorded
-// in traffic stats. The server middleware uses this to gate inflight + record.
-func (h *ProxyHandler) TracksRequest(path string) bool {
+// TracksRequest reports whether requests for the given method+path should be
+// recorded in traffic stats. The server middleware uses this to gate inflight +
+// record. GET /v1/responses (the proxy-owned websocket bridge upgrade) is
+// excluded: it is one long-lived connection serving many turns, so recording it
+// as a single request would pin the in-flight gauge and feed a minutes-long
+// latency sample. The bridge records each turn's usage directly instead.
+func (h *ProxyHandler) TracksRequest(method, path string) bool {
 	if h == nil || h.stats == nil {
+		return false
+	}
+	if method == http.MethodGet && path == "/v1/responses" {
 		return false
 	}
 	return !isObservabilityPath(path)
@@ -684,6 +732,16 @@ func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAg
 		return
 	}
 	h.stats.record(summary, status, userAgent, dur)
+}
+
+// RecordResponsesTurn folds one completed /v1/responses websocket-bridge turn
+// into the traffic stats. The bridge does not flow through the HTTP request
+// middleware, so its token usage is recorded directly here.
+func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel string, usage responsesUsage) {
+	if h == nil || h.stats == nil {
+		return
+	}
+	h.stats.recordResponsesTurn(model, provider, kind, agentLabel, usage)
 }
 
 // HandleStatsJSON handles GET /stats.json with the current traffic snapshot.
