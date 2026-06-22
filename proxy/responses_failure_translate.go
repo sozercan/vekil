@@ -745,8 +745,14 @@ func (t *responsesFailureTap) maybeLog(eventName string, event responsesWebSocke
 	// so the stats middleware would otherwise record the turn as a success.
 	// Record an out-of-band failure status on the request summary so the
 	// dashboard reflects the failure, mirroring how the websocket bridge maps the
-	// same response.failed/incomplete into an errored turn.
-	observeResponseFailureStatus(t.ctx, http.StatusBadGateway)
+	// same response.failed/incomplete into an errored turn. Classify the event so
+	// rate limits (429) and overloads (503) keep their exact status rather than
+	// all collapsing to bad-gateway.
+	failureStatus, _, _ := responsesWebSocketStreamFailureDetails(event)
+	if failureStatus == 0 {
+		failureStatus = http.StatusBadGateway
+	}
+	observeResponseFailureStatus(t.ctx, failureStatus)
 
 	fields := []logger.Field{
 		logger.F("endpoint", "responses_stream_failure"),

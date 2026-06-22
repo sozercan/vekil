@@ -534,6 +534,20 @@ func TestTracksRequest(t *testing.T) {
 			t.Errorf("expected POST %s (gemini countTokens) to be skipped", p)
 		}
 	}
+	// Unsupported or typoed Gemini actions hit the registered handler but 400
+	// before any upstream completion, so they must not be folded into stats —
+	// only the two generating actions are tracked, by explicit suffix.
+	geminiNonGenerating := []string{
+		"/v1beta/models/gemini-2.5-pro:embedContent",
+		"/v1/models/gemini-2.5-pro:batchEmbedContents",
+		"/models/gemini-2.5-pro:generateContentt", // typo
+		"/v1beta/models/gemini-2.5-pro",           // no action
+	}
+	for _, p := range geminiNonGenerating {
+		if h.TracksRequest(http.MethodPost, p) {
+			t.Errorf("expected POST %s (non-generating gemini action) to be skipped", p)
+		}
+	}
 	// GET /v1/models (catalog refresh) is not inference traffic — excluded so it
 	// doesn't skew latency/avg-tokens. GET /v1/responses is the websocket-bridge
 	// upgrade — excluded so it doesn't pin inflight or poison latency; POST

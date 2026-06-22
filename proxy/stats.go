@@ -791,19 +791,29 @@ func isInferenceRoute(method, path string) bool {
 			"/v1/responses":
 			return true
 		}
-		// Gemini routes are registered as path prefixes ({model}:{action}).
-		// Track the generating verbs but not the :countTokens sizing probe; the
+		// Gemini routes are registered as path prefixes ({model}:{action}). Track
+		// only the generating actions HandleGeminiModels actually serves; the
 		// action is the suffix after the last colon (parseGeminiPath), and
-		// r.URL.Path carries no query string, so a suffix match is exact.
-		if strings.HasSuffix(path, ":countTokens") {
-			return false
+		// r.URL.Path carries no query string, so a suffix match is exact. This
+		// excludes :countTokens (a sizing probe) and any unsupported/typo action
+		// (e.g. :embedContent, :generateContentt) that the handler rejects with a
+		// 400 before any upstream completion — those must not skew the metrics.
+		if isGeminiModelsPath(path) {
+			return strings.HasSuffix(path, ":generateContent") ||
+				strings.HasSuffix(path, ":streamGenerateContent")
 		}
-		return strings.HasPrefix(path, "/v1beta/models/") ||
-			strings.HasPrefix(path, "/v1/models/") ||
-			strings.HasPrefix(path, "/models/")
+		return false
 	default:
 		return false
 	}
+}
+
+// isGeminiModelsPath reports whether path is one of the registered Gemini
+// model-action route prefixes.
+func isGeminiModelsPath(path string) bool {
+	return strings.HasPrefix(path, "/v1beta/models/") ||
+		strings.HasPrefix(path, "/v1/models/") ||
+		strings.HasPrefix(path, "/models/")
 }
 
 // retryStatsTrackedContextKey marks a context that belongs to a tracked

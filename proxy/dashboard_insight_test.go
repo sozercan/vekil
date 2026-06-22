@@ -56,6 +56,12 @@ func TestValidateInsightModelWarnsForResponsesOnly(t *testing.T) {
 	if out := build("", nil); strings.Contains(out, "insights will not work") {
 		t.Fatalf("did not expect insight warning when unconfigured, log was:\n%s", out)
 	}
+	// Misspelled / unknown static model → warning. The default static provider
+	// does not accept unknown models on /chat/completions, so the later insight
+	// call would be rejected; the startup validation must surface it.
+	if out := build("chat-modle-typo", nil); !strings.Contains(out, "insights will not work") {
+		t.Fatalf("expected insight warning for unknown static model, log was:\n%s", out)
+	}
 }
 
 func TestInsightGateSingleFlight(t *testing.T) {

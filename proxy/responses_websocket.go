@@ -33,6 +33,28 @@ var (
 // payload so clients can surface the upstream error details.
 var errStreamFailedUpstream = errors.New("upstream stream ended with response.failed or response.incomplete")
 
+// streamFailedUpstreamError carries the HTTP status that an upstream
+// response.failed/incomplete event was classified to (e.g. 429 for a rate
+// limit, 503 for an overload), so the turn is recorded in stats with its exact
+// semantic status rather than a generic 502. It unwraps to errStreamFailedUpstream
+// so existing errors.Is checks keep working.
+type streamFailedUpstreamError struct {
+	status int
+}
+
+func (e *streamFailedUpstreamError) Error() string { return errStreamFailedUpstream.Error() }
+func (e *streamFailedUpstreamError) Unwrap() error { return errStreamFailedUpstream }
+
+// streamFailureStatus returns the classified status carried by a stream-failure
+// error, or http.StatusBadGateway when none was attached.
+func streamFailureStatus(err error) int {
+	var sf *streamFailedUpstreamError
+	if errors.As(err, &sf) && sf.status != 0 {
+		return sf.status
+	}
+	return http.StatusBadGateway
+}
+
 var responsesWebSocketUpgrader = websocket.Upgrader{
 	ReadBufferSize:    4096,
 	WriteBufferSize:   4096,
@@ -543,6 +565,12 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	}
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
+	// The websocket bridge records each turn as tracked traffic (recordTurnStats),
+	// so mark the per-turn upstream context as retry-trackable too — otherwise a
+	// retryable 429/503 on a turn would be invisible in the dashboard retry
+	// counters. GET /v1/responses is not an inference route, so the middleware
+	// never marks it; do it explicitly here.
+	upstreamCtx = markRetryStatsTracked(upstreamCtx)
 	inflightGen := s.setInflightCancel(upstreamCancel)
 	defer func() {
 		s.clearInflightCancel(inflightGen)
@@ -599,8 +627,10 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	if err != nil {
 		if errors.Is(err, errStreamFailedUpstream) {
 			// The upstream sent response.failed/incomplete; count it as an errored
-			// turn so it shows in the dashboard's error stats and recent log.
-			s.recordTurnStats(h, request.Model, http.StatusBadGateway, responsesUsage{})
+			// turn so it shows in the dashboard's error stats and recent log, with
+			// the exact classified status (e.g. 429/503) the client was sent rather
+			// than a generic 502.
+			s.recordTurnStats(h, request.Model, streamFailureStatus(err), responsesUsage{})
 			return nil
 		}
 		s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil)
@@ -1099,7 +1129,7 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 			if parsedEvent && event.Type == "response.failed" {
 				if status, _, ok := classifyPrecommitResponsesFailure(event); ok {
 					s.sendWrappedError(status, responsesPrecommitErrorMessage(event, status), strings.TrimSpace(event.Response.Error.Code), headers)
-					return errStreamFailedUpstream
+					return &streamFailedUpstreamError{status: status}
 				}
 			}
 		}
@@ -1138,15 +1168,18 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 			// Return the sentinel immediately to break out of the SSE
 			// scanner loop. The failure event has already been forwarded to
 			// the client above, and we also emit a standard error payload so
-			// websocket clients can surface the upstream error details.
-			return errStreamFailedUpstream
+			// websocket clients can surface the upstream error details. Carry the
+			// classified status so the turn is recorded with its exact semantic
+			// status (e.g. 429/503) rather than a generic 502.
+			status, _, _ := responsesWebSocketStreamFailureDetails(event)
+			return &streamFailedUpstreamError{status: status}
 		}
 
 		return nil
 	}); err != nil && !errors.Is(err, errStreamFailedUpstream) {
 		return "", nil, responsesUsage{}, err
 	} else if errors.Is(err, errStreamFailedUpstream) {
-		return "", nil, responsesUsage{}, errStreamFailedUpstream
+		return "", nil, responsesUsage{}, err
 	}
 
 	if sawCompleted {

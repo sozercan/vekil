@@ -499,6 +499,14 @@ func (h *ProxyHandler) validateInsightModel() {
 	case known && !providerModelSupportsEndpoint(owner, providerEndpointChatCompletions):
 		h.log.Info("dashboard insight_model is /responses-only and cannot be reached via /chat/completions; insights will not work",
 			logger.F("insight_model", model), logger.F("provider", provider.id))
+	case !known && !provider.allowsUnknownModelEndpoint(providerEndpointChatCompletions):
+		// The model is not declared by any provider and fell back to the default
+		// provider, which does not accept unknown models on /chat/completions — so
+		// resolveProviderRequest will reject the insight call. Mirror that check
+		// here so a misspelled static insight_model surfaces at startup instead of
+		// only soft-failing on the first dashboard click.
+		h.log.Info("dashboard insight_model is not a known model for its provider; insights will not work",
+			logger.F("insight_model", model), logger.F("provider", provider.id))
 	}
 }
 

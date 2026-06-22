@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -394,5 +395,57 @@ func TestStreamAnthropicPassthroughFastPathPreservesOversizedLine(t *testing.T) 
 	// Usage from the normal-sized frame after the oversized one is still captured.
 	if summary.totalTokens == nil || *summary.totalTokens != 7 {
 		t.Fatalf("totalTokens = %v want 7 (usage after oversized line still sniffed)", summary.totalTokens)
+	}
+}
+
+// TestStreamFailureStatusCarriesClassifiedStatus covers that a stream-failure
+// error carrying a classified status (e.g. 429) is recovered by
+// streamFailureStatus, and that errors.Is still matches the sentinel so existing
+// branching keeps working (round-4: ws/HTTP failures must keep their exact
+// status, not collapse to 502).
+func TestStreamFailureStatusCarriesClassifiedStatus(t *testing.T) {
+	err := &streamFailedUpstreamError{status: http.StatusTooManyRequests}
+	if !errors.Is(err, errStreamFailedUpstream) {
+		t.Fatal("streamFailedUpstreamError must unwrap to the sentinel")
+	}
+	if got := streamFailureStatus(err); got != http.StatusTooManyRequests {
+		t.Fatalf("streamFailureStatus = %d want 429", got)
+	}
+	// Bare sentinel (no carried status) falls back to 502.
+	if got := streamFailureStatus(errStreamFailedUpstream); got != http.StatusBadGateway {
+		t.Fatalf("streamFailureStatus(bare) = %d want 502", got)
+	}
+	// A zero-status wrapper also falls back to 502.
+	if got := streamFailureStatus(&streamFailedUpstreamError{}); got != http.StatusBadGateway {
+		t.Fatalf("streamFailureStatus(zero) = %d want 502", got)
+	}
+}
+
+// TestResponsesWebSocketStreamFailureDetailsStatus covers the classifier shared
+// by the websocket and HTTP post-commit failure paths: rate limits map to 429,
+// overloads to 503, and incomplete to 409 (round-4: exact status preserved).
+func TestResponsesWebSocketStreamFailureDetailsStatus(t *testing.T) {
+	mk := func(typ, code string) responsesWebSocketStreamEvent {
+		var e responsesWebSocketStreamEvent
+		e.Type = typ
+		e.Response.Error.Code = code
+		return e
+	}
+	cases := []struct {
+		name  string
+		event responsesWebSocketStreamEvent
+		want  int
+	}{
+		{"rate-limit", mk("response.failed", "too_many_requests"), http.StatusTooManyRequests},
+		{"overload", mk("response.failed", "model_overloaded"), http.StatusServiceUnavailable},
+		{"incomplete", mk("response.incomplete", ""), http.StatusConflict},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, _, _ := responsesWebSocketStreamFailureDetails(tc.event)
+			if status != tc.want {
+				t.Fatalf("status = %d want %d", status, tc.want)
+			}
+		})
 	}
 }
