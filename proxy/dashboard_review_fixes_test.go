@@ -148,24 +148,50 @@ func TestMarkRetryStatsTrackedIfInference(t *testing.T) {
 
 // TestObserveAnthropicUsageBody covers usage capture for the direct
 // anthropic-compatible passthrough: Anthropic input/output tokens map onto the
-// chat-shaped fields the dashboard reads, with cache-read mapped to cached.
+// chat-shaped fields the dashboard reads. input_tokens counts only non-cached
+// tokens, so cache read + creation are folded into the prompt/total (cache-read
+// also surfaced as the cached detail).
 func TestObserveAnthropicUsageBody(t *testing.T) {
 	ctx, summary := WithRequestSummary(context.Background())
-	body := []byte(`{"id":"msg_1","type":"message","model":"claude-x","usage":{"input_tokens":120,"output_tokens":40,"cache_read_input_tokens":30}}`)
+	body := []byte(`{"id":"msg_1","type":"message","model":"claude-x","usage":{"input_tokens":120,"output_tokens":40,"cache_read_input_tokens":30,"cache_creation_input_tokens":10}}`)
 
 	observeAnthropicUsageBody(ctx, body)
 
-	if summary.promptTokens == nil || *summary.promptTokens != 120 {
-		t.Fatalf("promptTokens = %v want 120", summary.promptTokens)
+	// prompt = input(120) + cache_read(30) + cache_creation(10) = 160
+	if summary.promptTokens == nil || *summary.promptTokens != 160 {
+		t.Fatalf("promptTokens = %v want 160 (input + cache read + cache creation)", summary.promptTokens)
 	}
 	if summary.completionTokens == nil || *summary.completionTokens != 40 {
 		t.Fatalf("completionTokens = %v want 40", summary.completionTokens)
 	}
-	if summary.totalTokens == nil || *summary.totalTokens != 160 {
-		t.Fatalf("totalTokens = %v want 160", summary.totalTokens)
+	if summary.totalTokens == nil || *summary.totalTokens != 200 {
+		t.Fatalf("totalTokens = %v want 200", summary.totalTokens)
 	}
+	// cached detail must not exceed prompt total (the bug this fixes).
 	if summary.cachedTokens == nil || *summary.cachedTokens != 30 {
 		t.Fatalf("cachedTokens = %v want 30", summary.cachedTokens)
+	}
+	if *summary.cachedTokens > *summary.promptTokens {
+		t.Fatalf("cached(%d) must not exceed prompt(%d)", *summary.cachedTokens, *summary.promptTokens)
+	}
+}
+
+// TestObserveAnthropicUsageBodyCacheOnly covers a pure cache hit (a large cached
+// prefix with a tiny uncached suffix), which previously undercounted to near
+// zero and could make cached% exceed 100%.
+func TestObserveAnthropicUsageBodyCacheOnly(t *testing.T) {
+	ctx, summary := WithRequestSummary(context.Background())
+	// 100k cache read, 50-token uncached suffix, no output yet.
+	body := []byte(`{"usage":{"input_tokens":50,"output_tokens":0,"cache_read_input_tokens":100000}}`)
+	observeAnthropicUsageBody(ctx, body)
+	if summary.promptTokens == nil || *summary.promptTokens != 100050 {
+		t.Fatalf("promptTokens = %v want 100050", summary.promptTokens)
+	}
+	if summary.cachedTokens == nil || *summary.cachedTokens != 100000 {
+		t.Fatalf("cachedTokens = %v want 100000", summary.cachedTokens)
+	}
+	if *summary.cachedTokens > *summary.promptTokens {
+		t.Fatalf("cached(%d) must not exceed prompt(%d)", *summary.cachedTokens, *summary.promptTokens)
 	}
 }
 
@@ -282,11 +308,12 @@ func TestStreamOpenAIToGeminiCapturesUsage(t *testing.T) {
 
 // TestAnthropicStreamUsageAccumulator covers usage capture from an Anthropic
 // Messages SSE stream (finding: direct-Anthropic streaming recorded zero
-// tokens). Input/cache-read come from message_start; the running output total
-// comes from the last message_delta.
+// tokens). Input + cache read/write come from message_start; the running output
+// total comes from the last message_delta. input_tokens is non-cached only, so
+// cache tokens are folded into the prompt total.
 func TestAnthropicStreamUsageAccumulator(t *testing.T) {
 	acc := &anthropicStreamUsageAccumulator{}
-	acc.observe([]byte(`{"type":"message_start","message":{"usage":{"input_tokens":120,"cache_read_input_tokens":30,"output_tokens":1}}}`))
+	acc.observe([]byte(`{"type":"message_start","message":{"usage":{"input_tokens":120,"cache_read_input_tokens":30,"cache_creation_input_tokens":10,"output_tokens":1}}}`))
 	acc.observe([]byte(`{"type":"content_block_delta","delta":{"text":"hi"}}`))
 	acc.observe([]byte(`{"type":"message_delta","usage":{"output_tokens":7}}`))
 	acc.observe([]byte(`{"type":"message_delta","usage":{"output_tokens":42}}`)) // last wins
@@ -294,17 +321,21 @@ func TestAnthropicStreamUsageAccumulator(t *testing.T) {
 	ctx, summary := WithRequestSummary(context.Background())
 	acc.flush(ctx)
 
-	if summary.promptTokens == nil || *summary.promptTokens != 120 {
-		t.Fatalf("promptTokens = %v want 120", summary.promptTokens)
+	// prompt = input(120) + cache_read(30) + cache_creation(10) = 160
+	if summary.promptTokens == nil || *summary.promptTokens != 160 {
+		t.Fatalf("promptTokens = %v want 160 (input + cache read + cache creation)", summary.promptTokens)
 	}
 	if summary.completionTokens == nil || *summary.completionTokens != 42 {
 		t.Fatalf("completionTokens = %v want 42 (last message_delta wins)", summary.completionTokens)
 	}
-	if summary.totalTokens == nil || *summary.totalTokens != 162 {
-		t.Fatalf("totalTokens = %v want 162", summary.totalTokens)
+	if summary.totalTokens == nil || *summary.totalTokens != 202 {
+		t.Fatalf("totalTokens = %v want 202", summary.totalTokens)
 	}
 	if summary.cachedTokens == nil || *summary.cachedTokens != 30 {
 		t.Fatalf("cachedTokens = %v want 30", summary.cachedTokens)
+	}
+	if *summary.cachedTokens > *summary.promptTokens {
+		t.Fatalf("cached(%d) must not exceed prompt(%d)", *summary.cachedTokens, *summary.promptTokens)
 	}
 }
 

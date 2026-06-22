@@ -854,13 +854,17 @@ func (s *responsesWebSocketSession) rememberPlannedResponse(plan responsesWebSoc
 
 func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, request *responsesWebSocketCreateRequest, metrics responsesWebSocketRequestMetrics) responsesWebSocketRequestMetrics {
 	ctx, cancel := h.newInferenceUpstreamContext(true)
+	// Mark the compaction upstream context as retry-trackable, like the turn
+	// itself, so retries during auto-compaction are counted in retry stats.
+	ctx = markRetryStatsTracked(ctx)
 	inflightGen := s.setInflightCancel(cancel)
 	defer func() {
 		s.clearInflightCancel(inflightGen)
 		cancel()
 	}()
 
-	compaction, compacted, err := s.compactHistory(h, ctx, request, false)
+	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
+	compaction, compacted, err := s.compactHistory(h, ctx, request, false, budget)
 	if err != nil {
 		h.log.Debug("responses websocket auto-compaction failed",
 			logger.Err(err),
@@ -872,6 +876,14 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, req
 	}
 	if !compacted {
 		return metrics
+	}
+
+	// Auto-compaction spends upstream /responses tokens on an internal compact
+	// call that does not flow through the stats middleware. Record that usage as
+	// its own turn so long auto-compacting websocket sessions do not underreport
+	// total Responses token spend.
+	if compactionUsage := budget.usageTotals(); !compactionUsage.isZero() {
+		s.recordTurnStats(h, request.Model, http.StatusOK, compactionUsage)
 	}
 
 	h.log.Debug("responses websocket auto-compacted history",
@@ -987,7 +999,7 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 	return lastResp, nil
 }
 
-func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, force bool) (responsesWebSocketHistoryCompaction, bool, error) {
+func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, force bool, budget *compactBudget) (responsesWebSocketHistoryCompaction, bool, error) {
 	var result responsesWebSocketHistoryCompaction
 
 	cfg := h.responsesWebSocketConfig()
@@ -1012,7 +1024,7 @@ func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.
 		keepTail = responsesWebSocketAutoCompactKeepTail(s.historyItems, cfg)
 	}
 
-	compacted, result, ok, err := s.compactHistoryItemsWithKeepTail(h, ctx, request, s.historyItems, keepTail, nil)
+	compacted, result, ok, err := s.compactHistoryItemsWithKeepTail(h, ctx, request, s.historyItems, keepTail, budget)
 	if err != nil || !ok {
 		return result, ok, err
 	}

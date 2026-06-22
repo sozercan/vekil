@@ -88,13 +88,19 @@ func observeAnthropicUsageBody(ctx context.Context, body []byte) {
 		return
 	}
 	u := parsed.Usage
-	if u.InputTokens == 0 && u.OutputTokens == 0 {
+	if u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheReadInputTokens == 0 && u.CacheCreationInputTokens == 0 {
 		return
 	}
+	// Anthropic reports input_tokens as only the non-cached tokens after the last
+	// cache breakpoint; cache reads and writes are counted separately. Total input
+	// = input_tokens + cache_read_input_tokens + cache_creation_input_tokens. Fold
+	// the cache tokens into the prompt/total so cached-prompt volume is not
+	// undercounted (and the cached-prompt percentage cannot exceed 100%).
+	promptTokens := u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
 	usage := &models.OpenAIUsage{
-		PromptTokens:     u.InputTokens,
+		PromptTokens:     promptTokens,
 		CompletionTokens: u.OutputTokens,
-		TotalTokens:      u.InputTokens + u.OutputTokens,
+		TotalTokens:      promptTokens + u.OutputTokens,
 	}
 	if u.CacheReadInputTokens > 0 {
 		usage.PromptTokensDetails = &models.OpenAIPromptTokensDetails{CachedTokens: u.CacheReadInputTokens}
@@ -106,16 +112,17 @@ func observeAnthropicUsageBody(ctx context.Context, body []byte) {
 // Messages SSE stream so the direct anthropic-compatible streaming passthrough
 // can record it (that path only re-frames SSE and otherwise never converts
 // Anthropic usage into the chat-shaped fields the dashboard reads). Anthropic
-// reports input tokens (and cache-read) on the message_start event and the
+// reports input tokens plus cache read/write on the message_start event and the
 // running output-token total on each message_delta event; the last value seen
 // wins. Call observe(frameData) for each SSE data payload, then flush(ctx) once
 // at stream end.
 type anthropicStreamUsageAccumulator struct {
-	input      int
-	output     int
-	cacheRead  int
-	haveInput  bool
-	haveOutput bool
+	input         int
+	output        int
+	cacheRead     int
+	cacheCreation int
+	haveInput     bool
+	haveOutput    bool
 }
 
 func (a *anthropicStreamUsageAccumulator) observe(data []byte) {
@@ -134,6 +141,7 @@ func (a *anthropicStreamUsageAccumulator) observe(data []byte) {
 		if event.Message != nil && event.Message.Usage != nil {
 			a.input = event.Message.Usage.InputTokens
 			a.cacheRead = event.Message.Usage.CacheReadInputTokens
+			a.cacheCreation = event.Message.Usage.CacheCreationInputTokens
 			a.haveInput = true
 			if event.Message.Usage.OutputTokens > 0 {
 				a.output = event.Message.Usage.OutputTokens
@@ -152,10 +160,14 @@ func (a *anthropicStreamUsageAccumulator) flush(ctx context.Context) {
 	if !a.haveInput && !a.haveOutput {
 		return
 	}
+	// input_tokens counts only the non-cached tokens; fold cache read/write into
+	// the prompt total so cached-prompt volume is not undercounted (matching the
+	// non-streaming observeAnthropicUsageBody path).
+	promptTokens := a.input + a.cacheRead + a.cacheCreation
 	usage := &models.OpenAIUsage{
-		PromptTokens:     a.input,
+		PromptTokens:     promptTokens,
 		CompletionTokens: a.output,
-		TotalTokens:      a.input + a.output,
+		TotalTokens:      promptTokens + a.output,
 	}
 	if a.cacheRead > 0 {
 		usage.PromptTokensDetails = &models.OpenAIPromptTokensDetails{CachedTokens: a.cacheRead}
