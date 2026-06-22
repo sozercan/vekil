@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
 
@@ -272,7 +273,7 @@ func TestStreamOpenAIToAnthropicCapturesUsage(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	var captured *models.OpenAIUsage
-	StreamOpenAIToAnthropicWithFinalResponse(w, body, "claude-x", "msg_test", nil, func(u *models.OpenAIUsage) {
+	StreamOpenAIToAnthropicWithFinalResponse(w, body, "claude-x", "msg_test", nil, nil, func(u *models.OpenAIUsage) {
 		captured = u
 	})
 	if captured == nil || captured.TotalTokens != 10 {
@@ -298,7 +299,7 @@ func TestStreamOpenAIToGeminiCapturesUsage(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	var captured *models.OpenAIUsage
-	StreamOpenAIToGeminiWithFinalResponse(w, body, nil, func(u *models.OpenAIUsage) {
+	StreamOpenAIToGeminiWithFinalResponse(w, body, nil, nil, func(u *models.OpenAIUsage) {
 		captured = u
 	})
 	if captured == nil || captured.TotalTokens != 9 {
@@ -518,4 +519,187 @@ func TestObserveInternalResponsesUsageIgnoresZero(t *testing.T) {
 	if summary.extraPromptTokens != 0 || summary.extraCompletionTokens != 0 {
 		t.Fatalf("zero internal usage should not accumulate: prompt=%d completion=%d", summary.extraPromptTokens, summary.extraCompletionTokens)
 	}
+}
+
+// TestStreamOpenAIChatPassthroughDetectsErrorEvent covers that a post-commit
+// upstream stream error (event: error or data: {"error":...}) fires the onError
+// callback so the chat request is recorded as a failure even after its 200 was
+// committed (round-7).
+func TestStreamOpenAIChatPassthroughDetectsErrorEvent(t *testing.T) {
+	cases := []struct {
+		name   string
+		stream string
+	}{
+		{
+			name:   "error event",
+			stream: "event: error\ndata: {\"error\":{\"type\":\"server_error\",\"message\":\"boom\"}}\n\n",
+		},
+		{
+			name:   "error in data",
+			stream: "data: {\"error\":{\"message\":\"rate limited\",\"code\":\"too_many_requests\"}}\n\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := io.NopCloser(strings.NewReader(tc.stream))
+			w := httptest.NewRecorder()
+			errored := false
+			StreamOpenAIChatPassthrough(w, body, false, func() { errored = true }, nil, func(*models.OpenAIUsage) {})
+			if !errored {
+				t.Fatalf("expected onError to fire for %q", tc.name)
+			}
+		})
+	}
+
+	// A normal content stream must NOT fire onError.
+	body := io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"))
+	w := httptest.NewRecorder()
+	errored := false
+	StreamOpenAIChatPassthrough(w, body, false, func() { errored = true }, nil, func(*models.OpenAIUsage) {})
+	if errored {
+		t.Fatal("onError must not fire for a normal content stream")
+	}
+}
+
+// TestExtractResponsesUsageObject covers recovering usage from a large
+// response.completed buffer that exceeds the failure tap's buffer cap before its
+// delimiter (round-7): the usage object embedded after a big output is found and
+// parsed.
+func TestExtractResponsesUsageObject(t *testing.T) {
+	bigOutput := strings.Repeat("x", 4096)
+	// Simulate a partially-buffered SSE data line: huge output then usage, no
+	// closing of the outer object (delimiter not yet seen).
+	buf := []byte(`data: {"type":"response.completed","response":{"id":"r1","output":"` + bigOutput +
+		`","usage":{"input_tokens":1234,"output_tokens":56,"total_tokens":1290}}`)
+	u, ok := extractResponsesUsageObject(buf)
+	if !ok {
+		t.Fatal("expected to extract usage from oversized buffer")
+	}
+	if u.InputTokens != 1234 || u.OutputTokens != 56 || u.TotalTokens != 1290 {
+		t.Fatalf("usage = %+v want input=1234 output=56 total=1290", u)
+	}
+
+	// No usage object → ok=false.
+	if _, ok := extractResponsesUsageObject([]byte(`{"type":"response.output_text.delta","delta":"hi"}`)); ok {
+		t.Fatal("expected ok=false when no usage object present")
+	}
+	// Zero usage → ok=false (treated as no usage).
+	if _, ok := extractResponsesUsageObject([]byte(`{"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}`)); ok {
+		t.Fatal("expected ok=false for zero usage")
+	}
+}
+
+// TestBalancedJSONObject covers the brace matcher used by the usage extractor,
+// including braces inside strings and escaped quotes.
+func TestBalancedJSONObject(t *testing.T) {
+	in := []byte(`{"a":{"b":"}{"},"c":"\"}"}TRAILER`)
+	obj, end := balancedJSONObject(in)
+	if string(obj) != `{"a":{"b":"}{"},"c":"\"}"}` {
+		t.Fatalf("balanced object = %q", string(obj))
+	}
+	if string(in[end:]) != "TRAILER" {
+		t.Fatalf("trailer = %q want TRAILER", string(in[end:]))
+	}
+	// Unclosed object → (nil, 0).
+	if _, end := balancedJSONObject([]byte(`{"a":1`)); end != 0 {
+		t.Fatalf("unclosed object should return end=0, got %d", end)
+	}
+}
+
+// TestResponsesFailureTapRecoversUsageFromOversizedCompleted covers that the tap
+// recovers usage from a response.completed event whose buffered bytes exceed the
+// tap's buffer cap before its delimiter arrives (round-7): the overflow path
+// best-effort sniffs the usage object instead of dropping it to zero.
+func TestResponsesFailureTapRecoversUsageFromOversizedCompleted(t *testing.T) {
+	ctx, summary := WithRequestSummary(context.Background())
+	tap := newResponsesFailureTap(ctx, &ProxyHandler{}, nil, nil, "")
+
+	// A response.completed data line larger than the buffer cap, with usage near
+	// the end, and no terminating blank line yet (delimiter not seen).
+	bigOutput := strings.Repeat("y", responsesFailureTapMaxBuffer+8192)
+	line := `data: {"type":"response.completed","response":{"id":"r1","output":"` + bigOutput +
+		`","usage":{"input_tokens":900,"output_tokens":80,"total_tokens":980}}}` + "\n"
+	if _, err := tap.Write([]byte(line)); err != nil {
+		t.Fatalf("tap.Write: %v", err)
+	}
+
+	if summary.totalTokens == nil || *summary.totalTokens != 980 {
+		t.Fatalf("totalTokens = %v want 980 (usage recovered from oversized completed)", summary.totalTokens)
+	}
+}
+
+// TestStreamResponsesPipeMarksFailureOnCopyError covers that a broken upstream
+// SSE stream (the io.Copy returns an error before any response.failed event)
+// records an out-of-band failure status, so a truncated stream after a committed
+// 200 is not counted as a 2xx success (round-7).
+func TestStreamResponsesPipeMarksFailureOnCopyError(t *testing.T) {
+	ctx, summary := WithRequestSummary(context.Background())
+	// A reader that yields a little data then errors (simulating a reset).
+	r := &erroringReader{data: []byte("event: response.created\ndata: {\"type\":\"response.created\"}\n\n")}
+	w := httptest.NewRecorder()
+
+	streamResponsesPipeWithFailureLog(ctx, &ProxyHandler{log: logger.New(logger.LevelError)}, w, r, nil, nil, "")
+
+	if summary.FailureStatus() != http.StatusBadGateway {
+		t.Fatalf("FailureStatus = %d want 502 (broken stream after commit)", summary.FailureStatus())
+	}
+}
+
+type erroringReader struct {
+	data []byte
+	done bool
+}
+
+func (e *erroringReader) Read(p []byte) (int, error) {
+	if !e.done {
+		e.done = true
+		n := copy(p, e.data)
+		return n, nil
+	}
+	return 0, io.ErrUnexpectedEOF
+}
+
+// TestTranslatedStreamsFireOnErrorForUpstreamError covers that the Anthropic and
+// Gemini SSE translators invoke onError when the upstream stream carries an
+// error event or ends before [DONE] after the 200 was committed (round-7
+// sibling of the OpenAI chat onError fix), so those translated streams are also
+// recorded as failures.
+func TestTranslatedStreamsFireOnErrorForUpstreamError(t *testing.T) {
+	t.Run("anthropic error event", func(t *testing.T) {
+		body := io.NopCloser(strings.NewReader("event: error\ndata: {\"error\":{\"message\":\"boom\"}}\n\n"))
+		w := httptest.NewRecorder()
+		errored := false
+		StreamOpenAIToAnthropicWithFinalResponse(w, body, "claude-x", "msg_1", func() { errored = true }, nil)
+		if !errored {
+			t.Fatal("expected onError to fire for anthropic upstream error event")
+		}
+	})
+	t.Run("gemini error event", func(t *testing.T) {
+		body := io.NopCloser(strings.NewReader("event: error\ndata: {\"error\":{\"message\":\"boom\"}}\n\n"))
+		w := httptest.NewRecorder()
+		errored := false
+		StreamOpenAIToGeminiWithFinalResponse(w, body, func() { errored = true }, nil)
+		if !errored {
+			t.Fatal("expected onError to fire for gemini upstream error event")
+		}
+	})
+	t.Run("anthropic missing DONE", func(t *testing.T) {
+		// A content chunk but no [DONE] → ended-before-DONE failure.
+		body := io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+		w := httptest.NewRecorder()
+		errored := false
+		StreamOpenAIToAnthropicWithFinalResponse(w, body, "claude-x", "msg_1", func() { errored = true }, nil)
+		if !errored {
+			t.Fatal("expected onError to fire when stream ends before [DONE]")
+		}
+	})
+	t.Run("normal stream does not fire", func(t *testing.T) {
+		body := io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"))
+		w := httptest.NewRecorder()
+		errored := false
+		StreamOpenAIToAnthropicWithFinalResponse(w, body, "claude-x", "msg_1", func() { errored = true }, nil)
+		if errored {
+			t.Fatal("onError must not fire for a normal completed stream")
+		}
+	})
 }

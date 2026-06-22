@@ -1510,7 +1510,7 @@ func TestStreamOpenAIToAnthropicWithFinalResponse_CapturesStreamedToolCalls(t *t
 
 	var captured *models.OpenAIResponse
 	w := httptest.NewRecorder()
-	StreamOpenAIToAnthropicWithFinalResponse(w, body, "claude-sonnet-4", "msg_tool_1", func(resp *models.OpenAIResponse) {
+	StreamOpenAIToAnthropicWithFinalResponse(w, body, "claude-sonnet-4", "msg_tool_1", nil, func(resp *models.OpenAIResponse) {
 		captured = resp
 	})
 

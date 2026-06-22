@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 
@@ -62,6 +63,81 @@ func sniffResponsesUsageBody(body []byte) responsesUsage {
 		return responsesUsage{}
 	}
 	return envelope.Usage
+}
+
+// extractResponsesUsageObject finds the last "usage":{...} object in a raw byte
+// buffer and parses it as a responsesUsage. It is used to recover usage from an
+// oversized streamed response.completed event whose full JSON exceeds the
+// failure tap's buffer cap (so it cannot be parsed as a whole). A streamed
+// response.completed embeds usage after its (large) output, so the last
+// balanced object following a "usage" key is the response usage. Returns ok=false
+// when no parseable, non-zero usage object is found.
+func extractResponsesUsageObject(buf []byte) (responsesUsage, bool) {
+	key := []byte(`"usage"`)
+	search := buf
+	var found responsesUsage
+	ok := false
+	for {
+		idx := bytes.LastIndex(search, key)
+		if idx < 0 {
+			break
+		}
+		// Find the opening brace after the key (skipping whitespace and the colon).
+		j := idx + len(key)
+		for j < len(search) && (search[j] == ' ' || search[j] == '\t' || search[j] == ':' || search[j] == '\r' || search[j] == '\n') {
+			j++
+		}
+		if j < len(search) && search[j] == '{' {
+			if obj, end := balancedJSONObject(search[j:]); end > 0 {
+				var u responsesUsage
+				if err := json.Unmarshal(obj, &u); err == nil && !u.isZero() {
+					return u, true
+				}
+			}
+		}
+		// Not a usable usage object here; keep searching earlier in the buffer.
+		search = search[:idx]
+	}
+	return found, ok
+}
+
+// balancedJSONObject returns the leading balanced { ... } object of buf (which
+// must start with '{') and the index just past its closing brace, or (nil, 0) if
+// the object is not closed within buf. It respects JSON string quoting/escaping
+// so braces inside strings do not affect the depth count.
+func balancedJSONObject(buf []byte) ([]byte, int) {
+	if len(buf) == 0 || buf[0] != '{' {
+		return nil, 0
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i := 0; i < len(buf); i++ {
+		c := buf[i]
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return buf[:i+1], i + 1
+			}
+		}
+	}
+	return nil, 0
 }
 
 // observeResponsesUsage records a Responses usage object into the per-request

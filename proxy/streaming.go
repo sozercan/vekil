@@ -88,7 +88,7 @@ func StreamOpenAIPassthroughWithFinalResponse(
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
-	streamOpenAIPassthrough(w, body, false, onFinalResponse, onUsageCallbacks...)
+	streamOpenAIPassthrough(w, body, false, nil, onFinalResponse, onUsageCallbacks...)
 }
 
 // StreamOpenAIPassthroughDroppingInjectedUsage behaves like
@@ -104,7 +104,25 @@ func StreamOpenAIPassthroughDroppingInjectedUsage(
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
-	streamOpenAIPassthrough(w, body, true, onFinalResponse, onUsageCallbacks...)
+	streamOpenAIPassthrough(w, body, true, nil, onFinalResponse, onUsageCallbacks...)
+}
+
+// StreamOpenAIChatPassthrough forwards an OpenAI chat SSE stream to the client
+// like StreamOpenAIPassthroughWithFinalResponse, additionally invoking onError
+// when a post-commit upstream error event (event: error / data: {"error":...})
+// is seen, and dropping the proxy-injected usage-only chunk when dropInjectedUsage
+// is set. It is the entry point for the client-facing /v1/chat/completions
+// streaming path, where the request must be recorded as a failure if the stream
+// errors after its 200 header was committed.
+func StreamOpenAIChatPassthrough(
+	w http.ResponseWriter,
+	body io.ReadCloser,
+	dropInjectedUsage bool,
+	onError func(),
+	onFinalResponse func(*models.OpenAIResponse),
+	onUsageCallbacks ...func(*models.OpenAIUsage),
+) {
+	streamOpenAIPassthrough(w, body, dropInjectedUsage, onError, onFinalResponse, onUsageCallbacks...)
 }
 
 // streamOpenAIPassthrough forwards an upstream OpenAI SSE stream to the client.
@@ -119,6 +137,7 @@ func streamOpenAIPassthrough(
 	w http.ResponseWriter,
 	body io.ReadCloser,
 	dropInjectedUsage bool,
+	onError func(),
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
@@ -137,7 +156,7 @@ func streamOpenAIPassthrough(
 	}
 
 	onUsage := firstOpenAIUsageCallback(onUsageCallbacks)
-	if onFinalResponse == nil && onUsage == nil {
+	if onFinalResponse == nil && onUsage == nil && onError == nil {
 		_, _ = io.Copy(&flushWriter{w: w, flusher: flusher}, body)
 		return
 	}
@@ -152,10 +171,19 @@ func streamOpenAIPassthrough(
 	dropCurrent := false
 	var accumulator sseDataAccumulator
 	pending := make([]string, 0, 4)
-	processData := func(_ string, data string) bool {
+	processData := func(eventType string, data string) bool {
 		if data == "[DONE]" {
 			sawDone = true
 			return true
+		}
+
+		// A post-commit upstream error (event: error or data: {"error":...})
+		// arrives after the HTTP 200; surface it so the request is recorded as a
+		// failure even though the client already received a 200 header.
+		if onError != nil {
+			if _, isErr := parseOpenAIStreamError(eventType, data); isErr {
+				onError()
+			}
 		}
 
 		var chunk models.OpenAIStreamChunk
@@ -365,17 +393,21 @@ func splitSSELineEnding(line string) (string, string) {
 
 // StreamOpenAIToAnthropic translates an OpenAI SSE stream into Anthropic SSE format.
 func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model string, requestID string) {
-	StreamOpenAIToAnthropicWithFinalResponse(w, body, model, requestID, nil)
+	StreamOpenAIToAnthropicWithFinalResponse(w, body, model, requestID, nil, nil)
 }
 
 // StreamOpenAIToAnthropicWithFinalResponse translates an OpenAI SSE stream into
 // Anthropic SSE format and optionally invokes onFinalResponse with the complete
 // aggregated OpenAI response after the translated stream finishes successfully.
+// onError, when non-nil, is invoked if the upstream stream errors or ends before
+// [DONE] after the SSE headers were already committed, so the request can be
+// recorded as a failure even though its HTTP status was sent as 200.
 func StreamOpenAIToAnthropicWithFinalResponse(
 	w http.ResponseWriter,
 	body io.ReadCloser,
 	model string,
 	requestID string,
+	onError func(),
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
@@ -403,6 +435,9 @@ func StreamOpenAIToAnthropicWithFinalResponse(
 		return state.consumeChunk(chunk)
 	})
 	if err != nil {
+		if onError != nil {
+			onError()
+		}
 		var streamErr *openAIStreamError
 		if errors.As(err, &streamErr) {
 			state.emitError(streamErr.Error())
@@ -412,6 +447,9 @@ func StreamOpenAIToAnthropicWithFinalResponse(
 		return
 	}
 	if !sawDone {
+		if onError != nil {
+			onError()
+		}
 		state.emitError("upstream stream ended before [DONE]")
 		return
 	}

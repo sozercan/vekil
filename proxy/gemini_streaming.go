@@ -45,16 +45,19 @@ func writeGeminiSSEData(w http.ResponseWriter, data interface{}) error {
 // StreamOpenAIToGemini translates upstream OpenAI SSE into Gemini-style
 // data-only SSE frames.
 func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
-	StreamOpenAIToGeminiWithFinalResponse(w, body, nil)
+	StreamOpenAIToGeminiWithFinalResponse(w, body, nil, nil)
 }
 
 // StreamOpenAIToGeminiWithFinalResponse translates upstream OpenAI SSE into
 // Gemini-style data-only SSE frames and optionally invokes onFinalResponse with
 // the complete aggregated OpenAI response after the translated stream finishes
-// successfully.
+// successfully. onError, when non-nil, is invoked if the upstream stream errors
+// or ends before [DONE] after the SSE headers were committed, so the request can
+// be recorded as a failure even though its HTTP status was sent as 200.
 func StreamOpenAIToGeminiWithFinalResponse(
 	w http.ResponseWriter,
 	body io.ReadCloser,
+	onError func(),
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
@@ -78,6 +81,9 @@ func StreamOpenAIToGeminiWithFinalResponse(
 		return state.consumeChunk(chunk)
 	})
 	if err != nil {
+		if onError != nil {
+			onError()
+		}
 		var streamErr *openAIStreamError
 		if errors.As(err, &streamErr) {
 			state.writeError(streamErr.Error())
@@ -87,6 +93,9 @@ func StreamOpenAIToGeminiWithFinalResponse(
 		return
 	}
 	if !sawDone {
+		if onError != nil {
+			onError()
+		}
 		state.writeError("upstream stream ended before [DONE]")
 		return
 	}

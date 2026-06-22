@@ -15,10 +15,16 @@ import (
 )
 
 const (
-	responsesPrecommitPeekTimeout   = 750 * time.Millisecond
-	responsesPrecommitMaxPeekBytes  = 64 * 1024
-	responsesPeekReadChunkSize      = 4 * 1024
-	responsesFailureTapMaxBuffer    = 64 * 1024
+	responsesPrecommitPeekTimeout  = 750 * time.Millisecond
+	responsesPrecommitMaxPeekBytes = 64 * 1024
+	responsesPeekReadChunkSize     = 4 * 1024
+	// responsesFailureTapMaxBuffer bounds how much of an in-flight SSE event the
+	// failure tap buffers while waiting for its delimiter. It must be large
+	// enough to hold a real response.completed event, which embeds the full
+	// response output plus the usage object — long Codex turns routinely exceed
+	// 64 KiB — so it is sized at 1 MiB. On overflow the tap still best-effort
+	// sniffs usage from the buffered bytes before dropping them.
+	responsesFailureTapMaxBuffer    = 1 << 20
 	responsesFailureLogMessageLimit = 256
 )
 
@@ -467,7 +473,17 @@ func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w h
 	}
 
 	tap := newResponsesFailureTap(ctx, h, upstreamHeaders, store, scope)
-	_, _ = io.Copy(fw, io.TeeReader(r, tap))
+	if _, err := io.Copy(fw, io.TeeReader(r, tap)); err != nil {
+		// The HTTP 200 was already committed, so the client receives a truncated
+		// stream when the upstream SSE connection resets or the pipe closes with
+		// an error before a response.failed/incomplete event. Record an out-of-band
+		// failure status so the dashboard does not count the broken stream as a
+		// success (the tap's maybeLog handles the explicit-failure-event case).
+		observeResponseFailureStatus(ctx, http.StatusBadGateway)
+		if h != nil && h.log != nil {
+			h.log.Debug("responses stream copy failed after commit", logger.Err(err))
+		}
+	}
 }
 
 func parseResponsesStreamEvent(data string) (responsesWebSocketStreamEvent, error) {
@@ -673,10 +689,27 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 		t.maybeProcess(msg)
 	}
 	if len(t.parser.pending) > responsesFailureTapMaxBuffer {
+		// The event exceeds the buffer (e.g. a very large response.completed whose
+		// delimiter has not arrived yet). Best-effort sniff usage from the buffered
+		// bytes before dropping them, so an oversized completed event still records
+		// tokens instead of degrading to zero.
+		t.sniffUsageFromOverflow(t.parser.pending)
 		t.parser.pending = nil
 		t.parser.allowBOM = false
 	}
 	return len(p), nil
+}
+
+// sniffUsageFromOverflow extracts a usage object from a partially-buffered SSE
+// event that is about to be dropped for exceeding the buffer cap. It scans for
+// the last "usage":{...} object in the buffer (the completed event carries usage
+// after its output) and records it. It runs once per turn — once usage is
+// observed onto the summary, a later real terminal event would just re-observe
+// the same value. Best-effort: any parse failure is ignored.
+func (t *responsesFailureTap) sniffUsageFromOverflow(buf []byte) {
+	if usage, ok := extractResponsesUsageObject(buf); ok {
+		observeResponsesUsage(t.ctx, usage)
+	}
 }
 
 func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
