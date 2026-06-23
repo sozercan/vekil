@@ -363,6 +363,10 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 			if ctx.Err() == nil && fw.writeErr == nil {
 				observeResponseFailureStatus(ctx, http.StatusBadGateway)
 			}
+		} else if ctx.Err() == nil && !sniffer.sawMessageStop {
+			// Clean EOF before Anthropic's terminal message_stop means the upstream
+			// stream was truncated even though the transport closed without error.
+			observeResponseFailureStatus(ctx, http.StatusBadGateway)
 		}
 		return
 	}
@@ -370,6 +374,7 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 	reader := bufio.NewReaderSize(body, openAIStreamScannerInitialBuffer)
 	frame := make([]string, 0, 4)
 	clientWriteFailed := false
+	sawMessageStop := false
 	emit := func() {
 		if len(frame) == 0 {
 			return
@@ -377,8 +382,12 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 		for _, line := range frame {
 			content, _ := splitSSELineEnding(line)
 			if data, ok := parseSSELine(content); ok {
-				usage.observe([]byte(data))
-				markFailure([]byte(data))
+				dataBytes := []byte(data)
+				usage.observe(dataBytes)
+				markFailure(dataBytes)
+				if anthropicStreamDataIsMessageStop(dataBytes) {
+					sawMessageStop = true
+				}
 			}
 		}
 		if !writeAnthropicSSEFrame(w, frame, publicModel) {
@@ -399,13 +408,29 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 		}
 		if err != nil {
 			emit()
-			if err != io.EOF && ctx.Err() == nil && !clientWriteFailed {
-				// Upstream read error after the 200 was committed: a broken stream.
-				observeResponseFailureStatus(ctx, http.StatusBadGateway)
+			if ctx.Err() == nil && !clientWriteFailed {
+				if err != io.EOF {
+					// Upstream read error after the 200 was committed: a broken stream.
+					observeResponseFailureStatus(ctx, http.StatusBadGateway)
+				} else if !sawMessageStop {
+					// Clean EOF before Anthropic's terminal message_stop is still a
+					// truncated stream.
+					observeResponseFailureStatus(ctx, http.StatusBadGateway)
+				}
 			}
 			return
 		}
 	}
+}
+
+func anthropicStreamDataIsMessageStop(data []byte) bool {
+	var event struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &event); err != nil {
+		return false
+	}
+	return strings.TrimSpace(event.Type) == "message_stop"
 }
 
 // anthropicUsageSniffWriter scans an Anthropic SSE byte stream for usage (and
@@ -415,10 +440,11 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 // the buffer cap is skipped so the sniffer never affects the client copy or grows
 // unbounded.
 type anthropicUsageSniffWriter struct {
-	acc      *anthropicStreamUsageAccumulator
-	onData   func([]byte)
-	line     []byte
-	overflow bool
+	acc            *anthropicStreamUsageAccumulator
+	onData         func([]byte)
+	line           []byte
+	overflow       bool
+	sawMessageStop bool
 }
 
 func newAnthropicUsageSniffWriter(acc *anthropicStreamUsageAccumulator, onData func([]byte)) *anthropicUsageSniffWriter {
@@ -430,9 +456,13 @@ func (s *anthropicUsageSniffWriter) Write(p []byte) (int, error) {
 		if b == '\n' {
 			if !s.overflow {
 				if data, ok := parseSSELine(strings.TrimRight(string(s.line), "\r")); ok {
-					s.acc.observe([]byte(data))
+					dataBytes := []byte(data)
+					s.acc.observe(dataBytes)
 					if s.onData != nil {
-						s.onData([]byte(data))
+						s.onData(dataBytes)
+					}
+					if anthropicStreamDataIsMessageStop(dataBytes) {
+						s.sawMessageStop = true
 					}
 				}
 			}

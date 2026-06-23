@@ -448,6 +448,38 @@ func TestStreamAnthropicPassthroughFastPathPreservesOversizedLine(t *testing.T) 
 	}
 }
 
+// TestStreamAnthropicPassthroughMarksCleanEOFBeforeMessageStop covers direct
+// Anthropic-compatible streams that close cleanly before the terminal
+// message_stop event. Transport EOF is nil in this case, but the SSE protocol
+// stream is truncated and should be recorded as a failed turn.
+func TestStreamAnthropicPassthroughMarksCleanEOFBeforeMessageStop(t *testing.T) {
+	stream := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-upstream","content":[],"usage":{"input_tokens":5,"output_tokens":0}}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}` + "\n\n"
+
+	t.Run("byte-exact", func(t *testing.T) {
+		ctx, summary := WithRequestSummary(context.Background())
+		w := httptest.NewRecorder()
+		streamAnthropicPassthroughBody(ctx, w, strings.NewReader(stream), "claude-upstream", "claude-upstream")
+		if summary.FailureStatus() != http.StatusBadGateway {
+			t.Fatalf("FailureStatus = %d want 502", summary.FailureStatus())
+		}
+		if got := w.Body.String(); got != stream {
+			t.Fatalf("byte-exact stream changed: got %q want %q", got, stream)
+		}
+	})
+
+	t.Run("model-rewrite", func(t *testing.T) {
+		ctx, summary := WithRequestSummary(context.Background())
+		w := httptest.NewRecorder()
+		streamAnthropicPassthroughBody(ctx, w, strings.NewReader(stream), "claude-public", "claude-upstream")
+		if summary.FailureStatus() != http.StatusBadGateway {
+			t.Fatalf("FailureStatus = %d want 502", summary.FailureStatus())
+		}
+	})
+}
+
 // TestStreamFailureStatusCarriesClassifiedStatus covers that a stream-failure
 // error carrying a classified status (e.g. 429) is recovered by
 // streamFailureStatus, and that errors.Is still matches the sentinel so existing
