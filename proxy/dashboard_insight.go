@@ -110,14 +110,22 @@ func dashboardInsightRequestAllowed(r *http.Request) bool {
 		return false
 	}
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" {
-		return true
+	if origin != "" {
+		return requestOriginMatchesHost(origin, r.Host)
 	}
-	parsed, err := url.Parse(origin)
+	referer := strings.TrimSpace(r.Header.Get("Referer"))
+	if referer != "" {
+		return requestOriginMatchesHost(referer, r.Host)
+	}
+	return true
+}
+
+func requestOriginMatchesHost(originOrReferer, host string) bool {
+	parsed, err := url.Parse(originOrReferer)
 	if err != nil || parsed.Host == "" {
 		return false
 	}
-	return strings.EqualFold(parsed.Host, r.Host)
+	return strings.EqualFold(parsed.Host, host)
 }
 
 // HandleDashboardInsight generates a short natural-language summary of the

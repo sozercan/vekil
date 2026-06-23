@@ -74,6 +74,16 @@ func TestHandleDashboardInsightRejectsCrossSite(t *testing.T) {
 		t.Fatalf("expected mismatched Origin to be rejected, got error=%q", got.Error)
 	}
 
+	// Older browser/webview requests may omit Sec-Fetch-Site; a cross-site Referer
+	// still proves this is not the dashboard origin and must be blocked.
+	reqBadReferer := httptest.NewRequest(http.MethodPost, "http://dashboard.local/dashboard/insight", nil)
+	reqBadReferer.Header.Set("Referer", "http://evil.local/page")
+	wBadReferer := httptest.NewRecorder()
+	h.HandleDashboardInsight(wBadReferer, reqBadReferer)
+	if got := decode(t, wBadReferer.Result().Body); !strings.Contains(got.Error, "cross-site") {
+		t.Fatalf("expected mismatched Referer to be rejected, got error=%q", got.Error)
+	}
+
 	// same-origin passes the CSRF guard. To prove it cleared the guard without
 	// triggering a real (nil-upstream) generation, pre-acquire the rate-limit
 	// gate that runs immediately after the guard: an allowed request then stops
