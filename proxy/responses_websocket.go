@@ -27,6 +27,37 @@ var (
 	responsesWebSocketPingPeriod = 30 * time.Second
 )
 
+var errResponsesWebSocketClientWrite = errors.New("responses websocket client write failed")
+
+type responsesWebSocketClientWriteError struct {
+	err error
+}
+
+func (e *responsesWebSocketClientWriteError) Error() string {
+	if e == nil || e.err == nil {
+		return errResponsesWebSocketClientWrite.Error()
+	}
+	return e.err.Error()
+}
+
+func (e *responsesWebSocketClientWriteError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func (e *responsesWebSocketClientWriteError) Is(target error) bool {
+	return target == errResponsesWebSocketClientWrite
+}
+
+func isResponsesWebSocketClientDisconnect(ctx context.Context, err error) bool {
+	if errors.Is(err, errResponsesWebSocketClientWrite) {
+		return true
+	}
+	return ctx != nil && ctx.Err() != nil
+}
+
 // errStreamFailedUpstream is a sentinel error indicating the upstream stream
 // ended with response.failed or response.incomplete after forwarding the
 // upstream failure event. This path also emits the standard websocket error
@@ -625,6 +656,9 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 
 	responseID, outputItems, turnUsage, err := s.streamUpstreamResponse(h, resp.Body, resp.Header)
 	if err != nil {
+		if isResponsesWebSocketClientDisconnect(s.ctx, err) {
+			return err
+		}
 		if errors.Is(err, errStreamFailedUpstream) {
 			// The upstream sent response.failed/incomplete; count it as an errored
 			// turn so it shows in the dashboard's error stats and recent log, with
@@ -1128,10 +1162,12 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 	// actual model used. The Codex CLI parses openai-model from
 	// codex.response.metadata frames via response_model().
 	if mappedHeaders := responsesWebSocketMetadataHeaders(headers); len(mappedHeaders) > 0 {
-		_ = s.writeJSON(map[string]interface{}{
+		if err := s.writeJSON(map[string]interface{}{
 			"type":    "codex.response.metadata",
 			"headers": mappedHeaders,
-		})
+		}); err != nil {
+			return "", nil, responsesUsage{}, &responsesWebSocketClientWriteError{err: err}
+		}
 	}
 
 	var responseID string
@@ -1159,7 +1195,7 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 
 		_ = s.conn.SetWriteDeadline(time.Now().Add(responsesWebSocketWriteWait))
 		if err := s.conn.WriteMessage(websocket.TextMessage, []byte(data)); err != nil {
-			return err
+			return &responsesWebSocketClientWriteError{err: err}
 		}
 
 		if !parsedEvent {

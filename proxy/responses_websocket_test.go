@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -110,6 +111,52 @@ func TestResponsesWebSocketCreateRequest_IgnoresInitiatorForSignatureAndUpstream
 		if _, ok := upstream[key]; ok {
 			t.Fatalf("upstream request should not include websocket field %q", key)
 		}
+	}
+}
+
+func TestResponsesWebSocketClientWriteErrorIsClientDisconnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !isResponsesWebSocketClientDisconnect(context.Background(), &responsesWebSocketClientWriteError{err: io.ErrClosedPipe}) {
+		t.Fatal("wrapped websocket write errors should be classified as client disconnects")
+	}
+	if !isResponsesWebSocketClientDisconnect(ctx, context.Canceled) {
+		t.Fatal("canceled session context should be classified as client disconnect")
+	}
+}
+
+func TestResponsesWebSocketStreamUpstreamResponseWrapsClientWriteError(t *testing.T) {
+	connCh := make(chan *websocket.Conn, 1)
+	done := make(chan struct{})
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		connCh <- conn
+		<-done
+		_ = conn.Close()
+	}))
+	defer server.Close()
+	defer close(done)
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	client, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	serverConn := <-connCh
+	_ = client.Close()
+	_ = serverConn.Close()
+
+	session := &responsesWebSocketSession{conn: serverConn, ctx: context.Background()}
+	stream := strings.NewReader("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n" +
+		"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n\n")
+	_, _, _, err = session.streamUpstreamResponse(nil, stream, nil)
+	if !errors.Is(err, errResponsesWebSocketClientWrite) {
+		t.Fatalf("streamUpstreamResponse error = %v, want client write sentinel", err)
 	}
 }
 
