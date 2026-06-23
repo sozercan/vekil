@@ -61,7 +61,7 @@ See [OpenAI Responses Compatibility](responses.md) for compaction, oversized rep
 
 ## `GET /healthz`
 
-Returns `{"status":"ok"}`.
+Returns `{"status":"ok"}` as soon as the HTTP listener is serving. This endpoint reports process liveness and does not wait for provider authentication.
 
 ## `GET /readyz`
 

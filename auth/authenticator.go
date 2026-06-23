@@ -57,11 +57,16 @@ var (
 // It handles the device code flow, token caching to disk, and automatic
 // refresh using a read-write mutex for concurrent access.
 type Authenticator struct {
-	tokenDir       string
-	accessToken    string
-	copilotToken   string
-	tokenExpiry    time.Time
-	mu             sync.RWMutex
+	tokenDir     string
+	accessToken  string
+	copilotToken string
+	tokenExpiry  time.Time
+	mu           sync.RWMutex
+
+	// deviceFlowMu serializes interactive logins without blocking readers that
+	// only want to know whether non-interactive credentials are already usable.
+	deviceFlowMu sync.Mutex
+
 	client         *http.Client
 	directClient   *http.Client
 	copilotBaseURL string // overridable for tests; defaults to https://api.github.com
@@ -290,6 +295,18 @@ func (a *Authenticator) getToken(ctx context.Context, allowDeviceFlow bool) (str
 		return a.getTokenFromEnv(ctx, envToken)
 	}
 
+	token, err := a.getTokenWithoutDeviceFlow(ctx)
+	if err == nil {
+		return token, nil
+	}
+	if !allowDeviceFlow || !IsInteractiveLoginRequired(err) {
+		return "", err
+	}
+
+	return a.getTokenWithDeviceFlow(ctx)
+}
+
+func (a *Authenticator) getTokenWithoutDeviceFlow(ctx context.Context) (string, error) {
 	a.mu.RLock()
 	if a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
 		token := a.copilotToken
@@ -309,10 +326,30 @@ func (a *Authenticator) getToken(ctx context.Context, allowDeviceFlow bool) (str
 		return a.copilotToken, nil
 	}
 
-	if err := a.refreshToken(ctx, allowDeviceFlow); err != nil {
+	if err := a.refreshToken(ctx, false); err != nil {
 		return "", err
 	}
 	return a.copilotToken, nil
+}
+
+func (a *Authenticator) getTokenWithDeviceFlow(ctx context.Context) (string, error) {
+	a.deviceFlowMu.Lock()
+	defer a.deviceFlowMu.Unlock()
+
+	// Another goroutine may have completed sign-in while this caller waited for
+	// the interactive-login slot.
+	token, err := a.getToken(ctx, false)
+	if err == nil {
+		return token, nil
+	}
+	if !IsInteractiveLoginRequired(err) {
+		return "", err
+	}
+
+	if err := a.deviceCodeFlow(ctx); err != nil {
+		return "", err
+	}
+	return a.getToken(ctx, false)
 }
 
 func (a *Authenticator) getTokenFromEnv(ctx context.Context, envToken string) (string, error) {
@@ -433,15 +470,12 @@ func (a *Authenticator) RequestDeviceCode(ctx context.Context) (*DeviceCodeRespo
 
 // PollForAuthorization polls GitHub until the user authorizes the device code,
 // then saves the access token and exchanges it for a Copilot API token.
-// It acquires the write lock internally.
 func (a *Authenticator) PollForAuthorization(ctx context.Context, dcResp *DeviceCodeResponse) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.deviceFlowMu.Lock()
+	defer a.deviceFlowMu.Unlock()
 	return a.pollForAuthorization(ctx, dcResp)
 }
 
-// pollForAuthorization is the internal implementation that must be called with
-// the write lock already held (or from PollForAuthorization which acquires it).
 func (a *Authenticator) pollForAuthorization(ctx context.Context, dcResp *DeviceCodeResponse) error {
 	interval := time.Duration(dcResp.Interval) * time.Second
 	if interval == 0 {
@@ -482,20 +516,7 @@ func (a *Authenticator) pollForAuthorization(ctx context.Context, dcResp *Device
 
 		switch atResp.Error {
 		case "":
-			a.accessToken = atResp.AccessToken
-			if err := a.saveAccessToken(); err != nil {
-				return fmt.Errorf("saving access token: %w", err)
-			}
-			if err := a.exchangeForCopilotToken(ctx); err != nil {
-				return err
-			}
-			if err := a.clearSignedOutMarker(); err != nil {
-				return fmt.Errorf("clearing signed-out marker: %w", err)
-			}
-			if err := a.setGitHubCLIAutoSignIn(false); err != nil {
-				return fmt.Errorf("saving auth preferences: %w", err)
-			}
-			return nil
+			return a.completeDeviceAuthorization(ctx, atResp.AccessToken)
 		case "authorization_pending":
 			continue
 		case "slow_down":
@@ -507,6 +528,26 @@ func (a *Authenticator) pollForAuthorization(ctx context.Context, dcResp *Device
 	}
 
 	return fmt.Errorf("device code flow timed out")
+}
+
+func (a *Authenticator) completeDeviceAuthorization(ctx context.Context, accessToken string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.accessToken = accessToken
+	if err := a.saveAccessToken(); err != nil {
+		return fmt.Errorf("saving access token: %w", err)
+	}
+	if err := a.exchangeForCopilotToken(ctx); err != nil {
+		return err
+	}
+	if err := a.clearSignedOutMarker(); err != nil {
+		return fmt.Errorf("clearing signed-out marker: %w", err)
+	}
+	if err := a.setGitHubCLIAutoSignIn(false); err != nil {
+		return fmt.Errorf("saving auth preferences: %w", err)
+	}
+	return nil
 }
 
 func (a *Authenticator) deviceCodeFlow(ctx context.Context) error {
@@ -523,6 +564,9 @@ func (a *Authenticator) deviceCodeFlow(ctx context.Context) error {
 // SignOut clears all authentication state from memory and removes persisted
 // token files from disk. It is safe for concurrent use.
 func (a *Authenticator) SignOut() error {
+	a.deviceFlowMu.Lock()
+	defer a.deviceFlowMu.Unlock()
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -552,6 +596,9 @@ func (a *Authenticator) SignOut() error {
 // GitHub CLI account. The GitHub CLI token is kept only in memory as a
 // short-lived Copilot bearer token and is never persisted by Vekil.
 func (a *Authenticator) SignInWithGitHubCLI(ctx context.Context) error {
+	a.deviceFlowMu.Lock()
+	defer a.deviceFlowMu.Unlock()
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
 

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -186,6 +187,153 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	if cliServe.responsesWebSocketConfig().Enabled {
 		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
 	}
+}
+
+func TestServeUntilContextDoneStartsServerBeforeCopilotAuthCompletes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	events := make(chan string, 4)
+	server := &fakeServeLifecycleServer{
+		startFn: func() error {
+			events <- "start"
+			return nil
+		},
+		stopFn: func(context.Context) error {
+			events <- "stop"
+			return nil
+		},
+	}
+	authenticator := &fakeServeStartupAuthenticator{
+		getTokenFn: func(ctx context.Context) (string, error) {
+			events <- "auth"
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- serveUntilContextDone(ctx, server, authenticator, true, logger.NewWithWriter(logger.LevelError, io.Discard))
+	}()
+
+	assertNextServeEvent(t, events, "start")
+	assertNextServeEvent(t, events, "auth")
+
+	select {
+	case err := <-done:
+		t.Fatalf("serveUntilContextDone returned while Copilot auth was still pending: %v", err)
+	default:
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("serveUntilContextDone after cancellation returned error: %v", err)
+	}
+	assertNextServeEvent(t, events, "stop")
+}
+
+func TestServeUntilContextDoneTreatsValidationCancellationAsShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	server := &fakeServeLifecycleServer{
+		validateFn: func(ctx context.Context) error {
+			cancel()
+			return ctx.Err()
+		},
+	}
+	authenticator := &fakeServeStartupAuthenticator{}
+
+	if err := serveUntilContextDone(ctx, server, authenticator, true, logger.NewWithWriter(logger.LevelError, io.Discard)); err != nil {
+		t.Fatalf("serveUntilContextDone returned error for shutdown during validation: %v", err)
+	}
+	if !server.stopped {
+		t.Fatal("expected server to be stopped after shutdown during validation")
+	}
+}
+
+func TestServeUntilContextDoneStopsServerOnCopilotAuthFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := &fakeServeLifecycleServer{}
+	authenticator := &fakeServeStartupAuthenticator{
+		getTokenFn: func(context.Context) (string, error) {
+			return "", fmt.Errorf("device code flow timed out")
+		},
+	}
+
+	err := serveUntilContextDone(ctx, server, authenticator, true, logger.NewWithWriter(logger.LevelError, io.Discard))
+	if err == nil {
+		t.Fatal("expected authentication failure")
+	}
+	if !strings.Contains(err.Error(), "authentication failed") {
+		t.Fatalf("expected authentication failure error, got %v", err)
+	}
+	if !server.stopped {
+		t.Fatal("expected server to be stopped after authentication failure")
+	}
+}
+
+func assertNextServeEvent(t *testing.T, events <-chan string, want string) {
+	t.Helper()
+	select {
+	case got := <-events:
+		if got != want {
+			t.Fatalf("next serve event = %q, want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for serve event %q", want)
+	}
+}
+
+type fakeServeLifecycleServer struct {
+	startFn            func() error
+	stopFn             func(context.Context) error
+	validateFn         func(context.Context) error
+	authPending        bool
+	authPendingUpdates []bool
+	started            bool
+	stopped            bool
+}
+
+func (f *fakeServeLifecycleServer) Start() error {
+	f.started = true
+	if f.startFn != nil {
+		return f.startFn()
+	}
+	return nil
+}
+
+func (f *fakeServeLifecycleServer) Stop(ctx context.Context) error {
+	f.stopped = true
+	if f.stopFn != nil {
+		return f.stopFn(ctx)
+	}
+	return nil
+}
+
+func (f *fakeServeLifecycleServer) ValidateDynamicProviderModels(ctx context.Context) error {
+	if f.validateFn != nil {
+		return f.validateFn(ctx)
+	}
+	return nil
+}
+
+func (f *fakeServeLifecycleServer) SetStartupAuthenticationPending(pending bool) {
+	f.authPending = pending
+	f.authPendingUpdates = append(f.authPendingUpdates, pending)
+}
+
+type fakeServeStartupAuthenticator struct {
+	getTokenFn func(context.Context) (string, error)
+}
+
+func (f *fakeServeStartupAuthenticator) GetToken(ctx context.Context) (string, error) {
+	if f.getTokenFn != nil {
+		return f.getTokenFn(ctx)
+	}
+	return "test-token", nil
 }
 
 func TestCommandFromArgs(t *testing.T) {

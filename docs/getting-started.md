@@ -84,7 +84,7 @@ Zero-config startup and explicit `type: "copilot"` providers need GitHub Copilot
 2. Vekil-managed cached credentials in `~/.config/vekil/`
 3. GitHub CLI auth, but only after `vekil login --github-cli` or `vekil login --gh`
 
-If none are available, first startup starts GitHub's device-code flow. You can also run `vekil login` ahead of time, `vekil login --force` for a fresh device-code sign-in, or `vekil logout` to clear Vekil-managed auth and disable silent GitHub CLI reuse.
+If none are available, first startup starts GitHub's device-code flow after binding the HTTP listener. During that one-time login window, `/healthz` is available for liveness probes and `/readyz` remains `not_ready` until authentication and upstream probing succeed. You can also run `vekil login` ahead of time, `vekil login --force` for a fresh device-code sign-in, or `vekil logout` to clear Vekil-managed auth and disable silent GitHub CLI reuse.
 
 ### Azure OpenAI and Microsoft Foundry
 

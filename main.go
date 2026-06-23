@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -282,6 +283,100 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 	}
 }
 
+type serveLifecycleServer interface {
+	Start() error
+	Stop(context.Context) error
+}
+
+type serveStartupAuthenticator interface {
+	GetToken(context.Context) (string, error)
+}
+
+type dynamicProviderModelValidator interface {
+	ValidateDynamicProviderModels(context.Context) error
+}
+
+type startupAuthenticationGate interface {
+	SetStartupAuthenticationPending(bool)
+}
+
+func serveUntilContextDone(ctx context.Context, srv serveLifecycleServer, authenticator serveStartupAuthenticator, usesCopilot bool, log *logger.Logger) error {
+	if gate, ok := srv.(startupAuthenticationGate); ok {
+		gate.SetStartupAuthenticationPending(usesCopilot)
+	}
+	if err := srv.Start(); err != nil {
+		return fmt.Errorf("server start error: %w", err)
+	}
+
+	if usesCopilot {
+		authDone := make(chan error, 1)
+		go func() {
+			if log != nil {
+				log.Info("authenticating with GitHub Copilot...")
+			}
+			_, err := authenticator.GetToken(ctx)
+			if err == nil && log != nil {
+				log.Info("authenticated successfully")
+			}
+			authDone <- err
+		}()
+
+		select {
+		case <-ctx.Done():
+			return stopServeServer(srv, log)
+		case err := <-authDone:
+			if err != nil {
+				if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+					return stopServeServer(srv, log)
+				}
+				authErr := fmt.Errorf("authentication failed: %w", err)
+				if stopErr := stopServeServer(srv, log); stopErr != nil {
+					return errors.Join(authErr, stopErr)
+				}
+				return authErr
+			}
+			if gate, ok := srv.(startupAuthenticationGate); ok {
+				gate.SetStartupAuthenticationPending(false)
+			}
+			if validator, ok := srv.(dynamicProviderModelValidator); ok {
+				if err := validator.ValidateDynamicProviderModels(ctx); err != nil {
+					if ctx.Err() != nil {
+						return stopServeServer(srv, log)
+					}
+					validationErr := fmt.Errorf("provider model validation failed: %w", err)
+					if stopErr := stopServeServer(srv, log); stopErr != nil {
+						return errors.Join(validationErr, stopErr)
+					}
+					return validationErr
+				}
+			}
+		}
+	}
+
+	<-ctx.Done()
+	return stopServeServer(srv, log)
+}
+
+func stopServeServer(srv serveLifecycleServer, log *logger.Logger) error {
+	if gate, ok := srv.(startupAuthenticationGate); ok {
+		gate.SetStartupAuthenticationPending(false)
+	}
+	if log != nil {
+		log.Info("shutting down...")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Stop(ctx); err != nil {
+		return fmt.Errorf("shutdown error: %w", err)
+	}
+	if log != nil {
+		log.Info("server stopped")
+	}
+	return nil
+}
+
 func runServe() {
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
@@ -298,15 +393,6 @@ func runServe() {
 		log.Fatal("failed to load providers config", logger.Err(err))
 	}
 
-	if providersCfg.UsesCopilot() {
-		log.Info("authenticating with GitHub Copilot...")
-		ctx := context.Background()
-		if _, err := authenticator.GetToken(ctx); err != nil {
-			log.Fatal("authentication failed", logger.Err(err))
-		}
-		log.Info("authenticated successfully")
-	}
-
 	srv, err := server.New(
 		authenticator,
 		log,
@@ -318,28 +404,21 @@ func runServe() {
 		server.WithCompactUpstreamChunkBytes(*serve.compactUpstreamChunkBytes),
 		server.WithCompactUpstreamChunkConcurrency(*serve.compactUpstreamChunkConcurrency),
 		server.WithCompactUpstreamMaxAttempts(*serve.compactUpstreamMaxAttempts),
-		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
+		server.WithProxyOptions(
+			proxy.WithProvidersConfig(providersCfg),
+			proxy.WithDeferredDynamicProviderModelValidation(providersCfg.UsesCopilot()),
+		),
 	)
 	if err != nil {
 		log.Fatal("failed to initialize server", logger.Err(err))
 	}
 
-	if err := srv.Start(); err != nil {
-		log.Fatal("server start error", logger.Err(err))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := serveUntilContextDone(ctx, srv, authenticator, providersCfg.UsesCopilot(), log); err != nil {
+		log.Fatal("serve error", logger.Err(err))
 	}
-
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
-	log.Info("shutting down...")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := srv.Stop(ctx); err != nil {
-		log.Fatal("shutdown error", logger.Err(err))
-	}
-	log.Info("server stopped")
 }
 
 func getEnv(key, fallback string) string {

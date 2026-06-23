@@ -49,6 +49,111 @@ func TestStart_ReturnsErrorWhenPortInUse(t *testing.T) {
 	}
 }
 
+func TestServerBlocksNonHealthRoutesWhileStartupAuthenticationPending(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+	srv.SetStartupAuthenticationPending(true)
+
+	for _, tc := range []struct {
+		method string
+		path   string
+		want   int
+	}{
+		{method: http.MethodGet, path: "/healthz", want: http.StatusOK},
+		{method: http.MethodGet, path: "/readyz", want: http.StatusServiceUnavailable},
+		{method: http.MethodGet, path: "/v1/models", want: http.StatusServiceUnavailable},
+		{method: http.MethodPost, path: "/v1/chat/completions", want: http.StatusServiceUnavailable},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{"model":"gpt-5.4"}`))
+			w := httptest.NewRecorder()
+			srv.httpServer.Handler.ServeHTTP(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != tc.want {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d: %s", resp.StatusCode, tc.want, body)
+			}
+			if tc.path != "/healthz" {
+				body, _ := io.ReadAll(resp.Body)
+				if !strings.Contains(string(body), "startup authentication pending") {
+					t.Fatalf("response missing startup auth pending message: %s", body)
+				}
+			}
+		})
+	}
+}
+
+func TestServerBlocksNonHealthRoutesWhileProviderValidationPending(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer upstream.Close()
+
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+		WithProxyOptions(
+			proxy.WithDeferredDynamicProviderModelValidation(true),
+			proxy.WithProvidersConfig(proxy.ProvidersConfig{
+				Providers: []proxy.ProviderConfig{
+					{ID: "copilot", Type: "copilot", Default: true},
+					{
+						ID:       "local",
+						Type:     "openai-compatible",
+						BaseURL:  upstream.URL,
+						AuthType: "none",
+						Models: []proxy.ProviderModelConfig{{
+							PublicID: "local-model",
+						}},
+					},
+				},
+			}),
+		),
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	for _, tc := range []struct {
+		method string
+		path   string
+		want   int
+	}{
+		{method: http.MethodGet, path: "/healthz", want: http.StatusOK},
+		{method: http.MethodGet, path: "/readyz", want: http.StatusServiceUnavailable},
+		{method: http.MethodGet, path: "/v1/models", want: http.StatusServiceUnavailable},
+		{method: http.MethodPost, path: "/v1/chat/completions", want: http.StatusServiceUnavailable},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{"model":"gpt-5.4"}`))
+			w := httptest.NewRecorder()
+			srv.httpServer.Handler.ServeHTTP(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != tc.want {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d: %s", resp.StatusCode, tc.want, body)
+			}
+			if tc.path != "/healthz" {
+				body, _ := io.ReadAll(resp.Body)
+				if !strings.Contains(string(body), "provider model validation pending") {
+					t.Fatalf("response missing pending validation message: %s", body)
+				}
+			}
+		})
+	}
+}
+
 func TestNew_ConfiguresExtendedWriteTimeout(t *testing.T) {
 	srv, err := New(
 		auth.NewTestAuthenticator("test-token"),
