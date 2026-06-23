@@ -55,6 +55,33 @@ jobs:
       - name: Vet
         run: make vet
 
+  k8s-smoke:
+    runs-on: ubuntu-latest
+    needs: [lint, build, test]
+    env:
+      KIND_VERSION: v0.32.0
+      KUBECTL_VERSION: v1.36.1
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install kind and kubectl
+        run: |
+          curl -fsSL -o /tmp/kind-linux-amd64 "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          curl -fsSL -o /tmp/kind.sha256sum "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64.sha256sum"
+          (cd /tmp && sha256sum -c kind.sha256sum)
+          sudo install -m 0755 /tmp/kind-linux-amd64 /usr/local/bin/kind
+
+          curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          curl -fsSL -o /tmp/kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
+          echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum -c -
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+
+          kind version
+          kubectl version --client=true
+
+      - name: Kubernetes liveness smoke
+        run: scripts/k8s-kind-smoke.sh
+
   e2e:
     runs-on: ubuntu-latest
     needs: [lint, build, test]

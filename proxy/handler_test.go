@@ -7023,6 +7023,122 @@ func TestHandleOpenAIChatCompletions_RejectsOpenAICodexProvider(t *testing.T) {
 	}
 }
 
+func TestNewProxyHandler_DefersConfiguredCopilotDynamicModelValidation(t *testing.T) {
+	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+
+	var modelHits atomic.Int32
+	copilotServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		modelHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.4","object":"model","created":0,"owned_by":"github-copilot"}]}`))
+	}))
+	defer copilotServer.Close()
+
+	authenticator, err := auth.NewAuthenticator(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewAuthenticator returned error: %v", err)
+	}
+
+	_, err = NewProxyHandler(
+		authenticator,
+		logger.New(logger.LevelInfo),
+		withCopilotBaseURLForTest(copilotServer.URL),
+		WithDeferredDynamicProviderModelValidation(true),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{ID: "copilot", Type: "copilot", Default: true},
+				{
+					ID:         "azure",
+					Type:       "azure-openai",
+					BaseURL:    "https://example.openai.azure.com/openai/v1",
+					APIVersion: "2025-04-01-preview",
+					APIKeyEnv:  "TEST_AZURE_API_KEY",
+					Models: []ProviderModelConfig{{
+						PublicID:   "azure-only",
+						Deployment: "azure-only",
+					}},
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+	if got := modelHits.Load(); got != 0 {
+		t.Fatalf("expected deferred startup to skip Copilot /models fetch, got %d hits", got)
+	}
+}
+
+func TestValidateDynamicProviderModelsLoadsDeferredConfiguredCopilotModels(t *testing.T) {
+	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+
+	copilotServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/models" {
+			t.Fatalf("expected /models lookup, got %s", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.4","object":"model","created":0,"owned_by":"github-copilot","supported_endpoints":["/responses"],"name":"GPT-5.4"}]}`))
+	}))
+	defer copilotServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		withCopilotBaseURLForTest(copilotServer.URL),
+		WithDeferredDynamicProviderModelValidation(true),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{ID: "copilot", Type: "copilot", Default: true},
+				{
+					ID:         "azure",
+					Type:       "azure-openai",
+					BaseURL:    "https://example.openai.azure.com/openai/v1",
+					APIVersion: "2025-04-01-preview",
+					APIKeyEnv:  "TEST_AZURE_API_KEY",
+					Models: []ProviderModelConfig{{
+						PublicID:   "azure-only",
+						Deployment: "azure-only",
+					}},
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+	if _, ok := handler.providerSetup().lookupModel("gpt-5.4"); ok {
+		t.Fatal("expected deferred Copilot model to be absent before validation")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	handler.HandleReadyz(w, req)
+	resp := w.Result()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("readyz before validation status = %d, want 503: %s", resp.StatusCode, body)
+	}
+	var ready map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&ready); err != nil {
+		t.Fatalf("decode readyz response: %v", err)
+	}
+	if ready["status"] != "not_ready" || !strings.Contains(ready["error"], "provider model validation pending") {
+		t.Fatalf("unexpected readyz response before validation: %+v", ready)
+	}
+
+	if err := handler.ValidateDynamicProviderModels(context.Background()); err != nil {
+		t.Fatalf("ValidateDynamicProviderModels returned error: %v", err)
+	}
+
+	model, ok := handler.providerSetup().lookupModel("gpt-5.4")
+	if !ok {
+		t.Fatal("expected deferred Copilot model to load after validation")
+	}
+	if model.providerID != "copilot" {
+		t.Fatalf("model provider = %q, want copilot", model.providerID)
+	}
+}
+
 func TestNewProxyHandler_FailsWhenProvidersSharePlainModelID(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 

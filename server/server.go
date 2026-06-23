@@ -122,6 +122,22 @@ func (r *responseRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
 
+func withProviderValidationGate(next http.Handler, handler *proxy.ProxyHandler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if handler != nil && (handler.StartupAuthenticationPending() || handler.DynamicProviderValidationPending()) && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" {
+			message := "provider model validation pending"
+			if handler.StartupAuthenticationPending() {
+				message = "startup authentication pending"
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = fmt.Fprintf(w, `{"error":{"message":%q,"type":"service_unavailable"}}`, message)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -225,7 +241,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	return &Server{
 		httpServer: &http.Server{
 			Addr:         addr,
-			Handler:      withRequestLog(mux, log, handler),
+			Handler:      withRequestLog(withProviderValidationGate(mux, handler), log, handler),
 			ReadTimeout:  30 * time.Second,
 			WriteTimeout: handler.ServerWriteTimeout(),
 			IdleTimeout:  120 * time.Second,
@@ -254,6 +270,21 @@ func (s *Server) Start() error {
 	}()
 
 	return nil
+}
+
+// SetStartupAuthenticationPending gates non-health routes while startup auth is in progress.
+func (s *Server) SetStartupAuthenticationPending(pending bool) {
+	if s.proxyHandler != nil {
+		s.proxyHandler.SetStartupAuthenticationPending(pending)
+	}
+}
+
+// ValidateDynamicProviderModels loads deferred dynamic provider catalogs.
+func (s *Server) ValidateDynamicProviderModels(ctx context.Context) error {
+	if s.proxyHandler == nil {
+		return nil
+	}
+	return s.proxyHandler.ValidateDynamicProviderModels(ctx)
 }
 
 // Stop performs a graceful shutdown of the server.
