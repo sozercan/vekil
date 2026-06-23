@@ -504,6 +504,14 @@ func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w h
 		if h != nil && h.log != nil {
 			h.log.Debug("responses stream copy failed after commit", logger.Err(err))
 		}
+		return
+	}
+
+	if ctx.Err() == nil && !tap.completedCleanly() {
+		observeResponseFailureStatus(ctx, http.StatusBadGateway)
+		if h != nil && h.log != nil {
+			h.log.Debug("responses stream ended before terminal event")
+		}
 	}
 }
 
@@ -689,12 +697,24 @@ type responsesFailureTap struct {
 	// event's framing is unrecoverable once dropped, so the normal dispatch path
 	// cannot parse it).
 	overflowed bool
+	// overflowActive remains true while forwarding the rest of an overflowed event.
+	// It is cleared once that event's blank-line boundary is observed.
+	overflowActive bool
+	// overflowCompletedEvent is set when the overflowed event appears to be a
+	// response.completed terminal event, either from its event/type prefix or from
+	// the terminal usage object recovered near the tail.
+	overflowCompletedEvent bool
+	overflowBoundaryTail   []byte
 	// overflowUsageRecorded is set once usage has been recovered from an
 	// overflowed event, to avoid redundant re-sniffing on every subsequent write.
 	overflowUsageRecorded bool
 	// usageTail is a bounded rolling window of the most recent raw stream bytes,
 	// used to recover usage from an oversized streamed response.completed event.
 	usageTail []byte
+	// terminalSeen is set after a parsed terminal Responses event. A clean EOF
+	// before response.completed/failed/incomplete means the committed stream was
+	// truncated and should not be counted as a successful 200.
+	terminalSeen bool
 }
 
 func newResponsesFailureTap(ctx context.Context, h *ProxyHandler, upstreamHeaders http.Header, store *ToolExecutionContextStore, scope string) *responsesFailureTap {
@@ -721,6 +741,9 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 	t.appendUsageTail(p)
 
 	t.parser.push(p)
+	if t.overflowActive {
+		t.observeOverflowBoundary(p)
+	}
 	for {
 		msg, ok := t.parser.nextSemantic()
 		if !ok {
@@ -737,6 +760,11 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 		// the parser buffer (its framing is unrecoverable) and flag overflow so
 		// later writes keep sniffing the tail.
 		t.overflowed = true
+		t.overflowActive = true
+		if responsesOverflowLooksCompleted(t.parser.pending) {
+			t.overflowCompletedEvent = true
+		}
+		t.overflowBoundaryTail = trailingBytes(t.parser.pending, 3)
 		t.sniffUsageFromOverflow(t.usageTail)
 		t.parser.pending = nil
 		t.parser.allowBOM = false
@@ -769,7 +797,36 @@ func (t *responsesFailureTap) sniffUsageFromOverflow(buf []byte) {
 	if usage, ok := extractResponsesUsageObject(buf); ok {
 		observeResponsesUsage(t.ctx, usage)
 		t.overflowUsageRecorded = true
+		t.overflowCompletedEvent = true
 	}
+}
+
+func (t *responsesFailureTap) observeOverflowBoundary(p []byte) {
+	if t == nil || !t.overflowActive {
+		return
+	}
+	combined := append(append([]byte(nil), t.overflowBoundaryTail...), p...)
+	if bytes.Contains(combined, []byte("\n\n")) || bytes.Contains(combined, []byte("\r\n\r\n")) {
+		t.overflowActive = false
+	}
+	t.overflowBoundaryTail = trailingBytes(combined, 3)
+}
+
+func trailingBytes(buf []byte, n int) []byte {
+	if n <= 0 || len(buf) == 0 {
+		return nil
+	}
+	if len(buf) > n {
+		buf = buf[len(buf)-n:]
+	}
+	return append([]byte(nil), buf...)
+}
+
+func responsesOverflowLooksCompleted(buf []byte) bool {
+	return bytes.Contains(buf, []byte("event: response.completed")) ||
+		bytes.Contains(buf, []byte("event:response.completed")) ||
+		bytes.Contains(buf, []byte(`"type":"response.completed"`)) ||
+		bytes.Contains(buf, []byte(`"type": "response.completed"`))
 }
 
 func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
@@ -792,6 +849,10 @@ func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
 	if eventName == "" {
 		eventName = eventType
 	}
+	switch eventName {
+	case "response.completed", "response.failed", "response.incomplete":
+		t.terminalSeen = true
+	}
 	if eventName == "response.completed" {
 		// Record token usage from the terminal event. This is best-effort: a
 		// response.completed larger than responsesFailureTapMaxBuffer is dropped
@@ -802,6 +863,16 @@ func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
 	}
 	t.maybeCaptureToolCommand(eventName, event)
 	t.maybeLog(eventName, event)
+}
+
+func (t *responsesFailureTap) completedCleanly() bool {
+	if t == nil {
+		return true
+	}
+	// If a giant response.completed event overflowed the bounded parser, treat it
+	// as complete only after that overflowed event's blank-line boundary is seen.
+	// Non-overflowing streams still require a parsed terminal event.
+	return t.terminalSeen || (t.overflowCompletedEvent && !t.overflowActive)
 }
 
 func (t *responsesFailureTap) maybeCaptureToolCommand(eventName string, event responsesWebSocketStreamEvent) {

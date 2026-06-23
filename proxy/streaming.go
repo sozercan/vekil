@@ -237,44 +237,46 @@ func streamOpenAIPassthrough(
 		return true
 	}
 
-	rawForwardOnly := false
+	rawForwardOversizedEvent := false
 	for {
 		line, err := readOpenAISSELine(reader)
 		if errors.Is(err, errOpenAISSELineTooLong) {
 			// A single SSE line exceeded the parse buffer (e.g. a very large
 			// tool-call argument). The returned bytes are valid but the line is
 			// truncated for parsing, so flush everything buffered for this event
-			// plus the partial line and forward it raw. This keeps the client
-			// stream intact and is not a failure. We switch to raw-forward mode so
-			// subsequent lines are written immediately, but keep tapping them for
-			// usage / error events so a terminal usage chunk or post-oversized
-			// error after the big line is still recorded.
+			// plus the partial line and forward the remainder of this event raw.
+			// Once the event boundary arrives, resume parsed event buffering so
+			// later usage-only chunks injected by this proxy can still be dropped.
 			for _, l := range pending {
 				if _, werr := io.WriteString(w, l); werr != nil {
 					return
 				}
 			}
 			pending = pending[:0]
+			accumulator = sseDataAccumulator{}
+			dropCurrent = false
 			if _, werr := io.WriteString(w, line); werr != nil {
 				return
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
-			rawForwardOnly = true
+			rawForwardOversizedEvent = true
 			continue
 		}
 		if len(line) > 0 {
-			if rawForwardOnly {
-				// Forward the line immediately (no drop-buffering after an oversized
-				// line) while still feeding the parser for usage/error detection.
+			if rawForwardOversizedEvent {
 				if _, werr := io.WriteString(w, line); werr != nil {
 					return
 				}
 				if flusher != nil {
 					flusher.Flush()
 				}
-				accumulator.consumeLine(line, processData)
+				if strings.TrimRight(line, "\r\n") == "" {
+					rawForwardOversizedEvent = false
+					accumulator = sseDataAccumulator{}
+					dropCurrent = false
+				}
 			} else {
 				pending = append(pending, line)
 				isBoundary := strings.TrimRight(line, "\r\n") == ""
@@ -284,6 +286,7 @@ func streamOpenAIPassthrough(
 				}
 			}
 		}
+
 		if err != nil {
 			if err == io.EOF {
 				break

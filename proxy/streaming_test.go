@@ -129,6 +129,48 @@ func TestStreamOpenAIPassthroughDroppingInjectedUsage(t *testing.T) {
 	}
 }
 
+func TestStreamOpenAIPassthroughDroppingInjectedUsageAfterOversizedEvent(t *testing.T) {
+	content := models.OpenAIStreamChunk{
+		ID:      "chatcmpl-oversized",
+		Object:  "chat.completion.chunk",
+		Model:   "gpt-4o",
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{Content: json.RawMessage(`"hi"`)}}},
+	}
+	usageOnly := models.OpenAIStreamChunk{
+		ID:     "chatcmpl-oversized",
+		Object: "chat.completion.chunk",
+		Model:  "gpt-4o",
+		Usage:  &models.OpenAIUsage{PromptTokens: 7, CompletionTokens: 3, TotalTokens: 10},
+	}
+
+	huge := strings.Repeat("x", openAIStreamScannerMaxBuffer+4096)
+	var stream strings.Builder
+	stream.WriteString("data: " + mustMarshal(t, content) + "\n\n")
+	stream.WriteString("data: " + huge + "\n\n")
+	stream.WriteString("data: " + mustMarshal(t, usageOnly) + "\n\n")
+	stream.WriteString("data: [DONE]\n\n")
+
+	w := httptest.NewRecorder()
+	var captured *models.OpenAIUsage
+	StreamOpenAIPassthroughDroppingInjectedUsage(w, io.NopCloser(strings.NewReader(stream.String())), nil, func(u *models.OpenAIUsage) {
+		captured = u
+	})
+
+	out := w.Body.String()
+	if !strings.Contains(out, huge) {
+		t.Fatal("oversized event should be forwarded unchanged")
+	}
+	if !strings.Contains(out, "data: [DONE]") {
+		t.Fatal("[DONE] should still be forwarded after oversized event")
+	}
+	if strings.Contains(out, `"total_tokens":10`) || strings.Contains(out, `"usage"`) {
+		t.Fatal("usage-only chunk leaked to client after oversized event")
+	}
+	if captured == nil || captured.TotalTokens != 10 {
+		t.Fatalf("usage callback = %#v, want total tokens 10", captured)
+	}
+}
+
 func TestStreamOpenAIPassthroughDroppingInjectedUsage_KeepsUsageWithChoices(t *testing.T) {
 	// A chunk that carries usage AND choices is a normal content chunk (some
 	// upstreams attach usage to the final content delta); it must be forwarded,

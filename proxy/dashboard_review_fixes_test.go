@@ -645,6 +645,22 @@ func TestStreamResponsesPipeMarksFailureOnCopyError(t *testing.T) {
 	}
 }
 
+// TestStreamResponsesPipeMarksFailureOnCleanEOFBeforeTerminal covers a cleanly
+// closed upstream stream that never emits response.completed/failed/incomplete.
+// Even though io.Copy returns nil, the committed Responses stream is truncated
+// at the protocol level and must not be counted as a successful 200.
+func TestStreamResponsesPipeMarksFailureOnCleanEOFBeforeTerminal(t *testing.T) {
+	ctx, summary := WithRequestSummary(context.Background())
+	r := io.NopCloser(strings.NewReader("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-clean-eof\"}}\n\n"))
+	w := httptest.NewRecorder()
+
+	streamResponsesPipeWithFailureLog(ctx, &ProxyHandler{log: logger.New(logger.LevelError)}, w, r, nil, nil, "")
+
+	if summary.FailureStatus() != http.StatusBadGateway {
+		t.Fatalf("FailureStatus = %d want 502 (clean EOF before terminal Responses event)", summary.FailureStatus())
+	}
+}
+
 type erroringReader struct {
 	data []byte
 	done bool
