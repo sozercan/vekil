@@ -545,7 +545,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 
-	resp, bodyBytes, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, bodyBytes, mode)
+	resp, _, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, bodyBytes, mode)
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
