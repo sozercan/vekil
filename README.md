@@ -72,6 +72,7 @@ Documentation lives under [`docs/`](docs/README.md); start with these:
 | [Client Examples](docs/clients.md)                           | Copy-paste snippets per client      |
 | [API Reference](docs/api.md)                                 | Endpoint behavior and compatibility |
 | [Architecture](docs/architecture.md)                         | Package layout and design notes     |
+| [Traffic Dashboard](docs/dashboard.md)                       | Live browser dashboard and stats    |
 | [Tray App](docs/menubar.md)                                  | macOS/Linux menubar usage           |
 | [Development](docs/development.md)                           | Build, test, benchmarks, CI         |
 

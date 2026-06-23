@@ -1,0 +1,36 @@
+# Anthropic provider with dashboard insights powered by Claude Opus 4.8.
+#
+# `insight_model` enables the dashboard's "Generate insights" button: when a
+# user clicks it, Vekil sends the current traffic snapshot to this model through
+# its own /v1/chat/completions path and shows the model's summary in the banner.
+# Leave `insight_model` unset to hide the button.
+#
+# The model named by `insight_model` must be one this config serves. Here that is
+# Claude Opus 4.8: the public id `claude-opus-4.8` (Vekil normalizes model names
+# to dotted form) maps to the upstream model `claude-opus-4-8` via `deployment`.
+#
+# Run:
+#   ANTHROPIC_API_KEY=sk-ant-... \
+#     vekil --providers-config examples/anthropic-with-insights.yaml
+#   open http://127.0.0.1:1337/dashboard   # click "Generate insights"
+
+insight_model: claude-opus-4.8
+
+providers:
+  - id: anthropic
+    type: openai-compatible            # Anthropic's OpenAI-compatible endpoint
+    base_url: https://api.anthropic.com/v1
+    auth_type: api-key-header          # sends the key in the auth_header below
+    auth_header: x-api-key
+    api_key_env: ANTHROPIC_API_KEY
+    model_discovery: static
+    default: true
+    models:
+      - public_id: claude-opus-4.8
+        deployment: claude-opus-4-8    # upstream model id
+        endpoints:
+          - /chat/completions
+      - public_id: claude-sonnet-4.6
+        deployment: claude-sonnet-4-6
+        endpoints:
+          - /chat/completions

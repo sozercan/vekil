@@ -81,7 +81,16 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	if forceStream {
 		streamFlag := true
 		oaiReq.Stream = &streamFlag
+	}
+	streamUsageInjected := false
+	if forceStream || stream {
+		// Force-streamed or client-streamed: request a usage chunk so the
+		// request records tokens (the usage callback on the stream branch reads
+		// it). The translated Gemini stream consumes the OpenAI usage chunk, so
+		// it is not forwarded raw to the client. A strict OpenAI-compatible
+		// provider may reject stream_options; retry once without it on 400.
 		oaiReq.StreamOptions = &models.StreamOptions{IncludeUsage: true}
+		streamUsageInjected = true
 	}
 
 	oaiBody, err := json.Marshal(oaiReq)
@@ -90,7 +99,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		return
 	}
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(stream || forceStream)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), stream || forceStream)
 	defer upstreamCancel()
 
 	resp, err := h.postChatCompletions(upstreamCtx, oaiBody)
@@ -99,6 +108,12 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		return
 	}
 
+	mode := chatCompletionsMode{
+		clientRequestedStream: stream,
+		forceUpstreamStream:   forceStream,
+		injectedStreamUsage:   streamUsageInjected,
+	}
+	resp, oaiBody, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, oaiBody, mode)
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	if resp.StatusCode != http.StatusOK {
@@ -116,13 +131,9 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		return
 	}
 
-	mode := chatCompletionsMode{
-		clientRequestedStream: stream,
-		forceUpstreamStream:   forceStream,
-	}
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			StreamOpenAIToGeminiWithFinalResponse(w, resp.Body, h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope))
+			StreamOpenAIToGeminiWithFinalResponse(w, resp.Body, func(status int) { observeResponseFailureStatus(r.Context(), status) }, h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope), openAIChatStreamUsageCallback(r.Context()))
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)

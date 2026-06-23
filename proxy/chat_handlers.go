@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,15 @@ import (
 type chatCompletionsMode struct {
 	clientRequestedStream bool
 	forceUpstreamStream   bool
+	// injectedStreamUsage is true when the proxy added stream_options.include_usage
+	// to a streamed upstream request. If a strict OpenAI-compatible provider rejects
+	// that optional field with 400, the request can be retried once without it.
+	injectedStreamUsage bool
+	// injectedClientStreamUsage is true when the proxy added
+	// stream_options.include_usage to a client-requested stream that did not opt
+	// in. On the verbatim OpenAI passthrough the resulting upstream usage-only
+	// chunk must be dropped from the client stream (it never requested it).
+	injectedClientStreamUsage bool
 }
 
 type chatCompletionsResponseHandlers struct {
@@ -46,6 +56,17 @@ func prepareOpenAIChatCompletionsRequest(body []byte) ([]byte, chatCompletionsMo
 	body = injectParallelToolCalls(body)
 	if mode.forceUpstreamStream {
 		body = injectForceStream(body)
+		mode.injectedStreamUsage = true
+	} else if mode.clientRequestedStream {
+		// Ask upstream for a usage chunk so streamed traffic records tokens.
+		// Record whether we actually injected it (the client supplied no
+		// stream_options): if so, the resulting upstream usage-only chunk is
+		// dropped from the verbatim passthrough so the client does not receive a
+		// terminal chunk it never opted into.
+		var injected bool
+		body, injected = ensureStreamUsage(body)
+		mode.injectedStreamUsage = injected
+		mode.injectedClientStreamUsage = injected
 	}
 	return body, mode
 }
@@ -60,10 +81,18 @@ func prepareAnthropicChatCompletionsRequest(req *models.AnthropicRequest) ([]byt
 		clientRequestedStream: req.Stream,
 		forceUpstreamStream:   !req.Stream,
 	}
-	if mode.forceUpstreamStream {
-		stream := true
-		oaiReq.Stream = &stream
+	if mode.forceUpstreamStream || mode.clientRequestedStream {
+		// Force-streamed or client-streamed: ask upstream for a usage chunk so
+		// the request records tokens. For force-stream we also set stream:true;
+		// for a client stream the request already streams, we only add the
+		// usage option. A strict OpenAI-compatible provider may reject
+		// stream_options; callers retry once without it when that happens.
+		if mode.forceUpstreamStream {
+			stream := true
+			oaiReq.Stream = &stream
+		}
 		oaiReq.StreamOptions = &models.StreamOptions{IncludeUsage: true}
+		mode.injectedStreamUsage = true
 	}
 
 	body, err := json.Marshal(oaiReq)
@@ -129,7 +158,7 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 	streaming := req != nil && req.Stream
 	publicModel, upstreamModel := h.directAnthropicResponseModels(req)
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(streaming)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), streaming)
 	defer upstreamCancel()
 
 	resp, err := h.postAnthropicMessages(upstreamCtx, body, anthropicExtraHeadersFromRequest(r))
@@ -145,11 +174,11 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 	}
 
 	if resp.StatusCode == http.StatusOK && streaming {
-		writeDirectAnthropicStreamResponse(w, resp, publicModel, upstreamModel)
+		writeDirectAnthropicStreamResponse(r.Context(), w, resp, publicModel, upstreamModel)
 		return
 	}
 	if resp.StatusCode == http.StatusOK {
-		if err := writeDirectAnthropicJSONResponse(w, resp, publicModel, upstreamModel); err != nil {
+		if err := writeDirectAnthropicJSONResponse(r.Context(), w, resp, publicModel, upstreamModel); err != nil {
 			h.log.Error("upstream response rewrite failed", logger.F("endpoint", "anthropic"), logger.Err(err))
 			writeAnthropicError(w, http.StatusBadGateway, "api_error", "failed to read upstream response")
 		}
@@ -271,7 +300,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	}
 	oaiBody = h.rewriteOpenAIChatRequestBodyWithToolOptimizers(r.Context(), oaiBody, h.toolContexts, scope)
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 
 	resp, err := h.postChatCompletions(upstreamCtx, oaiBody)
@@ -286,6 +315,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	resp, oaiBody, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, oaiBody, mode)
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	if resp.StatusCode != http.StatusOK {
@@ -310,7 +340,9 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 				resp.Body,
 				req.Model,
 				"msg_"+uuid.New().String(),
+				func(status int) { observeResponseFailureStatus(r.Context(), status) },
 				h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope),
+				openAIChatStreamUsageCallback(r.Context()),
 			)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
@@ -498,7 +530,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	h.observeRequestSummary(r.Context(), "openai_chat", requestedModel, mode.clientRequestedStream, providerEndpointChatCompletions)
 	bodyBytes = h.rewriteOpenAIChatRequestBodyWithToolOptimizers(r.Context(), bodyBytes, h.toolContexts, scope)
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(mode.clientRequestedStream || mode.forceUpstreamStream)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 
 	resp, err := h.postChatCompletions(upstreamCtx, bodyBytes)
@@ -513,12 +545,21 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 
+	resp, _, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, bodyBytes, mode)
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
 			copyPassthroughHeaders(w.Header(), resp.Header)
-			StreamOpenAIPassthroughWithFinalResponse(w, resp.Body, h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope), openAIChatStreamUsageCallback(r.Context()))
+			finalResponse := h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope)
+			usage := openAIChatStreamUsageCallback(r.Context())
+			// A post-commit upstream stream error (the 200 header is already sent)
+			// should be recorded as a failed request with its classified status
+			// (e.g. 429 for a rate limit), not a 2xx success.
+			onError := func(status int) { observeResponseFailureStatus(r.Context(), status) }
+			// dropInjectedUsage drops the upstream usage-only chunk the proxy asked
+			// for when the client did not opt into stream_options.include_usage.
+			StreamOpenAIChatPassthrough(w, resp.Body, mode.injectedClientStreamUsage, onError, finalResponse, usage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
@@ -660,4 +701,71 @@ func injectForceStream(body []byte) []byte {
 		return body
 	}
 	return result
+}
+
+// ensureStreamUsage asks the upstream to emit a final usage chunk on a
+// client-requested stream by setting stream_options.include_usage. Without it,
+// many upstreams omit token usage from streamed responses and the proxy records
+// zero tokens. It is merge-safe: if the client already supplied stream_options,
+// their choice is left untouched (they may have deliberately set include_usage
+// false or other options). The bool result reports whether include_usage was
+// actually injected (true only when the client supplied no stream_options), so
+// the caller can drop the resulting upstream usage-only chunk from a verbatim
+// passthrough the client never opted into.
+func ensureStreamUsage(body []byte) ([]byte, bool) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body, false
+	}
+	if _, ok := m["stream_options"]; ok {
+		return body, false
+	}
+	m["stream_options"] = json.RawMessage(`{"include_usage":true}`)
+	result, err := json.Marshal(m)
+	if err != nil {
+		return body, false
+	}
+	return result, true
+}
+
+func stripStreamOptions(body []byte) ([]byte, bool) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body, false
+	}
+	if _, ok := m["stream_options"]; !ok {
+		return body, false
+	}
+	delete(m, "stream_options")
+	result, err := json.Marshal(m)
+	if err != nil {
+		return body, false
+	}
+	return result, true
+}
+
+func (h *ProxyHandler) retryChatCompletionsWithoutInjectedStreamOptions(ctx context.Context, resp *http.Response, body []byte, mode chatCompletionsMode) (*http.Response, []byte, chatCompletionsMode) {
+	if h == nil || resp == nil || resp.StatusCode != http.StatusBadRequest || !mode.injectedStreamUsage {
+		return resp, body, mode
+	}
+	fallbackBody, ok := stripStreamOptions(body)
+	if !ok {
+		return resp, body, mode
+	}
+	retryResp, err := h.postChatCompletions(ctx, fallbackBody)
+	if err != nil {
+		if h != nil && h.log != nil {
+			h.log.Debug("retry without stream_options failed", logger.Err(err))
+		}
+		return resp, body, mode
+	}
+	if resp.Body != nil {
+		drainAndClose(resp.Body)
+	}
+	mode.injectedStreamUsage = false
+	mode.injectedClientStreamUsage = false
+	if h != nil && h.log != nil {
+		h.log.Debug("retried chat completions without injected stream_options", logger.F("status", retryResp.StatusCode))
+	}
+	return retryResp, fallbackBody, mode
 }

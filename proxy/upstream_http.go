@@ -9,16 +9,35 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/sozercan/vekil/models"
 )
 
 func (h *ProxyHandler) newInferenceUpstreamContext(streaming bool) (context.Context, context.CancelFunc) {
+	return h.newInferenceUpstreamContextFrom(context.Background(), streaming)
+}
+
+// newInferenceUpstreamContextFrom builds the upstream request context the same
+// way as newInferenceUpstreamContext (background-rooted with a timeout, so a
+// client disconnect does not cancel the upstream call) but copies the
+// retry-stats tracked marker from the inbound request context when present. The
+// background root deliberately strips inherited values, so this explicit copy is
+// what lets a tracked inference request's upstream retries be counted while
+// non-tracked callers (insight, model-catalog fetch, count-token probes) stay
+// uncounted. Pass the inbound r.Context(); a context without the marker (e.g.
+// context.Background()) yields an untracked upstream context.
+func (h *ProxyHandler) newInferenceUpstreamContextFrom(inbound context.Context, streaming bool) (context.Context, context.CancelFunc) {
 	// Use background context with timeout to avoid cancellation from client
 	// disconnects while still preventing goroutine leaks on upstream hangs.
 	timeout := upstreamTimeout
 	if streaming {
 		timeout = h.effectiveStreamingUpstreamTimeout()
 	}
-	return context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	if isRetryStatsTracked(inbound) {
+		ctx = markRetryStatsTracked(ctx)
+	}
+	return ctx, cancel
 }
 
 func upstreamStatusCode(err error, fallback int) int {
@@ -250,12 +269,94 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func writeDirectAnthropicJSONResponse(w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) error {
+// writeOpenAIPassthroughObservingUsage writes a non-streaming OpenAI chat
+// response to the client byte-for-byte while sniffing usage tokens for traffic
+// stats. It preserves the near-zero-copy contract: the original body bytes and
+// headers (including Content-Length) are sent unchanged; only a best-effort
+// usage parse is layered on top, and any parse failure is silently ignored.
+// Memory is bounded: bodies larger than usageSniffMaxBuffer stream through
+// without a usage parse rather than being buffered whole (see
+// writePassthroughSniffingUsage).
+func (h *ProxyHandler) writeOpenAIPassthroughObservingUsage(ctx context.Context, w http.ResponseWriter, resp *http.Response) {
+	writePassthroughSniffingUsage(w, resp, func(body []byte) {
+		observeOpenAIUsage(ctx, sniffOpenAIUsage(body))
+	})
+}
+
+// usageSniffMaxBuffer bounds how much of a non-streaming upstream response the
+// proxy buffers in memory solely to parse its usage block for traffic stats.
+// Real LLM JSON responses — even very large completions — sit well under this,
+// so usage is captured for all realistic traffic; the cap only prevents a
+// single pathological multi-megabyte body (or many concurrent ones) from being
+// buffered whole. Oversized bodies stream through with usage stats skipped.
+const usageSniffMaxBuffer = 4 << 20 // 4 MiB
+
+// writePassthroughSniffingUsage writes a non-streaming upstream response to the
+// client while buffering at most usageSniffMaxBuffer bytes to sniff usage via
+// the supplied parse callback. A body that fits the cap is buffered, parsed, and
+// written back byte-for-byte (headers, including Content-Length, untouched). A
+// body that exceeds the cap is not buffered whole: the bounded prefix is written
+// and the remainder is streamed through with io.Copy, so proxy memory stays
+// bounded at the cost of skipping usage stats for that one oversized response
+// (fail-open). Non-200 responses and read errors fall back to a plain copy.
+func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, sniff func([]byte)) {
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		copyPassthroughHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+		return
+	}
+
+	// Read one byte past the cap so we can tell a full body from an oversized one.
+	prefix, err := io.ReadAll(io.LimitReader(resp.Body, usageSniffMaxBuffer+1))
+	copyPassthroughHeaders(w.Header(), resp.Header)
+	if err != nil {
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(prefix)
+		return
+	}
+
+	if len(prefix) <= usageSniffMaxBuffer {
+		// Whole body fits: parse usage, then write the same bytes unchanged.
+		sniff(prefix)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(prefix)
+		return
+	}
+
+	// Oversized: skip the usage parse and stream prefix + remainder so memory
+	// stays bounded. Total bytes written equal the full body, so any
+	// Content-Length header copied above remains correct.
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(prefix)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// sniffOpenAIUsage extracts the usage block from a non-streaming OpenAI chat
+// completion body without disturbing the rest of the payload. It returns nil
+// when the body is not valid JSON or carries no usage, so callers can pass the
+// result straight to observeOpenAIUsage.
+func sniffOpenAIUsage(body []byte) *models.OpenAIUsage {
+	var parsed struct {
+		Usage *models.OpenAIUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil
+	}
+	return parsed.Usage
+}
+
+func writeDirectAnthropicJSONResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) error {
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
+	}
+	if resp.StatusCode == http.StatusOK {
+		observeAnthropicUsageBody(ctx, body)
 	}
 	rewritten, changed := rewriteAnthropicResponseModelJSON(body, publicModel, upstreamModel)
 
@@ -268,14 +369,14 @@ func writeDirectAnthropicJSONResponse(w http.ResponseWriter, resp *http.Response
 	return nil
 }
 
-func writeDirectAnthropicStreamResponse(w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) {
+func writeDirectAnthropicStreamResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) {
 	defer func() { _ = resp.Body.Close() }()
 
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.Header().Del("Content-Length")
 	setSSEHeaders(w)
 	w.WriteHeader(resp.StatusCode)
-	streamAnthropicPassthroughBody(w, resp.Body, publicModel, upstreamModel)
+	streamAnthropicPassthroughBody(ctx, w, resp.Body, publicModel, upstreamModel)
 }
 
 func rewriteAnthropicResponseModelJSON(body []byte, publicModel, upstreamModel string) ([]byte, bool) {

@@ -3,8 +3,10 @@ package proxy
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 
 	"github.com/sozercan/vekil/models"
@@ -59,13 +61,24 @@ func parseSSEEventLine(line string) (string, bool) {
 	return strings.TrimSpace(eventType), true
 }
 
+// errOpenAISSELineTooLong is returned by readOpenAISSELine when a single SSE
+// line exceeds openAIStreamScannerMaxBuffer. The accumulated bytes read so far
+// are returned alongside the error so a forwarding caller can write them to the
+// client and fall back to raw passthrough of the remainder (the bytes are valid,
+// just too large to buffer for parsing) rather than treating it as a failure.
+var errOpenAISSELineTooLong = errors.New("SSE line exceeds maximum buffer")
+
 func readOpenAISSELine(reader *bufio.Reader) (string, error) {
 	var line strings.Builder
 	for {
 		fragment, err := reader.ReadSlice('\n')
 		if len(fragment) > 0 {
 			if line.Len()+len(fragment) > openAIStreamScannerMaxBuffer {
-				return "", fmt.Errorf("SSE line exceeds %d bytes", openAIStreamScannerMaxBuffer)
+				// Return what we have so the caller can still forward it; the rest of
+				// this line remains in the reader and is drained by the caller's raw
+				// fallback copy.
+				line.Write(fragment)
+				return line.String(), errOpenAISSELineTooLong
 			}
 			line.Write(fragment)
 		}
@@ -83,6 +96,32 @@ type openAIStreamError struct {
 	Type    string
 	Code    string
 	Message string
+}
+
+// httpStatus maps an OpenAI-style stream error to an HTTP status so a
+// post-commit stream failure is recorded with its real semantic status (e.g.
+// 429 for a rate limit, 503 for an overload) rather than a generic bad gateway.
+func (e *openAIStreamError) httpStatus() int {
+	if e == nil {
+		return http.StatusBadGateway
+	}
+	switch strings.ToLower(strings.TrimSpace(e.Code)) {
+	case "too_many_requests", "rate_limit_exceeded", "rate_limit_error":
+		return http.StatusTooManyRequests
+	case "model_overloaded", "engine_overloaded", "overloaded_error", "service_unavailable":
+		return http.StatusServiceUnavailable
+	case "gateway_timeout", "timeout":
+		return http.StatusGatewayTimeout
+	case "bad_gateway":
+		return http.StatusBadGateway
+	}
+	switch strings.ToLower(strings.TrimSpace(e.Type)) {
+	case "rate_limit_error", "rate_limit_exceeded":
+		return http.StatusTooManyRequests
+	case "overloaded_error":
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadGateway
 }
 
 func (e *openAIStreamError) Error() string {

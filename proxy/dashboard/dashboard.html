@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vekil Traffic</title>
+<link rel="stylesheet" href="/dashboard/uPlot.min.css">
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2230;
+    --border: #2a3038;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --accent-2: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    padding: 20px;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--muted); box-shadow: 0 0 0 3px rgba(139,148,158,.15);
+  }
+  .dot.live { background: var(--accent-2); box-shadow: 0 0 0 3px rgba(63,185,80,.2); }
+  .dot.stale { background: var(--err); box-shadow: 0 0 0 3px rgba(248,81,73,.2); }
+  .sub { color: var(--muted); font-size: 12px; }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+  }
+  .card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .card .value { font-size: 26px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .card .value small { font-size: 13px; color: var(--muted); font-weight: 400; }
+  .card .card-sub { color: var(--muted); font-size: 11.5px; margin-top: 2px; min-height: 14px; }
+  .recent-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .recent-toggle { color: var(--muted); font-size: 12.5px; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+  .recent-table { display: flex; flex-direction: column; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .recent-row {
+    display: grid;
+    grid-template-columns: 58px 64px 1fr 110px 70px 70px 1fr;
+    gap: 10px; align-items: center;
+    padding: 5px 8px; border-radius: 6px;
+  }
+  .recent-row:nth-child(odd) { background: var(--panel-2); }
+  .recent-row.head { color: var(--muted); text-transform: uppercase; font-size: 10.5px; letter-spacing: .04em; background: none; }
+  .recent-row .ago { color: var(--muted); }
+  .recent-row .st { font-weight: 650; }
+  .recent-row .st.s2 { color: var(--accent-2); }
+  .recent-row .st.s3 { color: var(--accent); }
+  .recent-row .st.s4 { color: var(--warn); }
+  .recent-row .st.s5 { color: var(--err); }
+  .recent-row .cell-ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .recent-row .rid { color: var(--muted); cursor: pointer; }
+  .recent-row .rid:hover { color: var(--accent); text-decoration: underline; }
+  .grid {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+  .controls {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin-bottom: 12px; font-size: 13px; color: var(--muted);
+  }
+  .controls-label { font-weight: 600; color: var(--text); }
+  .controls label { display: inline-flex; align-items: center; gap: 6px; }
+  .controls select, .filter-input {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 7px;
+    padding: 6px 9px; font: inherit; font-size: 13px;
+  }
+  .controls select:focus, .filter-input:focus { outline: none; border-color: var(--accent); }
+  .filter-input { min-width: 200px; }
+  .filter-clear {
+    background: var(--panel-2); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 7px;
+    padding: 6px 10px; font: inherit; cursor: pointer;
+  }
+  .filter-clear:hover { color: var(--text); border-color: var(--accent); }
+  .usage-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 12px;
+  }
+  .usage {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+  .usage .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .usage .uval { font-size: 22px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .usage .usub { color: var(--muted); font-size: 11.5px; margin-top: 2px; min-height: 14px; }
+  .bar-fill.err {
+    background: linear-gradient(90deg, rgba(248,81,73,.38), rgba(248,81,73,.16));
+    border-right: 2px solid var(--err);
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .panel h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
+    color: var(--muted); margin: 0 0 6px;
+  }
+  .desc { color: var(--muted); font-size: 12px; margin: 0 0 12px; line-height: 1.4; }
+  .narrative {
+    background: linear-gradient(90deg, rgba(88,166,255,.10), rgba(63,185,80,.05));
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius);
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    font-size: 14px;
+    line-height: 1.5;
+    min-height: 20px;
+  }
+  .narrative b { color: var(--text); font-weight: 650; }
+  .narrative-wrap { display: flex; align-items: stretch; gap: 12px; margin-bottom: 12px; }
+  .narrative-wrap .narrative { flex: 1; margin-bottom: 0; }
+  .ai-insight {
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent-2);
+    border-radius: var(--radius);
+    background: linear-gradient(90deg, rgba(63,185,80,.12), rgba(88,166,255,.04));
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .ai-insight.loading { opacity: .7; }
+  .ai-insight .ai-label { color: var(--accent-2); font-weight: 650; }
+  .ai-insight b { color: var(--text); font-weight: 650; }
+  .insight-btn {
+    align-self: center;
+    white-space: nowrap;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 9px 14px;
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    transition: background .15s ease, border-color .15s ease;
+  }
+  .insight-btn:hover:not(:disabled) { background: #232b3a; border-color: var(--accent); }
+  .insight-btn:disabled { opacity: .55; cursor: default; }
+  .chart { width: 100%; }
+  .bars { display: flex; flex-direction: column; gap: 8px; }
+  .bar-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
+  .bar-track {
+    position: relative;
+    background: var(--panel-2);
+    border-radius: 6px;
+    height: 26px;
+    overflow: hidden;
+  }
+  .bar-fill {
+    position: absolute; inset: 0 auto 0 0;
+    background: linear-gradient(90deg, rgba(88,166,255,.35), rgba(88,166,255,.18));
+    border-right: 2px solid var(--accent);
+    border-radius: 6px;
+    transition: width .35s ease;
+  }
+  .bar-label {
+    position: absolute; left: 10px; top: 0; height: 100%;
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    max-width: 100%;
+  }
+  .bar-kind { color: var(--muted); font-size: 11px; }
+  .bar-val { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 56px; text-align: right; }
+  .empty { color: var(--muted); font-size: 12.5px; padding: 6px 0; }
+  .status-pills { display: flex; gap: 8px; flex-wrap: wrap; }
+  .pill {
+    border-radius: 999px; padding: 4px 12px; font-size: 12.5px;
+    font-variant-numeric: tabular-nums; border: 1px solid var(--border); background: var(--panel-2);
+  }
+  .pill.s2 { color: var(--accent-2); }
+  .pill.s3 { color: var(--accent); }
+  .pill.s4 { color: var(--warn); }
+  .pill.s5 { color: var(--err); }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  footer { color: var(--muted); font-size: 11.5px; margin-top: 6px; }
+  .uplot, .u-legend { font-family: inherit; }
+</style>
+</head>
+<body>
+  <header>
+    <span id="dot" class="dot"></span>
+    <h1>Vekil Traffic</h1>
+    <span id="uptime" class="sub"></span>
+  </header>
+
+  <div class="narrative-wrap">
+    <div id="narrative" class="narrative">Waiting for traffic…</div>
+    <button id="insightBtn" class="insight-btn" type="button" hidden>✨ Generate insights</button>
+  </div>
+  <div id="aiInsight" class="ai-insight" hidden></div>
+
+  <div class="cards">
+    <div class="card"><div class="label">In-flight</div><div id="inflight" class="value">0</div></div>
+    <div class="card"><div class="label">Requests/s</div><div id="reqps" class="value">0</div></div>
+    <div class="card"><div class="label">Tokens/s</div><div id="tokps" class="value">0</div></div>
+    <div class="card"><div class="label">Error rate</div><div id="errrate" class="value">0%</div></div>
+    <div class="card"><div class="label">Latency p50 / p95</div><div id="latency" class="value">—</div></div>
+    <div class="card"><div class="label">Upstream retries</div><div id="retries" class="value">0</div><div id="retriesSub" class="card-sub"></div></div>
+    <div class="card"><div class="label">Total tokens</div><div id="tottok" class="value">0</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Requests / second</h2>
+    <div class="desc">Throughput over the last few minutes. The red line is errors/sec — watch for spikes.</div>
+    <div class="legend">
+      <span><i class="swatch" style="background:#58a6ff"></i>requests</span>
+      <span><i class="swatch" style="background:#f85149"></i>errors</span>
+    </div>
+    <div id="reqChart" class="chart"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Tokens / second</h2>
+    <div class="desc">How fast tokens are being consumed, split by prompt (input) and completion (output).</div>
+    <div class="legend">
+      <span><i class="swatch" style="background:#58a6ff"></i>prompt</span>
+      <span><i class="swatch" style="background:#3fb950"></i>completion</span>
+    </div>
+    <div id="tokChart" class="chart"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Total usage (since start)</h2>
+    <div class="desc">Cumulative since the proxy started. Cached prompt tokens are served from the upstream prompt cache (cheaper); reasoning tokens are model thinking tokens.</div>
+    <div class="usage-grid">
+      <div class="usage"><div class="label">Requests</div><div id="uReq" class="uval">0</div></div>
+      <div class="usage"><div class="label">Total tokens</div><div id="uTot" class="uval">0</div></div>
+      <div class="usage"><div class="label">Prompt</div><div id="uPrompt" class="uval">0</div></div>
+      <div class="usage"><div class="label">Completion</div><div id="uCompletion" class="uval">0</div></div>
+      <div class="usage"><div class="label">Cached prompt</div><div id="uCached" class="uval">0</div><div id="uCachedPct" class="usub"></div></div>
+      <div class="usage"><div class="label">Reasoning</div><div id="uReasoning" class="uval">0</div></div>
+      <div class="usage"><div class="label">Avg tokens/req</div><div id="uAvg" class="uval">0</div></div>
+      <div class="usage"><div class="label">Errors</div><div id="uErr" class="uval">0</div><div id="uErrPct" class="usub"></div></div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <span class="controls-label">Breakdowns:</span>
+    <label>sort by
+      <select id="sortBy">
+        <option value="requests">requests</option>
+        <option value="tokens">tokens</option>
+        <option value="errors">errors</option>
+        <option value="avg_ms">latency</option>
+      </select>
+    </label>
+    <input id="filterText" class="filter-input" type="search" placeholder="filter, e.g. gpt-5.4-pro" autocomplete="off" spellcheck="false">
+    <button id="filterClear" class="filter-clear" type="button" title="Clear filter">✕</button>
+  </div>
+
+  <div class="grid">
+    <div>
+      <div class="panel">
+        <h2>Top models</h2>
+        <div class="desc">Busiest models by request count, with token volume and average latency.</div>
+        <div id="byModel" class="bars"></div>
+      </div>
+      <div class="panel">
+        <h2>Top agents</h2>
+        <div class="desc">Which clients are driving traffic, classified from the User-Agent.</div>
+        <div id="byAgent" class="bars"></div>
+      </div>
+    </div>
+    <div>
+      <div class="panel">
+        <h2>Providers</h2>
+        <div class="desc">Where requests are routed upstream (Copilot, Azure, Codex, …).</div>
+        <div id="byProvider" class="bars"></div>
+      </div>
+      <div class="panel">
+        <h2>Status</h2>
+        <div class="desc">Response classes the client received.</div>
+        <div id="status" class="status-pills"></div>
+      </div>
+      <div class="panel">
+        <h2>Errors by status code</h2>
+        <div class="desc">Exact failure codes — e.g. 429 rate-limit vs 400 bad request vs 503 upstream.</div>
+        <div id="statusCodes" class="bars"></div>
+      </div>
+      <div class="panel">
+        <h2>Errors by provider / model</h2>
+        <div class="desc">Which provider/model the failures are attributed to.</div>
+        <div id="errTargets" class="bars"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="recent-head">
+      <h2>Recent requests</h2>
+      <label class="recent-toggle"><input type="checkbox" id="recentErrorsOnly"> errors only</label>
+    </div>
+    <div class="desc">The last requests through the proxy (newest first). Filter and the breakdown search box both apply. Click a request ID to copy it for correlating with upstream logs.</div>
+    <div id="recentTable" class="recent-table"></div>
+  </div>
+
+  <footer>Polling <code>/stats.json</code> every second · charts by uPlot (v1.6.31, MIT)</footer>
+
+  <script src="/dashboard/uPlot.min.js"></script>
+  <script>
+  "use strict";
+
+  var POLL_MS = 1000;
+  var lastStamp = 0;
+  var staticNarrative = "";  // last templated narrative (live banner + sent to model)
+  var lastSnapshot = null;   // last /stats.json payload, for instant re-sort/filter
+
+  function fmt(n) {
+    n = n || 0;
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+    return String(Math.round(n));
+  }
+  function fmtUptime(s) {
+    s = Math.max(0, s | 0);
+    var h = (s / 3600) | 0, m = ((s % 3600) / 60) | 0, sec = s % 60;
+    if (h) return h + "h " + m + "m";
+    if (m) return m + "m " + sec + "s";
+    return sec + "s";
+  }
+
+  // Average over the most recent `n` complete seconds, skipping the current
+  // (still-filling) second so headline rates do not dip every tick.
+  function recentRate(series, key, n) {
+    if (!series || series.length < 2) return 0;
+    var end = series.length - 1; // exclude current second
+    var start = Math.max(0, end - n);
+    var sum = 0, count = 0;
+    for (var i = start; i < end; i++) { sum += series[i][key] || 0; count++; }
+    return count ? sum / count : 0;
+  }
+
+  function chartOpts(title, el, series) {
+    return {
+      width: el.clientWidth || 600,
+      height: 160,
+      cursor: { y: false },
+      legend: { show: false },
+      scales: { x: { time: true } },
+      axes: [
+        { stroke: "#8b949e", grid: { stroke: "#21262d" }, ticks: { stroke: "#21262d" } },
+        { stroke: "#8b949e", grid: { stroke: "#21262d" }, ticks: { stroke: "#21262d" },
+          size: 44, values: function (u, vals) { return vals.map(fmt); } }
+      ],
+      series: series
+    };
+  }
+
+  var reqChart, tokChart;
+  function makeCharts() {
+    var rEl = document.getElementById("reqChart");
+    var tEl = document.getElementById("tokChart");
+    reqChart = new uPlot(chartOpts("req", rEl, [
+      {},
+      { label: "req/s", stroke: "#58a6ff", width: 2, fill: "rgba(88,166,255,.12)" },
+      { label: "err/s", stroke: "#f85149", width: 2, fill: "rgba(248,81,73,.14)" }
+    ]), [[0], [0], [0]], rEl);
+    tokChart = new uPlot(chartOpts("tok", tEl, [
+      {},
+      { label: "prompt", stroke: "#58a6ff", width: 2, fill: "rgba(88,166,255,.10)" },
+      { label: "completion", stroke: "#3fb950", width: 2, fill: "rgba(63,185,80,.10)" }
+    ]), [[0], [0], [0]], tEl);
+  }
+
+  function resizeCharts() {
+    if (reqChart) reqChart.setSize({ width: document.getElementById("reqChart").clientWidth, height: 160 });
+    if (tokChart) tokChart.setSize({ width: document.getElementById("tokChart").clientWidth, height: 160 });
+  }
+  window.addEventListener("resize", resizeCharts);
+
+  var DISPLAY_ROWS = 10;
+  // metricOf returns the value a breakdown row contributes for the active sort.
+  function metricOf(r, sort) {
+    if (sort === "tokens") return r.tokens || 0;
+    if (sort === "errors") return r.errors || 0;
+    if (sort === "avg_ms") return r.avg_ms || 0;
+    return r.requests || 0;
+  }
+
+  function renderBars(elId, rows, labelKey) {
+    var el = document.getElementById(elId);
+    var sort = document.getElementById("sortBy").value;
+    var filter = document.getElementById("filterText").value.trim().toLowerCase();
+
+    var list = (rows || []).slice();
+    // Filter by label substring (and kind, e.g. "azure" for providers).
+    if (filter) {
+      list = list.filter(function (r) {
+        var label = (r[labelKey] || "").toLowerCase();
+        var kind = (r.kind || "").toLowerCase();
+        return label.indexOf(filter) !== -1 || kind.indexOf(filter) !== -1;
+      });
+    }
+    // When sorting by errors or latency, drop rows with none — the list becomes
+    // "models with errors" / "models with latency", which is the point.
+    if (sort === "errors" || sort === "avg_ms") {
+      list = list.filter(function (r) { return metricOf(r, sort) > 0; });
+    }
+    list.sort(function (a, b) { return metricOf(b, sort) - metricOf(a, sort); });
+    list = list.slice(0, DISPLAY_ROWS);
+
+    if (!list.length) {
+      var why = filter ? "No match" : (sort === "errors" ? "No errors" : (sort === "avg_ms" ? "No latency data" : "No traffic yet"));
+      el.innerHTML = '<div class="empty">' + why + '</div>';
+      return;
+    }
+
+    var top = metricOf(list[0], sort) || 1;
+    var html = "";
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i];
+      var label = r[labelKey] || "unknown";
+      var w = Math.max(2, Math.round((metricOf(r, sort) / top) * 100));
+      var kind = r.kind ? '<span class="bar-kind">' + escapeHtml(r.kind) + '</span>' : "";
+      // Emphasize the active metric in the value column.
+      var parts = [
+        seg(fmt(r.requests) + " req", sort === "requests"),
+        seg(fmt(r.tokens) + " tok", sort === "tokens"),
+      ];
+      if (r.avg_ms) parts.push(seg(fmt(r.avg_ms) + " ms", sort === "avg_ms"));
+      if (r.errors) parts.push('<span style="color:var(--err)' + (sort === "errors" ? ";font-weight:650" : "") + '">' + fmt(r.errors) + " err</span>");
+      html += '<div class="bar-row"><div class="bar-track">' +
+        '<div class="bar-fill" style="width:' + w + '%"></div>' +
+        '<div class="bar-label">' + escapeHtml(label) + " " + kind + '</div></div>' +
+        '<div class="bar-val">' + parts.join(" · ") + "</div></div>";
+    }
+    el.innerHTML = html;
+  }
+  function seg(text, active) { return active ? "<b>" + text + "</b>" : text; }
+
+  // renderErrorBars draws the error-by-status-code and error-by-target lists,
+  // which carry {label, count} rows rather than request/token breakdowns.
+  function renderErrorBars(elId, rows, emptyText) {
+    var el = document.getElementById(elId);
+    if (!rows || !rows.length) { el.innerHTML = '<div class="empty">' + (emptyText || "None") + '</div>'; return; }
+    var top = rows[0].count || 1;
+    var html = "";
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      var pct = Math.max(2, Math.round((r.count / top) * 100));
+      html += '<div class="bar-row"><div class="bar-track">' +
+        '<div class="bar-fill err" style="width:' + pct + '%"></div>' +
+        '<div class="bar-label">' + escapeHtml(r.label) + '</div></div>' +
+        '<div class="bar-val">' + fmt(r.count) + '</div></div>';
+    }
+    el.innerHTML = html;
+  }
+
+  function renderStatus(status) {
+    var el = document.getElementById("status");
+    var order = ["2xx", "3xx", "4xx", "5xx"];
+    var cls = { "2xx": "s2", "3xx": "s3", "4xx": "s4", "5xx": "s5" };
+    var html = "", any = false;
+    for (var i = 0; i < order.length; i++) {
+      var k = order[i], v = (status && status[k]) || 0;
+      if (!v) continue;
+      any = true;
+      html += '<span class="pill ' + cls[k] + '">' + k + " · " + fmt(v) + "</span>";
+    }
+    el.innerHTML = any ? html : '<div class="empty">No traffic yet</div>';
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function applyCharts(series) {
+    var xs = [], req = [], err = [], prompt = [], completion = [];
+    for (var i = 0; i < series.length; i++) {
+      xs.push(series[i].t);
+      req.push(series[i].req);
+      err.push(series[i].err);
+      prompt.push(series[i].prompt);
+      completion.push(series[i].completion);
+    }
+    if (reqChart) reqChart.setData([xs, req, err]);
+    if (tokChart) tokChart.setData([xs, prompt, completion]);
+  }
+
+  function setDot(state) {
+    var d = document.getElementById("dot");
+    d.className = "dot" + (state ? " " + state : "");
+  }
+
+  function render(s) {
+    var series = s.series || [];
+    var reqps = recentRate(series, "req", 5);
+    var tokps = recentRate(series, "prompt", 5) + recentRate(series, "completion", 5);
+
+    document.getElementById("inflight").textContent = fmt(s.inflight);
+    document.getElementById("reqps").textContent = reqps.toFixed(reqps < 10 ? 1 : 0);
+    document.getElementById("tokps").innerHTML = fmt(tokps) + ' <small>tok/s</small>';
+
+    var t = s.totals || {};
+    var errRate = t.requests ? (t.errors / t.requests) * 100 : 0;
+    document.getElementById("errrate").textContent = errRate.toFixed(errRate < 10 ? 1 : 0) + "%";
+    document.getElementById("latency").innerHTML = (t.latency_p50_ms || 0) + ' <small>/ ' + (t.latency_p95_ms || 0) + ' ms</small>';
+    document.getElementById("retries").textContent = fmt(s.retries);
+    var rbc = s.retries_by_code || [];
+    document.getElementById("retriesSub").textContent =
+      s.retries ? "mostly " + rbc.slice(0, 2).map(function (x) { return x.label + "×" + fmt(x.count); }).join(", ") : "none — upstream stable";
+    document.getElementById("tottok").innerHTML = fmt(t.total_tokens) +
+      ' <small>' + fmt(t.prompt_tokens) + " in / " + fmt(t.completion_tokens) + " out</small>";
+    document.getElementById("uptime").textContent = "up " + fmtUptime(s.uptime_seconds);
+
+    // Total usage panel.
+    var cachePct = t.prompt_tokens ? (t.cached_tokens / t.prompt_tokens) * 100 : 0;
+    var avg = t.requests ? t.total_tokens / t.requests : 0;
+    document.getElementById("uReq").textContent = fmt(t.requests);
+    document.getElementById("uTot").textContent = fmt(t.total_tokens);
+    document.getElementById("uPrompt").textContent = fmt(t.prompt_tokens);
+    document.getElementById("uCompletion").textContent = fmt(t.completion_tokens);
+    document.getElementById("uCached").textContent = fmt(t.cached_tokens);
+    document.getElementById("uCachedPct").textContent = cachePct ? cachePct.toFixed(1) + "% of prompt" : "";
+    document.getElementById("uReasoning").textContent = fmt(t.reasoning_tokens);
+    document.getElementById("uAvg").textContent = fmt(avg);
+    document.getElementById("uErr").textContent = fmt(t.errors);
+    document.getElementById("uErrPct").textContent = t.requests ? errRate.toFixed(errRate < 10 ? 1 : 0) + "% rate" : "";
+
+    lastSnapshot = s;
+    applyBreakdowns();
+    renderStatus(s.status);
+    renderErrorBars("statusCodes", s.status_codes, "No errors");
+    renderErrorBars("errTargets", s.errors, "No errors");
+    applyCharts(series);
+
+    // Show the insight button only when the proxy has a model configured.
+    var btn = document.getElementById("insightBtn");
+    btn.hidden = !s.insights_enabled;
+
+    // The templated narrative always refreshes (the AI insight lives in its own
+    // block below and never overrides it). We keep the latest text so it can be
+    // sent to the model as "already shown".
+    staticNarrative = buildNarrative(s, reqps, tokps, errRate, cachePct);
+    var n = document.getElementById("narrative");
+    n.innerHTML = staticNarrative;
+  }
+
+  // buildNarrative synthesizes the current snapshot into a plain-language summary
+  // so a first-time viewer understands what the dashboard is showing at a glance.
+  function buildNarrative(s, reqps, tokps, errRate, cachePct) {
+    var t = s.totals || {};
+    if (!t.requests) return "No traffic yet. Send a request through the proxy and this will come alive.";
+
+    var parts = [];
+    parts.push("Handling <b>" + reqps.toFixed(reqps < 10 ? 1 : 0) + " req/s</b> (" +
+      s.inflight + " in flight) at <b>" + fmt(tokps) + " tok/s</b>.");
+
+    var top = (s.by_model && s.by_model[0]) ? s.by_model[0].model : null;
+    var topAgent = (s.by_agent && s.by_agent[0]) ? s.by_agent[0].agent : null;
+    if (top) {
+      var bit = "Busiest model is <b>" + escapeHtml(top) + "</b>";
+      if (topAgent) bit += ", mostly from <b>" + escapeHtml(topAgent) + "</b>";
+      parts.push(bit + ".");
+    }
+
+    if (t.latency_p95_ms) parts.push("p95 latency <b>" + t.latency_p95_ms + " ms</b>.");
+
+    if (cachePct >= 1) parts.push("<b>" + cachePct.toFixed(0) + "%</b> of prompt tokens served from cache.");
+
+    if (t.errors) {
+      var worst = (s.status_codes && s.status_codes[0]) ? s.status_codes[0].label : null;
+      var msg = "Error rate <b style=\"color:var(--err)\">" + errRate.toFixed(errRate < 10 ? 1 : 0) + "%</b>";
+      if (worst) msg += " (mostly <b>" + escapeHtml(worst) + "</b>)";
+      parts.push(msg + ".");
+    } else {
+      parts.push("No errors. ✓");
+    }
+    return parts.join(" ");
+  }
+
+  function tick() {
+    fetch("/stats.json", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (s) { lastStamp = Date.now(); setDot("live"); render(s); })
+      .catch(function () { setDot("stale"); });
+  }
+
+  // generateInsight asks the proxy to summarize current traffic with the
+  // configured model, telling it what the static banner already shows so it adds
+  // rather than repeats. The result renders in its own block below the live
+  // narrative; on any failure that block is hidden and the static line stays.
+  function generateInsight() {
+    var btn = document.getElementById("insightBtn");
+    var box = document.getElementById("aiInsight");
+    btn.disabled = true;
+    btn.textContent = "✨ Thinking…";
+    box.hidden = false;
+    box.className = "ai-insight loading";
+    box.textContent = "Generating insights…";
+
+    function fail() { box.hidden = true; box.textContent = ""; }
+
+    var shownText = stripTags(staticNarrative);
+    fetch("/dashboard/insight", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ shown: shownText })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d && d.insight) {
+          box.className = "ai-insight";
+          box.innerHTML = '<span class="ai-label">✨ ' + escapeHtml(d.model || "insight") + ':</span> ' + escapeHtml(d.insight);
+        } else {
+          fail(); // soft failure → static narrative (still live above) is enough
+        }
+      })
+      .catch(fail)
+      .finally(function () {
+        btn.disabled = false;
+        btn.textContent = "✨ Regenerate insights";
+      });
+  }
+  function stripTags(html) {
+    var d = document.createElement("div");
+    d.innerHTML = html || "";
+    return (d.textContent || "").trim();
+  }
+  document.getElementById("insightBtn").addEventListener("click", generateInsight);
+
+  // applyBreakdowns re-renders the model/agent/provider panels from the last
+  // snapshot using the current sort + filter controls. Called on every poll and
+  // immediately when a control changes (no waiting for the next tick).
+  function applyBreakdowns() {
+    if (!lastSnapshot) return;
+    renderBars("byModel", lastSnapshot.by_model, "model");
+    renderBars("byProvider", lastSnapshot.by_provider, "provider");
+    renderBars("byAgent", lastSnapshot.by_agent, "agent");
+    renderRecent();
+  }
+
+  // renderRecent draws the recent-requests drill-down table. It honors the
+  // shared filter box (matched against model/agent/provider/endpoint) and the
+  // errors-only toggle.
+  function renderRecent() {
+    var el = document.getElementById("recentTable");
+    if (!lastSnapshot) return;
+    var rows = lastSnapshot.recent || [];
+    var filter = document.getElementById("filterText").value.trim().toLowerCase();
+    var errorsOnly = document.getElementById("recentErrorsOnly").checked;
+    var now = Math.floor(Date.now() / 1000);
+
+    var list = rows.filter(function (r) {
+      if (errorsOnly && r.status < 400) return false;
+      if (!filter) return true;
+      return [r.model, r.agent, r.provider, r.endpoint].some(function (f) {
+        return (f || "").toLowerCase().indexOf(filter) !== -1;
+      });
+    }).slice(0, 40);
+
+    if (!list.length) {
+      el.innerHTML = '<div class="empty">' + (rows.length ? "No matching requests" : "No traffic yet") + '</div>';
+      return;
+    }
+    var html = '<div class="recent-row head"><span>age</span><span>status</span><span>model</span><span>agent</span><span>latency</span><span>tokens</span><span>request id</span></div>';
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i];
+      var ago = Math.max(0, now - r.t);
+      var sc = "s" + Math.floor(r.status / 100);
+      var rid = r.upstream_request_id
+        ? '<span class="rid" data-rid="' + escapeHtml(r.upstream_request_id) + '" title="click to copy">' + escapeHtml(shortId(r.upstream_request_id)) + '</span>'
+        : '<span class="ago">—</span>';
+      html += '<div class="recent-row">' +
+        '<span class="ago">' + ago + 's</span>' +
+        '<span class="st ' + sc + '">' + r.status + '</span>' +
+        '<span class="cell-ellip">' + escapeHtml(r.model || "—") + '</span>' +
+        '<span class="cell-ellip">' + escapeHtml(r.agent || "—") + '</span>' +
+        '<span>' + fmt(r.dur_ms) + ' ms</span>' +
+        '<span>' + fmt(r.total_tokens) + '</span>' +
+        rid +
+        '</div>';
+    }
+    el.innerHTML = html;
+  }
+  function shortId(id) { return id.length > 18 ? id.slice(0, 15) + "…" : id; }
+  // Copy the full request id when a row's id is clicked.
+  document.getElementById("recentTable").addEventListener("click", function (e) {
+    var t = e.target;
+    if (t && t.classList.contains("rid") && t.dataset.rid && navigator.clipboard) {
+      navigator.clipboard.writeText(t.dataset.rid).then(function () {
+        var prev = t.textContent;
+        t.textContent = "copied!";
+        setTimeout(function () { t.textContent = prev; }, 900);
+      });
+    }
+  });
+  document.getElementById("recentErrorsOnly").addEventListener("change", renderRecent);
+
+  document.getElementById("sortBy").addEventListener("change", applyBreakdowns);
+  document.getElementById("filterText").addEventListener("input", applyBreakdowns);
+  document.getElementById("filterClear").addEventListener("click", function () {
+    document.getElementById("filterText").value = "";
+    applyBreakdowns();
+  });
+
+  makeCharts();
+  tick();
+  setInterval(tick, POLL_MS);
+  // Mark stale if a poll has not landed in 3s.
+  setInterval(function () {
+    if (lastStamp && Date.now() - lastStamp > 3000) setDot("stale");
+  }, 1000);
+  </script>
+</body>
+</html>

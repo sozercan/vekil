@@ -308,7 +308,7 @@ func TestStreamOpenAIToGeminiWithFinalResponse_CapturesStreamedToolCalls(t *test
 
 	w := httptest.NewRecorder()
 	var final *models.OpenAIResponse
-	StreamOpenAIToGeminiWithFinalResponse(w, body, func(resp *models.OpenAIResponse) {
+	StreamOpenAIToGeminiWithFinalResponse(w, body, nil, func(resp *models.OpenAIResponse) {
 		final = resp
 	})
 

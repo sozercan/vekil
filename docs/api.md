@@ -46,6 +46,8 @@ Near zero-copy passthrough for requests without tools. When tools are present, t
 
 The proxy enforces the selected model's configured endpoint allowlist before forwarding. If a model is `/responses`-only, `POST /v1/chat/completions` fails fast with `400` instead of probing an unsupported upstream route.
 
+For client-requested streams that omit `stream_options`, the proxy asks the upstream for a final usage chunk (`stream_options.include_usage`) so streamed traffic still records token totals in the dashboard. That injected usage-only chunk is consumed internally and **not** forwarded to the client, so the streamed SSE the client sees is unchanged from a standard OpenAI stream (no extra `choices: []` terminal chunk). If the client supplied its own `stream_options`, its choice is preserved untouched.
+
 ## Responses Compatibility Endpoints
 
 Supported OpenAI/Codex-style routes:
@@ -66,3 +68,11 @@ Returns `{"status":"ok"}` as soon as the HTTP listener is serving. This endpoint
 ## `GET /readyz`
 
 Validates that the proxy can authenticate to and successfully probe the configured upstream providers. On success it returns `{"status":"ready"}`. On failure it returns `503` with `{"status":"not_ready","error":"..."}`.
+
+## Traffic Dashboard Endpoints
+
+- `GET /dashboard` — live, browser-based traffic dashboard served from the proxy (available wherever the proxy runs).
+- `GET /stats.json` — in-memory traffic snapshot (totals, latency percentiles, per-second series, by-model/provider/agent breakdowns, upstream retries, and a recent-requests log) polled by the dashboard.
+- `POST /dashboard/insight` — optional AI-generated traffic summary. Active only when `insight_model` is set in providers config; single-flight with a cooldown; fails open.
+
+These endpoints are unauthenticated like `/healthz` and are excluded from their own stats. See [Traffic Dashboard](dashboard.md) for the payload shape, agent classification, AI insights, and access/security notes.

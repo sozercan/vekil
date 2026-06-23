@@ -27,11 +27,64 @@ var (
 	responsesWebSocketPingPeriod = 30 * time.Second
 )
 
+var errResponsesWebSocketClientWrite = errors.New("responses websocket client write failed")
+
+type responsesWebSocketClientWriteError struct {
+	err error
+}
+
+func (e *responsesWebSocketClientWriteError) Error() string {
+	if e == nil || e.err == nil {
+		return errResponsesWebSocketClientWrite.Error()
+	}
+	return e.err.Error()
+}
+
+func (e *responsesWebSocketClientWriteError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func (e *responsesWebSocketClientWriteError) Is(target error) bool {
+	return target == errResponsesWebSocketClientWrite
+}
+
+func isResponsesWebSocketClientDisconnect(ctx context.Context, err error) bool {
+	if errors.Is(err, errResponsesWebSocketClientWrite) {
+		return true
+	}
+	return ctx != nil && ctx.Err() != nil
+}
+
 // errStreamFailedUpstream is a sentinel error indicating the upstream stream
 // ended with response.failed or response.incomplete after forwarding the
 // upstream failure event. This path also emits the standard websocket error
 // payload so clients can surface the upstream error details.
 var errStreamFailedUpstream = errors.New("upstream stream ended with response.failed or response.incomplete")
+
+// streamFailedUpstreamError carries the HTTP status that an upstream
+// response.failed/incomplete event was classified to (e.g. 429 for a rate
+// limit, 503 for an overload), so the turn is recorded in stats with its exact
+// semantic status rather than a generic 502. It unwraps to errStreamFailedUpstream
+// so existing errors.Is checks keep working.
+type streamFailedUpstreamError struct {
+	status int
+}
+
+func (e *streamFailedUpstreamError) Error() string { return errStreamFailedUpstream.Error() }
+func (e *streamFailedUpstreamError) Unwrap() error { return errStreamFailedUpstream }
+
+// streamFailureStatus returns the classified status carried by a stream-failure
+// error, or http.StatusBadGateway when none was attached.
+func streamFailureStatus(err error) int {
+	var sf *streamFailedUpstreamError
+	if errors.As(err, &sf) && sf.status != 0 {
+		return sf.status
+	}
+	return http.StatusBadGateway
+}
 
 var responsesWebSocketUpgrader = websocket.Upgrader{
 	ReadBufferSize:    4096,
@@ -64,6 +117,7 @@ type responsesWebSocketStreamEvent struct {
 		ID                string                                    `json:"id"`
 		Error             responsesWebSocketStreamError             `json:"error"`
 		IncompleteDetails responsesWebSocketStreamIncompleteDetails `json:"incomplete_details"`
+		Usage             responsesUsage                            `json:"usage"`
 	} `json:"response,omitempty"`
 	Item json.RawMessage `json:"item,omitempty"`
 }
@@ -82,6 +136,7 @@ type responsesWebSocketSession struct {
 	conn           *websocket.Conn
 	ctx            context.Context
 	baseHeaders    http.Header
+	userAgent      string
 	turnState      string
 	turnMetadata   string
 	lastResponseID string
@@ -407,6 +462,7 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 		conn:        conn,
 		ctx:         r.Context(),
 		baseHeaders: baseHeaders,
+		userAgent:   r.Header.Get("User-Agent"),
 		// Codex treats X-Codex-Turn-State as server-issued, turn-scoped
 		// sticky-routing state. This bridge only trusts state it received from
 		// upstream during this proxy-owned websocket session.
@@ -540,6 +596,12 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	}
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
+	// The websocket bridge records each turn as tracked traffic (recordTurnStats),
+	// so mark the per-turn upstream context as retry-trackable too — otherwise a
+	// retryable 429/503 on a turn would be invisible in the dashboard retry
+	// counters. GET /v1/responses is not an inference route, so the middleware
+	// never marks it; do it explicitly here.
+	upstreamCtx = markRetryStatsTracked(upstreamCtx)
 	inflightGen := s.setInflightCancel(upstreamCancel)
 	defer func() {
 		s.clearInflightCancel(inflightGen)
@@ -566,6 +628,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			code = strings.TrimSpace(translated.failure.Response.Error.Code)
 		}
 		s.sendWrappedError(translated.status, translated.message, code, translatedHeaders)
+		// A precommit translated failure (e.g. unsupported-model or rate-limit
+		// surfaced before the stream is handed off) is still a failed turn; count
+		// it so it appears in the dashboard error stats and recent log, matching
+		// the non-200 and stream-error branches below.
+		s.recordTurnStats(h, request.Model, translated.status, responsesUsage{})
 		return nil
 	}
 	if resp == nil {
@@ -583,22 +650,49 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		}
 		message, code := extractResponsesWebSocketError(resp.StatusCode, respBody)
 		s.sendWrappedError(resp.StatusCode, message, code, resp.Header)
+		s.recordTurnStats(h, request.Model, resp.StatusCode, responsesUsage{})
 		return fmt.Errorf("upstream websocket bridge status %d", resp.StatusCode)
 	}
 
-	responseID, outputItems, err := s.streamUpstreamResponse(h, resp.Body, resp.Header)
+	responseID, outputItems, turnUsage, err := s.streamUpstreamResponse(h, resp.Body, resp.Header)
 	if err != nil {
+		if isResponsesWebSocketClientDisconnect(s.ctx, err) {
+			return err
+		}
 		if errors.Is(err, errStreamFailedUpstream) {
+			// The upstream sent response.failed/incomplete; count it as an errored
+			// turn so it shows in the dashboard's error stats and recent log, with
+			// the exact classified status (e.g. 429/503) the client was sent rather
+			// than a generic 502.
+			s.recordTurnStats(h, request.Model, streamFailureStatus(err), responsesUsage{})
 			return nil
 		}
 		s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil)
+		s.recordTurnStats(h, request.Model, http.StatusBadGateway, responsesUsage{})
 		return err
 	}
+
+	// Record this successful bridge turn into traffic stats. The bridge does not
+	// flow through the HTTP request middleware, so it is recorded directly. Every
+	// completed turn is counted (with whatever usage it carried, possibly zero),
+	// matching the HTTP path's request accounting.
+	s.recordTurnStats(h, request.Model, http.StatusOK, turnUsage)
 
 	s.rememberPlannedResponse(plan, responseID, outputItems)
 	metrics = s.maybeAutoCompactHistory(h, request, metrics)
 	s.logRequestMetrics(h, request, responseID, metrics)
 	return nil
+}
+
+// recordTurnStats records one websocket-bridge turn into traffic stats,
+// resolving the provider for attribution. status is the turn outcome (200 for a
+// completed turn, an error status for a failed one).
+func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model string, status int, usage responsesUsage) {
+	providerID, providerKind := "", ""
+	if provider, _, _ := h.resolveProviderModel(model, providerEndpointResponses); provider != nil {
+		providerID, providerKind = provider.id, string(provider.kind)
+	}
+	h.RecordResponsesTurn(model, providerID, providerKind, classifyAgent(s.userAgent), status, usage)
 }
 
 func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) (responsesWebSocketRequestPlan, error) {
@@ -668,7 +762,10 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 	}
 	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizers(ctx, bodyBytes, "responses/websocket", true, s.toolContexts, s.toolScope)
 	headers := s.requestHeaders(request, includeTurnState)
-	if compactionResp, handled, err := h.maybeBuildResponsesCompactionTriggerResponse(ctx, bodyBytes, headers, true); handled || err != nil {
+	// The websocket bridge records each turn's usage downstream from the streamed
+	// response body (recordTurnStats), so the per-turn usage total returned here
+	// is not observed separately — discard it.
+	if compactionResp, handled, _, err := h.maybeBuildResponsesCompactionTriggerResponse(ctx, bodyBytes, headers, true); handled || err != nil {
 		return compactionResp, err
 	}
 	return h.postResponsesWithHeaders(ctx, bodyBytes, headers)
@@ -791,13 +888,17 @@ func (s *responsesWebSocketSession) rememberPlannedResponse(plan responsesWebSoc
 
 func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, request *responsesWebSocketCreateRequest, metrics responsesWebSocketRequestMetrics) responsesWebSocketRequestMetrics {
 	ctx, cancel := h.newInferenceUpstreamContext(true)
+	// Mark the compaction upstream context as retry-trackable, like the turn
+	// itself, so retries during auto-compaction are counted in retry stats.
+	ctx = markRetryStatsTracked(ctx)
 	inflightGen := s.setInflightCancel(cancel)
 	defer func() {
 		s.clearInflightCancel(inflightGen)
 		cancel()
 	}()
 
-	compaction, compacted, err := s.compactHistory(h, ctx, request, false)
+	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
+	compaction, compacted, err := s.compactHistory(h, ctx, request, false, budget)
 	if err != nil {
 		h.log.Debug("responses websocket auto-compaction failed",
 			logger.Err(err),
@@ -809,6 +910,14 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, req
 	}
 	if !compacted {
 		return metrics
+	}
+
+	// Auto-compaction spends upstream /responses tokens on an internal compact
+	// call that does not flow through the stats middleware. Record that usage as
+	// its own turn so long auto-compacting websocket sessions do not underreport
+	// total Responses token spend.
+	if compactionUsage := budget.usageTotals(); !compactionUsage.isZero() {
+		s.recordTurnStats(h, request.Model, http.StatusOK, compactionUsage)
 	}
 
 	h.log.Debug("responses websocket auto-compacted history",
@@ -859,6 +968,17 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 	}
 
 	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
+	// The 413 oversized-replay fallback spends upstream /responses tokens on
+	// internal compaction calls (accumulated into budget) before retrying the
+	// turn. That spend does not flow through the stats middleware, and the retry
+	// turn's own usage is recorded separately downstream, so record the
+	// compaction usage here as its own turn on every exit path — matching the
+	// auto-compaction path — so 413-fallback sessions do not underreport spend.
+	defer func() {
+		if compactionUsage := budget.usageTotals(); !compactionUsage.isZero() {
+			s.recordTurnStats(h, request.Model, http.StatusOK, compactionUsage)
+		}
+	}()
 	for attempt, keepTail := range keepTailSchedule {
 		compactedHistory, compaction, compacted, err := s.compactHistoryItemsWithKeepTail(h, ctx, request, originalHistory, keepTail, budget)
 		if err != nil {
@@ -924,7 +1044,7 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 	return lastResp, nil
 }
 
-func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, force bool) (responsesWebSocketHistoryCompaction, bool, error) {
+func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, force bool, budget *compactBudget) (responsesWebSocketHistoryCompaction, bool, error) {
 	var result responsesWebSocketHistoryCompaction
 
 	cfg := h.responsesWebSocketConfig()
@@ -949,7 +1069,7 @@ func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.
 		keepTail = responsesWebSocketAutoCompactKeepTail(s.historyItems, cfg)
 	}
 
-	compacted, result, ok, err := s.compactHistoryItemsWithKeepTail(h, ctx, request, s.historyItems, keepTail, nil)
+	compacted, result, ok, err := s.compactHistoryItemsWithKeepTail(h, ctx, request, s.historyItems, keepTail, budget)
 	if err != nil || !ok {
 		return result, ok, err
 	}
@@ -1037,19 +1157,22 @@ func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *
 	)
 }
 
-func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body io.Reader, headers http.Header) (string, []json.RawMessage, error) {
+func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body io.Reader, headers http.Header) (string, []json.RawMessage, responsesUsage, error) {
 	// Emit a synthetic metadata event so WebSocket clients can discover the
 	// actual model used. The Codex CLI parses openai-model from
 	// codex.response.metadata frames via response_model().
 	if mappedHeaders := responsesWebSocketMetadataHeaders(headers); len(mappedHeaders) > 0 {
-		_ = s.writeJSON(map[string]interface{}{
+		if err := s.writeJSON(map[string]interface{}{
 			"type":    "codex.response.metadata",
 			"headers": mappedHeaders,
-		})
+		}); err != nil {
+			return "", nil, responsesUsage{}, &responsesWebSocketClientWriteError{err: err}
+		}
 	}
 
 	var responseID string
 	var outputItems []json.RawMessage
+	var turnUsage responsesUsage
 	sawCompleted := false
 	sawSemanticEvent := false
 
@@ -1065,14 +1188,14 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 			if parsedEvent && event.Type == "response.failed" {
 				if status, _, ok := classifyPrecommitResponsesFailure(event); ok {
 					s.sendWrappedError(status, responsesPrecommitErrorMessage(event, status), strings.TrimSpace(event.Response.Error.Code), headers)
-					return errStreamFailedUpstream
+					return &streamFailedUpstreamError{status: status}
 				}
 			}
 		}
 
 		_ = s.conn.SetWriteDeadline(time.Now().Add(responsesWebSocketWriteWait))
 		if err := s.conn.WriteMessage(websocket.TextMessage, []byte(data)); err != nil {
-			return err
+			return &responsesWebSocketClientWriteError{err: err}
 		}
 
 		if !parsedEvent {
@@ -1096,29 +1219,35 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 			if event.Response.ID != "" {
 				responseID = event.Response.ID
 			}
+			if !event.Response.Usage.isZero() {
+				turnUsage = event.Response.Usage
+			}
 		case "response.failed", "response.incomplete":
 			s.sendUpstreamStreamFailure(event, headers)
 			// Return the sentinel immediately to break out of the SSE
 			// scanner loop. The failure event has already been forwarded to
 			// the client above, and we also emit a standard error payload so
-			// websocket clients can surface the upstream error details.
-			return errStreamFailedUpstream
+			// websocket clients can surface the upstream error details. Carry the
+			// classified status so the turn is recorded with its exact semantic
+			// status (e.g. 429/503) rather than a generic 502.
+			status, _, _ := responsesWebSocketStreamFailureDetails(event)
+			return &streamFailedUpstreamError{status: status}
 		}
 
 		return nil
 	}); err != nil && !errors.Is(err, errStreamFailedUpstream) {
-		return "", nil, err
+		return "", nil, responsesUsage{}, err
 	} else if errors.Is(err, errStreamFailedUpstream) {
-		return "", nil, errStreamFailedUpstream
+		return "", nil, responsesUsage{}, err
 	}
 
 	if sawCompleted {
 		if responseID == "" {
-			return "", nil, fmt.Errorf("response.completed missing response id")
+			return "", nil, responsesUsage{}, fmt.Errorf("response.completed missing response id")
 		}
-		return responseID, outputItems, nil
+		return responseID, outputItems, turnUsage, nil
 	}
-	return "", nil, fmt.Errorf("stream ended before response.completed")
+	return "", nil, responsesUsage{}, fmt.Errorf("stream ended before response.completed")
 }
 
 func (s *responsesWebSocketSession) writeJSON(payload interface{}) error {

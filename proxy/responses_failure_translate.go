@@ -15,10 +15,22 @@ import (
 )
 
 const (
-	responsesPrecommitPeekTimeout   = 750 * time.Millisecond
-	responsesPrecommitMaxPeekBytes  = 64 * 1024
-	responsesPeekReadChunkSize      = 4 * 1024
-	responsesFailureTapMaxBuffer    = 64 * 1024
+	responsesPrecommitPeekTimeout  = 750 * time.Millisecond
+	responsesPrecommitMaxPeekBytes = 64 * 1024
+	responsesPeekReadChunkSize     = 4 * 1024
+	// responsesFailureTapMaxBuffer bounds how much of an in-flight SSE event the
+	// failure tap buffers while waiting for its delimiter. It must be large
+	// enough to hold a real response.completed event, which embeds the full
+	// response output plus the usage object — long Codex turns routinely exceed
+	// 64 KiB — so it is sized at 1 MiB. On overflow the tap still best-effort
+	// sniffs usage from the buffered bytes before dropping them.
+	responsesFailureTapMaxBuffer = 1 << 20
+	// responsesFailureTapOverflowTail is the trailing window retained when a
+	// single SSE event overflows the buffer. A streamed response.completed embeds
+	// its (small) usage object near the end of the event, so retaining the tail
+	// lets a later chunk complete the "usage":{...} object for sniffing instead of
+	// dropping it. 64 KiB comfortably holds a usage object plus surrounding JSON.
+	responsesFailureTapOverflowTail = 64 * 1024
 	responsesFailureLogMessageLimit = 256
 )
 
@@ -456,6 +468,17 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 	return "", ""
 }
 
+// isClientWriteError reports whether an io.Copy error originated from writing to
+// the client (the flushWriter destination) rather than from reading the upstream
+// source. A client-side write error (the client disconnected) is not an upstream
+// failure and must not be recorded as one.
+func isClientWriteError(fw *flushWriter, err error) bool {
+	if fw == nil || err == nil {
+		return false
+	}
+	return fw.writeErr != nil
+}
+
 func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w http.ResponseWriter, r io.Reader, upstreamHeaders http.Header, store *ToolExecutionContextStore, scope string) {
 	if closer, ok := r.(io.Closer); ok {
 		defer func() { _ = closer.Close() }()
@@ -467,7 +490,29 @@ func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w h
 	}
 
 	tap := newResponsesFailureTap(ctx, h, upstreamHeaders, store, scope)
-	_, _ = io.Copy(fw, io.TeeReader(r, tap))
+	if _, err := io.Copy(fw, io.TeeReader(r, tap)); err != nil {
+		// The HTTP 200 was already committed, so the client receives a truncated
+		// stream when the upstream SSE connection resets or the pipe closes with
+		// an error before a response.failed/incomplete event. Only record an
+		// upstream failure for an actual upstream/transport error — a client
+		// disconnect or cancellation (ctx cancelled, or a write error forwarding
+		// to a gone client) is not an upstream failure and must not pollute the
+		// dashboard error rate.
+		if ctx.Err() == nil && !isClientWriteError(fw, err) {
+			observeResponseFailureStatus(ctx, http.StatusBadGateway)
+		}
+		if h != nil && h.log != nil {
+			h.log.Debug("responses stream copy failed after commit", logger.Err(err))
+		}
+		return
+	}
+
+	if ctx.Err() == nil && !tap.completedCleanly() {
+		observeResponseFailureStatus(ctx, http.StatusBadGateway)
+		if h != nil && h.log != nil {
+			h.log.Debug("responses stream ended before terminal event")
+		}
+	}
 }
 
 func parseResponsesStreamEvent(data string) (responsesWebSocketStreamEvent, error) {
@@ -647,6 +692,29 @@ type responsesFailureTap struct {
 	scope           string
 	responseScope   string
 	parser          responsesSSEParser
+	// overflowed is set once a single SSE event has exceeded the buffer cap, so
+	// later writes keep best-effort sniffing usage from the rolling tail (the
+	// event's framing is unrecoverable once dropped, so the normal dispatch path
+	// cannot parse it).
+	overflowed bool
+	// overflowActive remains true while forwarding the rest of an overflowed event.
+	// It is cleared once that event's blank-line boundary is observed.
+	overflowActive bool
+	// overflowCompletedEvent is set when the overflowed event appears to be a
+	// response.completed terminal event, either from its event/type prefix or from
+	// the terminal usage object recovered near the tail.
+	overflowCompletedEvent bool
+	overflowBoundaryTail   []byte
+	// overflowUsageRecorded is set once usage has been recovered from an
+	// overflowed event, to avoid redundant re-sniffing on every subsequent write.
+	overflowUsageRecorded bool
+	// usageTail is a bounded rolling window of the most recent raw stream bytes,
+	// used to recover usage from an oversized streamed response.completed event.
+	usageTail []byte
+	// terminalSeen is set after a parsed terminal Responses event. A clean EOF
+	// before response.completed/failed/incomplete means the committed stream was
+	// truncated and should not be counted as a successful 200.
+	terminalSeen bool
 }
 
 func newResponsesFailureTap(ctx context.Context, h *ProxyHandler, upstreamHeaders http.Header, store *ToolExecutionContextStore, scope string) *responsesFailureTap {
@@ -664,7 +732,18 @@ func newResponsesFailureTap(ctx context.Context, h *ProxyHandler, upstreamHeader
 }
 
 func (t *responsesFailureTap) Write(p []byte) (int, error) {
+	// Maintain a small rolling tail of the raw byte stream, independent of the SSE
+	// parser's pending buffer, so usage can be recovered from a very large streamed
+	// response.completed event even after the parser truncates/clears its buffer
+	// (the giant event's framing is corrupted once it overflows, so the normal
+	// dispatch path cannot parse it). usage sits near the end of the event, so a
+	// bounded tail of recent bytes is enough to capture the "usage":{...} object.
+	t.appendUsageTail(p)
+
 	t.parser.push(p)
+	if t.overflowActive {
+		t.observeOverflowBoundary(p)
+	}
 	for {
 		msg, ok := t.parser.nextSemantic()
 		if !ok {
@@ -672,11 +751,82 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 		}
 		t.maybeProcess(msg)
 	}
+	if t.overflowed {
+		t.sniffUsageFromOverflow(t.usageTail)
+	}
 	if len(t.parser.pending) > responsesFailureTapMaxBuffer {
+		// The event exceeds the buffer (a very large response.completed whose
+		// delimiter has not arrived). Sniff usage from the rolling tail, then drop
+		// the parser buffer (its framing is unrecoverable) and flag overflow so
+		// later writes keep sniffing the tail.
+		t.overflowed = true
+		t.overflowActive = true
+		if responsesOverflowLooksCompleted(t.parser.pending) {
+			t.overflowCompletedEvent = true
+		}
+		t.overflowBoundaryTail = trailingBytes(t.parser.pending, 3)
+		t.sniffUsageFromOverflow(t.usageTail)
 		t.parser.pending = nil
 		t.parser.allowBOM = false
 	}
 	return len(p), nil
+}
+
+// appendUsageTail keeps the last responsesFailureTapOverflowTail bytes of the raw
+// stream in t.usageTail for best-effort usage recovery from oversized events.
+func (t *responsesFailureTap) appendUsageTail(p []byte) {
+	if t.overflowUsageRecorded {
+		return
+	}
+	t.usageTail = append(t.usageTail, p...)
+	if len(t.usageTail) > responsesFailureTapOverflowTail {
+		t.usageTail = t.usageTail[len(t.usageTail)-responsesFailureTapOverflowTail:]
+	}
+}
+
+// sniffUsageFromOverflow extracts a usage object from a partially-buffered SSE
+// event that is about to be dropped for exceeding the buffer cap. It scans for
+// the last "usage":{...} object in the buffer (the completed event carries usage
+// after its output) and records it. It runs once per turn — once usage is
+// observed onto the summary, a later real terminal event would just re-observe
+// the same value. Best-effort: any parse failure is ignored.
+func (t *responsesFailureTap) sniffUsageFromOverflow(buf []byte) {
+	if t.overflowUsageRecorded {
+		return
+	}
+	if usage, ok := extractResponsesUsageObject(buf); ok {
+		observeResponsesUsage(t.ctx, usage)
+		t.overflowUsageRecorded = true
+		t.overflowCompletedEvent = true
+	}
+}
+
+func (t *responsesFailureTap) observeOverflowBoundary(p []byte) {
+	if t == nil || !t.overflowActive {
+		return
+	}
+	combined := append(append([]byte(nil), t.overflowBoundaryTail...), p...)
+	if bytes.Contains(combined, []byte("\n\n")) || bytes.Contains(combined, []byte("\r\n\r\n")) {
+		t.overflowActive = false
+	}
+	t.overflowBoundaryTail = trailingBytes(combined, 3)
+}
+
+func trailingBytes(buf []byte, n int) []byte {
+	if n <= 0 || len(buf) == 0 {
+		return nil
+	}
+	if len(buf) > n {
+		buf = buf[len(buf)-n:]
+	}
+	return append([]byte(nil), buf...)
+}
+
+func responsesOverflowLooksCompleted(buf []byte) bool {
+	return bytes.Contains(buf, []byte("event: response.completed")) ||
+		bytes.Contains(buf, []byte("event:response.completed")) ||
+		bytes.Contains(buf, []byte(`"type":"response.completed"`)) ||
+		bytes.Contains(buf, []byte(`"type": "response.completed"`))
 }
 
 func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
@@ -699,8 +849,30 @@ func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
 	if eventName == "" {
 		eventName = eventType
 	}
+	switch eventName {
+	case "response.completed", "response.failed", "response.incomplete":
+		t.terminalSeen = true
+	}
+	if eventName == "response.completed" {
+		// Record token usage from the terminal event. This is best-effort: a
+		// response.completed larger than responsesFailureTapMaxBuffer is dropped
+		// by the tap before its delimiter, in which case usage is simply not
+		// recorded for that turn (it degrades to zero rather than erroring). The
+		// usage payload is small in practice (~hundreds of bytes).
+		observeResponsesUsage(t.ctx, event.Response.Usage)
+	}
 	t.maybeCaptureToolCommand(eventName, event)
 	t.maybeLog(eventName, event)
+}
+
+func (t *responsesFailureTap) completedCleanly() bool {
+	if t == nil {
+		return true
+	}
+	// If a giant response.completed event overflowed the bounded parser, treat it
+	// as complete only after that overflowed event's blank-line boundary is seen.
+	// Non-overflowing streams still require a parsed terminal event.
+	return t.terminalSeen || (t.overflowCompletedEvent && !t.overflowActive)
 }
 
 func (t *responsesFailureTap) maybeCaptureToolCommand(eventName string, event responsesWebSocketStreamEvent) {
@@ -732,6 +904,19 @@ func (t *responsesFailureTap) maybeLog(eventName string, event responsesWebSocke
 	if eventName != "response.failed" && eventName != "response.incomplete" {
 		return
 	}
+
+	// The HTTP 200 was already committed before this post-commit failure event,
+	// so the stats middleware would otherwise record the turn as a success.
+	// Record an out-of-band failure status on the request summary so the
+	// dashboard reflects the failure, mirroring how the websocket bridge maps the
+	// same response.failed/incomplete into an errored turn. Classify the event so
+	// rate limits (429) and overloads (503) keep their exact status rather than
+	// all collapsing to bad-gateway.
+	failureStatus, _, _ := responsesWebSocketStreamFailureDetails(event)
+	if failureStatus == 0 {
+		failureStatus = http.StatusBadGateway
+	}
+	observeResponseFailureStatus(t.ctx, failureStatus)
 
 	fields := []logger.Field{
 		logger.F("endpoint", "responses_stream_failure"),

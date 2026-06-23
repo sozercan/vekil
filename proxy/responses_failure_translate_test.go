@@ -394,3 +394,34 @@ func (r *blockingReadCloser) Close() error {
 	})
 	return nil
 }
+
+// TestStreamResponsesPipeRecordsUsage verifies the streaming POST /v1/responses
+// path observes token usage from the response.completed SSE event into the
+// per-request RequestSummary, while forwarding the stream bytes unchanged.
+func TestStreamResponsesPipeRecordsUsage(t *testing.T) {
+	sse := "event: response.created\n" +
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n" +
+		"event: response.completed\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"," +
+		"\"usage\":{\"input_tokens\":210,\"output_tokens\":75,\"total_tokens\":285," +
+		"\"input_tokens_details\":{\"cached_tokens\":40}," +
+		"\"output_tokens_details\":{\"reasoning_tokens\":18}}}}\n\n"
+
+	ctx, summary := WithRequestSummary(context.Background())
+	rec := httptest.NewRecorder()
+	h := &ProxyHandler{log: logger.New(logger.LevelInfo)}
+
+	streamResponsesPipeWithFailureLog(ctx, h, rec, strings.NewReader(sse), http.Header{}, nil, "")
+
+	d := readSummaryForStats(summary)
+	if d.prompt != 210 || d.completion != 75 || d.total != 285 {
+		t.Fatalf("streamed usage not recorded: prompt=%d completion=%d total=%d", d.prompt, d.completion, d.total)
+	}
+	if d.cached != 40 || d.reasoning != 18 {
+		t.Fatalf("streamed detail usage not recorded: cached=%d reasoning=%d", d.cached, d.reasoning)
+	}
+	// The stream bytes must be forwarded to the client unchanged.
+	if got := rec.Body.String(); got != sse {
+		t.Fatalf("stream body altered.\n got: %q\nwant: %q", got, sse)
+	}
+}

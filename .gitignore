@@ -1,4 +1,7 @@
-vekil
+/vekil
+/menubar
+/vekil-menubar
+/vekil-tray
 Vekil.app/
 .build/
 .DS_Store

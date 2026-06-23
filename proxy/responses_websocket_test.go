@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -110,6 +111,52 @@ func TestResponsesWebSocketCreateRequest_IgnoresInitiatorForSignatureAndUpstream
 		if _, ok := upstream[key]; ok {
 			t.Fatalf("upstream request should not include websocket field %q", key)
 		}
+	}
+}
+
+func TestResponsesWebSocketClientWriteErrorIsClientDisconnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !isResponsesWebSocketClientDisconnect(context.Background(), &responsesWebSocketClientWriteError{err: io.ErrClosedPipe}) {
+		t.Fatal("wrapped websocket write errors should be classified as client disconnects")
+	}
+	if !isResponsesWebSocketClientDisconnect(ctx, context.Canceled) {
+		t.Fatal("canceled session context should be classified as client disconnect")
+	}
+}
+
+func TestResponsesWebSocketStreamUpstreamResponseWrapsClientWriteError(t *testing.T) {
+	connCh := make(chan *websocket.Conn, 1)
+	done := make(chan struct{})
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		connCh <- conn
+		<-done
+		_ = conn.Close()
+	}))
+	defer server.Close()
+	defer close(done)
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	client, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	serverConn := <-connCh
+	_ = client.Close()
+	_ = serverConn.Close()
+
+	session := &responsesWebSocketSession{conn: serverConn, ctx: context.Background()}
+	stream := strings.NewReader("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n" +
+		"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n\n")
+	_, _, _, err = session.streamUpstreamResponse(nil, stream, nil)
+	if !errors.Is(err, errResponsesWebSocketClientWrite) {
+		t.Fatalf("streamUpstreamResponse error = %v, want client write sentinel", err)
 	}
 }
 
@@ -873,7 +920,7 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 
 		if instructions, _ := body["instructions"].(string); strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprint(w, `{"id":"comp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint summary"}]}]}`)
+			_, _ = fmt.Fprint(w, `{"id":"comp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint summary"}]}],"usage":{"input_tokens":1000,"output_tokens":200,"total_tokens":1200}}`)
 			return
 		}
 
@@ -898,6 +945,7 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 		AutoCompactMaxBytes: 1 << 20,
 		AutoCompactKeepTail: 2,
 	}
+	handler.stats = newStatsCollector()
 
 	server := startResponsesWebSocketProxyServer(t, handler)
 	conn := mustDialResponsesWebSocket(t, server, nil)
@@ -959,6 +1007,22 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 	}
 	if got := inputTextFromMessage(t, secondTurnInput[3]); got != "second turn" {
 		t.Fatalf("expected latest user turn to be preserved, got %q", got)
+	}
+
+	// The internal auto-compaction call spends upstream /responses tokens that do
+	// not flow through the HTTP middleware; assert they were recorded into stats
+	// as their own turn (round-5: long auto-compacting sessions must not
+	// underreport token spend). The compaction upstream reports 1000+200 tokens.
+	deadlineStats := time.Now().Add(2 * time.Second)
+	for {
+		snap := handler.stats.snapshot()
+		if snap.Totals.TotalTokens >= 1200 {
+			break
+		}
+		if time.Now().After(deadlineStats) {
+			t.Fatalf("expected compaction usage (>=1200 tokens) recorded in stats, got %d", snap.Totals.TotalTokens)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1084,7 +1148,7 @@ func TestResponsesWebSocketAutoCompactsShortBytePressureHistory(t *testing.T) {
 	if !responsesWebSocketHistoryExceedsThreshold(session.historyItems, handler.responsesWS) {
 		t.Fatalf("expected short history to exceed byte threshold despite keep-tail being larger than item count")
 	}
-	_, compacted, err := session.compactHistory(handler, context.Background(), request, false)
+	_, compacted, err := session.compactHistory(handler, context.Background(), request, false, nil)
 	if err != nil {
 		t.Fatalf("compactHistory failed: %v", err)
 	}
@@ -1167,7 +1231,7 @@ func TestResponsesWebSocketCompactHistoryRewritesPriorSyntheticCheckpoint(t *tes
 	}
 	request := &responsesWebSocketCreateRequest{Model: "gpt-5.4"}
 
-	_, compacted, err := session.compactHistory(handler, context.Background(), request, false)
+	_, compacted, err := session.compactHistory(handler, context.Background(), request, false, nil)
 	if err != nil {
 		t.Fatalf("compactHistory failed: %v", err)
 	}
@@ -1236,7 +1300,7 @@ func TestResponsesWebSocketCompactHistoryKeepsToolPairsAcrossBoundary(t *testing
 	}
 	request := &responsesWebSocketCreateRequest{Model: "gpt-5.4"}
 
-	_, compacted, err := session.compactHistory(handler, context.Background(), request, false)
+	_, compacted, err := session.compactHistory(handler, context.Background(), request, false, nil)
 	if err != nil {
 		t.Fatalf("compactHistory failed: %v", err)
 	}
@@ -1322,7 +1386,7 @@ func TestResponsesWebSocketAutoCompactReducesTailWhenToolOutputDominatesBytes(t 
 	originalBytes := rawMessagesSize(session.historyItems)
 	request := &responsesWebSocketCreateRequest{Model: "gpt-5.4"}
 
-	_, compacted, err := session.compactHistory(handler, context.Background(), request, false)
+	_, compacted, err := session.compactHistory(handler, context.Background(), request, false, nil)
 	if err != nil {
 		t.Fatalf("compactHistory failed: %v", err)
 	}
@@ -1375,7 +1439,7 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 
 		if instructions, _ := body["instructions"].(string); strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprint(w, `{"id":"comp-413","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint summary after 413"}]}]}`)
+			_, _ = fmt.Fprint(w, `{"id":"comp-413","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint summary after 413"}]}],"usage":{"input_tokens":700,"output_tokens":90,"total_tokens":790}}`)
 			return
 		}
 
@@ -1404,6 +1468,7 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 		DisableAutoCompact:  true,
 		AutoCompactKeepTail: 2,
 	}
+	handler.stats = newStatsCollector()
 
 	server := startResponsesWebSocketProxyServer(t, handler)
 	conn := mustDialResponsesWebSocket(t, server, nil)
@@ -1486,6 +1551,18 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 	}
 	if got := inputTextFromMessage(t, retriedInput[3]); got != "second turn" {
 		t.Fatalf("expected retried request to keep latest user turn, got %q", got)
+	}
+
+	// The 413 oversized-replay fallback spends upstream /responses tokens on its
+	// internal compaction call; assert that spend is recorded into stats as its own
+	// turn (round-6: 413-fallback sessions must not underreport). The compaction
+	// upstream reports 700+90 tokens.
+	deadlineStats := time.Now().Add(2 * time.Second)
+	for handler.stats.snapshot().Totals.TotalTokens < 790 {
+		if time.Now().After(deadlineStats) {
+			t.Fatalf("expected 413 compaction usage (>=790 tokens) in stats, got %d", handler.stats.snapshot().Totals.TotalTokens)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
