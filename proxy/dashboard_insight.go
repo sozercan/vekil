@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -96,6 +97,29 @@ func (c *captureResponseWriter) Write(p []byte) (int, error) {
 }
 func (c *captureResponseWriter) WriteHeader(status int) { c.status = status }
 
+func dashboardInsightRequestAllowed(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "same-origin", "none":
+		// allowed by Fetch Metadata; Origin is checked below when present.
+	case "same-site", "cross-site", "cross-origin":
+		return false
+	default:
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	return strings.EqualFold(parsed.Host, r.Host)
+}
+
 // HandleDashboardInsight generates a short natural-language summary of the
 // current traffic by calling the proxy's own chat-completions endpoint with the
 // configured insight model. It fails open: any error returns a 200 with an
@@ -114,15 +138,12 @@ func (h *ProxyHandler) HandleDashboardInsight(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// CSRF guard: this endpoint spends tokens, so reject cross-site browser
-	// requests. Browsers send Sec-Fetch-Site on every fetch and it cannot be
-	// forged by page script; we allow same-origin/same-site (the dashboard) and
-	// "none" (address-bar / non-fetch), and allow an absent header (non-browser
-	// tools like curl). A cross-site or cross-origin page is rejected.
-	switch r.Header.Get("Sec-Fetch-Site") {
-	case "", "same-origin", "same-site", "none":
-		// allowed
-	default:
+	// CSRF guard: this endpoint spends tokens, so reject browser requests unless
+	// they are same-origin with this dashboard. Same-site is deliberately rejected:
+	// a sibling origin on the same registrable site is still cross-origin and should
+	// not be allowed to spend tokens. Absent Fetch Metadata is allowed for
+	// non-browser tools, but a present Origin header must still match Host.
+	if !dashboardInsightRequestAllowed(r) {
 		writeInsightError(w, "cross-site insight requests are not allowed")
 		return
 	}

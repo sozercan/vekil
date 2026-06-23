@@ -5799,6 +5799,58 @@ func TestPostJSONEndpointWithHeaders_ProxyHeadersTakePrecedence(t *testing.T) {
 	}
 }
 
+func TestHandleOpenAIChatCompletions_RetriesWithoutInjectedStreamOptions(t *testing.T) {
+	var calls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		var payload map[string]json.RawMessage
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("upstream request JSON: %v", err)
+		}
+		if n == 1 {
+			if _, ok := payload["stream_options"]; !ok {
+				t.Fatalf("first request should include injected stream_options: %s", body)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"unknown field stream_options","type":"invalid_request_error"}}`))
+			return
+		}
+		if n != 2 {
+			t.Fatalf("unexpected upstream call %d", n)
+		}
+		if _, ok := payload["stream_options"]; ok {
+			t.Fatalf("retry should remove injected stream_options: %s", body)
+		}
+		if string(payload["stream"]) != "true" {
+			t.Fatalf("retry should remain streaming, stream=%s", payload["stream"])
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	})
+
+	reqBody := `{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"Hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d want 200 after retry, body=%s", resp.StatusCode, body)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "data: [DONE]") || !strings.Contains(string(body), "ok") {
+		t.Fatalf("stream response not forwarded after retry: %s", body)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls = %d want 2", calls.Load())
+	}
+}
+
 func TestHandleOpenAIChatCompletionsUpstreamError(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

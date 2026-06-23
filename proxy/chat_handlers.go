@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,10 @@ import (
 type chatCompletionsMode struct {
 	clientRequestedStream bool
 	forceUpstreamStream   bool
+	// injectedStreamUsage is true when the proxy added stream_options.include_usage
+	// to a streamed upstream request. If a strict OpenAI-compatible provider rejects
+	// that optional field with 400, the request can be retried once without it.
+	injectedStreamUsage bool
 	// injectedClientStreamUsage is true when the proxy added
 	// stream_options.include_usage to a client-requested stream that did not opt
 	// in. On the verbatim OpenAI passthrough the resulting upstream usage-only
@@ -51,6 +56,7 @@ func prepareOpenAIChatCompletionsRequest(body []byte) ([]byte, chatCompletionsMo
 	body = injectParallelToolCalls(body)
 	if mode.forceUpstreamStream {
 		body = injectForceStream(body)
+		mode.injectedStreamUsage = true
 	} else if mode.clientRequestedStream {
 		// Ask upstream for a usage chunk so streamed traffic records tokens.
 		// Record whether we actually injected it (the client supplied no
@@ -59,6 +65,7 @@ func prepareOpenAIChatCompletionsRequest(body []byte) ([]byte, chatCompletionsMo
 		// terminal chunk it never opted into.
 		var injected bool
 		body, injected = ensureStreamUsage(body)
+		mode.injectedStreamUsage = injected
 		mode.injectedClientStreamUsage = injected
 	}
 	return body, mode
@@ -78,12 +85,14 @@ func prepareAnthropicChatCompletionsRequest(req *models.AnthropicRequest) ([]byt
 		// Force-streamed or client-streamed: ask upstream for a usage chunk so
 		// the request records tokens. For force-stream we also set stream:true;
 		// for a client stream the request already streams, we only add the
-		// usage option.
+		// usage option. A strict OpenAI-compatible provider may reject
+		// stream_options; callers retry once without it when that happens.
 		if mode.forceUpstreamStream {
 			stream := true
 			oaiReq.Stream = &stream
 		}
 		oaiReq.StreamOptions = &models.StreamOptions{IncludeUsage: true}
+		mode.injectedStreamUsage = true
 	}
 
 	body, err := json.Marshal(oaiReq)
@@ -306,6 +315,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	resp, oaiBody, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, oaiBody, mode)
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	if resp.StatusCode != http.StatusOK {
@@ -535,6 +545,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 
+	resp, bodyBytes, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, bodyBytes, mode)
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
@@ -715,4 +726,46 @@ func ensureStreamUsage(body []byte) ([]byte, bool) {
 		return body, false
 	}
 	return result, true
+}
+
+func stripStreamOptions(body []byte) ([]byte, bool) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body, false
+	}
+	if _, ok := m["stream_options"]; !ok {
+		return body, false
+	}
+	delete(m, "stream_options")
+	result, err := json.Marshal(m)
+	if err != nil {
+		return body, false
+	}
+	return result, true
+}
+
+func (h *ProxyHandler) retryChatCompletionsWithoutInjectedStreamOptions(ctx context.Context, resp *http.Response, body []byte, mode chatCompletionsMode) (*http.Response, []byte, chatCompletionsMode) {
+	if h == nil || resp == nil || resp.StatusCode != http.StatusBadRequest || !mode.injectedStreamUsage {
+		return resp, body, mode
+	}
+	fallbackBody, ok := stripStreamOptions(body)
+	if !ok {
+		return resp, body, mode
+	}
+	retryResp, err := h.postChatCompletions(ctx, fallbackBody)
+	if err != nil {
+		if h != nil && h.log != nil {
+			h.log.Debug("retry without stream_options failed", logger.Err(err))
+		}
+		return resp, body, mode
+	}
+	if resp.Body != nil {
+		drainAndClose(resp.Body)
+	}
+	mode.injectedStreamUsage = false
+	mode.injectedClientStreamUsage = false
+	if h != nil && h.log != nil {
+		h.log.Debug("retried chat completions without injected stream_options", logger.F("status", retryResp.StatusCode))
+	}
+	return retryResp, fallbackBody, mode
 }

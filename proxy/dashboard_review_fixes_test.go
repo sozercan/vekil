@@ -15,10 +15,9 @@ import (
 )
 
 // TestHandleDashboardInsightRejectsCrossSite covers the CSRF guard: the
-// token-spending insight endpoint must reject a cross-site browser request
-// (Sec-Fetch-Site: cross-site) before attempting any generation, while allowing
-// same-origin requests and non-browser callers (absent header) through to the
-// rate-limit gate.
+// token-spending insight endpoint must reject a cross-site or merely same-site
+// browser request before attempting any generation, while allowing same-origin
+// requests and non-browser callers (absent header) through to the rate-limit gate.
 func TestHandleDashboardInsightRejectsCrossSite(t *testing.T) {
 	h := &ProxyHandler{
 		stats:           newStatsCollector(),
@@ -54,6 +53,25 @@ func TestHandleDashboardInsightRejectsCrossSite(t *testing.T) {
 	h.HandleDashboardInsight(w2, req2)
 	if got := decode(t, w2.Result().Body); !strings.Contains(got.Error, "cross-site") {
 		t.Fatalf("expected cross-origin to be rejected, got error=%q", got.Error)
+	}
+
+	// same-site is still cross-origin and must be rejected.
+	reqSameSite := httptest.NewRequest(http.MethodPost, "/dashboard/insight", nil)
+	reqSameSite.Header.Set("Sec-Fetch-Site", "same-site")
+	wSameSite := httptest.NewRecorder()
+	h.HandleDashboardInsight(wSameSite, reqSameSite)
+	if got := decode(t, wSameSite.Result().Body); !strings.Contains(got.Error, "cross-site") {
+		t.Fatalf("expected same-site to be rejected, got error=%q", got.Error)
+	}
+
+	// A present Origin header must match Host even if Fetch Metadata says same-origin.
+	reqBadOrigin := httptest.NewRequest(http.MethodPost, "http://dashboard.local/dashboard/insight", nil)
+	reqBadOrigin.Header.Set("Sec-Fetch-Site", "same-origin")
+	reqBadOrigin.Header.Set("Origin", "http://evil.local")
+	wBadOrigin := httptest.NewRecorder()
+	h.HandleDashboardInsight(wBadOrigin, reqBadOrigin)
+	if got := decode(t, wBadOrigin.Result().Body); !strings.Contains(got.Error, "cross-site") {
+		t.Fatalf("expected mismatched Origin to be rejected, got error=%q", got.Error)
 	}
 
 	// same-origin passes the CSRF guard. To prove it cleared the guard without
