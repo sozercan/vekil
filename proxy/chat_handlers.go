@@ -330,7 +330,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 				resp.Body,
 				req.Model,
 				"msg_"+uuid.New().String(),
-				func() { observeResponseFailureStatus(r.Context(), http.StatusBadGateway) },
+				func(status int) { observeResponseFailureStatus(r.Context(), status) },
 				h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope),
 				openAIChatStreamUsageCallback(r.Context()),
 			)
@@ -543,8 +543,9 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			finalResponse := h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope)
 			usage := openAIChatStreamUsageCallback(r.Context())
 			// A post-commit upstream stream error (the 200 header is already sent)
-			// should be recorded as a failed request, not a 2xx success.
-			onError := func() { observeResponseFailureStatus(r.Context(), http.StatusBadGateway) }
+			// should be recorded as a failed request with its classified status
+			// (e.g. 429 for a rate limit), not a 2xx success.
+			onError := func(status int) { observeResponseFailureStatus(r.Context(), status) }
 			// dropInjectedUsage drops the upstream usage-only chunk the proxy asked
 			// for when the client did not opt into stream_options.include_usage.
 			StreamOpenAIChatPassthrough(w, resp.Body, mode.injectedClientStreamUsage, onError, finalResponse, usage)

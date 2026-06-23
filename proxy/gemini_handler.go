@@ -128,7 +128,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	}
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			StreamOpenAIToGeminiWithFinalResponse(w, resp.Body, func() { observeResponseFailureStatus(r.Context(), http.StatusBadGateway) }, h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope), openAIChatStreamUsageCallback(r.Context()))
+			StreamOpenAIToGeminiWithFinalResponse(w, resp.Body, func(status int) { observeResponseFailureStatus(r.Context(), status) }, h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope), openAIChatStreamUsageCallback(r.Context()))
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)

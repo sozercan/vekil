@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"strings"
 
 	"github.com/sozercan/vekil/models"
 )
@@ -230,6 +232,47 @@ func (a *anthropicStreamUsageAccumulator) observe(data []byte) {
 			a.haveOutput = true
 		}
 	}
+}
+
+// anthropicStreamErrorStatus inspects an Anthropic SSE data payload and, if it
+// is an error event ({"type":"error","error":{"type":...}}), returns the mapped
+// HTTP status and ok=true. Anthropic streams an error frame for post-commit
+// failures (e.g. overloaded_error, rate_limit_error). Returns ok=false for any
+// non-error frame.
+func anthropicStreamErrorStatus(data []byte) (int, bool) {
+	var event struct {
+		Type  string `json:"type"`
+		Error *struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(data, &event); err != nil {
+		return 0, false
+	}
+	if event.Type != "error" && event.Error == nil {
+		return 0, false
+	}
+	errType := ""
+	if event.Error != nil {
+		errType = strings.ToLower(strings.TrimSpace(event.Error.Type))
+	}
+	switch errType {
+	case "rate_limit_error", "rate_limit_exceeded":
+		return http.StatusTooManyRequests, true
+	case "overloaded_error":
+		return http.StatusServiceUnavailable, true
+	case "api_error", "internal_server_error":
+		return http.StatusBadGateway, true
+	case "invalid_request_error":
+		return http.StatusBadRequest, true
+	case "authentication_error":
+		return http.StatusUnauthorized, true
+	case "permission_error":
+		return http.StatusForbidden, true
+	case "not_found_error":
+		return http.StatusNotFound, true
+	}
+	return http.StatusBadGateway, true
 }
 
 func (a *anthropicStreamUsageAccumulator) flush(ctx context.Context) {

@@ -117,16 +117,19 @@ func StreamOpenAIPassthroughDroppingInjectedUsage(
 
 // StreamOpenAIChatPassthrough forwards an OpenAI chat SSE stream to the client
 // like StreamOpenAIPassthroughWithFinalResponse, additionally invoking onError
-// when a post-commit upstream error event (event: error / data: {"error":...})
-// is seen, and dropping the proxy-injected usage-only chunk when dropInjectedUsage
-// is set. It is the entry point for the client-facing /v1/chat/completions
-// streaming path, where the request must be recorded as a failure if the stream
-// errors after its 200 header was committed.
+// (with the failure's HTTP status) when a post-commit upstream error event
+// (event: error / data: {"error":...}), an upstream read error, or a premature
+// end is seen, and dropping the proxy-injected usage-only chunk when
+// dropInjectedUsage is set. onError receives the classified status (e.g. 429 for
+// a rate limit) or 502 for a generic transport break. It is the entry point for
+// the client-facing /v1/chat/completions streaming path, where the request must
+// be recorded as a failure if the stream errors after its 200 header was
+// committed. onError is never invoked for a client-side write failure.
 func StreamOpenAIChatPassthrough(
 	w http.ResponseWriter,
 	body io.ReadCloser,
 	dropInjectedUsage bool,
-	onError func(),
+	onError func(status int),
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
@@ -145,7 +148,7 @@ func streamOpenAIPassthrough(
 	w http.ResponseWriter,
 	body io.ReadCloser,
 	dropInjectedUsage bool,
-	onError func(),
+	onError func(status int),
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
@@ -177,6 +180,7 @@ func streamOpenAIPassthrough(
 
 	sawDone := false
 	dropCurrent := false
+	errorReported := false
 	var accumulator sseDataAccumulator
 	pending := make([]string, 0, 4)
 	processData := func(eventType string, data string) bool {
@@ -187,10 +191,12 @@ func streamOpenAIPassthrough(
 
 		// A post-commit upstream error (event: error or data: {"error":...})
 		// arrives after the HTTP 200; surface it so the request is recorded as a
-		// failure even though the client already received a 200 header.
-		if onError != nil {
-			if _, isErr := parseOpenAIStreamError(eventType, data); isErr {
-				onError()
+		// failure even though the client already received a 200 header, with the
+		// error's classified status (e.g. 429 for a rate limit) rather than 502.
+		if onError != nil && !errorReported {
+			if streamErr, isErr := parseOpenAIStreamError(eventType, data); isErr {
+				onError(streamErr.httpStatus())
+				errorReported = true
 			}
 		}
 
@@ -231,34 +237,51 @@ func streamOpenAIPassthrough(
 		return true
 	}
 
+	rawForwardOnly := false
 	for {
 		line, err := readOpenAISSELine(reader)
 		if errors.Is(err, errOpenAISSELineTooLong) {
 			// A single SSE line exceeded the parse buffer (e.g. a very large
 			// tool-call argument). The returned bytes are valid but the line is
 			// truncated for parsing, so flush everything buffered for this event
-			// plus the partial line, then fall back to a raw copy of the remainder.
-			// This keeps the client stream intact; it is not a failure.
+			// plus the partial line and forward it raw. This keeps the client
+			// stream intact and is not a failure. We switch to raw-forward mode so
+			// subsequent lines are written immediately, but keep tapping them for
+			// usage / error events so a terminal usage chunk or post-oversized
+			// error after the big line is still recorded.
 			for _, l := range pending {
 				if _, werr := io.WriteString(w, l); werr != nil {
 					return
 				}
 			}
+			pending = pending[:0]
 			if _, werr := io.WriteString(w, line); werr != nil {
 				return
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
-			_, _ = io.Copy(&flushWriter{w: w, flusher: flusher}, reader)
-			return
+			rawForwardOnly = true
+			continue
 		}
 		if len(line) > 0 {
-			pending = append(pending, line)
-			isBoundary := strings.TrimRight(line, "\r\n") == ""
-			accumulator.consumeLine(line, processData)
-			if isBoundary && !flushEvent() {
-				return
+			if rawForwardOnly {
+				// Forward the line immediately (no drop-buffering after an oversized
+				// line) while still feeding the parser for usage/error detection.
+				if _, werr := io.WriteString(w, line); werr != nil {
+					return
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+				accumulator.consumeLine(line, processData)
+			} else {
+				pending = append(pending, line)
+				isBoundary := strings.TrimRight(line, "\r\n") == ""
+				accumulator.consumeLine(line, processData)
+				if isBoundary && !flushEvent() {
+					return
+				}
 			}
 		}
 		if err != nil {
@@ -266,9 +289,10 @@ func streamOpenAIPassthrough(
 				break
 			}
 			// Any other non-EOF read error after the 200 was committed is a broken
-			// stream (upstream reset / transport error); surface it as a failure.
-			if onError != nil {
-				onError()
+			// stream (upstream reset / transport error); surface it as a failure
+			// unless an error event already reported a (more specific) status.
+			if onError != nil && !errorReported {
+				onError(http.StatusBadGateway)
 			}
 			return
 		}
@@ -281,8 +305,8 @@ func streamOpenAIPassthrough(
 	if !sawDone {
 		// The stream ended (EOF) without a [DONE] sentinel: the upstream closed
 		// the connection prematurely, so the client received a truncated stream.
-		if onError != nil {
-			onError()
+		if onError != nil && !errorReported {
+			onError(http.StatusBadGateway)
 		}
 		return
 	}
@@ -311,29 +335,52 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 	}
 
 	// Tap each SSE frame for Anthropic usage so direct-routed streaming traffic
-	// records tokens. The tap never alters the bytes written to the client.
+	// records tokens. The tap never alters the bytes written to the client. Also
+	// record a failure status when the stream carries an Anthropic error frame or
+	// the upstream read breaks, so a post-commit failure is not counted as a 2xx
+	// success (client-side write failures are excluded — they are client aborts).
 	usage := &anthropicStreamUsageAccumulator{}
 	defer usage.flush(ctx)
+	markFailure := func(data []byte) {
+		if status, ok := anthropicStreamErrorStatus(data); ok {
+			observeResponseFailureStatus(ctx, status)
+		}
+	}
 
 	if publicModel == "" || publicModel == upstreamModel {
 		// No model rewrite: preserve the original byte-exact, unbounded passthrough
 		// (io.Copy handles SSE lines of any size) while teeing the bytes through a
-		// best-effort usage sniffer. The sniffer skips lines it cannot buffer, so
-		// an oversized line degrades usage capture for that turn rather than
-		// truncating the client stream.
-		sniffer := newAnthropicUsageSniffWriter(usage)
-		_, _ = io.Copy(&flushWriter{w: w, flusher: flusher}, io.TeeReader(body, sniffer))
+		// best-effort usage/error sniffer. The sniffer skips lines it cannot buffer.
+		sniffer := newAnthropicUsageSniffWriter(usage, markFailure)
+		fw := &flushWriter{w: w, flusher: flusher}
+		if _, err := io.Copy(fw, io.TeeReader(body, sniffer)); err != nil {
+			// io.Copy failed: distinguish a client-side write error (client gone,
+			// recorded on the flushWriter) from an upstream read break. Only an
+			// upstream read break is an upstream failure.
+			if ctx.Err() == nil && fw.writeErr == nil {
+				observeResponseFailureStatus(ctx, http.StatusBadGateway)
+			}
+		}
 		return
 	}
 
 	reader := bufio.NewReaderSize(body, openAIStreamScannerInitialBuffer)
 	frame := make([]string, 0, 4)
+	clientWriteFailed := false
 	emit := func() {
 		if len(frame) == 0 {
 			return
 		}
-		observeAnthropicFrameUsage(usage, frame)
-		writeAnthropicSSEFrame(w, frame, publicModel)
+		for _, line := range frame {
+			content, _ := splitSSELineEnding(line)
+			if data, ok := parseSSELine(content); ok {
+				usage.observe([]byte(data))
+				markFailure([]byte(data))
+			}
+		}
+		if !writeAnthropicSSEFrame(w, frame, publicModel) {
+			clientWriteFailed = true
+		}
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -349,24 +396,30 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 		}
 		if err != nil {
 			emit()
+			if err != io.EOF && ctx.Err() == nil && !clientWriteFailed {
+				// Upstream read error after the 200 was committed: a broken stream.
+				observeResponseFailureStatus(ctx, http.StatusBadGateway)
+			}
 			return
 		}
 	}
 }
 
-// anthropicUsageSniffWriter scans an Anthropic SSE byte stream for usage as it
-// is copied to the client. It buffers a single SSE line at a time and, on each
-// complete data line, feeds the payload to the accumulator. A line longer than
-// the buffer cap is skipped (its usage, if any, is not recorded) so the sniffer
-// never affects the client copy or grows unbounded.
+// anthropicUsageSniffWriter scans an Anthropic SSE byte stream for usage (and
+// error frames) as it is copied to the client. It buffers a single SSE line at a
+// time and, on each complete data line, feeds the payload to the accumulator and
+// the optional onData callback (used to detect error frames). A line longer than
+// the buffer cap is skipped so the sniffer never affects the client copy or grows
+// unbounded.
 type anthropicUsageSniffWriter struct {
 	acc      *anthropicStreamUsageAccumulator
+	onData   func([]byte)
 	line     []byte
 	overflow bool
 }
 
-func newAnthropicUsageSniffWriter(acc *anthropicStreamUsageAccumulator) *anthropicUsageSniffWriter {
-	return &anthropicUsageSniffWriter{acc: acc, line: make([]byte, 0, 512)}
+func newAnthropicUsageSniffWriter(acc *anthropicStreamUsageAccumulator, onData func([]byte)) *anthropicUsageSniffWriter {
+	return &anthropicUsageSniffWriter{acc: acc, onData: onData, line: make([]byte, 0, 512)}
 }
 
 func (s *anthropicUsageSniffWriter) Write(p []byte) (int, error) {
@@ -375,6 +428,9 @@ func (s *anthropicUsageSniffWriter) Write(p []byte) (int, error) {
 			if !s.overflow {
 				if data, ok := parseSSELine(strings.TrimRight(string(s.line), "\r")); ok {
 					s.acc.observe([]byte(data))
+					if s.onData != nil {
+						s.onData([]byte(data))
+					}
 				}
 			}
 			s.line = s.line[:0]
@@ -392,33 +448,29 @@ func (s *anthropicUsageSniffWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// observeAnthropicFrameUsage feeds the data payload of an SSE frame (its
-// "data:" lines, joined) to the Anthropic usage accumulator.
-func observeAnthropicFrameUsage(acc *anthropicStreamUsageAccumulator, frame []string) {
-	for _, line := range frame {
-		content, _ := splitSSELineEnding(line)
-		if data, ok := parseSSELine(content); ok {
-			acc.observe([]byte(data))
-		}
-	}
-}
-
-func writeAnthropicSSEFrame(w io.Writer, frame []string, publicModel string) {
+func writeAnthropicSSEFrame(w io.Writer, frame []string, publicModel string) bool {
 	for _, line := range frame {
 		content, ending := splitSSELineEnding(line)
 		data, ok := parseSSELine(content)
 		if !ok {
-			_, _ = io.WriteString(w, line)
+			if _, err := io.WriteString(w, line); err != nil {
+				return false
+			}
 			continue
 		}
 
 		rewritten, changed := rewriteAnthropicResponseModelJSON([]byte(data), publicModel, "")
 		if !changed {
-			_, _ = io.WriteString(w, line)
+			if _, err := io.WriteString(w, line); err != nil {
+				return false
+			}
 			continue
 		}
-		_, _ = fmt.Fprintf(w, "data: %s%s", rewritten, ending)
+		if _, err := fmt.Fprintf(w, "data: %s%s", rewritten, ending); err != nil {
+			return false
+		}
 	}
+	return true
 }
 
 func splitSSELineEnding(line string) (string, string) {
@@ -448,7 +500,7 @@ func StreamOpenAIToAnthropicWithFinalResponse(
 	body io.ReadCloser,
 	model string,
 	requestID string,
-	onError func(),
+	onError func(status int),
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
@@ -476,20 +528,27 @@ func StreamOpenAIToAnthropicWithFinalResponse(
 		return state.consumeChunk(chunk)
 	})
 	if err != nil {
-		if onError != nil {
-			onError()
-		}
 		var streamErr *openAIStreamError
 		if errors.As(err, &streamErr) {
+			// A genuine upstream error event/read error: record the classified
+			// failure status (not on a client-side write abort).
+			if onError != nil && !state.clientWriteFailed {
+				onError(streamErr.httpStatus())
+			}
 			state.emitError(streamErr.Error())
 			return
+		}
+		if onError != nil && !state.clientWriteFailed {
+			onError(http.StatusBadGateway)
 		}
 		state.emitError(fmt.Sprintf("upstream stream read failed: %v", err))
 		return
 	}
 	if !sawDone {
-		if onError != nil {
-			onError()
+		// The stream stopped before [DONE]. If our writes to the client failed,
+		// this is a client abort, not an upstream failure — do not record it.
+		if onError != nil && !state.clientWriteFailed {
+			onError(http.StatusBadGateway)
 		}
 		state.emitError("upstream stream ended before [DONE]")
 		return
@@ -536,6 +595,10 @@ type anthropicStreamState struct {
 	storedUsage         *models.OpenAIUsage
 	toolCallBlockIndex  map[int]int
 	openToolCallIndexes map[int]struct{}
+	// clientWriteFailed is set when an emit to the client fails (the client
+	// disconnected). It lets the caller distinguish a client-side abort from an
+	// upstream stream failure so the request is not mislabeled as a 502.
+	clientWriteFailed bool
 }
 
 func newAnthropicStreamState(w http.ResponseWriter, model string, requestID string) *anthropicStreamState {
@@ -564,7 +627,11 @@ func (s *anthropicStreamState) start() bool {
 }
 
 func (s *anthropicStreamState) emit(eventType string, data interface{}) bool {
-	return writeSSEEvent(s.w, eventType, data) == nil
+	if writeSSEEvent(s.w, eventType, data) != nil {
+		s.clientWriteFailed = true
+		return false
+	}
+	return true
 }
 
 func (s *anthropicStreamState) emitError(message string) bool {

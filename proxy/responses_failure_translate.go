@@ -24,7 +24,13 @@ const (
 	// response output plus the usage object — long Codex turns routinely exceed
 	// 64 KiB — so it is sized at 1 MiB. On overflow the tap still best-effort
 	// sniffs usage from the buffered bytes before dropping them.
-	responsesFailureTapMaxBuffer    = 1 << 20
+	responsesFailureTapMaxBuffer = 1 << 20
+	// responsesFailureTapOverflowTail is the trailing window retained when a
+	// single SSE event overflows the buffer. A streamed response.completed embeds
+	// its (small) usage object near the end of the event, so retaining the tail
+	// lets a later chunk complete the "usage":{...} object for sniffing instead of
+	// dropping it. 64 KiB comfortably holds a usage object plus surrounding JSON.
+	responsesFailureTapOverflowTail = 64 * 1024
 	responsesFailureLogMessageLimit = 256
 )
 
@@ -678,6 +684,17 @@ type responsesFailureTap struct {
 	scope           string
 	responseScope   string
 	parser          responsesSSEParser
+	// overflowed is set once a single SSE event has exceeded the buffer cap, so
+	// later writes keep best-effort sniffing usage from the rolling tail (the
+	// event's framing is unrecoverable once dropped, so the normal dispatch path
+	// cannot parse it).
+	overflowed bool
+	// overflowUsageRecorded is set once usage has been recovered from an
+	// overflowed event, to avoid redundant re-sniffing on every subsequent write.
+	overflowUsageRecorded bool
+	// usageTail is a bounded rolling window of the most recent raw stream bytes,
+	// used to recover usage from an oversized streamed response.completed event.
+	usageTail []byte
 }
 
 func newResponsesFailureTap(ctx context.Context, h *ProxyHandler, upstreamHeaders http.Header, store *ToolExecutionContextStore, scope string) *responsesFailureTap {
@@ -695,6 +712,14 @@ func newResponsesFailureTap(ctx context.Context, h *ProxyHandler, upstreamHeader
 }
 
 func (t *responsesFailureTap) Write(p []byte) (int, error) {
+	// Maintain a small rolling tail of the raw byte stream, independent of the SSE
+	// parser's pending buffer, so usage can be recovered from a very large streamed
+	// response.completed event even after the parser truncates/clears its buffer
+	// (the giant event's framing is corrupted once it overflows, so the normal
+	// dispatch path cannot parse it). usage sits near the end of the event, so a
+	// bounded tail of recent bytes is enough to capture the "usage":{...} object.
+	t.appendUsageTail(p)
+
 	t.parser.push(p)
 	for {
 		msg, ok := t.parser.nextSemantic()
@@ -703,16 +728,32 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 		}
 		t.maybeProcess(msg)
 	}
+	if t.overflowed {
+		t.sniffUsageFromOverflow(t.usageTail)
+	}
 	if len(t.parser.pending) > responsesFailureTapMaxBuffer {
-		// The event exceeds the buffer (e.g. a very large response.completed whose
-		// delimiter has not arrived yet). Best-effort sniff usage from the buffered
-		// bytes before dropping them, so an oversized completed event still records
-		// tokens instead of degrading to zero.
-		t.sniffUsageFromOverflow(t.parser.pending)
+		// The event exceeds the buffer (a very large response.completed whose
+		// delimiter has not arrived). Sniff usage from the rolling tail, then drop
+		// the parser buffer (its framing is unrecoverable) and flag overflow so
+		// later writes keep sniffing the tail.
+		t.overflowed = true
+		t.sniffUsageFromOverflow(t.usageTail)
 		t.parser.pending = nil
 		t.parser.allowBOM = false
 	}
 	return len(p), nil
+}
+
+// appendUsageTail keeps the last responsesFailureTapOverflowTail bytes of the raw
+// stream in t.usageTail for best-effort usage recovery from oversized events.
+func (t *responsesFailureTap) appendUsageTail(p []byte) {
+	if t.overflowUsageRecorded {
+		return
+	}
+	t.usageTail = append(t.usageTail, p...)
+	if len(t.usageTail) > responsesFailureTapOverflowTail {
+		t.usageTail = t.usageTail[len(t.usageTail)-responsesFailureTapOverflowTail:]
+	}
 }
 
 // sniffUsageFromOverflow extracts a usage object from a partially-buffered SSE
@@ -722,8 +763,12 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 // observed onto the summary, a later real terminal event would just re-observe
 // the same value. Best-effort: any parse failure is ignored.
 func (t *responsesFailureTap) sniffUsageFromOverflow(buf []byte) {
+	if t.overflowUsageRecorded {
+		return
+	}
 	if usage, ok := extractResponsesUsageObject(buf); ok {
 		observeResponsesUsage(t.ctx, usage)
+		t.overflowUsageRecorded = true
 	}
 }
 

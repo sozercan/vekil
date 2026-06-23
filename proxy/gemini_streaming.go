@@ -57,7 +57,7 @@ func StreamOpenAIToGemini(w http.ResponseWriter, body io.ReadCloser) {
 func StreamOpenAIToGeminiWithFinalResponse(
 	w http.ResponseWriter,
 	body io.ReadCloser,
-	onError func(),
+	onError func(status int),
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
@@ -81,20 +81,23 @@ func StreamOpenAIToGeminiWithFinalResponse(
 		return state.consumeChunk(chunk)
 	})
 	if err != nil {
-		if onError != nil {
-			onError()
-		}
 		var streamErr *openAIStreamError
 		if errors.As(err, &streamErr) {
+			if onError != nil && !state.clientWriteFailed {
+				onError(streamErr.httpStatus())
+			}
 			state.writeError(streamErr.Error())
 			return
+		}
+		if onError != nil && !state.clientWriteFailed {
+			onError(http.StatusBadGateway)
 		}
 		state.writeError(fmt.Sprintf("upstream stream read failed: %v", err))
 		return
 	}
 	if !sawDone {
-		if onError != nil {
-			onError()
+		if onError != nil && !state.clientWriteFailed {
+			onError(http.StatusBadGateway)
 		}
 		state.writeError("upstream stream ended before [DONE]")
 		return
@@ -111,6 +114,10 @@ type geminiStreamState struct {
 	bufferedToolCalls  map[int]*geminiStreamingToolCall
 	storedFinishReason string
 	storedUsage        *models.OpenAIUsage
+	// clientWriteFailed is set when a write to the client fails (client
+	// disconnected), so the caller can distinguish a client abort from an
+	// upstream failure and avoid mislabeling it as a 502.
+	clientWriteFailed bool
 }
 
 func newGeminiStreamState(w http.ResponseWriter) *geminiStreamState {
@@ -320,7 +327,11 @@ func (s *geminiStreamState) writeTail() bool {
 }
 
 func (s *geminiStreamState) writeData(data interface{}) bool {
-	return writeGeminiSSEData(s.w, data) == nil
+	if writeGeminiSSEData(s.w, data) != nil {
+		s.clientWriteFailed = true
+		return false
+	}
+	return true
 }
 
 func (s *geminiStreamState) writeError(message string) bool {

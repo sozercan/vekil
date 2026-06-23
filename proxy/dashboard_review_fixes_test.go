@@ -544,7 +544,7 @@ func TestStreamOpenAIChatPassthroughDetectsErrorEvent(t *testing.T) {
 			body := io.NopCloser(strings.NewReader(tc.stream))
 			w := httptest.NewRecorder()
 			errored := false
-			StreamOpenAIChatPassthrough(w, body, false, func() { errored = true }, nil, func(*models.OpenAIUsage) {})
+			StreamOpenAIChatPassthrough(w, body, false, func(int) { errored = true }, nil, func(*models.OpenAIUsage) {})
 			if !errored {
 				t.Fatalf("expected onError to fire for %q", tc.name)
 			}
@@ -555,7 +555,7 @@ func TestStreamOpenAIChatPassthroughDetectsErrorEvent(t *testing.T) {
 	body := io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"))
 	w := httptest.NewRecorder()
 	errored := false
-	StreamOpenAIChatPassthrough(w, body, false, func() { errored = true }, nil, func(*models.OpenAIUsage) {})
+	StreamOpenAIChatPassthrough(w, body, false, func(int) { errored = true }, nil, func(*models.OpenAIUsage) {})
 	if errored {
 		t.Fatal("onError must not fire for a normal content stream")
 	}
@@ -669,7 +669,7 @@ func TestTranslatedStreamsFireOnErrorForUpstreamError(t *testing.T) {
 		body := io.NopCloser(strings.NewReader("event: error\ndata: {\"error\":{\"message\":\"boom\"}}\n\n"))
 		w := httptest.NewRecorder()
 		errored := false
-		StreamOpenAIToAnthropicWithFinalResponse(w, body, "claude-x", "msg_1", func() { errored = true }, nil)
+		StreamOpenAIToAnthropicWithFinalResponse(w, body, "claude-x", "msg_1", func(int) { errored = true }, nil)
 		if !errored {
 			t.Fatal("expected onError to fire for anthropic upstream error event")
 		}
@@ -678,7 +678,7 @@ func TestTranslatedStreamsFireOnErrorForUpstreamError(t *testing.T) {
 		body := io.NopCloser(strings.NewReader("event: error\ndata: {\"error\":{\"message\":\"boom\"}}\n\n"))
 		w := httptest.NewRecorder()
 		errored := false
-		StreamOpenAIToGeminiWithFinalResponse(w, body, func() { errored = true }, nil)
+		StreamOpenAIToGeminiWithFinalResponse(w, body, func(int) { errored = true }, nil)
 		if !errored {
 			t.Fatal("expected onError to fire for gemini upstream error event")
 		}
@@ -688,7 +688,7 @@ func TestTranslatedStreamsFireOnErrorForUpstreamError(t *testing.T) {
 		body := io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
 		w := httptest.NewRecorder()
 		errored := false
-		StreamOpenAIToAnthropicWithFinalResponse(w, body, "claude-x", "msg_1", func() { errored = true }, nil)
+		StreamOpenAIToAnthropicWithFinalResponse(w, body, "claude-x", "msg_1", func(int) { errored = true }, nil)
 		if !errored {
 			t.Fatal("expected onError to fire when stream ends before [DONE]")
 		}
@@ -697,7 +697,7 @@ func TestTranslatedStreamsFireOnErrorForUpstreamError(t *testing.T) {
 		body := io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"))
 		w := httptest.NewRecorder()
 		errored := false
-		StreamOpenAIToAnthropicWithFinalResponse(w, body, "claude-x", "msg_1", func() { errored = true }, nil)
+		StreamOpenAIToAnthropicWithFinalResponse(w, body, "claude-x", "msg_1", func(int) { errored = true }, nil)
 		if errored {
 			t.Fatal("onError must not fire for a normal completed stream")
 		}
@@ -728,7 +728,7 @@ func TestStreamOpenAIChatPassthroughMarksTransportError(t *testing.T) {
 	body := &errAfterReader{data: []byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")}
 	w := httptest.NewRecorder()
 	errored := false
-	StreamOpenAIChatPassthrough(w, body, false, func() { errored = true }, nil, func(*models.OpenAIUsage) {})
+	StreamOpenAIChatPassthrough(w, body, false, func(int) { errored = true }, nil, func(*models.OpenAIUsage) {})
 	if !errored {
 		t.Fatal("expected onError to fire on a mid-stream transport error")
 	}
@@ -740,7 +740,7 @@ func TestStreamOpenAIChatPassthroughMarksPrematureEnd(t *testing.T) {
 	body := io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")) // no [DONE]
 	w := httptest.NewRecorder()
 	errored := false
-	StreamOpenAIChatPassthrough(w, body, false, func() { errored = true }, nil, func(*models.OpenAIUsage) {})
+	StreamOpenAIChatPassthrough(w, body, false, func(int) { errored = true }, nil, func(*models.OpenAIUsage) {})
 	if !errored {
 		t.Fatal("expected onError to fire when the stream ends before [DONE]")
 	}
@@ -758,7 +758,7 @@ func TestStreamOpenAIChatPassthroughFailsOpenOnOversizedLine(t *testing.T) {
 	body := io.NopCloser(strings.NewReader(stream))
 	w := httptest.NewRecorder()
 	errored := false
-	StreamOpenAIChatPassthrough(w, body, false, func() { errored = true }, nil, func(*models.OpenAIUsage) {})
+	StreamOpenAIChatPassthrough(w, body, false, func(int) { errored = true }, nil, func(*models.OpenAIUsage) {})
 
 	if errored {
 		t.Fatal("oversized line is not a failure; onError must not fire")
@@ -797,3 +797,98 @@ type failingResponseWriter struct {
 func (f *failingResponseWriter) Header() http.Header       { return f.header }
 func (f *failingResponseWriter) WriteHeader(int)           {}
 func (f *failingResponseWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+// TestStreamOpenAIChatPassthroughErrorStatusClassified covers round-9 [1]: a
+// post-commit error event with a classifiable code passes its mapped status to
+// onError (e.g. 429), not a hardcoded 502.
+func TestStreamOpenAIChatPassthroughErrorStatusClassified(t *testing.T) {
+	body := io.NopCloser(strings.NewReader("data: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"too_many_requests\"}}\n\n"))
+	w := httptest.NewRecorder()
+	var gotStatus int
+	StreamOpenAIChatPassthrough(w, body, false, func(status int) { gotStatus = status }, nil, func(*models.OpenAIUsage) {})
+	if gotStatus != http.StatusTooManyRequests {
+		t.Fatalf("onError status = %d want 429 (classified)", gotStatus)
+	}
+}
+
+// TestOpenAIStreamErrorHTTPStatus covers the chat stream error classifier.
+func TestOpenAIStreamErrorHTTPStatus(t *testing.T) {
+	cases := []struct {
+		code, typ string
+		want      int
+	}{
+		{"too_many_requests", "", http.StatusTooManyRequests},
+		{"model_overloaded", "", http.StatusServiceUnavailable},
+		{"", "rate_limit_error", http.StatusTooManyRequests},
+		{"something_unknown", "server_error", http.StatusBadGateway},
+		{"", "", http.StatusBadGateway},
+	}
+	for _, c := range cases {
+		e := &openAIStreamError{Code: c.code, Type: c.typ}
+		if got := e.httpStatus(); got != c.want {
+			t.Errorf("httpStatus(code=%q type=%q) = %d want %d", c.code, c.typ, got, c.want)
+		}
+	}
+	if (*openAIStreamError)(nil).httpStatus() != http.StatusBadGateway {
+		t.Fatal("nil error should map to 502")
+	}
+}
+
+// TestAnthropicStreamErrorStatus covers the direct-Anthropic error frame
+// classifier used by round-9 [2].
+func TestAnthropicStreamErrorStatus(t *testing.T) {
+	if s, ok := anthropicStreamErrorStatus([]byte(`{"type":"error","error":{"type":"overloaded_error"}}`)); !ok || s != http.StatusServiceUnavailable {
+		t.Fatalf("overloaded_error → %d ok=%v want 503", s, ok)
+	}
+	if s, ok := anthropicStreamErrorStatus([]byte(`{"type":"error","error":{"type":"rate_limit_error"}}`)); !ok || s != http.StatusTooManyRequests {
+		t.Fatalf("rate_limit_error → %d ok=%v want 429", s, ok)
+	}
+	if _, ok := anthropicStreamErrorStatus([]byte(`{"type":"message_delta","usage":{"output_tokens":5}}`)); ok {
+		t.Fatal("non-error frame must return ok=false")
+	}
+}
+
+// TestStreamAnthropicPassthroughMarksUpstreamError covers round-9 [2]: the direct
+// Anthropic passthrough records a failure status when the stream carries an
+// Anthropic error frame.
+func TestStreamAnthropicPassthroughMarksUpstreamError(t *testing.T) {
+	ctx, summary := WithRequestSummary(context.Background())
+	// No model rewrite (fast path); an error frame mid-stream.
+	stream := "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n"
+	w := httptest.NewRecorder()
+	streamAnthropicPassthroughBody(ctx, w, strings.NewReader(stream), "claude-x", "claude-x")
+	if summary.FailureStatus() != http.StatusServiceUnavailable {
+		t.Fatalf("FailureStatus = %d want 503 (anthropic error frame)", summary.FailureStatus())
+	}
+	// The error frame is still forwarded to the client unchanged.
+	if !strings.Contains(w.Body.String(), "overloaded_error") {
+		t.Fatal("error frame must still be forwarded to the client")
+	}
+}
+
+// TestResponsesFailureTapCapturesUsageAcrossChunkedOverflow covers round-9 [0]:
+// a response.completed streamed in small Write chunks, whose buffer overflows
+// before the trailing usage arrives, still records usage (the tail is retained).
+func TestResponsesFailureTapCapturesUsageAcrossChunkedOverflow(t *testing.T) {
+	ctx, summary := WithRequestSummary(context.Background())
+	tap := newResponsesFailureTap(ctx, &ProxyHandler{}, nil, nil, "")
+
+	// Build a response.completed whose output far exceeds the buffer, with usage
+	// at the very end — then feed it to the tap in small chunks (as io.Copy does).
+	bigOutput := strings.Repeat("z", responsesFailureTapMaxBuffer*2)
+	full := `data: {"type":"response.completed","response":{"id":"r1","output":"` + bigOutput +
+		`","usage":{"input_tokens":321,"output_tokens":12,"total_tokens":333}}}` + "\n\n"
+	for i := 0; i < len(full); i += 4096 {
+		end := i + 4096
+		if end > len(full) {
+			end = len(full)
+		}
+		if _, err := tap.Write([]byte(full[i:end])); err != nil {
+			t.Fatalf("tap.Write: %v", err)
+		}
+	}
+
+	if summary.totalTokens == nil || *summary.totalTokens != 333 {
+		t.Fatalf("totalTokens = %v want 333 (usage recovered across chunked overflow)", summary.totalTokens)
+	}
+}

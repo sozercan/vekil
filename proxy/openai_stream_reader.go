@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 
 	"github.com/sozercan/vekil/models"
@@ -95,6 +96,32 @@ type openAIStreamError struct {
 	Type    string
 	Code    string
 	Message string
+}
+
+// httpStatus maps an OpenAI-style stream error to an HTTP status so a
+// post-commit stream failure is recorded with its real semantic status (e.g.
+// 429 for a rate limit, 503 for an overload) rather than a generic bad gateway.
+func (e *openAIStreamError) httpStatus() int {
+	if e == nil {
+		return http.StatusBadGateway
+	}
+	switch strings.ToLower(strings.TrimSpace(e.Code)) {
+	case "too_many_requests", "rate_limit_exceeded", "rate_limit_error":
+		return http.StatusTooManyRequests
+	case "model_overloaded", "engine_overloaded", "overloaded_error", "service_unavailable":
+		return http.StatusServiceUnavailable
+	case "gateway_timeout", "timeout":
+		return http.StatusGatewayTimeout
+	case "bad_gateway":
+		return http.StatusBadGateway
+	}
+	switch strings.ToLower(strings.TrimSpace(e.Type)) {
+	case "rate_limit_error", "rate_limit_exceeded":
+		return http.StatusTooManyRequests
+	case "overloaded_error":
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadGateway
 }
 
 func (e *openAIStreamError) Error() string {
