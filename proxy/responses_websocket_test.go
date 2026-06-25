@@ -1174,6 +1174,78 @@ func TestResponsesWebSocketAutoCompactsShortBytePressureHistory(t *testing.T) {
 	}
 }
 
+func TestResponsesWebSocketCompactHistoryStripsInternalChatMetadataBeforeUpstream(t *testing.T) {
+	raw := func(v interface{}) json.RawMessage {
+		t.Helper()
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("failed to marshal raw message: %v", err)
+		}
+		return b
+	}
+
+	var compactInput []map[string]interface{}
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("upstream path = %q, want /responses", r.URL.Path)
+		}
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		if strings.Contains(string(bodyBytes), responsesInternalChatMessageMetadataPassthroughField) {
+			t.Fatalf("compact upstream body retained internal chat metadata passthrough: %s", bodyBytes)
+		}
+
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+		compactInput = upstreamInputItems(t, body)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"comp-strip-metadata","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"metadata-free checkpoint"}]}]}`)
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		AutoCompactMaxBytes: 1,
+		AutoCompactKeepTail: 1,
+	}
+
+	session := &responsesWebSocketSession{
+		ctx: context.Background(),
+		historyItems: []json.RawMessage{
+			raw(map[string]interface{}{
+				"type":    "message",
+				"role":    "user",
+				"content": []map[string]string{{"type": "input_text", "text": "old question"}},
+				responsesInternalChatMessageMetadataPassthroughField: map[string]string{"turn_id": "turn-old"},
+				"nested": map[string]interface{}{responsesInternalChatMessageMetadataPassthroughField: map[string]string{"turn_id": "nested-old"}},
+			}),
+			raw(map[string]interface{}{
+				"type":    "message",
+				"role":    "assistant",
+				"content": []map[string]string{{"type": "output_text", "text": "latest answer"}},
+				responsesInternalChatMessageMetadataPassthroughField: map[string]string{"turn_id": "turn-tail"},
+			}),
+		},
+	}
+	request := &responsesWebSocketCreateRequest{Model: "gpt-5.4"}
+
+	_, compacted, err := session.compactHistory(handler, context.Background(), request, false, nil)
+	if err != nil {
+		t.Fatalf("compactHistory failed: %v", err)
+	}
+	if !compacted {
+		t.Fatal("expected websocket history to compact")
+	}
+	if len(compactInput) != 1 {
+		t.Fatalf("expected one compacted prefix item, got %d items: %#v", len(compactInput), compactInput)
+	}
+	if got := inputTextFromMessage(t, compactInput[0]); got != "old question" {
+		t.Fatalf("expected compacted prefix content to survive, got %q", got)
+	}
+}
+
 func TestResponsesWebSocketCompactHistoryRewritesPriorSyntheticCheckpoint(t *testing.T) {
 	raw := func(v interface{}) json.RawMessage {
 		t.Helper()

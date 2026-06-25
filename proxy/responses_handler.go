@@ -938,6 +938,16 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 	// compaction call).
 	bodyBytes = applyResolvedCompactModel(bodyBytes, budget)
 
+	requestedModel := extractResponsesRequestModel(bodyBytes)
+	provider, _, _ := h.resolveProviderModel(requestedModel, providerEndpointResponses)
+	if rewrittenBody, strippedFields := stripUnsupportedResponsesRequestFields(bodyBytes, provider); len(strippedFields) > 0 {
+		bodyBytes = rewrittenBody
+		h.log.Debug("stripped unsupported responses request fields",
+			logger.F("endpoint", "responses/compact/internal"),
+			logger.F("fields", strippedFields),
+		)
+	}
+
 	if proactiveChunk && targetBodySize > 0 && len(bodyBytes) > targetBodySize {
 		h.log.Debug("using learned compact chunk target before upstream post",
 			logger.F("body_bytes", len(bodyBytes)),
