@@ -138,6 +138,104 @@ func TestResolveProviderRequest_RejectsKnownModelWithoutEndpointSupport(t *testi
 	}
 }
 
+func TestHandleResponses_StripsInternalChatMessageMetadataBeforeUpstream(t *testing.T) {
+	var upstreamBody []byte
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("upstream path = %q, want /responses", r.URL.Path)
+		}
+		var err error
+		upstreamBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed"}`))
+	})
+
+	body := `{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("HandleResponses status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(string(upstreamBody), "internal_chat_message_metadata_passthrough") {
+		t.Fatalf("upstream body retained internal chat metadata passthrough: %s", upstreamBody)
+	}
+	if !strings.Contains(string(upstreamBody), `"text":"hello"`) {
+		t.Fatalf("upstream body lost user content: %s", upstreamBody)
+	}
+}
+
+func TestResponsesRequestRewriting_StripsInternalChatMessageMetadataForDefaultCopilot(t *testing.T) {
+	handler := newTestProxyHandler(t, func(http.ResponseWriter, *http.Request) {})
+	originalBody := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{
+				"type":"message",
+				"role":"user",
+				"content":[{"type":"input_text","text":"hello"}],
+				"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}
+			},
+			{
+				"type":"function_call_output",
+				"call_id":"call-1",
+				"output":"{}",
+				"nested":{"internal_chat_message_metadata_passthrough":{"turn_id":"nested-turn"}}
+			}
+		]
+	}`)
+
+	rewrittenForResponses := handler.rewriteResponsesRequestBody(originalBody, "responses", true)
+	provider, _, rewrittenBody, err := handler.resolveProviderRequest(rewrittenForResponses, "/responses")
+	if err != nil {
+		t.Fatalf("resolveProviderRequest() error = %v", err)
+	}
+	if provider == nil {
+		t.Fatal("resolveProviderRequest() provider = nil, want default copilot provider")
+	}
+	if provider.kind != providerTypeCopilot {
+		t.Fatalf("resolveProviderRequest() provider.kind = %q, want %q", provider.kind, providerTypeCopilot)
+	}
+
+	if strings.Contains(string(rewrittenBody), "internal_chat_message_metadata_passthrough") {
+		t.Fatalf("rewritten body retained internal chat metadata passthrough: %s", rewrittenBody)
+	}
+
+	payload := decodeResponsesRequestPayload(t, rewrittenBody)
+	var input []map[string]interface{}
+	if err := json.Unmarshal(payload["input"], &input); err != nil {
+		t.Fatalf("json.Unmarshal(input) error = %v", err)
+	}
+	if len(input) != 2 {
+		t.Fatalf("len(input) = %d, want 2", len(input))
+	}
+	if got := input[0]["type"]; got != "message" {
+		t.Fatalf("input[0].type = %v, want message", got)
+	}
+}
+
+func TestResponsesRequestRewriting_PreservesInternalChatMessageMetadataForOpenAICodex(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}],"top_p":1}`)
+
+	rewrittenBody, strippedFields := stripUnsupportedResponsesRequestFields(body, &providerRuntime{kind: providerTypeOpenAICodex})
+	if !strings.Contains(string(rewrittenBody), "internal_chat_message_metadata_passthrough") {
+		t.Fatalf("rewritten body stripped OpenAI Codex internal chat metadata passthrough: %s", rewrittenBody)
+	}
+	if strings.Contains(strings.Join(strippedFields, ","), "internal_chat_message_metadata_passthrough") {
+		t.Fatalf("stripped fields unexpectedly include internal chat metadata passthrough: %v", strippedFields)
+	}
+
+	payload := decodeResponsesRequestPayload(t, rewrittenBody)
+	if _, ok := payload["top_p"]; ok {
+		t.Fatalf("rewritten payload retained top_p for OpenAI Codex: %s", rewrittenBody)
+	}
+}
+
 func TestResponsesRequestRewriting_StripsUnsupportedImageGenerationToolForAzure(t *testing.T) {
 	handler := newProviderRoutingTestHandler(t, []string{"/responses"})
 	originalBody := []byte(`{"model":"gpt-5-public","input":"hello","tools":[{"type":"function","name":"lookup_weather","description":"Lookup the weather","parameters":{"type":"object","properties":{}}},{"type":"image_generation"}],"tool_choice":"auto"}`)

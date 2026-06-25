@@ -1952,6 +1952,10 @@ func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint st
 	return bodyBytes
 }
 
+const responsesInternalChatMessageMetadataPassthroughField = "internal_chat_message_metadata_passthrough"
+
+var responsesInternalChatMessageMetadataPassthroughFieldBytes = []byte(responsesInternalChatMessageMetadataPassthroughField)
+
 func stripUnsupportedResponsesRequestFields(bodyBytes []byte, provider *providerRuntime) ([]byte, []string) {
 	if provider == nil {
 		return bodyBytes, nil
@@ -1959,7 +1963,8 @@ func stripUnsupportedResponsesRequestFields(bodyBytes []byte, provider *provider
 
 	unsupportedToolTypes := unsupportedResponsesToolTypes(provider)
 	unsupportedSamplingFields := unsupportedResponsesSamplingFields(provider)
-	if len(unsupportedToolTypes) == 0 && len(unsupportedSamplingFields) == 0 {
+	stripInternalChatMetadata := !providerSupportsResponsesInternalChatMessageMetadataPassthrough(provider) && bytes.Contains(bodyBytes, responsesInternalChatMessageMetadataPassthroughFieldBytes)
+	if len(unsupportedToolTypes) == 0 && len(unsupportedSamplingFields) == 0 && !stripInternalChatMetadata {
 		return bodyBytes, nil
 	}
 
@@ -1968,11 +1973,20 @@ func stripUnsupportedResponsesRequestFields(bodyBytes []byte, provider *provider
 		return bodyBytes, nil
 	}
 
-	strippedFields := make([]string, 0, len(unsupportedSamplingFields)+1)
+	strippedFields := make([]string, 0, len(unsupportedSamplingFields)+2)
 	for _, field := range unsupportedSamplingFields {
 		if _, ok := payload[field]; ok {
 			delete(payload, field)
 			strippedFields = append(strippedFields, field)
+		}
+	}
+
+	if stripInternalChatMetadata {
+		if rawInput, ok := payload["input"]; ok {
+			if rewrittenInput, stripCount, err := stripResponsesInternalChatMessageMetadataPassthrough(rawInput); err == nil && stripCount > 0 {
+				payload["input"] = rewrittenInput
+				strippedFields = append(strippedFields, "input[*]."+responsesInternalChatMessageMetadataPassthroughField)
+			}
 		}
 	}
 
@@ -2031,6 +2045,97 @@ func unsupportedResponsesSamplingFields(provider *providerRuntime) []string {
 		return []string{"top_p", "temperature"}
 	}
 	return nil
+}
+
+func providerSupportsResponsesInternalChatMessageMetadataPassthrough(provider *providerRuntime) bool {
+	if provider == nil {
+		return false
+	}
+	return provider.kind == providerTypeOpenAICodex
+}
+
+func stripResponsesInternalChatMessageMetadataPassthrough(raw json.RawMessage) (json.RawMessage, int, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return raw, 0, nil
+	}
+
+	switch trimmed[0] {
+	case '{':
+		return stripResponsesInternalChatMessageMetadataPassthroughObject(raw)
+	case '[':
+		return stripResponsesInternalChatMessageMetadataPassthroughArray(raw)
+	default:
+		return raw, 0, nil
+	}
+}
+
+func stripResponsesInternalChatMessageMetadataPassthroughObject(raw json.RawMessage) (json.RawMessage, int, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return raw, 0, err
+	}
+
+	stripCount := 0
+	changed := false
+	if _, ok := object[responsesInternalChatMessageMetadataPassthroughField]; ok {
+		delete(object, responsesInternalChatMessageMetadataPassthroughField)
+		stripCount++
+		changed = true
+	}
+
+	for key, value := range object {
+		rewrittenValue, nestedStripCount, err := stripResponsesInternalChatMessageMetadataPassthrough(value)
+		if err != nil {
+			return raw, 0, err
+		}
+		if nestedStripCount == 0 {
+			continue
+		}
+		object[key] = rewrittenValue
+		stripCount += nestedStripCount
+		changed = true
+	}
+
+	if !changed {
+		return raw, 0, nil
+	}
+	rewritten, err := json.Marshal(object)
+	if err != nil {
+		return raw, 0, err
+	}
+	return rewritten, stripCount, nil
+}
+
+func stripResponsesInternalChatMessageMetadataPassthroughArray(raw json.RawMessage) (json.RawMessage, int, error) {
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return raw, 0, err
+	}
+
+	stripCount := 0
+	changed := false
+	for i, item := range items {
+		rewrittenItem, itemStripCount, err := stripResponsesInternalChatMessageMetadataPassthrough(item)
+		if err != nil {
+			return raw, 0, err
+		}
+		if itemStripCount == 0 {
+			continue
+		}
+		items[i] = rewrittenItem
+		stripCount += itemStripCount
+		changed = true
+	}
+
+	if !changed {
+		return raw, 0, nil
+	}
+	rewritten, err := json.Marshal(items)
+	if err != nil {
+		return raw, 0, err
+	}
+	return rewritten, stripCount, nil
 }
 
 func unsupportedResponsesToolTypes(provider *providerRuntime) map[string]struct{} {
