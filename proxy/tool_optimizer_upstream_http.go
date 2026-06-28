@@ -38,7 +38,7 @@ func (h *ProxyHandler) writeResponsesUpstreamResponse(ctx context.Context, w htt
 // body to the client byte-for-byte while sniffing usage tokens for traffic
 // stats. It preserves the near-zero-copy contract: on a 200 it reads the body
 // to parse usage and writes the same bytes back unchanged (headers and
-// Content-Length untouched); any non-200 or read failure falls back to a plain
+// Content-Length untouched); any non-2xx or read failure falls back to a plain
 // streamed copy. Memory is bounded via usageSniffMaxBuffer: an oversized body
 // streams through with the usage parse skipped rather than being buffered whole.
 // ctx must be the inbound request context so the usage lands on the right
@@ -48,7 +48,8 @@ func writeResponsesPassthroughObservingUsage(ctx context.Context, w http.Respons
 		writeUpstreamResponse(w, resp)
 		return
 	}
-	writePassthroughSniffingUsage(w, resp, func(body []byte) {
+	writePassthroughSniffingUsage(w, resp, func(body []byte) ([]byte, bool) {
 		observeResponsesUsage(ctx, sniffResponsesUsageBody(body))
+		return body, false
 	})
 }

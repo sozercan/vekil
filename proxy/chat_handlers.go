@@ -559,16 +559,17 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			onError := func(status int) { observeResponseFailureStatus(r.Context(), status) }
 			// dropInjectedUsage drops the upstream usage-only chunk the proxy asked
 			// for when the client did not opt into stream_options.include_usage.
-			StreamOpenAIChatPassthrough(w, resp.Body, mode.injectedClientStreamUsage, onError, finalResponse, usage)
+			StreamOpenAIChatPassthrough(w, resp.Body, requestedModel, mode.injectedClientStreamUsage, onError, finalResponse, usage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			normalizeOpenAIChatCompletionStruct(oaiResp, requestedModel)
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(oaiResp)
 		},
 		passthrough: func(resp *http.Response) error {
-			return h.maybeWriteOptimizedOpenAIChatPassthrough(r.Context(), w, resp, h.toolContexts, scope)
+			return h.maybeWriteOptimizedOpenAIChatPassthrough(r.Context(), w, resp, requestedModel, h.toolContexts, scope)
 		},
 	})
 	if err != nil {

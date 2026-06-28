@@ -96,7 +96,7 @@ func StreamOpenAIPassthroughWithFinalResponse(
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
-	streamOpenAIPassthrough(w, body, false, nil, onFinalResponse, onUsageCallbacks...)
+	streamOpenAIPassthrough(w, body, false, nil, onFinalResponse, nil, onUsageCallbacks...)
 }
 
 // StreamOpenAIPassthroughDroppingInjectedUsage behaves like
@@ -112,7 +112,7 @@ func StreamOpenAIPassthroughDroppingInjectedUsage(
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
-	streamOpenAIPassthrough(w, body, true, nil, onFinalResponse, onUsageCallbacks...)
+	streamOpenAIPassthrough(w, body, true, nil, onFinalResponse, nil, onUsageCallbacks...)
 }
 
 // StreamOpenAIChatPassthrough forwards an OpenAI chat SSE stream to the client
@@ -128,12 +128,13 @@ func StreamOpenAIPassthroughDroppingInjectedUsage(
 func StreamOpenAIChatPassthrough(
 	w http.ResponseWriter,
 	body io.ReadCloser,
+	requestedModel string,
 	dropInjectedUsage bool,
 	onError func(status int),
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
-	streamOpenAIPassthrough(w, body, dropInjectedUsage, onError, onFinalResponse, onUsageCallbacks...)
+	streamOpenAIPassthrough(w, body, dropInjectedUsage, onError, onFinalResponse, newOpenAIChatCompletionChunkNormalizer(requestedModel).normalize, onUsageCallbacks...)
 }
 
 // streamOpenAIPassthrough forwards an upstream OpenAI SSE stream to the client.
@@ -144,12 +145,15 @@ func StreamOpenAIChatPassthrough(
 // dropInjectedUsage path decide whether to emit an event after parsing it: when
 // set, a usage-only chunk (empty choices + usage) is fed to the usage/final
 // callbacks but not written to the client.
+type openAIStreamDataTransformer func(eventType, data string) (string, bool)
+
 func streamOpenAIPassthrough(
 	w http.ResponseWriter,
 	body io.ReadCloser,
 	dropInjectedUsage bool,
 	onError func(status int),
 	onFinalResponse func(*models.OpenAIResponse),
+	transformData openAIStreamDataTransformer,
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
 	defer func() { _ = body.Close() }()
@@ -167,7 +171,7 @@ func streamOpenAIPassthrough(
 	}
 
 	onUsage := firstOpenAIUsageCallback(onUsageCallbacks)
-	if onFinalResponse == nil && onUsage == nil && onError == nil {
+	if onFinalResponse == nil && onUsage == nil && onError == nil && transformData == nil {
 		_, _ = io.Copy(&flushWriter{w: w, flusher: flusher}, body)
 		return
 	}
@@ -183,6 +187,7 @@ func streamOpenAIPassthrough(
 	errorReported := false
 	var accumulator sseDataAccumulator
 	pending := make([]string, 0, 4)
+	var transformedCurrentData *string
 	processData := func(eventType string, data string) bool {
 		if data == "[DONE]" {
 			sawDone = true
@@ -197,6 +202,13 @@ func streamOpenAIPassthrough(
 			if streamErr, isErr := parseOpenAIStreamError(eventType, data); isErr {
 				onError(streamErr.httpStatus())
 				errorReported = true
+			}
+		}
+
+		if transformData != nil {
+			if transformed, changed := transformData(eventType, data); changed {
+				data = transformed
+				transformedCurrentData = &data
 			}
 		}
 
@@ -222,13 +234,20 @@ func streamOpenAIPassthrough(
 		defer func() {
 			pending = pending[:0]
 			dropCurrent = false
+			transformedCurrentData = nil
 		}()
 		if dropCurrent {
 			return true
 		}
-		for _, l := range pending {
-			if _, err := io.WriteString(w, l); err != nil {
+		if transformedCurrentData != nil {
+			if !writeTransformedSSEEvent(w, pending, *transformedCurrentData) {
 				return false
+			}
+		} else {
+			for _, l := range pending {
+				if _, err := io.WriteString(w, l); err != nil {
+					return false
+				}
 			}
 		}
 		if flusher != nil {
@@ -255,6 +274,7 @@ func streamOpenAIPassthrough(
 			pending = pending[:0]
 			accumulator = sseDataAccumulator{}
 			dropCurrent = false
+			transformedCurrentData = nil
 			if _, werr := io.WriteString(w, line); werr != nil {
 				return
 			}
@@ -276,6 +296,7 @@ func streamOpenAIPassthrough(
 					rawForwardOversizedEvent = false
 					accumulator = sseDataAccumulator{}
 					dropCurrent = false
+					transformedCurrentData = nil
 				}
 			} else {
 				pending = append(pending, line)
@@ -317,6 +338,41 @@ func streamOpenAIPassthrough(
 		return
 	}
 	onFinalResponse(aggregator.buildResponse())
+}
+
+func writeTransformedSSEEvent(w http.ResponseWriter, pending []string, data string) bool {
+	insertedData := false
+	writeData := func(ending string) bool {
+		if ending == "" {
+			ending = "\n"
+		}
+		for _, line := range strings.Split(data, "\n") {
+			if _, err := fmt.Fprintf(w, "data: %s%s", line, ending); err != nil {
+				return false
+			}
+		}
+		insertedData = true
+		return true
+	}
+
+	for _, line := range pending {
+		content, ending := splitSSELineEnding(line)
+		if _, ok := parseSSELine(content); ok {
+			if !insertedData && !writeData(ending) {
+				return false
+			}
+			continue
+		}
+		if strings.TrimSpace(content) == "" && !insertedData {
+			if !writeData(ending) {
+				return false
+			}
+		}
+		if _, err := io.WriteString(w, line); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func firstOpenAIUsageCallback(callbacks []func(*models.OpenAIUsage)) func(*models.OpenAIUsage) {

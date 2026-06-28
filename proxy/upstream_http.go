@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sozercan/vekil/models"
 )
@@ -269,17 +271,27 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-// writeOpenAIPassthroughObservingUsage writes a non-streaming OpenAI chat
-// response to the client byte-for-byte while sniffing usage tokens for traffic
-// stats. It preserves the near-zero-copy contract: the original body bytes and
-// headers (including Content-Length) are sent unchanged; only a best-effort
-// usage parse is layered on top, and any parse failure is silently ignored.
-// Memory is bounded: bodies larger than usageSniffMaxBuffer stream through
-// without a usage parse rather than being buffered whole (see
-// writePassthroughSniffingUsage).
+// writeOpenAIChatCompletionResponse writes a non-streaming OpenAI chat response,
+// normalizing missing required Chat Completions fields for strict SDK clients
+// while preserving vendor-specific fields. It only rewrites successful JSON
+// responses that fit in usageSniffMaxBuffer; errors, invalid JSON, and oversized
+// responses fail open to passthrough behavior.
+func (h *ProxyHandler) writeOpenAIChatCompletionResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, requestedModel string) {
+	writePassthroughSniffingUsage(w, resp, func(body []byte) ([]byte, bool) {
+		out, changed, err := normalizeOpenAIChatCompletionResponse(body, requestedModel, time.Now())
+		if err != nil {
+			observeOpenAIUsage(ctx, sniffOpenAIUsage(body))
+			return body, false
+		}
+		observeOpenAIUsage(ctx, sniffOpenAIUsage(out))
+		return out, changed
+	})
+}
+
 func (h *ProxyHandler) writeOpenAIPassthroughObservingUsage(ctx context.Context, w http.ResponseWriter, resp *http.Response) {
-	writePassthroughSniffingUsage(w, resp, func(body []byte) {
+	writePassthroughSniffingUsage(w, resp, func(body []byte) ([]byte, bool) {
 		observeOpenAIUsage(ctx, sniffOpenAIUsage(body))
+		return body, false
 	})
 }
 
@@ -292,17 +304,16 @@ func (h *ProxyHandler) writeOpenAIPassthroughObservingUsage(ctx context.Context,
 const usageSniffMaxBuffer = 4 << 20 // 4 MiB
 
 // writePassthroughSniffingUsage writes a non-streaming upstream response to the
-// client while buffering at most usageSniffMaxBuffer bytes to sniff usage via
-// the supplied parse callback. A body that fits the cap is buffered, parsed, and
-// written back byte-for-byte (headers, including Content-Length, untouched). A
-// body that exceeds the cap is not buffered whole: the bounded prefix is written
-// and the remainder is streamed through with io.Copy, so proxy memory stays
-// bounded at the cost of skipping usage stats for that one oversized response
-// (fail-open). Non-200 responses and read errors fall back to a plain copy.
-func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, sniff func([]byte)) {
+// client while buffering at most usageSniffMaxBuffer bytes so the supplied
+// transform can sniff usage and optionally rewrite the complete body. A 2xx body
+// that fits the cap is buffered and passed to transform; if transform reports a
+// rewrite, Content-Length is adjusted. Oversized bodies stream through without a
+// transform so proxy memory stays bounded. Non-2xx responses and read errors
+// fall back to a plain copy.
+func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, transform func([]byte) ([]byte, bool)) {
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		copyPassthroughHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
@@ -319,10 +330,18 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, s
 	}
 
 	if len(prefix) <= usageSniffMaxBuffer {
-		// Whole body fits: parse usage, then write the same bytes unchanged.
-		sniff(prefix)
+		// Whole body fits: parse/transform it, then write the result.
+		out := prefix
+		changed := false
+		if transform != nil {
+			out, changed = transform(prefix)
+		}
+		if changed {
+			w.Header().Del("Content-Length")
+			w.Header().Set("Content-Length", strconv.Itoa(len(out)))
+		}
 		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(prefix)
+		_, _ = w.Write(out)
 		return
 	}
 
