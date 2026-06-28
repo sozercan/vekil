@@ -42,13 +42,13 @@ Gemini compatibility is a translation layer over OpenAI Chat Completions. See [G
 
 ## `POST /v1/chat/completions` (OpenAI)
 
-Near zero-copy passthrough for requests without tools. Successful non-streaming responses are conservatively normalized to strict OpenAI Chat Completions shape when upstreams omit required compatibility fields: missing `object` becomes `"chat.completion"`, missing `created`/`id`/`usage` are filled, requested `model` is used when absent, and choice `message`/`index`/`finish_reason` gaps are repaired while vendor-specific metadata is preserved.
+Near zero-copy passthrough for requests without tools. Successful non-streaming responses are conservatively normalized to strict OpenAI Chat Completions shape when upstreams omit required compatibility fields: missing `object` becomes `"chat.completion"`, missing `created`/`id`/`usage` are filled, requested `model` is used when absent, and choice `message`/`index`/`finish_reason` gaps are repaired while vendor-specific metadata is preserved. Streaming chat chunks are similarly normalized only for missing chunk envelope fields such as `object: "chat.completion.chunk"`, `id`, `created`, `model`, `choices[].index`, and `choices[].delta`.
 
 When tools are present, the proxy injects `parallel_tool_calls: true`, forces upstream streaming for reliable parallel tool calls, and aggregates the result back to non-streaming JSON.
 
 The proxy enforces the selected model's configured endpoint allowlist before forwarding. If a model is `/responses`-only, `POST /v1/chat/completions` fails fast with `400` instead of probing an unsupported upstream route.
 
-For client-requested streams that omit `stream_options`, the proxy asks the upstream for a final usage chunk (`stream_options.include_usage`) so streamed traffic still records token totals in the dashboard. That injected usage-only chunk is consumed internally and **not** forwarded to the client, so the streamed SSE the client sees is unchanged from a standard OpenAI stream (no extra `choices: []` terminal chunk). If the client supplied its own `stream_options`, its choice is preserved untouched.
+For client-requested streams that omit `stream_options`, the proxy asks the upstream for a final usage chunk (`stream_options.include_usage`) so streamed traffic still records token totals in the dashboard. That injected usage-only chunk is consumed internally and **not** forwarded to the client, so clients do not see an extra `choices: []` terminal chunk. If the client supplied its own `stream_options`, its choice is preserved untouched.
 
 ## Responses Compatibility Endpoints
 

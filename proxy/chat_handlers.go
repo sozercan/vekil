@@ -551,8 +551,6 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
 			copyPassthroughHeaders(w.Header(), resp.Header)
-			// TODO: add a separate ChatCompletionChunk normalizer if strict streaming
-			// clients encounter upstream chunks missing OpenAI-required chunk fields.
 			finalResponse := h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope)
 			usage := openAIChatStreamUsageCallback(r.Context())
 			// A post-commit upstream stream error (the 200 header is already sent)
@@ -561,7 +559,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			onError := func(status int) { observeResponseFailureStatus(r.Context(), status) }
 			// dropInjectedUsage drops the upstream usage-only chunk the proxy asked
 			// for when the client did not opt into stream_options.include_usage.
-			StreamOpenAIChatPassthrough(w, resp.Body, mode.injectedClientStreamUsage, onError, finalResponse, usage)
+			StreamOpenAIChatPassthrough(w, resp.Body, requestedModel, mode.injectedClientStreamUsage, onError, finalResponse, usage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
 			normalizeOpenAIChatCompletionStruct(oaiResp, requestedModel)

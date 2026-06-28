@@ -12,7 +12,193 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-const openAIChatCompletionObject = "chat.completion"
+const (
+	openAIChatCompletionObject      = "chat.completion"
+	openAIChatCompletionChunkObject = "chat.completion.chunk"
+)
+
+type openAIChatCompletionChunkNormalizer struct {
+	requestedModel string
+	streamID       string
+	created        int64
+	model          string
+}
+
+func newOpenAIChatCompletionChunkNormalizer(requestedModel string) *openAIChatCompletionChunkNormalizer {
+	return &openAIChatCompletionChunkNormalizer{requestedModel: strings.TrimSpace(requestedModel)}
+}
+
+func openAIChatStreamEventMayCarryChunk(eventType string) bool {
+	switch strings.TrimSpace(eventType) {
+	case "", "message", openAIChatCompletionChunkObject:
+		return true
+	default:
+		return false
+	}
+}
+
+func (n *openAIChatCompletionChunkNormalizer) normalize(eventType, data string) (string, bool) {
+	// OpenAI chat completion streams usually use unnamed SSE events. Also accept
+	// explicit event names that are equivalent to the default SSE "message" event
+	// or that directly label a chat chunk. Leave other side-band events
+	// (event: ping, event: metadata, event: error, etc.) untouched so provider
+	// metadata is not converted into a synthetic chat chunk.
+	if n == nil || !openAIChatStreamEventMayCarryChunk(eventType) {
+		return data, false
+	}
+	if strings.TrimSpace(data) == "" || strings.TrimSpace(data) == "[DONE]" {
+		return data, false
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(data), &payload); err != nil || payload == nil {
+		return data, false
+	}
+	if hasNonNullJSONField(payload, "error") {
+		return data, false
+	}
+
+	changed := false
+	if !hasNonEmptyStringJSONField(payload, "object") {
+		payload["object"] = mustMarshalRaw(openAIChatCompletionChunkObject)
+		changed = true
+	}
+	if hasNonEmptyStringJSONField(payload, "id") {
+		n.streamID = jsonRawString(payload["id"])
+	} else {
+		if n.streamID == "" {
+			n.streamID = "chatcmpl-" + uuid.NewString()
+		}
+		payload["id"] = mustMarshalRaw(n.streamID)
+		changed = true
+	}
+	if created, ok := jsonRawNumberAsInt64(payload["created"]); ok && created > 0 {
+		n.created = created
+	} else {
+		if n.created == 0 {
+			n.created = time.Now().Unix()
+		}
+		payload["created"] = mustMarshalRaw(n.created)
+		changed = true
+	}
+	if hasNonEmptyStringJSONField(payload, "model") {
+		n.model = jsonRawString(payload["model"])
+	} else {
+		model := strings.TrimSpace(n.model)
+		if model == "" {
+			model = n.requestedModel
+		}
+		if model != "" {
+			payload["model"] = mustMarshalRaw(model)
+			changed = true
+		}
+	}
+
+	if !hasNonNullJSONField(payload, "choices") {
+		payload["choices"] = json.RawMessage("[]")
+		changed = true
+	} else if choices, choicesChanged, err := normalizeOpenAIChatCompletionChunkChoices(payload["choices"]); err == nil && choicesChanged {
+		payload["choices"] = choices
+		changed = true
+	}
+
+	if !changed {
+		return data, false
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return data, false
+	}
+	return string(out), true
+}
+
+func normalizeOpenAIChatCompletionChunkChoices(raw json.RawMessage) (json.RawMessage, bool, error) {
+	var choices []json.RawMessage
+	if err := json.Unmarshal(raw, &choices); err != nil {
+		return nil, false, err
+	}
+
+	changed := false
+	for i := range choices {
+		choiceRaw, choiceChanged, err := normalizeOpenAIChatCompletionChunkChoice(choices[i], i)
+		if err != nil {
+			return nil, false, err
+		}
+		if choiceChanged {
+			choices[i] = choiceRaw
+			changed = true
+		}
+	}
+
+	if !changed {
+		return raw, false, nil
+	}
+	out, err := json.Marshal(choices)
+	if err != nil {
+		return nil, false, err
+	}
+	return out, true, nil
+}
+
+func normalizeOpenAIChatCompletionChunkChoice(raw json.RawMessage, arrayIndex int) (json.RawMessage, bool, error) {
+	var choice map[string]json.RawMessage
+	if len(bytes.TrimSpace(raw)) > 0 && string(bytes.TrimSpace(raw)) != "null" {
+		if err := json.Unmarshal(raw, &choice); err != nil {
+			return nil, false, err
+		}
+	}
+	if choice == nil {
+		choice = make(map[string]json.RawMessage)
+	}
+
+	changed := false
+	if !hasNonNullJSONField(choice, "index") {
+		choice["index"] = mustMarshalRaw(arrayIndex)
+		changed = true
+	}
+	if !hasNonNullJSONField(choice, "delta") {
+		choice["delta"] = defaultOpenAIChatCompletionChunkDelta(choice)
+		changed = true
+	}
+
+	if !changed {
+		return raw, false, nil
+	}
+	out, err := json.Marshal(choice)
+	if err != nil {
+		return nil, false, err
+	}
+	return out, true, nil
+}
+
+func defaultOpenAIChatCompletionChunkDelta(choice map[string]json.RawMessage) json.RawMessage {
+	delta := make(map[string]json.RawMessage)
+	if content, ok := firstProviderChoiceContent(choice); ok {
+		delta["content"] = content
+	}
+	if role, ok := firstProviderChoiceStringField(choice, "role"); ok {
+		delta["role"] = role
+	}
+	if len(delta) == 0 {
+		return json.RawMessage("{}")
+	}
+	out, err := json.Marshal(delta)
+	if err != nil {
+		return json.RawMessage("{}")
+	}
+	return out
+}
+
+func firstProviderChoiceStringField(choice map[string]json.RawMessage, key string) (json.RawMessage, bool) {
+	raw, ok := choice[key]
+	if !ok || len(bytes.TrimSpace(raw)) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+		return nil, false
+	}
+	if isJSONString(raw) {
+		return raw, true
+	}
+	return nil, false
+}
 
 // normalizeOpenAIChatCompletionResponse fills in OpenAI Chat Completions fields
 // that strict SDK clients require while preserving upstream/vendor-specific
@@ -28,7 +214,7 @@ func normalizeOpenAIChatCompletionResponse(body []byte, requestedModel string, n
 	}
 
 	changed := false
-	if !hasNonNullJSONField(payload, "object") {
+	if !hasNonEmptyStringJSONField(payload, "object") {
 		payload["object"] = mustMarshalRaw(openAIChatCompletionObject)
 		changed = true
 	}
@@ -319,6 +505,14 @@ func hasNonEmptyStringJSONField(m map[string]json.RawMessage, key string) bool {
 	}
 	var value string
 	return json.Unmarshal(raw, &value) == nil && strings.TrimSpace(value) != ""
+}
+
+func jsonRawString(raw json.RawMessage) string {
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(value)
 }
 
 func isJSONString(raw json.RawMessage) bool {

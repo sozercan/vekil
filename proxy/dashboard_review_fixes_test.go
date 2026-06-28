@@ -604,7 +604,7 @@ func TestStreamOpenAIChatPassthroughDetectsErrorEvent(t *testing.T) {
 			body := io.NopCloser(strings.NewReader(tc.stream))
 			w := httptest.NewRecorder()
 			errored := false
-			StreamOpenAIChatPassthrough(w, body, false, func(int) { errored = true }, nil, func(*models.OpenAIUsage) {})
+			StreamOpenAIChatPassthrough(w, body, "gpt-4", false, func(int) { errored = true }, nil, func(*models.OpenAIUsage) {})
 			if !errored {
 				t.Fatalf("expected onError to fire for %q", tc.name)
 			}
@@ -615,7 +615,7 @@ func TestStreamOpenAIChatPassthroughDetectsErrorEvent(t *testing.T) {
 	body := io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"))
 	w := httptest.NewRecorder()
 	errored := false
-	StreamOpenAIChatPassthrough(w, body, false, func(int) { errored = true }, nil, func(*models.OpenAIUsage) {})
+	StreamOpenAIChatPassthrough(w, body, "gpt-4", false, func(int) { errored = true }, nil, func(*models.OpenAIUsage) {})
 	if errored {
 		t.Fatal("onError must not fire for a normal content stream")
 	}
@@ -804,7 +804,7 @@ func TestStreamOpenAIChatPassthroughMarksTransportError(t *testing.T) {
 	body := &errAfterReader{data: []byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")}
 	w := httptest.NewRecorder()
 	errored := false
-	StreamOpenAIChatPassthrough(w, body, false, func(int) { errored = true }, nil, func(*models.OpenAIUsage) {})
+	StreamOpenAIChatPassthrough(w, body, "gpt-4", false, func(int) { errored = true }, nil, func(*models.OpenAIUsage) {})
 	if !errored {
 		t.Fatal("expected onError to fire on a mid-stream transport error")
 	}
@@ -816,7 +816,7 @@ func TestStreamOpenAIChatPassthroughMarksPrematureEnd(t *testing.T) {
 	body := io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")) // no [DONE]
 	w := httptest.NewRecorder()
 	errored := false
-	StreamOpenAIChatPassthrough(w, body, false, func(int) { errored = true }, nil, func(*models.OpenAIUsage) {})
+	StreamOpenAIChatPassthrough(w, body, "gpt-4", false, func(int) { errored = true }, nil, func(*models.OpenAIUsage) {})
 	if !errored {
 		t.Fatal("expected onError to fire when the stream ends before [DONE]")
 	}
@@ -834,7 +834,7 @@ func TestStreamOpenAIChatPassthroughFailsOpenOnOversizedLine(t *testing.T) {
 	body := io.NopCloser(strings.NewReader(stream))
 	w := httptest.NewRecorder()
 	errored := false
-	StreamOpenAIChatPassthrough(w, body, false, func(int) { errored = true }, nil, func(*models.OpenAIUsage) {})
+	StreamOpenAIChatPassthrough(w, body, "gpt-4", false, func(int) { errored = true }, nil, func(*models.OpenAIUsage) {})
 
 	if errored {
 		t.Fatal("oversized line is not a failure; onError must not fire")
@@ -881,7 +881,7 @@ func TestStreamOpenAIChatPassthroughErrorStatusClassified(t *testing.T) {
 	body := io.NopCloser(strings.NewReader("data: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"too_many_requests\"}}\n\n"))
 	w := httptest.NewRecorder()
 	var gotStatus int
-	StreamOpenAIChatPassthrough(w, body, false, func(status int) { gotStatus = status }, nil, func(*models.OpenAIUsage) {})
+	StreamOpenAIChatPassthrough(w, body, "gpt-4", false, func(status int) { gotStatus = status }, nil, func(*models.OpenAIUsage) {})
 	if gotStatus != http.StatusTooManyRequests {
 		t.Fatalf("onError status = %d want 429 (classified)", gotStatus)
 	}

@@ -9098,7 +9098,7 @@ func TestOpenAIErrorResponseShape(t *testing.T) {
 }
 
 // TestOpenAIChatCompletionsStreaming validates that streaming responses are
-// passed through correctly with proper SSE headers.
+// forwarded with proper SSE headers.
 func TestOpenAIChatCompletionsStreaming(t *testing.T) {
 	sseBody := "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\ndata: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}]}\n\ndata: [DONE]\n\n"
 
@@ -9138,7 +9138,7 @@ func TestOpenAIChatCompletionsStreaming(t *testing.T) {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)
 	}
 
-	// Verify SSE body is passed through
+	// Verify SSE body is forwarded
 	body, _ := io.ReadAll(resp.Body)
 	bodyStr := string(body)
 	if !strings.Contains(bodyStr, "data: {") {
@@ -9151,7 +9151,7 @@ func TestOpenAIChatCompletionsStreaming(t *testing.T) {
 
 // TestOpenAIResponsesStreaming validates streaming passthrough for the Responses API.
 func TestOpenAIResponsesStreaming(t *testing.T) {
-	sseBody := "event: response.created\ndata: {\"id\":\"resp-1\",\"type\":\"response\"}\n\nevent: response.completed\ndata: {\"id\":\"resp-1\",\"status\":\"completed\"}\n\n"
+	sseBody := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"object\":\"response\",\"created_at\":1700000000,\"status\":\"in_progress\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"object\":\"response\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n"
 
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/responses" {
@@ -9195,8 +9195,28 @@ func TestOpenAIResponsesStreaming(t *testing.T) {
 	}
 
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "response.created") {
-		t.Error("streaming response should contain event data")
+	if got := string(body); got != sseBody {
+		t.Fatalf("Responses stream should be preserved exactly:\n got: %q\nwant: %q", got, sseBody)
+	}
+	events := parseSSEEvents(string(body))
+	if len(events) != 2 {
+		t.Fatalf("Responses stream events = %d, want 2", len(events))
+	}
+	if events[0].Event != "response.created" || events[1].Event != "response.completed" {
+		t.Fatalf("Responses event types = %q/%q, want response.created/response.completed", events[0].Event, events[1].Event)
+	}
+	var createdEvent struct {
+		Type     string `json:"type"`
+		Response struct {
+			ID     string `json:"id"`
+			Object string `json:"object"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(events[0].Data), &createdEvent); err != nil {
+		t.Fatalf("unmarshal response.created event: %v", err)
+	}
+	if createdEvent.Type != "response.created" || createdEvent.Response.ID != "resp-1" || createdEvent.Response.Object != "response" {
+		t.Fatalf("unexpected response.created payload: %+v", createdEvent)
 	}
 }
 
@@ -9235,8 +9255,8 @@ func TestOpenAIResponsesStreaming_PreservesUpstreamHeaders(t *testing.T) {
 	}
 }
 
-func TestOpenAIChatCompletionsStreamingNotNormalized(t *testing.T) {
-	sseBody := "data: {\"id\":\"chatcmpl-stream\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\ndata: [DONE]\n\n"
+func TestOpenAIChatCompletionsStreamingNormalizesChunks(t *testing.T) {
+	sseBody := "data: {\"id\":\"chatcmpl-stream\",\"object\":\"\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n"
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -9254,11 +9274,155 @@ func TestOpenAIChatCompletionsStreamingNotNormalized(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if got := string(body); got != sseBody {
-		t.Fatalf("stream body changed:\n got: %q\nwant: %q", got, sseBody)
+	events := parseSSEEvents(string(body))
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want 2; body=%s", len(events), body)
 	}
-	if strings.Contains(string(body), "chat.completion") {
-		t.Fatalf("streaming chunks should not be normalized by the non-streaming normalizer: %s", body)
+	var chunk map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(events[0].Data), &chunk); err != nil {
+		t.Fatalf("unmarshal chunk: %v", err)
+	}
+	var object string
+	if err := json.Unmarshal(chunk["object"], &object); err != nil {
+		t.Fatalf("unmarshal object: %v", err)
+	}
+	if object != "chat.completion.chunk" {
+		t.Fatalf("object = %q, want chat.completion.chunk", object)
+	}
+	var created int64
+	if err := json.Unmarshal(chunk["created"], &created); err != nil {
+		t.Fatalf("unmarshal created: %v", err)
+	}
+	if created == 0 {
+		t.Fatal("created = 0, want non-zero Unix seconds")
+	}
+	var model string
+	if err := json.Unmarshal(chunk["model"], &model); err != nil {
+		t.Fatalf("unmarshal model: %v", err)
+	}
+	if model != "gpt-4" {
+		t.Fatalf("model = %q, want requested model", model)
+	}
+	var choices []map[string]json.RawMessage
+	if err := json.Unmarshal(chunk["choices"], &choices); err != nil {
+		t.Fatalf("unmarshal choices: %v", err)
+	}
+	if len(choices) != 1 {
+		t.Fatalf("choices = %d, want 1", len(choices))
+	}
+	var index int
+	if err := json.Unmarshal(choices[0]["index"], &index); err != nil {
+		t.Fatalf("unmarshal choice index: %v", err)
+	}
+	if index != 0 {
+		t.Fatalf("choice index = %d, want 0", index)
+	}
+	if _, ok := choices[0]["delta"]; !ok {
+		t.Fatal("choice delta missing")
+	}
+	if events[1].Data != "[DONE]" {
+		t.Fatalf("terminal event = %q, want [DONE]", events[1].Data)
+	}
+}
+
+func TestOpenAIChatCompletionsStreamingNamedMessageEventNormalized(t *testing.T) {
+	sseBody := "event: message\ndata: {\"id\":\"chatcmpl-stream\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n"
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(sseBody))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	body, _ := io.ReadAll(w.Result().Body)
+	events := parseSSEEvents(string(body))
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want 2; body=%s", len(events), body)
+	}
+	if events[0].Event != "message" {
+		t.Fatalf("event type = %q, want message", events[0].Event)
+	}
+	var chunk map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(events[0].Data), &chunk); err != nil {
+		t.Fatalf("unmarshal named message chunk: %v", err)
+	}
+	var object string
+	if err := json.Unmarshal(chunk["object"], &object); err != nil {
+		t.Fatalf("unmarshal chunk object: %v", err)
+	}
+	if object != "chat.completion.chunk" {
+		t.Fatalf("named message chunk object = %q, want chat.completion.chunk", object)
+	}
+}
+
+func TestOpenAIChatCompletionsStreamingSidebandEventNotNormalized(t *testing.T) {
+	sseBody := "event: ping\ndata: {\"time\":1700000000}\n\ndata: {\"id\":\"chatcmpl-stream\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\ndata: [DONE]\n\n"
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(sseBody))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	events := parseSSEEvents(string(body))
+	if len(events) != 3 {
+		t.Fatalf("events = %d, want 3; body=%s", len(events), body)
+	}
+	if events[0].Event != "ping" || events[0].Data != `{"time":1700000000}` {
+		t.Fatalf("sideband event changed: %+v", events[0])
+	}
+	if strings.Contains(events[0].Data, "chat.completion.chunk") {
+		t.Fatalf("sideband event was normalized as a chat chunk: %s", events[0].Data)
+	}
+	var chunk map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(events[1].Data), &chunk); err != nil {
+		t.Fatalf("unmarshal normalized chat chunk: %v", err)
+	}
+	var object string
+	if err := json.Unmarshal(chunk["object"], &object); err != nil {
+		t.Fatalf("unmarshal chunk object: %v", err)
+	}
+	if object != "chat.completion.chunk" {
+		t.Fatalf("chat chunk object = %q, want chat.completion.chunk", object)
+	}
+}
+
+func TestOpenAIChatCompletionsStreamingErrorEventNotNormalized(t *testing.T) {
+	sseBody := "event: error\ndata: {\"error\":{\"message\":\"rate limit\",\"type\":\"rate_limit_error\"}}\n\n"
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(sseBody))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected committed stream status 200, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if got := string(body); got != sseBody {
+		t.Fatalf("stream error event changed:\n got: %q\nwant: %q", got, sseBody)
 	}
 }
 
@@ -9355,6 +9519,38 @@ func TestOpenAIChatCompletionsNormalizesMissingTopLevelFields(t *testing.T) {
 
 	if _, ok := raw["copilot_usage"]; !ok {
 		t.Fatal("copilot_usage was not preserved")
+	}
+}
+
+func TestOpenAIChatCompletionsNormalizesEmptyObject(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id": "chatcmpl-empty-object",
+			"object": "",
+			"created": 1700000000,
+			"model": "gpt-4",
+			"choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello"}, "finish_reason": "stop"}],
+			"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+		}`))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(w.Result().Body).Decode(&raw); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var object string
+	if err := json.Unmarshal(raw["object"], &object); err != nil {
+		t.Fatalf("unmarshal object: %v", err)
+	}
+	if object != "chat.completion" {
+		t.Fatalf("object = %q, want chat.completion", object)
 	}
 }
 
@@ -9731,7 +9927,7 @@ func TestOpenAIResponsesResponseShape(t *testing.T) {
 	}
 
 	// Verify key Responses API fields are preserved in passthrough
-	for _, f := range []string{"id", "object", "status", "model", "output", "usage"} {
+	for _, f := range []string{"id", "object", "created_at", "status", "model", "output", "usage"} {
 		if _, ok := raw[f]; !ok {
 			t.Errorf("response missing field %q", f)
 		}
