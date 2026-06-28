@@ -212,6 +212,9 @@ func normalizeOpenAIChatCompletionResponse(body []byte, requestedModel string, n
 	if payload == nil {
 		return nil, false, fmt.Errorf("chat completion response is not a JSON object")
 	}
+	if hasNonNullJSONField(payload, "error") {
+		return body, false, nil
+	}
 
 	changed := false
 	if !hasNonEmptyStringJSONField(payload, "object") {
@@ -403,6 +406,18 @@ func normalizeOpenAIChatCompletionMessage(choice map[string]json.RawMessage) (js
 		}
 		changed = true
 	}
+	if !hasNonNullJSONField(message, "tool_calls") {
+		if toolCalls, ok := choice["tool_calls"]; ok && len(bytes.TrimSpace(toolCalls)) > 0 && string(bytes.TrimSpace(toolCalls)) != "null" {
+			message["tool_calls"] = toolCalls
+			changed = true
+		}
+	}
+	if !hasNonNullJSONField(message, "function_call") {
+		if functionCall, ok := choice["function_call"]; ok && len(bytes.TrimSpace(functionCall)) > 0 && string(bytes.TrimSpace(functionCall)) != "null" {
+			message["function_call"] = functionCall
+			changed = true
+		}
+	}
 
 	if !changed {
 		return choice["message"], false
@@ -427,8 +442,20 @@ func firstProviderChoiceContent(choice map[string]json.RawMessage) (json.RawMess
 	return nil, false
 }
 
+func choiceMessageHasToolCall(choice map[string]json.RawMessage) bool {
+	raw, ok := choice["message"]
+	if !ok || len(bytes.TrimSpace(raw)) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+		return false
+	}
+	var message map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &message); err != nil || message == nil {
+		return false
+	}
+	return hasNonNullJSONField(message, "tool_calls") || hasNonNullJSONField(message, "function_call")
+}
+
 func defaultOpenAIChatChoiceFinishReason(choice map[string]json.RawMessage) string {
-	if hasNonNullJSONField(choice, "tool_calls") || hasNonNullJSONField(choice, "function_call") {
+	if hasNonNullJSONField(choice, "tool_calls") || hasNonNullJSONField(choice, "function_call") || choiceMessageHasToolCall(choice) {
 		return "tool_calls"
 	}
 	if raw, ok := choice["stop_reason"]; ok {
