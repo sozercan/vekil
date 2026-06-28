@@ -551,6 +551,8 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
 			copyPassthroughHeaders(w.Header(), resp.Header)
+			// TODO: add a separate ChatCompletionChunk normalizer if strict streaming
+			// clients encounter upstream chunks missing OpenAI-required chunk fields.
 			finalResponse := h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope)
 			usage := openAIChatStreamUsageCallback(r.Context())
 			// A post-commit upstream stream error (the 200 header is already sent)
@@ -562,13 +564,14 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			StreamOpenAIChatPassthrough(w, resp.Body, mode.injectedClientStreamUsage, onError, finalResponse, usage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			normalizeOpenAIChatCompletionStruct(oaiResp, requestedModel)
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(oaiResp)
 		},
 		passthrough: func(resp *http.Response) error {
-			return h.maybeWriteOptimizedOpenAIChatPassthrough(r.Context(), w, resp, h.toolContexts, scope)
+			return h.maybeWriteOptimizedOpenAIChatPassthrough(r.Context(), w, resp, requestedModel, h.toolContexts, scope)
 		},
 	})
 	if err != nil {

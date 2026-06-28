@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
@@ -305,9 +306,9 @@ func (h *ProxyHandler) rewriteOpenAIChatRequestBodyWithToolOptimizers(ctx contex
 	return rewritten
 }
 
-func (h *ProxyHandler) maybeWriteOptimizedOpenAIChatPassthrough(ctx context.Context, w http.ResponseWriter, resp *http.Response, store *ToolExecutionContextStore, scope string) error {
+func (h *ProxyHandler) maybeWriteOptimizedOpenAIChatPassthrough(ctx context.Context, w http.ResponseWriter, resp *http.Response, requestedModel string, store *ToolExecutionContextStore, scope string) error {
 	if h == nil || h.toolOptimizers == nil || !h.toolOptimizers.ShouldInspectNonStreamingResponses() || resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK {
-		h.writeOpenAIPassthroughObservingUsage(ctx, w, resp)
+		h.writeOpenAIChatCompletionResponse(ctx, w, resp, requestedModel)
 		return nil
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -320,9 +321,19 @@ func (h *ProxyHandler) maybeWriteOptimizedOpenAIChatPassthrough(ctx context.Cont
 		return nil
 	}
 
+	normalizedBody, normalized, normalizeErr := normalizeOpenAIChatCompletionResponse(bodyBytes, requestedModel, time.Now())
+	if normalizeErr == nil {
+		bodyBytes = normalizedBody
+	}
+
 	var parsed models.OpenAIResponse
 	if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
+		observeOpenAIUsage(ctx, sniffOpenAIUsage(bodyBytes))
 		copyPassthroughHeaders(w.Header(), resp.Header)
+		if normalized {
+			w.Header().Del("Content-Length")
+			w.Header().Set("Content-Length", strconv.Itoa(len(bodyBytes)))
+		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(bodyBytes)
 		return nil
@@ -340,7 +351,7 @@ func (h *ProxyHandler) maybeWriteOptimizedOpenAIChatPassthrough(ctx context.Cont
 	}
 
 	copyPassthroughHeaders(w.Header(), resp.Header)
-	if changedCount > 0 {
+	if normalized || changedCount > 0 {
 		w.Header().Del("Content-Length")
 		w.Header().Set("Content-Length", strconv.Itoa(len(out)))
 	}

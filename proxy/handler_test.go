@@ -9235,6 +9235,33 @@ func TestOpenAIResponsesStreaming_PreservesUpstreamHeaders(t *testing.T) {
 	}
 }
 
+func TestOpenAIChatCompletionsStreamingNotNormalized(t *testing.T) {
+	sseBody := "data: {\"id\":\"chatcmpl-stream\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\ndata: [DONE]\n\n"
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(sseBody))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if got := string(body); got != sseBody {
+		t.Fatalf("stream body changed:\n got: %q\nwant: %q", got, sseBody)
+	}
+	if strings.Contains(string(body), "chat.completion") {
+		t.Fatalf("streaming chunks should not be normalized by the non-streaming normalizer: %s", body)
+	}
+}
+
 // TestOpenAIChatCompletionsUpstreamErrorPassthrough validates that upstream error
 // responses are forwarded with correct status and content-type.
 func TestOpenAIChatCompletionsUpstreamErrorPassthrough(t *testing.T) {
@@ -9264,6 +9291,298 @@ func TestOpenAIChatCompletionsUpstreamErrorPassthrough(t *testing.T) {
 	}
 	if errResp["error"]["type"] != "invalid_request_error" {
 		t.Errorf("error.type = %v, want invalid_request_error", errResp["error"]["type"])
+	}
+}
+
+func TestOpenAIChatCompletionsNormalizesMissingTopLevelFields(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices": [{"message": {"role": "assistant", "content": "Hello"}, "finish_reason": "stop"}],
+			"usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+			"copilot_usage": {"prompt_tokens": 10}
+		}`))
+	})
+
+	reqBody := `{"model":"gpt-5-mini","messages":[{"role":"user","content":"Hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	var object string
+	if err := json.Unmarshal(raw["object"], &object); err != nil {
+		t.Fatalf("unmarshal object: %v", err)
+	}
+	if object != "chat.completion" {
+		t.Fatalf("object = %q, want chat.completion", object)
+	}
+
+	var created int64
+	if err := json.Unmarshal(raw["created"], &created); err != nil {
+		t.Fatalf("unmarshal created: %v", err)
+	}
+	if created == 0 {
+		t.Fatal("created = 0, want non-zero Unix seconds")
+	}
+
+	var id string
+	if err := json.Unmarshal(raw["id"], &id); err != nil {
+		t.Fatalf("unmarshal id: %v", err)
+	}
+	if !strings.HasPrefix(id, "chatcmpl-") {
+		t.Fatalf("id = %q, want chatcmpl- prefix", id)
+	}
+
+	var model string
+	if err := json.Unmarshal(raw["model"], &model); err != nil {
+		t.Fatalf("unmarshal model: %v", err)
+	}
+	if model != "gpt-5-mini" {
+		t.Fatalf("model = %q, want requested model", model)
+	}
+
+	if _, ok := raw["copilot_usage"]; !ok {
+		t.Fatal("copilot_usage was not preserved")
+	}
+}
+
+func TestOpenAIChatCompletionsNormalizesChoicesUsageAndPreservesVendorFields(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id": "chatcmpl-upstream",
+			"model": "gpt-5-mini",
+			"choices": [
+				{"message": {}},
+				{"content": "provider content"},
+				{"content": {"type": "structured"}}
+			],
+			"usage": {"prompt_tokens": 4, "completion_tokens": 6, "reasoning_tokens": 2},
+			"prompt_filter_results": [{"prompt_index": 0}],
+			"content_filter_results": {"hate": {"filtered": false}}
+		}`))
+	})
+
+	reqBody := `{"model":"gpt-5-mini","messages":[{"role":"user","content":"Hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	var choices []map[string]json.RawMessage
+	if err := json.Unmarshal(raw["choices"], &choices); err != nil {
+		t.Fatalf("unmarshal choices: %v", err)
+	}
+	if len(choices) != 3 {
+		t.Fatalf("choices length = %d, want 3", len(choices))
+	}
+	for i, choice := range choices {
+		var index int
+		if err := json.Unmarshal(choice["index"], &index); err != nil {
+			t.Fatalf("choice[%d] index: %v", i, err)
+		}
+		if index != i {
+			t.Fatalf("choice[%d].index = %d, want %d", i, index, i)
+		}
+		var finishReason string
+		if err := json.Unmarshal(choice["finish_reason"], &finishReason); err != nil {
+			t.Fatalf("choice[%d] finish_reason: %v", i, err)
+		}
+		if finishReason != "stop" {
+			t.Fatalf("choice[%d].finish_reason = %q, want stop", i, finishReason)
+		}
+	}
+
+	var msg0 map[string]json.RawMessage
+	if err := json.Unmarshal(choices[0]["message"], &msg0); err != nil {
+		t.Fatalf("choice[0] message: %v", err)
+	}
+	var role0 string
+	if err := json.Unmarshal(msg0["role"], &role0); err != nil {
+		t.Fatalf("choice[0] role: %v", err)
+	}
+	if role0 != "assistant" {
+		t.Fatalf("choice[0].message.role = %q, want assistant", role0)
+	}
+	var content0 string
+	if err := json.Unmarshal(msg0["content"], &content0); err != nil {
+		t.Fatalf("choice[0] content: %v", err)
+	}
+	if content0 != "" {
+		t.Fatalf("choice[0].message.content = %q, want empty string", content0)
+	}
+
+	var msg1 map[string]json.RawMessage
+	if err := json.Unmarshal(choices[1]["message"], &msg1); err != nil {
+		t.Fatalf("choice[1] message: %v", err)
+	}
+	var role1, content1 string
+	if err := json.Unmarshal(msg1["role"], &role1); err != nil {
+		t.Fatalf("choice[1] role: %v", err)
+	}
+	if err := json.Unmarshal(msg1["content"], &content1); err != nil {
+		t.Fatalf("choice[1] content: %v", err)
+	}
+	if role1 != "assistant" || content1 != "provider content" {
+		t.Fatalf("choice[1] message = role %q content %q, want assistant/provider content", role1, content1)
+	}
+
+	var msg2 map[string]json.RawMessage
+	if err := json.Unmarshal(choices[2]["message"], &msg2); err != nil {
+		t.Fatalf("choice[2] message: %v", err)
+	}
+	var content2 string
+	if err := json.Unmarshal(msg2["content"], &content2); err != nil {
+		t.Fatalf("choice[2] content: %v", err)
+	}
+	if content2 != "" {
+		t.Fatalf("choice[2].message.content = %q, want empty string for non-string provider content", content2)
+	}
+
+	var usage map[string]json.RawMessage
+	if err := json.Unmarshal(raw["usage"], &usage); err != nil {
+		t.Fatalf("unmarshal usage: %v", err)
+	}
+	wantUsage := map[string]int{"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10}
+	for key, want := range wantUsage {
+		var got int
+		if err := json.Unmarshal(usage[key], &got); err != nil {
+			t.Fatalf("usage[%s]: %v", key, err)
+		}
+		if got != want {
+			t.Fatalf("usage[%s] = %d, want %d", key, got, want)
+		}
+	}
+	if _, ok := usage["reasoning_tokens"]; !ok {
+		t.Fatal("usage.reasoning_tokens was not preserved")
+	}
+	if _, ok := raw["prompt_filter_results"]; !ok {
+		t.Fatal("prompt_filter_results was not preserved")
+	}
+	if _, ok := raw["content_filter_results"]; !ok {
+		t.Fatal("content_filter_results was not preserved")
+	}
+}
+
+func TestOpenAIChatCompletionsNormalizesSuccessful2xxResponses(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"created"}}]}`))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 201, got %d: %s", resp.StatusCode, body)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var object string
+	if err := json.Unmarshal(raw["object"], &object); err != nil {
+		t.Fatalf("unmarshal object: %v", err)
+	}
+	if object != "chat.completion" {
+		t.Fatalf("object = %q, want chat.completion", object)
+	}
+}
+
+func TestOpenAIChatCompletionsNormalizesMissingUsage(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id": "chatcmpl-usage",
+			"object": "chat.completion",
+			"created": 1700000000,
+			"model": "gpt-4",
+			"choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello"}, "finish_reason": "stop"}]
+		}`))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var usage map[string]int
+	if err := json.Unmarshal(raw["usage"], &usage); err != nil {
+		t.Fatalf("unmarshal usage: %v", err)
+	}
+	for _, key := range []string{"prompt_tokens", "completion_tokens", "total_tokens"} {
+		if got := usage[key]; got != 0 {
+			t.Fatalf("usage[%s] = %d, want 0", key, got)
+		}
+	}
+}
+
+func TestOpenAIChatCompletionsDoesNotNormalizeErrorResponses(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"bad request","type":"invalid_request_error"}}`))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if _, ok := raw["object"]; ok {
+		t.Fatal("error response should not be normalized with object")
+	}
+	if _, ok := raw["created"]; ok {
+		t.Fatal("error response should not be normalized with created")
 	}
 }
 
