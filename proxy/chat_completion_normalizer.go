@@ -18,10 +18,11 @@ const (
 )
 
 type openAIChatCompletionChunkNormalizer struct {
-	requestedModel string
-	streamID       string
-	created        int64
-	model          string
+	requestedModel    string
+	streamID          string
+	syntheticStreamID bool
+	created           int64
+	model             string
 }
 
 func newOpenAIChatCompletionChunkNormalizer(requestedModel string) *openAIChatCompletionChunkNormalizer {
@@ -64,10 +65,19 @@ func (n *openAIChatCompletionChunkNormalizer) normalize(eventType, data string) 
 		changed = true
 	}
 	if hasNonEmptyStringJSONField(payload, "id") {
-		n.streamID = jsonRawString(payload["id"])
+		upstreamID := jsonRawString(payload["id"])
+		if n.streamID == "" {
+			n.streamID = upstreamID
+		} else if n.syntheticStreamID && upstreamID != n.streamID {
+			payload["id"] = mustMarshalRaw(n.streamID)
+			changed = true
+		} else {
+			n.streamID = upstreamID
+		}
 	} else {
 		if n.streamID == "" {
 			n.streamID = "chatcmpl-" + uuid.NewString()
+			n.syntheticStreamID = true
 		}
 		payload["id"] = mustMarshalRaw(n.streamID)
 		changed = true
@@ -178,6 +188,12 @@ func defaultOpenAIChatCompletionChunkDelta(choice map[string]json.RawMessage) js
 	}
 	if role, ok := firstProviderChoiceStringField(choice, "role"); ok {
 		delta["role"] = role
+	}
+	if toolCalls, ok := choice["tool_calls"]; ok && rawToolCallsNonEmpty(toolCalls) {
+		delta["tool_calls"] = toolCalls
+	}
+	if functionCall, ok := choice["function_call"]; ok && rawFunctionCallNonEmpty(functionCall) {
+		delta["function_call"] = functionCall
 	}
 	if len(delta) == 0 {
 		return json.RawMessage("{}")
@@ -358,7 +374,7 @@ func normalizeOpenAIChatCompletionChoice(raw json.RawMessage, arrayIndex int) (j
 		choice["index"] = mustMarshalRaw(arrayIndex)
 		changed = true
 	}
-	if !hasNonNullJSONField(choice, "finish_reason") {
+	if !hasNonEmptyStringJSONField(choice, "finish_reason") {
 		choice["finish_reason"] = mustMarshalRaw(defaultOpenAIChatChoiceFinishReason(choice))
 		changed = true
 	}
@@ -407,13 +423,13 @@ func normalizeOpenAIChatCompletionMessage(choice map[string]json.RawMessage) (js
 		changed = true
 	}
 	if !hasNonNullJSONField(message, "tool_calls") {
-		if toolCalls, ok := choice["tool_calls"]; ok && len(bytes.TrimSpace(toolCalls)) > 0 && string(bytes.TrimSpace(toolCalls)) != "null" {
+		if toolCalls, ok := choice["tool_calls"]; ok && rawToolCallsNonEmpty(toolCalls) {
 			message["tool_calls"] = toolCalls
 			changed = true
 		}
 	}
 	if !hasNonNullJSONField(message, "function_call") {
-		if functionCall, ok := choice["function_call"]; ok && len(bytes.TrimSpace(functionCall)) > 0 && string(bytes.TrimSpace(functionCall)) != "null" {
+		if functionCall, ok := choice["function_call"]; ok && rawFunctionCallNonEmpty(functionCall) {
 			message["function_call"] = functionCall
 			changed = true
 		}
@@ -451,11 +467,31 @@ func choiceMessageHasToolCall(choice map[string]json.RawMessage) bool {
 	if err := json.Unmarshal(raw, &message); err != nil || message == nil {
 		return false
 	}
-	return hasNonNullJSONField(message, "tool_calls") || hasNonNullJSONField(message, "function_call")
+	return rawToolCallsNonEmpty(message["tool_calls"]) || rawFunctionCallNonEmpty(message["function_call"])
+}
+
+func choiceHasToolCall(choice map[string]json.RawMessage) bool {
+	return rawToolCallsNonEmpty(choice["tool_calls"]) || rawFunctionCallNonEmpty(choice["function_call"]) || choiceMessageHasToolCall(choice)
+}
+
+func rawToolCallsNonEmpty(raw json.RawMessage) bool {
+	if len(bytes.TrimSpace(raw)) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+		return false
+	}
+	var calls []json.RawMessage
+	return json.Unmarshal(raw, &calls) == nil && len(calls) > 0
+}
+
+func rawFunctionCallNonEmpty(raw json.RawMessage) bool {
+	if len(bytes.TrimSpace(raw)) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+		return false
+	}
+	var call map[string]json.RawMessage
+	return json.Unmarshal(raw, &call) == nil && len(call) > 0
 }
 
 func defaultOpenAIChatChoiceFinishReason(choice map[string]json.RawMessage) string {
-	if hasNonNullJSONField(choice, "tool_calls") || hasNonNullJSONField(choice, "function_call") || choiceMessageHasToolCall(choice) {
+	if choiceHasToolCall(choice) {
 		return "tool_calls"
 	}
 	if raw, ok := choice["stop_reason"]; ok {

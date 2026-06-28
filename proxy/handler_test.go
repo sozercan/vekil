@@ -9325,6 +9325,75 @@ func TestOpenAIChatCompletionsStreamingNormalizesChunks(t *testing.T) {
 	}
 }
 
+func TestOpenAIChatCompletionsStreamingKeepsSyntheticIDStable(t *testing.T) {
+	sseBody := "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\ndata: {\"id\":\"chatcmpl-upstream\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}]}\n\ndata: [DONE]\n\n"
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(sseBody))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	events := parseSSEEvents(w.Body.String())
+	if len(events) != 3 {
+		t.Fatalf("events = %d, want 3; body=%s", len(events), w.Body.String())
+	}
+	var first, second map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(events[0].Data), &first); err != nil {
+		t.Fatalf("decode first chunk: %v", err)
+	}
+	if err := json.Unmarshal([]byte(events[1].Data), &second); err != nil {
+		t.Fatalf("decode second chunk: %v", err)
+	}
+	var firstID, secondID string
+	if err := json.Unmarshal(first["id"], &firstID); err != nil {
+		t.Fatalf("decode first id: %v", err)
+	}
+	if err := json.Unmarshal(second["id"], &secondID); err != nil {
+		t.Fatalf("decode second id: %v", err)
+	}
+	if firstID == "" || !strings.HasPrefix(firstID, "chatcmpl-") {
+		t.Fatalf("first id = %q, want synthetic chatcmpl- id", firstID)
+	}
+	if secondID != firstID {
+		t.Fatalf("second id = %q, want stable synthetic id %q", secondID, firstID)
+	}
+}
+
+func TestOpenAIChatCompletionsStreamingSynthesizesDeltaToolCalls(t *testing.T) {
+	sseBody := "data: {\"id\":\"chatcmpl-tools\",\"choices\":[{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}]}\n\ndata: [DONE]\n\n"
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(sseBody))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	events := parseSSEEvents(w.Body.String())
+	var chunk map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(events[0].Data), &chunk); err != nil {
+		t.Fatalf("decode chunk: %v", err)
+	}
+	choices := decodeChoicesForTest(t, chunk["choices"])
+	var delta map[string]json.RawMessage
+	if err := json.Unmarshal(choices[0]["delta"], &delta); err != nil {
+		t.Fatalf("decode delta: %v", err)
+	}
+	if _, ok := delta["tool_calls"]; !ok {
+		t.Fatalf("delta.tool_calls missing: %s", choices[0]["delta"])
+	}
+}
+
 func TestOpenAIChatCompletionsStreamingNamedMessageEventNormalized(t *testing.T) {
 	sseBody := "event: message\ndata: {\"id\":\"chatcmpl-stream\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n"
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -9643,6 +9712,72 @@ func mustCompactRawForTest(raw map[string]json.RawMessage) string {
 		return "<invalid>"
 	}
 	return string(b)
+}
+
+func TestOpenAIChatCompletionsDoesNotTreatEmptyToolFieldsAsToolCalls(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"chatcmpl-empty-tools",
+			"object":"chat.completion",
+			"created":1700000000,
+			"model":"gpt-4",
+			"choices":[{"message":{"role":"assistant","content":"done","tool_calls":[]}}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(w.Result().Body).Decode(&raw); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	choices := decodeChoicesForTest(t, raw["choices"])
+	var finishReason string
+	if err := json.Unmarshal(choices[0]["finish_reason"], &finishReason); err != nil {
+		t.Fatalf("decode finish_reason: %v", err)
+	}
+	if finishReason != "stop" {
+		t.Fatalf("finish_reason = %q, want stop for empty tool_calls", finishReason)
+	}
+}
+
+func TestOpenAIChatCompletionsNormalizesBlankFinishReason(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"chatcmpl-blank-finish",
+			"object":"chat.completion",
+			"created":1700000000,
+			"model":"gpt-4",
+			"choices":[{"index":0,"finish_reason":"","message":{"role":"assistant","content":"done"}}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`))
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(w, req)
+
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(w.Result().Body).Decode(&raw); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	choices := decodeChoicesForTest(t, raw["choices"])
+	var finishReason string
+	if err := json.Unmarshal(choices[0]["finish_reason"], &finishReason); err != nil {
+		t.Fatalf("decode finish_reason: %v", err)
+	}
+	if finishReason != "stop" {
+		t.Fatalf("finish_reason = %q, want stop", finishReason)
+	}
 }
 
 func TestOpenAIChatCompletionsNormalizesEmptyObject(t *testing.T) {
