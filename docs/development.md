@@ -7,6 +7,7 @@ go build -o vekil .
 make build-app
 make docker-build
 make docker-build-rtk   # optional RTK image variant
+make docker-rtk-e2e     # verifies bundled RTK reduces tool output through Vekil
 ```
 
 `go test ./...` and ordinary Go builds do not require Sparkle. The updater code is only compiled for the packaged macOS app build via `make build-app`, which downloads Sparkle 2.9.0 into `.build/sparkle/`, passes the `sparkle` build tag, embeds `Sparkle.framework`, and ad-hoc signs the finished app bundle.

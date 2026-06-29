@@ -15,7 +15,7 @@ SPARKLE_DOWNLOAD_URL := https://github.com/sparkle-project/Sparkle/releases/down
 SPARKLE_FEED_URL ?= https://github.com/sozercan/vekil/releases/latest/download/appcast.xml
 SPARKLE_PUBLIC_ED_KEY ?=
 
-.PHONY: build build-app build-tray-linux test-app test compaction-lab vet lint clean docker-build docker-build-rtk
+.PHONY: build build-app build-tray-linux test-app test compaction-lab vet lint clean docker-build docker-build-rtk docker-rtk-e2e
 
 build:
 	go build -ldflags="$(LDFLAGS)" -o $(BINARY) .
@@ -116,3 +116,6 @@ docker-build:
 
 docker-build-rtk:
 	docker build --target runtime-rtk -t $(BINARY):rtk .
+
+docker-rtk-e2e:
+	scripts/rtk-container-e2e.sh

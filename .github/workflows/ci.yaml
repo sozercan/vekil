@@ -106,5 +106,5 @@ jobs:
       - name: Docker build RTK variant
         run: make docker-build-rtk
 
-      - name: Verify RTK variant
-        run: docker run --rm --entrypoint /usr/local/bin/rtk vekil:rtk --version | grep -E '^rtk '
+      - name: Verify RTK variant reduces tool output
+        run: make docker-rtk-e2e
