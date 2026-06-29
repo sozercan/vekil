@@ -111,11 +111,23 @@ jobs:
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
+          target: runtime
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             ghcr.io/${{ github.repository }}:${{ steps.version.outputs.tag }}
             ghcr.io/${{ github.repository }}:latest
+
+      - name: Build and push RTK variant
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          target: runtime-rtk
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.tag }}-rtk
+            ghcr.io/${{ github.repository }}:latest-rtk
 
   finalize-release:
     runs-on: ubuntu-latest

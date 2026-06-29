@@ -6,6 +6,7 @@
 go build -o vekil .
 make build-app
 make docker-build
+make docker-build-rtk   # optional RTK image variant
 ```
 
 `go test ./...` and ordinary Go builds do not require Sparkle. The updater code is only compiled for the packaged macOS app build via `make build-app`, which downloads Sparkle 2.9.0 into `.build/sparkle/`, passes the `sparkle` build tag, embeds `Sparkle.framework`, and ad-hoc signs the finished app bundle.
@@ -67,6 +68,7 @@ The same release workflow also:
 - generates and uploads `appcast.xml` for Sparkle update checks
 - updates the `vekil` cask in `sozercan/homebrew-repo`
 - pushes the multi-arch container image to GHCR
+- pushes the `-rtk` multi-arch container image variant to GHCR
 
 To publish the Homebrew cask, configure the repository secret `HOMEBREW_REPO_TOKEN` with push access to `sozercan/homebrew-repo`.
 
