@@ -36,6 +36,8 @@ tool_optimizers:
 
 With this config, Vekil asks RTK to rewrite shell commands and reduce shell output where supported. The minimal `rtk_cli` provider relies on two defaults: `path` defaults to `rtk`, and omitted `stages` means the provider is eligible for both `command_rewrite` and `output_reduce`. For example, depending on RTK policy, command rewrite may replace common shell commands with RTK-aware equivalents such as `rtk ls`, `rtk read`, or `rtk grep`.
 
+When running Vekil in Docker, use the `ghcr.io/sozercan/vekil:latest-rtk` image variant or build one locally with `docker build -f Dockerfile.rtk -t vekil:rtk .`. The default image intentionally does not include RTK. In the RTK variant, prefer `path: /usr/local/bin/rtk` so the config does not depend on `PATH` lookup.
+
 Advanced custom optimizer example:
 
 ```yaml

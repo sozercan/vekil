@@ -102,3 +102,9 @@ jobs:
 
       - name: Docker build
         run: make docker-build
+
+      - name: Docker build RTK variant
+        run: make docker-build-rtk
+
+      - name: Verify RTK variant reduces tool output
+        run: make docker-rtk-e2e

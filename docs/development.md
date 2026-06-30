@@ -6,6 +6,8 @@
 go build -o vekil .
 make build-app
 make docker-build
+make docker-build-rtk   # optional RTK image variant
+make docker-rtk-e2e     # verifies bundled RTK reduces tool output through Vekil
 ```
 
 `go test ./...` and ordinary Go builds do not require Sparkle. The updater code is only compiled for the packaged macOS app build via `make build-app`, which downloads Sparkle 2.9.0 into `.build/sparkle/`, passes the `sparkle` build tag, embeds `Sparkle.framework`, and ad-hoc signs the finished app bundle.
@@ -61,12 +63,15 @@ The macOS tray app has its own workflow in [`.github/workflows/macos-app.yaml`](
 
 Tag pushes to [`.github/workflows/release.yaml`](../.github/workflows/release.yaml) use [`.goreleaser.yaml`](../.goreleaser.yaml) to publish the CLI binaries and checksums to GitHub Releases for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`.
 
+RTK version bumps for the optional Docker variant are automated by [`.github/workflows/update-rtk.yaml`](../.github/workflows/update-rtk.yaml). The scheduled workflow runs [`scripts/update-rtk-version.sh`](../scripts/update-rtk-version.sh), updates the pinned `RTK_VERSION` Docker build arg in `Dockerfile.rtk` when `rtk-ai/rtk` publishes a new latest release, validates the rebuilt variant with `make docker-build-rtk` and `make docker-rtk-e2e`, and opens a signed PR.
+
 The same release workflow also:
 
 - builds `vekil-macos-arm64.zip` on a macOS runner and uploads it to the tagged release
 - generates and uploads `appcast.xml` for Sparkle update checks
 - updates the `vekil` cask in `sozercan/homebrew-repo`
 - pushes the multi-arch container image to GHCR
+- pushes the `-rtk` multi-arch container image variant to GHCR
 
 To publish the Homebrew cask, configure the repository secret `HOMEBREW_REPO_TOKEN` with push access to `sozercan/homebrew-repo`.
 

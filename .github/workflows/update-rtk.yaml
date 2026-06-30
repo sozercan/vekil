@@ -1,0 +1,74 @@
+name: Update RTK
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "27 9 * * 1"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-rtk
+  cancel-in-progress: true
+
+jobs:
+  update-rtk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Check latest RTK release
+        id: rtk
+        run: scripts/update-rtk-version.sh
+
+      - name: Stop when already current
+        if: ${{ steps.rtk.outputs.changed != 'true' }}
+        run: echo "RTK is already current at ${{ steps.rtk.outputs['current-version'] }}."
+
+      - name: Build RTK variant
+        if: ${{ steps.rtk.outputs.changed == 'true' }}
+        run: make docker-build-rtk
+
+      - name: Verify RTK variant reduces tool output
+        if: ${{ steps.rtk.outputs.changed == 'true' }}
+        run: make docker-rtk-e2e
+
+      - name: Open RTK update pull request
+        if: ${{ steps.rtk.outputs.changed == 'true' }}
+        env:
+          RTK_VERSION: ${{ steps.rtk.outputs['latest-version'] }}
+        run: |
+          set -euo pipefail
+
+          branch="deps/update-rtk-${RTK_VERSION}"
+          title="chore(deps): update RTK to ${RTK_VERSION}"
+          body_file="$(mktemp)"
+
+          cat > "${body_file}" <<EOF_BODY
+          ## Summary
+          - update bundled RTK in the optional Docker image variant to ${RTK_VERSION}
+
+          ## Validation
+          - \`make docker-build-rtk\`
+          - \`make docker-rtk-e2e\`
+          EOF_BODY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "${branch}"
+          git add Dockerfile.rtk
+          git commit -s -m "${title}"
+          git push --force origin "${branch}"
+
+          pr_number="$(gh pr list --head "${branch}" --state open --json number --jq '.[0].number // ""')"
+          if [[ -n "${pr_number}" ]]; then
+            gh pr edit "${pr_number}" --title "${title}" --body-file "${body_file}"
+          else
+            gh pr create --base main --head "${branch}" --title "${title}" --body-file "${body_file}"
+          fi
