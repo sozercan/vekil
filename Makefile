@@ -112,10 +112,10 @@ clean:
 	rm -rf "$(APP_NAME)" .build
 
 docker-build:
-	docker build --target runtime -t $(BINARY) .
+	docker build -t $(BINARY) .
 
 docker-build-rtk:
-	docker build --target runtime-rtk -t $(BINARY):rtk .
+	docker build -f Dockerfile.rtk -t $(BINARY):rtk .
 
 docker-rtk-e2e:
 	scripts/rtk-container-e2e.sh

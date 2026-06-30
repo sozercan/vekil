@@ -25,7 +25,7 @@ write_output() {
 
 require_cmd python3
 
-DOCKERFILE="${RTK_UPDATE_DOCKERFILE:-Dockerfile}"
+DOCKERFILE="${RTK_UPDATE_DOCKERFILE:-Dockerfile.rtk}"
 REPO="${RTK_UPDATE_REPO:-rtk-ai/rtk}"
 
 [[ -f "${DOCKERFILE}" ]] || die "Dockerfile not found: ${DOCKERFILE}"

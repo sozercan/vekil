@@ -6,40 +6,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /vekil .
 
-# Optional RTK downloader used only by the runtime-rtk target.
-FROM debian:trixie-slim AS rtk-downloader
-ARG RTK_VERSION=0.43.0
-ARG TARGETARCH
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl tar \
-    && rm -rf /var/lib/apt/lists/*
-RUN set -eux; \
-    arch="${TARGETARCH:-$(uname -m)}"; \
-    case "${arch}" in \
-        amd64|x86_64) target="x86_64-unknown-linux-musl" ;; \
-        arm64|aarch64) target="aarch64-unknown-linux-gnu" ;; \
-        *) echo "unsupported RTK target architecture: ${arch}" >&2; exit 1 ;; \
-    esac; \
-    version="${RTK_VERSION#v}"; \
-    archive="rtk-${target}.tar.gz"; \
-    base_url="https://github.com/rtk-ai/rtk/releases/download/v${version}"; \
-    curl -fsSLo "/tmp/${archive}" "${base_url}/${archive}"; \
-    curl -fsSLo /tmp/checksums.txt "${base_url}/checksums.txt"; \
-    checksum="$(grep "  ${archive}$" /tmp/checksums.txt)"; \
-    printf '%s\n' "${checksum}" | (cd /tmp && sha256sum -c -); \
-    tar -xzf "/tmp/${archive}" -C /usr/local/bin rtk; \
-    chmod 0755 /usr/local/bin/rtk; \
-    /usr/local/bin/rtk --version
-
-FROM gcr.io/distroless/cc-debian13:nonroot AS runtime-rtk
-COPY --from=builder /vekil /vekil
-COPY --from=rtk-downloader /usr/local/bin/rtk /usr/local/bin/rtk
-ENV HOST=0.0.0.0
-EXPOSE 1337
-ENTRYPOINT ["/vekil"]
-
-# Keep the minimal runtime as the final stage so `docker build .` stays unchanged.
-FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /vekil /vekil
 ENV HOST=0.0.0.0
 EXPOSE 1337

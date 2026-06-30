@@ -138,7 +138,7 @@ class Handler(BaseHTTPRequestHandler):
         print(fmt % args, file=sys.stderr)
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", int(sys.argv[1])), Handler).serve_forever()
 PY
 
 cat > "${ORIGINAL_OUTPUT_FILE}" <<'EOF_DIFF'
@@ -160,7 +160,7 @@ index 1111111..2222222 100644
  }
 EOF_DIFF
 
-log "Starting mock OpenAI-compatible upstream on 127.0.0.1:${UPSTREAM_PORT}"
+log "Starting mock OpenAI-compatible upstream on 0.0.0.0:${UPSTREAM_PORT}"
 python3 "${UPSTREAM_SCRIPT}" "${UPSTREAM_PORT}" >"${UPSTREAM_LOG}" 2>&1 &
 upstream_pid=$!
 for _ in $(seq 1 50); do

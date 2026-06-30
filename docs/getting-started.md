@@ -74,7 +74,7 @@ Build a local image:
 ```bash
 docker build -t vekil .
 # Optional RTK variant:
-# docker build --target runtime-rtk -t vekil:rtk .
+# docker build -f Dockerfile.rtk -t vekil:rtk .
 docker run -p 1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   vekil
