@@ -14,6 +14,8 @@ For responses-only Azure deployments such as the `gpt-5.4-pro` example configura
 
 Streaming Responses requests preserve upstream headers and are otherwise passed through directly. One narrow exception exists for `POST /v1/responses` with `stream: true`: if the first semantic SSE event is an immediate transient `response.failed` admission error such as `too_many_requests`, `model_overloaded`, `bad_gateway`, or `gateway_timeout`, the proxy translates that pre-commit failure into a normal HTTP error before flushing `200 OK`. All other streaming failures stay passthrough SSE.
 
+If an upstream rejects a `/responses` request with `400 invalid_request_body` because replayed `encrypted_content` cannot be verified or decrypted, Vekil retries once after removing the opaque encrypted replay items it cannot interpret. The original request remains near-zero-copy when the selected upstream accepts its own encrypted tokens; the retry only applies after that specific upstream rejection. Vekil-owned compaction checkpoints are still expanded to developer context before forwarding.
+
 `GET /v1/responses` can upgrade to a websocket bridge for Codex-style clients when `--responses-ws-enabled` or `RESPONSES_WS_ENABLED=true` is set. The proxy:
 
 - accepts `response.create` frames, including websocket-only top-level fields such as `client_metadata` and `initiator`

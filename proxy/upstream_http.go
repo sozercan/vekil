@@ -236,7 +236,11 @@ func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*h
 }
 
 func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	return h.postJSONEndpointWithHeaders(ctx, providerEndpointResponses, body, extraHeaders)
+	resp, err := h.postJSONEndpointWithHeaders(ctx, providerEndpointResponses, body, extraHeaders)
+	if err != nil {
+		return nil, err
+	}
+	return h.maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx, body, extraHeaders, resp)
 }
 
 func (h *ProxyHandler) postAnthropicMessages(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {

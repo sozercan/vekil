@@ -2196,6 +2196,179 @@ func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, bod
 	return resp, err
 }
 
+func (h *ProxyHandler) maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, resp *http.Response) (*http.Response, error) {
+	if resp == nil || resp.StatusCode != http.StatusBadRequest {
+		return resp, nil
+	}
+
+	respBodyPrefix, err := io.ReadAll(io.LimitReader(resp.Body, int64(compactUpstreamErrorBodySize)+1))
+	if err != nil {
+		_ = resp.Body.Close()
+		return nil, err
+	}
+	classificationBody := respBodyPrefix
+	if len(classificationBody) > compactUpstreamErrorBodySize {
+		classificationBody = classificationBody[:compactUpstreamErrorBodySize]
+	}
+	restoreOriginalResp := func() *http.Response {
+		cloned := new(http.Response)
+		*cloned = *resp
+		if resp.Header != nil {
+			cloned.Header = resp.Header.Clone()
+		}
+		cloned.Body = prefixedReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(respBodyPrefix), resp.Body),
+			close:  resp.Body.Close,
+		}
+		return cloned
+	}
+
+	if !isUnverifiableEncryptedContentError(resp.StatusCode, classificationBody) {
+		return restoreOriginalResp(), nil
+	}
+
+	retryBody, strippedItems := sanitizeResponsesUnverifiableEncryptedContentBody(bodyBytes)
+	if strippedItems == 0 {
+		return restoreOriginalResp(), nil
+	}
+
+	h.log.Info("retrying responses request without unverifiable encrypted content",
+		logger.F("encrypted_items_stripped", strippedItems),
+	)
+	retryResp, retryErr := h.postJSONEndpointWithHeaders(ctx, providerEndpointResponses, retryBody, extraHeaders)
+	if retryErr != nil {
+		h.log.Debug("responses encrypted-content retry request failed", logger.Err(retryErr))
+		return restoreOriginalResp(), nil
+	}
+	_ = resp.Body.Close()
+	return retryResp, nil
+}
+
+type prefixedReadCloser struct {
+	io.Reader
+	close func() error
+}
+
+func (r prefixedReadCloser) Close() error {
+	if r.close == nil {
+		return nil
+	}
+	return r.close()
+}
+
+func isUnverifiableEncryptedContentError(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadRequest {
+		return false
+	}
+
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return false
+	}
+
+	message := strings.ToLower(strings.TrimSpace(envelope.Error.Message))
+	if !strings.Contains(message, "encrypted content") {
+		return false
+	}
+	if strings.Contains(message, "decrypt") || strings.Contains(message, "could not be verified") || strings.Contains(message, "could not be parsed") {
+		return true
+	}
+
+	return strings.EqualFold(strings.TrimSpace(envelope.Error.Code), "invalid_request_body")
+}
+
+func sanitizeResponsesUnverifiableEncryptedContentBody(body []byte) ([]byte, int) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body, 0
+	}
+
+	rawInput, ok := payload["input"]
+	if !ok {
+		return body, 0
+	}
+	rewrittenInput, strippedItems, err := sanitizeResponsesUnverifiableEncryptedContentInput(rawInput)
+	if err != nil || strippedItems == 0 {
+		return body, 0
+	}
+	payload["input"] = rewrittenInput
+
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return body, 0
+	}
+	return rewritten, strippedItems
+}
+
+func sanitizeResponsesUnverifiableEncryptedContentInput(raw json.RawMessage) (json.RawMessage, int, error) {
+	var input []json.RawMessage
+	if err := json.Unmarshal(raw, &input); err != nil {
+		return raw, 0, err
+	}
+
+	rewritten := make([]json.RawMessage, 0, len(input))
+	strippedItems := 0
+	for _, rawItem := range input {
+		item, keep, count, err := sanitizeResponsesUnverifiableEncryptedContentItem(rawItem)
+		if err != nil {
+			rewritten = append(rewritten, rawItem)
+			continue
+		}
+		strippedItems += count
+		if keep {
+			rewritten = append(rewritten, item)
+		}
+	}
+	if strippedItems == 0 {
+		return raw, 0, nil
+	}
+
+	encoded, err := json.Marshal(rewritten)
+	if err != nil {
+		return raw, 0, err
+	}
+	return encoded, strippedItems, nil
+}
+
+func sanitizeResponsesUnverifiableEncryptedContentItem(raw json.RawMessage) (json.RawMessage, bool, int, error) {
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return raw, true, 0, err
+	}
+
+	itemType := rawJSONString(item["type"])
+	if itemType == "reasoning" {
+		return nil, false, 1, nil
+	}
+
+	if _, ok := item["encrypted_content"]; !ok {
+		return raw, true, 0, nil
+	}
+	if responsesInputItemIsProxyCompactionContext(raw) {
+		return raw, true, 0, nil
+	}
+
+	switch itemType {
+	case "compaction", "context_compaction":
+		// Unknown opaque checkpoint tokens cannot be interpreted once the selected
+		// upstream has rejected them. Drop the item rather than retrying an invalid
+		// shell such as {"type":"compaction"} without its required payload.
+		return nil, false, 1, nil
+	}
+
+	delete(item, "encrypted_content")
+	rewritten, err := json.Marshal(item)
+	if err != nil {
+		return raw, true, 0, err
+	}
+	return rewritten, true, 1, nil
+}
+
 // postResponsesWithFallbackHeadersTracked behaves like
 // postResponsesWithFallbackHeaders, but also returns the model the request was
 // ultimately served by — empty unless the model-fallback path engaged. The
