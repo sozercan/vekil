@@ -3888,6 +3888,139 @@ func TestHandleResponses_PreservesOpaqueCompaction(t *testing.T) {
 	}
 }
 
+func TestHandleResponses_RetriesWithoutUnverifiableEncryptedContent(t *testing.T) {
+	const encryptedToken = "gAAAAABencryptedReasoningPayloadpQ=="
+	var upstreamRequestsMu sync.Mutex
+	upstreamRequests := make([]map[string]interface{}, 0, 2)
+	var attempts atomic.Int32
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
+		}
+
+		upstreamRequestsMu.Lock()
+		upstreamRequests = append(upstreamRequests, body)
+		upstreamRequestsMu.Unlock()
+
+		switch attempts.Add(1) {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprintf(w, `{"error":{"message":"The encrypted content %s could not be verified. Reason: Encrypted content could not be decrypted or parsed.","code":"invalid_request_body"}}`, encryptedToken)
+		case 2:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-sanitized-encrypted-content","object":"response","status":"completed","output":[]}`))
+		default:
+			t.Fatalf("unexpected upstream attempt %d", attempts.Load())
+		}
+	})
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model":                "gpt-5.4",
+		"previous_response_id": "resp-prev",
+		"input": []interface{}{
+			map[string]interface{}{
+				"type":              "reasoning",
+				"id":                "rs-prev",
+				"encrypted_content": encryptedToken,
+			},
+			map[string]interface{}{
+				"type":              "compaction",
+				"encrypted_content": encryptedToken,
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": "continue without opaque state"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request body: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected retry to recover with 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	upstreamRequestsMu.Lock()
+	requests := append([]map[string]interface{}(nil), upstreamRequests...)
+	upstreamRequestsMu.Unlock()
+	if len(requests) != 2 {
+		t.Fatalf("expected initial request and sanitized retry, got %d", len(requests))
+	}
+
+	initialInput := upstreamInputItems(t, requests[0])
+	if len(initialInput) != 3 {
+		t.Fatalf("expected initial replay to include opaque items, got %d items", len(initialInput))
+	}
+	if initialInput[0]["type"] != "reasoning" || initialInput[0]["encrypted_content"] != encryptedToken {
+		t.Fatalf("expected initial request to include encrypted reasoning item, got %#v", initialInput[0])
+	}
+	if initialInput[1]["type"] != "compaction" || initialInput[1]["encrypted_content"] != encryptedToken {
+		t.Fatalf("expected initial request to include encrypted compaction item, got %#v", initialInput[1])
+	}
+
+	retryInput := upstreamInputItems(t, requests[1])
+	if len(retryInput) != 1 {
+		t.Fatalf("expected retry to drop unverifiable opaque items and keep user input, got %d: %#v", len(retryInput), retryInput)
+	}
+	if got := requireMessageTextWithRole(t, retryInput[0], "user"); got != "continue without opaque state" {
+		t.Fatalf("expected retry to preserve user message, got %q", got)
+	}
+	if got := requests[1]["previous_response_id"]; got != "resp-prev" {
+		t.Fatalf("expected retry to preserve previous_response_id, got %#v", got)
+	}
+}
+
+func TestHandleResponses_PreservesLargeNonEncryptedContentBadRequestBody(t *testing.T) {
+	const suffix = "--large-non-matching-error-end"
+	largeError := strings.Repeat("x", compactUpstreamErrorBodySize+1024) + suffix
+	var attempts atomic.Int32
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(largeError))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.4","input":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected upstream 400 passthrough, got %d: %s", resp.StatusCode, body)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if got := string(body); got != largeError {
+		t.Fatalf("expected non-matching 400 body to be preserved in full, got len=%d want len=%d suffix=%v", len(got), len(largeError), strings.HasSuffix(got, suffix))
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("expected no retry for non-matching 400, got %d upstream attempts", got)
+	}
+}
+
 func TestHandleResponses_RetriesCompacted413Replay(t *testing.T) {
 	var upstreamRequestsMu sync.Mutex
 	upstreamRequests := make([]map[string]interface{}, 0, 3)
