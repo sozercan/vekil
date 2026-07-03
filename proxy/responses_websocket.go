@@ -142,6 +142,7 @@ type responsesWebSocketSession struct {
 	lastResponseID string
 	lastSignature  string
 	historyItems   []json.RawMessage
+	historyBytes   int
 	toolContexts   *ToolExecutionContextStore
 	toolScope      string
 	done           chan struct{}
@@ -157,6 +158,8 @@ type responsesWebSocketRequestPlan struct {
 	currentInput       []json.RawMessage
 	fullReplaySegments [][]json.RawMessage
 	useTurnStateDelta  bool
+	compactionChecked  bool
+	compactionTrigger  bool
 }
 
 type responsesWebSocketRequestMetrics struct {
@@ -191,11 +194,17 @@ func (p responsesWebSocketRequestPlan) historyUpdateInput() (bool, []json.RawMes
 }
 
 func (p responsesWebSocketRequestPlan) hasCompactionTrigger() bool {
+	if p.compactionChecked {
+		return p.compactionTrigger
+	}
 	return responsesInputContainsCompactionTrigger(p.currentInput)
 }
 
 func responsesInputContainsCompactionTrigger(input []json.RawMessage) bool {
 	for _, raw := range input {
+		if !bytes.Contains(raw, responsesCompactionMarkerBytes) && !bytes.Contains(raw, []byte(`\u`)) {
+			continue
+		}
 		if responsesInputItemType(raw) == "compaction_trigger" {
 			return true
 		}
@@ -697,8 +706,10 @@ func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model strin
 
 func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) (responsesWebSocketRequestPlan, error) {
 	plan := responsesWebSocketRequestPlan{
-		signature:    request.signature(),
-		currentInput: request.Input,
+		signature:         request.signature(),
+		currentInput:      request.Input,
+		compactionChecked: true,
+		compactionTrigger: responsesInputContainsCompactionTrigger(request.Input),
 	}
 	if request.PreviousResponseID == "" {
 		plan.resetHistory = true
@@ -873,9 +884,11 @@ func (s *responsesWebSocketSession) rememberResponse(resetHistory bool, response
 	s.lastSignature = signature
 	if resetHistory {
 		s.historyItems = nil
+		s.historyBytes = 0
 	}
 	s.historyItems = append(s.historyItems, currentInput...)
 	s.historyItems = append(s.historyItems, outputItems...)
+	s.historyBytes += rawMessagesSize(currentInput) + rawMessagesSize(outputItems)
 }
 
 func (s *responsesWebSocketSession) rememberPlannedResponse(plan responsesWebSocketRequestPlan, responseID string, outputItems []json.RawMessage) {
@@ -904,7 +917,7 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, req
 			logger.Err(err),
 			logger.F("model", request.Model),
 			logger.F("history_items", len(s.historyItems)),
-			logger.F("history_bytes", rawMessagesSize(s.historyItems)),
+			logger.F("history_bytes", s.currentHistoryBytes()),
 		)
 		return metrics
 	}
@@ -997,6 +1010,7 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 		}
 
 		s.historyItems = compactedHistory
+		s.historyBytes = rawMessagesSize(compactedHistory)
 		h.log.Debug("responses websocket compacted oversized replay; retrying request",
 			logger.F("model", request.Model),
 			logger.F("previous_response_id", request.PreviousResponseID),
@@ -1056,7 +1070,7 @@ func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.
 		if !cfg.autoCompactEnabled() {
 			return result, false, nil
 		}
-		if !responsesWebSocketHistoryExceedsThreshold(s.historyItems, cfg) {
+		if !responsesWebSocketHistoryExceedsThresholdWithBytes(s.historyItems, s.currentHistoryBytes(), cfg) {
 			return result, false, nil
 		}
 	}
@@ -1074,6 +1088,7 @@ func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.
 		return result, ok, err
 	}
 	s.historyItems = compacted
+	s.historyBytes = rawMessagesSize(compacted)
 	return result, true, nil
 }
 
@@ -1149,7 +1164,7 @@ func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *
 		logger.F("delta_fallback", metrics.deltaFallback),
 		logger.F("auto_compacted", metrics.autoCompacted),
 		logger.F("history_items", len(s.historyItems)),
-		logger.F("history_bytes", rawMessagesSize(s.historyItems)),
+		logger.F("history_bytes", s.currentHistoryBytes()),
 		logger.F("compacted_from_items", metrics.compactedFromItems),
 		logger.F("compacted_from_bytes", metrics.compactedFromBytes),
 		logger.F("compacted_to_items", metrics.compactedToItems),
@@ -1448,16 +1463,35 @@ func responsesWebSocketMetadataHeaders(headers http.Header) map[string]interface
 }
 
 func responsesWebSocketHistoryExceedsThreshold(items []json.RawMessage, cfg ResponsesWebSocketConfig) bool {
+	return responsesWebSocketHistoryExceedsThresholdWithBytes(items, 0, cfg)
+}
+
+func responsesWebSocketHistoryExceedsThresholdWithBytes(items []json.RawMessage, historyBytes int, cfg ResponsesWebSocketConfig) bool {
 	if len(items) <= 1 {
 		return false
 	}
 	if cfg.AutoCompactMaxItems > 0 && len(items) > cfg.AutoCompactMaxItems && responsesWebSocketHistoryCanReduceItemCount(items, cfg.AutoCompactKeepTail) {
 		return true
 	}
-	if cfg.AutoCompactMaxBytes > 0 && rawMessagesSize(items) > cfg.AutoCompactMaxBytes {
-		return true
+	if cfg.AutoCompactMaxBytes > 0 {
+		if historyBytes <= 0 {
+			historyBytes = rawMessagesSize(items)
+		}
+		if historyBytes > cfg.AutoCompactMaxBytes {
+			return true
+		}
 	}
 	return false
+}
+
+func (s *responsesWebSocketSession) currentHistoryBytes() int {
+	if len(s.historyItems) == 0 {
+		return 0
+	}
+	if s.historyBytes <= 0 {
+		return rawMessagesSize(s.historyItems)
+	}
+	return s.historyBytes
 }
 
 func responsesWebSocketHistoryCanReduceItemCount(items []json.RawMessage, keepTail int) bool {

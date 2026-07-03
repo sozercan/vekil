@@ -9,6 +9,8 @@ import (
 	"testing"
 )
 
+var benchmarkProviderSetupSink *providerSetup
+
 func TestLoadProvidersConfigFileAzureV1BaseURLAndModelMetadata(t *testing.T) {
 	t.Parallel()
 
@@ -1092,5 +1094,97 @@ func TestBuildProvidersAzureAuthModeValidation(t *testing.T) {
 				t.Fatalf("buildProviders() error = %v, want %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestInitializeProvidersCachesDefaultProviderSetup(t *testing.T) {
+	t.Parallel()
+
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.test/"}
+	if err := handler.initializeProviders(); err != nil {
+		t.Fatalf("initializeProviders() error = %v", err)
+	}
+
+	first := handler.providerSetup()
+	second := handler.providerSetup()
+	if first == nil {
+		t.Fatal("providerSetup() = nil, want default setup")
+	}
+	if first != second {
+		t.Fatal("providerSetup() returned different default setup pointers; want cached setup")
+	}
+	if first.hasConfiguredState {
+		t.Fatal("default setup hasConfiguredState = true, want false")
+	}
+	if got, want := first.defaultProviderID, "copilot"; got != want {
+		t.Fatalf("defaultProviderID = %q, want %q", got, want)
+	}
+	if !reflect.DeepEqual(first.providerOrder, []string{"copilot"}) {
+		t.Fatalf("providerOrder = %v, want [copilot]", first.providerOrder)
+	}
+
+	provider := first.defaultProvider()
+	if provider == nil {
+		t.Fatal("defaultProvider() = nil, want copilot provider")
+	}
+	if got, want := provider.baseURL, "https://copilot.example.test"; got != want {
+		t.Fatalf("default provider baseURL = %q, want %q", got, want)
+	}
+}
+
+func TestInitializeProvidersConfiguredSetupStillUsesConfiguredState(t *testing.T) {
+	t.Parallel()
+
+	handler := &ProxyHandler{
+		copilotURL: "https://copilot.example.test",
+		providersConfig: ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:       "local-openai",
+				Type:     "openai-compatible",
+				Default:  true,
+				BaseURL:  "https://local-openai.example.test",
+				AuthType: "none",
+				Models: []ProviderModelConfig{{
+					PublicID: "local-chat",
+				}},
+			}},
+		},
+	}
+	if err := handler.initializeProviders(); err != nil {
+		t.Fatalf("initializeProviders() error = %v", err)
+	}
+
+	setup := handler.providerSetup()
+	if setup == nil {
+		t.Fatal("providerSetup() = nil, want configured setup")
+	}
+	if !setup.hasConfiguredState {
+		t.Fatal("configured setup hasConfiguredState = false, want true")
+	}
+	if got, want := setup.defaultProviderID, "local-openai"; got != want {
+		t.Fatalf("defaultProviderID = %q, want %q", got, want)
+	}
+	if _, ok := setup.providers["copilot"]; ok {
+		t.Fatal("configured setup unexpectedly contains zero-config copilot provider")
+	}
+	model, ok := setup.lookupModel("local-chat")
+	if !ok {
+		t.Fatal("lookupModel(local-chat) = false, want configured model")
+	}
+	if got, want := model.providerID, "local-openai"; got != want {
+		t.Fatalf("model providerID = %q, want %q", got, want)
+	}
+}
+
+func BenchmarkDefaultProviderSetup(b *testing.B) {
+	handler := &ProxyHandler{copilotURL: "https://api.githubcopilot.com"}
+	if err := handler.initializeProviders(); err != nil {
+		b.Fatalf("initializeProviders() error = %v", err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		benchmarkProviderSetupSink = handler.providerSetup()
 	}
 }
