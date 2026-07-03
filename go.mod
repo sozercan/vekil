@@ -11,7 +11,7 @@ require (
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
-	github.com/klauspost/compress v1.18.6
+	github.com/klauspost/compress v1.19.0
 	golang.org/x/net v0.56.0
 	gopkg.in/yaml.v3 v3.0.1
 )
