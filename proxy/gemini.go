@@ -307,20 +307,6 @@ func hashOpenAIRequest(req *models.OpenAIRequest) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-func cloneOpenAIRequest(req *models.OpenAIRequest) (*models.OpenAIRequest, error) {
-	raw, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-
-	var clone models.OpenAIRequest
-	if err := json.Unmarshal(raw, &clone); err != nil {
-		return nil, err
-	}
-
-	return &clone, nil
-}
-
 func parseGeminiPath(path string) (string, string, error) {
 	prefixes := []string{"/v1beta/models/", "/v1/models/", "/models/"}
 	for _, prefix := range prefixes {

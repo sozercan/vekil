@@ -1440,6 +1440,161 @@ func TestHandleGeminiModelsGenerateContent_ForcedStreamingUsesStreamingUpstreamT
 	assertDeadlineApprox(t, <-deadlineCh, streamingUpstreamTimeout)
 }
 
+func TestHandleGeminiModelsGenerateContentDoesNotForceStreamWhenToolChoiceNone(t *testing.T) {
+	handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+
+		if oaiReq.Stream != nil && *oaiReq.Stream {
+			t.Fatal("Stream = true, want unset or false when Gemini tool_choice translates to none")
+		}
+		if oaiReq.StreamOptions != nil {
+			t.Fatalf("StreamOptions = %#v, want nil when upstream stream is not forced", oaiReq.StreamOptions)
+		}
+		if len(oaiReq.Tools) != 1 {
+			t.Fatalf("len(Tools) = %d, want 1", len(oaiReq.Tools))
+		}
+		if !openAIToolChoiceIsNone(oaiReq.ToolChoice) {
+			t.Fatalf("ToolChoice = %s, want none", string(oaiReq.ToolChoice))
+		}
+
+		return jsonHTTPResponse(`{
+			"id":"chatcmpl-gemini-tool-none",
+			"model":"gemini-2.5-pro",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"Tool use disabled"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}
+		}`), nil
+	}))
+
+	reqBody := `{
+		"model": "models/gemini-2.5-pro",
+		"contents": [{"role":"user","parts":[{"text":"Hi"}]}],
+		"tools": [{"functionDeclarations":[{"name":"lookup_weather","parameters":{"type":"object"}}]}],
+		"toolConfig": {"functionCallingConfig": {"mode": "NONE"}}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/models/models/gemini-2.5-pro:generateContent", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleGeminiModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, string(body))
+	}
+
+	var geminiResp models.GeminiGenerateContentResponse
+	if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if geminiResp.UsageMetadata == nil || geminiResp.UsageMetadata.TotalTokenCount != 8 {
+		t.Fatalf("UsageMetadata = %#v, want totalTokenCount=8", geminiResp.UsageMetadata)
+	}
+	if len(geminiResp.Candidates) != 1 || geminiResp.Candidates[0].Content == nil || len(geminiResp.Candidates[0].Content.Parts) != 1 {
+		t.Fatalf("Candidates = %#v, want one text candidate", geminiResp.Candidates)
+	}
+	if got := geminiResp.Candidates[0].Content.Parts[0].Text; got == nil || *got != "Tool use disabled" {
+		t.Fatalf("text = %v, want Tool use disabled", got)
+	}
+}
+
+func TestRunGeminiCountTokensProbeDoesNotMutateBaseRequest(t *testing.T) {
+	var calls atomic.Int32
+	handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		call := calls.Add(1)
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Fatalf("unmarshal upstream request %d: %v", call, err)
+		}
+
+		if oaiReq.Stream == nil || *oaiReq.Stream {
+			t.Fatalf("request %d Stream = %v, want false", call, oaiReq.Stream)
+		}
+		if oaiReq.StreamOptions != nil {
+			t.Fatalf("request %d StreamOptions = %#v, want nil", call, oaiReq.StreamOptions)
+		}
+		if oaiReq.Temperature == nil || *oaiReq.Temperature != 0 {
+			t.Fatalf("request %d Temperature = %v, want 0", call, oaiReq.Temperature)
+		}
+
+		if call == 1 {
+			if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != 1 {
+				t.Fatalf("first request MaxCompletionTokens = %v, want 1", oaiReq.MaxCompletionTokens)
+			}
+			if oaiReq.MaxTokens != nil {
+				t.Fatalf("first request MaxTokens = %v, want nil", oaiReq.MaxTokens)
+			}
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"max_completion_tokens unsupported"}}`)),
+			}, nil
+		}
+
+		if call != 2 {
+			t.Fatalf("unexpected request %d", call)
+		}
+		if oaiReq.MaxCompletionTokens != nil {
+			t.Fatalf("fallback request MaxCompletionTokens = %v, want nil", oaiReq.MaxCompletionTokens)
+		}
+		if oaiReq.MaxTokens == nil || *oaiReq.MaxTokens != 1 {
+			t.Fatalf("fallback request MaxTokens = %v, want 1", oaiReq.MaxTokens)
+		}
+		return jsonHTTPResponse(`{
+			"id":"chatcmpl-gemini-counttokens",
+			"model":"gemini-2.5-pro",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"length"}],
+			"usage":{"prompt_tokens":21,"completion_tokens":1,"total_tokens":22}
+		}`), nil
+	}))
+
+	originalMaxTokens := 42
+	originalTemperature := 0.8
+	originalStreamOptions := &models.StreamOptions{IncludeUsage: true}
+	baseReq := &models.OpenAIRequest{
+		Model: "gemini-2.5-pro",
+		Messages: []models.OpenAIMessage{{
+			Role:    "user",
+			Content: json.RawMessage(`"count these tokens"`),
+		}},
+		MaxTokens:     &originalMaxTokens,
+		Temperature:   &originalTemperature,
+		StreamOptions: originalStreamOptions,
+	}
+
+	oaiResp, err := handler.runGeminiCountTokensProbe(baseReq)
+	if err != nil {
+		t.Fatalf("runGeminiCountTokensProbe() error = %v", err)
+	}
+	if oaiResp == nil || oaiResp.Usage == nil || oaiResp.Usage.TotalTokens != 22 {
+		t.Fatalf("probe response = %#v, want totalTokens=22", oaiResp)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("upstream calls = %d, want 2", got)
+	}
+
+	if baseReq.Stream != nil {
+		t.Fatalf("base Stream = %v, want nil", baseReq.Stream)
+	}
+	if baseReq.StreamOptions != originalStreamOptions {
+		t.Fatalf("base StreamOptions pointer changed: %#v", baseReq.StreamOptions)
+	}
+	if baseReq.MaxTokens != &originalMaxTokens || *baseReq.MaxTokens != 42 {
+		t.Fatalf("base MaxTokens = %v, want original 42", baseReq.MaxTokens)
+	}
+	if baseReq.MaxCompletionTokens != nil {
+		t.Fatalf("base MaxCompletionTokens = %v, want nil", baseReq.MaxCompletionTokens)
+	}
+	if baseReq.Temperature != &originalTemperature || *baseReq.Temperature != 0.8 {
+		t.Fatalf("base Temperature = %v, want original 0.8", baseReq.Temperature)
+	}
+}
+
 func TestHandleGeminiModelsGenerateContentIgnoresTopKAndThinkingConfig(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		var oaiReq models.OpenAIRequest
@@ -2611,5 +2766,60 @@ func TestHandleGeminiModelsCountTokensDoesNotEstimatePermanentUpstreamErrors(t *
 				t.Fatalf("expected real error response, got %#v", errResp)
 			}
 		})
+	}
+}
+
+func BenchmarkRunGeminiCountTokensProbe(b *testing.B) {
+	handler := newRoundTripTestProxyHandler(b, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = r.Body.Close()
+		return jsonHTTPResponse(`{
+			"id":"chatcmpl-gemini-counttokens-bench",
+			"model":"gemini-2.5-pro",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"length"}],
+			"usage":{"prompt_tokens":256,"completion_tokens":1,"total_tokens":257}
+		}`), nil
+	}))
+	baseReq := benchmarkGeminiCountTokensOpenAIRequest()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := handler.runGeminiCountTokensProbe(baseReq); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchmarkGeminiCountTokensOpenAIRequest() *models.OpenAIRequest {
+	content := json.RawMessage(`"Count these benchmark tokens while preserving the translated Gemini payload."`)
+	messages := make([]models.OpenAIMessage, 0, 64)
+	for i := 0; i < cap(messages); i++ {
+		messages = append(messages, models.OpenAIMessage{
+			Role:    "user",
+			Content: content,
+		})
+	}
+
+	maxTokens := 1024
+	temperature := 0.7
+	topP := 0.95
+	parallelToolCalls := true
+	return &models.OpenAIRequest{
+		Model:    "gemini-2.5-pro",
+		Messages: messages,
+		Tools: []models.OpenAITool{{
+			Type: "function",
+			Function: models.OpenAIFunction{
+				Name:        "lookup_weather",
+				Description: "Returns weather for a city.",
+				Parameters:  json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}`),
+			},
+		}},
+		ToolChoice:        json.RawMessage(`"auto"`),
+		MaxTokens:         &maxTokens,
+		Temperature:       &temperature,
+		TopP:              &topP,
+		ParallelToolCalls: &parallelToolCalls,
 	}
 }

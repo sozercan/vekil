@@ -77,7 +77,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	}
 	h.maybeReduceOpenAIChatToolOutputs(r.Context(), oaiReq, h.toolContexts, scope)
 
-	forceStream := !stream && len(oaiReq.Tools) > 0
+	forceStream := !stream && len(oaiReq.Tools) > 0 && !openAIToolChoiceIsNone(oaiReq.ToolChoice)
 	if forceStream {
 		streamFlag := true
 		oaiReq.Stream = &streamFlag
@@ -312,14 +312,7 @@ func geminiContentHasInlineMedia(content *models.GeminiContent) bool {
 }
 
 func (h *ProxyHandler) runGeminiCountTokensProbe(baseReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
-	probeReq, err := cloneOpenAIRequest(baseReq)
-	if err != nil {
-		return nil, &geminiProtocolError{
-			statusCode: http.StatusInternalServerError,
-			status:     "INTERNAL",
-			message:    "failed to clone countTokens request",
-		}
-	}
+	probeReq := copyOpenAIRequestForGeminiCountTokensProbe(baseReq)
 
 	streamFlag := false
 	temperature := 0.0
@@ -338,6 +331,17 @@ func (h *ProxyHandler) runGeminiCountTokensProbe(baseReq *models.OpenAIRequest) 
 		return h.executeGeminiCountTokensProbeFinal(probeReq)
 	}
 	return oaiResp, err
+}
+
+func copyOpenAIRequestForGeminiCountTokensProbe(baseReq *models.OpenAIRequest) *models.OpenAIRequest {
+	// The probe path only replaces top-level fields below (streaming, token
+	// limits, and temperature). Shared slices/raw messages remain read-only, so a
+	// struct copy avoids the JSON round-trip deep clone on every countTokens miss.
+	if baseReq == nil {
+		return &models.OpenAIRequest{}
+	}
+	probeReq := *baseReq
+	return &probeReq
 }
 
 func (h *ProxyHandler) executeGeminiCountTokensProbe(probeReq *models.OpenAIRequest) (*models.OpenAIResponse, bool, error) {

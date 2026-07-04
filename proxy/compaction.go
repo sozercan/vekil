@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"strings"
@@ -21,6 +22,10 @@ func encodeSyntheticCompaction(summary string) string {
 }
 
 func rewriteSyntheticCompactionRequest(body []byte) ([]byte, int) {
+	if !responsesBodyMayContainSyntheticCompaction(body) {
+		return body, 0
+	}
+
 	var req map[string]json.RawMessage
 	if err := json.Unmarshal(body, &req); err != nil {
 		return body, 0
@@ -54,6 +59,23 @@ func rewriteSyntheticCompactionRequest(body []byte) ([]byte, int) {
 	return rewrittenBody, rewriteCount
 }
 
+func responsesBodyMayContainSyntheticCompaction(body []byte) bool {
+	return bytes.Contains(body, []byte(syntheticCompactionPrefix)) ||
+		bytes.Contains(body, []byte(legacySyntheticCompactionPrefix)) ||
+		responsesBodyMayContainCompactionToken(body)
+}
+
+func responsesBodyMayContainContextCompaction(body []byte) bool {
+	return responsesBodyMayContainCompactionToken(body)
+}
+
+func responsesBodyMayContainCompactionToken(body []byte) bool {
+	// Fast-path ordinary requests that cannot contain proxy-owned compaction
+	// items. If the body contains any JSON unicode escapes, fall back to the
+	// legacy parser so escaped marker strings keep their previous behavior.
+	return bytes.Contains(body, []byte("compaction")) || bytes.Contains(body, []byte(`\u`))
+}
+
 func rewriteSyntheticCompactionRequestFields(requestFields map[string]json.RawMessage) (map[string]json.RawMessage, int) {
 	rawInput, ok := requestFields["input"]
 	if !ok {
@@ -84,6 +106,10 @@ func rewriteSyntheticCompactionRequestFields(requestFields map[string]json.RawMe
 }
 
 func sanitizeContextCompactionRequest(body []byte) ([]byte, int) {
+	if !responsesBodyMayContainContextCompaction(body) {
+		return body, 0
+	}
+
 	var req map[string]json.RawMessage
 	if err := json.Unmarshal(body, &req); err != nil {
 		return body, 0

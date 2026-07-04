@@ -1966,6 +1966,8 @@ const responsesInternalChatMessageMetadataPassthroughField = "internal_chat_mess
 
 var responsesInternalChatMessageMetadataPassthroughFieldBytes = []byte(responsesInternalChatMessageMetadataPassthroughField)
 
+var responsesCompactionMarkerBytes = []byte("compaction")
+
 func stripUnsupportedResponsesRequestFields(bodyBytes []byte, provider *providerRuntime) ([]byte, []string) {
 	if provider == nil {
 		return bodyBytes, nil
@@ -3116,6 +3118,10 @@ func (h *ProxyHandler) maybeBuildResponsesCompactionTriggerResponse(ctx context.
 }
 
 func compactTriggerRequestFields(bodyBytes []byte) (map[string]json.RawMessage, bool, error) {
+	if !bytes.Contains(bodyBytes, responsesCompactionMarkerBytes) && !bytes.Contains(bodyBytes, []byte(`\u`)) {
+		return nil, false, nil
+	}
+
 	var requestFields map[string]json.RawMessage
 	if err := json.Unmarshal(bodyBytes, &requestFields); err != nil {
 		return nil, false, nil

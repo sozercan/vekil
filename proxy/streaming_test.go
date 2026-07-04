@@ -449,6 +449,112 @@ func TestConsumeOpenAIStreamChunks_MultiLineDataEvent(t *testing.T) {
 	}
 }
 
+func TestSSEDataAccumulatorDispatchesSingleAndMultiLineData(t *testing.T) {
+	t.Run("single line", func(t *testing.T) {
+		var gotEvent, gotData string
+		acc := sseDataAccumulator{}
+		acc.consumeLine("event: chat.completion.chunk\n", func(eventType, data string) bool {
+			gotEvent, gotData = eventType, data
+			return true
+		})
+		acc.consumeLine("data: {\"id\":\"single\"}\n", func(eventType, data string) bool {
+			gotEvent, gotData = eventType, data
+			return true
+		})
+		acc.consumeLine("\n", func(eventType, data string) bool {
+			gotEvent, gotData = eventType, data
+			return true
+		})
+
+		if gotEvent != "chat.completion.chunk" {
+			t.Fatalf("eventType = %q, want chat.completion.chunk", gotEvent)
+		}
+		if gotData != `{"id":"single"}` {
+			t.Fatalf("data = %q, want single data line", gotData)
+		}
+	})
+
+	t.Run("multi line", func(t *testing.T) {
+		var gotData string
+		acc := sseDataAccumulator{}
+		acc.consumeLine("data: {\"id\":\"multi\",\n", func(_ string, data string) bool {
+			gotData = data
+			return true
+		})
+		acc.consumeLine("data: \"created\":123}\n", func(_ string, data string) bool {
+			gotData = data
+			return true
+		})
+		acc.consumeLine("\n", func(_ string, data string) bool {
+			gotData = data
+			return true
+		})
+
+		want := "{\"id\":\"multi\",\n\"created\":123}"
+		if gotData != want {
+			t.Fatalf("data = %q, want %q", gotData, want)
+		}
+	})
+}
+
+func TestParseOpenAIStreamErrorSemantics(t *testing.T) {
+	if streamErr, ok := parseOpenAIStreamError("", `{"choices":[{"delta":{"content":"error"}}]}`); ok || streamErr != nil {
+		t.Fatalf("ordinary chunk parsed as stream error: err=%#v ok=%v", streamErr, ok)
+	}
+	if streamErr, ok := parseOpenAIStreamError("", ` {"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`); !ok || streamErr.httpStatus() != 429 || streamErr.Error() != "slow down" {
+		t.Fatalf("error envelope = (%#v, %v), want rate limit error", streamErr, ok)
+	}
+	if streamErr, ok := parseOpenAIStreamError(" error ", `{"type":"overloaded_error","message":"busy"}`); !ok || streamErr.httpStatus() != 503 || streamErr.Error() != "busy" {
+		t.Fatalf("event error = (%#v, %v), want overloaded error", streamErr, ok)
+	}
+	if streamErr, ok := parseOpenAIStreamError("error", "upstream disconnected"); !ok || streamErr.Error() != "upstream disconnected" {
+		t.Fatalf("plain event error = (%#v, %v), want sanitized message", streamErr, ok)
+	}
+}
+
+func TestOpenAIResponseAggregatorInterleavesToolCallArgumentFragments(t *testing.T) {
+	idx0, idx1 := 0, 1
+	agg := newOpenAIResponseAggregator()
+	agg.addChunk(models.OpenAIStreamChunk{
+		ID:      "chatcmpl-tools",
+		Object:  "chat.completion.chunk",
+		Created: 123,
+		Model:   "gpt-4o",
+		Choices: []models.OpenAIStreamChoice{{
+			Index: 0,
+			Delta: models.OpenAIMessage{Role: "assistant", ToolCalls: []models.OpenAIToolCall{
+				{ID: "call_0", Type: "function", Index: &idx0, Function: models.OpenAIFunctionCall{Name: "first", Arguments: `{"a":`}},
+				{ID: "call_1", Type: "function", Index: &idx1, Function: models.OpenAIFunctionCall{Name: "second", Arguments: `{"b":`}},
+			}},
+		}},
+	})
+	agg.addChunk(models.OpenAIStreamChunk{
+		ID:      "chatcmpl-tools",
+		Object:  "chat.completion.chunk",
+		Created: 123,
+		Model:   "gpt-4o",
+		Choices: []models.OpenAIStreamChoice{{
+			Index: 0,
+			Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{
+				{Index: &idx1, Function: models.OpenAIFunctionCall{Arguments: `"two"}`}},
+				{Index: &idx0, Function: models.OpenAIFunctionCall{Arguments: `"one"}`}},
+			}},
+		}},
+	})
+
+	resp := agg.buildResponse()
+	if len(resp.Choices) != 1 || len(resp.Choices[0].Message.ToolCalls) != 2 {
+		t.Fatalf("tool calls = %#v, want two calls", resp.Choices)
+	}
+	calls := resp.Choices[0].Message.ToolCalls
+	if calls[0].Function.Arguments != `{"a":"one"}` {
+		t.Fatalf("call 0 arguments = %q", calls[0].Function.Arguments)
+	}
+	if calls[1].Function.Arguments != `{"b":"two"}` {
+		t.Fatalf("call 1 arguments = %q", calls[1].Function.Arguments)
+	}
+}
+
 func TestStreamOpenAIToAnthropic_TextOnly(t *testing.T) {
 	stop := "stop"
 	idx := 0

@@ -42,7 +42,10 @@ func (a *sseDataAccumulator) dispatch(onData func(string, string) bool) bool {
 		a.eventType = ""
 		return true
 	}
-	data := strings.Join(a.dataLines, "\n")
+	data := a.dataLines[0]
+	if len(a.dataLines) > 1 {
+		data = strings.Join(a.dataLines, "\n")
+	}
 	eventType := a.eventType
 	a.dataLines = a.dataLines[:0]
 	a.eventType = ""
@@ -140,7 +143,25 @@ func (e *openAIStreamError) Error() string {
 	return "upstream stream error"
 }
 
+// shouldParseOpenAIStreamError is a cheap guard for the hot path: ordinary
+// chat-completion chunks should not pay a second JSON unmarshal just to discover
+// they are not post-commit error events.
+func shouldParseOpenAIStreamError(eventType, data string) bool {
+	if strings.EqualFold(strings.TrimSpace(eventType), "error") {
+		return true
+	}
+	data = strings.TrimLeft(data, " \t\r\n")
+	if data == "" || data[0] != '{' {
+		return false
+	}
+	return strings.Contains(data, `"error"`)
+}
+
 func parseOpenAIStreamError(eventType, data string) (*openAIStreamError, bool) {
+	if !shouldParseOpenAIStreamError(eventType, data) {
+		return nil, false
+	}
+
 	var envelope struct {
 		Error *struct {
 			Type    string `json:"type"`

@@ -942,10 +942,11 @@ func (s *anthropicStreamState) finish() bool {
 }
 
 type aggregatedOpenAIChoice struct {
-	role         string
-	content      strings.Builder
-	toolCalls    map[int]*models.OpenAIToolCall
-	finishReason *string
+	role              string
+	content           strings.Builder
+	toolCalls         map[int]*models.OpenAIToolCall
+	toolCallArguments map[int]*strings.Builder
+	finishReason      *string
 }
 
 type openAIResponseAggregator struct {
@@ -1014,7 +1015,7 @@ func (a *openAIResponseAggregator) addChoice(choice models.OpenAIStreamChoice) {
 			call.Function.Name = toolCall.Function.Name
 		}
 
-		call.Function.Arguments += toolCall.Function.Arguments
+		aggChoice.appendToolCallArguments(toolIndex, toolCall.Function.Arguments)
 	}
 
 	if choice.FinishReason != nil {
@@ -1035,6 +1036,24 @@ func (a *openAIResponseAggregator) choice(index int) *aggregatedOpenAIChoice {
 	}
 	a.choicesByIndex[index] = aggChoice
 	return aggChoice
+}
+
+// appendToolCallArguments keeps streamed argument fragments out of the
+// OpenAIToolCall until build time so long tool-call argument streams do not pay
+// repeated string-concatenation copies on every delta.
+func (c *aggregatedOpenAIChoice) appendToolCallArguments(index int, arguments string) {
+	if arguments == "" {
+		return
+	}
+	if c.toolCallArguments == nil {
+		c.toolCallArguments = make(map[int]*strings.Builder)
+	}
+	builder, ok := c.toolCallArguments[index]
+	if !ok {
+		builder = &strings.Builder{}
+		c.toolCallArguments[index] = builder
+	}
+	builder.WriteString(arguments)
 }
 
 func (a *openAIResponseAggregator) buildResponse() *models.OpenAIResponse {
@@ -1075,11 +1094,14 @@ func (a *openAIResponseAggregator) buildMessage(choice *aggregatedOpenAIChoice) 
 	sort.Ints(toolIndexes)
 
 	for _, toolIndex := range toolIndexes {
-		toolCall := choice.toolCalls[toolIndex]
+		toolCall := *choice.toolCalls[toolIndex]
+		if argumentBuilder := choice.toolCallArguments[toolIndex]; argumentBuilder != nil {
+			toolCall.Function.Arguments = argumentBuilder.String()
+		}
 		if !json.Valid([]byte(toolCall.Function.Arguments)) {
 			toolCall.Function.Arguments = "{}"
 		}
-		message.ToolCalls = append(message.ToolCalls, *toolCall)
+		message.ToolCalls = append(message.ToolCalls, toolCall)
 	}
 
 	return message
