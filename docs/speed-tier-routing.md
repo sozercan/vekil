@@ -60,7 +60,7 @@ Signals are computed from the current request body and headers only:
 
 | Field | Meaning |
 |---|---|
-| `max_tokens_lte` | Match when `max_tokens` or `max_output_tokens` is present and below the threshold. |
+| `max_tokens_lte` | Match when `max_tokens`, `max_completion_tokens`, or `max_output_tokens` is present and below the threshold. |
 | `tools_count_lte` | Match when top-level `tools` is present and its length is below the threshold. |
 | `input_chars_lte` | Match when the raw JSON request body is below the threshold. This is a cheap proxy, not tokenization. |
 | `system_chars_lte` | Match when detected system/instruction text is below the threshold. |

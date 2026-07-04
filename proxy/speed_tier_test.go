@@ -776,3 +776,15 @@ func TestSpeedTierMaxTokensSignalIncludesMaxCompletionTokens(t *testing.T) {
 		t.Fatalf("decision = %+v, want max_completion_tokens to satisfy max_tokens_lte", decision)
 	}
 }
+
+func TestSpeedTierMaxTokensNullDoesNotMatch(t *testing.T) {
+	owner := providerModel{publicID: "sonnet-public", speedTier: &speedTierRule{
+		downgradeTo: "haiku-public",
+		semantics:   speedTierSemanticsAny,
+		when:        SpeedTierWhenConfig{MaxTokensLTE: speedTierIntPtr(512)},
+	}}
+	decision := evaluateSpeedTier([]byte(`{"model":"sonnet-public","max_tokens":null}`), providerEndpointChatCompletions, nil, owner, false)
+	if decision.decision != speedTierDecisionConsideredReject {
+		t.Fatalf("decision = %+v, want max_tokens:null not to match", decision)
+	}
+}

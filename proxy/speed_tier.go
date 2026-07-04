@@ -459,6 +459,9 @@ func firstJSONInt(payload map[string]json.RawMessage, keys ...string) int {
 }
 
 func jsonInt(raw json.RawMessage) (int, bool) {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return 0, false
+	}
 	var num json.Number
 	if err := json.Unmarshal(raw, &num); err == nil {
 		if i, err := num.Int64(); err == nil {
