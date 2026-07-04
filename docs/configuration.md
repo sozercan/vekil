@@ -57,17 +57,18 @@ The Codex-style `GET /v1/responses` websocket bridge is disabled by default and 
 
 ## Prometheus metrics
 
-Vekil exposes a Prometheus-compatible `/metrics` endpoint beside `/stats.json`. The endpoint is scrape-only and backed by the in-memory request statistics collector used by the dashboard. It includes request counters, recent latency quantiles, token counters, retry counts, upstream error counts, in-flight request gauges, an aggregate endpoint health gauge, build info, and minimal Go runtime gauges.
+Vekil exposes a Prometheus-compatible `/metrics` endpoint beside `/stats.json`. The endpoint is scrape-only and backed by the in-memory request statistics collector used by the dashboard. It includes request counters, recent latency quantiles, token counters, retry counts, upstream error counts, in-flight request gauges, build info, and minimal Go runtime gauges.
 
 Important metric families include:
 
 - `vekil_requests_total{provider,public_model,endpoint,status}`
-- `vekil_request_duration_seconds{quantile}`
+- `vekil_request_duration_seconds{quantile}` plus `_sum` and `_count`
 - `vekil_tokens_total{provider,public_model,direction}`
 - `vekil_retries_total{provider,public_model,reason}`
 - `vekil_upstream_errors_total{provider,public_model,code}`
 - `vekil_inflight_requests{provider}`
-- `vekil_endpoint_healthy{provider,endpoint}`
 - `vekil_build_info{version,go_version,commit}`
 
-Latency quantiles are exported from the bounded recent latency sample already used by the dashboard.
+Request counters are emitted for each bounded provider/model/endpoint key that observed traffic. Use Prometheus aggregation (for example `sum by (provider)` or `sum without (public_model,endpoint)`) for rollups instead of relying on a separate blank-label aggregate row.
+
+Latency quantiles are exported from the bounded recent latency sample already used by the dashboard. The `_sum` and `_count` series are cumulative over the same non-streaming latency observations; streamed requests are excluded because their wall-clock duration reflects connection lifetime rather than model latency.

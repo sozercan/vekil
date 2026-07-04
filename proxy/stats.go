@@ -56,6 +56,12 @@ type statsTotals struct {
 	LatencyP50 int64 `json:"latency_p50_ms"`
 	LatencyP95 int64 `json:"latency_p95_ms"`
 	LatencyP99 int64 `json:"latency_p99_ms"`
+	// LatencySumMs/LatencyCount are cumulative over the same non-streaming
+	// observations that populate the latency reservoir. Streamed requests are
+	// excluded because their wall-clock duration is connection lifetime, not model
+	// latency.
+	LatencySumMs int64 `json:"latency_sum_ms"`
+	LatencyCount int64 `json:"latency_count"`
 }
 
 // statsSeriesPoint is one second of traffic in the live time series.
@@ -80,6 +86,14 @@ type statsBreakdown struct {
 	AvgMs    int64  `json:"avg_ms"`
 }
 
+type statsRequestMetric struct {
+	Provider string
+	Model    string
+	Endpoint string
+	Requests int64
+	Errors   int64
+}
+
 // statsErrorRow is one row in the error-by-status or error-by-target lists.
 type statsErrorRow struct {
 	Label string `json:"label"`
@@ -98,6 +112,10 @@ type statsSnapshot struct {
 	ByModel       []statsBreakdown   `json:"by_model"`
 	ByProvider    []statsBreakdown   `json:"by_provider"`
 	ByAgent       []statsBreakdown   `json:"by_agent"`
+	// RequestMetrics contains the full bounded provider/model/endpoint keyspace
+	// for Prometheus request counters. Dashboard breakdown rows may be top-N
+	// truncated; Prometheus counters should not churn when rankings change.
+	RequestMetrics []statsRequestMetric `json:"-"`
 	// Retries is the total upstream retry attempts and the breakdown by the
 	// status that triggered them (surfaces flakiness the proxy absorbed).
 	Retries       int64           `json:"retries"`
@@ -126,22 +144,28 @@ type breakdownCounter struct {
 	kind       string
 }
 
+type requestMetricCounter struct {
+	requests int64
+	errors   int64
+}
+
 // statsCollector aggregates per-request traffic in memory for the dashboard.
 // It is written on every tracked request and read by the dashboard poll; the
 // per-second series uses a lazy ring buffer so no background goroutine is
 // needed. The clock is injectable for deterministic tests.
 type statsCollector struct {
-	mu          sync.Mutex
-	start       time.Time
-	now         func() time.Time
-	ring        []secondBucket
-	totals      statsTotals
-	status      map[string]int64
-	statusCodes map[int]int64
-	errTargets  map[string]int64
-	byModel     map[string]*breakdownCounter
-	byProvider  map[string]*breakdownCounter
-	byAgent     map[string]*breakdownCounter
+	mu             sync.Mutex
+	start          time.Time
+	now            func() time.Time
+	ring           []secondBucket
+	totals         statsTotals
+	status         map[string]int64
+	statusCodes    map[int]int64
+	errTargets     map[string]int64
+	byModel        map[string]*breakdownCounter
+	byProvider     map[string]*breakdownCounter
+	byAgent        map[string]*breakdownCounter
+	requestMetrics map[string]*requestMetricCounter
 
 	// retries counts upstream retry attempts the proxy made (transient 429/503,
 	// transport errors). These are usually invisible to clients because the
@@ -186,17 +210,18 @@ const (
 
 func newStatsCollector() *statsCollector {
 	c := &statsCollector{
-		now:           time.Now,
-		ring:          make([]secondBucket, statsRingSeconds),
-		status:        make(map[string]int64, 4),
-		statusCodes:   make(map[int]int64),
-		errTargets:    make(map[string]int64),
-		byModel:       make(map[string]*breakdownCounter),
-		byProvider:    make(map[string]*breakdownCounter),
-		byAgent:       make(map[string]*breakdownCounter),
-		retriesByCode: make(map[int]int64),
-		recent:        make([]recentRequest, statsRecentRequests),
-		latencies:     make([]int64, statsLatencySamples),
+		now:            time.Now,
+		ring:           make([]secondBucket, statsRingSeconds),
+		status:         make(map[string]int64, 4),
+		statusCodes:    make(map[int]int64),
+		errTargets:     make(map[string]int64),
+		byModel:        make(map[string]*breakdownCounter),
+		byProvider:     make(map[string]*breakdownCounter),
+		byAgent:        make(map[string]*breakdownCounter),
+		requestMetrics: make(map[string]*requestMetricCounter),
+		retriesByCode:  make(map[int]int64),
+		recent:         make([]recentRequest, statsRecentRequests),
+		latencies:      make([]int64, statsLatencySamples),
 	}
 	c.start = c.now()
 	return c
@@ -302,6 +327,8 @@ func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, 
 		if c.latencyCount < len(c.latencies) {
 			c.latencyCount++
 		}
+		c.totals.LatencySumMs += durMs
+		c.totals.LatencyCount++
 	}
 
 	c.status[statusClass(status)]++
@@ -310,13 +337,17 @@ func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, 
 		c.errTargets[capKey(c.errTargets, errorTargetLabel(d.provider, d.model))]++
 	}
 
+	modelKey := ""
 	if d.model != "" {
-		addBreakdown(c.byModel, capKey(c.byModel, d.model), int64(d.total), "", isErr, durMs, measureLatency)
+		modelKey = capKey(c.byModel, d.model)
+		addBreakdown(c.byModel, modelKey, int64(d.total), "", isErr, durMs, measureLatency)
 	}
+	providerKey := d.provider
 	if d.provider != "" {
 		// Providers are configured, not client-controlled, so no cap needed.
-		addBreakdown(c.byProvider, d.provider, int64(d.total), d.kind, isErr, durMs, measureLatency)
+		addBreakdown(c.byProvider, providerKey, int64(d.total), d.kind, isErr, durMs, measureLatency)
 	}
+	addRequestMetric(c.requestMetrics, providerKey, modelKey, d.endpoint, isErr)
 	addBreakdown(c.byAgent, capKey(c.byAgent, agent), int64(d.total), "", isErr, durMs, measureLatency)
 
 	// Append to the recent-requests drill-down ring (newest overwrites oldest).
@@ -397,19 +428,20 @@ func (c *statsCollector) snapshot() statsSnapshot {
 	totals.LatencyP50, totals.LatencyP95, totals.LatencyP99 = c.latencyPercentiles()
 
 	return statsSnapshot{
-		UptimeSeconds: int64(now.Sub(c.start).Seconds()),
-		Inflight:      c.inflight.Load(),
-		Totals:        totals,
-		Status:        status,
-		StatusCodes:   topStatusCodes(c.statusCodes),
-		Errors:        topErrorTargets(c.errTargets),
-		Series:        series,
-		ByModel:       topBreakdowns(c.byModel, breakdownKindModel),
-		ByProvider:    topBreakdowns(c.byProvider, breakdownKindProvider),
-		ByAgent:       topBreakdowns(c.byAgent, breakdownKindAgent),
-		Retries:       c.retries,
-		RetriesByCode: retriesRows(c.retriesByCode),
-		Recent:        c.recentSnapshot(),
+		UptimeSeconds:  int64(now.Sub(c.start).Seconds()),
+		Inflight:       c.inflight.Load(),
+		Totals:         totals,
+		Status:         status,
+		StatusCodes:    topStatusCodes(c.statusCodes),
+		Errors:         topErrorTargets(c.errTargets),
+		Series:         series,
+		ByModel:        topBreakdowns(c.byModel, breakdownKindModel, true),
+		ByProvider:     topBreakdowns(c.byProvider, breakdownKindProvider, true),
+		ByAgent:        topBreakdowns(c.byAgent, breakdownKindAgent, true),
+		RequestMetrics: requestMetricRows(c.requestMetrics),
+		Retries:        c.retries,
+		RetriesByCode:  retriesRows(c.retriesByCode),
+		Recent:         c.recentSnapshot(),
 	}
 }
 
@@ -554,13 +586,30 @@ func addBreakdown(m map[string]*breakdownCounter, key string, tokens int64, kind
 	}
 }
 
+func addRequestMetric(m map[string]*requestMetricCounter, provider, model, endpoint string, isErr bool) {
+	key := requestMetricKey(provider, model, endpoint)
+	e := m[key]
+	if e == nil {
+		e = &requestMetricCounter{}
+		m[key] = e
+	}
+	e.requests++
+	if isErr {
+		e.errors++
+	}
+}
+
+func requestMetricKey(provider, model, endpoint string) string {
+	return provider + "\x00" + model + "\x00" + endpoint
+}
+
 const (
 	breakdownKindModel    = "model"
 	breakdownKindProvider = "provider"
 	breakdownKindAgent    = "agent"
 )
 
-func topBreakdowns(m map[string]*breakdownCounter, kind string) []statsBreakdown {
+func topBreakdowns(m map[string]*breakdownCounter, kind string, truncate bool) []statsBreakdown {
 	out := make([]statsBreakdown, 0, len(m))
 	for key, e := range m {
 		b := statsBreakdown{Requests: e.requests, Tokens: e.tokens, Errors: e.errors}
@@ -579,7 +628,7 @@ func topBreakdowns(m map[string]*breakdownCounter, kind string) []statsBreakdown
 		out = append(out, b)
 	}
 	sortBreakdownsByRequests(out)
-	if len(out) <= statsBreakdownRows {
+	if !truncate || len(out) <= statsBreakdownRows {
 		return out
 	}
 	// The dashboard re-sorts and filters these rows client-side by errors,
@@ -646,6 +695,34 @@ func unionTopBreakdowns(rows []statsBreakdown, n int) []statsBreakdown {
 		}
 	}
 	return result
+}
+
+func requestMetricRows(m map[string]*requestMetricCounter) []statsRequestMetric {
+	out := make([]statsRequestMetric, 0, len(m))
+	for key, e := range m {
+		parts := strings.SplitN(key, "\x00", 3)
+		row := statsRequestMetric{Requests: e.requests, Errors: e.errors}
+		if len(parts) > 0 {
+			row.Provider = parts[0]
+		}
+		if len(parts) > 1 {
+			row.Model = parts[1]
+		}
+		if len(parts) > 2 {
+			row.Endpoint = parts[2]
+		}
+		out = append(out, row)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Provider != out[j].Provider {
+			return out[i].Provider < out[j].Provider
+		}
+		if out[i].Model != out[j].Model {
+			return out[i].Model < out[j].Model
+		}
+		return out[i].Endpoint < out[j].Endpoint
+	})
+	return out
 }
 
 func breakdownLabel(b statsBreakdown) string {

@@ -4,7 +4,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /vekil .
+ARG VERSION=dev
+ARG COMMIT=
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X github.com/sozercan/vekil/proxy.metricsBuildVersion=${VERSION} -X github.com/sozercan/vekil/proxy.metricsBuildCommit=${COMMIT}" -o /vekil .
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /vekil /vekil

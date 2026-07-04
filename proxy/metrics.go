@@ -9,7 +9,12 @@ import (
 	"strings"
 )
 
-const metricsBuildVersion = "dev"
+// metricsBuildVersion and metricsBuildCommit are variables so release builds can
+// inject them with -ldflags -X github.com/sozercan/vekil/proxy.<name>=<value>.
+var (
+	metricsBuildVersion = "dev"
+	metricsBuildCommit  = ""
+)
 
 // HandleMetrics renders the in-memory traffic stats as Prometheus-compatible
 // text exposition. It reuses the same collector as /stats.json so the metrics
@@ -25,15 +30,10 @@ func (h *ProxyHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	_, _ = fmt.Fprintln(w, "# HELP vekil_requests_total Total Vekil proxy requests by provider, public model, endpoint, and status.")
 	_, _ = fmt.Fprintln(w, "# TYPE vekil_requests_total counter")
-	writePromIntMetric(w, "vekil_requests_total", map[string]string{"provider": "", "public_model": "", "endpoint": "", "status": "total"}, snap.Totals.Requests)
-	writePromIntMetric(w, "vekil_requests_total", map[string]string{"provider": "", "public_model": "", "endpoint": "", "status": "error"}, snap.Totals.Errors)
-	for _, row := range snap.ByProvider {
-		writePromIntMetric(w, "vekil_requests_total", map[string]string{"provider": row.Provider, "public_model": "", "endpoint": "", "status": "total"}, row.Requests)
-		writePromIntMetric(w, "vekil_requests_total", map[string]string{"provider": row.Provider, "public_model": "", "endpoint": "", "status": "error"}, row.Errors)
-	}
-	for _, row := range snap.ByModel {
-		writePromIntMetric(w, "vekil_requests_total", map[string]string{"provider": "", "public_model": row.Model, "endpoint": "", "status": "total"}, row.Requests)
-		writePromIntMetric(w, "vekil_requests_total", map[string]string{"provider": "", "public_model": row.Model, "endpoint": "", "status": "error"}, row.Errors)
+	for _, row := range snap.RequestMetrics {
+		labels := map[string]string{"provider": row.Provider, "public_model": row.Model, "endpoint": row.Endpoint, "status": "total"}
+		writePromIntMetric(w, "vekil_requests_total", labels, row.Requests)
+		writePromIntMetric(w, "vekil_requests_total", mapWithLabel(labels, "status", "error"), row.Errors)
 	}
 
 	_, _ = fmt.Fprintln(w, "# HELP vekil_request_duration_seconds Recent request latency summary in seconds.")
@@ -41,8 +41,8 @@ func (h *ProxyHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 	writePromFloatMetric(w, "vekil_request_duration_seconds", map[string]string{"quantile": "0.50"}, millisToSeconds(snap.Totals.LatencyP50))
 	writePromFloatMetric(w, "vekil_request_duration_seconds", map[string]string{"quantile": "0.95"}, millisToSeconds(snap.Totals.LatencyP95))
 	writePromFloatMetric(w, "vekil_request_duration_seconds", map[string]string{"quantile": "0.99"}, millisToSeconds(snap.Totals.LatencyP99))
-	writePromFloatMetric(w, "vekil_request_duration_seconds_sum", nil, 0)
-	writePromIntMetric(w, "vekil_request_duration_seconds_count", nil, snap.Totals.Requests)
+	writePromFloatMetric(w, "vekil_request_duration_seconds_sum", nil, millisToSeconds(snap.Totals.LatencySumMs))
+	writePromIntMetric(w, "vekil_request_duration_seconds_count", nil, snap.Totals.LatencyCount)
 
 	_, _ = fmt.Fprintln(w, "# HELP vekil_tokens_total Total observed upstream tokens by direction.")
 	_, _ = fmt.Fprintln(w, "# TYPE vekil_tokens_total counter")
@@ -69,13 +69,9 @@ func (h *ProxyHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintln(w, "# TYPE vekil_inflight_requests gauge")
 	writePromIntMetric(w, "vekil_inflight_requests", map[string]string{"provider": ""}, snap.Inflight)
 
-	_, _ = fmt.Fprintln(w, "# HELP vekil_endpoint_healthy Endpoint health gauge. Currently reports aggregate proxy health until endpoint-level health checks land.")
-	_, _ = fmt.Fprintln(w, "# TYPE vekil_endpoint_healthy gauge")
-	writePromIntMetric(w, "vekil_endpoint_healthy", map[string]string{"provider": "", "endpoint": ""}, 1)
-
 	_, _ = fmt.Fprintln(w, "# HELP vekil_build_info Build and runtime information for Vekil.")
 	_, _ = fmt.Fprintln(w, "# TYPE vekil_build_info gauge")
-	writePromIntMetric(w, "vekil_build_info", map[string]string{"version": metricsBuildVersion, "go_version": runtime.Version(), "commit": ""}, 1)
+	writePromIntMetric(w, "vekil_build_info", map[string]string{"version": metricsBuildVersion, "go_version": runtime.Version(), "commit": metricsBuildCommit}, 1)
 
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
@@ -88,6 +84,15 @@ func (h *ProxyHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func millisToSeconds(ms int64) float64 { return float64(ms) / 1000 }
+
+func mapWithLabel(labels map[string]string, key, value string) map[string]string {
+	out := make(map[string]string, len(labels)+1)
+	for k, v := range labels {
+		out[k] = v
+	}
+	out[key] = value
+	return out
+}
 
 func writePromIntMetric(w http.ResponseWriter, name string, labels map[string]string, value int64) {
 	_, _ = fmt.Fprintf(w, "%s%s %d\n", name, promLabels(labels), value)

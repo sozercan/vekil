@@ -161,6 +161,28 @@ func TestStatsCollectorLatencyPercentiles(t *testing.T) {
 	}
 }
 
+func TestStatsCollectorLatencySummaryTotalsExcludeStreaming(t *testing.T) {
+	c := newStatsCollector()
+
+	nonStreaming := newStatsRequestSummary("gpt-5", "openai", "openai", 1, 1, 2)
+	streaming := newStatsRequestSummary("gpt-5", "openai", "openai", 1, 1, 2)
+	streaming.setRoute("/v1/chat/completions", "gpt-5", true)
+
+	c.record(nonStreaming, http.StatusOK, "curl/8", 25*time.Millisecond)
+	c.record(streaming, http.StatusOK, "curl/8", 5*time.Second)
+
+	snap := c.snapshot()
+	if snap.Totals.Requests != 2 {
+		t.Fatalf("requests: got %d want 2", snap.Totals.Requests)
+	}
+	if snap.Totals.LatencyCount != 1 {
+		t.Fatalf("latency count: got %d want 1", snap.Totals.LatencyCount)
+	}
+	if snap.Totals.LatencySumMs != 25 {
+		t.Fatalf("latency sum ms: got %d want 25", snap.Totals.LatencySumMs)
+	}
+}
+
 func TestStatsCollectorCapsCardinality(t *testing.T) {
 	c := newStatsCollector()
 	fixed := time.Unix(1_700_000_000, 0)
@@ -312,7 +334,7 @@ func TestTopBreakdownsPreservesAlternateSortRows(t *testing.T) {
 	m["rare-but-broken"] = &breakdownCounter{requests: 1, tokens: 1, errors: 999}
 	m["rare-but-slow"] = &breakdownCounter{requests: 1, tokens: 1, durMs: 9_000_000, durSamples: 1}
 
-	rows := topBreakdowns(m, breakdownKindModel)
+	rows := topBreakdowns(m, breakdownKindModel, true)
 
 	find := func(label string) *statsBreakdown {
 		for i := range rows {

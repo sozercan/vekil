@@ -1,10 +1,11 @@
 BINARY := vekil
-LDFLAGS := -s -w
+VERSION ?= dev-$(shell git rev-parse --short HEAD)
+APP_VERSION := $(patsubst v%,%,$(VERSION))
+COMMIT ?= $(shell git rev-parse --short HEAD)
+LDFLAGS := -s -w -X github.com/sozercan/vekil/proxy.metricsBuildVersion=$(APP_VERSION) -X github.com/sozercan/vekil/proxy.metricsBuildCommit=$(COMMIT)
 APP_NAME := Vekil.app
 APP_BUNDLE_ID := com.vekil.menubar
 APP_ICON := assets/macos/Vekil.icns
-VERSION ?= dev-$(shell git rev-parse --short HEAD)
-APP_VERSION := $(patsubst v%,%,$(VERSION))
 APP_CGO_LDFLAGS = -F$(abspath $(SPARKLE_UNPACK_DIR)) -Wl,-rpath,@executable_path/../Frameworks
 SPARKLE_VERSION := 2.9.0
 SPARKLE_BUILD_DIR := .build/sparkle
