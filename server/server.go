@@ -92,6 +92,7 @@ func (r *responseRecorder) Write(p []byte) (int, error) {
 	if r.status == 0 {
 		r.status = http.StatusOK
 	}
+	// codeql[go/reflected-xss]: responseRecorder only counts bytes while delegating to handlers that set content types for their own responses.
 	n, err := r.ResponseWriter.Write(p)
 	r.bytes += int64(n)
 	return n, err
