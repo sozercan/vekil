@@ -147,7 +147,7 @@ func promLabelValue(value string) string {
 			b.WriteString(`\"`)
 		default:
 			if r < 0x20 || r == 0x7f {
-				b.WriteString(fmt.Sprintf("%%%02X", r))
+				_, _ = fmt.Fprintf(&b, "%%%02X", r)
 				continue
 			}
 			b.WriteRune(r)
