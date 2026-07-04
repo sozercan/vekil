@@ -20,6 +20,7 @@ const (
 	speedTierDecisionForcedAlias      = "forced_alias"
 )
 
+// SpeedTierConfig configures an optional per-model downgrade to a cheaper or faster sibling.
 type SpeedTierConfig struct {
 	DowngradeTo          string                   `json:"downgrade_to" yaml:"downgrade_to"`
 	Semantics            string                   `json:"semantics,omitempty" yaml:"semantics,omitempty"`
@@ -28,6 +29,7 @@ type SpeedTierConfig struct {
 	WSStickyAfterUpgrade *bool                    `json:"ws_sticky_after_upgrade,omitempty" yaml:"ws_sticky_after_upgrade,omitempty"`
 }
 
+// SpeedTierWhenConfig lists request-shape signals that make a speed-tier route eligible.
 type SpeedTierWhenConfig struct {
 	MaxTokensLTE      *int     `json:"max_tokens_lte,omitempty" yaml:"max_tokens_lte,omitempty"`
 	ToolsCountLTE     *int     `json:"tools_count_lte,omitempty" yaml:"tools_count_lte,omitempty"`
@@ -37,6 +39,7 @@ type SpeedTierWhenConfig struct {
 	RequireEndpointIn []string `json:"require_endpoint_in,omitempty" yaml:"require_endpoint_in,omitempty"`
 }
 
+// SpeedTierNeverWhenConfig lists absolute denylist signals that block speed-tier routing.
 type SpeedTierNeverWhenConfig struct {
 	ThinkingEnabled   bool     `json:"thinking_enabled,omitempty" yaml:"thinking_enabled,omitempty"`
 	ReasoningEffortIn []string `json:"reasoning_effort_in,omitempty" yaml:"reasoning_effort_in,omitempty"`
