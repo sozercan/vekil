@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -31,8 +30,8 @@ func (h *ProxyHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintln(w, "# HELP vekil_requests_total Total Vekil proxy requests by provider, public model, endpoint, and status.")
 	_, _ = fmt.Fprintln(w, "# TYPE vekil_requests_total counter")
 	for _, row := range snap.RequestMetrics {
-		labels := map[string]string{"provider": row.Provider, "public_model": row.Model, "endpoint": row.Endpoint, "status": "total"}
-		writePromIntMetric(w, "vekil_requests_total", labels, row.Requests)
+		labels := map[string]string{"provider": row.Provider, "public_model": row.Model, "endpoint": row.Endpoint, "status": "success"}
+		writePromIntMetric(w, "vekil_requests_total", labels, row.Requests-row.Errors)
 		writePromIntMetric(w, "vekil_requests_total", mapWithLabel(labels, "status", "error"), row.Errors)
 	}
 
@@ -44,25 +43,30 @@ func (h *ProxyHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 	writePromFloatMetric(w, "vekil_request_duration_seconds_sum", nil, millisToSeconds(snap.Totals.LatencySumMs))
 	writePromIntMetric(w, "vekil_request_duration_seconds_count", nil, snap.Totals.LatencyCount)
 
-	_, _ = fmt.Fprintln(w, "# HELP vekil_tokens_total Total observed upstream tokens by direction.")
+	_, _ = fmt.Fprintln(w, "# HELP vekil_tokens_total Total observed upstream tokens by provider, public model, and direction.")
 	_, _ = fmt.Fprintln(w, "# TYPE vekil_tokens_total counter")
-	writePromIntMetric(w, "vekil_tokens_total", map[string]string{"provider": "", "public_model": "", "direction": "prompt"}, snap.Totals.PromptTokens)
-	writePromIntMetric(w, "vekil_tokens_total", map[string]string{"provider": "", "public_model": "", "direction": "completion"}, snap.Totals.CompletionTokens)
-	writePromIntMetric(w, "vekil_tokens_total", map[string]string{"provider": "", "public_model": "", "direction": "total"}, snap.Totals.TotalTokens)
-	writePromIntMetric(w, "vekil_tokens_total", map[string]string{"provider": "", "public_model": "", "direction": "cached"}, snap.Totals.CachedTokens)
-	writePromIntMetric(w, "vekil_tokens_total", map[string]string{"provider": "", "public_model": "", "direction": "reasoning"}, snap.Totals.ReasoningTokens)
-
-	_, _ = fmt.Fprintln(w, "# HELP vekil_retries_total Total upstream retry attempts by reason/status.")
-	_, _ = fmt.Fprintln(w, "# TYPE vekil_retries_total counter")
-	writePromIntMetric(w, "vekil_retries_total", map[string]string{"provider": "", "public_model": "", "reason": "all"}, snap.Retries)
-	for _, row := range snap.RetriesByCode {
-		writePromIntMetric(w, "vekil_retries_total", map[string]string{"provider": "", "public_model": "", "reason": row.Label}, row.Count)
+	for _, row := range snap.TokenMetrics {
+		labels := map[string]string{"provider": row.Provider, "public_model": row.Model, "direction": "prompt"}
+		writePromIntMetric(w, "vekil_tokens_total", labels, row.PromptTokens)
+		writePromIntMetric(w, "vekil_tokens_total", mapWithLabel(labels, "direction", "completion"), row.CompletionTokens)
+		writePromIntMetric(w, "vekil_tokens_total", mapWithLabel(labels, "direction", "total"), row.TotalTokens)
+		writePromIntMetric(w, "vekil_tokens_total", mapWithLabel(labels, "direction", "cached"), row.CachedTokens)
+		writePromIntMetric(w, "vekil_tokens_total", mapWithLabel(labels, "direction", "reasoning"), row.ReasoningTokens)
 	}
 
-	_, _ = fmt.Fprintln(w, "# HELP vekil_upstream_errors_total Total upstream/proxy errors by status code.")
+	_, _ = fmt.Fprintln(w, "# HELP vekil_retries_total Total upstream retry attempts.")
+	_, _ = fmt.Fprintln(w, "# TYPE vekil_retries_total counter")
+	writePromIntMetric(w, "vekil_retries_total", nil, snap.Retries)
+	_, _ = fmt.Fprintln(w, "# HELP vekil_retries_by_reason_total Total upstream retry attempts by reason/status.")
+	_, _ = fmt.Fprintln(w, "# TYPE vekil_retries_by_reason_total counter")
+	for _, row := range snap.RetriesByCode {
+		writePromIntMetric(w, "vekil_retries_by_reason_total", map[string]string{"reason": row.Label}, row.Count)
+	}
+
+	_, _ = fmt.Fprintln(w, "# HELP vekil_upstream_errors_total Total upstream/proxy errors by provider, public model, and status code.")
 	_, _ = fmt.Fprintln(w, "# TYPE vekil_upstream_errors_total counter")
-	for _, row := range snap.StatusCodes {
-		writePromIntMetric(w, "vekil_upstream_errors_total", map[string]string{"provider": "", "public_model": "", "code": row.Label}, row.Count)
+	for _, row := range snap.UpstreamErrorMetrics {
+		writePromIntMetric(w, "vekil_upstream_errors_total", map[string]string{"provider": row.Provider, "public_model": row.Model, "code": fmt.Sprint(row.Code)}, row.Count)
 	}
 
 	_, _ = fmt.Fprintln(w, "# HELP vekil_inflight_requests Current in-flight Vekil proxy requests.")
@@ -113,13 +117,28 @@ func promLabels(labels map[string]string) string {
 	sort.Strings(keys)
 	parts := make([]string, 0, len(keys))
 	for _, key := range keys {
-		parts = append(parts, key+"="+strconv.Quote(promLabelValue(labels[key])))
+		parts = append(parts, key+"=\""+promLabelValue(labels[key])+"\"")
 	}
 	return "{" + strings.Join(parts, ",") + "}"
 }
 
 func promLabelValue(value string) string {
-	value = strings.ReplaceAll(value, "\n", " ")
-	value = strings.ReplaceAll(value, "\r", " ")
-	return value
+	var b strings.Builder
+	for _, r := range value {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				b.WriteByte(' ')
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }

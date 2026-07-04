@@ -33,9 +33,9 @@ func TestHandleMetrics(t *testing.T) {
 	body := w.Body.String()
 	for _, want := range []string{
 		"# HELP vekil_requests_total",
-		`vekil_requests_total{endpoint="/v1/chat/completions",provider="openai",public_model="gpt-5",status="total"} 1`,
+		`vekil_requests_total{endpoint="/v1/chat/completions",provider="openai",public_model="gpt-5",status="success"} 1`,
 		`vekil_requests_total{endpoint="/v1/chat/completions",provider="openai",public_model="gpt-5",status="error"} 0`,
-		`vekil_tokens_total{direction="prompt",provider="",public_model=""} 11`,
+		`vekil_tokens_total{direction="prompt",provider="openai",public_model="gpt-5"} 11`,
 		`vekil_request_duration_seconds_sum 0.025`,
 		`vekil_request_duration_seconds_count 1`,
 		"vekil_inflight_requests",
@@ -48,7 +48,7 @@ func TestHandleMetrics(t *testing.T) {
 		}
 	}
 	for _, notWant := range []string{
-		`vekil_requests_total{endpoint="",provider="",public_model="",status="total"}`,
+		`vekil_requests_total{endpoint="",provider="",public_model="",status="success"}`,
 		"vekil_endpoint_healthy",
 	} {
 		if strings.Contains(body, notWant) {
@@ -68,12 +68,46 @@ func TestHandleMetricsExportsAllBoundedModelRequestSeries(t *testing.T) {
 	body := w.Body.String()
 
 	for _, model := range []string{"model-00", "model-24", "model-29"} {
-		want := fmt.Sprintf(`vekil_requests_total{endpoint="/v1/chat/completions",provider="openai",public_model="%s",status="total"} 1`, model)
+		want := fmt.Sprintf(`vekil_requests_total{endpoint="/v1/chat/completions",provider="openai",public_model="%s",status="success"} 1`, model)
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics body missing %q:\n%s", want, body)
 		}
 	}
 	if got := strings.Count(body, `vekil_requests_total{`); got != (statsBreakdownRows+5)*2 {
 		t.Fatalf("request metric series count = %d, want %d\n%s", got, (statsBreakdownRows+5)*2, body)
+	}
+}
+
+func TestHandleMetricsAttributesErrorRetryAndTokenSeries(t *testing.T) {
+	h := &ProxyHandler{stats: newStatsCollector()}
+	h.stats.record(newStatsRequestSummary("gpt-5.4", "azure", "azure", 5, 3, 8), http.StatusBadGateway, "test-agent", 10*time.Millisecond)
+	h.stats.incRetry(http.StatusTooManyRequests)
+
+	w := httptest.NewRecorder()
+	h.HandleMetrics(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := w.Body.String()
+	for _, want := range []string{
+		`vekil_requests_total{endpoint="/v1/chat/completions",provider="azure",public_model="gpt-5.4",status="success"} 0`,
+		`vekil_requests_total{endpoint="/v1/chat/completions",provider="azure",public_model="gpt-5.4",status="error"} 1`,
+		`vekil_tokens_total{direction="prompt",provider="azure",public_model="gpt-5.4"} 5`,
+		`vekil_tokens_total{direction="completion",provider="azure",public_model="gpt-5.4"} 3`,
+		`vekil_retries_total 1`,
+		`vekil_retries_by_reason_total{reason="429"} 1`,
+		`vekil_upstream_errors_total{code="502",provider="azure",public_model="gpt-5.4"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics body missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, `vekil_retries_total{reason="all"}`) {
+		t.Fatalf("retry aggregate should not share the per-reason metric family:\n%s", body)
+	}
+}
+
+func TestPromLabelsEscapesTextFormatValues(t *testing.T) {
+	got := promLabels(map[string]string{"model": "a\tb\\c\"d\ne\x00f"})
+	want := `{model="a b\\c\"d\ne f"}`
+	if got != want {
+		t.Fatalf("promLabels() = %q, want %q", got, want)
 	}
 }

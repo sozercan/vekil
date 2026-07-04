@@ -64,11 +64,11 @@ Important metric families include:
 - `vekil_requests_total{provider,public_model,endpoint,status}`
 - `vekil_request_duration_seconds{quantile}` plus `_sum` and `_count`
 - `vekil_tokens_total{provider,public_model,direction}`
-- `vekil_retries_total{provider,public_model,reason}`
+- `vekil_retries_total` and `vekil_retries_by_reason_total{reason}`
 - `vekil_upstream_errors_total{provider,public_model,code}`
 - `vekil_inflight_requests{provider}`
 - `vekil_build_info{version,go_version,commit}`
 
-Request counters are emitted for each bounded provider/model/endpoint key that observed traffic. Use Prometheus aggregation (for example `sum by (provider)` or `sum without (public_model,endpoint)`) for rollups instead of relying on a separate blank-label aggregate row.
+Request counters are emitted for each bounded provider/model/endpoint key that observed traffic, with disjoint `status="success"` and `status="error"` series. Use Prometheus aggregation (for example `sum by (provider)` or `sum without (public_model,endpoint,status)`) for rollups instead of relying on a separate blank-label aggregate row.
 
 Latency quantiles are exported from the bounded recent latency sample already used by the dashboard. The `_sum` and `_count` series are cumulative over the same non-streaming latency observations; streamed requests are excluded because their wall-clock duration reflects connection lifetime rather than model latency.

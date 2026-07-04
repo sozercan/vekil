@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,6 +27,24 @@ func newStatsRequestSummary(model, provider, kind string, prompt, completion, to
 		TotalTokens:      total,
 	})
 	return s
+}
+
+func TestSeedRequestSummaryEndpointPreservesEarlyErrorRoute(t *testing.T) {
+	ctx, summary := WithRequestSummary(context.Background())
+	SeedRequestSummaryEndpointForRoute(ctx, http.MethodPost, "/v1/chat/completions")
+	if got := readSummaryForStats(summary).endpoint; got != "/v1/chat/completions" {
+		t.Fatalf("seeded endpoint = %q, want route path", got)
+	}
+	summary.setRoute("openai_chat", "gpt-5", false)
+	if got := readSummaryForStats(summary).endpoint; got != "openai_chat" {
+		t.Fatalf("handler endpoint = %q, want semantic endpoint", got)
+	}
+
+	ctx, geminiSummary := WithRequestSummary(context.Background())
+	SeedRequestSummaryEndpointForRoute(ctx, http.MethodPost, "/v1beta/models/gemini-unique:generateContent")
+	if got := readSummaryForStats(geminiSummary).endpoint; got != "gemini" {
+		t.Fatalf("gemini seeded endpoint = %q, want stable route label", got)
+	}
 }
 
 func TestStatsCollectorRecordTotals(t *testing.T) {
@@ -88,6 +107,13 @@ func TestStatsCollectorUsageDetails(t *testing.T) {
 	if snap.Totals.ReasoningTokens != 50 {
 		t.Fatalf("reasoning tokens: got %d want 50", snap.Totals.ReasoningTokens)
 	}
+	if len(snap.TokenMetrics) != 1 {
+		t.Fatalf("token metric rows: got %d want 1 (%+v)", len(snap.TokenMetrics), snap.TokenMetrics)
+	}
+	row := snap.TokenMetrics[0]
+	if row.Provider != "azure" || row.Model != "gpt-5.4" || row.PromptTokens != 300 || row.CompletionTokens != 130 || row.TotalTokens != 430 || row.CachedTokens != 100 || row.ReasoningTokens != 50 {
+		t.Fatalf("token metric row: got %+v", row)
+	}
 }
 
 func TestStatsCollectorErrorClassification(t *testing.T) {
@@ -111,6 +137,15 @@ func TestStatsCollectorErrorClassification(t *testing.T) {
 	}
 	if snap.StatusCodes[1].Label != "503" || snap.StatusCodes[1].Count != 1 {
 		t.Fatalf("second status code: got %+v want 503 x1", snap.StatusCodes[1])
+	}
+	if len(snap.UpstreamErrorMetrics) != 2 {
+		t.Fatalf("upstream error metrics: got %d want 2 (%+v)", len(snap.UpstreamErrorMetrics), snap.UpstreamErrorMetrics)
+	}
+	if got := snap.UpstreamErrorMetrics[0]; got.Provider != "azure" || got.Model != "gpt-5.4" || got.Code != 503 || got.Count != 1 {
+		t.Fatalf("first upstream error metric: got %+v", got)
+	}
+	if got := snap.UpstreamErrorMetrics[1]; got.Provider != "copilot" || got.Model != "claude-sonnet-4.5" || got.Code != 429 || got.Count != 2 {
+		t.Fatalf("second upstream error metric: got %+v", got)
 	}
 
 	// Error targets attribute provider/model.

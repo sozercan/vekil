@@ -75,6 +75,7 @@ Validates that the proxy can authenticate to and successfully probe the configur
 
 - `GET /dashboard` — live, browser-based traffic dashboard served from the proxy (available wherever the proxy runs).
 - `GET /stats.json` — in-memory traffic snapshot (totals, latency percentiles, per-second series, by-model/provider/agent breakdowns, upstream retries, and a recent-requests log) polled by the dashboard.
+- `GET /metrics` — Prometheus-compatible text exposition for request, latency, token, retry, upstream-error, in-flight, build-info, and minimal Go runtime metrics.
 - `POST /dashboard/insight` — optional AI-generated traffic summary. Active only when `insight_model` is set in providers config; single-flight with a cooldown; fails open.
 
-These endpoints are unauthenticated like `/healthz` and are excluded from their own stats. See [Traffic Dashboard](dashboard.md) for the payload shape, agent classification, AI insights, and access/security notes.
+These endpoints are unauthenticated like `/healthz` and are excluded from their own stats. See [Traffic Dashboard](dashboard.md) for the `/stats.json` payload shape, agent classification, AI insights, and access/security notes; see [Configuration](configuration.md#prometheus-metrics) for `/metrics` metric families.

@@ -146,6 +146,7 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 
 		tracked := handler != nil && handler.TracksRequest(r.Method, r.URL.Path)
 		if tracked {
+			proxy.SeedRequestSummaryEndpointForRoute(ctx, r.Method, r.URL.Path)
 			handler.IncInflight()
 			defer handler.DecInflight()
 		}

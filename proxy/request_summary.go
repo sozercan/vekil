@@ -85,6 +85,33 @@ func (s *RequestSummary) setRoute(endpoint, model string, stream bool) {
 	s.streamSet = true
 }
 
+func (s *RequestSummary) seedEndpoint(endpoint string) {
+	if s == nil {
+		return
+	}
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.endpoint == "" {
+		s.endpoint = endpoint
+	}
+}
+
+func SeedRequestSummaryEndpoint(ctx context.Context, endpoint string) {
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		summary.seedEndpoint(endpoint)
+	}
+}
+
+func SeedRequestSummaryEndpointForRoute(ctx context.Context, method, path string) {
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		summary.seedEndpoint(inferenceEndpointLabel(method, path))
+	}
+}
+
 func (s *RequestSummary) setProvider(provider, kind string) {
 	if s == nil {
 		return
