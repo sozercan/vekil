@@ -166,6 +166,13 @@ read_normalized_output() {
   awk 'NF { gsub(/\r/, "", $0); printf "%s", $0 }' "$1"
 }
 
+normalize_gemini_output() {
+  # Gemini CLI may compose command-output tool results as JSON objects such as
+  # {"output":"LEFT"}|{"output":"RIGHT"}. The smoke prompt asks for only
+  # stdout contents, so unwrap that stable CLI envelope before comparing.
+  sed -E 's/\{"output":"([^"\\]*)"\}/\1/g'
+}
+
 start_proxy() {
   [[ -x "${PROXY_BIN}" ]] || die "proxy binary not found or not executable: ${PROXY_BIN}"
 
@@ -322,7 +329,7 @@ EOF
       > "${output_file}"
   )
 
-  actual="$(read_normalized_output "${output_file}")"
+  actual="$(read_normalized_output "${output_file}" | normalize_gemini_output)"
   assert_exact_output "gemini" "${expected}" "${actual}"
   printf '%s' "${actual}" > "${output_file}"
 }
@@ -435,6 +442,9 @@ run_zen_harness_once() {
   fi
 
   actual="$(read_normalized_output "${output_file}")"
+  if [[ "${client}" == "gemini" ]]; then
+    actual="$(printf '%s' "${actual}" | normalize_gemini_output)"
+  fi
   if [[ -z "${actual}" ]]; then
     ATTEMPT_STATUS="SKIP_UPSTREAM"; return 0
   fi
