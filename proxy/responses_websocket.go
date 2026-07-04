@@ -601,7 +601,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	// retryable 429/503 on a turn would be invisible in the dashboard retry
 	// counters. GET /v1/responses is not an inference route, so the middleware
 	// never marks it; do it explicitly here.
-	upstreamCtx = markRetryStatsTracked(upstreamCtx)
+	upstreamCtx = markResponsesWebSocketRetryStatsTracked(h, upstreamCtx, request.Model)
 	inflightGen := s.setInflightCancel(upstreamCancel)
 	defer func() {
 		s.clearInflightCancel(inflightGen)
@@ -682,6 +682,16 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	metrics = s.maybeAutoCompactHistory(h, request, metrics)
 	s.logRequestMetrics(h, request, responseID, metrics)
 	return nil
+}
+
+func markResponsesWebSocketRetryStatsTracked(h *ProxyHandler, ctx context.Context, model string) context.Context {
+	providerID := ""
+	if h != nil {
+		if provider, _, _ := h.resolveProviderModel(model, providerEndpointResponses); provider != nil {
+			providerID = provider.id
+		}
+	}
+	return markRetryStatsTrackedWithLabels(ctx, providerID, model)
 }
 
 // recordTurnStats records one websocket-bridge turn into traffic stats,
@@ -890,7 +900,7 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, req
 	ctx, cancel := h.newInferenceUpstreamContext(true)
 	// Mark the compaction upstream context as retry-trackable, like the turn
 	// itself, so retries during auto-compaction are counted in retry stats.
-	ctx = markRetryStatsTracked(ctx)
+	ctx = markResponsesWebSocketRetryStatsTracked(h, ctx, request.Model)
 	inflightGen := s.setInflightCancel(cancel)
 	defer func() {
 		s.clearInflightCancel(inflightGen)

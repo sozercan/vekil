@@ -217,6 +217,8 @@ type serveFlags struct {
 	tokenDir                        *string
 	providersConfigPath             *string
 	logLevel                        *string
+	metrics                         *bool
+	noMetrics                       *bool
 	streamingUpstreamTimeout        *time.Duration
 	copilotEditorVersion            *string
 	copilotPluginVersion            *string
@@ -242,6 +244,8 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
+		metrics:                         fs.Bool("metrics", getEnvBool("METRICS", true), "Expose Prometheus metrics at /metrics"),
+		noMetrics:                       fs.Bool("no-metrics", getEnvBool("NO_METRICS", false), "Disable Prometheus metrics endpoint"),
 		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
 		copilotPluginVersion:            fs.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header"),
@@ -259,6 +263,10 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		compactUpstreamChunkConcurrency: fs.Int("compact-upstream-chunk-concurrency", getEnvInt("COMPACT_UPSTREAM_CHUNK_CONCURRENCY", proxy.DefaultCompactUpstreamChunkConcurrency()), "Maximum sibling chunk compaction calls to run concurrently after the first chunk succeeds"),
 		compactUpstreamMaxAttempts:      fs.Int("compact-upstream-max-attempts", getEnvInt("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts()), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy"),
 	}
+}
+
+func (f serveFlags) metricsEnabled() bool {
+	return *f.metrics && !*f.noMetrics
 }
 
 func (f serveFlags) copilotHeaderConfig() proxy.CopilotHeaderConfig {
@@ -398,6 +406,7 @@ func runServe() {
 		log,
 		*serve.host,
 		*serve.port,
+		server.WithMetricsEnabled(serve.metricsEnabled()),
 		server.WithStreamingUpstreamTimeout(*serve.streamingUpstreamTimeout),
 		server.WithCopilotHeaderConfig(serve.copilotHeaderConfig()),
 		server.WithResponsesWebSocketConfig(serve.responsesWebSocketConfig()),

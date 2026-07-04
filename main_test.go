@@ -166,6 +166,29 @@ func TestServeFlagsCopilotHeaderCLIOverridesEnv(t *testing.T) {
 	}
 }
 
+func TestServeFlagsMetricsEnabled(t *testing.T) {
+	if !parseServeFlagsForTest(t).metricsEnabled() {
+		t.Fatal("metrics should be enabled by default")
+	}
+
+	if serve := parseServeFlagsForTest(t, "--metrics=false"); serve.metricsEnabled() {
+		t.Fatal("--metrics=false should disable metrics")
+	}
+	if serve := parseServeFlagsForTest(t, "--metrics=true", "--no-metrics=true"); serve.metricsEnabled() {
+		t.Fatal("--no-metrics should disable metrics even when --metrics=true")
+	}
+
+	t.Setenv("METRICS", "false")
+	if serve := parseServeFlagsForTest(t); serve.metricsEnabled() {
+		t.Fatal("METRICS=false should disable metrics")
+	}
+	t.Setenv("METRICS", "true")
+	t.Setenv("NO_METRICS", "true")
+	if serve := parseServeFlagsForTest(t); serve.metricsEnabled() {
+		t.Fatal("NO_METRICS=true should disable metrics")
+	}
+}
+
 func TestServeFlagsResponsesWebSocketDisabledByDefault(t *testing.T) {
 	serve := parseServeFlagsForTest(t)
 	cfg := serve.responsesWebSocketConfig()

@@ -185,7 +185,7 @@ func (h *ProxyHandler) logRetryAttempt(ctx context.Context, attempt int, status 
 	// build their upstream context without the marker, so their retries are not
 	// folded into the dashboard's retry stats.
 	if h != nil && h.stats != nil && isRetryStatsTracked(ctx) {
-		h.stats.incRetry(status)
+		h.stats.incRetry(ctx, status)
 	}
 	if h == nil || h.log == nil {
 		return

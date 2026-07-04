@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -38,14 +39,14 @@ func TestHandleMetrics(t *testing.T) {
 		`vekil_requests_total{endpoint="/v1/chat/completions",provider="openai",public_model="gpt-5",status="success"} 1`,
 		`vekil_requests_total{endpoint="/v1/chat/completions",provider="openai",public_model="gpt-5",status="error"} 0`,
 		`# TYPE vekil_request_duration_seconds histogram`,
-		`vekil_request_duration_seconds_bucket{le="0.025"} 1`,
-		`vekil_request_duration_seconds_bucket{le="+Inf"} 1`,
-		`vekil_request_duration_seconds_sum 0.025`,
-		`vekil_request_duration_seconds_count 1`,
+		`vekil_request_duration_seconds_bucket{endpoint="/v1/chat/completions",le="0.025",provider="openai",public_model="gpt-5"} 1`,
+		`vekil_request_duration_seconds_bucket{endpoint="/v1/chat/completions",le="+Inf",provider="openai",public_model="gpt-5"} 1`,
+		`vekil_request_duration_seconds_sum{endpoint="/v1/chat/completions",provider="openai",public_model="gpt-5"} 0.025`,
+		`vekil_request_duration_seconds_count{endpoint="/v1/chat/completions",provider="openai",public_model="gpt-5"} 1`,
 		`vekil_tokens_total{direction="prompt",provider="openai",public_model="gpt-5"} 11`,
+		`vekil_tokens_reported_total{provider="openai",public_model="gpt-5"} 18`,
 		`vekil_tokens_cached_total{provider="openai",public_model="gpt-5"} 0`,
 		`vekil_tokens_reasoning_total{provider="openai",public_model="gpt-5"} 0`,
-		`vekil_inflight_requests `,
 		`vekil_build_info{commit="abc123"`,
 		`version="test-version"`,
 		"go_goroutines",
@@ -60,7 +61,7 @@ func TestHandleMetrics(t *testing.T) {
 		`vekil_tokens_total{direction="total"`,
 		`vekil_tokens_total{direction="cached"`,
 		`vekil_tokens_total{direction="reasoning"`,
-		`vekil_inflight_requests{provider=`,
+		"\nvekil_inflight_requests ",
 		"vekil_endpoint_healthy",
 	} {
 		if strings.Contains(body, notWant) {
@@ -93,7 +94,7 @@ func TestHandleMetricsExportsAllBoundedModelRequestSeries(t *testing.T) {
 func TestHandleMetricsAttributesErrorRetryAndTokenSeries(t *testing.T) {
 	h := &ProxyHandler{stats: newStatsCollector()}
 	h.stats.record(newStatsRequestSummary("gpt-5.4", "azure", "azure", 5, 3, 8), http.StatusBadGateway, "test-agent", 10*time.Millisecond)
-	h.stats.incRetry(http.StatusTooManyRequests)
+	h.stats.incRetry(context.Background(), http.StatusTooManyRequests)
 
 	w := httptest.NewRecorder()
 	h.HandleMetrics(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
@@ -103,10 +104,11 @@ func TestHandleMetricsAttributesErrorRetryAndTokenSeries(t *testing.T) {
 		`vekil_requests_total{endpoint="/v1/chat/completions",provider="azure",public_model="gpt-5.4",status="error"} 1`,
 		`vekil_tokens_total{direction="prompt",provider="azure",public_model="gpt-5.4"} 5`,
 		`vekil_tokens_total{direction="completion",provider="azure",public_model="gpt-5.4"} 3`,
+		`vekil_tokens_reported_total{provider="azure",public_model="gpt-5.4"} 8`,
 		`vekil_tokens_cached_total{provider="azure",public_model="gpt-5.4"} 0`,
 		`vekil_tokens_reasoning_total{provider="azure",public_model="gpt-5.4"} 0`,
 		`vekil_retries_total 1`,
-		`vekil_retries_by_reason_total{reason="429"} 1`,
+		`vekil_retries_by_reason_total{provider="unrouted",public_model="unknown",reason="429"} 1`,
 		`vekil_upstream_errors_total{code="502",provider="azure",public_model="gpt-5.4"} 1`,
 	} {
 		if !strings.Contains(body, want) {
@@ -118,9 +120,56 @@ func TestHandleMetricsAttributesErrorRetryAndTokenSeries(t *testing.T) {
 	}
 }
 
+func TestHandleMetricsPreservesTotalOnlyTokenUsage(t *testing.T) {
+	h := &ProxyHandler{stats: newStatsCollector()}
+	s := &RequestSummary{}
+	s.setRoute("/v1/chat/completions", "total-only", false)
+	s.setProvider("openai", "openai")
+	s.setOpenAIUsage(&models.OpenAIUsage{TotalTokens: 42})
+	h.stats.record(s, http.StatusOK, "test-agent", time.Millisecond)
+
+	w := httptest.NewRecorder()
+	h.HandleMetrics(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := w.Body.String()
+	for _, want := range []string{
+		`vekil_tokens_total{direction="prompt",provider="openai",public_model="total-only"} 0`,
+		`vekil_tokens_total{direction="completion",provider="openai",public_model="total-only"} 0`,
+		`vekil_tokens_reported_total{provider="openai",public_model="total-only"} 42`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics body missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestHandleMetricsExportsInflightByProvider(t *testing.T) {
+	h := &ProxyHandler{stats: newStatsCollector()}
+	summary := &RequestSummary{}
+	h.IncInflight(summary)
+	h.MoveInflightProvider(summary, "azure")
+
+	w := httptest.NewRecorder()
+	h.HandleMetrics(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := w.Body.String()
+	want := `vekil_inflight_requests{provider="azure"} 1`
+	if !strings.Contains(body, want) {
+		t.Fatalf("metrics body missing %q:\n%s", want, body)
+	}
+	if strings.Contains(body, `vekil_inflight_requests{provider="unrouted"}`) {
+		t.Fatalf("inflight request should have moved from unrouted to azure:\n%s", body)
+	}
+
+	h.DecInflight(summary)
+	w = httptest.NewRecorder()
+	h.HandleMetrics(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if body = w.Body.String(); strings.Contains(body, `vekil_inflight_requests{provider="azure"}`) {
+		t.Fatalf("finished in-flight request should not remain exported:\n%s", body)
+	}
+}
+
 func TestPromLabelsEscapesTextFormatValues(t *testing.T) {
 	got := promLabels(map[string]string{"model": "a\tb\\c\"d\ne\x00f"})
-	want := `{model="a b\\c\"d\ne f"}`
+	want := `{model="a%09b\\c\"d%0Ae%00f"}`
 	if got != want {
 		t.Fatalf("promLabels() = %q, want %q", got, want)
 	}
@@ -137,7 +186,7 @@ func TestHandleMetricsPreservesStructuredMetricLabels(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.HandleMetrics(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body := w.Body.String()
-	want := `vekil_requests_total{endpoint="/v1/chat/completions",provider="openai",public_model="bad x",status="success"} 1`
+	want := `vekil_requests_total{endpoint="/v1/chat/completions",provider="openai",public_model="bad%00x",status="success"} 1`
 	if !strings.Contains(body, want) {
 		t.Fatalf("metrics body missing %q:\n%s", want, body)
 	}
@@ -149,13 +198,13 @@ func TestHandleMetricsPreservesStructuredMetricLabels(t *testing.T) {
 func TestHandleMetricsExportsAllRetryReasonCounters(t *testing.T) {
 	h := &ProxyHandler{stats: newStatsCollector()}
 	for i := 400; i < 400+statsTopN+5; i++ {
-		h.stats.incRetry(i)
+		h.stats.incRetry(context.Background(), i)
 	}
 
 	w := httptest.NewRecorder()
 	h.HandleMetrics(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body := w.Body.String()
-	want := `vekil_retries_by_reason_total{reason="414"} 1`
+	want := `vekil_retries_by_reason_total{provider="unrouted",public_model="unknown",reason="414"} 1`
 	if !strings.Contains(body, want) {
 		t.Fatalf("metrics body missing non-top retry reason %q:\n%s", want, body)
 	}

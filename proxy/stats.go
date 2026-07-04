@@ -87,11 +87,14 @@ type statsBreakdown struct {
 }
 
 type statsRequestMetric struct {
-	Provider string
-	Model    string
-	Endpoint string
-	Requests int64
-	Errors   int64
+	Provider       string
+	Model          string
+	Endpoint       string
+	Requests       int64
+	Errors         int64
+	LatencyBuckets []statsLatencyBucket
+	LatencySumMs   int64
+	LatencyCount   int64
 }
 
 type statsTokenMetric struct {
@@ -114,6 +117,18 @@ type statsUpstreamErrorMetric struct {
 type statsLatencyBucket struct {
 	Le    string
 	Count int64
+}
+
+type statsRetryMetric struct {
+	Provider string
+	Model    string
+	Reason   string
+	Count    int64
+}
+
+type statsInflightMetric struct {
+	Provider string
+	Count    int64
 }
 
 // statsErrorRow is one row in the error-by-status or error-by-target lists.
@@ -150,9 +165,12 @@ type statsSnapshot struct {
 	// the status that triggered them (surfaces flakiness the proxy absorbed).
 	Retries       int64           `json:"retries"`
 	RetriesByCode []statsErrorRow `json:"retries_by_code"`
-	// RetryMetrics carries the full retry reason keyspace for Prometheus. The
-	// dashboard row above is top-N truncated.
-	RetryMetrics []statsErrorRow `json:"-"`
+	// RetryMetrics carries the full retry reason/provider/model keyspace for
+	// Prometheus. The dashboard row above is top-N truncated.
+	RetryMetrics []statsRetryMetric `json:"-"`
+	// InflightMetrics carries current in-flight request gauges by provider for
+	// Prometheus. The dashboard JSON keeps the compact aggregate field above.
+	InflightMetrics []statsInflightMetric `json:"-"`
 	// Recent is the most-recent completed requests (newest first) for drill-down.
 	Recent []recentRequest `json:"recent"`
 	// InsightsEnabled reports whether a model is configured for on-demand
@@ -178,8 +196,11 @@ type breakdownCounter struct {
 }
 
 type requestMetricCounter struct {
-	requests int64
-	errors   int64
+	requests       int64
+	errors         int64
+	latencyBuckets []int64
+	latencySumMs   int64
+	latencyCount   int64
 }
 
 type tokenMetricCounter struct {
@@ -211,6 +232,16 @@ type statsUpstreamErrorMetricKey struct {
 	code     int
 }
 
+type statsRetryMetricKey struct {
+	provider string
+	model    string
+	reason   string
+}
+
+type retryMetricCounter struct {
+	count int64
+}
+
 // statsCollector aggregates per-request traffic in memory for the dashboard.
 // It is written on every tracked request and read by the dashboard poll; the
 // per-second series uses a lazy ring buffer so no background goroutine is
@@ -234,8 +265,10 @@ type statsCollector struct {
 	// retries counts upstream retry attempts the proxy made (transient 429/503,
 	// transport errors). These are usually invisible to clients because the
 	// retry succeeds, so they surface flakiness that the error counters miss.
-	retries       int64
-	retriesByCode map[int]int64 // upstream status that triggered the retry (0 = transport error)
+	retries           int64
+	retriesByCode     map[int]int64 // upstream status that triggered the retry (0 = transport error)
+	retryMetrics      map[statsRetryMetricKey]*retryMetricCounter
+	retryMetricModels map[statsProviderModelKey]struct{}
 
 	// recent is a bounded ring of the most recent completed requests for the
 	// drill-down log. Newest writes overwrite oldest.
@@ -250,7 +283,8 @@ type statsCollector struct {
 	latencyCount   int
 	latencyBuckets []int64
 
-	inflight atomic.Int64
+	inflight           atomic.Int64
+	inflightByProvider map[string]int64
 }
 
 // recentRequest is one row in the recent-requests drill-down log.
@@ -304,23 +338,84 @@ func newStatsCollector() *statsCollector {
 		tokenMetrics:        make(map[statsProviderModelKey]*tokenMetricCounter),
 		upstreamErrorMetric: make(map[statsUpstreamErrorMetricKey]*upstreamErrorMetricCounter),
 		retriesByCode:       make(map[int]int64),
+		retryMetrics:        make(map[statsRetryMetricKey]*retryMetricCounter),
+		retryMetricModels:   make(map[statsProviderModelKey]struct{}),
 		recent:              make([]recentRequest, statsRecentRequests),
 		latencies:           make([]int64, statsLatencySamples),
 		latencyBuckets:      make([]int64, len(statsLatencyBucketBounds)),
+		inflightByProvider:  make(map[string]int64),
 	}
 	c.start = c.now()
 	return c
 }
 
-func (c *statsCollector) incInflight() { c.inflight.Add(1) }
-func (c *statsCollector) decInflight() { c.inflight.Add(-1) }
+func (c *statsCollector) incInflight() { c.incInflightForProvider("") }
+func (c *statsCollector) decInflight() { c.decInflightForProvider("") }
+
+func (c *statsCollector) incInflightForProvider(provider string) {
+	provider = metricProviderLabel(provider)
+	c.inflight.Add(1)
+	c.mu.Lock()
+	c.inflightByProvider[provider]++
+	c.mu.Unlock()
+}
+
+func (c *statsCollector) decInflightForProvider(provider string) {
+	provider = metricProviderLabel(provider)
+	c.inflight.Add(-1)
+	c.mu.Lock()
+	if c.inflightByProvider[provider] <= 1 {
+		delete(c.inflightByProvider, provider)
+	} else {
+		c.inflightByProvider[provider]--
+	}
+	c.mu.Unlock()
+}
+
+func (c *statsCollector) moveInflightProvider(oldProvider, newProvider string) {
+	oldProvider = metricProviderLabel(oldProvider)
+	newProvider = metricProviderLabel(newProvider)
+	if oldProvider == newProvider {
+		return
+	}
+	c.mu.Lock()
+	if c.inflightByProvider[oldProvider] <= 1 {
+		delete(c.inflightByProvider, oldProvider)
+	} else {
+		c.inflightByProvider[oldProvider]--
+	}
+	c.inflightByProvider[newProvider]++
+	c.mu.Unlock()
+}
+
+func (c *statsCollector) retryMetricModelLabelLocked(provider, model string) string {
+	key := statsProviderModelKey{provider: provider, model: model}
+	if _, ok := c.retryMetricModels[key]; ok {
+		return model
+	}
+	if len(c.retryMetricModels) >= statsMaxKeys {
+		return statsOtherKey
+	}
+	c.retryMetricModels[key] = struct{}{}
+	return model
+}
 
 // incRetry records one upstream retry attempt. status is the upstream status
 // that triggered it, or 0 for a transport-level error.
-func (c *statsCollector) incRetry(status int) {
+func (c *statsCollector) incRetry(ctx context.Context, status int) {
+	provider, model := retryMetricLabelsFromContext(ctx)
+	reason := retryReasonLabel(status)
 	c.mu.Lock()
+	model = c.retryMetricModelLabelLocked(provider, model)
 	c.retries++
 	c.retriesByCode[status]++
+	key := statsRetryMetricKey{provider: provider, model: model, reason: reason}
+	e := c.retryMetrics[key]
+	if e == nil {
+		e = &retryMetricCounter{}
+		c.retryMetrics[key] = e
+	}
+	e.count++
 	c.mu.Unlock()
 }
 
@@ -426,12 +521,13 @@ func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, 
 		modelKey = capKey(c.byModel, d.model)
 	}
 	providerKey := d.provider
+	metricProvider, metricModel := metricProviderModelLabels(providerKey, modelKey)
 
 	c.status[statusClass(status)]++
 	if isErr {
 		c.statusCodes[status]++
 		c.errTargets[capKey(c.errTargets, errorTargetLabel(d.provider, d.model))]++
-		addUpstreamErrorMetric(c.upstreamErrorMetric, providerKey, modelKey, status)
+		addUpstreamErrorMetric(c.upstreamErrorMetric, metricProvider, metricModel, status)
 	}
 
 	if modelKey != "" {
@@ -441,8 +537,8 @@ func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, 
 		// Providers are configured, not client-controlled, so no cap needed.
 		addBreakdown(c.byProvider, providerKey, int64(d.total), d.kind, isErr, durMs, measureLatency)
 	}
-	addRequestMetric(c.requestMetrics, providerKey, modelKey, d.endpoint, isErr)
-	addTokenMetric(c.tokenMetrics, providerKey, modelKey, d)
+	addRequestMetric(c.requestMetrics, metricProvider, metricModel, d.endpoint, isErr, durMs, measureLatency)
+	addTokenMetric(c.tokenMetrics, metricProvider, metricModel, d)
 	addBreakdown(c.byAgent, capKey(c.byAgent, agent), int64(d.total), "", isErr, durMs, measureLatency)
 
 	// Append to the recent-requests drill-down ring (newest overwrites oldest).
@@ -539,7 +635,8 @@ func (c *statsCollector) snapshot() statsSnapshot {
 		LatencyBuckets:       c.latencyBucketSnapshot(),
 		Retries:              c.retries,
 		RetriesByCode:        retriesRows(c.retriesByCode, true),
-		RetryMetrics:         retriesRows(c.retriesByCode, false),
+		RetryMetrics:         retryMetricRows(c.retryMetrics),
+		InflightMetrics:      inflightMetricRows(c.inflightByProvider),
 		Recent:               c.recentSnapshot(),
 	}
 }
@@ -567,11 +664,59 @@ func retriesRows(m map[int]int64, truncate bool) []statsErrorRow {
 	return out
 }
 
+func retryReasonLabel(code int) string {
+	if code == 0 {
+		return "transport"
+	}
+	return strconv.Itoa(code)
+}
+
+func retryMetricRows(m map[statsRetryMetricKey]*retryMetricCounter) []statsRetryMetric {
+	out := make([]statsRetryMetric, 0, len(m))
+	for key, e := range m {
+		out = append(out, statsRetryMetric{Provider: key.provider, Model: key.model, Reason: key.reason, Count: e.count})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Provider != out[j].Provider {
+			return out[i].Provider < out[j].Provider
+		}
+		if out[i].Model != out[j].Model {
+			return out[i].Model < out[j].Model
+		}
+		return out[i].Reason < out[j].Reason
+	})
+	return out
+}
+
+func inflightMetricRows(m map[string]int64) []statsInflightMetric {
+	out := make([]statsInflightMetric, 0, len(m))
+	for provider, count := range m {
+		if count == 0 {
+			continue
+		}
+		out = append(out, statsInflightMetric{Provider: metricProviderLabel(provider), Count: count})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Provider < out[j].Provider })
+	return out
+}
+
 // latencyBucketSnapshot returns cumulative histogram bucket counts. Caller holds c.mu.
 func (c *statsCollector) latencyBucketSnapshot() []statsLatencyBucket {
 	out := make([]statsLatencyBucket, 0, len(statsLatencyBucketBounds))
 	for i, bucket := range statsLatencyBucketBounds {
 		out = append(out, statsLatencyBucket{Le: bucket.label, Count: c.latencyBuckets[i]})
+	}
+	return out
+}
+
+func latencyBucketRows(counts []int64) []statsLatencyBucket {
+	out := make([]statsLatencyBucket, 0, len(statsLatencyBucketBounds))
+	for i, bucket := range statsLatencyBucketBounds {
+		var count int64
+		if i < len(counts) {
+			count = counts[i]
+		}
+		out = append(out, statsLatencyBucket{Le: bucket.label, Count: count})
 	}
 	return out
 }
@@ -694,16 +839,44 @@ func addBreakdown(m map[string]*breakdownCounter, key string, tokens int64, kind
 	}
 }
 
-func addRequestMetric(m map[statsRequestMetricKey]*requestMetricCounter, provider, model, endpoint string, isErr bool) {
+func metricProviderLabel(provider string) string {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		return "unrouted"
+	}
+	return provider
+}
+
+func metricProviderModelLabels(provider, model string) (string, string) {
+	provider = metricProviderLabel(provider)
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = "unknown"
+	} else {
+		model = boundStatLabel(model)
+	}
+	return provider, model
+}
+
+func addRequestMetric(m map[statsRequestMetricKey]*requestMetricCounter, provider, model, endpoint string, isErr bool, durMs int64, measureLatency bool) {
 	key := statsRequestMetricKey{provider: provider, model: model, endpoint: requestMetricEndpointLabel(endpoint)}
 	e := m[key]
 	if e == nil {
-		e = &requestMetricCounter{}
+		e = &requestMetricCounter{latencyBuckets: make([]int64, len(statsLatencyBucketBounds))}
 		m[key] = e
 	}
 	e.requests++
 	if isErr {
 		e.errors++
+	}
+	if measureLatency {
+		e.latencySumMs += durMs
+		e.latencyCount++
+		for i, bucket := range statsLatencyBucketBounds {
+			if durMs <= bucket.upperMs {
+				e.latencyBuckets[i]++
+			}
+		}
 	}
 }
 
@@ -845,11 +1018,14 @@ func requestMetricRows(m map[statsRequestMetricKey]*requestMetricCounter) []stat
 	out := make([]statsRequestMetric, 0, len(m))
 	for key, e := range m {
 		out = append(out, statsRequestMetric{
-			Provider: key.provider,
-			Model:    key.model,
-			Endpoint: key.endpoint,
-			Requests: e.requests,
-			Errors:   e.errors,
+			Provider:       key.provider,
+			Model:          key.model,
+			Endpoint:       key.endpoint,
+			Requests:       e.requests,
+			Errors:         e.errors,
+			LatencyBuckets: latencyBucketRows(e.latencyBuckets),
+			LatencySumMs:   e.latencySumMs,
+			LatencyCount:   e.latencyCount,
 		})
 	}
 	sortRequestMetricRows(out)
@@ -1114,12 +1290,24 @@ func inferenceEndpointLabel(method, path string) string {
 // GET /v1/models catalog fetch, count-token probes, and the proxy shims) carry
 // no marker and are not counted.
 type retryStatsTrackedContextKey struct{}
+type retryStatsLabelsContextKey struct{}
+
+type retryStatsLabels struct {
+	provider string
+	model    string
+}
 
 func markRetryStatsTracked(ctx context.Context) context.Context {
+	return markRetryStatsTrackedWithLabels(ctx, "", "")
+}
+
+func markRetryStatsTrackedWithLabels(ctx context.Context, provider, model string) context.Context {
+	provider, model = metricProviderModelLabels(provider, model)
 	if ctx == nil {
-		return context.WithValue(context.Background(), retryStatsTrackedContextKey{}, true)
+		ctx = context.Background()
 	}
-	return context.WithValue(ctx, retryStatsTrackedContextKey{}, true)
+	ctx = context.WithValue(ctx, retryStatsTrackedContextKey{}, true)
+	return context.WithValue(ctx, retryStatsLabelsContextKey{}, retryStatsLabels{provider: provider, model: model})
 }
 
 func isRetryStatsTracked(ctx context.Context) bool {
@@ -1128,6 +1316,15 @@ func isRetryStatsTracked(ctx context.Context) bool {
 	}
 	v, _ := ctx.Value(retryStatsTrackedContextKey{}).(bool)
 	return v
+}
+
+func retryMetricLabelsFromContext(ctx context.Context) (string, string) {
+	if ctx != nil {
+		if labels, ok := ctx.Value(retryStatsLabelsContextKey{}).(retryStatsLabels); ok {
+			return metricProviderModelLabels(labels.provider, labels.model)
+		}
+	}
+	return metricProviderModelLabels("", "")
 }
 
 // MarkRetryStatsTrackedIfInference returns a context carrying the retry-stats
@@ -1158,16 +1355,35 @@ func (h *ProxyHandler) TracksRequest(method, path string) bool {
 }
 
 // IncInflight increments the live in-flight request gauge.
-func (h *ProxyHandler) IncInflight() {
-	if h != nil && h.stats != nil {
-		h.stats.incInflight()
+func (h *ProxyHandler) IncInflight(summary *RequestSummary) {
+	if h == nil || h.stats == nil {
+		return
+	}
+	provider, ok := summary.startInflight("")
+	if ok {
+		h.stats.incInflightForProvider(provider)
+	}
+}
+
+// MoveInflightProvider reattributes an active request after provider routing is resolved.
+func (h *ProxyHandler) MoveInflightProvider(summary *RequestSummary, provider string) {
+	if h == nil || h.stats == nil || summary == nil {
+		return
+	}
+	oldProvider, newProvider, changed := summary.updateInflightProvider(provider)
+	if changed {
+		h.stats.moveInflightProvider(oldProvider, newProvider)
 	}
 }
 
 // DecInflight decrements the live in-flight request gauge.
-func (h *ProxyHandler) DecInflight() {
-	if h != nil && h.stats != nil {
-		h.stats.decInflight()
+func (h *ProxyHandler) DecInflight(summary *RequestSummary) {
+	if h == nil || h.stats == nil {
+		return
+	}
+	provider, ok := summary.finishInflight()
+	if ok {
+		h.stats.decInflightForProvider(provider)
 	}
 }
 

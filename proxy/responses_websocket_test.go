@@ -473,6 +473,56 @@ func TestHandleResponsesWebSocket_IgnoresResponseProcessedControlFrame(t *testin
 	}
 }
 
+func TestResponsesWebSocketRetryStatsContextAttributesProviderModel(t *testing.T) {
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "local",
+			Type:     "openai-compatible",
+			Default:  true,
+			BaseURL:  "https://example.test",
+			AuthType: "none",
+			Models: []ProviderModelConfig{{
+				PublicID:  "gpt-5-public",
+				Endpoints: []string{providerEndpointResponses},
+			}},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	ctx := markResponsesWebSocketRetryStatsTracked(handler, context.Background(), "gpt-5-public")
+	handler.logRetryAttempt(ctx, 1, http.StatusTooManyRequests, "", 0, nil)
+
+	snap := handler.stats.snapshot()
+	if len(snap.RetryMetrics) != 1 {
+		t.Fatalf("retry metric rows: got %d want 1 (%+v)", len(snap.RetryMetrics), snap.RetryMetrics)
+	}
+	got := snap.RetryMetrics[0]
+	if got.Provider != "local" || got.Model != "gpt-5-public" || got.Reason != "429" || got.Count != 1 {
+		t.Fatalf("retry metric = %+v, want local/gpt-5-public/429 count 1", got)
+	}
+
+	longModel := strings.Repeat("x", statLabelMaxLen+20)
+	ctx = markResponsesWebSocketRetryStatsTracked(handler, context.Background(), longModel)
+	handler.logRetryAttempt(ctx, 1, http.StatusServiceUnavailable, "", 0, nil)
+	snap = handler.stats.snapshot()
+	var sawBounded bool
+	for _, row := range snap.RetryMetrics {
+		if row.Reason == "503" {
+			sawBounded = true
+			if row.Model != boundStatLabel(longModel) {
+				t.Fatalf("long websocket retry model = %q, want bounded %q", row.Model, boundStatLabel(longModel))
+			}
+		}
+	}
+	if !sawBounded {
+		t.Fatalf("missing retry metric row for long websocket model: %+v", snap.RetryMetrics)
+	}
+}
+
 func TestHandleResponsesWebSocket_RoutesConfiguredAzureModelAndPreservesPriorityServiceTier(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 

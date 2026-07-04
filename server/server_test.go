@@ -156,6 +156,26 @@ func TestServerBlocksNonHealthRoutesWhileProviderValidationPending(t *testing.T)
 	}
 }
 
+func TestNewCanDisableMetricsRoute(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+		WithMetricsEnabled(false),
+	)
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(w, req)
+	if got := w.Result().StatusCode; got != http.StatusNotFound {
+		t.Fatalf("GET /metrics status = %d, want 404 when metrics disabled", got)
+	}
+}
+
 func TestNew_ConfiguresExtendedWriteTimeout(t *testing.T) {
 	srv, err := New(
 		auth.NewTestAuthenticator("test-token"),

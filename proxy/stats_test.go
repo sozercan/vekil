@@ -174,6 +174,20 @@ func TestStatsCollectorErrorClassification(t *testing.T) {
 	}
 }
 
+func TestStatsCollectorPreRoutingErrorsExportUpstreamErrorMetric(t *testing.T) {
+	c := newStatsCollector()
+	c.record(&RequestSummary{}, http.StatusBadRequest, "test-agent", time.Millisecond)
+
+	snap := c.snapshot()
+	if len(snap.UpstreamErrorMetrics) != 1 {
+		t.Fatalf("upstream error metrics: got %d want 1 (%+v)", len(snap.UpstreamErrorMetrics), snap.UpstreamErrorMetrics)
+	}
+	got := snap.UpstreamErrorMetrics[0]
+	if got.Provider != "unrouted" || got.Model != "unknown" || got.Code != http.StatusBadRequest || got.Count != 1 {
+		t.Fatalf("upstream error metric = %+v, want unrouted/unknown/400 count 1", got)
+	}
+}
+
 func TestStatsCollectorLatencyPercentiles(t *testing.T) {
 	c := newStatsCollector()
 	fixed := time.Unix(1_700_000_000, 0)
@@ -253,10 +267,10 @@ func TestStatsCollectorCapsCardinality(t *testing.T) {
 
 func TestStatsCollectorRetries(t *testing.T) {
 	c := newStatsCollector()
-	c.incRetry(429)
-	c.incRetry(429)
-	c.incRetry(503)
-	c.incRetry(0) // transport error
+	c.incRetry(context.Background(), 429)
+	c.incRetry(context.Background(), 429)
+	c.incRetry(context.Background(), 503)
+	c.incRetry(context.Background(), 0) // transport error
 
 	snap := c.snapshot()
 	if snap.Retries != 4 {
@@ -280,6 +294,29 @@ func TestStatsCollectorRetries(t *testing.T) {
 	}
 	if len(snap.RetryMetrics) != 3 {
 		t.Fatalf("retry metric rows: got %d want 3 (%+v)", len(snap.RetryMetrics), snap.RetryMetrics)
+	}
+}
+
+func TestStatsCollectorRetryMetricsCapsModelCardinality(t *testing.T) {
+	c := newStatsCollector()
+	for i := 0; i < statsMaxKeys+10; i++ {
+		ctx := markRetryStatsTrackedWithLabels(context.Background(), "openai", fmt.Sprintf("model-%03d", i))
+		c.incRetry(ctx, http.StatusTooManyRequests)
+	}
+
+	snap := c.snapshot()
+	if got, want := len(snap.RetryMetrics), statsMaxKeys+1; got != want {
+		t.Fatalf("retry metric rows = %d, want %d", got, want)
+	}
+	var overflow statsRetryMetric
+	for _, row := range snap.RetryMetrics {
+		if row.Model == statsOtherKey {
+			overflow = row
+			break
+		}
+	}
+	if overflow.Provider != "openai" || overflow.Reason != "429" || overflow.Count != 10 {
+		t.Fatalf("overflow retry metric = %+v, want openai/other/429 count 10", overflow)
 	}
 }
 
@@ -473,11 +510,15 @@ func TestStatsCollectorSeriesZeroFill(t *testing.T) {
 
 func TestStatsCollectorInflight(t *testing.T) {
 	c := newStatsCollector()
-	c.incInflight()
+	c.incInflightForProvider("azure")
 	c.incInflight()
 	c.decInflight()
-	if got := c.snapshot().Inflight; got != 1 {
+	snap := c.snapshot()
+	if got := snap.Inflight; got != 1 {
 		t.Fatalf("inflight: got %d want 1", got)
+	}
+	if len(snap.InflightMetrics) != 1 || snap.InflightMetrics[0].Provider != "azure" || snap.InflightMetrics[0].Count != 1 {
+		t.Fatalf("inflight metrics: got %+v want azure=1", snap.InflightMetrics)
 	}
 }
 

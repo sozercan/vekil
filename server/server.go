@@ -23,11 +23,19 @@ type Server struct {
 }
 
 type options struct {
-	proxyOptions []proxy.Option
+	proxyOptions   []proxy.Option
+	metricsEnabled bool
 }
 
 // Option customizes server creation.
 type Option func(*options)
+
+// WithMetricsEnabled controls whether GET /metrics is registered.
+func WithMetricsEnabled(enabled bool) Option {
+	return func(o *options) {
+		o.metricsEnabled = enabled
+	}
+}
 
 // WithProxyOptions forwards proxy-level options to the underlying handler.
 func WithProxyOptions(opts ...proxy.Option) Option {
@@ -147,8 +155,8 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 		tracked := handler != nil && handler.TracksRequest(r.Method, r.URL.Path)
 		if tracked {
 			proxy.SeedRequestSummaryEndpointForRoute(ctx, r.Method, r.URL.Path)
-			handler.IncInflight()
-			defer handler.DecInflight()
+			handler.IncInflight(summary)
+			defer handler.DecInflight(summary)
 		}
 
 		// Mark the request context so upstream retries made on behalf of a tracked
@@ -206,7 +214,7 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 
 // New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
-	cfg := options{}
+	cfg := options{metricsEnabled: true}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
@@ -236,7 +244,9 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /dashboard/{asset}", handler.HandleDashboardAsset)
 	mux.HandleFunc("POST /dashboard/insight", handler.HandleDashboardInsight)
 	mux.HandleFunc("GET /stats.json", handler.HandleStatsJSON)
-	mux.HandleFunc("GET /metrics", handler.HandleMetrics)
+	if cfg.metricsEnabled {
+		mux.HandleFunc("GET /metrics", handler.HandleMetrics)
+	}
 	mux.HandleFunc("GET /favicon.ico", handler.HandleFavicon)
 
 	addr := fmt.Sprintf("%s:%s", host, port)

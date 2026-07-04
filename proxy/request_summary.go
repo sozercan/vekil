@@ -43,6 +43,13 @@ type RequestSummary struct {
 	// 200 header was sent. The stats middleware prefers it over the recorded HTTP
 	// status so post-commit failures are not counted as successes.
 	failureStatus int
+
+	// inflightTracked/inflightProvider let the metrics collector move an active
+	// request from the initial unrouted bucket to the resolved provider once the
+	// handler has parsed enough of the request to route it. They are internal
+	// bookkeeping only and are not emitted in request logs.
+	inflightTracked  bool
+	inflightProvider string
 }
 
 // WithRequestSummary attaches a mutable request summary to ctx and returns both
@@ -182,6 +189,50 @@ func (s *RequestSummary) FailureStatus() int {
 	return s.failureStatus
 }
 
+func (s *RequestSummary) startInflight(provider string) (string, bool) {
+	if s == nil {
+		return metricProviderLabel(provider), true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inflightTracked {
+		return s.inflightProvider, false
+	}
+	s.inflightTracked = true
+	s.inflightProvider = metricProviderLabel(provider)
+	return s.inflightProvider, true
+}
+
+func (s *RequestSummary) updateInflightProvider(provider string) (oldProvider, newProvider string, changed bool) {
+	if s == nil {
+		return "", "", false
+	}
+	newProvider = metricProviderLabel(provider)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.inflightTracked || s.inflightProvider == newProvider {
+		return "", "", false
+	}
+	oldProvider = s.inflightProvider
+	s.inflightProvider = newProvider
+	return oldProvider, newProvider, true
+}
+
+func (s *RequestSummary) finishInflight() (string, bool) {
+	if s == nil {
+		return metricProviderLabel(""), true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.inflightTracked {
+		return "", false
+	}
+	provider := s.inflightProvider
+	s.inflightTracked = false
+	s.inflightProvider = ""
+	return provider, true
+}
+
 // addInternalUsage accumulates out-of-band token spend (e.g. an internal
 // compaction call) that is separate from the turn's own reported usage, so it is
 // not clobbered when setOpenAIUsage overwrites the turn usage. It is additive.
@@ -269,6 +320,7 @@ func (h *ProxyHandler) observeRequestSummary(ctx context.Context, endpoint, mode
 		return
 	}
 	summary.setProvider(provider.id, string(provider.kind))
+	h.MoveInflightProvider(summary, provider.id)
 }
 
 func observeOpenAIUsage(ctx context.Context, usage *models.OpenAIUsage) {

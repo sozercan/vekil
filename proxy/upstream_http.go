@@ -37,7 +37,12 @@ func (h *ProxyHandler) newInferenceUpstreamContextFrom(inbound context.Context, 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	if isRetryStatsTracked(inbound) {
-		ctx = markRetryStatsTracked(ctx)
+		provider, model := "", ""
+		if summary := RequestSummaryFromContext(inbound); summary != nil {
+			d := readSummaryForStats(summary)
+			provider, model = d.provider, d.model
+		}
+		ctx = markRetryStatsTrackedWithLabels(ctx, provider, model)
 	}
 	return ctx, cancel
 }
