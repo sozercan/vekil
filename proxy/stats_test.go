@@ -510,7 +510,7 @@ func TestTracksRequest(t *testing.T) {
 			t.Errorf("expected POST %s (gemini) to be tracked", p)
 		}
 	}
-	skipped := []string{"/healthz", "/readyz", "/stats.json", "/dashboard", "/dashboard/uPlot.min.js", "/favicon.ico"}
+	skipped := []string{"/healthz", "/readyz", "/stats.json", "/metrics", "/dashboard", "/dashboard/uPlot.min.js", "/favicon.ico"}
 	for _, p := range skipped {
 		if h.TracksRequest(http.MethodGet, p) {
 			t.Errorf("expected %s to be skipped", p)

@@ -53,3 +53,21 @@ Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership 
 ## Responses WebSocket Bridge
 
 The Codex-style `GET /v1/responses` websocket bridge is disabled by default and remains a proxy-owned transport over upstream HTTP `/responses`. See [Responses WebSocket Bridge](responses-websocket.md) for websocket flags, auto-compaction settings, chunked compaction knobs, and a debug run example.
+
+
+## Prometheus metrics
+
+Vekil exposes a Prometheus-compatible `/metrics` endpoint beside `/stats.json`. The endpoint is scrape-only and backed by the in-memory request statistics collector used by the dashboard. It includes request counters, recent latency quantiles, token counters, retry counts, upstream error counts, in-flight request gauges, an aggregate endpoint health gauge, build info, and minimal Go runtime gauges.
+
+Important metric families include:
+
+- `vekil_requests_total{provider,public_model,endpoint,status}`
+- `vekil_request_duration_seconds{quantile}`
+- `vekil_tokens_total{provider,public_model,direction}`
+- `vekil_retries_total{provider,public_model,reason}`
+- `vekil_upstream_errors_total{provider,public_model,code}`
+- `vekil_inflight_requests{provider}`
+- `vekil_endpoint_healthy{provider,endpoint}`
+- `vekil_build_info{version,go_version,commit}`
+
+Latency quantiles are exported from the bounded recent latency sample already used by the dashboard.
