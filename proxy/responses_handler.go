@@ -71,6 +71,7 @@ func responsesUpstreamHeaders(extraHeaders http.Header, stream bool) http.Header
 type preparedResponsesRequest struct {
 	body            []byte
 	extraHeaders    http.Header
+	routingHeaders  http.Header
 	upstreamHeaders http.Header
 	headerToolScope string
 	streaming       bool
@@ -87,6 +88,7 @@ func (h *ProxyHandler) prepareResponsesRequest(ctx context.Context, r *http.Requ
 	return preparedResponsesRequest{
 		body:            bodyBytes,
 		extraHeaders:    extraHeaders,
+		routingHeaders:  r.Header,
 		upstreamHeaders: responsesUpstreamHeaders(extraHeaders, streaming),
 		headerToolScope: headerToolScope,
 		streaming:       streaming,
@@ -102,11 +104,11 @@ func responsesRequestStreams(bodyBytes []byte) bool {
 }
 
 func (h *ProxyHandler) postPreparedResponsesRequest(ctx, observeCtx context.Context, req preparedResponsesRequest) (*http.Response, error) {
-	resp, err := h.postResponsesWithHeaders(ctx, req.body, req.upstreamHeaders)
+	resp, err := h.postResponsesWithHeaders(ctx, req.body, req.upstreamHeaders, req.routingHeaders)
 	if err != nil {
 		return nil, err
 	}
-	return h.maybeRetryCompactedResponsesRequest(ctx, observeCtx, req.body, req.extraHeaders, req.upstreamHeaders, resp)
+	return h.maybeRetryCompactedResponsesRequest(ctx, observeCtx, req.body, req.extraHeaders, req.upstreamHeaders, resp, req.routingHeaders)
 }
 
 func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWriter, endpoint string, err error) {
@@ -136,7 +138,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), prepared.streaming)
 	defer upstreamCancel()
 
-	if compactionResp, handled, compactionUsage, err := h.maybeBuildResponsesCompactionTriggerResponse(upstreamCtx, prepared.body, prepared.extraHeaders, prepared.streaming); handled || err != nil {
+	if compactionResp, handled, compactionUsage, err := h.maybeBuildResponsesCompactionTriggerResponse(upstreamCtx, prepared.body, prepared.extraHeaders, prepared.streaming, prepared.routingHeaders); handled || err != nil {
 		if err != nil {
 			statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 			h.log.Error("upstream request failed", logger.F("endpoint", "responses/compaction_trigger"), logger.Err(err))
@@ -459,7 +461,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
 	defer upstreamCancel()
 
-	summaryText, resp, err := h.compactResponsesRequest(upstreamCtx, body, responsesExtraHeadersFromRequest(r))
+	summaryText, resp, err := h.compactResponsesRequest(upstreamCtx, body, responsesExtraHeadersFromRequest(r), r.Header)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "compact"), logger.Err(err))
@@ -546,7 +548,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
 
-	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, reqBody, responsesExtraHeadersFromRequest(r))
+	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, reqBody, responsesExtraHeadersFromRequest(r), r.Header)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "memory_summarize"), logger.Err(err))
@@ -739,12 +741,16 @@ func (r compactInflightResult) clone() (string, *http.Response, error) {
 	return r.summary, cloneHTTPResponseWithBody(r.resp, r.respBody), r.err
 }
 
-func compactInflightKey(requestFields map[string]json.RawMessage, extraHeaders http.Header) (string, bool) {
+func compactInflightKey(requestFields map[string]json.RawMessage, extraHeaders http.Header, routingHeaders ...http.Header) (string, bool) {
 	h := sha256.New()
 	writeCompactInflightKeyPart(h, []byte("request"))
 	writeCompactInflightKeyRawMap(h, requestFields)
 	writeCompactInflightKeyPart(h, []byte("headers"))
 	writeCompactInflightKeyHeaders(h, extraHeaders)
+	writeCompactInflightKeyPart(h, []byte("routing_headers"))
+	for _, headers := range routingHeaders {
+		writeCompactInflightKeyHeaders(h, headers)
+	}
 	return hex.EncodeToString(h.Sum(nil)), true
 }
 
@@ -829,11 +835,11 @@ func waitCompactInflight(ctx context.Context, call *compactInflightCall) (string
 	}
 }
 
-func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header) (string, *http.Response, error) {
-	key, ok := compactInflightKey(requestFields, extraHeaders)
+func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, routingHeaders ...http.Header) (string, *http.Response, error) {
+	key, ok := compactInflightKey(requestFields, extraHeaders, routingHeaders...)
 	if !ok {
 		budget := newCompactBudget(h.effectiveCompactMaxAttempts())
-		return h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget)
+		return h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget, routingHeaders...)
 	}
 
 	call, leader := h.beginCompactInflight(key)
@@ -842,7 +848,7 @@ func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestField
 	}
 
 	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
-	summary, resp, err := h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget)
+	summary, resp, err := h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget, routingHeaders...)
 	result := compactInflightResult{summary: summary, err: err}
 	if resp != nil {
 		respBody, truncated, readErr := readBodyWithCap(resp.Body, compactUpstreamErrorBodySize)
@@ -898,7 +904,7 @@ func (h *ProxyHandler) compactLearnedTargetKeyForRequest(requestFields map[strin
 	}, true
 }
 
-func (h *ProxyHandler) compactResponsesRequestWithBudget(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, budget *compactBudget) (string, *http.Response, error) {
+func (h *ProxyHandler) compactResponsesRequestWithBudget(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, budget *compactBudget, routingHeaders ...http.Header) (string, *http.Response, error) {
 	if rewrittenFields, rewriteCount := sanitizeContextCompactionRequestFields(requestFields); rewriteCount > 0 {
 		requestFields = rewrittenFields
 		h.log.Debug("sanitized context compaction items before upstream compact request",
@@ -922,10 +928,10 @@ func (h *ProxyHandler) compactResponsesRequestWithBudget(ctx context.Context, re
 		targetBodySize = learnedTarget
 	}
 	proactiveChunk := learned || h.compactProactiveChunkingEnabled()
-	return h.compactResponsesRequestDepth(ctx, requestFields, extraHeaders, 0, targetBodySize, budget, proactiveChunk)
+	return h.compactResponsesRequestDepth(ctx, requestFields, extraHeaders, 0, targetBodySize, budget, proactiveChunk, routingHeaders...)
 }
 
-func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int, targetBodySize int, budget *compactBudget, proactiveChunk bool) (string, *http.Response, error) {
+func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int, targetBodySize int, budget *compactBudget, proactiveChunk bool, routingHeaders ...http.Header) (string, *http.Response, error) {
 	bodyBytes, err := marshalCompactResponsesRequest(requestFields, nil)
 	if err != nil {
 		return "", nil, err
@@ -954,7 +960,7 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 			logger.F("target_body_size", targetBodySize),
 			logger.F("depth", depth),
 		)
-		if summary, err := h.compactResponsesRequestInChunks(ctx, requestFields, extraHeaders, depth+1, targetBodySize, budget); err == nil {
+		if summary, err := h.compactResponsesRequestInChunks(ctx, requestFields, extraHeaders, depth+1, targetBodySize, budget, routingHeaders...); err == nil {
 			return summary, nil, nil
 		} else {
 			h.log.Debug("learned compact chunk target pre-split failed; falling back to upstream post", logger.Err(err))
@@ -971,7 +977,7 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 		return "", nil, fmt.Errorf("compact upstream attempt budget exhausted (max=%d)", maxAttempts)
 	}
 
-	resp, err := h.postResponsesCompactWithFallback(ctx, bodyBytes, extraHeaders, budget)
+	resp, err := h.postResponsesCompactWithFallback(ctx, bodyBytes, extraHeaders, budget, routingHeaders...)
 	if err != nil {
 		return "", nil, err
 	}
@@ -1043,7 +1049,7 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 		)
 	}
 
-	summary, err := h.compactResponsesRequestInChunks(ctx, requestFields, extraHeaders, depth+1, nextTarget, budget)
+	summary, err := h.compactResponsesRequestInChunks(ctx, requestFields, extraHeaders, depth+1, nextTarget, budget, routingHeaders...)
 	if err != nil {
 		attempts, maxAttempts := budget.attemptsSnapshot()
 		h.log.Debug("chunked compact request failed",
@@ -1109,7 +1115,7 @@ func readBodyWithCap(r io.Reader, maxBytes int) ([]byte, bool, error) {
 	return body, false, nil
 }
 
-func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int, targetBodySize int, budget *compactBudget) (summary string, err error) {
+func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int, targetBodySize int, budget *compactBudget, routingHeaders ...http.Header) (summary string, err error) {
 	if targetBodySize <= 0 {
 		targetBodySize = h.effectiveCompactChunkBodyBytes()
 	}
@@ -1209,7 +1215,7 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 			return "", err
 		}
 		chunkFields := copyResponsesRequestFieldsWithInput(fallbackFields, chunkInput)
-		summary, resp, err := h.compactResponsesRequestDepth(chunkCtx, chunkFields, extraHeaders, depth, targetBodySize, budget, false)
+		summary, resp, err := h.compactResponsesRequestDepth(chunkCtx, chunkFields, extraHeaders, depth, targetBodySize, budget, false, routingHeaders...)
 		if err != nil {
 			return "", err
 		}
@@ -1240,12 +1246,12 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 				logger.F("prior_target", targetBodySize),
 				logger.F("remaining_chunks", len(chunks)-1),
 			)
-			tail, err := h.compactResponsesRequestInChunks(ctx, remainingFields, extraHeaders, depth, learnedTarget, budget)
+			tail, err := h.compactResponsesRequestInChunks(ctx, remainingFields, extraHeaders, depth, learnedTarget, budget, routingHeaders...)
 			if err != nil {
 				return "", err
 			}
 			summaries = append(summaries[:1], tail)
-			return h.mergeCompactionSummaries(ctx, fallbackFields, summaries, extraHeaders, depth, targetBodySize, budget)
+			return h.mergeCompactionSummaries(ctx, fallbackFields, summaries, extraHeaders, depth, targetBodySize, budget, routingHeaders...)
 		}
 	}
 
@@ -1332,16 +1338,16 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 				logger.F("completed_chunks", sentThrough+1),
 				logger.F("remaining_chunks", len(chunks)-sentThrough-1),
 			)
-			tail, err := h.compactResponsesRequestInChunks(ctx, remainingFields, extraHeaders, depth, learnedTarget, budget)
+			tail, err := h.compactResponsesRequestInChunks(ctx, remainingFields, extraHeaders, depth, learnedTarget, budget, routingHeaders...)
 			if err != nil {
 				return "", err
 			}
 			summaries = append(summaries[:sentThrough+1], tail)
-			return h.mergeCompactionSummaries(ctx, fallbackFields, summaries, extraHeaders, depth, targetBodySize, budget)
+			return h.mergeCompactionSummaries(ctx, fallbackFields, summaries, extraHeaders, depth, targetBodySize, budget, routingHeaders...)
 		}
 	}
 
-	return h.mergeCompactionSummaries(ctx, fallbackFields, summaries, extraHeaders, depth, targetBodySize, budget)
+	return h.mergeCompactionSummaries(ctx, fallbackFields, summaries, extraHeaders, depth, targetBodySize, budget, routingHeaders...)
 }
 
 // flattenCompactChunks concatenates a list of chunked input slices back into
@@ -1845,7 +1851,7 @@ func encodedRawMessageSize(raw json.RawMessage) (int, error) {
 	return len(encoded), nil
 }
 
-func (h *ProxyHandler) mergeCompactionSummaries(ctx context.Context, requestFields map[string]json.RawMessage, summaries []string, extraHeaders http.Header, depth int, targetBodySize int, budget *compactBudget) (string, error) {
+func (h *ProxyHandler) mergeCompactionSummaries(ctx context.Context, requestFields map[string]json.RawMessage, summaries []string, extraHeaders http.Header, depth int, targetBodySize int, budget *compactBudget, routingHeaders ...http.Header) (string, error) {
 	switch len(summaries) {
 	case 0:
 		return "", nil
@@ -1872,7 +1878,7 @@ func (h *ProxyHandler) mergeCompactionSummaries(ctx context.Context, requestFiel
 	}
 
 	mergeFields := copyResponsesRequestFieldsWithInput(requestFields, input)
-	summary, resp, err := h.compactResponsesRequestDepth(ctx, mergeFields, extraHeaders, depth, targetBodySize, budget, false)
+	summary, resp, err := h.compactResponsesRequestDepth(ctx, mergeFields, extraHeaders, depth, targetBodySize, budget, false, routingHeaders...)
 	if err != nil {
 		return "", err
 	}
@@ -2193,12 +2199,12 @@ func stripUnsupportedResponsesToolChoice(rawToolChoice json.RawMessage, noRemain
 	return rawToolChoice, false
 }
 
-func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, bodyBytes []byte, extraHeaders http.Header) (*http.Response, error) {
-	resp, _, err := h.postResponsesWithFallbackHeadersTracked(ctx, bodyBytes, extraHeaders)
+func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, routingHeaders ...http.Header) (*http.Response, error) {
+	resp, _, err := h.postResponsesWithFallbackHeadersTracked(ctx, bodyBytes, extraHeaders, routingHeaders...)
 	return resp, err
 }
 
-func (h *ProxyHandler) maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, resp *http.Response) (*http.Response, error) {
+func (h *ProxyHandler) maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, resp *http.Response, routingHeaders ...http.Header) (*http.Response, error) {
 	if resp == nil || resp.StatusCode != http.StatusBadRequest {
 		return resp, nil
 	}
@@ -2237,7 +2243,7 @@ func (h *ProxyHandler) maybeRetryResponsesWithoutUnverifiableEncryptedContent(ct
 	h.log.Info("retrying responses request without unverifiable encrypted content",
 		logger.F("encrypted_items_stripped", strippedItems),
 	)
-	retryResp, retryErr := h.postJSONEndpointWithHeaders(ctx, providerEndpointResponses, retryBody, extraHeaders)
+	retryResp, retryErr := h.postJSONEndpointWithHeaders(ctx, providerEndpointResponses, retryBody, extraHeaders, routingHeaders...)
 	if retryErr != nil {
 		h.log.Debug("responses encrypted-content retry request failed", logger.Err(retryErr))
 		return restoreOriginalResp(), nil
@@ -2376,8 +2382,8 @@ func sanitizeResponsesUnverifiableEncryptedContentItem(raw json.RawMessage) (jso
 // ultimately served by — empty unless the model-fallback path engaged. The
 // compact fanout uses this to memoize the resolved fallback so siblings don't
 // each re-pay the unsupported-model probe.
-func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Context, bodyBytes []byte, extraHeaders http.Header) (*http.Response, string, error) {
-	resp, err := h.postResponsesWithHeaders(ctx, bodyBytes, extraHeaders)
+func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, routingHeaders ...http.Header) (*http.Response, string, error) {
+	resp, err := h.postResponsesWithHeaders(ctx, bodyBytes, extraHeaders, routingHeaders...)
 	if err != nil {
 		return nil, "", err
 	}
@@ -2423,7 +2429,7 @@ func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Conte
 		logger.F("fallback_model", fallbackModel),
 	)
 
-	retryResp, retryErr := h.postResponsesWithHeaders(ctx, fallbackBody, extraHeaders)
+	retryResp, retryErr := h.postResponsesWithHeaders(ctx, fallbackBody, extraHeaders, noSpeedTierRoutingHeaders())
 	if retryErr != nil {
 		h.log.Debug("responses fallback request failed", logger.Err(retryErr))
 		return resp, "", nil
@@ -2436,8 +2442,8 @@ func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Conte
 // resolved fallback model is captured on the shared compact budget. Subsequent
 // compact calls in the same fanout pre-rewrite their body via
 // applyResolvedCompactModel and skip the unsupported-model probe entirely.
-func (h *ProxyHandler) postResponsesCompactWithFallback(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, budget *compactBudget) (*http.Response, error) {
-	resp, fallbackModel, err := h.postResponsesWithFallbackHeadersTracked(ctx, bodyBytes, extraHeaders)
+func (h *ProxyHandler) postResponsesCompactWithFallback(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, budget *compactBudget, routingHeaders ...http.Header) (*http.Response, error) {
+	resp, fallbackModel, err := h.postResponsesWithFallbackHeadersTracked(ctx, bodyBytes, extraHeaders, routingHeaders...)
 	if err != nil {
 		return nil, err
 	}
@@ -2512,7 +2518,7 @@ func applyResolvedCompactModel(bodyBytes []byte, budget *compactBudget) []byte {
 	return sanitizeResponsesModelFallbackBody(rewritten)
 }
 
-func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx context.Context, bodyBytes []byte, extraHeaders, upstreamHeaders http.Header, resp *http.Response) (*http.Response, error) {
+func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx context.Context, bodyBytes []byte, extraHeaders, upstreamHeaders http.Header, resp *http.Response, routingHeaders ...http.Header) (*http.Response, error) {
 	if resp == nil || resp.StatusCode != http.StatusRequestEntityTooLarge {
 		return resp, nil
 	}
@@ -2583,7 +2589,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 		prefixLen := compactedResponsesAlignedPrefixLen(input, keepTail)
 		alignedKeepTail := len(input) - prefixLen
 		lastAlignedKeepTail = alignedKeepTail
-		summary, err := h.compactResponsesInputWithBudget(ctx, model, input[:prefixLen], extraHeaders, budget)
+		summary, err := h.compactResponsesInputWithBudget(ctx, model, input[:prefixLen], extraHeaders, budget, routingHeaders...)
 		if err != nil {
 			h.log.Debug("responses 413 compaction failed", logger.F("keep_tail", keepTail), logger.Err(err))
 			return lastResp, nil
@@ -2631,7 +2637,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 		}
 		h.log.Info("retrying responses request with compacted history after 413", fields...)
 
-		retryResp, retryErr := h.postResponsesWithHeaders(ctx, retryBody, upstreamHeaders)
+		retryResp, retryErr := h.postResponsesWithHeaders(ctx, retryBody, upstreamHeaders, routingHeaders...)
 		if retryErr != nil {
 			h.log.Debug("responses 413 retry request failed", logger.F("keep_tail", keepTail), logger.Err(retryErr))
 			return lastResp, nil
@@ -3063,12 +3069,12 @@ func compactedResponsesRetryKeepTailSchedule(inputItems int, configuredKeepTail 
 	return schedule
 }
 
-func (h *ProxyHandler) compactResponsesInput(ctx context.Context, model string, input []json.RawMessage, extraHeaders http.Header) (string, error) {
+func (h *ProxyHandler) compactResponsesInput(ctx context.Context, model string, input []json.RawMessage, extraHeaders http.Header, routingHeaders ...http.Header) (string, error) {
 	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
-	return h.compactResponsesInputWithBudget(ctx, model, input, extraHeaders, budget)
+	return h.compactResponsesInputWithBudget(ctx, model, input, extraHeaders, budget, routingHeaders...)
 }
 
-func (h *ProxyHandler) compactResponsesInputWithBudget(ctx context.Context, model string, input []json.RawMessage, extraHeaders http.Header, budget *compactBudget) (string, error) {
+func (h *ProxyHandler) compactResponsesInputWithBudget(ctx context.Context, model string, input []json.RawMessage, extraHeaders http.Header, budget *compactBudget, routingHeaders ...http.Header) (string, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return "", fmt.Errorf("missing model for websocket compaction")
@@ -3087,7 +3093,7 @@ func (h *ProxyHandler) compactResponsesInputWithBudget(ctx context.Context, mode
 		"model": modelRaw,
 		"input": inputRaw,
 	}
-	summary, resp, err := h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget)
+	summary, resp, err := h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget, routingHeaders...)
 	if err != nil {
 		return "", err
 	}
@@ -3099,14 +3105,14 @@ func (h *ProxyHandler) compactResponsesInputWithBudget(ctx context.Context, mode
 	return summary, nil
 }
 
-func (h *ProxyHandler) maybeBuildResponsesCompactionTriggerResponse(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, stream bool) (*http.Response, bool, responsesUsage, error) {
+func (h *ProxyHandler) maybeBuildResponsesCompactionTriggerResponse(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, stream bool, routingHeaders ...http.Header) (*http.Response, bool, responsesUsage, error) {
 	requestFields, ok, err := compactTriggerRequestFields(bodyBytes)
 	if err != nil || !ok {
 		return nil, ok, responsesUsage{}, err
 	}
 
 	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
-	summary, resp, err := h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget)
+	summary, resp, err := h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget, routingHeaders...)
 	if err != nil {
 		return nil, true, responsesUsage{}, err
 	}

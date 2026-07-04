@@ -102,7 +102,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), stream || forceStream)
 	defer upstreamCancel()
 
-	resp, err := h.postChatCompletions(upstreamCtx, oaiBody)
+	resp, err := h.postChatCompletionsWithHeaders(upstreamCtx, oaiBody, r.Header)
 	if err != nil {
 		h.writeGeminiUpstreamFailure(w, err)
 		return
@@ -113,7 +113,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		forceUpstreamStream:   forceStream,
 		injectedStreamUsage:   streamUsageInjected,
 	}
-	resp, oaiBody, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, oaiBody, mode)
+	resp, oaiBody, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, oaiBody, mode, r.Header)
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	if resp.StatusCode != http.StatusOK {
@@ -357,7 +357,7 @@ func (h *ProxyHandler) executeGeminiCountTokensProbe(probeReq *models.OpenAIRequ
 		}
 	}
 
-	resp, err := h.postChatCompletions(upstreamCtx, body)
+	resp, err := h.postChatCompletionsWithHeaders(upstreamCtx, body, noSpeedTierRoutingHeaders())
 	if err != nil {
 		return nil, false, mapGeminiCountTokensTransportError(err)
 	}
@@ -383,7 +383,7 @@ func (h *ProxyHandler) executeGeminiCountTokensProbeFinal(probeReq *models.OpenA
 		}
 	}
 
-	resp, err := h.postChatCompletions(upstreamCtx, body)
+	resp, err := h.postChatCompletionsWithHeaders(upstreamCtx, body, noSpeedTierRoutingHeaders())
 	if err != nil {
 		return nil, mapGeminiCountTokensTransportError(err)
 	}

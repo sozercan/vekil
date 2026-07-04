@@ -138,13 +138,9 @@ func mergeHeaderValues(dst, src http.Header) {
 	}
 }
 
-func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*providerRuntime, providerModel, []byte, error) {
+func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string, routingHeaders ...http.Header) (*providerRuntime, providerModel, []byte, error) {
 	model := extractRequestModel(body)
-	lookupModel := model
-	if endpoint == providerEndpointMessages {
-		lookupModel = NormalizeModelName(model)
-	}
-	provider, owner, known := h.resolveProviderModel(lookupModel, endpoint)
+	provider, owner, known, forcedSpeedAlias := h.resolveProviderModelWithFastAlias(model, endpoint)
 	if provider == nil {
 		return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no provider available for endpoint %s", endpoint)}
 	}
@@ -166,6 +162,12 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 			err:        fmt.Errorf("model %q does not support %s", model, endpoint),
 		}
 	}
+
+	routingHeader := http.Header(nil)
+	if len(routingHeaders) > 0 {
+		routingHeader = routingHeaders[0]
+	}
+	owner, body = h.maybeApplySpeedTierRouting(body, endpoint, routingHeader, provider, owner, known, forcedSpeedAlias)
 
 	rewrittenBody := body
 	if !providerUsesAzureClassicDeploymentPath(provider, endpoint) {
@@ -212,12 +214,8 @@ func applyProviderModelRequestPolicy(body []byte, owner providerModel) []byte {
 	return rewritten
 }
 
-func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body []byte) (*http.Response, error) {
-	return h.postJSONEndpointWithHeaders(ctx, path, body, nil)
-}
-
-func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	provider, owner, rewrittenBody, err := h.resolveProviderRequest(body, path)
+func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header, routingHeaders ...http.Header) (*http.Response, error) {
+	provider, owner, rewrittenBody, err := h.resolveProviderRequest(body, path, routingHeaders...)
 	if err != nil {
 		return nil, err
 	}
@@ -232,23 +230,27 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
-	return h.postJSONEndpoint(ctx, providerEndpointChatCompletions, body)
+	return h.postChatCompletionsWithHeaders(ctx, body, nil)
 }
 
-func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	resp, err := h.postJSONEndpointWithHeaders(ctx, providerEndpointResponses, body, extraHeaders)
+func (h *ProxyHandler) postChatCompletionsWithHeaders(ctx context.Context, body []byte, routingHeaders http.Header) (*http.Response, error) {
+	return h.postJSONEndpointWithHeaders(ctx, providerEndpointChatCompletions, body, nil, routingHeaders)
+}
+
+func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header, routingHeaders ...http.Header) (*http.Response, error) {
+	resp, err := h.postJSONEndpointWithHeaders(ctx, providerEndpointResponses, body, extraHeaders, routingHeaders...)
 	if err != nil {
 		return nil, err
 	}
-	return h.maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx, body, extraHeaders, resp)
+	return h.maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx, body, extraHeaders, resp, routingHeaders...)
 }
 
-func (h *ProxyHandler) postAnthropicMessages(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	return h.postJSONEndpointWithHeaders(ctx, providerEndpointMessages, body, extraHeaders)
+func (h *ProxyHandler) postAnthropicMessages(ctx context.Context, body []byte, extraHeaders http.Header, routingHeaders ...http.Header) (*http.Response, error) {
+	return h.postJSONEndpointWithHeaders(ctx, providerEndpointMessages, body, extraHeaders, routingHeaders...)
 }
 
 func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	provider, owner, rewrittenBody, err := h.resolveProviderRequest(body, providerEndpointMessages)
+	provider, owner, rewrittenBody, err := h.resolveProviderRequest(body, providerEndpointMessages, noSpeedTierRoutingHeaders())
 	if err != nil {
 		return nil, err
 	}

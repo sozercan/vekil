@@ -11,6 +11,7 @@ This folder is intentionally split into small, single-purpose files so humans an
 | [`provider-routing.md`](provider-routing.md) | provider auth, JSON/YAML routing examples, model ownership, endpoint allowlists | providers, routing behavior, auth, or model metadata changes |
 | [`provider-api-keys.md`](provider-api-keys.md) | where to get provider API keys and how to map them into providers config | provider signup/key URLs or auth field guidance changes |
 | [`tool-optimizers.md`](tool-optimizers.md) | optional shell command rewrite and tool-output reduction config | optimizer config or behavior changes |
+| [`speed-tier-routing.md`](speed-tier-routing.md) | optional speed/cost-tier model downgrade routing | speed-tier config, signals, validation, or logging behavior changes |
 | [`responses-websocket.md`](responses-websocket.md) | Codex-style `GET /v1/responses` websocket bridge tuning | websocket bridge, auto-compaction, or compact retry knobs change |
 | [`clients.md`](clients.md) | copy-paste client examples | onboarding snippets or client compatibility changes |
 | [`api.md`](api.md) | concise endpoint map and compatibility links | public routes are added, removed, or renamed |

@@ -125,6 +125,18 @@ func mapAnthropicUpstreamStatus(statusCode int) string {
 	}
 }
 
+func anthropicRoutingHeaders(r *http.Request, req *models.AnthropicRequest) http.Header {
+	if req != nil && req.Thinking != nil && strings.EqualFold(strings.TrimSpace(req.Thinking.Type), "enabled") {
+		headers := r.Header.Clone()
+		if headers == nil {
+			headers = make(http.Header)
+		}
+		headers.Set("X-Vekil-Routing", "default")
+		return headers
+	}
+	return r.Header
+}
+
 func anthropicExtraHeadersFromRequest(r *http.Request) http.Header {
 	var headers http.Header
 	for _, name := range []string{
@@ -145,12 +157,12 @@ func anthropicExtraHeadersFromRequest(r *http.Request) http.Header {
 }
 
 func (h *ProxyHandler) shouldForwardAnthropicMessagesDirect(model string) bool {
-	provider, _, _ := h.resolveProviderModel(NormalizeModelName(model), providerEndpointMessages)
+	provider, _, _, _ := h.resolveProviderModelWithFastAlias(model, providerEndpointMessages)
 	return provider != nil && provider.kind == providerTypeAnthropicCompatible
 }
 
 func (h *ProxyHandler) shouldForwardAnthropicCountTokensDirect(model string) bool {
-	provider, _, _ := h.resolveProviderModel(NormalizeModelName(model), providerEndpointMessages)
+	provider, _, _, _ := h.resolveProviderModelWithFastAlias(model, providerEndpointMessages)
 	return provider != nil && provider.kind == providerTypeAnthropicCompatible
 }
 
@@ -161,7 +173,7 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), streaming)
 	defer upstreamCancel()
 
-	resp, err := h.postAnthropicMessages(upstreamCtx, body, anthropicExtraHeadersFromRequest(r))
+	resp, err := h.postAnthropicMessages(upstreamCtx, body, anthropicExtraHeadersFromRequest(r), r.Header)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "anthropic"), logger.Err(err))
@@ -213,7 +225,7 @@ func (h *ProxyHandler) directAnthropicResponseModels(req *models.AnthropicReques
 	}
 	publicModel := strings.TrimSpace(req.Model)
 	upstreamModel := publicModel
-	_, owner, known := h.resolveProviderModel(NormalizeModelName(req.Model), providerEndpointMessages)
+	_, owner, known, _ := h.resolveProviderModelWithFastAlias(req.Model, providerEndpointMessages)
 	if !known {
 		return publicModel, upstreamModel
 	}
@@ -303,7 +315,8 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 
-	resp, err := h.postChatCompletions(upstreamCtx, oaiBody)
+	routingHeaders := anthropicRoutingHeaders(r, &req)
+	resp, err := h.postChatCompletionsWithHeaders(upstreamCtx, oaiBody, routingHeaders)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "anthropic"), logger.Err(err))
@@ -315,7 +328,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	resp, oaiBody, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, oaiBody, mode)
+	resp, oaiBody, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, oaiBody, mode, routingHeaders)
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	if resp.StatusCode != http.StatusOK {
@@ -458,7 +471,7 @@ func (h *ProxyHandler) executeAnthropicCountTokensProbe(probeReq *models.OpenAIR
 		return nil, false, fmt.Errorf("failed to marshal count_tokens probe request: %w", err)
 	}
 
-	resp, err := h.postChatCompletions(upstreamCtx, body)
+	resp, err := h.postChatCompletionsWithHeaders(upstreamCtx, body, noSpeedTierRoutingHeaders())
 	if err != nil {
 		return nil, false, err
 	}
@@ -481,7 +494,7 @@ func (h *ProxyHandler) executeAnthropicCountTokensProbeFinal(probeReq *models.Op
 		return nil, fmt.Errorf("failed to marshal count_tokens probe request: %w", err)
 	}
 
-	resp, err := h.postChatCompletions(upstreamCtx, body)
+	resp, err := h.postChatCompletionsWithHeaders(upstreamCtx, body, noSpeedTierRoutingHeaders())
 	if err != nil {
 		return nil, err
 	}
@@ -533,7 +546,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 
-	resp, err := h.postChatCompletions(upstreamCtx, bodyBytes)
+	resp, err := h.postChatCompletionsWithHeaders(upstreamCtx, bodyBytes, r.Header)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "openai"), logger.Err(err))
@@ -545,7 +558,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 
-	resp, _, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, bodyBytes, mode)
+	resp, _, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, bodyBytes, mode, r.Header)
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
@@ -745,7 +758,7 @@ func stripStreamOptions(body []byte) ([]byte, bool) {
 	return result, true
 }
 
-func (h *ProxyHandler) retryChatCompletionsWithoutInjectedStreamOptions(ctx context.Context, resp *http.Response, body []byte, mode chatCompletionsMode) (*http.Response, []byte, chatCompletionsMode) {
+func (h *ProxyHandler) retryChatCompletionsWithoutInjectedStreamOptions(ctx context.Context, resp *http.Response, body []byte, mode chatCompletionsMode, routingHeaders http.Header) (*http.Response, []byte, chatCompletionsMode) {
 	if h == nil || resp == nil || resp.StatusCode != http.StatusBadRequest || !mode.injectedStreamUsage {
 		return resp, body, mode
 	}
@@ -753,7 +766,7 @@ func (h *ProxyHandler) retryChatCompletionsWithoutInjectedStreamOptions(ctx cont
 	if !ok {
 		return resp, body, mode
 	}
-	retryResp, err := h.postChatCompletions(ctx, fallbackBody)
+	retryResp, err := h.postChatCompletionsWithHeaders(ctx, fallbackBody, routingHeaders)
 	if err != nil {
 		if h != nil && h.log != nil {
 			h.log.Debug("retry without stream_options failed", logger.Err(err))

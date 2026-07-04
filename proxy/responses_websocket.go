@@ -133,23 +133,28 @@ type responsesWebSocketStreamIncompleteDetails struct {
 }
 
 type responsesWebSocketSession struct {
-	conn           *websocket.Conn
-	ctx            context.Context
-	baseHeaders    http.Header
-	userAgent      string
-	turnState      string
-	turnMetadata   string
-	lastResponseID string
-	lastSignature  string
-	historyItems   []json.RawMessage
-	historyBytes   int
-	toolContexts   *ToolExecutionContextStore
-	toolScope      string
-	done           chan struct{}
-	doneOnce       sync.Once
-	inflightMu     sync.Mutex
-	inflightCancel context.CancelFunc
-	inflightGen    uint64
+	conn                      *websocket.Conn
+	ctx                       context.Context
+	baseHeaders               http.Header
+	routingHeaders            http.Header
+	userAgent                 string
+	turnState                 string
+	turnMetadata              string
+	lastResponseID            string
+	lastSignature             string
+	historyItems              []json.RawMessage
+	historyBytes              int
+	toolContexts              *ToolExecutionContextStore
+	toolScope                 string
+	done                      chan struct{}
+	doneOnce                  sync.Once
+	inflightMu                sync.Mutex
+	inflightCancel            context.CancelFunc
+	inflightGen               uint64
+	speedTierDowngraded       bool
+	speedTierDowngradedSource string
+	speedTierPinnedModel      string
+	speedTierPinnedSource     string
 }
 
 type responsesWebSocketRequestPlan struct {
@@ -468,10 +473,11 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 	}
 
 	return &responsesWebSocketSession{
-		conn:        conn,
-		ctx:         r.Context(),
-		baseHeaders: baseHeaders,
-		userAgent:   r.Header.Get("User-Agent"),
+		conn:           conn,
+		ctx:            r.Context(),
+		baseHeaders:    baseHeaders,
+		routingHeaders: r.Header.Clone(),
+		userAgent:      r.Header.Get("User-Agent"),
 		// Codex treats X-Codex-Turn-State as server-issued, turn-scoped
 		// sticky-routing state. This bridge only trusts state it received from
 		// upstream during this proxy-owned websocket session.
@@ -574,6 +580,10 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	s.syncTurnMetadata(request)
 	if request.PreviousResponseID == "" {
 		s.turnState = ""
+		s.speedTierDowngraded = false
+		s.speedTierDowngradedSource = ""
+		s.speedTierPinnedModel = ""
+		s.speedTierPinnedSource = ""
 	}
 
 	plan, err := s.planRequest(h, request)
@@ -766,6 +776,19 @@ func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx conte
 	return resp, true, true, err
 }
 
+func (s *responsesWebSocketSession) speedTierRoutingHeadersForRequest(request *responsesWebSocketCreateRequest) http.Header {
+	headers := s.requestHeaders(request, false)
+	routingHeaders := s.routingHeaders.Clone()
+	if routingHeaders == nil {
+		routingHeaders = make(http.Header)
+	}
+	mergeHeaderValues(routingHeaders, headers)
+	if s.speedTierPinnedModel != "" {
+		routingHeaders.Set("X-Vekil-Routing", "default")
+	}
+	return routingHeaders
+}
+
 func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, inputSegments [][]json.RawMessage, includeTurnState bool) (*http.Response, error) {
 	bodyBytes, err := request.upstreamBody(inputSegments...)
 	if err != nil {
@@ -773,13 +796,38 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 	}
 	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizers(ctx, bodyBytes, "responses/websocket", true, s.toolContexts, s.toolScope)
 	headers := s.requestHeaders(request, includeTurnState)
+	requestModel, _ := speedTierBaseModel(extractRequestModel(bodyBytes))
+	if s.speedTierPinnedModel != "" && s.speedTierPinnedSource != "" && requestModel != s.speedTierPinnedSource {
+		s.speedTierPinnedModel = ""
+		s.speedTierPinnedSource = ""
+	}
+	if s.speedTierDowngradedSource != "" && requestModel != s.speedTierDowngradedSource {
+		s.speedTierDowngraded = false
+		s.speedTierDowngradedSource = ""
+	}
+	routingHeaders := s.speedTierRoutingHeadersForRequest(request)
+	if s.speedTierPinnedModel != "" {
+		if pinnedBody, _, err := rewriteRequestModelForProvider(bodyBytes, s.speedTierPinnedModel); err == nil {
+			bodyBytes = pinnedBody
+		}
+		routingHeaders.Set("X-Vekil-Routing", "default")
+	} else if source, decision, ok := h.speedTierDecisionForRequest(bodyBytes, providerEndpointResponses, routingHeaders); ok {
+		if decision.shouldDowngrade() {
+			s.speedTierDowngraded = true
+			s.speedTierDowngradedSource = source.publicID
+		} else if s.speedTierDowngraded && s.speedTierDowngradedSource == source.publicID && source.speedTier != nil && source.speedTier.wsStickyAfterUpgrade && speedTierDecisionPinsWebSocket(decision) {
+			s.speedTierPinnedModel = source.publicID
+			s.speedTierPinnedSource = source.publicID
+			routingHeaders.Set("X-Vekil-Routing", "default")
+		}
+	}
 	// The websocket bridge records each turn's usage downstream from the streamed
 	// response body (recordTurnStats), so the per-turn usage total returned here
 	// is not observed separately — discard it.
-	if compactionResp, handled, _, err := h.maybeBuildResponsesCompactionTriggerResponse(ctx, bodyBytes, headers, true); handled || err != nil {
+	if compactionResp, handled, _, err := h.maybeBuildResponsesCompactionTriggerResponse(ctx, bodyBytes, headers, true, routingHeaders); handled || err != nil {
 		return compactionResp, err
 	}
-	return h.postResponsesWithHeaders(ctx, bodyBytes, headers)
+	return h.postResponsesWithHeaders(ctx, bodyBytes, headers, routingHeaders)
 }
 
 func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCreateRequest, includeTurnState bool) http.Header {
@@ -1130,12 +1178,15 @@ func (s *responsesWebSocketSession) compactHistoryItemsWithKeepTail(h *ProxyHand
 	result.fromItems = len(history)
 	result.fromBytes = rawMessagesSize(history)
 
+	headers := s.requestHeaders(request, false)
+	routingHeaders := s.speedTierRoutingHeadersForRequest(request)
+
 	var summary string
 	var err error
 	if budget == nil {
-		summary, err = h.compactResponsesInput(ctx, request.Model, prefix, s.requestHeaders(request, false))
+		summary, err = h.compactResponsesInput(ctx, request.Model, prefix, headers, routingHeaders)
 	} else {
-		summary, err = h.compactResponsesInputWithBudget(ctx, request.Model, prefix, s.requestHeaders(request, false), budget)
+		summary, err = h.compactResponsesInputWithBudget(ctx, request.Model, prefix, headers, budget, routingHeaders)
 	}
 	if err != nil {
 		return nil, result, false, err

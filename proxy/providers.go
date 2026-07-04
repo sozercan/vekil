@@ -60,8 +60,9 @@ var openAICodexProviderEndpoints = []string{providerEndpointResponses}
 // ProvidersConfig configures optional non-Copilot upstream providers.
 // When empty, the proxy keeps its legacy zero-config Copilot behavior.
 type ProvidersConfig struct {
-	Providers      []ProviderConfig     `json:"providers" yaml:"providers"`
-	ToolOptimizers ToolOptimizersConfig `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
+	Providers        []ProviderConfig     `json:"providers" yaml:"providers"`
+	ToolOptimizers   ToolOptimizersConfig `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
+	SpeedTierEnabled bool                 `json:"speed_tier_enabled,omitempty" yaml:"speed_tier_enabled,omitempty"`
 	// InsightModel is the public model ID the dashboard uses to generate
 	// natural-language traffic insights on demand. Empty disables the feature
 	// (the dashboard's "Generate insights" button is hidden). The model must be
@@ -98,17 +99,18 @@ type ProviderConfig struct {
 // ProviderModelConfig maps a public model ID exposed by this proxy to the
 // upstream model or deployment name used by the provider.
 type ProviderModelConfig struct {
-	PublicID            string   `json:"public_id" yaml:"public_id"`
-	Deployment          string   `json:"deployment,omitempty" yaml:"deployment,omitempty"`
-	Name                string   `json:"name,omitempty" yaml:"name,omitempty"`
-	Endpoints           []string `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
-	ModelPickerEnabled  *bool    `json:"model_picker_enabled,omitempty" yaml:"model_picker_enabled,omitempty"`
-	ModelPickerCategory string   `json:"model_picker_category,omitempty" yaml:"model_picker_category,omitempty"`
-	ReasoningEffort     []string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
-	Vision              *bool    `json:"vision,omitempty" yaml:"vision,omitempty"`
-	ParallelToolCalls   *bool    `json:"parallel_tool_calls,omitempty" yaml:"parallel_tool_calls,omitempty"`
-	DropSamplingParams  *bool    `json:"drop_sampling_params,omitempty" yaml:"drop_sampling_params,omitempty"`
-	ContextWindow       *int64   `json:"context_window,omitempty" yaml:"context_window,omitempty"`
+	PublicID            string           `json:"public_id" yaml:"public_id"`
+	Deployment          string           `json:"deployment,omitempty" yaml:"deployment,omitempty"`
+	Name                string           `json:"name,omitempty" yaml:"name,omitempty"`
+	Endpoints           []string         `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
+	ModelPickerEnabled  *bool            `json:"model_picker_enabled,omitempty" yaml:"model_picker_enabled,omitempty"`
+	ModelPickerCategory string           `json:"model_picker_category,omitempty" yaml:"model_picker_category,omitempty"`
+	ReasoningEffort     []string         `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
+	Vision              *bool            `json:"vision,omitempty" yaml:"vision,omitempty"`
+	ParallelToolCalls   *bool            `json:"parallel_tool_calls,omitempty" yaml:"parallel_tool_calls,omitempty"`
+	DropSamplingParams  *bool            `json:"drop_sampling_params,omitempty" yaml:"drop_sampling_params,omitempty"`
+	ContextWindow       *int64           `json:"context_window,omitempty" yaml:"context_window,omitempty"`
+	SpeedTier           *SpeedTierConfig `json:"speed_tier,omitempty" yaml:"speed_tier,omitempty"`
 }
 
 type providerRuntime struct {
@@ -150,6 +152,7 @@ type providerModel struct {
 	supportedEndpoints []string
 	parallelToolCalls  *bool
 	dropSamplingParams bool
+	speedTier          *speedTierRule
 	disabled           bool
 	raw                json.RawMessage
 }
@@ -160,6 +163,7 @@ type providerSetup struct {
 	defaultProviderID  string
 	modelsMu           sync.RWMutex
 	models             map[string]providerModel
+	speedTierEnabled   bool
 	hasConfiguredState bool
 }
 
@@ -430,6 +434,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 		providerOrder:      providerOrder,
 		defaultProviderID:  defaultProviderID,
 		models:             make(map[string]providerModel),
+		speedTierEnabled:   cfg.SpeedTierEnabled,
 		hasConfiguredState: true,
 	}
 
@@ -514,6 +519,11 @@ func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*provider
 		provider, err := buildProviderRuntime(raw, h.copilotURL, h.azureIdentityTokenSourceFactory)
 		if err != nil {
 			return nil, nil, "", err
+		}
+		if cfg.SpeedTierEnabled {
+			if err := validateStaticSpeedTierModels(provider); err != nil {
+				return nil, nil, "", err
+			}
 		}
 		if _, exists := providers[provider.id]; exists {
 			return nil, nil, "", fmt.Errorf("duplicate provider id %q", provider.id)
@@ -746,6 +756,39 @@ func addStaticProviderModels(runtime *providerRuntime, models []ProviderModelCon
 		runtime.staticModels[model.publicID] = model
 		runtime.staticConfigs[model.publicID] = normalizeProviderModelConfig(modelCfg)
 		runtime.staticOrder = append(runtime.staticOrder, model.publicID)
+	}
+	return nil
+}
+
+func validateStaticSpeedTierModels(runtime *providerRuntime) error {
+	if runtime == nil {
+		return nil
+	}
+	for _, publicID := range runtime.staticOrder {
+		model := runtime.staticModels[publicID]
+		if model.speedTier == nil {
+			continue
+		}
+		if model.speedTier.downgradeTo == "" {
+			return fmt.Errorf("provider %q model %q speed_tier.downgrade_to is required", runtime.id, model.publicID)
+		}
+		switch model.speedTier.semantics {
+		case speedTierSemanticsAll, speedTierSemanticsAny:
+		default:
+			return fmt.Errorf("provider %q model %q speed_tier.semantics must be %q or %q", runtime.id, model.publicID, speedTierSemanticsAll, speedTierSemanticsAny)
+		}
+		target, ok := runtime.staticModels[model.speedTier.downgradeTo]
+		if !ok {
+			return fmt.Errorf("provider %q model %q speed_tier.downgrade_to %q is not a known public_id in the same provider", runtime.id, model.publicID, model.speedTier.downgradeTo)
+		}
+		if target.speedTier != nil {
+			return fmt.Errorf("provider %q model %q speed_tier.downgrade_to %q declares its own speed_tier; chained downgrades are not supported", runtime.id, model.publicID, target.publicID)
+		}
+		for _, endpoint := range model.supportedEndpoints {
+			if !providerModelSupportsEndpoint(target, endpoint) {
+				return fmt.Errorf("provider %q model %q speed_tier.downgrade_to %q does not support endpoint %s", runtime.id, model.publicID, target.publicID, endpoint)
+			}
+		}
 	}
 	return nil
 }
@@ -1002,6 +1045,11 @@ func buildStaticProviderModel(providerID string, cfg ProviderModelConfig, defaul
 		return providerModel{}, err
 	}
 
+	speedTier, err := normalizeSpeedTierRule(cfg.SpeedTier)
+	if err != nil {
+		return providerModel{}, fmt.Errorf("provider %q model %q: %w", providerID, publicID, err)
+	}
+
 	return providerModel{
 		publicID:           publicID,
 		upstreamModel:      upstreamModel,
@@ -1009,6 +1057,7 @@ func buildStaticProviderModel(providerID string, cfg ProviderModelConfig, defaul
 		supportedEndpoints: endpoints,
 		parallelToolCalls:  cloneBoolPtr(cfg.ParallelToolCalls),
 		dropSamplingParams: cfg.DropSamplingParams != nil && *cfg.DropSamplingParams,
+		speedTier:          speedTier,
 		raw:                raw,
 	}, nil
 }
@@ -1023,6 +1072,12 @@ func normalizeProviderModelConfig(cfg ProviderModelConfig) ProviderModelConfig {
 	}
 	if cfg.ReasoningEffort != nil {
 		cfg.ReasoningEffort = append([]string(nil), cfg.ReasoningEffort...)
+	}
+	if cfg.SpeedTier != nil {
+		copy := *cfg.SpeedTier
+		copy.When = normalizeSpeedTierWhen(copy.When)
+		copy.NeverWhen = normalizeSpeedTierNeverWhen(copy.NeverWhen)
+		cfg.SpeedTier = &copy
 	}
 	return cfg
 }
