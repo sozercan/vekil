@@ -39,6 +39,12 @@ func TestSeedRequestSummaryEndpointPreservesEarlyErrorRoute(t *testing.T) {
 	if got := readSummaryForStats(summary).endpoint; got != "openai_chat" {
 		t.Fatalf("handler endpoint = %q, want semantic endpoint", got)
 	}
+	c := newStatsCollector()
+	summary.setProvider("openai", "openai")
+	c.record(summary, http.StatusOK, "test-agent", time.Millisecond)
+	if got := c.snapshot().RequestMetrics[0].Endpoint; got != "/v1/chat/completions" {
+		t.Fatalf("metric endpoint = %q, want normalized route path", got)
+	}
 
 	ctx, geminiSummary := WithRequestSummary(context.Background())
 	SeedRequestSummaryEndpointForRoute(ctx, http.MethodPost, "/v1beta/models/gemini-unique:generateContent")
@@ -271,6 +277,9 @@ func TestStatsCollectorRetries(t *testing.T) {
 	}
 	if !sawTransport {
 		t.Fatal("expected a 'transport' retry row")
+	}
+	if len(snap.RetryMetrics) != 3 {
+		t.Fatalf("retry metric rows: got %d want 3 (%+v)", len(snap.RetryMetrics), snap.RetryMetrics)
 	}
 }
 

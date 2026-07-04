@@ -35,23 +35,27 @@ func (h *ProxyHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 		writePromIntMetric(w, "vekil_requests_total", mapWithLabel(labels, "status", "error"), row.Errors)
 	}
 
-	_, _ = fmt.Fprintln(w, "# HELP vekil_request_duration_seconds Recent request latency summary in seconds.")
-	_, _ = fmt.Fprintln(w, "# TYPE vekil_request_duration_seconds summary")
-	writePromFloatMetric(w, "vekil_request_duration_seconds", map[string]string{"quantile": "0.50"}, millisToSeconds(snap.Totals.LatencyP50))
-	writePromFloatMetric(w, "vekil_request_duration_seconds", map[string]string{"quantile": "0.95"}, millisToSeconds(snap.Totals.LatencyP95))
-	writePromFloatMetric(w, "vekil_request_duration_seconds", map[string]string{"quantile": "0.99"}, millisToSeconds(snap.Totals.LatencyP99))
+	_, _ = fmt.Fprintln(w, "# HELP vekil_request_duration_seconds Non-streaming request latency histogram in seconds.")
+	_, _ = fmt.Fprintln(w, "# TYPE vekil_request_duration_seconds histogram")
+	for _, bucket := range snap.LatencyBuckets {
+		writePromIntMetric(w, "vekil_request_duration_seconds_bucket", map[string]string{"le": bucket.Le}, bucket.Count)
+	}
+	writePromIntMetric(w, "vekil_request_duration_seconds_bucket", map[string]string{"le": "+Inf"}, snap.Totals.LatencyCount)
 	writePromFloatMetric(w, "vekil_request_duration_seconds_sum", nil, millisToSeconds(snap.Totals.LatencySumMs))
 	writePromIntMetric(w, "vekil_request_duration_seconds_count", nil, snap.Totals.LatencyCount)
 
-	_, _ = fmt.Fprintln(w, "# HELP vekil_tokens_total Total observed upstream tokens by provider, public model, and direction.")
+	_, _ = fmt.Fprintln(w, "# HELP vekil_tokens_total Total observed upstream tokens by provider, public model, and disjoint direction.")
 	_, _ = fmt.Fprintln(w, "# TYPE vekil_tokens_total counter")
+	_, _ = fmt.Fprintln(w, "# HELP vekil_tokens_cached_total Total cached prompt tokens by provider and public model.")
+	_, _ = fmt.Fprintln(w, "# TYPE vekil_tokens_cached_total counter")
+	_, _ = fmt.Fprintln(w, "# HELP vekil_tokens_reasoning_total Total reasoning completion tokens by provider and public model.")
+	_, _ = fmt.Fprintln(w, "# TYPE vekil_tokens_reasoning_total counter")
 	for _, row := range snap.TokenMetrics {
 		labels := map[string]string{"provider": row.Provider, "public_model": row.Model, "direction": "prompt"}
 		writePromIntMetric(w, "vekil_tokens_total", labels, row.PromptTokens)
 		writePromIntMetric(w, "vekil_tokens_total", mapWithLabel(labels, "direction", "completion"), row.CompletionTokens)
-		writePromIntMetric(w, "vekil_tokens_total", mapWithLabel(labels, "direction", "total"), row.TotalTokens)
-		writePromIntMetric(w, "vekil_tokens_total", mapWithLabel(labels, "direction", "cached"), row.CachedTokens)
-		writePromIntMetric(w, "vekil_tokens_total", mapWithLabel(labels, "direction", "reasoning"), row.ReasoningTokens)
+		writePromIntMetric(w, "vekil_tokens_cached_total", map[string]string{"provider": row.Provider, "public_model": row.Model}, row.CachedTokens)
+		writePromIntMetric(w, "vekil_tokens_reasoning_total", map[string]string{"provider": row.Provider, "public_model": row.Model}, row.ReasoningTokens)
 	}
 
 	_, _ = fmt.Fprintln(w, "# HELP vekil_retries_total Total upstream retry attempts.")
@@ -59,7 +63,7 @@ func (h *ProxyHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 	writePromIntMetric(w, "vekil_retries_total", nil, snap.Retries)
 	_, _ = fmt.Fprintln(w, "# HELP vekil_retries_by_reason_total Total upstream retry attempts by reason/status.")
 	_, _ = fmt.Fprintln(w, "# TYPE vekil_retries_by_reason_total counter")
-	for _, row := range snap.RetriesByCode {
+	for _, row := range snap.RetryMetrics {
 		writePromIntMetric(w, "vekil_retries_by_reason_total", map[string]string{"reason": row.Label}, row.Count)
 	}
 
@@ -71,7 +75,7 @@ func (h *ProxyHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	_, _ = fmt.Fprintln(w, "# HELP vekil_inflight_requests Current in-flight Vekil proxy requests.")
 	_, _ = fmt.Fprintln(w, "# TYPE vekil_inflight_requests gauge")
-	writePromIntMetric(w, "vekil_inflight_requests", map[string]string{"provider": ""}, snap.Inflight)
+	writePromIntMetric(w, "vekil_inflight_requests", nil, snap.Inflight)
 
 	_, _ = fmt.Fprintln(w, "# HELP vekil_build_info Build and runtime information for Vekil.")
 	_, _ = fmt.Fprintln(w, "# TYPE vekil_build_info gauge")

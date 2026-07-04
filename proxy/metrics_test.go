@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sozercan/vekil/models"
 )
 
 func TestHandleMetrics(t *testing.T) {
@@ -35,10 +37,15 @@ func TestHandleMetrics(t *testing.T) {
 		"# HELP vekil_requests_total",
 		`vekil_requests_total{endpoint="/v1/chat/completions",provider="openai",public_model="gpt-5",status="success"} 1`,
 		`vekil_requests_total{endpoint="/v1/chat/completions",provider="openai",public_model="gpt-5",status="error"} 0`,
-		`vekil_tokens_total{direction="prompt",provider="openai",public_model="gpt-5"} 11`,
+		`# TYPE vekil_request_duration_seconds histogram`,
+		`vekil_request_duration_seconds_bucket{le="0.025"} 1`,
+		`vekil_request_duration_seconds_bucket{le="+Inf"} 1`,
 		`vekil_request_duration_seconds_sum 0.025`,
 		`vekil_request_duration_seconds_count 1`,
-		"vekil_inflight_requests",
+		`vekil_tokens_total{direction="prompt",provider="openai",public_model="gpt-5"} 11`,
+		`vekil_tokens_cached_total{provider="openai",public_model="gpt-5"} 0`,
+		`vekil_tokens_reasoning_total{provider="openai",public_model="gpt-5"} 0`,
+		`vekil_inflight_requests `,
 		`vekil_build_info{commit="abc123"`,
 		`version="test-version"`,
 		"go_goroutines",
@@ -49,6 +56,11 @@ func TestHandleMetrics(t *testing.T) {
 	}
 	for _, notWant := range []string{
 		`vekil_requests_total{endpoint="",provider="",public_model="",status="success"}`,
+		`vekil_request_duration_seconds{quantile=`,
+		`vekil_tokens_total{direction="total"`,
+		`vekil_tokens_total{direction="cached"`,
+		`vekil_tokens_total{direction="reasoning"`,
+		`vekil_inflight_requests{provider=`,
 		"vekil_endpoint_healthy",
 	} {
 		if strings.Contains(body, notWant) {
@@ -91,6 +103,8 @@ func TestHandleMetricsAttributesErrorRetryAndTokenSeries(t *testing.T) {
 		`vekil_requests_total{endpoint="/v1/chat/completions",provider="azure",public_model="gpt-5.4",status="error"} 1`,
 		`vekil_tokens_total{direction="prompt",provider="azure",public_model="gpt-5.4"} 5`,
 		`vekil_tokens_total{direction="completion",provider="azure",public_model="gpt-5.4"} 3`,
+		`vekil_tokens_cached_total{provider="azure",public_model="gpt-5.4"} 0`,
+		`vekil_tokens_reasoning_total{provider="azure",public_model="gpt-5.4"} 0`,
 		`vekil_retries_total 1`,
 		`vekil_retries_by_reason_total{reason="429"} 1`,
 		`vekil_upstream_errors_total{code="502",provider="azure",public_model="gpt-5.4"} 1`,
@@ -109,5 +123,40 @@ func TestPromLabelsEscapesTextFormatValues(t *testing.T) {
 	want := `{model="a b\\c\"d\ne f"}`
 	if got != want {
 		t.Fatalf("promLabels() = %q, want %q", got, want)
+	}
+}
+
+func TestHandleMetricsPreservesStructuredMetricLabels(t *testing.T) {
+	h := &ProxyHandler{stats: newStatsCollector()}
+	s := &RequestSummary{}
+	s.setRoute("/v1/chat/completions", "bad\x00x", false)
+	s.setProvider("openai", "openai")
+	s.setOpenAIUsage(&models.OpenAIUsage{PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3})
+	h.stats.record(s, http.StatusOK, "test-agent", time.Millisecond)
+
+	w := httptest.NewRecorder()
+	h.HandleMetrics(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := w.Body.String()
+	want := `vekil_requests_total{endpoint="/v1/chat/completions",provider="openai",public_model="bad x",status="success"} 1`
+	if !strings.Contains(body, want) {
+		t.Fatalf("metrics body missing %q:\n%s", want, body)
+	}
+	if strings.Contains(body, `endpoint="x"`) {
+		t.Fatalf("NUL-containing model corrupted endpoint label:\n%s", body)
+	}
+}
+
+func TestHandleMetricsExportsAllRetryReasonCounters(t *testing.T) {
+	h := &ProxyHandler{stats: newStatsCollector()}
+	for i := 400; i < 400+statsTopN+5; i++ {
+		h.stats.incRetry(i)
+	}
+
+	w := httptest.NewRecorder()
+	h.HandleMetrics(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := w.Body.String()
+	want := `vekil_retries_by_reason_total{reason="414"} 1`
+	if !strings.Contains(body, want) {
+		t.Fatalf("metrics body missing non-top retry reason %q:\n%s", want, body)
 	}
 }

@@ -124,7 +124,7 @@ func (r *responseRecorder) Unwrap() http.ResponseWriter {
 
 func withProviderValidationGate(next http.Handler, handler *proxy.ProxyHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if handler != nil && (handler.StartupAuthenticationPending() || handler.DynamicProviderValidationPending()) && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" {
+		if handler != nil && (handler.StartupAuthenticationPending() || handler.DynamicProviderValidationPending()) && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && r.URL.Path != "/metrics" {
 			message := "provider model validation pending"
 			if handler.StartupAuthenticationPending() {
 				message = "startup authentication pending"

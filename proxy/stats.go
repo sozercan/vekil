@@ -111,6 +111,11 @@ type statsUpstreamErrorMetric struct {
 	Count    int64
 }
 
+type statsLatencyBucket struct {
+	Le    string
+	Count int64
+}
+
 // statsErrorRow is one row in the error-by-status or error-by-target lists.
 type statsErrorRow struct {
 	Label string `json:"label"`
@@ -138,10 +143,16 @@ type statsSnapshot struct {
 	// fields above, so these are intentionally omitted from /stats.json.
 	TokenMetrics         []statsTokenMetric         `json:"-"`
 	UpstreamErrorMetrics []statsUpstreamErrorMetric `json:"-"`
-	// Retries is the total upstream retry attempts and the breakdown by the
-	// status that triggered them (surfaces flakiness the proxy absorbed).
+	// LatencyBuckets contains cumulative Prometheus histogram buckets over the
+	// same non-streaming latency observations counted by Totals.LatencyCount.
+	LatencyBuckets []statsLatencyBucket `json:"-"`
+	// Retries is the total upstream retry attempts and the dashboard breakdown by
+	// the status that triggered them (surfaces flakiness the proxy absorbed).
 	Retries       int64           `json:"retries"`
 	RetriesByCode []statsErrorRow `json:"retries_by_code"`
+	// RetryMetrics carries the full retry reason keyspace for Prometheus. The
+	// dashboard row above is top-N truncated.
+	RetryMetrics []statsErrorRow `json:"-"`
 	// Recent is the most-recent completed requests (newest first) for drill-down.
 	Recent []recentRequest `json:"recent"`
 	// InsightsEnabled reports whether a model is configured for on-demand
@@ -183,6 +194,23 @@ type upstreamErrorMetricCounter struct {
 	count int64
 }
 
+type statsRequestMetricKey struct {
+	provider string
+	model    string
+	endpoint string
+}
+
+type statsProviderModelKey struct {
+	provider string
+	model    string
+}
+
+type statsUpstreamErrorMetricKey struct {
+	provider string
+	model    string
+	code     int
+}
+
 // statsCollector aggregates per-request traffic in memory for the dashboard.
 // It is written on every tracked request and read by the dashboard poll; the
 // per-second series uses a lazy ring buffer so no background goroutine is
@@ -199,9 +227,9 @@ type statsCollector struct {
 	byModel             map[string]*breakdownCounter
 	byProvider          map[string]*breakdownCounter
 	byAgent             map[string]*breakdownCounter
-	requestMetrics      map[string]*requestMetricCounter
-	tokenMetrics        map[string]*tokenMetricCounter
-	upstreamErrorMetric map[string]*upstreamErrorMetricCounter
+	requestMetrics      map[statsRequestMetricKey]*requestMetricCounter
+	tokenMetrics        map[statsProviderModelKey]*tokenMetricCounter
+	upstreamErrorMetric map[statsUpstreamErrorMetricKey]*upstreamErrorMetricCounter
 
 	// retries counts upstream retry attempts the proxy made (transient 429/503,
 	// transport errors). These are usually invisible to clients because the
@@ -217,9 +245,10 @@ type statsCollector struct {
 
 	// latencies is a bounded ring of recent request durations (ms) used to
 	// compute p50/p95/p99 without retaining every sample forever.
-	latencies    []int64
-	latencyIdx   int
-	latencyCount int
+	latencies      []int64
+	latencyIdx     int
+	latencyCount   int
+	latencyBuckets []int64
 
 	inflight atomic.Int64
 }
@@ -244,6 +273,23 @@ const (
 	statsRecentRequests = 80
 )
 
+var statsLatencyBucketBounds = []struct {
+	label   string
+	upperMs int64
+}{
+	{label: "0.005", upperMs: 5},
+	{label: "0.01", upperMs: 10},
+	{label: "0.025", upperMs: 25},
+	{label: "0.05", upperMs: 50},
+	{label: "0.1", upperMs: 100},
+	{label: "0.25", upperMs: 250},
+	{label: "0.5", upperMs: 500},
+	{label: "1", upperMs: 1000},
+	{label: "2.5", upperMs: 2500},
+	{label: "5", upperMs: 5000},
+	{label: "10", upperMs: 10000},
+}
+
 func newStatsCollector() *statsCollector {
 	c := &statsCollector{
 		now:                 time.Now,
@@ -254,12 +300,13 @@ func newStatsCollector() *statsCollector {
 		byModel:             make(map[string]*breakdownCounter),
 		byProvider:          make(map[string]*breakdownCounter),
 		byAgent:             make(map[string]*breakdownCounter),
-		requestMetrics:      make(map[string]*requestMetricCounter),
-		tokenMetrics:        make(map[string]*tokenMetricCounter),
-		upstreamErrorMetric: make(map[string]*upstreamErrorMetricCounter),
+		requestMetrics:      make(map[statsRequestMetricKey]*requestMetricCounter),
+		tokenMetrics:        make(map[statsProviderModelKey]*tokenMetricCounter),
+		upstreamErrorMetric: make(map[statsUpstreamErrorMetricKey]*upstreamErrorMetricCounter),
 		retriesByCode:       make(map[int]int64),
 		recent:              make([]recentRequest, statsRecentRequests),
 		latencies:           make([]int64, statsLatencySamples),
+		latencyBuckets:      make([]int64, len(statsLatencyBucketBounds)),
 	}
 	c.start = c.now()
 	return c
@@ -367,6 +414,11 @@ func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, 
 		}
 		c.totals.LatencySumMs += durMs
 		c.totals.LatencyCount++
+		for i, bucket := range statsLatencyBucketBounds {
+			if durMs <= bucket.upperMs {
+				c.latencyBuckets[i]++
+			}
+		}
 	}
 
 	modelKey := ""
@@ -484,15 +536,17 @@ func (c *statsCollector) snapshot() statsSnapshot {
 		RequestMetrics:       requestMetricRows(c.requestMetrics),
 		TokenMetrics:         tokenMetricRows(c.tokenMetrics),
 		UpstreamErrorMetrics: upstreamErrorMetricRows(c.upstreamErrorMetric),
+		LatencyBuckets:       c.latencyBucketSnapshot(),
 		Retries:              c.retries,
-		RetriesByCode:        retriesRows(c.retriesByCode),
+		RetriesByCode:        retriesRows(c.retriesByCode, true),
+		RetryMetrics:         retriesRows(c.retriesByCode, false),
 		Recent:               c.recentSnapshot(),
 	}
 }
 
 // retriesRows renders the retry-by-status map as sorted rows. Status 0 (a
 // transport-level error) is labeled "transport".
-func retriesRows(m map[int]int64) []statsErrorRow {
+func retriesRows(m map[int]int64, truncate bool) []statsErrorRow {
 	out := make([]statsErrorRow, 0, len(m))
 	for code, count := range m {
 		label := strconv.Itoa(code)
@@ -507,8 +561,17 @@ func retriesRows(m map[int]int64) []statsErrorRow {
 		}
 		return out[i].Label < out[j].Label
 	})
-	if len(out) > statsTopN {
+	if truncate && len(out) > statsTopN {
 		out = out[:statsTopN]
+	}
+	return out
+}
+
+// latencyBucketSnapshot returns cumulative histogram bucket counts. Caller holds c.mu.
+func (c *statsCollector) latencyBucketSnapshot() []statsLatencyBucket {
+	out := make([]statsLatencyBucket, 0, len(statsLatencyBucketBounds))
+	for i, bucket := range statsLatencyBucketBounds {
+		out = append(out, statsLatencyBucket{Le: bucket.label, Count: c.latencyBuckets[i]})
 	}
 	return out
 }
@@ -631,8 +694,8 @@ func addBreakdown(m map[string]*breakdownCounter, key string, tokens int64, kind
 	}
 }
 
-func addRequestMetric(m map[string]*requestMetricCounter, provider, model, endpoint string, isErr bool) {
-	key := requestMetricKey(provider, model, endpoint)
+func addRequestMetric(m map[statsRequestMetricKey]*requestMetricCounter, provider, model, endpoint string, isErr bool) {
+	key := statsRequestMetricKey{provider: provider, model: model, endpoint: requestMetricEndpointLabel(endpoint)}
 	e := m[key]
 	if e == nil {
 		e = &requestMetricCounter{}
@@ -644,11 +707,11 @@ func addRequestMetric(m map[string]*requestMetricCounter, provider, model, endpo
 	}
 }
 
-func addTokenMetric(m map[string]*tokenMetricCounter, provider, model string, d summaryStats) {
+func addTokenMetric(m map[statsProviderModelKey]*tokenMetricCounter, provider, model string, d summaryStats) {
 	if d.prompt == 0 && d.completion == 0 && d.total == 0 && d.cached == 0 && d.reasoning == 0 {
 		return
 	}
-	key := metricKey(provider, model)
+	key := statsProviderModelKey{provider: provider, model: model}
 	e := m[key]
 	if e == nil {
 		e = &tokenMetricCounter{}
@@ -661,8 +724,8 @@ func addTokenMetric(m map[string]*tokenMetricCounter, provider, model string, d 
 	e.reasoning += int64(d.reasoning)
 }
 
-func addUpstreamErrorMetric(m map[string]*upstreamErrorMetricCounter, provider, model string, code int) {
-	key := provider + "\x00" + model + "\x00" + strconv.Itoa(code)
+func addUpstreamErrorMetric(m map[statsUpstreamErrorMetricKey]*upstreamErrorMetricCounter, provider, model string, code int) {
+	key := statsUpstreamErrorMetricKey{provider: provider, model: model, code: code}
 	e := m[key]
 	if e == nil {
 		e = &upstreamErrorMetricCounter{}
@@ -671,12 +734,17 @@ func addUpstreamErrorMetric(m map[string]*upstreamErrorMetricCounter, provider, 
 	e.count++
 }
 
-func requestMetricKey(provider, model, endpoint string) string {
-	return provider + "\x00" + model + "\x00" + endpoint
-}
-
-func metricKey(provider, model string) string {
-	return provider + "\x00" + model
+func requestMetricEndpointLabel(endpoint string) string {
+	switch endpoint {
+	case "anthropic":
+		return "/v1/messages"
+	case "openai_chat":
+		return "/v1/chat/completions"
+	case "responses":
+		return "/v1/responses"
+	default:
+		return endpoint
+	}
 }
 
 const (
@@ -773,44 +841,33 @@ func unionTopBreakdowns(rows []statsBreakdown, n int) []statsBreakdown {
 	return result
 }
 
-func requestMetricRows(m map[string]*requestMetricCounter) []statsRequestMetric {
+func requestMetricRows(m map[statsRequestMetricKey]*requestMetricCounter) []statsRequestMetric {
 	out := make([]statsRequestMetric, 0, len(m))
 	for key, e := range m {
-		parts := strings.SplitN(key, "\x00", 3)
-		row := statsRequestMetric{Requests: e.requests, Errors: e.errors}
-		if len(parts) > 0 {
-			row.Provider = parts[0]
-		}
-		if len(parts) > 1 {
-			row.Model = parts[1]
-		}
-		if len(parts) > 2 {
-			row.Endpoint = parts[2]
-		}
-		out = append(out, row)
+		out = append(out, statsRequestMetric{
+			Provider: key.provider,
+			Model:    key.model,
+			Endpoint: key.endpoint,
+			Requests: e.requests,
+			Errors:   e.errors,
+		})
 	}
 	sortRequestMetricRows(out)
 	return out
 }
 
-func tokenMetricRows(m map[string]*tokenMetricCounter) []statsTokenMetric {
+func tokenMetricRows(m map[statsProviderModelKey]*tokenMetricCounter) []statsTokenMetric {
 	out := make([]statsTokenMetric, 0, len(m))
 	for key, e := range m {
-		parts := strings.SplitN(key, "\x00", 2)
-		row := statsTokenMetric{
+		out = append(out, statsTokenMetric{
+			Provider:         key.provider,
+			Model:            key.model,
 			PromptTokens:     e.prompt,
 			CompletionTokens: e.completion,
 			TotalTokens:      e.total,
 			CachedTokens:     e.cached,
 			ReasoningTokens:  e.reasoning,
-		}
-		if len(parts) > 0 {
-			row.Provider = parts[0]
-		}
-		if len(parts) > 1 {
-			row.Model = parts[1]
-		}
-		out = append(out, row)
+		})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Provider != out[j].Provider {
@@ -821,21 +878,15 @@ func tokenMetricRows(m map[string]*tokenMetricCounter) []statsTokenMetric {
 	return out
 }
 
-func upstreamErrorMetricRows(m map[string]*upstreamErrorMetricCounter) []statsUpstreamErrorMetric {
+func upstreamErrorMetricRows(m map[statsUpstreamErrorMetricKey]*upstreamErrorMetricCounter) []statsUpstreamErrorMetric {
 	out := make([]statsUpstreamErrorMetric, 0, len(m))
 	for key, e := range m {
-		parts := strings.SplitN(key, "\x00", 3)
-		row := statsUpstreamErrorMetric{Count: e.count}
-		if len(parts) > 0 {
-			row.Provider = parts[0]
-		}
-		if len(parts) > 1 {
-			row.Model = parts[1]
-		}
-		if len(parts) > 2 {
-			row.Code, _ = strconv.Atoi(parts[2])
-		}
-		out = append(out, row)
+		out = append(out, statsUpstreamErrorMetric{
+			Provider: key.provider,
+			Model:    key.model,
+			Code:     key.code,
+			Count:    e.count,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Provider != out[j].Provider {

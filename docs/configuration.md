@@ -57,18 +57,19 @@ The Codex-style `GET /v1/responses` websocket bridge is disabled by default and 
 
 ## Prometheus metrics
 
-Vekil exposes a Prometheus-compatible `/metrics` endpoint beside `/stats.json`. The endpoint is scrape-only and backed by the in-memory request statistics collector used by the dashboard. It includes request counters, recent latency quantiles, token counters, retry counts, upstream error counts, in-flight request gauges, build info, and minimal Go runtime gauges.
+Vekil exposes a Prometheus-compatible `/metrics` endpoint beside `/stats.json`. The endpoint is scrape-only and backed by the in-memory request statistics collector used by the dashboard. It includes request counters, non-streaming latency histogram buckets, token counters, retry counts, upstream error counts, an in-flight request gauge, build info, and minimal Go runtime gauges.
 
 Important metric families include:
 
 - `vekil_requests_total{provider,public_model,endpoint,status}`
-- `vekil_request_duration_seconds{quantile}` plus `_sum` and `_count`
-- `vekil_tokens_total{provider,public_model,direction}`
+- `vekil_request_duration_seconds_bucket{le}` plus `_sum` and `_count`
+- `vekil_tokens_total{provider,public_model,direction}` for disjoint `prompt` and `completion` directions
+- `vekil_tokens_cached_total{provider,public_model}` and `vekil_tokens_reasoning_total{provider,public_model}` for token sub-components
 - `vekil_retries_total` and `vekil_retries_by_reason_total{reason}`
 - `vekil_upstream_errors_total{provider,public_model,code}`
-- `vekil_inflight_requests{provider}`
+- `vekil_inflight_requests`
 - `vekil_build_info{version,go_version,commit}`
 
 Request counters are emitted for each bounded provider/model/endpoint key that observed traffic, with disjoint `status="success"` and `status="error"` series. Use Prometheus aggregation (for example `sum by (provider)` or `sum without (public_model,endpoint,status)`) for rollups instead of relying on a separate blank-label aggregate row.
 
-Latency quantiles are exported from the bounded recent latency sample already used by the dashboard. The `_sum` and `_count` series are cumulative over the same non-streaming latency observations; streamed requests are excluded because their wall-clock duration reflects connection lifetime rather than model latency.
+Latency is exported as a Prometheus histogram with bucket boundaries at `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, and `10` seconds, plus the standard `+Inf` bucket. The `_sum` and `_count` series are cumulative over the same non-streaming latency observations; streamed requests are excluded because their wall-clock duration reflects connection lifetime rather than model latency.

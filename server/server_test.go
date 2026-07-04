@@ -68,6 +68,7 @@ func TestServerBlocksNonHealthRoutesWhileStartupAuthenticationPending(t *testing
 	}{
 		{method: http.MethodGet, path: "/healthz", want: http.StatusOK},
 		{method: http.MethodGet, path: "/readyz", want: http.StatusServiceUnavailable},
+		{method: http.MethodGet, path: "/metrics", want: http.StatusOK},
 		{method: http.MethodGet, path: "/v1/models", want: http.StatusServiceUnavailable},
 		{method: http.MethodPost, path: "/v1/chat/completions", want: http.StatusServiceUnavailable},
 	} {
@@ -81,7 +82,7 @@ func TestServerBlocksNonHealthRoutesWhileStartupAuthenticationPending(t *testing
 				body, _ := io.ReadAll(resp.Body)
 				t.Fatalf("status = %d, want %d: %s", resp.StatusCode, tc.want, body)
 			}
-			if tc.path != "/healthz" {
+			if tc.want == http.StatusServiceUnavailable {
 				body, _ := io.ReadAll(resp.Body)
 				if !strings.Contains(string(body), "startup authentication pending") {
 					t.Fatalf("response missing startup auth pending message: %s", body)
@@ -131,6 +132,7 @@ func TestServerBlocksNonHealthRoutesWhileProviderValidationPending(t *testing.T)
 	}{
 		{method: http.MethodGet, path: "/healthz", want: http.StatusOK},
 		{method: http.MethodGet, path: "/readyz", want: http.StatusServiceUnavailable},
+		{method: http.MethodGet, path: "/metrics", want: http.StatusOK},
 		{method: http.MethodGet, path: "/v1/models", want: http.StatusServiceUnavailable},
 		{method: http.MethodPost, path: "/v1/chat/completions", want: http.StatusServiceUnavailable},
 	} {
@@ -144,7 +146,7 @@ func TestServerBlocksNonHealthRoutesWhileProviderValidationPending(t *testing.T)
 				body, _ := io.ReadAll(resp.Body)
 				t.Fatalf("status = %d, want %d: %s", resp.StatusCode, tc.want, body)
 			}
-			if tc.path != "/healthz" {
+			if tc.want == http.StatusServiceUnavailable {
 				body, _ := io.ReadAll(resp.Body)
 				if !strings.Contains(string(body), "provider model validation pending") {
 					t.Fatalf("response missing pending validation message: %s", body)
