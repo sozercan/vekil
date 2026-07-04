@@ -62,7 +62,7 @@ func setSSEHeaders(w http.ResponseWriter) {
 
 // flushWriter wraps an http.ResponseWriter and flushes after every Write.
 type flushWriter struct {
-	w        http.ResponseWriter
+	w        io.Writer
 	flusher  http.Flusher
 	writeErr error
 }

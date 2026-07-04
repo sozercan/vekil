@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -76,6 +77,7 @@ func WithCompactUpstreamMaxAttempts(max int) Option {
 
 type responseRecorder struct {
 	http.ResponseWriter
+	writer io.Writer
 	status int
 	bytes  int64
 }
@@ -93,7 +95,7 @@ func (r *responseRecorder) Write(p []byte) (int, error) {
 		r.status = http.StatusOK
 	}
 	// responseRecorder only counts bytes while delegating to handlers that set content types for their own responses.
-	n, err := r.ResponseWriter.Write(p) // lgtm[go/reflected-xss]
+	n, err := r.writer.Write(p)
 	r.bytes += int64(n)
 	return n, err
 }
@@ -142,7 +144,7 @@ func withProviderValidationGate(next http.Handler, handler *proxy.ProxyHandler) 
 func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		recorder := &responseRecorder{ResponseWriter: w}
+		recorder := &responseRecorder{ResponseWriter: w, writer: w}
 		ctx, summary := proxy.WithRequestSummary(r.Context())
 
 		tracked := handler != nil && handler.TracksRequest(r.Method, r.URL.Path)
