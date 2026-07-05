@@ -69,7 +69,7 @@ type flushWriter struct {
 
 func (fw *flushWriter) Write(p []byte) (int, error) {
 	// flushWriter is an http.ResponseWriter wrapper for SSE bytes; callers set the event-stream content type before forwarding upstream chunks.
-	n, err := fw.w.Write(p) // lgtm[go/reflected-xss]
+	n, err := fw.w.Write(p)
 	if err != nil {
 		// Record that the failure came from writing to the client (e.g. the client
 		// disconnected) so callers can distinguish a client-side error from an
