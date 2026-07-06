@@ -6,7 +6,7 @@ RUN go mod download
 COPY . .
 ARG VERSION=dev
 ARG COMMIT=
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X github.com/sozercan/vekil/proxy.metricsBuildVersion=${VERSION} -X github.com/sozercan/vekil/proxy.metricsBuildCommit=${COMMIT}" -o /vekil .
+RUN VERSION_NO_V=${VERSION#v} && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X github.com/sozercan/vekil/proxy.metricsBuildVersion=${VERSION_NO_V} -X github.com/sozercan/vekil/proxy.metricsBuildCommit=${COMMIT}" -o /vekil .
 
 FROM debian:trixie-slim AS rtk-downloader
 ARG RTK_VERSION=0.43.0

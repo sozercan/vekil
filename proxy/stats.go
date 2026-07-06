@@ -158,9 +158,6 @@ type statsSnapshot struct {
 	// fields above, so these are intentionally omitted from /stats.json.
 	TokenMetrics         []statsTokenMetric         `json:"-"`
 	UpstreamErrorMetrics []statsUpstreamErrorMetric `json:"-"`
-	// LatencyBuckets contains cumulative Prometheus histogram buckets over the
-	// same non-streaming latency observations counted by Totals.LatencyCount.
-	LatencyBuckets []statsLatencyBucket `json:"-"`
 	// Retries is the total upstream retry attempts and the dashboard breakdown by
 	// the status that triggered them (surfaces flakiness the proxy absorbed).
 	Retries       int64           `json:"retries"`
@@ -632,7 +629,6 @@ func (c *statsCollector) snapshot() statsSnapshot {
 		RequestMetrics:       requestMetricRows(c.requestMetrics),
 		TokenMetrics:         tokenMetricRows(c.tokenMetrics),
 		UpstreamErrorMetrics: upstreamErrorMetricRows(c.upstreamErrorMetric),
-		LatencyBuckets:       c.latencyBucketSnapshot(),
 		Retries:              c.retries,
 		RetriesByCode:        retriesRows(c.retriesByCode, true),
 		RetryMetrics:         retryMetricRows(c.retryMetrics),
@@ -697,15 +693,6 @@ func inflightMetricRows(m map[string]int64) []statsInflightMetric {
 		out = append(out, statsInflightMetric{Provider: metricProviderLabel(provider), Count: count})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Provider < out[j].Provider })
-	return out
-}
-
-// latencyBucketSnapshot returns cumulative histogram bucket counts. Caller holds c.mu.
-func (c *statsCollector) latencyBucketSnapshot() []statsLatencyBucket {
-	out := make([]statsLatencyBucket, 0, len(statsLatencyBucketBounds))
-	for i, bucket := range statsLatencyBucketBounds {
-		out = append(out, statsLatencyBucket{Le: bucket.label, Count: c.latencyBuckets[i]})
-	}
 	return out
 }
 

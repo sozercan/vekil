@@ -107,12 +107,6 @@ func (s *RequestSummary) seedEndpoint(endpoint string) {
 	}
 }
 
-func SeedRequestSummaryEndpoint(ctx context.Context, endpoint string) {
-	if summary := RequestSummaryFromContext(ctx); summary != nil {
-		summary.seedEndpoint(endpoint)
-	}
-}
-
 func SeedRequestSummaryEndpointForRoute(ctx context.Context, method, path string) {
 	if summary := RequestSummaryFromContext(ctx); summary != nil {
 		summary.seedEndpoint(inferenceEndpointLabel(method, path))
