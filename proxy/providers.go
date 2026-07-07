@@ -2414,7 +2414,7 @@ func buildProviderEndpointRuntimes(providerID string, kind providerType, cfg Pro
 			return nil, nil, nil, "", fmt.Errorf("provider %q endpoint %q: %w", providerID, name, err)
 		}
 		runtime := &providerEndpointRuntime{
-			endpoint: selector.Endpoint{Name: name, BaseURL: baseURL, Key: apiKey, Weight: raw.Weight, Healthy: true},
+			endpoint: selector.Endpoint{Name: name, BaseURL: baseURL, Weight: raw.Weight, Healthy: true},
 			apiKey:   apiKey,
 			health:   newEndpointHealthTracker(healthCfg),
 		}
