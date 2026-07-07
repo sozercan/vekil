@@ -233,15 +233,15 @@ func (a *Authenticator) Status() AuthStatus {
 	return status
 }
 
-// hasAccessTokenStored returns true when the Vekil-managed access token exists
-// and is non-empty. Must NOT be called with the write lock held.
+// hasAccessTokenStored is a fast, side-effect-free check of file fallback state.
+// It intentionally does not query the OS keyring; token loading is responsible
+// for keyring reads/migration.
 func (a *Authenticator) hasAccessTokenStored() bool {
 	return a.store().Exists(accessTokenSecretName)
 }
 
-// hasValidCopilotTokenStored returns true when the persisted Copilot token
-// exists, is valid JSON, and has not expired yet. Must NOT be called with the
-// write lock held.
+// hasValidCopilotTokenStored is a fast, side-effect-free check of file fallback
+// state. It intentionally does not query the OS keyring.
 func (a *Authenticator) hasValidCopilotTokenStored() bool {
 	data, err := a.store().Get(copilotTokenSecretName)
 	if err != nil {

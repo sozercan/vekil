@@ -102,7 +102,7 @@ Zero-config startup and explicit `type: "copilot"` providers need GitHub Copilot
 
 If none are available, first startup starts GitHub's device-code flow after binding the HTTP listener. During that one-time login window, `/healthz` is available for liveness probes and `/readyz` remains `not_ready` until authentication and upstream probing succeed. You can also run `vekil login` ahead of time, `vekil login --force` for a fresh device-code sign-in, or `vekil logout` to clear Vekil-managed auth and disable silent GitHub CLI reuse.
 
-Vekil-managed device-code credentials are stored in the system secret store by default. Legacy token files are migrated into the secret store on first use and removed. Use `VEKIL_SECRET_STORE=file` only when running in a headless/test environment without an OS keyring.
+Vekil-managed device-code credentials are stored in the system secret store by default. Legacy token files are migrated into the secret store on first real token load and removed. If the OS keyring is unavailable, Vekil falls back to the legacy token files automatically; use `VEKIL_SECRET_STORE=file` to force file storage in headless/test environments.
 
 ### Azure OpenAI and Microsoft Foundry
 

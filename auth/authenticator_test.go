@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1596,5 +1597,103 @@ func TestKeyringCredentialStoreMigratesLegacyAccessTokenFile(t *testing.T) {
 	}
 	if reloaded.accessToken != "legacy-token" {
 		t.Fatalf("reloaded accessToken = %q", reloaded.accessToken)
+	}
+}
+
+func TestKeyringCredentialStoreMissingEntryIsNotExist(t *testing.T) {
+	keyring.MockInit()
+	t.Setenv(credentialStoreEnv, "")
+	a, err := NewAuthenticator(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewAuthenticator() error = %v", err)
+	}
+	if err := a.loadAccessToken(); !os.IsNotExist(err) {
+		t.Fatalf("loadAccessToken() error = %v, want os.IsNotExist", err)
+	}
+}
+
+func TestKeyringCredentialStoreUnavailableFallsBackToLegacyFile(t *testing.T) {
+	keyring.MockInitWithError(errors.New("keyring unavailable"))
+	t.Setenv(credentialStoreEnv, "")
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("legacy-token"), 0o600); err != nil {
+		t.Fatalf("write legacy token: %v", err)
+	}
+	a, err := NewAuthenticator(dir)
+	if err != nil {
+		t.Fatalf("NewAuthenticator() error = %v", err)
+	}
+	if err := a.loadAccessToken(); err != nil {
+		t.Fatalf("loadAccessToken() error = %v", err)
+	}
+	if a.accessToken != "legacy-token" {
+		t.Fatalf("accessToken = %q", a.accessToken)
+	}
+}
+
+func TestKeyringCredentialStoreWriteFallsBackToFileWhenUnavailable(t *testing.T) {
+	keyring.MockInitWithError(errors.New("keyring unavailable"))
+	t.Setenv(credentialStoreEnv, "")
+	dir := t.TempDir()
+	a, err := NewAuthenticator(dir)
+	if err != nil {
+		t.Fatalf("NewAuthenticator() error = %v", err)
+	}
+	a.accessToken = "fallback-token"
+	if err := a.saveAccessToken(); err != nil {
+		t.Fatalf("saveAccessToken() error = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "access-token"))
+	if err != nil {
+		t.Fatalf("read fallback token file: %v", err)
+	}
+	if strings.TrimSpace(string(data)) != "fallback-token" {
+		t.Fatalf("fallback file = %q", data)
+	}
+}
+
+func TestKeyringCredentialStoreScopesEntriesByTokenDir(t *testing.T) {
+	keyring.MockInit()
+	t.Setenv(credentialStoreEnv, "")
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	a, err := NewAuthenticator(dirA)
+	if err != nil {
+		t.Fatalf("NewAuthenticator(A) error = %v", err)
+	}
+	a.accessToken = "token-a"
+	if err := a.saveAccessToken(); err != nil {
+		t.Fatalf("saveAccessToken(A) error = %v", err)
+	}
+	b, err := NewAuthenticator(dirB)
+	if err != nil {
+		t.Fatalf("NewAuthenticator(B) error = %v", err)
+	}
+	if err := b.loadAccessToken(); !os.IsNotExist(err) {
+		t.Fatalf("loadAccessToken(B) error = %v, want missing scoped credential", err)
+	}
+}
+
+func TestStatusDoesNotMigrateLegacyTokenToKeyring(t *testing.T) {
+	keyring.MockInit()
+	t.Setenv(credentialStoreEnv, "")
+	dir := t.TempDir()
+	legacyPath := filepath.Join(dir, "access-token")
+	if err := os.WriteFile(legacyPath, []byte("legacy-token"), 0o600); err != nil {
+		t.Fatalf("write legacy token: %v", err)
+	}
+	a, err := NewAuthenticator(dir)
+	if err != nil {
+		t.Fatalf("NewAuthenticator() error = %v", err)
+	}
+	status := a.Status()
+	if !status.HasVekilAccessToken || !status.SignedIn {
+		t.Fatalf("Status() = %+v, want file-backed signed-in status", status)
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("legacy token should remain after Status(): %v", err)
+	}
+	if _, err := keyring.Get(credentialStoreService, a.store().(keyringCredentialStore).key(accessTokenSecretName)); !errors.Is(err, keyring.ErrNotFound) {
+		t.Fatalf("Status() migrated token to keyring, err=%v", err)
 	}
 }

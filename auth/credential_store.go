@@ -1,8 +1,9 @@
 package auth
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,44 +67,57 @@ func newDefaultCredentialStore(tokenDir string) credentialStore {
 	return keyringCredentialStore{fallback: fileCredentialStore{dir: tokenDir}}
 }
 
+func (s keyringCredentialStore) key(name string) string {
+	dir := s.fallback.dir
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	sum := sha256.Sum256([]byte(dir))
+	return name + ":" + hex.EncodeToString(sum[:8])
+}
+
 func (s keyringCredentialStore) Get(name string) ([]byte, error) {
-	secret, err := keyring.Get(credentialStoreService, name)
+	secret, err := keyring.Get(credentialStoreService, s.key(name))
 	if err == nil {
 		return []byte(secret), nil
 	}
-	if !errors.Is(err, keyring.ErrNotFound) {
-		return nil, err
-	}
+
 	legacy, legacyErr := s.fallback.Get(name)
-	if legacyErr != nil {
-		return nil, err
-	}
-	if strings.TrimSpace(string(legacy)) == "" {
-		return nil, err
-	}
-	if setErr := s.Set(name, legacy); setErr != nil {
+	if legacyErr == nil && strings.TrimSpace(string(legacy)) != "" {
+		if setErr := keyring.Set(credentialStoreService, s.key(name), string(legacy)); setErr == nil {
+			_ = s.fallback.Delete(name)
+		}
 		return legacy, nil
 	}
-	_ = s.fallback.Delete(name)
-	return legacy, nil
+
+	if errors.Is(err, keyring.ErrNotFound) {
+		return nil, os.ErrNotExist
+	}
+	// If the OS keyring backend is unavailable, treat an absent fallback file as no
+	// stored credential. This keeps headless/container startup on the old
+	// unauthenticated path instead of failing before device/env auth can proceed.
+	return nil, os.ErrNotExist
 }
 
 func (s keyringCredentialStore) Set(name string, data []byte) error {
-	if err := keyring.Set(credentialStoreService, name, string(data)); err != nil {
-		return fmt.Errorf("system secret store: %w", err)
+	if err := keyring.Set(credentialStoreService, s.key(name), string(data)); err != nil {
+		return s.fallback.Set(name, data)
 	}
 	_ = s.fallback.Delete(name)
 	return nil
 }
 
 func (s keyringCredentialStore) Delete(name string) error {
-	if err := keyring.Delete(credentialStoreService, name); err != nil && !errors.Is(err, keyring.ErrNotFound) {
-		return fmt.Errorf("system secret store: %w", err)
+	if err := keyring.Delete(credentialStoreService, s.key(name)); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+		// Best effort: locked/unavailable keyrings should not make logout fail or
+		// prevent cleanup of file fallback credentials.
 	}
 	return s.fallback.Delete(name)
 }
 
 func (s keyringCredentialStore) Exists(name string) bool {
-	data, err := s.Get(name)
-	return err == nil && strings.TrimSpace(string(data)) != ""
+	// Status checks must be fast and side-effect-free: do not touch the OS
+	// keyring here because desktop keyrings can block, prompt, or trigger legacy
+	// migration from a nominally read-only status refresh.
+	return s.fallback.Exists(name)
 }
