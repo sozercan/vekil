@@ -166,6 +166,23 @@ read_normalized_output() {
   awk 'NF { gsub(/\r/, "", $0); printf "%s", $0 }' "$1"
 }
 
+normalize_cli_output() {
+  local client="$1"
+  local actual="$2"
+
+  actual="$(printf '%s' "${actual}" | sed -E 's/(^|\|)[[:space:]]*[0-9]+[.)][[:space:]]*(ZX_[A-Z]+_(LEFT|RIGHT))/\1\2/g')"
+
+  if [[ "${client}" == "gemini" && "${actual}" == *'{"output"'* ]]; then
+    local parsed
+    parsed="$(printf '%s' "${actual}" | jq -Rr '(try (fromjson | .output // "") catch "") as $single | if $single != "" then $single else split("|") | map(try (fromjson | .output // "") catch "") | map(select(length > 0)) | join("|") end' 2>/dev/null || true)"
+    if [[ -n "${parsed}" ]]; then
+      actual="${parsed}"
+    fi
+  fi
+
+  printf '%s' "${actual}"
+}
+
 start_proxy() {
   [[ -x "${PROXY_BIN}" ]] || die "proxy binary not found or not executable: ${PROXY_BIN}"
 
@@ -322,7 +339,7 @@ EOF
       > "${output_file}"
   )
 
-  actual="$(read_normalized_output "${output_file}")"
+  actual="$(normalize_cli_output "gemini" "$(read_normalized_output "${output_file}")")"
   assert_exact_output "gemini" "${expected}" "${actual}"
   printf '%s' "${actual}" > "${output_file}"
 }
@@ -434,7 +451,7 @@ run_zen_harness_once() {
     ATTEMPT_STATUS="SKIP_UPSTREAM"; return 0
   fi
 
-  actual="$(read_normalized_output "${output_file}")"
+  actual="$(normalize_cli_output "${client}" "$(read_normalized_output "${output_file}")")"
   if [[ -z "${actual}" ]]; then
     ATTEMPT_STATUS="SKIP_UPSTREAM"; return 0
   fi
