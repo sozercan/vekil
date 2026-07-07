@@ -166,6 +166,43 @@ read_normalized_output() {
   awk 'NF { gsub(/\r/, "", $0); printf "%s", $0 }' "$1"
 }
 
+# Gemini CLI >=0.5 may wrap text output in {"output":"..."} JSON per response
+# part.  Unwrap each pipe-delimited segment that is valid JSON with an .output
+# field, then rejoin so the assertion matches the expected plain-text payload.
+read_gemini_normalized_output() {
+  local raw
+  raw="$(read_normalized_output "$1")"
+  if [[ -z "${raw}" ]]; then
+    return
+  fi
+  # Fast path: no JSON wrapping detected
+  if ! printf '%s' "${raw}" | grep -q '{'; then
+    printf '%s' "${raw}"
+    return
+  fi
+  # Try whole-output unwrap first: {"output":"LEFT|RIGHT"}
+  local whole
+  whole="$(printf '%s' "${raw}" | jq -r '.output // empty' 2>/dev/null)" || whole=""
+  if [[ -n "${whole}" ]]; then
+    printf '%s' "${whole}"
+    return
+  fi
+  # Per-segment unwrap: {"output":"LEFT"}|{"output":"RIGHT"}
+  local IFS='|'
+  local parts=()
+  read -ra parts <<< "${raw}"
+  local result="" seg unwrapped
+  for seg in "${parts[@]}"; do
+    unwrapped="$(printf '%s' "${seg}" | jq -r '.output // empty' 2>/dev/null)" || unwrapped=""
+    if [[ -n "${unwrapped}" ]]; then
+      result="${result:+${result}|}${unwrapped}"
+    else
+      result="${result:+${result}|}${seg}"
+    fi
+  done
+  printf '%s' "${result}"
+}
+
 start_proxy() {
   [[ -x "${PROXY_BIN}" ]] || die "proxy binary not found or not executable: ${PROXY_BIN}"
 
@@ -322,7 +359,7 @@ EOF
       > "${output_file}"
   )
 
-  actual="$(read_normalized_output "${output_file}")"
+  actual="$(read_gemini_normalized_output "${output_file}")"
   assert_exact_output "gemini" "${expected}" "${actual}"
   printf '%s' "${actual}" > "${output_file}"
 }
@@ -434,7 +471,11 @@ run_zen_harness_once() {
     ATTEMPT_STATUS="SKIP_UPSTREAM"; return 0
   fi
 
-  actual="$(read_normalized_output "${output_file}")"
+  if [[ "${client}" == "gemini" ]]; then
+    actual="$(read_gemini_normalized_output "${output_file}")"
+  else
+    actual="$(read_normalized_output "${output_file}")"
+  fi
   if [[ -z "${actual}" ]]; then
     ATTEMPT_STATUS="SKIP_UPSTREAM"; return 0
   fi
