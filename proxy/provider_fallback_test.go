@@ -435,3 +435,47 @@ func TestResponsesFallbackAttributesUsageToBackupProvider(t *testing.T) {
 		t.Fatalf("summary provider = %q, want backup", summary.provider)
 	}
 }
+
+func TestResponsesStreamModelLineRewrite(t *testing.T) {
+	line := "data: {\"type\":\"response.created\",\"model\":\"backup-upstream\"}\n"
+	rewritten := rewriteResponsesSSEModelLine(line, "gpt-primary")
+	if !strings.Contains(rewritten, `"model":"gpt-primary"`) {
+		t.Fatalf("rewritten line = %q, want public model", rewritten)
+	}
+}
+
+func TestNormalizeResponsesModelResponseLeavesOversizedBodyStreaming(t *testing.T) {
+	body := strings.Repeat("x", usageSniffMaxBuffer+2)
+	resp := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
+	got := normalizeResponsesModelResponse(resp, "public", "upstream")
+	read, err := io.ReadAll(got.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if string(read) != body {
+		t.Fatalf("oversized body changed, got len %d want %d", len(read), len(body))
+	}
+}
+
+func TestChatFallbackAttributesUsageToBackupProvider(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-ok","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
+	}))
+	defer backup.Close()
+	handler := newFallbackTestHandler(t, primary.URL, backup.URL)
+	ctx, summary := WithRequestSummary(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-primary","messages":[{"role":"user","content":"hi"}]}`)).WithContext(ctx)
+	w := httptest.NewRecorder()
+	handler.HandleOpenAIChatCompletions(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if summary.provider != "backup" {
+		t.Fatalf("summary provider = %q, want backup", summary.provider)
+	}
+}

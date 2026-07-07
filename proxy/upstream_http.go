@@ -40,6 +40,9 @@ func (h *ProxyHandler) newInferenceUpstreamContextFrom(inbound context.Context, 
 	if isRetryStatsTracked(inbound) {
 		ctx = markRetryStatsTracked(ctx)
 	}
+	if summary := RequestSummaryFromContext(inbound); summary != nil {
+		ctx = contextWithRequestSummary(ctx, summary)
+	}
 	return ctx, cancel
 }
 
@@ -213,7 +216,10 @@ func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body [
 }
 
 func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	resp, _, _, err := h.postJSONEndpointWithHeadersTracked(ctx, path, body, extraHeaders)
+	resp, selectedOwner, _, err := h.postJSONEndpointWithHeadersTracked(ctx, path, body, extraHeaders)
+	if err == nil {
+		h.observeSelectedProvider(ctx, selectedOwner)
+	}
 	return resp, err
 }
 

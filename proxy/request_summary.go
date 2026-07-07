@@ -61,6 +61,13 @@ func WithRequestSummary(ctx context.Context) (context.Context, *RequestSummary) 
 
 // RequestSummaryFromContext returns the mutable request summary attached to ctx,
 // if any.
+func contextWithRequestSummary(ctx context.Context, summary *RequestSummary) context.Context {
+	if summary == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, requestSummaryContextKey{}, summary)
+}
+
 func RequestSummaryFromContext(ctx context.Context) *RequestSummary {
 	if ctx == nil {
 		return nil

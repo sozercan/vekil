@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -169,6 +170,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	if prepared.streaming && resp.StatusCode == http.StatusOK {
 		model := extractRequestModel(prepared.body)
+		resp = normalizeResponsesStreamModelResponse(resp, model, selectedOwner.upstreamModel)
 		peekAndForwardResponses(h, w, r, resp, upstreamCancel, model, prepared.headerToolScope)
 		return
 	}
@@ -3357,34 +3359,105 @@ func normalizeResponsesModelResponse(resp *http.Response, publicModel, upstreamM
 	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK || strings.TrimSpace(publicModel) == "" || strings.TrimSpace(publicModel) == strings.TrimSpace(upstreamModel) {
 		return resp
 	}
-	body, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
+	prefix, err := io.ReadAll(io.LimitReader(resp.Body, usageSniffMaxBuffer+1))
 	if err != nil {
-		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.Body = io.NopCloser(bytes.NewReader(prefix))
 		return resp
 	}
+	if len(prefix) > usageSniffMaxBuffer {
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{Reader: io.MultiReader(bytes.NewReader(prefix), resp.Body), Closer: resp.Body}
+		return resp
+	}
+	_ = resp.Body.Close()
 	var payload map[string]json.RawMessage
-	if err := json.Unmarshal(body, &payload); err != nil {
-		resp.Body = io.NopCloser(bytes.NewReader(body))
+	if err := json.Unmarshal(prefix, &payload); err != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(prefix))
 		return resp
 	}
 	if rawJSONString(payload["model"]) == "" {
-		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.Body = io.NopCloser(bytes.NewReader(prefix))
 		return resp
 	}
 	raw, err := json.Marshal(publicModel)
 	if err != nil {
-		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.Body = io.NopCloser(bytes.NewReader(prefix))
 		return resp
 	}
 	payload["model"] = raw
 	rewritten, err := json.Marshal(payload)
 	if err != nil {
-		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.Body = io.NopCloser(bytes.NewReader(prefix))
 		return resp
 	}
 	resp.Header.Del("Content-Length")
 	resp.Header.Set("Content-Length", strconv.Itoa(len(rewritten)))
 	resp.Body = io.NopCloser(bytes.NewReader(rewritten))
 	return resp
+}
+
+func normalizeResponsesStreamModelResponse(resp *http.Response, publicModel, upstreamModel string) *http.Response {
+	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK || strings.TrimSpace(publicModel) == "" || strings.TrimSpace(publicModel) == strings.TrimSpace(upstreamModel) {
+		return resp
+	}
+	resp.Body = newResponsesModelRewriteReadCloser(resp.Body, publicModel)
+	resp.Header.Del("Content-Length")
+	return resp
+}
+
+func newResponsesModelRewriteReadCloser(body io.ReadCloser, publicModel string) io.ReadCloser {
+	pr, pw := io.Pipe()
+	go func() {
+		defer func() { _ = body.Close() }()
+		reader := bufio.NewReader(body)
+		for {
+			line, err := reader.ReadString('\n')
+			if line != "" {
+				_, writeErr := io.WriteString(pw, rewriteResponsesSSEModelLine(line, publicModel))
+				if writeErr != nil {
+					_ = pw.CloseWithError(writeErr)
+					return
+				}
+			}
+			if err != nil {
+				if err == io.EOF {
+					_ = pw.Close()
+				} else {
+					_ = pw.CloseWithError(err)
+				}
+				return
+			}
+		}
+	}()
+	return pr
+}
+
+func rewriteResponsesSSEModelLine(line, publicModel string) string {
+	trimmed := strings.TrimPrefix(line, "data:")
+	if trimmed == line || len(line) > responsesFailureTapMaxBuffer {
+		return line
+	}
+	prefixLen := len(line) - len(trimmed)
+	leading := len(trimmed) - len(strings.TrimLeft(trimmed, " 	"))
+	jsonPart := strings.TrimRight(trimmed[leading:], "\r\n")
+	lineEnding := line[prefixLen+leading+len(jsonPart):]
+	if jsonPart == "" || jsonPart == "[DONE]" {
+		return line
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(jsonPart), &payload); err != nil || rawJSONString(payload["model"]) == "" {
+		return line
+	}
+	raw, err := json.Marshal(publicModel)
+	if err != nil {
+		return line
+	}
+	payload["model"] = raw
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return line
+	}
+	return line[:prefixLen+leading] + string(rewritten) + lineEnding
 }
