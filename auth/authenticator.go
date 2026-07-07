@@ -57,11 +57,12 @@ var (
 // It handles the device code flow, token caching to disk, and automatic
 // refresh using a read-write mutex for concurrent access.
 type Authenticator struct {
-	tokenDir     string
-	accessToken  string
-	copilotToken string
-	tokenExpiry  time.Time
-	mu           sync.RWMutex
+	tokenDir        string
+	credentialStore credentialStore
+	accessToken     string
+	copilotToken    string
+	tokenExpiry     time.Time
+	mu              sync.RWMutex
 
 	// deviceFlowMu serializes interactive logins without blocking readers that
 	// only want to know whether non-interactive credentials are already usable.
@@ -162,9 +163,10 @@ func NewAuthenticator(tokenDir string) (*Authenticator, error) {
 	}
 
 	return &Authenticator{
-		tokenDir:     tokenDir,
-		client:       newAuthHTTPClient(30*time.Second, true),
-		directClient: newAuthHTTPClient(30*time.Second, false),
+		tokenDir:        tokenDir,
+		credentialStore: newDefaultCredentialStore(tokenDir),
+		client:          newAuthHTTPClient(30*time.Second, true),
+		directClient:    newAuthHTTPClient(30*time.Second, false),
 	}, nil
 }
 
@@ -183,8 +185,8 @@ func (a *Authenticator) Status() AuthStatus {
 		SignedOut:           a.hasSignedOutMarker(),
 	}
 
-	status.HasVekilAccessToken = a.hasAccessTokenOnDisk()
-	status.HasValidCopilotCache = a.hasValidCopilotTokenOnDisk()
+	status.HasVekilAccessToken = a.hasAccessTokenStored()
+	status.HasValidCopilotCache = a.hasValidCopilotTokenStored()
 
 	a.mu.RLock()
 	memoryAccessToken := strings.TrimSpace(a.accessToken) != ""
@@ -231,21 +233,17 @@ func (a *Authenticator) Status() AuthStatus {
 	return status
 }
 
-// hasAccessTokenOnDisk returns true when the access-token file exists and is
-// non-empty. Must NOT be called with the write lock held.
-func (a *Authenticator) hasAccessTokenOnDisk() bool {
-	data, err := os.ReadFile(filepath.Join(a.tokenDir, "access-token"))
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(data)) != ""
+// hasAccessTokenStored returns true when the Vekil-managed access token exists
+// and is non-empty. Must NOT be called with the write lock held.
+func (a *Authenticator) hasAccessTokenStored() bool {
+	return a.store().Exists(accessTokenSecretName)
 }
 
-// hasValidCopilotTokenOnDisk returns true when the persisted Copilot token file
+// hasValidCopilotTokenStored returns true when the persisted Copilot token
 // exists, is valid JSON, and has not expired yet. Must NOT be called with the
 // write lock held.
-func (a *Authenticator) hasValidCopilotTokenOnDisk() bool {
-	data, err := os.ReadFile(filepath.Join(a.tokenDir, "api-key.json"))
+func (a *Authenticator) hasValidCopilotTokenStored() bool {
+	data, err := a.store().Get(copilotTokenSecretName)
 	if err != nil {
 		return false
 	}
@@ -575,8 +573,8 @@ func (a *Authenticator) SignOut() error {
 	a.tokenExpiry = time.Time{}
 
 	var errs []error
-	for _, name := range []string{"access-token", "api-key.json"} {
-		if err := os.Remove(filepath.Join(a.tokenDir, name)); err != nil && !os.IsNotExist(err) {
+	for _, name := range []string{accessTokenSecretName, copilotTokenSecretName} {
+		if err := a.store().Delete(name); err != nil {
 			errs = append(errs, fmt.Errorf("remove %s: %w", name, err))
 		}
 	}
@@ -612,8 +610,8 @@ func (a *Authenticator) SignInWithGitHubCLI(ctx context.Context) error {
 		a.tokenExpiry = previousTokenExpiry
 		return err
 	}
-	for _, name := range []string{"access-token", "api-key.json"} {
-		if err := os.Remove(filepath.Join(a.tokenDir, name)); err != nil && !os.IsNotExist(err) {
+	for _, name := range []string{accessTokenSecretName, copilotTokenSecretName} {
+		if err := a.store().Delete(name); err != nil {
 			return fmt.Errorf("removing stale %s: %w", name, err)
 		}
 	}
@@ -898,8 +896,15 @@ func isLoopbackProxyHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+func (a *Authenticator) store() credentialStore {
+	if a.credentialStore != nil {
+		return a.credentialStore
+	}
+	return newFileCredentialStore(a.tokenDir)
+}
+
 func (a *Authenticator) loadAccessToken() error {
-	data, err := os.ReadFile(filepath.Join(a.tokenDir, "access-token"))
+	data, err := a.store().Get(accessTokenSecretName)
 	if err != nil {
 		return err
 	}
@@ -1052,11 +1057,11 @@ func githubCLIEnvironment() []string {
 }
 
 func (a *Authenticator) saveAccessToken() error {
-	return atomicWriteFile(filepath.Join(a.tokenDir, "access-token"), []byte(a.accessToken), 0o600)
+	return a.store().Set(accessTokenSecretName, []byte(a.accessToken))
 }
 
 func (a *Authenticator) loadCopilotToken() error {
-	data, err := os.ReadFile(filepath.Join(a.tokenDir, "api-key.json"))
+	data, err := a.store().Get(copilotTokenSecretName)
 	if err != nil {
 		return err
 	}
@@ -1080,7 +1085,7 @@ func (a *Authenticator) saveCopilotToken() error {
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(filepath.Join(a.tokenDir, "api-key.json"), data, 0o600)
+	return a.store().Set(copilotTokenSecretName, data)
 }
 
 func lookupAccessTokenFromEnv() (string, string) {

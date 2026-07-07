@@ -102,6 +102,8 @@ Zero-config startup and explicit `type: "copilot"` providers need GitHub Copilot
 
 If none are available, first startup starts GitHub's device-code flow after binding the HTTP listener. During that one-time login window, `/healthz` is available for liveness probes and `/readyz` remains `not_ready` until authentication and upstream probing succeed. You can also run `vekil login` ahead of time, `vekil login --force` for a fresh device-code sign-in, or `vekil logout` to clear Vekil-managed auth and disable silent GitHub CLI reuse.
 
+Vekil-managed device-code credentials are stored in the system secret store by default. Legacy token files are migrated into the secret store on first use and removed. Use `VEKIL_SECRET_STORE=file` only when running in a headless/test environment without an OS keyring.
+
 ### Azure OpenAI and Microsoft Foundry
 
 Configure Azure credentials in the provider entry. Use `api_key`/`api_key_env` for key auth, or set `auth_mode: azure_identity` to use Microsoft Entra auth through the Azure SDK `DefaultAzureCredential` chain. Vekil does not run `az login` itself; for local SDK auth, sign in with Azure CLI or another supported Azure credential before starting the proxy.

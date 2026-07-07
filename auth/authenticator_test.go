@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/zalando/go-keyring"
 )
 
 func TestGetToken_ReturnsCachedToken(t *testing.T) {
@@ -1534,5 +1536,65 @@ func TestRefreshToken_AutoDeviceFlowReturnsTransientRefreshError(t *testing.T) {
 	}
 	if got := err.Error(); got != "copilot token request failed with status 502: gateway unavailable" {
 		t.Fatalf("unexpected error: %q", got)
+	}
+}
+
+func TestKeyringCredentialStoreSavesTokensOutsideTokenDir(t *testing.T) {
+	keyring.MockInit()
+	t.Setenv(credentialStoreEnv, "")
+	dir := t.TempDir()
+	a, err := NewAuthenticator(dir)
+	if err != nil {
+		t.Fatalf("NewAuthenticator() error = %v", err)
+	}
+	a.accessToken = "persisted-access-token"
+	if err := a.saveAccessToken(); err != nil {
+		t.Fatalf("saveAccessToken() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "access-token")); !os.IsNotExist(err) {
+		t.Fatalf("access-token file exists after keyring save: %v", err)
+	}
+	reloaded, err := NewAuthenticator(dir)
+	if err != nil {
+		t.Fatalf("NewAuthenticator(reloaded) error = %v", err)
+	}
+	if err := reloaded.loadAccessToken(); err != nil {
+		t.Fatalf("loadAccessToken() error = %v", err)
+	}
+	if reloaded.accessToken != "persisted-access-token" {
+		t.Fatalf("accessToken = %q", reloaded.accessToken)
+	}
+}
+
+func TestKeyringCredentialStoreMigratesLegacyAccessTokenFile(t *testing.T) {
+	keyring.MockInit()
+	t.Setenv(credentialStoreEnv, "")
+	dir := t.TempDir()
+	legacyPath := filepath.Join(dir, "access-token")
+	if err := os.WriteFile(legacyPath, []byte("legacy-token"), 0o600); err != nil {
+		t.Fatalf("write legacy token: %v", err)
+	}
+	a, err := NewAuthenticator(dir)
+	if err != nil {
+		t.Fatalf("NewAuthenticator() error = %v", err)
+	}
+	if err := a.loadAccessToken(); err != nil {
+		t.Fatalf("loadAccessToken() error = %v", err)
+	}
+	if a.accessToken != "legacy-token" {
+		t.Fatalf("accessToken = %q", a.accessToken)
+	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy access-token file still exists: %v", err)
+	}
+	reloaded, err := NewAuthenticator(dir)
+	if err != nil {
+		t.Fatalf("NewAuthenticator(reloaded) error = %v", err)
+	}
+	if err := reloaded.loadAccessToken(); err != nil {
+		t.Fatalf("reloaded loadAccessToken() error = %v", err)
+	}
+	if reloaded.accessToken != "legacy-token" {
+		t.Fatalf("reloaded accessToken = %q", reloaded.accessToken)
 	}
 }
