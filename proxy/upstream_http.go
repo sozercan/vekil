@@ -571,7 +571,7 @@ func shouldFallbackToNextProvider(err error) bool {
 	}
 	var providerErr *providerRequestError
 	if errors.As(err, &providerErr) {
-		return providerErr.statusCode >= http.StatusInternalServerError
+		return providerErr.statusCode >= http.StatusInternalServerError && strings.Contains(strings.ToLower(providerErr.err.Error()), "no healthy endpoints")
 	}
 	if permanentTransportError(err) {
 		return false

@@ -458,7 +458,7 @@ func (h *ProxyHandler) initializeProviders() error {
 		return err
 	}
 	h.providersState = setup
-	h.dynamicProviderValidationPending.Store(h.deferDynamicProviderModelRefresh && len(setup.providers) > 1 && hasDynamicProvider(setup.providers))
+	h.dynamicProviderValidationPending.Store(h.deferDynamicProviderModelRefresh && hasDynamicProvider(setup.providers) && (len(setup.providers) > 1 || len(h.providersConfig.Fallbacks) > 0))
 	return nil
 }
 
@@ -489,8 +489,10 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 				return nil, err
 			}
 		}
-		if err := setup.configureFallbackChains(cfg.Fallbacks); err != nil {
-			return nil, err
+		if validateDynamicModels || !hasDynamicProvider(providers) {
+			if err := setup.configureFallbackChains(cfg.Fallbacks); err != nil {
+				return nil, err
+			}
 		}
 		return setup, nil
 	}
@@ -2660,6 +2662,9 @@ func (ps *providerSetup) configureFallbackChains(configs []ProviderFallbackConfi
 				return fmt.Errorf("fallback %q references unknown model %q on provider %q", public, modelID, providerID)
 			}
 			chain = append(chain, model)
+		}
+		if len(chain) > 0 && chain[0].publicID != public {
+			return fmt.Errorf("fallback %q public key must match first chain model %q", public, chain[0].publicID)
 		}
 		chains[public] = chain
 	}

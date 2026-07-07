@@ -107,6 +107,7 @@ func (h *ProxyHandler) postPreparedResponsesRequest(ctx, observeCtx context.Cont
 	if err != nil {
 		return nil, providerModel{}, err
 	}
+	h.observeSelectedProvider(observeCtx, selectedOwner)
 	resp, err = h.maybeRetryCompactedResponsesRequest(ctx, observeCtx, req.body, req.extraHeaders, req.upstreamHeaders, resp)
 	return resp, selectedOwner, err
 }

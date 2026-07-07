@@ -255,3 +255,15 @@ func observeUpstreamHeaders(ctx context.Context, headers http.Header) {
 		summary.setUpstreamRequestID(UpstreamRequestID(headers))
 	}
 }
+
+func (h *ProxyHandler) observeSelectedProvider(ctx context.Context, owner providerModel) {
+	summary := RequestSummaryFromContext(ctx)
+	if summary == nil || strings.TrimSpace(owner.providerID) == "" {
+		return
+	}
+	provider := h.providerSetup().providerByID(owner.providerID)
+	if provider == nil {
+		return
+	}
+	summary.setProvider(provider.id, string(provider.kind))
+}
