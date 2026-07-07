@@ -3,7 +3,6 @@
 package main
 
 import (
-	"errors"
 	"os/exec"
 	"strings"
 )
@@ -14,7 +13,7 @@ func showOsascriptDialog(title, message, defaultButton, secondButton string) str
 	// Use WinForms because it is present on stock Windows desktop installs where
 	// the tray app runs. If PowerShell is unavailable, proceed with the default
 	// action so sign-in can continue via the browser.
-	script := `$title = $args[0]; $message = $args[1]; Add-Type -AssemblyName System.Windows.Forms; $result = [System.Windows.Forms.MessageBox]::Show($message, $title, [System.Windows.Forms.MessageBoxButtons]::OKCancel, [System.Windows.Forms.MessageBoxIcon]::Information); if ($result -eq [System.Windows.Forms.DialogResult]::OK) { "OK" } else { "Cancel" }`
+	script := `& { param($title, $message) Add-Type -AssemblyName System.Windows.Forms; $result = [System.Windows.Forms.MessageBox]::Show($message, $title, [System.Windows.Forms.MessageBoxButtons]::OKCancel, [System.Windows.Forms.MessageBoxIcon]::Information); if ($result -eq [System.Windows.Forms.DialogResult]::OK) { "OK" } else { "Cancel" } }`
 	out, err := powershellCommand("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script, title, message).Output()
 	if err != nil {
 		return defaultButton
@@ -26,8 +25,12 @@ func showOsascriptDialog(title, message, defaultButton, secondButton string) str
 }
 
 func showErrorDialog(title, message string) {
-	script := `$title = $args[0]; $message = $args[1]; Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show($message, $title, [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null`
-	_ = powershellCommand("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script, title, message).Run()
+	showWindowsMessageBox(title, message, "Error")
+}
+
+func showWindowsMessageBox(title, message, icon string) {
+	script := `& { param($title, $message, $icon) Add-Type -AssemblyName System.Windows.Forms; $boxIcon = [System.Windows.Forms.MessageBoxIcon]::$icon; [System.Windows.Forms.MessageBox]::Show($message, $title, [System.Windows.Forms.MessageBoxButtons]::OK, $boxIcon) | Out-Null }`
+	_ = powershellCommand("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script, title, message, icon).Run()
 }
 
 func chooseProvidersConfigPath() (string, error) {
@@ -44,7 +47,7 @@ func chooseProvidersConfigPath() (string, error) {
 }
 
 func copyToClipboard(text string) {
-	cmd := powershellCommand("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "Set-Clipboard -Value $args[0]", text)
+	cmd := powershellCommand("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", `& { param($text) Set-Clipboard -Value $text }`, text)
 	_ = cmd.Run()
 }
 
@@ -59,9 +62,5 @@ func showNotification(title, message string) {
 	if strings.TrimSpace(title) == "" && strings.TrimSpace(message) == "" {
 		return
 	}
-	showErrorDialog(title, message)
-}
-
-func isDialogCancel(err error) bool {
-	return errors.Is(err, errDialogCanceled)
+	showWindowsMessageBox(title, message, "Information")
 }
