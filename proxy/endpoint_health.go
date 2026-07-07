@@ -123,9 +123,10 @@ func (h *endpointHealthTracker) recordFailure(now time.Time) bool {
 		}
 	}
 	h.failures = append(kept, now)
-	if h.latencyEWMA == 0 {
-		h.latencyEWMA = time.Hour
-	}
+	// Deprioritize failed endpoints for least-latency selection immediately, not
+	// only after quarantine, so retries can move to healthy siblings within the
+	// same request even when the error budget is larger than the retry count.
+	h.latencyEWMA = time.Hour
 	if len(h.failures) >= h.cfg.errorBudget.Limit {
 		h.quarantinedUntil = now.Add(h.cfg.cooldown)
 		h.failures = nil

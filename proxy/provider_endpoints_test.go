@@ -467,3 +467,52 @@ func TestCopilotReadyzUsesNonInteractiveAuthForUnkeyedEndpoint(t *testing.T) {
 		t.Fatalf("Authorization = %q, want non-interactive default token", got)
 	}
 }
+
+func TestLeastLatencyRotatesAfterPreviouslyFastEndpointFails(t *testing.T) {
+	var eastHits atomic.Int32
+	east := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		eastHits.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer east.Close()
+	var westHits atomic.Int32
+	west := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		westHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-ok","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer west.Close()
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "multi",
+			Type:     "openai-compatible",
+			Default:  true,
+			AuthType: "none",
+			Selector: "least_latency",
+			Endpoints: []ProviderEndpointConfig{
+				{Name: "east", BaseURL: east.URL},
+				{Name: "west", BaseURL: west.URL},
+			},
+			Models: []ProviderModelConfig{{PublicID: "gpt-public", Deployment: "gpt-upstream", Endpoints: []string{providerEndpointChatCompletions}}},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	handler.maxRetries = 2
+	handler.retryBaseDelay = time.Millisecond
+	provider := handler.providerSetup().providerByID("multi")
+	provider.endpointByName["east"].health.recordSuccess(time.Millisecond)
+	provider.endpointByName["west"].health.recordSuccess(20 * time.Millisecond)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-public","messages":[{"role":"user","content":"hi"}]}`))
+	w := httptest.NewRecorder()
+	handler.HandleOpenAIChatCompletions(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if eastHits.Load() != 1 || westHits.Load() != 1 {
+		t.Fatalf("hits east/west = %d/%d, want failover from previously-fast east to west", eastHits.Load(), westHits.Load())
+	}
+}
