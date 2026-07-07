@@ -885,7 +885,7 @@ func (h *ProxyHandler) IncInflight() {
 		h.stats.incInflight()
 	}
 	if h != nil && h.metrics != nil {
-		h.metrics.IncInflight("")
+		h.metrics.IncInflight()
 	}
 }
 
@@ -895,7 +895,7 @@ func (h *ProxyHandler) DecInflight() {
 		h.stats.decInflight()
 	}
 	if h != nil && h.metrics != nil {
-		h.metrics.DecInflight("")
+		h.metrics.DecInflight()
 	}
 }
 

@@ -172,34 +172,29 @@ func TestMetricsCollector_Record(t *testing.T) {
 func TestMetricsCollector_InflightGauge(t *testing.T) {
 	m := NewMetricsCollector()
 
-	m.IncInflight("copilot")
-	m.IncInflight("copilot")
-	m.IncInflight("azure")
+	m.IncInflight()
+	m.IncInflight()
+	m.IncInflight()
 
 	metrics, err := m.registry.Gather()
 	if err != nil {
 		t.Fatalf("failed to gather metrics: %v", err)
 	}
 
-	copilotInflight := getGaugeValue(metrics, "vekil_inflight_requests", map[string]string{"provider": "copilot"})
-	if copilotInflight != 2 {
-		t.Errorf("inflight(copilot) = %v, want 2", copilotInflight)
+	inflight := getPlainGaugeValue(metrics, "vekil_inflight_requests")
+	if inflight != 3 {
+		t.Errorf("inflight = %v, want 3", inflight)
 	}
 
-	azureInflight := getGaugeValue(metrics, "vekil_inflight_requests", map[string]string{"provider": "azure"})
-	if azureInflight != 1 {
-		t.Errorf("inflight(azure) = %v, want 1", azureInflight)
-	}
-
-	m.DecInflight("copilot")
+	m.DecInflight()
 	metrics, err = m.registry.Gather()
 	if err != nil {
 		t.Fatalf("failed to gather metrics: %v", err)
 	}
 
-	copilotInflight = getGaugeValue(metrics, "vekil_inflight_requests", map[string]string{"provider": "copilot"})
-	if copilotInflight != 1 {
-		t.Errorf("inflight(copilot) after dec = %v, want 1", copilotInflight)
+	inflight = getPlainGaugeValue(metrics, "vekil_inflight_requests")
+	if inflight != 2 {
+		t.Errorf("inflight after dec = %v, want 2", inflight)
 	}
 }
 
@@ -270,8 +265,8 @@ func TestMetricsCollector_NilSafety(t *testing.T) {
 	m.Record(nil, 200, time.Second)
 	m.RecordResponsesTurn("model", "provider", 200, responsesUsage{})
 	m.RecordRetry("p", "m", 429)
-	m.IncInflight("p")
-	m.DecInflight("p")
+	m.IncInflight()
+	m.DecInflight()
 	m.SetBuildInfo("v", "c", "g")
 
 	if m.Handler() != nil {
@@ -304,6 +299,18 @@ func getGaugeValue(families []*io_prometheus_client.MetricFamily, name string, l
 			if matchLabels(m.GetLabel(), labels) {
 				return m.GetGauge().GetValue()
 			}
+		}
+	}
+	return 0
+}
+
+func getPlainGaugeValue(families []*io_prometheus_client.MetricFamily, name string) float64 {
+	for _, mf := range families {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			return m.GetGauge().GetValue()
 		}
 	}
 	return 0

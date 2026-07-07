@@ -188,7 +188,13 @@ func (h *ProxyHandler) logRetryAttempt(ctx context.Context, attempt int, status 
 		h.stats.incRetry(status)
 	}
 	if h != nil && h.metrics != nil && isRetryStatsTracked(ctx) {
-		h.metrics.RecordRetry("", "", status)
+		var provider, model string
+		if summary := RequestSummaryFromContext(ctx); summary != nil {
+			d := readSummaryForStats(summary)
+			provider = d.provider
+			model = d.model
+		}
+		h.metrics.RecordRetry(provider, model, status)
 	}
 	if h == nil || h.log == nil {
 		return

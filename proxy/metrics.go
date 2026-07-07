@@ -21,7 +21,7 @@ type MetricsCollector struct {
 	tokensTotal        *prometheus.CounterVec
 	retriesTotal       *prometheus.CounterVec
 	upstreamErrors     *prometheus.CounterVec
-	inflightRequests   *prometheus.GaugeVec
+	inflightRequests   prometheus.Gauge
 	buildInfo          *prometheus.GaugeVec
 }
 
@@ -54,10 +54,10 @@ func NewMetricsCollector() *MetricsCollector {
 			Name: "vekil_upstream_errors_total",
 			Help: "Total upstream errors, labeled by HTTP status code.",
 		}, []string{"provider", "public_model", "code"}),
-		inflightRequests: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		inflightRequests: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "vekil_inflight_requests",
 			Help: "Number of requests currently being processed.",
-		}, []string{"provider"}),
+		}),
 		buildInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "vekil_build_info",
 			Help: "Build information about the running vekil binary. Always 1.",
@@ -153,20 +153,20 @@ func (m *MetricsCollector) RecordRetry(provider, model string, status int) {
 	m.retriesTotal.WithLabelValues(provider, model, reason).Inc()
 }
 
-// IncInflight increments the in-flight request gauge for the given provider.
-func (m *MetricsCollector) IncInflight(provider string) {
+// IncInflight increments the in-flight request gauge.
+func (m *MetricsCollector) IncInflight() {
 	if m == nil {
 		return
 	}
-	m.inflightRequests.WithLabelValues(provider).Inc()
+	m.inflightRequests.Inc()
 }
 
-// DecInflight decrements the in-flight request gauge for the given provider.
-func (m *MetricsCollector) DecInflight(provider string) {
+// DecInflight decrements the in-flight request gauge.
+func (m *MetricsCollector) DecInflight() {
 	if m == nil {
 		return
 	}
-	m.inflightRequests.WithLabelValues(provider).Dec()
+	m.inflightRequests.Dec()
 }
 
 // Handler returns an http.Handler that serves the Prometheus metrics exposition
@@ -191,6 +191,6 @@ func retryReasonLabel(status int) string {
 	case status >= 500:
 		return "5xx"
 	default:
-		return strconv.Itoa(status)
+		return "other"
 	}
 }

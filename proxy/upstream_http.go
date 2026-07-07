@@ -39,6 +39,11 @@ func (h *ProxyHandler) newInferenceUpstreamContextFrom(inbound context.Context, 
 	if isRetryStatsTracked(inbound) {
 		ctx = markRetryStatsTracked(ctx)
 	}
+	// Propagate the request summary so retry-logging can read provider/model
+	// labels without needing a separate plumbing path.
+	if summary := RequestSummaryFromContext(inbound); summary != nil {
+		ctx = context.WithValue(ctx, requestSummaryContextKey{}, summary)
+	}
 	return ctx, cancel
 }
 

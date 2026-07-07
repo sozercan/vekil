@@ -10,7 +10,7 @@ Vekil exposes a Prometheus-compatible `/metrics` endpoint for scraping by Promet
 |--------|--------|-------------|
 | `vekil_requests_total` | `provider`, `public_model`, `endpoint`, `status` | Total requests processed |
 | `vekil_tokens_total` | `provider`, `public_model`, `direction` | Total tokens (direction: `prompt` or `completion`) |
-| `vekil_retries_total` | `provider`, `public_model`, `reason` | Upstream retry attempts (reason: `429`, `5xx`, `timeout`) |
+| `vekil_retries_total` | `provider`, `public_model`, `reason` | Upstream retry attempts (reason: `429`, `5xx`, `timeout`, `other`) |
 | `vekil_upstream_errors_total` | `provider`, `public_model`, `code` | Upstream errors by HTTP status code |
 
 ### Histograms
@@ -27,7 +27,7 @@ These buckets cover the typical range of LLM inference latencies from 5ms to 10s
 
 | Metric | Labels | Description |
 |--------|--------|-------------|
-| `vekil_inflight_requests` | `provider` | Currently in-flight requests |
+| `vekil_inflight_requests` | — | Currently in-flight requests (global) |
 | `vekil_build_info` | `version`, `go_version`, `commit` | Always 1; useful for dashboard joins |
 
 ### Standard Go Runtime Metrics
@@ -70,7 +70,7 @@ An example Grafana dashboard JSON is provided at [`docs/grafana-dashboard.json`]
 - Latency histograms (p50, p95, p99)
 - Token throughput (prompt vs completion)
 - Retry rate by reason
-- In-flight request gauge
+- In-flight request gauge (global)
 - Build info annotation
 
 ## Label Notes
@@ -80,4 +80,4 @@ An example Grafana dashboard JSON is provided at [`docs/grafana-dashboard.json`]
 - `endpoint`: the internal endpoint type (`chat_completions`, `messages`, `responses`, `responses_ws`, or Gemini action names).
 - `status`: HTTP status code as a string (e.g., `200`, `429`, `500`).
 - `direction`: `prompt` or `completion` for token counters.
-- `reason`: retry trigger category — `429` for rate limits, `5xx` for server errors, `timeout` for transport-level failures.
+- `reason`: retry trigger category — `429` for rate limits, `5xx` for server errors, `timeout` for transport-level failures, `other` for any unexpected status.

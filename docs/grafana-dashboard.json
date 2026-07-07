@@ -135,8 +135,8 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
       "targets": [
         {
-          "expr": "sum(vekil_inflight_requests) by (provider)",
-          "legendFormat": "{{provider}}",
+          "expr": "vekil_inflight_requests",
+          "legendFormat": "inflight",
           "refId": "A"
         }
       ],
