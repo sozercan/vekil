@@ -52,11 +52,12 @@ func parseEndpointErrorBudget(raw string) (endpointErrorBudget, error) {
 }
 
 type endpointHealthTracker struct {
-	mu               sync.Mutex
-	cfg              endpointHealthConfig
-	failures         []time.Time
-	quarantinedUntil time.Time
-	latencyEWMA      time.Duration
+	mu                 sync.Mutex
+	cfg                endpointHealthConfig
+	failures           []time.Time
+	quarantinedUntil   time.Time
+	deprioritizedUntil time.Time
+	latencyEWMA        time.Duration
 }
 
 func newEndpointHealthTracker(cfg endpointHealthConfig) *endpointHealthTracker {
@@ -84,6 +85,12 @@ func (h *endpointHealthTracker) latency() time.Duration {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if !h.deprioritizedUntil.IsZero() && !time.Now().Before(h.deprioritizedUntil) {
+		h.deprioritizedUntil = time.Time{}
+		if h.latencyEWMA >= time.Hour {
+			h.latencyEWMA = 0
+		}
+	}
 	return h.latencyEWMA
 }
 
@@ -98,6 +105,10 @@ func (h *endpointHealthTracker) recordSuccess(latency time.Duration) {
 			return
 		}
 		h.quarantinedUntil = time.Time{}
+		h.deprioritizedUntil = time.Time{}
+		if h.latencyEWMA >= time.Hour {
+			h.latencyEWMA = 0
+		}
 	}
 	if latency <= 0 {
 		return
@@ -127,8 +138,10 @@ func (h *endpointHealthTracker) recordFailure(now time.Time) bool {
 	// only after quarantine, so retries can move to healthy siblings within the
 	// same request even when the error budget is larger than the retry count.
 	h.latencyEWMA = time.Hour
+	h.deprioritizedUntil = now.Add(h.cfg.cooldown)
 	if len(h.failures) >= h.cfg.errorBudget.Limit {
 		h.quarantinedUntil = now.Add(h.cfg.cooldown)
+		h.deprioritizedUntil = h.quarantinedUntil
 		h.failures = nil
 		return true
 	}
