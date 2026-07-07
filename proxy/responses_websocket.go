@@ -476,7 +476,7 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 		conn:           conn,
 		ctx:            r.Context(),
 		baseHeaders:    baseHeaders,
-		routingHeaders: r.Header.Clone(),
+		routingHeaders: speedTierRoutingHeadersOnly(r.Header),
 		userAgent:      r.Header.Get("User-Agent"),
 		// Codex treats X-Codex-Turn-State as server-issued, turn-scoped
 		// sticky-routing state. This bridge only trusts state it received from

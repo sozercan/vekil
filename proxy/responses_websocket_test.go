@@ -3471,3 +3471,29 @@ func TestHandleResponsesWebSocket_SendsPingAndAcceptsPong(t *testing.T) {
 		t.Fatal("timed out waiting for websocket reader to finish")
 	}
 }
+
+func TestNewResponsesWebSocketSessionStoresOnlyRoutingHeaders(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Cookie", "session=secret")
+	req.Header.Set("User-Agent", "codex-test")
+	req.Header.Set("X-Vekil-Routing", "default")
+	req.Header.Set("X-Vekil-No-Downgrade", "1")
+
+	session := newResponsesWebSocketSession(nil, req)
+	if got := session.routingHeaders.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization retained in routingHeaders: %q", got)
+	}
+	if got := session.routingHeaders.Get("Cookie"); got != "" {
+		t.Fatalf("Cookie retained in routingHeaders: %q", got)
+	}
+	if got := session.routingHeaders.Get("User-Agent"); got != "" {
+		t.Fatalf("User-Agent retained in routingHeaders: %q", got)
+	}
+	if got := session.routingHeaders.Get("X-Vekil-Routing"); got != "default" {
+		t.Fatalf("X-Vekil-Routing = %q, want default", got)
+	}
+	if got := session.routingHeaders.Get("X-Vekil-No-Downgrade"); got != "1" {
+		t.Fatalf("X-Vekil-No-Downgrade = %q, want 1", got)
+	}
+}
