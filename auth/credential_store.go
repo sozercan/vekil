@@ -108,9 +108,9 @@ func (s keyringCredentialStore) Set(name string, data []byte) error {
 }
 
 func (s keyringCredentialStore) Delete(name string) error {
-	// Best effort: locked/unavailable keyrings should not make logout fail or
-	// prevent cleanup of file fallback credentials.
-	_ = keyring.Delete(credentialStoreService, s.key(name))
+	if err := keyring.Delete(credentialStoreService, s.key(name)); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+		return err
+	}
 	return s.fallback.Delete(name)
 }
 
