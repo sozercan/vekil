@@ -262,6 +262,11 @@ type ProxyHandler struct {
 	models                           modelsCache
 	geminiCounts                     geminiCountTokensCache
 	stats                            *statsCollector
+	metrics                          *MetricsCollector
+	metricsEnabled                   bool
+	buildVersion                     string
+	buildCommit                      string
+	buildGoVersion                   string
 	insightGate                      *insightGate
 	insightGateOnce                  sync.Once
 }
@@ -433,6 +438,25 @@ func WithCompactUpstreamMaxAttempts(max int) Option {
 	}
 }
 
+// WithMetricsEnabled controls whether Prometheus metrics collection is active.
+// When enabled, a MetricsCollector is initialized and the /metrics endpoint is
+// served. Disabled by default unless explicitly enabled.
+func WithMetricsEnabled(enabled bool) Option {
+	return func(h *ProxyHandler) {
+		h.metricsEnabled = enabled
+	}
+}
+
+// WithBuildInfo passes build version metadata so the MetricsCollector can
+// populate the vekil_build_info gauge at init time.
+func WithBuildInfo(version, commit, goVersion string) Option {
+	return func(h *ProxyHandler) {
+		h.buildVersion = version
+		h.buildCommit = commit
+		h.buildGoVersion = goVersion
+	}
+}
+
 func newInferenceTransport() *http.Transport {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 100
@@ -482,6 +506,10 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		if opt != nil {
 			opt(h)
 		}
+	}
+	if h.metricsEnabled {
+		h.metrics = NewMetricsCollector()
+		h.metrics.SetBuildInfo(h.buildVersion, h.buildCommit, h.buildGoVersion)
 	}
 	h.initializeToolOptimizers()
 	if err := h.initializeProviders(); err != nil {
@@ -1397,4 +1425,13 @@ func readBodyStatusCode(err error) int {
 		return bodyErr.statusCode
 	}
 	return http.StatusBadRequest
+}
+
+// MetricsHandler returns the HTTP handler for the /metrics endpoint, or nil if
+// metrics collection is disabled.
+func (h *ProxyHandler) MetricsHandler() http.Handler {
+	if h == nil || h.metrics == nil {
+		return nil
+	}
+	return h.metrics.Handler()
 }

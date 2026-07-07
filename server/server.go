@@ -237,6 +237,10 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /stats.json", handler.HandleStatsJSON)
 	mux.HandleFunc("GET /favicon.ico", handler.HandleFavicon)
 
+	if metricsHandler := handler.MetricsHandler(); metricsHandler != nil {
+		mux.Handle("GET /metrics", metricsHandler)
+	}
+
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{
 		httpServer: &http.Server{

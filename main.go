@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"syscall"
 	"time"
@@ -17,6 +18,13 @@ import (
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
 	"github.com/sozercan/vekil/server"
+)
+
+// Build-time variables injected via -ldflags.
+var (
+	version   = "dev"
+	commit    = "unknown"
+	goVersion = runtime.Version()
 )
 
 type cliCommand int
@@ -233,6 +241,7 @@ type serveFlags struct {
 	compactUpstreamChunkBytes       *int
 	compactUpstreamChunkConcurrency *int
 	compactUpstreamMaxAttempts      *int
+	noMetrics                       *bool
 }
 
 func registerServeFlags(fs *flag.FlagSet) serveFlags {
@@ -258,6 +267,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		compactUpstreamChunkBytes:       fs.Int("compact-upstream-chunk-bytes", getEnvInt("COMPACT_UPSTREAM_CHUNK_BYTES", proxy.DefaultCompactUpstreamChunkBytes()), "Target body size (bytes) for chunked /v1/responses/compact retries after an upstream 413; halved on each recursive 413 down to a 64 KiB floor"),
 		compactUpstreamChunkConcurrency: fs.Int("compact-upstream-chunk-concurrency", getEnvInt("COMPACT_UPSTREAM_CHUNK_CONCURRENCY", proxy.DefaultCompactUpstreamChunkConcurrency()), "Maximum sibling chunk compaction calls to run concurrently after the first chunk succeeds"),
 		compactUpstreamMaxAttempts:      fs.Int("compact-upstream-max-attempts", getEnvInt("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts()), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy"),
+		noMetrics:                       fs.Bool("no-metrics", getEnvBool("NO_METRICS", false), "Disable the Prometheus /metrics endpoint"),
 	}
 }
 
@@ -407,6 +417,8 @@ func runServe() {
 		server.WithProxyOptions(
 			proxy.WithProvidersConfig(providersCfg),
 			proxy.WithDeferredDynamicProviderModelValidation(providersCfg.UsesCopilot()),
+			proxy.WithMetricsEnabled(!*serve.noMetrics),
+			proxy.WithBuildInfo(version, commit, goVersion),
 		),
 	)
 	if err != nil {

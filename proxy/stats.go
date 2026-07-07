@@ -884,12 +884,18 @@ func (h *ProxyHandler) IncInflight() {
 	if h != nil && h.stats != nil {
 		h.stats.incInflight()
 	}
+	if h != nil && h.metrics != nil {
+		h.metrics.IncInflight("")
+	}
 }
 
 // DecInflight decrements the live in-flight request gauge.
 func (h *ProxyHandler) DecInflight() {
 	if h != nil && h.stats != nil {
 		h.stats.decInflight()
+	}
+	if h != nil && h.metrics != nil {
+		h.metrics.DecInflight("")
 	}
 }
 
@@ -899,6 +905,9 @@ func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAg
 		return
 	}
 	h.stats.record(summary, status, userAgent, dur)
+	if h.metrics != nil {
+		h.metrics.Record(summary, status, dur)
+	}
 }
 
 // RecordResponsesTurn folds one /v1/responses websocket-bridge turn into the
@@ -910,6 +919,12 @@ func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel str
 		return
 	}
 	h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage)
+	if h.metrics != nil {
+		if status == 0 {
+			status = http.StatusOK
+		}
+		h.metrics.RecordResponsesTurn(model, provider, status, usage)
+	}
 }
 
 // HandleStatsJSON handles GET /stats.json with the current traffic snapshot.
