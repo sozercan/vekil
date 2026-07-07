@@ -242,15 +242,18 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersTracked(ctx context.Context, p
 		if i > 0 && ctx.Err() != nil {
 			attemptCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), upstreamTimeout)
 		}
-		if cancel != nil {
-			defer cancel()
-		}
 		attemptProvider := h.providerSetup().providerByID(attemptOwner.providerID)
 		if attemptProvider == nil || !attemptProvider.supportsEndpoint(path) || !providerModelSupportsEndpoint(attemptOwner, path) {
+			if cancel != nil {
+				cancel()
+			}
 			continue
 		}
 		attemptBody, prepErr := prepareProviderRequestBody(attemptProvider, attemptOwner, body, path)
 		if prepErr != nil {
+			if cancel != nil {
+				cancel()
+			}
 			return nil, providerModel{}, nil, prepErr
 		}
 		resp, postErr := h.doWithRetry(func() (*http.Request, error) {
@@ -263,6 +266,13 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersTracked(ctx context.Context, p
 		lastOwner = attemptOwner
 		lastBody = attemptBody
 		if !shouldFallbackResponse(resp, postErr) || i == len(attempts)-1 {
+			if cancel != nil {
+				if resp != nil && resp.Body != nil && postErr == nil {
+					resp.Body = &cancelOnCloseReadCloser{ReadCloser: resp.Body, cancel: cancel}
+				} else {
+					cancel()
+				}
+			}
 			return resp, attemptOwner, attemptBody, postErr
 		}
 		lastErr = postErr
@@ -270,12 +280,29 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersTracked(ctx context.Context, p
 			lastErr = &upstreamError{statusCode: resp.StatusCode, headers: resp.Header.Clone()}
 			drainAndClose(resp.Body)
 		}
+		if cancel != nil {
+			cancel()
+		}
 		h.logProviderFallback(owner.publicID, attemptOwner, attempts[i+1], lastErr)
 	}
 	if lastErr != nil {
 		return nil, lastOwner, lastBody, lastErr
 	}
 	return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no fallback provider available for model %q", owner.publicID)}
+}
+
+type cancelOnCloseReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnCloseReadCloser) Close() error {
+	err := c.ReadCloser.Close()
+	if c.cancel != nil {
+		c.cancel()
+		c.cancel = nil
+	}
+	return err
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
@@ -584,7 +611,7 @@ func shouldFallbackToNextProvider(err error) bool {
 	}
 	var upstreamErr *upstreamError
 	if errors.As(err, &upstreamErr) {
-		return retryable(upstreamErr.statusCode)
+		return retryable(upstreamErr.statusCode) || upstreamErr.statusCode == http.StatusInternalServerError
 	}
 	return true
 }

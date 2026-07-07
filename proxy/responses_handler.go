@@ -3411,24 +3411,33 @@ func newResponsesModelRewriteReadCloser(body io.ReadCloser, publicModel string) 
 	pr, pw := io.Pipe()
 	go func() {
 		defer func() { _ = body.Close() }()
-		reader := bufio.NewReader(body)
+		reader := bufio.NewReaderSize(body, responsesFailureTapMaxBuffer)
 		for {
-			line, err := reader.ReadString('\n')
-			if line != "" {
-				_, writeErr := io.WriteString(pw, rewriteResponsesSSEModelLine(line, publicModel))
-				if writeErr != nil {
+			fragment, err := reader.ReadSlice('\n')
+			if len(fragment) != 0 {
+				line := string(fragment)
+				if err != bufio.ErrBufferFull {
+					line = rewriteResponsesSSEModelLine(line, publicModel)
+				}
+				if _, writeErr := io.WriteString(pw, line); writeErr != nil {
 					_ = pw.CloseWithError(writeErr)
 					return
 				}
 			}
-			if err != nil {
-				if err == io.EOF {
-					_ = pw.Close()
-				} else {
-					_ = pw.CloseWithError(err)
-				}
-				return
+			if err == nil {
+				continue
 			}
+			if err == bufio.ErrBufferFull {
+				// The current SSE line is larger than the rewrite cap. Stream it
+				// through unchanged in bounded chunks until the delimiter appears.
+				continue
+			}
+			if err == io.EOF {
+				_ = pw.Close()
+			} else {
+				_ = pw.CloseWithError(err)
+			}
+			return
 		}
 	}()
 	return pr
@@ -3447,17 +3456,38 @@ func rewriteResponsesSSEModelLine(line, publicModel string) string {
 		return line
 	}
 	var payload map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(jsonPart), &payload); err != nil || rawJSONString(payload["model"]) == "" {
+	if err := json.Unmarshal([]byte(jsonPart), &payload); err != nil {
 		return line
 	}
-	raw, err := json.Marshal(publicModel)
-	if err != nil {
+	if !rewriteResponsesPayloadModels(payload, publicModel) {
 		return line
 	}
-	payload["model"] = raw
 	rewritten, err := json.Marshal(payload)
 	if err != nil {
 		return line
 	}
 	return line[:prefixLen+leading] + string(rewritten) + lineEnding
+}
+
+func rewriteResponsesPayloadModels(payload map[string]json.RawMessage, publicModel string) bool {
+	raw, err := json.Marshal(publicModel)
+	if err != nil {
+		return false
+	}
+	changed := false
+	if rawJSONString(payload["model"]) != "" {
+		payload["model"] = raw
+		changed = true
+	}
+	if rawResponse := payload["response"]; len(rawResponse) != 0 {
+		var response map[string]json.RawMessage
+		if err := json.Unmarshal(rawResponse, &response); err == nil && rawJSONString(response["model"]) != "" {
+			response["model"] = raw
+			if rewritten, err := json.Marshal(response); err == nil {
+				payload["response"] = rewritten
+				changed = true
+			}
+		}
+	}
+	return changed
 }

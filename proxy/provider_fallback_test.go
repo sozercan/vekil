@@ -479,3 +479,195 @@ func TestChatFallbackAttributesUsageToBackupProvider(t *testing.T) {
 		t.Fatalf("summary provider = %q, want backup", summary.provider)
 	}
 }
+
+func TestFallbackChainsRejectDynamicAliasMissingFromLoadedCatalog(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"unrelated-upstream"}]}`))
+	}))
+	defer primary.Close()
+
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-backup"}]}`))
+	}))
+	defer backup.Close()
+
+	_, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{
+					ID:             "primary",
+					Type:           "openai-compatible",
+					Default:        true,
+					BaseURL:        primary.URL,
+					AuthType:       "none",
+					ModelDiscovery: "openai",
+					Models: []ProviderModelConfig{{
+						PublicID:   "gpt-primary",
+						Deployment: "missing-upstream",
+						Endpoints:  []string{providerEndpointChatCompletions},
+					}},
+				},
+				{ID: "backup", Type: "openai-compatible", BaseURL: backup.URL, AuthType: "none", ModelDiscovery: "openai"},
+			},
+			Fallbacks: []ProviderFallbackConfig{{Public: "gpt-primary", Chain: []ProviderFallbackChainEntry{{Provider: "primary", Model: "gpt-primary"}, {Provider: "backup", Model: "gpt-backup"}}}},
+		}),
+	)
+	if err == nil || !strings.Contains(err.Error(), "references unknown model") {
+		t.Fatalf("NewProxyHandler() error = %v, want fallback unknown dynamic model", err)
+	}
+}
+
+func TestProviderFallbackExhaustsPrimaryEndpointsBeforeProviderFallbackOn500(t *testing.T) {
+	var eastHits atomic.Int32
+	east := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		eastHits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"east down"}}`))
+	}))
+	defer east.Close()
+
+	var westHits atomic.Int32
+	west := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		westHits.Add(1)
+		assertFallbackUpstreamModel(t, r, "primary-upstream")
+		writeFallbackChatOK(w, "west-ok")
+	}))
+	defer west.Close()
+
+	var backupHits atomic.Int32
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		writeFallbackChatOK(w, "backup-ok")
+	}))
+	defer backup.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{
+					ID:       "primary",
+					Type:     "openai-compatible",
+					Default:  true,
+					AuthType: "none",
+					Endpoints: []ProviderEndpointConfig{
+						{Name: "east", BaseURL: east.URL, Health: ProviderEndpointHealthConfig{ErrorBudget: "1/m", Cooldown: "1h"}},
+						{Name: "west", BaseURL: west.URL, Health: ProviderEndpointHealthConfig{ErrorBudget: "1/m", Cooldown: "1h"}},
+					},
+					Models: []ProviderModelConfig{{PublicID: "gpt-primary", Deployment: "primary-upstream", Endpoints: []string{providerEndpointChatCompletions}}},
+				},
+				{ID: "backup", Type: "openai-compatible", BaseURL: backup.URL, AuthType: "none", Models: []ProviderModelConfig{{PublicID: "gpt-backup", Deployment: "backup-upstream", Endpoints: []string{providerEndpointChatCompletions}}}},
+			},
+			Fallbacks: []ProviderFallbackConfig{{Public: "gpt-primary", Chain: []ProviderFallbackChainEntry{{Provider: "primary", Model: "gpt-primary"}, {Provider: "backup", Model: "gpt-backup"}}}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	handler.maxRetries = 2
+	handler.retryBaseDelay = time.Millisecond
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-primary","messages":[{"role":"user","content":"hi"}]}`))
+	handler.HandleOpenAIChatCompletions(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if eastHits.Load() != 1 || westHits.Load() != 1 || backupHits.Load() != 0 {
+		t.Fatalf("hits east/west/backup = %d/%d/%d, want 1/1/0", eastHits.Load(), westHits.Load(), backupHits.Load())
+	}
+}
+
+func TestFallbackResponseBodySurvivesPrimaryContextTimeout(t *testing.T) {
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(25 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-ok","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"backup-ok"}}]}`))
+	}))
+	defer backup.Close()
+
+	handler := newFallbackTestHandler(t, "http://127.0.0.1:1", backup.URL)
+	handler.maxRetries = 1
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	resp, owner, _, err := handler.postJSONEndpointWithHeadersTracked(ctx, providerEndpointChatCompletions, []byte(`{"model":"gpt-primary","messages":[{"role":"user","content":"hi"}]}`), nil)
+	if err != nil {
+		t.Fatalf("postJSONEndpointWithHeadersTracked() error = %v", err)
+	}
+	if owner.providerID != "backup" {
+		t.Fatalf("owner.providerID = %q, want backup", owner.providerID)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll(fallback body) error = %v", err)
+	}
+	if !strings.Contains(string(body), "backup-ok") {
+		t.Fatalf("fallback body = %s, want backup-ok", string(body))
+	}
+}
+
+func TestResponsesStreamNestedModelLineRewrite(t *testing.T) {
+	line := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-backup\",\"model\":\"backup-upstream\"}}\n"
+	rewritten := rewriteResponsesSSEModelLine(line, "gpt-primary")
+	if !strings.Contains(rewritten, `"model":"gpt-primary"`) {
+		t.Fatalf("rewritten line = %q, want nested public model", rewritten)
+	}
+	if strings.Contains(rewritten, "backup-upstream") {
+		t.Fatalf("rewritten line = %q, leaked backup model", rewritten)
+	}
+}
+
+func TestResponsesStreamModelRewriteLeavesOversizedDataLineUnchanged(t *testing.T) {
+	body := "data: {\"model\":\"backup-upstream\",\"payload\":\"" + strings.Repeat("x", responsesFailureTapMaxBuffer) + "\"}\n"
+	readCloser := newResponsesModelRewriteReadCloser(io.NopCloser(strings.NewReader(body)), "gpt-primary")
+	defer readCloser.Close()
+	read, err := io.ReadAll(readCloser)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if string(read) != body {
+		t.Fatalf("oversized SSE line changed; got len %d want len %d", len(read), len(body))
+	}
+}
+
+func TestResponsesWebSocketStatsUseSelectedFallbackOwner(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-backup","object":"response","status":"completed","model":"backup-upstream","output":[]}`))
+	}))
+	defer backup.Close()
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{ID: "primary", Type: "openai-compatible", Default: true, BaseURL: primary.URL, AuthType: "none", Models: []ProviderModelConfig{{PublicID: "gpt-primary", Deployment: "primary-upstream", Endpoints: []string{providerEndpointResponses}}}},
+				{ID: "backup", Type: "openai-compatible", BaseURL: backup.URL, AuthType: "none", Models: []ProviderModelConfig{{PublicID: "gpt-backup", Deployment: "backup-upstream", Endpoints: []string{providerEndpointResponses}}}},
+			},
+			Fallbacks: []ProviderFallbackConfig{{Public: "gpt-primary", Chain: []ProviderFallbackChainEntry{{Provider: "primary", Model: "gpt-primary"}, {Provider: "backup", Model: "gpt-backup"}}}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	session := &responsesWebSocketSession{selectedOwner: providerModel{providerID: "backup"}, userAgent: "codex/1.0"}
+	session.recordTurnStats(handler, "gpt-primary", http.StatusOK, responsesUsage{InputTokens: 2, OutputTokens: 3})
+	snap := handler.stats.snapshot()
+	if len(snap.ByProvider) == 0 || snap.ByProvider[0].Provider != "backup" {
+		t.Fatalf("ByProvider = %#v, want backup attribution", snap.ByProvider)
+	}
+}

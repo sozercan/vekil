@@ -174,9 +174,10 @@ type providerRuntime struct {
 }
 
 type providerEndpointRuntime struct {
-	endpoint selector.Endpoint
-	apiKey   string
-	health   *endpointHealthTracker
+	endpoint                 selector.Endpoint
+	apiKey                   string
+	health                   *endpointHealthTracker
+	retryInternalServerError bool
 }
 
 type providerEndpointPaths struct {
@@ -2444,9 +2445,10 @@ func buildProviderEndpointRuntimes(providerID string, kind providerType, cfg Pro
 			return nil, nil, nil, "", fmt.Errorf("provider %q endpoint %q: %w", providerID, name, err)
 		}
 		runtime := &providerEndpointRuntime{
-			endpoint: selector.Endpoint{Name: name, BaseURL: baseURL, Weight: raw.Weight, Healthy: true},
-			apiKey:   apiKey,
-			health:   newEndpointHealthTracker(healthCfg),
+			endpoint:                 selector.Endpoint{Name: name, BaseURL: baseURL, Weight: raw.Weight, Healthy: true},
+			apiKey:                   apiKey,
+			health:                   newEndpointHealthTracker(healthCfg),
+			retryInternalServerError: len(cfg.Endpoints) > 1,
 		}
 		endpoints = append(endpoints, runtime)
 		byName[name] = runtime
@@ -2677,6 +2679,16 @@ func (ps *providerSetup) lookupProviderModel(providerID, modelID string) (provid
 	provider := ps.providerByID(providerID)
 	if provider == nil {
 		return providerModel{}, false
+	}
+	modelID = strings.TrimSpace(modelID)
+	if providerUsesDynamicModels(provider) {
+		ps.modelsMu.RLock()
+		model, ok := ps.models[modelID]
+		ps.modelsMu.RUnlock()
+		if !ok || model.providerID != providerID {
+			return providerModel{}, false
+		}
+		return model, true
 	}
 	if model, ok := provider.staticModels[modelID]; ok {
 		return model, true

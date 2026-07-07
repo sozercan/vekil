@@ -43,6 +43,13 @@ func retryable(statusCode int) bool {
 	return false
 }
 
+func retryableForAttempt(statusCode int, endpoint *providerEndpointRuntime) bool {
+	if retryable(statusCode) {
+		return true
+	}
+	return statusCode == http.StatusInternalServerError && endpoint != nil && endpoint.retryInternalServerError
+}
+
 // backoff returns the delay for the given attempt (0-indexed) with jitter.
 func backoff(base time.Duration, attempt int) time.Duration {
 	if base <= 0 {
@@ -149,7 +156,7 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 			continue
 		}
 
-		if !retryable(resp.StatusCode) {
+		if !retryableForAttempt(resp.StatusCode, attemptEndpoint) {
 			if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 				recordEndpointSuccess(attemptEndpoint, time.Since(attemptStart))
 			} else if resp.StatusCode >= http.StatusInternalServerError {

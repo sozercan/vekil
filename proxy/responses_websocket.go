@@ -145,6 +145,7 @@ type responsesWebSocketSession struct {
 	historyBytes   int
 	toolContexts   *ToolExecutionContextStore
 	toolScope      string
+	selectedOwner  providerModel
 	done           chan struct{}
 	doneOnce       sync.Once
 	inflightMu     sync.Mutex
@@ -698,7 +699,12 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 // completed turn, an error status for a failed one).
 func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model string, status int, usage responsesUsage) {
 	providerID, providerKind := "", ""
-	if provider, _, _ := h.resolveProviderModel(model, providerEndpointResponses); provider != nil {
+	if s.selectedOwner.providerID != "" {
+		providerID = s.selectedOwner.providerID
+		if provider := h.providerSetup().providerByID(providerID); provider != nil {
+			providerKind = string(provider.kind)
+		}
+	} else if provider, _, _ := h.resolveProviderModel(model, providerEndpointResponses); provider != nil {
 		providerID, providerKind = provider.id, string(provider.kind)
 	}
 	h.RecordResponsesTurn(model, providerID, providerKind, classifyAgent(s.userAgent), status, usage)
@@ -779,7 +785,11 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 	if compactionResp, handled, _, err := h.maybeBuildResponsesCompactionTriggerResponse(ctx, bodyBytes, headers, true); handled || err != nil {
 		return compactionResp, err
 	}
-	return h.postResponsesWithHeaders(ctx, bodyBytes, headers)
+	resp, owner, err := h.postResponsesWithHeadersTracked(ctx, bodyBytes, headers)
+	if owner.providerID != "" {
+		s.selectedOwner = owner
+	}
+	return resp, err
 }
 
 func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCreateRequest, includeTurnState bool) http.Header {
