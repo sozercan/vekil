@@ -80,9 +80,8 @@ type ProviderFallbackConfig struct {
 
 // ProviderFallbackChainEntry names one provider/model hop in a fallback chain.
 type ProviderFallbackChainEntry struct {
-	Provider                 string `json:"provider" yaml:"provider"`
-	Model                    string `json:"model" yaml:"model"`
-	AllowProtocolTranslation bool   `json:"allow_protocol_translation,omitempty" yaml:"allow_protocol_translation,omitempty"`
+	Provider string `json:"provider" yaml:"provider"`
+	Model    string `json:"model" yaml:"model"`
 }
 
 // ProviderConfig configures one upstream provider instance.
@@ -481,7 +480,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 		hasConfiguredState: true,
 	}
 
-	needsDynamicModelValidation := len(providers) > 1 && hasDynamicProvider(providers)
+	needsDynamicModelValidation := hasDynamicProvider(providers) && (len(providers) > 1 || len(cfg.Fallbacks) > 0)
 
 	if !needsDynamicModelValidation || !validateDynamicModels {
 		for _, providerID := range providerOrder {
@@ -533,7 +532,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 // model-map updates are applied through providerSetup's locked replacement path.
 func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error {
 	setup := h.providerSetup()
-	if setup == nil || !setup.hasConfiguredState || len(setup.providers) <= 1 || !hasDynamicProvider(setup.providers) {
+	if setup == nil || !setup.hasConfiguredState || !hasDynamicProvider(setup.providers) || (len(setup.providers) <= 1 && len(h.providersConfig.Fallbacks) == 0) {
 		h.dynamicProviderValidationPending.Store(false)
 		return nil
 	}
