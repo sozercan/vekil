@@ -262,6 +262,8 @@ type ProxyHandler struct {
 	models                           modelsCache
 	geminiCounts                     geminiCountTokensCache
 	stats                            *statsCollector
+	metrics                          *metricsRegistry
+	metricsEnabled                   bool
 	insightGate                      *insightGate
 	insightGateOnce                  sync.Once
 }
@@ -431,6 +433,38 @@ func WithCompactUpstreamMaxAttempts(max int) Option {
 			h.compactMaxAttempts = max
 		}
 	}
+}
+
+// WithMetrics enables the Prometheus /metrics endpoint with the given build
+// info. When enabled, all request choke points emit counters and histograms.
+func WithMetrics(version, commit, goVersion string) Option {
+	return func(h *ProxyHandler) {
+		h.metricsEnabled = true
+		h.metrics = newMetricsRegistry(version, commit, goVersion)
+	}
+}
+
+// WithMetricsEnabled controls whether the metrics endpoint is active. When
+// disabled (false), the metrics registry is not created and /metrics is not
+// mounted. Use WithMetrics to enable and provide build info.
+func WithMetricsEnabled(enabled bool) Option {
+	return func(h *ProxyHandler) {
+		h.metricsEnabled = enabled
+	}
+}
+
+// MetricsEnabled reports whether Prometheus metrics are active.
+func (h *ProxyHandler) MetricsEnabled() bool {
+	return h != nil && h.metricsEnabled && h.metrics != nil
+}
+
+// MetricsHTTPHandler returns the HTTP handler for the /metrics endpoint.
+// Returns http.NotFoundHandler if metrics are disabled.
+func (h *ProxyHandler) MetricsHTTPHandler() http.Handler {
+	if h == nil || h.metrics == nil {
+		return http.NotFoundHandler()
+	}
+	return h.metrics.handler()
 }
 
 func newInferenceTransport() *http.Transport {

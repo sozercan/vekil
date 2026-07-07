@@ -18,6 +18,8 @@ This folder is intentionally split into small, single-purpose files so humans an
 | [`responses.md`](responses.md) | OpenAI Responses, compact, and memory shim details | Responses passthrough, compaction, or shim behavior changes |
 | [`architecture.md`](architecture.md) | package responsibilities and data flow | implementation boundaries or design decisions change |
 | [`dashboard.md`](dashboard.md) | live browser traffic dashboard and `/stats.json` | dashboard metrics, endpoints, or stats behavior change |
+| [`metrics.md`](metrics.md) | Prometheus `/metrics` endpoint, metric definitions, histogram buckets, and scrape config | metrics, `/metrics` route, or observability behavior changes |
+| [`grafana-dashboard.json`](grafana-dashboard.json) | example Grafana dashboard for `vekil_*` metrics | metric names/labels change |
 | [`menubar.md`](menubar.md) | macOS/Linux tray app usage | tray behavior or packaging changes |
 | [`development.md`](development.md) | build, test, benchmark, and CI workflows | local dev or CI commands change |
 

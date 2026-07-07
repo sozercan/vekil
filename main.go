@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"syscall"
 	"time"
@@ -19,12 +20,19 @@ import (
 	"github.com/sozercan/vekil/server"
 )
 
+// Build-time variables injected via -ldflags.
+var (
+	version = "dev"
+	commit  = "unknown"
+)
+
 type cliCommand int
 
 const (
 	cliCommandServe cliCommand = iota
 	cliCommandLogin
 	cliCommandLogout
+	cliCommandVersion
 )
 
 func main() {
@@ -35,6 +43,9 @@ func main() {
 		return
 	case cliCommandLogout:
 		runLogout(os.Args[2:])
+		return
+	case cliCommandVersion:
+		fmt.Printf("vekil %s (commit: %s, go: %s)\n", version, commit, runtime.Version())
 		return
 	}
 
@@ -51,6 +62,8 @@ func commandFromArgs(args []string) cliCommand {
 		return cliCommandLogin
 	case "logout":
 		return cliCommandLogout
+	case "version", "--version", "-v":
+		return cliCommandVersion
 	default:
 		return cliCommandServe
 	}
@@ -218,6 +231,7 @@ type serveFlags struct {
 	providersConfigPath             *string
 	logLevel                        *string
 	streamingUpstreamTimeout        *time.Duration
+	metrics                         *bool
 	copilotEditorVersion            *string
 	copilotPluginVersion            *string
 	copilotUserAgent                *string
@@ -243,6 +257,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
 		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
+		metrics:                         fs.Bool("metrics", getEnvBool("METRICS", true), "Enable Prometheus /metrics endpoint"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
 		copilotPluginVersion:            fs.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header"),
 		copilotUserAgent:                fs.String("copilot-user-agent", getEnv("COPILOT_USER_AGENT", ""), "Upstream Copilot user-agent header"),
@@ -404,6 +419,7 @@ func runServe() {
 		server.WithCompactUpstreamChunkBytes(*serve.compactUpstreamChunkBytes),
 		server.WithCompactUpstreamChunkConcurrency(*serve.compactUpstreamChunkConcurrency),
 		server.WithCompactUpstreamMaxAttempts(*serve.compactUpstreamMaxAttempts),
+		server.WithMetrics(*serve.metrics, version, commit),
 		server.WithProxyOptions(
 			proxy.WithProvidersConfig(providersCfg),
 			proxy.WithDeferredDynamicProviderModelValidation(providersCfg.UsesCopilot()),

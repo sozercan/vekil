@@ -187,6 +187,21 @@ func (h *ProxyHandler) logRetryAttempt(ctx context.Context, attempt int, status 
 	if h != nil && h.stats != nil && isRetryStatsTracked(ctx) {
 		h.stats.incRetry(status)
 	}
+
+	// Emit Prometheus retry metric. Use the request summary for provider/model
+	// context when available.
+	if h != nil && h.metrics != nil && isRetryStatsTracked(ctx) {
+		provider := ""
+		model := ""
+		if summary := RequestSummaryFromContext(ctx); summary != nil {
+			summary.mu.Lock()
+			provider = summary.provider
+			model = summary.model
+			summary.mu.Unlock()
+		}
+		h.metrics.observeRetry(provider, model, status)
+	}
+
 	if h == nil || h.log == nil {
 		return
 	}

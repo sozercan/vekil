@@ -884,12 +884,38 @@ func (h *ProxyHandler) IncInflight() {
 	if h != nil && h.stats != nil {
 		h.stats.incInflight()
 	}
+	if h != nil && h.metrics != nil {
+		h.metrics.incInflight("unknown")
+	}
+}
+
+// IncInflightProvider increments the live in-flight request gauge with provider context.
+func (h *ProxyHandler) IncInflightProvider(provider string) {
+	if h != nil && h.stats != nil {
+		h.stats.incInflight()
+	}
+	if h != nil && h.metrics != nil {
+		h.metrics.incInflight(provider)
+	}
 }
 
 // DecInflight decrements the live in-flight request gauge.
 func (h *ProxyHandler) DecInflight() {
 	if h != nil && h.stats != nil {
 		h.stats.decInflight()
+	}
+	if h != nil && h.metrics != nil {
+		h.metrics.decInflight("unknown")
+	}
+}
+
+// DecInflightProvider decrements the live in-flight request gauge with provider context.
+func (h *ProxyHandler) DecInflightProvider(provider string) {
+	if h != nil && h.stats != nil {
+		h.stats.decInflight()
+	}
+	if h != nil && h.metrics != nil {
+		h.metrics.decInflight(provider)
 	}
 }
 
@@ -899,6 +925,12 @@ func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAg
 		return
 	}
 	h.stats.record(summary, status, userAgent, dur)
+
+	// Emit into Prometheus metrics.
+	if h.metrics != nil {
+		d := readSummaryForStats(summary)
+		h.metrics.observeRequest(d, status, dur.Seconds())
+	}
 }
 
 // RecordResponsesTurn folds one /v1/responses websocket-bridge turn into the
@@ -910,6 +942,29 @@ func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel str
 		return
 	}
 	h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage)
+
+	// Emit into Prometheus metrics.
+	if h.metrics != nil {
+		total := usage.TotalTokens
+		if total == 0 {
+			total = usage.InputTokens + usage.OutputTokens
+		}
+		d := summaryStats{
+			model:      boundStatLabel(model),
+			provider:   provider,
+			kind:       kind,
+			endpoint:   "responses_ws",
+			stream:     true,
+			prompt:     usage.InputTokens,
+			completion: usage.OutputTokens,
+			total:      total,
+		}
+		effectiveStatus := status
+		if effectiveStatus == 0 {
+			effectiveStatus = http.StatusOK
+		}
+		h.metrics.observeRequest(d, effectiveStatus, 0)
+	}
 }
 
 // HandleStatsJSON handles GET /stats.json with the current traffic snapshot.

@@ -362,6 +362,21 @@ func TestCommandFromArgs(t *testing.T) {
 			args: []string{"vekil", "serve"},
 			want: cliCommandServe,
 		},
+		{
+			name: "version subcommand dispatches",
+			args: []string{"vekil", "version"},
+			want: cliCommandVersion,
+		},
+		{
+			name: "--version flag dispatches",
+			args: []string{"vekil", "--version"},
+			want: cliCommandVersion,
+		},
+		{
+			name: "-v flag dispatches",
+			args: []string{"vekil", "-v"},
+			want: cliCommandVersion,
+		},
 	}
 
 	for _, tc := range tests {

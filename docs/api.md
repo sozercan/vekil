@@ -78,3 +78,13 @@ Validates that the proxy can authenticate to and successfully probe the configur
 - `POST /dashboard/insight` — optional AI-generated traffic summary. Active only when `insight_model` is set in providers config; single-flight with a cooldown; fails open.
 
 These endpoints are unauthenticated like `/healthz` and are excluded from their own stats. See [Traffic Dashboard](dashboard.md) for the payload shape, agent classification, AI insights, and access/security notes.
+
+## `GET /metrics`
+
+Prometheus-compatible metrics exposition endpoint. Enabled by default (`--metrics=true`); disabled with `--metrics=false` or `METRICS=false`. Returns `text/plain` Prometheus exposition format including `vekil_*` counters, histograms, gauges, and standard Go runtime metrics.
+
+```bash
+curl http://localhost:1337/metrics
+```
+
+See [Prometheus Metrics](metrics.md) for the full metric catalog, histogram bucket definitions, label cardinality notes, and example scrape configuration.

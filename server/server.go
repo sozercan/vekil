@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"runtime"
 	"sync/atomic"
 	"time"
 
@@ -23,7 +24,10 @@ type Server struct {
 }
 
 type options struct {
-	proxyOptions []proxy.Option
+	proxyOptions   []proxy.Option
+	metricsEnabled bool
+	metricsVersion string
+	metricsCommit  string
 }
 
 // Option customizes server creation.
@@ -72,6 +76,16 @@ func WithCompactUpstreamChunkConcurrency(concurrency int) Option {
 // shared transport-retry policy.
 func WithCompactUpstreamMaxAttempts(max int) Option {
 	return WithProxyOptions(proxy.WithCompactUpstreamMaxAttempts(max))
+}
+
+// WithMetrics enables or disables the Prometheus /metrics endpoint with the
+// given build info (version and commit). go_version is derived from runtime.
+func WithMetrics(enabled bool, version, commit string) Option {
+	return func(o *options) {
+		o.metricsEnabled = enabled
+		o.metricsVersion = version
+		o.metricsCommit = commit
+	}
 }
 
 type responseRecorder struct {
@@ -124,7 +138,7 @@ func (r *responseRecorder) Unwrap() http.ResponseWriter {
 
 func withProviderValidationGate(next http.Handler, handler *proxy.ProxyHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if handler != nil && (handler.StartupAuthenticationPending() || handler.DynamicProviderValidationPending()) && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" {
+		if handler != nil && (handler.StartupAuthenticationPending() || handler.DynamicProviderValidationPending()) && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && r.URL.Path != "/metrics" {
 			message := "provider model validation pending"
 			if handler.StartupAuthenticationPending() {
 				message = "startup authentication pending"
@@ -212,6 +226,13 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 		}
 	}
 
+	// If metrics are enabled, prepend the WithMetrics proxy option.
+	if cfg.metricsEnabled {
+		cfg.proxyOptions = append([]proxy.Option{
+			proxy.WithMetrics(cfg.metricsVersion, cfg.metricsCommit, runtime.Version()),
+		}, cfg.proxyOptions...)
+	}
+
 	handler, err := proxy.NewProxyHandler(authenticator, log, cfg.proxyOptions...)
 	if err != nil {
 		return nil, err
@@ -236,6 +257,11 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("POST /dashboard/insight", handler.HandleDashboardInsight)
 	mux.HandleFunc("GET /stats.json", handler.HandleStatsJSON)
 	mux.HandleFunc("GET /favicon.ico", handler.HandleFavicon)
+
+	// Mount /metrics only when enabled.
+	if handler.MetricsEnabled() {
+		mux.Handle("GET /metrics", handler.MetricsHTTPHandler())
+	}
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	return &Server{
