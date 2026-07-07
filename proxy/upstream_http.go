@@ -168,7 +168,7 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 	}
 
 	rewrittenBody := body
-	if !(provider.kind == providerTypeAzureOpenAI && len(provider.endpoints) > 0) {
+	if provider.kind != providerTypeAzureOpenAI || len(provider.endpoints) == 0 {
 		if !providerUsesAzureClassicDeploymentPath(provider, endpoint) {
 			var err error
 			rewrittenBody, _, err = rewriteRequestModelForProvider(body, owner.upstreamModel)
