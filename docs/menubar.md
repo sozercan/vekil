@@ -1,6 +1,6 @@
-# macOS/Linux Tray App
+# Tray App (macOS / Linux / Windows)
 
-The tray app runs Vekil without a terminal. It supports macOS and Linux; published macOS app bundles also include Sparkle update checks.
+The tray app runs Vekil without a terminal. It supports macOS, Linux, and Windows; published macOS app bundles also include Sparkle update checks.
 
 ## macOS Install
 
@@ -80,3 +80,54 @@ Dialogs, notifications, and sign-in use DBus directly when possible. Optional he
 | Clipboard | `wl-clipboard`, `xclip`, or `xsel` |
 | Open URLs | `xdg-open` |
 | Notifications | DBus notification daemon; `notify-send` fallback |
+
+## Windows Tray
+
+The same tray app runs on Windows using the native system tray (notification area). No additional runtime dependencies are required.
+
+### Build From Source
+
+```bash
+make build-tray-windows
+```
+
+Or directly with Go:
+
+```bash
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w -H=windowsgui" -o vekil-tray.exe ./cmd/menubar/
+```
+
+The `-H=windowsgui` linker flag suppresses the console window so the app runs as a pure tray application.
+
+### Running
+
+Double-click `vekil-tray.exe` or launch it from a shortcut. The Vekil icon appears in the system tray (notification area) with the same menu as macOS and Linux: start/stop proxy, auth status, provider config selection, and launch-at-login.
+
+### Launch At Login
+
+The `Launch at Login` menu item adds or removes a registry entry under:
+
+```
+HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run
+```
+
+This starts `vekil-tray.exe` automatically when the current user signs in.
+
+### Dialogs And Notifications
+
+| Feature | Mechanism |
+|---------|-----------|
+| Dialogs | Native Win32 `MessageBoxW` |
+| File picker | PowerShell `OpenFileDialog` |
+| Clipboard | `clip.exe` via `cmd /c` |
+| Open URLs | `cmd /c start` |
+| Notifications | Windows toast notification (PowerShell); BalloonTip fallback |
+
+### Cross-Compile
+
+Build a Windows binary from macOS or Linux:
+
+```bash
+GOOS=windows GOARCH=amd64 make build-tray-windows
+GOOS=windows GOARCH=arm64 make build-tray-windows
+```

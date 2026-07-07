@@ -15,7 +15,7 @@ SPARKLE_DOWNLOAD_URL := https://github.com/sparkle-project/Sparkle/releases/down
 SPARKLE_FEED_URL ?= https://github.com/sozercan/vekil/releases/latest/download/appcast.xml
 SPARKLE_PUBLIC_ED_KEY ?=
 
-.PHONY: build build-app build-tray-linux test-app test compaction-lab vet lint clean docker-build docker-build-rtk docker-rtk-e2e
+.PHONY: build build-app build-tray-linux build-tray-windows test-app test compaction-lab vet lint clean docker-build docker-build-rtk docker-rtk-e2e
 
 build:
 	go build -ldflags="$(LDFLAGS)" -o $(BINARY) .
@@ -91,10 +91,15 @@ test-app: build-app
 	otool -L "$(APP_NAME)/Contents/MacOS/vekil-menubar" | grep -Fq '@rpath/Sparkle.framework/Versions/B/Sparkle'
 
 TRAY_LINUX_BINARY := vekil-tray
+TRAY_WINDOWS_BINARY := vekil-tray.exe
 
 build-tray-linux:
 	CGO_ENABLED=0 GOOS=linux \
 		go build -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o $(TRAY_LINUX_BINARY) ./cmd/menubar/
+
+build-tray-windows:
+	CGO_ENABLED=0 GOOS=windows \
+		go build -ldflags="$(LDFLAGS) -H=windowsgui -X main.buildVersion=$(APP_VERSION)" -o $(TRAY_WINDOWS_BINARY) ./cmd/menubar/
 
 test:
 	go test ./... -count=1
@@ -108,7 +113,7 @@ vet:
 lint: vet
 
 clean:
-	rm -f $(BINARY) $(TRAY_LINUX_BINARY)
+	rm -f $(BINARY) $(TRAY_LINUX_BINARY) $(TRAY_WINDOWS_BINARY)
 	rm -rf "$(APP_NAME)" .build
 
 docker-build:
