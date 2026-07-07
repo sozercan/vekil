@@ -50,7 +50,6 @@ Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership 
 - See [Tool Optimizers](tool-optimizers.md) for the optional `tool_optimizers` block that can live alongside `providers` in the same config file.
 - Set the optional top-level `insight_model` key to a public model ID the config serves to enable the dashboard's AI insights button. See [Traffic Dashboard](dashboard.md#ai-insights-optional).
 
-
 ### Environment Variable Interpolation
 
 Provider config string fields support `${env:VAR_NAME}` interpolation after JSON/YAML parsing. Use this for host-specific URLs, API keys, or header values without hardcoding secrets into the config file:
