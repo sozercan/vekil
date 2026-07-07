@@ -326,3 +326,46 @@ func TestProviderFallbackAfterProviderEndpointExhaustion(t *testing.T) {
 		t.Fatalf("backup hits = %d, want 1", backupHits.Load())
 	}
 }
+
+func TestResponsesFallbackPreservesRequestedModel(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"primary down"}}`))
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertFallbackUpstreamModel(t, r, "backup-upstream")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-backup","object":"response","status":"completed","model":"backup-upstream","output":[]}`))
+	}))
+	defer backup.Close()
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{ID: "primary", Type: "openai-compatible", Default: true, BaseURL: primary.URL, AuthType: "none", Models: []ProviderModelConfig{{PublicID: "gpt-primary", Deployment: "primary-upstream", Endpoints: []string{providerEndpointResponses}}}},
+				{ID: "backup", Type: "openai-compatible", BaseURL: backup.URL, AuthType: "none", Models: []ProviderModelConfig{{PublicID: "gpt-backup", Deployment: "backup-upstream", Endpoints: []string{providerEndpointResponses}}}},
+			},
+			Fallbacks: []ProviderFallbackConfig{{Public: "gpt-primary", Chain: []ProviderFallbackChainEntry{{Provider: "primary", Model: "gpt-primary"}, {Provider: "backup", Model: "gpt-backup"}}}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	handler.maxRetries = 1
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-primary","input":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	handler.HandleResponses(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := rawJSONString(payload["model"]); got != "gpt-primary" {
+		t.Fatalf("response model = %q, want requested gpt-primary", got)
+	}
+}

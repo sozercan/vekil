@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -101,12 +102,13 @@ func responsesRequestStreams(bodyBytes []byte) bool {
 	return partial.Stream != nil && *partial.Stream
 }
 
-func (h *ProxyHandler) postPreparedResponsesRequest(ctx, observeCtx context.Context, req preparedResponsesRequest) (*http.Response, error) {
-	resp, err := h.postResponsesWithHeaders(ctx, req.body, req.upstreamHeaders)
+func (h *ProxyHandler) postPreparedResponsesRequest(ctx, observeCtx context.Context, req preparedResponsesRequest) (*http.Response, providerModel, error) {
+	resp, selectedOwner, err := h.postResponsesWithHeadersTracked(ctx, req.body, req.upstreamHeaders)
 	if err != nil {
-		return nil, err
+		return nil, providerModel{}, err
 	}
-	return h.maybeRetryCompactedResponsesRequest(ctx, observeCtx, req.body, req.extraHeaders, req.upstreamHeaders, resp)
+	resp, err = h.maybeRetryCompactedResponsesRequest(ctx, observeCtx, req.body, req.extraHeaders, req.upstreamHeaders, resp)
+	return resp, selectedOwner, err
 }
 
 func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWriter, endpoint string, err error) {
@@ -156,7 +158,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := h.postPreparedResponsesRequest(upstreamCtx, r.Context(), prepared)
+	resp, selectedOwner, err := h.postPreparedResponsesRequest(upstreamCtx, r.Context(), prepared)
 	if err != nil {
 		h.writeResponsesUpstreamRequestFailure(w, "responses", err)
 		return
@@ -170,7 +172,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.writeResponsesUpstreamResponse(r.Context(), w, resp, h.toolContexts, prepared.headerToolScope)
+	h.writeResponsesUpstreamResponse(r.Context(), w, normalizeResponsesModelResponse(resp, extractRequestModel(prepared.body), selectedOwner.upstreamModel), h.toolContexts, prepared.headerToolScope)
 }
 
 // compactPrompt is the system instruction used when the upstream does not
@@ -3348,4 +3350,40 @@ func (h *ProxyHandler) pickResponsesCompatibleModel(ctx context.Context, provide
 	}
 
 	return firstAvailable, nil
+}
+
+func normalizeResponsesModelResponse(resp *http.Response, publicModel, upstreamModel string) *http.Response {
+	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK || strings.TrimSpace(publicModel) == "" || strings.TrimSpace(publicModel) == strings.TrimSpace(upstreamModel) {
+		return resp
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		return resp
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		return resp
+	}
+	if rawJSONString(payload["model"]) == "" {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		return resp
+	}
+	raw, err := json.Marshal(publicModel)
+	if err != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		return resp
+	}
+	payload["model"] = raw
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		return resp
+	}
+	resp.Header.Del("Content-Length")
+	resp.Header.Set("Content-Length", strconv.Itoa(len(rewritten)))
+	resp.Body = io.NopCloser(bytes.NewReader(rewritten))
+	return resp
 }
