@@ -46,6 +46,18 @@ func (h *ProxyHandler) HandleGeminiModels(w http.ResponseWriter, r *http.Request
 	}
 }
 
+func geminiRoutingHeaders(r *http.Request, generationConfig *models.GeminiGenerationConfig) http.Header {
+	if generationConfig == nil || !hasRawJSON(generationConfig.ThinkingConfig) {
+		return r.Header
+	}
+	headers := r.Header.Clone()
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	headers.Set("X-Vekil-Routing", "default")
+	return headers
+}
+
 func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *http.Request, pathModel string, stream bool) {
 	body, err := readBody(r)
 	if err != nil {
@@ -102,7 +114,8 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), stream || forceStream)
 	defer upstreamCancel()
 
-	resp, selectedOwner, err := h.postChatCompletionsWithHeadersTracked(upstreamCtx, oaiBody, r.Header)
+	routingHeaders := geminiRoutingHeaders(r, req.GenerationConfig)
+	resp, selectedOwner, err := h.postChatCompletionsWithHeadersTracked(upstreamCtx, oaiBody, routingHeaders)
 	if err != nil {
 		h.writeGeminiUpstreamFailure(w, err)
 		return
@@ -113,7 +126,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		forceUpstreamStream:   forceStream,
 		injectedStreamUsage:   streamUsageInjected,
 	}
-	resp, oaiBody, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, oaiBody, mode, r.Header, selectedOwner)
+	resp, oaiBody, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, oaiBody, mode, routingHeaders, selectedOwner)
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	if resp.StatusCode != http.StatusOK {

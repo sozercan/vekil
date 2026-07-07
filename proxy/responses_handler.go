@@ -742,6 +742,10 @@ func (r compactInflightResult) clone() (string, *http.Response, error) {
 }
 
 func compactInflightKey(requestFields map[string]json.RawMessage, extraHeaders http.Header, routingHeaders ...http.Header) (string, bool) {
+	return compactInflightKeyWithRoutingHeaderNames(requestFields, extraHeaders, nil, routingHeaders...)
+}
+
+func compactInflightKeyWithRoutingHeaderNames(requestFields map[string]json.RawMessage, extraHeaders http.Header, routingHeaderNames []string, routingHeaders ...http.Header) (string, bool) {
 	h := sha256.New()
 	writeCompactInflightKeyPart(h, []byte("request"))
 	writeCompactInflightKeyRawMap(h, requestFields)
@@ -749,7 +753,7 @@ func compactInflightKey(requestFields map[string]json.RawMessage, extraHeaders h
 	writeCompactInflightKeyHeaders(h, extraHeaders)
 	writeCompactInflightKeyPart(h, []byte("routing_headers"))
 	for _, headers := range routingHeaders {
-		writeCompactInflightKeyHeaders(h, speedTierRoutingHeadersOnly(headers))
+		writeCompactInflightKeyHeaders(h, speedTierRoutingHeadersOnly(headers, routingHeaderNames...))
 	}
 	return hex.EncodeToString(h.Sum(nil)), true
 }
@@ -836,7 +840,7 @@ func waitCompactInflight(ctx context.Context, call *compactInflightCall) (string
 }
 
 func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, routingHeaders ...http.Header) (string, *http.Response, error) {
-	key, ok := compactInflightKey(requestFields, extraHeaders, routingHeaders...)
+	key, ok := compactInflightKeyWithRoutingHeaderNames(requestFields, extraHeaders, h.speedTierRoutingHeaderNames(), routingHeaders...)
 	if !ok {
 		budget := newCompactBudget(h.effectiveCompactMaxAttempts())
 		return h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget, routingHeaders...)

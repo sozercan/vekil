@@ -413,12 +413,22 @@ func noSpeedTierRoutingHeaders() http.Header {
 	return http.Header{"X-Vekil-Routing": []string{"default"}}
 }
 
-func speedTierRoutingHeadersOnly(headers http.Header) http.Header {
+func speedTierRoutingHeadersOnly(headers http.Header, extraNames ...string) http.Header {
 	if len(headers) == 0 {
 		return nil
 	}
-	filtered := make(http.Header, 3)
-	for _, name := range []string{"X-Vekil-Routing", "X-Vekil-Tier", "X-Vekil-No-Downgrade"} {
+	names := append([]string{"X-Vekil-Routing", "X-Vekil-Tier", "X-Vekil-No-Downgrade"}, extraNames...)
+	filtered := make(http.Header, len(names))
+	seen := map[string]struct{}{}
+	for _, name := range names {
+		name = http.CanonicalHeaderKey(strings.TrimSpace(name))
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
 		for _, value := range headers.Values(name) {
 			filtered.Add(name, value)
 		}

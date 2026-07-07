@@ -788,6 +788,9 @@ func validateProviderSpeedTierModels(providerID string, models []providerModel) 
 		if !ok {
 			return fmt.Errorf("provider %q model %q speed_tier.downgrade_to %q is not a known public_id in the same provider", providerID, model.publicID, model.speedTier.downgradeTo)
 		}
+		if target.disabled {
+			return fmt.Errorf("provider %q model %q speed_tier.downgrade_to %q is disabled", providerID, model.publicID, target.publicID)
+		}
 		if target.speedTier != nil {
 			return fmt.Errorf("provider %q model %q speed_tier.downgrade_to %q declares its own speed_tier; chained downgrades are not supported", providerID, model.publicID, target.publicID)
 		}
@@ -2330,4 +2333,30 @@ func mergeProviderModelRaw(raw json.RawMessage, supportedEndpoints []string) jso
 		return append(json.RawMessage(nil), raw...)
 	}
 	return merged
+}
+
+func (h *ProxyHandler) speedTierRoutingHeaderNames() []string {
+	setup := h.providerSetup()
+	if setup == nil {
+		return nil
+	}
+	setup.modelsMu.RLock()
+	defer setup.modelsMu.RUnlock()
+	seen := map[string]struct{}{}
+	var names []string
+	for _, model := range setup.models {
+		if model.speedTier == nil {
+			continue
+		}
+		name := http.CanonicalHeaderKey(strings.TrimSpace(model.speedTier.neverWhen.HasHeader))
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names
 }

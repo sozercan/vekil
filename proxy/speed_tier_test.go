@@ -940,3 +940,58 @@ func TestSpeedTierMaxTokensNullDoesNotMatch(t *testing.T) {
 		t.Fatalf("decision = %+v, want max_tokens:null not to match", decision)
 	}
 }
+
+func TestCompactInflightKeyIncludesConfiguredDenyHeaders(t *testing.T) {
+	fields := map[string]json.RawMessage{"model": json.RawMessage(`"sonnet-public"`), "input": json.RawMessage(`[]`)}
+	headersA := http.Header{"X-Do-Not-Downgrade": []string{"1"}, "Authorization": []string{"Bearer a"}}
+	headersB := http.Header{"Authorization": []string{"Bearer b"}}
+	keyA, okA := compactInflightKeyWithRoutingHeaderNames(fields, nil, []string{"X-Do-Not-Downgrade"}, headersA)
+	keyB, okB := compactInflightKeyWithRoutingHeaderNames(fields, nil, []string{"X-Do-Not-Downgrade"}, headersB)
+	keyNoisy, okNoisy := compactInflightKeyWithRoutingHeaderNames(fields, nil, []string{"X-Do-Not-Downgrade"}, http.Header{"X-Do-Not-Downgrade": []string{"1"}, "Authorization": []string{"Bearer c"}})
+	if !okA || !okB || !okNoisy {
+		t.Fatalf("compactInflightKey ok = %v/%v/%v, want true", okA, okB, okNoisy)
+	}
+	if keyA == keyB {
+		t.Fatalf("custom deny header did not affect compact key")
+	}
+	if keyA != keyNoisy {
+		t.Fatalf("unrelated auth header affected compact key")
+	}
+}
+
+func TestValidateProviderSpeedTierRejectsDisabledTarget(t *testing.T) {
+	models := []providerModel{
+		{publicID: "sonnet-public", supportedEndpoints: []string{providerEndpointChatCompletions}, speedTier: &speedTierRule{downgradeTo: "haiku-public", semantics: speedTierSemanticsAll}},
+		{publicID: "haiku-public", supportedEndpoints: []string{providerEndpointChatCompletions}, disabled: true},
+	}
+	if err := validateProviderSpeedTierModels("test-provider", models); err == nil || !strings.Contains(err.Error(), "is disabled") {
+		t.Fatalf("validateProviderSpeedTierModels() error = %v, want disabled target error", err)
+	}
+}
+
+func TestGeminiThinkingConfigForcesNoDowngrade(t *testing.T) {
+	var upstreamModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		upstreamModel = speedTierRawJSONString(payload["model"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-gemini","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	handler := newSpeedTierHTTPHandler(t, upstream.URL, true)
+	reqBody := `{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"includeThoughts":true},"maxOutputTokens":256}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/sonnet-public:generateContent", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleGeminiModels(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if upstreamModel != "sonnet-upstream" {
+		t.Fatalf("Gemini thinking upstream model = %q, want sonnet-upstream", upstreamModel)
+	}
+}
