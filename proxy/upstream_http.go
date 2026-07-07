@@ -240,7 +240,13 @@ func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*h
 }
 
 func (h *ProxyHandler) postChatCompletionsWithHeaders(ctx context.Context, body []byte, routingHeaders http.Header) (*http.Response, error) {
-	return h.postJSONEndpointWithHeaders(ctx, providerEndpointChatCompletions, body, nil, routingHeaders)
+	resp, _, err := h.postChatCompletionsWithHeadersTracked(ctx, body, routingHeaders)
+	return resp, err
+}
+
+func (h *ProxyHandler) postChatCompletionsWithHeadersTracked(ctx context.Context, body []byte, routingHeaders http.Header) (*http.Response, providerModel, error) {
+	resp, owner, _, err := h.postJSONEndpointWithHeadersTracked(ctx, providerEndpointChatCompletions, body, nil, routingHeaders)
+	return resp, owner, err
 }
 
 func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header, routingHeaders ...http.Header) (*http.Response, error) {

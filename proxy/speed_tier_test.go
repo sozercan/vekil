@@ -365,6 +365,30 @@ func newSpeedTierHTTPHandler(t *testing.T, upstreamURL string, enabled bool) *Pr
 	return handler
 }
 
+func newSpeedTierAnthropicHTTPHandler(t *testing.T, upstreamURL string, enabled bool) *ProxyHandler {
+	t.Helper()
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{
+			SpeedTierEnabled: enabled,
+			Providers: []ProviderConfig{{
+				ID:           "test-provider",
+				Type:         "anthropic-compatible",
+				Default:      true,
+				BaseURL:      upstreamURL,
+				AuthType:     "none",
+				MessagesPath: providerEndpointMessages,
+				Models:       speedTierModels(),
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	return handler
+}
+
 func parseSpeedTierWSRequest(t *testing.T, body string) *responsesWebSocketCreateRequest {
 	t.Helper()
 	req, err := parseResponsesWebSocketCreateRequest([]byte(body))
@@ -402,6 +426,37 @@ func TestSpeedTierChatRetryPreservesOptOutHeaders(t *testing.T) {
 	_ = retryResp.Body.Close()
 	if retryModel != "sonnet-upstream" {
 		t.Fatalf("retry upstream model = %q, want sonnet-upstream", retryModel)
+	}
+}
+
+func TestSpeedTierChatRetryPreservesFirstSelectedModel(t *testing.T) {
+	var retryModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		retryModel = speedTierRawJSONString(payload["model"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-retry","object":"chat.completion","choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	handler := newSpeedTierHTTPHandler(t, upstream.URL, true)
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"bad stream_options"}}`)),
+	}
+	body := []byte(`{"model":"sonnet-public","max_tokens":256,"tools":[],"messages":[{"role":"user","content":"hi"}],"stream_options":{"include_usage":true}}`)
+	selectedOwner := providerModel{publicID: "sonnet-public"}
+	retryResp, _, _ := handler.retryChatCompletionsWithoutInjectedStreamOptions(t.Context(), resp, body, chatCompletionsMode{injectedStreamUsage: true}, nil, selectedOwner)
+	if retryResp == nil {
+		t.Fatal("retry response is nil")
+	}
+	_ = retryResp.Body.Close()
+	if retryModel != "sonnet-upstream" {
+		t.Fatalf("retry upstream model = %q, want first selected model sonnet-upstream", retryModel)
 	}
 }
 
@@ -659,6 +714,72 @@ func TestAnthropicTranslatedThinkingForcesNoDowngrade(t *testing.T) {
 	_ = resp.Body.Close()
 	if upstreamModel != "sonnet-upstream" {
 		t.Fatalf("thinking upstream model = %q, want sonnet-upstream", upstreamModel)
+	}
+}
+
+func TestDirectAnthropicThinkingForcesNoDowngrade(t *testing.T) {
+	var upstreamModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/v1/messages" {
+			t.Fatalf("upstream path = %q, want /v1/messages", got)
+		}
+		var payload map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		upstreamModel = speedTierRawJSONString(payload["model"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"sonnet-upstream","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	handler := newSpeedTierAnthropicHTTPHandler(t, upstream.URL, true)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"sonnet-public","max_tokens":256,"thinking":{"type":"enabled","budget_tokens":1024},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if upstreamModel != "sonnet-upstream" {
+		t.Fatalf("direct thinking upstream model = %q, want sonnet-upstream", upstreamModel)
+	}
+}
+
+func TestDirectAnthropicSpeedTierPreservesRequestedResponseModel(t *testing.T) {
+	var upstreamModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		upstreamModel = speedTierRawJSONString(payload["model"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"haiku-upstream","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	handler := newSpeedTierAnthropicHTTPHandler(t, upstream.URL, true)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"sonnet-public","max_tokens":256,"tools":[],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if upstreamModel != "haiku-upstream" {
+		t.Fatalf("direct speed-tier upstream model = %q, want haiku-upstream", upstreamModel)
+	}
+	var resp models.AnthropicResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Model != "sonnet-public" {
+		t.Fatalf("response model = %q, want requested public model sonnet-public", resp.Model)
 	}
 }
 
