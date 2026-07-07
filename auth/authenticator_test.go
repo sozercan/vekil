@@ -1726,3 +1726,34 @@ func TestStatusDoesNotMigrateLegacyCopilotTokenToKeyring(t *testing.T) {
 		t.Fatalf("Status() migrated copilot cache to keyring, err=%v", err)
 	}
 }
+
+func TestStatusReportsKeyringBackedTokensAfterRestart(t *testing.T) {
+	keyring.MockInit()
+	t.Setenv(credentialStoreEnv, "")
+	dir := t.TempDir()
+	a, err := NewAuthenticator(dir)
+	if err != nil {
+		t.Fatalf("NewAuthenticator() error = %v", err)
+	}
+	a.accessToken = "stored-token"
+	if err := a.saveAccessToken(); err != nil {
+		t.Fatalf("saveAccessToken() error = %v", err)
+	}
+	cache := CopilotTokenResponse{Token: "copilot-token", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	data, err := json.Marshal(cache)
+	if err != nil {
+		t.Fatalf("marshal cache: %v", err)
+	}
+	if err := a.store().Set(copilotTokenSecretName, data); err != nil {
+		t.Fatalf("save copilot cache: %v", err)
+	}
+
+	reloaded, err := NewAuthenticator(dir)
+	if err != nil {
+		t.Fatalf("NewAuthenticator(reloaded) error = %v", err)
+	}
+	status := reloaded.Status()
+	if !status.SignedIn || status.Source != AuthSourceVekil || !status.HasVekilAccessToken || !status.HasValidCopilotCache {
+		t.Fatalf("Status() = %+v, want keyring-backed Vekil credentials", status)
+	}
+}

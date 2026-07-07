@@ -115,8 +115,12 @@ func (s keyringCredentialStore) Delete(name string) error {
 }
 
 func (s keyringCredentialStore) Exists(name string) bool {
-	// Status checks must be fast and side-effect-free: do not touch the OS
-	// keyring here because desktop keyrings can block, prompt, or trigger legacy
-	// migration from a nominally read-only status refresh.
+	// Status checks must be side-effect-free: query the keyring directly without
+	// legacy-file migration, and fall back to legacy file state when the keyring is
+	// missing or unavailable.
+	secret, err := keyring.Get(credentialStoreService, s.key(name))
+	if err == nil && strings.TrimSpace(secret) != "" {
+		return true
+	}
 	return s.fallback.Exists(name)
 }

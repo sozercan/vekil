@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/zalando/go-keyring"
 )
 
 const (
@@ -233,17 +235,30 @@ func (a *Authenticator) Status() AuthStatus {
 	return status
 }
 
-// hasAccessTokenStored is a fast, side-effect-free check of file fallback state.
-// It intentionally does not query the OS keyring; token loading is responsible
-// for keyring reads/migration.
+// hasAccessTokenStored is a side-effect-free check for Vekil-managed access
+// tokens. It may read the OS keyring, but it must not migrate or delete legacy
+// files.
 func (a *Authenticator) hasAccessTokenStored() bool {
 	return a.store().Exists(accessTokenSecretName)
 }
 
-// hasValidCopilotTokenStored is a fast, side-effect-free check of file fallback
-// state. It intentionally does not query the OS keyring.
+// hasValidCopilotTokenStored is a side-effect-free check for a valid Copilot
+// token cache. It may read the OS keyring, but it must not migrate or delete
+// legacy files.
+func (a *Authenticator) getStoredCredentialForStatus(name string) ([]byte, error) {
+	switch store := a.store().(type) {
+	case keyringCredentialStore:
+		if secret, err := keyring.Get(credentialStoreService, store.key(name)); err == nil {
+			return []byte(secret), nil
+		}
+		return store.fallback.Get(name)
+	default:
+		return store.Get(name)
+	}
+}
+
 func (a *Authenticator) hasValidCopilotTokenStored() bool {
-	data, err := newFileCredentialStore(a.tokenDir).Get(copilotTokenSecretName)
+	data, err := a.getStoredCredentialForStatus(copilotTokenSecretName)
 	if err != nil {
 		return false
 	}
