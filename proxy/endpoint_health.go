@@ -162,3 +162,24 @@ func (h *endpointHealthTracker) recordFailure(now time.Time) bool {
 	}
 	return false
 }
+
+func (h *endpointHealthTracker) usableIgnoringPenalty(now time.Time) bool {
+	if h == nil {
+		return true
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.quarantinedUntil.IsZero() && now.Before(h.quarantinedUntil) {
+		return false
+	}
+	if !h.quarantinedUntil.IsZero() && !now.Before(h.quarantinedUntil) {
+		h.quarantinedUntil = time.Time{}
+	}
+	if !h.deprioritizedUntil.IsZero() && !now.Before(h.deprioritizedUntil) {
+		h.deprioritizedUntil = time.Time{}
+		if h.latencyEWMA >= time.Hour {
+			h.latencyEWMA = 0
+		}
+	}
+	return true
+}
