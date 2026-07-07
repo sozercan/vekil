@@ -2,6 +2,7 @@ BINARY := vekil
 LDFLAGS := -s -w
 APP_NAME := Vekil.app
 APP_BUNDLE_ID := com.vekil.menubar
+WINDOWS_TRAY_EXE := VekilTray.exe
 APP_ICON := assets/macos/Vekil.icns
 VERSION ?= dev-$(shell git rev-parse --short HEAD)
 APP_VERSION := $(patsubst v%,%,$(VERSION))
@@ -75,6 +76,9 @@ build-app: $(SPARKLE_FRAMEWORK)
 </plist>' > "$(APP_NAME)/Contents/Info.plist"
 	codesign --force --deep --sign - --timestamp=none "$(APP_NAME)"
 	codesign --verify --deep --strict "$(APP_NAME)"
+
+build-windows-tray:
+	GOOS=windows GOARCH=amd64 go build -ldflags="$(LDFLAGS) -H=windowsgui -X main.buildVersion=$(APP_VERSION)" -o "$(WINDOWS_TRAY_EXE)" ./cmd/menubar/
 
 test-app: build-app
 	test -x "$(APP_NAME)/Contents/MacOS/vekil-menubar"

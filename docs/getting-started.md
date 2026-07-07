@@ -16,13 +16,19 @@ brew install --cask sozercan/repo/vekil
 xattr -cr /Applications/Vekil.app  # only if macOS quarantine blocks launch
 ```
 
-For tray app details, see [macOS/Linux Tray App](menubar.md).
+For tray app details, see [macOS/Linux Tray App](menubar.md) and [Windows Tray App](windows-tray.md).
 
 Build from source:
 
 ```bash
 go build -o vekil .
 ./vekil
+```
+
+Build the portable Windows tray app from source:
+
+```bash
+make build-windows-tray
 ```
 
 ## Docker
