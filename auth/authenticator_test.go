@@ -1822,34 +1822,41 @@ func TestKeyringCredentialStoreSetReportsFallbackDeleteFailure(t *testing.T) {
 }
 
 func TestSignInWithGitHubCLIAttemptsAllCleanupAfterDeleteError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake gh shell script test is Unix-only")
+	}
 	keyring.MockInitWithError(errors.New("keyring unavailable"))
 	t.Setenv(credentialStoreEnv, "")
 	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+printf 'gh-cli-access-token\n'
+`
+	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("old-access"), 0o600); err != nil {
 		t.Fatalf("write access token: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "api-key.json"), []byte(`{"token":"old","expires_at":9999999999}`), 0o600); err != nil {
 		t.Fatalf("write copilot cache: %v", err)
 	}
-	a := &Authenticator{tokenDir: dir, credentialStore: newDefaultCredentialStore(dir), client: newAuthHTTPClient(time.Second, false), directClient: newAuthHTTPClient(time.Second, false)}
-	a.accessToken = ""
-	a.copilotToken = "cli-token"
-	a.tokenExpiry = time.Now().Add(time.Hour)
-	// Avoid shelling out: useGitHubCLICopilotToken is bypassed by preloading state
-	// through a fake githubCLIPath that returns a token is too heavy here, so test
-	// the cleanup body via delete calls directly.
-	var errs []error
-	for _, name := range []string{accessTokenSecretName, copilotTokenSecretName} {
-		if err := a.store().Delete(name); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if len(errs) == 0 {
-		t.Fatal("expected keyring delete errors")
+	chatEnabled := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(CopilotUserResponse{Login: "test-user", ChatEnabled: &chatEnabled})
+	}))
+	defer server.Close()
+	a := &Authenticator{tokenDir: dir, credentialStore: newDefaultCredentialStore(dir), githubCLIPath: ghPath, client: server.Client(), copilotBaseURL: server.URL}
+	err := a.SignInWithGitHubCLI(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "github cli sign-in cleanup") {
+		t.Fatalf("SignInWithGitHubCLI() error = %v, want cleanup error", err)
 	}
 	for _, file := range []string{"access-token", "api-key.json"} {
 		if _, err := os.Stat(filepath.Join(dir, file)); !os.IsNotExist(err) {
 			t.Fatalf("%s still exists after cleanup: %v", file, err)
 		}
+	}
+	if prefs := readAuthPreferencesForTest(t, dir); !prefs.GitHubCLIAutoSignIn {
+		t.Fatal("expected GitHub CLI preference to be written despite cleanup errors")
 	}
 }

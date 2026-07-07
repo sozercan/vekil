@@ -248,10 +248,13 @@ func (a *Authenticator) hasAccessTokenStored() bool {
 func (a *Authenticator) getStoredCredentialForStatus(name string) ([]byte, error) {
 	switch store := a.store().(type) {
 	case keyringCredentialStore:
+		if fallback, err := store.fallback.Get(name); err == nil && strings.TrimSpace(string(fallback)) != "" {
+			return fallback, nil
+		}
 		if secret, err := keyring.Get(credentialStoreService, store.key(name)); err == nil {
 			return []byte(secret), nil
 		}
-		return store.fallback.Get(name)
+		return nil, os.ErrNotExist
 	default:
 		return store.Get(name)
 	}
