@@ -2644,6 +2644,9 @@ func (ps *providerSetup) configureFallbackChains(configs []ProviderFallbackConfi
 		if public == "" {
 			return fmt.Errorf("fallback public model is required")
 		}
+		if _, exists := chains[public]; exists {
+			return fmt.Errorf("fallback %q is configured more than once", public)
+		}
 		if len(cfg.Chain) == 0 {
 			return fmt.Errorf("fallback %q must include at least one chain entry", public)
 		}

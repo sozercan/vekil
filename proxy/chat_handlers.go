@@ -162,6 +162,7 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 	defer upstreamCancel()
 
 	resp, owner, err := h.postAnthropicMessagesTracked(upstreamCtx, body, anthropicExtraHeadersFromRequest(r))
+	h.observeSelectedProvider(upstreamCtx, owner)
 	if owner.upstreamModel != "" {
 		upstreamModel = owner.upstreamModel
 	}

@@ -29,6 +29,22 @@ func (h *ProxyHandler) newInferenceUpstreamContext(streaming bool) (context.Cont
 // non-tracked callers (insight, model-catalog fetch, count-token probes) stay
 // uncounted. Pass the inbound r.Context(); a context without the marker (e.g.
 // context.Background()) yields an untracked upstream context.
+type upstreamAttemptTimeoutContextKey struct{}
+
+func contextWithUpstreamAttemptTimeout(ctx context.Context, timeout time.Duration) context.Context {
+	if timeout <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, upstreamAttemptTimeoutContextKey{}, timeout)
+}
+
+func upstreamAttemptTimeoutFromContext(ctx context.Context, fallback time.Duration) time.Duration {
+	if timeout, ok := ctx.Value(upstreamAttemptTimeoutContextKey{}).(time.Duration); ok && timeout > 0 {
+		return timeout
+	}
+	return fallback
+}
+
 func (h *ProxyHandler) newInferenceUpstreamContextFrom(inbound context.Context, streaming bool) (context.Context, context.CancelFunc) {
 	// Use background context with timeout to avoid cancellation from client
 	// disconnects while still preventing goroutine leaks on upstream hangs.
@@ -43,6 +59,7 @@ func (h *ProxyHandler) newInferenceUpstreamContextFrom(inbound context.Context, 
 	if summary := RequestSummaryFromContext(inbound); summary != nil {
 		ctx = contextWithRequestSummary(ctx, summary)
 	}
+	ctx = contextWithUpstreamAttemptTimeout(ctx, timeout)
 	return ctx, cancel
 }
 
@@ -217,9 +234,7 @@ func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body [
 
 func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header) (*http.Response, error) {
 	resp, selectedOwner, _, err := h.postJSONEndpointWithHeadersTracked(ctx, path, body, extraHeaders)
-	if err == nil {
-		h.observeSelectedProvider(ctx, selectedOwner)
-	}
+	h.observeSelectedProvider(ctx, selectedOwner)
 	return resp, err
 }
 
@@ -240,7 +255,7 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersTracked(ctx context.Context, p
 		attemptCtx := ctx
 		var cancel context.CancelFunc
 		if i > 0 && ctx.Err() != nil {
-			attemptCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), upstreamTimeout)
+			attemptCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), upstreamAttemptTimeoutFromContext(ctx, upstreamTimeout))
 		}
 		attemptProvider := h.providerSetup().providerByID(attemptOwner.providerID)
 		if attemptProvider == nil || !attemptProvider.supportsEndpoint(path) || !providerModelSupportsEndpoint(attemptOwner, path) {
@@ -249,7 +264,7 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersTracked(ctx context.Context, p
 			}
 			continue
 		}
-		attemptBody, prepErr := prepareProviderRequestBody(attemptProvider, attemptOwner, body, path)
+		attemptBody, prepErr := prepareProviderRequestBody(attemptProvider, attemptOwner, body, path, owner)
 		if prepErr != nil {
 			if cancel != nil {
 				cancel()
@@ -317,9 +332,12 @@ func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte
 func (h *ProxyHandler) postResponsesWithHeadersTracked(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, providerModel, error) {
 	resp, owner, _, err := h.postJSONEndpointWithHeadersTracked(ctx, providerEndpointResponses, body, extraHeaders)
 	if err != nil {
-		return nil, providerModel{}, err
+		return nil, owner, err
 	}
-	resp, err = h.maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx, body, extraHeaders, resp)
+	resp, retryOwner, err := h.maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx, body, extraHeaders, resp)
+	if retryOwner.providerID != "" {
+		owner = retryOwner
+	}
 	return resp, owner, err
 }
 
@@ -541,7 +559,7 @@ func rewriteAnthropicModelFields(payload map[string]json.RawMessage, publicModel
 	return changed
 }
 
-func prepareProviderRequestBody(provider *providerRuntime, owner providerModel, body []byte, endpoint string) ([]byte, error) {
+func prepareProviderRequestBody(provider *providerRuntime, owner providerModel, body []byte, endpoint string, sourceOwners ...providerModel) ([]byte, error) {
 	rewrittenBody := body
 	if provider == nil {
 		return nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider is required")}
@@ -555,7 +573,30 @@ func prepareProviderRequestBody(provider *providerRuntime, owner providerModel, 
 			}
 		}
 	}
+	if endpoint == providerEndpointResponses && len(sourceOwners) > 0 && providerFallbackChangesStateOwner(sourceOwners[0], owner) {
+		rewrittenBody = stripResponsesPreviousResponseID(rewrittenBody)
+	}
 	return applyProviderModelRequestPolicy(rewrittenBody, owner), nil
+}
+
+func providerFallbackChangesStateOwner(source, target providerModel) bool {
+	return strings.TrimSpace(source.providerID) != "" && strings.TrimSpace(target.providerID) != "" && source.providerID != target.providerID
+}
+
+func stripResponsesPreviousResponseID(body []byte) []byte {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	if _, ok := payload["previous_response_id"]; !ok {
+		return body
+	}
+	delete(payload, "previous_response_id")
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return rewritten
 }
 
 func (h *ProxyHandler) providerFallbackAttempts(owner providerModel, endpoint string) []providerModel {

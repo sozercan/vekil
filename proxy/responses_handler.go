@@ -106,10 +106,15 @@ func responsesRequestStreams(bodyBytes []byte) bool {
 func (h *ProxyHandler) postPreparedResponsesRequest(ctx, observeCtx context.Context, req preparedResponsesRequest) (*http.Response, providerModel, error) {
 	resp, selectedOwner, err := h.postResponsesWithHeadersTracked(ctx, req.body, req.upstreamHeaders)
 	if err != nil {
-		return nil, providerModel{}, err
+		h.observeSelectedProvider(observeCtx, selectedOwner)
+		return nil, selectedOwner, err
 	}
 	h.observeSelectedProvider(observeCtx, selectedOwner)
-	resp, err = h.maybeRetryCompactedResponsesRequest(ctx, observeCtx, req.body, req.extraHeaders, req.upstreamHeaders, resp)
+	resp, retryOwner, err := h.maybeRetryCompactedResponsesRequest(ctx, observeCtx, req.body, req.extraHeaders, req.upstreamHeaders, resp)
+	if retryOwner.providerID != "" {
+		selectedOwner = retryOwner
+		h.observeSelectedProvider(observeCtx, selectedOwner)
+	}
 	return resp, selectedOwner, err
 }
 
@@ -2203,15 +2208,15 @@ func (h *ProxyHandler) postResponsesWithFallbackHeaders(ctx context.Context, bod
 	return resp, err
 }
 
-func (h *ProxyHandler) maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, resp *http.Response) (*http.Response, error) {
+func (h *ProxyHandler) maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, resp *http.Response) (*http.Response, providerModel, error) {
 	if resp == nil || resp.StatusCode != http.StatusBadRequest {
-		return resp, nil
+		return resp, providerModel{}, nil
 	}
 
 	respBodyPrefix, err := io.ReadAll(io.LimitReader(resp.Body, int64(compactUpstreamErrorBodySize)+1))
 	if err != nil {
 		_ = resp.Body.Close()
-		return nil, err
+		return nil, providerModel{}, err
 	}
 	classificationBody := respBodyPrefix
 	if len(classificationBody) > compactUpstreamErrorBodySize {
@@ -2231,24 +2236,24 @@ func (h *ProxyHandler) maybeRetryResponsesWithoutUnverifiableEncryptedContent(ct
 	}
 
 	if !isUnverifiableEncryptedContentError(resp.StatusCode, classificationBody) {
-		return restoreOriginalResp(), nil
+		return restoreOriginalResp(), providerModel{}, nil
 	}
 
 	retryBody, strippedItems := sanitizeResponsesUnverifiableEncryptedContentBody(bodyBytes)
 	if strippedItems == 0 {
-		return restoreOriginalResp(), nil
+		return restoreOriginalResp(), providerModel{}, nil
 	}
 
 	h.log.Info("retrying responses request without unverifiable encrypted content",
 		logger.F("encrypted_items_stripped", strippedItems),
 	)
-	retryResp, retryErr := h.postJSONEndpointWithHeaders(ctx, providerEndpointResponses, retryBody, extraHeaders)
+	retryResp, retryOwner, _, retryErr := h.postJSONEndpointWithHeadersTracked(ctx, providerEndpointResponses, retryBody, extraHeaders)
 	if retryErr != nil {
 		h.log.Debug("responses encrypted-content retry request failed", logger.Err(retryErr))
-		return restoreOriginalResp(), nil
+		return restoreOriginalResp(), providerModel{}, nil
 	}
 	_ = resp.Body.Close()
-	return retryResp, nil
+	return retryResp, retryOwner, nil
 }
 
 type prefixedReadCloser struct {
@@ -2517,15 +2522,15 @@ func applyResolvedCompactModel(bodyBytes []byte, budget *compactBudget) []byte {
 	return sanitizeResponsesModelFallbackBody(rewritten)
 }
 
-func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx context.Context, bodyBytes []byte, extraHeaders, upstreamHeaders http.Header, resp *http.Response) (*http.Response, error) {
+func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx context.Context, bodyBytes []byte, extraHeaders, upstreamHeaders http.Header, resp *http.Response) (*http.Response, providerModel, error) {
 	if resp == nil || resp.StatusCode != http.StatusRequestEntityTooLarge {
-		return resp, nil
+		return resp, providerModel{}, nil
 	}
 
 	var requestFields map[string]json.RawMessage
 	if err := json.Unmarshal(bodyBytes, &requestFields); err != nil {
 		h.log.Debug("responses 413 compaction skipped", logger.F("reason", "invalid_request_json"), logger.Err(err))
-		return resp, nil
+		return resp, providerModel{}, nil
 	}
 
 	var previousResponseID string
@@ -2535,14 +2540,14 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 	var model string
 	if err := json.Unmarshal(requestFields["model"], &model); err != nil || strings.TrimSpace(model) == "" {
 		h.log.Debug("responses 413 compaction skipped", logger.F("reason", "missing_model"))
-		return resp, nil
+		return resp, providerModel{}, nil
 	}
 	model = strings.TrimSpace(model)
 
 	var input []json.RawMessage
 	if err := json.Unmarshal(requestFields["input"], &input); err != nil {
 		h.log.Debug("responses 413 compaction skipped", logger.F("reason", "input_not_array"), logger.Err(err))
-		return resp, nil
+		return resp, providerModel{}, nil
 	}
 	if !isLikelyResponsesReplay(input) {
 		h.log.Info("responses 413 compaction skipped",
@@ -2550,25 +2555,25 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 			logger.F("input_items", len(input)),
 			logger.F("previous_response_id_present", previousResponseID != ""),
 		)
-		return resp, nil
+		return resp, providerModel{}, nil
 	}
 
 	configuredKeepTail := h.responsesWebSocketConfig().AutoCompactKeepTail
 	if configuredKeepTail <= 0 {
 		h.log.Debug("responses 413 compaction skipped", logger.F("reason", "keep_tail_disabled"), logger.F("keep_tail", configuredKeepTail))
-		return resp, nil
+		return resp, providerModel{}, nil
 	}
 
 	keepTailSchedule := compactedResponsesRetryKeepTailSchedule(len(input), configuredKeepTail)
 	if len(keepTailSchedule) == 0 {
 		h.log.Debug("responses 413 compaction skipped", logger.F("reason", "not_enough_input_items"), logger.F("input_items", len(input)), logger.F("keep_tail", configuredKeepTail))
-		return resp, nil
+		return resp, providerModel{}, nil
 	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		_ = resp.Body.Close()
-		return nil, err
+		return nil, providerModel{}, err
 	}
 	_ = resp.Body.Close()
 	lastResp := cloneHTTPResponseWithBody(resp, respBody)
@@ -2591,13 +2596,13 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 		summary, err := h.compactResponsesInputWithBudget(ctx, model, input[:prefixLen], extraHeaders, budget)
 		if err != nil {
 			h.log.Debug("responses 413 compaction failed", logger.F("keep_tail", keepTail), logger.Err(err))
-			return lastResp, nil
+			return lastResp, providerModel{}, nil
 		}
 
 		checkpoint, err := proxyCompactionContextRawMessage(summary)
 		if err != nil {
 			h.log.Debug("responses 413 compaction checkpoint build failed", logger.F("keep_tail", keepTail), logger.Err(err))
-			return lastResp, nil
+			return lastResp, providerModel{}, nil
 		}
 
 		compactedInput := make([]json.RawMessage, 0, alignedKeepTail+1)
@@ -2607,14 +2612,14 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 		compactedInputRaw, err := json.Marshal(compactedInput)
 		if err != nil {
 			h.log.Debug("responses 413 compaction marshal failed", logger.F("keep_tail", keepTail), logger.Err(err))
-			return lastResp, nil
+			return lastResp, providerModel{}, nil
 		}
 		requestFields["input"] = compactedInputRaw
 
 		retryBody, err := json.Marshal(requestFields)
 		if err != nil {
 			h.log.Debug("responses 413 retry body marshal failed", logger.F("keep_tail", keepTail), logger.Err(err))
-			return lastResp, nil
+			return lastResp, providerModel{}, nil
 		}
 
 		fields := []logger.Field{
@@ -2636,19 +2641,19 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 		}
 		h.log.Info("retrying responses request with compacted history after 413", fields...)
 
-		retryResp, retryErr := h.postResponsesWithHeaders(ctx, retryBody, upstreamHeaders)
+		retryResp, retryOwner, retryErr := h.postResponsesWithHeadersTracked(ctx, retryBody, upstreamHeaders)
 		if retryErr != nil {
 			h.log.Debug("responses 413 retry request failed", logger.F("keep_tail", keepTail), logger.Err(retryErr))
-			return lastResp, nil
+			return lastResp, providerModel{}, nil
 		}
 		if retryResp.StatusCode != http.StatusRequestEntityTooLarge {
-			return retryResp, nil
+			return retryResp, retryOwner, nil
 		}
 
 		retryBodyBytes, truncated, readErr := readBodyWithCap(retryResp.Body, compactUpstreamErrorBodySize)
 		_ = retryResp.Body.Close()
 		if readErr != nil {
-			return nil, readErr
+			return nil, providerModel{}, readErr
 		}
 		lastResp = cloneHTTPResponseWithBody(retryResp, retryBodyBytes)
 		if truncated {
@@ -2680,7 +2685,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 		logger.F("compact_attempts_used", compactAttempts),
 		logger.F("compact_attempts_max", compactMaxAttempts),
 	)
-	return lastResp, nil
+	return lastResp, providerModel{}, nil
 }
 
 func isLikelyResponsesReplay(input []json.RawMessage) bool {
