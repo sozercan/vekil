@@ -4,6 +4,7 @@ package selector
 
 import (
 	"errors"
+	"sync/atomic"
 	"time"
 )
 
@@ -11,15 +12,32 @@ import (
 var ErrNoEndpoints = errors.New("no endpoints available")
 
 // Endpoint represents a single upstream target within a provider. The Healthy
-// flag and LatencyEWMA are maintained externally by the health tracker and read
-// by selectors at pick time.
+// flag is maintained externally by the health tracker and read by selectors at
+// pick time. LatencyEWMA is updated atomically via accessor methods.
 type Endpoint struct {
-	Name        string
-	BaseURL     string
-	Key         string
-	Weight      uint
-	Healthy     bool
-	LatencyEWMA time.Duration
+	Name    string
+	BaseURL string
+	Key     string
+	Weight  uint
+	Healthy bool
+	// latencyEWMA stores the EWMA as int64 nanoseconds for atomic access.
+	latencyEWMA atomic.Int64
+}
+
+// LoadLatencyEWMA returns the current EWMA latency, safe for concurrent use.
+func (e *Endpoint) LoadLatencyEWMA() time.Duration {
+	return time.Duration(e.latencyEWMA.Load())
+}
+
+// StoreLatencyEWMA sets the EWMA latency, safe for concurrent use.
+func (e *Endpoint) StoreLatencyEWMA(d time.Duration) {
+	e.latencyEWMA.Store(int64(d))
+}
+
+// SetLatencyEWMA sets the initial EWMA latency. Convenience for test setup
+// and initialization. Equivalent to StoreLatencyEWMA.
+func (e *Endpoint) SetLatencyEWMA(d time.Duration) {
+	e.latencyEWMA.Store(int64(d))
 }
 
 // Selector picks the next endpoint to use from a list of candidates.

@@ -135,8 +135,11 @@ func (t *EndpointHealthTracker) isHealthyLocked() bool {
 			t.halfOpen = true
 			t.halfOpenProbed = false
 		}
-		// In half-open state, allow one probe request.
+		// In half-open state, allow one probe request. Mark as probed
+		// immediately so subsequent callers under the same lock cycle
+		// do not also receive permission to probe.
 		if t.halfOpen && !t.halfOpenProbed {
+			t.halfOpenProbed = true
 			return true
 		}
 	}

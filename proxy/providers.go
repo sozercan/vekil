@@ -203,6 +203,13 @@ func (p *providerRuntime) pickEndpoint() *providerEndpoint {
 
 // pickEndpointExcluding selects an endpoint different from the excluded one.
 // Used during retry to prefer a different healthy endpoint.
+//
+// NOTE: Each call to pickEndpoint() advances the underlying selector state
+// (e.g. round-robin counter or weighted accumulator). When multiple picks are
+// needed to skip the excluded endpoint, the extra advances may perturb the
+// load-balancing distribution observed by concurrent requests. This is an
+// acceptable trade-off for retry correctness: retries are infrequent relative
+// to normal traffic and the selector rebalances over subsequent picks.
 func (p *providerRuntime) pickEndpointExcluding(exclude *providerEndpoint) *providerEndpoint {
 	if len(p.endpoints) <= 1 {
 		return p.pickEndpoint()
@@ -1625,22 +1632,22 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 
 // newProviderJSONRequestWithEndpoint is like newProviderJSONRequest but uses
 // the endpoint's baseURL and apiKey instead of the provider-level ones.
+// It builds the request without mutating the shared providerRuntime to avoid
+// data races under concurrent access.
 func (h *ProxyHandler) newProviderJSONRequestWithEndpoint(ctx context.Context, provider *providerRuntime, ep *providerEndpoint, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
-	// Temporarily swap in the endpoint-specific overrides.
-	origBaseURL := provider.baseURL
-	origAPIKey := provider.apiKey
+	// Determine the effective baseURL and apiKey from the endpoint, falling
+	// back to the provider-level values. We build a shallow copy of the
+	// provider with these overrides so concurrent requests never observe
+	// partially-swapped state on the shared struct.
+	epProvider := *provider
 	if ep.baseURL != "" {
-		provider.baseURL = ep.baseURL
+		epProvider.baseURL = ep.baseURL
 	}
 	if ep.apiKey != "" {
-		provider.apiKey = ep.apiKey
+		epProvider.apiKey = ep.apiKey
 	}
-	defer func() {
-		provider.baseURL = origBaseURL
-		provider.apiKey = origAPIKey
-	}()
 
-	return h.newProviderJSONRequest(ctx, provider, method, path, body, extraHeaders, extraQuery, owners...)
+	return h.newProviderJSONRequest(ctx, &epProvider, method, path, body, extraHeaders, extraQuery, owners...)
 }
 
 func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *providerRuntime, rawQuery, ifNoneMatch string) (providerModelsFetchResult, error) {

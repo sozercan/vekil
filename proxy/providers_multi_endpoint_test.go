@@ -459,20 +459,20 @@ func TestMultiEndpointValidationErrors(t *testing.T) {
 func TestMultiEndpointLatencyEWMAUpdate(t *testing.T) {
 	ep := &providerEndpoint{
 		name: "test",
-		sel:  &selector.Endpoint{Name: "test", Healthy: true, LatencyEWMA: 0},
+		sel:  &selector.Endpoint{Name: "test", Healthy: true},
 	}
 
 	// First measurement initializes.
 	updateEndpointLatencyEWMA(ep, 100*time.Millisecond)
-	if ep.sel.LatencyEWMA != 100*time.Millisecond {
-		t.Errorf("first EWMA = %v, want 100ms", ep.sel.LatencyEWMA)
+	if ep.sel.LoadLatencyEWMA() != 100*time.Millisecond {
+		t.Errorf("first EWMA = %v, want 100ms", ep.sel.LoadLatencyEWMA())
 	}
 
 	// Second measurement applies smoothing.
 	updateEndpointLatencyEWMA(ep, 200*time.Millisecond)
 	// Expected: 0.3*200 + 0.7*100 = 60 + 70 = 130ms
 	expected := time.Duration(0.3*float64(200*time.Millisecond) + 0.7*float64(100*time.Millisecond))
-	if ep.sel.LatencyEWMA != expected {
-		t.Errorf("second EWMA = %v, want %v", ep.sel.LatencyEWMA, expected)
+	if ep.sel.LoadLatencyEWMA() != expected {
+		t.Errorf("second EWMA = %v, want %v", ep.sel.LoadLatencyEWMA(), expected)
 	}
 }

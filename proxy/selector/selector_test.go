@@ -6,6 +6,13 @@ import (
 	"time"
 )
 
+// newEndpoint creates an Endpoint with the given latency for test convenience.
+func newEndpoint(name string, healthy bool, latency time.Duration) *Endpoint {
+	ep := &Endpoint{Name: name, Healthy: healthy}
+	ep.SetLatencyEWMA(latency)
+	return ep
+}
+
 func TestRoundRobinBasic(t *testing.T) {
 	rr := NewRoundRobin()
 	eps := []*Endpoint{
@@ -163,9 +170,9 @@ func TestWeightedEmpty(t *testing.T) {
 func TestLeastLatencyBasic(t *testing.T) {
 	ll := NewLeastLatency()
 	eps := []*Endpoint{
-		{Name: "slow", Healthy: true, LatencyEWMA: 200 * time.Millisecond},
-		{Name: "fast", Healthy: true, LatencyEWMA: 50 * time.Millisecond},
-		{Name: "medium", Healthy: true, LatencyEWMA: 100 * time.Millisecond},
+		newEndpoint("slow", true, 200*time.Millisecond),
+		newEndpoint("fast", true, 50*time.Millisecond),
+		newEndpoint("medium", true, 100*time.Millisecond),
 	}
 
 	ep, err := ll.Pick(eps)
@@ -180,8 +187,8 @@ func TestLeastLatencyBasic(t *testing.T) {
 func TestLeastLatencyPrefersUnprobed(t *testing.T) {
 	ll := NewLeastLatency()
 	eps := []*Endpoint{
-		{Name: "probed", Healthy: true, LatencyEWMA: 50 * time.Millisecond},
-		{Name: "unprobed", Healthy: true, LatencyEWMA: 0},
+		newEndpoint("probed", true, 50*time.Millisecond),
+		newEndpoint("unprobed", true, 0),
 	}
 
 	ep, err := ll.Pick(eps)
@@ -196,8 +203,8 @@ func TestLeastLatencyPrefersUnprobed(t *testing.T) {
 func TestLeastLatencySkipsUnhealthy(t *testing.T) {
 	ll := NewLeastLatency()
 	eps := []*Endpoint{
-		{Name: "fast-down", Healthy: false, LatencyEWMA: 10 * time.Millisecond},
-		{Name: "slow-up", Healthy: true, LatencyEWMA: 200 * time.Millisecond},
+		newEndpoint("fast-down", false, 10*time.Millisecond),
+		newEndpoint("slow-up", true, 200*time.Millisecond),
 	}
 
 	ep, err := ll.Pick(eps)
@@ -212,8 +219,8 @@ func TestLeastLatencySkipsUnhealthy(t *testing.T) {
 func TestLeastLatencyAllUnhealthy(t *testing.T) {
 	ll := NewLeastLatency()
 	eps := []*Endpoint{
-		{Name: "a", Healthy: false, LatencyEWMA: 100 * time.Millisecond},
-		{Name: "b", Healthy: false, LatencyEWMA: 50 * time.Millisecond},
+		newEndpoint("a", false, 100*time.Millisecond),
+		newEndpoint("b", false, 50*time.Millisecond),
 	}
 
 	ep, err := ll.Pick(eps)
