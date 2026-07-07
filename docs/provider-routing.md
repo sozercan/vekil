@@ -120,6 +120,67 @@ providers:
 
 JSON configs use the same snake_case field names as YAML.
 
+### Multi-Endpoint Load Balancing
+
+A provider can declare `endpoints: [...]` instead of a single `base_url`/key pair. Vekil picks a healthy endpoint for each upstream attempt, retries retryable failures (`429`, `5xx`, and transient transport errors) against another healthy endpoint of the same provider, and quarantines endpoints whose error budget is exhausted. Single-endpoint provider configs continue to behave as before.
+
+Selector strategies:
+
+- `round_robin` (default) rotates across healthy endpoints.
+- `weighted` repeats endpoints by `weight` before rotating.
+- `least_latency` prefers endpoints with the lowest successful-request EWMA, probing never-used endpoints first.
+
+Endpoint health defaults to `error_budget: "10/m"` and `cooldown: 30s`. The error budget syntax is `N/{ms,s,m,h}`; for example, `2/s`, `10/m`, or `1500/h`.
+
+Azure three-region example:
+
+```yaml
+providers:
+  - id: azure-openai
+    type: azure-openai
+    default: true
+    selector: weighted
+    api_version: 2025-04-01-preview
+    endpoints:
+      - name: eastus
+        base_url: https://eastus-resource.openai.azure.com
+        api_key_env: AZURE_EASTUS_KEY
+        weight: 2
+        health:
+          error_budget: "10/m"
+          cooldown: 30s
+      - name: westus
+        base_url: https://westus-resource.openai.azure.com
+        api_key_env: AZURE_WESTUS_KEY
+        weight: 1
+      - name: centralus
+        base_url: https://centralus-resource.openai.azure.com
+        api_key_env: AZURE_CENTRALUS_KEY
+        weight: 1
+    models:
+      - public_id: gpt-5.4
+        deployment: gpt-5.4
+        endpoints:
+          - /chat/completions
+```
+
+Copilot two-account example:
+
+```yaml
+providers:
+  - id: copilot
+    type: copilot
+    default: true
+    selector: round_robin
+    endpoints:
+      - name: alice
+        api_key_env: COPILOT_ALICE_TOKEN
+      - name: bob
+        api_key_env: COPILOT_BOB_TOKEN
+```
+
+For Copilot endpoints, `api_key`/`api_key_env` override the default local Copilot token for that endpoint. If an endpoint omits a key, Vekil falls back to the normal local Copilot authentication flow.
+
 ### Generic Provider Behavior
 
 OpenAI-compatible providers route `POST /v1/chat/completions` to `chat_completions_path`. Anthropic `POST /v1/messages` requests for these models are translated through the existing OpenAI Chat Completions adapter. `POST /v1/responses` is never inferred; add `/responses` to a model only after validating the upstream model and path.
@@ -143,6 +204,13 @@ Anthropic-compatible providers directly forward Anthropic `POST /v1/messages` to
 | `messages_path` | `anthropic-compatible` | Upstream path for public `POST /v1/messages`. Defaults to `/v1/messages`. |
 | `models_path` | generic providers | Upstream path for dynamic model discovery and readiness probes. Defaults to `/models`. |
 | `model_discovery` | generic providers | `static`, `openai`, `ollama`, or `openrouter-tools`. |
+| `selector` | providers with `endpoints` | Endpoint selector: `round_robin`, `weighted`, or `least_latency`. Defaults to `round_robin`. |
+| `endpoints[].name` | providers with `endpoints` | Stable endpoint label for logs and health tracking. Auto-fills to `endpoint-N` if omitted. |
+| `endpoints[].base_url` | providers with `endpoints` | Endpoint-specific upstream origin. Defaults to provider `base_url`; Copilot defaults to the built-in Copilot API URL. |
+| `endpoints[].api_key`, `endpoints[].api_key_env` | providers with `endpoints` | Endpoint-specific credential. Defaults to provider-level key for API-key providers. |
+| `endpoints[].weight` | `weighted` selector | Relative endpoint weight; `0` behaves like `1`. |
+| `endpoints[].health.error_budget` | providers with `endpoints` | Retryable failure budget before quarantine, formatted as `N/{ms,s,m,h}`. Defaults to `10/m`. |
+| `endpoints[].health.cooldown` | providers with `endpoints` | Quarantine duration before the endpoint is eligible again. Defaults to `30s`. |
 | `models[].endpoints` | all static models | Public endpoint allowlist. This remains the source of truth for what Vekil advertises and routes. |
 
 ### Generic Provider Cookbook

@@ -130,12 +130,15 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 			return nil, err
 		}
 
+		attemptEndpoint := providerEndpointFromContext(req.Context())
+		attemptStart := time.Now()
 		resp, err := h.client.Do(req)
 		if err != nil {
 			lastErr = err
 			if permanentTransportError(err) {
 				return nil, err
 			}
+			recordEndpointFailure(attemptEndpoint, time.Now())
 			if attempt < maxRetries-1 {
 				delay := backoff(retryDelay, attempt)
 				h.logRetryAttempt(req.Context(), attempt, 0, "", delay, err)
@@ -147,8 +150,12 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		}
 
 		if !retryable(resp.StatusCode) {
+			if resp.StatusCode < http.StatusInternalServerError && resp.StatusCode != http.StatusTooManyRequests {
+				recordEndpointSuccess(attemptEndpoint, time.Since(attemptStart))
+			}
 			return resp, nil
 		}
+		recordEndpointFailure(attemptEndpoint, time.Now())
 
 		retryAfterHeader := resp.Header.Get("Retry-After")
 		upstreamErr := &upstreamError{
@@ -199,6 +206,9 @@ func (h *ProxyHandler) logRetryAttempt(ctx context.Context, attempt int, status 
 	}
 	if retryAfter != "" {
 		fields = append(fields, logger.F("retry_after", retryAfter))
+	}
+	if endpoint := providerEndpointNameFromContext(ctx); endpoint != "" {
+		fields = append(fields, logger.F("endpoint", endpoint))
 	}
 	if err != nil {
 		fields = append(fields, logger.Err(err))
@@ -287,4 +297,18 @@ func drainRetryableUpstreamErrorBody(body io.ReadCloser) {
 		_ = timer.Stop()
 		closeBody()
 	}()
+}
+
+func recordEndpointFailure(endpoint *providerEndpointRuntime, now time.Time) {
+	if endpoint == nil || endpoint.health == nil {
+		return
+	}
+	endpoint.health.recordFailure(now)
+}
+
+func recordEndpointSuccess(endpoint *providerEndpointRuntime, latency time.Duration) {
+	if endpoint == nil || endpoint.health == nil {
+		return
+	}
+	endpoint.health.recordSuccess(latency)
 }

@@ -12,7 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/sozercan/vekil/proxy/selector"
 	"gopkg.in/yaml.v3"
 )
 
@@ -92,7 +94,25 @@ type ProviderConfig struct {
 	ModelsPath          string                      `json:"models_path,omitempty" yaml:"models_path,omitempty"`
 	ModelDiscovery      string                      `json:"model_discovery,omitempty" yaml:"model_discovery,omitempty"`
 	Headers             CopilotHeaderProfilesConfig `json:"headers,omitempty" yaml:"headers,omitempty"`
+	Selector            string                      `json:"selector,omitempty" yaml:"selector,omitempty"`
+	Endpoints           []ProviderEndpointConfig    `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
 	Models              []ProviderModelConfig       `json:"models,omitempty" yaml:"models,omitempty"`
+}
+
+// ProviderEndpointConfig configures one upstream endpoint/key under a provider.
+type ProviderEndpointConfig struct {
+	Name      string                       `json:"name" yaml:"name"`
+	BaseURL   string                       `json:"base_url,omitempty" yaml:"base_url,omitempty"`
+	APIKey    string                       `json:"api_key,omitempty" yaml:"api_key,omitempty"`
+	APIKeyEnv string                       `json:"api_key_env,omitempty" yaml:"api_key_env,omitempty"`
+	Weight    uint                         `json:"weight,omitempty" yaml:"weight,omitempty"`
+	Health    ProviderEndpointHealthConfig `json:"health,omitempty" yaml:"health,omitempty"`
+}
+
+// ProviderEndpointHealthConfig controls endpoint quarantine after retryable failures.
+type ProviderEndpointHealthConfig struct {
+	ErrorBudget string `json:"error_budget,omitempty" yaml:"error_budget,omitempty"`
+	Cooldown    string `json:"cooldown,omitempty" yaml:"cooldown,omitempty"`
 }
 
 // ProviderModelConfig maps a public model ID exposed by this proxy to the
@@ -134,6 +154,16 @@ type providerRuntime struct {
 	staticOrder    []string
 	codexAuth      *openAICodexAuth
 	headerProfiles CopilotHeaderProfilesConfig
+	endpoints      []*providerEndpointRuntime
+	endpointByName map[string]*providerEndpointRuntime
+	selectorName   string
+	selector       selector.Selector
+}
+
+type providerEndpointRuntime struct {
+	endpoint selector.Endpoint
+	apiKey   string
+	health   *endpointHealthTracker
 }
 
 type providerEndpointPaths struct {
@@ -608,20 +638,24 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		runtime.headerProfiles = cfg.Headers
 	case providerTypeAzureOpenAI:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+		baseKind := azureBaseURLKindInvalid
 		if baseURL == "" {
-			return nil, fmt.Errorf("provider %q must set base_url", id)
-		}
-		baseKind := classifyAzureBaseURL(baseURL)
-		switch baseKind {
-		case azureBaseURLKindOpenAIV1, azureBaseURLKindLegacyOpenAI, azureBaseURLKindResourceRoot:
-		case azureBaseURLKindModels:
-			return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: Microsoft Foundry /models inference endpoints are not supported; use the OpenAI-compatible endpoint ending in /openai/v1 instead", id, baseURL)
-		default:
-			return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: expected an absolute URL whose path ends in /openai/v1 or /openai, or is the Azure OpenAI resource root, with no query string or fragment", id, baseURL)
+			if len(cfg.Endpoints) == 0 {
+				return nil, fmt.Errorf("provider %q must set base_url", id)
+			}
+		} else {
+			baseKind = classifyAzureBaseURL(baseURL)
+			switch baseKind {
+			case azureBaseURLKindOpenAIV1, azureBaseURLKindLegacyOpenAI, azureBaseURLKindResourceRoot:
+			case azureBaseURLKindModels:
+				return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: Microsoft Foundry /models inference endpoints are not supported; use the OpenAI-compatible endpoint ending in /openai/v1 instead", id, baseURL)
+			default:
+				return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: expected an absolute URL whose path ends in /openai/v1 or /openai, or is the Azure OpenAI resource root, with no query string or fragment", id, baseURL)
+			}
 		}
 		runtime.baseURL = baseURL
 		runtime.apiVersion = strings.TrimSpace(cfg.APIVersion)
-		if runtime.apiVersion == "" && baseKind != azureBaseURLKindOpenAIV1 {
+		if runtime.apiVersion == "" && (baseURL == "" || baseKind != azureBaseURLKindOpenAIV1) {
 			return nil, fmt.Errorf("provider %q api_version is required for Azure base_url %q unless the path ends in /openai/v1", id, baseURL)
 		}
 
@@ -639,7 +673,7 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 			if runtime.apiKey == "" && strings.TrimSpace(cfg.APIKeyEnv) != "" {
 				runtime.apiKey = strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.APIKeyEnv)))
 			}
-			if runtime.apiKey == "" {
+			if runtime.apiKey == "" && len(cfg.Endpoints) == 0 {
 				return nil, fmt.Errorf("provider %q must set api_key or api_key_env", id)
 			}
 		case providerAuthModeAzureIdentity:
@@ -686,9 +720,10 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 		if baseURL == "" {
-			return nil, fmt.Errorf("provider %q must set base_url", id)
-		}
-		if err := validateGenericProviderBaseURL(id, string(kind), baseURL); err != nil {
+			if len(cfg.Endpoints) == 0 {
+				return nil, fmt.Errorf("provider %q must set base_url", id)
+			}
+		} else if err := validateGenericProviderBaseURL(id, string(kind), baseURL); err != nil {
 			return nil, err
 		}
 		paths, err := configuredProviderEndpointPaths(kind, cfg)
@@ -723,6 +758,22 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		if err := addStaticProviderModels(runtime, cfg.Models, runtime.defaultStaticModelEndpoints()); err != nil {
 			return nil, err
 		}
+	}
+
+	endpointCfg := cfg
+	if kind == providerTypeCopilot && strings.TrimSpace(endpointCfg.BaseURL) == "" {
+		endpointCfg.BaseURL = runtime.baseURL
+	}
+	endpoints, endpointByName, endpointSelector, selectorName, err := buildProviderEndpointRuntimes(id, kind, endpointCfg)
+	if err != nil {
+		return nil, err
+	}
+	runtime.endpoints = endpoints
+	runtime.endpointByName = endpointByName
+	runtime.selector = endpointSelector
+	runtime.selectorName = selectorName
+	if err := validateProviderEndpointAuth(runtime); err != nil {
+		return nil, err
 	}
 
 	return runtime, nil
@@ -806,7 +857,7 @@ func configuredGenericProviderAuth(cfg ProviderConfig) (providerAuthType, string
 	case providerAuthTypeNone:
 		return authType, "", "", apiKey, nil
 	case providerAuthTypeBearer:
-		if apiKey == "" {
+		if apiKey == "" && len(cfg.Endpoints) == 0 {
 			return "", "", "", "", fmt.Errorf("auth_type bearer requires api_key or api_key_env")
 		}
 		if authHeader == "" {
@@ -816,7 +867,7 @@ func configuredGenericProviderAuth(cfg ProviderConfig) (providerAuthType, string
 			authPrefix = "Bearer"
 		}
 	case providerAuthTypeAPIKeyHeader:
-		if apiKey == "" {
+		if apiKey == "" && len(cfg.Endpoints) == 0 {
 			return "", "", "", "", fmt.Errorf("auth_type api-key-header requires api_key or api_key_env")
 		}
 		if authHeader == "" {
@@ -1193,11 +1244,18 @@ func rewriteRequestModelForProvider(body []byte, upstreamModel string) ([]byte, 
 }
 
 func (h *ProxyHandler) providerRequestURL(provider *providerRuntime, path string, extraQuery string, owners ...providerModel) (string, error) {
+	return h.providerRequestURLForEndpoint(provider, nil, path, extraQuery, owners...)
+}
+
+func (h *ProxyHandler) providerRequestURLForEndpoint(provider *providerRuntime, endpoint *providerEndpointRuntime, path string, extraQuery string, owners ...providerModel) (string, error) {
 	if provider == nil {
 		return "", fmt.Errorf("provider is required")
 	}
 
 	baseURL := strings.TrimRight(provider.baseURL, "/")
+	if endpoint != nil && strings.TrimSpace(endpoint.endpoint.BaseURL) != "" {
+		baseURL = strings.TrimRight(strings.TrimSpace(endpoint.endpoint.BaseURL), "/")
+	}
 	upstreamPath := provider.upstreamPath(path)
 	if upstreamPath == "" {
 		return "", fmt.Errorf("provider %q has no upstream path configured for %s", provider.id, path)
@@ -1244,7 +1302,11 @@ func providerUsesAzureClassicDeploymentPath(provider *providerRuntime, endpoint 
 	if provider == nil || provider.kind != providerTypeAzureOpenAI || endpoint != providerEndpointChatCompletions {
 		return false
 	}
-	baseKind := classifyAzureBaseURL(provider.baseURL)
+	baseURL := provider.baseURL
+	if baseURL == "" && len(provider.endpoints) > 0 && provider.endpoints[0] != nil {
+		baseURL = provider.endpoints[0].endpoint.BaseURL
+	}
+	baseKind := classifyAzureBaseURL(baseURL)
 	return baseKind == azureBaseURLKindLegacyOpenAI || baseKind == azureBaseURLKindResourceRoot
 }
 
@@ -1346,25 +1408,29 @@ func appendRawQuery(rawURL, rawQuery string) string {
 	return rawURL + separator + rawQuery
 }
 
-func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *providerRuntime, endpoint string) error {
+func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *providerRuntime, routeEndpoint string, selectedEndpoint *providerEndpointRuntime) error {
 	if provider == nil {
 		return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider is required")}
 	}
 
 	switch provider.kind {
 	case providerTypeCopilot:
-		token, err := h.auth.GetToken(req.Context())
-		if err != nil {
-			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
+		token := providerAPIKey(provider, selectedEndpoint)
+		if token == "" {
+			var err error
+			token, err = h.auth.GetToken(req.Context())
+			if err != nil {
+				return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
+			}
 		}
-		h.setCopilotHeadersForProvider(req, token, provider, endpoint)
+		h.setCopilotHeadersForProvider(req, token, provider, routeEndpoint)
 	case providerTypeAzureOpenAI:
 		clearCopilotHeaders(req.Header)
 		mergeHeaderValues(req.Header, provider.extraHeaders)
 		req.Header.Del("api-key")
 		switch provider.azureAuthMode() {
 		case providerAuthModeAPIKey:
-			req.Header.Set("api-key", provider.apiKey)
+			req.Header.Set("api-key", providerAPIKey(provider, selectedEndpoint))
 		case providerAuthModeAzureIdentity:
 			if provider.azureToken == nil {
 				return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no Azure identity token source configured", provider.id)}
@@ -1398,7 +1464,7 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		clearCopilotHeaders(req.Header)
 		mergeHeaderValues(req.Header, provider.extraHeaders)
-		if err := applyGenericProviderAuth(req, provider); err != nil {
+		if err := applyGenericProviderAuth(req, provider, selectedEndpoint); err != nil {
 			return err
 		}
 		if req.Method != http.MethodGet {
@@ -1410,19 +1476,19 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 	return nil
 }
 
-func applyGenericProviderAuth(req *http.Request, provider *providerRuntime) error {
+func applyGenericProviderAuth(req *http.Request, provider *providerRuntime, endpoint *providerEndpointRuntime) error {
 	switch provider.authType {
 	case providerAuthTypeNone, "":
 		return nil
 	case providerAuthTypeBearer, providerAuthTypeAPIKeyHeader:
-		if strings.TrimSpace(provider.apiKey) == "" {
+		if providerAPIKey(provider, endpoint) == "" {
 			return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no API key configured", provider.id)}
 		}
 		header := strings.TrimSpace(provider.authHeader)
 		if header == "" {
 			return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no auth header configured", provider.id)}
 		}
-		value := provider.apiKey
+		value := providerAPIKey(provider, endpoint)
 		if prefix := strings.TrimSpace(provider.authPrefix); prefix != "" {
 			value = prefix + " " + value
 		}
@@ -1434,10 +1500,15 @@ func applyGenericProviderAuth(req *http.Request, provider *providerRuntime) erro
 }
 
 func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
-	fullURL, err := h.providerRequestURL(provider, path, extraQuery, owners...)
+	selectedEndpoint, err := provider.pickEndpoint()
 	if err != nil {
 		return nil, err
 	}
+	fullURL, err := h.providerRequestURLForEndpoint(provider, selectedEndpoint, path, extraQuery, owners...)
+	if err != nil {
+		return nil, err
+	}
+	ctx = contextWithProviderEndpoint(ctx, selectedEndpoint)
 
 	var bodyReader io.Reader
 	if len(body) > 0 {
@@ -1451,7 +1522,7 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 	if len(extraHeaders) > 0 {
 		mergeHeaderValues(req.Header, extraHeaders)
 	}
-	if err := h.applyProviderHeaders(req, provider, path); err != nil {
+	if err := h.applyProviderHeaders(req, provider, path, selectedEndpoint); err != nil {
 		return nil, err
 	}
 	return req, nil
@@ -2268,4 +2339,196 @@ func mergeProviderModelRaw(raw json.RawMessage, supportedEndpoints []string) jso
 		return append(json.RawMessage(nil), raw...)
 	}
 	return merged
+}
+
+func buildProviderEndpointRuntimes(providerID string, kind providerType, cfg ProviderConfig) ([]*providerEndpointRuntime, map[string]*providerEndpointRuntime, selector.Selector, string, error) {
+	if len(cfg.Endpoints) == 0 {
+		return nil, nil, nil, "", nil
+	}
+	selectorName := strings.TrimSpace(cfg.Selector)
+	if selectorName == "" {
+		selectorName = "round_robin"
+	}
+	selected, err := newProviderEndpointSelector(selectorName)
+	if err != nil {
+		return nil, nil, nil, "", fmt.Errorf("provider %q: %w", providerID, err)
+	}
+	endpoints := make([]*providerEndpointRuntime, 0, len(cfg.Endpoints))
+	byName := make(map[string]*providerEndpointRuntime, len(cfg.Endpoints))
+	for i, raw := range cfg.Endpoints {
+		name := strings.TrimSpace(raw.Name)
+		if name == "" {
+			name = fmt.Sprintf("endpoint-%d", i+1)
+		}
+		if _, exists := byName[name]; exists {
+			return nil, nil, nil, "", fmt.Errorf("provider %q has duplicate endpoint name %q", providerID, name)
+		}
+		baseURL := strings.TrimRight(strings.TrimSpace(raw.BaseURL), "/")
+		if baseURL == "" {
+			baseURL = strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+		}
+		if baseURL == "" {
+			return nil, nil, nil, "", fmt.Errorf("provider %q endpoint %q must set base_url", providerID, name)
+		}
+		if err := validateEndpointBaseURL(providerID, name, kind, baseURL); err != nil {
+			return nil, nil, nil, "", err
+		}
+		apiKey := strings.TrimSpace(raw.APIKey)
+		if apiKey == "" && strings.TrimSpace(raw.APIKeyEnv) != "" {
+			apiKey = strings.TrimSpace(os.Getenv(strings.TrimSpace(raw.APIKeyEnv)))
+			if apiKey == "" {
+				return nil, nil, nil, "", fmt.Errorf("provider %q endpoint %q api_key_env %q is not set or is empty", providerID, name, strings.TrimSpace(raw.APIKeyEnv))
+			}
+		}
+		if apiKey == "" {
+			apiKey = strings.TrimSpace(cfg.APIKey)
+			if apiKey == "" && strings.TrimSpace(cfg.APIKeyEnv) != "" {
+				apiKey = strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.APIKeyEnv)))
+			}
+		}
+		healthCfg, err := buildEndpointHealthConfig(raw.Health)
+		if err != nil {
+			return nil, nil, nil, "", fmt.Errorf("provider %q endpoint %q: %w", providerID, name, err)
+		}
+		runtime := &providerEndpointRuntime{
+			endpoint: selector.Endpoint{Name: name, BaseURL: baseURL, Key: apiKey, Weight: raw.Weight, Healthy: true},
+			apiKey:   apiKey,
+			health:   newEndpointHealthTracker(healthCfg),
+		}
+		endpoints = append(endpoints, runtime)
+		byName[name] = runtime
+	}
+	return endpoints, byName, selected, selectorName, nil
+}
+
+func validateEndpointBaseURL(providerID, endpointName string, kind providerType, baseURL string) error {
+	switch kind {
+	case providerTypeAzureOpenAI:
+		baseKind := classifyAzureBaseURL(baseURL)
+		switch baseKind {
+		case azureBaseURLKindOpenAIV1, azureBaseURLKindLegacyOpenAI, azureBaseURLKindResourceRoot:
+			return nil
+		case azureBaseURLKindModels:
+			return fmt.Errorf("provider %q endpoint %q has unsupported Azure base_url %q: Microsoft Foundry /models inference endpoints are not supported; use the OpenAI-compatible endpoint ending in /openai/v1 instead", providerID, endpointName, baseURL)
+		default:
+			return fmt.Errorf("provider %q endpoint %q has unsupported Azure base_url %q: expected an absolute URL whose path ends in /openai/v1 or /openai, or is the Azure OpenAI resource root, with no query string or fragment", providerID, endpointName, baseURL)
+		}
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeOpenAICodex:
+		return validateGenericProviderBaseURL(providerID, string(kind), baseURL)
+	default:
+		return nil
+	}
+}
+
+func buildEndpointHealthConfig(raw ProviderEndpointHealthConfig) (endpointHealthConfig, error) {
+	cfg := defaultEndpointHealthConfig()
+	budget, err := parseEndpointErrorBudget(raw.ErrorBudget)
+	if err != nil {
+		return endpointHealthConfig{}, err
+	}
+	cfg.errorBudget = budget
+	if strings.TrimSpace(raw.Cooldown) != "" {
+		cooldown, err := time.ParseDuration(strings.TrimSpace(raw.Cooldown))
+		if err != nil || cooldown <= 0 {
+			return endpointHealthConfig{}, fmt.Errorf("invalid cooldown %q: expected positive duration", raw.Cooldown)
+		}
+		cfg.cooldown = cooldown
+	}
+	return cfg, nil
+}
+
+func newProviderEndpointSelector(name string) (selector.Selector, error) {
+	switch strings.TrimSpace(name) {
+	case "", "round_robin", "round-robin":
+		return selector.NewRoundRobin(), nil
+	case "weighted":
+		return selector.NewWeighted(), nil
+	case "least_latency", "least-latency":
+		return selector.NewLeastLatency(), nil
+	default:
+		return nil, fmt.Errorf("unsupported selector %q", name)
+	}
+}
+
+func (p *providerRuntime) pickEndpoint() (*providerEndpointRuntime, error) {
+	if p == nil || len(p.endpoints) == 0 {
+		return nil, nil
+	}
+	views := make([]*selector.Endpoint, 0, len(p.endpoints))
+	now := time.Now()
+	for _, endpoint := range p.endpoints {
+		if endpoint == nil {
+			continue
+		}
+		view := endpoint.endpoint
+		view.Healthy = endpoint.health == nil || endpoint.health.healthy(now)
+		view.LatencyEWMA = endpoint.health.latency()
+		views = append(views, &view)
+	}
+	selected, err := p.selector.Pick(views)
+	if err != nil {
+		return nil, &providerRequestError{statusCode: http.StatusServiceUnavailable, err: fmt.Errorf("provider %q has no healthy endpoints", p.id)}
+	}
+	endpoint := p.endpointByName[selected.Name]
+	if endpoint == nil {
+		return nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q selected unknown endpoint %q", p.id, selected.Name)}
+	}
+	return endpoint, nil
+}
+
+func validateProviderEndpointAuth(provider *providerRuntime) error {
+	if provider == nil || len(provider.endpoints) == 0 {
+		return nil
+	}
+	for _, endpoint := range provider.endpoints {
+		if endpoint == nil {
+			continue
+		}
+		switch provider.kind {
+		case providerTypeAzureOpenAI:
+			if provider.azureAuthMode() == providerAuthModeAPIKey && strings.TrimSpace(endpoint.apiKey) == "" {
+				return fmt.Errorf("provider %q endpoint %q must set api_key or api_key_env", provider.id, endpoint.endpoint.Name)
+			}
+		case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+			if provider.authType != providerAuthTypeNone && strings.TrimSpace(endpoint.apiKey) == "" {
+				return fmt.Errorf("provider %q endpoint %q must set api_key or api_key_env", provider.id, endpoint.endpoint.Name)
+			}
+		}
+	}
+	return nil
+}
+
+func providerAPIKey(provider *providerRuntime, endpoint *providerEndpointRuntime) string {
+	if endpoint != nil && strings.TrimSpace(endpoint.apiKey) != "" {
+		return strings.TrimSpace(endpoint.apiKey)
+	}
+	if provider == nil {
+		return ""
+	}
+	return strings.TrimSpace(provider.apiKey)
+}
+
+type providerEndpointContextKey struct{}
+
+func contextWithProviderEndpoint(ctx context.Context, endpoint *providerEndpointRuntime) context.Context {
+	if endpoint == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, providerEndpointContextKey{}, endpoint)
+}
+
+func providerEndpointFromContext(ctx context.Context) *providerEndpointRuntime {
+	if ctx == nil {
+		return nil
+	}
+	endpoint, _ := ctx.Value(providerEndpointContextKey{}).(*providerEndpointRuntime)
+	return endpoint
+}
+
+func providerEndpointNameFromContext(ctx context.Context) string {
+	endpoint := providerEndpointFromContext(ctx)
+	if endpoint == nil {
+		return ""
+	}
+	return endpoint.endpoint.Name
 }
