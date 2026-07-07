@@ -166,6 +166,27 @@ read_normalized_output() {
   awk 'NF { gsub(/\r/, "", $0); printf "%s", $0 }' "$1"
 }
 
+read_gemini_normalized_output() {
+  local output_file="$1"
+  local actual
+  actual="$(read_normalized_output "${output_file}")"
+
+  # Newer Gemini CLI builds may still emit JSON-shaped chunks even with
+  # `-o text`, e.g. {"output":"LEFT"}|{"output":"RIGHT"}. Normalize that
+  # wrapper before exact matching so the smoke tests keep validating proxy
+  # translation rather than a CLI presentation detail.
+  if [[ "${actual}" == *'{"output"'* ]]; then
+    local parsed
+    parsed="$(printf '%s' "${actual}" | jq -Rr 'split("|") | map((fromjson? // {}) | .output? // empty) | select(length > 0) | join("|")' 2>/dev/null || true)"
+    if [[ -n "${parsed}" ]]; then
+      printf '%s' "${parsed}"
+      return
+    fi
+  fi
+
+  printf '%s' "${actual}"
+}
+
 start_proxy() {
   [[ -x "${PROXY_BIN}" ]] || die "proxy binary not found or not executable: ${PROXY_BIN}"
 
@@ -322,7 +343,7 @@ EOF
       > "${output_file}"
   )
 
-  actual="$(read_normalized_output "${output_file}")"
+  actual="$(read_gemini_normalized_output "${output_file}")"
   assert_exact_output "gemini" "${expected}" "${actual}"
   printf '%s' "${actual}" > "${output_file}"
 }
