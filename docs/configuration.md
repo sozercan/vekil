@@ -41,6 +41,48 @@ These overrides only affect Copilot-backed upstream requests. For provider-level
 | `--copilot-github-api-version` | `COPILOT_GITHUB_API_VERSION` | `2025-05-01` | Upstream `x-github-api-version` header |
 | `--copilot-openai-intent` | `COPILOT_OPENAI_INTENT` | unset (`conversation-panel` for chat/responses) | Upstream `openai-intent` header |
 
+## Environment Variable Interpolation
+
+Provider config files support `${env:VAR_NAME}` interpolation in any string value. Variables are expanded at load time, before YAML/JSON parsing, so they work in any field.
+
+### Syntax
+
+| Form | Behavior |
+|------|----------|
+| `${env:VAR_NAME}` | Replaced with the value of the environment variable `VAR_NAME` |
+| `\${env:VAR_NAME}` | Escaped — preserved as the literal string `${env:VAR_NAME}` |
+
+### Behavior
+
+- **Hard error on missing variables**: If a referenced variable is not set in the environment, Vekil refuses to start and prints an error naming the undefined variable(s).
+- **Empty is valid**: A variable that is set to an empty string substitutes to empty — only truly unset variables cause an error.
+- **No default-value syntax**: `${env:VAR:-default}` is not supported. Set required variables before starting Vekil.
+
+### Example — Azure provider with secrets from environment
+
+```yaml
+providers:
+  - id: azure
+    type: azure-openai
+    base_url: ${env:AZURE_OPENAI_ENDPOINT}
+    api_key: ${env:AZURE_OPENAI_KEY}
+    api_version: "2024-12-01-preview"
+    models:
+      - public_id: gpt-4o
+        deployment: gpt-4o
+        endpoints: ["/responses"]
+
+  - id: copilot
+    type: copilot
+    default: true
+```
+
+```bash
+export AZURE_OPENAI_ENDPOINT="https://myresource.openai.azure.com/openai/v1"
+export AZURE_OPENAI_KEY="sk-..."
+vekil --providers-config providers.yaml
+```
+
 ## Provider Configs
 
 Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership of public model IDs across providers. Provider config files can be JSON (`.json`) or YAML (`.yaml`/`.yml`).

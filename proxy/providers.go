@@ -236,6 +236,10 @@ func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("read providers config %q: %w", path, err)
 	}
+	body, err = expandEnvVars(body)
+	if err != nil {
+		return cfg, fmt.Errorf("providers config %q: %w", path, err)
+	}
 	if err := decodeProvidersConfigFile(path, body, &cfg); err != nil {
 		return cfg, err
 	}
