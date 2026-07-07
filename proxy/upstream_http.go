@@ -215,18 +215,24 @@ func applyProviderModelRequestPolicy(body []byte, owner providerModel) []byte {
 }
 
 func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header, routingHeaders ...http.Header) (*http.Response, error) {
+	resp, _, _, err := h.postJSONEndpointWithHeadersTracked(ctx, path, body, extraHeaders, routingHeaders...)
+	return resp, err
+}
+
+func (h *ProxyHandler) postJSONEndpointWithHeadersTracked(ctx context.Context, path string, body []byte, extraHeaders http.Header, routingHeaders ...http.Header) (*http.Response, providerModel, []byte, error) {
 	provider, owner, rewrittenBody, err := h.resolveProviderRequest(body, path, routingHeaders...)
 	if err != nil {
-		return nil, err
+		return nil, providerModel{}, nil, err
 	}
 
-	return h.doWithRetry(func() (*http.Request, error) {
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
 		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "", owner)
 		if err != nil {
 			return nil, err
 		}
 		return req, nil
 	})
+	return resp, owner, rewrittenBody, err
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
@@ -238,15 +244,22 @@ func (h *ProxyHandler) postChatCompletionsWithHeaders(ctx context.Context, body 
 }
 
 func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header, routingHeaders ...http.Header) (*http.Response, error) {
-	resp, err := h.postJSONEndpointWithHeaders(ctx, providerEndpointResponses, body, extraHeaders, routingHeaders...)
+	resp, owner, _, err := h.postJSONEndpointWithHeadersTracked(ctx, providerEndpointResponses, body, extraHeaders, routingHeaders...)
 	if err != nil {
 		return nil, err
 	}
-	return h.maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx, body, extraHeaders, resp, routingHeaders...)
+	retryBody := body
+	if owner.publicID != "" {
+		if selectedBody, _, rewriteErr := rewriteRequestModelForProvider(body, owner.publicID); rewriteErr == nil {
+			retryBody = selectedBody
+		}
+	}
+	return h.maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx, retryBody, extraHeaders, resp, noSpeedTierRoutingHeaders())
 }
 
-func (h *ProxyHandler) postAnthropicMessages(ctx context.Context, body []byte, extraHeaders http.Header, routingHeaders ...http.Header) (*http.Response, error) {
-	return h.postJSONEndpointWithHeaders(ctx, providerEndpointMessages, body, extraHeaders, routingHeaders...)
+func (h *ProxyHandler) postAnthropicMessagesTracked(ctx context.Context, body []byte, extraHeaders http.Header, routingHeaders ...http.Header) (*http.Response, providerModel, error) {
+	resp, owner, _, err := h.postJSONEndpointWithHeadersTracked(ctx, providerEndpointMessages, body, extraHeaders, routingHeaders...)
+	return resp, owner, err
 }
 
 func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {

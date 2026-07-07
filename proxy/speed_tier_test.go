@@ -670,7 +670,7 @@ func TestResponsesWebSocketPinnedModelForcesDefaultRoutingHeaders(t *testing.T) 
 		speedTierPinnedSource: "sonnet-public",
 	}
 	req := parseSpeedTierWSRequest(t, `{"type":"response.create","model":"sonnet-public","client_metadata":{"ws_request_header_X-Vekil-Routing":"speed"},"input":[]}`)
-	headers := session.speedTierRoutingHeadersForRequest(req)
+	headers := session.speedTierRoutingHeadersForRequest(req, false)
 	if got := headers.Get("X-Vekil-Routing"); got != "default" {
 		t.Fatalf("X-Vekil-Routing = %q, want default", got)
 	}

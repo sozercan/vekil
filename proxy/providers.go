@@ -334,6 +334,11 @@ func (ps *providerSetup) addProviderModels(providerID string, models []providerM
 
 	provider := ps.providerByID(providerID)
 	models = filterProviderModels(provider, models)
+	if ps.speedTierEnabled {
+		if err := validateProviderSpeedTierModels(providerID, models); err != nil {
+			return err
+		}
+	}
 
 	ps.modelsMu.Lock()
 	defer ps.modelsMu.Unlock()
@@ -355,6 +360,11 @@ func (ps *providerSetup) replaceProviderModels(providerID string, models []provi
 
 	provider := ps.providerByID(providerID)
 	models = filterProviderModels(provider, models)
+	if ps.speedTierEnabled {
+		if err := validateProviderSpeedTierModels(providerID, models); err != nil {
+			return err
+		}
+	}
 
 	ps.modelsMu.Lock()
 	defer ps.modelsMu.Unlock()
@@ -519,11 +529,6 @@ func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*provider
 		provider, err := buildProviderRuntime(raw, h.copilotURL, h.azureIdentityTokenSourceFactory)
 		if err != nil {
 			return nil, nil, "", err
-		}
-		if cfg.SpeedTierEnabled {
-			if err := validateStaticSpeedTierModels(provider); err != nil {
-				return nil, nil, "", err
-			}
 		}
 		if _, exists := providers[provider.id]; exists {
 			return nil, nil, "", fmt.Errorf("duplicate provider id %q", provider.id)
@@ -760,33 +765,35 @@ func addStaticProviderModels(runtime *providerRuntime, models []ProviderModelCon
 	return nil
 }
 
-func validateStaticSpeedTierModels(runtime *providerRuntime) error {
-	if runtime == nil {
-		return nil
+func validateProviderSpeedTierModels(providerID string, models []providerModel) error {
+	modelByID := make(map[string]providerModel, len(models))
+	for _, model := range models {
+		if model.publicID != "" {
+			modelByID[model.publicID] = model
+		}
 	}
-	for _, publicID := range runtime.staticOrder {
-		model := runtime.staticModels[publicID]
+	for _, model := range models {
 		if model.speedTier == nil {
 			continue
 		}
 		if model.speedTier.downgradeTo == "" {
-			return fmt.Errorf("provider %q model %q speed_tier.downgrade_to is required", runtime.id, model.publicID)
+			return fmt.Errorf("provider %q model %q speed_tier.downgrade_to is required", providerID, model.publicID)
 		}
 		switch model.speedTier.semantics {
 		case speedTierSemanticsAll, speedTierSemanticsAny:
 		default:
-			return fmt.Errorf("provider %q model %q speed_tier.semantics must be %q or %q", runtime.id, model.publicID, speedTierSemanticsAll, speedTierSemanticsAny)
+			return fmt.Errorf("provider %q model %q speed_tier.semantics must be %q or %q", providerID, model.publicID, speedTierSemanticsAll, speedTierSemanticsAny)
 		}
-		target, ok := runtime.staticModels[model.speedTier.downgradeTo]
+		target, ok := modelByID[model.speedTier.downgradeTo]
 		if !ok {
-			return fmt.Errorf("provider %q model %q speed_tier.downgrade_to %q is not a known public_id in the same provider", runtime.id, model.publicID, model.speedTier.downgradeTo)
+			return fmt.Errorf("provider %q model %q speed_tier.downgrade_to %q is not a known public_id in the same provider", providerID, model.publicID, model.speedTier.downgradeTo)
 		}
 		if target.speedTier != nil {
-			return fmt.Errorf("provider %q model %q speed_tier.downgrade_to %q declares its own speed_tier; chained downgrades are not supported", runtime.id, model.publicID, target.publicID)
+			return fmt.Errorf("provider %q model %q speed_tier.downgrade_to %q declares its own speed_tier; chained downgrades are not supported", providerID, model.publicID, target.publicID)
 		}
 		for _, endpoint := range model.supportedEndpoints {
 			if !providerModelSupportsEndpoint(target, endpoint) {
-				return fmt.Errorf("provider %q model %q speed_tier.downgrade_to %q does not support endpoint %s", runtime.id, model.publicID, target.publicID, endpoint)
+				return fmt.Errorf("provider %q model %q speed_tier.downgrade_to %q does not support endpoint %s", providerID, model.publicID, target.publicID, endpoint)
 			}
 		}
 	}
@@ -1074,10 +1081,10 @@ func normalizeProviderModelConfig(cfg ProviderModelConfig) ProviderModelConfig {
 		cfg.ReasoningEffort = append([]string(nil), cfg.ReasoningEffort...)
 	}
 	if cfg.SpeedTier != nil {
-		copy := *cfg.SpeedTier
-		copy.When = normalizeSpeedTierWhen(copy.When)
-		copy.NeverWhen = normalizeSpeedTierNeverWhen(copy.NeverWhen)
-		cfg.SpeedTier = &copy
+		cloned := *cfg.SpeedTier
+		cloned.When = normalizeSpeedTierWhen(cloned.When)
+		cloned.NeverWhen = normalizeSpeedTierNeverWhen(cloned.NeverWhen)
+		cfg.SpeedTier = &cloned
 	}
 	return cfg
 }

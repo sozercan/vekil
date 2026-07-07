@@ -776,8 +776,8 @@ func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx conte
 	return resp, true, true, err
 }
 
-func (s *responsesWebSocketSession) speedTierRoutingHeadersForRequest(request *responsesWebSocketCreateRequest) http.Header {
-	headers := s.requestHeaders(request, false)
+func (s *responsesWebSocketSession) speedTierRoutingHeadersForRequest(request *responsesWebSocketCreateRequest, includeTurnState bool) http.Header {
+	headers := s.requestHeaders(request, includeTurnState)
 	routingHeaders := s.routingHeaders.Clone()
 	if routingHeaders == nil {
 		routingHeaders = make(http.Header)
@@ -805,7 +805,7 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 		s.speedTierDowngraded = false
 		s.speedTierDowngradedSource = ""
 	}
-	routingHeaders := s.speedTierRoutingHeadersForRequest(request)
+	routingHeaders := s.speedTierRoutingHeadersForRequest(request, includeTurnState)
 	if s.speedTierPinnedModel != "" {
 		if pinnedBody, _, err := rewriteRequestModelForProvider(bodyBytes, s.speedTierPinnedModel); err == nil {
 			bodyBytes = pinnedBody
@@ -1179,7 +1179,7 @@ func (s *responsesWebSocketSession) compactHistoryItemsWithKeepTail(h *ProxyHand
 	result.fromBytes = rawMessagesSize(history)
 
 	headers := s.requestHeaders(request, false)
-	routingHeaders := s.speedTierRoutingHeadersForRequest(request)
+	routingHeaders := s.speedTierRoutingHeadersForRequest(request, false)
 
 	var summary string
 	var err error
