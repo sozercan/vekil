@@ -1697,3 +1697,32 @@ func TestStatusDoesNotMigrateLegacyTokenToKeyring(t *testing.T) {
 		t.Fatalf("Status() migrated token to keyring, err=%v", err)
 	}
 }
+
+func TestStatusDoesNotMigrateLegacyCopilotTokenToKeyring(t *testing.T) {
+	keyring.MockInit()
+	t.Setenv(credentialStoreEnv, "")
+	dir := t.TempDir()
+	legacyPath := filepath.Join(dir, "api-key.json")
+	cache := CopilotTokenResponse{Token: "cached-token", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	data, err := json.Marshal(cache)
+	if err != nil {
+		t.Fatalf("marshal cache: %v", err)
+	}
+	if err := os.WriteFile(legacyPath, data, 0o600); err != nil {
+		t.Fatalf("write legacy copilot cache: %v", err)
+	}
+	a, err := NewAuthenticator(dir)
+	if err != nil {
+		t.Fatalf("NewAuthenticator() error = %v", err)
+	}
+	status := a.Status()
+	if !status.HasValidCopilotCache || !status.SignedIn {
+		t.Fatalf("Status() = %+v, want file-backed copilot cache", status)
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("legacy copilot cache should remain after Status(): %v", err)
+	}
+	if _, err := keyring.Get(credentialStoreService, a.store().(keyringCredentialStore).key(copilotTokenSecretName)); !errors.Is(err, keyring.ErrNotFound) {
+		t.Fatalf("Status() migrated copilot cache to keyring, err=%v", err)
+	}
+}

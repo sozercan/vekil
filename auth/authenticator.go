@@ -243,7 +243,7 @@ func (a *Authenticator) hasAccessTokenStored() bool {
 // hasValidCopilotTokenStored is a fast, side-effect-free check of file fallback
 // state. It intentionally does not query the OS keyring.
 func (a *Authenticator) hasValidCopilotTokenStored() bool {
-	data, err := a.store().Get(copilotTokenSecretName)
+	data, err := newFileCredentialStore(a.tokenDir).Get(copilotTokenSecretName)
 	if err != nil {
 		return false
 	}
