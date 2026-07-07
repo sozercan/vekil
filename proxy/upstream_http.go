@@ -248,11 +248,15 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersTracked(ctx context.Context, p
 		})
 		lastOwner = attemptOwner
 		lastBody = attemptBody
-		if !shouldFallbackToNextProvider(postErr) || i == len(attempts)-1 {
+		if !shouldFallbackResponse(resp, postErr) || i == len(attempts)-1 {
 			return resp, attemptOwner, attemptBody, postErr
 		}
 		lastErr = postErr
-		h.logProviderFallback(owner.publicID, attemptOwner, attempts[i+1], postErr)
+		if lastErr == nil && resp != nil {
+			lastErr = &upstreamError{statusCode: resp.StatusCode, headers: resp.Header.Clone()}
+			drainAndClose(resp.Body)
+		}
+		h.logProviderFallback(owner.publicID, attemptOwner, attempts[i+1], lastErr)
 	}
 	if lastErr != nil {
 		return nil, lastOwner, lastBody, lastErr
@@ -273,7 +277,13 @@ func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte
 }
 
 func (h *ProxyHandler) postAnthropicMessages(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	return h.postJSONEndpointWithHeaders(ctx, providerEndpointMessages, body, extraHeaders)
+	resp, _, err := h.postAnthropicMessagesTracked(ctx, body, extraHeaders)
+	return resp, err
+}
+
+func (h *ProxyHandler) postAnthropicMessagesTracked(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, providerModel, error) {
+	resp, owner, _, err := h.postJSONEndpointWithHeadersTracked(ctx, providerEndpointMessages, body, extraHeaders)
+	return resp, owner, err
 }
 
 func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
@@ -532,6 +542,13 @@ func (h *ProxyHandler) providerFallbackAttempts(owner providerModel, endpoint st
 		}
 	}
 	return attempts
+}
+
+func shouldFallbackResponse(resp *http.Response, err error) bool {
+	if err != nil {
+		return shouldFallbackToNextProvider(err)
+	}
+	return resp != nil && resp.StatusCode >= http.StatusInternalServerError
 }
 
 func shouldFallbackToNextProvider(err error) bool {

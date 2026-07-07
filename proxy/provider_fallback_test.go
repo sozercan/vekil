@@ -12,6 +12,7 @@ import (
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/models"
 )
 
 func newFallbackTestHandler(t *testing.T, primaryURL, backupURL string) *ProxyHandler {
@@ -182,4 +183,104 @@ func assertFallbackUpstreamModel(t *testing.T, r *http.Request, want string) {
 func writeFallbackChatOK(w http.ResponseWriter, content string) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"id":"chatcmpl-ok","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"` + content + `"}}]}`))
+}
+
+func TestProviderFallbackSucceedsOnSecondHopAfter500(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"primary internal"}}`))
+	}))
+	defer primary.Close()
+	var backupHits atomic.Int32
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		assertFallbackUpstreamModel(t, r, "backup-upstream")
+		writeFallbackChatOK(w, "backup-ok")
+	}))
+	defer backup.Close()
+
+	handler := newFallbackTestHandler(t, primary.URL, backup.URL)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-primary","messages":[{"role":"user","content":"hi"}]}`))
+	handler.HandleOpenAIChatCompletions(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if backupHits.Load() != 1 {
+		t.Fatalf("backup hits = %d, want 1", backupHits.Load())
+	}
+}
+
+func TestFallbackChainsConfiguredAfterDynamicModelLoading(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-primary"}]}`))
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-backup"}]}`))
+	}))
+	defer backup.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{ID: "primary", Type: "openai-compatible", Default: true, BaseURL: primary.URL, AuthType: "none", ModelDiscovery: "openai"},
+				{ID: "backup", Type: "openai-compatible", BaseURL: backup.URL, AuthType: "none", ModelDiscovery: "openai"},
+			},
+			Fallbacks: []ProviderFallbackConfig{{Public: "gpt-primary", Chain: []ProviderFallbackChainEntry{{Provider: "primary", Model: "gpt-primary"}, {Provider: "backup", Model: "gpt-backup"}}}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	chain := handler.providerSetup().fallbackChain("gpt-primary")
+	if len(chain) != 2 || chain[0].providerID != "primary" || chain[1].providerID != "backup" {
+		t.Fatalf("fallback chain = %#v, want primary->backup", chain)
+	}
+}
+
+func TestDirectAnthropicFallbackPreservesRequestedResponseModel(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"primary internal"}}`))
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"backup-upstream","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer backup.Close()
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{
+				{ID: "primary", Type: "anthropic-compatible", Default: true, BaseURL: primary.URL, AuthType: "none", MessagesPath: "/v1/messages", Models: []ProviderModelConfig{{PublicID: "claude-primary", Deployment: "primary-upstream", Endpoints: []string{providerEndpointMessages}}}},
+				{ID: "backup", Type: "anthropic-compatible", BaseURL: backup.URL, AuthType: "none", MessagesPath: "/v1/messages", Models: []ProviderModelConfig{{PublicID: "claude-backup", Deployment: "backup-upstream", Endpoints: []string{providerEndpointMessages}}}},
+			},
+			Fallbacks: []ProviderFallbackConfig{{Public: "claude-primary", Chain: []ProviderFallbackChainEntry{{Provider: "primary", Model: "claude-primary"}, {Provider: "backup", Model: "claude-backup"}}}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	handler.maxRetries = 1
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-primary","max_tokens":128,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleAnthropicMessages(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp models.AnthropicResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Model != "claude-primary" {
+		t.Fatalf("response model = %q, want requested claude-primary", resp.Model)
+	}
 }

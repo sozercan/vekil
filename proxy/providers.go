@@ -519,6 +519,9 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 		}
 	}
 
+	if err := setup.configureFallbackChains(cfg.Fallbacks); err != nil {
+		return nil, err
+	}
 	return setup, nil
 }
 
@@ -550,6 +553,9 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 		}
 	}
 
+	if err := setup.configureFallbackChains(h.providersConfig.Fallbacks); err != nil {
+		return err
+	}
 	h.dynamicProviderValidationPending.Store(false)
 	return nil
 }

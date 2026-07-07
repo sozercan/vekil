@@ -161,7 +161,10 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), streaming)
 	defer upstreamCancel()
 
-	resp, err := h.postAnthropicMessages(upstreamCtx, body, anthropicExtraHeadersFromRequest(r))
+	resp, owner, err := h.postAnthropicMessagesTracked(upstreamCtx, body, anthropicExtraHeadersFromRequest(r))
+	if owner.upstreamModel != "" {
+		upstreamModel = owner.upstreamModel
+	}
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "anthropic"), logger.Err(err))
