@@ -189,6 +189,16 @@ func TestServeFlagsMetricsEnabled(t *testing.T) {
 	}
 }
 
+func TestServeFlagsPricesPath(t *testing.T) {
+	t.Setenv("PRICES_CONFIG", "/env/prices.json")
+	if got := *parseServeFlagsForTest(t).pricesPath; got != "/env/prices.json" {
+		t.Fatalf("pricesPath from env = %q", got)
+	}
+	if got := *parseServeFlagsForTest(t, "--prices", "/cli/prices.json").pricesPath; got != "/cli/prices.json" {
+		t.Fatalf("pricesPath from CLI = %q", got)
+	}
+}
+
 func TestServeFlagsResponsesWebSocketDisabledByDefault(t *testing.T) {
 	serve := parseServeFlagsForTest(t)
 	cfg := serve.responsesWebSocketConfig()

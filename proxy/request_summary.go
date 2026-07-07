@@ -29,6 +29,7 @@ type RequestSummary struct {
 	totalTokens       *int
 	cachedTokens      *int
 	reasoningTokens   *int
+	costUSD           *float64
 	// extraPromptTokens / extraCompletionTokens accumulate out-of-band token
 	// spend that is separate from the turn's own reported usage — e.g. an
 	// internal /responses compaction call made while serving a 413 oversized-
@@ -260,6 +261,33 @@ func observeInternalResponsesUsage(ctx context.Context, usage responsesUsage) {
 	}
 }
 
+func (s *RequestSummary) costInputs() (model string, promptTokens, completionTokens int) {
+	if s == nil {
+		return "", 0, 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	model = strings.TrimSpace(s.model)
+	if s.promptTokens != nil {
+		promptTokens = *s.promptTokens
+	}
+	if s.completionTokens != nil {
+		completionTokens = *s.completionTokens
+	}
+	promptTokens += s.extraPromptTokens
+	completionTokens += s.extraCompletionTokens
+	return model, promptTokens, completionTokens
+}
+
+func (s *RequestSummary) setCostUSD(cost float64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.costUSD = &cost
+}
+
 // LoggerFields returns the structured fields populated for this request.
 func (s *RequestSummary) LoggerFields() []logger.Field {
 	if s == nil {
@@ -295,6 +323,9 @@ func (s *RequestSummary) LoggerFields() []logger.Field {
 	}
 	if s.totalTokens != nil {
 		fields = append(fields, logger.F("total_tokens", *s.totalTokens))
+	}
+	if s.costUSD != nil {
+		fields = append(fields, logger.F("cost_usd", *s.costUSD))
 	}
 	return fields
 }

@@ -55,6 +55,8 @@ func (h *ProxyHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintln(w, "# TYPE vekil_tokens_cached_total counter")
 	_, _ = fmt.Fprintln(w, "# HELP vekil_tokens_reasoning_total Total reasoning completion tokens by provider and public model.")
 	_, _ = fmt.Fprintln(w, "# TYPE vekil_tokens_reasoning_total counter")
+	_, _ = fmt.Fprintln(w, "# HELP vekil_cost_usd_total Estimated upstream cost in USD by provider and public model.")
+	_, _ = fmt.Fprintln(w, "# TYPE vekil_cost_usd_total counter")
 	for _, row := range snap.TokenMetrics {
 		labels := map[string]string{"provider": row.Provider, "public_model": row.Model, "direction": "prompt"}
 		componentLabels := map[string]string{"provider": row.Provider, "public_model": row.Model}
@@ -63,6 +65,9 @@ func (h *ProxyHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 		writePromIntMetric(w, "vekil_tokens_reported_total", componentLabels, row.TotalTokens)
 		writePromIntMetric(w, "vekil_tokens_cached_total", componentLabels, row.CachedTokens)
 		writePromIntMetric(w, "vekil_tokens_reasoning_total", componentLabels, row.ReasoningTokens)
+		if row.CostUSD > 0 {
+			writePromFloatMetric(w, "vekil_cost_usd_total", componentLabels, row.CostUSD)
+		}
 	}
 
 	_, _ = fmt.Fprintln(w, "# HELP vekil_retries_total Total upstream retry attempts.")

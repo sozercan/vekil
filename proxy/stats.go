@@ -45,13 +45,14 @@ const (
 
 // statsTotals is the cumulative session counters.
 type statsTotals struct {
-	Requests         int64 `json:"requests"`
-	Errors           int64 `json:"errors"`
-	PromptTokens     int64 `json:"prompt_tokens"`
-	CompletionTokens int64 `json:"completion_tokens"`
-	TotalTokens      int64 `json:"total_tokens"`
-	CachedTokens     int64 `json:"cached_tokens"`
-	ReasoningTokens  int64 `json:"reasoning_tokens"`
+	Requests         int64   `json:"requests"`
+	Errors           int64   `json:"errors"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	TotalTokens      int64   `json:"total_tokens"`
+	CachedTokens     int64   `json:"cached_tokens"`
+	ReasoningTokens  int64   `json:"reasoning_tokens"`
+	CostUSD          float64 `json:"cost_usd,omitempty"`
 	// Latency percentiles in milliseconds over a bounded recent sample.
 	LatencyP50 int64 `json:"latency_p50_ms"`
 	LatencyP95 int64 `json:"latency_p95_ms"`
@@ -105,6 +106,7 @@ type statsTokenMetric struct {
 	TotalTokens      int64
 	CachedTokens     int64
 	ReasoningTokens  int64
+	CostUSD          float64
 }
 
 type statsUpstreamErrorMetric struct {
@@ -206,6 +208,7 @@ type tokenMetricCounter struct {
 	total      int64
 	cached     int64
 	reasoning  int64
+	costUSD    float64
 }
 
 type upstreamErrorMetricCounter struct {
@@ -434,7 +437,7 @@ func (c *statsCollector) record(summary *RequestSummary, status int, userAgent s
 // failed/non-200 turn) so failures show up in error counts and the recent log.
 // Streamed turns carry no latency sample. Every turn is counted as a request
 // even with zero/absent usage, matching the HTTP path.
-func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage) {
+func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, costUSD float64) {
 	total := usage.TotalTokens
 	if total == 0 {
 		total = usage.InputTokens + usage.OutputTokens
@@ -450,6 +453,7 @@ func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel s
 		total:      total,
 		cached:     usage.InputTokensDetails.CachedTokens,
 		reasoning:  usage.OutputTokensDetails.ReasoningTokens,
+		costUSD:    costUSD,
 	}
 	agent := agentLabel
 	if agent == "" {
@@ -491,6 +495,7 @@ func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, 
 	c.totals.TotalTokens += int64(d.total)
 	c.totals.CachedTokens += int64(d.cached)
 	c.totals.ReasoningTokens += int64(d.reasoning)
+	c.totals.CostUSD += d.costUSD
 
 	// Latency: only non-streaming requests carry a meaningful end-to-end
 	// duration. A streamed response (SSE chat, or a GET /v1/responses websocket
@@ -882,6 +887,7 @@ func addTokenMetric(m map[statsProviderModelKey]*tokenMetricCounter, provider, m
 	e.total += int64(d.total)
 	e.cached += int64(d.cached)
 	e.reasoning += int64(d.reasoning)
+	e.costUSD += d.costUSD
 }
 
 func addUpstreamErrorMetric(m map[statsUpstreamErrorMetricKey]*upstreamErrorMetricCounter, provider, model string, code int) {
@@ -1028,6 +1034,7 @@ func tokenMetricRows(m map[statsProviderModelKey]*tokenMetricCounter) []statsTok
 			PromptTokens:     e.prompt,
 			CompletionTokens: e.completion,
 			TotalTokens:      e.total,
+			CostUSD:          e.costUSD,
 			CachedTokens:     e.cached,
 			ReasoningTokens:  e.reasoning,
 		})
@@ -1098,6 +1105,7 @@ type summaryStats struct {
 	prompt     int
 	completion int
 	total      int
+	costUSD    float64
 	cached     int
 	reasoning  int
 }
@@ -1144,6 +1152,9 @@ func readSummaryForStats(summary *RequestSummary) summaryStats {
 	}
 	if summary.reasoningTokens != nil {
 		d.reasoning = *summary.reasoningTokens
+	}
+	if summary.costUSD != nil {
+		d.costUSD = *summary.costUSD
 	}
 	return d
 }
@@ -1379,7 +1390,19 @@ func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAg
 	if h == nil || h.stats == nil {
 		return
 	}
+	h.applyRequestCost(summary)
 	h.stats.record(summary, status, userAgent, dur)
+}
+
+func (h *ProxyHandler) applyRequestCost(summary *RequestSummary) {
+	if h == nil || summary == nil {
+		return
+	}
+	model, promptTokens, completionTokens := summary.costInputs()
+	cost, ok := h.prices.estimate(model, promptTokens, completionTokens)
+	if ok {
+		summary.setCostUSD(cost)
+	}
 }
 
 // RecordResponsesTurn folds one /v1/responses websocket-bridge turn into the
@@ -1390,7 +1413,11 @@ func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel str
 	if h == nil || h.stats == nil {
 		return
 	}
-	h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage)
+	cost, ok := h.prices.estimate(model, usage.InputTokens, usage.OutputTokens)
+	if !ok {
+		cost = 0
+	}
+	h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage, cost)
 }
 
 // HandleStatsJSON handles GET /stats.json with the current traffic snapshot.

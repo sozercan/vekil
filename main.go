@@ -216,6 +216,7 @@ type serveFlags struct {
 	host                            *string
 	tokenDir                        *string
 	providersConfigPath             *string
+	pricesPath                      *string
 	logLevel                        *string
 	metrics                         *bool
 	noMetrics                       *bool
@@ -243,6 +244,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
+		pricesPath:                      fs.String("prices", getEnv("PRICES_CONFIG", ""), "Path to JSON model price override file"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
 		metrics:                         fs.Bool("metrics", getEnvBool("METRICS", true), "Expose Prometheus metrics at /metrics"),
 		noMetrics:                       fs.Bool("no-metrics", getEnvBool("NO_METRICS", false), "Disable Prometheus metrics endpoint"),
@@ -400,6 +402,10 @@ func runServe() {
 	if err != nil {
 		log.Fatal("failed to load providers config", logger.Err(err))
 	}
+	priceCatalog, err := proxy.LoadPriceCatalogFile(*serve.pricesPath)
+	if err != nil {
+		log.Fatal("failed to load prices config", logger.Err(err))
+	}
 
 	srv, err := server.New(
 		authenticator,
@@ -416,6 +422,7 @@ func runServe() {
 		server.WithProxyOptions(
 			proxy.WithProvidersConfig(providersCfg),
 			proxy.WithDeferredDynamicProviderModelValidation(providersCfg.UsesCopilot()),
+			proxy.WithPriceCatalog(priceCatalog),
 		),
 	)
 	if err != nil {

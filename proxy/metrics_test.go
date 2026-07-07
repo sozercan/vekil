@@ -209,3 +209,58 @@ func TestHandleMetricsExportsAllRetryReasonCounters(t *testing.T) {
 		t.Fatalf("metrics body missing non-top retry reason %q:\n%s", want, body)
 	}
 }
+
+func TestHandleMetricsExportsEstimatedCost(t *testing.T) {
+	h := &ProxyHandler{stats: newStatsCollector(), prices: newPriceCatalog(map[string]PriceEntry{
+		"priced-model": {InputPer1K: 0.01, OutputPer1K: 0.02},
+	})}
+	s := newStatsRequestSummary("priced-model", "openai", "openai", 1000, 500, 1500)
+	h.RecordRequest(s, http.StatusOK, "test-agent", time.Millisecond)
+
+	w := httptest.NewRecorder()
+	h.HandleMetrics(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := w.Body.String()
+	want := `vekil_cost_usd_total{provider="openai",public_model="priced-model"} 0.02`
+	if !strings.Contains(body, want) {
+		t.Fatalf("metrics body missing %q:\n%s", want, body)
+	}
+	fields := s.LoggerFields()
+	found := false
+	for _, field := range fields {
+		if field.Key == "cost_usd" && field.Value == 0.02 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("LoggerFields missing cost_usd=0.02: %#v", fields)
+	}
+}
+
+func TestHandleMetricsOmitsCostForUnpricedModel(t *testing.T) {
+	h := &ProxyHandler{stats: newStatsCollector(), prices: newPriceCatalog(nil)}
+	s := newStatsRequestSummary("unpriced", "openai", "openai", 1000, 500, 1500)
+	h.RecordRequest(s, http.StatusOK, "test-agent", time.Millisecond)
+
+	w := httptest.NewRecorder()
+	h.HandleMetrics(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := w.Body.String()
+	if strings.Contains(body, `vekil_cost_usd_total{`) {
+		t.Fatalf("unpriced model should not emit cost metric:\n%s", body)
+	}
+}
+
+func TestRecordRequestCostUsesRawModelBeforeStatsTruncation(t *testing.T) {
+	longModel := strings.Repeat("model-", 20)
+	h := &ProxyHandler{stats: newStatsCollector(), prices: newPriceCatalog(map[string]PriceEntry{
+		longModel: {InputPer1K: 0.01, OutputPer1K: 0.02},
+	})}
+	s := newStatsRequestSummary(longModel, "openai", "openai", 1000, 500, 1500)
+	h.RecordRequest(s, http.StatusOK, "test-agent", time.Millisecond)
+	fields := s.LoggerFields()
+	for _, field := range fields {
+		if field.Key == "cost_usd" && field.Value == 0.02 {
+			return
+		}
+	}
+	t.Fatalf("LoggerFields missing cost for long raw model: %#v", fields)
+}

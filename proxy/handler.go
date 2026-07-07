@@ -262,6 +262,7 @@ type ProxyHandler struct {
 	models                           modelsCache
 	geminiCounts                     geminiCountTokensCache
 	stats                            *statsCollector
+	prices                           *priceCatalog
 	insightGate                      *insightGate
 	insightGateOnce                  sync.Once
 }
@@ -343,6 +344,13 @@ func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
 func WithProvidersConfig(cfg ProvidersConfig) Option {
 	return func(h *ProxyHandler) {
 		h.providersConfig = cfg
+	}
+}
+
+// WithPriceCatalog overrides the default token cost estimates used for logs and metrics.
+func WithPriceCatalog(catalog *priceCatalog) Option {
+	return func(h *ProxyHandler) {
+		h.prices = catalog
 	}
 }
 
@@ -477,6 +485,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		streamingUpstreamTimeout:        streamingUpstreamTimeout,
 		log:                             log,
 		stats:                           newStatsCollector(),
+		prices:                          defaultPriceCatalog(),
 	}
 	for _, opt := range opts {
 		if opt != nil {

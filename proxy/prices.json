@@ -1,0 +1,20 @@
+{
+  "gpt-5.5": {"input_per_1k": 0.010, "output_per_1k": 0.030},
+  "gpt-5.4": {"input_per_1k": 0.010, "output_per_1k": 0.030},
+  "gpt-5.4-pro": {"input_per_1k": 0.015, "output_per_1k": 0.060},
+  "gpt-5.3-codex": {"input_per_1k": 0.010, "output_per_1k": 0.030},
+  "gpt-5.2": {"input_per_1k": 0.010, "output_per_1k": 0.030},
+  "gpt-5.2-codex": {"input_per_1k": 0.010, "output_per_1k": 0.030},
+  "gpt-5.1": {"input_per_1k": 0.010, "output_per_1k": 0.030},
+  "gpt-5.1-codex": {"input_per_1k": 0.010, "output_per_1k": 0.030},
+  "gpt-5.1-codex-max": {"input_per_1k": 0.015, "output_per_1k": 0.060},
+  "gpt-5.1-codex-mini": {"input_per_1k": 0.001, "output_per_1k": 0.004},
+  "gpt-5-mini": {"input_per_1k": 0.001, "output_per_1k": 0.004},
+  "claude-sonnet-4": {"input_per_1k": 0.003, "output_per_1k": 0.015},
+  "claude-sonnet-4.5": {"input_per_1k": 0.003, "output_per_1k": 0.015},
+  "claude-sonnet-4.6": {"input_per_1k": 0.003, "output_per_1k": 0.015},
+  "claude-opus-4.6": {"input_per_1k": 0.015, "output_per_1k": 0.075},
+  "gemini-2.5-pro": {"input_per_1k": 0.00125, "output_per_1k": 0.010},
+  "gemini-2.5-flash": {"input_per_1k": 0.0003, "output_per_1k": 0.0025},
+  "gemini-3.1-pro-preview": {"input_per_1k": 0.00125, "output_per_1k": 0.010}
+}

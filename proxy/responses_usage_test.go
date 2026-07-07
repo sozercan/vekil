@@ -76,7 +76,7 @@ func TestRecordResponsesTurn(t *testing.T) {
 	u.InputTokensDetails.CachedTokens = 20
 	u.OutputTokensDetails.ReasoningTokens = 10
 
-	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 200, u)
+	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 200, u, 0)
 
 	snap := c.snapshot()
 	if snap.Totals.Requests != 1 {
@@ -103,7 +103,7 @@ func TestRecordResponsesTurn(t *testing.T) {
 	}
 	// A zero-usage turn is still counted as a request (matching the HTTP path),
 	// just with zero tokens.
-	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 200, responsesUsage{})
+	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 200, responsesUsage{}, 0)
 	after := c.snapshot()
 	if after.Totals.Requests != 2 {
 		t.Fatalf("zero-usage turn should still be counted: got %d requests want 2", after.Totals.Requests)
@@ -118,7 +118,7 @@ func TestRecordResponsesTurn(t *testing.T) {
 // recorded, and lands in the error counts so the dashboard reflects it.
 func TestRecordResponsesTurnCountsFailures(t *testing.T) {
 	c := newStatsCollector()
-	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", http.StatusBadGateway, responsesUsage{})
+	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", http.StatusBadGateway, responsesUsage{}, 0)
 
 	snap := c.snapshot()
 	if snap.Totals.Requests != 1 {
@@ -131,7 +131,7 @@ func TestRecordResponsesTurnCountsFailures(t *testing.T) {
 		t.Fatalf("failed turn should land in 5xx status class: got %+v", snap.Status)
 	}
 	// Default status 0 is treated as a successful (200) turn, not an error.
-	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 0, responsesUsage{})
+	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 0, responsesUsage{}, 0)
 	snap2 := c.snapshot()
 	if snap2.Totals.Errors != 1 {
 		t.Fatalf("status 0 should default to success, errors stayed: got %d want 1", snap2.Totals.Errors)

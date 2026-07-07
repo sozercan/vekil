@@ -23,6 +23,7 @@ Vekil supports two runtime patterns:
 | `--host` | `HOST` | `127.0.0.1` | Listen host |
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
+| `--prices` | `PRICES_CONFIG` | unset | Path to JSON price overrides merged onto the embedded default token-cost table |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 
@@ -49,6 +50,24 @@ Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership 
 - See [Provider API Keys](provider-api-keys.md) for provider console links and key-to-config mapping.
 - See [Tool Optimizers](tool-optimizers.md) for the optional `tool_optimizers` block that can live alongside `providers` in the same config file.
 - Set the optional top-level `insight_model` key to a public model ID the config serves to enable the dashboard's AI insights button. See [Traffic Dashboard](dashboard.md#ai-insights-optional).
+
+
+## Price Configs
+
+Vekil ships an embedded best-effort USD price table for common public model IDs and uses it only for estimates in logs and Prometheus metrics. Token counters are emitted for every model, but `vekil_cost_usd_total{provider,public_model}` is emitted only when a price entry exists.
+
+Use `--prices` or `PRICES_CONFIG` to merge a JSON override file onto the embedded defaults:
+
+```json
+{
+  "models": {
+    "gpt-5.4": {"input_per_1k": 0.01, "output_per_1k": 0.03},
+    "my-public-model": {"input_per_1k": 0.002, "output_per_1k": 0.008}
+  }
+}
+```
+
+A flat object keyed by public model ID is also accepted. Values are USD per 1,000 prompt/input tokens and USD per 1,000 completion/output tokens. Prices are estimates and should be reviewed against provider pricing pages before financial reporting or billing automation.
 
 ## Responses WebSocket Bridge
 
