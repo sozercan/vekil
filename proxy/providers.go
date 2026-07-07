@@ -788,7 +788,7 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 	}
 
 	endpointCfg := cfg
-	if kind == providerTypeCopilot && strings.TrimSpace(endpointCfg.BaseURL) == "" {
+	if (kind == providerTypeCopilot || kind == providerTypeOpenAICodex) && strings.TrimSpace(endpointCfg.BaseURL) == "" {
 		endpointCfg.BaseURL = runtime.baseURL
 	}
 	endpoints, endpointByName, endpointSelector, selectorName, err := buildProviderEndpointRuntimes(id, kind, endpointCfg)
@@ -2421,6 +2421,9 @@ func buildProviderEndpointRuntimes(providerID string, kind providerType, cfg Pro
 		if err := validateEndpointBaseURL(providerID, name, kind, baseURL); err != nil {
 			return nil, nil, nil, "", err
 		}
+		if kind == providerTypeAzureOpenAI && providerAuthMode(strings.TrimSpace(cfg.AuthMode)) == providerAuthModeAzureIdentity && (strings.TrimSpace(raw.APIKey) != "" || strings.TrimSpace(raw.APIKeyEnv) != "") {
+			return nil, nil, nil, "", fmt.Errorf("provider %q endpoint %q auth_mode %q cannot be combined with api_key or api_key_env", providerID, name, providerAuthModeAzureIdentity)
+		}
 		apiKey := strings.TrimSpace(raw.APIKey)
 		if apiKey == "" && strings.TrimSpace(raw.APIKeyEnv) != "" {
 			apiKey = strings.TrimSpace(os.Getenv(strings.TrimSpace(raw.APIKeyEnv)))
@@ -2515,7 +2518,23 @@ func (p *providerRuntime) pickEndpoint() (*providerEndpointRuntime, error) {
 	}
 	selected, err := p.selector.Pick(views)
 	if err != nil {
-		return nil, &providerRequestError{statusCode: http.StatusServiceUnavailable, err: fmt.Errorf("provider %q has no healthy endpoints", p.id)}
+		fallbackViews := make([]*selector.Endpoint, 0, len(p.endpoints))
+		for _, endpoint := range p.endpoints {
+			if endpoint == nil || (endpoint.health != nil && !endpoint.health.usableIgnoringPenalty(now)) {
+				continue
+			}
+			view := endpoint.endpoint
+			view.Healthy = true
+			view.LatencyEWMA = endpoint.health.latency()
+			fallbackViews = append(fallbackViews, &view)
+		}
+		if len(fallbackViews) == 0 {
+			return nil, &providerRequestError{statusCode: http.StatusServiceUnavailable, err: fmt.Errorf("provider %q has no healthy endpoints", p.id)}
+		}
+		selected, err = p.selector.Pick(fallbackViews)
+		if err != nil {
+			return nil, &providerRequestError{statusCode: http.StatusServiceUnavailable, err: fmt.Errorf("provider %q has no healthy endpoints", p.id)}
+		}
 	}
 	endpoint := p.endpointByName[selected.Name]
 	if endpoint == nil {
@@ -2536,6 +2555,10 @@ func validateProviderEndpointAuth(provider *providerRuntime) error {
 		case providerTypeAzureOpenAI:
 			if provider.azureAuthMode() == providerAuthModeAPIKey && strings.TrimSpace(endpoint.apiKey) == "" {
 				return fmt.Errorf("provider %q endpoint %q must set api_key or api_key_env", provider.id, endpoint.endpoint.Name)
+			}
+		case providerTypeOpenAICodex:
+			if strings.TrimSpace(endpoint.apiKey) != "" {
+				return fmt.Errorf("provider %q endpoint %q does not support api_key or api_key_env; Codex uses CODEX_HOME/auth.json", provider.id, endpoint.endpoint.Name)
 			}
 		case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 			if provider.authType != providerAuthTypeNone && strings.TrimSpace(endpoint.apiKey) == "" {
@@ -2605,18 +2628,6 @@ func azureEndpointConfigsAllOpenAIV1WithDefault(defaultBaseURL string, endpoints
 		}
 	}
 	return true
-}
-
-func providerHasEndpointCredentials(provider *providerRuntime) bool {
-	if provider == nil {
-		return false
-	}
-	for _, endpoint := range provider.endpoints {
-		if endpoint != nil && strings.TrimSpace(endpoint.apiKey) != "" {
-			return true
-		}
-	}
-	return false
 }
 
 func (ps *providerSetup) configureFallbackChains(configs []ProviderFallbackConfig) error {

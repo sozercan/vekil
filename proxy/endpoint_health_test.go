@@ -56,3 +56,32 @@ func TestEndpointHealthSuccessDoesNotClearActiveQuarantine(t *testing.T) {
 		t.Fatal("success while cooldown is active should not clear quarantine")
 	}
 }
+
+func TestEndpointHealthFailurePenaltyExpires(t *testing.T) {
+	tracker := newEndpointHealthTracker(endpointHealthConfig{errorBudget: endpointErrorBudget{Limit: 10, Window: time.Minute}, cooldown: time.Millisecond})
+	now := time.Now()
+	tracker.recordFailure(now)
+	if got := tracker.latency(); got < time.Hour {
+		t.Fatalf("latency immediately after failure = %v, want penalty", got)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if got := tracker.latency(); got != 0 {
+		t.Fatalf("latency after penalty expiry = %v, want reset probe latency", got)
+	}
+}
+
+func TestEndpointHealthHealthyClearsExpiredFailurePenalty(t *testing.T) {
+	tracker := newEndpointHealthTracker(endpointHealthConfig{errorBudget: endpointErrorBudget{Limit: 10, Window: time.Minute}, cooldown: time.Millisecond})
+	now := time.Now()
+	tracker.recordFailure(now)
+	if tracker.healthy(now) {
+		t.Fatal("endpoint should be temporarily unhealthy immediately after failure")
+	}
+	time.Sleep(2 * time.Millisecond)
+	if !tracker.healthy(time.Now()) {
+		t.Fatal("endpoint should be healthy after penalty expires")
+	}
+	if got := tracker.latency(); got != 0 {
+		t.Fatalf("latency after healthy() cleared penalty = %v, want 0", got)
+	}
+}

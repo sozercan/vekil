@@ -52,11 +52,12 @@ func parseEndpointErrorBudget(raw string) (endpointErrorBudget, error) {
 }
 
 type endpointHealthTracker struct {
-	mu               sync.Mutex
-	cfg              endpointHealthConfig
-	failures         []time.Time
-	quarantinedUntil time.Time
-	latencyEWMA      time.Duration
+	mu                 sync.Mutex
+	cfg                endpointHealthConfig
+	failures           []time.Time
+	quarantinedUntil   time.Time
+	deprioritizedUntil time.Time
+	latencyEWMA        time.Duration
 }
 
 func newEndpointHealthTracker(cfg endpointHealthConfig) *endpointHealthTracker {
@@ -75,7 +76,22 @@ func (h *endpointHealthTracker) healthy(now time.Time) bool {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.quarantinedUntil.IsZero() || !now.Before(h.quarantinedUntil)
+	if !h.quarantinedUntil.IsZero() {
+		if now.Before(h.quarantinedUntil) {
+			return false
+		}
+		h.quarantinedUntil = time.Time{}
+	}
+	if !h.deprioritizedUntil.IsZero() {
+		if now.Before(h.deprioritizedUntil) {
+			return false
+		}
+		h.deprioritizedUntil = time.Time{}
+		if h.latencyEWMA >= time.Hour {
+			h.latencyEWMA = 0
+		}
+	}
+	return true
 }
 
 func (h *endpointHealthTracker) latency() time.Duration {
@@ -84,6 +100,12 @@ func (h *endpointHealthTracker) latency() time.Duration {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if !h.deprioritizedUntil.IsZero() && !time.Now().Before(h.deprioritizedUntil) {
+		h.deprioritizedUntil = time.Time{}
+		if h.latencyEWMA >= time.Hour {
+			h.latencyEWMA = 0
+		}
+	}
 	return h.latencyEWMA
 }
 
@@ -98,6 +120,10 @@ func (h *endpointHealthTracker) recordSuccess(latency time.Duration) {
 			return
 		}
 		h.quarantinedUntil = time.Time{}
+		h.deprioritizedUntil = time.Time{}
+		if h.latencyEWMA >= time.Hour {
+			h.latencyEWMA = 0
+		}
 	}
 	if latency <= 0 {
 		return
@@ -123,13 +149,37 @@ func (h *endpointHealthTracker) recordFailure(now time.Time) bool {
 		}
 	}
 	h.failures = append(kept, now)
-	if h.latencyEWMA == 0 {
-		h.latencyEWMA = time.Hour
-	}
+	// Deprioritize failed endpoints for least-latency selection immediately, not
+	// only after quarantine, so retries can move to healthy siblings within the
+	// same request even when the error budget is larger than the retry count.
+	h.latencyEWMA = time.Hour
+	h.deprioritizedUntil = now.Add(h.cfg.cooldown)
 	if len(h.failures) >= h.cfg.errorBudget.Limit {
 		h.quarantinedUntil = now.Add(h.cfg.cooldown)
+		h.deprioritizedUntil = h.quarantinedUntil
 		h.failures = nil
 		return true
 	}
 	return false
+}
+
+func (h *endpointHealthTracker) usableIgnoringPenalty(now time.Time) bool {
+	if h == nil {
+		return true
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.quarantinedUntil.IsZero() && now.Before(h.quarantinedUntil) {
+		return false
+	}
+	if !h.quarantinedUntil.IsZero() && !now.Before(h.quarantinedUntil) {
+		h.quarantinedUntil = time.Time{}
+	}
+	if !h.deprioritizedUntil.IsZero() && !now.Before(h.deprioritizedUntil) {
+		h.deprioritizedUntil = time.Time{}
+		if h.latencyEWMA >= time.Hour {
+			h.latencyEWMA = 0
+		}
+	}
+	return true
 }

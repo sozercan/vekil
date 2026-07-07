@@ -181,7 +181,7 @@ func TestProviderEndpointsYAMLConfig(t *testing.T) {
 }
 
 func TestCopilotEndpointOverridesToken(t *testing.T) {
-	handler := &ProxyHandler{auth: auth.NewTestAuthenticator("default-token"), copilotURL: "https://copilot.example.test"}
+	handler := &ProxyHandler{auth: auth.NewTestAuthenticator("default-token"), client: http.DefaultClient, copilotURL: "https://copilot.example.test"}
 	providers, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
 		ID:       "copilot",
 		Type:     "copilot",
@@ -465,5 +465,216 @@ func TestCopilotReadyzUsesNonInteractiveAuthForUnkeyedEndpoint(t *testing.T) {
 	}
 	if got := req.Header.Get("Authorization"); got != "Bearer default-token" {
 		t.Fatalf("Authorization = %q, want non-interactive default token", got)
+	}
+}
+
+func TestLeastLatencyRotatesAfterPreviouslyFastEndpointFails(t *testing.T) {
+	var eastHits atomic.Int32
+	east := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		eastHits.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer east.Close()
+	var westHits atomic.Int32
+	west := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		westHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-ok","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer west.Close()
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "multi",
+			Type:     "openai-compatible",
+			Default:  true,
+			AuthType: "none",
+			Selector: "least_latency",
+			Endpoints: []ProviderEndpointConfig{
+				{Name: "east", BaseURL: east.URL},
+				{Name: "west", BaseURL: west.URL},
+			},
+			Models: []ProviderModelConfig{{PublicID: "gpt-public", Deployment: "gpt-upstream", Endpoints: []string{providerEndpointChatCompletions}}},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	handler.maxRetries = 2
+	handler.retryBaseDelay = time.Millisecond
+	provider := handler.providerSetup().providerByID("multi")
+	provider.endpointByName["east"].health.recordSuccess(time.Millisecond)
+	provider.endpointByName["west"].health.recordSuccess(20 * time.Millisecond)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-public","messages":[{"role":"user","content":"hi"}]}`))
+	w := httptest.NewRecorder()
+	handler.HandleOpenAIChatCompletions(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if eastHits.Load() != 1 || westHits.Load() != 1 {
+		t.Fatalf("hits east/west = %d/%d, want failover from previously-fast east to west", eastHits.Load(), westHits.Load())
+	}
+}
+
+func TestAzureIdentityRejectsEndpointAPIKeys(t *testing.T) {
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.test", azureIdentityTokenSourceFactory: (&recordingAzureIdentityFactory{}).factory}
+	_, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
+		ID:       "azure",
+		Type:     "azure-openai",
+		Default:  true,
+		AuthMode: "azure_identity",
+		BaseURL:  "https://example.openai.azure.com/openai/v1",
+		Endpoints: []ProviderEndpointConfig{{
+			Name:   "east",
+			APIKey: "should-not-be-used",
+		}},
+		Models: []ProviderModelConfig{{PublicID: "gpt-public", Deployment: "gpt-deployment", Endpoints: []string{providerEndpointChatCompletions}}},
+	}}})
+	if err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Fatalf("buildProviders() error = %v, want endpoint key rejection", err)
+	}
+}
+
+func TestOpenAICodexEndpointsUseDefaultBaseURL(t *testing.T) {
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.test"}
+	providers, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
+		ID:             "codex",
+		Type:           "openai-codex",
+		Default:        true,
+		ModelDiscovery: "static",
+		Endpoints: []ProviderEndpointConfig{{
+			Name: "default",
+		}},
+		Models: []ProviderModelConfig{{PublicID: "gpt-5.5", Endpoints: []string{providerEndpointResponses}}},
+	}}})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+	if got := providers["codex"].endpoints[0].endpoint.BaseURL; got != defaultOpenAICodexBaseURL {
+		t.Fatalf("codex endpoint baseURL = %q, want default", got)
+	}
+}
+
+func TestEndpointHealthDeprioritizationMakesEndpointTemporarilyUnhealthy(t *testing.T) {
+	tracker := newEndpointHealthTracker(endpointHealthConfig{errorBudget: endpointErrorBudget{Limit: 10, Window: time.Minute}, cooldown: time.Millisecond})
+	now := time.Now()
+	tracker.recordSuccess(time.Millisecond)
+	tracker.recordFailure(now)
+	if tracker.healthy(now) {
+		t.Fatal("endpoint should be temporarily unhealthy during failure penalty")
+	}
+	time.Sleep(2 * time.Millisecond)
+	if !tracker.healthy(time.Now()) {
+		t.Fatal("endpoint should recover after failure penalty")
+	}
+}
+
+func TestEndpointHealthCountsPlain500Failure(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:        "multi",
+			Type:      "openai-compatible",
+			Default:   true,
+			AuthType:  "none",
+			Endpoints: []ProviderEndpointConfig{{Name: "east", BaseURL: upstream.URL, Health: ProviderEndpointHealthConfig{ErrorBudget: "1/m", Cooldown: "1h"}}},
+			Models:    []ProviderModelConfig{{PublicID: "gpt-public", Deployment: "gpt-upstream", Endpoints: []string{providerEndpointChatCompletions}}},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-public","messages":[{"role":"user","content":"hi"}]}`))
+	w := httptest.NewRecorder()
+	handler.HandleOpenAIChatCompletions(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", w.Code)
+	}
+	provider := handler.providerSetup().providerByID("multi")
+	if provider.endpointByName["east"].health.healthy(time.Now()) {
+		t.Fatal("plain 500 should count against health and quarantine endpoint")
+	}
+}
+
+func TestEndpointSelectionFallsBackToOnlyPenalizedEndpoint(t *testing.T) {
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.test"}
+	providers, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
+		ID:       "single",
+		Type:     "openai-compatible",
+		Default:  true,
+		AuthType: "none",
+		Endpoints: []ProviderEndpointConfig{{
+			Name:    "only",
+			BaseURL: "https://only.example.test/v1",
+			Health:  ProviderEndpointHealthConfig{ErrorBudget: "10/m", Cooldown: "1h"},
+		}},
+		Models: []ProviderModelConfig{{PublicID: "gpt-public", Deployment: "gpt-upstream", Endpoints: []string{providerEndpointChatCompletions}}},
+	}}})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+	provider := providers["single"]
+	provider.endpointByName["only"].health.recordFailure(time.Now())
+	endpoint, err := provider.pickEndpoint()
+	if err != nil {
+		t.Fatalf("pickEndpoint() error = %v, want last-resort penalized endpoint", err)
+	}
+	if endpoint.endpoint.Name != "only" {
+		t.Fatalf("endpoint = %q, want only", endpoint.endpoint.Name)
+	}
+}
+
+func TestCopilotReadyzUsesEndpointBaseURLWithoutEndpointToken(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer default-token" {
+			t.Fatalf("Authorization = %q, want default token", got)
+		}
+		if got := r.URL.Path; got != "/models" {
+			t.Fatalf("path = %q, want /models", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer upstream.Close()
+	handler := &ProxyHandler{auth: auth.NewTestAuthenticator("default-token"), client: http.DefaultClient, copilotURL: "https://copilot.example.test"}
+	providers, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
+		ID:      "copilot",
+		Type:    "copilot",
+		Default: true,
+		Endpoints: []ProviderEndpointConfig{{
+			Name:    "custom",
+			BaseURL: upstream.URL,
+		}},
+	}}})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+	if err := handler.checkProviderReady(context.Background(), providers["copilot"]); err != nil {
+		t.Fatalf("checkProviderReady() error = %v", err)
+	}
+}
+
+func TestOpenAICodexRejectsEndpointAPIKeys(t *testing.T) {
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.test"}
+	_, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
+		ID:      "codex",
+		Type:    "openai-codex",
+		Default: true,
+		Endpoints: []ProviderEndpointConfig{{
+			Name:   "bad-key",
+			APIKey: "ignored",
+		}},
+		Models: []ProviderModelConfig{{PublicID: "gpt-5.5", Endpoints: []string{providerEndpointResponses}}},
+	}}})
+	if err == nil || !strings.Contains(err.Error(), "does not support api_key") {
+		t.Fatalf("buildProviders() error = %v, want Codex endpoint key rejection", err)
 	}
 }

@@ -802,7 +802,7 @@ func (h *ProxyHandler) newProviderProbeRequest(ctx context.Context, provider *pr
 
 	switch provider.kind {
 	case providerTypeCopilot:
-		if providerHasEndpointCredentials(provider) {
+		if len(provider.endpoints) > 0 {
 			req, err := h.newProviderJSONRequest(contextWithNonInteractiveAuth(ctx), provider, http.MethodGet, "/models", nil, nil, "")
 			if err != nil {
 				return nil, fmt.Errorf("failed to create provider %q probe request: %w", provider.id, err)
