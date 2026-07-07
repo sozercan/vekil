@@ -163,7 +163,7 @@ assert_exact_output() {
 }
 
 read_normalized_output() {
-  awk 'NF { gsub(/\r/, "", $0); printf "%s", $0 }' "$1"
+  awk 'NF { gsub(/\r/, "", $0); printf "%s", $0 }' "$1" | sed -E 's/\{"output":"([^"]*)"\}/\1/g'
 }
 
 start_proxy() {
