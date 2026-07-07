@@ -1536,3 +1536,79 @@ func TestRefreshToken_AutoDeviceFlowReturnsTransientRefreshError(t *testing.T) {
 		t.Fatalf("unexpected error: %q", got)
 	}
 }
+
+func TestFlexString_UnmarshalStringAndObject(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "plain string",
+			input:    `{"error_details":"invalid access token"}`,
+			expected: "invalid access token",
+		},
+		{
+			name:     "object value",
+			input:    `{"error_details":{"code":"auth_failed","message":"token expired"}}`,
+			expected: `{"code":"auth_failed","message":"token expired"}`,
+		},
+		{
+			name:     "null value",
+			input:    `{"error_details":null}`,
+			expected: "",
+		},
+		{
+			name:     "absent field",
+			input:    `{"token":"tok"}`,
+			expected: "",
+		},
+		{
+			name:     "number value",
+			input:    `{"error_details":42}`,
+			expected: "42",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var resp CopilotTokenResponse
+			if err := json.Unmarshal([]byte(tc.input), &resp); err != nil {
+				t.Fatalf("unmarshal error: %v", err)
+			}
+			if got := string(resp.ErrorDetails); got != tc.expected {
+				t.Errorf("expected %q, got %q", tc.expected, got)
+			}
+		})
+	}
+}
+
+func TestExchangeForCopilotToken_ObjectErrorDetails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simulate GitHub returning error_details as a JSON object (the scenario
+		// that caused the CI smoke failure).
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error_details":{"code":"auth_failed","message":"token expired"}}`))
+	}))
+	defer server.Close()
+
+	a := &Authenticator{
+		accessToken:    "bad-token",
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+		tokenDir:       t.TempDir(),
+	}
+
+	err := a.exchangeForCopilotToken(context.Background())
+	if err == nil {
+		t.Fatal("expected error for object-shaped error_details")
+	}
+	if !errors.Is(err, ErrInvalidAccessToken) {
+		t.Fatalf("expected ErrInvalidAccessToken, got %v", err)
+	}
+	// The error message should contain the raw JSON object representation.
+	expected := `invalid access token: {"code":"auth_failed","message":"token expired"}`
+	if got := err.Error(); got != expected {
+		t.Errorf("expected %q, got %q", expected, got)
+	}
+}

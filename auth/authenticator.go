@@ -99,9 +99,36 @@ type AccessTokenResponse struct {
 
 // CopilotTokenResponse is the response from the Copilot token exchange endpoint.
 type CopilotTokenResponse struct {
-	Token        string `json:"token"`
-	ExpiresAt    int64  `json:"expires_at"`
-	ErrorDetails string `json:"error_details,omitempty"`
+	Token        string     `json:"token"`
+	ExpiresAt    int64      `json:"expires_at"`
+	ErrorDetails flexString `json:"error_details,omitempty"`
+}
+
+// flexString is a string type that tolerates both JSON string and JSON object
+// values during unmarshaling. When the JSON value is a string it stores it
+// directly; when it is an object or other non-string JSON type it stores the
+// raw JSON text. This handles upstream APIs that may change a field from a
+// plain string to a structured object without breaking deserialization.
+type flexString string
+
+// UnmarshalJSON implements json.Unmarshaler for flexString.
+func (f *flexString) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || string(data) == "null" {
+		*f = ""
+		return nil
+	}
+	// Fast path: JSON string value — unmarshal normally.
+	if data[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		*f = flexString(s)
+		return nil
+	}
+	// Object, array, number, or bool — store the raw JSON as a string.
+	*f = flexString(data)
+	return nil
 }
 
 // CopilotUserResponse is the response from the Copilot user endpoint used to
@@ -112,9 +139,9 @@ type CopilotUserResponse struct {
 }
 
 type githubAPIErrorResponse struct {
-	Message      string `json:"message,omitempty"`
-	Status       string `json:"status,omitempty"`
-	ErrorDetails string `json:"error_details,omitempty"`
+	Message      string     `json:"message,omitempty"`
+	Status       string     `json:"status,omitempty"`
+	ErrorDetails flexString `json:"error_details,omitempty"`
 }
 
 // AuthPreferences stores explicit authentication preferences shared by the
@@ -711,7 +738,7 @@ func readGitHubAPIErrorDetail(body io.Reader) string {
 
 	var apiErr githubAPIErrorResponse
 	if err := json.Unmarshal(data, &apiErr); err == nil {
-		for _, detail := range []string{apiErr.ErrorDetails, apiErr.Message, apiErr.Status} {
+		for _, detail := range []string{string(apiErr.ErrorDetails), apiErr.Message, apiErr.Status} {
 			if strings.TrimSpace(detail) != "" {
 				return strings.TrimSpace(detail)
 			}
@@ -741,22 +768,23 @@ func (a *Authenticator) exchangeForCopilotToken(ctx context.Context) error {
 	}
 
 	if ctResp.Token == "" {
-		if resp.StatusCode == http.StatusUnauthorized || isInvalidAccessTokenDetail(ctResp.ErrorDetails) {
-			if strings.TrimSpace(ctResp.ErrorDetails) == "" {
+		errorDetails := string(ctResp.ErrorDetails)
+		if resp.StatusCode == http.StatusUnauthorized || isInvalidAccessTokenDetail(errorDetails) {
+			if strings.TrimSpace(errorDetails) == "" {
 				return ErrInvalidAccessToken
 			}
-			return fmt.Errorf("%w: %s", ErrInvalidAccessToken, ctResp.ErrorDetails)
+			return fmt.Errorf("%w: %s", ErrInvalidAccessToken, errorDetails)
 		}
 		if resp.StatusCode != http.StatusOK {
-			if strings.TrimSpace(ctResp.ErrorDetails) != "" {
-				return fmt.Errorf("copilot token request failed with status %d: %s", resp.StatusCode, ctResp.ErrorDetails)
+			if strings.TrimSpace(errorDetails) != "" {
+				return fmt.Errorf("copilot token request failed with status %d: %s", resp.StatusCode, errorDetails)
 			}
 			return fmt.Errorf("copilot token request failed with status %d", resp.StatusCode)
 		}
-		if strings.TrimSpace(ctResp.ErrorDetails) == "" {
+		if strings.TrimSpace(errorDetails) == "" {
 			return fmt.Errorf("empty copilot token")
 		}
-		return fmt.Errorf("empty copilot token: %s", ctResp.ErrorDetails)
+		return fmt.Errorf("empty copilot token: %s", errorDetails)
 	}
 
 	a.copilotToken = ctResp.Token
