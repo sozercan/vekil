@@ -638,14 +638,12 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		runtime.headerProfiles = cfg.Headers
 	case providerTypeAzureOpenAI:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
-		baseKind := azureBaseURLKindInvalid
 		if baseURL == "" {
 			if len(cfg.Endpoints) == 0 {
 				return nil, fmt.Errorf("provider %q must set base_url", id)
 			}
 		} else {
-			baseKind = classifyAzureBaseURL(baseURL)
-			switch baseKind {
+			switch baseKind := classifyAzureBaseURL(baseURL); baseKind {
 			case azureBaseURLKindOpenAIV1, azureBaseURLKindLegacyOpenAI, azureBaseURLKindResourceRoot:
 			case azureBaseURLKindModels:
 				return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: Microsoft Foundry /models inference endpoints are not supported; use the OpenAI-compatible endpoint ending in /openai/v1 instead", id, baseURL)
