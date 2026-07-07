@@ -103,8 +103,7 @@ func (s keyringCredentialStore) Set(name string, data []byte) error {
 	if err := keyring.Set(credentialStoreService, s.key(name), string(data)); err != nil {
 		return s.fallback.Set(name, data)
 	}
-	_ = s.fallback.Delete(name)
-	return nil
+	return s.fallback.Delete(name)
 }
 
 func (s keyringCredentialStore) Delete(name string) error {

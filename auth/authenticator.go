@@ -627,16 +627,20 @@ func (a *Authenticator) SignInWithGitHubCLI(ctx context.Context) error {
 		a.tokenExpiry = previousTokenExpiry
 		return err
 	}
+	var errs []error
 	for _, name := range []string{accessTokenSecretName, copilotTokenSecretName} {
 		if err := a.store().Delete(name); err != nil {
-			return fmt.Errorf("removing stale %s: %w", name, err)
+			errs = append(errs, fmt.Errorf("removing stale %s: %w", name, err))
 		}
 	}
 	if err := a.clearSignedOutMarker(); err != nil {
-		return fmt.Errorf("clearing signed-out marker: %w", err)
+		errs = append(errs, fmt.Errorf("clearing signed-out marker: %w", err))
 	}
 	if err := a.setGitHubCLIAutoSignIn(true); err != nil {
-		return fmt.Errorf("saving auth preferences: %w", err)
+		errs = append(errs, fmt.Errorf("saving auth preferences: %w", err))
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("github cli sign-in cleanup: %w", errors.Join(errs...))
 	}
 
 	return nil
