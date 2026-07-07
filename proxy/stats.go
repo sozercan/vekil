@@ -901,10 +901,12 @@ func (h *ProxyHandler) DecInflight() {
 
 // RecordRequest folds one completed request into the traffic stats.
 func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAgent string, dur time.Duration) {
-	if h == nil || h.stats == nil {
+	if h == nil {
 		return
 	}
-	h.stats.record(summary, status, userAgent, dur)
+	if h.stats != nil {
+		h.stats.record(summary, status, userAgent, dur)
+	}
 	if h.metrics != nil {
 		h.metrics.Record(summary, status, dur)
 	}
@@ -915,10 +917,12 @@ func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAg
 // so turns are recorded directly here. status is the turn outcome so failed
 // turns appear in error counts.
 func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage) {
-	if h == nil || h.stats == nil {
+	if h == nil {
 		return
 	}
-	h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage)
+	if h.stats != nil {
+		h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage)
+	}
 	if h.metrics != nil {
 		if status == 0 {
 			status = http.StatusOK

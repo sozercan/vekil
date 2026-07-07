@@ -1,11 +1,11 @@
 BINARY := vekil
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 GO_VERSION := $(shell go version | awk '{print $$3}')
+VERSION ?= dev-$(shell git rev-parse --short HEAD)
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.goVersion=$(GO_VERSION)
 APP_NAME := Vekil.app
 APP_BUNDLE_ID := com.vekil.menubar
 APP_ICON := assets/macos/Vekil.icns
-VERSION ?= dev-$(shell git rev-parse --short HEAD)
 APP_VERSION := $(patsubst v%,%,$(VERSION))
 APP_CGO_LDFLAGS = -F$(abspath $(SPARKLE_UNPACK_DIR)) -Wl,-rpath,@executable_path/../Frameworks
 SPARKLE_VERSION := 2.9.0
