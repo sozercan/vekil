@@ -91,13 +91,14 @@ if ($d.ShowDialog() -eq 'OK') { $d.FileName } else { exit 1 }`
 
 // copyToClipboard copies text to the Windows clipboard using clip.exe.
 func copyToClipboard(text string) {
-	cmd := execCommand("cmd", "/c", "echo|set /p="+text+"|clip")
+	cmd := execCommand("clip")
+	cmd.Stdin = strings.NewReader(text)
 	_ = cmd.Run()
 }
 
 // openURL opens a URL in the default browser.
 func openURL(url string) {
-	_ = execCommand("cmd", "/c", "start", "", url).Start()
+	_ = execCommand("rundll32", "url.dll,FileProtocolHandler", url).Start()
 }
 
 // showNotification displays a toast notification via PowerShell.
