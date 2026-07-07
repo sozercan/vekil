@@ -621,6 +621,9 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 	case providerTypeCopilot:
 		runtime.baseURL = strings.TrimRight(defaultCopilotURL, "/")
 		runtime.headerProfiles = cfg.Headers
+		if err := addStaticProviderModels(runtime, cfg.Models, runtime.defaultStaticModelEndpoints()); err != nil {
+			return nil, err
+		}
 	case providerTypeAzureOpenAI:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 		if baseURL == "" {
@@ -698,6 +701,9 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		}
 		runtime.baseURL = baseURL
 		runtime.codexAuth = codexAuth
+		if err := addStaticProviderModels(runtime, cfg.Models, runtime.defaultStaticModelEndpoints()); err != nil {
+			return nil, err
+		}
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 		if baseURL == "" {
@@ -1610,7 +1616,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 		if err != nil {
 			return providerModelsFetchResult{}, err
 		}
-		result.models = models
+		result.models = mergeDiscoveredProviderModelsWithStaticConfig(provider, models)
 		return result, nil
 	case providerTypeOpenAICodex:
 		modelsQuery := openAICodexModelsRawQuery(rawQuery)
@@ -1651,7 +1657,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 		if err != nil {
 			return providerModelsFetchResult{}, err
 		}
-		result.models = models
+		result.models = mergeDiscoveredProviderModelsWithStaticConfig(provider, models)
 		return result, nil
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		if provider.modelDiscovery == providerModelDiscoveryStatic {

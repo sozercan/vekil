@@ -537,7 +537,8 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 			},
 		},
 	}
-	if h.shouldSetSyntheticResponsesStoreFalse(memReq.Model) {
+	provider, _, _, _ := h.resolveProviderModelWithFastAlias(memReq.Model, providerEndpointResponses)
+	if h.shouldSetSyntheticResponsesStoreFalseForProvider(provider) {
 		responsesReq["store"] = false
 	}
 	if len(memReq.Reasoning) > 0 && string(memReq.Reasoning) != "null" {
@@ -705,14 +706,17 @@ func writeCompactResponse(w http.ResponseWriter, summaryText string, retainedOut
 }
 
 func (h *ProxyHandler) setSyntheticResponsesStoreFalse(requestFields map[string]json.RawMessage) {
-	if requestFields == nil || !h.shouldSetSyntheticResponsesStoreFalse(rawJSONString(requestFields["model"])) {
+	if requestFields == nil {
+		return
+	}
+	provider, _, _, _ := h.resolveProviderModelWithFastAlias(rawJSONString(requestFields["model"]), providerEndpointResponses)
+	if !h.shouldSetSyntheticResponsesStoreFalseForProvider(provider) {
 		return
 	}
 	requestFields["store"] = json.RawMessage("false")
 }
 
-func (h *ProxyHandler) shouldSetSyntheticResponsesStoreFalse(model string) bool {
-	provider, _, _ := h.resolveProviderModel(strings.TrimSpace(model), providerEndpointResponses)
+func (h *ProxyHandler) shouldSetSyntheticResponsesStoreFalseForProvider(provider *providerRuntime) bool {
 	if provider == nil {
 		return false
 	}
@@ -2597,12 +2601,19 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 	defer func() {
 		observeInternalResponsesUsage(observeCtx, budget.usageTotals())
 	}()
+	compactionModel := model
+	compactionRoutingHeaders := routingHeaders
+	if len(selectedOwners) > 0 && selectedOwners[0].publicID != "" {
+		compactionModel = selectedOwners[0].publicID
+		compactionRoutingHeaders = noSpeedTierRoutingHeaders()
+	}
+
 	lastAlignedKeepTail := 0
 	for attempt, keepTail := range keepTailSchedule {
 		prefixLen := compactedResponsesAlignedPrefixLen(input, keepTail)
 		alignedKeepTail := len(input) - prefixLen
 		lastAlignedKeepTail = alignedKeepTail
-		summary, err := h.compactResponsesInputWithBudget(ctx, model, input[:prefixLen], extraHeaders, budget, routingHeaders)
+		summary, err := h.compactResponsesInputWithBudget(ctx, compactionModel, input[:prefixLen], extraHeaders, budget, compactionRoutingHeaders)
 		if err != nil {
 			h.log.Debug("responses 413 compaction failed", logger.F("keep_tail", keepTail), logger.Err(err))
 			return lastResp, nil

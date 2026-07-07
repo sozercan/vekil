@@ -386,8 +386,12 @@ func (f speedTierFeatures) matchWhen(when SpeedTierWhenConfig, endpoint string) 
 	if when.MessageCountLTE != nil {
 		check("message_count_lte", f.messageCount >= 0 && f.messageCount <= *when.MessageCountLTE)
 	}
-	if len(when.RequireEndpointIn) > 0 && !stringInSlice(endpoint, when.RequireEndpointIn) {
-		return 0, "", configured
+	if len(when.RequireEndpointIn) > 0 {
+		endpointMatches := stringInSlice(endpoint, when.RequireEndpointIn)
+		check("require_endpoint_in", endpointMatches)
+		if !endpointMatches {
+			return 0, "", configured
+		}
 	}
 	return matches, first, configured
 }

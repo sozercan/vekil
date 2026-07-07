@@ -11328,6 +11328,28 @@ func TestStripUnsupportedResponsesRequestFields_RemovesSamplingForCodexOnly(t *t
 	}
 }
 
+func TestSyntheticResponsesStoreFalseUsesFastAliasBaseProvider(t *testing.T) {
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+			{ID: "anthropic", Type: "anthropic-compatible", Default: true, BaseURL: "https://anthropic.example.com", AuthType: "none", MessagesPath: "/v1/messages", Models: []ProviderModelConfig{{PublicID: "claude-public", Endpoints: []string{providerEndpointMessages}}}},
+			{ID: "responses", Type: "openai-compatible", BaseURL: "https://responses.example.com", AuthType: "none", Models: []ProviderModelConfig{{PublicID: "gpt-public", Endpoints: []string{providerEndpointResponses}}}},
+		}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	fields := map[string]json.RawMessage{
+		"model": json.RawMessage(`"fast/gpt-public"`),
+		"input": json.RawMessage(`"hi"`),
+	}
+	handler.setSyntheticResponsesStoreFalse(fields)
+	if got := strings.TrimSpace(string(fields["store"])); got != "false" {
+		t.Fatalf("synthetic store for fast alias = %q, want false", got)
+	}
+}
+
 func TestSyntheticResponsesStoreFalseOnlyForProxyBuiltRequests(t *testing.T) {
 	handler := &ProxyHandler{copilotURL: "https://api.githubcopilot.com"}
 	fields := map[string]json.RawMessage{

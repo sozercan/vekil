@@ -582,7 +582,7 @@ func TestResponsesWebSocketSpeedTierHonorsUpgradeOptOutHeader(t *testing.T) {
 	}
 }
 
-func TestSpeedTierEndpointFilterDoesNotTriggerAnyModeByItself(t *testing.T) {
+func TestSpeedTierEndpointFilterCountsAsAnyModeSignal(t *testing.T) {
 	owner := providerModel{publicID: "sonnet-public", speedTier: &speedTierRule{
 		downgradeTo: "haiku-public",
 		semantics:   speedTierSemanticsAny,
@@ -592,8 +592,8 @@ func TestSpeedTierEndpointFilterDoesNotTriggerAnyModeByItself(t *testing.T) {
 		},
 	}}
 	decision := evaluateSpeedTier([]byte(`{"model":"sonnet-public","max_tokens":2048}`), providerEndpointResponses, nil, owner, false)
-	if decision.decision != speedTierDecisionConsideredReject {
-		t.Fatalf("decision = %+v, want endpoint filter not to trigger any-mode downgrade", decision)
+	if decision.decision != speedTierDecisionDowngraded || decision.triggeringSignal != "require_endpoint_in" {
+		t.Fatalf("decision = %+v, want endpoint signal downgrade", decision)
 	}
 }
 
@@ -1079,5 +1079,126 @@ func TestResponsesFallbackCanReturnToSourceAfterSpeedTierRejection(t *testing.T)
 	}
 	if retryModel != "sonnet-upstream" {
 		t.Fatalf("retry upstream model = %q, want sonnet-upstream", retryModel)
+	}
+}
+
+func TestSpeedTierEndpointOnlyWhenSignalDowngrades(t *testing.T) {
+	owner := providerModel{publicID: "sonnet-public", speedTier: &speedTierRule{
+		downgradeTo: "haiku-public",
+		semantics:   speedTierSemanticsAll,
+		when:        SpeedTierWhenConfig{RequireEndpointIn: []string{providerEndpointResponses}},
+	}}
+	decision := evaluateSpeedTier([]byte(`{"model":"sonnet-public"}`), providerEndpointResponses, nil, owner, false)
+	if decision.decision != speedTierDecisionDowngraded || decision.triggeringSignal != speedTierSemanticsAll {
+		t.Fatalf("responses decision = %+v, want endpoint-only all-mode downgrade", decision)
+	}
+	decision = evaluateSpeedTier([]byte(`{"model":"sonnet-public"}`), providerEndpointChatCompletions, nil, owner, false)
+	if decision.decision != speedTierDecisionConsideredReject {
+		t.Fatalf("chat decision = %+v, want endpoint mismatch reject", decision)
+	}
+}
+
+func TestSpeedTierStickyRequestModelPreservesLiteralFastPublicID(t *testing.T) {
+	handler, _ := newSpeedTierRoutingHandler(t, true, []ProviderModelConfig{
+		{PublicID: "fast/sonnet-public", Deployment: "literal-fast-upstream", Endpoints: []string{providerEndpointResponses}, SpeedTier: &SpeedTierConfig{DowngradeTo: "haiku-public", When: SpeedTierWhenConfig{MaxTokensLTE: speedTierIntPtr(512)}}},
+		{PublicID: "sonnet-public", Deployment: "sonnet-upstream", Endpoints: []string{providerEndpointResponses}},
+		{PublicID: "haiku-public", Deployment: "haiku-upstream", Endpoints: []string{providerEndpointResponses}},
+	})
+	if got := handler.speedTierStickyRequestModel("fast/sonnet-public", providerEndpointResponses); got != "fast/sonnet-public" {
+		t.Fatalf("literal fast sticky model = %q, want fast/sonnet-public", got)
+	}
+	if got := handler.speedTierStickyRequestModel("fast/unknown-public", providerEndpointResponses); got != "unknown-public" {
+		t.Fatalf("alias sticky model = %q, want unknown-public", got)
+	}
+}
+
+func TestDynamicProviderSpeedTierOverlaysApplyToCopilotAndCodexModels(t *testing.T) {
+	models := []ProviderModelConfig{
+		{PublicID: "gpt-source", Endpoints: []string{providerEndpointResponses}, SpeedTier: &SpeedTierConfig{DowngradeTo: "gpt-target", When: SpeedTierWhenConfig{MaxTokensLTE: speedTierIntPtr(512)}}},
+		{PublicID: "gpt-target", Endpoints: []string{providerEndpointResponses}},
+	}
+	for _, providerType := range []string{"copilot", "openai-codex"} {
+		t.Run(providerType, func(t *testing.T) {
+			handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+			providers, _, _, err := handler.buildProviders(ProvidersConfig{SpeedTierEnabled: true, Providers: []ProviderConfig{{ID: providerType, Type: providerType, Default: true, Models: models}}})
+			if err != nil {
+				t.Fatalf("buildProviders() error = %v", err)
+			}
+			provider := providers[providerType]
+			if provider == nil || len(provider.staticConfigs) == 0 {
+				t.Fatalf("provider static speed-tier overlays were not loaded: %#v", provider)
+			}
+			merged := mergeDiscoveredProviderModelsWithStaticConfig(provider, []providerModel{
+				{publicID: "gpt-source", upstreamModel: "gpt-source", providerID: providerType, supportedEndpoints: []string{providerEndpointResponses}},
+				{publicID: "gpt-target", upstreamModel: "gpt-target", providerID: providerType, supportedEndpoints: []string{providerEndpointResponses}},
+			})
+			if len(merged) != 2 || merged[0].speedTier == nil || merged[0].speedTier.downgradeTo != "gpt-target" {
+				t.Fatalf("merged overlays = %#v, want speed-tier rule on source", merged)
+			}
+		})
+	}
+}
+
+func TestResponses413CompactionSummaryPinnedToSelectedSourceModel(t *testing.T) {
+	var compactionModel string
+	var retryModel string
+	call := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call++
+		var payload map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		model := speedTierRawJSONString(payload["model"])
+		w.Header().Set("Content-Type", "application/json")
+		switch call {
+		case 1:
+			compactionModel = model
+			_, _ = w.Write([]byte(`{"id":"resp-summary","object":"response","status":"completed","model":"` + model + `","output":[{"type":"message","content":[{"type":"output_text","text":"summary"}]}]}`))
+		default:
+			retryModel = model
+			_, _ = w.Write([]byte(`{"id":"resp-ok","object":"response","status":"completed","model":"` + model + `","output":[]}`))
+		}
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithResponsesWebSocketConfig(ResponsesWebSocketConfig{AutoCompactKeepTail: 1}),
+		WithCompactUpstreamMaxAttempts(4),
+		WithProvidersConfig(ProvidersConfig{SpeedTierEnabled: true, Providers: []ProviderConfig{{
+			ID:            "test-provider",
+			Type:          "openai-compatible",
+			Default:       true,
+			BaseURL:       upstream.URL,
+			AuthType:      "none",
+			ResponsesPath: providerEndpointResponses,
+			Models: []ProviderModelConfig{
+				{PublicID: "sonnet-public", Deployment: "sonnet-upstream", Endpoints: []string{providerEndpointResponses}, SpeedTier: &SpeedTierConfig{DowngradeTo: "haiku-public", When: SpeedTierWhenConfig{InputCharsLTE: speedTierIntPtr(1 << 20)}}},
+				{PublicID: "haiku-public", Deployment: "haiku-upstream", Endpoints: []string{providerEndpointResponses}},
+			},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	input := []json.RawMessage{
+		json.RawMessage(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"old"}]}`),
+		json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"new"}]}`),
+	}
+	inputRaw, _ := json.Marshal(input)
+	body := []byte(`{"model":"sonnet-public","input":` + string(inputRaw) + `}`)
+	resp := &http.Response{StatusCode: http.StatusRequestEntityTooLarge, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"message":"too large"}}`))}
+	got, err := handler.maybeRetryCompactedResponsesRequest(context.Background(), context.Background(), body, nil, nil, resp, nil, providerModel{publicID: "sonnet-public"})
+	if err != nil {
+		t.Fatalf("maybeRetryCompactedResponsesRequest() error = %v", err)
+	}
+	if got == nil || got.StatusCode != http.StatusOK {
+		t.Fatalf("retry response = %#v, want 200", got)
+	}
+	_ = got.Body.Close()
+	if compactionModel != "sonnet-upstream" || retryModel != "sonnet-upstream" {
+		t.Fatalf("compaction/retry models = %q/%q, want source sonnet-upstream", compactionModel, retryModel)
 	}
 }

@@ -19,7 +19,7 @@ providers:
     models:
       - public_id: claude-sonnet-4.5
         deployment: claude-sonnet-4-5-20250929
-        endpoints: [/v1/messages, /chat/completions]
+        endpoints: [/v1/messages]
         speed_tier:
           downgrade_to: claude-haiku-4.5
           semantics: all
@@ -38,7 +38,7 @@ providers:
 
       - public_id: claude-haiku-4.5
         deployment: claude-haiku-4-5-20251001
-        endpoints: [/v1/messages, /chat/completions]
+        endpoints: [/v1/messages]
 ```
 
 `speed_tier_enabled` defaults to `false`, so adding a `speed_tier` block is inert until the operator enables the global switch.

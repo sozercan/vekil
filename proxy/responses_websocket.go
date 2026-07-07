@@ -796,6 +796,18 @@ func (s *responsesWebSocketSession) speedTierRoutingHeadersForRequest(request *r
 	return routingHeaders
 }
 
+func (h *ProxyHandler) speedTierStickyRequestModel(model, endpoint string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return ""
+	}
+	if _, _, known := h.resolveProviderModel(providerModelLookupName(model, endpoint), endpoint); known {
+		return providerModelLookupName(model, endpoint)
+	}
+	baseModel, _ := speedTierBaseModel(model)
+	return providerModelLookupName(baseModel, endpoint)
+}
+
 func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, inputSegments [][]json.RawMessage, includeTurnState bool) (*http.Response, error) {
 	bodyBytes, err := request.upstreamBody(inputSegments...)
 	if err != nil {
@@ -803,7 +815,7 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 	}
 	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizers(ctx, bodyBytes, "responses/websocket", true, s.toolContexts, s.toolScope)
 	headers := s.requestHeaders(request, includeTurnState)
-	requestModel, _ := speedTierBaseModel(extractRequestModel(bodyBytes))
+	requestModel := h.speedTierStickyRequestModel(extractRequestModel(bodyBytes), providerEndpointResponses)
 	if s.speedTierPinnedModel != "" && s.speedTierPinnedSource != "" && requestModel != s.speedTierPinnedSource {
 		s.speedTierPinnedModel = ""
 		s.speedTierPinnedSource = ""
