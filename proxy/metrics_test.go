@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -143,7 +144,7 @@ func TestMetricsRetries(t *testing.T) {
 	h := newMetricsHandler(t, true)
 
 	// Simulate retries with context carrying the retry-stats marker and a summary.
-	ctx, summary := WithRequestSummary(nil)
+	ctx, summary := WithRequestSummary(context.TODO())
 	summary.setProvider("test-provider", "openai-compatible")
 	summary.setRoute("responses", "test-model", true)
 	ctx = markRetryStatsTracked(ctx)
