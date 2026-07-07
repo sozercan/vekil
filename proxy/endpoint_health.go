@@ -118,6 +118,10 @@ func NewEndpointHealthTracker(budget ErrorBudget, cooldown time.Duration) *Endpo
 // IsHealthy returns true if the endpoint is available for requests.
 // An endpoint is healthy if it is not quarantined, or if the cooldown has
 // elapsed (half-open state allows one probe).
+//
+// IMPORTANT: This method has a side effect — it consumes the half-open probe
+// opportunity. Use PeekHealthy() when you only need to query availability
+// without claiming the probe (e.g., during selector sync).
 func (t *EndpointHealthTracker) IsHealthy() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -142,6 +146,62 @@ func (t *EndpointHealthTracker) isHealthyLocked() bool {
 			t.halfOpenProbed = true
 			return true
 		}
+	}
+	return false
+}
+
+// PeekHealthy returns true if the endpoint is available for requests WITHOUT
+// consuming the half-open probe opportunity. Use this for selector health sync
+// where you need to know if an endpoint *could* serve traffic, but the endpoint
+// may not ultimately be selected. Call ClaimProbe() after endpoint selection to
+// actually consume the half-open probe slot.
+func (t *EndpointHealthTracker) PeekHealthy() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.peekHealthyLocked()
+}
+
+func (t *EndpointHealthTracker) peekHealthyLocked() bool {
+	if !t.quarantined {
+		return true
+	}
+	now := t.now()
+	if now.After(t.quarantineEnd) || now.Equal(t.quarantineEnd) {
+		// Cooldown elapsed: would enter half-open state.
+		// Report as available if not yet probed, but do NOT consume the probe.
+		if !t.halfOpen {
+			return true // Will become half-open; probe not yet consumed.
+		}
+		if t.halfOpen && !t.halfOpenProbed {
+			return true // Half-open and probe still available.
+		}
+	}
+	return false
+}
+
+// ClaimProbe transitions the endpoint into half-open state (if not already)
+// and consumes the probe opportunity. Returns true if the probe was successfully
+// claimed, false if already consumed or the endpoint is not in a probeable state.
+// Call this after endpoint selection to commit to sending the probe request.
+func (t *EndpointHealthTracker) ClaimProbe() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if !t.quarantined {
+		return false // Not quarantined; no probe needed.
+	}
+	now := t.now()
+	if now.Before(t.quarantineEnd) {
+		return false // Still in cooldown.
+	}
+	// Cooldown elapsed: enter half-open state if needed.
+	if !t.halfOpen {
+		t.halfOpen = true
+		t.halfOpenProbed = false
+	}
+	if t.halfOpen && !t.halfOpenProbed {
+		t.halfOpenProbed = true
+		return true
 	}
 	return false
 }

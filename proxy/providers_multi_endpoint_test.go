@@ -476,3 +476,77 @@ func TestMultiEndpointLatencyEWMAUpdate(t *testing.T) {
 		t.Errorf("second EWMA = %v, want %v", ep.sel.LoadLatencyEWMA(), expected)
 	}
 }
+
+func TestMultiEndpointHalfOpenProbeNotWastedOnUnselectedEndpoint(t *testing.T) {
+	// Regression test for the P2 issue: with 3+ endpoints, pickEndpoint() must
+	// NOT consume the half-open probe opportunity for an endpoint that is not
+	// ultimately selected. Without the fix, IsHealthy() consumed the probe as a
+	// side effect during health sync, causing an endpoint to get stuck in
+	// quarantine when the selector picked a different endpoint.
+	now := time.Now()
+
+	healthA := NewEndpointHealthTracker(ErrorBudget{Count: 2, Window: time.Minute}, 30*time.Second)
+	healthA.now = func() time.Time { return now }
+	healthB := NewEndpointHealthTracker(ErrorBudget{Count: 10, Window: time.Minute}, 30*time.Second)
+	healthB.now = func() time.Time { return now }
+	healthC := NewEndpointHealthTracker(ErrorBudget{Count: 10, Window: time.Minute}, 30*time.Second)
+	healthC.now = func() time.Time { return now }
+
+	runtime := &providerRuntime{
+		id:               "test",
+		endpointSelector: selector.NewRoundRobin(),
+		endpoints: []*providerEndpoint{
+			{
+				name:   "a",
+				health: healthA,
+				sel:    selector.NewEndpoint("a", "", "", 0, true),
+			},
+			{
+				name:   "b",
+				health: healthB,
+				sel:    selector.NewEndpoint("b", "", "", 0, true),
+			},
+			{
+				name:   "c",
+				health: healthC,
+				sel:    selector.NewEndpoint("c", "", "", 0, true),
+			},
+		},
+	}
+
+	// Quarantine endpoint A.
+	healthA.RecordFailure()
+	healthA.RecordFailure()
+
+	// Advance past cooldown so A enters half-open.
+	now = now.Add(31 * time.Second)
+
+	// Verify A is peek-healthy (half-open, probe available).
+	if !healthA.PeekHealthy() {
+		t.Fatal("endpoint A should be peek-healthy (half-open after cooldown)")
+	}
+
+	// Call pickEndpoint multiple times. Since the round-robin will cycle through
+	// all 3, endpoint A may or may not be selected. The key property: if A is
+	// NOT selected on a given call, its probe must NOT be consumed.
+	selectedA := false
+	for range 10 {
+		ep := runtime.pickEndpoint()
+		if ep.name == "a" {
+			selectedA = true
+			break
+		}
+		// After each pick that did NOT select A, verify A's probe is still available.
+		if !healthA.PeekHealthy() {
+			t.Fatal("endpoint A's half-open probe was consumed even though it was not selected — this is the bug")
+		}
+	}
+
+	// If A was eventually selected, verify that ClaimProbe was consumed.
+	if selectedA {
+		// The probe should now be consumed (ClaimProbe was called by pickEndpoint).
+		if healthA.PeekHealthy() {
+			t.Error("after A is selected, PeekHealthy should return false (probe consumed)")
+		}
+	}
+}

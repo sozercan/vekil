@@ -14,6 +14,12 @@ func NewRoundRobin() *RoundRobin {
 }
 
 // Pick selects the next healthy endpoint in rotation order.
+//
+// Note: The monotonically increasing counter modulo the healthy candidate count
+// may produce temporarily uneven distribution when the healthy set changes size
+// between calls (e.g., an endpoint transitions in/out of quarantine). This is a
+// known property of simple modular round-robin and self-corrects over subsequent
+// picks as the candidate set stabilizes.
 func (rr *RoundRobin) Pick(endpoints []*Endpoint) (*Endpoint, error) {
 	if len(endpoints) == 0 {
 		return nil, ErrNoEndpoints

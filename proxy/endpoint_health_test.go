@@ -201,3 +201,105 @@ func TestEndpointHealthTrackerSuccessWithoutHalfOpen(t *testing.T) {
 		t.Error("should remain healthy")
 	}
 }
+
+func TestEndpointHealthTrackerPeekHealthyNoSideEffect(t *testing.T) {
+	now := time.Now()
+	tracker := NewEndpointHealthTracker(ErrorBudget{Count: 2, Window: time.Minute}, 30*time.Second)
+	tracker.now = func() time.Time { return now }
+
+	// Exhaust budget to quarantine.
+	tracker.RecordFailure()
+	tracker.RecordFailure()
+
+	// Still quarantined.
+	if tracker.PeekHealthy() {
+		t.Error("should not be peek-healthy during quarantine")
+	}
+
+	// Advance past cooldown.
+	now = now.Add(31 * time.Second)
+
+	// PeekHealthy should report available without consuming probe.
+	if !tracker.PeekHealthy() {
+		t.Error("should be peek-healthy after cooldown")
+	}
+
+	// Call PeekHealthy multiple times - should remain available.
+	if !tracker.PeekHealthy() {
+		t.Error("PeekHealthy should be repeatable without consuming probe")
+	}
+	if !tracker.PeekHealthy() {
+		t.Error("PeekHealthy should be repeatable without consuming probe (3rd call)")
+	}
+
+	// Now ClaimProbe should still succeed since PeekHealthy didn't consume it.
+	if !tracker.ClaimProbe() {
+		t.Error("ClaimProbe should succeed after PeekHealthy calls")
+	}
+
+	// Second ClaimProbe should fail (probe already consumed).
+	if tracker.ClaimProbe() {
+		t.Error("second ClaimProbe should fail")
+	}
+
+	// PeekHealthy should now return false (probe consumed, still quarantined).
+	if tracker.PeekHealthy() {
+		t.Error("PeekHealthy should be false after probe consumed")
+	}
+}
+
+func TestEndpointHealthTrackerClaimProbeOnHealthy(t *testing.T) {
+	tracker := NewEndpointHealthTracker(ErrorBudget{Count: 5, Window: time.Minute}, 30*time.Second)
+
+	// ClaimProbe on a healthy (non-quarantined) endpoint returns false.
+	if tracker.ClaimProbe() {
+		t.Error("ClaimProbe should return false for healthy endpoint")
+	}
+}
+
+func TestEndpointHealthTrackerClaimProbeDuringCooldown(t *testing.T) {
+	now := time.Now()
+	tracker := NewEndpointHealthTracker(ErrorBudget{Count: 2, Window: time.Minute}, 30*time.Second)
+	tracker.now = func() time.Time { return now }
+
+	// Exhaust budget to quarantine.
+	tracker.RecordFailure()
+	tracker.RecordFailure()
+
+	// Still in cooldown - ClaimProbe should fail.
+	if tracker.ClaimProbe() {
+		t.Error("ClaimProbe should fail during cooldown")
+	}
+}
+
+func TestEndpointHealthTrackerPeekAndClaimRecoveryFlow(t *testing.T) {
+	now := time.Now()
+	tracker := NewEndpointHealthTracker(ErrorBudget{Count: 2, Window: time.Minute}, 30*time.Second)
+	tracker.now = func() time.Time { return now }
+
+	// Exhaust budget to quarantine.
+	tracker.RecordFailure()
+	tracker.RecordFailure()
+
+	// Advance past cooldown.
+	now = now.Add(31 * time.Second)
+
+	// Simulate the selector flow: PeekHealthy -> endpoint selected -> ClaimProbe.
+	if !tracker.PeekHealthy() {
+		t.Fatal("should be peek-healthy for selector sync")
+	}
+	if !tracker.ClaimProbe() {
+		t.Fatal("should claim probe after selection")
+	}
+
+	// Simulate successful probe.
+	tracker.RecordSuccess()
+
+	// Should be fully restored.
+	if !tracker.IsHealthy() {
+		t.Error("should be fully healthy after successful probe")
+	}
+	if !tracker.PeekHealthy() {
+		t.Error("should be peek-healthy after full recovery")
+	}
+}

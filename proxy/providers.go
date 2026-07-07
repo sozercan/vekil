@@ -182,10 +182,13 @@ func (p *providerRuntime) pickEndpoint() *providerEndpoint {
 		return p.endpoints[0]
 	}
 
-	// Sync health state into selector endpoints.
+	// Sync health state into selector endpoints using PeekHealthy() which
+	// does NOT consume the half-open probe opportunity. This ensures that
+	// quarantined endpoints in half-open state are visible to the selector
+	// without wasting the probe if a different endpoint is ultimately picked.
 	sels := make([]*selector.Endpoint, len(p.endpoints))
 	for i, ep := range p.endpoints {
-		ep.sel.SetHealthy(ep.health.IsHealthy())
+		ep.sel.SetHealthy(ep.health.PeekHealthy())
 		sels[i] = ep.sel
 	}
 
@@ -195,6 +198,9 @@ func (p *providerRuntime) pickEndpoint() *providerEndpoint {
 	}
 	for _, ep := range p.endpoints {
 		if ep.sel == picked {
+			// Claim the half-open probe now that we've committed to this
+			// endpoint. This is a no-op for healthy endpoints.
+			ep.health.ClaimProbe()
 			return ep
 		}
 	}
