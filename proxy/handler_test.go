@@ -238,7 +238,7 @@ func TestHandleReadyz(t *testing.T) {
 		if result["status"] != "not_ready" {
 			t.Fatalf("expected status not_ready, got %q", result["status"])
 		}
-		if !strings.Contains(result["error"], "upstream probe returned 503") {
+		if !strings.Contains(result["error"], "upstream probe failed") {
 			t.Fatalf("unexpected error message: %q", result["error"])
 		}
 	})

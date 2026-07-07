@@ -655,14 +655,11 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		}
 		runtime.baseURL = baseURL
 		runtime.apiVersion = strings.TrimSpace(cfg.APIVersion)
-		if runtime.apiVersion == "" {
-			if baseURL != "" {
-				if baseKind != azureBaseURLKindOpenAIV1 {
-					return nil, fmt.Errorf("provider %q api_version is required for Azure base_url %q unless the path ends in /openai/v1", id, baseURL)
-				}
-			} else if !azureEndpointConfigsAllOpenAIV1(cfg.Endpoints) {
-				return nil, fmt.Errorf("provider %q api_version is required unless every endpoint base_url ends in /openai/v1", id)
+		if runtime.apiVersion == "" && !azureEndpointConfigsAllOpenAIV1WithDefault(baseURL, cfg.Endpoints) {
+			if baseURL != "" && len(cfg.Endpoints) == 0 {
+				return nil, fmt.Errorf("provider %q api_version is required for Azure base_url %q unless the path ends in /openai/v1", id, baseURL)
 			}
+			return nil, fmt.Errorf("provider %q api_version is required unless every effective endpoint base_url ends in /openai/v1", id)
 		}
 
 		authMode := providerAuthMode(strings.TrimSpace(cfg.AuthMode))
@@ -1430,7 +1427,11 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 		token := providerAPIKey(provider, selectedEndpoint)
 		if token == "" {
 			var err error
-			token, err = h.auth.GetToken(req.Context())
+			if nonInteractiveAuthFromContext(req.Context()) {
+				token, err = h.auth.GetTokenNonInteractive(req.Context())
+			} else {
+				token, err = h.auth.GetToken(req.Context())
+			}
 			if err != nil {
 				return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
 			}
@@ -2565,12 +2566,16 @@ func providerConfigHasEndpointCredentials(cfg ProviderConfig) bool {
 	return false
 }
 
-func azureEndpointConfigsAllOpenAIV1(endpoints []ProviderEndpointConfig) bool {
+func azureEndpointConfigsAllOpenAIV1WithDefault(defaultBaseURL string, endpoints []ProviderEndpointConfig) bool {
+	defaultBaseURL = strings.TrimRight(strings.TrimSpace(defaultBaseURL), "/")
 	if len(endpoints) == 0 {
-		return false
+		return defaultBaseURL != "" && classifyAzureBaseURL(defaultBaseURL) == azureBaseURLKindOpenAIV1
 	}
 	for _, endpoint := range endpoints {
 		baseURL := strings.TrimRight(strings.TrimSpace(endpoint.BaseURL), "/")
+		if baseURL == "" {
+			baseURL = defaultBaseURL
+		}
 		if baseURL == "" || classifyAzureBaseURL(baseURL) != azureBaseURLKindOpenAIV1 {
 			return false
 		}
@@ -2588,4 +2593,18 @@ func providerHasEndpointCredentials(provider *providerRuntime) bool {
 		}
 	}
 	return false
+}
+
+type nonInteractiveAuthContextKey struct{}
+
+func contextWithNonInteractiveAuth(ctx context.Context) context.Context {
+	return context.WithValue(ctx, nonInteractiveAuthContextKey{}, true)
+}
+
+func nonInteractiveAuthFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(nonInteractiveAuthContextKey{}).(bool)
+	return v
 }

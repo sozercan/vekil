@@ -759,12 +759,13 @@ func (h *ProxyHandler) checkProviderReady(ctx context.Context, provider *provide
 		return nil
 	}
 
-	req, err := h.newProviderProbeRequest(ctx, provider)
-	if err != nil {
-		return err
-	}
-
-	resp, err := h.client.Do(req)
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		req, err := h.newProviderProbeRequest(ctx, provider)
+		if err != nil {
+			return nil, err
+		}
+		return req, nil
+	})
 	if err != nil {
 		return fmt.Errorf("provider %q upstream probe failed: %w", provider.id, err)
 	}
@@ -802,7 +803,7 @@ func (h *ProxyHandler) newProviderProbeRequest(ctx context.Context, provider *pr
 	switch provider.kind {
 	case providerTypeCopilot:
 		if providerHasEndpointCredentials(provider) {
-			req, err := h.newProviderJSONRequest(ctx, provider, http.MethodGet, "/models", nil, nil, "")
+			req, err := h.newProviderJSONRequest(contextWithNonInteractiveAuth(ctx), provider, http.MethodGet, "/models", nil, nil, "")
 			if err != nil {
 				return nil, fmt.Errorf("failed to create provider %q probe request: %w", provider.id, err)
 			}
