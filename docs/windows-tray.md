@@ -34,7 +34,7 @@ Disabling the menu item removes that value. No administrator privileges are requ
 
 ## Authentication storage
 
-This PR is based on the current `main` branch, where Vekil-managed credentials are still stored as local token files under the token directory (default `%AppData%\vekil`). Use **GitHub Auth → Sign Out** from the tray menu to clear those cached credentials. The system secret-store work is tracked separately and will update this behavior when that branch lands.
+This PR is based on the current `main` branch, where Vekil-managed credentials are still stored as local token files under the token directory (default `%USERPROFILE%\.config\vekil`). Use **GitHub Auth → Sign Out** from the tray menu to clear those cached credentials. The system secret-store work is tracked separately and will update this behavior when that branch lands.
 
 ## Packaging status
 
