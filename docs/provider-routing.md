@@ -321,3 +321,124 @@ Routing rules:
 - The example Azure `gpt-5.4-pro` model shown above is `/responses`-only. Do not advertise `/chat/completions` for that model unless you have verified native support.
 
 Use the examples above as a starting point for your local providers config file. JSON and YAML use the same snake_case field names.
+
+## Multi-Endpoint Load Balancing
+
+Providers can distribute requests across multiple endpoints (regions, deployments, accounts) with configurable selection strategies and per-endpoint health tracking. This is useful for:
+
+- Azure OpenAI rate limits per deployment/region
+- Copilot per-account quotas shared across a team
+- Regional failover for high availability
+
+### Configuration
+
+Use `endpoints` instead of (or alongside) the top-level `base_url`/`api_key` to configure multiple upstream targets. The single-endpoint form (today's default) continues to work unchanged.
+
+#### Azure Multi-Region Example
+
+```yaml
+providers:
+  - id: azure-multi
+    type: azure-openai
+    default: true
+    api_version: "2024-12-01-preview"
+    selector: weighted
+    endpoints:
+      - name: east
+        base_url: https://east.openai.azure.com/openai
+        api_key_env: AZURE_EAST_KEY
+        weight: 2
+        health:
+          error_budget: "10/m"
+          cooldown: 30s
+      - name: west
+        base_url: https://west.openai.azure.com/openai
+        api_key_env: AZURE_WEST_KEY
+        weight: 1
+        health:
+          error_budget: "10/m"
+          cooldown: 30s
+      - name: central
+        base_url: https://central.openai.azure.com/openai
+        api_key_env: AZURE_CENTRAL_KEY
+        weight: 1
+    models:
+      - public_id: gpt-4o
+        deployment: gpt-4o
+        endpoints:
+          - /chat/completions
+          - /responses
+```
+
+#### Copilot Multi-Account Example
+
+```yaml
+providers:
+  - id: copilot
+    type: copilot
+    default: true
+    selector: round_robin
+    endpoints:
+      - name: account-1
+        base_url: https://api.githubcopilot.com
+        api_key_env: COPILOT_TOKEN_1
+      - name: account-2
+        base_url: https://api.githubcopilot.com
+        api_key_env: COPILOT_TOKEN_2
+```
+
+### Selector Strategies
+
+Configure `selector` at the provider level. Default is `round_robin`.
+
+| Strategy | Behavior |
+|----------|----------|
+| `round_robin` | Rotates through healthy endpoints sequentially. Simple and predictable. |
+| `weighted` | Smooth weighted round-robin (Nginx-style). Endpoints with higher `weight` receive proportionally more traffic. Zero weight is treated as 1. |
+| `least_latency` | Routes to the endpoint with the lowest latency EWMA. New (unprobed) endpoints are preferred to allow discovery. |
+
+### Per-Endpoint Health Tracking
+
+Each endpoint has an independent health tracker with an error-budget DSL:
+
+```yaml
+health:
+  error_budget: "10/m"   # 10 errors per minute allowed
+  cooldown: 30s          # quarantine duration when budget is exhausted
+```
+
+#### Error Budget DSL
+
+Format: `N/{s,m,h}` — count of allowed errors per time unit.
+
+| Example | Meaning |
+|---------|---------|
+| `"10/m"` | 10 errors per minute (default) |
+| `"5/s"` | 5 errors per second |
+| `"1500/h"` | 1500 errors per hour |
+
+Invalid formats fail at startup with a clear error message.
+
+#### Health State Machine
+
+1. **Healthy** — endpoint accepts requests normally.
+2. **Quarantined** — error budget exhausted; endpoint is skipped by the selector for `cooldown` duration.
+3. **Half-open** — after cooldown expires, one probe request is allowed. Success restores full health; failure re-quarantines.
+
+Old failures decay outside the rolling window (the budget window), so transient bursts do not permanently disable an endpoint.
+
+### Retry Integration
+
+When multi-endpoint is active, retries prefer a *different* healthy endpoint on each attempt. This maximizes the chance of success when one endpoint is rate-limited or experiencing issues. The retry logic (backoff, `Retry-After` header parsing) remains unchanged.
+
+### Endpoint Field Reference
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `name` | yes | — | Unique identifier within the provider (used in logs) |
+| `base_url` | yes | — | Upstream base URL for this endpoint |
+| `api_key` | no | — | API key literal for this endpoint |
+| `api_key_env` | no | — | Environment variable holding the API key |
+| `weight` | no | 1 | Relative weight for `weighted` selector |
+| `health.error_budget` | no | `"10/m"` | Error budget DSL string |
+| `health.cooldown` | no | `30s` | Quarantine duration after budget exhaustion |

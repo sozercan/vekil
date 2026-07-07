@@ -12,7 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/sozercan/vekil/proxy/selector"
 	"gopkg.in/yaml.v3"
 )
 
@@ -93,6 +95,26 @@ type ProviderConfig struct {
 	ModelDiscovery      string                      `json:"model_discovery,omitempty" yaml:"model_discovery,omitempty"`
 	Headers             CopilotHeaderProfilesConfig `json:"headers,omitempty" yaml:"headers,omitempty"`
 	Models              []ProviderModelConfig       `json:"models,omitempty" yaml:"models,omitempty"`
+	// Multi-endpoint load balancing.
+	Selector  string                   `json:"selector,omitempty" yaml:"selector,omitempty"`
+	Endpoints []ProviderEndpointConfig `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
+}
+
+// ProviderEndpointConfig configures one upstream endpoint within a
+// multi-endpoint provider.
+type ProviderEndpointConfig struct {
+	Name    string                     `json:"name" yaml:"name"`
+	BaseURL string                     `json:"base_url" yaml:"base_url"`
+	APIKey  string                     `json:"api_key,omitempty" yaml:"api_key,omitempty"`
+	KeyEnv  string                     `json:"api_key_env,omitempty" yaml:"api_key_env,omitempty"`
+	Weight  uint                       `json:"weight,omitempty" yaml:"weight,omitempty"`
+	Health  ProviderEndpointHealthConf `json:"health,omitempty" yaml:"health,omitempty"`
+}
+
+// ProviderEndpointHealthConf configures health tracking for one endpoint.
+type ProviderEndpointHealthConf struct {
+	ErrorBudget string `json:"error_budget,omitempty" yaml:"error_budget,omitempty"`
+	Cooldown    string `json:"cooldown,omitempty" yaml:"cooldown,omitempty"`
 }
 
 // ProviderModelConfig maps a public model ID exposed by this proxy to the
@@ -134,6 +156,67 @@ type providerRuntime struct {
 	staticOrder    []string
 	codexAuth      *openAICodexAuth
 	headerProfiles CopilotHeaderProfilesConfig
+	// Multi-endpoint load balancing state.
+	endpoints        []*providerEndpoint
+	endpointSelector selector.Selector
+}
+
+// providerEndpoint is the runtime representation of one endpoint within a
+// multi-endpoint provider. It holds the resolved credentials and health tracker.
+type providerEndpoint struct {
+	name    string
+	baseURL string
+	apiKey  string
+	weight  uint
+	health  *EndpointHealthTracker
+	sel     *selector.Endpoint // selector-visible state
+}
+
+// pickEndpoint selects the next endpoint for a request using the provider's
+// selector strategy. Returns nil if the provider is not multi-endpoint.
+func (p *providerRuntime) pickEndpoint() *providerEndpoint {
+	if len(p.endpoints) == 0 {
+		return nil
+	}
+	if len(p.endpoints) == 1 {
+		return p.endpoints[0]
+	}
+
+	// Sync health state into selector endpoints.
+	sels := make([]*selector.Endpoint, len(p.endpoints))
+	for i, ep := range p.endpoints {
+		ep.sel.Healthy = ep.health.IsHealthy()
+		sels[i] = ep.sel
+	}
+
+	picked, err := p.endpointSelector.Pick(sels)
+	if err != nil {
+		return p.endpoints[0]
+	}
+	for _, ep := range p.endpoints {
+		if ep.sel == picked {
+			return ep
+		}
+	}
+	return p.endpoints[0]
+}
+
+// pickEndpointExcluding selects an endpoint different from the excluded one.
+// Used during retry to prefer a different healthy endpoint.
+func (p *providerRuntime) pickEndpointExcluding(exclude *providerEndpoint) *providerEndpoint {
+	if len(p.endpoints) <= 1 {
+		return p.pickEndpoint()
+	}
+
+	// Try up to len(endpoints) picks to get a different one.
+	for range len(p.endpoints) {
+		ep := p.pickEndpoint()
+		if ep != exclude {
+			return ep
+		}
+	}
+	// Fallback: return whatever we get.
+	return p.pickEndpoint()
 }
 
 type providerEndpointPaths struct {
@@ -608,8 +691,12 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		runtime.headerProfiles = cfg.Headers
 	case providerTypeAzureOpenAI:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
-		if baseURL == "" {
+		if baseURL == "" && len(cfg.Endpoints) == 0 {
 			return nil, fmt.Errorf("provider %q must set base_url", id)
+		}
+		if baseURL == "" && len(cfg.Endpoints) > 0 {
+			// Multi-endpoint: use the first endpoint's base_url for validation.
+			baseURL = strings.TrimRight(strings.TrimSpace(cfg.Endpoints[0].BaseURL), "/")
 		}
 		baseKind := classifyAzureBaseURL(baseURL)
 		switch baseKind {
@@ -639,7 +726,7 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 			if runtime.apiKey == "" && strings.TrimSpace(cfg.APIKeyEnv) != "" {
 				runtime.apiKey = strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.APIKeyEnv)))
 			}
-			if runtime.apiKey == "" {
+			if runtime.apiKey == "" && len(cfg.Endpoints) == 0 {
 				return nil, fmt.Errorf("provider %q must set api_key or api_key_env", id)
 			}
 		case providerAuthModeAzureIdentity:
@@ -725,7 +812,86 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		}
 	}
 
+	// Initialize multi-endpoint load balancing if configured.
+	if len(cfg.Endpoints) > 0 {
+		endpoints, err := buildProviderEndpoints(id, cfg.Endpoints)
+		if err != nil {
+			return nil, err
+		}
+		runtime.endpoints = endpoints
+		runtime.endpointSelector = selector.New(strings.TrimSpace(cfg.Selector))
+		// Use the first endpoint's baseURL/apiKey as the provider-level default
+		// so single-code-path dispatch still works for provider-level operations.
+		if runtime.baseURL == "" && len(endpoints) > 0 {
+			runtime.baseURL = endpoints[0].baseURL
+		}
+		if runtime.apiKey == "" && len(endpoints) > 0 {
+			runtime.apiKey = endpoints[0].apiKey
+		}
+	}
+
 	return runtime, nil
+}
+
+func buildProviderEndpoints(providerID string, configs []ProviderEndpointConfig) ([]*providerEndpoint, error) {
+	endpoints := make([]*providerEndpoint, 0, len(configs))
+	names := make(map[string]struct{}, len(configs))
+
+	for _, epCfg := range configs {
+		name := strings.TrimSpace(epCfg.Name)
+		if name == "" {
+			return nil, fmt.Errorf("provider %q: endpoint name is required", providerID)
+		}
+		if _, exists := names[name]; exists {
+			return nil, fmt.Errorf("provider %q: duplicate endpoint name %q", providerID, name)
+		}
+		names[name] = struct{}{}
+
+		baseURL := strings.TrimRight(strings.TrimSpace(epCfg.BaseURL), "/")
+		if baseURL == "" {
+			return nil, fmt.Errorf("provider %q endpoint %q: base_url is required", providerID, name)
+		}
+
+		apiKey := strings.TrimSpace(epCfg.APIKey)
+		if apiKey == "" && strings.TrimSpace(epCfg.KeyEnv) != "" {
+			apiKey = strings.TrimSpace(os.Getenv(strings.TrimSpace(epCfg.KeyEnv)))
+		}
+
+		budget := DefaultErrorBudget
+		if strings.TrimSpace(epCfg.Health.ErrorBudget) != "" {
+			parsed, err := ParseErrorBudget(epCfg.Health.ErrorBudget)
+			if err != nil {
+				return nil, fmt.Errorf("provider %q endpoint %q: %w", providerID, name, err)
+			}
+			budget = parsed
+		}
+
+		cooldown := DefaultCooldown
+		if strings.TrimSpace(epCfg.Health.Cooldown) != "" {
+			d, err := time.ParseDuration(strings.TrimSpace(epCfg.Health.Cooldown))
+			if err != nil {
+				return nil, fmt.Errorf("provider %q endpoint %q: invalid cooldown %q: %w", providerID, name, epCfg.Health.Cooldown, err)
+			}
+			cooldown = d
+		}
+
+		ep := &providerEndpoint{
+			name:    name,
+			baseURL: baseURL,
+			apiKey:  apiKey,
+			weight:  epCfg.Weight,
+			health:  NewEndpointHealthTracker(budget, cooldown),
+			sel: &selector.Endpoint{
+				Name:    name,
+				BaseURL: baseURL,
+				Key:     apiKey,
+				Weight:  epCfg.Weight,
+				Healthy: true,
+			},
+		}
+		endpoints = append(endpoints, ep)
+	}
+	return endpoints, nil
 }
 
 func addStaticProviderModels(runtime *providerRuntime, models []ProviderModelConfig, defaultEndpoints []string) error {
@@ -1455,6 +1621,26 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 		return nil, err
 	}
 	return req, nil
+}
+
+// newProviderJSONRequestWithEndpoint is like newProviderJSONRequest but uses
+// the endpoint's baseURL and apiKey instead of the provider-level ones.
+func (h *ProxyHandler) newProviderJSONRequestWithEndpoint(ctx context.Context, provider *providerRuntime, ep *providerEndpoint, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
+	// Temporarily swap in the endpoint-specific overrides.
+	origBaseURL := provider.baseURL
+	origAPIKey := provider.apiKey
+	if ep.baseURL != "" {
+		provider.baseURL = ep.baseURL
+	}
+	if ep.apiKey != "" {
+		provider.apiKey = ep.apiKey
+	}
+	defer func() {
+		provider.baseURL = origBaseURL
+		provider.apiKey = origAPIKey
+	}()
+
+	return h.newProviderJSONRequest(ctx, provider, method, path, body, extraHeaders, extraQuery, owners...)
 }
 
 func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *providerRuntime, rawQuery, ifNoneMatch string) (providerModelsFetchResult, error) {

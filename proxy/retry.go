@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand/v2"
 	"net"
@@ -174,6 +175,133 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		}
 	}
 	return nil, lastErr
+}
+
+// doWithRetryMultiEndpoint is like doWithRetry but picks a different endpoint
+// on each retry attempt. The reqFactoryForEndpoint produces a reqFactory closure
+// for the given endpoint. On success, the endpoint's health tracker is updated.
+func (h *ProxyHandler) doWithRetryMultiEndpoint(provider *providerRuntime, reqFactoryForEndpoint func(ep *providerEndpoint) func() (*http.Request, error)) (*http.Response, error) {
+	maxRetries := h.maxRetries
+	if maxRetries == 0 {
+		maxRetries = 3
+	}
+	retryDelay := h.retryBaseDelay
+	if retryDelay == 0 {
+		retryDelay = 1 * time.Second
+	}
+
+	var lastErr error
+	var lastEndpoint *providerEndpoint
+
+	for attempt := range maxRetries {
+		var ep *providerEndpoint
+		if attempt == 0 || lastEndpoint == nil {
+			ep = provider.pickEndpoint()
+		} else {
+			ep = provider.pickEndpointExcluding(lastEndpoint)
+		}
+		if ep == nil {
+			return nil, &providerRequestError{statusCode: http.StatusServiceUnavailable, err: fmt.Errorf("no endpoints available for provider %q", provider.id)}
+		}
+		lastEndpoint = ep
+
+		reqFactory := reqFactoryForEndpoint(ep)
+		req, err := reqFactory()
+		if err != nil {
+			return nil, err
+		}
+
+		startTime := time.Now()
+		resp, err := h.client.Do(req)
+		latency := time.Since(startTime)
+
+		if err != nil {
+			lastErr = err
+			ep.health.RecordFailure()
+			if h.log != nil {
+				h.log.Debug("endpoint request failed", logger.F("endpoint", ep.name), logger.Err(err))
+			}
+			if permanentTransportError(err) {
+				return nil, err
+			}
+			if attempt < maxRetries-1 {
+				delay := backoff(retryDelay, attempt)
+				h.logRetryAttemptWithEndpoint(req.Context(), attempt, 0, "", delay, err, ep.name)
+				if ctxErr := sleepWithContext(req.Context(), delay); ctxErr != nil {
+					return nil, ctxErr
+				}
+			}
+			continue
+		}
+
+		if !retryable(resp.StatusCode) {
+			ep.health.RecordSuccess()
+			// Update EWMA latency on the selector endpoint.
+			updateEndpointLatencyEWMA(ep, latency)
+			return resp, nil
+		}
+
+		// Retryable status: record failure.
+		ep.health.RecordFailure()
+
+		retryAfterHeader := resp.Header.Get("Retry-After")
+		upstreamErr := &upstreamError{
+			statusCode: resp.StatusCode,
+			retryAfter: retryAfterHeader,
+			headers:    resp.Header.Clone(),
+		}
+		lastErr = upstreamErr
+
+		if attempt < maxRetries-1 {
+			drainAndClose(resp.Body)
+			delay := backoff(retryDelay, attempt)
+			if ra, ok := parseRetryAfter(retryAfterHeader); ok && ra > delay {
+				delay = ra
+			}
+			h.logRetryAttemptWithEndpoint(req.Context(), attempt, resp.StatusCode, retryAfterHeader, delay, nil, ep.name)
+			if ctxErr := sleepWithContext(req.Context(), delay); ctxErr != nil {
+				return nil, ctxErr
+			}
+		} else {
+			upstreamErr.body = readRetryableUpstreamErrorBody(resp.Body)
+		}
+	}
+	return nil, lastErr
+}
+
+// updateEndpointLatencyEWMA updates the EWMA latency on the selector endpoint.
+// Uses a smoothing factor of 0.3 (recent observations have ~30% weight).
+func updateEndpointLatencyEWMA(ep *providerEndpoint, latency time.Duration) {
+	const alpha = 0.3
+	if ep.sel.LatencyEWMA == 0 {
+		ep.sel.LatencyEWMA = latency
+	} else {
+		ep.sel.LatencyEWMA = time.Duration(alpha*float64(latency) + (1-alpha)*float64(ep.sel.LatencyEWMA))
+	}
+}
+
+func (h *ProxyHandler) logRetryAttemptWithEndpoint(ctx context.Context, attempt int, status int, retryAfter string, delay time.Duration, err error, endpoint string) {
+	if h != nil && h.stats != nil && isRetryStatsTracked(ctx) {
+		h.stats.incRetry(status)
+	}
+	if h == nil || h.log == nil {
+		return
+	}
+	fields := []logger.Field{
+		logger.F("attempt", attempt),
+		logger.F("delay", delay.String()),
+		logger.F("endpoint", endpoint),
+	}
+	if status != 0 {
+		fields = append(fields, logger.F("status", status))
+	}
+	if retryAfter != "" {
+		fields = append(fields, logger.F("retry_after", retryAfter))
+	}
+	if err != nil {
+		fields = append(fields, logger.Err(err))
+	}
+	h.log.Debug("retrying upstream request", fields...)
 }
 
 func (h *ProxyHandler) logRetryAttempt(ctx context.Context, attempt int, status int, retryAfter string, delay time.Duration, err error) {

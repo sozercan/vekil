@@ -222,6 +222,19 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 		return nil, err
 	}
 
+	// Multi-endpoint: pick an endpoint and use its baseURL/apiKey overrides.
+	if len(provider.endpoints) > 0 {
+		return h.doWithRetryMultiEndpoint(provider, func(ep *providerEndpoint) func() (*http.Request, error) {
+			return func() (*http.Request, error) {
+				req, err := h.newProviderJSONRequestWithEndpoint(ctx, provider, ep, http.MethodPost, path, rewrittenBody, extraHeaders, "", owner)
+				if err != nil {
+					return nil, err
+				}
+				return req, nil
+			}
+		})
+	}
+
 	return h.doWithRetry(func() (*http.Request, error) {
 		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "", owner)
 		if err != nil {
