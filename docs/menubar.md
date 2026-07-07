@@ -1,6 +1,6 @@
-# macOS/Linux Tray App
+# macOS/Linux/Windows Tray App
 
-The tray app runs Vekil without a terminal. It supports macOS and Linux; published macOS app bundles also include Sparkle update checks.
+The tray app runs Vekil without a terminal. It supports macOS, Linux, and Windows; published macOS app bundles also include Sparkle update checks.
 
 ## macOS Install
 
@@ -80,3 +80,44 @@ Dialogs, notifications, and sign-in use DBus directly when possible. Optional he
 | Clipboard | `wl-clipboard`, `xclip`, or `xsel` |
 | Open URLs | `xdg-open` |
 | Notifications | DBus notification daemon; `notify-send` fallback |
+
+## Windows Tray
+
+The same tray app runs on Windows using the system notification area. It requires Windows 10 or later.
+
+### Build From Source
+
+```bash
+make build-tray-windows
+```
+
+Or directly with Go:
+
+```bash
+CGO_ENABLED=0 GOOS=windows go build -ldflags="-s -w -H windowsgui" -o vekil-tray.exe ./cmd/menubar/
+```
+
+The `-H windowsgui` linker flag suppresses the console window on launch so the app runs as a pure tray icon.
+
+### Running
+
+Double-click `vekil-tray.exe` or run it from a terminal. The tray icon appears in the notification area with the same menu as macOS and Linux:
+
+- Start/stop the proxy
+- Status icon and tooltip showing running state and port
+- GitHub auth sign-in/sign-out
+- Choose providers config file
+- Launch at Login (adds a registry entry under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`)
+
+### Dependencies
+
+All dialog, clipboard, and notification functions use PowerShell (`powershell.exe`) and `clip.exe`, both present on all standard Windows 10+ installations. No additional software is required.
+
+| Feature | Mechanism |
+|---------|-----------|
+| Dialogs | PowerShell `System.Windows.Forms.MessageBox` |
+| File picker | PowerShell `System.Windows.Forms.OpenFileDialog` |
+| Clipboard | `clip.exe` |
+| Open URLs | `cmd /c start` |
+| Notifications | PowerShell `NotifyIcon.ShowBalloonTip` |
+| Launch at Login | Windows Registry (`HKCU\...\Run`) |
