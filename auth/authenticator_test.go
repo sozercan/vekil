@@ -1757,3 +1757,48 @@ func TestStatusReportsKeyringBackedTokensAfterRestart(t *testing.T) {
 		t.Fatalf("Status() = %+v, want keyring-backed Vekil credentials", status)
 	}
 }
+
+func TestKeyringCredentialStorePrefersFallbackFileOverStaleKeyring(t *testing.T) {
+	keyring.MockInit()
+	t.Setenv(credentialStoreEnv, "")
+	dir := t.TempDir()
+	store := newDefaultCredentialStore(dir).(keyringCredentialStore)
+	if err := keyring.Set(credentialStoreService, store.key(accessTokenSecretName), "old-keyring-token"); err != nil {
+		t.Fatalf("seed keyring: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("new-file-token"), 0o600); err != nil {
+		t.Fatalf("write fallback token: %v", err)
+	}
+	data, err := store.Get(accessTokenSecretName)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if strings.TrimSpace(string(data)) != "new-file-token" {
+		t.Fatalf("Get() = %q, want newer fallback token", data)
+	}
+	secret, err := keyring.Get(credentialStoreService, store.key(accessTokenSecretName))
+	if err != nil {
+		t.Fatalf("keyring Get() after migration: %v", err)
+	}
+	if secret != "new-file-token" {
+		t.Fatalf("keyring secret = %q, want migrated fallback token", secret)
+	}
+}
+
+func TestKeyringCredentialStoreDeleteRemovesFallbackDespiteKeyringError(t *testing.T) {
+	keyring.MockInitWithError(errors.New("keyring unavailable"))
+	t.Setenv(credentialStoreEnv, "")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "access-token")
+	if err := os.WriteFile(path, []byte("file-token"), 0o600); err != nil {
+		t.Fatalf("write fallback token: %v", err)
+	}
+	store := newDefaultCredentialStore(dir)
+	err := store.Delete(accessTokenSecretName)
+	if err == nil {
+		t.Fatal("Delete() error = nil, want keyring error surfaced")
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("fallback file still exists after failed keyring delete: %v", statErr)
+	}
+}

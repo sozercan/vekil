@@ -242,9 +242,9 @@ func (a *Authenticator) hasAccessTokenStored() bool {
 	return a.store().Exists(accessTokenSecretName)
 }
 
-// hasValidCopilotTokenStored is a side-effect-free check for a valid Copilot
-// token cache. It may read the OS keyring, but it must not migrate or delete
-// legacy files.
+// getStoredCredentialForStatus returns stored credential bytes for status-only
+// checks. It may read the OS keyring, but it must not migrate or delete legacy
+// files.
 func (a *Authenticator) getStoredCredentialForStatus(name string) ([]byte, error) {
 	switch store := a.store().(type) {
 	case keyringCredentialStore:
@@ -257,6 +257,8 @@ func (a *Authenticator) getStoredCredentialForStatus(name string) ([]byte, error
 	}
 }
 
+// hasValidCopilotTokenStored is a side-effect-free check for a valid Copilot
+// token cache.
 func (a *Authenticator) hasValidCopilotTokenStored() bool {
 	data, err := a.getStoredCredentialForStatus(copilotTokenSecretName)
 	if err != nil {

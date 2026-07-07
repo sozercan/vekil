@@ -77,17 +77,17 @@ func (s keyringCredentialStore) key(name string) string {
 }
 
 func (s keyringCredentialStore) Get(name string) ([]byte, error) {
+	fallback, fallbackErr := s.fallback.Get(name)
+	if fallbackErr == nil && strings.TrimSpace(string(fallback)) != "" {
+		if setErr := keyring.Set(credentialStoreService, s.key(name), string(fallback)); setErr == nil {
+			_ = s.fallback.Delete(name)
+		}
+		return fallback, nil
+	}
+
 	secret, err := keyring.Get(credentialStoreService, s.key(name))
 	if err == nil {
 		return []byte(secret), nil
-	}
-
-	legacy, legacyErr := s.fallback.Get(name)
-	if legacyErr == nil && strings.TrimSpace(string(legacy)) != "" {
-		if setErr := keyring.Set(credentialStoreService, s.key(name), string(legacy)); setErr == nil {
-			_ = s.fallback.Delete(name)
-		}
-		return legacy, nil
 	}
 
 	if errors.Is(err, keyring.ErrNotFound) {
@@ -108,10 +108,15 @@ func (s keyringCredentialStore) Set(name string, data []byte) error {
 }
 
 func (s keyringCredentialStore) Delete(name string) error {
-	if err := keyring.Delete(credentialStoreService, s.key(name)); err != nil && !errors.Is(err, keyring.ErrNotFound) {
-		return err
+	keyringErr := keyring.Delete(credentialStoreService, s.key(name))
+	fallbackErr := s.fallback.Delete(name)
+	if keyringErr != nil && !errors.Is(keyringErr, keyring.ErrNotFound) {
+		if fallbackErr != nil {
+			return errors.Join(keyringErr, fallbackErr)
+		}
+		return keyringErr
 	}
-	return s.fallback.Delete(name)
+	return fallbackErr
 }
 
 func (s keyringCredentialStore) Exists(name string) bool {
