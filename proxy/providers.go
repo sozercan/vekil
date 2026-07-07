@@ -2604,18 +2604,6 @@ func azureEndpointConfigsAllOpenAIV1WithDefault(defaultBaseURL string, endpoints
 	return true
 }
 
-func providerHasEndpointCredentials(provider *providerRuntime) bool {
-	if provider == nil {
-		return false
-	}
-	for _, endpoint := range provider.endpoints {
-		if endpoint != nil && strings.TrimSpace(endpoint.apiKey) != "" {
-			return true
-		}
-	}
-	return false
-}
-
 type nonInteractiveAuthContextKey struct{}
 
 func contextWithNonInteractiveAuth(ctx context.Context) context.Context {
