@@ -125,8 +125,17 @@ func mapAnthropicUpstreamStatus(statusCode int) string {
 	}
 }
 
+func anthropicThinkingForcesDefaultRouting(thinkingType string) bool {
+	switch strings.ToLower(strings.TrimSpace(thinkingType)) {
+	case "enabled", "adaptive":
+		return true
+	default:
+		return false
+	}
+}
+
 func anthropicRoutingHeaders(r *http.Request, req *models.AnthropicRequest) http.Header {
-	if req != nil && req.Thinking != nil && strings.EqualFold(strings.TrimSpace(req.Thinking.Type), "enabled") {
+	if req != nil && req.Thinking != nil && anthropicThinkingForcesDefaultRouting(req.Thinking.Type) {
 		headers := r.Header.Clone()
 		if headers == nil {
 			headers = make(http.Header)

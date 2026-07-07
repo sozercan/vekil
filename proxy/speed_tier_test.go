@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -995,5 +996,88 @@ func TestDeferredSingleDynamicSpeedTierKeepsValidationPending(t *testing.T) {
 	}
 	if !handler.dynamicProviderValidationPending.Load() {
 		t.Fatal("dynamicProviderValidationPending = false, want true for deferred single dynamic speed-tier provider")
+	}
+}
+
+func TestAnthropicAdaptiveThinkingForcesNoDowngradeHeader(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	anthropicReq := &models.AnthropicRequest{Thinking: &models.AnthropicThinking{Type: "adaptive"}}
+	headers := anthropicRoutingHeaders(req, anthropicReq)
+	if got := headers.Get("X-Vekil-Routing"); got != "default" {
+		t.Fatalf("X-Vekil-Routing = %q, want default", got)
+	}
+}
+
+func TestResponsesRequestBodySanitizesFastAliasUsingBaseProvider(t *testing.T) {
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:      "azure",
+			Type:    "azure-openai",
+			Default: true,
+			BaseURL: "https://example.openai.azure.com/openai/v1",
+			APIKey:  "test-key",
+			Models:  []ProviderModelConfig{{PublicID: "gpt-public", Deployment: "gpt-upstream", Endpoints: []string{providerEndpointResponses}}},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	body := []byte(`{"model":"fast/gpt-public","input":"hello","tools":[{"type":"image_generation"}],"tool_choice":"required"}`)
+	rewritten := handler.rewriteResponsesRequestBody(body, "responses", true)
+	if strings.Contains(string(rewritten), "image_generation") {
+		t.Fatalf("rewriteResponsesRequestBody kept unsupported image_generation for fast alias: %s", rewritten)
+	}
+}
+
+func TestResponsesFallbackCanReturnToSourceAfterSpeedTierRejection(t *testing.T) {
+	var retryModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		model := speedTierRawJSONString(payload["model"])
+		if model == "haiku-upstream" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"model does not support /responses","code":"unsupported_api_for_model","param":"model"}}`))
+			return
+		}
+		retryModel = model
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-ok","object":"response","status":"completed","model":"sonnet-upstream","output":[]}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{SpeedTierEnabled: true, Providers: []ProviderConfig{{
+			ID:            "test-provider",
+			Type:          "openai-compatible",
+			Default:       true,
+			BaseURL:       upstream.URL,
+			AuthType:      "none",
+			ResponsesPath: providerEndpointResponses,
+			Models: []ProviderModelConfig{
+				{PublicID: "sonnet-public", Deployment: "sonnet-upstream", Endpoints: []string{providerEndpointResponses}, SpeedTier: &SpeedTierConfig{DowngradeTo: "haiku-public", When: SpeedTierWhenConfig{MaxTokensLTE: speedTierIntPtr(512)}}},
+				{PublicID: "haiku-public", Deployment: "haiku-upstream", Endpoints: []string{providerEndpointResponses}},
+			},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	resp, fallbackModel, err := handler.postResponsesWithFallbackHeadersTracked(context.Background(), []byte(`{"model":"sonnet-public","max_tokens":256,"input":"hi"}`), nil)
+	if err != nil {
+		t.Fatalf("postResponsesWithFallbackHeadersTracked() error = %v", err)
+	}
+	_ = resp.Body.Close()
+	if fallbackModel != "sonnet-public" {
+		t.Fatalf("fallbackModel = %q, want source sonnet-public", fallbackModel)
+	}
+	if retryModel != "sonnet-upstream" {
+		t.Fatalf("retry upstream model = %q, want sonnet-upstream", retryModel)
 	}
 }

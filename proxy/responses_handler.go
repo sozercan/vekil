@@ -1924,7 +1924,7 @@ func fallbackMergedCompactionSummaries(summaries []string) string {
 
 func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint string, injectResumePrompt bool) []byte {
 	requestedModel := extractResponsesRequestModel(bodyBytes)
-	provider, _, _ := h.resolveProviderModel(requestedModel, "/responses")
+	provider, _, _, _ := h.resolveProviderModelWithFastAlias(requestedModel, "/responses")
 
 	if rewrittenBody, strippedFields := stripUnsupportedResponsesRequestFields(bodyBytes, provider); len(strippedFields) > 0 {
 		bodyBytes = rewrittenBody
@@ -2418,11 +2418,15 @@ func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Conte
 		h.log.Debug("responses fallback lookup failed", logger.Err(fallbackErr))
 		return resp, "", nil
 	}
-	if fallbackModel == "" || fallbackModel == requestedModel {
+	if fallbackModel == "" || fallbackModel == selectedModel {
 		return resp, "", nil
 	}
 
 	fallbackBody, changed, fallbackErr := rewriteResponsesRequestModel(bodyBytes, fallbackModel)
+	if fallbackModel == requestedModel && selectedModel != requestedModel {
+		fallbackBody = bodyBytes
+		changed = true
+	}
 	if fallbackErr != nil {
 		h.log.Debug("responses fallback rewrite failed", logger.Err(fallbackErr))
 		return resp, "", nil
