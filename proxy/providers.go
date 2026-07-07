@@ -658,14 +658,12 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		runtime.headerProfiles = cfg.Headers
 	case providerTypeAzureOpenAI:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
-		baseKind := azureBaseURLKindInvalid
 		if baseURL == "" {
 			if len(cfg.Endpoints) == 0 {
 				return nil, fmt.Errorf("provider %q must set base_url", id)
 			}
 		} else {
-			baseKind = classifyAzureBaseURL(baseURL)
-			switch baseKind {
+			switch baseKind := classifyAzureBaseURL(baseURL); baseKind {
 			case azureBaseURLKindOpenAIV1, azureBaseURLKindLegacyOpenAI, azureBaseURLKindResourceRoot:
 			case azureBaseURLKindModels:
 				return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: Microsoft Foundry /models inference endpoints are not supported; use the OpenAI-compatible endpoint ending in /openai/v1 instead", id, baseURL)
@@ -675,14 +673,11 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		}
 		runtime.baseURL = baseURL
 		runtime.apiVersion = strings.TrimSpace(cfg.APIVersion)
-		if runtime.apiVersion == "" {
-			if baseURL != "" {
-				if baseKind != azureBaseURLKindOpenAIV1 {
-					return nil, fmt.Errorf("provider %q api_version is required for Azure base_url %q unless the path ends in /openai/v1", id, baseURL)
-				}
-			} else if !azureEndpointConfigsAllOpenAIV1(cfg.Endpoints) {
-				return nil, fmt.Errorf("provider %q api_version is required unless every endpoint base_url ends in /openai/v1", id)
+		if runtime.apiVersion == "" && !azureEndpointConfigsAllOpenAIV1WithDefault(baseURL, cfg.Endpoints) {
+			if baseURL != "" && len(cfg.Endpoints) == 0 {
+				return nil, fmt.Errorf("provider %q api_version is required for Azure base_url %q unless the path ends in /openai/v1", id, baseURL)
 			}
+			return nil, fmt.Errorf("provider %q api_version is required unless every effective endpoint base_url ends in /openai/v1", id)
 		}
 
 		authMode := providerAuthMode(strings.TrimSpace(cfg.AuthMode))
@@ -1450,7 +1445,11 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 		token := providerAPIKey(provider, selectedEndpoint)
 		if token == "" {
 			var err error
-			token, err = h.auth.GetToken(req.Context())
+			if nonInteractiveAuthFromContext(req.Context()) {
+				token, err = h.auth.GetTokenNonInteractive(req.Context())
+			} else {
+				token, err = h.auth.GetToken(req.Context())
+			}
 			if err != nil {
 				return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
 			}
@@ -2434,7 +2433,7 @@ func buildProviderEndpointRuntimes(providerID string, kind providerType, cfg Pro
 			return nil, nil, nil, "", fmt.Errorf("provider %q endpoint %q: %w", providerID, name, err)
 		}
 		runtime := &providerEndpointRuntime{
-			endpoint: selector.Endpoint{Name: name, BaseURL: baseURL, Key: apiKey, Weight: raw.Weight, Healthy: true},
+			endpoint: selector.Endpoint{Name: name, BaseURL: baseURL, Weight: raw.Weight, Healthy: true},
 			apiKey:   apiKey,
 			health:   newEndpointHealthTracker(healthCfg),
 		}
@@ -2585,12 +2584,16 @@ func providerConfigHasEndpointCredentials(cfg ProviderConfig) bool {
 	return false
 }
 
-func azureEndpointConfigsAllOpenAIV1(endpoints []ProviderEndpointConfig) bool {
+func azureEndpointConfigsAllOpenAIV1WithDefault(defaultBaseURL string, endpoints []ProviderEndpointConfig) bool {
+	defaultBaseURL = strings.TrimRight(strings.TrimSpace(defaultBaseURL), "/")
 	if len(endpoints) == 0 {
-		return false
+		return defaultBaseURL != "" && classifyAzureBaseURL(defaultBaseURL) == azureBaseURLKindOpenAIV1
 	}
 	for _, endpoint := range endpoints {
 		baseURL := strings.TrimRight(strings.TrimSpace(endpoint.BaseURL), "/")
+		if baseURL == "" {
+			baseURL = defaultBaseURL
+		}
 		if baseURL == "" || classifyAzureBaseURL(baseURL) != azureBaseURLKindOpenAIV1 {
 			return false
 		}
@@ -2663,4 +2666,18 @@ func (ps *providerSetup) fallbackChain(public string) []providerModel {
 	out := make([]providerModel, len(chain))
 	copy(out, chain)
 	return out
+}
+
+type nonInteractiveAuthContextKey struct{}
+
+func contextWithNonInteractiveAuth(ctx context.Context) context.Context {
+	return context.WithValue(ctx, nonInteractiveAuthContextKey{}, true)
+}
+
+func nonInteractiveAuthFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(nonInteractiveAuthContextKey{}).(bool)
+	return v
 }

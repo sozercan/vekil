@@ -10,7 +10,6 @@ import (
 type Endpoint struct {
 	Name        string
 	BaseURL     string
-	Key         string
 	Weight      uint
 	Healthy     bool
 	LatencyEWMA time.Duration

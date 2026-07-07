@@ -14,6 +14,7 @@ import (
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/proxy/selector"
 )
 
 func TestProviderEndpointsWeightedSelectionAndEndpointKeys(t *testing.T) {
@@ -376,5 +377,93 @@ func TestLeastLatencyRotatesAfterRetryableFailure(t *testing.T) {
 	}
 	if eastHits.Load() != 1 || westHits.Load() != 1 {
 		t.Fatalf("hits east/west = %d/%d, want one retry failover to west", eastHits.Load(), westHits.Load())
+	}
+}
+
+func TestAzureEndpointOverrideRequiresAPIVersionWhenNotOpenAIV1(t *testing.T) {
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.test"}
+	_, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
+		ID:      "azure",
+		Type:    "azure-openai",
+		Default: true,
+		BaseURL: "https://default.openai.azure.com/openai/v1",
+		Endpoints: []ProviderEndpointConfig{{
+			Name:    "classic",
+			BaseURL: "https://classic.openai.azure.com",
+			APIKey:  "classic-key",
+		}},
+		Models: []ProviderModelConfig{{PublicID: "gpt-public", Deployment: "gpt-deployment", Endpoints: []string{providerEndpointChatCompletions}}},
+	}}})
+	if err == nil || !strings.Contains(err.Error(), "api_version is required") {
+		t.Fatalf("buildProviders() error = %v, want api_version validation error", err)
+	}
+}
+
+func TestReadyzRetriesEndpointProbeToHealthySibling(t *testing.T) {
+	var eastHits atomic.Int32
+	east := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		eastHits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer east.Close()
+	var westHits atomic.Int32
+	west := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		westHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer west.Close()
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:             "dynamic",
+			Type:           "openai-compatible",
+			Default:        true,
+			AuthType:       "none",
+			ModelDiscovery: "openai",
+			Selector:       "least_latency",
+			Endpoints: []ProviderEndpointConfig{
+				{Name: "east", BaseURL: east.URL},
+				{Name: "west", BaseURL: west.URL},
+			},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	handler.maxRetries = 2
+	handler.retryBaseDelay = time.Millisecond
+	w := httptest.NewRecorder()
+	handler.HandleReadyz(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("readyz status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if eastHits.Load() != 1 || westHits.Load() != 1 {
+		t.Fatalf("probe hits east/west = %d/%d, want failover 1/1", eastHits.Load(), westHits.Load())
+	}
+}
+
+func TestCopilotReadyzUsesNonInteractiveAuthForUnkeyedEndpoint(t *testing.T) {
+	handler := &ProxyHandler{auth: auth.NewTestAuthenticator("default-token"), copilotURL: "https://copilot.example.test"}
+	provider := &providerRuntime{
+		id:             "copilot",
+		kind:           providerTypeCopilot,
+		baseURL:        "https://copilot.example.test",
+		paths:          providerEndpointPolicyFor(providerTypeCopilot).defaultEndpointPaths(),
+		staticModels:   map[string]providerModel{},
+		endpointByName: map[string]*providerEndpointRuntime{},
+		selector:       selector.NewRoundRobin(),
+	}
+	provider.endpoints = []*providerEndpointRuntime{
+		{endpoint: selector.Endpoint{Name: "unkeyed", BaseURL: "https://copilot.example.test", Healthy: true}, health: newEndpointHealthTracker(defaultEndpointHealthConfig())},
+	}
+	provider.endpointByName["unkeyed"] = provider.endpoints[0]
+	req, err := handler.newProviderProbeRequest(context.Background(), provider)
+	if err != nil {
+		t.Fatalf("newProviderProbeRequest() error = %v", err)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer default-token" {
+		t.Fatalf("Authorization = %q, want non-interactive default token", got)
 	}
 }
