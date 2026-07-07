@@ -762,7 +762,7 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 	}
 
 	endpointCfg := cfg
-	if kind == providerTypeCopilot && strings.TrimSpace(endpointCfg.BaseURL) == "" {
+	if (kind == providerTypeCopilot || kind == providerTypeOpenAICodex) && strings.TrimSpace(endpointCfg.BaseURL) == "" {
 		endpointCfg.BaseURL = runtime.baseURL
 	}
 	endpoints, endpointByName, endpointSelector, selectorName, err := buildProviderEndpointRuntimes(id, kind, endpointCfg)
@@ -2394,6 +2394,9 @@ func buildProviderEndpointRuntimes(providerID string, kind providerType, cfg Pro
 		}
 		if err := validateEndpointBaseURL(providerID, name, kind, baseURL); err != nil {
 			return nil, nil, nil, "", err
+		}
+		if kind == providerTypeAzureOpenAI && providerAuthMode(strings.TrimSpace(cfg.AuthMode)) == providerAuthModeAzureIdentity && (strings.TrimSpace(raw.APIKey) != "" || strings.TrimSpace(raw.APIKeyEnv) != "") {
+			return nil, nil, nil, "", fmt.Errorf("provider %q endpoint %q auth_mode %q cannot be combined with api_key or api_key_env", providerID, name, providerAuthModeAzureIdentity)
 		}
 		apiKey := strings.TrimSpace(raw.APIKey)
 		if apiKey == "" && strings.TrimSpace(raw.APIKeyEnv) != "" {

@@ -76,7 +76,22 @@ func (h *endpointHealthTracker) healthy(now time.Time) bool {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.quarantinedUntil.IsZero() || !now.Before(h.quarantinedUntil)
+	if !h.quarantinedUntil.IsZero() {
+		if now.Before(h.quarantinedUntil) {
+			return false
+		}
+		h.quarantinedUntil = time.Time{}
+	}
+	if !h.deprioritizedUntil.IsZero() {
+		if now.Before(h.deprioritizedUntil) {
+			return false
+		}
+		h.deprioritizedUntil = time.Time{}
+		if h.latencyEWMA >= time.Hour {
+			h.latencyEWMA = 0
+		}
+	}
+	return true
 }
 
 func (h *endpointHealthTracker) latency() time.Duration {
