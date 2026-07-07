@@ -2387,7 +2387,7 @@ func sanitizeResponsesUnverifiableEncryptedContentItem(raw json.RawMessage) (jso
 // compact fanout uses this to memoize the resolved fallback so siblings don't
 // each re-pay the unsupported-model probe.
 func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, routingHeaders ...http.Header) (*http.Response, string, error) {
-	resp, err := h.postResponsesWithHeaders(ctx, bodyBytes, extraHeaders, routingHeaders...)
+	resp, selectedOwner, err := h.postResponsesWithHeadersTracked(ctx, bodyBytes, extraHeaders, routingHeaders...)
 	if err != nil {
 		return nil, "", err
 	}
@@ -2408,8 +2408,12 @@ func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Conte
 	}
 
 	requestedModel := extractResponsesRequestModel(bodyBytes)
-	provider, _, _ := h.resolveProviderModel(requestedModel, "/responses")
-	fallbackModel, fallbackErr := h.pickResponsesCompatibleModel(ctx, provider, requestedModel)
+	selectedModel := strings.TrimSpace(selectedOwner.publicID)
+	if selectedModel == "" {
+		selectedModel = requestedModel
+	}
+	provider, _, _ := h.resolveProviderModel(selectedModel, "/responses")
+	fallbackModel, fallbackErr := h.pickResponsesCompatibleModel(ctx, provider, selectedModel)
 	if fallbackErr != nil {
 		h.log.Debug("responses fallback lookup failed", logger.Err(fallbackErr))
 		return resp, "", nil
@@ -2430,6 +2434,7 @@ func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Conte
 
 	h.log.Info("retrying responses request with fallback model",
 		logger.F("requested_model", requestedModel),
+		logger.F("selected_model", selectedModel),
 		logger.F("fallback_model", fallbackModel),
 	)
 

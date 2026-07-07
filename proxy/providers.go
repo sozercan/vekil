@@ -492,7 +492,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 // model-map updates are applied through providerSetup's locked replacement path.
 func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error {
 	setup := h.providerSetup()
-	if setup == nil || !setup.hasConfiguredState || len(setup.providers) <= 1 || !hasDynamicProvider(setup.providers) {
+	if setup == nil || !setup.hasConfiguredState || !hasDynamicProvider(setup.providers) || (len(setup.providers) <= 1 && !setup.speedTierEnabled) {
 		h.dynamicProviderValidationPending.Store(false)
 		return nil
 	}

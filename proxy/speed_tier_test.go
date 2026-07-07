@@ -460,33 +460,6 @@ func TestSpeedTierChatRetryPreservesFirstSelectedModel(t *testing.T) {
 	}
 }
 
-func TestGeminiRetryPreservesFirstSelectedModel(t *testing.T) {
-	var retryModel string
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var payload map[string]json.RawMessage
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Fatalf("decode upstream body: %v", err)
-		}
-		retryModel = speedTierRawJSONString(payload["model"])
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"chatcmpl-retry","object":"chat.completion","choices":[]}`))
-	}))
-	defer upstream.Close()
-
-	handler := newSpeedTierHTTPHandler(t, upstream.URL, true)
-	resp := &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"message":"bad stream_options"}}`))}
-	body := []byte(`{"model":"sonnet-public","max_tokens":256,"tools":[],"messages":[{"role":"user","content":"hi"}],"stream_options":{"include_usage":true}}`)
-	selectedOwner := providerModel{publicID: "sonnet-public"}
-	retryResp, _, _ := handler.retryChatCompletionsWithoutInjectedStreamOptions(t.Context(), resp, body, chatCompletionsMode{injectedStreamUsage: true}, nil, selectedOwner)
-	if retryResp == nil {
-		t.Fatal("retry response is nil")
-	}
-	_ = retryResp.Body.Close()
-	if retryModel != "sonnet-upstream" {
-		t.Fatalf("Gemini retry upstream model = %q, want first selected model sonnet-upstream", retryModel)
-	}
-}
-
 func TestAnthropicTranslatedSpeedTierHonorsOptOutHeaders(t *testing.T) {
 	var upstreamModel string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

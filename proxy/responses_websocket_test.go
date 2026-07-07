@@ -3480,7 +3480,7 @@ func TestNewResponsesWebSocketSessionStoresOnlyRoutingHeaders(t *testing.T) {
 	req.Header.Set("X-Vekil-Routing", "default")
 	req.Header.Set("X-Vekil-No-Downgrade", "1")
 
-	session := newResponsesWebSocketSession(nil, req)
+	session := newResponsesWebSocketSession(nil, nil, req)
 	if got := session.routingHeaders.Get("Authorization"); got != "" {
 		t.Fatalf("Authorization retained in routingHeaders: %q", got)
 	}
@@ -3495,5 +3495,39 @@ func TestNewResponsesWebSocketSessionStoresOnlyRoutingHeaders(t *testing.T) {
 	}
 	if got := session.routingHeaders.Get("X-Vekil-No-Downgrade"); got != "1" {
 		t.Fatalf("X-Vekil-No-Downgrade = %q, want 1", got)
+	}
+}
+
+func TestNewResponsesWebSocketSessionKeepsConfiguredDenyHeader(t *testing.T) {
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{
+			SpeedTierEnabled: true,
+			Providers: []ProviderConfig{{
+				ID:       "test",
+				Type:     "openai-compatible",
+				Default:  true,
+				BaseURL:  "https://upstream.example.com/v1",
+				AuthType: "none",
+				Models: []ProviderModelConfig{
+					{PublicID: "sonnet-public", Deployment: "sonnet-upstream", Endpoints: []string{providerEndpointResponses}, SpeedTier: &SpeedTierConfig{DowngradeTo: "haiku-public", When: SpeedTierWhenConfig{MaxTokensLTE: intPtr(512)}, NeverWhen: SpeedTierNeverWhenConfig{HasHeader: "X-Do-Not-Downgrade"}}},
+					{PublicID: "haiku-public", Deployment: "haiku-upstream", Endpoints: []string{providerEndpointResponses}},
+				},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("X-Do-Not-Downgrade", "1")
+	session := newResponsesWebSocketSession(handler, nil, req)
+	if got := session.routingHeaders.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization retained: %q", got)
+	}
+	if got := session.routingHeaders.Get("X-Do-Not-Downgrade"); got != "1" {
+		t.Fatalf("X-Do-Not-Downgrade = %q, want 1", got)
 	}
 }

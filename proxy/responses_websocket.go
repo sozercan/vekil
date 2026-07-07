@@ -247,7 +247,7 @@ func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.R
 	defer func() { _ = conn.Close() }()
 
 	conn.SetReadLimit(maxRequestBodySize)
-	session := newResponsesWebSocketSession(conn, r)
+	session := newResponsesWebSocketSession(h, conn, r)
 	session.startPingLoop()
 	if !h.registerResponsesWebSocketSession(session) {
 		session.sendGoingAwayWithDeadline(time.Now().Add(responsesWebSocketWriteWait))
@@ -447,7 +447,14 @@ func parseResponsesWebSocketFrameType(payload []byte) (string, error) {
 	return envelope.Type, nil
 }
 
-func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *responsesWebSocketSession {
+func websocketSpeedTierRoutingHeaderNames(h *ProxyHandler) []string {
+	if h == nil {
+		return nil
+	}
+	return h.speedTierRoutingHeaderNames()
+}
+
+func newResponsesWebSocketSession(h *ProxyHandler, conn *websocket.Conn, r *http.Request) *responsesWebSocketSession {
 	baseHeaders := make(http.Header)
 	for _, name := range []string{
 		"X-Codex-Beta-Features",
@@ -476,7 +483,7 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 		conn:           conn,
 		ctx:            r.Context(),
 		baseHeaders:    baseHeaders,
-		routingHeaders: speedTierRoutingHeadersOnly(r.Header),
+		routingHeaders: speedTierRoutingHeadersOnly(r.Header, websocketSpeedTierRoutingHeaderNames(h)...),
 		userAgent:      r.Header.Get("User-Agent"),
 		// Codex treats X-Codex-Turn-State as server-issued, turn-scoped
 		// sticky-routing state. This bridge only trusts state it received from
@@ -1002,7 +1009,7 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 	}
 
 	cfg := h.responsesWebSocketConfig()
-	requestModel, _ := speedTierBaseModel(strings.TrimSpace(request.Model))
+	requestModel := strings.TrimSpace(request.Model)
 	restorePinned := false
 	if !s.speedTierDowngraded && s.speedTierPinnedModel == "" && requestModel != "" {
 		s.speedTierPinnedModel = requestModel
