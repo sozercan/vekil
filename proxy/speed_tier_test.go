@@ -968,3 +968,32 @@ func TestGeminiThinkingConfigForcesNoDowngrade(t *testing.T) {
 		t.Fatalf("Gemini thinking upstream model = %q, want sonnet-upstream", upstreamModel)
 	}
 }
+
+func TestDeferredSingleDynamicSpeedTierKeepsValidationPending(t *testing.T) {
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithDeferredDynamicProviderModelValidation(true),
+		WithProvidersConfig(ProvidersConfig{
+			SpeedTierEnabled: true,
+			Providers: []ProviderConfig{{
+				ID:             "dynamic",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        "https://upstream.example.com/v1",
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+				Models: []ProviderModelConfig{
+					{PublicID: "sonnet-public", Endpoints: []string{providerEndpointChatCompletions}, SpeedTier: &SpeedTierConfig{DowngradeTo: "haiku-public", When: SpeedTierWhenConfig{MaxTokensLTE: speedTierIntPtr(512)}}},
+					{PublicID: "haiku-public", Endpoints: []string{providerEndpointChatCompletions}},
+				},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	if !handler.dynamicProviderValidationPending.Load() {
+		t.Fatal("dynamicProviderValidationPending = false, want true for deferred single dynamic speed-tier provider")
+	}
+}

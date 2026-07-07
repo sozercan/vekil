@@ -425,7 +425,7 @@ func (h *ProxyHandler) initializeProviders() error {
 		return err
 	}
 	h.providersState = setup
-	h.dynamicProviderValidationPending.Store(h.deferDynamicProviderModelRefresh && len(setup.providers) > 1 && hasDynamicProvider(setup.providers))
+	h.dynamicProviderValidationPending.Store(h.deferDynamicProviderModelRefresh && hasDynamicProvider(setup.providers) && (len(setup.providers) > 1 || h.providersConfig.SpeedTierEnabled))
 	return nil
 }
 
