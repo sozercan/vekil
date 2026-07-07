@@ -118,6 +118,6 @@ All dialog, clipboard, and notification functions use PowerShell (`powershell.ex
 | Dialogs | PowerShell `System.Windows.Forms.MessageBox` |
 | File picker | PowerShell `System.Windows.Forms.OpenFileDialog` |
 | Clipboard | `clip.exe` |
-| Open URLs | `cmd /c start` |
+| Open URLs | `rundll32 url.dll,FileProtocolHandler` |
 | Notifications | PowerShell `NotifyIcon.ShowBalloonTip` |
 | Launch at Login | Windows Registry (`HKCU\...\Run`) |

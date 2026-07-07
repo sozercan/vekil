@@ -1,7 +1,10 @@
 /vekil
 /menubar
+/menubar.exe
 /vekil-menubar
 /vekil-tray
+/vekil-tray.exe
+*.exe
 Vekil.app/
 .build/
 .DS_Store
