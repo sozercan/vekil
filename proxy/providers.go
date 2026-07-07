@@ -1519,7 +1519,7 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 	if err != nil {
 		return nil, err
 	}
-	ctx = contextWithProviderEndpoint(ctx, selectedEndpoint)
+	ctx = contextWithProviderEndpoint(ctx, selectedEndpoint, len(provider.endpoints))
 
 	if len(body) > 0 && provider != nil && provider.kind == providerTypeAzureOpenAI && len(provider.endpoints) > 0 && len(owners) > 0 {
 		owner := owners[0]
@@ -2554,12 +2554,17 @@ func providerAPIKey(provider *providerRuntime, endpoint *providerEndpointRuntime
 }
 
 type providerEndpointContextKey struct{}
+type providerEndpointCountContextKey struct{}
 
-func contextWithProviderEndpoint(ctx context.Context, endpoint *providerEndpointRuntime) context.Context {
+func contextWithProviderEndpoint(ctx context.Context, endpoint *providerEndpointRuntime, count int) context.Context {
 	if endpoint == nil {
 		return ctx
 	}
-	return context.WithValue(ctx, providerEndpointContextKey{}, endpoint)
+	ctx = context.WithValue(ctx, providerEndpointContextKey{}, endpoint)
+	if count > 0 {
+		ctx = context.WithValue(ctx, providerEndpointCountContextKey{}, count)
+	}
+	return ctx
 }
 
 func providerEndpointFromContext(ctx context.Context) *providerEndpointRuntime {
@@ -2568,6 +2573,14 @@ func providerEndpointFromContext(ctx context.Context) *providerEndpointRuntime {
 	}
 	endpoint, _ := ctx.Value(providerEndpointContextKey{}).(*providerEndpointRuntime)
 	return endpoint
+}
+
+func providerEndpointCountFromContext(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	count, _ := ctx.Value(providerEndpointCountContextKey{}).(int)
+	return count
 }
 
 func providerEndpointNameFromContext(ctx context.Context) string {

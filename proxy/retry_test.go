@@ -14,6 +14,7 @@ import (
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/proxy/selector"
 )
 
 func TestDoWithRetry_SuccessOnFirstTry(t *testing.T) {
@@ -450,5 +451,89 @@ func TestBackoffGuardsZeroBaseAndLargeAttempt(t *testing.T) {
 	}
 	if got := backoff(time.Second, 1000); got < maxRetryBackoff || got >= maxRetryBackoff+maxRetryBackoff/4 {
 		t.Fatalf("backoff(time.Second, 1000) = %v, want capped delay plus bounded jitter", got)
+	}
+}
+
+func TestDoWithRetry_DoesNotPenalizeCanceledRequest(t *testing.T) {
+	endpoint := &providerEndpointRuntime{endpoint: selector.Endpoint{Name: "east", Healthy: true}, health: newEndpointHealthTracker(endpointHealthConfig{errorBudget: endpointErrorBudget{Limit: 1, Window: time.Minute}, cooldown: time.Hour})}
+	h := &ProxyHandler{client: http.DefaultClient, log: logger.New(logger.LevelError), retryBaseDelay: time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := h.doWithRetry(func() (*http.Request, error) {
+		req, reqErr := http.NewRequestWithContext(contextWithProviderEndpoint(ctx, endpoint, 2), http.MethodGet, "http://127.0.0.1:1", nil)
+		return req, reqErr
+	})
+	if err == nil {
+		t.Fatal("doWithRetry() error = nil, want canceled request error")
+	}
+	if !endpoint.health.healthy(time.Now()) {
+		t.Fatal("canceled request should not penalize endpoint health")
+	}
+}
+
+func TestDoWithRetry_BypassesRetryAfterForMultiEndpointFailover(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "60")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	endpoint := &providerEndpointRuntime{endpoint: selector.Endpoint{Name: "east", Healthy: true}, health: newEndpointHealthTracker(defaultEndpointHealthConfig())}
+	h := &ProxyHandler{client: server.Client(), log: logger.New(logger.LevelError), retryBaseDelay: time.Millisecond}
+	start := time.Now()
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		return http.NewRequestWithContext(contextWithProviderEndpoint(context.Background(), endpoint, 2), http.MethodGet, server.URL, nil)
+	})
+	if err != nil {
+		t.Fatalf("doWithRetry() error = %v", err)
+	}
+	_ = resp.Body.Close()
+	if time.Since(start) > time.Second {
+		t.Fatalf("retry slept too long despite alternate endpoints: %v", time.Since(start))
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestDoWithRetry_PenalizesAuthFailures(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusUnauthorized) }))
+	defer server.Close()
+	endpoint := &providerEndpointRuntime{endpoint: selector.Endpoint{Name: "bad-key", Healthy: true}, health: newEndpointHealthTracker(endpointHealthConfig{errorBudget: endpointErrorBudget{Limit: 1, Window: time.Minute}, cooldown: time.Hour})}
+	h := &ProxyHandler{client: server.Client(), log: logger.New(logger.LevelError)}
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		return http.NewRequestWithContext(contextWithProviderEndpoint(context.Background(), endpoint, 2), http.MethodGet, server.URL, nil)
+	})
+	if err != nil {
+		t.Fatalf("doWithRetry() error = %v", err)
+	}
+	_ = resp.Body.Close()
+	if endpoint.health.healthy(time.Now()) {
+		t.Fatal("401 endpoint should be penalized")
+	}
+}
+
+func TestDoWithRetry_DoesNotRecordStreamingHeaderAsSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: hi\n\n"))
+	}))
+	defer server.Close()
+	endpoint := &providerEndpointRuntime{endpoint: selector.Endpoint{Name: "stream", Healthy: true}, health: newEndpointHealthTracker(defaultEndpointHealthConfig())}
+	h := &ProxyHandler{client: server.Client(), log: logger.New(logger.LevelError)}
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		return http.NewRequestWithContext(contextWithProviderEndpoint(context.Background(), endpoint, 2), http.MethodGet, server.URL, nil)
+	})
+	if err != nil {
+		t.Fatalf("doWithRetry() error = %v", err)
+	}
+	_ = resp.Body.Close()
+	if got := endpoint.health.latency(); got != 0 {
+		t.Fatalf("streaming header recorded latency = %v, want 0 until body completes", got)
 	}
 }

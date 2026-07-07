@@ -177,7 +177,7 @@ read_gemini_normalized_output() {
   # translation rather than a CLI presentation detail.
   if [[ "${actual}" == *'{"output"'* ]]; then
     local parsed
-    parsed="$(printf '%s' "${actual}" | jq -Rr '((fromjson? // {}) | .output? // empty) as $single | if $single != "" then $single else split("|") | map((fromjson? // {}) | .output? // empty) | select(length > 0) | join("|") end' 2>/dev/null || true)"
+    parsed="$(printf '%s' "${actual}" | jq -Rr '(try (fromjson | .output // "") catch "") as $single | if $single != "" then $single else split("|") | map(try (fromjson | .output // "") catch "") | map(select(length > 0)) | join("|") end' 2>/dev/null || true)"
     if [[ -n "${parsed}" ]]; then
       printf '%s' "${parsed}"
       return

@@ -135,6 +135,9 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		resp, err := h.client.Do(req)
 		if err != nil {
 			lastErr = err
+			if req.Context().Err() != nil {
+				return nil, err
+			}
 			if permanentTransportError(err) {
 				return nil, err
 			}
@@ -151,8 +154,10 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 
 		if !retryable(resp.StatusCode) {
 			if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
-				recordEndpointSuccess(attemptEndpoint, time.Since(attemptStart))
-			} else if resp.StatusCode >= http.StatusInternalServerError {
+				if !responseLooksStreaming(resp) {
+					recordEndpointSuccess(attemptEndpoint, time.Since(attemptStart))
+				}
+			} else if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode >= http.StatusInternalServerError {
 				recordEndpointFailure(attemptEndpoint, time.Now())
 			}
 			return resp, nil
@@ -171,8 +176,10 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 			// Drain and close body before retry to allow connection reuse.
 			drainAndClose(resp.Body)
 			delay := backoff(retryDelay, attempt)
-			if ra, ok := parseRetryAfter(retryAfterHeader); ok && ra > delay {
-				delay = ra
+			if providerEndpointCountFromContext(req.Context()) <= 1 {
+				if ra, ok := parseRetryAfter(retryAfterHeader); ok && ra > delay {
+					delay = ra
+				}
 			}
 			h.logRetryAttempt(req.Context(), attempt, resp.StatusCode, retryAfterHeader, delay, nil)
 			if ctxErr := sleepWithContext(req.Context(), delay); ctxErr != nil {
@@ -313,4 +320,12 @@ func recordEndpointSuccess(endpoint *providerEndpointRuntime, latency time.Durat
 		return
 	}
 	endpoint.health.recordSuccess(latency)
+}
+
+func responseLooksStreaming(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	return strings.Contains(contentType, "text/event-stream")
 }
