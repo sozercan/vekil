@@ -51,7 +51,9 @@ func TestExpandEnvVars_SameVarMultipleTimes(t *testing.T) {
 }
 
 func TestExpandEnvVars_Missing(t *testing.T) {
-	os.Unsetenv("VEKIL_TEST_MISSING_VAR")
+	if err := os.Unsetenv("VEKIL_TEST_MISSING_VAR"); err != nil {
+		t.Fatal(err)
+	}
 
 	input := []byte(`{"key": "${env:VEKIL_TEST_MISSING_VAR}"}`)
 	_, err := expandEnvVars(input)
@@ -67,8 +69,12 @@ func TestExpandEnvVars_Missing(t *testing.T) {
 }
 
 func TestExpandEnvVars_MultipleMissing(t *testing.T) {
-	os.Unsetenv("VEKIL_TEST_MISS_A")
-	os.Unsetenv("VEKIL_TEST_MISS_B")
+	if err := os.Unsetenv("VEKIL_TEST_MISS_A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv("VEKIL_TEST_MISS_B"); err != nil {
+		t.Fatal(err)
+	}
 
 	input := []byte(`a: ${env:VEKIL_TEST_MISS_A}, b: ${env:VEKIL_TEST_MISS_B}`)
 	_, err := expandEnvVars(input)
