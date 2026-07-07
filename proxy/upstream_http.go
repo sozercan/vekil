@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
 
@@ -167,17 +168,10 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 		}
 	}
 
-	rewrittenBody := body
-	if provider.kind != providerTypeAzureOpenAI || len(provider.endpoints) == 0 {
-		if !providerUsesAzureClassicDeploymentPath(provider, endpoint) {
-			var err error
-			rewrittenBody, _, err = rewriteRequestModelForProvider(body, owner.upstreamModel)
-			if err != nil {
-				return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
-			}
-		}
+	rewrittenBody, err := prepareProviderRequestBody(provider, owner, body, endpoint)
+	if err != nil {
+		return nil, providerModel{}, nil, err
 	}
-	rewrittenBody = applyProviderModelRequestPolicy(rewrittenBody, owner)
 	return provider, owner, rewrittenBody, nil
 }
 
@@ -219,18 +213,51 @@ func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body [
 }
 
 func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	provider, owner, rewrittenBody, err := h.resolveProviderRequest(body, path)
+	resp, _, _, err := h.postJSONEndpointWithHeadersTracked(ctx, path, body, extraHeaders)
+	return resp, err
+}
+
+func (h *ProxyHandler) postJSONEndpointWithHeadersTracked(ctx context.Context, path string, body []byte, extraHeaders http.Header) (*http.Response, providerModel, []byte, error) {
+	_, owner, rewrittenBody, err := h.resolveProviderRequest(body, path)
 	if err != nil {
-		return nil, err
+		return nil, providerModel{}, nil, err
 	}
 
-	return h.doWithRetry(func() (*http.Request, error) {
-		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "", owner)
-		if err != nil {
-			return nil, err
+	attempts := h.providerFallbackAttempts(owner, path)
+	if len(attempts) == 0 {
+		attempts = []providerModel{owner}
+	}
+	var lastErr error
+	lastOwner := owner
+	lastBody := rewrittenBody
+	for i, attemptOwner := range attempts {
+		attemptProvider := h.providerSetup().providerByID(attemptOwner.providerID)
+		if attemptProvider == nil || !attemptProvider.supportsEndpoint(path) || !providerModelSupportsEndpoint(attemptOwner, path) {
+			continue
 		}
-		return req, nil
-	})
+		attemptBody, prepErr := prepareProviderRequestBody(attemptProvider, attemptOwner, body, path)
+		if prepErr != nil {
+			return nil, providerModel{}, nil, prepErr
+		}
+		resp, postErr := h.doWithRetry(func() (*http.Request, error) {
+			req, err := h.newProviderJSONRequest(ctx, attemptProvider, http.MethodPost, path, attemptBody, extraHeaders, "", attemptOwner)
+			if err != nil {
+				return nil, err
+			}
+			return req, nil
+		})
+		lastOwner = attemptOwner
+		lastBody = attemptBody
+		if !shouldFallbackToNextProvider(postErr) || i == len(attempts)-1 {
+			return resp, attemptOwner, attemptBody, postErr
+		}
+		lastErr = postErr
+		h.logProviderFallback(owner.publicID, attemptOwner, attempts[i+1], postErr)
+	}
+	if lastErr != nil {
+		return nil, lastOwner, lastBody, lastErr
+	}
+	return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no fallback provider available for model %q", owner.publicID)}
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
@@ -455,4 +482,86 @@ func rewriteAnthropicModelFields(payload map[string]json.RawMessage, publicModel
 	}
 
 	return changed
+}
+
+func prepareProviderRequestBody(provider *providerRuntime, owner providerModel, body []byte, endpoint string) ([]byte, error) {
+	rewrittenBody := body
+	if provider == nil {
+		return nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider is required")}
+	}
+	if provider.kind != providerTypeAzureOpenAI || len(provider.endpoints) == 0 {
+		if !providerUsesAzureClassicDeploymentPath(provider, endpoint) {
+			var err error
+			rewrittenBody, _, err = rewriteRequestModelForProvider(body, owner.upstreamModel)
+			if err != nil {
+				return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+			}
+		}
+	}
+	return applyProviderModelRequestPolicy(rewrittenBody, owner), nil
+}
+
+func (h *ProxyHandler) providerFallbackAttempts(owner providerModel, endpoint string) []providerModel {
+	setup := h.providerSetup()
+	chain := setup.fallbackChain(owner.publicID)
+	if len(chain) == 0 {
+		return nil
+	}
+	attempts := make([]providerModel, 0, len(chain)+1)
+	seenCurrent := false
+	for _, candidate := range chain {
+		if candidate.providerID == owner.providerID && candidate.publicID == owner.publicID {
+			seenCurrent = true
+		}
+		if !seenCurrent {
+			continue
+		}
+		if providerModelSupportsEndpoint(candidate, endpoint) {
+			attempts = append(attempts, candidate)
+		}
+	}
+	if len(attempts) == 0 {
+		attempts = append(attempts, owner)
+		for _, candidate := range chain {
+			if candidate.providerID == owner.providerID && candidate.publicID == owner.publicID {
+				continue
+			}
+			if providerModelSupportsEndpoint(candidate, endpoint) {
+				attempts = append(attempts, candidate)
+			}
+		}
+	}
+	return attempts
+}
+
+func shouldFallbackToNextProvider(err error) bool {
+	if err == nil {
+		return false
+	}
+	var providerErr *providerRequestError
+	if errors.As(err, &providerErr) {
+		return false
+	}
+	var upstreamErr *upstreamError
+	if errors.As(err, &upstreamErr) {
+		return retryable(upstreamErr.statusCode)
+	}
+	return true
+}
+
+func (h *ProxyHandler) logProviderFallback(requested string, from, to providerModel, cause error) {
+	if h == nil || h.log == nil {
+		return
+	}
+	fields := []logger.Field{
+		logger.F("requested_model", requested),
+		logger.F("from_provider", from.providerID),
+		logger.F("from_model", from.publicID),
+		logger.F("to_provider", to.providerID),
+		logger.F("to_model", to.publicID),
+	}
+	if cause != nil {
+		fields = append(fields, logger.Err(cause))
+	}
+	h.log.Info("provider fallback", fields...)
 }

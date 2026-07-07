@@ -181,6 +181,46 @@ providers:
 
 For Copilot endpoints, `api_key`/`api_key_env` override the default local Copilot token for that endpoint. If an endpoint omits a key, Vekil falls back to the normal local Copilot authentication flow.
 
+
+### Cross-Provider Fallback Chains
+
+`fallbacks` declare ordered provider/model hops for one public model. Vekil tries the first hop normally. If that provider exhausts its in-provider retries with a retryable failure (`429`, `5xx`, or transient transport/timeout errors), Vekil logs a `provider fallback` event and retries the request against the next hop. Client errors such as `400`, `401`, `403`, and `404` short-circuit and are returned unchanged.
+
+```yaml
+providers:
+  - id: azure-east
+    type: azure-openai
+    base_url: https://east.openai.azure.com/openai/v1
+    api_key_env: AZURE_EAST_KEY
+    models:
+      - public_id: gpt-5.4-east
+        deployment: gpt-5.4
+        endpoints: [/chat/completions]
+  - id: azure-west
+    type: azure-openai
+    base_url: https://west.openai.azure.com/openai/v1
+    api_key_env: AZURE_WEST_KEY
+    models:
+      - public_id: gpt-5.4-west
+        deployment: gpt-5.4
+        endpoints: [/chat/completions]
+  - id: copilot
+    type: copilot
+    default: true
+
+fallbacks:
+  - public: gpt-5.4-east
+    chain:
+      - provider: azure-east
+        model: gpt-5.4-east
+      - provider: azure-west
+        model: gpt-5.4-west
+      - provider: copilot
+        model: claude-sonnet-4.5
+```
+
+Fallback chain entries target configured provider models. Keep each hop on an endpoint the provider/model supports; protocol translation across incompatible public endpoints is not inferred.
+
 ### Generic Provider Behavior
 
 OpenAI-compatible providers route `POST /v1/chat/completions` to `chat_completions_path`. Anthropic `POST /v1/messages` requests for these models are translated through the existing OpenAI Chat Completions adapter. `POST /v1/responses` is never inferred; add `/responses` to a model only after validating the upstream model and path.
@@ -204,6 +244,9 @@ Anthropic-compatible providers directly forward Anthropic `POST /v1/messages` to
 | `messages_path` | `anthropic-compatible` | Upstream path for public `POST /v1/messages`. Defaults to `/v1/messages`. |
 | `models_path` | generic providers | Upstream path for dynamic model discovery and readiness probes. Defaults to `/models`. |
 | `model_discovery` | generic providers | `static`, `openai`, `ollama`, or `openrouter-tools`. |
+| `fallbacks[].public` | top-level `fallbacks` | Public model ID whose requests should follow the declared fallback chain. |
+| `fallbacks[].chain[].provider` | top-level `fallbacks` | Provider ID for one fallback hop. |
+| `fallbacks[].chain[].model` | top-level `fallbacks` | Provider model public ID to use at that hop. |
 | `selector` | providers with `endpoints` | Endpoint selector: `round_robin`, `weighted`, or `least_latency`. Defaults to `round_robin`. |
 | `endpoints[].name` | providers with `endpoints` | Stable endpoint label for logs and health tracking. Auto-fills to `endpoint-N` if omitted. |
 | `endpoints[].base_url` | providers with `endpoints` | Endpoint-specific upstream origin. Defaults to provider `base_url`; Copilot defaults to the built-in Copilot API URL. |

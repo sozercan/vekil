@@ -62,13 +62,27 @@ var openAICodexProviderEndpoints = []string{providerEndpointResponses}
 // ProvidersConfig configures optional non-Copilot upstream providers.
 // When empty, the proxy keeps its legacy zero-config Copilot behavior.
 type ProvidersConfig struct {
-	Providers      []ProviderConfig     `json:"providers" yaml:"providers"`
-	ToolOptimizers ToolOptimizersConfig `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
+	Providers      []ProviderConfig         `json:"providers" yaml:"providers"`
+	Fallbacks      []ProviderFallbackConfig `json:"fallbacks,omitempty" yaml:"fallbacks,omitempty"`
+	ToolOptimizers ToolOptimizersConfig     `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
 	// InsightModel is the public model ID the dashboard uses to generate
 	// natural-language traffic insights on demand. Empty disables the feature
 	// (the dashboard's "Generate insights" button is hidden). The model must be
 	// one served by the configured providers.
 	InsightModel string `json:"insight_model,omitempty" yaml:"insight_model,omitempty"`
+}
+
+// ProviderFallbackConfig declares an ordered cross-provider fallback chain for one public model.
+type ProviderFallbackConfig struct {
+	Public string                       `json:"public" yaml:"public"`
+	Chain  []ProviderFallbackChainEntry `json:"chain" yaml:"chain"`
+}
+
+// ProviderFallbackChainEntry names one provider/model hop in a fallback chain.
+type ProviderFallbackChainEntry struct {
+	Provider                 string `json:"provider" yaml:"provider"`
+	Model                    string `json:"model" yaml:"model"`
+	AllowProtocolTranslation bool   `json:"allow_protocol_translation,omitempty" yaml:"allow_protocol_translation,omitempty"`
 }
 
 // ProviderConfig configures one upstream provider instance.
@@ -190,6 +204,7 @@ type providerSetup struct {
 	defaultProviderID  string
 	modelsMu           sync.RWMutex
 	models             map[string]providerModel
+	fallbackChains     map[string][]providerModel
 	hasConfiguredState bool
 }
 
@@ -319,6 +334,7 @@ func defaultProviderSetup(h *ProxyHandler) *providerSetup {
 		providerOrder:     []string{"copilot"},
 		defaultProviderID: "copilot",
 		models:            map[string]providerModel{},
+		fallbackChains:    map[string][]providerModel{},
 	}
 }
 
@@ -460,6 +476,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 		providerOrder:      providerOrder,
 		defaultProviderID:  defaultProviderID,
 		models:             make(map[string]providerModel),
+		fallbackChains:     make(map[string][]providerModel),
 		hasConfiguredState: true,
 	}
 
@@ -470,6 +487,9 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 			if err := setup.addStaticProviderModels(providerID); err != nil {
 				return nil, err
 			}
+		}
+		if err := setup.configureFallbackChains(cfg.Fallbacks); err != nil {
+			return nil, err
 		}
 		return setup, nil
 	}
@@ -2588,4 +2608,59 @@ func providerHasEndpointCredentials(provider *providerRuntime) bool {
 		}
 	}
 	return false
+}
+
+func (ps *providerSetup) configureFallbackChains(configs []ProviderFallbackConfig) error {
+	if ps == nil || len(configs) == 0 {
+		return nil
+	}
+	chains := make(map[string][]providerModel, len(configs))
+	for _, cfg := range configs {
+		public := strings.TrimSpace(cfg.Public)
+		if public == "" {
+			return fmt.Errorf("fallback public model is required")
+		}
+		if len(cfg.Chain) == 0 {
+			return fmt.Errorf("fallback %q must include at least one chain entry", public)
+		}
+		chain := make([]providerModel, 0, len(cfg.Chain))
+		for _, entry := range cfg.Chain {
+			providerID := strings.TrimSpace(entry.Provider)
+			modelID := strings.TrimSpace(entry.Model)
+			if providerID == "" || modelID == "" {
+				return fmt.Errorf("fallback %q chain entries must set provider and model", public)
+			}
+			provider := ps.providerByID(providerID)
+			if provider == nil {
+				return fmt.Errorf("fallback %q references unknown provider %q", public, providerID)
+			}
+			model, ok := provider.staticModels[modelID]
+			if !ok {
+				if providerUsesDynamicModels(provider) {
+					model = providerModel{publicID: modelID, upstreamModel: modelID, providerID: providerID, supportedEndpoints: provider.defaultDynamicModelEndpoints()}
+					ok = true
+				}
+			}
+			if !ok {
+				return fmt.Errorf("fallback %q references unknown model %q on provider %q", public, modelID, providerID)
+			}
+			chain = append(chain, model)
+		}
+		chains[public] = chain
+	}
+	ps.fallbackChains = chains
+	return nil
+}
+
+func (ps *providerSetup) fallbackChain(public string) []providerModel {
+	if ps == nil {
+		return nil
+	}
+	chain := ps.fallbackChains[strings.TrimSpace(public)]
+	if len(chain) == 0 {
+		return nil
+	}
+	out := make([]providerModel, len(chain))
+	copy(out, chain)
+	return out
 }
