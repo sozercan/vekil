@@ -243,6 +243,8 @@ type ProxyHandler struct {
 	azureIdentityTokenSourceFactory  azureIdentityTokenSourceFactory
 	toolOptimizers                   *ToolOptimizerManager
 	toolContexts                     *ToolExecutionContextStore
+	codeExecConfig                   CodeExecConfig
+	codeExecBackend                  CodeExecutionBackend
 	responsesWS                      ResponsesWebSocketConfig
 	responsesWSSessionsMu            sync.Mutex
 	responsesWSSessions              map[*responsesWebSocketSession]struct{}
@@ -343,6 +345,25 @@ func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
 func WithProvidersConfig(cfg ProvidersConfig) Option {
 	return func(h *ProxyHandler) {
 		h.providersConfig = cfg
+	}
+}
+
+// WithCodeExecConfig enables optional proxy-mediated code execution. When unset
+// or disabled, the proxy keeps its default transparent behavior and never
+// intercepts tool calls. Environment overrides (VEKIL_CODE_EXEC_*) are applied
+// on top of the supplied config during initialization.
+func WithCodeExecConfig(cfg CodeExecConfig) Option {
+	return func(h *ProxyHandler) {
+		h.codeExecConfig = cfg
+	}
+}
+
+// WithCodeExecBackend overrides the code-execution backend. Primarily used by
+// tests to inject a scripted backend; production wiring selects a backend by
+// name during initialization.
+func WithCodeExecBackend(backend CodeExecutionBackend) Option {
+	return func(h *ProxyHandler) {
+		h.codeExecBackend = backend
 	}
 }
 
@@ -484,6 +505,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		}
 	}
 	h.initializeToolOptimizers()
+	h.initializeCodeExec()
 	if err := h.initializeProviders(); err != nil {
 		return nil, err
 	}

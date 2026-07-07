@@ -407,6 +407,10 @@ func runServe() {
 		server.WithProxyOptions(
 			proxy.WithProvidersConfig(providersCfg),
 			proxy.WithDeferredDynamicProviderModelValidation(providersCfg.UsesCopilot()),
+			// Proxy-mediated code execution is disabled unless enabled via
+			// VEKIL_CODE_EXEC_* env vars (or a future config surface). The env
+			// overrides are applied during proxy initialization.
+			proxy.WithCodeExecConfig(proxy.CodeExecConfig{}),
 		),
 	)
 	if err != nil {

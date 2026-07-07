@@ -53,3 +53,8 @@ Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership 
 ## Responses WebSocket Bridge
 
 The Codex-style `GET /v1/responses` websocket bridge is disabled by default and remains a proxy-owned transport over upstream HTTP `/responses`. See [Responses WebSocket Bridge](responses-websocket.md) for websocket flags, auto-compaction settings, chunked compaction knobs, and a debug run example.
+
+## Code Execution
+
+Proxy-mediated code execution is an optional, explicit mode (disabled by default) in which Vekil owns selected code-execution tool calls, runs them through a compute backend, and returns only the final assistant response to the client. It is configured through `VEKIL_CODE_EXEC_*` environment variables. See [Proxy-Mediated Code Execution](code-execution.md) for the full variable table, backend and policy details, the security model, and MVP limitations.
+

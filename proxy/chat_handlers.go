@@ -346,6 +346,20 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			// Proxy-mediated code execution runs before translating back to
+			// Anthropic. When enabled and the buffered response contains an owned
+			// tool call, execute it internally and translate only the loop's final
+			// assistant response. Fail closed on loop error so an owned tool call is
+			// never forwarded to the client.
+			if h.codeExecActive() {
+				finalResp, execErr := h.maybeInterceptCodeExec(r.Context(), oaiBody, oaiResp)
+				if execErr != nil {
+					h.log.Error("code exec loop failed", logger.F("endpoint", "anthropic"), logger.Err(execErr))
+					writeAnthropicError(w, http.StatusBadGateway, "api_error", "code execution failed")
+					return
+				}
+				oaiResp = finalResp
+			}
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
 			anthropicResp := TranslateOpenAIToAnthropic(oaiResp, req.Model)
@@ -562,6 +576,19 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			StreamOpenAIChatPassthrough(w, resp.Body, requestedModel, mode.injectedClientStreamUsage, onError, finalResponse, usage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
+			// Proxy-mediated code execution: when enabled and the buffered response
+			// contains an owned tool call, run it internally and replace the
+			// response with the loop's final assistant response. On failure fail
+			// closed rather than forward the owned tool call to the client.
+			if h.codeExecActive() {
+				finalResp, execErr := h.maybeInterceptCodeExec(r.Context(), bodyBytes, oaiResp)
+				if execErr != nil {
+					h.log.Error("code exec loop failed", logger.F("endpoint", "openai"), logger.Err(execErr))
+					writeOpenAIError(w, http.StatusBadGateway, "code execution failed", "server_error")
+					return
+				}
+				oaiResp = finalResp
+			}
 			normalizeOpenAIChatCompletionStruct(oaiResp, requestedModel)
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
