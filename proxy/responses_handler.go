@@ -104,11 +104,11 @@ func responsesRequestStreams(bodyBytes []byte) bool {
 }
 
 func (h *ProxyHandler) postPreparedResponsesRequest(ctx, observeCtx context.Context, req preparedResponsesRequest) (*http.Response, error) {
-	resp, err := h.postResponsesWithHeaders(ctx, req.body, req.upstreamHeaders, req.routingHeaders)
+	resp, selectedOwner, err := h.postResponsesWithHeadersTracked(ctx, req.body, req.upstreamHeaders, req.routingHeaders)
 	if err != nil {
 		return nil, err
 	}
-	return h.maybeRetryCompactedResponsesRequest(ctx, observeCtx, req.body, req.extraHeaders, req.upstreamHeaders, resp, req.routingHeaders)
+	return h.maybeRetryCompactedResponsesRequest(ctx, observeCtx, req.body, req.extraHeaders, req.upstreamHeaders, resp, req.routingHeaders, selectedOwner)
 }
 
 func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWriter, endpoint string, err error) {
@@ -749,7 +749,7 @@ func compactInflightKey(requestFields map[string]json.RawMessage, extraHeaders h
 	writeCompactInflightKeyHeaders(h, extraHeaders)
 	writeCompactInflightKeyPart(h, []byte("routing_headers"))
 	for _, headers := range routingHeaders {
-		writeCompactInflightKeyHeaders(h, headers)
+		writeCompactInflightKeyHeaders(h, speedTierRoutingHeadersOnly(headers))
 	}
 	return hex.EncodeToString(h.Sum(nil)), true
 }
@@ -2518,7 +2518,7 @@ func applyResolvedCompactModel(bodyBytes []byte, budget *compactBudget) []byte {
 	return sanitizeResponsesModelFallbackBody(rewritten)
 }
 
-func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx context.Context, bodyBytes []byte, extraHeaders, upstreamHeaders http.Header, resp *http.Response, routingHeaders ...http.Header) (*http.Response, error) {
+func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx context.Context, bodyBytes []byte, extraHeaders, upstreamHeaders http.Header, resp *http.Response, routingHeaders http.Header, selectedOwners ...providerModel) (*http.Response, error) {
 	if resp == nil || resp.StatusCode != http.StatusRequestEntityTooLarge {
 		return resp, nil
 	}
@@ -2589,7 +2589,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 		prefixLen := compactedResponsesAlignedPrefixLen(input, keepTail)
 		alignedKeepTail := len(input) - prefixLen
 		lastAlignedKeepTail = alignedKeepTail
-		summary, err := h.compactResponsesInputWithBudget(ctx, model, input[:prefixLen], extraHeaders, budget, routingHeaders...)
+		summary, err := h.compactResponsesInputWithBudget(ctx, model, input[:prefixLen], extraHeaders, budget, routingHeaders)
 		if err != nil {
 			h.log.Debug("responses 413 compaction failed", logger.F("keep_tail", keepTail), logger.Err(err))
 			return lastResp, nil
@@ -2637,7 +2637,17 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 		}
 		h.log.Info("retrying responses request with compacted history after 413", fields...)
 
-		retryResp, retryErr := h.postResponsesWithHeaders(ctx, retryBody, upstreamHeaders, routingHeaders...)
+		retryHeaders := routingHeaders
+		if len(selectedOwners) > 0 {
+			owner := selectedOwners[0]
+			if owner.publicID != "" {
+				if pinnedBody, _, err := rewriteRequestModelForProvider(retryBody, owner.publicID); err == nil {
+					retryBody = pinnedBody
+				}
+			}
+			retryHeaders = noSpeedTierRoutingHeaders()
+		}
+		retryResp, retryErr := h.postResponsesWithHeaders(ctx, retryBody, upstreamHeaders, retryHeaders)
 		if retryErr != nil {
 			h.log.Debug("responses 413 retry request failed", logger.F("keep_tail", keepTail), logger.Err(retryErr))
 			return lastResp, nil

@@ -448,7 +448,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 		hasConfiguredState: true,
 	}
 
-	needsDynamicModelValidation := len(providers) > 1 && hasDynamicProvider(providers)
+	needsDynamicModelValidation := hasDynamicProvider(providers) && (len(providers) > 1 || cfg.SpeedTierEnabled)
 
 	if !needsDynamicModelValidation || !validateDynamicModels {
 		for _, providerID := range providerOrder {

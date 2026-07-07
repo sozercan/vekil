@@ -250,9 +250,14 @@ func (h *ProxyHandler) postChatCompletionsWithHeadersTracked(ctx context.Context
 }
 
 func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header, routingHeaders ...http.Header) (*http.Response, error) {
+	resp, _, err := h.postResponsesWithHeadersTracked(ctx, body, extraHeaders, routingHeaders...)
+	return resp, err
+}
+
+func (h *ProxyHandler) postResponsesWithHeadersTracked(ctx context.Context, body []byte, extraHeaders http.Header, routingHeaders ...http.Header) (*http.Response, providerModel, error) {
 	resp, owner, _, err := h.postJSONEndpointWithHeadersTracked(ctx, providerEndpointResponses, body, extraHeaders, routingHeaders...)
 	if err != nil {
-		return nil, err
+		return nil, providerModel{}, err
 	}
 	retryBody := body
 	if owner.publicID != "" {
@@ -260,7 +265,8 @@ func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte
 			retryBody = selectedBody
 		}
 	}
-	return h.maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx, retryBody, extraHeaders, resp, noSpeedTierRoutingHeaders())
+	resp, err = h.maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx, retryBody, extraHeaders, resp, noSpeedTierRoutingHeaders())
+	return resp, owner, err
 }
 
 func (h *ProxyHandler) postAnthropicMessagesTracked(ctx context.Context, body []byte, extraHeaders http.Header, routingHeaders ...http.Header) (*http.Response, providerModel, error) {

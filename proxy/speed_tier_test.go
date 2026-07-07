@@ -460,6 +460,33 @@ func TestSpeedTierChatRetryPreservesFirstSelectedModel(t *testing.T) {
 	}
 }
 
+func TestGeminiRetryPreservesFirstSelectedModel(t *testing.T) {
+	var retryModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		retryModel = speedTierRawJSONString(payload["model"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-retry","object":"chat.completion","choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	handler := newSpeedTierHTTPHandler(t, upstream.URL, true)
+	resp := &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"message":"bad stream_options"}}`))}
+	body := []byte(`{"model":"sonnet-public","max_tokens":256,"tools":[],"messages":[{"role":"user","content":"hi"}],"stream_options":{"include_usage":true}}`)
+	selectedOwner := providerModel{publicID: "sonnet-public"}
+	retryResp, _, _ := handler.retryChatCompletionsWithoutInjectedStreamOptions(t.Context(), resp, body, chatCompletionsMode{injectedStreamUsage: true}, nil, selectedOwner)
+	if retryResp == nil {
+		t.Fatal("retry response is nil")
+	}
+	_ = retryResp.Body.Close()
+	if retryModel != "sonnet-upstream" {
+		t.Fatalf("Gemini retry upstream model = %q, want first selected model sonnet-upstream", retryModel)
+	}
+}
+
 func TestAnthropicTranslatedSpeedTierHonorsOptOutHeaders(t *testing.T) {
 	var upstreamModel string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -611,15 +638,19 @@ func TestResolveProviderRequestPreservesLiteralFastPublicID(t *testing.T) {
 	}
 }
 
-func TestCompactInflightKeyIncludesRoutingHeaders(t *testing.T) {
+func TestCompactInflightKeyIncludesOnlySpeedTierRoutingHeaders(t *testing.T) {
 	fields := map[string]json.RawMessage{"model": json.RawMessage(`"sonnet-public"`), "input": json.RawMessage(`[]`)}
-	keyA, okA := compactInflightKey(fields, nil, http.Header{"X-Vekil-Routing": []string{"default"}})
-	keyB, okB := compactInflightKey(fields, nil, http.Header{"X-Vekil-Routing": []string{"speed"}})
-	if !okA || !okB {
-		t.Fatalf("compactInflightKey ok = %v/%v, want both true", okA, okB)
+	keyDefault, okDefault := compactInflightKey(fields, nil, http.Header{"X-Vekil-Routing": []string{"default"}, "Authorization": []string{"Bearer a"}, "User-Agent": []string{"one"}})
+	keySpeed, okSpeed := compactInflightKey(fields, nil, http.Header{"X-Vekil-Routing": []string{"speed"}, "Authorization": []string{"Bearer a"}, "User-Agent": []string{"one"}})
+	keyNoisy, okNoisy := compactInflightKey(fields, nil, http.Header{"X-Vekil-Routing": []string{"default"}, "Authorization": []string{"Bearer b"}, "User-Agent": []string{"two"}, "Cookie": []string{"session=abc"}})
+	if !okDefault || !okSpeed || !okNoisy {
+		t.Fatalf("compactInflightKey ok = %v/%v/%v, want all true", okDefault, okSpeed, okNoisy)
 	}
-	if keyA == keyB {
-		t.Fatalf("compact inflight key ignored routing headers: %q", keyA)
+	if keyDefault == keySpeed {
+		t.Fatalf("compact inflight key ignored speed-tier routing header: %q", keyDefault)
+	}
+	if keyDefault != keyNoisy {
+		t.Fatalf("compact inflight key included unrelated volatile headers: default=%q noisy=%q", keyDefault, keyNoisy)
 	}
 }
 

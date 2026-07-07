@@ -413,6 +413,22 @@ func noSpeedTierRoutingHeaders() http.Header {
 	return http.Header{"X-Vekil-Routing": []string{"default"}}
 }
 
+func speedTierRoutingHeadersOnly(headers http.Header) http.Header {
+	if len(headers) == 0 {
+		return nil
+	}
+	filtered := make(http.Header, 3)
+	for _, name := range []string{"X-Vekil-Routing", "X-Vekil-Tier", "X-Vekil-No-Downgrade"} {
+		for _, value := range headers.Values(name) {
+			filtered.Add(name, value)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return filtered
+}
+
 func speedTierClientOptIn(headers http.Header) bool {
 	routing := strings.ToLower(strings.TrimSpace(headers.Get("X-Vekil-Routing")))
 	legacy := strings.ToLower(strings.TrimSpace(headers.Get("X-Vekil-Tier")))

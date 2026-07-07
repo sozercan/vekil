@@ -102,7 +102,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), stream || forceStream)
 	defer upstreamCancel()
 
-	resp, err := h.postChatCompletionsWithHeaders(upstreamCtx, oaiBody, r.Header)
+	resp, selectedOwner, err := h.postChatCompletionsWithHeadersTracked(upstreamCtx, oaiBody, r.Header)
 	if err != nil {
 		h.writeGeminiUpstreamFailure(w, err)
 		return
@@ -113,7 +113,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		forceUpstreamStream:   forceStream,
 		injectedStreamUsage:   streamUsageInjected,
 	}
-	resp, oaiBody, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, oaiBody, mode, r.Header)
+	resp, oaiBody, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, oaiBody, mode, r.Header, selectedOwner)
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	if resp.StatusCode != http.StatusOK {

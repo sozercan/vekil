@@ -1002,6 +1002,19 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 	}
 
 	cfg := h.responsesWebSocketConfig()
+	requestModel, _ := speedTierBaseModel(strings.TrimSpace(request.Model))
+	restorePinned := false
+	if !s.speedTierDowngraded && s.speedTierPinnedModel == "" && requestModel != "" {
+		s.speedTierPinnedModel = requestModel
+		s.speedTierPinnedSource = requestModel
+		restorePinned = true
+	}
+	if restorePinned {
+		defer func() {
+			s.speedTierPinnedModel = ""
+			s.speedTierPinnedSource = ""
+		}()
+	}
 	configuredKeepTail := cfg.AutoCompactKeepTail
 	if configuredKeepTail <= 0 || strings.TrimSpace(request.Model) == "" {
 		return resp, nil
