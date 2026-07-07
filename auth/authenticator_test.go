@@ -366,8 +366,8 @@ func TestSaveAndLoadCopilotToken(t *testing.T) {
 		t.Fatalf("save error: %v", err)
 	}
 
-	// Verify file exists and is valid JSON
-	data, err := os.ReadFile(filepath.Join(dir, "api-key.json"))
+	// Verify file exists and is valid JSON (now stored under "copilot-token" key)
+	data, err := os.ReadFile(filepath.Join(dir, "copilot-token"))
 	if err != nil {
 		t.Fatalf("read error: %v", err)
 	}

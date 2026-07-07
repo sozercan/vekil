@@ -19,6 +19,7 @@ This folder is intentionally split into small, single-purpose files so humans an
 | [`architecture.md`](architecture.md) | package responsibilities and data flow | implementation boundaries or design decisions change |
 | [`dashboard.md`](dashboard.md) | live browser traffic dashboard and `/stats.json` | dashboard metrics, endpoints, or stats behavior change |
 | [`menubar.md`](menubar.md) | macOS/Linux tray app usage | tray behavior or packaging changes |
+| [`secret-storage.md`](secret-storage.md) | token persistence via OS keyring with file fallback | secret store behavior, keyring backends, or migration logic changes |
 | [`development.md`](development.md) | build, test, benchmark, and CI workflows | local dev or CI commands change |
 
 ## Agent Notes

@@ -72,11 +72,25 @@ type Authenticator struct {
 	copilotBaseURL string // overridable for tests; defaults to https://api.github.com
 	githubCLIPath  string // optional override for tests; defaults to gh lookup/common paths
 
+	// secretStore abstracts token persistence. Defaults to a keyring-backed
+	// store with file fallback (see NewSecretStore).
+	secretStore SecretStore
+
 	// DisableAutoDeviceFlow prevents refreshToken from falling through to the
 	// interactive device-code flow. When true, callers (e.g. the menubar app)
 	// are expected to drive the flow themselves via RequestDeviceCode /
 	// PollForAuthorization.
 	DisableAutoDeviceFlow bool
+}
+
+// getSecretStore returns the configured secret store, initializing a
+// file-backed fallback if none has been set (e.g. in tests that construct
+// Authenticator literals directly).
+func (a *Authenticator) getSecretStore() SecretStore {
+	if a.secretStore != nil {
+		return a.secretStore
+	}
+	return &fileSecretStore{dir: a.tokenDir}
 }
 
 // DeviceCodeResponse is the response from GitHub's device code endpoint.
@@ -165,6 +179,7 @@ func NewAuthenticator(tokenDir string) (*Authenticator, error) {
 		tokenDir:     tokenDir,
 		client:       newAuthHTTPClient(30*time.Second, true),
 		directClient: newAuthHTTPClient(30*time.Second, false),
+		secretStore:  NewSecretStore(tokenDir),
 	}, nil
 }
 
@@ -231,27 +246,27 @@ func (a *Authenticator) Status() AuthStatus {
 	return status
 }
 
-// hasAccessTokenOnDisk returns true when the access-token file exists and is
-// non-empty. Must NOT be called with the write lock held.
+// hasAccessTokenOnDisk returns true when the access-token exists in the
+// secret store and is non-empty. Must NOT be called with the write lock held.
 func (a *Authenticator) hasAccessTokenOnDisk() bool {
-	data, err := os.ReadFile(filepath.Join(a.tokenDir, "access-token"))
+	val, err := a.getSecretStore().Get("access-token")
 	if err != nil {
 		return false
 	}
-	return strings.TrimSpace(string(data)) != ""
+	return strings.TrimSpace(val) != ""
 }
 
-// hasValidCopilotTokenOnDisk returns true when the persisted Copilot token file
-// exists, is valid JSON, and has not expired yet. Must NOT be called with the
-// write lock held.
+// hasValidCopilotTokenOnDisk returns true when the persisted Copilot token
+// exists in the secret store, is valid JSON, and has not expired yet. Must NOT
+// be called with the write lock held.
 func (a *Authenticator) hasValidCopilotTokenOnDisk() bool {
-	data, err := os.ReadFile(filepath.Join(a.tokenDir, "api-key.json"))
+	data, err := a.getSecretStore().Get("copilot-token")
 	if err != nil {
 		return false
 	}
 
 	var ctResp CopilotTokenResponse
-	if err := json.Unmarshal(data, &ctResp); err != nil {
+	if err := json.Unmarshal([]byte(data), &ctResp); err != nil {
 		return false
 	}
 
@@ -575,10 +590,14 @@ func (a *Authenticator) SignOut() error {
 	a.tokenExpiry = time.Time{}
 
 	var errs []error
-	for _, name := range []string{"access-token", "api-key.json"} {
-		if err := os.Remove(filepath.Join(a.tokenDir, name)); err != nil && !os.IsNotExist(err) {
-			errs = append(errs, fmt.Errorf("remove %s: %w", name, err))
+	for _, key := range []string{"access-token", "copilot-token"} {
+		if err := a.getSecretStore().Delete(key); err != nil {
+			errs = append(errs, fmt.Errorf("delete %s: %w", key, err))
 		}
+	}
+	// Also clean up legacy file names in case of migration from older versions.
+	for _, name := range []string{"access-token", "api-key.json"} {
+		_ = os.Remove(filepath.Join(a.tokenDir, name))
 	}
 	if err := a.setGitHubCLIAutoSignIn(false); err != nil {
 		errs = append(errs, fmt.Errorf("writing auth preferences: %w", err))
@@ -612,10 +631,12 @@ func (a *Authenticator) SignInWithGitHubCLI(ctx context.Context) error {
 		a.tokenExpiry = previousTokenExpiry
 		return err
 	}
+	// Remove Vekil-managed tokens from both the secret store and legacy files.
+	for _, key := range []string{"access-token", "copilot-token"} {
+		_ = a.getSecretStore().Delete(key)
+	}
 	for _, name := range []string{"access-token", "api-key.json"} {
-		if err := os.Remove(filepath.Join(a.tokenDir, name)); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("removing stale %s: %w", name, err)
-		}
+		_ = os.Remove(filepath.Join(a.tokenDir, name))
 	}
 	if err := a.clearSignedOutMarker(); err != nil {
 		return fmt.Errorf("clearing signed-out marker: %w", err)
@@ -899,11 +920,14 @@ func isLoopbackProxyHost(host string) bool {
 }
 
 func (a *Authenticator) loadAccessToken() error {
-	data, err := os.ReadFile(filepath.Join(a.tokenDir, "access-token"))
+	val, err := a.getSecretStore().Get("access-token")
 	if err != nil {
+		if errors.Is(err, ErrSecretNotFound) {
+			return ErrNotAuthenticated
+		}
 		return err
 	}
-	a.accessToken = strings.TrimSpace(string(data))
+	a.accessToken = strings.TrimSpace(val)
 	if a.accessToken == "" {
 		return ErrNotAuthenticated
 	}
@@ -1052,16 +1076,26 @@ func githubCLIEnvironment() []string {
 }
 
 func (a *Authenticator) saveAccessToken() error {
-	return atomicWriteFile(filepath.Join(a.tokenDir, "access-token"), []byte(a.accessToken), 0o600)
+	if err := a.getSecretStore().Set("access-token", a.accessToken); err != nil {
+		return err
+	}
+	// Migration: remove legacy plain-text file if the store is keyring-backed.
+	if _, isFile := a.getSecretStore().(*fileSecretStore); !isFile {
+		_ = os.Remove(filepath.Join(a.tokenDir, "access-token"))
+	}
+	return nil
 }
 
 func (a *Authenticator) loadCopilotToken() error {
-	data, err := os.ReadFile(filepath.Join(a.tokenDir, "api-key.json"))
+	data, err := a.getSecretStore().Get("copilot-token")
 	if err != nil {
+		if errors.Is(err, ErrSecretNotFound) {
+			return fmt.Errorf("copilot token not found")
+		}
 		return err
 	}
 	var ctResp CopilotTokenResponse
-	if err := json.Unmarshal(data, &ctResp); err != nil {
+	if err := json.Unmarshal([]byte(data), &ctResp); err != nil {
 		return err
 	}
 	if time.Now().Unix() >= ctResp.ExpiresAt-300 {
@@ -1080,7 +1114,14 @@ func (a *Authenticator) saveCopilotToken() error {
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(filepath.Join(a.tokenDir, "api-key.json"), data, 0o600)
+	if err := a.getSecretStore().Set("copilot-token", string(data)); err != nil {
+		return err
+	}
+	// Migration: remove legacy plain-text file if the store is keyring-backed.
+	if _, isFile := a.getSecretStore().(*fileSecretStore); !isFile {
+		_ = os.Remove(filepath.Join(a.tokenDir, "api-key.json"))
+	}
+	return nil
 }
 
 func lookupAccessTokenFromEnv() (string, string) {
