@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -239,6 +240,9 @@ func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
 	if err := decodeProvidersConfigFile(path, body, &cfg); err != nil {
 		return cfg, err
 	}
+	if err := interpolateProvidersConfigEnv(&cfg); err != nil {
+		return cfg, fmt.Errorf("providers config %q: %w", path, err)
+	}
 	return cfg, nil
 }
 
@@ -258,6 +262,131 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 		}
 	}
 	return nil
+}
+
+func interpolateProvidersConfigEnv(cfg *ProvidersConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	return interpolateProviderConfigValue(reflect.ValueOf(cfg).Elem(), "")
+}
+
+func interpolateProviderConfigValue(v reflect.Value, path string) error {
+	if !v.IsValid() {
+		return nil
+	}
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return nil
+		}
+		return interpolateProviderConfigValue(v.Elem(), path)
+	}
+
+	switch v.Kind() {
+	case reflect.Struct:
+		t := v.Type()
+		for i := 0; i < v.NumField(); i++ {
+			field := v.Field(i)
+			fieldInfo := t.Field(i)
+			if fieldInfo.PkgPath != "" {
+				continue
+			}
+			fieldPath := joinProviderConfigPath(path, providerConfigFieldName(fieldInfo))
+			if err := interpolateProviderConfigValue(field, fieldPath); err != nil {
+				return err
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			if err := interpolateProviderConfigValue(v.Index(i), fmt.Sprintf("%s[%d]", path, i)); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		if v.Type().Key().Kind() != reflect.String || v.Type().Elem().Kind() != reflect.String {
+			return nil
+		}
+		for _, key := range v.MapKeys() {
+			value := v.MapIndex(key)
+			interpolated, err := interpolateProviderConfigString(value.String(), joinProviderConfigPath(path, key.String()))
+			if err != nil {
+				return err
+			}
+			v.SetMapIndex(key, reflect.ValueOf(interpolated))
+		}
+	case reflect.String:
+		if !v.CanSet() {
+			return nil
+		}
+		interpolated, err := interpolateProviderConfigString(v.String(), path)
+		if err != nil {
+			return err
+		}
+		v.SetString(interpolated)
+	}
+	return nil
+}
+
+func providerConfigFieldName(field reflect.StructField) string {
+	for _, tagName := range []string{"json", "yaml"} {
+		if tag := strings.TrimSpace(field.Tag.Get(tagName)); tag != "" {
+			name := strings.Split(tag, ",")[0]
+			if name != "" && name != "-" {
+				return name
+			}
+		}
+	}
+	return field.Name
+}
+
+func joinProviderConfigPath(parent, child string) string {
+	child = strings.TrimSpace(child)
+	if parent == "" {
+		return child
+	}
+	if child == "" {
+		return parent
+	}
+	return parent + "." + child
+}
+
+func interpolateProviderConfigString(value, fieldPath string) (string, error) {
+	if value == "" || !strings.Contains(value, "${env:") {
+		return value, nil
+	}
+	var b strings.Builder
+	for i := 0; i < len(value); {
+		if strings.HasPrefix(value[i:], `\${env:`) {
+			b.WriteString(`\${env:`)
+			i += len(`\${env:`)
+			continue
+		}
+		if !strings.HasPrefix(value[i:], `${env:`) {
+			b.WriteByte(value[i])
+			i++
+			continue
+		}
+		end := strings.IndexByte(value[i:], '}')
+		if end < 0 {
+			b.WriteByte(value[i])
+			i++
+			continue
+		}
+		end += i
+		name := strings.TrimSpace(value[i+len(`${env:`) : end])
+		if name == "" {
+			b.WriteString(value[i : end+1])
+			i = end + 1
+			continue
+		}
+		envValue, ok := os.LookupEnv(name)
+		if !ok {
+			return "", fmt.Errorf("field %q references undefined env var %s", fieldPath, name)
+		}
+		b.WriteString(envValue)
+		i = end + 1
+	}
+	return b.String(), nil
 }
 
 func (c ProvidersConfig) UsesCopilot() bool {

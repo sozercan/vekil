@@ -50,6 +50,31 @@ Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership 
 - See [Tool Optimizers](tool-optimizers.md) for the optional `tool_optimizers` block that can live alongside `providers` in the same config file.
 - Set the optional top-level `insight_model` key to a public model ID the config serves to enable the dashboard's AI insights button. See [Traffic Dashboard](dashboard.md#ai-insights-optional).
 
+
+### Environment Variable Interpolation
+
+Provider config string fields support `${env:VAR_NAME}` interpolation after JSON/YAML parsing. Use this for host-specific URLs, API keys, or header values without hardcoding secrets into the config file:
+
+```yaml
+providers:
+  - id: azure-openai
+    type: azure-openai
+    default: true
+    base_url: ${env:AZURE_OPENAI_BASE_URL}
+    api_key: ${env:AZURE_OPENAI_API_KEY}
+    models:
+      - public_id: gpt-5.4-pro
+        deployment: ${env:AZURE_OPENAI_DEPLOYMENT}
+        endpoints: [/responses]
+
+  - id: copilot
+    type: copilot
+    exclude_models:
+      - ${env:COPILOT_EXCLUDED_MODEL}
+```
+
+If a referenced variable is unset, startup fails loudly with the field path and variable name, for example `field "providers[0].api_key" references undefined env var AZURE_OPENAI_API_KEY`. Backslash-prefix the expression (`\${env:VAR_NAME}`) to keep it literal. Non-string fields are not interpolated, and default-value syntax such as `${env:VAR:-default}` is intentionally unsupported.
+
 ## Responses WebSocket Bridge
 
 The Codex-style `GET /v1/responses` websocket bridge is disabled by default and remains a proxy-owned transport over upstream HTTP `/responses`. See [Responses WebSocket Bridge](responses-websocket.md) for websocket flags, auto-compaction settings, chunked compaction knobs, and a debug run example.

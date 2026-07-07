@@ -1188,3 +1188,96 @@ func BenchmarkDefaultProviderSetup(b *testing.B) {
 		benchmarkProviderSetupSink = handler.providerSetup()
 	}
 }
+
+func TestLoadProvidersConfigFileInterpolatesEnvStrings(t *testing.T) {
+	t.Setenv("VEKIL_TEST_BASE_URL", "https://env.example.com/openai/v1")
+	t.Setenv("VEKIL_TEST_API_KEY", "env-key")
+	t.Setenv("VEKIL_TEST_HEADER", "header-value")
+
+	providersPath := filepath.Join(t.TempDir(), "providers.yaml")
+	body := []byte(`providers:
+  - id: azure-openai
+    type: azure-openai
+    default: true
+    base_url: ${env:VEKIL_TEST_BASE_URL}
+    api_key: ${env:VEKIL_TEST_API_KEY}
+    extra_headers:
+      X-Test-Header: prefix-${env:VEKIL_TEST_HEADER}
+    models:
+      - public_id: gpt-5.4
+        deployment: ${env:VEKIL_TEST_DEPLOYMENT}
+        endpoints:
+          - /responses
+`)
+	t.Setenv("VEKIL_TEST_DEPLOYMENT", "gpt-5.4-env")
+	if err := os.WriteFile(providersPath, body, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	cfg, err := LoadProvidersConfigFile(providersPath)
+	if err != nil {
+		t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+	}
+	provider := cfg.Providers[0]
+	if provider.BaseURL != "https://env.example.com/openai/v1" {
+		t.Fatalf("BaseURL = %q", provider.BaseURL)
+	}
+	if provider.APIKey != "env-key" {
+		t.Fatalf("APIKey = %q", provider.APIKey)
+	}
+	if provider.ExtraHeaders["X-Test-Header"] != "prefix-header-value" {
+		t.Fatalf("extra header = %q", provider.ExtraHeaders["X-Test-Header"])
+	}
+	if provider.Models[0].Deployment != "gpt-5.4-env" {
+		t.Fatalf("deployment = %q", provider.Models[0].Deployment)
+	}
+}
+
+func TestLoadProvidersConfigFileEnvInterpolationMissingEnv(t *testing.T) {
+	providersPath := filepath.Join(t.TempDir(), "providers.json")
+	body := []byte(`{"providers":[{"id":"azure","type":"azure-openai","base_url":"${env:MISSING_VEKIL_BASE_URL}"}]}`)
+	if err := os.WriteFile(providersPath, body, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	_, err := LoadProvidersConfigFile(providersPath)
+	if err == nil {
+		t.Fatal("LoadProvidersConfigFile() error = nil, want missing env error")
+	}
+	if !strings.Contains(err.Error(), `field "providers[0].base_url" references undefined env var MISSING_VEKIL_BASE_URL`) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadProvidersConfigFileEnvInterpolationEscapedAndNonStringNoop(t *testing.T) {
+	t.Setenv("VEKIL_TEST_DEFAULT", "false")
+	providersPath := filepath.Join(t.TempDir(), "providers.yaml")
+	body := []byte(`providers:
+  - id: literal
+    type: openai-compatible
+    default: false
+    base_url: \${env:VEKIL_TEST_BASE_URL}
+    api_key: ${env:VEKIL_TEST_API_KEY}
+    models:
+      - public_id: m
+        context_window: 12345
+`)
+	t.Setenv("VEKIL_TEST_API_KEY", "key")
+	if err := os.WriteFile(providersPath, body, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	cfg, err := LoadProvidersConfigFile(providersPath)
+	if err != nil {
+		t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+	}
+	if cfg.Providers[0].BaseURL != `\${env:VEKIL_TEST_BASE_URL}` {
+		t.Fatalf("escaped base_url = %q", cfg.Providers[0].BaseURL)
+	}
+	if cfg.Providers[0].APIKey != "key" {
+		t.Fatalf("api_key = %q", cfg.Providers[0].APIKey)
+	}
+	if cfg.Providers[0].Models[0].ContextWindow == nil || *cfg.Providers[0].Models[0].ContextWindow != 12345 {
+		t.Fatalf("context_window = %v, want 12345", cfg.Providers[0].Models[0].ContextWindow)
+	}
+}
