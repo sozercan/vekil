@@ -1188,3 +1188,193 @@ func BenchmarkDefaultProviderSetup(b *testing.B) {
 		benchmarkProviderSetupSink = handler.providerSetup()
 	}
 }
+
+func TestExpandEnvVarsSingleVar(t *testing.T) {
+	t.Setenv("VEKIL_TEST_KEY", "my-secret-key")
+
+	input := []byte(`api_key: ${env:VEKIL_TEST_KEY}`)
+	got, err := expandEnvVars(input)
+	if err != nil {
+		t.Fatalf("expandEnvVars() error = %v", err)
+	}
+	if string(got) != "api_key: my-secret-key" {
+		t.Fatalf("expandEnvVars() = %q, want %q", string(got), "api_key: my-secret-key")
+	}
+}
+
+func TestExpandEnvVarsMultipleVars(t *testing.T) {
+	t.Setenv("VEKIL_TEST_URL", "https://example.azure.com")
+	t.Setenv("VEKIL_TEST_SECRET", "s3cret")
+
+	input := []byte(`base_url: ${env:VEKIL_TEST_URL}
+api_key: ${env:VEKIL_TEST_SECRET}`)
+	got, err := expandEnvVars(input)
+	if err != nil {
+		t.Fatalf("expandEnvVars() error = %v", err)
+	}
+	want := "base_url: https://example.azure.com\napi_key: s3cret"
+	if string(got) != want {
+		t.Fatalf("expandEnvVars() = %q, want %q", string(got), want)
+	}
+}
+
+func TestExpandEnvVarsMissingVarError(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(`api_key: ${env:VEKIL_DEFINITELY_MISSING_VAR}`)
+	_, err := expandEnvVars(input)
+	if err == nil {
+		t.Fatal("expandEnvVars() error = nil, want missing var error")
+	}
+	if !strings.Contains(err.Error(), "VEKIL_DEFINITELY_MISSING_VAR") {
+		t.Fatalf("expandEnvVars() error = %v, want reference to VEKIL_DEFINITELY_MISSING_VAR", err)
+	}
+	if !strings.Contains(err.Error(), "undefined environment variable") {
+		t.Fatalf("expandEnvVars() error = %v, want 'undefined environment variable' message", err)
+	}
+}
+
+func TestExpandEnvVarsMultipleMissingVarsReportsAll(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(`base_url: ${env:VEKIL_MISSING_A}
+api_key: ${env:VEKIL_MISSING_B}`)
+	_, err := expandEnvVars(input)
+	if err == nil {
+		t.Fatal("expandEnvVars() error = nil, want missing vars error")
+	}
+	if !strings.Contains(err.Error(), "VEKIL_MISSING_A") || !strings.Contains(err.Error(), "VEKIL_MISSING_B") {
+		t.Fatalf("expandEnvVars() error = %v, want both VEKIL_MISSING_A and VEKIL_MISSING_B", err)
+	}
+}
+
+func TestExpandEnvVarsEscapedLiteral(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(`value: \${env:NOT_EXPANDED}`)
+	got, err := expandEnvVars(input)
+	if err != nil {
+		t.Fatalf("expandEnvVars() error = %v", err)
+	}
+	if string(got) != `value: ${env:NOT_EXPANDED}` {
+		t.Fatalf("expandEnvVars() = %q, want %q", string(got), `value: ${env:NOT_EXPANDED}`)
+	}
+}
+
+func TestExpandEnvVarsNoPatternPassthrough(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(`api_key: hardcoded-value`)
+	got, err := expandEnvVars(input)
+	if err != nil {
+		t.Fatalf("expandEnvVars() error = %v", err)
+	}
+	if string(got) != "api_key: hardcoded-value" {
+		t.Fatalf("expandEnvVars() = %q, want unmodified input", string(got))
+	}
+}
+
+func TestExpandEnvVarsEmptyValueAllowed(t *testing.T) {
+	t.Setenv("VEKIL_TEST_EMPTY", "")
+
+	input := []byte(`value: ${env:VEKIL_TEST_EMPTY}`)
+	got, err := expandEnvVars(input)
+	if err != nil {
+		t.Fatalf("expandEnvVars() error = %v", err)
+	}
+	if string(got) != "value: " {
+		t.Fatalf("expandEnvVars() = %q, want %q", string(got), "value: ")
+	}
+}
+
+func TestLoadProvidersConfigFileEnvVarInterpolation(t *testing.T) {
+	tests := []struct {
+		name string
+		ext  string
+		body string
+	}{
+		{
+			name: "YAML",
+			ext:  ".yaml",
+			body: `providers:
+  - id: azure
+    type: azure-openai
+    base_url: ${env:VEKIL_TEST_AZURE_URL}
+    api_key: ${env:VEKIL_TEST_AZURE_KEY}
+    models:
+      - public_id: gpt-5.4
+        deployment: gpt-5.4
+        endpoints:
+          - /responses
+`,
+		},
+		{
+			name: "JSON",
+			ext:  ".json",
+			body: `{
+  "providers": [{
+    "id": "azure",
+    "type": "azure-openai",
+    "base_url": "${env:VEKIL_TEST_AZURE_URL}",
+    "api_key": "${env:VEKIL_TEST_AZURE_KEY}",
+    "models": [{"public_id":"gpt-5.4","deployment":"gpt-5.4","endpoints":["/responses"]}]
+  }]
+}`,
+		},
+	}
+
+	t.Setenv("VEKIL_TEST_AZURE_URL", "https://example.openai.azure.com/openai/v1")
+	t.Setenv("VEKIL_TEST_AZURE_KEY", "test-key-from-env")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			providersPath := filepath.Join(t.TempDir(), "providers"+tt.ext)
+			if err := os.WriteFile(providersPath, []byte(tt.body), 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+
+			cfg, err := LoadProvidersConfigFile(providersPath)
+			if err != nil {
+				t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+			}
+			if len(cfg.Providers) != 1 {
+				t.Fatalf("providers count = %d, want 1", len(cfg.Providers))
+			}
+			provider := cfg.Providers[0]
+			if provider.BaseURL != "https://example.openai.azure.com/openai/v1" {
+				t.Fatalf("base_url = %q, want expanded env var value", provider.BaseURL)
+			}
+			if provider.APIKey != "test-key-from-env" {
+				t.Fatalf("api_key = %q, want test-key-from-env", provider.APIKey)
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileMissingEnvVarError(t *testing.T) {
+	t.Parallel()
+
+	providersPath := filepath.Join(t.TempDir(), "providers.yaml")
+	body := []byte(`providers:
+  - id: azure
+    type: azure-openai
+    base_url: https://example.openai.azure.com/openai/v1
+    api_key: ${env:VEKIL_TEST_NONEXISTENT_VAR}
+    models:
+      - public_id: gpt-5.4
+`)
+	if err := os.WriteFile(providersPath, body, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	_, err := LoadProvidersConfigFile(providersPath)
+	if err == nil {
+		t.Fatal("LoadProvidersConfigFile() error = nil, want missing env var error")
+	}
+	if !strings.Contains(err.Error(), "VEKIL_TEST_NONEXISTENT_VAR") {
+		t.Fatalf("error = %v, want reference to VEKIL_TEST_NONEXISTENT_VAR", err)
+	}
+	if !strings.Contains(err.Error(), "undefined environment variable") {
+		t.Fatalf("error = %v, want 'undefined environment variable' message", err)
+	}
+}

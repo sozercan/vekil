@@ -50,6 +50,58 @@ Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership 
 - See [Tool Optimizers](tool-optimizers.md) for the optional `tool_optimizers` block that can live alongside `providers` in the same config file.
 - Set the optional top-level `insight_model` key to a public model ID the config serves to enable the dashboard's AI insights button. See [Traffic Dashboard](dashboard.md#ai-insights-optional).
 
+## Environment Variable Interpolation
+
+Any string value in a provider config file (JSON or YAML) supports `${env:VAR_NAME}` interpolation. References are expanded at load time before parsing, so they work in any field position.
+
+### Syntax
+
+| Form | Behavior |
+|------|----------|
+| `${env:VAR_NAME}` | Replaced with the value of environment variable `VAR_NAME` |
+| `\${env:VAR_NAME}` | Escaped — passes through as the literal `${env:VAR_NAME}` (backslash stripped) |
+
+Variable names must match `[A-Za-z_][A-Za-z0-9_]*`.
+
+### Error behavior
+
+Missing environment variables produce a **hard startup error** that names every undefined variable referenced in the file. The proxy will not start with unresolved references.
+
+### Example
+
+```yaml
+providers:
+  - id: azure
+    type: azure-openai
+    base_url: ${env:AZURE_OPENAI_BASE_URL}
+    api_key: ${env:AZURE_OPENAI_KEY}
+    models:
+      - public_id: gpt-5.4-pro
+        deployment: gpt-5.4-pro
+        endpoints:
+          - /responses
+
+  - id: copilot
+    type: copilot
+    default: true
+    exclude_models:
+      - gpt-5.4-pro
+```
+
+With environment variables set:
+
+```bash
+export AZURE_OPENAI_BASE_URL=https://myorg.openai.azure.com/openai/v1
+export AZURE_OPENAI_KEY=sk-abc123...
+vekil --providers-config providers.yaml
+```
+
+### Notes
+
+- Interpolation applies before YAML/JSON parsing, so it works identically for both formats.
+- An empty environment variable (set but empty string) is valid and substitutes as-is.
+- Default values (`${env:VAR:-default}`) are not supported — keep variable definitions explicit.
+
 ## Responses WebSocket Bridge
 
 The Codex-style `GET /v1/responses` websocket bridge is disabled by default and remains a proxy-owned transport over upstream HTTP `/responses`. See [Responses WebSocket Bridge](responses-websocket.md) for websocket flags, auto-compaction settings, chunked compaction knobs, and a debug run example.

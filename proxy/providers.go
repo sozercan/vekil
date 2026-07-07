@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -236,10 +237,51 @@ func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("read providers config %q: %w", path, err)
 	}
+	body, err = expandEnvVars(body)
+	if err != nil {
+		return cfg, fmt.Errorf("providers config %q: %w", path, err)
+	}
 	if err := decodeProvidersConfigFile(path, body, &cfg); err != nil {
 		return cfg, err
 	}
 	return cfg, nil
+}
+
+// envVarPattern matches ${env:VAR_NAME} references in config file bytes.
+var envVarPattern = regexp.MustCompile(`\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// expandEnvVars replaces ${env:VAR} references in raw config bytes with the
+// corresponding environment variable value. Missing variables produce a hard
+// error listing all undefined references. The escaped form \${env:...} passes
+// through as the literal ${env:...} with the backslash stripped.
+func expandEnvVars(data []byte) ([]byte, error) {
+	// Replace escaped \${env:...} with a placeholder to protect from expansion.
+	const placeholder = "\x00VEKIL_ESC_ENV\x00"
+	escaped := bytes.ReplaceAll(data, []byte(`\${env:`), []byte(placeholder))
+
+	// Find all ${env:VAR} references and collect missing variables.
+	var missing []string
+	result := envVarPattern.ReplaceAllFunc(escaped, func(match []byte) []byte {
+		submatch := envVarPattern.FindSubmatch(match)
+		if len(submatch) < 2 {
+			return match
+		}
+		varName := string(submatch[1])
+		value, ok := os.LookupEnv(varName)
+		if !ok {
+			missing = append(missing, varName)
+			return match
+		}
+		return []byte(value)
+	})
+
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("references undefined environment variable(s): %s", strings.Join(missing, ", "))
+	}
+
+	// Restore escaped references as literal ${env:...} (backslash stripped).
+	result = bytes.ReplaceAll(result, []byte(placeholder), []byte("${env:"))
+	return result, nil
 }
 
 func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) error {
