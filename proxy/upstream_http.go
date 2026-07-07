@@ -231,6 +231,14 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersTracked(ctx context.Context, p
 	lastOwner := owner
 	lastBody := rewrittenBody
 	for i, attemptOwner := range attempts {
+		attemptCtx := ctx
+		var cancel context.CancelFunc
+		if i > 0 && ctx.Err() != nil {
+			attemptCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), upstreamTimeout)
+		}
+		if cancel != nil {
+			defer cancel()
+		}
 		attemptProvider := h.providerSetup().providerByID(attemptOwner.providerID)
 		if attemptProvider == nil || !attemptProvider.supportsEndpoint(path) || !providerModelSupportsEndpoint(attemptOwner, path) {
 			continue
@@ -240,7 +248,7 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersTracked(ctx context.Context, p
 			return nil, providerModel{}, nil, prepErr
 		}
 		resp, postErr := h.doWithRetry(func() (*http.Request, error) {
-			req, err := h.newProviderJSONRequest(ctx, attemptProvider, http.MethodPost, path, attemptBody, extraHeaders, "", attemptOwner)
+			req, err := h.newProviderJSONRequest(attemptCtx, attemptProvider, http.MethodPost, path, attemptBody, extraHeaders, "", attemptOwner)
 			if err != nil {
 				return nil, err
 			}
@@ -557,6 +565,9 @@ func shouldFallbackToNextProvider(err error) bool {
 	}
 	var providerErr *providerRequestError
 	if errors.As(err, &providerErr) {
+		return providerErr.statusCode >= http.StatusInternalServerError
+	}
+	if permanentTransportError(err) {
 		return false
 	}
 	var upstreamErr *upstreamError

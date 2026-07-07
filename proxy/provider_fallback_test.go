@@ -13,6 +13,7 @@ import (
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
+	"github.com/sozercan/vekil/proxy/selector"
 )
 
 func newFallbackTestHandler(t *testing.T, primaryURL, backupURL string) *ProxyHandler {
@@ -282,5 +283,46 @@ func TestDirectAnthropicFallbackPreservesRequestedResponseModel(t *testing.T) {
 	}
 	if resp.Model != "claude-primary" {
 		t.Fatalf("response model = %q, want requested claude-primary", resp.Model)
+	}
+}
+
+func TestProviderFallbackDoesNotMaskPermanentTransportError(t *testing.T) {
+	backupHits := atomic.Int32{}
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		writeFallbackChatOK(w, "backup-ok")
+	}))
+	defer backup.Close()
+	handler := newFallbackTestHandler(t, "https://missing.invalid", backup.URL)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-primary","messages":[{"role":"user","content":"hi"}]}`))
+	handler.HandleOpenAIChatCompletions(w, req)
+	if backupHits.Load() != 0 {
+		t.Fatalf("backup hits = %d, want 0 for permanent DNS failure", backupHits.Load())
+	}
+}
+
+func TestProviderFallbackAfterProviderEndpointExhaustion(t *testing.T) {
+	backupHits := atomic.Int32{}
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		writeFallbackChatOK(w, "backup-ok")
+	}))
+	defer backup.Close()
+	handler := newFallbackTestHandler(t, "http://127.0.0.1:1", backup.URL)
+	primary := handler.providerSetup().providerByID("primary")
+	primary.endpoints = []*providerEndpointRuntime{{endpoint: selector.Endpoint{Name: "dead", BaseURL: "http://127.0.0.1:1", Healthy: true}, health: newEndpointHealthTracker(endpointHealthConfig{errorBudget: endpointErrorBudget{Limit: 1, Window: time.Minute}, cooldown: time.Hour})}}
+	primary.endpointByName = map[string]*providerEndpointRuntime{"dead": primary.endpoints[0]}
+	primary.selector = selector.NewRoundRobin()
+	primary.endpointByName["dead"].health.recordFailure(time.Now())
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-primary","messages":[{"role":"user","content":"hi"}]}`))
+	handler.HandleOpenAIChatCompletions(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if backupHits.Load() != 1 {
+		t.Fatalf("backup hits = %d, want 1", backupHits.Load())
 	}
 }

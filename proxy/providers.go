@@ -204,6 +204,7 @@ type providerSetup struct {
 	defaultProviderID  string
 	modelsMu           sync.RWMutex
 	models             map[string]providerModel
+	fallbackChainsMu   sync.RWMutex
 	fallbackChains     map[string][]providerModel
 	hasConfiguredState bool
 }
@@ -2654,13 +2655,7 @@ func (ps *providerSetup) configureFallbackChains(configs []ProviderFallbackConfi
 			if provider == nil {
 				return fmt.Errorf("fallback %q references unknown provider %q", public, providerID)
 			}
-			model, ok := provider.staticModels[modelID]
-			if !ok {
-				if providerUsesDynamicModels(provider) {
-					model = providerModel{publicID: modelID, upstreamModel: modelID, providerID: providerID, supportedEndpoints: provider.defaultDynamicModelEndpoints()}
-					ok = true
-				}
-			}
+			model, ok := ps.lookupProviderModel(providerID, modelID)
 			if !ok {
 				return fmt.Errorf("fallback %q references unknown model %q on provider %q", public, modelID, providerID)
 			}
@@ -2668,15 +2663,36 @@ func (ps *providerSetup) configureFallbackChains(configs []ProviderFallbackConfi
 		}
 		chains[public] = chain
 	}
+	ps.fallbackChainsMu.Lock()
 	ps.fallbackChains = chains
+	ps.fallbackChainsMu.Unlock()
 	return nil
+}
+
+func (ps *providerSetup) lookupProviderModel(providerID, modelID string) (providerModel, bool) {
+	provider := ps.providerByID(providerID)
+	if provider == nil {
+		return providerModel{}, false
+	}
+	if model, ok := provider.staticModels[modelID]; ok {
+		return model, true
+	}
+	ps.modelsMu.RLock()
+	defer ps.modelsMu.RUnlock()
+	model, ok := ps.models[modelID]
+	if !ok || model.providerID != providerID {
+		return providerModel{}, false
+	}
+	return model, true
 }
 
 func (ps *providerSetup) fallbackChain(public string) []providerModel {
 	if ps == nil {
 		return nil
 	}
+	ps.fallbackChainsMu.RLock()
 	chain := ps.fallbackChains[strings.TrimSpace(public)]
+	ps.fallbackChainsMu.RUnlock()
 	if len(chain) == 0 {
 		return nil
 	}
