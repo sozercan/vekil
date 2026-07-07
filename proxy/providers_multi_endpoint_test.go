@@ -188,14 +188,14 @@ func TestMultiEndpointPickEndpoint(t *testing.T) {
 				baseURL: "https://a.example.com",
 				apiKey:  "key-a",
 				health:  NewEndpointHealthTracker(DefaultErrorBudget, DefaultCooldown),
-				sel:     &selector.Endpoint{Name: "a", Healthy: true},
+				sel:     selector.NewEndpoint("a", "", "key-a", 0, true),
 			},
 			{
 				name:    "b",
 				baseURL: "https://b.example.com",
 				apiKey:  "key-b",
 				health:  NewEndpointHealthTracker(DefaultErrorBudget, DefaultCooldown),
-				sel:     &selector.Endpoint{Name: "b", Healthy: true},
+				sel:     selector.NewEndpoint("b", "", "key-b", 0, true),
 			},
 		},
 	}
@@ -223,13 +223,13 @@ func TestMultiEndpointQuarantineSkips(t *testing.T) {
 				name:    "a",
 				baseURL: "https://a.example.com",
 				health:  healthA,
-				sel:     &selector.Endpoint{Name: "a", Healthy: true},
+				sel:     selector.NewEndpoint("a", "", "", 0, true),
 			},
 			{
 				name:    "b",
 				baseURL: "https://b.example.com",
 				health:  healthB,
-				sel:     &selector.Endpoint{Name: "b", Healthy: true},
+				sel:     selector.NewEndpoint("b", "", "", 0, true),
 			},
 		},
 	}
@@ -256,13 +256,13 @@ func TestMultiEndpointPickExcluding(t *testing.T) {
 				name:    "a",
 				baseURL: "https://a.example.com",
 				health:  NewEndpointHealthTracker(DefaultErrorBudget, DefaultCooldown),
-				sel:     &selector.Endpoint{Name: "a", Healthy: true},
+				sel:     selector.NewEndpoint("a", "", "", 0, true),
 			},
 			{
 				name:    "b",
 				baseURL: "https://b.example.com",
 				health:  NewEndpointHealthTracker(DefaultErrorBudget, DefaultCooldown),
-				sel:     &selector.Endpoint{Name: "b", Healthy: true},
+				sel:     selector.NewEndpoint("b", "", "", 0, true),
 			},
 		},
 	}
@@ -319,13 +319,13 @@ func TestMultiEndpointRetryPicksDifferentEndpoint(t *testing.T) {
 				name:    "a",
 				baseURL: serverA.URL,
 				health:  NewEndpointHealthTracker(ErrorBudget{Count: 10, Window: time.Minute}, 30*time.Second),
-				sel:     &selector.Endpoint{Name: "a", BaseURL: serverA.URL, Healthy: true},
+				sel:     selector.NewEndpoint("a", serverA.URL, "", 0, true),
 			},
 			{
 				name:    "b",
 				baseURL: serverB.URL,
 				health:  NewEndpointHealthTracker(ErrorBudget{Count: 10, Window: time.Minute}, 30*time.Second),
-				sel:     &selector.Endpoint{Name: "b", BaseURL: serverB.URL, Healthy: true},
+				sel:     selector.NewEndpoint("b", serverB.URL, "", 0, true),
 			},
 		},
 	}
@@ -459,7 +459,7 @@ func TestMultiEndpointValidationErrors(t *testing.T) {
 func TestMultiEndpointLatencyEWMAUpdate(t *testing.T) {
 	ep := &providerEndpoint{
 		name: "test",
-		sel:  &selector.Endpoint{Name: "test", Healthy: true},
+		sel:  selector.NewEndpoint("test", "", "", 0, true),
 	}
 
 	// First measurement initializes.

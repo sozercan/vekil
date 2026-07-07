@@ -34,6 +34,19 @@ func (w *Weighted) Pick(endpoints []*Endpoint) (*Endpoint, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// Prune stale entries for endpoints not in the current candidate set.
+	// This prevents accumulated weight from persisting across quarantine
+	// recovery, which could cause traffic bursts.
+	candidateNames := make(map[string]struct{}, len(candidates))
+	for _, ep := range candidates {
+		candidateNames[ep.Name] = struct{}{}
+	}
+	for name := range w.currentWeights {
+		if _, ok := candidateNames[name]; !ok {
+			delete(w.currentWeights, name)
+		}
+	}
+
 	var totalWeight int64
 	for _, ep := range candidates {
 		totalWeight += effectiveWeight(ep)

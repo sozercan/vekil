@@ -271,7 +271,13 @@ func (h *ProxyHandler) doWithRetryMultiEndpoint(provider *providerRuntime, reqFa
 
 // updateEndpointLatencyEWMA updates the EWMA latency on the selector endpoint.
 // Uses a smoothing factor of 0.3 (recent observations have ~30% weight).
-// Safe for concurrent use via atomic load/store on LatencyEWMA.
+//
+// Concurrency note: the load-compute-store sequence is intentionally not
+// linearizable (no CAS loop). Under concurrent updates from parallel requests
+// to the same endpoint, one update may be lost. This is acceptable for a
+// best-effort latency estimate — the EWMA self-corrects over subsequent
+// observations and the slight inaccuracy does not affect correctness of
+// endpoint selection.
 func updateEndpointLatencyEWMA(ep *providerEndpoint, latency time.Duration) {
 	const alpha = 0.3
 	current := ep.sel.LoadLatencyEWMA()

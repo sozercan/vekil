@@ -32,7 +32,7 @@ func (rr *RoundRobin) Pick(endpoints []*Endpoint) (*Endpoint, error) {
 func filterHealthy(endpoints []*Endpoint) []*Endpoint {
 	var out []*Endpoint
 	for _, ep := range endpoints {
-		if ep.Healthy {
+		if ep.IsHealthy() {
 			out = append(out, ep)
 		}
 	}

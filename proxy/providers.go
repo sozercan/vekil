@@ -185,7 +185,7 @@ func (p *providerRuntime) pickEndpoint() *providerEndpoint {
 	// Sync health state into selector endpoints.
 	sels := make([]*selector.Endpoint, len(p.endpoints))
 	for i, ep := range p.endpoints {
-		ep.sel.Healthy = ep.health.IsHealthy()
+		ep.sel.SetHealthy(ep.health.IsHealthy())
 		sels[i] = ep.sel
 	}
 
@@ -888,13 +888,7 @@ func buildProviderEndpoints(providerID string, configs []ProviderEndpointConfig)
 			apiKey:  apiKey,
 			weight:  epCfg.Weight,
 			health:  NewEndpointHealthTracker(budget, cooldown),
-			sel: &selector.Endpoint{
-				Name:    name,
-				BaseURL: baseURL,
-				Key:     apiKey,
-				Weight:  epCfg.Weight,
-				Healthy: true,
-			},
+			sel: selector.NewEndpoint(name, baseURL, apiKey, epCfg.Weight, true),
 		}
 		endpoints = append(endpoints, ep)
 	}

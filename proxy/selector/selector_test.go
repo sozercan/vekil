@@ -8,7 +8,7 @@ import (
 
 // newEndpoint creates an Endpoint with the given latency for test convenience.
 func newEndpoint(name string, healthy bool, latency time.Duration) *Endpoint {
-	ep := &Endpoint{Name: name, Healthy: healthy}
+	ep := NewEndpoint(name, "", "", 0, healthy)
 	ep.SetLatencyEWMA(latency)
 	return ep
 }
@@ -16,9 +16,9 @@ func newEndpoint(name string, healthy bool, latency time.Duration) *Endpoint {
 func TestRoundRobinBasic(t *testing.T) {
 	rr := NewRoundRobin()
 	eps := []*Endpoint{
-		{Name: "a", Healthy: true},
-		{Name: "b", Healthy: true},
-		{Name: "c", Healthy: true},
+		NewEndpoint("a", "", "", 0, true),
+		NewEndpoint("b", "", "", 0, true),
+		NewEndpoint("c", "", "", 0, true),
 	}
 
 	// Should cycle through a, b, c, a, b, c...
@@ -41,9 +41,9 @@ func TestRoundRobinBasic(t *testing.T) {
 func TestRoundRobinSkipsUnhealthy(t *testing.T) {
 	rr := NewRoundRobin()
 	eps := []*Endpoint{
-		{Name: "a", Healthy: false},
-		{Name: "b", Healthy: true},
-		{Name: "c", Healthy: true},
+		NewEndpoint("a", "", "", 0, false),
+		NewEndpoint("b", "", "", 0, true),
+		NewEndpoint("c", "", "", 0, true),
 	}
 
 	for range 4 {
@@ -60,8 +60,8 @@ func TestRoundRobinSkipsUnhealthy(t *testing.T) {
 func TestRoundRobinFallsBackWhenAllUnhealthy(t *testing.T) {
 	rr := NewRoundRobin()
 	eps := []*Endpoint{
-		{Name: "a", Healthy: false},
-		{Name: "b", Healthy: false},
+		NewEndpoint("a", "", "", 0, false),
+		NewEndpoint("b", "", "", 0, false),
 	}
 
 	ep, err := rr.Pick(eps)
@@ -75,7 +75,7 @@ func TestRoundRobinFallsBackWhenAllUnhealthy(t *testing.T) {
 
 func TestRoundRobinSingleEndpoint(t *testing.T) {
 	rr := NewRoundRobin()
-	eps := []*Endpoint{{Name: "only", Healthy: true}}
+	eps := []*Endpoint{NewEndpoint("only", "", "", 0, true)}
 
 	for range 5 {
 		ep, err := rr.Pick(eps)
@@ -99,8 +99,8 @@ func TestRoundRobinEmpty(t *testing.T) {
 func TestWeightedDistribution(t *testing.T) {
 	w := NewWeighted()
 	eps := []*Endpoint{
-		{Name: "heavy", Weight: 2, Healthy: true},
-		{Name: "light", Weight: 1, Healthy: true},
+		NewEndpoint("heavy", "", "", 2, true),
+		NewEndpoint("light", "", "", 1, true),
 	}
 
 	counts := map[string]int{}
@@ -123,8 +123,8 @@ func TestWeightedDistribution(t *testing.T) {
 func TestWeightedZeroWeight(t *testing.T) {
 	w := NewWeighted()
 	eps := []*Endpoint{
-		{Name: "a", Weight: 0, Healthy: true},
-		{Name: "b", Weight: 0, Healthy: true},
+		NewEndpoint("a", "", "", 0, true),
+		NewEndpoint("b", "", "", 0, true),
 	}
 
 	// Zero weight should be treated as 1 (equal distribution).
@@ -144,8 +144,8 @@ func TestWeightedZeroWeight(t *testing.T) {
 func TestWeightedSkipsUnhealthy(t *testing.T) {
 	w := NewWeighted()
 	eps := []*Endpoint{
-		{Name: "a", Weight: 5, Healthy: false},
-		{Name: "b", Weight: 1, Healthy: true},
+		NewEndpoint("a", "", "", 5, false),
+		NewEndpoint("b", "", "", 1, true),
 	}
 
 	for range 5 {

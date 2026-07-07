@@ -13,15 +13,27 @@ var ErrNoEndpoints = errors.New("no endpoints available")
 
 // Endpoint represents a single upstream target within a provider. The Healthy
 // flag is maintained externally by the health tracker and read by selectors at
-// pick time. LatencyEWMA is updated atomically via accessor methods.
+// pick time via atomic accessors. LatencyEWMA is updated atomically via
+// accessor methods.
 type Endpoint struct {
 	Name    string
 	BaseURL string
 	Key     string
 	Weight  uint
-	Healthy bool
+	// healthy is accessed atomically; use SetHealthy/IsHealthy.
+	healthy atomic.Bool
 	// latencyEWMA stores the EWMA as int64 nanoseconds for atomic access.
 	latencyEWMA atomic.Int64
+}
+
+// SetHealthy updates the health status atomically, safe for concurrent use.
+func (e *Endpoint) SetHealthy(healthy bool) {
+	e.healthy.Store(healthy)
+}
+
+// IsHealthy returns the current health status atomically, safe for concurrent use.
+func (e *Endpoint) IsHealthy() bool {
+	return e.healthy.Load()
 }
 
 // LoadLatencyEWMA returns the current EWMA latency, safe for concurrent use.
@@ -47,6 +59,19 @@ type Selector interface {
 	// both healthy and unhealthy endpoints; implementations should prefer
 	// healthy ones but may fall back to unhealthy if none are healthy.
 	Pick(endpoints []*Endpoint) (*Endpoint, error)
+}
+
+// NewEndpoint creates an Endpoint with the given fields and initial healthy state.
+// Use this instead of struct literals since the healthy field is atomic.
+func NewEndpoint(name, baseURL, key string, weight uint, healthy bool) *Endpoint {
+	ep := &Endpoint{
+		Name:    name,
+		BaseURL: baseURL,
+		Key:     key,
+		Weight:  weight,
+	}
+	ep.healthy.Store(healthy)
+	return ep
 }
 
 // New creates a Selector by name. Known names: "round_robin" (default),
