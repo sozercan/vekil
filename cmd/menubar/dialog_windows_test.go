@@ -59,6 +59,13 @@ func TestEscapePowerShellString(t *testing.T) {
 		{"no quotes", "hello world", "hello world"},
 		{"single quote", "it's", "it''s"},
 		{"multiple quotes", "can't won't", "can''t won''t"},
+		{"strips newline", "line1\nline2", "line1line2"},
+		{"strips carriage return", "line1\r\nline2", "line1line2"},
+		{"strips tab", "col1\tcol2", "col1col2"},
+		{"strips null byte", "before\x00after", "beforeafter"},
+		{"strips mixed control chars", "a\x01b\x1fc", "abc"},
+		{"strips DEL", "test\x7fvalue", "testvalue"},
+		{"quotes and control chars", "it's\nnew", "it''snew"},
 	}
 
 	for _, tc := range tests {
@@ -88,11 +95,9 @@ func TestChooseProvidersConfigPathCanceled(t *testing.T) {
 func restoreDialogHooks(t *testing.T) {
 	t.Helper()
 
-	oldLookPath := execLookPath
 	oldCommand := execCommand
 
 	t.Cleanup(func() {
-		execLookPath = oldLookPath
 		execCommand = oldCommand
 	})
 }

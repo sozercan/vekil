@@ -7,10 +7,7 @@ import (
 	"strings"
 )
 
-var (
-	execLookPath = exec.LookPath
-	execCommand  = exec.Command
-)
+var execCommand = exec.Command
 
 // showOsascriptDialog displays a dialog using PowerShell and returns the button
 // the user clicked. If no dialog mechanism is available, defaultButton is
@@ -79,9 +76,10 @@ func copyToClipboard(text string) {
 	_ = cmd.Run()
 }
 
-// openURL opens a URL in the default browser using cmd /c start.
+// openURL opens a URL in the default browser using rundll32, avoiding cmd.exe
+// shell parsing which could interpret metacharacters in the URL.
 func openURL(url string) {
-	_ = execCommand("cmd", "/c", "start", "", url).Start()
+	_ = execCommand("rundll32", "url.dll,FileProtocolHandler", url).Start()
 }
 
 // showNotification displays a Windows notification using PowerShell.
@@ -100,8 +98,23 @@ func showNotification(title, message string) {
 	_ = execCommand("powershell", "-NoProfile", "-NonInteractive", "-Command", script).Run()
 }
 
-// escapePowerShellString escapes single quotes for use inside PowerShell
-// single-quoted string literals.
+// escapePowerShellString escapes a string for safe use inside PowerShell
+// single-quoted string literals. It strips control characters (which could
+// break argument parsing at the Windows command-line layer) and doubles
+// single quotes per PowerShell's escaping rules.
 func escapePowerShellString(s string) string {
-	return strings.ReplaceAll(s, "'", "''")
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		// Strip control characters (including \r, \n, \t, \x00, etc.)
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		if r == '\'' {
+			b.WriteString("''")
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }

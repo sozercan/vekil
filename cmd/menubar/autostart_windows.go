@@ -40,7 +40,10 @@ func removeLaunchAgent() error {
 	k, err := registry.OpenKey(registry.CURRENT_USER, autostartRegistryKey, registry.SET_VALUE)
 	if err != nil {
 		// If the key doesn't exist, nothing to remove.
-		return nil
+		if err == registry.ErrNotExist {
+			return nil
+		}
+		return err
 	}
 	defer k.Close()
 
