@@ -150,7 +150,7 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		}
 
 		if !retryable(resp.StatusCode) {
-			if resp.StatusCode < http.StatusInternalServerError && resp.StatusCode != http.StatusTooManyRequests {
+			if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 				recordEndpointSuccess(attemptEndpoint, time.Since(attemptStart))
 			}
 			return resp, nil

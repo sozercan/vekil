@@ -655,8 +655,14 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		}
 		runtime.baseURL = baseURL
 		runtime.apiVersion = strings.TrimSpace(cfg.APIVersion)
-		if runtime.apiVersion == "" && (baseURL == "" || baseKind != azureBaseURLKindOpenAIV1) {
-			return nil, fmt.Errorf("provider %q api_version is required for Azure base_url %q unless the path ends in /openai/v1", id, baseURL)
+		if runtime.apiVersion == "" {
+			if baseURL != "" {
+				if baseKind != azureBaseURLKindOpenAIV1 {
+					return nil, fmt.Errorf("provider %q api_version is required for Azure base_url %q unless the path ends in /openai/v1", id, baseURL)
+				}
+			} else if !azureEndpointConfigsAllOpenAIV1(cfg.Endpoints) {
+				return nil, fmt.Errorf("provider %q api_version is required unless every endpoint base_url ends in /openai/v1", id)
+			}
 		}
 
 		authMode := providerAuthMode(strings.TrimSpace(cfg.AuthMode))
@@ -843,7 +849,7 @@ func configuredGenericProviderAuth(cfg ProviderConfig) (providerAuthType, string
 
 	authType := providerAuthType(strings.TrimSpace(cfg.AuthType))
 	if authType == "" {
-		if apiKey == "" {
+		if apiKey == "" && !providerConfigHasEndpointCredentials(cfg) {
 			authType = providerAuthTypeNone
 		} else {
 			authType = providerAuthTypeBearer
@@ -1299,11 +1305,17 @@ func azureClassicOpenAIBaseURL(baseURL string, baseKind azureBaseURLKind) string
 }
 
 func providerUsesAzureClassicDeploymentPath(provider *providerRuntime, endpoint string) bool {
+	return providerUsesAzureClassicDeploymentPathForEndpoint(provider, nil, endpoint)
+}
+
+func providerUsesAzureClassicDeploymentPathForEndpoint(provider *providerRuntime, selectedEndpoint *providerEndpointRuntime, endpoint string) bool {
 	if provider == nil || provider.kind != providerTypeAzureOpenAI || endpoint != providerEndpointChatCompletions {
 		return false
 	}
 	baseURL := provider.baseURL
-	if baseURL == "" && len(provider.endpoints) > 0 && provider.endpoints[0] != nil {
+	if selectedEndpoint != nil && strings.TrimSpace(selectedEndpoint.endpoint.BaseURL) != "" {
+		baseURL = selectedEndpoint.endpoint.BaseURL
+	} else if baseURL == "" && len(provider.endpoints) > 0 && provider.endpoints[0] != nil {
 		baseURL = provider.endpoints[0].endpoint.BaseURL
 	}
 	baseKind := classifyAzureBaseURL(baseURL)
@@ -1509,6 +1521,17 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 		return nil, err
 	}
 	ctx = contextWithProviderEndpoint(ctx, selectedEndpoint)
+
+	if len(body) > 0 && provider != nil && provider.kind == providerTypeAzureOpenAI && len(provider.endpoints) > 0 && len(owners) > 0 {
+		owner := owners[0]
+		if !providerUsesAzureClassicDeploymentPathForEndpoint(provider, selectedEndpoint, path) {
+			var rewriteErr error
+			body, _, rewriteErr = rewriteRequestModelForProvider(body, owner.upstreamModel)
+			if rewriteErr != nil {
+				return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: rewriteErr}
+			}
+		}
+	}
 
 	var bodyReader io.Reader
 	if len(body) > 0 {
@@ -2531,4 +2554,38 @@ func providerEndpointNameFromContext(ctx context.Context) string {
 		return ""
 	}
 	return endpoint.endpoint.Name
+}
+
+func providerConfigHasEndpointCredentials(cfg ProviderConfig) bool {
+	for _, endpoint := range cfg.Endpoints {
+		if strings.TrimSpace(endpoint.APIKey) != "" || strings.TrimSpace(endpoint.APIKeyEnv) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func azureEndpointConfigsAllOpenAIV1(endpoints []ProviderEndpointConfig) bool {
+	if len(endpoints) == 0 {
+		return false
+	}
+	for _, endpoint := range endpoints {
+		baseURL := strings.TrimRight(strings.TrimSpace(endpoint.BaseURL), "/")
+		if baseURL == "" || classifyAzureBaseURL(baseURL) != azureBaseURLKindOpenAIV1 {
+			return false
+		}
+	}
+	return true
+}
+
+func providerHasEndpointCredentials(provider *providerRuntime) bool {
+	if provider == nil {
+		return false
+	}
+	for _, endpoint := range provider.endpoints {
+		if endpoint != nil && strings.TrimSpace(endpoint.apiKey) != "" {
+			return true
+		}
+	}
+	return false
 }

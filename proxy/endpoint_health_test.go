@@ -44,3 +44,15 @@ func TestEndpointHealthQuarantineAndRelease(t *testing.T) {
 		t.Fatalf("latency = %v, want 100ms", got)
 	}
 }
+
+func TestEndpointHealthSuccessDoesNotClearActiveQuarantine(t *testing.T) {
+	tracker := newEndpointHealthTracker(endpointHealthConfig{errorBudget: endpointErrorBudget{Limit: 1, Window: time.Minute}, cooldown: time.Hour})
+	now := time.Now()
+	if quarantined := tracker.recordFailure(now); !quarantined {
+		t.Fatal("failure should quarantine")
+	}
+	tracker.recordSuccess(10 * time.Millisecond)
+	if tracker.healthy(now.Add(time.Second)) {
+		t.Fatal("success while cooldown is active should not clear quarantine")
+	}
+}

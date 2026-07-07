@@ -122,7 +122,7 @@ JSON configs use the same snake_case field names as YAML.
 
 ### Multi-Endpoint Load Balancing
 
-A provider can declare `endpoints: [...]` instead of a single `base_url`/key pair. Vekil picks a healthy endpoint for each upstream attempt, retries retryable failures (`429`, `5xx`, and transient transport errors) against another healthy endpoint of the same provider, and quarantines endpoints whose error budget is exhausted. Single-endpoint provider configs continue to behave as before.
+A provider can declare `endpoints: [...]` instead of a single `base_url`/key pair. Vekil picks a healthy endpoint for each upstream attempt, records retryable failures (`429`, `5xx`, and transient transport errors), and quarantines endpoints whose error budget is exhausted so later attempts can move to remaining healthy endpoints. Single-endpoint provider configs continue to behave as before.
 
 Selector strategies:
 

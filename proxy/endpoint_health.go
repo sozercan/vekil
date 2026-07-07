@@ -93,12 +93,16 @@ func (h *endpointHealthTracker) recordSuccess(latency time.Duration) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.failures = nil
-	h.quarantinedUntil = time.Time{}
+	if !h.quarantinedUntil.IsZero() {
+		if time.Now().Before(h.quarantinedUntil) {
+			return
+		}
+		h.quarantinedUntil = time.Time{}
+	}
 	if latency <= 0 {
 		return
 	}
-	if h.latencyEWMA <= 0 {
+	if h.latencyEWMA <= 0 || h.latencyEWMA > time.Minute {
 		h.latencyEWMA = latency
 		return
 	}
@@ -119,6 +123,9 @@ func (h *endpointHealthTracker) recordFailure(now time.Time) bool {
 		}
 	}
 	h.failures = append(kept, now)
+	if h.latencyEWMA == 0 {
+		h.latencyEWMA = time.Hour
+	}
 	if len(h.failures) >= h.cfg.errorBudget.Limit {
 		h.quarantinedUntil = now.Add(h.cfg.cooldown)
 		h.failures = nil

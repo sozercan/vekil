@@ -44,7 +44,7 @@ func (s *RoundRobin) Pick(endpoints []*Endpoint) (*Endpoint, error) {
 
 type Weighted struct {
 	mu   sync.Mutex
-	next int
+	next uint64
 }
 
 func NewWeighted() *Weighted { return &Weighted{} }
@@ -54,21 +54,30 @@ func (s *Weighted) Pick(endpoints []*Endpoint) (*Endpoint, error) {
 	if len(healthy) == 0 {
 		return nil, ErrNoHealthyEndpoints
 	}
-	weighted := make([]*Endpoint, 0, len(healthy))
+	var total uint64
 	for _, endpoint := range healthy {
-		weight := endpoint.Weight
+		weight := uint64(endpoint.Weight)
 		if weight == 0 {
 			weight = 1
 		}
-		for range weight {
-			weighted = append(weighted, endpoint)
-		}
+		total += weight
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	idx := s.next % len(weighted)
-	s.next = (s.next + 1) % len(weighted)
-	return weighted[idx], nil
+	pick := s.next % total
+	s.next = (s.next + 1) % total
+	s.mu.Unlock()
+	var cumulative uint64
+	for _, endpoint := range healthy {
+		weight := uint64(endpoint.Weight)
+		if weight == 0 {
+			weight = 1
+		}
+		cumulative += weight
+		if pick < cumulative {
+			return endpoint, nil
+		}
+	}
+	return healthy[len(healthy)-1], nil
 }
 
 type LeastLatency struct{}
@@ -83,8 +92,10 @@ func (s *LeastLatency) Pick(endpoints []*Endpoint) (*Endpoint, error) {
 	best := healthy[0]
 	for _, candidate := range healthy[1:] {
 		switch {
-		case best.LatencyEWMA == 0 && candidate.LatencyEWMA != 0:
-			// Keep never-used endpoints ahead of known-latency endpoints so they get probes.
+		case best.LatencyEWMA == 0:
+			// Keep the earliest never-used endpoint ahead of known-latency endpoints
+			// and other never-used endpoints so retries can deprioritize it after a
+			// failure via the endpoint health tracker.
 			continue
 		case candidate.LatencyEWMA == 0:
 			best = candidate

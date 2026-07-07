@@ -168,11 +168,13 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 	}
 
 	rewrittenBody := body
-	if !providerUsesAzureClassicDeploymentPath(provider, endpoint) {
-		var err error
-		rewrittenBody, _, err = rewriteRequestModelForProvider(body, owner.upstreamModel)
-		if err != nil {
-			return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+	if !(provider.kind == providerTypeAzureOpenAI && len(provider.endpoints) > 0) {
+		if !providerUsesAzureClassicDeploymentPath(provider, endpoint) {
+			var err error
+			rewrittenBody, _, err = rewriteRequestModelForProvider(body, owner.upstreamModel)
+			if err != nil {
+				return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+			}
 		}
 	}
 	rewrittenBody = applyProviderModelRequestPolicy(rewrittenBody, owner)
