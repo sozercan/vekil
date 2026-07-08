@@ -377,7 +377,12 @@ func (h *ProxyHandler) resendChatCompletionsForLoop(ctx context.Context, baseFie
 // message list, dropping stream bookkeeping so injectForceStream can set it
 // cleanly.
 func encodeChatRequestForLoop(baseFields map[string]json.RawMessage, messages []models.OpenAIMessage) ([]byte, error) {
-	fields := make(map[string]json.RawMessage, len(baseFields)+1)
+	// Capacity hint only: baseFields already contains the "messages" key (it is
+	// read in decodeChatRequestForLoop), so the loop below overwrites rather than
+	// grows the map — len(baseFields) is the exact final size. Avoid arithmetic on
+	// a length derived from the untrusted request body so the size computation
+	// cannot overflow (CWE-190).
+	fields := make(map[string]json.RawMessage, len(baseFields))
 	for key, value := range baseFields {
 		fields[key] = value
 	}
