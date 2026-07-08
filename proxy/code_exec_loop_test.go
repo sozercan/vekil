@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -237,6 +238,41 @@ func TestCodeExecLoop_MultiStep(t *testing.T) {
 	}
 }
 
+// TestCodeExecLoop_InternalTurnUsageMetered verifies token usage from internal
+// (non-final) loop turns is accumulated as additive internal usage rather than
+// dropped. The final turn's own usage is metered separately by the handler via
+// observeOpenAIUsage, so only the initial + intermediate turns land here.
+func TestCodeExecLoop_InternalTurnUsageMetered(t *testing.T) {
+	backend := &scriptedBackend{
+		results: []CodeExecResult{
+			{Command: "step1", ExitCode: 0, Stdout: "one"},
+			{Command: "step2", ExitCode: 0, Stdout: "two"},
+		},
+	}
+	// Two internal turns (initial + one follow-up owned call), then a final turn.
+	// Each SSE response reports usage of prompt=5, completion=5.
+	upstream, _ := scriptedUpstream(t,
+		sseToolCallResponse("toolu_2", "Bash", `{"command":"step2"}`),
+		sseFinalTextResponse("done"),
+	)
+	h := newCodeExecLoopHandler(t, backend, upstream)
+
+	ctx, summary := WithRequestSummary(context.Background())
+	initial := aggregateInitial(t, sseToolCallResponse("toolu_1", "Bash", `{"command":"step1"}`))
+
+	if _, err := h.runCodeExecLoop(ctx, requestBodyWithBashResult(), initial); err != nil {
+		t.Fatalf("runCodeExecLoop error = %v", err)
+	}
+
+	// Two internal turns each contributed prompt=5, completion=5.
+	if summary.extraPromptTokens != 10 {
+		t.Errorf("internal prompt tokens = %d, want 10 (2 internal turns × 5)", summary.extraPromptTokens)
+	}
+	if summary.extraCompletionTokens != 10 {
+		t.Errorf("internal completion tokens = %d, want 10 (2 internal turns × 5)", summary.extraCompletionTokens)
+	}
+}
+
 func TestCodeExecLoop_MaxDepthEnforced(t *testing.T) {
 	backend := &scriptedBackend{fallback: CodeExecResult{Command: "loop", ExitCode: 0}}
 	// Upstream always returns another owned tool call → never terminates.
@@ -364,5 +400,76 @@ func TestClassifyOwnedToolCalls(t *testing.T) {
 	}
 	if len(unowned) != 1 {
 		t.Errorf("unowned = %d, want 1", len(unowned))
+	}
+}
+
+// multiChoiceResponse builds an n>1 response where the owned tool call sits in a
+// choice other than index 0. Choices[0] carries only an unowned call.
+func multiChoiceResponse(ownedName string) *models.OpenAIResponse {
+	return &models.OpenAIResponse{
+		Choices: []models.OpenAIChoice{
+			{
+				Index: 0,
+				Message: models.OpenAIMessage{
+					Role:      "assistant",
+					ToolCalls: []models.OpenAIToolCall{{ID: "u1", Function: models.OpenAIFunctionCall{Name: "WebSearch", Arguments: `{"query":"x"}`}}},
+				},
+			},
+			{
+				Index: 1,
+				Message: models.OpenAIMessage{
+					Role:      "assistant",
+					ToolCalls: []models.OpenAIToolCall{{ID: "toolu_owned", Function: models.OpenAIFunctionCall{Name: ownedName, Arguments: `{"command":"pytest"}`}}},
+				},
+			},
+		},
+	}
+}
+
+// TestClassifyOwnedToolCalls_ScansAllChoices guards the core invariant: an owned
+// tool call in a choice other than index 0 must still be detected. Missing it
+// would let responseHasOwnedToolCall report "no owned call" and forward the owned
+// call to the client.
+func TestClassifyOwnedToolCalls_ScansAllChoices(t *testing.T) {
+	cfg := CodeExecConfig{Enabled: true, OwnedTools: []string{"Bash"}}.withDefaults()
+	owned, unowned := classifyOwnedToolCalls(multiChoiceResponse("Bash"), cfg)
+	if len(owned) != 1 {
+		t.Fatalf("owned = %d, want 1 (owned call in Choices[1] must be detected)", len(owned))
+	}
+	if owned[0].ID != "toolu_owned" {
+		t.Errorf("owned call id = %q, want toolu_owned", owned[0].ID)
+	}
+	if len(unowned) != 1 {
+		t.Errorf("unowned = %d, want 1", len(unowned))
+	}
+}
+
+// TestResponseHasOwnedToolCall_MultiChoice verifies the interception gate sees an
+// owned call sitting outside Choices[0] in a multi-choice response.
+func TestResponseHasOwnedToolCall_MultiChoice(t *testing.T) {
+	h := newCodeExecLoopHandler(t, &scriptedBackend{}, func(http.ResponseWriter, *http.Request) {})
+	if !h.responseHasOwnedToolCall(multiChoiceResponse("Bash")) {
+		t.Fatal("responseHasOwnedToolCall = false, want true for owned call in Choices[1]")
+	}
+}
+
+// TestCodeExecLoop_MultiChoiceOwnedCallFailsClosed verifies the loop fails closed
+// (rather than executing or forwarding) when an owned call appears in a
+// multi-choice (n>1) response — the owned call must never leak to the client.
+func TestCodeExecLoop_MultiChoiceOwnedCallFailsClosed(t *testing.T) {
+	backend := &scriptedBackend{}
+	h := newCodeExecLoopHandler(t, backend, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("upstream should not be called for a multi-choice owned response")
+	})
+
+	_, err := h.runCodeExecLoop(context.Background(), requestBodyWithBashResult(), multiChoiceResponse("Bash"))
+	if err == nil {
+		t.Fatal("runCodeExecLoop error = nil, want multi-choice error")
+	}
+	if !errors.Is(err, errCodeExecMultiChoice) {
+		t.Errorf("error = %v, want errCodeExecMultiChoice", err)
+	}
+	if len(backend.requests()) != 0 {
+		t.Errorf("backend was invoked for a multi-choice owned response (%d calls); owned call must not execute", len(backend.requests()))
 	}
 }

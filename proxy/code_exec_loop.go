@@ -31,6 +31,12 @@ var (
 	// errCodeExecMissingCommand is returned when an owned tool call carries no
 	// extractable command argument.
 	errCodeExecMissingCommand = errors.New("code exec: owned tool call has no command argument")
+	// errCodeExecMultiChoice is returned when a response carrying an owned tool
+	// call has more than one choice. The internal loop models a single assistant
+	// message per turn, so an n>1 response cannot be represented without dropping
+	// or duplicating choices; forwarding it could leak an owned call sitting in a
+	// choice the loop does not process, so the loop fails closed.
+	errCodeExecMultiChoice = errors.New("code exec: owned tool call in multi-choice (n>1) response")
 )
 
 // codeExecActive reports whether proxy-mediated code execution is enabled and
@@ -86,9 +92,12 @@ func newCodeExecBackend(name string) (CodeExecutionBackend, error) {
 	}
 }
 
-// responseHasOwnedToolCall reports whether the first choice of resp contains a
-// tool call for a configured owned tool. This is the gate the chat handler uses
-// to decide whether to divert a buffered response into the execution loop.
+// responseHasOwnedToolCall reports whether resp contains a tool call for a
+// configured owned tool in any of its choices. This is the gate the chat
+// handler uses to decide whether to divert a buffered response into the
+// execution loop. Every choice is inspected — not just Choices[0] — so an owned
+// call in a secondary choice of a multi-choice (n>1) response cannot slip past
+// the gate and be forwarded to the client.
 func (h *ProxyHandler) responseHasOwnedToolCall(resp *models.OpenAIResponse) bool {
 	if !h.codeExecActive() || resp == nil {
 		return false
@@ -111,19 +120,24 @@ func (h *ProxyHandler) maybeInterceptCodeExec(ctx context.Context, requestBody [
 	return h.runCodeExecLoop(ctx, requestBody, oaiResp)
 }
 
-// classifyOwnedToolCalls splits the first choice's tool calls into owned and
-// unowned sets. Only the first choice is considered: tool-calling responses
-// carry their calls on choice 0, which is also the single assistant message the
-// force-stream aggregator produces.
+// classifyOwnedToolCalls splits the tool calls across every choice into owned
+// and unowned sets. All choices are inspected — not just Choices[0] — so an
+// owned tool call in a secondary choice of a multi-choice (n>1) response is
+// never overlooked. Overlooking it would let the gate report "no owned call"
+// and forward the owned call to the client, violating the core invariant. The
+// loop still fails closed on n>1 before executing (see runCodeExecLoop); this
+// function's job is detection, so it must see every call.
 func classifyOwnedToolCalls(resp *models.OpenAIResponse, cfg CodeExecConfig) (owned, unowned []models.OpenAIToolCall) {
-	if resp == nil || len(resp.Choices) == 0 {
+	if resp == nil {
 		return nil, nil
 	}
-	for _, call := range resp.Choices[0].Message.ToolCalls {
-		if cfg.ownsTool(call.Function.Name) {
-			owned = append(owned, call)
-		} else {
-			unowned = append(unowned, call)
+	for i := range resp.Choices {
+		for _, call := range resp.Choices[i].Message.ToolCalls {
+			if cfg.ownsTool(call.Function.Name) {
+				owned = append(owned, call)
+			} else {
+				unowned = append(unowned, call)
+			}
 		}
 	}
 	return owned, unowned
@@ -166,11 +180,25 @@ func (h *ProxyHandler) runCodeExecLoop(ctx context.Context, requestBody []byte, 
 			// (Any unowned tool calls are forwarded unchanged as normal.)
 			return current, nil
 		}
+		if len(current.Choices) > 1 {
+			// An owned call in a multi-choice (n>1) response cannot be handled by
+			// the single-assistant-message internal loop without dropping or
+			// duplicating choices. Forwarding it could leak an owned call in a
+			// choice the loop does not process, so fail closed.
+			return nil, errCodeExecMultiChoice
+		}
 		if len(unowned) > 0 {
 			// Mixed ownership is unsupported for the MVP. Forwarding would leak the
 			// owned call, so fail closed.
 			return nil, errCodeExecMixedTools
 		}
+
+		// This turn is consumed internally: its response never reaches the client,
+		// so its usage would otherwise be dropped from metrics/billing. Account it
+		// as additive internal usage. This covers the initial turn (first iteration)
+		// and every intermediate turn; the final, client-visible turn is metered
+		// normally by the handler via observeOpenAIUsage.
+		observeInternalOpenAIUsage(ctx, current.Usage)
 
 		assistantMessage := current.Choices[0].Message
 		messages = append(messages, assistantMessage)
@@ -197,6 +225,15 @@ func (h *ProxyHandler) runCodeExecLoop(ctx context.Context, requestBody []byte, 
 // through the backend under the given policy, and returns an OpenAI tool-result
 // message carrying the structured result. Audit logging records each command
 // before execution.
+//
+// Backend execution is detached from the inbound request context with
+// context.WithoutCancel so a client disconnect does not cancel a command
+// mid-loop. This matches the follow-up upstream turns (which run under a
+// background-rooted context via newInferenceUpstreamContextFrom): both halves of
+// an internal turn now complete regardless of client disconnect rather than the
+// command being killed while the upstream call would have continued. The
+// per-command policy timeout still bounds execution — the backend applies it
+// internally — so detaching does not remove the wall-clock limit.
 func (h *ProxyHandler) executeOwnedToolCall(ctx context.Context, call models.OpenAIToolCall, policy CodeExecPolicy) (models.OpenAIMessage, error) {
 	command, ok := extractCommandArgument(call.Function.Arguments)
 	if !ok {
@@ -212,7 +249,8 @@ func (h *ProxyHandler) executeOwnedToolCall(ctx context.Context, call models.Ope
 		)
 	}
 
-	result, err := h.codeExecBackend.RunCommand(ctx, CodeExecRequest{
+	execCtx := context.WithoutCancel(ctx)
+	result, err := h.codeExecBackend.RunCommand(execCtx, CodeExecRequest{
 		ToolUseID: call.ID,
 		ToolName:  call.Function.Name,
 		Command:   command,

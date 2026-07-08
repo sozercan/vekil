@@ -188,6 +188,22 @@ func observeInternalResponsesUsage(ctx context.Context, usage responsesUsage) {
 	}
 }
 
+// observeInternalOpenAIUsage accumulates out-of-band OpenAI chat token spend
+// from an internal turn onto the request summary attached to ctx, if any. The
+// proxy-mediated code-execution loop makes real upstream calls for its initial
+// and intermediate turns whose responses are consumed internally and never
+// become the client-visible response; without this, only the final turn's usage
+// would be counted. It is additive, so it survives the final turn's
+// setOpenAIUsage overwrite (mirroring observeInternalResponsesUsage).
+func observeInternalOpenAIUsage(ctx context.Context, usage *models.OpenAIUsage) {
+	if usage == nil {
+		return
+	}
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		summary.addInternalUsage(usage.PromptTokens, usage.CompletionTokens)
+	}
+}
+
 // LoggerFields returns the structured fields populated for this request.
 func (s *RequestSummary) LoggerFields() []logger.Field {
 	if s == nil {

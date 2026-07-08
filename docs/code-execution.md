@@ -113,14 +113,23 @@ A command that runs but exits non-zero is reported through `exit_code`, not as a
 
 - Model-generated code has no implicit access to Vekil's process credentials or environment (empty environment unless allowlisted).
 - No implicit access to the full host filesystem: an explicit working directory is required.
-- Every executed command is audit-logged before execution, along with its exit code, timeout status, and duration.
+- Every executed command is audit-logged before execution, along with its exit code, timeout status, and duration. The **full command string is logged verbatim at `Info` level** (which is on by default when the feature is enabled), so model-generated commands — including any arguments they contain, such as tokens or paths — appear in the proxy logs. Operators who route sensitive arguments through executed commands should account for this in their log handling.
 - Code execution is never auto-enabled; it requires an explicit opt-in.
+
+## Loop and cancellation semantics
+
+Once an owned tool call is intercepted, the internal model/tool loop is designed to run to completion independently of the client connection:
+
+- **Owned-tool detection spans all choices.** Every choice of the buffered response is inspected for owned tool calls, not just the first. If an owned call appears in a multi-choice (`n>1`) response the loop **fails closed** (it cannot represent multiple assistant messages in the single internal transcript), so an owned call in a secondary choice is never forwarded to the client.
+- **Internal turns are disconnect-resilient.** Both halves of an internal turn — backend command execution and the follow-up upstream model call — run under a context detached from the inbound request, so a client disconnect does not cancel a command mid-loop or abort an in-flight upstream turn. The per-command policy timeout still bounds execution.
+- **Internal turn usage is metered.** The initial and intermediate turns make real upstream calls; their token usage is accumulated as additive internal usage so it is not dropped from metrics/billing when only the final turn's usage is reported to the client.
 
 ## Limitations (MVP)
 
 - **Buffered / non-streaming only.** Interception runs on the aggregated (force-streamed then buffered) chat path. Client-requested streaming responses are not intercepted, so an owned tool call in a streamed response is forwarded normally. Streaming support would require synthesizing a final-only stream or careful SSE rewriting.
 - **Single-request scope.** The hidden transcript that carries the internal model/tool loop lives only for the duration of one proxied request. There is no persistent shadow transcript across client turns.
 - **No mixed ownership after execution starts.** If a response mixes owned and unowned tool calls, the loop fails closed rather than leak the owned call. A response with only unowned tool calls is forwarded unchanged.
+- **Single choice only.** If an owned tool call appears in a multi-choice (`n>1`) response, the loop fails closed. The internal transcript models one assistant message per turn, so multiple choices cannot be executed without dropping or duplicating a choice (which could leak an owned call).
 - **Depth bound.** The internal loop is capped by `VEKIL_CODE_EXEC_MAX_LOOP_DEPTH`; exceeding it fails closed.
 - **No local workspace mutation guarantees.** Execution is treated as isolated; results are returned as structured outputs rather than assumed to mutate the user's local project.
 
