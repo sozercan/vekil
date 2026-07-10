@@ -21,6 +21,31 @@ func decodeContentParts(t *testing.T, raw json.RawMessage) []models.OpenAIConten
 	return parts
 }
 
+func TestNormalizeModelName(t *testing.T) {
+	tests := []struct {
+		name  string
+		model string
+		want  string
+	}{
+		{name: "generic numeric suffix", model: "claude-opus-4-8", want: "claude-opus-4.8"},
+		{name: "dated generic numeric suffix", model: "claude-opus-4-8-20260701", want: "claude-opus-4.8"},
+		{name: "preserves non-version hyphens", model: "claude-super-long-opus-4-8", want: "claude-super-long-opus-4.8"},
+		{name: "existing alias", model: "claude-sonnet-4-6", want: "claude-sonnet-4.6"},
+		{name: "existing dotted version", model: "claude-opus-4.8", want: "claude-opus-4.8"},
+		{name: "non-Claude numeric suffix", model: "gpt-4-8", want: "gpt-4-8"},
+		{name: "non-version Claude hyphens", model: "claude-3-opus", want: "claude-3-opus"},
+		{name: "dated integer version", model: "claude-sonnet-4-20250514", want: "claude-sonnet-4"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := NormalizeModelName(tt.model); got != tt.want {
+				t.Fatalf("NormalizeModelName(%q) = %q, want %q", tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestTranslateAnthropicToOpenAI(t *testing.T) {
 	t.Run("simple text message", func(t *testing.T) {
 		req := &models.AnthropicRequest{

@@ -156,7 +156,12 @@ func streamOpenAIPassthrough(
 	transformData openAIStreamDataTransformer,
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
-	defer func() { _ = body.Close() }()
+	bodyHandled := false
+	defer func() {
+		if !bodyHandled {
+			_ = body.Close()
+		}
+	}()
 	setSSEHeaders(w)
 	// This is a streamed SSE response, so any upstream Content-Length copied by
 	// the caller (via copyPassthroughHeaders) is wrong — and definitely wrong on
@@ -171,11 +176,6 @@ func streamOpenAIPassthrough(
 	}
 
 	onUsage := firstOpenAIUsageCallback(onUsageCallbacks)
-	if onFinalResponse == nil && onUsage == nil && onError == nil && transformData == nil {
-		_, _ = io.Copy(&flushWriter{w: w, flusher: flusher}, body)
-		return
-	}
-
 	var aggregator *openAIResponseAggregator
 	if onFinalResponse != nil {
 		aggregator = newOpenAIResponseAggregator()
@@ -183,6 +183,7 @@ func streamOpenAIPassthrough(
 	reader := bufio.NewReaderSize(body, openAIStreamScannerInitialBuffer)
 
 	sawDone := false
+	sawTerminalError := false
 	dropCurrent := false
 	errorReported := false
 	var accumulator sseDataAccumulator
@@ -191,18 +192,20 @@ func streamOpenAIPassthrough(
 	processData := func(eventType string, data string) bool {
 		if data == "[DONE]" {
 			sawDone = true
-			return true
+			return false
 		}
 
 		// A post-commit upstream error (event: error or data: {"error":...})
 		// arrives after the HTTP 200; surface it so the request is recorded as a
 		// failure even though the client already received a 200 header, with the
 		// error's classified status (e.g. 429 for a rate limit) rather than 502.
-		if onError != nil && !errorReported {
-			if streamErr, isErr := parseOpenAIStreamError(eventType, data); isErr {
+		if streamErr, isErr := parseOpenAIStreamError(eventType, data); isErr {
+			sawTerminalError = true
+			if onError != nil && !errorReported {
 				onError(streamErr.httpStatus())
-				errorReported = true
 			}
+			errorReported = true
+			return false
 		}
 
 		if transformData != nil {
@@ -210,6 +213,9 @@ func streamOpenAIPassthrough(
 				data = transformed
 				transformedCurrentData = &data
 			}
+		}
+		if !dropInjectedUsage && onUsage == nil && aggregator == nil {
+			return true
 		}
 
 		var chunk models.OpenAIStreamChunk
@@ -257,6 +263,7 @@ func streamOpenAIPassthrough(
 	}
 
 	rawForwardOversizedEvent := false
+streamLoop:
 	for {
 		line, err := readOpenAISSELine(reader)
 		if errors.Is(err, errOpenAISSELineTooLong) {
@@ -301,9 +308,12 @@ func streamOpenAIPassthrough(
 			} else {
 				pending = append(pending, line)
 				isBoundary := strings.TrimRight(line, "\r\n") == ""
-				accumulator.consumeLine(line, processData)
+				continueStream := accumulator.consumeLine(line, processData)
 				if isBoundary && !flushEvent() {
 					return
+				}
+				if isBoundary && !continueStream {
+					break streamLoop
 				}
 			}
 		}
@@ -322,8 +332,18 @@ func streamOpenAIPassthrough(
 		}
 	}
 
-	accumulator.dispatch(processData)
+	_ = accumulator.dispatch(processData)
 	if !flushEvent() {
+		return
+	}
+	if sawDone || sawTerminalError {
+		// Consume the normal HTTP response EOF (including any bytes already held by
+		// reader) before closing so HTTP/1.x keep-alive remains reusable. A held-open
+		// upstream is still bounded by upstreamErrorDetailDrainTimeout.
+		drainReaderAndClose(reader, body)
+		bodyHandled = true
+	}
+	if sawTerminalError {
 		return
 	}
 	if !sawDone {

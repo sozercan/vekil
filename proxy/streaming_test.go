@@ -3,9 +3,12 @@ package proxy
 import (
 	"encoding/json"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/sozercan/vekil/models"
 )
@@ -75,6 +78,255 @@ func TestStreamOpenAIPassthrough(t *testing.T) {
 	}
 	if !strings.Contains(result, "data: [DONE]") {
 		t.Errorf("output missing [DONE], got:\n%s", result)
+	}
+}
+
+func TestStreamOpenAIPassthroughStopsAfterDoneWhenBodyStaysOpen(t *testing.T) {
+	body := newBlockingSSEReadCloser("data: [DONE]\n\n")
+	w := httptest.NewRecorder()
+	returned := make(chan time.Duration, 1)
+
+	go func() {
+		start := time.Now()
+		StreamOpenAIPassthrough(w, body)
+		returned <- time.Since(start)
+	}()
+
+	elapsed := waitForBlockingStreamReturn(t, returned, body)
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("stream return elapsed = %v, want less than 500ms", elapsed)
+	}
+	if got := w.Body.String(); got != "data: [DONE]\n\n" {
+		t.Fatalf("forwarded stream = %q, want terminal event unchanged", got)
+	}
+	waitForBlockingSSEBodyClose(t, body.closed)
+}
+
+func TestStreamOpenAIPassthroughDoneInvokesFinalOnceWhenBodyStaysOpen(t *testing.T) {
+	body := newBlockingSSEReadCloser("data: {\"id\":\"chatcmpl-terminal\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n")
+	w := httptest.NewRecorder()
+	type result struct {
+		elapsed    time.Duration
+		finalCalls int
+		errorCalls int
+	}
+	returned := make(chan result, 1)
+
+	go func() {
+		start := time.Now()
+		finalCalls := 0
+		errorCalls := 0
+		streamOpenAIPassthrough(
+			w,
+			body,
+			false,
+			func(int) { errorCalls++ },
+			func(*models.OpenAIResponse) { finalCalls++ },
+			nil,
+		)
+		returned <- result{
+			elapsed:    time.Since(start),
+			finalCalls: finalCalls,
+			errorCalls: errorCalls,
+		}
+	}()
+
+	var got result
+	select {
+	case got = <-returned:
+	case <-time.After(500 * time.Millisecond):
+		_ = body.Close()
+		select {
+		case <-returned:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("stream remained blocked after forwarding [DONE]")
+	}
+
+	if got.elapsed >= 500*time.Millisecond {
+		t.Fatalf("stream return elapsed = %v, want less than 500ms", got.elapsed)
+	}
+	if got.finalCalls != 1 {
+		t.Fatalf("final callback calls = %d, want 1", got.finalCalls)
+	}
+	if got.errorCalls != 0 {
+		t.Fatalf("error callback calls = %d, want 0", got.errorCalls)
+	}
+	if !strings.Contains(w.Body.String(), "data: [DONE]\n\n") {
+		t.Fatalf("forwarded stream missing [DONE]: %q", w.Body.String())
+	}
+	waitForBlockingSSEBodyClose(t, body.closed)
+}
+
+func TestStreamOpenAIPassthroughErrorInvokesErrorOnceWhenBodyStaysOpen(t *testing.T) {
+	body := newBlockingSSEReadCloser("data: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"}}\n\n")
+	w := httptest.NewRecorder()
+	type result struct {
+		elapsed       time.Duration
+		finalCalls    int
+		errorCalls    int
+		errorStatuses []int
+	}
+	returned := make(chan result, 1)
+
+	go func() {
+		start := time.Now()
+		finalCalls := 0
+		errorStatuses := make([]int, 0, 1)
+		streamOpenAIPassthrough(
+			w,
+			body,
+			false,
+			func(status int) { errorStatuses = append(errorStatuses, status) },
+			func(*models.OpenAIResponse) { finalCalls++ },
+			nil,
+		)
+		returned <- result{
+			elapsed:       time.Since(start),
+			finalCalls:    finalCalls,
+			errorCalls:    len(errorStatuses),
+			errorStatuses: errorStatuses,
+		}
+	}()
+
+	var got result
+	select {
+	case got = <-returned:
+	case <-time.After(500 * time.Millisecond):
+		_ = body.Close()
+		select {
+		case <-returned:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("stream remained blocked after forwarding terminal error event")
+	}
+
+	if got.elapsed >= 500*time.Millisecond {
+		t.Fatalf("stream return elapsed = %v, want less than 500ms", got.elapsed)
+	}
+	if got.errorCalls != 1 {
+		t.Fatalf("error callback calls = %d, want 1", got.errorCalls)
+	}
+	if got.errorStatuses[0] != http.StatusTooManyRequests {
+		t.Fatalf("error callback status = %d, want 429", got.errorStatuses[0])
+	}
+	if got.finalCalls != 0 {
+		t.Fatalf("final callback calls = %d, want 0", got.finalCalls)
+	}
+	if !strings.Contains(w.Body.String(), `"message":"slow down"`) {
+		t.Fatalf("forwarded stream missing terminal error event: %q", w.Body.String())
+	}
+	waitForBlockingSSEBodyClose(t, body.closed)
+}
+
+func TestStreamOpenAIPassthroughConsumesEOFBeforeCloseForConnectionReuse(t *testing.T) {
+	tests := []struct {
+		name   string
+		stream string
+	}{
+		{
+			name:   "done",
+			stream: "data: [DONE]\n\n",
+		},
+		{
+			name:   "terminal error",
+			stream: "data: {\"error\":{\"type\":\"server_error\",\"message\":\"boom\"}}\n\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := newEOFTrackingSSEReadCloser(tt.stream)
+			w := httptest.NewRecorder()
+
+			StreamOpenAIPassthrough(w, body)
+
+			if !body.eofObserved {
+				t.Fatal("upstream EOF was not consumed after terminal event; HTTP/1.x connection cannot be reused")
+			}
+			if body.closedBeforeEOF {
+				t.Fatal("upstream body was closed before EOF was observed")
+			}
+			if !body.closed {
+				t.Fatal("upstream body was not closed after EOF")
+			}
+		})
+	}
+}
+
+type eofTrackingSSEReadCloser struct {
+	reader          *strings.Reader
+	eofObserved     bool
+	closed          bool
+	closedBeforeEOF bool
+}
+
+func newEOFTrackingSSEReadCloser(stream string) *eofTrackingSSEReadCloser {
+	return &eofTrackingSSEReadCloser{reader: strings.NewReader(stream)}
+}
+
+func (b *eofTrackingSSEReadCloser) Read(p []byte) (int, error) {
+	n, err := b.reader.Read(p)
+	if err == io.EOF {
+		b.eofObserved = true
+	}
+	return n, err
+}
+
+func (b *eofTrackingSSEReadCloser) Close() error {
+	b.closed = true
+	b.closedBeforeEOF = !b.eofObserved
+	return nil
+}
+
+type blockingSSEReadCloser struct {
+	prefix    *strings.Reader
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func newBlockingSSEReadCloser(prefix string) *blockingSSEReadCloser {
+	return &blockingSSEReadCloser{
+		prefix: strings.NewReader(prefix),
+		closed: make(chan struct{}),
+	}
+}
+
+func (b *blockingSSEReadCloser) Read(p []byte) (int, error) {
+	if b.prefix.Len() > 0 {
+		return b.prefix.Read(p)
+	}
+	<-b.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (b *blockingSSEReadCloser) Close() error {
+	b.closeOnce.Do(func() { close(b.closed) })
+	return nil
+}
+
+func waitForBlockingStreamReturn(t *testing.T, returned <-chan time.Duration, body io.Closer) time.Duration {
+	t.Helper()
+	select {
+	case elapsed := <-returned:
+		return elapsed
+	case <-time.After(500 * time.Millisecond):
+		_ = body.Close()
+		select {
+		case <-returned:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("stream remained blocked after terminal event")
+		return 0
+	}
+}
+
+func waitForBlockingSSEBodyClose(t *testing.T, closed <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream stream body to close")
 	}
 }
 

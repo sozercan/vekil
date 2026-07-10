@@ -105,10 +105,52 @@ func clampRetryAfter(delay time.Duration) time.Duration {
 
 // drainAndClose discards up to 4 KB from the body before closing it so that
 // HTTP/2 streams are cleanly consumed and the underlying connection can be
-// reused instead of being reset.
+// reused instead of being reset. The read is time-bounded because a response
+// body can yield a short prefix and then stall indefinitely.
 func drainAndClose(body io.ReadCloser) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, 4096))
-	_ = body.Close()
+	_ = captureAndDrainResponseBody(body, upstreamErrorDetailMaxBodyBytes, 0)
+}
+
+// drainReaderAndClose consumes reader through EOF before closing body so an
+// HTTP/1.x transport can reuse a normally completed response connection. If the
+// reader stalls, the existing upstream-body timeout closes it and lets the
+// caller return without waiting indefinitely. The reader may wrap body (for
+// example, a bufio.Reader with already-buffered bytes), so callers must pass the
+// reader they were actively consuming rather than body directly.
+func drainReaderAndClose(reader io.Reader, body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	if reader == nil {
+		_ = body.Close()
+		return
+	}
+
+	var closeOnce sync.Once
+	closeBody := func() {
+		closeOnce.Do(func() { _ = body.Close() })
+	}
+
+	timedOut := make(chan struct{})
+	timer := time.AfterFunc(upstreamErrorDetailDrainTimeout, func() {
+		// Signal first so a pathological Close implementation cannot extend the
+		// caller-visible timeout. net/http response bodies unblock Read on Close.
+		close(timedOut)
+		closeBody()
+	})
+
+	drained := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, reader)
+		_ = timer.Stop()
+		closeBody()
+		close(drained)
+	}()
+
+	select {
+	case <-drained:
+	case <-timedOut:
+	}
 }
 
 // doWithRetry executes an HTTP request with retry on transient failures.
@@ -264,27 +306,118 @@ func (e *upstreamError) Error() string {
 }
 
 func readRetryableUpstreamErrorBody(body io.ReadCloser) []byte {
+	return captureAndDrainResponseBody(body, upstreamErrorDetailMaxBodyBytes, upstreamErrorDetailDrainBytes)
+}
+
+type responseBodyReadProgress struct {
+	captured        []byte
+	captureComplete bool
+}
+
+// captureAndDrainResponseBody captures up to captureBytes and then drains up to
+// drainBytes more before closing the body. It returns as soon as capture is
+// complete, EOF is reached, or the timeout expires; any remaining bounded drain
+// continues asynchronously so normal short responses can still leave their
+// connection reusable. Progress is sent as owned byte slices so a timed-out
+// caller can safely return the short prefix already received while Close
+// interrupts a stalled Read.
+func captureAndDrainResponseBody(body io.ReadCloser, captureBytes, drainBytes int) []byte {
 	if body == nil {
 		return nil
 	}
-	bodyBytes, _ := io.ReadAll(io.LimitReader(body, upstreamErrorDetailMaxBodyBytes))
-	drainRetryableUpstreamErrorBody(body)
-	return bodyBytes
-}
+	if captureBytes <= 0 {
+		_ = body.Close()
+		return nil
+	}
+	if drainBytes < 0 {
+		drainBytes = 0
+	}
 
-func drainRetryableUpstreamErrorBody(body io.ReadCloser) {
-	// Drain a bounded remainder after the bounded capture. This preserves
-	// connection reuse for normal upstream error bodies without letting a huge or
-	// stalled body delay returning the synthesized error indefinitely.
+	var closeOnce sync.Once
+	closeBody := func() {
+		closeOnce.Do(func() { _ = body.Close() })
+	}
+
+	timedOut := make(chan struct{})
+	timer := time.AfterFunc(upstreamErrorDetailDrainTimeout, func() {
+		// Signal first so a pathological Close implementation cannot extend the
+		// caller-visible bound. net/http response bodies unblock Read on Close.
+		close(timedOut)
+		closeBody()
+	})
+
+	progress := make(chan responseBodyReadProgress)
+	callerDone := make(chan struct{})
+	defer close(callerDone)
+
 	go func() {
-		var closeOnce sync.Once
-		closeBody := func() {
-			closeOnce.Do(func() { _ = body.Close() })
+		defer func() {
+			_ = timer.Stop()
+			closeBody()
+		}()
+
+		captureRemaining := captureBytes
+		totalRemaining := captureBytes + drainBytes
+		buf := make([]byte, min(totalRemaining, 32*1024))
+		captureComplete := false
+
+		sendProgress := func(captured []byte, complete bool) {
+			select {
+			case progress <- responseBodyReadProgress{captured: captured, captureComplete: complete}:
+			case <-callerDone:
+			}
 		}
 
-		timer := time.AfterFunc(upstreamErrorDetailDrainTimeout, closeBody)
-		_, _ = io.Copy(io.Discard, io.LimitReader(body, upstreamErrorDetailDrainBytes))
-		_ = timer.Stop()
-		closeBody()
+		for totalRemaining > 0 {
+			readSize := min(len(buf), totalRemaining)
+			n, err := body.Read(buf[:readSize])
+			if n > 0 {
+				if n > totalRemaining {
+					n = totalRemaining
+				}
+				totalRemaining -= n
+
+				captureCount := min(n, captureRemaining)
+				var captured []byte
+				if captureCount > 0 {
+					captured = append([]byte(nil), buf[:captureCount]...)
+					captureRemaining -= captureCount
+				}
+				complete := captureRemaining == 0
+				if complete && totalRemaining == 0 {
+					closeBody()
+				}
+				if captureCount > 0 || (complete && !captureComplete) {
+					sendProgress(captured, complete)
+				}
+				captureComplete = complete
+			}
+
+			if err != nil {
+				closeBody()
+				if !captureComplete {
+					sendProgress(nil, true)
+				}
+				return
+			}
+		}
+
+		if !captureComplete {
+			closeBody()
+			sendProgress(nil, true)
+		}
 	}()
+
+	captured := make([]byte, 0, captureBytes)
+	for {
+		select {
+		case update := <-progress:
+			captured = append(captured, update.captured...)
+			if update.captureComplete {
+				return captured
+			}
+		case <-timedOut:
+			return captured
+		}
+	}
 }

@@ -292,6 +292,133 @@ func TestDoWithRetry_RespectsRetryAfter(t *testing.T) {
 	}
 }
 
+func TestDoWithRetry_StalledIntermediateBodyIsTimeBounded(t *testing.T) {
+	stalledBody := newBlockingRetryBodyReadCloserWithBody(`{"error":{"message":"retry later"}}`)
+	var attempts atomic.Int32
+	h := &ProxyHandler{
+		client: &http.Client{Transport: retryRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if attempts.Add(1) == 1 {
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Header:     make(http.Header),
+					Body:       stalledBody,
+					Request:    req,
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+				Request:    req,
+			}, nil
+		})},
+		log:            logger.New(logger.LevelError),
+		maxRetries:     2,
+		retryBaseDelay: time.Nanosecond,
+	}
+
+	type result struct {
+		resp    *http.Response
+		err     error
+		elapsed time.Duration
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		start := time.Now()
+		resp, err := h.doWithRetry(func() (*http.Request, error) {
+			return http.NewRequest(http.MethodPost, "http://upstream.test/retry", nil)
+		})
+		resultCh <- result{resp: resp, err: err, elapsed: time.Since(start)}
+	}()
+
+	var got result
+	select {
+	case got = <-resultCh:
+	case <-time.After(upstreamErrorDetailDrainTimeout + 750*time.Millisecond):
+		attemptsBeforeCleanup := attempts.Load()
+		_ = stalledBody.Close()
+		select {
+		case <-resultCh:
+		case <-time.After(time.Second):
+		}
+		t.Fatalf("retry remained blocked on stalled intermediate body; attempts before cleanup = %d, want 2", attemptsBeforeCleanup)
+	}
+
+	if got.err != nil {
+		t.Fatalf("doWithRetry() error = %v, want success", got.err)
+	}
+	defer func() { _ = got.resp.Body.Close() }()
+	if got.resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", got.resp.StatusCode)
+	}
+	if gotAttempts := attempts.Load(); gotAttempts != 2 {
+		t.Fatalf("attempts = %d, want 2", gotAttempts)
+	}
+	if got.elapsed < upstreamErrorDetailDrainTimeout/2 || got.elapsed >= upstreamErrorDetailDrainTimeout+750*time.Millisecond {
+		t.Fatalf("elapsed = %v, want bounded wait in [%v, %v)", got.elapsed, upstreamErrorDetailDrainTimeout/2, upstreamErrorDetailDrainTimeout+750*time.Millisecond)
+	}
+	waitForRetryBodyClose(t, stalledBody.closed)
+}
+
+func TestDoWithRetry_StalledFinalBodyIsTimeBoundedAndCaptured(t *testing.T) {
+	stalledBody := newBlockingRetryBodyReadCloserWithBody(`{"error":{"message":"short stalled error"}}`)
+	var attempts atomic.Int32
+	h := &ProxyHandler{
+		client: &http.Client{Transport: retryRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			attempts.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Header:     make(http.Header),
+				Body:       stalledBody,
+				Request:    req,
+			}, nil
+		})},
+		log:            logger.New(logger.LevelError),
+		maxRetries:     1,
+		retryBaseDelay: time.Nanosecond,
+	}
+
+	type result struct {
+		err     error
+		elapsed time.Duration
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		start := time.Now()
+		_, err := h.doWithRetry(func() (*http.Request, error) {
+			return http.NewRequest(http.MethodPost, "http://upstream.test/final", nil)
+		})
+		resultCh <- result{err: err, elapsed: time.Since(start)}
+	}()
+
+	var got result
+	select {
+	case got = <-resultCh:
+	case <-time.After(upstreamErrorDetailDrainTimeout + 750*time.Millisecond):
+		attemptsBeforeCleanup := attempts.Load()
+		_ = stalledBody.Close()
+		select {
+		case <-resultCh:
+		case <-time.After(time.Second):
+		}
+		t.Fatalf("terminal error remained blocked on stalled final body; attempts before cleanup = %d, want 1", attemptsBeforeCleanup)
+	}
+
+	if got.err == nil {
+		t.Fatal("doWithRetry() error = nil, want exhausted retry error")
+	}
+	if !strings.Contains(got.err.Error(), "short stalled error") {
+		t.Fatalf("error = %q, want captured short body detail", got.err)
+	}
+	if gotAttempts := attempts.Load(); gotAttempts != 1 {
+		t.Fatalf("attempts = %d, want 1", gotAttempts)
+	}
+	if got.elapsed < upstreamErrorDetailDrainTimeout/2 || got.elapsed >= upstreamErrorDetailDrainTimeout+750*time.Millisecond {
+		t.Fatalf("elapsed = %v, want bounded wait in [%v, %v)", got.elapsed, upstreamErrorDetailDrainTimeout/2, upstreamErrorDetailDrainTimeout+750*time.Millisecond)
+	}
+	waitForRetryBodyClose(t, stalledBody.closed)
+}
+
 func TestReadRetryableUpstreamErrorBodyDrainsAfterBoundedCapture(t *testing.T) {
 	body := strings.Repeat("a", upstreamErrorDetailMaxBodyBytes+123)
 	reader := newRetryBodyReadCloser(body)
@@ -362,26 +489,25 @@ func (r *retryBodyReadCloser) Close() error {
 }
 
 type blockingRetryBodyReadCloser struct {
-	remaining int
+	prefix    *strings.Reader
 	closeOnce sync.Once
 	closed    chan struct{}
 }
 
 func newBlockingRetryBodyReadCloser(prefixBytes int) *blockingRetryBodyReadCloser {
+	return newBlockingRetryBodyReadCloserWithBody(strings.Repeat("a", prefixBytes))
+}
+
+func newBlockingRetryBodyReadCloserWithBody(prefix string) *blockingRetryBodyReadCloser {
 	return &blockingRetryBodyReadCloser{
-		remaining: prefixBytes,
-		closed:    make(chan struct{}),
+		prefix: strings.NewReader(prefix),
+		closed: make(chan struct{}),
 	}
 }
 
 func (r *blockingRetryBodyReadCloser) Read(p []byte) (int, error) {
-	if r.remaining > 0 {
-		n := min(len(p), r.remaining)
-		for i := range n {
-			p[i] = 'a'
-		}
-		r.remaining -= n
-		return n, nil
+	if r.prefix.Len() > 0 {
+		return r.prefix.Read(p)
 	}
 	<-r.closed
 	return 0, io.ErrClosedPipe
@@ -399,6 +525,12 @@ func waitForRetryBodyClose(t *testing.T, closed <-chan struct{}) {
 	case <-time.After(upstreamErrorDetailDrainTimeout + time.Second):
 		t.Fatal("timed out waiting for response body to close")
 	}
+}
+
+type retryRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f retryRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
 func TestParseRetryAfter(t *testing.T) {
