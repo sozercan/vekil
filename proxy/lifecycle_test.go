@@ -36,6 +36,22 @@ func TestNewProxyHandlerInitializesLifecycle(t *testing.T) {
 	}
 }
 
+func TestWaitLifecycleWorkersCompletedWinsExpiredContext(t *testing.T) {
+	handler := &ProxyHandler{}
+	if !handler.beginLifecycleWorker() {
+		t.Fatal("beginLifecycleWorker() = false, want worker registration")
+	}
+	handler.endLifecycleWorker()
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	for i := 0; i < 100; i++ {
+		if err := handler.WaitLifecycleWorkers(ctx); err != nil {
+			t.Fatalf("WaitLifecycleWorkers() iteration %d error = %v, want completed workers to win", i, err)
+		}
+	}
+}
+
 func TestInferenceLifecycleDetachesClientCancellationUntilShutdown(t *testing.T) {
 	upstreamStarted := make(chan struct{})
 	upstreamCanceled := make(chan struct{})

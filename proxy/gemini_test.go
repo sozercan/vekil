@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -2670,6 +2671,107 @@ func TestHandleGeminiModelsCountTokensCacheNormalizesSnakeCase(t *testing.T) {
 
 	if callCount != 2 {
 		t.Fatalf("upstream callCount = %d, want 2", callCount)
+	}
+}
+
+func TestGeminiCountTokensCacheBoundsCardinalityAndEvictsOldest(t *testing.T) {
+	handler := &ProxyHandler{}
+	now := time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC)
+	handler.geminiCounts.now = func() time.Time { return now }
+
+	const expectedMaxEntries = geminiCountTokensCacheMaxEntries
+	for i := 0; i <= expectedMaxEntries; i++ {
+		handler.setGeminiCountTokensCache(fmt.Sprintf("key-%04d", i), models.GeminiCountTokensResponse{TotalTokens: i + 1})
+	}
+
+	handler.geminiCounts.mu.RLock()
+	cacheEntries := len(handler.geminiCounts.entries)
+	_, keptOldest := handler.geminiCounts.entries["key-0000"]
+	_, keptNewest := handler.geminiCounts.entries[fmt.Sprintf("key-%04d", expectedMaxEntries)]
+	handler.geminiCounts.mu.RUnlock()
+
+	if cacheEntries != expectedMaxEntries {
+		t.Fatalf("countTokens cache entries = %d, want bounded at %d", cacheEntries, expectedMaxEntries)
+	}
+	if keptOldest {
+		t.Fatal("countTokens cache retained the oldest entry after reaching its bound")
+	}
+	if !keptNewest {
+		t.Fatal("countTokens cache evicted the newest entry instead of the oldest")
+	}
+}
+
+func TestGeminiCountTokensCachePrunesAllExpiredEntriesOnAccessAndInsert(t *testing.T) {
+	now := time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC)
+
+	t.Run("access", func(t *testing.T) {
+		handler := &ProxyHandler{}
+		handler.geminiCounts.now = func() time.Time { return now }
+		handler.geminiCounts.entries = map[string]geminiCountTokensCacheEntry{
+			"expired-a": {
+				response: models.GeminiCountTokensResponse{TotalTokens: 1},
+				expiry:   now.Add(-time.Minute),
+			},
+			"expired-b": {
+				response: models.GeminiCountTokensResponse{TotalTokens: 2},
+				expiry:   now.Add(-time.Second),
+			},
+			"live": {
+				response: models.GeminiCountTokensResponse{TotalTokens: 3},
+				expiry:   now.Add(time.Minute),
+			},
+		}
+
+		got, ok := handler.getGeminiCountTokensCache("live")
+		if !ok || got.TotalTokens != 3 {
+			t.Fatalf("live cache lookup = %+v, %v; want TotalTokens 3", got, ok)
+		}
+
+		handler.geminiCounts.mu.RLock()
+		cacheEntries := len(handler.geminiCounts.entries)
+		_, keptExpiredA := handler.geminiCounts.entries["expired-a"]
+		_, keptExpiredB := handler.geminiCounts.entries["expired-b"]
+		handler.geminiCounts.mu.RUnlock()
+
+		if cacheEntries != 1 || keptExpiredA || keptExpiredB {
+			t.Fatalf("countTokens cache after access = len %d, expired-a %v, expired-b %v; want only live entry", cacheEntries, keptExpiredA, keptExpiredB)
+		}
+	})
+
+	t.Run("insert", func(t *testing.T) {
+		handler := &ProxyHandler{}
+		handler.geminiCounts.now = func() time.Time { return now }
+		handler.geminiCounts.entries = map[string]geminiCountTokensCacheEntry{
+			"expired-a": {expiry: now.Add(-time.Minute)},
+			"expired-b": {expiry: now.Add(-time.Second)},
+		}
+
+		handler.setGeminiCountTokensCache("live", models.GeminiCountTokensResponse{TotalTokens: 4})
+
+		handler.geminiCounts.mu.RLock()
+		cacheEntries := len(handler.geminiCounts.entries)
+		_, keptLive := handler.geminiCounts.entries["live"]
+		handler.geminiCounts.mu.RUnlock()
+		if cacheEntries != 1 || !keptLive {
+			t.Fatalf("countTokens cache after insert = len %d, live %v; want only live entry", cacheEntries, keptLive)
+		}
+	})
+}
+
+func TestGeminiCountTokensCacheUsesInjectedTimeForTTL(t *testing.T) {
+	now := time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC)
+	handler := &ProxyHandler{}
+	handler.geminiCounts.now = func() time.Time { return now }
+	handler.setGeminiCountTokensCache("key", models.GeminiCountTokensResponse{TotalTokens: 7})
+
+	now = now.Add(geminiCountTokensCacheTTL - time.Nanosecond)
+	if got, ok := handler.getGeminiCountTokensCache("key"); !ok || got.TotalTokens != 7 {
+		t.Fatalf("cache lookup before TTL = %+v, %v; want hit", got, ok)
+	}
+
+	now = now.Add(2 * time.Nanosecond)
+	if got, ok := handler.getGeminiCountTokensCache("key"); ok {
+		t.Fatalf("cache lookup after TTL = %+v, %v; want miss", got, ok)
 	}
 }
 

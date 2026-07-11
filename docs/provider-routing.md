@@ -130,6 +130,8 @@ Anthropic-compatible providers directly forward Anthropic `POST /v1/messages` to
 
 `model_discovery` can be `static`, `openai`, `ollama`, or `openrouter-tools`. OpenAI discovery reads an OpenAI-style `data` array. Ollama discovery reads `/api/tags`. OpenRouter-tools discovery reads an OpenAI/OpenRouter-style `data` array and exposes only models that advertise tool parameters.
 
+Successful decoded dynamic model catalogs are capped at 4 MiB before JSON decoding. Oversized Copilot, Codex, or generic catalogs fail without updating routing/cache state; an oversized optional Azure metadata overlay falls back to the configured static catalog. Concurrent requests for the same `/v1/models` query variant share one upstream refresh, and failed canonical refreshes briefly back off for one second while stale canonical data remains available.
+
 ### Generic Provider Field Reference
 
 | Field | Applies To | Purpose |

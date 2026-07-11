@@ -14,16 +14,24 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-const geminiCountTokensCacheTTL = 60 * time.Second
+const (
+	geminiCountTokensCacheTTL = 60 * time.Second
+	// geminiCountTokensCacheMaxEntries bounds unique countTokens payloads while
+	// retaining ample reuse for active client sessions.
+	geminiCountTokensCacheMaxEntries = 1024
+)
 
 type geminiCountTokensCache struct {
-	mu      sync.RWMutex
-	entries map[string]geminiCountTokensCacheEntry
+	mu           sync.RWMutex
+	entries      map[string]geminiCountTokensCacheEntry
+	now          func() time.Time
+	nextSequence uint64
 }
 
 type geminiCountTokensCacheEntry struct {
 	response models.GeminiCountTokensResponse
 	expiry   time.Time
+	sequence uint64
 }
 
 // HandleGeminiModels routes Gemini-native model actions to the corresponding
@@ -581,17 +589,13 @@ func writeGeminiError(w http.ResponseWriter, statusCode int, status, message str
 }
 
 func (h *ProxyHandler) getGeminiCountTokensCache(key string) (models.GeminiCountTokensResponse, bool) {
-	h.geminiCounts.mu.RLock()
-	entry, ok := h.geminiCounts.entries[key]
-	h.geminiCounts.mu.RUnlock()
-	if !ok {
-		return models.GeminiCountTokensResponse{}, false
-	}
+	now := h.geminiCounts.nowTime()
+	h.geminiCounts.mu.Lock()
+	defer h.geminiCounts.mu.Unlock()
 
-	if time.Now().After(entry.expiry) {
-		h.geminiCounts.mu.Lock()
-		delete(h.geminiCounts.entries, key)
-		h.geminiCounts.mu.Unlock()
+	pruneExpiredGeminiCountTokensEntries(h.geminiCounts.entries, now)
+	entry, ok := h.geminiCounts.entries[key]
+	if !ok {
 		return models.GeminiCountTokensResponse{}, false
 	}
 
@@ -599,15 +603,54 @@ func (h *ProxyHandler) getGeminiCountTokensCache(key string) (models.GeminiCount
 }
 
 func (h *ProxyHandler) setGeminiCountTokensCache(key string, response models.GeminiCountTokensResponse) {
+	now := h.geminiCounts.nowTime()
 	h.geminiCounts.mu.Lock()
 	defer h.geminiCounts.mu.Unlock()
 
 	if h.geminiCounts.entries == nil {
 		h.geminiCounts.entries = make(map[string]geminiCountTokensCacheEntry)
 	}
+	pruneExpiredGeminiCountTokensEntries(h.geminiCounts.entries, now)
+
+	if _, exists := h.geminiCounts.entries[key]; !exists && len(h.geminiCounts.entries) >= geminiCountTokensCacheMaxEntries {
+		if evictionKey, ok := oldestGeminiCountTokensCacheEntry(h.geminiCounts.entries); ok {
+			delete(h.geminiCounts.entries, evictionKey)
+		}
+	}
+	h.geminiCounts.nextSequence++
 
 	h.geminiCounts.entries[key] = geminiCountTokensCacheEntry{
 		response: response,
-		expiry:   time.Now().Add(geminiCountTokensCacheTTL),
+		expiry:   now.Add(geminiCountTokensCacheTTL),
+		sequence: h.geminiCounts.nextSequence,
 	}
+}
+
+func (c *geminiCountTokensCache) nowTime() time.Time {
+	if c != nil && c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+func pruneExpiredGeminiCountTokensEntries(entries map[string]geminiCountTokensCacheEntry, now time.Time) {
+	for key, entry := range entries {
+		if now.After(entry.expiry) {
+			delete(entries, key)
+		}
+	}
+}
+
+func oldestGeminiCountTokensCacheEntry(entries map[string]geminiCountTokensCacheEntry) (string, bool) {
+	oldestKey := ""
+	var oldestSequence uint64
+	found := false
+	for key, entry := range entries {
+		if !found || entry.sequence < oldestSequence || (entry.sequence == oldestSequence && key < oldestKey) {
+			oldestKey = key
+			oldestSequence = entry.sequence
+			found = true
+		}
+	}
+	return oldestKey, found
 }

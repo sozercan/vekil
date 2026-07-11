@@ -1516,7 +1516,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 		}
 
 		bodyReader := newLifecycleAwareReadCloser(resp.Body, ctx)
-		body, err := io.ReadAll(bodyReader)
+		body, err := readProviderModelCatalogBody(bodyReader)
 		if bodyReader.canceledAtFailure() {
 			if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) {
 				return providerModelsFetchResult{}, ctxErr
@@ -1578,7 +1578,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 			}
 		}
 
-		body, err := io.ReadAll(resp.Body)
+		body, err := readProviderModelCatalogBody(resp.Body)
 		if err != nil {
 			return providerModelsFetchResult{}, err
 		}
@@ -1619,7 +1619,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 			}
 		}
 
-		body, err := io.ReadAll(resp.Body)
+		body, err := readProviderModelCatalogBody(resp.Body)
 		if err != nil {
 			return providerModelsFetchResult{}, err
 		}
@@ -1663,7 +1663,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 			}
 		}
 
-		body, err := io.ReadAll(resp.Body)
+		body, err := readProviderModelCatalogBody(resp.Body)
 		if err != nil {
 			return providerModelsFetchResult{}, err
 		}
