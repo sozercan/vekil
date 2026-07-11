@@ -1,0 +1,737 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/vekil-smoke-reliability.XXXXXX")"
+ORIGINAL_PATH="${PATH}"
+
+server_pids=()
+server_ports=()
+MOCK_SERVER_PID=""
+MOCK_SERVER_PORT=""
+failures=0
+
+log() {
+  printf '==> %s\n' "$*" >&2
+}
+
+stop_mock_servers() {
+  local pid attempt
+  for pid in "${server_pids[@]:-}"; do
+    [[ -n "${pid}" ]] || continue
+    if kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" 2>/dev/null || true
+      for ((attempt = 0; attempt < 50; attempt++)); do
+        kill -0 "${pid}" 2>/dev/null || break
+        sleep 0.05
+      done
+      if kill -0 "${pid}" 2>/dev/null; then
+        kill -KILL "${pid}" 2>/dev/null || true
+      fi
+    fi
+    wait "${pid}" 2>/dev/null || true
+  done
+}
+
+cleanup() {
+  stop_mock_servers
+  rm -rf "${TMP_ROOT}"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+cat > "${TMP_ROOT}/mock_server.py" <<'PY'
+import argparse
+import json
+import pathlib
+import signal
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--port-file", required=True)
+parser.add_argument("--host", default="127.0.0.1")
+parser.add_argument("--port", type=int, default=0)
+parser.add_argument("--canary-status", type=int, default=200)
+parser.add_argument("--canary-status-sequence", default="")
+parser.add_argument("--canary-message", default="")
+parser.add_argument("--canary-bad-shape", action="store_true")
+parser.add_argument("--hang-chat", action="store_true")
+args = parser.parse_args()
+
+MODEL = "deepseek-v4-flash-free"
+CANARY_STATUSES = [int(value) for value in args.canary_status_sequence.split(",") if value] or [args.canary_status]
+canary_index = 0
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, _format, *_args):
+        return
+
+    def send_json(self, status, payload):
+        data = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/healthz":
+            self.send_json(200, {"status": "ok"})
+            return
+        if self.path == "/readyz":
+            self.send_json(200, {"status": "ready"})
+            return
+        if self.path == "/v1/models":
+            self.send_json(200, {"data": [
+                {"id": MODEL, "supported_endpoints": ["/chat/completions", "/responses"]},
+                {"id": "mimo-v2.5-free", "supported_endpoints": ["/chat/completions"]},
+                {"id": "gpt-5.4", "supported_endpoints": ["/responses"]},
+            ]})
+            return
+        self.send_json(404, {"error": {"message": "not found"}})
+
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        if length:
+            self.rfile.read(length)
+        if self.path == "/v1/chat/completions":
+            if args.hang_chat:
+                time.sleep(300)
+                return
+            global canary_index
+            status = CANARY_STATUSES[min(canary_index, len(CANARY_STATUSES) - 1)]
+            canary_index += 1
+            message = args.canary_message or f"mock HTTP {status}"
+            if status == 200 and not args.canary_bad_shape:
+                self.send_json(200, {
+                    "model": MODEL,
+                    "choices": [{"message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}],
+                })
+            else:
+                self.send_json(status, {"error": {"message": message}})
+            return
+        if self.path == "/v1/responses/compact":
+            self.send_json(200, {"output": [{"type": "compaction", "encrypted_content": "opaque"}]})
+            return
+        if self.path == "/v1/responses":
+            self.send_json(200, {"output": [{"type": "message", "content": [{"type": "output_text", "text": "VEKIL_COMPACTION_REPLAY_OK"}]}]})
+            return
+        self.send_json(404, {"error": {"message": "not found"}})
+
+server = ThreadingHTTPServer((args.host, args.port), Handler)
+pathlib.Path(args.port_file).write_text(str(server.server_address[1]))
+
+def stop(_signum, _frame):
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, stop)
+try:
+    server.serve_forever()
+finally:
+    server.server_close()
+PY
+
+cat > "${TMP_ROOT}/hang_server.py" <<'PY'
+import socket
+import sys
+import time
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, port))
+    sock.listen()
+    while True:
+        conn, _ = sock.accept()
+        # Hold the connection open forever without returning an HTTP response.
+        time.sleep(300)
+        conn.close()
+PY
+
+wait_for_file() {
+  local path="$1"
+  local attempt
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    [[ -s "${path}" ]] && return 0
+    sleep 0.05
+  done
+  return 1
+}
+
+start_mock_server() {
+  local case_dir="$1"
+  local status="${2:-200}"
+  local sequence="${3:-}"
+  local message="${4:-}"
+  local bad_shape="${5:-0}"
+  local hang_chat="${6:-0}"
+  local port_file="${case_dir}/port"
+  local args=(--port-file "${port_file}" --canary-status "${status}")
+  if [[ -n "${sequence}" ]]; then
+    args+=(--canary-status-sequence "${sequence}")
+  fi
+  if [[ -n "${message}" ]]; then
+    args+=(--canary-message "${message}")
+  fi
+  if [[ "${bad_shape}" == "1" ]]; then
+    args+=(--canary-bad-shape)
+  fi
+  if [[ "${hang_chat}" == "1" ]]; then
+    args+=(--hang-chat)
+  fi
+  mkdir -p "${case_dir}"
+  python3 "${TMP_ROOT}/mock_server.py" "${args[@]}" \
+    >"${case_dir}/server.log" 2>&1 &
+  MOCK_SERVER_PID=$!
+  server_pids+=("${MOCK_SERVER_PID}")
+  if ! wait_for_file "${port_file}"; then
+    cat "${case_dir}/server.log" >&2 || true
+    kill "${MOCK_SERVER_PID}" 2>/dev/null || true
+    wait "${MOCK_SERVER_PID}" 2>/dev/null || true
+    return 1
+  fi
+  MOCK_SERVER_PORT="$(cat "${port_file}")"
+  server_ports+=("${MOCK_SERVER_PORT}")
+}
+
+write_fake_clients() {
+  local bin_dir="$1"
+  local copilot_mode="$2"
+  local claude_mode="$3"
+  local gemini_mode="$4"
+  mkdir -p "${bin_dir}"
+
+  write_fake_client "${bin_dir}/copilot" "${copilot_mode}"
+  write_fake_client "${bin_dir}/claude" "${claude_mode}"
+  write_fake_client "${bin_dir}/gemini" "${gemini_mode}"
+}
+
+write_fake_client() {
+  local path="$1"
+  local mode="$2"
+  local mode_q
+  printf -v mode_q %q "${mode}"
+  cat > "${path}" <<EOF_CLIENT
+#!/usr/bin/env bash
+set -euo pipefail
+mode=${mode_q}
+case "\${mode}" in
+  pass)
+    printf '%s|%s\n' "\$(cat left.txt)" "\$(cat right.txt)"
+    ;;
+  exit42)
+    exit 42
+    ;;
+  fail-once)
+    state_dir="\${FAKE_CLI_STATE_DIR:?}"
+    mkdir -p "\${state_dir}"
+    state_file="\${state_dir}/\$(basename "\$0")"
+    count=0
+    [[ ! -f "\${state_file}" ]] || count="\$(cat "\${state_file}")"
+    count=\$((count + 1))
+    printf '%s
+' "\${count}" > "\${state_file}"
+    if [[ "\${count}" -eq 1 ]]; then
+      exit 42
+    fi
+    printf '%s|%s
+' "\$(cat left.txt)" "\$(cat right.txt)"
+    ;;
+  fork-sleeper)
+    sleep 300 &
+    child=\$!
+    printf '%s\n' "\${child}" > "\${FAKE_CLI_CHILD_PID_FILE:?}"
+    exit 42
+    ;;
+  *)
+    printf 'unknown fake client mode: %s\n' "\${mode}" >&2
+    exit 99
+    ;;
+esac
+EOF_CLIENT
+  chmod +x "${path}"
+}
+
+write_bind_failure_proxy() {
+  local path="$1"
+  cat > "${path}" <<'EOF_PROXY'
+#!/usr/bin/env bash
+printf 'Please visit https://github.com/login/device and enter code: TEST-CODE\n' >&2
+printf '{"level":"fatal","msg":"serve error","error":"server start error: listen: address already in use"}\n' >&2
+printf '{"level":"debug","msg":"rewrote compaction items"}\n' >&2
+exit 1
+EOF_PROXY
+  chmod +x "${path}"
+}
+
+write_healthy_proxy() {
+  local path="$1"
+  mkdir -p "$(dirname "${path}")"
+  cat > "${path}" <<EOF_PROXY
+#!/usr/bin/env bash
+set -euo pipefail
+host=127.0.0.1
+port=
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    --host) host="\$2"; shift 2 ;;
+    --port) port="\$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '{"addr":"%s:%s","level":"info","msg":"vekil listening","time":"2026-01-01T00:00:00Z"}\n' "\${host}" "\${port}"
+printf 'Please visit https://github.com/login/device and enter code: TEST-CODE\n'
+printf '{"level":"debug","msg":"rewrote compaction items"}\n'
+exec python3 "${TMP_ROOT}/mock_server.py" --host "\${host}" --port "\${port}" --port-file "${TMP_ROOT}/healthy-proxy-port"
+EOF_PROXY
+  chmod +x "${path}"
+}
+
+write_hanging_proxy() {
+  local path="$1"
+  cat > "${path}" <<EOF_PROXY
+#!/usr/bin/env bash
+set -euo pipefail
+host=127.0.0.1
+port=
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    --host) host="\$2"; shift 2 ;;
+    --port) port="\$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '{"addr":"%s:%s","level":"info","msg":"vekil listening","time":"2026-01-01T00:00:00Z"}\n' "\${host}" "\${port}"
+exec python3 "${TMP_ROOT}/hang_server.py" "\${host}" "\${port}"
+EOF_PROXY
+  chmod +x "${path}"
+}
+
+run_bounded() {
+  local timeout_seconds="$1"
+  local stdout_file="$2"
+  local stderr_file="$3"
+  shift 3
+
+  set +e
+  python3 - "${timeout_seconds}" "${stdout_file}" "${stderr_file}" "$@" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+timeout = float(sys.argv[1])
+stdout_path = sys.argv[2]
+stderr_path = sys.argv[3]
+command = sys.argv[4:]
+with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
+    proc = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        rc = 124
+sys.exit(rc)
+PY
+  local rc=$?
+  set -e
+  return "${rc}"
+}
+
+record_failure() {
+  local name="$1"
+  local detail="$2"
+  failures=$((failures + 1))
+  printf 'not ok - %s: %s\n' "${name}" "${detail}" >&2
+}
+
+record_success() {
+  printf 'ok - %s\n' "$1" >&2
+}
+
+expect_hard_failure() {
+  local name="$1"
+  local timeout_seconds="$2"
+  shift 2
+  local case_dir="${TMP_ROOT}/cases/${name//[^a-zA-Z0-9_.-]/_}"
+  mkdir -p "${case_dir}"
+  local rc=0
+  run_bounded "${timeout_seconds}" "${case_dir}/stdout" "${case_dir}/stderr" "$@" || rc=$?
+  if [[ "${rc}" -eq 0 ]]; then
+    record_failure "${name}" "command unexpectedly succeeded"
+    cat "${case_dir}/stderr" >&2 || true
+    return
+  fi
+  if [[ "${rc}" -eq 124 ]]; then
+    record_failure "${name}" "command exceeded ${timeout_seconds}s outer test deadline"
+    cat "${case_dir}/stderr" >&2 || true
+    return
+  fi
+  record_success "${name}"
+}
+
+expect_hard_failure_with_stderr() {
+  local name="$1"
+  local timeout_seconds="$2"
+  local pattern="$3"
+  shift 3
+  local case_dir="${TMP_ROOT}/cases/${name//[^a-zA-Z0-9_.-]/_}"
+  mkdir -p "${case_dir}"
+  local rc=0
+  run_bounded "${timeout_seconds}" "${case_dir}/stdout" "${case_dir}/stderr" "$@" || rc=$?
+  if [[ "${rc}" -eq 0 ]]; then
+    record_failure "${name}" "command unexpectedly succeeded"
+    cat "${case_dir}/stderr" >&2 || true
+    return
+  fi
+  if [[ "${rc}" -eq 124 ]]; then
+    record_failure "${name}" "command exceeded ${timeout_seconds}s outer test deadline"
+    cat "${case_dir}/stderr" >&2 || true
+    return
+  fi
+  if ! grep -Eq "${pattern}" "${case_dir}/stderr"; then
+    record_failure "${name}" "stderr did not match ${pattern}"
+    cat "${case_dir}/stderr" >&2 || true
+    return
+  fi
+  record_success "${name}"
+}
+
+expect_success() {
+  local name="$1"
+  local timeout_seconds="$2"
+  shift 2
+  local case_dir="${TMP_ROOT}/cases/${name//[^a-zA-Z0-9_.-]/_}"
+  mkdir -p "${case_dir}"
+  local rc=0
+  run_bounded "${timeout_seconds}" "${case_dir}/stdout" "${case_dir}/stderr" "$@" || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    record_failure "${name}" "command failed with ${rc}"
+    cat "${case_dir}/stderr" >&2 || true
+    return 1
+  fi
+  record_success "${name}"
+}
+
+port_accepts_tcp() {
+  python3 - "$1" <<'PY_PORT_CHECK'
+import socket
+import sys
+try:
+    with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=0.2):
+        pass
+except OSError:
+    raise SystemExit(1)
+PY_PORT_CHECK
+}
+
+common_zen_env() {
+  local smoke_dir="$1"
+  local port="$2"
+  local fake_bin="$3"
+  printf '%s\0' \
+    "PATH=${fake_bin}:${ORIGINAL_PATH}" \
+    "SMOKE_PROVIDER=zen" \
+    "START_PROXY=0" \
+    "PROXY_HOST=127.0.0.1" \
+    "PROXY_PORT=${port}" \
+    "LIVE_CLI_SMOKE_DIR=${smoke_dir}" \
+    "SMOKE_STARTUP_TIMEOUT_SECONDS=2" \
+    "SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1" \
+    "SMOKE_CURL_MAX_TIME_SECONDS=2" \
+    "SMOKE_CLI_TIMEOUT_SECONDS=2"
+}
+
+run_zen_case_expect_failure() {
+  local name="$1"
+  local status="$2"
+  local copilot_mode="$3"
+  local claude_mode="$4"
+  local gemini_mode="$5"
+  local message="${6:-}"
+  local bad_shape="${7:-0}"
+  local case_dir="${TMP_ROOT}/setup/${name}"
+  local port
+  start_mock_server "${case_dir}/server" "${status}" "" "${message}" "${bad_shape}"
+  port="${MOCK_SERVER_PORT}"
+  local fake_bin="${case_dir}/bin"
+  write_fake_clients "${fake_bin}" "${copilot_mode}" "${claude_mode}" "${gemini_mode}"
+  local smoke_dir="${case_dir}/smoke"
+  local env_args=()
+  while IFS= read -r -d '' item; do env_args+=("${item}"); done < <(common_zen_env "${smoke_dir}" "${port}" "${fake_bin}")
+  expect_hard_failure "${name}" 8 env "${env_args[@]}" "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+}
+
+run_zen_classification_case() {
+  local name="$1"
+  local status="$2"
+  local message="$3"
+  local bad_shape="$4"
+  local case_dir="${TMP_ROOT}/setup/${name}"
+  local port
+  start_mock_server "${case_dir}/server" "${status}" "" "${message}" "${bad_shape}"
+  port="${MOCK_SERVER_PORT}"
+  write_fake_clients "${case_dir}/bin" pass pass pass
+
+  expect_hard_failure "${name} via CLI harness" 8 \
+    env PATH="${case_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+      PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" LIVE_CLI_SMOKE_DIR="${case_dir}/cli-smoke" \
+      SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+      "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+
+  mkdir -p "${case_dir}/raw-smoke"
+  expect_hard_failure_with_stderr "${name} via raw Zen smoke" 8 '^FAIL[[:space:]]+' \
+    env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" \
+      LIVE_ZEN_SMOKE_DIR="${case_dir}/raw-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+      SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-zen-smoke.sh"
+}
+
+log "Running deterministic smoke reliability regressions"
+
+render_block="${TMP_ROOT}/k8s-render-kustomization.txt"
+awk '
+  /<<EOF_KUSTOMIZE$/ { capture=1; next }
+  capture && /^EOF_KUSTOMIZE$/ { exit }
+  capture { print }
+' "${REPO_ROOT}/scripts/k8s-kind-smoke.sh" > "${render_block}"
+pull_policy_path_count="$(grep -cF 'path: /spec/template/spec/containers/0/imagePullPolicy' "${render_block}" || true)"
+pull_policy_value_count="$(grep -cF 'value: IfNotPresent' "${render_block}" || true)"
+if [[ "${pull_policy_path_count}" == "1" && "${pull_policy_value_count}" == "1" ]]; then
+  record_success "k8s render imagePullPolicy patch is unique"
+else
+  record_failure "k8s render imagePullPolicy patch is unique" \
+    "found ${pull_policy_path_count} paths and ${pull_policy_value_count} IfNotPresent values"
+fi
+
+readiness_timeout="$(awk '
+  $1 == "readinessProbe:" { in_readiness=1; next }
+  in_readiness && $1 == "timeoutSeconds:" { print $2; exit }
+' "${REPO_ROOT}/k8s/vekil.yaml")"
+if [[ "${readiness_timeout}" =~ ^[0-9]+$ ]] && (( readiness_timeout >= 10 )); then
+  record_success "k8s readiness timeout covers the 10s provider probe"
+else
+  record_failure "k8s readiness timeout covers the 10s provider probe" \
+    "timeoutSeconds=${readiness_timeout:-<missing>}"
+fi
+
+startup_values="$(awk '
+  $1 == "startupProbe:" { in_startup=1; next }
+  in_startup && $1 == "timeoutSeconds:" { timeout=$2 }
+  in_startup && $1 == "periodSeconds:" { period=$2 }
+  in_startup && $1 == "failureThreshold:" { print timeout, period, $2; exit }
+' "${REPO_ROOT}/k8s/vekil.yaml")"
+read -r startup_timeout startup_period startup_failures <<< "${startup_values}"
+startup_budget=0
+if [[ "${startup_period:-}" =~ ^[0-9]+$ && "${startup_failures:-}" =~ ^[0-9]+$ ]]; then
+  startup_budget=$((startup_period * startup_failures))
+fi
+if [[ "${startup_timeout:-}" =~ ^[0-9]+$ \
+  && "${startup_period:-}" =~ ^[0-9]+$ \
+  && "${startup_failures:-}" =~ ^[0-9]+$ \
+  && "${startup_period}" -ge "${startup_timeout}" \
+  && "${startup_budget}" -ge 60 ]]; then
+  record_success "k8s startup probe has a coherent >=60s failure budget"
+else
+  record_failure "k8s startup probe has a coherent >=60s failure budget" \
+    "timeout=${startup_timeout:-<missing>} period=${startup_period:-<missing>} failures=${startup_failures:-<missing>} budget=${startup_budget}s"
+fi
+
+# A stale healthy process must not satisfy readiness after the spawned proxy loses
+# the bind race and exits.
+case_dir="${TMP_ROOT}/setup/stale-listener"
+start_mock_server "${case_dir}/server" 200
+port="${MOCK_SERVER_PORT}"
+write_fake_clients "${case_dir}/bin" pass pass pass
+write_bind_failure_proxy "${case_dir}/bind-fail-proxy"
+expect_hard_failure "stale healthy listener while spawned proxy bind fails" 6 \
+  env PATH="${case_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=1 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" PROXY_BIN="${case_dir}/bind-fail-proxy" \
+    PROVIDERS_CONFIG="${REPO_ROOT}/examples/opencode-zen-free.yaml" \
+    LIVE_CLI_SMOKE_DIR="${case_dir}/smoke" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=1 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+
+# The lightweight raw Zen and compact smoke scripts enforce the same spawned-PID
+# ownership rule rather than trusting the stale server.
+expect_hard_failure "raw Zen rejects stale healthy listener" 6 \
+  env START_PROXY=1 PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" \
+    PROXY_BIN="${case_dir}/bind-fail-proxy" PROVIDERS_CONFIG="${REPO_ROOT}/examples/opencode-zen-free.yaml" \
+    LIVE_ZEN_SMOKE_DIR="${case_dir}/raw-zen" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=1 \
+    "${REPO_ROOT}/scripts/live-zen-smoke.sh"
+expect_hard_failure "compact smoke rejects stale healthy listener" 6 \
+  env START_PROXY=1 PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" \
+    PROXY_BIN="${case_dir}/bind-fail-proxy" LIVE_COMPACT_SMOKE_DIR="${case_dir}/compact" \
+    PROXY_TOKEN_DIR="${case_dir}/token" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=1 \
+    "${REPO_ROOT}/scripts/live-compact-smoke.sh"
+
+# With no caller-supplied port, a successfully spawned proxy gets an isolated
+# non-default/non-legacy port and cleanup releases it.
+auto_dir="${TMP_ROOT}/setup/auto-port"
+write_fake_clients "${auto_dir}/bin" pass pass pass
+write_healthy_proxy "${auto_dir}/healthy-proxy"
+if expect_success "auto port is isolated and released" 10 \
+  env PATH="${auto_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=1 \
+    PROXY_HOST=127.0.0.1 PROXY_BIN="${auto_dir}/healthy-proxy" \
+    PROVIDERS_CONFIG="${REPO_ROOT}/examples/opencode-zen-free.yaml" \
+    LIVE_CLI_SMOKE_DIR="${auto_dir}/smoke" SMOKE_STARTUP_TIMEOUT_SECONDS=3 \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"; then
+  auto_stderr="${TMP_ROOT}/cases/auto_port_is_isolated_and_released/stderr"
+  auto_port="$(sed -nE 's/.*Starting proxy at http:\/\/127\.0\.0\.1:([0-9]+).*/\1/p' "${auto_stderr}" | head -1)"
+  if [[ -z "${auto_port}" || "${auto_port}" == "1337" || "${auto_port}" == "8899" ]]; then
+    record_failure "auto port selection" "unexpected selected port ${auto_port:-<missing>}"
+  elif port_accepts_tcp "${auto_port}"; then
+    record_failure "auto port cleanup" "port ${auto_port} still accepts TCP after script exit"
+  else
+    record_success "auto port selection and cleanup verification"
+  fi
+fi
+
+mixed_compact_dir="${TMP_ROOT}/setup/mixed-log-compact"
+write_healthy_proxy "${mixed_compact_dir}/healthy-proxy"
+if expect_success "compact listener tolerates mixed JSON and plain-text logs" 10 \
+  env START_PROXY=1 PROXY_HOST=127.0.0.1 PROXY_BIN="${mixed_compact_dir}/healthy-proxy" \
+    LIVE_COMPACT_SMOKE_DIR="${mixed_compact_dir}/smoke" PROXY_TOKEN_DIR="${mixed_compact_dir}/token" \
+    SMOKE_STARTUP_TIMEOUT_SECONDS=3 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"; then
+  :
+fi
+
+mixed_raw_dir="${TMP_ROOT}/setup/mixed-log-raw-zen"
+write_healthy_proxy "${mixed_raw_dir}/healthy-proxy"
+if expect_success "raw Zen listener tolerates mixed JSON and plain-text logs" 10 \
+  env START_PROXY=1 PROXY_HOST=127.0.0.1 PROXY_BIN="${mixed_raw_dir}/healthy-proxy" \
+    PROVIDERS_CONFIG="${REPO_ROOT}/examples/opencode-zen-free.yaml" \
+    LIVE_ZEN_SMOKE_DIR="${mixed_raw_dir}/smoke" SMOKE_STARTUP_TIMEOUT_SECONDS=3 \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-zen-smoke.sh"; then
+  :
+fi
+
+neutral_dir="${TMP_ROOT}/setup/neutral-before-client"
+start_mock_server "${neutral_dir}/server" 429
+neutral_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${neutral_dir}/bin" exit42 exit42 exit42
+expect_success "neutral skip only before any client is exercised" 8 \
+  env PATH="${neutral_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${neutral_port}" LIVE_CLI_SMOKE_DIR="${neutral_dir}/smoke" \
+    SMOKE_STARTUP_TIMEOUT_SECONDS=2 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+
+retry_dir="${TMP_ROOT}/setup/second-canary-transient"
+retry_sequence="200,429,200,200,429,200,200,429,200"
+start_mock_server "${retry_dir}/server" 200 "${retry_sequence}"
+retry_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${retry_dir}/bin" fail-once fail-once fail-once
+expect_success "second canary transient permits retry but every client still passes" 12 \
+  env PATH="${retry_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${retry_port}" LIVE_CLI_SMOKE_DIR="${retry_dir}/smoke" \
+    FAKE_CLI_STATE_DIR="${retry_dir}/state" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+
+run_zen_classification_case "canary 404 plus transient text is hard" 404 \
+  "service temporarily unavailable" 0
+run_zen_classification_case "canary 200 bad shape plus transient text is hard" 200 \
+  "service temporarily unavailable" 1
+
+hanging_chat_dir="${TMP_ROOT}/setup/hanging-chat-canary"
+start_mock_server "${hanging_chat_dir}/server" 200 "" "" 0 1
+hanging_chat_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${hanging_chat_dir}/bin" pass pass pass
+expect_hard_failure_with_stderr "hanging chat canary is hard via CLI harness" 8 'curl-exit-28' \
+  env PATH="${hanging_chat_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${hanging_chat_port}" \
+    LIVE_CLI_SMOKE_DIR="${hanging_chat_dir}/cli-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=1 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+mkdir -p "${hanging_chat_dir}/raw-smoke"
+expect_hard_failure_with_stderr "hanging chat canary is hard via raw Zen smoke" 8 \
+  '^FAIL[[:space:]]+.*curl-exit-28' \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${hanging_chat_port}" \
+    LIVE_ZEN_SMOKE_DIR="${hanging_chat_dir}/raw-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=1 "${REPO_ROOT}/scripts/live-zen-smoke.sh"
+
+run_zen_case_expect_failure "canary 200 plus CLI exit 42" 200 exit42 exit42 exit42
+run_zen_case_expect_failure "canary 404 is a hard failure" 404 pass pass pass
+run_zen_case_expect_failure "one client pass cannot mask another failure" 200 pass exit42 pass
+
+# A listener that accepts TCP but never answers HTTP must hit the script's own
+# bounded startup deadline, not the outer test watchdog.
+case_dir="${TMP_ROOT}/setup/never-responds"
+write_fake_clients "${case_dir}/bin" pass pass pass
+write_hanging_proxy "${case_dir}/hanging-proxy"
+port_file="${case_dir}/chosen-port"
+expect_hard_failure "accepts TCP but never responds exits within deadline" 7 \
+  env PATH="${case_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=1 \
+    PROXY_HOST=127.0.0.1 PROXY_BIN="${case_dir}/hanging-proxy" \
+    PROVIDERS_CONFIG="${REPO_ROOT}/examples/opencode-zen-free.yaml" \
+    LIVE_CLI_SMOKE_DIR="${case_dir}/smoke" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=1 SMOKE_CLI_TIMEOUT_SECONDS=1 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+
+# A failed CLI may fork; the smoke harness must reap the entire process group.
+case_dir="${TMP_ROOT}/setup/fork-sleeper"
+start_mock_server "${case_dir}/server" 200
+port="${MOCK_SERVER_PORT}"
+write_fake_clients "${case_dir}/bin" fork-sleeper pass pass
+child_pid_file="${case_dir}/child.pid"
+expect_hard_failure "fake CLI forks sleeper" 8 \
+  env PATH="${case_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" LIVE_CLI_SMOKE_DIR="${case_dir}/smoke" \
+    FAKE_CLI_CHILD_PID_FILE="${child_pid_file}" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+if [[ ! -s "${child_pid_file}" ]]; then
+  record_failure "fake CLI forks sleeper cleanup" "fake CLI never recorded its child pid"
+else
+  child_pid="$(cat "${child_pid_file}")"
+  sleep 0.2
+  if kill -0 "${child_pid}" 2>/dev/null; then
+    kill "${child_pid}" 2>/dev/null || true
+    record_failure "fake CLI forks sleeper cleanup" "child ${child_pid} remained alive"
+  else
+    record_success "fake CLI forks sleeper cleanup"
+  fi
+fi
+
+stop_mock_servers
+mock_server_leaks=0
+for pid in "${server_pids[@]:-}"; do
+  if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+    record_failure "mock server cleanup" "PID ${pid} remained alive"
+    mock_server_leaks=1
+  fi
+done
+for port in "${server_ports[@]:-}"; do
+  if [[ -n "${port}" ]] && port_accepts_tcp "${port}"; then
+    record_failure "mock server cleanup" "listener 127.0.0.1:${port} remained open"
+    mock_server_leaks=1
+  fi
+done
+if [[ "${mock_server_leaks}" == "0" ]]; then
+  record_success "all tracked mock servers and listeners were cleaned up"
+fi
+
+if [[ "${failures}" -ne 0 ]]; then
+  printf '%s deterministic smoke reliability test(s) failed\n' "${failures}" >&2
+  exit 1
+fi
+
+log "All deterministic smoke reliability regressions passed"

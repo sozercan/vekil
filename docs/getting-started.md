@@ -88,6 +88,15 @@ A sample manifest is included at [`k8s/vekil.yaml`](../k8s/vekil.yaml).
 kubectl apply -f k8s/vekil.yaml
 ```
 
+The manifest first uses `/healthz` as a startup probe with a 90-second failure budget. This covers synchronous dynamic-provider model initialization, which can take up to 30 seconds before the HTTP listener exists; Kubernetes suppresses liveness and readiness checks until startup succeeds. Afterward, `/healthz` provides liveness and `/readyz` provides readiness. The readiness probe allows 12 seconds, leaving margin over Vekil's 10-second provider readiness check, and runs every 15 seconds with a single failure threshold. With the default zero-config Copilot startup, the process can therefore stay live while device-code authentication is pending, but the Pod remains not Ready and the Service has no ready endpoint until authentication succeeds.
+
+The example token cache is an `emptyDir`. It survives a container restart inside the same Pod, but **does not survive Pod replacement, rescheduling, or a Deployment rollout**. For a durable deployment, either:
+
+- inject `COPILOT_GITHUB_TOKEN` from a Kubernetes Secret so every replacement can authenticate non-interactively, or
+- replace the `emptyDir` with persistent storage if you rely on Vekil-managed cached credentials.
+
+Explicit provider routing also needs the provider file to exist in the container. Mount the JSON/YAML config from a Secret or ConfigMap and add `--providers-config /path/in/container/providers.yaml` to the container args. Any `api_key_env` or other credential environment variables referenced by that file must be supplied separately, normally from Secrets. Do not assume the example `emptyDir` persists either provider credentials or configuration.
+
 ## First Run And Authentication
 
 Startup behavior depends on active providers. For the full auth matrix, see [Provider Authentication](provider-routing.md#provider-authentication). For provider console links and key setup patterns, see [Provider API Keys](provider-api-keys.md).

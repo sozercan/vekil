@@ -5,9 +5,9 @@ name: Live OpenCode Zen Smoke
 # request including external-contributor forks. It exercises vekil's generic
 # openai-compatible provider routing end to end through real coding-agent CLIs.
 #
-# The Zen free tier rotates and is rate-limited per IP, so the script
-# (scripts/live-cli-smoke.sh in SMOKE_PROVIDER=zen mode) neutral-skips when no
-# free model is reachable and only fails on a genuine proxy fault. See
+# The Zen free tier rotates and is rate-limited per IP. The script neutral-skips
+# only when no model is reachable before any CLI is exercised; once a canary
+# reaches a model, every installed CLI is an independent hard gate. See
 # docs/development.md.
 
 on:
@@ -27,7 +27,7 @@ concurrency:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -47,7 +47,7 @@ jobs:
 
       - name: Install Claude Code
         run: |
-          curl -fsSL https://claude.ai/install.sh | bash -s stable
+          curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 https://claude.ai/install.sh | bash -s stable
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install Gemini CLI
@@ -66,9 +66,10 @@ jobs:
       - name: Run live OpenCode Zen CLI smoke
         env:
           SMOKE_PROVIDER: zen
-          PROXY_PORT: "8899"
           PROVIDERS_CONFIG: examples/opencode-zen-free.yaml
           LIVE_CLI_SMOKE_DIR: ${{ runner.temp }}/live-zen-cli-smoke
+          SMOKE_CLI_TIMEOUT_SECONDS: "120"
+          SMOKE_CURL_MAX_TIME_SECONDS: "45"
         run: scripts/live-cli-smoke.sh
 
       - name: Show proxy log on failure
