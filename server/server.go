@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,6 +25,9 @@ type Server struct {
 	running      atomic.Bool
 	boundAddr    atomic.Pointer[string]
 	dynamicAddr  bool
+	stopMu       sync.Mutex
+	stopDone     chan struct{}
+	stopErr      error
 }
 
 type options struct {
@@ -316,19 +320,75 @@ func (s *Server) ValidateDynamicProviderModels(ctx context.Context) error {
 
 // Stop performs a graceful shutdown of the server.
 func (s *Server) Stop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	s.stopMu.Lock()
+	if done := s.stopDone; done != nil {
+		s.stopMu.Unlock()
+		select {
+		case <-done:
+			s.stopMu.Lock()
+			err := s.stopErr
+			s.stopMu.Unlock()
+			return err
+		default:
+		}
+		select {
+		case <-done:
+			s.stopMu.Lock()
+			err := s.stopErr
+			s.stopMu.Unlock()
+			return err
+		case <-ctx.Done():
+			select {
+			case <-done:
+				s.stopMu.Lock()
+				err := s.stopErr
+				s.stopMu.Unlock()
+				return err
+			default:
+			}
+			return ctx.Err()
+		}
+	}
+	done := make(chan struct{})
+	s.stopDone = done
+	s.stopMu.Unlock()
+
+	err := s.stop(ctx)
+	s.stopMu.Lock()
+	s.stopErr = err
+	close(done)
+	s.stopMu.Unlock()
+	return err
+}
+
+func (s *Server) stop(ctx context.Context) error {
 	var websocketErr error
 	var workerErr error
+	var forceCloseErr error
 	if s.proxyHandler != nil {
 		s.proxyHandler.BeginShutdown()
 		s.proxyHandler.SetStartupAuthenticationPending(false)
 		websocketErr = s.proxyHandler.ShutdownWebSocketSessions(ctx)
 	}
 	shutdownErr := s.httpServer.Shutdown(ctx)
+	if shutdownErr != nil {
+		// Shutdown leaves active connections alone after its deadline. Force-close
+		// them so a stalled upload or non-reading downstream cannot survive into a
+		// later server generation (notably in the menubar stop/start flow).
+		forceCloseErr = s.httpServer.Close()
+		if errors.Is(forceCloseErr, http.ErrServerClosed) {
+			forceCloseErr = nil
+		}
+	}
 	if s.proxyHandler != nil {
 		workerErr = s.proxyHandler.WaitLifecycleWorkers(ctx)
 	}
 	s.running.Store(false)
-	return errors.Join(websocketErr, shutdownErr, workerErr)
+	return errors.Join(websocketErr, shutdownErr, forceCloseErr, workerErr)
 }
 
 // IsRunning returns whether the server is currently running.

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1548,5 +1549,190 @@ func TestStopClosesIdleUpstreamConnections(t *testing.T) {
 			t.Fatalf("idle upstream connections after Stop = %d, want 0", remaining)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestStopForceClosesNonReadingDownstreamAfterDeadline(t *testing.T) {
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	var written atomic.Int64
+	chunk := bytes.Repeat([]byte("x"), 64<<10)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		startedOnce.Do(func() { close(started) })
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			default:
+			}
+			n, err := w.Write(chunk)
+			written.Add(int64(n))
+			if err != nil {
+				return
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		"127.0.0.1",
+		"0",
+		WithProxyOptions(proxy.WithCopilotBaseURL(upstream.URL)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	conn, err := net.Dial("tcp", srv.Addr())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetReadBuffer(1024)
+	}
+	body := `{"model":"gpt-5","messages":[{"role":"user","content":"hello"}]}`
+	if _, err := fmt.Fprintf(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", srv.Addr(), len(body), body); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream response")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for written.Load() < 9<<19 {
+		if time.Now().After(deadline) {
+			t.Fatalf("upstream wrote %d bytes, want enough to backpressure downstream", written.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	start := time.Now()
+	stopErr := srv.Stop(ctx)
+	cancel()
+	if stopErr != nil && !errors.Is(stopErr, context.DeadlineExceeded) {
+		t.Fatalf("Stop() error = %v, want nil or deadline exceeded", stopErr)
+	}
+	if elapsed := time.Since(start); elapsed >= 500*time.Millisecond {
+		t.Fatalf("Stop() took %s after forced-close deadline", elapsed)
+	}
+
+	deadline = time.Now().Add(time.Second)
+	for {
+		w := httptest.NewRecorder()
+		srv.proxyHandler.HandleStatsJSON(w, httptest.NewRequest(http.MethodGet, "/stats.json", nil))
+		var stats struct {
+			Inflight int64 `json:"inflight"`
+		}
+		if err := json.NewDecoder(w.Result().Body).Decode(&stats); err != nil {
+			t.Fatalf("decode stats: %v", err)
+		}
+		if stats.Inflight == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("inflight after forced close = %d, want 0", stats.Inflight)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestConcurrentStopShortWaiterCannotForceCloseOwnerShutdown(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv.httpServer.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	})
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	requestDone := make(chan error, 1)
+	go func() {
+		resp, err := http.Get("http://" + srv.Addr())
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		requestDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for blocking handler")
+	}
+
+	ownerDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		ownerDone <- srv.Stop(ctx)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for srv.IsRunning() {
+		if time.Now().After(deadline) {
+			t.Fatal("owner Stop did not start shutdown")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	shortCtx, cancelShort := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	shortErr := srv.Stop(shortCtx)
+	cancelShort()
+	if !errors.Is(shortErr, context.DeadlineExceeded) {
+		t.Fatalf("short waiter Stop() error = %v, want deadline exceeded", shortErr)
+	}
+	select {
+	case err := <-requestDone:
+		t.Fatalf("short waiter force-closed owner's active request: %v", err)
+	default:
+	}
+
+	close(release)
+	select {
+	case err := <-ownerDone:
+		if err != nil {
+			t.Fatalf("owner Stop() error = %v, want graceful nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("owner Stop did not complete after handler release")
+	}
+	select {
+	case err := <-requestDone:
+		if err != nil {
+			t.Fatalf("graceful request error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request did not complete after release")
+	}
+
+	alreadyCanceled, cancelAlready := context.WithCancel(context.Background())
+	cancelAlready()
+	if err := srv.Stop(alreadyCanceled); err != nil {
+		t.Fatalf("completed Stop with canceled waiter context = %v, want shared nil result", err)
 	}
 }
