@@ -131,15 +131,33 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		return
 	}
 
+	writeAggregatedResponse := func(oaiResp *models.OpenAIResponse) {
+		observeOpenAIUsage(r.Context(), oaiResp.Usage)
+		h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(oaiResp))
+	}
+
+	if mode.forceUpstreamStream {
+		oaiResp, aggregateErr := aggregateGeminiStreamToResponse(resp.Body)
+		if aggregateErr != nil {
+			status := http.StatusBadGateway
+			message := aggregateErr.Error()
+			var streamErr *openAIStreamError
+			if errors.As(aggregateErr, &streamErr) {
+				status = streamErr.httpStatus()
+				message = streamErr.Error()
+			}
+			writeGeminiError(w, status, mapGeminiUpstreamStatus(status), message)
+			return
+		}
+		writeAggregatedResponse(oaiResp)
+		return
+	}
+
 	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
 			StreamOpenAIToGeminiWithFinalResponse(w, resp.Body, func(status int) { observeResponseFailureStatus(r.Context(), status) }, h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope), openAIChatStreamUsageCallback(r.Context()))
-		},
-		aggregate: func(oaiResp *models.OpenAIResponse) {
-			observeOpenAIUsage(r.Context(), oaiResp.Usage)
-			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(oaiResp))
 		},
 		passthrough: func(resp *http.Response) error {
 			defer func() { _ = resp.Body.Close() }()
@@ -156,11 +174,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		},
 	})
 	if err != nil {
-		message := "failed to parse upstream response"
-		if mode.forceUpstreamStream {
-			message = "failed to aggregate upstream response"
-		}
-		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", message)
+		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", "failed to parse upstream response")
 	}
 }
 

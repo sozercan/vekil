@@ -2,9 +2,11 @@ package proxy
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sozercan/vekil/models"
 )
@@ -432,6 +434,164 @@ func TestStreamOpenAIToGeminiToolCallWithoutArgumentsFlushesEmptyObject(t *testi
 	}
 	if tail.UsageMetadata == nil || tail.UsageMetadata.TotalTokenCount != 7 {
 		t.Errorf("UsageMetadata = %#v, want totalTokenCount=7", tail.UsageMetadata)
+	}
+}
+
+func TestStreamOpenAIToGeminiSparseToolCallIndices(t *testing.T) {
+	toolStop := "tool_calls"
+	zeroIndex := 0
+	sparseIndex := 1 << 30
+	sparseChunk := models.OpenAIStreamChunk{
+		ID:    "chatcmpl-sparse",
+		Model: "gemini-2.5-pro",
+		Choices: []models.OpenAIStreamChoice{{
+			Index: 0,
+			Delta: models.OpenAIMessage{
+				ToolCalls: []models.OpenAIToolCall{{
+					ID:    "call_sparse",
+					Index: &sparseIndex,
+					Function: models.OpenAIFunctionCall{
+						Name:      "sparse_call",
+						Arguments: `{}`,
+					},
+				}},
+			},
+		}},
+	}
+	zeroChunk := models.OpenAIStreamChunk{
+		ID:    "chatcmpl-sparse",
+		Model: "gemini-2.5-pro",
+		Choices: []models.OpenAIStreamChoice{{
+			Index: 0,
+			Delta: models.OpenAIMessage{
+				ToolCalls: []models.OpenAIToolCall{{
+					ID:    "call_zero",
+					Index: &zeroIndex,
+					Function: models.OpenAIFunctionCall{
+						Name:      "zero_call",
+						Arguments: `{}`,
+					},
+				}},
+			},
+		}},
+	}
+	finishChunk := models.OpenAIStreamChunk{
+		ID:    "chatcmpl-sparse",
+		Model: "gemini-2.5-pro",
+		Choices: []models.OpenAIStreamChoice{{
+			Index:        0,
+			FinishReason: &toolStop,
+		}},
+	}
+
+	body := buildSSEStream(mustMarshal(t, sparseChunk), mustMarshal(t, zeroChunk), mustMarshal(t, finishChunk), "[DONE]")
+	w := httptest.NewRecorder()
+	started := time.Now()
+	StreamOpenAIToGemini(w, body)
+	elapsed := time.Since(started)
+	t.Logf("sparse tool-call translation completed in %s", elapsed)
+	if elapsed > time.Second {
+		t.Fatalf("sparse tool-call translation took %s, want <= 1s", elapsed)
+	}
+
+	frames := parseGeminiSSEFrames(w.Body.String())
+	if len(frames) != 2 {
+		t.Fatalf("len(frames) = %d, want 2\nraw:\n%s", len(frames), w.Body.String())
+	}
+
+	var calls models.GeminiGenerateContentResponse
+	if err := json.Unmarshal([]byte(frames[0]), &calls); err != nil {
+		t.Fatalf("unmarshal function-call frame: %v", err)
+	}
+	if len(calls.Candidates) != 1 || calls.Candidates[0].Content == nil {
+		t.Fatalf("function-call frame = %#v, want one candidate with content", calls)
+	}
+	parts := calls.Candidates[0].Content.Parts
+	if len(parts) != 2 {
+		t.Fatalf("len(parts) = %d, want 2", len(parts))
+	}
+	if parts[0].FunctionCall == nil || parts[0].FunctionCall.ID != "call_zero" {
+		t.Fatalf("parts[0] = %#v, want call_zero", parts[0])
+	}
+	if parts[1].FunctionCall == nil || parts[1].FunctionCall.ID != "call_sparse" {
+		t.Fatalf("parts[1] = %#v, want call_sparse", parts[1])
+	}
+}
+
+func TestStreamOpenAIToGeminiRejectsNegativeToolCallIndex(t *testing.T) {
+	negativeIndex := -1
+	chunk := models.OpenAIStreamChunk{
+		ID:    "chatcmpl-negative-index",
+		Model: "gemini-2.5-pro",
+		Choices: []models.OpenAIStreamChoice{{
+			Index: 0,
+			Delta: models.OpenAIMessage{
+				ToolCalls: []models.OpenAIToolCall{{
+					ID:    "call_negative",
+					Index: &negativeIndex,
+					Function: models.OpenAIFunctionCall{
+						Name:      "bad_call",
+						Arguments: `{}`,
+					},
+				}},
+			},
+		}},
+	}
+
+	body := buildSSEStream(mustMarshal(t, chunk), "[DONE]")
+	w := httptest.NewRecorder()
+	gotFailureStatus := 0
+	StreamOpenAIToGeminiWithFinalResponse(w, body, func(status int) {
+		gotFailureStatus = status
+	}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("HTTP status = %d, want committed 200", w.Code)
+	}
+	if gotFailureStatus != http.StatusBadGateway {
+		t.Fatalf("onError status = %d, want 502", gotFailureStatus)
+	}
+
+	frames := parseGeminiSSEFrames(w.Body.String())
+	if len(frames) != 1 {
+		t.Fatalf("len(frames) = %d, want 1\nraw:\n%s", len(frames), w.Body.String())
+	}
+	var errResp models.GeminiErrorResponse
+	if err := json.Unmarshal([]byte(frames[0]), &errResp); err != nil {
+		t.Fatalf("unmarshal error frame: %v", err)
+	}
+	if errResp.Error.Code != http.StatusBadGateway || errResp.Error.Status != "UNAVAILABLE" {
+		t.Fatalf("error = %#v, want 502 UNAVAILABLE", errResp.Error)
+	}
+	if !strings.Contains(errResp.Error.Message, "tool call index -1") {
+		t.Fatalf("Error.Message = %q, want negative index detail", errResp.Error.Message)
+	}
+}
+
+func BenchmarkGeminiStreamSparseToolCall(b *testing.B) {
+	benchmarks := []struct {
+		name  string
+		index int
+	}{
+		{name: "index_0", index: 0},
+		{name: "index_1<<30", index: 1 << 30},
+	}
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				w := httptest.NewRecorder()
+				state := newGeminiStreamState(w)
+				state.bufferedToolCalls[bm.index] = &geminiStreamingToolCall{
+					ID:   "call_sparse",
+					Name: "sparse_call",
+				}
+				if !state.flushToolCalls(true) {
+					b.Fatal("flushToolCalls returned false")
+				}
+			}
+		})
 	}
 }
 

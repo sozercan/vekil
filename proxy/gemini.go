@@ -475,7 +475,12 @@ func translateGeminiContents(contents []models.GeminiContent) ([]models.OpenAIMe
 			return nil, invalidGeminiArgument("contents[%d].parts must not be empty", contentIdx)
 		}
 
-		switch content.Role {
+		role := content.Role
+		if role == "" {
+			role = "user"
+		}
+
+		switch role {
 		case "user":
 			var contentBuilder openAIContentBuilder
 			flushUserContent := func() error {
