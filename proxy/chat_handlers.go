@@ -72,9 +72,16 @@ func prepareOpenAIChatCompletionsRequest(body []byte) ([]byte, chatCompletionsMo
 }
 
 func prepareAnthropicChatCompletionsRequest(req *models.AnthropicRequest) ([]byte, chatCompletionsMode, error) {
+	return prepareAnthropicChatCompletionsRequestWithModelOverride(req, "")
+}
+
+func prepareAnthropicChatCompletionsRequestWithModelOverride(req *models.AnthropicRequest, modelOverride string) ([]byte, chatCompletionsMode, error) {
 	oaiReq, err := TranslateAnthropicToOpenAI(req)
 	if err != nil {
 		return nil, chatCompletionsMode{}, err
+	}
+	if modelOverride = strings.TrimSpace(modelOverride); modelOverride != "" {
+		oaiReq.Model = modelOverride
 	}
 
 	mode := chatCompletionsMode{
@@ -100,6 +107,18 @@ func prepareAnthropicChatCompletionsRequest(req *models.AnthropicRequest) ([]byt
 		return nil, chatCompletionsMode{}, err
 	}
 	return body, mode, nil
+}
+
+func (h *ProxyHandler) anthropicChatTranslationModel(model string) string {
+	rawModel := strings.TrimSpace(model)
+	if rawModel != "" {
+		if setup := h.providerSetup(); setup != nil {
+			if _, known := setup.lookupModel(rawModel); known {
+				return rawModel
+			}
+		}
+	}
+	return NormalizeModelName(rawModel)
 }
 
 func mapAnthropicUpstreamStatus(statusCode int) string {
@@ -145,12 +164,12 @@ func anthropicExtraHeadersFromRequest(r *http.Request) http.Header {
 }
 
 func (h *ProxyHandler) shouldForwardAnthropicMessagesDirect(model string) bool {
-	provider, _, _ := h.resolveProviderModel(NormalizeModelName(model), providerEndpointMessages)
+	provider, _, _ := h.resolveProviderModelForRequest(model, providerEndpointMessages)
 	return provider != nil && provider.kind == providerTypeAnthropicCompatible
 }
 
 func (h *ProxyHandler) shouldForwardAnthropicCountTokensDirect(model string) bool {
-	provider, _, _ := h.resolveProviderModel(NormalizeModelName(model), providerEndpointMessages)
+	provider, _, _ := h.resolveProviderModelForRequest(model, providerEndpointMessages)
 	return provider != nil && provider.kind == providerTypeAnthropicCompatible
 }
 
@@ -213,7 +232,7 @@ func (h *ProxyHandler) directAnthropicResponseModels(req *models.AnthropicReques
 	}
 	publicModel := strings.TrimSpace(req.Model)
 	upstreamModel := publicModel
-	_, owner, known := h.resolveProviderModel(NormalizeModelName(req.Model), providerEndpointMessages)
+	_, owner, known := h.resolveProviderModelForRequest(req.Model, providerEndpointMessages)
 	if !known {
 		return publicModel, upstreamModel
 	}
@@ -282,10 +301,13 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	directAnthropic := h.shouldForwardAnthropicMessagesDirect(req.Model)
 	providerEndpoint := providerEndpointChatCompletions
+	providerModel := req.Model
 	if directAnthropic {
 		providerEndpoint = providerEndpointMessages
+	} else {
+		providerModel = h.anthropicChatTranslationModel(req.Model)
 	}
-	h.observeRequestSummary(r.Context(), "anthropic", req.Model, req.Stream, providerEndpoint)
+	h.observeRequestSummaryWithProviderModel(r.Context(), "anthropic", req.Model, providerModel, req.Stream, providerEndpoint)
 
 	if directAnthropic {
 		h.forwardAnthropicMessagesDirect(w, r, body, &req)
@@ -293,7 +315,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	}
 
 	scope := chatToolExecutionScopeFromHeaders(r.Header)
-	oaiBody, mode, err := prepareAnthropicChatCompletionsRequest(&req)
+	oaiBody, mode, err := prepareAnthropicChatCompletionsRequestWithModelOverride(&req, providerModel)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("translation error: %v", err))
 		return
@@ -380,17 +402,20 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 
 	directAnthropic := h.shouldForwardAnthropicCountTokensDirect(req.Model)
 	providerEndpoint := providerEndpointChatCompletions
+	providerModel := req.Model
 	if directAnthropic {
 		providerEndpoint = providerEndpointMessages
+	} else {
+		providerModel = h.anthropicChatTranslationModel(req.Model)
 	}
-	h.observeRequestSummary(r.Context(), "anthropic_count_tokens", req.Model, false, providerEndpoint)
+	h.observeRequestSummaryWithProviderModel(r.Context(), "anthropic_count_tokens", req.Model, providerModel, false, providerEndpoint)
 
 	if directAnthropic {
 		h.forwardAnthropicCountTokensDirect(w, r, body)
 		return
 	}
 
-	oaiReq, err := prepareAnthropicCountTokensProbeRequest(&req)
+	oaiReq, err := prepareAnthropicCountTokensProbeRequestWithModelOverride(&req, providerModel)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("translation error: %v", err))
 		return
@@ -420,9 +445,16 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 }
 
 func prepareAnthropicCountTokensProbeRequest(req *models.AnthropicRequest) (*models.OpenAIRequest, error) {
+	return prepareAnthropicCountTokensProbeRequestWithModelOverride(req, "")
+}
+
+func prepareAnthropicCountTokensProbeRequestWithModelOverride(req *models.AnthropicRequest, modelOverride string) (*models.OpenAIRequest, error) {
 	oaiReq, err := TranslateAnthropicToOpenAI(req)
 	if err != nil {
 		return nil, err
+	}
+	if modelOverride = strings.TrimSpace(modelOverride); modelOverride != "" {
+		oaiReq.Model = modelOverride
 	}
 
 	stream := false

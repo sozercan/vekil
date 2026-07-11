@@ -228,16 +228,16 @@ func (s *RequestSummary) LoggerFields() []logger.Field {
 }
 
 func (h *ProxyHandler) observeRequestSummary(ctx context.Context, endpoint, model string, stream bool, providerEndpoint string) {
+	h.observeRequestSummaryWithProviderModel(ctx, endpoint, model, model, stream, providerEndpoint)
+}
+
+func (h *ProxyHandler) observeRequestSummaryWithProviderModel(ctx context.Context, endpoint, model, providerModel string, stream bool, providerEndpoint string) {
 	summary := RequestSummaryFromContext(ctx)
 	if summary == nil {
 		return
 	}
 	summary.setRoute(endpoint, model, stream)
-	lookupModel := strings.TrimSpace(model)
-	if providerEndpoint == providerEndpointMessages {
-		lookupModel = NormalizeModelName(lookupModel)
-	}
-	provider, _, _ := h.resolveProviderModel(lookupModel, providerEndpoint)
+	provider, _, _ := h.resolveProviderModelForRequest(providerModel, providerEndpoint)
 	if provider == nil {
 		return
 	}

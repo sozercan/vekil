@@ -43,6 +43,9 @@ const (
 	modelsUpstreamTimeout = 30 * time.Second
 	// modelsCacheTTL is how long the /models response is cached.
 	modelsCacheTTL = 5 * time.Minute
+	// modelsCacheMaxEntries bounds caller-specific /models query variants while
+	// retaining enough room for common client-version and feature queries.
+	modelsCacheMaxEntries = 64
 	// syntheticCompactionPrefix marks proxy-owned compaction payloads so they
 	// can be expanded back into normal context on subsequent /responses calls.
 	syntheticCompactionPrefix = "vekil.compaction.v1:"
@@ -74,8 +77,9 @@ var preferredResponsesFallbackModels = []string{
 
 // modelsCache holds a cached /models response to avoid repeated upstream calls.
 type modelsCache struct {
-	mu      sync.RWMutex
-	entries map[string]cachedModelsResponse
+	canonicalMu sync.Mutex
+	mu          sync.RWMutex
+	entries     map[string]cachedModelsResponse
 }
 
 type cachedModelsResponse struct {
@@ -712,6 +716,109 @@ func writeCachedModelsResponse(w http.ResponseWriter, entry cachedModelsResponse
 	_, _ = w.Write(entry.body)
 }
 
+func (h *ProxyHandler) storeModelsCacheEntry(cacheKey string, entry cachedModelsResponse) {
+	if h == nil {
+		return
+	}
+
+	now := time.Now()
+	h.models.mu.Lock()
+	defer h.models.mu.Unlock()
+
+	if h.models.entries == nil {
+		h.models.entries = make(map[string]cachedModelsResponse)
+	}
+	for key, cached := range h.models.entries {
+		if key == "" {
+			continue
+		}
+		if !cached.expiry.IsZero() && !now.Before(cached.expiry) {
+			delete(h.models.entries, key)
+		}
+	}
+
+	delete(h.models.entries, cacheKey)
+	for len(h.models.entries) >= modelsCacheMaxEntries {
+		evictionKey, ok := oldestModelsCacheEntry(h.models.entries, true)
+		if !ok {
+			evictionKey, ok = oldestModelsCacheEntry(h.models.entries, false)
+		}
+		if !ok {
+			break
+		}
+		delete(h.models.entries, evictionKey)
+	}
+	h.models.entries[cacheKey] = entry
+}
+
+func oldestModelsCacheEntry(entries map[string]cachedModelsResponse, skipCanonical bool) (string, bool) {
+	var oldestKey string
+	var oldestExpiry time.Time
+	found := false
+	for key, entry := range entries {
+		if skipCanonical && key == "" {
+			continue
+		}
+		if !found || entry.expiry.Before(oldestExpiry) {
+			oldestKey = key
+			oldestExpiry = entry.expiry
+			found = true
+		}
+	}
+	return oldestKey, found
+}
+
+func isCanonicalModelsQuery(rawQuery string) bool {
+	return strings.TrimSpace(rawQuery) == ""
+}
+
+func (h *ProxyHandler) replaceModelsCacheWithCanonical(entry cachedModelsResponse) {
+	if h == nil {
+		return
+	}
+	h.models.mu.Lock()
+	h.models.entries = map[string]cachedModelsResponse{"": entry}
+	h.models.mu.Unlock()
+}
+
+func (h *ProxyHandler) ensureCanonicalModelsCacheEntry(ctx context.Context) (cachedModelsResponse, bool, error) {
+	if h == nil {
+		return cachedModelsResponse{}, false, fmt.Errorf("proxy handler is required")
+	}
+
+	h.models.canonicalMu.Lock()
+	defer h.models.canonicalMu.Unlock()
+
+	h.models.mu.RLock()
+	entry, ok := h.models.entries[""]
+	h.models.mu.RUnlock()
+	if ok && time.Now().Before(entry.expiry) {
+		return entry, true, nil
+	}
+
+	ifNoneMatch := ""
+	if ok {
+		ifNoneMatch = entry.etag
+	}
+	refreshed, notModified, err := h.buildMergedModelsEntry(ctx, "", ifNoneMatch)
+	if err != nil {
+		return entry, ok, err
+	}
+	if notModified {
+		if !ok {
+			return cachedModelsResponse{}, false, fmt.Errorf("canonical models request unexpectedly returned not modified without a cached entry")
+		}
+		entry.expiry = time.Now().Add(modelsCacheTTL)
+		h.storeModelsCacheEntry("", entry)
+		return entry, true, nil
+	}
+	if refreshed.statusCode != http.StatusOK {
+		return entry, ok, fmt.Errorf("canonical models request returned status %d", refreshed.statusCode)
+	}
+	h.replaceModelsCacheWithCanonical(refreshed)
+	return refreshed, true, nil
+}
+
 // HandleHealthz handles GET /healthz and returns {"status":"ok"}.
 func (h *ProxyHandler) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -787,6 +894,8 @@ func providerSkipsReadyzProbe(provider *providerRuntime) bool {
 		return false
 	}
 	switch provider.kind {
+	case providerTypeAzureOpenAI:
+		return true
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		return provider.modelDiscovery == providerModelDiscoveryStatic
 	default:
@@ -880,7 +989,35 @@ func writeReadyzStatus(w http.ResponseWriter, statusCode int, status string, err
 // repeated upstream calls.
 func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	cacheKey := r.URL.RawQuery
-	now := time.Now()
+	canonicalQuery := isCanonicalModelsQuery(cacheKey)
+
+	ctx, cancel := context.WithTimeout(context.Background(), modelsUpstreamTimeout)
+	defer cancel()
+
+	canonicalEntry, hasCanonicalEntry, err := h.ensureCanonicalModelsCacheEntry(ctx)
+	if err != nil {
+		h.log.Error("upstream request failed", logger.F("endpoint", "models"), logger.Err(err))
+		if canonicalQuery && hasCanonicalEntry {
+			writeCachedModelsResponse(w, canonicalEntry)
+			return
+		}
+		if !canonicalQuery && hasCanonicalEntry {
+			h.models.mu.RLock()
+			cachedEntry, hasCachedEntry := h.models.entries[cacheKey]
+			h.models.mu.RUnlock()
+			if hasCachedEntry {
+				writeCachedModelsResponse(w, cachedEntry)
+				return
+			}
+		}
+		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
+		return
+	}
+	if canonicalQuery {
+		writeCachedModelsResponse(w, canonicalEntry)
+		return
+	}
 
 	var cachedEntry cachedModelsResponse
 	var hasCachedEntry bool
@@ -891,19 +1028,12 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	h.models.mu.RUnlock()
 
 	// Without an ETag we cannot safely revalidate, so honor the TTL-based cache.
-	if hasCachedEntry && cachedEntry.etag == "" && now.Before(cachedEntry.expiry) {
+	if hasCachedEntry && cachedEntry.etag == "" && time.Now().Before(cachedEntry.expiry) {
 		writeCachedModelsResponse(w, cachedEntry)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), modelsUpstreamTimeout)
-	defer cancel()
-
-	conditionalETag := ""
-	if hasCachedEntry {
-		conditionalETag = cachedEntry.etag
-	}
-	entry, notModified, err := h.buildMergedModelsEntry(ctx, cacheKey, conditionalETag)
+	entry, notModified, err := h.buildMergedModelsEntry(ctx, cacheKey, "")
 	if err != nil {
 		h.log.Error("upstream request failed", logger.F("endpoint", "models"), logger.Err(err))
 		if hasCachedEntry {
@@ -917,12 +1047,7 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 
 	if notModified && hasCachedEntry {
 		cachedEntry.expiry = time.Now().Add(modelsCacheTTL)
-		h.models.mu.Lock()
-		if h.models.entries == nil {
-			h.models.entries = make(map[string]cachedModelsResponse)
-		}
-		h.models.entries[cacheKey] = cachedEntry
-		h.models.mu.Unlock()
+		h.storeModelsCacheEntry(cacheKey, cachedEntry)
 
 		writeCachedModelsResponse(w, cachedEntry)
 		return
@@ -930,12 +1055,7 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 
 	// Cache successful responses
 	if entry.statusCode == http.StatusOK {
-		h.models.mu.Lock()
-		if h.models.entries == nil {
-			h.models.entries = make(map[string]cachedModelsResponse)
-		}
-		h.models.entries[cacheKey] = entry
-		h.models.mu.Unlock()
+		h.storeModelsCacheEntry(cacheKey, entry)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -948,6 +1068,7 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 
 func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifNoneMatch string) (cachedModelsResponse, bool, error) {
 	setup := h.providerSetup()
+	canonicalRefresh := isCanonicalModelsQuery(rawQuery)
 	rawEntries := make([]json.RawMessage, 0)
 	owners := make(map[string]string)
 	refreshedDynamicModels := make(map[string][]providerModel)
@@ -988,7 +1109,9 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 				continue
 			}
 			allDynamicProvidersUnchanged = false
-			refreshedDynamicModels[provider.id] = models
+			if canonicalRefresh {
+				refreshedDynamicModels[provider.id] = models
+			}
 			if result.etag != "" {
 				mergedETag = result.etag
 			}

@@ -135,10 +135,10 @@ func (p *providerRuntime) allowsUnknownModelEndpoint(endpoint string) bool {
 	if p == nil {
 		return false
 	}
-	if p.endpointPolicy().allowAnyUnknownModel {
-		return true
+	if !providerUsesDynamicModels(p) || providerHasModelFilters(p) {
+		return false
 	}
-	return providerUsesDynamicModels(p) && p.endpointPolicy().allowsUnknownModelEndpoint(endpoint)
+	return p.endpointPolicy().allowsUnknownModelEndpoint(endpoint)
 }
 
 func (p *providerRuntime) acceptsDiscoveredModelEndpoint(endpoint string) bool {

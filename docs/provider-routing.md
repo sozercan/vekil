@@ -46,6 +46,8 @@ When `auth_type` is omitted, Vekil uses `bearer` if `api_key` or `api_key_env` i
 
 Use `--providers-config` when you want explicit ownership of public model IDs across providers such as GitHub Copilot, Azure OpenAI, OpenAI Codex, or generic OpenAI-compatible and Anthropic-compatible upstreams. Provider config files can be JSON (`.json`) or YAML (`.yaml`/`.yml`).
 
+Provider config decoding is strict. Unknown top-level fields and unknown fields in provider or `models[]` objects are rejected so typos do not silently change routing. A JSON file must contain exactly one value, and a YAML file must contain exactly one document.
+
 You can run Azure-only or Codex-only configs, or mix those providers with Copilot behind the same local endpoint.
 
 ### Azure-Only Example
@@ -298,6 +300,7 @@ Routing rules:
 - Clients keep using plain model IDs such as `gpt-5.4-pro`.
 - Azure `deployment` is the upstream model name; the proxy rewrites the public ID before forwarding.
 - Azure `models[]` remains the routing source of truth. The proxy does not autodiscover new Azure deployments for inference.
+- Azure is treated as a static provider for `/readyz`: readiness does not depend on Azure's optional `/models` endpoint. `GET /v1/models` may still probe Azure `/models` for best-effort metadata enrichment.
 - OpenAI Codex discovers models dynamically from its upstream `/models` endpoint and exposes only models that are listed and supported in the API.
 - OpenAI Codex models are `/responses`-only. The proxy rejects `/chat/completions` for those models instead of probing an unsupported route.
 - Azure `auth_mode` is optional and defaults to `api_key`. Supported values are `api_key` and `azure_identity`.
@@ -311,6 +314,9 @@ Routing rules:
 - Public model IDs are global across all providers. Startup fails if two providers expose the same ID.
 - `include_models` is the recommended way to use dynamic providers without prefixes. It lets you opt into only the discovered model IDs that should belong to that provider.
 - `exclude_models` lets one provider give ownership of a public ID to another provider.
+- Configuring `include_models` or `exclude_models` on a dynamic provider forces canonical model discovery during initialization, even when it is the only provider; initialization fails if that discovery fails. When discovery is explicitly deferred, `/readyz` remains not ready until `ValidateDynamicProviderModels` completes.
+- Unknown-model passthrough is available only on unfiltered dynamic providers. Once `include_models` or `exclude_models` is configured, a request must resolve to a model retained in that provider's canonical discovered catalog or it fails locally with `400`.
+- Only a queryless canonical `/v1/models` build may refresh global dynamic model ownership. If the first caller request has a query string, the proxy performs and caches an internal queryless canonical build before returning the query-specific variant; the variant itself never replaces routing state.
 - Only one Copilot provider is supported in a config today.
 - For Copilot-discovered models, Codex-compatible `/v1/models` metadata treats `capabilities.limits.max_prompt_tokens` as the active `context_window` and keeps `max_context_window_tokens` as `max_context_window`. If Copilot omits the prompt cap, the proxy falls back to the total context window.
 - `models[].endpoints` is an allowlist, not a guess. Keep it limited to the routes you have validated for that deployment.

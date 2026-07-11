@@ -249,12 +249,30 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".yaml", ".yml":
-		if err := yaml.Unmarshal(body, cfg); err != nil {
+		decoder := yaml.NewDecoder(bytes.NewReader(body))
+		decoder.KnownFields(true)
+		if err := decoder.Decode(cfg); err != nil {
 			return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
 		}
+		var extra interface{}
+		if err := decoder.Decode(&extra); err != io.EOF {
+			if err != nil {
+				return fmt.Errorf("decode providers config %q as YAML: trailing document: %w", path, err)
+			}
+			return fmt.Errorf("decode providers config %q as YAML: more than one YAML document", path)
+		}
 	default:
-		if err := json.Unmarshal(body, cfg); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(cfg); err != nil {
 			return fmt.Errorf("decode providers config %q as JSON: %w", path, err)
+		}
+		var extra interface{}
+		if err := decoder.Decode(&extra); err != io.EOF {
+			if err != nil {
+				return fmt.Errorf("decode providers config %q as JSON: trailing value: %w", path, err)
+			}
+			return fmt.Errorf("decode providers config %q as JSON: more than one JSON value", path)
 		}
 	}
 	return nil
@@ -411,7 +429,7 @@ func (h *ProxyHandler) initializeProviders() error {
 		return err
 	}
 	h.providersState = setup
-	h.dynamicProviderValidationPending.Store(h.deferDynamicProviderModelRefresh && len(setup.providers) > 1 && hasDynamicProvider(setup.providers))
+	h.dynamicProviderValidationPending.Store(h.deferDynamicProviderModelRefresh && needsDynamicProviderModelValidation(setup.providers))
 	return nil
 }
 
@@ -433,7 +451,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 		hasConfiguredState: true,
 	}
 
-	needsDynamicModelValidation := len(providers) > 1 && hasDynamicProvider(providers)
+	needsDynamicModelValidation := needsDynamicProviderModelValidation(providers)
 
 	if !needsDynamicModelValidation || !validateDynamicModels {
 		for _, providerID := range providerOrder {
@@ -477,7 +495,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 // model-map updates are applied through providerSetup's locked replacement path.
 func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error {
 	setup := h.providerSetup()
-	if setup == nil || !setup.hasConfiguredState || len(setup.providers) <= 1 || !hasDynamicProvider(setup.providers) {
+	if setup == nil || !setup.hasConfiguredState || !needsDynamicProviderModelValidation(setup.providers) {
 		h.dynamicProviderValidationPending.Store(false)
 		return nil
 	}
@@ -919,13 +937,18 @@ func filterProviderModels(provider *providerRuntime, models []providerModel) []p
 	return filtered
 }
 
-func hasDynamicProvider(providers map[string]*providerRuntime) bool {
+func needsDynamicProviderModelValidation(providers map[string]*providerRuntime) bool {
+	multipleProviders := len(providers) > 1
 	for _, provider := range providers {
-		if providerUsesDynamicModels(provider) {
+		if providerUsesDynamicModels(provider) && (multipleProviders || providerHasModelFilters(provider)) {
 			return true
 		}
 	}
 	return false
+}
+
+func providerHasModelFilters(provider *providerRuntime) bool {
+	return provider != nil && (len(provider.includeModels) > 0 || len(provider.excludeModels) > 0)
 }
 
 func providerUsesDynamicModels(provider *providerRuntime) bool {
@@ -1160,6 +1183,20 @@ func (h *ProxyHandler) resolveProviderModel(model, endpoint string) (*providerRu
 		providerID:         defaultProvider.id,
 		supportedEndpoints: nil,
 	}, false
+}
+
+func (h *ProxyHandler) resolveProviderModelForRequest(model, endpoint string) (*providerRuntime, providerModel, bool) {
+	rawModel := strings.TrimSpace(model)
+	rawProvider, rawOwner, rawKnown := h.resolveProviderModel(rawModel, endpoint)
+	if rawKnown || endpoint != providerEndpointMessages {
+		return rawProvider, rawOwner, rawKnown
+	}
+
+	normalizedModel := NormalizeModelName(rawModel)
+	if normalizedModel == rawModel {
+		return rawProvider, rawOwner, false
+	}
+	return h.resolveProviderModel(normalizedModel, endpoint)
 }
 
 func providerModelSupportsEndpoint(model providerModel, endpoint string) bool {
@@ -1539,7 +1576,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 		if err != nil {
 			return providerModelsFetchResult{}, err
 		}
-		result.models = models
+		result.models = filterProviderModels(provider, models)
 		return result, nil
 	case providerTypeOpenAICodex:
 		modelsQuery := openAICodexModelsRawQuery(rawQuery)
@@ -1855,9 +1892,6 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 		if publicID == "" {
 			continue
 		}
-		if !provider.allowsModel(publicID) {
-			continue
-		}
 		if provider.modelDiscovery == providerModelDiscoveryOpenRouterTools && !openRouterModelSupportsTools(parsed.SupportedParams) {
 			continue
 		}
@@ -1920,8 +1954,11 @@ func openRouterModelSupportsTools(supportedParams []string) bool {
 }
 
 func mergeDiscoveredProviderModelsWithStaticConfig(provider *providerRuntime, discovered []providerModel) []providerModel {
-	if provider == nil || len(discovered) == 0 || len(provider.staticConfigs) == 0 {
+	if provider == nil {
 		return discovered
+	}
+	if len(discovered) == 0 || len(provider.staticConfigs) == 0 {
+		return filterProviderModels(provider, discovered)
 	}
 
 	merged := make([]providerModel, 0, len(discovered))
@@ -1945,7 +1982,7 @@ func mergeDiscoveredProviderModelsWithStaticConfig(provider *providerRuntime, di
 			merged = append(merged, staticModel)
 		}
 	}
-	return merged
+	return filterProviderModels(provider, merged)
 }
 
 func staticConfigsForDiscoveredProviderModel(provider *providerRuntime, model providerModel) []ProviderModelConfig {
@@ -1999,10 +2036,6 @@ func decodeOllamaModelsFromBody(provider *providerRuntime, body []byte) ([]provi
 		if _, duplicate := seen[publicID]; duplicate {
 			continue
 		}
-		if !provider.allowsModel(publicID) {
-			continue
-		}
-
 		cfg := ProviderModelConfig{
 			PublicID:  publicID,
 			Name:      publicID,

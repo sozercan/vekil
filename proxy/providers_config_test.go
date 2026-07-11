@@ -585,6 +585,95 @@ func TestLoadProvidersConfigFileRejectsEmptyBody(t *testing.T) {
 	}
 }
 
+func TestLoadProvidersConfigFileRejectsUnknownFieldsAndExtraDocuments(t *testing.T) {
+	t.Parallel()
+
+	validProviderJSON := `{"id":"local","type":"openai-compatible","base_url":"http://localhost:1234","auth_type":"none","models":[{"public_id":"local-model"}]}`
+	validProviderYAML := `
+  - id: local
+    type: openai-compatible
+    base_url: http://localhost:1234
+    auth_type: none
+    models:
+      - public_id: local-model`
+
+	testCases := []struct {
+		name string
+		ext  string
+		body string
+		want string
+	}{
+		{
+			name: "JSON unknown top-level field",
+			ext:  ".json",
+			body: `{"providers":[],"providerz":[]}`,
+			want: "providerz",
+		},
+		{
+			name: "YAML unknown top-level field",
+			ext:  ".yaml",
+			body: "providers: []\nproviderz: []\n",
+			want: "providerz",
+		},
+		{
+			name: "JSON unknown provider field",
+			ext:  ".json",
+			body: `{"providers":[` + strings.TrimSuffix(validProviderJSON, `}`) + `,"timeout_ms":1000}]}`,
+			want: "timeout_ms",
+		},
+		{
+			name: "YAML unknown provider field",
+			ext:  ".yaml",
+			body: "providers:" + validProviderYAML + "\n    timeout_ms: 1000\n",
+			want: "timeout_ms",
+		},
+		{
+			name: "JSON model endpoint typo",
+			ext:  ".json",
+			body: `{"providers":[{"id":"local","type":"openai-compatible","base_url":"http://localhost:1234","auth_type":"none","models":[{"public_id":"local-model","endpoint":["/chat/completions"]}]}]}`,
+			want: "endpoint",
+		},
+		{
+			name: "YAML model endpoint typo",
+			ext:  ".yaml",
+			body: "providers:" + validProviderYAML + "\n        endpoint:\n          - /chat/completions\n",
+			want: "endpoint",
+		},
+		{
+			name: "trailing JSON value",
+			ext:  ".json",
+			body: `{"providers":[]} {"providers":[]}`,
+			want: "more than one JSON value",
+		},
+		{
+			name: "multiple YAML documents",
+			ext:  ".yaml",
+			body: "providers: []\n---\nproviders: []\n",
+			want: "more than one YAML document",
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			providersPath := filepath.Join(t.TempDir(), "providers"+tc.ext)
+			if err := os.WriteFile(providersPath, []byte(tc.body), 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+
+			_, err := LoadProvidersConfigFile(providersPath)
+			if err == nil {
+				t.Fatal("LoadProvidersConfigFile() error = nil, want strict decode error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadProvidersConfigFile() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadProvidersConfigFileAllowsExplicitEmptyProviders(t *testing.T) {
 	t.Parallel()
 
