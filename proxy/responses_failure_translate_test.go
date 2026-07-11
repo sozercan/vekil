@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -320,6 +322,124 @@ func TestPeekAndForwardResponses_ClientDisconnectDuringPeekClosesUpstream(t *tes
 	}
 }
 
+func TestResponsesPreparedBodyCloseUnblocksCompletedPumpWithQueuedTrailingData(t *testing.T) {
+	prefix := []byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n")
+	trailing := append([]byte("data: "), bytes.Repeat([]byte("x"), 1<<20)...)
+	trailing = append(trailing, '\n', '\n')
+
+	pr, pw := io.Pipe()
+	chunkCh := make(chan responsesPeekChunk, 1)
+	chunkCh <- responsesPeekChunk{data: trailing}
+	abortCh := make(chan struct{})
+	var abortOnce sync.Once
+	body := &responsesPreparedBody{
+		reader: pr,
+		closeFn: func() {
+			abortOnce.Do(func() { close(abortCh) })
+		},
+	}
+
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		writePrefixAndDrainResponsesStream(pw, prefix, chunkCh, abortCh, false, nil)
+	}()
+
+	err := consumeResponsesSSEData(body, func(data string) error {
+		if strings.Contains(data, `"type":"response.completed"`) {
+			return errResponsesWebSocketStreamTerminal
+		}
+		return nil
+	})
+	if !errors.Is(err, errResponsesWebSocketStreamTerminal) {
+		t.Fatalf("consumeResponsesSSEData error = %v, want terminal sentinel", err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for len(chunkCh) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("pump did not dequeue separately queued trailing data")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-pumpDone:
+		t.Fatal("pump unexpectedly exited before the prepared body was closed")
+	default:
+	}
+
+	if err := body.Close(); err != nil {
+		t.Fatalf("prepared body Close() error = %v", err)
+	}
+	select {
+	case <-pumpDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("closing prepared body did not unblock pump blocked in pipe write")
+	}
+}
+
+func TestRunResponsesPeekPump_CompletedWithQueuedTrailingDataAlwaysExits(t *testing.T) {
+	for iteration := range 50 {
+		upstream := newCompletedThenTrailingReadCloser()
+		pr, pw := io.Pipe()
+		peekDone := make(chan peekResult, 1)
+		commitCh := make(chan struct{})
+		abortCh := make(chan struct{})
+		var abortOnce sync.Once
+		abort := func() {
+			abortOnce.Do(func() {
+				close(abortCh)
+				_ = upstream.Close()
+			})
+		}
+		body := &responsesPreparedBody{reader: pr, closeFn: abort}
+		pumpDone := make(chan struct{})
+		go func() {
+			defer close(pumpDone)
+			runResponsesPeekPump(upstream, pw, http.Header{}, peekDone, commitCh, abortCh, responsesPrecommitMaxPeekBytes)
+		}()
+
+		select {
+		case result := <-peekDone:
+			if result.decision != responsesPeekDecisionPassthrough {
+				t.Fatalf("iteration %d peek decision = %v, want passthrough", iteration, result.decision)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d timed out waiting for peek decision", iteration)
+		}
+		select {
+		case <-upstream.trailingQueued:
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d trailing data was not separately queued", iteration)
+		}
+		close(commitCh)
+
+		err := consumeResponsesSSEData(body, func(data string) error {
+			if strings.Contains(data, `"type":"response.completed"`) {
+				return errResponsesWebSocketStreamTerminal
+			}
+			return nil
+		})
+		if !errors.Is(err, errResponsesWebSocketStreamTerminal) {
+			t.Fatalf("iteration %d consume error = %v, want terminal sentinel", iteration, err)
+		}
+		if err := body.Close(); err != nil {
+			t.Fatalf("iteration %d prepared body Close() error = %v", iteration, err)
+		}
+		select {
+		case <-pumpDone:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("iteration %d prepared-stream pump did not exit", iteration)
+		}
+		select {
+		case <-upstream.readerDone:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("iteration %d upstream reader goroutine did not exit", iteration)
+		}
+	}
+}
+
 func cloneHeader(src http.Header) http.Header {
 	dst := make(http.Header, len(src))
 	for key, values := range src {
@@ -377,6 +497,50 @@ func (r *timeoutReadCloser) Close() error {
 type blockingReadCloser struct {
 	closed chan struct{}
 	once   sync.Once
+}
+
+type completedThenTrailingReadCloser struct {
+	mu             sync.Mutex
+	step           int
+	closed         chan struct{}
+	closeOnce      sync.Once
+	trailingQueued chan struct{}
+	trailingOnce   sync.Once
+	readerDone     chan struct{}
+	readerDoneOnce sync.Once
+}
+
+func newCompletedThenTrailingReadCloser() *completedThenTrailingReadCloser {
+	return &completedThenTrailingReadCloser{
+		closed:         make(chan struct{}),
+		trailingQueued: make(chan struct{}),
+		readerDone:     make(chan struct{}),
+	}
+}
+
+func (r *completedThenTrailingReadCloser) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	step := r.step
+	r.step++
+	r.mu.Unlock()
+
+	switch step {
+	case 0:
+		return copy(p, []byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-queued\"}}\n\n"+
+			"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-queued\"}}\n\n")), nil
+	case 1:
+		return copy(p, []byte("data: trailing-after-completed\n\n")), nil
+	default:
+		r.trailingOnce.Do(func() { close(r.trailingQueued) })
+		<-r.closed
+		r.readerDoneOnce.Do(func() { close(r.readerDone) })
+		return 0, io.EOF
+	}
+}
+
+func (r *completedThenTrailingReadCloser) Close() error {
+	r.closeOnce.Do(func() { close(r.closed) })
+	return nil
 }
 
 func newBlockingReadCloser() *blockingReadCloser {

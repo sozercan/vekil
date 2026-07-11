@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -9,9 +10,11 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
@@ -363,5 +366,164 @@ func TestStreamingChatCompletionsPassthroughThroughServer(t *testing.T) {
 	}
 	if got := entry["upstream_request_id"]; got != "req-stream-456" {
 		t.Fatalf("log[upstream_request_id] = %#v, want req-stream-456", got)
+	}
+}
+
+func TestStopCancelsActiveResponsesWebSocketInference(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	var startedOnce sync.Once
+	var canceledOnce sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		startedOnce.Do(func() { close(started) })
+		<-r.Context().Done()
+		canceledOnce.Do(func() { close(canceled) })
+	}))
+	defer upstream.Close()
+
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		"127.0.0.1",
+		"0",
+		WithProxyOptions(proxy.WithCopilotBaseURL(upstream.URL)),
+		WithResponsesWebSocketConfig(proxy.ResponsesWebSocketConfig{Enabled: true, DisableAutoCompact: true}),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	testServer := httptest.NewServer(srv.httpServer.Handler)
+	defer testServer.Close()
+
+	conn := dialServerResponsesWebSocket(t, testServer)
+	defer func() { _ = conn.Close() }()
+	if err := conn.WriteJSON(serverResponsesWebSocketRequest(nil)); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for active websocket inference")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := srv.Stop(ctx); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Stop did not cancel active websocket inference")
+	}
+}
+
+func TestStopCancelsResponsesWebSocketAutoCompaction(t *testing.T) {
+	compactionStarted := make(chan struct{})
+	compactionCanceled := make(chan struct{})
+	var startedOnce sync.Once
+	var canceledOnce sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream body: %v", err)
+			return
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Errorf("decode upstream body: %v", err)
+			return
+		}
+		if instructions, _ := body["instructions"].(string); strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
+			startedOnce.Do(func() { close(compactionStarted) })
+			<-r.Context().Done()
+			canceledOnce.Do(func() { close(compactionCanceled) })
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-stop-compact\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-1\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-2\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-3\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-stop-compact\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n")
+	}))
+	defer upstream.Close()
+
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		"127.0.0.1",
+		"0",
+		WithProxyOptions(proxy.WithCopilotBaseURL(upstream.URL)),
+		WithResponsesWebSocketConfig(proxy.ResponsesWebSocketConfig{
+			Enabled:             true,
+			AutoCompactMaxItems: 2,
+			AutoCompactMaxBytes: 1 << 20,
+			AutoCompactKeepTail: 1,
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	testServer := httptest.NewServer(srv.httpServer.Handler)
+	defer testServer.Close()
+
+	conn := dialServerResponsesWebSocket(t, testServer)
+	defer func() { _ = conn.Close() }()
+	if err := conn.WriteJSON(serverResponsesWebSocketRequest([]interface{}{
+		map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "compact"}}},
+	})); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+	for range 5 {
+		if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatalf("set websocket read deadline: %v", err)
+		}
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Fatalf("read websocket response: %v", err)
+		}
+	}
+	select {
+	case <-compactionStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for websocket auto-compaction")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := srv.Stop(ctx); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	select {
+	case <-compactionCanceled:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Stop did not cancel websocket auto-compaction")
+	}
+}
+
+func dialServerResponsesWebSocket(t *testing.T, server *httptest.Server) *websocket.Conn {
+	t.Helper()
+	url := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		t.Fatalf("dial websocket %s: %v", url, err)
+	}
+	return conn
+}
+
+func serverResponsesWebSocketRequest(input []interface{}) map[string]interface{} {
+	return map[string]interface{}{
+		"type":                "response.create",
+		"model":               "gpt-5.4",
+		"instructions":        "You are helpful",
+		"input":               input,
+		"tools":               []interface{}{},
+		"tool_choice":         "auto",
+		"parallel_tool_calls": true,
+		"store":               false,
+		"stream":              true,
+		"include":             []string{},
 	}
 }

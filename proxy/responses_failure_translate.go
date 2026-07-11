@@ -80,8 +80,10 @@ type responsesPreparedStream struct {
 }
 
 type responsesPreparedBody struct {
-	reader  *io.PipeReader
-	closeFn func()
+	reader    *io.PipeReader
+	closeFn   func()
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (b *responsesPreparedBody) Read(p []byte) (int, error) {
@@ -89,10 +91,18 @@ func (b *responsesPreparedBody) Read(p []byte) (int, error) {
 }
 
 func (b *responsesPreparedBody) Close() error {
-	if b.closeFn != nil {
-		b.closeFn()
-	}
-	return nil
+	b.closeOnce.Do(func() {
+		// Closing the reader is required in addition to aborting the upstream.
+		// A committed pump may already be blocked inside pw.Write, where it cannot
+		// observe abortCh until the reader side is closed.
+		if b.reader != nil {
+			b.closeErr = b.reader.CloseWithError(context.Canceled)
+		}
+		if b.closeFn != nil {
+			b.closeFn()
+		}
+	})
+	return b.closeErr
 }
 
 func newResponsesPreparedStream(resp *http.Response, maxPeekBytes int) *responsesPreparedStream {

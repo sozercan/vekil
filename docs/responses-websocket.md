@@ -6,7 +6,9 @@ Important:
 
 - This websocket bridge is proxy-owned and still forwards upstream over HTTP `/responses`.
 - It is separate from Azure OpenAI's native `/realtime` websocket and WebRTC APIs.
-- Each websocket session is serialized: one active turn is processed at a time. Vekil does not multiplex turns or implement Copilot-style request superseding. Closing the websocket ends the session; once Vekil observes the disconnect, it stops relaying and closes the upstream response body while the upstream request context remains governed by the proxy streaming timeout.
+- Each websocket session is serialized: one active turn is processed at a time, with at most one additional request queued. Vekil does not multiplex turns or implement Copilot-style request superseding; clients that try to queue more than one request receive a WebSocket policy-violation close.
+- A dedicated session reader continues handling close and pong control frames while inference or automatic compaction is in progress. Client close/read failure, missed pong deadlines, and server shutdown cancel the active upstream inference or compaction promptly and prevent new turn work from starting.
+- `response.completed` is terminal for the current upstream SSE response. After forwarding and recording the completed response ID, output, and usage, Vekil closes the upstream body immediately; trailing bytes, a held-open body, or a later transport reset do not delay or fail the completed turn. `response.failed`, `response.incomplete`, and streams that end without completion remain errors.
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
