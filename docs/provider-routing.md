@@ -14,11 +14,15 @@ Plain `vekil login` refreshes an existing Vekil-managed login when possible, oth
 
 After `vekil logout` or menubar Sign Out, Vekil clears its cached credentials, disables GitHub CLI auto sign-in, and suppresses automatic GitHub CLI reuse until you explicitly opt back in with `vekil login --github-cli` or `vekil login --gh`. `COPILOT_GITHUB_TOKEN` remains an explicit override and still works while signed out.
 
+Concurrent Copilot-token refresh callers share one refresh attempt, but each caller still honors its own context deadline. The same rule applies to callers waiting for an interactive device flow.
+
 ### OpenAI Codex
 
 OpenAI Codex uses the ChatGPT/Codex CLI credentials in `~/.codex/auth.json` by default. Set `CODEX_HOME` if your Codex home lives elsewhere.
 
 OpenAI Codex requires file-based ChatGPT auth from `codex login`; API-key auth and OS keychain-backed credentials are not read by the proxy.
+
+Concurrent refresh callers share one token refresh while retaining independent deadlines. On POSIX systems, Vekil persists rotated tokens back to the authoritative `auth.json` through a mode-`0600` `.vekil-cache` transaction journal: the journal is synced before the in-place auth update, removed only after the updated file is synced, and used to recover interrupted writes. Source-digest and inode checks keep an atomic external `codex login` replacement authoritative. On Windows, Vekil reads fresh `auth.json` credentials but does not perform token refresh; run `codex login` when the file becomes stale until equivalent secure journal and atomic-update semantics are available.
 
 ### Azure OpenAI and Microsoft Foundry
 
@@ -30,6 +34,8 @@ Azure providers support two auth modes:
 For Entra auth, `token_scope` is optional and defaults to `https://ai.azure.com/.default`, which is appropriate for Microsoft Foundry OpenAI-compatible endpoints. Override it if your resource requires a different Azure audience, such as `https://cognitiveservices.azure.com/.default` for classic Azure OpenAI deployments.
 
 Vekil does not run `az login` for you. For local development, sign in with Azure CLI or another credential supported by `DefaultAzureCredential`; in hosted environments, use managed identity, workload identity, or environment credentials. The signed-in principal needs the required Azure RBAC role, for example Cognitive Services OpenAI User on the target resource.
+
+Entra token refreshes are shared across concurrent requests; waiters can time out or cancel without waiting for the leader refresh to finish.
 
 ### Generic Providers
 

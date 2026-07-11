@@ -30,7 +30,8 @@ go build -o vekil .
 Base run:
 
 ```bash
-docker run -p 1337:1337 \
+mkdir -p ~/.config/vekil
+docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot -p 1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   ghcr.io/sozercan/vekil:latest
 ```
@@ -40,27 +41,29 @@ The image sets `HOST=0.0.0.0` so published Docker ports work. Native binary and 
 With explicit provider routing:
 
 ```bash
-docker run -p 1337:1337 \
+mkdir -p ~/.config/vekil
+docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot -p 1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   -v /path/to/providers.yaml:/config/providers.yaml:ro \
   ghcr.io/sozercan/vekil:latest \
   --providers-config /config/providers.yaml
 ```
 
-If the config includes `type: "openai-codex"`, also mount the Codex home read-only:
+If the config includes `type: "openai-codex"`, also mount the Codex home read-write so Vekil can journal and persist rotated refresh tokens back to the Codex-owned `auth.json`. The `--user` setting above is required for normal host files/directories owned by your UID/GID; alternatively, arrange equivalent ownership and permissions explicitly:
 
 ```bash
--v ~/.codex:/home/nonroot/.codex:ro
+-v ~/.codex:/home/nonroot/.codex
 ```
 
-If you customize `CODEX_HOME`, set the container-side path and mount your host directory there. The published image supports `linux/amd64` and `linux/arm64`.
+If you intentionally mount it read-only, fresh access tokens work until they become stale, but Vekil cannot refresh them; run `codex login` on the host and restart the container. If you customize `CODEX_HOME`, set the container-side path and mount your host directory there. The published image supports `linux/amd64` and `linux/arm64`.
 
 ### RTK image variant
 
 Use the `-rtk` image variant when your providers config enables the optional [`rtk_cli` tool optimizer](tool-optimizers.md#rtk_cli-provider). The default image stays minimal; the RTK variant only adds the `rtk` binary and does not enable tool optimizers by itself.
 
 ```bash
-docker run -p 1337:1337 \
+mkdir -p ~/.config/vekil
+docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot -p 1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   -v /path/to/providers.yaml:/config/providers.yaml:ro \
   ghcr.io/sozercan/vekil:latest-rtk \
@@ -75,7 +78,8 @@ Build a local image:
 docker build -t vekil .
 # Optional RTK variant:
 # docker build -f Dockerfile.rtk -t vekil:rtk .
-docker run -p 1337:1337 \
+mkdir -p ~/.config/vekil
+docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot -p 1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   vekil
 ```
