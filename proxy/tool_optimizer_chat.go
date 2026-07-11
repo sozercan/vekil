@@ -28,7 +28,7 @@ func (h *ProxyHandler) maybeReduceOpenAIChatToolOutputs(ctx context.Context, req
 	if manager == nil || !manager.OutputReduceEnabled() || req == nil {
 		return 0
 	}
-	turnCtx, cancel := manager.withTurnBudget(ctx, toolOptimizerStageOutputReduce)
+	turnCtx, cancel := h.withToolOptimizerStageContext(ctx, manager, toolOptimizerStageOutputReduce)
 	defer cancel()
 	ctx = turnCtx
 
@@ -118,7 +118,7 @@ func (h *ProxyHandler) maybeRewriteOrCaptureOpenAIChatToolCommands(ctx context.C
 		return 0
 	}
 	if allowRewrite && manager.CommandRewriteEnabled() {
-		turnCtx, cancel := manager.withTurnBudget(ctx, toolOptimizerStageCommandRewrite)
+		turnCtx, cancel := h.withToolOptimizerStageContext(ctx, manager, toolOptimizerStageCommandRewrite)
 		defer cancel()
 		ctx = turnCtx
 	}
@@ -243,7 +243,7 @@ func (h *ProxyHandler) rewriteOpenAIChatRequestBodyWithToolOptimizers(ctx contex
 	if err := json.Unmarshal(rawMessages, &messages); err != nil {
 		return bodyBytes
 	}
-	turnCtx, cancel := manager.withTurnBudget(ctx, toolOptimizerStageOutputReduce)
+	turnCtx, cancel := h.withToolOptimizerStageContext(ctx, manager, toolOptimizerStageOutputReduce)
 	defer cancel()
 	ctx = turnCtx
 
@@ -316,11 +316,10 @@ func (h *ProxyHandler) rewriteOpenAIChatRequestBodyWithToolOptimizers(ctx contex
 
 func (h *ProxyHandler) maybeWriteOptimizedOpenAIChatPassthrough(ctx context.Context, w http.ResponseWriter, resp *http.Response, requestedModel string, store *ToolExecutionContextStore, scope string) error {
 	if h == nil || h.toolOptimizers == nil || !h.toolOptimizers.ShouldInspectNonStreamingResponses() || resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK {
-		h.writeOpenAIChatCompletionResponse(ctx, w, resp, requestedModel)
-		return nil
+		return h.writeOpenAIChatCompletionResponse(ctx, w, resp, requestedModel)
 	}
 
-	writePassthroughSniffingUsage(w, resp, func(bodyBytes []byte) ([]byte, bool) {
+	return writePassthroughSniffingUsage(w, resp, func(bodyBytes []byte) ([]byte, bool) {
 		normalizedBody, normalized, normalizeErr := normalizeOpenAIChatCompletionResponse(bodyBytes, requestedModel, time.Now())
 		if normalizeErr == nil {
 			bodyBytes = normalizedBody
@@ -343,5 +342,4 @@ func (h *ProxyHandler) maybeWriteOptimizedOpenAIChatPassthrough(ctx context.Cont
 		}
 		return rewritten, true
 	})
-	return nil
 }

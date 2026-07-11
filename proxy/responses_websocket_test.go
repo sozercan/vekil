@@ -1704,6 +1704,105 @@ func TestResponsesWebSocketMaybeRetryCompactedCreateRequestCapsOriginal413Body(t
 	}
 }
 
+func TestHandleResponsesWebSocket_Compacted413BodyCancellationPreservesStatus(t *testing.T) {
+	for _, stage := range []string{"initial", "retry"} {
+		stage := stage
+		t.Run(stage, func(t *testing.T) {
+			stalledBodyCh := make(chan *stalledWebSocket413Body, 1)
+			var normalCalls atomic.Int32
+			handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+				bodyBytes, err := io.ReadAll(req.Body)
+				if err != nil {
+					return nil, err
+				}
+				var payload map[string]interface{}
+				if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+					return nil, err
+				}
+				if instructions, _ := payload["instructions"].(string); strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body: io.NopCloser(strings.NewReader(
+							`{"id":"comp-race","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint"}]}]}`)),
+						Request: req,
+					}, nil
+				}
+
+				call := normalCalls.Add(1)
+				if stage == "retry" && call == 1 {
+					return &http.Response{
+						StatusCode: http.StatusRequestEntityTooLarge,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"initial replay too large"}}`)),
+						Request:    req,
+					}, nil
+				}
+
+				body := newStalledWebSocket413Body(req.Context(), `{"error":{"message":"partial 413 detail`)
+				stalledBodyCh <- body
+				return &http.Response{
+					StatusCode: http.StatusRequestEntityTooLarge,
+					Header: http.Header{
+						"Content-Type":   []string{"application/problem+json"},
+						"Content-Length": []string{"999"},
+						"X-413-Stage":    []string{stage},
+					},
+					Body:          body,
+					ContentLength: 999,
+					Request:       req,
+				}, nil
+			})
+			handler.maxRetries = 1
+			handler.stats = newStatsCollector()
+			handler.responsesWS = ResponsesWebSocketConfig{
+				DisableAutoCompact:  true,
+				AutoCompactKeepTail: 2,
+			}
+
+			serverConn, clientConn := newResponsesWebSocketConnPair(t)
+			defer func() { _ = clientConn.Close() }()
+			defer func() { _ = serverConn.Close() }()
+			session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+			session.historyItems = []json.RawMessage{
+				json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"first"}]}`),
+				json.RawMessage(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}`),
+				json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"second"}]}`),
+			}
+			session.historyBytes = rawMessagesSize(session.historyItems)
+			request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest([]interface{}{
+				map[string]interface{}{
+					"type": "message", "role": "user",
+					"content": []map[string]string{{"type": "input_text", "text": "latest"}},
+				},
+			}))
+			request.PreviousResponseID = "resp-prev"
+			session.lastResponseID = request.PreviousResponseID
+			session.lastSignature = request.signature()
+
+			done := make(chan error, 1)
+			go func() { done <- session.handleCreateRequest(handler, request) }()
+			var stalledBody *stalledWebSocket413Body
+			select {
+			case stalledBody = <-stalledBodyCh:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for stalled 413 response")
+			}
+			waitForLifecycleSignal(t, stalledBody.blocked, "stalled websocket 413 body read")
+			handler.BeginShutdown()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("handleCreateRequest error = %v, want graceful shutdown cancellation", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for websocket 413 shutdown")
+			}
+			assertSingleResponsesWebSocketFailureStats(t, handler, http.StatusRequestEntityTooLarge)
+		})
+	}
+}
+
 func TestHandleResponsesWebSocket_ReducesKeepTailWhenCompactedReplayStill413s(t *testing.T) {
 	var upstreamRequestsMu sync.Mutex
 	upstreamRequests := make([]map[string]interface{}, 0, 6)
@@ -2987,12 +3086,13 @@ func TestHandleResponsesWebSocket_ResponseFailedOnStalledUpstreamKeepsSessionOpe
 	}
 }
 
-func TestHandleResponsesWebSocket_LaterTransientResponseFailedStillRelaysEventAndMaps429(t *testing.T) {
+func TestHandleResponsesWebSocket_SameChunkCreatedThenFailedRelaysSSE(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-later-rate-limit\"}}\n\n")
-		_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-later-rate-limit\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"Too Many Requests\"}}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-later-rate-limit\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"Too Many Requests\"},\"usage\":{\"input_tokens\":9,\"output_tokens\":2,\"total_tokens\":11}}}\n\n")
 	})
+	handler.stats = newStatsCollector()
 
 	server := startResponsesWebSocketProxyServer(t, handler)
 	conn := mustDialResponsesWebSocket(t, server, nil)
@@ -3015,12 +3115,10 @@ func TestHandleResponsesWebSocket_LaterTransientResponseFailedStillRelaysEventAn
 	if created["type"] != "response.created" {
 		t.Fatalf("expected response.created, got %v", created["type"])
 	}
-
 	failed := mustReadWebSocketJSON(t, conn)
 	if failed["type"] != "response.failed" {
 		t.Fatalf("expected response.failed, got %v", failed["type"])
 	}
-
 	errFrame := mustReadWebSocketJSON(t, conn)
 	if errFrame["type"] != "error" {
 		t.Fatalf("expected error frame after response.failed, got %v", errFrame["type"])
@@ -3037,6 +3135,13 @@ func TestHandleResponsesWebSocket_LaterTransientResponseFailedStillRelaysEventAn
 	}
 	if errPayload["message"] != "Too Many Requests" {
 		t.Fatalf("expected error message Too Many Requests, got %v", errPayload["message"])
+	}
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 1 {
+		t.Fatalf("failed turn stats = requests:%d errors:%d, want 1/1", snap.Totals.Requests, snap.Totals.Errors)
+	}
+	if snap.Totals.PromptTokens != 9 || snap.Totals.CompletionTokens != 2 || snap.Totals.TotalTokens != 11 {
+		t.Fatalf("failed turn usage = prompt:%d completion:%d total:%d, want 9/2/11", snap.Totals.PromptTokens, snap.Totals.CompletionTokens, snap.Totals.TotalTokens)
 	}
 }
 
@@ -3839,6 +3944,37 @@ func TestShutdownWebSocketSessions_AlreadyCanceledContextStillClosesSession(t *t
 	waitForResponsesWebSocketSessionCount(t, handler, 0)
 }
 
+func TestShutdownWebSocketSessionsReportsIncompleteHandlerDrain(t *testing.T) {
+	handler := &ProxyHandler{responsesWSSessions: make(map[*responsesWebSocketSession]struct{})}
+	sessionCtx, cancelSession := context.WithCancel(context.Background())
+	conn := newBlockingResponsesWebSocketShutdownConn()
+	session := &responsesWebSocketSession{
+		ctx:          sessionCtx,
+		cancel:       cancelSession,
+		handlerDone:  make(chan struct{}),
+		shutdownConn: conn,
+		writeWait:    time.Second,
+	}
+	handler.responsesWSSessions[session] = struct{}{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := handler.ShutdownWebSocketSessions(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ShutdownWebSocketSessions() error = %v, want deadline exceeded", err)
+	}
+	select {
+	case <-sessionCtx.Done():
+	default:
+		t.Fatal("incomplete handler session was not canceled")
+	}
+	select {
+	case <-conn.closed:
+	default:
+		t.Fatal("incomplete handler session was not hard-closed")
+	}
+}
+
 func TestShutdownWebSocketSessions_SendsGoingAwayToWritableClients(t *testing.T) {
 	handler := &ProxyHandler{log: logger.New(logger.LevelError), responsesWS: ResponsesWebSocketConfig{Enabled: true}}
 	server := startResponsesWebSocketProxyServer(t, handler)
@@ -3902,6 +4038,84 @@ func TestShutdownWebSocketSessions_HardClosesAllBackpressuredSessions(t *testing
 		case <-time.After(100 * time.Millisecond):
 			t.Fatalf("backpressured session %d was not hard-closed", idx)
 		}
+	}
+	waitForResponsesWebSocketSessionCount(t, handler, 0)
+}
+
+func TestBeginShutdownBeforeWebSocketDrainPreservesGoingAwayClose(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	var startedOnce sync.Once
+	var canceledOnce sync.Once
+	handler := newRoundTripTestProxyHandler(t, func(r *http.Request) (*http.Response, error) {
+		startedOnce.Do(func() { close(started) })
+		<-r.Context().Done()
+		canceledOnce.Do(func() { close(canceled) })
+		return nil, r.Context().Err()
+	})
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+	if err := conn.WriteJSON(newResponsesWebSocketCreateRequest(nil)); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for active inference")
+	}
+
+	type readResult struct {
+		messageType int
+		payload     []byte
+		err         error
+	}
+	readDone := make(chan readResult, 1)
+	go func() {
+		messageType, payload, err := conn.ReadMessage()
+		readDone <- readResult{messageType: messageType, payload: payload, err: err}
+	}()
+
+	// Server.Stop begins lifecycle cancellation before entering the websocket
+	// drain. Give the canceled turn time to unwind so this test catches any
+	// spurious upstream-error frame emitted in that ordering window.
+	handler.BeginShutdown()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("BeginShutdown did not cancel active websocket inference")
+	}
+
+	var early *readResult
+	select {
+	case result := <-readDone:
+		early = &result
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	handler.ShutdownWebSocketSessions(ctx)
+	cancel()
+
+	if early != nil {
+		if early.err == nil {
+			t.Fatalf("received websocket data frame before graceful drain: type=%d payload=%s", early.messageType, early.payload)
+		}
+		t.Fatalf("websocket closed before graceful drain: %v", early.err)
+	}
+
+	var result readResult
+	select {
+	case result = <-readDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for websocket GoingAway close")
+	}
+	var closeErr *websocket.CloseError
+	if !errors.As(result.err, &closeErr) {
+		t.Fatalf("ReadMessage() error = %v, want websocket close error", result.err)
+	}
+	if closeErr.Code != websocket.CloseGoingAway {
+		t.Fatalf("websocket close code = %d, want %d", closeErr.Code, websocket.CloseGoingAway)
 	}
 	waitForResponsesWebSocketSessionCount(t, handler, 0)
 }
@@ -4135,6 +4349,459 @@ func TestHandleResponsesWebSocket_StreamFailureStatsSurviveClientCloseAtDelivery
 	}
 }
 
+func TestHandleResponsesWebSocket_StreamFailureShutdownCausality(t *testing.T) {
+	t.Run("lifecycle canceled body is suppressed", func(t *testing.T) {
+		var body *lifecycleCanceledResponsesBody
+		handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+			body = newLifecycleCanceledResponsesBody(req.Context())
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       body,
+			}, nil
+		})
+		handler.stats = newStatsCollector()
+		serverConn, clientConn := newResponsesWebSocketConnPair(t)
+		defer func() { _ = clientConn.Close() }()
+		defer func() { _ = serverConn.Close() }()
+		session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+		request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+		handleDone := make(chan error, 1)
+		go func() { handleDone <- session.handleCreateRequest(handler, request) }()
+
+		created := mustReadWebSocketJSON(t, clientConn)
+		if created["type"] != "response.created" {
+			t.Fatalf("first frame type = %v, want response.created", created["type"])
+		}
+		waitForLifecycleSignal(t, body.blocked, "websocket lifecycle body read")
+		handler.BeginShutdown()
+		select {
+		case err := <-handleDone:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("handleCreateRequest error = %v, want context.Canceled", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for lifecycle-canceled websocket stream")
+		}
+		snap := handler.stats.snapshot()
+		if snap.Totals.Requests != 0 || snap.Totals.Errors != 0 {
+			t.Fatalf("lifecycle cancellation stats = requests:%d errors:%d, want 0/0", snap.Totals.Requests, snap.Totals.Errors)
+		}
+	})
+
+	t.Run("independent reset before shutdown records one 502", func(t *testing.T) {
+		raceErr := newWebSocketShutdownRaceError("independent upstream reset")
+		body := newGatedResponsesFailureBody("", raceErr)
+		handler := newRoundTripTestProxyHandler(t, func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       body,
+			}, nil
+		})
+		handler.stats = newStatsCollector()
+		serverConn, clientConn := newResponsesWebSocketConnPair(t)
+		defer func() { _ = clientConn.Close() }()
+		defer func() { _ = serverConn.Close() }()
+		session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+		request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+		handleDone := make(chan error, 1)
+		go func() { handleDone <- session.handleCreateRequest(handler, request) }()
+
+		created := mustReadWebSocketJSON(t, clientConn)
+		if created["type"] != "response.created" {
+			t.Fatalf("first frame type = %v, want response.created", created["type"])
+		}
+		body.releaseSecond()
+		waitForLifecycleSignal(t, raceErr.ready, "independent websocket reset")
+		handler.BeginShutdown()
+		close(raceErr.release)
+		select {
+		case err := <-handleDone:
+			if err == nil || errors.Is(err, context.Canceled) {
+				t.Fatalf("handleCreateRequest error = %v, want independent reset", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for independent websocket reset")
+		}
+		assertSingleResponsesWebSocketFailureStats(t, handler, http.StatusBadGateway)
+	})
+}
+
+func TestHandleResponsesWebSocket_PreHeaderErrorShutdownCausality(t *testing.T) {
+	t.Run("lifecycle cancellation is suppressed", func(t *testing.T) {
+		started := make(chan struct{})
+		handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+			close(started)
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		})
+		handler.maxRetries = 1
+		handler.stats = newStatsCollector()
+		serverConn, clientConn := newResponsesWebSocketConnPair(t)
+		defer func() { _ = clientConn.Close() }()
+		defer func() { _ = serverConn.Close() }()
+		session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+		request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+		done := make(chan error, 1)
+		go func() { done <- session.handleCreateRequest(handler, request) }()
+		waitForLifecycleSignal(t, started, "websocket pre-header request")
+		handler.BeginShutdown()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("handleCreateRequest error = %v, want context.Canceled", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for lifecycle-canceled pre-header request")
+		}
+		snap := handler.stats.snapshot()
+		if snap.Totals.Requests != 0 || snap.Totals.Errors != 0 {
+			t.Fatalf("lifecycle cancellation stats = requests:%d errors:%d, want 0/0", snap.Totals.Requests, snap.Totals.Errors)
+		}
+	})
+
+	for _, tt := range []struct {
+		name       string
+		cause      error
+		wantStatus int
+	}{
+		{name: "independent reset before shutdown", cause: errors.New("connection reset by peer"), wantStatus: http.StatusBadGateway},
+		{name: "independent timeout before shutdown", cause: &upstreamError{statusCode: http.StatusGatewayTimeout}, wantStatus: http.StatusGatewayTimeout},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			raceErr := newWebSocketShutdownRaceErrorWithCause(tt.name, tt.cause)
+			handler := newRoundTripTestProxyHandler(t, func(*http.Request) (*http.Response, error) {
+				return nil, raceErr
+			})
+			handler.maxRetries = 1
+			handler.stats = newStatsCollector()
+			serverConn, clientConn := newResponsesWebSocketConnPair(t)
+			defer func() { _ = clientConn.Close() }()
+			defer func() { _ = serverConn.Close() }()
+			session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+			request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+			done := make(chan error, 1)
+			go func() { done <- session.handleCreateRequest(handler, request) }()
+
+			waitForLifecycleSignal(t, raceErr.ready, "independent pre-header error")
+			handler.BeginShutdown()
+			close(raceErr.release)
+			select {
+			case err := <-done:
+				if err == nil || errors.Is(err, context.Canceled) {
+					t.Fatalf("handleCreateRequest error = %v, want independent provider error", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for independent pre-header failure")
+			}
+			assertSingleResponsesWebSocketFailureStats(t, handler, tt.wantStatus)
+		})
+	}
+}
+
+func TestHandleResponsesWebSocket_IndependentErrorsRecordBeforeClientClose(t *testing.T) {
+	t.Run("pre-header reset", func(t *testing.T) {
+		raceErr := newWebSocketShutdownRaceError("independent pre-header reset")
+		handler := newRoundTripTestProxyHandler(t, func(*http.Request) (*http.Response, error) {
+			return nil, raceErr
+		})
+		handler.maxRetries = 1
+		handler.stats = newStatsCollector()
+		serverConn, clientConn := newResponsesWebSocketConnPair(t)
+		defer func() { _ = clientConn.Close() }()
+		defer func() { _ = serverConn.Close() }()
+		session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+		request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+		done := make(chan error, 1)
+		go func() { done <- session.handleCreateRequest(handler, request) }()
+		waitForLifecycleSignal(t, raceErr.ready, "independent pre-header reset")
+		session.beginClosing()
+		close(raceErr.release)
+		select {
+		case err := <-done:
+			if err == nil || errors.Is(err, context.Canceled) {
+				t.Fatalf("handleCreateRequest error = %v, want independent reset", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for pre-header reset after client close")
+		}
+		assertSingleResponsesWebSocketFailureStats(t, handler, http.StatusBadGateway)
+	})
+
+	t.Run("committed stream reset", func(t *testing.T) {
+		raceErr := newWebSocketShutdownRaceError("independent committed reset")
+		body := newGatedResponsesFailureBody("", raceErr)
+		handler := newRoundTripTestProxyHandler(t, func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: body}, nil
+		})
+		handler.stats = newStatsCollector()
+		serverConn, clientConn := newResponsesWebSocketConnPair(t)
+		defer func() { _ = clientConn.Close() }()
+		defer func() { _ = serverConn.Close() }()
+		session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+		request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+		done := make(chan error, 1)
+		go func() { done <- session.handleCreateRequest(handler, request) }()
+		created := mustReadWebSocketJSON(t, clientConn)
+		if created["type"] != "response.created" {
+			t.Fatalf("first frame type = %v, want response.created", created["type"])
+		}
+		body.releaseSecond()
+		waitForLifecycleSignal(t, raceErr.ready, "independent committed reset")
+		session.beginClosing()
+		close(raceErr.release)
+		select {
+		case err := <-done:
+			if err == nil || errors.Is(err, context.Canceled) {
+				t.Fatalf("handleCreateRequest error = %v, want independent reset", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for committed reset after client close")
+		}
+		assertSingleResponsesWebSocketFailureStats(t, handler, http.StatusBadGateway)
+	})
+}
+
+func TestHandleResponsesWebSocket_CompletionAccountsBeforeTerminalClientWrite(t *testing.T) {
+	completed := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-created\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3,\"total_tokens\":10}}}\n\n"
+	body := newGatedResponsesFailureBody(completed, nil)
+	handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       body,
+			Request:    req,
+		}, nil
+	})
+	handler.stats = newStatsCollector()
+	serverConn, clientConn := newResponsesWebSocketConnPair(t)
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+	done := make(chan error, 1)
+	go func() { done <- session.handleCreateRequest(handler, request) }()
+
+	created := mustReadWebSocketJSON(t, clientConn)
+	if created["type"] != "response.created" {
+		t.Fatalf("first frame type = %v, want response.created", created["type"])
+	}
+	_ = serverConn.Close()
+	body.releaseSecond()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errResponsesWebSocketClientWrite) {
+			t.Fatalf("handleCreateRequest error = %v, want client write error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for terminal client write failure")
+	}
+
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 {
+		t.Fatalf("completion stats = requests:%d errors:%d, want 1/0", snap.Totals.Requests, snap.Totals.Errors)
+	}
+	if snap.Totals.PromptTokens != 7 || snap.Totals.CompletionTokens != 3 || snap.Totals.TotalTokens != 10 {
+		t.Fatalf("completion usage = prompt:%d completion:%d total:%d, want 7/3/10", snap.Totals.PromptTokens, snap.Totals.CompletionTokens, snap.Totals.TotalTokens)
+	}
+}
+
+func TestHandleResponsesWebSocket_BufferedTerminalPrecedesLifecycleCancellation(t *testing.T) {
+	created := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-peek-ws\"}}\n\n"
+	for _, tt := range []struct {
+		name       string
+		terminal   string
+		wantStatus int
+		wantFrames []string
+	}{
+		{
+			name:       "completed",
+			terminal:   "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-peek-ws\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n",
+			wantStatus: http.StatusOK,
+			wantFrames: []string{"response.created", "response.completed"},
+		},
+		{
+			name:       "failed",
+			terminal:   "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-peek-ws\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"}}}\n\n",
+			wantStatus: http.StatusTooManyRequests,
+			wantFrames: []string{"response.created", "response.failed", "error"},
+		},
+		{
+			name:       "incomplete",
+			terminal:   "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-peek-ws\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+			wantStatus: http.StatusConflict,
+			wantFrames: []string{"response.created", "response.incomplete"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			bodyCh := make(chan *singleChunkTerminalThenCancelBody, 1)
+			var handler *ProxyHandler
+			handler = newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+				body := newSingleChunkTerminalThenCancelBody(req.Context(), created+tt.terminal)
+				body.onBlocked = handler.BeginShutdown
+				bodyCh <- body
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       body,
+					Request:    req,
+				}, nil
+			})
+			handler.stats = newStatsCollector()
+			serverConn, clientConn := newResponsesWebSocketConnPair(t)
+			defer func() { _ = clientConn.Close() }()
+			defer func() { _ = serverConn.Close() }()
+			session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+			request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+			done := make(chan error, 1)
+			go func() { done <- session.handleCreateRequest(handler, request) }()
+			body := <-bodyCh
+			waitForLifecycleSignal(t, body.blocked, "websocket Responses speculative body read")
+			handler.BeginShutdown()
+
+			for _, wantType := range tt.wantFrames {
+				frame := mustReadWebSocketJSON(t, clientConn)
+				if frame["type"] != wantType {
+					t.Fatalf("frame type = %v, want %s", frame["type"], wantType)
+				}
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("handleCreateRequest error = %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for buffered terminal websocket turn")
+			}
+
+			if tt.wantStatus == http.StatusOK {
+				snap := handler.stats.snapshot()
+				if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 {
+					t.Fatalf("completed stats = requests:%d errors:%d, want 1/0", snap.Totals.Requests, snap.Totals.Errors)
+				}
+			} else {
+				assertSingleResponsesWebSocketFailureStats(t, handler, tt.wantStatus)
+			}
+		})
+	}
+}
+
+func TestHandleResponsesWebSocket_QueuedTerminalPrecedesLifecycleCancellation(t *testing.T) {
+	created := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-peek-split-ws\"}}\n\n"
+	for _, tt := range []struct {
+		name       string
+		terminal   string
+		wantStatus int
+		wantFrames []string
+	}{
+		{name: "completed", terminal: "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-peek-split-ws\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n", wantStatus: http.StatusOK, wantFrames: []string{"response.created", "response.completed"}},
+		{name: "failed", terminal: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-peek-split-ws\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"}}}\n\n", wantStatus: http.StatusTooManyRequests, wantFrames: []string{"response.created", "response.failed", "error"}},
+		{name: "incomplete", terminal: "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-peek-split-ws\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n", wantStatus: http.StatusConflict, wantFrames: []string{"response.created", "response.incomplete"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			bodyCh := make(chan *splitChunkTerminalThenCancelBody, 1)
+			var handler *ProxyHandler
+			handler = newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+				body := newSplitChunkTerminalThenCancelBody(req.Context(), created, tt.terminal)
+				body.onBlocked = handler.BeginShutdown
+				bodyCh <- body
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: body, Request: req}, nil
+			})
+			handler.stats = newStatsCollector()
+			serverConn, clientConn := newResponsesWebSocketConnPair(t)
+			defer func() { _ = clientConn.Close() }()
+			defer func() { _ = serverConn.Close() }()
+			session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+			request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+			done := make(chan error, 1)
+			go func() { done <- session.handleCreateRequest(handler, request) }()
+			body := <-bodyCh
+			waitForLifecycleSignal(t, body.blocked, "queued websocket terminal speculative read")
+
+			for _, wantType := range tt.wantFrames {
+				frame := mustReadWebSocketJSON(t, clientConn)
+				if frame["type"] != wantType {
+					t.Fatalf("frame type = %v, want %s", frame["type"], wantType)
+				}
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("handleCreateRequest error = %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for queued terminal websocket turn")
+			}
+
+			if tt.wantStatus == http.StatusOK {
+				snap := handler.stats.snapshot()
+				if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 {
+					t.Fatalf("completed stats = requests:%d errors:%d, want 1/0", snap.Totals.Requests, snap.Totals.Errors)
+				}
+			} else {
+				assertSingleResponsesWebSocketFailureStats(t, handler, tt.wantStatus)
+			}
+		})
+	}
+}
+
+func TestHandleResponsesWebSocket_PeekReadOutcomeCausality(t *testing.T) {
+	created := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-outcome-ws\"}}\n\n"
+	for _, tt := range []struct {
+		name        string
+		readErr     error
+		independent bool
+	}{
+		{name: "independent EOF", readErr: io.EOF, independent: true},
+		{name: "independent reset", readErr: errors.New("independent reset"), independent: true},
+		{name: "lifecycle cancellation", readErr: context.Canceled},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var handler *ProxyHandler
+			handler = newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+				body := newPeekReadOutcomeRaceBody(created, tt.readErr, handler.BeginShutdown)
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: body, Request: req}, nil
+			})
+			handler.stats = newStatsCollector()
+			serverConn, clientConn := newResponsesWebSocketConnPair(t)
+			defer func() { _ = clientConn.Close() }()
+			defer func() { _ = serverConn.Close() }()
+			session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+			request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+			done := make(chan error, 1)
+			go func() { done <- session.handleCreateRequest(handler, request) }()
+
+			if tt.independent {
+				frame := mustReadWebSocketJSON(t, clientConn)
+				if frame["type"] != "response.created" {
+					t.Fatalf("frame type = %v, want response.created", frame["type"])
+				}
+			}
+			select {
+			case err := <-done:
+				if tt.independent {
+					if err == nil || errors.Is(err, context.Canceled) {
+						t.Fatalf("handleCreateRequest error = %v, want independent stream failure", err)
+					}
+				} else if !errors.Is(err, context.Canceled) {
+					t.Fatalf("handleCreateRequest error = %v, want lifecycle cancellation", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for peek outcome resolution")
+			}
+			if tt.independent {
+				assertSingleResponsesWebSocketFailureStats(t, handler, http.StatusBadGateway)
+			} else {
+				snap := handler.stats.snapshot()
+				if snap.Totals.Requests != 0 || snap.Totals.Errors != 0 {
+					t.Fatalf("lifecycle stats = requests:%d errors:%d, want 0/0", snap.Totals.Requests, snap.Totals.Errors)
+				}
+			}
+		})
+	}
+}
+
 type resetAfterDataReadCloser struct {
 	data      []byte
 	offset    int
@@ -4152,6 +4819,87 @@ type gatedResponsesFailureBody struct {
 	closed      chan struct{}
 	closeOnce   sync.Once
 }
+
+type lifecycleCanceledResponsesBody struct {
+	ctx       context.Context
+	prefix    *strings.Reader
+	blocked   chan struct{}
+	blockOnce sync.Once
+}
+
+type stalledWebSocket413Body struct {
+	ctx       context.Context
+	prefix    *strings.Reader
+	blocked   chan struct{}
+	blockOnce sync.Once
+}
+
+func newStalledWebSocket413Body(ctx context.Context, prefix string) *stalledWebSocket413Body {
+	return &stalledWebSocket413Body{
+		ctx:     ctx,
+		prefix:  strings.NewReader(prefix),
+		blocked: make(chan struct{}),
+	}
+}
+
+func (b *stalledWebSocket413Body) Read(p []byte) (int, error) {
+	if b.prefix.Len() > 0 {
+		return b.prefix.Read(p)
+	}
+	b.blockOnce.Do(func() { close(b.blocked) })
+	<-b.ctx.Done()
+	return 0, context.Canceled
+}
+
+func (b *stalledWebSocket413Body) Close() error { return nil }
+
+func newLifecycleCanceledResponsesBody(ctx context.Context) *lifecycleCanceledResponsesBody {
+	return &lifecycleCanceledResponsesBody{
+		ctx:     ctx,
+		prefix:  strings.NewReader("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-lifecycle\"}}\n\n"),
+		blocked: make(chan struct{}),
+	}
+}
+
+func (b *lifecycleCanceledResponsesBody) Read(p []byte) (int, error) {
+	if b.prefix.Len() > 0 {
+		return b.prefix.Read(p)
+	}
+	b.blockOnce.Do(func() { close(b.blocked) })
+	<-b.ctx.Done()
+	return 0, context.Canceled
+}
+
+func (b *lifecycleCanceledResponsesBody) Close() error { return nil }
+
+type webSocketShutdownRaceError struct {
+	message string
+	cause   error
+	ready   chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newWebSocketShutdownRaceError(message string) *webSocketShutdownRaceError {
+	return newWebSocketShutdownRaceErrorWithCause(message, nil)
+}
+
+func newWebSocketShutdownRaceErrorWithCause(message string, cause error) *webSocketShutdownRaceError {
+	return &webSocketShutdownRaceError{
+		message: message,
+		cause:   cause,
+		ready:   make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (e *webSocketShutdownRaceError) Error() string {
+	e.once.Do(func() { close(e.ready) })
+	<-e.release
+	return e.message
+}
+
+func (e *webSocketShutdownRaceError) Unwrap() error { return e.cause }
 
 func newGatedResponsesFailureBody(second string, secondErr error) *gatedResponsesFailureBody {
 	return &gatedResponsesFailureBody{
@@ -4585,5 +5333,55 @@ func TestHandleResponsesWebSocket_SendsPingAndAcceptsPong(t *testing.T) {
 	case <-readDone:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for websocket reader to finish")
+	}
+}
+
+func TestHandleResponsesWebSocket_ChunkingIndependentNormalWireFormatStress(t *testing.T) {
+	created := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-normal-split-ws\"}}\n\n"
+	failed := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-normal-split-ws\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"}}}\n\n"
+	deliveries := []struct {
+		name string
+		body func() io.ReadCloser
+	}{
+		{name: "coalesced", body: func() io.ReadCloser { return io.NopCloser(strings.NewReader(created + failed)) }},
+		{name: "split", body: func() io.ReadCloser { return newSplitChunkEOFReadCloser(created, failed) }},
+	}
+	for _, delivery := range deliveries {
+		t.Run(delivery.name, func(t *testing.T) {
+			for i := 0; i < 15; i++ {
+				handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+						Body:       delivery.body(),
+						Request:    req,
+					}, nil
+				})
+				handler.stats = newStatsCollector()
+				serverConn, clientConn := newResponsesWebSocketConnPair(t)
+				session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+				request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+				done := make(chan error, 1)
+				go func() { done <- session.handleCreateRequest(handler, request) }()
+
+				for _, wantType := range []string{"response.created", "response.failed", "error"} {
+					frame := mustReadWebSocketJSON(t, clientConn)
+					if frame["type"] != wantType {
+						t.Fatalf("iteration %d frame type = %v, want %s", i, frame["type"], wantType)
+					}
+				}
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatalf("iteration %d handleCreateRequest error = %v", i, err)
+					}
+				case <-time.After(time.Second):
+					t.Fatalf("iteration %d timed out", i)
+				}
+				assertSingleResponsesWebSocketFailureStats(t, handler, http.StatusTooManyRequests)
+				_ = clientConn.Close()
+				_ = serverConn.Close()
+			}
+		})
 	}
 }

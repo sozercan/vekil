@@ -3,9 +3,11 @@ package server
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -20,11 +22,15 @@ type Server struct {
 	proxyHandler *proxy.ProxyHandler
 	log          *logger.Logger
 	running      atomic.Bool
+	boundAddr    atomic.Pointer[string]
+	dynamicAddr  bool
 }
 
 type options struct {
 	proxyOptions []proxy.Option
 }
+
+type serverConnContextKey struct{}
 
 // Option customizes server creation.
 type Option func(*options)
@@ -144,7 +150,8 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 		recorder := &responseRecorder{ResponseWriter: w}
 		ctx, summary := proxy.WithRequestSummary(r.Context())
 
-		tracked := handler != nil && handler.TracksRequest(r.Method, r.URL.Path)
+		admitted := handler == nil || !handler.ShuttingDown() || r.URL.Path == "/healthz"
+		tracked := admitted && handler != nil && handler.TracksRequest(r.Method, r.URL.Path)
 		if tracked {
 			handler.IncInflight()
 			defer handler.DecInflight()
@@ -153,13 +160,27 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 		// Mark the request context so upstream retries made on behalf of a tracked
 		// inference request are counted in retry stats. The mark must be set here
 		// (not derived inside the upstream call) because newInferenceUpstreamContext
-		// rebuilds the upstream context from context.Background(); only an
-		// explicitly-propagated positive marker survives that.
-		if handler != nil {
+		// rebuilds the upstream context from the detached proxy lifecycle root;
+		// only an explicitly propagated positive marker survives.
+		if handler != nil && admitted {
 			ctx = handler.MarkRetryStatsTrackedIfInference(ctx, r.Method, r.URL.Path)
 		}
 
-		next.ServeHTTP(recorder, r.WithContext(ctx))
+		r = r.WithContext(ctx)
+		var releaseRequestBody func()
+		if admitted && handler != nil {
+			var forceClose func()
+			if conn, ok := r.Context().Value(serverConnContextKey{}).(net.Conn); ok && conn != nil {
+				forceClose = func() { _ = conn.Close() }
+			}
+			releaseRequestBody = handler.BindRequestBodyToLifecycle(r, forceClose)
+			defer releaseRequestBody()
+		}
+		if admitted {
+			next.ServeHTTP(recorder, r)
+		} else {
+			handler.WriteShutdownServiceUnavailable(recorder, r)
+		}
 		status := recorder.status
 		if status == 0 {
 			status = http.StatusOK
@@ -173,7 +194,7 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 			statsStatus = failure
 		}
 		elapsed := time.Since(start)
-		if tracked {
+		if tracked && !summary.StatsSuppressed() {
 			handler.RecordRequest(summary, statsStatus, r.Header.Get("User-Agent"), elapsed)
 		}
 		if log != nil {
@@ -245,9 +266,13 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 			ReadTimeout:  30 * time.Second,
 			WriteTimeout: handler.ServerWriteTimeout(),
 			IdleTimeout:  120 * time.Second,
+			ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+				return context.WithValue(ctx, serverConnContextKey{}, conn)
+			},
 		},
 		proxyHandler: handler,
 		log:          log,
+		dynamicAddr:  strings.TrimSpace(port) == "0",
 	}, nil
 }
 
@@ -259,8 +284,10 @@ func (s *Server) Start() error {
 		return fmt.Errorf("listen on %s: %w", s.httpServer.Addr, err)
 	}
 
+	boundAddr := ln.Addr().String()
+	s.boundAddr.Store(&boundAddr)
 	s.running.Store(true)
-	s.log.Info("vekil listening", logger.F("addr", s.httpServer.Addr))
+	s.log.Info("vekil listening", logger.F("addr", s.listenerLogAddr(boundAddr)))
 
 	go func() {
 		defer s.running.Store(false)
@@ -289,12 +316,19 @@ func (s *Server) ValidateDynamicProviderModels(ctx context.Context) error {
 
 // Stop performs a graceful shutdown of the server.
 func (s *Server) Stop(ctx context.Context) error {
+	var websocketErr error
+	var workerErr error
 	if s.proxyHandler != nil {
-		s.proxyHandler.ShutdownWebSocketSessions(ctx)
+		s.proxyHandler.BeginShutdown()
+		s.proxyHandler.SetStartupAuthenticationPending(false)
+		websocketErr = s.proxyHandler.ShutdownWebSocketSessions(ctx)
 	}
-	err := s.httpServer.Shutdown(ctx)
+	shutdownErr := s.httpServer.Shutdown(ctx)
+	if s.proxyHandler != nil {
+		workerErr = s.proxyHandler.WaitLifecycleWorkers(ctx)
+	}
 	s.running.Store(false)
-	return err
+	return errors.Join(websocketErr, shutdownErr, workerErr)
 }
 
 // IsRunning returns whether the server is currently running.
@@ -302,7 +336,26 @@ func (s *Server) IsRunning() bool {
 	return s.running.Load()
 }
 
-// Addr returns the listen address.
+func (s *Server) listenerLogAddr(boundAddr string) string {
+	if s != nil && s.dynamicAddr {
+		return boundAddr
+	}
+	if s == nil || s.httpServer == nil {
+		return boundAddr
+	}
+	return s.httpServer.Addr
+}
+
+// Addr returns the configured listen address, except that a server configured
+// with port 0 reports the actual bound address after Start succeeds.
 func (s *Server) Addr() string {
+	if s != nil && s.dynamicAddr {
+		if boundAddr := s.boundAddr.Load(); boundAddr != nil {
+			return *boundAddr
+		}
+	}
+	if s == nil || s.httpServer == nil {
+		return ""
+	}
 	return s.httpServer.Addr
 }

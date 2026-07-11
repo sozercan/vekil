@@ -123,6 +123,7 @@ func TestStreamOpenAIPassthroughDoneInvokesFinalOnceWhenBodyStaysOpen(t *testing
 			func(int) { errorCalls++ },
 			func(*models.OpenAIResponse) { finalCalls++ },
 			nil,
+			streamLifecycleHooks{},
 		)
 		returned <- result{
 			elapsed:    time.Since(start),
@@ -180,6 +181,7 @@ func TestStreamOpenAIPassthroughErrorInvokesErrorOnceWhenBodyStaysOpen(t *testin
 			func(status int) { errorStatuses = append(errorStatuses, status) },
 			func(*models.OpenAIResponse) { finalCalls++ },
 			nil,
+			streamLifecycleHooks{},
 		)
 		returned <- result{
 			elapsed:       time.Since(start),

@@ -5,14 +5,13 @@ import (
 	"net/http"
 )
 
-func (h *ProxyHandler) writeResponsesUpstreamResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, store *ToolExecutionContextStore, scope string) {
+func (h *ProxyHandler) writeResponsesUpstreamResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, store *ToolExecutionContextStore, scope string) error {
 	if h == nil || h.toolOptimizers == nil || !h.toolOptimizers.ShouldInspectNonStreamingResponses() || resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK {
 		// Optimizers off (the default) or a non-OK/empty response: stream the body
 		// through verbatim while sniffing usage tokens for traffic stats.
-		writeResponsesPassthroughObservingUsage(ctx, w, resp)
-		return
+		return writeResponsesPassthroughObservingUsage(ctx, w, resp)
 	}
-	writePassthroughSniffingUsage(w, resp, func(bodyBytes []byte) ([]byte, bool) {
+	return writePassthroughSniffingUsage(w, resp, func(bodyBytes []byte) ([]byte, bool) {
 		observeResponsesUsage(ctx, sniffResponsesUsageBody(bodyBytes))
 		return h.maybeRewriteResponsesResponseBody(ctx, bodyBytes, store, scope)
 	})
@@ -27,12 +26,11 @@ func (h *ProxyHandler) writeResponsesUpstreamResponse(ctx context.Context, w htt
 // streams through with the usage parse skipped rather than being buffered whole.
 // ctx must be the inbound request context so the usage lands on the right
 // RequestSummary.
-func writeResponsesPassthroughObservingUsage(ctx context.Context, w http.ResponseWriter, resp *http.Response) {
+func writeResponsesPassthroughObservingUsage(ctx context.Context, w http.ResponseWriter, resp *http.Response) error {
 	if resp == nil || resp.Body == nil {
-		writeUpstreamResponse(w, resp)
-		return
+		return writeUpstreamResponse(w, resp)
 	}
-	writePassthroughSniffingUsage(w, resp, func(body []byte) ([]byte, bool) {
+	return writePassthroughSniffingUsage(w, resp, func(body []byte) ([]byte, bool) {
 		observeResponsesUsage(ctx, sniffResponsesUsageBody(body))
 		return body, false
 	})

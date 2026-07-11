@@ -827,9 +827,9 @@ func isGeminiModelsPath(path string) bool {
 // retryStatsTrackedContextKey marks a context that belongs to a tracked
 // inference request, so upstream retries made on its behalf are counted in the
 // dashboard's retry stats. It is a positive allow-marker rather than an
-// exclusion marker because the upstream request context is rebuilt from
-// context.Background() (newInferenceUpstreamContext), which strips inherited
-// values — an "is this excluded?" marker set on the inbound request context
+// exclusion marker because the upstream request context is rebuilt from the
+// detached proxy lifecycle root (newInferenceUpstreamContext), which strips
+// inherited values — an "is this excluded?" marker on the inbound context
 // would simply be lost. The middleware sets it only when TracksRequest is true,
 // and newInferenceUpstreamContext copies it onto the upstream context, so
 // retries from non-tracked callers (the in-process /dashboard/insight call, the
@@ -895,7 +895,7 @@ func (h *ProxyHandler) DecInflight() {
 
 // RecordRequest folds one completed request into the traffic stats.
 func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAgent string, dur time.Duration) {
-	if h == nil || h.stats == nil {
+	if h == nil || h.stats == nil || (summary != nil && summary.StatsSuppressed()) {
 		return
 	}
 	h.stats.record(summary, status, userAgent, dur)

@@ -63,6 +63,8 @@ const (
 	defaultResponsesWSCompactKeepTail = 4
 )
 
+var errProxyLifecycleShutdown = fmt.Errorf("proxy lifecycle shutdown: %w", context.Canceled)
+
 var preferredResponsesFallbackModels = []string{
 	"gpt-5.4",
 	"gpt-5.3-codex",
@@ -242,6 +244,12 @@ type ProxyHandler struct {
 	providersConfig                  ProvidersConfig
 	providersState                   *providerSetup
 	deferDynamicProviderModelRefresh bool
+	draining                         atomic.Bool
+	lifecycleOnce                    sync.Once
+	lifecycleCtx                     context.Context
+	lifecycleCancel                  context.CancelCauseFunc
+	lifecycleWorkersMu               sync.Mutex
+	lifecycleWorkers                 sync.WaitGroup
 	startupAuthenticationPending     atomic.Bool
 	dynamicProviderValidationPending atomic.Bool
 	azureIdentityTokenSourceFactory  azureIdentityTokenSourceFactory
@@ -268,6 +276,256 @@ type ProxyHandler struct {
 	stats                            *statsCollector
 	insightGate                      *insightGate
 	insightGateOnce                  sync.Once
+}
+
+// initializeLifecycle installs the proxy-owned cancellation root used by
+// detached upstream work. sync.Once keeps zero-value handlers used by focused
+// tests safe while NewProxyHandler initializes the lifecycle eagerly.
+func (h *ProxyHandler) initializeLifecycle() {
+	if h == nil {
+		return
+	}
+	h.lifecycleOnce.Do(func() {
+		h.lifecycleCtx, h.lifecycleCancel = context.WithCancelCause(context.Background())
+	})
+}
+
+func (h *ProxyHandler) lifecycleContext() context.Context {
+	if h == nil {
+		return context.Background()
+	}
+	h.initializeLifecycle()
+	return h.lifecycleCtx
+}
+
+// BeginShutdown idempotently cancels proxy-owned upstream work. Existing and
+// future lifecycle-rooted contexts observe cancellation immediately, while
+// ordinary inference remains detached from inbound client disconnects before
+// shutdown begins.
+func (h *ProxyHandler) BeginShutdown() {
+	if h == nil {
+		return
+	}
+	h.draining.Store(true)
+	h.initializeLifecycle()
+	h.lifecycleCancel(errProxyLifecycleShutdown)
+	if h.client != nil {
+		h.client.CloseIdleConnections()
+	}
+}
+
+// ShuttingDown reports whether admission has closed and lifecycle cancellation
+// has begun. It becomes true before BeginShutdown cancels upstream contexts.
+func (h *ProxyHandler) ShuttingDown() bool {
+	return h != nil && h.draining.Load()
+}
+
+func (h *ProxyHandler) upstreamShutdownStarted() bool {
+	return h.ShuttingDown()
+}
+
+// BindRequestBodyToLifecycle makes a request body read interruptible by proxy
+// shutdown without changing the inbound request context. The separate cause
+// context preserves whether client cancellation or lifecycle shutdown happened
+// first, so a client disconnect racing shutdown is not rewritten as a local 503.
+func (h *ProxyHandler) BindRequestBodyToLifecycle(r *http.Request, forceClose func()) func() {
+	if h == nil || r == nil || r.Body == nil || r.Body == http.NoBody {
+		return func() {}
+	}
+
+	causeCtx, cancelCause := context.WithCancelCause(r.Context())
+	body := &lifecycleRequestBody{ReadCloser: r.Body, causeCtx: causeCtx}
+	r.Body = body
+
+	cancelForShutdown := func() {
+		cancelCause(errProxyLifecycleShutdown)
+		if !body.complete.Load() && forceClose != nil {
+			forceClose()
+			go func() { _ = body.Close() }()
+			return
+		}
+		_ = body.Close()
+	}
+	stopLifecycle := context.AfterFunc(h.lifecycleContext(), cancelForShutdown)
+	if h.ShuttingDown() {
+		cancelForShutdown()
+	}
+
+	return func() {
+		stopLifecycle()
+		cancelCause(context.Canceled)
+	}
+}
+
+type lifecycleRequestBody struct {
+	io.ReadCloser
+	causeCtx context.Context
+	closeMu  sync.Mutex
+	closed   bool
+	closeErr error
+	complete atomic.Bool
+}
+
+func (b *lifecycleRequestBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if errors.Is(err, io.EOF) {
+		b.complete.Store(true)
+	}
+	if err != nil && b.causeCtx != nil && errors.Is(context.Cause(b.causeCtx), errProxyLifecycleShutdown) {
+		return n, errProxyLifecycleShutdown
+	}
+	return n, err
+}
+
+func (b *lifecycleRequestBody) Close() error {
+	if b == nil || b.ReadCloser == nil {
+		return nil
+	}
+	b.closeMu.Lock()
+	defer b.closeMu.Unlock()
+	if !b.closed {
+		b.closed = true
+		b.closeErr = b.ReadCloser.Close()
+	}
+	return b.closeErr
+}
+
+func (h *ProxyHandler) beginLifecycleWorker() bool {
+	if h == nil {
+		return false
+	}
+	h.lifecycleWorkersMu.Lock()
+	defer h.lifecycleWorkersMu.Unlock()
+	if h.ShuttingDown() {
+		return false
+	}
+	h.lifecycleWorkers.Add(1)
+	return true
+}
+
+func (h *ProxyHandler) endLifecycleWorker() {
+	if h != nil {
+		h.lifecycleWorkers.Done()
+	}
+}
+
+// WaitLifecycleWorkers waits for proxy-owned detached workers after admission
+// has closed. The mutex pairs worker registration with the transition to Wait,
+// preventing a WaitGroup Add/Wait race while shutdown starts.
+func (h *ProxyHandler) WaitLifecycleWorkers(ctx context.Context) error {
+	if h == nil {
+		return nil
+	}
+	h.lifecycleWorkersMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		h.lifecycleWorkers.Wait()
+		close(done)
+	}()
+	h.lifecycleWorkersMu.Unlock()
+
+	if ctx == nil {
+		<-done
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (h *ProxyHandler) handleResponseBodyWriteError(w http.ResponseWriter, r *http.Request, upstreamCtx context.Context, endpoint string, err error) bool {
+	var bodyErr *responseBodyWriteError
+	if !errors.As(err, &bodyErr) {
+		return false
+	}
+	if !bodyErr.upstream {
+		return true
+	}
+	if bodyErr.statusCode < http.StatusOK || bodyErr.statusCode >= http.StatusMultipleChoices {
+		return true
+	}
+	if bodyErr.cancellationAtFailure && h.ShuttingDown() && upstreamCtx != nil && errors.Is(context.Cause(upstreamCtx), errProxyLifecycleShutdown) {
+		if bodyErr.committed {
+			if r != nil {
+				suppressRequestStats(r.Context())
+			}
+		} else {
+			h.WriteShutdownServiceUnavailable(w, r)
+		}
+		return true
+	}
+	if bodyErr.committed {
+		if r != nil {
+			observeResponseFailureStatus(r.Context(), http.StatusBadGateway)
+		}
+		if h.log != nil {
+			h.log.Error("upstream response body failed", logger.F("endpoint", endpoint), logger.Err(err))
+		}
+		return true
+	}
+	return false
+}
+
+func (h *ProxyHandler) handleShutdownError(w http.ResponseWriter, r *http.Request, upstreamCtx context.Context, err error) bool {
+	if err == nil || !h.ShuttingDown() {
+		return false
+	}
+	lifecycleCanceled := errors.Is(err, errProxyLifecycleShutdown)
+	if !lifecycleCanceled && upstreamCtx != nil && errors.Is(context.Cause(upstreamCtx), errProxyLifecycleShutdown) {
+		lifecycleCanceled = contextTerminationMatches(upstreamCtx, err)
+	}
+	if !lifecycleCanceled {
+		return false
+	}
+	h.WriteShutdownServiceUnavailable(w, r)
+	return true
+}
+
+// WriteShutdownServiceUnavailable marks the request as locally suppressed from
+// provider stats and writes a protocol-appropriate 503 response. Callers must
+// use it only before committing a streaming response.
+func (h *ProxyHandler) WriteShutdownServiceUnavailable(w http.ResponseWriter, r *http.Request) {
+	if r != nil {
+		suppressRequestStats(r.Context())
+	}
+	if w == nil {
+		return
+	}
+	headers := w.Header()
+	clear(headers)
+	headers.Set("Cache-Control", "no-store")
+	headers.Set("Retry-After", "1")
+	path := ""
+	if r != nil && r.URL != nil {
+		path = r.URL.Path
+	}
+	switch {
+	case path == "/v1/messages" || path == "/v1/messages/count_tokens":
+		writeAnthropicError(w, http.StatusServiceUnavailable, "overloaded_error", "server shutting down")
+	case isGeminiModelsPath(path):
+		writeGeminiError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "server shutting down")
+	default:
+		writeOpenAIError(w, http.StatusServiceUnavailable, "server shutting down", "service_unavailable")
+	}
+}
+
+func (h *ProxyHandler) lifecycleStreamHooks(observeCtx context.Context, canceledAtFailure func() bool, precommit ...func()) streamLifecycleHooks {
+	var writePrecommitShutdown func()
+	if len(precommit) > 0 {
+		writePrecommitShutdown = precommit[0]
+	}
+	return streamLifecycleHooks{
+		transportCanceled: func() bool {
+			return h.ShuttingDown() && canceledAtFailure != nil && canceledAtFailure()
+		},
+		suppressStats: func() {
+			suppressRequestStats(observeCtx)
+		},
+		writePrecommitShutdown: writePrecommitShutdown,
+	}
 }
 
 type compactLearnedTargetKey struct {
@@ -482,6 +740,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		log:                             log,
 		stats:                           newStatsCollector(),
 	}
+	h.initializeLifecycle()
 	for _, opt := range opts {
 		if opt != nil {
 			opt(h)
@@ -489,6 +748,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 	}
 	h.initializeToolOptimizers()
 	if err := h.initializeProviders(); err != nil {
+		h.BeginShutdown()
 		return nil, err
 	}
 	h.validateInsightModel()
@@ -991,11 +1251,14 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	cacheKey := r.URL.RawQuery
 	canonicalQuery := isCanonicalModelsQuery(cacheKey)
 
-	ctx, cancel := context.WithTimeout(context.Background(), modelsUpstreamTimeout)
+	ctx, cancel := h.newLifecycleUpstreamContext(modelsUpstreamTimeout)
 	defer cancel()
 
 	canonicalEntry, hasCanonicalEntry, err := h.ensureCanonicalModelsCacheEntry(ctx)
 	if err != nil {
+		if h.handleShutdownError(w, r, ctx, err) {
+			return
+		}
 		h.log.Error("upstream request failed", logger.F("endpoint", "models"), logger.Err(err))
 		if canonicalQuery && hasCanonicalEntry {
 			writeCachedModelsResponse(w, canonicalEntry)
@@ -1035,6 +1298,9 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 
 	entry, notModified, err := h.buildMergedModelsEntry(ctx, cacheKey, "")
 	if err != nil {
+		if h.handleShutdownError(w, r, ctx, err) {
+			return
+		}
 		h.log.Error("upstream request failed", logger.F("endpoint", "models"), logger.Err(err))
 		if hasCachedEntry {
 			writeCachedModelsResponse(w, cachedEntry)

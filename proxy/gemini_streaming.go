@@ -62,7 +62,20 @@ func StreamOpenAIToGeminiWithFinalResponse(
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
+	streamOpenAIToGeminiWithLifecycle(w, body, onError, onFinalResponse, streamLifecycleHooks{}, onUsageCallbacks...)
+}
+
+func streamOpenAIToGeminiWithLifecycle(
+	w http.ResponseWriter,
+	body io.ReadCloser,
+	onError func(status int),
+	onFinalResponse func(*models.OpenAIResponse),
+	lifecycle streamLifecycleHooks,
+	onUsageCallbacks ...func(*models.OpenAIUsage),
+) {
 	defer func() { _ = body.Close() }()
+	trackedWriter := &commitTrackingResponseWriter{ResponseWriter: w}
+	w = trackedWriter
 	setSSEHeaders(w)
 
 	state := newGeminiStreamState(w)
@@ -101,6 +114,12 @@ func StreamOpenAIToGeminiWithFinalResponse(
 			state.writeError(status, streamErr.Error())
 			return
 		}
+		if lifecycle.suppressTransportCancellation(trackedWriter.committed) {
+			if trackedWriter.committed && !state.clientWriteFailed {
+				state.writeError(http.StatusServiceUnavailable, "server shutting down")
+			}
+			return
+		}
 		if onError != nil && !state.clientWriteFailed {
 			onError(http.StatusBadGateway)
 		}
@@ -108,6 +127,12 @@ func StreamOpenAIToGeminiWithFinalResponse(
 		return
 	}
 	if !sawDone {
+		if lifecycle.suppressTransportCancellation(trackedWriter.committed) {
+			if trackedWriter.committed && !state.clientWriteFailed {
+				state.writeError(http.StatusServiceUnavailable, "server shutting down")
+			}
+			return
+		}
 		if onError != nil && !state.clientWriteFailed {
 			onError(http.StatusBadGateway)
 		}

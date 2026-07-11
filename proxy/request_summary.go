@@ -43,6 +43,10 @@ type RequestSummary struct {
 	// 200 header was sent. The stats middleware prefers it over the recorded HTTP
 	// status so post-commit failures are not counted as successes.
 	failureStatus int
+	// statsSuppressed excludes local shutdown rejections and lifecycle-canceled
+	// in-flight work from provider traffic accounting. A semantic provider failure
+	// already recorded in failureStatus wins and cannot be suppressed afterward.
+	statsSuppressed bool
 }
 
 // WithRequestSummary attaches a mutable request summary to ctx and returns both
@@ -142,6 +146,9 @@ func (s *RequestSummary) setFailureStatus(status int) {
 	if s.failureStatus == 0 {
 		s.failureStatus = status
 	}
+	// A semantic provider failure is authoritative even if lifecycle transport
+	// cancellation raced ahead and tentatively suppressed the request.
+	s.statsSuppressed = false
 }
 
 // FailureStatus returns the out-of-band failure status, or 0 if none. The stats
@@ -153,6 +160,35 @@ func (s *RequestSummary) FailureStatus() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.failureStatus
+}
+
+// SuppressStats excludes this request from provider traffic accounting unless a
+// semantic provider failure was already observed.
+func (s *RequestSummary) SuppressStats() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failureStatus == 0 {
+		s.statsSuppressed = true
+	}
+}
+
+// StatsSuppressed reports whether provider traffic accounting should omit this request.
+func (s *RequestSummary) StatsSuppressed() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.statsSuppressed
+}
+
+func suppressRequestStats(ctx context.Context) {
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		summary.SuppressStats()
+	}
 }
 
 // addInternalUsage accumulates out-of-band token spend (e.g. an internal
@@ -223,6 +259,9 @@ func (s *RequestSummary) LoggerFields() []logger.Field {
 	}
 	if s.totalTokens != nil {
 		fields = append(fields, logger.F("total_tokens", *s.totalTokens))
+	}
+	if s.statsSuppressed {
+		fields = append(fields, logger.F("stats_suppressed", true))
 	}
 	return fields
 }

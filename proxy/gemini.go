@@ -192,10 +192,18 @@ type geminiProtocolError struct {
 	statusCode int
 	status     string
 	message    string
+	cause      error
 }
 
 func (e *geminiProtocolError) Error() string {
 	return e.message
+}
+
+func (e *geminiProtocolError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }
 
 func invalidGeminiArgument(format string, args ...interface{}) error {

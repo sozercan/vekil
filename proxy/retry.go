@@ -165,25 +165,60 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		retryDelay = 1 * time.Second
 	}
 
+	type pendingRetryAttempt struct {
+		attempt     int
+		status      int
+		retryAfter  string
+		delay       time.Duration
+		err         error
+		upstreamErr *upstreamError
+		requestCtx  context.Context
+	}
 	var lastErr error
+	var pending *pendingRetryAttempt
 	for attempt := range maxRetries {
 		req, err := reqFactory()
 		if err != nil {
+			if pending != nil && pending.upstreamErr != nil && pending.requestCtx != nil &&
+				errors.Is(err, context.Canceled) && errors.Is(context.Cause(pending.requestCtx), errProxyLifecycleShutdown) {
+				return nil, pending.upstreamErr
+			}
 			return nil, err
+		}
+		if ctxErr := req.Context().Err(); ctxErr != nil {
+			if pending != nil && pending.upstreamErr != nil {
+				return nil, pending.upstreamErr
+			}
+			return nil, ctxErr
 		}
 
 		resp, err := h.client.Do(req)
+		lifecyclePreempted := errors.Is(context.Cause(req.Context()), errProxyLifecycleShutdown) &&
+			contextTerminationMatches(req.Context(), err)
+		if pending != nil && !lifecyclePreempted {
+			h.logRetryAttempt(req.Context(), pending.attempt, pending.status, pending.retryAfter, pending.delay, pending.err)
+		}
+		pending = nil
 		if err != nil {
+			if contextTerminationMatches(req.Context(), err) {
+				return nil, req.Context().Err()
+			}
 			lastErr = err
 			if permanentTransportError(err) {
 				return nil, err
 			}
 			if attempt < maxRetries-1 {
 				delay := backoff(retryDelay, attempt)
-				h.logRetryAttempt(req.Context(), attempt, 0, "", delay, err)
+				if req.Context().Err() != nil {
+					return nil, err
+				}
 				if ctxErr := sleepWithContext(req.Context(), delay); ctxErr != nil {
 					return nil, ctxErr
 				}
+				if ctxErr := req.Context().Err(); ctxErr != nil {
+					return nil, ctxErr
+				}
+				pending = &pendingRetryAttempt{attempt: attempt, delay: delay, err: err}
 			}
 			continue
 		}
@@ -201,21 +236,59 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		lastErr = upstreamErr
 
 		if attempt < maxRetries-1 {
+			if req.Context().Err() != nil {
+				drainAndClose(resp.Body)
+				return nil, upstreamErr
+			}
 			// Drain and close body before retry to allow connection reuse.
 			drainAndClose(resp.Body)
+			if req.Context().Err() != nil {
+				return nil, upstreamErr
+			}
 			delay := backoff(retryDelay, attempt)
 			if ra, ok := parseRetryAfter(retryAfterHeader); ok && ra > delay {
 				delay = ra
 			}
-			h.logRetryAttempt(req.Context(), attempt, resp.StatusCode, retryAfterHeader, delay, nil)
+			if req.Context().Err() != nil {
+				return nil, upstreamErr
+			}
 			if ctxErr := sleepWithContext(req.Context(), delay); ctxErr != nil {
-				return nil, ctxErr
+				return nil, upstreamErr
+			}
+			if req.Context().Err() != nil {
+				return nil, upstreamErr
+			}
+			pending = &pendingRetryAttempt{
+				attempt:     attempt,
+				status:      resp.StatusCode,
+				retryAfter:  retryAfterHeader,
+				delay:       delay,
+				upstreamErr: upstreamErr,
+				requestCtx:  req.Context(),
 			}
 		} else {
 			upstreamErr.body = readRetryableUpstreamErrorBody(resp.Body)
 		}
 	}
 	return nil, lastErr
+}
+
+func contextTerminationMatches(ctx context.Context, err error) bool {
+	if ctx == nil || ctx.Err() == nil || err == nil {
+		return false
+	}
+	errCanceled := errors.Is(err, context.Canceled)
+	errDeadline := errors.Is(err, context.DeadlineExceeded)
+	if errors.Is(context.Cause(ctx), errProxyLifecycleShutdown) {
+		return errCanceled && !errDeadline
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return errDeadline
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return errCanceled && !errDeadline
+	}
+	return false
 }
 
 func (h *ProxyHandler) logRetryAttempt(ctx context.Context, attempt int, status int, retryAfter string, delay time.Duration, err error) {

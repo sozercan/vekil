@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1504,6 +1505,9 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 			return h.newProviderJSONRequest(ctx, provider, http.MethodGet, "/models", nil, nil, "")
 		})
 		if err != nil {
+			if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) {
+				return providerModelsFetchResult{}, ctxErr
+			}
 			return providerModelsFetchResult{models: models}, nil
 		}
 		defer drainAndClose(resp.Body)
@@ -1511,7 +1515,14 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 			return providerModelsFetchResult{models: models}, nil
 		}
 
-		body, err := io.ReadAll(resp.Body)
+		bodyReader := newLifecycleAwareReadCloser(resp.Body, ctx)
+		body, err := io.ReadAll(bodyReader)
+		if bodyReader.canceledAtFailure() {
+			if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) {
+				return providerModelsFetchResult{}, ctxErr
+			}
+			return providerModelsFetchResult{models: models}, nil
+		}
 		if err != nil {
 			return providerModelsFetchResult{models: models}, nil
 		}

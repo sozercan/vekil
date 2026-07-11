@@ -151,6 +151,24 @@ func (m *ToolOptimizerManager) ShellCommandArgPath() string {
 	return path
 }
 
+func (h *ProxyHandler) withToolOptimizerStageContext(parent context.Context, manager *ToolOptimizerManager, stage string) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancelParent := context.WithCancel(parent)
+	lifecycle := h.lifecycleContext()
+	stopLifecycle := context.AfterFunc(lifecycle, cancelParent)
+	if h.ShuttingDown() || lifecycle.Err() != nil {
+		cancelParent()
+	}
+	stageCtx, cancelStage := manager.withTurnBudget(ctx, stage)
+	return stageCtx, func() {
+		cancelStage()
+		stopLifecycle()
+		cancelParent()
+	}
+}
+
 // withTurnBudget installs one deadline and provider-call budget for all items in
 // a request/response optimizer stage. Direct manager calls intentionally do not
 // install this state, preserving their historical per-call timeout behavior.

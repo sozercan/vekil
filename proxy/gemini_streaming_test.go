@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -645,5 +647,44 @@ func TestStreamOpenAIToGemini_NoTailWithoutDone(t *testing.T) {
 	}
 	if errFrame.Error.Message == "" {
 		t.Fatalf("expected truncation error frame, got %#v", errFrame)
+	}
+}
+
+func TestGeminiCommittedLifecycleCancellationEmitsUnavailable(t *testing.T) {
+	ctx, summary := WithRequestSummary(context.Background())
+	upstreamCtx, cancelUpstream := context.WithCancel(context.Background())
+	prefix := "data: {\"id\":\"chatcmpl-gemini-shutdown\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n"
+	innerBody := newBlockingSSEReadCloser(prefix)
+	readStarted := make(chan struct{})
+	body := &readSignalBody{ReadCloser: innerBody, started: readStarted}
+	writer := newLifecycleStreamResponseWriter()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		streamOpenAIToGeminiWithLifecycle(writer, body, nil, nil, streamLifecycleHooks{
+			transportCanceled: func() bool { return errors.Is(upstreamCtx.Err(), context.Canceled) },
+			suppressStats:     func() { suppressRequestStats(ctx) },
+		})
+	}()
+
+	waitForLifecycleSignal(t, readStarted, "Gemini body read")
+	waitForLifecycleSignal(t, writer.flushed, "Gemini prefix flush")
+	cancelUpstream()
+	_ = body.Close()
+	waitForLifecycleSignal(t, done, "Gemini shutdown stream")
+
+	events := parseSSEEvents(writer.BodyString())
+	if len(events) != 2 {
+		t.Fatalf("events = %#v, want content plus shutdown error; raw=%s", events, writer.BodyString())
+	}
+	var terminal models.GeminiErrorResponse
+	if err := json.Unmarshal([]byte(events[len(events)-1].Data), &terminal); err != nil {
+		t.Fatalf("decode terminal Gemini error: %v", err)
+	}
+	if terminal.Error.Code != http.StatusServiceUnavailable || terminal.Error.Status != "UNAVAILABLE" || terminal.Error.Message != "server shutting down" {
+		t.Fatalf("terminal error = %#v", terminal.Error)
+	}
+	if !summary.StatsSuppressed() {
+		t.Fatal("shutdown-canceled Gemini stream was not stats-suppressed")
 	}
 }

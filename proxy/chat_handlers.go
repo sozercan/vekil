@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -182,6 +183,9 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 
 	resp, err := h.postAnthropicMessages(upstreamCtx, body, anthropicExtraHeadersFromRequest(r))
 	if err != nil {
+		if h.handleShutdownError(w, r, upstreamCtx, err) {
+			return
+		}
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "anthropic"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
@@ -193,18 +197,24 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 	}
 
 	if resp.StatusCode == http.StatusOK && streaming {
-		writeDirectAnthropicStreamResponse(r.Context(), w, resp, publicModel, upstreamModel)
+		h.writeDirectAnthropicStreamResponse(r.Context(), upstreamCtx, w, resp, publicModel, upstreamModel)
 		return
 	}
 	if resp.StatusCode == http.StatusOK {
-		if err := writeDirectAnthropicJSONResponse(r.Context(), w, resp, publicModel, upstreamModel); err != nil {
+		if err := writeDirectAnthropicJSONResponse(r.Context(), upstreamCtx, w, resp, publicModel, upstreamModel); err != nil {
+			if h.handleResponseBodyWriteError(w, r, upstreamCtx, "anthropic", err) {
+				return
+			}
+			if h.handleShutdownError(w, r, upstreamCtx, err) {
+				return
+			}
 			h.log.Error("upstream response rewrite failed", logger.F("endpoint", "anthropic"), logger.Err(err))
 			writeAnthropicError(w, http.StatusBadGateway, "api_error", "failed to read upstream response")
 		}
 		return
 	}
 
-	writeUpstreamResponse(w, resp)
+	_ = writeUpstreamResponse(w, resp)
 }
 
 func (h *ProxyHandler) forwardAnthropicCountTokensDirect(w http.ResponseWriter, r *http.Request, body []byte) {
@@ -213,6 +223,9 @@ func (h *ProxyHandler) forwardAnthropicCountTokensDirect(w http.ResponseWriter, 
 
 	resp, err := h.postAnthropicMessagesCountTokens(upstreamCtx, body, anthropicExtraHeadersFromRequest(r))
 	if err != nil {
+		if h.handleShutdownError(w, r, upstreamCtx, err) {
+			return
+		}
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "anthropic_count_tokens"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
@@ -223,7 +236,18 @@ func (h *ProxyHandler) forwardAnthropicCountTokensDirect(w http.ResponseWriter, 
 		return
 	}
 
-	writeUpstreamResponse(w, resp)
+	var writeErr error
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		writeErr = writePassthroughSniffingUsage(w, resp, nil)
+	} else {
+		writeErr = writeUpstreamResponse(w, resp)
+	}
+	if writeErr != nil {
+		if h.handleResponseBodyWriteError(w, r, upstreamCtx, "anthropic_count_tokens", writeErr) {
+			return
+		}
+		writeAnthropicError(w, http.StatusBadGateway, "api_error", "failed to read upstream response")
+	}
 }
 
 func (h *ProxyHandler) directAnthropicResponseModels(req *models.AnthropicRequest) (string, string) {
@@ -245,7 +269,7 @@ func (h *ProxyHandler) directAnthropicResponseModels(req *models.AnthropicReques
 	return publicModel, upstreamModel
 }
 
-func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp *http.Response, mode chatCompletionsMode, handlers chatCompletionsResponseHandlers) error {
+func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp *http.Response, upstreamCtx context.Context, mode chatCompletionsMode, handlers chatCompletionsResponseHandlers) error {
 	if resp.StatusCode == http.StatusOK && mode.clientRequestedStream {
 		if handlers.stream == nil {
 			return fmt.Errorf("missing stream response handler")
@@ -258,8 +282,12 @@ func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp 
 		if handlers.aggregate == nil {
 			return fmt.Errorf("missing aggregate response handler")
 		}
-		oaiResp, err := aggregateStreamToResponse(resp.Body)
+		body := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
+		oaiResp, err := aggregateStreamToResponse(body)
 		if err != nil {
+			if body.canceledAtFailure() {
+				return context.Canceled
+			}
 			return err
 		}
 		handlers.aggregate(oaiResp)
@@ -270,8 +298,7 @@ func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp 
 		return handlers.passthrough(resp)
 	}
 
-	writeUpstreamResponse(w, resp)
-	return nil
+	return writeUpstreamResponse(w, resp)
 }
 
 // HandleAnthropicMessages handles POST /v1/messages by translating the Anthropic
@@ -279,6 +306,9 @@ func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp 
 func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
+		if h.handleShutdownError(w, r, nil, err) {
+			return
+		}
 		status := readBodyStatusCode(err)
 		writeAnthropicError(w, status, mapAnthropicUpstreamStatus(status), err.Error())
 		return
@@ -327,6 +357,9 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	resp, err := h.postChatCompletions(upstreamCtx, oaiBody)
 	if err != nil {
+		if h.handleShutdownError(w, r, upstreamCtx, err) {
+			return
+		}
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "anthropic"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
@@ -355,15 +388,17 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
+	err = h.routeChatCompletionsResponse(w, resp, upstreamCtx, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			StreamOpenAIToAnthropicWithFinalResponse(
+			body := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
+			streamOpenAIToAnthropicWithLifecycle(
 				w,
-				resp.Body,
+				body,
 				req.Model,
 				"msg_"+uuid.New().String(),
 				func(status int) { observeResponseFailureStatus(r.Context(), status) },
 				h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope),
+				h.lifecycleStreamHooks(r.Context(), body.canceledAtFailure, func() { h.WriteShutdownServiceUnavailable(w, r) }),
 				openAIChatStreamUsageCallback(r.Context()),
 			)
 		},
@@ -376,7 +411,17 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		},
 	})
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", "failed to aggregate upstream response")
+		if h.handleShutdownError(w, r, upstreamCtx, err) {
+			return
+		}
+		status := http.StatusBadGateway
+		message := "failed to aggregate upstream response"
+		var streamErr *openAIStreamError
+		if errors.As(err, &streamErr) {
+			status = streamErr.httpStatus()
+			message = streamErr.Error()
+		}
+		writeAnthropicError(w, status, mapAnthropicUpstreamStatus(status), message)
 	}
 }
 
@@ -387,6 +432,9 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
+		if h.handleShutdownError(w, r, nil, err) {
+			return
+		}
 		status := readBodyStatusCode(err)
 		writeAnthropicError(w, status, mapAnthropicUpstreamStatus(status), err.Error())
 		return
@@ -421,8 +469,14 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		return
 	}
 
-	oaiResp, err := h.runAnthropicCountTokensProbe(oaiReq)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
+	defer upstreamCancel()
+
+	oaiResp, err := h.runAnthropicCountTokensProbeWithContext(upstreamCtx, oaiReq)
 	if err != nil {
+		if h.handleShutdownError(w, r, upstreamCtx, err) {
+			return
+		}
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "anthropic_count_tokens"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
@@ -471,20 +525,23 @@ func prepareAnthropicCountTokensProbeRequestWithModelOverride(req *models.Anthro
 }
 
 func (h *ProxyHandler) runAnthropicCountTokensProbe(probeReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
-	oaiResp, fallback, err := h.executeAnthropicCountTokensProbe(probeReq)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
+	defer upstreamCancel()
+	return h.runAnthropicCountTokensProbeWithContext(upstreamCtx, probeReq)
+}
+
+func (h *ProxyHandler) runAnthropicCountTokensProbeWithContext(upstreamCtx context.Context, probeReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
+	oaiResp, fallback, err := h.executeAnthropicCountTokensProbe(upstreamCtx, probeReq)
 	if fallback {
 		one := 1
 		probeReq.MaxCompletionTokens = nil
 		probeReq.MaxTokens = &one
-		return h.executeAnthropicCountTokensProbeFinal(probeReq)
+		return h.executeAnthropicCountTokensProbeFinal(upstreamCtx, probeReq)
 	}
 	return oaiResp, err
 }
 
-func (h *ProxyHandler) executeAnthropicCountTokensProbe(probeReq *models.OpenAIRequest) (*models.OpenAIResponse, bool, error) {
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
-	defer upstreamCancel()
-
+func (h *ProxyHandler) executeAnthropicCountTokensProbe(upstreamCtx context.Context, probeReq *models.OpenAIRequest) (*models.OpenAIResponse, bool, error) {
 	body, err := json.Marshal(probeReq)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to marshal count_tokens probe request: %w", err)
@@ -504,10 +561,7 @@ func (h *ProxyHandler) executeAnthropicCountTokensProbe(probeReq *models.OpenAIR
 	return oaiResp, false, err
 }
 
-func (h *ProxyHandler) executeAnthropicCountTokensProbeFinal(probeReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
-	defer upstreamCancel()
-
+func (h *ProxyHandler) executeAnthropicCountTokensProbeFinal(upstreamCtx context.Context, probeReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
 	body, err := json.Marshal(probeReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal count_tokens probe request: %w", err)
@@ -545,6 +599,9 @@ func (h *ProxyHandler) decodeAnthropicCountTokensProbeResponse(resp *http.Respon
 func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := readBody(r)
 	if err != nil {
+		if h.handleShutdownError(w, r, nil, err) {
+			return
+		}
 		status := readBodyStatusCode(err)
 		writeOpenAIRequestBodyError(w, status, err)
 		return
@@ -567,6 +624,9 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 
 	resp, err := h.postChatCompletions(upstreamCtx, bodyBytes)
 	if err != nil {
+		if h.handleShutdownError(w, r, upstreamCtx, err) {
+			return
+		}
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "openai"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
@@ -580,9 +640,10 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	resp, _, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, bodyBytes, mode)
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
-	err = h.routeChatCompletionsResponse(w, resp, mode, chatCompletionsResponseHandlers{
+	err = h.routeChatCompletionsResponse(w, resp, upstreamCtx, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
 			copyPassthroughHeaders(w.Header(), resp.Header)
+			body := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
 			finalResponse := h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope)
 			usage := openAIChatStreamUsageCallback(r.Context())
 			// A post-commit upstream stream error (the 200 header is already sent)
@@ -591,7 +652,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			onError := func(status int) { observeResponseFailureStatus(r.Context(), status) }
 			// dropInjectedUsage drops the upstream usage-only chunk the proxy asked
 			// for when the client did not opt into stream_options.include_usage.
-			StreamOpenAIChatPassthrough(w, resp.Body, requestedModel, mode.injectedClientStreamUsage, onError, finalResponse, usage)
+			streamOpenAIChatPassthroughWithLifecycle(w, body, requestedModel, mode.injectedClientStreamUsage, onError, finalResponse, h.lifecycleStreamHooks(r.Context(), body.canceledAtFailure, func() { h.WriteShutdownServiceUnavailable(w, r) }), usage)
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
 			normalizeOpenAIChatCompletionStruct(oaiResp, requestedModel)
@@ -605,7 +666,26 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		},
 	})
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "failed to aggregate upstream response", "server_error")
+		if h.handleResponseBodyWriteError(w, r, upstreamCtx, "openai", err) {
+			return
+		}
+		if h.handleShutdownError(w, r, upstreamCtx, err) {
+			return
+		}
+		status := http.StatusBadGateway
+		message := "failed to aggregate upstream response"
+		errType := "server_error"
+		code := ""
+		var streamErr *openAIStreamError
+		if errors.As(err, &streamErr) {
+			status = streamErr.httpStatus()
+			message = streamErr.Error()
+			if strings.TrimSpace(streamErr.Type) != "" {
+				errType = streamErr.Type
+			}
+			code = streamErr.Code
+		}
+		writeOpenAIErrorWithDetails(w, status, message, errType, "", code)
 	}
 }
 

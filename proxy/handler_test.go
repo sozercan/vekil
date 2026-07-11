@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -624,6 +625,7 @@ func TestHandleAnthropicMessagesCountTokensFallbacksToMaxTokens(t *testing.T) {
 }
 
 func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProvider(t *testing.T) {
+	const upstreamBody = "{\n  \"input_tokens\": 42\n}\n"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Path; got != "/native/messages/count_tokens" {
 			t.Fatalf("expected native count_tokens path /native/messages/count_tokens, got %s", got)
@@ -647,7 +649,8 @@ func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProv
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"input_tokens":42}`))
+		w.Header().Set("X-Upstream-Count", "preserved")
+		_, _ = io.WriteString(w, upstreamBody)
 	}))
 	defer upstream.Close()
 
@@ -692,8 +695,18 @@ func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProv
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
 	}
+	if got := resp.Header.Get("X-Upstream-Count"); got != "preserved" {
+		t.Fatalf("X-Upstream-Count = %q, want preserved", got)
+	}
+	rawBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read count_tokens response: %v", err)
+	}
+	if string(rawBody) != upstreamBody {
+		t.Fatalf("count_tokens body = %q, want byte-identical %q", rawBody, upstreamBody)
+	}
 	var countResp models.AnthropicCountTokensResponse
-	if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+	if err := json.Unmarshal(rawBody, &countResp); err != nil {
 		t.Fatalf("decode count_tokens response: %v", err)
 	}
 	if countResp.InputTokens != 42 {
@@ -2385,10 +2398,27 @@ func TestCompactResponsesRequestInChunks_CancelsFanoutOnFirstError(t *testing.T)
 
 	var chunkCalls atomic.Int32
 	var mergeCalls atomic.Int32
+	var failurePublished atomic.Bool
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		call := chunkCalls.Add(1)
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			t.Fatalf("read upstream body: %v", err)
+			// The second request is the asserted failure source and must remain
+			// active long enough to receive its complete request body. Once it
+			// publishes the 500, compact fanout intentionally cancels in-flight
+			// siblings; net/http may surface those aborted uploads as
+			// context.Canceled, io.ErrUnexpectedEOF, or an opaque closed-transport
+			// error. Only tolerate them after the asserted failure was published and
+			// this specific sibling's request context has actually been canceled.
+			if call != 2 && failurePublished.Load() {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+			t.Errorf("read active upstream body for call %d: %v", call, err)
+			return
 		}
 		var req map[string]interface{}
 		if err := json.Unmarshal(body, &req); err != nil {
@@ -2403,8 +2433,8 @@ func TestCompactResponsesRequestInChunks_CancelsFanoutOnFirstError(t *testing.T)
 			}
 		}
 
-		call := chunkCalls.Add(1)
 		if call == 2 {
+			failurePublished.Store(true)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte(`{"error":{"message":"chunk failed"}}`))
@@ -2429,6 +2459,92 @@ func TestCompactResponsesRequestInChunks_CancelsFanoutOnFirstError(t *testing.T)
 	}
 	if got := chunkCalls.Load(); got >= int32(len(chunks)) {
 		t.Fatalf("expected cancellation to stop before all %d chunks ran, got %d chunk calls", len(chunks), got)
+	}
+}
+
+func TestCompactResponsesRequestInChunks_PreservesWorkerErrorAfterShutdown(t *testing.T) {
+	const targetBodySize = 96 << 10
+	texts := make([]string, 0, 7)
+	for i := 0; i < 7; i++ {
+		texts = append(texts, fmt.Sprintf("item %d: %s", i+1, strings.Repeat("z", 60<<10)))
+	}
+	requestFields, chunks := compactChunkTestRequestFields(t, targetBodySize, texts)
+	if len(chunks) < 3 {
+		t.Fatalf("test setup expected at least 3 chunks, got %d", len(chunks))
+	}
+
+	siblingStarted := make(chan struct{})
+	fanoutCanceled := make(chan struct{})
+	releaseSibling := make(chan struct{})
+	var calls atomic.Int32
+	handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		switch call := calls.Add(1); call {
+		case 1:
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(
+					`{"id":"chunk-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first summary"}]}]}`)),
+				Request: req,
+			}, nil
+		case 2:
+			<-siblingStarted
+			return &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Header:     http.Header{"X-Worker-Failure": []string{"independent"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"worker failed"}}`)),
+				Request:    req,
+			}, nil
+		case 3:
+			close(siblingStarted)
+			<-req.Context().Done()
+			close(fanoutCanceled)
+			<-releaseSibling
+			return nil, req.Context().Err()
+		default:
+			return nil, fmt.Errorf("unexpected upstream call %d", call)
+		}
+	})
+	handler.maxRetries = 1
+	handler.compactChunkConcurrency = 2
+	handler.stats = newStatsCollector()
+	ctx, cancel := handler.newInferenceUpstreamContext(false)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := handler.compactResponsesRequestInChunks(ctx, requestFields, nil, 0, targetBodySize, newCompactBudget(len(chunks)+2))
+		done <- err
+	}()
+	waitForLifecycleSignal(t, fanoutCanceled, "fanout worker error cancellation")
+	handler.BeginShutdown()
+	close(releaseSibling)
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for compact fanout result")
+	}
+	if err == nil || !strings.Contains(err.Error(), "returned 500") {
+		t.Fatalf("fanout error = %v, want independent worker 500", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("worker failure was replaced by shutdown cancellation: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
+	requestCtx, summary := WithRequestSummary(req.Context())
+	req = req.WithContext(requestCtx)
+	if handler.handleShutdownError(httptest.NewRecorder(), req, ctx, err) {
+		t.Fatal("independent worker failure was misclassified as local shutdown")
+	}
+	providerStatus := upstreamStatusCode(err, http.StatusBadGateway)
+	if providerStatus != http.StatusBadGateway {
+		t.Fatalf("provider status = %d, want classified 502", providerStatus)
+	}
+	handler.RecordRequest(summary, providerStatus, "fanout-race", time.Millisecond)
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 1 {
+		t.Fatalf("stats = requests:%d errors:%d, want 1/1", snap.Totals.Requests, snap.Totals.Errors)
 	}
 }
 
