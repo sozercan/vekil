@@ -2800,7 +2800,8 @@ func TestHandleCompact_FallsBackToChunkedCompactionForStringInputOnUpstream413(t
 	}
 }
 
-func TestHandleCompact_StripsOversizedToolsDuring413Fallback(t *testing.T) {
+func TestHandleCompact_NormalizesOversizedToolsBeforeInternalCompaction(t *testing.T) {
+	const inputText = "please compact this small history"
 	hugeToolDescription := strings.Repeat("a", compactUpstreamChunkBodySize)
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
@@ -2809,7 +2810,7 @@ func TestHandleCompact_StripsOversizedToolsDuring413Fallback(t *testing.T) {
 				"type": "message",
 				"role": "user",
 				"content": []map[string]string{
-					{"type": "input_text", "text": "please compact this small history"},
+					{"type": "input_text", "text": inputText},
 				},
 			},
 		},
@@ -2825,62 +2826,51 @@ func TestHandleCompact_StripsOversizedToolsDuring413Fallback(t *testing.T) {
 			},
 		},
 		"tool_choice": map[string]interface{}{"type": "function", "name": "oversized_tool"},
-		"text":        map[string]interface{}{"format": map[string]string{"type": "text"}},
 	})
 	if err != nil {
 		t.Fatalf("failed to marshal request body: %v", err)
 	}
+	if len(reqBody) <= compactUpstreamChunkBodySize {
+		t.Fatalf("test setup expected caller tools to push body over chunk target, got %d bytes", len(reqBody))
+	}
 
 	var calls atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if call := calls.Add(1); call != 1 {
+			t.Fatalf("unexpected /responses request count %d", call)
+		}
+
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Fatalf("failed to read upstream body: %v", err)
 		}
-		var req map[string]interface{}
-		if err := json.Unmarshal(body, &req); err != nil {
-			t.Fatalf("upstream received invalid JSON: %v", err)
-		}
-		input, ok := req["input"].([]interface{})
-		if !ok || len(input) != 1 {
-			t.Fatalf("expected one compact input item, got %#v", req["input"])
+		if len(body) > compactUpstreamChunkBodySize {
+			t.Fatalf("expected normalized compact body to fit target, got %d bytes", len(body))
 		}
 
-		switch call := calls.Add(1); call {
-		case 1:
-			if len(body) <= compactUpstreamChunkBodySize {
-				t.Fatalf("expected initial compact body to exceed chunk target, got %d bytes", len(body))
-			}
-			if _, ok := req["tools"]; !ok {
-				t.Fatalf("expected initial upstream request to include tools")
-			}
-			if _, ok := req["tool_choice"]; !ok {
-				t.Fatalf("expected initial upstream request to include tool_choice")
-			}
-			if _, ok := req["text"]; !ok {
-				t.Fatalf("expected initial upstream request to include text")
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusRequestEntityTooLarge)
-			_, _ = w.Write([]byte(`{"error":{"message":"payload too large"}}`))
-		case 2:
-			if len(body) > compactUpstreamChunkBodySize {
-				t.Fatalf("expected sanitized compact fallback body to fit target, got %d bytes", len(body))
-			}
-			if _, ok := req["tools"]; ok {
-				t.Fatalf("expected sanitized fallback request to omit oversized tools")
-			}
-			if _, ok := req["tool_choice"]; ok {
-				t.Fatalf("expected sanitized fallback request to omit tool_choice with tools")
-			}
-			if _, ok := req["text"]; !ok {
-				t.Fatalf("expected sanitized fallback request to preserve small text field")
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"resp-sanitized-tools","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary without oversized tools"}]}]}`))
-		default:
-			t.Fatalf("unexpected /responses request count %d", call)
+		var upstreamRequest map[string]interface{}
+		if err := json.Unmarshal(body, &upstreamRequest); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
 		}
+		if _, ok := upstreamRequest["tools"]; ok {
+			t.Fatalf("internal compaction request must omit caller tools: %s", body)
+		}
+		if _, ok := upstreamRequest["tool_choice"]; ok {
+			t.Fatalf("internal compaction request must omit caller tool_choice: %s", body)
+		}
+		if got := upstreamRequest["model"]; got != "gpt-5.4" {
+			t.Fatalf("expected model to survive normalization, got %#v", got)
+		}
+		input, ok := upstreamRequest["input"].([]interface{})
+		if !ok || len(input) != 1 {
+			t.Fatalf("expected one compact input item, got %#v", upstreamRequest["input"])
+		}
+		if got := requireMessageTextWithRole(t, input[0], "user"); got != inputText {
+			t.Fatalf("expected ordinary input to survive normalization, got %q", got)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-normalized-tools","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary without caller tools"}]}]}`))
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
@@ -2890,25 +2880,27 @@ func TestHandleCompact_StripsOversizedToolsDuring413Fallback(t *testing.T) {
 	handler.HandleCompact(w, req)
 
 	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
 	}
-	if calls.Load() != 2 {
-		t.Fatalf("expected initial request and one sanitized fallback request, got %d", calls.Load())
+	if calls.Load() != 1 {
+		t.Fatalf("expected exactly one normalized upstream request, got %d", calls.Load())
 	}
 
 	body, _ := io.ReadAll(resp.Body)
 	summary, encryptedSummary := requireCompactResponseSummaryForTest(t, body)
-	if summary != "summary without oversized tools" {
-		t.Fatalf("expected sanitized tools summary, got %q", summary)
+	if summary == "" || summary != "summary without caller tools" {
+		t.Fatalf("expected nonempty normalized tools summary, got %q", summary)
 	}
-	if encryptedSummary != "summary without oversized tools" {
-		t.Fatalf("expected encoded sanitized tools summary, got %q", encryptedSummary)
+	if encryptedSummary != summary {
+		t.Fatalf("expected encoded normalized tools summary %q, got %q", summary, encryptedSummary)
 	}
 }
 
-func TestHandleCompact_StripsOversizedTextDuring413Fallback(t *testing.T) {
+func TestHandleCompact_NormalizesStructuredTextFormatBeforeInternalCompaction(t *testing.T) {
+	const inputText = "please compact this history with a text schema"
 	hugeJSONSchemaDescription := strings.Repeat("b", compactUpstreamChunkBodySize)
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
@@ -2917,7 +2909,7 @@ func TestHandleCompact_StripsOversizedTextDuring413Fallback(t *testing.T) {
 				"type": "message",
 				"role": "user",
 				"content": []map[string]string{
-					{"type": "input_text", "text": "please compact this history with a text schema"},
+					{"type": "input_text", "text": inputText},
 				},
 			},
 		},
@@ -2925,7 +2917,7 @@ func TestHandleCompact_StripsOversizedTextDuring413Fallback(t *testing.T) {
 			map[string]interface{}{
 				"type":        "function",
 				"name":        "small_tool",
-				"description": "small tool that should survive fallback sanitization",
+				"description": "caller tool must not influence internal compaction",
 				"parameters": map[string]interface{}{
 					"type":       "object",
 					"properties": map[string]interface{}{},
@@ -2942,62 +2934,63 @@ func TestHandleCompact_StripsOversizedTextDuring413Fallback(t *testing.T) {
 					"description": hugeJSONSchemaDescription,
 				},
 			},
+			"verbosity": "low",
 		},
 	})
 	if err != nil {
 		t.Fatalf("failed to marshal request body: %v", err)
 	}
+	if len(reqBody) <= compactUpstreamChunkBodySize {
+		t.Fatalf("test setup expected structured format to push body over chunk target, got %d bytes", len(reqBody))
+	}
 
 	var calls atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if call := calls.Add(1); call != 1 {
+			t.Fatalf("unexpected /responses request count %d", call)
+		}
+
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Fatalf("failed to read upstream body: %v", err)
 		}
-		var req map[string]interface{}
-		if err := json.Unmarshal(body, &req); err != nil {
-			t.Fatalf("upstream received invalid JSON: %v", err)
-		}
-		input, ok := req["input"].([]interface{})
-		if !ok || len(input) != 1 {
-			t.Fatalf("expected one compact input item, got %#v", req["input"])
+		if len(body) > compactUpstreamChunkBodySize {
+			t.Fatalf("expected normalized compact body to fit target, got %d bytes", len(body))
 		}
 
-		switch call := calls.Add(1); call {
-		case 1:
-			if len(body) <= compactUpstreamChunkBodySize {
-				t.Fatalf("expected initial compact body to exceed chunk target, got %d bytes", len(body))
-			}
-			if _, ok := req["text"]; !ok {
-				t.Fatalf("expected initial upstream request to include text")
-			}
-			if _, ok := req["tools"]; !ok {
-				t.Fatalf("expected initial upstream request to include tools")
-			}
-			if _, ok := req["tool_choice"]; !ok {
-				t.Fatalf("expected initial upstream request to include tool_choice")
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusRequestEntityTooLarge)
-			_, _ = w.Write([]byte(`{"error":{"message":"payload too large"}}`))
-		case 2:
-			if len(body) > compactUpstreamChunkBodySize {
-				t.Fatalf("expected sanitized compact fallback body to fit target, got %d bytes", len(body))
-			}
-			if _, ok := req["text"]; ok {
-				t.Fatalf("expected sanitized fallback request to omit oversized text field")
-			}
-			if _, ok := req["tools"]; !ok {
-				t.Fatalf("expected sanitized fallback request to preserve small tools")
-			}
-			if _, ok := req["tool_choice"]; !ok {
-				t.Fatalf("expected sanitized fallback request to preserve tool_choice with tools")
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"resp-sanitized-text","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary without oversized text schema"}]}]}`))
-		default:
-			t.Fatalf("unexpected /responses request count %d", call)
+		var upstreamRequest map[string]interface{}
+		if err := json.Unmarshal(body, &upstreamRequest); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
 		}
+		if _, ok := upstreamRequest["tools"]; ok {
+			t.Fatalf("internal compaction request must omit caller tools: %s", body)
+		}
+		if _, ok := upstreamRequest["tool_choice"]; ok {
+			t.Fatalf("internal compaction request must omit caller tool_choice: %s", body)
+		}
+		text, ok := upstreamRequest["text"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected non-format text controls to survive normalization, got %#v", upstreamRequest["text"])
+		}
+		if _, ok := text["format"]; ok {
+			t.Fatalf("internal compaction request must omit caller text.format: %#v", text)
+		}
+		if got := text["verbosity"]; got != "low" {
+			t.Fatalf("expected text.verbosity to survive normalization, got %#v", got)
+		}
+		if got := upstreamRequest["model"]; got != "gpt-5.4" {
+			t.Fatalf("expected model to survive normalization, got %#v", got)
+		}
+		input, ok := upstreamRequest["input"].([]interface{})
+		if !ok || len(input) != 1 {
+			t.Fatalf("expected one compact input item, got %#v", upstreamRequest["input"])
+		}
+		if got := requireMessageTextWithRole(t, input[0], "user"); got != inputText {
+			t.Fatalf("expected ordinary input to survive normalization, got %q", got)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-normalized-text","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary without caller schema"}]}]}`))
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
@@ -3007,21 +3000,22 @@ func TestHandleCompact_StripsOversizedTextDuring413Fallback(t *testing.T) {
 	handler.HandleCompact(w, req)
 
 	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
 	}
-	if calls.Load() != 2 {
-		t.Fatalf("expected initial request and one sanitized fallback request, got %d", calls.Load())
+	if calls.Load() != 1 {
+		t.Fatalf("expected exactly one normalized upstream request, got %d", calls.Load())
 	}
 
 	body, _ := io.ReadAll(resp.Body)
 	summary, encryptedSummary := requireCompactResponseSummaryForTest(t, body)
-	if summary != "summary without oversized text schema" {
-		t.Fatalf("expected sanitized text summary, got %q", summary)
+	if summary == "" || summary != "summary without caller schema" {
+		t.Fatalf("expected nonempty normalized text summary, got %q", summary)
 	}
-	if encryptedSummary != "summary without oversized text schema" {
-		t.Fatalf("expected encoded sanitized text summary, got %q", encryptedSummary)
+	if encryptedSummary != summary {
+		t.Fatalf("expected encoded normalized text summary %q, got %q", summary, encryptedSummary)
 	}
 }
 

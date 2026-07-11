@@ -3,8 +3,10 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/sozercan/vekil/auth"
@@ -37,6 +39,26 @@ func TestExtractResponsesOutputText(t *testing.T) {
 func TestExtractResponsesOutputText_InvalidJSON(t *testing.T) {
 	if _, err := extractResponsesOutputText([]byte(`{`)); err == nil {
 		t.Fatal("expected error for invalid JSON")
+	}
+}
+
+func TestExtractResponsesOutputText_RejectsInvalidSummaryResults(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "incomplete", body: `{"status":"incomplete","output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}]}`},
+		{name: "refusal only", body: `{"status":"completed","output":[{"type":"message","content":[{"type":"refusal","refusal":"no"}]}]}`},
+		{name: "tool only", body: `{"status":"completed","output":[{"type":"function_call","name":"summarize","arguments":"{}"}]}`},
+		{name: "empty", body: `{"status":"completed","output":[]}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if text, err := extractResponsesOutputText([]byte(tt.body)); err == nil {
+				t.Fatalf("expected invalid summary response to fail, got text %q", text)
+			}
+		})
 	}
 }
 
@@ -174,5 +196,105 @@ func TestPrepareResponsesRequestBuildsHeaderAndStreamingPlan(t *testing.T) {
 	}
 	if got := prepared.extraHeaders.Get("Accept"); got != "" {
 		t.Fatalf("extra Accept mutated to %q, want empty", got)
+	}
+}
+
+type summaryResponseRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f summaryResponseRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type summaryResponseTrackingBody struct {
+	reader    *strings.Reader
+	bytesRead int
+	closed    bool
+}
+
+func newSummaryResponseTrackingBody(body string) *summaryResponseTrackingBody {
+	return &summaryResponseTrackingBody{reader: strings.NewReader(body)}
+}
+
+func (b *summaryResponseTrackingBody) Read(p []byte) (int, error) {
+	n, err := b.reader.Read(p)
+	b.bytesRead += n
+	return n, err
+}
+
+func (b *summaryResponseTrackingBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+func newSummaryResponseHandler(t testing.TB, body *summaryResponseTrackingBody) *ProxyHandler {
+	t.Helper()
+	handler, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.New(logger.LevelInfo))
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	handler.copilotURL = "http://upstream.test"
+	handler.client = &http.Client{Transport: summaryResponseRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("Content-Type", "application/json")
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        header,
+			Body:          body,
+			ContentLength: int64(body.reader.Len()),
+			Request:       req,
+		}, nil
+	})}
+	return handler
+}
+
+func TestHandleCompact_BoundsSuccessfulSummaryResponse(t *testing.T) {
+	oversizedText := strings.Repeat("x", proxySummaryResponseBodySize+4096)
+	upstreamBody := newSummaryResponseTrackingBody(`{"id":"resp-oversized","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"` + oversizedText + `"}]}]}`)
+	handler := newSummaryResponseHandler(t, upstreamBody)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"gpt-5.4","input":"history"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleCompact(w, req)
+
+	resp := w.Result()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected oversized successful compaction response to fail with 502, got %d", resp.StatusCode)
+	}
+	if bytes.Contains(body, []byte(syntheticCompactionPrefix)) {
+		t.Fatalf("oversized compaction response must not emit a checkpoint: %s", body)
+	}
+	if upstreamBody.bytesRead > proxySummaryResponseBodySize+1 {
+		t.Fatalf("expected bounded compaction response read, got %d bytes", upstreamBody.bytesRead)
+	}
+	if !upstreamBody.closed {
+		t.Fatal("expected oversized compaction response body to be closed")
+	}
+}
+
+func TestHandleMemorySummarize_BoundsSuccessfulSummaryResponse(t *testing.T) {
+	oversizedText := strings.Repeat("m", proxySummaryResponseBodySize+4096)
+	upstreamBody := newSummaryResponseTrackingBody(`{"id":"resp-memory-oversized","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"` + oversizedText + `"}]}]}`)
+	handler := newSummaryResponseHandler(t, upstreamBody)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/memories/trace_summarize", strings.NewReader(`{"model":"gpt-5.4","traces":[{"id":"trace-1","items":[]}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleMemorySummarize(w, req)
+
+	resp := w.Result()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected oversized successful memory summary response to fail with 502, got %d", resp.StatusCode)
+	}
+	if bytes.Contains(body, []byte(`"trace_summary"`)) {
+		t.Fatalf("oversized memory response must not emit summary output: %s", body)
+	}
+	if upstreamBody.bytesRead > proxySummaryResponseBodySize+1 {
+		t.Fatalf("expected bounded memory response read, got %d bytes", upstreamBody.bytesRead)
+	}
+	if !upstreamBody.closed {
+		t.Fatal("expected oversized memory response body to be closed")
 	}
 }

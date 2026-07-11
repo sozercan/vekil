@@ -11,7 +11,10 @@ type syntheticCompactionPayload struct {
 	Summary string `json:"summary"`
 }
 
-const proxyCompactionContextIntro = "You are resuming an interrupted assistant turn from a context checkpoint."
+const (
+	proxyCompactionContextIntro         = "You are resuming an interrupted assistant turn from a context checkpoint."
+	syntheticCompactionResponseIDPrefix = "resp-vekil-compact-"
+)
 
 func encodeSyntheticCompaction(summary string) string {
 	payload, err := json.Marshal(syntheticCompactionPayload{Summary: summary})
@@ -57,6 +60,46 @@ func rewriteSyntheticCompactionRequest(body []byte) ([]byte, int) {
 		return body, 0
 	}
 	return rewrittenBody, rewriteCount
+}
+
+// resetSyntheticCompactionResponseLineage removes server-side continuation
+// state that points at a proxy-generated compaction response. Those synthetic
+// response IDs exist only at Vekil's public surface and can never be resolved
+// by the upstream Responses API. The reset is intentionally narrow: an ID with
+// the proxy prefix is removed only when the same request also carries a
+// proxy-owned compaction checkpoint that Vekil can expand into normal context.
+func resetSyntheticCompactionResponseLineage(body []byte) ([]byte, bool) {
+	if !bytes.Contains(body, []byte(syntheticCompactionResponseIDPrefix)) || !responsesBodyMayContainSyntheticCompaction(body) {
+		return body, false
+	}
+
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body, false
+	}
+
+	var previousResponseID string
+	if err := json.Unmarshal(req["previous_response_id"], &previousResponseID); err != nil {
+		return body, false
+	}
+	if !strings.HasPrefix(strings.TrimSpace(previousResponseID), syntheticCompactionResponseIDPrefix) {
+		return body, false
+	}
+
+	var input interface{}
+	if err := json.Unmarshal(req["input"], &input); err != nil {
+		return body, false
+	}
+	if _, rewriteCount := rewriteSyntheticCompactionValue(input); rewriteCount == 0 {
+		return body, false
+	}
+
+	delete(req, "previous_response_id")
+	rewrittenBody, err := json.Marshal(req)
+	if err != nil {
+		return body, false
+	}
+	return rewrittenBody, true
 }
 
 func responsesBodyMayContainSyntheticCompaction(body []byte) bool {
