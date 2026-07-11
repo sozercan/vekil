@@ -36,6 +36,8 @@ func newRTKToolOptimizer(cfg ToolOptimizerProviderConfig) ToolOptimizer {
 	}
 }
 
+func (*rtkToolOptimizer) optimizerUsesExternalProcess() {}
+
 func (r *rtkToolOptimizer) ID() string {
 	if r == nil {
 		return "rtk"
@@ -47,8 +49,11 @@ func (r *rtkToolOptimizer) RewriteCommand(ctx context.Context, req ToolCommandRe
 	if r == nil || strings.TrimSpace(req.Command) == "" {
 		return ToolCommandRewriteResult{}, nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cmd := exec.CommandContext(ctx, r.path, "hook", "check", "--", req.Command)
-	stdout, err := r.run(cmd, "")
+	stdout, err := r.run(ctx, cmd, "")
 	if err != nil {
 		return ToolCommandRewriteResult{}, err
 	}
@@ -67,8 +72,11 @@ func (r *rtkToolOptimizer) ReduceOutput(ctx context.Context, req ToolOutputReduc
 	if isSupportedRTKFilter(req.FilterHint) {
 		args = append(args, "--filter", req.FilterHint)
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cmd := exec.CommandContext(ctx, r.path, args...)
-	stdout, err := r.run(cmd, req.Output)
+	stdout, err := r.run(ctx, cmd, req.Output)
 	if err != nil {
 		return ToolOutputReduceResult{}, err
 	}
@@ -78,7 +86,7 @@ func (r *rtkToolOptimizer) ReduceOutput(ctx context.Context, req ToolOutputReduc
 	return ToolOutputReduceResult{Changed: true, Output: string(stdout), Provider: r.ID(), Reason: "rtk pipe"}, nil
 }
 
-func (r *rtkToolOptimizer) run(cmd *exec.Cmd, stdin string) ([]byte, error) {
+func (r *rtkToolOptimizer) run(ctx context.Context, cmd *exec.Cmd, stdin string) ([]byte, error) {
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -87,7 +95,7 @@ func (r *rtkToolOptimizer) run(cmd *exec.Cmd, stdin string) ([]byte, error) {
 	stderr.limit = r.maxStderrBytes
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := runOptimizerCommand(ctx, cmd); err != nil {
 		return nil, err
 	}
 	if stdout.Truncated() || stderr.Truncated() {

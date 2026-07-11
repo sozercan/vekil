@@ -1,11 +1,8 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
-	"io"
 	"net/http"
-	"strconv"
 )
 
 func (h *ProxyHandler) writeResponsesUpstreamResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, store *ToolExecutionContextStore, scope string) {
@@ -15,23 +12,10 @@ func (h *ProxyHandler) writeResponsesUpstreamResponse(ctx context.Context, w htt
 		writeResponsesPassthroughObservingUsage(ctx, w, resp)
 		return
 	}
-	defer func() { _ = resp.Body.Close() }()
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		copyPassthroughHeaders(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, bytes.NewReader(bodyBytes))
-		return
-	}
-	observeResponsesUsage(ctx, sniffResponsesUsageBody(bodyBytes))
-	rewritten, changed := h.maybeRewriteResponsesResponseBody(ctx, bodyBytes, store, scope)
-	copyPassthroughHeaders(w.Header(), resp.Header)
-	if changed {
-		w.Header().Del("Content-Length")
-		w.Header().Set("Content-Length", strconv.Itoa(len(rewritten)))
-	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(rewritten)
+	writePassthroughSniffingUsage(w, resp, func(bodyBytes []byte) ([]byte, bool) {
+		observeResponsesUsage(ctx, sniffResponsesUsageBody(bodyBytes))
+		return h.maybeRewriteResponsesResponseBody(ctx, bodyBytes, store, scope)
+	})
 }
 
 // writeResponsesPassthroughObservingUsage writes a non-streaming Responses

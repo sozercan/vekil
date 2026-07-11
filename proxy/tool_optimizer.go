@@ -2,11 +2,17 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"time"
 )
 
-const maxOptimizedCommandBytes = 32 << 10
+const (
+	maxOptimizedCommandBytes                       = 32 << 10
+	defaultToolOptimizerMaxProviderCallsPerTurn    = 8
+	defaultToolOptimizerMaxConcurrentExternalCalls = 4
+)
 
 type ToolCommandRewriteRequest struct {
 	ToolName string
@@ -44,6 +50,10 @@ type ToolOptimizer interface {
 	ReduceOutput(context.Context, ToolOutputReduceRequest) (ToolOutputReduceResult, error)
 }
 
+type externalToolOptimizer interface {
+	optimizerUsesExternalProcess()
+}
+
 type stagedToolOptimizer struct {
 	optimizer      ToolOptimizer
 	commandRewrite bool
@@ -51,14 +61,31 @@ type stagedToolOptimizer struct {
 }
 
 type ToolOptimizerManager struct {
-	cfg        ToolOptimizersConfig
-	providers  []stagedToolOptimizer
-	shellNames map[string]struct{}
+	cfg           ToolOptimizersConfig
+	providers     []stagedToolOptimizer
+	shellNames    map[string]struct{}
+	externalCalls chan struct{}
+}
+
+type toolOptimizerTurnBudgetContextKey struct{}
+
+type toolOptimizerTurnBudget struct {
+	manager *ToolOptimizerManager
+	stage   string
+
+	mu               sync.Mutex
+	providerCalls    int
+	stoppedProviders map[int]struct{}
 }
 
 func NewToolOptimizerManager(cfg ToolOptimizersConfig, providers []stagedToolOptimizer) *ToolOptimizerManager {
 	cfg = cfg.withDefaults()
-	m := &ToolOptimizerManager{cfg: cfg, providers: providers, shellNames: make(map[string]struct{})}
+	m := &ToolOptimizerManager{
+		cfg:           cfg,
+		providers:     providers,
+		shellNames:    make(map[string]struct{}),
+		externalCalls: make(chan struct{}, defaultToolOptimizerMaxConcurrentExternalCalls),
+	}
 	for _, name := range cfg.Tools.ShellFunctionCalls.Names {
 		trimmed := strings.TrimSpace(name)
 		if trimmed != "" {
@@ -84,7 +111,21 @@ func (m *ToolOptimizerManager) OutputReduceEnabled() bool {
 }
 
 func (m *ToolOptimizerManager) ShouldInspectNonStreamingResponses() bool {
-	return m != nil && m.cfg.Enabled && (m.cfg.CommandRewrite.Enabled || m.cfg.OutputReduce.Enabled)
+	if m == nil || !m.cfg.Enabled {
+		return false
+	}
+	for _, provider := range m.providers {
+		if provider.optimizer == nil {
+			continue
+		}
+		if m.cfg.CommandRewrite.Enabled && provider.commandRewrite {
+			return true
+		}
+		if m.cfg.OutputReduce.Enabled && provider.outputReduce {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *ToolOptimizerManager) ShellFunctionCallsEnabled() bool {
@@ -110,24 +151,153 @@ func (m *ToolOptimizerManager) ShellCommandArgPath() string {
 	return path
 }
 
+// withTurnBudget installs one deadline and provider-call budget for all items in
+// a request/response optimizer stage. Direct manager calls intentionally do not
+// install this state, preserving their historical per-call timeout behavior.
+func (m *ToolOptimizerManager) withTurnBudget(parent context.Context, stage string) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if existing := toolOptimizerTurnBudgetFromContext(parent, m, stage); existing != nil {
+		return parent, func() {}
+	}
+
+	timeoutMS := 0
+	switch stage {
+	case toolOptimizerStageCommandRewrite:
+		timeoutMS = m.cfg.CommandRewrite.TimeoutMS
+	case toolOptimizerStageOutputReduce:
+		timeoutMS = m.cfg.OutputReduce.TimeoutMS
+	}
+	budgetCtx, cancel := optimizerCallContext(parent, timeoutMS)
+	budget := &toolOptimizerTurnBudget{
+		manager:          m,
+		stage:            stage,
+		stoppedProviders: make(map[int]struct{}),
+	}
+	return context.WithValue(budgetCtx, toolOptimizerTurnBudgetContextKey{}, budget), cancel
+}
+
+func toolOptimizerTurnBudgetFromContext(ctx context.Context, manager *ToolOptimizerManager, stage string) *toolOptimizerTurnBudget {
+	if ctx == nil {
+		return nil
+	}
+	budget, _ := ctx.Value(toolOptimizerTurnBudgetContextKey{}).(*toolOptimizerTurnBudget)
+	if budget == nil || budget.manager != manager || budget.stage != stage {
+		return nil
+	}
+	return budget
+}
+
+func (b *toolOptimizerTurnBudget) providerAvailable(providerIndex int) (available, exhausted bool) {
+	if b == nil {
+		return true, false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.providerCalls >= defaultToolOptimizerMaxProviderCallsPerTurn {
+		return false, true
+	}
+	_, stopped := b.stoppedProviders[providerIndex]
+	return !stopped, false
+}
+
+func (b *toolOptimizerTurnBudget) startProviderCall(providerIndex int) bool {
+	if b == nil {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.providerCalls >= defaultToolOptimizerMaxProviderCallsPerTurn {
+		return false
+	}
+	if _, stopped := b.stoppedProviders[providerIndex]; stopped {
+		return false
+	}
+	b.providerCalls++
+	return true
+}
+
+func (b *toolOptimizerTurnBudget) stopProvider(providerIndex int) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.stoppedProviders[providerIndex] = struct{}{}
+	b.mu.Unlock()
+}
+
 func (m *ToolOptimizerManager) RewriteCommand(ctx context.Context, req ToolCommandRewriteRequest) ToolCommandRewriteResult {
 	if !m.CommandRewriteEnabled() || strings.TrimSpace(req.Command) == "" {
 		return ToolCommandRewriteResult{}
 	}
-	for _, provider := range m.providers {
+	budget := toolOptimizerTurnBudgetFromContext(ctx, m, toolOptimizerStageCommandRewrite)
+	for providerIndex, provider := range m.providers {
 		if provider.optimizer == nil || !provider.commandRewrite {
 			continue
 		}
-		callCtx, cancel := optimizerCallContext(ctx, m.cfg.CommandRewrite.TimeoutMS)
+		if budget != nil {
+			available, exhausted := budget.providerAvailable(providerIndex)
+			if exhausted {
+				return ToolCommandRewriteResult{}
+			}
+			if !available {
+				continue
+			}
+		}
+
+		callCtx, cancel := optimizerProviderCallContext(ctx, m.cfg.CommandRewrite.TimeoutMS, budget)
+		if optimizerContextErr(callCtx) != nil {
+			cancel()
+			return ToolCommandRewriteResult{}
+		}
+		release, acquired := m.acquireExternalCall(callCtx, provider.optimizer)
+		if !acquired {
+			if budget != nil && optimizerContextErr(callCtx) != nil {
+				budget.stopProvider(providerIndex)
+			}
+			cancel()
+			return ToolCommandRewriteResult{}
+		}
+		if budget != nil && !budget.startProviderCall(providerIndex) {
+			release()
+			cancel()
+			return ToolCommandRewriteResult{}
+		}
+
 		result, err := provider.optimizer.RewriteCommand(callCtx, req)
-		cancel()
-		if err != nil || !result.Changed {
+		release()
+		if callCtxErr := optimizerContextErr(callCtx); callCtxErr != nil {
+			cancel()
+			if budget != nil {
+				budget.stopProvider(providerIndex)
+			}
+			return ToolCommandRewriteResult{}
+		}
+		if err != nil {
+			cancel()
+			if budget != nil && optimizerProviderTimedOut(err) {
+				budget.stopProvider(providerIndex)
+			}
+			continue
+		}
+		if !result.Changed {
+			cancel()
 			continue
 		}
 		result.Provider = firstNonEmpty(result.Provider, provider.optimizer.ID())
 		if !validCommandReplacement(req.Command, result.Command) {
+			cancel()
 			continue
 		}
+		if optimizerContextErr(callCtx) != nil {
+			cancel()
+			if budget != nil {
+				budget.stopProvider(providerIndex)
+			}
+			return ToolCommandRewriteResult{}
+		}
+		cancel()
 		return result
 	}
 	return ToolCommandRewriteResult{}
@@ -140,23 +310,117 @@ func (m *ToolOptimizerManager) ReduceOutput(ctx context.Context, req ToolOutputR
 	if !m.outputWithinConfiguredThresholds(req.Output) {
 		return ToolOutputReduceResult{}
 	}
-	for _, provider := range m.providers {
+	budget := toolOptimizerTurnBudgetFromContext(ctx, m, toolOptimizerStageOutputReduce)
+	for providerIndex, provider := range m.providers {
 		if provider.optimizer == nil || !provider.outputReduce {
 			continue
 		}
-		callCtx, cancel := optimizerCallContext(ctx, m.cfg.OutputReduce.TimeoutMS)
+		if budget != nil {
+			available, exhausted := budget.providerAvailable(providerIndex)
+			if exhausted {
+				return ToolOutputReduceResult{}
+			}
+			if !available {
+				continue
+			}
+		}
+
+		callCtx, cancel := optimizerProviderCallContext(ctx, m.cfg.OutputReduce.TimeoutMS, budget)
+		if optimizerContextErr(callCtx) != nil {
+			cancel()
+			return ToolOutputReduceResult{}
+		}
+		release, acquired := m.acquireExternalCall(callCtx, provider.optimizer)
+		if !acquired {
+			if budget != nil && optimizerContextErr(callCtx) != nil {
+				budget.stopProvider(providerIndex)
+			}
+			cancel()
+			return ToolOutputReduceResult{}
+		}
+		if budget != nil && !budget.startProviderCall(providerIndex) {
+			release()
+			cancel()
+			return ToolOutputReduceResult{}
+		}
+
 		result, err := provider.optimizer.ReduceOutput(callCtx, req)
-		cancel()
-		if err != nil || !result.Changed {
+		release()
+		if callCtxErr := optimizerContextErr(callCtx); callCtxErr != nil {
+			cancel()
+			if budget != nil {
+				budget.stopProvider(providerIndex)
+			}
+			return ToolOutputReduceResult{}
+		}
+		if err != nil {
+			cancel()
+			if budget != nil && optimizerProviderTimedOut(err) {
+				budget.stopProvider(providerIndex)
+			}
+			continue
+		}
+		if !result.Changed {
+			cancel()
 			continue
 		}
 		result.Provider = firstNonEmpty(result.Provider, provider.optimizer.ID())
 		if !validOutputReplacement(req.Output, result.Output) {
+			cancel()
 			continue
 		}
+		if optimizerContextErr(callCtx) != nil {
+			cancel()
+			if budget != nil {
+				budget.stopProvider(providerIndex)
+			}
+			return ToolOutputReduceResult{}
+		}
+		cancel()
 		return result
 	}
 	return ToolOutputReduceResult{}
+}
+
+func optimizerProviderCallContext(parent context.Context, timeoutMS int, budget *toolOptimizerTurnBudget) (context.Context, context.CancelFunc) {
+	if budget != nil {
+		if parent == nil {
+			parent = context.Background()
+		}
+		return parent, func() {}
+	}
+	return optimizerCallContext(parent, timeoutMS)
+}
+
+func optimizerProviderTimedOut(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+}
+
+func (m *ToolOptimizerManager) acquireExternalCall(ctx context.Context, optimizer ToolOptimizer) (func(), bool) {
+	if _, external := optimizer.(externalToolOptimizer); !external || m == nil || m.externalCalls == nil {
+		return func() {}, true
+	}
+	if optimizerContextErr(ctx) != nil {
+		return nil, false
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline && ctx.Done() == nil {
+		select {
+		case m.externalCalls <- struct{}{}:
+			return func() { <-m.externalCalls }, true
+		default:
+			return nil, false
+		}
+	}
+	select {
+	case m.externalCalls <- struct{}{}:
+		if optimizerContextErr(ctx) != nil {
+			<-m.externalCalls
+			return nil, false
+		}
+		return func() { <-m.externalCalls }, true
+	case <-ctx.Done():
+		return nil, false
+	}
 }
 
 func (m *ToolOptimizerManager) outputWithinConfiguredThresholds(output string) bool {

@@ -232,6 +232,9 @@ func (h *ProxyHandler) maybeRewriteResponsesResponseBody(ctx context.Context, bo
 	if err := json.Unmarshal(rawOutput, &outputItems); err != nil {
 		return bodyBytes, false
 	}
+	turnCtx, cancel := manager.withTurnBudget(ctx, toolOptimizerStageCommandRewrite)
+	defer cancel()
+	ctx = turnCtx
 	responseScope := toolExecutionScopeFromResponsePayload(payload)
 	captureScopes := uniqueToolExecutionScopes(scope, responseScope)
 	changed := false
@@ -330,6 +333,9 @@ func (h *ProxyHandler) maybeReduceResponsesToolOutputsInRequestBody(ctx context.
 	if err := json.Unmarshal(rawInput, &inputItems); err != nil {
 		return bodyBytes, 0
 	}
+	turnCtx, cancel := manager.withTurnBudget(ctx, toolOptimizerStageOutputReduce)
+	defer cancel()
+	ctx = turnCtx
 
 	localContexts := make(map[string]ToolExecutionContext)
 	changedCount := 0
