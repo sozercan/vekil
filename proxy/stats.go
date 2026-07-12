@@ -151,9 +151,10 @@ type statsCollector struct {
 
 	// recent is a bounded ring of the most recent completed requests for the
 	// drill-down log. Newest writes overwrite oldest.
-	recent     []recentRequest
-	recentIdx  int
-	recentSize int
+	recent         []recentRequest
+	recentIdx      int
+	recentSize     int
+	recentSequence uint64
 
 	// latencies is a bounded ring of recent request durations (ms) used to
 	// compute p50/p95/p99 without retaining every sample forever.
@@ -166,6 +167,7 @@ type statsCollector struct {
 
 // recentRequest is one row in the recent-requests drill-down log.
 type recentRequest struct {
+	recordID          uint64
 	T                 int64  `json:"t"`
 	Endpoint          string `json:"endpoint,omitempty"`
 	Model             string `json:"model,omitempty"`
@@ -175,6 +177,20 @@ type recentRequest struct {
 	DurMs             int64  `json:"dur_ms"`
 	TotalTokens       int64  `json:"total_tokens"`
 	UpstreamRequestID string `json:"upstream_request_id,omitempty"`
+}
+
+// responsesTurnStatsRecord identifies the aggregate buckets updated by one
+// websocket create turn. It lets post-terminal internal compaction add token
+// usage without incrementing request/error counts or attributing the delta to a
+// provider/model that changed after the upstream route was selected.
+type responsesTurnStatsRecord struct {
+	valid       bool
+	sec         int64
+	modelKey    string
+	providerKey string
+	agentKey    string
+	recentIndex int
+	recordID    uint64
 }
 
 const (
@@ -225,18 +241,17 @@ func (c *statsCollector) record(summary *RequestSummary, status int, userAgent s
 	c.recordLocked(d, agent, status, durMs)
 }
 
-// recordResponsesTurn folds one /v1/responses websocket-bridge turn into the
-// aggregates. The bridge does not flow through the HTTP request middleware (one
-// upgrade serves many turns), so turns are recorded here directly. status is the
-// turn outcome (200 for a completed turn, or an upstream error status for a
-// failed/non-200 turn) so failures show up in error counts and the recent log.
-// Streamed turns carry no latency sample. Every turn is counted as a request
-// even with zero/absent usage, matching the HTTP path.
-func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage) {
-	total := usage.TotalTokens
-	if total == 0 {
-		total = usage.InputTokens + usage.OutputTokens
-	}
+// recordResponsesTurn folds one client /v1/responses websocket create turn into
+// the aggregates. The bridge does not flow through the HTTP request middleware
+// (one upgrade serves many turns), so turns are recorded here directly. Internal
+// compaction usage available before the terminal event is folded into usage;
+// post-terminal compaction amends the returned record without another request.
+// status is the client turn outcome (200 for completed,
+// or an upstream error status for failed/non-200) so failures show up in error
+// counts and the recent log. Streamed turns carry no latency sample. Every turn
+// is counted as one request even with zero/absent usage, matching the HTTP path.
+func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage) responsesTurnStatsRecord {
+	total := usage.totalTokens()
 	d := summaryStats{
 		model:      boundStatLabel(model),
 		provider:   provider,
@@ -259,12 +274,56 @@ func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel s
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.recordLocked(d, agent, status, 0)
+	return c.recordLocked(d, agent, status, 0)
+}
+
+// addResponsesTurnUsage adds post-terminal internal usage to an already-recorded
+// websocket turn without changing request, error, status, or latency counters.
+// If the time-series or recent-request slot has since wrapped, cumulative and
+// still-addressable breakdown totals remain correct without corrupting a newer
+// slot.
+func (c *statsCollector) addResponsesTurnUsage(record responsesTurnStatsRecord, usage responsesUsage) {
+	if c == nil || !record.valid || usage.isZero() {
+		return
+	}
+	total := int64(usage.totalTokens())
+	prompt := int64(usage.InputTokens)
+	completion := int64(usage.OutputTokens)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if bucket := &c.ring[ringIndex(record.sec, len(c.ring))]; bucket.sec == record.sec {
+		bucket.prompt += prompt
+		bucket.completion += completion
+	}
+	c.totals.PromptTokens += prompt
+	c.totals.CompletionTokens += completion
+	c.totals.TotalTokens += total
+	c.totals.CachedTokens += int64(usage.InputTokensDetails.CachedTokens)
+	c.totals.ReasoningTokens += int64(usage.OutputTokensDetails.ReasoningTokens)
+	if record.modelKey != "" {
+		if counter := c.byModel[record.modelKey]; counter != nil {
+			counter.tokens += total
+		}
+	}
+	if record.providerKey != "" {
+		if counter := c.byProvider[record.providerKey]; counter != nil {
+			counter.tokens += total
+		}
+	}
+	if record.agentKey != "" {
+		if counter := c.byAgent[record.agentKey]; counter != nil {
+			counter.tokens += total
+		}
+	}
+	if record.recentIndex >= 0 && record.recentIndex < len(c.recent) && c.recent[record.recentIndex].recordID == record.recordID {
+		c.recent[record.recentIndex].TotalTokens += total
+	}
 }
 
 // recordLocked folds one already-resolved request/turn into the aggregates.
 // Caller must hold c.mu. agent is the already-classified label.
-func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, durMs int64) {
+func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, durMs int64) responsesTurnStatsRecord {
 	sec := c.now().Unix()
 	isErr := status >= http.StatusBadRequest
 
@@ -310,17 +369,27 @@ func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, 
 		c.errTargets[capKey(c.errTargets, errorTargetLabel(d.provider, d.model))]++
 	}
 
+	modelKey := ""
 	if d.model != "" {
-		addBreakdown(c.byModel, capKey(c.byModel, d.model), int64(d.total), "", isErr, durMs, measureLatency)
+		modelKey = capKey(c.byModel, d.model)
+		addBreakdown(c.byModel, modelKey, int64(d.total), "", isErr, durMs, measureLatency)
 	}
-	if d.provider != "" {
+	providerKey := d.provider
+	if providerKey != "" {
 		// Providers are configured, not client-controlled, so no cap needed.
-		addBreakdown(c.byProvider, d.provider, int64(d.total), d.kind, isErr, durMs, measureLatency)
+		addBreakdown(c.byProvider, providerKey, int64(d.total), d.kind, isErr, durMs, measureLatency)
 	}
-	addBreakdown(c.byAgent, capKey(c.byAgent, agent), int64(d.total), "", isErr, durMs, measureLatency)
+	agentKey := capKey(c.byAgent, agent)
+	addBreakdown(c.byAgent, agentKey, int64(d.total), "", isErr, durMs, measureLatency)
 
 	// Append to the recent-requests drill-down ring (newest overwrites oldest).
-	c.recent[c.recentIdx] = recentRequest{
+	if c.recentSequence == ^uint64(0) {
+		panic("stats recent request sequence exhausted")
+	}
+	c.recentSequence++
+	recentIndex := c.recentIdx
+	c.recent[recentIndex] = recentRequest{
+		recordID:          c.recentSequence,
 		T:                 sec,
 		Endpoint:          d.endpoint,
 		Model:             d.model,
@@ -334,6 +403,15 @@ func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, 
 	c.recentIdx = (c.recentIdx + 1) % len(c.recent)
 	if c.recentSize < len(c.recent) {
 		c.recentSize++
+	}
+	return responsesTurnStatsRecord{
+		valid:       true,
+		sec:         sec,
+		modelKey:    modelKey,
+		providerKey: providerKey,
+		agentKey:    agentKey,
+		recentIndex: recentIndex,
+		recordID:    c.recentSequence,
 	}
 }
 
@@ -901,15 +979,24 @@ func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAg
 	h.stats.record(summary, status, userAgent, dur)
 }
 
-// RecordResponsesTurn folds one /v1/responses websocket-bridge turn into the
+// RecordResponsesTurn folds one client /v1/responses websocket create turn into
 // traffic stats. The bridge does not flow through the HTTP request middleware,
-// so turns are recorded directly here. status is the turn outcome so failed
-// turns appear in error counts.
-func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage) {
+// so turns are recorded directly here. usage includes internal compaction spend
+// accumulated before the terminal outcome; the returned record accepts bounded
+// post-terminal usage amendments without creating synthetic requests. status is
+// the client turn outcome so failed turns appear in error counts.
+func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage) responsesTurnStatsRecord {
+	if h == nil || h.stats == nil {
+		return responsesTurnStatsRecord{}
+	}
+	return h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage)
+}
+
+func (h *ProxyHandler) AddResponsesTurnUsage(record responsesTurnStatsRecord, usage responsesUsage) {
 	if h == nil || h.stats == nil {
 		return
 	}
-	h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage)
+	h.stats.addResponsesTurnUsage(record, usage)
 }
 
 // HandleStatsJSON handles GET /stats.json with the current traffic snapshot.

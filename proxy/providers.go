@@ -1465,7 +1465,61 @@ func applyGenericProviderAuth(req *http.Request, provider *providerRuntime) erro
 	}
 }
 
+type providerRouteContextKey struct{}
+type providerRouteObserverContextKey struct{}
+
+type providerRouteInfo struct {
+	id   string
+	kind string
+}
+
+type providerRouteObserver struct {
+	mu    sync.Mutex
+	route providerRouteInfo
+}
+
+func withProviderRouteObserver(ctx context.Context) (context.Context, *providerRouteObserver) {
+	observer := &providerRouteObserver{}
+	return context.WithValue(ctx, providerRouteObserverContextKey{}, observer), observer
+}
+
+func publishProviderRoute(ctx context.Context, route providerRouteInfo) {
+	if ctx == nil || route.id == "" {
+		return
+	}
+	observer, _ := ctx.Value(providerRouteObserverContextKey{}).(*providerRouteObserver)
+	if observer == nil {
+		return
+	}
+	observer.mu.Lock()
+	observer.route = route
+	observer.mu.Unlock()
+}
+
+func (o *providerRouteObserver) snapshot() (providerRouteInfo, bool) {
+	if o == nil {
+		return providerRouteInfo{}, false
+	}
+	o.mu.Lock()
+	route := o.route
+	o.mu.Unlock()
+	return route, route.id != ""
+}
+
+func providerRouteFromResponse(resp *http.Response) (providerRouteInfo, bool) {
+	if resp == nil || resp.Request == nil {
+		return providerRouteInfo{}, false
+	}
+	route, ok := resp.Request.Context().Value(providerRouteContextKey{}).(providerRouteInfo)
+	return route, ok && route.id != ""
+}
+
 func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
+	route := providerRouteInfo{id: provider.id, kind: string(provider.kind)}
+	// Route selection has already happened before URL construction or provider
+	// authentication. Publish it now so failures in either step retain the actual
+	// provider attribution even if the dynamic model catalog changes afterward.
+	publishProviderRoute(ctx, route)
 	fullURL, err := h.providerRequestURL(provider, path, extraQuery, owners...)
 	if err != nil {
 		return nil, err
@@ -1476,6 +1530,7 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 		bodyReader = bytes.NewReader(body)
 	}
 
+	ctx = context.WithValue(ctx, providerRouteContextKey{}, route)
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
 	if err != nil {
 		return nil, err

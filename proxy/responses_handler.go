@@ -294,28 +294,20 @@ type compactBudget struct {
 	max           int
 	learnedTarget int
 	resolvedModel string
-	usage         responsesUsageTotals
-}
-
-type responsesUsageTotals struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-	TotalTokens  int `json:"total_tokens"`
+	usage         responsesUsage
 }
 
 func (b *compactBudget) addResponsesUsage(body []byte) {
 	if b == nil {
 		return
 	}
-	usage := extractResponsesUsageTotals(body)
-	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
+	usage := sniffResponsesUsageBody(body)
+	if usage.isZero() {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.usage.InputTokens += usage.InputTokens
-	b.usage.OutputTokens += usage.OutputTokens
-	b.usage.TotalTokens += usage.TotalTokens
+	b.usage.add(usage)
 }
 
 func (b *compactBudget) responsesUsage() map[string]interface{} {
@@ -325,17 +317,23 @@ func (b *compactBudget) responsesUsage() map[string]interface{} {
 	b.mu.Lock()
 	usage := b.usage
 	b.mu.Unlock()
-	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
+	if usage.isZero() {
 		return zeroResponsesUsage()
 	}
-	if usage.TotalTokens == 0 {
-		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+	usage.TotalTokens = usage.totalTokens()
+	var inputDetails interface{}
+	if usage.InputTokensDetails.CachedTokens != 0 {
+		inputDetails = map[string]int{"cached_tokens": usage.InputTokensDetails.CachedTokens}
+	}
+	var outputDetails interface{}
+	if usage.OutputTokensDetails.ReasoningTokens != 0 {
+		outputDetails = map[string]int{"reasoning_tokens": usage.OutputTokensDetails.ReasoningTokens}
 	}
 	return map[string]interface{}{
 		"input_tokens":          usage.InputTokens,
-		"input_tokens_details":  nil,
+		"input_tokens_details":  inputDetails,
 		"output_tokens":         usage.OutputTokens,
-		"output_tokens_details": nil,
+		"output_tokens_details": outputDetails,
 		"total_tokens":          usage.TotalTokens,
 	}
 }
@@ -351,25 +349,8 @@ func (b *compactBudget) usageTotals() responsesUsage {
 	b.mu.Lock()
 	usage := b.usage
 	b.mu.Unlock()
-	total := usage.TotalTokens
-	if total == 0 {
-		total = usage.InputTokens + usage.OutputTokens
-	}
-	return responsesUsage{
-		InputTokens:  usage.InputTokens,
-		OutputTokens: usage.OutputTokens,
-		TotalTokens:  total,
-	}
-}
-
-func extractResponsesUsageTotals(body []byte) responsesUsageTotals {
-	var envelope struct {
-		Usage responsesUsageTotals `json:"usage"`
-	}
-	if err := json.Unmarshal(body, &envelope); err == nil {
-		return envelope.Usage
-	}
-	return responsesUsageTotals{}
+	usage.TotalTokens = usage.totalTokens()
+	return usage
 }
 
 func newCompactBudget(max int) *compactBudget {

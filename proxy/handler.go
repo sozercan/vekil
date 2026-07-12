@@ -256,6 +256,8 @@ type ProxyHandler struct {
 	lifecycleOnce                    sync.Once
 	lifecycleCtx                     context.Context
 	lifecycleCancel                  context.CancelCauseFunc
+	shutdownSequenceOnce             sync.Once
+	shutdownSequence                 atomic.Uint64
 	lifecycleWorkersMu               sync.Mutex
 	lifecycleWorkers                 sync.WaitGroup
 	lifecycleWorkersActive           int
@@ -315,6 +317,11 @@ func (h *ProxyHandler) BeginShutdown() {
 	if h == nil {
 		return
 	}
+	h.shutdownSequenceOnce.Do(func() {
+		publishResponsesLifecycleSequence(func(sequence uint64) {
+			h.shutdownSequence.Store(sequence)
+		})
+	})
 	h.draining.Store(true)
 	h.initializeLifecycle()
 	h.lifecycleCancel(errProxyLifecycleShutdown)

@@ -155,7 +155,7 @@ func TestResponsesWebSocketStreamUpstreamResponseWrapsClientWriteError(t *testin
 	session := &responsesWebSocketSession{conn: serverConn, ctx: context.Background()}
 	stream := strings.NewReader("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n" +
 		"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n\n")
-	_, _, _, err = session.streamUpstreamResponse(nil, "", stream, nil)
+	_, err = session.streamUpstreamResponse(nil, stream, nil, nil)
 	if !errors.Is(err, errResponsesWebSocketClientWrite) {
 		t.Fatalf("streamUpstreamResponse error = %v, want client write sentinel", err)
 	}
@@ -351,6 +351,7 @@ func TestHandleResponsesWebSocket_ForwardsCompletedUsage(t *testing.T) {
 		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-usage\"}}\n\n")
 		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-usage\",\"usage\":{\"input_tokens\":1234,\"input_tokens_details\":{\"cached_tokens\":456},\"output_tokens\":78,\"output_tokens_details\":{\"reasoning_tokens\":9},\"total_tokens\":1312}}}\n\n")
 	})
+	handler.stats = newStatsCollector()
 
 	server := startResponsesWebSocketProxyServer(t, handler)
 	conn := mustDialResponsesWebSocket(t, server, nil)
@@ -410,6 +411,27 @@ func TestHandleResponsesWebSocket_ForwardsCompletedUsage(t *testing.T) {
 	}
 	if got, ok := outputDetails["reasoning_tokens"].(float64); !ok || got != 9 {
 		t.Fatalf("reasoning_tokens = %#v, want 9", outputDetails["reasoning_tokens"])
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		snap := handler.stats.snapshot()
+		if snap.Totals.Requests >= 1 {
+			if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 {
+				t.Fatalf("no-compaction success stats = requests:%d errors:%d, want 1/0", snap.Totals.Requests, snap.Totals.Errors)
+			}
+			if snap.Totals.PromptTokens != 1234 || snap.Totals.CompletionTokens != 78 || snap.Totals.TotalTokens != 1312 {
+				t.Fatalf("no-compaction success usage = prompt:%d completion:%d total:%d, want 1234/78/1312", snap.Totals.PromptTokens, snap.Totals.CompletionTokens, snap.Totals.TotalTokens)
+			}
+			if snap.Totals.CachedTokens != 456 || snap.Totals.ReasoningTokens != 9 {
+				t.Fatalf("no-compaction success detail usage = cached:%d reasoning:%d, want 456/9", snap.Totals.CachedTokens, snap.Totals.ReasoningTokens)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no-compaction success stats were not recorded: %+v", snap.Totals)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -933,23 +955,24 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-1\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"}]}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-2\",\"content\":[{\"type\":\"output_text\",\"text\":\"second\"}]}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-3\",\"content\":[{\"type\":\"output_text\",\"text\":\"third\"}]}}\n\n")
-			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-4\",\"content\":[{\"type\":\"output_text\",\"text\":\"fourth\"}]}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":4},\"output_tokens\":2,\"output_tokens_details\":{\"reasoning_tokens\":1},\"total_tokens\":12}}}\n\n")
 		case 2:
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n")
-			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":20,\"input_tokens_details\":{\"cached_tokens\":6},\"output_tokens\":3,\"output_tokens_details\":{\"reasoning_tokens\":2},\"total_tokens\":23}}}\n\n")
 		default:
 			t.Fatalf("unexpected normal upstream request count %d", requestNumber)
 		}
 	})
 	handler.responsesWS = ResponsesWebSocketConfig{
-		AutoCompactMaxItems: 3,
+		AutoCompactMaxItems: 4,
 		AutoCompactMaxBytes: 1 << 20,
 		AutoCompactKeepTail: 2,
 	}
 	handler.stats = newStatsCollector()
 
 	server := startResponsesWebSocketProxyServer(t, handler)
-	conn := mustDialResponsesWebSocket(t, server, nil)
+	conn := mustDialResponsesWebSocket(t, server, http.Header{"User-Agent": []string{"Codex CLI accounting-test"}})
 	defer func() { _ = conn.Close() }()
 
 	first := newResponsesWebSocketCreateRequest([]interface{}{
@@ -966,6 +989,7 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 	}
 
 	firstCreated := mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
 	_ = mustReadWebSocketJSON(t, conn)
 	_ = mustReadWebSocketJSON(t, conn)
 	_ = mustReadWebSocketJSON(t, conn)
@@ -1010,20 +1034,38 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 		t.Fatalf("expected latest user turn to be preserved, got %q", got)
 	}
 
-	// The internal auto-compaction call spends upstream /responses tokens that do
-	// not flow through the HTTP middleware; assert they were recorded into stats
-	// as their own turn (round-5: long auto-compacting sessions must not
-	// underreport token spend). The compaction upstream reports 1000+200 tokens.
+	// One websocket response.create is one dashboard request even when the proxy
+	// performs internal auto-compaction. The two client turns report 10+2 and
+	// 20+3 tokens; compaction reports 1000+200 and must be folded into those two
+	// turns without creating a third request.
 	deadlineStats := time.Now().Add(2 * time.Second)
 	for {
 		snap := handler.stats.snapshot()
-		if snap.Totals.TotalTokens >= 1200 {
+		if snap.Totals.TotalTokens >= 1235 {
+			if snap.Totals.Requests != 2 || snap.Totals.Errors != 0 {
+				t.Fatalf("auto-compaction stats = requests:%d errors:%d, want 2/0", snap.Totals.Requests, snap.Totals.Errors)
+			}
+			if snap.Totals.PromptTokens != 1030 || snap.Totals.CompletionTokens != 205 || snap.Totals.TotalTokens != 1235 {
+				t.Fatalf("auto-compaction usage = prompt:%d completion:%d total:%d, want 1030/205/1235", snap.Totals.PromptTokens, snap.Totals.CompletionTokens, snap.Totals.TotalTokens)
+			}
+			if snap.Totals.CachedTokens != 10 || snap.Totals.ReasoningTokens != 3 {
+				t.Fatalf("auto-compaction detail usage = cached:%d reasoning:%d, want 10/3", snap.Totals.CachedTokens, snap.Totals.ReasoningTokens)
+			}
+			if len(snap.ByModel) != 1 || snap.ByModel[0].Model != "gpt-5.4" || snap.ByModel[0].Requests != 2 || snap.ByModel[0].Tokens != 1235 {
+				t.Fatalf("auto-compaction model attribution = %+v, want gpt-5.4 requests=2 tokens=1235", snap.ByModel)
+			}
+			if len(snap.ByProvider) != 1 || snap.ByProvider[0].Provider != "copilot" || snap.ByProvider[0].Requests != 2 || snap.ByProvider[0].Tokens != 1235 {
+				t.Fatalf("auto-compaction provider attribution = %+v, want copilot requests=2 tokens=1235", snap.ByProvider)
+			}
+			if len(snap.ByAgent) != 1 || snap.ByAgent[0].Agent != "Codex CLI" || snap.ByAgent[0].Requests != 2 || snap.ByAgent[0].Tokens != 1235 {
+				t.Fatalf("auto-compaction agent attribution = %+v, want Codex CLI requests=2 tokens=1235", snap.ByAgent)
+			}
 			break
 		}
 		if time.Now().After(deadlineStats) {
-			t.Fatalf("expected compaction usage (>=1200 tokens) recorded in stats, got %d", snap.Totals.TotalTokens)
+			t.Fatalf("auto-compaction stats never reached expected usage: %+v", snap.Totals)
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -1524,7 +1566,7 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-1\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"}]}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-2\",\"content\":[{\"type\":\"output_text\",\"text\":\"second\"}]}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-3\",\"content\":[{\"type\":\"output_text\",\"text\":\"third\"}]}}\n\n")
-			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":2},\"output_tokens\":1,\"output_tokens_details\":null,\"total_tokens\":6}}}\n\n")
 		case 2:
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusRequestEntityTooLarge)
@@ -1532,7 +1574,7 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 		case 3:
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n")
-			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":8,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":2,\"output_tokens_details\":{\"reasoning_tokens\":1},\"total_tokens\":10}}}\n\n")
 		default:
 			t.Fatalf("unexpected normal upstream request count %d", requestNumber)
 		}
@@ -1626,16 +1668,233 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 		t.Fatalf("expected retried request to keep latest user turn, got %q", got)
 	}
 
-	// The 413 oversized-replay fallback spends upstream /responses tokens on its
-	// internal compaction call; assert that spend is recorded into stats as its own
-	// turn (round-6: 413-fallback sessions must not underreport). The compaction
-	// upstream reports 700+90 tokens.
+	// The initial and retried client turns report 5+1 and 8+2 tokens. The
+	// internal 413 compaction reports 700+90 and must be added to the second
+	// client turn without becoming a third dashboard request.
 	deadlineStats := time.Now().Add(2 * time.Second)
-	for handler.stats.snapshot().Totals.TotalTokens < 790 {
-		if time.Now().After(deadlineStats) {
-			t.Fatalf("expected 413 compaction usage (>=790 tokens) in stats, got %d", handler.stats.snapshot().Totals.TotalTokens)
+	for {
+		snap := handler.stats.snapshot()
+		if snap.Totals.TotalTokens >= 806 {
+			if snap.Totals.Requests != 2 || snap.Totals.Errors != 0 {
+				t.Fatalf("413 fallback stats = requests:%d errors:%d, want 2/0", snap.Totals.Requests, snap.Totals.Errors)
+			}
+			if snap.Totals.PromptTokens != 713 || snap.Totals.CompletionTokens != 93 || snap.Totals.TotalTokens != 806 {
+				t.Fatalf("413 fallback usage = prompt:%d completion:%d total:%d, want 713/93/806", snap.Totals.PromptTokens, snap.Totals.CompletionTokens, snap.Totals.TotalTokens)
+			}
+			if snap.Totals.CachedTokens != 5 || snap.Totals.ReasoningTokens != 1 {
+				t.Fatalf("413 fallback detail usage = cached:%d reasoning:%d, want 5/1", snap.Totals.CachedTokens, snap.Totals.ReasoningTokens)
+			}
+			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		if time.Now().After(deadlineStats) {
+			t.Fatalf("413 fallback stats never reached expected usage: %+v", snap.Totals)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestHandleResponsesWebSocket_CompactionErrorAfterUsageCountsFailedCreateOnce(t *testing.T) {
+	var normalRequests atomic.Int32
+	var compactionRequests atomic.Int32
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+
+		if instructions, _ := body["instructions"].(string); strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
+			compactionRequests.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"comp-invalid","object":"response","status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}`)
+			return
+		}
+
+		switch requestNumber := normalRequests.Add(1); requestNumber {
+		case 1:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-before-compact-error\"}}\n\n")
+			for i := 1; i <= 3; i++ {
+				_, _ = fmt.Fprintf(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-%d\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer-%d\"}]}}\n\n", i, i)
+			}
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-before-compact-error\",\"usage\":{\"input_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":2},\"output_tokens\":1,\"output_tokens_details\":null,\"total_tokens\":6}}}\n\n")
+		case 2:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = fmt.Fprint(w, `{"error":{"message":"request too large","code":"payload_too_large"}}`)
+		default:
+			t.Fatalf("unexpected normal upstream request count %d", requestNumber)
+		}
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		DisableAutoCompact:  true,
+		AutoCompactKeepTail: 2,
+	}
+	handler.stats = newStatsCollector()
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	first := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type":    "message",
+			"role":    "user",
+			"content": []map[string]string{{"type": "input_text", "text": "seed history"}},
+		},
+	})
+	if err := conn.WriteJSON(first); err != nil {
+		t.Fatalf("failed to write first request: %v", err)
+	}
+	firstCreated := mustReadWebSocketJSON(t, conn)
+	for range 4 {
+		_ = mustReadWebSocketJSON(t, conn)
+	}
+
+	second := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type":    "message",
+			"role":    "user",
+			"content": []map[string]string{{"type": "input_text", "text": "trigger oversized replay"}},
+		},
+	})
+	second["previous_response_id"] = websocketResponseID(t, firstCreated)
+	if err := conn.WriteJSON(second); err != nil {
+		t.Fatalf("failed to write second request: %v", err)
+	}
+
+	errFrame := mustReadWebSocketJSON(t, conn)
+	if errFrame["type"] != "error" {
+		t.Fatalf("second frame type = %v, want error", errFrame["type"])
+	}
+	if got, _ := errFrame["status_code"].(float64); got != float64(http.StatusRequestEntityTooLarge) {
+		t.Fatalf("error status = %v, want 413", errFrame["status_code"])
+	}
+	if got := normalRequests.Load(); got != 2 {
+		t.Fatalf("normal upstream requests = %d, want 2", got)
+	}
+	if got := compactionRequests.Load(); got != 1 {
+		t.Fatalf("compaction upstream requests = %d, want 1", got)
+	}
+
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 2 || snap.Totals.Errors != 1 {
+		t.Fatalf("compaction-error stats = requests:%d errors:%d, want 2/1", snap.Totals.Requests, snap.Totals.Errors)
+	}
+	if snap.Totals.PromptTokens != 105 || snap.Totals.CompletionTokens != 21 || snap.Totals.TotalTokens != 126 {
+		t.Fatalf("compaction-error usage = prompt:%d completion:%d total:%d, want 105/21/126", snap.Totals.PromptTokens, snap.Totals.CompletionTokens, snap.Totals.TotalTokens)
+	}
+	if snap.Totals.CachedTokens != 2 || snap.Totals.ReasoningTokens != 0 {
+		t.Fatalf("compaction-error detail usage = cached:%d reasoning:%d, want 2/0", snap.Totals.CachedTokens, snap.Totals.ReasoningTokens)
+	}
+}
+
+func TestHandleResponsesWebSocket_CompactedRetryFailureCombinesTerminalAndInternalUsage(t *testing.T) {
+	var normalRequests atomic.Int32
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+
+		if instructions, _ := body["instructions"].(string); strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"comp-before-failure","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint before failed retry"}]}],"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}`)
+			return
+		}
+
+		switch requestNumber := normalRequests.Add(1); requestNumber {
+		case 1:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-before-failed-retry\"}}\n\n")
+			for i := 1; i <= 3; i++ {
+				_, _ = fmt.Fprintf(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-%d\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer-%d\"}]}}\n\n", i, i)
+			}
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-before-failed-retry\",\"usage\":{\"input_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":2},\"output_tokens\":1,\"output_tokens_details\":null,\"total_tokens\":6}}}\n\n")
+		case 2:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = fmt.Fprint(w, `{"error":{"message":"request too large","code":"payload_too_large"}}`)
+		case 3:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-failed-after-compact\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-failed-after-compact\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"},\"usage\":{\"input_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":2,\"output_tokens_details\":{\"reasoning_tokens\":1},\"total_tokens\":11}}}\n\n")
+		default:
+			t.Fatalf("unexpected normal upstream request count %d", requestNumber)
+		}
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		DisableAutoCompact:  true,
+		AutoCompactKeepTail: 2,
+	}
+	handler.stats = newStatsCollector()
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	first := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type":    "message",
+			"role":    "user",
+			"content": []map[string]string{{"type": "input_text", "text": "seed history"}},
+		},
+	})
+	if err := conn.WriteJSON(first); err != nil {
+		t.Fatalf("failed to write first request: %v", err)
+	}
+	firstCreated := mustReadWebSocketJSON(t, conn)
+	for range 4 {
+		_ = mustReadWebSocketJSON(t, conn)
+	}
+
+	second := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type":    "message",
+			"role":    "user",
+			"content": []map[string]string{{"type": "input_text", "text": "trigger failed compact retry"}},
+		},
+	})
+	second["previous_response_id"] = websocketResponseID(t, firstCreated)
+	if err := conn.WriteJSON(second); err != nil {
+		t.Fatalf("failed to write second request: %v", err)
+	}
+
+	var errFrame map[string]interface{}
+	for _, wantType := range []string{"response.created", "response.failed", "error"} {
+		frame := mustReadWebSocketJSON(t, conn)
+		if frame["type"] != wantType {
+			t.Fatalf("frame type = %v, want %s", frame["type"], wantType)
+		}
+		if wantType == "error" {
+			errFrame = frame
+		}
+	}
+	if got, _ := errFrame["status_code"].(float64); got != float64(http.StatusTooManyRequests) {
+		t.Fatalf("failed compact retry status = %v, want 429", errFrame["status_code"])
+	}
+
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 2 || snap.Totals.Errors != 1 {
+		t.Fatalf("failed compact retry stats = requests:%d errors:%d, want 2/1", snap.Totals.Requests, snap.Totals.Errors)
+	}
+	if snap.Totals.PromptTokens != 114 || snap.Totals.CompletionTokens != 23 || snap.Totals.TotalTokens != 137 {
+		t.Fatalf("failed compact retry usage = prompt:%d completion:%d total:%d, want 114/23/137", snap.Totals.PromptTokens, snap.Totals.CompletionTokens, snap.Totals.TotalTokens)
+	}
+	if snap.Totals.CachedTokens != 5 || snap.Totals.ReasoningTokens != 1 {
+		t.Fatalf("failed compact retry detail usage = cached:%d reasoning:%d, want 5/1", snap.Totals.CachedTokens, snap.Totals.ReasoningTokens)
+	}
+	if len(snap.StatusCodes) != 1 || snap.StatusCodes[0].Label != "429" || snap.StatusCodes[0].Count != 1 {
+		t.Fatalf("failed compact retry status accounting = %+v, want one 429", snap.StatusCodes)
 	}
 }
 
@@ -1676,7 +1935,7 @@ func TestResponsesWebSocketMaybeRetryCompactedCreateRequestCapsOriginal413Body(t
 		},
 	}
 
-	got, err := session.maybeRetryCompactedCreateRequest(handler, context.Background(), request, resp, true)
+	got, err := session.maybeRetryCompactedCreateRequest(handler, context.Background(), request, resp, true, nil)
 	if err != nil {
 		t.Fatalf("maybeRetryCompactedCreateRequest returned error: %v", err)
 	}
@@ -5383,5 +5642,881 @@ func TestHandleResponsesWebSocket_ChunkingIndependentNormalWireFormatStress(t *t
 				_ = serverConn.Close()
 			}
 		})
+	}
+}
+
+func TestHandleResponsesWebSocket_ClientDisconnectBeforeTerminalRecordsOnce(t *testing.T) {
+	second := "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n"
+	body := newGatedResponsesFailureBody(second, nil)
+	handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       body,
+			Request:    req,
+		}, nil
+	})
+	handler.stats = newStatsCollector()
+	serverConn, clientConn := newResponsesWebSocketConnPair(t)
+	defer func() { _ = clientConn.Close() }()
+	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+	done := make(chan error, 1)
+	go func() { done <- session.handleCreateRequest(handler, request) }()
+
+	created := mustReadWebSocketJSON(t, clientConn)
+	if created["type"] != "response.created" {
+		t.Fatalf("first frame type = %v, want response.created", created["type"])
+	}
+	_ = serverConn.Close()
+	body.releaseSecond()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errResponsesWebSocketClientWrite) {
+			t.Fatalf("handleCreateRequest error = %v, want client write error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for client write failure")
+	}
+
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 1 {
+		t.Fatalf("client disconnect stats = requests:%d errors:%d, want 1/1", snap.Totals.Requests, snap.Totals.Errors)
+	}
+	if len(snap.StatusCodes) != 1 || snap.StatusCodes[0].Label != "499" || snap.StatusCodes[0].Count != 1 {
+		t.Fatalf("client disconnect status codes = %#v, want one 499", snap.StatusCodes)
+	}
+}
+
+func TestHandleResponsesWebSocket_BufferedTerminalAccountsOnEarlyMetadataWriteFailure(t *testing.T) {
+	body := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-buffered-write\"}}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered-write\",\"usage\":{\"input_tokens\":8,\"output_tokens\":3,\"total_tokens\":11}}}\n\n"
+	handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+				"Openai-Model": []string{"gpt-5.4-actual"},
+			},
+			Body:    io.NopCloser(strings.NewReader(body)),
+			Request: req,
+		}, nil
+	})
+	handler.stats = newStatsCollector()
+	serverConn, clientConn := newResponsesWebSocketConnPair(t)
+	_ = serverConn.Close()
+	defer func() { _ = clientConn.Close() }()
+	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+
+	err := session.handleCreateRequest(handler, request)
+	if !errors.Is(err, errResponsesWebSocketClientWrite) {
+		t.Fatalf("handleCreateRequest error = %v, want client write error", err)
+	}
+
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 {
+		t.Fatalf("buffered terminal stats = requests:%d errors:%d, want 1/0", snap.Totals.Requests, snap.Totals.Errors)
+	}
+	if snap.Totals.PromptTokens != 8 || snap.Totals.CompletionTokens != 3 || snap.Totals.TotalTokens != 11 {
+		t.Fatalf("buffered terminal usage = prompt:%d completion:%d total:%d, want 8/3/11", snap.Totals.PromptTokens, snap.Totals.CompletionTokens, snap.Totals.TotalTokens)
+	}
+}
+
+type callbackEOFResponsesBody struct {
+	reader *strings.Reader
+	onEOF  func()
+	once   sync.Once
+}
+
+func (b *callbackEOFResponsesBody) Read(p []byte) (int, error) {
+	if b.reader.Len() > 0 {
+		return b.reader.Read(p)
+	}
+	b.once.Do(func() {
+		if b.onEOF != nil {
+			b.onEOF()
+		}
+	})
+	return 0, io.EOF
+}
+
+func (*callbackEOFResponsesBody) Close() error { return nil }
+
+func TestHandleResponsesWebSocket_BufferedTerminalAccountsDuringShutdownWriteFailure(t *testing.T) {
+	stream := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-shutdown-buffered\"}}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-shutdown-buffered\",\"usage\":{\"input_tokens\":6,\"output_tokens\":2,\"total_tokens\":8}}}\n\n"
+	var handler *ProxyHandler
+	handler = newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		body := &callbackEOFResponsesBody{reader: strings.NewReader(stream), onEOF: handler.BeginShutdown}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+				"Openai-Model": []string{"gpt-5.4-actual"},
+			},
+			Body:    body,
+			Request: req,
+		}, nil
+	})
+	handler.stats = newStatsCollector()
+	serverConn, clientConn := newResponsesWebSocketConnPair(t)
+	_ = serverConn.Close()
+	defer func() { _ = clientConn.Close() }()
+	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+
+	err := session.handleCreateRequest(handler, request)
+	if !errors.Is(err, errResponsesWebSocketClientWrite) {
+		t.Fatalf("handleCreateRequest error = %v, want client write error", err)
+	}
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 || snap.Totals.TotalTokens != 8 {
+		t.Fatalf("buffered shutdown terminal stats = requests:%d errors:%d total:%d, want 1/0/8", snap.Totals.Requests, snap.Totals.Errors, snap.Totals.TotalTokens)
+	}
+}
+
+func TestResponsesWebSocketCloseCauseOrdering(t *testing.T) {
+	t.Run("client before shutdown", func(t *testing.T) {
+		session := &responsesWebSocketSession{}
+		handler := &ProxyHandler{}
+		session.beginClosing()
+		handler.BeginShutdown()
+		if !session.clientClosePrecedesShutdown(handler) {
+			t.Fatal("client close preceding shutdown was not preserved")
+		}
+	})
+
+	t.Run("shutdown before client", func(t *testing.T) {
+		session := &responsesWebSocketSession{}
+		handler := &ProxyHandler{}
+		handler.BeginShutdown()
+		session.beginClosing()
+		if session.clientClosePrecedesShutdown(handler) {
+			t.Fatal("client close after shutdown incorrectly won cause ordering")
+		}
+	})
+
+	t.Run("policy close stamps client cause", func(t *testing.T) {
+		session := &responsesWebSocketSession{}
+		barrier, owner := session.startControlClose()
+		if barrier == nil || !owner {
+			t.Fatal("policy close did not acquire close barrier")
+		}
+		handler := &ProxyHandler{}
+		handler.BeginShutdown()
+		if !session.clientClosePrecedesShutdown(handler) {
+			t.Fatal("policy close did not preserve client cause")
+		}
+	})
+
+	t.Run("concurrent shutdown publishes one earliest sequence", func(t *testing.T) {
+		handler := &ProxyHandler{}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for range 32 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				handler.BeginShutdown()
+			}()
+		}
+		close(start)
+		wg.Wait()
+		if got := handler.shutdownSequence.Load(); got == 0 {
+			t.Fatal("shutdown sequence was not published")
+		}
+	})
+}
+
+func TestHandleResponsesWebSocket_RecordsCompletionBeforeAutoCompactionFinishes(t *testing.T) {
+	compactionStarted := make(chan struct{})
+	releaseCompaction := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseCompaction) }) })
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+		if instructions, _ := body["instructions"].(string); strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
+			close(compactionStarted)
+			select {
+			case <-releaseCompaction:
+			case <-r.Context().Done():
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"comp-delayed","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint"}]}],"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}`)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-immediate-stats\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-a\",\"content\":[{\"type\":\"output_text\",\"text\":\"a\"}]}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-b\",\"content\":[{\"type\":\"output_text\",\"text\":\"b\"}]}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-immediate-stats\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1,\"total_tokens\":6}}}\n\n")
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		AutoCompactMaxItems: 2,
+		AutoCompactMaxBytes: 1 << 20,
+		AutoCompactKeepTail: 1,
+	}
+	handler.stats = newStatsCollector()
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+	create := newResponsesWebSocketCreateRequest([]interface{}{map[string]interface{}{
+		"type":    "message",
+		"role":    "user",
+		"content": []map[string]string{{"type": "input_text", "text": "trigger compaction"}},
+	}})
+	if err := conn.WriteJSON(create); err != nil {
+		t.Fatalf("failed to write create request: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		_ = mustReadWebSocketJSON(t, conn)
+	}
+
+	select {
+	case <-compactionStarted:
+	case <-time.After(time.Second):
+		t.Fatal("auto-compaction did not start")
+	}
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 || snap.Totals.TotalTokens != 6 {
+		t.Fatalf("terminal stats while compaction blocked = requests:%d errors:%d total:%d, want 1/0/6", snap.Totals.Requests, snap.Totals.Errors, snap.Totals.TotalTokens)
+	}
+
+	releaseOnce.Do(func() { close(releaseCompaction) })
+	deadline := time.Now().Add(time.Second)
+	for {
+		snap = handler.stats.snapshot()
+		if snap.Totals.TotalTokens == 126 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("post-compaction usage was not amended: %+v", snap.Totals)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 {
+		t.Fatalf("post-compaction count = requests:%d errors:%d, want 1/0", snap.Totals.Requests, snap.Totals.Errors)
+	}
+}
+
+type lateTerminalResponsesBody struct {
+	first      *strings.Reader
+	terminal   *strings.Reader
+	release    <-chan struct{}
+	secondRead chan struct{}
+	secondOnce sync.Once
+	closed     chan struct{}
+	closeOnce  sync.Once
+}
+
+func (b *lateTerminalResponsesBody) Read(p []byte) (int, error) {
+	if b.first.Len() > 0 {
+		return b.first.Read(p)
+	}
+	b.secondOnce.Do(func() { close(b.secondRead) })
+	select {
+	case <-b.release:
+		return b.terminal.Read(p)
+	case <-b.closed:
+		return 0, context.Canceled
+	}
+}
+
+func (b *lateTerminalResponsesBody) Close() error {
+	b.closeOnce.Do(func() { close(b.closed) })
+	return nil
+}
+
+func TestHandleResponsesWebSocket_EarlyWriteFailureDrainsLateTerminalBeforeCancel(t *testing.T) {
+
+	releaseTerminal := make(chan struct{})
+	upstreamContext := make(chan context.Context, 1)
+	largeOutput := strings.Repeat("x", openAIStreamScannerMaxBuffer-(64<<10))
+	body := &lateTerminalResponsesBody{
+		first:      strings.NewReader("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-late-terminal\"}}\n\n"),
+		terminal:   strings.NewReader("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-late-terminal\",\"output\":\"" + largeOutput + "\",\"usage\":{\"input_tokens\":9,\"output_tokens\":2,\"total_tokens\":11}}}\n\n"),
+		release:    releaseTerminal,
+		secondRead: make(chan struct{}),
+		closed:     make(chan struct{}),
+	}
+	handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		upstreamContext <- req.Context()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+				"Openai-Model": []string{"gpt-5.4-actual"},
+			},
+			Body:    body,
+			Request: req,
+		}, nil
+	})
+	handler.stats = newStatsCollector()
+	serverConn, clientConn := newResponsesWebSocketConnPair(t)
+	_ = serverConn.Close()
+	defer func() { _ = clientConn.Close() }()
+	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	session.terminalObservationWait = 3 * time.Second
+	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+
+	done := make(chan error, 1)
+	go func() { done <- session.handleCreateRequest(handler, request) }()
+	ctx := <-upstreamContext
+	select {
+	case <-body.secondRead:
+	case <-time.After(time.Second):
+		t.Fatal("terminal body read did not block")
+	}
+	select {
+	case <-ctx.Done():
+		t.Fatalf("client write failure canceled upstream before terminal observation: %v", context.Cause(ctx))
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseTerminal)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errResponsesWebSocketClientWrite) {
+			t.Fatalf("handleCreateRequest error = %v, want client write error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleCreateRequest did not finish after terminal release")
+	}
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 || snap.Totals.TotalTokens != 11 {
+		t.Fatalf("late terminal stats = requests:%d errors:%d total:%d, want 1/0/11", snap.Totals.Requests, snap.Totals.Errors, snap.Totals.TotalTokens)
+	}
+}
+
+func TestHandleResponsesWebSocket_MalformedCompletedRetainsUsageButCountsFailure(t *testing.T) {
+	stream := `event: response.created
+data: {"type":"response.created","response":{"id":"resp-created-only"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"   ","usage":{"input_tokens":6,"output_tokens":2,"total_tokens":8}}}
+
+`
+	handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+				"Openai-Model": []string{"gpt-5.4-actual"},
+			},
+			Body:    io.NopCloser(strings.NewReader(stream)),
+			Request: req,
+		}, nil
+	})
+	handler.stats = newStatsCollector()
+	serverConn, clientConn := newResponsesWebSocketConnPair(t)
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+
+	done := make(chan error, 1)
+	go func() { done <- session.handleCreateRequest(handler, request) }()
+	_ = mustReadWebSocketJSON(t, clientConn) // metadata
+	created := mustReadWebSocketJSON(t, clientConn)
+	if created["type"] != "response.created" {
+		t.Fatalf("created frame type = %v, want response.created", created["type"])
+	}
+	completed := mustReadWebSocketJSON(t, clientConn)
+	if completed["type"] != "response.completed" {
+		t.Fatalf("terminal frame type = %v, want response.completed", completed["type"])
+	}
+	wrapped := mustReadWebSocketJSON(t, clientConn)
+	if got := int(wrapped["status_code"].(float64)); got != http.StatusBadGateway {
+		t.Fatalf("wrapped status = %d, want 502", got)
+	}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "missing response id") {
+			t.Fatalf("handleCreateRequest error = %v, want missing response id", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handleCreateRequest did not finish")
+	}
+
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 1 || snap.Totals.TotalTokens != 8 {
+		t.Fatalf("malformed completion stats = requests:%d errors:%d total:%d, want 1/1/8", snap.Totals.Requests, snap.Totals.Errors, snap.Totals.TotalTokens)
+	}
+	if snap.Status["5xx"] != 1 {
+		t.Fatalf("malformed completion status = %+v, want one 5xx", snap.Status)
+	}
+}
+
+func TestHandleResponsesWebSocket_StatsKeepDispatchedProviderAcrossCatalogChange(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseTerminal := make(chan struct{})
+	providerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-provider-a\"}}\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(requestStarted)
+		select {
+		case <-releaseTerminal:
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-provider-a\",\"usage\":{\"input_tokens\":4,\"output_tokens\":1,\"total_tokens\":5}}}\n\n")
+	}))
+	defer providerA.Close()
+	providerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("provider B unexpectedly received request %s", r.URL.Path)
+	}))
+	defer providerB.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:       "provider-a",
+				Type:     "openai-compatible",
+				Default:  true,
+				BaseURL:  providerA.URL,
+				AuthType: "none",
+				Models: []ProviderModelConfig{{
+					PublicID:  "gpt-route-stable",
+					Endpoints: []string{"/responses"},
+				}},
+			},
+			{
+				ID:       "provider-b",
+				Type:     "openai-compatible",
+				BaseURL:  providerB.URL,
+				AuthType: "none",
+				Models: []ProviderModelConfig{{
+					PublicID:  "provider-b-only",
+					Endpoints: []string{"/responses"},
+				}},
+			},
+		}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+	handler.responsesWS.Enabled = true
+	handler.responsesWS.DisableAutoCompact = true
+	handler.stats = newStatsCollector()
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+	create := newResponsesWebSocketCreateRequest(nil)
+	create["model"] = "gpt-route-stable"
+	if err := conn.WriteJSON(create); err != nil {
+		t.Fatalf("failed to write create request: %v", err)
+	}
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("provider A request did not start")
+	}
+
+	setup := handler.providerSetup()
+	setup.modelsMu.Lock()
+	owner := setup.models["gpt-route-stable"]
+	owner.providerID = "provider-b"
+	setup.models["gpt-route-stable"] = owner
+	setup.modelsMu.Unlock()
+	close(releaseTerminal)
+
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
+	deadline := time.Now().Add(time.Second)
+	for {
+		snap := handler.stats.snapshot()
+		if snap.Totals.Requests == 1 {
+			if len(snap.ByProvider) != 1 || snap.ByProvider[0].Provider != "provider-a" || snap.ByProvider[0].Tokens != 5 {
+				t.Fatalf("provider attribution = %+v, want provider-a with 5 tokens", snap.ByProvider)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("turn was not recorded: %+v", snap.Totals)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+type createdThenCanceledResponsesBody struct {
+	first      *strings.Reader
+	ctx        context.Context
+	canceled   chan struct{}
+	cancelOnce sync.Once
+}
+
+func (b *createdThenCanceledResponsesBody) Read(p []byte) (int, error) {
+	if b.first.Len() > 0 {
+		return b.first.Read(p)
+	}
+	<-b.ctx.Done()
+	b.cancelOnce.Do(func() { close(b.canceled) })
+	return 0, b.ctx.Err()
+}
+
+func (*createdThenCanceledResponsesBody) Close() error { return nil }
+
+func TestHandleResponsesWebSocket_ClientCloseAfterCreatedCancelsStalledBody(t *testing.T) {
+	canceled := make(chan struct{})
+	handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: &createdThenCanceledResponsesBody{
+				first:    strings.NewReader("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-stalled-after-created\"}}\n\n"),
+				ctx:      req.Context(),
+				canceled: canceled,
+			},
+			Request: req,
+		}, nil
+	})
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	if err := conn.WriteJSON(newResponsesWebSocketCreateRequest(nil)); err != nil {
+		t.Fatalf("failed to write create request: %v", err)
+	}
+	created := mustReadWebSocketJSON(t, conn)
+	if created["type"] != "response.created" {
+		t.Fatalf("first frame type = %v, want response.created", created["type"])
+	}
+	if err := conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "done"), time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("failed to send client close: %v", err)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("client close after response.created did not cancel stalled upstream body")
+	}
+	_ = conn.Close()
+}
+
+func TestHandleResponsesWebSocket_TransportFailureKeepsDispatchedProvider(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseFailure := make(chan struct{})
+	var startedOnce sync.Once
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:       "provider-a",
+				Type:     "openai-compatible",
+				Default:  true,
+				BaseURL:  "http://provider-a.test",
+				AuthType: "none",
+				Models: []ProviderModelConfig{{
+					PublicID:  "gpt-route-error",
+					Endpoints: []string{"/responses"},
+				}},
+			},
+			{
+				ID:       "provider-b",
+				Type:     "openai-compatible",
+				BaseURL:  "http://provider-b.test",
+				AuthType: "none",
+				Models: []ProviderModelConfig{{
+					PublicID:  "provider-b-only",
+					Endpoints: []string{"/responses"},
+				}},
+			},
+		}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+	handler.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host != "provider-a.test" {
+			t.Fatalf("request routed to %q, want provider-a.test", req.URL.Host)
+		}
+		startedOnce.Do(func() { close(requestStarted) })
+		<-releaseFailure
+		return nil, errors.New("injected transport failure")
+	})}
+	handler.retryBaseDelay = time.Millisecond
+	handler.responsesWS.Enabled = true
+	handler.responsesWS.DisableAutoCompact = true
+	handler.stats = newStatsCollector()
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+	create := newResponsesWebSocketCreateRequest(nil)
+	create["model"] = "gpt-route-error"
+	if err := conn.WriteJSON(create); err != nil {
+		t.Fatalf("failed to write create request: %v", err)
+	}
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("provider A transport request did not start")
+	}
+
+	setup := handler.providerSetup()
+	setup.modelsMu.Lock()
+	owner := setup.models["gpt-route-error"]
+	owner.providerID = "provider-b"
+	setup.models["gpt-route-error"] = owner
+	setup.modelsMu.Unlock()
+	close(releaseFailure)
+
+	wrapped := mustReadWebSocketJSON(t, conn)
+	if got := int(wrapped["status_code"].(float64)); got != http.StatusBadGateway {
+		t.Fatalf("wrapped status = %d, want 502", got)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		snap := handler.stats.snapshot()
+		if snap.Totals.Requests == 1 {
+			if snap.Totals.Errors != 1 {
+				t.Fatalf("transport failure errors = %d, want 1", snap.Totals.Errors)
+			}
+			if len(snap.ByProvider) != 1 || snap.ByProvider[0].Provider != "provider-a" {
+				t.Fatalf("transport failure provider attribution = %+v, want provider-a", snap.ByProvider)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("transport failure was not recorded: %+v", snap.Totals)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+type terminalAfterContextDoneBody struct {
+	ctx      context.Context
+	terminal *strings.Reader
+	delay    time.Duration
+	once     sync.Once
+}
+
+func (b *terminalAfterContextDoneBody) Read(p []byte) (int, error) {
+	b.once.Do(func() {
+		<-b.ctx.Done()
+		time.Sleep(b.delay)
+	})
+	return b.terminal.Read(p)
+}
+
+func (*terminalAfterContextDoneBody) Close() error { return nil }
+
+func TestHandleResponsesWebSocket_PreservesUpstreamTimeoutTerminalAndReplayState(t *testing.T) {
+	stream := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-timeout-race\",\"output\":[{\"type\":\"message\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n"
+	handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: &terminalAfterContextDoneBody{
+				ctx:      req.Context(),
+				terminal: strings.NewReader(stream),
+				delay:    15 * time.Millisecond,
+			},
+			Request: req,
+		}, nil
+	})
+	WithStreamingUpstreamTimeout(time.Millisecond)(handler)
+	handler.stats = newStatsCollector()
+	serverConn, clientConn := newResponsesWebSocketConnPair(t)
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+
+	done := make(chan error, 1)
+	go func() { done <- session.handleCreateRequest(handler, request) }()
+	terminal := mustReadWebSocketJSON(t, clientConn)
+	if terminal["type"] != "response.completed" {
+		t.Fatalf("salvaged frame type = %v, want response.completed", terminal["type"])
+	}
+	response, _ := terminal["response"].(map[string]interface{})
+	if response["id"] != "resp-timeout-race" {
+		t.Fatalf("salvaged response = %+v, want id resp-timeout-race", response)
+	}
+	if output, _ := response["output"].([]interface{}); len(output) != 1 {
+		t.Fatalf("salvaged response output = %+v, want original output item", response["output"])
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("handleCreateRequest error = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handleCreateRequest did not finish after salvaged terminal")
+	}
+	if session.lastResponseID != "resp-timeout-race" {
+		t.Fatalf("session last response id = %q, want resp-timeout-race", session.lastResponseID)
+	}
+	if len(session.historyItems) != 1 {
+		t.Fatalf("session history items = %d, want terminal response output preserved", len(session.historyItems))
+	}
+	var remembered map[string]interface{}
+	if err := json.Unmarshal(session.historyItems[0], &remembered); err != nil || remembered["type"] != "message" {
+		t.Fatalf("remembered terminal output = %s err=%v, want message item", session.historyItems[0], err)
+	}
+	followUp := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+	followUp.PreviousResponseID = "resp-timeout-race"
+	if _, err := session.planRequest(handler, followUp); err != nil {
+		t.Fatalf("salvaged completion did not preserve replay state: %v", err)
+	}
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 || snap.Totals.TotalTokens != 3 {
+		t.Fatalf("salvaged terminal stats = requests:%d errors:%d total:%d, want 1/0/3", snap.Totals.Requests, snap.Totals.Errors, snap.Totals.TotalTokens)
+	}
+}
+
+func TestNewProviderJSONRequestPublishesRouteBeforeAuthFailure(t *testing.T) {
+	handler := &ProxyHandler{}
+	ctx, observer := withProviderRouteObserver(context.Background())
+	provider := &providerRuntime{
+		id:         "auth-failing-provider",
+		kind:       providerTypeOpenAICompatible,
+		baseURL:    "http://provider.test",
+		authType:   providerAuthTypeBearer,
+		authHeader: "Authorization",
+	}
+	if _, err := handler.newProviderJSONRequest(ctx, provider, http.MethodPost, providerEndpointResponses, []byte(`{"model":"gpt-test"}`), nil, ""); err == nil {
+		t.Fatal("newProviderJSONRequest unexpectedly succeeded without an API key")
+	}
+	route, ok := observer.snapshot()
+	if !ok || route.id != "auth-failing-provider" || route.kind != string(providerTypeOpenAICompatible) {
+		t.Fatalf("published route = %+v ok=%v, want auth-failing-provider/openai-compatible", route, ok)
+	}
+}
+
+func TestHandleResponsesWebSocket_CRLFEventNameCompletesConsistently(t *testing.T) {
+	stream := "event: response.completed\r\ndata: {\"response\":{\"id\":\"resp-crlf-event\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\r\n\r\n"
+	handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(stream)),
+			Request:    req,
+		}, nil
+	})
+	handler.stats = newStatsCollector()
+	serverConn, clientConn := newResponsesWebSocketConnPair(t)
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+
+	done := make(chan error, 1)
+	go func() { done <- session.handleCreateRequest(handler, request) }()
+	completed := mustReadWebSocketJSON(t, clientConn)
+	if completed["type"] != "response.completed" {
+		t.Fatalf("completed frame = %+v, want injected response.completed type", completed)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("handleCreateRequest error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handleCreateRequest did not finish")
+	}
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 || snap.Totals.TotalTokens != 4 {
+		t.Fatalf("CRLF terminal stats = requests:%d errors:%d total:%d, want 1/0/4", snap.Totals.Requests, snap.Totals.Errors, snap.Totals.TotalTokens)
+	}
+}
+
+func TestHandleResponsesWebSocket_OversizedTerminalFailureRetainsUsage(t *testing.T) {
+	payload := fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp-overflow-usage","output":"%s","usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}`, strings.Repeat("x", openAIStreamScannerMaxBuffer+4096))
+	stream := "event: response.completed\ndata: " + payload + "\n\n"
+	handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+				"Openai-Model": []string{"gpt-5.4-actual"},
+			},
+			Body:    io.NopCloser(strings.NewReader(stream)),
+			Request: req,
+		}, nil
+	})
+	handler.stats = newStatsCollector()
+	serverConn, clientConn := newResponsesWebSocketConnPair(t)
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+
+	done := make(chan error, 1)
+	go func() { done <- session.handleCreateRequest(handler, request) }()
+	_ = mustReadWebSocketJSON(t, clientConn) // metadata
+	wrapped := mustReadWebSocketJSON(t, clientConn)
+	if got := int(wrapped["status_code"].(float64)); got != http.StatusBadGateway {
+		t.Fatalf("wrapped status = %d, want 502", got)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("oversized terminal unexpectedly succeeded")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("oversized terminal handler did not finish")
+	}
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 1 {
+		t.Fatalf("oversized terminal count = requests:%d errors:%d, want 1/1", snap.Totals.Requests, snap.Totals.Errors)
+	}
+	if snap.Totals.PromptTokens != 10 || snap.Totals.CompletionTokens != 3 || snap.Totals.TotalTokens != 13 {
+		t.Fatalf("oversized terminal usage = prompt:%d completion:%d total:%d, want 10/3/13", snap.Totals.PromptTokens, snap.Totals.CompletionTokens, snap.Totals.TotalTokens)
+	}
+}
+
+func TestHandleResponsesWebSocket_DoneMarkerPreventsTrailingTerminalAccounting(t *testing.T) {
+	stream := "data: [DONE]\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-after-done\",\"usage\":{\"input_tokens\":9,\"output_tokens\":1,\"total_tokens\":10}}}\n\n"
+	handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(stream)),
+			Request:    req,
+		}, nil
+	})
+	handler.stats = newStatsCollector()
+	serverConn, clientConn := newResponsesWebSocketConnPair(t)
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+
+	done := make(chan error, 1)
+	go func() { done <- session.handleCreateRequest(handler, request) }()
+	wrapped := mustReadWebSocketJSON(t, clientConn)
+	if got := int(wrapped["status_code"].(float64)); got != http.StatusBadGateway {
+		t.Fatalf("wrapped status = %d, want 502", got)
+	}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "before response.completed") {
+			t.Fatalf("handleCreateRequest error = %v, want missing completion", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handleCreateRequest did not finish")
+	}
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 1 || snap.Totals.TotalTokens != 0 {
+		t.Fatalf("[DONE] stats = requests:%d errors:%d total:%d, want 1/1/0", snap.Totals.Requests, snap.Totals.Errors, snap.Totals.TotalTokens)
 	}
 }

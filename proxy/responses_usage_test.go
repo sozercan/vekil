@@ -35,6 +35,27 @@ func TestResponsesUsageTotalDerived(t *testing.T) {
 	}
 }
 
+func TestResponsesUsageAdd(t *testing.T) {
+	turn := responsesUsage{InputTokens: 7, OutputTokens: 3, TotalTokens: 10}
+	turn.InputTokensDetails.CachedTokens = 2
+	turn.OutputTokensDetails.ReasoningTokens = 1
+
+	internal := responsesUsage{InputTokens: 100, OutputTokens: 20}
+	turn.add(internal)
+
+	if turn.InputTokens != 107 || turn.OutputTokens != 23 || turn.TotalTokens != 130 {
+		t.Fatalf("combined usage = %+v, want input=107 output=23 total=130", turn)
+	}
+	if turn.InputTokensDetails.CachedTokens != 2 || turn.OutputTokensDetails.ReasoningTokens != 1 {
+		t.Fatalf("combined detail usage = cached:%d reasoning:%d, want 2/1", turn.InputTokensDetails.CachedTokens, turn.OutputTokensDetails.ReasoningTokens)
+	}
+
+	turn.add(responsesUsage{})
+	if turn.InputTokens != 107 || turn.OutputTokens != 23 || turn.TotalTokens != 130 {
+		t.Fatalf("zero add changed usage: %+v", turn)
+	}
+}
+
 func TestSniffResponsesUsageBody(t *testing.T) {
 	body := `{"id":"resp_1","object":"response","usage":{"input_tokens":120,"output_tokens":45,"total_tokens":165,"input_tokens_details":{"cached_tokens":60},"output_tokens_details":{"reasoning_tokens":15}}}`
 	u := sniffResponsesUsageBody([]byte(body))
@@ -135,5 +156,57 @@ func TestRecordResponsesTurnCountsFailures(t *testing.T) {
 	snap2 := c.snapshot()
 	if snap2.Totals.Errors != 1 {
 		t.Fatalf("status 0 should default to success, errors stayed: got %d want 1", snap2.Totals.Errors)
+	}
+}
+
+func TestCompactBudgetPreservesUsageDetailsAndMixedTotals(t *testing.T) {
+	budget := newCompactBudget(4)
+	budget.addResponsesUsage([]byte(`{"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_tokens_details":{"cached_tokens":4},"output_tokens_details":{"reasoning_tokens":1}}}`))
+	budget.addResponsesUsage([]byte(`{"usage":{"input_tokens":7,"output_tokens":3,"input_tokens_details":{"cached_tokens":2},"output_tokens_details":{"reasoning_tokens":2}}}`))
+
+	got := budget.usageTotals()
+	if got.InputTokens != 17 || got.OutputTokens != 5 || got.TotalTokens != 22 {
+		t.Fatalf("usage totals = input:%d output:%d total:%d, want 17/5/22", got.InputTokens, got.OutputTokens, got.TotalTokens)
+	}
+	if got.InputTokensDetails.CachedTokens != 6 || got.OutputTokensDetails.ReasoningTokens != 3 {
+		t.Fatalf("usage details = cached:%d reasoning:%d, want 6/3", got.InputTokensDetails.CachedTokens, got.OutputTokensDetails.ReasoningTokens)
+	}
+}
+
+func TestRecordResponsesTurnAddsPostTerminalUsageWithoutAnotherRequest(t *testing.T) {
+	c := newStatsCollector()
+	turn := responsesUsage{InputTokens: 7, OutputTokens: 3, TotalTokens: 10}
+	turn.InputTokensDetails.CachedTokens = 2
+	record := c.recordResponsesTurn("gpt-5.4", "copilot", "copilot", "Codex CLI", http.StatusOK, turn)
+
+	internal := responsesUsage{InputTokens: 100, OutputTokens: 20}
+	internal.InputTokensDetails.CachedTokens = 11
+	internal.OutputTokensDetails.ReasoningTokens = 4
+	c.addResponsesTurnUsage(record, internal)
+
+	snap := c.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 {
+		t.Fatalf("turn count = requests:%d errors:%d, want 1/0", snap.Totals.Requests, snap.Totals.Errors)
+	}
+	if snap.Totals.PromptTokens != 107 || snap.Totals.CompletionTokens != 23 || snap.Totals.TotalTokens != 130 {
+		t.Fatalf("amended totals = prompt:%d completion:%d total:%d, want 107/23/130", snap.Totals.PromptTokens, snap.Totals.CompletionTokens, snap.Totals.TotalTokens)
+	}
+	if snap.Totals.CachedTokens != 13 || snap.Totals.ReasoningTokens != 4 {
+		t.Fatalf("amended details = cached:%d reasoning:%d, want 13/4", snap.Totals.CachedTokens, snap.Totals.ReasoningTokens)
+	}
+	if len(snap.ByModel) != 1 || snap.ByModel[0].Requests != 1 || snap.ByModel[0].Tokens != 130 {
+		t.Fatalf("model amendment = %+v", snap.ByModel)
+	}
+	if len(snap.ByProvider) != 1 || snap.ByProvider[0].Requests != 1 || snap.ByProvider[0].Tokens != 130 {
+		t.Fatalf("provider amendment = %+v", snap.ByProvider)
+	}
+	if len(snap.ByAgent) != 1 || snap.ByAgent[0].Requests != 1 || snap.ByAgent[0].Tokens != 130 {
+		t.Fatalf("agent amendment = %+v", snap.ByAgent)
+	}
+	if len(snap.Recent) != 1 || snap.Recent[0].TotalTokens != 130 {
+		t.Fatalf("recent amendment = %+v", snap.Recent)
+	}
+	if got := snap.Series[len(snap.Series)-1]; got.Req != 1 || got.Prompt != 107 || got.Completion != 23 {
+		t.Fatalf("series amendment = %+v", got)
 	}
 }

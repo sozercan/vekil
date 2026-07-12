@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -398,7 +399,7 @@ func TestRunResponsesPeekPump_CompletedWithQueuedTrailingDataAlwaysExits(t *test
 		pumpDone := make(chan struct{})
 		go func() {
 			defer close(pumpDone)
-			runResponsesPeekPump(upstream, pw, http.Header{}, peekDone, newResponsesPeekState(), commitCh, abortCh, responsesPrecommitMaxPeekBytes)
+			runResponsesPeekPump(upstream, pw, http.Header{}, peekDone, newResponsesPeekState(), commitCh, abortCh, make(chan struct{}), responsesPrecommitMaxPeekBytes)
 		}()
 
 		select {
@@ -871,6 +872,8 @@ func TestPeekAndForwardResponses_PrecommitAwaitTerminationOverHTTP(t *testing.T)
 			t.Fatal("timed out waiting for prepared stream read")
 		}
 
+		var client clientResult
+		clientFinished := false
 		switch mode {
 		case "deadline":
 			// The lifecycle-rooted upstream timeout fires on its own.
@@ -879,20 +882,28 @@ func TestPeekAndForwardResponses_PrecommitAwaitTerminationOverHTTP(t *testing.T)
 		case "shutdown":
 			h.BeginShutdown()
 		case "client_cancel":
-			// Cancel the actual client request and the server-side derivative used
-			// by the handler so this control remains deterministic across net/http
-			// connection-cancellation timing.
+			// First wait for the actual HTTP client to observe its cancellation,
+			// then release the server-side derivative. Returning the handler before
+			// Client.Do has processed cancellation can race net/http's implicit empty
+			// 200 response and make this transport assertion flaky.
 			cancelRequest()
+			select {
+			case client = <-clientDone:
+				clientFinished = true
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for HTTP client cancellation")
+			}
 			control.cancelInbound()
 		default:
 			t.Fatalf("unknown mode %q", mode)
 		}
 
-		var client clientResult
-		select {
-		case client = <-clientDone:
-		case <-time.After(time.Second):
-			t.Fatal("timed out waiting for HTTP client result")
+		if !clientFinished {
+			select {
+			case client = <-clientDone:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for HTTP client result")
+			}
 		}
 		var result handlerResult
 		select {
@@ -1078,3 +1089,535 @@ func (b *lifecyclePeekBlockBody) Read(p []byte) (int, error) {
 }
 
 func (b *lifecyclePeekBlockBody) Close() error { return nil }
+
+func TestResponsesPeekPumpObservesTerminalAfterCommittedWriterBlocks(t *testing.T) {
+	completed := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-observe-only\",\"usage\":{\"input_tokens\":4,\"output_tokens\":1,\"total_tokens\":5}}}\n\n"
+	body := newGatedResponsesFailureBody(completed, nil)
+	pr, pw := io.Pipe()
+	defer func() { _ = pr.Close() }()
+	peekDone := make(chan peekResult, 1)
+	peekState := newResponsesPeekState()
+	commitCh := make(chan struct{})
+	abortCh := make(chan struct{})
+	observeOnlyCh := make(chan struct{})
+	go runResponsesPeekPump(body, pw, http.Header{}, peekDone, peekState, commitCh, abortCh, observeOnlyCh, responsesPrecommitMaxPeekBytes)
+
+	select {
+	case result := <-peekDone:
+		if result.terminal != nil {
+			t.Fatalf("initial peek unexpectedly terminal: %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initial response.created peek")
+	}
+	close(commitCh)
+	close(observeOnlyCh)
+	body.releaseSecond()
+
+	select {
+	case <-peekState.terminalDone:
+		terminal, ok := peekState.terminalResult()
+		if !ok || terminal.terminal == nil || terminal.terminal.Type != "response.completed" {
+			t.Fatalf("terminal result = %+v, want response.completed", terminal)
+		}
+		if got := terminal.terminal.Response.Usage.TotalTokens; got != 5 {
+			t.Fatalf("terminal usage total = %d, want 5", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal was not observed after committed pipe writer blocked")
+	}
+	close(abortCh)
+}
+
+func TestResponsesTerminalObserverHandlesBoundedCompletedAndRejectsOversizedFragments(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		outputSize   int
+		total        int
+		wantTerminal bool
+	}{
+		{name: "large valid terminal", outputSize: 2 << 20, total: 17, wantTerminal: true},
+		{name: "oversized fragment reconstruction is not authoritative", outputSize: openAIStreamScannerMaxBuffer + 4096, total: 23},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			state := newResponsesPeekState()
+			observer := newResponsesTerminalObserver(nil, state)
+			payload := fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp-large","output":"%s","usage":{"input_tokens":%d,"output_tokens":1,"total_tokens":%d}}}`, strings.Repeat("x", tt.outputSize), tt.total-1, tt.total)
+			stream := []byte("event: response.completed\ndata: " + payload + "\n\n")
+			for len(stream) > 0 {
+				n := min(len(stream), responsesPeekReadChunkSize)
+				observer.Write(stream[:n])
+				stream = stream[n:]
+			}
+
+			terminal, ok := state.terminalResult()
+			if !tt.wantTerminal {
+				if ok {
+					t.Fatalf("terminal = %+v, want no authoritative oversized fragment result", terminal)
+				}
+				return
+			}
+			if !ok || terminal.terminal == nil || terminal.terminal.Type != "response.completed" {
+				t.Fatalf("terminal = %+v, want response.completed", terminal)
+			}
+			if got := terminal.terminal.Response.ID; got != "resp-large" {
+				t.Fatalf("terminal response id = %q, want resp-large", got)
+			}
+			if got := terminal.terminal.Response.Usage.TotalTokens; got != tt.total {
+				t.Fatalf("terminal total tokens = %d, want %d", got, tt.total)
+			}
+		})
+	}
+}
+
+func TestResponsesTerminalObserverFinalizesTerminalAtEOFWithoutDelimiter(t *testing.T) {
+	state := newResponsesPeekState()
+	observer := newResponsesTerminalObserver(nil, state)
+	observer.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-eof\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}"))
+	observer.FinalizeEOF()
+
+	terminal, ok := state.terminalResult()
+	if !ok || terminal.terminal == nil || terminal.terminal.Type != "response.completed" {
+		t.Fatalf("terminal = %+v, want response.completed", terminal)
+	}
+	if got := terminal.terminal.Response.Usage.TotalTokens; got != 3 {
+		t.Fatalf("terminal total tokens = %d, want 3", got)
+	}
+}
+
+func TestResponsesTerminalObserverFirstTerminalWinsAndInfersEventType(t *testing.T) {
+	state := newResponsesPeekState()
+	observer := newResponsesTerminalObserver(nil, state)
+	observer.Write([]byte("event: response.completed\ndata: {\"response\":{\"id\":\"resp-first\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n"))
+	observer.Write([]byte("event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"too_many_requests\",\"message\":\"late\"}}}\n\n"))
+
+	terminal, ok := state.terminalResult()
+	if !ok || terminal.terminal == nil {
+		t.Fatal("terminal result missing")
+	}
+	if terminal.terminal.Type != "response.completed" {
+		t.Fatalf("terminal type = %q, want inferred response.completed", terminal.terminal.Type)
+	}
+	if terminal.decision != responsesPeekDecisionPassthrough || terminal.terminal.Response.Usage.TotalTokens != 4 {
+		t.Fatalf("terminal result = %+v, want first completed outcome", terminal)
+	}
+}
+
+func TestPrepareResponsesStreamPreservesTerminalWhenInboundCancellationWins(t *testing.T) {
+	stream := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-cancel-race\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n"
+	for i := 0; i < 20; i++ {
+		waitCtx, cancelWait := context.WithCancel(context.Background())
+		cancelWait()
+		resp, result, _, err := prepareResponsesStreamAttemptWithGrace(waitCtx, context.Background(), 100*time.Millisecond, func() (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(stream)),
+			}, nil
+		})
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if err != nil || result == nil || result.terminal == nil || result.terminal.Type != "response.completed" {
+			t.Fatalf("iteration %d result = resp:%v result:%+v err:%v, want completed terminal", i, resp != nil, result, err)
+		}
+	}
+}
+
+func TestResponsesTerminalObserverDoesNotClassifyOversizedFailureFragments(t *testing.T) {
+	state := newResponsesPeekState()
+	observer := newResponsesTerminalObserver(nil, state)
+	payload := fmt.Sprintf(`{"type":"response.failed","response":{"id":"resp-large-failure","output":"%s","error":{"type":"server_error","code":"too_many_requests","message":"slow down"},"usage":{"input_tokens":9,"output_tokens":2,"total_tokens":11}}}`, strings.Repeat("x", openAIStreamScannerMaxBuffer+4096))
+	stream := []byte("event: response.failed\r\ndata: " + payload + "\r\n\r\n")
+	for len(stream) > 0 {
+		n := min(len(stream), responsesPeekReadChunkSize)
+		observer.Write(stream[:n])
+		stream = stream[n:]
+	}
+	if terminal, ok := state.terminalResult(); ok {
+		t.Fatalf("terminal = %+v, want no authoritative oversized fragment result", terminal)
+	}
+}
+
+func TestPrepareResponsesStreamPropagatesSalvagedTerminalWithoutResponse(t *testing.T) {
+	stream := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-wrapper-cancel\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n"
+	sawNilResponse := false
+	for i := 0; i < 20; i++ {
+		waitCtx, cancelWait := context.WithCancel(context.Background())
+		cancelWait()
+		h := &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}
+		resp, result, _, err := h.prepareResponsesStreamWithGrace(waitCtx, context.Background(), "gpt-5.4", 100*time.Millisecond, func() (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(stream)),
+			}, nil
+		})
+		if resp == nil {
+			sawNilResponse = true
+		} else if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if err != nil || result == nil || result.terminal == nil || result.terminal.Type != "response.completed" {
+			t.Fatalf("iteration %d result = resp:%v result:%+v err:%v, want propagated completed terminal", i, resp != nil, result, err)
+		}
+	}
+	if !sawNilResponse {
+		t.Fatal("test never exercised the salvaged-terminal path with a nil response")
+	}
+}
+
+type delayedResponsesOutcomeReadCloser struct {
+	steps []responsesOutcomeReadStep
+	index int
+	delay time.Duration
+}
+
+type responsesOutcomeReadStep struct {
+	data string
+	err  error
+}
+
+func (r *delayedResponsesOutcomeReadCloser) Read(p []byte) (int, error) {
+	if r.index >= len(r.steps) {
+		return 0, io.EOF
+	}
+	if r.delay > 0 {
+		time.Sleep(r.delay)
+	}
+	step := r.steps[r.index]
+	r.index++
+	return copy(p, step.data), step.err
+}
+
+func (r *delayedResponsesOutcomeReadCloser) Close() error { return nil }
+
+func TestPrepareResponsesStreamAttemptPreservesIndependentReadOutcomeOverCancellation(t *testing.T) {
+	resetErr := errors.New("upstream reset")
+	for _, tt := range []struct {
+		name        string
+		steps       []responsesOutcomeReadStep
+		wantBody    string
+		wantReadErr error
+	}{
+		{name: "EOF without bytes", steps: []responsesOutcomeReadStep{{err: io.EOF}}},
+		{name: "EOF with same-read bytes", steps: []responsesOutcomeReadStep{{data: ": keepalive\n\n", err: io.EOF}}, wantBody: ": keepalive\n\n"},
+		{name: "reset without bytes", steps: []responsesOutcomeReadStep{{err: resetErr}}, wantReadErr: resetErr},
+		{name: "reset after separate bytes", steps: []responsesOutcomeReadStep{{data: ": keepalive\n\n"}, {err: resetErr}}, wantBody: ": keepalive\n\n", wantReadErr: resetErr},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			waitCtx, cancelWait := context.WithCancel(context.Background())
+			cancelWait()
+			resp, result, _, err := prepareResponsesStreamAttempt(waitCtx, context.Background(), func() (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body: &delayedResponsesOutcomeReadCloser{
+						steps: tt.steps,
+						delay: time.Millisecond,
+					},
+				}, nil
+			})
+			if err != nil {
+				t.Fatalf("prepareResponsesStreamAttempt() error = %v, want preserved response", err)
+			}
+			if result != nil {
+				t.Fatalf("result = %+v, want no terminal result", result)
+			}
+			if resp == nil || resp.Body == nil {
+				t.Fatal("response body missing after independent read outcome")
+			}
+			body, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if string(body) != tt.wantBody {
+				t.Fatalf("body = %q, want %q", body, tt.wantBody)
+			}
+			if !errors.Is(readErr, tt.wantReadErr) {
+				t.Fatalf("read error = %v, want %v", readErr, tt.wantReadErr)
+			}
+		})
+	}
+}
+
+func TestResponsesTerminalObserverDoesNotFinalizeTruncatedOversizedTerminalAtEOF(t *testing.T) {
+	state := newResponsesPeekState()
+	observer := newResponsesTerminalObserver(nil, state)
+	payload := fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp-truncated-large","output":"%s","usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}`, strings.Repeat("x", openAIStreamScannerMaxBuffer+4096))
+	observer.Write([]byte("event: response.completed\ndata: " + payload + "\n"))
+	observer.FinalizeEOF()
+
+	if terminal, ok := state.terminalResult(); ok {
+		t.Fatalf("terminal = %+v, want no authoritative terminal without explicit SSE boundary", terminal)
+	}
+	if usage, ok := state.recoveredUsageResult(); !ok || usage.TotalTokens != 9 {
+		t.Fatalf("recovered usage = %+v ok=%v, want terminal usage 9 at EOF", usage, ok)
+	}
+	if len(observer.line) > openAIStreamScannerMaxBuffer || len(observer.data) > openAIStreamScannerMaxBuffer || len(observer.usageTail) > responsesFailureTapOverflowTail {
+		t.Fatalf("observer retained unbounded state: line=%d data=%d tail=%d", len(observer.line), len(observer.data), len(observer.usageTail))
+	}
+}
+
+func TestResponsesTerminalObserverDoesNotClassifyOversizedDataOnlyFragments(t *testing.T) {
+	for _, typeName := range []string{"response.completed", "response.failed", "response.incomplete"} {
+		t.Run(typeName, func(t *testing.T) {
+			state := newResponsesPeekState()
+			observer := newResponsesTerminalObserver(nil, state)
+			payload := fmt.Sprintf(`{"type":%q,"response":{"id":"resp-data-only","output":"%s","usage":{"input_tokens":8,"output_tokens":3,"total_tokens":11}}}`, typeName, strings.Repeat("x", openAIStreamScannerMaxBuffer+4096))
+			stream := []byte("data: " + payload + "\r\n\r\n")
+			for len(stream) > 0 {
+				n := min(len(stream), responsesPeekReadChunkSize)
+				observer.Write(stream[:n])
+				stream = stream[n:]
+			}
+			if terminal, ok := state.terminalResult(); ok {
+				t.Fatalf("terminal = %+v, want no authoritative oversized fragment result", terminal)
+			}
+		})
+	}
+}
+
+func TestResponsesSSEBoundaryEndAcrossAllChunkSplits(t *testing.T) {
+	for _, boundary := range []string{"\n\n", "\n\r\n", "\r\n\n", "\r\n\r\n"} {
+		for split := 0; split <= len(boundary); split++ {
+			t.Run(fmt.Sprintf("%q/split-%d", boundary, split), func(t *testing.T) {
+				tail := []byte("payload")
+				seen := false
+				for _, chunk := range [][]byte{[]byte(boundary[:split]), []byte(boundary[split:])} {
+					if len(chunk) == 0 {
+						continue
+					}
+					combined := append(append([]byte(nil), trailingBytes(tail, 3)...), chunk...)
+					if responsesSSEBoundaryEnd(combined) > 0 {
+						seen = true
+						break
+					}
+					tail = trailingBytes(combined, 3)
+				}
+				if !seen {
+					t.Fatalf("boundary %q was not detected across split %d", boundary, split)
+				}
+			})
+		}
+	}
+}
+
+func TestExtractResponsesTerminalTypeIgnoresEscapedNestedText(t *testing.T) {
+	buf := []byte(`data: {"type":"response.output_item.done","item":{"text":"quoted \\"type\\":\\"response.failed\\" text"}}`)
+	if got := extractResponsesTerminalType(buf); got != "" {
+		t.Fatalf("terminal type = %q, want none from escaped output text", got)
+	}
+	buf = []byte("data: {\"response\":{}, \"type\" : \"response.incomplete\"}")
+	if got := extractResponsesTerminalType(buf); got != "response.incomplete" {
+		t.Fatalf("terminal type = %q, want response.incomplete", got)
+	}
+}
+
+func TestStreamResponsesPipeHandlesOversizedTerminalFraming(t *testing.T) {
+	payload := fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp-http-truncated","output":"%s","usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}`, strings.Repeat("x", responsesFailureTapMaxBuffer+4096))
+	for _, tt := range []struct {
+		name        string
+		delimiter   string
+		wantFailure int
+	}{
+		{name: "EOF without boundary", delimiter: "\n", wantFailure: http.StatusBadGateway},
+		{name: "explicit SSE boundary", delimiter: "\n\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			wire := "data: " + payload + tt.delimiter
+			ctx, summary := WithRequestSummary(context.Background())
+			recorder := httptest.NewRecorder()
+			streamResponsesPipeWithFailureLog(ctx, &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, recorder, strings.NewReader(wire), nil, nil, "")
+
+			if got := summary.FailureStatus(); got != tt.wantFailure {
+				t.Fatalf("FailureStatus = %d, want %d", got, tt.wantFailure)
+			}
+			usage := readSummaryForStats(summary)
+			if usage.prompt != 7 || usage.completion != 2 || usage.total != 9 {
+				t.Fatalf("usage = prompt:%d completion:%d total:%d, want retained 7/2/9", usage.prompt, usage.completion, usage.total)
+			}
+			if got := recorder.Body.String(); got != wire {
+				t.Fatalf("forwarded body changed: got %d bytes, want %d", len(got), len(wire))
+			}
+		})
+	}
+}
+
+func TestResponsesPreparedBodyTerminalResultReturnsWhenReadOutcomeEnds(t *testing.T) {
+	state := newResponsesPeekState()
+	state.publishOutcome(responsesPeekReadOutcome{err: io.EOF})
+	observed := false
+	body := &responsesPreparedBody{
+		peekState: state,
+		observeOnlyFn: func() {
+			observed = true
+		},
+	}
+	start := time.Now()
+	if terminal, ok := body.terminalResultWithin(500 * time.Millisecond); ok {
+		t.Fatalf("unexpected terminal result: %+v", terminal)
+	}
+	if !observed {
+		t.Fatal("terminal observation did not switch the reader to observe-only mode")
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("known EOF waited for terminal grace: %v", elapsed)
+	}
+}
+
+func TestPrepareResponsesStreamAttemptCommitsUpstreamCanceledTerminal(t *testing.T) {
+
+	streamCtx, cancelStream := context.WithCancel(context.Background())
+	cancelStream()
+	stream := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-upstream-cancel\",\"output\":[{\"type\":\"message\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n"
+	resp, result, _, err := prepareResponsesStreamAttemptWithGrace(context.Background(), streamCtx, 100*time.Millisecond, func() (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: &delayedResponsesOutcomeReadCloser{
+				steps: []responsesOutcomeReadStep{{data: stream, err: io.EOF}},
+				delay: 50 * time.Millisecond,
+			},
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("prepareResponsesStreamAttempt error = %v", err)
+	}
+	if resp == nil || resp.Body == nil {
+		t.Fatal("upstream-canceled terminal did not retain the prepared response")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if result == nil || result.terminal == nil || result.terminal.Type != "response.completed" {
+		t.Fatalf("terminal result = %+v, want response.completed", result)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		t.Fatalf("read committed terminal body: %v", readErr)
+	}
+	if string(body) != stream {
+		t.Fatalf("committed terminal body changed: got %q want %q", body, stream)
+	}
+}
+
+func TestResponsesFailureTapResumesAfterOversizedNonterminalEvent(t *testing.T) {
+	oversized := fmt.Sprintf("event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"text\":\"%s\"}}\n\n", strings.Repeat("x", responsesFailureTapMaxBuffer+4096))
+	completed := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-after-oversize\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n"
+	wire := oversized + completed
+	ctx, summary := WithRequestSummary(context.Background())
+	recorder := httptest.NewRecorder()
+	streamResponsesPipeWithFailureLog(ctx, &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, recorder, strings.NewReader(wire), nil, nil, "")
+
+	if got := summary.FailureStatus(); got != 0 {
+		t.Fatalf("FailureStatus = %d, want successful terminal after oversized nonterminal", got)
+	}
+	usage := readSummaryForStats(summary)
+	if usage.total != 3 {
+		t.Fatalf("total usage = %d, want 3 from final completed event", usage.total)
+	}
+	if recorder.Body.String() != wire {
+		t.Fatal("forwarded stream changed")
+	}
+}
+
+func TestResponsesFailureTapParsesNearLimitTerminalBeforeFollowingEvent(t *testing.T) {
+	prefix := `event: response.completed
+data: {"type":"response.completed","response":{"id":"resp-near-limit","output":"`
+	suffix := `","usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}
+
+`
+	outputBytes := responsesFailureTapMaxBuffer - len(prefix) - len(suffix) - 1
+	if outputBytes <= 0 {
+		t.Fatal("invalid near-limit test sizing")
+	}
+	completed := prefix + strings.Repeat("x", outputBytes) + suffix
+	if len(completed) >= responsesFailureTapMaxBuffer {
+		t.Fatalf("completed event bytes = %d, want below %d", len(completed), responsesFailureTapMaxBuffer)
+	}
+	wire := completed + "data: [DONE]\n\n"
+	if len(wire) <= responsesFailureTapMaxBuffer {
+		t.Fatalf("combined wire bytes = %d, want above %d", len(wire), responsesFailureTapMaxBuffer)
+	}
+
+	ctx, summary := WithRequestSummary(context.Background())
+	recorder := httptest.NewRecorder()
+	streamResponsesPipeWithFailureLog(ctx, &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, recorder, strings.NewReader(wire), nil, nil, "")
+	if got := summary.FailureStatus(); got != 0 {
+		t.Fatalf("FailureStatus = %d, want near-limit completed event to remain successful", got)
+	}
+	usage := readSummaryForStats(summary)
+	if usage.prompt != 5 || usage.completion != 2 || usage.total != 7 {
+		t.Fatalf("usage = prompt:%d completion:%d total:%d, want 5/2/7", usage.prompt, usage.completion, usage.total)
+	}
+	if recorder.Body.String() != wire {
+		t.Fatal("forwarded near-limit stream changed")
+	}
+}
+
+func TestResponsesTerminalObserverIgnoresOversizedNonterminalUsage(t *testing.T) {
+	state := newResponsesPeekState()
+	observer := newResponsesTerminalObserver(nil, state)
+	payload := fmt.Sprintf(`{"type":"response.output_item.done","item":{"type":"message","output":"%s","usage":{"input_tokens":900,"output_tokens":80,"total_tokens":980}}}`, strings.Repeat("x", openAIStreamScannerMaxBuffer+4096))
+	stream := []byte("event: response.output_item.done\ndata: " + payload + "\n\n")
+	for len(stream) > 0 {
+		n := min(len(stream), responsesPeekReadChunkSize)
+		observer.Write(stream[:n])
+		stream = stream[n:]
+	}
+	if terminal, ok := state.terminalResult(); ok {
+		t.Fatalf("terminal = %+v, want no terminal from output_item.done", terminal)
+	}
+	if usage, ok := state.recoveredUsageResult(); ok {
+		t.Fatalf("recovered usage = %+v, want none from nonterminal event", usage)
+	}
+}
+
+func TestResponsesTerminalObserverDoesNotRecoverUsageFromNonterminalOverflow(t *testing.T) {
+	state := newResponsesPeekState()
+	observer := newResponsesTerminalObserver(nil, state)
+	payload := fmt.Sprintf(`{"type":"response.output_item.done","item":{"type":"message","content":"%s","usage":{"input_tokens":99,"output_tokens":1,"total_tokens":100}}}`, strings.Repeat("x", openAIStreamScannerMaxBuffer+4096))
+	stream := []byte("event: response.output_item.done\ndata: " + payload + "\n\n")
+	for len(stream) > 0 {
+		n := min(len(stream), responsesPeekReadChunkSize)
+		observer.Write(stream[:n])
+		stream = stream[n:]
+	}
+	if usage, ok := state.recoveredUsageResult(); ok {
+		t.Fatalf("nonterminal overflow recovered usage %+v", usage)
+	}
+	if terminal, ok := state.terminalResult(); ok {
+		t.Fatalf("nonterminal overflow published terminal %+v", terminal)
+	}
+}
+
+func TestResponsesPreparedStreamCanDisableTerminalObservation(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-http\"}}\n\n")),
+	}
+	prepared := newResponsesPreparedStream(resp, responsesPrecommitMaxPeekBytes, false)
+	if prepared.peekState.observeTerminal {
+		t.Fatal("HTTP prepared stream unexpectedly enabled terminal observation")
+	}
+	result, _, _, err := prepared.await(context.Background(), context.Background(), time.Second)
+	if err != nil {
+		t.Fatalf("prepared await error: %v", err)
+	}
+	if result.terminal == nil || result.terminal.Type != "response.completed" {
+		t.Fatalf("precommit parser result = %+v, want completed decision", result)
+	}
+	committed := prepared.commitResponse()
+	_, _ = io.Copy(io.Discard, committed.Body)
+	_ = committed.Body.Close()
+}
+
+func TestResponsesTerminalObserverStopsAtDoneMarker(t *testing.T) {
+	state := newResponsesPeekState()
+	observer := newResponsesTerminalObserver(nil, state)
+	observer.Write([]byte("data: [DONE]\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-after-done\",\"usage\":{\"input_tokens\":9,\"output_tokens\":1,\"total_tokens\":10}}}\n\n"))
+	if terminal, ok := state.terminalResult(); ok {
+		t.Fatalf("terminal = %+v, want [DONE] to stop observation", terminal)
+	}
+	if usage, ok := state.recoveredUsageResult(); ok {
+		t.Fatalf("recovered usage = %+v, want none after [DONE]", usage)
+	}
+}

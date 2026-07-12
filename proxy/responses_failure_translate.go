@@ -21,12 +21,12 @@ const (
 	responsesPeekReadChunkSize     = 4 * 1024
 	responsesPeekCancellationGrace = 10 * time.Millisecond
 	// responsesFailureTapMaxBuffer bounds how much of an in-flight SSE event the
-	// failure tap buffers while waiting for its delimiter. It must be large
-	// enough to hold a real response.completed event, which embeds the full
-	// response output plus the usage object — long Codex turns routinely exceed
-	// 64 KiB — so it is sized at 1 MiB. On overflow the tap still best-effort
-	// sniffs usage from the buffered bytes before dropping them.
-	responsesFailureTapMaxBuffer = 1 << 20
+	// failure tap buffers while waiting for its delimiter. It matches the
+	// supported Responses scanner limit so every accepted terminal event is fully
+	// parsed before it can affect status. Larger events retain best-effort usage
+	// only and are treated as over-limit/truncated rather than reconstructed from
+	// unvalidated fragments.
+	responsesFailureTapMaxBuffer = openAIStreamScannerMaxBuffer
 	// responsesFailureTapOverflowTail is the trailing window retained when a
 	// single SSE event overflows the buffer. A streamed response.completed embeds
 	// its (small) usage object near the end of the event, so retaining the tail
@@ -84,33 +84,518 @@ type responsesSSEMessage struct {
 type responsesSSEParser struct {
 	pending  []byte
 	allowBOM bool
+	done     bool
+}
+
+// responsesTerminalObserver incrementally inspects committed Responses SSE
+// without rescanning an incomplete event on every transport chunk. It buffers at
+// at most the normal WebSocket stream parser's event limit and keeps a bounded
+// tail so a larger response.completed can still publish terminal identity and
+// usage without retaining the full model output.
+type responsesTerminalObserver struct {
+	headers       http.Header
+	peekState     *responsesPeekState
+	line          []byte
+	data          []byte
+	event         string
+	usageTail     []byte
+	overflowEvent responsesWebSocketStreamEvent
+	lineOverflow  bool
+	overflow      bool
+	firstLine     bool
+	done          bool
+	skipEvent     bool
+}
+
+func newResponsesTerminalObserver(headers http.Header, state *responsesPeekState) *responsesTerminalObserver {
+	return &responsesTerminalObserver{headers: headers, peekState: state, firstLine: true}
+}
+
+func (o *responsesTerminalObserver) Write(p []byte) {
+	if o == nil || o.done {
+		return
+	}
+	for _, b := range p {
+		if o.done {
+			return
+		}
+		if !o.skipEvent {
+			o.usageTail = append(o.usageTail, b)
+			if len(o.usageTail) > responsesFailureTapOverflowTail {
+				o.usageTail = o.usageTail[len(o.usageTail)-responsesFailureTapOverflowTail:]
+			}
+		}
+		if b == '\n' {
+			o.finishLine()
+			continue
+		}
+		if o.skipEvent {
+			o.line = nil
+			o.lineOverflow = true
+			continue
+		}
+		if o.overflow {
+			if b == '\r' && !o.lineOverflow && len(o.line) == 0 {
+				o.line = append(o.line, b)
+			} else {
+				o.line = nil
+				o.lineOverflow = true
+			}
+			continue
+		}
+		if o.lineOverflow {
+			continue
+		}
+		if len(o.line)+len(o.data)+len(o.event) >= openAIStreamScannerMaxBuffer {
+			o.rememberOverflowEvent(o.data)
+			o.rememberOverflowEvent(o.line)
+			o.line = nil
+			o.data = nil
+			o.lineOverflow = true
+			o.overflow = true
+			continue
+		}
+		o.line = append(o.line, b)
+	}
+}
+
+func (o *responsesTerminalObserver) finishLine() {
+	if o.lineOverflow {
+		o.lineOverflow = false
+		o.line = nil
+		return
+	}
+	line := bytes.TrimSuffix(o.line, []byte{'\r'})
+	o.line = nil
+	if o.firstLine {
+		line = bytes.TrimPrefix(line, []byte{0xEF, 0xBB, 0xBF})
+		o.firstLine = false
+	}
+	if len(line) == 0 {
+		o.finishEvent(true)
+		return
+	}
+	if line[0] == ':' {
+		return
+	}
+	field, value := line, []byte{}
+	if colon := bytes.IndexByte(line, ':'); colon >= 0 {
+		field = line[:colon]
+		value = line[colon+1:]
+		value = bytes.TrimPrefix(value, []byte{' '})
+	}
+	switch string(field) {
+	case "event":
+		if len(o.data)+len(value) > openAIStreamScannerMaxBuffer {
+			o.rememberOverflowEvent(o.data)
+			o.rememberOverflowEvent(value)
+			o.data = nil
+			o.overflow = true
+			return
+		}
+		o.event = string(value)
+		o.skipEvent = strings.TrimSpace(o.event) != "" && !isResponsesTerminalType(o.event)
+		o.rememberOverflowEvent(value)
+	case "data":
+		if o.skipEvent {
+			return
+		}
+		if o.overflow {
+			return
+		}
+		separator := 0
+		if len(o.data) > 0 {
+			separator = 1
+		}
+		if len(o.data)+separator+len(value)+len(o.event) > openAIStreamScannerMaxBuffer {
+			o.rememberOverflowEvent(o.data)
+			o.rememberOverflowEvent(value)
+			o.data = nil
+			o.overflow = true
+			return
+		}
+		if len(o.data) == 0 {
+			o.data = value
+			return
+		}
+		o.data = append(o.data, '\n')
+		o.data = append(o.data, value...)
+	}
+}
+
+func (o *responsesTerminalObserver) rememberOverflowEvent(buf []byte) {
+	if o == nil {
+		return
+	}
+	updateResponsesTerminalEvent(&o.overflowEvent, strings.TrimSpace(o.event), buf)
+}
+
+func (o *responsesTerminalObserver) finishEvent(explicitBoundary bool) {
+	if o.skipEvent {
+		o.data = nil
+		o.event = ""
+		o.usageTail = nil
+		o.overflowEvent = responsesWebSocketStreamEvent{}
+		o.overflow = false
+		o.skipEvent = false
+		return
+	}
+	if !o.overflow && strings.TrimSpace(string(o.data)) == "[DONE]" {
+		o.data = nil
+		o.event = ""
+		o.usageTail = nil
+		o.overflowEvent = responsesWebSocketStreamEvent{}
+		o.done = true
+		return
+	}
+	if o.overflow {
+		// Fragment recovery is best-effort metadata only. Without the complete JSON
+		// payload, even an explicit SSE boundary cannot make the event authoritative.
+		// The normal websocket scanner will report an over-limit stream error. Usage
+		// after a real boundary remains billable evidence and is retained separately.
+		o.rememberOverflowEvent(o.usageTail)
+		if isResponsesTerminalType(o.overflowEvent.Type) {
+			// Status remains non-authoritative without the full JSON, but terminal
+			// usage is still billable evidence whether EOF or a blank line ended it.
+			o.peekState.publishRecoveredUsage(o.overflowEvent.Response.Usage)
+		}
+	} else if len(o.data) > 0 || strings.TrimSpace(o.event) != "" {
+		result := classifyResponsesPeekMessage(responsesSSEMessage{event: o.event, data: string(o.data), semantic: true}, o.headers)
+		o.peekState.publishTerminal(result)
+	}
+	o.data = nil
+	o.event = ""
+	o.usageTail = nil
+	o.overflowEvent = responsesWebSocketStreamEvent{}
+	o.overflow = false
+	o.skipEvent = false
+}
+
+func (o *responsesTerminalObserver) FinalizeEOF() {
+	if o == nil {
+		return
+	}
+	if o.lineOverflow {
+		o.lineOverflow = false
+		o.line = nil
+	} else if len(o.line) > 0 {
+		o.finishLine()
+	}
+	if o.overflow || len(o.data) > 0 || strings.TrimSpace(o.event) != "" {
+		o.finishEvent(false)
+	}
+}
+
+func marshalResponsesObserverEvent(value interface{}) string {
+	body, _ := json.Marshal(value)
+	return string(body)
+}
+
+func extractResponsesFailureObject(buf []byte) (responsesWebSocketStreamError, bool) {
+	var result responsesWebSocketStreamError
+	object, ok := extractResponsesNamedObject(buf, []byte(`"error"`))
+	if !ok || json.Unmarshal(object, &result) != nil {
+		return responsesWebSocketStreamError{}, false
+	}
+	return result, result.Code != "" || result.Type != "" || result.Message != ""
+}
+
+func extractResponsesIncompleteDetails(buf []byte) (responsesWebSocketStreamIncompleteDetails, bool) {
+	var result responsesWebSocketStreamIncompleteDetails
+	object, ok := extractResponsesNamedObject(buf, []byte(`"incomplete_details"`))
+	if !ok || json.Unmarshal(object, &result) != nil {
+		return responsesWebSocketStreamIncompleteDetails{}, false
+	}
+	return result, result.Reason != ""
+}
+
+func extractResponsesNamedObject(buf, key []byte) ([]byte, bool) {
+	search := buf
+	for {
+		idx := bytes.LastIndex(search, key)
+		if idx < 0 {
+			return nil, false
+		}
+		cursor := idx + len(key)
+		for cursor < len(search) && (search[cursor] == ' ' || search[cursor] == '\t' || search[cursor] == ':' || search[cursor] == '\r' || search[cursor] == '\n') {
+			cursor++
+		}
+		if cursor < len(search) && search[cursor] == '{' {
+			if object, end := balancedJSONObject(search[cursor:]); end > 0 {
+				return object, true
+			}
+		}
+		search = search[:idx]
+	}
+}
+
+func isResponsesTerminalType(eventType string) bool {
+	switch strings.TrimSpace(eventType) {
+	case "response.completed", "response.failed", "response.incomplete":
+		return true
+	default:
+		return false
+	}
+}
+
+func extractResponsesTerminalType(buf []byte) string {
+	lines := buf
+	for len(lines) > 0 {
+		lineEnd := bytes.IndexByte(lines, '\n')
+		line := lines
+		if lineEnd >= 0 {
+			line = lines[:lineEnd]
+		}
+		line = bytes.TrimSuffix(line, []byte{'\r'})
+		if colon := bytes.IndexByte(line, ':'); colon >= 0 && string(line[:colon]) == "event" {
+			if eventType := strings.TrimSpace(string(line[colon+1:])); isResponsesTerminalType(eventType) {
+				return eventType
+			}
+		}
+		if lineEnd < 0 {
+			break
+		}
+		lines = lines[lineEnd+1:]
+	}
+
+	const (
+		responsesJSONExpectKey = iota
+		responsesJSONExpectColon
+		responsesJSONExpectValue
+		responsesJSONAfterValue
+	)
+	const (
+		responsesJSONStringIgnored = iota
+		responsesJSONStringKey
+		responsesJSONStringValue
+	)
+
+	depth := 0
+	state := responsesJSONExpectKey
+	keyIsType := false
+	inString := false
+	escaped := false
+	stringEscaped := false
+	stringRole := responsesJSONStringIgnored
+	stringStart := 0
+
+	for i, b := range buf {
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if b == '\\' {
+				escaped = true
+				stringEscaped = true
+				continue
+			}
+			if b != '"' {
+				continue
+			}
+
+			value := buf[stringStart:i]
+			switch stringRole {
+			case responsesJSONStringKey:
+				keyIsType = !stringEscaped && bytes.Equal(value, []byte("type"))
+				state = responsesJSONExpectColon
+			case responsesJSONStringValue:
+				if keyIsType && !stringEscaped {
+					eventType := string(value)
+					if isResponsesTerminalType(eventType) {
+						return eventType
+					}
+				}
+				keyIsType = false
+				state = responsesJSONAfterValue
+			}
+			inString = false
+			stringRole = responsesJSONStringIgnored
+			continue
+		}
+
+		if depth == 0 {
+			if b == '{' {
+				depth = 1
+				state = responsesJSONExpectKey
+				keyIsType = false
+			}
+			continue
+		}
+
+		if b == '"' {
+			inString = true
+			escaped = false
+			stringEscaped = false
+			stringStart = i + 1
+			if depth == 1 {
+				switch state {
+				case responsesJSONExpectKey:
+					stringRole = responsesJSONStringKey
+				case responsesJSONExpectValue:
+					stringRole = responsesJSONStringValue
+				default:
+					stringRole = responsesJSONStringIgnored
+				}
+			}
+			continue
+		}
+
+		if depth == 1 {
+			switch b {
+			case ':':
+				if state == responsesJSONExpectColon {
+					state = responsesJSONExpectValue
+				}
+				continue
+			case ',':
+				state = responsesJSONExpectKey
+				keyIsType = false
+				continue
+			case '}':
+				depth = 0
+				state = responsesJSONExpectKey
+				keyIsType = false
+				continue
+			case ' ', '\t', '\r', '\n':
+				continue
+			}
+			if state == responsesJSONExpectValue {
+				state = responsesJSONAfterValue
+				keyIsType = false
+			}
+		}
+
+		switch b {
+		case '{', '[':
+			depth++
+		case '}', ']':
+			if depth > 0 {
+				depth--
+			}
+		}
+	}
+	return ""
+}
+
+func extractResponsesResponseID(buf []byte) (string, bool) {
+	start := bytes.IndexByte(buf, '{')
+	if start < 0 {
+		return "", false
+	}
+	dec := json.NewDecoder(bytes.NewReader(buf[start:]))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return "", false
+	}
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return "", false
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return "", false
+		}
+		if key != "response" {
+			if err := skipJSONValue(dec); err != nil {
+				return "", false
+			}
+			continue
+		}
+		tok, err := dec.Token()
+		if err != nil || tok != json.Delim('{') {
+			return "", false
+		}
+		for dec.More() {
+			responseKeyToken, err := dec.Token()
+			if err != nil {
+				return "", false
+			}
+			responseKey, ok := responseKeyToken.(string)
+			if !ok {
+				return "", false
+			}
+			if responseKey == "id" {
+				var responseID string
+				if err := dec.Decode(&responseID); err != nil {
+					return "", false
+				}
+				responseID = strings.TrimSpace(responseID)
+				return responseID, responseID != ""
+			}
+			if err := skipJSONValue(dec); err != nil {
+				return "", false
+			}
+		}
+		return "", false
+	}
+	return "", false
+}
+
+func updateResponsesTerminalEvent(event *responsesWebSocketStreamEvent, hintedType string, buf []byte) {
+	if event == nil {
+		return
+	}
+	if event.Type == "" {
+		if isResponsesTerminalType(hintedType) {
+			event.Type = strings.TrimSpace(hintedType)
+		} else {
+			event.Type = extractResponsesTerminalType(buf)
+		}
+	}
+	if event.Response.ID == "" {
+		if responseID, ok := extractResponsesResponseID(buf); ok {
+			event.Response.ID = responseID
+		}
+	}
+	if usage, ok := extractResponsesUsageObject(buf); ok {
+		event.Response.Usage = usage
+	}
+	if failure, ok := extractResponsesFailureObject(buf); ok {
+		event.Response.Error = failure
+	}
+	if details, ok := extractResponsesIncompleteDetails(buf); ok {
+		event.Response.IncompleteDetails = details
+	}
 }
 
 type responsesPreparedStream struct {
-	resp      *http.Response
-	pr        *io.PipeReader
-	peekDone  chan peekResult
-	peekState *responsesPeekState
-	commitCh  chan struct{}
-	abortCh   chan struct{}
-	commitFn  func()
-	abortFn   func()
+	resp          *http.Response
+	pr            *io.PipeReader
+	peekDone      chan peekResult
+	peekState     *responsesPeekState
+	commitCh      chan struct{}
+	abortCh       chan struct{}
+	commitFn      func()
+	abortFn       func()
+	observeOnlyFn func()
 }
 
 type responsesPeekState struct {
-	mu           sync.Mutex
-	terminal     peekResult
-	hasTerminal  bool
-	terminalDone chan struct{}
-	doneOnce     sync.Once
-	outcome      responsesPeekReadOutcome
-	hasOutcome   bool
-	outcomeDone  chan struct{}
-	outcomeOnce  sync.Once
+	observeTerminal         bool
+	mu                      sync.Mutex
+	terminal                peekResult
+	hasTerminal             bool
+	terminalDone            chan struct{}
+	doneOnce                sync.Once
+	outcome                 responsesPeekReadOutcome
+	hasOutcome              bool
+	outcomeDone             chan struct{}
+	outcomeOnce             sync.Once
+	recoveredUsage          responsesUsage
+	hasRecoveredUsage       bool
+	stopTerminalObservation chan struct{}
+	stopTerminalOnce        sync.Once
 }
 
 func newResponsesPeekState() *responsesPeekState {
-	return &responsesPeekState{terminalDone: make(chan struct{}), outcomeDone: make(chan struct{})}
+	return &responsesPeekState{
+		observeTerminal:         true,
+		terminalDone:            make(chan struct{}),
+		outcomeDone:             make(chan struct{}),
+		stopTerminalObservation: make(chan struct{}),
+	}
 }
 
 func (s *responsesPeekState) publishOutcome(outcome responsesPeekReadOutcome) {
@@ -131,12 +616,33 @@ func (s *responsesPeekState) publishTerminal(result peekResult) {
 		return
 	}
 	s.mu.Lock()
-	if !s.hasTerminal || (result.decision == responsesPeekDecisionTranslate && s.terminal.decision != responsesPeekDecisionTranslate) {
+	if !s.hasTerminal {
 		s.terminal = result
 		s.hasTerminal = true
 	}
 	s.mu.Unlock()
 	s.doneOnce.Do(func() { close(s.terminalDone) })
+}
+
+func (s *responsesPeekState) publishRecoveredUsage(usage responsesUsage) {
+	if s == nil || usage.isZero() {
+		return
+	}
+	s.mu.Lock()
+	if !s.hasRecoveredUsage && !s.hasTerminal {
+		s.recoveredUsage = usage
+		s.hasRecoveredUsage = true
+	}
+	s.mu.Unlock()
+}
+
+func (s *responsesPeekState) recoveredUsageResult() (responsesUsage, bool) {
+	if s == nil {
+		return responsesUsage{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recoveredUsage, s.hasRecoveredUsage
 }
 
 func (s *responsesPeekState) terminalResult() (peekResult, bool) {
@@ -158,10 +664,47 @@ func (s *responsesPeekState) readOutcome() (responsesPeekReadOutcome, bool) {
 }
 
 type responsesPreparedBody struct {
-	reader    *io.PipeReader
-	closeFn   func()
-	closeOnce sync.Once
-	closeErr  error
+	reader        *io.PipeReader
+	peekState     *responsesPeekState
+	closeFn       func()
+	observeOnlyFn func()
+	closeOnce     sync.Once
+	closeErr      error
+}
+
+func (b *responsesPreparedBody) terminalResultWithin(grace time.Duration) (peekResult, bool) {
+	if b == nil || b.peekState == nil {
+		return peekResult{}, false
+	}
+	if terminal, ok := b.peekState.terminalResult(); ok {
+		return terminal, true
+	}
+	if b.observeOnlyFn != nil {
+		b.observeOnlyFn()
+	}
+	if grace <= 0 {
+		return peekResult{}, false
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-b.peekState.terminalDone:
+		return b.peekState.terminalResult()
+	case <-b.peekState.outcomeDone:
+		if terminal, ok := b.peekState.terminalResult(); ok {
+			return terminal, true
+		}
+		return peekResult{}, false
+	case <-timer.C:
+		return peekResult{}, false
+	}
+}
+
+func (b *responsesPreparedBody) recoveredUsage() (responsesUsage, bool) {
+	if b == nil || b.peekState == nil {
+		return responsesUsage{}, false
+	}
+	return b.peekState.recoveredUsageResult()
 }
 
 func (b *responsesPreparedBody) Read(p []byte) (int, error) {
@@ -183,12 +726,14 @@ func (b *responsesPreparedBody) Close() error {
 	return b.closeErr
 }
 
-func newResponsesPreparedStream(resp *http.Response, maxPeekBytes int) *responsesPreparedStream {
+func newResponsesPreparedStream(resp *http.Response, maxPeekBytes int, observeTerminal bool) *responsesPreparedStream {
 	pr, pw := io.Pipe()
 	peekDone := make(chan peekResult, 1)
 	peekState := newResponsesPeekState()
+	peekState.observeTerminal = observeTerminal
 	commitCh := make(chan struct{})
 	abortCh := make(chan struct{})
+	observeOnlyCh := make(chan struct{})
 	upstreamBody := resp.Body
 
 	var commitOnce sync.Once
@@ -205,19 +750,31 @@ func newResponsesPreparedStream(resp *http.Response, maxPeekBytes int) *response
 			_ = upstreamBody.Close()
 		})
 	}
+	var observeOnlyOnce sync.Once
+	observeOnly := func() {
+		observeOnlyOnce.Do(func() { close(observeOnlyCh) })
+	}
 
-	go runResponsesPeekPump(upstreamBody, pw, resp.Header, peekDone, peekState, commitCh, abortCh, maxPeekBytes)
+	go runResponsesPeekPump(upstreamBody, pw, resp.Header, peekDone, peekState, commitCh, abortCh, observeOnlyCh, maxPeekBytes)
 
 	return &responsesPreparedStream{
-		resp:      resp,
-		pr:        pr,
-		peekDone:  peekDone,
-		peekState: peekState,
-		commitCh:  commitCh,
-		abortCh:   abortCh,
-		commitFn:  commit,
-		abortFn:   abort,
+		resp:          resp,
+		pr:            pr,
+		peekDone:      peekDone,
+		peekState:     peekState,
+		commitCh:      commitCh,
+		abortCh:       abortCh,
+		commitFn:      commit,
+		abortFn:       abort,
+		observeOnlyFn: observeOnly,
 	}
+}
+
+func (s *responsesPreparedStream) stopTerminalObservation() {
+	if s == nil || s.peekState == nil || s.peekState.stopTerminalObservation == nil {
+		return
+	}
+	s.peekState.stopTerminalOnce.Do(func() { close(s.peekState.stopTerminalObservation) })
 }
 
 func (s *responsesPreparedStream) terminalResult() (peekResult, bool) {
@@ -225,6 +782,13 @@ func (s *responsesPreparedStream) terminalResult() (peekResult, bool) {
 		return peekResult{}, false
 	}
 	return s.peekState.terminalResult()
+}
+
+func isIndependentResponsesPeekOutcome(outcome responsesPeekReadOutcome) bool {
+	if outcome.err == nil || outcome.lifecycleCanceledAtFailure {
+		return false
+	}
+	return !errors.Is(outcome.err, context.Canceled) && !errors.Is(outcome.err, context.DeadlineExceeded)
 }
 
 func (s *responsesPreparedStream) awaitCancellationResolution(grace time.Duration) (peekResult, bool, responsesPeekReadOutcome, bool) {
@@ -298,7 +862,7 @@ func (s *responsesPreparedStream) await(waitCtx, retryCtx context.Context, peekT
 
 func (s *responsesPreparedStream) commitResponse() *http.Response {
 	s.commitFn()
-	s.resp.Body = &responsesPreparedBody{reader: s.pr, closeFn: s.abortFn}
+	s.resp.Body = &responsesPreparedBody{reader: s.pr, peekState: s.peekState, closeFn: s.abortFn, observeOnlyFn: s.observeOnlyFn}
 	return s.resp
 }
 
@@ -321,8 +885,15 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 		lifecycle = lifecycleHooks[0]
 	}
 
-	prepared := newResponsesPreparedStream(resp, maxPeekBytes)
+	prepared := newResponsesPreparedStream(resp, maxPeekBytes, true)
 	result, hasResult, awaitSource, err := prepared.await(r.Context(), upstreamCtx, peekTimeout)
+	// Inbound cancellation owns the downstream response even if the peek pump
+	// publishes a simultaneous passthrough decision. Do not race a 200 header
+	// against a client that has already gone away.
+	if r.Context().Err() != nil {
+		prepared.abort()
+		return
+	}
 	lifecycleCanceled := awaitSource != responsesPreparedAwaitInbound && upstreamCtx != nil && upstreamCtx.Err() != nil && errors.Is(context.Cause(upstreamCtx), errProxyLifecycleShutdown) && (err == nil || errors.Is(err, context.Canceled))
 	if err != nil && !lifecycleCanceled {
 		prepared.abort()
@@ -370,14 +941,30 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 		writeOpenAIErrorWithRetryAfter(w, result.status, result.message, result.errType, result.retryAfter, resp.Header)
 		return
 	}
+	if !(hasResult && result.terminal != nil) {
+		if terminal, ok := prepared.terminalResult(); ok {
+			terminal.decision = responsesPeekDecisionPassthrough
+			result, hasResult = terminal, true
+		}
+	}
+	if !(hasResult && result.terminal != nil) && lifecycle.transportCanceled != nil && lifecycle.transportCanceled() {
+		terminal, hasTerminal, _, _ := prepared.awaitCancellationResolution(responsesPeekCancellationGrace)
+		if hasTerminal {
+			terminal.decision = responsesPeekDecisionPassthrough
+			result, hasResult = terminal, true
+		} else {
+			prepared.abort()
+			lifecycle.suppressKnownTransportCancellation(false)
+			return
+		}
+	}
 	if hasResult && result.failure != nil && result.decision == responsesPeekDecisionPassthrough {
 		logResponsesPrecommitFailOpen(h, result.failure, model, resp.Header)
 	}
-	if !(hasResult && result.terminal != nil) && lifecycle.suppressTransportCancellation(false) {
-		prepared.abort()
-		return
-	}
-
+	// The committed HTTP path has its own bounded failure tap. Stop the
+	// speculative observer here so large response.completed payloads are not
+	// buffered twice for the remainder of the stream.
+	prepared.stopTerminalObservation()
 	resp = prepared.commitResponse()
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(http.StatusOK)
@@ -389,24 +976,46 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 }
 
 func prepareResponsesStreamAttempt(waitCtx, streamCtx context.Context, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
+	return prepareResponsesStreamAttemptWithGrace(waitCtx, streamCtx, responsesPeekCancellationGrace, request)
+}
+
+func prepareResponsesStreamAttemptWithGrace(waitCtx, streamCtx context.Context, cancellationGrace time.Duration, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
 	resp, err := request()
 	if err != nil || resp == nil || resp.StatusCode != http.StatusOK {
 		return resp, nil, nil, err
 	}
 
-	prepared := newResponsesPreparedStream(resp, responsesPrecommitMaxPeekBytes)
-	result, hasResult, _, err := prepared.await(waitCtx, streamCtx, responsesPrecommitPeekTimeout)
+	prepared := newResponsesPreparedStream(resp, responsesPrecommitMaxPeekBytes, true)
+	result, hasResult, awaitSource, err := prepared.await(waitCtx, streamCtx, responsesPrecommitPeekTimeout)
 	if err != nil {
+		terminal, hasTerminal, outcome, hasOutcome := prepared.awaitCancellationResolution(cancellationGrace)
+		if hasTerminal {
+			terminal.decision = responsesPeekDecisionPassthrough
+			if awaitSource == responsesPreparedAwaitInbound {
+				prepared.abort()
+				return nil, &terminal, resp.Header.Clone(), nil
+			}
+			// Upstream timeout/shutdown lost the await race to an authoritative
+			// terminal event. Commit the prepared body so the websocket bridge can
+			// forward the original bytes and run normal session finalization.
+			return prepared.commitResponse(), &terminal, nil, nil
+		}
+		if hasOutcome && isIndependentResponsesPeekOutcome(outcome) {
+			// The upstream body independently reached EOF or a transport reset while
+			// cancellation was winning the await race. Preserve that provider outcome
+			// on the prepared body instead of replacing it with local cancellation.
+			return prepared.commitResponse(), nil, nil, nil
+		}
 		prepared.abort()
 		return nil, nil, nil, err
 	}
 	if streamCtx != nil && streamCtx.Err() != nil && errors.Is(context.Cause(streamCtx), errProxyLifecycleShutdown) && !(hasResult && result.terminal != nil) {
-		terminal, hasTerminal, outcome, hasOutcome := prepared.awaitCancellationResolution(responsesPeekCancellationGrace)
+		terminal, hasTerminal, outcome, hasOutcome := prepared.awaitCancellationResolution(cancellationGrace)
 		switch {
 		case hasTerminal:
 			terminal.decision = responsesPeekDecisionPassthrough
 			result, hasResult = terminal, true
-		case hasOutcome && !outcome.lifecycleCanceledAtFailure:
+		case hasOutcome && isIndependentResponsesPeekOutcome(outcome):
 			// Preserve the independently-ended prepared stream; handleCreateRequest
 			// will classify it after consuming the pipe.
 		case hasOutcome && outcome.lifecycleCanceledAtFailure:
@@ -428,7 +1037,11 @@ func prepareResponsesStreamAttempt(waitCtx, streamCtx context.Context, request f
 }
 
 func (h *ProxyHandler) prepareResponsesStream(waitCtx, streamCtx context.Context, model string, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
-	resp, result, translatedHeaders, err := prepareResponsesStreamAttempt(waitCtx, streamCtx, request)
+	return h.prepareResponsesStreamWithGrace(waitCtx, streamCtx, model, responsesPeekCancellationGrace, request)
+}
+
+func (h *ProxyHandler) prepareResponsesStreamWithGrace(waitCtx, streamCtx context.Context, model string, cancellationGrace time.Duration, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
+	resp, result, translatedHeaders, err := prepareResponsesStreamAttemptWithGrace(waitCtx, streamCtx, cancellationGrace, request)
 	if err != nil || result == nil {
 		return resp, nil, nil, err
 	}
@@ -436,18 +1049,25 @@ func (h *ProxyHandler) prepareResponsesStream(waitCtx, streamCtx context.Context
 		logResponsesPrecommitTranslated(h, *result, model, translatedHeaders)
 		return nil, result, translatedHeaders, nil
 	}
-	if result.failure != nil && resp != nil {
-		logResponsesPrecommitFailOpen(h, result.failure, model, resp.Header)
+	headers := translatedHeaders
+	if resp != nil {
+		headers = resp.Header
 	}
-	if result.terminal != nil && resp != nil {
-		return resp, result, nil, nil
+	if result.failure != nil {
+		logResponsesPrecommitFailOpen(h, result.failure, model, headers)
+	}
+	if result.terminal != nil {
+		// A cancellation race can salvage an authoritative terminal event after the
+		// prepared response has already been aborted. Propagate it even without resp
+		// so the production websocket wrapper can retain terminal accounting.
+		return resp, result, translatedHeaders, nil
 	}
 	return resp, nil, nil, nil
 }
 
-func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.Header, peekDone chan<- peekResult, peekState *responsesPeekState, commitCh, abortCh <-chan struct{}, maxPeekBytes int) {
+func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.Header, peekDone chan<- peekResult, peekState *responsesPeekState, commitCh, abortCh, observeOnlyCh <-chan struct{}, maxPeekBytes int) {
 	chunkCh := make(chan responsesPeekChunk, 1)
-	go readResponsesPeekChunks(body, chunkCh, abortCh)
+	go readResponsesPeekChunks(body, chunkCh, abortCh, observeOnlyCh, headers, peekState)
 
 	parser := responsesSSEParser{allowBOM: true}
 	var prefix bytes.Buffer
@@ -538,6 +1158,10 @@ func inspectResponsesPeekMessages(parser *responsesSSEParser, headers http.Heade
 		if !ok {
 			break
 		}
+		if strings.TrimSpace(msg.data) == "[DONE]" {
+			parser.done = true
+			break
+		}
 		classified := classifyResponsesPeekMessage(msg, headers)
 		peekState.publishTerminal(classified)
 		if !sawSemantic {
@@ -548,28 +1172,54 @@ func inspectResponsesPeekMessages(parser *responsesSSEParser, headers http.Heade
 	return result, sawSemantic
 }
 
-func readResponsesPeekChunks(body io.ReadCloser, chunkCh chan<- responsesPeekChunk, abortCh <-chan struct{}) {
+func readResponsesPeekChunks(body io.ReadCloser, chunkCh chan<- responsesPeekChunk, abortCh, observeOnlyCh <-chan struct{}, headers http.Header, peekState *responsesPeekState) {
 	defer close(chunkCh)
 
 	buf := make([]byte, responsesPeekReadChunkSize)
+	var terminalObserver *responsesTerminalObserver
+	if peekState == nil || peekState.observeTerminal {
+		terminalObserver = newResponsesTerminalObserver(headers, peekState)
+	}
+	observeOnly := false
 	for {
 		n, err := body.Read(buf)
 		if n > 0 {
 			chunk := append([]byte(nil), buf[:n]...)
-			select {
-			case chunkCh <- responsesPeekChunk{data: chunk}:
-			case <-abortCh:
-				return
+			if terminalObserver != nil && peekState != nil && peekState.stopTerminalObservation != nil {
+				select {
+				case <-peekState.stopTerminalObservation:
+					terminalObserver = nil
+				default:
+				}
+			}
+			if terminalObserver != nil {
+				terminalObserver.Write(chunk)
+			}
+			if !observeOnly {
+				select {
+				case chunkCh <- responsesPeekChunk{data: chunk}:
+				case <-observeOnlyCh:
+					observeOnly = true
+				case <-abortCh:
+					return
+				}
 			}
 		}
 		if err != nil {
+			if errors.Is(err, io.EOF) && terminalObserver != nil {
+				terminalObserver.FinalizeEOF()
+			}
 			lifecycleCanceledAtFailure := false
 			if observer, ok := body.(interface{ canceledAtFailure() bool }); ok {
 				lifecycleCanceledAtFailure = observer.canceledAtFailure()
 			}
-			select {
-			case chunkCh <- responsesPeekChunk{err: err, lifecycleCanceledAtFailure: lifecycleCanceledAtFailure}:
-			case <-abortCh:
+			peekState.publishOutcome(responsesPeekReadOutcome{err: err, lifecycleCanceledAtFailure: lifecycleCanceledAtFailure})
+			if !observeOnly {
+				select {
+				case chunkCh <- responsesPeekChunk{err: err, lifecycleCanceledAtFailure: lifecycleCanceledAtFailure}:
+				case <-observeOnlyCh:
+				case <-abortCh:
+				}
 			}
 			return
 		}
@@ -622,16 +1272,21 @@ func writePrefixAndDrainResponsesStream(pw *io.PipeWriter, prefix []byte, chunkC
 }
 
 func classifyResponsesPeekMessage(msg responsesSSEMessage, headers http.Header) peekResult {
-	result := peekResult{decision: responsesPeekDecisionPassthrough}
-	eventName := strings.TrimSpace(msg.event)
 	event, err := parseResponsesStreamEvent(msg.data)
 	if err != nil {
-		return result
+		return peekResult{decision: responsesPeekDecisionPassthrough}
 	}
+	return classifyResponsesPeekEvent(event, msg.event, headers)
+}
+
+func classifyResponsesPeekEvent(event responsesWebSocketStreamEvent, eventName string, headers http.Header) peekResult {
+	result := peekResult{decision: responsesPeekDecisionPassthrough}
+	eventName = strings.TrimSpace(eventName)
 	terminalType := strings.TrimSpace(event.Type)
 	if terminalType == "" {
 		terminalType = eventName
 	}
+	event.Type = terminalType
 	switch terminalType {
 	case "response.completed", "response.failed", "response.incomplete":
 		terminal := event
@@ -866,6 +1521,9 @@ func (p *responsesSSEParser) push(chunk []byte) {
 }
 
 func (p *responsesSSEParser) nextSemantic() (responsesSSEMessage, bool) {
+	if p.done {
+		return responsesSSEMessage{}, false
+	}
 	for {
 		msg, consumed, incomplete := nextResponsesSSEMessage(p.pending, p.allowBOM)
 		if incomplete {
@@ -935,31 +1593,29 @@ func nextResponsesSSEMessage(buf []byte, allowBOM bool) (responsesSSEMessage, in
 }
 
 type responsesFailureTap struct {
-	h               *ProxyHandler
-	upstreamHeaders http.Header
-	ctx             context.Context
-	store           *ToolExecutionContextStore
-	scope           string
-	responseScope   string
-	parser          responsesSSEParser
-	// overflowed is set once a single SSE event has exceeded the buffer cap, so
-	// later writes keep best-effort sniffing usage from the rolling tail (the
-	// event's framing is unrecoverable once dropped, so the normal dispatch path
-	// cannot parse it).
+	h                   *ProxyHandler
+	upstreamHeaders     http.Header
+	ctx                 context.Context
+	store               *ToolExecutionContextStore
+	scope               string
+	responseScope       string
+	parser              responsesSSEParser
+	pendingBoundaryTail []byte
+	// overflowed is set while a single SSE event has exceeded the buffer cap, so
+	// later writes keep best-effort extracting terminal details from the rolling
+	// tail after the normal parser buffer is dropped.
 	overflowed bool
 	// overflowActive remains true while forwarding the rest of an overflowed event.
-	// It is cleared once that event's blank-line boundary is observed.
+	// It is cleared only after that event's explicit blank-line boundary is seen.
 	overflowActive bool
-	// overflowCompletedEvent is set when the overflowed event appears to be a
-	// response.completed terminal event, either from its event/type prefix or from
-	// the terminal usage object recovered near the tail.
-	overflowCompletedEvent bool
-	overflowBoundaryTail   []byte
-	// overflowUsageRecorded is set once usage has been recovered from an
-	// overflowed event, to avoid redundant re-sniffing on every subsequent write.
+	// overflowEvent retains the terminal type plus bounded usage/failure details
+	// recovered from the prefix before overflow and the rolling tail afterward.
+	overflowEvent        responsesWebSocketStreamEvent
+	overflowBoundaryTail []byte
+	// overflowUsageRecorded avoids re-observing the same partial usage on every
+	// subsequent write while the oversized event is still in flight.
 	overflowUsageRecorded bool
-	// usageTail is a bounded rolling window of the most recent raw stream bytes,
-	// used to recover usage from an oversized streamed response.completed event.
+	// usageTail is a bounded rolling window of the most recent raw stream bytes.
 	usageTail []byte
 	// terminalSeen is set after a parsed terminal Responses event. A clean EOF
 	// before response.completed/failed/incomplete means the committed stream was
@@ -982,52 +1638,108 @@ func newResponsesFailureTap(ctx context.Context, h *ProxyHandler, upstreamHeader
 }
 
 func (t *responsesFailureTap) Write(p []byte) (int, error) {
-	// Maintain a small rolling tail of the raw byte stream, independent of the SSE
-	// parser's pending buffer, so usage can be recovered from a very large streamed
-	// response.completed event even after the parser truncates/clears its buffer
-	// (the giant event's framing is corrupted once it overflows, so the normal
-	// dispatch path cannot parse it). usage sits near the end of the event, so a
-	// bounded tail of recent bytes is enough to capture the "usage":{...} object.
-	t.appendUsageTail(p)
-
-	t.parser.push(p)
-	if t.overflowActive {
-		t.observeOverflowBoundary(p)
+	total := len(p)
+	const maxChunk = responsesFailureTapOverflowTail
+	for len(p) > 0 {
+		chunkSize := min(len(p), maxChunk)
+		t.writeChunk(p[:chunkSize])
+		p = p[chunkSize:]
 	}
+	return total, nil
+}
+
+func (t *responsesFailureTap) writeChunk(p []byte) {
+	if len(p) == 0 {
+		return
+	}
+	if t.overflowActive {
+		if remaining := t.consumeOverflowChunk(p); len(remaining) > 0 {
+			t.writeChunk(remaining)
+		}
+		return
+	}
+
+	// Maintain a small rolling tail independent of the SSE parser so terminal
+	// type, failure details, and usage can be recovered after an oversized event
+	// forces the normal parser buffer to be dropped.
+	t.appendUsageTail(p)
+	t.parser.push(p)
+
+	combinedBoundary := append(append([]byte(nil), t.pendingBoundaryTail...), p...)
+	if responsesSSEBoundaryEnd(combinedBoundary) == 0 {
+		if len(t.parser.pending) > responsesFailureTapMaxBuffer {
+			t.startOverflowFromPending()
+			return
+		}
+		t.pendingBoundaryTail = trailingBytes(combinedBoundary, 3)
+		return
+	}
+
 	for {
-		msg, ok := t.parser.nextSemantic()
-		if !ok {
+		boundaryEnd := responsesSSEBoundaryEnd(t.parser.pending)
+		if boundaryEnd == 0 {
 			break
 		}
-		t.maybeProcess(msg)
-	}
-	if t.overflowed {
-		t.sniffUsageFromOverflow(t.usageTail)
-	}
-	if len(t.parser.pending) > responsesFailureTapMaxBuffer {
-		// The event exceeds the buffer (a very large response.completed whose
-		// delimiter has not arrived). Sniff usage from the rolling tail, then drop
-		// the parser buffer (its framing is unrecoverable) and flag overflow so
-		// later writes keep sniffing the tail.
-		t.overflowed = true
-		t.overflowActive = true
-		if responsesOverflowLooksCompleted(t.parser.pending) {
-			t.overflowCompletedEvent = true
+		if boundaryEnd > responsesFailureTapMaxBuffer {
+			// The first complete event itself exceeds the supported parser limit.
+			// Recover usage from that event only, discard its unvalidated status,
+			// then continue parsing any following event bytes from the same write.
+			overflowEvent := append([]byte(nil), t.parser.pending[:boundaryEnd]...)
+			remainder := append([]byte(nil), t.parser.pending[boundaryEnd:]...)
+			t.overflowed = true
+			t.overflowActive = true
+			t.usageTail = trailingBytes(overflowEvent, responsesFailureTapOverflowTail)
+			t.rememberOverflowEvent(overflowEvent)
+			t.sniffUsageFromOverflow(t.usageTail)
+			t.finishOverflowEvent()
+			t.parser.pending = nil
+			t.parser.allowBOM = false
+			t.pendingBoundaryTail = nil
+			if len(remainder) > 0 {
+				t.writeChunk(remainder)
+			}
+			return
 		}
-		t.overflowBoundaryTail = trailingBytes(t.parser.pending, 3)
-		t.sniffUsageFromOverflow(t.usageTail)
-		t.parser.pending = nil
+
+		msg, consumed, incomplete := nextResponsesSSEMessage(t.parser.pending, t.parser.allowBOM)
+		if incomplete {
+			break
+		}
 		t.parser.allowBOM = false
+		t.parser.pending = t.parser.pending[consumed:]
+		if msg.semantic {
+			t.maybeProcess(msg)
+		}
+		t.usageTail = trailingBytes(t.parser.pending, responsesFailureTapOverflowTail)
 	}
-	return len(p), nil
+
+	if len(t.parser.pending) > responsesFailureTapMaxBuffer {
+		t.startOverflowFromPending()
+		return
+	}
+	t.pendingBoundaryTail = trailingBytes(t.parser.pending, 3)
+
+}
+
+func (t *responsesFailureTap) startOverflowFromPending() {
+	if t == nil || len(t.parser.pending) == 0 {
+		return
+	}
+	// The current event exceeded the limit before its delimiter arrived. Retain
+	// only bounded usage hints and let later writes locate the boundary.
+	t.overflowed = true
+	t.overflowActive = true
+	t.rememberOverflowEvent(t.parser.pending)
+	t.overflowBoundaryTail = trailingBytes(t.parser.pending, 3)
+	t.sniffUsageFromOverflow(t.usageTail)
+	t.parser.pending = nil
+	t.parser.allowBOM = false
+	t.pendingBoundaryTail = nil
 }
 
 // appendUsageTail keeps the last responsesFailureTapOverflowTail bytes of the raw
 // stream in t.usageTail for best-effort usage recovery from oversized events.
 func (t *responsesFailureTap) appendUsageTail(p []byte) {
-	if t.overflowUsageRecorded {
-		return
-	}
 	t.usageTail = append(t.usageTail, p...)
 	if len(t.usageTail) > responsesFailureTapOverflowTail {
 		t.usageTail = t.usageTail[len(t.usageTail)-responsesFailureTapOverflowTail:]
@@ -1040,26 +1752,99 @@ func (t *responsesFailureTap) appendUsageTail(p []byte) {
 // after its output) and records it. It runs once per turn — once usage is
 // observed onto the summary, a later real terminal event would just re-observe
 // the same value. Best-effort: any parse failure is ignored.
-func (t *responsesFailureTap) sniffUsageFromOverflow(buf []byte) {
-	if t.overflowUsageRecorded {
+func (t *responsesFailureTap) rememberOverflowEvent(buf []byte) {
+	if t == nil {
 		return
 	}
-	if usage, ok := extractResponsesUsageObject(buf); ok {
-		observeResponsesUsage(t.ctx, usage)
-		t.overflowUsageRecorded = true
-		t.overflowCompletedEvent = true
-	}
+	updateResponsesTerminalEvent(&t.overflowEvent, t.overflowEvent.Type, buf)
 }
 
-func (t *responsesFailureTap) observeOverflowBoundary(p []byte) {
-	if t == nil || !t.overflowActive {
+func (t *responsesFailureTap) sniffUsageFromOverflow(buf []byte) {
+	if t == nil {
 		return
 	}
-	combined := append(append([]byte(nil), t.overflowBoundaryTail...), p...)
-	if bytes.Contains(combined, []byte("\n\n")) || bytes.Contains(combined, []byte("\r\n\r\n")) {
-		t.overflowActive = false
+	t.rememberOverflowEvent(buf)
+	if t.overflowUsageRecorded || !isResponsesTerminalType(t.overflowEvent.Type) {
+		return
 	}
-	t.overflowBoundaryTail = trailingBytes(combined, 3)
+	usage := t.overflowEvent.Response.Usage
+	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
+		return
+	}
+	observeResponsesUsage(t.ctx, usage)
+	t.overflowUsageRecorded = true
+}
+
+func (t *responsesFailureTap) finishOverflowEvent() {
+	if t == nil {
+		return
+	}
+	t.rememberOverflowEvent(t.usageTail)
+	// HTTP is a passthrough surface: an explicit, bounded SSE event name plus its
+	// blank-line boundary is authoritative framing even when the JSON body is too
+	// large for accounting inspection. Do not synthesize detailed provider status
+	// from fragments; completed remains successful, while failed/incomplete retain
+	// a conservative 502 plus best-effort usage.
+	switch t.overflowEvent.Type {
+	case "response.completed":
+		t.terminalSeen = true
+	case "response.failed", "response.incomplete":
+		t.terminalSeen = true
+		observeResponseFailureStatus(t.ctx, http.StatusBadGateway)
+	}
+	t.overflowed = false
+	t.overflowActive = false
+	t.overflowEvent = responsesWebSocketStreamEvent{}
+	t.overflowBoundaryTail = nil
+	t.overflowUsageRecorded = false
+	t.usageTail = nil
+}
+
+func (t *responsesFailureTap) consumeOverflowChunk(p []byte) []byte {
+	if t == nil || !t.overflowActive || len(p) == 0 {
+		return p
+	}
+	combined := append(append([]byte(nil), t.overflowBoundaryTail...), p...)
+	boundaryEnd := responsesSSEBoundaryEnd(combined)
+	if boundaryEnd == 0 {
+		t.appendUsageTail(p)
+		t.rememberOverflowEvent(t.usageTail)
+		t.sniffUsageFromOverflow(t.usageTail)
+		t.overflowBoundaryTail = trailingBytes(combined, 3)
+		return nil
+	}
+
+	eventBytes := boundaryEnd - len(t.overflowBoundaryTail)
+	if eventBytes < 0 {
+		eventBytes = 0
+	}
+	if eventBytes > len(p) {
+		eventBytes = len(p)
+	}
+	if eventBytes > 0 {
+		t.appendUsageTail(p[:eventBytes])
+	}
+	t.rememberOverflowEvent(t.usageTail)
+	t.sniffUsageFromOverflow(t.usageTail)
+	t.finishOverflowEvent()
+	return p[eventBytes:]
+}
+
+func responsesSSEBoundaryEnd(buf []byte) int {
+	for i := 0; i < len(buf); i++ {
+		if buf[i] != '\n' || i+1 >= len(buf) {
+			continue
+		}
+		switch buf[i+1] {
+		case '\n':
+			return i + 2
+		case '\r':
+			if i+2 < len(buf) && buf[i+2] == '\n' {
+				return i + 3
+			}
+		}
+	}
+	return 0
 }
 
 func trailingBytes(buf []byte, n int) []byte {
@@ -1070,13 +1855,6 @@ func trailingBytes(buf []byte, n int) []byte {
 		buf = buf[len(buf)-n:]
 	}
 	return append([]byte(nil), buf...)
-}
-
-func responsesOverflowLooksCompleted(buf []byte) bool {
-	return bytes.Contains(buf, []byte("event: response.completed")) ||
-		bytes.Contains(buf, []byte("event:response.completed")) ||
-		bytes.Contains(buf, []byte(`"type":"response.completed"`)) ||
-		bytes.Contains(buf, []byte(`"type": "response.completed"`))
 }
 
 func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
@@ -1120,10 +1898,10 @@ func (t *responsesFailureTap) completedCleanly() bool {
 	if t == nil {
 		return true
 	}
-	// If a giant response.completed event overflowed the bounded parser, treat it
-	// as complete only after that overflowed event's blank-line boundary is seen.
-	// Non-overflowing streams still require a parsed terminal event.
-	return t.terminalSeen || (t.overflowCompletedEvent && !t.overflowActive)
+	// Oversized terminals become authoritative only after finishOverflowEvent sees
+	// their explicit blank-line boundary and routes the retained event through the
+	// normal terminal classifier.
+	return t.terminalSeen
 }
 
 func (t *responsesFailureTap) maybeCaptureToolCommand(eventName string, event responsesWebSocketStreamEvent) {
