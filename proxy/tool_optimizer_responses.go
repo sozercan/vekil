@@ -232,6 +232,9 @@ func (h *ProxyHandler) maybeRewriteResponsesResponseBody(ctx context.Context, bo
 	if err := json.Unmarshal(rawOutput, &outputItems); err != nil {
 		return bodyBytes, false
 	}
+	turnCtx, cancel := h.withToolOptimizerStageContext(ctx, manager, toolOptimizerStageCommandRewrite)
+	defer cancel()
+	ctx = turnCtx
 	responseScope := toolExecutionScopeFromResponsePayload(payload)
 	captureScopes := uniqueToolExecutionScopes(scope, responseScope)
 	changed := false
@@ -330,6 +333,9 @@ func (h *ProxyHandler) maybeReduceResponsesToolOutputsInRequestBody(ctx context.
 	if err := json.Unmarshal(rawInput, &inputItems); err != nil {
 		return bodyBytes, 0
 	}
+	turnCtx, cancel := h.withToolOptimizerStageContext(ctx, manager, toolOptimizerStageOutputReduce)
+	defer cancel()
+	ctx = turnCtx
 
 	localContexts := make(map[string]ToolExecutionContext)
 	changedCount := 0
@@ -408,10 +414,6 @@ func (h *ProxyHandler) maybeReduceResponsesToolOutputsInRequestBody(ctx context.
 		return bodyBytes, 0
 	}
 	return rewritten, changedCount
-}
-
-func (h *ProxyHandler) rewriteResponsesRequestBodyWithToolOptimizers(ctx context.Context, bodyBytes []byte, endpoint string, injectResumePrompt bool, store *ToolExecutionContextStore, scope string) []byte {
-	return h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, bodyBytes, extractResponsesRequestModel(bodyBytes), endpoint, injectResumePrompt, store, scope)
 }
 
 func (h *ProxyHandler) rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx context.Context, bodyBytes []byte, requestedModel string, endpoint string, injectResumePrompt bool, store *ToolExecutionContextStore, scope string) []byte {

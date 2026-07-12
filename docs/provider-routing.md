@@ -14,11 +14,15 @@ Plain `vekil login` refreshes an existing Vekil-managed login when possible, oth
 
 After `vekil logout` or menubar Sign Out, Vekil clears its cached credentials, disables GitHub CLI auto sign-in, and suppresses automatic GitHub CLI reuse until you explicitly opt back in with `vekil login --github-cli` or `vekil login --gh`. `COPILOT_GITHUB_TOKEN` remains an explicit override and still works while signed out.
 
+Concurrent Copilot-token refresh callers share one refresh attempt, but each caller still honors its own context deadline. The same rule applies to callers waiting for an interactive device flow.
+
 ### OpenAI Codex
 
 OpenAI Codex uses the ChatGPT/Codex CLI credentials in `~/.codex/auth.json` by default. Set `CODEX_HOME` if your Codex home lives elsewhere.
 
 OpenAI Codex requires file-based ChatGPT auth from `codex login`; API-key auth and OS keychain-backed credentials are not read by the proxy.
+
+Concurrent refresh callers share one token refresh while retaining independent deadlines. On POSIX systems, Vekil persists rotated tokens back to the authoritative `auth.json` through a mode-`0600` `.vekil-cache` transaction journal: the journal is synced before the in-place auth update, removed only after the updated file is synced, and used to recover interrupted writes. Source-digest and inode checks keep an atomic external `codex login` replacement authoritative. On Windows, Vekil reads fresh `auth.json` credentials but does not perform token refresh; run `codex login` when the file becomes stale until equivalent secure journal and atomic-update semantics are available.
 
 ### Azure OpenAI and Microsoft Foundry
 
@@ -30,6 +34,8 @@ Azure providers support two auth modes:
 For Entra auth, `token_scope` is optional and defaults to `https://ai.azure.com/.default`, which is appropriate for Microsoft Foundry OpenAI-compatible endpoints. Override it if your resource requires a different Azure audience, such as `https://cognitiveservices.azure.com/.default` for classic Azure OpenAI deployments.
 
 Vekil does not run `az login` for you. For local development, sign in with Azure CLI or another credential supported by `DefaultAzureCredential`; in hosted environments, use managed identity, workload identity, or environment credentials. The signed-in principal needs the required Azure RBAC role, for example Cognitive Services OpenAI User on the target resource.
+
+Entra token refreshes are shared across concurrent requests; waiters can time out or cancel without waiting for the leader refresh to finish.
 
 ### Generic Providers
 
@@ -45,6 +51,8 @@ When `auth_type` is omitted, Vekil uses `bearer` if `api_key` or `api_key_env` i
 ## Provider Routing
 
 Use `--providers-config` when you want explicit ownership of public model IDs across providers such as GitHub Copilot, Azure OpenAI, OpenAI Codex, or generic OpenAI-compatible and Anthropic-compatible upstreams. Provider config files can be JSON (`.json`) or YAML (`.yaml`/`.yml`).
+
+Provider config decoding is strict. Unknown top-level fields and unknown fields in provider or `models[]` objects are rejected so typos do not silently change routing. A JSON file must contain exactly one value, and a YAML file must contain exactly one document.
 
 You can run Azure-only or Codex-only configs, or mix those providers with Copilot behind the same local endpoint.
 
@@ -127,6 +135,8 @@ OpenAI-compatible providers route `POST /v1/chat/completions` to `chat_completio
 Anthropic-compatible providers directly forward Anthropic `POST /v1/messages` to `messages_path`. They do not serve OpenAI Chat Completions or Responses routes.
 
 `model_discovery` can be `static`, `openai`, `ollama`, or `openrouter-tools`. OpenAI discovery reads an OpenAI-style `data` array. Ollama discovery reads `/api/tags`. OpenRouter-tools discovery reads an OpenAI/OpenRouter-style `data` array and exposes only models that advertise tool parameters.
+
+Successful decoded dynamic model catalogs are capped at 4 MiB before JSON decoding. Oversized Copilot, Codex, or generic catalogs fail without updating routing/cache state; an oversized optional Azure metadata overlay falls back to the configured static catalog. Concurrent requests for the same `/v1/models` query variant share one upstream refresh, and failed canonical refreshes briefly back off for one second while stale canonical data remains available.
 
 ### Generic Provider Field Reference
 
@@ -298,6 +308,7 @@ Routing rules:
 - Clients keep using plain model IDs such as `gpt-5.4-pro`.
 - Azure `deployment` is the upstream model name; the proxy rewrites the public ID before forwarding.
 - Azure `models[]` remains the routing source of truth. The proxy does not autodiscover new Azure deployments for inference.
+- Azure is treated as a static provider for `/readyz`: readiness does not depend on Azure's optional `/models` endpoint. `GET /v1/models` may still probe Azure `/models` for best-effort metadata enrichment.
 - OpenAI Codex discovers models dynamically from its upstream `/models` endpoint and exposes only models that are listed and supported in the API.
 - OpenAI Codex models are `/responses`-only. The proxy rejects `/chat/completions` for those models instead of probing an unsupported route.
 - Azure `auth_mode` is optional and defaults to `api_key`. Supported values are `api_key` and `azure_identity`.
@@ -311,6 +322,9 @@ Routing rules:
 - Public model IDs are global across all providers. Startup fails if two providers expose the same ID.
 - `include_models` is the recommended way to use dynamic providers without prefixes. It lets you opt into only the discovered model IDs that should belong to that provider.
 - `exclude_models` lets one provider give ownership of a public ID to another provider.
+- Configuring `include_models` or `exclude_models` on a dynamic provider forces canonical model discovery during initialization, even when it is the only provider; initialization fails if that discovery fails. When discovery is explicitly deferred, `/readyz` remains not ready until `ValidateDynamicProviderModels` completes.
+- Unknown-model passthrough is available only on unfiltered dynamic providers. Once `include_models` or `exclude_models` is configured, a request must resolve to a model retained in that provider's canonical discovered catalog or it fails locally with `400`.
+- Only a queryless canonical `/v1/models` build may refresh global dynamic model ownership. If the first caller request has a query string, the proxy performs and caches an internal queryless canonical build before returning the query-specific variant; the variant itself never replaces routing state.
 - Only one Copilot provider is supported in a config today.
 - For Copilot-discovered models, Codex-compatible `/v1/models` metadata treats `capabilities.limits.max_prompt_tokens` as the active `context_window` and keeps `max_context_window_tokens` as `max_context_window`. If Copilot omits the prompt cap, the proxy falls back to the total context window.
 - `models[].endpoints` is an allowlist, not a guess. Keep it limited to the routes you have validated for that deployment.

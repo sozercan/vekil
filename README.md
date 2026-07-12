@@ -33,7 +33,8 @@ Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Az
 Grab a binary from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest), or run the container from GHCR:
 
 ```bash
-docker run -p 1337:1337 \
+mkdir -p ~/.config/vekil
+docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot -p 1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   ghcr.io/sozercan/vekil:latest
 ```

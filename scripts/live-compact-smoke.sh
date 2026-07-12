@@ -21,11 +21,72 @@ ORIGINAL_HOME="${HOME}"
 
 PROXY_BIN="${PROXY_BIN:-${REPO_ROOT}/vekil}"
 PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
-PROXY_PORT="${PROXY_PORT:-1337}"
-PROXY_BASE_URL="http://${PROXY_HOST}:${PROXY_PORT}"
 START_PROXY="${START_PROXY:-1}"
+SMOKE_STARTUP_TIMEOUT_SECONDS="${SMOKE_STARTUP_TIMEOUT_SECONDS:-120}"
+SMOKE_CURL_CONNECT_TIMEOUT_SECONDS="${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS:-5}"
+SMOKE_CURL_MAX_TIME_SECONDS="${SMOKE_CURL_MAX_TIME_SECONDS:-180}"
+SMOKE_READINESS_REQUEST_MAX_TIME_SECONDS="${SMOKE_READINESS_REQUEST_MAX_TIME_SECONDS:-5}"
+SMOKE_PROCESS_TERM_GRACE_SECONDS="${SMOKE_PROCESS_TERM_GRACE_SECONDS:-5}"
+SMOKE_PORT_RELEASE_TIMEOUT_SECONDS="${SMOKE_PORT_RELEASE_TIMEOUT_SECONDS:-5}"
+
+python_command() {
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return
+  fi
+  if command -v python >/dev/null 2>&1; then
+    command -v python
+    return
+  fi
+  die "python3 (or python) is required to allocate and verify an isolated smoke port"
+}
+
+connect_host() {
+  case "${PROXY_HOST}" in
+    0.0.0.0) printf '127.0.0.1\n' ;;
+    ::|\[::\]) printf '::1\n' ;;
+    *) printf '%s\n' "${PROXY_HOST}" ;;
+  esac
+}
+
+allocate_free_port() {
+  local python_bin host
+  python_bin="$(python_command)"
+  host="$(connect_host)"
+  "${python_bin}" - "${host}" <<'PY_PORT'
+import socket
+import sys
+
+host = sys.argv[1]
+family = socket.AF_INET6 if ":" in host else socket.AF_INET
+for _ in range(20):
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        port = sock.getsockname()[1]
+    if port != 1337:
+        print(port)
+        raise SystemExit(0)
+raise SystemExit("unable to allocate a non-default port")
+PY_PORT
+}
+
+proxy_port_was_set=0
+if [[ ${PROXY_PORT+x} == x ]]; then
+  proxy_port_was_set=1
+fi
+if [[ "${START_PROXY}" == "1" && "${proxy_port_was_set}" == "0" ]]; then
+  PROXY_PORT="$(allocate_free_port)"
+elif [[ "${proxy_port_was_set}" == "0" ]]; then
+  PROXY_PORT=1337
+fi
+[[ "${PROXY_PORT}" =~ ^[0-9]+$ ]] || die "PROXY_PORT must be numeric: ${PROXY_PORT}"
+
+PROXY_BASE_URL="http://${PROXY_HOST}:${PROXY_PORT}"
 TMP_PARENT="${LIVE_COMPACT_SMOKE_TMP_PARENT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
 SMOKE_DIR="${LIVE_COMPACT_SMOKE_DIR:-$(mktemp -d "${TMP_PARENT%/}/live-compact-smoke.XXXXXX")}"
+if [[ "${SMOKE_DIR}" != /* ]]; then
+  SMOKE_DIR="${PWD}/${SMOKE_DIR}"
+fi
 PROXY_LOG="${SMOKE_DIR}/proxy.log"
 MODELS_JSON="${SMOKE_DIR}/models.json"
 COMPACT_REQUEST_JSON="${SMOKE_DIR}/compact-request.json"
@@ -42,15 +103,94 @@ else
 fi
 
 proxy_pid=""
+proxy_pgid=""
+proxy_listen_confirmed=0
 
-cleanup() {
-  if [[ -n "${proxy_pid}" ]] && kill -0 "${proxy_pid}" 2>/dev/null; then
-    kill "${proxy_pid}" 2>/dev/null || true
-    wait "${proxy_pid}" 2>/dev/null || true
+process_is_running() {
+  local pid="$1"
+  local state
+  kill -0 "${pid}" 2>/dev/null || return 1
+  state="$(ps -o stat= -p "${pid}" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+  [[ "${state}" != Z* ]]
+}
+
+process_group_is_alive() {
+  local pgid="$1"
+  [[ -n "${pgid}" ]] || return 1
+  kill -0 -- "-${pgid}" 2>/dev/null
+}
+
+terminate_process_group() {
+  local pid="$1"
+  local pgid="$2"
+  local deadline
+  if process_group_is_alive "${pgid}"; then
+    kill -TERM -- "-${pgid}" 2>/dev/null || true
+    deadline=$((SECONDS + SMOKE_PROCESS_TERM_GRACE_SECONDS))
+    while process_group_is_alive "${pgid}" && (( SECONDS < deadline )); do
+      sleep 0.1
+    done
+    if process_group_is_alive "${pgid}"; then
+      kill -KILL -- "-${pgid}" 2>/dev/null || true
+    fi
+  elif [[ -n "${pid}" ]] && process_is_running "${pid}"; then
+    kill -TERM "${pid}" 2>/dev/null || true
+  fi
+  [[ -z "${pid}" ]] || wait "${pid}" 2>/dev/null || true
+}
+
+port_is_open() {
+  local python_bin host
+  python_bin="$(python_command)"
+  host="$(connect_host)"
+  "${python_bin}" - "${host}" "${PROXY_PORT}" <<'PY_CONNECT' >/dev/null 2>&1
+import socket
+import sys
+
+try:
+    with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=0.2):
+        pass
+except OSError:
+    raise SystemExit(1)
+PY_CONNECT
+}
+
+wait_for_port_release() {
+  local deadline=$((SECONDS + SMOKE_PORT_RELEASE_TIMEOUT_SECONDS))
+  while (( SECONDS < deadline )); do
+    if ! port_is_open; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  ! port_is_open
+}
+
+dump_proxy_log() {
+  if [[ -f "${PROXY_LOG}" ]]; then
+    log "Proxy log:"
+    cat "${PROXY_LOG}" >&2
   fi
 }
 
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM
+  if [[ -n "${proxy_pgid}" ]]; then
+    terminate_process_group "${proxy_pid}" "${proxy_pgid}"
+    proxy_pid=""
+    proxy_pgid=""
+  fi
+  if [[ "${proxy_listen_confirmed}" == "1" ]] && ! wait_for_port_release; then
+    printf 'error: proxy cleanup did not release %s:%s\n' "${PROXY_HOST}" "${PROXY_PORT}" >&2
+    rc=1
+  fi
+  exit "${rc}"
+}
+
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 seed_access_token() {
   if [[ -z "${COPILOT_GITHUB_TOKEN:-}" ]]; then
@@ -89,6 +229,7 @@ start_proxy() {
   seed_access_token
 
   log "Starting proxy at ${PROXY_BASE_URL}"
+  set -m
   "${PROXY_BIN}" \
     --host "${PROXY_HOST}" \
     --port "${PROXY_PORT}" \
@@ -96,27 +237,76 @@ start_proxy() {
     --log-level debug \
     >"${PROXY_LOG}" 2>&1 &
   proxy_pid="$!"
+  proxy_pgid="${proxy_pid}"
+  set +m
+}
+
+proxy_log_has_expected_listener() {
+  [[ -f "${PROXY_LOG}" ]] || return 1
+  jq -R -s -e --arg addr "${PROXY_HOST}:${PROXY_PORT}" '
+    [
+      split("\n")[]
+      | fromjson?
+      | select(.level == "info" and .msg == "vekil listening" and .addr == $addr)
+    ]
+    | length > 0
+  ' "${PROXY_LOG}" >/dev/null 2>&1
+}
+
+proxy_log_has_fatal() {
+  [[ -f "${PROXY_LOG}" ]] || return 1
+  jq -R -s -e '
+    [split("\n")[] | fromjson? | select(.level == "fatal")]
+    | length > 0
+  ' "${PROXY_LOG}" >/dev/null 2>&1
+}
+
+assert_spawned_proxy_alive() {
+  if proxy_log_has_fatal; then
+    dump_proxy_log
+    die "spawned proxy logged a fatal startup error"
+  fi
+  if ! process_is_running "${proxy_pid}"; then
+    dump_proxy_log
+    die "spawned proxy PID ${proxy_pid} exited before readiness"
+  fi
 }
 
 wait_for_ready() {
-  local attempt
-  for attempt in $(seq 1 60); do
-    if curl -fsS "${PROXY_BASE_URL}/readyz" > "${SMOKE_DIR}/readyz.json"; then
+  local deadline=$((SECONDS + SMOKE_STARTUP_TIMEOUT_SECONDS))
+  local listen_seen=0
+  while (( SECONDS < deadline )); do
+    assert_spawned_proxy_alive
+    if [[ "${listen_seen}" == "0" ]]; then
+      if proxy_log_has_expected_listener; then
+        listen_seen=1
+        proxy_listen_confirmed=1
+      else
+        sleep 0.1
+        continue
+      fi
+    fi
+    if curl --fail --silent --show-error \
+      --connect-timeout "${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS}" \
+      --max-time "${SMOKE_READINESS_REQUEST_MAX_TIME_SECONDS}" \
+      "${PROXY_BASE_URL}/readyz" > "${SMOKE_DIR}/readyz.json" 2>/dev/null; then
+      assert_spawned_proxy_alive
+      proxy_log_has_expected_listener || die "spawned proxy never logged expected listener ${PROXY_HOST}:${PROXY_PORT}"
       return 0
     fi
-    sleep 2
+    sleep 0.2
   done
 
-  if [[ -f "${PROXY_LOG}" ]]; then
-    log "Proxy log from failed readiness check:"
-    cat "${PROXY_LOG}" >&2
-  fi
-
-  die "proxy never became ready at ${PROXY_BASE_URL}"
+  dump_proxy_log
+  die "proxy never became ready at ${PROXY_BASE_URL} within ${SMOKE_STARTUP_TIMEOUT_SECONDS}s"
 }
 
 fetch_models() {
-  curl -fsS "${PROXY_BASE_URL}/v1/models" > "${MODELS_JSON}"
+  curl --fail --silent --show-error \
+    --connect-timeout "${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS}" \
+    --max-time "${SMOKE_CURL_MAX_TIME_SECONDS}" \
+    "${PROXY_BASE_URL}/v1/models" > "${MODELS_JSON}" \
+    || die "GET ${PROXY_BASE_URL}/v1/models failed"
   jq -e '.data | length > 0' "${MODELS_JSON}" >/dev/null || die "no models returned by ${PROXY_BASE_URL}/v1/models"
 }
 
@@ -158,12 +348,15 @@ post_json() {
   local response_file="$3"
   local status
 
-  status="$(curl -sS \
-    -o "${response_file}" \
-    -w '%{http_code}' \
+  status="$(curl --silent --show-error \
+    --output "${response_file}" \
+    --write-out '%{http_code}' \
+    --connect-timeout "${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS}" \
+    --max-time "${SMOKE_CURL_MAX_TIME_SECONDS}" \
     -X POST "${PROXY_BASE_URL}${endpoint}" \
     -H 'Content-Type: application/json' \
-    --data-binary "@${request_file}")"
+    --data-binary "@${request_file}")" \
+    || die "${endpoint} request failed before an HTTP response"
 
   if [[ "${status}" != "200" ]]; then
     if [[ -s "${response_file}" ]]; then

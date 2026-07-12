@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -54,8 +55,8 @@ var (
 )
 
 // Authenticator manages GitHub OAuth and Copilot API tokens.
-// It handles the device code flow, token caching to disk, and automatic
-// refresh using a read-write mutex for concurrent access.
+// It handles the device code flow, token caching to disk, and shared automatic
+// refreshes whose waiters can stop independently when their contexts expire.
 type Authenticator struct {
 	tokenDir     string
 	accessToken  string
@@ -63,9 +64,21 @@ type Authenticator struct {
 	tokenExpiry  time.Time
 	mu           sync.RWMutex
 
-	// deviceFlowMu serializes interactive logins without blocking readers that
-	// only want to know whether non-interactive credentials are already usable.
-	deviceFlowMu sync.Mutex
+	refreshMu   sync.Mutex
+	refreshCall *authTokenCall
+
+	deviceCallMu sync.Mutex
+	deviceCall   *authTokenCall
+
+	deviceFlowOnce sync.Once
+	deviceFlowGate chan struct{}
+
+	signOutMu  sync.Mutex
+	signingOut atomic.Bool
+	generation atomic.Uint64
+
+	beforeRefreshCallFinalize func()
+	beforeDeviceCallFinalize  func()
 
 	client         *http.Client
 	directClient   *http.Client
@@ -77,6 +90,20 @@ type Authenticator struct {
 	// are expected to drive the flow themselves via RequestDeviceCode /
 	// PollForAuthorization.
 	DisableAutoDeviceFlow bool
+}
+
+type authTokenCall struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	done       chan struct{}
+	token      string
+	err        error
+	waiters    int
+	completed  bool
+	abandoned  bool
+	generation uint64
+	force      bool
+	envToken   string
 }
 
 // DeviceCodeResponse is the response from GitHub's device code endpoint.
@@ -275,13 +302,8 @@ func (a *Authenticator) GetTokenNonInteractive(ctx context.Context) (string, err
 // flow. Unlike GetTokenNonInteractive, it bypasses any cached Copilot token so
 // callers can verify that the underlying GitHub auth is still refreshable.
 func (a *Authenticator) RefreshTokenNonInteractive(ctx context.Context) (string, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if err := a.refreshToken(ctx, false); err != nil {
-		return "", err
-	}
-	return a.copilotToken, nil
+	envToken, _ := lookupAccessTokenFromEnv()
+	return a.runSharedRefresh(ctx, envToken, true)
 }
 
 // IsInteractiveLoginRequired reports whether resolving the error should fall
@@ -307,77 +329,291 @@ func (a *Authenticator) getToken(ctx context.Context, allowDeviceFlow bool) (str
 }
 
 func (a *Authenticator) getTokenWithoutDeviceFlow(ctx context.Context) (string, error) {
-	a.mu.RLock()
-	if a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
-		token := a.copilotToken
-		a.mu.RUnlock()
-		return token, nil
-	}
-	a.mu.RUnlock()
+	return a.runSharedRefresh(ctx, "", false)
+}
 
+func (a *Authenticator) getTokenWithDeviceFlow(ctx context.Context) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a.signingOut.Load() {
+		return "", ErrNotAuthenticated
+	}
+
+	a.deviceCallMu.Lock()
+	if err := ctx.Err(); err != nil {
+		a.deviceCallMu.Unlock()
+		return "", err
+	}
+	if a.signingOut.Load() {
+		a.deviceCallMu.Unlock()
+		return "", ErrNotAuthenticated
+	}
+	if call := a.deviceCall; call != nil && !call.abandoned {
+		call.waiters++
+		a.deviceCallMu.Unlock()
+		return a.waitForDeviceCall(ctx, call)
+	}
+
+	callCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	call := &authTokenCall{
+		ctx:        callCtx,
+		cancel:     cancel,
+		done:       make(chan struct{}),
+		waiters:    1,
+		generation: a.generation.Load(),
+	}
+	a.deviceCall = call
+	a.deviceCallMu.Unlock()
+
+	go a.executeDeviceCall(call)
+	return a.waitForDeviceCall(ctx, call)
+}
+
+func (a *Authenticator) executeDeviceCall(call *authTokenCall) {
+	var token string
+	var err error
+	if lockErr := a.acquireDeviceFlow(call.ctx); lockErr != nil {
+		err = lockErr
+	} else {
+		// Another goroutine or process may have completed sign-in while this
+		// call waited for the interactive-login slot.
+		token, err = a.getToken(call.ctx, false)
+		if err != nil && IsInteractiveLoginRequired(err) && call.ctx.Err() == nil && !a.signingOut.Load() {
+			err = a.deviceCodeFlow(call.ctx)
+			if err == nil {
+				token, err = a.getToken(call.ctx, false)
+			}
+		}
+		a.releaseDeviceFlow()
+	}
+
+	if a.beforeDeviceCallFinalize != nil {
+		a.beforeDeviceCallFinalize()
+	}
+
+	a.deviceCallMu.Lock()
+	if call.abandoned {
+		token = ""
+		if err == nil {
+			err = context.Canceled
+		}
+	}
+	call.token = token
+	call.err = err
+	call.completed = true
+	if a.deviceCall == call {
+		a.deviceCall = nil
+	}
+	close(call.done)
+	call.cancel()
+	a.deviceCallMu.Unlock()
+}
+
+func (a *Authenticator) waitForDeviceCall(ctx context.Context, call *authTokenCall) (string, error) {
+	completed := false
+	select {
+	case <-call.done:
+		completed = true
+	case <-ctx.Done():
+	}
+
+	a.deviceCallMu.Lock()
+	call.waiters--
+	if !completed && call.waiters == 0 && !call.completed {
+		call.abandoned = true
+		if a.deviceCall == call {
+			a.deviceCall = nil
+		}
+		call.cancel()
+	}
+	token, err := call.token, call.err
+	a.deviceCallMu.Unlock()
+
+	if !completed {
+		return "", ctx.Err()
+	}
+	if a.signingOut.Load() || call.generation != a.generation.Load() {
+		return "", ErrNotAuthenticated
+	}
+	return token, err
+}
+
+func (a *Authenticator) getTokenFromEnv(ctx context.Context, envToken string) (string, error) {
+	return a.runSharedRefresh(ctx, envToken, false)
+}
+
+func (a *Authenticator) runSharedRefresh(ctx context.Context, envToken string, force bool) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a.signingOut.Load() {
+		return "", ErrNotAuthenticated
+	}
+
+	for {
+		a.refreshMu.Lock()
+		if err := ctx.Err(); err != nil {
+			a.refreshMu.Unlock()
+			return "", err
+		}
+		if a.signingOut.Load() {
+			a.refreshMu.Unlock()
+			return "", ErrNotAuthenticated
+		}
+		if call := a.refreshCall; call != nil && !call.abandoned {
+			call.waiters++
+			compatible := call.envToken == envToken && (call.force || !force)
+			a.refreshMu.Unlock()
+			token, err, completed := a.waitForRefreshCall(ctx, call)
+			if compatible || !completed {
+				return token, err
+			}
+			continue
+		}
+
+		callCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		call := &authTokenCall{
+			ctx:        callCtx,
+			cancel:     cancel,
+			done:       make(chan struct{}),
+			waiters:    1,
+			generation: a.generation.Load(),
+			force:      force,
+			envToken:   envToken,
+		}
+		a.refreshCall = call
+		a.refreshMu.Unlock()
+
+		go a.executeRefreshCall(call)
+		token, err, _ := a.waitForRefreshCall(ctx, call)
+		return token, err
+	}
+}
+
+func (a *Authenticator) executeRefreshCall(call *authTokenCall) {
+	token, err := a.performRefresh(call.ctx, call.envToken, call.force)
+
+	if a.beforeRefreshCallFinalize != nil {
+		a.beforeRefreshCallFinalize()
+	}
+
+	a.refreshMu.Lock()
+	if call.abandoned {
+		token = ""
+		if err == nil {
+			err = context.Canceled
+		}
+	}
+	call.token = token
+	call.err = err
+	call.completed = true
+	if a.refreshCall == call {
+		a.refreshCall = nil
+	}
+	close(call.done)
+	call.cancel()
+	a.refreshMu.Unlock()
+}
+
+func (a *Authenticator) waitForRefreshCall(ctx context.Context, call *authTokenCall) (string, error, bool) {
+	completed := false
+	select {
+	case <-call.done:
+		completed = true
+	case <-ctx.Done():
+	}
+
+	a.refreshMu.Lock()
+	call.waiters--
+	if !completed && call.waiters == 0 && !call.completed {
+		call.abandoned = true
+		if a.refreshCall == call {
+			a.refreshCall = nil
+		}
+		call.cancel()
+	}
+	token, err := call.token, call.err
+	a.refreshMu.Unlock()
+
+	if !completed {
+		return "", ctx.Err(), false
+	}
+	if a.signingOut.Load() || call.generation != a.generation.Load() {
+		return "", ErrNotAuthenticated, false
+	}
+	return token, err, true
+}
+
+func (a *Authenticator) cancelSharedAuthCalls() {
+	a.refreshMu.Lock()
+	if call := a.refreshCall; call != nil {
+		call.cancel()
+	}
+	a.refreshMu.Unlock()
+
+	a.deviceCallMu.Lock()
+	if call := a.deviceCall; call != nil {
+		call.cancel()
+	}
+	a.deviceCallMu.Unlock()
+}
+
+func (a *Authenticator) abandonSharedAuthCalls() {
+	a.refreshMu.Lock()
+	if call := a.refreshCall; call != nil {
+		call.abandoned = true
+		a.refreshCall = nil
+		call.cancel()
+	}
+	a.refreshMu.Unlock()
+
+	a.deviceCallMu.Lock()
+	if call := a.deviceCall; call != nil {
+		call.abandoned = true
+		a.deviceCall = nil
+		call.cancel()
+	}
+	a.deviceCallMu.Unlock()
+}
+
+func (a *Authenticator) performRefresh(ctx context.Context, envToken string, force bool) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// Double-check after acquiring write lock.
-	if a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
-		return a.copilotToken, nil
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
-	if err := a.loadCopilotToken(); err == nil {
+	if !force {
+		if envToken != "" {
+			if a.accessToken == envToken && a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
+				return a.copilotToken, nil
+			}
+		} else {
+			if a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
+				return a.copilotToken, nil
+			}
+			if err := a.loadCopilotToken(); err == nil {
+				return a.copilotToken, nil
+			}
+		}
+	}
+
+	if envToken != "" {
+		// Environment-provided access tokens intentionally override any persisted
+		// login state so CI or explicit shell configuration always wins.
+		if a.accessToken != envToken {
+			a.accessToken = envToken
+			a.copilotToken = ""
+			a.tokenExpiry = time.Time{}
+		}
+		if err := a.exchangeForCopilotToken(ctx); err != nil {
+			return "", err
+		}
 		return a.copilotToken, nil
 	}
 
 	if err := a.refreshToken(ctx, false); err != nil {
-		return "", err
-	}
-	return a.copilotToken, nil
-}
-
-func (a *Authenticator) getTokenWithDeviceFlow(ctx context.Context) (string, error) {
-	a.deviceFlowMu.Lock()
-	defer a.deviceFlowMu.Unlock()
-
-	// Another goroutine may have completed sign-in while this caller waited for
-	// the interactive-login slot.
-	token, err := a.getToken(ctx, false)
-	if err == nil {
-		return token, nil
-	}
-	if !IsInteractiveLoginRequired(err) {
-		return "", err
-	}
-
-	if err := a.deviceCodeFlow(ctx); err != nil {
-		return "", err
-	}
-	return a.getToken(ctx, false)
-}
-
-func (a *Authenticator) getTokenFromEnv(ctx context.Context, envToken string) (string, error) {
-	a.mu.RLock()
-	if a.accessToken == envToken && a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
-		token := a.copilotToken
-		a.mu.RUnlock()
-		return token, nil
-	}
-	a.mu.RUnlock()
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	// Double-check after acquiring write lock.
-	if a.accessToken == envToken && a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
-		return a.copilotToken, nil
-	}
-
-	// Environment-provided access tokens intentionally override any persisted
-	// login state so CI or explicit shell configuration always wins.
-	if a.accessToken != envToken {
-		a.accessToken = envToken
-		a.copilotToken = ""
-		a.tokenExpiry = time.Time{}
-	}
-
-	if err := a.exchangeForCopilotToken(ctx); err != nil {
 		return "", err
 	}
 	return a.copilotToken, nil
@@ -439,6 +675,25 @@ func (a *Authenticator) refreshToken(ctx context.Context, allowDeviceFlow bool) 
 	return refreshErr
 }
 
+func (a *Authenticator) acquireDeviceFlow(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.deviceFlowOnce.Do(func() {
+		a.deviceFlowGate = make(chan struct{}, 1)
+	})
+	select {
+	case a.deviceFlowGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (a *Authenticator) releaseDeviceFlow() {
+	<-a.deviceFlowGate
+}
+
 // RequestDeviceCode initiates the GitHub device-code flow by requesting a
 // device code and user code from GitHub. The caller should present the
 // UserCode and VerificationURI to the user, then call PollForAuthorization.
@@ -471,8 +726,16 @@ func (a *Authenticator) RequestDeviceCode(ctx context.Context) (*DeviceCodeRespo
 // PollForAuthorization polls GitHub until the user authorizes the device code,
 // then saves the access token and exchanges it for a Copilot API token.
 func (a *Authenticator) PollForAuthorization(ctx context.Context, dcResp *DeviceCodeResponse) error {
-	a.deviceFlowMu.Lock()
-	defer a.deviceFlowMu.Unlock()
+	if a.signingOut.Load() {
+		return ErrNotAuthenticated
+	}
+	if err := a.acquireDeviceFlow(ctx); err != nil {
+		return err
+	}
+	defer a.releaseDeviceFlow()
+	if a.signingOut.Load() {
+		return ErrNotAuthenticated
+	}
 	return a.pollForAuthorization(ctx, dcResp)
 }
 
@@ -534,6 +797,12 @@ func (a *Authenticator) completeDeviceAuthorization(ctx context.Context, accessT
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if a.signingOut.Load() {
+		return ErrNotAuthenticated
+	}
 	a.accessToken = accessToken
 	if err := a.saveAccessToken(); err != nil {
 		return fmt.Errorf("saving access token: %w", err)
@@ -564,12 +833,21 @@ func (a *Authenticator) deviceCodeFlow(ctx context.Context) error {
 // SignOut clears all authentication state from memory and removes persisted
 // token files from disk. It is safe for concurrent use.
 func (a *Authenticator) SignOut() error {
-	a.deviceFlowMu.Lock()
-	defer a.deviceFlowMu.Unlock()
+	a.signOutMu.Lock()
+	defer a.signOutMu.Unlock()
+
+	a.signingOut.Store(true)
+	// Stop shared work before waiting for the device-flow and state locks. The
+	// generation is advanced only after cleanup so calls created before or during
+	// sign-out cannot publish a token once sign-out has completed.
+	a.cancelSharedAuthCalls()
+
+	if err := a.acquireDeviceFlow(context.Background()); err != nil {
+		a.signingOut.Store(false)
+		return err
+	}
 
 	a.mu.Lock()
-	defer a.mu.Unlock()
-
 	a.accessToken = ""
 	a.copilotToken = ""
 	a.tokenExpiry = time.Time{}
@@ -586,6 +864,13 @@ func (a *Authenticator) SignOut() error {
 	if err := a.markSignedOut(); err != nil {
 		errs = append(errs, fmt.Errorf("writing signed-out marker: %w", err))
 	}
+
+	a.generation.Add(1)
+	a.abandonSharedAuthCalls()
+	a.mu.Unlock()
+	a.releaseDeviceFlow()
+	a.signingOut.Store(false)
+
 	if len(errs) > 0 {
 		return fmt.Errorf("sign out cleanup: %w", errors.Join(errs...))
 	}
@@ -596,8 +881,10 @@ func (a *Authenticator) SignOut() error {
 // GitHub CLI account. The GitHub CLI token is kept only in memory as a
 // short-lived Copilot bearer token and is never persisted by Vekil.
 func (a *Authenticator) SignInWithGitHubCLI(ctx context.Context) error {
-	a.deviceFlowMu.Lock()
-	defer a.deviceFlowMu.Unlock()
+	if err := a.acquireDeviceFlow(ctx); err != nil {
+		return err
+	}
+	defer a.releaseDeviceFlow()
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -648,6 +935,10 @@ func (a *Authenticator) useGitHubCLICopilotToken(ctx context.Context) error {
 	}
 
 	if err := a.validateGitHubCLIToken(ctx, accessToken); err != nil {
+		return err
+	}
+
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 
@@ -759,6 +1050,9 @@ func (a *Authenticator) exchangeForCopilotToken(ctx context.Context) error {
 		return fmt.Errorf("empty copilot token: %s", ctResp.ErrorDetails)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	a.copilotToken = ctResp.Token
 	a.tokenExpiry = time.Unix(ctResp.ExpiresAt-300, 0)
 

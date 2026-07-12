@@ -1,12 +1,9 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +28,9 @@ func (h *ProxyHandler) maybeReduceOpenAIChatToolOutputs(ctx context.Context, req
 	if manager == nil || !manager.OutputReduceEnabled() || req == nil {
 		return 0
 	}
+	turnCtx, cancel := h.withToolOptimizerStageContext(ctx, manager, toolOptimizerStageOutputReduce)
+	defer cancel()
+	ctx = turnCtx
 
 	changedCount := 0
 	localContexts := make(map[string]ToolExecutionContext)
@@ -116,6 +116,11 @@ func (h *ProxyHandler) maybeRewriteOrCaptureOpenAIChatToolCommands(ctx context.C
 	manager := h.toolOptimizers
 	if manager == nil || !manager.ShouldInspectNonStreamingResponses() || resp == nil {
 		return 0
+	}
+	if allowRewrite && manager.CommandRewriteEnabled() {
+		turnCtx, cancel := h.withToolOptimizerStageContext(ctx, manager, toolOptimizerStageCommandRewrite)
+		defer cancel()
+		ctx = turnCtx
 	}
 
 	changedCount := 0
@@ -238,6 +243,9 @@ func (h *ProxyHandler) rewriteOpenAIChatRequestBodyWithToolOptimizers(ctx contex
 	if err := json.Unmarshal(rawMessages, &messages); err != nil {
 		return bodyBytes
 	}
+	turnCtx, cancel := h.withToolOptimizerStageContext(ctx, manager, toolOptimizerStageOutputReduce)
+	defer cancel()
+	ctx = turnCtx
 
 	changedCount := 0
 	localContexts := make(map[string]ToolExecutionContext)
@@ -308,54 +316,30 @@ func (h *ProxyHandler) rewriteOpenAIChatRequestBodyWithToolOptimizers(ctx contex
 
 func (h *ProxyHandler) maybeWriteOptimizedOpenAIChatPassthrough(ctx context.Context, w http.ResponseWriter, resp *http.Response, requestedModel string, store *ToolExecutionContextStore, scope string) error {
 	if h == nil || h.toolOptimizers == nil || !h.toolOptimizers.ShouldInspectNonStreamingResponses() || resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK {
-		h.writeOpenAIChatCompletionResponse(ctx, w, resp, requestedModel)
-		return nil
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		copyPassthroughHeaders(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, bytes.NewReader(bodyBytes))
-		return nil
+		return h.writeOpenAIChatCompletionResponse(ctx, w, resp, requestedModel)
 	}
 
-	normalizedBody, normalized, normalizeErr := normalizeOpenAIChatCompletionResponse(bodyBytes, requestedModel, time.Now())
-	if normalizeErr == nil {
-		bodyBytes = normalizedBody
-	}
-
-	var parsed models.OpenAIResponse
-	if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
-		observeOpenAIUsage(ctx, sniffOpenAIUsage(bodyBytes))
-		copyPassthroughHeaders(w.Header(), resp.Header)
-		if normalized {
-			w.Header().Del("Content-Length")
-			w.Header().Set("Content-Length", strconv.Itoa(len(bodyBytes)))
+	return writePassthroughSniffingUsage(w, resp, func(bodyBytes []byte) ([]byte, bool) {
+		normalizedBody, normalized, normalizeErr := normalizeOpenAIChatCompletionResponse(bodyBytes, requestedModel, time.Now())
+		if normalizeErr == nil {
+			bodyBytes = normalizedBody
 		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(bodyBytes)
-		return nil
-	}
 
-	observeOpenAIUsage(ctx, parsed.Usage)
-	changedCount := h.maybeRewriteOrCaptureOpenAIChatToolCommands(ctx, &parsed, store, scope, false)
-	out := bodyBytes
-	if changedCount > 0 {
-		if rewritten, err := json.Marshal(&parsed); err == nil {
-			out = rewritten
-		} else {
-			changedCount = 0
+		var parsed models.OpenAIResponse
+		if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
+			observeOpenAIUsage(ctx, sniffOpenAIUsage(bodyBytes))
+			return bodyBytes, normalized
 		}
-	}
 
-	copyPassthroughHeaders(w.Header(), resp.Header)
-	if normalized || changedCount > 0 {
-		w.Header().Del("Content-Length")
-		w.Header().Set("Content-Length", strconv.Itoa(len(out)))
-	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(out)
-	return nil
+		observeOpenAIUsage(ctx, parsed.Usage)
+		changedCount := h.maybeRewriteOrCaptureOpenAIChatToolCommands(ctx, &parsed, store, scope, false)
+		if changedCount == 0 {
+			return bodyBytes, normalized
+		}
+		rewritten, err := json.Marshal(&parsed)
+		if err != nil {
+			return bodyBytes, normalized
+		}
+		return rewritten, true
+	})
 }

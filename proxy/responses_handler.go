@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -110,6 +111,13 @@ func parseResponsesRequestMetadata(bodyBytes []byte) responsesRequestMetadata {
 func (h *ProxyHandler) prepareResponsesRequest(ctx context.Context, r *http.Request, bodyBytes []byte) preparedResponsesRequest {
 	metadata := parseResponsesRequestMetadata(bodyBytes)
 	extraHeaders := responsesExtraHeadersFromRequest(r)
+	if rewrittenBody, resetLineage := resetSyntheticCompactionResponseLineage(bodyBytes); resetLineage {
+		bodyBytes = rewrittenBody
+		extraHeaders.Del("X-Codex-Turn-State")
+		h.log.Debug("reset synthetic compaction response lineage",
+			logger.F("endpoint", "responses"),
+		)
+	}
 	headerToolScope := toolExecutionScopeFromHeaders(extraHeaders)
 	requestToolScope := responsesRequestToolExecutionScope(headerToolScope, metadata.PreviousResponseID)
 
@@ -133,7 +141,10 @@ func (h *ProxyHandler) postPreparedResponsesRequest(ctx context.Context, observe
 	return h.maybeRetryCompactedResponsesRequest(ctx, observeCtx, req.body, req.extraHeaders, req.upstreamHeaders, resp)
 }
 
-func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWriter, endpoint string, err error) {
+func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWriter, r *http.Request, upstreamCtx context.Context, endpoint string, err error) {
+	if h.handleShutdownError(w, r, upstreamCtx, err) {
+		return
+	}
 	statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 	h.log.Error("upstream request failed", logger.F("endpoint", endpoint), logger.Err(err))
 	if statusCode == http.StatusBadRequest {
@@ -148,6 +159,9 @@ func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWrite
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
+		if h.handleShutdownError(w, r, nil, err) {
+			return
+		}
 		status := readBodyStatusCode(err)
 		writeOpenAIRequestBodyError(w, status, err)
 		return
@@ -162,6 +176,9 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	if compactionResp, handled, compactionUsage, err := h.maybeBuildResponsesCompactionTriggerResponse(upstreamCtx, prepared.body, prepared.extraHeaders, prepared.streaming); handled || err != nil {
 		if err != nil {
+			if h.handleShutdownError(w, r, upstreamCtx, err) {
+				return
+			}
 			statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 			h.log.Error("upstream request failed", logger.F("endpoint", "responses/compaction_trigger"), logger.Err(err))
 			if statusCode == http.StatusBadRequest {
@@ -176,24 +193,31 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		// the usage-observing passthrough below. Record the aggregate usage onto the
 		// inbound request summary so the dashboard does not count it as zero tokens.
 		observeResponsesUsage(r.Context(), compactionUsage)
-		writeUpstreamResponse(w, compactionResp)
+		if err := writeUpstreamResponse(w, compactionResp); err != nil {
+			h.log.Debug("failed to write compaction trigger response", logger.Err(err))
+		}
 		return
 	}
 
 	resp, err := h.postPreparedResponsesRequest(upstreamCtx, r.Context(), prepared)
 	if err != nil {
-		h.writeResponsesUpstreamRequestFailure(w, "responses", err)
+		h.writeResponsesUpstreamRequestFailure(w, r, upstreamCtx, "responses", err)
 		return
 	}
 
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	if prepared.streaming && resp.StatusCode == http.StatusOK {
-		peekAndForwardResponses(h, w, r, resp, upstreamCancel, prepared.model, prepared.headerToolScope)
+		peekAndForwardResponses(h, w, r, resp, upstreamCtx, upstreamCancel, prepared.model, prepared.headerToolScope)
 		return
 	}
 
-	h.writeResponsesUpstreamResponse(r.Context(), w, resp, h.toolContexts, prepared.headerToolScope)
+	if err := h.writeResponsesUpstreamResponse(r.Context(), w, resp, h.toolContexts, prepared.headerToolScope); err != nil {
+		if h.handleResponseBodyWriteError(w, r, upstreamCtx, "responses", err) {
+			return
+		}
+		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
+	}
 }
 
 // compactPrompt is the system instruction used when the upstream does not
@@ -221,6 +245,15 @@ const (
 	// compactUpstreamErrorBodySize caps upstream error bodies that the compact
 	// fallback buffers only so it can replay the original failure if chunking fails.
 	compactUpstreamErrorBodySize = 1 << 20
+	// compactInflightPublicationGrace gives a canceled singleflight waiter a
+	// short opportunity to receive an authoritative response the leader is
+	// already buffering, without letting a stuck leader block shutdown.
+	compactInflightPublicationGrace = 50 * time.Millisecond
+	// proxySummaryResponseBodySize caps successful proxy-owned compaction and
+	// memory-summary responses before JSON decoding. Summaries should be far
+	// smaller than request histories; a 1 MiB ceiling prevents an upstream from
+	// making the proxy buffer an unbounded 200 response.
+	proxySummaryResponseBodySize = 1 << 20
 	// compactUpstreamMaxAttempts caps the number of logical compaction calls
 	// the compact-413 fallback may issue per inbound request. Each logical
 	// call may make up to one extra HTTP POST if the configured model is
@@ -263,28 +296,20 @@ type compactBudget struct {
 	max           int
 	learnedTarget int
 	resolvedModel string
-	usage         responsesUsageTotals
-}
-
-type responsesUsageTotals struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-	TotalTokens  int `json:"total_tokens"`
+	usage         responsesUsage
 }
 
 func (b *compactBudget) addResponsesUsage(body []byte) {
 	if b == nil {
 		return
 	}
-	usage := extractResponsesUsageTotals(body)
-	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
+	usage := sniffResponsesUsageBody(body)
+	if usage.isZero() {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.usage.InputTokens += usage.InputTokens
-	b.usage.OutputTokens += usage.OutputTokens
-	b.usage.TotalTokens += usage.TotalTokens
+	b.usage.add(usage)
 }
 
 func (b *compactBudget) responsesUsage() map[string]interface{} {
@@ -294,17 +319,23 @@ func (b *compactBudget) responsesUsage() map[string]interface{} {
 	b.mu.Lock()
 	usage := b.usage
 	b.mu.Unlock()
-	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
+	if usage.isZero() {
 		return zeroResponsesUsage()
 	}
-	if usage.TotalTokens == 0 {
-		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+	usage.TotalTokens = usage.totalTokens()
+	var inputDetails interface{}
+	if usage.InputTokensDetails.CachedTokens != 0 {
+		inputDetails = map[string]int{"cached_tokens": usage.InputTokensDetails.CachedTokens}
+	}
+	var outputDetails interface{}
+	if usage.OutputTokensDetails.ReasoningTokens != 0 {
+		outputDetails = map[string]int{"reasoning_tokens": usage.OutputTokensDetails.ReasoningTokens}
 	}
 	return map[string]interface{}{
 		"input_tokens":          usage.InputTokens,
-		"input_tokens_details":  nil,
+		"input_tokens_details":  inputDetails,
 		"output_tokens":         usage.OutputTokens,
-		"output_tokens_details": nil,
+		"output_tokens_details": outputDetails,
 		"total_tokens":          usage.TotalTokens,
 	}
 }
@@ -320,25 +351,8 @@ func (b *compactBudget) usageTotals() responsesUsage {
 	b.mu.Lock()
 	usage := b.usage
 	b.mu.Unlock()
-	total := usage.TotalTokens
-	if total == 0 {
-		total = usage.InputTokens + usage.OutputTokens
-	}
-	return responsesUsage{
-		InputTokens:  usage.InputTokens,
-		OutputTokens: usage.OutputTokens,
-		TotalTokens:  total,
-	}
-}
-
-func extractResponsesUsageTotals(body []byte) responsesUsageTotals {
-	var envelope struct {
-		Usage responsesUsageTotals `json:"usage"`
-	}
-	if err := json.Unmarshal(body, &envelope); err == nil {
-		return envelope.Usage
-	}
-	return responsesUsageTotals{}
+	usage.TotalTokens = usage.totalTokens()
+	return usage
 }
 
 func newCompactBudget(max int) *compactBudget {
@@ -464,6 +478,9 @@ Be concise, structured, and factual. Do not chat with the user. Do not ask follo
 func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
+		if h.handleShutdownError(w, r, nil, err) {
+			return
+		}
 		status := readBodyStatusCode(err)
 		writeOpenAIRequestBodyError(w, status, err)
 		return
@@ -484,6 +501,9 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 
 	summaryText, resp, err := h.compactResponsesRequest(upstreamCtx, body, responsesExtraHeadersFromRequest(r))
 	if err != nil {
+		if h.handleShutdownError(w, r, upstreamCtx, err) {
+			return
+		}
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "compact"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
@@ -523,6 +543,9 @@ Respond with a JSON array where each element has "trace_summary" and "memory_sum
 func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
 	if err != nil {
+		if h.handleShutdownError(w, r, nil, err) {
+			return
+		}
 		status := readBodyStatusCode(err)
 		writeOpenAIRequestBodyError(w, status, err)
 		return
@@ -571,6 +594,9 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 
 	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, reqBody, responsesExtraHeadersFromRequest(r))
 	if err != nil {
+		if h.handleShutdownError(w, r, upstreamCtx, err) {
+			return
+		}
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "memory_summarize"), logger.Err(err))
 		if statusCode == http.StatusBadRequest {
@@ -591,9 +617,16 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, truncated, err := readBodyWithCap(resp.Body, proxySummaryResponseBodySize)
 	if err != nil {
+		if h.handleShutdownError(w, r, upstreamCtx, err) {
+			return
+		}
 		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
+		return
+	}
+	if truncated {
+		writeOpenAIError(w, http.StatusBadGateway, "upstream summary response exceeded size limit", "server_error")
 		return
 	}
 
@@ -644,10 +677,14 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 
 func extractResponsesOutputText(body []byte) (string, error) {
 	var upstream struct {
+		Status *string           `json:"status"`
 		Output []json.RawMessage `json:"output"`
 	}
 	if err := json.Unmarshal(body, &upstream); err != nil {
 		return "", err
+	}
+	if upstream.Status != nil && strings.TrimSpace(*upstream.Status) != "completed" {
+		return "", fmt.Errorf("upstream summary response status is %q, not completed", strings.TrimSpace(*upstream.Status))
 	}
 
 	var sb strings.Builder
@@ -672,7 +709,11 @@ func extractResponsesOutputText(body []byte) (string, error) {
 		}
 	}
 
-	return sanitizeProxySummaryText(sb.String()), nil
+	summary := sanitizeProxySummaryText(sb.String())
+	if summary == "" {
+		return "", fmt.Errorf("upstream summary response contained no output text")
+	}
+	return summary, nil
 }
 
 func retainedCompactResponseMessages(body []byte) []json.RawMessage {
@@ -723,6 +764,64 @@ func writeCompactResponse(w http.ResponseWriter, summaryText string, retainedOut
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(compactResp)
+}
+
+// normalizeCompactionRequestFields removes caller generation controls that can
+// prevent an internal checkpoint from producing ordinary text. Provider/model
+// and routing fields are copied through unchanged; only controls that can force
+// tool use, asynchronous/streaming output, structured output, or a tiny output
+// budget are removed. text.verbosity and other non-format text controls remain.
+func normalizeCompactionRequestFields(requestFields map[string]json.RawMessage) (map[string]json.RawMessage, []string) {
+	normalized := copyResponsesRequestFields(requestFields)
+	removed := make([]string, 0, 12)
+	for _, field := range []string{
+		"tools",
+		"tool_choice",
+		"parallel_tool_calls",
+		"response_format",
+		"max_output_tokens",
+		"max_tokens",
+		"max_completion_tokens",
+		"stream",
+		"stream_options",
+		"background",
+	} {
+		if _, ok := normalized[field]; !ok {
+			continue
+		}
+		delete(normalized, field)
+		removed = append(removed, field)
+	}
+
+	rawText, ok := normalized["text"]
+	if !ok {
+		return normalized, removed
+	}
+
+	var textFields map[string]json.RawMessage
+	if err := json.Unmarshal(rawText, &textFields); err != nil {
+		delete(normalized, "text")
+		removed = append(removed, "text")
+		return normalized, removed
+	}
+	if _, ok := textFields["format"]; !ok {
+		return normalized, removed
+	}
+
+	delete(textFields, "format")
+	removed = append(removed, "text.format")
+	if len(textFields) == 0 {
+		delete(normalized, "text")
+		return normalized, removed
+	}
+	encodedText, err := json.Marshal(textFields)
+	if err != nil {
+		delete(normalized, "text")
+		removed = append(removed, "text")
+		return normalized, removed
+	}
+	normalized["text"] = encodedText
+	return normalized, removed
 }
 
 func (h *ProxyHandler) setSyntheticResponsesStoreFalse(requestFields map[string]json.RawMessage) {
@@ -848,6 +947,21 @@ func waitCompactInflight(ctx context.Context, call *compactInflightCall) (string
 	case <-call.done:
 		return call.result.clone()
 	case <-ctx.Done():
+		if errors.Is(context.Cause(ctx), errProxyLifecycleShutdown) {
+			// The shared leader may already hold an authoritative non-OK response
+			// whose body read is being interrupted by the same lifecycle cancel.
+			// Let it publish that bounded replay instead of racing the waiter into a
+			// local shutdown error. Successful-body cancellation is stored as an
+			// error and still propagates normally through this same result.
+			timer := time.NewTimer(compactInflightPublicationGrace)
+			defer timer.Stop()
+			select {
+			case <-call.done:
+				return call.result.clone()
+			case <-timer.C:
+				return "", nil, ctx.Err()
+			}
+		}
 		return "", nil, ctx.Err()
 	}
 }
@@ -864,13 +978,20 @@ func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestField
 		return waitCompactInflight(ctx, call)
 	}
 
+	result := compactInflightResult{err: errors.New("compact in-flight leader exited before publishing a result")}
+	defer func() {
+		// Always release waiters and remove the map entry, including panic paths.
+		// A panic still propagates after deferred publication.
+		h.finishCompactInflight(key, call, result)
+	}()
+
 	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
 	summary, resp, err := h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget)
-	result := compactInflightResult{summary: summary, err: err}
+	result = compactInflightResult{summary: summary, err: err}
 	if resp != nil {
-		respBody, truncated, readErr := readBodyWithCap(resp.Body, compactUpstreamErrorBodySize)
+		respBody, truncated, readErr := readBodyWithCapAvailable(resp.Body, compactUpstreamErrorBodySize)
 		_ = resp.Body.Close()
-		if readErr != nil {
+		if readErr != nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 			if err == nil {
 				err = readErr
 			}
@@ -880,17 +1001,17 @@ func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestField
 			result.resp = cloneHTTPResponseWithBody(resp, respBody)
 			result.respBody = respBody
 			resp = cloneHTTPResponseWithBody(resp, respBody)
-			if truncated {
+			if truncated || readErr != nil {
 				result.resp.Header.Del("Content-Length")
 				resp.Header.Del("Content-Length")
-				h.log.Debug("truncated upstream compact response body for in-flight replay",
+				h.log.Debug("bounded upstream compact response body for in-flight replay",
 					logger.F("status", resp.StatusCode),
 					logger.F("max_bytes", compactUpstreamErrorBodySize),
+					logger.Err(readErr),
 				)
 			}
 		}
 	}
-	h.finishCompactInflight(key, call, result)
 	return summary, resp, err
 }
 
@@ -922,6 +1043,15 @@ func (h *ProxyHandler) compactLearnedTargetKeyForRequest(requestFields map[strin
 }
 
 func (h *ProxyHandler) compactResponsesRequestWithBudget(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, budget *compactBudget) (string, *http.Response, error) {
+	normalizedFields, removedFields := normalizeCompactionRequestFields(requestFields)
+	requestFields = normalizedFields
+	if len(removedFields) > 0 {
+		h.log.Debug("normalized internal compaction generation controls",
+			logger.F("endpoint", "responses/compact/internal"),
+			logger.F("fields", removedFields),
+		)
+	}
+
 	if rewrittenFields, rewriteCount := sanitizeContextCompactionRequestFields(requestFields); rewriteCount > 0 {
 		requestFields = rewrittenFields
 		h.log.Debug("sanitized context compaction items before upstream compact request",
@@ -1001,9 +1131,12 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 
 	if resp.StatusCode == http.StatusOK {
 		defer func() { _ = resp.Body.Close() }()
-		respBody, err := io.ReadAll(resp.Body)
+		respBody, truncated, err := readBodyWithCap(resp.Body, proxySummaryResponseBodySize)
 		if err != nil {
 			return "", nil, err
+		}
+		if truncated {
+			return "", nil, fmt.Errorf("upstream compaction response exceeded %d-byte limit", proxySummaryResponseBodySize)
 		}
 		budget.addResponsesUsage(respBody)
 		summary, err := extractResponsesOutputText(respBody)
@@ -1017,18 +1150,19 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 		return "", resp, nil
 	}
 
-	respBody, truncated, readErr := readBodyWithCap(resp.Body, compactUpstreamErrorBodySize)
+	respBody, truncated, readErr := readBodyWithCapAvailable(resp.Body, compactUpstreamErrorBodySize)
 	_ = resp.Body.Close()
-	if readErr != nil {
-		return "", nil, readErr
-	}
 	originalResp := cloneHTTPResponseWithBody(resp, respBody)
-	if truncated {
+	if truncated || readErr != nil {
 		originalResp.Header.Del("Content-Length")
-		h.log.Debug("truncated upstream compact error response body for fallback",
+		h.log.Debug("bounded upstream compact error response body for fallback",
 			logger.F("status", resp.StatusCode),
 			logger.F("max_bytes", compactUpstreamErrorBodySize),
+			logger.Err(readErr),
 		)
+	}
+	if readErr != nil {
+		return "", originalResp, nil
 	}
 	if resp.StatusCode != http.StatusRequestEntityTooLarge && !isCompactPromptTooLargeError(resp.StatusCode, respBody) {
 		return "", originalResp, nil
@@ -1082,7 +1216,7 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 }
 
 func marshalCompactResponsesRequest(requestFields map[string]json.RawMessage, input []json.RawMessage) ([]byte, error) {
-	body := make(map[string]json.RawMessage, len(requestFields)+1)
+	body := make(map[string]json.RawMessage, len(requestFields))
 	for key, value := range requestFields {
 		body[key] = value
 	}
@@ -1119,17 +1253,23 @@ func cloneHTTPResponseWithBody(resp *http.Response, body []byte) *http.Response 
 }
 
 func readBodyWithCap(r io.Reader, maxBytes int) ([]byte, bool, error) {
+	body, truncated, err := readBodyWithCapAvailable(r, maxBytes)
+	if err != nil {
+		return nil, false, err
+	}
+	return body, truncated, nil
+}
+
+func readBodyWithCapAvailable(r io.Reader, maxBytes int) ([]byte, bool, error) {
 	if maxBytes < 0 {
 		return nil, false, fmt.Errorf("invalid body cap %d", maxBytes)
 	}
 	body, err := io.ReadAll(io.LimitReader(r, int64(maxBytes)+1))
-	if err != nil {
-		return nil, false, err
+	truncated := len(body) > maxBytes
+	if truncated {
+		body = body[:maxBytes]
 	}
-	if len(body) > maxBytes {
-		return body[:maxBytes], true, nil
-	}
-	return body, false, nil
+	return body, truncated, err
 }
 
 func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int, targetBodySize int, budget *compactBudget) (summary string, err error) {
@@ -1335,9 +1475,6 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 
 		select {
 		case fanoutErr := <-errCh:
-			if ctx.Err() != nil {
-				return "", ctx.Err()
-			}
 			return "", fanoutErr
 		default:
 		}
@@ -2286,10 +2423,15 @@ func (h *ProxyHandler) maybeRetryResponsesWithoutUnverifiableEncryptedContent(ct
 		return resp, nil
 	}
 
-	respBodyPrefix, err := io.ReadAll(io.LimitReader(resp.Body, int64(compactUpstreamErrorBodySize)+1))
-	if err != nil {
+	respBodyPrefix, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(compactUpstreamErrorBodySize)+1))
+	if readErr != nil {
 		_ = resp.Body.Close()
-		return nil, err
+		if len(respBodyPrefix) > compactUpstreamErrorBodySize {
+			respBodyPrefix = respBodyPrefix[:compactUpstreamErrorBodySize]
+		}
+		cloned := cloneHTTPResponseWithBody(resp, respBodyPrefix)
+		cloned.Header.Del("Content-Length")
+		return cloned, nil
 	}
 	classificationBody := respBodyPrefix
 	if len(classificationBody) > compactUpstreamErrorBodySize {
@@ -2468,13 +2610,19 @@ func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Conte
 		return resp, "", nil
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		_ = resp.Body.Close()
-		return nil, "", err
-	}
+	respBody, truncated, readErr := readBodyWithCapAvailable(resp.Body, compactUpstreamErrorBodySize)
 	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(respBody))
+	resp.ContentLength = int64(len(respBody))
+	if truncated || readErr != nil {
+		resp.Header.Del("Content-Length")
+	}
+	if readErr != nil {
+		// The upstream status and headers are already authoritative. A canceled
+		// body read only limits the optional error detail available for model
+		// fallback detection; it must not erase the known response.
+		return resp, "", nil
+	}
 
 	if !isUnsupportedResponsesModelError(resp.StatusCode, respBody) {
 		return resp, "", nil
@@ -2643,13 +2791,15 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 		return resp, nil
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		_ = resp.Body.Close()
-		return nil, err
-	}
+	respBody, truncated, readErr := readBodyWithCapAvailable(resp.Body, compactUpstreamErrorBodySize)
 	_ = resp.Body.Close()
 	lastResp := cloneHTTPResponseWithBody(resp, respBody)
+	if truncated || readErr != nil {
+		lastResp.Header.Del("Content-Length")
+	}
+	if readErr != nil {
+		return lastResp, nil
+	}
 
 	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
 	// The 413 oversized-replay fallback spends upstream /responses tokens on
@@ -2678,8 +2828,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 			return lastResp, nil
 		}
 
-		compactedInput := make([]json.RawMessage, 0, alignedKeepTail+1)
-		compactedInput = append(compactedInput, checkpoint)
+		compactedInput := []json.RawMessage{checkpoint}
 		compactedInput = append(compactedInput, input[prefixLen:]...)
 
 		compactedInputRaw, err := json.Marshal(compactedInput)
@@ -3252,7 +3401,7 @@ func syntheticCompactionTriggerResponse(summary string, stream bool, usage map[s
 	if usage == nil {
 		usage = zeroResponsesUsage()
 	}
-	responseID := "resp-vekil-compact-" + uuid.NewString()
+	responseID := syntheticCompactionResponseIDPrefix + uuid.NewString()
 	compactionItem := map[string]string{
 		"type":              "compaction",
 		"encrypted_content": encodeSyntheticCompaction(summary),

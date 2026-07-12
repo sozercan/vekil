@@ -15,27 +15,45 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
+func (h *ProxyHandler) newLifecycleUpstreamContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	causeCtx, cancelCause := context.WithCancelCause(h.lifecycleContext())
+	ctx, cancelTimeout := context.WithTimeout(causeCtx, timeout)
+	// BeginShutdown publishes draining before canceling the lifecycle root so
+	// admission closes first. Close that tiny ordering window for children
+	// derived from the still-live root; the parent cancellation covers the
+	// opposite ordering where it wins before this recheck.
+	if h.ShuttingDown() {
+		cancelCause(errProxyLifecycleShutdown)
+	}
+	return ctx, func() {
+		// Preserve the historical caller-cancel semantics: an explicit returned
+		// cancel is ordinary context cancellation, while timeout and lifecycle
+		// shutdown retain their own causes.
+		cancelTimeout()
+		cancelCause(context.Canceled)
+	}
+}
+
 func (h *ProxyHandler) newInferenceUpstreamContext(streaming bool) (context.Context, context.CancelFunc) {
 	return h.newInferenceUpstreamContextFrom(context.Background(), streaming)
 }
 
-// newInferenceUpstreamContextFrom builds the upstream request context the same
-// way as newInferenceUpstreamContext (background-rooted with a timeout, so a
-// client disconnect does not cancel the upstream call) but copies the
-// retry-stats tracked marker from the inbound request context when present. The
-// background root deliberately strips inherited values, so this explicit copy is
-// what lets a tracked inference request's upstream retries be counted while
-// non-tracked callers (insight, model-catalog fetch, count-token probes) stay
-// uncounted. Pass the inbound r.Context(); a context without the marker (e.g.
-// context.Background()) yields an untracked upstream context.
+// newInferenceUpstreamContextFrom builds a lifecycle-rooted upstream request
+// context with its own timeout. It deliberately does not inherit cancellation
+// or arbitrary values from the inbound request, so an ordinary client disconnect
+// does not cancel upstream inference. BeginShutdown cancels the lifecycle root,
+// which promptly stops both existing work and contexts created after draining
+// begins.
+//
+// The retry-stats tracked marker is copied explicitly when present. A context
+// without the marker (for example context.Background()) yields an untracked
+// upstream context for internal insight, catalog, count-token, and shim work.
 func (h *ProxyHandler) newInferenceUpstreamContextFrom(inbound context.Context, streaming bool) (context.Context, context.CancelFunc) {
-	// Use background context with timeout to avoid cancellation from client
-	// disconnects while still preventing goroutine leaks on upstream hangs.
 	timeout := upstreamTimeout
 	if streaming {
 		timeout = h.effectiveStreamingUpstreamTimeout()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := h.newLifecycleUpstreamContext(timeout)
 	if isRetryStatsTracked(inbound) {
 		ctx = markRetryStatsTracked(ctx)
 	}
@@ -143,11 +161,7 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 }
 
 func (h *ProxyHandler) resolveProviderRequestForModel(body []byte, endpoint string, model string) (*providerRuntime, providerModel, []byte, error) {
-	lookupModel := model
-	if endpoint == providerEndpointMessages {
-		lookupModel = NormalizeModelName(model)
-	}
-	provider, owner, known := h.resolveProviderModel(lookupModel, endpoint)
+	provider, owner, known := h.resolveProviderModelForRequest(model, endpoint)
 	if provider == nil {
 		return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no provider available for endpoint %s", endpoint)}
 	}
@@ -279,11 +293,68 @@ func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, bod
 	})
 }
 
-func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
-	defer func() { _ = resp.Body.Close() }()
+type bodyCopyWriter struct {
+	w        http.ResponseWriter
+	writeErr error
+}
+
+func (w *bodyCopyWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	if err != nil {
+		w.writeErr = err
+	}
+	return n, err
+}
+
+type responseBodyWriteError struct {
+	err                   error
+	committed             bool
+	upstream              bool
+	statusCode            int
+	cancellationAtFailure bool
+}
+
+func (e *responseBodyWriteError) Error() string { return e.err.Error() }
+func (e *responseBodyWriteError) Unwrap() error { return e.err }
+
+func newResponseBodyWriteError(resp *http.Response, err error, committed, upstream, cancellationAtFailure bool) *responseBodyWriteError {
+	statusCode := 0
+	if resp != nil {
+		statusCode = resp.StatusCode
+	}
+	return &responseBodyWriteError{
+		err:                   err,
+		committed:             committed,
+		upstream:              upstream,
+		statusCode:            statusCode,
+		cancellationAtFailure: cancellationAtFailure,
+	}
+}
+
+func responseRequestContext(resp *http.Response) context.Context {
+	if resp != nil && resp.Request != nil {
+		return resp.Request.Context()
+	}
+	return context.Background()
+}
+
+func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) error {
+	if resp == nil || resp.Body == nil {
+		return &responseBodyWriteError{err: fmt.Errorf("upstream response body is unavailable"), upstream: true}
+	}
+	body := newLifecycleAwareReadCloser(resp.Body, responseRequestContext(resp))
+	defer func() { _ = body.Close() }()
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	tracked := &bodyCopyWriter{w: w}
+	_, err := io.Copy(tracked, body)
+	if body.canceledAtFailure() {
+		return newResponseBodyWriteError(resp, context.Canceled, true, true, body.canceledAtFailure())
+	}
+	if err == nil {
+		return nil
+	}
+	return newResponseBodyWriteError(resp, err, true, tracked.writeErr == nil, body.canceledAtFailure())
 }
 
 // writeOpenAIChatCompletionResponse writes a non-streaming OpenAI chat response,
@@ -291,8 +362,8 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
 // while preserving vendor-specific fields. It only rewrites successful JSON
 // responses that fit in usageSniffMaxBuffer; errors, invalid JSON, and oversized
 // responses fail open to passthrough behavior.
-func (h *ProxyHandler) writeOpenAIChatCompletionResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, requestedModel string) {
-	writePassthroughSniffingUsage(w, resp, func(body []byte) ([]byte, bool) {
+func (h *ProxyHandler) writeOpenAIChatCompletionResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, requestedModel string) error {
+	return writePassthroughSniffingUsage(w, resp, func(body []byte) ([]byte, bool) {
 		out, changed, err := normalizeOpenAIChatCompletionResponse(body, requestedModel, time.Now())
 		if err != nil {
 			observeOpenAIUsage(ctx, sniffOpenAIUsage(body))
@@ -303,8 +374,8 @@ func (h *ProxyHandler) writeOpenAIChatCompletionResponse(ctx context.Context, w 
 	})
 }
 
-func (h *ProxyHandler) writeOpenAIPassthroughObservingUsage(ctx context.Context, w http.ResponseWriter, resp *http.Response) {
-	writePassthroughSniffingUsage(w, resp, func(body []byte) ([]byte, bool) {
+func (h *ProxyHandler) writeOpenAIPassthroughObservingUsage(ctx context.Context, w http.ResponseWriter, resp *http.Response) error {
+	return writePassthroughSniffingUsage(w, resp, func(body []byte) ([]byte, bool) {
 		observeOpenAIUsage(ctx, sniffOpenAIUsage(body))
 		return body, false
 	})
@@ -325,24 +396,36 @@ const usageSniffMaxBuffer = 4 << 20 // 4 MiB
 // rewrite, Content-Length is adjusted. Oversized bodies stream through without a
 // transform so proxy memory stays bounded. Non-2xx responses and read errors
 // fall back to a plain copy.
-func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, transform func([]byte) ([]byte, bool)) {
-	defer func() { _ = resp.Body.Close() }()
+func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, transform func([]byte) ([]byte, bool)) error {
+	if resp == nil || resp.Body == nil {
+		return &responseBodyWriteError{err: fmt.Errorf("upstream response body is unavailable"), upstream: true}
+	}
+	body := newLifecycleAwareReadCloser(resp.Body, responseRequestContext(resp))
+	defer func() { _ = body.Close() }()
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		copyPassthroughHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
-		return
+		tracked := &bodyCopyWriter{w: w}
+		_, err := io.Copy(tracked, body)
+		if body.canceledAtFailure() {
+			return newResponseBodyWriteError(resp, context.Canceled, true, true, body.canceledAtFailure())
+		}
+		if err != nil {
+			return newResponseBodyWriteError(resp, err, true, tracked.writeErr == nil, body.canceledAtFailure())
+		}
+		return nil
 	}
 
 	// Read one byte past the cap so we can tell a full body from an oversized one.
-	prefix, err := io.ReadAll(io.LimitReader(resp.Body, usageSniffMaxBuffer+1))
-	copyPassthroughHeaders(w.Header(), resp.Header)
-	if err != nil {
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(prefix)
-		return
+	prefix, err := io.ReadAll(io.LimitReader(body, usageSniffMaxBuffer+1))
+	if body.canceledAtFailure() {
+		return newResponseBodyWriteError(resp, context.Canceled, false, true, body.canceledAtFailure())
 	}
+	if err != nil {
+		return newResponseBodyWriteError(resp, err, false, true, body.canceledAtFailure())
+	}
+	copyPassthroughHeaders(w.Header(), resp.Header)
 
 	if len(prefix) <= usageSniffMaxBuffer {
 		// Whole body fits: parse/transform it, then write the result.
@@ -356,16 +439,28 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 			w.Header().Set("Content-Length", strconv.Itoa(len(out)))
 		}
 		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(out)
-		return
+		if _, err := w.Write(out); err != nil {
+			return newResponseBodyWriteError(resp, err, true, false, false)
+		}
+		return nil
 	}
 
 	// Oversized: skip the usage parse and stream prefix + remainder so memory
 	// stays bounded. Total bytes written equal the full body, so any
 	// Content-Length header copied above remains correct.
 	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(prefix)
-	_, _ = io.Copy(w, resp.Body)
+	if _, err := w.Write(prefix); err != nil {
+		return newResponseBodyWriteError(resp, err, true, false, false)
+	}
+	tracked := &bodyCopyWriter{w: w}
+	_, err = io.Copy(tracked, body)
+	if body.canceledAtFailure() {
+		return newResponseBodyWriteError(resp, context.Canceled, true, true, body.canceledAtFailure())
+	}
+	if err != nil {
+		return newResponseBodyWriteError(resp, err, true, tracked.writeErr == nil, body.canceledAtFailure())
+	}
+	return nil
 }
 
 // sniffOpenAIUsage extracts the usage block from a non-streaming OpenAI chat
@@ -382,12 +477,16 @@ func sniffOpenAIUsage(body []byte) *models.OpenAIUsage {
 	return parsed.Usage
 }
 
-func writeDirectAnthropicJSONResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) error {
-	defer func() { _ = resp.Body.Close() }()
+func writeDirectAnthropicJSONResponse(ctx, upstreamCtx context.Context, w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) error {
+	bodyReader := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
+	defer func() { _ = bodyReader.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(bodyReader)
+	if bodyReader.canceledAtFailure() {
+		return newResponseBodyWriteError(resp, context.Canceled, false, true, bodyReader.canceledAtFailure())
+	}
 	if err != nil {
-		return err
+		return newResponseBodyWriteError(resp, err, false, true, bodyReader.canceledAtFailure())
 	}
 	if resp.StatusCode == http.StatusOK {
 		observeAnthropicUsageBody(ctx, body)
@@ -399,18 +498,21 @@ func writeDirectAnthropicJSONResponse(ctx context.Context, w http.ResponseWriter
 		w.Header().Del("Content-Length")
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(rewritten)
+	if _, err := w.Write(rewritten); err != nil {
+		return newResponseBodyWriteError(resp, err, true, false, false)
+	}
 	return nil
 }
 
-func writeDirectAnthropicStreamResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) {
+func (h *ProxyHandler) writeDirectAnthropicStreamResponse(ctx, upstreamCtx context.Context, w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) {
 	defer func() { _ = resp.Body.Close() }()
 
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.Header().Del("Content-Length")
 	setSSEHeaders(w)
 	w.WriteHeader(resp.StatusCode)
-	streamAnthropicPassthroughBody(ctx, w, resp.Body, publicModel, upstreamModel)
+	body := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
+	streamAnthropicPassthroughBody(ctx, w, body, publicModel, upstreamModel, h.lifecycleStreamHooks(ctx, body.canceledAtFailure))
 }
 
 func rewriteAnthropicResponseModelJSON(body []byte, publicModel, upstreamModel string) ([]byte, bool) {

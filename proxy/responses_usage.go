@@ -31,15 +31,34 @@ func (u responsesUsage) isZero() bool {
 	return u.InputTokens == 0 && u.OutputTokens == 0 && u.TotalTokens == 0
 }
 
+func (u responsesUsage) totalTokens() int {
+	if u.TotalTokens != 0 {
+		return u.TotalTokens
+	}
+	return u.InputTokens + u.OutputTokens
+}
+
+// add accumulates another Responses usage observation. It normalizes omitted
+// totals before summing so internal compaction usage can be folded into a
+// terminal client turn without losing cached/reasoning details from that turn.
+func (u *responsesUsage) add(other responsesUsage) {
+	if u == nil || other.isZero() {
+		return
+	}
+	total := u.totalTokens() + other.totalTokens()
+	u.InputTokens += other.InputTokens
+	u.OutputTokens += other.OutputTokens
+	u.TotalTokens = total
+	u.InputTokensDetails.CachedTokens += other.InputTokensDetails.CachedTokens
+	u.OutputTokensDetails.ReasoningTokens += other.OutputTokensDetails.ReasoningTokens
+}
+
 // toOpenAIUsage maps the Responses usage shape onto the chat-shaped
 // models.OpenAIUsage so it can flow through the existing observeOpenAIUsage /
 // setOpenAIUsage path: input→prompt, output→completion, cached and reasoning
 // carried in the detail structs.
 func (u responsesUsage) toOpenAIUsage() *models.OpenAIUsage {
-	total := u.TotalTokens
-	if total == 0 {
-		total = u.InputTokens + u.OutputTokens
-	}
+	total := u.totalTokens()
 	usage := &models.OpenAIUsage{
 		PromptTokens:     u.InputTokens,
 		CompletionTokens: u.OutputTokens,

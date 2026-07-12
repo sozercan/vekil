@@ -21,6 +21,7 @@ ORIGINAL_HOME="${HOME}"
 
 PROXY_BIN="${PROXY_BIN:-${REPO_ROOT}/vekil}"
 PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
+START_PROXY="${START_PROXY:-1}"
 # SMOKE_PROVIDER selects the upstream under test:
 #   copilot (default) -> zero-config GitHub Copilot, credentialed, used by the gated
 #                        Live Copilot Smoke workflow.
@@ -28,13 +29,74 @@ PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
 #                        runs on fork PRs. See main_zen below.
 SMOKE_PROVIDER="${SMOKE_PROVIDER:-copilot}"
 PROVIDERS_CONFIG="${PROVIDERS_CONFIG:-${REPO_ROOT}/examples/opencode-zen-free.yaml}"
-if [[ "${SMOKE_PROVIDER}" == "zen" ]]; then
-  PROXY_PORT="${PROXY_PORT:-8899}"
-else
-  PROXY_PORT="${PROXY_PORT:-1337}"
+SMOKE_STARTUP_TIMEOUT_SECONDS="${SMOKE_STARTUP_TIMEOUT_SECONDS:-120}"
+SMOKE_CURL_CONNECT_TIMEOUT_SECONDS="${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS:-5}"
+SMOKE_CURL_MAX_TIME_SECONDS="${SMOKE_CURL_MAX_TIME_SECONDS:-90}"
+SMOKE_READINESS_REQUEST_MAX_TIME_SECONDS="${SMOKE_READINESS_REQUEST_MAX_TIME_SECONDS:-5}"
+SMOKE_CLI_TIMEOUT_SECONDS="${SMOKE_CLI_TIMEOUT_SECONDS:-240}"
+SMOKE_PROCESS_TERM_GRACE_SECONDS="${SMOKE_PROCESS_TERM_GRACE_SECONDS:-5}"
+SMOKE_PORT_RELEASE_TIMEOUT_SECONDS="${SMOKE_PORT_RELEASE_TIMEOUT_SECONDS:-5}"
+
+python_command() {
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return
+  fi
+  if command -v python >/dev/null 2>&1; then
+    command -v python
+    return
+  fi
+  die "python3 (or python) is required to allocate and verify an isolated smoke port"
+}
+
+connect_host() {
+  case "${PROXY_HOST}" in
+    0.0.0.0) printf '127.0.0.1\n' ;;
+    ::|\[::\]) printf '::1\n' ;;
+    *) printf '%s\n' "${PROXY_HOST}" ;;
+  esac
+}
+
+allocate_free_port() {
+  local python_bin host
+  python_bin="$(python_command)"
+  host="$(connect_host)"
+  "${python_bin}" - "${host}" <<'PY_PORT'
+import socket
+import sys
+
+host = sys.argv[1]
+family = socket.AF_INET6 if ":" in host else socket.AF_INET
+for _ in range(20):
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        port = sock.getsockname()[1]
+    if port != 1337:
+        print(port)
+        raise SystemExit(0)
+raise SystemExit("unable to allocate a non-default port")
+PY_PORT
+}
+
+proxy_port_was_set=0
+if [[ ${PROXY_PORT+x} == x ]]; then
+  proxy_port_was_set=1
 fi
+if [[ "${START_PROXY}" == "1" && "${proxy_port_was_set}" == "0" ]]; then
+  PROXY_PORT="$(allocate_free_port)"
+elif [[ "${proxy_port_was_set}" == "0" ]]; then
+  if [[ "${SMOKE_PROVIDER}" == "zen" ]]; then
+    PROXY_PORT=8899
+  else
+    PROXY_PORT=1337
+  fi
+fi
+[[ "${PROXY_PORT}" =~ ^[0-9]+$ ]] || die "PROXY_PORT must be numeric: ${PROXY_PORT}"
+if [[ "${START_PROXY}" == "1" && "${PROXY_PORT}" == "1337" && "${proxy_port_was_set}" == "0" ]]; then
+  die "auto-selected smoke port must not use the default port 1337"
+fi
+
 PROXY_BASE_URL="http://${PROXY_HOST}:${PROXY_PORT}"
-START_PROXY="${START_PROXY:-1}"
 TMP_PARENT="${LIVE_CLI_SMOKE_TMP_PARENT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
 SMOKE_DIR="${LIVE_CLI_SMOKE_DIR:-$(mktemp -d "${TMP_PARENT%/}/live-cli-smoke.XXXXXX")}"
 if [[ "${SMOKE_DIR}" != /* ]]; then
@@ -51,15 +113,156 @@ else
 fi
 
 proxy_pid=""
+proxy_pgid=""
+active_pid=""
+active_pgid=""
+proxy_listen_confirmed=0
+LAST_PROCESS_PID=""
+LAST_PROCESS_PGID=""
 
-cleanup() {
-  if [[ -n "${proxy_pid}" ]] && kill -0 "${proxy_pid}" 2>/dev/null; then
-    kill "${proxy_pid}" 2>/dev/null || true
-    wait "${proxy_pid}" 2>/dev/null || true
+process_is_running() {
+  local pid="$1"
+  local state
+  kill -0 "${pid}" 2>/dev/null || return 1
+  state="$(ps -o stat= -p "${pid}" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+  [[ "${state}" != Z* ]]
+}
+
+process_group_is_alive() {
+  local pgid="$1"
+  [[ -n "${pgid}" ]] || return 1
+  kill -0 -- "-${pgid}" 2>/dev/null
+}
+
+start_process_group() {
+  set -m
+  "$@" &
+  LAST_PROCESS_PID="$!"
+  LAST_PROCESS_PGID="${LAST_PROCESS_PID}"
+  set +m
+}
+
+terminate_process_group() {
+  local pid="$1"
+  local pgid="$2"
+  local deadline
+
+  if process_group_is_alive "${pgid}"; then
+    kill -TERM -- "-${pgid}" 2>/dev/null || true
+    deadline=$((SECONDS + SMOKE_PROCESS_TERM_GRACE_SECONDS))
+    while process_group_is_alive "${pgid}" && (( SECONDS < deadline )); do
+      sleep 0.1
+    done
+    if process_group_is_alive "${pgid}"; then
+      kill -KILL -- "-${pgid}" 2>/dev/null || true
+    fi
+  elif [[ -n "${pid}" ]] && process_is_running "${pid}"; then
+    kill -TERM "${pid}" 2>/dev/null || true
+  fi
+  if [[ -n "${pid}" ]]; then
+    wait "${pid}" 2>/dev/null || true
   fi
 }
 
+run_with_deadline() {
+  local timeout_seconds="$1"
+  local label="$2"
+  shift 2
+  local deadline rc pid pgid
+
+  start_process_group "$@"
+  pid="${LAST_PROCESS_PID}"
+  pgid="${LAST_PROCESS_PGID}"
+  active_pid="${pid}"
+  active_pgid="${pgid}"
+  deadline=$((SECONDS + timeout_seconds))
+
+  while process_is_running "${pid}"; do
+    if (( SECONDS >= deadline )); then
+      log "${label} exceeded ${timeout_seconds}s deadline; terminating process group ${pgid}"
+      terminate_process_group "${pid}" "${pgid}"
+      active_pid=""
+      active_pgid=""
+      return 124
+    fi
+    sleep 0.1
+  done
+
+  if wait "${pid}"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  # A CLI may exit while leaving descendants behind. Reap the entire dedicated
+  # group before returning so one test cannot leak work into the next one.
+  if process_group_is_alive "${pgid}"; then
+    terminate_process_group "" "${pgid}"
+  fi
+  active_pid=""
+  active_pgid=""
+  return "${rc}"
+}
+
+port_is_open() {
+  local python_bin host
+  python_bin="$(python_command)"
+  host="$(connect_host)"
+  "${python_bin}" - "${host}" "${PROXY_PORT}" <<'PY_CONNECT' >/dev/null 2>&1
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+try:
+    with socket.create_connection((host, port), timeout=0.2):
+        pass
+except OSError:
+    raise SystemExit(1)
+PY_CONNECT
+}
+
+wait_for_port_release() {
+  local deadline=$((SECONDS + SMOKE_PORT_RELEASE_TIMEOUT_SECONDS))
+  while (( SECONDS < deadline )); do
+    if ! port_is_open; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  ! port_is_open
+}
+
+dump_proxy_log() {
+  if [[ -f "${PROXY_LOG}" ]]; then
+    log "Proxy log:"
+    cat "${PROXY_LOG}" >&2
+  fi
+}
+
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM
+
+  if [[ -n "${active_pgid}" ]]; then
+    terminate_process_group "${active_pid}" "${active_pgid}"
+    active_pid=""
+    active_pgid=""
+  fi
+  if [[ -n "${proxy_pgid}" ]]; then
+    terminate_process_group "${proxy_pid}" "${proxy_pgid}"
+    proxy_pid=""
+    proxy_pgid=""
+  fi
+  if [[ "${proxy_listen_confirmed}" == "1" ]] && ! wait_for_port_release; then
+    printf 'error: proxy cleanup did not release %s:%s\n' "${PROXY_HOST}" "${PROXY_PORT}" >&2
+    rc=1
+  fi
+  exit "${rc}"
+}
+
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 seed_access_token() {
   if [[ -z "${COPILOT_GITHUB_TOKEN:-}" ]]; then
@@ -174,12 +377,16 @@ start_proxy() {
   if [[ "${SMOKE_PROVIDER}" == "zen" ]]; then
     [[ -f "${PROVIDERS_CONFIG}" ]] || die "providers config not found: ${PROVIDERS_CONFIG}"
     log "Starting proxy at ${PROXY_BASE_URL} with ${PROVIDERS_CONFIG} (no credentials)"
+    set -m
     "${PROXY_BIN}" \
       --host "${PROXY_HOST}" \
       --port "${PROXY_PORT}" \
+      --log-level info \
       --providers-config "${PROVIDERS_CONFIG}" \
       >"${PROXY_LOG}" 2>&1 &
     proxy_pid="$!"
+    proxy_pgid="${proxy_pid}"
+    set +m
     return
   fi
 
@@ -187,33 +394,92 @@ start_proxy() {
   seed_access_token
 
   log "Starting proxy at ${PROXY_BASE_URL}"
+  set -m
   "${PROXY_BIN}" \
     --host "${PROXY_HOST}" \
     --port "${PROXY_PORT}" \
+    --log-level info \
     --token-dir "${PROXY_TOKEN_DIR}" \
     >"${PROXY_LOG}" 2>&1 &
   proxy_pid="$!"
+  proxy_pgid="${proxy_pid}"
+  set +m
+}
+
+proxy_log_has_expected_listener() {
+  [[ -f "${PROXY_LOG}" ]] || return 1
+  jq -R -s -e --arg addr "${PROXY_HOST}:${PROXY_PORT}" '
+    [
+      split("\n")[]
+      | fromjson?
+      | select(.level == "info" and .msg == "vekil listening" and .addr == $addr)
+    ]
+    | length > 0
+  ' "${PROXY_LOG}" >/dev/null 2>&1
+}
+
+proxy_log_has_fatal() {
+  [[ -f "${PROXY_LOG}" ]] || return 1
+  jq -R -s -e '
+    [split("\n")[] | fromjson? | select(.level == "fatal")]
+    | length > 0
+  ' "${PROXY_LOG}" >/dev/null 2>&1
+}
+
+assert_spawned_proxy_alive() {
+  if proxy_log_has_fatal; then
+    dump_proxy_log
+    die "spawned proxy logged a fatal startup error"
+  fi
+  if ! process_is_running "${proxy_pid}"; then
+    dump_proxy_log
+    die "spawned proxy PID ${proxy_pid} exited before readiness"
+  fi
 }
 
 wait_for_ready() {
-  local attempt
-  for attempt in $(seq 1 60); do
-    if curl -fsS "${PROXY_BASE_URL}/readyz" > "${SMOKE_DIR}/readyz.json"; then
+  local deadline=$((SECONDS + SMOKE_STARTUP_TIMEOUT_SECONDS))
+  local listen_seen=0
+
+  while (( SECONDS < deadline )); do
+    assert_spawned_proxy_alive
+
+    if [[ "${listen_seen}" == "0" ]]; then
+      if proxy_log_has_expected_listener; then
+        listen_seen=1
+        proxy_listen_confirmed=1
+      else
+        sleep 0.1
+        continue
+      fi
+    fi
+
+    if curl --fail --silent --show-error \
+      --connect-timeout "${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS}" \
+      --max-time "${SMOKE_READINESS_REQUEST_MAX_TIME_SECONDS}" \
+      "${PROXY_BASE_URL}/readyz" > "${SMOKE_DIR}/readyz.json" 2>/dev/null; then
+      # Check again after the HTTP response. This prevents a stale listener from
+      # satisfying readiness while the process we launched exits concurrently.
+      assert_spawned_proxy_alive
+      proxy_log_has_expected_listener || {
+        dump_proxy_log
+        die "spawned proxy never logged the expected listener ${PROXY_HOST}:${PROXY_PORT}"
+      }
       return 0
     fi
-    sleep 2
+    sleep 0.2
   done
 
-  if [[ -f "${PROXY_LOG}" ]]; then
-    log "Proxy log from failed readiness check:"
-    cat "${PROXY_LOG}" >&2
-  fi
-
-  die "proxy never became ready at ${PROXY_BASE_URL}"
+  dump_proxy_log
+  die "proxy never became ready at ${PROXY_BASE_URL} within ${SMOKE_STARTUP_TIMEOUT_SECONDS}s"
 }
 
 fetch_models() {
-  curl -fsS "${PROXY_BASE_URL}/v1/models" > "${MODELS_JSON}"
+  curl --fail --silent --show-error \
+    --connect-timeout "${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS}" \
+    --max-time "${SMOKE_CURL_MAX_TIME_SECONDS}" \
+    "${PROXY_BASE_URL}/v1/models" > "${MODELS_JSON}" \
+    || die "GET ${PROXY_BASE_URL}/v1/models failed"
   jq -e '.data | length > 0' "${MODELS_JSON}" >/dev/null || die "no models returned by ${PROXY_BASE_URL}/v1/models"
 }
 
@@ -229,21 +495,62 @@ run_codex_smoke() {
   printf 'model = "%s"\nopenai_base_url = "%s"\n' "${CODEX_MODEL}" "${PROXY_BASE_URL}/v1" > "${home_dir}/.codex/config.toml"
 
   log "Running Codex smoke with model ${CODEX_MODEL}"
-  HOME="${home_dir}" \
-  OPENAI_API_KEY=dummy \
-  OPENAI_BASE_URL="${PROXY_BASE_URL}/v1" \
-  codex exec \
-    --skip-git-repo-check \
-    --cd "${case_dir}" \
-    --dangerously-bypass-approvals-and-sandbox \
-    -m "${CODEX_MODEL}" \
-    --color never \
-    -o "${output_file}" \
-    "${PROMPT}"
+  run_with_deadline "${SMOKE_CLI_TIMEOUT_SECONDS}" "Codex CLI" \
+    env \
+      HOME="${home_dir}" \
+      OPENAI_API_KEY=dummy \
+      OPENAI_BASE_URL="${PROXY_BASE_URL}/v1" \
+      codex exec \
+        --skip-git-repo-check \
+        --cd "${case_dir}" \
+        --dangerously-bypass-approvals-and-sandbox \
+        -m "${CODEX_MODEL}" \
+        --color never \
+        -o "${output_file}" \
+        "${PROMPT}" \
+    || die "Codex CLI failed or timed out"
 
   actual="$(read_normalized_output "${output_file}")"
   assert_exact_output "codex" "${expected}" "${actual}"
   printf '%s' "${actual}" > "${output_file}"
+}
+
+run_claude_command() {
+  local case_dir="$1"
+  local home_dir="$2"
+  local output_file="$3"
+  local model="$4"
+  cd "${case_dir}"
+  HOME="${home_dir}" \
+  ANTHROPIC_BASE_URL="${PROXY_BASE_URL}" \
+  ANTHROPIC_API_KEY=dummy \
+  claude \
+    --dangerously-skip-permissions \
+    --print \
+    --output-format text \
+    --model "${model}" \
+    "${PROMPT}" \
+    > "${output_file}" < /dev/null
+}
+
+run_gemini_command() {
+  local case_dir="$1"
+  local home_dir="$2"
+  local output_file="$3"
+  local model="$4"
+  cd "${case_dir}"
+  HOME="${home_dir}" \
+  GEMINI_API_KEY=dummy \
+  GOOGLE_GEMINI_BASE_URL="${PROXY_BASE_URL}" \
+  GOOGLE_GENAI_API_VERSION=v1beta \
+  GEMINI_CLI_NO_RELAUNCH=true \
+  GEMINI_CLI_TRUST_WORKSPACE=true \
+  gemini \
+    -m "${model}" \
+    -p "${PROMPT}" \
+    -o text \
+    -y \
+    > "${output_file}" < /dev/null
 }
 
 run_claude_smoke() {
@@ -266,19 +573,9 @@ run_claude_smoke() {
 EOF
 
   log "Running Claude smoke with model ${CLAUDE_MODEL}"
-  (
-    cd "${case_dir}"
-    HOME="${home_dir}" \
-    ANTHROPIC_BASE_URL="${PROXY_BASE_URL}" \
-    ANTHROPIC_API_KEY=dummy \
-    claude \
-      --dangerously-skip-permissions \
-      --print \
-      --output-format text \
-      --model "${CLAUDE_MODEL}" \
-      "${PROMPT}" \
-      > "${output_file}"
-  )
+  run_with_deadline "${SMOKE_CLI_TIMEOUT_SECONDS}" "Claude CLI" \
+    run_claude_command "${case_dir}" "${home_dir}" "${output_file}" "${CLAUDE_MODEL}" \
+    || die "Claude CLI failed or timed out"
 
   actual="$(read_normalized_output "${output_file}")"
   assert_exact_output "claude" "${expected}" "${actual}"
@@ -306,21 +603,9 @@ run_gemini_smoke() {
 EOF
 
   log "Running Gemini smoke with model ${GEMINI_MODEL}"
-  (
-    cd "${case_dir}"
-    HOME="${home_dir}" \
-    GEMINI_API_KEY=dummy \
-    GOOGLE_GEMINI_BASE_URL="${PROXY_BASE_URL}" \
-    GOOGLE_GENAI_API_VERSION=v1beta \
-    GEMINI_CLI_NO_RELAUNCH=true \
-    GEMINI_CLI_TRUST_WORKSPACE=true \
-    gemini \
-      -m "${GEMINI_MODEL}" \
-      -p "${PROMPT}" \
-      -o text \
-      -y \
-      > "${output_file}"
-  )
+  run_with_deadline "${SMOKE_CLI_TIMEOUT_SECONDS}" "Gemini CLI" \
+    run_gemini_command "${case_dir}" "${home_dir}" "${output_file}" "${GEMINI_MODEL}" \
+    || die "Gemini CLI failed or timed out"
 
   actual="$(read_normalized_output "${output_file}")"
   assert_exact_output "gemini" "${expected}" "${actual}"
@@ -330,20 +615,20 @@ EOF
 # ---------------------------------------------------------------------------
 # Zen mode (SMOKE_PROVIDER=zen): credential-free OpenCode Zen free-tier smoke.
 #
-# The free tier rotates and is rate-limited per IP, so the contract is:
-#   - hard FAIL only on a real proxy fault, or a model that a raw-chat canary
-#     proves reachable yet whose CLI output is wrong (a translation regression);
-#   - SKIP (try the next model) on promo-ended / 401 / 429 / 5xx / transport;
-#   - exit 0 if >=1 harness passes OR every model is upstream-unreachable
-#     (neutral skip — a Zen outage must not block unrelated PRs).
+# The free tier rotates and is rate-limited per IP, so the contract is strict:
+#   - an initial canary may skip only specifically recognized transient upstream
+#     conditions evidenced by HTTP (promotion ended, 408/425/429, or 5xx);
+#   - after a 200 canary, any CLI nonzero/timeout/invalid output is a hard failure
+#     unless one bounded second canary proves such a transient appeared;
+#   - every installed client must pass independently;
+#   - neutral exit 0 is allowed only if no model was reachable before any client
+#     was exercised.
 # Codex is intentionally excluded: codex CLI is /responses-only and always sends
 # a nameless web_search tool that Zen free upstreams reject. Copilot CLI covers
 # the same role via COPILOT_PROVIDER_WIRE_API=completions.
 # ---------------------------------------------------------------------------
 
 # Preference order for free models; intersected with the live /v1/models catalog.
-# deepseek-v4-flash-free is first because it returns clean output (some weaker
-# free models leak chain-of-thought), so it anchors the mismatch=FAIL check.
 ZEN_MODEL_PREFS=(
   deepseek-v4-flash-free
   mimo-v2.5-free
@@ -353,71 +638,147 @@ ZEN_MODEL_PREFS=(
 )
 
 ATTEMPT_STATUS=""
+ATTEMPT_DETAIL=""
+ZEN_ANY_CLIENT_EXERCISED=0
 
-# zen_canary <model> -> echoes: OK | SKIP <reason> | FAIL <reason>
-# A raw /v1/chat/completions probe that decides reachability before we trust a
-# CLI's output. Distinguishes a proxy-generated fault from an upstream outage.
+zen_error_is_transient() {
+  local message="$1"
+  printf '%s' "${message}" | grep -qiE \
+    'promotion (has )?ended|free promotion[^[:alnum:]]+ended|rate[ -]?limit|too many requests|temporar(il)?y unavailable|service unavailable|overload(ed)?|over capacity|capacity (has been )?exceeded|upstream[^[:alnum:]]+(timeout|unavailable)|gateway timeout'
+}
+
+# zen_canary <model> [artifact-tag] -> echoes:
+#   OK <detail> | TRANSIENT <recognized-reason> | FAIL <reason>
 zen_canary() {
   local model="$1"
-  local body="${SMOKE_DIR}/canary-${model//[^a-zA-Z0-9_.-]/_}.json"
-  local request="${SMOKE_DIR}/canary-req-${model//[^a-zA-Z0-9_.-]/_}.json"
-  local code errmsg
+  local tag="${2:-initial}"
+  local safe="${model//[^a-zA-Z0-9_.-]/_}-${tag//[^a-zA-Z0-9_.-]/_}"
+  local body="${SMOKE_DIR}/canary-${safe}.json"
+  local request="${SMOKE_DIR}/canary-req-${safe}.json"
+  local curl_error="${SMOKE_DIR}/canary-${safe}.curl.err"
+  local code errmsg curl_rc
 
-  # Build the request body with jq so model IDs are always valid JSON (matches
-  # probe_model in live-zen-smoke.sh and live-compact-smoke.sh).
   jq -n --arg model "${model}" \
     '{model: $model, max_tokens: 16, messages: [{role: "user", content: "ping"}]}' \
-    > "${request}" || { printf 'SKIP request-build-error\n'; return; }
+    > "${request}" || { printf 'FAIL request-build-error\n'; return; }
 
-  code="$(curl -s -o "${body}" -w '%{http_code}' --max-time 60 \
+  if code="$(curl --silent --show-error \
+    --output "${body}" \
+    --write-out '%{http_code}' \
+    --connect-timeout "${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS}" \
+    --max-time "${SMOKE_CURL_MAX_TIME_SECONDS}" \
     -X POST "${PROXY_BASE_URL}/v1/chat/completions" \
     -H 'content-type: application/json' \
     --data-binary "@${request}" \
-    2>/dev/null)" || { printf 'SKIP transport-error\n'; return; }
+    2>"${curl_error}")"; then
+    curl_rc=0
+  else
+    curl_rc=$?
+  fi
+
+  if [[ "${curl_rc}" -ne 0 ]]; then
+    # This curl terminates at the local Vekil boundary. A timeout or transport
+    # failure may be a stuck proxy handler, so only an HTTP response can prove
+    # an upstream transient.
+    printf 'FAIL curl-exit-%s\n' "${curl_rc}"
+    return
+  fi
 
   errmsg="$(jq -r '.error.message? // empty' "${body}" 2>/dev/null || true)"
-  if printf '%s' "${errmsg}" | grep -qiE 'promotion has ended|not supported for format'; then
-    printf 'SKIP promo-ended\n'; return
-  fi
-  if printf '%s' "${errmsg}" | grep -qiE 'does not support /|unknown model|no upstream'; then
-    printf 'FAIL proxy:%s\n' "${errmsg:0:80}"; return
-  fi
+
+  # Status and successful-response shape are authoritative. In particular, a
+  # hard 404/405 or malformed 200 cannot be softened by transient-looking text.
   case "${code}" in
-    200) printf 'OK\n' ;;
-    400) printf 'FAIL http-400:%s\n' "${errmsg:0:80}" ;;     # proxy-generated bad request
-    401|403|429|5*) printf 'SKIP http-%s\n' "${code}" ;;
-    *) printf 'SKIP http-%s\n' "${code}" ;;
+    200)
+      if jq -e '.choices[0].message' "${body}" >/dev/null 2>&1; then
+        printf 'OK http-200\n'
+      else
+        printf 'FAIL http-200-bad-shape\n'
+      fi
+      ;;
+    400|404|405)
+      printf 'FAIL http-%s:%s\n' "${code}" "${errmsg:0:80}"
+      ;;
+    408|425|429|5??)
+      if printf '%s' "${errmsg}" | grep -qiE 'does not support /|unknown model|no upstream'; then
+        printf 'FAIL proxy:%s\n' "${errmsg:0:80}"
+      else
+        printf 'TRANSIENT http-%s\n' "${code}"
+      fi
+      ;;
+    401|403)
+      if printf '%s' "${errmsg}" | grep -qiE 'does not support /|unknown model|no upstream'; then
+        printf 'FAIL proxy:%s\n' "${errmsg:0:80}"
+      elif zen_error_is_transient "${errmsg}"; then
+        printf 'TRANSIENT message:%s\n' "${errmsg:0:80}"
+      else
+        printf 'FAIL http-%s:%s\n' "${code}" "${errmsg:0:80}"
+      fi
+      ;;
+    *)
+      printf 'FAIL http-%s:%s\n' "${code}" "${errmsg:0:80}"
+      ;;
   esac
 }
 
-# run_harness_iterated <client> <model>...  -> 0 pass, 2 all-skipped; dies on fault.
+# run_harness_iterated <client> <model>... -> 0 pass, 2 no initial reachability.
 run_harness_iterated() {
-  local client="$1"; shift
-  local model verdict status
+  local client="$1"
+  shift
+  local model verdict status second_verdict second_status
+
   for model in "$@"; do
-    verdict="$(zen_canary "${model}")"
+    verdict="$(zen_canary "${model}" "${client}-before")"
     status="${verdict%% *}"
     case "${status}" in
-      SKIP) log "[${client}] skip ${model} (${verdict#* })"; continue ;;
-      FAIL) die "[${client}] proxy fault on ${model}: ${verdict#* } (see ${PROXY_LOG})" ;;
+      TRANSIENT)
+        log "[${client}] skip ${model} before CLI (${verdict#* })"
+        continue
+        ;;
+      FAIL)
+        die "[${client}] canary failed for ${model}: ${verdict#* }"
+        ;;
+      OK)
+        ;;
+      *)
+        die "[${client}] unrecognized canary verdict for ${model}: ${verdict}"
+        ;;
     esac
 
-    # Canary says reachable. Run the real CLI and classify the result.
+    ZEN_ANY_CLIENT_EXERCISED=1
     run_zen_harness_once "${client}" "${model}"
-    case "${ATTEMPT_STATUS}" in
-      PASS)
-        log "[${client}] PASS ${model}"; return 0 ;;
-      FAIL_WRONG)
-        die "[${client}] ${model} reachable (canary 200) but output mismatch — translation regression" ;;
-      SKIP_UPSTREAM)
-        log "[${client}] skip ${model} (CLI/upstream error after reachable canary)"; continue ;;
+    if [[ "${ATTEMPT_STATUS}" == "PASS" ]]; then
+      log "[${client}] PASS ${model}"
+      return 0
+    fi
+
+    # A reachable model followed by a bad CLI result is not skippable on its own.
+    # Give the upstream one bounded re-check; only an explicitly recognized
+    # transient may excuse this attempt.
+    second_verdict="$(zen_canary "${model}" "${client}-after")"
+    second_status="${second_verdict%% *}"
+    case "${second_status}" in
+      TRANSIENT)
+        log "[${client}] ${model} CLI ${ATTEMPT_DETAIL}; second canary proved transient (${second_verdict#* })"
+        continue
+        ;;
+      OK)
+        die "[${client}] ${model} canary remained reachable after CLI ${ATTEMPT_DETAIL}"
+        ;;
+      FAIL)
+        die "[${client}] ${model} CLI ${ATTEMPT_DETAIL}; second canary failed: ${second_verdict#* }"
+        ;;
+      *)
+        die "[${client}] unrecognized second canary verdict for ${model}: ${second_verdict}"
+        ;;
     esac
   done
-  log "[${client}] SKIP — no reachable free model"
+
+  log "[${client}] no model was initially reachable"
   return 2
 }
 
-# run_zen_harness_once <client> <model> -> sets ATTEMPT_STATUS=PASS|FAIL_WRONG|SKIP_UPSTREAM
+# run_zen_harness_once <client> <model> -> ATTEMPT_STATUS=PASS|INVALID.
 run_zen_harness_once() {
   local client="$1"
   local model="$2"
@@ -426,25 +787,43 @@ run_zen_harness_once() {
   local expected actual rc
 
   rm -rf "${case_dir}"
+  rm -f "${output_file}" "${SMOKE_DIR}/outputs/${client}.err"
   expected="$(write_case_files "${case_dir}" "${client}")"
 
-  rc=0
-  "run_${client}_zen" "${case_dir}" "${model}" "${output_file}" || rc=$?
+  if run_with_deadline "${SMOKE_CLI_TIMEOUT_SECONDS}" "${client} CLI (${model})" \
+    "run_${client}_zen" "${case_dir}" "${model}" "${output_file}"; then
+    rc=0
+  else
+    rc=$?
+  fi
   if [[ "${rc}" -ne 0 ]]; then
-    ATTEMPT_STATUS="SKIP_UPSTREAM"; return 0
+    ATTEMPT_STATUS="INVALID"
+    ATTEMPT_DETAIL="exited ${rc}"
+    return 0
+  fi
+  if [[ ! -f "${output_file}" ]]; then
+    ATTEMPT_STATUS="INVALID"
+    ATTEMPT_DETAIL="produced no output file"
+    return 0
   fi
 
   actual="$(read_normalized_output "${output_file}")"
   if [[ -z "${actual}" ]]; then
-    ATTEMPT_STATUS="SKIP_UPSTREAM"; return 0
+    ATTEMPT_STATUS="INVALID"
+    ATTEMPT_DETAIL="produced empty output"
+    return 0
   fi
   if [[ "${actual}" == "${expected}" ]]; then
     ATTEMPT_STATUS="PASS"
-  else
-    printf 'expected %s output: %s\n' "${client}" "${expected}" >&2
-    printf 'actual %s output:   %s\n' "${client}" "${actual}" >&2
-    ATTEMPT_STATUS="FAIL_WRONG"
+    ATTEMPT_DETAIL="passed"
+    printf '%s' "${actual}" > "${output_file}"
+    return 0
   fi
+
+  printf 'expected %s output: %s\n' "${client}" "${expected}" >&2
+  printf 'actual %s output:   %s\n' "${client}" "${actual}" >&2
+  ATTEMPT_STATUS="INVALID"
+  ATTEMPT_DETAIL="returned mismatched output"
   return 0
 }
 
@@ -496,7 +875,7 @@ EOF
       --output-format text \
       --model "${model}" \
       "${PROMPT}" \
-      > "${output_file}" < /dev/null
+      > "${output_file}" 2>"${SMOKE_DIR}/outputs/claude.err" < /dev/null
   )
 }
 
@@ -530,7 +909,7 @@ EOF
       -p "${PROMPT}" \
       -o text \
       -y \
-      > "${output_file}" < /dev/null
+      > "${output_file}" 2>"${SMOKE_DIR}/outputs/gemini.err" < /dev/null
   )
 }
 
@@ -559,35 +938,48 @@ main_zen() {
   [[ "${#candidates[@]}" -gt 0 ]] || die "zen config lists no usable models (checked: ${ZEN_MODEL_PREFS[*]})"
   log "Zen candidate models: ${candidates[*]}"
 
-  local any_pass=0 any_skip=0 rc
+  local rc
 
-  # Copilot CLI is required; Claude and Gemini are optional (skipped if absent).
+  # Copilot CLI is required; installed Claude and Gemini clients are also gates.
   local clients=(copilot)
-  command -v claude >/dev/null 2>&1 && clients+=(claude) || log "claude not installed; skipping Claude harness"
-  command -v gemini >/dev/null 2>&1 && clients+=(gemini) || log "gemini not installed; skipping Gemini harness"
+  if command -v claude >/dev/null 2>&1; then
+    clients+=(claude)
+  else
+    log "claude not installed; skipping Claude harness"
+  fi
+  if command -v gemini >/dev/null 2>&1; then
+    clients+=(gemini)
+  else
+    log "gemini not installed; skipping Gemini harness"
+  fi
 
   local client
   for client in "${clients[@]}"; do
-    rc=0
-    run_harness_iterated "${client}" "${candidates[@]}" || rc=$?
+    if run_harness_iterated "${client}" "${candidates[@]}"; then
+      rc=0
+    else
+      rc=$?
+    fi
     case "${rc}" in
-      0) any_pass=1 ;;
-      2) any_skip=1 ;;
+      0)
+        ;;
+      2)
+        if [[ "${ZEN_ANY_CLIENT_EXERCISED}" == "0" ]]; then
+          log "Zen smoke NEUTRAL SKIP: no free model was reachable before any client was exercised."
+          log "This is not a proxy failure; re-check the live free set with:"
+          log "  curl --connect-timeout 10 --max-time 30 -s https://opencode.ai/zen/v1/models -H 'authorization: Bearer public'"
+          return 0
+        fi
+        die "[${client}] did not pass after the smoke had already exercised a reachable model"
+        ;;
+      *)
+        die "[${client}] harness returned unexpected status ${rc}"
+        ;;
     esac
   done
 
-  if [[ "${any_pass}" -eq 1 ]]; then
-    log "Zen smoke passed (>=1 harness produced exact output through the proxy)."
-    log "Artifacts: ${SMOKE_DIR}"
-    return 0
-  fi
-  if [[ "${any_skip}" -eq 1 ]]; then
-    log "Zen smoke NEUTRAL SKIP: no free model was reachable (rotation / rate limit / outage)."
-    log "This is not a proxy failure; re-check the live free set with:"
-    log "  curl -s https://opencode.ai/zen/v1/models -H 'authorization: Bearer public'"
-    return 0
-  fi
-  die "Zen smoke produced neither a pass nor a skip (unexpected)"
+  log "Zen smoke passed: every installed client produced exact output independently."
+  log "Artifacts: ${SMOKE_DIR}"
 }
 
 main() {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,6 +42,17 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+type observedDoneContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+func (c *observedDoneContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
 }
 
 func newRoundTripTestProxyHandler(t testing.TB, transport roundTripFunc) *ProxyHandler {
@@ -91,6 +103,20 @@ func jsonHTTPResponse(body string) *http.Response {
 		Header:     h,
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
+}
+
+func paddedProviderModelCatalog(t testing.TB, size int, modelID string) []byte {
+	t.Helper()
+	prefix := []byte(fmt.Sprintf(`{"object":"list","data":[{"id":%q,"object":"model","owned_by":"test","name":"Oversized metadata","description":"Oversized metadata"}]}`, modelID))
+	if len(prefix) > size {
+		t.Fatalf("catalog prefix is %d bytes, exceeds requested size %d", len(prefix), size)
+	}
+	body := make([]byte, size)
+	copy(body, prefix)
+	for i := len(prefix); i < len(body); i++ {
+		body[i] = ' '
+	}
+	return body
 }
 
 func sseHTTPResponse(body string) *http.Response {
@@ -283,6 +309,51 @@ func TestHandleReadyz(t *testing.T) {
 		}
 		if got := probeHits.Load(); got != 0 {
 			t.Fatalf("expected no upstream probe, got %d hits", got)
+		}
+	})
+
+	t.Run("dynamic generic provider still requires models probe", func(t *testing.T) {
+		var probeHits atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			probeHits.Add(1)
+			if r.URL.Path != "/models" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		}))
+		defer upstream.Close()
+
+		h, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.New(logger.LevelInfo),
+			WithProvidersConfig(ProvidersConfig{
+				Providers: []ProviderConfig{{
+					ID:             "dynamic",
+					Type:           "openai-compatible",
+					Default:        true,
+					BaseURL:        upstream.URL,
+					AuthType:       "none",
+					ModelDiscovery: "openai",
+				}},
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler returned error: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		w := httptest.NewRecorder()
+		h.HandleReadyz(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+		}
+		if got := probeHits.Load(); got != 1 {
+			t.Fatalf("expected one dynamic upstream probe, got %d hits", got)
 		}
 	})
 
@@ -579,6 +650,7 @@ func TestHandleAnthropicMessagesCountTokensFallbacksToMaxTokens(t *testing.T) {
 }
 
 func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProvider(t *testing.T) {
+	const upstreamBody = "{\n  \"input_tokens\": 42\n}\n"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Path; got != "/native/messages/count_tokens" {
 			t.Fatalf("expected native count_tokens path /native/messages/count_tokens, got %s", got)
@@ -602,7 +674,8 @@ func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProv
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"input_tokens":42}`))
+		w.Header().Set("X-Upstream-Count", "preserved")
+		_, _ = io.WriteString(w, upstreamBody)
 	}))
 	defer upstream.Close()
 
@@ -647,12 +720,408 @@ func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProv
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
 	}
+	if got := resp.Header.Get("X-Upstream-Count"); got != "preserved" {
+		t.Fatalf("X-Upstream-Count = %q, want preserved", got)
+	}
+	rawBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read count_tokens response: %v", err)
+	}
+	if string(rawBody) != upstreamBody {
+		t.Fatalf("count_tokens body = %q, want byte-identical %q", rawBody, upstreamBody)
+	}
 	var countResp models.AnthropicCountTokensResponse
-	if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+	if err := json.Unmarshal(rawBody, &countResp); err != nil {
 		t.Fatalf("decode count_tokens response: %v", err)
 	}
 	if countResp.InputTokens != 42 {
 		t.Fatalf("input_tokens = %d, want 42", countResp.InputTokens)
+	}
+}
+
+func TestHandleAnthropicMessages_FilteredDynamicProviderRetainsRawDiscoveredModelIDs(t *testing.T) {
+	rawModels := []string{"claude-sonnet-4-5", "claude-sonnet-4-20250514"}
+	var modelsHits atomic.Int32
+	var messagesMu sync.Mutex
+	forwardedModels := make([]string, 0, len(rawModels))
+
+	anthropicUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			modelsHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"claude-sonnet-4-5","object":"model","owned_by":"anthropic"},{"id":"claude-sonnet-4-20250514","object":"model","owned_by":"anthropic"}]}`))
+		case "/v1/messages":
+			var payload struct {
+				Model string `json:"model"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("decode upstream messages request: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			messagesMu.Lock()
+			forwardedModels = append(forwardedModels, payload.Model)
+			messagesMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"msg-1","type":"message","role":"assistant","model":%q,"content":[],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`, payload.Model)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer anthropicUpstream.Close()
+
+	var fallbackHits atomic.Int32
+	fallbackUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackHits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer fallbackUpstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:             "fallback",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        fallbackUpstream.URL,
+				AuthType:       "none",
+				ModelDiscovery: "static",
+				Models:         []ProviderModelConfig{{PublicID: "fallback-only"}},
+			},
+			{
+				ID:             "anthropic",
+				Type:           "anthropic-compatible",
+				BaseURL:        anthropicUpstream.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+				IncludeModels:  rawModels,
+			},
+		}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+	if got := modelsHits.Load(); got != 1 {
+		t.Fatalf("startup /models hits = %d, want 1", got)
+	}
+
+	for _, model := range rawModels {
+		t.Run(model, func(t *testing.T) {
+			body := fmt.Sprintf(`{"model":%q,"max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`, model)
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			handler.HandleAnthropicMessages(w, req)
+
+			resp := w.Result()
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusOK {
+				responseBody, _ := io.ReadAll(resp.Body)
+				t.Fatalf("messages status = %d, want 200: %s", resp.StatusCode, responseBody)
+			}
+		})
+	}
+
+	messagesMu.Lock()
+	gotForwardedModels := append([]string(nil), forwardedModels...)
+	messagesMu.Unlock()
+	if !reflect.DeepEqual(gotForwardedModels, rawModels) {
+		t.Fatalf("forwarded models = %v, want raw discovered IDs %v", gotForwardedModels, rawModels)
+	}
+	if got := fallbackHits.Load(); got != 0 {
+		t.Fatalf("fallback upstream hits = %d, want 0", got)
+	}
+}
+
+func TestHandleAnthropicMessages_ExactRawOwnerPrecedesNormalizedAlias(t *testing.T) {
+	type observedRequest struct {
+		path  string
+		model string
+	}
+	var rawMu sync.Mutex
+	rawRequests := make([]observedRequest, 0, 2)
+	rawUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode raw-owner request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		rawMu.Lock()
+		rawRequests = append(rawRequests, observedRequest{path: r.URL.Path, model: payload.Model})
+		rawMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/count_tokens") {
+			_, _ = w.Write([]byte(`{"input_tokens":7}`))
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"id":"msg-raw","type":"message","role":"assistant","model":%q,"content":[],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`, payload.Model)
+	}))
+	defer rawUpstream.Close()
+
+	var normalizedMu sync.Mutex
+	normalizedRequests := make([]observedRequest, 0, 1)
+	normalizedUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode normalized-owner request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		normalizedMu.Lock()
+		normalizedRequests = append(normalizedRequests, observedRequest{path: r.URL.Path, model: payload.Model})
+		normalizedMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"msg-normalized","type":"message","role":"assistant","model":%q,"content":[],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`, payload.Model)
+	}))
+	defer normalizedUpstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:           "normalized",
+				Type:         "anthropic-compatible",
+				Default:      true,
+				BaseURL:      normalizedUpstream.URL,
+				AuthType:     "none",
+				MessagesPath: "/normalized/messages",
+				Models: []ProviderModelConfig{
+					{PublicID: "claude-sonnet-4.5", Deployment: "normalized-sonnet", Endpoints: []string{"/v1/messages"}},
+					{PublicID: "claude-haiku-4.5", Deployment: "normalized-haiku", Endpoints: []string{"/v1/messages"}},
+				},
+			},
+			{
+				ID:           "raw",
+				Type:         "anthropic-compatible",
+				BaseURL:      rawUpstream.URL,
+				AuthType:     "none",
+				MessagesPath: "/raw/messages",
+				Models: []ProviderModelConfig{{
+					PublicID:   "claude-sonnet-4-5",
+					Deployment: "raw-sonnet",
+					Endpoints:  []string{"/v1/messages"},
+				}},
+			},
+		}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	requestMessages := func(model string) *http.Response {
+		t.Helper()
+		body := fmt.Sprintf(`{"model":%q,"max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`, model)
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.HandleAnthropicMessages(w, req)
+		return w.Result()
+	}
+
+	rawResp := requestMessages("claude-sonnet-4-5")
+	_ = rawResp.Body.Close()
+	if rawResp.StatusCode != http.StatusOK {
+		t.Fatalf("raw-owner messages status = %d, want 200", rawResp.StatusCode)
+	}
+
+	countReq := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"count"}]}`))
+	countReq.Header.Set("Content-Type", "application/json")
+	countW := httptest.NewRecorder()
+	handler.HandleAnthropicMessagesCountTokens(countW, countReq)
+	countResp := countW.Result()
+	_ = countResp.Body.Close()
+	if countResp.StatusCode != http.StatusOK {
+		t.Fatalf("raw-owner count_tokens status = %d, want 200", countResp.StatusCode)
+	}
+
+	ctx, summary := WithRequestSummary(context.Background())
+	handler.observeRequestSummary(ctx, "anthropic", "claude-sonnet-4-5", false, providerEndpointMessages)
+	if summary.provider != "raw" {
+		t.Fatalf("request summary provider = %q, want raw", summary.provider)
+	}
+	publicModel, upstreamModel := handler.directAnthropicResponseModels(&models.AnthropicRequest{Model: "claude-sonnet-4-5"})
+	if publicModel != "claude-sonnet-4-5" || upstreamModel != "raw-sonnet" {
+		t.Fatalf("direct response models = (%q, %q), want (claude-sonnet-4-5, raw-sonnet)", publicModel, upstreamModel)
+	}
+
+	aliasResp := requestMessages("claude-haiku-4-5")
+	_ = aliasResp.Body.Close()
+	if aliasResp.StatusCode != http.StatusOK {
+		t.Fatalf("normalized alias messages status = %d, want 200", aliasResp.StatusCode)
+	}
+
+	rawMu.Lock()
+	gotRawRequests := append([]observedRequest(nil), rawRequests...)
+	rawMu.Unlock()
+	wantRawRequests := []observedRequest{
+		{path: "/raw/messages", model: "raw-sonnet"},
+		{path: "/raw/messages/count_tokens", model: "raw-sonnet"},
+	}
+	if !reflect.DeepEqual(gotRawRequests, wantRawRequests) {
+		t.Fatalf("raw-owner requests = %+v, want %+v", gotRawRequests, wantRawRequests)
+	}
+	normalizedMu.Lock()
+	gotNormalizedRequests := append([]observedRequest(nil), normalizedRequests...)
+	normalizedMu.Unlock()
+	wantNormalizedRequests := []observedRequest{{path: "/normalized/messages", model: "normalized-haiku"}}
+	if !reflect.DeepEqual(gotNormalizedRequests, wantNormalizedRequests) {
+		t.Fatalf("normalized-owner requests = %+v, want %+v", gotNormalizedRequests, wantNormalizedRequests)
+	}
+}
+
+func TestHandleAnthropicTranslationPreservesExactRawOwnerAndNormalizedFallback(t *testing.T) {
+	type observedRequest struct {
+		model string
+		count bool
+	}
+	newChatUpstream := func(t *testing.T, observations *[]observedRequest, mu *sync.Mutex) *httptest.Server {
+		t.Helper()
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/chat/completions" {
+				t.Errorf("upstream path = %q, want /chat/completions", r.URL.Path)
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			var payload models.OpenAIRequest
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("decode translated request: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			isCount := payload.Stream != nil && !*payload.Stream
+			mu.Lock()
+			*observations = append(*observations, observedRequest{model: payload.Model, count: isCount})
+			mu.Unlock()
+			if isCount {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"id":"chat-count","object":"chat.completion","model":%q,"choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"length"}],"usage":{"prompt_tokens":9,"completion_tokens":1,"total_tokens":10}}`, payload.Model)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "data: {\"id\":\"chat-1\",\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n", payload.Model)
+			_, _ = fmt.Fprintf(w, "data: {\"id\":\"chat-1\",\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n", payload.Model)
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		}))
+	}
+
+	var rawMu sync.Mutex
+	rawRequests := make([]observedRequest, 0, 2)
+	rawUpstream := newChatUpstream(t, &rawRequests, &rawMu)
+	defer rawUpstream.Close()
+
+	var normalizedMu sync.Mutex
+	normalizedRequests := make([]observedRequest, 0, 2)
+	normalizedUpstream := newChatUpstream(t, &normalizedRequests, &normalizedMu)
+	defer normalizedUpstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:             "raw",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        rawUpstream.URL,
+				AuthType:       "none",
+				ModelDiscovery: "static",
+				Models: []ProviderModelConfig{{
+					PublicID:   "claude-sonnet-4-5",
+					Deployment: "raw-sonnet-upstream",
+					Endpoints:  []string{"/chat/completions"},
+				}},
+			},
+			{
+				ID:             "normalized",
+				Type:           "openai-compatible",
+				BaseURL:        normalizedUpstream.URL,
+				AuthType:       "none",
+				ModelDiscovery: "static",
+				Models: []ProviderModelConfig{
+					{PublicID: "claude-sonnet-4.5", Deployment: "normalized-sonnet-upstream", Endpoints: []string{"/chat/completions"}},
+					{PublicID: "claude-haiku-4.5", Deployment: "normalized-haiku-upstream", Endpoints: []string{"/chat/completions"}},
+				},
+			},
+		}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	requestMessages := func(model string) *RequestSummary {
+		t.Helper()
+		ctx, summary := WithRequestSummary(context.Background())
+		body := fmt.Sprintf(`{"model":%q,"max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`, model)
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)).WithContext(ctx)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.HandleAnthropicMessages(w, req)
+		resp := w.Result()
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			responseBody, _ := io.ReadAll(resp.Body)
+			t.Fatalf("messages(%q) status = %d, want 200: %s", model, resp.StatusCode, responseBody)
+		}
+		return summary
+	}
+	requestCountTokens := func(model string) *RequestSummary {
+		t.Helper()
+		ctx, summary := WithRequestSummary(context.Background())
+		body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"count"}]}`, model)
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(body)).WithContext(ctx)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.HandleAnthropicMessagesCountTokens(w, req)
+		resp := w.Result()
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			responseBody, _ := io.ReadAll(resp.Body)
+			t.Fatalf("count_tokens(%q) status = %d, want 200: %s", model, resp.StatusCode, responseBody)
+		}
+		return summary
+	}
+
+	if summary := requestMessages("claude-sonnet-4-5"); summary.provider != "raw" {
+		t.Fatalf("raw Messages summary provider = %q, want raw", summary.provider)
+	}
+	if summary := requestCountTokens("claude-sonnet-4-5"); summary.provider != "raw" {
+		t.Fatalf("raw count_tokens summary provider = %q, want raw", summary.provider)
+	}
+	if summary := requestMessages("claude-haiku-4-5"); summary.provider != "normalized" {
+		t.Fatalf("alias Messages summary provider = %q, want normalized", summary.provider)
+	}
+	if summary := requestCountTokens("claude-haiku-4-5"); summary.provider != "normalized" {
+		t.Fatalf("alias count_tokens summary provider = %q, want normalized", summary.provider)
+	}
+
+	rawMu.Lock()
+	gotRawRequests := append([]observedRequest(nil), rawRequests...)
+	rawMu.Unlock()
+	wantRawRequests := []observedRequest{
+		{model: "raw-sonnet-upstream", count: false},
+		{model: "raw-sonnet-upstream", count: true},
+	}
+	if !reflect.DeepEqual(gotRawRequests, wantRawRequests) {
+		t.Fatalf("raw-owner translated requests = %+v, want %+v", gotRawRequests, wantRawRequests)
+	}
+	normalizedMu.Lock()
+	gotNormalizedRequests := append([]observedRequest(nil), normalizedRequests...)
+	normalizedMu.Unlock()
+	wantNormalizedRequests := []observedRequest{
+		{model: "normalized-haiku-upstream", count: false},
+		{model: "normalized-haiku-upstream", count: true},
+	}
+	if !reflect.DeepEqual(gotNormalizedRequests, wantNormalizedRequests) {
+		t.Fatalf("normalized-owner translated requests = %+v, want %+v", gotNormalizedRequests, wantNormalizedRequests)
 	}
 }
 
@@ -1954,10 +2423,27 @@ func TestCompactResponsesRequestInChunks_CancelsFanoutOnFirstError(t *testing.T)
 
 	var chunkCalls atomic.Int32
 	var mergeCalls atomic.Int32
+	var failurePublished atomic.Bool
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		call := chunkCalls.Add(1)
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			t.Fatalf("read upstream body: %v", err)
+			// The second request is the asserted failure source and must remain
+			// active long enough to receive its complete request body. Once it
+			// publishes the 500, compact fanout intentionally cancels in-flight
+			// siblings; net/http may surface those aborted uploads as
+			// context.Canceled, io.ErrUnexpectedEOF, or an opaque closed-transport
+			// error. Only tolerate them after the asserted failure was published and
+			// this specific sibling's request context has actually been canceled.
+			if call != 2 && failurePublished.Load() {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+			t.Errorf("read active upstream body for call %d: %v", call, err)
+			return
 		}
 		var req map[string]interface{}
 		if err := json.Unmarshal(body, &req); err != nil {
@@ -1972,8 +2458,8 @@ func TestCompactResponsesRequestInChunks_CancelsFanoutOnFirstError(t *testing.T)
 			}
 		}
 
-		call := chunkCalls.Add(1)
 		if call == 2 {
+			failurePublished.Store(true)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte(`{"error":{"message":"chunk failed"}}`))
@@ -1998,6 +2484,92 @@ func TestCompactResponsesRequestInChunks_CancelsFanoutOnFirstError(t *testing.T)
 	}
 	if got := chunkCalls.Load(); got >= int32(len(chunks)) {
 		t.Fatalf("expected cancellation to stop before all %d chunks ran, got %d chunk calls", len(chunks), got)
+	}
+}
+
+func TestCompactResponsesRequestInChunks_PreservesWorkerErrorAfterShutdown(t *testing.T) {
+	const targetBodySize = 96 << 10
+	texts := make([]string, 0, 7)
+	for i := 0; i < 7; i++ {
+		texts = append(texts, fmt.Sprintf("item %d: %s", i+1, strings.Repeat("z", 60<<10)))
+	}
+	requestFields, chunks := compactChunkTestRequestFields(t, targetBodySize, texts)
+	if len(chunks) < 3 {
+		t.Fatalf("test setup expected at least 3 chunks, got %d", len(chunks))
+	}
+
+	siblingStarted := make(chan struct{})
+	fanoutCanceled := make(chan struct{})
+	releaseSibling := make(chan struct{})
+	var calls atomic.Int32
+	handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		switch call := calls.Add(1); call {
+		case 1:
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(
+					`{"id":"chunk-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first summary"}]}]}`)),
+				Request: req,
+			}, nil
+		case 2:
+			<-siblingStarted
+			return &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Header:     http.Header{"X-Worker-Failure": []string{"independent"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"worker failed"}}`)),
+				Request:    req,
+			}, nil
+		case 3:
+			close(siblingStarted)
+			<-req.Context().Done()
+			close(fanoutCanceled)
+			<-releaseSibling
+			return nil, req.Context().Err()
+		default:
+			return nil, fmt.Errorf("unexpected upstream call %d", call)
+		}
+	})
+	handler.maxRetries = 1
+	handler.compactChunkConcurrency = 2
+	handler.stats = newStatsCollector()
+	ctx, cancel := handler.newInferenceUpstreamContext(false)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := handler.compactResponsesRequestInChunks(ctx, requestFields, nil, 0, targetBodySize, newCompactBudget(len(chunks)+2))
+		done <- err
+	}()
+	waitForLifecycleSignal(t, fanoutCanceled, "fanout worker error cancellation")
+	handler.BeginShutdown()
+	close(releaseSibling)
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for compact fanout result")
+	}
+	if err == nil || !strings.Contains(err.Error(), "returned 500") {
+		t.Fatalf("fanout error = %v, want independent worker 500", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("worker failure was replaced by shutdown cancellation: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
+	requestCtx, summary := WithRequestSummary(req.Context())
+	req = req.WithContext(requestCtx)
+	if handler.handleShutdownError(httptest.NewRecorder(), req, ctx, err) {
+		t.Fatal("independent worker failure was misclassified as local shutdown")
+	}
+	providerStatus := upstreamStatusCode(err, http.StatusBadGateway)
+	if providerStatus != http.StatusBadGateway {
+		t.Fatalf("provider status = %d, want classified 502", providerStatus)
+	}
+	handler.RecordRequest(summary, providerStatus, "fanout-race", time.Millisecond)
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 1 {
+		t.Fatalf("stats = requests:%d errors:%d, want 1/1", snap.Totals.Requests, snap.Totals.Errors)
 	}
 }
 
@@ -2369,7 +2941,8 @@ func TestHandleCompact_FallsBackToChunkedCompactionForStringInputOnUpstream413(t
 	}
 }
 
-func TestHandleCompact_StripsOversizedToolsDuring413Fallback(t *testing.T) {
+func TestHandleCompact_NormalizesOversizedToolsBeforeInternalCompaction(t *testing.T) {
+	const inputText = "please compact this small history"
 	hugeToolDescription := strings.Repeat("a", compactUpstreamChunkBodySize)
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
@@ -2378,7 +2951,7 @@ func TestHandleCompact_StripsOversizedToolsDuring413Fallback(t *testing.T) {
 				"type": "message",
 				"role": "user",
 				"content": []map[string]string{
-					{"type": "input_text", "text": "please compact this small history"},
+					{"type": "input_text", "text": inputText},
 				},
 			},
 		},
@@ -2394,62 +2967,51 @@ func TestHandleCompact_StripsOversizedToolsDuring413Fallback(t *testing.T) {
 			},
 		},
 		"tool_choice": map[string]interface{}{"type": "function", "name": "oversized_tool"},
-		"text":        map[string]interface{}{"format": map[string]string{"type": "text"}},
 	})
 	if err != nil {
 		t.Fatalf("failed to marshal request body: %v", err)
 	}
+	if len(reqBody) <= compactUpstreamChunkBodySize {
+		t.Fatalf("test setup expected caller tools to push body over chunk target, got %d bytes", len(reqBody))
+	}
 
 	var calls atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if call := calls.Add(1); call != 1 {
+			t.Fatalf("unexpected /responses request count %d", call)
+		}
+
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Fatalf("failed to read upstream body: %v", err)
 		}
-		var req map[string]interface{}
-		if err := json.Unmarshal(body, &req); err != nil {
-			t.Fatalf("upstream received invalid JSON: %v", err)
-		}
-		input, ok := req["input"].([]interface{})
-		if !ok || len(input) != 1 {
-			t.Fatalf("expected one compact input item, got %#v", req["input"])
+		if len(body) > compactUpstreamChunkBodySize {
+			t.Fatalf("expected normalized compact body to fit target, got %d bytes", len(body))
 		}
 
-		switch call := calls.Add(1); call {
-		case 1:
-			if len(body) <= compactUpstreamChunkBodySize {
-				t.Fatalf("expected initial compact body to exceed chunk target, got %d bytes", len(body))
-			}
-			if _, ok := req["tools"]; !ok {
-				t.Fatalf("expected initial upstream request to include tools")
-			}
-			if _, ok := req["tool_choice"]; !ok {
-				t.Fatalf("expected initial upstream request to include tool_choice")
-			}
-			if _, ok := req["text"]; !ok {
-				t.Fatalf("expected initial upstream request to include text")
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusRequestEntityTooLarge)
-			_, _ = w.Write([]byte(`{"error":{"message":"payload too large"}}`))
-		case 2:
-			if len(body) > compactUpstreamChunkBodySize {
-				t.Fatalf("expected sanitized compact fallback body to fit target, got %d bytes", len(body))
-			}
-			if _, ok := req["tools"]; ok {
-				t.Fatalf("expected sanitized fallback request to omit oversized tools")
-			}
-			if _, ok := req["tool_choice"]; ok {
-				t.Fatalf("expected sanitized fallback request to omit tool_choice with tools")
-			}
-			if _, ok := req["text"]; !ok {
-				t.Fatalf("expected sanitized fallback request to preserve small text field")
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"resp-sanitized-tools","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary without oversized tools"}]}]}`))
-		default:
-			t.Fatalf("unexpected /responses request count %d", call)
+		var upstreamRequest map[string]interface{}
+		if err := json.Unmarshal(body, &upstreamRequest); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
 		}
+		if _, ok := upstreamRequest["tools"]; ok {
+			t.Fatalf("internal compaction request must omit caller tools: %s", body)
+		}
+		if _, ok := upstreamRequest["tool_choice"]; ok {
+			t.Fatalf("internal compaction request must omit caller tool_choice: %s", body)
+		}
+		if got := upstreamRequest["model"]; got != "gpt-5.4" {
+			t.Fatalf("expected model to survive normalization, got %#v", got)
+		}
+		input, ok := upstreamRequest["input"].([]interface{})
+		if !ok || len(input) != 1 {
+			t.Fatalf("expected one compact input item, got %#v", upstreamRequest["input"])
+		}
+		if got := requireMessageTextWithRole(t, input[0], "user"); got != inputText {
+			t.Fatalf("expected ordinary input to survive normalization, got %q", got)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-normalized-tools","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary without caller tools"}]}]}`))
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
@@ -2459,25 +3021,27 @@ func TestHandleCompact_StripsOversizedToolsDuring413Fallback(t *testing.T) {
 	handler.HandleCompact(w, req)
 
 	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
 	}
-	if calls.Load() != 2 {
-		t.Fatalf("expected initial request and one sanitized fallback request, got %d", calls.Load())
+	if calls.Load() != 1 {
+		t.Fatalf("expected exactly one normalized upstream request, got %d", calls.Load())
 	}
 
 	body, _ := io.ReadAll(resp.Body)
 	summary, encryptedSummary := requireCompactResponseSummaryForTest(t, body)
-	if summary != "summary without oversized tools" {
-		t.Fatalf("expected sanitized tools summary, got %q", summary)
+	if summary == "" || summary != "summary without caller tools" {
+		t.Fatalf("expected nonempty normalized tools summary, got %q", summary)
 	}
-	if encryptedSummary != "summary without oversized tools" {
-		t.Fatalf("expected encoded sanitized tools summary, got %q", encryptedSummary)
+	if encryptedSummary != summary {
+		t.Fatalf("expected encoded normalized tools summary %q, got %q", summary, encryptedSummary)
 	}
 }
 
-func TestHandleCompact_StripsOversizedTextDuring413Fallback(t *testing.T) {
+func TestHandleCompact_NormalizesStructuredTextFormatBeforeInternalCompaction(t *testing.T) {
+	const inputText = "please compact this history with a text schema"
 	hugeJSONSchemaDescription := strings.Repeat("b", compactUpstreamChunkBodySize)
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
@@ -2486,7 +3050,7 @@ func TestHandleCompact_StripsOversizedTextDuring413Fallback(t *testing.T) {
 				"type": "message",
 				"role": "user",
 				"content": []map[string]string{
-					{"type": "input_text", "text": "please compact this history with a text schema"},
+					{"type": "input_text", "text": inputText},
 				},
 			},
 		},
@@ -2494,7 +3058,7 @@ func TestHandleCompact_StripsOversizedTextDuring413Fallback(t *testing.T) {
 			map[string]interface{}{
 				"type":        "function",
 				"name":        "small_tool",
-				"description": "small tool that should survive fallback sanitization",
+				"description": "caller tool must not influence internal compaction",
 				"parameters": map[string]interface{}{
 					"type":       "object",
 					"properties": map[string]interface{}{},
@@ -2511,62 +3075,63 @@ func TestHandleCompact_StripsOversizedTextDuring413Fallback(t *testing.T) {
 					"description": hugeJSONSchemaDescription,
 				},
 			},
+			"verbosity": "low",
 		},
 	})
 	if err != nil {
 		t.Fatalf("failed to marshal request body: %v", err)
 	}
+	if len(reqBody) <= compactUpstreamChunkBodySize {
+		t.Fatalf("test setup expected structured format to push body over chunk target, got %d bytes", len(reqBody))
+	}
 
 	var calls atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if call := calls.Add(1); call != 1 {
+			t.Fatalf("unexpected /responses request count %d", call)
+		}
+
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Fatalf("failed to read upstream body: %v", err)
 		}
-		var req map[string]interface{}
-		if err := json.Unmarshal(body, &req); err != nil {
-			t.Fatalf("upstream received invalid JSON: %v", err)
-		}
-		input, ok := req["input"].([]interface{})
-		if !ok || len(input) != 1 {
-			t.Fatalf("expected one compact input item, got %#v", req["input"])
+		if len(body) > compactUpstreamChunkBodySize {
+			t.Fatalf("expected normalized compact body to fit target, got %d bytes", len(body))
 		}
 
-		switch call := calls.Add(1); call {
-		case 1:
-			if len(body) <= compactUpstreamChunkBodySize {
-				t.Fatalf("expected initial compact body to exceed chunk target, got %d bytes", len(body))
-			}
-			if _, ok := req["text"]; !ok {
-				t.Fatalf("expected initial upstream request to include text")
-			}
-			if _, ok := req["tools"]; !ok {
-				t.Fatalf("expected initial upstream request to include tools")
-			}
-			if _, ok := req["tool_choice"]; !ok {
-				t.Fatalf("expected initial upstream request to include tool_choice")
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusRequestEntityTooLarge)
-			_, _ = w.Write([]byte(`{"error":{"message":"payload too large"}}`))
-		case 2:
-			if len(body) > compactUpstreamChunkBodySize {
-				t.Fatalf("expected sanitized compact fallback body to fit target, got %d bytes", len(body))
-			}
-			if _, ok := req["text"]; ok {
-				t.Fatalf("expected sanitized fallback request to omit oversized text field")
-			}
-			if _, ok := req["tools"]; !ok {
-				t.Fatalf("expected sanitized fallback request to preserve small tools")
-			}
-			if _, ok := req["tool_choice"]; !ok {
-				t.Fatalf("expected sanitized fallback request to preserve tool_choice with tools")
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"resp-sanitized-text","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary without oversized text schema"}]}]}`))
-		default:
-			t.Fatalf("unexpected /responses request count %d", call)
+		var upstreamRequest map[string]interface{}
+		if err := json.Unmarshal(body, &upstreamRequest); err != nil {
+			t.Fatalf("upstream received invalid JSON: %v", err)
 		}
+		if _, ok := upstreamRequest["tools"]; ok {
+			t.Fatalf("internal compaction request must omit caller tools: %s", body)
+		}
+		if _, ok := upstreamRequest["tool_choice"]; ok {
+			t.Fatalf("internal compaction request must omit caller tool_choice: %s", body)
+		}
+		text, ok := upstreamRequest["text"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected non-format text controls to survive normalization, got %#v", upstreamRequest["text"])
+		}
+		if _, ok := text["format"]; ok {
+			t.Fatalf("internal compaction request must omit caller text.format: %#v", text)
+		}
+		if got := text["verbosity"]; got != "low" {
+			t.Fatalf("expected text.verbosity to survive normalization, got %#v", got)
+		}
+		if got := upstreamRequest["model"]; got != "gpt-5.4" {
+			t.Fatalf("expected model to survive normalization, got %#v", got)
+		}
+		input, ok := upstreamRequest["input"].([]interface{})
+		if !ok || len(input) != 1 {
+			t.Fatalf("expected one compact input item, got %#v", upstreamRequest["input"])
+		}
+		if got := requireMessageTextWithRole(t, input[0], "user"); got != inputText {
+			t.Fatalf("expected ordinary input to survive normalization, got %q", got)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-normalized-text","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary without caller schema"}]}]}`))
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
@@ -2576,21 +3141,22 @@ func TestHandleCompact_StripsOversizedTextDuring413Fallback(t *testing.T) {
 	handler.HandleCompact(w, req)
 
 	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
 	}
-	if calls.Load() != 2 {
-		t.Fatalf("expected initial request and one sanitized fallback request, got %d", calls.Load())
+	if calls.Load() != 1 {
+		t.Fatalf("expected exactly one normalized upstream request, got %d", calls.Load())
 	}
 
 	body, _ := io.ReadAll(resp.Body)
 	summary, encryptedSummary := requireCompactResponseSummaryForTest(t, body)
-	if summary != "summary without oversized text schema" {
-		t.Fatalf("expected sanitized text summary, got %q", summary)
+	if summary == "" || summary != "summary without caller schema" {
+		t.Fatalf("expected nonempty normalized text summary, got %q", summary)
 	}
-	if encryptedSummary != "summary without oversized text schema" {
-		t.Fatalf("expected encoded sanitized text summary, got %q", encryptedSummary)
+	if encryptedSummary != summary {
+		t.Fatalf("expected encoded normalized text summary %q, got %q", summary, encryptedSummary)
 	}
 }
 
@@ -7372,6 +7938,62 @@ func TestNewProxyHandler_FailsWhenProvidersSharePlainModelID(t *testing.T) {
 	}
 }
 
+func TestValidateDynamicProviderModelsLoadsDeferredSingleFilteredProvider(t *testing.T) {
+	var modelHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/models" {
+			t.Fatalf("expected /models lookup, got %s", got)
+		}
+		modelHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"allowed","object":"model","owned_by":"dynamic"},{"id":"blocked","object":"model","owned_by":"dynamic"}]}`))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithDeferredDynamicProviderModelValidation(true),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:             "dynamic",
+			Type:           "openai-compatible",
+			Default:        true,
+			BaseURL:        upstream.URL,
+			AuthType:       "none",
+			ModelDiscovery: "openai",
+			IncludeModels:  []string{"allowed"},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+	if got := modelHits.Load(); got != 0 {
+		t.Fatalf("deferred startup /models hits = %d, want 0", got)
+	}
+	if !handler.DynamicProviderValidationPending() {
+		t.Fatal("expected single filtered dynamic provider validation to be pending")
+	}
+	if _, ok := handler.providerSetup().lookupModel("allowed"); ok {
+		t.Fatal("expected allowed model to be absent before deferred validation")
+	}
+
+	if err := handler.ValidateDynamicProviderModels(context.Background()); err != nil {
+		t.Fatalf("ValidateDynamicProviderModels returned error: %v", err)
+	}
+	if got := modelHits.Load(); got != 1 {
+		t.Fatalf("deferred validation /models hits = %d, want 1", got)
+	}
+	if handler.DynamicProviderValidationPending() {
+		t.Fatal("expected dynamic provider validation pending state to clear")
+	}
+	if model, ok := handler.providerSetup().lookupModel("allowed"); !ok || model.providerID != "dynamic" {
+		t.Fatalf("allowed canonical model = %+v, %v; want dynamic ownership", model, ok)
+	}
+	if _, ok := handler.providerSetup().lookupModel("blocked"); ok {
+		t.Fatal("expected blocked model to be filtered from canonical ownership")
+	}
+}
+
 func TestNewProxyHandler_FailsWhenOpenAICodexModelCollidesWithAzure(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 	codexHome := t.TempDir()
@@ -7948,6 +8570,1107 @@ func TestHandleModels_RefreshesDynamicProviderOwnershipForRouting(t *testing.T) 
 	}
 }
 
+func TestHandleModels_CanonicalCatalogOwnsRoutingAcrossQueryVariants(t *testing.T) {
+	var modelsHits atomic.Int32
+	var dynamicChatHits atomic.Int32
+	var fallbackChatHits atomic.Int32
+
+	dynamicServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			modelsHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.RawQuery == "view=partial" {
+				_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"model-a","object":"model","owned_by":"dynamic"}]}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"model-a","object":"model","owned_by":"dynamic"},{"id":"model-b","object":"model","owned_by":"dynamic"}]}`))
+		case "/chat/completions":
+			dynamicChatHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"dynamic-chat","object":"chat.completion","choices":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer dynamicServer.Close()
+
+	fallbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackChatHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"fallback-chat","object":"chat.completion","choices":[]}`))
+	}))
+	defer fallbackServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:             "dynamic",
+				Type:           "openai-compatible",
+				BaseURL:        dynamicServer.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			},
+			{
+				ID:             "fallback",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        fallbackServer.URL,
+				AuthType:       "none",
+				ModelDiscovery: "static",
+				Models: []ProviderModelConfig{{
+					PublicID: "fallback-only",
+				}},
+			},
+		}}),
+		WithDeferredDynamicProviderModelValidation(true),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	readModelIDs := func(target string) map[string]bool {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		w := httptest.NewRecorder()
+		handler.HandleModels(w, req)
+		resp := w.Result()
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("HandleModels(%q) status = %d, want 200: %s", target, resp.StatusCode, body)
+		}
+		var result struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode HandleModels(%q): %v", target, err)
+		}
+		ids := make(map[string]bool, len(result.Data))
+		for _, model := range result.Data {
+			ids[model.ID] = true
+		}
+		return ids
+	}
+
+	canonical := readModelIDs("/v1/models")
+	if !canonical["model-a"] || !canonical["model-b"] {
+		t.Fatalf("canonical catalog = %v, want model-a and model-b", canonical)
+	}
+
+	partial := readModelIDs("/v1/models?view=partial")
+	if !partial["model-a"] || partial["model-b"] {
+		t.Fatalf("partial query catalog = %v, want only model-a from dynamic provider", partial)
+	}
+
+	canonicalCached := readModelIDs("/v1/models")
+	if !canonicalCached["model-b"] {
+		t.Fatalf("cached canonical catalog = %v, want model-b", canonicalCached)
+	}
+	owner, ok := handler.providerSetup().lookupModel("model-b")
+	if !ok || owner.providerID != "dynamic" {
+		t.Fatalf("routing owner for model-b = %+v, %v; want dynamic owner matching cached canonical catalog", owner, ok)
+	}
+
+	resp, err := handler.postChatCompletions(context.Background(), []byte(`{"model":"model-b","messages":[{"role":"user","content":"hello"}]}`))
+	if err != nil {
+		t.Fatalf("postChatCompletions(model-b) error = %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("postChatCompletions(model-b) status = %d, want 200", resp.StatusCode)
+	}
+	if got := modelsHits.Load(); got != 2 {
+		t.Fatalf("dynamic /models hits = %d, want 2 (canonical plus variant; canonical reread cached)", got)
+	}
+	if got := dynamicChatHits.Load(); got != 1 {
+		t.Fatalf("dynamic chat hits = %d, want 1", got)
+	}
+	if got := fallbackChatHits.Load(); got != 0 {
+		t.Fatalf("fallback chat hits = %d, want 0", got)
+	}
+}
+
+func TestHandleModels_QueryVariantFirstSeedsCanonicalResponsesRouting(t *testing.T) {
+	var modelsMu sync.Mutex
+	modelsQueries := make([]string, 0, 2)
+	var responsesHits atomic.Int32
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			modelsMu.Lock()
+			modelsQueries = append(modelsQueries, r.URL.RawQuery)
+			modelsMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"responses-model","object":"model","owned_by":"dynamic","supported_endpoints":["/responses"]}]}`))
+		case "/responses":
+			responsesHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:             "dynamic",
+			Type:           "openai-compatible",
+			Default:        true,
+			BaseURL:        upstream.URL,
+			AuthType:       "none",
+			ModelDiscovery: "openai",
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+	if _, ok := handler.providerSetup().lookupModel("responses-model"); ok {
+		t.Fatal("expected unfiltered single-provider routing to start without discovery")
+	}
+
+	modelsReq := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=x", nil)
+	modelsW := httptest.NewRecorder()
+	handler.HandleModels(modelsW, modelsReq)
+	modelsResp := modelsW.Result()
+	defer func() { _ = modelsResp.Body.Close() }()
+	if modelsResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(modelsResp.Body)
+		t.Fatalf("query variant models status = %d, want 200: %s", modelsResp.StatusCode, body)
+	}
+	if owner, ok := handler.providerSetup().lookupModel("responses-model"); !ok || owner.providerID != "dynamic" {
+		t.Fatalf("canonical owner after query-first request = %+v, %v; want dynamic", owner, ok)
+	}
+
+	responsesReq := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"responses-model","input":"hello"}`))
+	responsesReq.Header.Set("Content-Type", "application/json")
+	responsesW := httptest.NewRecorder()
+	handler.HandleResponses(responsesW, responsesReq)
+	responsesResp := responsesW.Result()
+	defer func() { _ = responsesResp.Body.Close() }()
+	if responsesResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(responsesResp.Body)
+		t.Fatalf("responses status = %d, want 200: %s", responsesResp.StatusCode, body)
+	}
+	if got := responsesHits.Load(); got != 1 {
+		t.Fatalf("responses upstream hits = %d, want 1", got)
+	}
+
+	modelsMu.Lock()
+	gotQueries := append([]string(nil), modelsQueries...)
+	modelsMu.Unlock()
+	if want := []string{"", "client_version=x"}; !reflect.DeepEqual(gotQueries, want) {
+		t.Fatalf("upstream models queries = %v, want %v", gotQueries, want)
+	}
+}
+
+func TestHandleModels_QueryVariantRefreshesExpiredCanonicalOwnership(t *testing.T) {
+	var changed atomic.Bool
+	var canonicalConditional atomic.Bool
+	var modelsMu sync.Mutex
+	modelsQueries := make([]string, 0, 3)
+	var responsesHits atomic.Int32
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			modelsMu.Lock()
+			modelsQueries = append(modelsQueries, r.URL.RawQuery)
+			modelsMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.RawQuery == "" {
+				if !changed.Load() {
+					w.Header().Set("ETag", `"catalog-a"`)
+					_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"model-a","object":"model","owned_by":"dynamic","supported_endpoints":["/responses"]}]}`))
+					return
+				}
+				if r.Header.Get("If-None-Match") == `"catalog-a"` {
+					canonicalConditional.Store(true)
+				}
+				w.Header().Set("ETag", `"catalog-b"`)
+				_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"model-b","object":"model","owned_by":"dynamic","supported_endpoints":["/responses"]}]}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"model-b","object":"model","owned_by":"dynamic","supported_endpoints":["/responses"]}]}`))
+		case "/responses":
+			responsesHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:             "dynamic",
+			Type:           "openai-compatible",
+			Default:        true,
+			BaseURL:        upstream.URL,
+			AuthType:       "none",
+			ModelDiscovery: "openai",
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	initialReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	initialW := httptest.NewRecorder()
+	handler.HandleModels(initialW, initialReq)
+	initialResp := initialW.Result()
+	_ = initialResp.Body.Close()
+	if initialResp.StatusCode != http.StatusOK {
+		t.Fatalf("initial canonical status = %d, want 200", initialResp.StatusCode)
+	}
+	if _, ok := handler.providerSetup().lookupModel("model-a"); !ok {
+		t.Fatal("expected model-a ownership after initial canonical build")
+	}
+
+	handler.models.mu.Lock()
+	canonical := handler.models.entries[""]
+	canonical.expiry = time.Now().Add(-time.Minute)
+	handler.models.entries[""] = canonical
+	handler.models.mu.Unlock()
+	changed.Store(true)
+
+	variantReq := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=x", nil)
+	variantW := httptest.NewRecorder()
+	handler.HandleModels(variantW, variantReq)
+	variantResp := variantW.Result()
+	defer func() { _ = variantResp.Body.Close() }()
+	if variantResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(variantResp.Body)
+		t.Fatalf("query variant status = %d, want 200: %s", variantResp.StatusCode, body)
+	}
+	if !canonicalConditional.Load() {
+		t.Fatal("expired canonical refresh did not send its cached ETag")
+	}
+	if _, ok := handler.providerSetup().lookupModel("model-a"); ok {
+		t.Fatal("model-a retained ownership after canonical catalog changed")
+	}
+	if owner, ok := handler.providerSetup().lookupModel("model-b"); !ok || owner.providerID != "dynamic" {
+		t.Fatalf("model-b owner = %+v, %v; want dynamic", owner, ok)
+	}
+
+	modelBResp, err := handler.postResponsesWithHeaders(context.Background(), []byte(`{"model":"model-b","input":"hello"}`), nil)
+	if err != nil {
+		t.Fatalf("model-b responses error = %v", err)
+	}
+	_ = modelBResp.Body.Close()
+	if _, err := handler.postResponsesWithHeaders(context.Background(), []byte(`{"model":"model-a","input":"hello"}`), nil); err == nil {
+		t.Fatal("model-a responses error = nil, want local rejection after ownership replacement")
+	}
+	if got := responsesHits.Load(); got != 1 {
+		t.Fatalf("responses upstream hits = %d, want only model-b", got)
+	}
+
+	modelsMu.Lock()
+	gotQueries := append([]string(nil), modelsQueries...)
+	modelsMu.Unlock()
+	if want := []string{"", "", "client_version=x"}; !reflect.DeepEqual(gotQueries, want) {
+		t.Fatalf("upstream models queries = %v, want %v", gotQueries, want)
+	}
+}
+
+func TestHandleModels_QueryVariantCanonicalRefreshFailureUsesOnlyCachedFallback(t *testing.T) {
+	for _, seedVariant := range []bool{false, true} {
+		name := "without cached variant"
+		if seedVariant {
+			name = "with cached variant"
+		}
+		t.Run(name, func(t *testing.T) {
+			var outage atomic.Bool
+			var canonicalHits atomic.Int32
+			var variantHits atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/models" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				if r.URL.RawQuery == "" {
+					canonicalHits.Add(1)
+					if outage.Load() {
+						w.WriteHeader(http.StatusServiceUnavailable)
+						_, _ = w.Write([]byte(`{"error":"catalog unavailable"}`))
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"model-a","object":"model","owned_by":"dynamic","supported_endpoints":["/responses"]}]}`))
+					return
+				}
+				variantHits.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"variant-model","object":"model","owned_by":"dynamic","supported_endpoints":["/responses"]}]}`))
+			}))
+			defer upstream.Close()
+
+			handler, err := NewProxyHandler(
+				auth.NewTestAuthenticator("test-token"),
+				logger.New(logger.LevelInfo),
+				WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+					ID:             "dynamic",
+					Type:           "openai-compatible",
+					Default:        true,
+					BaseURL:        upstream.URL,
+					AuthType:       "none",
+					ModelDiscovery: "openai",
+				}}}),
+			)
+			if err != nil {
+				t.Fatalf("NewProxyHandler returned error: %v", err)
+			}
+			handler.maxRetries = 1
+
+			requestModels := func(target string) *http.Response {
+				t.Helper()
+				req := httptest.NewRequest(http.MethodGet, target, nil)
+				w := httptest.NewRecorder()
+				handler.HandleModels(w, req)
+				return w.Result()
+			}
+
+			initial := requestModels("/v1/models")
+			_ = initial.Body.Close()
+			if initial.StatusCode != http.StatusOK {
+				t.Fatalf("initial canonical status = %d, want 200", initial.StatusCode)
+			}
+			if seedVariant {
+				variant := requestModels("/v1/models?client_version=x")
+				_ = variant.Body.Close()
+				if variant.StatusCode != http.StatusOK {
+					t.Fatalf("seed variant status = %d, want 200", variant.StatusCode)
+				}
+			}
+
+			handler.models.mu.Lock()
+			canonical := handler.models.entries[""]
+			canonical.expiry = time.Now().Add(-time.Minute)
+			handler.models.entries[""] = canonical
+			handler.models.mu.Unlock()
+			outage.Store(true)
+
+			resp := requestModels("/v1/models?client_version=x")
+			defer func() { _ = resp.Body.Close() }()
+			if seedVariant {
+				if resp.StatusCode != http.StatusOK {
+					body, _ := io.ReadAll(resp.Body)
+					t.Fatalf("cached variant fallback status = %d, want 200: %s", resp.StatusCode, body)
+				}
+				var result struct {
+					Data []struct {
+						ID string `json:"id"`
+					} `json:"data"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+					t.Fatalf("decode cached variant fallback: %v", err)
+				}
+				if len(result.Data) != 1 || result.Data[0].ID != "variant-model" {
+					t.Fatalf("cached variant fallback = %+v, want variant-model", result.Data)
+				}
+			} else if resp.StatusCode != http.StatusServiceUnavailable {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("uncached variant status = %d, want 503: %s", resp.StatusCode, body)
+			}
+
+			if got := canonicalHits.Load(); got != 2 {
+				t.Fatalf("canonical hits = %d, want initial build plus failed refresh", got)
+			}
+			wantVariantHits := int32(0)
+			if seedVariant {
+				wantVariantHits = 1
+			}
+			if got := variantHits.Load(); got != wantVariantHits {
+				t.Fatalf("variant hits = %d, want %d; failed canonical refresh must not fetch a new variant", got, wantVariantHits)
+			}
+			if _, ok := handler.providerSetup().lookupModel("model-a"); !ok {
+				t.Fatal("stale canonical routing for model-a was lost after refresh failure")
+			}
+		})
+	}
+}
+
+func TestHandleModels_QueryVariantRefreshDoesNotMixCanonicalStateFrom304(t *testing.T) {
+	var firstProviderCalls atomic.Int32
+	var secondProviderCalls atomic.Int32
+	var firstProviderConditional atomic.Bool
+	var secondProviderConditional atomic.Bool
+
+	firstProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := firstProviderCalls.Add(1)
+		if r.URL.RawQuery == "" {
+			w.Header().Set("ETag", `"canonical-first"`)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"first-a","object":"model","owned_by":"first"},{"id":"first-canonical-only","object":"model","owned_by":"first"}]}`))
+			return
+		}
+
+		if call >= 3 && r.Header.Get("If-None-Match") != "" {
+			firstProviderConditional.Store(true)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", fmt.Sprintf(`"variant-first-%d"`, call))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"first-a","object":"model","owned_by":"first"}]}`))
+	}))
+	defer firstProvider.Close()
+
+	secondProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := secondProviderCalls.Add(1)
+		if r.URL.RawQuery == "" {
+			w.Header().Set("ETag", `"canonical-second"`)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"second-a","object":"model","owned_by":"second"},{"id":"second-canonical-only","object":"model","owned_by":"second"}]}`))
+			return
+		}
+
+		if call >= 3 && r.Header.Get("If-None-Match") != "" {
+			secondProviderConditional.Store(true)
+		}
+		modelID := "second-a"
+		if call >= 3 {
+			modelID = "second-b"
+		}
+		w.Header().Set("ETag", fmt.Sprintf(`"variant-second-%d"`, call))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"object":"list","data":[{"id":%q,"object":"model","owned_by":"second"}]}`, modelID)
+	}))
+	defer secondProvider.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:             "first",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        firstProvider.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			},
+			{
+				ID:             "second",
+				Type:           "openai-compatible",
+				BaseURL:        secondProvider.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			},
+		}}),
+		WithDeferredDynamicProviderModelValidation(true),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	readIDs := func(target string) map[string]bool {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		w := httptest.NewRecorder()
+		handler.HandleModels(w, req)
+		resp := w.Result()
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("HandleModels(%q) status = %d, want 200: %s", target, resp.StatusCode, body)
+		}
+		var result struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode HandleModels(%q): %v", target, err)
+		}
+		ids := make(map[string]bool, len(result.Data))
+		for _, model := range result.Data {
+			ids[model.ID] = true
+		}
+		return ids
+	}
+
+	canonical := readIDs("/v1/models")
+	if !canonical["first-canonical-only"] || !canonical["second-canonical-only"] {
+		t.Fatalf("canonical catalog = %v, want both canonical-only models", canonical)
+	}
+	firstVariant := readIDs("/v1/models?view=partial")
+	if !firstVariant["first-a"] || !firstVariant["second-a"] || firstVariant["first-canonical-only"] {
+		t.Fatalf("first variant catalog = %v, want first-a and second-a only", firstVariant)
+	}
+	secondVariant := readIDs("/v1/models?view=partial")
+	if !secondVariant["first-a"] || !secondVariant["second-b"] || secondVariant["first-canonical-only"] {
+		t.Fatalf("refreshed variant catalog = %v, want fresh first-a and second-b without canonical-only entries", secondVariant)
+	}
+	if firstProviderConditional.Load() || secondProviderConditional.Load() {
+		t.Fatalf("query variant sent conditional ETag headers: first=%v second=%v", firstProviderConditional.Load(), secondProviderConditional.Load())
+	}
+}
+
+func TestHandleModels_BoundsAndPrunesQueryCache(t *testing.T) {
+	const queryCount = modelsCacheMaxEntries * 4
+
+	var upstreamHits atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"model-a","object":"model","owned_by":"copilot"}]}`))
+	})
+	handler.models.entries = map[string]cachedModelsResponse{
+		"expired=true": {
+			body:       []byte(`{"object":"list","data":[]}`),
+			statusCode: http.StatusOK,
+			expiry:     time.Now().Add(-time.Minute),
+		},
+	}
+
+	for i := 0; i < queryCount; i++ {
+		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v1/models?caller=%d", i), nil)
+		w := httptest.NewRecorder()
+		handler.HandleModels(w, req)
+		resp := w.Result()
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("query %d status = %d, want 200", i, resp.StatusCode)
+		}
+	}
+
+	handler.models.mu.RLock()
+	cacheEntries := len(handler.models.entries)
+	_, keptExpired := handler.models.entries["expired=true"]
+	handler.models.mu.RUnlock()
+
+	if cacheEntries != modelsCacheMaxEntries {
+		t.Fatalf("models cache entries = %d after %d unique queries, want bounded at %d", cacheEntries, queryCount, modelsCacheMaxEntries)
+	}
+	if keptExpired {
+		t.Fatal("models cache retained expired query entry, want it pruned")
+	}
+	if got, want := upstreamHits.Load(), int32(queryCount+1); got != want {
+		t.Fatalf("upstream /models hits = %d, want %d (one canonical seed plus unique query responses)", got, want)
+	}
+}
+
+func TestHandleModels_VariantCacheWritePreservesExpiredCanonicalForStaleFallback(t *testing.T) {
+	var canonicalHits atomic.Int32
+	var variantHits atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.RawQuery != "" {
+			variantHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"variant-model","object":"model","owned_by":"copilot"}]}`))
+			return
+		}
+
+		if canonicalHits.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"stale-canonical","object":"model","owned_by":"copilot"}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"catalog unavailable"}`))
+	})
+	handler.maxRetries = 1
+
+	requestModels := func(target string) *http.Response {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		w := httptest.NewRecorder()
+		handler.HandleModels(w, req)
+		return w.Result()
+	}
+
+	initial := requestModels("/v1/models")
+	if initial.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(initial.Body)
+		_ = initial.Body.Close()
+		t.Fatalf("initial canonical status = %d, want 200: %s", initial.StatusCode, body)
+	}
+	_ = initial.Body.Close()
+
+	handler.models.mu.Lock()
+	canonicalEntry, ok := handler.models.entries[""]
+	if !ok {
+		handler.models.mu.Unlock()
+		t.Fatal("canonical cache entry missing after initial request")
+	}
+	canonicalEntry.expiry = time.Now().Add(-time.Minute)
+	handler.models.entries[""] = canonicalEntry
+	handler.models.mu.Unlock()
+
+	handler.storeModelsCacheEntry("view=partial", cachedModelsResponse{
+		body:       []byte(`{"object":"list","data":[{"id":"variant-model","object":"model","owned_by":"copilot"}]}`),
+		statusCode: http.StatusOK,
+		expiry:     time.Now().Add(modelsCacheTTL),
+	})
+
+	stale := requestModels("/v1/models")
+	defer func() { _ = stale.Body.Close() }()
+	if stale.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(stale.Body)
+		t.Fatalf("canonical outage status = %d, want stale 200 response: %s", stale.StatusCode, body)
+	}
+	var result struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(stale.Body).Decode(&result); err != nil {
+		t.Fatalf("decode stale canonical response: %v", err)
+	}
+	if len(result.Data) != 1 || result.Data[0].ID != "stale-canonical" {
+		t.Fatalf("stale canonical response = %+v, want stale-canonical", result.Data)
+	}
+	if got := canonicalHits.Load(); got != 2 {
+		t.Fatalf("canonical upstream hits = %d, want initial success plus outage", got)
+	}
+	if got := variantHits.Load(); got != 0 {
+		t.Fatalf("variant upstream hits = %d, want 0 for direct cache write", got)
+	}
+}
+
+func TestHandleModels_CoalescesIdenticalQueryVariantMissForCanceledWaiter(t *testing.T) {
+	var variantHits atomic.Int32
+	variantStarted := make(chan struct{})
+	releaseVariant := make(chan struct{})
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.RawQuery == "" {
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"canonical-model","object":"model","owned_by":"copilot"}]}`))
+			return
+		}
+
+		call := variantHits.Add(1)
+		if call == 1 {
+			close(variantStarted)
+			<-releaseVariant
+		}
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"variant-model","object":"model","owned_by":"copilot"}]}`))
+	})
+
+	seedReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	seedW := httptest.NewRecorder()
+	handler.HandleModels(seedW, seedReq)
+	seedResp := seedW.Result()
+	_ = seedResp.Body.Close()
+	if seedResp.StatusCode != http.StatusOK {
+		t.Fatalf("canonical seed status = %d, want 200", seedResp.StatusCode)
+	}
+
+	leaderDone := make(chan *http.Response, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=x", nil)
+		w := httptest.NewRecorder()
+		handler.HandleModels(w, req)
+		leaderDone <- w.Result()
+	}()
+
+	select {
+	case <-variantStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for query-variant leader")
+	}
+
+	waiterCtx, cancelWaiter := context.WithCancel(context.Background())
+	cancelWaiter()
+	waiterReq := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=x", nil).WithContext(waiterCtx)
+	waiterW := httptest.NewRecorder()
+	handler.HandleModels(waiterW, waiterReq)
+
+	if got := variantHits.Load(); got != 1 {
+		close(releaseVariant)
+		t.Fatalf("query-variant upstream hits before leader release = %d, want 1 shared fetch", got)
+	}
+	if got := waiterW.Body.String(); got != "" {
+		close(releaseVariant)
+		t.Fatalf("canceled waiter wrote response body %q, want no response", got)
+	}
+
+	close(releaseVariant)
+	select {
+	case resp := <-leaderDone:
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("query-variant leader status = %d, want 200", resp.StatusCode)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for query-variant leader")
+	}
+}
+
+func TestHandleModels_CoalescesConcurrentIdenticalQueryVariantMisses(t *testing.T) {
+	const waiters = 12
+
+	var variantHits atomic.Int32
+	variantStarted := make(chan struct{})
+	releaseVariant := make(chan struct{})
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.RawQuery == "" {
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"canonical-model","object":"model","owned_by":"copilot"}]}`))
+			return
+		}
+
+		if call := variantHits.Add(1); call == 1 {
+			close(variantStarted)
+			<-releaseVariant
+		}
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"variant-model","object":"model","owned_by":"copilot"}]}`))
+	})
+
+	seedReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	seedW := httptest.NewRecorder()
+	handler.HandleModels(seedW, seedReq)
+	seedResp := seedW.Result()
+	_ = seedResp.Body.Close()
+	if seedResp.StatusCode != http.StatusOK {
+		t.Fatalf("canonical seed status = %d, want 200", seedResp.StatusCode)
+	}
+
+	responses := make(chan *http.Response, waiters+1)
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=x", nil)
+		w := httptest.NewRecorder()
+		handler.HandleModels(w, req)
+		responses <- w.Result()
+	}()
+	select {
+	case <-variantStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for query-variant leader")
+	}
+
+	observed := make([]chan struct{}, 0, waiters)
+	for range waiters {
+		waitObserved := make(chan struct{})
+		observed = append(observed, waitObserved)
+		go func() {
+			ctx := &observedDoneContext{Context: context.Background(), observed: waitObserved}
+			req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=x", nil).WithContext(ctx)
+			w := httptest.NewRecorder()
+			handler.HandleModels(w, req)
+			responses <- w.Result()
+		}()
+	}
+	for i, joined := range observed {
+		select {
+		case <-joined:
+		case <-time.After(5 * time.Second):
+			close(releaseVariant)
+			t.Fatalf("waiter %d did not join the query-variant flight", i)
+		}
+	}
+	if got := variantHits.Load(); got != 1 {
+		close(releaseVariant)
+		t.Fatalf("query-variant upstream hits while waiters joined = %d, want 1", got)
+	}
+
+	close(releaseVariant)
+	for i := 0; i < waiters+1; i++ {
+		select {
+		case resp := <-responses:
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"variant-model"`)) {
+				t.Fatalf("query-variant caller %d response = status %d body %s", i, resp.StatusCode, body)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for query-variant caller %d", i)
+		}
+	}
+	if got := variantHits.Load(); got != 1 {
+		t.Fatalf("query-variant upstream hits after completion = %d, want 1", got)
+	}
+}
+
+func TestRefreshModelsCacheVariantStartsFreshLifecycleDeadline(t *testing.T) {
+	remaining := make(chan time.Duration, 1)
+	handler := newTestProxyHandler(t, func(http.ResponseWriter, *http.Request) {})
+	handler.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		deadline, ok := req.Context().Deadline()
+		if !ok {
+			return nil, errors.New("variant upstream request has no deadline")
+		}
+		remaining <- time.Until(deadline)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"object":"list","data":[{"id":"fresh-deadline-model","object":"model","owned_by":"copilot"}]}`)),
+			Request:    req,
+		}, nil
+	})}
+
+	result := handler.refreshModelsCacheVariant(context.Background(), "client_version=fresh-deadline")
+	if result.err != nil {
+		t.Fatalf("refreshModelsCacheVariant() error = %v", result.err)
+	}
+	if !result.hasEntry || result.entry.statusCode != http.StatusOK {
+		t.Fatalf("refresh result = %+v, want cached 200 entry", result)
+	}
+	select {
+	case got := <-remaining:
+		if got < modelsUpstreamTimeout-time.Second {
+			t.Fatalf("variant upstream deadline remaining = %s, want fresh %s timeout", got, modelsUpstreamTimeout)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("variant upstream request was not observed")
+	}
+}
+
+func TestRefreshModelsCacheVariantPreservesLifecycleShutdownCause(t *testing.T) {
+	started := make(chan struct{})
+	handler := newTestProxyHandler(t, func(http.ResponseWriter, *http.Request) {})
+	handler.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		close(started)
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+	handler.maxRetries = 1
+
+	done := make(chan modelsCacheFlightResult, 1)
+	go func() {
+		done <- handler.refreshModelsCacheVariant(context.Background(), "client_version=shutdown-cause")
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("variant refresh did not start")
+	}
+	handler.BeginShutdown()
+
+	select {
+	case result := <-done:
+		if !errors.Is(result.err, errProxyLifecycleShutdown) {
+			t.Fatalf("variant refresh error = %v, want lifecycle shutdown cause", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("variant refresh did not return after shutdown")
+	}
+}
+
+func TestHandleModels_CoalescesExpiredCanonicalFailureAndBacksOff(t *testing.T) {
+	const callers = 16
+
+	now := time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC)
+	var canonicalHits atomic.Int32
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.RawQuery != "" {
+			t.Fatalf("unexpected query variant during canonical refresh: %q", r.URL.RawQuery)
+		}
+
+		call := canonicalHits.Add(1)
+		if call == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"stale-model","object":"model","owned_by":"copilot"}]}`))
+			return
+		}
+		if call == 2 {
+			close(refreshStarted)
+			<-releaseRefresh
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"catalog unavailable"}`))
+	})
+	handler.maxRetries = 1
+	handler.models.now = func() time.Time { return now }
+
+	seedReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	seedW := httptest.NewRecorder()
+	handler.HandleModels(seedW, seedReq)
+	seedResp := seedW.Result()
+	_ = seedResp.Body.Close()
+	if seedResp.StatusCode != http.StatusOK {
+		t.Fatalf("canonical seed status = %d, want 200", seedResp.StatusCode)
+	}
+
+	now = now.Add(modelsCacheTTL + time.Nanosecond)
+
+	results := make(chan *http.Response, callers)
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+		handler.HandleModels(w, req)
+		results <- w.Result()
+	}()
+
+	select {
+	case <-refreshStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for failed canonical refresh")
+	}
+
+	observed := make([]chan struct{}, 0, callers-1)
+	for range callers - 1 {
+		waitObserved := make(chan struct{})
+		observed = append(observed, waitObserved)
+		go func() {
+			ctx := &observedDoneContext{Context: context.Background(), observed: waitObserved}
+			req := httptest.NewRequest(http.MethodGet, "/v1/models", nil).WithContext(ctx)
+			w := httptest.NewRecorder()
+			handler.HandleModels(w, req)
+			results <- w.Result()
+		}()
+	}
+	for i, joined := range observed {
+		select {
+		case <-joined:
+		case <-time.After(5 * time.Second):
+			close(releaseRefresh)
+			t.Fatalf("canonical waiter %d did not join the refresh", i)
+		}
+	}
+	close(releaseRefresh)
+
+	for i := 0; i < callers; i++ {
+		select {
+		case resp := <-results:
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"stale-model"`)) {
+				t.Fatalf("caller %d stale response = status %d body %s; want stale 200", i, resp.StatusCode, body)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for canonical caller %d", i)
+		}
+	}
+
+	if got := canonicalHits.Load(); got != 2 {
+		t.Fatalf("canonical upstream hits after concurrent failure = %d, want seed plus one shared refresh", got)
+	}
+
+	backoffReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	backoffW := httptest.NewRecorder()
+	handler.HandleModels(backoffW, backoffReq)
+	backoffResp := backoffW.Result()
+	defer func() { _ = backoffResp.Body.Close() }()
+	if backoffResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(backoffResp.Body)
+		t.Fatalf("backoff stale status = %d, want 200: %s", backoffResp.StatusCode, body)
+	}
+	if got := canonicalHits.Load(); got != 2 {
+		t.Fatalf("canonical upstream hits during failure backoff = %d, want no additional refresh", got)
+	}
+
+	now = now.Add(modelsCacheFailureBackoff + time.Nanosecond)
+	retryReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	retryW := httptest.NewRecorder()
+	handler.HandleModels(retryW, retryReq)
+	retryResp := retryW.Result()
+	defer func() { _ = retryResp.Body.Close() }()
+	if retryResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(retryResp.Body)
+		t.Fatalf("post-backoff stale status = %d, want 200: %s", retryResp.StatusCode, body)
+	}
+	if got := canonicalHits.Load(); got != 3 {
+		t.Fatalf("canonical upstream hits after bounded backoff = %d, want one retry", got)
+	}
+}
+
+func TestHandleModels_ConcurrentCanonicalAndVariantRefreshKeepsCanonicalRouting(t *testing.T) {
+	variantStarted := make(chan struct{})
+	releaseVariant := make(chan struct{})
+	var startOnce sync.Once
+	var modelsHits atomic.Int32
+
+	dynamicServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		modelsHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.RawQuery == "view=partial" {
+			startOnce.Do(func() { close(variantStarted) })
+			<-releaseVariant
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"model-a","object":"model","owned_by":"dynamic"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"model-a","object":"model","owned_by":"dynamic"},{"id":"model-b","object":"model","owned_by":"dynamic"}]}`))
+	}))
+	defer dynamicServer.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:             "dynamic",
+				Type:           "openai-compatible",
+				BaseURL:        dynamicServer.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			},
+			{
+				ID:             "fallback",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        "http://fallback.invalid",
+				AuthType:       "none",
+				ModelDiscovery: "static",
+				Models:         []ProviderModelConfig{{PublicID: "fallback-only"}},
+			},
+		}}),
+		WithDeferredDynamicProviderModelValidation(true),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	variantDone := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models?view=partial", nil)
+		w := httptest.NewRecorder()
+		handler.HandleModels(w, req)
+		resp := w.Result()
+		variantDone <- resp.StatusCode
+		_ = resp.Body.Close()
+	}()
+
+	select {
+	case <-variantStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for variant refresh to start")
+	}
+
+	canonicalReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	canonicalW := httptest.NewRecorder()
+	handler.HandleModels(canonicalW, canonicalReq)
+	canonicalResp := canonicalW.Result()
+	defer func() { _ = canonicalResp.Body.Close() }()
+	if canonicalResp.StatusCode != http.StatusOK {
+		close(releaseVariant)
+		t.Fatalf("canonical refresh status = %d, want 200", canonicalResp.StatusCode)
+	}
+	close(releaseVariant)
+
+	select {
+	case status := <-variantDone:
+		if status != http.StatusOK {
+			t.Fatalf("variant refresh status = %d, want 200", status)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for variant refresh to finish")
+	}
+
+	owner, ok := handler.providerSetup().lookupModel("model-b")
+	if !ok || owner.providerID != "dynamic" {
+		t.Fatalf("routing owner for model-b after concurrent refreshes = %+v, %v; want canonical dynamic owner", owner, ok)
+	}
+	if got := modelsHits.Load(); got != 2 {
+		t.Fatalf("dynamic /models hits = %d, want 2", got)
+	}
+}
+
 func TestNewProviderJSONRequest_OmitsBodyForGetNilPayload(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {})
 
@@ -8007,6 +9730,178 @@ func TestFetchProviderModels_AzureNonOKDrainsResponseBody(t *testing.T) {
 	}
 	if body.bytesRead == 0 {
 		t.Fatal("expected Azure /models body to be drained before close")
+	}
+}
+
+func TestReadProviderModelCatalogBodyBoundsDecodedBytes(t *testing.T) {
+	exact := paddedProviderModelCatalog(t, maxProviderModelCatalogBodySize, "model-exact")
+	body, err := readProviderModelCatalogBody(bytes.NewReader(exact))
+	if err != nil {
+		t.Fatalf("exact-limit catalog error = %v", err)
+	}
+	if len(body) != maxProviderModelCatalogBodySize {
+		t.Fatalf("exact-limit catalog bytes = %d, want %d", len(body), maxProviderModelCatalogBodySize)
+	}
+
+	oversized := paddedProviderModelCatalog(t, maxProviderModelCatalogBodySize+1, "model-too-large")
+	if _, err := readProviderModelCatalogBody(bytes.NewReader(oversized)); !errors.Is(err, errProviderModelCatalogTooLarge) {
+		t.Fatalf("oversized catalog error = %v, want %v", err, errProviderModelCatalogTooLarge)
+	}
+}
+
+func TestFetchProviderModelsRejectsOversizedSuccessfulCatalogs(t *testing.T) {
+	oversized := paddedProviderModelCatalog(t, maxProviderModelCatalogBodySize+1, "oversized-model")
+	codexAuthPath := writeTestOpenAICodexAuth(
+		t,
+		t.TempDir(),
+		testOpenAICodexTokens(t, time.Now().Add(time.Hour), "acct-size-test", false, "refresh-token"),
+	)
+
+	tests := []struct {
+		name     string
+		provider *providerRuntime
+	}{
+		{
+			name: "Copilot",
+			provider: &providerRuntime{
+				id:      "copilot",
+				kind:    providerTypeCopilot,
+				baseURL: "http://upstream.test",
+			},
+		},
+		{
+			name: "OpenAI Codex",
+			provider: &providerRuntime{
+				id:        "codex",
+				kind:      providerTypeOpenAICodex,
+				baseURL:   "http://upstream.test",
+				codexAuth: &openAICodexAuth{path: codexAuthPath},
+			},
+		},
+		{
+			name: "generic OpenAI discovery",
+			provider: &providerRuntime{
+				id:             "generic",
+				kind:           providerTypeOpenAICompatible,
+				baseURL:        "http://upstream.test",
+				authType:       providerAuthTypeNone,
+				modelDiscovery: providerModelDiscoveryOpenAI,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(bytes.NewReader(oversized)),
+				}, nil
+			}))
+
+			result, err := handler.fetchProviderModels(context.Background(), tt.provider, "", "")
+			if !errors.Is(err, errProviderModelCatalogTooLarge) {
+				t.Fatalf("fetchProviderModels() error = %v, want %v", err, errProviderModelCatalogTooLarge)
+			}
+			if len(result.models) != 0 || result.etag != "" || result.notModified {
+				t.Fatalf("oversized catalog result = %+v, want no accepted provider state", result)
+			}
+		})
+	}
+}
+
+func TestFetchProviderModelsAzureOversizedOverlayKeepsStaticCatalog(t *testing.T) {
+	provider, err := buildProviderRuntime(ProviderConfig{
+		ID:       "azure",
+		Type:     "azure-openai",
+		BaseURL:  "https://example.openai.azure.com/openai/v1",
+		AuthMode: "api_key",
+		APIKey:   "test-key",
+		Models: []ProviderModelConfig{{
+			PublicID:   "gpt-static",
+			Deployment: "gpt-static-deployment",
+			Name:       "Configured Static Name",
+		}},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("buildProviderRuntime() error = %v", err)
+	}
+
+	oversized := paddedProviderModelCatalog(t, maxProviderModelCatalogBodySize+1, "gpt-static")
+	handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewReader(oversized)),
+		}, nil
+	}))
+
+	result, err := handler.fetchProviderModels(context.Background(), provider, "", "")
+	if err != nil {
+		t.Fatalf("fetchProviderModels() error = %v, want best-effort static fallback", err)
+	}
+	if len(result.models) != 1 || result.models[0].publicID != "gpt-static" {
+		t.Fatalf("Azure oversized overlay models = %+v, want configured static catalog", result.models)
+	}
+	if bytes.Contains(result.models[0].raw, []byte("Oversized metadata")) {
+		t.Fatalf("Azure oversized overlay mutated static metadata: %s", result.models[0].raw)
+	}
+}
+
+func TestHandleModelsRejectsCompressedOversizedCatalogWithoutInstallingState(t *testing.T) {
+	oversized := paddedProviderModelCatalog(t, maxProviderModelCatalogBodySize+1, "oversized-model")
+	var acceptedGzip atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		acceptedGzip.Store(strings.Contains(r.Header.Get("Accept-Encoding"), "gzip"))
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		_, _ = gz.Write(oversized)
+		_ = gz.Close()
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:             "dynamic",
+			Type:           "openai-compatible",
+			Default:        true,
+			BaseURL:        upstream.URL,
+			AuthType:       "none",
+			ModelDiscovery: "openai",
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	provider := handler.providerSetup().defaultProvider()
+	if _, err := handler.fetchProviderModels(context.Background(), provider, "", ""); !errors.Is(err, errProviderModelCatalogTooLarge) {
+		t.Fatalf("compressed fetchProviderModels() error = %v, want decoded %v", err, errProviderModelCatalogTooLarge)
+	}
+	if !acceptedGzip.Load() {
+		t.Fatal("test transport did not negotiate gzip, so decompressed-size limit was not exercised")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	handler.HandleModels(w, req)
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("compressed oversized catalog status = %d, want 502: %s", resp.StatusCode, body)
+	}
+	if _, ok := handler.providerSetup().lookupModel("oversized-model"); ok {
+		t.Fatal("oversized compressed catalog installed dynamic routing ownership")
+	}
+	handler.models.mu.RLock()
+	_, cached := handler.models.entries[""]
+	handler.models.mu.RUnlock()
+	if cached {
+		t.Fatal("oversized compressed catalog installed a canonical cache entry")
 	}
 }
 
@@ -9039,12 +10934,11 @@ func TestHandleModels_OpenAICodexPreservesContextMetadata(t *testing.T) {
 }
 
 func TestHandleModels_ForwardsQueryAndETag(t *testing.T) {
+	var queries []string
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		if got := r.URL.RawQuery; got != "client_version=0.99.0" {
-			t.Errorf("expected client_version query, got %q", got)
-		}
+		queries = append(queries, r.URL.RawQuery)
 		if got := r.Header.Get("If-None-Match"); got != "" {
-			t.Errorf("expected no If-None-Match on first request, got %q", got)
+			t.Errorf("expected no If-None-Match while seeding canonical/query responses, got %q", got)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -9061,27 +10955,42 @@ func TestHandleModels_ForwardsQueryAndETag(t *testing.T) {
 	if got := resp.Header.Get("ETag"); got != `"models-etag-1"` {
 		t.Errorf("ETag = %q, want %q", got, `"models-etag-1"`)
 	}
+	if want := []string{"", "client_version=0.99.0"}; !reflect.DeepEqual(queries, want) {
+		t.Fatalf("upstream queries = %v, want %v", queries, want)
+	}
 }
 
-func TestHandleModels_RevalidatesCachedEntryWhenETagChanges(t *testing.T) {
+func TestHandleModels_QueryVariantRefreshesWithoutConditionalETag(t *testing.T) {
 	requestCount := 0
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
-		if got := r.URL.RawQuery; got != "client_version=0.99.0" {
-			t.Errorf("expected client_version query, got %q", got)
-		}
 
 		w.Header().Set("Content-Type", "application/json")
 		switch requestCount {
 		case 1:
+			if got := r.URL.RawQuery; got != "" {
+				t.Errorf("canonical seed query = %q, want empty", got)
+			}
 			if got := r.Header.Get("If-None-Match"); got != "" {
-				t.Errorf("expected no If-None-Match on first request, got %q", got)
+				t.Errorf("expected no If-None-Match on canonical seed, got %q", got)
+			}
+			w.Header().Set("ETag", `"canonical-etag"`)
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"canonical-model","object":"model","created":0,"owned_by":"github-copilot","name":"Canonical"}]}`))
+		case 2:
+			if got := r.URL.RawQuery; got != "client_version=0.99.0" {
+				t.Errorf("first variant query = %q, want client_version=0.99.0", got)
+			}
+			if got := r.Header.Get("If-None-Match"); got != "" {
+				t.Errorf("expected no If-None-Match for first query variant, got %q", got)
 			}
 			w.Header().Set("ETag", `"models-etag-1"`)
 			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4o","object":"model","created":0,"owned_by":"github-copilot","name":"GPT-4o"}]}`))
-		case 2:
-			if got := r.Header.Get("If-None-Match"); got != `"models-etag-1"` {
-				t.Errorf("If-None-Match = %q, want %q", got, `"models-etag-1"`)
+		case 3:
+			if got := r.URL.RawQuery; got != "client_version=0.99.0" {
+				t.Errorf("refreshed variant query = %q, want client_version=0.99.0", got)
+			}
+			if got := r.Header.Get("If-None-Match"); got != "" {
+				t.Errorf("expected no If-None-Match for query variant refresh, got %q", got)
 			}
 			w.Header().Set("ETag", `"models-etag-2"`)
 			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5","object":"model","created":0,"owned_by":"github-copilot","name":"GPT-5"}]}`))
@@ -9098,8 +11007,8 @@ func TestHandleModels_RevalidatesCachedEntryWhenETagChanges(t *testing.T) {
 	w2 := httptest.NewRecorder()
 	handler.HandleModels(w2, req2)
 
-	if requestCount != 2 {
-		t.Fatalf("expected 2 upstream requests, got %d", requestCount)
+	if requestCount != 3 {
+		t.Fatalf("expected canonical seed plus 2 variant requests, got %d", requestCount)
 	}
 
 	resp := w2.Result()
@@ -9141,11 +11050,16 @@ func TestHandleModels_UsesCachedEntryOnNotModified(t *testing.T) {
 		}
 	})
 
-	req1 := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.99.0", nil)
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	w1 := httptest.NewRecorder()
 	handler.HandleModels(w1, req1)
+	handler.models.mu.Lock()
+	entry := handler.models.entries[""]
+	entry.expiry = time.Now().Add(-time.Minute)
+	handler.models.entries[""] = entry
+	handler.models.mu.Unlock()
 
-	req2 := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.99.0", nil)
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	w2 := httptest.NewRecorder()
 	handler.HandleModels(w2, req2)
 
@@ -9155,6 +11069,15 @@ func TestHandleModels_UsesCachedEntryOnNotModified(t *testing.T) {
 	}
 	if got := resp.Header.Get("ETag"); got != `"models-etag-1"` {
 		t.Errorf("ETag = %q, want %q", got, `"models-etag-1"`)
+	}
+	if requestCount != 2 {
+		t.Fatalf("upstream request count = %d, want initial response plus expired-entry revalidation", requestCount)
+	}
+	handler.models.mu.RLock()
+	refreshedExpiry := handler.models.entries[""].expiry
+	handler.models.mu.RUnlock()
+	if !time.Now().Before(refreshedExpiry) {
+		t.Fatalf("canonical expiry = %v, want extended TTL after 304", refreshedExpiry)
 	}
 
 	body, _ := io.ReadAll(resp.Body)
@@ -10964,21 +12887,13 @@ func TestNewProviderJSONRequest_StripsClientHeadersForAzureIdentity(t *testing.T
 	}
 }
 
-func TestHandleReadyz_AzureIdentityProvider(t *testing.T) {
+func TestHandleReadyz_AzureIdentityProviderSkipsModelsProbe(t *testing.T) {
 	tokenSource := &staticAzureTokenSource{token: "readyz-entra-token"}
+	var modelsProbeHits atomic.Int32
 
 	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.URL.Path; got != "/openai/v1/models" {
-			t.Fatalf("expected Azure readiness path /openai/v1/models, got %s", got)
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer readyz-entra-token" {
-			t.Fatalf("expected Azure identity Authorization header, got %q", got)
-		}
-		if got := r.Header.Get("api-key"); got != "" {
-			t.Fatalf("expected no api-key header, got %q", got)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		modelsProbeHits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer azureServer.Close()
 
@@ -11019,8 +12934,11 @@ func TestHandleReadyz_AzureIdentityProvider(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
 	}
-	if tokenSource.calls.Load() != 1 {
-		t.Fatalf("token source calls = %d, want 1", tokenSource.calls.Load())
+	if got := modelsProbeHits.Load(); got != 0 {
+		t.Fatalf("Azure /models readiness probe hits = %d, want 0", got)
+	}
+	if tokenSource.calls.Load() != 0 {
+		t.Fatalf("token source calls = %d, want 0 when readiness skips Azure metadata", tokenSource.calls.Load())
 	}
 }
 

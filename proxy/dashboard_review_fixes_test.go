@@ -113,7 +113,7 @@ func TestHandleDashboardInsightRejectsCrossSite(t *testing.T) {
 // marker: a marked (tracked) context counts, an unmarked one (insight call,
 // model-catalog fetch, count-token probe, proxy shim) does not. The marker is a
 // positive allow-signal rather than an exclusion signal because the upstream
-// request context is rebuilt from context.Background(), which strips any
+// request context is rebuilt from the proxy lifecycle root, which strips any
 // exclusion marker set on the inbound request.
 func TestLogRetryAttemptCountsOnlyTrackedRequests(t *testing.T) {
 	h := &ProxyHandler{stats: newStatsCollector()}
@@ -135,7 +135,8 @@ func TestLogRetryAttemptCountsOnlyTrackedRequests(t *testing.T) {
 // TestNewInferenceUpstreamContextPropagatesTrackedMarker covers that the upstream
 // context inherits the retry-stats marker from a tracked inbound context (so
 // retries are counted) but not from an unmarked one (so insight / catalog /
-// probe retries stay uncounted) — the background root would otherwise strip it.
+// probe retries stay uncounted) — the detached lifecycle root would otherwise
+// strip it.
 func TestNewInferenceUpstreamContextPropagatesTrackedMarker(t *testing.T) {
 	h := &ProxyHandler{}
 
