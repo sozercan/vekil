@@ -17,6 +17,14 @@ log() {
   printf '==> %s\n' "$*" >&2
 }
 
+process_is_running() {
+  local pid="$1"
+  local state
+  kill -0 "${pid}" 2>/dev/null || return 1
+  state="$(ps -o stat= -p "${pid}" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+  [[ "${state}" != Z* ]]
+}
+
 stop_mock_servers() {
   local pid attempt
   for pid in "${server_pids[@]:-}"; do
@@ -703,7 +711,7 @@ if [[ ! -s "${child_pid_file}" ]]; then
 else
   child_pid="$(cat "${child_pid_file}")"
   sleep 0.2
-  if kill -0 "${child_pid}" 2>/dev/null; then
+  if process_is_running "${child_pid}"; then
     kill "${child_pid}" 2>/dev/null || true
     record_failure "fake CLI forks sleeper cleanup" "child ${child_pid} remained alive"
   else
