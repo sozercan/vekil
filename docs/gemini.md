@@ -44,6 +44,8 @@ Explicit `501 UNIMPLEMENTED` cases include:
 
 Validation failures (`400 INVALID_ARGUMENT`) include path/body model mismatches, explicit content roles other than `user` or `model`, malformed content parts, invalid function-call history, and unmatched `functionResponse` parts.
 
+`functionResponse.response` objects retain their JSON structure when translated for generic Gemini clients. For Gemini CLI requests, an exact one-field `{"output":"<text>"}` response is unwrapped to the text value; responses with metadata or non-string `output` values remain structured JSON.
+
 ## `POST /v1beta/models/{model}:streamGenerateContent`, `POST /v1/models/{model}:streamGenerateContent`, and `POST /models/{model}:streamGenerateContent` (Gemini)
 
 `streamGenerateContent` uses the same request body, translation rules, and validation behavior as `generateContent`, but returns data-only SSE frames instead of a single JSON response.

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +21,11 @@ const (
 	// retaining ample reuse for active client sessions.
 	geminiCountTokensCacheMaxEntries = 1024
 )
+
+func isGeminiCLIUserAgent(userAgent string) bool {
+	userAgent = strings.ToLower(strings.TrimSpace(userAgent))
+	return strings.Contains(userAgent, "geminicli/") || strings.HasPrefix(userAgent, "gemini-cli")
+}
 
 type geminiCountTokensCache struct {
 	mu           sync.RWMutex
@@ -82,7 +88,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	h.observeRequestSummary(r.Context(), "gemini", pathModel, stream, providerEndpointChatCompletions)
 
 	scope := chatToolExecutionScopeFromHeaders(r.Header)
-	oaiReq, err := TranslateGeminiToOpenAI(req, pathModel, stream)
+	oaiReq, err := translateGeminiToOpenAIWithOptions(req, pathModel, stream, geminiTranslationOptions{unwrapCLITextOutput: isGeminiCLIUserAgent(r.UserAgent())})
 	if err != nil {
 		h.writeGeminiProtocolError(w, err)
 		return

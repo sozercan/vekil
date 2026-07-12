@@ -1297,8 +1297,8 @@ func TestDecodeGeminiGenerateContentRequestAcceptsThoughtMetadata(t *testing.T) 
 	if err := json.Unmarshal(got.Messages[1].Content, &toolResult); err != nil {
 		t.Fatalf("unmarshal tool result: %v", err)
 	}
-	if toolResult != "ok" {
-		t.Fatalf("tool result = %q, want unwrapped output %q", toolResult, "ok")
+	if toolResult != `{"output":"ok"}` {
+		t.Fatalf("tool result = %q, want preserved structured output %q", toolResult, `{"output":"ok"}`)
 	}
 }
 
@@ -3204,18 +3204,20 @@ func benchmarkGeminiCountTokensOpenAIRequest() *models.OpenAIRequest {
 
 func TestNormalizeGeminiFunctionResponse(t *testing.T) {
 	tests := []struct {
-		name string
-		raw  string
-		want string
+		name      string
+		raw       string
+		unwrapCLI bool
+		want      string
 	}{
 		{name: "string", raw: `"plain"`, want: "plain"},
-		{name: "single output string", raw: `{"output":"ZX_LEFT"}`, want: "ZX_LEFT"},
-		{name: "output with metadata stays structured", raw: `{"output":"ZX_LEFT","status":"ok"}`, want: `{"output":"ZX_LEFT","status":"ok"}`},
-		{name: "non-string output stays structured", raw: `{"output":{"value":1}}`, want: `{"output":{"value":1}}`},
+		{name: "generic output object stays structured", raw: `{"output":"ZX_LEFT"}`, want: `{"output":"ZX_LEFT"}`},
+		{name: "Gemini CLI output string unwraps", raw: `{"output":"ZX_LEFT"}`, unwrapCLI: true, want: "ZX_LEFT"},
+		{name: "CLI output with metadata stays structured", raw: `{"output":"ZX_LEFT","status":"ok"}`, unwrapCLI: true, want: `{"output":"ZX_LEFT","status":"ok"}`},
+		{name: "CLI non-string output stays structured", raw: `{"output":{"value":1}}`, unwrapCLI: true, want: `{"output":{"value":1}}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := normalizeGeminiFunctionResponse(json.RawMessage(tt.raw))
+			got, err := normalizeGeminiFunctionResponse(json.RawMessage(tt.raw), tt.unwrapCLI)
 			if err != nil {
 				t.Fatalf("normalizeGeminiFunctionResponse() error = %v", err)
 			}
@@ -3223,5 +3225,33 @@ func TestNormalizeGeminiFunctionResponse(t *testing.T) {
 				t.Fatalf("normalizeGeminiFunctionResponse() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestGeminiCLITranslationUnwrapsTextOutputOnlyForCLIRequests(t *testing.T) {
+	req := &models.GeminiGenerateContentRequest{Contents: []models.GeminiContent{
+		{Role: "model", Parts: []models.GeminiPart{{FunctionCall: &models.GeminiFunctionCall{ID: "call-1", Name: "read_file", Args: json.RawMessage(`{"file_path":"left.txt"}`)}}}},
+		{Role: "user", Parts: []models.GeminiPart{{FunctionResponse: &models.GeminiFunctionResponse{ID: "call-1", Name: "read_file", Response: json.RawMessage(`{"output":"ZX_LEFT"}`)}}}},
+	}}
+	generic, err := TranslateGeminiToOpenAI(req, "gemini-3.1-pro-preview", false)
+	if err != nil {
+		t.Fatalf("generic translation error = %v", err)
+	}
+	cli, err := translateGeminiToOpenAIWithOptions(req, "gemini-3.1-pro-preview", false, geminiTranslationOptions{unwrapCLITextOutput: true})
+	if err != nil {
+		t.Fatalf("CLI translation error = %v", err)
+	}
+	var genericResult, cliResult string
+	if err := json.Unmarshal(generic.Messages[1].Content, &genericResult); err != nil {
+		t.Fatalf("decode generic result: %v", err)
+	}
+	if err := json.Unmarshal(cli.Messages[1].Content, &cliResult); err != nil {
+		t.Fatalf("decode CLI result: %v", err)
+	}
+	if genericResult != `{"output":"ZX_LEFT"}` || cliResult != "ZX_LEFT" {
+		t.Fatalf("results = generic:%q CLI:%q", genericResult, cliResult)
+	}
+	if !isGeminiCLIUserAgent("GeminiCLI/1.0.0/gemini-3.1-pro-preview (linux; x64)") || isGeminiCLIUserAgent("custom-client/1.0") {
+		t.Fatal("Gemini CLI user-agent classification mismatch")
 	}
 }
