@@ -139,7 +139,10 @@ func mergeHeaderValues(dst, src http.Header) {
 }
 
 func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*providerRuntime, providerModel, []byte, error) {
-	model := extractRequestModel(body)
+	return h.resolveProviderRequestForModel(body, endpoint, extractRequestModel(body))
+}
+
+func (h *ProxyHandler) resolveProviderRequestForModel(body []byte, endpoint string, model string) (*providerRuntime, providerModel, []byte, error) {
 	lookupModel := model
 	if endpoint == providerEndpointMessages {
 		lookupModel = NormalizeModelName(model)
@@ -170,7 +173,7 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 	rewrittenBody := body
 	if !providerUsesAzureClassicDeploymentPath(provider, endpoint) {
 		var err error
-		rewrittenBody, _, err = rewriteRequestModelForProvider(body, owner.upstreamModel)
+		rewrittenBody, _, err = rewriteRequestModelForProviderFromModel(body, model, owner.upstreamModel)
 		if err != nil {
 			return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 		}
@@ -217,7 +220,11 @@ func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body [
 }
 
 func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	provider, owner, rewrittenBody, err := h.resolveProviderRequest(body, path)
+	return h.postJSONEndpointWithHeadersForModel(ctx, path, body, extraHeaders, extractRequestModel(body))
+}
+
+func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, path string, body []byte, extraHeaders http.Header, model string) (*http.Response, error) {
+	provider, owner, rewrittenBody, err := h.resolveProviderRequestForModel(body, path, model)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +243,11 @@ func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*h
 }
 
 func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	resp, err := h.postJSONEndpointWithHeaders(ctx, providerEndpointResponses, body, extraHeaders)
+	return h.postResponsesWithHeadersForModel(ctx, body, extraHeaders, extractRequestModel(body))
+}
+
+func (h *ProxyHandler) postResponsesWithHeadersForModel(ctx context.Context, body []byte, extraHeaders http.Header, model string) (*http.Response, error) {
+	resp, err := h.postJSONEndpointWithHeadersForModel(ctx, providerEndpointResponses, body, extraHeaders, model)
 	if err != nil {
 		return nil, err
 	}

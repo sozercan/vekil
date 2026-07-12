@@ -429,6 +429,10 @@ func extractFunctionCallOutputItem(raw json.RawMessage) (toolOutputItem, bool) {
 	if err := json.Unmarshal(raw, &item); err != nil {
 		return toolOutputItem{}, false
 	}
+	return extractFunctionCallOutput(item)
+}
+
+func extractFunctionCallOutput(item map[string]json.RawMessage) (toolOutputItem, bool) {
 	itemType, ok := extractNonEmptyJSONStringField(item, "type")
 	if !ok || (itemType != "function_call_output" && itemType != "local_shell_call_output") {
 		return toolOutputItem{}, false
