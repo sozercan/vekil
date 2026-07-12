@@ -1170,23 +1170,17 @@ func providerModelSupportsEndpoint(model providerModel, endpoint string) bool {
 }
 
 func rewriteRequestModelForProvider(body []byte, upstreamModel string) ([]byte, bool, error) {
+	return rewriteRequestModelForProviderFromModel(body, extractResponsesRequestModel(body), upstreamModel)
+}
+
+func rewriteRequestModelForProviderFromModel(body []byte, currentModel string, upstreamModel string) ([]byte, bool, error) {
 	upstreamModel = strings.TrimSpace(upstreamModel)
 	if upstreamModel == "" {
 		return body, false, nil
 	}
 
-	current := extractResponsesRequestModel(body)
-	if current == "" {
-		var payload struct {
-			Model string `json:"model"`
-		}
-		if err := json.Unmarshal(body, &payload); err != nil {
-			return body, false, nil
-		}
-		current = strings.TrimSpace(payload.Model)
-	}
-
-	if current == "" || current == upstreamModel {
+	currentModel = strings.TrimSpace(currentModel)
+	if currentModel == "" || currentModel == upstreamModel {
 		return body, false, nil
 	}
 	return rewriteResponsesRequestModel(body, upstreamModel)

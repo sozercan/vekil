@@ -140,3 +140,65 @@ func TestToolOptimizerResponsesReducePrefersLocalToolContextOverStore(t *testing
 		t.Fatalf("rewritten output = %v, want reduced output", got)
 	}
 }
+
+func TestResponsesPayloadMayContainOptimizableToolItems(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		body []byte
+		want bool
+	}{
+		{name: "ordinary messages", body: []byte(`{"input":[{"type":"message","content":"hello"}]}`), want: false},
+		{name: "function call", body: []byte(`{"type":"function_call"}`), want: true},
+		{name: "local shell call", body: []byte(`{"type":"local_shell_call_output"}`), want: true},
+		{name: "unicode escaped type", body: []byte(`{"type":"function_\u0063all"}`), want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := responsesPayloadMayContainOptimizableToolItems(tt.body); got != tt.want {
+				t.Fatalf("responsesPayloadMayContainOptimizableToolItems() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestToolOptimizerResponsesReduceHandlesUnicodeEscapedItemTypes(t *testing.T) {
+	fake := &recordingToolOptimizer{}
+	handler := &ProxyHandler{}
+	configureRecordingToolOptimizer(handler, fake)
+
+	body := []byte(`{
+		"model": "gpt-4",
+		"input": [
+			{
+				"type": "function_\u0063all",
+				"name": "shell_command",
+				"call_id": "call-escaped-1",
+				"arguments": "{\"command\":\"fresh command\"}"
+			},
+			{
+				"type": "function_\u0063all_output",
+				"call_id": "call-escaped-1",
+				"output": "large output"
+			}
+		]
+	}`)
+
+	rewritten, count := handler.maybeReduceResponsesToolOutputsInRequestBody(context.Background(), body, handler.toolContexts, "session:escaped-types")
+	if count != 1 {
+		t.Fatalf("reduced output count = %d, want 1; body=%s", count, rewritten)
+	}
+
+	var payload struct {
+		Input []map[string]interface{} `json:"input"`
+	}
+	if err := json.Unmarshal(rewritten, &payload); err != nil {
+		t.Fatalf("decode rewritten body: %v", err)
+	}
+	if got := payload.Input[1]["output"]; got != "reduced output" {
+		t.Fatalf("rewritten output = %v, want reduced output", got)
+	}
+}

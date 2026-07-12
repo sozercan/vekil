@@ -70,39 +70,63 @@ func responsesUpstreamHeaders(extraHeaders http.Header, stream bool) http.Header
 
 type preparedResponsesRequest struct {
 	body            []byte
+	model           string
 	extraHeaders    http.Header
 	upstreamHeaders http.Header
 	headerToolScope string
 	streaming       bool
 }
 
+type responsesRequestMetadata struct {
+	Model              string
+	PreviousResponseID string
+	Stream             bool
+}
+
+// parseResponsesRequestMetadata extracts the fields needed by routing, streaming,
+// and tool scoping in one decode so long replay bodies are not rescanned for each
+// field independently.
+func parseResponsesRequestMetadata(bodyBytes []byte) responsesRequestMetadata {
+	var raw struct {
+		Model              json.RawMessage `json:"model"`
+		PreviousResponseID json.RawMessage `json:"previous_response_id,omitempty"`
+		Stream             json.RawMessage `json:"stream,omitempty"`
+	}
+	if err := json.Unmarshal(bodyBytes, &raw); err != nil {
+		return responsesRequestMetadata{}
+	}
+
+	var metadata responsesRequestMetadata
+	if err := json.Unmarshal(raw.Model, &metadata.Model); err == nil {
+		metadata.Model = strings.TrimSpace(metadata.Model)
+	}
+	if err := json.Unmarshal(raw.PreviousResponseID, &metadata.PreviousResponseID); err == nil {
+		metadata.PreviousResponseID = strings.TrimSpace(metadata.PreviousResponseID)
+	}
+	_ = json.Unmarshal(raw.Stream, &metadata.Stream)
+	return metadata
+}
+
 func (h *ProxyHandler) prepareResponsesRequest(ctx context.Context, r *http.Request, bodyBytes []byte) preparedResponsesRequest {
+	metadata := parseResponsesRequestMetadata(bodyBytes)
 	extraHeaders := responsesExtraHeadersFromRequest(r)
 	headerToolScope := toolExecutionScopeFromHeaders(extraHeaders)
-	requestToolScope := responsesRequestToolExecutionScope(headerToolScope, bodyBytes)
+	requestToolScope := responsesRequestToolExecutionScope(headerToolScope, metadata.PreviousResponseID)
 
-	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizers(ctx, bodyBytes, "responses", true, h.toolContexts, requestToolScope)
-	streaming := responsesRequestStreams(bodyBytes)
+	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, bodyBytes, metadata.Model, "responses", true, h.toolContexts, requestToolScope)
 
 	return preparedResponsesRequest{
 		body:            bodyBytes,
+		model:           metadata.Model,
 		extraHeaders:    extraHeaders,
-		upstreamHeaders: responsesUpstreamHeaders(extraHeaders, streaming),
+		upstreamHeaders: responsesUpstreamHeaders(extraHeaders, metadata.Stream),
 		headerToolScope: headerToolScope,
-		streaming:       streaming,
+		streaming:       metadata.Stream,
 	}
 }
 
-func responsesRequestStreams(bodyBytes []byte) bool {
-	var partial struct {
-		Stream *bool `json:"stream,omitempty"`
-	}
-	_ = json.Unmarshal(bodyBytes, &partial)
-	return partial.Stream != nil && *partial.Stream
-}
-
-func (h *ProxyHandler) postPreparedResponsesRequest(ctx, observeCtx context.Context, req preparedResponsesRequest) (*http.Response, error) {
-	resp, err := h.postResponsesWithHeaders(ctx, req.body, req.upstreamHeaders)
+func (h *ProxyHandler) postPreparedResponsesRequest(ctx context.Context, observeCtx context.Context, req preparedResponsesRequest) (*http.Response, error) {
+	resp, err := h.postResponsesWithHeadersForModel(ctx, req.body, req.upstreamHeaders, req.model)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +155,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = r.Body.Close() }()
 
 	prepared := h.prepareResponsesRequest(r.Context(), r, bodyBytes)
-	h.observeRequestSummary(r.Context(), "responses", extractRequestModel(prepared.body), prepared.streaming, providerEndpointResponses)
+	h.observeRequestSummary(r.Context(), "responses", prepared.model, prepared.streaming, providerEndpointResponses)
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), prepared.streaming)
 	defer upstreamCancel()
@@ -165,8 +189,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	if prepared.streaming && resp.StatusCode == http.StatusOK {
-		model := extractRequestModel(prepared.body)
-		peekAndForwardResponses(h, w, r, resp, upstreamCancel, model, prepared.headerToolScope)
+		peekAndForwardResponses(h, w, r, resp, upstreamCancel, prepared.model, prepared.headerToolScope)
 		return
 	}
 
@@ -1913,7 +1936,10 @@ func fallbackMergedCompactionSummaries(summaries []string) string {
 }
 
 func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint string, injectResumePrompt bool) []byte {
-	requestedModel := extractResponsesRequestModel(bodyBytes)
+	return h.rewriteResponsesRequestBodyForModel(bodyBytes, extractResponsesRequestModel(bodyBytes), endpoint, injectResumePrompt)
+}
+
+func (h *ProxyHandler) rewriteResponsesRequestBodyForModel(bodyBytes []byte, requestedModel string, endpoint string, injectResumePrompt bool) []byte {
 	provider, _, _ := h.resolveProviderModel(requestedModel, "/responses")
 
 	if rewrittenBody, strippedFields := stripUnsupportedResponsesRequestFields(bodyBytes, provider); len(strippedFields) > 0 {
@@ -1977,6 +2003,9 @@ func stripUnsupportedResponsesRequestFields(bodyBytes []byte, provider *provider
 	unsupportedSamplingFields := unsupportedResponsesSamplingFields(provider)
 	stripInternalChatMetadata := !providerSupportsResponsesInternalChatMessageMetadataPassthrough(provider) && bytes.Contains(bodyBytes, responsesInternalChatMessageMetadataPassthroughFieldBytes)
 	if len(unsupportedToolTypes) == 0 && len(unsupportedSamplingFields) == 0 && !stripInternalChatMetadata {
+		return bodyBytes, nil
+	}
+	if !responsesRequestNeedsUnsupportedFieldRewrite(bodyBytes, unsupportedToolTypes, unsupportedSamplingFields, stripInternalChatMetadata) {
 		return bodyBytes, nil
 	}
 
@@ -2049,12 +2078,68 @@ func stripUnsupportedResponsesRequestFields(bodyBytes []byte, provider *provider
 	return rewrittenBody, strippedFields
 }
 
+// responsesRequestNeedsUnsupportedFieldRewrite is a conservative preflight.
+// Cheap byte checks keep ordinary long histories on the passthrough path; a JSON
+// unicode escape forces structural inspection so escaped policy values still work.
+func responsesRequestNeedsUnsupportedFieldRewrite(bodyBytes []byte, unsupportedToolTypes map[string]struct{}, unsupportedSamplingFields []string, stripInternalChatMetadata bool) bool {
+	if stripInternalChatMetadata {
+		return true
+	}
+
+	hasUnicodeEscape := bytes.Contains(bodyBytes, []byte(`\u`))
+	for _, field := range unsupportedSamplingFields {
+		if hasUnicodeEscape || bytes.Contains(bodyBytes, []byte(`"`+field+`"`)) {
+			return true
+		}
+	}
+
+	if len(unsupportedToolTypes) == 0 {
+		return false
+	}
+	hasUnsupportedToolMarker := hasUnicodeEscape
+	if !hasUnsupportedToolMarker {
+		for toolType := range unsupportedToolTypes {
+			if bytes.Contains(bodyBytes, []byte(toolType)) {
+				hasUnsupportedToolMarker = true
+				break
+			}
+		}
+	}
+	if !hasUnsupportedToolMarker {
+		return false
+	}
+
+	var probe struct {
+		Tools json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(bodyBytes, &probe); err != nil || len(probe.Tools) == 0 {
+		return false
+	}
+	var tools []json.RawMessage
+	if err := json.Unmarshal(probe.Tools, &tools); err != nil {
+		return false
+	}
+	for _, rawTool := range tools {
+		if _, unsupported := unsupportedToolTypes[responsesToolType(rawTool)]; unsupported {
+			return true
+		}
+	}
+	return false
+}
+
+var (
+	openAICodexUnsupportedResponsesSamplingFields = []string{"top_p", "temperature"}
+	imageGenerationUnsupportedResponsesToolTypes  = map[string]struct{}{
+		"image_generation": {},
+	}
+)
+
 func unsupportedResponsesSamplingFields(provider *providerRuntime) []string {
 	if provider == nil {
 		return nil
 	}
 	if provider.kind == providerTypeOpenAICodex {
-		return []string{"top_p", "temperature"}
+		return openAICodexUnsupportedResponsesSamplingFields
 	}
 	return nil
 }
@@ -2157,9 +2242,7 @@ func unsupportedResponsesToolTypes(provider *providerRuntime) map[string]struct{
 
 	switch provider.kind {
 	case providerTypeCopilot, providerTypeAzureOpenAI:
-		return map[string]struct{}{
-			"image_generation": {},
-		}
+		return imageGenerationUnsupportedResponsesToolTypes
 	default:
 		return nil
 	}

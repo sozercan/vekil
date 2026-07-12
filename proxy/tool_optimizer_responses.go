@@ -68,16 +68,6 @@ func uniqueToolExecutionScopes(scopes ...string) []string {
 	return out
 }
 
-func toolExecutionScopeFromPreviousResponseID(bodyBytes []byte) string {
-	var partial struct {
-		PreviousResponseID string `json:"previous_response_id,omitempty"`
-	}
-	if err := json.Unmarshal(bodyBytes, &partial); err != nil {
-		return ""
-	}
-	return toolExecutionScopeFromResponseID(partial.PreviousResponseID)
-}
-
 func toolExecutionScopeFromResponsePayload(payload map[string]json.RawMessage) string {
 	if payload == nil {
 		return ""
@@ -89,8 +79,8 @@ func toolExecutionScopeFromResponsePayload(payload map[string]json.RawMessage) s
 	return toolExecutionScopeFromResponseID(responseID)
 }
 
-func responsesRequestToolExecutionScope(headerScope string, bodyBytes []byte) string {
-	previousScope := toolExecutionScopeFromPreviousResponseID(bodyBytes)
+func responsesRequestToolExecutionScope(headerScope, previousResponseID string) string {
+	previousScope := toolExecutionScopeFromResponseID(previousResponseID)
 	scope := strings.TrimSpace(headerScope)
 	if isClientRequestToolExecutionScope(scope) && previousScope != "" {
 		return previousScope
@@ -308,9 +298,24 @@ func (h *ProxyHandler) maybeRewriteOrCaptureToolCommandItemInScopes(ctx context.
 	return rawItem, changed
 }
 
+var (
+	responsesFunctionCallMarker      = []byte("function_call")
+	responsesLocalShellCallMarker    = []byte("local_shell_call")
+	responsesJSONUnicodeEscapeMarker = []byte(`\u`)
+)
+
+// responsesPayloadMayContainOptimizableToolItems avoids decoding replay items
+// that cannot be tool calls or tool outputs. Unicode escapes force inspection to
+// avoid missing an escaped type value.
+func responsesPayloadMayContainOptimizableToolItems(payload []byte) bool {
+	return bytes.Contains(payload, responsesFunctionCallMarker) ||
+		bytes.Contains(payload, responsesLocalShellCallMarker) ||
+		bytes.Contains(payload, responsesJSONUnicodeEscapeMarker)
+}
+
 func (h *ProxyHandler) maybeReduceResponsesToolOutputsInRequestBody(ctx context.Context, bodyBytes []byte, store *ToolExecutionContextStore, scope string) ([]byte, int) {
 	manager := h.toolOptimizers
-	if manager == nil || !manager.OutputReduceEnabled() {
+	if manager == nil || !manager.OutputReduceEnabled() || !responsesPayloadMayContainOptimizableToolItems(bodyBytes) {
 		return bodyBytes, 0
 	}
 	var payload map[string]json.RawMessage
@@ -329,7 +334,24 @@ func (h *ProxyHandler) maybeReduceResponsesToolOutputsInRequestBody(ctx context.
 	localContexts := make(map[string]ToolExecutionContext)
 	changedCount := 0
 	for i, rawItem := range inputItems {
-		if commandItem, ok := extractShellFunctionCommandItem(rawItem, manager); ok {
+		if !responsesPayloadMayContainOptimizableToolItems(rawItem) {
+			continue
+		}
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(rawItem, &item); err != nil {
+			continue
+		}
+		itemType, ok := extractNonEmptyJSONStringField(item, "type")
+		if !ok {
+			continue
+		}
+
+		switch itemType {
+		case "function_call", "local_shell_call":
+			commandItem, ok := extractShellFunctionCommand(item, manager)
+			if !ok {
+				continue
+			}
 			toolCtx := newToolExecutionContext(commandItem, commandItem.Command, commandItem.Command, "")
 			localContexts[commandItem.CallID] = toolCtx
 			if store != nil && scope != "" {
@@ -338,9 +360,12 @@ func (h *ProxyHandler) maybeReduceResponsesToolOutputsInRequestBody(ctx context.
 				}
 			}
 			continue
+		case "function_call_output", "local_shell_call_output":
+		default:
+			continue
 		}
 
-		outputItem, ok := extractFunctionCallOutputItem(rawItem)
+		outputItem, ok := extractFunctionCallOutput(item)
 		if !ok {
 			continue
 		}
@@ -386,7 +411,11 @@ func (h *ProxyHandler) maybeReduceResponsesToolOutputsInRequestBody(ctx context.
 }
 
 func (h *ProxyHandler) rewriteResponsesRequestBodyWithToolOptimizers(ctx context.Context, bodyBytes []byte, endpoint string, injectResumePrompt bool, store *ToolExecutionContextStore, scope string) []byte {
-	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, endpoint, injectResumePrompt)
+	return h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, bodyBytes, extractResponsesRequestModel(bodyBytes), endpoint, injectResumePrompt, store, scope)
+}
+
+func (h *ProxyHandler) rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx context.Context, bodyBytes []byte, requestedModel string, endpoint string, injectResumePrompt bool, store *ToolExecutionContextStore, scope string) []byte {
+	bodyBytes = h.rewriteResponsesRequestBodyForModel(bodyBytes, requestedModel, endpoint, injectResumePrompt)
 	rewritten, count := h.maybeReduceResponsesToolOutputsInRequestBody(ctx, bodyBytes, store, scope)
 	if count > 0 {
 		h.log.Debug("reduced responses tool outputs", logger.F("endpoint", endpoint), logger.F("count", count))

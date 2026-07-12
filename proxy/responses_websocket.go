@@ -771,7 +771,7 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 	if err != nil {
 		return nil, err
 	}
-	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizers(ctx, bodyBytes, "responses/websocket", true, s.toolContexts, s.toolScope)
+	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, bodyBytes, request.Model, "responses/websocket", true, s.toolContexts, s.toolScope)
 	headers := s.requestHeaders(request, includeTurnState)
 	// The websocket bridge records each turn's usage downstream from the streamed
 	// response body (recordTurnStats), so the per-turn usage total returned here
@@ -779,7 +779,7 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 	if compactionResp, handled, _, err := h.maybeBuildResponsesCompactionTriggerResponse(ctx, bodyBytes, headers, true); handled || err != nil {
 		return compactionResp, err
 	}
-	return h.postResponsesWithHeaders(ctx, bodyBytes, headers)
+	return h.postResponsesWithHeadersForModel(ctx, bodyBytes, headers, request.Model)
 }
 
 func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCreateRequest, includeTurnState bool) http.Header {
