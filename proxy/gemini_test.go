@@ -1297,8 +1297,8 @@ func TestDecodeGeminiGenerateContentRequestAcceptsThoughtMetadata(t *testing.T) 
 	if err := json.Unmarshal(got.Messages[1].Content, &toolResult); err != nil {
 		t.Fatalf("unmarshal tool result: %v", err)
 	}
-	if toolResult != `{"output":"ok"}` {
-		t.Fatalf("tool result = %q, want %q", toolResult, `{"output":"ok"}`)
+	if toolResult != "ok" {
+		t.Fatalf("tool result = %q, want unwrapped output %q", toolResult, "ok")
 	}
 }
 
@@ -3199,5 +3199,29 @@ func benchmarkGeminiCountTokensOpenAIRequest() *models.OpenAIRequest {
 		Temperature:       &temperature,
 		TopP:              &topP,
 		ParallelToolCalls: &parallelToolCalls,
+	}
+}
+
+func TestNormalizeGeminiFunctionResponse(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "string", raw: `"plain"`, want: "plain"},
+		{name: "single output string", raw: `{"output":"ZX_LEFT"}`, want: "ZX_LEFT"},
+		{name: "output with metadata stays structured", raw: `{"output":"ZX_LEFT","status":"ok"}`, want: `{"output":"ZX_LEFT","status":"ok"}`},
+		{name: "non-string output stays structured", raw: `{"output":{"value":1}}`, want: `{"output":{"value":1}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeGeminiFunctionResponse(json.RawMessage(tt.raw))
+			if err != nil {
+				t.Fatalf("normalizeGeminiFunctionResponse() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("normalizeGeminiFunctionResponse() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

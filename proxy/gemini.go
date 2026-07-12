@@ -1043,6 +1043,21 @@ func normalizeGeminiFunctionResponse(raw json.RawMessage) (string, error) {
 		return asString, nil
 	}
 
+	// Gemini CLI wraps text-only shell results as {"output":"..."}. OpenAI
+	// tool messages carry the textual result directly; preserving the wrapper
+	// makes models echo JSON instead of the command output. Unwrap only the exact
+	// single-field string shape so structured or metadata-bearing responses keep
+	// their full JSON semantics.
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err == nil && len(object) == 1 {
+		if outputRaw, ok := object["output"]; ok {
+			var output string
+			if err := json.Unmarshal(outputRaw, &output); err == nil {
+				return output, nil
+			}
+		}
+	}
+
 	response, err := canonicalizeJSON(raw)
 	if err != nil {
 		return "", err

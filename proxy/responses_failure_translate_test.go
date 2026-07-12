@@ -782,7 +782,7 @@ func TestPeekAndForwardResponses_PrecommitAwaitTerminationOverHTTP(t *testing.T)
 		cancelInbound context.CancelFunc
 	}
 
-	run := func(t *testing.T, mode string) (*http.Response, error, handlerResult, statsSnapshot, string) {
+	run := func(t *testing.T, mode string) (*http.Response, handlerResult, statsSnapshot, string, error) {
 		t.Helper()
 
 		var logs bytes.Buffer
@@ -911,15 +911,15 @@ func TestPeekAndForwardResponses_PrecommitAwaitTerminationOverHTTP(t *testing.T)
 		case <-time.After(time.Second):
 			t.Fatal("timed out waiting for HTTP handler result")
 		}
-		return client.resp, client.err, result, h.stats.snapshot(), logs.String()
+		return client.resp, result, h.stats.snapshot(), logs.String(), client.err
 	}
 
 	t.Run("upstream deadline", func(t *testing.T) {
-		resp, err, result, stats, logs := run(t, "deadline")
+		resp, result, stats, logs, err := run(t, "deadline")
 		if err != nil {
 			t.Fatalf("HTTP request error = %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode != http.StatusGatewayTimeout || result.status != http.StatusGatewayTimeout {
 			t.Fatalf("status = client:%d handler:%d, want 504; body=%s", resp.StatusCode, result.status, body)
@@ -939,11 +939,11 @@ func TestPeekAndForwardResponses_PrecommitAwaitTerminationOverHTTP(t *testing.T)
 	})
 
 	t.Run("ordinary upstream cancellation", func(t *testing.T) {
-		resp, err, result, stats, logs := run(t, "upstream_cancel")
+		resp, result, stats, logs, err := run(t, "upstream_cancel")
 		if err != nil {
 			t.Fatalf("HTTP request error = %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusBadGateway || result.status != http.StatusBadGateway {
 			body, _ := io.ReadAll(resp.Body)
 			t.Fatalf("status = client:%d handler:%d, want 502; body=%s", resp.StatusCode, result.status, body)
@@ -960,11 +960,11 @@ func TestPeekAndForwardResponses_PrecommitAwaitTerminationOverHTTP(t *testing.T)
 	})
 
 	t.Run("lifecycle shutdown", func(t *testing.T) {
-		resp, err, result, stats, logs := run(t, "shutdown")
+		resp, result, stats, logs, err := run(t, "shutdown")
 		if err != nil {
 			t.Fatalf("HTTP request error = %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusServiceUnavailable || result.status != http.StatusServiceUnavailable {
 			body, _ := io.ReadAll(resp.Body)
 			t.Fatalf("status = client:%d handler:%d, want 503; body=%s", resp.StatusCode, result.status, body)
@@ -981,7 +981,7 @@ func TestPeekAndForwardResponses_PrecommitAwaitTerminationOverHTTP(t *testing.T)
 	})
 
 	t.Run("inbound client cancellation", func(t *testing.T) {
-		resp, err, result, stats, logs := run(t, "client_cancel")
+		resp, result, stats, logs, err := run(t, "client_cancel")
 		if resp != nil {
 			_ = resp.Body.Close()
 			t.Fatalf("client cancellation unexpectedly received HTTP %d", resp.StatusCode)

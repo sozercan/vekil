@@ -416,10 +416,6 @@ func (h *ProxyHandler) maybeReduceResponsesToolOutputsInRequestBody(ctx context.
 	return rewritten, changedCount
 }
 
-func (h *ProxyHandler) rewriteResponsesRequestBodyWithToolOptimizers(ctx context.Context, bodyBytes []byte, endpoint string, injectResumePrompt bool, store *ToolExecutionContextStore, scope string) []byte {
-	return h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, bodyBytes, extractResponsesRequestModel(bodyBytes), endpoint, injectResumePrompt, store, scope)
-}
-
 func (h *ProxyHandler) rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx context.Context, bodyBytes []byte, requestedModel string, endpoint string, injectResumePrompt bool, store *ToolExecutionContextStore, scope string) []byte {
 	bodyBytes = h.rewriteResponsesRequestBodyForModel(bodyBytes, requestedModel, endpoint, injectResumePrompt)
 	rewritten, count := h.maybeReduceResponsesToolOutputsInRequestBody(ctx, bodyBytes, store, scope)

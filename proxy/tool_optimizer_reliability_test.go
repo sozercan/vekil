@@ -339,7 +339,9 @@ func TestToolOptimizerOversizedResponsesBodyStreamsUnchangedWithinSniffCap(t *te
 	writer := newOptimizerTrackingResponseWriter(body)
 	resp := optimizerLargeHTTPResponse(body, payload.total)
 
-	handler.writeResponsesUpstreamResponse(context.Background(), writer, resp, handler.toolContexts, "session:oversized-responses")
+	if err := handler.writeResponsesUpstreamResponse(context.Background(), writer, resp, handler.toolContexts, "session:oversized-responses"); err != nil {
+		t.Fatalf("write oversized Responses response: %v", err)
+	}
 	assertOptimizerLargePassthrough(t, writer, payload)
 	if calls := len(fake.snapshotRewriteRequests()); calls != 0 {
 		t.Fatalf("oversized Responses body launched %d optimizer calls, want 0", calls)
@@ -400,7 +402,9 @@ func benchmarkOptimizerOversizedPassthrough(b *testing.B, surface string) {
 		writer := &optimizerDiscardResponseWriter{header: make(http.Header)}
 		resp := optimizerLargeHTTPResponse(body, payload.total)
 		if surface == "responses" {
-			handler.writeResponsesUpstreamResponse(context.Background(), writer, resp, nil, "")
+			if err := handler.writeResponsesUpstreamResponse(context.Background(), writer, resp, nil, ""); err != nil {
+				b.Fatalf("write oversized Responses response: %v", err)
+			}
 		} else if err := handler.maybeWriteOptimizedOpenAIChatPassthrough(context.Background(), writer, resp, "gpt-test", nil, ""); err != nil {
 			b.Fatalf("write oversized chat response: %v", err)
 		}

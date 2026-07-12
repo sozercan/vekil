@@ -773,7 +773,9 @@ func TestWriteOpenAIPassthroughObservingUsage_SniffsWithinCap(t *testing.T) {
 	body := `{"choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15}}`
 
 	w := httptest.NewRecorder()
-	h.writeOpenAIPassthroughObservingUsage(ctx, w, fakeBodyResponse(body))
+	if err := h.writeOpenAIPassthroughObservingUsage(ctx, w, fakeBodyResponse(body)); err != nil {
+		t.Fatalf("write passthrough response: %v", err)
+	}
 
 	if got := w.Body.String(); got != body {
 		t.Fatalf("body changed:\n got: %s\nwant: %s", got, body)
@@ -795,7 +797,9 @@ func TestWriteOpenAIPassthroughObservingUsage_OversizedStreamsThroughIntact(t *t
 	body := `{"padding":"` + filler + `","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
 
 	w := httptest.NewRecorder()
-	h.writeOpenAIPassthroughObservingUsage(ctx, w, fakeBodyResponse(body))
+	if err := h.writeOpenAIPassthroughObservingUsage(ctx, w, fakeBodyResponse(body)); err != nil {
+		t.Fatalf("write oversized passthrough response: %v", err)
+	}
 
 	if got := w.Body.String(); got != body {
 		t.Fatalf("oversized body not streamed through intact: got %d bytes, want %d", len(got), len(body))
@@ -813,7 +817,9 @@ func TestWriteOpenAIPassthroughObservingUsage_Non200PlainCopy(t *testing.T) {
 	resp.StatusCode = http.StatusTooManyRequests
 
 	w := httptest.NewRecorder()
-	h.writeOpenAIPassthroughObservingUsage(ctx, w, resp)
+	if err := h.writeOpenAIPassthroughObservingUsage(ctx, w, resp); err != nil {
+		t.Fatalf("write passthrough response: %v", err)
+	}
 
 	if w.Result().StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", w.Result().StatusCode)

@@ -64,7 +64,7 @@ func (l *Logger) log(level Level, msg string, fields map[string]interface{}) {
 		return
 	}
 
-	e := make(map[string]interface{}, len(fields)+3)
+	e := make(map[string]interface{})
 	e["time"] = time.Now().UTC().Format(time.RFC3339)
 	e["level"] = levelNames[level]
 	e["msg"] = msg

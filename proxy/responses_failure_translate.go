@@ -286,11 +286,6 @@ func (o *responsesTerminalObserver) FinalizeEOF() {
 	}
 }
 
-func marshalResponsesObserverEvent(value interface{}) string {
-	body, _ := json.Marshal(value)
-	return string(body)
-}
-
 func extractResponsesFailureObject(buf []byte) (responsesWebSocketStreamError, bool) {
 	var result responsesWebSocketStreamError
 	object, ok := extractResponsesNamedObject(buf, []byte(`"error"`))
@@ -915,7 +910,7 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 		writeOpenAIUpstreamRequestFailure(w, status, err)
 		return
 	}
-	if lifecycleCanceled && !(hasResult && result.terminal != nil) {
+	if lifecycleCanceled && (!hasResult || result.terminal == nil) {
 		terminal, hasTerminal, outcome, hasOutcome := prepared.awaitCancellationResolution(responsesPeekCancellationGrace)
 		switch {
 		case hasTerminal:
@@ -941,13 +936,13 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 		writeOpenAIErrorWithRetryAfter(w, result.status, result.message, result.errType, result.retryAfter, resp.Header)
 		return
 	}
-	if !(hasResult && result.terminal != nil) {
+	if !hasResult || result.terminal == nil {
 		if terminal, ok := prepared.terminalResult(); ok {
 			terminal.decision = responsesPeekDecisionPassthrough
 			result, hasResult = terminal, true
 		}
 	}
-	if !(hasResult && result.terminal != nil) && lifecycle.transportCanceled != nil && lifecycle.transportCanceled() {
+	if (!hasResult || result.terminal == nil) && lifecycle.transportCanceled != nil && lifecycle.transportCanceled() {
 		terminal, hasTerminal, _, _ := prepared.awaitCancellationResolution(responsesPeekCancellationGrace)
 		if hasTerminal {
 			terminal.decision = responsesPeekDecisionPassthrough
@@ -1009,7 +1004,7 @@ func prepareResponsesStreamAttemptWithGrace(waitCtx, streamCtx context.Context, 
 		prepared.abort()
 		return nil, nil, nil, err
 	}
-	if streamCtx != nil && streamCtx.Err() != nil && errors.Is(context.Cause(streamCtx), errProxyLifecycleShutdown) && !(hasResult && result.terminal != nil) {
+	if streamCtx != nil && streamCtx.Err() != nil && errors.Is(context.Cause(streamCtx), errProxyLifecycleShutdown) && (!hasResult || result.terminal == nil) {
 		terminal, hasTerminal, outcome, hasOutcome := prepared.awaitCancellationResolution(cancellationGrace)
 		switch {
 		case hasTerminal:

@@ -498,10 +498,6 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 	})
 }
 
-func prepareAnthropicCountTokensProbeRequest(req *models.AnthropicRequest) (*models.OpenAIRequest, error) {
-	return prepareAnthropicCountTokensProbeRequestWithModelOverride(req, "")
-}
-
 func prepareAnthropicCountTokensProbeRequestWithModelOverride(req *models.AnthropicRequest, modelOverride string) (*models.OpenAIRequest, error) {
 	oaiReq, err := TranslateAnthropicToOpenAI(req)
 	if err != nil {
@@ -522,12 +518,6 @@ func prepareAnthropicCountTokensProbeRequestWithModelOverride(req *models.Anthro
 	oaiReq.MaxTokens = nil
 
 	return oaiReq, nil
-}
-
-func (h *ProxyHandler) runAnthropicCountTokensProbe(probeReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
-	defer upstreamCancel()
-	return h.runAnthropicCountTokensProbeWithContext(upstreamCtx, probeReq)
 }
 
 func (h *ProxyHandler) runAnthropicCountTokensProbeWithContext(upstreamCtx context.Context, probeReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {

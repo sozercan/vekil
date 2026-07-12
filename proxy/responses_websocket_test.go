@@ -3850,7 +3850,8 @@ func TestHandleResponsesWebSocket_SerializesOneQueuedTurn(t *testing.T) {
 		defer active.Add(-1)
 
 		responseID := "resp-queued-2"
-		if call == 1 {
+		switch call {
+		case 1:
 			responseID = "resp-queued-1"
 			close(firstStarted)
 			select {
@@ -3858,9 +3859,9 @@ func TestHandleResponsesWebSocket_SerializesOneQueuedTurn(t *testing.T) {
 			case <-r.Context().Done():
 				return nil, r.Context().Err()
 			}
-		} else if call == 2 {
+		case 2:
 			close(secondStarted)
-		} else {
+		default:
 			return nil, fmt.Errorf("unexpected concurrent/extra upstream call %d", call)
 		}
 
@@ -4192,7 +4193,9 @@ func TestShutdownWebSocketSessions_AlreadyCanceledContextStillClosesSession(t *t
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	handler.ShutdownWebSocketSessions(ctx)
+	if err := handler.ShutdownWebSocketSessions(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("ShutdownWebSocketSessions() error = %v, want nil or context canceled", err)
+	}
 
 	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("failed to set read deadline: %v", err)
@@ -4247,7 +4250,9 @@ func TestShutdownWebSocketSessions_SendsGoingAwayToWritableClients(t *testing.T)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	handler.ShutdownWebSocketSessions(ctx)
+	if err := handler.ShutdownWebSocketSessions(ctx); err != nil {
+		t.Fatalf("ShutdownWebSocketSessions() error = %v", err)
+	}
 
 	for idx, conn := range connections {
 		if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
@@ -4289,7 +4294,9 @@ func TestShutdownWebSocketSessions_HardClosesAllBackpressuredSessions(t *testing
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	handler.ShutdownWebSocketSessions(ctx)
+	if err := handler.ShutdownWebSocketSessions(ctx); err != nil {
+		t.Fatalf("ShutdownWebSocketSessions() error = %v", err)
+	}
 
 	for idx, conn := range connections {
 		select {
@@ -4353,7 +4360,9 @@ func TestBeginShutdownBeforeWebSocketDrainPreservesGoingAwayClose(t *testing.T) 
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	handler.ShutdownWebSocketSessions(ctx)
+	if err := handler.ShutdownWebSocketSessions(ctx); err != nil {
+		t.Fatalf("ShutdownWebSocketSessions() error = %v", err)
+	}
 	cancel()
 
 	if early != nil {
@@ -4404,7 +4413,9 @@ func TestShutdownWebSocketSessions_CancelsActiveInference(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	handler.ShutdownWebSocketSessions(ctx)
+	if err := handler.ShutdownWebSocketSessions(ctx); err != nil {
+		t.Fatalf("ShutdownWebSocketSessions() error = %v", err)
+	}
 	select {
 	case <-canceled:
 	case <-time.After(500 * time.Millisecond):
@@ -4437,12 +4448,13 @@ func TestShutdownWebSocketSessions_ConcurrentClientCloseAndShutdown(t *testing.T
 	}
 
 	shutdownDone := make(chan struct{})
+	shutdownErr := make(chan error, 1)
 	closeWriteDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		handler.ShutdownWebSocketSessions(ctx)
+		shutdownErr <- handler.ShutdownWebSocketSessions(ctx)
 	}()
 	go func() {
 		defer close(closeWriteDone)
@@ -4459,6 +4471,9 @@ func TestShutdownWebSocketSessions_ConcurrentClientCloseAndShutdown(t *testing.T
 		case <-time.After(time.Second):
 			t.Fatalf("timed out waiting for concurrent %s", name)
 		}
+	}
+	if err := <-shutdownErr; err != nil {
+		t.Fatalf("ShutdownWebSocketSessions() error = %v", err)
 	}
 	waitForResponsesWebSocketSessionCount(t, handler, 0)
 }

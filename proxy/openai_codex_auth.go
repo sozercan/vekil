@@ -288,7 +288,6 @@ func (a *openAICodexAuth) executeRefresh(
 	if refresh.abandoned {
 		credentials = openAICodexCredentials{}
 		cacheState = nil
-		clearCache = false
 		if refreshErr == nil {
 			refreshErr = context.Canceled
 		}

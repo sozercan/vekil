@@ -193,7 +193,9 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		// the usage-observing passthrough below. Record the aggregate usage onto the
 		// inbound request summary so the dashboard does not count it as zero tokens.
 		observeResponsesUsage(r.Context(), compactionUsage)
-		writeUpstreamResponse(w, compactionResp)
+		if err := writeUpstreamResponse(w, compactionResp); err != nil {
+			h.log.Debug("failed to write compaction trigger response", logger.Err(err))
+		}
 		return
 	}
 
@@ -1214,7 +1216,7 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 }
 
 func marshalCompactResponsesRequest(requestFields map[string]json.RawMessage, input []json.RawMessage) ([]byte, error) {
-	body := make(map[string]json.RawMessage, len(requestFields)+1)
+	body := make(map[string]json.RawMessage, len(requestFields))
 	for key, value := range requestFields {
 		body[key] = value
 	}
@@ -2826,8 +2828,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 			return lastResp, nil
 		}
 
-		compactedInput := make([]json.RawMessage, 0, alignedKeepTail+1)
-		compactedInput = append(compactedInput, checkpoint)
+		compactedInput := []json.RawMessage{checkpoint}
 		compactedInput = append(compactedInput, input[prefixLen:]...)
 
 		compactedInputRaw, err := json.Marshal(compactedInput)
