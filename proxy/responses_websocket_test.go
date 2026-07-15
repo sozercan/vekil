@@ -3163,6 +3163,43 @@ func TestHandleResponsesWebSocket_FirstEventTransientResponseFailedWithoutUpstre
 	}
 }
 
+func TestResponsesWebSocketSendWrappedErrorSynthesizesRetryAfterFromQuotaReset(t *testing.T) {
+	serverConn, clientConn := newResponsesWebSocketConnPair(t)
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
+	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	headers := http.Header{
+		"x-ratelimit-remaining-tokens": []string{"0"},
+		"x-ratelimit-reset-tokens":     []string{"62"},
+	}
+	if err := session.sendWrappedError(http.StatusTooManyRequests, "rate limited", "", headers); err != nil {
+		t.Fatalf("sendWrappedError error = %v", err)
+	}
+	frame := mustReadWebSocketJSON(t, clientConn)
+	mapped, ok := frame["headers"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("headers = %T, want object", frame["headers"])
+	}
+	if got := mapped["Retry-After"]; got != "62" {
+		t.Fatalf("Retry-After = %v, want 62", got)
+	}
+	if got := headers.Get("Retry-After"); got != "" {
+		t.Fatalf("source headers mutated with Retry-After = %q", got)
+	}
+}
+
+func TestResponsesWebSocketErrorHeadersPreservesExistingRetryAfter(t *testing.T) {
+	headers := http.Header{
+		"Retry-After":                  []string{"3"},
+		"x-ratelimit-remaining-tokens": []string{"0"},
+		"x-ratelimit-reset-tokens":     []string{"62"},
+	}
+	got := responsesWebSocketErrorHeaders(http.StatusTooManyRequests, headers)
+	if retryAfter := got.Get("Retry-After"); retryAfter != "3" {
+		t.Fatalf("Retry-After = %q, want existing value 3", retryAfter)
+	}
+}
+
 func TestHandleResponsesWebSocket_ResponseIncompleteKeepsSessionOpen(t *testing.T) {
 	var upstreamRequests atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -4516,6 +4553,22 @@ func TestHandleResponsesWebSocket_FailureStatsSurviveImmediateClientWriteFailure
 			wantStatus: http.StatusTooManyRequests,
 		},
 		{
+			name: "translated uncoded quota failure",
+			response: func() *http.Response {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header: http.Header{
+						"Content-Type":                 []string{"text/event-stream"},
+						"retry-after-ms":               []string{"2169"},
+						"x-ratelimit-remaining-tokens": []string{"-36161"},
+					},
+					Body: io.NopCloser(strings.NewReader(
+						"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-uncoded-quota\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n")),
+				}
+			},
+			wantStatus: http.StatusTooManyRequests,
+		},
+		{
 			name: "parsed first response.failed",
 			response: func() *http.Response {
 				return &http.Response{
@@ -4574,6 +4627,11 @@ func TestHandleResponsesWebSocket_StreamFailureStatsSurviveClientCloseAtDelivery
 			wantStatus: http.StatusTooManyRequests,
 		},
 		{
+			name:       "later uncoded quota failure",
+			second:     "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-later-uncoded\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n",
+			wantStatus: http.StatusTooManyRequests,
+		},
+		{
 			name:       "response.incomplete",
 			second:     "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
 			wantStatus: http.StatusConflict,
@@ -4591,8 +4649,12 @@ func TestHandleResponsesWebSocket_StreamFailureStatsSurviveClientCloseAtDelivery
 			handler := newRoundTripTestProxyHandler(t, func(*http.Request) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-					Body:       body,
+					Header: http.Header{
+						"Content-Type":                 []string{"text/event-stream"},
+						"retry-after-ms":               []string{"2169"},
+						"x-ratelimit-remaining-tokens": []string{"-36161"},
+					},
+					Body: body,
 				}, nil
 			})
 			handler.stats = newStatsCollector()

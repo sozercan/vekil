@@ -1165,7 +1165,14 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 				}
 				return http.StatusOK, usage, true
 			case "response.failed", "response.incomplete":
-				status, _, _ := responsesWebSocketStreamFailureDetails(*terminalPeek.terminal)
+				if terminalPeek.status != 0 {
+					return terminalPeek.status, usage, true
+				}
+				var headers http.Header
+				if resp != nil {
+					headers = resp.Header
+				}
+				status, _, _ := responsesWebSocketStreamFailureDetails(*terminalPeek.terminal, headers)
 				return status, usage, true
 			}
 		}
@@ -1945,7 +1952,7 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 		}
 		failureStatus := 0
 		if parsedEvent && (event.Type == "response.failed" || event.Type == "response.incomplete") {
-			failureStatus, _, _ = responsesWebSocketStreamFailureDetails(event)
+			failureStatus, _, _ = responsesWebSocketStreamFailureDetails(event, headers)
 			if failureStatus != 0 {
 				result.usage = event.Response.Usage
 				// Account before forwarding either the upstream failure event or the
@@ -1958,7 +1965,7 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 		if !sawSemanticEvent {
 			sawSemanticEvent = true
 			if parsedEvent && event.Type == "response.failed" {
-				if status, _, ok := classifyPrecommitResponsesFailure(event); ok {
+				if status, _, ok := classifyResponsesFailure(event, headers); ok {
 					if writeErr := s.sendWrappedError(status, responsesPrecommitErrorMessage(event, status), strings.TrimSpace(event.Response.Error.Code), headers); writeErr != nil {
 						return writeErr
 					}
@@ -2085,7 +2092,7 @@ func (s *responsesWebSocketSession) writeTextMessage(payload []byte) error {
 }
 
 func (s *responsesWebSocketSession) sendUpstreamStreamFailure(event responsesWebSocketStreamEvent, headers http.Header) error {
-	status, message, code := responsesWebSocketStreamFailureDetails(event)
+	status, message, code := responsesWebSocketStreamFailureDetails(event, headers)
 	if status == 0 || strings.TrimSpace(message) == "" {
 		return nil
 	}
@@ -2103,6 +2110,7 @@ func (s *responsesWebSocketSession) sendWrappedError(status int, message, code s
 	if code != "" {
 		payload["error"].(map[string]interface{})["code"] = code
 	}
+	headers = responsesWebSocketErrorHeaders(status, headers)
 	if mappedHeaders := flattenResponsesWebSocketHeaders(headers); len(mappedHeaders) > 0 {
 		payload["headers"] = mappedHeaders
 	}
@@ -2213,10 +2221,10 @@ func extractResponsesWebSocketError(status int, body []byte) (string, string) {
 	return http.StatusText(status), ""
 }
 
-func responsesWebSocketStreamFailureDetails(event responsesWebSocketStreamEvent) (int, string, string) {
+func responsesWebSocketStreamFailureDetails(event responsesWebSocketStreamEvent, headers http.Header) (int, string, string) {
 	switch event.Type {
 	case "response.failed":
-		if status, _, ok := classifyPrecommitResponsesFailure(event); ok {
+		if status, _, ok := classifyResponsesFailure(event, headers); ok {
 			message := responsesPrecommitErrorMessage(event, status)
 			return status, message, strings.TrimSpace(event.Response.Error.Code)
 		}
@@ -2261,6 +2269,25 @@ func responsesWebSocketErrorStatus(errType string) int {
 	default:
 		return http.StatusBadGateway
 	}
+}
+
+func responsesWebSocketErrorHeaders(status int, headers http.Header) http.Header {
+	if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable && status != http.StatusGatewayTimeout {
+		return headers
+	}
+	if strings.TrimSpace(headerGetCI(headers, "Retry-After")) != "" {
+		return headers
+	}
+	retryAfter, _ := selectResponsesRetryAfter(headers)
+	if retryAfter == "" {
+		return headers
+	}
+	result := headers.Clone()
+	if result == nil {
+		result = make(http.Header)
+	}
+	result.Set("Retry-After", retryAfter)
+	return result
 }
 
 func flattenResponsesWebSocketHeaders(headers http.Header) map[string]interface{} {

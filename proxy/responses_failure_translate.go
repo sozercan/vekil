@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	responsesPrecommitPeekTimeout  = 750 * time.Millisecond
-	responsesPrecommitMaxPeekBytes = 64 * 1024
-	responsesPeekReadChunkSize     = 4 * 1024
-	responsesPeekCancellationGrace = 10 * time.Millisecond
+	responsesPrecommitPeekTimeout          = 750 * time.Millisecond
+	responsesPrecommitMaxPeekBytes         = 64 * 1024
+	responsesPrecommitHeldPreambleMaxBytes = 512 * 1024
+	responsesPeekReadChunkSize             = 4 * 1024
+	responsesPeekCancellationGrace         = 10 * time.Millisecond
 	// responsesFailureTapMaxBuffer bounds how much of an in-flight SSE event the
 	// failure tap buffers while waiting for its delimiter. It matches the
 	// supported Responses scanner limit so every accepted terminal event is fully
@@ -1118,7 +1119,7 @@ func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.He
 				if !decisionSent {
 					if result.decision == responsesPeekDecisionTranslate {
 						sendResult(result)
-					} else if prefix.Len() >= maxPeekBytes {
+					} else if prefix.Len() >= maxPeekBytes && (!holdPreamble || sawBeyondPreamble || prefix.Len() >= max(responsesPrecommitHeldPreambleMaxBytes, maxPeekBytes)) {
 						if sawSemantic {
 							sendResult(result)
 						} else {
@@ -1301,7 +1302,7 @@ func classifyResponsesPeekEvent(event responsesWebSocketStreamEvent, eventName s
 		return result
 	}
 
-	status, errType, ok := classifyPrecommitResponsesFailure(event)
+	status, errType, ok := classifyResponsesFailure(event, headers)
 	if !ok {
 		return result
 	}
@@ -1329,20 +1330,60 @@ func classifyResponsesPeekEvent(event responsesWebSocketStreamEvent, eventName s
 // providers without exhausted-quota headers retain the low-latency first-event
 // passthrough path.
 func shouldHoldResponsesPrecommitPreamble(headers http.Header) bool {
-	if retryAfter, _ := selectResponsesRetryAfter(headers); retryAfter == "" {
-		return false
+	return responsesQuotaEvidence(headers)
+}
+
+func classifyResponsesFailure(event responsesWebSocketStreamEvent, headers http.Header) (int, string, bool) {
+	if status, errType, ok := classifyPrecommitResponsesFailure(event); ok {
+		return status, errType, true
 	}
-	for _, name := range []string{"x-ratelimit-remaining-tokens", "x-ratelimit-remaining-requests"} {
-		value := strings.TrimSpace(headerGetCI(headers, name))
-		if value == "" {
-			continue
-		}
-		remaining, err := strconv.ParseInt(value, 10, 64)
-		if err == nil && remaining <= 0 {
+	if strings.TrimSpace(event.Response.Error.Code) == "" && strings.TrimSpace(event.Response.Error.Type) == "" &&
+		responsesQuotaEvidence(headers) && responsesRateLimitMessage(event.Response.Error.Message) {
+		return http.StatusTooManyRequests, "rate_limit_error", true
+	}
+	return 0, "", false
+}
+
+func responsesQuotaEvidence(headers http.Header) bool {
+	if _, source := selectResponsesRetryAfter(headers); source == "retry-after-ms" || source == "Retry-After" {
+		return true
+	}
+	for _, dimension := range []string{"tokens", "requests"} {
+		remaining, exhausted := responsesQuotaRemaining(headers, dimension)
+		if exhausted && remaining != -1 {
 			return true
 		}
 	}
 	return false
+}
+
+func responsesRateLimitMessage(message string) bool {
+	message = strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(message, "rate limit") || strings.Contains(message, "too many requests") || strings.Contains(message, "quota exceeded")
+}
+
+func responsesQuotaRemaining(headers http.Header, dimension string) (int64, bool) {
+	value := strings.TrimSpace(headerGetCI(headers, "x-ratelimit-remaining-"+dimension))
+	remaining, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || remaining > 0 {
+		return 0, false
+	}
+	return remaining, true
+}
+
+func responsesQuotaResetSeconds(headers http.Header, dimension string) int {
+	value := strings.TrimSpace(headerGetCI(headers, "x-ratelimit-reset-"+dimension))
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds > 0 {
+			return seconds
+		}
+		return 0
+	}
+	delay, err := time.ParseDuration(value)
+	if err != nil || delay <= 0 {
+		return 0
+	}
+	return int((delay + time.Second - 1) / time.Second)
 }
 
 func classifyPrecommitResponsesFailure(event responsesWebSocketStreamEvent) (int, string, bool) {
@@ -1382,6 +1423,25 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 
 	if delay, ok := parseRetryAfter(strings.TrimSpace(headerGetCI(headers, "Retry-After"))); ok && delay > 0 {
 		return strconv.Itoa(int(delay / time.Second)), "Retry-After"
+	}
+
+	resetSeconds := 0
+	resetSource := ""
+	for _, dimension := range []string{"tokens", "requests"} {
+		remaining, exhausted := responsesQuotaRemaining(headers, dimension)
+		if !exhausted || remaining == -1 {
+			continue
+		}
+		seconds := responsesQuotaResetSeconds(headers, dimension)
+		if seconds <= resetSeconds {
+			continue
+		}
+		resetSeconds = seconds
+		resetSource = "x-ratelimit-reset-" + dimension
+	}
+	if resetSeconds > 0 {
+		delay := clampRetryAfter(time.Duration(resetSeconds) * time.Second)
+		return strconv.Itoa(int(delay / time.Second)), resetSource
 	}
 
 	return "", ""
@@ -1967,7 +2027,7 @@ func (t *responsesFailureTap) maybeLog(eventName string, event responsesWebSocke
 	// same response.failed/incomplete into an errored turn. Classify the event so
 	// rate limits (429) and overloads (503) keep their exact status rather than
 	// all collapsing to bad-gateway.
-	failureStatus, _, _ := responsesWebSocketStreamFailureDetails(event)
+	failureStatus, _, _ := responsesWebSocketStreamFailureDetails(event, t.upstreamHeaders)
 	if failureStatus == 0 {
 		failureStatus = http.StatusBadGateway
 	}

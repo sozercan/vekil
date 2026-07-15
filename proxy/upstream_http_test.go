@@ -115,6 +115,49 @@ func TestResolveProviderRequest_RewritesConfiguredResponsesModelToProviderDeploy
 	}
 }
 
+func TestApplyProviderModelRequestPolicy_UsesMaxCompletionTokensOnlyForChatCompletions(t *testing.T) {
+	owner := providerModel{useMaxCompletionTokens: true}
+
+	chatBody := applyProviderModelRequestPolicy(
+		[]byte(`{"model":"gpt-5.6-sol","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`),
+		providerEndpointChatCompletions,
+		owner,
+	)
+	var chatPayload map[string]json.RawMessage
+	if err := json.Unmarshal(chatBody, &chatPayload); err != nil {
+		t.Fatalf("json.Unmarshal(chatBody) error = %v", err)
+	}
+	if _, ok := chatPayload["max_tokens"]; ok {
+		t.Fatalf("chat payload retained max_tokens: %s", chatBody)
+	}
+	if got := string(chatPayload["max_completion_tokens"]); got != "64" {
+		t.Fatalf("max_completion_tokens = %s, want 64", got)
+	}
+
+	responsesBody := []byte(`{"model":"gpt-5.6-sol","max_tokens":64,"input":"hello"}`)
+	if got := applyProviderModelRequestPolicy(responsesBody, providerEndpointResponses, owner); string(got) != string(responsesBody) {
+		t.Fatalf("responses payload changed = %s, want original %s", got, responsesBody)
+	}
+}
+
+func TestApplyProviderModelRequestPolicy_PreservesExplicitMaxCompletionTokens(t *testing.T) {
+	body := applyProviderModelRequestPolicy(
+		[]byte(`{"max_tokens":64,"max_completion_tokens":32}`),
+		providerEndpointChatCompletions,
+		providerModel{useMaxCompletionTokens: true},
+	)
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("json.Unmarshal(body) error = %v", err)
+	}
+	if _, ok := payload["max_tokens"]; ok {
+		t.Fatalf("payload retained max_tokens: %s", body)
+	}
+	if got := string(payload["max_completion_tokens"]); got != "32" {
+		t.Fatalf("max_completion_tokens = %s, want explicit value 32", got)
+	}
+}
+
 func TestResolveProviderRequest_RejectsKnownModelWithoutEndpointSupport(t *testing.T) {
 	handler := newProviderRoutingTestHandler(t, []string{"/responses"})
 

@@ -12,7 +12,7 @@ Like chat completions, Responses requests are routed by the public `model` ID. F
 
 For responses-only Azure deployments such as the `gpt-5.4-pro` example configuration, this is the canonical inference path.
 
-Streaming Responses requests preserve upstream headers and are otherwise passed through directly. One narrow exception exists for `POST /v1/responses` with `stream: true`: if the first semantic SSE event is an immediate transient `response.failed` admission error such as `too_many_requests`, `model_overloaded`, `bad_gateway`, or `gateway_timeout`, the proxy translates that pre-commit failure into a normal HTTP error before flushing `200 OK`. All other streaming failures stay passthrough SSE.
+Streaming Responses requests preserve upstream headers and are otherwise passed through directly. Before flushing `200 OK`, the proxy translates a transient `response.failed` admission error such as `too_many_requests`, `model_overloaded`, `bad_gateway`, or `gateway_timeout` into a normal HTTP error. For upstreams such as Azure Foundry that may emit `response.created` or `response.in_progress` before an admission failure, Vekil can briefly retain those preamble events when the response headers show exhausted quota. An uncoded terminal failure is treated as HTTP `429` only when its message indicates rate limiting and the quota telemetry is corroborating; explicit error codes and types remain authoritative. The retained preamble is time- and size-bounded. Once a non-preamble/output event appears, the HTTP stream is committed and later failures remain passthrough SSE, while provider accounting still records their classified failure status.
 
 If an upstream rejects a `/responses` request with `400 invalid_request_body` because replayed `encrypted_content` cannot be verified or decrypted, Vekil retries once after removing the opaque encrypted replay items it cannot interpret. The original request remains near-zero-copy when the selected upstream accepts its own encrypted tokens; the retry only applies after that specific upstream rejection. Vekil-owned compaction checkpoints are still expanded to developer context before forwarding.
 
@@ -34,7 +34,7 @@ Websocket bridge behavior:
 - long sessions are auto-compacted into one proxy-owned checkpoint plus a recent tail
 - optional turn-state delta replay can be enabled with `--responses-ws-turn-state-delta`
 - if upstream rejects delta replay, the proxy automatically falls back to full replay
-- if the first streamed upstream event is a transient `response.failed` admission error, the bridge sends a wrapped websocket error frame instead of relaying the raw `response.failed` event
+- if the first meaningful streamed upstream event is a transient `response.failed` admission error, including an uncoded Azure quota failure corroborated by headers, the bridge sends a wrapped websocket error frame instead of relaying the raw `response.failed` event; synthesized `Retry-After` metadata is included when only reset telemetry is available
 
 This websocket bridge is a proxy transport adaptation layered over upstream HTTP `/responses`. It is not the same feature as provider-native websocket or realtime APIs such as Azure `/realtime`.
 
