@@ -192,12 +192,13 @@ func (h *ProxyHandler) resolveProviderRequestForModel(body []byte, endpoint stri
 			return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 		}
 	}
-	rewrittenBody = applyProviderModelRequestPolicy(rewrittenBody, owner)
+	rewrittenBody = applyProviderModelRequestPolicy(rewrittenBody, endpoint, owner)
 	return provider, owner, rewrittenBody, nil
 }
 
-func applyProviderModelRequestPolicy(body []byte, owner providerModel) []byte {
-	if !owner.dropSamplingParams && (owner.parallelToolCalls == nil || *owner.parallelToolCalls) {
+func applyProviderModelRequestPolicy(body []byte, endpoint string, owner providerModel) []byte {
+	rewriteMaxTokens := endpoint == providerEndpointChatCompletions && owner.useMaxCompletionTokens
+	if !owner.dropSamplingParams && !rewriteMaxTokens && (owner.parallelToolCalls == nil || *owner.parallelToolCalls) {
 		return body
 	}
 	var payload map[string]json.RawMessage
@@ -211,6 +212,15 @@ func applyProviderModelRequestPolicy(body []byte, owner providerModel) []byte {
 				delete(payload, field)
 				changed = true
 			}
+		}
+	}
+	if rewriteMaxTokens {
+		if maxTokens, ok := payload["max_tokens"]; ok {
+			if _, exists := payload["max_completion_tokens"]; !exists {
+				payload["max_completion_tokens"] = maxTokens
+			}
+			delete(payload, "max_tokens")
+			changed = true
 		}
 	}
 	if owner.parallelToolCalls != nil && !*owner.parallelToolCalls {

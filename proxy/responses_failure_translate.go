@@ -62,6 +62,7 @@ type peekResult struct {
 	terminal         *responsesWebSocketStreamEvent
 	bufferedBytes    int
 	peekDuration     time.Duration
+	preamble         bool
 }
 
 type responsesPeekChunk struct {
@@ -1110,7 +1111,8 @@ func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.He
 			if len(chunk.data) > 0 {
 				_, _ = prefix.Write(chunk.data)
 				parser.push(chunk.data)
-				result, sawSemantic := inspectResponsesPeekMessages(&parser, headers, peekState)
+				holdPreamble := shouldHoldResponsesPrecommitPreamble(headers)
+				result, sawSemantic, sawBeyondPreamble := inspectResponsesPeekMessages(&parser, headers, peekState, holdPreamble)
 				result.bufferedBytes = prefix.Len()
 				result.peekDuration = time.Since(start)
 				if !decisionSent {
@@ -1122,7 +1124,7 @@ func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.He
 						} else {
 							sendResult(peekResult{decision: responsesPeekDecisionPassthrough})
 						}
-					} else if sawSemantic {
+					} else if sawSemantic && (!holdPreamble || sawBeyondPreamble) {
 						sendResult(result)
 					}
 				}
@@ -1145,9 +1147,10 @@ func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.He
 	}
 }
 
-func inspectResponsesPeekMessages(parser *responsesSSEParser, headers http.Header, peekState *responsesPeekState) (peekResult, bool) {
+func inspectResponsesPeekMessages(parser *responsesSSEParser, headers http.Header, peekState *responsesPeekState, preferTranslatedFailure bool) (peekResult, bool, bool) {
 	result := peekResult{decision: responsesPeekDecisionPassthrough}
 	sawSemantic := false
+	sawBeyondPreamble := false
 	for {
 		msg, ok := parser.nextSemantic()
 		if !ok {
@@ -1159,12 +1162,15 @@ func inspectResponsesPeekMessages(parser *responsesSSEParser, headers http.Heade
 		}
 		classified := classifyResponsesPeekMessage(msg, headers)
 		peekState.publishTerminal(classified)
-		if !sawSemantic {
+		if !sawSemantic || (preferTranslatedFailure && !sawBeyondPreamble && classified.decision == responsesPeekDecisionTranslate) {
 			result = classified
+		}
+		if !classified.preamble {
+			sawBeyondPreamble = true
 		}
 		sawSemantic = true
 	}
-	return result, sawSemantic
+	return result, sawSemantic, sawBeyondPreamble
 }
 
 func readResponsesPeekChunks(body io.ReadCloser, chunkCh chan<- responsesPeekChunk, abortCh, observeOnlyCh <-chan struct{}, headers http.Header, peekState *responsesPeekState) {
@@ -1282,6 +1288,7 @@ func classifyResponsesPeekEvent(event responsesWebSocketStreamEvent, eventName s
 		terminalType = eventName
 	}
 	event.Type = terminalType
+	result.preamble = terminalType == "response.created" || terminalType == "response.in_progress"
 	switch terminalType {
 	case "response.completed", "response.failed", "response.incomplete":
 		terminal := event
@@ -1311,6 +1318,31 @@ func classifyResponsesPeekEvent(event responsesWebSocketStreamEvent, eventName s
 	result.retryAfter = retryAfter
 	result.retryAfterSource = source
 	return result
+}
+
+// shouldHoldResponsesPrecommitPreamble keeps Azure/compatible streaming
+// responses uncommitted when their headers already report exhausted quota.
+// These upstreams can emit response.created and then fail the stream a few
+// hundred milliseconds later with response.failed. Waiting within the existing
+// precommit timeout lets the proxy translate that terminal event into HTTP 429
+// so clients can apply their normal Retry-After behavior. Healthy streams and
+// providers without exhausted-quota headers retain the low-latency first-event
+// passthrough path.
+func shouldHoldResponsesPrecommitPreamble(headers http.Header) bool {
+	if retryAfter, _ := selectResponsesRetryAfter(headers); retryAfter == "" {
+		return false
+	}
+	for _, name := range []string{"x-ratelimit-remaining-tokens", "x-ratelimit-remaining-requests"} {
+		value := strings.TrimSpace(headerGetCI(headers, name))
+		if value == "" {
+			continue
+		}
+		remaining, err := strconv.ParseInt(value, 10, 64)
+		if err == nil && remaining <= 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func classifyPrecommitResponsesFailure(event responsesWebSocketStreamEvent) (int, string, bool) {
