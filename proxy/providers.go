@@ -99,17 +99,18 @@ type ProviderConfig struct {
 // ProviderModelConfig maps a public model ID exposed by this proxy to the
 // upstream model or deployment name used by the provider.
 type ProviderModelConfig struct {
-	PublicID            string   `json:"public_id" yaml:"public_id"`
-	Deployment          string   `json:"deployment,omitempty" yaml:"deployment,omitempty"`
-	Name                string   `json:"name,omitempty" yaml:"name,omitempty"`
-	Endpoints           []string `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
-	ModelPickerEnabled  *bool    `json:"model_picker_enabled,omitempty" yaml:"model_picker_enabled,omitempty"`
-	ModelPickerCategory string   `json:"model_picker_category,omitempty" yaml:"model_picker_category,omitempty"`
-	ReasoningEffort     []string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
-	Vision              *bool    `json:"vision,omitempty" yaml:"vision,omitempty"`
-	ParallelToolCalls   *bool    `json:"parallel_tool_calls,omitempty" yaml:"parallel_tool_calls,omitempty"`
-	DropSamplingParams  *bool    `json:"drop_sampling_params,omitempty" yaml:"drop_sampling_params,omitempty"`
-	ContextWindow       *int64   `json:"context_window,omitempty" yaml:"context_window,omitempty"`
+	PublicID               string   `json:"public_id" yaml:"public_id"`
+	Deployment             string   `json:"deployment,omitempty" yaml:"deployment,omitempty"`
+	Name                   string   `json:"name,omitempty" yaml:"name,omitempty"`
+	Endpoints              []string `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
+	ModelPickerEnabled     *bool    `json:"model_picker_enabled,omitempty" yaml:"model_picker_enabled,omitempty"`
+	ModelPickerCategory    string   `json:"model_picker_category,omitempty" yaml:"model_picker_category,omitempty"`
+	ReasoningEffort        []string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
+	Vision                 *bool    `json:"vision,omitempty" yaml:"vision,omitempty"`
+	ParallelToolCalls      *bool    `json:"parallel_tool_calls,omitempty" yaml:"parallel_tool_calls,omitempty"`
+	DropSamplingParams     *bool    `json:"drop_sampling_params,omitempty" yaml:"drop_sampling_params,omitempty"`
+	UseMaxCompletionTokens *bool    `json:"use_max_completion_tokens,omitempty" yaml:"use_max_completion_tokens,omitempty"`
+	ContextWindow          *int64   `json:"context_window,omitempty" yaml:"context_window,omitempty"`
 }
 
 type providerRuntime struct {
@@ -145,14 +146,15 @@ type providerEndpointPaths struct {
 }
 
 type providerModel struct {
-	publicID           string
-	upstreamModel      string
-	providerID         string
-	supportedEndpoints []string
-	parallelToolCalls  *bool
-	dropSamplingParams bool
-	disabled           bool
-	raw                json.RawMessage
+	publicID               string
+	upstreamModel          string
+	providerID             string
+	supportedEndpoints     []string
+	parallelToolCalls      *bool
+	dropSamplingParams     bool
+	useMaxCompletionTokens bool
+	disabled               bool
+	raw                    json.RawMessage
 }
 
 type providerSetup struct {
@@ -1027,13 +1029,14 @@ func buildStaticProviderModel(providerID string, cfg ProviderModelConfig, defaul
 	}
 
 	return providerModel{
-		publicID:           publicID,
-		upstreamModel:      upstreamModel,
-		providerID:         providerID,
-		supportedEndpoints: endpoints,
-		parallelToolCalls:  cloneBoolPtr(cfg.ParallelToolCalls),
-		dropSamplingParams: cfg.DropSamplingParams != nil && *cfg.DropSamplingParams,
-		raw:                raw,
+		publicID:               publicID,
+		upstreamModel:          upstreamModel,
+		providerID:             providerID,
+		supportedEndpoints:     endpoints,
+		parallelToolCalls:      cloneBoolPtr(cfg.ParallelToolCalls),
+		dropSamplingParams:     cfg.DropSamplingParams != nil && *cfg.DropSamplingParams,
+		useMaxCompletionTokens: cfg.UseMaxCompletionTokens != nil && *cfg.UseMaxCompletionTokens,
+		raw:                    raw,
 	}, nil
 }
 

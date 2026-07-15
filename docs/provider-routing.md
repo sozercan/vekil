@@ -154,6 +154,7 @@ Successful decoded dynamic model catalogs are capped at 4 MiB before JSON decodi
 | `models_path` | generic providers | Upstream path for dynamic model discovery and readiness probes. Defaults to `/models`. |
 | `model_discovery` | generic providers | `static`, `openai`, `ollama`, or `openrouter-tools`. |
 | `models[].endpoints` | all static models | Public endpoint allowlist. This remains the source of truth for what Vekil advertises and routes. |
+| `models[].use_max_completion_tokens` | static models with `/chat/completions` | When `true`, rewrite translated Chat/Anthropic `max_tokens` to `max_completion_tokens` before forwarding. Use only for deployments that reject the legacy field. |
 
 ### Generic Provider Cookbook
 
@@ -329,6 +330,7 @@ Routing rules:
 - For Copilot-discovered models, Codex-compatible `/v1/models` metadata treats `capabilities.limits.max_prompt_tokens` as the active `context_window` and keeps `max_context_window_tokens` as `max_context_window`. If Copilot omits the prompt cap, the proxy falls back to the total context window.
 - `models[].endpoints` is an allowlist, not a guess. Keep it limited to the routes you have validated for that deployment.
 - Static provider models can also advertise richer Codex `/v1/models` metadata via optional fields on each `models[]` entry: `model_picker_category`, `reasoning_effort`, `vision`, `parallel_tool_calls`, and `context_window`. Without those fields, the proxy exposes a minimal but valid model entry.
+- `models[].use_max_completion_tokens: true` is a request policy for `/chat/completions`; it rewrites `max_tokens` to `max_completion_tokens` after translation. It does not affect `/responses` requests.
 - For Azure OpenAI, `/v1/models` only does a best-effort metadata overlay for each configured `models[]` entry by probing Azure's upstream `/models` response. The proxy matches by `public_id` first, then by `deployment` for aliased models.
 - Azure's upstream `/models` catalog can omit Codex-style fields entirely. The proxy only copies fields that Azure already returns; it does not derive reasoning levels, vision, parallel tool calls, model picker metadata, or context window from other Azure docs or capability hints.
 - Explicit `models[]` metadata overrides Azure `/models` overlay metadata. Configured public IDs and endpoint allowlists always win, and the proxy falls back to the static entry if the Azure `/models` probe fails or returns a sparse payload.

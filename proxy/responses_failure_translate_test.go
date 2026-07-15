@@ -96,6 +96,33 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantRawBody:     "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-unknown\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}}\n\n",
 		},
 		{
+			name: "created then immediate rate limit translates before commit",
+			body: "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-created-rate-limit\"}}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-created-rate-limit\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"token rate limit exceeded\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"retry-after-ms":               []string{"2457"},
+				"x-ratelimit-remaining-tokens": []string{"-40957"},
+				"x-ratelimit-reset-tokens":     []string{"62"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "3",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "token rate limit exceeded",
+		},
+		{
+			name: "output before rate limit preserves stream",
+			body: "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-output-rate-limit\"}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"response_id\":\"resp-output-rate-limit\",\"delta\":\"partial\"}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-output-rate-limit\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"token rate limit exceeded\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"retry-after-ms":               []string{"2457"},
+				"x-ratelimit-remaining-tokens": []string{"-40957"},
+			},
+			wantStatus:      http.StatusOK,
+			wantContentType: "text/event-stream",
+			wantRawBody:     "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-output-rate-limit\"}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"response_id\":\"resp-output-rate-limit\",\"delta\":\"partial\"}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-output-rate-limit\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"token rate limit exceeded\"}}}\n\n",
+		},
+		{
 			name: "non failed first event stays passthrough",
 			body: "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n",
 			headers: http.Header{

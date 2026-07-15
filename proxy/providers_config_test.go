@@ -45,6 +45,7 @@ func TestLoadProvidersConfigFileAzureV1BaseURLAndModelMetadata(t *testing.T) {
           "reasoning_effort": ["low", "medium", "high"],
           "vision": true,
           "parallel_tool_calls": true,
+          "use_max_completion_tokens": true,
           "context_window": 400000
         }
       ]
@@ -111,6 +112,9 @@ func TestLoadProvidersConfigFileAzureV1BaseURLAndModelMetadata(t *testing.T) {
 	if cfgModel.ParallelToolCalls == nil || !*cfgModel.ParallelToolCalls {
 		t.Fatalf("parallel_tool_calls = %v, want true", cfgModel.ParallelToolCalls)
 	}
+	if cfgModel.UseMaxCompletionTokens == nil || !*cfgModel.UseMaxCompletionTokens {
+		t.Fatalf("use_max_completion_tokens = %v, want true", cfgModel.UseMaxCompletionTokens)
+	}
 	if cfgModel.ContextWindow == nil || *cfgModel.ContextWindow != 400000 {
 		t.Fatalf("context_window = %v, want 400000", cfgModel.ContextWindow)
 	}
@@ -150,6 +154,7 @@ func TestLoadProvidersConfigFileYAML(t *testing.T) {
           - high
         vision: true
         parallel_tool_calls: true
+        use_max_completion_tokens: true
         context_window: 400000
   - id: openai-codex
     type: openai-codex
@@ -213,6 +218,9 @@ func TestLoadProvidersConfigFileYAML(t *testing.T) {
 			}
 			if model.ParallelToolCalls == nil || !*model.ParallelToolCalls {
 				t.Fatalf("parallel_tool_calls = %v, want true", model.ParallelToolCalls)
+			}
+			if model.UseMaxCompletionTokens == nil || !*model.UseMaxCompletionTokens {
+				t.Fatalf("use_max_completion_tokens = %v, want true", model.UseMaxCompletionTokens)
 			}
 			if model.ContextWindow == nil || *model.ContextWindow != 400000 {
 				t.Fatalf("context_window = %v, want 400000", model.ContextWindow)

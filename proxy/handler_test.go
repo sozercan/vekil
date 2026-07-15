@@ -6813,6 +6813,81 @@ func TestHandleAnthropicMessages_UsesOpenAITranslationForGenericOpenAICompatible
 	}
 }
 
+func TestHandleAnthropicMessages_AzureUsesConfiguredMaxCompletionTokens(t *testing.T) {
+	t.Setenv("TEST_AZURE_API_KEY", "test-value")
+	useMaxCompletionTokens := true
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/openai/v1/chat/completions" {
+			t.Fatalf("expected Azure path /openai/v1/chat/completions, got %s", got)
+		}
+
+		var upstreamReq models.OpenAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamReq.Model != "gpt-5.6-sol" {
+			t.Fatalf("upstream model = %q, want gpt-5.6-sol", upstreamReq.Model)
+		}
+		if upstreamReq.MaxCompletionTokens == nil || *upstreamReq.MaxCompletionTokens != 64 {
+			t.Fatalf("max_completion_tokens = %v, want 64", upstreamReq.MaxCompletionTokens)
+		}
+		if upstreamReq.MaxTokens != nil {
+			t.Fatalf("max_tokens = %v, want nil", upstreamReq.MaxTokens)
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"id\":\"chunk-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello from Sol\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{
+			Providers: []ProviderConfig{{
+				ID:        "azure",
+				Type:      "azure-openai",
+				Default:   true,
+				BaseURL:   upstream.URL + "/openai/v1",
+				APIKeyEnv: "TEST_AZURE_API_KEY",
+				Models: []ProviderModelConfig{{
+					PublicID:               "gpt-5.6-sol",
+					Deployment:             "gpt-5.6-sol",
+					Endpoints:              []string{"/chat/completions"},
+					UseMaxCompletionTokens: &useMaxCompletionTokens,
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model": "gpt-5.6-sol",
+		"max_tokens": 64,
+		"messages": [{"role": "user", "content": "Hello"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var anthropicResp models.AnthropicResponse
+	if err := json.NewDecoder(resp.Body).Decode(&anthropicResp); err != nil {
+		t.Fatalf("decode Anthropic response: %v", err)
+	}
+	if len(anthropicResp.Content) != 1 || anthropicResp.Content[0].Text == nil || *anthropicResp.Content[0].Text != "Hello from Sol" {
+		t.Fatalf("unexpected Anthropic response: %+v", anthropicResp)
+	}
+}
+
 func TestHandleAnthropicMessages_DirectGenericAnthropicCompatibleProvider(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Path; got != "/native/messages" {
