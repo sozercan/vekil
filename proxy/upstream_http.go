@@ -555,34 +555,99 @@ func sniffOpenAIUsage(body []byte) *models.OpenAIUsage {
 }
 
 func writeDirectAnthropicJSONResponse(ctx, upstreamCtx context.Context, w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) error {
-	if info, ok := explicitRouteResponseInfoFromResponse(resp); ok {
+	info, explicitRoute := explicitRouteResponseInfoFromResponse(resp)
+	if explicitRoute {
 		publicModel = info.publicID
 		upstreamModel = ""
 	}
 	bodyReader := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
 	defer func() { _ = bodyReader.Close() }()
 
-	body, err := io.ReadAll(bodyReader)
+	maxBodySize := int64(0)
+	if explicitRoute {
+		maxBodySize = maxLargeRequestBodySize
+	}
+	body, err := readDirectAnthropicJSONBody(bodyReader, maxBodySize)
 	if bodyReader.canceledAtFailure() {
 		return newResponseBodyWriteError(resp, context.Canceled, false, true, bodyReader.canceledAtFailure())
 	}
 	if err != nil {
 		return newResponseBodyWriteError(resp, err, false, true, bodyReader.canceledAtFailure())
 	}
+
+	var rewritten []byte
+	var changed bool
+	if explicitRoute {
+		rewritten, changed, err = normalizeExplicitAnthropicResponseModelJSON(body, publicModel)
+		if err != nil {
+			return newResponseBodyWriteError(resp, err, false, true, false)
+		}
+	} else {
+		rewritten, changed = rewriteAnthropicResponseModelJSON(body, publicModel, upstreamModel)
+	}
 	if resp.StatusCode == http.StatusOK {
 		observeAnthropicUsageBody(ctx, body)
 	}
-	rewritten, changed := rewriteAnthropicResponseModelJSON(body, publicModel, upstreamModel)
 
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	if changed {
 		w.Header().Del("Content-Length")
+	}
+	if explicitRoute {
+		markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 	}
 	w.WriteHeader(resp.StatusCode)
 	if _, err := w.Write(rewritten); err != nil {
 		return newResponseBodyWriteError(resp, err, true, false, false)
 	}
 	return nil
+}
+
+// readDirectAnthropicJSONBody keeps the historical unbounded legacy read when
+// maxBodySize is zero. Explicit routes pass a positive bound so a successful
+// response cannot bypass public-model normalization by exceeding the buffer.
+func readDirectAnthropicJSONBody(body io.Reader, maxBodySize int64) ([]byte, error) {
+	if maxBodySize <= 0 {
+		return io.ReadAll(body)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(body, maxBodySize+1))
+	if err != nil {
+		return data, err
+	}
+	if int64(len(data)) > maxBodySize {
+		return nil, errors.New("explicit route anthropic response exceeds model-normalization limit")
+	}
+	return data, nil
+}
+
+// normalizeExplicitAnthropicResponseModelJSON is the fail-closed counterpart
+// to rewriteAnthropicResponseModelJSON. Explicit routes must not forward a
+// successful body unless it is a complete JSON object that can be normalized.
+func normalizeExplicitAnthropicResponseModelJSON(body []byte, publicModel string) ([]byte, bool, error) {
+	publicModel = strings.TrimSpace(publicModel)
+	if publicModel == "" {
+		return body, false, nil
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, false, fmt.Errorf("malformed explicit route anthropic response: %w", err)
+	}
+	if payload == nil {
+		return nil, false, errors.New("malformed explicit route anthropic response: expected JSON object")
+	}
+
+	changed := rewriteAnthropicModelFields(payload, publicModel)
+	if !changed {
+		return body, false, nil
+	}
+
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false, fmt.Errorf("normalize explicit route anthropic response model: %w", err)
+	}
+	return rewritten, true, nil
 }
 
 func (h *ProxyHandler) writeDirectAnthropicStreamResponse(ctx, upstreamCtx context.Context, w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) {

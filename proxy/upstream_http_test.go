@@ -87,6 +87,16 @@ func TestExtractRequestModel(t *testing.T) {
 	}
 }
 
+func TestReadDirectAnthropicJSONBodyRejectsOversizedExplicitResponse(t *testing.T) {
+	data, err := readDirectAnthropicJSONBody(strings.NewReader("12345"), 4)
+	if err == nil || !strings.Contains(err.Error(), "exceeds model-normalization limit") {
+		t.Fatalf("readDirectAnthropicJSONBody() error = %v, want normalization limit error", err)
+	}
+	if data != nil {
+		t.Fatalf("readDirectAnthropicJSONBody() data = %q, want nil on oversized response", data)
+	}
+}
+
 func TestPostJSONEndpointWithHeadersForModel_ExplicitRouteRewritesNormalizedAliasToCanonicalTarget(t *testing.T) {
 	const (
 		requestedModel = "claude-sonnet-4-5"

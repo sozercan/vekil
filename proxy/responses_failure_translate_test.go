@@ -915,6 +915,109 @@ func TestResponsesFailureHeadersEventValuesReplaceUpstreamCaseInsensitively(t *t
 	}
 }
 
+func TestDecimalMillisecondsToRetryAfterSeconds(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+		ok    bool
+	}{
+		{name: "empty", value: "", ok: false},
+		{name: "zero", value: "000", ok: false},
+		{name: "invalid", value: "1000ms", ok: false},
+		{name: "subsecond", value: "1", want: "1", ok: true},
+		{name: "last subsecond millisecond", value: "999", want: "1", ok: true},
+		{name: "exact second", value: "1000", want: "1", ok: true},
+		{name: "round up", value: "1001", want: "2", ok: true},
+		{name: "carry across prefix", value: "999999", want: "1000", ok: true},
+		{name: "leading zeros", value: " 000001001 ", want: "2", ok: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := decimalMillisecondsToRetryAfterSeconds(tt.value)
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("decimalMillisecondsToRetryAfterSeconds(%q) = (%q, %v), want (%q, %v)", tt.value, got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
+func TestSelectResponsesRetryAfterPreservesVeryLongDecimalHeaders(t *testing.T) {
+	const digits = 64 * 1024
+
+	t.Run("retry-after-ms rounds an arbitrary-length carry", func(t *testing.T) {
+		milliseconds := strings.Repeat("9", digits) + "001"
+		want := "1" + strings.Repeat("0", digits)
+		headers := http.Header{"retry-after-ms": []string{milliseconds}}
+
+		got, source := selectResponsesRetryAfter(headers)
+		if got != want || source != "retry-after-ms" {
+			t.Fatalf("selectResponsesRetryAfter() returned length/source %d/%q, want %d/%q", len(got), source, len(want), "retry-after-ms")
+		}
+	})
+
+	t.Run("retry-after seconds strips zeros without a client clamp", func(t *testing.T) {
+		want := "8" + strings.Repeat("7", digits-1)
+		headers := http.Header{"Retry-After": []string{"000" + want}}
+
+		got, source := selectResponsesRetryAfter(headers)
+		if got != want || source != "Retry-After" {
+			t.Fatalf("selectResponsesRetryAfter() returned length/source %d/%q, want %d/%q", len(got), source, len(want), "Retry-After")
+		}
+	})
+
+	t.Run("reset with more digits wins", func(t *testing.T) {
+		tokenReset := strings.Repeat("9", digits)
+		requestReset := "1" + strings.Repeat("0", digits)
+		headers := http.Header{
+			"x-ratelimit-remaining-tokens":   []string{"0"},
+			"x-ratelimit-reset-tokens":       []string{tokenReset},
+			"x-ratelimit-remaining-requests": []string{"0"},
+			"x-ratelimit-reset-requests":     []string{"000" + requestReset},
+		}
+
+		got, source := selectResponsesRetryAfter(headers)
+		if got != requestReset || source != "x-ratelimit-reset-requests" {
+			t.Fatalf("selectResponsesRetryAfter() returned length/source %d/%q, want %d/%q", len(got), source, len(requestReset), "x-ratelimit-reset-requests")
+		}
+	})
+
+	t.Run("lexicographically larger equal-length reset wins", func(t *testing.T) {
+		tokenReset := "8" + strings.Repeat("0", digits-1)
+		requestReset := "7" + strings.Repeat("9", digits-1)
+		headers := http.Header{
+			"x-ratelimit-remaining-tokens":   []string{"0"},
+			"x-ratelimit-reset-tokens":       []string{tokenReset},
+			"x-ratelimit-remaining-requests": []string{"0"},
+			"x-ratelimit-reset-requests":     []string{requestReset},
+		}
+
+		got, source := selectResponsesRetryAfter(headers)
+		if got != tokenReset || source != "x-ratelimit-reset-tokens" {
+			t.Fatalf("selectResponsesRetryAfter() returned length/source %d/%q, want %d/%q", len(got), source, len(tokenReset), "x-ratelimit-reset-tokens")
+		}
+	})
+}
+
+func TestDecimalMillisecondsToRetryAfterSecondsVeryLongInputUsesBoundedAllocations(t *testing.T) {
+	const digits = 64 * 1024
+	value := strings.Repeat("9", digits) + "001"
+	want := "1" + strings.Repeat("0", digits)
+
+	var got string
+	var ok bool
+	allocations := testing.AllocsPerRun(10, func() {
+		got, ok = decimalMillisecondsToRetryAfterSeconds(value)
+	})
+	if !ok || got != want {
+		t.Fatalf("very long millisecond conversion returned length/ok %d/%v, want %d/true", len(got), ok, len(want))
+	}
+	if allocations > 2 {
+		t.Fatalf("very long millisecond conversion allocations = %.1f, want at most 2 fixed output allocations", allocations)
+	}
+}
+
 func TestSelectResponsesRetryAfterRoundsUpHTTPDate(t *testing.T) {
 	var now time.Time
 	for {
@@ -937,6 +1040,43 @@ func TestSelectResponsesRetryAfterRoundsUpHTTPDate(t *testing.T) {
 	retryAfter, source := selectResponsesRetryAfter(headers)
 	if retryAfter != "1" || source != "Retry-After" {
 		t.Fatalf("selectResponsesRetryAfter() = (%q, %q), want (\"1\", \"Retry-After\")", retryAfter, source)
+	}
+}
+
+var benchmarkRetryAfterSeconds string
+var benchmarkRetryAfterOK bool
+var benchmarkRetryAfterSource string
+
+func BenchmarkDecimalMillisecondsToRetryAfterSecondsVeryLong(b *testing.B) {
+	for _, digits := range []int{1024, 64 * 1024} {
+		value := strings.Repeat("9", digits) + "001"
+		b.Run(strconv.Itoa(digits)+"-digit-prefix", func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(value)))
+			for b.Loop() {
+				benchmarkRetryAfterSeconds, benchmarkRetryAfterOK = decimalMillisecondsToRetryAfterSeconds(value)
+			}
+		})
+	}
+}
+
+func BenchmarkSelectResponsesRetryAfterVeryLongReset(b *testing.B) {
+	for _, digits := range []int{1024, 64 * 1024} {
+		tokenReset := "8" + strings.Repeat("0", digits-1)
+		requestReset := "7" + strings.Repeat("9", digits-1)
+		headers := http.Header{
+			"x-ratelimit-remaining-tokens":   []string{"0"},
+			"x-ratelimit-reset-tokens":       []string{tokenReset},
+			"x-ratelimit-remaining-requests": []string{"0"},
+			"x-ratelimit-reset-requests":     []string{requestReset},
+		}
+		b.Run(strconv.Itoa(digits)+"-digit-resets", func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(tokenReset) + len(requestReset)))
+			for b.Loop() {
+				benchmarkRetryAfterSeconds, benchmarkRetryAfterSource = selectResponsesRetryAfter(headers)
+			}
+		})
 	}
 }
 

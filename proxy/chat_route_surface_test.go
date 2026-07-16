@@ -3,6 +3,8 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/models"
 )
 
 type completeJSONThenErrorReadCloser struct {
@@ -150,6 +153,174 @@ func TestExplicitRouteOpenAIChatNormalizationReadErrorFailsBeforeCommit(t *testi
 	}
 	if got := w.Header().Get("Openai-Model"); got == "physical-primary" {
 		t.Fatalf("client response exposed physical model header %q", got)
+	}
+}
+
+func TestExplicitRouteAnthropicJSONNormalizationFailuresBeforeCommit(t *testing.T) {
+	tests := []struct {
+		name string
+		body func() io.ReadCloser
+	}{
+		{
+			name: "malformed JSON",
+			body: func() io.ReadCloser {
+				return io.NopCloser(strings.NewReader(`{"id":"msg-primary","type":"message","model":"physical-primary"`))
+			},
+		},
+		{
+			name: "complete body with non-EOF read error",
+			body: func() io.ReadCloser {
+				return &completeJSONThenErrorReadCloser{payload: []byte(`{"id":"msg-primary","type":"message","role":"assistant","model":"physical-primary","content":[],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			upstreamBody := tt.body()
+			h := newExplicitRouteSurfaceHandler(t, providerTypeAnthropicCompatible, providerEndpointMessages, "http://primary.invalid", "http://secondary.invalid")
+			h.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if calls.Add(1) != 1 {
+					return nil, errors.New("unexpected failover after accepted Anthropic response")
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Header: http.Header{
+						"Content-Type":    []string{"application/json"},
+						"X-Upstream-Only": []string{"must-not-leak"},
+					},
+					Body:    upstreamBody,
+					Request: req,
+				}, nil
+			})}
+
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"public-model","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}`))
+			h.HandleAnthropicMessages(w, req)
+
+			if w.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusBadGateway, w.Body.String())
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("upstream calls = %d, want 1", calls.Load())
+			}
+			if strings.Contains(w.Body.String(), "physical-primary") {
+				t.Fatalf("client response exposed physical model: %s", w.Body.String())
+			}
+			if got := w.Header().Get("X-Upstream-Only"); got != "" {
+				t.Fatalf("precommit normalization failure copied upstream header %q", got)
+			}
+
+			var envelope models.AnthropicError
+			if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
+				t.Fatalf("decode Anthropic error envelope: %v; body=%s", err, w.Body.String())
+			}
+			if envelope.Type != "error" || envelope.Error.Type != "api_error" || envelope.Error.Message != "failed to read upstream response" {
+				t.Fatalf("unexpected Anthropic error envelope: %+v", envelope)
+			}
+			if tracked, ok := upstreamBody.(*completeJSONThenErrorReadCloser); ok && !tracked.closed.Load() {
+				t.Fatal("upstream response body was not closed after normalization read failure")
+			}
+		})
+	}
+}
+
+func TestExplicitRouteAnthropicJSONNormalizationRewritesPublicModel(t *testing.T) {
+	const upstreamResponse = `{"id":"msg-primary","type":"message","role":"assistant","model":"physical-primary","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1},"vendor":{"preserved":true}}`
+	var calls atomic.Int32
+	h := newExplicitRouteSurfaceHandler(t, providerTypeAnthropicCompatible, providerEndpointMessages, "http://primary.invalid", "http://secondary.invalid")
+	h.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header: http.Header{
+				"Content-Type":   []string{"application/json"},
+				"Content-Length": []string{fmt.Sprintf("%d", len(upstreamResponse))},
+				"Openai-Model":   []string{"physical-primary"},
+			},
+			Body:    io.NopCloser(strings.NewReader(upstreamResponse)),
+			Request: req,
+		}, nil
+	})}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"public-model","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}`))
+	h.HandleAnthropicMessages(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", calls.Load())
+	}
+	if strings.Contains(w.Body.String(), "physical-primary") {
+		t.Fatalf("client response exposed physical model: %s", w.Body.String())
+	}
+	if got := w.Header().Get("Openai-Model"); got != "public-model" {
+		t.Fatalf("Openai-Model = %q, want public-model", got)
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode normalized Anthropic response: %v", err)
+	}
+	if got := rawJSONString(payload["model"]); got != "public-model" {
+		t.Fatalf("response model = %q, want public-model", got)
+	}
+	if !strings.Contains(string(payload["vendor"]), `"preserved":true`) {
+		t.Fatalf("vendor field was not preserved: %s", payload["vendor"])
+	}
+}
+
+func TestLegacyAnthropicJSONNormalizationRemainsBestEffort(t *testing.T) {
+	const upstreamResponse = `{"id":"msg-legacy","type":"message","model":"physical-model"`
+	var calls atomic.Int32
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "legacy",
+			Type:     string(providerTypeAnthropicCompatible),
+			Default:  true,
+			BaseURL:  "http://legacy.invalid",
+			AuthType: "none",
+			Models: []ProviderModelConfig{{
+				PublicID:   "public-model",
+				Deployment: "physical-model",
+				Endpoints:  []string{providerEndpointMessages},
+			}},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	h.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(upstreamResponse)),
+			Request:    req,
+		}, nil
+	})}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"public-model","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}`))
+	h.HandleAnthropicMessages(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", calls.Load())
+	}
+	if got := w.Body.String(); got != upstreamResponse {
+		t.Fatalf("legacy body = %q, want byte-identical %q", got, upstreamResponse)
 	}
 }
 

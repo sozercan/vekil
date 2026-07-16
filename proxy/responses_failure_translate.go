@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
@@ -1661,16 +1660,48 @@ func normalizePositiveDecimal(value string) (string, bool) {
 	if value == "" {
 		return "", false
 	}
+	firstNonZero := -1
 	for i := 0; i < len(value); i++ {
 		if value[i] < '0' || value[i] > '9' {
 			return "", false
 		}
+		if firstNonZero == -1 && value[i] != '0' {
+			firstNonZero = i
+		}
 	}
-	value = strings.TrimLeft(value, "0")
-	if value == "" {
+	if firstNonZero == -1 {
 		return "", false
 	}
-	return value, true
+	return value[firstNonZero:], true
+}
+
+// incrementPositiveDecimal adds one without converting an unbounded upstream
+// value into a machine or arbitrary-precision integer. The returned decimal
+// requires at most one allocation, which is unavoidable when a carry changes
+// its digits.
+func incrementPositiveDecimal(value string) string {
+	carryIndex := len(value) - 1
+	for carryIndex >= 0 && value[carryIndex] == '9' {
+		carryIndex--
+	}
+
+	var incremented strings.Builder
+	if carryIndex < 0 {
+		incremented.Grow(len(value) + 1)
+		incremented.WriteByte('1')
+		for range len(value) {
+			incremented.WriteByte('0')
+		}
+		return incremented.String()
+	}
+
+	incremented.Grow(len(value))
+	incremented.WriteString(value[:carryIndex])
+	incremented.WriteByte(value[carryIndex] + 1)
+	for i := carryIndex + 1; i < len(value); i++ {
+		incremented.WriteByte('0')
+	}
+	return incremented.String()
 }
 
 func decimalMillisecondsToRetryAfterSeconds(value string) (string, bool) {
@@ -1678,16 +1709,16 @@ func decimalMillisecondsToRetryAfterSeconds(value string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	milliseconds, ok := new(big.Int).SetString(normalized, 10)
-	if !ok {
-		return "", false
+	if len(normalized) <= 3 {
+		return "1", true
 	}
-	milliseconds.Add(milliseconds, big.NewInt(999))
-	milliseconds.Quo(milliseconds, big.NewInt(1000))
-	if milliseconds.Sign() <= 0 {
-		return "", false
+
+	secondsEnd := len(normalized) - 3
+	seconds := normalized[:secondsEnd]
+	if normalized[secondsEnd:] == "000" {
+		return seconds, true
 	}
-	return milliseconds.String(), true
+	return incrementPositiveDecimal(seconds), true
 }
 
 func retryAfterHeaderSeconds(value string) (string, bool) {
@@ -1710,23 +1741,27 @@ func retryAfterHeaderSeconds(value string) (string, bool) {
 	return strconv.FormatInt(seconds, 10), true
 }
 
-func responsesQuotaResetRetryAfter(headers http.Header, dimension string) (string, *big.Int, bool) {
+func responsesQuotaResetRetryAfter(headers http.Header, dimension string) (string, bool) {
 	value := strings.TrimSpace(headerGetCI(headers, "x-ratelimit-reset-"+dimension))
 	if normalized, ok := normalizePositiveDecimal(value); ok {
-		seconds, parsed := new(big.Int).SetString(normalized, 10)
-		return normalized, seconds, parsed && seconds.Sign() > 0
+		return normalized, true
 	}
 	delay, err := time.ParseDuration(value)
 	if err != nil || delay <= 0 {
-		return "", nil, false
+		return "", false
 	}
 	seconds := durationSecondsCeil(delay)
 	if seconds <= 0 {
-		return "", nil, false
+		return "", false
 	}
-	value = strconv.FormatInt(seconds, 10)
-	parsed, _ := new(big.Int).SetString(value, 10)
-	return value, parsed, true
+	return strconv.FormatInt(seconds, 10), true
+}
+
+func positiveDecimalGreater(left, right string) bool {
+	if len(left) != len(right) {
+		return len(left) > len(right)
+	}
+	return left > right
 }
 
 func classifyPrecommitResponsesFailure(event responsesWebSocketStreamEvent) (int, string, bool) {
@@ -1777,7 +1812,6 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 		return seconds, "Retry-After"
 	}
 
-	var resetSeconds *big.Int
 	resetValue := ""
 	resetSource := ""
 	for _, dimension := range []string{"tokens", "requests"} {
@@ -1785,11 +1819,10 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 		if !exhausted || remaining == -1 {
 			continue
 		}
-		value, seconds, ok := responsesQuotaResetRetryAfter(headers, dimension)
-		if !ok || (resetSeconds != nil && seconds.Cmp(resetSeconds) <= 0) {
+		value, ok := responsesQuotaResetRetryAfter(headers, dimension)
+		if !ok || (resetValue != "" && !positiveDecimalGreater(value, resetValue)) {
 			continue
 		}
-		resetSeconds = seconds
 		resetValue = value
 		resetSource = "x-ratelimit-reset-" + dimension
 	}

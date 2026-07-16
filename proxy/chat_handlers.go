@@ -727,7 +727,6 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 		return
 	}
 	if resp.StatusCode == http.StatusOK {
-		markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 		if err := writeDirectAnthropicJSONResponse(r.Context(), upstreamCtx, w, resp, publicModel, upstreamModel); err != nil {
 			if h.handleResponseBodyWriteError(w, r, upstreamCtx, "anthropic", err) {
 				return
