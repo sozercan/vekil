@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -254,6 +255,10 @@ const (
 	// smaller than request histories; a 1 MiB ceiling prevents an upstream from
 	// making the proxy buffer an unbounded 200 response.
 	proxySummaryResponseBodySize = 1 << 20
+	// internalCompactionMaxOutputTokens bounds proxy-owned checkpoint generation.
+	// It is deliberately large enough for useful handoffs while preventing an
+	// upstream provider's unbounded/default output allowance from controlling cost.
+	internalCompactionMaxOutputTokens = 16 * 1024
 	// compactUpstreamMaxAttempts caps the number of logical compaction calls
 	// the compact-413 fallback may issue per inbound request. Each logical
 	// call may make up to one extra HTTP POST if the configured model is
@@ -282,6 +287,10 @@ const (
 // chunk forces a halving, every remaining sibling drops to that new target
 // instead of repeating the same known-doomed POST.
 //
+// learnedOutputTokens records the smallest internal generation cap selected
+// after a provider rejects a larger value for the chosen model. Sibling chunks
+// and the merge request reuse it instead of repeating the same cap probes.
+//
 // resolvedModel records the substitute model picked by the model-fallback path
 // the first time the configured model is rejected as unsupported. Subsequent
 // compact calls in the same fanout pre-rewrite their request body to this
@@ -295,8 +304,11 @@ type compactBudget struct {
 	attempts      int
 	max           int
 	learnedTarget int
-	resolvedModel string
-	usage         responsesUsage
+	// learnedOutputTokens records the smallest provider-accepted internal
+	// compaction cap discovered in this request fanout.
+	learnedOutputTokens int
+	resolvedModel       string
+	usage               responsesUsage
 }
 
 func (b *compactBudget) addResponsesUsage(body []byte) {
@@ -399,6 +411,15 @@ func (b *compactBudget) resolvedModelValue() string {
 	return resolvedModel
 }
 
+func (b *compactBudget) learnedOutputTokensValue() int {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.learnedOutputTokens
+}
+
 func (b *compactBudget) wouldExceed(extra int) (bool, int, int) {
 	if b == nil || extra <= 0 {
 		attempts, max := b.attemptsSnapshot()
@@ -420,6 +441,20 @@ func (b *compactBudget) recordLearnedTarget(target int) {
 	defer b.mu.Unlock()
 	if b.learnedTarget == 0 || target < b.learnedTarget {
 		b.learnedTarget = target
+	}
+}
+
+// recordLearnedOutputTokens ratchets the shared internal generation cap down
+// after a provider reports that the prior cap exceeds the selected model's
+// maximum. Sibling chunks and the final merge reuse the learned value.
+func (b *compactBudget) recordLearnedOutputTokens(limit int) {
+	if b == nil || limit <= 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.learnedOutputTokens == 0 || limit < b.learnedOutputTokens {
+		b.learnedOutputTokens = limit
 	}
 }
 
@@ -779,7 +814,6 @@ func normalizeCompactionRequestFields(requestFields map[string]json.RawMessage) 
 		"tool_choice",
 		"parallel_tool_calls",
 		"response_format",
-		"max_output_tokens",
 		"max_tokens",
 		"max_completion_tokens",
 		"stream",
@@ -792,6 +826,11 @@ func normalizeCompactionRequestFields(requestFields map[string]json.RawMessage) 
 		delete(normalized, field)
 		removed = append(removed, field)
 	}
+
+	if _, ok := normalized["max_output_tokens"]; ok {
+		removed = append(removed, "max_output_tokens")
+	}
+	normalized["max_output_tokens"] = json.RawMessage(strconv.Itoa(internalCompactionMaxOutputTokens))
 
 	rawText, ok := normalized["text"]
 	if !ok {
@@ -822,6 +861,71 @@ func normalizeCompactionRequestFields(requestFields map[string]json.RawMessage) 
 	}
 	normalized["text"] = encodedText
 	return normalized, removed
+}
+
+func compactOutputTokenLimit(requestFields map[string]json.RawMessage) (int, bool) {
+	raw, ok := requestFields["max_output_tokens"]
+	if !ok {
+		return 0, false
+	}
+	var limit int
+	if err := json.Unmarshal(raw, &limit); err != nil || limit <= 0 {
+		return 0, false
+	}
+	return limit, true
+}
+
+func applyLearnedCompactOutputTokenLimit(requestFields map[string]json.RawMessage, budget *compactBudget) map[string]json.RawMessage {
+	learnedLimit := budget.learnedOutputTokensValue()
+	if learnedLimit <= 0 {
+		return requestFields
+	}
+	if currentLimit, ok := compactOutputTokenLimit(requestFields); ok && currentLimit <= learnedLimit {
+		return requestFields
+	}
+	rewritten := copyResponsesRequestFields(requestFields)
+	rewritten["max_output_tokens"] = json.RawMessage(strconv.Itoa(learnedLimit))
+	return rewritten
+}
+
+func isCompactOutputTokenLimitExceededError(status int, body []byte) bool {
+	if status != http.StatusBadRequest || isCompactPromptTooLargeError(status, body) {
+		return false
+	}
+	details := parseResponsesChatErrorDetails(status, body)
+	param, _ := details.param.(string)
+	message := strings.ToLower(details.message)
+	mentionsLimit := strings.EqualFold(strings.TrimSpace(param), "max_output_tokens") ||
+		strings.Contains(message, "max_output_tokens") ||
+		strings.Contains(message, "maximum output token")
+	if !mentionsLimit {
+		return false
+	}
+	for _, marker := range []string{
+		"maximum",
+		"too large",
+		"at most",
+		"less than",
+		"exceed",
+		"above",
+		"between",
+		"<=",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func compactRetryCancellation(ctx context.Context, retryErr error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if errors.Is(retryErr, context.Canceled) || errors.Is(retryErr, context.DeadlineExceeded) {
+		return retryErr
+	}
+	return nil
 }
 
 func (h *ProxyHandler) setSyntheticResponsesStoreFalse(requestFields map[string]json.RawMessage) {
@@ -1079,6 +1183,7 @@ func (h *ProxyHandler) compactResponsesRequestWithBudget(ctx context.Context, re
 }
 
 func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, depth int, targetBodySize int, budget *compactBudget, proactiveChunk bool) (string, *http.Response, error) {
+	requestFields = applyLearnedCompactOutputTokenLimit(requestFields, budget)
 	bodyBytes, err := marshalCompactResponsesRequest(requestFields, nil)
 	if err != nil {
 		return "", nil, err
@@ -1163,6 +1268,30 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 	}
 	if readErr != nil {
 		return "", originalResp, nil
+	}
+	if resp.StatusCode == http.StatusBadRequest && isCompactOutputTokenLimitExceededError(resp.StatusCode, respBody) {
+		currentLimit, ok := compactOutputTokenLimit(requestFields)
+		if ok && currentLimit > responsesChatMinimumOutputTokens {
+			nextLimit := currentLimit / 2
+			if nextLimit < responsesChatMinimumOutputTokens {
+				nextLimit = responsesChatMinimumOutputTokens
+			}
+			budget.recordLearnedOutputTokens(nextLimit)
+			h.log.Info("retrying internal compaction with a lower output-token cap",
+				logger.F("previous_max_output_tokens", currentLimit),
+				logger.F("max_output_tokens", nextLimit),
+				logger.F("depth", depth),
+			)
+			summary, retryResp, retryErr := h.compactResponsesRequestDepth(ctx, requestFields, extraHeaders, depth, targetBodySize, budget, proactiveChunk)
+			if retryErr == nil {
+				return summary, retryResp, nil
+			}
+			if cancellationErr := compactRetryCancellation(ctx, retryErr); cancellationErr != nil {
+				return "", nil, cancellationErr
+			}
+			h.log.Debug("internal compaction output-token retry failed; returning original response", logger.Err(retryErr))
+			return "", originalResp, nil
+		}
 	}
 	if resp.StatusCode != http.StatusRequestEntityTooLarge && !isCompactPromptTooLargeError(resp.StatusCode, respBody) {
 		return "", originalResp, nil

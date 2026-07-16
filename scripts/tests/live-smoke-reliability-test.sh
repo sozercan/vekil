@@ -249,6 +249,20 @@ print(
 )
 PY_WRAPPED_OUTPUT
     ;;
+  json-wrapped)
+    jq -cn --arg output "\$(cat left.txt)" '{output: \$output}'
+    printf '|'
+    jq -cn --arg output "\$(cat right.txt)" '{output: \$output}'
+    ;;
+  json-wrapped-whole)
+    jq -cn --arg output "\$(cat left.txt)|\$(cat right.txt)" '{output: \$output}'
+    ;;
+  json-wrapped-trailing-separator)
+    jq -cn --arg output "\$(cat left.txt)" '{output: \$output}'
+    printf '|'
+    jq -cn --arg output "\$(cat right.txt)" '{output: \$output}'
+    printf '|'
+    ;;
   exit42)
     exit 42
     ;;
@@ -477,6 +491,22 @@ common_zen_env() {
     "SMOKE_CLI_TIMEOUT_SECONDS=2"
 }
 
+run_zen_case_expect_success() {
+  local name="$1"
+  local copilot_mode="$2"
+  local claude_mode="$3"
+  local gemini_mode="$4"
+  local case_dir="${TMP_ROOT}/setup/${name}"
+  start_mock_server "${case_dir}/server" 200
+  local port="${MOCK_SERVER_PORT}"
+  local fake_bin="${case_dir}/bin"
+  write_fake_clients "${fake_bin}" "${copilot_mode}" "${claude_mode}" "${gemini_mode}"
+  local smoke_dir="${case_dir}/smoke"
+  local env_args=()
+  while IFS= read -r -d '' item; do env_args+=("${item}"); done < <(common_zen_env "${smoke_dir}" "${port}" "${fake_bin}")
+  expect_success "${name}" 8 env "${env_args[@]}" "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+}
+
 run_zen_case_expect_failure() {
   local name="$1"
   local status="$2"
@@ -522,6 +552,22 @@ run_zen_classification_case() {
 }
 
 log "Running deterministic smoke reliability regressions"
+
+escape_client="${TMP_ROOT}/json-wrapped-client"
+write_fake_client "${escape_client}" json-wrapped
+escape_case="${TMP_ROOT}/json-wrapped-fixtures"
+mkdir -p "${escape_case}"
+printf '%s' 'left "quote" \ slash' > "${escape_case}/left.txt"
+printf 'right\ncontrol' > "${escape_case}/right.txt"
+escape_output="$(cd "${escape_case}" && "${escape_client}")"
+escape_left="${escape_output%%|*}"
+escape_right="${escape_output#*|}"
+if [[ "$(jq -r '.output' <<< "${escape_left}")" == 'left "quote" \ slash' ]] &&
+   [[ "$(jq -r '.output' <<< "${escape_right}")" == $'right\ncontrol' ]]; then
+  record_success "fake Gemini JSON wrapper escapes arbitrary fixture content"
+else
+  record_failure "fake Gemini JSON wrapper escapes arbitrary fixture content" "wrapper output was not valid escaped JSON: ${escape_output}"
+fi
 
 render_block="${TMP_ROOT}/k8s-render-kustomization.txt"
 awk '
@@ -727,6 +773,10 @@ expect_hard_failure_with_stderr "hanging chat canary is hard via raw Zen smoke" 
   env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${hanging_chat_port}" \
     LIVE_ZEN_SMOKE_DIR="${hanging_chat_dir}/raw-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
     SMOKE_CURL_MAX_TIME_SECONDS=1 "${REPO_ROOT}/scripts/live-zen-smoke.sh"
+
+run_zen_case_expect_success "Gemini strict JSON wrapper around complete result normalizes to exact text" pass pass json-wrapped-whole
+run_zen_case_expect_success "Gemini strict JSON wrapper sequence normalizes to exact text" pass pass json-wrapped
+run_zen_case_expect_failure "Gemini dangling JSON wrapper separator is rejected" 200 pass pass json-wrapped-trailing-separator
 
 run_zen_case_expect_failure "canary 200 plus CLI exit 42" 200 exit42 exit42 exit42
 run_zen_case_expect_failure "canary 404 is a hard failure" 404 pass pass pass

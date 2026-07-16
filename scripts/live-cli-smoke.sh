@@ -369,10 +369,12 @@ read_normalized_output() {
   awk 'NF { gsub(/\r/, "", $0); printf "%s", $0 }' "$1"
 }
 
-# Recent Gemini CLI versions may render each successful Read result as a compact
-# {"output":"..."} object even when text output was requested. Accept only the
-# exact two-object wrapper produced for this smoke's two files; leave every other
-# shape unchanged so unexpected model commentary still fails the exact assertion.
+# Recent Gemini CLI versions may render Read results as strict
+# {"output":"..."} objects even when text output was requested. Accept either
+# one wrapper around the complete result or the exact two-wrapper sequence for
+# this smoke's two files. Leave every other shape unchanged so malformed JSON,
+# extra fields, unwrapped text, and unexpected commentary still fail the exact
+# assertion.
 read_gemini_normalized_output() {
   local path="$1"
   local python_bin
@@ -388,21 +390,34 @@ raw = "".join(
     if line.strip()
 )
 try:
-    decoder = json.JSONDecoder()
-    left, offset = decoder.raw_decode(raw)
-    if raw[offset:offset + 1] != "|":
-        raise ValueError("missing separator")
-    right, end = decoder.raw_decode(raw, offset + 1)
-    if end != len(raw):
-        raise ValueError("trailing content")
-    if set(left) != {"output"} or set(right) != {"output"}:
-        raise ValueError("unexpected wrapper keys")
-    if not isinstance(left["output"], str) or not isinstance(right["output"], str):
-        raise ValueError("non-string output")
+    whole = json.loads(raw)
+    if set(whole) != {"output"} or not isinstance(whole["output"], str):
+        raise ValueError("not a strict whole-result wrapper")
 except (TypeError, ValueError, json.JSONDecodeError):
-    print(raw, end="")
+    try:
+        decoder = json.JSONDecoder()
+        outputs = []
+        offset = 0
+        while offset < len(raw):
+            wrapper, offset = decoder.raw_decode(raw, offset)
+            if set(wrapper) != {"output"} or not isinstance(wrapper["output"], str):
+                raise ValueError("not a strict output wrapper")
+            outputs.append(wrapper["output"])
+            if offset == len(raw):
+                break
+            if raw[offset:offset + 1] != "|":
+                raise ValueError("missing separator")
+            offset += 1
+            if offset == len(raw):
+                raise ValueError("dangling separator")
+        if len(outputs) < 2:
+            raise ValueError("wrapper sequence is incomplete")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        print(raw, end="")
+    else:
+        print("|".join(outputs), end="")
 else:
-    print(f'{left["output"]}|{right["output"]}', end="")
+    print(whole["output"], end="")
 PY_GEMINI_OUTPUT
 }
 

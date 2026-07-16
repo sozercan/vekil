@@ -1440,7 +1440,7 @@ func classifyResponsesPeekEvent(event responsesWebSocketStreamEvent, eventName s
 	case "response.completed", "response.failed", "response.incomplete", "error":
 		terminal := event
 		result.terminal = &terminal
-		if terminalType == "response.failed" || terminalType == "response.incomplete" || terminalType == "error" {
+		if terminalType == "response.failed" || terminalType == "error" {
 			result.failure = &terminal
 		}
 	}

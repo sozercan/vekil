@@ -6,7 +6,7 @@ Concise endpoint map for Vekil's public API surface. Provider routing is always 
 
 Anthropic Messages compatibility for the supported content and tool subset. Requests are normally translated to canonical OpenAI Chat Completions, sent through Vekil's Chat execution layer, and translated back to Anthropic. The selected model may be backed natively by `/chat/completions` or by `/responses`; native Chat is preferred when both are available. For `anthropic-compatible` providers, the proxy instead forwards Messages requests directly to the configured `messages_path`.
 
-The native-Chat path supports the existing text/image/tool-use subset, system messages, tool choice, stop sequences, extended thinking via `thinking.type: "enabled"`, and streaming Anthropic SSE translation. When the selected model is Responses-native, the translated request must also fit the strict [Responses-backed Chat field subset](#responses-backed-chat-request-subset). In particular, non-empty Anthropic `stop_sequences` are rejected because the initial adapter does not emulate stop sequences locally.
+The native-Chat path supports the existing text/image/tool-use subset, system messages, tool choice, stop sequences, extended thinking via `thinking.type: "enabled"`, and streaming Anthropic SSE translation. Extended thinking preserves `max_tokens` as the hard per-response limit. An interleaved thinking budget may exceed that limit only with the exact interleaved-thinking beta, active tools, and omitted or `auto` tool choice; forced `any` or named-tool choices are rejected with thinking. When the selected model is Responses-native, the translated request must also fit the strict [Responses-backed Chat field subset](#responses-backed-chat-request-subset). In particular, non-empty Anthropic `stop_sequences` are rejected because the initial adapter does not emulate stop sequences locally.
 
 Model normalization strips dated suffixes such as `claude-sonnet-4-20250514` and maps hyphenated version numbers to dotted form, for example `claude-sonnet-4-5` to `claude-sonnet-4.5`.
 
@@ -71,7 +71,7 @@ Additional rules:
 
 - `model` is required and `messages` must be a non-empty array.
 - `max_tokens` and `max_completion_tokens` both map to `max_output_tokens`; if both are present they must be equal.
-- Because the native Responses endpoint requires at least 16 output tokens, a client-supplied limit from 1 through 15 is rejected locally on Responses-backed routes rather than silently clamped beyond the Chat upper bound. Native Chat routes retain their provider behavior.
+- Because the native Responses endpoint requires at least 16 output tokens, a client-supplied limit from 0 through 15 is rejected locally on Responses-backed routes rather than silently clamped beyond the Chat upper bound. Native Chat routes retain non-streaming `max_tokens: 0` prewarm requests when thinking is disabled; Vekil returns empty content with `stop_reason: "max_tokens"`, and rejects zero-token requests that enable streaming or thinking.
 - `response_format` accepts `text`, `json_object`, and `json_schema`.
 - `tool_choice` accepts `none`, `auto`, `required`, or a declared named function.
 - Message content supports text and ordered content parts. HTTP(S) images and base64 image data URLs are accepted only in user messages.

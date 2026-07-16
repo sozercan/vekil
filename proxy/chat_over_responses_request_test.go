@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 )
@@ -466,14 +467,16 @@ func TestTranslateChatRequestToResponsesFlattensToolMessageTextParts(t *testing.
 
 func TestTranslateChatRequestToResponsesRejectsCapsBelowResponsesMinimum(t *testing.T) {
 	for _, field := range []string{"max_tokens", "max_completion_tokens"} {
-		t.Run(field, func(t *testing.T) {
-			body := []byte(`{"model":"gpt","messages":[{"role":"user","content":"hello"}],"` + field + `":1}`)
-			_, err := translateChatRequestToResponses(body, responsesChatRequestOptions{})
-			var executionErr *chatExecutionError
-			if !errors.As(err, &executionErr) || executionErr.StatusCode != 400 || executionErr.Param != field {
-				t.Fatalf("error = %#v", err)
-			}
-		})
+		for _, limit := range []int{0, 1, 15} {
+			t.Run(fmt.Sprintf("%s_%d", field, limit), func(t *testing.T) {
+				body := []byte(fmt.Sprintf(`{"model":"gpt","messages":[{"role":"user","content":"hello"}],%q:%d}`, field, limit))
+				_, err := translateChatRequestToResponses(body, responsesChatRequestOptions{})
+				var executionErr *chatExecutionError
+				if !errors.As(err, &executionErr) || executionErr.StatusCode != 400 || executionErr.Param != field {
+					t.Fatalf("error = %#v", err)
+				}
+			})
+		}
 	}
 	plan, err := translateChatRequestToResponses([]byte(`{"model":"gpt","messages":[{"role":"user","content":"hello"}],"max_tokens":16}`), responsesChatRequestOptions{})
 	if err != nil {

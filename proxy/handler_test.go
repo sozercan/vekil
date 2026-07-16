@@ -6825,6 +6825,262 @@ func TestHandleAnthropicMessages_UsesOpenAITranslationForGenericOpenAICompatible
 	}
 }
 
+func TestHandleAnthropicMessages_RejectsMissingMaxTokens(t *testing.T) {
+	var upstreamHits atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model": "claude-sonnet-4",
+		"messages": [{"role": "user", "content": "Hello"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, body)
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("upstream hits = %d, want 0", got)
+	}
+	var anthropicErr models.AnthropicError
+	if err := json.NewDecoder(resp.Body).Decode(&anthropicErr); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if anthropicErr.Error.Type != "invalid_request_error" || !strings.Contains(anthropicErr.Error.Message, "max_tokens") {
+		t.Fatalf("unexpected Anthropic error: %+v", anthropicErr)
+	}
+}
+
+func TestHandleAnthropicMessages_PrewarmUsesNonStreamingUpstream(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		var upstreamReq models.OpenAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamReq.Stream != nil {
+			t.Fatalf("stream = %v, want omitted for prewarm", *upstreamReq.Stream)
+		}
+		if upstreamReq.StreamOptions != nil {
+			t.Fatalf("stream_options = %+v, want nil for prewarm", upstreamReq.StreamOptions)
+		}
+		if upstreamReq.MaxTokens == nil || *upstreamReq.MaxTokens != 0 {
+			t.Fatalf("max_tokens = %v, want 0", upstreamReq.MaxTokens)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-prewarm","object":"chat.completion","model":"claude-sonnet-4","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":0,"total_tokens":5}}`)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model": "claude-sonnet-4",
+		"max_tokens": 0,
+		"messages": [{"role": "user", "content": "warm cache"}]
+	}`))
+	w := httptest.NewRecorder()
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	var anthropicResp models.AnthropicResponse
+	if err := json.NewDecoder(resp.Body).Decode(&anthropicResp); err != nil {
+		t.Fatalf("decode Anthropic response: %v", err)
+	}
+	if anthropicResp.StopReason == nil || *anthropicResp.StopReason != "max_tokens" || len(anthropicResp.Content) != 0 || anthropicResp.Usage.InputTokens != 5 || anthropicResp.Usage.OutputTokens != 0 {
+		t.Fatalf("unexpected prewarm response: %+v", anthropicResp)
+	}
+}
+
+func TestHandleAnthropicMessages_StreamedInterleavedThinkingPreservesPerResponseLimit(t *testing.T) {
+	var upstreamHits atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		var upstreamReq models.OpenAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamReq.Stream == nil || !*upstreamReq.Stream {
+			t.Fatalf("stream = %v, want true", upstreamReq.Stream)
+		}
+		if upstreamReq.MaxCompletionTokens == nil || *upstreamReq.MaxCompletionTokens != 4096 {
+			t.Fatalf("max_completion_tokens = %v, want 4096", upstreamReq.MaxCompletionTokens)
+		}
+		if upstreamReq.MaxTokens != nil {
+			t.Fatalf("max_tokens = %v, want nil", upstreamReq.MaxTokens)
+		}
+		if upstreamReq.StreamOptions == nil || !upstreamReq.StreamOptions.IncludeUsage {
+			t.Fatalf("stream_options = %+v, want include_usage", upstreamReq.StreamOptions)
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chunk-interleaved\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"streamed\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model": "claude-opus-4-5",
+		"max_tokens": 4096,
+		"stream": true,
+		"thinking": {"type": "enabled", "budget_tokens": 8192},
+		"tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+		"messages": [{"role": "user", "content": "use tools"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Beta", anthropicInterleavedThinkingBeta)
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("upstream hits = %d, want 1", got)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("streamed")) {
+		t.Fatalf("streamed response body = %q, want translated content", body)
+	}
+}
+
+func newAzureResponsesOnlyAnthropicHandlerForTest(t *testing.T, upstreamURL string) *ProxyHandler {
+	t.Helper()
+	t.Setenv("TEST_AZURE_API_KEY", "test-value")
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:         "azure",
+			Type:       "azure-openai",
+			Default:    true,
+			BaseURL:    upstreamURL + "/openai",
+			APIVersion: "2025-04-01-preview",
+			APIKeyEnv:  "TEST_AZURE_API_KEY",
+			Models: []ProviderModelConfig{{
+				PublicID:   "gpt-5.4-pro",
+				Deployment: "gpt-5.4-pro",
+				Endpoints:  []string{"/responses"},
+				Name:       "GPT-5.4 Pro",
+			}},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+	return handler
+}
+
+func TestHandleAnthropicMessages_ResponsesOnlyPrewarmRejectsBelowMinimum(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	handler := newAzureResponsesOnlyAnthropicHandlerForTest(t, upstream.URL)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model": "gpt-5.4-pro",
+		"max_tokens": 0,
+		"messages": [{"role": "user", "content": "warm cache"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, body)
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("upstream hits = %d, want 0", got)
+	}
+	var anthropicErr models.AnthropicError
+	if err := json.NewDecoder(resp.Body).Decode(&anthropicErr); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if anthropicErr.Error.Type != "invalid_request_error" || !strings.Contains(anthropicErr.Error.Message, "at least 16") {
+		t.Fatalf("unexpected Anthropic error: %+v", anthropicErr)
+	}
+}
+
+func TestHandleAnthropicMessages_ResponsesOnlyInterleavedThinkingPreservesPerResponseLimit(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/chat_over_responses/stream_text.sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		if got, want := r.URL.Path, "/openai/responses"; got != want {
+			t.Fatalf("upstream path = %q, want %q", got, want)
+		}
+		if got := r.URL.Query().Get("api-version"); got != "2025-04-01-preview" {
+			t.Fatalf("api-version = %q", got)
+		}
+		var request struct {
+			Model           string `json:"model"`
+			Stream          bool   `json:"stream"`
+			MaxOutputTokens int    `json:"max_output_tokens"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if request.Model != "gpt-5.4-pro" || !request.Stream || request.MaxOutputTokens != 4096 {
+			t.Fatalf("upstream request = %+v, want model gpt-5.4-pro, stream true, max_output_tokens 4096", request)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write(fixture)
+	}))
+	defer upstream.Close()
+
+	handler := newAzureResponsesOnlyAnthropicHandlerForTest(t, upstream.URL)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model": "gpt-5.4-pro",
+		"max_tokens": 4096,
+		"stream": true,
+		"thinking": {"type": "enabled", "budget_tokens": 8192},
+		"tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+		"messages": [{"role": "user", "content": "use tools"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Beta", anthropicInterleavedThinkingBeta)
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("upstream hits = %d, want 1", got)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("Synthetic fixture ")) || !bytes.Contains(body, []byte("text response.")) {
+		t.Fatalf("streamed response body = %q, want translated Responses content", body)
+	}
+}
+
 func TestHandleAnthropicMessages_AzureUsesConfiguredMaxCompletionTokens(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "test-value")
 	useMaxCompletionTokens := true

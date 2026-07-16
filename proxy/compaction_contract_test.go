@@ -3,7 +3,9 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -76,6 +78,117 @@ func TestCompactionContract_CompactEndpointReturnsCodexCompatibleHistory(t *test
 		if contractItemRole(t, item) == "assistant" {
 			t.Fatalf("compact response must not include assistant summary messages that duplicate the checkpoint: %s", item)
 		}
+	}
+}
+
+func TestCompactionContract_ReducesInternalOutputLimitToProviderMaximum(t *testing.T) {
+	var mu sync.Mutex
+	var limits []int
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("expected compact fallback to call /responses, got %q", r.URL.Path)
+		}
+		body := decodeJSONBodyForContract(t, r.Body)
+		var limit int
+		if err := json.Unmarshal(body["max_output_tokens"], &limit); err != nil {
+			t.Fatalf("decode max_output_tokens: %v", err)
+		}
+		mu.Lock()
+		limits = append(limits, limit)
+		mu.Unlock()
+		if limit > 4096 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprintf(w, `{"error":{"message":"Invalid 'max_output_tokens': integer above maximum value. Expected a value <= 4096, but got %d instead.","type":"invalid_request_error","code":"invalid_value","param":"max_output_tokens"}}`, limit)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-compact","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"bounded checkpoint summary"}]}]}`))
+	})
+
+	reqBody := mustMarshalContractJSON(t, map[string]interface{}{
+		"model": "gpt-4-turbo",
+		"input": []interface{}{messageItemForContract("user", "history to compact")},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	mu.Lock()
+	gotLimits := append([]int(nil), limits...)
+	mu.Unlock()
+	if got, want := fmt.Sprint(gotLimits), "[16384 8192 4096]"; got != want {
+		t.Fatalf("max_output_tokens attempts = %s, want %s", got, want)
+	}
+}
+
+func TestIsCompactOutputTokenLimitExceededError(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{name: "param and upper bound", status: http.StatusBadRequest, body: `{"error":{"message":"Expected a value <= 4096","param":"max_output_tokens"}}`, want: true},
+		{name: "message only", status: http.StatusBadRequest, body: `{"error":{"message":"max_output_tokens exceeds the maximum for this model"}}`, want: true},
+		{name: "minimum rejection", status: http.StatusBadRequest, body: `{"error":{"message":"max_output_tokens must be at least 16","param":"max_output_tokens"}}`},
+		{name: "unsupported field", status: http.StatusBadRequest, body: `{"error":{"message":"max_output_tokens is not supported","param":"max_output_tokens"}}`},
+		{name: "context overflow mentioning output tokens", status: http.StatusBadRequest, body: `{"error":{"message":"maximum context length exceeded: input plus max_output_tokens exceeds the model limit","code":"context_length_exceeded","param":"max_output_tokens"}}`},
+		{name: "wrong status", status: http.StatusRequestEntityTooLarge, body: `{"error":{"message":"max_output_tokens exceeds the maximum","param":"max_output_tokens"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isCompactOutputTokenLimitExceededError(tt.status, []byte(tt.body)); got != tt.want {
+				t.Fatalf("isCompactOutputTokenLimitExceededError() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCompactBudgetPersistsLearnedOutputTokenLimit(t *testing.T) {
+	budget := newCompactBudget(10)
+	budget.recordLearnedOutputTokens(4096)
+	budget.recordLearnedOutputTokens(8192)
+	if got := budget.learnedOutputTokensValue(); got != 4096 {
+		t.Fatalf("learned output-token cap = %d, want 4096", got)
+	}
+
+	original := map[string]json.RawMessage{"max_output_tokens": json.RawMessage("16384")}
+	rewritten := applyLearnedCompactOutputTokenLimit(original, budget)
+	if got, ok := compactOutputTokenLimit(rewritten); !ok || got != 4096 {
+		t.Fatalf("rewritten output-token cap = %d, %v, want 4096, true", got, ok)
+	}
+	if got, _ := compactOutputTokenLimit(original); got != 16384 {
+		t.Fatalf("original output-token cap mutated to %d", got)
+	}
+
+	budget.recordLearnedOutputTokens(2048)
+	rewritten = applyLearnedCompactOutputTokenLimit(original, budget)
+	if got, ok := compactOutputTokenLimit(rewritten); !ok || got != 2048 {
+		t.Fatalf("ratcheted output-token cap = %d, %v, want 2048, true", got, ok)
+	}
+}
+
+func TestCompactRetryCancellation(t *testing.T) {
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := compactRetryCancellation(canceledCtx, errors.New("retry failed")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled context error = %v, want context.Canceled", err)
+	}
+
+	wrappedDeadline := fmt.Errorf("retry transport: %w", context.DeadlineExceeded)
+	if err := compactRetryCancellation(context.Background(), wrappedDeadline); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wrapped deadline error = %v, want context.DeadlineExceeded", err)
+	}
+	if err := compactRetryCancellation(context.Background(), errors.New("ordinary failure")); err != nil {
+		t.Fatalf("ordinary retry error classified as cancellation: %v", err)
 	}
 }
 
@@ -214,7 +327,6 @@ func TestCompactionContract_InternalCompactionNormalizesCallerControls(t *testin
 				"tool_choice",
 				"parallel_tool_calls",
 				"response_format",
-				"max_output_tokens",
 				"max_tokens",
 				"max_completion_tokens",
 				"stream",
@@ -224,6 +336,10 @@ func TestCompactionContract_InternalCompactionNormalizesCallerControls(t *testin
 				if _, ok := upstream[field]; ok {
 					t.Fatalf("internal compaction request must remove caller field %q: %s", field, upstream[field])
 				}
+			}
+
+			if got := rawJSONToIntForContract(t, upstream["max_output_tokens"]); got != internalCompactionMaxOutputTokens {
+				t.Fatalf("internal max_output_tokens = %d, want proxy cap %d", got, internalCompactionMaxOutputTokens)
 			}
 
 			text := rawJSONObjectForContract(t, upstream["text"])
@@ -967,6 +1083,15 @@ func rawJSONObjectForContract(t testing.TB, raw json.RawMessage) map[string]json
 		t.Fatalf("decode JSON object %s: %v", string(raw), err)
 	}
 	return item
+}
+
+func rawJSONToIntForContract(t testing.TB, raw json.RawMessage) int {
+	t.Helper()
+	var value int
+	if err := json.Unmarshal(raw, &value); err != nil {
+		t.Fatalf("decode JSON integer %s: %v", string(raw), err)
+	}
+	return value
 }
 
 func rawJSONToStringForContract(t testing.TB, raw json.RawMessage) string {
