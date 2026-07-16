@@ -2237,7 +2237,7 @@ func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
 	case "response.completed", "response.failed", "response.incomplete", "error":
 		t.terminalSeen = true
 	}
-	if eventName == "response.completed" || eventName == "response.failed" || eventName == "response.incomplete" {
+	if eventName == "response.completed" || eventName == "response.failed" || eventName == "response.incomplete" || eventName == "error" {
 		// Record token usage from every terminal event. Failed and incomplete
 		// responses can still carry billable partial usage. This is best-effort: a
 		// response.completed larger than responsesFailureTapMaxBuffer is dropped

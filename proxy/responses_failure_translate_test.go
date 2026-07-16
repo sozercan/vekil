@@ -1126,7 +1126,7 @@ func TestStreamResponsesPipeClassifiesUncodedRateLimitFromHeaders(t *testing.T) 
 
 func TestStreamResponsesPipeClassifiesTopLevelErrorEvent(t *testing.T) {
 	sse := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n" +
-		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"no_capacity\",\"message\":\"No capacity is available.\",\"headers\":{\"retry-after-ms\":\"1200\"}}}\n\n"
+		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"no_capacity\",\"message\":\"No capacity is available.\",\"headers\":{\"retry-after-ms\":\"1200\"}},\"response\":{\"id\":\"resp-error-usage\",\"usage\":{\"input_tokens\":11,\"output_tokens\":4,\"total_tokens\":15}}}\n\n"
 	ctx, summary := WithRequestSummary(context.Background())
 	rec := httptest.NewRecorder()
 	tap := newResponsesFailureTap(ctx, &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, nil, nil, "")
@@ -1140,11 +1140,19 @@ func TestStreamResponsesPipeClassifiesTopLevelErrorEvent(t *testing.T) {
 	if got := summary.FailureStatus(); got != http.StatusTooManyRequests {
 		t.Fatalf("FailureStatus = %d, want 429", got)
 	}
+	usage := readSummaryForStats(summary)
+	if usage.prompt != 11 || usage.completion != 4 || usage.total != 15 {
+		t.Fatalf("tap usage = prompt:%d completion:%d total:%d, want 11/4/15", usage.prompt, usage.completion, usage.total)
+	}
 
 	streamCtx, streamSummary := WithRequestSummary(context.Background())
 	streamResponsesPipeWithFailureLog(streamCtx, &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, rec, strings.NewReader(sse), nil, nil, "")
 	if got := streamSummary.FailureStatus(); got != http.StatusTooManyRequests {
 		t.Fatalf("stream FailureStatus = %d, want 429", got)
+	}
+	streamUsage := readSummaryForStats(streamSummary)
+	if streamUsage.prompt != 11 || streamUsage.completion != 4 || streamUsage.total != 15 {
+		t.Fatalf("stream usage = prompt:%d completion:%d total:%d, want 11/4/15", streamUsage.prompt, streamUsage.completion, streamUsage.total)
 	}
 	if got := rec.Body.String(); got != sse {
 		t.Fatalf("stream body altered. got %q want %q", got, sse)
