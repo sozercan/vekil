@@ -2300,28 +2300,6 @@ func responsesWebSocketErrorHeaders(status int, headers http.Header) http.Header
 	if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable && status != http.StatusGatewayTimeout {
 		return headers
 	}
-	if existingRA := strings.TrimSpace(headerGetCI(headers, "Retry-After")); existingRA != "" {
-		// Normalize the existing value through the clamped path so that very large
-		// provider-supplied values (e.g. 10000000000) do not escape the five-minute cap.
-		delay, ok := parseRetryAfter(existingRA)
-		if !ok || delay <= 0 {
-			return headers
-		}
-		// truncate to whole seconds; parseRetryAfter returns integer-second
-		// multiples for numeric inputs and clamps large values to maxRetryAfter.
-		normalized := strconv.FormatInt(int64(delay/time.Second), 10)
-		result := headers.Clone()
-		if result == nil {
-			result = make(http.Header)
-		}
-		for key := range result {
-			if strings.EqualFold(key, "Retry-After") {
-				delete(result, key)
-			}
-		}
-		result.Set("Retry-After", normalized)
-		return result
-	}
 	retryAfter, _ := selectResponsesRetryAfter(headers)
 	if retryAfter == "" {
 		return headers
@@ -2330,6 +2308,7 @@ func responsesWebSocketErrorHeaders(status int, headers http.Header) http.Header
 	if result == nil {
 		result = make(http.Header)
 	}
+	deleteHeaderCI(result, "Retry-After")
 	result.Set("Retry-After", retryAfter)
 	return result
 }

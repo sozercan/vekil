@@ -3296,6 +3296,21 @@ func TestResponsesWebSocketErrorHeadersClampsMassiveRetryAfter(t *testing.T) {
 	}
 }
 
+func TestResponsesWebSocketErrorHeadersFallsBackFromInvalidRetryAfter(t *testing.T) {
+	headers := http.Header{
+		"Retry-After":    []string{"not-a-delay"},
+		"retry-after-ms": []string{"1200"},
+	}
+
+	got := responsesWebSocketErrorHeaders(http.StatusTooManyRequests, headers)
+	if retryAfter := got.Get("Retry-After"); retryAfter != "2" {
+		t.Fatalf("Retry-After = %q, want fallback value 2; headers=%v", retryAfter, got)
+	}
+	if source := headers.Get("Retry-After"); source != "not-a-delay" {
+		t.Fatalf("source Retry-After = %q, want unchanged invalid value", source)
+	}
+}
+
 func TestHandleResponsesWebSocket_ResponseIncompleteKeepsSessionOpen(t *testing.T) {
 	var upstreamRequests atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {

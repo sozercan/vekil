@@ -1648,7 +1648,7 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 	}
 
 	if delay, ok := parseRetryAfter(strings.TrimSpace(headerGetCI(headers, "Retry-After"))); ok && delay > 0 {
-		return strconv.Itoa(int(delay / time.Second)), "Retry-After"
+		return strconv.FormatInt(durationSecondsCeil(delay), 10), "Retry-After"
 	}
 
 	var resetSeconds int64
