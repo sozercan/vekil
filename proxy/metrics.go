@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,7 +14,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-const metricsUnroutedModel = "unrouted"
+const (
+	metricsUnroutedModel     = "unrouted"
+	metricsModelEscapePrefix = "__vekil_model__:"
+)
 
 var llmRequestDurationBuckets = []float64{
 	0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
@@ -158,7 +162,7 @@ func (m *MetricsCollector) recordResponsesTurn(model, provider string, status in
 	m.requestsTotal.WithLabelValues(provider, model, "responses_ws", statusStr).Inc()
 	m.addTokens(provider, model, usage.InputTokens, usage.OutputTokens)
 
-	if upstreamAttempted && status >= http.StatusBadRequest {
+	if upstreamAttempted && status >= http.StatusBadRequest && status != 499 {
 		m.upstreamErrors.WithLabelValues(provider, model, statusStr).Inc()
 	}
 	return responsesTurnMetricsRecord{valid: true, provider: provider, model: model}
@@ -210,6 +214,7 @@ func (m *MetricsCollector) modelLabel(provider, model string, modelKnown bool) s
 	if provider == "" || !modelKnown || model == "" {
 		return metricsUnroutedModel
 	}
+	model = escapeMetricsModelLabel(model)
 
 	m.modelLabelsMu.Lock()
 	defer m.modelLabelsMu.Unlock()
@@ -220,6 +225,13 @@ func (m *MetricsCollector) modelLabel(provider, model string, modelKnown bool) s
 		return statsOtherKey
 	}
 	m.modelLabels[model] = struct{}{}
+	return model
+}
+
+func escapeMetricsModelLabel(model string) string {
+	if model == metricsUnroutedModel || model == statsOtherKey || strings.HasPrefix(model, metricsModelEscapePrefix) {
+		return metricsModelEscapePrefix + model
+	}
 	return model
 }
 

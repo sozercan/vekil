@@ -393,6 +393,52 @@ func TestMetricsCollector_ModelCardinalityBoundedAcrossFamilies(t *testing.T) {
 	}
 }
 
+func TestMetricsCollector_EscapesSyntheticModelLabelCollisions(t *testing.T) {
+	m := NewMetricsCollector()
+	tests := []struct {
+		model string
+		want  string
+	}{
+		{model: metricsUnroutedModel, want: metricsModelEscapePrefix + metricsUnroutedModel},
+		{model: statsOtherKey, want: metricsModelEscapePrefix + statsOtherKey},
+		{model: metricsModelEscapePrefix + statsOtherKey, want: metricsModelEscapePrefix + metricsModelEscapePrefix + statsOtherKey},
+		{model: "gpt-5.4", want: "gpt-5.4"},
+	}
+	for _, tt := range tests {
+		if got := m.modelLabel("provider", tt.model, true); got != tt.want {
+			t.Errorf("modelLabel(%q) = %q, want %q", tt.model, got, tt.want)
+		}
+	}
+	if got := m.modelLabel("provider", "anything", false); got != metricsUnroutedModel {
+		t.Errorf("unknown model label = %q, want %q", got, metricsUnroutedModel)
+	}
+}
+
+func TestMetricsCollector_WebSocketClientDisconnectIsNotUpstreamError(t *testing.T) {
+	m := NewMetricsCollector()
+	m.recordResponsesTurn("gpt-5.4", "copilot", 499, responsesUsage{}, true, true)
+
+	families, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	if got := getCounterValue(families, "vekil_requests_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": "gpt-5.4",
+		"endpoint":     "responses_ws",
+		"status":       "499",
+	}); got != 1 {
+		t.Fatalf("client-disconnect request metric = %v, want 1", got)
+	}
+	if got := getCounterValue(families, "vekil_upstream_errors_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": "gpt-5.4",
+		"code":         "499",
+	}); got != 0 {
+		t.Fatalf("client-disconnect upstream error metric = %v, want 0", got)
+	}
+}
+
 func TestMetricsCollector_DurationBucketsCoverLongInference(t *testing.T) {
 	m := NewMetricsCollector()
 	summary := &RequestSummary{}

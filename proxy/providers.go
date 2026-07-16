@@ -917,21 +917,12 @@ func filterProviderModels(provider *providerRuntime, models []providerModel) []p
 	}
 	filtered := make([]providerModel, 0, len(models))
 	for _, model := range models {
-		if isReservedMetricsModelLabel(model.publicID) || !provider.allowsModel(model.publicID) {
+		if !provider.allowsModel(model.publicID) {
 			continue
 		}
 		filtered = append(filtered, model)
 	}
 	return filtered
-}
-
-func isReservedMetricsModelLabel(model string) bool {
-	switch strings.TrimSpace(model) {
-	case metricsUnroutedModel, statsOtherKey:
-		return true
-	default:
-		return false
-	}
 }
 
 func needsDynamicProviderModelValidation(providers map[string]*providerRuntime) bool {
@@ -1001,9 +992,6 @@ func buildStaticProviderModel(providerID string, cfg ProviderModelConfig, defaul
 	publicID := strings.TrimSpace(cfg.PublicID)
 	if publicID == "" {
 		return providerModel{}, fmt.Errorf("provider %q contains a model without public_id", providerID)
-	}
-	if isReservedMetricsModelLabel(publicID) {
-		return providerModel{}, fmt.Errorf("provider %q model public_id %q is reserved for metrics aggregation", providerID, publicID)
 	}
 
 	upstreamModel := strings.TrimSpace(cfg.Deployment)

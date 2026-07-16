@@ -533,16 +533,6 @@ func TestBuildProvidersGenericValidation(t *testing.T) {
 			want: "no query string or fragment",
 		},
 		{
-			name: "reserved metrics model label",
-			cfg: ProviderConfig{
-				ID:      "local",
-				Type:    "openai-compatible",
-				BaseURL: "http://localhost:1234",
-				Models:  []ProviderModelConfig{{PublicID: metricsUnroutedModel}},
-			},
-			want: "reserved for metrics aggregation",
-		},
-		{
 			name: "bad discovery",
 			cfg: ProviderConfig{
 				ID:             "local",
@@ -564,6 +554,25 @@ func TestBuildProvidersGenericValidation(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("buildProviders() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildProvidersAllowsMetricsBucketModelIDs(t *testing.T) {
+	for _, publicID := range []string{metricsUnroutedModel, statsOtherKey, metricsModelEscapePrefix + statsOtherKey} {
+		t.Run(publicID, func(t *testing.T) {
+			handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+			_, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
+				ID:       "local",
+				Type:     "openai-compatible",
+				Default:  true,
+				BaseURL:  "http://localhost:1234",
+				AuthType: "none",
+				Models:   []ProviderModelConfig{{PublicID: publicID}},
+			}}})
+			if err != nil {
+				t.Fatalf("buildProviders() rejected public_id %q: %v", publicID, err)
 			}
 		})
 	}
@@ -1201,19 +1210,6 @@ func TestBuildProvidersAzureAuthModeValidation(t *testing.T) {
 				t.Fatalf("buildProviders() error = %v, want %q", err, tc.wantErr)
 			}
 		})
-	}
-}
-
-func TestFilterProviderModelsDropsReservedMetricsLabels(t *testing.T) {
-	provider := &providerRuntime{kind: providerTypeCopilot}
-	models := []providerModel{
-		{publicID: "valid-model"},
-		{publicID: metricsUnroutedModel},
-		{publicID: statsOtherKey},
-	}
-	got := filterProviderModels(provider, models)
-	if len(got) != 1 || got[0].publicID != "valid-model" {
-		t.Fatalf("filterProviderModels() = %+v, want only valid-model", got)
 	}
 }
 
