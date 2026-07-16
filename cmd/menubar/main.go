@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -173,6 +175,15 @@ func onReady() {
 	}()
 }
 
+func metricsDisabledFromEnv() bool {
+	value := os.Getenv("NO_METRICS")
+	if value == "" {
+		return false
+	}
+	disabled, err := strconv.ParseBool(value)
+	return err == nil && disabled
+}
+
 func startProxy() {
 	if providersConfigErr != nil {
 		title, message := providersConfigStartDialog(providersConfigErr)
@@ -199,6 +210,7 @@ func startProxy() {
 		proxyPort,
 		server.WithProxyOptions(
 			proxy.WithProvidersConfig(providersCfg),
+			proxy.WithMetricsEnabled(!metricsDisabledFromEnv()),
 			proxy.WithBuildInfo(buildVersion, buildCommit, runtime.Version()),
 		),
 	)
