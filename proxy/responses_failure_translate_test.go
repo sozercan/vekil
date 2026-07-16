@@ -77,6 +77,19 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantErrorMessage: "capacity",
 		},
 		{
+			name: "huge retry-after-ms is safely clamped",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-huge-retry-ms\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":   []string{"text/event-stream"},
+				"retry-after-ms": []string{"9223372036854775807"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "300",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "slow down",
+		},
+		{
 			name: "empty code with rate_limit_error still translates",
 			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-rate-limit-type\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}}\n\n",
 			headers: http.Header{
@@ -245,6 +258,20 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantStatus:       http.StatusTooManyRequests,
 			wantContentType:  "application/json",
 			wantRetryAfter:   "2",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Your requests have exceeded rate limit.",
+		},
+		{
+			name: "maximum duration reset is rounded without overflow",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-max-duration-reset\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"x-ratelimit-remaining-tokens": []string{"0"},
+				"x-ratelimit-reset-tokens":     []string{time.Duration(1<<63 - 1).String()},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "300",
 			wantErrorType:    "rate_limit_error",
 			wantErrorMessage: "Your requests have exceeded rate limit.",
 		},
@@ -636,6 +663,30 @@ func TestPeekAndForwardResponses_TranslatesFailureAtEOFWithoutSSEDelimiter(t *te
 	body, _ := io.ReadAll(result.Body)
 	if result.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429; body=%s", result.StatusCode, body)
+	}
+}
+
+func TestPeekAndForwardResponses_TranslatedFailureRecordsPartialUsage(t *testing.T) {
+	raw := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-precommit-usage\",\"error\":{\"code\":\"too_many_requests\",\"message\":\"slow down\"},\"usage\":{\"input_tokens\":11,\"output_tokens\":4,\"total_tokens\":15}}}\n\n"
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(raw)),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":true}`))
+	ctx, summary := WithRequestSummary(req.Context())
+	req = req.WithContext(ctx)
+	w := httptest.NewRecorder()
+	h := &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}
+
+	peekAndForwardResponsesWithConfig(h, w, req, resp, context.Background(), func() {}, "gpt-5.6-sol", time.Second, responsesPrecommitMaxPeekBytes, "")
+
+	if got := w.Result().StatusCode; got != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", got)
+	}
+	usage := readSummaryForStats(summary)
+	if usage.prompt != 11 || usage.completion != 4 || usage.total != 15 {
+		t.Fatalf("usage = prompt:%d completion:%d total:%d, want 11/4/15", usage.prompt, usage.completion, usage.total)
 	}
 }
 

@@ -1065,6 +1065,7 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 			streamErr := responsesStreamEventError(*result.failure)
 			errorCode = strings.TrimSpace(streamErr.Code)
 			errorParam = strings.TrimSpace(streamErr.Param)
+			observeResponsesUsage(r.Context(), result.failure.Response.Usage)
 		}
 		writeOpenAIErrorWithRetryAfterDetails(w, result.status, result.message, result.errType, result.retryAfter, failureHeaders, errorParam, errorCode)
 		return
@@ -1592,7 +1593,7 @@ func responsesQuotaResetSeconds(headers http.Header, dimension string) int64 {
 	if err != nil || delay <= 0 {
 		return 0
 	}
-	return int64((delay + time.Second - 1) / time.Second)
+	return durationSecondsCeil(delay)
 }
 
 func classifyPrecommitResponsesFailure(event responsesWebSocketStreamEvent) (int, string, bool) {
@@ -1631,11 +1632,12 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 	}
 
 	if value := strings.TrimSpace(headerGetCI(headers, "retry-after-ms")); value != "" {
-		ms, err := strconv.Atoi(value)
+		ms, err := strconv.ParseInt(value, 10, 64)
 		if err == nil && ms > 0 {
-			seconds := (ms + 999) / 1000
+			delay := retryAfterDurationFromMilliseconds(ms)
+			seconds := durationSecondsCeil(delay)
 			if seconds > 0 {
-				return strconv.Itoa(seconds), "retry-after-ms"
+				return strconv.FormatInt(seconds, 10), "retry-after-ms"
 			}
 		}
 	}

@@ -3115,7 +3115,7 @@ func TestHandleResponsesWebSocket_FirstEventTopLevelErrorSendsOnlyErrorFrame(t *
 	if !ok {
 		t.Fatalf("error payload type = %T, want object", errFrame["error"])
 	}
-	if errPayload["code"] != "no_capacity" || errPayload["message"] != "No capacity is available." {
+	if errPayload["type"] != "rate_limit_error" || errPayload["code"] != "no_capacity" || errPayload["message"] != "No capacity is available." {
 		t.Fatalf("error payload = %#v, want no_capacity message", errPayload)
 	}
 	headers, ok := errFrame["headers"].(map[string]interface{})
@@ -3160,7 +3160,7 @@ func TestHandleResponsesWebSocket_FirstEventRootErrorPreservesDiagnostics(t *tes
 	if !ok {
 		t.Fatalf("error payload type = %T, want object", errFrame["error"])
 	}
-	if errPayload["code"] != "invalid_prompt" || errPayload["message"] != "The prompt is invalid." || errPayload["param"] != "input" {
+	if errPayload["type"] != "invalid_request_error" || errPayload["code"] != "invalid_prompt" || errPayload["message"] != "The prompt is invalid." || errPayload["param"] != "input" {
 		t.Fatalf("error payload = %#v, want canonical root diagnostics", errPayload)
 	}
 	assertSingleResponsesWebSocketFailureStats(t, handler, http.StatusBadRequest)
@@ -3555,6 +3555,10 @@ func TestHandleResponsesWebSocket_TopLevelErrorAfterCreatedRelaysErrorAndWrapped
 	wrapped := mustReadWebSocketJSON(t, conn)
 	if wrapped["type"] != "error" || wrapped["status_code"] != float64(http.StatusTooManyRequests) {
 		t.Fatalf("wrapped error = %#v, want status 429", wrapped)
+	}
+	wrappedError, ok := wrapped["error"].(map[string]interface{})
+	if !ok || wrappedError["type"] != "rate_limit_error" {
+		t.Fatalf("wrapped error payload = %#v, want rate_limit_error", wrapped["error"])
 	}
 	headers, ok := wrapped["headers"].(map[string]interface{})
 	if !ok || headers["Retry-After"] != "2" {

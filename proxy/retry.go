@@ -114,6 +114,28 @@ func retryAfterDurationFromSeconds(seconds int64) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+func retryAfterDurationFromMilliseconds(milliseconds int64) time.Duration {
+	if milliseconds <= 0 {
+		return 0
+	}
+	maxMilliseconds := int64(maxRetryAfter / time.Millisecond)
+	if milliseconds >= maxMilliseconds {
+		return maxRetryAfter
+	}
+	return time.Duration(milliseconds) * time.Millisecond
+}
+
+func durationSecondsCeil(delay time.Duration) int64 {
+	if delay <= 0 {
+		return 0
+	}
+	seconds := int64(delay / time.Second)
+	if delay%time.Second != 0 {
+		seconds++
+	}
+	return seconds
+}
+
 // drainAndClose discards up to 4 KB from the body before closing it so that
 // HTTP/2 streams are cleanly consumed and the underlying connection can be
 // reused instead of being reset. The read is time-bounded because a response

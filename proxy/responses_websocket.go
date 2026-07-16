@@ -1317,7 +1317,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		if s.isClosing() || h.upstreamShutdownStarted() {
 			return context.Canceled
 		}
-		if writeErr := s.sendWrappedErrorDetails(peek.status, peek.message, code, param, translatedHeaders); writeErr != nil {
+		if writeErr := s.sendWrappedErrorDetails(peek.status, peek.message, peek.errType, code, param, translatedHeaders); writeErr != nil {
 			return writeErr
 		}
 		return nil
@@ -1974,10 +1974,10 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 		if !sawSemanticEvent {
 			sawSemanticEvent = true
 			if parsedEvent && (event.Type == "response.failed" || event.Type == "error") {
-				if status, _, ok := classifyResponsesFailure(event, headers); ok {
+				if status, errType, ok := classifyResponsesFailure(event, headers); ok {
 					failureHeaders := responsesFailureHeaders(event, headers)
 					streamErr := responsesStreamEventError(event)
-					if writeErr := s.sendWrappedErrorDetails(status, responsesPrecommitErrorMessage(event, status), strings.TrimSpace(streamErr.Code), strings.TrimSpace(streamErr.Param), failureHeaders); writeErr != nil {
+					if writeErr := s.sendWrappedErrorDetails(status, responsesPrecommitErrorMessage(event, status), errType, strings.TrimSpace(streamErr.Code), strings.TrimSpace(streamErr.Param), failureHeaders); writeErr != nil {
 						return writeErr
 					}
 					return &streamFailedUpstreamError{status: failureStatus}
@@ -2108,14 +2108,15 @@ func (s *responsesWebSocketSession) sendUpstreamStreamFailure(event responsesWeb
 	if status == 0 || strings.TrimSpace(message) == "" {
 		return nil
 	}
-	return s.sendWrappedErrorDetails(status, message, code, strings.TrimSpace(responsesStreamEventError(event).Param), headers)
+	errType := responsesWebSocketStreamFailureType(event, headers)
+	return s.sendWrappedErrorDetails(status, message, errType, code, strings.TrimSpace(responsesStreamEventError(event).Param), headers)
 }
 
 func (s *responsesWebSocketSession) sendWrappedError(status int, message, code string, headers http.Header) error {
-	return s.sendWrappedErrorDetails(status, message, code, "", headers)
+	return s.sendWrappedErrorDetails(status, message, "", code, "", headers)
 }
 
-func (s *responsesWebSocketSession) sendWrappedErrorDetails(status int, message, code, param string, headers http.Header) error {
+func (s *responsesWebSocketSession) sendWrappedErrorDetails(status int, message, errType, code, param string, headers http.Header) error {
 	payload := map[string]interface{}{
 		"type":        "error",
 		"status_code": status,
@@ -2125,6 +2126,9 @@ func (s *responsesWebSocketSession) sendWrappedErrorDetails(status int, message,
 	}
 	if code != "" {
 		payload["error"].(map[string]interface{})["code"] = code
+	}
+	if errType != "" {
+		payload["error"].(map[string]interface{})["type"] = errType
 	}
 	if param != "" {
 		payload["error"].(map[string]interface{})["param"] = param
@@ -2269,6 +2273,18 @@ func responsesWebSocketStreamFailureDetails(event responsesWebSocketStreamEvent,
 		return http.StatusConflict, "upstream response.incomplete: " + reason, reason
 	default:
 		return 0, "", ""
+	}
+}
+
+func responsesWebSocketStreamFailureType(event responsesWebSocketStreamEvent, headers http.Header) string {
+	switch event.Type {
+	case "response.failed", "error":
+		if _, errType, ok := classifyResponsesFailure(event, headers); ok {
+			return errType
+		}
+		return strings.TrimSpace(responsesStreamEventError(event).Type)
+	default:
+		return ""
 	}
 }
 
