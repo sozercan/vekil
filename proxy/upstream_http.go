@@ -341,7 +341,7 @@ func (h *ProxyHandler) postAnthropicMessages(ctx context.Context, body []byte, e
 func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
 	model := extractRequestModel(body)
 	if operation := routeOperationFromContext(ctx); operation != nil && operation.route != nil && !operation.route.legacy {
-		return h.executeExplicitRouteRequestPath(ctx, operation.route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, operation.route.public.id, false)
+		return h.executeExplicitRouteRequestPath(ctx, operation.route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)
 	}
 	if route, known := h.resolveModelRouteForRequest(model, providerEndpointMessages); known && route != nil && !route.legacy {
 		return h.executeExplicitRouteRequestPath(ctx, route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)

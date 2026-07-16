@@ -168,6 +168,87 @@ func TestPostJSONEndpointWithHeadersForModel_ExplicitRouteRewritesNormalizedAlia
 	}
 }
 
+func TestPostAnthropicMessagesCountTokens_ExplicitOperationRewritesNormalizedAliasToCanonicalTarget(t *testing.T) {
+	const (
+		requestedModel = "claude-sonnet-4-5"
+		canonicalModel = "claude-sonnet-4.5"
+	)
+
+	var calls atomic.Int32
+	forwardedModels := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path != providerEndpointMessagesCount {
+			t.Errorf("upstream path = %q, want %q", r.URL.Path, providerEndpointMessagesCount)
+		}
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		forwardedModels <- payload.Model
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"input_tokens":42}`)
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(ProvidersConfig{
+			SchemaVersion: ProvidersConfigSchemaVersion2,
+			Providers: []ProviderConfig{{
+				ID:       "explicit",
+				Type:     string(providerTypeAnthropicCompatible),
+				Default:  true,
+				BaseURL:  upstream.URL,
+				AuthType: "none",
+			}},
+			ModelRoutes: []ModelRouteConfig{{
+				ID:        "claude-route",
+				PublicID:  canonicalModel,
+				Endpoints: []string{providerEndpointMessages},
+				Targets: []ModelRouteTargetConfig{{
+					ID:            "target",
+					Provider:      "explicit",
+					UpstreamModel: canonicalModel,
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	defer handler.BeginShutdown()
+
+	ctx, operation, route, err := handler.withExplicitRouteOperation(context.Background(), context.Background(), requestedModel, providerEndpointMessages)
+	if err != nil {
+		t.Fatalf("withExplicitRouteOperation() error = %v", err)
+	}
+	if operation == nil || route == nil {
+		t.Fatal("withExplicitRouteOperation() did not create an explicit route operation")
+	}
+
+	body := []byte(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"count"}]}`)
+	resp, err := handler.postAnthropicMessagesCountTokens(ctx, body, nil)
+	if err != nil {
+		t.Fatalf("postAnthropicMessagesCountTokens() error = %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("upstream status = %d, want 200", resp.StatusCode)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", calls.Load())
+	}
+	if forwardedModel := <-forwardedModels; forwardedModel != canonicalModel {
+		t.Fatalf("upstream model = %q, want canonical %q", forwardedModel, canonicalModel)
+	}
+}
+
 func TestResolveProviderRequest_RewritesConfiguredResponsesModelToProviderDeployment(t *testing.T) {
 	handler := newProviderRoutingTestHandler(t, []string{"/responses"})
 

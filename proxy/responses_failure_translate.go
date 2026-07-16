@@ -1329,19 +1329,16 @@ func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.He
 }
 
 func responsesFailureOutputHasProgress(raw json.RawMessage) bool {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("[]")) || bytes.Equal(trimmed, []byte("{}")) || bytes.Equal(trimmed, []byte(`""`)) {
+	if len(raw) == 0 {
 		return false
 	}
 	var items []json.RawMessage
-	if json.Unmarshal(trimmed, &items) == nil {
-		return len(items) > 0
+	// Decoding into a slice accepts only null or an array. Any other shape or
+	// malformed JSON is ambiguous progress and must suppress replay/failover.
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &items); err != nil {
+		return true
 	}
-	var text string
-	if json.Unmarshal(trimmed, &text) == nil {
-		return strings.TrimSpace(text) != ""
-	}
-	return true
+	return len(items) > 0
 }
 
 func inspectResponsesPeekMessages(parser *responsesSSEParser, headers http.Header, peekState *responsesPeekState, preferTranslatedFailure bool) (peekResult, bool, bool) {

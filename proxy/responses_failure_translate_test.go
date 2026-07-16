@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -640,6 +641,86 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 				t.Fatalf("error.message = %q, want %q", envelope.Error.Message, tt.wantErrorMessage)
 			}
 		})
+	}
+}
+
+func TestResponsesFailureOutputHasProgress(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  json.RawMessage
+		want bool
+	}{
+		{name: "absent", raw: nil, want: false},
+		{name: "null", raw: json.RawMessage(`null`), want: false},
+		{name: "whitespace padded null", raw: json.RawMessage(" \n null\t"), want: false},
+		{name: "empty array", raw: json.RawMessage(`[]`), want: false},
+		{name: "whitespace padded empty array", raw: json.RawMessage(" \n [ ]\t"), want: false},
+		{name: "non-empty array", raw: json.RawMessage(`[{}]`), want: true},
+		{name: "object", raw: json.RawMessage(`{}`), want: true},
+		{name: "empty string", raw: json.RawMessage(`""`), want: true},
+		{name: "whitespace string", raw: json.RawMessage(`"   "`), want: true},
+		{name: "non-empty string", raw: json.RawMessage(`"partial"`), want: true},
+		{name: "number scalar", raw: json.RawMessage(`0`), want: true},
+		{name: "boolean scalar", raw: json.RawMessage(`false`), want: true},
+		{name: "whitespace only invalid json", raw: json.RawMessage(" \n\t"), want: true},
+		{name: "truncated invalid json", raw: json.RawMessage(`{`), want: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := responsesFailureOutputHasProgress(tt.raw); got != tt.want {
+				t.Fatalf("responsesFailureOutputHasProgress(%q) = %t, want %t", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExplicitRouteStreamingFailureWithNonArrayOutputDoesNotSwitch(t *testing.T) {
+	t.Parallel()
+
+	var secondaryCalls atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"output\":{},\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"late quota\"}}}\n\n")
+	}))
+	defer primary.Close()
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondaryCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-secondary\",\"output\":[]}}\n\n")
+	}))
+	defer secondary.Close()
+
+	h, route := explicitRouteTestHandler(t, http.DefaultClient, routeModePriorityFailover, 2, 2,
+		explicitRouteTestProvider("primary", primary.URL, "one"),
+		explicitRouteTestProvider("secondary", secondary.URL, "two"),
+	)
+	requestCtx, summary := WithRequestSummary(context.Background())
+	ctx := withRouteOperation(requestCtx, newRouteOperation(route, requestCtx))
+	resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model","stream":true}`), nil, "public-model", true)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if resp == nil {
+		t.Fatal("response = nil, want original failed stream")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		t.Fatalf("read response: %v", readErr)
+	}
+	if !strings.Contains(string(body), `"output":{}`) {
+		t.Fatalf("body = %s, want original ambiguous output", body)
+	}
+	if got := secondaryCalls.Load(); got != 0 {
+		t.Fatalf("secondary calls = %d, want 0", got)
+	}
+	if got := summary.TargetSwitchCount(); got != 0 {
+		t.Fatalf("target switches = %d, want 0", got)
 	}
 }
 
