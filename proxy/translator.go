@@ -100,12 +100,15 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 	// MaxTokens
 	oaiReq.MaxTokens = req.MaxTokens
 
-	// Anthropic's thinking budget is part of max_tokens, while OpenAI's
+	// Anthropic's thinking budget is normally part of max_tokens, while OpenAI's
 	// max_completion_tokens caps reasoning plus visible output together. Preserve
-	// the caller's total generation limit instead of shrinking it to the internal
-	// reasoning budget.
+	// max_tokens as the total limit for ordinary thinking, but never cap below an
+	// interleaved-thinking budget that Anthropic allows to exceed max_tokens.
 	if req.Thinking != nil && req.Thinking.Type == "enabled" && req.MaxTokens != nil {
 		tokens := *req.MaxTokens
+		if req.Thinking.BudgetTokens != nil && *req.Thinking.BudgetTokens > tokens {
+			tokens = *req.Thinking.BudgetTokens
+		}
 		oaiReq.MaxCompletionTokens = &tokens
 		oaiReq.MaxTokens = nil
 	}

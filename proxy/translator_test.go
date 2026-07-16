@@ -389,6 +389,27 @@ func TestTranslateAnthropicToOpenAI(t *testing.T) {
 		}
 	})
 
+	t.Run("interleaved thinking budget above max tokens", func(t *testing.T) {
+		req := &models.AnthropicRequest{
+			Model:     "claude-opus-4-5",
+			MaxTokens: intPtr(4096),
+			Messages: []models.AnthropicMessage{
+				{Role: "user", Content: json.RawMessage(`"Use tools and keep thinking"`)},
+			},
+			Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(8192)},
+		}
+		got, err := TranslateAnthropicToOpenAI(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.MaxCompletionTokens == nil || *got.MaxCompletionTokens != 8192 {
+			t.Errorf("MaxCompletionTokens = %v, want interleaved thinking budget 8192", got.MaxCompletionTokens)
+		}
+		if got.MaxTokens != nil {
+			t.Errorf("MaxTokens should be nil when thinking is enabled, got %v", *got.MaxTokens)
+		}
+	})
+
 	t.Run("thinking/disabled", func(t *testing.T) {
 		req := &models.AnthropicRequest{
 			Model:     "claude-3-opus",
