@@ -165,8 +165,15 @@ func explicitResponsesItemOwnsEncryptedContent(item map[string]any) bool {
 }
 
 func isProxyOwnedEncryptedContent(value string) bool {
-	return strings.HasPrefix(value, syntheticCompactionPrefix) ||
-		strings.HasPrefix(value, legacySyntheticCompactionPrefix)
+	// A recognized prefix is not sufficient proof of proxy ownership. If the
+	// checkpoint cannot be decoded, preserve it as provider state so explicit
+	// routes fail closed instead of forwarding opaque content unbound.
+	if !strings.HasPrefix(value, syntheticCompactionPrefix) &&
+		!strings.HasPrefix(value, legacySyntheticCompactionPrefix) {
+		return false
+	}
+	_, ok := extractSyntheticOrLegacyCompactionSummary(value)
+	return ok
 }
 
 func extractExplicitResponsesOutputState(body []byte) ([]stateBindingToken, error) {

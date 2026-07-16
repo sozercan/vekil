@@ -1457,14 +1457,19 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 	setup := h.providerSetup()
 	canonicalRefresh := isCanonicalModelsQuery(rawQuery)
 	rawEntries := make([]json.RawMessage, 0)
-	owners := make(map[string]string)
+	owners := make(map[string]mergedModelReservation)
 	if registry := setup.routeRegistry(); registry != nil {
 		for _, route := range registry.explicitRoutes() {
 			if route == nil {
 				continue
 			}
-			for _, alias := range configuredPublicModelAliases(route.public.id) {
-				owners[alias] = route.public.routeID
+			reservation := mergedModelReservation{
+				ownerID:     route.public.routeID,
+				rawPublicID: strings.TrimSpace(route.public.id),
+				ownerType:   mergedModelOwnerExplicitRoute,
+			}
+			for _, alias := range configuredPublicModelAliases(reservation.rawPublicID) {
+				owners[alias] = reservation
 			}
 			rawEntries = append(rawEntries, append(json.RawMessage(nil), route.public.raw...))
 		}
@@ -1552,30 +1557,51 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 	}, false, nil
 }
 
+type mergedModelOwnerType uint8
+
+const (
+	mergedModelOwnerProvider mergedModelOwnerType = iota
+	mergedModelOwnerExplicitRoute
+)
+
+type mergedModelReservation struct {
+	ownerID     string
+	rawPublicID string
+	ownerType   mergedModelOwnerType
+}
+
 // reserveMergedModelOwner reserves both the raw public ID and every normalized
 // request alias before a provider model is exposed in any /models response.
 // Exact duplicates from the same provider retain the historical first-entry
 // behavior; distinct IDs that share an alias are collisions even within one
 // provider, matching the strict version-2 route registry.
-func reserveMergedModelOwner(owners map[string]string, model providerModel) (bool, error) {
+func reserveMergedModelOwner(owners map[string]mergedModelReservation, model providerModel) (bool, error) {
 	publicID := strings.TrimSpace(model.publicID)
-	if existingOwner, exists := owners[publicID]; exists {
-		if existingOwner == model.providerID {
-			return false, nil
-		}
-		return false, providerModelCollisionError(publicID, existingOwner, model.providerID)
+	reservation := mergedModelReservation{
+		ownerID:     model.providerID,
+		rawPublicID: publicID,
+		ownerType:   mergedModelOwnerProvider,
 	}
 	aliases := configuredPublicModelAliases(publicID)
+	duplicate := false
 	for _, alias := range aliases {
-		if alias == publicID {
+		existing, exists := owners[alias]
+		if !exists {
 			continue
 		}
-		if existingOwner, exists := owners[alias]; exists {
-			return false, providerModelCollisionError(alias, existingOwner, model.providerID)
+		if existing.ownerType == reservation.ownerType &&
+			existing.ownerID == reservation.ownerID &&
+			existing.rawPublicID == reservation.rawPublicID {
+			duplicate = true
+			continue
 		}
+		return false, providerModelCollisionError(alias, existing.ownerID, model.providerID)
+	}
+	if duplicate {
+		return false, nil
 	}
 	for _, alias := range aliases {
-		owners[alias] = model.providerID
+		owners[alias] = reservation
 	}
 	return true, nil
 }

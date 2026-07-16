@@ -8366,6 +8366,202 @@ func TestNewProxyHandler_RejectsMultipleCopilotProviders(t *testing.T) {
 	}
 }
 
+func TestReserveMergedModelOwner_IsOrderIndependent(t *testing.T) {
+	model := func(providerID, publicID, marker string) providerModel {
+		return providerModel{
+			providerID: providerID,
+			publicID:   publicID,
+			raw:        json.RawMessage(fmt.Sprintf(`{"id":%q,"marker":%q}`, publicID, marker)),
+		}
+	}
+
+	tests := []struct {
+		name            string
+		models          []providerModel
+		wantErr         bool
+		wantCollisionID string
+		wantOwners      []string
+	}{
+		{
+			name: "same provider normalized aliases",
+			models: []providerModel{
+				model("dynamic", "claude-sonnet-4-5", "dashed"),
+				model("dynamic", "claude-sonnet-4.5", "dotted"),
+			},
+			wantErr:         true,
+			wantCollisionID: "claude-sonnet-4.5",
+			wantOwners:      []string{"dynamic"},
+		},
+		{
+			name: "true exact duplicates",
+			models: []providerModel{
+				model("dynamic", "claude-sonnet-4-5", "first"),
+				model("dynamic", "claude-sonnet-4-5", "second"),
+			},
+		},
+		{
+			name: "different provider exact collision",
+			models: []providerModel{
+				model("first", "gpt-5.4", "first"),
+				model("second", "gpt-5.4", "second"),
+			},
+			wantErr:         true,
+			wantCollisionID: "gpt-5.4",
+			wantOwners:      []string{"first", "second"},
+		},
+		{
+			name: "different provider normalized alias collision",
+			models: []providerModel{
+				model("first", "claude-sonnet-4-5", "dashed"),
+				model("second", "claude-sonnet-4.5", "dotted"),
+			},
+			wantErr:         true,
+			wantCollisionID: "claude-sonnet-4.5",
+			wantOwners:      []string{"first", "second"},
+		},
+	}
+
+	for _, tc := range tests {
+		for _, reversed := range []bool{false, true} {
+			orderName := "forward"
+			ordered := append([]providerModel(nil), tc.models...)
+			if reversed {
+				orderName = "reversed"
+				ordered[0], ordered[1] = ordered[1], ordered[0]
+			}
+			t.Run(tc.name+"/"+orderName, func(t *testing.T) {
+				owners := make(map[string]mergedModelReservation)
+				appended := make([]json.RawMessage, 0, len(ordered))
+				var gotErr error
+				for _, candidate := range ordered {
+					appendModel, err := reserveMergedModelOwner(owners, candidate)
+					if err != nil {
+						gotErr = err
+						break
+					}
+					if appendModel {
+						appended = append(appended, candidate.raw)
+					}
+				}
+
+				if tc.wantErr {
+					if gotErr == nil {
+						t.Fatal("reserveMergedModelOwner() error = nil, want collision")
+					}
+					if !strings.Contains(gotErr.Error(), tc.wantCollisionID) {
+						t.Fatalf("collision error = %v, want model %q", gotErr, tc.wantCollisionID)
+					}
+					for _, owner := range tc.wantOwners {
+						if !strings.Contains(gotErr.Error(), owner) {
+							t.Fatalf("collision error = %v, want owner %q", gotErr, owner)
+						}
+					}
+				} else if gotErr != nil {
+					t.Fatalf("reserveMergedModelOwner() error = %v, want exact duplicate to be skipped", gotErr)
+				}
+				if len(appended) != 1 {
+					t.Fatalf("appended entries = %d, want first entry only", len(appended))
+				}
+				if got, want := string(appended[0]), string(ordered[0].raw); got != want {
+					t.Fatalf("appended entry = %s, want first catalog entry %s", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestHandleModels_RejectsSameProviderAliasCollisionsInAnyCatalogOrder(t *testing.T) {
+	orders := [][]string{
+		{"claude-sonnet-4-5", "claude-sonnet-4.5"},
+		{"claude-sonnet-4.5", "claude-sonnet-4-5"},
+	}
+	requests := []struct {
+		name string
+		path string
+	}{
+		{name: "canonical", path: "/v1/models"},
+		{name: "query variant", path: "/v1/models?view=variant"},
+	}
+
+	for _, request := range requests {
+		for orderIndex, order := range orders {
+			orderName := "dashed first"
+			if orderIndex == 1 {
+				orderName = "dotted first"
+			}
+			t.Run(request.name+"/"+orderName, func(t *testing.T) {
+				var queriesMu sync.Mutex
+				queries := make([]string, 0, 2)
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path != providerEndpointModels {
+						t.Fatalf("upstream path = %q, want %q", r.URL.Path, providerEndpointModels)
+					}
+					queriesMu.Lock()
+					queries = append(queries, r.URL.RawQuery)
+					queriesMu.Unlock()
+
+					modelIDs := order
+					if request.path != "/v1/models" && r.URL.RawQuery == "" {
+						modelIDs = []string{"safe-canonical-model"}
+					}
+					data := make([]map[string]any, 0, len(modelIDs))
+					for _, modelID := range modelIDs {
+						data = append(data, map[string]any{
+							"id":                  modelID,
+							"object":              "model",
+							"owned_by":            "dynamic",
+							"supported_endpoints": []string{providerEndpointResponses},
+						})
+					}
+					w.Header().Set("Content-Type", "application/json")
+					if err := json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data}); err != nil {
+						t.Errorf("encode model catalog: %v", err)
+					}
+				}))
+				defer upstream.Close()
+
+				h, err := NewProxyHandler(
+					auth.NewTestAuthenticator("test-token"),
+					logger.NewWithWriter(logger.LevelError, io.Discard),
+					WithDeferredDynamicProviderModelValidation(true),
+					WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+						ID:             "dynamic",
+						Type:           string(providerTypeOpenAICompatible),
+						Default:        true,
+						BaseURL:        upstream.URL,
+						AuthType:       "none",
+						ModelDiscovery: string(providerModelDiscoveryOpenAI),
+					}}}),
+				)
+				if err != nil {
+					t.Fatalf("NewProxyHandler() error = %v", err)
+				}
+				defer h.BeginShutdown()
+
+				w := httptest.NewRecorder()
+				h.HandleModels(w, httptest.NewRequest(http.MethodGet, request.path, nil))
+				resp := w.Result()
+				defer func() { _ = resp.Body.Close() }()
+				if resp.StatusCode != http.StatusBadGateway {
+					body, _ := io.ReadAll(resp.Body)
+					t.Fatalf("HandleModels() status = %d, want %d: %s", resp.StatusCode, http.StatusBadGateway, body)
+				}
+
+				queriesMu.Lock()
+				gotQueries := append([]string(nil), queries...)
+				queriesMu.Unlock()
+				wantQueries := []string{""}
+				if request.path != "/v1/models" {
+					wantQueries = append(wantQueries, "view=variant")
+				}
+				if !reflect.DeepEqual(gotQueries, wantQueries) {
+					t.Fatalf("upstream queries = %v, want %v", gotQueries, wantQueries)
+				}
+			})
+		}
+	}
+}
+
 func TestNewProxyHandler_AllowsDuplicateModelIDsWithinSameProvider(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 

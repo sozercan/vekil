@@ -91,12 +91,12 @@ func contextCompactionStateRequestBody(t *testing.T, token string) []byte {
 	return body
 }
 
-func syntheticCompactionStateRequestBody(t *testing.T, summary string, includeSyntheticLineage bool) []byte {
+func proxyCompactionStateRequestBody(t *testing.T, token string, includeSyntheticLineage bool) []byte {
 	t.Helper()
 	body := map[string]any{
 		"model": "public-model",
 		"input": []any{
-			map[string]any{"type": "compaction", "encrypted_content": encodeSyntheticCompaction(summary)},
+			map[string]any{"type": "compaction", "encrypted_content": token},
 			map[string]any{"type": "message", "role": "user", "content": "continue"},
 		},
 	}
@@ -108,6 +108,37 @@ func syntheticCompactionStateRequestBody(t *testing.T, summary string, includeSy
 		t.Fatalf("json.Marshal() error = %v", err)
 	}
 	return encoded
+}
+
+func TestExplicitResponsesRoutesRejectMalformedProxyCheckpointsBeforeDispatch(t *testing.T) {
+	endpoints := []struct {
+		name   string
+		path   string
+		handle func(*ProxyHandler, http.ResponseWriter, *http.Request)
+	}{
+		{name: "responses", path: "/v1/responses", handle: (*ProxyHandler).HandleResponses},
+		{name: "compact", path: "/v1/responses/compact", handle: (*ProxyHandler).HandleCompact},
+	}
+
+	for _, endpoint := range endpoints {
+		t.Run(endpoint.name, func(t *testing.T) {
+			for _, tc := range malformedSyntheticCheckpointTokensForTest(t) {
+				t.Run(tc.name, func(t *testing.T) {
+					h, _, primary, secondary := newExplicitResponsesStateBindingHandler(t)
+					body := proxyCompactionStateRequestBody(t, tc.token, false)
+					w := httptest.NewRecorder()
+					endpoint.handle(h, w, httptest.NewRequest(http.MethodPost, endpoint.path, bytes.NewReader(body)))
+
+					if w.Code != http.StatusBadRequest {
+						t.Fatalf("status = %d body=%s, want 400", w.Code, w.Body.String())
+					}
+					if primary.calls.Load() != 0 || secondary.calls.Load() != 0 {
+						t.Fatalf("malformed checkpoint reached upstream: primary=%d secondary=%d", primary.calls.Load(), secondary.calls.Load())
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestHandleResponsesValidatesContextCompactionStateBeforeSanitizing(t *testing.T) {
@@ -141,31 +172,38 @@ func TestHandleResponsesValidatesContextCompactionStateBeforeSanitizing(t *testi
 		}
 	})
 
-	t.Run("proxy checkpoint keeps synthetic lineage compatibility", func(t *testing.T) {
-		const summary = "proxy checkpoint summary for state binding"
-		h, _, primary, secondary := newExplicitResponsesStateBindingHandler(t)
-		req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(syntheticCompactionStateRequestBody(t, summary, true)))
-		req.Header.Set("X-Codex-Turn-State", "stale synthetic turn state")
-		w := httptest.NewRecorder()
-		h.HandleResponses(w, req)
+	for _, checkpoint := range []struct {
+		name  string
+		token string
+	}{
+		{name: "current", token: encodeSyntheticCompaction("current proxy checkpoint summary for state binding")},
+		{name: "legacy", token: syntheticCheckpointTokenForTest(t, legacySyntheticCompactionPrefix, "legacy proxy checkpoint summary for state binding")},
+	} {
+		t.Run("proxy "+checkpoint.name+" checkpoint keeps synthetic lineage compatibility", func(t *testing.T) {
+			h, _, primary, secondary := newExplicitResponsesStateBindingHandler(t)
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(proxyCompactionStateRequestBody(t, checkpoint.token, true)))
+			req.Header.Set("X-Codex-Turn-State", "stale synthetic turn state")
+			w := httptest.NewRecorder()
+			h.HandleResponses(w, req)
 
-		if w.Code != http.StatusOK {
-			t.Fatalf("status = %d body=%s, want 200", w.Code, w.Body.String())
-		}
-		if primary.calls.Load() != 1 || secondary.calls.Load() != 0 {
-			t.Fatalf("proxy checkpoint calls primary=%d secondary=%d, want 1/0", primary.calls.Load(), secondary.calls.Load())
-		}
-		body, headers := primary.onlyRequest(t)
-		if bytes.Contains(body, []byte(syntheticCompactionResponseIDPrefix)) {
-			t.Fatalf("upstream body retained synthetic response lineage: %s", body)
-		}
-		if bytes.Contains(body, []byte(syntheticCompactionPrefix)) || !bytes.Contains(body, []byte(summary)) {
-			t.Fatalf("upstream body did not expand proxy checkpoint: %s", body)
-		}
-		if got := headers.Get("X-Codex-Turn-State"); got != "" {
-			t.Fatalf("upstream X-Codex-Turn-State = %q, want empty", got)
-		}
-	})
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%s, want 200", w.Code, w.Body.String())
+			}
+			if primary.calls.Load() != 1 || secondary.calls.Load() != 0 {
+				t.Fatalf("proxy checkpoint calls primary=%d secondary=%d, want 1/0", primary.calls.Load(), secondary.calls.Load())
+			}
+			body, headers := primary.onlyRequest(t)
+			if bytes.Contains(body, []byte(syntheticCompactionResponseIDPrefix)) {
+				t.Fatalf("upstream body retained synthetic response lineage: %s", body)
+			}
+			if bytes.Contains(body, []byte(checkpoint.token)) || !bytes.Contains(body, []byte("proxy checkpoint summary for state binding")) {
+				t.Fatalf("upstream body did not expand proxy checkpoint: %s", body)
+			}
+			if got := headers.Get("X-Codex-Turn-State"); got != "" {
+				t.Fatalf("upstream X-Codex-Turn-State = %q, want empty", got)
+			}
+		})
+	}
 }
 
 func TestHandleCompactValidatesContextCompactionStateBeforeSanitizing(t *testing.T) {
@@ -199,21 +237,37 @@ func TestHandleCompactValidatesContextCompactionStateBeforeSanitizing(t *testing
 		}
 	})
 
-	t.Run("proxy checkpoint keeps synthetic rewrite compatibility", func(t *testing.T) {
-		const summary = "proxy compact checkpoint summary for state binding"
-		h, _, primary, secondary := newExplicitResponsesStateBindingHandler(t)
-		w := httptest.NewRecorder()
-		h.HandleCompact(w, httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(syntheticCompactionStateRequestBody(t, summary, false))))
+	for _, checkpoint := range []struct {
+		name    string
+		summary string
+		token   string
+	}{
+		{
+			name:    "current",
+			summary: "current proxy compact checkpoint summary for state binding",
+			token:   encodeSyntheticCompaction("current proxy compact checkpoint summary for state binding"),
+		},
+		{
+			name:    "legacy",
+			summary: "legacy proxy compact checkpoint summary for state binding",
+			token:   syntheticCheckpointTokenForTest(t, legacySyntheticCompactionPrefix, "legacy proxy compact checkpoint summary for state binding"),
+		},
+	} {
+		t.Run("proxy "+checkpoint.name+" checkpoint keeps synthetic rewrite compatibility", func(t *testing.T) {
+			h, _, primary, secondary := newExplicitResponsesStateBindingHandler(t)
+			w := httptest.NewRecorder()
+			h.HandleCompact(w, httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(proxyCompactionStateRequestBody(t, checkpoint.token, false))))
 
-		if w.Code != http.StatusOK {
-			t.Fatalf("status = %d body=%s, want 200", w.Code, w.Body.String())
-		}
-		if primary.calls.Load() != 1 || secondary.calls.Load() != 0 {
-			t.Fatalf("proxy compact checkpoint calls primary=%d secondary=%d, want 1/0", primary.calls.Load(), secondary.calls.Load())
-		}
-		body, _ := primary.onlyRequest(t)
-		if bytes.Contains(body, []byte(syntheticCompactionPrefix)) || !strings.Contains(string(body), summary) {
-			t.Fatalf("upstream compact body did not expand proxy checkpoint: %s", body)
-		}
-	})
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%s, want 200", w.Code, w.Body.String())
+			}
+			if primary.calls.Load() != 1 || secondary.calls.Load() != 0 {
+				t.Fatalf("proxy compact checkpoint calls primary=%d secondary=%d, want 1/0", primary.calls.Load(), secondary.calls.Load())
+			}
+			body, _ := primary.onlyRequest(t)
+			if bytes.Contains(body, []byte(checkpoint.token)) || !strings.Contains(string(body), checkpoint.summary) {
+				t.Fatalf("upstream compact body did not expand proxy checkpoint: %s", body)
+			}
+		})
+	}
 }

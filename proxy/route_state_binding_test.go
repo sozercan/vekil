@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -90,6 +92,80 @@ func TestExtractExplicitResponsesRequestStateOnlyReadsResponseItems(t *testing.T
 			}
 			requireStateBindingTokens(t, got, tc.wantTokens)
 		})
+	}
+}
+
+func TestIsProxyOwnedEncryptedContentRequiresDecodableSyntheticCheckpoint(t *testing.T) {
+	validPayload, err := json.Marshal(syntheticCompactionPayload{Summary: "valid checkpoint"})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	validEncoded := base64.RawURLEncoding.EncodeToString(validPayload)
+	malformedEncoded := base64.RawURLEncoding.EncodeToString([]byte(`{"summary":`))
+
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "current checkpoint", value: syntheticCompactionPrefix + validEncoded, want: true},
+		{name: "legacy checkpoint", value: legacySyntheticCompactionPrefix + validEncoded, want: true},
+		{name: "review example malformed token", value: syntheticCompactionPrefix + "not-base64"},
+		{name: "current malformed base64", value: syntheticCompactionPrefix + "***"},
+		{name: "legacy malformed base64", value: legacySyntheticCompactionPrefix + "***"},
+		{name: "current malformed payload", value: syntheticCompactionPrefix + malformedEncoded},
+		{name: "legacy malformed payload", value: legacySyntheticCompactionPrefix + malformedEncoded},
+		{name: "unsupported version", value: "vekil.compaction.v2:" + validEncoded},
+		{name: "missing version", value: "vekil.compaction:" + validEncoded},
+		{name: "lookalike prefix", value: "x" + syntheticCompactionPrefix + validEncoded},
+		{name: "current prefix only", value: syntheticCompactionPrefix},
+		{name: "legacy prefix only", value: legacySyntheticCompactionPrefix},
+		{name: "legacy plaintext summary", value: "legacy plaintext checkpoint summary"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isProxyOwnedEncryptedContent(tc.value); got != tc.want {
+				t.Fatalf("isProxyOwnedEncryptedContent(%q) = %v, want %v", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+func syntheticCheckpointTokenForTest(t *testing.T, prefix, summary string) string {
+	t.Helper()
+	payload, err := json.Marshal(syntheticCompactionPayload{Summary: summary})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	return prefix + base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func malformedSyntheticCheckpointTokensForTest(t *testing.T) []struct {
+	name  string
+	token string
+} {
+	t.Helper()
+	validPayload, err := json.Marshal(syntheticCompactionPayload{Summary: "valid checkpoint"})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	validEncoded := base64.RawURLEncoding.EncodeToString(validPayload)
+	malformedEncoded := base64.RawURLEncoding.EncodeToString([]byte(`{"summary":`))
+
+	return []struct {
+		name  string
+		token string
+	}{
+		{name: "review example malformed token", token: syntheticCompactionPrefix + "not-base64"},
+		{name: "current malformed base64", token: syntheticCompactionPrefix + "***"},
+		{name: "legacy malformed base64", token: legacySyntheticCompactionPrefix + "***"},
+		{name: "current malformed payload", token: syntheticCompactionPrefix + malformedEncoded},
+		{name: "legacy malformed payload", token: legacySyntheticCompactionPrefix + malformedEncoded},
+		{name: "unsupported version", token: "vekil.compaction.v2:" + validEncoded},
+		{name: "malformed prefix", token: "vekil.compaction.v1" + validEncoded},
+		{name: "current prefix only", token: syntheticCompactionPrefix},
+		{name: "legacy prefix only", token: legacySyntheticCompactionPrefix},
 	}
 }
 
