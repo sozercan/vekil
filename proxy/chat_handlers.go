@@ -81,9 +81,9 @@ func (h *ProxyHandler) executeChatCompletionsRouteRequestForModel(ctx context.Co
 	return h.executeExplicitRouteSurfaceRequest(ctx, providerEndpointChatCompletions, mode.clientRequestedStream, explicitRouteStreamOpenAIChat, send)
 }
 
-func (h *ProxyHandler) executeAnthropicMessagesRouteRequest(ctx context.Context, body []byte, headers http.Header, streaming bool) (*http.Response, error) {
+func (h *ProxyHandler) executeAnthropicMessagesRouteRequest(ctx context.Context, body []byte, headers http.Header, streaming bool, model string) (*http.Response, error) {
 	send := func(attemptCtx context.Context) (*http.Response, error) {
-		return h.postAnthropicMessages(attemptCtx, body, headers)
+		return h.postJSONEndpointWithHeadersForModel(attemptCtx, providerEndpointMessages, body, headers, model)
 	}
 	return h.executeExplicitRouteSurfaceRequest(ctx, providerEndpointMessages, streaming, explicitRouteStreamAnthropic, send)
 }
@@ -173,7 +173,8 @@ func (h *ProxyHandler) executeExplicitRouteSurfaceRequest(ctx context.Context, e
 				result.failure.statusCode = status
 				decision, retry := h.explicitRouteRetryDecision(ctx, operation, endpoint)
 				if retry {
-					if !prepared.abortAndWait(ctx) {
+					if !prepared.abortAndWait(upstreamErrorDetailDrainTimeout) {
+						operation.reclassifyAcceptedRouteAttempt(info.targetID, result.failure.statusCode, requestDeliveredOrAmbiguous, upstreamProgressUnknown, downstreamCommitmentNone, routeRetrySuppressedLifecycle, responsesUpstreamRequestID(resp.Header), false, false)
 						return nil, fmt.Errorf("failed to clean up rejected stream attempt before failover")
 					}
 					if canonical == nil {
@@ -469,26 +470,29 @@ func explicitRoutePublicModel(route *modelRoute, fallback string) string {
 	return fallback
 }
 
-func normalizeExplicitOpenAIChatResponseModel(resp *http.Response, publicModel string) {
+func normalizeExplicitOpenAIChatResponseModel(resp *http.Response, publicModel string) error {
 	if resp == nil || resp.Body == nil || resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return
+		return nil
 	}
 	if _, ok := explicitRouteResponseInfoFromResponse(resp); !ok {
-		return
+		return nil
 	}
 	publicModel = strings.TrimSpace(publicModel)
 	if publicModel == "" {
-		return
+		return nil
+	}
+
+	bodyReader := newLifecycleAwareReadCloser(resp.Body, responseRequestContext(resp))
+	defer func() { _ = bodyReader.Close() }()
+	prefix, err := io.ReadAll(io.LimitReader(bodyReader, maxLargeRequestBodySize+1))
+	if bodyReader.canceledAtFailure() {
+		return newResponseBodyWriteError(resp, context.Canceled, false, true, true)
+	}
+	if err != nil {
+		return newResponseBodyWriteError(resp, err, false, true, false)
 	}
 	normalizeExplicitModelHeaders(resp.Header, publicModel)
-	originalBody := resp.Body
-	prefix, err := io.ReadAll(io.LimitReader(originalBody, maxLargeRequestBodySize+1))
-	if err != nil {
-		resp.Body = prefixedReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), originalBody), close: originalBody.Close}
-		return
-	}
 	if len(prefix) > maxLargeRequestBodySize {
-		_ = originalBody.Close()
 		body := []byte(`{"error":{"message":"explicit route chat response exceeds model-normalization limit","type":"server_error"}}`)
 		resp.StatusCode = http.StatusBadGateway
 		resp.Status = "502 Bad Gateway"
@@ -496,9 +500,8 @@ func normalizeExplicitOpenAIChatResponseModel(resp *http.Response, publicModel s
 		resp.ContentLength = int64(len(body))
 		resp.Header.Set("Content-Type", "application/json")
 		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
-		return
+		return nil
 	}
-	_ = originalBody.Close()
 	var payload map[string]json.RawMessage
 	if json.Unmarshal(prefix, &payload) == nil && payload != nil && !hasNonNullJSONField(payload, "error") {
 		payload["model"] = mustMarshalRaw(publicModel)
@@ -509,6 +512,7 @@ func normalizeExplicitOpenAIChatResponseModel(resp *http.Response, publicModel s
 	resp.Body = io.NopCloser(bytes.NewReader(prefix))
 	resp.ContentLength = int64(len(prefix))
 	resp.Header.Del("Content-Length")
+	return nil
 }
 
 func explicitAnthropicResponseModels(operation *routeOperation, resp *http.Response, fallbackPublic, fallbackUpstream string) (string, string) {
@@ -701,7 +705,7 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 	}
 
 	publicModel = explicitRoutePublicModel(route, publicModel)
-	resp, err := h.executeAnthropicMessagesRouteRequest(upstreamCtx, body, anthropicExtraHeadersFromRequest(r), streaming)
+	resp, err := h.executeAnthropicMessagesRouteRequest(upstreamCtx, body, anthropicExtraHeadersFromRequest(r), streaming, req.Model)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -740,6 +744,30 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 	_ = writeUpstreamResponse(w, resp)
 }
 
+func (h *ProxyHandler) postAnthropicMessagesCountTokensForModel(ctx context.Context, body []byte, extraHeaders http.Header, model string) (*http.Response, error) {
+	if operation := routeOperationFromContext(ctx); operation != nil && operation.route != nil && !operation.route.legacy {
+		return h.executeExplicitRouteRequestPath(ctx, operation.route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)
+	}
+	if route, known := h.resolveModelRouteForRequest(model, providerEndpointMessages); known && route != nil && !route.legacy {
+		return h.executeExplicitRouteRequestPath(ctx, route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)
+	}
+
+	provider, owner, rewrittenBody, err := h.resolveProviderRequestForModel(body, providerEndpointMessages, model)
+	if err != nil {
+		return nil, err
+	}
+	if provider.kind != providerTypeAnthropicCompatible {
+		return nil, &providerRequestError{
+			statusCode: http.StatusBadRequest,
+			err:        fmt.Errorf("provider %q does not support %s", provider.id, providerEndpointMessagesCount),
+		}
+	}
+
+	return h.doWithRetry(func() (*http.Request, error) {
+		return h.newProviderJSONRequest(ctx, provider, http.MethodPost, providerEndpointMessagesCount, rewrittenBody, extraHeaders, "", owner)
+	})
+}
+
 func (h *ProxyHandler) forwardAnthropicCountTokensDirect(w http.ResponseWriter, r *http.Request, body []byte, model string) {
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
@@ -753,7 +781,7 @@ func (h *ProxyHandler) forwardAnthropicCountTokensDirect(w http.ResponseWriter, 
 		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
 	}
 
-	resp, err := h.postAnthropicMessagesCountTokens(upstreamCtx, body, anthropicExtraHeadersFromRequest(r))
+	resp, err := h.postAnthropicMessagesCountTokensForModel(upstreamCtx, body, anthropicExtraHeadersFromRequest(r), model)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -846,15 +874,18 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	if err := h.validateRouteAwareRequestJSON(body, extractRequestModel(body), providerEndpointMessages); err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
-		return
-	}
 
 	var req models.AnthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		message, _ := jsonDecodeErrorDetails(err, "invalid JSON in request body")
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", message)
+		return
+	}
+	// Route-aware duplicate-key validation must use the same selected model as
+	// handler forwarding. encoding/json resolves duplicate struct fields with the
+	// last occurrence, so validate only after decoding req.Model.
+	if err := h.validateRouteAwareRequestJSON(body, req.Model, providerEndpointMessages); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 
@@ -1016,15 +1047,18 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	if err := h.validateRouteAwareRequestJSON(body, extractRequestModel(body), providerEndpointMessages); err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
-		return
-	}
 
 	var req models.AnthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		message, _ := jsonDecodeErrorDetails(err, "invalid JSON in request body")
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", message)
+		return
+	}
+	// Route-aware duplicate-key validation must use the same selected model as
+	// handler forwarding. encoding/json resolves duplicate struct fields with the
+	// last occurrence, so validate only after decoding req.Model.
+	if err := h.validateRouteAwareRequestJSON(body, req.Model, providerEndpointMessages); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 
@@ -1232,7 +1266,16 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 
 	resp, bodyBytes, mode = h.retryChatCompletionsWithoutInjectedStreamOptionsForModel(upstreamCtx, resp, bodyBytes, mode, requestedModel)
 	if routeOperation != nil && !mode.clientRequestedStream && !mode.forceUpstreamStream {
-		normalizeExplicitOpenAIChatResponseModel(resp, responseModel)
+		if normalizeErr := normalizeExplicitOpenAIChatResponseModel(resp, responseModel); normalizeErr != nil {
+			if h.handleResponseBodyWriteError(w, r, upstreamCtx, "openai", normalizeErr) {
+				return
+			}
+			if h.handleShutdownError(w, r, upstreamCtx, normalizeErr) {
+				return
+			}
+			writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
+			return
+		}
 	}
 	observeUpstreamHeaders(r.Context(), resp.Header)
 

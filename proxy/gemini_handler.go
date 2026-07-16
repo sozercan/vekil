@@ -258,27 +258,30 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 	}
 	h.observeRequestSummary(r.Context(), "gemini_count_tokens", pathModel, false, providerEndpointChatCompletions)
 
-	cacheKey, err := hashOpenAIRequest(oaiReq)
-	if err != nil {
-		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", "failed to hash countTokens request")
-		return
-	}
-
-	if cached, ok := h.getGeminiCountTokensCache(cacheKey); ok {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(cached)
-		return
-	}
-
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
-	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), oaiReq.Model, providerEndpointChatCompletions)
+	upstreamCtx, routeOperation, route, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), oaiReq.Model, providerEndpointChatCompletions)
 	if err != nil {
 		h.writeGeminiUpstreamFailure(w, err)
 		return
 	}
 	if routeOperation != nil {
 		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
+	}
+
+	requestCacheKey, err := hashOpenAIRequest(oaiReq)
+	if err != nil {
+		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", "failed to hash countTokens request")
+		return
+	}
+
+	lookupTargetID := geminiCountTokensSelectedTargetID(route, routeOperation)
+	if cacheKey, ok := geminiCountTokensRouteCacheKey(requestCacheKey, route, lookupTargetID); ok {
+		if cached, hit := h.getGeminiCountTokensCache(cacheKey); hit {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(cached)
+			return
+		}
 	}
 
 	oaiResp, err := h.runGeminiCountTokensProbeWithContext(upstreamCtx, oaiReq)
@@ -301,7 +304,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 	if oaiResp.Usage == nil {
 		estimated := buildEstimatedGeminiCountTokensResult(req, estimateOpenAIRequestTokens(oaiReq))
 		h.log.Debug("using estimated Gemini token count", logger.F("reason", "missing_usage"), logger.F("total_tokens", estimated.TotalTokens))
-		h.setGeminiCountTokensCache(cacheKey, estimated)
+		h.cacheGeminiCountTokensResult(requestCacheKey, route, routeOperation, estimated)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(estimated)
 		return
@@ -317,10 +320,54 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 		}}
 	}
 
-	h.setGeminiCountTokensCache(cacheKey, result)
+	h.cacheGeminiCountTokensResult(requestCacheKey, route, routeOperation, result)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(result)
+}
+
+// geminiCountTokensSelectedTargetID mirrors the next target dispatch would choose
+// without consuming any route-attempt budget.
+func geminiCountTokensSelectedTargetID(route *modelRoute, operation *routeOperation) string {
+	if route == nil || route.legacy || operation == nil {
+		return ""
+	}
+	targets := orderedRouteTargets(route, operation, providerEndpointChatCompletions)
+	if len(targets) == 0 {
+		return ""
+	}
+	return targets[0].id
+}
+
+// geminiCountTokensRouteCacheKey preserves the legacy request-only key while
+// isolating explicit-route entries by their physical tokenizer/model owner.
+func geminiCountTokensRouteCacheKey(requestKey string, route *modelRoute, targetID string) (string, bool) {
+	if route == nil || route.legacy {
+		return requestKey, true
+	}
+	target, ok := route.targetByID(targetID)
+	if !ok || target.provider == nil {
+		return "", false
+	}
+	return strings.Join([]string{
+		requestKey,
+		route.public.routeID,
+		target.id,
+		target.provider.id,
+		target.upstreamModel,
+	}, "\x00"), true
+}
+
+func (h *ProxyHandler) cacheGeminiCountTokensResult(requestKey string, route *modelRoute, operation *routeOperation, response models.GeminiCountTokensResponse) {
+	targetID := ""
+	if operation != nil {
+		targetID = operation.pinnedTarget()
+	}
+	cacheKey, ok := geminiCountTokensRouteCacheKey(requestKey, route, targetID)
+	if !ok {
+		return
+	}
+	h.setGeminiCountTokensCache(cacheKey, response)
 }
 
 func buildEstimatedGeminiCountTokensResult(req *models.GeminiGenerateContentRequest, total int) models.GeminiCountTokensResponse {

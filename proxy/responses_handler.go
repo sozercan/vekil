@@ -517,9 +517,19 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	extraHeaders := responsesExtraHeadersFromRequest(r)
+	if rewrittenBody, resetLineage := resetSyntheticCompactionResponseLineage(bodyBytes); resetLineage {
+		bodyBytes = rewrittenBody
+		extraHeaders.Del("X-Codex-Turn-State")
+		h.log.Debug("reset synthetic compaction response lineage",
+			logger.F("endpoint", "responses/compact"),
+		)
+	}
+
 	retainedOutput := retainedCompactResponseMessages(bodyBytes)
-	// Keep provider state visible for exact-route validation. The dispatch body
-	// still applies context sanitization and proxy-owned checkpoint expansion.
+	// Keep provider state visible for exact-route validation. Capture this view
+	// after synthetic response lineage is reset, while the dispatch body still
+	// applies context sanitization and proxy-owned checkpoint expansion.
 	stateBindingBody := bodyBytes
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/compact", false)
 
@@ -532,7 +542,6 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
 	defer upstreamCancel()
 	model := rawJSONString(body["model"])
-	extraHeaders := responsesExtraHeadersFromRequest(r)
 	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), model, providerEndpointResponses)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)

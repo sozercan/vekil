@@ -253,10 +253,12 @@ func TestHandleCompactValidatesContextCompactionStateBeforeSanitizing(t *testing
 			token:   syntheticCheckpointTokenForTest(t, legacySyntheticCompactionPrefix, "legacy proxy compact checkpoint summary for state binding"),
 		},
 	} {
-		t.Run("proxy "+checkpoint.name+" checkpoint keeps synthetic rewrite compatibility", func(t *testing.T) {
+		t.Run("proxy "+checkpoint.name+" checkpoint resets synthetic lineage before binding and dispatch", func(t *testing.T) {
 			h, _, primary, secondary := newExplicitResponsesStateBindingHandler(t)
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(proxyCompactionStateRequestBody(t, checkpoint.token, true)))
+			req.Header.Set("X-Codex-Turn-State", "stale synthetic compact turn state")
 			w := httptest.NewRecorder()
-			h.HandleCompact(w, httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(proxyCompactionStateRequestBody(t, checkpoint.token, false))))
+			h.HandleCompact(w, req)
 
 			if w.Code != http.StatusOK {
 				t.Fatalf("status = %d body=%s, want 200", w.Code, w.Body.String())
@@ -264,9 +266,15 @@ func TestHandleCompactValidatesContextCompactionStateBeforeSanitizing(t *testing
 			if primary.calls.Load() != 1 || secondary.calls.Load() != 0 {
 				t.Fatalf("proxy compact checkpoint calls primary=%d secondary=%d, want 1/0", primary.calls.Load(), secondary.calls.Load())
 			}
-			body, _ := primary.onlyRequest(t)
+			body, headers := primary.onlyRequest(t)
+			if bytes.Contains(body, []byte(syntheticCompactionResponseIDPrefix)) {
+				t.Fatalf("upstream compact body retained synthetic response lineage: %s", body)
+			}
 			if bytes.Contains(body, []byte(checkpoint.token)) || !strings.Contains(string(body), checkpoint.summary) {
 				t.Fatalf("upstream compact body did not expand proxy checkpoint: %s", body)
+			}
+			if got := headers.Get("X-Codex-Turn-State"); got != "" {
+				t.Fatalf("upstream compact X-Codex-Turn-State = %q, want empty", got)
 			}
 		})
 	}

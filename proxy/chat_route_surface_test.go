@@ -7,12 +7,71 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 )
+
+type completeJSONThenErrorReadCloser struct {
+	payload []byte
+	offset  int
+	closed  atomic.Bool
+}
+
+func (r *completeJSONThenErrorReadCloser) Read(p []byte) (int, error) {
+	if r.offset >= len(r.payload) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.payload[r.offset:])
+	r.offset += n
+	if r.offset == len(r.payload) {
+		return n, io.ErrUnexpectedEOF
+	}
+	return n, nil
+}
+
+func (r *completeJSONThenErrorReadCloser) Close() error {
+	r.closed.Store(true)
+	return nil
+}
+
+type cleanupTimeoutStreamBody struct {
+	prefix       *strings.Reader
+	releaseCh    chan struct{}
+	closeStarted chan struct{}
+	releaseOnce  sync.Once
+	closeOnce    sync.Once
+}
+
+func newCleanupTimeoutStreamBody(prefix string) *cleanupTimeoutStreamBody {
+	return &cleanupTimeoutStreamBody{
+		prefix:       strings.NewReader(prefix),
+		releaseCh:    make(chan struct{}),
+		closeStarted: make(chan struct{}),
+	}
+}
+
+func (b *cleanupTimeoutStreamBody) Read(p []byte) (int, error) {
+	if b.prefix.Len() > 0 {
+		return b.prefix.Read(p)
+	}
+	<-b.releaseCh
+	return 0, io.ErrClosedPipe
+}
+
+func (b *cleanupTimeoutStreamBody) Close() error {
+	b.closeOnce.Do(func() { close(b.closeStarted) })
+	<-b.releaseCh
+	return nil
+}
+
+func (b *cleanupTimeoutStreamBody) release() {
+	b.releaseOnce.Do(func() { close(b.releaseCh) })
+}
 
 func newExplicitRouteSurfaceHandler(t *testing.T, providerKind providerType, endpoint string, primaryURL, secondaryURL string) *ProxyHandler {
 	t.Helper()
@@ -55,6 +114,43 @@ func newExplicitRouteSurfaceHandler(t *testing.T, providerKind providerType, end
 	}
 	t.Cleanup(h.BeginShutdown)
 	return h
+}
+
+func TestExplicitRouteOpenAIChatNormalizationReadErrorFailsBeforeCommit(t *testing.T) {
+	body := &completeJSONThenErrorReadCloser{payload: []byte(`{"id":"chat-primary","object":"chat.completion","model":"physical-primary","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)}
+	var calls atomic.Int32
+	h := newExplicitRouteSurfaceHandler(t, providerTypeAzureOpenAI, providerEndpointChatCompletions, "http://primary.invalid", "http://secondary.invalid")
+	h.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Status:        "200 OK",
+			Header:        http.Header{"Content-Type": []string{"application/json"}, "Openai-Model": []string{"physical-primary"}},
+			Body:          body,
+			ContentLength: int64(len(body.payload)),
+			Request:       req,
+		}, nil
+	})}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"public-model","messages":[{"role":"user","content":"hi"}]}`))
+	h.HandleOpenAIChatCompletions(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusBadGateway, w.Body.String())
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", calls.Load())
+	}
+	if !body.closed.Load() {
+		t.Fatal("upstream response body was not closed after normalization read failure")
+	}
+	if strings.Contains(w.Body.String(), "physical-primary") {
+		t.Fatalf("client response exposed physical model after read failure: %s", w.Body.String())
+	}
+	if got := w.Header().Get("Openai-Model"); got == "physical-primary" {
+		t.Fatalf("client response exposed physical model header %q", got)
+	}
 }
 
 func TestExplicitRouteOpenAIChatHTTPRejectionPolicyAndPublicIdentity(t *testing.T) {
@@ -193,6 +289,93 @@ func TestExplicitRouteOpenAIChatStreamProtectsProxyOperationID(t *testing.T) {
 	}
 	if got := w.Header().Get("X-Request-Id"); got != "chat-stream-request-id" {
 		t.Fatalf("X-Request-Id = %q, want chat-stream-request-id", got)
+	}
+}
+
+func TestExplicitRouteCertifiedStreamCleanupTimeoutSuppressesFailover(t *testing.T) {
+	tests := []struct {
+		name          string
+		providerKind  providerType
+		endpoint      string
+		requestPath   string
+		requestBody   string
+		primaryStream string
+		secondaryBody string
+		handle        func(*ProxyHandler, http.ResponseWriter, *http.Request)
+	}{
+		{
+			name:          "OpenAI Chat",
+			providerKind:  providerTypeAzureOpenAI,
+			endpoint:      providerEndpointChatCompletions,
+			requestPath:   "/v1/chat/completions",
+			requestBody:   `{"model":"public-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			primaryStream: "event: error\ndata: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}\n\n",
+			secondaryBody: "data: [DONE]\n\n",
+			handle:        (*ProxyHandler).HandleOpenAIChatCompletions,
+		},
+		{
+			name:          "Anthropic Messages",
+			providerKind:  providerTypeAnthropicCompatible,
+			endpoint:      providerEndpointMessages,
+			requestPath:   "/v1/messages",
+			requestBody:   `{"model":"public-model","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			primaryStream: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}\n\n",
+			secondaryBody: "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+			handle:        (*ProxyHandler).HandleAnthropicMessages,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := newCleanupTimeoutStreamBody(tt.primaryStream)
+			defer body.release()
+			var calls atomic.Int32
+			h := newExplicitRouteSurfaceHandler(t, tt.providerKind, tt.endpoint, "http://primary.invalid", "http://secondary.invalid")
+			h.streamingUpstreamTimeout = 3 * time.Second
+			h.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if calls.Add(1) == 1 {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Status:     "200 OK",
+						Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+						Body:       body,
+						Request:    req,
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       io.NopCloser(strings.NewReader(tt.secondaryBody)),
+					Request:    req,
+				}, nil
+			})}
+
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, tt.requestPath, strings.NewReader(tt.requestBody))
+			started := time.Now()
+			tt.handle(h, w, req)
+			elapsed := time.Since(started)
+
+			select {
+			case <-body.closeStarted:
+			default:
+				t.Fatal("rejected stream cleanup did not attempt to close the upstream body")
+			}
+			body.release()
+			if elapsed >= 1500*time.Millisecond {
+				t.Fatalf("handler remained blocked for %v, want bounded cleanup well below the 3s inference timeout", elapsed)
+			}
+			if w.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusBadGateway, w.Body.String())
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("upstream calls = %d, want cleanup timeout to suppress failover", calls.Load())
+			}
+			if strings.Contains(w.Body.String(), "secondary") {
+				t.Fatalf("client response unexpectedly included secondary output: %s", w.Body.String())
+			}
+		})
 	}
 }
 
@@ -380,10 +563,18 @@ func TestExplicitRouteSurfacesRejectAmbiguousJSONBeforeTranslation(t *testing.T)
 			run:  func(h *ProxyHandler, w http.ResponseWriter, r *http.Request) { h.HandleOpenAIChatCompletions(w, r) },
 		},
 		{
-			name: "Anthropic translation",
+			name: "Anthropic Messages",
 			path: "/v1/messages",
-			body: `{"model":"public-model","model":"shadow-model","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`,
+			body: `{"model":"shadow-model","model":"public-model","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`,
 			run:  func(h *ProxyHandler, w http.ResponseWriter, r *http.Request) { h.HandleAnthropicMessages(w, r) },
+		},
+		{
+			name: "Anthropic count_tokens",
+			path: "/v1/messages/count_tokens",
+			body: `{"model":"shadow-model","model":"public-model","messages":[{"role":"user","content":"hi"}]}`,
+			run: func(h *ProxyHandler, w http.ResponseWriter, r *http.Request) {
+				h.HandleAnthropicMessagesCountTokens(w, r)
+			},
 		},
 		{
 			name: "Gemini translation",
@@ -418,6 +609,99 @@ func TestExplicitRouteSurfacesRejectAmbiguousJSONBeforeTranslation(t *testing.T)
 			}
 			if !strings.Contains(w.Body.String(), "duplicate") {
 				t.Fatalf("body = %s, want duplicate-key detail", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestAnthropicDuplicateModelSelectionPreservesLegacyForwarding(t *testing.T) {
+	tests := []struct {
+		name         string
+		path         string
+		body         string
+		responseBody string
+		handle       func(*ProxyHandler, http.ResponseWriter, *http.Request)
+	}{
+		{
+			name:         "Messages",
+			path:         "/v1/messages",
+			body:         `{"model":"public-model","model":"legacy-model","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`,
+			responseBody: `{"id":"msg_legacy","type":"message","role":"assistant","model":"legacy-model","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`,
+			handle:       (*ProxyHandler).HandleAnthropicMessages,
+		},
+		{
+			name:         "count_tokens",
+			path:         "/v1/messages/count_tokens",
+			body:         `{"model":"public-model","model":"legacy-model","messages":[{"role":"user","content":"hi"}]}`,
+			responseBody: `{"input_tokens":3}`,
+			handle:       (*ProxyHandler).HandleAnthropicMessagesCountTokens,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			seenModel := make(chan string, 1)
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				var payload struct {
+					Model string `json:"model"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Errorf("decode upstream request: %v", err)
+				}
+				seenModel <- payload.Model
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tt.responseBody)
+			}))
+			defer upstream.Close()
+
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
+				SchemaVersion: ProvidersConfigSchemaVersion2,
+				Providers: []ProviderConfig{
+					{
+						ID:       "legacy",
+						Type:     string(providerTypeAnthropicCompatible),
+						Default:  true,
+						BaseURL:  upstream.URL,
+						AuthType: "none",
+						Models: []ProviderModelConfig{{
+							PublicID:   "legacy-model",
+							Deployment: "legacy-model",
+							Endpoints:  []string{providerEndpointMessages},
+						}},
+					},
+					{ID: "explicit", Type: string(providerTypeAnthropicCompatible), BaseURL: upstream.URL, AuthType: "none"},
+				},
+				ModelRoutes: []ModelRouteConfig{{
+					ID:        "explicit-route",
+					PublicID:  "public-model",
+					Endpoints: []string{providerEndpointMessages},
+					Targets: []ModelRouteTargetConfig{{
+						ID: "target", Provider: "explicit", UpstreamModel: "physical-model",
+					}},
+				}},
+			}))
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+			defer h.BeginShutdown()
+
+			w := httptest.NewRecorder()
+			tt.handle(h, w, httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body)))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("upstream calls = %d, want 1", calls.Load())
+			}
+			select {
+			case model := <-seenModel:
+				if model != "legacy-model" {
+					t.Fatalf("forwarded model = %q, want last duplicate value legacy-model", model)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("upstream request model was not observed")
 			}
 		})
 	}

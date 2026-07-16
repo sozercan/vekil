@@ -338,10 +338,6 @@ func (h *ProxyHandler) postResponsesWithHeadersForModel(ctx context.Context, bod
 	return h.maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx, body, extraHeaders, resp)
 }
 
-func (h *ProxyHandler) postAnthropicMessages(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	return h.postJSONEndpointWithHeaders(ctx, providerEndpointMessages, body, extraHeaders)
-}
-
 func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
 	model := extractRequestModel(body)
 	if operation := routeOperationFromContext(ctx); operation != nil && operation.route != nil && !operation.route.legacy {

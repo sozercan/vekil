@@ -558,18 +558,24 @@ func (s *explicitRoutePreparedStream) abort() {
 	})
 }
 
-func (s *explicitRoutePreparedStream) abortAndWait(ctx context.Context) bool {
+func (s *explicitRoutePreparedStream) abortAndWait(timeout time.Duration) bool {
 	if s == nil {
 		return true
 	}
 	s.abort()
-	if ctx == nil {
-		ctx = context.Background()
+	if s.doneCh == nil {
+		return true
 	}
+	if timeout <= 0 {
+		<-s.doneCh
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case <-s.doneCh:
 		return true
-	case <-ctx.Done():
+	case <-timer.C:
 		return false
 	}
 }
