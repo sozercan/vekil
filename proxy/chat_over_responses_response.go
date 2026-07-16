@@ -218,9 +218,9 @@ func responsesChatMessageContent(raw json.RawMessage) (string, string, error) {
 	var item struct {
 		Role    string `json:"role"`
 		Content []struct {
-			Type    string `json:"type"`
-			Text    string `json:"text"`
-			Refusal string `json:"refusal"`
+			Type    string  `json:"type"`
+			Text    *string `json:"text"`
+			Refusal *string `json:"refusal"`
 		} `json:"content"`
 	}
 	if err := json.Unmarshal(raw, &item); err != nil {
@@ -234,9 +234,15 @@ func responsesChatMessageContent(raw json.RawMessage) (string, string, error) {
 	for _, part := range item.Content {
 		switch part.Type {
 		case "output_text":
-			text.WriteString(part.Text)
+			if part.Text == nil {
+				return "", "", newChatServerError("unsupported_responses_output", "Responses output_text content is missing a string text field")
+			}
+			text.WriteString(*part.Text)
 		case "refusal":
-			refusal.WriteString(part.Refusal)
+			if part.Refusal == nil {
+				return "", "", newChatServerError("unsupported_responses_output", "Responses refusal content is missing a string refusal field")
+			}
+			refusal.WriteString(*part.Refusal)
 		default:
 			return "", "", newChatServerError("unsupported_responses_output", fmt.Sprintf("Responses content type %q is not supported", part.Type))
 		}

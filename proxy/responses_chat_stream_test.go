@@ -539,25 +539,67 @@ func TestResponsesChatStream_MultipleAssistantContentParts(t *testing.T) {
 	}
 }
 
-func TestResponsesChatStream_IgnoresAllowlistedReasoningProgressEvents(t *testing.T) {
+func TestResponsesChatStream_ValidatesAndIgnoresReasoningProgressEvents(t *testing.T) {
 	state := newResponsesChatStreamState(responsesChatStreamConfig{PublicModel: "gpt-public", Now: time.Now})
 	events := []string{
 		`{"type":"response.created","sequence_number":0,"response":{"id":"resp-reasoning","created_at":1700000000,"status":"in_progress"}}`,
-		`{"type":"response.reasoning_summary_part.added","sequence_number":1}`,
-		`{"type":"response.reasoning_summary_text.delta","sequence_number":2,"delta":"hidden"}`,
-		`{"type":"response.reasoning_summary_text.done","sequence_number":3,"text":"hidden"}`,
-		`{"type":"response.reasoning_summary_part.done","sequence_number":4}`,
-		`{"type":"response.reasoning_text.delta","sequence_number":5,"delta":"hidden"}`,
-		`{"type":"response.reasoning_text.done","sequence_number":6,"text":"hidden"}`,
+		`{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"reasoning","id":"reasoning-1","status":"in_progress"}}`,
+		`{"type":"response.reasoning_summary_part.added","sequence_number":2,"item_id":"reasoning-1","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}`,
+		`{"type":"response.reasoning_summary_text.delta","sequence_number":3,"item_id":"reasoning-delta","output_index":0,"summary_index":0,"delta":"hidden"}`,
+		`{"type":"response.reasoning_summary_text.done","sequence_number":4,"item_id":"reasoning-summary-done","output_index":0,"summary_index":0,"text":"hidden"}`,
+		`{"type":"response.reasoning_summary_part.done","sequence_number":5,"item_id":"reasoning-part-done","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":"hidden"}}`,
+		`{"type":"response.reasoning_text.delta","sequence_number":6,"item_id":"reasoning-text-delta","output_index":0,"content_index":0,"delta":"hidden"}`,
+		`{"type":"response.reasoning_text.done","sequence_number":7,"item_id":"reasoning-text-done","output_index":0,"content_index":0,"text":"hidden"}`,
 	}
 	for _, raw := range events {
 		var header struct {
 			Type string `json:"type"`
 		}
 		_ = json.Unmarshal([]byte(raw), &header)
-		if _, err := state.handleMessage(responsesSSEMessage{event: header.Type, data: raw, semantic: true}); err != nil {
+		transition, err := state.handleMessage(responsesSSEMessage{event: header.Type, data: raw, semantic: true})
+		if err != nil {
 			t.Fatalf("event %s error = %v", header.Type, err)
 		}
+		if len(transition.chunks) != 0 || transition.terminal {
+			t.Fatalf("reasoning event %s produced Chat output: %#v", header.Type, transition)
+		}
+	}
+}
+
+func TestResponsesChatStream_RejectsMalformedReasoningProgressEvents(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup []string
+		event string
+	}{
+		{name: "before response created", event: `{"type":"response.reasoning_text.delta","sequence_number":0,"item_id":"reasoning-1","output_index":0,"content_index":0,"delta":"hidden"}`},
+		{name: "without active item", setup: []string{`{"type":"response.created","sequence_number":0,"response":{"id":"resp","status":"in_progress"}}`}, event: `{"type":"response.reasoning_text.delta","sequence_number":1,"item_id":"reasoning-1","output_index":0,"content_index":0,"delta":"hidden"}`},
+		{name: "empty item id", setup: []string{`{"type":"response.created","sequence_number":0,"response":{"id":"resp","status":"in_progress"}}`, `{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"reasoning","id":"reasoning-1"}}`}, event: `{"type":"response.reasoning_text.delta","sequence_number":2,"item_id":"","output_index":0,"content_index":0,"delta":"hidden"}`},
+		{name: "missing content index", setup: []string{`{"type":"response.created","sequence_number":0,"response":{"id":"resp","status":"in_progress"}}`, `{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"reasoning","id":"reasoning-1"}}`}, event: `{"type":"response.reasoning_text.delta","sequence_number":2,"item_id":"reasoning-1","output_index":0,"delta":"hidden"}`},
+		{name: "malformed summary part", setup: []string{`{"type":"response.created","sequence_number":0,"response":{"id":"resp","status":"in_progress"}}`, `{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"reasoning","id":"reasoning-1"}}`}, event: `{"type":"response.reasoning_summary_part.added","sequence_number":2,"item_id":"reasoning-1","output_index":0,"summary_index":0,"part":{"type":"output_text","text":"hidden"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := newResponsesChatStreamState(responsesChatStreamConfig{PublicModel: "gpt-public", Now: time.Now})
+			for _, raw := range tt.setup {
+				var header struct {
+					Type string `json:"type"`
+				}
+				_ = json.Unmarshal([]byte(raw), &header)
+				if _, err := state.handleMessage(responsesSSEMessage{event: header.Type, data: raw, semantic: true}); err != nil {
+					t.Fatalf("setup event %s error = %v", header.Type, err)
+				}
+			}
+			var header struct {
+				Type string `json:"type"`
+			}
+			_ = json.Unmarshal([]byte(tt.event), &header)
+			_, err := state.handleMessage(responsesSSEMessage{event: header.Type, data: tt.event, semantic: true})
+			var executionErr *chatExecutionError
+			if !errors.As(err, &executionErr) || executionErr.Code != "invalid_responses_stream" {
+				t.Fatalf("error = %#v, want invalid_responses_stream", err)
+			}
+		})
 	}
 }
 

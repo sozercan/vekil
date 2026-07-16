@@ -529,12 +529,84 @@ func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (respo
 		"response.reasoning_summary_text.done",
 		"response.reasoning_text.delta",
 		"response.reasoning_text.done":
-		// Hidden reasoning progress is non-semantic for Chat output. The exact
-		// authoritative reasoning item is retained from output_item.done/terminal output.
-		return responsesChatStreamTransition{}, nil
+		return s.handleReasoningProgress(eventType, []byte(msg.data))
 	default:
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_event", fmt.Sprintf("upstream Responses event %q is not supported", eventType))
 	}
+}
+
+func (s *responsesChatStreamState) handleReasoningProgress(eventType string, data []byte) (responsesChatStreamTransition, error) {
+	if !s.createdSeen {
+		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "reasoning progress arrived before response.created")
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "reasoning progress event is malformed")
+	}
+	if _, ok := requiredResponsesChatJSONString(raw, "item_id"); !ok {
+		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "reasoning progress event is missing item_id")
+	}
+	outputIndex, ok := requiredResponsesChatNonnegativeInt(raw, "output_index")
+	if !ok || s.itemsByIndex[outputIndex] != "reasoning" || s.doneByIndex[outputIndex] {
+		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "reasoning progress event does not match an active reasoning item")
+	}
+	var indexKey, textKey string
+	switch eventType {
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		indexKey = "summary_index"
+		var part struct {
+			Type string  `json:"type"`
+			Text *string `json:"text"`
+		}
+		if err := json.Unmarshal(raw["part"], &part); err != nil || part.Type != "summary_text" || part.Text == nil {
+			return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "reasoning summary part is malformed")
+		}
+	case "response.reasoning_summary_text.delta":
+		indexKey, textKey = "summary_index", "delta"
+	case "response.reasoning_summary_text.done":
+		indexKey, textKey = "summary_index", "text"
+	case "response.reasoning_text.delta":
+		indexKey, textKey = "content_index", "delta"
+	case "response.reasoning_text.done":
+		indexKey, textKey = "content_index", "text"
+	default:
+		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_event", fmt.Sprintf("upstream Responses event %q is not supported", eventType))
+	}
+	if _, ok := requiredResponsesChatNonnegativeInt(raw, indexKey); !ok {
+		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "reasoning progress event has an invalid index")
+	}
+	if textKey != "" {
+		if _, ok := requiredResponsesChatJSONString(raw, textKey); !ok {
+			return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "reasoning progress event is missing text")
+		}
+	}
+	// Hidden reasoning progress is non-semantic for Chat output. Exact output is
+	// retained only from output_item.done and the terminal response.
+	return responsesChatStreamTransition{}, nil
+}
+
+func requiredResponsesChatJSONString(raw map[string]json.RawMessage, key string) (string, bool) {
+	value, exists := raw[key]
+	if !exists {
+		return "", false
+	}
+	var decoded string
+	if err := json.Unmarshal(value, &decoded); err != nil || strings.TrimSpace(decoded) == "" {
+		return "", false
+	}
+	return decoded, true
+}
+
+func requiredResponsesChatNonnegativeInt(raw map[string]json.RawMessage, key string) (int, bool) {
+	value, exists := raw[key]
+	if !exists {
+		return 0, false
+	}
+	var decoded int
+	if err := json.Unmarshal(value, &decoded); err != nil || decoded < 0 {
+		return 0, false
+	}
+	return decoded, true
 }
 
 func (s *responsesChatStreamState) handleCreated(data []byte) (responsesChatStreamTransition, error) {

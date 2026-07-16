@@ -838,10 +838,9 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 }
 
 // validateInsightModel logs a non-fatal warning when the configured dashboard
-// insight model cannot be reached over /chat/completions (the path the insight
-// endpoint uses). This surfaces a misconfiguration — e.g. pointing insight_model
-// at a /responses-only provider such as Codex or an Azure responses deployment —
-// at startup instead of silently failing on the first click.
+// insight model cannot be served through Vekil's Chat compatibility route. The
+// route may use native /chat/completions or the Chat-over-Responses adapter; only
+// models that support neither native endpoint are startup misconfigurations.
 func (h *ProxyHandler) validateInsightModel() {
 	model := strings.TrimSpace(h.providersConfig.InsightModel)
 	if model == "" || h.log == nil || h.DynamicProviderValidationPending() {
