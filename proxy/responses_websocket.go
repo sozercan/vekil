@@ -1899,17 +1899,21 @@ func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *
 	)
 }
 
-func (s *responsesWebSocketSession) terminalResponseOutputItems(h *ProxyHandler, data string) []json.RawMessage {
+func (s *responsesWebSocketSession) terminalResponseOutputItems(h *ProxyHandler, data string) ([]json.RawMessage, bool) {
 	var envelope struct {
 		Response struct {
-			Output []json.RawMessage `json:"output"`
+			Output json.RawMessage `json:"output"`
 		} `json:"response"`
 	}
 	if err := json.NewDecoder(strings.NewReader(data)).Decode(&envelope); err != nil || len(envelope.Response.Output) == 0 {
-		return nil
+		return nil, false
 	}
-	items := make([]json.RawMessage, 0, len(envelope.Response.Output))
-	for _, item := range envelope.Response.Output {
+	var output []json.RawMessage
+	if err := json.Unmarshal(envelope.Response.Output, &output); err != nil || output == nil {
+		return nil, false
+	}
+	items := make([]json.RawMessage, 0, len(output))
+	for _, item := range output {
 		if len(item) == 0 {
 			continue
 		}
@@ -1918,7 +1922,7 @@ func (s *responsesWebSocketSession) terminalResponseOutputItems(h *ProxyHandler,
 		}
 		items = append(items, cloneRawMessage(item))
 	}
-	return items
+	return items, true
 }
 
 func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body io.Reader, headers http.Header, recordTerminal func(int, responsesUsage)) (responsesWebSocketStreamResult, error) {
@@ -1998,13 +2002,11 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 			if !event.Response.Usage.isZero() {
 				result.usage = event.Response.Usage
 			}
-			if strings.Contains(data, `"output"`) {
-				// The terminal snapshot is authoritative and may include partial items
-				// that never received response.output_item.done. Replace the incremental
-				// collection so continuation history exactly matches the response.
-				if terminalItems := s.terminalResponseOutputItems(h, data); len(terminalItems) > 0 {
-					result.outputItems = terminalItems
-				}
+			// The terminal snapshot is authoritative and may include partial items
+			// that never received response.output_item.done. A present empty array also
+			// clears incremental items; an absent or invalid field preserves them.
+			if terminalItems, present := s.terminalResponseOutputItems(h, data); present {
+				result.outputItems = terminalItems
 			}
 			if validIncompleteEvent && recordTerminal != nil {
 				// An incomplete provider response is still an authoritative terminal
@@ -2026,8 +2028,10 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 			if !event.Response.Usage.isZero() {
 				result.usage = event.Response.Usage
 			}
-			if len(result.outputItems) == 0 && strings.Contains(data, `"output"`) {
-				result.outputItems = s.terminalResponseOutputItems(h, data)
+			if len(result.outputItems) == 0 {
+				if terminalItems, present := s.terminalResponseOutputItems(h, data); present {
+					result.outputItems = terminalItems
+				}
 			}
 			if validCompletedEvent && recordTerminal != nil {
 				// A structurally valid provider completion is authoritative before

@@ -3377,6 +3377,63 @@ func TestHandleResponsesWebSocket_ResponseIncompletePreservesContinuationState(t
 	}
 }
 
+func TestHandleResponsesWebSocket_ResponseIncompleteEmptyOutputClearsIncrementalHistory(t *testing.T) {
+	var upstreamRequests atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		requestNumber := upstreamRequests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch requestNumber {
+		case 1:
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-empty\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"stale\",\"content\":[{\"type\":\"output_text\",\"text\":\"stale incremental\"}]}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-empty\",\"output\":[],\"incomplete_details\":{\"reason\":\"content_filter\"}}}\n\n")
+		case 2:
+			var body map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode follow-up upstream request: %v", err)
+			}
+			input := rawJSONArrayForContract(t, body["input"])
+			if len(input) != 2 {
+				t.Fatalf("follow-up input items = %d, want original user + continuation only: %s", len(input), body["input"])
+			}
+			if got := contractMessageText(t, input[1], "user"); got != "continue" {
+				t.Fatalf("follow-up user input = %q, want continue", got)
+			}
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-next\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-next\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n")
+		default:
+			t.Fatalf("unexpected upstream request count %d", requestNumber)
+		}
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{messageItemForContract("user", "hello")})
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+	for _, wantType := range []string{"response.created", "response.output_item.done", "response.incomplete"} {
+		frame := mustReadWebSocketJSON(t, conn)
+		if frame["type"] != wantType {
+			t.Fatalf("frame type = %v, want %s", frame["type"], wantType)
+		}
+	}
+
+	next := newResponsesWebSocketCreateRequest([]interface{}{messageItemForContract("user", "continue")})
+	next["previous_response_id"] = "resp-empty"
+	if err := conn.WriteJSON(next); err != nil {
+		t.Fatalf("failed to write follow-up websocket request: %v", err)
+	}
+	for _, wantType := range []string{"response.created", "response.completed"} {
+		frame := mustReadWebSocketJSON(t, conn)
+		if frame["type"] != wantType {
+			t.Fatalf("follow-up frame type = %v, want %s", frame["type"], wantType)
+		}
+	}
+}
+
 func TestHandleResponsesWebSocket_ResponseFailedOnStalledUpstreamKeepsSessionOpen(t *testing.T) {
 	// Regression test: if upstream emits response.failed and then stalls
 	// (keeps the body open), the proxy should exit the SSE loop immediately
