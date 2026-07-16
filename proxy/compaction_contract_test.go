@@ -214,7 +214,6 @@ func TestCompactionContract_InternalCompactionNormalizesCallerControls(t *testin
 				"tool_choice",
 				"parallel_tool_calls",
 				"response_format",
-				"max_output_tokens",
 				"max_tokens",
 				"max_completion_tokens",
 				"stream",
@@ -224,6 +223,10 @@ func TestCompactionContract_InternalCompactionNormalizesCallerControls(t *testin
 				if _, ok := upstream[field]; ok {
 					t.Fatalf("internal compaction request must remove caller field %q: %s", field, upstream[field])
 				}
+			}
+
+			if got := rawJSONToIntForContract(t, upstream["max_output_tokens"]); got != internalCompactionMaxOutputTokens {
+				t.Fatalf("internal max_output_tokens = %d, want proxy cap %d", got, internalCompactionMaxOutputTokens)
 			}
 
 			text := rawJSONObjectForContract(t, upstream["text"])
@@ -967,6 +970,15 @@ func rawJSONObjectForContract(t testing.TB, raw json.RawMessage) map[string]json
 		t.Fatalf("decode JSON object %s: %v", string(raw), err)
 	}
 	return item
+}
+
+func rawJSONToIntForContract(t testing.TB, raw json.RawMessage) int {
+	t.Helper()
+	var value int
+	if err := json.Unmarshal(raw, &value); err != nil {
+		t.Fatalf("decode JSON integer %s: %v", string(raw), err)
+	}
+	return value
 }
 
 func rawJSONToStringForContract(t testing.TB, raw json.RawMessage) string {

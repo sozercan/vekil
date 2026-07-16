@@ -371,18 +371,18 @@ func TestTranslateAnthropicToOpenAI(t *testing.T) {
 	t.Run("thinking/extended thinking", func(t *testing.T) {
 		req := &models.AnthropicRequest{
 			Model:     "claude-3-opus",
-			MaxTokens: intPtr(500),
+			MaxTokens: intPtr(16000),
 			Messages: []models.AnthropicMessage{
 				{Role: "user", Content: json.RawMessage(`"Think hard"`)},
 			},
-			Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(1000)},
+			Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(10000)},
 		}
 		got, err := TranslateAnthropicToOpenAI(req)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if got.MaxCompletionTokens == nil || *got.MaxCompletionTokens != 1000 {
-			t.Errorf("MaxCompletionTokens = %v, want 1000", got.MaxCompletionTokens)
+		if got.MaxCompletionTokens == nil || *got.MaxCompletionTokens != 16000 {
+			t.Errorf("MaxCompletionTokens = %v, want total max_tokens limit 16000", got.MaxCompletionTokens)
 		}
 		if got.MaxTokens != nil {
 			t.Errorf("MaxTokens should be nil when thinking is enabled, got %v", *got.MaxTokens)

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -105,6 +106,42 @@ func TestPrepareOpenAIChatCompletionsRequest_ClientStreamOptionsPreserved(t *tes
 	}
 	if mode.injectedClientStreamUsage {
 		t.Fatal("injectedClientStreamUsage = true, want false when client supplied stream_options")
+	}
+}
+
+func TestValidateAnthropicMessageTokenLimits(t *testing.T) {
+	intPtr := func(value int) *int { return &value }
+	tests := []struct {
+		name    string
+		req     *models.AnthropicRequest
+		headers http.Header
+		wantErr string
+	}{
+		{name: "missing max_tokens", req: &models.AnthropicRequest{}, wantErr: "max_tokens is required"},
+		{name: "negative max_tokens", req: &models.AnthropicRequest{MaxTokens: intPtr(-1)}, wantErr: "max_tokens must be greater than or equal to 0"},
+		{name: "zero max_tokens is valid for non-streaming prewarm", req: &models.AnthropicRequest{MaxTokens: intPtr(0)}},
+		{name: "zero max_tokens rejects streaming", req: &models.AnthropicRequest{MaxTokens: intPtr(0), Stream: true}, wantErr: "max_tokens must be greater than 0 when stream is true"},
+		{name: "enabled thinking requires budget", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled"}}, wantErr: "thinking.budget_tokens is required"},
+		{name: "enabled thinking requires minimum budget", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(1023)}}, wantErr: "thinking.budget_tokens must be greater than or equal to 1024"},
+		{name: "enabled thinking budget must fit total", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(4096)}}, wantErr: "thinking.budget_tokens must be less than max_tokens"},
+		{name: "interleaved thinking permits larger budget", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(8192)}}, headers: http.Header{"Anthropic-Beta": []string{anthropicInterleavedThinkingBeta}}},
+		{name: "unknown interleaved beta does not bypass validation", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(8192)}}, headers: http.Header{"Anthropic-Beta": []string{"interleaved-thinking-disabled"}}, wantErr: "thinking.budget_tokens must be less than max_tokens"},
+		{name: "enabled thinking valid", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(1024)}}, wantErr: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateAnthropicMessageTokenLimits(tt.req, tt.headers)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateAnthropicMessageTokenLimits() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("validateAnthropicMessageTokenLimits() error = %v, want %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 

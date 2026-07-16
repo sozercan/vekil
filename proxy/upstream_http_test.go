@@ -140,6 +140,24 @@ func TestApplyProviderModelRequestPolicy_UsesMaxCompletionTokensOnlyForChatCompl
 	}
 }
 
+func TestApplyProviderModelRequestPolicy_TreatsNullMaxCompletionTokensAsAbsent(t *testing.T) {
+	body := applyProviderModelRequestPolicy(
+		[]byte(`{"max_tokens":64,"max_completion_tokens":null}`),
+		providerEndpointChatCompletions,
+		providerModel{useMaxCompletionTokens: true},
+	)
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("json.Unmarshal(body) error = %v", err)
+	}
+	if _, ok := payload["max_tokens"]; ok {
+		t.Fatalf("payload retained max_tokens: %s", body)
+	}
+	if got := string(payload["max_completion_tokens"]); got != "64" {
+		t.Fatalf("max_completion_tokens = %s, want legacy value 64", got)
+	}
+}
+
 func TestApplyProviderModelRequestPolicy_PreservesExplicitMaxCompletionTokens(t *testing.T) {
 	body := applyProviderModelRequestPolicy(
 		[]byte(`{"max_tokens":64,"max_completion_tokens":32}`),

@@ -6813,6 +6813,39 @@ func TestHandleAnthropicMessages_UsesOpenAITranslationForGenericOpenAICompatible
 	}
 }
 
+func TestHandleAnthropicMessages_RejectsMissingMaxTokens(t *testing.T) {
+	var upstreamHits atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model": "claude-sonnet-4",
+		"messages": [{"role": "user", "content": "Hello"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, body)
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("upstream hits = %d, want 0", got)
+	}
+	var anthropicErr models.AnthropicError
+	if err := json.NewDecoder(resp.Body).Decode(&anthropicErr); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if anthropicErr.Error.Type != "invalid_request_error" || !strings.Contains(anthropicErr.Error.Message, "max_tokens") {
+		t.Fatalf("unexpected Anthropic error: %+v", anthropicErr)
+	}
+}
+
 func TestHandleAnthropicMessages_AzureUsesConfiguredMaxCompletionTokens(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "test-value")
 	useMaxCompletionTokens := true
