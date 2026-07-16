@@ -236,7 +236,9 @@ case "\${mode}" in
     printf '%s|%s\n' "\$(cat left.txt)" "\$(cat right.txt)"
     ;;
   json-wrapped)
-    printf '{"output":"%s"}|{"output":"%s"}\n' "\$(cat left.txt)" "\$(cat right.txt)"
+    jq -cn --arg output "\$(cat left.txt)" '{output: \$output}'
+    printf '|'
+    jq -cn --arg output "\$(cat right.txt)" '{output: \$output}'
     ;;
   exit42)
     exit 42
@@ -527,6 +529,22 @@ run_zen_classification_case() {
 }
 
 log "Running deterministic smoke reliability regressions"
+
+escape_client="${TMP_ROOT}/json-wrapped-client"
+write_fake_client "${escape_client}" json-wrapped
+escape_case="${TMP_ROOT}/json-wrapped-fixtures"
+mkdir -p "${escape_case}"
+printf '%s' 'left "quote" \ slash' > "${escape_case}/left.txt"
+printf 'right\ncontrol' > "${escape_case}/right.txt"
+escape_output="$(cd "${escape_case}" && "${escape_client}")"
+escape_left="${escape_output%%|*}"
+escape_right="${escape_output#*|}"
+if [[ "$(jq -r '.output' <<< "${escape_left}")" == 'left "quote" \ slash' ]] &&
+   [[ "$(jq -r '.output' <<< "${escape_right}")" == $'right\ncontrol' ]]; then
+  record_success "fake Gemini JSON wrapper escapes arbitrary fixture content"
+else
+  record_failure "fake Gemini JSON wrapper escapes arbitrary fixture content" "wrapper output was not valid escaped JSON: ${escape_output}"
+fi
 
 render_block="${TMP_ROOT}/k8s-render-kustomization.txt"
 awk '
