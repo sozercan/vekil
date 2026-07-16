@@ -343,7 +343,7 @@ type responsesChatToolState struct {
 	name          string
 	arguments     strings.Builder
 	argumentsDone bool
-	completed     bool
+	doneStatus    string
 	done          bool
 }
 
@@ -969,13 +969,15 @@ func (s *responsesChatStreamState) handleOutputItemDone(data []byte) (responsesC
 		if err := json.Unmarshal(event.Item, &call); err != nil || call.CallID != tool.upstreamCall || call.Name != tool.name {
 			return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "completed function call does not match streamed arguments")
 		}
-		if strings.TrimSpace(call.Status) == "completed" {
+		status, err := normalizeResponsesChatTerminalFunctionCallStatus(call.Status)
+		if err != nil {
+			return responsesChatStreamTransition{}, err
+		}
+		tool.doneStatus = status
+		if status == "completed" {
 			if !tool.argumentsDone || call.Arguments != tool.arguments.String() {
 				return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "completed function call does not match streamed arguments")
 			}
-			tool.completed = true
-		} else {
-			s.hasIncompleteTool = true
 		}
 		tool.done = true
 	case "reasoning":
@@ -1020,6 +1022,10 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 		attachChatExecutionErrorUsage(err, terminalUsage)
 		transition = usageFailureTransition
 	}()
+	terminalResponseID := strings.TrimSpace(event.Response.ID)
+	if terminalResponseID == "" {
+		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "terminal Responses event is missing a response ID")
+	}
 	if event.Response.Status != terminalStatus || event.Response.Error != nil || len(event.Response.Output) != len(s.itemsByIndex) {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "terminal Responses event is malformed")
 	}
@@ -1079,14 +1085,26 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 			if err := json.Unmarshal(raw, &call); err != nil || call.CallID != tool.upstreamCall || call.Name != tool.name {
 				return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "terminal function call does not match streamed arguments")
 			}
-			if strings.TrimSpace(call.Status) != "completed" {
-				if terminalStatus != "incomplete" {
-					return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "non-completed function call appeared in a completed Responses stream")
-				}
+			terminalCallStatus, err := normalizeResponsesChatTerminalFunctionCallStatus(call.Status)
+			if err != nil {
+				return responsesChatStreamTransition{}, err
+			}
+			if tool.doneStatus != "" && terminalCallStatus != "" && terminalCallStatus != tool.doneStatus {
+				return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "terminal function-call status does not match response.output_item.done")
+			}
+			effectiveCallStatus := terminalCallStatus
+			if effectiveCallStatus == "" {
+				effectiveCallStatus = tool.doneStatus
+			}
+			completed, err := responsesChatFunctionCallCompleted(terminalStatus, effectiveCallStatus)
+			if err != nil {
+				return responsesChatStreamTransition{}, err
+			}
+			if !completed {
 				s.hasIncompleteTool = true
 				continue
 			}
-			if !tool.completed || call.Arguments != tool.arguments.String() {
+			if !tool.argumentsDone || call.Arguments != tool.arguments.String() {
 				return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "terminal function call does not match streamed arguments")
 			}
 			publishCalls = append(publishCalls, responsesChatReplayPublishCall{

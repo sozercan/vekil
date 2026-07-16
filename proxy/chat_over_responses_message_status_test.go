@@ -182,3 +182,86 @@ func TestTranslateResponsesJSONToChatInvalidReasoningStatusDoesNotPublishReplay(
 		t.Fatalf("replay state was published before reasoning validation: %#v", stats)
 	}
 }
+
+func TestTranslateResponsesJSONToChatValidatesFunctionCallStatus(t *testing.T) {
+	status := func(value string) *string { return &value }
+	tests := []struct {
+		name           string
+		envelopeStatus string
+		callStatus     *string
+		wantFinish     string
+		wantCalls      int
+		wantError      bool
+	}{
+		{name: "completed response with completed call", envelopeStatus: "completed", callStatus: status("completed"), wantFinish: "tool_calls", wantCalls: 1},
+		{name: "completed response with omitted call status", envelopeStatus: "completed", wantFinish: "tool_calls", wantCalls: 1},
+		{name: "completed response rejects incomplete call", envelopeStatus: "completed", callStatus: status("incomplete"), wantError: true},
+		{name: "completed response rejects in progress call", envelopeStatus: "completed", callStatus: status("in_progress"), wantError: true},
+		{name: "completed response rejects unknown call status", envelopeStatus: "completed", callStatus: status("mystery"), wantError: true},
+		{name: "incomplete response with completed call", envelopeStatus: "incomplete", callStatus: status("completed"), wantFinish: "tool_calls", wantCalls: 1},
+		{name: "incomplete response with incomplete call", envelopeStatus: "incomplete", callStatus: status("incomplete"), wantFinish: "length"},
+		{name: "incomplete response with omitted call status", envelopeStatus: "incomplete", wantFinish: "length"},
+		{name: "incomplete response rejects in progress call", envelopeStatus: "incomplete", callStatus: status("in_progress"), wantError: true},
+		{name: "incomplete response rejects unknown call status", envelopeStatus: "incomplete", callStatus: status("mystery"), wantError: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := map[string]any{
+				"type":      "function_call",
+				"id":        "fc-function-status",
+				"call_id":   "call-function-status",
+				"name":      "lookup",
+				"arguments": `{}`,
+			}
+			if tt.callStatus != nil {
+				call["status"] = *tt.callStatus
+			}
+			envelope := map[string]any{
+				"id":         "resp-function-status",
+				"created_at": int64(1_700_000_000),
+				"status":     tt.envelopeStatus,
+				"output":     []any{call},
+			}
+			if tt.envelopeStatus == "incomplete" {
+				envelope["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+			}
+			body, err := json.Marshal(envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := newResponsesChatReplayStore()
+			t.Cleanup(func() { _ = store.Close() })
+			result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
+				PublicModel: "gpt-public",
+				ReplayStore: store,
+				ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
+			})
+			if tt.wantError {
+				var executionErr *chatExecutionError
+				if !errors.As(err, &executionErr) || executionErr.Code != "unsupported_responses_output" {
+					t.Fatalf("error = %#v, want unsupported_responses_output", err)
+				}
+				if stats := store.Stats(); stats.Groups != 0 || stats.Calls != 0 {
+					t.Fatalf("replay stats = %#v", stats)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("translateResponsesJSONToChat() error = %v", err)
+			}
+			choice := result.Response.Choices[0]
+			if choice.FinishReason == nil || *choice.FinishReason != tt.wantFinish || len(choice.Message.ToolCalls) != tt.wantCalls {
+				t.Fatalf("choice = %#v, want finish %q and %d calls", choice, tt.wantFinish, tt.wantCalls)
+			}
+			stats := store.Stats()
+			if tt.wantCalls > 0 {
+				if stats.Groups != 1 || stats.Calls != tt.wantCalls {
+					t.Fatalf("replay stats = %#v", stats)
+				}
+			} else if stats.Groups != 0 || stats.Calls != 0 {
+				t.Fatalf("replay stats = %#v", stats)
+			}
+		})
+	}
+}

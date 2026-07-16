@@ -106,12 +106,16 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 				if err != nil {
 					return responsesChatJSONResult{}, err
 				}
-				if call.Status != "completed" {
-					if strings.TrimSpace(envelope.Status) == "incomplete" {
-						sawIncompleteFunctionCall = true
-						continue
-					}
-					return responsesChatJSONResult{}, newChatServerError("unsupported_responses_output", "non-completed function call appeared in a completed Responses body")
+				completed, err := responsesChatFunctionCallCompleted(envelope.Status, call.Status)
+				if err != nil {
+					return responsesChatJSONResult{}, err
+				}
+				if !completed {
+					sawIncompleteFunctionCall = true
+					continue
+				}
+				if call.UpstreamCallID == "" || call.Name == "" || !call.ArgumentsPresent {
+					return responsesChatJSONResult{}, newChatServerError("unsupported_responses_output", "completed function-call output item is incomplete")
 				}
 				functionCalls = append(functionCalls, call)
 			case "":
@@ -248,6 +252,34 @@ func validateResponsesChatReasoningStatus(responseStatus, reasoningStatus string
 	return nil
 }
 
+func normalizeResponsesChatTerminalFunctionCallStatus(status string) (string, error) {
+	status = strings.TrimSpace(status)
+	switch status {
+	case "", "completed", "incomplete":
+		return status, nil
+	default:
+		return "", newChatServerError("unsupported_responses_output", fmt.Sprintf("terminal function-call status %q is not supported", status))
+	}
+}
+
+func responsesChatFunctionCallCompleted(responseStatus, callStatus string) (bool, error) {
+	callStatus, err := normalizeResponsesChatTerminalFunctionCallStatus(callStatus)
+	if err != nil {
+		return false, err
+	}
+	switch strings.TrimSpace(responseStatus) {
+	case "completed":
+		if callStatus == "" || callStatus == "completed" {
+			return true, nil
+		}
+		return false, newChatServerError("unsupported_responses_output", "incomplete function call appeared in a completed Responses result")
+	case "incomplete":
+		return callStatus == "completed", nil
+	default:
+		return callStatus == "completed", nil
+	}
+}
+
 func responsesChatMessageContent(raw json.RawMessage) (string, string, error) {
 	var item struct {
 		Role    string `json:"role"`
@@ -335,11 +367,12 @@ func newChatServerError(code, message string) *chatExecutionError {
 }
 
 type responsesChatParsedFunctionCall struct {
-	UpstreamCallID  string
-	Name            string
-	Arguments       string
-	Status          string
-	OutputItemIndex int
+	UpstreamCallID   string
+	Name             string
+	Arguments        string
+	ArgumentsPresent bool
+	Status           string
+	OutputItemIndex  int
 }
 
 func parseResponsesChatFunctionCall(raw json.RawMessage, outputIndex int) (responsesChatParsedFunctionCall, error) {
@@ -364,11 +397,12 @@ func parseResponsesChatFunctionCall(raw json.RawMessage, outputIndex int) (respo
 		arguments = *call.Arguments
 	}
 	return responsesChatParsedFunctionCall{
-		UpstreamCallID:  call.CallID,
-		Name:            call.Name,
-		Arguments:       arguments,
-		Status:          call.Status,
-		OutputItemIndex: outputIndex,
+		UpstreamCallID:   call.CallID,
+		Name:             call.Name,
+		Arguments:        arguments,
+		ArgumentsPresent: call.Arguments != nil,
+		Status:           call.Status,
+		OutputItemIndex:  outputIndex,
 	}, nil
 }
 
