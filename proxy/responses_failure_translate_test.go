@@ -94,7 +94,7 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-huge-retry-ms\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"}}}\n\n",
 			headers: http.Header{
 				"Content-Type":   []string{"text/event-stream"},
-				"retry-after-ms": []string{"9223372036854775807"},
+				"retry-after-ms": []string{"9223372036854775808"},
 			},
 			wantStatus:       http.StatusTooManyRequests,
 			wantContentType:  "application/json",
@@ -408,7 +408,7 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			headers: http.Header{
 				"Content-Type":                   []string{"text/event-stream"},
 				"x-ratelimit-remaining-requests": []string{"0"},
-				"x-ratelimit-reset-requests":     []string{"10000000000"},
+				"x-ratelimit-reset-requests":     []string{"9223372036854775808"},
 			},
 			wantStatus:       http.StatusTooManyRequests,
 			wantContentType:  "application/json",

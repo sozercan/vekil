@@ -553,6 +553,7 @@ func TestParseRetryAfter(t *testing.T) {
 		{"120", 120 * time.Second, true},
 		{"999999", maxRetryAfter, true},
 		{"10000000000", maxRetryAfter, true},
+		{"9223372036854775808", maxRetryAfter, true},
 		{"Wed, 21 Oct 2015 07:28:00 GMT", 0, false},
 	}
 

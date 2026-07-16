@@ -1585,11 +1585,8 @@ func responsesQuotaRemaining(headers http.Header, dimension string) (int64, bool
 
 func responsesQuotaResetSeconds(headers http.Header, dimension string) int64 {
 	value := strings.TrimSpace(headerGetCI(headers, "x-ratelimit-reset-"+dimension))
-	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
-		if seconds > 0 {
-			return seconds
-		}
-		return 0
+	if seconds, ok := parsePositiveDecimalClamped(value, int64(maxRetryAfter/time.Second)); ok {
+		return seconds
 	}
 	delay, err := time.ParseDuration(value)
 	if err != nil || delay <= 0 {
@@ -1637,8 +1634,7 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 	}
 
 	if value := strings.TrimSpace(headerGetCI(headers, "retry-after-ms")); value != "" {
-		ms, err := strconv.ParseInt(value, 10, 64)
-		if err == nil && ms > 0 {
+		if ms, ok := parsePositiveDecimalClamped(value, int64(maxRetryAfter/time.Millisecond)); ok {
 			delay := retryAfterDurationFromMilliseconds(ms)
 			seconds := durationSecondsCeil(delay)
 			if seconds > 0 {
