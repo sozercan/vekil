@@ -16,6 +16,37 @@ import (
 	"github.com/sozercan/vekil/logger"
 )
 
+type retryPublicModelContextKey struct{}
+
+type retryPublicModelInfo struct {
+	model string
+	known bool
+}
+
+func withRetryPublicModel(ctx context.Context, model string, known bool) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, retryPublicModelContextKey{}, retryPublicModelInfo{model: boundStatLabel(strings.TrimSpace(model)), known: known})
+}
+
+func retryMetricLabelsFromContext(ctx context.Context) (provider, model string, modelKnown bool) {
+	if ctx == nil {
+		return "", "", false
+	}
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		d := readSummaryForStats(summary)
+		provider, model, modelKnown = d.provider, d.metricModel, d.modelKnown
+	}
+	if route, ok := ctx.Value(providerRouteContextKey{}).(providerRouteInfo); ok && route.id != "" {
+		provider = route.id
+	}
+	if publicModel, _ := ctx.Value(retryPublicModelContextKey{}).(retryPublicModelInfo); publicModel.model != "" {
+		model, modelKnown = publicModel.model, publicModel.known
+	}
+	return provider, model, modelKnown
+}
+
 const (
 	upstreamErrorDetailDrainTimeout = 250 * time.Millisecond
 	maxRetryBackoff                 = 30 * time.Second
@@ -248,7 +279,11 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		lifecyclePreempted := errors.Is(context.Cause(req.Context()), errProxyLifecycleShutdown) &&
 			contextTerminationMatches(req.Context(), err)
 		if pending != nil && !lifecyclePreempted {
-			h.logRetryAttempt(req.Context(), pending.attempt, pending.status, pending.retryAfter, pending.delay, pending.err)
+			retryCtx := pending.requestCtx
+			if retryCtx == nil {
+				retryCtx = req.Context()
+			}
+			h.logRetryAttempt(retryCtx, pending.attempt, pending.status, pending.retryAfter, pending.delay, pending.err)
 		}
 		pending = nil
 		if err != nil {
@@ -270,7 +305,7 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 				if ctxErr := req.Context().Err(); ctxErr != nil {
 					return nil, ctxErr
 				}
-				pending = &pendingRetryAttempt{attempt: attempt, delay: delay, err: err}
+				pending = &pendingRetryAttempt{attempt: attempt, delay: delay, err: err, requestCtx: req.Context()}
 			}
 			continue
 		}
@@ -355,13 +390,8 @@ func (h *ProxyHandler) logRetryAttempt(ctx context.Context, attempt int, status 
 		h.stats.incRetry(status)
 	}
 	if h != nil && h.metrics != nil && isRetryStatsTracked(ctx) {
-		var provider, model string
-		if summary := RequestSummaryFromContext(ctx); summary != nil {
-			d := readSummaryForStats(summary)
-			provider = d.provider
-			model = d.model
-		}
-		h.metrics.RecordRetry(provider, model, status)
+		provider, model, modelKnown := retryMetricLabelsFromContext(ctx)
+		h.metrics.recordRetry(provider, model, status, modelKnown)
 	}
 	if h == nil || h.log == nil {
 		return

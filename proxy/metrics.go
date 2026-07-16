@@ -11,6 +11,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+const metricsUnroutedModel = "unrouted"
+
 var llmRequestDurationBuckets = []float64{
 	0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
 	20, 30, 60, 120, 300,
@@ -116,7 +118,7 @@ func (m *MetricsCollector) Record(summary *RequestSummary, status int, dur time.
 
 	d := readSummaryForStats(summary)
 	provider := d.provider
-	model := m.modelLabel(d.model)
+	model := m.modelLabel(provider, d.metricModel, d.modelKnown)
 	endpoint := d.endpoint
 	statusStr := strconv.Itoa(status)
 
@@ -138,17 +140,17 @@ func (m *MetricsCollector) Record(summary *RequestSummary, status int, dur time.
 // RecordResponsesTurn records a websocket-bridge turn into Prometheus metrics.
 // Websocket turn failures are recorded after the upstream request path starts.
 func (m *MetricsCollector) RecordResponsesTurn(model, provider string, status int, usage responsesUsage) responsesTurnMetricsRecord {
-	return m.recordResponsesTurn(model, provider, status, usage, true)
+	return m.recordResponsesTurn(model, provider, status, usage, true, true)
 }
 
-func (m *MetricsCollector) recordResponsesTurn(model, provider string, status int, usage responsesUsage, upstreamAttempted bool) responsesTurnMetricsRecord {
+func (m *MetricsCollector) recordResponsesTurn(model, provider string, status int, usage responsesUsage, upstreamAttempted, modelKnown bool) responsesTurnMetricsRecord {
 	if m == nil {
 		return responsesTurnMetricsRecord{}
 	}
 	if status == 0 {
 		status = http.StatusOK
 	}
-	model = m.modelLabel(model)
+	model = m.modelLabel(provider, model, modelKnown)
 	statusStr := strconv.Itoa(status)
 
 	m.requestsTotal.WithLabelValues(provider, model, "responses_ws", statusStr).Inc()
@@ -180,23 +182,34 @@ func (m *MetricsCollector) addTokens(provider, model string, prompt, completion 
 
 // RecordRetry records one upstream retry attempt.
 func (m *MetricsCollector) RecordRetry(provider, model string, status int) {
+	m.recordRetry(provider, model, status, true)
+}
+
+func (m *MetricsCollector) recordRetry(provider, model string, status int, modelKnown bool) {
 	if m == nil {
 		return
 	}
 	reason := retryReasonLabel(status)
-	m.retriesTotal.WithLabelValues(provider, m.modelLabel(model), reason).Inc()
+	m.retriesTotal.WithLabelValues(provider, m.modelLabel(provider, model, modelKnown), reason).Inc()
 }
 
 // modelLabel bounds both the length and lifetime cardinality of the
 // client-controlled public_model dimension. All metric families share this
 // registry so overflow values consistently fold into one "other" series.
-func (m *MetricsCollector) modelLabel(model string) string {
+func (m *MetricsCollector) modelLabel(provider, model string, modelKnown bool) string {
 	if m == nil {
 		return ""
 	}
 	model = boundStatLabel(model)
 	if model == "" {
 		return ""
+	}
+	// Only models resolved from the configured/dynamic catalog enter the
+	// persistent budget. Default-provider fallbacks and locally unrouted client
+	// values share one stable label so invalid names cannot force configured
+	// models into the overflow bucket until restart.
+	if provider == "" || !modelKnown {
+		return metricsUnroutedModel
 	}
 
 	m.modelLabelsMu.Lock()

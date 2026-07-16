@@ -1250,6 +1250,8 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	// counters. GET /v1/responses is not an inference route, so the middleware
 	// never marks it; do it explicitly here.
 	upstreamCtx = markRetryStatsTracked(upstreamCtx)
+	_, _, retryModelKnown := h.resolveProviderModel(request.Model, providerEndpointResponses)
+	upstreamCtx = withRetryPublicModel(upstreamCtx, request.Model, retryModelKnown)
 	upstreamCtx, upstreamAttempt = withUpstreamAttemptObserver(upstreamCtx)
 	upstreamCtx, routeObserver := withProviderRouteObserver(upstreamCtx)
 	inflightGen := s.setInflightCancel(upstreamCancel)
@@ -1438,12 +1440,11 @@ func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model, prov
 	if h == nil {
 		return responsesTurnStatsRecord{}
 	}
-	if providerID == "" {
-		if provider, _, _ := h.resolveProviderModel(model, providerEndpointResponses); provider != nil {
-			providerID, providerKind = provider.id, string(provider.kind)
-		}
+	provider, _, modelKnown := h.resolveProviderModel(model, providerEndpointResponses)
+	if providerID == "" && provider != nil {
+		providerID, providerKind = provider.id, string(provider.kind)
 	}
-	return h.recordResponsesTurn(model, providerID, providerKind, classifyAgent(s.userAgent), status, usage, upstreamAttempted)
+	return h.recordResponsesTurn(model, providerID, providerKind, classifyAgent(s.userAgent), status, usage, upstreamAttempted, modelKnown)
 }
 
 func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) (responsesWebSocketRequestPlan, error) {
@@ -1649,6 +1650,8 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, req
 	// Mark the compaction upstream context as retry-trackable, like the turn
 	// itself, so retries during auto-compaction are counted in retry stats.
 	ctx = markRetryStatsTracked(ctx)
+	_, _, modelKnown := h.resolveProviderModel(request.Model, providerEndpointResponses)
+	ctx = withRetryPublicModel(ctx, request.Model, modelKnown)
 	inflightGen := s.setInflightCancel(cancel)
 	defer func() {
 		s.clearInflightCancel(inflightGen)

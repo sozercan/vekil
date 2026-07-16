@@ -2663,7 +2663,8 @@ func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Conte
 		logger.F("fallback_model", fallbackModel),
 	)
 
-	retryResp, retryErr := h.postResponsesWithHeaders(ctx, fallbackBody, extraHeaders)
+	fallbackCtx := withRetryPublicModel(ctx, fallbackModel, true)
+	retryResp, retryErr := h.postResponsesWithHeaders(fallbackCtx, fallbackBody, extraHeaders)
 	if retryErr != nil {
 		h.log.Debug("responses fallback request failed", logger.Err(retryErr))
 		return resp, "", nil
@@ -2677,6 +2678,9 @@ func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Conte
 // compact calls in the same fanout pre-rewrite their body via
 // applyResolvedCompactModel and skip the unsupported-model probe entirely.
 func (h *ProxyHandler) postResponsesCompactWithFallback(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, budget *compactBudget) (*http.Response, error) {
+	if resolvedModel := budget.resolvedModelValue(); resolvedModel != "" && extractResponsesRequestModel(bodyBytes) == resolvedModel {
+		ctx = withRetryPublicModel(ctx, resolvedModel, true)
+	}
 	resp, fallbackModel, err := h.postResponsesWithFallbackHeadersTracked(ctx, bodyBytes, extraHeaders)
 	if err != nil {
 		return nil, err

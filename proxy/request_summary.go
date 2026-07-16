@@ -25,8 +25,10 @@ type RequestSummary struct {
 
 	endpoint          string
 	model             string
+	metricModel       string
 	provider          string
 	providerKind      string
+	modelKnown        bool
 	streamSet         bool
 	stream            bool
 	upstreamRequestID string
@@ -115,12 +117,17 @@ func (s *RequestSummary) setRoute(endpoint, model string, stream bool) {
 	}
 	if model = strings.TrimSpace(model); model != "" {
 		s.model = model
+		s.metricModel = model
 	}
 	s.stream = stream
 	s.streamSet = true
 }
 
 func (s *RequestSummary) setProvider(provider, kind string) {
+	s.setProviderModel(provider, kind, true, "")
+}
+
+func (s *RequestSummary) setProviderModel(provider, kind string, modelKnown bool, canonicalModel string) {
 	if s == nil {
 		return
 	}
@@ -132,6 +139,10 @@ func (s *RequestSummary) setProvider(provider, kind string) {
 	if kind = strings.TrimSpace(kind); kind != "" {
 		s.providerKind = kind
 	}
+	if canonicalModel = strings.TrimSpace(canonicalModel); modelKnown && canonicalModel != "" {
+		s.metricModel = canonicalModel
+	}
+	s.modelKnown = modelKnown
 }
 
 func (s *RequestSummary) markUpstreamAttempted() {
@@ -316,11 +327,11 @@ func (h *ProxyHandler) observeRequestSummaryWithProviderModel(ctx context.Contex
 		return
 	}
 	summary.setRoute(endpoint, model, stream)
-	provider, _, _ := h.resolveProviderModelForRequest(providerModel, providerEndpoint)
+	provider, owner, modelKnown := h.resolveProviderModelForRequest(providerModel, providerEndpoint)
 	if provider == nil {
 		return
 	}
-	summary.setProvider(provider.id, string(provider.kind))
+	summary.setProviderModel(provider.id, string(provider.kind), modelKnown, owner.publicID)
 }
 
 func observeOpenAIUsage(ctx context.Context, usage *models.OpenAIUsage) {

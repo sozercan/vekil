@@ -10,6 +10,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	io_prometheus_client "github.com/prometheus/client_model/go"
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 func TestMetricsCollector_Record(t *testing.T) {
@@ -17,6 +19,7 @@ func TestMetricsCollector_Record(t *testing.T) {
 		name              string
 		provider          string
 		model             string
+		wantModel         string
 		endpoint          string
 		status            int
 		stream            bool
@@ -64,6 +67,7 @@ func TestMetricsCollector_Record(t *testing.T) {
 			name:           "local validation error is not an upstream error",
 			provider:       "",
 			model:          "bad-model",
+			wantModel:      metricsUnroutedModel,
 			endpoint:       "openai_chat",
 			status:         400,
 			stream:         false,
@@ -101,6 +105,7 @@ func TestMetricsCollector_Record(t *testing.T) {
 			summary.endpoint = tt.endpoint
 			summary.stream = tt.stream
 			summary.upstreamAttempted = tt.upstreamAttempted
+			summary.modelKnown = tt.provider != ""
 			if tt.prompt > 0 {
 				p := tt.prompt
 				summary.promptTokens = &p
@@ -117,6 +122,11 @@ func TestMetricsCollector_Record(t *testing.T) {
 
 			m.Record(summary, tt.status, tt.dur)
 
+			wantModel := tt.wantModel
+			if wantModel == "" {
+				wantModel = tt.model
+			}
+
 			// Use the registry to gather all metrics
 			metrics, err := m.registry.Gather()
 			if err != nil {
@@ -125,7 +135,7 @@ func TestMetricsCollector_Record(t *testing.T) {
 
 			gotRequests := getCounterValue(metrics, "vekil_requests_total", map[string]string{
 				"provider":     tt.provider,
-				"public_model": tt.model,
+				"public_model": wantModel,
 				"endpoint":     tt.endpoint,
 			})
 			if gotRequests != tt.wantRequests {
@@ -135,7 +145,7 @@ func TestMetricsCollector_Record(t *testing.T) {
 			if tt.wantPrompt > 0 {
 				gotPrompt := getCounterValue(metrics, "vekil_tokens_total", map[string]string{
 					"provider":     tt.provider,
-					"public_model": tt.model,
+					"public_model": wantModel,
 					"direction":    "prompt",
 				})
 				if gotPrompt != tt.wantPrompt {
@@ -146,7 +156,7 @@ func TestMetricsCollector_Record(t *testing.T) {
 			if tt.wantCompletion > 0 {
 				gotCompletion := getCounterValue(metrics, "vekil_tokens_total", map[string]string{
 					"provider":     tt.provider,
-					"public_model": tt.model,
+					"public_model": wantModel,
 					"direction":    "completion",
 				})
 				if gotCompletion != tt.wantCompletion {
@@ -156,7 +166,7 @@ func TestMetricsCollector_Record(t *testing.T) {
 
 			gotErrors := getCounterValue(metrics, "vekil_upstream_errors_total", map[string]string{
 				"provider":     tt.provider,
-				"public_model": tt.model,
+				"public_model": wantModel,
 			})
 			if gotErrors != tt.wantErrors {
 				t.Errorf("upstream_errors_total = %v, want %v", gotErrors, tt.wantErrors)
@@ -166,7 +176,7 @@ func TestMetricsCollector_Record(t *testing.T) {
 			if !tt.stream && tt.dur > 0 {
 				gotHistCount := getHistogramCount(metrics, "vekil_request_duration_seconds", map[string]string{
 					"provider":     tt.provider,
-					"public_model": tt.model,
+					"public_model": wantModel,
 					"endpoint":     tt.endpoint,
 				})
 				if gotHistCount != 1 {
@@ -176,7 +186,7 @@ func TestMetricsCollector_Record(t *testing.T) {
 			if tt.stream {
 				gotHistCount := getHistogramCount(metrics, "vekil_request_duration_seconds", map[string]string{
 					"provider":     tt.provider,
-					"public_model": tt.model,
+					"public_model": wantModel,
 					"endpoint":     tt.endpoint,
 				})
 				if gotHistCount != 0 {
@@ -233,6 +243,104 @@ func TestMetricsCollector_RecordResponsesTurn(t *testing.T) {
 		"code":         "429",
 	}); got != 1 {
 		t.Errorf("upstream errors = %v, want 1", got)
+	}
+}
+
+func TestMetricsCollector_UnroutedModelsDoNotConsumeBudget(t *testing.T) {
+	m := NewMetricsCollector()
+	for i := 0; i < statsMaxKeys+5; i++ {
+		summary := &RequestSummary{}
+		summary.setRoute("openai_chat", fmt.Sprintf("invalid-%03d", i), false)
+		m.Record(summary, http.StatusBadRequest, time.Millisecond)
+	}
+	if got := len(m.modelLabels); got != 0 {
+		t.Fatalf("unrouted requests consumed %d model budget entries, want 0", got)
+	}
+
+	valid := &RequestSummary{}
+	valid.setRoute("openai_chat", "valid-after-invalid", false)
+	valid.setProvider("copilot", "copilot")
+	m.Record(valid, http.StatusOK, time.Millisecond)
+	if _, ok := m.modelLabels["valid-after-invalid"]; !ok {
+		t.Fatal("routed model was not admitted after invalid-model traffic")
+	}
+
+	metrics, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	if got := getCounterValue(metrics, "vekil_requests_total", map[string]string{
+		"provider":     "",
+		"public_model": metricsUnroutedModel,
+		"endpoint":     "openai_chat",
+		"status":       "400",
+	}); got != statsMaxKeys+5 {
+		t.Errorf("unrouted request count = %v, want %d", got, statsMaxKeys+5)
+	}
+	if got := getCounterValue(metrics, "vekil_requests_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": "valid-after-invalid",
+		"endpoint":     "openai_chat",
+		"status":       "200",
+	}); got != 1 {
+		t.Errorf("routed request count = %v, want 1", got)
+	}
+}
+
+func TestMetricsCollector_CanonicalizesKnownAnthropicAliases(t *testing.T) {
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithMetricsEnabled(false),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "alias-provider",
+			Type:     "openai-compatible",
+			Default:  true,
+			BaseURL:  "http://upstream.test",
+			AuthType: "none",
+			Models: []ProviderModelConfig{{
+				PublicID:  "claude-sonnet-4",
+				Endpoints: []string{"/chat/completions"},
+			}},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+
+	m := NewMetricsCollector()
+	for i := 0; i < statsMaxKeys+5; i++ {
+		rawModel := fmt.Sprintf("claude-sonnet-4-%08d", 20250000+i)
+		ctx, summary := WithRequestSummary(context.Background())
+		handler.observeRequestSummaryWithProviderModel(
+			ctx,
+			"anthropic",
+			rawModel,
+			NormalizeModelName(rawModel),
+			false,
+			providerEndpointChatCompletions,
+		)
+		d := readSummaryForStats(summary)
+		if !d.modelKnown || d.metricModel != "claude-sonnet-4" {
+			t.Fatalf("alias %q resolved to known=%t metric_model=%q", rawModel, d.modelKnown, d.metricModel)
+		}
+		m.Record(summary, http.StatusOK, time.Millisecond)
+	}
+
+	if got := len(m.modelLabels); got != 1 {
+		t.Fatalf("canonical aliases consumed %d model budget entries, want 1", got)
+	}
+	families, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	if got := getCounterValue(families, "vekil_requests_total", map[string]string{
+		"provider":     "alias-provider",
+		"public_model": "claude-sonnet-4",
+		"endpoint":     "anthropic",
+		"status":       "200",
+	}); got != statsMaxKeys+5 {
+		t.Fatalf("canonical alias request count = %v, want %d", got, statsMaxKeys+5)
 	}
 }
 
@@ -399,6 +507,64 @@ func TestMetricsCollector_RecordRetry(t *testing.T) {
 	})
 	if gotTimeout != 1 {
 		t.Errorf("retries(timeout) = %v, want 1", gotTimeout)
+	}
+}
+
+func TestDoWithRetryKeepsFailingAttemptMetricLabels(t *testing.T) {
+	m := NewMetricsCollector()
+	h := &ProxyHandler{
+		metrics:        m,
+		maxRetries:     2,
+		retryBaseDelay: time.Nanosecond,
+	}
+	h.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		route, _ := req.Context().Value(providerRouteContextKey{}).(providerRouteInfo)
+		status := http.StatusOK
+		if route.id == "first-provider" {
+			status = http.StatusServiceUnavailable
+		}
+		return &http.Response{
+			StatusCode: status,
+			Header:     make(http.Header),
+			Body:       http.NoBody,
+			Request:    req,
+		}, nil
+	})}
+
+	baseCtx := markRetryStatsTracked(context.Background())
+	baseCtx = withRetryPublicModel(baseCtx, "gpt-5.4", true)
+	attempt := 0
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		attempt++
+		provider := "first-provider"
+		if attempt > 1 {
+			provider = "second-provider"
+		}
+		ctx := context.WithValue(baseCtx, providerRouteContextKey{}, providerRouteInfo{id: provider, kind: "test"})
+		return http.NewRequestWithContext(ctx, http.MethodPost, "http://upstream.test/responses", nil)
+	})
+	if err != nil {
+		t.Fatalf("doWithRetry() error = %v", err)
+	}
+	_ = resp.Body.Close()
+
+	metrics, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	if got := getCounterValue(metrics, "vekil_retries_total", map[string]string{
+		"provider":     "first-provider",
+		"public_model": "gpt-5.4",
+		"reason":       "5xx",
+	}); got != 1 {
+		t.Fatalf("failing-attempt retry metric = %v, want 1", got)
+	}
+	if got := getCounterValue(metrics, "vekil_retries_total", map[string]string{
+		"provider":     "second-provider",
+		"public_model": "gpt-5.4",
+		"reason":       "5xx",
+	}); got != 0 {
+		t.Fatalf("next-attempt retry metric = %v, want 0", got)
 	}
 }
 

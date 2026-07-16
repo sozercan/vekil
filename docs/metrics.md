@@ -76,7 +76,7 @@ An example Grafana dashboard JSON is provided at [`docs/grafana-dashboard.json`]
 ## Label Notes
 
 - `provider`: the provider ID from your providers config (e.g., `copilot`, `azure-prod`), or empty for requests that fail before routing resolves.
-- `public_model`: the public model name as seen by the client (e.g., `claude-sonnet-4`, `gpt-4o`). Values are length-bounded, and after 200 distinct model labels per process, new values fold into `other` to protect Prometheus cardinality.
+- `public_model`: the canonical configured public model ID (e.g., `claude-sonnet-4`, `gpt-4o`). Accepted aliases normalize to that catalog ID; unconfigured or unrouted client values fold into `unrouted`. Routed values are length-bounded, and after 200 distinct routed model labels per process, new values fold into `other` to protect Prometheus cardinality.
 - `endpoint`: the internal endpoint type emitted by tracked routes: `openai_chat`, `anthropic`, `gemini`, `responses`, or `responses_ws`.
 - `status`: HTTP status code as a string (e.g., `200`, `429`, `500`).
 - `direction`: `prompt` or `completion` for token counters.

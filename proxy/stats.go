@@ -742,11 +742,13 @@ func breakdownLabel(b statsBreakdown) string {
 // summaryStats is the subset of a RequestSummary the collector folds in.
 type summaryStats struct {
 	model             string
+	metricModel       string
 	provider          string
 	kind              string
 	endpoint          string
 	upstreamID        string
 	upstreamAttempted bool
+	modelKnown        bool
 	stream            bool
 	prompt            int
 	completion        int
@@ -767,11 +769,16 @@ func readSummaryForStats(summary *RequestSummary) summaryStats {
 	// stats (the cardinality cap limits count, not size). provider/kind are
 	// configured server-side, so they are trusted.
 	d.model = boundStatLabel(summary.model)
+	d.metricModel = boundStatLabel(summary.metricModel)
+	if d.metricModel == "" {
+		d.metricModel = d.model
+	}
 	d.provider = summary.provider
 	d.kind = summary.providerKind
 	d.endpoint = summary.endpoint
 	d.upstreamID = summary.upstreamRequestID
 	d.upstreamAttempted = summary.upstreamAttempted
+	d.modelKnown = summary.modelKnown
 	d.stream = summary.stream
 	if summary.promptTokens != nil {
 		d.prompt = *summary.promptTokens
@@ -1000,10 +1007,10 @@ func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAg
 // post-terminal usage amendments without creating synthetic requests. status is
 // the client turn outcome so failed turns appear in error counts.
 func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage) responsesTurnStatsRecord {
-	return h.recordResponsesTurn(model, provider, kind, agentLabel, status, usage, true)
+	return h.recordResponsesTurn(model, provider, kind, agentLabel, status, usage, true, true)
 }
 
-func (h *ProxyHandler) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, upstreamAttempted bool) responsesTurnStatsRecord {
+func (h *ProxyHandler) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, upstreamAttempted, modelKnown bool) responsesTurnStatsRecord {
 	if h == nil {
 		return responsesTurnStatsRecord{}
 	}
@@ -1013,7 +1020,7 @@ func (h *ProxyHandler) recordResponsesTurn(model, provider, kind, agentLabel str
 		record = h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage)
 	}
 	if h.metrics != nil {
-		record.metrics = h.metrics.recordResponsesTurn(model, provider, status, usage, upstreamAttempted)
+		record.metrics = h.metrics.recordResponsesTurn(model, provider, status, usage, upstreamAttempted, modelKnown)
 	}
 	return record
 }

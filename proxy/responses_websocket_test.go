@@ -1069,6 +1069,109 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 	}
 }
 
+func TestResponsesWebSocketAutoCompactionRetryMetricsKeepFallbackModel(t *testing.T) {
+	var logs strings.Builder
+	var responsePosts atomic.Int32
+	var fallbackPosts atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/models" {
+			_, _ = fmt.Fprint(w, `{"data":[{"id":"gpt-fallback","object":"model","supported_endpoints":["/responses"],"capabilities":{"supports":{"streaming":true,"tool_calls":true}}}]}`)
+			return
+		}
+		if got, want := r.URL.Path, "/responses"; got != want {
+			t.Errorf("upstream path = %q, want %q", got, want)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		model := extractResponsesRequestModel(body)
+		responsePosts.Add(1)
+		switch model {
+		case "gpt-unsupported":
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprint(w, `{"error":{"message":"model not supported","param":"model","code":"model_not_supported"}}`)
+		case "gpt-fallback":
+			if fallbackPosts.Add(1) == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = fmt.Fprint(w, `{"error":{"message":"retry fallback compaction"}}`)
+				return
+			}
+			_, _ = fmt.Fprint(w, `{"id":"comp-retry","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint summary"}]}],"usage":{"input_tokens":11,"output_tokens":2,"total_tokens":13}}`)
+		default:
+			t.Errorf("unexpected upstream model %q", model)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelDebug, &logs),
+		WithCopilotBaseURL(upstream.URL),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	handler.maxRetries = 2
+	handler.retryBaseDelay = time.Nanosecond
+	handler.responsesWS = ResponsesWebSocketConfig{
+		AutoCompactMaxItems: 2,
+		AutoCompactMaxBytes: 1 << 20,
+		AutoCompactKeepTail: 1,
+	}
+
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"first"}]}`),
+		json.RawMessage(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second"}]}`),
+		json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"third"}]}`),
+	}
+	session := &responsesWebSocketSession{
+		ctx:          context.Background(),
+		historyItems: history,
+		historyBytes: rawMessagesSize(history),
+	}
+	payload := newResponsesWebSocketCreateRequest(nil)
+	payload["model"] = "gpt-unsupported"
+	request := mustParseResponsesWebSocketCreateRequest(t, payload)
+
+	result, usage := session.maybeAutoCompactHistory(handler, request, responsesWebSocketRequestMetrics{})
+	if !result.autoCompacted {
+		t.Fatalf("auto-compaction did not complete: responses_posts=%d fallback_posts=%d usage=%+v logs=%s", responsePosts.Load(), fallbackPosts.Load(), usage, logs.String())
+	}
+	if got := responsePosts.Load(); got != 3 {
+		t.Fatalf("responses POSTs = %d, want unsupported probe + two fallback attempts", got)
+	}
+	if got := fallbackPosts.Load(); got != 2 {
+		t.Fatalf("fallback POSTs = %d, want 2", got)
+	}
+	if got, want := usage.totalTokens(), 13; got != want {
+		t.Fatalf("auto-compaction tokens = %d, want %d", got, want)
+	}
+
+	families, err := handler.metrics.registry.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	if got := getCounterValue(families, "vekil_retries_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": "gpt-fallback",
+		"reason":       "5xx",
+	}); got != 1 {
+		t.Fatalf("fallback retry metric = %v, want 1", got)
+	}
+	if got := getCounterValue(families, "vekil_retries_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": metricsUnroutedModel,
+		"reason":       "5xx",
+	}); got != 0 {
+		t.Fatalf("stale original-model retry metric = %v, want 0", got)
+	}
+}
+
 func TestResponsesWebSocketDefaultAutoCompactCoversObservedPressure(t *testing.T) {
 	cfg := DefaultResponsesWebSocketConfig()
 	if cfg.AutoCompactKeepTail >= 10 {
