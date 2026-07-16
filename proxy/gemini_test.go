@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
 
@@ -2429,6 +2431,74 @@ func TestHandleGeminiModelsPost200StreamErrorMatrix(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestHandleGeminiModelsCountTokensRejectsIneligibleExplicitRoute(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(upstream.Close)
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(ProvidersConfig{
+			SchemaVersion: ProvidersConfigSchemaVersion2,
+			Providers: []ProviderConfig{{
+				ID:      "azure",
+				Type:    string(providerTypeAzureOpenAI),
+				Default: true,
+				BaseURL: upstream.URL + "/openai/v1",
+				APIKey:  "azure-key",
+			}},
+			ModelRoutes: []ModelRouteConfig{{
+				ID:        "responses-route",
+				PublicID:  "public-model",
+				Endpoints: []string{providerEndpointResponses},
+				Targets: []ModelRouteTargetConfig{{
+					ID:            "primary",
+					Provider:      "azure",
+					UpstreamModel: "physical-model",
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	t.Cleanup(handler.BeginShutdown)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/public-model:countTokens", strings.NewReader(`{
+		"contents": [{"role":"user","parts":[{"text":"Count this"}]}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleGeminiModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("StatusCode = %d, want 400; body=%s", resp.StatusCode, w.Body.String())
+	}
+
+	var errResp models.GeminiErrorResponse
+	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode Gemini error response: %v", err)
+	}
+	if errResp.Error.Code != http.StatusBadRequest {
+		t.Errorf("Error.Code = %d, want 400", errResp.Error.Code)
+	}
+	if errResp.Error.Status != "INVALID_ARGUMENT" {
+		t.Errorf("Error.Status = %q, want INVALID_ARGUMENT", errResp.Error.Status)
+	}
+	if !strings.Contains(errResp.Error.Message, `model "public-model" does not support /chat/completions`) {
+		t.Errorf("Error.Message = %q, want unsupported endpoint detail", errResp.Error.Message)
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Fatalf("upstream calls = %d, want 0", got)
 	}
 }
 

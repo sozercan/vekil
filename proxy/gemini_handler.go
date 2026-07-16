@@ -274,7 +274,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 	defer upstreamCancel()
 	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), oaiReq.Model, providerEndpointChatCompletions)
 	if err != nil {
-		h.writeGeminiProtocolError(w, err)
+		h.writeGeminiUpstreamFailure(w, err)
 		return
 	}
 	if routeOperation != nil {

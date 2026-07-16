@@ -250,20 +250,27 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, path string, body []byte, extraHeaders http.Header, model string) (*http.Response, error) {
 	if operation := routeOperationFromContext(ctx); operation != nil && operation.route != nil && !operation.route.legacy {
 		route := operation.route
-		if strings.TrimSpace(model) != "" && strings.TrimSpace(model) != route.public.id {
+		requestedModel := strings.TrimSpace(model)
+		if requestedModel == "" {
+			requestedModel = route.public.id
+		}
+		if requestedModel != route.public.id {
 			resolvedAlias := false
-			if resolved, known := h.resolveModelRouteForRequest(model, path); known && resolved == route {
+			if resolved, known := h.resolveModelRouteForRequest(requestedModel, path); known && resolved == route {
+				// Keep the actual alias as the rewrite source. Using the canonical
+				// public ID here can leave the alias in the immutable request body
+				// when the target upstream model is already canonical.
 				resolvedAlias = true
 			}
 			attemptKind := routeAttemptKindFromContext(ctx)
 			if !resolvedAlias && attemptKind != routeAttemptCompatibilityFallback && attemptKind != routeAttemptCompaction {
 				return nil, &providerRequestError{
 					statusCode: http.StatusBadRequest,
-					err:        fmt.Errorf("explicit model route %q cannot change model to %q", route.public.id, model),
+					err:        fmt.Errorf("explicit model route %q cannot change model to %q", route.public.id, requestedModel),
 				}
 			}
 			if !resolvedAlias {
-				upstreamModel := strings.TrimSpace(model)
+				upstreamModel := requestedModel
 				if pinned := operation.pinnedTarget(); pinned != "" {
 					if target, ok := route.targetByID(pinned); ok && target.provider != nil {
 						if configured, exists := target.provider.staticModels[upstreamModel]; exists && configured.upstreamModel != "" {
@@ -272,13 +279,14 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, 
 					}
 				}
 				ctx = withRouteUpstreamModelOverride(ctx, upstreamModel)
+				requestedModel = route.public.id
 			}
 		}
 		if !route.supportsEndpoint(path) {
 			return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("model %q does not support %s", route.public.id, path)}
 		}
 		stream := path == providerEndpointResponses && parseResponsesRequestMetadata(body).Stream
-		return h.executeExplicitRouteRequest(ctx, route, path, body, extraHeaders, route.public.id, stream)
+		return h.executeExplicitRouteRequest(ctx, route, path, body, extraHeaders, requestedModel, stream)
 	}
 
 	route, known := h.resolveModelRouteForRequest(model, path)

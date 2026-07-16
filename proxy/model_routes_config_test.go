@@ -479,6 +479,14 @@ func TestValidateModelRoutesRejectsDuplicatesAndCollisions(t *testing.T) {
 			c.Providers[0].Models = []ProviderModelConfig{{PublicID: "legacy", Endpoints: []string{providerEndpointResponses}}}
 			c.ModelRoutes[0].ID = c.Providers[0].ID
 		}, want: "collides with legacy provider id"},
+		{name: "route id collides with dynamic provider owner despite filters", mutate: func(c *ProvidersConfig) {
+			c.Providers[0].Default = true
+			c.Providers = append(c.Providers, ProviderConfig{
+				ID: "dynamic", Type: "openai-compatible", BaseURL: "https://example.test/v1", AuthType: "none",
+				ModelDiscovery: "openai", IncludeModels: []string{"other-model"},
+			})
+			c.ModelRoutes[0].ID = "dynamic"
+		}, want: "collides with legacy provider id"},
 		{name: "duplicate provider model endpoints", mutate: func(c *ProvidersConfig) {
 			c.Providers[0].Models = []ProviderModelConfig{{PublicID: "legacy", Endpoints: []string{providerEndpointResponses, " /responses "}}}
 		}, want: "providers[0].models[0].endpoints[1]"},
@@ -497,6 +505,67 @@ func TestValidateModelRoutesRejectsDuplicatesAndCollisions(t *testing.T) {
 			_, err := validateAndNormalizeProvidersConfig(cfg)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("validation error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateModelRoutesHonorsLegacyProviderModelFilters(t *testing.T) {
+	tests := []struct {
+		name          string
+		modelPublicID string
+		routePublicID string
+		includeModels []string
+		excludeModels []string
+		wantErr       string
+	}{
+		{
+			name:          "excluded model does not reserve public id",
+			modelPublicID: "gpt-public",
+			routePublicID: "gpt-public",
+			excludeModels: []string{" gpt-public "},
+		},
+		{
+			name:          "model omitted from include does not reserve public id",
+			modelPublicID: "gpt-public",
+			routePublicID: "gpt-public",
+			includeModels: []string{"other-model"},
+		},
+		{
+			name:          "included model still collides",
+			modelPublicID: "gpt-public",
+			routePublicID: "gpt-public",
+			includeModels: []string{" gpt-public "},
+			wantErr:       "providers[0].models[0].public_id",
+		},
+		{
+			name:          "excluded model does not reserve normalized aliases",
+			modelPublicID: "claude-sonnet-4-5",
+			routePublicID: "claude-sonnet-4.5",
+			excludeModels: []string{" claude-sonnet-4-5 "},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validAzureRouteConfig()
+			cfg.Providers[0].Models = []ProviderModelConfig{{
+				PublicID:  tc.modelPublicID,
+				Endpoints: []string{providerEndpointResponses},
+			}}
+			cfg.Providers[0].IncludeModels = tc.includeModels
+			cfg.Providers[0].ExcludeModels = tc.excludeModels
+			cfg.ModelRoutes[0].PublicID = tc.routePublicID
+
+			err := ValidateProvidersConfig(cfg)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidateProvidersConfig() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ValidateProvidersConfig() error = %v, want %q", err, tc.wantErr)
 			}
 		})
 	}

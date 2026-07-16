@@ -217,11 +217,15 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 
 	legacyPublicIDs := make(map[string]string)
 	for _, descriptor := range providerOrder {
+		modelFilter := newNormalizedProviderModelFilter(validated.config.Providers[descriptor.index])
 		for modelIndex, model := range descriptor.models {
 			publicID := strings.TrimSpace(model.PublicID)
 			path := fmt.Sprintf("providers[%d].models[%d].public_id", descriptor.index, modelIndex)
 			if publicID == "" {
 				return validatedProvidersConfig{}, configPathError(path, "is required")
+			}
+			if !modelFilter.allows(publicID) {
+				continue
 			}
 			for _, alias := range configuredPublicModelAliases(publicID) {
 				if prior, exists := legacyPublicIDs[alias]; exists {
@@ -585,6 +589,45 @@ func providerPathValidationField(err error) string {
 	return "base_url"
 }
 
+type normalizedProviderModelFilter struct {
+	included map[string]struct{}
+	excluded map[string]struct{}
+}
+
+func newNormalizedProviderModelFilter(cfg ProviderConfig) normalizedProviderModelFilter {
+	filter := normalizedProviderModelFilter{
+		included: make(map[string]struct{}, len(cfg.IncludeModels)),
+		excluded: make(map[string]struct{}, len(cfg.ExcludeModels)),
+	}
+	for _, model := range cfg.IncludeModels {
+		if model = strings.TrimSpace(model); model != "" {
+			filter.included[model] = struct{}{}
+		}
+	}
+	for _, model := range cfg.ExcludeModels {
+		if model = strings.TrimSpace(model); model != "" {
+			filter.excluded[model] = struct{}{}
+		}
+	}
+	return filter
+}
+
+func (f normalizedProviderModelFilter) allows(publicID string) bool {
+	publicID = strings.TrimSpace(publicID)
+	if publicID == "" {
+		return false
+	}
+	if len(f.included) > 0 {
+		if _, included := f.included[publicID]; !included {
+			return false
+		}
+	}
+	if _, excluded := f.excluded[publicID]; excluded {
+		return false
+	}
+	return true
+}
+
 func providerConfigHasLegacyCatalog(provider providerConfigDescriptor, cfg ProviderConfig) bool {
 	switch provider.kind {
 	case providerTypeCopilot, providerTypeOpenAICodex:
@@ -598,32 +641,11 @@ func providerConfigHasLegacyCatalog(provider providerConfigDescriptor, cfg Provi
 		return false
 	}
 
-	included := make(map[string]struct{}, len(cfg.IncludeModels))
-	for _, model := range cfg.IncludeModels {
-		if model = strings.TrimSpace(model); model != "" {
-			included[model] = struct{}{}
-		}
-	}
-	excluded := make(map[string]struct{}, len(cfg.ExcludeModels))
-	for _, model := range cfg.ExcludeModels {
-		if model = strings.TrimSpace(model); model != "" {
-			excluded[model] = struct{}{}
-		}
-	}
+	filter := newNormalizedProviderModelFilter(cfg)
 	for _, model := range provider.models {
-		publicID := strings.TrimSpace(model.PublicID)
-		if publicID == "" {
-			continue
+		if filter.allows(model.PublicID) {
+			return true
 		}
-		if len(included) > 0 {
-			if _, ok := included[publicID]; !ok {
-				continue
-			}
-		}
-		if _, blocked := excluded[publicID]; blocked {
-			continue
-		}
-		return true
 	}
 	return false
 }

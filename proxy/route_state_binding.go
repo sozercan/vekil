@@ -79,11 +79,13 @@ func extractExplicitResponsesRequestState(body []byte, headers http.Header) ([]s
 
 	if object, ok := payload.(map[string]any); ok {
 		if raw, exists := object["previous_response_id"]; exists {
-			value, ok := raw.(string)
-			if !ok || strings.TrimSpace(value) == "" {
-				return nil, fmt.Errorf("previous_response_id must be a non-empty string")
+			if raw != nil {
+				value, ok := raw.(string)
+				if !ok || strings.TrimSpace(value) == "" {
+					return nil, fmt.Errorf("previous_response_id must be a non-empty string")
+				}
+				add(stateBindingTypeResponseID, value)
 			}
-			add(stateBindingTypeResponseID, value)
 		}
 		if err := visitExplicitResponsesItems(object["input"], true, func(stateType stateBindingType, value string) {
 			if stateType == stateBindingTypeEncryptedContent && isProxyOwnedEncryptedContent(value) {

@@ -93,6 +93,80 @@ func TestExtractExplicitResponsesRequestStateOnlyReadsResponseItems(t *testing.T
 	}
 }
 
+func TestExtractExplicitResponsesRequestStatePreviousResponseID(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		wantTokens []stateBindingToken
+		wantErr    string
+	}{
+		{
+			name: "absent",
+			body: `{"model":"route"}`,
+		},
+		{
+			name: "null",
+			body: `{"model":"route","previous_response_id":null}`,
+		},
+		{
+			name: "valid string",
+			body: `{"model":"route","previous_response_id":"  resp-123  "}`,
+			wantTokens: []stateBindingToken{
+				{stateType: stateBindingTypeResponseID, value: "resp-123"},
+			},
+		},
+		{
+			name:    "empty string",
+			body:    `{"model":"route","previous_response_id":""}`,
+			wantErr: "previous_response_id must be a non-empty string",
+		},
+		{
+			name:    "whitespace string",
+			body:    `{"model":"route","previous_response_id":"   "}`,
+			wantErr: "previous_response_id must be a non-empty string",
+		},
+		{
+			name:    "number",
+			body:    `{"model":"route","previous_response_id":42}`,
+			wantErr: "previous_response_id must be a non-empty string",
+		},
+		{
+			name:    "boolean",
+			body:    `{"model":"route","previous_response_id":false}`,
+			wantErr: "previous_response_id must be a non-empty string",
+		},
+		{
+			name:    "object",
+			body:    `{"model":"route","previous_response_id":{}}`,
+			wantErr: "previous_response_id must be a non-empty string",
+		},
+		{
+			name:    "array",
+			body:    `{"model":"route","previous_response_id":[]}`,
+			wantErr: "previous_response_id must be a non-empty string",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := extractExplicitResponsesRequestState([]byte(tc.body), nil)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatal("extractExplicitResponsesRequestState() error = nil, want error")
+				}
+				if err.Error() != tc.wantErr {
+					t.Fatalf("extractExplicitResponsesRequestState() error = %q, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("extractExplicitResponsesRequestState() error = %v", err)
+			}
+			requireStateBindingTokens(t, got, tc.wantTokens)
+		})
+	}
+}
+
 func TestExtractExplicitResponsesOutputStateOnlyReadsResponseItems(t *testing.T) {
 	tests := []struct {
 		name       string
