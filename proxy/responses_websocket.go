@@ -2307,6 +2307,8 @@ func responsesWebSocketErrorHeaders(status int, headers http.Header) http.Header
 		if !ok || delay <= 0 {
 			return headers
 		}
+		// truncate to whole seconds; parseRetryAfter returns integer-second
+		// multiples for numeric inputs and clamps large values to maxRetryAfter.
 		normalized := strconv.FormatInt(int64(delay/time.Second), 10)
 		result := headers.Clone()
 		if result == nil {
