@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sozercan/vekil/models"
 )
@@ -135,6 +136,751 @@ func setSSEHeaders(w http.ResponseWriter) {
 	w.Header().Set("Connection", "keep-alive")
 }
 
+type explicitRouteStreamProtocol uint8
+
+const (
+	explicitRouteStreamNone explicitRouteStreamProtocol = iota
+	explicitRouteStreamOpenAIChat
+	explicitRouteStreamAnthropic
+)
+
+type explicitRouteStreamFailure struct {
+	statusCode int
+	errType    string
+	code       string
+	message    string
+}
+
+func (f *explicitRouteStreamFailure) Error() string {
+	if f == nil {
+		return ""
+	}
+	if strings.TrimSpace(f.message) != "" {
+		return f.message
+	}
+	if strings.TrimSpace(f.code) != "" {
+		return f.code
+	}
+	if strings.TrimSpace(f.errType) != "" {
+		return f.errType
+	}
+	return "upstream stream error"
+}
+
+func (f *explicitRouteStreamFailure) asUpstreamError(headers http.Header) error {
+	if f == nil {
+		return nil
+	}
+	status := f.statusCode
+	if status == 0 {
+		status = http.StatusBadGateway
+	}
+	body, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": f.Error(),
+			"type":    strings.TrimSpace(f.errType),
+			"code":    strings.TrimSpace(f.code),
+		},
+	})
+	return &upstreamError{statusCode: status, body: body, headers: headers.Clone()}
+}
+
+type explicitRouteStreamInspection struct {
+	chunk           *models.OpenAIStreamChunk
+	progress        upstreamSemanticProgress
+	failure         *explicitRouteStreamFailure
+	terminalSuccess bool
+}
+
+func mergeUpstreamSemanticProgress(current, next upstreamSemanticProgress) upstreamSemanticProgress {
+	if next == "" || next == upstreamProgressNone {
+		return current
+	}
+	if current == upstreamProgressUnknown || next == upstreamProgressUnknown {
+		return upstreamProgressUnknown
+	}
+	if current == upstreamProgressToolActivity || next == upstreamProgressToolActivity {
+		return upstreamProgressToolActivity
+	}
+	if current == upstreamProgressSemanticOutput || next == upstreamProgressSemanticOutput {
+		return upstreamProgressSemanticOutput
+	}
+	if current == upstreamProgressTerminalSuccess || next == upstreamProgressTerminalSuccess {
+		return upstreamProgressTerminalSuccess
+	}
+	if current == upstreamProgressTerminalFailure || next == upstreamProgressTerminalFailure {
+		return upstreamProgressTerminalFailure
+	}
+	if current == upstreamProgressAllowedPreamble || next == upstreamProgressAllowedPreamble {
+		return upstreamProgressAllowedPreamble
+	}
+	return next
+}
+
+func upstreamProgressAllowsTargetSwitch(progress upstreamSemanticProgress) bool {
+	return progress == "" || progress == upstreamProgressNone || progress == upstreamProgressAllowedPreamble
+}
+
+func inspectOpenAIChatStreamEvent(eventType, data string) explicitRouteStreamInspection {
+	data = strings.TrimSpace(data)
+	if data == "[DONE]" {
+		return explicitRouteStreamInspection{progress: upstreamProgressTerminalSuccess, terminalSuccess: true}
+	}
+	if streamErr, ok := parseOpenAIStreamError(eventType, data); ok {
+		failureProgress := upstreamProgressNone
+		var envelope map[string]json.RawMessage
+		if json.Unmarshal([]byte(data), &envelope) != nil || envelope == nil {
+			failureProgress = upstreamProgressUnknown
+		} else {
+			for key, value := range envelope {
+				switch key {
+				case "error", "request_id", "request-id":
+				default:
+					if !rawJSONIsNullOrEmpty(value) {
+						failureProgress = upstreamProgressUnknown
+					}
+				}
+			}
+		}
+		return explicitRouteStreamInspection{failure: &explicitRouteStreamFailure{
+			statusCode: streamErr.httpStatus(),
+			errType:    streamErr.Type,
+			code:       streamErr.Code,
+			message:    streamErr.Error(),
+		}, progress: failureProgress}
+	}
+	if data == "" {
+		return explicitRouteStreamInspection{progress: upstreamProgressAllowedPreamble}
+	}
+
+	trimmedEvent := strings.ToLower(strings.TrimSpace(eventType))
+	if trimmedEvent != "" && trimmedEvent != "message" && trimmedEvent != "completion" && trimmedEvent != "chat.completion.chunk" {
+		return explicitRouteStreamInspection{progress: upstreamProgressUnknown}
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(data), &raw); err != nil || raw == nil {
+		return explicitRouteStreamInspection{progress: upstreamProgressUnknown}
+	}
+	var chunk models.OpenAIStreamChunk
+	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+		return explicitRouteStreamInspection{progress: upstreamProgressUnknown}
+	}
+
+	progress := classifyOpenAIChatChunkProgress(raw)
+	return explicitRouteStreamInspection{chunk: &chunk, progress: progress}
+}
+
+func classifyOpenAIChatChunkProgress(raw map[string]json.RawMessage) upstreamSemanticProgress {
+	if raw == nil {
+		return upstreamProgressUnknown
+	}
+	knownTopLevel := map[string]struct{}{
+		"id": {}, "object": {}, "created": {}, "model": {}, "choices": {},
+		"system_fingerprint": {}, "service_tier": {}, "usage": {},
+	}
+	for key, value := range raw {
+		if _, known := knownTopLevel[key]; !known && !rawJSONIsNullOrEmpty(value) {
+			return upstreamProgressUnknown
+		}
+	}
+	if usage, ok := raw["usage"]; ok && !rawJSONIsNullOrEmpty(usage) {
+		// A usage frame proves the attempt reached provider-side accounting. Even an
+		// otherwise empty usage-only chunk is therefore beyond a replay-safe preamble.
+		return upstreamProgressTerminalSuccess
+	}
+
+	choicesRaw, hasChoices := raw["choices"]
+	if !hasChoices || rawJSONIsNullOrEmpty(choicesRaw) {
+		return upstreamProgressAllowedPreamble
+	}
+	var choices []json.RawMessage
+	if err := json.Unmarshal(choicesRaw, &choices); err != nil {
+		return upstreamProgressUnknown
+	}
+	if len(choices) == 0 {
+		return upstreamProgressAllowedPreamble
+	}
+
+	progress := upstreamProgressAllowedPreamble
+	for _, choiceRaw := range choices {
+		var choice map[string]json.RawMessage
+		if err := json.Unmarshal(choiceRaw, &choice); err != nil || choice == nil {
+			return upstreamProgressUnknown
+		}
+		if finish, ok := choice["finish_reason"]; ok && !rawJSONIsNullOrEmpty(finish) {
+			progress = mergeUpstreamSemanticProgress(progress, upstreamProgressTerminalSuccess)
+		}
+		deltaRaw, ok := choice["delta"]
+		if !ok || rawJSONIsNullOrEmpty(deltaRaw) {
+			continue
+		}
+		var delta map[string]json.RawMessage
+		if err := json.Unmarshal(deltaRaw, &delta); err != nil || delta == nil {
+			return upstreamProgressUnknown
+		}
+		deltaProgress := classifyOpenAIChatDeltaProgress(delta)
+		progress = mergeUpstreamSemanticProgress(progress, deltaProgress)
+	}
+	return progress
+}
+
+func classifyOpenAIChatDeltaProgress(delta map[string]json.RawMessage) upstreamSemanticProgress {
+	if delta == nil {
+		return upstreamProgressUnknown
+	}
+	progress := upstreamProgressAllowedPreamble
+	known := map[string]struct{}{
+		"role": {}, "content": {}, "tool_calls": {}, "function_call": {},
+		"reasoning": {}, "reasoning_content": {}, "reasoning_text": {},
+		"refusal": {}, "audio": {},
+	}
+	for key, value := range delta {
+		switch key {
+		case "role":
+			// Role-only chunks are the OpenAI chat preamble equivalent.
+		case "tool_calls", "function_call":
+			if !rawJSONIsNullOrEmpty(value) {
+				progress = mergeUpstreamSemanticProgress(progress, upstreamProgressToolActivity)
+			}
+		case "content", "reasoning", "reasoning_content", "reasoning_text", "refusal", "audio":
+			if rawJSONHasSemanticValue(value) {
+				progress = mergeUpstreamSemanticProgress(progress, upstreamProgressSemanticOutput)
+			}
+		default:
+			if _, ok := known[key]; !ok && !rawJSONIsNullOrEmpty(value) {
+				return upstreamProgressUnknown
+			}
+		}
+	}
+	return progress
+}
+
+func rawJSONIsNullOrEmpty(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
+}
+
+func rawJSONHasSemanticValue(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte(`""`)) {
+		return false
+	}
+	var text string
+	if json.Unmarshal(trimmed, &text) == nil {
+		return text != ""
+	}
+	return true
+}
+
+func inspectAnthropicStreamEvent(eventType, data string) explicitRouteStreamInspection {
+	data = strings.TrimSpace(data)
+	if data == "" {
+		return explicitRouteStreamInspection{progress: upstreamProgressAllowedPreamble}
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(data), &payload); err != nil || payload == nil {
+		return explicitRouteStreamInspection{progress: upstreamProgressUnknown}
+	}
+	typeName := rawJSONString(payload["type"])
+	if typeName == "" {
+		typeName = strings.TrimSpace(eventType)
+	}
+	switch strings.ToLower(typeName) {
+	case "ping", "message_start":
+		return explicitRouteStreamInspection{progress: upstreamProgressAllowedPreamble}
+	case "content_block_start":
+		var block map[string]json.RawMessage
+		if err := json.Unmarshal(payload["content_block"], &block); err != nil || block == nil {
+			return explicitRouteStreamInspection{progress: upstreamProgressUnknown}
+		}
+		switch strings.ToLower(rawJSONString(block["type"])) {
+		case "tool_use", "server_tool_use", "web_search_tool_result":
+			return explicitRouteStreamInspection{progress: upstreamProgressToolActivity}
+		case "text", "thinking", "redacted_thinking":
+			return explicitRouteStreamInspection{progress: upstreamProgressSemanticOutput}
+		default:
+			return explicitRouteStreamInspection{progress: upstreamProgressUnknown}
+		}
+	case "content_block_delta":
+		var delta map[string]json.RawMessage
+		if err := json.Unmarshal(payload["delta"], &delta); err != nil || delta == nil {
+			return explicitRouteStreamInspection{progress: upstreamProgressUnknown}
+		}
+		switch strings.ToLower(rawJSONString(delta["type"])) {
+		case "input_json_delta":
+			return explicitRouteStreamInspection{progress: upstreamProgressToolActivity}
+		case "text_delta", "thinking_delta", "signature_delta", "citations_delta":
+			return explicitRouteStreamInspection{progress: upstreamProgressSemanticOutput}
+		default:
+			return explicitRouteStreamInspection{progress: upstreamProgressUnknown}
+		}
+	case "content_block_stop", "message_delta", "message_stop":
+		return explicitRouteStreamInspection{progress: upstreamProgressTerminalSuccess, terminalSuccess: true}
+	case "error":
+		status, ok := anthropicStreamErrorStatus([]byte(data))
+		if !ok {
+			status = http.StatusBadGateway
+		}
+		var envelope struct {
+			Error struct {
+				Type    string `json:"type"`
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal([]byte(data), &envelope)
+		code := strings.TrimSpace(envelope.Error.Code)
+		if code == "" {
+			code = strings.TrimSpace(envelope.Error.Type)
+		}
+		return explicitRouteStreamInspection{failure: &explicitRouteStreamFailure{
+			statusCode: status,
+			errType:    strings.TrimSpace(envelope.Error.Type),
+			code:       code,
+			message:    strings.TrimSpace(envelope.Error.Message),
+		}}
+	default:
+		return explicitRouteStreamInspection{progress: upstreamProgressUnknown}
+	}
+}
+
+type explicitRoutePreparedStream struct {
+	resp         *http.Response
+	upstreamBody io.ReadCloser
+	reader       *io.PipeReader
+	resultCh     chan explicitRouteStreamInspection
+	commitCh     chan struct{}
+	abortCh      chan struct{}
+	doneCh       chan struct{}
+	commitOnce   sync.Once
+	abortOnce    sync.Once
+}
+
+type explicitRoutePreparedBody struct {
+	reader    *io.PipeReader
+	abort     func()
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (b *explicitRoutePreparedBody) Read(p []byte) (int, error) {
+	return b.reader.Read(p)
+}
+
+func (b *explicitRoutePreparedBody) Close() error {
+	if b == nil {
+		return nil
+	}
+	b.closeOnce.Do(func() {
+		if b.reader != nil {
+			b.closeErr = b.reader.CloseWithError(context.Canceled)
+		}
+		if b.abort != nil {
+			b.abort()
+		}
+	})
+	return b.closeErr
+}
+
+func newExplicitRoutePreparedStream(resp *http.Response, protocol explicitRouteStreamProtocol, maxPeekBytes int) *explicitRoutePreparedStream {
+	if resp == nil || resp.Body == nil {
+		return nil
+	}
+	if maxPeekBytes <= 0 {
+		maxPeekBytes = responsesPrecommitMaxPeekBytes
+	}
+	upstreamBody := resp.Body
+	pr, pw := io.Pipe()
+	prepared := &explicitRoutePreparedStream{
+		resp:         resp,
+		upstreamBody: upstreamBody,
+		reader:       pr,
+		resultCh:     make(chan explicitRouteStreamInspection, 1),
+		commitCh:     make(chan struct{}),
+		abortCh:      make(chan struct{}),
+		doneCh:       make(chan struct{}),
+	}
+	go func() {
+		defer close(prepared.doneCh)
+		runExplicitRouteStreamPeekPump(upstreamBody, pw, protocol, prepared.resultCh, prepared.commitCh, prepared.abortCh, maxPeekBytes)
+	}()
+	return prepared
+}
+
+func (s *explicitRoutePreparedStream) await(waitCtx, upstreamCtx context.Context, timeout time.Duration) (explicitRouteStreamInspection, bool, error) {
+	if s == nil {
+		return explicitRouteStreamInspection{}, false, fmt.Errorf("prepared stream is unavailable")
+	}
+	if timeout <= 0 {
+		timeout = responsesPrecommitPeekTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var waitDone <-chan struct{}
+	if waitCtx != nil {
+		waitDone = waitCtx.Done()
+	}
+	var upstreamDone <-chan struct{}
+	if upstreamCtx != nil && upstreamCtx != waitCtx {
+		upstreamDone = upstreamCtx.Done()
+	}
+	select {
+	case result := <-s.resultCh:
+		return result, true, nil
+	case <-timer.C:
+		return explicitRouteStreamInspection{}, false, nil
+	case <-waitDone:
+		return explicitRouteStreamInspection{}, false, waitCtx.Err()
+	case <-upstreamDone:
+		return explicitRouteStreamInspection{}, false, upstreamCtx.Err()
+	}
+}
+
+func (s *explicitRoutePreparedStream) commitResponse() *http.Response {
+	if s == nil || s.resp == nil {
+		return nil
+	}
+	s.commitOnce.Do(func() { close(s.commitCh) })
+	s.resp.Body = &explicitRoutePreparedBody{reader: s.reader, abort: s.abort}
+	return s.resp
+}
+
+func (s *explicitRoutePreparedStream) abort() {
+	if s == nil {
+		return
+	}
+	s.abortOnce.Do(func() {
+		close(s.abortCh)
+		if s.upstreamBody != nil {
+			go func() { _ = s.upstreamBody.Close() }()
+		}
+	})
+}
+
+func (s *explicitRoutePreparedStream) abortAndWait(ctx context.Context) bool {
+	if s == nil {
+		return true
+	}
+	s.abort()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-s.doneCh:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// prepareExplicitChatSurfaceStream is the shared executor seam for Phase 6
+// streaming Chat, translated Anthropic/Gemini (OpenAI chat SSE upstream), and
+// direct Anthropic Messages SSE attempts.
+//
+// Call contract:
+//   - invoke only for an explicit-route HTTP 200 response whose logical request
+//     is client-streaming;
+//   - endpoint selects the upstream protocol: /chat/completions uses OpenAI chat
+//     SSE, while /v1/messages uses native Anthropic SSE;
+//   - accepted is a replayable prepared response whose buffered prefix is emitted
+//     exactly once after the caller returns it downstream;
+//   - progress reports the observation that made the target irrevocable (or an
+//     allowed preamble when the time/byte bound commits it);
+//   - failure is non-nil only when the attempt must not be returned downstream.
+//     A retry-safe rate-limit/overload failure is classified as explicitly
+//     rejected and its body pump is fully stopped before return. Ambiguous reads,
+//     malformed cleanup, and lifecycle cancellation never become switchable.
+func (h *ProxyHandler) prepareExplicitChatSurfaceStream(ctx context.Context, operation *routeOperation, target targetBinding, endpoint string, resp *http.Response) (accepted *http.Response, progress upstreamSemanticProgress, failure *routeAttemptFailure) {
+	if resp == nil || resp.Body == nil {
+		return nil, upstreamProgressUnknown, &routeAttemptFailure{
+			err:        fmt.Errorf("upstream stream response body is unavailable"),
+			delivery:   requestDeliveredOrAmbiguous,
+			progress:   upstreamProgressUnknown,
+			commitment: downstreamCommitmentNone,
+			statusCode: http.StatusOK,
+		}
+	}
+	protocol := explicitRouteStreamNone
+	switch endpoint {
+	case providerEndpointChatCompletions:
+		protocol = explicitRouteStreamOpenAIChat
+	case providerEndpointMessages:
+		protocol = explicitRouteStreamAnthropic
+	default:
+		return nil, upstreamProgressUnknown, &routeAttemptFailure{
+			err:        fmt.Errorf("explicit stream preparation does not support endpoint %s", endpoint),
+			delivery:   requestDefinitelyNotDelivered,
+			progress:   upstreamProgressNone,
+			commitment: downstreamCommitmentNone,
+			statusCode: resp.StatusCode,
+		}
+	}
+
+	prepared := newExplicitRoutePreparedStream(resp, protocol, responsesPrecommitMaxPeekBytes)
+	waitCtx := context.Context(nil)
+	if operation != nil {
+		waitCtx = operation.inbound
+	}
+	result, hasResult, err := prepared.await(waitCtx, ctx, responsesPrecommitPeekTimeout)
+	if err != nil {
+		prepared.abort()
+		return nil, upstreamProgressUnknown, &routeAttemptFailure{
+			err:        err,
+			delivery:   requestDeliveredOrAmbiguous,
+			progress:   upstreamProgressUnknown,
+			commitment: downstreamCommitmentNone,
+			statusCode: resp.StatusCode,
+		}
+	}
+	if hasResult && result.failure != nil {
+		certifiedStatus, certified := explicitRouteTargetCertifiesStreamFailure(target, result.failure)
+		if upstreamProgressAllowsTargetSwitch(result.progress) && certified {
+			result.failure.statusCode = certifiedStatus
+			if prepared.abortAndWait(ctx) {
+				return nil, result.progress, &routeAttemptFailure{
+					err:        result.failure.asUpstreamError(resp.Header),
+					delivery:   requestExplicitlyRejected,
+					progress:   result.progress,
+					commitment: downstreamCommitmentNone,
+					statusCode: result.failure.statusCode,
+				}
+			}
+			return nil, upstreamProgressUnknown, &routeAttemptFailure{
+				err:        fmt.Errorf("rejected stream cleanup did not complete"),
+				delivery:   requestDeliveredOrAmbiguous,
+				progress:   upstreamProgressUnknown,
+				commitment: downstreamCommitmentNone,
+				statusCode: result.failure.statusCode,
+			}
+		}
+		progress = mergeUpstreamSemanticProgress(result.progress, upstreamProgressTerminalFailure)
+		return prepared.commitResponse(), progress, nil
+	}
+	if hasResult {
+		progress = result.progress
+	} else {
+		// Reaching the bounded peek window intentionally fails open and commits the
+		// selected target. The pump may have seen only a role/message preamble.
+		progress = upstreamProgressAllowedPreamble
+	}
+	return prepared.commitResponse(), progress, nil
+}
+
+func isExplicitRoutePreparedChatResponse(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	_, ok := resp.Body.(*explicitRoutePreparedBody)
+	return ok
+}
+
+type explicitRouteStreamLine struct {
+	line string
+	err  error
+}
+
+func readExplicitRouteStreamLines(body io.ReadCloser, out chan<- explicitRouteStreamLine, abortCh <-chan struct{}) {
+	defer close(out)
+	defer body.Close()
+	reader := bufio.NewReaderSize(body, openAIStreamScannerInitialBuffer)
+	for {
+		line, err := readOpenAISSELine(reader)
+		result := explicitRouteStreamLine{line: line, err: err}
+		select {
+		case out <- result:
+		case <-abortCh:
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func runExplicitRouteStreamPeekPump(body io.ReadCloser, pw *io.PipeWriter, protocol explicitRouteStreamProtocol, resultCh chan<- explicitRouteStreamInspection, commitCh, abortCh <-chan struct{}, maxPeekBytes int) {
+	lineCh := make(chan explicitRouteStreamLine, 1)
+	go readExplicitRouteStreamLines(body, lineCh, abortCh)
+
+	var prefix bytes.Buffer
+	var accumulator sseDataAccumulator
+	progress := upstreamProgressNone
+	decisionSent := false
+
+	sendResult := func(result explicitRouteStreamInspection) {
+		if decisionSent {
+			return
+		}
+		if result.progress == "" {
+			result.progress = progress
+		}
+		decisionSent = true
+		select {
+		case resultCh <- result:
+		default:
+		}
+	}
+	writeCommitted := func() {
+		if prefix.Len() > 0 {
+			if _, err := pw.Write(prefix.Bytes()); err != nil {
+				_ = pw.CloseWithError(err)
+				return
+			}
+		}
+		for result := range lineCh {
+			if len(result.line) > 0 {
+				if _, err := io.WriteString(pw, result.line); err != nil {
+					_ = pw.CloseWithError(err)
+					return
+				}
+			}
+			if result.err != nil {
+				if result.err == io.EOF {
+					_ = pw.Close()
+				} else {
+					_ = pw.CloseWithError(result.err)
+				}
+				return
+			}
+		}
+		_ = pw.Close()
+	}
+	abortAndDrain := func() {
+		for range lineCh {
+		}
+		_ = pw.CloseWithError(context.Canceled)
+	}
+	waitForAction := func() {
+		select {
+		case <-abortCh:
+			abortAndDrain()
+		case <-commitCh:
+			writeCommitted()
+		}
+	}
+	inspect := func(eventType, data string) bool {
+		var result explicitRouteStreamInspection
+		switch protocol {
+		case explicitRouteStreamAnthropic:
+			result = inspectAnthropicStreamEvent(eventType, data)
+		default:
+			result = inspectOpenAIChatStreamEvent(eventType, data)
+		}
+		if result.failure != nil {
+			result.progress = mergeUpstreamSemanticProgress(progress, result.progress)
+			sendResult(result)
+			return false
+		}
+		progress = mergeUpstreamSemanticProgress(progress, result.progress)
+		if result.terminalSuccess || !upstreamProgressAllowsTargetSwitch(progress) {
+			result.progress = progress
+			sendResult(result)
+			return false
+		}
+		return true
+	}
+
+	for {
+		select {
+		case <-abortCh:
+			abortAndDrain()
+			return
+		case <-commitCh:
+			writeCommitted()
+			return
+		case result, ok := <-lineCh:
+			if !ok {
+				sendResult(explicitRouteStreamInspection{progress: progress})
+				waitForAction()
+				return
+			}
+			line, readErr := result.line, result.err
+			if len(line) > 0 {
+				_, _ = prefix.WriteString(line)
+				if strings.TrimRight(line, "\r\n") == "" && accumulator.eventType != "" && len(accumulator.dataLines) == 0 {
+					progress = upstreamProgressUnknown
+					sendResult(explicitRouteStreamInspection{progress: progress})
+					waitForAction()
+					return
+				}
+				if errors.Is(readErr, errOpenAISSELineTooLong) {
+					progress = upstreamProgressUnknown
+					sendResult(explicitRouteStreamInspection{progress: progress})
+					waitForAction()
+					return
+				}
+				if !accumulator.consumeLine(line, inspect) {
+					waitForAction()
+					return
+				}
+			}
+			if prefix.Len() >= maxPeekBytes {
+				sendResult(explicitRouteStreamInspection{progress: progress})
+				waitForAction()
+				return
+			}
+			if readErr == nil {
+				continue
+			}
+			if readErr == io.EOF {
+				_ = accumulator.dispatch(inspect)
+			}
+			sendResult(explicitRouteStreamInspection{progress: progress})
+			waitForAction()
+			return
+		}
+	}
+}
+
+func consumeOpenAIStreamChunksWithProgress(r io.Reader, onChunk func(models.OpenAIStreamChunk) bool) (bool, upstreamSemanticProgress, error) {
+	reader := bufio.NewReaderSize(r, openAIStreamScannerInitialBuffer)
+	progress := upstreamProgressNone
+	sawDone := false
+	var streamReadErr error
+	var accumulator sseDataAccumulator
+	processData := func(eventType, data string) bool {
+		result := inspectOpenAIChatStreamEvent(eventType, data)
+		if result.failure != nil {
+			progress = mergeUpstreamSemanticProgress(progress, result.progress)
+			streamReadErr = &openAIStreamError{Type: result.failure.errType, Code: result.failure.code, Message: result.failure.Error()}
+			return false
+		}
+		progress = mergeUpstreamSemanticProgress(progress, result.progress)
+		if result.terminalSuccess && strings.TrimSpace(data) == "[DONE]" {
+			sawDone = true
+			return false
+		}
+		if result.chunk == nil {
+			return true
+		}
+		return onChunk == nil || onChunk(*result.chunk)
+	}
+
+	for {
+		line, err := readOpenAISSELine(reader)
+		if len(line) > 0 {
+			if strings.TrimRight(line, "\r\n") == "" && accumulator.eventType != "" && len(accumulator.dataLines) == 0 {
+				return sawDone, upstreamProgressUnknown, streamReadErr
+			}
+			if !accumulator.consumeLine(line, processData) {
+				return sawDone, progress, streamReadErr
+			}
+		}
+		if err == nil {
+			continue
+		}
+		if err == io.EOF {
+			break
+		}
+		progress = mergeUpstreamSemanticProgress(progress, upstreamProgressUnknown)
+		return false, progress, fmt.Errorf("reading SSE stream: %w", err)
+	}
+	if !accumulator.dispatch(processData) {
+		return sawDone, progress, streamReadErr
+	}
+	return sawDone, progress, nil
+}
+
 // flushWriter wraps an http.ResponseWriter and flushes after every Write.
 type flushWriter struct {
 	w        http.ResponseWriter
@@ -171,7 +917,7 @@ func StreamOpenAIPassthroughWithFinalResponse(
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
-	streamOpenAIPassthrough(w, body, false, nil, onFinalResponse, nil, streamLifecycleHooks{}, onUsageCallbacks...)
+	streamOpenAIPassthrough(w, body, false, nil, onFinalResponse, nil, false, streamLifecycleHooks{}, onUsageCallbacks...)
 }
 
 // StreamOpenAIPassthroughDroppingInjectedUsage behaves like
@@ -187,7 +933,7 @@ func StreamOpenAIPassthroughDroppingInjectedUsage(
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
-	streamOpenAIPassthrough(w, body, true, nil, onFinalResponse, nil, streamLifecycleHooks{}, onUsageCallbacks...)
+	streamOpenAIPassthrough(w, body, true, nil, onFinalResponse, nil, false, streamLifecycleHooks{}, onUsageCallbacks...)
 }
 
 // StreamOpenAIChatPassthrough forwards an OpenAI chat SSE stream to the client
@@ -209,7 +955,7 @@ func StreamOpenAIChatPassthrough(
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
-	streamOpenAIPassthrough(w, body, dropInjectedUsage, onError, onFinalResponse, newOpenAIChatCompletionChunkNormalizer(requestedModel).normalize, streamLifecycleHooks{}, onUsageCallbacks...)
+	streamOpenAIPassthrough(w, body, dropInjectedUsage, onError, onFinalResponse, newOpenAIChatCompletionChunkNormalizer(requestedModel).normalize, false, streamLifecycleHooks{}, onUsageCallbacks...)
 }
 
 func streamOpenAIChatPassthroughWithLifecycle(
@@ -222,7 +968,41 @@ func streamOpenAIChatPassthroughWithLifecycle(
 	lifecycle streamLifecycleHooks,
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
-	streamOpenAIPassthrough(w, body, dropInjectedUsage, onError, onFinalResponse, newOpenAIChatCompletionChunkNormalizer(requestedModel).normalize, lifecycle, onUsageCallbacks...)
+	streamOpenAIPassthrough(w, body, dropInjectedUsage, onError, onFinalResponse, newOpenAIChatCompletionChunkNormalizer(requestedModel).normalize, false, lifecycle, onUsageCallbacks...)
+}
+
+func streamExplicitRouteOpenAIChatPassthroughWithLifecycle(
+	w http.ResponseWriter,
+	body io.ReadCloser,
+	publicModel string,
+	dropInjectedUsage bool,
+	onError func(status int),
+	onFinalResponse func(*models.OpenAIResponse),
+	lifecycle streamLifecycleHooks,
+	onUsageCallbacks ...func(*models.OpenAIUsage),
+) {
+	normalizer := newOpenAIChatCompletionChunkNormalizer(publicModel)
+	transform := func(eventType, data string) (string, bool) {
+		normalized, changed := normalizer.normalize(eventType, data)
+		if !openAIChatStreamEventMayCarryChunk(eventType) || strings.TrimSpace(normalized) == "" || strings.TrimSpace(normalized) == "[DONE]" {
+			return normalized, changed
+		}
+		var payload map[string]json.RawMessage
+		if json.Unmarshal([]byte(normalized), &payload) != nil || payload == nil || hasNonNullJSONField(payload, "error") {
+			return normalized, changed
+		}
+		model := strings.TrimSpace(publicModel)
+		if model == "" || jsonRawString(payload["model"]) == model {
+			return normalized, changed
+		}
+		payload["model"] = mustMarshalRaw(model)
+		rewritten, err := json.Marshal(payload)
+		if err != nil {
+			return normalized, changed
+		}
+		return string(rewritten), true
+	}
+	streamOpenAIPassthrough(w, body, dropInjectedUsage, onError, onFinalResponse, transform, true, lifecycle, onUsageCallbacks...)
 }
 
 // streamOpenAIPassthrough forwards an upstream OpenAI SSE stream to the client.
@@ -242,6 +1022,7 @@ func streamOpenAIPassthrough(
 	onError func(status int),
 	onFinalResponse func(*models.OpenAIResponse),
 	transformData openAIStreamDataTransformer,
+	failOnOversized bool,
 	lifecycle streamLifecycleHooks,
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
@@ -327,12 +1108,14 @@ func streamOpenAIPassthrough(
 		return true
 	}
 
+	pendingBytes := 0
 	flushEvent := func() bool {
 		if len(pending) == 0 {
 			return true
 		}
 		defer func() {
 			pending = pending[:0]
+			pendingBytes = 0
 			dropCurrent = false
 			transformedCurrentData = nil
 		}()
@@ -356,11 +1139,21 @@ func streamOpenAIPassthrough(
 		return true
 	}
 
+	reportOversized := func() {
+		if onError != nil && !errorReported {
+			onError(http.StatusBadGateway)
+		}
+		errorReported = true
+	}
 	rawForwardOversizedEvent := false
 streamLoop:
 	for {
 		line, err := readOpenAISSELine(reader)
 		if errors.Is(err, errOpenAISSELineTooLong) {
+			if failOnOversized {
+				reportOversized()
+				return
+			}
 			// A single SSE line exceeded the parse buffer (e.g. a very large
 			// tool-call argument). The returned bytes are valid but the line is
 			// truncated for parsing, so flush everything buffered for this event
@@ -373,6 +1166,7 @@ streamLoop:
 				}
 			}
 			pending = pending[:0]
+			pendingBytes = 0
 			accumulator = sseDataAccumulator{}
 			dropCurrent = false
 			transformedCurrentData = nil
@@ -400,7 +1194,12 @@ streamLoop:
 					transformedCurrentData = nil
 				}
 			} else {
+				if failOnOversized && pendingBytes+len(line) > openAIStreamScannerMaxBuffer {
+					reportOversized()
+					return
+				}
 				pending = append(pending, line)
+				pendingBytes += len(line)
 				isBoundary := strings.TrimRight(line, "\r\n") == ""
 				continueStream := accumulator.consumeLine(line, processData)
 				if isBoundary && !flushEvent() {
@@ -614,6 +1413,13 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 	}
 	for {
 		line, err := readOpenAISSELine(reader)
+		if errors.Is(err, errOpenAISSELineTooLong) {
+			frame = frame[:0]
+			if ctx.Err() == nil && !clientWriteFailed {
+				observeResponseFailureStatus(ctx, http.StatusBadGateway)
+			}
+			return
+		}
 		if len(line) > 0 {
 			frame = append(frame, line)
 			if strings.TrimRight(line, "\r\n") == "" {
@@ -933,21 +1739,31 @@ func streamOpenAIToAnthropicWithLifecycle(
 // OpenAIResponse. This is used when we force streaming to the upstream for
 // reliable parallel tool call support, but the client requested non-streaming.
 func aggregateStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, error) {
+	response, _, err := aggregateStreamToResponseWithProgress(body)
+	return response, err
+}
+
+// aggregateStreamToResponseWithProgress is the explicit-route aggregation seam.
+// It retains the legacy aggregate result while also reporting whether text,
+// reasoning, tool activity, an unknown event, or a terminal frame was observed
+// before an error. Callers may only switch targets when the returned progress is
+// none or an allowed role/preamble chunk.
+func aggregateStreamToResponseWithProgress(body io.ReadCloser) (*models.OpenAIResponse, upstreamSemanticProgress, error) {
 	defer func() { _ = body.Close() }()
 
 	aggregator := newOpenAIResponseAggregator()
-	sawDone, err := consumeOpenAIStreamChunks(body, func(chunk models.OpenAIStreamChunk) bool {
+	sawDone, progress, err := consumeOpenAIStreamChunksWithProgress(body, func(chunk models.OpenAIStreamChunk) bool {
 		aggregator.addChunk(chunk)
 		return true
 	})
 	if err != nil {
-		return nil, err
+		return nil, progress, err
 	}
 	if !sawDone {
-		return nil, fmt.Errorf("stream ended before [DONE]")
+		return nil, progress, fmt.Errorf("stream ended before [DONE]")
 	}
 
-	return aggregator.buildResponse(), nil
+	return aggregator.buildResponse(), progress, nil
 }
 
 type anthropicStreamState struct {

@@ -23,7 +23,7 @@ Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Az
 - **Anthropic Messages API** — drop-in compatible with Claude clients
 - **Gemini API** — Generate Content, Stream Generate Content, and Count Tokens
 - **OpenAI Chat Completions** and **Responses** APIs, including optional Codex websocket bridging
-- **Multi-provider routing** across GitHub Copilot, Azure OpenAI, OpenAI Codex, and generic compatible providers
+- **Multi-provider routing** across GitHub Copilot, Azure OpenAI, OpenAI Codex, and generic compatible providers; schema-v2 ordered failover is available for supported static Azure/generic targets
 - **Optional tool optimizers** for opt-in shell command rewrites and tool-output reduction across supported API surfaces; see [Tool Optimizers](docs/tool-optimizers.md)
 - **Codex compatibility shims** for compaction and memory summarization
 - **Streaming**, tool use, parallel tool calls, compressed request bodies, and auth/token caching
@@ -66,7 +66,7 @@ Documentation lives under [`docs/`](docs/README.md); start with these:
 | ------------------------------------------------------------ | ----------------------------------- |
 | [Getting Started](docs/getting-started.md)                   | Install, run, first auth            |
 | [Configuration](docs/configuration.md)                       | Config map and generic flags        |
-| [Provider Routing](docs/provider-routing.md)                 | Provider auth and model ownership   |
+| [Provider Routing](docs/provider-routing.md)                 | Provider auth and route failover    |
 | [Provider API Keys](docs/provider-api-keys.md)               | Where to get provider keys          |
 | [Tool Optimizers](docs/tool-optimizers.md)                   | Shell rewrite/output reduction      |
 | [Responses WebSocket](docs/responses-websocket.md)           | Websocket bridge tuning             |

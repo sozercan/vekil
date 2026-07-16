@@ -167,12 +167,28 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+	if err := h.validateRouteAwareRequestJSON(bodyBytes); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
 
 	prepared := h.prepareResponsesRequest(r.Context(), r, bodyBytes)
 	h.observeRequestSummary(r.Context(), "responses", prepared.model, prepared.streaming, providerEndpointResponses)
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), prepared.streaming)
 	defer upstreamCancel()
+	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), prepared.model, providerEndpointResponses)
+	if err != nil {
+		h.writeResponsesUpstreamRequestFailure(w, r, upstreamCtx, "responses", err)
+		return
+	}
+	if routeOperation != nil {
+		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
+		if err := h.applyExplicitRequestStateBinding(routeOperation, prepared.body, prepared.extraHeaders); err != nil {
+			h.writeResponsesUpstreamRequestFailure(w, r, upstreamCtx, "responses_state_binding", err)
+			return
+		}
+	}
 
 	if compactionResp, handled, compactionUsage, err := h.maybeBuildResponsesCompactionTriggerResponse(upstreamCtx, prepared.body, prepared.extraHeaders, prepared.streaming); handled || err != nil {
 		if err != nil {
@@ -208,7 +224,11 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	if prepared.streaming && resp.StatusCode == http.StatusOK {
-		peekAndForwardResponses(h, w, r, resp, upstreamCtx, upstreamCancel, prepared.model, prepared.headerToolScope)
+		if isExplicitRoutePreparedResponse(resp) {
+			forwardExplicitPreparedResponses(h, w, r, resp, upstreamCtx, upstreamCancel, prepared.headerToolScope)
+		} else {
+			peekAndForwardResponses(h, w, r, resp, upstreamCtx, upstreamCancel, prepared.model, prepared.headerToolScope)
+		}
 		return
 	}
 
@@ -486,6 +506,10 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+	if err := h.validateRouteAwareRequestJSON(bodyBytes); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
 
 	retainedOutput := retainedCompactResponseMessages(bodyBytes)
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/compact", false)
@@ -498,8 +522,25 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
 	defer upstreamCancel()
+	model := rawJSONString(body["model"])
+	extraHeaders := responsesExtraHeadersFromRequest(r)
+	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), model, providerEndpointResponses)
+	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+		return
+	}
+	if routeOperation != nil {
+		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
+		canonicalBody, _ := json.Marshal(body)
+		if err := h.applyExplicitRequestStateBinding(routeOperation, canonicalBody, extraHeaders); err != nil {
+			statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+			return
+		}
+	}
 
-	summaryText, resp, err := h.compactResponsesRequest(upstreamCtx, body, responsesExtraHeadersFromRequest(r))
+	summaryText, resp, err := h.compactResponsesRequest(upstreamCtx, body, extraHeaders)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -551,6 +592,10 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+	if err := h.validateRouteAwareRequestJSON(bodyBytes); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
 
 	var memReq struct {
 		Model     string            `json:"model"`
@@ -591,8 +636,23 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
+	extraHeaders := responsesExtraHeadersFromRequest(r)
+	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), memReq.Model, providerEndpointResponses)
+	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+		return
+	}
+	if routeOperation != nil {
+		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
+		if err := h.applyExplicitRequestStateBinding(routeOperation, reqBody, extraHeaders); err != nil {
+			statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+			return
+		}
+	}
 
-	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, reqBody, responsesExtraHeadersFromRequest(r))
+	resp, err := h.postResponsesWithFallbackHeaders(upstreamCtx, reqBody, extraHeaders)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -1414,6 +1474,11 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 
 	if len(chunks) > 1 {
 		concurrency := h.effectiveCompactChunkConcurrency()
+		if routeOperationFromContext(ctx) != nil {
+			// Explicit routes serialize every physical send so cleanup and target
+			// pinning are complete before another attempt starts.
+			concurrency = 1
+		}
 		remaining := len(chunks) - 1
 		if concurrency > remaining {
 			concurrency = remaining
@@ -2459,15 +2524,30 @@ func (h *ProxyHandler) maybeRetryResponsesWithoutUnverifiableEncryptedContent(ct
 		return restoreOriginalResp(), nil
 	}
 
+	var explicitOriginal *http.Response
+	explicitOperation := routeOperationFromContext(ctx) != nil
+	if explicitOperation {
+		explicitOriginal = cloneHTTPResponseWithBody(resp, classificationBody)
+		explicitOriginal.Header.Del("Content-Length")
+		if !closeResponseBodyWithTimeout(resp.Body, upstreamErrorDetailDrainTimeout) {
+			return explicitOriginal, nil
+		}
+	}
+
 	h.log.Info("retrying responses request without unverifiable encrypted content",
 		logger.F("encrypted_items_stripped", strippedItems),
 	)
-	retryResp, retryErr := h.postJSONEndpointWithHeaders(ctx, providerEndpointResponses, retryBody, extraHeaders)
+	retryResp, retryErr := h.postJSONEndpointWithHeaders(withRouteAttemptKind(ctx, routeAttemptProtocolRecovery), providerEndpointResponses, retryBody, extraHeaders)
 	if retryErr != nil {
 		h.log.Debug("responses encrypted-content retry request failed", logger.Err(retryErr))
+		if explicitOperation {
+			return explicitOriginal, nil
+		}
 		return restoreOriginalResp(), nil
 	}
-	_ = resp.Body.Close()
+	if !explicitOperation {
+		_ = resp.Body.Close()
+	}
 	return retryResp, nil
 }
 
@@ -2630,6 +2710,11 @@ func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Conte
 
 	requestedModel := extractResponsesRequestModel(bodyBytes)
 	provider, _, _ := h.resolveProviderModel(requestedModel, "/responses")
+	if operation := routeOperationFromContext(ctx); operation != nil {
+		if target, ok := operation.route.targetByID(operation.pinnedTarget()); ok && target.provider != nil {
+			provider = target.provider
+		}
+	}
 	fallbackModel, fallbackErr := h.pickResponsesCompatibleModel(ctx, provider, requestedModel)
 	if fallbackErr != nil {
 		h.log.Debug("responses fallback lookup failed", logger.Err(fallbackErr))
@@ -2654,7 +2739,7 @@ func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Conte
 		logger.F("fallback_model", fallbackModel),
 	)
 
-	retryResp, retryErr := h.postResponsesWithHeaders(ctx, fallbackBody, extraHeaders)
+	retryResp, retryErr := h.postResponsesWithHeaders(withRouteAttemptKind(ctx, routeAttemptCompatibilityFallback), fallbackBody, extraHeaders)
 	if retryErr != nil {
 		h.log.Debug("responses fallback request failed", logger.Err(retryErr))
 		return resp, "", nil
@@ -2668,7 +2753,7 @@ func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Conte
 // compact calls in the same fanout pre-rewrite their body via
 // applyResolvedCompactModel and skip the unsupported-model probe entirely.
 func (h *ProxyHandler) postResponsesCompactWithFallback(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, budget *compactBudget) (*http.Response, error) {
-	resp, fallbackModel, err := h.postResponsesWithFallbackHeadersTracked(ctx, bodyBytes, extraHeaders)
+	resp, fallbackModel, err := h.postResponsesWithFallbackHeadersTracked(withRouteAttemptKind(ctx, routeAttemptCompaction), bodyBytes, extraHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -2863,7 +2948,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 		}
 		h.log.Info("retrying responses request with compacted history after 413", fields...)
 
-		retryResp, retryErr := h.postResponsesWithHeaders(ctx, retryBody, upstreamHeaders)
+		retryResp, retryErr := h.postResponsesWithHeaders(withRouteAttemptKind(ctx, routeAttemptCompaction), retryBody, upstreamHeaders)
 		if retryErr != nil {
 			h.log.Debug("responses 413 retry request failed", logger.F("keep_tail", keepTail), logger.Err(retryErr))
 			return lastResp, nil

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -686,5 +687,16 @@ func TestGeminiCommittedLifecycleCancellationEmitsUnavailable(t *testing.T) {
 	}
 	if !summary.StatsSuppressed() {
 		t.Fatal("shutdown-canceled Gemini stream was not stats-suppressed")
+	}
+}
+
+func TestAggregateGeminiStreamToResponseWithProgressReportsToolActivity(t *testing.T) {
+	stream := "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":-1,\"id\":\"call_bad\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n"
+	_, progress, err := aggregateGeminiStreamToResponseWithProgress(io.NopCloser(strings.NewReader(stream)))
+	if err == nil {
+		t.Fatal("aggregate error = nil")
+	}
+	if progress != upstreamProgressToolActivity {
+		t.Fatalf("progress = %q want %q", progress, upstreamProgressToolActivity)
 	}
 }

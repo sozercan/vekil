@@ -248,6 +248,56 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 }
 
 func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, path string, body []byte, extraHeaders http.Header, model string) (*http.Response, error) {
+	if operation := routeOperationFromContext(ctx); operation != nil && operation.route != nil && !operation.route.legacy {
+		route := operation.route
+		if strings.TrimSpace(model) != "" && strings.TrimSpace(model) != route.public.id {
+			resolvedAlias := false
+			if resolved, known := h.resolveModelRouteForRequest(model, path); known && resolved == route {
+				resolvedAlias = true
+			}
+			attemptKind := routeAttemptKindFromContext(ctx)
+			if !resolvedAlias && attemptKind != routeAttemptCompatibilityFallback && attemptKind != routeAttemptCompaction {
+				return nil, &providerRequestError{
+					statusCode: http.StatusBadRequest,
+					err:        fmt.Errorf("explicit model route %q cannot change model to %q", route.public.id, model),
+				}
+			}
+			if resolvedAlias {
+				model = route.public.id
+			} else {
+				upstreamModel := strings.TrimSpace(model)
+				if pinned := operation.pinnedTarget(); pinned != "" {
+					if target, ok := route.targetByID(pinned); ok && target.provider != nil {
+						if configured, exists := target.provider.staticModels[upstreamModel]; exists && configured.upstreamModel != "" {
+							upstreamModel = configured.upstreamModel
+						}
+					}
+				}
+				ctx = withRouteUpstreamModelOverride(ctx, upstreamModel)
+			}
+		}
+		if !route.supportsEndpoint(path) {
+			return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("model %q does not support %s", route.public.id, path)}
+		}
+		stream := path == providerEndpointResponses && parseResponsesRequestMetadata(body).Stream
+		return h.executeExplicitRouteRequest(ctx, route, path, body, extraHeaders, route.public.id, stream)
+	}
+
+	route, known := h.resolveModelRouteForRequest(model, path)
+	if known && route != nil && !route.legacy {
+		if err := rejectDuplicateJSONMappingKeys(body); err != nil {
+			return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("invalid ambiguous JSON request: %w", err)}
+		}
+		if !route.supportsEndpoint(path) {
+			return nil, &providerRequestError{
+				statusCode: http.StatusBadRequest,
+				err:        fmt.Errorf("model %q does not support %s", model, path),
+			}
+		}
+		stream := path == providerEndpointResponses && parseResponsesRequestMetadata(body).Stream
+		return h.executeExplicitRouteRequest(ctx, route, path, body, extraHeaders, model, stream)
+	}
+
 	provider, owner, rewrittenBody, err := h.resolveProviderRequestForModel(body, path, model)
 	if err != nil {
 		return nil, err
@@ -283,6 +333,14 @@ func (h *ProxyHandler) postAnthropicMessages(ctx context.Context, body []byte, e
 }
 
 func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
+	model := extractRequestModel(body)
+	if operation := routeOperationFromContext(ctx); operation != nil && operation.route != nil && !operation.route.legacy {
+		return h.executeExplicitRouteRequestPath(ctx, operation.route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, operation.route.public.id, false)
+	}
+	if route, known := h.resolveModelRouteForRequest(model, providerEndpointMessages); known && route != nil && !route.legacy {
+		return h.executeExplicitRouteRequestPath(ctx, route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)
+	}
+
 	provider, owner, rewrittenBody, err := h.resolveProviderRequest(body, providerEndpointMessages)
 	if err != nil {
 		return nil, err
@@ -488,6 +546,10 @@ func sniffOpenAIUsage(body []byte) *models.OpenAIUsage {
 }
 
 func writeDirectAnthropicJSONResponse(ctx, upstreamCtx context.Context, w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) error {
+	if info, ok := explicitRouteResponseInfoFromResponse(resp); ok {
+		publicModel = info.publicID
+		upstreamModel = ""
+	}
 	bodyReader := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
 	defer func() { _ = bodyReader.Close() }()
 
@@ -515,6 +577,10 @@ func writeDirectAnthropicJSONResponse(ctx, upstreamCtx context.Context, w http.R
 }
 
 func (h *ProxyHandler) writeDirectAnthropicStreamResponse(ctx, upstreamCtx context.Context, w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) {
+	if info, ok := explicitRouteResponseInfoFromResponse(resp); ok {
+		publicModel = info.publicID
+		upstreamModel = ""
+	}
 	defer func() { _ = resp.Body.Close() }()
 
 	copyPassthroughHeaders(w.Header(), resp.Header)

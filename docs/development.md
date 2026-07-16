@@ -26,6 +26,43 @@ scripts/tests/live-smoke-reliability-test.sh  # deterministic mock-server/fake-C
 
 `cmd/compaction-lab` starts an in-process proxy and fake `/responses` upstream, then exercises the compact-response shape, opaque compaction replay, remote compaction v2 trigger handling, and websocket `response.processed` control frames. It is intended as a quick deterministic check for compaction regressions before running live Copilot smoke tests.
 
+### Model-route safety suite
+
+Provider-agnostic model-route implementation started from repository baseline `3388071`. Verify that the baseline is reachable from the revision under test before comparing behavior or performance:
+
+```bash
+git merge-base --is-ancestor 3388071 HEAD
+printf 'baseline=%s head=%s\n' "$(git rev-parse 3388071)" "$(git rev-parse HEAD)"
+```
+
+The production-phase gate is:
+
+```bash
+make test
+make vet
+make build
+go test -race ./... -count=1
+```
+
+For a fast route-focused pass before the full suite:
+
+```bash
+go test ./proxy/ -run 'Test(LoadProvidersConfigFile|ValidateModelRoutes|RouteReferenced|UnreferencedStatic|CompileExplicit|ExplicitRoute|ConfiguredExplicitRoute|StateBindingStore|RouteObservability|RequestSummary)' -count=1
+```
+
+Route-specific deterministic tests use local upstream servers plus injected transports/clocks; live provider credentials are not the merge gate. Coverage should include:
+
+- strict version-1/version-2 decoding, duplicate-key rejection, limits, feature-matrix rejection, two-pass provider/route references, normalized public-ID collisions, and `vekil config validate`;
+- legacy route catalog/unknown-model/retry compatibility and explicit route ordering/catalog identity;
+- pristine request body/header/auth construction for every target, including API-key, Entra, bearer, and custom-header switches;
+- exact target-attempt and network-send counts for normal attempts, redirects, prewrite failures, ambiguous delivery, protocol recovery, compaction/replay, and compatibility fallback;
+- Responses preamble commitment, partial/malformed streams, forced-stream semantic/tool progress, translated Anthropic/Gemini preambles, and client-write races;
+- exact state binding before exposure, known/unknown/conflicting state, expiry/eviction/restart/second-process behavior, and pinned WebSocket first-turn/later-turn behavior with no cross-target migration;
+- client-request versus physical-attempt accounting, final target attribution, bounded-cardinality/redaction rules, and failed-attempt usage isolation; and
+- client disconnect, total deadline, shutdown, response-body cleanup, goroutine termination, and no-overlap/no-new-attempt races.
+
+For large request and replay paths, keep the `64 MiB` request boundary in the deterministic matrix and verify that operation/send budgets prevent compaction, recovery, or fallback from creating an unbounded tree.
+
 ## Benchmarks
 
 ```bash
@@ -33,6 +70,36 @@ go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesWebSocketRequestBuild' -ben
 go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesTransport' -benchmem -count=1
 go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesSession' -benchmem -count=1
 ```
+
+For the model-route change, compare at least ten controlled samples against baseline `3388071`. Keep the Go version, fixtures, target count, and machine load identical, and set an explicit `GOMAXPROCS` instead of relying on the machine default:
+
+```bash
+export GOMAXPROCS=8  # choose one fixed value for both baseline and candidate
+go version
+go env GOOS GOARCH
+printf 'GOMAXPROCS=%s\n' "$GOMAXPROCS"
+
+go test ./proxy/ -run '^$' -bench 'BenchmarkChatRoute' -benchmem -count=10
+go test ./proxy/ -run '^$' -bench 'BenchmarkDefaultProviderSetup' -benchmem -count=10
+go test ./proxy/ -run '^$' -bench 'BenchmarkOpenAIResponseAggregatorToolCallArguments' -benchmem -count=10
+go test ./proxy/ -run '^$' -bench 'BenchmarkGeminiStreamSparseToolCall' -benchmem -count=10
+go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesTransport' -benchmem -count=10
+go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesSession' -benchmem -count=10
+go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesWebSocketRequestBuild' -benchmem -count=10
+```
+
+Capture baseline and candidate output separately, then compare `ns/op`, `B/op`, and `allocs/op` with `benchstat`:
+
+```bash
+# Run the same benchmark command from a clean checkout/worktree at 3388071.
+GOMAXPROCS="$GOMAXPROCS" go test ./proxy/ -run '^$' -bench '<same-regex>' -benchmem -count=10 > baseline-3388071.txt
+GOMAXPROCS="$GOMAXPROCS" go test ./proxy/ -run '^$' -bench '<same-regex>' -benchmem -count=10 > candidate.txt
+benchstat baseline-3388071.txt candidate.txt
+```
+
+Record the full baseline SHA, candidate SHA, Go version, OS/architecture, `GOMAXPROCS`, fixture/body size, stream mode, and target count with the results. Do not use the unrelated `fca0b12` commit as the route baseline; it is not an ancestor of `3388071` in this worktree. Credentialed Azure pool smoke is supplementary only and never replaces deterministic local tests or controlled benchmarks.
+
+`BenchmarkChatRouteLegacyDirectResolutionRequestBuild` and `BenchmarkChatRouteExplicitPriorityOneTargetRequestBuild` provide the direct legacy-versus-route request-build baseline. `BenchmarkChatRouteLegacyDirectTransport` and `BenchmarkChatRouteExplicitPrimaryOnlyTransport` add deterministic `http.Client`/`RoundTripper` dispatch coverage without network variability. Prepared-stream TTFT coverage and a stats-contention benchmark are **not currently checked in**; do not claim those remaining performance gates are complete until dedicated benchmarks are added.
 
 ## Lint
 
@@ -145,5 +212,5 @@ You can also run the same smoke scripts locally after building `vekil`; the CLI 
 - Register the provider kind in `proxy/providers.go` and its endpoint policy in `proxy/provider_endpoint_policy.go`.
 - Keep upstream deployment names internal to provider config; public model IDs remain global.
 - Treat `models[].endpoints` as a verified allowlist. Do not advertise routes that have not been tested for that provider/model.
-- Preserve startup failure on public-model-ID collisions.
+- Preserve startup failure on public-model-ID collisions. For schema version 2, add new provider/surface/mode support to the compiled route feature matrix and reject unsupported combinations rather than accepting them as degraded routes.
 - Cross-link config examples in [`provider-routing.md`](provider-routing.md) instead of duplicating YAML here.

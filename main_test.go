@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -514,6 +515,16 @@ func TestCommandFromArgs(t *testing.T) {
 			want: cliCommandLogout,
 		},
 		{
+			name: "config namespace dispatches without serving",
+			args: []string{"vekil", "config"},
+			want: cliCommandConfig,
+		},
+		{
+			name: "config validate dispatches without serving",
+			args: []string{"vekil", "config", "validate", "--providers-config", "/tmp/providers.yaml"},
+			want: cliCommandConfig,
+		},
+		{
 			name: "unknown subcommand falls back to serve",
 			args: []string{"vekil", "serve"},
 			want: cliCommandServe,
@@ -524,6 +535,208 @@ func TestCommandFromArgs(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := commandFromArgs(tc.args); got != tc.want {
 				t.Fatalf("commandFromArgs(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunConfigValidateSuccess(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	var gotPath string
+	calls := 0
+
+	code := runConfigWithDeps([]string{"validate", "--providers-config", "/tmp/provider config.yaml"}, configValidateDeps{
+		stdout: &stdout,
+		stderr: &stderr,
+		validateProvidersConfigFile: func(path string) error {
+			calls++
+			gotPath = path
+			return nil
+		},
+	})
+
+	if code != 0 {
+		t.Fatalf("runConfigWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if calls != 1 {
+		t.Fatalf("ValidateProvidersConfigFile calls = %d, want 1", calls)
+	}
+	if gotPath != "/tmp/provider config.yaml" {
+		t.Fatalf("ValidateProvidersConfigFile path = %q, want %q", gotPath, "/tmp/provider config.yaml")
+	}
+	if got := stdout.String(); got != "Providers config is valid: /tmp/provider config.yaml\n" {
+		t.Fatalf("stdout = %q, want success message", got)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty", got)
+	}
+}
+
+func TestRunConfigValidateFailure(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	validationErr := errors.New("model_routes[1].targets[0].provider: unknown provider")
+
+	code := runConfigWithDeps([]string{"validate", "--providers-config=/tmp/providers.yaml"}, configValidateDeps{
+		stdout: &stdout,
+		stderr: &stderr,
+		validateProvidersConfigFile: func(path string) error {
+			if path != "/tmp/providers.yaml" {
+				t.Fatalf("ValidateProvidersConfigFile path = %q, want /tmp/providers.yaml", path)
+			}
+			return validationErr
+		},
+	})
+
+	if code != 1 {
+		t.Fatalf("runConfigWithDeps() code = %d, want 1", code)
+	}
+	if got := stdout.String(); got != "" {
+		t.Fatalf("stdout = %q, want empty", got)
+	}
+	want := "error: providers config validation failed: " + validationErr.Error() + "\n"
+	if got := stderr.String(); got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+}
+
+func TestRunConfigValidateUsageErrorsDoNotValidate(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		wantText string
+	}{
+		{
+			name:     "missing providers config",
+			args:     []string{"validate"},
+			wantText: "--providers-config PATH is required",
+		},
+		{
+			name:     "unknown flag",
+			args:     []string{"validate", "--unknown"},
+			wantText: "flag provided but not defined: -unknown",
+		},
+		{
+			name:     "unexpected positional argument",
+			args:     []string{"validate", "--providers-config", "/tmp/providers.yaml", "extra"},
+			wantText: `unexpected argument "extra"`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			validated := false
+
+			code := runConfigWithDeps(tc.args, configValidateDeps{
+				stdout: &stdout,
+				stderr: &stderr,
+				validateProvidersConfigFile: func(string) error {
+					validated = true
+					return nil
+				},
+			})
+
+			if code != 2 {
+				t.Fatalf("runConfigWithDeps() code = %d, want 2", code)
+			}
+			if validated {
+				t.Fatal("usage error called ValidateProvidersConfigFile")
+			}
+			if got := stdout.String(); got != "" {
+				t.Fatalf("stdout = %q, want empty", got)
+			}
+			output := stderr.String()
+			for _, want := range []string{tc.wantText, "Usage: vekil config validate --providers-config PATH"} {
+				if !strings.Contains(output, want) {
+					t.Fatalf("stderr missing %q:\n%s", want, output)
+				}
+			}
+		})
+	}
+}
+
+func TestRunConfigHelpDoesNotValidate(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "config short help", args: []string{"-h"}},
+		{name: "config long help", args: []string{"--help"}},
+		{name: "config help command", args: []string{"help"}},
+		{name: "validate short help", args: []string{"validate", "-h"}},
+		{name: "validate long help", args: []string{"validate", "--help"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			validated := false
+
+			code := runConfigWithDeps(tc.args, configValidateDeps{
+				stdout: &stdout,
+				stderr: &stderr,
+				validateProvidersConfigFile: func(string) error {
+					validated = true
+					return nil
+				},
+			})
+
+			if code != 0 {
+				t.Fatalf("runConfigWithDeps(%v) code = %d, want 0", tc.args, code)
+			}
+			if validated {
+				t.Fatal("help called ValidateProvidersConfigFile")
+			}
+			if got := stdout.String(); got != "" {
+				t.Fatalf("stdout = %q, want empty", got)
+			}
+			output := stderr.String()
+			for _, want := range []string{"Usage: vekil config validate --providers-config PATH", "validate"} {
+				if !strings.Contains(output, want) {
+					t.Fatalf("help output missing %q:\n%s", want, output)
+				}
+			}
+		})
+	}
+}
+
+func TestRunConfigRejectsMissingOrUnknownCommand(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		wantText string
+	}{
+		{name: "missing command", args: nil, wantText: "config command is required"},
+		{name: "unknown command", args: []string{"check"}, wantText: `unknown config command "check"`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			validated := false
+			code := runConfigWithDeps(tc.args, configValidateDeps{
+				stderr: &stderr,
+				validateProvidersConfigFile: func(string) error {
+					validated = true
+					return nil
+				},
+			})
+
+			if code != 2 {
+				t.Fatalf("runConfigWithDeps(%v) code = %d, want 2", tc.args, code)
+			}
+			if validated {
+				t.Fatal("invalid config command called ValidateProvidersConfigFile")
+			}
+			output := stderr.String()
+			for _, want := range []string{tc.wantText, "Usage: vekil config validate --providers-config PATH"} {
+				if !strings.Contains(output, want) {
+					t.Fatalf("stderr missing %q:\n%s", want, output)
+				}
 			}
 		})
 	}

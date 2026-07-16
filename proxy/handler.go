@@ -285,6 +285,9 @@ type ProxyHandler struct {
 	models                           modelsCache
 	geminiCounts                     geminiCountTokensCache
 	stats                            *statsCollector
+	stateBindingsOnce                sync.Once
+	stateBindings                    *stateBindingStore
+	stateBindingsErr                 error
 	insightGate                      *insightGate
 	insightGateOnce                  sync.Once
 }
@@ -787,6 +790,10 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		if opt != nil {
 			opt(h)
 		}
+	}
+	if _, err := h.ensureStateBindingStore(); err != nil {
+		h.BeginShutdown()
+		return nil, err
 	}
 	h.initializeToolOptimizers()
 	if err := h.initializeProviders(); err != nil {
@@ -1451,6 +1458,15 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 	canonicalRefresh := isCanonicalModelsQuery(rawQuery)
 	rawEntries := make([]json.RawMessage, 0)
 	owners := make(map[string]string)
+	if registry := setup.routeRegistry(); registry != nil {
+		for _, route := range registry.explicitRoutes() {
+			if route == nil {
+				continue
+			}
+			owners[route.public.id] = route.public.routeID
+			rawEntries = append(rawEntries, append(json.RawMessage(nil), route.public.raw...))
+		}
+	}
 	refreshedDynamicModels := make(map[string][]providerModel)
 	mergedETag := ""
 	sawDynamicProvider := false
@@ -1524,10 +1540,8 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 		return cachedModelsResponse{}, false, err
 	}
 
-	for providerID, models := range refreshedDynamicModels {
-		if err := setup.replaceProviderModels(providerID, models); err != nil {
-			return cachedModelsResponse{}, false, err
-		}
+	if err := setup.replaceProviderModelsBatch(refreshedDynamicModels); err != nil {
+		return cachedModelsResponse{}, false, err
 	}
 
 	return cachedModelsResponse{

@@ -1,6 +1,21 @@
 # Gemini Compatibility
 
-Gemini endpoints are implemented as a translation layer, not zero-copy passthrough. Requests are translated to OpenAI Chat Completions, routed through the provider that owns the selected public model, and translated back into Gemini responses.
+Gemini endpoints are implemented as a translation layer, not zero-copy passthrough. Requests are translated to OpenAI Chat Completions, routed through the route that owns the selected public model, and translated back into Gemini responses.
+
+## Model routes and failover
+
+For a schema-version-2 explicit route, Gemini `generateContent`, `streamGenerateContent`, and `countTokens` use the route's canonical `/chat/completions` operation. Translation and opt-in tool optimization run once on an immutable logical request; target-specific model rewrite, URL construction, wire policy, and authentication are applied only after a target is selected. Gemini routing and catalog identity remain the requested public ID; Vekil does not add a physical deployment name to the Gemini response payload.
+
+`primary_only` uses the first configured target. `priority_failover` can select the next equivalent target only before request delivery/progress is ambiguous and before any Gemini response is committed. For the canonical Chat operation, safe candidates are limited to prewrite transport failures and adapter-certified `429` or overload/unavailable rejections before semantic progress. It is not cross-model fallback, and one route cannot mix a native-Anthropic target with an OpenAI-translated target.
+
+Commitment rules are surface-specific:
+
+- A non-streaming `generateContent` may switch targets only before an upstream response or semantic/tool progress makes replay unsafe.
+- When a non-streaming Gemini request is force-streamed upstream for tool reliability, observed text or tool-call progress makes a later aggregation failure ambiguous even though the downstream response is still silent; Vekil does not start a second generation.
+- `streamGenerateContent` holds only a nonsemantic upstream prefix, bounded by `750 ms` and `64 KiB`, before committing Gemini SSE headers/frames. An adapter-certified admission failure inside that window may use the next target. Text, reasoning, tool activity, usage/accounting output, unknown/malformed events, either precommit bound, or a client write permanently disables target failover. Postcommit failures remain Gemini error frames on the already-committed HTTP `200`.
+- Each dispatched upstream `countTokens` probe is subject to the explicit route's target/send limits. A cache hit or dependency-free local estimate does not create an upstream attempt.
+
+The running binary validates supported provider/surface/mode combinations at configuration time. Unsupported explicit-route combinations are rejected rather than silently downgraded. See [Provider Routing](provider-routing.md#supported-route-surfaces) for the current matrix and [Architecture](architecture.md#attempt-execution-and-replay-safety) for the shared safety gate.
 
 ## `POST /v1beta/models/{model}:generateContent`, `POST /v1/models/{model}:generateContent`, and `POST /models/{model}:generateContent` (Gemini)
 

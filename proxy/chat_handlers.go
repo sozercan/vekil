@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -33,6 +34,496 @@ type chatCompletionsResponseHandlers struct {
 	stream      func(*http.Response)
 	aggregate   func(*models.OpenAIResponse)
 	passthrough func(*http.Response) error
+}
+
+type explicitRouteSurfaceSend func(context.Context) (*http.Response, error)
+
+type explicitRouteStreamAggregator func(io.ReadCloser) (*models.OpenAIResponse, upstreamSemanticProgress, error)
+
+type explicitRouteCanonicalFailure struct {
+	response *capturedRouteResponse
+	stream   *explicitRouteStreamFailure
+	headers  http.Header
+}
+
+func (f *explicitRouteCanonicalFailure) result() (*http.Response, error) {
+	if f == nil {
+		return nil, nil
+	}
+	if f.response != nil {
+		return f.response.response(), nil
+	}
+	if f.stream != nil {
+		return nil, f.stream.asUpstreamError(f.headers)
+	}
+	return nil, nil
+}
+
+func explicitRouteCanonicalOrError(canonical *explicitRouteCanonicalFailure, err error) (*http.Response, error) {
+	if canonical == nil || err == nil {
+		return nil, err
+	}
+	var routeErr *routeExecutionFailureError
+	if errors.As(err, &routeErr) && routeErr.failure.precedence() < 2 {
+		return canonical.result()
+	}
+	return nil, err
+}
+
+func (h *ProxyHandler) executeChatCompletionsRouteRequest(ctx context.Context, body []byte, mode chatCompletionsMode) (*http.Response, error) {
+	send := func(attemptCtx context.Context) (*http.Response, error) {
+		return h.postChatCompletions(attemptCtx, body)
+	}
+	return h.executeExplicitRouteSurfaceRequest(ctx, providerEndpointChatCompletions, mode.clientRequestedStream, explicitRouteStreamOpenAIChat, send)
+}
+
+func (h *ProxyHandler) executeAnthropicMessagesRouteRequest(ctx context.Context, body []byte, headers http.Header, streaming bool) (*http.Response, error) {
+	send := func(attemptCtx context.Context) (*http.Response, error) {
+		return h.postAnthropicMessages(attemptCtx, body, headers)
+	}
+	return h.executeExplicitRouteSurfaceRequest(ctx, providerEndpointMessages, streaming, explicitRouteStreamAnthropic, send)
+}
+
+func (h *ProxyHandler) executeExplicitRouteSurfaceRequest(ctx context.Context, endpoint string, clientStream bool, protocol explicitRouteStreamProtocol, send explicitRouteSurfaceSend) (*http.Response, error) {
+	resp, err := send(ctx)
+	if err != nil {
+		return nil, err
+	}
+	operation := routeOperationFromContext(ctx)
+	if operation == nil || operation.route == nil || operation.route.legacy {
+		return resp, nil
+	}
+
+	var canonical *explicitRouteCanonicalFailure
+	for {
+		if resp == nil {
+			return nil, fmt.Errorf("upstream response is unavailable")
+		}
+		// The proxy-owned operation ID is authoritative. Never let a same-named
+		// upstream header overwrite the value installed on the client response.
+		resp.Header.Del("X-Vekil-Request-ID")
+
+		info, target, ok := explicitRouteTargetForResponse(operation, resp)
+		if !ok {
+			return resp, nil
+		}
+		if explicitRouteSurfaceMayExplicitlyReject(target, endpoint, resp.StatusCode) {
+			accepted := operation.hasAcceptedRouteAttempt(info.targetID)
+			statusCode := resp.StatusCode
+			upstreamID := responsesUpstreamRequestID(resp.Header)
+			captured, cleanupDone := captureRouteResponse(resp)
+			resp = captured.response()
+			if !cleanupDone {
+				if accepted {
+					operation.reclassifyAcceptedRouteAttempt(info.targetID, statusCode, requestDeliveredOrAmbiguous, upstreamProgressUnknown, downstreamCommitmentNone, routeRetrySuppressedLifecycle, upstreamID, false, false)
+				}
+				return resp, nil
+			}
+			if !explicitRouteSurfaceCertifiesHTTPRejection(target, endpoint, captured) {
+				// A bare/gateway 503 remains ambiguous. Return the bounded captured
+				// response and never release the target for another generation.
+				if accepted {
+					operation.reclassifyAcceptedRouteAttempt(info.targetID, statusCode, requestDeliveredOrAmbiguous, upstreamProgressUnknown, downstreamCommitmentNone, routeRetrySuppressedDelivery, upstreamID, false, true)
+				}
+				return resp, nil
+			}
+
+			decision, retry := h.explicitRouteRetryDecision(ctx, operation, endpoint)
+			if accepted && retry {
+				if canonical == nil {
+					canonical = &explicitRouteCanonicalFailure{response: captured}
+				}
+				operation.reclassifyAcceptedRouteAttempt(info.targetID, statusCode, requestExplicitlyRejected, upstreamProgressNone, downstreamCommitmentNone, decision, upstreamID, true, true)
+				resp, err = send(ctx)
+				if err != nil {
+					return explicitRouteCanonicalOrError(canonical, err)
+				}
+				continue
+			}
+			if accepted {
+				operation.reclassifyAcceptedRouteAttempt(info.targetID, statusCode, requestExplicitlyRejected, upstreamProgressNone, downstreamCommitmentNone, decision, upstreamID, false, true)
+				h.recordManualRouteExhaustion(operation, decision)
+			}
+			if canonical != nil {
+				return canonical.result()
+			}
+			return resp, nil
+		}
+
+		if resp.StatusCode != http.StatusOK || !clientStream || protocol == explicitRouteStreamNone {
+			return resp, nil
+		}
+		if isExplicitRoutePreparedChatResponse(resp) {
+			return resp, nil
+		}
+
+		prepared := newExplicitRoutePreparedStream(resp, protocol, responsesPrecommitMaxPeekBytes)
+		result, hasResult, awaitErr := prepared.await(operation.inbound, ctx, responsesPrecommitPeekTimeout)
+		if awaitErr != nil {
+			prepared.abort()
+			return nil, awaitErr
+		}
+		if hasResult && result.failure != nil {
+			status, certified := explicitRouteTargetCertifiesStreamFailure(target, result.failure)
+			if upstreamProgressAllowsTargetSwitch(result.progress) && certified {
+				result.failure.statusCode = status
+				decision, retry := h.explicitRouteRetryDecision(ctx, operation, endpoint)
+				if retry {
+					if !prepared.abortAndWait(ctx) {
+						return nil, fmt.Errorf("failed to clean up rejected stream attempt before failover")
+					}
+					if canonical == nil {
+						canonical = &explicitRouteCanonicalFailure{stream: result.failure, headers: resp.Header.Clone()}
+					}
+					operation.reclassifyAcceptedRouteAttempt(info.targetID, result.failure.statusCode, requestExplicitlyRejected, result.progress, downstreamCommitmentNone, decision, responsesUpstreamRequestID(resp.Header), true, true)
+					resp, err = send(ctx)
+					if err != nil {
+						return explicitRouteCanonicalOrError(canonical, err)
+					}
+					continue
+				}
+				prepared.abort()
+				operation.reclassifyAcceptedRouteAttempt(info.targetID, result.failure.statusCode, requestExplicitlyRejected, result.progress, downstreamCommitmentNone, decision, responsesUpstreamRequestID(resp.Header), false, true)
+				h.recordManualRouteExhaustion(operation, decision)
+				if canonical != nil {
+					return canonical.result()
+				}
+				return nil, result.failure.asUpstreamError(resp.Header)
+			}
+		}
+
+		if hasResult {
+			operation.updateAcceptedRouteAttempt(info.targetID, result.progress, downstreamCommitmentNone)
+		}
+		return prepared.commitResponse(), nil
+	}
+}
+
+func (h *ProxyHandler) aggregateExplicitChatCompletionsResponse(ctx context.Context, initialResp *http.Response, body []byte, mode chatCompletionsMode, aggregate explicitRouteStreamAggregator) (*models.OpenAIResponse, *http.Response, error) {
+	resp := initialResp
+	operation := routeOperationFromContext(ctx)
+	var canonical error
+
+	for {
+		if resp == nil {
+			return nil, nil, fmt.Errorf("upstream response is unavailable")
+		}
+		if resp.StatusCode != http.StatusOK {
+			if canonical != nil {
+				if info, target, ok := explicitRouteTargetForResponse(operation, resp); ok && explicitRouteSurfaceMayExplicitlyReject(target, providerEndpointChatCompletions, resp.StatusCode) {
+					_ = info
+					captured, cleanupDone := captureRouteResponse(resp)
+					resp = captured.response()
+					if cleanupDone && explicitRouteSurfaceCertifiesHTTPRejection(target, providerEndpointChatCompletions, captured) {
+						return nil, nil, canonical
+					}
+				}
+			}
+			return nil, resp, nil
+		}
+
+		lifecycleBody := newLifecycleAwareReadCloser(resp.Body, ctx)
+		response, progress, aggregateErr := aggregate(lifecycleBody)
+		if aggregateErr != nil && lifecycleBody.canceledAtFailure() {
+			aggregateErr = context.Canceled
+		}
+		if operation == nil || operation.route == nil || operation.route.legacy {
+			return response, nil, aggregateErr
+		}
+
+		info, target, ok := explicitRouteTargetForResponse(operation, resp)
+		if !ok {
+			return response, nil, aggregateErr
+		}
+		if aggregateErr == nil {
+			progress = mergeUpstreamSemanticProgress(progress, upstreamProgressTerminalSuccess)
+			operation.updateAcceptedRouteAttempt(info.targetID, progress, downstreamCommitmentNone)
+			return response, nil, nil
+		}
+
+		failure := explicitRouteStreamFailureFromError(aggregateErr)
+		certifiedStatus, certified := explicitRouteTargetCertifiesStreamFailure(target, failure)
+		if failure == nil || !upstreamProgressAllowsTargetSwitch(progress) || !certified {
+			decision := routeRetrySuppressedDelivery
+			delivery := requestDeliveredOrAmbiguous
+			if !upstreamProgressAllowsTargetSwitch(progress) {
+				decision = routeRetrySuppressedProgress
+			}
+			if progress == upstreamProgressNone {
+				progress = upstreamProgressUnknown
+			}
+			operation.reclassifyAcceptedRouteAttempt(info.targetID, routeErrorStatus(aggregateErr), delivery, progress, downstreamCommitmentNone, decision, responsesUpstreamRequestID(resp.Header), false, true)
+			return nil, nil, aggregateErr
+		}
+
+		failure.statusCode = certifiedStatus
+		decision, retry := h.explicitRouteRetryDecision(ctx, operation, providerEndpointChatCompletions)
+		operation.reclassifyAcceptedRouteAttempt(info.targetID, failure.statusCode, requestExplicitlyRejected, progress, downstreamCommitmentNone, decision, responsesUpstreamRequestID(resp.Header), retry, true)
+		if canonical == nil {
+			canonical = aggregateErr
+		}
+		if !retry {
+			h.recordManualRouteExhaustion(operation, decision)
+			return nil, nil, canonical
+		}
+
+		nextMode := mode
+		nextMode.clientRequestedStream = false
+		resp, aggregateErr = h.executeChatCompletionsRouteRequest(ctx, body, nextMode)
+		if aggregateErr != nil {
+			var routeErr *routeExecutionFailureError
+			if canonical != nil && errors.As(aggregateErr, &routeErr) && routeErr.failure.precedence() < 2 {
+				return nil, nil, canonical
+			}
+			return nil, nil, aggregateErr
+		}
+	}
+}
+
+func explicitRouteStreamFailureFromError(err error) *explicitRouteStreamFailure {
+	var streamErr *openAIStreamError
+	if !errors.As(err, &streamErr) {
+		return nil
+	}
+	return &explicitRouteStreamFailure{
+		statusCode: streamErr.httpStatus(),
+		errType:    strings.TrimSpace(streamErr.Type),
+		code:       strings.TrimSpace(streamErr.Code),
+		message:    streamErr.Error(),
+	}
+}
+
+func explicitRouteTargetForResponse(operation *routeOperation, resp *http.Response) (explicitRouteResponseInfo, targetBinding, bool) {
+	if operation == nil || operation.route == nil {
+		return explicitRouteResponseInfo{}, targetBinding{}, false
+	}
+	info, ok := explicitRouteResponseInfoFromResponse(resp)
+	if !ok || info.routeID != operation.route.public.routeID {
+		return explicitRouteResponseInfo{}, targetBinding{}, false
+	}
+	target, ok := operation.route.targetByID(info.targetID)
+	return info, target, ok && target.provider != nil
+}
+
+func explicitRouteSurfaceMayExplicitlyReject(target targetBinding, endpoint string, statusCode int) bool {
+	if routeAdapterMayExplicitlyReject(target, endpoint, statusCode) {
+		return true
+	}
+	if endpoint != providerEndpointChatCompletions && endpoint != providerEndpointMessages {
+		return false
+	}
+	if target.provider == nil || (statusCode != http.StatusServiceUnavailable && statusCode != 529) {
+		return false
+	}
+	// Phase 6 reuses the same provider overload envelope classifier as Responses,
+	// but still requires bounded body capture and code/type certification below.
+	if routeAdapterMayExplicitlyReject(target, providerEndpointResponses, statusCode) {
+		return true
+	}
+	return target.provider.kind == providerTypeAnthropicCompatible && statusCode == 529
+}
+
+func explicitRouteSurfaceCertifiesHTTPRejection(target targetBinding, endpoint string, response *capturedRouteResponse) bool {
+	if routeAdapterCertifiesHTTPRejection(target, endpoint, response) {
+		return true
+	}
+	if endpoint != providerEndpointChatCompletions && endpoint != providerEndpointMessages {
+		return false
+	}
+	return routeAdapterCertifiesHTTPRejection(target, providerEndpointResponses, response)
+}
+
+func explicitRouteTargetCertifiesStreamFailure(target targetBinding, failure *explicitRouteStreamFailure) (int, bool) {
+	if failure == nil || target.provider == nil {
+		return 0, false
+	}
+	event := responsesWebSocketStreamEvent{}
+	event.Response.Error.Code = strings.TrimSpace(failure.code)
+	event.Response.Error.Type = strings.TrimSpace(failure.errType)
+	event.Response.Error.Message = strings.TrimSpace(failure.message)
+	return routeAdapterCertifiesStreamFailure(target, event)
+}
+
+func (h *ProxyHandler) explicitRouteRetryDecision(ctx context.Context, operation *routeOperation, endpoint string) (routeRetryDecision, bool) {
+	if operation == nil || operation.route == nil {
+		return routeRetrySuppressedNoTarget, false
+	}
+	if operation.route.policy.mode != routeModePriorityFailover {
+		return routeRetrySuppressedMode, false
+	}
+	if !operation.allowsAutomaticTargetSwitch(routeAttemptKindFromContext(ctx)) {
+		return routeRetrySuppressedState, false
+	}
+	if h.ShuttingDown() || (ctx != nil && ctx.Err() != nil) || (operation.inbound != nil && operation.inbound.Err() != nil) {
+		return routeRetrySuppressedLifecycle, false
+	}
+
+	operation.mu.Lock()
+	defer operation.mu.Unlock()
+	if operation.commitment != downstreamCommitmentNone {
+		return routeRetrySuppressedCommitment, false
+	}
+	if operation.remainingTargetAttempts <= 0 || operation.remainingUpstreamSends <= 0 {
+		return routeRetrySuppressedBudget, false
+	}
+	for _, target := range operation.route.targets {
+		if target.provider == nil || !target.provider.supportsEndpoint(endpoint) {
+			continue
+		}
+		if _, attempted := operation.attemptedTargets[target.id]; !attempted {
+			return routeRetrySwitchTarget, true
+		}
+	}
+	return routeRetrySuppressedNoTarget, false
+}
+
+func (h *ProxyHandler) recordManualRouteExhaustion(operation *routeOperation, decision routeRetryDecision) {
+	if operation == nil {
+		return
+	}
+	if (decision == routeRetrySuppressedBudget || decision == routeRetrySuppressedNoTarget) && operation.markExhausted() {
+		h.RecordRouteExhaustion(operation.inbound)
+	}
+}
+
+func (o *routeOperation) hasAcceptedRouteAttempt(targetID string) bool {
+	if o == nil {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for i := len(o.trace) - 1; i >= 0; i-- {
+		if o.trace[i].TargetID == targetID {
+			return o.trace[i].Decision == routeRetryAccepted
+		}
+	}
+	return false
+}
+
+func (o *routeOperation) reclassifyAcceptedRouteAttempt(targetID string, statusCode int, delivery requestDelivery, progress upstreamSemanticProgress, commitment downstreamCommitment, decision routeRetryDecision, upstreamID string, releaseTarget, cleanupDone bool) bool {
+	if o == nil {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for i := len(o.trace) - 1; i >= 0; i-- {
+		trace := &o.trace[i]
+		if trace.TargetID != targetID || trace.Decision != routeRetryAccepted {
+			continue
+		}
+		trace.StatusCode = statusCode
+		trace.Delivery = delivery
+		trace.Progress = progress
+		trace.Commitment = commitment
+		trace.Decision = decision
+		trace.CleanupDone = cleanupDone
+		if strings.TrimSpace(upstreamID) != "" {
+			trace.UpstreamID = upstreamID
+		}
+		if releaseTarget && !o.hardPinned && o.pinnedTargetID == targetID {
+			o.pinnedTargetID = ""
+		}
+		return true
+	}
+	return false
+}
+
+func (o *routeOperation) updateAcceptedRouteAttempt(targetID string, progress upstreamSemanticProgress, commitment downstreamCommitment) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for i := len(o.trace) - 1; i >= 0; i-- {
+		trace := &o.trace[i]
+		if trace.TargetID != targetID || trace.Decision != routeRetryAccepted {
+			continue
+		}
+		trace.Progress = mergeUpstreamSemanticProgress(trace.Progress, progress)
+		if routeCommitmentRank(commitment) > routeCommitmentRank(trace.Commitment) {
+			trace.Commitment = commitment
+		}
+		return
+	}
+}
+
+func markExplicitRouteDownstreamCommitment(ctx context.Context, commitment downstreamCommitment) {
+	operation := routeOperationFromContext(ctx)
+	if operation == nil {
+		return
+	}
+	operation.setCommitment(commitment)
+	if targetID := operation.pinnedTarget(); targetID != "" {
+		operation.updateAcceptedRouteAttempt(targetID, upstreamProgressNone, commitment)
+	}
+}
+
+func explicitRoutePublicModel(route *modelRoute, fallback string) string {
+	if route != nil && !route.legacy && strings.TrimSpace(route.public.id) != "" {
+		return route.public.id
+	}
+	return fallback
+}
+
+func normalizeExplicitOpenAIChatResponseModel(resp *http.Response, publicModel string) {
+	if resp == nil || resp.Body == nil || resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return
+	}
+	if _, ok := explicitRouteResponseInfoFromResponse(resp); !ok {
+		return
+	}
+	publicModel = strings.TrimSpace(publicModel)
+	if publicModel == "" {
+		return
+	}
+	normalizeExplicitModelHeaders(resp.Header, publicModel)
+	originalBody := resp.Body
+	prefix, err := io.ReadAll(io.LimitReader(originalBody, maxLargeRequestBodySize+1))
+	if err != nil {
+		resp.Body = prefixedReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), originalBody), close: originalBody.Close}
+		return
+	}
+	if len(prefix) > maxLargeRequestBodySize {
+		_ = originalBody.Close()
+		body := []byte(`{"error":{"message":"explicit route chat response exceeds model-normalization limit","type":"server_error"}}`)
+		resp.StatusCode = http.StatusBadGateway
+		resp.Status = "502 Bad Gateway"
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Type", "application/json")
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return
+	}
+	_ = originalBody.Close()
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(prefix, &payload) == nil && payload != nil && !hasNonNullJSONField(payload, "error") {
+		payload["model"] = mustMarshalRaw(publicModel)
+		if rewritten, marshalErr := json.Marshal(payload); marshalErr == nil {
+			prefix = rewritten
+		}
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(prefix))
+	resp.ContentLength = int64(len(prefix))
+	resp.Header.Del("Content-Length")
+}
+
+func explicitAnthropicResponseModels(operation *routeOperation, resp *http.Response, fallbackPublic, fallbackUpstream string) (string, string) {
+	if operation == nil || operation.route == nil {
+		return fallbackPublic, fallbackUpstream
+	}
+	info, target, ok := explicitRouteTargetForResponse(operation, resp)
+	if !ok {
+		return fallbackPublic, fallbackUpstream
+	}
+	publicModel := strings.TrimSpace(info.publicID)
+	if publicModel == "" {
+		publicModel = fallbackPublic
+	}
+	upstreamModel := strings.TrimSpace(target.upstreamModel)
+	if upstreamModel == "" {
+		upstreamModel = fallbackUpstream
+	}
+	return publicModel, upstreamModel
 }
 
 func parseOpenAIChatCompletionsMode(body []byte) chatCompletionsMode {
@@ -114,7 +605,7 @@ func (h *ProxyHandler) anthropicChatTranslationModel(model string) string {
 	rawModel := strings.TrimSpace(model)
 	if rawModel != "" {
 		if setup := h.providerSetup(); setup != nil {
-			if _, known := setup.lookupModel(rawModel); known {
+			if _, known := setup.lookupRoute(rawModel); known {
 				return rawModel
 			}
 		}
@@ -180,8 +671,18 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), streaming)
 	defer upstreamCancel()
+	upstreamCtx, routeOperation, route, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), publicModel, providerEndpointMessages)
+	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
+		return
+	}
+	if routeOperation != nil {
+		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
+	}
 
-	resp, err := h.postAnthropicMessages(upstreamCtx, body, anthropicExtraHeadersFromRequest(r))
+	publicModel = explicitRoutePublicModel(route, publicModel)
+	resp, err := h.executeAnthropicMessagesRouteRequest(upstreamCtx, body, anthropicExtraHeadersFromRequest(r), streaming)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -196,11 +697,14 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 		return
 	}
 
+	publicModel, upstreamModel = explicitAnthropicResponseModels(routeOperation, resp, publicModel, upstreamModel)
 	if resp.StatusCode == http.StatusOK && streaming {
+		markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentProtocolFrame)
 		h.writeDirectAnthropicStreamResponse(r.Context(), upstreamCtx, w, resp, publicModel, upstreamModel)
 		return
 	}
 	if resp.StatusCode == http.StatusOK {
+		markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 		if err := writeDirectAnthropicJSONResponse(r.Context(), upstreamCtx, w, resp, publicModel, upstreamModel); err != nil {
 			if h.handleResponseBodyWriteError(w, r, upstreamCtx, "anthropic", err) {
 				return
@@ -217,9 +721,18 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 	_ = writeUpstreamResponse(w, resp)
 }
 
-func (h *ProxyHandler) forwardAnthropicCountTokensDirect(w http.ResponseWriter, r *http.Request, body []byte) {
+func (h *ProxyHandler) forwardAnthropicCountTokensDirect(w http.ResponseWriter, r *http.Request, body []byte, model string) {
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
+	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), model, providerEndpointMessages)
+	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
+		return
+	}
+	if routeOperation != nil {
+		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
+	}
 
 	resp, err := h.postAnthropicMessagesCountTokens(upstreamCtx, body, anthropicExtraHeadersFromRequest(r))
 	if err != nil {
@@ -314,6 +827,10 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+	if err := h.validateRouteAwareRequestJSON(body); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 
 	var req models.AnthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -354,8 +871,18 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
+	upstreamCtx, routeOperation, route, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), providerModel, providerEndpointChatCompletions)
+	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
+		return
+	}
+	if routeOperation != nil {
+		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
+	}
 
-	resp, err := h.postChatCompletions(upstreamCtx, oaiBody)
+	publicModel := explicitRoutePublicModel(route, req.Model)
+	resp, err := h.executeChatCompletionsRouteRequest(upstreamCtx, oaiBody, mode)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -372,6 +899,35 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	resp, oaiBody, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, oaiBody, mode)
 	observeUpstreamHeaders(r.Context(), resp.Header)
+
+	if mode.forceUpstreamStream {
+		oaiResp, finalResp, aggregateErr := h.aggregateExplicitChatCompletionsResponse(upstreamCtx, resp, oaiBody, mode, aggregateStreamToResponseWithProgress)
+		if aggregateErr != nil {
+			if h.handleShutdownError(w, r, upstreamCtx, aggregateErr) {
+				return
+			}
+			status := http.StatusBadGateway
+			message := "failed to aggregate upstream response"
+			var streamErr *openAIStreamError
+			if errors.As(aggregateErr, &streamErr) {
+				status = streamErr.httpStatus()
+				message = streamErr.Error()
+			}
+			writeAnthropicError(w, status, mapAnthropicUpstreamStatus(status), message)
+			return
+		}
+		if finalResp != nil {
+			resp = finalResp
+		} else {
+			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
+			observeOpenAIUsage(r.Context(), oaiResp.Usage)
+			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
+			anthropicResp := TranslateOpenAIToAnthropic(oaiResp, publicModel)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(anthropicResp)
+			return
+		}
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		defer func() { _ = resp.Body.Close() }()
@@ -390,11 +946,12 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	err = h.routeChatCompletionsResponse(w, resp, upstreamCtx, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
+			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentProtocolFrame)
 			body := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
 			streamOpenAIToAnthropicWithLifecycle(
 				w,
 				body,
-				req.Model,
+				publicModel,
 				"msg_"+uuid.New().String(),
 				func(status int) { observeResponseFailureStatus(r.Context(), status) },
 				h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope),
@@ -405,7 +962,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		aggregate: func(oaiResp *models.OpenAIResponse) {
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
-			anthropicResp := TranslateOpenAIToAnthropic(oaiResp, req.Model)
+			anthropicResp := TranslateOpenAIToAnthropic(oaiResp, publicModel)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(anthropicResp)
 		},
@@ -440,6 +997,10 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+	if err := h.validateRouteAwareRequestJSON(body); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 
 	var req models.AnthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -459,7 +1020,7 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 	h.observeRequestSummaryWithProviderModel(r.Context(), "anthropic_count_tokens", req.Model, providerModel, false, providerEndpoint)
 
 	if directAnthropic {
-		h.forwardAnthropicCountTokensDirect(w, r, body)
+		h.forwardAnthropicCountTokensDirect(w, r, body, req.Model)
 		return
 	}
 
@@ -471,6 +1032,15 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
+	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), providerModel, providerEndpointChatCompletions)
+	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
+		return
+	}
+	if routeOperation != nil {
+		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
+	}
 
 	oaiResp, err := h.runAnthropicCountTokensProbeWithContext(upstreamCtx, oaiReq)
 	if err != nil {
@@ -526,7 +1096,7 @@ func (h *ProxyHandler) runAnthropicCountTokensProbeWithContext(upstreamCtx conte
 		one := 1
 		probeReq.MaxCompletionTokens = nil
 		probeReq.MaxTokens = &one
-		return h.executeAnthropicCountTokensProbeFinal(upstreamCtx, probeReq)
+		return h.executeAnthropicCountTokensProbeFinal(withRouteAttemptKind(upstreamCtx, routeAttemptProtocolRecovery), probeReq)
 	}
 	return oaiResp, err
 }
@@ -597,6 +1167,10 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+	if err := h.validateRouteAwareRequestJSON(bodyBytes); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
 
 	if message, param, ok := validateOpenAIChatRequest(bodyBytes); ok {
 		writeOpenAIErrorWithDetails(w, http.StatusBadRequest, message, "invalid_request_error", param, "")
@@ -611,8 +1185,18 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
+	upstreamCtx, routeOperation, route, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), requestedModel, providerEndpointChatCompletions)
+	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+		return
+	}
+	if routeOperation != nil {
+		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
+	}
 
-	resp, err := h.postChatCompletions(upstreamCtx, bodyBytes)
+	responseModel := explicitRoutePublicModel(route, requestedModel)
+	resp, err := h.executeChatCompletionsRouteRequest(upstreamCtx, bodyBytes, mode)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -627,12 +1211,54 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 
-	resp, _, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, bodyBytes, mode)
+	resp, bodyBytes, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, bodyBytes, mode)
+	if routeOperation != nil && !mode.clientRequestedStream && !mode.forceUpstreamStream {
+		normalizeExplicitOpenAIChatResponseModel(resp, responseModel)
+	}
 	observeUpstreamHeaders(r.Context(), resp.Header)
+
+	if mode.forceUpstreamStream {
+		oaiResp, finalResp, aggregateErr := h.aggregateExplicitChatCompletionsResponse(upstreamCtx, resp, bodyBytes, mode, aggregateStreamToResponseWithProgress)
+		if aggregateErr != nil {
+			if h.handleShutdownError(w, r, upstreamCtx, aggregateErr) {
+				return
+			}
+			status := http.StatusBadGateway
+			message := "failed to aggregate upstream response"
+			errType := "server_error"
+			code := ""
+			var streamErr *openAIStreamError
+			if errors.As(aggregateErr, &streamErr) {
+				status = streamErr.httpStatus()
+				message = streamErr.Error()
+				if strings.TrimSpace(streamErr.Type) != "" {
+					errType = streamErr.Type
+				}
+				code = streamErr.Code
+			}
+			writeOpenAIErrorWithDetails(w, status, message, errType, "", code)
+			return
+		}
+		if finalResp != nil {
+			resp = finalResp
+		} else {
+			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
+			if routeOperation != nil {
+				oaiResp.Model = responseModel
+			}
+			normalizeOpenAIChatCompletionStruct(oaiResp, responseModel)
+			observeOpenAIUsage(r.Context(), oaiResp.Usage)
+			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(oaiResp)
+			return
+		}
+	}
 
 	err = h.routeChatCompletionsResponse(w, resp, upstreamCtx, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
 			copyPassthroughHeaders(w.Header(), resp.Header)
+			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentProtocolFrame)
 			body := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
 			finalResponse := h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope)
 			usage := openAIChatStreamUsageCallback(r.Context())
@@ -642,17 +1268,23 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			onError := func(status int) { observeResponseFailureStatus(r.Context(), status) }
 			// dropInjectedUsage drops the upstream usage-only chunk the proxy asked
 			// for when the client did not opt into stream_options.include_usage.
-			streamOpenAIChatPassthroughWithLifecycle(w, body, requestedModel, mode.injectedClientStreamUsage, onError, finalResponse, h.lifecycleStreamHooks(r.Context(), body.canceledAtFailure, func() { h.WriteShutdownServiceUnavailable(w, r) }), usage)
+			lifecycle := h.lifecycleStreamHooks(r.Context(), body.canceledAtFailure, func() { h.WriteShutdownServiceUnavailable(w, r) })
+			if routeOperation != nil {
+				streamExplicitRouteOpenAIChatPassthroughWithLifecycle(w, body, responseModel, mode.injectedClientStreamUsage, onError, finalResponse, lifecycle, usage)
+			} else {
+				streamOpenAIChatPassthroughWithLifecycle(w, body, responseModel, mode.injectedClientStreamUsage, onError, finalResponse, lifecycle, usage)
+			}
 		},
 		aggregate: func(oaiResp *models.OpenAIResponse) {
-			normalizeOpenAIChatCompletionStruct(oaiResp, requestedModel)
+			normalizeOpenAIChatCompletionStruct(oaiResp, responseModel)
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(oaiResp)
 		},
 		passthrough: func(resp *http.Response) error {
-			return h.maybeWriteOptimizedOpenAIChatPassthrough(r.Context(), w, resp, requestedModel, h.toolContexts, scope)
+			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentProtocolFrame)
+			return h.maybeWriteOptimizedOpenAIChatPassthrough(r.Context(), w, resp, responseModel, h.toolContexts, scope)
 		},
 	})
 	if err != nil {
@@ -855,14 +1487,24 @@ func (h *ProxyHandler) retryChatCompletionsWithoutInjectedStreamOptions(ctx cont
 	if !ok {
 		return resp, body, mode
 	}
-	retryResp, err := h.postChatCompletions(ctx, fallbackBody)
+	originalResp := resp
+	explicitOperation := routeOperationFromContext(ctx)
+	if explicitOperation != nil {
+		captured, cleanupDone := captureRouteResponse(resp)
+		if !cleanupDone {
+			return captured.response(), body, mode
+		}
+		originalResp = captured.response()
+	}
+	retryCtx := withRouteAttemptKind(ctx, routeAttemptProtocolRecovery)
+	retryResp, err := h.executeChatCompletionsRouteRequest(retryCtx, fallbackBody, mode)
 	if err != nil {
 		if h != nil && h.log != nil {
 			h.log.Debug("retry without stream_options failed", logger.Err(err))
 		}
-		return resp, body, mode
+		return originalResp, body, mode
 	}
-	if resp.Body != nil {
+	if explicitOperation == nil && resp.Body != nil {
 		drainAndClose(resp.Body)
 	}
 	mode.injectedStreamUsage = false

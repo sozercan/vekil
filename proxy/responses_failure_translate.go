@@ -52,17 +52,18 @@ const (
 )
 
 type peekResult struct {
-	decision         responsesPeekDecision
-	status           int
-	errType          string
-	message          string
-	retryAfter       string
-	retryAfterSource string
-	failure          *responsesWebSocketStreamEvent
-	terminal         *responsesWebSocketStreamEvent
-	bufferedBytes    int
-	peekDuration     time.Duration
-	preamble         bool
+	decision            responsesPeekDecision
+	status              int
+	errType             string
+	message             string
+	retryAfter          string
+	retryAfterSource    string
+	failure             *responsesWebSocketStreamEvent
+	terminal            *responsesWebSocketStreamEvent
+	bufferedBytes       int
+	peekDuration        time.Duration
+	preamble            bool
+	precommitReplaySafe bool
 }
 
 type responsesPeekChunk struct {
@@ -563,6 +564,7 @@ type responsesPreparedStream struct {
 	peekState     *responsesPeekState
 	commitCh      chan struct{}
 	abortCh       chan struct{}
+	doneCh        chan struct{}
 	commitFn      func()
 	abortFn       func()
 	observeOnlyFn func()
@@ -570,6 +572,7 @@ type responsesPreparedStream struct {
 
 type responsesPeekState struct {
 	observeTerminal         bool
+	holdPreamble            bool
 	mu                      sync.Mutex
 	terminal                peekResult
 	hasTerminal             bool
@@ -723,10 +726,15 @@ func (b *responsesPreparedBody) Close() error {
 }
 
 func newResponsesPreparedStream(resp *http.Response, maxPeekBytes int, observeTerminal bool) *responsesPreparedStream {
+	return newResponsesPreparedStreamConfigured(resp, maxPeekBytes, observeTerminal, false)
+}
+
+func newResponsesPreparedStreamConfigured(resp *http.Response, maxPeekBytes int, observeTerminal, holdPreamble bool) *responsesPreparedStream {
 	pr, pw := io.Pipe()
 	peekDone := make(chan peekResult, 1)
 	peekState := newResponsesPeekState()
 	peekState.observeTerminal = observeTerminal
+	peekState.holdPreamble = holdPreamble
 	commitCh := make(chan struct{})
 	abortCh := make(chan struct{})
 	observeOnlyCh := make(chan struct{})
@@ -743,7 +751,7 @@ func newResponsesPreparedStream(resp *http.Response, maxPeekBytes int, observeTe
 	abort := func() {
 		abortOnce.Do(func() {
 			close(abortCh)
-			_ = upstreamBody.Close()
+			go func() { _ = upstreamBody.Close() }()
 		})
 	}
 	var observeOnlyOnce sync.Once
@@ -751,7 +759,11 @@ func newResponsesPreparedStream(resp *http.Response, maxPeekBytes int, observeTe
 		observeOnlyOnce.Do(func() { close(observeOnlyCh) })
 	}
 
-	go runResponsesPeekPump(upstreamBody, pw, resp.Header, peekDone, peekState, commitCh, abortCh, observeOnlyCh, maxPeekBytes)
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		runResponsesPeekPump(upstreamBody, pw, resp.Header, peekDone, peekState, commitCh, abortCh, observeOnlyCh, maxPeekBytes)
+	}()
 
 	return &responsesPreparedStream{
 		resp:          resp,
@@ -760,6 +772,7 @@ func newResponsesPreparedStream(resp *http.Response, maxPeekBytes int, observeTe
 		peekState:     peekState,
 		commitCh:      commitCh,
 		abortCh:       abortCh,
+		doneCh:        doneCh,
 		commitFn:      commit,
 		abortFn:       abort,
 		observeOnlyFn: observeOnly,
@@ -1094,6 +1107,11 @@ func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.He
 
 		select {
 		case <-abortCh:
+			// The abort function closes the upstream body. Wait for the read pump
+			// to observe that close before publishing cleanup completion so a new
+			// route target cannot overlap the abandoned attempt.
+			for range chunkCh {
+			}
 			_ = pw.CloseWithError(context.Canceled)
 			return
 		case <-commitCh:
@@ -1111,7 +1129,10 @@ func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.He
 			if len(chunk.data) > 0 {
 				_, _ = prefix.Write(chunk.data)
 				parser.push(chunk.data)
-				holdPreamble := shouldHoldResponsesPrecommitPreamble(headers)
+				holdPreamble := peekState != nil && peekState.holdPreamble
+				if !holdPreamble {
+					holdPreamble = shouldHoldResponsesPrecommitPreamble(headers)
+				}
 				result, sawSemantic, sawBeyondPreamble := inspectResponsesPeekMessages(&parser, headers, peekState, holdPreamble)
 				result.bufferedBytes = prefix.Len()
 				result.peekDuration = time.Since(start)
@@ -1147,10 +1168,27 @@ func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.He
 	}
 }
 
+func responsesFailureOutputHasProgress(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("[]")) || bytes.Equal(trimmed, []byte("{}")) || bytes.Equal(trimmed, []byte(`""`)) {
+		return false
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(trimmed, &items) == nil {
+		return len(items) > 0
+	}
+	var text string
+	if json.Unmarshal(trimmed, &text) == nil {
+		return strings.TrimSpace(text) != ""
+	}
+	return true
+}
+
 func inspectResponsesPeekMessages(parser *responsesSSEParser, headers http.Header, peekState *responsesPeekState, preferTranslatedFailure bool) (peekResult, bool, bool) {
 	result := peekResult{decision: responsesPeekDecisionPassthrough}
 	sawSemantic := false
 	sawBeyondPreamble := false
+	sawUnsafeProgress := false
 	for {
 		msg, ok := parser.nextSemantic()
 		if !ok {
@@ -1161,12 +1199,23 @@ func inspectResponsesPeekMessages(parser *responsesSSEParser, headers http.Heade
 			break
 		}
 		classified := classifyResponsesPeekMessage(msg, headers)
+		failureCarriesProgress := classified.failure != nil && (responsesFailureOutputHasProgress(classified.failure.Response.Output) || !classified.failure.Response.Usage.isZero())
+		if classified.failure != nil && !sawUnsafeProgress && !failureCarriesProgress {
+			classified.precommitReplaySafe = true
+		}
+		if failureCarriesProgress {
+			sawUnsafeProgress = true
+			classified.decision = responsesPeekDecisionPassthrough
+		}
 		peekState.publishTerminal(classified)
-		if !sawSemantic || (preferTranslatedFailure && !sawBeyondPreamble && classified.decision == responsesPeekDecisionTranslate) {
+		if !sawSemantic || (preferTranslatedFailure && !sawUnsafeProgress && classified.decision == responsesPeekDecisionTranslate) {
 			result = classified
 		}
 		if !classified.preamble {
 			sawBeyondPreamble = true
+			if classified.terminal == nil || classified.failure == nil {
+				sawUnsafeProgress = true
+			}
 		}
 		sawSemantic = true
 	}
