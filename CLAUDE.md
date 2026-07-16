@@ -83,5 +83,5 @@ GitHub Actions in `.github/workflows/ci.yaml` runs `golangci-lint` (only new iss
 
 Live smoke workflows are separate from `ci.yaml` so the core gate stays deterministic and credential-free:
 
-- `live-copilot-smoke.yaml` — credentialed Copilot CLI smoke (Codex, Claude, Gemini). Needs `COPILOT_GITHUB_TOKEN`; self-skips on fork PRs and Dependabot.
+- `live-copilot-smoke.yaml` — credentialed Copilot smoke for compaction, Responses-backed Chat text/tool replay, and Codex/Claude/Gemini CLIs. Needs `COPILOT_GITHUB_TOKEN`; self-skips on fork PRs and Dependabot.
 - `live-zen-smoke.yaml` — credential-free OpenCode Zen free-tier smoke. Runs `scripts/live-cli-smoke.sh` in `SMOKE_PROVIDER=zen` mode (Copilot CLI offline, Claude, Gemini) and runs on every PR including forks. Neutral-skips when the Zen free tier is unreachable so it never blocks unrelated PRs.

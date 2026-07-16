@@ -951,7 +951,6 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 
 	var assistantText strings.Builder
 	hasRefusal := false
-	assistantContent := json.RawMessage(`""`)
 	// Chat-style surfaces intentionally do not run command_rewrite; they preserve
 	// upstream arguments and only capture tool context for later output reduction.
 	publishCalls := make([]responsesChatReplayPublishCall, 0, len(s.tools))
@@ -1011,7 +1010,7 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 		}
 	}
 
-	assistantContent, _ = json.Marshal(assistantText.String())
+	assistantContent, _ := json.Marshal(assistantText.String())
 	if len(s.tools) > 0 && hasRefusal {
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "Responses tool-call turns with refusal content are not supported")
 	}

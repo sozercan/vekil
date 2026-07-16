@@ -7,7 +7,7 @@ import (
 
 func TestTranslateChatRequestToResponsesNormalizesReplayAssistantContentParts(t *testing.T) {
 	store := newResponsesChatReplayStore()
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
 	published, err := store.Publish(responsesChatReplayPublishRequest{
@@ -81,7 +81,7 @@ func TestTranslateChatRequestToResponsesPreservesReplayNullEmptyContentCompatibi
 		publishedContent := publishedContent
 		t.Run(string(publishedContent), func(t *testing.T) {
 			store := newResponsesChatReplayStore()
-			defer store.Close()
+			defer func() { _ = store.Close() }()
 			route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
 			published, err := store.Publish(responsesChatReplayPublishRequest{
 				Route:            route,

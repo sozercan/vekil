@@ -94,7 +94,7 @@ func TestResponsesChatReplayPublishesOpaqueIDsAndResolvesFullProjection(t *testi
 
 func TestResponsesChatReplayMissingAndCrossRouteAreTypedStateLoss(t *testing.T) {
 	store := newResponsesChatReplayStore()
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	request := newResponsesChatReplayTestRequest("missing", replayTestCallSpec{
 		upstreamID: "upstream-missing",
@@ -210,7 +210,7 @@ func assertResponsesChatReplayMissing(t *testing.T, err error) {
 
 func TestResponsesChatReplayRequiresTheFullOrderedAssistantProjection(t *testing.T) {
 	store := newResponsesChatReplayStore()
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	request := newResponsesChatReplayTestRequest("projection",
 		replayTestCallSpec{upstreamID: "upstream-1", name: "first", visible: `{"n":1}`},
@@ -297,7 +297,7 @@ func assertResponsesChatReplayProjection(t *testing.T, err error) {
 
 func TestResponsesChatReplayRejectsMixedGroupsWithTypedError(t *testing.T) {
 	store := newResponsesChatReplayStore()
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	firstRequest := newResponsesChatReplayTestRequest("mixed-first", replayTestCallSpec{
 		upstreamID: "upstream-first", name: "first", visible: `{}`,
@@ -336,7 +336,7 @@ func TestResponsesChatReplayRejectsMixedGroupsWithTypedError(t *testing.T) {
 
 func TestResponsesChatReplayValidatesVisibleAndOriginalOptimizerProjections(t *testing.T) {
 	store := newResponsesChatReplayStore()
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	originalOne := `{"value":"original-one"}`
 	originalTwo := `{"value":"original-two"}`
@@ -382,7 +382,7 @@ func TestResponsesChatReplayValidatesVisibleAndOriginalOptimizerProjections(t *t
 
 func TestResponsesChatReplayResolutionSupportsFullOrPerCallPartialReplay(t *testing.T) {
 	store := newResponsesChatReplayStore()
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	request := responsesChatReplayPublishRequest{
 		Route: responsesChatReplayRoute{
@@ -433,7 +433,7 @@ func TestResponsesChatReplayResolutionSupportsFullOrPerCallPartialReplay(t *test
 
 func TestResponsesChatReplayDefensivelyCopiesPublishAndResolveData(t *testing.T) {
 	store := newResponsesChatReplayStore()
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	request := newResponsesChatReplayTestRequest("copies", replayTestCallSpec{
 		upstreamID: "upstream-copies", name: "copy", visible: `{"copy":true}`,
@@ -488,7 +488,7 @@ func TestResponsesChatReplayTTLIsAbsoluteAndDoesNotSlideOnResolve(t *testing.T) 
 	store := newResponsesChatReplayStoreWithOptions(responsesChatReplayStoreOptions{
 		Now: func() time.Time { return time.Unix(0, nowNanos.Load()) },
 	})
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	request := newResponsesChatReplayTestRequest("ttl", replayTestCallSpec{
 		upstreamID: "upstream-ttl", name: "clock", visible: `{}`,
@@ -523,7 +523,7 @@ func TestResponsesChatReplayEnforcesFrozenPerGroupLimitsWithTypedErrors(t *testi
 
 	t.Run("items", func(t *testing.T) {
 		store := newResponsesChatReplayStore()
-		defer store.Close()
+		defer func() { _ = store.Close() }()
 		request := newResponsesChatReplayTestRequest("limit-items", replayTestCallSpec{
 			upstreamID: "upstream-limit-items", name: "limit", visible: `{}`,
 		})
@@ -536,7 +536,7 @@ func TestResponsesChatReplayEnforcesFrozenPerGroupLimitsWithTypedErrors(t *testi
 
 	t.Run("calls", func(t *testing.T) {
 		store := newResponsesChatReplayStore()
-		defer store.Close()
+		defer func() { _ = store.Close() }()
 		specs := make([]replayTestCallSpec, responsesChatReplayMaxCalls+1)
 		for i := range specs {
 			specs[i] = replayTestCallSpec{
@@ -551,7 +551,7 @@ func TestResponsesChatReplayEnforcesFrozenPerGroupLimitsWithTypedErrors(t *testi
 
 	t.Run("group bytes", func(t *testing.T) {
 		store := newResponsesChatReplayStore()
-		defer store.Close()
+		defer func() { _ = store.Close() }()
 		request := newResponsesChatReplayTestRequest("limit-bytes", replayTestCallSpec{
 			upstreamID: "upstream-limit-bytes", name: "limit", visible: `{}`,
 		})
@@ -564,7 +564,7 @@ func TestResponsesChatReplayEnforcesFrozenPerGroupLimitsWithTypedErrors(t *testi
 		store := newResponsesChatReplayStoreWithOptions(responsesChatReplayStoreOptions{
 			MaxTotalBytes: 64,
 		})
-		defer store.Close()
+		defer func() { _ = store.Close() }()
 		request := newResponsesChatReplayTestRequest("limit-total", replayTestCallSpec{
 			upstreamID: "upstream-limit-total", name: "limit", visible: `{}`,
 		})
@@ -636,7 +636,7 @@ func TestResponsesChatReplayDeterministicLRUEvictionByGroupAndTotalBytes(t *test
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			store := newResponsesChatReplayStoreWithOptions(test.options)
-			defer store.Close()
+			defer func() { _ = store.Close() }()
 
 			first, err := store.Publish(requestA)
 			if err != nil {
@@ -684,7 +684,7 @@ func TestResponsesChatReplayRetriesStoredAndInFlightIDCollisions(t *testing.T) {
 	store := newResponsesChatReplayStoreWithOptions(responsesChatReplayStoreOptions{
 		Random: bytes.NewReader(randomBytes),
 	})
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	first, err := store.Publish(newResponsesChatReplayTestRequest("collision-a", replayTestCallSpec{
 		upstreamID: "upstream-collision-a", name: "lookup", visible: `{}`,
@@ -727,7 +727,7 @@ func TestResponsesChatReplayPublishIsAtomicWhenIDGenerationFails(t *testing.T) {
 	store := newResponsesChatReplayStoreWithOptions(responsesChatReplayStoreOptions{
 		Random: bytes.NewReader(bytes.Repeat([]byte{7}, responsesChatReplayRandomBytes)),
 	})
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	_, err := store.Publish(newResponsesChatReplayTestRequest("atomic",
 		replayTestCallSpec{upstreamID: "upstream-atomic-1", name: "first", visible: `{}`},
@@ -847,7 +847,7 @@ func TestResponsesChatReplayConcurrentPublishResolveClose(t *testing.T) {
 
 func TestResponsesChatReplayByteAccountingTracksOnlyResidentGroups(t *testing.T) {
 	store := newResponsesChatReplayStore()
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	firstRequest := newResponsesChatReplayTestRequest("bytes-first", replayTestCallSpec{
 		upstreamID: "upstream-bytes-first", name: "bytes", visible: `{}`,
@@ -889,7 +889,7 @@ func TestResponsesChatReplayErrorsNeverContainRawReplayContent(t *testing.T) {
 	}
 
 	store := newResponsesChatReplayStore()
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	published, err := store.Publish(request)
 	if err != nil {
 		t.Fatalf("Publish() error = %v", err)
@@ -904,7 +904,7 @@ func TestResponsesChatReplayErrorsNeverContainRawReplayContent(t *testing.T) {
 
 func TestResponsesChatReplayPublishesOnlyStructurallyCompleteGroups(t *testing.T) {
 	store := newResponsesChatReplayStore()
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	request := newResponsesChatReplayTestRequest("incomplete", replayTestCallSpec{
 		upstreamID: "upstream-incomplete", name: "expected", visible: `{}`,

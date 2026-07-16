@@ -225,14 +225,6 @@ func responsesChatMessageContent(raw json.RawMessage) (string, string, error) {
 	return text.String(), refusal.String(), nil
 }
 
-func responsesChatMessageText(raw json.RawMessage) (string, error) {
-	text, refusal, err := responsesChatMessageContent(raw)
-	if err != nil {
-		return "", err
-	}
-	return text + refusal, nil
-}
-
 func responsesChatFinishReason(status string, details *struct {
 	Reason string `json:"reason"`
 }, hasCalls bool) (string, error) {

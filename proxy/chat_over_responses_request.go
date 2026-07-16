@@ -252,7 +252,10 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 	if err != nil {
 		return nil, err
 	}
-	input := make([]json.RawMessage, 0, len(messages)+4)
+	// The slice may grow when one Chat message expands to multiple Responses
+	// items. Start with the bounded decoded message count and let append grow it;
+	// avoid arithmetic on an untrusted length in the allocation size.
+	input := make([]json.RawMessage, 0, len(messages))
 	calls := make(map[string]string)
 	results := make(map[string]struct{})
 	restoredGroups := make(map[uint64]struct{})

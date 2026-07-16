@@ -28,7 +28,7 @@ func TestExecuteChatCompletionsUsesNativeChatWhenAvailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer result.Response.Body.Close()
+	defer func() { _ = result.Response.Body.Close() }()
 	if result.Backend != chatBackendNativeChat || result.Response == nil || result.Completion != nil || result.Stream != nil {
 		t.Fatalf("result = %#v", result)
 	}
@@ -133,7 +133,7 @@ func TestExecuteChatCompletionsCanonicalErrorRetainsSafeHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer result.Response.Body.Close()
+	defer func() { _ = result.Response.Body.Close() }()
 	if result.Headers.Get("Retry-After") != "4" || result.Headers.Get("X-Request-Id") != "req-error" {
 		t.Fatalf("headers = %#v response headers=%#v", result.Headers, result.Response.Header)
 	}
@@ -156,7 +156,7 @@ func TestExecuteChatCompletionsDoesNotRerouteReplayLikeNativeIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer result.Response.Body.Close()
+	defer func() { _ = result.Response.Body.Close() }()
 	if result.Backend != chatBackendNativeChat || upstreamCalls != 1 {
 		t.Fatalf("backend/calls = %v/%d", result.Backend, upstreamCalls)
 	}
