@@ -79,6 +79,183 @@ func TestCompactionContract_CompactEndpointReturnsCodexCompatibleHistory(t *test
 	}
 }
 
+func TestCompactionContract_CompactEndpointRejectsInvalidSummaryResponses(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "incomplete with partial text",
+			body: `{"id":"resp-incomplete","object":"response","status":"incomplete","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial checkpoint"}]}]}`,
+		},
+		{
+			name: "refusal only",
+			body: `{"id":"resp-refusal","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"cannot summarize"}]}]}`,
+		},
+		{
+			name: "function call only",
+			body: `{"id":"resp-tool","object":"response","status":"completed","output":[{"type":"function_call","call_id":"call-1","name":"summarize","arguments":"{}"}]}`,
+		},
+		{
+			name: "empty output",
+			body: `{"id":"resp-empty","object":"response","status":"completed","output":[]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tt.body)
+			})
+
+			reqBody := mustMarshalContractJSON(t, map[string]interface{}{
+				"model": "gpt-5.4",
+				"input": []interface{}{messageItemForContract("user", "history to compact")},
+			})
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			handler.HandleCompact(w, req)
+
+			resp := w.Result()
+			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Fatalf("expected invalid compaction response to fail with 502, got %d: %s", resp.StatusCode, body)
+			}
+			if bytes.Contains(body, []byte(syntheticCompactionPrefix)) {
+				t.Fatalf("invalid compaction response must not emit a synthetic checkpoint: %s", body)
+			}
+		})
+	}
+}
+
+func TestCompactionContract_InternalCompactionNormalizesCallerControls(t *testing.T) {
+	tests := []struct {
+		name   string
+		path   string
+		invoke func(*ProxyHandler, http.ResponseWriter, *http.Request)
+		input  []interface{}
+	}{
+		{
+			name:   "compact endpoint",
+			path:   "/v1/responses/compact",
+			invoke: (*ProxyHandler).HandleCompact,
+			input:  []interface{}{messageItemForContract("user", "compact controls")},
+		},
+		{
+			name:   "remote compaction trigger",
+			path:   "/v1/responses",
+			invoke: (*ProxyHandler).HandleResponses,
+			input: []interface{}{
+				messageItemForContract("user", "compact controls"),
+				map[string]interface{}{"type": "compaction_trigger"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var upstream map[string]json.RawMessage
+			handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				upstream = decodeJSONBodyForContract(t, r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"resp-controls","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"normalized checkpoint"}]}]}`)
+			})
+
+			reqBody := mustMarshalContractJSON(t, map[string]interface{}{
+				"model":                "gpt-5.4",
+				"previous_response_id": "resp-upstream-lineage",
+				"input":                tt.input,
+				"tools": []interface{}{
+					map[string]interface{}{"type": "function", "name": "must_not_run"},
+				},
+				"tool_choice":         "required",
+				"parallel_tool_calls": true,
+				"text": map[string]interface{}{
+					"format": map[string]interface{}{
+						"type": "json_schema",
+						"name": "caller_schema",
+						"schema": map[string]interface{}{
+							"type": "object",
+						},
+					},
+					"verbosity": "low",
+				},
+				"response_format":       map[string]interface{}{"type": "json_object"},
+				"max_output_tokens":     1,
+				"max_tokens":            2,
+				"max_completion_tokens": 3,
+				"stream":                true,
+				"stream_options":        map[string]interface{}{"include_usage": true},
+				"background":            true,
+				"service_tier":          "priority",
+				"prompt_cache_key":      "route-sentinel",
+				"metadata":              map[string]interface{}{"route": "ROUTING_SENTINEL"},
+			})
+			req := httptest.NewRequest(http.MethodPost, tt.path, bytes.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			tt.invoke(handler, w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+			}
+			if upstream == nil {
+				t.Fatal("expected an internal upstream compaction request")
+			}
+
+			for _, field := range []string{
+				"tools",
+				"tool_choice",
+				"parallel_tool_calls",
+				"response_format",
+				"max_tokens",
+				"max_completion_tokens",
+				"stream",
+				"stream_options",
+				"background",
+			} {
+				if _, ok := upstream[field]; ok {
+					t.Fatalf("internal compaction request must remove caller field %q: %s", field, upstream[field])
+				}
+			}
+
+			if got := rawJSONToIntForContract(t, upstream["max_output_tokens"]); got != internalCompactionMaxOutputTokens {
+				t.Fatalf("internal max_output_tokens = %d, want proxy cap %d", got, internalCompactionMaxOutputTokens)
+			}
+
+			text := rawJSONObjectForContract(t, upstream["text"])
+			if _, ok := text["format"]; ok {
+				t.Fatalf("internal compaction request must remove text.format: %s", upstream["text"])
+			}
+			if got := rawJSONToStringForContract(t, text["verbosity"]); got != "low" {
+				t.Fatalf("expected non-format text controls to survive, got %q", got)
+			}
+			if got := rawJSONToStringForContract(t, upstream["model"]); got != "gpt-5.4" {
+				t.Fatalf("expected model to survive normalization, got %q", got)
+			}
+			if got := rawJSONToStringForContract(t, upstream["previous_response_id"]); got != "resp-upstream-lineage" {
+				t.Fatalf("expected ordinary upstream lineage to survive normalization, got %q", got)
+			}
+			if got := rawJSONToStringForContract(t, upstream["service_tier"]); got != "priority" {
+				t.Fatalf("expected routing service tier to survive, got %q", got)
+			}
+			if got := rawJSONToStringForContract(t, upstream["prompt_cache_key"]); got != "route-sentinel" {
+				t.Fatalf("expected prompt cache routing key to survive, got %q", got)
+			}
+			metadata := rawJSONObjectForContract(t, upstream["metadata"])
+			if got := rawJSONToStringForContract(t, metadata["route"]); got != "ROUTING_SENTINEL" {
+				t.Fatalf("expected routing metadata to survive, got %q", got)
+			}
+		})
+	}
+}
+
 func TestCompactionContract_UnknownCompactionTokenIsPreserved(t *testing.T) {
 	const upstreamOpaqueToken = "opaque+server/token/with/slashes=="
 	var upstreamInput []json.RawMessage
@@ -224,6 +401,204 @@ func TestCompactionContract_RemoteCompactionV2PreservesPreviousResponseID(t *tes
 	input := rawJSONArrayForContract(t, upstreamRequest["input"])
 	if len(input) != 0 {
 		t.Fatalf("expected compact fallback to strip only the trigger from delta input, got %s", upstreamRequest["input"])
+	}
+}
+
+func TestCompactionContract_HTTPRemoteCompactionFollowUpResetsSyntheticLineage(t *testing.T) {
+	const historySentinel = "HISTORY_SENTINEL_BATCH_4"
+	const followUpSentinel = "FOLLOW_UP_SENTINEL_BATCH_4"
+
+	var upstreamCalls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		call := upstreamCalls.Add(1)
+		body := decodeJSONBodyForContract(t, r.Body)
+
+		switch call {
+		case 1:
+			if !strings.Contains(rawJSONToStringForContract(t, body["instructions"]), "CONTEXT CHECKPOINT COMPACTION") {
+				t.Fatalf("expected first upstream call to be compaction, got %s", body["instructions"])
+			}
+			input := rawJSONArrayForContract(t, body["input"])
+			if len(input) != 2 {
+				t.Fatalf("expected compaction input history without trigger, got %d items: %s", len(input), body["input"])
+			}
+			if got := contractMessageText(t, input[0], "user"); got != historySentinel {
+				t.Fatalf("expected history sentinel in compaction input, got %q", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"resp-compact-upstream","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checkpoint preserves %s"}]}]}`, historySentinel)
+		case 2:
+			if _, ok := body["previous_response_id"]; ok {
+				t.Fatalf("follow-up must not forward proxy synthetic previous_response_id: %s", body["previous_response_id"])
+			}
+			if got := r.Header.Get("X-Codex-Turn-State"); got != "" {
+				t.Fatalf("follow-up must not forward stale turn state after proxy compaction, got %q", got)
+			}
+			input := rawJSONArrayForContract(t, body["input"])
+			if len(input) != 2 {
+				t.Fatalf("expected expanded checkpoint plus new input, got %d items: %s", len(input), body["input"])
+			}
+			if got := contractMessageText(t, input[0], "developer"); !strings.Contains(got, historySentinel) {
+				t.Fatalf("expected expanded checkpoint to retain history sentinel, got %q", got)
+			}
+			if got := contractMessageText(t, input[1], "user"); got != followUpSentinel {
+				t.Fatalf("expected follow-up input to survive, got %q", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"resp-follow-up","object":"response","status":"completed","output":[]}`)
+		default:
+			t.Fatalf("unexpected upstream request %d", call)
+		}
+	})
+
+	compactBody := mustMarshalContractJSON(t, map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			messageItemForContract("user", historySentinel),
+			messageItemForContract("assistant", "history answer"),
+			map[string]interface{}{"type": "compaction_trigger"},
+		},
+	})
+	compactReq := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(compactBody))
+	compactReq.Header.Set("Content-Type", "application/json")
+	compactW := httptest.NewRecorder()
+	handler.HandleResponses(compactW, compactReq)
+
+	compactResp := compactW.Result()
+	if compactResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(compactResp.Body)
+		t.Fatalf("expected compact trigger 200, got %d: %s", compactResp.StatusCode, body)
+	}
+	compactResult := decodeJSONBodyForContract(t, compactResp.Body)
+	syntheticID := rawJSONToStringForContract(t, compactResult["id"])
+	if !strings.HasPrefix(syntheticID, syntheticCompactionResponseIDPrefix) {
+		t.Fatalf("expected proxy synthetic response id, got %q", syntheticID)
+	}
+	compactOutput := rawJSONArrayForContract(t, compactResult["output"])
+	if len(compactOutput) != 1 || contractItemType(t, compactOutput[0]) != "compaction" {
+		t.Fatalf("expected one proxy compaction item, got %s", compactResult["output"])
+	}
+
+	followUpBody := mustMarshalContractJSON(t, map[string]interface{}{
+		"model":                "gpt-5.4",
+		"previous_response_id": syntheticID,
+		"input": []interface{}{
+			compactOutput[0],
+			messageItemForContract("user", followUpSentinel),
+		},
+	})
+	followUpReq := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(followUpBody))
+	followUpReq.Header.Set("Content-Type", "application/json")
+	followUpReq.Header.Set("X-Codex-Turn-State", "stale-turn-state-from-synthetic-response")
+	followUpW := httptest.NewRecorder()
+	handler.HandleResponses(followUpW, followUpReq)
+
+	followUpResp := followUpW.Result()
+	if followUpResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(followUpResp.Body)
+		t.Fatalf("expected follow-up 200, got %d: %s", followUpResp.StatusCode, body)
+	}
+	if got := upstreamCalls.Load(); got != 2 {
+		t.Fatalf("expected compact and follow-up upstream calls, got %d", got)
+	}
+}
+
+func TestCompactionContract_HTTPProxyCheckpointPreservesOrdinaryUpstreamLineage(t *testing.T) {
+	const upstreamResponseID = "resp-real-upstream"
+	const turnState = "real-upstream-turn-state"
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body := decodeJSONBodyForContract(t, r.Body)
+		if got := rawJSONToStringForContract(t, body["previous_response_id"]); got != upstreamResponseID {
+			t.Fatalf("expected ordinary upstream response id to be preserved, got %q", got)
+		}
+		if got := r.Header.Get("X-Codex-Turn-State"); got != turnState {
+			t.Fatalf("expected ordinary upstream turn state to be preserved, got %q", got)
+		}
+		input := rawJSONArrayForContract(t, body["input"])
+		if got := contractMessageText(t, input[0], "developer"); !strings.Contains(got, "ordinary lineage checkpoint") {
+			t.Fatalf("expected proxy checkpoint to still be expanded, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp-next","object":"response","status":"completed","output":[]}`)
+	})
+
+	reqBody := mustMarshalContractJSON(t, map[string]interface{}{
+		"model":                "gpt-5.4",
+		"previous_response_id": upstreamResponseID,
+		"input": []interface{}{
+			map[string]interface{}{
+				"type":              "compaction",
+				"encrypted_content": encodeSyntheticCompaction("ordinary lineage checkpoint"),
+			},
+			messageItemForContract("user", "continue"),
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Codex-Turn-State", turnState)
+	w := httptest.NewRecorder()
+	handler.HandleResponses(w, req)
+
+	if resp := w.Result(); resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestCompactionContract_Responses413PreservesOriginalFailureWhenCompactionIsIncomplete(t *testing.T) {
+	const original413Body = `{"error":{"message":"ORIGINAL_413_SENTINEL","code":"payload_too_large"}}`
+
+	var normalCalls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body := decodeJSONBodyForContract(t, r.Body)
+		instructions := ""
+		if len(body["instructions"]) > 0 {
+			instructions = rawJSONToStringForContract(t, body["instructions"])
+		}
+		if strings.Contains(instructions, "CONTEXT CHECKPOINT COMPACTION") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"resp-incomplete-413","object":"response","status":"incomplete","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial checkpoint must not be used"}]}]}`)
+			return
+		}
+
+		if normalCalls.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = io.WriteString(w, original413Body)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp-should-not-exist","object":"response","status":"completed","output":[]}`)
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		DisableAutoCompact:  true,
+		AutoCompactKeepTail: 1,
+	}
+
+	reqBody := mustMarshalContractJSON(t, map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			messageItemForContract("assistant", "older answer"),
+			messageItemForContract("user", "latest request"),
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected original 413 when compaction is incomplete, got %d: %s", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte("ORIGINAL_413_SENTINEL")) {
+		t.Fatalf("expected original 413 body to survive, got %s", body)
+	}
+	if got := normalCalls.Load(); got != 1 {
+		t.Fatalf("incomplete compaction must not produce a compacted retry, got %d normal calls", got)
 	}
 }
 
@@ -595,6 +970,15 @@ func rawJSONObjectForContract(t testing.TB, raw json.RawMessage) map[string]json
 		t.Fatalf("decode JSON object %s: %v", string(raw), err)
 	}
 	return item
+}
+
+func rawJSONToIntForContract(t testing.TB, raw json.RawMessage) int {
+	t.Helper()
+	var value int
+	if err := json.Unmarshal(raw, &value); err != nil {
+		t.Fatalf("decode JSON integer %s: %v", string(raw), err)
+	}
+	return value
 }
 
 func rawJSONToStringForContract(t testing.TB, raw json.RawMessage) string {

@@ -16,8 +16,12 @@ Important behavior:
 - `command_rewrite.streaming_mode` defaults to `disabled`, which is the only supported value today. Command rewrites are applied only when Vekil inspects non-streaming Responses response bodies; websocket/streaming paths capture command context for later output reduction but do not rewrite commands today.
 - For `/v1/responses`, stable scope headers are preferred. Headerless clients can still correlate ordinary continuations through `previous_response_id`, and replay bodies that include a `function_call` before its output can be reduced within that same request.
 - For chat-style APIs, cross-request output reduction requires a stable scope header such as `session_id` or Codex thread/window headers. `X-Client-Request-Id` is treated as per-request and is not used for chat-style scoping. Headerless chat requests are only reduced when the request replays the matching assistant `tool_calls` before the tool output in the same `messages` array; Vekil does not share chat tool-call context globally across conversations.
-- Optimizers are fail-open. External errors, timeouts, invalid JSON, unsupported provider config, or invalid replacements are ignored and the original payload is used.
-- `output_reduce.timeout_ms: 0` disables the per-provider optimizer timeout while still honoring the surrounding request context. `output_reduce.min_input_bytes: 0` disables the minimum-size gate, and `output_reduce.max_input_bytes: 0` disables the maximum-size gate.
+- Optimizers are fail-open. External errors, timeouts, saturation, invalid JSON, unsupported provider config, or invalid replacements are ignored and the original payload is used.
+- Each enabled stage gets one work deadline per inspected request/response turn. `timeout_ms` is the total stage budget; it is not reset for each tool item or provider attempt. A provider that returns a cancellation/deadline error is skipped for the rest of that turn, and no stage runs more than eight provider calls in one turn.
+- `output_reduce.timeout_ms: 0` disables the output-reduction stage deadline while still honoring the surrounding request context and fixed safety limits. `output_reduce.min_input_bytes: 0` disables the minimum-size gate, and `output_reduce.max_input_bytes: 0` disables the maximum-size gate.
+- External `rtk_cli` and `exec_json` calls share a manager-wide four-process concurrency limit. Waiting for a slot honors the stage/request context; a canceled or exhausted wait fails open without launching another process.
+- Non-streaming Responses and Chat bodies are inspected only when an enabled stage has at least one eligible provider. Complete bodies of at most 4 MiB may be parsed/transformed. Larger bodies stream byte-for-byte, skip optimizer inspection and usage sniffing, and are never buffered in full.
+- Tool argument strings must contain exactly one JSON value. Trailing values or garbage disable extraction/rewriting for that tool call. Built-in filter hints also require shell token boundaries (`go test` matches; `go testify` does not).
 - Command replacements must be changed, non-empty after trimming, at most `32768` bytes, and contain no NUL characters. Internal newlines and carriage returns are allowed for multi-line shell snippets.
 - Output replacements must be changed and non-empty after trimming.
 
@@ -86,6 +90,16 @@ Provider entries support these `type` values:
 - `noop` accepts config and never changes payloads; it is useful for tests and dry runs.
 
 Provider entries are enabled by default; set `enabled: false` to keep an entry in the file without using it. Each provider can set `stages`. If `stages` is omitted or empty, the provider is eligible for both `command_rewrite` and `output_reduce`; otherwise list only the stage names it should handle: `command_rewrite` and/or `output_reduce`. Providers run in config order, and the first valid changed result wins.
+
+External adapters are contained and cleaned up as process trees. Unix builds launch each invocation in an isolated process group; Windows builds assign a suspended process to a kill-on-close Job Object before it can create descendants. Cancellation terminates the whole tree, successful/error completion performs a final tree cleanup, inherited stdout/stderr waits have a bounded delay, and output observed after the context deadline is rejected.
+
+Fixed reliability limits:
+
+| Limit | Value |
+|-------|-------|
+| Provider calls per stage/turn | `8` |
+| Concurrent external calls per manager | `4` |
+| Non-streaming inspection body cap | `4194304` bytes (4 MiB) |
 
 ## `exec_json` Provider Protocol
 

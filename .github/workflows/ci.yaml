@@ -12,6 +12,7 @@ permissions:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -27,12 +28,18 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
+
+      - name: Shell smoke reliability tests
+        run: |
+          bash -n scripts/live-cli-smoke.sh scripts/live-zen-smoke.sh scripts/live-compact-smoke.sh scripts/k8s-kind-smoke.sh scripts/tests/live-smoke-reliability-test.sh
+          scripts/tests/live-smoke-reliability-test.sh
 
       - name: Test
         run: make test
@@ -42,6 +49,7 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -57,6 +65,7 @@ jobs:
 
   k8s-smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     needs: [lint, build, test]
     env:
       KIND_VERSION: v0.32.0
@@ -66,24 +75,25 @@ jobs:
 
       - name: Install kind and kubectl
         run: |
-          curl -fsSL -o /tmp/kind-linux-amd64 "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          curl -fsSL -o /tmp/kind.sha256sum "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64.sha256sum"
+          curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 -o /tmp/kind-linux-amd64 "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 -o /tmp/kind.sha256sum "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64.sha256sum"
           (cd /tmp && sha256sum -c kind.sha256sum)
           sudo install -m 0755 /tmp/kind-linux-amd64 /usr/local/bin/kind
 
-          curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          curl -fsSL -o /tmp/kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
+          curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 -o /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 -o /tmp/kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
           echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum -c -
           sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
 
           kind version
           kubectl version --client=true
 
-      - name: Kubernetes liveness smoke
+      - name: Kubernetes operational smoke
         run: scripts/k8s-kind-smoke.sh
 
   e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [lint, build, test]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -95,10 +105,10 @@ jobs:
       - name: Build
         run: make build
 
-      - name: Verify binary runs
+      - name: Verify binary help exits successfully
         run: |
-          ./vekil --help 2>&1 || true
-          echo "Binary executes successfully"
+          ./vekil --help > /tmp/vekil-help.txt 2>&1
+          grep -q '^Usage of ' /tmp/vekil-help.txt
 
       - name: Docker build
         run: make docker-build

@@ -368,9 +368,6 @@ func serveUntilContextDone(ctx context.Context, srv serveLifecycleServer, authen
 }
 
 func stopServeServer(srv serveLifecycleServer, log *logger.Logger) error {
-	if gate, ok := srv.(startupAuthenticationGate); ok {
-		gate.SetStartupAuthenticationPending(false)
-	}
 	if log != nil {
 		log.Info("shutting down...")
 	}
@@ -378,7 +375,14 @@ func stopServeServer(srv serveLifecycleServer, log *logger.Logger) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := srv.Stop(ctx); err != nil {
+	err := srv.Stop(ctx)
+	// Keep the startup gate closed until Stop has begun the server's shutdown
+	// admission transition. Clearing it before Stop briefly reopens inference
+	// routes that were intentionally gated while authentication was pending.
+	if gate, ok := srv.(startupAuthenticationGate); ok {
+		gate.SetStartupAuthenticationPending(false)
+	}
+	if err != nil {
 		return fmt.Errorf("shutdown error: %w", err)
 	}
 	if log != nil {

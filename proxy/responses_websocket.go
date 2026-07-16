@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -22,12 +23,37 @@ import (
 
 const responsesWebSocketRequestHeaderPrefix = "ws_request_header_"
 
+var responsesLifecycleOrder = struct {
+	sync.Mutex
+	sequence uint64
+}{}
+
+// publishResponsesLifecycleSequence assigns and publishes one globally ordered
+// lifecycle event while holding the order lock. Keeping allocation and
+// publication in the same critical section prevents a later client-close event
+// from becoming visible before an earlier shutdown sequence is published.
+func publishResponsesLifecycleSequence(publish func(uint64)) {
+	responsesLifecycleOrder.Lock()
+	defer responsesLifecycleOrder.Unlock()
+	if responsesLifecycleOrder.sequence == ^uint64(0) {
+		panic("responses lifecycle sequence exhausted")
+	}
+	responsesLifecycleOrder.sequence++
+	publish(responsesLifecycleOrder.sequence)
+}
+
+const responsesWebSocketOutstandingRequestLimit = 2
+
 var (
-	responsesWebSocketWriteWait  = 10 * time.Second
-	responsesWebSocketPingPeriod = 30 * time.Second
+	responsesWebSocketWriteWait               = 10 * time.Second
+	responsesWebSocketPingPeriod              = 30 * time.Second
+	responsesWebSocketPongWait                = 60 * time.Second
+	responsesWebSocketShutdownCloseWait       = 100 * time.Millisecond
+	responsesWebSocketTerminalObservationWait = 500 * time.Millisecond
 )
 
 var errResponsesWebSocketClientWrite = errors.New("responses websocket client write failed")
+var errResponsesWebSocketStreamTerminal = errors.New("responses websocket upstream stream reached terminal event")
 
 type responsesWebSocketClientWriteError struct {
 	err error
@@ -59,16 +85,16 @@ func isResponsesWebSocketClientDisconnect(ctx context.Context, err error) bool {
 }
 
 // errStreamFailedUpstream is a sentinel error indicating the upstream stream
-// ended with response.failed or response.incomplete after forwarding the
-// upstream failure event. This path also emits the standard websocket error
-// payload so clients can surface the upstream error details.
-var errStreamFailedUpstream = errors.New("upstream stream ended with response.failed or response.incomplete")
+// ended with response.failed or a top-level error event
+// after forwarding the upstream failure event. This path also emits the standard
+// websocket error payload so clients can surface the upstream error details.
+var errStreamFailedUpstream = errors.New("upstream stream ended with response.failed or error")
 
 // streamFailedUpstreamError carries the HTTP status that an upstream
-// response.failed/incomplete event was classified to (e.g. 429 for a rate
-// limit, 503 for an overload), so the turn is recorded in stats with its exact
-// semantic status rather than a generic 502. It unwraps to errStreamFailedUpstream
-// so existing errors.Is checks keep working.
+// failure terminal event was classified to (e.g. 429 for a rate limit, 503 for
+// an overload), so the turn is recorded in stats with its exact semantic status
+// rather than a generic 502. It unwraps to errStreamFailedUpstream so existing
+// errors.Is checks keep working.
 type streamFailedUpstreamError struct {
 	status int
 }
@@ -112,44 +138,109 @@ type responsesWebSocketJSONField struct {
 }
 
 type responsesWebSocketStreamEvent struct {
-	Type     string `json:"type"`
+	Type     string                     `json:"type"`
+	Code     string                     `json:"code,omitempty"`
+	Message  string                     `json:"message,omitempty"`
+	Param    string                     `json:"param,omitempty"`
+	Headers  map[string]json.RawMessage `json:"headers,omitempty"`
 	Response struct {
 		ID                string                                    `json:"id"`
 		Error             responsesWebSocketStreamError             `json:"error"`
 		IncompleteDetails responsesWebSocketStreamIncompleteDetails `json:"incomplete_details"`
 		Usage             responsesUsage                            `json:"usage"`
 	} `json:"response,omitempty"`
-	Item json.RawMessage `json:"item,omitempty"`
+	Error responsesWebSocketStreamError `json:"error,omitempty"`
+	Item  json.RawMessage               `json:"item,omitempty"`
 }
 
 type responsesWebSocketStreamError struct {
-	Type    string `json:"type"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Type    string                     `json:"type"`
+	Code    string                     `json:"code"`
+	Message string                     `json:"message"`
+	Param   string                     `json:"param,omitempty"`
+	Headers map[string]json.RawMessage `json:"headers,omitempty"`
 }
 
 type responsesWebSocketStreamIncompleteDetails struct {
 	Reason string `json:"reason"`
 }
 
+type responsesWebSocketFrame struct {
+	messageType int
+	payload     []byte
+}
+
+type responsesWebSocketShutdownConn interface {
+	WriteControl(messageType int, data []byte, deadline time.Time) error
+	Close() error
+}
+
+type responsesWebSocketCloseBarrier struct {
+	done chan struct{}
+	once sync.Once
+}
+
+type responsesWebSocketCloseCause uint8
+
+const (
+	responsesWebSocketCloseCauseUnknown responsesWebSocketCloseCause = iota
+	responsesWebSocketCloseCauseClient
+	responsesWebSocketCloseCauseServer
+)
+
+func newResponsesWebSocketCloseBarrier() *responsesWebSocketCloseBarrier {
+	return &responsesWebSocketCloseBarrier{done: make(chan struct{})}
+}
+
+func (b *responsesWebSocketCloseBarrier) release() {
+	if b == nil {
+		return
+	}
+	b.once.Do(func() { close(b.done) })
+}
+
+func (b *responsesWebSocketCloseBarrier) released() bool {
+	if b == nil {
+		return true
+	}
+	select {
+	case <-b.done:
+		return true
+	default:
+		return false
+	}
+}
+
 type responsesWebSocketSession struct {
-	conn           *websocket.Conn
-	ctx            context.Context
-	baseHeaders    http.Header
-	userAgent      string
-	turnState      string
-	turnMetadata   string
-	lastResponseID string
-	lastSignature  string
-	historyItems   []json.RawMessage
-	historyBytes   int
-	toolContexts   *ToolExecutionContextStore
-	toolScope      string
-	done           chan struct{}
-	doneOnce       sync.Once
-	inflightMu     sync.Mutex
-	inflightCancel context.CancelFunc
-	inflightGen    uint64
+	conn                    *websocket.Conn
+	shutdownConn            responsesWebSocketShutdownConn
+	ctx                     context.Context
+	cancel                  context.CancelFunc
+	baseHeaders             http.Header
+	userAgent               string
+	turnState               string
+	turnMetadata            string
+	lastResponseID          string
+	lastSignature           string
+	historyItems            []json.RawMessage
+	historyBytes            int
+	toolContexts            *ToolExecutionContextStore
+	toolScope               string
+	handlerDone             chan struct{}
+	handlerDoneOnce         sync.Once
+	writeWait               time.Duration
+	pingPeriod              time.Duration
+	pongWait                time.Duration
+	terminalObservationWait time.Duration
+	inflightMu              sync.Mutex
+	inflightCancel          context.CancelFunc
+	inflightGen             uint64
+	inflightCancelHolds     int
+	closing                 bool
+	closeCause              responsesWebSocketCloseCause
+	closeSequence           uint64
+	closeBarrier            *responsesWebSocketCloseBarrier
+	socketClosed            bool
 }
 
 type responsesWebSocketRequestPlan struct {
@@ -170,6 +261,47 @@ type responsesWebSocketRequestMetrics struct {
 	compactedFromBytes int
 	compactedToItems   int
 	compactedToBytes   int
+	internalUsage      responsesUsage
+	providerID         string
+	providerKind       string
+}
+
+func (m *responsesWebSocketRequestMetrics) captureObservedProvider(observer *providerRouteObserver) {
+	if m == nil {
+		return
+	}
+	if route, ok := observer.snapshot(); ok {
+		m.providerID = route.id
+		m.providerKind = route.kind
+	}
+}
+
+func (m *responsesWebSocketRequestMetrics) captureProvider(resp *http.Response) {
+	if m == nil {
+		return
+	}
+	if route, ok := providerRouteFromResponse(resp); ok {
+		m.providerID = route.id
+		m.providerKind = route.kind
+	}
+}
+
+func (m *responsesWebSocketRequestMetrics) addInternalUsage(usage responsesUsage) {
+	if m == nil {
+		return
+	}
+	m.internalUsage.add(usage)
+}
+
+func (m responsesWebSocketRequestMetrics) totalUsage(turnUsage responsesUsage) responsesUsage {
+	turnUsage.add(m.internalUsage)
+	return turnUsage
+}
+
+type responsesWebSocketStreamResult struct {
+	responseID  string
+	outputItems []json.RawMessage
+	usage       responsesUsage
 }
 
 type responsesWebSocketHistoryCompaction struct {
@@ -239,46 +371,112 @@ func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.R
 	if err != nil {
 		return
 	}
-	defer func() { _ = conn.Close() }()
 
 	conn.SetReadLimit(maxRequestBodySize)
 	session := newResponsesWebSocketSession(conn, r)
-	session.startPingLoop()
+	registered := false
+	defer func() {
+		session.beginClosing()
+		session.hardClose()
+		if registered {
+			h.unregisterResponsesWebSocketSession(session)
+		}
+		session.closeHandlerDone()
+	}()
+
 	if !h.registerResponsesWebSocketSession(session) {
-		session.sendGoingAwayWithDeadline(time.Now().Add(responsesWebSocketWriteWait))
+		session.sendGoingAwayWithDeadline(time.Now().Add(session.effectiveWriteWait()))
 		return
 	}
-	defer h.unregisterResponsesWebSocketSession(session)
-	defer session.closeDone()
+	registered = true
+
+	if err := session.configureReadDeadline(); err != nil {
+		session.beginClosing()
+		return
+	}
+
+	frames := make(chan responsesWebSocketFrame, responsesWebSocketOutstandingRequestLimit)
+	outstanding := make(chan struct{}, responsesWebSocketOutstandingRequestLimit)
+	session.startPingLoop()
+	go session.readPump(frames, outstanding)
 
 	for {
-		messageType, payload, err := conn.ReadMessage()
+		select {
+		case <-session.ctx.Done():
+			return
+		case frame, ok := <-frames:
+			if !ok || session.isClosing() {
+				return
+			}
+			err := session.handleFrame(h, frame)
+			<-outstanding
+			if err != nil {
+				h.log.Debug("responses websocket request failed", logger.Err(err))
+				if isResponsesWebSocketClientDisconnect(session.ctx, err) || session.isClosing() {
+					return
+				}
+			}
+		}
+	}
+}
+
+func (s *responsesWebSocketSession) handleFrame(h *ProxyHandler, frame responsesWebSocketFrame) error {
+	if s == nil || s.isClosing() {
+		return context.Canceled
+	}
+	if frame.messageType != websocket.TextMessage {
+		return s.sendWrappedError(http.StatusBadRequest, "responses websocket only accepts text frames", "invalid_request_error", nil)
+	}
+
+	frameType, err := parseResponsesWebSocketFrameType(frame.payload)
+	if err != nil {
+		return s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
+	}
+	if frameType == "response.processed" {
+		return nil
+	}
+
+	request, err := parseResponsesWebSocketCreateRequest(frame.payload)
+	if err != nil {
+		return s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
+	}
+	return s.handleCreateRequest(h, request)
+}
+
+func (s *responsesWebSocketSession) readPump(frames chan<- responsesWebSocketFrame, outstanding chan struct{}) {
+	defer close(frames)
+	for {
+		messageType, payload, err := s.conn.ReadMessage()
 		if err != nil {
+			s.beginClosing()
+			s.hardClose()
 			return
 		}
-		if messageType != websocket.TextMessage {
-			session.sendWrappedError(http.StatusBadRequest, "responses websocket only accepts text frames", "invalid_request_error", nil)
-			continue
+
+		// response.processed is an advisory acknowledgement and does not consume
+		// the single queued-turn slot while inference is active.
+		if messageType == websocket.TextMessage {
+			if frameType, parseErr := parseResponsesWebSocketFrameType(payload); parseErr == nil && frameType == "response.processed" {
+				continue
+			}
 		}
 
-		frameType, err := parseResponsesWebSocketFrameType(payload)
-		if err != nil {
-			session.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
-			continue
-		}
-		if frameType == "response.processed" {
-			continue
-		}
-
-		request, err := parseResponsesWebSocketCreateRequest(payload)
-		if err != nil {
-			session.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
-			continue
+		select {
+		case outstanding <- struct{}{}:
+		default:
+			// The two outstanding slots are exactly one active request plus one
+			// queued request. They are held until serialized processing finishes,
+			// so acceptance is independent of handler scheduling.
+			s.closeWithControl(websocket.ClosePolicyViolation, "only one responses request may be queued", time.Now().Add(s.effectiveWriteWait()))
+			return
 		}
 
-		if err := session.handleCreateRequest(h, request); err != nil {
-			h.log.Debug("responses websocket request failed", logger.Err(err))
-			continue
+		frame := responsesWebSocketFrame{messageType: messageType, payload: payload}
+		select {
+		case frames <- frame:
+		case <-s.ctx.Done():
+			<-outstanding
+			return
 		}
 	}
 }
@@ -317,9 +515,9 @@ func (h *ProxyHandler) responsesWebSocketIsDraining() bool {
 	return h.responsesWSDraining
 }
 
-func (h *ProxyHandler) ShutdownWebSocketSessions(ctx context.Context) {
+func (h *ProxyHandler) ShutdownWebSocketSessions(ctx context.Context) error {
 	if h == nil {
-		return
+		return nil
 	}
 	h.responsesWSSessionsMu.Lock()
 	h.responsesWSDraining = true
@@ -329,41 +527,128 @@ func (h *ProxyHandler) ShutdownWebSocketSessions(ctx context.Context) {
 	}
 	h.responsesWSSessionsMu.Unlock()
 
+	// Phase one marks every session closing before any handler can start new
+	// turn or compaction work. A per-session barrier prevents handler teardown,
+	// read failures, or ping failures from hard-closing the socket before its
+	// graceful close attempt gets a bounded opportunity to run.
+	closeDeadline := responsesWebSocketShutdownCloseDeadline(ctx)
+	attempts := make([]<-chan struct{}, 0, len(sessions))
+	barriers := make([]*responsesWebSocketCloseBarrier, 0, len(sessions))
 	for _, session := range sessions {
-		select {
-		case <-ctx.Done():
-			return
-		default:
+		session.markServerShutdown()
+		barrier, owner := session.startControlClose(responsesWebSocketCloseCauseServer)
+		if barrier == nil {
+			continue
 		}
-		session.sendGoingAwayWithDeadline(responsesWebSocketShutdownCloseDeadline(ctx))
+		barriers = append(barriers, barrier)
+		if !owner {
+			attempts = append(attempts, barrier.done)
+			continue
+		}
+		attemptDone := make(chan struct{})
+		attempts = append(attempts, attemptDone)
+		go func() {
+			defer close(attemptDone)
+			session.writeCloseControl(websocket.CloseGoingAway, "server shutting down", closeDeadline)
+		}()
+	}
+	waitForResponsesWebSocketCloseAttempts(ctx, closeDeadline, attempts)
+
+	// Phase two is unconditional, including when ctx was already canceled: lift
+	// every close barrier, cancel active inference/compaction and the session
+	// context, then hard-close every hijacked socket.
+	for _, barrier := range barriers {
+		barrier.release()
+	}
+	for _, session := range sessions {
+		session.beginClosing()
+	}
+	for _, session := range sessions {
+		session.hardClose()
+	}
+
+	// Phase three waits only for real handler teardown. handlerDone is closed
+	// after unregistration, never merely because shutdown requested a close.
+	waitDeadline := responsesWebSocketShutdownWaitDeadline(ctx)
+	for _, session := range sessions {
+		if !session.waitForHandlerDone(ctx, waitDeadline) {
+			if ctx != nil && ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return context.DeadlineExceeded
+		}
+	}
+	return nil
+}
+
+func waitForResponsesWebSocketCloseAttempts(ctx context.Context, deadline time.Time, attempts []<-chan struct{}) {
+	if len(attempts) == 0 {
+		return
+	}
+	allDone := make(chan struct{})
+	go func() {
+		defer close(allDone)
+		for _, done := range attempts {
+			<-done
+		}
+	}()
+
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	var ctxDone <-chan struct{}
+	if ctx != nil {
+		ctxDone = ctx.Done()
+	}
+	select {
+	case <-allDone:
+	case <-ctxDone:
+	case <-timer.C:
 	}
 }
 
-func (s *responsesWebSocketSession) closeDone() {
-	if s == nil || s.done == nil {
+func (s *responsesWebSocketSession) closeHandlerDone() {
+	if s == nil || s.handlerDone == nil {
 		return
 	}
-	s.doneOnce.Do(func() { close(s.done) })
+	s.handlerDoneOnce.Do(func() { close(s.handlerDone) })
+}
+
+func (s *responsesWebSocketSession) configureReadDeadline() error {
+	if s == nil || s.conn == nil || s.pongWait <= 0 {
+		return nil
+	}
+	if err := s.conn.SetReadDeadline(time.Now().Add(s.pongWait)); err != nil {
+		return err
+	}
+	s.conn.SetPongHandler(func(string) error {
+		return s.conn.SetReadDeadline(time.Now().Add(s.pongWait))
+	})
+	return nil
 }
 
 func (s *responsesWebSocketSession) startPingLoop() {
-	if s == nil || s.conn == nil || responsesWebSocketPingPeriod <= 0 {
+	if s == nil || s.conn == nil || s.pingPeriod <= 0 {
 		return
 	}
-	ticker := time.NewTicker(responsesWebSocketPingPeriod)
+	ticker := time.NewTicker(s.pingPeriod)
 	go func() {
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				deadline := time.Now().Add(responsesWebSocketWriteWait)
+				deadline := time.Now().Add(s.effectiveWriteWait())
 				if err := s.conn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
-					s.cancelInflight()
-					_ = s.conn.Close()
-					s.closeDone()
+					s.beginClosing()
+					s.hardClose()
 					return
 				}
-			case <-s.done:
+			case <-s.ctx.Done():
+				return
+			case <-s.handlerDone:
 				return
 			}
 		}
@@ -371,24 +656,241 @@ func (s *responsesWebSocketSession) startPingLoop() {
 }
 
 func responsesWebSocketShutdownCloseDeadline(ctx context.Context) time.Time {
-	deadline := time.Now().Add(responsesWebSocketWriteWait)
-	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-		return ctxDeadline
+	wait := responsesWebSocketShutdownCloseWait
+	if wait <= 0 || wait > responsesWebSocketWriteWait {
+		wait = responsesWebSocketWriteWait
+	}
+	deadline := time.Now().Add(wait)
+	if ctx != nil {
+		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+			return ctxDeadline
+		}
+		if ctx.Err() != nil {
+			return time.Now()
+		}
 	}
 	return deadline
 }
 
-func (s *responsesWebSocketSession) sendGoingAwayWithDeadline(deadline time.Time) {
-	if s == nil || s.conn == nil {
+func responsesWebSocketShutdownWaitDeadline(ctx context.Context) time.Time {
+	deadline := time.Now().Add(responsesWebSocketWriteWait)
+	if ctx != nil {
+		if ctx.Err() != nil {
+			return time.Now()
+		}
+		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+			return ctxDeadline
+		}
+	}
+	return deadline
+}
+
+func (s *responsesWebSocketSession) waitForHandlerDone(ctx context.Context, deadline time.Time) bool {
+	if s == nil || s.handlerDone == nil {
+		return true
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		select {
+		case <-s.handlerDone:
+			return true
+		default:
+			return false
+		}
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	var ctxDone <-chan struct{}
+	if ctx != nil {
+		ctxDone = ctx.Done()
+	}
+	select {
+	case <-s.handlerDone:
+		return true
+	case <-ctxDone:
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
+func (s *responsesWebSocketSession) effectiveTerminalObservationWait() time.Duration {
+	if s != nil && s.terminalObservationWait > 0 {
+		return s.terminalObservationWait
+	}
+	return responsesWebSocketTerminalObservationWait
+}
+
+func (s *responsesWebSocketSession) effectiveWriteWait() time.Duration {
+	if s != nil && s.writeWait > 0 {
+		return s.writeWait
+	}
+	return responsesWebSocketWriteWait
+}
+
+func (s *responsesWebSocketSession) writeCloseControl(code int, message string, deadline time.Time) {
+	if s == nil {
 		return
 	}
-	s.cancelInflight()
-	if deadline.IsZero() {
-		deadline = time.Now().Add(responsesWebSocketWriteWait)
+	conn := s.shutdownConn
+	if conn == nil {
+		conn = s.conn
 	}
-	_ = s.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "server shutting down"), deadline)
-	_ = s.conn.Close()
-	s.closeDone()
+	if conn == nil {
+		return
+	}
+	if deadline.IsZero() {
+		deadline = time.Now().Add(s.effectiveWriteWait())
+	}
+	_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, message), deadline)
+}
+
+func (s *responsesWebSocketSession) closeWithControl(code int, message string, deadline time.Time) {
+	if s == nil {
+		return
+	}
+	barrier, owner := s.startControlClose()
+	if barrier == nil {
+		s.beginClosing()
+		s.hardClose()
+		return
+	}
+	if owner {
+		s.writeCloseControl(code, message, deadline)
+		barrier.release()
+	} else {
+		<-barrier.done
+	}
+	s.beginClosing()
+	s.hardClose()
+}
+
+func (s *responsesWebSocketSession) sendGoingAwayWithDeadline(deadline time.Time) {
+	s.closeWithControl(websocket.CloseGoingAway, "server shutting down", deadline)
+}
+
+func (s *responsesWebSocketSession) hardClose() {
+	if s == nil {
+		return
+	}
+	for {
+		s.inflightMu.Lock()
+		if s.socketClosed {
+			s.inflightMu.Unlock()
+			return
+		}
+		barrier := s.closeBarrier
+		if barrier != nil && !barrier.released() {
+			done := barrier.done
+			s.inflightMu.Unlock()
+			<-done
+			continue
+		}
+		s.socketClosed = true
+		conn := s.shutdownConn
+		if conn == nil {
+			conn = s.conn
+		}
+		s.inflightMu.Unlock()
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return
+	}
+}
+
+func (s *responsesWebSocketSession) startControlClose(causes ...responsesWebSocketCloseCause) (*responsesWebSocketCloseBarrier, bool) {
+	if s == nil {
+		return nil, false
+	}
+	s.inflightMu.Lock()
+	defer s.inflightMu.Unlock()
+	s.closing = true
+	cause := responsesWebSocketCloseCauseClient
+	if len(causes) > 0 {
+		cause = causes[0]
+	}
+	s.markCloseCauseLocked(cause)
+	if s.socketClosed {
+		return nil, false
+	}
+	if s.closeBarrier != nil {
+		return s.closeBarrier, false
+	}
+	barrier := newResponsesWebSocketCloseBarrier()
+	s.closeBarrier = barrier
+	return barrier, true
+}
+
+func (s *responsesWebSocketSession) isClosing() bool {
+	if s == nil {
+		return true
+	}
+	s.inflightMu.Lock()
+	defer s.inflightMu.Unlock()
+	return s.closing
+}
+
+func (s *responsesWebSocketSession) beginClosing() {
+	if s == nil {
+		return
+	}
+	s.inflightMu.Lock()
+	s.closing = true
+	s.markCloseCauseLocked(responsesWebSocketCloseCauseClient)
+	if s.closeBarrier != nil && !s.closeBarrier.released() {
+		s.inflightMu.Unlock()
+		return
+	}
+	cancelSession := s.cancel
+	cancelInflight := s.inflightCancel
+	if s.inflightCancelHolds > 0 {
+		cancelInflight = nil
+	}
+	s.inflightMu.Unlock()
+	if cancelSession != nil {
+		cancelSession()
+	}
+	if cancelInflight != nil {
+		cancelInflight()
+	}
+}
+
+func (s *responsesWebSocketSession) markServerShutdown() {
+	if s == nil {
+		return
+	}
+	s.inflightMu.Lock()
+	s.markCloseCauseLocked(responsesWebSocketCloseCauseServer)
+	s.inflightMu.Unlock()
+}
+
+func (s *responsesWebSocketSession) markCloseCauseLocked(cause responsesWebSocketCloseCause) {
+	if s.closeCause != responsesWebSocketCloseCauseUnknown {
+		return
+	}
+	s.closeCause = cause
+	publishResponsesLifecycleSequence(func(sequence uint64) {
+		s.closeSequence = sequence
+	})
+}
+
+func (s *responsesWebSocketSession) clientClosePrecedesShutdown(h *ProxyHandler) bool {
+	if s == nil {
+		return false
+	}
+	s.inflightMu.Lock()
+	cause := s.closeCause
+	closeSequence := s.closeSequence
+	s.inflightMu.Unlock()
+	if cause != responsesWebSocketCloseCauseClient {
+		return false
+	}
+	shutdownSequence := uint64(0)
+	if h != nil {
+		shutdownSequence = h.shutdownSequence.Load()
+	}
+	return shutdownSequence == 0 || (closeSequence != 0 && closeSequence < shutdownSequence)
 }
 
 // setInflightCancel records the cancel func for the current in-flight upstream
@@ -397,16 +899,76 @@ func (s *responsesWebSocketSession) sendGoingAwayWithDeadline(deadline time.Time
 // subsequent in-flight calls (e.g. auto-compaction inside a create request)
 // bump the generation, and a stale clear is then a no-op rather than nilling
 // out a newer cancel. (context.CancelFunc values are not comparable, so the
-// generation token stands in for identity.)
+// generation token stands in for identity.) Work installed after closing starts
+// is canceled immediately and is never published as active.
 func (s *responsesWebSocketSession) setInflightCancel(cancel context.CancelFunc) uint64 {
 	if s == nil || cancel == nil {
 		return 0
 	}
 	s.inflightMu.Lock()
-	defer s.inflightMu.Unlock()
 	s.inflightGen++
-	s.inflightCancel = cancel
-	return s.inflightGen
+	gen := s.inflightGen
+	closing := s.closing || (s.ctx != nil && s.ctx.Err() != nil)
+	if closing {
+		s.closing = true
+	} else {
+		s.inflightCancel = cancel
+	}
+	s.inflightMu.Unlock()
+	if closing {
+		cancel()
+	}
+	return gen
+}
+
+// beginClosingForStreamWriteFailure marks a client-side socket failure while
+// holding the active upstream cancellation just long enough for the prepared
+// stream observer to drain an already-produced terminal event. Ordinary client
+// close, pong timeout, and policy-close paths still cancel stalled upstream work
+// immediately.
+func (s *responsesWebSocketSession) beginClosingForStreamWriteFailure() {
+	if s == nil {
+		return
+	}
+	s.inflightMu.Lock()
+	s.closing = true
+	s.markCloseCauseLocked(responsesWebSocketCloseCauseClient)
+	if s.closeCause == responsesWebSocketCloseCauseClient && s.inflightCancel != nil && s.inflightCancelHolds == 0 {
+		s.inflightCancelHolds = 1
+	}
+	if s.closeBarrier != nil && !s.closeBarrier.released() {
+		s.inflightMu.Unlock()
+		return
+	}
+	cancelSession := s.cancel
+	cancelInflight := s.inflightCancel
+	if s.inflightCancelHolds > 0 {
+		cancelInflight = nil
+	}
+	s.inflightMu.Unlock()
+	if cancelSession != nil {
+		cancelSession()
+	}
+	if cancelInflight != nil {
+		cancelInflight()
+	}
+}
+
+func (s *responsesWebSocketSession) releaseInflightCancellationHold(gen uint64) {
+	if s == nil || gen == 0 {
+		return
+	}
+	s.inflightMu.Lock()
+	if s.inflightGen == gen && s.inflightCancelHolds > 0 {
+		s.inflightCancelHolds--
+	}
+	shouldCancel := s.closing && s.inflightCancelHolds == 0 && s.inflightGen == gen &&
+		(s.closeBarrier == nil || s.closeBarrier.released())
+	cancelInflight := s.inflightCancel
+	s.inflightMu.Unlock()
+	if shouldCancel && cancelInflight != nil {
+		cancelInflight()
+	}
 }
 
 func (s *responsesWebSocketSession) clearInflightCancel(gen uint64) {
@@ -417,18 +979,6 @@ func (s *responsesWebSocketSession) clearInflightCancel(gen uint64) {
 	defer s.inflightMu.Unlock()
 	if s.inflightGen == gen {
 		s.inflightCancel = nil
-	}
-}
-
-func (s *responsesWebSocketSession) cancelInflight() {
-	if s == nil {
-		return
-	}
-	s.inflightMu.Lock()
-	cancel := s.inflightCancel
-	s.inflightMu.Unlock()
-	if cancel != nil {
-		cancel()
 	}
 }
 
@@ -443,6 +993,7 @@ func parseResponsesWebSocketFrameType(payload []byte) (string, error) {
 }
 
 func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *responsesWebSocketSession {
+	ctx, cancel := context.WithCancel(r.Context())
 	baseHeaders := make(http.Header)
 	for _, name := range []string{
 		"X-Codex-Beta-Features",
@@ -468,16 +1019,21 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 	}
 
 	return &responsesWebSocketSession{
-		conn:        conn,
-		ctx:         r.Context(),
-		baseHeaders: baseHeaders,
-		userAgent:   r.Header.Get("User-Agent"),
+		conn:         conn,
+		shutdownConn: conn,
+		ctx:          ctx,
+		cancel:       cancel,
+		baseHeaders:  baseHeaders,
+		userAgent:    r.Header.Get("User-Agent"),
 		// Codex treats X-Codex-Turn-State as server-issued, turn-scoped
 		// sticky-routing state. This bridge only trusts state it received from
 		// upstream during this proxy-owned websocket session.
 		toolContexts: NewToolExecutionContextStore(),
 		toolScope:    "responses-ws:" + uuid.NewString(),
-		done:         make(chan struct{}),
+		handlerDone:  make(chan struct{}),
+		writeWait:    responsesWebSocketWriteWait,
+		pingPeriod:   responsesWebSocketPingPeriod,
+		pongWait:     responsesWebSocketPongWait,
 	}
 }
 
@@ -571,6 +1127,9 @@ func (r *responsesWebSocketCreateRequest) upstreamBody(inputSegments ...[]json.R
 }
 
 func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) error {
+	if s == nil || s.isClosing() || (s.ctx != nil && s.ctx.Err() != nil) || h.upstreamShutdownStarted() {
+		return context.Canceled
+	}
 	s.syncTurnMetadata(request)
 	if request.PreviousResponseID == "" {
 		s.turnState = ""
@@ -578,10 +1137,81 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 
 	plan, err := s.planRequest(h, request)
 	if err != nil {
-		s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
+		if writeErr := s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil); writeErr != nil {
+			return writeErr
+		}
 		return err
 	}
 	metrics := responsesWebSocketRequestMetrics{}
+	turnRecorded := false
+	var turnStatsRecord responsesTurnStatsRecord
+	recordTurn := func(status int, usage responsesUsage) {
+		if turnRecorded {
+			return
+		}
+		turnRecorded = true
+		turnStatsRecord = s.recordTurnStats(h, request.Model, metrics.providerID, metrics.providerKind, status, metrics.totalUsage(usage))
+	}
+	var peek *peekResult
+	var resp *http.Response
+	observedTerminalOutcome := func() (int, responsesUsage, bool) {
+		terminalPeek := peek
+		if (terminalPeek == nil || terminalPeek.terminal == nil) && resp != nil {
+			if preparedBody, ok := resp.Body.(*responsesPreparedBody); ok {
+				if terminal, hasTerminal := preparedBody.terminalResultWithin(s.effectiveTerminalObservationWait()); hasTerminal {
+					terminalPeek = &terminal
+				}
+			}
+		}
+		if terminalPeek != nil && terminalPeek.terminal != nil {
+			usage := terminalPeek.terminal.Response.Usage
+			switch terminalPeek.terminal.Type {
+			case "response.completed", "response.incomplete":
+				if strings.TrimSpace(terminalPeek.terminal.Response.ID) == "" {
+					return http.StatusBadGateway, usage, true
+				}
+				return http.StatusOK, usage, true
+			case "response.failed", "error":
+				if terminalPeek.status != 0 {
+					return terminalPeek.status, usage, true
+				}
+				var headers http.Header
+				if resp != nil {
+					headers = resp.Header
+				}
+				status, _, _, _ := responsesWebSocketStreamFailureDetails(*terminalPeek.terminal, headers)
+				return status, usage, true
+			}
+		}
+		return 0, responsesUsage{}, false
+	}
+	observedRecoveredUsage := func() responsesUsage {
+		if resp != nil {
+			if preparedBody, ok := resp.Body.(*responsesPreparedBody); ok {
+				if usage, hasUsage := preparedBody.recoveredUsage(); hasUsage {
+					return usage
+				}
+			}
+		}
+		return responsesUsage{}
+	}
+	recordDisconnected := func(status int, usage responsesUsage, allowFallback bool) {
+		if status == 0 {
+			if terminalStatus, terminalUsage, ok := observedTerminalOutcome(); ok {
+				status, usage = terminalStatus, terminalUsage
+			}
+		}
+		if usage.isZero() {
+			usage = observedRecoveredUsage()
+		}
+		if status == 0 {
+			if !allowFallback {
+				return
+			}
+			status = 499 // client closed request before a terminal provider outcome
+		}
+		recordTurn(status, usage)
+	}
 
 	if request.Generate != nil && !*request.Generate {
 		responseID := "vekil-ws-" + uuid.NewString()
@@ -611,44 +1241,116 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	// counters. GET /v1/responses is not an inference route, so the middleware
 	// never marks it; do it explicitly here.
 	upstreamCtx = markRetryStatsTracked(upstreamCtx)
+	upstreamCtx, routeObserver := withProviderRouteObserver(upstreamCtx)
 	inflightGen := s.setInflightCancel(upstreamCancel)
-	defer func() {
-		s.clearInflightCancel(inflightGen)
-		upstreamCancel()
-	}()
+	var finishUpstreamOnce sync.Once
+	finishUpstream := func() {
+		finishUpstreamOnce.Do(func() {
+			s.releaseInflightCancellationHold(inflightGen)
+			s.clearInflightCancel(inflightGen)
+			upstreamCancel()
+		})
+	}
+	defer finishUpstream()
 
-	resp, translated, translatedHeaders, err := h.prepareResponsesStream(s.ctx, upstreamCtx, request.Model, func() (*http.Response, error) {
+	var lifecycleBody *lifecycleAwareReadCloser
+	var preparedPeek *peekResult
+	var translatedHeaders http.Header
+	resp, preparedPeek, translatedHeaders, err = h.prepareResponsesStream(s.ctx, upstreamCtx, request.Model, func() (*http.Response, error) {
 		attemptPlan, err := s.planRequest(h, request)
 		if err != nil {
 			return nil, err
 		}
-		attemptResp, attemptDeltaAttempted, attemptDeltaFallback, err := s.postCreateRequest(h, upstreamCtx, request, attemptPlan)
+		attemptResp, attemptDeltaAttempted, attemptDeltaFallback, err := s.postCreateRequest(h, upstreamCtx, request, attemptPlan, &metrics)
+		metrics.captureObservedProvider(routeObserver)
+		metrics.captureProvider(attemptResp)
 		metrics.deltaAttempted = metrics.deltaAttempted || attemptDeltaAttempted
 		metrics.deltaFallback = metrics.deltaFallback || attemptDeltaFallback
+		if err == nil && attemptResp != nil && attemptResp.Body != nil {
+			lifecycleBody = newLifecycleAwareReadCloser(attemptResp.Body, upstreamCtx)
+			attemptResp.Body = lifecycleBody
+		}
 		return attemptResp, err
 	})
+	peek = preparedPeek
 	if err != nil {
-		s.sendWrappedError(upstreamStatusCode(err, http.StatusBadGateway), fmt.Sprintf("upstream request failed: %v", err), "server_error", nil)
+		lifecycleCanceled := errors.Is(err, context.Canceled) && errors.Is(context.Cause(upstreamCtx), errProxyLifecycleShutdown)
+		clientDisconnected := errors.Is(err, errResponsesWebSocketClientWrite) ||
+			(s.ctx != nil && s.ctx.Err() != nil && errors.Is(err, context.Canceled))
+		if lifecycleCanceled {
+			if s.clientClosePrecedesShutdown(h) {
+				recordDisconnected(0, responsesUsage{}, true)
+			}
+			return err
+		}
+		if clientDisconnected {
+			recordDisconnected(0, responsesUsage{}, s.clientClosePrecedesShutdown(h))
+			return err
+		}
+		status := upstreamStatusCode(err, http.StatusBadGateway)
+		if status == http.StatusBadGateway && errors.Is(err, context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
+		}
+		recordTurn(status, responsesUsage{})
+		if s.isClosing() || h.upstreamShutdownStarted() {
+			return err
+		}
+		if writeErr := s.sendWrappedError(status, fmt.Sprintf("upstream request failed: %v", err), "server_error", nil); writeErr != nil {
+			return writeErr
+		}
 		return err
 	}
-	if translated != nil {
-		code := ""
-		if translated.failure != nil {
-			code = strings.TrimSpace(translated.failure.Response.Error.Code)
+	if peek != nil && peek.decision == responsesPeekDecisionTranslate {
+		code, param := "", ""
+		if peek.failure != nil {
+			streamErr := responsesStreamEventError(*peek.failure)
+			code = strings.TrimSpace(streamErr.Code)
+			param = strings.TrimSpace(streamErr.Param)
 		}
-		s.sendWrappedError(translated.status, translated.message, code, translatedHeaders)
-		// A precommit translated failure (e.g. unsupported-model or rate-limit
-		// surfaced before the stream is handed off) is still a failed turn; count
-		// it so it appears in the dashboard error stats and recent log, matching
-		// the non-200 and stream-error branches below.
-		s.recordTurnStats(h, request.Model, translated.status, responsesUsage{})
+		// Record the classified failure before delivering the client error frame;
+		// a disconnected client must not erase dashboard/provider accounting.
+		usage := responsesUsage{}
+		if peek.failure != nil {
+			usage = peek.failure.Response.Usage
+		}
+		recordTurn(peek.status, usage)
+		if s.isClosing() || h.upstreamShutdownStarted() {
+			return context.Canceled
+		}
+		if writeErr := s.sendWrappedErrorDetails(peek.status, peek.message, peek.errType, code, param, translatedHeaders); writeErr != nil {
+			return writeErr
+		}
 		return nil
 	}
 	if resp == nil {
-		s.sendWrappedError(http.StatusBadGateway, "upstream request failed", "server_error", nil)
+		if terminalStatus, terminalUsage, ok := observedTerminalOutcome(); ok {
+			// A nil prepared response is reserved for inbound cancellation. Retain
+			// the authoritative provider accounting, but never fabricate a lossy
+			// terminal frame or commit replay state without the original stream.
+			recordTurn(terminalStatus, terminalUsage)
+			if s.isClosing() || h.upstreamShutdownStarted() {
+				return context.Canceled
+			}
+			if writeErr := s.sendWrappedError(http.StatusBadGateway, "upstream stream canceled before terminal delivery", "server_error", translatedHeaders); writeErr != nil {
+				return writeErr
+			}
+			return fmt.Errorf("upstream stream canceled before terminal delivery")
+		}
+		if s.isClosing() || h.upstreamShutdownStarted() {
+			recordDisconnected(0, responsesUsage{}, s.clientClosePrecedesShutdown(h))
+			return context.Canceled
+		}
+		if writeErr := s.sendWrappedError(http.StatusBadGateway, "upstream request failed", "server_error", nil); writeErr != nil {
+			return writeErr
+		}
 		return fmt.Errorf("upstream websocket bridge returned no response")
 	}
-	defer func() { _ = resp.Body.Close() }()
+	bodyClosed := false
+	defer func() {
+		if !bodyClosed {
+			_ = resp.Body.Close()
+		}
+	}()
 
 	s.updateTurnState(resp.Header)
 
@@ -658,50 +1360,80 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			respBody = nil
 		}
 		message, code := extractResponsesWebSocketError(resp.StatusCode, respBody)
-		s.sendWrappedError(resp.StatusCode, message, code, resp.Header)
-		s.recordTurnStats(h, request.Model, resp.StatusCode, responsesUsage{})
+		recordTurn(resp.StatusCode, responsesUsage{})
+		if s.isClosing() || h.upstreamShutdownStarted() {
+			return context.Canceled
+		}
+		if writeErr := s.sendWrappedError(resp.StatusCode, message, code, resp.Header); writeErr != nil {
+			return writeErr
+		}
 		return fmt.Errorf("upstream websocket bridge status %d", resp.StatusCode)
 	}
 
-	responseID, outputItems, turnUsage, err := s.streamUpstreamResponse(h, resp.Body, resp.Header)
+	streamResult, err := s.streamUpstreamResponse(h, resp.Body, resp.Header, recordTurn)
 	if err != nil {
-		if isResponsesWebSocketClientDisconnect(s.ctx, err) {
+		if errors.Is(err, errResponsesWebSocketClientWrite) ||
+			(s.ctx != nil && s.ctx.Err() != nil && errors.Is(err, context.Canceled)) {
+			recordDisconnected(0, streamResult.usage, s.clientClosePrecedesShutdown(h))
 			return err
 		}
 		if errors.Is(err, errStreamFailedUpstream) {
-			// The upstream sent response.failed/incomplete; count it as an errored
-			// turn so it shows in the dashboard's error stats and recent log, with
-			// the exact classified status (e.g. 429/503) the client was sent rather
-			// than a generic 502.
-			s.recordTurnStats(h, request.Model, streamFailureStatus(err), responsesUsage{})
+			// Parsed response.failed and top-level error events account themselves before
+			// client delivery, so the outer handler must not record them again.
 			return nil
 		}
-		s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil)
-		s.recordTurnStats(h, request.Model, http.StatusBadGateway, responsesUsage{})
+		if lifecycleBody != nil && lifecycleBody.canceledAtFailure() && errors.Is(context.Cause(upstreamCtx), errProxyLifecycleShutdown) {
+			return err
+		}
+		if terminalStatus, terminalUsage, ok := observedTerminalOutcome(); ok {
+			recordTurn(terminalStatus, terminalUsage)
+		} else {
+			usage := streamResult.usage
+			if usage.isZero() {
+				usage = observedRecoveredUsage()
+			}
+			recordTurn(http.StatusBadGateway, usage)
+		}
+		if s.isClosing() || h.upstreamShutdownStarted() {
+			return err
+		}
+		if writeErr := s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil); writeErr != nil {
+			return writeErr
+		}
 		return err
 	}
+	_ = resp.Body.Close()
+	bodyClosed = true
+	finishUpstream()
 
-	// Record this successful bridge turn into traffic stats. The bridge does not
-	// flow through the HTTP request middleware, so it is recorded directly. Every
-	// completed turn is counted (with whatever usage it carried, possibly zero),
-	// matching the HTTP path's request accounting.
-	s.recordTurnStats(h, request.Model, http.StatusOK, turnUsage)
+	s.rememberPlannedResponse(plan, streamResult.responseID, streamResult.outputItems)
+	var autoCompactionUsage responsesUsage
+	metrics, autoCompactionUsage = s.maybeAutoCompactHistory(h, request, metrics)
+	h.AddResponsesTurnUsage(turnStatsRecord, autoCompactionUsage)
 
-	s.rememberPlannedResponse(plan, responseID, outputItems)
-	metrics = s.maybeAutoCompactHistory(h, request, metrics)
-	s.logRequestMetrics(h, request, responseID, metrics)
+	// streamUpstreamResponse records a structurally valid completion before
+	// client delivery. This is a fallback for implementations that return a
+	// completed result without invoking the callback; the exactly-once guard keeps
+	// it from incrementing request counts twice. Auto-compaction usage was amended
+	// onto the existing record above rather than emitted as a synthetic request.
+	recordTurn(http.StatusOK, streamResult.usage)
+	s.logRequestMetrics(h, request, streamResult.responseID, metrics)
 	return nil
 }
 
 // recordTurnStats records one websocket-bridge turn into traffic stats,
 // resolving the provider for attribution. status is the turn outcome (200 for a
 // completed turn, an error status for a failed one).
-func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model string, status int, usage responsesUsage) {
-	providerID, providerKind := "", ""
-	if provider, _, _ := h.resolveProviderModel(model, providerEndpointResponses); provider != nil {
-		providerID, providerKind = provider.id, string(provider.kind)
+func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model, providerID, providerKind string, status int, usage responsesUsage) responsesTurnStatsRecord {
+	if h == nil {
+		return responsesTurnStatsRecord{}
 	}
-	h.RecordResponsesTurn(model, providerID, providerKind, classifyAgent(s.userAgent), status, usage)
+	if providerID == "" {
+		if provider, _, _ := h.resolveProviderModel(model, providerEndpointResponses); provider != nil {
+			providerID, providerKind = provider.id, string(provider.kind)
+		}
+	}
+	return h.RecordResponsesTurn(model, providerID, providerKind, classifyAgent(s.userAgent), status, usage)
 }
 
 func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) (responsesWebSocketRequestPlan, error) {
@@ -729,13 +1461,13 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 	return plan, nil
 }
 
-func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, plan responsesWebSocketRequestPlan) (*http.Response, bool, bool, error) {
+func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, plan responsesWebSocketRequestPlan, metrics *responsesWebSocketRequestMetrics) (*http.Response, bool, bool, error) {
 	resp, err := s.postCreateRequestSegments(h, ctx, request, plan.upstreamSegments(), plan.useTurnStateDelta)
 	if err != nil || resp == nil {
 		return resp, plan.useTurnStateDelta, false, err
 	}
 	if !plan.useTurnStateDelta {
-		resp, err = s.maybeRetryCompactedCreateRequest(h, ctx, request, resp, true)
+		resp, err = s.maybeRetryCompactedCreateRequest(h, ctx, request, resp, true, metrics)
 		return resp, false, false, err
 	}
 	if resp.StatusCode == http.StatusOK {
@@ -762,7 +1494,7 @@ func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx conte
 	if err != nil || resp == nil {
 		return resp, true, true, err
 	}
-	resp, err = s.maybeRetryCompactedCreateRequest(h, ctx, request, resp, true)
+	resp, err = s.maybeRetryCompactedCreateRequest(h, ctx, request, resp, true, metrics)
 	return resp, true, true, err
 }
 
@@ -771,7 +1503,7 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 	if err != nil {
 		return nil, err
 	}
-	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizers(ctx, bodyBytes, "responses/websocket", true, s.toolContexts, s.toolScope)
+	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, bodyBytes, request.Model, "responses/websocket", true, s.toolContexts, s.toolScope)
 	headers := s.requestHeaders(request, includeTurnState)
 	// The websocket bridge records each turn's usage downstream from the streamed
 	// response body (recordTurnStats), so the per-turn usage total returned here
@@ -779,7 +1511,7 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 	if compactionResp, handled, _, err := h.maybeBuildResponsesCompactionTriggerResponse(ctx, bodyBytes, headers, true); handled || err != nil {
 		return compactionResp, err
 	}
-	return h.postResponsesWithHeaders(ctx, bodyBytes, headers)
+	return h.postResponsesWithHeadersForModel(ctx, bodyBytes, headers, request.Model)
 }
 
 func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCreateRequest, includeTurnState bool) http.Header {
@@ -899,8 +1631,11 @@ func (s *responsesWebSocketSession) rememberPlannedResponse(plan responsesWebSoc
 	s.rememberResponse(resetHistory, responseID, plan.signature, historyInput, outputItems)
 }
 
-func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, request *responsesWebSocketCreateRequest, metrics responsesWebSocketRequestMetrics) responsesWebSocketRequestMetrics {
-	ctx, cancel := h.newInferenceUpstreamContext(true)
+func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, request *responsesWebSocketCreateRequest, metrics responsesWebSocketRequestMetrics) (responsesWebSocketRequestMetrics, responsesUsage) {
+	if s == nil || s.isClosing() || (s.ctx != nil && s.ctx.Err() != nil) {
+		return metrics, responsesUsage{}
+	}
+	ctx, cancel := h.newInferenceUpstreamContext(false)
 	// Mark the compaction upstream context as retry-trackable, like the turn
 	// itself, so retries during auto-compaction are counted in retry stats.
 	ctx = markRetryStatsTracked(ctx)
@@ -909,9 +1644,14 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, req
 		s.clearInflightCancel(inflightGen)
 		cancel()
 	}()
+	if ctx.Err() != nil {
+		return metrics, responsesUsage{}
+	}
 
 	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
 	compaction, compacted, err := s.compactHistory(h, ctx, request, false, budget)
+	autoUsage := budget.usageTotals()
+	metrics.addInternalUsage(autoUsage)
 	if err != nil {
 		h.log.Debug("responses websocket auto-compaction failed",
 			logger.Err(err),
@@ -919,18 +1659,10 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, req
 			logger.F("history_items", len(s.historyItems)),
 			logger.F("history_bytes", s.currentHistoryBytes()),
 		)
-		return metrics
+		return metrics, autoUsage
 	}
 	if !compacted {
-		return metrics
-	}
-
-	// Auto-compaction spends upstream /responses tokens on an internal compact
-	// call that does not flow through the stats middleware. Record that usage as
-	// its own turn so long auto-compacting websocket sessions do not underreport
-	// total Responses token spend.
-	if compactionUsage := budget.usageTotals(); !compactionUsage.isZero() {
-		s.recordTurnStats(h, request.Model, http.StatusOK, compactionUsage)
+		return metrics, autoUsage
 	}
 
 	h.log.Debug("responses websocket auto-compacted history",
@@ -945,10 +1677,10 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, req
 	metrics.compactedFromBytes = compaction.fromBytes
 	metrics.compactedToItems = compaction.toItems
 	metrics.compactedToBytes = compaction.toBytes
-	return metrics
+	return metrics, autoUsage
 }
 
-func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, resp *http.Response, fullReplayUsed bool) (*http.Response, error) {
+func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, resp *http.Response, fullReplayUsed bool, metrics *responsesWebSocketRequestMetrics) (*http.Response, error) {
 	if resp == nil || !fullReplayUsed || resp.StatusCode != http.StatusRequestEntityTooLarge || strings.TrimSpace(request.PreviousResponseID) == "" {
 		return resp, nil
 	}
@@ -965,32 +1697,27 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 		return resp, nil
 	}
 
-	respBody, truncated, err := readBodyWithCap(resp.Body, compactUpstreamErrorBodySize)
-	if err != nil {
-		_ = resp.Body.Close()
-		return nil, err
-	}
+	respBody, truncated, readErr := readBodyWithCapAvailable(resp.Body, compactUpstreamErrorBodySize)
 	_ = resp.Body.Close()
 	lastResp := cloneHTTPResponseWithBody(resp, respBody)
-	if truncated {
+	if truncated || readErr != nil {
 		lastResp.Header.Del("Content-Length")
 		h.log.Debug("truncated initial upstream 413 response body for websocket compact fallback",
 			logger.F("status", resp.StatusCode),
 			logger.F("max_bytes", compactUpstreamErrorBodySize),
+			logger.Err(readErr),
 		)
+	}
+	if readErr != nil {
+		return lastResp, nil
 	}
 
 	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
-	// The 413 oversized-replay fallback spends upstream /responses tokens on
-	// internal compaction calls (accumulated into budget) before retrying the
-	// turn. That spend does not flow through the stats middleware, and the retry
-	// turn's own usage is recorded separately downstream, so record the
-	// compaction usage here as its own turn on every exit path — matching the
-	// auto-compaction path — so 413-fallback sessions do not underreport spend.
+	// The 413 oversized-replay fallback spends upstream /responses tokens before
+	// the retried client turn completes. Preserve that spend on every exit path,
+	// but fold it into the one client-turn stats record in handleCreateRequest.
 	defer func() {
-		if compactionUsage := budget.usageTotals(); !compactionUsage.isZero() {
-			s.recordTurnStats(h, request.Model, http.StatusOK, compactionUsage)
-		}
+		metrics.addInternalUsage(budget.usageTotals())
 	}()
 	for attempt, keepTail := range keepTailSchedule {
 		compactedHistory, compaction, compacted, err := s.compactHistoryItemsWithKeepTail(h, ctx, request, originalHistory, keepTail, budget)
@@ -1035,14 +1762,14 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 			return retryResp, nil
 		}
 
-		retryBody, truncated, readErr := readBodyWithCap(retryResp.Body, compactUpstreamErrorBodySize)
+		retryBody, truncated, readErr := readBodyWithCapAvailable(retryResp.Body, compactUpstreamErrorBodySize)
 		_ = retryResp.Body.Close()
-		if readErr != nil {
-			return nil, readErr
-		}
 		lastResp = cloneHTTPResponseWithBody(retryResp, retryBody)
-		if truncated {
+		if truncated || readErr != nil {
 			lastResp.Header.Del("Content-Length")
+		}
+		if readErr != nil {
+			return lastResp, nil
 		}
 
 		if attempt+1 < len(keepTailSchedule) {
@@ -1172,45 +1899,149 @@ func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *
 	)
 }
 
-func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body io.Reader, headers http.Header) (string, []json.RawMessage, responsesUsage, error) {
+func (s *responsesWebSocketSession) terminalResponseOutputItems(h *ProxyHandler, data string) ([]json.RawMessage, bool) {
+	var envelope struct {
+		Response struct {
+			Output json.RawMessage `json:"output"`
+		} `json:"response"`
+	}
+	if err := json.NewDecoder(strings.NewReader(data)).Decode(&envelope); err != nil || len(envelope.Response.Output) == 0 {
+		return nil, false
+	}
+	var output []json.RawMessage
+	if err := json.Unmarshal(envelope.Response.Output, &output); err != nil || output == nil {
+		return nil, false
+	}
+	items := make([]json.RawMessage, 0, len(output))
+	for _, item := range output {
+		if len(item) == 0 {
+			continue
+		}
+		if h != nil {
+			h.maybeRewriteOrCaptureToolCommandItem(s.ctx, item, s.toolContexts, s.toolScope, false)
+		}
+		items = append(items, cloneRawMessage(item))
+	}
+	return items, true
+}
+
+func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body io.Reader, headers http.Header, recordTerminal func(int, responsesUsage)) (responsesWebSocketStreamResult, error) {
+	var result responsesWebSocketStreamResult
+
 	// Emit a synthetic metadata event so WebSocket clients can discover the
 	// actual model used. The Codex CLI parses openai-model from
 	// codex.response.metadata frames via response_model().
 	if mappedHeaders := responsesWebSocketMetadataHeaders(headers); len(mappedHeaders) > 0 {
-		if err := s.writeJSON(map[string]interface{}{
+		if err := s.writeStreamJSON(map[string]interface{}{
 			"type":    "codex.response.metadata",
 			"headers": mappedHeaders,
 		}); err != nil {
-			return "", nil, responsesUsage{}, &responsesWebSocketClientWriteError{err: err}
+			return result, err
 		}
 	}
 
-	var responseID string
-	var outputItems []json.RawMessage
-	var turnUsage responsesUsage
 	sawCompleted := false
+	sawIncomplete := false
+	completedResponseIDValid := false
+	incompleteResponseIDValid := false
 	sawSemanticEvent := false
 
-	if err := consumeResponsesSSEData(body, func(data string) error {
-		if data == "" || data == "[DONE]" {
+	err := consumeResponsesSSEMessages(body, func(msg responsesSSEMessage) error {
+		data := msg.data
+		if data == "" {
 			return nil
+		}
+		if data == "[DONE]" {
+			return errResponsesWebSocketStreamTerminal
 		}
 
 		var event responsesWebSocketStreamEvent
 		parsedEvent := json.Unmarshal([]byte(data), &event) == nil
+		originalEventType := strings.TrimSpace(event.Type)
+		if parsedEvent && originalEventType == "" {
+			event.Type = strings.TrimSpace(msg.event)
+		}
+		wireData := data
+		if parsedEvent && originalEventType == "" && event.Type != "" {
+			wireData = responsesDataWithEventType(data, event.Type)
+		}
+		failureStatus := 0
+		if parsedEvent && (event.Type == "response.failed" || event.Type == "error") {
+			failureStatus, _, _, _ = responsesWebSocketStreamFailureDetails(event, headers)
+			if failureStatus != 0 {
+				result.usage = event.Response.Usage
+				// Account before forwarding either the upstream failure event or the
+				// standard error payload. Both writes may fail after client disconnect.
+				if recordTerminal != nil {
+					recordTerminal(failureStatus, result.usage)
+				}
+			}
+		}
 		if !sawSemanticEvent {
 			sawSemanticEvent = true
-			if parsedEvent && event.Type == "response.failed" {
-				if status, _, ok := classifyPrecommitResponsesFailure(event); ok {
-					s.sendWrappedError(status, responsesPrecommitErrorMessage(event, status), strings.TrimSpace(event.Response.Error.Code), headers)
-					return &streamFailedUpstreamError{status: status}
+			if parsedEvent && (event.Type == "response.failed" || event.Type == "error") {
+				if status, errType, ok := classifyResponsesFailure(event, headers); ok {
+					failureHeaders := responsesFailureHeaders(event, headers)
+					streamErr := responsesStreamEventError(event)
+					if writeErr := s.sendWrappedErrorDetails(status, responsesPrecommitErrorMessage(event, status), errType, strings.TrimSpace(streamErr.Code), strings.TrimSpace(streamErr.Param), failureHeaders); writeErr != nil {
+						return writeErr
+					}
+					return &streamFailedUpstreamError{status: failureStatus}
 				}
 			}
 		}
 
-		_ = s.conn.SetWriteDeadline(time.Now().Add(responsesWebSocketWriteWait))
-		if err := s.conn.WriteMessage(websocket.TextMessage, []byte(data)); err != nil {
-			return &responsesWebSocketClientWriteError{err: err}
+		if parsedEvent && event.Type == "response.incomplete" {
+			sawIncomplete = true
+			validIncompleteEvent := false
+			if responseID := strings.TrimSpace(event.Response.ID); responseID != "" {
+				result.responseID = responseID
+				incompleteResponseIDValid = true
+				validIncompleteEvent = true
+			}
+			if !event.Response.Usage.isZero() {
+				result.usage = event.Response.Usage
+			}
+			// The terminal snapshot is authoritative and may include partial items
+			// that never received response.output_item.done. A present empty array also
+			// clears incremental items; an absent or invalid field preserves them.
+			if terminalItems, present := s.terminalResponseOutputItems(h, data); present {
+				result.outputItems = terminalItems
+			}
+			if validIncompleteEvent && recordTerminal != nil {
+				// An incomplete provider response is still an authoritative terminal
+				// result with a resumable ID. Account before client delivery so a
+				// disconnect cannot rewrite it as a client-aborted turn.
+				recordTerminal(http.StatusOK, result.usage)
+			}
+		}
+
+		completedEvent := parsedEvent && event.Type == "response.completed"
+		validCompletedEvent := false
+		if completedEvent {
+			sawCompleted = true
+			if responseID := strings.TrimSpace(event.Response.ID); responseID != "" {
+				result.responseID = responseID
+				validCompletedEvent = true
+				completedResponseIDValid = true
+			}
+			if !event.Response.Usage.isZero() {
+				result.usage = event.Response.Usage
+			}
+			if len(result.outputItems) == 0 {
+				if terminalItems, present := s.terminalResponseOutputItems(h, data); present {
+					result.outputItems = terminalItems
+				}
+			}
+			if validCompletedEvent && recordTerminal != nil {
+				// A structurally valid provider completion is authoritative before
+				// client delivery or post-terminal auto-compaction can fail or stall.
+				recordTerminal(http.StatusOK, result.usage)
+			}
+		}
+
+		if err := s.writeStreamTextMessage([]byte(wireData)); err != nil {
+			return err
 		}
 
 		if !parsedEvent {
@@ -1219,50 +2050,53 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 
 		switch event.Type {
 		case "response.created":
-			if responseID == "" && event.Response.ID != "" {
-				responseID = event.Response.ID
+			if result.responseID == "" && event.Response.ID != "" {
+				result.responseID = event.Response.ID
 			}
 		case "response.output_item.done":
 			if len(event.Item) > 0 {
 				if h != nil {
 					h.maybeRewriteOrCaptureToolCommandItem(s.ctx, event.Item, s.toolContexts, s.toolScope, false)
 				}
-				outputItems = append(outputItems, cloneRawMessage(event.Item))
+				result.outputItems = append(result.outputItems, cloneRawMessage(event.Item))
 			}
-		case "response.completed":
-			sawCompleted = true
-			if event.Response.ID != "" {
-				responseID = event.Response.ID
+		case "response.completed", "response.incomplete":
+			return errResponsesWebSocketStreamTerminal
+		case "response.failed", "error":
+			if writeErr := s.sendUpstreamStreamFailure(event, headers); writeErr != nil {
+				return writeErr
 			}
-			if !event.Response.Usage.isZero() {
-				turnUsage = event.Response.Usage
-			}
-		case "response.failed", "response.incomplete":
-			s.sendUpstreamStreamFailure(event, headers)
 			// Return the sentinel immediately to break out of the SSE
 			// scanner loop. The failure event has already been forwarded to
 			// the client above, and we also emit a standard error payload so
 			// websocket clients can surface the upstream error details. Carry the
 			// classified status so the turn is recorded with its exact semantic
 			// status (e.g. 429/503) rather than a generic 502.
-			status, _, _ := responsesWebSocketStreamFailureDetails(event)
-			return &streamFailedUpstreamError{status: status}
+			return &streamFailedUpstreamError{status: failureStatus}
 		}
 
 		return nil
-	}); err != nil && !errors.Is(err, errStreamFailedUpstream) {
-		return "", nil, responsesUsage{}, err
-	} else if errors.Is(err, errStreamFailedUpstream) {
-		return "", nil, responsesUsage{}, err
+	})
+	if errors.Is(err, errStreamFailedUpstream) {
+		return result, err
+	}
+	if err != nil && !errors.Is(err, errResponsesWebSocketStreamTerminal) {
+		return result, err
 	}
 
 	if sawCompleted {
-		if responseID == "" {
-			return "", nil, responsesUsage{}, fmt.Errorf("response.completed missing response id")
+		if !completedResponseIDValid {
+			return result, fmt.Errorf("response.completed missing response id")
 		}
-		return responseID, outputItems, turnUsage, nil
+		return result, nil
 	}
-	return "", nil, responsesUsage{}, fmt.Errorf("stream ended before response.completed")
+	if sawIncomplete {
+		if !incompleteResponseIDValid {
+			return result, fmt.Errorf("response.incomplete missing response id")
+		}
+		return result, nil
+	}
+	return result, fmt.Errorf("stream ended before response.completed or response.incomplete")
 }
 
 func (s *responsesWebSocketSession) writeJSON(payload interface{}) error {
@@ -1270,19 +2104,57 @@ func (s *responsesWebSocketSession) writeJSON(payload interface{}) error {
 	if err != nil {
 		return err
 	}
-	_ = s.conn.SetWriteDeadline(time.Now().Add(responsesWebSocketWriteWait))
-	return s.conn.WriteMessage(websocket.TextMessage, encoded)
+	return s.writeTextMessage(encoded)
 }
 
-func (s *responsesWebSocketSession) sendUpstreamStreamFailure(event responsesWebSocketStreamEvent, headers http.Header) {
-	status, message, code := responsesWebSocketStreamFailureDetails(event)
-	if status == 0 || strings.TrimSpace(message) == "" {
-		return
+func (s *responsesWebSocketSession) writeStreamJSON(payload interface{}) error {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
 	}
-	s.sendWrappedError(status, message, code, headers)
+	return s.writeStreamTextMessage(encoded)
 }
 
-func (s *responsesWebSocketSession) sendWrappedError(status int, message, code string, headers http.Header) {
+func (s *responsesWebSocketSession) writeStreamTextMessage(payload []byte) error {
+	if s == nil || s.conn == nil {
+		return &responsesWebSocketClientWriteError{err: net.ErrClosed}
+	}
+	_ = s.conn.SetWriteDeadline(time.Now().Add(s.effectiveWriteWait()))
+	if err := s.conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+		s.beginClosingForStreamWriteFailure()
+		s.hardClose()
+		return &responsesWebSocketClientWriteError{err: err}
+	}
+	return nil
+}
+
+func (s *responsesWebSocketSession) writeTextMessage(payload []byte) error {
+	if s == nil || s.conn == nil {
+		return &responsesWebSocketClientWriteError{err: net.ErrClosed}
+	}
+	_ = s.conn.SetWriteDeadline(time.Now().Add(s.effectiveWriteWait()))
+	if err := s.conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+		s.beginClosing()
+		s.hardClose()
+		return &responsesWebSocketClientWriteError{err: err}
+	}
+	return nil
+}
+
+func (s *responsesWebSocketSession) sendUpstreamStreamFailure(event responsesWebSocketStreamEvent, headers http.Header) error {
+	headers = responsesFailureHeaders(event, headers)
+	status, message, code, errType := responsesWebSocketStreamFailureDetails(event, headers)
+	if status == 0 || strings.TrimSpace(message) == "" {
+		return nil
+	}
+	return s.sendWrappedErrorDetails(status, message, errType, code, strings.TrimSpace(responsesStreamEventError(event).Param), headers)
+}
+
+func (s *responsesWebSocketSession) sendWrappedError(status int, message, code string, headers http.Header) error {
+	return s.sendWrappedErrorDetails(status, message, "", code, "", headers)
+}
+
+func (s *responsesWebSocketSession) sendWrappedErrorDetails(status int, message, errType, code, param string, headers http.Header) error {
 	payload := map[string]interface{}{
 		"type":        "error",
 		"status_code": status,
@@ -1293,37 +2165,85 @@ func (s *responsesWebSocketSession) sendWrappedError(status int, message, code s
 	if code != "" {
 		payload["error"].(map[string]interface{})["code"] = code
 	}
+	if errType != "" {
+		payload["error"].(map[string]interface{})["type"] = errType
+	}
+	if param != "" {
+		payload["error"].(map[string]interface{})["param"] = param
+	}
+	headers = responsesWebSocketErrorHeaders(status, headers)
 	if mappedHeaders := flattenResponsesWebSocketHeaders(headers); len(mappedHeaders) > 0 {
 		payload["headers"] = mappedHeaders
 	}
-	_ = s.writeJSON(payload)
+	return s.writeJSON(payload)
+}
+
+func responsesDataWithEventType(data, eventType string) string {
+	var object map[string]json.RawMessage
+	if json.Unmarshal([]byte(data), &object) != nil || object == nil {
+		return data
+	}
+	encodedType, _ := json.Marshal(eventType)
+	object["type"] = encodedType
+	encoded, err := json.Marshal(object)
+	if err != nil {
+		return data
+	}
+	return string(encoded)
 }
 
 func consumeResponsesSSEData(body io.Reader, onData func(string) error) error {
+	return consumeResponsesSSEMessages(body, func(msg responsesSSEMessage) error {
+		return onData(msg.data)
+	})
+}
+
+func consumeResponsesSSEMessages(body io.Reader, onMessage func(responsesSSEMessage) error) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, openAIStreamScannerInitialBuffer), openAIStreamScannerMaxBuffer)
 
+	var eventName string
 	var dataLines []string
+	firstLine := true
 	dispatch := func() error {
-		if len(dataLines) == 0 {
+		if len(dataLines) == 0 && strings.TrimSpace(eventName) == "" {
 			return nil
 		}
-		data := strings.Join(dataLines, "\n")
+		msg := responsesSSEMessage{
+			event:    eventName,
+			data:     strings.Join(dataLines, "\n"),
+			semantic: len(dataLines) > 0 || strings.TrimSpace(eventName) != "",
+		}
+		eventName = ""
 		dataLines = dataLines[:0]
-		return onData(data)
+		return onMessage(msg)
 	}
 
 	for scanner.Scan() {
-		line := scanner.Text()
-		switch {
-		case line == "":
+		line := strings.TrimSuffix(scanner.Text(), "\r")
+		if firstLine {
+			line = strings.TrimPrefix(line, "\uFEFF")
+			firstLine = false
+		}
+		if line == "" {
 			if err := dispatch(); err != nil {
 				return err
 			}
-		case strings.HasPrefix(line, "data:"):
-			data := strings.TrimPrefix(line, "data:")
-			data = strings.TrimPrefix(data, " ")
-			dataLines = append(dataLines, data)
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		field, value := line, ""
+		if colon := strings.IndexByte(line, ':'); colon >= 0 {
+			field = line[:colon]
+			value = strings.TrimPrefix(line[colon+1:], " ")
+		}
+		switch field {
+		case "event":
+			eventName = value
+		case "data":
+			dataLines = append(dataLines, value)
 		}
 	}
 
@@ -1362,54 +2282,75 @@ func extractResponsesWebSocketError(status int, body []byte) (string, string) {
 	return http.StatusText(status), ""
 }
 
-func responsesWebSocketStreamFailureDetails(event responsesWebSocketStreamEvent) (int, string, string) {
+func responsesWebSocketStreamFailureDetails(event responsesWebSocketStreamEvent, headers http.Header) (int, string, string, string) {
 	switch event.Type {
-	case "response.failed":
-		if status, _, ok := classifyPrecommitResponsesFailure(event); ok {
+	case "response.failed", "error":
+		if status, errType, ok := classifyResponsesFailure(event, headers); ok {
 			message := responsesPrecommitErrorMessage(event, status)
-			return status, message, strings.TrimSpace(event.Response.Error.Code)
+			return status, message, strings.TrimSpace(responsesStreamEventError(event).Code), errType
 		}
-		errType := strings.TrimSpace(event.Response.Error.Type)
-		code := strings.TrimSpace(event.Response.Error.Code)
-		message := strings.TrimSpace(event.Response.Error.Message)
+		streamErr := responsesStreamEventError(event)
+		errType := strings.TrimSpace(streamErr.Type)
+		code := strings.TrimSpace(streamErr.Code)
+		message := strings.TrimSpace(streamErr.Message)
 		if message == "" {
 			if code != "" {
 				message = code
+			} else if event.Type == "error" {
+				message = "upstream error event"
 			} else {
 				message = "upstream response.failed"
 			}
 		}
-		return responsesWebSocketErrorStatus(errType), message, code
+		return responsesWebSocketErrorStatus(errType), message, code, errType
 	case "response.incomplete":
 		reason := strings.TrimSpace(event.Response.IncompleteDetails.Reason)
 		if reason == "" {
-			return http.StatusConflict, "upstream response.incomplete", "response_incomplete"
+			return http.StatusConflict, "upstream response.incomplete", "response_incomplete", "conflict_error"
 		}
-		return http.StatusConflict, "upstream response.incomplete: " + reason, reason
+		return http.StatusConflict, "upstream response.incomplete: " + reason, reason, "conflict_error"
 	default:
-		return 0, "", ""
+		return 0, "", "", ""
 	}
 }
 
 func responsesWebSocketErrorStatus(errType string) int {
-	switch strings.TrimSpace(errType) {
-	case "invalid_request_error":
+	switch strings.ToLower(strings.TrimSpace(errType)) {
+	case "invalid_request_error", "user_error":
 		return http.StatusBadRequest
 	case "authentication_error":
 		return http.StatusUnauthorized
-	case "permission_error":
+	case "permission_error", "forbidden":
 		return http.StatusForbidden
 	case "not_found_error":
 		return http.StatusNotFound
 	case "conflict_error":
 		return http.StatusConflict
-	case "rate_limit_error":
+	case "rate_limit_error", "too_many_requests":
 		return http.StatusTooManyRequests
 	case "server_error":
 		return http.StatusInternalServerError
 	default:
 		return http.StatusBadGateway
 	}
+}
+
+func responsesWebSocketErrorHeaders(status int, headers http.Header) http.Header {
+	if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable && status != http.StatusGatewayTimeout {
+		return headers
+	}
+	// selectResponsesRetryAfter centralizes Retry-After normalization and clamping.
+	retryAfter, _ := selectResponsesRetryAfter(headers)
+	if retryAfter == "" {
+		return headers
+	}
+	result := headers.Clone()
+	if result == nil {
+		result = make(http.Header)
+	}
+	deleteHeaderCI(result, "Retry-After")
+	result.Set("Retry-After", retryAfter)
+	return result
 }
 
 func flattenResponsesWebSocketHeaders(headers http.Header) map[string]interface{} {

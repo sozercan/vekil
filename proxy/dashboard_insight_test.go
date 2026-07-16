@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -186,6 +188,77 @@ func TestHandleDashboardInsightNotConfigured(t *testing.T) {
 	}
 	if out.Error == "" {
 		t.Fatal("expected an error message when no model configured")
+	}
+}
+
+func TestDashboardInsightWorkerIsJoinedDuringShutdown(t *testing.T) {
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	h.providersConfig.InsightModel = "gpt-5"
+
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	h.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		close(started)
+		<-req.Context().Done()
+		close(canceled)
+		<-release
+		return nil, req.Context().Err()
+	})}
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/insight", strings.NewReader(`{"shown":""}`)).WithContext(requestCtx)
+	w := httptest.NewRecorder()
+	handlerDone := make(chan struct{})
+	go func() {
+		defer close(handlerDone)
+		h.HandleDashboardInsight(w, req)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for insight worker")
+	}
+	cancelRequest()
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("outer insight handler did not return after client cancellation")
+	}
+
+	h.BeginShutdown()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not cancel detached insight worker")
+	}
+
+	waitDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		waitDone <- h.WaitLifecycleWorkers(ctx)
+	}()
+	select {
+	case err := <-waitDone:
+		t.Fatalf("WaitLifecycleWorkers() returned before worker cleanup: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("WaitLifecycleWorkers() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitLifecycleWorkers() did not observe worker completion")
 	}
 }
 

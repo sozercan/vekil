@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -76,20 +77,55 @@ func BenchmarkResponsesTransportWSSCold(b *testing.B) {
 }
 
 func BenchmarkResponsesSessionHTTPSFullReplayLongHistoryWarm(b *testing.B) {
+	benchmarkResponsesSessionHTTPSFullReplayLongHistoryWarm(b, false)
+}
+
+func BenchmarkResponsesSessionHTTPSFullReplayLongHistoryToolOptimizerWarm(b *testing.B) {
+	benchmarkResponsesSessionHTTPSFullReplayLongHistoryWarm(b, true)
+}
+
+func BenchmarkResponsesSessionHTTPSFullReplayToolHistoryToolOptimizerWarm(b *testing.B) {
+	history := benchmarkResponsesToolHistory(b, 100, 256, false)
+	benchmarkResponsesSessionHTTPSBodyWarm(b, marshalBenchmarkResponsesPOSTRequest(b, history), true)
+}
+
+func BenchmarkResponsesSessionHTTPSFullReplayToolHistoryMetadataToolOptimizerWarm(b *testing.B) {
+	history := benchmarkResponsesToolHistory(b, 100, 256, true)
+	benchmarkResponsesSessionHTTPSBodyWarm(b, marshalBenchmarkResponsesPOSTRequest(b, history), true)
+}
+
+func benchmarkResponsesSessionHTTPSFullReplayLongHistoryWarm(b *testing.B, enableToolOptimizer bool) {
 	fixtures := newResponsesSessionBenchmarkFixtures(b)
-	env := newResponsesTransportBenchmarkEnvWithHandler(b, newTestProxyHandler(b, func(w http.ResponseWriter, r *http.Request) {
+	benchmarkResponsesSessionHTTPSBodyWarm(b, fixtures.fullReplayPOSTBody, enableToolOptimizer)
+}
+
+func benchmarkResponsesSessionHTTPSBodyWarm(b *testing.B, requestBody []byte, enableToolOptimizer bool) {
+	handler := newTestProxyHandler(b, func(w http.ResponseWriter, r *http.Request) {
 		discardBenchmarkRequestBody(b, r)
 		writeBenchmarkResponsesStream(b, w, "")
-	}))
+	})
+	if enableToolOptimizer {
+		handler.toolOptimizers = NewToolOptimizerManager(ToolOptimizersConfig{
+			Enabled: true,
+			CommandRewrite: ToolOptimizerRewriteConfig{
+				Enabled: true,
+			},
+			OutputReduce: ToolOptimizerOutputConfig{
+				Enabled: true,
+			},
+		}, nil)
+		handler.toolContexts = NewToolExecutionContextStore()
+	}
+	env := newResponsesTransportBenchmarkEnvWithHandler(b, handler)
 	client := newResponsesTransportHTTPClient(b, env.proxyServer, false)
 
-	totalBytes := 2*len(fixtures.fullReplayPOSTBody) + 2*len(benchmarkResponsesStreamingSSE)
+	totalBytes := 2*len(requestBody) + 2*len(benchmarkResponsesStreamingSSE)
 	b.ReportAllocs()
 	b.SetBytes(int64(totalBytes))
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		req, err := http.NewRequest(http.MethodPost, env.proxyServer.URL+"/v1/responses", bytes.NewReader(fixtures.fullReplayPOSTBody))
+		req, err := http.NewRequest(http.MethodPost, env.proxyServer.URL+"/v1/responses", bytes.NewReader(requestBody))
 		if err != nil {
 			b.Fatalf("create long-history HTTPS request: %v", err)
 		}
@@ -479,6 +515,56 @@ func discardBenchmarkRequestBody(b *testing.B, r *http.Request) {
 	if err := r.Body.Close(); err != nil {
 		b.Fatalf("close benchmark request body: %v", err)
 	}
+}
+
+func benchmarkResponsesToolHistory(b *testing.B, turns, payloadSize int, includeMetadata bool) []json.RawMessage {
+	b.Helper()
+
+	history := make([]json.RawMessage, 0, turns*4)
+	for i := 0; i < turns; i++ {
+		callID := fmt.Sprintf("call-bench-%03d", i)
+		history = append(history, marshalBenchmarkResponsesHistoryMessage(b, "user", fmt.Sprintf("run command %03d", i), i, includeMetadata))
+		history = append(history, marshalBenchmarkResponsesItem(b, map[string]interface{}{
+			"type":      "function_call",
+			"name":      "shell_command",
+			"call_id":   callID,
+			"arguments": fmt.Sprintf(`{"command":"printf %03d"}`, i),
+		}))
+		history = append(history, marshalBenchmarkResponsesItem(b, map[string]interface{}{
+			"type":    "function_call_output",
+			"call_id": callID,
+			"output":  strings.Repeat("x", payloadSize),
+		}))
+		history = append(history, marshalBenchmarkResponsesHistoryMessage(b, "assistant", fmt.Sprintf("command %03d complete", i), i, includeMetadata))
+	}
+	return history
+}
+
+func marshalBenchmarkResponsesHistoryMessage(b *testing.B, role, text string, index int, includeMetadata bool) json.RawMessage {
+	b.Helper()
+	item := map[string]interface{}{
+		"type": "message",
+		"role": role,
+		"content": []map[string]string{{
+			"type": "input_text",
+			"text": text,
+		}},
+	}
+	if includeMetadata {
+		item[responsesInternalChatMessageMetadataPassthroughField] = map[string]interface{}{
+			"turn_id": fmt.Sprintf("turn-bench-%03d", index),
+		}
+	}
+	return marshalBenchmarkResponsesItem(b, item)
+}
+
+func marshalBenchmarkResponsesItem(b *testing.B, item map[string]interface{}) json.RawMessage {
+	b.Helper()
+	encoded, err := json.Marshal(item)
+	if err != nil {
+		b.Fatalf("marshal benchmark responses item: %v", err)
+	}
+	return encoded
 }
 
 func marshalBenchmarkResponsesPOSTRequest(b *testing.B, input []json.RawMessage) []byte {

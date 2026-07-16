@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -98,17 +99,18 @@ type ProviderConfig struct {
 // ProviderModelConfig maps a public model ID exposed by this proxy to the
 // upstream model or deployment name used by the provider.
 type ProviderModelConfig struct {
-	PublicID            string   `json:"public_id" yaml:"public_id"`
-	Deployment          string   `json:"deployment,omitempty" yaml:"deployment,omitempty"`
-	Name                string   `json:"name,omitempty" yaml:"name,omitempty"`
-	Endpoints           []string `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
-	ModelPickerEnabled  *bool    `json:"model_picker_enabled,omitempty" yaml:"model_picker_enabled,omitempty"`
-	ModelPickerCategory string   `json:"model_picker_category,omitempty" yaml:"model_picker_category,omitempty"`
-	ReasoningEffort     []string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
-	Vision              *bool    `json:"vision,omitempty" yaml:"vision,omitempty"`
-	ParallelToolCalls   *bool    `json:"parallel_tool_calls,omitempty" yaml:"parallel_tool_calls,omitempty"`
-	DropSamplingParams  *bool    `json:"drop_sampling_params,omitempty" yaml:"drop_sampling_params,omitempty"`
-	ContextWindow       *int64   `json:"context_window,omitempty" yaml:"context_window,omitempty"`
+	PublicID               string   `json:"public_id" yaml:"public_id"`
+	Deployment             string   `json:"deployment,omitempty" yaml:"deployment,omitempty"`
+	Name                   string   `json:"name,omitempty" yaml:"name,omitempty"`
+	Endpoints              []string `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
+	ModelPickerEnabled     *bool    `json:"model_picker_enabled,omitempty" yaml:"model_picker_enabled,omitempty"`
+	ModelPickerCategory    string   `json:"model_picker_category,omitempty" yaml:"model_picker_category,omitempty"`
+	ReasoningEffort        []string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
+	Vision                 *bool    `json:"vision,omitempty" yaml:"vision,omitempty"`
+	ParallelToolCalls      *bool    `json:"parallel_tool_calls,omitempty" yaml:"parallel_tool_calls,omitempty"`
+	DropSamplingParams     *bool    `json:"drop_sampling_params,omitempty" yaml:"drop_sampling_params,omitempty"`
+	UseMaxCompletionTokens *bool    `json:"use_max_completion_tokens,omitempty" yaml:"use_max_completion_tokens,omitempty"`
+	ContextWindow          *int64   `json:"context_window,omitempty" yaml:"context_window,omitempty"`
 }
 
 type providerRuntime struct {
@@ -144,14 +146,15 @@ type providerEndpointPaths struct {
 }
 
 type providerModel struct {
-	publicID           string
-	upstreamModel      string
-	providerID         string
-	supportedEndpoints []string
-	parallelToolCalls  *bool
-	dropSamplingParams bool
-	disabled           bool
-	raw                json.RawMessage
+	publicID               string
+	upstreamModel          string
+	providerID             string
+	supportedEndpoints     []string
+	parallelToolCalls      *bool
+	dropSamplingParams     bool
+	useMaxCompletionTokens bool
+	disabled               bool
+	raw                    json.RawMessage
 }
 
 type providerSetup struct {
@@ -249,12 +252,30 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".yaml", ".yml":
-		if err := yaml.Unmarshal(body, cfg); err != nil {
+		decoder := yaml.NewDecoder(bytes.NewReader(body))
+		decoder.KnownFields(true)
+		if err := decoder.Decode(cfg); err != nil {
 			return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
 		}
+		var extra interface{}
+		if err := decoder.Decode(&extra); err != io.EOF {
+			if err != nil {
+				return fmt.Errorf("decode providers config %q as YAML: trailing document: %w", path, err)
+			}
+			return fmt.Errorf("decode providers config %q as YAML: more than one YAML document", path)
+		}
 	default:
-		if err := json.Unmarshal(body, cfg); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(cfg); err != nil {
 			return fmt.Errorf("decode providers config %q as JSON: %w", path, err)
+		}
+		var extra interface{}
+		if err := decoder.Decode(&extra); err != io.EOF {
+			if err != nil {
+				return fmt.Errorf("decode providers config %q as JSON: trailing value: %w", path, err)
+			}
+			return fmt.Errorf("decode providers config %q as JSON: more than one JSON value", path)
 		}
 	}
 	return nil
@@ -411,7 +432,7 @@ func (h *ProxyHandler) initializeProviders() error {
 		return err
 	}
 	h.providersState = setup
-	h.dynamicProviderValidationPending.Store(h.deferDynamicProviderModelRefresh && len(setup.providers) > 1 && hasDynamicProvider(setup.providers))
+	h.dynamicProviderValidationPending.Store(h.deferDynamicProviderModelRefresh && needsDynamicProviderModelValidation(setup.providers))
 	return nil
 }
 
@@ -433,7 +454,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 		hasConfiguredState: true,
 	}
 
-	needsDynamicModelValidation := len(providers) > 1 && hasDynamicProvider(providers)
+	needsDynamicModelValidation := needsDynamicProviderModelValidation(providers)
 
 	if !needsDynamicModelValidation || !validateDynamicModels {
 		for _, providerID := range providerOrder {
@@ -477,7 +498,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 // model-map updates are applied through providerSetup's locked replacement path.
 func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error {
 	setup := h.providerSetup()
-	if setup == nil || !setup.hasConfiguredState || len(setup.providers) <= 1 || !hasDynamicProvider(setup.providers) {
+	if setup == nil || !setup.hasConfiguredState || !needsDynamicProviderModelValidation(setup.providers) {
 		h.dynamicProviderValidationPending.Store(false)
 		return nil
 	}
@@ -919,13 +940,18 @@ func filterProviderModels(provider *providerRuntime, models []providerModel) []p
 	return filtered
 }
 
-func hasDynamicProvider(providers map[string]*providerRuntime) bool {
+func needsDynamicProviderModelValidation(providers map[string]*providerRuntime) bool {
+	multipleProviders := len(providers) > 1
 	for _, provider := range providers {
-		if providerUsesDynamicModels(provider) {
+		if providerUsesDynamicModels(provider) && (multipleProviders || providerHasModelFilters(provider)) {
 			return true
 		}
 	}
 	return false
+}
+
+func providerHasModelFilters(provider *providerRuntime) bool {
+	return provider != nil && (len(provider.includeModels) > 0 || len(provider.excludeModels) > 0)
 }
 
 func providerUsesDynamicModels(provider *providerRuntime) bool {
@@ -1003,13 +1029,14 @@ func buildStaticProviderModel(providerID string, cfg ProviderModelConfig, defaul
 	}
 
 	return providerModel{
-		publicID:           publicID,
-		upstreamModel:      upstreamModel,
-		providerID:         providerID,
-		supportedEndpoints: endpoints,
-		parallelToolCalls:  cloneBoolPtr(cfg.ParallelToolCalls),
-		dropSamplingParams: cfg.DropSamplingParams != nil && *cfg.DropSamplingParams,
-		raw:                raw,
+		publicID:               publicID,
+		upstreamModel:          upstreamModel,
+		providerID:             providerID,
+		supportedEndpoints:     endpoints,
+		parallelToolCalls:      cloneBoolPtr(cfg.ParallelToolCalls),
+		dropSamplingParams:     cfg.DropSamplingParams != nil && *cfg.DropSamplingParams,
+		useMaxCompletionTokens: cfg.UseMaxCompletionTokens != nil && *cfg.UseMaxCompletionTokens,
+		raw:                    raw,
 	}, nil
 }
 
@@ -1162,6 +1189,20 @@ func (h *ProxyHandler) resolveProviderModel(model, endpoint string) (*providerRu
 	}, false
 }
 
+func (h *ProxyHandler) resolveProviderModelForRequest(model, endpoint string) (*providerRuntime, providerModel, bool) {
+	rawModel := strings.TrimSpace(model)
+	rawProvider, rawOwner, rawKnown := h.resolveProviderModel(rawModel, endpoint)
+	if rawKnown || endpoint != providerEndpointMessages {
+		return rawProvider, rawOwner, rawKnown
+	}
+
+	normalizedModel := NormalizeModelName(rawModel)
+	if normalizedModel == rawModel {
+		return rawProvider, rawOwner, false
+	}
+	return h.resolveProviderModel(normalizedModel, endpoint)
+}
+
 func providerModelSupportsEndpoint(model providerModel, endpoint string) bool {
 	if len(model.supportedEndpoints) == 0 {
 		return true
@@ -1170,23 +1211,17 @@ func providerModelSupportsEndpoint(model providerModel, endpoint string) bool {
 }
 
 func rewriteRequestModelForProvider(body []byte, upstreamModel string) ([]byte, bool, error) {
+	return rewriteRequestModelForProviderFromModel(body, extractResponsesRequestModel(body), upstreamModel)
+}
+
+func rewriteRequestModelForProviderFromModel(body []byte, currentModel string, upstreamModel string) ([]byte, bool, error) {
 	upstreamModel = strings.TrimSpace(upstreamModel)
 	if upstreamModel == "" {
 		return body, false, nil
 	}
 
-	current := extractResponsesRequestModel(body)
-	if current == "" {
-		var payload struct {
-			Model string `json:"model"`
-		}
-		if err := json.Unmarshal(body, &payload); err != nil {
-			return body, false, nil
-		}
-		current = strings.TrimSpace(payload.Model)
-	}
-
-	if current == "" || current == upstreamModel {
+	currentModel = strings.TrimSpace(currentModel)
+	if currentModel == "" || currentModel == upstreamModel {
 		return body, false, nil
 	}
 	return rewriteResponsesRequestModel(body, upstreamModel)
@@ -1433,7 +1468,61 @@ func applyGenericProviderAuth(req *http.Request, provider *providerRuntime) erro
 	}
 }
 
+type providerRouteContextKey struct{}
+type providerRouteObserverContextKey struct{}
+
+type providerRouteInfo struct {
+	id   string
+	kind string
+}
+
+type providerRouteObserver struct {
+	mu    sync.Mutex
+	route providerRouteInfo
+}
+
+func withProviderRouteObserver(ctx context.Context) (context.Context, *providerRouteObserver) {
+	observer := &providerRouteObserver{}
+	return context.WithValue(ctx, providerRouteObserverContextKey{}, observer), observer
+}
+
+func publishProviderRoute(ctx context.Context, route providerRouteInfo) {
+	if ctx == nil || route.id == "" {
+		return
+	}
+	observer, _ := ctx.Value(providerRouteObserverContextKey{}).(*providerRouteObserver)
+	if observer == nil {
+		return
+	}
+	observer.mu.Lock()
+	observer.route = route
+	observer.mu.Unlock()
+}
+
+func (o *providerRouteObserver) snapshot() (providerRouteInfo, bool) {
+	if o == nil {
+		return providerRouteInfo{}, false
+	}
+	o.mu.Lock()
+	route := o.route
+	o.mu.Unlock()
+	return route, route.id != ""
+}
+
+func providerRouteFromResponse(resp *http.Response) (providerRouteInfo, bool) {
+	if resp == nil || resp.Request == nil {
+		return providerRouteInfo{}, false
+	}
+	route, ok := resp.Request.Context().Value(providerRouteContextKey{}).(providerRouteInfo)
+	return route, ok && route.id != ""
+}
+
 func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
+	route := providerRouteInfo{id: provider.id, kind: string(provider.kind)}
+	// Route selection has already happened before URL construction or provider
+	// authentication. Publish it now so failures in either step retain the actual
+	// provider attribution even if the dynamic model catalog changes afterward.
+	publishProviderRoute(ctx, route)
 	fullURL, err := h.providerRequestURL(provider, path, extraQuery, owners...)
 	if err != nil {
 		return nil, err
@@ -1444,6 +1533,7 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 		bodyReader = bytes.NewReader(body)
 	}
 
+	ctx = context.WithValue(ctx, providerRouteContextKey{}, route)
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
 	if err != nil {
 		return nil, err
@@ -1473,6 +1563,9 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 			return h.newProviderJSONRequest(ctx, provider, http.MethodGet, "/models", nil, nil, "")
 		})
 		if err != nil {
+			if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) {
+				return providerModelsFetchResult{}, ctxErr
+			}
 			return providerModelsFetchResult{models: models}, nil
 		}
 		defer drainAndClose(resp.Body)
@@ -1480,7 +1573,14 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 			return providerModelsFetchResult{models: models}, nil
 		}
 
-		body, err := io.ReadAll(resp.Body)
+		bodyReader := newLifecycleAwareReadCloser(resp.Body, ctx)
+		body, err := readProviderModelCatalogBody(bodyReader)
+		if bodyReader.canceledAtFailure() {
+			if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) {
+				return providerModelsFetchResult{}, ctxErr
+			}
+			return providerModelsFetchResult{models: models}, nil
+		}
 		if err != nil {
 			return providerModelsFetchResult{models: models}, nil
 		}
@@ -1536,7 +1636,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 			}
 		}
 
-		body, err := io.ReadAll(resp.Body)
+		body, err := readProviderModelCatalogBody(resp.Body)
 		if err != nil {
 			return providerModelsFetchResult{}, err
 		}
@@ -1545,7 +1645,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 		if err != nil {
 			return providerModelsFetchResult{}, err
 		}
-		result.models = models
+		result.models = filterProviderModels(provider, models)
 		return result, nil
 	case providerTypeOpenAICodex:
 		modelsQuery := openAICodexModelsRawQuery(rawQuery)
@@ -1577,7 +1677,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 			}
 		}
 
-		body, err := io.ReadAll(resp.Body)
+		body, err := readProviderModelCatalogBody(resp.Body)
 		if err != nil {
 			return providerModelsFetchResult{}, err
 		}
@@ -1621,7 +1721,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 			}
 		}
 
-		body, err := io.ReadAll(resp.Body)
+		body, err := readProviderModelCatalogBody(resp.Body)
 		if err != nil {
 			return providerModelsFetchResult{}, err
 		}
@@ -1861,9 +1961,6 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 		if publicID == "" {
 			continue
 		}
-		if !provider.allowsModel(publicID) {
-			continue
-		}
 		if provider.modelDiscovery == providerModelDiscoveryOpenRouterTools && !openRouterModelSupportsTools(parsed.SupportedParams) {
 			continue
 		}
@@ -1926,8 +2023,11 @@ func openRouterModelSupportsTools(supportedParams []string) bool {
 }
 
 func mergeDiscoveredProviderModelsWithStaticConfig(provider *providerRuntime, discovered []providerModel) []providerModel {
-	if provider == nil || len(discovered) == 0 || len(provider.staticConfigs) == 0 {
+	if provider == nil {
 		return discovered
+	}
+	if len(discovered) == 0 || len(provider.staticConfigs) == 0 {
+		return filterProviderModels(provider, discovered)
 	}
 
 	merged := make([]providerModel, 0, len(discovered))
@@ -1951,7 +2051,7 @@ func mergeDiscoveredProviderModelsWithStaticConfig(provider *providerRuntime, di
 			merged = append(merged, staticModel)
 		}
 	}
-	return merged
+	return filterProviderModels(provider, merged)
 }
 
 func staticConfigsForDiscoveredProviderModel(provider *providerRuntime, model providerModel) []ProviderModelConfig {
@@ -2005,10 +2105,6 @@ func decodeOllamaModelsFromBody(provider *providerRuntime, body []byte) ([]provi
 		if _, duplicate := seen[publicID]; duplicate {
 			continue
 		}
-		if !provider.allowsModel(publicID) {
-			continue
-		}
-
 		cfg := ProviderModelConfig{
 			PublicID:  publicID,
 			Name:      publicID,

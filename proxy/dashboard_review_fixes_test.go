@@ -113,7 +113,7 @@ func TestHandleDashboardInsightRejectsCrossSite(t *testing.T) {
 // marker: a marked (tracked) context counts, an unmarked one (insight call,
 // model-catalog fetch, count-token probe, proxy shim) does not. The marker is a
 // positive allow-signal rather than an exclusion signal because the upstream
-// request context is rebuilt from context.Background(), which strips any
+// request context is rebuilt from the proxy lifecycle root, which strips any
 // exclusion marker set on the inbound request.
 func TestLogRetryAttemptCountsOnlyTrackedRequests(t *testing.T) {
 	h := &ProxyHandler{stats: newStatsCollector()}
@@ -135,7 +135,8 @@ func TestLogRetryAttemptCountsOnlyTrackedRequests(t *testing.T) {
 // TestNewInferenceUpstreamContextPropagatesTrackedMarker covers that the upstream
 // context inherits the retry-stats marker from a tracked inbound context (so
 // retries are counted) but not from an unmarked one (so insight / catalog /
-// probe retries stay uncounted) — the background root would otherwise strip it.
+// probe retries stay uncounted) — the detached lifecycle root would otherwise
+// strip it.
 func TestNewInferenceUpstreamContextPropagatesTrackedMarker(t *testing.T) {
 	h := &ProxyHandler{}
 
@@ -534,11 +535,41 @@ func TestResponsesWebSocketStreamFailureDetailsStatus(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			status, _, _ := responsesWebSocketStreamFailureDetails(tc.event)
+			status, _, _, _ := responsesWebSocketStreamFailureDetails(tc.event, nil)
 			if status != tc.want {
 				t.Fatalf("status = %d want %d", status, tc.want)
 			}
 		})
+	}
+}
+
+func TestResponsesWebSocketStreamFailureDetailsUsesQuotaHeadersForUncodedFailure(t *testing.T) {
+	var event responsesWebSocketStreamEvent
+	event.Type = "response.failed"
+	event.Response.Error.Message = "Your requests have exceeded rate limit."
+	headers := http.Header{
+		"retry-after-ms":               []string{"2169"},
+		"x-ratelimit-remaining-tokens": []string{"-36161"},
+	}
+	status, message, code, _ := responsesWebSocketStreamFailureDetails(event, headers)
+	if status != http.StatusTooManyRequests || message != event.Response.Error.Message || code != "" {
+		t.Fatalf("failure details = (%d, %q, %q), want (429, %q, empty)", status, message, code, event.Response.Error.Message)
+	}
+}
+
+func TestResponsesWebSocketStreamFailureDetailsPreservesExplicitFailureOverQuotaHeaders(t *testing.T) {
+	var event responsesWebSocketStreamEvent
+	event.Type = "response.failed"
+	event.Response.Error.Type = "invalid_request_error"
+	event.Response.Error.Code = "context_length_exceeded"
+	event.Response.Error.Message = "too long"
+	headers := http.Header{
+		"retry-after-ms":               []string{"2169"},
+		"x-ratelimit-remaining-tokens": []string{"-36161"},
+	}
+	status, message, code, _ := responsesWebSocketStreamFailureDetails(event, headers)
+	if status != http.StatusBadRequest || message != "too long" || code != "context_length_exceeded" {
+		t.Fatalf("failure details = (%d, %q, %q), want (400, too long, context_length_exceeded)", status, message, code)
 	}
 }
 

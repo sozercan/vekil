@@ -12,6 +12,10 @@ import (
 // dateModelRegex strips dated suffixes like -20251001 from model names.
 var dateModelRegex = regexp.MustCompile(`-\d{8}$`)
 
+// claudeNumericVersionRegex matches a trailing Claude numeric version pair while
+// leaving all preceding model-family hyphens untouched.
+var claudeNumericVersionRegex = regexp.MustCompile(`^(claude(?:-[^-]+)*)-(\d+)-(\d+)$`)
+
 // modelAliases maps Anthropic model names to Copilot-compatible names.
 var modelAliases = map[string]string{
 	"claude-haiku-4-5":  "claude-haiku-4.5",
@@ -29,10 +33,10 @@ func NormalizeModelName(model string) string {
 	if alias, ok := modelAliases[normalized]; ok {
 		return alias
 	}
-	// Replace remaining hyphens-as-dots pattern for version numbers
-	// e.g., claude-sonnet-4-5 → claude-sonnet-4.5 (already handled above)
-	_ = strings.Count(normalized, "-") // keep strings imported
-	return normalized
+	// Convert any remaining trailing Claude numeric version pair while preserving
+	// non-version hyphens (e.g., claude-super-long-opus-4-8 →
+	// claude-super-long-opus-4.8). Existing dotted versions do not match.
+	return claudeNumericVersionRegex.ReplaceAllString(normalized, `${1}-${2}.${3}`)
 }
 
 // TranslateAnthropicToOpenAI converts an Anthropic Messages API request to OpenAI Chat Completions format.
@@ -96,9 +100,15 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 	// MaxTokens
 	oaiReq.MaxTokens = req.MaxTokens
 
-	// Thinking / extended thinking
-	if req.Thinking != nil && req.Thinking.Type == "enabled" && req.Thinking.BudgetTokens != nil {
-		tokens := *req.Thinking.BudgetTokens
+	// Anthropic's thinking budget is normally part of max_tokens, while OpenAI's
+	// max_completion_tokens caps reasoning plus visible output together. Preserve
+	// max_tokens as the total limit for ordinary thinking, but never cap below an
+	// interleaved-thinking budget that Anthropic allows to exceed max_tokens.
+	if req.Thinking != nil && req.Thinking.Type == "enabled" && req.MaxTokens != nil {
+		tokens := *req.MaxTokens
+		if req.Thinking.BudgetTokens != nil && *req.Thinking.BudgetTokens > tokens {
+			tokens = *req.Thinking.BudgetTokens
+		}
 		oaiReq.MaxCompletionTokens = &tokens
 		oaiReq.MaxTokens = nil
 	}

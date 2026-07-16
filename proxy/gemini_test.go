@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,33 @@ import (
 )
 
 func TestTranslateGeminiToOpenAI(t *testing.T) {
+	t.Run("omitted content role defaults to user", func(t *testing.T) {
+		req := &models.GeminiGenerateContentRequest{
+			Contents: []models.GeminiContent{{
+				Parts: []models.GeminiPart{{Text: stringPtr("Hello")}},
+			}},
+		}
+
+		got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+		if err != nil {
+			t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+		}
+		if len(got.Messages) != 1 {
+			t.Fatalf("len(Messages) = %d, want 1", len(got.Messages))
+		}
+		if got.Messages[0].Role != "user" {
+			t.Fatalf("Messages[0].Role = %q, want user", got.Messages[0].Role)
+		}
+
+		var text string
+		if err := json.Unmarshal(got.Messages[0].Content, &text); err != nil {
+			t.Fatalf("unmarshal user content: %v", err)
+		}
+		if text != "Hello" {
+			t.Fatalf("Messages[0].Content = %q, want Hello", text)
+		}
+	})
+
 	t.Run("system text and user text", func(t *testing.T) {
 		req := &models.GeminiGenerateContentRequest{
 			Model: "models/gemini-2.5-pro",
@@ -878,6 +906,16 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 		wantMsg    string
 	}{
 		{
+			name: "invalid explicit content role",
+			req: &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{{Role: "assistant", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
+			},
+			pathModel:  "gemini-2.5-pro",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    `contents[0].role must be "user" or "model"`,
+		},
+		{
 			name: "candidate count unsupported",
 			req: &models.GeminiGenerateContentRequest{
 				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
@@ -1260,7 +1298,7 @@ func TestDecodeGeminiGenerateContentRequestAcceptsThoughtMetadata(t *testing.T) 
 		t.Fatalf("unmarshal tool result: %v", err)
 	}
 	if toolResult != `{"output":"ok"}` {
-		t.Fatalf("tool result = %q, want %q", toolResult, `{"output":"ok"}`)
+		t.Fatalf("tool result = %q, want preserved structured output %q", toolResult, `{"output":"ok"}`)
 	}
 }
 
@@ -1397,6 +1435,126 @@ func TestHandleGeminiModelsGenerateContent(t *testing.T) {
 	}
 	if geminiResp.UsageMetadata == nil || geminiResp.UsageMetadata.TotalTokenCount != 13 {
 		t.Errorf("UsageMetadata = %#v, want totalTokenCount=13", geminiResp.UsageMetadata)
+	}
+}
+
+func TestHandleGeminiModelsOmittedRoleDefaultsToUser(t *testing.T) {
+	tests := []struct {
+		name   string
+		action string
+	}{
+		{name: "generateContent", action: "generateContent"},
+		{name: "streamGenerateContent", action: "streamGenerateContent"},
+		{name: "countTokens", action: "countTokens"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstreamCalls := 0
+			handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				upstreamCalls++
+				var oaiReq models.OpenAIRequest
+				body, _ := io.ReadAll(r.Body)
+				if err := json.Unmarshal(body, &oaiReq); err != nil {
+					t.Fatalf("unmarshal upstream request: %v", err)
+				}
+				if len(oaiReq.Messages) != 1 {
+					t.Fatalf("len(Messages) = %d, want 1", len(oaiReq.Messages))
+				}
+				if oaiReq.Messages[0].Role != "user" {
+					t.Fatalf("Messages[0].Role = %q, want user", oaiReq.Messages[0].Role)
+				}
+
+				if tt.action == "streamGenerateContent" {
+					if oaiReq.Stream == nil || !*oaiReq.Stream {
+						t.Fatalf("Stream = %v, want true", oaiReq.Stream)
+					}
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-role\",\"model\":\"gemini-2.5-pro\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+					return
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+					ID:      "chatcmpl-role",
+					Object:  "chat.completion",
+					Model:   "gemini-2.5-pro",
+					Choices: []models.OpenAIChoice{{Index: 0, Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)}, FinishReason: strPtr("stop")}},
+					Usage:   &models.OpenAIUsage{PromptTokens: 7, CompletionTokens: 1, TotalTokens: 8},
+				})
+			})
+
+			reqBody := `{"contents":[{"parts":[{"text":"Hi"}]}]}`
+			req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:"+tt.action, strings.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			handler.HandleGeminiModels(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, string(body))
+			}
+			if upstreamCalls != 1 {
+				t.Fatalf("upstreamCalls = %d, want 1", upstreamCalls)
+			}
+
+			switch tt.action {
+			case "streamGenerateContent":
+				frames := parseGeminiSSEFrames(w.Body.String())
+				if len(frames) == 0 {
+					t.Fatalf("stream response has no Gemini frames: %q", w.Body.String())
+				}
+			case "countTokens":
+				var countResp models.GeminiCountTokensResponse
+				if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+					t.Fatalf("decode countTokens response: %v", err)
+				}
+				if countResp.TotalTokens != 7 {
+					t.Fatalf("TotalTokens = %d, want 7", countResp.TotalTokens)
+				}
+			default:
+				var generateResp models.GeminiGenerateContentResponse
+				if err := json.NewDecoder(resp.Body).Decode(&generateResp); err != nil {
+					t.Fatalf("decode generateContent response: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestHandleGeminiModelsInvalidExplicitRole(t *testing.T) {
+	for _, action := range []string{"generateContent", "streamGenerateContent", "countTokens"} {
+		t.Run(action, func(t *testing.T) {
+			handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				t.Fatal("backend should not be called")
+			})
+
+			reqBody := `{"contents":[{"role":"assistant","parts":[{"text":"Hi"}]}]}`
+			req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:"+action, strings.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			handler.HandleGeminiModels(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != http.StatusBadRequest {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("StatusCode = %d, want 400: %s", resp.StatusCode, string(body))
+			}
+
+			var errResp models.GeminiErrorResponse
+			if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if errResp.Error.Status != "INVALID_ARGUMENT" {
+				t.Fatalf("Error.Status = %q, want INVALID_ARGUMENT", errResp.Error.Status)
+			}
+			if !strings.Contains(errResp.Error.Message, `contents[0].role must be "user" or "model"`) {
+				t.Fatalf("Error.Message = %q, want invalid role detail", errResp.Error.Message)
+			}
+		})
 	}
 }
 
@@ -2155,6 +2313,125 @@ func TestHandleGeminiModelsStreamGenerateContent(t *testing.T) {
 	}
 }
 
+func TestHandleGeminiModelsPost200StreamErrorMatrix(t *testing.T) {
+	failures := []struct {
+		name        string
+		upstreamSSE string
+		wantCode    int
+		wantStatus  string
+		wantMessage string
+	}{
+		{
+			name:        "rate limit",
+			upstreamSSE: "data: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"}}\n\n",
+			wantCode:    http.StatusTooManyRequests,
+			wantStatus:  "RESOURCE_EXHAUSTED",
+			wantMessage: "slow down",
+		},
+		{
+			name:        "overload",
+			upstreamSSE: "event: error\ndata: {\"error\":{\"type\":\"overloaded_error\",\"code\":\"model_overloaded\",\"message\":\"capacity exhausted\"}}\n\n",
+			wantCode:    http.StatusServiceUnavailable,
+			wantStatus:  "UNAVAILABLE",
+			wantMessage: "capacity exhausted",
+		},
+		{
+			name:        "missing done",
+			upstreamSSE: "data: {\"id\":\"chatcmpl-truncated\",\"model\":\"gemini-2.5-pro\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+			wantCode:    http.StatusBadGateway,
+			wantStatus:  "UNAVAILABLE",
+			wantMessage: "before [DONE]",
+		},
+		{
+			name:        "negative tool call index",
+			upstreamSSE: "data: {\"id\":\"chatcmpl-negative\",\"model\":\"gemini-2.5-pro\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call_negative\",\"index\":-1,\"type\":\"function\",\"function\":{\"name\":\"bad_call\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+			wantCode:    http.StatusBadGateway,
+			wantStatus:  "UNAVAILABLE",
+			wantMessage: "tool call index -1",
+		},
+	}
+
+	modes := []struct {
+		name             string
+		action           string
+		requestBody      string
+		wantHTTPStatusFn func(int) int
+		streamedResponse bool
+	}{
+		{
+			name:             "streamGenerateContent",
+			action:           "streamGenerateContent",
+			requestBody:      `{"contents":[{"role":"user","parts":[{"text":"Hi"}]}]}`,
+			wantHTTPStatusFn: func(int) int { return http.StatusOK },
+			streamedResponse: true,
+		},
+		{
+			name:        "forced streaming generateContent",
+			action:      "generateContent",
+			requestBody: `{"contents":[{"role":"user","parts":[{"text":"Hi"}]}],"tools":[{"functionDeclarations":[{"name":"lookup_weather","parameters":{"type":"object"}}]}]}`,
+			wantHTTPStatusFn: func(semanticStatus int) int {
+				return semanticStatus
+			},
+		},
+	}
+
+	for _, mode := range modes {
+		for _, failure := range failures {
+			t.Run(mode.name+"/"+failure.name, func(t *testing.T) {
+				handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+					var oaiReq models.OpenAIRequest
+					body, _ := io.ReadAll(r.Body)
+					if err := json.Unmarshal(body, &oaiReq); err != nil {
+						t.Fatalf("unmarshal upstream request: %v", err)
+					}
+					if oaiReq.Stream == nil || !*oaiReq.Stream {
+						t.Fatalf("Stream = %v, want true", oaiReq.Stream)
+					}
+
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(failure.upstreamSSE))
+				})
+
+				req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:"+mode.action, strings.NewReader(mode.requestBody))
+				req.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+
+				handler.HandleGeminiModels(w, req)
+
+				resp := w.Result()
+				wantHTTPStatus := mode.wantHTTPStatusFn(failure.wantCode)
+				if resp.StatusCode != wantHTTPStatus {
+					t.Errorf("StatusCode = %d, want %d; body=%s", resp.StatusCode, wantHTTPStatus, w.Body.String())
+				}
+
+				var errResp models.GeminiErrorResponse
+				if mode.streamedResponse {
+					frames := parseGeminiSSEFrames(w.Body.String())
+					if len(frames) == 0 {
+						t.Fatalf("stream response has no frames: %q", w.Body.String())
+					}
+					if err := json.Unmarshal([]byte(frames[len(frames)-1]), &errResp); err != nil {
+						t.Fatalf("decode final SSE error frame: %v", err)
+					}
+				} else if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+					t.Fatalf("decode JSON error response: %v", err)
+				}
+
+				if errResp.Error.Code != failure.wantCode {
+					t.Errorf("Error.Code = %d, want %d", errResp.Error.Code, failure.wantCode)
+				}
+				if errResp.Error.Status != failure.wantStatus {
+					t.Errorf("Error.Status = %q, want %q", errResp.Error.Status, failure.wantStatus)
+				}
+				if !strings.Contains(errResp.Error.Message, failure.wantMessage) {
+					t.Errorf("Error.Message = %q, want substring %q", errResp.Error.Message, failure.wantMessage)
+				}
+			})
+		}
+	}
+}
+
 func TestHandleGeminiModelsCountTokensFallbackAndCache(t *testing.T) {
 	callCount := 0
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2394,6 +2671,107 @@ func TestHandleGeminiModelsCountTokensCacheNormalizesSnakeCase(t *testing.T) {
 
 	if callCount != 2 {
 		t.Fatalf("upstream callCount = %d, want 2", callCount)
+	}
+}
+
+func TestGeminiCountTokensCacheBoundsCardinalityAndEvictsOldest(t *testing.T) {
+	handler := &ProxyHandler{}
+	now := time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC)
+	handler.geminiCounts.now = func() time.Time { return now }
+
+	const expectedMaxEntries = geminiCountTokensCacheMaxEntries
+	for i := 0; i <= expectedMaxEntries; i++ {
+		handler.setGeminiCountTokensCache(fmt.Sprintf("key-%04d", i), models.GeminiCountTokensResponse{TotalTokens: i + 1})
+	}
+
+	handler.geminiCounts.mu.RLock()
+	cacheEntries := len(handler.geminiCounts.entries)
+	_, keptOldest := handler.geminiCounts.entries["key-0000"]
+	_, keptNewest := handler.geminiCounts.entries[fmt.Sprintf("key-%04d", expectedMaxEntries)]
+	handler.geminiCounts.mu.RUnlock()
+
+	if cacheEntries != expectedMaxEntries {
+		t.Fatalf("countTokens cache entries = %d, want bounded at %d", cacheEntries, expectedMaxEntries)
+	}
+	if keptOldest {
+		t.Fatal("countTokens cache retained the oldest entry after reaching its bound")
+	}
+	if !keptNewest {
+		t.Fatal("countTokens cache evicted the newest entry instead of the oldest")
+	}
+}
+
+func TestGeminiCountTokensCachePrunesAllExpiredEntriesOnAccessAndInsert(t *testing.T) {
+	now := time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC)
+
+	t.Run("access", func(t *testing.T) {
+		handler := &ProxyHandler{}
+		handler.geminiCounts.now = func() time.Time { return now }
+		handler.geminiCounts.entries = map[string]geminiCountTokensCacheEntry{
+			"expired-a": {
+				response: models.GeminiCountTokensResponse{TotalTokens: 1},
+				expiry:   now.Add(-time.Minute),
+			},
+			"expired-b": {
+				response: models.GeminiCountTokensResponse{TotalTokens: 2},
+				expiry:   now.Add(-time.Second),
+			},
+			"live": {
+				response: models.GeminiCountTokensResponse{TotalTokens: 3},
+				expiry:   now.Add(time.Minute),
+			},
+		}
+
+		got, ok := handler.getGeminiCountTokensCache("live")
+		if !ok || got.TotalTokens != 3 {
+			t.Fatalf("live cache lookup = %+v, %v; want TotalTokens 3", got, ok)
+		}
+
+		handler.geminiCounts.mu.RLock()
+		cacheEntries := len(handler.geminiCounts.entries)
+		_, keptExpiredA := handler.geminiCounts.entries["expired-a"]
+		_, keptExpiredB := handler.geminiCounts.entries["expired-b"]
+		handler.geminiCounts.mu.RUnlock()
+
+		if cacheEntries != 1 || keptExpiredA || keptExpiredB {
+			t.Fatalf("countTokens cache after access = len %d, expired-a %v, expired-b %v; want only live entry", cacheEntries, keptExpiredA, keptExpiredB)
+		}
+	})
+
+	t.Run("insert", func(t *testing.T) {
+		handler := &ProxyHandler{}
+		handler.geminiCounts.now = func() time.Time { return now }
+		handler.geminiCounts.entries = map[string]geminiCountTokensCacheEntry{
+			"expired-a": {expiry: now.Add(-time.Minute)},
+			"expired-b": {expiry: now.Add(-time.Second)},
+		}
+
+		handler.setGeminiCountTokensCache("live", models.GeminiCountTokensResponse{TotalTokens: 4})
+
+		handler.geminiCounts.mu.RLock()
+		cacheEntries := len(handler.geminiCounts.entries)
+		_, keptLive := handler.geminiCounts.entries["live"]
+		handler.geminiCounts.mu.RUnlock()
+		if cacheEntries != 1 || !keptLive {
+			t.Fatalf("countTokens cache after insert = len %d, live %v; want only live entry", cacheEntries, keptLive)
+		}
+	})
+}
+
+func TestGeminiCountTokensCacheUsesInjectedTimeForTTL(t *testing.T) {
+	now := time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC)
+	handler := &ProxyHandler{}
+	handler.geminiCounts.now = func() time.Time { return now }
+	handler.setGeminiCountTokensCache("key", models.GeminiCountTokensResponse{TotalTokens: 7})
+
+	now = now.Add(geminiCountTokensCacheTTL - time.Nanosecond)
+	if got, ok := handler.getGeminiCountTokensCache("key"); !ok || got.TotalTokens != 7 {
+		t.Fatalf("cache lookup before TTL = %+v, %v; want hit", got, ok)
+	}
+
+	now = now.Add(2 * time.Nanosecond)
+	if got, ok := handler.getGeminiCountTokensCache("key"); ok {
+		t.Fatalf("cache lookup after TTL = %+v, %v; want miss", got, ok)
 	}
 }
 
@@ -2821,5 +3199,59 @@ func benchmarkGeminiCountTokensOpenAIRequest() *models.OpenAIRequest {
 		Temperature:       &temperature,
 		TopP:              &topP,
 		ParallelToolCalls: &parallelToolCalls,
+	}
+}
+
+func TestNormalizeGeminiFunctionResponse(t *testing.T) {
+	tests := []struct {
+		name      string
+		raw       string
+		unwrapCLI bool
+		want      string
+	}{
+		{name: "string", raw: `"plain"`, want: "plain"},
+		{name: "generic output object stays structured", raw: `{"output":"ZX_LEFT"}`, want: `{"output":"ZX_LEFT"}`},
+		{name: "Gemini CLI output string unwraps", raw: `{"output":"ZX_LEFT"}`, unwrapCLI: true, want: "ZX_LEFT"},
+		{name: "CLI output with metadata stays structured", raw: `{"output":"ZX_LEFT","status":"ok"}`, unwrapCLI: true, want: `{"output":"ZX_LEFT","status":"ok"}`},
+		{name: "CLI non-string output stays structured", raw: `{"output":{"value":1}}`, unwrapCLI: true, want: `{"output":{"value":1}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeGeminiFunctionResponse(json.RawMessage(tt.raw), tt.unwrapCLI)
+			if err != nil {
+				t.Fatalf("normalizeGeminiFunctionResponse() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("normalizeGeminiFunctionResponse() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGeminiCLITranslationUnwrapsTextOutputOnlyForCLIRequests(t *testing.T) {
+	req := &models.GeminiGenerateContentRequest{Contents: []models.GeminiContent{
+		{Role: "model", Parts: []models.GeminiPart{{FunctionCall: &models.GeminiFunctionCall{ID: "call-1", Name: "read_file", Args: json.RawMessage(`{"file_path":"left.txt"}`)}}}},
+		{Role: "user", Parts: []models.GeminiPart{{FunctionResponse: &models.GeminiFunctionResponse{ID: "call-1", Name: "read_file", Response: json.RawMessage(`{"output":"ZX_LEFT"}`)}}}},
+	}}
+	generic, err := TranslateGeminiToOpenAI(req, "gemini-3.1-pro-preview", false)
+	if err != nil {
+		t.Fatalf("generic translation error = %v", err)
+	}
+	cli, err := translateGeminiToOpenAIWithOptions(req, "gemini-3.1-pro-preview", false, geminiTranslationOptions{unwrapCLITextOutput: true})
+	if err != nil {
+		t.Fatalf("CLI translation error = %v", err)
+	}
+	var genericResult, cliResult string
+	if err := json.Unmarshal(generic.Messages[1].Content, &genericResult); err != nil {
+		t.Fatalf("decode generic result: %v", err)
+	}
+	if err := json.Unmarshal(cli.Messages[1].Content, &cliResult); err != nil {
+		t.Fatalf("decode CLI result: %v", err)
+	}
+	if genericResult != `{"output":"ZX_LEFT"}` || cliResult != "ZX_LEFT" {
+		t.Fatalf("results = generic:%q CLI:%q", genericResult, cliResult)
+	}
+	if !isGeminiCLIUserAgent("GeminiCLI/1.0.0/gemini-3.1-pro-preview (linux; x64)") || isGeminiCLIUserAgent("custom-client/1.0") {
+		t.Fatal("Gemini CLI user-agent classification mismatch")
 	}
 }

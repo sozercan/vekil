@@ -21,6 +21,31 @@ func decodeContentParts(t *testing.T, raw json.RawMessage) []models.OpenAIConten
 	return parts
 }
 
+func TestNormalizeModelName(t *testing.T) {
+	tests := []struct {
+		name  string
+		model string
+		want  string
+	}{
+		{name: "generic numeric suffix", model: "claude-opus-4-8", want: "claude-opus-4.8"},
+		{name: "dated generic numeric suffix", model: "claude-opus-4-8-20260701", want: "claude-opus-4.8"},
+		{name: "preserves non-version hyphens", model: "claude-super-long-opus-4-8", want: "claude-super-long-opus-4.8"},
+		{name: "existing alias", model: "claude-sonnet-4-6", want: "claude-sonnet-4.6"},
+		{name: "existing dotted version", model: "claude-opus-4.8", want: "claude-opus-4.8"},
+		{name: "non-Claude numeric suffix", model: "gpt-4-8", want: "gpt-4-8"},
+		{name: "non-version Claude hyphens", model: "claude-3-opus", want: "claude-3-opus"},
+		{name: "dated integer version", model: "claude-sonnet-4-20250514", want: "claude-sonnet-4"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := NormalizeModelName(tt.model); got != tt.want {
+				t.Fatalf("NormalizeModelName(%q) = %q, want %q", tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestTranslateAnthropicToOpenAI(t *testing.T) {
 	t.Run("simple text message", func(t *testing.T) {
 		req := &models.AnthropicRequest{
@@ -346,18 +371,39 @@ func TestTranslateAnthropicToOpenAI(t *testing.T) {
 	t.Run("thinking/extended thinking", func(t *testing.T) {
 		req := &models.AnthropicRequest{
 			Model:     "claude-3-opus",
-			MaxTokens: intPtr(500),
+			MaxTokens: intPtr(16000),
 			Messages: []models.AnthropicMessage{
 				{Role: "user", Content: json.RawMessage(`"Think hard"`)},
 			},
-			Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(1000)},
+			Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(10000)},
 		}
 		got, err := TranslateAnthropicToOpenAI(req)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if got.MaxCompletionTokens == nil || *got.MaxCompletionTokens != 1000 {
-			t.Errorf("MaxCompletionTokens = %v, want 1000", got.MaxCompletionTokens)
+		if got.MaxCompletionTokens == nil || *got.MaxCompletionTokens != 16000 {
+			t.Errorf("MaxCompletionTokens = %v, want total max_tokens limit 16000", got.MaxCompletionTokens)
+		}
+		if got.MaxTokens != nil {
+			t.Errorf("MaxTokens should be nil when thinking is enabled, got %v", *got.MaxTokens)
+		}
+	})
+
+	t.Run("interleaved thinking budget above max tokens", func(t *testing.T) {
+		req := &models.AnthropicRequest{
+			Model:     "claude-opus-4-5",
+			MaxTokens: intPtr(4096),
+			Messages: []models.AnthropicMessage{
+				{Role: "user", Content: json.RawMessage(`"Use tools and keep thinking"`)},
+			},
+			Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(8192)},
+		}
+		got, err := TranslateAnthropicToOpenAI(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.MaxCompletionTokens == nil || *got.MaxCompletionTokens != 8192 {
+			t.Errorf("MaxCompletionTokens = %v, want interleaved thinking budget 8192", got.MaxCompletionTokens)
 		}
 		if got.MaxTokens != nil {
 			t.Errorf("MaxTokens should be nil when thinking is enabled, got %v", *got.MaxTokens)

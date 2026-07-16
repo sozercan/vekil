@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/sozercan/vekil/auth"
@@ -112,6 +115,67 @@ func TestResolveProviderRequest_RewritesConfiguredResponsesModelToProviderDeploy
 	}
 }
 
+func TestApplyProviderModelRequestPolicy_UsesMaxCompletionTokensOnlyForChatCompletions(t *testing.T) {
+	owner := providerModel{useMaxCompletionTokens: true}
+
+	chatBody := applyProviderModelRequestPolicy(
+		[]byte(`{"model":"gpt-5.6-sol","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`),
+		providerEndpointChatCompletions,
+		owner,
+	)
+	var chatPayload map[string]json.RawMessage
+	if err := json.Unmarshal(chatBody, &chatPayload); err != nil {
+		t.Fatalf("json.Unmarshal(chatBody) error = %v", err)
+	}
+	if _, ok := chatPayload["max_tokens"]; ok {
+		t.Fatalf("chat payload retained max_tokens: %s", chatBody)
+	}
+	if got := string(chatPayload["max_completion_tokens"]); got != "64" {
+		t.Fatalf("max_completion_tokens = %s, want 64", got)
+	}
+
+	responsesBody := []byte(`{"model":"gpt-5.6-sol","max_tokens":64,"input":"hello"}`)
+	if got := applyProviderModelRequestPolicy(responsesBody, providerEndpointResponses, owner); string(got) != string(responsesBody) {
+		t.Fatalf("responses payload changed = %s, want original %s", got, responsesBody)
+	}
+}
+
+func TestApplyProviderModelRequestPolicy_TreatsNullMaxCompletionTokensAsAbsent(t *testing.T) {
+	body := applyProviderModelRequestPolicy(
+		[]byte(`{"max_tokens":64,"max_completion_tokens":null}`),
+		providerEndpointChatCompletions,
+		providerModel{useMaxCompletionTokens: true},
+	)
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("json.Unmarshal(body) error = %v", err)
+	}
+	if _, ok := payload["max_tokens"]; ok {
+		t.Fatalf("payload retained max_tokens: %s", body)
+	}
+	if got := string(payload["max_completion_tokens"]); got != "64" {
+		t.Fatalf("max_completion_tokens = %s, want legacy value 64", got)
+	}
+}
+
+func TestApplyProviderModelRequestPolicy_PreservesExplicitMaxCompletionTokens(t *testing.T) {
+	body := applyProviderModelRequestPolicy(
+		[]byte(`{"max_tokens":64,"max_completion_tokens":32}`),
+		providerEndpointChatCompletions,
+		providerModel{useMaxCompletionTokens: true},
+	)
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("json.Unmarshal(body) error = %v", err)
+	}
+	if _, ok := payload["max_tokens"]; ok {
+		t.Fatalf("payload retained max_tokens: %s", body)
+	}
+	if got := string(payload["max_completion_tokens"]); got != "32" {
+		t.Fatalf("max_completion_tokens = %s, want explicit value 32", got)
+	}
+}
+
 func TestResolveProviderRequest_RejectsKnownModelWithoutEndpointSupport(t *testing.T) {
 	handler := newProviderRoutingTestHandler(t, []string{"/responses"})
 
@@ -135,6 +199,288 @@ func TestResolveProviderRequest_RejectsKnownModelWithoutEndpointSupport(t *testi
 	}
 	if !strings.Contains(providerErr.Error(), `does not support /chat/completions`) {
 		t.Fatalf("providerRequestError.Error() = %q, want unsupported endpoint message", providerErr.Error())
+	}
+}
+
+func TestPostChatCompletions_UnknownModelFallbackHonorsDynamicProviderFilters(t *testing.T) {
+	testCases := []struct {
+		name               string
+		model              string
+		includeModels      []string
+		excludeModels      []string
+		wantStatus         int
+		wantModelsHits     int32
+		wantChatHits       int32
+		wantCanonicalModel bool
+	}{
+		{
+			name:               "include_models routes a discovered included model",
+			model:              "allowed",
+			includeModels:      []string{"allowed"},
+			wantStatus:         http.StatusOK,
+			wantModelsHits:     1,
+			wantChatHits:       1,
+			wantCanonicalModel: true,
+		},
+		{
+			name:           "include_models rejects a discovered model outside the allowlist",
+			model:          "blocked",
+			includeModels:  []string{"allowed"},
+			wantStatus:     http.StatusBadRequest,
+			wantModelsHits: 1,
+		},
+		{
+			name:           "include_models rejects an included model absent from discovery",
+			model:          "absent",
+			includeModels:  []string{"absent"},
+			wantStatus:     http.StatusBadRequest,
+			wantModelsHits: 1,
+		},
+		{
+			name:               "exclude_models routes a discovered non-excluded model",
+			model:              "allowed",
+			excludeModels:      []string{"blocked"},
+			wantStatus:         http.StatusOK,
+			wantModelsHits:     1,
+			wantChatHits:       1,
+			wantCanonicalModel: true,
+		},
+		{
+			name:           "exclude_models rejects a discovered excluded model",
+			model:          "blocked",
+			excludeModels:  []string{"blocked"},
+			wantStatus:     http.StatusBadRequest,
+			wantModelsHits: 1,
+		},
+		{
+			name:         "unfiltered dynamic provider preserves unknown model passthrough without discovery",
+			model:        "unknown",
+			wantStatus:   http.StatusOK,
+			wantChatHits: 1,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var modelsHits atomic.Int32
+			var chatHits atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/models":
+					modelsHits.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"allowed","object":"model","owned_by":"dynamic"},{"id":"blocked","object":"model","owned_by":"dynamic"}]}`))
+				case "/chat/completions":
+					chatHits.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"id":"chat-1","object":"chat.completion","choices":[]}`))
+				default:
+					t.Fatalf("unexpected upstream path %q", r.URL.Path)
+				}
+			}))
+			defer upstream.Close()
+
+			handler, err := NewProxyHandler(
+				auth.NewTestAuthenticator("test-token"),
+				logger.New(logger.LevelInfo),
+				WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+					ID:             "dynamic",
+					Type:           "openai-compatible",
+					Default:        true,
+					BaseURL:        upstream.URL,
+					AuthType:       "none",
+					ModelDiscovery: "openai",
+					IncludeModels:  tc.includeModels,
+					ExcludeModels:  tc.excludeModels,
+				}}}),
+			)
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+			if got := modelsHits.Load(); got != tc.wantModelsHits {
+				t.Fatalf("startup /models hits = %d, want %d", got, tc.wantModelsHits)
+			}
+			_, canonical := handler.providerSetup().lookupModel(tc.model)
+			if canonical != tc.wantCanonicalModel {
+				t.Fatalf("canonical ownership for %q = %v, want %v", tc.model, canonical, tc.wantCanonicalModel)
+			}
+
+			body := []byte(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hello"}]}`, tc.model))
+			resp, err := handler.postChatCompletions(context.Background(), body)
+			if tc.wantStatus == http.StatusOK {
+				if err != nil {
+					t.Fatalf("postChatCompletions() error = %v", err)
+				}
+				defer func() { _ = resp.Body.Close() }()
+				if resp.StatusCode != tc.wantStatus {
+					t.Fatalf("postChatCompletions() status = %d, want %d", resp.StatusCode, tc.wantStatus)
+				}
+			} else {
+				if err == nil {
+					if resp != nil {
+						_ = resp.Body.Close()
+					}
+					t.Fatal("postChatCompletions() error = nil, want local routing rejection")
+				}
+				var providerErr *providerRequestError
+				if !errors.As(err, &providerErr) {
+					t.Fatalf("postChatCompletions() error = %T, want *providerRequestError", err)
+				}
+				if providerErr.statusCode != tc.wantStatus {
+					t.Fatalf("providerRequestError.statusCode = %d, want %d", providerErr.statusCode, tc.wantStatus)
+				}
+			}
+
+			if got := chatHits.Load(); got != tc.wantChatHits {
+				t.Fatalf("upstream chat hits = %d, want %d", got, tc.wantChatHits)
+			}
+		})
+	}
+}
+
+func TestFilteredGenericDynamicAliasDiscoveryRoutesOnlyCanonicalAlias(t *testing.T) {
+	testCases := []struct {
+		name              string
+		deployment        string
+		wantCanonical     bool
+		wantCatalog       []string
+		wantStatus        int
+		wantResponsesHits int32
+	}{
+		{
+			name:              "discovered deployment expands to included public alias",
+			deployment:        "upstream-model",
+			wantCanonical:     true,
+			wantCatalog:       []string{"public-alias"},
+			wantStatus:        http.StatusOK,
+			wantResponsesHits: 1,
+		},
+		{
+			name:        "included public alias absent from discovery is rejected",
+			deployment:  "missing-upstream-model",
+			wantCatalog: []string{},
+			wantStatus:  http.StatusBadRequest,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var modelsHits atomic.Int32
+			var responsesHits atomic.Int32
+			var forwardedModel string
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/models":
+					modelsHits.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"upstream-model","object":"model","owned_by":"dynamic","supported_endpoints":["/responses"]}]}`))
+				case "/responses":
+					responsesHits.Add(1)
+					var payload struct {
+						Model string `json:"model"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Errorf("decode upstream responses request: %v", err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					forwardedModel = payload.Model
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[]}`))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer upstream.Close()
+
+			handler, err := NewProxyHandler(
+				auth.NewTestAuthenticator("test-token"),
+				logger.New(logger.LevelInfo),
+				WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+					ID:             "dynamic",
+					Type:           "openai-compatible",
+					Default:        true,
+					BaseURL:        upstream.URL,
+					AuthType:       "none",
+					ModelDiscovery: "openai",
+					IncludeModels:  []string{"public-alias"},
+					Models: []ProviderModelConfig{{
+						PublicID:   "public-alias",
+						Deployment: tc.deployment,
+						Endpoints:  []string{"/responses"},
+					}},
+				}}}),
+			)
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+			if got := modelsHits.Load(); got != 1 {
+				t.Fatalf("startup /models hits = %d, want 1", got)
+			}
+			owner, canonical := handler.providerSetup().lookupModel("public-alias")
+			if canonical != tc.wantCanonical {
+				t.Fatalf("canonical public-alias ownership = %v, want %v", canonical, tc.wantCanonical)
+			}
+			if canonical && owner.upstreamModel != tc.deployment {
+				t.Fatalf("canonical upstream model = %q, want %q", owner.upstreamModel, tc.deployment)
+			}
+
+			modelsReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+			modelsW := httptest.NewRecorder()
+			handler.HandleModels(modelsW, modelsReq)
+			modelsResp := modelsW.Result()
+			defer func() { _ = modelsResp.Body.Close() }()
+			if modelsResp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(modelsResp.Body)
+				t.Fatalf("models status = %d, want 200: %s", modelsResp.StatusCode, body)
+			}
+			var catalog struct {
+				Data []struct {
+					ID string `json:"id"`
+				} `json:"data"`
+			}
+			if err := json.NewDecoder(modelsResp.Body).Decode(&catalog); err != nil {
+				t.Fatalf("decode models catalog: %v", err)
+			}
+			catalogIDs := make([]string, 0, len(catalog.Data))
+			for _, model := range catalog.Data {
+				catalogIDs = append(catalogIDs, model.ID)
+			}
+			if !reflect.DeepEqual(catalogIDs, tc.wantCatalog) {
+				t.Fatalf("catalog IDs = %v, want %v", catalogIDs, tc.wantCatalog)
+			}
+			if got := modelsHits.Load(); got != 2 {
+				t.Fatalf("/models hits after catalog read = %d, want startup discovery plus canonical read", got)
+			}
+
+			resp, err := handler.postResponsesWithHeaders(context.Background(), []byte(`{"model":"public-alias","input":"hello"}`), nil)
+			if tc.wantStatus == http.StatusOK {
+				if err != nil {
+					t.Fatalf("postResponsesWithHeaders() error = %v", err)
+				}
+				defer func() { _ = resp.Body.Close() }()
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("responses status = %d, want 200", resp.StatusCode)
+				}
+				if forwardedModel != "upstream-model" {
+					t.Fatalf("forwarded model = %q, want upstream-model", forwardedModel)
+				}
+			} else {
+				if err == nil {
+					if resp != nil {
+						_ = resp.Body.Close()
+					}
+					t.Fatal("postResponsesWithHeaders() error = nil, want local routing rejection")
+				}
+				var providerErr *providerRequestError
+				if !errors.As(err, &providerErr) || providerErr.statusCode != tc.wantStatus {
+					t.Fatalf("postResponsesWithHeaders() error = %v, want provider status %d", err, tc.wantStatus)
+				}
+			}
+			if got := responsesHits.Load(); got != tc.wantResponsesHits {
+				t.Fatalf("responses upstream hits = %d, want %d", got, tc.wantResponsesHits)
+			}
+		})
 	}
 }
 
@@ -488,7 +834,9 @@ func TestWriteOpenAIPassthroughObservingUsage_SniffsWithinCap(t *testing.T) {
 	body := `{"choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15}}`
 
 	w := httptest.NewRecorder()
-	h.writeOpenAIPassthroughObservingUsage(ctx, w, fakeBodyResponse(body))
+	if err := h.writeOpenAIPassthroughObservingUsage(ctx, w, fakeBodyResponse(body)); err != nil {
+		t.Fatalf("write passthrough response: %v", err)
+	}
 
 	if got := w.Body.String(); got != body {
 		t.Fatalf("body changed:\n got: %s\nwant: %s", got, body)
@@ -510,7 +858,9 @@ func TestWriteOpenAIPassthroughObservingUsage_OversizedStreamsThroughIntact(t *t
 	body := `{"padding":"` + filler + `","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
 
 	w := httptest.NewRecorder()
-	h.writeOpenAIPassthroughObservingUsage(ctx, w, fakeBodyResponse(body))
+	if err := h.writeOpenAIPassthroughObservingUsage(ctx, w, fakeBodyResponse(body)); err != nil {
+		t.Fatalf("write oversized passthrough response: %v", err)
+	}
 
 	if got := w.Body.String(); got != body {
 		t.Fatalf("oversized body not streamed through intact: got %d bytes, want %d", len(got), len(body))
@@ -528,7 +878,9 @@ func TestWriteOpenAIPassthroughObservingUsage_Non200PlainCopy(t *testing.T) {
 	resp.StatusCode = http.StatusTooManyRequests
 
 	w := httptest.NewRecorder()
-	h.writeOpenAIPassthroughObservingUsage(ctx, w, resp)
+	if err := h.writeOpenAIPassthroughObservingUsage(ctx, w, resp); err != nil {
+		t.Fatalf("write passthrough response: %v", err)
+	}
 
 	if w.Result().StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", w.Result().StatusCode)

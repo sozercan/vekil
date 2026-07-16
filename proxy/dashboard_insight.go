@@ -206,15 +206,23 @@ func (h *ProxyHandler) HandleDashboardInsight(w http.ResponseWriter, r *http.Req
 
 	// Run the in-process chat call on its own goroutine and bound the wait with
 	// insightUpstreamTimeout. The inner handler builds its own upstream context
-	// (it does not honor a request context), so a select here is what actually
-	// enforces the deadline. The gate is released when the worker completes,
+	// (it does not honor the dashboard client's request cancellation), so a select
+	// here enforces the client-visible deadline. The inner upstream call is still
+	// rooted in the proxy lifecycle and is canceled during server shutdown. The
+	// gate is released when the worker completes,
 	// whether or not we have already returned a timeout to the client.
 	type insightResult struct {
 		text   string
 		status int
 	}
 	done := make(chan insightResult, 1)
+	if !h.beginLifecycleWorker() {
+		gate.release()
+		writeInsightError(w, "server shutting down")
+		return
+	}
 	go func() {
+		defer h.endLifecycleWorker()
 		defer gate.release()
 		rec := newCaptureResponseWriter()
 		h.HandleOpenAIChatCompletions(rec, innerReq)

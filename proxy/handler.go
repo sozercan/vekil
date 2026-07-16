@@ -43,6 +43,13 @@ const (
 	modelsUpstreamTimeout = 30 * time.Second
 	// modelsCacheTTL is how long the /models response is cached.
 	modelsCacheTTL = 5 * time.Minute
+	// modelsCacheMaxEntries bounds caller-specific /models query variants while
+	// retaining enough room for common client-version and feature queries.
+	modelsCacheMaxEntries = 64
+	// modelsCacheFailureBackoff prevents an expired canonical catalog from
+	// stampeding an unavailable provider. Stale canonical data remains usable,
+	// and one retry is allowed after this short fixed interval.
+	modelsCacheFailureBackoff = time.Second
 	// syntheticCompactionPrefix marks proxy-owned compaction payloads so they
 	// can be expanded back into normal context on subsequent /responses calls.
 	syntheticCompactionPrefix = "vekil.compaction.v1:"
@@ -60,6 +67,8 @@ const (
 	defaultResponsesWSCompactKeepTail = 4
 )
 
+var errProxyLifecycleShutdown = fmt.Errorf("proxy lifecycle shutdown: %w", context.Canceled)
+
 var preferredResponsesFallbackModels = []string{
 	"gpt-5.4",
 	"gpt-5.3-codex",
@@ -74,8 +83,13 @@ var preferredResponsesFallbackModels = []string{
 
 // modelsCache holds a cached /models response to avoid repeated upstream calls.
 type modelsCache struct {
-	mu      sync.RWMutex
-	entries map[string]cachedModelsResponse
+	mu                    sync.RWMutex
+	entries               map[string]cachedModelsResponse
+	canonicalFailureUntil time.Time
+	canonicalFailureErr   error
+	now                   func() time.Time
+	flightMu              sync.Mutex
+	flights               map[string]*modelsCacheFlight
 }
 
 type cachedModelsResponse struct {
@@ -238,6 +252,15 @@ type ProxyHandler struct {
 	providersConfig                  ProvidersConfig
 	providersState                   *providerSetup
 	deferDynamicProviderModelRefresh bool
+	draining                         atomic.Bool
+	lifecycleOnce                    sync.Once
+	lifecycleCtx                     context.Context
+	lifecycleCancel                  context.CancelCauseFunc
+	shutdownSequenceOnce             sync.Once
+	shutdownSequence                 atomic.Uint64
+	lifecycleWorkersMu               sync.Mutex
+	lifecycleWorkers                 sync.WaitGroup
+	lifecycleWorkersActive           int
 	startupAuthenticationPending     atomic.Bool
 	dynamicProviderValidationPending atomic.Bool
 	azureIdentityTokenSourceFactory  azureIdentityTokenSourceFactory
@@ -269,6 +292,287 @@ type ProxyHandler struct {
 	buildGoVersion                   string
 	insightGate                      *insightGate
 	insightGateOnce                  sync.Once
+}
+
+// initializeLifecycle installs the proxy-owned cancellation root used by
+// detached upstream work. sync.Once keeps zero-value handlers used by focused
+// tests safe while NewProxyHandler initializes the lifecycle eagerly.
+func (h *ProxyHandler) initializeLifecycle() {
+	if h == nil {
+		return
+	}
+	h.lifecycleOnce.Do(func() {
+		h.lifecycleCtx, h.lifecycleCancel = context.WithCancelCause(context.Background())
+	})
+}
+
+func (h *ProxyHandler) lifecycleContext() context.Context {
+	if h == nil {
+		return context.Background()
+	}
+	h.initializeLifecycle()
+	return h.lifecycleCtx
+}
+
+// BeginShutdown idempotently cancels proxy-owned upstream work. Existing and
+// future lifecycle-rooted contexts observe cancellation immediately, while
+// ordinary inference remains detached from inbound client disconnects before
+// shutdown begins.
+func (h *ProxyHandler) BeginShutdown() {
+	if h == nil {
+		return
+	}
+	h.shutdownSequenceOnce.Do(func() {
+		publishResponsesLifecycleSequence(func(sequence uint64) {
+			h.shutdownSequence.Store(sequence)
+		})
+	})
+	h.draining.Store(true)
+	h.initializeLifecycle()
+	h.lifecycleCancel(errProxyLifecycleShutdown)
+	if h.client != nil {
+		h.client.CloseIdleConnections()
+	}
+}
+
+// ShuttingDown reports whether admission has closed and lifecycle cancellation
+// has begun. It becomes true before BeginShutdown cancels upstream contexts.
+func (h *ProxyHandler) ShuttingDown() bool {
+	return h != nil && h.draining.Load()
+}
+
+func (h *ProxyHandler) upstreamShutdownStarted() bool {
+	return h.ShuttingDown()
+}
+
+// BindRequestBodyToLifecycle makes a request body read interruptible by proxy
+// shutdown without changing the inbound request context. The separate cause
+// context preserves whether client cancellation or lifecycle shutdown happened
+// first, so a client disconnect racing shutdown is not rewritten as a local 503.
+func (h *ProxyHandler) BindRequestBodyToLifecycle(r *http.Request, forceClose func()) func() {
+	if h == nil || r == nil || r.Body == nil || r.Body == http.NoBody {
+		return func() {}
+	}
+
+	causeCtx, cancelCause := context.WithCancelCause(r.Context())
+	body := &lifecycleRequestBody{ReadCloser: r.Body, causeCtx: causeCtx}
+	r.Body = body
+
+	cancelForShutdown := func() {
+		cancelCause(errProxyLifecycleShutdown)
+		if !body.complete.Load() && forceClose != nil {
+			forceClose()
+			return
+		}
+		_ = body.Close()
+	}
+	stopLifecycle := context.AfterFunc(h.lifecycleContext(), cancelForShutdown)
+	if h.ShuttingDown() {
+		cancelForShutdown()
+	}
+
+	return func() {
+		stopLifecycle()
+		cancelCause(context.Canceled)
+	}
+}
+
+type lifecycleRequestBody struct {
+	io.ReadCloser
+	causeCtx context.Context
+	closeMu  sync.Mutex
+	closed   bool
+	closeErr error
+	complete atomic.Bool
+}
+
+func (b *lifecycleRequestBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if errors.Is(err, io.EOF) {
+		b.complete.Store(true)
+	}
+	if err != nil && b.causeCtx != nil && errors.Is(context.Cause(b.causeCtx), errProxyLifecycleShutdown) {
+		return n, errProxyLifecycleShutdown
+	}
+	return n, err
+}
+
+func (b *lifecycleRequestBody) Close() error {
+	if b == nil || b.ReadCloser == nil {
+		return nil
+	}
+	b.closeMu.Lock()
+	defer b.closeMu.Unlock()
+	if !b.closed {
+		b.closed = true
+		b.closeErr = b.ReadCloser.Close()
+	}
+	return b.closeErr
+}
+
+func (h *ProxyHandler) beginLifecycleWorker() bool {
+	if h == nil {
+		return false
+	}
+	h.lifecycleWorkersMu.Lock()
+	defer h.lifecycleWorkersMu.Unlock()
+	if h.ShuttingDown() {
+		return false
+	}
+	h.lifecycleWorkers.Add(1)
+	h.lifecycleWorkersActive++
+	return true
+}
+
+func (h *ProxyHandler) endLifecycleWorker() {
+	if h == nil {
+		return
+	}
+	h.lifecycleWorkersMu.Lock()
+	h.lifecycleWorkersActive--
+	h.lifecycleWorkers.Done()
+	h.lifecycleWorkersMu.Unlock()
+}
+
+// WaitLifecycleWorkers waits for proxy-owned detached workers after admission
+// has closed. The mutex pairs worker registration with the transition to Wait,
+// preventing a WaitGroup Add/Wait race while shutdown starts. Already-complete
+// work wins over an expired shutdown context so repeated Stop calls do not add
+// a duplicate deadline error.
+func (h *ProxyHandler) WaitLifecycleWorkers(ctx context.Context) error {
+	if h == nil {
+		return nil
+	}
+	h.lifecycleWorkersMu.Lock()
+	if h.lifecycleWorkersActive == 0 {
+		h.lifecycleWorkersMu.Unlock()
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		h.lifecycleWorkers.Wait()
+		close(done)
+	}()
+	h.lifecycleWorkersMu.Unlock()
+
+	if ctx == nil {
+		<-done
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	default:
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+		h.lifecycleWorkersMu.Lock()
+		completed := h.lifecycleWorkersActive == 0
+		h.lifecycleWorkersMu.Unlock()
+		if completed {
+			return nil
+		}
+		return ctx.Err()
+	}
+}
+
+func (h *ProxyHandler) handleResponseBodyWriteError(w http.ResponseWriter, r *http.Request, upstreamCtx context.Context, endpoint string, err error) bool {
+	var bodyErr *responseBodyWriteError
+	if !errors.As(err, &bodyErr) {
+		return false
+	}
+	if !bodyErr.upstream {
+		return true
+	}
+	if bodyErr.statusCode < http.StatusOK || bodyErr.statusCode >= http.StatusMultipleChoices {
+		return true
+	}
+	if bodyErr.cancellationAtFailure && h.ShuttingDown() && upstreamCtx != nil && errors.Is(context.Cause(upstreamCtx), errProxyLifecycleShutdown) {
+		if bodyErr.committed {
+			if r != nil {
+				suppressRequestStats(r.Context())
+			}
+		} else {
+			h.WriteShutdownServiceUnavailable(w, r)
+		}
+		return true
+	}
+	if bodyErr.committed {
+		if r != nil {
+			observeResponseFailureStatus(r.Context(), http.StatusBadGateway)
+		}
+		if h.log != nil {
+			h.log.Error("upstream response body failed", logger.F("endpoint", endpoint), logger.Err(err))
+		}
+		return true
+	}
+	return false
+}
+
+func (h *ProxyHandler) handleShutdownError(w http.ResponseWriter, r *http.Request, upstreamCtx context.Context, err error) bool {
+	if err == nil || !h.ShuttingDown() {
+		return false
+	}
+	lifecycleCanceled := errors.Is(err, errProxyLifecycleShutdown)
+	if !lifecycleCanceled && upstreamCtx != nil && errors.Is(context.Cause(upstreamCtx), errProxyLifecycleShutdown) {
+		lifecycleCanceled = contextTerminationMatches(upstreamCtx, err)
+	}
+	if !lifecycleCanceled {
+		return false
+	}
+	h.WriteShutdownServiceUnavailable(w, r)
+	return true
+}
+
+// WriteShutdownServiceUnavailable marks the request as locally suppressed from
+// provider stats and writes a protocol-appropriate 503 response. Callers must
+// use it only before committing a streaming response.
+func (h *ProxyHandler) WriteShutdownServiceUnavailable(w http.ResponseWriter, r *http.Request) {
+	if r != nil {
+		suppressRequestStats(r.Context())
+	}
+	if w == nil {
+		return
+	}
+	headers := w.Header()
+	clear(headers)
+	headers.Set("Cache-Control", "no-store")
+	headers.Set("Retry-After", "1")
+	path := ""
+	if r != nil && r.URL != nil {
+		path = r.URL.Path
+	}
+	switch {
+	case path == "/v1/messages" || path == "/v1/messages/count_tokens":
+		writeAnthropicError(w, http.StatusServiceUnavailable, "overloaded_error", "server shutting down")
+	case isGeminiModelsPath(path):
+		writeGeminiError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "server shutting down")
+	default:
+		writeOpenAIError(w, http.StatusServiceUnavailable, "server shutting down", "service_unavailable")
+	}
+}
+
+func (h *ProxyHandler) lifecycleStreamHooks(observeCtx context.Context, canceledAtFailure func() bool, precommit ...func()) streamLifecycleHooks {
+	var writePrecommitShutdown func()
+	if len(precommit) > 0 {
+		writePrecommitShutdown = precommit[0]
+	}
+	return streamLifecycleHooks{
+		transportCanceled: func() bool {
+			return h.ShuttingDown() && canceledAtFailure != nil && canceledAtFailure()
+		},
+		suppressStats: func() {
+			suppressRequestStats(observeCtx)
+		},
+		writePrecommitShutdown: writePrecommitShutdown,
+	}
 }
 
 type compactLearnedTargetKey struct {
@@ -502,6 +806,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		log:                             log,
 		stats:                           newStatsCollector(),
 	}
+	h.initializeLifecycle()
 	for _, opt := range opts {
 		if opt != nil {
 			opt(h)
@@ -513,6 +818,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 	}
 	h.initializeToolOptimizers()
 	if err := h.initializeProviders(); err != nil {
+		h.BeginShutdown()
 		return nil, err
 	}
 	h.validateInsightModel()
@@ -740,6 +1046,148 @@ func writeCachedModelsResponse(w http.ResponseWriter, entry cachedModelsResponse
 	_, _ = w.Write(entry.body)
 }
 
+func (h *ProxyHandler) storeModelsCacheEntry(cacheKey string, entry cachedModelsResponse) {
+	if h == nil {
+		return
+	}
+
+	now := h.models.nowTime()
+	h.models.mu.Lock()
+	defer h.models.mu.Unlock()
+
+	if h.models.entries == nil {
+		h.models.entries = make(map[string]cachedModelsResponse)
+	}
+	for key, cached := range h.models.entries {
+		if key == "" {
+			continue
+		}
+		if !cached.expiry.IsZero() && !now.Before(cached.expiry) {
+			delete(h.models.entries, key)
+		}
+	}
+
+	delete(h.models.entries, cacheKey)
+	for len(h.models.entries) >= modelsCacheMaxEntries {
+		evictionKey, ok := oldestModelsCacheEntry(h.models.entries, true)
+		if !ok {
+			evictionKey, ok = oldestModelsCacheEntry(h.models.entries, false)
+		}
+		if !ok {
+			break
+		}
+		delete(h.models.entries, evictionKey)
+	}
+	h.models.entries[cacheKey] = entry
+}
+
+func oldestModelsCacheEntry(entries map[string]cachedModelsResponse, skipCanonical bool) (string, bool) {
+	var oldestKey string
+	var oldestExpiry time.Time
+	found := false
+	for key, entry := range entries {
+		if skipCanonical && key == "" {
+			continue
+		}
+		if !found || entry.expiry.Before(oldestExpiry) {
+			oldestKey = key
+			oldestExpiry = entry.expiry
+			found = true
+		}
+	}
+	return oldestKey, found
+}
+
+func isCanonicalModelsQuery(rawQuery string) bool {
+	return strings.TrimSpace(rawQuery) == ""
+}
+
+func (h *ProxyHandler) replaceModelsCacheWithCanonical(entry cachedModelsResponse) {
+	if h == nil {
+		return
+	}
+	h.models.mu.Lock()
+	h.models.entries = map[string]cachedModelsResponse{"": entry}
+	h.models.canonicalFailureUntil = time.Time{}
+	h.models.canonicalFailureErr = nil
+	h.models.mu.Unlock()
+}
+
+func (h *ProxyHandler) ensureCanonicalModelsCacheEntry(ctx, waitCtx context.Context) (cachedModelsResponse, bool, error) {
+	if h == nil {
+		return cachedModelsResponse{}, false, fmt.Errorf("proxy handler is required")
+	}
+
+	now := h.models.nowTime()
+	entry, ok, failureErr := h.canonicalModelsCacheState(now)
+	if failureErr != nil || (ok && now.Before(entry.expiry)) {
+		return entry, ok, failureErr
+	}
+
+	result := h.models.doFlight(waitCtx, "", func() modelsCacheFlightResult {
+		now := h.models.nowTime()
+		entry, ok, failureErr := h.canonicalModelsCacheState(now)
+		if failureErr != nil || (ok && now.Before(entry.expiry)) {
+			return modelsCacheFlightResult{entry: entry, hasEntry: ok, err: failureErr}
+		}
+
+		ifNoneMatch := ""
+		if ok {
+			ifNoneMatch = entry.etag
+		}
+		refreshed, notModified, err := h.buildMergedModelsEntry(ctx, "", ifNoneMatch)
+		if err != nil {
+			h.recordCanonicalModelsRefreshFailure(h.models.nowTime(), err)
+			return modelsCacheFlightResult{entry: entry, hasEntry: ok, err: err}
+		}
+		if notModified {
+			if !ok {
+				err := fmt.Errorf("canonical models request unexpectedly returned not modified without a cached entry")
+				h.recordCanonicalModelsRefreshFailure(h.models.nowTime(), err)
+				return modelsCacheFlightResult{err: err}
+			}
+			entry.expiry = h.models.nowTime().Add(modelsCacheTTL)
+			h.storeModelsCacheEntry("", entry)
+			h.clearCanonicalModelsRefreshFailure()
+			return modelsCacheFlightResult{entry: entry, hasEntry: true}
+		}
+		if refreshed.statusCode != http.StatusOK {
+			err := fmt.Errorf("canonical models request returned status %d", refreshed.statusCode)
+			h.recordCanonicalModelsRefreshFailure(h.models.nowTime(), err)
+			return modelsCacheFlightResult{entry: entry, hasEntry: ok, err: err}
+		}
+		h.replaceModelsCacheWithCanonical(refreshed)
+		return modelsCacheFlightResult{entry: refreshed, hasEntry: true}
+	})
+
+	return result.entry, result.hasEntry, result.err
+}
+
+func (h *ProxyHandler) canonicalModelsCacheState(now time.Time) (cachedModelsResponse, bool, error) {
+	h.models.mu.RLock()
+	defer h.models.mu.RUnlock()
+
+	entry, ok := h.models.entries[""]
+	if h.models.canonicalFailureErr != nil && now.Before(h.models.canonicalFailureUntil) {
+		return entry, ok, h.models.canonicalFailureErr
+	}
+	return entry, ok, nil
+}
+
+func (h *ProxyHandler) recordCanonicalModelsRefreshFailure(now time.Time, err error) {
+	h.models.mu.Lock()
+	h.models.canonicalFailureUntil = now.Add(modelsCacheFailureBackoff)
+	h.models.canonicalFailureErr = err
+	h.models.mu.Unlock()
+}
+
+func (h *ProxyHandler) clearCanonicalModelsRefreshFailure() {
+	h.models.mu.Lock()
+	h.models.canonicalFailureUntil = time.Time{}
+	h.models.canonicalFailureErr = nil
+	h.models.mu.Unlock()
+}
+
 // HandleHealthz handles GET /healthz and returns {"status":"ok"}.
 func (h *ProxyHandler) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -815,6 +1263,8 @@ func providerSkipsReadyzProbe(provider *providerRuntime) bool {
 		return false
 	}
 	switch provider.kind {
+	case providerTypeAzureOpenAI:
+		return true
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		return provider.modelDiscovery == providerModelDiscoveryStatic
 	default:
@@ -908,7 +1358,41 @@ func writeReadyzStatus(w http.ResponseWriter, statusCode int, status string, err
 // repeated upstream calls.
 func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	cacheKey := r.URL.RawQuery
-	now := time.Now()
+	canonicalQuery := isCanonicalModelsQuery(cacheKey)
+
+	ctx, cancel := h.newLifecycleUpstreamContext(modelsUpstreamTimeout)
+	defer cancel()
+
+	canonicalEntry, hasCanonicalEntry, err := h.ensureCanonicalModelsCacheEntry(ctx, r.Context())
+	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		if h.handleShutdownError(w, r, ctx, err) {
+			return
+		}
+		h.log.Error("upstream request failed", logger.F("endpoint", "models"), logger.Err(err))
+		if canonicalQuery && hasCanonicalEntry {
+			writeCachedModelsResponse(w, canonicalEntry)
+			return
+		}
+		if !canonicalQuery && hasCanonicalEntry {
+			h.models.mu.RLock()
+			cachedEntry, hasCachedEntry := h.models.entries[cacheKey]
+			h.models.mu.RUnlock()
+			if hasCachedEntry {
+				writeCachedModelsResponse(w, cachedEntry)
+				return
+			}
+		}
+		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
+		return
+	}
+	if canonicalQuery {
+		writeCachedModelsResponse(w, canonicalEntry)
+		return
+	}
 
 	var cachedEntry cachedModelsResponse
 	var hasCachedEntry bool
@@ -919,51 +1403,28 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	h.models.mu.RUnlock()
 
 	// Without an ETag we cannot safely revalidate, so honor the TTL-based cache.
-	if hasCachedEntry && cachedEntry.etag == "" && now.Before(cachedEntry.expiry) {
+	if hasCachedEntry && cachedEntry.etag == "" && h.models.nowTime().Before(cachedEntry.expiry) {
 		writeCachedModelsResponse(w, cachedEntry)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), modelsUpstreamTimeout)
-	defer cancel()
-
-	conditionalETag := ""
-	if hasCachedEntry {
-		conditionalETag = cachedEntry.etag
-	}
-	entry, notModified, err := h.buildMergedModelsEntry(ctx, cacheKey, conditionalETag)
+	result := h.refreshModelsCacheVariant(r.Context(), cacheKey)
+	entry, hasCachedEntry, err := result.entry, result.hasEntry, result.err
 	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		if h.handleShutdownError(w, r, ctx, err) {
+			return
+		}
 		h.log.Error("upstream request failed", logger.F("endpoint", "models"), logger.Err(err))
 		if hasCachedEntry {
-			writeCachedModelsResponse(w, cachedEntry)
+			writeCachedModelsResponse(w, entry)
 			return
 		}
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
 		return
-	}
-
-	if notModified && hasCachedEntry {
-		cachedEntry.expiry = time.Now().Add(modelsCacheTTL)
-		h.models.mu.Lock()
-		if h.models.entries == nil {
-			h.models.entries = make(map[string]cachedModelsResponse)
-		}
-		h.models.entries[cacheKey] = cachedEntry
-		h.models.mu.Unlock()
-
-		writeCachedModelsResponse(w, cachedEntry)
-		return
-	}
-
-	// Cache successful responses
-	if entry.statusCode == http.StatusOK {
-		h.models.mu.Lock()
-		if h.models.entries == nil {
-			h.models.entries = make(map[string]cachedModelsResponse)
-		}
-		h.models.entries[cacheKey] = entry
-		h.models.mu.Unlock()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -974,8 +1435,48 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(entry.body)
 }
 
+func (h *ProxyHandler) refreshModelsCacheVariant(waitCtx context.Context, cacheKey string) modelsCacheFlightResult {
+	return h.models.doFlight(waitCtx, cacheKey, func() modelsCacheFlightResult {
+		ctx, cancel := h.newLifecycleUpstreamContext(modelsUpstreamTimeout)
+		defer cancel()
+
+		now := h.models.nowTime()
+		h.models.mu.RLock()
+		cachedEntry, hasCachedEntry := h.models.entries[cacheKey]
+		h.models.mu.RUnlock()
+
+		// Query variants intentionally do not send conditional ETags because a
+		// provider-local 304 cannot safely reconstruct a merged multi-provider
+		// variant. Entries without ETags remain ordinary TTL caches.
+		if hasCachedEntry && cachedEntry.etag == "" && now.Before(cachedEntry.expiry) {
+			return modelsCacheFlightResult{entry: cachedEntry, hasEntry: true}
+		}
+
+		entry, notModified, err := h.buildMergedModelsEntry(ctx, cacheKey, "")
+		if err != nil {
+			if errors.Is(context.Cause(ctx), errProxyLifecycleShutdown) && contextTerminationMatches(ctx, err) {
+				err = errProxyLifecycleShutdown
+			}
+			return modelsCacheFlightResult{entry: cachedEntry, hasEntry: hasCachedEntry, err: err}
+		}
+		if notModified {
+			if !hasCachedEntry {
+				return modelsCacheFlightResult{err: fmt.Errorf("models query variant %q unexpectedly returned not modified without a cached entry", cacheKey)}
+			}
+			cachedEntry.expiry = h.models.nowTime().Add(modelsCacheTTL)
+			h.storeModelsCacheEntry(cacheKey, cachedEntry)
+			return modelsCacheFlightResult{entry: cachedEntry, hasEntry: true}
+		}
+		if entry.statusCode == http.StatusOK {
+			h.storeModelsCacheEntry(cacheKey, entry)
+		}
+		return modelsCacheFlightResult{entry: entry, hasEntry: entry.statusCode == http.StatusOK}
+	})
+}
+
 func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifNoneMatch string) (cachedModelsResponse, bool, error) {
 	setup := h.providerSetup()
+	canonicalRefresh := isCanonicalModelsQuery(rawQuery)
 	rawEntries := make([]json.RawMessage, 0)
 	owners := make(map[string]string)
 	refreshedDynamicModels := make(map[string][]providerModel)
@@ -1016,7 +1517,9 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 				continue
 			}
 			allDynamicProvidersUnchanged = false
-			refreshedDynamicModels[provider.id] = models
+			if canonicalRefresh {
+				refreshedDynamicModels[provider.id] = models
+			}
 			if result.etag != "" {
 				mergedETag = result.etag
 			}
@@ -1058,7 +1561,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 	return cachedModelsResponse{
 		body:       transformModelsResponse(body),
 		statusCode: http.StatusOK,
-		expiry:     time.Now().Add(modelsCacheTTL),
+		expiry:     h.models.nowTime().Add(modelsCacheTTL),
 		etag:       mergedETag,
 	}, false, nil
 }

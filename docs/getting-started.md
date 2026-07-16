@@ -30,7 +30,8 @@ go build -o vekil .
 Base run:
 
 ```bash
-docker run -p 1337:1337 \
+mkdir -p ~/.config/vekil
+docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot -p 1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   ghcr.io/sozercan/vekil:latest
 ```
@@ -40,27 +41,29 @@ The image sets `HOST=0.0.0.0` so published Docker ports work. Native binary and 
 With explicit provider routing:
 
 ```bash
-docker run -p 1337:1337 \
+mkdir -p ~/.config/vekil
+docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot -p 1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   -v /path/to/providers.yaml:/config/providers.yaml:ro \
   ghcr.io/sozercan/vekil:latest \
   --providers-config /config/providers.yaml
 ```
 
-If the config includes `type: "openai-codex"`, also mount the Codex home read-only:
+If the config includes `type: "openai-codex"`, also mount the Codex home read-write so Vekil can journal and persist rotated refresh tokens back to the Codex-owned `auth.json`. The `--user` setting above is required for normal host files/directories owned by your UID/GID; alternatively, arrange equivalent ownership and permissions explicitly:
 
 ```bash
--v ~/.codex:/home/nonroot/.codex:ro
+-v ~/.codex:/home/nonroot/.codex
 ```
 
-If you customize `CODEX_HOME`, set the container-side path and mount your host directory there. The published image supports `linux/amd64` and `linux/arm64`.
+If you intentionally mount it read-only, fresh access tokens work until they become stale, but Vekil cannot refresh them; run `codex login` on the host and restart the container. If you customize `CODEX_HOME`, set the container-side path and mount your host directory there. The published image supports `linux/amd64` and `linux/arm64`.
 
 ### RTK image variant
 
 Use the `-rtk` image variant when your providers config enables the optional [`rtk_cli` tool optimizer](tool-optimizers.md#rtk_cli-provider). The default image stays minimal; the RTK variant only adds the `rtk` binary and does not enable tool optimizers by itself.
 
 ```bash
-docker run -p 1337:1337 \
+mkdir -p ~/.config/vekil
+docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot -p 1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   -v /path/to/providers.yaml:/config/providers.yaml:ro \
   ghcr.io/sozercan/vekil:latest-rtk \
@@ -75,7 +78,8 @@ Build a local image:
 docker build -t vekil .
 # Optional RTK variant:
 # docker build -f Dockerfile.rtk -t vekil:rtk .
-docker run -p 1337:1337 \
+mkdir -p ~/.config/vekil
+docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot -p 1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   vekil
 ```
@@ -87,6 +91,15 @@ A sample manifest is included at [`k8s/vekil.yaml`](../k8s/vekil.yaml).
 ```bash
 kubectl apply -f k8s/vekil.yaml
 ```
+
+The manifest first uses `/healthz` as a startup probe with a 90-second failure budget. This covers synchronous dynamic-provider model initialization, which can take up to 30 seconds before the HTTP listener exists; Kubernetes suppresses liveness and readiness checks until startup succeeds. Afterward, `/healthz` provides liveness and `/readyz` provides readiness. The readiness probe allows 12 seconds, leaving margin over Vekil's 10-second provider readiness check, and runs every 15 seconds with a single failure threshold. With the default zero-config Copilot startup, the process can therefore stay live while device-code authentication is pending, but the Pod remains not Ready and the Service has no ready endpoint until authentication succeeds.
+
+The example token cache is an `emptyDir`. It survives a container restart inside the same Pod, but **does not survive Pod replacement, rescheduling, or a Deployment rollout**. For a durable deployment, either:
+
+- inject `COPILOT_GITHUB_TOKEN` from a Kubernetes Secret so every replacement can authenticate non-interactively, or
+- replace the `emptyDir` with persistent storage if you rely on Vekil-managed cached credentials.
+
+Explicit provider routing also needs the provider file to exist in the container. Mount the JSON/YAML config from a Secret or ConfigMap and add `--providers-config /path/in/container/providers.yaml` to the container args. Any `api_key_env` or other credential environment variables referenced by that file must be supplied separately, normally from Secrets. Do not assume the example `emptyDir` persists either provider credentials or configuration.
 
 ## First Run And Authentication
 

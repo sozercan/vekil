@@ -87,6 +87,66 @@ func TestProviderEndpointPolicyDefaults(t *testing.T) {
 	}
 }
 
+func TestNeedsDynamicProviderModelValidation(t *testing.T) {
+	t.Parallel()
+
+	dynamic := func() *providerRuntime {
+		return &providerRuntime{kind: providerTypeOpenAICompatible, modelDiscovery: providerModelDiscoveryOpenAI}
+	}
+	static := func() *providerRuntime {
+		return &providerRuntime{kind: providerTypeOpenAICompatible, modelDiscovery: providerModelDiscoveryStatic}
+	}
+
+	tests := []struct {
+		name      string
+		providers map[string]*providerRuntime
+		want      bool
+	}{
+		{name: "no providers", providers: nil, want: false},
+		{name: "single static provider", providers: map[string]*providerRuntime{"static": static()}, want: false},
+		{name: "single unfiltered dynamic provider", providers: map[string]*providerRuntime{"dynamic": dynamic()}, want: false},
+		{
+			name: "single dynamic provider with include_models",
+			providers: map[string]*providerRuntime{
+				"dynamic": {kind: providerTypeOpenAICompatible, modelDiscovery: providerModelDiscoveryOpenAI, includeModels: map[string]struct{}{"allowed": {}}},
+			},
+			want: true,
+		},
+		{
+			name: "single dynamic provider with exclude_models",
+			providers: map[string]*providerRuntime{
+				"dynamic": {kind: providerTypeOpenAICompatible, modelDiscovery: providerModelDiscoveryOpenAI, excludeModels: map[string]struct{}{"blocked": {}}},
+			},
+			want: true,
+		},
+		{
+			name: "multiple providers with a dynamic provider",
+			providers: map[string]*providerRuntime{
+				"dynamic": dynamic(),
+				"static":  static(),
+			},
+			want: true,
+		},
+		{
+			name: "multiple static providers",
+			providers: map[string]*providerRuntime{
+				"first":  static(),
+				"second": static(),
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := needsDynamicProviderModelValidation(tt.providers); got != tt.want {
+				t.Fatalf("needsDynamicProviderModelValidation() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestProviderEndpointPolicyRouting(t *testing.T) {
 	t.Parallel()
 
@@ -107,11 +167,11 @@ func TestProviderEndpointPolicyRouting(t *testing.T) {
 			wantDiscoveredModel: true,
 		},
 		{
-			name:                "azure preserves legacy unknown model routing",
+			name:                "azure configured catalog rejects unknown models",
 			provider:            providerRuntime{kind: providerTypeAzureOpenAI},
 			endpoint:            providerEndpointResponses,
 			wantSupports:        true,
-			wantUnknownModel:    true,
+			wantUnknownModel:    false,
 			wantDiscoveredModel: true,
 		},
 		{
@@ -144,6 +204,18 @@ func TestProviderEndpointPolicyRouting(t *testing.T) {
 			endpoint:            providerEndpointChatCompletions,
 			wantSupports:        true,
 			wantUnknownModel:    true,
+			wantDiscoveredModel: true,
+		},
+		{
+			name: "filtered dynamic openai compatible rejects unknown chat models",
+			provider: providerRuntime{
+				kind:           providerTypeOpenAICompatible,
+				modelDiscovery: providerModelDiscoveryOpenAI,
+				includeModels:  map[string]struct{}{"allowed": {}},
+			},
+			endpoint:            providerEndpointChatCompletions,
+			wantSupports:        true,
+			wantUnknownModel:    false,
 			wantDiscoveredModel: true,
 		},
 		{

@@ -9,7 +9,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -77,12 +76,8 @@ func parseRetryAfter(value string) (time.Duration, bool) {
 	if value == "" {
 		return 0, false
 	}
-	seconds, err := strconv.Atoi(value)
-	if err == nil {
-		if seconds <= 0 {
-			return 0, false
-		}
-		return clampRetryAfter(time.Duration(seconds) * time.Second), true
+	if seconds, ok := parsePositiveDecimalClamped(value, int64(maxRetryAfter/time.Second)); ok {
+		return retryAfterDurationFromSeconds(seconds), true
 	}
 
 	retryAt, err := http.ParseTime(value)
@@ -103,12 +98,110 @@ func clampRetryAfter(delay time.Duration) time.Duration {
 	return delay
 }
 
+func retryAfterDurationFromSeconds(seconds int64) time.Duration {
+	if seconds <= 0 {
+		return 0
+	}
+	maxSeconds := int64(maxRetryAfter / time.Second)
+	if seconds >= maxSeconds {
+		return maxRetryAfter
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func parsePositiveDecimalClamped(value string, max int64) (int64, bool) {
+	if value == "" || max <= 0 {
+		return 0, false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return 0, false
+		}
+	}
+	var parsed int64
+	for i := 0; i < len(value); i++ {
+		digit := int64(value[i] - '0')
+		if parsed > (max-digit)/10 {
+			return max, true
+		}
+		parsed = parsed*10 + digit
+	}
+	if parsed <= 0 {
+		return 0, false
+	}
+	return parsed, true
+}
+
+func retryAfterDurationFromMilliseconds(milliseconds int64) time.Duration {
+	if milliseconds <= 0 {
+		return 0
+	}
+	maxMilliseconds := int64(maxRetryAfter / time.Millisecond)
+	if milliseconds >= maxMilliseconds {
+		return maxRetryAfter
+	}
+	return time.Duration(milliseconds) * time.Millisecond
+}
+
+func durationSecondsCeil(delay time.Duration) int64 {
+	if delay <= 0 {
+		return 0
+	}
+	seconds := int64(delay / time.Second)
+	if delay%time.Second != 0 {
+		seconds++
+	}
+	return seconds
+}
+
 // drainAndClose discards up to 4 KB from the body before closing it so that
 // HTTP/2 streams are cleanly consumed and the underlying connection can be
-// reused instead of being reset.
+// reused instead of being reset. The read is time-bounded because a response
+// body can yield a short prefix and then stall indefinitely.
 func drainAndClose(body io.ReadCloser) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, 4096))
-	_ = body.Close()
+	_ = captureAndDrainResponseBody(body, upstreamErrorDetailMaxBodyBytes, 0)
+}
+
+// drainReaderAndClose consumes reader through EOF before closing body so an
+// HTTP/1.x transport can reuse a normally completed response connection. If the
+// reader stalls, the existing upstream-body timeout closes it and lets the
+// caller return without waiting indefinitely. The reader may wrap body (for
+// example, a bufio.Reader with already-buffered bytes), so callers must pass the
+// reader they were actively consuming rather than body directly.
+func drainReaderAndClose(reader io.Reader, body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	if reader == nil {
+		_ = body.Close()
+		return
+	}
+
+	var closeOnce sync.Once
+	closeBody := func() {
+		closeOnce.Do(func() { _ = body.Close() })
+	}
+
+	timedOut := make(chan struct{})
+	timer := time.AfterFunc(upstreamErrorDetailDrainTimeout, func() {
+		// Signal first so a pathological Close implementation cannot extend the
+		// caller-visible timeout. net/http response bodies unblock Read on Close.
+		close(timedOut)
+		closeBody()
+	})
+
+	drained := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, reader)
+		_ = timer.Stop()
+		closeBody()
+		close(drained)
+	}()
+
+	select {
+	case <-drained:
+	case <-timedOut:
+	}
 }
 
 // doWithRetry executes an HTTP request with retry on transient failures.
@@ -123,25 +216,60 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		retryDelay = 1 * time.Second
 	}
 
+	type pendingRetryAttempt struct {
+		attempt     int
+		status      int
+		retryAfter  string
+		delay       time.Duration
+		err         error
+		upstreamErr *upstreamError
+		requestCtx  context.Context
+	}
 	var lastErr error
+	var pending *pendingRetryAttempt
 	for attempt := range maxRetries {
 		req, err := reqFactory()
 		if err != nil {
+			if pending != nil && pending.upstreamErr != nil && pending.requestCtx != nil &&
+				errors.Is(err, context.Canceled) && errors.Is(context.Cause(pending.requestCtx), errProxyLifecycleShutdown) {
+				return nil, pending.upstreamErr
+			}
 			return nil, err
+		}
+		if ctxErr := req.Context().Err(); ctxErr != nil {
+			if pending != nil && pending.upstreamErr != nil {
+				return nil, pending.upstreamErr
+			}
+			return nil, ctxErr
 		}
 
 		resp, err := h.client.Do(req)
+		lifecyclePreempted := errors.Is(context.Cause(req.Context()), errProxyLifecycleShutdown) &&
+			contextTerminationMatches(req.Context(), err)
+		if pending != nil && !lifecyclePreempted {
+			h.logRetryAttempt(req.Context(), pending.attempt, pending.status, pending.retryAfter, pending.delay, pending.err)
+		}
+		pending = nil
 		if err != nil {
+			if contextTerminationMatches(req.Context(), err) {
+				return nil, req.Context().Err()
+			}
 			lastErr = err
 			if permanentTransportError(err) {
 				return nil, err
 			}
 			if attempt < maxRetries-1 {
 				delay := backoff(retryDelay, attempt)
-				h.logRetryAttempt(req.Context(), attempt, 0, "", delay, err)
+				if req.Context().Err() != nil {
+					return nil, err
+				}
 				if ctxErr := sleepWithContext(req.Context(), delay); ctxErr != nil {
 					return nil, ctxErr
 				}
+				if ctxErr := req.Context().Err(); ctxErr != nil {
+					return nil, ctxErr
+				}
+				pending = &pendingRetryAttempt{attempt: attempt, delay: delay, err: err}
 			}
 			continue
 		}
@@ -159,21 +287,59 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		lastErr = upstreamErr
 
 		if attempt < maxRetries-1 {
+			if req.Context().Err() != nil {
+				drainAndClose(resp.Body)
+				return nil, upstreamErr
+			}
 			// Drain and close body before retry to allow connection reuse.
 			drainAndClose(resp.Body)
+			if req.Context().Err() != nil {
+				return nil, upstreamErr
+			}
 			delay := backoff(retryDelay, attempt)
 			if ra, ok := parseRetryAfter(retryAfterHeader); ok && ra > delay {
 				delay = ra
 			}
-			h.logRetryAttempt(req.Context(), attempt, resp.StatusCode, retryAfterHeader, delay, nil)
+			if req.Context().Err() != nil {
+				return nil, upstreamErr
+			}
 			if ctxErr := sleepWithContext(req.Context(), delay); ctxErr != nil {
-				return nil, ctxErr
+				return nil, upstreamErr
+			}
+			if req.Context().Err() != nil {
+				return nil, upstreamErr
+			}
+			pending = &pendingRetryAttempt{
+				attempt:     attempt,
+				status:      resp.StatusCode,
+				retryAfter:  retryAfterHeader,
+				delay:       delay,
+				upstreamErr: upstreamErr,
+				requestCtx:  req.Context(),
 			}
 		} else {
 			upstreamErr.body = readRetryableUpstreamErrorBody(resp.Body)
 		}
 	}
 	return nil, lastErr
+}
+
+func contextTerminationMatches(ctx context.Context, err error) bool {
+	if ctx == nil || ctx.Err() == nil || err == nil {
+		return false
+	}
+	errCanceled := errors.Is(err, context.Canceled)
+	errDeadline := errors.Is(err, context.DeadlineExceeded)
+	if errors.Is(context.Cause(ctx), errProxyLifecycleShutdown) {
+		return errCanceled && !errDeadline
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return errDeadline
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return errCanceled && !errDeadline
+	}
+	return false
 }
 
 func (h *ProxyHandler) logRetryAttempt(ctx context.Context, attempt int, status int, retryAfter string, delay time.Duration, err error) {
@@ -273,27 +439,118 @@ func (e *upstreamError) Error() string {
 }
 
 func readRetryableUpstreamErrorBody(body io.ReadCloser) []byte {
+	return captureAndDrainResponseBody(body, upstreamErrorDetailMaxBodyBytes, upstreamErrorDetailDrainBytes)
+}
+
+type responseBodyReadProgress struct {
+	captured        []byte
+	captureComplete bool
+}
+
+// captureAndDrainResponseBody captures up to captureBytes and then drains up to
+// drainBytes more before closing the body. It returns as soon as capture is
+// complete, EOF is reached, or the timeout expires; any remaining bounded drain
+// continues asynchronously so normal short responses can still leave their
+// connection reusable. Progress is sent as owned byte slices so a timed-out
+// caller can safely return the short prefix already received while Close
+// interrupts a stalled Read.
+func captureAndDrainResponseBody(body io.ReadCloser, captureBytes, drainBytes int) []byte {
 	if body == nil {
 		return nil
 	}
-	bodyBytes, _ := io.ReadAll(io.LimitReader(body, upstreamErrorDetailMaxBodyBytes))
-	drainRetryableUpstreamErrorBody(body)
-	return bodyBytes
-}
+	if captureBytes <= 0 {
+		_ = body.Close()
+		return nil
+	}
+	if drainBytes < 0 {
+		drainBytes = 0
+	}
 
-func drainRetryableUpstreamErrorBody(body io.ReadCloser) {
-	// Drain a bounded remainder after the bounded capture. This preserves
-	// connection reuse for normal upstream error bodies without letting a huge or
-	// stalled body delay returning the synthesized error indefinitely.
+	var closeOnce sync.Once
+	closeBody := func() {
+		closeOnce.Do(func() { _ = body.Close() })
+	}
+
+	timedOut := make(chan struct{})
+	timer := time.AfterFunc(upstreamErrorDetailDrainTimeout, func() {
+		// Signal first so a pathological Close implementation cannot extend the
+		// caller-visible bound. net/http response bodies unblock Read on Close.
+		close(timedOut)
+		closeBody()
+	})
+
+	progress := make(chan responseBodyReadProgress)
+	callerDone := make(chan struct{})
+	defer close(callerDone)
+
 	go func() {
-		var closeOnce sync.Once
-		closeBody := func() {
-			closeOnce.Do(func() { _ = body.Close() })
+		defer func() {
+			_ = timer.Stop()
+			closeBody()
+		}()
+
+		captureRemaining := captureBytes
+		totalRemaining := captureBytes + drainBytes
+		buf := make([]byte, min(totalRemaining, 32*1024))
+		captureComplete := false
+
+		sendProgress := func(captured []byte, complete bool) {
+			select {
+			case progress <- responseBodyReadProgress{captured: captured, captureComplete: complete}:
+			case <-callerDone:
+			}
 		}
 
-		timer := time.AfterFunc(upstreamErrorDetailDrainTimeout, closeBody)
-		_, _ = io.Copy(io.Discard, io.LimitReader(body, upstreamErrorDetailDrainBytes))
-		_ = timer.Stop()
-		closeBody()
+		for totalRemaining > 0 {
+			readSize := min(len(buf), totalRemaining)
+			n, err := body.Read(buf[:readSize])
+			if n > 0 {
+				if n > totalRemaining {
+					n = totalRemaining
+				}
+				totalRemaining -= n
+
+				captureCount := min(n, captureRemaining)
+				var captured []byte
+				if captureCount > 0 {
+					captured = append([]byte(nil), buf[:captureCount]...)
+					captureRemaining -= captureCount
+				}
+				complete := captureRemaining == 0
+				if complete && totalRemaining == 0 {
+					closeBody()
+				}
+				if captureCount > 0 || (complete && !captureComplete) {
+					sendProgress(captured, complete)
+				}
+				captureComplete = complete
+			}
+
+			if err != nil {
+				closeBody()
+				if !captureComplete {
+					sendProgress(nil, true)
+				}
+				return
+			}
+		}
+
+		if !captureComplete {
+			closeBody()
+			sendProgress(nil, true)
+		}
 	}()
+
+	captured := make([]byte, 0, captureBytes)
+	for {
+		select {
+		case update := <-progress:
+			captured = append(captured, update.captured...)
+			if update.captureComplete {
+				return captured
+			}
+		case <-timedOut:
+			return captured
+		}
+	}
 }

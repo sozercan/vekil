@@ -3,22 +3,36 @@ package proxy
 import "strings"
 
 func ResolveFilterHint(command string) string {
-	cmd := strings.TrimSpace(command)
-	cmdLower := strings.ToLower(cmd)
+	cmdLower := strings.ToLower(strings.TrimSpace(command))
 	switch {
-	case strings.HasPrefix(cmdLower, "git diff"):
+	case hasShellCommandPrefix(cmdLower, "git diff"):
 		return "git-diff"
-	case strings.HasPrefix(cmdLower, "git status"):
+	case hasShellCommandPrefix(cmdLower, "git status"):
 		return "git-status"
-	case strings.HasPrefix(cmdLower, "pytest"):
+	case hasShellCommandPrefix(cmdLower, "pytest"):
 		return "pytest"
-	case strings.HasPrefix(cmdLower, "cargo test"):
+	case hasShellCommandPrefix(cmdLower, "cargo test"):
 		return "cargo-test"
-	case strings.HasPrefix(cmdLower, "go test"):
+	case hasShellCommandPrefix(cmdLower, "go test"):
 		return "go-test"
-	case strings.HasPrefix(cmdLower, "vitest"), strings.HasPrefix(cmdLower, "npx vitest"):
+	case hasShellCommandPrefix(cmdLower, "vitest"), hasShellCommandPrefix(cmdLower, "npx vitest"):
 		return "vitest"
 	default:
 		return ""
+	}
+}
+
+func hasShellCommandPrefix(command, prefix string) bool {
+	if command == prefix {
+		return true
+	}
+	if !strings.HasPrefix(command, prefix) || len(command) <= len(prefix) {
+		return false
+	}
+	switch command[len(prefix)] {
+	case ' ', '\t', '\n', '\r', ';', '|', '&', '(', ')', '<', '>':
+		return true
+	default:
+		return false
 	}
 }

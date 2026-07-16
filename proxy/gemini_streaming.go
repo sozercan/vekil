@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/sozercan/vekil/models"
@@ -61,7 +62,20 @@ func StreamOpenAIToGeminiWithFinalResponse(
 	onFinalResponse func(*models.OpenAIResponse),
 	onUsageCallbacks ...func(*models.OpenAIUsage),
 ) {
+	streamOpenAIToGeminiWithLifecycle(w, body, onError, onFinalResponse, streamLifecycleHooks{}, onUsageCallbacks...)
+}
+
+func streamOpenAIToGeminiWithLifecycle(
+	w http.ResponseWriter,
+	body io.ReadCloser,
+	onError func(status int),
+	onFinalResponse func(*models.OpenAIResponse),
+	lifecycle streamLifecycleHooks,
+	onUsageCallbacks ...func(*models.OpenAIUsage),
+) {
 	defer func() { _ = body.Close() }()
+	trackedWriter := &commitTrackingResponseWriter{ResponseWriter: w}
+	w = trackedWriter
 	setSSEHeaders(w)
 
 	state := newGeminiStreamState(w)
@@ -75,31 +89,54 @@ func StreamOpenAIToGeminiWithFinalResponse(
 		if onUsage != nil && chunk.Usage != nil {
 			onUsage(chunk.Usage)
 		}
+		if !state.consumeChunk(chunk) {
+			return false
+		}
 		if aggregator != nil {
 			aggregator.addChunk(chunk)
 		}
-		return state.consumeChunk(chunk)
+		return true
 	})
+	if state.upstreamProtocolError != nil {
+		if onError != nil && !state.clientWriteFailed {
+			onError(http.StatusBadGateway)
+		}
+		state.writeError(http.StatusBadGateway, state.upstreamProtocolError.Error())
+		return
+	}
 	if err != nil {
 		var streamErr *openAIStreamError
 		if errors.As(err, &streamErr) {
+			status := streamErr.httpStatus()
 			if onError != nil && !state.clientWriteFailed {
-				onError(streamErr.httpStatus())
+				onError(status)
 			}
-			state.writeError(streamErr.Error())
+			state.writeError(status, streamErr.Error())
+			return
+		}
+		if lifecycle.suppressTransportCancellation(trackedWriter.committed) {
+			if trackedWriter.committed && !state.clientWriteFailed {
+				state.writeError(http.StatusServiceUnavailable, "server shutting down")
+			}
 			return
 		}
 		if onError != nil && !state.clientWriteFailed {
 			onError(http.StatusBadGateway)
 		}
-		state.writeError(fmt.Sprintf("upstream stream read failed: %v", err))
+		state.writeError(http.StatusBadGateway, fmt.Sprintf("upstream stream read failed: %v", err))
 		return
 	}
 	if !sawDone {
+		if lifecycle.suppressTransportCancellation(trackedWriter.committed) {
+			if trackedWriter.committed && !state.clientWriteFailed {
+				state.writeError(http.StatusServiceUnavailable, "server shutting down")
+			}
+			return
+		}
 		if onError != nil && !state.clientWriteFailed {
 			onError(http.StatusBadGateway)
 		}
-		state.writeError("upstream stream ended before [DONE]")
+		state.writeError(http.StatusBadGateway, "upstream stream ended before [DONE]")
 		return
 	}
 
@@ -109,11 +146,42 @@ func StreamOpenAIToGeminiWithFinalResponse(
 	onFinalResponse(aggregator.buildResponse())
 }
 
+// aggregateGeminiStreamToResponse collects a force-streamed Gemini upstream
+// response while applying Gemini-specific validation before aggregation.
+func aggregateGeminiStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, error) {
+	defer func() { _ = body.Close() }()
+
+	aggregator := newOpenAIResponseAggregator()
+	var protocolErr error
+	sawDone, err := consumeOpenAIStreamChunks(body, func(chunk models.OpenAIStreamChunk) bool {
+		for _, choice := range chunk.Choices {
+			if err := validateGeminiToolCallIndexes(choice.Delta.ToolCalls); err != nil {
+				protocolErr = err
+				return false
+			}
+		}
+		aggregator.addChunk(chunk)
+		return true
+	})
+	if protocolErr != nil {
+		return nil, protocolErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !sawDone {
+		return nil, fmt.Errorf("stream ended before [DONE]")
+	}
+
+	return aggregator.buildResponse(), nil
+}
+
 type geminiStreamState struct {
-	w                  http.ResponseWriter
-	bufferedToolCalls  map[int]*geminiStreamingToolCall
-	storedFinishReason string
-	storedUsage        *models.OpenAIUsage
+	w                     http.ResponseWriter
+	bufferedToolCalls     map[int]*geminiStreamingToolCall
+	storedFinishReason    string
+	storedUsage           *models.OpenAIUsage
+	upstreamProtocolError error
 	// clientWriteFailed is set when a write to the client fails (client
 	// disconnected), so the caller can distinguish a client abort from an
 	// upstream failure and avoid mislabeling it as a 502.
@@ -178,7 +246,11 @@ func (s *geminiStreamState) emitText(text string) bool {
 }
 
 func (s *geminiStreamState) consumeToolCalls(toolCalls []models.OpenAIToolCall) bool {
-	var parts []models.GeminiPart
+	if err := validateGeminiToolCallIndexes(toolCalls); err != nil {
+		s.upstreamProtocolError = err
+		return false
+	}
+
 	for _, toolCall := range toolCalls {
 		toolIndex := 0
 		if toolCall.Index != nil {
@@ -199,41 +271,18 @@ func (s *geminiStreamState) consumeToolCalls(toolCalls []models.OpenAIToolCall) 
 		if toolCall.Function.Arguments != "" {
 			buffered.Arguments.WriteString(toolCall.Function.Arguments)
 		}
-
-		args := strings.TrimSpace(buffered.Arguments.String())
-		if buffered.Emitted || buffered.Name == "" || args == "" {
-			continue
-		}
-
-		normalized, err := canonicalizeJSON(json.RawMessage(args))
-		if err != nil {
-			continue
-		}
-
-		parts = append(parts, models.GeminiPart{
-			FunctionCall: &models.GeminiFunctionCall{
-				ID:   buffered.ID,
-				Name: buffered.Name,
-				Args: normalized,
-			},
-		})
-		buffered.Emitted = true
 	}
 
-	if len(parts) == 0 {
-		return true
-	}
+	return true
+}
 
-	candidateIndex := 0
-	return s.writeData(models.GeminiGenerateContentResponse{
-		Candidates: []models.GeminiCandidate{{
-			Content: &models.GeminiContent{
-				Role:  "model",
-				Parts: parts,
-			},
-			Index: &candidateIndex,
-		}},
-	})
+func validateGeminiToolCallIndexes(toolCalls []models.OpenAIToolCall) error {
+	for _, toolCall := range toolCalls {
+		if toolCall.Index != nil && *toolCall.Index < 0 {
+			return fmt.Errorf("upstream stream tool call index %d is invalid; indices must be non-negative", *toolCall.Index)
+		}
+	}
+	return nil
 }
 
 func (s *geminiStreamState) finish() bool {
@@ -249,17 +298,20 @@ func (s *geminiStreamState) flushToolCalls(terminal bool) bool {
 		return true
 	}
 
-	maxIndex := -1
+	toolIndexes := make([]int, 0, len(s.bufferedToolCalls))
 	for toolIndex := range s.bufferedToolCalls {
-		if toolIndex > maxIndex {
-			maxIndex = toolIndex
+		if toolIndex < 0 {
+			s.upstreamProtocolError = fmt.Errorf("upstream stream tool call index %d is invalid; indices must be non-negative", toolIndex)
+			return false
 		}
+		toolIndexes = append(toolIndexes, toolIndex)
 	}
+	sort.Ints(toolIndexes)
 
 	var parts []models.GeminiPart
-	for toolIndex := 0; toolIndex <= maxIndex; toolIndex++ {
-		buffered, ok := s.bufferedToolCalls[toolIndex]
-		if !ok || buffered.Emitted || buffered.Name == "" {
+	for _, toolIndex := range toolIndexes {
+		buffered := s.bufferedToolCalls[toolIndex]
+		if buffered.Emitted || buffered.Name == "" {
 			continue
 		}
 
@@ -334,16 +386,16 @@ func (s *geminiStreamState) writeData(data interface{}) bool {
 	return true
 }
 
-func (s *geminiStreamState) writeError(message string) bool {
+func (s *geminiStreamState) writeError(statusCode int, message string) bool {
 	message = strings.TrimSpace(message)
 	if message == "" {
 		message = "upstream stream ended unexpectedly"
 	}
 	return s.writeData(models.GeminiErrorResponse{
 		Error: models.GeminiError{
-			Code:    http.StatusBadGateway,
+			Code:    statusCode,
 			Message: message,
-			Status:  "UNAVAILABLE",
+			Status:  mapGeminiUpstreamStatus(statusCode),
 		},
 	})
 }

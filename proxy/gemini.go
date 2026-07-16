@@ -192,10 +192,18 @@ type geminiProtocolError struct {
 	statusCode int
 	status     string
 	message    string
+	cause      error
 }
 
 func (e *geminiProtocolError) Error() string {
 	return e.message
+}
+
+func (e *geminiProtocolError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }
 
 func invalidGeminiArgument(format string, args ...interface{}) error {
@@ -330,7 +338,15 @@ func parseGeminiPath(path string) (string, string, error) {
 	return "", "", invalidGeminiArgument("unsupported Gemini route")
 }
 
+type geminiTranslationOptions struct {
+	unwrapCLITextOutput bool
+}
+
 func TranslateGeminiToOpenAI(req *models.GeminiGenerateContentRequest, pathModel string, stream bool) (*models.OpenAIRequest, error) {
+	return translateGeminiToOpenAIWithOptions(req, pathModel, stream, geminiTranslationOptions{})
+}
+
+func translateGeminiToOpenAIWithOptions(req *models.GeminiGenerateContentRequest, pathModel string, stream bool, options geminiTranslationOptions) (*models.OpenAIRequest, error) {
 	if req == nil {
 		return nil, invalidGeminiArgument("request body is required")
 	}
@@ -373,7 +389,7 @@ func TranslateGeminiToOpenAI(req *models.GeminiGenerateContentRequest, pathModel
 		}
 	}
 
-	translatedMessages, err := translateGeminiContents(req.Contents)
+	translatedMessages, err := translateGeminiContents(req.Contents, options)
 	if err != nil {
 		return nil, err
 	}
@@ -466,7 +482,7 @@ func translateGeminiSystemInstruction(systemInstruction *models.GeminiContent) (
 	return strings.Join(textParts, "\n"), nil
 }
 
-func translateGeminiContents(contents []models.GeminiContent) ([]models.OpenAIMessage, error) {
+func translateGeminiContents(contents []models.GeminiContent, options geminiTranslationOptions) ([]models.OpenAIMessage, error) {
 	pendingToolCalls := newGeminiPendingToolCalls()
 	var messages []models.OpenAIMessage
 
@@ -475,7 +491,12 @@ func translateGeminiContents(contents []models.GeminiContent) ([]models.OpenAIMe
 			return nil, invalidGeminiArgument("contents[%d].parts must not be empty", contentIdx)
 		}
 
-		switch content.Role {
+		role := content.Role
+		if role == "" {
+			role = "user"
+		}
+
+		switch role {
 		case "user":
 			var contentBuilder openAIContentBuilder
 			flushUserContent := func() error {
@@ -520,7 +541,7 @@ func translateGeminiContents(contents []models.GeminiContent) ([]models.OpenAIMe
 						return nil, err
 					}
 
-					message, err := translateGeminiFunctionResponse(part.FunctionResponse, pendingToolCalls)
+					message, err := translateGeminiFunctionResponse(part.FunctionResponse, pendingToolCalls, options)
 					if err != nil {
 						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].functionResponse", contentIdx, partIdx)
 					}
@@ -623,7 +644,7 @@ func translateGeminiFunctionCall(functionCall *models.GeminiFunctionCall, conten
 	}, explicitID, nil
 }
 
-func translateGeminiFunctionResponse(functionResponse *models.GeminiFunctionResponse, pendingToolCalls *geminiPendingToolCalls) (models.OpenAIMessage, error) {
+func translateGeminiFunctionResponse(functionResponse *models.GeminiFunctionResponse, pendingToolCalls *geminiPendingToolCalls, options geminiTranslationOptions) (models.OpenAIMessage, error) {
 	if functionResponse == nil || strings.TrimSpace(functionResponse.Name) == "" {
 		return models.OpenAIMessage{}, invalidGeminiArgument("functionResponse.name is required")
 	}
@@ -643,7 +664,7 @@ func translateGeminiFunctionResponse(functionResponse *models.GeminiFunctionResp
 		}
 	}
 
-	responseText, err := normalizeGeminiFunctionResponse(functionResponse.Response)
+	responseText, err := normalizeGeminiFunctionResponse(functionResponse.Response, options.unwrapCLITextOutput)
 	if err != nil {
 		return models.OpenAIMessage{}, invalidGeminiArgument("functionResponse.response must be valid JSON")
 	}
@@ -1020,7 +1041,7 @@ func normalizeGeminiArguments(raw json.RawMessage) (string, error) {
 	return string(args), nil
 }
 
-func normalizeGeminiFunctionResponse(raw json.RawMessage) (string, error) {
+func normalizeGeminiFunctionResponse(raw json.RawMessage, unwrapCLITextOutput bool) (string, error) {
 	if !hasRawJSON(raw) {
 		return `{}`, nil
 	}
@@ -1028,6 +1049,23 @@ func normalizeGeminiFunctionResponse(raw json.RawMessage) (string, error) {
 	var asString string
 	if err := json.Unmarshal(raw, &asString); err == nil {
 		return asString, nil
+	}
+
+	// Gemini CLI wraps text-only shell results as {"output":"..."}. OpenAI
+	// tool messages carry the textual result directly; preserving the wrapper
+	// makes models echo JSON instead of the command output. Unwrap only the exact
+	// single-field string shape so structured or metadata-bearing responses keep
+	// their full JSON semantics.
+	var object map[string]json.RawMessage
+	if unwrapCLITextOutput {
+		if err := json.Unmarshal(raw, &object); err == nil && len(object) == 1 {
+			if outputRaw, ok := object["output"]; ok {
+				var output string
+				if err := json.Unmarshal(outputRaw, &output); err == nil {
+					return output, nil
+				}
+			}
+		}
 	}
 
 	response, err := canonicalizeJSON(raw)

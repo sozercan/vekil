@@ -59,6 +59,8 @@ func newExecJSONToolOptimizer(cfg ToolOptimizerProviderConfig) ToolOptimizer {
 	}
 }
 
+func (*execJSONToolOptimizer) optimizerUsesExternalProcess() {}
+
 func (e *execJSONToolOptimizer) ID() string {
 	if e == nil {
 		return "exec_json"
@@ -109,6 +111,9 @@ func (e *execJSONToolOptimizer) call(ctx context.Context, req execJSONToolOptimi
 	if err != nil {
 		return execJSONToolOptimizerResponse{}, err
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cmd := exec.CommandContext(ctx, e.path, e.args...)
 	cmd.Stdin = bytes.NewReader(input)
 	var stdout, stderr limitedBuffer
@@ -116,7 +121,7 @@ func (e *execJSONToolOptimizer) call(ctx context.Context, req execJSONToolOptimi
 	stderr.limit = e.maxStderrBytes
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := runOptimizerCommand(ctx, cmd); err != nil {
 		return execJSONToolOptimizerResponse{}, err
 	}
 	if stdout.Truncated() || stderr.Truncated() {

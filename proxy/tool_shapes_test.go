@@ -345,3 +345,90 @@ func toolShapesTestManager() *ToolOptimizerManager {
 		},
 	}, nil)
 }
+
+func TestToolShapesLocalShellRawGroupingCommandsRemainExtractableAndReplaceable(t *testing.T) {
+	manager := toolShapesTestManager()
+	tests := []struct {
+		name    string
+		command string
+	}{
+		{name: "test expression", command: `[ -f go.mod ] && go test ./...`},
+		{name: "brace group", command: `{ echo hi; }`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rawArguments, err := json.Marshal(tt.command)
+			if err != nil {
+				t.Fatalf("marshal arguments: %v", err)
+			}
+			raw := json.RawMessage(`{"type":"local_shell_call","call_id":"call-grouping","arguments":` + string(rawArguments) + `}`)
+
+			item, ok := extractShellFunctionCommandItem(raw, manager)
+			if !ok {
+				t.Fatalf("raw grouping command was not extracted: %s", raw)
+			}
+			if item.Command != tt.command {
+				t.Fatalf("command = %q, want %q", item.Command, tt.command)
+			}
+
+			const replacement = "go test ./proxy/..."
+			rewritten, ok := replaceShellFunctionCommand(raw, replacement, manager)
+			if !ok {
+				t.Fatalf("raw grouping command was not replaceable: %s", raw)
+			}
+			rewrittenItem, ok := extractShellFunctionCommandItem(rewritten, manager)
+			if !ok {
+				t.Fatalf("rewritten grouping command was not extractable: %s", rewritten)
+			}
+			if rewrittenItem.Command != replacement {
+				t.Fatalf("rewritten command = %q, want %q", rewrittenItem.Command, replacement)
+			}
+		})
+	}
+}
+
+func TestToolShapesRejectsTrailingToolArgumentJSON(t *testing.T) {
+	manager := toolShapesTestManager()
+	arguments := `{"command":"go test ./..."} trailing garbage`
+	rawArguments, err := json.Marshal(arguments)
+	if err != nil {
+		t.Fatalf("marshal arguments: %v", err)
+	}
+	raw := json.RawMessage(`{"type":"function_call","name":"shell_command","call_id":"call-trailing","arguments":` + string(rawArguments) + `}`)
+
+	if item, ok := extractShellFunctionCommandItem(raw, manager); ok {
+		t.Fatalf("trailing argument JSON was extracted: %+v", item)
+	}
+	if got, ok := extractStringArgumentAtPath(arguments, "/command"); ok {
+		t.Fatalf("trailing argument JSON returned command %q", got)
+	}
+	if got, ok := replaceStringArgumentAtPath(arguments, "/command", "go test ./proxy"); ok || got != arguments {
+		t.Fatalf("trailing argument JSON rewrite = %q, ok=%v; want unchanged false", got, ok)
+	}
+	if got, ok := replaceShellFunctionCommand(raw, "go test ./proxy", manager); ok || string(got) != string(raw) {
+		t.Fatalf("trailing argument item rewrite = %s, ok=%v; want unchanged false", got, ok)
+	}
+
+	localTrailingArguments := []struct {
+		name      string
+		arguments string
+	}{
+		{name: "object", arguments: arguments},
+		{name: "array", arguments: `["bash","-lc","go test ./..."] trailing garbage`},
+	}
+	for _, tt := range localTrailingArguments {
+		t.Run("local "+tt.name, func(t *testing.T) {
+			localArguments, err := json.Marshal(tt.arguments)
+			if err != nil {
+				t.Fatalf("marshal local arguments: %v", err)
+			}
+			localRaw := json.RawMessage(`{"type":"local_shell_call","call_id":"call-local-trailing","arguments":` + string(localArguments) + `}`)
+			if item, ok := extractShellFunctionCommandItem(localRaw, manager); ok {
+				t.Fatalf("trailing local-shell argument JSON was extracted: %+v", item)
+			}
+			if got, ok := replaceShellFunctionCommand(localRaw, "go test ./proxy", manager); ok || string(got) != string(localRaw) {
+				t.Fatalf("trailing local-shell argument rewrite = %s, ok=%v; want unchanged false", got, ok)
+			}
+		})
+	}
+}

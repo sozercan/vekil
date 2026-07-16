@@ -45,6 +45,7 @@ func TestLoadProvidersConfigFileAzureV1BaseURLAndModelMetadata(t *testing.T) {
           "reasoning_effort": ["low", "medium", "high"],
           "vision": true,
           "parallel_tool_calls": true,
+          "use_max_completion_tokens": true,
           "context_window": 400000
         }
       ]
@@ -111,6 +112,9 @@ func TestLoadProvidersConfigFileAzureV1BaseURLAndModelMetadata(t *testing.T) {
 	if cfgModel.ParallelToolCalls == nil || !*cfgModel.ParallelToolCalls {
 		t.Fatalf("parallel_tool_calls = %v, want true", cfgModel.ParallelToolCalls)
 	}
+	if cfgModel.UseMaxCompletionTokens == nil || !*cfgModel.UseMaxCompletionTokens {
+		t.Fatalf("use_max_completion_tokens = %v, want true", cfgModel.UseMaxCompletionTokens)
+	}
 	if cfgModel.ContextWindow == nil || *cfgModel.ContextWindow != 400000 {
 		t.Fatalf("context_window = %v, want 400000", cfgModel.ContextWindow)
 	}
@@ -150,6 +154,7 @@ func TestLoadProvidersConfigFileYAML(t *testing.T) {
           - high
         vision: true
         parallel_tool_calls: true
+        use_max_completion_tokens: true
         context_window: 400000
   - id: openai-codex
     type: openai-codex
@@ -213,6 +218,9 @@ func TestLoadProvidersConfigFileYAML(t *testing.T) {
 			}
 			if model.ParallelToolCalls == nil || !*model.ParallelToolCalls {
 				t.Fatalf("parallel_tool_calls = %v, want true", model.ParallelToolCalls)
+			}
+			if model.UseMaxCompletionTokens == nil || !*model.UseMaxCompletionTokens {
+				t.Fatalf("use_max_completion_tokens = %v, want true", model.UseMaxCompletionTokens)
 			}
 			if model.ContextWindow == nil || *model.ContextWindow != 400000 {
 				t.Fatalf("context_window = %v, want 400000", model.ContextWindow)
@@ -580,6 +588,95 @@ func TestLoadProvidersConfigFileRejectsEmptyBody(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "empty") {
 				t.Fatalf("LoadProvidersConfigFile() error = %v, want empty config error", err)
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileRejectsUnknownFieldsAndExtraDocuments(t *testing.T) {
+	t.Parallel()
+
+	validProviderJSON := `{"id":"local","type":"openai-compatible","base_url":"http://localhost:1234","auth_type":"none","models":[{"public_id":"local-model"}]}`
+	validProviderYAML := `
+  - id: local
+    type: openai-compatible
+    base_url: http://localhost:1234
+    auth_type: none
+    models:
+      - public_id: local-model`
+
+	testCases := []struct {
+		name string
+		ext  string
+		body string
+		want string
+	}{
+		{
+			name: "JSON unknown top-level field",
+			ext:  ".json",
+			body: `{"providers":[],"providerz":[]}`,
+			want: "providerz",
+		},
+		{
+			name: "YAML unknown top-level field",
+			ext:  ".yaml",
+			body: "providers: []\nproviderz: []\n",
+			want: "providerz",
+		},
+		{
+			name: "JSON unknown provider field",
+			ext:  ".json",
+			body: `{"providers":[` + strings.TrimSuffix(validProviderJSON, `}`) + `,"timeout_ms":1000}]}`,
+			want: "timeout_ms",
+		},
+		{
+			name: "YAML unknown provider field",
+			ext:  ".yaml",
+			body: "providers:" + validProviderYAML + "\n    timeout_ms: 1000\n",
+			want: "timeout_ms",
+		},
+		{
+			name: "JSON model endpoint typo",
+			ext:  ".json",
+			body: `{"providers":[{"id":"local","type":"openai-compatible","base_url":"http://localhost:1234","auth_type":"none","models":[{"public_id":"local-model","endpoint":["/chat/completions"]}]}]}`,
+			want: "endpoint",
+		},
+		{
+			name: "YAML model endpoint typo",
+			ext:  ".yaml",
+			body: "providers:" + validProviderYAML + "\n        endpoint:\n          - /chat/completions\n",
+			want: "endpoint",
+		},
+		{
+			name: "trailing JSON value",
+			ext:  ".json",
+			body: `{"providers":[]} {"providers":[]}`,
+			want: "more than one JSON value",
+		},
+		{
+			name: "multiple YAML documents",
+			ext:  ".yaml",
+			body: "providers: []\n---\nproviders: []\n",
+			want: "more than one YAML document",
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			providersPath := filepath.Join(t.TempDir(), "providers"+tc.ext)
+			if err := os.WriteFile(providersPath, []byte(tc.body), 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+
+			_, err := LoadProvidersConfigFile(providersPath)
+			if err == nil {
+				t.Fatal("LoadProvidersConfigFile() error = nil, want strict decode error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadProvidersConfigFile() error = %v, want %q", err, tc.want)
 			}
 		})
 	}

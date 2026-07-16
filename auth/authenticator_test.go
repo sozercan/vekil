@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -868,7 +869,9 @@ func TestStatus_ReportsAuthSources(t *testing.T) {
 
 func TestSignOutWaitsForPendingDeviceAuthorization(t *testing.T) {
 	a := &Authenticator{tokenDir: t.TempDir()}
-	a.deviceFlowMu.Lock()
+	if err := a.acquireDeviceFlow(context.Background()); err != nil {
+		t.Fatalf("acquire device flow: %v", err)
+	}
 
 	done := make(chan error, 1)
 	go func() {
@@ -881,7 +884,7 @@ func TestSignOutWaitsForPendingDeviceAuthorization(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	a.deviceFlowMu.Unlock()
+	a.releaseDeviceFlow()
 
 	select {
 	case err := <-done:
@@ -965,6 +968,21 @@ func TestPollForAuthorization_Success(t *testing.T) {
 	}
 	if prefs := readAuthPreferencesForTest(t, dir); prefs.GitHubCLIAutoSignIn {
 		t.Fatal("expected device-code authorization to disable GitHub CLI auto sign-in")
+	}
+}
+
+func TestPollForAuthorizationWaiterHonorsContextDeadline(t *testing.T) {
+	a := &Authenticator{tokenDir: t.TempDir()}
+	if err := a.acquireDeviceFlow(context.Background()); err != nil {
+		t.Fatalf("acquire device flow: %v", err)
+	}
+	defer a.releaseDeviceFlow()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := a.PollForAuthorization(ctx, &DeviceCodeResponse{})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("PollForAuthorization() error = %v, want context.DeadlineExceeded", err)
 	}
 }
 
@@ -1534,5 +1552,885 @@ func TestRefreshToken_AutoDeviceFlowReturnsTransientRefreshError(t *testing.T) {
 	}
 	if got := err.Error(); got != "copilot token request failed with status 502: gateway unavailable" {
 		t.Fatalf("unexpected error: %q", got)
+	}
+}
+
+func waitForAuthRefreshWaiters(t *testing.T, a *Authenticator, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		a.refreshMu.Lock()
+		got := 0
+		if a.refreshCall != nil {
+			got = a.refreshCall.waiters
+		}
+		a.refreshMu.Unlock()
+		if got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d auth refresh waiters", want)
+}
+
+func waitForAuthDeviceWaiters(t *testing.T, a *Authenticator, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		a.deviceCallMu.Lock()
+		got := 0
+		if a.deviceCall != nil {
+			got = a.deviceCall.waiters
+		}
+		a.deviceCallMu.Unlock()
+		if got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d auth device-flow waiters", want)
+}
+
+func TestGetTokenRefreshWaiterHonorsContextDeadline(t *testing.T) {
+	var calls atomic.Int32
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		close(refreshStarted)
+		<-releaseRefresh
+		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
+			Token:     "shared-token",
+			ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("valid-access-token"), 0o600); err != nil {
+		t.Fatalf("write access token: %v", err)
+	}
+	a := &Authenticator{
+		tokenDir:       dir,
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := a.GetTokenNonInteractive(context.Background())
+		leaderDone <- err
+	}()
+	<-refreshStarted
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := a.GetTokenNonInteractive(ctx)
+		waiterDone <- err
+	}()
+	waitForAuthRefreshWaiters(t, a, 2)
+
+	select {
+	case err := <-waiterDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("waiter error = %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("refresh waiter did not honor its context deadline")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("refresh calls while leader blocked = %d, want 1", got)
+	}
+
+	close(releaseRefresh)
+	if err := <-leaderDone; err != nil {
+		t.Fatalf("leader error = %v", err)
+	}
+}
+
+func TestGetTokenSharesFailedRefreshAcrossWaiters(t *testing.T) {
+	var calls atomic.Int32
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		close(refreshStarted)
+		<-releaseRefresh
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{ErrorDetails: "temporary failure"})
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("valid-access-token"), 0o600); err != nil {
+		t.Fatalf("write access token: %v", err)
+	}
+	a := &Authenticator{
+		tokenDir:       dir,
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	const callers = 8
+	results := make(chan error, callers)
+	go func() {
+		_, err := a.GetTokenNonInteractive(context.Background())
+		results <- err
+	}()
+	<-refreshStarted
+	for range callers - 1 {
+		go func() {
+			_, err := a.GetTokenNonInteractive(context.Background())
+			results <- err
+		}()
+	}
+	waitForAuthRefreshWaiters(t, a, callers)
+	close(releaseRefresh)
+
+	for range callers {
+		err := <-results
+		if err == nil || err.Error() != "copilot token request failed with status 503: temporary failure" {
+			t.Fatalf("shared refresh error = %v", err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("refresh calls = %d, want 1 shared failed refresh", got)
+	}
+}
+
+func TestGetTokenDeviceFlowWaiterHonorsContextDeadline(t *testing.T) {
+	deviceCodeStarted := make(chan struct{})
+	releaseDeviceCode := make(chan struct{})
+	var deviceCodeCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login/device/code":
+			deviceCodeCalls.Add(1)
+			close(deviceCodeStarted)
+			<-releaseDeviceCode
+			_ = json.NewEncoder(w).Encode(DeviceCodeResponse{
+				DeviceCode:      "dc_wait",
+				UserCode:        "WAIT-1234",
+				VerificationURI: "https://github.com/login/device",
+				ExpiresIn:       60,
+				Interval:        1,
+			})
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	a := &Authenticator{
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+		tokenDir:       t.TempDir(),
+		githubCLIPath:  missingGitHubCLIPath(t),
+	}
+	a.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		rewritten, _ := url.Parse(server.URL + req.URL.Path)
+		rewritten.RawQuery = req.URL.RawQuery
+		req.URL = rewritten
+		return http.DefaultTransport.RoundTrip(req)
+	})
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := a.GetToken(leaderCtx)
+		leaderDone <- err
+	}()
+	<-deviceCodeStarted
+
+	waiterCtx, cancelWaiter := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelWaiter()
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := a.GetToken(waiterCtx)
+		waiterDone <- err
+	}()
+	waitForAuthDeviceWaiters(t, a, 2)
+
+	select {
+	case err := <-waiterDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("device-flow waiter error = %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("device-flow waiter did not honor its context deadline")
+	}
+	if got := deviceCodeCalls.Load(); got != 1 {
+		t.Fatalf("device-code calls while leader blocked = %d, want 1", got)
+	}
+
+	cancelLeader()
+	close(releaseDeviceCode)
+	select {
+	case err := <-leaderDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("leader error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for device-flow leader to exit")
+	}
+}
+
+func TestRefreshTokenNonInteractiveDoesNotJoinCachedLookup(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
+			Token:     "refreshed-token",
+			ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+	}))
+	defer server.Close()
+
+	a := &Authenticator{
+		tokenDir:       t.TempDir(),
+		accessToken:    "valid-access-token",
+		copilotToken:   "cached-token",
+		tokenExpiry:    time.Now().Add(time.Hour),
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	// Hold the state lock so the regular lookup publishes its in-flight call
+	// before it can return the cached token.
+	a.mu.Lock()
+	cachedResult := make(chan struct {
+		token string
+		err   error
+	}, 1)
+	go func() {
+		token, err := a.GetTokenNonInteractive(context.Background())
+		cachedResult <- struct {
+			token string
+			err   error
+		}{token: token, err: err}
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		a.refreshMu.Lock()
+		active := a.refreshCall != nil && !a.refreshCall.force
+		a.refreshMu.Unlock()
+		if active {
+			break
+		}
+		if time.Now().After(deadline) {
+			a.mu.Unlock()
+			t.Fatal("timed out waiting for cached lookup flight")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	forcedResult := make(chan struct {
+		token string
+		err   error
+	}, 1)
+	go func() {
+		token, err := a.RefreshTokenNonInteractive(context.Background())
+		forcedResult <- struct {
+			token string
+			err   error
+		}{token: token, err: err}
+	}()
+	waitForAuthRefreshWaiters(t, a, 2)
+	a.mu.Unlock()
+
+	cached := <-cachedResult
+	if cached.err != nil || cached.token != "cached-token" {
+		t.Fatalf("cached lookup = (%q, %v), want cached-token", cached.token, cached.err)
+	}
+	forced := <-forcedResult
+	if forced.err != nil || forced.token != "refreshed-token" {
+		t.Fatalf("forced refresh = (%q, %v), want refreshed-token", forced.token, forced.err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("token exchange calls = %d, want 1 forced refresh", got)
+	}
+}
+
+func TestGetTokenSharesFailedDeviceFlowAcrossWaiters(t *testing.T) {
+	deviceCodeStarted := make(chan struct{})
+	releaseDeviceCode := make(chan struct{})
+	var deviceCodeCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/login/device/code" {
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+		deviceCodeCalls.Add(1)
+		close(deviceCodeStarted)
+		<-releaseDeviceCode
+		_, _ = w.Write([]byte("{"))
+	}))
+	defer server.Close()
+
+	a := &Authenticator{
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+		tokenDir:       t.TempDir(),
+		githubCLIPath:  missingGitHubCLIPath(t),
+	}
+	a.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		rewritten, _ := url.Parse(server.URL + req.URL.Path)
+		rewritten.RawQuery = req.URL.RawQuery
+		req.URL = rewritten
+		return http.DefaultTransport.RoundTrip(req)
+	})
+
+	const callers = 8
+	results := make(chan error, callers)
+	go func() {
+		_, err := a.GetToken(context.Background())
+		results <- err
+	}()
+	<-deviceCodeStarted
+	for range callers - 1 {
+		go func() {
+			_, err := a.GetToken(context.Background())
+			results <- err
+		}()
+	}
+	waitForAuthDeviceWaiters(t, a, callers)
+	close(releaseDeviceCode)
+
+	var sharedError string
+	for range callers {
+		err := <-results
+		if err == nil {
+			t.Fatal("device flow error = nil")
+		}
+		if sharedError == "" {
+			sharedError = err.Error()
+		} else if err.Error() != sharedError {
+			t.Fatalf("device flow errors differ: %q != %q", err.Error(), sharedError)
+		}
+	}
+	if got := deviceCodeCalls.Load(); got != 1 {
+		t.Fatalf("device-code calls = %d, want 1 shared failed flow", got)
+	}
+}
+
+func copilotTokenResponseForTest(t *testing.T, token string) *http.Response {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	if err := json.NewEncoder(recorder).Encode(CopilotTokenResponse{
+		Token:     token,
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}); err != nil {
+		t.Fatalf("encode Copilot token response: %v", err)
+	}
+	return recorder.Result()
+}
+
+func TestGetTokenRefreshLeaderCancellationDoesNotCancelLiveWaiter(t *testing.T) {
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	refreshCanceled := make(chan struct{})
+	var startOnce sync.Once
+	var cancelOnce sync.Once
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("valid-access-token"), 0o600); err != nil {
+		t.Fatalf("write access token: %v", err)
+	}
+	a := &Authenticator{
+		tokenDir:       dir,
+		copilotBaseURL: "http://copilot.test",
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			startOnce.Do(func() { close(refreshStarted) })
+			select {
+			case <-releaseRefresh:
+				return copilotTokenResponseForTest(t, "waiter-token"), nil
+			case <-req.Context().Done():
+				cancelOnce.Do(func() { close(refreshCanceled) })
+				return nil, req.Context().Err()
+			}
+		})},
+	}
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := a.GetTokenNonInteractive(leaderCtx)
+		leaderDone <- err
+	}()
+	<-refreshStarted
+
+	waiterDone := make(chan struct {
+		token string
+		err   error
+	}, 1)
+	go func() {
+		token, err := a.GetTokenNonInteractive(context.Background())
+		waiterDone <- struct {
+			token string
+			err   error
+		}{token: token, err: err}
+	}()
+	waitForAuthRefreshWaiters(t, a, 2)
+	cancelLeader()
+
+	if err := <-leaderDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader error = %v, want context.Canceled", err)
+	}
+	a.refreshMu.Lock()
+	activeCall := a.refreshCall
+	a.refreshMu.Unlock()
+	if activeCall == nil {
+		t.Fatal("shared Copilot refresh disappeared while a waiter remained")
+	}
+	select {
+	case <-activeCall.ctx.Done():
+		t.Fatal("shared Copilot refresh context was canceled while a waiter remained")
+	default:
+	}
+	select {
+	case <-refreshCanceled:
+		t.Fatal("shared Copilot refresh was canceled while a waiter remained")
+	default:
+	}
+
+	close(releaseRefresh)
+	waiter := <-waiterDone
+	if waiter.err != nil || waiter.token != "waiter-token" {
+		t.Fatalf("waiter result = (%q, %v), want waiter-token", waiter.token, waiter.err)
+	}
+}
+
+func TestGetTokenRefreshCancelsWhenAllWaitersLeave(t *testing.T) {
+	refreshStarted := make(chan struct{})
+	refreshCanceled := make(chan struct{})
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("valid-access-token"), 0o600); err != nil {
+		t.Fatalf("write access token: %v", err)
+	}
+	a := &Authenticator{
+		tokenDir:       dir,
+		copilotBaseURL: "http://copilot.test",
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			close(refreshStarted)
+			<-req.Context().Done()
+			close(refreshCanceled)
+			return nil, req.Context().Err()
+		})},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.GetTokenNonInteractive(ctx)
+		done <- err
+	}()
+	<-refreshStarted
+	cancel()
+
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetTokenNonInteractive() error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-refreshCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("underlying Copilot refresh was not canceled after its last waiter left")
+	}
+}
+
+func TestGetTokenDeviceLeaderCancellationDoesNotCancelLiveWaiter(t *testing.T) {
+	dir := t.TempDir()
+	data, err := json.Marshal(CopilotTokenResponse{
+		Token:     "device-waiter-token",
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("marshal token: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "api-key.json"), data, 0o600); err != nil {
+		t.Fatalf("write token cache: %v", err)
+	}
+	a := &Authenticator{tokenDir: dir}
+	if err := a.acquireDeviceFlow(context.Background()); err != nil {
+		t.Fatalf("acquire device flow: %v", err)
+	}
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := a.getTokenWithDeviceFlow(leaderCtx)
+		leaderDone <- err
+	}()
+	waitForAuthDeviceWaiters(t, a, 1)
+
+	waiterDone := make(chan struct {
+		token string
+		err   error
+	}, 1)
+	go func() {
+		token, err := a.getTokenWithDeviceFlow(context.Background())
+		waiterDone <- struct {
+			token string
+			err   error
+		}{token: token, err: err}
+	}()
+	waitForAuthDeviceWaiters(t, a, 2)
+	cancelLeader()
+
+	if err := <-leaderDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader error = %v, want context.Canceled", err)
+	}
+	a.deviceCallMu.Lock()
+	activeCall := a.deviceCall
+	a.deviceCallMu.Unlock()
+	if activeCall == nil {
+		t.Fatal("shared device-flow call disappeared while a waiter remained")
+	}
+	select {
+	case <-activeCall.ctx.Done():
+		t.Fatal("shared device-flow context was canceled while a waiter remained")
+	default:
+	}
+	a.releaseDeviceFlow()
+
+	waiter := <-waiterDone
+	if waiter.err != nil || waiter.token != "device-waiter-token" {
+		t.Fatalf("waiter result = (%q, %v), want device-waiter-token", waiter.token, waiter.err)
+	}
+}
+
+func TestGetTokenDeviceFlowCancelsWhenAllWaitersLeave(t *testing.T) {
+	a := &Authenticator{tokenDir: t.TempDir()}
+	if err := a.acquireDeviceFlow(context.Background()); err != nil {
+		t.Fatalf("acquire device flow: %v", err)
+	}
+	defer a.releaseDeviceFlow()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.getTokenWithDeviceFlow(ctx)
+		done <- err
+	}()
+	waitForAuthDeviceWaiters(t, a, 1)
+	cancel()
+
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("getTokenWithDeviceFlow() error = %v, want context.Canceled", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		a.deviceCallMu.Lock()
+		active := a.deviceCall != nil
+		a.deviceCallMu.Unlock()
+		if !active {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("abandoned device-flow call remained active")
+}
+
+func TestSignOutInvalidatesInFlightNonInteractiveResults(t *testing.T) {
+	refreshStarted := make(chan struct{})
+	refreshCanceled := make(chan struct{})
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("valid-access-token"), 0o600); err != nil {
+		t.Fatalf("write access token: %v", err)
+	}
+	a := &Authenticator{
+		tokenDir:       dir,
+		copilotBaseURL: "http://copilot.test",
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			close(refreshStarted)
+			<-req.Context().Done()
+			close(refreshCanceled)
+			return nil, req.Context().Err()
+		})},
+	}
+
+	results := make(chan struct {
+		token string
+		err   error
+	}, 2)
+	go func() {
+		token, err := a.GetTokenNonInteractive(context.Background())
+		results <- struct {
+			token string
+			err   error
+		}{token: token, err: err}
+	}()
+	<-refreshStarted
+	go func() {
+		token, err := a.GetTokenNonInteractive(context.Background())
+		results <- struct {
+			token string
+			err   error
+		}{token: token, err: err}
+	}()
+	waitForAuthRefreshWaiters(t, a, 2)
+
+	if err := a.SignOut(); err != nil {
+		t.Fatalf("SignOut() error = %v", err)
+	}
+	select {
+	case <-refreshCanceled:
+	default:
+		t.Fatal("SignOut did not cancel the in-flight refresh")
+	}
+	for range 2 {
+		result := <-results
+		if result.token != "" || result.err == nil {
+			t.Fatalf("post-sign-out result = (%q, %v), want no token and an error", result.token, result.err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "api-key.json")); !os.IsNotExist(err) {
+		t.Fatalf("api-key.json exists after SignOut: %v", err)
+	}
+}
+
+func TestSignOutInvalidatesInFlightDeviceResults(t *testing.T) {
+	dir := t.TempDir()
+	data, err := json.Marshal(CopilotTokenResponse{
+		Token:     "stale-device-token",
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("marshal token: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "api-key.json"), data, 0o600); err != nil {
+		t.Fatalf("write token cache: %v", err)
+	}
+	a := &Authenticator{tokenDir: dir}
+	if err := a.acquireDeviceFlow(context.Background()); err != nil {
+		t.Fatalf("acquire device flow: %v", err)
+	}
+
+	results := make(chan struct {
+		token string
+		err   error
+	}, 2)
+	for range 2 {
+		go func() {
+			token, err := a.getTokenWithDeviceFlow(context.Background())
+			results <- struct {
+				token string
+				err   error
+			}{token: token, err: err}
+		}()
+	}
+	waitForAuthDeviceWaiters(t, a, 2)
+
+	signOutDone := make(chan error, 1)
+	go func() { signOutDone <- a.SignOut() }()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && !a.signingOut.Load() {
+		time.Sleep(time.Millisecond)
+	}
+	if !a.signingOut.Load() {
+		t.Fatal("SignOut did not enter invalidation state")
+	}
+	a.releaseDeviceFlow()
+	if err := <-signOutDone; err != nil {
+		t.Fatalf("SignOut() error = %v", err)
+	}
+
+	for range 2 {
+		result := <-results
+		if result.token != "" || result.err == nil {
+			t.Fatalf("post-sign-out device result = (%q, %v), want no token and an error", result.token, result.err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "api-key.json")); !os.IsNotExist(err) {
+		t.Fatalf("api-key.json exists after SignOut: %v", err)
+	}
+}
+
+func TestSignOutInvalidatesCompletedSharedResults(t *testing.T) {
+	a := &Authenticator{tokenDir: t.TempDir()}
+	generation := a.generation.Load()
+	refresh := &authTokenCall{
+		done:       make(chan struct{}),
+		token:      "stale-refresh-token",
+		waiters:    1,
+		completed:  true,
+		generation: generation,
+	}
+	device := &authTokenCall{
+		done:       make(chan struct{}),
+		token:      "stale-device-token",
+		waiters:    1,
+		completed:  true,
+		generation: generation,
+	}
+	close(refresh.done)
+	close(device.done)
+
+	if err := a.SignOut(); err != nil {
+		t.Fatalf("SignOut() error = %v", err)
+	}
+	if token, err, _ := a.waitForRefreshCall(context.Background(), refresh); token != "" || !errors.Is(err, ErrNotAuthenticated) {
+		t.Fatalf("completed refresh result = (%q, %v), want ErrNotAuthenticated", token, err)
+	}
+	if token, err := a.waitForDeviceCall(context.Background(), device); token != "" || !errors.Is(err, ErrNotAuthenticated) {
+		t.Fatalf("completed device result = (%q, %v), want ErrNotAuthenticated", token, err)
+	}
+}
+
+func TestSignOutDetachesRefreshBeforeAllowingFreshAuth(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		prepareNew func(*testing.T, string)
+	}{
+		{
+			name: "environment",
+			prepareNew: func(t *testing.T, _ string) {
+				t.Setenv("COPILOT_GITHUB_TOKEN", "new-env-access-token")
+			},
+		},
+		{
+			name: "persisted access token",
+			prepareNew: func(t *testing.T, dir string) {
+				if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("new-disk-access-token"), 0o600); err != nil {
+					t.Fatalf("write replacement access token: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("COPILOT_GITHUB_TOKEN", "")
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("old-access-token"), 0o600); err != nil {
+				t.Fatalf("write old access token: %v", err)
+			}
+
+			oldRequestStarted := make(chan struct{})
+			oldAtFinalize := make(chan struct{})
+			releaseOldFinalize := make(chan struct{})
+			var requests atomic.Int32
+			var finalizeCalls atomic.Int32
+			a := &Authenticator{
+				tokenDir:       dir,
+				copilotBaseURL: "http://copilot.test",
+				client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if requests.Add(1) == 1 {
+						close(oldRequestStarted)
+						<-req.Context().Done()
+						return nil, req.Context().Err()
+					}
+					return copilotTokenResponseForTest(t, "fresh-token"), nil
+				})},
+				beforeRefreshCallFinalize: func() {
+					if finalizeCalls.Add(1) == 1 {
+						close(oldAtFinalize)
+						<-releaseOldFinalize
+					}
+				},
+			}
+
+			oldDone := make(chan error, 1)
+			go func() {
+				_, err := a.GetTokenNonInteractive(context.Background())
+				oldDone <- err
+			}()
+			<-oldRequestStarted
+
+			signOutDone := make(chan error, 1)
+			go func() { signOutDone <- a.SignOut() }()
+			<-oldAtFinalize
+			if err := <-signOutDone; err != nil {
+				t.Fatalf("SignOut() error = %v", err)
+			}
+
+			a.refreshMu.Lock()
+			oldAttached := a.refreshCall != nil
+			a.refreshMu.Unlock()
+			if oldAttached {
+				t.Fatal("old refresh call remained attached after SignOut returned")
+			}
+
+			tt.prepareNew(t, dir)
+			token, err := a.GetTokenNonInteractive(context.Background())
+			if err != nil || token != "fresh-token" {
+				t.Fatalf("fresh auth result = (%q, %v), want fresh-token", token, err)
+			}
+			if got := requests.Load(); got != 2 {
+				t.Fatalf("upstream requests = %d, want a fresh second request", got)
+			}
+
+			close(releaseOldFinalize)
+			if err := <-oldDone; err == nil {
+				t.Fatal("old refresh returned success after SignOut")
+			}
+		})
+	}
+}
+
+func TestSignOutDetachesDeviceCallBeforeFreshNonInteractiveAuth(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "")
+	dir := t.TempDir()
+	cached, err := json.Marshal(CopilotTokenResponse{
+		Token:     "old-device-token",
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("marshal old device token: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "api-key.json"), cached, 0o600); err != nil {
+		t.Fatalf("write old device token: %v", err)
+	}
+
+	oldAtFinalize := make(chan struct{})
+	releaseOldFinalize := make(chan struct{})
+	var requests atomic.Int32
+	var finalizeCalls atomic.Int32
+	a := &Authenticator{
+		tokenDir:       dir,
+		copilotBaseURL: "http://copilot.test",
+		client: &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			requests.Add(1)
+			return copilotTokenResponseForTest(t, "fresh-noninteractive-token"), nil
+		})},
+		beforeDeviceCallFinalize: func() {
+			if finalizeCalls.Add(1) == 1 {
+				close(oldAtFinalize)
+				<-releaseOldFinalize
+			}
+		},
+	}
+
+	oldDone := make(chan error, 1)
+	go func() {
+		_, err := a.getTokenWithDeviceFlow(context.Background())
+		oldDone <- err
+	}()
+	<-oldAtFinalize
+
+	if err := a.SignOut(); err != nil {
+		t.Fatalf("SignOut() error = %v", err)
+	}
+	a.deviceCallMu.Lock()
+	oldAttached := a.deviceCall != nil
+	a.deviceCallMu.Unlock()
+	if oldAttached {
+		t.Fatal("old device call remained attached after SignOut returned")
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("new-access-token"), 0o600); err != nil {
+		t.Fatalf("write new access token: %v", err)
+	}
+	token, err := a.GetTokenNonInteractive(context.Background())
+	if err != nil || token != "fresh-noninteractive-token" {
+		t.Fatalf("fresh noninteractive result = (%q, %v), want fresh-noninteractive-token", token, err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("upstream requests = %d, want 1 fresh request", got)
+	}
+
+	close(releaseOldFinalize)
+	if err := <-oldDone; err == nil {
+		t.Fatal("old device call returned success after SignOut")
 	}
 }

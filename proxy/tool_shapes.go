@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"io"
 	"strconv"
 	"strings"
 )
@@ -145,6 +146,9 @@ func extractLocalShellCommandFromArguments(raw json.RawMessage) (string, bool) {
 		if command, ok := extractShellCommandArgumentAtPath(arguments, "/action/command"); ok {
 			return command, true
 		}
+		if hasTrailingDataAfterStructuredToolArgumentJSON(arguments) {
+			return "", false
+		}
 		if strings.TrimSpace(arguments) != "" {
 			return arguments, true
 		}
@@ -165,6 +169,22 @@ func extractLocalShellCommandFromArguments(raw json.RawMessage) (string, bool) {
 		return command, true
 	}
 	return "", false
+}
+
+func hasTrailingDataAfterStructuredToolArgumentJSON(arguments string) bool {
+	var value interface{}
+	decoder := json.NewDecoder(strings.NewReader(arguments))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return false
+	}
+	switch value.(type) {
+	case map[string]interface{}, []interface{}:
+	default:
+		return false
+	}
+	var trailing interface{}
+	return decoder.Decode(&trailing) != io.EOF
 }
 
 func extractNonEmptyJSONStringField(item map[string]json.RawMessage, key string) (string, bool) {
@@ -369,6 +389,9 @@ func replaceLocalShellCommandInArguments(item map[string]json.RawMessage, replac
 		if strings.TrimSpace(arguments) == "" {
 			return false, false
 		}
+		if hasTrailingDataAfterStructuredToolArgumentJSON(arguments) {
+			return false, true
+		}
 		encoded, err := json.Marshal(replacement)
 		if err != nil {
 			return false, true
@@ -429,6 +452,10 @@ func extractFunctionCallOutputItem(raw json.RawMessage) (toolOutputItem, bool) {
 	if err := json.Unmarshal(raw, &item); err != nil {
 		return toolOutputItem{}, false
 	}
+	return extractFunctionCallOutput(item)
+}
+
+func extractFunctionCallOutput(item map[string]json.RawMessage) (toolOutputItem, bool) {
 	itemType, ok := extractNonEmptyJSONStringField(item, "type")
 	if !ok || (itemType != "function_call_output" && itemType != "local_shell_call_output") {
 		return toolOutputItem{}, false
@@ -508,10 +535,8 @@ func extractArgumentAtPath(argumentsJSON, pointer string) (interface{}, bool) {
 		return nil, false
 	}
 
-	var value interface{}
-	decoder := json.NewDecoder(strings.NewReader(argumentsJSON))
-	decoder.UseNumber()
-	if err := decoder.Decode(&value); err != nil {
+	value, ok := decodeSingleToolArgumentJSON(argumentsJSON)
+	if !ok {
 		return nil, false
 	}
 
@@ -543,10 +568,8 @@ func replaceStringArgumentAtPath(argumentsJSON, pointer, replacement string) (st
 		return argumentsJSON, false
 	}
 
-	var value interface{}
-	decoder := json.NewDecoder(strings.NewReader(argumentsJSON))
-	decoder.UseNumber()
-	if err := decoder.Decode(&value); err != nil {
+	value, ok := decodeSingleToolArgumentJSON(argumentsJSON)
+	if !ok {
 		return argumentsJSON, false
 	}
 
@@ -559,6 +582,20 @@ func replaceStringArgumentAtPath(argumentsJSON, pointer, replacement string) (st
 		return argumentsJSON, false
 	}
 	return string(newArguments), true
+}
+
+func decodeSingleToolArgumentJSON(argumentsJSON string) (interface{}, bool) {
+	var value interface{}
+	decoder := json.NewDecoder(strings.NewReader(argumentsJSON))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return nil, false
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, false
+	}
+	return value, true
 }
 
 func parseToolOptimizerJSONPointer(pointer string) ([]string, bool) {

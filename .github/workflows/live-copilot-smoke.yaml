@@ -15,7 +15,7 @@ concurrency:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     env:
       COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
     steps:
@@ -78,7 +78,7 @@ jobs:
       - name: Install Claude Code
         if: steps.gate.outputs.run == 'true'
         run: |
-          curl -fsSL https://claude.ai/install.sh | bash -s stable
+          curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 https://claude.ai/install.sh | bash -s stable
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install Gemini CLI

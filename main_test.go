@@ -3,9 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -13,6 +16,8 @@ import (
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/proxy"
+	"github.com/sozercan/vekil/server"
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -186,6 +191,157 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	cliServe := parseServeFlagsForTest(t, "--responses-ws-enabled=false")
 	if cliServe.responsesWebSocketConfig().Enabled {
 		t.Fatal("--responses-ws-enabled=false should override RESPONSES_WS_ENABLED=true")
+	}
+}
+
+func TestServeUntilContextDoneCancelsActiveUpstreamWork(t *testing.T) {
+	upstreamStarted := make(chan struct{})
+	upstreamCanceled := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(upstreamStarted)
+		select {
+		case <-r.Context().Done():
+			close(upstreamCanceled)
+		case <-releaseUpstream:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"chatcmpl-main-stop","object":"chat.completion","choices":[]}`)
+		}
+	}))
+
+	var serverLogs bytes.Buffer
+	srv, err := server.New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelInfo, &serverLogs),
+		"127.0.0.1",
+		"0",
+		server.WithProxyOptions(proxy.WithCopilotBaseURL(upstream.URL)),
+	)
+	if err != nil {
+		close(releaseUpstream)
+		upstream.Close()
+		t.Fatalf("server.New() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serveErr := make(chan error, 1)
+	serveExited := make(chan struct{})
+	go func() {
+		defer close(serveExited)
+		serveErr <- serveUntilContextDone(ctx, srv, nil, false, logger.NewWithWriter(logger.LevelError, io.Discard))
+	}()
+	t.Cleanup(func() {
+		cancel()
+		close(releaseUpstream)
+		select {
+		case <-serveExited:
+		case <-time.After(time.Second):
+		}
+		upstream.Close()
+	})
+
+	baseURL := ""
+	healthDeadline := time.Now().Add(time.Second)
+	for {
+		if addr := srv.Addr(); addr != "127.0.0.1:0" {
+			baseURL = "http://" + addr
+			resp, requestErr := http.Get(baseURL + "/healthz")
+			if requestErr == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					break
+				}
+			}
+		}
+		select {
+		case <-serveExited:
+			t.Fatalf("server exited before becoming healthy: %v", <-serveErr)
+		default:
+		}
+		if time.Now().After(healthDeadline) {
+			t.Fatal("timed out waiting for proxy health endpoint")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	type requestResult struct {
+		status int
+		body   []byte
+		err    error
+	}
+	requestDone := make(chan requestResult, 1)
+	go func() {
+		resp, requestErr := http.Post(
+			baseURL+"/v1/chat/completions",
+			"application/json",
+			strings.NewReader(`{"model":"gpt-5","messages":[{"role":"user","content":"hello"}]}`),
+		)
+		result := requestResult{err: requestErr}
+		if requestErr == nil {
+			result.status = resp.StatusCode
+			result.body, _ = io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+		}
+		requestDone <- result
+	}()
+
+	select {
+	case <-upstreamStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for active upstream work")
+	}
+
+	start := time.Now()
+	cancel() // signal.NotifyContext uses the same cancellation path for SIGTERM.
+	select {
+	case <-serveExited:
+	case <-time.After(time.Second):
+		t.Fatal("main serve lifecycle did not exit promptly after signal-context cancellation")
+	}
+	if err := <-serveErr; err != nil {
+		t.Fatalf("serveUntilContextDone() error = %v", err)
+	}
+	t.Logf("signal-context shutdown returned in %s", time.Since(start))
+
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("signal-context shutdown did not cancel active upstream work")
+	}
+	select {
+	case result := <-requestDone:
+		if result.err != nil {
+			t.Fatalf("client request error = %v", result.err)
+		}
+		if result.status != http.StatusServiceUnavailable {
+			t.Fatalf("shutdown response status = %d, want 503; body=%s", result.status, result.body)
+		}
+		if !bytes.Contains(result.body, []byte("server shutting down")) {
+			t.Fatalf("shutdown response missing service-unavailable detail: %s", result.body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client request did not return after signal-context shutdown")
+	}
+
+	foundSuppressed := false
+	for _, line := range strings.Split(strings.TrimSpace(serverLogs.String()), "\n") {
+		var entry map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode server log: %v", err)
+		}
+		if entry["path"] == "/v1/chat/completions" {
+			if entry["status"] != float64(http.StatusServiceUnavailable) {
+				t.Fatalf("logged shutdown status = %#v, want 503", entry["status"])
+			}
+			if entry["stats_suppressed"] != true {
+				t.Fatalf("shutdown request log missing stats_suppressed: %#v", entry)
+			}
+			foundSuppressed = true
+		}
+	}
+	if !foundSuppressed {
+		t.Fatalf("missing shutdown request log: %s", serverLogs.String())
 	}
 }
 
