@@ -158,11 +158,6 @@ func (r *modelRouteRegistry) lookupAlias(publicID string) (*modelRoute, bool) {
 	return route, ok
 }
 
-func (r *modelRouteRegistry) hasExplicitRoutes() bool {
-	snapshot := r.load()
-	return snapshot != nil && len(snapshot.explicit) > 0
-}
-
 func (r *modelRouteRegistry) explicitRoutes() []*modelRoute {
 	snapshot := r.load()
 	if snapshot == nil {
@@ -536,19 +531,15 @@ func compileLegacyProviderRoutes(provider *providerRuntime, models []providerMod
 	return compiled, nil
 }
 
-func (ps *providerSetup) hasExplicitRoutes() bool {
-	if ps == nil || ps.routes == nil {
-		return false
-	}
-	return ps.routes.hasExplicitRoutes()
-}
-
-func (h *ProxyHandler) validateRouteAwareRequestJSON(body []byte) error {
+// validateRouteAwareRequestJSON keeps strict duplicate-key rejection scoped to
+// proxy-owned explicit routes; legacy and provider-owned requests retain their
+// existing decoder and upstream behavior.
+func (h *ProxyHandler) validateRouteAwareRequestJSON(body []byte, model, endpoint string) error {
 	if h == nil {
 		return nil
 	}
-	setup := h.providerSetup()
-	if setup == nil || !setup.hasExplicitRoutes() {
+	route, known := h.resolveModelRouteForRequest(model, endpoint)
+	if !known || route == nil || route.legacy {
 		return nil
 	}
 	if err := rejectDuplicateJSONMappingKeys(body); err != nil {

@@ -72,7 +72,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	if err := h.validateRouteAwareRequestJSON(body); err != nil {
+	if err := h.validateRouteAwareRequestJSON(body, normalizeGeminiModelName(pathModel), providerEndpointChatCompletions); err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
@@ -240,7 +240,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	if err := h.validateRouteAwareRequestJSON(body); err != nil {
+	if err := h.validateRouteAwareRequestJSON(body, normalizeGeminiModelName(pathModel), providerEndpointChatCompletions); err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}

@@ -167,7 +167,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	if err := h.validateRouteAwareRequestJSON(bodyBytes); err != nil {
+	if err := h.validateRouteAwareRequestJSON(bodyBytes, extractResponsesRequestModel(bodyBytes), providerEndpointResponses); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
@@ -506,7 +506,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	if err := h.validateRouteAwareRequestJSON(bodyBytes); err != nil {
+	if err := h.validateRouteAwareRequestJSON(bodyBytes, extractResponsesRequestModel(bodyBytes), providerEndpointResponses); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
@@ -592,7 +592,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	if err := h.validateRouteAwareRequestJSON(bodyBytes); err != nil {
+	if err := h.validateRouteAwareRequestJSON(bodyBytes, extractResponsesRequestModel(bodyBytes), providerEndpointResponses); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}

@@ -387,6 +387,114 @@ func TestExplicitRouteSurfacesRejectAmbiguousJSONBeforeTranslation(t *testing.T)
 	}
 }
 
+func TestMixedRouteConfigScopesAmbiguousJSONValidationToExplicitRoutes(t *testing.T) {
+	const (
+		legacyModel        = "legacy-model"
+		explicitModel      = "claude-sonnet-4.5"
+		explicitModelAlias = "claude-sonnet-4-5-20250514"
+	)
+
+	var legacyCalls, explicitCalls atomic.Int32
+	legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		legacyCalls.Add(1)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode legacy request: %v", err)
+		} else if body["model"] != legacyModel {
+			t.Errorf("legacy model = %#v, want %q", body["model"], legacyModel)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp-legacy","object":"response","status":"completed","model":"legacy-model","output":[]}`)
+	}))
+	defer legacy.Close()
+
+	explicit := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		explicitCalls.Add(1)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode explicit request: %v", err)
+		} else if body["model"] != "physical-explicit" {
+			t.Errorf("explicit model = %#v, want physical-explicit", body["model"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp-explicit","object":"response","status":"completed","model":"physical-explicit","output":[]}`)
+	}))
+	defer explicit.Close()
+
+	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
+		SchemaVersion: ProvidersConfigSchemaVersion2,
+		Providers: []ProviderConfig{
+			{
+				ID:       "legacy",
+				Type:     string(providerTypeOpenAICompatible),
+				Default:  true,
+				BaseURL:  legacy.URL,
+				AuthType: "none",
+				Models: []ProviderModelConfig{{
+					PublicID:  legacyModel,
+					Endpoints: []string{providerEndpointResponses},
+				}},
+			},
+			{ID: "explicit", Type: string(providerTypeOpenAICompatible), BaseURL: explicit.URL, AuthType: "none"},
+		},
+		ModelRoutes: []ModelRouteConfig{{
+			ID:        "explicit-route",
+			PublicID:  explicitModel,
+			Endpoints: []string{providerEndpointResponses},
+			Targets: []ModelRouteTargetConfig{{
+				ID: "target", Provider: "explicit", UpstreamModel: "physical-explicit",
+			}},
+		}},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.BeginShutdown()
+
+	request := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		h.HandleResponses(w, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+		return w
+	}
+
+	t.Run("legacy request keeps provider-owned duplicate-key behavior", func(t *testing.T) {
+		w := request(`{"model":"legacy-model","input":"first","input":"second"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+		}
+		if legacyCalls.Load() != 1 || explicitCalls.Load() != 0 {
+			t.Fatalf("legacy calls = %d, explicit calls = %d", legacyCalls.Load(), explicitCalls.Load())
+		}
+	})
+
+	t.Run("explicit route rejects before dispatch", func(t *testing.T) {
+		w := request(`{"model":"claude-sonnet-4.5","input":"first","input":"second"}`)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+		}
+		if legacyCalls.Load() != 1 || explicitCalls.Load() != 0 {
+			t.Fatalf("legacy calls = %d, explicit calls = %d", legacyCalls.Load(), explicitCalls.Load())
+		}
+		if !strings.Contains(w.Body.String(), "duplicate") {
+			t.Fatalf("body = %s, want duplicate-key detail", w.Body.String())
+		}
+	})
+
+	t.Run("explicit route alias rejects before dispatch", func(t *testing.T) {
+		w := request(`{"model":"` + explicitModelAlias + `","input":"first","input":"second"}`)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+		}
+		if legacyCalls.Load() != 1 || explicitCalls.Load() != 0 {
+			t.Fatalf("legacy calls = %d, explicit calls = %d", legacyCalls.Load(), explicitCalls.Load())
+		}
+		if !strings.Contains(w.Body.String(), "duplicate") {
+			t.Fatalf("body = %s, want duplicate-key detail", w.Body.String())
+		}
+	})
+}
+
 func TestExplicitRouteGeminiCompressionAliasUsesCanonicalRouteOperation(t *testing.T) {
 	var primaryCalls, secondaryCalls atomic.Int32
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
