@@ -85,9 +85,9 @@ func isResponsesWebSocketClientDisconnect(ctx context.Context, err error) bool {
 }
 
 // errStreamFailedUpstream is a sentinel error indicating the upstream stream
-// ended with response.failed or response.incomplete after forwarding the
-// upstream failure event. This path also emits the standard websocket error
-// payload so clients can surface the upstream error details.
+// ended with response.failed, response.incomplete, or a top-level error event
+// after forwarding the upstream failure event. This path also emits the standard
+// websocket error payload so clients can surface the upstream error details.
 var errStreamFailedUpstream = errors.New("upstream stream ended with response.failed or response.incomplete")
 
 // streamFailedUpstreamError carries the HTTP status that an upstream
@@ -138,20 +138,27 @@ type responsesWebSocketJSONField struct {
 }
 
 type responsesWebSocketStreamEvent struct {
-	Type     string `json:"type"`
+	Type     string                     `json:"type"`
+	Code     string                     `json:"code,omitempty"`
+	Message  string                     `json:"message,omitempty"`
+	Param    string                     `json:"param,omitempty"`
+	Headers  map[string]json.RawMessage `json:"headers,omitempty"`
 	Response struct {
 		ID                string                                    `json:"id"`
 		Error             responsesWebSocketStreamError             `json:"error"`
 		IncompleteDetails responsesWebSocketStreamIncompleteDetails `json:"incomplete_details"`
 		Usage             responsesUsage                            `json:"usage"`
 	} `json:"response,omitempty"`
-	Item json.RawMessage `json:"item,omitempty"`
+	Error responsesWebSocketStreamError `json:"error,omitempty"`
+	Item  json.RawMessage               `json:"item,omitempty"`
 }
 
 type responsesWebSocketStreamError struct {
-	Type    string `json:"type"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Type    string                     `json:"type"`
+	Code    string                     `json:"code"`
+	Message string                     `json:"message"`
+	Param   string                     `json:"param,omitempty"`
+	Headers map[string]json.RawMessage `json:"headers,omitempty"`
 }
 
 type responsesWebSocketStreamIncompleteDetails struct {
@@ -1164,7 +1171,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 					return http.StatusBadGateway, usage, true
 				}
 				return http.StatusOK, usage, true
-			case "response.failed", "response.incomplete":
+			case "response.failed", "response.incomplete", "error":
 				if terminalPeek.status != 0 {
 					return terminalPeek.status, usage, true
 				}
@@ -1294,9 +1301,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return err
 	}
 	if peek != nil && peek.decision == responsesPeekDecisionTranslate {
-		code := ""
+		code, param := "", ""
 		if peek.failure != nil {
-			code = strings.TrimSpace(peek.failure.Response.Error.Code)
+			streamErr := responsesStreamEventError(*peek.failure)
+			code = strings.TrimSpace(streamErr.Code)
+			param = strings.TrimSpace(streamErr.Param)
 		}
 		// Record the classified failure before delivering the client error frame;
 		// a disconnected client must not erase dashboard/provider accounting.
@@ -1308,7 +1317,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		if s.isClosing() || h.upstreamShutdownStarted() {
 			return context.Canceled
 		}
-		if writeErr := s.sendWrappedError(peek.status, peek.message, code, translatedHeaders); writeErr != nil {
+		if writeErr := s.sendWrappedErrorDetails(peek.status, peek.message, code, param, translatedHeaders); writeErr != nil {
 			return writeErr
 		}
 		return nil
@@ -1951,7 +1960,7 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 			wireData = responsesDataWithEventType(data, event.Type)
 		}
 		failureStatus := 0
-		if parsedEvent && (event.Type == "response.failed" || event.Type == "response.incomplete") {
+		if parsedEvent && (event.Type == "response.failed" || event.Type == "response.incomplete" || event.Type == "error") {
 			failureStatus, _, _ = responsesWebSocketStreamFailureDetails(event, headers)
 			if failureStatus != 0 {
 				result.usage = event.Response.Usage
@@ -1964,9 +1973,11 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 		}
 		if !sawSemanticEvent {
 			sawSemanticEvent = true
-			if parsedEvent && event.Type == "response.failed" {
+			if parsedEvent && (event.Type == "response.failed" || event.Type == "error") {
 				if status, _, ok := classifyResponsesFailure(event, headers); ok {
-					if writeErr := s.sendWrappedError(status, responsesPrecommitErrorMessage(event, status), strings.TrimSpace(event.Response.Error.Code), headers); writeErr != nil {
+					failureHeaders := responsesFailureHeaders(event, headers)
+					streamErr := responsesStreamEventError(event)
+					if writeErr := s.sendWrappedErrorDetails(status, responsesPrecommitErrorMessage(event, status), strings.TrimSpace(streamErr.Code), strings.TrimSpace(streamErr.Param), failureHeaders); writeErr != nil {
 						return writeErr
 					}
 					return &streamFailedUpstreamError{status: failureStatus}
@@ -2018,7 +2029,7 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 			}
 		case "response.completed":
 			return errResponsesWebSocketStreamTerminal
-		case "response.failed", "response.incomplete":
+		case "response.failed", "response.incomplete", "error":
 			if writeErr := s.sendUpstreamStreamFailure(event, headers); writeErr != nil {
 				return writeErr
 			}
@@ -2092,14 +2103,19 @@ func (s *responsesWebSocketSession) writeTextMessage(payload []byte) error {
 }
 
 func (s *responsesWebSocketSession) sendUpstreamStreamFailure(event responsesWebSocketStreamEvent, headers http.Header) error {
+	headers = responsesFailureHeaders(event, headers)
 	status, message, code := responsesWebSocketStreamFailureDetails(event, headers)
 	if status == 0 || strings.TrimSpace(message) == "" {
 		return nil
 	}
-	return s.sendWrappedError(status, message, code, headers)
+	return s.sendWrappedErrorDetails(status, message, code, strings.TrimSpace(responsesStreamEventError(event).Param), headers)
 }
 
 func (s *responsesWebSocketSession) sendWrappedError(status int, message, code string, headers http.Header) error {
+	return s.sendWrappedErrorDetails(status, message, code, "", headers)
+}
+
+func (s *responsesWebSocketSession) sendWrappedErrorDetails(status int, message, code, param string, headers http.Header) error {
 	payload := map[string]interface{}{
 		"type":        "error",
 		"status_code": status,
@@ -2109,6 +2125,9 @@ func (s *responsesWebSocketSession) sendWrappedError(status int, message, code s
 	}
 	if code != "" {
 		payload["error"].(map[string]interface{})["code"] = code
+	}
+	if param != "" {
+		payload["error"].(map[string]interface{})["param"] = param
 	}
 	headers = responsesWebSocketErrorHeaders(status, headers)
 	if mappedHeaders := flattenResponsesWebSocketHeaders(headers); len(mappedHeaders) > 0 {
@@ -2223,17 +2242,20 @@ func extractResponsesWebSocketError(status int, body []byte) (string, string) {
 
 func responsesWebSocketStreamFailureDetails(event responsesWebSocketStreamEvent, headers http.Header) (int, string, string) {
 	switch event.Type {
-	case "response.failed":
+	case "response.failed", "error":
 		if status, _, ok := classifyResponsesFailure(event, headers); ok {
 			message := responsesPrecommitErrorMessage(event, status)
-			return status, message, strings.TrimSpace(event.Response.Error.Code)
+			return status, message, strings.TrimSpace(responsesStreamEventError(event).Code)
 		}
-		errType := strings.TrimSpace(event.Response.Error.Type)
-		code := strings.TrimSpace(event.Response.Error.Code)
-		message := strings.TrimSpace(event.Response.Error.Message)
+		streamErr := responsesStreamEventError(event)
+		errType := strings.TrimSpace(streamErr.Type)
+		code := strings.TrimSpace(streamErr.Code)
+		message := strings.TrimSpace(streamErr.Message)
 		if message == "" {
 			if code != "" {
 				message = code
+			} else if event.Type == "error" {
+				message = "upstream error event"
 			} else {
 				message = "upstream response.failed"
 			}
@@ -2251,18 +2273,18 @@ func responsesWebSocketStreamFailureDetails(event responsesWebSocketStreamEvent,
 }
 
 func responsesWebSocketErrorStatus(errType string) int {
-	switch strings.TrimSpace(errType) {
-	case "invalid_request_error":
+	switch strings.ToLower(strings.TrimSpace(errType)) {
+	case "invalid_request_error", "user_error":
 		return http.StatusBadRequest
 	case "authentication_error":
 		return http.StatusUnauthorized
-	case "permission_error":
+	case "permission_error", "forbidden":
 		return http.StatusForbidden
 	case "not_found_error":
 		return http.StatusNotFound
 	case "conflict_error":
 		return http.StatusConflict
-	case "rate_limit_error":
+	case "rate_limit_error", "too_many_requests":
 		return http.StatusTooManyRequests
 	case "server_error":
 		return http.StatusInternalServerError

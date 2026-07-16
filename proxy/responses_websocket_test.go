@@ -3080,6 +3080,92 @@ func TestHandleResponsesWebSocket_FirstEventTransientResponseFailedSendsOnlyErro
 	}
 }
 
+func TestHandleResponsesWebSocket_FirstEventTopLevelErrorSendsOnlyErrorFrame(t *testing.T) {
+	var upstreamRequests atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		requestNumber := upstreamRequests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch requestNumber {
+		case 1:
+			_, _ = fmt.Fprint(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"no_capacity\",\"message\":\"No capacity is available.\",\"headers\":{\"retry-after-ms\":\"1200\",\"x-request-id\":\"event-ws-req\"}}}\n\n")
+		case 2:
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-next-top-level-error\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-next-top-level-error\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n")
+		default:
+			t.Fatalf("unexpected upstream request count %d", requestNumber)
+		}
+	})
+	handler.stats = newStatsCollector()
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.WriteJSON(newResponsesWebSocketCreateRequest(nil)); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+	errFrame := mustReadWebSocketJSON(t, conn)
+	if errFrame["type"] != "error" {
+		t.Fatalf("first frame type = %v, want error", errFrame["type"])
+	}
+	if statusCode, _ := errFrame["status_code"].(float64); statusCode != float64(http.StatusTooManyRequests) {
+		t.Fatalf("status_code = %v, want 429", errFrame["status_code"])
+	}
+	errPayload, ok := errFrame["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("error payload type = %T, want object", errFrame["error"])
+	}
+	if errPayload["code"] != "no_capacity" || errPayload["message"] != "No capacity is available." {
+		t.Fatalf("error payload = %#v, want no_capacity message", errPayload)
+	}
+	headers, ok := errFrame["headers"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("headers type = %T, want object", errFrame["headers"])
+	}
+	if headers["Retry-After"] != "2" || headers["X-Request-Id"] != "event-ws-req" {
+		t.Fatalf("headers = %#v, want Retry-After=2 and X-Request-Id=event-ws-req", headers)
+	}
+	assertSingleResponsesWebSocketFailureStats(t, handler, http.StatusTooManyRequests)
+
+	if err := conn.WriteJSON(newResponsesWebSocketCreateRequest(nil)); err != nil {
+		t.Fatalf("failed to write follow-up websocket request: %v", err)
+	}
+	if frame := mustReadWebSocketJSON(t, conn); frame["type"] != "response.created" {
+		t.Fatalf("follow-up first frame type = %v, want response.created", frame["type"])
+	}
+	if frame := mustReadWebSocketJSON(t, conn); frame["type"] != "response.completed" {
+		t.Fatalf("follow-up second frame type = %v, want response.completed", frame["type"])
+	}
+}
+
+func TestHandleResponsesWebSocket_FirstEventRootErrorPreservesDiagnostics(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: error\ndata: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"The prompt is invalid.\",\"param\":\"input\",\"sequence_number\":1}\n\n")
+	})
+	handler.stats = newStatsCollector()
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.WriteJSON(newResponsesWebSocketCreateRequest(nil)); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+	errFrame := mustReadWebSocketJSON(t, conn)
+	if errFrame["type"] != "error" || errFrame["status_code"] != float64(http.StatusBadRequest) {
+		t.Fatalf("error frame = %#v, want status 400", errFrame)
+	}
+	errPayload, ok := errFrame["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("error payload type = %T, want object", errFrame["error"])
+	}
+	if errPayload["code"] != "invalid_prompt" || errPayload["message"] != "The prompt is invalid." || errPayload["param"] != "input" {
+		t.Fatalf("error payload = %#v, want canonical root diagnostics", errPayload)
+	}
+	assertSingleResponsesWebSocketFailureStats(t, handler, http.StatusBadRequest)
+}
+
 func TestHandleResponsesWebSocket_FirstEventTransientResponseFailedWithoutUpstreamCodeOmitsErrorCode(t *testing.T) {
 	var upstreamRequests atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -3439,6 +3525,42 @@ func TestHandleResponsesWebSocket_SameChunkCreatedThenFailedRelaysSSE(t *testing
 	if snap.Totals.PromptTokens != 9 || snap.Totals.CompletionTokens != 2 || snap.Totals.TotalTokens != 11 {
 		t.Fatalf("failed turn usage = prompt:%d completion:%d total:%d, want 9/2/11", snap.Totals.PromptTokens, snap.Totals.CompletionTokens, snap.Totals.TotalTokens)
 	}
+}
+
+func TestHandleResponsesWebSocket_TopLevelErrorAfterCreatedRelaysErrorAndWrappedFailure(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-later-top-level-error\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"server_error\",\"message\":\"Request rate limit exceeded.\",\"headers\":{\"retry-after-ms\":\"1200\"}}}\n\n")
+	})
+	handler.stats = newStatsCollector()
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.WriteJSON(newResponsesWebSocketCreateRequest(nil)); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+	if frame := mustReadWebSocketJSON(t, conn); frame["type"] != "response.created" {
+		t.Fatalf("first frame type = %v, want response.created", frame["type"])
+	}
+	upstreamError := mustReadWebSocketJSON(t, conn)
+	if upstreamError["type"] != "error" {
+		t.Fatalf("second frame type = %v, want upstream error event", upstreamError["type"])
+	}
+	if _, ok := upstreamError["status_code"]; ok {
+		t.Fatalf("upstream error event unexpectedly wrapped: %#v", upstreamError)
+	}
+	wrapped := mustReadWebSocketJSON(t, conn)
+	if wrapped["type"] != "error" || wrapped["status_code"] != float64(http.StatusTooManyRequests) {
+		t.Fatalf("wrapped error = %#v, want status 429", wrapped)
+	}
+	headers, ok := wrapped["headers"].(map[string]interface{})
+	if !ok || headers["Retry-After"] != "2" {
+		t.Fatalf("wrapped headers = %#v, want Retry-After=2", wrapped["headers"])
+	}
+	assertSingleResponsesWebSocketFailureStats(t, handler, http.StatusTooManyRequests)
 }
 
 func TestHandleResponsesWebSocket_RelaysUpstreamHeadersOnSuccess(t *testing.T) {

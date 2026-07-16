@@ -29,6 +29,8 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 		wantContentType  string
 		wantRetryAfter   string
 		wantErrorType    string
+		wantErrorCode    string
+		wantErrorParam   string
 		wantErrorMessage string
 		wantRawBody      string
 		assertHeaders    func(t *testing.T, headers http.Header)
@@ -84,6 +86,80 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantContentType:  "application/json",
 			wantErrorType:    "rate_limit_error",
 			wantErrorMessage: "slow down",
+		},
+		{
+			name: "top level error event translates before commit",
+			body: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"no_capacity\",\"message\":\"No capacity is available for this model.\",\"param\":\"model\",\"headers\":{\"retry-after-ms\":\"1200\",\"x-request-id\":\"event-req-1\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "2",
+			wantErrorType:    "rate_limit_error",
+			wantErrorParam:   "model",
+			wantErrorMessage: "No capacity is available for this model.",
+			assertHeaders: func(t *testing.T, headers http.Header) {
+				t.Helper()
+				if got := headers.Get("X-Request-Id"); got != "event-req-1" {
+					t.Fatalf("X-Request-Id = %q, want event-req-1", got)
+				}
+			},
+		},
+		{
+			name: "canonical root error event translates before commit",
+			body: "event: error\ndata: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"Rate limit reached for this request.\",\"param\":null,\"sequence_number\":1}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantErrorType:    "rate_limit_error",
+			wantErrorCode:    "rate_limit_exceeded",
+			wantErrorMessage: "Rate limit reached for this request.",
+		},
+		{
+			name: "canonical root server error maps to 500",
+			body: "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"The server had an error while processing your request.\",\"param\":null,\"sequence_number\":1}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusInternalServerError,
+			wantContentType:  "application/json",
+			wantErrorType:    "server_error",
+			wantErrorCode:    "server_error",
+			wantErrorMessage: "The server had an error while processing your request.",
+		},
+		{
+			name: "canonical invalid prompt preserves parameter",
+			body: "event: error\ndata: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"The prompt is invalid.\",\"param\":\"input\",\"sequence_number\":1}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusBadRequest,
+			wantContentType:  "application/json",
+			wantErrorType:    "invalid_request_error",
+			wantErrorCode:    "invalid_prompt",
+			wantErrorParam:   "input",
+			wantErrorMessage: "The prompt is invalid.",
+		},
+		{
+			name: "root and nested error headers merge with nested precedence",
+			body: "event: error\ndata: {\"type\":\"error\",\"headers\":{\"retry-after-ms\":\"1200\",\"x-ratelimit-remaining-requests\":\"0\",\"x-request-id\":\"root-request-id\"},\"error\":{\"type\":\"server_error\",\"message\":\"Request rate limit exceeded.\",\"headers\":{\"X-Request-Id\":\"nested-request-id\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "2",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Request rate limit exceeded.",
+			assertHeaders: func(t *testing.T, headers http.Header) {
+				t.Helper()
+				if got := headers.Get("X-Request-Id"); got != "nested-request-id" {
+					t.Fatalf("X-Request-Id = %q, want nested-request-id", got)
+				}
+			},
 		},
 		{
 			name: "unknown failure fails open",
@@ -227,6 +303,31 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantRetryAfter:   "3",
 			wantErrorType:    "rate_limit_error",
 			wantErrorMessage: "Your requests to gpt-5.6-sol for gpt-5.6-sol in westus3 have exceeded rate limit.",
+		},
+		{
+			name: "generic server error with quota evidence translates",
+			body: "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-generic-rate-limit\"}}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-generic-rate-limit\",\"error\":{\"type\":\"server_error\",\"message\":\"Request rate limit exceeded.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                   []string{"text/event-stream"},
+				"retry-after-ms":                 []string{"1800"},
+				"x-ratelimit-remaining-requests": []string{"0"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "2",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Request rate limit exceeded.",
+		},
+		{
+			name: "numeric 429 code translates",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-numeric-429\",\"error\":{\"type\":\"server_error\",\"code\":\"429\",\"message\":\"Too many requests.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Too many requests.",
 		},
 		{
 			name: "created then immediate rate limit translates before commit",
@@ -378,6 +479,8 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 				Error struct {
 					Message string `json:"message"`
 					Type    string `json:"type"`
+					Code    string `json:"code"`
+					Param   string `json:"param"`
 				} `json:"error"`
 			}
 			if err := json.Unmarshal(body, &envelope); err != nil {
@@ -385,6 +488,12 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			}
 			if envelope.Error.Type != tt.wantErrorType {
 				t.Fatalf("error.type = %q, want %q", envelope.Error.Type, tt.wantErrorType)
+			}
+			if tt.wantErrorCode != "" && envelope.Error.Code != tt.wantErrorCode {
+				t.Fatalf("error.code = %q, want %q", envelope.Error.Code, tt.wantErrorCode)
+			}
+			if tt.wantErrorParam != "" && envelope.Error.Param != tt.wantErrorParam {
+				t.Fatalf("error.param = %q, want %q", envelope.Error.Param, tt.wantErrorParam)
 			}
 			if envelope.Error.Message != tt.wantErrorMessage {
 				t.Fatalf("error.message = %q, want %q", envelope.Error.Message, tt.wantErrorMessage)
@@ -435,6 +544,26 @@ func TestPeekAndForwardResponses_ExhaustedQuotaPreambleRetainsHardCap(t *testing
 	body, _ := io.ReadAll(result.Body)
 	if result.StatusCode != http.StatusOK || string(body) != created {
 		t.Fatalf("status = %d body length=%d, want passthrough 200 body length=%d", result.StatusCode, len(body), len(created))
+	}
+}
+
+func TestPeekAndForwardResponses_TranslatesFailureAtEOFWithoutSSEDelimiter(t *testing.T) {
+	raw := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-eof-rate-limit\",\"error\":{\"code\":\"too_many_requests\",\"message\":\"slow down\"}}}"
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(raw)),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":true}`))
+	w := httptest.NewRecorder()
+	h := &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}
+
+	peekAndForwardResponsesWithConfig(h, w, req, resp, context.Background(), func() {}, "gpt-5.6-sol", time.Second, responsesPrecommitMaxPeekBytes, "")
+
+	result := w.Result()
+	body, _ := io.ReadAll(result.Body)
+	if result.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429; body=%s", result.StatusCode, body)
 	}
 }
 
@@ -808,6 +937,33 @@ func TestStreamResponsesPipeClassifiesUncodedRateLimitFromHeaders(t *testing.T) 
 	streamResponsesPipeWithFailureLog(ctx, &ProxyHandler{log: logger.New(logger.LevelError)}, rec, strings.NewReader(sse), headers, nil, "")
 	if got := summary.FailureStatus(); got != http.StatusTooManyRequests {
 		t.Fatalf("FailureStatus = %d, want 429", got)
+	}
+	if got := rec.Body.String(); got != sse {
+		t.Fatalf("stream body altered. got %q want %q", got, sse)
+	}
+}
+
+func TestStreamResponsesPipeClassifiesTopLevelErrorEvent(t *testing.T) {
+	sse := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n" +
+		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"no_capacity\",\"message\":\"No capacity is available.\",\"headers\":{\"retry-after-ms\":\"1200\"}}}\n\n"
+	ctx, summary := WithRequestSummary(context.Background())
+	rec := httptest.NewRecorder()
+	tap := newResponsesFailureTap(ctx, &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, nil, nil, "")
+
+	if _, err := tap.Write([]byte(sse)); err != nil {
+		t.Fatalf("tap.Write() error = %v", err)
+	}
+	if !tap.completedCleanly() {
+		t.Fatal("top-level error event was not treated as terminal")
+	}
+	if got := summary.FailureStatus(); got != http.StatusTooManyRequests {
+		t.Fatalf("FailureStatus = %d, want 429", got)
+	}
+
+	streamCtx, streamSummary := WithRequestSummary(context.Background())
+	streamResponsesPipeWithFailureLog(streamCtx, &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, rec, strings.NewReader(sse), nil, nil, "")
+	if got := streamSummary.FailureStatus(); got != http.StatusTooManyRequests {
+		t.Fatalf("stream FailureStatus = %d, want 429", got)
 	}
 	if got := rec.Body.String(); got != sse {
 		t.Fatalf("stream body altered. got %q want %q", got, sse)
