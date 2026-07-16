@@ -85,7 +85,9 @@ func prepareAnthropicChatCompletionsRequestWithModelOverride(req *models.Anthrop
 		oaiReq.Model = modelOverride
 	}
 
-	prewarm := req.MaxTokens != nil && *req.MaxTokens == 0 && !req.Stream
+	prewarm := !req.Stream &&
+		((oaiReq.MaxTokens != nil && *oaiReq.MaxTokens == 0) ||
+			(oaiReq.MaxCompletionTokens != nil && *oaiReq.MaxCompletionTokens == 0))
 	mode := chatCompletionsMode{
 		clientRequestedStream: req.Stream,
 		forceUpstreamStream:   !req.Stream && !prewarm,

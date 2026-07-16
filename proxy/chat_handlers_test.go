@@ -180,6 +180,45 @@ func TestPrepareAnthropicChatCompletionsRequest_PrewarmStaysNonStreaming(t *test
 	}
 }
 
+func TestPrepareAnthropicChatCompletionsRequest_InterleavedThinkingZeroMaxStillStreams(t *testing.T) {
+	zero := 0
+	budget := 8192
+	req := &models.AnthropicRequest{
+		Model:     "claude-opus-4-5",
+		MaxTokens: &zero,
+		Messages: []models.AnthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"use tools"`)},
+		},
+		Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: &budget},
+		Tools: []models.AnthropicTool{{
+			Name:        "lookup",
+			InputSchema: json.RawMessage(`{"type":"object"}`),
+		}},
+	}
+
+	prepared, mode, err := prepareAnthropicChatCompletionsRequest(req)
+	if err != nil {
+		t.Fatalf("prepareAnthropicChatCompletionsRequest: %v", err)
+	}
+	if !mode.forceUpstreamStream || !mode.injectedStreamUsage {
+		t.Fatalf("interleaved thinking mode = %+v, want forced upstream streaming", mode)
+	}
+
+	var oaiReq models.OpenAIRequest
+	if err := json.Unmarshal(prepared, &oaiReq); err != nil {
+		t.Fatalf("unmarshal prepared request: %v", err)
+	}
+	if oaiReq.Stream == nil || !*oaiReq.Stream {
+		t.Fatalf("stream = %v, want true", oaiReq.Stream)
+	}
+	if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != budget {
+		t.Fatalf("max_completion_tokens = %v, want %d", oaiReq.MaxCompletionTokens, budget)
+	}
+	if oaiReq.MaxTokens != nil {
+		t.Fatalf("max_tokens = %v, want nil", oaiReq.MaxTokens)
+	}
+}
+
 func TestPrepareAnthropicChatCompletionsRequest_ForcesStreaming(t *testing.T) {
 	req := &models.AnthropicRequest{
 		Model: "claude-sonnet-4",
