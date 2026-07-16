@@ -386,6 +386,20 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantErrorMessage: "Your requests to gpt-5.6-sol for gpt-5.6-sol in westus3 have exceeded rate limit.",
 		},
 		{
+			name: "overflow-sized retry-after-ms is clamped to five minutes",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-retry-ms-overflow\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"retry-after-ms":               []string{"10000000000"},
+				"x-ratelimit-remaining-tokens": []string{"0"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "300",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Your requests have exceeded rate limit.",
+		},
+		{
 			name: "generic server error with quota evidence translates",
 			body: "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-generic-rate-limit\"}}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-generic-rate-limit\",\"error\":{\"type\":\"server_error\",\"message\":\"Request rate limit exceeded.\"}}}\n\n",
 			headers: http.Header{
@@ -580,6 +594,37 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 				t.Fatalf("error.message = %q, want %q", envelope.Error.Message, tt.wantErrorMessage)
 			}
 		})
+	}
+}
+
+func TestHandleResponses_PrecommitFailureTranslationRecordsUsage(t *testing.T) {
+	handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			Body: io.NopCloser(strings.NewReader("event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-rate-limit-usage\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"},\"usage\":{\"input_tokens\":11,\"output_tokens\":4,\"total_tokens\":15}}}\n\n")),
+		}, nil
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.4","input":"Hello","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx, summary := WithRequestSummary(req.Context())
+	req = req.WithContext(ctx)
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 429, body=%s", resp.StatusCode, body)
+	}
+	usage := readSummaryForStats(summary)
+	if usage.prompt != 11 || usage.completion != 4 || usage.total != 15 {
+		t.Fatalf("usage = prompt:%d completion:%d total:%d, want 11/4/15", usage.prompt, usage.completion, usage.total)
 	}
 }
 

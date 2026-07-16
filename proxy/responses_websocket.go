@@ -1179,7 +1179,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 				if resp != nil {
 					headers = resp.Header
 				}
-				status, _, _ := responsesWebSocketStreamFailureDetails(*terminalPeek.terminal, headers)
+				status, _, _, _ := responsesWebSocketStreamFailureDetails(*terminalPeek.terminal, headers)
 				return status, usage, true
 			}
 		}
@@ -1961,7 +1961,7 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 		}
 		failureStatus := 0
 		if parsedEvent && (event.Type == "response.failed" || event.Type == "response.incomplete" || event.Type == "error") {
-			failureStatus, _, _ = responsesWebSocketStreamFailureDetails(event, headers)
+			failureStatus, _, _, _ = responsesWebSocketStreamFailureDetails(event, headers)
 			if failureStatus != 0 {
 				result.usage = event.Response.Usage
 				// Account before forwarding either the upstream failure event or the
@@ -2104,7 +2104,7 @@ func (s *responsesWebSocketSession) writeTextMessage(payload []byte) error {
 
 func (s *responsesWebSocketSession) sendUpstreamStreamFailure(event responsesWebSocketStreamEvent, headers http.Header) error {
 	headers = responsesFailureHeaders(event, headers)
-	status, message, code := responsesWebSocketStreamFailureDetails(event, headers)
+	status, message, code, errType := responsesWebSocketStreamFailureDetails(event, headers)
 	if status == 0 || strings.TrimSpace(message) == "" {
 		return nil
 	}
@@ -2244,12 +2244,12 @@ func extractResponsesWebSocketError(status int, body []byte) (string, string) {
 	return http.StatusText(status), ""
 }
 
-func responsesWebSocketStreamFailureDetails(event responsesWebSocketStreamEvent, headers http.Header) (int, string, string) {
+func responsesWebSocketStreamFailureDetails(event responsesWebSocketStreamEvent, headers http.Header) (int, string, string, string) {
 	switch event.Type {
 	case "response.failed", "error":
-		if status, _, ok := classifyResponsesFailure(event, headers); ok {
+		if status, errType, ok := classifyResponsesFailure(event, headers); ok {
 			message := responsesPrecommitErrorMessage(event, status)
-			return status, message, strings.TrimSpace(responsesStreamEventError(event).Code)
+			return status, message, strings.TrimSpace(responsesStreamEventError(event).Code), errType
 		}
 		streamErr := responsesStreamEventError(event)
 		errType := strings.TrimSpace(streamErr.Type)
@@ -2264,15 +2264,15 @@ func responsesWebSocketStreamFailureDetails(event responsesWebSocketStreamEvent,
 				message = "upstream response.failed"
 			}
 		}
-		return responsesWebSocketErrorStatus(errType), message, code
+		return responsesWebSocketErrorStatus(errType), message, code, errType
 	case "response.incomplete":
 		reason := strings.TrimSpace(event.Response.IncompleteDetails.Reason)
 		if reason == "" {
-			return http.StatusConflict, "upstream response.incomplete", "response_incomplete"
+			return http.StatusConflict, "upstream response.incomplete", "response_incomplete", "conflict_error"
 		}
-		return http.StatusConflict, "upstream response.incomplete: " + reason, reason
+		return http.StatusConflict, "upstream response.incomplete: " + reason, reason, "conflict_error"
 	default:
-		return 0, "", ""
+		return 0, "", "", ""
 	}
 }
 

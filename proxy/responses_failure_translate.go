@@ -1059,13 +1059,15 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 			failureHeaders = responsesFailureHeaders(*result.failure, resp.Header)
 		}
 		logResponsesPrecommitTranslated(h, result, model, failureHeaders)
+		if result.failure != nil {
+			observeResponsesUsage(r.Context(), result.failure.Response.Usage)
+		}
 		prepared.abort()
 		errorCode, errorParam := "", ""
 		if result.failure != nil {
 			streamErr := responsesStreamEventError(*result.failure)
 			errorCode = strings.TrimSpace(streamErr.Code)
 			errorParam = strings.TrimSpace(streamErr.Param)
-			observeResponsesUsage(r.Context(), result.failure.Response.Usage)
 		}
 		writeOpenAIErrorWithRetryAfterDetails(w, result.status, result.message, result.errType, result.retryAfter, failureHeaders, errorParam, errorCode)
 		return
@@ -2295,7 +2297,7 @@ func (t *responsesFailureTap) maybeLog(eventName string, event responsesWebSocke
 	// rate limits (429) and overloads (503) keep their exact status rather than
 	// all collapsing to bad-gateway.
 	failureHeaders := responsesFailureHeaders(event, t.upstreamHeaders)
-	failureStatus, _, _ := responsesWebSocketStreamFailureDetails(event, failureHeaders)
+	failureStatus, _, _, _ := responsesWebSocketStreamFailureDetails(event, failureHeaders)
 	if failureStatus == 0 {
 		failureStatus = http.StatusBadGateway
 	}

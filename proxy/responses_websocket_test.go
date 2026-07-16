@@ -3118,6 +3118,9 @@ func TestHandleResponsesWebSocket_FirstEventTopLevelErrorSendsOnlyErrorFrame(t *
 	if errPayload["type"] != "rate_limit_error" || errPayload["code"] != "no_capacity" || errPayload["message"] != "No capacity is available." {
 		t.Fatalf("error payload = %#v, want no_capacity message", errPayload)
 	}
+	if errPayload["type"] != "rate_limit_error" {
+		t.Fatalf("error type = %#v, want rate_limit_error", errPayload["type"])
+	}
 	headers, ok := errFrame["headers"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("headers type = %T, want object", errFrame["headers"])
