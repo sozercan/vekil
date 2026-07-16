@@ -704,6 +704,146 @@ func TestHandleResponsesWebSocket_RoutesConfiguredAzureIdentityProvider(t *testi
 	}
 }
 
+func TestPrepareExplicitResponsesWebSocketSuccessResponse_ConcurrentCompactionWaiterStaysLocal(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	var releaseOnce sync.Once
+	releaseLeader := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseLeader()
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read compact request: %v", err)
+		}
+		if !strings.Contains(string(body), `"model":"physical-primary"`) {
+			t.Errorf("compact request did not use primary physical model: %s", body)
+		}
+		startedOnce.Do(func() { close(started) })
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_compact","object":"response","model":"physical-primary","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"shared checkpoint"}]}],"usage":{"input_tokens":13,"output_tokens":2,"total_tokens":15}}`)
+	}))
+	defer upstream.Close()
+
+	handler := newExplicitRouteResponsesWebSocketHandler(t, upstream.URL, upstream.URL)
+	route, known := handler.resolveModelRouteForRequest("public-ws-model", providerEndpointResponses)
+	if !known || route == nil || route.legacy {
+		t.Fatal("explicit websocket route was not resolved")
+	}
+
+	turn := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type":    "message",
+			"role":    "user",
+			"content": []map[string]string{{"type": "input_text", "text": "compact me"}},
+		},
+		map[string]interface{}{"type": "compaction_trigger"},
+	})
+	turn["model"] = "public-ws-model"
+	parsedTurn := mustParseResponsesWebSocketCreateRequest(t, turn)
+	turnBody, err := parsedTurn.upstreamBody(parsedTurn.Input)
+	if err != nil {
+		t.Fatalf("build compaction turn body: %v", err)
+	}
+	requestFields, handled, err := compactTriggerRequestFields(turnBody)
+	if err != nil || !handled {
+		t.Fatalf("extract compaction turn fields: handled=%t err=%v", handled, err)
+	}
+	type compactResult struct {
+		summary string
+		resp    *http.Response
+		err     error
+	}
+	runCompact := func(operation *routeOperation, done chan<- compactResult) {
+		summary, resp, err := handler.compactResponsesRequest(
+			withRouteOperation(context.Background(), operation),
+			copyResponsesRequestFields(requestFields),
+			nil,
+		)
+		done <- compactResult{summary: summary, resp: resp, err: err}
+	}
+
+	leaderOperation := newRouteOperation(route, context.Background())
+	leaderDone := make(chan compactResult, 1)
+	go runCompact(leaderOperation, leaderDone)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for compact singleflight leader")
+	}
+
+	waiterOperation := newRouteOperation(route, context.Background())
+	waiterDone := make(chan compactResult, 1)
+	go runCompact(waiterOperation, waiterDone)
+	waitForCompactInflightWaiters(t, handler, 1)
+	releaseLeader()
+
+	leader := <-leaderDone
+	waiter := <-waiterDone
+	for _, result := range []struct {
+		name string
+		compactResult
+	}{
+		{name: "leader", compactResult: leader},
+		{name: "waiter", compactResult: waiter},
+	} {
+		if result.err != nil {
+			t.Fatalf("%s compact request failed: %v", result.name, result.err)
+		}
+		if result.resp != nil {
+			_ = result.resp.Body.Close()
+			t.Fatalf("%s compact response = %v, want synthetic summary", result.name, result.resp.StatusCode)
+		}
+		if result.summary != "shared checkpoint" {
+			t.Fatalf("%s compact summary = %q, want shared checkpoint", result.name, result.summary)
+		}
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream compact calls = %d, want one singleflight leader", got)
+	}
+	stats := handler.stats.snapshot()
+	if stats.UpstreamAttempts != 1 || stats.TargetSwitches != 0 {
+		t.Fatalf("route metrics = attempts:%d switches:%d, want 1/0", stats.UpstreamAttempts, stats.TargetSwitches)
+	}
+
+	leaderSends, _, _ := leaderOperation.snapshot()
+	if leaderSends != 1 || leaderOperation.pinnedTarget() != "primary" {
+		t.Fatalf("leader operation = sends:%d target:%q, want one send pinned to primary", leaderSends, leaderOperation.pinnedTarget())
+	}
+	waiterSends, _, _ := waiterOperation.snapshot()
+	if waiterSends != 0 || waiterOperation.pinnedTarget() != "" {
+		t.Fatalf("waiter operation = sends:%d target:%q, want local result with no selected target", waiterSends, waiterOperation.pinnedTarget())
+	}
+
+	plan := responsesWebSocketRequestPlan{compactionChecked: true, compactionTrigger: true}
+	t.Run("joined local response does not require target ownership", func(t *testing.T) {
+		resp := syntheticCompactionTriggerResponse(waiter.summary, true, zeroResponsesUsage())
+		defer func() { _ = resp.Body.Close() }()
+		session := &responsesWebSocketSession{}
+		if err := session.prepareExplicitRouteSuccessResponse(handler, resp, route, waiterOperation, plan); err != nil {
+			t.Fatalf("prepare local compaction response: %v", err)
+		}
+		if session.explicitRouteID != "" || session.explicitTargetID != "" {
+			t.Fatalf("local compaction response pinned session to route=%q target=%q", session.explicitRouteID, session.explicitTargetID)
+		}
+	})
+
+	t.Run("upstream compaction still pins selected target", func(t *testing.T) {
+		resp := syntheticCompactionTriggerResponse(leader.summary, true, zeroResponsesUsage())
+		defer func() { _ = resp.Body.Close() }()
+		session := &responsesWebSocketSession{}
+		if err := session.prepareExplicitRouteSuccessResponse(handler, resp, route, leaderOperation, plan); err != nil {
+			t.Fatalf("prepare upstream compaction response: %v", err)
+		}
+		if session.explicitRouteID != route.public.routeID || session.explicitTargetID != "primary" {
+			t.Fatalf("upstream compaction response pinned route=%q target=%q, want %q/primary", session.explicitRouteID, session.explicitTargetID, route.public.routeID)
+		}
+	})
+}
+
 func TestHandleResponsesWebSocket_ExplicitRouteFirstTurnFailsOverThenPinsSession(t *testing.T) {
 	var primaryCalls atomic.Int32
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

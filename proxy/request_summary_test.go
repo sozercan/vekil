@@ -89,6 +89,20 @@ func TestRequestSummarySeparatesLastAttemptFromFinalRouteAttribution(t *testing.
 	}
 }
 
+func TestRequestSummaryFinalRouteResultRestoresCanonicalAttribution(t *testing.T) {
+	summary := &RequestSummary{}
+	summary.setFinalRouteResult("secondary-target", "secondary", "openai-compatible", "secondary-request")
+	summary.setFinalRouteResult(" primary-target ", " primary ", " azure-openai ", "")
+
+	stats := readSummaryForStats(summary)
+	if stats.finalTarget != "primary-target" || stats.provider != "primary" || stats.kind != "azure-openai" {
+		t.Fatalf("final attribution = %q/%q/%q, want primary attribution", stats.finalTarget, stats.provider, stats.kind)
+	}
+	if stats.upstreamID != "" {
+		t.Fatalf("upstream request ID = %q, want cleared with canonical result", stats.upstreamID)
+	}
+}
+
 func TestRequestSummaryRouteObservabilityNilSafe(t *testing.T) {
 	var summary *RequestSummary
 	summary.SetOperationID("op")

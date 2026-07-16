@@ -176,6 +176,27 @@ func (s *RequestSummary) setFinalRouteAttribution(targetID, provider, kind strin
 	s.providerKind = kind
 }
 
+// setFinalRouteResult atomically restores the complete attribution for the
+// response or error selected for return. Unlike setUpstreamRequestID, an empty
+// upstream request ID is meaningful here: it clears correlation metadata left
+// by a later attempt when an earlier canonical result wins precedence.
+func (s *RequestSummary) setFinalRouteResult(targetID, provider, kind, upstreamRequestID string) {
+	if s == nil {
+		return
+	}
+	targetID = strings.TrimSpace(targetID)
+	if targetID == "" {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finalTarget = targetID
+	s.provider = strings.TrimSpace(provider)
+	s.providerKind = strings.TrimSpace(kind)
+	s.upstreamRequestID = strings.TrimSpace(upstreamRequestID)
+}
+
 // FinalTarget returns the final/canonical physical target ID, if known.
 func (s *RequestSummary) FinalTarget() string {
 	if s == nil {

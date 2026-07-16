@@ -78,6 +78,15 @@ func (b *cleanupTimeoutStreamBody) release() {
 
 func newExplicitRouteSurfaceHandler(t *testing.T, providerKind providerType, endpoint string, primaryURL, secondaryURL string) *ProxyHandler {
 	t.Helper()
+	return newExplicitRouteSurfaceHandlerWithRouting(t, providerKind, endpoint, primaryURL, secondaryURL, ModelRouteRoutingConfig{
+		Mode:              string(routeModePriorityFailover),
+		MaxTargetAttempts: 2,
+		MaxUpstreamSends:  2,
+	})
+}
+
+func newExplicitRouteSurfaceHandlerWithRouting(t *testing.T, providerKind providerType, endpoint string, primaryURL, secondaryURL string, routing ModelRouteRoutingConfig) *ProxyHandler {
+	t.Helper()
 	provider := func(id, baseURL, key string, primary bool) ProviderConfig {
 		cfg := ProviderConfig{ID: id, Type: string(providerKind), BaseURL: baseURL, Default: primary}
 		switch providerKind {
@@ -108,7 +117,7 @@ func newExplicitRouteSurfaceHandler(t *testing.T, providerKind providerType, end
 					{ID: "primary-target", Provider: "primary", UpstreamModel: "physical-primary"},
 					{ID: "secondary-target", Provider: "secondary", UpstreamModel: "physical-secondary"},
 				},
-				Routing: ModelRouteRoutingConfig{Mode: string(routeModePriorityFailover), MaxTargetAttempts: 2, MaxUpstreamSends: 2},
+				Routing: routing,
 			}},
 		}),
 	)
@@ -566,6 +575,63 @@ func TestExplicitRouteOpenAIChatStreamProtectsProxyOperationID(t *testing.T) {
 	}
 }
 
+func TestExplicitRouteCanonicalStreamFailureRestoresPrimaryAttributionAfterSecondaryPrewriteError(t *testing.T) {
+	var primaryCalls, secondaryCalls atomic.Int32
+	h := newExplicitRouteSurfaceHandler(t, providerTypeAzureOpenAI, providerEndpointChatCompletions, "https://primary.example", "https://secondary.example")
+	h.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Hostname() {
+		case "primary.example":
+			primaryCalls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header: http.Header{
+					"Content-Type": []string{"text/event-stream"},
+					"X-Request-Id": []string{"primary-stream-request"},
+				},
+				Body:    io.NopCloser(strings.NewReader("event: error\ndata: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}\n\n")),
+				Request: req,
+			}, nil
+		case "secondary.example":
+			secondaryCalls.Add(1)
+			return nil, errors.New("secondary prewrite failure")
+		default:
+			t.Fatalf("unexpected target host %q", req.URL.Hostname())
+			return nil, errors.New("unexpected target")
+		}
+	})}
+
+	ctx, summary := WithRequestSummary(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"public-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`)).WithContext(ctx)
+	w := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(w, req)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusTooManyRequests, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "slow down") {
+		t.Fatalf("body = %s, want canonical primary failure", w.Body.String())
+	}
+	if primaryCalls.Load() != 1 || secondaryCalls.Load() != 1 {
+		t.Fatalf("calls primary=%d secondary=%d, want 1/1", primaryCalls.Load(), secondaryCalls.Load())
+	}
+
+	stats := readSummaryForStats(summary)
+	if stats.finalTarget != "primary-target" || stats.provider != "primary" || stats.kind != string(providerTypeAzureOpenAI) {
+		t.Fatalf("final attribution = %q/%q/%q, want primary attribution", stats.finalTarget, stats.provider, stats.kind)
+	}
+	if stats.upstreamID != "primary-stream-request" {
+		t.Fatalf("upstream request ID = %q, want primary-stream-request", stats.upstreamID)
+	}
+	if stats.upstreamSends != 2 || stats.targetSwitches != 1 {
+		t.Fatalf("route counts = sends:%d switches:%d, want 2/1", stats.upstreamSends, stats.targetSwitches)
+	}
+	lastTarget, lastProvider, lastKind := summary.lastUpstreamAttempt()
+	if lastTarget != "secondary-target" || lastProvider != "secondary" || lastKind != string(providerTypeAzureOpenAI) {
+		t.Fatalf("last attempt = %q/%q/%q, want secondary attempt attribution", lastTarget, lastProvider, lastKind)
+	}
+}
+
 func TestExplicitRouteCertifiedStreamCleanupTimeoutSuppressesFailover(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -726,6 +792,182 @@ func TestExplicitRouteForcedStreamProgressControlsFailover(t *testing.T) {
 				t.Fatalf("body = %s, want %q", w.Body.String(), tt.wantText)
 			}
 		})
+	}
+}
+
+func TestExplicitRouteForcedStreamFailoverRetriesStrictSecondaryWithoutInjectedStreamOptions(t *testing.T) {
+	tests := []struct {
+		name        string
+		path        string
+		requestBody string
+		handle      func(*ProxyHandler, http.ResponseWriter, *http.Request)
+	}{
+		{
+			name:        "OpenAI Chat",
+			path:        "/v1/chat/completions",
+			requestBody: `{"model":"public-model","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`,
+			handle:      (*ProxyHandler).HandleOpenAIChatCompletions,
+		},
+		{
+			name:        "Anthropic Messages",
+			path:        "/v1/messages",
+			requestBody: `{"model":"public-model","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}`,
+			handle:      (*ProxyHandler).HandleAnthropicMessages,
+		},
+		{
+			name:        "Gemini generateContent",
+			path:        "/v1beta/models/public-model:generateContent",
+			requestBody: `{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tools":[{"functionDeclarations":[{"name":"lookup","parameters":{"type":"object"}}]}]}`,
+			handle:      (*ProxyHandler).HandleGeminiModels,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var primaryCalls, secondaryCalls atomic.Int32
+			primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				primaryCalls.Add(1)
+				var payload map[string]json.RawMessage
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Errorf("decode primary request: %v", err)
+					http.Error(w, "invalid test request", http.StatusInternalServerError)
+					return
+				}
+				if _, ok := payload["stream_options"]; !ok {
+					t.Errorf("primary request missing injected stream_options: %v", payload)
+					http.Error(w, "missing stream_options", http.StatusInternalServerError)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "event: error\ndata: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}\n\n")
+			}))
+			defer primary.Close()
+
+			secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				call := secondaryCalls.Add(1)
+				var payload map[string]json.RawMessage
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Errorf("decode secondary request %d: %v", call, err)
+					http.Error(w, "invalid test request", http.StatusInternalServerError)
+					return
+				}
+				if got := rawJSONString(payload["model"]); got != "physical-secondary" {
+					t.Errorf("secondary request %d model = %q, want physical-secondary", call, got)
+					http.Error(w, "wrong model", http.StatusInternalServerError)
+					return
+				}
+				if string(payload["stream"]) != "true" {
+					t.Errorf("secondary request %d stream = %s, want true", call, payload["stream"])
+					http.Error(w, "stream disabled", http.StatusInternalServerError)
+					return
+				}
+				switch call {
+				case 1:
+					if _, ok := payload["stream_options"]; !ok {
+						t.Errorf("first secondary request missing injected stream_options: %v", payload)
+						http.Error(w, "missing stream_options", http.StatusInternalServerError)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = io.WriteString(w, `{"error":{"message":"unknown field stream_options","type":"invalid_request_error"}}`)
+				case 2:
+					if _, ok := payload["stream_options"]; ok {
+						t.Errorf("secondary protocol recovery retained stream_options: %v", payload)
+						http.Error(w, "stream_options retained", http.StatusInternalServerError)
+						return
+					}
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.Header().Set("X-Request-Id", "secondary-recovery-request")
+					_, _ = io.WriteString(w, "data: {\"id\":\"secondary\",\"object\":\"chat.completion.chunk\",\"model\":\"physical-secondary\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n")
+					_, _ = io.WriteString(w, "data: {\"id\":\"secondary\",\"object\":\"chat.completion.chunk\",\"model\":\"physical-secondary\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"secondary\"},\"finish_reason\":\"stop\"}]}\n\n")
+					_, _ = io.WriteString(w, "data: [DONE]\n\n")
+				default:
+					t.Errorf("unexpected secondary call %d", call)
+					http.Error(w, "unexpected call", http.StatusInternalServerError)
+				}
+			}))
+			defer secondary.Close()
+
+			h := newExplicitRouteSurfaceHandlerWithRouting(t, providerTypeOpenAICompatible, providerEndpointChatCompletions, primary.URL, secondary.URL, ModelRouteRoutingConfig{
+				Mode:              string(routeModePriorityFailover),
+				MaxTargetAttempts: 2,
+				MaxUpstreamSends:  3,
+			})
+			ctx, summary := WithRequestSummary(context.Background())
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.requestBody)).WithContext(ctx)
+			w := httptest.NewRecorder()
+			tt.handle(h, w, req)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "secondary") || strings.Contains(w.Body.String(), "unknown field stream_options") {
+				t.Fatalf("body = %s, want recovered secondary output", w.Body.String())
+			}
+			if primaryCalls.Load() != 1 || secondaryCalls.Load() != 2 {
+				t.Fatalf("calls primary=%d secondary=%d, want 1/2", primaryCalls.Load(), secondaryCalls.Load())
+			}
+			stats := readSummaryForStats(summary)
+			if stats.finalTarget != "secondary-target" || stats.provider != "secondary" || stats.kind != string(providerTypeOpenAICompatible) {
+				t.Fatalf("final attribution = %q/%q/%q, want secondary attribution", stats.finalTarget, stats.provider, stats.kind)
+			}
+			if stats.upstreamSends != 3 || stats.targetSwitches != 1 {
+				t.Fatalf("route counts = sends:%d switches:%d, want 3/1", stats.upstreamSends, stats.targetSwitches)
+			}
+		})
+	}
+}
+
+func TestExplicitRouteForcedStreamProtocolRecoveryBudgetPreservesCanonicalFailure(t *testing.T) {
+	var primaryCalls, secondaryCalls atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		primaryCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Request-Id", "primary-rate-limit-request")
+		_, _ = io.WriteString(w, "event: error\ndata: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}\n\n")
+	}))
+	defer primary.Close()
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondaryCalls.Add(1)
+		var payload map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode secondary request: %v", err)
+			http.Error(w, "invalid test request", http.StatusInternalServerError)
+			return
+		}
+		if _, ok := payload["stream_options"]; !ok {
+			t.Errorf("secondary request missing injected stream_options: %v", payload)
+			http.Error(w, "missing stream_options", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"message":"unknown field stream_options","type":"invalid_request_error"}}`)
+	}))
+	defer secondary.Close()
+
+	h := newExplicitRouteSurfaceHandler(t, providerTypeOpenAICompatible, providerEndpointChatCompletions, primary.URL, secondary.URL)
+	ctx, summary := WithRequestSummary(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"public-model","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`)).WithContext(ctx)
+	w := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(w, req)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusTooManyRequests, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "slow down") || strings.Contains(w.Body.String(), "unknown field stream_options") {
+		t.Fatalf("body = %s, want canonical primary failure", w.Body.String())
+	}
+	if primaryCalls.Load() != 1 || secondaryCalls.Load() != 1 {
+		t.Fatalf("calls primary=%d secondary=%d, want send budget to stop at 1/1", primaryCalls.Load(), secondaryCalls.Load())
+	}
+	stats := readSummaryForStats(summary)
+	if stats.finalTarget != "primary-target" || stats.provider != "primary" || stats.upstreamID != "primary-rate-limit-request" {
+		t.Fatalf("canonical attribution = target:%q provider:%q upstream:%q, want primary", stats.finalTarget, stats.provider, stats.upstreamID)
+	}
+	if stats.upstreamSends != 2 || stats.targetSwitches != 1 {
+		t.Fatalf("route counts = sends:%d switches:%d, want 2/1", stats.upstreamSends, stats.targetSwitches)
 	}
 }
 

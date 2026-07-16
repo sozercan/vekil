@@ -41,17 +41,26 @@ type explicitRouteSurfaceSend func(context.Context) (*http.Response, error)
 type explicitRouteStreamAggregator func(io.ReadCloser) (*models.OpenAIResponse, upstreamSemanticProgress, error)
 
 type explicitRouteCanonicalFailure struct {
-	response *capturedRouteResponse
-	stream   *explicitRouteStreamFailure
-	headers  http.Header
+	response    *capturedRouteResponse
+	stream      *explicitRouteStreamFailure
+	err         error
+	headers     http.Header
+	attribution routeResultAttribution
+	upstreamID  string
 }
 
-func (f *explicitRouteCanonicalFailure) result() (*http.Response, error) {
+func (f *explicitRouteCanonicalFailure) result(ctx context.Context) (*http.Response, error) {
 	if f == nil {
 		return nil, nil
 	}
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		summary.setFinalRouteResult(f.attribution.targetID, f.attribution.providerID, f.attribution.providerKind, f.upstreamID)
+	}
 	if f.response != nil {
 		return f.response.response(), nil
+	}
+	if f.err != nil {
+		return nil, f.err
 	}
 	if f.stream != nil {
 		return nil, f.stream.asUpstreamError(f.headers)
@@ -59,13 +68,13 @@ func (f *explicitRouteCanonicalFailure) result() (*http.Response, error) {
 	return nil, nil
 }
 
-func explicitRouteCanonicalOrError(canonical *explicitRouteCanonicalFailure, err error) (*http.Response, error) {
+func explicitRouteCanonicalOrError(ctx context.Context, canonical *explicitRouteCanonicalFailure, err error) (*http.Response, error) {
 	if canonical == nil || err == nil {
 		return nil, err
 	}
 	var routeErr *routeExecutionFailureError
 	if errors.As(err, &routeErr) && routeErr.failure.precedence() < 2 {
-		return canonical.result()
+		return canonical.result(ctx)
 	}
 	return nil, err
 }
@@ -135,12 +144,16 @@ func (h *ProxyHandler) executeExplicitRouteSurfaceRequest(ctx context.Context, e
 			decision, retry := h.explicitRouteRetryDecision(ctx, operation, endpoint)
 			if accepted && retry {
 				if canonical == nil {
-					canonical = &explicitRouteCanonicalFailure{response: captured}
+					canonical = &explicitRouteCanonicalFailure{
+						response:    captured,
+						attribution: routeResultAttributionForTarget(target),
+						upstreamID:  upstreamID,
+					}
 				}
 				operation.reclassifyAcceptedRouteAttempt(info.targetID, statusCode, requestExplicitlyRejected, upstreamProgressNone, downstreamCommitmentNone, decision, upstreamID, true, true)
 				resp, err = send(ctx)
 				if err != nil {
-					return explicitRouteCanonicalOrError(canonical, err)
+					return explicitRouteCanonicalOrError(operation.inbound, canonical, err)
 				}
 				continue
 			}
@@ -149,7 +162,7 @@ func (h *ProxyHandler) executeExplicitRouteSurfaceRequest(ctx context.Context, e
 				h.recordManualRouteExhaustion(operation, decision)
 			}
 			if canonical != nil {
-				return canonical.result()
+				return canonical.result(operation.inbound)
 			}
 			return resp, nil
 		}
@@ -178,12 +191,17 @@ func (h *ProxyHandler) executeExplicitRouteSurfaceRequest(ctx context.Context, e
 						return nil, fmt.Errorf("failed to clean up rejected stream attempt before failover")
 					}
 					if canonical == nil {
-						canonical = &explicitRouteCanonicalFailure{stream: result.failure, headers: resp.Header.Clone()}
+						canonical = &explicitRouteCanonicalFailure{
+							stream:      result.failure,
+							headers:     resp.Header.Clone(),
+							attribution: routeResultAttributionForTarget(target),
+							upstreamID:  responsesUpstreamRequestID(resp.Header),
+						}
 					}
 					operation.reclassifyAcceptedRouteAttempt(info.targetID, result.failure.statusCode, requestExplicitlyRejected, result.progress, downstreamCommitmentNone, decision, responsesUpstreamRequestID(resp.Header), true, true)
 					resp, err = send(ctx)
 					if err != nil {
-						return explicitRouteCanonicalOrError(canonical, err)
+						return explicitRouteCanonicalOrError(operation.inbound, canonical, err)
 					}
 					continue
 				}
@@ -191,7 +209,7 @@ func (h *ProxyHandler) executeExplicitRouteSurfaceRequest(ctx context.Context, e
 				operation.reclassifyAcceptedRouteAttempt(info.targetID, result.failure.statusCode, requestExplicitlyRejected, result.progress, downstreamCommitmentNone, decision, responsesUpstreamRequestID(resp.Header), false, true)
 				h.recordManualRouteExhaustion(operation, decision)
 				if canonical != nil {
-					return canonical.result()
+					return canonical.result(operation.inbound)
 				}
 				return nil, result.failure.asUpstreamError(resp.Header)
 			}
@@ -207,7 +225,7 @@ func (h *ProxyHandler) executeExplicitRouteSurfaceRequest(ctx context.Context, e
 func (h *ProxyHandler) aggregateExplicitChatCompletionsResponse(ctx context.Context, initialResp *http.Response, body []byte, mode chatCompletionsMode, aggregate explicitRouteStreamAggregator) (*models.OpenAIResponse, *http.Response, error) {
 	resp := initialResp
 	operation := routeOperationFromContext(ctx)
-	var canonical error
+	var canonical *explicitRouteCanonicalFailure
 
 	for {
 		if resp == nil {
@@ -215,12 +233,12 @@ func (h *ProxyHandler) aggregateExplicitChatCompletionsResponse(ctx context.Cont
 		}
 		if resp.StatusCode != http.StatusOK {
 			if canonical != nil {
-				if info, target, ok := explicitRouteTargetForResponse(operation, resp); ok && explicitRouteSurfaceMayExplicitlyReject(target, providerEndpointChatCompletions, resp.StatusCode) {
-					_ = info
+				if _, target, ok := explicitRouteTargetForResponse(operation, resp); ok && explicitRouteSurfaceMayExplicitlyReject(target, providerEndpointChatCompletions, resp.StatusCode) {
 					captured, cleanupDone := captureRouteResponse(resp)
 					resp = captured.response()
 					if cleanupDone && explicitRouteSurfaceCertifiesHTTPRejection(target, providerEndpointChatCompletions, captured) {
-						return nil, nil, canonical
+						_, canonicalErr := canonical.result(operation.inbound)
+						return nil, nil, canonicalErr
 					}
 				}
 			}
@@ -265,23 +283,33 @@ func (h *ProxyHandler) aggregateExplicitChatCompletionsResponse(ctx context.Cont
 		decision, retry := h.explicitRouteRetryDecision(ctx, operation, providerEndpointChatCompletions)
 		operation.reclassifyAcceptedRouteAttempt(info.targetID, failure.statusCode, requestExplicitlyRejected, progress, downstreamCommitmentNone, decision, responsesUpstreamRequestID(resp.Header), retry, true)
 		if canonical == nil {
-			canonical = aggregateErr
+			canonical = &explicitRouteCanonicalFailure{
+				err:         aggregateErr,
+				attribution: routeResultAttributionForTarget(target),
+				upstreamID:  responsesUpstreamRequestID(resp.Header),
+			}
 		}
 		if !retry {
 			h.recordManualRouteExhaustion(operation, decision)
-			return nil, nil, canonical
+			_, canonicalErr := canonical.result(operation.inbound)
+			return nil, nil, canonicalErr
 		}
 
 		nextMode := mode
 		nextMode.clientRequestedStream = false
 		resp, aggregateErr = h.executeChatCompletionsRouteRequest(ctx, body, nextMode)
 		if aggregateErr != nil {
-			var routeErr *routeExecutionFailureError
-			if canonical != nil && errors.As(aggregateErr, &routeErr) && routeErr.failure.precedence() < 2 {
-				return nil, nil, canonical
-			}
-			return nil, nil, aggregateErr
+			_, selectedErr := explicitRouteCanonicalOrError(operation.inbound, canonical, aggregateErr)
+			return nil, nil, selectedErr
 		}
+
+		var recoveryErr error
+		resp, body, mode, recoveryErr = h.retryChatCompletionsWithoutInjectedStreamOptionsForModelResult(ctx, resp, body, nextMode, extractRequestModel(body))
+		if recoveryErr != nil {
+			_, selectedErr := explicitRouteCanonicalOrError(operation.inbound, canonical, recoveryErr)
+			return nil, nil, selectedErr
+		}
+		observeUpstreamHeaders(operation.inbound, resp.Header)
 	}
 }
 
@@ -1545,19 +1573,24 @@ func (h *ProxyHandler) retryChatCompletionsWithoutInjectedStreamOptions(ctx cont
 }
 
 func (h *ProxyHandler) retryChatCompletionsWithoutInjectedStreamOptionsForModel(ctx context.Context, resp *http.Response, body []byte, mode chatCompletionsMode, model string) (*http.Response, []byte, chatCompletionsMode) {
+	retryResp, retryBody, retryMode, _ := h.retryChatCompletionsWithoutInjectedStreamOptionsForModelResult(ctx, resp, body, mode, model)
+	return retryResp, retryBody, retryMode
+}
+
+func (h *ProxyHandler) retryChatCompletionsWithoutInjectedStreamOptionsForModelResult(ctx context.Context, resp *http.Response, body []byte, mode chatCompletionsMode, model string) (*http.Response, []byte, chatCompletionsMode, error) {
 	if h == nil || resp == nil || resp.StatusCode != http.StatusBadRequest || !mode.injectedStreamUsage {
-		return resp, body, mode
+		return resp, body, mode, nil
 	}
 	fallbackBody, ok := stripStreamOptions(body)
 	if !ok {
-		return resp, body, mode
+		return resp, body, mode, nil
 	}
 	originalResp := resp
 	explicitOperation := routeOperationFromContext(ctx)
 	if explicitOperation != nil {
 		captured, cleanupDone := captureRouteResponse(resp)
 		if !cleanupDone {
-			return captured.response(), body, mode
+			return captured.response(), body, mode, nil
 		}
 		originalResp = captured.response()
 	}
@@ -1567,7 +1600,7 @@ func (h *ProxyHandler) retryChatCompletionsWithoutInjectedStreamOptionsForModel(
 		if h != nil && h.log != nil {
 			h.log.Debug("retry without stream_options failed", logger.Err(err))
 		}
-		return originalResp, body, mode
+		return originalResp, body, mode, err
 	}
 	if explicitOperation == nil && resp.Body != nil {
 		drainAndClose(resp.Body)
@@ -1577,5 +1610,5 @@ func (h *ProxyHandler) retryChatCompletionsWithoutInjectedStreamOptionsForModel(
 	if h != nil && h.log != nil {
 		h.log.Debug("retried chat completions without injected stream_options", logger.F("status", retryResp.StatusCode))
 	}
-	return retryResp, fallbackBody, mode
+	return retryResp, fallbackBody, mode, nil
 }

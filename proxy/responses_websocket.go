@@ -1334,6 +1334,32 @@ func prepareExplicitResponsesWebSocketResponse(h *ProxyHandler, resp *http.Respo
 	return nil
 }
 
+func isLocalResponsesWebSocketCompactionResponse(plan responsesWebSocketRequestPlan, operation *routeOperation) bool {
+	if operation == nil || !plan.hasCompactionTrigger() || operation.pinnedTarget() != "" {
+		return false
+	}
+	sends, _, _ := operation.snapshot()
+	return sends == 0
+}
+
+func (s *responsesWebSocketSession) prepareExplicitRouteSuccessResponse(h *ProxyHandler, resp *http.Response, route *modelRoute, operation *routeOperation, plan responsesWebSocketRequestPlan) error {
+	if resp == nil || operation == nil || resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	// An identical compaction trigger can join another request's in-flight compact
+	// call and build its synthetic success entirely in-process. That operation did
+	// not select a provider target and therefore has no provider response ownership
+	// to validate or pin onto the websocket session. A compaction operation that
+	// actually sent upstream has a send/target and still follows the normal path.
+	if isLocalResponsesWebSocketCompactionResponse(plan, operation) {
+		return nil
+	}
+	if err := s.pinExplicitRouteTarget(route, operation); err != nil {
+		return err
+	}
+	return prepareExplicitResponsesWebSocketResponse(h, resp, route, operation)
+}
+
 func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) error {
 	if s == nil || s.isClosing() || (s.ctx != nil && s.ctx.Err() != nil) || h.upstreamShutdownStarted() {
 		return context.Canceled
@@ -1583,27 +1609,15 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		}
 	}()
 
-	if routeOperation != nil && resp.StatusCode == http.StatusOK {
-		if err := s.pinExplicitRouteTarget(explicitRoute, routeOperation); err != nil {
-			recordTurn(http.StatusBadGateway, responsesUsage{})
-			if s.isClosing() || h.upstreamShutdownStarted() {
-				return err
-			}
-			if writeErr := s.sendExplicitRouteError(routeOperation, http.StatusBadGateway, err.Error(), "server_error", resp.Header); writeErr != nil {
-				return writeErr
-			}
+	if err := s.prepareExplicitRouteSuccessResponse(h, resp, explicitRoute, routeOperation, plan); err != nil {
+		recordTurn(http.StatusBadGateway, responsesUsage{})
+		if s.isClosing() || h.upstreamShutdownStarted() {
 			return err
 		}
-		if err := prepareExplicitResponsesWebSocketResponse(h, resp, explicitRoute, routeOperation); err != nil {
-			recordTurn(http.StatusBadGateway, responsesUsage{})
-			if s.isClosing() || h.upstreamShutdownStarted() {
-				return err
-			}
-			if writeErr := s.sendExplicitRouteError(routeOperation, http.StatusBadGateway, err.Error(), "server_error", resp.Header); writeErr != nil {
-				return writeErr
-			}
-			return err
+		if writeErr := s.sendExplicitRouteError(routeOperation, http.StatusBadGateway, err.Error(), "server_error", resp.Header); writeErr != nil {
+			return writeErr
 		}
+		return err
 	}
 	var pendingExplicitTurnState string
 	if routeOperation == nil {
