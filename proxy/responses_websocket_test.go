@@ -771,6 +771,9 @@ func TestHandleResponsesWebSocket_WarmupStaysLocalAndNextRequestExpandsState(t *
 		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
 	})
 
+	handler.stats = newStatsCollector()
+	handler.metrics = NewMetricsCollector()
+
 	server := startResponsesWebSocketProxyServer(t, handler)
 	conn := mustDialResponsesWebSocket(t, server, nil)
 	defer func() { _ = conn.Close() }()
@@ -800,6 +803,27 @@ func TestHandleResponsesWebSocket_WarmupStaysLocalAndNextRequestExpandsState(t *
 	}
 	if got := upstreamRequests.Load(); got != 0 {
 		t.Fatalf("expected warmup request to avoid upstream call, got %d requests", got)
+	}
+	if snap := handler.stats.snapshot(); snap.Totals.Requests != 1 || snap.Totals.Errors != 0 {
+		t.Fatalf("local warmup stats = requests:%d errors:%d, want 1/0", snap.Totals.Requests, snap.Totals.Errors)
+	}
+	families, err := handler.metrics.registry.Gather()
+	if err != nil {
+		t.Fatalf("gather warmup metrics: %v", err)
+	}
+	if got := getCounterValue(families, "vekil_requests_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": metricsUnroutedModel,
+		"endpoint":     "responses_ws",
+		"status":       "200",
+	}); got != 1 {
+		t.Fatalf("local warmup request metric = %v, want 1", got)
+	}
+	if got := getCounterValue(families, "vekil_upstream_errors_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": metricsUnroutedModel,
+	}); got != 0 {
+		t.Fatalf("local warmup upstream errors = %v, want 0", got)
 	}
 
 	warmupID := websocketResponseID(t, warmupCreated)
@@ -1169,6 +1193,79 @@ func TestResponsesWebSocketAutoCompactionRetryMetricsKeepFallbackModel(t *testin
 		"reason":       "5xx",
 	}); got != 0 {
 		t.Fatalf("stale original-model retry metric = %v, want 0", got)
+	}
+}
+
+func TestHandleResponsesWebSocket_RecordsLocalPlanFailure(t *testing.T) {
+	handler := newTestProxyHandler(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("local plan failure unexpectedly reached upstream")
+	})
+	handler.stats = newStatsCollector()
+	handler.metrics = NewMetricsCollector()
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+	request := newResponsesWebSocketCreateRequest(nil)
+	request["previous_response_id"] = "missing-response"
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("write invalid request: %v", err)
+	}
+	_ = mustReadWebSocketJSON(t, conn)
+
+	if snap := handler.stats.snapshot(); snap.Totals.Requests != 1 || snap.Totals.Errors != 1 {
+		t.Fatalf("local failure stats = requests:%d errors:%d, want 1/1", snap.Totals.Requests, snap.Totals.Errors)
+	}
+	families, err := handler.metrics.registry.Gather()
+	if err != nil {
+		t.Fatalf("gather local failure metrics: %v", err)
+	}
+	if got := getCounterValue(families, "vekil_requests_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": metricsUnroutedModel,
+		"endpoint":     "responses_ws",
+		"status":       "400",
+	}); got != 1 {
+		t.Fatalf("local failure request metric = %v, want 1", got)
+	}
+	if got := getCounterValue(families, "vekil_upstream_errors_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": metricsUnroutedModel,
+	}); got != 0 {
+		t.Fatalf("local failure upstream errors = %v, want 0", got)
+	}
+}
+
+func TestResponsesWebSocketTurnKeepsRawStatsAndCanonicalMetricsModel(t *testing.T) {
+	handler := &ProxyHandler{stats: newStatsCollector(), metrics: NewMetricsCollector()}
+	session := &responsesWebSocketSession{userAgent: "Codex CLI"}
+	session.recordTurnStats(
+		handler,
+		"client-model-alias",
+		"canonical-model",
+		"provider-a",
+		"openai-compatible",
+		http.StatusOK,
+		responsesUsage{InputTokens: 2, OutputTokens: 1},
+		true,
+		true,
+	)
+
+	snap := handler.stats.snapshot()
+	if len(snap.ByModel) != 1 || snap.ByModel[0].Model != "client-model-alias" {
+		t.Fatalf("raw dashboard model stats = %+v, want client-model-alias", snap.ByModel)
+	}
+	families, err := handler.metrics.registry.Gather()
+	if err != nil {
+		t.Fatalf("gather canonical metrics: %v", err)
+	}
+	if got := getCounterValue(families, "vekil_requests_total", map[string]string{
+		"provider":     "provider-a",
+		"public_model": "canonical-model",
+		"endpoint":     "responses_ws",
+		"status":       "200",
+	}); got != 1 {
+		t.Fatalf("canonical websocket request metric = %v, want 1", got)
 	}
 }
 
@@ -6806,6 +6903,7 @@ func TestHandleResponsesWebSocket_PreservesUpstreamTimeoutTerminalAndReplayState
 func TestNewProviderJSONRequestPublishesRouteBeforeAuthFailure(t *testing.T) {
 	handler := &ProxyHandler{}
 	ctx, observer := withProviderRouteObserver(context.Background())
+	ctx = withRetryPublicModel(ctx, "gpt-canonical", true)
 	provider := &providerRuntime{
 		id:         "auth-failing-provider",
 		kind:       providerTypeOpenAICompatible,
@@ -6813,12 +6911,14 @@ func TestNewProviderJSONRequestPublishesRouteBeforeAuthFailure(t *testing.T) {
 		authType:   providerAuthTypeBearer,
 		authHeader: "Authorization",
 	}
-	if _, err := handler.newProviderJSONRequest(ctx, provider, http.MethodPost, providerEndpointResponses, []byte(`{"model":"gpt-test"}`), nil, ""); err == nil {
+	owner := providerModel{publicID: "gpt-canonical", providerID: provider.id}
+	if _, err := handler.newProviderJSONRequest(ctx, provider, http.MethodPost, providerEndpointResponses, []byte(`{"model":"gpt-canonical"}`), nil, "", owner); err == nil {
 		t.Fatal("newProviderJSONRequest unexpectedly succeeded without an API key")
 	}
 	route, ok := observer.snapshot()
-	if !ok || route.id != "auth-failing-provider" || route.kind != string(providerTypeOpenAICompatible) {
-		t.Fatalf("published route = %+v ok=%v, want auth-failing-provider/openai-compatible", route, ok)
+	if !ok || route.id != "auth-failing-provider" || route.kind != string(providerTypeOpenAICompatible) ||
+		route.publicModel != "gpt-canonical" || !route.modelKnown {
+		t.Fatalf("published route = %+v ok=%v, want auth-failing-provider/openai-compatible/gpt-canonical known", route, ok)
 	}
 }
 

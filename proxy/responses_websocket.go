@@ -264,25 +264,31 @@ type responsesWebSocketRequestMetrics struct {
 	internalUsage      responsesUsage
 	providerID         string
 	providerKind       string
+	publicModel        string
+	modelKnown         bool
 }
 
-func (m *responsesWebSocketRequestMetrics) captureObservedProvider(observer *providerRouteObserver) {
+func (m *responsesWebSocketRequestMetrics) captureRoute(route providerRouteInfo) {
 	if m == nil {
 		return
 	}
+	m.providerID = route.id
+	m.providerKind = route.kind
+	if route.publicModel != "" {
+		m.publicModel = route.publicModel
+		m.modelKnown = route.modelKnown
+	}
+}
+
+func (m *responsesWebSocketRequestMetrics) captureObservedProvider(observer *providerRouteObserver) {
 	if route, ok := observer.snapshot(); ok {
-		m.providerID = route.id
-		m.providerKind = route.kind
+		m.captureRoute(route)
 	}
 }
 
 func (m *responsesWebSocketRequestMetrics) captureProvider(resp *http.Response) {
-	if m == nil {
-		return
-	}
 	if route, ok := providerRouteFromResponse(resp); ok {
-		m.providerID = route.id
-		m.providerKind = route.kind
+		m.captureRoute(route)
 	}
 }
 
@@ -1135,13 +1141,6 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		s.turnState = ""
 	}
 
-	plan, err := s.planRequest(h, request)
-	if err != nil {
-		if writeErr := s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil); writeErr != nil {
-			return writeErr
-		}
-		return err
-	}
 	metrics := responsesWebSocketRequestMetrics{}
 	turnRecorded := false
 	var turnStatsRecord responsesTurnStatsRecord
@@ -1154,12 +1153,23 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		turnStatsRecord = s.recordTurnStats(
 			h,
 			request.Model,
+			metrics.publicModel,
 			metrics.providerID,
 			metrics.providerKind,
 			status,
 			metrics.totalUsage(usage),
 			upstreamAttempt.Attempted(),
+			metrics.modelKnown,
 		)
+	}
+
+	plan, err := s.planRequest(h, request)
+	if err != nil {
+		recordTurn(http.StatusBadRequest, responsesUsage{})
+		if writeErr := s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil); writeErr != nil {
+			return writeErr
+		}
+		return err
 	}
 	var peek *peekResult
 	var resp *http.Response
@@ -1223,6 +1233,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	}
 
 	if request.Generate != nil && !*request.Generate {
+		recordTurn(http.StatusOK, responsesUsage{})
 		responseID := "vekil-ws-" + uuid.NewString()
 		s.rememberPlannedResponse(plan, responseID, nil)
 		s.logRequestMetrics(h, request, responseID, metrics)
@@ -1436,15 +1447,22 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 // recordTurnStats records one websocket-bridge turn into traffic stats,
 // resolving the provider for attribution. status is the turn outcome (200 for a
 // completed turn, an error status for a failed one).
-func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model, providerID, providerKind string, status int, usage responsesUsage, upstreamAttempted bool) responsesTurnStatsRecord {
+func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model, metricModel, providerID, providerKind string, status int, usage responsesUsage, upstreamAttempted, modelKnown bool) responsesTurnStatsRecord {
 	if h == nil {
 		return responsesTurnStatsRecord{}
 	}
-	provider, _, modelKnown := h.resolveProviderModel(model, providerEndpointResponses)
+	provider, owner, resolvedKnown := h.resolveProviderModel(model, providerEndpointResponses)
 	if providerID == "" && provider != nil {
 		providerID, providerKind = provider.id, string(provider.kind)
 	}
-	return h.recordResponsesTurn(model, providerID, providerKind, classifyAgent(s.userAgent), status, usage, upstreamAttempted, modelKnown)
+	if metricModel == "" {
+		metricModel = model
+		modelKnown = resolvedKnown
+		if resolvedKnown && owner.publicID != "" {
+			metricModel = owner.publicID
+		}
+	}
+	return h.recordResponsesTurn(model, metricModel, providerID, providerKind, classifyAgent(s.userAgent), status, usage, upstreamAttempted, modelKnown)
 }
 
 func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) (responsesWebSocketRequestPlan, error) {

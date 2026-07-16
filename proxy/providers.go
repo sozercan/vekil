@@ -1472,8 +1472,10 @@ type providerRouteContextKey struct{}
 type providerRouteObserverContextKey struct{}
 
 type providerRouteInfo struct {
-	id   string
-	kind string
+	id          string
+	kind        string
+	publicModel string
+	modelKnown  bool
 }
 
 type providerRouteObserver struct {
@@ -1519,9 +1521,33 @@ func providerRouteFromResponse(resp *http.Response) (providerRouteInfo, bool) {
 
 func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
 	route := providerRouteInfo{id: provider.id, kind: string(provider.kind)}
+	inherited, _ := ctx.Value(retryPublicModelContextKey{}).(retryPublicModelInfo)
+	if inherited.model != "" {
+		route.publicModel = inherited.model
+		route.modelKnown = inherited.known
+	}
+
+	// The base inference context may carry the originally requested model for
+	// internal catalog probes. Override it on each concrete provider request so
+	// a fallback or memoized compact model is attributed to the model that
+	// actually produced the retryable response.
+	if len(owners) > 0 {
+		owner := owners[0]
+		publicID := strings.TrimSpace(owner.publicID)
+		known := inherited.known && inherited.model == publicID
+		if catalogOwner, ok := h.providerSetup().lookupModel(publicID); ok &&
+			catalogOwner.providerID == provider.id && !catalogOwner.disabled {
+			publicID = catalogOwner.publicID
+			known = true
+		}
+		ctx = withRetryPublicModel(ctx, publicID, known)
+		route.publicModel = publicID
+		route.modelKnown = known
+	}
+
 	// Route selection has already happened before URL construction or provider
 	// authentication. Publish it now so failures in either step retain the actual
-	// provider attribution even if the dynamic model catalog changes afterward.
+	// provider/model attribution even if the dynamic catalog changes afterward.
 	publishProviderRoute(ctx, route)
 	fullURL, err := h.providerRequestURL(provider, path, extraQuery, owners...)
 	if err != nil {
@@ -1533,22 +1559,6 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 		bodyReader = bytes.NewReader(body)
 	}
 
-	// The base inference context may carry the originally requested model for
-	// internal catalog probes. Override it on each concrete provider request so
-	// a fallback or memoized compact model is attributed to the model that
-	// actually produced the retryable response.
-	if len(owners) > 0 {
-		owner := owners[0]
-		publicID := strings.TrimSpace(owner.publicID)
-		inherited, _ := ctx.Value(retryPublicModelContextKey{}).(retryPublicModelInfo)
-		known := inherited.known && inherited.model == publicID
-		if catalogOwner, ok := h.providerSetup().lookupModel(publicID); ok &&
-			catalogOwner.providerID == provider.id && !catalogOwner.disabled {
-			publicID = catalogOwner.publicID
-			known = true
-		}
-		ctx = withRetryPublicModel(ctx, publicID, known)
-	}
 	ctx = context.WithValue(ctx, providerRouteContextKey{}, route)
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
 	if err != nil {

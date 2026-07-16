@@ -1007,10 +1007,10 @@ func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAg
 // post-terminal usage amendments without creating synthetic requests. status is
 // the client turn outcome so failed turns appear in error counts.
 func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage) responsesTurnStatsRecord {
-	return h.recordResponsesTurn(model, provider, kind, agentLabel, status, usage, true, true)
+	return h.recordResponsesTurn(model, model, provider, kind, agentLabel, status, usage, true, true)
 }
 
-func (h *ProxyHandler) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, upstreamAttempted, modelKnown bool) responsesTurnStatsRecord {
+func (h *ProxyHandler) recordResponsesTurn(model, metricModel, provider, kind, agentLabel string, status int, usage responsesUsage, upstreamAttempted, modelKnown bool) responsesTurnStatsRecord {
 	if h == nil {
 		return responsesTurnStatsRecord{}
 	}
@@ -1020,7 +1020,7 @@ func (h *ProxyHandler) recordResponsesTurn(model, provider, kind, agentLabel str
 		record = h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage)
 	}
 	if h.metrics != nil {
-		record.metrics = h.metrics.recordResponsesTurn(model, provider, status, usage, upstreamAttempted, modelKnown)
+		record.metrics = h.metrics.recordResponsesTurn(metricModel, provider, status, usage, upstreamAttempted, modelKnown)
 	}
 	return record
 }
