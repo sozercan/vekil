@@ -77,6 +77,19 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantErrorMessage: "capacity",
 		},
 		{
+			name: "response failed overloaded type maps to 503",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-overloaded-type\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"capacity exhausted\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+				"Retry-After":  []string{"4"},
+			},
+			wantStatus:       http.StatusServiceUnavailable,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "4",
+			wantErrorType:    "server_error",
+			wantErrorMessage: "capacity exhausted",
+		},
+		{
 			name: "huge retry-after-ms is safely clamped",
 			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-huge-retry-ms\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"}}}\n\n",
 			headers: http.Header{

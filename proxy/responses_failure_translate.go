@@ -1604,8 +1604,11 @@ func classifyPrecommitResponsesFailure(event responsesWebSocketStreamEvent) (int
 	}
 
 	errType := strings.ToLower(strings.TrimSpace(streamErr.Type))
-	if errType == "too_many_requests" || (code == "" && errType == "rate_limit_error") {
+	switch {
+	case errType == "too_many_requests" || (code == "" && errType == "rate_limit_error"):
 		return http.StatusTooManyRequests, "rate_limit_error", true
+	case errType == "overloaded_error" || errType == "model_overloaded" || errType == "engine_overloaded":
+		return http.StatusServiceUnavailable, "server_error", true
 	}
 
 	return 0, "", false
