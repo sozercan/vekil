@@ -552,6 +552,8 @@ func TestParseRetryAfter(t *testing.T) {
 		{"5", 5 * time.Second, true},
 		{"120", 120 * time.Second, true},
 		{"999999", maxRetryAfter, true},
+		{"10000000000", maxRetryAfter, true},
+		{"9223372036854775808", maxRetryAfter, true},
 		{"Wed, 21 Oct 2015 07:28:00 GMT", 0, false},
 	}
 
@@ -579,6 +581,23 @@ func TestParseRetryAfter_HTTPDateAndClamp(t *testing.T) {
 	dur, ok = parseRetryAfter(farFuture)
 	if !ok || dur != maxRetryAfter {
 		t.Fatalf("far future duration = (%v, %v), want (%v, true)", dur, ok, maxRetryAfter)
+	}
+}
+
+func TestDurationSecondsCeil(t *testing.T) {
+	tests := []struct {
+		delay time.Duration
+		want  int64
+	}{
+		{delay: 500 * time.Millisecond, want: 1},
+		{delay: time.Second, want: 1},
+		{delay: 1500 * time.Millisecond, want: 2},
+		{delay: maxRetryAfter, want: 300},
+	}
+	for _, tt := range tests {
+		if got := durationSecondsCeil(tt.delay); got != tt.want {
+			t.Fatalf("durationSecondsCeil(%v) = %d, want %d", tt.delay, got, tt.want)
+		}
 	}
 }
 

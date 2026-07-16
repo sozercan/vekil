@@ -9,7 +9,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -77,12 +76,8 @@ func parseRetryAfter(value string) (time.Duration, bool) {
 	if value == "" {
 		return 0, false
 	}
-	seconds, err := strconv.Atoi(value)
-	if err == nil {
-		if seconds <= 0 {
-			return 0, false
-		}
-		return clampRetryAfter(time.Duration(seconds) * time.Second), true
+	if seconds, ok := parsePositiveDecimalClamped(value, int64(maxRetryAfter/time.Second)); ok {
+		return retryAfterDurationFromSeconds(seconds), true
 	}
 
 	retryAt, err := http.ParseTime(value)
@@ -101,6 +96,51 @@ func clampRetryAfter(delay time.Duration) time.Duration {
 		return maxRetryAfter
 	}
 	return delay
+}
+
+func retryAfterDurationFromSeconds(seconds int64) time.Duration {
+	if seconds <= 0 {
+		return 0
+	}
+	maxSeconds := int64(maxRetryAfter / time.Second)
+	if seconds >= maxSeconds {
+		return maxRetryAfter
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func parsePositiveDecimalClamped(value string, max int64) (int64, bool) {
+	if value == "" || max <= 0 {
+		return 0, false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return 0, false
+		}
+	}
+	var parsed int64
+	for i := 0; i < len(value); i++ {
+		digit := int64(value[i] - '0')
+		if parsed > (max-digit)/10 {
+			return max, true
+		}
+		parsed = parsed*10 + digit
+	}
+	if parsed <= 0 {
+		return 0, false
+	}
+	return parsed, true
+}
+
+func durationSecondsCeil(delay time.Duration) int64 {
+	if delay <= 0 {
+		return 0
+	}
+	seconds := int64(delay / time.Second)
+	if delay%time.Second != 0 {
+		seconds++
+	}
+	return seconds
 }
 
 // drainAndClose discards up to 4 KB from the body before closing it so that

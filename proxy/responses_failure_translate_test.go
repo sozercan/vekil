@@ -29,6 +29,8 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 		wantContentType  string
 		wantRetryAfter   string
 		wantErrorType    string
+		wantErrorCode    string
+		wantErrorParam   string
 		wantErrorMessage string
 		wantRawBody      string
 		assertHeaders    func(t *testing.T, headers http.Header)
@@ -75,6 +77,32 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantErrorMessage: "capacity",
 		},
 		{
+			name: "response failed overloaded type maps to 503",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-overloaded-type\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"capacity exhausted\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+				"Retry-After":  []string{"4"},
+			},
+			wantStatus:       http.StatusServiceUnavailable,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "4",
+			wantErrorType:    "server_error",
+			wantErrorMessage: "capacity exhausted",
+		},
+		{
+			name: "huge retry-after-ms preserves client delay",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-huge-retry-ms\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":   []string{"text/event-stream"},
+				"retry-after-ms": []string{"9223372036854775808"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "9223372036854776",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "slow down",
+		},
+		{
 			name: "empty code with rate_limit_error still translates",
 			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-rate-limit-type\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}}\n\n",
 			headers: http.Header{
@@ -86,6 +114,153 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantErrorMessage: "slow down",
 		},
 		{
+			name: "response failed rate_limit_exceeded type maps to 429",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-rate-limit-exceeded-type\",\"error\":{\"type\":\"rate_limit_exceeded\",\"message\":\"rate limited\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "rate limited",
+		},
+		{
+			name: "top level error event translates before commit",
+			body: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"no_capacity\",\"message\":\"No capacity is available for this model.\",\"param\":\"model\",\"headers\":{\"retry-after-ms\":\"1200\",\"x-request-id\":\"event-req-1\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "2",
+			wantErrorType:    "rate_limit_error",
+			wantErrorParam:   "model",
+			wantErrorMessage: "No capacity is available for this model.",
+			assertHeaders: func(t *testing.T, headers http.Header) {
+				t.Helper()
+				if got := headers.Get("X-Request-Id"); got != "event-req-1" {
+					t.Fatalf("X-Request-Id = %q, want event-req-1", got)
+				}
+			},
+		},
+		{
+			name: "top level rate_limit_exceeded type maps to 429",
+			body: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_exceeded\",\"message\":\"rate limited\"}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "rate limited",
+		},
+		{
+			name: "overloaded_error code maps to 503",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-overload-code\",\"error\":{\"code\":\"overloaded_error\",\"message\":\"capacity exhausted\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusServiceUnavailable,
+			wantContentType:  "application/json",
+			wantErrorType:    "server_error",
+			wantErrorCode:    "overloaded_error",
+			wantErrorMessage: "capacity exhausted",
+		},
+		{
+			name: "service_unavailable code maps to 503",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-service-unavailable-code\",\"error\":{\"code\":\"service_unavailable\",\"message\":\"capacity unavailable\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusServiceUnavailable,
+			wantContentType:  "application/json",
+			wantErrorType:    "server_error",
+			wantErrorCode:    "service_unavailable",
+			wantErrorMessage: "capacity unavailable",
+		},
+		{
+			name: "canonical root error event translates before commit",
+			body: "event: error\ndata: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"Rate limit reached for this request.\",\"param\":null,\"sequence_number\":1}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantErrorType:    "rate_limit_error",
+			wantErrorCode:    "rate_limit_exceeded",
+			wantErrorMessage: "Rate limit reached for this request.",
+		},
+		{
+			name: "canonical root server error maps to 500",
+			body: "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"The server had an error while processing your request.\",\"param\":null,\"sequence_number\":1}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusInternalServerError,
+			wantContentType:  "application/json",
+			wantErrorType:    "server_error",
+			wantErrorCode:    "server_error",
+			wantErrorMessage: "The server had an error while processing your request.",
+		},
+		{
+			name: "canonical invalid prompt preserves parameter",
+			body: "event: error\ndata: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"The prompt is invalid.\",\"param\":\"input\",\"sequence_number\":1}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusBadRequest,
+			wantContentType:  "application/json",
+			wantErrorType:    "invalid_request_error",
+			wantErrorCode:    "invalid_prompt",
+			wantErrorParam:   "input",
+			wantErrorMessage: "The prompt is invalid.",
+		},
+		{
+			name: "root and nested error headers merge with nested precedence",
+			body: "event: error\ndata: {\"type\":\"error\",\"headers\":{\"retry-after-ms\":\"1200\",\"x-ratelimit-remaining-requests\":\"0\",\"x-request-id\":\"root-request-id\"},\"error\":{\"type\":\"server_error\",\"message\":\"Request rate limit exceeded.\",\"headers\":{\"X-Request-Id\":\"nested-request-id\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "2",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Request rate limit exceeded.",
+			assertHeaders: func(t *testing.T, headers http.Header) {
+				t.Helper()
+				if got := headers.Get("X-Request-Id"); got != "nested-request-id" {
+					t.Fatalf("X-Request-Id = %q, want nested-request-id", got)
+				}
+			},
+		},
+		{
+			name: "explicit top level error code remains authoritative with quota headers",
+			body: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"Context rate limit exceeded.\"}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"retry-after-ms":               []string{"1200"},
+				"x-ratelimit-remaining-tokens": []string{"0"},
+			},
+			wantStatus:       http.StatusInternalServerError,
+			wantContentType:  "application/json",
+			wantErrorType:    "server_error",
+			wantErrorCode:    "context_length_exceeded",
+			wantErrorMessage: "Context rate limit exceeded.",
+		},
+		{
+			name: "overloaded top level error maps to 503",
+			body: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Capacity exhausted.\"}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+				"Retry-After":  []string{"4"},
+			},
+			wantStatus:       http.StatusServiceUnavailable,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "4",
+			wantErrorType:    "server_error",
+			wantErrorMessage: "Capacity exhausted.",
+		},
+		{
 			name: "unknown failure fails open",
 			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-unknown\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}}\n\n",
 			headers: http.Header{
@@ -94,6 +269,206 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantStatus:      http.StatusOK,
 			wantContentType: "text/event-stream",
 			wantRawBody:     "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-unknown\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}}\n\n",
+		},
+		{
+			name: "explicit unknown failure overrides exhausted quota headers",
+			body: "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-explicit-unknown\"}}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-explicit-unknown\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"retry-after-ms":               []string{"2169"},
+				"x-ratelimit-remaining-tokens": []string{"-36161"},
+			},
+			wantStatus:      http.StatusOK,
+			wantContentType: "text/event-stream",
+			wantRawBody:     "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-explicit-unknown\"}}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-explicit-unknown\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}}\n\n",
+		},
+		{
+			name: "sentinel quota headers do not classify rate limit message",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-sentinel-rate-limit\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"x-ratelimit-remaining-tokens": []string{"-1"},
+				"x-ratelimit-reset-tokens":     []string{"0"},
+			},
+			wantStatus:      http.StatusOK,
+			wantContentType: "text/event-stream",
+			wantRawBody:     "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-sentinel-rate-limit\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n",
+		},
+		{
+			name: "exhausted quota without reset still classifies rate limit message",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-no-reset\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"x-ratelimit-remaining-tokens": []string{"0"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Your requests have exceeded rate limit.",
+		},
+		{
+			name: "duration token reset is normalized",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-duration-reset\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"x-ratelimit-remaining-tokens": []string{"0"},
+				"x-ratelimit-reset-tokens":     []string{"1500ms"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "2",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Your requests have exceeded rate limit.",
+		},
+		{
+			name: "maximum duration reset is rounded without overflow",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-max-duration-reset\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"x-ratelimit-remaining-tokens": []string{"0"},
+				"x-ratelimit-reset-tokens":     []string{time.Duration(1<<63 - 1).String()},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "9223372037",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Your requests have exceeded rate limit.",
+		},
+		{
+			name: "sentinel quota headers do not classify unrelated uncoded failure",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-sentinel\",\"error\":{\"message\":\"upstream failed\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"x-ratelimit-remaining-tokens": []string{"-1"},
+				"x-ratelimit-reset-tokens":     []string{"0"},
+			},
+			wantStatus:      http.StatusOK,
+			wantContentType: "text/event-stream",
+			wantRawBody:     "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-sentinel\",\"error\":{\"message\":\"upstream failed\"}}}\n\n",
+		},
+		{
+			name: "exhausted quota headers without rate limit message fail open",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-unrelated-uncoded\",\"error\":{\"message\":\"upstream failed\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"x-ratelimit-remaining-tokens": []string{"-3"},
+				"x-ratelimit-reset-tokens":     []string{"62"},
+			},
+			wantStatus:      http.StatusOK,
+			wantContentType: "text/event-stream",
+			wantRawBody:     "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-unrelated-uncoded\",\"error\":{\"message\":\"upstream failed\"}}}\n\n",
+		},
+		{
+			name: "request reset ignores unrelated token reset",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-request-only\",\"error\":{\"message\":\"Request rate limit exceeded.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                   []string{"text/event-stream"},
+				"x-ratelimit-remaining-requests": []string{"0"},
+				"x-ratelimit-reset-requests":     []string{"7"},
+				"x-ratelimit-remaining-tokens":   []string{"500000"},
+				"x-ratelimit-reset-tokens":       []string{"300"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "7",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Request rate limit exceeded.",
+		},
+		{
+			name: "uncoded azure rate limit uses token reset when retry-after is absent",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-reset-only\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"x-ratelimit-remaining-tokens": []string{"-37268"},
+				"x-ratelimit-reset-tokens":     []string{"62"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "62",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Your requests have exceeded rate limit.",
+		},
+		{
+			name: "uncoded request quota failure uses request reset",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-request-reset\",\"error\":{\"message\":\"Request rate limit exceeded.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                   []string{"text/event-stream"},
+				"x-ratelimit-remaining-requests": []string{"0"},
+				"x-ratelimit-reset-requests":     []string{"7"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "7",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Request rate limit exceeded.",
+		},
+		{
+			name: "overflow-sized reset value preserves client delay",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-overflow-reset\",\"error\":{\"message\":\"Request rate limit exceeded.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                   []string{"text/event-stream"},
+				"x-ratelimit-remaining-requests": []string{"0"},
+				"x-ratelimit-reset-requests":     []string{"9223372036854775808"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "9223372036854775808",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Request rate limit exceeded.",
+		},
+		{
+			name: "created then uncoded azure rate limit translates from exhausted quota headers",
+			body: "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-azure-uncoded-rate-limit\"}}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-azure-uncoded-rate-limit\",\"error\":{\"message\":\"Your requests to gpt-5.6-sol for gpt-5.6-sol in westus3 have exceeded rate limit.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"retry-after-ms":               []string{"2169"},
+				"x-ratelimit-remaining-tokens": []string{"-36161"},
+				"x-ratelimit-reset-tokens":     []string{"62"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "3",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Your requests to gpt-5.6-sol for gpt-5.6-sol in westus3 have exceeded rate limit.",
+		},
+		{
+			name: "overflow-sized retry-after-ms preserves client delay",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-retry-ms-overflow\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"retry-after-ms":               []string{"10000000000"},
+				"x-ratelimit-remaining-tokens": []string{"0"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "10000000",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Your requests have exceeded rate limit.",
+		},
+		{
+			name: "generic server error with quota evidence translates",
+			body: "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-generic-rate-limit\"}}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-generic-rate-limit\",\"error\":{\"type\":\"server_error\",\"message\":\"Request rate limit exceeded.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                   []string{"text/event-stream"},
+				"retry-after-ms":                 []string{"1800"},
+				"x-ratelimit-remaining-requests": []string{"0"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "2",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Request rate limit exceeded.",
+		},
+		{
+			name: "numeric 429 code translates",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-numeric-429\",\"error\":{\"type\":\"server_error\",\"code\":\"429\",\"message\":\"Too many requests.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Too many requests.",
 		},
 		{
 			name: "created then immediate rate limit translates before commit",
@@ -245,6 +620,8 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 				Error struct {
 					Message string `json:"message"`
 					Type    string `json:"type"`
+					Code    string `json:"code"`
+					Param   string `json:"param"`
 				} `json:"error"`
 			}
 			if err := json.Unmarshal(body, &envelope); err != nil {
@@ -253,10 +630,192 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			if envelope.Error.Type != tt.wantErrorType {
 				t.Fatalf("error.type = %q, want %q", envelope.Error.Type, tt.wantErrorType)
 			}
+			if tt.wantErrorCode != "" && envelope.Error.Code != tt.wantErrorCode {
+				t.Fatalf("error.code = %q, want %q", envelope.Error.Code, tt.wantErrorCode)
+			}
+			if tt.wantErrorParam != "" && envelope.Error.Param != tt.wantErrorParam {
+				t.Fatalf("error.param = %q, want %q", envelope.Error.Param, tt.wantErrorParam)
+			}
 			if envelope.Error.Message != tt.wantErrorMessage {
 				t.Fatalf("error.message = %q, want %q", envelope.Error.Message, tt.wantErrorMessage)
 			}
 		})
+	}
+}
+
+func TestHandleResponses_PrecommitFailureTranslationRecordsUsage(t *testing.T) {
+	handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			Body: io.NopCloser(strings.NewReader("event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-rate-limit-usage\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"},\"usage\":{\"input_tokens\":11,\"output_tokens\":4,\"total_tokens\":15}}}\n\n")),
+		}, nil
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.4","input":"Hello","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx, summary := WithRequestSummary(req.Context())
+	req = req.WithContext(ctx)
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 429, body=%s", resp.StatusCode, body)
+	}
+	usage := readSummaryForStats(summary)
+	if usage.prompt != 11 || usage.completion != 4 || usage.total != 15 {
+		t.Fatalf("usage = prompt:%d completion:%d total:%d, want 11/4/15", usage.prompt, usage.completion, usage.total)
+	}
+}
+
+func TestResponsesFailureHeadersEventValuesReplaceUpstreamCaseInsensitively(t *testing.T) {
+	event := responsesWebSocketStreamEvent{Type: "error"}
+	event.Error.Headers = map[string]json.RawMessage{
+		"Retry-After-Ms": json.RawMessage(`"1200"`),
+		"X-Request-Id":   json.RawMessage(`"event-request-id"`),
+	}
+	upstream := http.Header{
+		"retry-after-ms": []string{"9000"},
+		"x-request-id":   []string{"upstream-request-id"},
+	}
+
+	merged := responsesFailureHeaders(event, upstream)
+	if got := headerGetCI(merged, "retry-after-ms"); got != "1200" {
+		t.Fatalf("retry-after-ms = %q, want event value 1200; headers=%v", got, merged)
+	}
+	if got := headerGetCI(merged, "x-request-id"); got != "event-request-id" {
+		t.Fatalf("x-request-id = %q, want event value; headers=%v", got, merged)
+	}
+	for _, name := range []string{"retry-after-ms", "x-request-id"} {
+		matchingKeys := 0
+		for key := range merged {
+			if strings.EqualFold(key, name) {
+				matchingKeys++
+			}
+		}
+		if matchingKeys != 1 {
+			t.Fatalf("case-insensitive key count for %s = %d, want 1; headers=%v", name, matchingKeys, merged)
+		}
+	}
+}
+
+func TestSelectResponsesRetryAfterRoundsUpHTTPDate(t *testing.T) {
+	var now time.Time
+	for {
+		now = time.Now()
+		withinSecond := time.Duration(now.Nanosecond())
+		if withinSecond >= 250*time.Millisecond && withinSecond <= 750*time.Millisecond {
+			break
+		}
+		midpoint := now.Truncate(time.Second).Add(500 * time.Millisecond)
+		if !midpoint.After(now) {
+			midpoint = midpoint.Add(time.Second)
+		}
+		time.Sleep(time.Until(midpoint))
+	}
+	retryAt := now.Truncate(time.Second).Add(time.Second)
+	headers := http.Header{
+		"Retry-After": []string{retryAt.UTC().Format(http.TimeFormat)},
+	}
+
+	retryAfter, source := selectResponsesRetryAfter(headers)
+	if retryAfter != "1" || source != "Retry-After" {
+		t.Fatalf("selectResponsesRetryAfter() = (%q, %q), want (\"1\", \"Retry-After\")", retryAfter, source)
+	}
+}
+
+func TestPeekAndForwardResponses_ExhaustedQuotaPreambleCrossesPeekLimitBeforeUncodedFailure(t *testing.T) {
+	created := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-large-created\",\"metadata\":{\"padding\":\"" + strings.Repeat("x", 96*1024) + "\"}}}\n\n"
+	failed := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-large-created\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n"
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type":                 []string{"text/event-stream"},
+			"retry-after-ms":               []string{"2169"},
+			"x-ratelimit-remaining-tokens": []string{"-36161"},
+		},
+		Body: io.NopCloser(strings.NewReader(created + failed)),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":true}`))
+	w := httptest.NewRecorder()
+	h := &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}
+	peekAndForwardResponsesWithConfig(h, w, req, resp, context.Background(), func() {}, "gpt-5.6-sol", time.Second, responsesPrecommitMaxPeekBytes, "")
+	result := w.Result()
+	body, _ := io.ReadAll(result.Body)
+	if result.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429; body length=%d", result.StatusCode, len(body))
+	}
+}
+
+func TestPeekAndForwardResponses_ExhaustedQuotaPreambleRetainsHardCap(t *testing.T) {
+	created := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-capped-created\",\"metadata\":{\"padding\":\"" + strings.Repeat("x", responsesPrecommitHeldPreambleMaxBytes+64*1024) + "\"}}}\n\n"
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type":                 []string{"text/event-stream"},
+			"retry-after-ms":               []string{"2169"},
+			"x-ratelimit-remaining-tokens": []string{"-36161"},
+		},
+		Body: io.NopCloser(strings.NewReader(created)),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":true}`))
+	w := httptest.NewRecorder()
+	h := &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}
+	peekAndForwardResponsesWithConfig(h, w, req, resp, context.Background(), func() {}, "gpt-5.6-sol", time.Second, responsesPrecommitMaxPeekBytes, "")
+	result := w.Result()
+	body, _ := io.ReadAll(result.Body)
+	if result.StatusCode != http.StatusOK || string(body) != created {
+		t.Fatalf("status = %d body length=%d, want passthrough 200 body length=%d", result.StatusCode, len(body), len(created))
+	}
+}
+
+func TestPeekAndForwardResponses_TranslatesFailureAtEOFWithoutSSEDelimiter(t *testing.T) {
+	raw := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-eof-rate-limit\",\"error\":{\"code\":\"too_many_requests\",\"message\":\"slow down\"}}}"
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(raw)),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":true}`))
+	w := httptest.NewRecorder()
+	h := &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}
+
+	peekAndForwardResponsesWithConfig(h, w, req, resp, context.Background(), func() {}, "gpt-5.6-sol", time.Second, responsesPrecommitMaxPeekBytes, "")
+
+	result := w.Result()
+	body, _ := io.ReadAll(result.Body)
+	if result.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429; body=%s", result.StatusCode, body)
+	}
+}
+
+func TestPeekAndForwardResponses_TranslatedFailureRecordsPartialUsage(t *testing.T) {
+	raw := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-precommit-usage\",\"error\":{\"code\":\"too_many_requests\",\"message\":\"slow down\"},\"usage\":{\"input_tokens\":11,\"output_tokens\":4,\"total_tokens\":15}}}\n\n"
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(raw)),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":true}`))
+	ctx, summary := WithRequestSummary(req.Context())
+	req = req.WithContext(ctx)
+	w := httptest.NewRecorder()
+	h := &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}
+
+	peekAndForwardResponsesWithConfig(h, w, req, resp, context.Background(), func() {}, "gpt-5.6-sol", time.Second, responsesPrecommitMaxPeekBytes, "")
+
+	if got := w.Result().StatusCode; got != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", got)
+	}
+	usage := readSummaryForStats(summary)
+	if usage.prompt != 11 || usage.completion != 4 || usage.total != 15 {
+		t.Fatalf("usage = prompt:%d completion:%d total:%d, want 11/4/15", usage.prompt, usage.completion, usage.total)
 	}
 }
 
@@ -616,6 +1175,119 @@ func TestStreamResponsesPipeRecordsUsage(t *testing.T) {
 	// The stream bytes must be forwarded to the client unchanged.
 	if got := rec.Body.String(); got != sse {
 		t.Fatalf("stream body altered.\n got: %q\nwant: %q", got, sse)
+	}
+}
+
+func TestStreamResponsesPipeClassifiesUncodedRateLimitFromHeaders(t *testing.T) {
+	sse := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-late-uncoded-rate-limit\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n"
+	headers := http.Header{
+		"retry-after-ms":               []string{"2169"},
+		"x-ratelimit-remaining-tokens": []string{"-36161"},
+	}
+	ctx, summary := WithRequestSummary(context.Background())
+	rec := httptest.NewRecorder()
+	streamResponsesPipeWithFailureLog(ctx, &ProxyHandler{log: logger.New(logger.LevelError)}, rec, strings.NewReader(sse), headers, nil, "")
+	if got := summary.FailureStatus(); got != http.StatusTooManyRequests {
+		t.Fatalf("FailureStatus = %d, want 429", got)
+	}
+	if got := rec.Body.String(); got != sse {
+		t.Fatalf("stream body altered. got %q want %q", got, sse)
+	}
+}
+
+func TestStreamResponsesPipeClassifiesTopLevelErrorEvent(t *testing.T) {
+	sse := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n" +
+		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"no_capacity\",\"message\":\"No capacity is available.\",\"headers\":{\"retry-after-ms\":\"1200\"}},\"response\":{\"id\":\"resp-error-usage\",\"usage\":{\"input_tokens\":11,\"output_tokens\":4,\"total_tokens\":15}}}\n\n"
+	ctx, summary := WithRequestSummary(context.Background())
+	rec := httptest.NewRecorder()
+	tap := newResponsesFailureTap(ctx, &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, nil, nil, "")
+
+	if _, err := tap.Write([]byte(sse)); err != nil {
+		t.Fatalf("tap.Write() error = %v", err)
+	}
+	if !tap.completedCleanly() {
+		t.Fatal("top-level error event was not treated as terminal")
+	}
+	if got := summary.FailureStatus(); got != http.StatusTooManyRequests {
+		t.Fatalf("FailureStatus = %d, want 429", got)
+	}
+	usage := readSummaryForStats(summary)
+	if usage.prompt != 11 || usage.completion != 4 || usage.total != 15 {
+		t.Fatalf("tap usage = prompt:%d completion:%d total:%d, want 11/4/15", usage.prompt, usage.completion, usage.total)
+	}
+
+	streamCtx, streamSummary := WithRequestSummary(context.Background())
+	streamResponsesPipeWithFailureLog(streamCtx, &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, rec, strings.NewReader(sse), nil, nil, "")
+	if got := streamSummary.FailureStatus(); got != http.StatusTooManyRequests {
+		t.Fatalf("stream FailureStatus = %d, want 429", got)
+	}
+	streamUsage := readSummaryForStats(streamSummary)
+	if streamUsage.prompt != 11 || streamUsage.completion != 4 || streamUsage.total != 15 {
+		t.Fatalf("stream usage = prompt:%d completion:%d total:%d, want 11/4/15", streamUsage.prompt, streamUsage.completion, streamUsage.total)
+	}
+	if got := rec.Body.String(); got != sse {
+		t.Fatalf("stream body altered. got %q want %q", got, sse)
+	}
+}
+
+func TestStreamResponsesPipeNormalizesEventNameForUntypedNestedError(t *testing.T) {
+	sse := "event: error\ndata: {\"error\":{\"type\":\"too_many_requests\",\"code\":\"no_capacity\",\"message\":\"No capacity is available.\",\"headers\":{\"retry-after-ms\":\"1200\"}}}\n\n"
+	ctx, summary := WithRequestSummary(context.Background())
+	rec := httptest.NewRecorder()
+
+	streamResponsesPipeWithFailureLog(ctx, &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, rec, strings.NewReader(sse), nil, nil, "")
+
+	if got := summary.FailureStatus(); got != http.StatusTooManyRequests {
+		t.Fatalf("FailureStatus = %d, want 429", got)
+	}
+	if got := rec.Body.String(); got != sse {
+		t.Fatalf("stream body altered. got %q want %q", got, sse)
+	}
+}
+
+func TestStreamResponsesPipeFinalizesTerminalAtEOFWithoutDelimiter(t *testing.T) {
+	tests := []struct {
+		name       string
+		sse        string
+		wantStatus int
+		wantUsage  responsesUsage
+	}{
+		{
+			name:      "completed",
+			sse:       "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-eof-completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3,\"total_tokens\":10}}}",
+			wantUsage: responsesUsage{InputTokens: 7, OutputTokens: 3, TotalTokens: 10},
+		},
+		{
+			name:       "failed",
+			sse:        "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-eof-failed\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"}}}",
+			wantStatus: http.StatusTooManyRequests,
+		},
+		{
+			name:       "incomplete",
+			sse:        "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-eof-incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}",
+			wantStatus: http.StatusConflict,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, summary := WithRequestSummary(context.Background())
+			rec := httptest.NewRecorder()
+			streamResponsesPipeWithFailureLog(ctx, &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, rec, strings.NewReader(tt.sse), nil, nil, "")
+
+			if got := summary.FailureStatus(); got != tt.wantStatus {
+				t.Fatalf("FailureStatus = %d, want %d", got, tt.wantStatus)
+			}
+			if got := rec.Body.String(); got != tt.sse {
+				t.Fatalf("stream body altered. got %q want %q", got, tt.sse)
+			}
+			if !tt.wantUsage.isZero() {
+				usage := readSummaryForStats(summary)
+				if usage.prompt != tt.wantUsage.InputTokens || usage.completion != tt.wantUsage.OutputTokens || usage.total != tt.wantUsage.TotalTokens {
+					t.Fatalf("usage = prompt:%d completion:%d total:%d, want %d/%d/%d", usage.prompt, usage.completion, usage.total, tt.wantUsage.InputTokens, tt.wantUsage.OutputTokens, tt.wantUsage.TotalTokens)
+				}
+			}
+		})
 	}
 }
 

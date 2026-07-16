@@ -36,13 +36,6 @@ const (
 	// stateBindingTypeEncryptedContent binds non-proxy opaque encrypted_content
 	// artifacts.
 	stateBindingTypeEncryptedContent stateBindingType = "encrypted_content"
-	// stateBindingTypeReasoningArtifact binds adapter-marked opaque reasoning
-	// artifacts that are not represented as encrypted_content.
-	stateBindingTypeReasoningArtifact stateBindingType = "reasoning_artifact"
-	// stateBindingTypeSessionHandle binds provider-issued session handles.
-	stateBindingTypeSessionHandle stateBindingType = "session_handle"
-	// stateBindingTypeToolHandle binds provider-issued tool handles.
-	stateBindingTypeToolHandle stateBindingType = "tool_handle"
 )
 
 type stateBindingOwner struct {
@@ -420,28 +413,28 @@ func (r *stateBindingRecord) expired(now time.Time) bool {
 	return !now.Before(r.expiresAt)
 }
 
-func (s *stateBindingStore) evictionCount() uint64 {
-	if s == nil {
-		return 0
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.evictions
-}
-
 // bindAll atomically validates and binds every token to one owner. If any live
 // token is already conflicted or owned elsewhere, conflicting records become
 // tombstones and no previously-unseen token from the batch is inserted. This
 // prevents state from an unexposed response from being partially published.
 func (s *stateBindingStore) bindAll(tokens []stateBindingToken, owner stateBindingOwner) stateBindingLookupResult {
+	result, _ := s.bindAllWithEvictionDelta(tokens, owner)
+	return result
+}
+
+// bindAllWithEvictionDelta applies one atomic batch and returns only the
+// capacity evictions caused by that batch. The delta is captured while the
+// store mutex is still held so concurrent binders cannot attribute each
+// other's evictions to themselves.
+func (s *stateBindingStore) bindAllWithEvictionDelta(tokens []stateBindingToken, owner stateBindingOwner) (stateBindingLookupResult, uint64) {
 	if s == nil || len(tokens) == 0 || !owner.valid() || len(tokens) > s.maxEntries {
-		return stateBindingLookupResult{outcome: stateBindingLookupConflict}
+		return stateBindingLookupResult{outcome: stateBindingLookupConflict}, 0
 	}
 	keys := make([]stateBindingKey, 0, len(tokens))
 	seen := make(map[stateBindingKey]struct{}, len(tokens))
 	for _, token := range tokens {
 		if token.stateType == "" || token.value == "" {
-			return stateBindingLookupResult{outcome: stateBindingLookupConflict}
+			return stateBindingLookupResult{outcome: stateBindingLookupConflict}, 0
 		}
 		key := s.bindingKey(token.stateType, token.value)
 		if _, ok := seen[key]; ok {
@@ -451,12 +444,16 @@ func (s *stateBindingStore) bindAll(tokens []stateBindingToken, owner stateBindi
 		keys = append(keys, key)
 	}
 	if len(keys) == 0 {
-		return stateBindingLookupResult{outcome: stateBindingLookupConflict}
+		return stateBindingLookupResult{outcome: stateBindingLookupConflict}, 0
 	}
 
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	evictionsBefore := s.evictions
+	finish := func(result stateBindingLookupResult) (stateBindingLookupResult, uint64) {
+		return result, s.evictions - evictionsBefore
+	}
 	s.pruneExpiredLocked(now)
 
 	conflicted := false
@@ -480,7 +477,7 @@ func (s *stateBindingStore) bindAll(tokens []stateBindingToken, owner stateBindi
 		}
 	}
 	if conflicted {
-		return stateBindingLookupResult{outcome: stateBindingLookupConflict}
+		return finish(stateBindingLookupResult{outcome: stateBindingLookupConflict})
 	}
 
 	for _, key := range keys {
@@ -499,5 +496,5 @@ func (s *stateBindingStore) bindAll(tokens []stateBindingToken, owner stateBindi
 		elem := s.recency.PushFront(record)
 		s.entries[key] = elem
 	}
-	return stateBindingLookupResult{outcome: stateBindingLookupKnown, owner: owner}
+	return finish(stateBindingLookupResult{outcome: stateBindingLookupKnown, owner: owner})
 }

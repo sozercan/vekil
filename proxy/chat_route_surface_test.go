@@ -477,6 +477,110 @@ func TestExplicitNativeAnthropicRouteAcceptsNormalizedAlias(t *testing.T) {
 	}
 }
 
+func TestExplicitRouteOpenAISurfacesAcceptDatedNormalizedAlias(t *testing.T) {
+	const (
+		publicModel    = "claude-sonnet-4.5"
+		requestedModel = "claude-sonnet-4-5-20250514"
+		upstreamModel  = "physical-claude"
+	)
+
+	tests := []struct {
+		name             string
+		endpoint         string
+		path             string
+		requestBody      string
+		upstreamResponse string
+		handle           func(*ProxyHandler, http.ResponseWriter, *http.Request)
+	}{
+		{
+			name:             "chat completions",
+			endpoint:         providerEndpointChatCompletions,
+			path:             "/v1/chat/completions",
+			requestBody:      `{"model":"` + requestedModel + `","messages":[{"role":"user","content":"hi"}]}`,
+			upstreamResponse: `{"id":"chat-alias","object":"chat.completion","model":"physical-claude","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`,
+			handle:           (*ProxyHandler).HandleOpenAIChatCompletions,
+		},
+		{
+			name:             "responses",
+			endpoint:         providerEndpointResponses,
+			path:             "/v1/responses",
+			requestBody:      `{"model":"` + requestedModel + `","input":"hi"}`,
+			upstreamResponse: `{"id":"resp-alias","object":"response","status":"completed","model":"physical-claude","output":[]}`,
+			handle:           (*ProxyHandler).HandleResponses,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var fallbackCalls, explicitCalls atomic.Int32
+			fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				fallbackCalls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tt.upstreamResponse)
+			}))
+			defer fallback.Close()
+
+			explicit := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				explicitCalls.Add(1)
+				if r.URL.Path != tt.endpoint {
+					t.Errorf("upstream path = %q, want %q", r.URL.Path, tt.endpoint)
+				}
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decode upstream request: %v", err)
+				} else if body["model"] != upstreamModel {
+					t.Errorf("upstream model = %#v, want %q", body["model"], upstreamModel)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tt.upstreamResponse)
+			}))
+			defer explicit.Close()
+
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
+				SchemaVersion: ProvidersConfigSchemaVersion2,
+				Providers: []ProviderConfig{
+					{
+						ID:       "fallback",
+						Type:     string(providerTypeOpenAICompatible),
+						Default:  true,
+						BaseURL:  fallback.URL,
+						AuthType: "none",
+						Models: []ProviderModelConfig{{
+							PublicID:  "fallback-model",
+							Endpoints: []string{providerEndpointChatCompletions},
+						}},
+					},
+					{ID: "explicit", Type: string(providerTypeOpenAICompatible), BaseURL: explicit.URL, AuthType: "none"},
+				},
+				ModelRoutes: []ModelRouteConfig{{
+					ID:        "claude-route",
+					PublicID:  publicModel,
+					Endpoints: []string{tt.endpoint},
+					Targets: []ModelRouteTargetConfig{{
+						ID: "target", Provider: "explicit", UpstreamModel: upstreamModel,
+					}},
+				}},
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.BeginShutdown()
+
+			w := httptest.NewRecorder()
+			tt.handle(h, w, httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.requestBody)))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+			}
+			if explicitCalls.Load() != 1 || fallbackCalls.Load() != 0 {
+				t.Fatalf("explicit calls = %d, fallback calls = %d", explicitCalls.Load(), fallbackCalls.Load())
+			}
+			if !strings.Contains(w.Body.String(), `"model":"`+publicModel+`"`) {
+				t.Fatalf("response did not preserve public model identity: %s", w.Body.String())
+			}
+		})
+	}
+}
+
 func TestExplicitRouteCountTokenRecoveryRespectsOneSendBudget(t *testing.T) {
 	t.Run("Gemini", func(t *testing.T) {
 		var calls atomic.Int32

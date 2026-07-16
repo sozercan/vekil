@@ -78,18 +78,6 @@ func (r *modelRoute) targetByID(id string) (targetBinding, bool) {
 	return targetBinding{}, false
 }
 
-func (r *modelRoute) targetIndex(id string) int {
-	if r == nil {
-		return -1
-	}
-	for i := range r.targets {
-		if r.targets[i].id == id {
-			return i
-		}
-	}
-	return -1
-}
-
 type modelRouteRegistrySnapshot struct {
 	byPublicID       map[string]*modelRoute
 	aliases          map[string]*modelRoute
@@ -417,8 +405,12 @@ func (h *ProxyHandler) resolveModelRouteForRequest(model, endpoint string) (*mod
 	if route, ok := setup.lookupRoute(rawModel); ok {
 		return route, true
 	}
-	if endpoint == providerEndpointMessages {
-		if route, ok := setup.lookupRouteAlias(NormalizeModelName(rawModel)); ok {
+	if route, ok := setup.lookupRouteAlias(NormalizeModelName(rawModel)); ok {
+		// Explicit routes reserve their normalized public-model aliases globally,
+		// so every public endpoint must resolve those aliases to the same route.
+		// Legacy provider catalogs keep their historical Messages-only alias
+		// fallback; chat and Responses still require an exact legacy public ID.
+		if !route.legacy || endpoint == providerEndpointMessages {
 			return route, true
 		}
 	}
@@ -441,15 +433,13 @@ func providerModelFromRouteTarget(route *modelRoute, target targetBinding) provi
 		return owner
 	}
 	owner := providerModel{
+		publicID:               route.public.id,
 		upstreamModel:          target.upstreamModel,
 		supportedEndpoints:     append([]string(nil), route.public.endpoints...),
 		parallelToolCalls:      cloneBoolPtr(route.public.policy.parallelToolCalls),
 		dropSamplingParams:     route.public.policy.dropSamplingParams,
 		useMaxCompletionTokens: target.wirePolicy.useMaxCompletionTokens,
 		raw:                    append(json.RawMessage(nil), route.public.raw...),
-	}
-	if route != nil {
-		owner.publicID = route.public.id
 	}
 	if target.provider != nil {
 		owner.providerID = target.provider.id

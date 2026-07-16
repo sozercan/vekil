@@ -111,7 +111,7 @@ func TestExplicitRoutePriorityFailoverOnAuthoritative429(t *testing.T) {
 	if err != nil {
 		t.Fatalf("executeExplicitRouteRequest() error = %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "resp-secondary") {
 		t.Fatalf("response = %d %s", resp.StatusCode, body)
@@ -147,7 +147,7 @@ func TestExplicitRoutePrimaryOnlyNeverSwitches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute error = %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -242,7 +242,7 @@ func TestExplicitRouteDoesNotFollowRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error = %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusTemporaryRedirect {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -275,13 +275,124 @@ func TestExplicitRouteStreamingPreambleFailureSwitchesBeforeCommit(t *testing.T)
 	if err != nil {
 		t.Fatalf("error = %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("read body: %v", err)
 	}
 	if strings.Contains(string(body), "resp-hidden") || !strings.Contains(string(body), "resp-visible") {
 		t.Fatalf("stream body = %s", body)
+	}
+}
+
+func TestExplicitRouteStreamingPreambleByteBoundCommitsWithoutSwitch(t *testing.T) {
+	var secondaryCalls atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		created := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-large-primary\",\"metadata\":{\"padding\":\"" + strings.Repeat("x", 96*1024) + "\"}}}\n\n"
+		failed := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-large-primary\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"late quota\"}}}\n\n"
+		_, _ = io.WriteString(w, created)
+		_, _ = io.WriteString(w, failed)
+	}))
+	defer primary.Close()
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondaryCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-secondary\"}}\n\n")
+	}))
+	defer secondary.Close()
+
+	h, route := explicitRouteTestHandler(t, http.DefaultClient, routeModePriorityFailover, 2, 2,
+		explicitRouteTestProvider("primary", primary.URL, "one"),
+		explicitRouteTestProvider("secondary", secondary.URL, "two"),
+	)
+	requestCtx, summary := WithRequestSummary(context.Background())
+	operation := newRouteOperation(route, requestCtx)
+	ctx := withRouteOperation(requestCtx, operation)
+	resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model","stream":true}`), nil, "public-model", true)
+	if err != nil {
+		t.Fatalf("executeExplicitRouteRequest() error = %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !strings.Contains(string(body), "resp-large-primary") || !strings.Contains(string(body), "late quota") {
+		t.Fatalf("body did not preserve committed primary stream: %s", body)
+	}
+	if secondaryCalls.Load() != 0 {
+		t.Fatalf("secondary calls = %d, want 0", secondaryCalls.Load())
+	}
+	if got := summary.TargetSwitchCount(); got != 0 {
+		t.Fatalf("target switches = %d, want 0", got)
+	}
+}
+
+func TestExplicitRouteStreamingTopLevelErrorSwitchesBeforeCommit(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: error\ndata: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"primary quota\"}\n\n")
+	}))
+	defer primary.Close()
+	var secondaryCalls atomic.Int32
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondaryCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-secondary\"}}\n\n")
+	}))
+	defer secondary.Close()
+
+	h, route := explicitRouteTestHandler(t, http.DefaultClient, routeModePriorityFailover, 2, 2,
+		explicitRouteTestProvider("primary", primary.URL, "one"),
+		explicitRouteTestProvider("secondary", secondary.URL, "two"),
+	)
+	ctx := withRouteOperation(context.Background(), newRouteOperation(route, context.Background()))
+	resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model","stream":true}`), nil, "public-model", true)
+	if err != nil {
+		t.Fatalf("executeExplicitRouteRequest() error = %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !strings.Contains(string(body), "resp-secondary") || strings.Contains(string(body), "primary quota") {
+		t.Fatalf("stream body = %s", body)
+	}
+	if secondaryCalls.Load() != 1 {
+		t.Fatalf("secondary calls = %d, want 1", secondaryCalls.Load())
+	}
+}
+
+func TestExplicitRouteStreamingTopLevelErrorPreservesDiagnostics(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: error\ndata: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"primary quota\",\"headers\":{\"Retry-After\":\"600\",\"X-Request-Id\":\"event-request-id\"}}\n\n")
+	}))
+	defer primary.Close()
+
+	h, route := explicitRouteTestHandler(t, http.DefaultClient, routeModePrimaryOnly, 1, 1,
+		explicitRouteTestProvider("primary", primary.URL, "one"),
+	)
+	ctx := withRouteOperation(context.Background(), newRouteOperation(route, context.Background()))
+	resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model","stream":true}`), nil, "public-model", true)
+	if resp != nil {
+		_ = resp.Body.Close()
+		t.Fatalf("response = %#v, want translated error", resp)
+	}
+	if got := upstreamStatusCode(err, 0); got != http.StatusTooManyRequests {
+		t.Fatalf("status = %d error=%v, want 429", got, err)
+	}
+	if !strings.Contains(formatUpstreamRequestFailure(err, "fallback"), "primary quota") {
+		t.Fatalf("formatted error = %q, want provider message", formatUpstreamRequestFailure(err, "fallback"))
+	}
+	retryAfter, headers := upstreamErrorRetryMetadata(err)
+	if retryAfter != "600" {
+		t.Fatalf("Retry-After metadata = %q, want 600", retryAfter)
+	}
+	if got := headerGetCI(headers, "X-Request-Id"); got != "event-request-id" {
+		t.Fatalf("X-Request-Id = %q, want event-request-id", got)
 	}
 }
 
@@ -394,6 +505,169 @@ func TestConfiguredExplicitRouteHandleResponsesAndCatalog(t *testing.T) {
 	}
 }
 
+func TestConfiguredExplicitResponsesRoutePreparesEachTargetFromLogicalRequest(t *testing.T) {
+	requestBody := `{
+		"model":"public-model",
+		"input":"hello",
+		"tools":[
+			{"type":"image_generation"},
+			{"type":"function","name":"lookup","parameters":{"type":"object"}}
+		],
+		"tool_choice":{"type":"image_generation"}
+	}`
+
+	for _, tc := range []struct {
+		name  string
+		order []providerType
+	}{
+		{name: "azure_then_openai_compatible", order: []providerType{providerTypeAzureOpenAI, providerTypeOpenAICompatible}},
+		{name: "openai_compatible_then_azure", order: []providerType{providerTypeOpenAICompatible, providerTypeAzureOpenAI}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			captures := map[providerType]chan []byte{
+				providerTypeAzureOpenAI:      make(chan []byte, 1),
+				providerTypeOpenAICompatible: make(chan []byte, 1),
+			}
+			servers := make(map[providerType]*httptest.Server, len(captures))
+			for kind, capture := range captures {
+				kind := kind
+				capture := capture
+				servers[kind] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodGet {
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = io.WriteString(w, `{"data":[]}`)
+						return
+					}
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Errorf("%s read body: %v", kind, err)
+					}
+					capture <- body
+					w.Header().Set("Content-Type", "application/json")
+					if kind == tc.order[0] {
+						w.WriteHeader(http.StatusTooManyRequests)
+						_, _ = io.WriteString(w, `{"error":{"message":"quota","type":"rate_limit_error"}}`)
+						return
+					}
+					_, _ = io.WriteString(w, `{"id":"resp-success","model":"physical-success","status":"completed","output":[]}`)
+				}))
+			}
+			defer func() {
+				for _, server := range servers {
+					server.Close()
+				}
+			}()
+
+			providerID := func(kind providerType) string {
+				if kind == providerTypeAzureOpenAI {
+					return "azure"
+				}
+				return "openai"
+			}
+			providerConfig := func(kind providerType, isDefault bool) ProviderConfig {
+				config := ProviderConfig{
+					ID:      providerID(kind),
+					Type:    string(kind),
+					Default: isDefault,
+				}
+				if kind == providerTypeAzureOpenAI {
+					config.BaseURL = servers[kind].URL + "/openai/v1"
+					config.APIKey = "azure-key"
+				} else {
+					config.BaseURL = servers[kind].URL
+					config.AuthType = "none"
+				}
+				return config
+			}
+
+			providers := make([]ProviderConfig, 0, len(tc.order))
+			targets := make([]ModelRouteTargetConfig, 0, len(tc.order))
+			for i, kind := range tc.order {
+				id := providerID(kind)
+				providers = append(providers, providerConfig(kind, i == 0))
+				targets = append(targets, ModelRouteTargetConfig{
+					ID:            id + "-target",
+					Provider:      id,
+					UpstreamModel: id + "-model",
+				})
+			}
+
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard),
+				WithProvidersConfig(ProvidersConfig{
+					SchemaVersion: 2,
+					Providers:     providers,
+					ModelRoutes: []ModelRouteConfig{{
+						ID:        "route-public",
+						PublicID:  "public-model",
+						Endpoints: []string{providerEndpointResponses},
+						Targets:   targets,
+						Routing: ModelRouteRoutingConfig{
+							Mode:              string(routeModePriorityFailover),
+							MaxTargetAttempts: 2,
+							MaxUpstreamSends:  2,
+						},
+					}},
+				}),
+			)
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+			defer h.BeginShutdown()
+
+			w := httptest.NewRecorder()
+			h.HandleResponses(w, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(requestBody)))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+			}
+
+			for kind, capture := range captures {
+				var body []byte
+				select {
+				case body = <-capture:
+				default:
+					t.Fatalf("%s target was not called", kind)
+				}
+				var payload struct {
+					Model      string            `json:"model"`
+					Tools      []json.RawMessage `json:"tools"`
+					ToolChoice json.RawMessage   `json:"tool_choice"`
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("decode %s body %s: %v", kind, body, err)
+				}
+				if want := providerID(kind) + "-model"; payload.Model != want {
+					t.Errorf("%s model = %q, want %q", kind, payload.Model, want)
+				}
+				toolTypes := make(map[string]bool, len(payload.Tools))
+				for _, rawTool := range payload.Tools {
+					toolTypes[responsesToolType(rawTool)] = true
+				}
+				if !toolTypes["function"] {
+					t.Errorf("%s tools = %s, missing function tool", kind, body)
+				}
+				if kind == providerTypeAzureOpenAI {
+					if toolTypes["image_generation"] {
+						t.Errorf("azure tools retained image_generation: %s", body)
+					}
+					if len(payload.ToolChoice) != 0 {
+						t.Errorf("azure tool_choice retained unsupported selection: %s", payload.ToolChoice)
+					}
+					continue
+				}
+				if !toolTypes["image_generation"] {
+					t.Errorf("openai-compatible tools prematurely stripped image_generation: %s", body)
+				}
+				var toolChoice struct {
+					Type string `json:"type"`
+				}
+				if err := json.Unmarshal(payload.ToolChoice, &toolChoice); err != nil || toolChoice.Type != "image_generation" {
+					t.Errorf("openai-compatible tool_choice = %s, want image_generation (err=%v)", payload.ToolChoice, err)
+				}
+			}
+		})
+	}
+}
+
 func TestConfiguredExplicitRouteBindsResponseStateToExactTarget(t *testing.T) {
 	var primaryCalls, secondaryCalls atomic.Int32
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -495,7 +769,7 @@ func TestExplicitRouteUncertified503DoesNotSwitch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error = %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -534,6 +808,47 @@ func TestVersion2ConfigRejectsAmbiguousDuplicateRequestKeysBeforeDispatch(t *tes
 	}
 }
 
+func TestExplicitRouteStreamingFailureWithUsageTranslatesWithoutSwitch(t *testing.T) {
+	var secondaryCalls atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-partial-usage\"}}\n\n"+
+			"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-partial-usage\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"quota\"},\"usage\":{\"input_tokens\":11,\"output_tokens\":4,\"total_tokens\":15}}}\n\n")
+	}))
+	defer primary.Close()
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondaryCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer secondary.Close()
+
+	h, route := explicitRouteTestHandler(t, http.DefaultClient, routeModePriorityFailover, 2, 2,
+		explicitRouteTestProvider("primary", primary.URL, "one"),
+		explicitRouteTestProvider("secondary", secondary.URL, "two"),
+	)
+	requestCtx, summary := WithRequestSummary(context.Background())
+	operation := newRouteOperation(route, requestCtx)
+	ctx := withRouteOperation(requestCtx, operation)
+	resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model","stream":true}`), nil, "public-model", true)
+	if resp != nil {
+		_ = resp.Body.Close()
+		t.Fatalf("response = %#v, want translated route failure", resp)
+	}
+	if got := upstreamStatusCode(err, 0); got != http.StatusTooManyRequests {
+		t.Fatalf("status = %d error=%v, want 429", got, err)
+	}
+	if secondaryCalls.Load() != 0 {
+		t.Fatalf("secondary calls = %d, want 0", secondaryCalls.Load())
+	}
+	if got := summary.TargetSwitchCount(); got != 0 {
+		t.Fatalf("target switches = %d, want 0", got)
+	}
+	usage := readSummaryForStats(summary)
+	if usage.prompt != 11 || usage.completion != 4 || usage.total != 15 {
+		t.Fatalf("usage = prompt:%d completion:%d total:%d, want 11/4/15", usage.prompt, usage.completion, usage.total)
+	}
+}
+
 func TestExplicitRouteStreamingFailureWithEmbeddedOutputDoesNotSwitch(t *testing.T) {
 	var secondaryCalls atomic.Int32
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -556,7 +871,7 @@ func TestExplicitRouteStreamingFailureWithEmbeddedOutputDoesNotSwitch(t *testing
 	if err != nil {
 		t.Fatalf("error = %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), "partial") {
 		t.Fatalf("body = %s", body)
@@ -593,7 +908,7 @@ func TestExplicitRouteHardPinnedTargetNeverRetriesOrSwitches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error = %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}

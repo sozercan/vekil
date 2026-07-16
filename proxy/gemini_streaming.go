@@ -146,13 +146,6 @@ func streamOpenAIToGeminiWithLifecycle(
 	onFinalResponse(aggregator.buildResponse())
 }
 
-// aggregateGeminiStreamToResponse collects a force-streamed Gemini upstream
-// response while applying Gemini-specific validation before aggregation.
-func aggregateGeminiStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, error) {
-	response, _, err := aggregateGeminiStreamToResponseWithProgress(body)
-	return response, err
-}
-
 func aggregateGeminiStreamToResponseWithProgress(body io.ReadCloser) (*models.OpenAIResponse, upstreamSemanticProgress, error) {
 	defer func() { _ = body.Close() }()
 

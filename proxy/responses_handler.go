@@ -2143,6 +2143,12 @@ func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint st
 
 func (h *ProxyHandler) rewriteResponsesRequestBodyForModel(bodyBytes []byte, requestedModel string, endpoint string, injectResumePrompt bool) []byte {
 	provider, _, _ := h.resolveProviderModel(requestedModel, "/responses")
+	if route, known := h.resolveModelRouteForRequest(requestedModel, providerEndpointResponses); known && route != nil && !route.legacy {
+		// Keep explicit-route requests provider-neutral until the executor selects
+		// a physical target. Each attempt will apply that target's policy from
+		// this logical request, including replay and compatibility child sends.
+		provider = nil
+	}
 
 	if rewrittenBody, strippedFields := stripUnsupportedResponsesRequestFields(bodyBytes, provider); len(strippedFields) > 0 {
 		bodyBytes = rewrittenBody

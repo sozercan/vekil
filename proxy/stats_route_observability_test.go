@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -265,7 +264,7 @@ func TestRouteObservabilityJSONFields(t *testing.T) {
 		"target_switches": float64(1),
 	} {
 		if got := recent[0][key]; got != want {
-			t.Errorf("recent JSON %s = %#v, want %#v (payload %s)", key, got, want, fmt.Sprintf("%s", encoded))
+			t.Errorf("recent JSON %s = %#v, want %#v (payload %s)", key, got, want, string(encoded))
 		}
 	}
 }

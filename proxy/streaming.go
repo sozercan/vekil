@@ -574,99 +574,6 @@ func (s *explicitRoutePreparedStream) abortAndWait(ctx context.Context) bool {
 	}
 }
 
-// prepareExplicitChatSurfaceStream is the shared executor seam for Phase 6
-// streaming Chat, translated Anthropic/Gemini (OpenAI chat SSE upstream), and
-// direct Anthropic Messages SSE attempts.
-//
-// Call contract:
-//   - invoke only for an explicit-route HTTP 200 response whose logical request
-//     is client-streaming;
-//   - endpoint selects the upstream protocol: /chat/completions uses OpenAI chat
-//     SSE, while /v1/messages uses native Anthropic SSE;
-//   - accepted is a replayable prepared response whose buffered prefix is emitted
-//     exactly once after the caller returns it downstream;
-//   - progress reports the observation that made the target irrevocable (or an
-//     allowed preamble when the time/byte bound commits it);
-//   - failure is non-nil only when the attempt must not be returned downstream.
-//     A retry-safe rate-limit/overload failure is classified as explicitly
-//     rejected and its body pump is fully stopped before return. Ambiguous reads,
-//     malformed cleanup, and lifecycle cancellation never become switchable.
-func (h *ProxyHandler) prepareExplicitChatSurfaceStream(ctx context.Context, operation *routeOperation, target targetBinding, endpoint string, resp *http.Response) (accepted *http.Response, progress upstreamSemanticProgress, failure *routeAttemptFailure) {
-	if resp == nil || resp.Body == nil {
-		return nil, upstreamProgressUnknown, &routeAttemptFailure{
-			err:        fmt.Errorf("upstream stream response body is unavailable"),
-			delivery:   requestDeliveredOrAmbiguous,
-			progress:   upstreamProgressUnknown,
-			commitment: downstreamCommitmentNone,
-			statusCode: http.StatusOK,
-		}
-	}
-	protocol := explicitRouteStreamNone
-	switch endpoint {
-	case providerEndpointChatCompletions:
-		protocol = explicitRouteStreamOpenAIChat
-	case providerEndpointMessages:
-		protocol = explicitRouteStreamAnthropic
-	default:
-		return nil, upstreamProgressUnknown, &routeAttemptFailure{
-			err:        fmt.Errorf("explicit stream preparation does not support endpoint %s", endpoint),
-			delivery:   requestDefinitelyNotDelivered,
-			progress:   upstreamProgressNone,
-			commitment: downstreamCommitmentNone,
-			statusCode: resp.StatusCode,
-		}
-	}
-
-	prepared := newExplicitRoutePreparedStream(resp, protocol, responsesPrecommitMaxPeekBytes)
-	waitCtx := context.Context(nil)
-	if operation != nil {
-		waitCtx = operation.inbound
-	}
-	result, hasResult, err := prepared.await(waitCtx, ctx, responsesPrecommitPeekTimeout)
-	if err != nil {
-		prepared.abort()
-		return nil, upstreamProgressUnknown, &routeAttemptFailure{
-			err:        err,
-			delivery:   requestDeliveredOrAmbiguous,
-			progress:   upstreamProgressUnknown,
-			commitment: downstreamCommitmentNone,
-			statusCode: resp.StatusCode,
-		}
-	}
-	if hasResult && result.failure != nil {
-		certifiedStatus, certified := explicitRouteTargetCertifiesStreamFailure(target, result.failure)
-		if upstreamProgressAllowsTargetSwitch(result.progress) && certified {
-			result.failure.statusCode = certifiedStatus
-			if prepared.abortAndWait(ctx) {
-				return nil, result.progress, &routeAttemptFailure{
-					err:        result.failure.asUpstreamError(resp.Header),
-					delivery:   requestExplicitlyRejected,
-					progress:   result.progress,
-					commitment: downstreamCommitmentNone,
-					statusCode: result.failure.statusCode,
-				}
-			}
-			return nil, upstreamProgressUnknown, &routeAttemptFailure{
-				err:        fmt.Errorf("rejected stream cleanup did not complete"),
-				delivery:   requestDeliveredOrAmbiguous,
-				progress:   upstreamProgressUnknown,
-				commitment: downstreamCommitmentNone,
-				statusCode: result.failure.statusCode,
-			}
-		}
-		progress = mergeUpstreamSemanticProgress(result.progress, upstreamProgressTerminalFailure)
-		return prepared.commitResponse(), progress, nil
-	}
-	if hasResult {
-		progress = result.progress
-	} else {
-		// Reaching the bounded peek window intentionally fails open and commits the
-		// selected target. The pump may have seen only a role/message preamble.
-		progress = upstreamProgressAllowedPreamble
-	}
-	return prepared.commitResponse(), progress, nil
-}
-
 func isExplicitRoutePreparedChatResponse(resp *http.Response) bool {
 	if resp == nil {
 		return false
@@ -682,7 +589,7 @@ type explicitRouteStreamLine struct {
 
 func readExplicitRouteStreamLines(body io.ReadCloser, out chan<- explicitRouteStreamLine, abortCh <-chan struct{}) {
 	defer close(out)
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	reader := bufio.NewReaderSize(body, openAIStreamScannerInitialBuffer)
 	for {
 		line, err := readOpenAISSELine(reader)

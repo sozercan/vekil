@@ -85,7 +85,7 @@ func writeExplicitResponsesResponse(ctx context.Context, h *ProxyHandler, w http
 		return writeUpstreamResponse(w, resp)
 	}
 	body := newLifecycleAwareReadCloser(resp.Body, responseRequestContext(resp))
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	data, err := io.ReadAll(io.LimitReader(body, maxLargeRequestBodySize+1))
 	if body.canceledAtFailure() {
@@ -103,13 +103,15 @@ func writeExplicitResponsesResponse(ctx context.Context, h *ProxyHandler, w http
 		observeResponsesUsage(ctx, sniffResponsesUsageBody(data))
 		bodyTokens, tokenErr := extractExplicitResponsesOutputState(data)
 		headerTokens, headerErr := explicitResponseHeaderStateTokens(resp.Header)
-		if tokenErr == nil && headerErr == nil {
-			allTokens := append(headerTokens, bodyTokens...)
-			if bindErr := h.bindExplicitStateTokens(info, allTokens); bindErr != nil {
-				return newResponseBodyWriteError(resp, bindErr, false, true, false)
-			}
-		} else if headerErr != nil {
+		if headerErr != nil {
 			return newResponseBodyWriteError(resp, headerErr, false, true, false)
+		}
+		if tokenErr != nil {
+			return newResponseBodyWriteError(resp, fmt.Errorf("malformed explicit route responses response: %w", tokenErr), false, true, false)
+		}
+		allTokens := append(headerTokens, bodyTokens...)
+		if bindErr := h.bindExplicitStateTokens(info, allTokens); bindErr != nil {
+			return newResponseBodyWriteError(resp, bindErr, false, true, false)
 		}
 	}
 	out := data
@@ -240,6 +242,9 @@ func rewriteResponsesSSEEventModel(raw []byte, publicModel string, onEvent func(
 		return raw, false, nil
 	}
 	data := strings.Join(dataParts, "\n")
+	if strings.TrimSpace(data) == "[DONE]" {
+		return raw, false, nil
+	}
 	if onEvent != nil {
 		if err := onEvent([]byte(data)); err != nil {
 			return nil, false, err

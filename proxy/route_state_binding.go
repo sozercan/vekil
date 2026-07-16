@@ -85,7 +85,7 @@ func extractExplicitResponsesRequestState(body []byte, headers http.Header) ([]s
 			}
 			add(stateBindingTypeResponseID, value)
 		}
-		if err := walkExplicitStateValues(object, func(stateType stateBindingType, value string) {
+		if err := visitExplicitResponsesItems(object["input"], true, func(stateType stateBindingType, value string) {
 			if stateType == stateBindingTypeEncryptedContent && isProxyOwnedEncryptedContent(value) {
 				return
 			}
@@ -112,30 +112,54 @@ func extractExplicitResponsesRequestState(body []byte, headers http.Header) ([]s
 	return tokens, nil
 }
 
-func walkExplicitStateValues(value any, visit func(stateBindingType, string)) error {
-	switch typed := value.(type) {
-	case map[string]any:
-		for key, child := range typed {
-			if key == "encrypted_content" {
-				token, ok := child.(string)
-				if !ok || strings.TrimSpace(token) == "" {
-					return fmt.Errorf("encrypted_content must be a non-empty string")
-				}
-				visit(stateBindingTypeEncryptedContent, token)
-				continue
-			}
-			if err := walkExplicitStateValues(child, visit); err != nil {
-				return err
-			}
-		}
-	case []any:
-		for _, child := range typed {
-			if err := walkExplicitStateValues(child, visit); err != nil {
-				return err
-			}
+func visitExplicitResponsesItems(value any, rejectMalformed bool, visit func(stateBindingType, string)) error {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	for _, item := range items {
+		if err := visitExplicitResponsesItem(item, rejectMalformed, visit); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// visitExplicitResponsesItem inspects only reasoning and compaction item
+// shapes, which own opaque continuation state. A same-named field on another
+// item or in request, response, item, or content metadata is ordinary user data
+// and must not pin a provider target.
+func visitExplicitResponsesItem(value any, rejectMalformed bool, visit func(stateBindingType, string)) error {
+	item, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	if !explicitResponsesItemOwnsEncryptedContent(item) {
+		return nil
+	}
+	raw, exists := item["encrypted_content"]
+	if !exists {
+		return nil
+	}
+	token, ok := raw.(string)
+	if !ok || strings.TrimSpace(token) == "" {
+		if rejectMalformed {
+			return fmt.Errorf("encrypted_content must be a non-empty string")
+		}
+		return nil
+	}
+	visit(stateBindingTypeEncryptedContent, token)
+	return nil
+}
+
+func explicitResponsesItemOwnsEncryptedContent(item map[string]any) bool {
+	itemType, _ := item["type"].(string)
+	switch strings.TrimSpace(itemType) {
+	case "reasoning", "compaction", "context_compaction":
+		return true
+	default:
+		return false
+	}
 }
 
 func isProxyOwnedEncryptedContent(value string) bool {
@@ -162,36 +186,37 @@ func extractExplicitResponsesOutputState(body []byte) ([]stateBindingToken, erro
 		seen[key] = struct{}{}
 		tokens = append(tokens, stateBindingToken{stateType: stateType, value: value})
 	}
-	if object, ok := payload.(map[string]any); ok {
-		if token, ok := object["id"].(string); ok {
+
+	object, ok := payload.(map[string]any)
+	if !ok {
+		return tokens, nil
+	}
+	visitItem := func(stateType stateBindingType, value string) {
+		add(stateType, value)
+	}
+	visitResponse := func(response map[string]any) error {
+		if token, ok := response["id"].(string); ok {
 			add(stateBindingTypeResponseID, token)
 		}
-		if response, ok := object["response"].(map[string]any); ok {
-			if token, ok := response["id"].(string); ok {
-				add(stateBindingTypeResponseID, token)
-			}
+		return visitExplicitResponsesItems(response["output"], false, visitItem)
+	}
+
+	// A non-streaming response is the root object. Streaming lifecycle events
+	// put the response under response, while output-item events put the exposed
+	// state-bearing artifact under item.
+	if err := visitResponse(object); err != nil {
+		return nil, err
+	}
+	if response, ok := object["response"].(map[string]any); ok {
+		if err := visitResponse(response); err != nil {
+			return nil, err
 		}
 	}
-	var walk func(any)
-	walk = func(value any) {
-		switch typed := value.(type) {
-		case map[string]any:
-			for key, child := range typed {
-				switch key {
-				case "encrypted_content":
-					if token, ok := child.(string); ok {
-						add(stateBindingTypeEncryptedContent, token)
-					}
-				}
-				walk(child)
-			}
-		case []any:
-			for _, child := range typed {
-				walk(child)
-			}
+	if item, exists := object["item"]; exists {
+		if err := visitExplicitResponsesItem(item, false, visitItem); err != nil {
+			return nil, err
 		}
 	}
-	walk(payload)
 	return tokens, nil
 }
 
@@ -204,12 +229,11 @@ func (h *ProxyHandler) bindExplicitStateTokens(info explicitRouteResponseInfo, t
 		return err
 	}
 	owner := stateBindingOwner{routeID: info.routeID, targetID: info.targetID}
-	before := store.evictionCount()
-	if result := store.bindAll(tokens, owner); result.outcome == stateBindingLookupConflict {
+	result, evictions := store.bindAllWithEvictionDelta(tokens, owner)
+	if result.outcome == stateBindingLookupConflict {
 		return fmt.Errorf("provider state token collided with another route target")
 	}
-	after := store.evictionCount()
-	for count := before; count < after; count++ {
+	for count := uint64(0); count < evictions; count++ {
 		h.RecordStateBindingEviction()
 	}
 	return nil

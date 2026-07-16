@@ -647,9 +647,10 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		req = req.WithContext(httptrace.WithClientTrace(req.Context(), observation.trace()))
 		if reserved, decision := operation.reserveSendAtDispatch(ctx, h.ShuttingDown()); !reserved {
 			message := "route upstream-send budget exhausted"
-			if decision == routeRetrySuppressedAdmission {
+			switch decision {
+			case routeRetrySuppressedAdmission:
 				message = "client disconnected before upstream dispatch"
-			} else if decision == routeRetrySuppressedLifecycle {
+			case routeRetrySuppressedLifecycle:
 				message = "route operation ended before upstream dispatch"
 			}
 			failure := routeAttemptFailure{err: fmt.Errorf("%s", message), delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: decision}
@@ -804,7 +805,14 @@ func prepareRouteTargetBody(body []byte, requestedModel, endpoint string, route 
 	if requestedModel == "" && route != nil {
 		requestedModel = route.public.id
 	}
+
+	// Every target attempt starts from its own copy of the immutable logical
+	// request. Provider-specific Responses policy must run only after target
+	// selection so one target's unsupported fields cannot leak into failover.
 	prepared := append([]byte(nil), body...)
+	if endpoint == providerEndpointResponses {
+		prepared, _ = stripUnsupportedResponsesRequestFields(prepared, target.provider)
+	}
 	if !providerUsesAzureClassicDeploymentPath(target.provider, endpoint) {
 		rewritten, _, err := rewriteRequestModelForProviderFromModel(prepared, requestedModel, target.upstreamModel)
 		if err != nil {
@@ -886,8 +894,9 @@ func routeAdapterCertifiesStreamFailure(target targetBinding, event responsesWeb
 	if target.provider == nil {
 		return 0, false
 	}
-	code := strings.ToLower(strings.TrimSpace(event.Response.Error.Code))
-	errType := strings.ToLower(strings.TrimSpace(event.Response.Error.Type))
+	streamErr := responsesStreamEventError(event)
+	code := strings.ToLower(strings.TrimSpace(streamErr.Code))
+	errType := strings.ToLower(strings.TrimSpace(streamErr.Type))
 	switch code {
 	case "too_many_requests", "rate_limit_exceeded":
 		return http.StatusTooManyRequests, true
@@ -920,6 +929,8 @@ func (h *ProxyHandler) prepareExplicitResponsesStream(ctx context.Context, opera
 		}
 	}
 	if hasResult && result.failure != nil {
+		failureHeaders := responsesFailureHeaders(*result.failure, resp.Header)
+		streamErr := responsesStreamEventError(*result.failure)
 		if status, safe := routeAdapterCertifiesStreamFailure(target, *result.failure); safe && result.precommitReplaySafe {
 			if !prepared.abortAndWait(upstreamErrorDetailDrainTimeout) {
 				return nil, &routeAttemptFailure{
@@ -930,9 +941,9 @@ func (h *ProxyHandler) prepareExplicitResponsesStream(ctx context.Context, opera
 					statusCode: status,
 				}
 			}
-			body, _ := json.Marshal(map[string]any{"error": result.failure.Response.Error})
+			body, _ := json.Marshal(map[string]any{"error": streamErr})
 			return nil, &routeAttemptFailure{
-				err:        &upstreamError{statusCode: status, body: body, retryAfter: result.retryAfter, headers: resp.Header.Clone()},
+				err:        &upstreamError{statusCode: status, body: body, retryAfter: result.retryAfter, headers: failureHeaders.Clone()},
 				delivery:   requestExplicitlyRejected,
 				progress:   upstreamProgressAllowedPreamble,
 				commitment: downstreamCommitmentNone,
@@ -941,10 +952,15 @@ func (h *ProxyHandler) prepareExplicitResponsesStream(ctx context.Context, opera
 		}
 	}
 	if hasResult && result.decision == responsesPeekDecisionTranslate && result.failure != nil {
+		// This terminal failure is intentionally not replay-safe (for example, it
+		// carries partial usage), so the route must not switch targets. The prepared
+		// body is aborted below and will never reach the downstream accounting tap;
+		// preserve any billable partial usage before translating the failure.
+		observeResponsesUsage(operation.inbound, result.failure.Response.Usage)
 		prepared.abort()
-		body, _ := json.Marshal(map[string]any{"error": result.failure.Response.Error})
+		body, _ := json.Marshal(map[string]any{"error": responsesStreamEventError(*result.failure)})
 		return nil, &routeAttemptFailure{
-			err:        &upstreamError{statusCode: result.status, body: body, retryAfter: result.retryAfter, headers: resp.Header.Clone()},
+			err:        &upstreamError{statusCode: result.status, body: body, retryAfter: result.retryAfter, headers: responsesFailureHeaders(*result.failure, resp.Header).Clone()},
 			delivery:   requestDeliveredOrAmbiguous,
 			progress:   upstreamProgressTerminalFailure,
 			commitment: downstreamCommitmentNone,
@@ -961,7 +977,9 @@ func (h *ProxyHandler) prepareExplicitResponsesStream(ctx context.Context, opera
 // semantic event, terminal event, timeout, or byte bound makes the target
 // irrevocable.
 func newResponsesPreparedStreamWithPolicy(resp *http.Response, maxPeekBytes int, observeTerminal, holdPreamble bool) *responsesPreparedStream {
-	return newResponsesPreparedStreamConfigured(resp, maxPeekBytes, observeTerminal, holdPreamble)
+	// Explicit priority routes commit at the configured peek byte bound. Legacy
+	// quota-aware preamble holding may use the larger compatibility cap.
+	return newResponsesPreparedStreamConfigured(resp, maxPeekBytes, observeTerminal, holdPreamble, maxPeekBytes)
 }
 
 func (s *responsesPreparedStream) abortAndWait(timeout time.Duration) bool {

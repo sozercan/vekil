@@ -262,9 +262,7 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, 
 					err:        fmt.Errorf("explicit model route %q cannot change model to %q", route.public.id, model),
 				}
 			}
-			if resolvedAlias {
-				model = route.public.id
-			} else {
+			if !resolvedAlias {
 				upstreamModel := strings.TrimSpace(model)
 				if pinned := operation.pinnedTarget(); pinned != "" {
 					if target, ok := route.targetByID(pinned); ok && target.provider != nil {
