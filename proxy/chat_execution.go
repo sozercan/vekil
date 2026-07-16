@@ -148,7 +148,19 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 		headers = make(http.Header)
 		headers.Set("Accept", "text/event-stream")
 	}
-	resp, err := h.postResolvedProviderRequest(ctx, route.provider, route.owner, providerEndpointResponses, requestBody, headers)
+	resp, err := h.postResolvedProviderRequest(ctx, route.provider, route.owner, route.nativeEndpoint, requestBody, headers)
+	if err != nil {
+		return chatExecutionResult{}, responsesChatExecutionErrorFromUpstream(err)
+	}
+	resp, err = h.maybeRetryResolvedResponsesWithoutUnverifiableEncryptedContent(
+		ctx,
+		route.provider,
+		route.owner,
+		route.nativeEndpoint,
+		requestBody,
+		headers,
+		resp,
+	)
 	if err != nil {
 		return chatExecutionResult{}, responsesChatExecutionErrorFromUpstream(err)
 	}

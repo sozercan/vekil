@@ -265,7 +265,7 @@ class Handler(BaseHTTPRequestHandler):
                 if body.get("tool_choice") != "required" or body.get("parallel_tool_calls") is not True:
                     self.send_json(400, fail("parallel request did not require parallel tools"))
                     return
-                self.send_json(200, chat_tools([call(PARALLEL_TOOLS[0]), call(PARALLEL_TOOLS[1])]))
+                self.send_json(200, chat_tools([call(PARALLEL_TOOLS[1]), call(PARALLEL_TOOLS[0])]))
                 return
             if len(tool_results) != 2 or not assistant_messages:
                 self.send_json(400, fail("parallel continuation shape mismatch"))
@@ -283,7 +283,7 @@ class Handler(BaseHTTPRequestHandler):
                 if body.get("tool_choice") != "required" or body.get("parallel_tool_calls") is not True:
                     self.send_json(400, fail("partial setup did not request both tools"))
                     return
-                self.send_json(200, chat_tools([call(PARTIAL_TOOLS[0]), call(PARTIAL_TOOLS[1])]))
+                self.send_json(200, chat_tools([call(PARTIAL_TOOLS[1]), call(PARTIAL_TOOLS[0])]))
                 return
             if len(tool_results) != 1 or not assistant_messages:
                 self.send_json(400, fail("partial continuation shape mismatch"))

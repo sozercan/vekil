@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
 
@@ -279,6 +280,77 @@ func (h *ProxyHandler) postResolvedProviderRequest(
 	return h.doWithRetry(func() (*http.Request, error) {
 		return h.newProviderJSONRequest(ctx, provider, http.MethodPost, endpoint, preparedBody, extraHeaders, "", owner)
 	})
+}
+
+// maybeRetryResolvedResponsesWithoutUnverifiableEncryptedContent mirrors the
+// native Responses retry contract while retaining an already-resolved provider,
+// model owner, and endpoint. Re-resolving from requestBody would route on the
+// already-rewritten upstream model instead of the public model that selected the
+// original route.
+func (h *ProxyHandler) maybeRetryResolvedResponsesWithoutUnverifiableEncryptedContent(
+	ctx context.Context,
+	provider *providerRuntime,
+	owner providerModel,
+	endpoint string,
+	requestBody []byte,
+	extraHeaders http.Header,
+	resp *http.Response,
+) (*http.Response, error) {
+	if resp == nil || resp.StatusCode != http.StatusBadRequest {
+		return resp, nil
+	}
+
+	respBodyPrefix, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(compactUpstreamErrorBodySize)+1))
+	if readErr != nil {
+		_ = resp.Body.Close()
+		if len(respBodyPrefix) > compactUpstreamErrorBodySize {
+			respBodyPrefix = respBodyPrefix[:compactUpstreamErrorBodySize]
+		}
+		cloned := cloneHTTPResponseWithBody(resp, respBodyPrefix)
+		cloned.Header.Del("Content-Length")
+		return cloned, nil
+	}
+	classificationBody := respBodyPrefix
+	if len(classificationBody) > compactUpstreamErrorBodySize {
+		classificationBody = classificationBody[:compactUpstreamErrorBodySize]
+	}
+	restoreOriginalResp := func() *http.Response {
+		cloned := new(http.Response)
+		*cloned = *resp
+		if resp.Header != nil {
+			cloned.Header = resp.Header.Clone()
+		}
+		cloned.Body = prefixedReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(respBodyPrefix), resp.Body),
+			close:  resp.Body.Close,
+		}
+		return cloned
+	}
+
+	if !isUnverifiableEncryptedContentError(resp.StatusCode, classificationBody) {
+		return restoreOriginalResp(), nil
+	}
+
+	retryBody, strippedItems := sanitizeResponsesUnverifiableEncryptedContentBody(requestBody)
+	if strippedItems == 0 {
+		return restoreOriginalResp(), nil
+	}
+
+	providerID := ""
+	if provider != nil {
+		providerID = provider.id
+	}
+	h.log.Info("retrying resolved Responses request without unverifiable encrypted content",
+		logger.F("encrypted_items_stripped", strippedItems),
+		logger.F("provider", providerID),
+	)
+	retryResp, retryErr := h.postResolvedProviderRequest(ctx, provider, owner, endpoint, retryBody, extraHeaders)
+	if retryErr != nil {
+		h.log.Debug("resolved Responses encrypted-content retry request failed", logger.Err(retryErr))
+		return restoreOriginalResp(), nil
+	}
+	_ = resp.Body.Close()
+	return retryResp, nil
 }
 
 func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body []byte) (*http.Response, error) {

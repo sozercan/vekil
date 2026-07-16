@@ -78,7 +78,8 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 	if !options.UsageOnly {
 		for index, rawItem := range envelope.Output {
 			var header struct {
-				Type string `json:"type"`
+				Type   string `json:"type"`
+				Status string `json:"status"`
 			}
 			if err := json.Unmarshal(rawItem, &header); err != nil {
 				return responsesChatJSONResult{}, newChatServerError("unsupported_responses_output", fmt.Sprintf("upstream output item %d is malformed", index))
@@ -88,6 +89,9 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 				// Hidden from Chat. Exact bytes are retained only when a later
 				// function-call group is published for replay.
 			case "message":
+				if err := validateResponsesChatMessageStatus(envelope.Status, header.Status); err != nil {
+					return responsesChatJSONResult{}, err
+				}
 				text, refusalText, err := responsesChatMessageContent(rawItem)
 				if err != nil {
 					return responsesChatJSONResult{}, err
@@ -193,6 +197,21 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 		return responsesChatJSONResult{}, newChatServerError("chat_body_too_large", "converted Chat response exceeds the JSON limit")
 	}
 	return responsesChatJSONResult{Response: response, Body: encoded, Usage: usage}, nil
+}
+
+func validateResponsesChatMessageStatus(responseStatus, messageStatus string) error {
+	responseStatus = strings.TrimSpace(responseStatus)
+	messageStatus = strings.TrimSpace(messageStatus)
+	switch responseStatus {
+	case "completed", "incomplete":
+		if messageStatus != responseStatus {
+			return newChatServerError(
+				"unsupported_responses_output",
+				fmt.Sprintf("assistant message status %q is incompatible with Responses status %q", messageStatus, responseStatus),
+			)
+		}
+	}
+	return nil
 }
 
 func responsesChatMessageContent(raw json.RawMessage) (string, string, error) {

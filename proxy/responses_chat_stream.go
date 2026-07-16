@@ -332,6 +332,7 @@ type responsesChatTextPart struct {
 type responsesChatMessageState struct {
 	outputIndex int
 	done        bool
+	doneStatus  string
 	parts       map[int]*responsesChatTextPart
 }
 
@@ -873,9 +874,11 @@ func (s *responsesChatStreamState) handleOutputItemDone(data []byte) (responsesC
 				return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "assistant message completed before its content")
 			}
 		}
-		if err := validateResponsesChatTerminalMessage(event.Item, message); err != nil {
+		status, err := validateResponsesChatTerminalMessage(event.Item, message)
+		if err != nil {
 			return responsesChatStreamTransition{}, err
 		}
+		message.doneStatus = status
 		message.done = true
 	case "function_call":
 		tool := s.toolsByIndex[*event.OutputIndex]
@@ -968,7 +971,14 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 			if message == nil {
 				return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "terminal assistant message was not streamed")
 			}
-			if err := validateResponsesChatTerminalMessage(raw, message); err != nil {
+			status, err := validateResponsesChatTerminalMessage(raw, message)
+			if err != nil {
+				return responsesChatStreamTransition{}, err
+			}
+			if status != message.doneStatus {
+				return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "terminal assistant message status does not match response.output_item.done")
+			}
+			if err := validateResponsesChatMessageStatus(terminalStatus, status); err != nil {
 				return responsesChatStreamTransition{}, err
 			}
 			text, refusal, err := responsesChatMessageContent(raw)
@@ -1149,11 +1159,12 @@ func (p *responsesChatTextPart) matchesValue(value string) bool {
 	return string(p.digest.Sum(nil)) == string(want[:])
 }
 
-func validateResponsesChatTerminalMessage(raw json.RawMessage, message *responsesChatMessageState) error {
+func validateResponsesChatTerminalMessage(raw json.RawMessage, message *responsesChatMessageState) (string, error) {
 	var item struct {
 		Type    string `json:"type"`
 		ID      string `json:"id"`
 		Role    string `json:"role"`
+		Status  string `json:"status"`
 		Content []struct {
 			Type    string `json:"type"`
 			Text    string `json:"text"`
@@ -1161,22 +1172,22 @@ func validateResponsesChatTerminalMessage(raw json.RawMessage, message *response
 		} `json:"content"`
 	}
 	if err := json.Unmarshal(raw, &item); err != nil || message == nil || item.Type != "message" || item.Role != "assistant" || len(item.Content) != len(message.parts) {
-		return newChatServerError("unsupported_responses_output", "terminal assistant message does not match the streamed output")
+		return "", newChatServerError("unsupported_responses_output", "terminal assistant message does not match the streamed output")
 	}
 	for contentIndex, content := range item.Content {
 		part := message.parts[contentIndex]
 		if part == nil || content.Type != part.kind {
-			return newChatServerError("unsupported_responses_output", "terminal assistant message does not match the streamed output")
+			return "", newChatServerError("unsupported_responses_output", "terminal assistant message does not match the streamed output")
 		}
 		value := content.Text
 		if part.kind == "refusal" {
 			value = content.Refusal
 		}
 		if !part.matchesValue(value) {
-			return newChatServerError("unsupported_responses_output", "terminal assistant message does not match the streamed output")
+			return "", newChatServerError("unsupported_responses_output", "terminal assistant message does not match the streamed output")
 		}
 	}
-	return nil
+	return strings.TrimSpace(item.Status), nil
 }
 
 func runResponsesChatStream(writer *chatStreamEventWriter, control *responsesChatStreamControl, readCh <-chan responsesChatStreamRead, readyCh chan<- responsesChatStreamReady, config responsesChatStreamConfig) {

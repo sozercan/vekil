@@ -7633,7 +7633,7 @@ func TestHandleOpenAIChatCompletions_ServesConfiguredAzureResponsesModel(t *test
 			t.Fatalf("upstream model = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"resp-azure-chat","created_at":1700000000,"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"azure responses chat"}]}],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}`))
+		_, _ = w.Write([]byte(`{"id":"resp-azure-chat","created_at":1700000000,"status":"completed","output":[{"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"azure responses chat"}]}],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}`))
 	}))
 	defer upstream.Close()
 
@@ -7832,7 +7832,7 @@ func TestHandleOpenAIChatCompletions_ServesOpenAICodexProvider(t *testing.T) {
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/responses"):
 			responsePosts++
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"resp-codex-chat","created_at":1700000000,"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"codex responses chat"}]}],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}`))
+			_, _ = w.Write([]byte(`{"id":"resp-codex-chat","created_at":1700000000,"status":"completed","output":[{"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"codex responses chat"}]}],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}`))
 		default:
 			t.Fatalf("unexpected Codex request %s %s", r.Method, r.URL.Path)
 		}

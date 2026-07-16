@@ -139,7 +139,7 @@ func TestTranslateResponsesJSONToChatOutputMatrix(t *testing.T) {
 	})
 
 	t.Run("refusal text is visible", func(t *testing.T) {
-		body := []byte(`{"id":"resp_refusal","created_at":1700000000,"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"Synthetic refusal."}]}]}`)
+		body := []byte(`{"id":"resp_refusal","created_at":1700000000,"status":"completed","output":[{"type":"message","status":"completed","role":"assistant","content":[{"type":"refusal","refusal":"Synthetic refusal."}]}]}`)
 		result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{PublicModel: "gpt-public"})
 		if err != nil {
 			t.Fatal(err)

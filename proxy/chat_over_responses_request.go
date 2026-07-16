@@ -629,7 +629,7 @@ func compactChatToolOutput(raw json.RawMessage, messageIndex int) (string, error
 				var probe struct {
 					Type string `json:"type"`
 				}
-				if json.Unmarshal(partRaw, &probe) != nil || strings.TrimSpace(probe.Type) == "" {
+				if json.Unmarshal(partRaw, &probe) != nil || probe.Type != "text" {
 					looksLikeContentParts = false
 					break
 				}

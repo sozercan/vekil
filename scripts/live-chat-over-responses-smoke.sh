@@ -507,13 +507,26 @@ run_parallel_tool_case() {
   local initial_response
   initial_response="$(post_chat parallel-initial "${initial_request}")"
   extract_tool_calls "${initial_response}" "${calls}" 2 parallel-initial
-  jq -e --arg left "${PARALLEL_LEFT_TOOL}" --arg right "${PARALLEL_RIGHT_TOOL}" 'map(.function.name) == [$left,$right]' "${calls}" >/dev/null || {
+  jq -e --arg left "${PARALLEL_LEFT_TOOL}" --arg right "${PARALLEL_RIGHT_TOOL}" '
+    length == 2
+    and ([.[].function.name] | sort) == ([$left, $right] | sort)
+    and ([.[].function.name] | unique | length) == 2
+  ' "${calls}" >/dev/null || {
     dump_redacted_file "parallel-initial.tool-calls.json" "${calls}"
-    die "parallel initial response did not return both tools in the declared order"
+    die "parallel initial response did not return each declared tool exactly once"
   }
 
   local continuation_request="${SMOKE_DIR}/parallel-continuation.request.json"
-  jq -n --arg model "${CHAT_MODEL}" --arg marker "${PARALLEL_MARKER}" --slurpfile tools "${tools}" --slurpfile calls "${calls}" '{model:$model,max_completion_tokens:768,stream:false,parallel_tool_calls:true,messages:[{role:"system",content:"Call both available tools once and wait for both results. Never invent tool results."},{role:"user",content:("Call both tools. After both results arrive, reply with exactly " + $marker)},{role:"assistant",content:null,tool_calls:$calls[0]},{role:"tool",tool_call_id:$calls[0][1].id,content:($marker + "_RIGHT")},{role:"tool",tool_call_id:$calls[0][0].id,content:($marker + "_LEFT")}],tools:$tools[0],tool_choice:"none"}' > "${continuation_request}"
+  jq -n --arg model "${CHAT_MODEL}" --arg marker "${PARALLEL_MARKER}" --arg left "${PARALLEL_LEFT_TOOL}" --arg right "${PARALLEL_RIGHT_TOOL}" --slurpfile tools "${tools}" --slurpfile calls "${calls}" '
+    ($calls[0] | map({key:.function.name,value:.id}) | from_entries) as $ids
+    | {model:$model,max_completion_tokens:768,stream:false,parallel_tool_calls:true,messages:[
+        {role:"system",content:"Call both available tools once and wait for both results. Never invent tool results."},
+        {role:"user",content:("Call both tools. After both results arrive, reply with exactly " + $marker)},
+        {role:"assistant",content:null,tool_calls:$calls[0]},
+        {role:"tool",tool_call_id:$ids[$right],content:($marker + "_RIGHT")},
+        {role:"tool",tool_call_id:$ids[$left],content:($marker + "_LEFT")}
+      ],tools:$tools[0],tool_choice:"none"}
+  ' > "${continuation_request}"
   local continuation_response
   continuation_response="$(post_chat parallel-continuation "${continuation_request}")"
   assert_chat_text "${continuation_response}" "${PARALLEL_MARKER}" parallel-continuation
@@ -529,18 +542,34 @@ run_partial_tool_case() {
   local initial_response
   initial_response="$(post_chat partial-initial "${initial_request}")"
   extract_tool_calls "${initial_response}" "${calls}" 2 partial-initial
-  jq -e --arg left "${PARTIAL_LEFT_TOOL}" --arg right "${PARTIAL_RIGHT_TOOL}" 'map(.function.name) == [$left,$right]' "${calls}" >/dev/null || {
+  jq -e --arg left "${PARTIAL_LEFT_TOOL}" --arg right "${PARTIAL_RIGHT_TOOL}" '
+    length == 2
+    and ([.[].function.name] | sort) == ([$left, $right] | sort)
+    and ([.[].function.name] | unique | length) == 2
+  ' "${calls}" >/dev/null || {
     dump_redacted_file "partial-initial.tool-calls.json" "${calls}"
-    die "partial initial response did not return both tools"
+    die "partial initial response did not return each declared tool exactly once"
   }
 
   local continuation_request="${SMOKE_DIR}/partial-continuation.request.json"
   local reissued_calls="${SMOKE_DIR}/partial-continuation.tool-calls.json"
-  jq -n --arg model "${CHAT_MODEL}" --arg missing "${PARTIAL_RIGHT_TOOL}" --slurpfile tools "${tools}" --slurpfile calls "${calls}" '{model:$model,max_completion_tokens:768,stream:false,parallel_tool_calls:true,messages:[{role:"system",content:"Call both available tools once."},{role:"user",content:"Call both tools, then reissue only a missing tool when one result is provided."},{role:"assistant",content:null,tool_calls:$calls[0]},{role:"tool",tool_call_id:$calls[0][0].id,content:"LEFT_RESULT_AVAILABLE"}],tools:$tools[0],tool_choice:{type:"function",function:{name:$missing}}}' > "${continuation_request}"
+  jq -n --arg model "${CHAT_MODEL}" --arg completed "${PARTIAL_LEFT_TOOL}" --arg missing "${PARTIAL_RIGHT_TOOL}" --slurpfile tools "${tools}" --slurpfile calls "${calls}" '
+    ($calls[0] | map({key:.function.name,value:.id}) | from_entries) as $ids
+    | {model:$model,max_completion_tokens:768,stream:false,parallel_tool_calls:true,messages:[
+        {role:"system",content:"Call both available tools once."},
+        {role:"user",content:"Call both tools, then reissue only a missing tool when one result is provided."},
+        {role:"assistant",content:null,tool_calls:$calls[0]},
+        {role:"tool",tool_call_id:$ids[$completed],content:"LEFT_RESULT_AVAILABLE"}
+      ],tools:$tools[0],tool_choice:{type:"function",function:{name:$missing}}}
+  ' > "${continuation_request}"
   local continuation_response
   continuation_response="$(post_chat partial-continuation "${continuation_request}")"
   extract_tool_calls "${continuation_response}" "${reissued_calls}" 1 partial-continuation
-  jq -e --arg missing "${PARTIAL_RIGHT_TOOL}" --slurpfile original "${calls}" '. == [{id:.[0].id,type:"function",function:{name:$missing,arguments:"{}"}}] and .[0].id != $original[0][1].id' "${reissued_calls}" >/dev/null || {
+  jq -e --arg missing "${PARTIAL_RIGHT_TOOL}" --slurpfile original "${calls}" '
+    ($original[0] | map({key:.function.name,value:.id}) | from_entries) as $ids
+    | . == [{id:.[0].id,type:"function",function:{name:$missing,arguments:"{}"}}]
+      and .[0].id != $ids[$missing]
+  ' "${reissued_calls}" >/dev/null || {
     dump_redacted_file "partial-continuation.tool-calls.json" "${reissued_calls}"
     die "partial continuation did not reissue only the missing call with a fresh proxy ID"
   }
