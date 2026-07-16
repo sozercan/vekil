@@ -418,6 +418,12 @@ func TranslateOpenAIToAnthropic(resp *models.OpenAIResponse, model string) *mode
 				})
 			}
 		}
+		if len(msg.Refusal) > 0 {
+			var refusal string
+			if err := json.Unmarshal(msg.Refusal, &refusal); err == nil && strings.TrimSpace(refusal) != "" {
+				content = append(content, models.ContentBlock{Type: "text", Text: stringPtr(refusal)})
+			}
+		}
 
 		// Add tool_use blocks
 		for _, tc := range msg.ToolCalls {

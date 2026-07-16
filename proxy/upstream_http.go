@@ -184,16 +184,33 @@ func (h *ProxyHandler) resolveProviderRequestForModel(body []byte, endpoint stri
 		}
 	}
 
+	rewrittenBody, err := prepareResolvedProviderRequestBody(body, model, endpoint, provider, owner)
+	if err != nil {
+		return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+	}
+	return provider, owner, rewrittenBody, nil
+}
+
+func prepareResolvedProviderRequestBody(
+	body []byte,
+	requestModel string,
+	endpoint string,
+	provider *providerRuntime,
+	owner providerModel,
+) ([]byte, error) {
+	if provider == nil {
+		return nil, fmt.Errorf("provider is required")
+	}
+
 	rewrittenBody := body
 	if !providerUsesAzureClassicDeploymentPath(provider, endpoint) {
 		var err error
-		rewrittenBody, _, err = rewriteRequestModelForProviderFromModel(body, model, owner.upstreamModel)
+		rewrittenBody, _, err = rewriteRequestModelForProviderFromModel(body, requestModel, owner.upstreamModel)
 		if err != nil {
-			return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+			return nil, err
 		}
 	}
-	rewrittenBody = applyProviderModelRequestPolicy(rewrittenBody, endpoint, owner)
-	return provider, owner, rewrittenBody, nil
+	return applyProviderModelRequestPolicy(rewrittenBody, endpoint, owner), nil
 }
 
 func applyProviderModelRequestPolicy(body []byte, endpoint string, owner providerModel) []byte {
@@ -239,6 +256,31 @@ func applyProviderModelRequestPolicy(body []byte, endpoint string, owner provide
 	return rewritten
 }
 
+func (h *ProxyHandler) postResolvedProviderRequest(
+	ctx context.Context,
+	provider *providerRuntime,
+	owner providerModel,
+	endpoint string,
+	body []byte,
+	extraHeaders http.Header,
+) (*http.Response, error) {
+	if provider == nil {
+		return nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider is required")}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	preparedBody, err := prepareResolvedProviderRequestBody(body, extractRequestModel(body), endpoint, provider, owner)
+	if err != nil {
+		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+	}
+
+	return h.doWithRetry(func() (*http.Request, error) {
+		return h.newProviderJSONRequest(ctx, provider, http.MethodPost, endpoint, preparedBody, extraHeaders, "", owner)
+	})
+}
+
 func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body []byte) (*http.Response, error) {
 	return h.postJSONEndpointWithHeaders(ctx, path, body, nil)
 }
@@ -260,10 +302,6 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, 
 		}
 		return req, nil
 	})
-}
-
-func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
-	return h.postJSONEndpoint(ctx, providerEndpointChatCompletions, body)
 }
 
 func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {

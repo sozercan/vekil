@@ -1,0 +1,41 @@
+{
+  "id": "resp_synth_text_001",
+  "object": "response",
+  "created_at": 1700000000,
+  "status": "completed",
+  "error": null,
+  "incomplete_details": null,
+  "model": "gpt-synthetic-responses",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_synth_text_001",
+      "status": "completed",
+      "role": "assistant",
+      "phase": "final_answer",
+      "content": [
+        {
+          "type": "output_text",
+          "annotations": [],
+          "logprobs": [],
+          "text": "Synthetic fixture text response."
+        }
+      ]
+    }
+  ],
+  "parallel_tool_calls": true,
+  "usage": {
+    "input_tokens": 11,
+    "input_tokens_details": {
+      "cached_tokens": 3
+    },
+    "output_tokens": 6,
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "total_tokens": 17
+  },
+  "metadata": {
+    "fixture": "nonstream-text"
+  }
+}

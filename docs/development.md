@@ -26,13 +26,26 @@ scripts/tests/live-smoke-reliability-test.sh  # deterministic mock-server/fake-C
 
 `cmd/compaction-lab` starts an in-process proxy and fake `/responses` upstream, then exercises the compact-response shape, opaque compaction replay, remote compaction v2 trigger handling, and websocket `response.processed` control frames. It is intended as a quick deterministic check for compaction regressions before running live Copilot smoke tests.
 
+For the Chat-over-Responses routing, conversion, replay, streaming, and public-ingress matrix, use:
+
+```bash
+go test ./proxy/ -run 'ChatRoute|ChatExecution|ChatOverResponses|ResponsesBacked|ResponsesChatReplay|ResponsesChatStream|InsightModel' -count=1
+go test -race ./proxy/ -run 'ChatRoute|ChatExecution|ChatOverResponses|ResponsesBacked|ResponsesChatReplay|ResponsesChatStream|InsightModel' -count=1
+go test ./proxy/ -run '^$' -fuzz 'FuzzTranslateChatRequestToResponses' -fuzztime=20s
+```
+
+The focused tests cover native-Chat preference, provider-local cold discovery, strict `MAP`/`LOCAL`/`REJECT` input handling, opaque replay IDs, full/reordered/partial parallel tool results, restart/state-loss errors, typed event streaming, Anthropic/Gemini ingress, count-token probes, and dashboard-compatible routing.
+
 ## Benchmarks
 
 ```bash
 go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesWebSocketRequestBuild' -benchmem -count=1
 go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesTransport' -benchmem -count=1
 go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesSession' -benchmem -count=1
+go test ./proxy/ -run '^$' -bench 'BenchmarkChatOverResponses' -benchmem -count=3
 ```
+
+The Chat-over-Responses benchmark regex includes permanent text-stream, fragmented function-argument, and interleaved parallel-tool cases. It also keeps the Phase 0 transport comparison available for regression work; review `ns/op`, `B/op`, and `allocs/op`, and do not introduce buffering proportional to the completed stream size.
 
 ## Lint
 
@@ -144,6 +157,8 @@ You can also run the same smoke scripts locally after building `vekil`; the CLI 
 
 - Register the provider kind in `proxy/providers.go` and its endpoint policy in `proxy/provider_endpoint_policy.go`.
 - Keep upstream deployment names internal to provider config; public model IDs remain global.
-- Treat `models[].endpoints` as a verified allowlist. Do not advertise routes that have not been tested for that provider/model.
+- Treat `models[].endpoints` as a verified **native** allowlist. Do not add `/chat/completions` merely because Vekil can emulate Chat through a native Responses model.
+- Keep Chat backend selection and Responses conversion inside the deep execution seam (`chat_execution.go`, `chat_route*.go`, and `chat_over_responses_*.go`); Anthropic and Gemini handlers should consume canonical Chat results rather than Responses events directly.
+- Responses-backed Chat must reject unsupported fields instead of silently dropping them, preserve opaque replay IDs/state bounds, and use the typed internal Chat event transport for streams.
 - Preserve startup failure on public-model-ID collisions.
 - Cross-link config examples in [`provider-routing.md`](provider-routing.md) instead of duplicating YAML here.

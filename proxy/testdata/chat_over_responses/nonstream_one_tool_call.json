@@ -1,0 +1,34 @@
+{
+  "id": "resp_synth_one_tool_001",
+  "object": "response",
+  "created_at": 1700000000,
+  "status": "completed",
+  "error": null,
+  "incomplete_details": null,
+  "model": "gpt-synthetic-responses",
+  "output": [
+    {
+      "type": "function_call",
+      "id": "fc_synth_lookup_001",
+      "call_id": "call_synth_lookup_001",
+      "name": "lookup_synthetic_widget",
+      "arguments": "{\"widget\":\"alpha-fixture\"}",
+      "status": "completed"
+    }
+  ],
+  "parallel_tool_calls": true,
+  "usage": {
+    "input_tokens": 20,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens": 9,
+    "output_tokens_details": {
+      "reasoning_tokens": 4
+    },
+    "total_tokens": 29
+  },
+  "metadata": {
+    "fixture": "nonstream-one-tool-call"
+  }
+}

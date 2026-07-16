@@ -40,6 +40,18 @@ This websocket bridge is a proxy transport adaptation layered over upstream HTTP
 
 See [responses-websocket.md](responses-websocket.md) for tuning flags.
 
+## Chat compatibility over a native Responses model
+
+A model that natively allows `/responses` but not `/chat/completions` can also serve Vekil's Chat-compatible public surfaces: OpenAI Chat Completions, translated Anthropic Messages, translated Gemini generation, both translated count-token probes, and dashboard insights. Native Chat remains preferred when a model supports both endpoints.
+
+This adapter uses low-level provider transport to `/responses`; it does **not** call the public `POST /v1/responses` handler and therefore does not enter compaction expansion, replay-`413` summarization, websocket session state, lineage reset, or the public Responses tool-optimizer pipeline. Its streaming decoder emits typed internal Chat events that the OpenAI, Anthropic, and Gemini adapters consume directly rather than synthesizing and reparsing Chat SSE.
+
+Provider metadata remains native. `models[].endpoints` and rendered `supported_endpoints` are not expanded with `/chat/completions`, `/v1/messages`, or Gemini paths. A Responses-only Azure or OpenAI Codex model should continue to advertise only `/responses`; compatibility is a Vekil serving behavior, not a claim about upstream native routes.
+
+The Chat adapter is intentionally narrower than direct Responses passthrough. It accepts only the strict field subset in [API Reference](api.md#responses-backed-chat-request-subset), supports function tools only, rejects hosted tools, and rejects non-empty `stop` rather than emulating stop matching locally. Tool continuations use opaque `call_vekil_...` IDs and a separate one-hour, byte-bounded, process-local replay store. That replay state is unrelated to direct Responses `previous_response_id`, compaction checkpoints, or websocket history and is lost when Vekil restarts.
+
+For privacy and stateless continuation, omitted Chat storage is materialized as `store: false`, and the adapter internally requests encrypted reasoning content. Streamed replay state is charged cumulatively while deltas arrive, so item, call, and byte limits fail before unbounded in-memory growth. Hidden reasoning-progress events are validated and suppressed; authoritative terminal reasoning items are retained only when a function-call turn needs replay.
+
 ## `POST /v1/responses/compact`
 
 Compatibility shim for environments expecting `/responses/compact`. The proxy rewrites the request into a normal upstream `/responses` call with a compaction prompt, then returns:

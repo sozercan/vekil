@@ -283,6 +283,9 @@ type ProxyHandler struct {
 	maxRetries                       int
 	retryBaseDelay                   time.Duration
 	models                           modelsCache
+	chatRoutes                       chatRouteDiscoveryCache
+	responsesChatReplayMu            sync.Mutex
+	responsesChatReplay              *responsesChatReplayStore
 	geminiCounts                     geminiCountTokensCache
 	stats                            *statsCollector
 	insightGate                      *insightGate
@@ -307,6 +310,33 @@ func (h *ProxyHandler) lifecycleContext() context.Context {
 	}
 	h.initializeLifecycle()
 	return h.lifecycleCtx
+}
+
+func (h *ProxyHandler) responsesChatReplayStore() *responsesChatReplayStore {
+	if h == nil {
+		return nil
+	}
+	h.responsesChatReplayMu.Lock()
+	defer h.responsesChatReplayMu.Unlock()
+	if h.responsesChatReplay == nil && !h.ShuttingDown() {
+		h.responsesChatReplay = newResponsesChatReplayStore()
+	}
+	return h.responsesChatReplay
+}
+
+// closeResponsesChatReplayStore clears process-local tool replay only after
+// graceful HTTP shutdown has drained request handlers. Closing it in
+// BeginShutdown would race in-flight Responses-backed streams publishing their
+// terminal tool calls and misclassify local shutdown as a provider failure.
+func (h *ProxyHandler) closeResponsesChatReplayStore() {
+	if h == nil {
+		return
+	}
+	h.responsesChatReplayMu.Lock()
+	defer h.responsesChatReplayMu.Unlock()
+	if h.responsesChatReplay != nil {
+		_ = h.responsesChatReplay.Close()
+	}
 }
 
 // BeginShutdown idempotently cancels proxy-owned upstream work. Existing and
@@ -434,10 +464,18 @@ func (h *ProxyHandler) endLifecycleWorker() {
 // preventing a WaitGroup Add/Wait race while shutdown starts. Already-complete
 // work wins over an expired shutdown context so repeated Stop calls do not add
 // a duplicate deadline error.
-func (h *ProxyHandler) WaitLifecycleWorkers(ctx context.Context) error {
+func (h *ProxyHandler) WaitLifecycleWorkers(ctx context.Context) (err error) {
 	if h == nil {
 		return nil
 	}
+	// Server.stop calls this after http.Server.Shutdown. Clear replay state only
+	// after a successful, non-expired drain; a forced-close timeout can still have
+	// handler goroutines unwinding from lifecycle cancellation.
+	defer func() {
+		if err == nil && h.ShuttingDown() && (ctx == nil || ctx.Err() == nil) {
+			h.closeResponsesChatReplayStore()
+		}
+	}()
 	h.lifecycleWorkersMu.Lock()
 	if h.lifecycleWorkersActive == 0 {
 		h.lifecycleWorkersMu.Unlock()
@@ -779,6 +817,8 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		azureIdentityTokenSourceFactory: newDefaultAzureIdentityTokenSource,
 		responsesWS:                     DefaultResponsesWebSocketConfig(),
 		streamingUpstreamTimeout:        streamingUpstreamTimeout,
+		chatRoutes:                      newChatRouteDiscoveryCache(),
+		responsesChatReplay:             newResponsesChatReplayStore(),
 		log:                             log,
 		stats:                           newStatsCollector(),
 	}
@@ -804,28 +844,17 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 // at startup instead of silently failing on the first click.
 func (h *ProxyHandler) validateInsightModel() {
 	model := strings.TrimSpace(h.providersConfig.InsightModel)
-	if model == "" || h.log == nil {
+	if model == "" || h.log == nil || h.DynamicProviderValidationPending() {
 		return
 	}
 	provider, owner, known := h.resolveProviderModel(model, providerEndpointChatCompletions)
-	switch {
-	case provider == nil:
-		h.log.Info("dashboard insight_model is not served by any configured provider; insights will not work",
-			logger.F("insight_model", model))
-	case !provider.supportsEndpoint(providerEndpointChatCompletions):
-		h.log.Info("dashboard insight_model provider does not support /chat/completions; insights will not work",
-			logger.F("insight_model", model), logger.F("provider", provider.id))
-	case known && !providerModelSupportsEndpoint(owner, providerEndpointChatCompletions):
-		h.log.Info("dashboard insight_model is /responses-only and cannot be reached via /chat/completions; insights will not work",
-			logger.F("insight_model", model), logger.F("provider", provider.id))
-	case !known && !provider.allowsUnknownModelEndpoint(providerEndpointChatCompletions):
-		// The model is not declared by any provider and fell back to the default
-		// provider, which does not accept unknown models on /chat/completions — so
-		// resolveProviderRequest will reject the insight call. Mirror that check
-		// here so a misspelled static insight_model surfaces at startup instead of
-		// only soft-failing on the first dashboard click.
-		h.log.Info("dashboard insight_model is not a known model for its provider; insights will not work",
-			logger.F("insight_model", model), logger.F("provider", provider.id))
+	if _, err := chooseChatRoute(provider, owner, known, model); err != nil {
+		providerID := ""
+		if provider != nil {
+			providerID = provider.id
+		}
+		h.log.Info("dashboard insight_model cannot be served through Chat compatibility; insights will not work",
+			logger.F("insight_model", model), logger.F("provider", providerID), logger.Err(err))
 	}
 }
 

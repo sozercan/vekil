@@ -29,13 +29,15 @@ func newTestProxyHandler(t testing.TB, backend http.HandlerFunc) *ProxyHandler {
 	t.Helper()
 	server := httptest.NewServer(backend)
 	t.Cleanup(server.Close)
-	return &ProxyHandler{
+	h := &ProxyHandler{
 		auth:           auth.NewTestAuthenticator("test-token"),
 		client:         server.Client(),
 		copilotURL:     server.URL,
 		log:            logger.New(logger.LevelInfo),
 		retryBaseDelay: 1 * time.Millisecond,
 	}
+	disableColdChatRouteDiscoveryForLegacyTest(h)
+	return h
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -57,13 +59,23 @@ func (c *observedDoneContext) Done() <-chan struct{} {
 
 func newRoundTripTestProxyHandler(t testing.TB, transport roundTripFunc) *ProxyHandler {
 	t.Helper()
-	return &ProxyHandler{
+	h := &ProxyHandler{
 		auth:           auth.NewTestAuthenticator("test-token"),
 		client:         &http.Client{Transport: transport},
 		copilotURL:     "http://upstream.test",
 		log:            logger.New(logger.LevelInfo),
 		retryBaseDelay: 1 * time.Millisecond,
 	}
+	disableColdChatRouteDiscoveryForLegacyTest(h)
+	return h
+}
+
+func disableColdChatRouteDiscoveryForLegacyTest(h *ProxyHandler) {
+	if h == nil {
+		return
+	}
+	h.chatRoutes = newChatRouteDiscoveryCache()
+	h.chatRoutes.providers["copilot"] = &chatRouteProviderDiscovery{successUntil: time.Now().Add(24 * time.Hour)}
 }
 
 type trackingReadCloser struct {
@@ -7604,28 +7616,44 @@ func TestHandleModels_GenericOpenRouterToolsDiscoveryFiltersToolModels(t *testin
 	}
 }
 
-func TestHandleOpenAIChatCompletions_RejectsConfiguredAzureModelWithoutChatSupport(t *testing.T) {
+func TestHandleOpenAIChatCompletions_ServesConfiguredAzureResponsesModel(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/openai/responses"; got != want {
+			t.Fatalf("upstream path = %q, want %q", got, want)
+		}
+		if got := r.URL.Query().Get("api-version"); got != "2025-04-01-preview" {
+			t.Fatalf("api-version = %q", got)
+		}
+		var request map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if got := jsonRawString(request["model"]); got != "gpt-5.4-pro" {
+			t.Fatalf("upstream model = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-azure-chat","created_at":1700000000,"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"azure responses chat"}]}],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}`))
+	}))
+	defer upstream.Close()
 
 	handler, err := NewProxyHandler(
 		auth.NewTestAuthenticator("test-token"),
 		logger.New(logger.LevelInfo),
-		WithProvidersConfig(ProvidersConfig{
-			Providers: []ProviderConfig{{
-				ID:         "azure",
-				Type:       "azure-openai",
-				Default:    true,
-				BaseURL:    "https://example.openai.azure.com/openai",
-				APIVersion: "2025-04-01-preview",
-				APIKeyEnv:  "TEST_AZURE_API_KEY",
-				Models: []ProviderModelConfig{{
-					PublicID:   "gpt-5.4-pro",
-					Deployment: "gpt-5.4-pro",
-					Endpoints:  []string{"/responses"},
-					Name:       "GPT-5.4 Pro",
-				}},
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:         "azure",
+			Type:       "azure-openai",
+			Default:    true,
+			BaseURL:    upstream.URL + "/openai",
+			APIVersion: "2025-04-01-preview",
+			APIKeyEnv:  "TEST_AZURE_API_KEY",
+			Models: []ProviderModelConfig{{
+				PublicID:   "gpt-5.4-pro",
+				Deployment: "gpt-5.4-pro",
+				Endpoints:  []string{"/responses"},
+				Name:       "GPT-5.4 Pro",
 			}},
-		}),
+		}}}),
 	)
 	if err != nil {
 		t.Fatalf("NewProxyHandler returned error: %v", err)
@@ -7637,25 +7665,19 @@ func TestHandleOpenAIChatCompletions_RejectsConfiguredAzureModelWithoutChatSuppo
 	}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-
 	handler.HandleOpenAIChatCompletions(w, req)
 
 	resp := w.Result()
-	if resp.StatusCode != http.StatusBadRequest {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
 	}
-
-	var errResp struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
+	var result models.OpenAIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
-		t.Fatalf("decode error response: %v", err)
-	}
-	if !strings.Contains(errResp.Error.Message, `does not support /chat/completions`) {
-		t.Fatalf("expected unsupported endpoint message, got %q", errResp.Error.Message)
+	if result.Model != "gpt-5.4-pro" || len(result.Choices) != 1 || string(result.Choices[0].Message.Content) != `"azure responses chat"` {
+		t.Fatalf("response = %+v", result)
 	}
 }
 
@@ -7795,27 +7817,37 @@ func TestHandleResponses_RoutesConfiguredOpenAICodexProvider(t *testing.T) {
 	}
 }
 
-func TestHandleOpenAIChatCompletions_RejectsOpenAICodexProvider(t *testing.T) {
+func TestHandleOpenAIChatCompletions_ServesOpenAICodexProvider(t *testing.T) {
 	codexHome := t.TempDir()
 	writeTestOpenAICodexAuth(t, codexHome, testOpenAICodexTokens(t, time.Now().Add(time.Hour), "acct-123", false, "refresh-token"))
 	t.Setenv("CODEX_HOME", codexHome)
 
+	var modelFetches, responsePosts int
 	codexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatalf("OpenAI Codex upstream should not be called for chat completions")
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/models"):
+			modelFetches++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"models":[{"slug":"gpt-5.5","display_name":"GPT-5.5","visibility":"list","supported_in_api":true,"supported_reasoning_levels":[{"effort":"medium"}],"supports_parallel_tool_calls":true,"context_window":272000}]}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/responses"):
+			responsePosts++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-codex-chat","created_at":1700000000,"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"codex responses chat"}]}],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}`))
+		default:
+			t.Fatalf("unexpected Codex request %s %s", r.Method, r.URL.Path)
+		}
 	}))
 	defer codexServer.Close()
 
 	handler, err := NewProxyHandler(
 		auth.NewTestAuthenticator("test-token"),
 		logger.New(logger.LevelInfo),
-		WithProvidersConfig(ProvidersConfig{
-			Providers: []ProviderConfig{{
-				ID:      "codex",
-				Type:    "openai-codex",
-				Default: true,
-				BaseURL: codexServer.URL,
-			}},
-		}),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:      "codex",
+			Type:    "openai-codex",
+			Default: true,
+			BaseURL: codexServer.URL,
+		}}}),
 	)
 	if err != nil {
 		t.Fatalf("NewProxyHandler returned error: %v", err)
@@ -7827,25 +7859,22 @@ func TestHandleOpenAIChatCompletions_RejectsOpenAICodexProvider(t *testing.T) {
 	}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-
 	handler.HandleOpenAIChatCompletions(w, req)
 
 	resp := w.Result()
-	if resp.StatusCode != http.StatusBadRequest {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
 	}
-
-	var errResp struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
+	if modelFetches != 1 || responsePosts != 1 {
+		t.Fatalf("model fetches/posts = %d/%d, want 1/1", modelFetches, responsePosts)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
-		t.Fatalf("decode error response: %v", err)
+	var result models.OpenAIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
 	}
-	if !strings.Contains(errResp.Error.Message, `provider "codex" does not support /chat/completions`) {
-		t.Fatalf("expected provider unsupported endpoint message, got %q", errResp.Error.Message)
+	if result.Model != "gpt-5.5" || string(result.Choices[0].Message.Content) != `"codex responses chat"` {
+		t.Fatalf("response = %+v", result)
 	}
 }
 
@@ -8751,9 +8780,13 @@ func TestHandleModels_CanonicalCatalogOwnsRoutingAcrossQueryVariants(t *testing.
 		t.Fatalf("routing owner for model-b = %+v, %v; want dynamic owner matching cached canonical catalog", owner, ok)
 	}
 
-	resp, err := handler.postChatCompletions(context.Background(), []byte(`{"model":"model-b","messages":[{"role":"user","content":"hello"}]}`))
+	route, err := handler.resolveChatRoute(context.Background(), "model-b")
 	if err != nil {
-		t.Fatalf("postChatCompletions(model-b) error = %v", err)
+		t.Fatalf("resolveChatRoute(model-b) error = %v", err)
+	}
+	resp, err := handler.postResolvedProviderRequest(context.Background(), route.provider, route.owner, route.nativeEndpoint, []byte(`{"model":"model-b","messages":[{"role":"user","content":"hello"}]}`), nil)
+	if err != nil {
+		t.Fatalf("postResolvedProviderRequest(model-b) error = %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {

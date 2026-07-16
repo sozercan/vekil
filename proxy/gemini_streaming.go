@@ -218,6 +218,14 @@ func (s *geminiStreamState) consumeChoice(choice models.OpenAIStreamChoice) bool
 			}
 		}
 	}
+	if choice.Delta.Refusal != nil {
+		var refusal string
+		if err := json.Unmarshal(choice.Delta.Refusal, &refusal); err == nil && refusal != "" {
+			if !s.emitText(refusal) {
+				return false
+			}
+		}
+	}
 
 	if len(choice.Delta.ToolCalls) > 0 && !s.consumeToolCalls(choice.Delta.ToolCalls) {
 		return false

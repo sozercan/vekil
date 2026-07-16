@@ -774,6 +774,10 @@ func newLifecycleStreamDefaultHandler(t testing.TB, upstreamURL string) *ProxyHa
 	if err != nil {
 		t.Fatalf("NewProxyHandler() error = %v", err)
 	}
+	// These lifecycle regressions exercise the native Chat stream itself. Keep
+	// cold dynamic model discovery from consuming the test's streaming endpoint
+	// before the request under test reaches /chat/completions.
+	disableColdChatRouteDiscoveryForLegacyTest(handler)
 	return handler
 }
 

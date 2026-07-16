@@ -288,25 +288,29 @@ func TestPostChatCompletions_UnknownModelFallbackHonorsDynamicProviderFilters(t 
 			}
 
 			body := []byte(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hello"}]}`, tc.model))
-			resp, err := handler.postChatCompletions(context.Background(), body)
+			route, err := handler.resolveChatRoute(context.Background(), tc.model)
+			var resp *http.Response
+			if err == nil {
+				resp, err = handler.postResolvedProviderRequest(context.Background(), route.provider, route.owner, route.nativeEndpoint, body, nil)
+			}
 			if tc.wantStatus == http.StatusOK {
 				if err != nil {
-					t.Fatalf("postChatCompletions() error = %v", err)
+					t.Fatalf("captured Chat route error = %v", err)
 				}
 				defer func() { _ = resp.Body.Close() }()
 				if resp.StatusCode != tc.wantStatus {
-					t.Fatalf("postChatCompletions() status = %d, want %d", resp.StatusCode, tc.wantStatus)
+					t.Fatalf("captured Chat response status = %d, want %d", resp.StatusCode, tc.wantStatus)
 				}
 			} else {
 				if err == nil {
 					if resp != nil {
 						_ = resp.Body.Close()
 					}
-					t.Fatal("postChatCompletions() error = nil, want local routing rejection")
+					t.Fatal("captured Chat route error = nil, want local routing rejection")
 				}
 				var providerErr *providerRequestError
 				if !errors.As(err, &providerErr) {
-					t.Fatalf("postChatCompletions() error = %T, want *providerRequestError", err)
+					t.Fatalf("captured Chat route error = %T, want *providerRequestError", err)
 				}
 				if providerErr.statusCode != tc.wantStatus {
 					t.Fatalf("providerRequestError.statusCode = %d, want %d", providerErr.statusCode, tc.wantStatus)
@@ -787,9 +791,13 @@ func TestPostChatCompletions_UsesAzureClassicDeploymentURLAndKeepsPublicBodyMode
 		t.Fatalf("NewProxyHandler() error = %v", err)
 	}
 
-	resp, err := handler.postChatCompletions(context.Background(), []byte(`{"model":"gpt-5-public","messages":[{"role":"user","content":"hi"}]}`))
+	route, err := handler.resolveChatRoute(context.Background(), "gpt-5-public")
 	if err != nil {
-		t.Fatalf("postChatCompletions() error = %v", err)
+		t.Fatalf("resolveChatRoute() error = %v", err)
+	}
+	resp, err := handler.postResolvedProviderRequest(context.Background(), route.provider, route.owner, route.nativeEndpoint, []byte(`{"model":"gpt-5-public","messages":[{"role":"user","content":"hi"}]}`), nil)
+	if err != nil {
+		t.Fatalf("postResolvedProviderRequest() error = %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {

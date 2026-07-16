@@ -3255,3 +3255,11 @@ func TestGeminiCLITranslationUnwrapsTextOutputOnlyForCLIRequests(t *testing.T) {
 		t.Fatal("Gemini CLI user-agent classification mismatch")
 	}
 }
+
+func TestTranslateOpenAIToGeminiIgnoresNullRefusal(t *testing.T) {
+	finish := "stop"
+	response := TranslateOpenAIToGemini(&models.OpenAIResponse{Choices: []models.OpenAIChoice{{Index: 0, Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`), Refusal: json.RawMessage(`null`)}, FinishReason: &finish}}})
+	if len(response.Candidates) != 1 || response.Candidates[0].Content == nil || len(response.Candidates[0].Content.Parts) != 1 || response.Candidates[0].Content.Parts[0].Text == nil || *response.Candidates[0].Content.Parts[0].Text != "ok" {
+		t.Fatalf("response = %#v", response)
+	}
+}
