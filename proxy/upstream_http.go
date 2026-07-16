@@ -359,10 +359,6 @@ func (h *ProxyHandler) maybeRetryResolvedResponsesWithoutUnverifiableEncryptedCo
 	return retryResp, nil
 }
 
-func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body []byte) (*http.Response, error) {
-	return h.postJSONEndpointWithHeaders(ctx, path, body, nil)
-}
-
 func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header) (*http.Response, error) {
 	return h.postJSONEndpointWithHeadersForModel(ctx, path, body, extraHeaders, extractRequestModel(body))
 }
