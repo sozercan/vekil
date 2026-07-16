@@ -263,6 +263,13 @@ PY_WRAPPED_OUTPUT
     jq -cn --arg output "\$(cat right.txt)" '{output: \$output}'
     printf '|'
     ;;
+  json-wrapped-three)
+    jq -cn --arg output "\$(cat left.txt)" '{output: \$output}'
+    printf '|'
+    jq -cn --arg output 'unexpected-third-wrapper' '{output: \$output}'
+    printf '|'
+    jq -cn --arg output "\$(cat right.txt)" '{output: \$output}'
+    ;;
   exit42)
     exit 42
     ;;
@@ -777,6 +784,7 @@ expect_hard_failure_with_stderr "hanging chat canary is hard via raw Zen smoke" 
 run_zen_case_expect_success "Gemini strict JSON wrapper around complete result normalizes to exact text" pass pass json-wrapped-whole
 run_zen_case_expect_success "Gemini strict JSON wrapper sequence normalizes to exact text" pass pass json-wrapped
 run_zen_case_expect_failure "Gemini dangling JSON wrapper separator is rejected" 200 pass pass json-wrapped-trailing-separator
+run_zen_case_expect_failure "Gemini three-wrapper sequence is rejected" 200 pass pass json-wrapped-three
 
 run_zen_case_expect_failure "canary 200 plus CLI exit 42" 200 exit42 exit42 exit42
 run_zen_case_expect_failure "canary 404 is a hard failure" 404 pass pass pass

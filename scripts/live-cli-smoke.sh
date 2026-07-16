@@ -410,8 +410,8 @@ except (TypeError, ValueError, json.JSONDecodeError):
             offset += 1
             if offset == len(raw):
                 raise ValueError("dangling separator")
-        if len(outputs) < 2:
-            raise ValueError("wrapper sequence is incomplete")
+        if len(outputs) != 2:
+            raise ValueError("expected exactly two wrappers")
     except (TypeError, ValueError, json.JSONDecodeError):
         print(raw, end="")
     else:
