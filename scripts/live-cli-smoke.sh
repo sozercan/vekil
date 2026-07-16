@@ -369,45 +369,56 @@ read_normalized_output() {
   awk 'NF { gsub(/\r/, "", $0); printf "%s", $0 }' "$1"
 }
 
-# Gemini CLI can render tool results as strict {"output":"..."} wrappers even
-# with -o text. Accept only a complete pipe-separated sequence of single-key
-# wrapper objects; malformed JSON, extra fields, or unwrapped text stay unchanged
-# and therefore still fail the exact-output assertion.
+# Recent Gemini CLI versions may render Read results as strict
+# {"output":"..."} objects even when text output was requested. Accept either
+# one wrapper around the complete result or the exact two-wrapper sequence for
+# this smoke's two files. Leave every other shape unchanged so malformed JSON,
+# extra fields, unwrapped text, and unexpected commentary still fail the exact
+# assertion.
 read_gemini_normalized_output() {
-  local raw part value normalized="" separator=""
-  local parts=()
-  raw="$(read_normalized_output "$1")"
+  local path="$1"
+  local python_bin
+  python_bin="$(python_command)"
+  "${python_bin}" - "${path}" <<'PY_GEMINI_OUTPUT'
+import json
+import pathlib
+import sys
 
-  # Prefer one strict wrapper around the complete result; its output string may
-  # legitimately contain the pipe separator used by the smoke fixture.
-  if value="$(jq -er '
-    if type == "object" and keys == ["output"] and (.output | type == "string")
-    then .output
-    else error("not a strict Gemini output wrapper")
-    end
-  ' <<< "${raw}" 2>/dev/null)"; then
-    printf '%s' "${value}"
-    return
-  fi
-
-  IFS='|' read -r -a parts <<< "${raw}"
-  [[ "${#parts[@]}" -gt 0 ]] || { printf '%s' "${raw}"; return; }
-
-  for part in "${parts[@]}"; do
-    if ! value="$(jq -er '
-      if type == "object" and keys == ["output"] and (.output | type == "string")
-      then .output
-      else error("not a strict Gemini output wrapper")
-      end
-    ' <<< "${part}" 2>/dev/null)"; then
-      printf '%s' "${raw}"
-      return
-    fi
-    normalized+="${separator}${value}"
-    separator='|'
-  done
-
-  printf '%s' "${normalized}"
+raw = "".join(
+    line.replace("\r", "")
+    for line in pathlib.Path(sys.argv[1]).read_text().splitlines()
+    if line.strip()
+)
+try:
+    whole = json.loads(raw)
+    if set(whole) != {"output"} or not isinstance(whole["output"], str):
+        raise ValueError("not a strict whole-result wrapper")
+except (TypeError, ValueError, json.JSONDecodeError):
+    try:
+        decoder = json.JSONDecoder()
+        outputs = []
+        offset = 0
+        while offset < len(raw):
+            wrapper, offset = decoder.raw_decode(raw, offset)
+            if set(wrapper) != {"output"} or not isinstance(wrapper["output"], str):
+                raise ValueError("not a strict output wrapper")
+            outputs.append(wrapper["output"])
+            if offset == len(raw):
+                break
+            if raw[offset:offset + 1] != "|":
+                raise ValueError("missing separator")
+            offset += 1
+            if offset == len(raw):
+                raise ValueError("dangling separator")
+        if len(outputs) != 2:
+            raise ValueError("expected exactly two wrappers")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        print(raw, end="")
+    else:
+        print("|".join(outputs), end="")
+else:
+    print(whole["output"], end="")
+PY_GEMINI_OUTPUT
 }
 
 start_proxy() {

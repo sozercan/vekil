@@ -246,6 +246,23 @@ func TestServerBlocksNonHealthRoutesWhileProviderValidationPending(t *testing.T)
 	}
 }
 
+// copilotChatProxyOptionWithModelDiscovery keeps a static Chat route while
+// intentionally exercising the upstream /models lifecycle in server tests.
+func copilotChatProxyOptionWithModelDiscovery(baseURL string) proxy.Option {
+	return proxy.WithProvidersConfig(proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{{
+		ID:             "test-provider",
+		Type:           "openai-compatible",
+		Default:        true,
+		BaseURL:        baseURL,
+		AuthType:       "none",
+		ModelDiscovery: "openai",
+		Models: []proxy.ProviderModelConfig{{
+			PublicID:  "gpt-5",
+			Endpoints: []string{"/chat/completions"},
+		}},
+	}}})
+}
+
 func TestNew_ConfiguresExtendedWriteTimeout(t *testing.T) {
 	srv, err := New(
 		auth.NewTestAuthenticator("test-token"),
@@ -318,7 +335,7 @@ func TestRequestLogIncludesSummaryUsageAndUpstreamRequestID(t *testing.T) {
 		logger.NewWithWriter(logger.LevelInfo, &logs),
 		"127.0.0.1",
 		"0",
-		WithProxyOptions(proxy.WithCopilotBaseURL(upstream.URL)),
+		WithProxyOptions(copilotChatProxyOptionWithModelDiscovery(upstream.URL)),
 	)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -351,8 +368,8 @@ func TestRequestLogIncludesSummaryUsageAndUpstreamRequestID(t *testing.T) {
 		"path":                "/v1/chat/completions",
 		"endpoint":            "openai_chat",
 		"model":               "gpt-5",
-		"provider":            "copilot",
-		"provider_kind":       "copilot",
+		"provider":            "test-provider",
+		"provider_kind":       "openai-compatible",
 		"stream":              false,
 		"upstream_request_id": "req-upstream-123",
 	}
@@ -403,7 +420,7 @@ func TestStreamingChatCompletionsPassthroughThroughServer(t *testing.T) {
 		logger.NewWithWriter(logger.LevelInfo, &logs),
 		"127.0.0.1",
 		"0",
-		WithProxyOptions(proxy.WithCopilotBaseURL(upstream.URL)),
+		WithProxyOptions(copilotChatProxyOptionWithModelDiscovery(upstream.URL)),
 	)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -511,7 +528,7 @@ func TestStopCancelsHangingInferenceAndModelCatalog(t *testing.T) {
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		"127.0.0.1",
 		"0",
-		WithProxyOptions(proxy.WithCopilotBaseURL(upstream.URL)),
+		WithProxyOptions(copilotChatProxyOptionWithModelDiscovery(upstream.URL)),
 	)
 	if err != nil {
 		close(release)
@@ -661,7 +678,7 @@ func TestStopIsConcurrentIdempotentAndRejectsNewUpstreamWork(t *testing.T) {
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		"127.0.0.1",
 		"0",
-		WithProxyOptions(proxy.WithCopilotBaseURL(upstream.URL)),
+		WithProxyOptions(copilotChatProxyOptionWithModelDiscovery(upstream.URL)),
 	)
 	if err != nil {
 		close(release)
@@ -794,7 +811,7 @@ func TestOpenAIStreamPreFirstEventShutdownReturns503OverNetHTTP(t *testing.T) {
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		"127.0.0.1",
 		"0",
-		WithProxyOptions(proxy.WithCopilotBaseURL(upstream.URL)),
+		WithProxyOptions(copilotChatProxyOptionWithModelDiscovery(upstream.URL)),
 	)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -905,7 +922,7 @@ func TestHTTPStreamShutdownAccounting(t *testing.T) {
 				logger.NewWithWriter(logger.LevelError, io.Discard),
 				"127.0.0.1",
 				"0",
-				WithProxyOptions(proxy.WithCopilotBaseURL(upstream.URL)),
+				WithProxyOptions(copilotChatProxyOptionWithModelDiscovery(upstream.URL)),
 			)
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
@@ -1489,7 +1506,7 @@ func TestStopClosesIdleUpstreamConnections(t *testing.T) {
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		"127.0.0.1",
 		"0",
-		WithProxyOptions(proxy.WithCopilotBaseURL(upstream.URL)),
+		WithProxyOptions(copilotChatProxyOptionWithModelDiscovery(upstream.URL)),
 	)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -1585,7 +1602,7 @@ func TestStopForceClosesNonReadingDownstreamAfterDeadline(t *testing.T) {
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		"127.0.0.1",
 		"0",
-		WithProxyOptions(proxy.WithCopilotBaseURL(upstream.URL)),
+		WithProxyOptions(copilotChatProxyOptionWithModelDiscovery(upstream.URL)),
 	)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)

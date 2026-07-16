@@ -1001,6 +1001,14 @@ func (s *anthropicStreamState) emit(eventType string, data interface{}) bool {
 }
 
 func (s *anthropicStreamState) emitError(message string) bool {
+	return s.emitTypedError("api_error", message)
+}
+
+func (s *anthropicStreamState) emitTypedError(errorType, message string) bool {
+	errorType = strings.TrimSpace(errorType)
+	if errorType == "" {
+		errorType = "api_error"
+	}
 	message = strings.TrimSpace(message)
 	if message == "" {
 		message = "upstream stream ended unexpectedly"
@@ -1008,7 +1016,7 @@ func (s *anthropicStreamState) emitError(message string) bool {
 	return s.emit("error", map[string]interface{}{
 		"type": "error",
 		"error": map[string]string{
-			"type":    "api_error",
+			"type":    errorType,
 			"message": message,
 		},
 	})
@@ -1051,6 +1059,14 @@ func (s *anthropicStreamState) consumeChoice(choice models.OpenAIStreamChoice) b
 		var text string
 		if err := json.Unmarshal(choice.Delta.Content, &text); err == nil && text != "" {
 			if !s.emitText(text) {
+				return false
+			}
+		}
+	}
+	if choice.Delta.Refusal != nil {
+		var refusal string
+		if err := json.Unmarshal(choice.Delta.Refusal, &refusal); err == nil && refusal != "" {
+			if !s.emitText(refusal) {
 				return false
 			}
 		}
@@ -1239,6 +1255,7 @@ func (s *anthropicStreamState) finish() bool {
 type aggregatedOpenAIChoice struct {
 	role              string
 	content           strings.Builder
+	refusal           strings.Builder
 	toolCalls         map[int]*models.OpenAIToolCall
 	toolCallArguments map[int]*strings.Builder
 	finishReason      *string
@@ -1285,6 +1302,12 @@ func (a *openAIResponseAggregator) addChoice(choice models.OpenAIStreamChoice) {
 		var text string
 		if err := json.Unmarshal(choice.Delta.Content, &text); err == nil {
 			aggChoice.content.WriteString(text)
+		}
+	}
+	if choice.Delta.Refusal != nil {
+		var refusal string
+		if err := json.Unmarshal(choice.Delta.Refusal, &refusal); err == nil {
+			aggChoice.refusal.WriteString(refusal)
 		}
 	}
 
@@ -1376,6 +1399,10 @@ func (a *openAIResponseAggregator) buildMessage(choice *aggregatedOpenAIChoice) 
 	if choice.content.Len() > 0 {
 		content, _ := json.Marshal(choice.content.String())
 		message.Content = content
+	}
+	if choice.refusal.Len() > 0 {
+		refusal, _ := json.Marshal(choice.refusal.String())
+		message.Refusal = refusal
 	}
 
 	if len(choice.toolCalls) == 0 {

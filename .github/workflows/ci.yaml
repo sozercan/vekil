@@ -38,8 +38,9 @@ jobs:
 
       - name: Shell smoke reliability tests
         run: |
-          bash -n scripts/live-cli-smoke.sh scripts/live-zen-smoke.sh scripts/live-compact-smoke.sh scripts/k8s-kind-smoke.sh scripts/tests/live-smoke-reliability-test.sh
+          bash -n scripts/live-cli-smoke.sh scripts/live-zen-smoke.sh scripts/live-compact-smoke.sh scripts/live-chat-over-responses-smoke.sh scripts/k8s-kind-smoke.sh scripts/tests/live-smoke-reliability-test.sh scripts/tests/live-chat-over-responses-smoke-test.sh
           scripts/tests/live-smoke-reliability-test.sh
+          scripts/tests/live-chat-over-responses-smoke-test.sh
 
       - name: Test
         run: make test

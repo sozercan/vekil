@@ -56,6 +56,19 @@ Provider config decoding is strict. Unknown top-level fields and unknown fields 
 
 You can run Azure-only or Codex-only configs, or mix those providers with Copilot behind the same local endpoint.
 
+### Native endpoints and Chat compatibility
+
+For canonical Chat requests, Vekil first prefers native `/chat/completions` when both the provider policy and model allowlist permit it. If native Chat is unavailable but native `/responses` is allowed, Vekil executes the request through its Chat-over-Responses adapter. This makes these public compatibility surfaces available to a Responses-native model without changing provider ownership:
+
+- `POST /v1/chat/completions`;
+- translated `POST /v1/messages` and `/v1/messages/count_tokens`;
+- Gemini `generateContent`, `streamGenerateContent`, and `countTokens`;
+- the dashboard insight call.
+
+This is served compatibility, not native capability metadata. Keep `models[].endpoints` limited to verified upstream routes. A Responses-only model must remain configured with only `/responses`, and `/v1/models` continues to render only that native endpoint even though Vekil can translate Chat-compatible traffic to it. Do not add `/chat/completions` merely to advertise the adapter.
+
+On an unknown model routed to an unfiltered dynamic provider, the first Chat-compatible request may perform one provider-local model refresh before choosing a backend. Discovery is coalesced per provider, bounded to two seconds, cached for five minutes after success, and backed off for five seconds after failure. It does not require or populate the merged public `/v1/models` cache.
+
 ### Azure-Only Example
 
 ```yaml
@@ -130,7 +143,7 @@ JSON configs use the same snake_case field names as YAML.
 
 ### Generic Provider Behavior
 
-OpenAI-compatible providers route `POST /v1/chat/completions` to `chat_completions_path`. Anthropic `POST /v1/messages` requests for these models are translated through the existing OpenAI Chat Completions adapter. `POST /v1/responses` is never inferred; add `/responses` to a model only after validating the upstream model and path.
+OpenAI-compatible providers use `chat_completions_path` for models with native `/chat/completions` support. If a model is configured as `/responses`-only, OpenAI Chat plus translated Anthropic and Gemini traffic is converted and sent to `responses_path` instead. `POST /v1/responses` support itself is never inferred; add `/responses` to a model only after validating the upstream model and path.
 
 Anthropic-compatible providers directly forward Anthropic `POST /v1/messages` to `messages_path`. They do not serve OpenAI Chat Completions or Responses routes.
 
@@ -311,7 +324,7 @@ Routing rules:
 - Azure `models[]` remains the routing source of truth. The proxy does not autodiscover new Azure deployments for inference.
 - Azure is treated as a static provider for `/readyz`: readiness does not depend on Azure's optional `/models` endpoint. `GET /v1/models` may still probe Azure `/models` for best-effort metadata enrichment.
 - OpenAI Codex discovers models dynamically from its upstream `/models` endpoint and exposes only models that are listed and supported in the API.
-- OpenAI Codex models are `/responses`-only. The proxy rejects `/chat/completions` for those models instead of probing an unsupported route.
+- OpenAI Codex models are `/responses`-only natively. Vekil may serve `/v1/chat/completions`, translated Anthropic, Gemini, count-token probes, and dashboard insights through Chat-over-Responses, while `/v1/models` still reports only native `/responses` support.
 - Azure `auth_mode` is optional and defaults to `api_key`. Supported values are `api_key` and `azure_identity`.
 - `openai-compatible` models default to `/chat/completions` when `models[].endpoints` is omitted. Add `/responses` only for models you have validated on `responses_path`.
 - `anthropic-compatible` models default to `/v1/messages` when `models[].endpoints` is omitted. OpenAI Chat Completions and Responses requests for those models fail fast.
@@ -334,6 +347,6 @@ Routing rules:
 - For Azure OpenAI, `/v1/models` only does a best-effort metadata overlay for each configured `models[]` entry by probing Azure's upstream `/models` response. The proxy matches by `public_id` first, then by `deployment` for aliased models.
 - Azure's upstream `/models` catalog can omit Codex-style fields entirely. The proxy only copies fields that Azure already returns; it does not derive reasoning levels, vision, parallel tool calls, model picker metadata, or context window from other Azure docs or capability hints.
 - Explicit `models[]` metadata overrides Azure `/models` overlay metadata. Configured public IDs and endpoint allowlists always win, and the proxy falls back to the static entry if the Azure `/models` probe fails or returns a sparse payload.
-- The example Azure `gpt-5.4-pro` model shown above is `/responses`-only. Do not advertise `/chat/completions` for that model unless you have verified native support.
+- The example Azure `gpt-5.4-pro` model shown above is `/responses`-only natively. Chat-compatible clients can use Vekil's adapter, but do not advertise `/chat/completions` in its endpoint allowlist unless the Azure deployment itself has verified native Chat support.
 
 Use the examples above as a starting point for your local providers config file. JSON and YAML use the same snake_case field names.

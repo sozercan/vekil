@@ -16,8 +16,8 @@ import (
 	"github.com/sozercan/vekil/logger"
 )
 
-func TestValidateInsightModelWarnsForResponsesOnly(t *testing.T) {
-	build := func(insightModel string, endpoints []string) string {
+func TestValidateInsightModelAcceptsChatCompatibleRoutes(t *testing.T) {
+	build := func(insightModel string) string {
 		var buf bytes.Buffer
 		log := logger.NewWithWriter(logger.LevelInfo, &buf)
 		_, err := NewProxyHandler(
@@ -25,19 +25,29 @@ func TestValidateInsightModelWarnsForResponsesOnly(t *testing.T) {
 			log,
 			WithProvidersConfig(ProvidersConfig{
 				InsightModel: insightModel,
-				Providers: []ProviderConfig{{
-					ID:             "dummy",
-					Type:           "openai-compatible",
-					Default:        true,
-					BaseURL:        "http://127.0.0.1:59999/v1",
-					AuthType:       "bearer",
-					APIKey:         "mock",
-					ModelDiscovery: "static",
-					Models: []ProviderModelConfig{
-						{PublicID: "responses-only-model", Endpoints: []string{"/responses"}},
-						{PublicID: "chat-model", Endpoints: []string{"/chat/completions"}},
+				Providers: []ProviderConfig{
+					{
+						ID:             "dummy",
+						Type:           "openai-compatible",
+						Default:        true,
+						BaseURL:        "http://127.0.0.1:59999/v1",
+						AuthType:       "bearer",
+						APIKey:         "mock",
+						ModelDiscovery: "static",
+						Models: []ProviderModelConfig{
+							{PublicID: "responses-only-model", Endpoints: []string{"/responses"}},
+							{PublicID: "chat-model", Endpoints: []string{"/chat/completions"}},
+						},
 					},
-				}},
+					{
+						ID:             "native-anthropic",
+						Type:           "anthropic-compatible",
+						BaseURL:        "http://127.0.0.1:59998",
+						AuthType:       "none",
+						ModelDiscovery: "static",
+						Models:         []ProviderModelConfig{{PublicID: "messages-only-model"}},
+					},
+				},
 			}),
 		)
 		if err != nil {
@@ -46,22 +56,26 @@ func TestValidateInsightModelWarnsForResponsesOnly(t *testing.T) {
 		return buf.String()
 	}
 
-	// /responses-only insight model → warning.
-	if out := build("responses-only-model", nil); !strings.Contains(out, "insights will not work") {
-		t.Fatalf("expected insight warning for /responses-only model, log was:\n%s", out)
+	// Responses-only models are served through the Chat compatibility route.
+	if out := build("responses-only-model"); strings.Contains(out, "insights will not work") {
+		t.Fatalf("did not expect insight warning for Responses-backed Chat model, log was:\n%s", out)
 	}
-	// Chat-capable insight model → silent.
-	if out := build("chat-model", nil); strings.Contains(out, "insights will not work") {
-		t.Fatalf("did not expect insight warning for chat-capable model, log was:\n%s", out)
+	// Native Chat-capable insight model → silent.
+	if out := build("chat-model"); strings.Contains(out, "insights will not work") {
+		t.Fatalf("did not expect insight warning for native Chat model, log was:\n%s", out)
+	}
+	// A model with neither native Chat nor Responses support remains unroutable.
+	if out := build("messages-only-model"); !strings.Contains(out, "insights will not work") {
+		t.Fatalf("expected insight warning for model without Chat compatibility, log was:\n%s", out)
 	}
 	// No insight model → silent.
-	if out := build("", nil); strings.Contains(out, "insights will not work") {
+	if out := build(""); strings.Contains(out, "insights will not work") {
 		t.Fatalf("did not expect insight warning when unconfigured, log was:\n%s", out)
 	}
 	// Misspelled / unknown static model → warning. The default static provider
-	// does not accept unknown models on /chat/completions, so the later insight
-	// call would be rejected; the startup validation must surface it.
-	if out := build("chat-modle-typo", nil); !strings.Contains(out, "insights will not work") {
+	// does not accept unknown models on either Chat or Responses, so the later
+	// insight call would be rejected; startup validation must surface it.
+	if out := build("chat-modle-typo"); !strings.Contains(out, "insights will not work") {
 		t.Fatalf("expected insight warning for unknown static model, log was:\n%s", out)
 	}
 }

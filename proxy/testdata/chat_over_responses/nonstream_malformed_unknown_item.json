@@ -1,0 +1,34 @@
+{
+  "id": "resp_synth_unknown_001",
+  "object": "response",
+  "created_at": 1700000000,
+  "status": "completed",
+  "error": null,
+  "incomplete_details": null,
+  "model": "gpt-synthetic-responses",
+  "output": [
+    {
+      "type": "synthetic_unknown_item",
+      "id": "item_synth_unknown_001",
+      "status": "completed",
+      "payload": {
+        "note": "Intentionally unsupported synthetic fixture item."
+      }
+    }
+  ],
+  "parallel_tool_calls": true,
+  "usage": {
+    "input_tokens": 1,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens": 1,
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "total_tokens": 2
+  },
+  "metadata": {
+    "fixture": "nonstream-malformed-unknown-item"
+  }
+}
