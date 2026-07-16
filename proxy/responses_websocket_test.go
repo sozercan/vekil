@@ -3313,7 +3313,7 @@ func TestResponsesWebSocketErrorHeadersFallsBackFromInvalidRetryAfter(t *testing
 	}
 }
 
-func TestHandleResponsesWebSocket_ResponseIncompleteKeepsSessionOpen(t *testing.T) {
+func TestHandleResponsesWebSocket_ResponseIncompletePreservesContinuationState(t *testing.T) {
 	var upstreamRequests atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		requestNumber := upstreamRequests.Add(1)
@@ -3321,10 +3321,25 @@ func TestHandleResponsesWebSocket_ResponseIncompleteKeepsSessionOpen(t *testing.
 		switch requestNumber {
 		case 1:
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-inc\"}}\n\n")
-			_, _ = fmt.Fprint(w, "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-inc\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-inc\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-inc\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-inc\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-terminal\",\"content\":[{\"type\":\"output_text\",\"text\":\"terminal-only partial\"}]}],\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n")
 		case 2:
+			var body map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode follow-up upstream request: %v", err)
+			}
+			input := rawJSONArrayForContract(t, body["input"])
+			if len(input) != 4 {
+				t.Fatalf("follow-up input items = %d, want original user + both partial assistant items + continuation: %s", len(input), body["input"])
+			}
+			if got := contractMessageText(t, input[1], "assistant"); got != "partial" {
+				t.Fatalf("incremental assistant output = %q, want partial", got)
+			}
+			if got := contractMessageText(t, input[2], "assistant"); got != "terminal-only partial" {
+				t.Fatalf("terminal-only assistant output = %q, want terminal-only partial", got)
+			}
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-next\"}}\n\n")
-			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-next\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-next\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n")
 		default:
 			t.Fatalf("unexpected upstream request count %d", requestNumber)
 		}
@@ -3335,66 +3350,87 @@ func TestHandleResponsesWebSocket_ResponseIncompleteKeepsSessionOpen(t *testing.
 	defer func() { _ = conn.Close() }()
 
 	request := newResponsesWebSocketCreateRequest([]interface{}{
-		map[string]interface{}{
-			"type": "message",
-			"role": "user",
-			"content": []map[string]string{
-				{"type": "input_text", "text": "hello"},
-			},
-		},
+		messageItemForContract("user", "hello"),
 	})
 	if err := conn.WriteJSON(request); err != nil {
 		t.Fatalf("failed to write websocket request: %v", err)
 	}
-
-	created := mustReadWebSocketJSON(t, conn)
-	if created["type"] != "response.created" {
-		t.Fatalf("expected response.created, got %v", created["type"])
-	}
-
-	incomplete := mustReadWebSocketJSON(t, conn)
-	if incomplete["type"] != "response.incomplete" {
-		t.Fatalf("expected response.incomplete, got %v", incomplete["type"])
-	}
-	errFrame := mustReadWebSocketJSON(t, conn)
-	if errFrame["type"] != "error" {
-		t.Fatalf("expected error frame after response.incomplete, got %v", errFrame["type"])
-	}
-	if statusCode, _ := errFrame["status_code"].(float64); statusCode != float64(http.StatusConflict) {
-		t.Fatalf("expected error status %d, got %v", http.StatusConflict, errFrame["status_code"])
-	}
-	errPayload, ok := errFrame["error"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("expected error payload, got %T", errFrame["error"])
-	}
-	if errPayload["code"] != "max_output_tokens" {
-		t.Fatalf("expected error code max_output_tokens, got %v", errPayload["code"])
-	}
-	if errPayload["message"] != "upstream response.incomplete: max_output_tokens" {
-		t.Fatalf("expected incomplete error message, got %v", errPayload["message"])
+	for _, wantType := range []string{"response.created", "response.output_item.done", "response.incomplete"} {
+		frame := mustReadWebSocketJSON(t, conn)
+		if frame["type"] != wantType {
+			t.Fatalf("frame type = %v, want %s", frame["type"], wantType)
+		}
 	}
 
 	next := newResponsesWebSocketCreateRequest([]interface{}{
-		map[string]interface{}{
-			"type": "message",
-			"role": "user",
-			"content": []map[string]string{
-				{"type": "input_text", "text": "continue"},
-			},
-		},
+		messageItemForContract("user", "continue"),
 	})
+	next["previous_response_id"] = "resp-inc"
 	if err := conn.WriteJSON(next); err != nil {
 		t.Fatalf("failed to write follow-up websocket request: %v", err)
 	}
+	for _, wantType := range []string{"response.created", "response.completed"} {
+		frame := mustReadWebSocketJSON(t, conn)
+		if frame["type"] != wantType {
+			t.Fatalf("follow-up frame type = %v, want %s", frame["type"], wantType)
+		}
+	}
+}
 
-	nextCreated := mustReadWebSocketJSON(t, conn)
-	if nextCreated["type"] != "response.created" {
-		t.Fatalf("expected follow-up response.created, got %v", nextCreated["type"])
+func TestHandleResponsesWebSocket_ResponseIncompleteEmptyOutputClearsIncrementalHistory(t *testing.T) {
+	var upstreamRequests atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		requestNumber := upstreamRequests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch requestNumber {
+		case 1:
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-empty\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"stale\",\"content\":[{\"type\":\"output_text\",\"text\":\"stale incremental\"}]}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-empty\",\"output\":[],\"incomplete_details\":{\"reason\":\"content_filter\"}}}\n\n")
+		case 2:
+			var body map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode follow-up upstream request: %v", err)
+			}
+			input := rawJSONArrayForContract(t, body["input"])
+			if len(input) != 2 {
+				t.Fatalf("follow-up input items = %d, want original user + continuation only: %s", len(input), body["input"])
+			}
+			if got := contractMessageText(t, input[1], "user"); got != "continue" {
+				t.Fatalf("follow-up user input = %q, want continue", got)
+			}
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-next\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-next\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n")
+		default:
+			t.Fatalf("unexpected upstream request count %d", requestNumber)
+		}
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{messageItemForContract("user", "hello")})
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+	for _, wantType := range []string{"response.created", "response.output_item.done", "response.incomplete"} {
+		frame := mustReadWebSocketJSON(t, conn)
+		if frame["type"] != wantType {
+			t.Fatalf("frame type = %v, want %s", frame["type"], wantType)
+		}
 	}
 
-	nextCompleted := mustReadWebSocketJSON(t, conn)
-	if nextCompleted["type"] != "response.completed" {
-		t.Fatalf("expected follow-up response.completed, got %v", nextCompleted["type"])
+	next := newResponsesWebSocketCreateRequest([]interface{}{messageItemForContract("user", "continue")})
+	next["previous_response_id"] = "resp-empty"
+	if err := conn.WriteJSON(next); err != nil {
+		t.Fatalf("failed to write follow-up websocket request: %v", err)
+	}
+	for _, wantType := range []string{"response.created", "response.completed"} {
+		frame := mustReadWebSocketJSON(t, conn)
+		if frame["type"] != wantType {
+			t.Fatalf("follow-up frame type = %v, want %s", frame["type"], wantType)
+		}
 	}
 }
 
@@ -4833,7 +4869,14 @@ func TestHandleResponsesWebSocket_StreamFailureStatsSurviveClientCloseAtDelivery
 			case <-time.After(time.Second):
 				t.Fatal("timed out waiting for failure delivery after client close")
 			}
-			assertSingleResponsesWebSocketFailureStats(t, handler, tt.wantStatus)
+			if tt.name == "response.incomplete" {
+				snap := handler.stats.snapshot()
+				if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 {
+					t.Fatalf("incomplete stats = requests:%d errors:%d, want 1/0", snap.Totals.Requests, snap.Totals.Errors)
+				}
+			} else {
+				assertSingleResponsesWebSocketFailureStats(t, handler, tt.wantStatus)
+			}
 		})
 	}
 }
@@ -5096,6 +5139,50 @@ func TestHandleResponsesWebSocket_CompletionAccountsBeforeTerminalClientWrite(t 
 	}
 }
 
+func TestHandleResponsesWebSocket_IncompleteAccountsBeforeTerminalClientWrite(t *testing.T) {
+	incomplete := "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-created\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":7,\"output_tokens\":3,\"total_tokens\":10}}}\n\n"
+	body := newGatedResponsesFailureBody(incomplete, nil)
+	handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       body,
+			Request:    req,
+		}, nil
+	})
+	handler.stats = newStatsCollector()
+	serverConn, clientConn := newResponsesWebSocketConnPair(t)
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+	done := make(chan error, 1)
+	go func() { done <- session.handleCreateRequest(handler, request) }()
+
+	created := mustReadWebSocketJSON(t, clientConn)
+	if created["type"] != "response.created" {
+		t.Fatalf("first frame type = %v, want response.created", created["type"])
+	}
+	_ = serverConn.Close()
+	body.releaseSecond()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errResponsesWebSocketClientWrite) {
+			t.Fatalf("handleCreateRequest error = %v, want client write error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for incomplete client write failure")
+	}
+
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 {
+		t.Fatalf("incomplete stats = requests:%d errors:%d, want 1/0", snap.Totals.Requests, snap.Totals.Errors)
+	}
+	if snap.Totals.PromptTokens != 7 || snap.Totals.CompletionTokens != 3 || snap.Totals.TotalTokens != 10 {
+		t.Fatalf("incomplete usage = prompt:%d completion:%d total:%d, want 7/3/10", snap.Totals.PromptTokens, snap.Totals.CompletionTokens, snap.Totals.TotalTokens)
+	}
+}
+
 func TestHandleResponsesWebSocket_BufferedTerminalPrecedesLifecycleCancellation(t *testing.T) {
 	created := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-peek-ws\"}}\n\n"
 	for _, tt := range []struct {
@@ -5164,10 +5251,10 @@ func TestHandleResponsesWebSocket_BufferedTerminalPrecedesLifecycleCancellation(
 				t.Fatal("timed out waiting for buffered terminal websocket turn")
 			}
 
-			if tt.wantStatus == http.StatusOK {
+			if tt.wantStatus == http.StatusOK || tt.name == "incomplete" {
 				snap := handler.stats.snapshot()
 				if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 {
-					t.Fatalf("completed stats = requests:%d errors:%d, want 1/0", snap.Totals.Requests, snap.Totals.Errors)
+					t.Fatalf("successful terminal stats = requests:%d errors:%d, want 1/0", snap.Totals.Requests, snap.Totals.Errors)
 				}
 			} else {
 				assertSingleResponsesWebSocketFailureStats(t, handler, tt.wantStatus)
@@ -5223,10 +5310,10 @@ func TestHandleResponsesWebSocket_QueuedTerminalPrecedesLifecycleCancellation(t 
 				t.Fatal("timed out waiting for queued terminal websocket turn")
 			}
 
-			if tt.wantStatus == http.StatusOK {
+			if tt.wantStatus == http.StatusOK || tt.name == "incomplete" {
 				snap := handler.stats.snapshot()
 				if snap.Totals.Requests != 1 || snap.Totals.Errors != 0 {
-					t.Fatalf("completed stats = requests:%d errors:%d, want 1/0", snap.Totals.Requests, snap.Totals.Errors)
+					t.Fatalf("successful terminal stats = requests:%d errors:%d, want 1/0", snap.Totals.Requests, snap.Totals.Errors)
 				}
 			} else {
 				assertSingleResponsesWebSocketFailureStats(t, handler, tt.wantStatus)

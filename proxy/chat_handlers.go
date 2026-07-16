@@ -85,9 +85,12 @@ func prepareAnthropicChatCompletionsRequestWithModelOverride(req *models.Anthrop
 		oaiReq.Model = modelOverride
 	}
 
+	prewarm := !req.Stream &&
+		((oaiReq.MaxTokens != nil && *oaiReq.MaxTokens == 0) ||
+			(oaiReq.MaxCompletionTokens != nil && *oaiReq.MaxCompletionTokens == 0))
 	mode := chatCompletionsMode{
 		clientRequestedStream: req.Stream,
-		forceUpstreamStream:   !req.Stream,
+		forceUpstreamStream:   !req.Stream && !prewarm,
 	}
 	if mode.forceUpstreamStream || mode.clientRequestedStream {
 		// Force-streamed or client-streamed: ask upstream for a usage chunk so
@@ -303,6 +306,55 @@ func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp 
 
 // HandleAnthropicMessages handles POST /v1/messages by translating the Anthropic
 // request to OpenAI format, forwarding to Copilot, and translating the response back.
+const anthropicInterleavedThinkingBeta = "interleaved-thinking-2025-05-14"
+
+func anthropicBetaEnabled(headers http.Header, feature string) bool {
+	feature = strings.TrimSpace(feature)
+	if feature == "" {
+		return false
+	}
+	for _, value := range headers.Values("Anthropic-Beta") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.TrimSpace(token) == feature {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func validateAnthropicMessageTokenLimits(req *models.AnthropicRequest, headers http.Header) error {
+	if req == nil || req.MaxTokens == nil {
+		return fmt.Errorf("max_tokens is required")
+	}
+	if *req.MaxTokens < 0 {
+		return fmt.Errorf("max_tokens must be greater than or equal to 0")
+	}
+
+	effectiveLimit := *req.MaxTokens
+	if req.Thinking != nil && req.Thinking.Type == "enabled" {
+		if req.Thinking.BudgetTokens == nil {
+			return fmt.Errorf("thinking.budget_tokens is required when thinking.type is enabled")
+		}
+		if *req.Thinking.BudgetTokens < 1024 {
+			return fmt.Errorf("thinking.budget_tokens must be greater than or equal to 1024")
+		}
+		interleavedThinking := anthropicBetaEnabled(headers, anthropicInterleavedThinkingBeta) &&
+			len(req.Tools) > 0 &&
+			(req.ToolChoice == nil || !strings.EqualFold(strings.TrimSpace(req.ToolChoice.Type), "none"))
+		if *req.Thinking.BudgetTokens >= *req.MaxTokens && !interleavedThinking {
+			return fmt.Errorf("thinking.budget_tokens must be less than max_tokens unless interleaved thinking with tools is enabled")
+		}
+		if *req.Thinking.BudgetTokens > effectiveLimit {
+			effectiveLimit = *req.Thinking.BudgetTokens
+		}
+	}
+	if effectiveLimit == 0 && req.Stream {
+		return fmt.Errorf("max_tokens must be greater than 0 when stream is true")
+	}
+	return nil
+}
+
 func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
@@ -319,6 +371,10 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	if err := json.Unmarshal(body, &req); err != nil {
 		message, _ := jsonDecodeErrorDetails(err, "invalid JSON in request body")
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", message)
+		return
+	}
+	if err := validateAnthropicMessageTokenLimits(&req, r.Header); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 
@@ -409,13 +465,28 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(anthropicResp)
 		},
+		passthrough: func(resp *http.Response) error {
+			body := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
+			defer func() { _ = body.Close() }()
+			var oaiResp models.OpenAIResponse
+			if err := json.NewDecoder(body).Decode(&oaiResp); err != nil {
+				if body.canceledAtFailure() {
+					return context.Canceled
+				}
+				return err
+			}
+			observeOpenAIUsage(r.Context(), oaiResp.Usage)
+			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), &oaiResp, h.toolContexts, scope, false)
+			w.Header().Set("Content-Type", "application/json")
+			return json.NewEncoder(w).Encode(TranslateOpenAIToAnthropic(&oaiResp, req.Model))
+		},
 	})
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
 		}
 		status := http.StatusBadGateway
-		message := "failed to aggregate upstream response"
+		message := "failed to process upstream response"
 		var streamErr *openAIStreamError
 		if errors.As(err, &streamErr) {
 			status = streamErr.httpStatus()
