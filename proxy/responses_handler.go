@@ -70,12 +70,13 @@ func responsesUpstreamHeaders(extraHeaders http.Header, stream bool) http.Header
 }
 
 type preparedResponsesRequest struct {
-	body            []byte
-	model           string
-	extraHeaders    http.Header
-	upstreamHeaders http.Header
-	headerToolScope string
-	streaming       bool
+	body             []byte
+	stateBindingBody []byte
+	model            string
+	extraHeaders     http.Header
+	upstreamHeaders  http.Header
+	headerToolScope  string
+	streaming        bool
 }
 
 type responsesRequestMetadata struct {
@@ -118,18 +119,23 @@ func (h *ProxyHandler) prepareResponsesRequest(ctx context.Context, r *http.Requ
 			logger.F("endpoint", "responses"),
 		)
 	}
+	// Exact provider state must be resolved before compatibility rewrites can
+	// turn state-bearing compaction items into proxy context. Capture the view
+	// after synthetic response lineage is reset so proxy-owned state remains local.
+	stateBindingBody := bodyBytes
 	headerToolScope := toolExecutionScopeFromHeaders(extraHeaders)
 	requestToolScope := responsesRequestToolExecutionScope(headerToolScope, metadata.PreviousResponseID)
 
 	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, bodyBytes, metadata.Model, "responses", true, h.toolContexts, requestToolScope)
 
 	return preparedResponsesRequest{
-		body:            bodyBytes,
-		model:           metadata.Model,
-		extraHeaders:    extraHeaders,
-		upstreamHeaders: responsesUpstreamHeaders(extraHeaders, metadata.Stream),
-		headerToolScope: headerToolScope,
-		streaming:       metadata.Stream,
+		body:             bodyBytes,
+		stateBindingBody: stateBindingBody,
+		model:            metadata.Model,
+		extraHeaders:     extraHeaders,
+		upstreamHeaders:  responsesUpstreamHeaders(extraHeaders, metadata.Stream),
+		headerToolScope:  headerToolScope,
+		streaming:        metadata.Stream,
 	}
 }
 
@@ -184,7 +190,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	if routeOperation != nil {
 		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
-		if err := h.applyExplicitRequestStateBinding(routeOperation, prepared.body, prepared.extraHeaders); err != nil {
+		if err := h.applyExplicitRequestStateBinding(routeOperation, prepared.stateBindingBody, prepared.extraHeaders); err != nil {
 			h.writeResponsesUpstreamRequestFailure(w, r, upstreamCtx, "responses_state_binding", err)
 			return
 		}
@@ -512,6 +518,9 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	}
 
 	retainedOutput := retainedCompactResponseMessages(bodyBytes)
+	// Keep provider state visible for exact-route validation. The dispatch body
+	// still applies context sanitization and proxy-owned checkpoint expansion.
+	stateBindingBody := bodyBytes
 	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/compact", false)
 
 	var body map[string]json.RawMessage
@@ -532,8 +541,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	}
 	if routeOperation != nil {
 		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
-		canonicalBody, _ := json.Marshal(body)
-		if err := h.applyExplicitRequestStateBinding(routeOperation, canonicalBody, extraHeaders); err != nil {
+		if err := h.applyExplicitRequestStateBinding(routeOperation, stateBindingBody, extraHeaders); err != nil {
 			statusCode := upstreamStatusCode(err, http.StatusBadRequest)
 			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
 			return
