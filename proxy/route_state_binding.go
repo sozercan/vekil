@@ -198,7 +198,7 @@ func extractExplicitResponsesOutputState(body []byte) ([]stateBindingToken, erro
 
 	object, ok := payload.(map[string]any)
 	if !ok {
-		return tokens, nil
+		return nil, fmt.Errorf("responses output root must be a JSON object")
 	}
 	visitItem := func(stateType stateBindingType, value string) {
 		add(stateType, value)
@@ -213,8 +213,11 @@ func extractExplicitResponsesOutputState(body []byte) ([]stateBindingToken, erro
 	// A non-streaming response is the root object. Streaming lifecycle events
 	// put the response under response, while output-item events put the exposed
 	// state-bearing artifact under item.
-	if err := visitResponse(object); err != nil {
-		return nil, err
+	eventType, _ := object["type"].(string)
+	if strings.TrimSpace(eventType) == "" {
+		if err := visitResponse(object); err != nil {
+			return nil, err
+		}
 	}
 	if response, ok := object["response"].(map[string]any); ok {
 		if err := visitResponse(response); err != nil {

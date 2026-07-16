@@ -90,7 +90,7 @@ func TestNormalizeResponsesStreamBodyPassesThroughDoneWithoutBinding(t *testing.
 	}
 }
 
-func TestNormalizeResponsesStreamBodyWithBindingFailsOpenForUnparseableEvents(t *testing.T) {
+func TestNormalizeResponsesStreamBodyWithBindingFailsOpenForExtractionErrors(t *testing.T) {
 	tests := []struct {
 		name   string
 		stream string
@@ -102,6 +102,18 @@ func TestNormalizeResponsesStreamBodyWithBindingFailsOpenForUnparseableEvents(t 
 		{
 			name:   "vendor non-JSON data",
 			stream: "event: vendor.extension\ndata: vendor-payload=opaque\n\n",
+		},
+		{
+			name:   "null JSON root",
+			stream: "event: vendor.extension\ndata: null\n\n",
+		},
+		{
+			name:   "array JSON root",
+			stream: "event: vendor.extension\ndata: []\n\n",
+		},
+		{
+			name:   "scalar JSON root",
+			stream: "event: vendor.extension\ndata: \"opaque\"\n\n",
 		},
 	}
 
@@ -130,6 +142,63 @@ func TestNormalizeResponsesStreamBodyWithBindingFailsOpenForUnparseableEvents(t 
 				t.Fatalf("state bindings after unparseable event = %#v, want empty", stats)
 			}
 		})
+	}
+}
+
+func TestNormalizeResponsesStreamBodyWithBindingIgnoresVendorEventRootID(t *testing.T) {
+	const eventID = "event-vendor"
+	const stream = "event: vendor.event\ndata: {\"type\":\"vendor.event\",\"id\":\"event-vendor\"}\n\n"
+	h := &ProxyHandler{}
+	body := normalizeResponsesStreamBodyWithBinding(h, io.NopCloser(strings.NewReader(stream)), explicitRouteResponseInfo{
+		routeID:  "route-1",
+		publicID: "public",
+		targetID: "target-1",
+	})
+	defer func() { _ = body.Close() }()
+
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if string(got) != stream {
+		t.Fatalf("stream = %q, want exact passthrough %q", got, stream)
+	}
+	store, err := h.ensureStateBindingStore()
+	if err != nil {
+		t.Fatalf("ensureStateBindingStore() error = %v", err)
+	}
+	if result := store.lookup(stateBindingTypeResponseID, eventID); result.outcome != stateBindingLookupUnknown {
+		t.Fatalf("vendor event root id binding outcome = %s, want unknown", result.outcome)
+	}
+}
+
+func TestNormalizeResponsesStreamBodyWithBindingBindsLifecycleNestedResponseIDOnly(t *testing.T) {
+	const eventID = "event-lifecycle"
+	const responseID = "resp-lifecycle"
+	const stream = "event: response.created\ndata: {\"type\":\"response.created\",\"id\":\"event-lifecycle\",\"response\":{\"id\":\"resp-lifecycle\",\"model\":\"physical\"}}\n\n"
+	h := &ProxyHandler{}
+	info := explicitRouteResponseInfo{routeID: "route-1", publicID: "public", targetID: "target-1"}
+	body := normalizeResponsesStreamBodyWithBinding(h, io.NopCloser(strings.NewReader(stream)), info)
+	defer func() { _ = body.Close() }()
+
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if strings.Contains(string(got), `"physical"`) || !strings.Contains(string(got), `"model":"public"`) {
+		t.Fatalf("stream = %s", got)
+	}
+	store, err := h.ensureStateBindingStore()
+	if err != nil {
+		t.Fatalf("ensureStateBindingStore() error = %v", err)
+	}
+	if result := store.lookup(stateBindingTypeResponseID, eventID); result.outcome != stateBindingLookupUnknown {
+		t.Fatalf("lifecycle event root id binding outcome = %s, want unknown", result.outcome)
+	}
+	wantOwner := stateBindingOwner{routeID: info.routeID, targetID: info.targetID}
+	result := store.lookup(stateBindingTypeResponseID, responseID)
+	if result.outcome != stateBindingLookupKnown || result.owner != wantOwner {
+		t.Fatalf("nested response id binding = %#v, want known owner %#v", result, wantOwner)
 	}
 }
 
@@ -236,36 +305,52 @@ func TestNormalizeResponsesStreamBodyWithBindingPropagatesTransportErrorAfterEar
 }
 
 func TestWriteExplicitResponsesResponseRejectsMalformedSuccessBeforeCommit(t *testing.T) {
-	w := newResponseModelNormalizationWriter()
-	resp := &http.Response{
-		StatusCode: http.StatusOK,
-		Header: http.Header{
-			"Content-Length": []string{"12"},
-			"Content-Type":   []string{"application/json"},
-			"X-Upstream":     []string{"present"},
-		},
-		Body: io.NopCloser(strings.NewReader(`{"id":`)),
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "malformed JSON", body: `{"id":`},
+		{name: "null root", body: `null`},
+		{name: "array root", body: `[]`},
+		{name: "string root", body: `"response"`},
+		{name: "number root", body: `42`},
+		{name: "boolean root", body: `true`},
 	}
 
-	err := writeExplicitResponsesResponse(context.Background(), &ProxyHandler{}, w, resp, explicitRouteResponseInfo{
-		routeID:  "route-1",
-		publicID: "public",
-		targetID: "target-1",
-	}, nil, "")
-	if err == nil {
-		t.Fatal("writeExplicitResponsesResponse() error = nil")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newResponseModelNormalizationWriter()
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Length": []string{strconv.Itoa(len(tc.body))},
+					"Content-Type":   []string{"application/json"},
+					"X-Upstream":     []string{"present"},
+				},
+				Body: io.NopCloser(strings.NewReader(tc.body)),
+			}
+
+			err := writeExplicitResponsesResponse(context.Background(), &ProxyHandler{}, w, resp, explicitRouteResponseInfo{
+				routeID:  "route-1",
+				publicID: "public",
+				targetID: "target-1",
+			}, nil, "")
+			if err == nil {
+				t.Fatal("writeExplicitResponsesResponse() error = nil")
+			}
+			var bodyErr *responseBodyWriteError
+			if !errors.As(err, &bodyErr) {
+				t.Fatalf("error type = %T, want *responseBodyWriteError", err)
+			}
+			if bodyErr.committed {
+				t.Fatal("response error was marked committed")
+			}
+			if !bodyErr.upstream {
+				t.Fatal("response parse failure was not marked upstream")
+			}
+			assertResponseModelNormalizationWriterUncommitted(t, w)
+		})
 	}
-	var bodyErr *responseBodyWriteError
-	if !errors.As(err, &bodyErr) {
-		t.Fatalf("error type = %T, want *responseBodyWriteError", err)
-	}
-	if bodyErr.committed {
-		t.Fatal("response error was marked committed")
-	}
-	if !bodyErr.upstream {
-		t.Fatal("response parse failure was not marked upstream")
-	}
-	assertResponseModelNormalizationWriterUncommitted(t, w)
 }
 
 func TestWriteExplicitResponsesResponsePreservesHeaderConflictFailure(t *testing.T) {

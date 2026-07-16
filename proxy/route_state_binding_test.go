@@ -253,6 +253,7 @@ func TestExtractExplicitResponsesOutputStateOnlyReadsResponseItems(t *testing.T)
 			name: "nested response output",
 			body: `{
 				"type":"response.completed",
+				"id":"event-nested",
 				"metadata":{"encrypted_content":"event-metadata"},
 				"response":{
 					"id":"resp-nested",
@@ -273,6 +274,7 @@ func TestExtractExplicitResponsesOutputStateOnlyReadsResponseItems(t *testing.T)
 			name: "output item event",
 			body: `{
 				"type":"response.output_item.done",
+				"id":"event-output-item",
 				"metadata":{"encrypted_content":"event-metadata"},
 				"item":{
 					"type":"compaction",
@@ -282,6 +284,24 @@ func TestExtractExplicitResponsesOutputStateOnlyReadsResponseItems(t *testing.T)
 			}`,
 			wantTokens: []stateBindingToken{
 				{stateType: stateBindingTypeEncryptedContent, value: "compaction-state"},
+			},
+		},
+		{
+			name: "vendor event root id is ordinary event data",
+			body: `{
+				"type":"vendor.event",
+				"id":"event-vendor"
+			}`,
+		},
+		{
+			name: "lifecycle event binds nested response id only",
+			body: `{
+				"type":"response.created",
+				"id":"event-lifecycle",
+				"response":{"id":"resp-lifecycle"}
+			}`,
+			wantTokens: []stateBindingToken{
+				{stateType: stateBindingTypeResponseID, value: "resp-lifecycle"},
 			},
 		},
 		{
@@ -327,6 +347,27 @@ func TestExtractExplicitResponsesOutputStateOnlyReadsResponseItems(t *testing.T)
 				t.Fatalf("extractExplicitResponsesOutputState() error = %v", err)
 			}
 			requireStateBindingTokens(t, got, tc.wantTokens)
+		})
+	}
+}
+
+func TestExtractExplicitResponsesOutputStateRequiresObjectRoot(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "null", body: `null`},
+		{name: "array", body: `[]`},
+		{name: "string", body: `"response"`},
+		{name: "number", body: `42`},
+		{name: "boolean", body: `true`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := extractExplicitResponsesOutputState([]byte(tc.body)); err == nil {
+				t.Fatal("extractExplicitResponsesOutputState() error = nil, want non-object root error")
+			}
 		})
 	}
 }
