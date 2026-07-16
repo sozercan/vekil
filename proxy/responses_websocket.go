@@ -88,13 +88,13 @@ func isResponsesWebSocketClientDisconnect(ctx context.Context, err error) bool {
 // ended with response.failed, response.incomplete, or a top-level error event
 // after forwarding the upstream failure event. This path also emits the standard
 // websocket error payload so clients can surface the upstream error details.
-var errStreamFailedUpstream = errors.New("upstream stream ended with response.failed or response.incomplete")
+var errStreamFailedUpstream = errors.New("upstream stream ended with response.failed, response.incomplete, or error")
 
 // streamFailedUpstreamError carries the HTTP status that an upstream
-// response.failed/incomplete event was classified to (e.g. 429 for a rate
-// limit, 503 for an overload), so the turn is recorded in stats with its exact
-// semantic status rather than a generic 502. It unwraps to errStreamFailedUpstream
-// so existing errors.Is checks keep working.
+// failure terminal event was classified to (e.g. 429 for a rate limit, 503 for
+// an overload), so the turn is recorded in stats with its exact semantic status
+// rather than a generic 502. It unwraps to errStreamFailedUpstream so existing
+// errors.Is checks keep working.
 type streamFailedUpstreamError struct {
 	status int
 }
