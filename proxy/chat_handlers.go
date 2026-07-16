@@ -330,23 +330,27 @@ func validateAnthropicMessageTokenLimits(req *models.AnthropicRequest, headers h
 	if *req.MaxTokens < 0 {
 		return fmt.Errorf("max_tokens must be greater than or equal to 0")
 	}
-	if *req.MaxTokens == 0 && req.Stream {
+
+	effectiveLimit := *req.MaxTokens
+	if req.Thinking != nil && req.Thinking.Type == "enabled" {
+		if req.Thinking.BudgetTokens == nil {
+			return fmt.Errorf("thinking.budget_tokens is required when thinking.type is enabled")
+		}
+		if *req.Thinking.BudgetTokens < 1024 {
+			return fmt.Errorf("thinking.budget_tokens must be greater than or equal to 1024")
+		}
+		interleavedThinking := anthropicBetaEnabled(headers, anthropicInterleavedThinkingBeta) &&
+			len(req.Tools) > 0 &&
+			(req.ToolChoice == nil || !strings.EqualFold(strings.TrimSpace(req.ToolChoice.Type), "none"))
+		if *req.Thinking.BudgetTokens >= *req.MaxTokens && !interleavedThinking {
+			return fmt.Errorf("thinking.budget_tokens must be less than max_tokens unless interleaved thinking with tools is enabled")
+		}
+		if *req.Thinking.BudgetTokens > effectiveLimit {
+			effectiveLimit = *req.Thinking.BudgetTokens
+		}
+	}
+	if effectiveLimit == 0 && req.Stream {
 		return fmt.Errorf("max_tokens must be greater than 0 when stream is true")
-	}
-	if req.Thinking == nil || req.Thinking.Type != "enabled" {
-		return nil
-	}
-	if req.Thinking.BudgetTokens == nil {
-		return fmt.Errorf("thinking.budget_tokens is required when thinking.type is enabled")
-	}
-	if *req.Thinking.BudgetTokens < 1024 {
-		return fmt.Errorf("thinking.budget_tokens must be greater than or equal to 1024")
-	}
-	interleavedThinking := anthropicBetaEnabled(headers, anthropicInterleavedThinkingBeta) &&
-		len(req.Tools) > 0 &&
-		(req.ToolChoice == nil || !strings.EqualFold(strings.TrimSpace(req.ToolChoice.Type), "none"))
-	if *req.Thinking.BudgetTokens >= *req.MaxTokens && !interleavedThinking {
-		return fmt.Errorf("thinking.budget_tokens must be less than max_tokens unless interleaved thinking with tools is enabled")
 	}
 	return nil
 }
