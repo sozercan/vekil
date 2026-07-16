@@ -475,7 +475,8 @@ func TestMetricsCollector_RecordRetry(t *testing.T) {
 	m.RecordRetry("copilot", "gpt-4o", 429)
 	m.RecordRetry("copilot", "gpt-4o", 429)
 	m.RecordRetry("copilot", "gpt-4o", 503)
-	m.RecordRetry("azure", "gpt-4", 0) // timeout
+	m.recordRetry("azure", "gpt-4", 0, context.DeadlineExceeded, true)
+	m.recordRetry("copilot", "gpt-4o", 0, fmt.Errorf("connection reset"), true)
 
 	metrics, err := m.registry.Gather()
 	if err != nil {
@@ -507,6 +508,15 @@ func TestMetricsCollector_RecordRetry(t *testing.T) {
 	})
 	if gotTimeout != 1 {
 		t.Errorf("retries(timeout) = %v, want 1", gotTimeout)
+	}
+
+	gotTransport := getCounterValue(metrics, "vekil_retries_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": "gpt-4o",
+		"reason":       "transport",
+	})
+	if gotTransport != 1 {
+		t.Errorf("retries(transport) = %v, want 1", gotTransport)
 	}
 }
 

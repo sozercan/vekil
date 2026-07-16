@@ -514,6 +514,16 @@ func TestCommandFromArgs(t *testing.T) {
 			want: cliCommandLogout,
 		},
 		{
+			name: "version subcommand dispatches",
+			args: []string{"vekil", "version"},
+			want: cliCommandVersion,
+		},
+		{
+			name: "version flag dispatches",
+			args: []string{"vekil", "--version"},
+			want: cliCommandVersion,
+		},
+		{
 			name: "unknown subcommand falls back to serve",
 			args: []string{"vekil", "serve"},
 			want: cliCommandServe,
@@ -526,6 +536,20 @@ func TestCommandFromArgs(t *testing.T) {
 				t.Fatalf("commandFromArgs(%v) = %v, want %v", tc.args, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestWriteVersionUsesBuildVariables(t *testing.T) {
+	oldVersion, oldCommit, oldGoVersion := version, commit, goVersion
+	t.Cleanup(func() {
+		version, commit, goVersion = oldVersion, oldCommit, oldGoVersion
+	})
+	version, commit, goVersion = "v1.2.3", "abc1234", "go1.26.5"
+
+	var stdout bytes.Buffer
+	writeVersion(&stdout)
+	if got, want := stdout.String(), "vekil v1.2.3 (commit abc1234, go1.26.5)\n"; got != want {
+		t.Fatalf("writeVersion() = %q, want %q", got, want)
 	}
 }
 

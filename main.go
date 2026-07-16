@@ -33,6 +33,7 @@ const (
 	cliCommandServe cliCommand = iota
 	cliCommandLogin
 	cliCommandLogout
+	cliCommandVersion
 )
 
 func main() {
@@ -43,6 +44,9 @@ func main() {
 		return
 	case cliCommandLogout:
 		runLogout(os.Args[2:])
+		return
+	case cliCommandVersion:
+		writeVersion(os.Stdout)
 		return
 	}
 
@@ -59,9 +63,18 @@ func commandFromArgs(args []string) cliCommand {
 		return cliCommandLogin
 	case "logout":
 		return cliCommandLogout
+	case "version", "--version", "-version":
+		return cliCommandVersion
 	default:
 		return cliCommandServe
 	}
+}
+
+func writeVersion(w io.Writer) {
+	if w == nil {
+		w = io.Discard
+	}
+	_, _ = fmt.Fprintf(w, "vekil %s (commit %s, %s)\n", version, commit, goVersion)
 }
 
 type loginOptions struct {

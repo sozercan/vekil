@@ -391,7 +391,7 @@ func (h *ProxyHandler) logRetryAttempt(ctx context.Context, attempt int, status 
 	}
 	if h != nil && h.metrics != nil && isRetryStatsTracked(ctx) {
 		provider, model, modelKnown := retryMetricLabelsFromContext(ctx)
-		h.metrics.recordRetry(provider, model, status, modelKnown)
+		h.metrics.recordRetry(provider, model, status, err, modelKnown)
 	}
 	if h == nil || h.log == nil {
 		return

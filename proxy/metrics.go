@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"sync"
@@ -182,14 +184,14 @@ func (m *MetricsCollector) addTokens(provider, model string, prompt, completion 
 
 // RecordRetry records one upstream retry attempt.
 func (m *MetricsCollector) RecordRetry(provider, model string, status int) {
-	m.recordRetry(provider, model, status, true)
+	m.recordRetry(provider, model, status, nil, true)
 }
 
-func (m *MetricsCollector) recordRetry(provider, model string, status int, modelKnown bool) {
+func (m *MetricsCollector) recordRetry(provider, model string, status int, err error, modelKnown bool) {
 	if m == nil {
 		return
 	}
-	reason := retryReasonLabel(status)
+	reason := retryReasonLabel(status, err)
 	m.retriesTotal.WithLabelValues(provider, m.modelLabel(provider, model, modelKnown), reason).Inc()
 }
 
@@ -253,10 +255,12 @@ func (m *MetricsCollector) Handler() http.Handler {
 
 // retryReasonLabel maps the upstream status code that triggered a retry to a
 // human-readable reason label for the vekil_retries_total metric.
-func retryReasonLabel(status int) string {
+func retryReasonLabel(status int, err error) string {
 	switch {
-	case status == 0:
+	case status == 0 && isRetryTimeout(err):
 		return "timeout"
+	case status == 0:
+		return "transport"
 	case status == http.StatusTooManyRequests:
 		return "429"
 	case status >= 500:
@@ -264,4 +268,15 @@ func retryReasonLabel(status int) string {
 	default:
 		return "other"
 	}
+}
+
+func isRetryTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var timeout interface{ Timeout() bool }
+	return errors.As(err, &timeout) && timeout.Timeout()
 }
