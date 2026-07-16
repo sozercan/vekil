@@ -1463,7 +1463,9 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 			if route == nil {
 				continue
 			}
-			owners[route.public.id] = route.public.routeID
+			for _, alias := range configuredPublicModelAliases(route.public.id) {
+				owners[alias] = route.public.routeID
+			}
 			rawEntries = append(rawEntries, append(json.RawMessage(nil), route.public.raw...))
 		}
 	}
@@ -1488,14 +1490,13 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 		if result.notModified {
 			models = filterProviderModels(provider, setup.modelsForProvider(provider.id))
 			for _, model := range models {
-				if existingProvider, exists := owners[model.publicID]; exists {
-					if existingProvider == model.providerID {
-						continue
-					}
-					return cachedModelsResponse{}, false, providerModelCollisionError(model.publicID, existingProvider, model.providerID)
+				appendModel, err := reserveMergedModelOwner(owners, model)
+				if err != nil {
+					return cachedModelsResponse{}, false, err
 				}
-				owners[model.publicID] = model.providerID
-				rawEntries = append(rawEntries, model.raw)
+				if appendModel {
+					rawEntries = append(rawEntries, model.raw)
+				}
 			}
 		}
 
@@ -1514,14 +1515,13 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 		}
 
 		for _, model := range models {
-			if existingProvider, exists := owners[model.publicID]; exists {
-				if existingProvider == model.providerID {
-					continue
-				}
-				return cachedModelsResponse{}, false, providerModelCollisionError(model.publicID, existingProvider, model.providerID)
+			appendModel, err := reserveMergedModelOwner(owners, model)
+			if err != nil {
+				return cachedModelsResponse{}, false, err
 			}
-			owners[model.publicID] = model.providerID
-			rawEntries = append(rawEntries, model.raw)
+			if appendModel {
+				rawEntries = append(rawEntries, model.raw)
+			}
 		}
 	}
 
@@ -1550,6 +1550,34 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 		expiry:     h.models.nowTime().Add(modelsCacheTTL),
 		etag:       mergedETag,
 	}, false, nil
+}
+
+// reserveMergedModelOwner reserves both the raw public ID and every normalized
+// request alias before a provider model is exposed in any /models response.
+// Exact duplicates from the same provider retain the historical first-entry
+// behavior; distinct IDs that share an alias are collisions even within one
+// provider, matching the strict version-2 route registry.
+func reserveMergedModelOwner(owners map[string]string, model providerModel) (bool, error) {
+	publicID := strings.TrimSpace(model.publicID)
+	if existingOwner, exists := owners[publicID]; exists {
+		if existingOwner == model.providerID {
+			return false, nil
+		}
+		return false, providerModelCollisionError(publicID, existingOwner, model.providerID)
+	}
+	aliases := configuredPublicModelAliases(publicID)
+	for _, alias := range aliases {
+		if alias == publicID {
+			continue
+		}
+		if existingOwner, exists := owners[alias]; exists {
+			return false, providerModelCollisionError(alias, existingOwner, model.providerID)
+		}
+	}
+	for _, alias := range aliases {
+		owners[alias] = model.providerID
+	}
+	return true, nil
 }
 
 // transformModelsResponse adds a Codex-compatible "models" field to the

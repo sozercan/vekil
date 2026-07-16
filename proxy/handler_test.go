@@ -8770,6 +8770,118 @@ func TestHandleModels_CanonicalCatalogOwnsRoutingAcrossQueryVariants(t *testing.
 	}
 }
 
+func TestHandleModels_QueryVariantRejectsExplicitRouteAliasCollisions(t *testing.T) {
+	const (
+		explicitModel = "claude-sonnet-4.5"
+		explicitAlias = "claude-sonnet-4-5"
+	)
+
+	tests := []struct {
+		name         string
+		variantModel string
+		wantStatus   int
+	}{
+		{name: "exact public id collision", variantModel: explicitModel, wantStatus: http.StatusBadGateway},
+		{name: "normalized alias collision", variantModel: explicitAlias, wantStatus: http.StatusBadGateway},
+		{name: "noncolliding model", variantModel: "variant-model", wantStatus: http.StatusOK},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var modelQueriesMu sync.Mutex
+			modelQueries := make([]string, 0, 2)
+			dynamic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != providerEndpointModels {
+					t.Fatalf("dynamic path = %q, want %q", r.URL.Path, providerEndpointModels)
+				}
+				modelQueriesMu.Lock()
+				modelQueries = append(modelQueries, r.URL.RawQuery)
+				modelQueriesMu.Unlock()
+				model := "safe-canonical-model"
+				if r.URL.RawQuery != "" {
+					model = tc.variantModel
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"object":"list","data":[{"id":%q,"object":"model","owned_by":"dynamic","supported_endpoints":["/responses"]}]}`, model)
+			}))
+			defer dynamic.Close()
+
+			explicit := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != providerEndpointResponses {
+					t.Fatalf("explicit path = %q, want %q", r.URL.Path, providerEndpointResponses)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"resp-explicit","object":"response","status":"completed","model":"physical-explicit","output":[]}`)
+			}))
+			defer explicit.Close()
+
+			h, err := NewProxyHandler(
+				auth.NewTestAuthenticator("test-token"),
+				logger.NewWithWriter(logger.LevelError, io.Discard),
+				WithDeferredDynamicProviderModelValidation(true),
+				WithProvidersConfig(ProvidersConfig{
+					SchemaVersion: ProvidersConfigSchemaVersion2,
+					Providers: []ProviderConfig{
+						{ID: "dynamic", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: dynamic.URL, AuthType: "none", ModelDiscovery: string(providerModelDiscoveryOpenAI)},
+						{ID: "explicit", Type: string(providerTypeOpenAICompatible), BaseURL: explicit.URL, AuthType: "none"},
+					},
+					ModelRoutes: []ModelRouteConfig{{
+						ID: "explicit-route", PublicID: explicitModel, Endpoints: []string{providerEndpointResponses},
+						Targets: []ModelRouteTargetConfig{{ID: "target", Provider: "explicit", UpstreamModel: "physical-explicit"}},
+					}},
+				}),
+			)
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+			defer h.BeginShutdown()
+
+			w := httptest.NewRecorder()
+			h.HandleModels(w, httptest.NewRequest(http.MethodGet, "/v1/models?view=variant", nil))
+			resp := w.Result()
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != tc.wantStatus {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("variant status = %d, want %d: %s", resp.StatusCode, tc.wantStatus, body)
+			}
+			if tc.wantStatus == http.StatusOK {
+				var catalog struct {
+					Data []struct {
+						ID string `json:"id"`
+					} `json:"data"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
+					t.Fatalf("decode variant catalog: %v", err)
+				}
+				ids := make([]string, 0, len(catalog.Data))
+				for _, model := range catalog.Data {
+					ids = append(ids, model.ID)
+				}
+				if len(ids) != 2 || ids[0] != explicitModel || ids[1] != tc.variantModel {
+					t.Fatalf("variant catalog ids = %v, want [%s %s]", ids, explicitModel, tc.variantModel)
+				}
+			}
+
+			for _, requested := range []string{explicitModel, explicitAlias} {
+				route, known := h.resolveModelRouteForRequest(requested, providerEndpointResponses)
+				if !known || route == nil || route.legacy || route.public.routeID != "explicit-route" {
+					t.Fatalf("route for %q = %+v, known=%v; want explicit-route", requested, route, known)
+				}
+			}
+			owner, ok := h.providerSetup().lookupModel("safe-canonical-model")
+			if !ok || owner.providerID != "dynamic" {
+				t.Fatalf("canonical dynamic owner = %+v, ok=%v; want dynamic", owner, ok)
+			}
+			modelQueriesMu.Lock()
+			queries := append([]string(nil), modelQueries...)
+			modelQueriesMu.Unlock()
+			if len(queries) != 2 || queries[0] != "" || queries[1] != "view=variant" {
+				t.Fatalf("models queries = %v, want canonical then variant", queries)
+			}
+		})
+	}
+}
+
 func TestHandleModels_QueryVariantFirstSeedsCanonicalResponsesRouting(t *testing.T) {
 	var modelsMu sync.Mutex
 	modelsQueries := make([]string, 0, 2)
