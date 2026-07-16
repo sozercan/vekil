@@ -59,13 +59,48 @@ func TestRequestSummaryRouteObservability(t *testing.T) {
 	}
 }
 
+func TestRequestSummarySeparatesLastAttemptFromFinalRouteAttribution(t *testing.T) {
+	summary := &RequestSummary{}
+
+	summary.recordUpstreamAttempt("op-123", "route-gpt", "target-primary", "provider-primary", "azure-openai")
+	summary.recordUpstreamAttempt("op-123", "route-gpt", "target-secondary", "provider-secondary", "openai-compatible")
+
+	if got := summary.FinalTarget(); got != "" {
+		t.Fatalf("FinalTarget before result selection = %q, want empty", got)
+	}
+	lastTarget, lastProvider, lastKind := summary.lastUpstreamAttempt()
+	if lastTarget != "target-secondary" || lastProvider != "provider-secondary" || lastKind != "openai-compatible" {
+		t.Fatalf("last attempt = %q/%q/%q, want secondary attribution", lastTarget, lastProvider, lastKind)
+	}
+
+	// The executor can select an earlier, higher-precedence result even though a
+	// later target was dispatched. Canonical attribution must follow that result.
+	summary.setFinalRouteAttribution("target-primary", "provider-primary", "azure-openai")
+	stats := readSummaryForStats(summary)
+	if stats.finalTarget != "target-primary" || stats.provider != "provider-primary" || stats.kind != "azure-openai" {
+		t.Fatalf("final attribution = %q/%q/%q, want primary attribution", stats.finalTarget, stats.provider, stats.kind)
+	}
+	if stats.upstreamSends != 2 {
+		t.Fatalf("upstream sends = %d, want 2", stats.upstreamSends)
+	}
+	lastTarget, lastProvider, lastKind = summary.lastUpstreamAttempt()
+	if lastTarget != "target-secondary" || lastProvider != "provider-secondary" || lastKind != "openai-compatible" {
+		t.Fatalf("last attempt after final selection = %q/%q/%q, want secondary attribution", lastTarget, lastProvider, lastKind)
+	}
+}
+
 func TestRequestSummaryRouteObservabilityNilSafe(t *testing.T) {
 	var summary *RequestSummary
 	summary.SetOperationID("op")
 	summary.SetRouteID("route")
 	summary.SetFinalTarget("target")
+	summary.setFinalRouteAttribution("target", "provider", "kind")
+	summary.recordUpstreamAttempt("op", "route", "target", "provider", "kind")
 	summary.RecordUpstreamSend()
 	summary.RecordTargetSwitch()
+	if target, provider, kind := summary.lastUpstreamAttempt(); target != "" || provider != "" || kind != "" {
+		t.Fatalf("nil last attempt = %q/%q/%q, want empty", target, provider, kind)
+	}
 	if summary.MarkRouteExhausted() {
 		t.Fatal("nil MarkRouteExhausted = true, want false")
 	}

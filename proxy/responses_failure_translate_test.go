@@ -644,7 +644,7 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 	}
 }
 
-func TestResponsesFailureOutputHasProgress(t *testing.T) {
+func TestResponsesOutputHasProgress(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -672,10 +672,139 @@ func TestResponsesFailureOutputHasProgress(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := responsesFailureOutputHasProgress(tt.raw); got != tt.want {
-				t.Fatalf("responsesFailureOutputHasProgress(%q) = %t, want %t", tt.raw, got, tt.want)
+			if got := responsesOutputHasProgress(tt.raw); got != tt.want {
+				t.Fatalf("responsesOutputHasProgress(%q) = %t, want %t", tt.raw, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestExplicitRouteStreamingPreambleProgressDoesNotSwitch(t *testing.T) {
+	tests := []struct {
+		name          string
+		preambleType  string
+		responseField string
+	}{
+		{name: "created with output", preambleType: "response.created", responseField: `"output":[{"type":"message"}]`},
+		{name: "created with usage", preambleType: "response.created", responseField: `"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}`},
+		{name: "created with malformed output", preambleType: "response.created", responseField: `"output":{}`},
+		{name: "in progress with output", preambleType: "response.in_progress", responseField: `"output":[{"type":"message"}]`},
+		{name: "in progress with usage", preambleType: "response.in_progress", responseField: `"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}`},
+		{name: "in progress with malformed output", preambleType: "response.in_progress", responseField: `"output":{}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			preamble := fmt.Sprintf("event: %s\ndata: {\"type\":%q,\"response\":{\"id\":\"resp-primary\",%s}}\n\n", tt.preambleType, tt.preambleType, tt.responseField)
+			failure := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-primary\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"quota\"}}}\n\n"
+			secondary := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-secondary\",\"output\":[]}}\n\n"
+
+			var secondaryCalls atomic.Int32
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var body io.ReadCloser
+				switch req.URL.Hostname() {
+				case "primary.example":
+					body = newSplitChunkEOFReadCloser(preamble, failure)
+				case "secondary.example":
+					secondaryCalls.Add(1)
+					body = io.NopCloser(strings.NewReader(secondary))
+				default:
+					t.Fatalf("unexpected target host %q", req.URL.Hostname())
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       body,
+					Request:    req,
+				}, nil
+			})}
+
+			h, route := explicitRouteTestHandler(t, client, routeModePriorityFailover, 2, 2,
+				explicitRouteTestProvider("primary", "https://primary.example", "one"),
+				explicitRouteTestProvider("secondary", "https://secondary.example", "two"),
+			)
+			requestCtx, summary := WithRequestSummary(context.Background())
+			ctx := withRouteOperation(requestCtx, newRouteOperation(route, requestCtx))
+			resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model","stream":true}`), nil, "public-model", true)
+			if err != nil {
+				t.Fatalf("error = %v", err)
+			}
+			if resp == nil {
+				t.Fatal("response = nil, want original primary stream")
+			}
+			defer func() { _ = resp.Body.Close() }()
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				t.Fatalf("read response: %v", readErr)
+			}
+			if !strings.Contains(string(body), "resp-primary") || !strings.Contains(string(body), "response.failed") {
+				t.Fatalf("body = %s, want original primary preamble and failure", body)
+			}
+			if strings.Contains(string(body), "resp-secondary") {
+				t.Fatalf("body = %s, unexpectedly contains secondary response", body)
+			}
+			if got := secondaryCalls.Load(); got != 0 {
+				t.Fatalf("secondary calls = %d, want 0", got)
+			}
+			if got := summary.TargetSwitchCount(); got != 0 {
+				t.Fatalf("target switches = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestExplicitRouteStreamingCleanPreambleStillSwitchesAcrossChunks(t *testing.T) {
+	created := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-primary\",\"output\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n"
+	inProgress := "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp-primary\",\"output\":null}}\n\n"
+	failure := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-primary\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"quota\"}}}\n\n"
+	secondary := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-secondary\",\"output\":[]}}\n\n"
+
+	var secondaryCalls atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var body io.ReadCloser
+		switch req.URL.Hostname() {
+		case "primary.example":
+			body = newSplitChunkEOFReadCloser(created, inProgress, failure)
+		case "secondary.example":
+			secondaryCalls.Add(1)
+			body = io.NopCloser(strings.NewReader(secondary))
+		default:
+			t.Fatalf("unexpected target host %q", req.URL.Hostname())
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       body,
+			Request:    req,
+		}, nil
+	})}
+
+	h, route := explicitRouteTestHandler(t, client, routeModePriorityFailover, 2, 2,
+		explicitRouteTestProvider("primary", "https://primary.example", "one"),
+		explicitRouteTestProvider("secondary", "https://secondary.example", "two"),
+	)
+	requestCtx, summary := WithRequestSummary(context.Background())
+	ctx := withRouteOperation(requestCtx, newRouteOperation(route, requestCtx))
+	resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model","stream":true}`), nil, "public-model", true)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if resp == nil {
+		t.Fatal("response = nil, want secondary stream")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		t.Fatalf("read response: %v", readErr)
+	}
+	if strings.Contains(string(body), "resp-primary") || !strings.Contains(string(body), "resp-secondary") {
+		t.Fatalf("body = %s, want only secondary response", body)
+	}
+	if got := secondaryCalls.Load(); got != 1 {
+		t.Fatalf("secondary calls = %d, want 1", got)
+	}
+	if got := summary.TargetSwitchCount(); got != 1 {
+		t.Fatalf("target switches = %d, want 1", got)
 	}
 }
 

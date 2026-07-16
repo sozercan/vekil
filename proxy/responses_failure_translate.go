@@ -65,6 +65,8 @@ type peekResult struct {
 	bufferedBytes       int
 	peekDuration        time.Duration
 	preamble            bool
+	eventOutputProgress bool
+	eventUsageProgress  bool
 	precommitReplaySafe bool
 }
 
@@ -86,9 +88,10 @@ type responsesSSEMessage struct {
 }
 
 type responsesSSEParser struct {
-	pending  []byte
-	allowBOM bool
-	done     bool
+	pending           []byte
+	allowBOM          bool
+	done              bool
+	sawUnsafeProgress bool
 }
 
 // responsesTerminalObserver incrementally inspects committed Responses SSE
@@ -1328,7 +1331,7 @@ func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.He
 	}
 }
 
-func responsesFailureOutputHasProgress(raw json.RawMessage) bool {
+func responsesOutputHasProgress(raw json.RawMessage) bool {
 	if len(raw) == 0 {
 		return false
 	}
@@ -1345,7 +1348,6 @@ func inspectResponsesPeekMessages(parser *responsesSSEParser, headers http.Heade
 	result := peekResult{decision: responsesPeekDecisionPassthrough}
 	sawSemantic := false
 	sawBeyondPreamble := false
-	sawUnsafeProgress := false
 	for {
 		msg, ok := parser.nextSemantic()
 		if !ok {
@@ -1356,31 +1358,30 @@ func inspectResponsesPeekMessages(parser *responsesSSEParser, headers http.Heade
 			break
 		}
 		classified := classifyResponsesPeekMessage(msg, headers)
-		unsafeBeforeMessage := sawUnsafeProgress
-		failureHasOutput := classified.failure != nil && responsesFailureOutputHasProgress(classified.failure.Response.Output)
-		failureHasUsage := classified.failure != nil && !classified.failure.Response.Usage.isZero()
-		if classified.failure != nil && !unsafeBeforeMessage && !failureHasOutput && !failureHasUsage {
+		unsafeBeforeMessage := parser.sawUnsafeProgress
+		if classified.failure != nil && !unsafeBeforeMessage && !classified.eventOutputProgress && !classified.eventUsageProgress {
 			classified.precommitReplaySafe = true
 		}
-		if failureHasOutput || failureHasUsage {
-			// Partial output and usage both prove that the target made semantic
-			// progress, so another target must not be attempted. Usage alone does
-			// not prevent translating a still-uncommitted terminal failure into
-			// its HTTP error; embedded output does, because translation would drop
-			// client-visible model output carried by the failure event.
-			sawUnsafeProgress = true
+		if classified.eventOutputProgress || classified.eventUsageProgress {
+			// Output and usage on any parsed event, including a nominal preamble,
+			// prove or ambiguously suggest semantic progress. Another target must
+			// not be attempted. Usage carried by the terminal failure itself still
+			// permits HTTP error translation; embedded output does not, because
+			// translation would drop client-visible model output.
+			parser.sawUnsafeProgress = true
 		}
-		if failureHasOutput {
+		if classified.eventOutputProgress {
 			classified.decision = responsesPeekDecisionPassthrough
 		}
 		peekState.publishTerminal(classified)
-		if !sawSemantic || (preferTranslatedFailure && !unsafeBeforeMessage && !failureHasOutput && classified.decision == responsesPeekDecisionTranslate) {
+		preserveUnsafeStream := unsafeBeforeMessage && classified.decision == responsesPeekDecisionTranslate
+		if (!sawSemantic && !preserveUnsafeStream) || (preferTranslatedFailure && !unsafeBeforeMessage && !classified.eventOutputProgress && classified.decision == responsesPeekDecisionTranslate) {
 			result = classified
 		}
 		if !classified.preamble {
 			sawBeyondPreamble = true
 			if classified.terminal == nil || classified.failure == nil {
-				sawUnsafeProgress = true
+				parser.sawUnsafeProgress = true
 			}
 		}
 		sawSemantic = true
@@ -1496,7 +1497,11 @@ func classifyResponsesPeekMessage(msg responsesSSEMessage, headers http.Header) 
 }
 
 func classifyResponsesPeekEvent(event responsesWebSocketStreamEvent, eventName string, headers http.Header) peekResult {
-	result := peekResult{decision: responsesPeekDecisionPassthrough}
+	result := peekResult{
+		decision:            responsesPeekDecisionPassthrough,
+		eventOutputProgress: responsesOutputHasProgress(event.Response.Output),
+		eventUsageProgress:  !event.Response.Usage.isZero(),
+	}
 	eventName = strings.TrimSpace(eventName)
 	terminalType := strings.TrimSpace(event.Type)
 	if terminalType == "" {

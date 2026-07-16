@@ -1673,9 +1673,6 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		s.historyItems = cloneRawMessages(metrics.pendingCompactedHistory)
 		s.historyBytes = rawMessagesSize(s.historyItems)
 	}
-	if metrics.deltaFallback {
-		s.turnState = ""
-	}
 	if pendingExplicitTurnState != "" {
 		s.turnState = pendingExplicitTurnState
 	}

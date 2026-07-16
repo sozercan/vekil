@@ -340,7 +340,7 @@ func TestExplicitRouteSurfacesRejectAmbiguousJSONBeforeTranslation(t *testing.T)
 		{
 			name: "OpenAI Chat",
 			path: "/v1/chat/completions",
-			body: `{"model":"public-model","model":"shadow-model","messages":[{"role":"user","content":"hi"}]}`,
+			body: `{"model":"shadow-model","model":"public-model","messages":[{"role":"user","content":"hi"}]}`,
 			run:  func(h *ProxyHandler, w http.ResponseWriter, r *http.Request) { h.HandleOpenAIChatCompletions(w, r) },
 		},
 		{
@@ -493,6 +493,144 @@ func TestMixedRouteConfigScopesAmbiguousJSONValidationToExplicitRoutes(t *testin
 			t.Fatalf("body = %s, want duplicate-key detail", w.Body.String())
 		}
 	})
+}
+
+func TestMixedRouteConfigOpenAIChatDuplicateModelValidationUsesForwardingSemantics(t *testing.T) {
+	const (
+		firstLegacyModel = "legacy-first"
+		lastLegacyModel  = "legacy-last"
+		explicitModel    = "explicit-model"
+	)
+
+	var legacyCalls, explicitCalls atomic.Int32
+	legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		legacyCalls.Add(1)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode legacy request: %v", err)
+		}
+		model, _ := body["model"].(string)
+		if stream, _ := body["stream"].(bool); stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, `data: {"id":"chat-legacy","object":"chat.completion.chunk","model":"`+model+`","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chat-legacy","object":"chat.completion","model":"`+model+`","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer legacy.Close()
+
+	explicit := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		explicitCalls.Add(1)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode explicit request: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chat-explicit\",\"object\":\"chat.completion.chunk\",\"model\":\"physical-explicit\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"unexpected\"},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer explicit.Close()
+
+	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
+		SchemaVersion: ProvidersConfigSchemaVersion2,
+		Providers: []ProviderConfig{
+			{
+				ID:       "legacy",
+				Type:     string(providerTypeOpenAICompatible),
+				Default:  true,
+				BaseURL:  legacy.URL,
+				AuthType: "none",
+				Models: []ProviderModelConfig{
+					{PublicID: firstLegacyModel, Endpoints: []string{providerEndpointChatCompletions}},
+					{PublicID: lastLegacyModel, Endpoints: []string{providerEndpointChatCompletions}},
+				},
+			},
+			{ID: "explicit", Type: string(providerTypeOpenAICompatible), BaseURL: explicit.URL, AuthType: "none"},
+		},
+		ModelRoutes: []ModelRouteConfig{{
+			ID:        "explicit-route",
+			PublicID:  explicitModel,
+			Endpoints: []string{providerEndpointChatCompletions},
+			Targets: []ModelRouteTargetConfig{{
+				ID: "target", Provider: "explicit", UpstreamModel: "physical-explicit",
+			}},
+		}},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.BeginShutdown()
+
+	tests := []struct {
+		name              string
+		models            string
+		wantStatus        int
+		wantLegacyCalls   int32
+		wantExplicitCalls int32
+		wantResponseModel string
+		stream            bool
+	}{
+		{
+			name:       "first legacy last explicit rejects",
+			models:     `"model":"legacy-first","model":"explicit-model"`,
+			wantStatus: http.StatusBadRequest,
+			stream:     true,
+		},
+		{
+			name:              "first explicit last legacy follows last decoded model",
+			models:            `"model":"explicit-model","model":"legacy-last"`,
+			wantStatus:        http.StatusOK,
+			wantLegacyCalls:   1,
+			wantResponseModel: lastLegacyModel,
+		},
+		{
+			name:       "same explicit duplicates reject",
+			models:     `"model":"explicit-model","model":"explicit-model"`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:              "purely legacy duplicates keep provider behavior",
+			models:            `"model":"legacy-first","model":"legacy-last"`,
+			wantStatus:        http.StatusOK,
+			wantLegacyCalls:   1,
+			wantResponseModel: lastLegacyModel,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			legacyBefore := legacyCalls.Load()
+			explicitBefore := explicitCalls.Load()
+			stream := ""
+			if tt.stream {
+				stream = `,"stream":true`
+			}
+			body := `{` + tt.models + stream + `,"messages":[{"role":"user","content":"hi"}]}`
+			w := httptest.NewRecorder()
+			h.HandleOpenAIChatCompletions(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d body=%s, want %d", w.Code, w.Body.String(), tt.wantStatus)
+			}
+			if got := legacyCalls.Load() - legacyBefore; got != tt.wantLegacyCalls {
+				t.Fatalf("legacy calls = %d, want %d", got, tt.wantLegacyCalls)
+			}
+			if got := explicitCalls.Load() - explicitBefore; got != tt.wantExplicitCalls {
+				t.Fatalf("explicit calls = %d, want %d", got, tt.wantExplicitCalls)
+			}
+			if tt.wantStatus == http.StatusBadRequest {
+				if !strings.Contains(w.Body.String(), "duplicate") {
+					t.Fatalf("body = %s, want duplicate-key detail", w.Body.String())
+				}
+				return
+			}
+			if !strings.Contains(w.Body.String(), `"model":"`+tt.wantResponseModel+`"`) {
+				t.Fatalf("body = %s, want response model %q", w.Body.String(), tt.wantResponseModel)
+			}
+		})
+	}
 }
 
 func TestExplicitRouteGeminiCompressionAliasUsesCanonicalRouteOperation(t *testing.T) {

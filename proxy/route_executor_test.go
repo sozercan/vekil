@@ -240,6 +240,119 @@ func TestExplicitRoutePrewriteFailureCanSwitchButAmbiguousCannot(t *testing.T) {
 	}
 }
 
+func TestExplicitRouteFinalAttributionFollowsReturnedResult(t *testing.T) {
+	tests := []struct {
+		name              string
+		secondaryResult   string
+		wantStatus        int
+		wantBodySubstring string
+		wantErrSubstring  string
+		wantTarget        string
+		wantProvider      string
+		wantKind          string
+	}{
+		{
+			name:              "earlier primary response after later prewrite failure",
+			secondaryResult:   "prewrite_error",
+			wantStatus:        http.StatusTooManyRequests,
+			wantBodySubstring: "primary quota",
+			wantTarget:        "target-primary",
+			wantProvider:      "primary",
+			wantKind:          string(providerTypeAzureOpenAI),
+		},
+		{
+			name:              "later successful response",
+			secondaryResult:   "success",
+			wantStatus:        http.StatusOK,
+			wantBodySubstring: "resp-secondary",
+			wantTarget:        "target-secondary",
+			wantProvider:      "secondary",
+			wantKind:          string(providerTypeOpenAICompatible),
+		},
+		{
+			name:             "later ambiguous error",
+			secondaryResult:  "ambiguous_error",
+			wantErrSubstring: "secondary ambiguous failure",
+			wantTarget:       "target-secondary",
+			wantProvider:     "secondary",
+			wantKind:         string(providerTypeOpenAICompatible),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Hostname() {
+				case "primary.example":
+					return routeExecutorTestResponse(req, http.StatusTooManyRequests, nil, `{"error":{"message":"primary quota","type":"rate_limit_error"}}`), nil
+				case "secondary.example":
+					switch tc.secondaryResult {
+					case "success":
+						return routeExecutorTestResponse(req, http.StatusOK, nil, `{"id":"resp-secondary","status":"completed","output":[]}`), nil
+					case "ambiguous_error":
+						if trace := httptrace.ContextClientTrace(req.Context()); trace != nil && trace.WroteHeaders != nil {
+							trace.WroteHeaders()
+						}
+						return nil, errors.New("secondary ambiguous failure")
+					default:
+						return nil, errors.New("secondary prewrite failure")
+					}
+				default:
+					t.Fatalf("unexpected target host %q", req.URL.Hostname())
+					return nil, errors.New("unexpected target")
+				}
+			})
+
+			primary := explicitRouteTestProvider("primary", "https://primary.example", "one")
+			secondary := explicitRouteTestProvider("secondary", "https://secondary.example", "two")
+			secondary.kind = providerTypeOpenAICompatible
+			secondary.paths = providerEndpointPolicyFor(providerTypeOpenAICompatible).defaultEndpointPaths()
+			h, route := explicitRouteTestHandler(t, &http.Client{Transport: transport}, routeModePriorityFailover, 2, 2, primary, secondary)
+			inbound, summary := WithRequestSummary(context.Background())
+			operation := newRouteOperation(route, inbound)
+			ctx := withRouteOperation(context.Background(), operation)
+
+			resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model"}`), nil, "public-model", false)
+			if tc.wantErrSubstring != "" {
+				if resp != nil {
+					_ = resp.Body.Close()
+					t.Fatalf("response = %#v, want error", resp)
+				}
+				if err == nil || !strings.Contains(err.Error(), tc.wantErrSubstring) {
+					t.Fatalf("error = %v, want substring %q", err, tc.wantErrSubstring)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("error = %v", err)
+				}
+				if resp == nil || resp.StatusCode != tc.wantStatus {
+					t.Fatalf("response = %#v, want status %d", resp, tc.wantStatus)
+				}
+				responseBody, readErr := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if readErr != nil {
+					t.Fatalf("read response body: %v", readErr)
+				}
+				if tc.wantBodySubstring != "" && !strings.Contains(string(responseBody), tc.wantBodySubstring) {
+					t.Fatalf("response body = %s, want substring %q", responseBody, tc.wantBodySubstring)
+				}
+			}
+
+			stats := readSummaryForStats(summary)
+			if stats.finalTarget != tc.wantTarget || stats.provider != tc.wantProvider || stats.kind != tc.wantKind {
+				t.Fatalf("final attribution = %q/%q/%q, want %q/%q/%q", stats.finalTarget, stats.provider, stats.kind, tc.wantTarget, tc.wantProvider, tc.wantKind)
+			}
+			if stats.upstreamSends != 2 || stats.targetSwitches != 1 {
+				t.Fatalf("route counts = sends:%d switches:%d, want 2/1", stats.upstreamSends, stats.targetSwitches)
+			}
+			lastTarget, lastProvider, lastKind := summary.lastUpstreamAttempt()
+			if lastTarget != "target-secondary" || lastProvider != "secondary" || lastKind != string(providerTypeOpenAICompatible) {
+				t.Fatalf("last attempt = %q/%q/%q, want secondary attribution", lastTarget, lastProvider, lastKind)
+			}
+		})
+	}
+}
+
 func TestExplicitRouteExhaustionAccountingRequiresBudgetOrNoTarget(t *testing.T) {
 	tests := []struct {
 		name               string

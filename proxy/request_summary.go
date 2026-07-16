@@ -24,6 +24,9 @@ type RequestSummary struct {
 	operationID       string
 	routeID           string
 	finalTarget       string
+	lastTarget        string
+	lastProvider      string
+	lastProviderKind  string
 	upstreamSendCount int64
 	targetSwitchCount int64
 	routeExhausted    bool
@@ -134,9 +137,10 @@ func (s *RequestSummary) RouteID() string {
 	return s.routeID
 }
 
-// SetFinalTarget records the latest physical target selected for the logical
-// operation. Unlike operation and route IDs, the target is intentionally
-// replaceable because a safe failover changes the final/canonical target.
+// SetFinalTarget records the final/canonical physical target selected for the
+// logical operation. Unlike operation and route IDs, the target is intentionally
+// replaceable because a later result-selection step can supersede an earlier
+// provisional result.
 func (s *RequestSummary) SetFinalTarget(targetID string) {
 	if s == nil {
 		return
@@ -148,6 +152,28 @@ func (s *RequestSummary) SetFinalTarget(targetID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.finalTarget = targetID
+}
+
+// setFinalRouteAttribution atomically records the target/provider attribution
+// for the response or error the route executor actually returns. A result with
+// no physical target leaves canonical attribution unchanged rather than
+// promoting the most recently dispatched attempt.
+func (s *RequestSummary) setFinalRouteAttribution(targetID, provider, kind string) {
+	if s == nil {
+		return
+	}
+	targetID = strings.TrimSpace(targetID)
+	provider = strings.TrimSpace(provider)
+	kind = strings.TrimSpace(kind)
+	if targetID == "" {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finalTarget = targetID
+	s.provider = provider
+	s.providerKind = kind
 }
 
 // FinalTarget returns the final/canonical physical target ID, if known.
@@ -171,9 +197,10 @@ func (s *RequestSummary) RecordUpstreamSend() {
 	s.upstreamSendCount++
 }
 
-// recordUpstreamAttempt applies one physical-send observation atomically so a
-// concurrent final stats read cannot see route/target/provider metadata from a
-// different send count.
+// recordUpstreamAttempt applies one physical-send observation atomically. The
+// latest dispatched target/provider is kept separate from final attribution so
+// a later prewrite failure cannot overwrite an earlier response selected for
+// return by the route executor.
 func (s *RequestSummary) recordUpstreamAttempt(operationID, routeID, targetID, provider, kind string) {
 	if s == nil {
 		return
@@ -193,15 +220,24 @@ func (s *RequestSummary) recordUpstreamAttempt(operationID, routeID, targetID, p
 		s.routeID = routeID
 	}
 	if targetID != "" {
-		s.finalTarget = targetID
+		s.lastTarget = targetID
 	}
 	if provider != "" {
-		s.provider = provider
+		s.lastProvider = provider
 	}
 	if kind != "" {
-		s.providerKind = kind
+		s.lastProviderKind = kind
 	}
 	s.upstreamSendCount++
+}
+
+func (s *RequestSummary) lastUpstreamAttempt() (targetID, provider, kind string) {
+	if s == nil {
+		return "", "", ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastTarget, s.lastProvider, s.lastProviderKind
 }
 
 // UpstreamSendCount returns the number of physical upstream dispatches made for

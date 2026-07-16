@@ -322,6 +322,10 @@ func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*h
 	return h.postJSONEndpoint(ctx, providerEndpointChatCompletions, body)
 }
 
+func (h *ProxyHandler) postChatCompletionsForModel(ctx context.Context, body []byte, model string) (*http.Response, error) {
+	return h.postJSONEndpointWithHeadersForModel(ctx, providerEndpointChatCompletions, body, nil, model)
+}
+
 func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
 	return h.postResponsesWithHeadersForModel(ctx, body, extraHeaders, extractRequestModel(body))
 }

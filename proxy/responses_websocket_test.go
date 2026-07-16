@@ -3112,7 +3112,7 @@ func TestHandleResponsesWebSocket_TurnStateDeltaKeepsStateWhenTurnMetadataEnrich
 
 func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing.T) {
 	var upstreamRequestsMu sync.Mutex
-	upstreamRequests := make([]map[string]interface{}, 0, 3)
+	upstreamRequests := make([]map[string]interface{}, 0, 4)
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -3146,8 +3146,17 @@ func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing
 				t.Fatalf("expected full replay fallback to omit turn state, got %q", got)
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("X-Codex-Turn-State", "turn-state-2")
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		case 4:
+			if got := r.Header.Get("X-Codex-Turn-State"); got != "turn-state-2" {
+				t.Fatalf("expected next delta to reuse fallback turn state, got %q", got)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("X-Codex-Turn-State", "turn-state-3")
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-3\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-3\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
 		default:
 			t.Fatalf("unexpected upstream request count %d", requestCount)
 		}
@@ -3215,6 +3224,41 @@ func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing
 	}
 	if got := inputTextFromMessage(t, fallbackInput[2]); got != "follow up" {
 		t.Fatalf("expected fallback replay to include latest user turn, got %q", got)
+	}
+
+	third := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "after fallback"},
+			},
+		},
+	})
+	third["previous_response_id"] = websocketResponseID(t, created)
+	if err := conn.WriteJSON(third); err != nil {
+		t.Fatalf("failed to write third request: %v", err)
+	}
+
+	thirdCreated := mustReadWebSocketJSONSkipMetadata(t, conn)
+	thirdCompleted := mustReadWebSocketJSON(t, conn)
+	if thirdCreated["type"] != "response.created" {
+		t.Fatalf("expected subsequent response.created event, got %v", thirdCreated["type"])
+	}
+	if thirdCompleted["type"] != "response.completed" {
+		t.Fatalf("expected subsequent response.completed event, got %v", thirdCompleted["type"])
+	}
+
+	requests = snapshotResponsesWebSocketRequests(&upstreamRequestsMu, upstreamRequests)
+	if len(requests) != 4 {
+		t.Fatalf("expected 4 upstream requests including subsequent delta, got %d", len(requests))
+	}
+	subsequentInput := upstreamInputItems(t, requests[3])
+	if len(subsequentInput) != 1 {
+		t.Fatalf("expected subsequent request to use delta replay, got %d input items", len(subsequentInput))
+	}
+	if got := inputTextFromMessage(t, subsequentInput[0]); got != "after fallback" {
+		t.Fatalf("expected subsequent delta to include only latest input, got %q", got)
 	}
 }
 

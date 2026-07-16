@@ -45,6 +45,7 @@ func TestRouteObservabilitySeparatesClientAndPhysicalLedgers(t *testing.T) {
 		ProviderID:   "azure-secondary",
 		ProviderKind: "azure",
 	})
+	summary.setFinalRouteAttribution("secondary", "azure-secondary", "azure")
 
 	// Physical ledger updates are independent from the one-per-client ledger.
 	before := h.stats.snapshot()
@@ -102,6 +103,7 @@ func TestRouteObservabilityFailedFailoverAndExhaustion(t *testing.T) {
 	h.RecordUpstreamAttempt(ctx, RouteAttemptObservation{OperationID: "op-fail", RouteID: "route-gpt", TargetID: "primary", ProviderID: "azure-a"})
 	h.RecordTargetSwitch(ctx)
 	h.RecordUpstreamAttempt(ctx, RouteAttemptObservation{OperationID: "op-fail", RouteID: "route-gpt", TargetID: "secondary", ProviderID: "azure-b"})
+	summary.setFinalRouteAttribution("secondary", "azure-b", "")
 	h.RecordRouteExhaustion(ctx)
 	h.RecordRouteExhaustion(ctx) // one logical operation, not two exhaustion events
 	h.RecordRequest(summary, http.StatusServiceUnavailable, "curl/8", time.Millisecond)
@@ -180,6 +182,7 @@ func TestRouteObservabilityBoundsOperationalLabels(t *testing.T) {
 		TargetID:    longID,
 		ProviderID:  longID,
 	})
+	summary.setFinalRouteAttribution(longID, longID, "")
 	h.RecordRequest(summary, http.StatusOK, "curl/8", time.Millisecond)
 
 	snap := h.stats.snapshot()

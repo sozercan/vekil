@@ -71,8 +71,12 @@ func explicitRouteCanonicalOrError(canonical *explicitRouteCanonicalFailure, err
 }
 
 func (h *ProxyHandler) executeChatCompletionsRouteRequest(ctx context.Context, body []byte, mode chatCompletionsMode) (*http.Response, error) {
+	return h.executeChatCompletionsRouteRequestForModel(ctx, body, mode, extractRequestModel(body))
+}
+
+func (h *ProxyHandler) executeChatCompletionsRouteRequestForModel(ctx context.Context, body []byte, mode chatCompletionsMode, model string) (*http.Response, error) {
 	send := func(attemptCtx context.Context) (*http.Response, error) {
-		return h.postChatCompletions(attemptCtx, body)
+		return h.postChatCompletionsForModel(attemptCtx, body, model)
 	}
 	return h.executeExplicitRouteSurfaceRequest(ctx, providerEndpointChatCompletions, mode.clientRequestedStream, explicitRouteStreamOpenAIChat, send)
 }
@@ -561,6 +565,21 @@ func prepareOpenAIChatCompletionsRequest(body []byte) ([]byte, chatCompletionsMo
 		mode.injectedClientStreamUsage = injected
 	}
 	return body, mode
+}
+
+// extractOpenAIChatCompletionsRequestModel follows the encoding/json decode
+// semantics used by chat preparation: when a request contains duplicate model
+// keys, the last occurrence is the decoded value.
+func extractOpenAIChatCompletionsRequestModel(body []byte) string {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	var model string
+	if err := json.Unmarshal(payload["model"], &model); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(model)
 }
 
 func prepareAnthropicChatCompletionsRequest(req *models.AnthropicRequest) ([]byte, chatCompletionsMode, error) {
@@ -1167,7 +1186,8 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	if err := h.validateRouteAwareRequestJSON(bodyBytes, extractRequestModel(bodyBytes), providerEndpointChatCompletions); err != nil {
+	requestedModel := extractOpenAIChatCompletionsRequestModel(bodyBytes)
+	if err := h.validateRouteAwareRequestJSON(bodyBytes, requestedModel, providerEndpointChatCompletions); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
@@ -1177,7 +1197,6 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 
-	requestedModel := extractRequestModel(bodyBytes)
 	scope := chatToolExecutionScopeFromHeaders(r.Header)
 	bodyBytes, mode := prepareOpenAIChatCompletionsRequest(bodyBytes)
 	h.observeRequestSummary(r.Context(), "openai_chat", requestedModel, mode.clientRequestedStream, providerEndpointChatCompletions)
@@ -1196,7 +1215,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 
 	responseModel := explicitRoutePublicModel(route, requestedModel)
-	resp, err := h.executeChatCompletionsRouteRequest(upstreamCtx, bodyBytes, mode)
+	resp, err := h.executeChatCompletionsRouteRequestForModel(upstreamCtx, bodyBytes, mode, requestedModel)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -1211,7 +1230,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 
-	resp, bodyBytes, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, bodyBytes, mode)
+	resp, bodyBytes, mode = h.retryChatCompletionsWithoutInjectedStreamOptionsForModel(upstreamCtx, resp, bodyBytes, mode, requestedModel)
 	if routeOperation != nil && !mode.clientRequestedStream && !mode.forceUpstreamStream {
 		normalizeExplicitOpenAIChatResponseModel(resp, responseModel)
 	}
@@ -1480,6 +1499,10 @@ func stripStreamOptions(body []byte) ([]byte, bool) {
 }
 
 func (h *ProxyHandler) retryChatCompletionsWithoutInjectedStreamOptions(ctx context.Context, resp *http.Response, body []byte, mode chatCompletionsMode) (*http.Response, []byte, chatCompletionsMode) {
+	return h.retryChatCompletionsWithoutInjectedStreamOptionsForModel(ctx, resp, body, mode, extractRequestModel(body))
+}
+
+func (h *ProxyHandler) retryChatCompletionsWithoutInjectedStreamOptionsForModel(ctx context.Context, resp *http.Response, body []byte, mode chatCompletionsMode, model string) (*http.Response, []byte, chatCompletionsMode) {
 	if h == nil || resp == nil || resp.StatusCode != http.StatusBadRequest || !mode.injectedStreamUsage {
 		return resp, body, mode
 	}
@@ -1497,7 +1520,7 @@ func (h *ProxyHandler) retryChatCompletionsWithoutInjectedStreamOptions(ctx cont
 		originalResp = captured.response()
 	}
 	retryCtx := withRouteAttemptKind(ctx, routeAttemptProtocolRecovery)
-	retryResp, err := h.executeChatCompletionsRouteRequest(retryCtx, fallbackBody, mode)
+	retryResp, err := h.executeChatCompletionsRouteRequestForModel(retryCtx, fallbackBody, mode, model)
 	if err != nil {
 		if h != nil && h.log != nil {
 			h.log.Debug("retry without stream_options failed", logger.Err(err))
