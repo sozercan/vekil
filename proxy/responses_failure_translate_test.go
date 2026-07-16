@@ -662,7 +662,7 @@ func TestResponsesFailureHeadersEventValuesReplaceUpstreamCaseInsensitively(t *t
 func TestSelectResponsesRetryAfterRoundsUpHTTPDate(t *testing.T) {
 	now := time.Now()
 	if now.Nanosecond() < int(150*time.Millisecond) {
-		time.Sleep(time.Second - time.Duration(now.Nanosecond()) + 150*time.Millisecond)
+		time.Sleep(150*time.Millisecond - time.Duration(now.Nanosecond()))
 		now = time.Now()
 	}
 	retryAt := now.Truncate(time.Second).Add(time.Second)
