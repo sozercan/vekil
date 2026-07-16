@@ -2108,7 +2108,6 @@ func (s *responsesWebSocketSession) sendUpstreamStreamFailure(event responsesWeb
 	if status == 0 || strings.TrimSpace(message) == "" {
 		return nil
 	}
-	errType := responsesWebSocketStreamFailureType(event, headers)
 	return s.sendWrappedErrorDetails(status, message, errType, code, strings.TrimSpace(responsesStreamEventError(event).Param), headers)
 }
 
@@ -2273,18 +2272,6 @@ func responsesWebSocketStreamFailureDetails(event responsesWebSocketStreamEvent,
 		return http.StatusConflict, "upstream response.incomplete: " + reason, reason, "conflict_error"
 	default:
 		return 0, "", "", ""
-	}
-}
-
-func responsesWebSocketStreamFailureType(event responsesWebSocketStreamEvent, headers http.Header) string {
-	switch event.Type {
-	case "response.failed", "error":
-		if _, errType, ok := classifyResponsesFailure(event, headers); ok {
-			return errType
-		}
-		return strings.TrimSpace(responsesStreamEventError(event).Type)
-	default:
-		return ""
 	}
 }
 
