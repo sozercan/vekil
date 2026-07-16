@@ -29,6 +29,10 @@ Vekil supports two runtime patterns:
 
 Native CLI and tray-app runs default to `127.0.0.1`. Container deployments that publish the proxy port must bind to `0.0.0.0`; the official image and sample Kubernetes manifest set `HOST=0.0.0.0` for that path.
 
+### Prometheus histogram buckets
+
+The enabled-by-default `/metrics` endpoint uses these non-streaming request-duration buckets (seconds): `.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 20, 30, 60, 120, 300`. See [Prometheus Metrics](metrics.md) for metric names, label bounds, and scrape examples.
+
 ## Copilot Header Overrides
 
 These overrides only affect Copilot-backed upstream requests. For provider-level header profiles, see [Copilot Provider Header Profiles](provider-routing.md#copilot-provider-header-profiles).

@@ -5,12 +5,18 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
 
 type requestSummaryContextKey struct{}
+type upstreamAttemptObserverContextKey struct{}
+
+type upstreamAttemptObserver struct {
+	attempted atomic.Bool
+}
 
 // RequestSummary is a mutable per-request summary populated by handlers and
 // emitted by the server-level request logging middleware.
@@ -24,6 +30,7 @@ type RequestSummary struct {
 	streamSet         bool
 	stream            bool
 	upstreamRequestID string
+	upstreamAttempted bool
 	promptTokens      *int
 	completionTokens  *int
 	totalTokens       *int
@@ -73,6 +80,30 @@ func RequestSummaryFromContext(ctx context.Context) *RequestSummary {
 	return summary
 }
 
+func withUpstreamAttemptObserver(ctx context.Context) (context.Context, *upstreamAttemptObserver) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	observer := &upstreamAttemptObserver{}
+	return context.WithValue(ctx, upstreamAttemptObserverContextKey{}, observer), observer
+}
+
+func (o *upstreamAttemptObserver) Attempted() bool {
+	return o != nil && o.attempted.Load()
+}
+
+func observeUpstreamAttempt(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		summary.markUpstreamAttempted()
+	}
+	if observer, _ := ctx.Value(upstreamAttemptObserverContextKey{}).(*upstreamAttemptObserver); observer != nil {
+		observer.attempted.Store(true)
+	}
+}
+
 func (s *RequestSummary) setRoute(endpoint, model string, stream bool) {
 	if s == nil {
 		return
@@ -101,6 +132,15 @@ func (s *RequestSummary) setProvider(provider, kind string) {
 	if kind = strings.TrimSpace(kind); kind != "" {
 		s.providerKind = kind
 	}
+}
+
+func (s *RequestSummary) markUpstreamAttempted() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.upstreamAttempted = true
+	s.mu.Unlock()
 }
 
 func (s *RequestSummary) setUpstreamRequestID(requestID string) {

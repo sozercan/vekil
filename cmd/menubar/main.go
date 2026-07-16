@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -196,7 +197,10 @@ func startProxy() {
 		log,
 		proxyHost,
 		proxyPort,
-		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
+		server.WithProxyOptions(
+			proxy.WithProvidersConfig(providersCfg),
+			proxy.WithBuildInfo(buildVersion, buildCommit, runtime.Version()),
+		),
 	)
 	if err != nil {
 		log.Error("server init failed", logger.Err(err))

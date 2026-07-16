@@ -1,12 +1,12 @@
 BINARY := vekil
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
-GO_VERSION := $(shell go version | awk '{print $$3}')
 VERSION ?= dev-$(shell git rev-parse --short HEAD)
-LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.goVersion=$(GO_VERSION)
+LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 APP_NAME := Vekil.app
 APP_BUNDLE_ID := com.vekil.menubar
 APP_ICON := assets/macos/Vekil.icns
 APP_VERSION := $(patsubst v%,%,$(VERSION))
+APP_LDFLAGS := -s -w -X main.buildVersion=$(APP_VERSION) -X main.buildCommit=$(COMMIT)
 APP_CGO_LDFLAGS = -F$(abspath $(SPARKLE_UNPACK_DIR)) -Wl,-rpath,@executable_path/../Frameworks
 SPARKLE_VERSION := 2.9.0
 SPARKLE_BUILD_DIR := .build/sparkle
@@ -37,7 +37,7 @@ build-app: $(SPARKLE_FRAMEWORK)
 	@mkdir -p "$(APP_NAME)/Contents/Resources"
 	@mkdir -p "$(APP_NAME)/Contents/Frameworks"
 	CGO_ENABLED=1 CGO_LDFLAGS="$(APP_CGO_LDFLAGS)" \
-		go build -tags sparkle -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o "$(APP_NAME)/Contents/MacOS/vekil-menubar" ./cmd/menubar/
+		go build -tags sparkle -ldflags="$(APP_LDFLAGS)" -o "$(APP_NAME)/Contents/MacOS/vekil-menubar" ./cmd/menubar/
 	otool -l "$(APP_NAME)/Contents/MacOS/vekil-menubar" | grep -q '@executable_path/../Frameworks'
 	cp "$(APP_ICON)" "$(APP_NAME)/Contents/Resources/Vekil.icns"
 	ditto "$(SPARKLE_FRAMEWORK)" "$(APP_NAME)/Contents/Frameworks/Sparkle.framework"
@@ -96,7 +96,7 @@ TRAY_LINUX_BINARY := vekil-tray
 
 build-tray-linux:
 	CGO_ENABLED=0 GOOS=linux \
-		go build -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o $(TRAY_LINUX_BINARY) ./cmd/menubar/
+		go build -ldflags="$(APP_LDFLAGS)" -o $(TRAY_LINUX_BINARY) ./cmd/menubar/
 
 test:
 	go test ./... -count=1
@@ -114,10 +114,10 @@ clean:
 	rm -rf "$(APP_NAME)" .build
 
 docker-build:
-	docker build -t $(BINARY) .
+	docker build --build-arg VERSION="$(VERSION)" --build-arg COMMIT="$(COMMIT)" -t $(BINARY) .
 
 docker-build-rtk:
-	docker build -f Dockerfile.rtk -t $(BINARY):rtk .
+	docker build --build-arg VERSION="$(VERSION)" --build-arg COMMIT="$(COMMIT)" -f Dockerfile.rtk -t $(BINARY):rtk .
 
 docker-rtk-e2e:
 	scripts/rtk-container-e2e.sh

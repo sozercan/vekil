@@ -191,6 +191,7 @@ type responsesTurnStatsRecord struct {
 	agentKey    string
 	recentIndex int
 	recordID    uint64
+	metrics     responsesTurnMetricsRecord
 }
 
 const (
@@ -740,17 +741,18 @@ func breakdownLabel(b statsBreakdown) string {
 
 // summaryStats is the subset of a RequestSummary the collector folds in.
 type summaryStats struct {
-	model      string
-	provider   string
-	kind       string
-	endpoint   string
-	upstreamID string
-	stream     bool
-	prompt     int
-	completion int
-	total      int
-	cached     int
-	reasoning  int
+	model             string
+	provider          string
+	kind              string
+	endpoint          string
+	upstreamID        string
+	upstreamAttempted bool
+	stream            bool
+	prompt            int
+	completion        int
+	total             int
+	cached            int
+	reasoning         int
 }
 
 func readSummaryForStats(summary *RequestSummary) summaryStats {
@@ -769,6 +771,7 @@ func readSummaryForStats(summary *RequestSummary) summaryStats {
 	d.kind = summary.providerKind
 	d.endpoint = summary.endpoint
 	d.upstreamID = summary.upstreamRequestID
+	d.upstreamAttempted = summary.upstreamAttempted
 	d.stream = summary.stream
 	if summary.promptTokens != nil {
 		d.prompt = *summary.promptTokens
@@ -997,6 +1000,10 @@ func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAg
 // post-terminal usage amendments without creating synthetic requests. status is
 // the client turn outcome so failed turns appear in error counts.
 func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage) responsesTurnStatsRecord {
+	return h.recordResponsesTurn(model, provider, kind, agentLabel, status, usage, true)
+}
+
+func (h *ProxyHandler) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, upstreamAttempted bool) responsesTurnStatsRecord {
 	if h == nil {
 		return responsesTurnStatsRecord{}
 	}
@@ -1006,19 +1013,21 @@ func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel str
 		record = h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage)
 	}
 	if h.metrics != nil {
-		if status == 0 {
-			status = http.StatusOK
-		}
-		h.metrics.RecordResponsesTurn(model, provider, status, usage)
+		record.metrics = h.metrics.recordResponsesTurn(model, provider, status, usage, upstreamAttempted)
 	}
 	return record
 }
 
 func (h *ProxyHandler) AddResponsesTurnUsage(record responsesTurnStatsRecord, usage responsesUsage) {
-	if h == nil || h.stats == nil {
+	if h == nil {
 		return
 	}
-	h.stats.addResponsesTurnUsage(record, usage)
+	if h.stats != nil {
+		h.stats.addResponsesTurnUsage(record, usage)
+	}
+	if h.metrics != nil {
+		h.metrics.AddResponsesTurnUsage(record.metrics, usage)
+	}
 }
 
 // HandleStatsJSON handles GET /stats.json with the current traffic snapshot.

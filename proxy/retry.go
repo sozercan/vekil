@@ -243,6 +243,7 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 			return nil, ctxErr
 		}
 
+		observeUpstreamAttempt(req.Context())
 		resp, err := h.client.Do(req)
 		lifecyclePreempted := errors.Is(context.Cause(req.Context()), errProxyLifecycleShutdown) &&
 			contextTerminationMatches(req.Context(), err)

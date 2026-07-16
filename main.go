@@ -20,7 +20,7 @@ import (
 	"github.com/sozercan/vekil/server"
 )
 
-// Build-time variables injected via -ldflags.
+// Version and commit are injected via -ldflags; Go reports its runtime version directly.
 var (
 	version   = "dev"
 	commit    = "unknown"

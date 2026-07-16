@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -743,8 +744,7 @@ func WithCompactUpstreamMaxAttempts(max int) Option {
 }
 
 // WithMetricsEnabled controls whether Prometheus metrics collection is active.
-// When enabled, a MetricsCollector is initialized and the /metrics endpoint is
-// served. Disabled by default unless explicitly enabled.
+// Metrics are enabled by default; pass false to remove the collector and route.
 func WithMetricsEnabled(enabled bool) Option {
 	return func(h *ProxyHandler) {
 		h.metricsEnabled = enabled
@@ -805,6 +805,10 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		streamingUpstreamTimeout:        streamingUpstreamTimeout,
 		log:                             log,
 		stats:                           newStatsCollector(),
+		metricsEnabled:                  true,
+		buildVersion:                    "dev",
+		buildCommit:                     "unknown",
+		buildGoVersion:                  runtime.Version(),
 	}
 	h.initializeLifecycle()
 	for _, opt := range opts {

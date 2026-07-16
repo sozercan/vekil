@@ -1,6 +1,10 @@
 package proxy
 
 import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -10,25 +14,26 @@ import (
 
 func TestMetricsCollector_Record(t *testing.T) {
 	tests := []struct {
-		name           string
-		provider       string
-		model          string
-		endpoint       string
-		status         int
-		stream         bool
-		prompt         int
-		completion     int
-		dur            time.Duration
-		wantRequests   float64
-		wantErrors     float64
-		wantPrompt     float64
-		wantCompletion float64
+		name              string
+		provider          string
+		model             string
+		endpoint          string
+		status            int
+		stream            bool
+		upstreamAttempted bool
+		prompt            int
+		completion        int
+		dur               time.Duration
+		wantRequests      float64
+		wantErrors        float64
+		wantPrompt        float64
+		wantCompletion    float64
 	}{
 		{
 			name:           "successful non-streaming request",
 			provider:       "copilot",
 			model:          "gpt-4o",
-			endpoint:       "chat_completions",
+			endpoint:       "openai_chat",
 			status:         200,
 			stream:         false,
 			prompt:         100,
@@ -40,17 +45,31 @@ func TestMetricsCollector_Record(t *testing.T) {
 			wantCompletion: 50,
 		},
 		{
-			name:           "error request",
-			provider:       "azure",
-			model:          "gpt-4",
-			endpoint:       "responses",
-			status:         429,
+			name:              "error request",
+			provider:          "azure",
+			model:             "gpt-4",
+			endpoint:          "responses",
+			status:            429,
+			stream:            false,
+			upstreamAttempted: true,
+			prompt:            0,
+			completion:        0,
+			dur:               100 * time.Millisecond,
+			wantRequests:      1,
+			wantErrors:        1,
+			wantPrompt:        0,
+			wantCompletion:    0,
+		},
+		{
+			name:           "local validation error is not an upstream error",
+			provider:       "",
+			model:          "bad-model",
+			endpoint:       "openai_chat",
+			status:         400,
 			stream:         false,
-			prompt:         0,
-			completion:     0,
-			dur:            100 * time.Millisecond,
+			dur:            10 * time.Millisecond,
 			wantRequests:   1,
-			wantErrors:     1,
+			wantErrors:     0,
 			wantPrompt:     0,
 			wantCompletion: 0,
 		},
@@ -58,7 +77,7 @@ func TestMetricsCollector_Record(t *testing.T) {
 			name:           "streaming request skips duration",
 			provider:       "copilot",
 			model:          "claude-sonnet-4",
-			endpoint:       "messages",
+			endpoint:       "anthropic",
 			status:         200,
 			stream:         true,
 			prompt:         200,
@@ -81,6 +100,7 @@ func TestMetricsCollector_Record(t *testing.T) {
 			summary.model = tt.model
 			summary.endpoint = tt.endpoint
 			summary.stream = tt.stream
+			summary.upstreamAttempted = tt.upstreamAttempted
 			if tt.prompt > 0 {
 				p := tt.prompt
 				summary.promptTokens = &p
@@ -134,14 +154,12 @@ func TestMetricsCollector_Record(t *testing.T) {
 				}
 			}
 
-			if tt.wantErrors > 0 {
-				gotErrors := getCounterValue(metrics, "vekil_upstream_errors_total", map[string]string{
-					"provider":     tt.provider,
-					"public_model": tt.model,
-				})
-				if gotErrors != tt.wantErrors {
-					t.Errorf("upstream_errors_total = %v, want %v", gotErrors, tt.wantErrors)
-				}
+			gotErrors := getCounterValue(metrics, "vekil_upstream_errors_total", map[string]string{
+				"provider":     tt.provider,
+				"public_model": tt.model,
+			})
+			if gotErrors != tt.wantErrors {
+				t.Errorf("upstream_errors_total = %v, want %v", gotErrors, tt.wantErrors)
 			}
 
 			// Verify histogram has an observation for non-streaming requests
@@ -166,6 +184,151 @@ func TestMetricsCollector_Record(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMetricsCollector_RecordResponsesTurn(t *testing.T) {
+	m := NewMetricsCollector()
+
+	record := m.RecordResponsesTurn("gpt-5.4", "azure", http.StatusTooManyRequests, responsesUsage{
+		InputTokens:  12,
+		OutputTokens: 3,
+	})
+	m.AddResponsesTurnUsage(record, responsesUsage{InputTokens: 5, OutputTokens: 2})
+
+	metrics, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+
+	labels := map[string]string{
+		"provider":     "azure",
+		"public_model": "gpt-5.4",
+	}
+	if got := getCounterValue(metrics, "vekil_requests_total", map[string]string{
+		"provider":     labels["provider"],
+		"public_model": labels["public_model"],
+		"endpoint":     "responses_ws",
+		"status":       "429",
+	}); got != 1 {
+		t.Fatalf("responses websocket requests = %v, want 1", got)
+	}
+	if got := getCounterValue(metrics, "vekil_tokens_total", map[string]string{
+		"provider":     labels["provider"],
+		"public_model": labels["public_model"],
+		"direction":    "prompt",
+	}); got != 17 {
+		t.Errorf("prompt tokens = %v, want 17", got)
+	}
+	if got := getCounterValue(metrics, "vekil_tokens_total", map[string]string{
+		"provider":     labels["provider"],
+		"public_model": labels["public_model"],
+		"direction":    "completion",
+	}); got != 5 {
+		t.Errorf("completion tokens = %v, want 5", got)
+	}
+	if got := getCounterValue(metrics, "vekil_upstream_errors_total", map[string]string{
+		"provider":     labels["provider"],
+		"public_model": labels["public_model"],
+		"code":         "429",
+	}); got != 1 {
+		t.Errorf("upstream errors = %v, want 1", got)
+	}
+}
+
+func TestMetricsCollector_ModelCardinalityBoundedAcrossFamilies(t *testing.T) {
+	m := NewMetricsCollector()
+	for i := 0; i < statsMaxKeys+5; i++ {
+		summary := &RequestSummary{}
+		summary.setRoute("openai_chat", fmt.Sprintf("model-%03d", i), false)
+		summary.setProvider("copilot", "copilot")
+		m.Record(summary, http.StatusOK, time.Millisecond)
+	}
+
+	wsRecord := m.RecordResponsesTurn("websocket-overflow", "copilot", http.StatusOK, responsesUsage{})
+	m.RecordRetry("copilot", "retry-overflow", http.StatusTooManyRequests)
+
+	if got, want := wsRecord.model, statsOtherKey; got != want {
+		t.Fatalf("websocket model label = %q, want %q", got, want)
+	}
+	metrics, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	if got, want := countMetricSeries(metrics, "vekil_requests_total"), statsMaxKeys+2; got != want {
+		// 200 named HTTP models, one HTTP overflow series, and one websocket
+		// overflow series (same model label, distinct endpoint/status set).
+		t.Fatalf("request series = %d, want %d", got, want)
+	}
+	if got := getCounterValue(metrics, "vekil_requests_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": statsOtherKey,
+		"endpoint":     "openai_chat",
+		"status":       "200",
+	}); got != 5 {
+		t.Errorf("HTTP overflow request count = %v, want 5", got)
+	}
+	if got := getCounterValue(metrics, "vekil_requests_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": statsOtherKey,
+		"endpoint":     "responses_ws",
+		"status":       "200",
+	}); got != 1 {
+		t.Errorf("websocket overflow request count = %v, want 1", got)
+	}
+	if got := getCounterValue(metrics, "vekil_retries_total", map[string]string{
+		"provider":     "copilot",
+		"public_model": statsOtherKey,
+		"reason":       "429",
+	}); got != 1 {
+		t.Errorf("retry overflow count = %v, want 1", got)
+	}
+}
+
+func TestMetricsCollector_DurationBucketsCoverLongInference(t *testing.T) {
+	m := NewMetricsCollector()
+	summary := &RequestSummary{}
+	summary.setRoute("openai_chat", "gpt-5.4", false)
+	summary.setProvider("azure", "azure")
+	m.Record(summary, http.StatusOK, 2*time.Minute)
+
+	metrics, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	labels := map[string]string{
+		"provider":     "azure",
+		"public_model": "gpt-5.4",
+		"endpoint":     "openai_chat",
+	}
+	if got := getHistogramBucketCount(metrics, "vekil_request_duration_seconds", labels, 60); got != 0 {
+		t.Errorf("60s bucket count = %d, want 0", got)
+	}
+	if got := getHistogramBucketCount(metrics, "vekil_request_duration_seconds", labels, 120); got != 1 {
+		t.Errorf("120s bucket count = %d, want 1", got)
+	}
+	if got := getHistogramBucketCount(metrics, "vekil_request_duration_seconds", labels, 300); got != 1 {
+		t.Errorf("300s bucket count = %d, want 1", got)
+	}
+}
+
+func TestDoWithRetryMarksUpstreamAttemptForMetrics(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer upstream.Close()
+
+	h := &ProxyHandler{client: upstream.Client(), maxRetries: 1}
+	ctx, summary := WithRequestSummary(context.Background())
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodPost, upstream.URL, nil)
+	})
+	if err != nil {
+		t.Fatalf("doWithRetry() error = %v", err)
+	}
+	_ = resp.Body.Close()
+	if got := readSummaryForStats(summary).upstreamAttempted; !got {
+		t.Fatal("upstream attempt was not recorded on the request summary")
 	}
 }
 
@@ -239,6 +402,36 @@ func TestMetricsCollector_RecordRetry(t *testing.T) {
 	}
 }
 
+func TestLogRetryAttemptRecordsResolvedMetricLabels(t *testing.T) {
+	m := NewMetricsCollector()
+	h := &ProxyHandler{metrics: m}
+	ctx, summary := WithRequestSummary(context.Background())
+	summary.setRoute("openai_chat", "gpt-5.4", false)
+	summary.setProvider("azure-prod", "azure-openai")
+	ctx = markRetryStatsTracked(ctx)
+
+	h.logRetryAttempt(ctx, 0, http.StatusServiceUnavailable, "", time.Second, nil)
+
+	metrics, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	if got := getCounterValue(metrics, "vekil_retries_total", map[string]string{
+		"provider":     "azure-prod",
+		"public_model": "gpt-5.4",
+		"reason":       "5xx",
+	}); got != 1 {
+		t.Fatalf("resolved retry metric = %v, want 1", got)
+	}
+	if got := getCounterValue(metrics, "vekil_retries_total", map[string]string{
+		"provider":     "",
+		"public_model": "",
+		"reason":       "5xx",
+	}); got != 0 {
+		t.Fatalf("empty-label retry metric = %v, want 0", got)
+	}
+}
+
 func TestMetricsCollector_BuildInfo(t *testing.T) {
 	m := NewMetricsCollector()
 	m.SetBuildInfo("1.2.3", "abc1234", "go1.22.0")
@@ -263,7 +456,8 @@ func TestMetricsCollector_NilSafety(t *testing.T) {
 
 	// All methods must be nil-safe.
 	m.Record(nil, 200, time.Second)
-	m.RecordResponsesTurn("model", "provider", 200, responsesUsage{})
+	record := m.RecordResponsesTurn("model", "provider", 200, responsesUsage{})
+	m.AddResponsesTurnUsage(record, responsesUsage{})
 	m.RecordRetry("p", "m", 429)
 	m.IncInflight()
 	m.DecInflight()
@@ -275,6 +469,34 @@ func TestMetricsCollector_NilSafety(t *testing.T) {
 }
 
 // Helper functions to extract metric values from gathered metric families.
+
+func countMetricSeries(families []*io_prometheus_client.MetricFamily, name string) int {
+	for _, mf := range families {
+		if mf.GetName() == name {
+			return len(mf.GetMetric())
+		}
+	}
+	return 0
+}
+
+func getHistogramBucketCount(families []*io_prometheus_client.MetricFamily, name string, labels map[string]string, upperBound float64) uint64 {
+	for _, mf := range families {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			if !matchLabels(metric.GetLabel(), labels) {
+				continue
+			}
+			for _, bucket := range metric.GetHistogram().GetBucket() {
+				if bucket.GetUpperBound() == upperBound {
+					return bucket.GetCumulativeCount()
+				}
+			}
+		}
+	}
+	return 0
+}
 
 func getCounterValue(families []*io_prometheus_client.MetricFamily, name string, labels map[string]string) float64 {
 	for _, mf := range families {

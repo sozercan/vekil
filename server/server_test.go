@@ -160,6 +160,7 @@ func TestServerBlocksNonHealthRoutesWhileStartupAuthenticationPending(t *testing
 	}{
 		{method: http.MethodGet, path: "/healthz", want: http.StatusOK},
 		{method: http.MethodGet, path: "/readyz", want: http.StatusServiceUnavailable},
+		{method: http.MethodGet, path: "/metrics", want: http.StatusOK},
 		{method: http.MethodGet, path: "/v1/models", want: http.StatusServiceUnavailable},
 		{method: http.MethodPost, path: "/v1/chat/completions", want: http.StatusServiceUnavailable},
 	} {
@@ -173,8 +174,14 @@ func TestServerBlocksNonHealthRoutesWhileStartupAuthenticationPending(t *testing
 				body, _ := io.ReadAll(resp.Body)
 				t.Fatalf("status = %d, want %d: %s", resp.StatusCode, tc.want, body)
 			}
-			if tc.path != "/healthz" {
-				body, _ := io.ReadAll(resp.Body)
+			body, _ := io.ReadAll(resp.Body)
+			switch tc.path {
+			case "/metrics":
+				if !strings.Contains(string(body), "vekil_build_info") {
+					t.Fatalf("metrics response missing build info: %s", body)
+				}
+			case "/healthz":
+			default:
 				if !strings.Contains(string(body), "startup authentication pending") {
 					t.Fatalf("response missing startup auth pending message: %s", body)
 				}
@@ -223,6 +230,7 @@ func TestServerBlocksNonHealthRoutesWhileProviderValidationPending(t *testing.T)
 	}{
 		{method: http.MethodGet, path: "/healthz", want: http.StatusOK},
 		{method: http.MethodGet, path: "/readyz", want: http.StatusServiceUnavailable},
+		{method: http.MethodGet, path: "/metrics", want: http.StatusOK},
 		{method: http.MethodGet, path: "/v1/models", want: http.StatusServiceUnavailable},
 		{method: http.MethodPost, path: "/v1/chat/completions", want: http.StatusServiceUnavailable},
 	} {
@@ -236,13 +244,39 @@ func TestServerBlocksNonHealthRoutesWhileProviderValidationPending(t *testing.T)
 				body, _ := io.ReadAll(resp.Body)
 				t.Fatalf("status = %d, want %d: %s", resp.StatusCode, tc.want, body)
 			}
-			if tc.path != "/healthz" {
-				body, _ := io.ReadAll(resp.Body)
+			body, _ := io.ReadAll(resp.Body)
+			switch tc.path {
+			case "/metrics":
+				if !strings.Contains(string(body), "vekil_build_info") {
+					t.Fatalf("metrics response missing build info: %s", body)
+				}
+			case "/healthz":
+			default:
 				if !strings.Contains(string(body), "provider model validation pending") {
 					t.Fatalf("response missing pending validation message: %s", body)
 				}
 			}
 		})
+	}
+}
+
+func TestServerMetricsCanBeDisabled(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		"127.0.0.1",
+		"0",
+		WithProxyOptions(proxy.WithMetricsEnabled(false)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(w, req)
+	if got, want := w.Code, http.StatusNotFound; got != want {
+		t.Fatalf("GET /metrics status = %d, want %d", got, want)
 	}
 }
 
