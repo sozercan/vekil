@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	responsesPrecommitPeekTimeout  = 750 * time.Millisecond
-	responsesPrecommitMaxPeekBytes = 64 * 1024
-	responsesPeekReadChunkSize     = 4 * 1024
-	responsesPeekCancellationGrace = 10 * time.Millisecond
+	responsesPrecommitPeekTimeout          = 750 * time.Millisecond
+	responsesPrecommitMaxPeekBytes         = 64 * 1024
+	responsesPrecommitHeldPreambleMaxBytes = 512 * 1024
+	responsesPeekReadChunkSize             = 4 * 1024
+	responsesPeekCancellationGrace         = 10 * time.Millisecond
 	// responsesFailureTapMaxBuffer bounds how much of an in-flight SSE event the
 	// failure tap buffers while waiting for its delimiter. It matches the
 	// supported Responses scanner limit so every accepted terminal event is fully
@@ -327,7 +328,7 @@ func extractResponsesNamedObject(buf, key []byte) ([]byte, bool) {
 
 func isResponsesTerminalType(eventType string) bool {
 	switch strings.TrimSpace(eventType) {
-	case "response.completed", "response.failed", "response.incomplete":
+	case "response.completed", "response.failed", "response.incomplete", "error":
 		return true
 	default:
 		return false
@@ -549,10 +550,131 @@ func updateResponsesTerminalEvent(event *responsesWebSocketStreamEvent, hintedTy
 		event.Response.Usage = usage
 	}
 	if failure, ok := extractResponsesFailureObject(buf); ok {
-		event.Response.Error = failure
+		if strings.TrimSpace(event.Type) == "error" {
+			event.Error = failure
+		} else {
+			event.Response.Error = failure
+		}
 	}
 	if details, ok := extractResponsesIncompleteDetails(buf); ok {
 		event.Response.IncompleteDetails = details
+	}
+}
+
+func responsesStreamEventError(event responsesWebSocketStreamEvent) responsesWebSocketStreamError {
+	if strings.TrimSpace(event.Type) != "error" {
+		return event.Response.Error
+	}
+	// Canonical Responses error events carry code/message at the event root,
+	// while Azure Foundry can wrap richer details and headers in an `error`
+	// object. Start with the canonical shape and overlay any nested extension so
+	// both forms retain their diagnostics.
+	result := responsesWebSocketStreamError{
+		Code:    event.Code,
+		Message: event.Message,
+		Param:   event.Param,
+		Headers: mergeResponsesStreamErrorHeaders(event.Headers, event.Error.Headers),
+	}
+	if value := strings.TrimSpace(event.Error.Type); value != "" {
+		result.Type = value
+	}
+	if value := strings.TrimSpace(event.Error.Code); value != "" {
+		result.Code = value
+	}
+	if value := strings.TrimSpace(event.Error.Message); value != "" {
+		result.Message = value
+	}
+	if value := strings.TrimSpace(event.Error.Param); value != "" {
+		result.Param = value
+	}
+	return result
+}
+
+func mergeResponsesStreamErrorHeaders(root, nested map[string]json.RawMessage) map[string]json.RawMessage {
+	if len(root) == 0 && len(nested) == 0 {
+		return nil
+	}
+	merged := make(map[string]json.RawMessage, len(root)+len(nested))
+	add := func(headers map[string]json.RawMessage) {
+		for name, value := range headers {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			merged[http.CanonicalHeaderKey(name)] = value
+		}
+	}
+	add(root)
+	// Nested Foundry metadata is the more specific representation and only
+	// replaces root values with the same case-insensitive header name.
+	add(nested)
+	return merged
+}
+
+func responsesStreamErrorHeaders(streamErr responsesWebSocketStreamError) http.Header {
+	if len(streamErr.Headers) == 0 {
+		return nil
+	}
+	headers := make(http.Header)
+	for name, raw := range streamErr.Headers {
+		name = strings.TrimSpace(name)
+		if name == "" || len(raw) == 0 {
+			continue
+		}
+		var value string
+		if json.Unmarshal(raw, &value) == nil {
+			if value = strings.TrimSpace(value); value != "" {
+				headers.Add(name, value)
+			}
+			continue
+		}
+		var values []string
+		if json.Unmarshal(raw, &values) == nil {
+			for _, value := range values {
+				if value = strings.TrimSpace(value); value != "" {
+					headers.Add(name, value)
+				}
+			}
+			continue
+		}
+		var number json.Number
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		if decoder.Decode(&number) == nil {
+			if value := strings.TrimSpace(number.String()); value != "" {
+				headers.Add(name, value)
+			}
+		}
+	}
+	if len(headers) == 0 {
+		return nil
+	}
+	return headers
+}
+
+func responsesFailureHeaders(event responsesWebSocketStreamEvent, upstream http.Header) http.Header {
+	eventHeaders := responsesStreamErrorHeaders(responsesStreamEventError(event))
+	if len(eventHeaders) == 0 {
+		return upstream
+	}
+	merged := upstream.Clone()
+	if merged == nil {
+		merged = make(http.Header)
+	}
+	for name, values := range eventHeaders {
+		deleteHeaderCI(merged, name)
+		for _, value := range values {
+			merged.Add(name, value)
+		}
+	}
+	return merged
+}
+
+func deleteHeaderCI(headers http.Header, name string) {
+	for key := range headers {
+		if strings.EqualFold(key, name) {
+			delete(headers, key)
+		}
 	}
 }
 
@@ -932,9 +1054,22 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 		}
 	}
 	if hasResult && result.decision == responsesPeekDecisionTranslate {
-		logResponsesPrecommitTranslated(h, result, model, resp.Header)
+		failureHeaders := resp.Header
+		if result.failure != nil {
+			failureHeaders = responsesFailureHeaders(*result.failure, resp.Header)
+		}
+		logResponsesPrecommitTranslated(h, result, model, failureHeaders)
+		if result.failure != nil {
+			observeResponsesUsage(r.Context(), result.failure.Response.Usage)
+		}
 		prepared.abort()
-		writeOpenAIErrorWithRetryAfter(w, result.status, result.message, result.errType, result.retryAfter, resp.Header)
+		errorCode, errorParam := "", ""
+		if result.failure != nil {
+			streamErr := responsesStreamEventError(*result.failure)
+			errorCode = strings.TrimSpace(streamErr.Code)
+			errorParam = strings.TrimSpace(streamErr.Param)
+		}
+		writeOpenAIErrorWithRetryAfterDetails(w, result.status, result.message, result.errType, result.retryAfter, failureHeaders, errorParam, errorCode)
 		return
 	}
 	if !hasResult || result.terminal == nil {
@@ -955,7 +1090,7 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 		}
 	}
 	if hasResult && result.failure != nil && result.decision == responsesPeekDecisionPassthrough {
-		logResponsesPrecommitFailOpen(h, result.failure, model, resp.Header)
+		logResponsesPrecommitFailOpen(h, result.failure, model, responsesFailureHeaders(*result.failure, resp.Header))
 	}
 	// The committed HTTP path has its own bounded failure tap. Stop the
 	// speculative observer here so large response.completed payloads are not
@@ -1023,8 +1158,12 @@ func prepareResponsesStreamAttemptWithGrace(waitCtx, streamCtx context.Context, 
 		}
 	}
 	if hasResult && result.decision == responsesPeekDecisionTranslate {
+		translatedHeaders := resp.Header
+		if result.failure != nil {
+			translatedHeaders = responsesFailureHeaders(*result.failure, resp.Header)
+		}
 		prepared.abort()
-		return nil, &result, resp.Header.Clone(), nil
+		return nil, &result, translatedHeaders.Clone(), nil
 	}
 	if hasResult && result.terminal != nil {
 		return prepared.commitResponse(), &result, nil, nil
@@ -1118,7 +1257,7 @@ func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.He
 				if !decisionSent {
 					if result.decision == responsesPeekDecisionTranslate {
 						sendResult(result)
-					} else if prefix.Len() >= maxPeekBytes {
+					} else if prefix.Len() >= maxPeekBytes && (!holdPreamble || sawBeyondPreamble || prefix.Len() >= max(responsesPrecommitHeldPreambleMaxBytes, maxPeekBytes)) {
 						if sawSemantic {
 							sendResult(result)
 						} else {
@@ -1131,6 +1270,14 @@ func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.He
 			}
 
 			if chunk.err != nil {
+				if errors.Is(chunk.err, io.EOF) && !decisionSent {
+					parser.finalizeEOF()
+					holdPreamble := shouldHoldResponsesPrecommitPreamble(headers)
+					result, sawSemantic, _ := inspectResponsesPeekMessages(&parser, headers, peekState, holdPreamble)
+					if result.decision == responsesPeekDecisionTranslate || sawSemantic {
+						sendResult(result)
+					}
+				}
 				peekState.publishOutcome(responsesPeekReadOutcome{
 					err:                        chunk.err,
 					lifecycleCanceledAtFailure: chunk.lifecycleCanceledAtFailure,
@@ -1290,25 +1437,26 @@ func classifyResponsesPeekEvent(event responsesWebSocketStreamEvent, eventName s
 	event.Type = terminalType
 	result.preamble = terminalType == "response.created" || terminalType == "response.in_progress"
 	switch terminalType {
-	case "response.completed", "response.failed", "response.incomplete":
+	case "response.completed", "response.failed", "response.incomplete", "error":
 		terminal := event
 		result.terminal = &terminal
-		if terminalType == "response.failed" || terminalType == "response.incomplete" {
+		if terminalType == "response.failed" || terminalType == "response.incomplete" || terminalType == "error" {
 			result.failure = &terminal
 		}
 	}
-	if terminalType != "response.failed" {
+	if terminalType != "response.failed" && terminalType != "error" {
 		return result
 	}
 
-	status, errType, ok := classifyPrecommitResponsesFailure(event)
+	failureHeaders := responsesFailureHeaders(event, headers)
+	status, errType, ok := classifyResponsesFailure(event, failureHeaders)
 	if !ok {
 		return result
 	}
 
 	retryAfter, source := "", ""
 	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout {
-		retryAfter, source = selectResponsesRetryAfter(headers)
+		retryAfter, source = selectResponsesRetryAfter(failureHeaders)
 	}
 
 	result.decision = responsesPeekDecisionTranslate
@@ -1329,40 +1477,155 @@ func classifyResponsesPeekEvent(event responsesWebSocketStreamEvent, eventName s
 // providers without exhausted-quota headers retain the low-latency first-event
 // passthrough path.
 func shouldHoldResponsesPrecommitPreamble(headers http.Header) bool {
-	if retryAfter, _ := selectResponsesRetryAfter(headers); retryAfter == "" {
-		return false
-	}
-	for _, name := range []string{"x-ratelimit-remaining-tokens", "x-ratelimit-remaining-requests"} {
-		value := strings.TrimSpace(headerGetCI(headers, name))
-		if value == "" {
-			continue
+	return responsesQuotaEvidence(headers)
+}
+
+func classifyResponsesFailure(event responsesWebSocketStreamEvent, headers http.Header) (int, string, bool) {
+	headers = responsesFailureHeaders(event, headers)
+	streamErr := responsesStreamEventError(event)
+	code := strings.ToLower(strings.TrimSpace(streamErr.Code))
+	errType := strings.ToLower(strings.TrimSpace(streamErr.Type))
+
+	if strings.TrimSpace(event.Type) == "error" {
+		if status, resultType, ok := classifyResponsesErrorEventCode(code); ok {
+			return status, resultType, true
 		}
-		remaining, err := strconv.ParseInt(value, 10, 64)
-		if err == nil && remaining <= 0 {
+		switch errType {
+		case "too_many_requests", "rate_limit_error", "rate_limit_exceeded":
+			return http.StatusTooManyRequests, "rate_limit_error", true
+		case "overloaded_error", "model_overloaded", "engine_overloaded", "service_unavailable":
+			return http.StatusServiceUnavailable, "server_error", true
+		case "forbidden", "permission_error":
+			return http.StatusForbidden, "permission_error", true
+		case "user_error", "invalid_request_error":
+			return http.StatusBadRequest, "invalid_request_error", true
+		case "authentication_error":
+			return http.StatusUnauthorized, "authentication_error", true
+		case "not_found_error":
+			return http.StatusNotFound, "not_found_error", true
+		case "conflict_error":
+			return http.StatusConflict, "conflict_error", true
+		}
+		if code == "" && (errType == "" || errType == "server_error") && responsesQuotaEvidence(headers) && responsesRateLimitMessage(streamErr.Message) {
+			return http.StatusTooManyRequests, "rate_limit_error", true
+		}
+		if errType == "server_error" {
+			return http.StatusInternalServerError, "server_error", true
+		}
+		// A top-level Responses error event is terminal even when a provider uses an
+		// unknown type/code. Translate it before commit rather than returning HTTP
+		// 200 for a stream that can never produce response.completed.
+		return http.StatusBadGateway, "server_error", true
+	}
+
+	if status, errType, ok := classifyPrecommitResponsesFailure(event); ok {
+		return status, errType, true
+	}
+	if code == "" && (errType == "" || errType == "server_error") &&
+		responsesQuotaEvidence(headers) && responsesRateLimitMessage(streamErr.Message) {
+		return http.StatusTooManyRequests, "rate_limit_error", true
+	}
+	return 0, "", false
+}
+
+func classifyResponsesErrorEventCode(code string) (int, string, bool) {
+	if status, errType, ok := classifyResponsesErrorCode(code); ok {
+		return status, errType, true
+	}
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "400", "invalid_prompt", "bio_policy",
+		"invalid_image", "invalid_image_format", "invalid_base64_image", "invalid_image_url",
+		"image_too_large", "image_too_small", "image_parse_error", "image_content_policy_violation",
+		"invalid_image_mode", "image_file_too_large", "unsupported_image_media_type", "empty_image_file",
+		"failed_to_download_image":
+		return http.StatusBadRequest, "invalid_request_error", true
+	case "401", "authentication_error":
+		return http.StatusUnauthorized, "authentication_error", true
+	case "403", "forbidden", "permission_error":
+		return http.StatusForbidden, "permission_error", true
+	case "404", "not_found", "not_found_error", "image_file_not_found":
+		return http.StatusNotFound, "not_found_error", true
+	case "409", "conflict", "conflict_error":
+		return http.StatusConflict, "conflict_error", true
+	case "500", "server_error":
+		return http.StatusInternalServerError, "server_error", true
+	case "vector_store_timeout":
+		return http.StatusGatewayTimeout, "server_error", true
+	default:
+		return 0, "", false
+	}
+}
+
+func responsesQuotaEvidence(headers http.Header) bool {
+	if _, source := selectResponsesRetryAfter(headers); source == "retry-after-ms" || source == "Retry-After" {
+		return true
+	}
+	for _, dimension := range []string{"tokens", "requests"} {
+		remaining, exhausted := responsesQuotaRemaining(headers, dimension)
+		if exhausted && remaining != -1 {
 			return true
 		}
 	}
 	return false
 }
 
+func responsesRateLimitMessage(message string) bool {
+	message = strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(message, "rate limit") || strings.Contains(message, "too many requests") || strings.Contains(message, "quota exceeded")
+}
+
+func responsesQuotaRemaining(headers http.Header, dimension string) (int64, bool) {
+	value := strings.TrimSpace(headerGetCI(headers, "x-ratelimit-remaining-"+dimension))
+	remaining, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || remaining > 0 {
+		return 0, false
+	}
+	return remaining, true
+}
+
+func responsesQuotaResetSeconds(headers http.Header, dimension string) int64 {
+	value := strings.TrimSpace(headerGetCI(headers, "x-ratelimit-reset-"+dimension))
+	if seconds, ok := parsePositiveDecimalClamped(value, int64(maxRetryAfter/time.Second)); ok {
+		return seconds
+	}
+	delay, err := time.ParseDuration(value)
+	if err != nil || delay <= 0 {
+		return 0
+	}
+	return durationSecondsCeil(delay)
+}
+
 func classifyPrecommitResponsesFailure(event responsesWebSocketStreamEvent) (int, string, bool) {
-	code := strings.ToLower(strings.TrimSpace(event.Response.Error.Code))
-	switch code {
-	case "too_many_requests", "rate_limit_exceeded":
-		return http.StatusTooManyRequests, "rate_limit_error", true
-	case "model_overloaded", "engine_overloaded":
-		return http.StatusServiceUnavailable, "server_error", true
-	case "bad_gateway":
-		return http.StatusBadGateway, "server_error", true
-	case "timeout", "gateway_timeout":
-		return http.StatusGatewayTimeout, "server_error", true
+	streamErr := responsesStreamEventError(event)
+	code := strings.ToLower(strings.TrimSpace(streamErr.Code))
+	if status, errType, ok := classifyResponsesErrorCode(code); ok {
+		return status, errType, true
 	}
 
-	if code == "" && strings.EqualFold(strings.TrimSpace(event.Response.Error.Type), "rate_limit_error") {
+	errType := strings.ToLower(strings.TrimSpace(streamErr.Type))
+	switch {
+	case errType == "too_many_requests" || (code == "" && (errType == "rate_limit_error" || errType == "rate_limit_exceeded")):
 		return http.StatusTooManyRequests, "rate_limit_error", true
+	case errType == "overloaded_error" || errType == "model_overloaded" || errType == "engine_overloaded" || errType == "service_unavailable":
+		return http.StatusServiceUnavailable, "server_error", true
 	}
 
 	return 0, "", false
+}
+
+func classifyResponsesErrorCode(code string) (int, string, bool) {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "429", "too_many_requests", "rate_limit_exceeded", "rate_limit_error", "quota_exceeded":
+		return http.StatusTooManyRequests, "rate_limit_error", true
+	case "503", "model_overloaded", "engine_overloaded", "overloaded_error", "service_unavailable":
+		return http.StatusServiceUnavailable, "server_error", true
+	case "502", "bad_gateway":
+		return http.StatusBadGateway, "server_error", true
+	case "504", "timeout", "gateway_timeout":
+		return http.StatusGatewayTimeout, "server_error", true
+	default:
+		return 0, "", false
+	}
 }
 
 func selectResponsesRetryAfter(headers http.Header) (string, string) {
@@ -1371,17 +1634,36 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 	}
 
 	if value := strings.TrimSpace(headerGetCI(headers, "retry-after-ms")); value != "" {
-		ms, err := strconv.Atoi(value)
-		if err == nil && ms > 0 {
-			seconds := (ms + 999) / 1000
+		if ms, ok := parsePositiveDecimalClamped(value, int64(maxRetryAfter/time.Millisecond)); ok {
+			delay := retryAfterDurationFromMilliseconds(ms)
+			seconds := durationSecondsCeil(delay)
 			if seconds > 0 {
-				return strconv.Itoa(seconds), "retry-after-ms"
+				return strconv.FormatInt(seconds, 10), "retry-after-ms"
 			}
 		}
 	}
 
 	if delay, ok := parseRetryAfter(strings.TrimSpace(headerGetCI(headers, "Retry-After"))); ok && delay > 0 {
-		return strconv.Itoa(int(delay / time.Second)), "Retry-After"
+		return strconv.FormatInt(durationSecondsCeil(delay), 10), "Retry-After"
+	}
+
+	var resetSeconds int64
+	resetSource := ""
+	for _, dimension := range []string{"tokens", "requests"} {
+		remaining, exhausted := responsesQuotaRemaining(headers, dimension)
+		if !exhausted || remaining == -1 {
+			continue
+		}
+		seconds := responsesQuotaResetSeconds(headers, dimension)
+		if seconds <= resetSeconds {
+			continue
+		}
+		resetSeconds = seconds
+		resetSource = "x-ratelimit-reset-" + dimension
+	}
+	if resetSeconds > 0 {
+		delay := retryAfterDurationFromSeconds(resetSeconds)
+		return strconv.Itoa(int(delay / time.Second)), resetSource
 	}
 
 	return "", ""
@@ -1435,6 +1717,7 @@ func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w h
 		}
 		return
 	}
+	tap.finalizeEOF()
 
 	if ctx.Err() == nil && !tap.completedCleanly() {
 		if lifecycle.suppressTransportCancellation(true) {
@@ -1456,14 +1739,15 @@ func parseResponsesStreamEvent(data string) (responsesWebSocketStreamEvent, erro
 }
 
 func responsesPrecommitErrorMessage(event responsesWebSocketStreamEvent, status int) string {
-	message := strings.TrimSpace(event.Response.Error.Message)
+	streamErr := responsesStreamEventError(event)
+	message := strings.TrimSpace(streamErr.Message)
 	if message != "" {
 		return message
 	}
-	if code := strings.TrimSpace(event.Response.Error.Code); code != "" {
+	if code := strings.TrimSpace(streamErr.Code); code != "" {
 		return code
 	}
-	if errType := strings.TrimSpace(event.Response.Error.Type); errType != "" {
+	if errType := strings.TrimSpace(streamErr.Type); errType != "" {
 		return errType
 	}
 	if text := http.StatusText(status); text != "" {
@@ -1485,12 +1769,13 @@ func logResponsesPrecommitTranslated(h *ProxyHandler, result peekResult, model s
 	if result.failure == nil {
 		return
 	}
+	streamErr := responsesStreamEventError(*result.failure)
 	h.log.Info("translated responses stream failure before commit",
 		logger.F("endpoint", "responses_precommit_translated"),
 		logger.F("status", result.status),
-		logger.F("error_code", strings.TrimSpace(result.failure.Response.Error.Code)),
-		logger.F("error_type", strings.TrimSpace(result.failure.Response.Error.Type)),
-		logger.F("error_message", truncateResponsesFailureLogMessage(result.failure.Response.Error.Message)),
+		logger.F("error_code", strings.TrimSpace(streamErr.Code)),
+		logger.F("error_type", strings.TrimSpace(streamErr.Type)),
+		logger.F("error_message", truncateResponsesFailureLogMessage(streamErr.Message)),
 		logger.F("retry_after_source", result.retryAfterSource),
 		logger.F("retry_after_seconds", result.retryAfter),
 		logger.F("upstream_request_id", responsesUpstreamRequestID(headers)),
@@ -1504,11 +1789,12 @@ func logResponsesPrecommitFailOpen(h *ProxyHandler, event *responsesWebSocketStr
 	if event == nil {
 		return
 	}
+	streamErr := responsesStreamEventError(*event)
 	h.log.Info("left responses stream failure as passthrough",
 		logger.F("endpoint", "responses_precommit_failopen"),
-		logger.F("error_code", strings.TrimSpace(event.Response.Error.Code)),
-		logger.F("error_type", strings.TrimSpace(event.Response.Error.Type)),
-		logger.F("error_message", truncateResponsesFailureLogMessage(event.Response.Error.Message)),
+		logger.F("error_code", strings.TrimSpace(streamErr.Code)),
+		logger.F("error_type", strings.TrimSpace(streamErr.Type)),
+		logger.F("error_message", truncateResponsesFailureLogMessage(streamErr.Message)),
 		logger.F("model", model),
 		logger.F("upstream_request_id", responsesUpstreamRequestID(headers)),
 	)
@@ -1545,6 +1831,21 @@ func headerValuesCI(headers http.Header, name string) []string {
 
 func (p *responsesSSEParser) push(chunk []byte) {
 	p.pending = append(p.pending, chunk...)
+}
+
+func (p *responsesSSEParser) finalizeEOF() {
+	if p == nil || p.done || len(p.pending) == 0 {
+		return
+	}
+	// The streaming consumer dispatches a final SSE event at EOF even if the
+	// provider omits the conventional blank-line delimiter. Add only parser-local
+	// framing so the pre-commit classifier follows the same rule without changing
+	// the raw bytes later forwarded on a fail-open path.
+	if p.pending[len(p.pending)-1] == '\n' {
+		p.pending = append(p.pending, '\n')
+		return
+	}
+	p.pending = append(p.pending, '\n', '\n')
 }
 
 func (p *responsesSSEParser) nextSemantic() (responsesSSEMessage, bool) {
@@ -1673,6 +1974,27 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 		p = p[chunkSize:]
 	}
 	return total, nil
+}
+
+func (t *responsesFailureTap) finalizeEOF() {
+	if t == nil || t.terminalSeen || t.overflowActive {
+		return
+	}
+	// A valid final SSE event is dispatched at EOF even when the provider omits
+	// the conventional blank-line delimiter. Add parser-only framing and route the
+	// event through the same terminal/accounting path without altering wire bytes.
+	t.parser.finalizeEOF()
+	for {
+		msg, ok := t.parser.nextSemantic()
+		if !ok {
+			return
+		}
+		if strings.TrimSpace(msg.data) == "[DONE]" {
+			t.parser.done = true
+			return
+		}
+		t.maybeProcess(msg)
+	}
 }
 
 func (t *responsesFailureTap) writeChunk(p []byte) {
@@ -1810,12 +2132,12 @@ func (t *responsesFailureTap) finishOverflowEvent() {
 	// HTTP is a passthrough surface: an explicit, bounded SSE event name plus its
 	// blank-line boundary is authoritative framing even when the JSON body is too
 	// large for accounting inspection. Do not synthesize detailed provider status
-	// from fragments; completed remains successful, while failed/incomplete retain
+	// from fragments; completed remains successful, while failure terminals retain
 	// a conservative 502 plus best-effort usage.
 	switch t.overflowEvent.Type {
 	case "response.completed":
 		t.terminalSeen = true
-	case "response.failed", "response.incomplete":
+	case "response.failed", "response.incomplete", "error":
 		t.terminalSeen = true
 		observeResponseFailureStatus(t.ctx, http.StatusBadGateway)
 	}
@@ -1891,7 +2213,8 @@ func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
 		eventName != "response.completed" &&
 		eventName != "response.output_item.done" &&
 		eventName != "response.failed" &&
-		eventName != "response.incomplete" {
+		eventName != "response.incomplete" &&
+		eventName != "error" {
 		return
 	}
 
@@ -1903,12 +2226,14 @@ func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
 	eventType := strings.TrimSpace(event.Type)
 	if eventName == "" {
 		eventName = eventType
+	} else if eventType == "" {
+		event.Type = eventName
 	}
 	switch eventName {
-	case "response.completed", "response.failed", "response.incomplete":
+	case "response.completed", "response.failed", "response.incomplete", "error":
 		t.terminalSeen = true
 	}
-	if eventName == "response.completed" || eventName == "response.failed" || eventName == "response.incomplete" {
+	if eventName == "response.completed" || eventName == "response.failed" || eventName == "response.incomplete" || eventName == "error" {
 		// Record token usage from every terminal event. Failed and incomplete
 		// responses can still carry billable partial usage. This is best-effort: a
 		// response.completed larger than responsesFailureTapMaxBuffer is dropped
@@ -1957,17 +2282,18 @@ func (t *responsesFailureTap) maybeLog(eventName string, event responsesWebSocke
 	if t.h == nil {
 		return
 	}
-	if eventName != "response.failed" && eventName != "response.incomplete" {
+	if eventName != "response.failed" && eventName != "response.incomplete" && eventName != "error" {
 		return
 	}
 	// The HTTP 200 was already committed before this post-commit failure event,
 	// so the stats middleware would otherwise record the turn as a success.
 	// Record an out-of-band failure status on the request summary so the
 	// dashboard reflects the failure, mirroring how the websocket bridge maps the
-	// same response.failed/incomplete into an errored turn. Classify the event so
+	// same failure terminal into an errored turn. Classify the event so
 	// rate limits (429) and overloads (503) keep their exact status rather than
 	// all collapsing to bad-gateway.
-	failureStatus, _, _ := responsesWebSocketStreamFailureDetails(event)
+	failureHeaders := responsesFailureHeaders(event, t.upstreamHeaders)
+	failureStatus, _, _, _ := responsesWebSocketStreamFailureDetails(event, failureHeaders)
 	if failureStatus == 0 {
 		failureStatus = http.StatusBadGateway
 	}
@@ -1976,14 +2302,15 @@ func (t *responsesFailureTap) maybeLog(eventName string, event responsesWebSocke
 	fields := []logger.Field{
 		logger.F("endpoint", "responses_stream_failure"),
 		logger.F("event_type", eventName),
-		logger.F("upstream_request_id", responsesUpstreamRequestID(t.upstreamHeaders)),
+		logger.F("upstream_request_id", responsesUpstreamRequestID(failureHeaders)),
 	}
 	switch eventName {
-	case "response.failed":
+	case "response.failed", "error":
+		streamErr := responsesStreamEventError(event)
 		fields = append(fields,
-			logger.F("error_code", strings.TrimSpace(event.Response.Error.Code)),
-			logger.F("error_type", strings.TrimSpace(event.Response.Error.Type)),
-			logger.F("error_message", truncateResponsesFailureLogMessage(event.Response.Error.Message)),
+			logger.F("error_code", strings.TrimSpace(streamErr.Code)),
+			logger.F("error_type", strings.TrimSpace(streamErr.Type)),
+			logger.F("error_message", truncateResponsesFailureLogMessage(streamErr.Message)),
 		)
 	case "response.incomplete":
 		fields = append(fields,

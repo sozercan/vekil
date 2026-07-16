@@ -3080,6 +3080,92 @@ func TestHandleResponsesWebSocket_FirstEventTransientResponseFailedSendsOnlyErro
 	}
 }
 
+func TestHandleResponsesWebSocket_FirstEventTopLevelErrorSendsOnlyErrorFrame(t *testing.T) {
+	var upstreamRequests atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		requestNumber := upstreamRequests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch requestNumber {
+		case 1:
+			_, _ = fmt.Fprint(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"no_capacity\",\"message\":\"No capacity is available.\",\"headers\":{\"retry-after-ms\":\"1200\",\"x-request-id\":\"event-ws-req\"}}}\n\n")
+		case 2:
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-next-top-level-error\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-next-top-level-error\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n")
+		default:
+			t.Fatalf("unexpected upstream request count %d", requestNumber)
+		}
+	})
+	handler.stats = newStatsCollector()
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.WriteJSON(newResponsesWebSocketCreateRequest(nil)); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+	errFrame := mustReadWebSocketJSON(t, conn)
+	if errFrame["type"] != "error" {
+		t.Fatalf("first frame type = %v, want error", errFrame["type"])
+	}
+	if statusCode, _ := errFrame["status_code"].(float64); statusCode != float64(http.StatusTooManyRequests) {
+		t.Fatalf("status_code = %v, want 429", errFrame["status_code"])
+	}
+	errPayload, ok := errFrame["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("error payload type = %T, want object", errFrame["error"])
+	}
+	if errPayload["type"] != "rate_limit_error" || errPayload["code"] != "no_capacity" || errPayload["message"] != "No capacity is available." {
+		t.Fatalf("error payload = %#v, want no_capacity message", errPayload)
+	}
+	headers, ok := errFrame["headers"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("headers type = %T, want object", errFrame["headers"])
+	}
+	if headers["Retry-After"] != "2" || headers["X-Request-Id"] != "event-ws-req" {
+		t.Fatalf("headers = %#v, want Retry-After=2 and X-Request-Id=event-ws-req", headers)
+	}
+	assertSingleResponsesWebSocketFailureStats(t, handler, http.StatusTooManyRequests)
+
+	if err := conn.WriteJSON(newResponsesWebSocketCreateRequest(nil)); err != nil {
+		t.Fatalf("failed to write follow-up websocket request: %v", err)
+	}
+	if frame := mustReadWebSocketJSON(t, conn); frame["type"] != "response.created" {
+		t.Fatalf("follow-up first frame type = %v, want response.created", frame["type"])
+	}
+	if frame := mustReadWebSocketJSON(t, conn); frame["type"] != "response.completed" {
+		t.Fatalf("follow-up second frame type = %v, want response.completed", frame["type"])
+	}
+}
+
+func TestHandleResponsesWebSocket_FirstEventRootErrorPreservesDiagnostics(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: error\ndata: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"The prompt is invalid.\",\"param\":\"input\",\"sequence_number\":1}\n\n")
+	})
+	handler.stats = newStatsCollector()
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.WriteJSON(newResponsesWebSocketCreateRequest(nil)); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+	errFrame := mustReadWebSocketJSON(t, conn)
+	if errFrame["type"] != "error" || errFrame["status_code"] != float64(http.StatusBadRequest) {
+		t.Fatalf("error frame = %#v, want status 400", errFrame)
+	}
+	errPayload, ok := errFrame["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("error payload type = %T, want object", errFrame["error"])
+	}
+	if errPayload["type"] != "invalid_request_error" || errPayload["code"] != "invalid_prompt" || errPayload["message"] != "The prompt is invalid." || errPayload["param"] != "input" {
+		t.Fatalf("error payload = %#v, want canonical root diagnostics", errPayload)
+	}
+	assertSingleResponsesWebSocketFailureStats(t, handler, http.StatusBadRequest)
+}
+
 func TestHandleResponsesWebSocket_FirstEventTransientResponseFailedWithoutUpstreamCodeOmitsErrorCode(t *testing.T) {
 	var upstreamRequests atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -3160,6 +3246,70 @@ func TestHandleResponsesWebSocket_FirstEventTransientResponseFailedWithoutUpstre
 	nextCompleted := mustReadWebSocketJSON(t, conn)
 	if nextCompleted["type"] != "response.completed" {
 		t.Fatalf("expected follow-up response.completed, got %v", nextCompleted["type"])
+	}
+}
+
+func TestResponsesWebSocketSendWrappedErrorSynthesizesRetryAfterFromQuotaReset(t *testing.T) {
+	serverConn, clientConn := newResponsesWebSocketConnPair(t)
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
+	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	headers := http.Header{
+		"x-ratelimit-remaining-tokens": []string{"0"},
+		"x-ratelimit-reset-tokens":     []string{"62"},
+	}
+	if err := session.sendWrappedError(http.StatusTooManyRequests, "rate limited", "", headers); err != nil {
+		t.Fatalf("sendWrappedError error = %v", err)
+	}
+	frame := mustReadWebSocketJSON(t, clientConn)
+	mapped, ok := frame["headers"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("headers = %T, want object", frame["headers"])
+	}
+	if got := mapped["Retry-After"]; got != "62" {
+		t.Fatalf("Retry-After = %v, want 62", got)
+	}
+	if got := headers.Get("Retry-After"); got != "" {
+		t.Fatalf("source headers mutated with Retry-After = %q", got)
+	}
+}
+
+func TestResponsesWebSocketErrorHeadersPreservesExistingRetryAfter(t *testing.T) {
+	headers := http.Header{
+		"Retry-After":                  []string{"3"},
+		"x-ratelimit-remaining-tokens": []string{"0"},
+		"x-ratelimit-reset-tokens":     []string{"62"},
+	}
+	got := responsesWebSocketErrorHeaders(http.StatusTooManyRequests, headers)
+	if retryAfter := got.Get("Retry-After"); retryAfter != "3" {
+		t.Fatalf("Retry-After = %q, want existing value 3", retryAfter)
+	}
+}
+
+func TestResponsesWebSocketErrorHeadersClampsMassiveRetryAfter(t *testing.T) {
+	headers := http.Header{
+		"Retry-After": []string{"10000000000"},
+	}
+	got := responsesWebSocketErrorHeaders(http.StatusTooManyRequests, headers)
+	if retryAfter := got.Get("Retry-After"); retryAfter != "300" {
+		t.Fatalf("Retry-After = %q, want clamped value 300", retryAfter)
+	}
+}
+
+func TestResponsesWebSocketErrorHeadersFallsBackFromInvalidRetryAfter(t *testing.T) {
+	headers := http.Header{
+		"retry-after":    []string{"not-a-delay"},
+		"retry-after-ms": []string{"1200"},
+	}
+
+	got := responsesWebSocketErrorHeaders(http.StatusTooManyRequests, headers)
+	if retryAfter := got.Get("Retry-After"); retryAfter != "2" {
+		t.Fatalf("Retry-After = %q, want fallback value 2; headers=%v", retryAfter, got)
+	}
+	for key := range got {
+		if strings.EqualFold(key, "Retry-After") && key != http.CanonicalHeaderKey("Retry-After") {
+			t.Fatalf("non-canonical Retry-After header was not replaced: key=%q headers=%v", key, got)
+		}
 	}
 }
 
@@ -3402,6 +3552,46 @@ func TestHandleResponsesWebSocket_SameChunkCreatedThenFailedRelaysSSE(t *testing
 	if snap.Totals.PromptTokens != 9 || snap.Totals.CompletionTokens != 2 || snap.Totals.TotalTokens != 11 {
 		t.Fatalf("failed turn usage = prompt:%d completion:%d total:%d, want 9/2/11", snap.Totals.PromptTokens, snap.Totals.CompletionTokens, snap.Totals.TotalTokens)
 	}
+}
+
+func TestHandleResponsesWebSocket_TopLevelErrorAfterCreatedRelaysErrorAndWrappedFailure(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-later-top-level-error\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"server_error\",\"message\":\"Request rate limit exceeded.\",\"headers\":{\"retry-after-ms\":\"1200\"}}}\n\n")
+	})
+	handler.stats = newStatsCollector()
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.WriteJSON(newResponsesWebSocketCreateRequest(nil)); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+	if frame := mustReadWebSocketJSON(t, conn); frame["type"] != "response.created" {
+		t.Fatalf("first frame type = %v, want response.created", frame["type"])
+	}
+	upstreamError := mustReadWebSocketJSON(t, conn)
+	if upstreamError["type"] != "error" {
+		t.Fatalf("second frame type = %v, want upstream error event", upstreamError["type"])
+	}
+	if _, ok := upstreamError["status_code"]; ok {
+		t.Fatalf("upstream error event unexpectedly wrapped: %#v", upstreamError)
+	}
+	wrapped := mustReadWebSocketJSON(t, conn)
+	if wrapped["type"] != "error" || wrapped["status_code"] != float64(http.StatusTooManyRequests) {
+		t.Fatalf("wrapped error = %#v, want status 429", wrapped)
+	}
+	wrappedError, ok := wrapped["error"].(map[string]interface{})
+	if !ok || wrappedError["type"] != "rate_limit_error" {
+		t.Fatalf("wrapped error payload = %#v, want rate_limit_error", wrapped["error"])
+	}
+	headers, ok := wrapped["headers"].(map[string]interface{})
+	if !ok || headers["Retry-After"] != "2" {
+		t.Fatalf("wrapped headers = %#v, want Retry-After=2", wrapped["headers"])
+	}
+	assertSingleResponsesWebSocketFailureStats(t, handler, http.StatusTooManyRequests)
 }
 
 func TestHandleResponsesWebSocket_RelaysUpstreamHeadersOnSuccess(t *testing.T) {
@@ -4516,6 +4706,22 @@ func TestHandleResponsesWebSocket_FailureStatsSurviveImmediateClientWriteFailure
 			wantStatus: http.StatusTooManyRequests,
 		},
 		{
+			name: "translated uncoded quota failure",
+			response: func() *http.Response {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header: http.Header{
+						"Content-Type":                 []string{"text/event-stream"},
+						"retry-after-ms":               []string{"2169"},
+						"x-ratelimit-remaining-tokens": []string{"-36161"},
+					},
+					Body: io.NopCloser(strings.NewReader(
+						"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-uncoded-quota\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n")),
+				}
+			},
+			wantStatus: http.StatusTooManyRequests,
+		},
+		{
 			name: "parsed first response.failed",
 			response: func() *http.Response {
 				return &http.Response{
@@ -4574,6 +4780,11 @@ func TestHandleResponsesWebSocket_StreamFailureStatsSurviveClientCloseAtDelivery
 			wantStatus: http.StatusTooManyRequests,
 		},
 		{
+			name:       "later uncoded quota failure",
+			second:     "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-later-uncoded\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n",
+			wantStatus: http.StatusTooManyRequests,
+		},
+		{
 			name:       "response.incomplete",
 			second:     "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
 			wantStatus: http.StatusConflict,
@@ -4591,8 +4802,12 @@ func TestHandleResponsesWebSocket_StreamFailureStatsSurviveClientCloseAtDelivery
 			handler := newRoundTripTestProxyHandler(t, func(*http.Request) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-					Body:       body,
+					Header: http.Header{
+						"Content-Type":                 []string{"text/event-stream"},
+						"retry-after-ms":               []string{"2169"},
+						"x-ratelimit-remaining-tokens": []string{"-36161"},
+					},
+					Body: body,
 				}, nil
 			})
 			handler.stats = newStatsCollector()

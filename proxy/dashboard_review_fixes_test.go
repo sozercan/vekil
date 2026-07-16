@@ -535,11 +535,41 @@ func TestResponsesWebSocketStreamFailureDetailsStatus(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			status, _, _ := responsesWebSocketStreamFailureDetails(tc.event)
+			status, _, _, _ := responsesWebSocketStreamFailureDetails(tc.event, nil)
 			if status != tc.want {
 				t.Fatalf("status = %d want %d", status, tc.want)
 			}
 		})
+	}
+}
+
+func TestResponsesWebSocketStreamFailureDetailsUsesQuotaHeadersForUncodedFailure(t *testing.T) {
+	var event responsesWebSocketStreamEvent
+	event.Type = "response.failed"
+	event.Response.Error.Message = "Your requests have exceeded rate limit."
+	headers := http.Header{
+		"retry-after-ms":               []string{"2169"},
+		"x-ratelimit-remaining-tokens": []string{"-36161"},
+	}
+	status, message, code, _ := responsesWebSocketStreamFailureDetails(event, headers)
+	if status != http.StatusTooManyRequests || message != event.Response.Error.Message || code != "" {
+		t.Fatalf("failure details = (%d, %q, %q), want (429, %q, empty)", status, message, code, event.Response.Error.Message)
+	}
+}
+
+func TestResponsesWebSocketStreamFailureDetailsPreservesExplicitFailureOverQuotaHeaders(t *testing.T) {
+	var event responsesWebSocketStreamEvent
+	event.Type = "response.failed"
+	event.Response.Error.Type = "invalid_request_error"
+	event.Response.Error.Code = "context_length_exceeded"
+	event.Response.Error.Message = "too long"
+	headers := http.Header{
+		"retry-after-ms":               []string{"2169"},
+		"x-ratelimit-remaining-tokens": []string{"-36161"},
+	}
+	status, message, code, _ := responsesWebSocketStreamFailureDetails(event, headers)
+	if status != http.StatusBadRequest || message != "too long" || code != "context_length_exceeded" {
+		t.Fatalf("failure details = (%d, %q, %q), want (400, too long, context_length_exceeded)", status, message, code)
 	}
 }
 
