@@ -639,6 +639,14 @@ func normalizeExplicitAnthropicResponseModelJSON(body []byte, publicModel string
 	}
 
 	changed := rewriteAnthropicModelFields(payload, publicModel)
+	if rawJSONString(payload["model"]) != publicModel {
+		rawPublicModel, err := json.Marshal(publicModel)
+		if err != nil {
+			return nil, false, fmt.Errorf("normalize explicit route anthropic response model: %w", err)
+		}
+		payload["model"] = rawPublicModel
+		changed = true
+	}
 	if !changed {
 		return body, false, nil
 	}

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -38,14 +39,66 @@ func (w *responseModelNormalizationWriter) Write(p []byte) (int, error) {
 	return w.body.Write(p)
 }
 
-func TestRewriteResponsesResponseModelJSON(t *testing.T) {
-	input := []byte(`{"id":"resp_1","model":"physical","response":{"id":"resp_1","model":"physical"},"output":[]}`)
-	got, changed := rewriteResponsesResponseModelJSON(input, "public")
-	if !changed {
-		t.Fatal("changed = false")
+func TestRewriteResponsesResponseModelJSONNormalizesNonStreamingResponses(t *testing.T) {
+	tests := []struct {
+		name  string
+		model string
+	}{
+		{name: "missing model"},
+		{name: "null model", model: `,"model":null`},
+		{name: "non-string model", model: `,"model":42`},
+		{name: "empty model", model: `,"model":""`},
+		{name: "valid model", model: `,"model":"physical"`},
 	}
-	if strings.Contains(string(got), `"physical"`) || strings.Count(string(got), `"public"`) != 2 {
-		t.Fatalf("rewritten = %s", got)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := []byte(`{"id":"resp_1","object":"response"` + tc.model + `,"output":[]}`)
+			got, changed := rewriteResponsesResponseModelJSON(input, "public")
+			if !changed {
+				t.Fatal("changed = false")
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(got, &payload); err != nil {
+				t.Fatalf("decode rewritten response: %v", err)
+			}
+			if gotModel := payload["model"]; gotModel != "public" {
+				t.Fatalf("model = %#v, want public", gotModel)
+			}
+		})
+	}
+}
+
+func TestRewriteResponsesResponseModelJSONLeavesNonResponseEventsUntouched(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "vendor event",
+			body: `{"type":"vendor.event","model":"vendor-model","response":{"model":"vendor-response"}}`,
+		},
+		{
+			name: "output item event",
+			body: `{"type":"response.output_item.done","item":{"type":"message","model":"item-model"}}`,
+		},
+		{
+			name: "malformed event type",
+			body: `{"type":42,"model":"vendor-model"}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := []byte(tc.body)
+			got, changed := rewriteResponsesResponseModelJSON(input, "public")
+			if changed {
+				t.Fatal("changed = true")
+			}
+			if !bytes.Equal(got, input) {
+				t.Fatalf("rewritten = %s, want exact passthrough %s", got, input)
+			}
+		})
 	}
 }
 
@@ -147,7 +200,7 @@ func TestNormalizeResponsesStreamBodyWithBindingFailsOpenForExtractionErrors(t *
 
 func TestNormalizeResponsesStreamBodyWithBindingIgnoresVendorEventRootID(t *testing.T) {
 	const eventID = "event-vendor"
-	const stream = "event: vendor.event\ndata: {\"type\":\"vendor.event\",\"id\":\"event-vendor\"}\n\n"
+	const stream = "event: vendor.event\ndata: {\"type\":\"vendor.event\",\"id\":\"event-vendor\",\"model\":\"vendor-model\"}\n\n"
 	h := &ProxyHandler{}
 	body := normalizeResponsesStreamBodyWithBinding(h, io.NopCloser(strings.NewReader(stream)), explicitRouteResponseInfo{
 		routeID:  "route-1",
@@ -169,6 +222,24 @@ func TestNormalizeResponsesStreamBodyWithBindingIgnoresVendorEventRootID(t *test
 	}
 	if result := store.lookup(stateBindingTypeResponseID, eventID); result.outcome != stateBindingLookupUnknown {
 		t.Fatalf("vendor event root id binding outcome = %s, want unknown", result.outcome)
+	}
+}
+
+func TestNormalizeResponsesStreamBodyWithBindingLeavesOutputItemEventUntouched(t *testing.T) {
+	const stream = "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"item-1\",\"type\":\"message\",\"model\":\"item-model\"}}\n\n"
+	body := normalizeResponsesStreamBodyWithBinding(&ProxyHandler{}, io.NopCloser(strings.NewReader(stream)), explicitRouteResponseInfo{
+		routeID:  "route-1",
+		publicID: "public",
+		targetID: "target-1",
+	})
+	defer func() { _ = body.Close() }()
+
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if string(got) != stream {
+		t.Fatalf("stream = %q, want exact passthrough %q", got, stream)
 	}
 }
 
@@ -202,21 +273,41 @@ func TestNormalizeResponsesStreamBodyWithBindingBindsLifecycleNestedResponseIDOn
 	}
 }
 
-func TestNormalizeResponsesStreamBodyWithBindingRewritesValidModel(t *testing.T) {
-	const stream = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-model\",\"model\":\"physical\"}}\n\n"
-	body := normalizeResponsesStreamBodyWithBinding(&ProxyHandler{}, io.NopCloser(strings.NewReader(stream)), explicitRouteResponseInfo{
-		routeID:  "route-1",
-		publicID: "public",
-		targetID: "target-1",
-	})
-	defer func() { _ = body.Close() }()
-
-	got, err := io.ReadAll(body)
-	if err != nil {
-		t.Fatalf("ReadAll() error = %v", err)
+func TestNormalizeResponsesStreamBodyWithBindingNormalizesLifecycleResponseModels(t *testing.T) {
+	tests := []struct {
+		name      string
+		eventType string
+		model     string
+	}{
+		{name: "missing model", eventType: "response.created"},
+		{name: "null model", eventType: "response.created", model: `,"model":null`},
+		{name: "non-string model", eventType: "response.created", model: `,"model":42`},
+		{name: "empty model", eventType: "response.created", model: `,"model":""`},
+		{name: "valid model", eventType: "response.created", model: `,"model":"physical"`},
+		{name: "queued lifecycle model", eventType: "response.queued"},
 	}
-	if strings.Contains(string(got), `"physical"`) || !strings.Contains(string(got), `"model":"public"`) {
-		t.Fatalf("stream = %s", got)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := "event: " + tc.eventType + "\ndata: {\"type\":\"" + tc.eventType + "\",\"response\":{\"id\":\"resp-model\"" + tc.model + "}}\n\n"
+			body := normalizeResponsesStreamBodyWithBinding(&ProxyHandler{}, io.NopCloser(strings.NewReader(stream)), explicitRouteResponseInfo{
+				routeID:  "route-1",
+				publicID: "public",
+				targetID: "target-1",
+			})
+			defer func() { _ = body.Close() }()
+
+			got, err := io.ReadAll(body)
+			if err != nil {
+				t.Fatalf("ReadAll() error = %v", err)
+			}
+			if !strings.Contains(string(got), `"model":"public"`) {
+				t.Fatalf("stream = %s", got)
+			}
+			if strings.Contains(string(got), `"model":"physical"`) || strings.Contains(string(got), `"model":42`) || strings.Contains(string(got), `"model":null`) {
+				t.Fatalf("stream retained upstream model = %s", got)
+			}
+		})
 	}
 }
 
@@ -376,41 +467,56 @@ func TestWriteExplicitResponsesResponsePreservesHeaderConflictFailure(t *testing
 	assertResponseModelNormalizationWriterUncommitted(t, w)
 }
 
-func TestWriteExplicitResponsesResponsePreservesModelNormalization(t *testing.T) {
-	const input = `{"model":"physical","output":[]}`
-	w := newResponseModelNormalizationWriter()
-	resp := &http.Response{
-		StatusCode: http.StatusOK,
-		Header: http.Header{
-			"Content-Length": []string{strconv.Itoa(len(input))},
-			"Content-Type":   []string{"application/json"},
-			"X-Upstream":     []string{"present"},
-		},
-		Body: io.NopCloser(strings.NewReader(input)),
+func TestWriteExplicitResponsesResponseNormalizesModel(t *testing.T) {
+	tests := []struct {
+		name  string
+		model string
+	}{
+		{name: "missing model"},
+		{name: "null model", model: `,"model":null`},
+		{name: "non-string model", model: `,"model":42`},
+		{name: "empty model", model: `,"model":""`},
+		{name: "valid model", model: `,"model":"physical"`},
 	}
 
-	err := writeExplicitResponsesResponse(context.Background(), &ProxyHandler{}, w, resp, explicitRouteResponseInfo{
-		routeID:  "route-1",
-		publicID: "public",
-		targetID: "target-1",
-	}, nil, "")
-	if err != nil {
-		t.Fatalf("writeExplicitResponsesResponse() error = %v", err)
-	}
-	if w.writeHeaderCalls != 1 || w.statusCode != http.StatusOK {
-		t.Fatalf("WriteHeader calls/status = %d/%d, want 1/%d", w.writeHeaderCalls, w.statusCode, http.StatusOK)
-	}
-	if w.writeCalls != 1 {
-		t.Fatalf("Write calls = %d, want 1", w.writeCalls)
-	}
-	if got := w.body.String(); strings.Contains(got, `"physical"`) || !strings.Contains(got, `"model":"public"`) {
-		t.Fatalf("body = %s", got)
-	}
-	if got := w.header.Get("X-Upstream"); got != "present" {
-		t.Fatalf("X-Upstream = %q, want present", got)
-	}
-	if got, want := w.header.Get("Content-Length"), strconv.Itoa(w.body.Len()); got != want {
-		t.Fatalf("Content-Length = %q, want %q", got, want)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := `{"id":"resp-model","object":"response"` + tc.model + `,"output":[]}`
+			w := newResponseModelNormalizationWriter()
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Length": []string{strconv.Itoa(len(input))},
+					"Content-Type":   []string{"application/json"},
+					"X-Upstream":     []string{"present"},
+				},
+				Body: io.NopCloser(strings.NewReader(input)),
+			}
+
+			err := writeExplicitResponsesResponse(context.Background(), &ProxyHandler{}, w, resp, explicitRouteResponseInfo{
+				routeID:  "route-1",
+				publicID: "public",
+				targetID: "target-1",
+			}, nil, "")
+			if err != nil {
+				t.Fatalf("writeExplicitResponsesResponse() error = %v", err)
+			}
+			if w.writeHeaderCalls != 1 || w.statusCode != http.StatusOK {
+				t.Fatalf("WriteHeader calls/status = %d/%d, want 1/%d", w.writeHeaderCalls, w.statusCode, http.StatusOK)
+			}
+			if w.writeCalls != 1 {
+				t.Fatalf("Write calls = %d, want 1", w.writeCalls)
+			}
+			if got := w.body.String(); strings.Contains(got, `"physical"`) || !strings.Contains(got, `"model":"public"`) {
+				t.Fatalf("body = %s", got)
+			}
+			if got := w.header.Get("X-Upstream"); got != "present" {
+				t.Fatalf("X-Upstream = %q, want present", got)
+			}
+			if got, want := w.header.Get("Content-Length"), strconv.Itoa(w.body.Len()); got != want {
+				t.Fatalf("Content-Length = %q, want %q", got, want)
+			}
+		})
 	}
 }
 

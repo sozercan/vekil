@@ -275,6 +275,109 @@ func TestExplicitRouteAnthropicJSONNormalizationRewritesPublicModel(t *testing.T
 	}
 }
 
+func TestExplicitRouteAnthropicJSONNormalizationEnforcesPublicModelBeforeCommit(t *testing.T) {
+	tests := []struct {
+		name             string
+		upstreamResponse string
+		wantNestedModel  bool
+	}{
+		{
+			name:             "top-level model",
+			upstreamResponse: `{"id":"msg-primary","type":"message","role":"assistant","model":"physical-primary","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1},"vendor":{"preserved":true}}`,
+		},
+		{
+			name:             "missing top-level model",
+			upstreamResponse: `{"id":"msg-primary","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1},"vendor":{"preserved":true}}`,
+		},
+		{
+			name:             "null top-level model",
+			upstreamResponse: `{"id":"msg-primary","type":"message","role":"assistant","model":null,"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1},"vendor":{"preserved":true}}`,
+		},
+		{
+			name:             "non-string top-level model",
+			upstreamResponse: `{"id":"msg-primary","type":"message","role":"assistant","model":{"deployment":"physical-primary"},"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1},"vendor":{"preserved":true}}`,
+		},
+		{
+			name:            "nested message model",
+			wantNestedModel: true,
+			upstreamResponse: `{"id":"msg-primary","type":"message","role":"assistant","model":"physical-primary","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1},` +
+				`"message":{"id":"msg-nested","type":"message","role":"assistant","model":"physical-nested","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}},"vendor":{"preserved":true}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			h := newExplicitRouteSurfaceHandler(t, providerTypeAnthropicCompatible, providerEndpointMessages, "http://primary.invalid", "http://secondary.invalid")
+			h.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls.Add(1)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Header: http.Header{
+						"Content-Type":   []string{"application/json"},
+						"Content-Length": []string{fmt.Sprintf("%d", len(tt.upstreamResponse))},
+						"Openai-Model":   []string{"physical-primary"},
+					},
+					Body:    io.NopCloser(strings.NewReader(tt.upstreamResponse)),
+					Request: req,
+				}, nil
+			})}
+
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"public-model","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}`))
+			h.HandleAnthropicMessages(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("upstream calls = %d, want 1", calls.Load())
+			}
+			if strings.Contains(w.Body.String(), "physical-") {
+				t.Fatalf("client response exposed physical model: %s", w.Body.String())
+			}
+			if got := w.Header().Get("Openai-Model"); got != "public-model" {
+				t.Fatalf("Openai-Model = %q, want public-model", got)
+			}
+			if got := w.Header().Get("Content-Length"); got != "" {
+				t.Fatalf("Content-Length = %q, want cleared after normalization", got)
+			}
+
+			var envelope models.AnthropicResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
+				t.Fatalf("decode normalized Anthropic success envelope: %v; body=%s", err, w.Body.String())
+			}
+			if envelope.ID != "msg-primary" || envelope.Type != "message" || envelope.Role != "assistant" {
+				t.Fatalf("invalid Anthropic success envelope identity: %+v", envelope)
+			}
+			if envelope.Model != "public-model" {
+				t.Fatalf("response model = %q, want public-model", envelope.Model)
+			}
+			if len(envelope.Content) != 1 || envelope.Usage.InputTokens != 1 || envelope.Usage.OutputTokens != 1 {
+				t.Fatalf("invalid Anthropic success envelope payload: %+v", envelope)
+			}
+
+			var payload map[string]json.RawMessage
+			if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode normalized Anthropic response fields: %v", err)
+			}
+			if !strings.Contains(string(payload["vendor"]), `"preserved":true`) {
+				t.Fatalf("vendor field was not preserved: %s", payload["vendor"])
+			}
+			if tt.wantNestedModel {
+				var nested models.AnthropicResponse
+				if err := json.Unmarshal(payload["message"], &nested); err != nil {
+					t.Fatalf("decode nested Anthropic message: %v; message=%s", err, payload["message"])
+				}
+				if nested.ID != "msg-nested" || nested.Type != "message" || nested.Role != "assistant" || nested.Model != "public-model" {
+					t.Fatalf("invalid normalized nested Anthropic message: %+v", nested)
+				}
+			}
+		})
+	}
+}
+
 func TestLegacyAnthropicJSONNormalizationRemainsBestEffort(t *testing.T) {
 	const upstreamResponse = `{"id":"msg-legacy","type":"message","model":"physical-model"`
 	var calls atomic.Int32

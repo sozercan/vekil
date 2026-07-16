@@ -47,8 +47,22 @@ func rewriteResponsesResponseModelJSON(body []byte, publicModel string) ([]byte,
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return body, false
 	}
-	changed := rewriteResponsesModelObject(payload, publicModel)
-	if nested, ok := payload["response"]; ok {
+
+	var changed bool
+	eventTypeRaw, hasEventType := payload["type"]
+	if !hasEventType {
+		// Non-streaming Responses payloads expose the Response object at the
+		// root, so the configured public model must be present regardless of
+		// what the upstream returned in model.
+		changed = rewriteResponsesModelObject(payload, publicModel)
+	} else if responsesLifecycleEventHasResponse(rawJSONString(eventTypeRaw)) {
+		// Streaming lifecycle envelopes expose the actual Response object under
+		// response. Other event kinds, including output-item and vendor events,
+		// do not own a response model and must remain transparent.
+		nested, ok := payload["response"]
+		if !ok {
+			return body, false
+		}
 		var response map[string]json.RawMessage
 		if json.Unmarshal(nested, &response) == nil && rewriteResponsesModelObject(response, publicModel) {
 			if raw, err := json.Marshal(response); err == nil {
@@ -68,8 +82,7 @@ func rewriteResponsesResponseModelJSON(body []byte, publicModel string) ([]byte,
 }
 
 func rewriteResponsesModelObject(payload map[string]json.RawMessage, publicModel string) bool {
-	raw, ok := payload["model"]
-	if !ok || rawJSONString(raw) == "" {
+	if payload == nil {
 		return false
 	}
 	encoded, err := json.Marshal(publicModel)
@@ -78,6 +91,15 @@ func rewriteResponsesModelObject(payload map[string]json.RawMessage, publicModel
 	}
 	payload["model"] = encoded
 	return true
+}
+
+func responsesLifecycleEventHasResponse(eventType string) bool {
+	switch strings.TrimSpace(eventType) {
+	case "response.queued", "response.created", "response.in_progress", "response.completed", "response.failed", "response.incomplete":
+		return true
+	default:
+		return false
+	}
 }
 
 func writeExplicitResponsesResponse(ctx context.Context, h *ProxyHandler, w http.ResponseWriter, resp *http.Response, info explicitRouteResponseInfo, store *ToolExecutionContextStore, scope string) error {
