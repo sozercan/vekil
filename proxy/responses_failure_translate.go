@@ -1659,8 +1659,11 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 		resetSource = "x-ratelimit-reset-" + dimension
 	}
 	if resetSeconds > 0 {
-		delay := clampRetryAfter(time.Duration(resetSeconds) * time.Second)
-		return strconv.Itoa(int(delay / time.Second)), resetSource
+		maxSec := int(maxRetryAfter / time.Second)
+		if resetSeconds > maxSec {
+			resetSeconds = maxSec
+		}
+		return strconv.Itoa(resetSeconds), resetSource
 	}
 
 	return "", ""

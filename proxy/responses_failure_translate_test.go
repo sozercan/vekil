@@ -317,6 +317,20 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantErrorMessage: "Request rate limit exceeded.",
 		},
 		{
+			name: "overflow-sized reset value is clamped to five minutes",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-overflow-reset\",\"error\":{\"message\":\"Request rate limit exceeded.\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type":                   []string{"text/event-stream"},
+				"x-ratelimit-remaining-requests": []string{"0"},
+				"x-ratelimit-reset-requests":     []string{"10000000000"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "300",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "Request rate limit exceeded.",
+		},
+		{
 			name: "created then uncoded azure rate limit translates from exhausted quota headers",
 			body: "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-azure-uncoded-rate-limit\"}}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-azure-uncoded-rate-limit\",\"error\":{\"message\":\"Your requests to gpt-5.6-sol for gpt-5.6-sol in westus3 have exceeded rate limit.\"}}}\n\n",
 			headers: http.Header{
