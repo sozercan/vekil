@@ -1491,9 +1491,9 @@ func classifyResponsesFailure(event responsesWebSocketStreamEvent, headers http.
 			return status, resultType, true
 		}
 		switch errType {
-		case "too_many_requests", "rate_limit_error":
+		case "too_many_requests", "rate_limit_error", "rate_limit_exceeded":
 			return http.StatusTooManyRequests, "rate_limit_error", true
-		case "overloaded_error", "model_overloaded", "engine_overloaded":
+		case "overloaded_error", "model_overloaded", "engine_overloaded", "service_unavailable":
 			return http.StatusServiceUnavailable, "server_error", true
 		case "forbidden", "permission_error":
 			return http.StatusForbidden, "permission_error", true
@@ -1607,9 +1607,9 @@ func classifyPrecommitResponsesFailure(event responsesWebSocketStreamEvent) (int
 
 	errType := strings.ToLower(strings.TrimSpace(streamErr.Type))
 	switch {
-	case errType == "too_many_requests" || (code == "" && errType == "rate_limit_error"):
+	case errType == "too_many_requests" || (code == "" && (errType == "rate_limit_error" || errType == "rate_limit_exceeded")):
 		return http.StatusTooManyRequests, "rate_limit_error", true
-	case errType == "overloaded_error" || errType == "model_overloaded" || errType == "engine_overloaded":
+	case errType == "overloaded_error" || errType == "model_overloaded" || errType == "engine_overloaded" || errType == "service_unavailable":
 		return http.StatusServiceUnavailable, "server_error", true
 	}
 
@@ -1620,7 +1620,7 @@ func classifyResponsesErrorCode(code string) (int, string, bool) {
 	switch strings.ToLower(strings.TrimSpace(code)) {
 	case "429", "too_many_requests", "rate_limit_exceeded", "rate_limit_error", "quota_exceeded":
 		return http.StatusTooManyRequests, "rate_limit_error", true
-	case "503", "model_overloaded", "engine_overloaded":
+	case "503", "model_overloaded", "engine_overloaded", "overloaded_error", "service_unavailable":
 		return http.StatusServiceUnavailable, "server_error", true
 	case "502", "bad_gateway":
 		return http.StatusBadGateway, "server_error", true

@@ -3306,8 +3306,10 @@ func TestResponsesWebSocketErrorHeadersFallsBackFromInvalidRetryAfter(t *testing
 	if retryAfter := got.Get("Retry-After"); retryAfter != "2" {
 		t.Fatalf("Retry-After = %q, want fallback value 2; headers=%v", retryAfter, got)
 	}
-	if _, ok := got["retry-after"]; ok {
-		t.Fatalf("lowercase retry-after header was not replaced: %#v", got["retry-after"])
+	for key := range got {
+		if strings.EqualFold(key, "Retry-After") && key != http.CanonicalHeaderKey("Retry-After") {
+			t.Fatalf("non-canonical Retry-After header was not replaced: key=%q headers=%v", key, got)
+		}
 	}
 }
 

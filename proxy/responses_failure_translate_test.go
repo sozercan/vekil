@@ -114,6 +114,17 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantErrorMessage: "slow down",
 		},
 		{
+			name: "response failed rate_limit_exceeded type maps to 429",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-rate-limit-exceeded-type\",\"error\":{\"type\":\"rate_limit_exceeded\",\"message\":\"rate limited\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "rate limited",
+		},
+		{
 			name: "top level error event translates before commit",
 			body: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"no_capacity\",\"message\":\"No capacity is available for this model.\",\"param\":\"model\",\"headers\":{\"retry-after-ms\":\"1200\",\"x-request-id\":\"event-req-1\"}}}\n\n",
 			headers: http.Header{
@@ -131,6 +142,41 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 					t.Fatalf("X-Request-Id = %q, want event-req-1", got)
 				}
 			},
+		},
+		{
+			name: "top level rate_limit_exceeded type maps to 429",
+			body: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_exceeded\",\"message\":\"rate limited\"}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusTooManyRequests,
+			wantContentType:  "application/json",
+			wantErrorType:    "rate_limit_error",
+			wantErrorMessage: "rate limited",
+		},
+		{
+			name: "overloaded_error code maps to 503",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-overload-code\",\"error\":{\"code\":\"overloaded_error\",\"message\":\"capacity exhausted\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusServiceUnavailable,
+			wantContentType:  "application/json",
+			wantErrorType:    "server_error",
+			wantErrorCode:    "overloaded_error",
+			wantErrorMessage: "capacity exhausted",
+		},
+		{
+			name: "service_unavailable code maps to 503",
+			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-service-unavailable-code\",\"error\":{\"code\":\"service_unavailable\",\"message\":\"capacity unavailable\"}}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+			},
+			wantStatus:       http.StatusServiceUnavailable,
+			wantContentType:  "application/json",
+			wantErrorType:    "server_error",
+			wantErrorCode:    "service_unavailable",
+			wantErrorMessage: "capacity unavailable",
 		},
 		{
 			name: "canonical root error event translates before commit",
