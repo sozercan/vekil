@@ -662,12 +662,20 @@ func responsesFailureHeaders(event responsesWebSocketStreamEvent, upstream http.
 		merged = make(http.Header)
 	}
 	for name, values := range eventHeaders {
-		merged.Del(name)
+		deleteHeaderCI(merged, name)
 		for _, value := range values {
 			merged.Add(name, value)
 		}
 	}
 	return merged
+}
+
+func deleteHeaderCI(headers http.Header, name string) {
+	for key := range headers {
+		if strings.EqualFold(key, name) {
+			delete(headers, key)
+		}
+	}
 }
 
 type responsesPreparedStream struct {
@@ -1482,6 +1490,8 @@ func classifyResponsesFailure(event responsesWebSocketStreamEvent, headers http.
 		switch errType {
 		case "too_many_requests", "rate_limit_error":
 			return http.StatusTooManyRequests, "rate_limit_error", true
+		case "overloaded_error", "model_overloaded", "engine_overloaded":
+			return http.StatusServiceUnavailable, "server_error", true
 		case "forbidden", "permission_error":
 			return http.StatusForbidden, "permission_error", true
 		case "user_error", "invalid_request_error":
@@ -1493,7 +1503,7 @@ func classifyResponsesFailure(event responsesWebSocketStreamEvent, headers http.
 		case "conflict_error":
 			return http.StatusConflict, "conflict_error", true
 		}
-		if (errType == "" || errType == "server_error") && responsesQuotaEvidence(headers) && responsesRateLimitMessage(streamErr.Message) {
+		if code == "" && (errType == "" || errType == "server_error") && responsesQuotaEvidence(headers) && responsesRateLimitMessage(streamErr.Message) {
 			return http.StatusTooManyRequests, "rate_limit_error", true
 		}
 		if errType == "server_error" {
@@ -2191,6 +2201,8 @@ func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
 	eventType := strings.TrimSpace(event.Type)
 	if eventName == "" {
 		eventName = eventType
+	} else if eventType == "" {
+		event.Type = eventName
 	}
 	switch eventName {
 	case "response.completed", "response.failed", "response.incomplete", "error":

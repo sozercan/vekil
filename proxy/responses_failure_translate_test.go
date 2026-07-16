@@ -162,6 +162,33 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			},
 		},
 		{
+			name: "explicit top level error code remains authoritative with quota headers",
+			body: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"Context rate limit exceeded.\"}}\n\n",
+			headers: http.Header{
+				"Content-Type":                 []string{"text/event-stream"},
+				"retry-after-ms":               []string{"1200"},
+				"x-ratelimit-remaining-tokens": []string{"0"},
+			},
+			wantStatus:       http.StatusInternalServerError,
+			wantContentType:  "application/json",
+			wantErrorType:    "server_error",
+			wantErrorCode:    "context_length_exceeded",
+			wantErrorMessage: "Context rate limit exceeded.",
+		},
+		{
+			name: "overloaded top level error maps to 503",
+			body: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Capacity exhausted.\"}}\n\n",
+			headers: http.Header{
+				"Content-Type": []string{"text/event-stream"},
+				"Retry-After":  []string{"4"},
+			},
+			wantStatus:       http.StatusServiceUnavailable,
+			wantContentType:  "application/json",
+			wantRetryAfter:   "4",
+			wantErrorType:    "server_error",
+			wantErrorMessage: "Capacity exhausted.",
+		},
+		{
 			name: "unknown failure fails open",
 			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-unknown\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}}\n\n",
 			headers: http.Header{
@@ -499,6 +526,37 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 				t.Fatalf("error.message = %q, want %q", envelope.Error.Message, tt.wantErrorMessage)
 			}
 		})
+	}
+}
+
+func TestResponsesFailureHeadersEventValuesReplaceUpstreamCaseInsensitively(t *testing.T) {
+	event := responsesWebSocketStreamEvent{Type: "error"}
+	event.Error.Headers = map[string]json.RawMessage{
+		"Retry-After-Ms": json.RawMessage(`"1200"`),
+		"X-Request-Id":   json.RawMessage(`"event-request-id"`),
+	}
+	upstream := http.Header{
+		"retry-after-ms": []string{"9000"},
+		"x-request-id":   []string{"upstream-request-id"},
+	}
+
+	merged := responsesFailureHeaders(event, upstream)
+	if got := headerGetCI(merged, "retry-after-ms"); got != "1200" {
+		t.Fatalf("retry-after-ms = %q, want event value 1200; headers=%v", got, merged)
+	}
+	if got := headerGetCI(merged, "x-request-id"); got != "event-request-id" {
+		t.Fatalf("x-request-id = %q, want event value; headers=%v", got, merged)
+	}
+	for _, name := range []string{"retry-after-ms", "x-request-id"} {
+		matchingKeys := 0
+		for key := range merged {
+			if strings.EqualFold(key, name) {
+				matchingKeys++
+			}
+		}
+		if matchingKeys != 1 {
+			t.Fatalf("case-insensitive key count for %s = %d, want 1; headers=%v", name, matchingKeys, merged)
+		}
 	}
 }
 
@@ -964,6 +1022,21 @@ func TestStreamResponsesPipeClassifiesTopLevelErrorEvent(t *testing.T) {
 	streamResponsesPipeWithFailureLog(streamCtx, &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, rec, strings.NewReader(sse), nil, nil, "")
 	if got := streamSummary.FailureStatus(); got != http.StatusTooManyRequests {
 		t.Fatalf("stream FailureStatus = %d, want 429", got)
+	}
+	if got := rec.Body.String(); got != sse {
+		t.Fatalf("stream body altered. got %q want %q", got, sse)
+	}
+}
+
+func TestStreamResponsesPipeNormalizesEventNameForUntypedNestedError(t *testing.T) {
+	sse := "event: error\ndata: {\"error\":{\"type\":\"too_many_requests\",\"code\":\"no_capacity\",\"message\":\"No capacity is available.\",\"headers\":{\"retry-after-ms\":\"1200\"}}}\n\n"
+	ctx, summary := WithRequestSummary(context.Background())
+	rec := httptest.NewRecorder()
+
+	streamResponsesPipeWithFailureLog(ctx, &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, rec, strings.NewReader(sse), nil, nil, "")
+
+	if got := summary.FailureStatus(); got != http.StatusTooManyRequests {
+		t.Fatalf("FailureStatus = %d, want 429", got)
 	}
 	if got := rec.Body.String(); got != sse {
 		t.Fatalf("stream body altered. got %q want %q", got, sse)
