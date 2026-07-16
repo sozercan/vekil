@@ -278,8 +278,11 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, 
 						}
 					}
 				}
+				// Keep requestedModel as the model present in the immutable fallback
+				// body. The override carries only the physical model selected for the
+				// pinned target, so prepareRouteTargetBody can still rewrite from the
+				// actual fallback model to that upstream model.
 				ctx = withRouteUpstreamModelOverride(ctx, upstreamModel)
-				requestedModel = route.public.id
 			}
 		}
 		if !route.supportsEndpoint(path) {

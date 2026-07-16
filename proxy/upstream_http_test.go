@@ -168,6 +168,106 @@ func TestPostJSONEndpointWithHeadersForModel_ExplicitRouteRewritesNormalizedAlia
 	}
 }
 
+func TestPostJSONEndpointWithHeadersForModel_ExplicitFallbackKeepsBodyModelAsRewriteSource(t *testing.T) {
+	const (
+		routeModel    = "model-a"
+		fallbackModel = "model-b"
+		targetID      = "target"
+	)
+
+	forwardedModels := make(chan string, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != providerEndpointResponses {
+			t.Errorf("upstream path = %q, want %q", r.URL.Path, providerEndpointResponses)
+		}
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		forwardedModels <- payload.Model
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp-fallback","object":"response","status":"completed","model":"model-a","output":[]}`)
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(ProvidersConfig{
+			SchemaVersion: ProvidersConfigSchemaVersion2,
+			Providers: []ProviderConfig{{
+				ID:       "explicit",
+				Type:     string(providerTypeOpenAICompatible),
+				Default:  true,
+				BaseURL:  upstream.URL,
+				AuthType: "none",
+				Models: []ProviderModelConfig{{
+					PublicID:   fallbackModel,
+					Deployment: routeModel,
+					Endpoints:  []string{providerEndpointResponses},
+				}},
+			}},
+			ModelRoutes: []ModelRouteConfig{{
+				ID:        "model-a-route",
+				PublicID:  routeModel,
+				Endpoints: []string{providerEndpointResponses},
+				Targets: []ModelRouteTargetConfig{{
+					ID:            targetID,
+					Provider:      "explicit",
+					UpstreamModel: routeModel,
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	defer handler.BeginShutdown()
+
+	tests := []struct {
+		name string
+		kind routeAttemptKind
+	}{
+		{name: "compatibility fallback", kind: routeAttemptCompatibilityFallback},
+		{name: "compaction fallback", kind: routeAttemptCompaction},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, operation, route, err := handler.withExplicitRouteOperation(context.Background(), context.Background(), routeModel, providerEndpointResponses)
+			if err != nil {
+				t.Fatalf("withExplicitRouteOperation() error = %v", err)
+			}
+			if operation == nil || route == nil {
+				t.Fatal("withExplicitRouteOperation() did not create an explicit route operation")
+			}
+			if err := operation.forcePinnedTarget(targetID); err != nil {
+				t.Fatalf("forcePinnedTarget() error = %v", err)
+			}
+			ctx = withRouteAttemptKind(ctx, tt.kind)
+
+			body := []byte(`{"model":"model-b","input":"hello"}`)
+			resp, err := handler.postJSONEndpointWithHeadersForModel(ctx, providerEndpointResponses, body, nil, fallbackModel)
+			if err != nil {
+				t.Fatalf("postJSONEndpointWithHeadersForModel() error = %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("upstream status = %d, want 200", resp.StatusCode)
+			}
+			if forwardedModel := <-forwardedModels; forwardedModel != routeModel {
+				t.Fatalf("upstream model = %q, want configured upstream %q", forwardedModel, routeModel)
+			}
+			if bodyModel := extractRequestModel(body); bodyModel != fallbackModel {
+				t.Fatalf("immutable body model = %q, want fallback model %q", bodyModel, fallbackModel)
+			}
+		})
+	}
+}
+
 func TestPostAnthropicMessagesCountTokens_ExplicitOperationRewritesNormalizedAliasToCanonicalTarget(t *testing.T) {
 	const (
 		requestedModel = "claude-sonnet-4-5"

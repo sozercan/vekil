@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/iotest"
 )
 
 type responseModelNormalizationWriter struct {
@@ -86,6 +87,151 @@ func TestNormalizeResponsesStreamBodyPassesThroughDoneWithoutBinding(t *testing.
 	}
 	if string(got) != stream {
 		t.Fatalf("stream = %q, want exact passthrough %q", got, stream)
+	}
+}
+
+func TestNormalizeResponsesStreamBodyWithBindingFailsOpenForUnparseableEvents(t *testing.T) {
+	tests := []struct {
+		name   string
+		stream string
+	}{
+		{
+			name:   "malformed JSON",
+			stream: "event: response.created\ndata: {\"type\":\"response.created\",\"response\":\n\n",
+		},
+		{
+			name:   "vendor non-JSON data",
+			stream: "event: vendor.extension\ndata: vendor-payload=opaque\n\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &ProxyHandler{}
+			body := normalizeResponsesStreamBodyWithBinding(h, io.NopCloser(strings.NewReader(tc.stream)), explicitRouteResponseInfo{
+				routeID:  "route-1",
+				publicID: "public",
+				targetID: "target-1",
+			})
+			defer func() { _ = body.Close() }()
+
+			got, err := io.ReadAll(body)
+			if err != nil {
+				t.Fatalf("ReadAll() error = %v", err)
+			}
+			if string(got) != tc.stream {
+				t.Fatalf("stream = %q, want exact passthrough %q", got, tc.stream)
+			}
+			store, err := h.ensureStateBindingStore()
+			if err != nil {
+				t.Fatalf("ensureStateBindingStore() error = %v", err)
+			}
+			if stats := store.stats(); stats.entries != 0 || stats.tombstones != 0 {
+				t.Fatalf("state bindings after unparseable event = %#v, want empty", stats)
+			}
+		})
+	}
+}
+
+func TestNormalizeResponsesStreamBodyWithBindingRewritesValidModel(t *testing.T) {
+	const stream = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-model\",\"model\":\"physical\"}}\n\n"
+	body := normalizeResponsesStreamBodyWithBinding(&ProxyHandler{}, io.NopCloser(strings.NewReader(stream)), explicitRouteResponseInfo{
+		routeID:  "route-1",
+		publicID: "public",
+		targetID: "target-1",
+	})
+	defer func() { _ = body.Close() }()
+
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if strings.Contains(string(got), `"physical"`) || !strings.Contains(string(got), `"model":"public"`) {
+		t.Fatalf("stream = %s", got)
+	}
+}
+
+func TestNormalizeResponsesStreamBodyWithBindingBindsValidState(t *testing.T) {
+	const token = "provider-state-1"
+	const stream = "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"provider-state-1\"}}\n\n"
+	h := &ProxyHandler{}
+	info := explicitRouteResponseInfo{routeID: "route-1", publicID: "public", targetID: "target-1"}
+	body := normalizeResponsesStreamBodyWithBinding(h, io.NopCloser(strings.NewReader(stream)), info)
+	defer func() { _ = body.Close() }()
+
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if string(got) != stream {
+		t.Fatalf("stream = %q, want exact passthrough %q", got, stream)
+	}
+	store, err := h.ensureStateBindingStore()
+	if err != nil {
+		t.Fatalf("ensureStateBindingStore() error = %v", err)
+	}
+	wantOwner := stateBindingOwner{routeID: info.routeID, targetID: info.targetID}
+	result := store.lookup(stateBindingTypeEncryptedContent, token)
+	if result.outcome != stateBindingLookupKnown || result.owner != wantOwner {
+		t.Fatalf("state binding = %#v, want known owner %#v", result, wantOwner)
+	}
+}
+
+func TestNormalizeResponsesStreamBodyWithBindingPropagatesConflictAfterEarlierEvents(t *testing.T) {
+	const conflictToken = "resp-conflict"
+	h := &ProxyHandler{}
+	store, err := h.ensureStateBindingStore()
+	if err != nil {
+		t.Fatalf("ensureStateBindingStore() error = %v", err)
+	}
+	otherOwner := stateBindingOwner{routeID: "route-1", targetID: "target-other"}
+	if result := store.bind(stateBindingTypeResponseID, conflictToken, otherOwner); result.outcome != stateBindingLookupKnown {
+		t.Fatalf("seed bind outcome = %s, want known", result.outcome)
+	}
+
+	const firstEvent = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-first\",\"model\":\"physical\"}}\n\n"
+	const conflictingEvent = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-conflict\",\"model\":\"physical\"}}\n\n"
+	info := explicitRouteResponseInfo{routeID: "route-1", publicID: "public", targetID: "target-1"}
+	body := normalizeResponsesStreamBodyWithBinding(h, io.NopCloser(strings.NewReader(firstEvent+conflictingEvent)), info)
+	defer func() { _ = body.Close() }()
+
+	got, err := io.ReadAll(body)
+	if err == nil || !strings.Contains(err.Error(), "provider state token collided with another route target") {
+		t.Fatalf("ReadAll() error = %v, want binding conflict", err)
+	}
+	if !strings.Contains(string(got), `"id":"resp-first"`) || !strings.Contains(string(got), `"model":"public"`) {
+		t.Fatalf("stream before conflict = %q, want rewritten first event", got)
+	}
+	if strings.Contains(string(got), conflictToken) {
+		t.Fatalf("stream before conflict = %q, conflicting event was forwarded", got)
+	}
+	wantOwner := stateBindingOwner{routeID: info.routeID, targetID: info.targetID}
+	firstResult := store.lookup(stateBindingTypeResponseID, "resp-first")
+	if firstResult.outcome != stateBindingLookupKnown || firstResult.owner != wantOwner {
+		t.Fatalf("first event binding = %#v, want known owner %#v", firstResult, wantOwner)
+	}
+	if conflictResult := store.lookup(stateBindingTypeResponseID, conflictToken); conflictResult.outcome != stateBindingLookupConflict {
+		t.Fatalf("conflicting binding outcome = %s, want conflict", conflictResult.outcome)
+	}
+}
+
+func TestNormalizeResponsesStreamBodyWithBindingPropagatesTransportErrorAfterEarlierEvents(t *testing.T) {
+	transportErr := errors.New("upstream stream failed")
+	const firstEvent = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-first\",\"model\":\"physical\"}}\n\n"
+	source := io.NopCloser(io.MultiReader(strings.NewReader(firstEvent), iotest.ErrReader(transportErr)))
+	body := normalizeResponsesStreamBodyWithBinding(&ProxyHandler{}, source, explicitRouteResponseInfo{
+		routeID:  "route-1",
+		publicID: "public",
+		targetID: "target-1",
+	})
+	defer func() { _ = body.Close() }()
+
+	got, err := io.ReadAll(body)
+	if !errors.Is(err, transportErr) {
+		t.Fatalf("ReadAll() error = %v, want %v", err, transportErr)
+	}
+	if !strings.Contains(string(got), `"id":"resp-first"`) || !strings.Contains(string(got), `"model":"public"`) {
+		t.Fatalf("stream before transport error = %q, want rewritten first event", got)
 	}
 }
 

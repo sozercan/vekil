@@ -283,7 +283,10 @@ func normalizeResponsesStreamBodyWithBinding(h *ProxyHandler, source io.ReadClos
 	return normalizeResponsesStreamBody(source, info.publicID, func(data []byte) error {
 		tokens, err := extractExplicitResponsesOutputState(data)
 		if err != nil {
-			return fmt.Errorf("malformed explicit route responses event: %w", err)
+			// Streaming headers are already committed. Vendor extensions and
+			// malformed events must remain transparent instead of terminating the
+			// downstream pipe; only successfully extracted state is bindable.
+			return nil
 		}
 		return h.bindExplicitStateTokens(info, tokens)
 	})
