@@ -216,7 +216,8 @@ func applyProviderModelRequestPolicy(body []byte, endpoint string, owner provide
 	}
 	if rewriteMaxTokens {
 		if maxTokens, ok := payload["max_tokens"]; ok {
-			if _, exists := payload["max_completion_tokens"]; !exists {
+			maxCompletionTokens, exists := payload["max_completion_tokens"]
+			if !exists || bytes.Equal(bytes.TrimSpace(maxCompletionTokens), []byte("null")) {
 				payload["max_completion_tokens"] = maxTokens
 			}
 			delete(payload, "max_tokens")

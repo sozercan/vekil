@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -280,6 +281,10 @@ const (
 	// smaller than request histories; a 1 MiB ceiling prevents an upstream from
 	// making the proxy buffer an unbounded 200 response.
 	proxySummaryResponseBodySize = 1 << 20
+	// internalCompactionMaxOutputTokens bounds proxy-owned checkpoint generation.
+	// It is deliberately large enough for useful handoffs while preventing an
+	// upstream provider's unbounded/default output allowance from controlling cost.
+	internalCompactionMaxOutputTokens = 16 * 1024
 	// compactUpstreamMaxAttempts caps the number of logical compaction calls
 	// the compact-413 fallback may issue per inbound request. Each logical
 	// call may make up to one extra HTTP POST if the configured model is
@@ -856,7 +861,6 @@ func normalizeCompactionRequestFields(requestFields map[string]json.RawMessage) 
 		"tool_choice",
 		"parallel_tool_calls",
 		"response_format",
-		"max_output_tokens",
 		"max_tokens",
 		"max_completion_tokens",
 		"stream",
@@ -869,6 +873,11 @@ func normalizeCompactionRequestFields(requestFields map[string]json.RawMessage) 
 		delete(normalized, field)
 		removed = append(removed, field)
 	}
+
+	if _, ok := normalized["max_output_tokens"]; ok {
+		removed = append(removed, "max_output_tokens")
+	}
+	normalized["max_output_tokens"] = json.RawMessage(strconv.Itoa(internalCompactionMaxOutputTokens))
 
 	rawText, ok := normalized["text"]
 	if !ok {

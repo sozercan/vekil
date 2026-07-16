@@ -369,6 +369,47 @@ read_normalized_output() {
   awk 'NF { gsub(/\r/, "", $0); printf "%s", $0 }' "$1"
 }
 
+# Gemini CLI can render tool results as strict {"output":"..."} wrappers even
+# with -o text. Accept only a complete pipe-separated sequence of single-key
+# wrapper objects; malformed JSON, extra fields, or unwrapped text stay unchanged
+# and therefore still fail the exact-output assertion.
+read_gemini_normalized_output() {
+  local raw part value normalized="" separator=""
+  local parts=()
+  raw="$(read_normalized_output "$1")"
+
+  # Prefer one strict wrapper around the complete result; its output string may
+  # legitimately contain the pipe separator used by the smoke fixture.
+  if value="$(jq -er '
+    if type == "object" and keys == ["output"] and (.output | type == "string")
+    then .output
+    else error("not a strict Gemini output wrapper")
+    end
+  ' <<< "${raw}" 2>/dev/null)"; then
+    printf '%s' "${value}"
+    return
+  fi
+
+  IFS='|' read -r -a parts <<< "${raw}"
+  [[ "${#parts[@]}" -gt 0 ]] || { printf '%s' "${raw}"; return; }
+
+  for part in "${parts[@]}"; do
+    if ! value="$(jq -er '
+      if type == "object" and keys == ["output"] and (.output | type == "string")
+      then .output
+      else error("not a strict Gemini output wrapper")
+      end
+    ' <<< "${part}" 2>/dev/null)"; then
+      printf '%s' "${raw}"
+      return
+    fi
+    normalized+="${separator}${value}"
+    separator='|'
+  done
+
+  printf '%s' "${normalized}"
+}
+
 start_proxy() {
   [[ -x "${PROXY_BIN}" ]] || die "proxy binary not found or not executable: ${PROXY_BIN}"
 
@@ -607,7 +648,7 @@ EOF
     run_gemini_command "${case_dir}" "${home_dir}" "${output_file}" "${GEMINI_MODEL}" \
     || die "Gemini CLI failed or timed out"
 
-  actual="$(read_normalized_output "${output_file}")"
+  actual="$(read_gemini_normalized_output "${output_file}")"
   assert_exact_output "gemini" "${expected}" "${actual}"
   printf '%s' "${actual}" > "${output_file}"
 }
@@ -807,7 +848,11 @@ run_zen_harness_once() {
     return 0
   fi
 
-  actual="$(read_normalized_output "${output_file}")"
+  if [[ "${client}" == "gemini" ]]; then
+    actual="$(read_gemini_normalized_output "${output_file}")"
+  else
+    actual="$(read_normalized_output "${output_file}")"
+  fi
   if [[ -z "${actual}" ]]; then
     ATTEMPT_STATUS="INVALID"
     ATTEMPT_DETAIL="produced empty output"

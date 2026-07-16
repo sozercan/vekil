@@ -2637,6 +2637,24 @@ func TestResponsesTerminalObserverDoesNotRecoverUsageFromNonterminalOverflow(t *
 	}
 }
 
+func TestClassifyResponsesPeekMessage_IncompleteIsTerminalWithoutFailure(t *testing.T) {
+	result := classifyResponsesPeekMessage(responsesSSEMessage{
+		event:    "response.incomplete",
+		data:     `{"type":"response.incomplete","response":{"id":"resp-incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`,
+		semantic: true,
+	}, nil)
+
+	if result.decision != responsesPeekDecisionPassthrough {
+		t.Fatalf("decision = %v, want passthrough", result.decision)
+	}
+	if result.terminal == nil || result.terminal.Type != "response.incomplete" {
+		t.Fatalf("terminal = %+v, want response.incomplete", result.terminal)
+	}
+	if result.failure != nil {
+		t.Fatalf("failure = %+v, want nil for a resumable incomplete terminal", result.failure)
+	}
+}
+
 func TestResponsesPreparedStreamCanDisableTerminalObservation(t *testing.T) {
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
