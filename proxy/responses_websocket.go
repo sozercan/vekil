@@ -1998,8 +1998,13 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 			if !event.Response.Usage.isZero() {
 				result.usage = event.Response.Usage
 			}
-			if len(result.outputItems) == 0 && strings.Contains(data, `"output"`) {
-				result.outputItems = s.terminalResponseOutputItems(h, data)
+			if strings.Contains(data, `"output"`) {
+				// The terminal snapshot is authoritative and may include partial items
+				// that never received response.output_item.done. Replace the incremental
+				// collection so continuation history exactly matches the response.
+				if terminalItems := s.terminalResponseOutputItems(h, data); len(terminalItems) > 0 {
+					result.outputItems = terminalItems
+				}
 			}
 			if validIncompleteEvent && recordTerminal != nil {
 				// An incomplete provider response is still an authoritative terminal

@@ -3322,18 +3322,21 @@ func TestHandleResponsesWebSocket_ResponseIncompletePreservesContinuationState(t
 		case 1:
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-inc\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-inc\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}}\n\n")
-			_, _ = fmt.Fprint(w, "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-inc\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-inc\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-inc\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg-terminal\",\"content\":[{\"type\":\"output_text\",\"text\":\"terminal-only partial\"}]}],\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n")
 		case 2:
 			var body map[string]json.RawMessage
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("decode follow-up upstream request: %v", err)
 			}
 			input := rawJSONArrayForContract(t, body["input"])
-			if len(input) != 3 {
-				t.Fatalf("follow-up input items = %d, want original user + partial assistant + continuation: %s", len(input), body["input"])
+			if len(input) != 4 {
+				t.Fatalf("follow-up input items = %d, want original user + both partial assistant items + continuation: %s", len(input), body["input"])
 			}
 			if got := contractMessageText(t, input[1], "assistant"); got != "partial" {
-				t.Fatalf("partial assistant output = %q, want partial", got)
+				t.Fatalf("incremental assistant output = %q, want partial", got)
+			}
+			if got := contractMessageText(t, input[2], "assistant"); got != "terminal-only partial" {
+				t.Fatalf("terminal-only assistant output = %q, want terminal-only partial", got)
 			}
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-next\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-next\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n")

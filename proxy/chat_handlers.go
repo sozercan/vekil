@@ -339,8 +339,11 @@ func validateAnthropicMessageTokenLimits(req *models.AnthropicRequest, headers h
 	if *req.Thinking.BudgetTokens < 1024 {
 		return fmt.Errorf("thinking.budget_tokens must be greater than or equal to 1024")
 	}
-	if *req.Thinking.BudgetTokens >= *req.MaxTokens && !anthropicBetaEnabled(headers, anthropicInterleavedThinkingBeta) {
-		return fmt.Errorf("thinking.budget_tokens must be less than max_tokens unless interleaved thinking is enabled")
+	interleavedThinking := anthropicBetaEnabled(headers, anthropicInterleavedThinkingBeta) &&
+		len(req.Tools) > 0 &&
+		(req.ToolChoice == nil || !strings.EqualFold(strings.TrimSpace(req.ToolChoice.Type), "none"))
+	if *req.Thinking.BudgetTokens >= *req.MaxTokens && !interleavedThinking {
+		return fmt.Errorf("thinking.budget_tokens must be less than max_tokens unless interleaved thinking with tools is enabled")
 	}
 	return nil
 }
