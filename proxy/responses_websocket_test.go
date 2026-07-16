@@ -3298,7 +3298,7 @@ func TestResponsesWebSocketErrorHeadersClampsMassiveRetryAfter(t *testing.T) {
 
 func TestResponsesWebSocketErrorHeadersFallsBackFromInvalidRetryAfter(t *testing.T) {
 	headers := http.Header{
-		"Retry-After":    []string{"not-a-delay"},
+		"retry-after":    []string{"not-a-delay"},
 		"retry-after-ms": []string{"1200"},
 	}
 
@@ -3306,8 +3306,8 @@ func TestResponsesWebSocketErrorHeadersFallsBackFromInvalidRetryAfter(t *testing
 	if retryAfter := got.Get("Retry-After"); retryAfter != "2" {
 		t.Fatalf("Retry-After = %q, want fallback value 2; headers=%v", retryAfter, got)
 	}
-	if source := headers.Get("Retry-After"); source != "not-a-delay" {
-		t.Fatalf("source Retry-After = %q, want unchanged invalid value", source)
+	if _, ok := got["retry-after"]; ok {
+		t.Fatalf("lowercase retry-after header was not replaced: %#v", got["retry-after"])
 	}
 }
 

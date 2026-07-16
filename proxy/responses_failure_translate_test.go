@@ -659,6 +659,23 @@ func TestResponsesFailureHeadersEventValuesReplaceUpstreamCaseInsensitively(t *t
 	}
 }
 
+func TestSelectResponsesRetryAfterRoundsUpHTTPDate(t *testing.T) {
+	now := time.Now()
+	if now.Nanosecond() < int(100*time.Millisecond) {
+		time.Sleep(150 * time.Millisecond)
+		now = time.Now()
+	}
+	retryAt := now.Truncate(time.Second).Add(time.Second)
+	headers := http.Header{
+		"Retry-After": []string{retryAt.UTC().Format(http.TimeFormat)},
+	}
+
+	retryAfter, source := selectResponsesRetryAfter(headers)
+	if retryAfter != "1" || source != "Retry-After" {
+		t.Fatalf("selectResponsesRetryAfter() = (%q, %q), want (\"1\", \"Retry-After\")", retryAfter, source)
+	}
+}
+
 func TestPeekAndForwardResponses_ExhaustedQuotaPreambleCrossesPeekLimitBeforeUncodedFailure(t *testing.T) {
 	created := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-large-created\",\"metadata\":{\"padding\":\"" + strings.Repeat("x", 96*1024) + "\"}}}\n\n"
 	failed := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-large-created\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n"
