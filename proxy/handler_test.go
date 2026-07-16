@@ -6846,6 +6846,47 @@ func TestHandleAnthropicMessages_RejectsMissingMaxTokens(t *testing.T) {
 	}
 }
 
+func TestHandleAnthropicMessages_PrewarmUsesNonStreamingUpstream(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		var upstreamReq models.OpenAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamReq.Stream != nil {
+			t.Fatalf("stream = %v, want omitted for prewarm", *upstreamReq.Stream)
+		}
+		if upstreamReq.StreamOptions != nil {
+			t.Fatalf("stream_options = %+v, want nil for prewarm", upstreamReq.StreamOptions)
+		}
+		if upstreamReq.MaxTokens == nil || *upstreamReq.MaxTokens != 0 {
+			t.Fatalf("max_tokens = %v, want 0", upstreamReq.MaxTokens)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-prewarm","object":"chat.completion","model":"claude-sonnet-4","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":0,"total_tokens":5}}`)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model": "claude-sonnet-4",
+		"max_tokens": 0,
+		"messages": [{"role": "user", "content": "warm cache"}]
+	}`))
+	w := httptest.NewRecorder()
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	var anthropicResp models.AnthropicResponse
+	if err := json.NewDecoder(resp.Body).Decode(&anthropicResp); err != nil {
+		t.Fatalf("decode Anthropic response: %v", err)
+	}
+	if anthropicResp.StopReason == nil || *anthropicResp.StopReason != "end_turn" || anthropicResp.Usage.InputTokens != 5 || anthropicResp.Usage.OutputTokens != 0 {
+		t.Fatalf("unexpected prewarm response: %+v", anthropicResp)
+	}
+}
+
 func TestHandleAnthropicMessages_AzureUsesConfiguredMaxCompletionTokens(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "test-value")
 	useMaxCompletionTokens := true

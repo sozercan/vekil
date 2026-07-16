@@ -85,9 +85,10 @@ func prepareAnthropicChatCompletionsRequestWithModelOverride(req *models.Anthrop
 		oaiReq.Model = modelOverride
 	}
 
+	prewarm := req.MaxTokens != nil && *req.MaxTokens == 0 && !req.Stream
 	mode := chatCompletionsMode{
 		clientRequestedStream: req.Stream,
-		forceUpstreamStream:   !req.Stream,
+		forceUpstreamStream:   !req.Stream && !prewarm,
 	}
 	if mode.forceUpstreamStream || mode.clientRequestedStream {
 		// Force-streamed or client-streamed: ask upstream for a usage chunk so
@@ -458,13 +459,28 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(anthropicResp)
 		},
+		passthrough: func(resp *http.Response) error {
+			body := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
+			defer func() { _ = body.Close() }()
+			var oaiResp models.OpenAIResponse
+			if err := json.NewDecoder(body).Decode(&oaiResp); err != nil {
+				if body.canceledAtFailure() {
+					return context.Canceled
+				}
+				return err
+			}
+			observeOpenAIUsage(r.Context(), oaiResp.Usage)
+			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), &oaiResp, h.toolContexts, scope, false)
+			w.Header().Set("Content-Type", "application/json")
+			return json.NewEncoder(w).Encode(TranslateOpenAIToAnthropic(&oaiResp, req.Model))
+		},
 	})
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
 		}
 		status := http.StatusBadGateway
-		message := "failed to aggregate upstream response"
+		message := "failed to process upstream response"
 		var streamErr *openAIStreamError
 		if errors.As(err, &streamErr) {
 			status = streamErr.httpStatus()

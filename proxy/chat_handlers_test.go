@@ -147,6 +147,39 @@ func TestValidateAnthropicMessageTokenLimits(t *testing.T) {
 	}
 }
 
+func TestPrepareAnthropicChatCompletionsRequest_PrewarmStaysNonStreaming(t *testing.T) {
+	zero := 0
+	req := &models.AnthropicRequest{
+		Model:     "claude-sonnet-4",
+		MaxTokens: &zero,
+		Messages: []models.AnthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"warm cache"`)},
+		},
+	}
+
+	prepared, mode, err := prepareAnthropicChatCompletionsRequest(req)
+	if err != nil {
+		t.Fatalf("prepareAnthropicChatCompletionsRequest: %v", err)
+	}
+	if mode.clientRequestedStream || mode.forceUpstreamStream || mode.injectedStreamUsage {
+		t.Fatalf("prewarm mode = %+v, want non-streaming passthrough", mode)
+	}
+
+	var oaiReq models.OpenAIRequest
+	if err := json.Unmarshal(prepared, &oaiReq); err != nil {
+		t.Fatalf("unmarshal prepared request: %v", err)
+	}
+	if oaiReq.Stream != nil {
+		t.Fatalf("stream = %v, want omitted", *oaiReq.Stream)
+	}
+	if oaiReq.StreamOptions != nil {
+		t.Fatalf("stream_options = %+v, want nil", oaiReq.StreamOptions)
+	}
+	if oaiReq.MaxTokens == nil || *oaiReq.MaxTokens != 0 {
+		t.Fatalf("max_tokens = %v, want 0", oaiReq.MaxTokens)
+	}
+}
+
 func TestPrepareAnthropicChatCompletionsRequest_ForcesStreaming(t *testing.T) {
 	req := &models.AnthropicRequest{
 		Model: "claude-sonnet-4",

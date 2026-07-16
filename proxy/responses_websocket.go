@@ -85,10 +85,10 @@ func isResponsesWebSocketClientDisconnect(ctx context.Context, err error) bool {
 }
 
 // errStreamFailedUpstream is a sentinel error indicating the upstream stream
-// ended with response.failed, response.incomplete, or a top-level error event
+// ended with response.failed or a top-level error event
 // after forwarding the upstream failure event. This path also emits the standard
 // websocket error payload so clients can surface the upstream error details.
-var errStreamFailedUpstream = errors.New("upstream stream ended with response.failed, response.incomplete, or error")
+var errStreamFailedUpstream = errors.New("upstream stream ended with response.failed or error")
 
 // streamFailedUpstreamError carries the HTTP status that an upstream
 // failure terminal event was classified to (e.g. 429 for a rate limit, 503 for
@@ -1378,7 +1378,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			return err
 		}
 		if errors.Is(err, errStreamFailedUpstream) {
-			// Parsed response.failed/incomplete events account themselves before
+			// Parsed response.failed and top-level error events account themselves before
 			// client delivery, so the outer handler must not record them again.
 			return nil
 		}
