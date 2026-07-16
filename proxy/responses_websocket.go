@@ -2300,6 +2300,8 @@ func responsesWebSocketErrorHeaders(status int, headers http.Header) http.Header
 	if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable && status != http.StatusGatewayTimeout {
 		return headers
 	}
+	// selectResponsesRetryAfter clamps and normalizes existing Retry-After,
+	// retry-after-ms, and exhausted-quota reset telemetry through one path.
 	retryAfter, _ := selectResponsesRetryAfter(headers)
 	if retryAfter == "" {
 		return headers
