@@ -235,6 +235,9 @@ case "\${mode}" in
   pass)
     printf '%s|%s\n' "\$(cat left.txt)" "\$(cat right.txt)"
     ;;
+  wrapped-output)
+    printf '{"output":"%s"}|{"output":"%s"}\n' "\$(cat left.txt)" "\$(cat right.txt)"
+    ;;
   exit42)
     exit 42
     ;;
@@ -651,6 +654,17 @@ expect_success "second canary transient permits retry but every client still pas
   env PATH="${retry_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
     PROXY_HOST=127.0.0.1 PROXY_PORT="${retry_port}" LIVE_CLI_SMOKE_DIR="${retry_dir}/smoke" \
     FAKE_CLI_STATE_DIR="${retry_dir}/state" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+
+wrapped_gemini_dir="${TMP_ROOT}/setup/gemini-wrapped-read-output"
+start_mock_server "${wrapped_gemini_dir}/server" 200
+wrapped_gemini_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${wrapped_gemini_dir}/bin" pass pass wrapped-output
+expect_success "Gemini wrapped Read outputs normalize to exact fixture text" 10 \
+  env PATH="${wrapped_gemini_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${wrapped_gemini_port}" \
+    LIVE_CLI_SMOKE_DIR="${wrapped_gemini_dir}/smoke" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
     SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 

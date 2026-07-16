@@ -369,6 +369,43 @@ read_normalized_output() {
   awk 'NF { gsub(/\r/, "", $0); printf "%s", $0 }' "$1"
 }
 
+# Recent Gemini CLI versions may render each successful Read result as a compact
+# {"output":"..."} object even when text output was requested. Accept only the
+# exact two-object wrapper produced for this smoke's two files; leave every other
+# shape unchanged so unexpected model commentary still fails the exact assertion.
+read_gemini_normalized_output() {
+  local path="$1"
+  local python_bin
+  python_bin="$(python_command)"
+  "${python_bin}" - "${path}" <<'PY_GEMINI_OUTPUT'
+import json
+import pathlib
+import sys
+
+raw = "".join(
+    line.replace("\r", "")
+    for line in pathlib.Path(sys.argv[1]).read_text().splitlines()
+    if line.strip()
+)
+try:
+    decoder = json.JSONDecoder()
+    left, offset = decoder.raw_decode(raw)
+    if raw[offset:offset + 1] != "|":
+        raise ValueError("missing separator")
+    right, end = decoder.raw_decode(raw, offset + 1)
+    if end != len(raw):
+        raise ValueError("trailing content")
+    if set(left) != {"output"} or set(right) != {"output"}:
+        raise ValueError("unexpected wrapper keys")
+    if not isinstance(left["output"], str) or not isinstance(right["output"], str):
+        raise ValueError("non-string output")
+except (TypeError, ValueError, json.JSONDecodeError):
+    print(raw, end="")
+else:
+    print(f'{left["output"]}|{right["output"]}', end="")
+PY_GEMINI_OUTPUT
+}
+
 start_proxy() {
   [[ -x "${PROXY_BIN}" ]] || die "proxy binary not found or not executable: ${PROXY_BIN}"
 
@@ -607,7 +644,7 @@ EOF
     run_gemini_command "${case_dir}" "${home_dir}" "${output_file}" "${GEMINI_MODEL}" \
     || die "Gemini CLI failed or timed out"
 
-  actual="$(read_normalized_output "${output_file}")"
+  actual="$(read_gemini_normalized_output "${output_file}")"
   assert_exact_output "gemini" "${expected}" "${actual}"
   printf '%s' "${actual}" > "${output_file}"
 }
@@ -807,7 +844,11 @@ run_zen_harness_once() {
     return 0
   fi
 
-  actual="$(read_normalized_output "${output_file}")"
+  if [[ "${client}" == "gemini" ]]; then
+    actual="$(read_gemini_normalized_output "${output_file}")"
+  else
+    actual="$(read_normalized_output "${output_file}")"
+  fi
   if [[ -z "${actual}" ]]; then
     ATTEMPT_STATUS="INVALID"
     ATTEMPT_DETAIL="produced empty output"
