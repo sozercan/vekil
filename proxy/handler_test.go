@@ -29,13 +29,15 @@ func newTestProxyHandler(t testing.TB, backend http.HandlerFunc) *ProxyHandler {
 	t.Helper()
 	server := httptest.NewServer(backend)
 	t.Cleanup(server.Close)
-	return &ProxyHandler{
+	h := &ProxyHandler{
 		auth:           auth.NewTestAuthenticator("test-token"),
 		client:         server.Client(),
 		copilotURL:     server.URL,
 		log:            logger.New(logger.LevelInfo),
 		retryBaseDelay: 1 * time.Millisecond,
 	}
+	disableColdChatRouteDiscoveryForLegacyTest(h)
+	return h
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -57,13 +59,23 @@ func (c *observedDoneContext) Done() <-chan struct{} {
 
 func newRoundTripTestProxyHandler(t testing.TB, transport roundTripFunc) *ProxyHandler {
 	t.Helper()
-	return &ProxyHandler{
+	h := &ProxyHandler{
 		auth:           auth.NewTestAuthenticator("test-token"),
 		client:         &http.Client{Transport: transport},
 		copilotURL:     "http://upstream.test",
 		log:            logger.New(logger.LevelInfo),
 		retryBaseDelay: 1 * time.Millisecond,
 	}
+	disableColdChatRouteDiscoveryForLegacyTest(h)
+	return h
+}
+
+func disableColdChatRouteDiscoveryForLegacyTest(h *ProxyHandler) {
+	if h == nil {
+		return
+	}
+	h.chatRoutes = newChatRouteDiscoveryCache()
+	h.chatRoutes.providers["copilot"] = &chatRouteProviderDiscovery{successUntil: time.Now().Add(24 * time.Hour)}
 }
 
 type trackingReadCloser struct {
@@ -6882,12 +6894,12 @@ func TestHandleAnthropicMessages_PrewarmUsesNonStreamingUpstream(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&anthropicResp); err != nil {
 		t.Fatalf("decode Anthropic response: %v", err)
 	}
-	if anthropicResp.StopReason == nil || *anthropicResp.StopReason != "end_turn" || anthropicResp.Usage.InputTokens != 5 || anthropicResp.Usage.OutputTokens != 0 {
+	if anthropicResp.StopReason == nil || *anthropicResp.StopReason != "max_tokens" || len(anthropicResp.Content) != 0 || anthropicResp.Usage.InputTokens != 5 || anthropicResp.Usage.OutputTokens != 0 {
 		t.Fatalf("unexpected prewarm response: %+v", anthropicResp)
 	}
 }
 
-func TestHandleAnthropicMessages_StreamedInterleavedThinkingUsesEffectiveLimit(t *testing.T) {
+func TestHandleAnthropicMessages_StreamedInterleavedThinkingPreservesPerResponseLimit(t *testing.T) {
 	var upstreamHits atomic.Int32
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		upstreamHits.Add(1)
@@ -6898,8 +6910,8 @@ func TestHandleAnthropicMessages_StreamedInterleavedThinkingUsesEffectiveLimit(t
 		if upstreamReq.Stream == nil || !*upstreamReq.Stream {
 			t.Fatalf("stream = %v, want true", upstreamReq.Stream)
 		}
-		if upstreamReq.MaxCompletionTokens == nil || *upstreamReq.MaxCompletionTokens != 8192 {
-			t.Fatalf("max_completion_tokens = %v, want 8192", upstreamReq.MaxCompletionTokens)
+		if upstreamReq.MaxCompletionTokens == nil || *upstreamReq.MaxCompletionTokens != 4096 {
+			t.Fatalf("max_completion_tokens = %v, want 4096", upstreamReq.MaxCompletionTokens)
 		}
 		if upstreamReq.MaxTokens != nil {
 			t.Fatalf("max_tokens = %v, want nil", upstreamReq.MaxTokens)
@@ -6915,7 +6927,7 @@ func TestHandleAnthropicMessages_StreamedInterleavedThinkingUsesEffectiveLimit(t
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
 		"model": "claude-opus-4-5",
-		"max_tokens": 0,
+		"max_tokens": 4096,
 		"stream": true,
 		"thinking": {"type": "enabled", "budget_tokens": 8192},
 		"tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
@@ -6941,6 +6953,131 @@ func TestHandleAnthropicMessages_StreamedInterleavedThinkingUsesEffectiveLimit(t
 	body, _ := io.ReadAll(resp.Body)
 	if !bytes.Contains(body, []byte("streamed")) {
 		t.Fatalf("streamed response body = %q, want translated content", body)
+	}
+}
+
+func newAzureResponsesOnlyAnthropicHandlerForTest(t *testing.T, upstreamURL string) *ProxyHandler {
+	t.Helper()
+	t.Setenv("TEST_AZURE_API_KEY", "test-value")
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:         "azure",
+			Type:       "azure-openai",
+			Default:    true,
+			BaseURL:    upstreamURL + "/openai",
+			APIVersion: "2025-04-01-preview",
+			APIKeyEnv:  "TEST_AZURE_API_KEY",
+			Models: []ProviderModelConfig{{
+				PublicID:   "gpt-5.4-pro",
+				Deployment: "gpt-5.4-pro",
+				Endpoints:  []string{"/responses"},
+				Name:       "GPT-5.4 Pro",
+			}},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+	return handler
+}
+
+func TestHandleAnthropicMessages_ResponsesOnlyPrewarmRejectsBelowMinimum(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	handler := newAzureResponsesOnlyAnthropicHandlerForTest(t, upstream.URL)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model": "gpt-5.4-pro",
+		"max_tokens": 0,
+		"messages": [{"role": "user", "content": "warm cache"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, body)
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("upstream hits = %d, want 0", got)
+	}
+	var anthropicErr models.AnthropicError
+	if err := json.NewDecoder(resp.Body).Decode(&anthropicErr); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if anthropicErr.Error.Type != "invalid_request_error" || !strings.Contains(anthropicErr.Error.Message, "at least 16") {
+		t.Fatalf("unexpected Anthropic error: %+v", anthropicErr)
+	}
+}
+
+func TestHandleAnthropicMessages_ResponsesOnlyInterleavedThinkingPreservesPerResponseLimit(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/chat_over_responses/stream_text.sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		if got, want := r.URL.Path, "/openai/responses"; got != want {
+			t.Fatalf("upstream path = %q, want %q", got, want)
+		}
+		if got := r.URL.Query().Get("api-version"); got != "2025-04-01-preview" {
+			t.Fatalf("api-version = %q", got)
+		}
+		var request struct {
+			Model           string `json:"model"`
+			Stream          bool   `json:"stream"`
+			MaxOutputTokens int    `json:"max_output_tokens"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if request.Model != "gpt-5.4-pro" || !request.Stream || request.MaxOutputTokens != 4096 {
+			t.Fatalf("upstream request = %+v, want model gpt-5.4-pro, stream true, max_output_tokens 4096", request)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write(fixture)
+	}))
+	defer upstream.Close()
+
+	handler := newAzureResponsesOnlyAnthropicHandlerForTest(t, upstream.URL)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model": "gpt-5.4-pro",
+		"max_tokens": 4096,
+		"stream": true,
+		"thinking": {"type": "enabled", "budget_tokens": 8192},
+		"tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+		"messages": [{"role": "user", "content": "use tools"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Beta", anthropicInterleavedThinkingBeta)
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("upstream hits = %d, want 1", got)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("Synthetic fixture ")) || !bytes.Contains(body, []byte("text response.")) {
+		t.Fatalf("streamed response body = %q, want translated Responses content", body)
 	}
 }
 
@@ -7735,28 +7872,44 @@ func TestHandleModels_GenericOpenRouterToolsDiscoveryFiltersToolModels(t *testin
 	}
 }
 
-func TestHandleOpenAIChatCompletions_RejectsConfiguredAzureModelWithoutChatSupport(t *testing.T) {
+func TestHandleOpenAIChatCompletions_ServesConfiguredAzureResponsesModel(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/openai/responses"; got != want {
+			t.Fatalf("upstream path = %q, want %q", got, want)
+		}
+		if got := r.URL.Query().Get("api-version"); got != "2025-04-01-preview" {
+			t.Fatalf("api-version = %q", got)
+		}
+		var request map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if got := jsonRawString(request["model"]); got != "gpt-5.4-pro" {
+			t.Fatalf("upstream model = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-azure-chat","created_at":1700000000,"status":"completed","output":[{"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"azure responses chat"}]}],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}`))
+	}))
+	defer upstream.Close()
 
 	handler, err := NewProxyHandler(
 		auth.NewTestAuthenticator("test-token"),
 		logger.New(logger.LevelInfo),
-		WithProvidersConfig(ProvidersConfig{
-			Providers: []ProviderConfig{{
-				ID:         "azure",
-				Type:       "azure-openai",
-				Default:    true,
-				BaseURL:    "https://example.openai.azure.com/openai",
-				APIVersion: "2025-04-01-preview",
-				APIKeyEnv:  "TEST_AZURE_API_KEY",
-				Models: []ProviderModelConfig{{
-					PublicID:   "gpt-5.4-pro",
-					Deployment: "gpt-5.4-pro",
-					Endpoints:  []string{"/responses"},
-					Name:       "GPT-5.4 Pro",
-				}},
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:         "azure",
+			Type:       "azure-openai",
+			Default:    true,
+			BaseURL:    upstream.URL + "/openai",
+			APIVersion: "2025-04-01-preview",
+			APIKeyEnv:  "TEST_AZURE_API_KEY",
+			Models: []ProviderModelConfig{{
+				PublicID:   "gpt-5.4-pro",
+				Deployment: "gpt-5.4-pro",
+				Endpoints:  []string{"/responses"},
+				Name:       "GPT-5.4 Pro",
 			}},
-		}),
+		}}}),
 	)
 	if err != nil {
 		t.Fatalf("NewProxyHandler returned error: %v", err)
@@ -7768,25 +7921,19 @@ func TestHandleOpenAIChatCompletions_RejectsConfiguredAzureModelWithoutChatSuppo
 	}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-
 	handler.HandleOpenAIChatCompletions(w, req)
 
 	resp := w.Result()
-	if resp.StatusCode != http.StatusBadRequest {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
 	}
-
-	var errResp struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
+	var result models.OpenAIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
-		t.Fatalf("decode error response: %v", err)
-	}
-	if !strings.Contains(errResp.Error.Message, `does not support /chat/completions`) {
-		t.Fatalf("expected unsupported endpoint message, got %q", errResp.Error.Message)
+	if result.Model != "gpt-5.4-pro" || len(result.Choices) != 1 || string(result.Choices[0].Message.Content) != `"azure responses chat"` {
+		t.Fatalf("response = %+v", result)
 	}
 }
 
@@ -7926,27 +8073,37 @@ func TestHandleResponses_RoutesConfiguredOpenAICodexProvider(t *testing.T) {
 	}
 }
 
-func TestHandleOpenAIChatCompletions_RejectsOpenAICodexProvider(t *testing.T) {
+func TestHandleOpenAIChatCompletions_ServesOpenAICodexProvider(t *testing.T) {
 	codexHome := t.TempDir()
 	writeTestOpenAICodexAuth(t, codexHome, testOpenAICodexTokens(t, time.Now().Add(time.Hour), "acct-123", false, "refresh-token"))
 	t.Setenv("CODEX_HOME", codexHome)
 
+	var modelFetches, responsePosts int
 	codexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatalf("OpenAI Codex upstream should not be called for chat completions")
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/models"):
+			modelFetches++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"models":[{"slug":"gpt-5.5","display_name":"GPT-5.5","visibility":"list","supported_in_api":true,"supported_reasoning_levels":[{"effort":"medium"}],"supports_parallel_tool_calls":true,"context_window":272000}]}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/responses"):
+			responsePosts++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-codex-chat","created_at":1700000000,"status":"completed","output":[{"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"codex responses chat"}]}],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}`))
+		default:
+			t.Fatalf("unexpected Codex request %s %s", r.Method, r.URL.Path)
+		}
 	}))
 	defer codexServer.Close()
 
 	handler, err := NewProxyHandler(
 		auth.NewTestAuthenticator("test-token"),
 		logger.New(logger.LevelInfo),
-		WithProvidersConfig(ProvidersConfig{
-			Providers: []ProviderConfig{{
-				ID:      "codex",
-				Type:    "openai-codex",
-				Default: true,
-				BaseURL: codexServer.URL,
-			}},
-		}),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:      "codex",
+			Type:    "openai-codex",
+			Default: true,
+			BaseURL: codexServer.URL,
+		}}}),
 	)
 	if err != nil {
 		t.Fatalf("NewProxyHandler returned error: %v", err)
@@ -7958,25 +8115,22 @@ func TestHandleOpenAIChatCompletions_RejectsOpenAICodexProvider(t *testing.T) {
 	}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-
 	handler.HandleOpenAIChatCompletions(w, req)
 
 	resp := w.Result()
-	if resp.StatusCode != http.StatusBadRequest {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
 	}
-
-	var errResp struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
+	if modelFetches != 1 || responsePosts != 1 {
+		t.Fatalf("model fetches/posts = %d/%d, want 1/1", modelFetches, responsePosts)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
-		t.Fatalf("decode error response: %v", err)
+	var result models.OpenAIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
 	}
-	if !strings.Contains(errResp.Error.Message, `provider "codex" does not support /chat/completions`) {
-		t.Fatalf("expected provider unsupported endpoint message, got %q", errResp.Error.Message)
+	if result.Model != "gpt-5.5" || string(result.Choices[0].Message.Content) != `"codex responses chat"` {
+		t.Fatalf("response = %+v", result)
 	}
 }
 
@@ -8882,9 +9036,13 @@ func TestHandleModels_CanonicalCatalogOwnsRoutingAcrossQueryVariants(t *testing.
 		t.Fatalf("routing owner for model-b = %+v, %v; want dynamic owner matching cached canonical catalog", owner, ok)
 	}
 
-	resp, err := handler.postChatCompletions(context.Background(), []byte(`{"model":"model-b","messages":[{"role":"user","content":"hello"}]}`))
+	route, err := handler.resolveChatRoute(context.Background(), "model-b")
 	if err != nil {
-		t.Fatalf("postChatCompletions(model-b) error = %v", err)
+		t.Fatalf("resolveChatRoute(model-b) error = %v", err)
+	}
+	resp, err := handler.postResolvedProviderRequest(context.Background(), route.provider, route.owner, route.nativeEndpoint, []byte(`{"model":"model-b","messages":[{"role":"user","content":"hello"}]}`), nil)
+	if err != nil {
+		t.Fatalf("postResolvedProviderRequest(model-b) error = %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {

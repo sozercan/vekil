@@ -1,6 +1,18 @@
 # Gemini Compatibility
 
-Gemini endpoints are implemented as a translation layer, not zero-copy passthrough. Requests are translated to OpenAI Chat Completions, routed through the provider that owns the selected public model, and translated back into Gemini responses.
+Gemini endpoints are implemented as a translation layer, not zero-copy passthrough. Requests are translated to canonical OpenAI Chat Completions, routed through the provider that owns the selected public model, and translated back into Gemini responses. The canonical Chat request can use native `/chat/completions` or, for a Responses-native model, Vekil's Chat-over-Responses adapter.
+
+### Responses-native model restrictions
+
+The Gemini decoder and translation rules below run first. If the selected model is Responses-native, the resulting Chat request must also fit the strict [Responses-backed Chat subset](api.md#responses-backed-chat-request-subset). In practice:
+
+- text, supported image `inlineData`, function declarations/calls/responses, `temperature`, `topP`, `maxOutputTokens`, structured text output, and function-calling modes map through the adapter;
+- `generationConfig.stopSequences` is rejected when non-empty because Vekil does not implement local stop matching;
+- `generationConfig.presencePenalty`, `frequencyPenalty`, and `seed` are rejected on this route;
+- only function tools are supported. Gemini built-in/hosted tools remain unsupported;
+- unknown or unsupported translated fields fail explicitly rather than being dropped.
+
+These extra restrictions do not apply to a model served through native Chat. Native endpoint metadata also remains unchanged: a model can report only `/responses` in `/v1/models` while serving these Gemini compatibility routes through translation.
 
 ## `POST /v1beta/models/{model}:generateContent`, `POST /v1/models/{model}:generateContent`, and `POST /models/{model}:generateContent` (Gemini)
 
@@ -64,7 +76,7 @@ Use `curl -N` or another SSE-capable client so streamed frames are not buffered 
 
 ## `POST /v1beta/models/{model}:countTokens`, `POST /v1/models/{model}:countTokens`, and `POST /models/{model}:countTokens` (Gemini)
 
-`countTokens` uses the same accepted route prefixes, omitted-role default, and content validation as the other Gemini compatibility routes. It normalizes the Gemini request into the same prompt/tool payload used by `generateContent`, performs a minimal upstream `/chat/completions` probe, and returns `usage.prompt_tokens` as Gemini `totalTokens`. Normalized successful requests are cached for 60 seconds; expired entries are pruned globally and the cache is capped at 1,024 request hashes with deterministic oldest-entry eviction. If the probe hits a transient transport error, 429, 5xx, or a 200 response with missing usage, the proxy returns a dependency-free local token estimate instead of failing the counting request. It still surfaces permanent client/configuration failures such as 400, 401, and 403 without estimating.
+`countTokens` uses the same accepted route prefixes, omitted-role default, and content validation as the other Gemini compatibility routes. It normalizes the Gemini request into the same canonical Chat prompt/tool payload used by `generateContent`, performs a minimal non-streaming probe through the selected native backend (`/chat/completions` or `/responses`), and returns `usage.prompt_tokens` as Gemini `totalTokens`. Native Chat uses a one-output-token probe; Responses-backed counting uses the upstream minimum of 16 output tokens, strips probe-only sampling controls, consumes usage only, and never publishes replay state from the discarded completion. Normalized successful requests are cached for 60 seconds; expired entries are pruned globally and the cache is capped at 1,024 request hashes with deterministic oldest-entry eviction. If the probe hits a transient transport error, 429, 5xx, or a 200 response with missing usage, the proxy returns a dependency-free local token estimate instead of failing the counting request. It still surfaces permanent client/configuration failures such as 400, 401, and 403 without estimating.
 
 ### Function calling modes
 

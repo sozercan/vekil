@@ -13,9 +13,9 @@ This folder is intentionally split into small, single-purpose files so humans an
 | [`tool-optimizers.md`](tool-optimizers.md) | optional shell command rewrite and tool-output reduction config | optimizer config or behavior changes |
 | [`responses-websocket.md`](responses-websocket.md) | Codex-style `GET /v1/responses` websocket bridge tuning | websocket bridge, auto-compaction, or compact retry knobs change |
 | [`clients.md`](clients.md) | copy-paste client examples | onboarding snippets or client compatibility changes |
-| [`api.md`](api.md) | concise endpoint map and compatibility links | public routes are added, removed, or renamed |
+| [`api.md`](api.md) | public endpoint map plus cross-surface Chat/Responses compatibility contract | public routes or Chat compatibility behavior changes |
 | [`gemini.md`](gemini.md) | Gemini translation compatibility details | Gemini request/response translation behavior changes |
-| [`responses.md`](responses.md) | OpenAI Responses, compact, and memory shim details | Responses passthrough, compaction, or shim behavior changes |
+| [`responses.md`](responses.md) | native Responses behavior, Chat-over-Responses boundary, compact, and memory shims | Responses passthrough, Chat adaptation boundary, compaction, or shim behavior changes |
 | [`architecture.md`](architecture.md) | package responsibilities and data flow | implementation boundaries or design decisions change |
 | [`dashboard.md`](dashboard.md) | live browser traffic dashboard and `/stats.json` | dashboard metrics, endpoints, or stats behavior change |
 | [`metrics.md`](metrics.md) | Prometheus `/metrics` endpoint, metric names, scraping | metrics or observability behavior changes |

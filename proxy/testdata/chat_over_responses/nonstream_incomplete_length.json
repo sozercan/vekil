@@ -1,0 +1,43 @@
+{
+  "id": "resp_synth_incomplete_001",
+  "object": "response",
+  "created_at": 1700000000,
+  "status": "incomplete",
+  "error": null,
+  "incomplete_details": {
+    "reason": "max_output_tokens"
+  },
+  "model": "gpt-synthetic-responses",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_synth_incomplete_001",
+      "status": "incomplete",
+      "role": "assistant",
+      "phase": "final_answer",
+      "content": [
+        {
+          "type": "output_text",
+          "annotations": [],
+          "logprobs": [],
+          "text": "Synthetic partial output"
+        }
+      ]
+    }
+  ],
+  "parallel_tool_calls": true,
+  "usage": {
+    "input_tokens": 9,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens": 4,
+    "output_tokens_details": {
+      "reasoning_tokens": 1
+    },
+    "total_tokens": 13
+  },
+  "metadata": {
+    "fixture": "nonstream-incomplete-length"
+  }
+}
