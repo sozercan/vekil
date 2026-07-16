@@ -491,18 +491,32 @@ func (o *routeSendObservation) deliveryForError() requestDelivery {
 	return requestDeliveredOrAmbiguous
 }
 
+func sanitizeExplicitRouteResponseHeaders(headers http.Header) {
+	for name := range headers {
+		if strings.EqualFold(name, "X-Vekil-Request-ID") {
+			delete(headers, name)
+		}
+	}
+}
+
 type capturedRouteResponse struct {
 	statusCode int
 	header     http.Header
 	body       []byte
 	request    *http.Request
+	upstreamID string
 }
 
 func captureRouteResponse(resp *http.Response) (*capturedRouteResponse, bool) {
 	if resp == nil {
 		return nil, true
 	}
+	// Preserve only a recognized upstream correlation ID before sanitizing the
+	// captured response. The proxy-owned X-Vekil-Request-ID is deliberately not
+	// eligible, so an upstream cannot spoof the logical operation ID in traces.
+	upstreamID := responsesUpstreamRequestID(resp.Header)
 	header := resp.Header.Clone()
+	sanitizeExplicitRouteResponseHeaders(header)
 	for _, name := range []string{
 		"X-Codex-Turn-State",
 		"X-Request-Id",
@@ -511,13 +525,15 @@ func captureRouteResponse(resp *http.Response) (*capturedRouteResponse, bool) {
 		"Authorization",
 		"Proxy-Authorization",
 		"Api-Key",
+		"X-Api-Key",
 	} {
-		header.Del(name)
+		deleteHeaderCI(header, name)
 	}
 	captured := &capturedRouteResponse{
 		statusCode: resp.StatusCode,
 		header:     header,
 		request:    resp.Request,
+		upstreamID: upstreamID,
 	}
 	if resp.Body == nil {
 		return captured, true
@@ -564,6 +580,15 @@ func (c *capturedRouteResponse) response() *http.Response {
 		Header:     header,
 		Body:       io.NopCloser(bytes.NewReader(c.body)),
 		Request:    c.request,
+	}
+}
+
+func (c *capturedRouteResponse) recordFinalUpstreamID(ctx context.Context) {
+	if c == nil || c.upstreamID == "" {
+		return
+	}
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		summary.setUpstreamRequestID(c.upstreamID)
 	}
 }
 
@@ -737,6 +762,9 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			})
 		}
 		resp, sendErr := h.singleInferenceSend(req)
+		if resp != nil {
+			sanitizeExplicitRouteResponseHeaders(resp.Header)
+		}
 		if sendErr == nil && resp != nil {
 			normalizeExplicitModelHeaders(resp.Header, route.public.id)
 		}
@@ -784,12 +812,14 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			return accepted, nil
 		}
 
+		responseUpstreamID := responsesUpstreamRequestID(resp.Header)
 		if routeAdapterMayExplicitlyReject(target, endpoint, resp.StatusCode) {
 			captured, cleanupDone := captureRouteResponse(resp)
+			responseUpstreamID = captured.upstreamID
 			if !cleanupDone {
 				failure := routeAttemptFailure{err: fmt.Errorf("route attempt cleanup did not complete"), attribution: attribution, delivery: requestDeliveredOrAmbiguous, progress: upstreamProgressUnknown, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedLifecycle, statusCode: resp.StatusCode}
 				failures = append(failures, failure)
-				operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: resp.StatusCode, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, UpstreamID: responsesUpstreamRequestID(resp.Header), CleanupDone: false})
+				operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: resp.StatusCode, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, UpstreamID: captured.upstreamID, CleanupDone: false})
 				break
 			}
 			if routeAdapterCertifiesHTTPRejection(target, endpoint, captured) {
@@ -799,7 +829,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				}
 				failure := routeAttemptFailure{response: captured, attribution: attribution, delivery: requestExplicitlyRejected, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: decision, statusCode: captured.statusCode}
 				failures = append(failures, failure)
-				operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: captured.statusCode, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: decision, UpstreamID: responsesUpstreamRequestID(captured.header), CleanupDone: true})
+				operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: captured.statusCode, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: decision, UpstreamID: captured.upstreamID, CleanupDone: true})
 				if decision == routeRetrySwitchTarget {
 					continue
 				}
@@ -807,6 +837,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			}
 			// The status was potentially retryable but the adapter could not prove
 			// pre-execution rejection. Return it as an ambiguous terminal response.
+			captured.recordFinalUpstreamID(operation.inbound)
 			resp = captured.response()
 		}
 
@@ -816,12 +847,12 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				_ = resp.Body.Close()
 				failure := routeAttemptFailure{err: err, attribution: attribution, delivery: requestDeliveredOrAmbiguous, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedState, statusCode: resp.StatusCode}
 				failures = append(failures, failure)
-				operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: resp.StatusCode, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, UpstreamID: responsesUpstreamRequestID(resp.Header), CleanupDone: true})
+				operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: resp.StatusCode, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, UpstreamID: responseUpstreamID, CleanupDone: true})
 				break
 			}
 		}
 		operation.pinTarget(target.id)
-		operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: resp.StatusCode, Delivery: requestDeliveredOrAmbiguous, Progress: upstreamProgressNone, Commitment: downstreamCommitmentNone, Decision: routeRetryAccepted, UpstreamID: responsesUpstreamRequestID(resp.Header), CleanupDone: true})
+		operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: resp.StatusCode, Delivery: requestDeliveredOrAmbiguous, Progress: upstreamProgressNone, Commitment: downstreamCommitmentNone, Decision: routeRetryAccepted, UpstreamID: responseUpstreamID, CleanupDone: true})
 		attribution.recordFinal(operation.inbound)
 		return resp, nil
 	}
@@ -830,6 +861,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 	failure := selectFinalRouteFailure(failures)
 	failure.attribution.recordFinal(operation.inbound)
 	if failure.response != nil {
+		failure.response.recordFinalUpstreamID(operation.inbound)
 		return failure.response.response(), nil
 	}
 	if failure.err != nil {

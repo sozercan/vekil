@@ -533,7 +533,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	defer upstreamCancel()
 	model := rawJSONString(body["model"])
 	extraHeaders := responsesExtraHeadersFromRequest(r)
-	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), model, providerEndpointResponses)
+	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), model, providerEndpointResponses)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
 		writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
@@ -645,7 +645,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
 	extraHeaders := responsesExtraHeadersFromRequest(r)
-	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), memReq.Model, providerEndpointResponses)
+	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), memReq.Model, providerEndpointResponses)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
 		writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")

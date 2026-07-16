@@ -160,6 +160,42 @@ func TestExplicitRouteOpenAIChatHTTPRejectionPolicyAndPublicIdentity(t *testing.
 	})
 }
 
+func TestExplicitRouteOpenAIChatStreamProtectsProxyOperationID(t *testing.T) {
+	var secondaryCalls atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Vekil-Request-ID", "upstream-spoof")
+		w.Header().Set("X-Request-Id", "chat-stream-request-id")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chat-primary\",\"object\":\"chat.completion.chunk\",\"model\":\"physical-primary\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer primary.Close()
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondaryCalls.Add(1)
+		http.Error(w, "unexpected secondary request", http.StatusInternalServerError)
+	}))
+	defer secondary.Close()
+
+	h := newExplicitRouteSurfaceHandler(t, providerTypeAzureOpenAI, providerEndpointChatCompletions, primary.URL, secondary.URL)
+	ctx, summary := WithRequestSummary(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"public-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`)).WithContext(ctx)
+	w := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	if secondaryCalls.Load() != 0 {
+		t.Fatalf("secondary calls = %d, want 0", secondaryCalls.Load())
+	}
+	if got := w.Header().Get("X-Vekil-Request-ID"); got == "" || got == "upstream-spoof" || got != summary.OperationID() {
+		t.Fatalf("X-Vekil-Request-ID=%q summary=%q", got, summary.OperationID())
+	}
+	if got := w.Header().Get("X-Request-Id"); got != "chat-stream-request-id" {
+		t.Fatalf("X-Request-Id = %q, want chat-stream-request-id", got)
+	}
+}
+
 func TestExplicitRouteForcedStreamProgressControlsFailover(t *testing.T) {
 	requestBody := `{"model":"public-model","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`
 	tests := []struct {

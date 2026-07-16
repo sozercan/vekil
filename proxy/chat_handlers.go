@@ -105,7 +105,7 @@ func (h *ProxyHandler) executeExplicitRouteSurfaceRequest(ctx context.Context, e
 		}
 		// The proxy-owned operation ID is authoritative. Never let a same-named
 		// upstream header overwrite the value installed on the client response.
-		resp.Header.Del("X-Vekil-Request-ID")
+		sanitizeExplicitRouteResponseHeaders(resp.Header)
 
 		info, target, ok := explicitRouteTargetForResponse(operation, resp)
 		if !ok {
@@ -743,7 +743,7 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 func (h *ProxyHandler) forwardAnthropicCountTokensDirect(w http.ResponseWriter, r *http.Request, body []byte, model string) {
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
-	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), model, providerEndpointMessages)
+	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), model, providerEndpointMessages)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
 		writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
@@ -1051,7 +1051,7 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
-	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), providerModel, providerEndpointChatCompletions)
+	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), providerModel, providerEndpointChatCompletions)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
 		writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())

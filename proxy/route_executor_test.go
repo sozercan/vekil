@@ -124,6 +124,33 @@ func TestExplicitRoutePriorityFailoverOnAuthoritative429(t *testing.T) {
 	}
 }
 
+func TestExplicitRouteCapturedFinalResponseSanitizesProxyRequestID(t *testing.T) {
+	t.Parallel()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Vekil-Request-ID", "upstream-spoof")
+		w.Header().Set("X-Request-Id", "upstream-request-id")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"quota","type":"rate_limit_error"}}`)
+	}))
+	defer upstream.Close()
+
+	h, route := explicitRouteTestHandler(t, http.DefaultClient, routeModePrimaryOnly, 1, 1,
+		explicitRouteTestProvider("primary", upstream.URL, "primary-key"),
+	)
+	operation := newRouteOperation(route, context.Background())
+	ctx := withRouteOperation(context.Background(), operation)
+	resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model"}`), nil, "public-model", false)
+	if err != nil {
+		t.Fatalf("executeExplicitRouteRequest() error = %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if got := headerGetCI(resp.Header, "X-Vekil-Request-ID"); got != "" {
+		t.Fatalf("X-Vekil-Request-ID = %q, want empty", got)
+	}
+}
+
 func TestExplicitRoutePrimaryOnlyNeverSwitches(t *testing.T) {
 	t.Parallel()
 	var secondaryCalls atomic.Int32
@@ -348,6 +375,148 @@ func TestExplicitRouteFinalAttributionFollowsReturnedResult(t *testing.T) {
 			lastTarget, lastProvider, lastKind := summary.lastUpstreamAttempt()
 			if lastTarget != "target-secondary" || lastProvider != "secondary" || lastKind != string(providerTypeOpenAICompatible) {
 				t.Fatalf("last attempt = %q/%q/%q, want secondary attribution", lastTarget, lastProvider, lastKind)
+			}
+		})
+	}
+}
+
+func TestExplicitRouteCapturedResponsePreservesUpstreamRequestIDInTrace(t *testing.T) {
+	tests := []struct {
+		name                string
+		requestIDHeader     string
+		requestID           string
+		primaryStatus       int
+		primaryBody         string
+		secondaryPrewrite   bool
+		wantPrimaryDelivery requestDelivery
+		wantPrimaryDecision routeRetryDecision
+		wantTraceLen        int
+	}{
+		{
+			name:                "certified rejection",
+			requestIDHeader:     "X-Request-Id",
+			requestID:           "request-primary",
+			primaryStatus:       http.StatusTooManyRequests,
+			primaryBody:         `{"error":{"message":"primary quota","type":"rate_limit_error"}}`,
+			wantPrimaryDelivery: requestExplicitlyRejected,
+			wantPrimaryDecision: routeRetrySuppressedMode,
+			wantTraceLen:        1,
+		},
+		{
+			name:                "ambiguous response",
+			requestIDHeader:     "X-Azure-Request-Id",
+			requestID:           "azure-primary",
+			primaryStatus:       http.StatusServiceUnavailable,
+			primaryBody:         `{"error":{"message":"gateway unavailable"}}`,
+			wantPrimaryDelivery: requestDeliveredOrAmbiguous,
+			wantPrimaryDecision: routeRetryAccepted,
+			wantTraceLen:        1,
+		},
+		{
+			name:                "final selected earlier response",
+			requestIDHeader:     "Openai-Request-Id",
+			requestID:           "openai-primary",
+			primaryStatus:       http.StatusTooManyRequests,
+			primaryBody:         `{"error":{"message":"primary quota","type":"rate_limit_error"}}`,
+			secondaryPrewrite:   true,
+			wantPrimaryDelivery: requestExplicitlyRejected,
+			wantPrimaryDecision: routeRetrySwitchTarget,
+			wantTraceLen:        2,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Hostname() {
+				case "primary.example":
+					headers := http.Header{
+						"Authorization":       []string{"Bearer upstream-secret"},
+						"Proxy-Authorization": []string{"Basic upstream-secret"},
+						"Api-Key":             []string{"upstream-api-key"},
+						"X-Api-Key":           []string{"upstream-x-api-key"},
+						"X-Vekil-Request-ID":  []string{"spoofed-operation-id"},
+						"X-Codex-Turn-State":  []string{"private-turn-state"},
+						tc.requestIDHeader:    []string{tc.requestID},
+					}
+					return routeExecutorTestResponse(req, tc.primaryStatus, headers, tc.primaryBody), nil
+				case "secondary.example":
+					if !tc.secondaryPrewrite {
+						t.Fatalf("unexpected secondary request")
+					}
+					return nil, errors.New("secondary prewrite failure")
+				default:
+					t.Fatalf("unexpected target host %q", req.URL.Hostname())
+					return nil, errors.New("unexpected target")
+				}
+			})
+
+			providers := []*providerRuntime{explicitRouteTestProvider("primary", "https://primary.example", "one")}
+			mode, maxTargets, maxSends := routeModePrimaryOnly, 1, 1
+			if tc.secondaryPrewrite {
+				providers = append(providers, explicitRouteTestProvider("secondary", "https://secondary.example", "two"))
+				mode, maxTargets, maxSends = routeModePriorityFailover, 2, 2
+			}
+			h, route := explicitRouteTestHandler(t, &http.Client{Transport: transport}, mode, maxTargets, maxSends, providers...)
+			inbound, summary := WithRequestSummary(context.Background())
+			operation := newRouteOperation(route, inbound)
+			ctx := withRouteOperation(context.Background(), operation)
+
+			resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model"}`), nil, "public-model", false)
+			if err != nil {
+				t.Fatalf("executeExplicitRouteRequest() error = %v", err)
+			}
+			if resp == nil {
+				t.Fatal("response = nil")
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != tc.primaryStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.primaryStatus)
+			}
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				t.Fatalf("read response body: %v", readErr)
+			}
+			if string(body) != tc.primaryBody {
+				t.Fatalf("body = %s, want %s", body, tc.primaryBody)
+			}
+
+			for _, name := range append(append([]string{}, upstreamRequestIDHeaderNames...),
+				"Authorization", "Proxy-Authorization", "Api-Key", "X-Api-Key", "X-Vekil-Request-ID", "X-Codex-Turn-State") {
+				if got := headerGetCI(resp.Header, name); got != "" {
+					t.Fatalf("sanitized response header %s = %q", name, got)
+				}
+			}
+
+			_, _, trace := operation.snapshot()
+			if len(trace) != tc.wantTraceLen {
+				t.Fatalf("trace = %+v, want %d entries", trace, tc.wantTraceLen)
+			}
+			primaryTrace := trace[0]
+			if primaryTrace.TargetID != "target-primary" || primaryTrace.StatusCode != tc.primaryStatus {
+				t.Fatalf("primary trace = %+v", primaryTrace)
+			}
+			if primaryTrace.UpstreamID != tc.requestID {
+				t.Fatalf("primary trace upstream ID = %q, want %q (trace=%+v)", primaryTrace.UpstreamID, tc.requestID, trace)
+			}
+			if primaryTrace.Delivery != tc.wantPrimaryDelivery {
+				t.Fatalf("primary trace delivery = %q, want %q", primaryTrace.Delivery, tc.wantPrimaryDelivery)
+			}
+			if primaryTrace.Decision != tc.wantPrimaryDecision {
+				t.Fatalf("primary trace decision = %q, want %q", primaryTrace.Decision, tc.wantPrimaryDecision)
+			}
+			if tc.secondaryPrewrite {
+				secondaryTrace := trace[1]
+				if secondaryTrace.TargetID != "target-secondary" || secondaryTrace.UpstreamID != "" || secondaryTrace.Decision != routeRetrySuppressedDelivery {
+					t.Fatalf("secondary trace = %+v, want prewrite delivery failure", secondaryTrace)
+				}
+			}
+			stats := readSummaryForStats(summary)
+			if stats.finalTarget != "target-primary" {
+				t.Fatalf("final target = %q, want target-primary", stats.finalTarget)
+			}
+			if stats.upstreamID != tc.requestID {
+				t.Fatalf("final upstream ID = %q, want %q", stats.upstreamID, tc.requestID)
 			}
 		})
 	}
@@ -801,6 +970,8 @@ func TestConfiguredExplicitRouteHandleResponsesAndCatalog(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Openai-Model", "physical-secondary")
 		w.Header().Set("X-Openai-Model", "physical-secondary")
+		w.Header().Set("X-Vekil-Request-ID", "upstream-spoof")
+		w.Header().Set("X-Request-Id", "secondary-request-id")
 		_, _ = io.WriteString(w, `{"id":"resp_configured","model":"physical-secondary","status":"completed","output":[]}`)
 	}))
 	defer secondary.Close()
@@ -843,8 +1014,11 @@ func TestConfiguredExplicitRouteHandleResponsesAndCatalog(t *testing.T) {
 	if got := w.Header().Get("X-Openai-Model"); got != "public-model" {
 		t.Fatalf("X-Openai-Model = %q", got)
 	}
-	if got := w.Header().Get("X-Vekil-Request-ID"); got == "" || got != summary.OperationID() {
+	if got := w.Header().Get("X-Vekil-Request-ID"); got == "" || got == "upstream-spoof" || got != summary.OperationID() {
 		t.Fatalf("X-Vekil-Request-ID=%q summary=%q", got, summary.OperationID())
+	}
+	if got := w.Header().Get("X-Request-Id"); got != "secondary-request-id" {
+		t.Fatalf("X-Request-Id = %q, want secondary-request-id", got)
 	}
 	if primaryCalls.Load() != 1 || secondaryCalls.Load() != 1 {
 		t.Fatalf("calls primary=%d secondary=%d", primaryCalls.Load(), secondaryCalls.Load())
