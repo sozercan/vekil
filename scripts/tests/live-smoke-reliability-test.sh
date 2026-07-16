@@ -235,6 +235,9 @@ case "\${mode}" in
   pass)
     printf '%s|%s\n' "\$(cat left.txt)" "\$(cat right.txt)"
     ;;
+  json-wrapped)
+    printf '{"output":"%s"}|{"output":"%s"}\n' "\$(cat left.txt)" "\$(cat right.txt)"
+    ;;
   exit42)
     exit 42
     ;;
@@ -463,6 +466,22 @@ common_zen_env() {
     "SMOKE_CLI_TIMEOUT_SECONDS=2"
 }
 
+run_zen_case_expect_success() {
+  local name="$1"
+  local copilot_mode="$2"
+  local claude_mode="$3"
+  local gemini_mode="$4"
+  local case_dir="${TMP_ROOT}/setup/${name}"
+  start_mock_server "${case_dir}/server" 200
+  local port="${MOCK_SERVER_PORT}"
+  local fake_bin="${case_dir}/bin"
+  write_fake_clients "${fake_bin}" "${copilot_mode}" "${claude_mode}" "${gemini_mode}"
+  local smoke_dir="${case_dir}/smoke"
+  local env_args=()
+  while IFS= read -r -d '' item; do env_args+=("${item}"); done < <(common_zen_env "${smoke_dir}" "${port}" "${fake_bin}")
+  expect_success "${name}" 8 env "${env_args[@]}" "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+}
+
 run_zen_case_expect_failure() {
   local name="$1"
   local status="$2"
@@ -675,6 +694,8 @@ expect_hard_failure_with_stderr "hanging chat canary is hard via raw Zen smoke" 
   env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${hanging_chat_port}" \
     LIVE_ZEN_SMOKE_DIR="${hanging_chat_dir}/raw-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
     SMOKE_CURL_MAX_TIME_SECONDS=1 "${REPO_ROOT}/scripts/live-zen-smoke.sh"
+
+run_zen_case_expect_success "Gemini strict JSON wrappers normalize to exact text" pass pass json-wrapped
 
 run_zen_case_expect_failure "canary 200 plus CLI exit 42" 200 exit42 exit42 exit42
 run_zen_case_expect_failure "canary 404 is a hard failure" 404 pass pass pass
