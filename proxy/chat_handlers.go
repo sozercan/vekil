@@ -303,6 +303,48 @@ func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp 
 
 // HandleAnthropicMessages handles POST /v1/messages by translating the Anthropic
 // request to OpenAI format, forwarding to Copilot, and translating the response back.
+const anthropicInterleavedThinkingBeta = "interleaved-thinking-2025-05-14"
+
+func anthropicBetaEnabled(headers http.Header, feature string) bool {
+	feature = strings.TrimSpace(feature)
+	if feature == "" {
+		return false
+	}
+	for _, value := range headers.Values("Anthropic-Beta") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.TrimSpace(token) == feature {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func validateAnthropicMessageTokenLimits(req *models.AnthropicRequest, headers http.Header) error {
+	if req == nil || req.MaxTokens == nil {
+		return fmt.Errorf("max_tokens is required")
+	}
+	if *req.MaxTokens < 0 {
+		return fmt.Errorf("max_tokens must be greater than or equal to 0")
+	}
+	if *req.MaxTokens == 0 && req.Stream {
+		return fmt.Errorf("max_tokens must be greater than 0 when stream is true")
+	}
+	if req.Thinking == nil || req.Thinking.Type != "enabled" {
+		return nil
+	}
+	if req.Thinking.BudgetTokens == nil {
+		return fmt.Errorf("thinking.budget_tokens is required when thinking.type is enabled")
+	}
+	if *req.Thinking.BudgetTokens < 1024 {
+		return fmt.Errorf("thinking.budget_tokens must be greater than or equal to 1024")
+	}
+	if *req.Thinking.BudgetTokens >= *req.MaxTokens && !anthropicBetaEnabled(headers, anthropicInterleavedThinkingBeta) {
+		return fmt.Errorf("thinking.budget_tokens must be less than max_tokens unless interleaved thinking is enabled")
+	}
+	return nil
+}
+
 func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
@@ -319,6 +361,10 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	if err := json.Unmarshal(body, &req); err != nil {
 		message, _ := jsonDecodeErrorDetails(err, "invalid JSON in request body")
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", message)
+		return
+	}
+	if err := validateAnthropicMessageTokenLimits(&req, r.Header); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 

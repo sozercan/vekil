@@ -1166,12 +1166,12 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		if terminalPeek != nil && terminalPeek.terminal != nil {
 			usage := terminalPeek.terminal.Response.Usage
 			switch terminalPeek.terminal.Type {
-			case "response.completed":
+			case "response.completed", "response.incomplete":
 				if strings.TrimSpace(terminalPeek.terminal.Response.ID) == "" {
 					return http.StatusBadGateway, usage, true
 				}
 				return http.StatusOK, usage, true
-			case "response.failed", "response.incomplete", "error":
+			case "response.failed", "error":
 				if terminalPeek.status != 0 {
 					return terminalPeek.status, usage, true
 				}
@@ -1899,7 +1899,7 @@ func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *
 	)
 }
 
-func (s *responsesWebSocketSession) completedResponseOutputItems(h *ProxyHandler, data string) []json.RawMessage {
+func (s *responsesWebSocketSession) terminalResponseOutputItems(h *ProxyHandler, data string) []json.RawMessage {
 	var envelope struct {
 		Response struct {
 			Output []json.RawMessage `json:"output"`
@@ -1937,7 +1937,9 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 	}
 
 	sawCompleted := false
+	sawIncomplete := false
 	completedResponseIDValid := false
+	incompleteResponseIDValid := false
 	sawSemanticEvent := false
 
 	err := consumeResponsesSSEMessages(body, func(msg responsesSSEMessage) error {
@@ -1960,7 +1962,7 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 			wireData = responsesDataWithEventType(data, event.Type)
 		}
 		failureStatus := 0
-		if parsedEvent && (event.Type == "response.failed" || event.Type == "response.incomplete" || event.Type == "error") {
+		if parsedEvent && (event.Type == "response.failed" || event.Type == "error") {
 			failureStatus, _, _, _ = responsesWebSocketStreamFailureDetails(event, headers)
 			if failureStatus != 0 {
 				result.usage = event.Response.Usage
@@ -1985,6 +1987,28 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 			}
 		}
 
+		if parsedEvent && event.Type == "response.incomplete" {
+			sawIncomplete = true
+			validIncompleteEvent := false
+			if responseID := strings.TrimSpace(event.Response.ID); responseID != "" {
+				result.responseID = responseID
+				incompleteResponseIDValid = true
+				validIncompleteEvent = true
+			}
+			if !event.Response.Usage.isZero() {
+				result.usage = event.Response.Usage
+			}
+			if len(result.outputItems) == 0 && strings.Contains(data, `"output"`) {
+				result.outputItems = s.terminalResponseOutputItems(h, data)
+			}
+			if validIncompleteEvent && recordTerminal != nil {
+				// An incomplete provider response is still an authoritative terminal
+				// result with a resumable ID. Account before client delivery so a
+				// disconnect cannot rewrite it as a client-aborted turn.
+				recordTerminal(http.StatusOK, result.usage)
+			}
+		}
+
 		completedEvent := parsedEvent && event.Type == "response.completed"
 		validCompletedEvent := false
 		if completedEvent {
@@ -1998,7 +2022,7 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 				result.usage = event.Response.Usage
 			}
 			if len(result.outputItems) == 0 && strings.Contains(data, `"output"`) {
-				result.outputItems = s.completedResponseOutputItems(h, data)
+				result.outputItems = s.terminalResponseOutputItems(h, data)
 			}
 			if validCompletedEvent && recordTerminal != nil {
 				// A structurally valid provider completion is authoritative before
@@ -2027,9 +2051,9 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 				}
 				result.outputItems = append(result.outputItems, cloneRawMessage(event.Item))
 			}
-		case "response.completed":
+		case "response.completed", "response.incomplete":
 			return errResponsesWebSocketStreamTerminal
-		case "response.failed", "response.incomplete", "error":
+		case "response.failed", "error":
 			if writeErr := s.sendUpstreamStreamFailure(event, headers); writeErr != nil {
 				return writeErr
 			}
@@ -2057,7 +2081,13 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 		}
 		return result, nil
 	}
-	return result, fmt.Errorf("stream ended before response.completed")
+	if sawIncomplete {
+		if !incompleteResponseIDValid {
+			return result, fmt.Errorf("response.incomplete missing response id")
+		}
+		return result, nil
+	}
+	return result, fmt.Errorf("stream ended before response.completed or response.incomplete")
 }
 
 func (s *responsesWebSocketSession) writeJSON(payload interface{}) error {
