@@ -915,29 +915,23 @@ func filterProviderModels(provider *providerRuntime, models []providerModel) []p
 	if provider == nil || len(models) == 0 {
 		return models
 	}
-	if len(provider.includeModels) == 0 && len(provider.excludeModels) == 0 {
-		return models
-	}
-
-	firstFiltered := -1
-	for i, model := range models {
-		if !provider.allowsModel(model.publicID) {
-			firstFiltered = i
-			break
+	filtered := make([]providerModel, 0, len(models))
+	for _, model := range models {
+		if isReservedMetricsModelLabel(model.publicID) || !provider.allowsModel(model.publicID) {
+			continue
 		}
-	}
-	if firstFiltered == -1 {
-		return models
-	}
-
-	filtered := make([]providerModel, 0, len(models)-1)
-	filtered = append(filtered, models[:firstFiltered]...)
-	for _, model := range models[firstFiltered+1:] {
-		if provider.allowsModel(model.publicID) {
-			filtered = append(filtered, model)
-		}
+		filtered = append(filtered, model)
 	}
 	return filtered
+}
+
+func isReservedMetricsModelLabel(model string) bool {
+	switch strings.TrimSpace(model) {
+	case metricsUnroutedModel, statsOtherKey:
+		return true
+	default:
+		return false
+	}
 }
 
 func needsDynamicProviderModelValidation(providers map[string]*providerRuntime) bool {
@@ -1007,6 +1001,9 @@ func buildStaticProviderModel(providerID string, cfg ProviderModelConfig, defaul
 	publicID := strings.TrimSpace(cfg.PublicID)
 	if publicID == "" {
 		return providerModel{}, fmt.Errorf("provider %q contains a model without public_id", providerID)
+	}
+	if isReservedMetricsModelLabel(publicID) {
+		return providerModel{}, fmt.Errorf("provider %q model public_id %q is reserved for metrics aggregation", providerID, publicID)
 	}
 
 	upstreamModel := strings.TrimSpace(cfg.Deployment)

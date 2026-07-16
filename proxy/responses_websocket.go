@@ -1136,6 +1136,8 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	if s == nil || s.isClosing() || (s.ctx != nil && s.ctx.Err() != nil) || h.upstreamShutdownStarted() {
 		return context.Canceled
 	}
+	h.IncInflight()
+	defer h.DecInflight()
 	s.syncTurnMetadata(request)
 	if request.PreviousResponseID == "" {
 		s.turnState = ""

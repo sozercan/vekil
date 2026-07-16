@@ -4904,6 +4904,73 @@ func TestShutdownWebSocketSessions_ConcurrentClientCloseAndShutdown(t *testing.T
 	waitForResponsesWebSocketSessionCount(t, handler, 0)
 }
 
+func TestResponsesWebSocketTurnUpdatesInflightGauge(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		startedOnce.Do(func() { close(started) })
+		<-release
+		body := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-inflight\"}}\n\n" +
+			"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-inflight\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n"
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	}))
+	handler.stats = newStatsCollector()
+	handler.metrics = NewMetricsCollector()
+	handler.responsesWS.DisableAutoCompact = true
+
+	serverConn, clientConn := newResponsesWebSocketConnPair(t)
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+	done := make(chan error, 1)
+	go func() { done <- session.handleCreateRequest(handler, request) }()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("websocket turn did not reach upstream")
+	}
+	if got := handler.stats.snapshot().Inflight; got != 1 {
+		t.Fatalf("dashboard inflight during turn = %d, want 1", got)
+	}
+	families, err := handler.metrics.registry.Gather()
+	if err != nil {
+		t.Fatalf("gather inflight metrics: %v", err)
+	}
+	if got := getPlainGaugeValue(families, "vekil_inflight_requests"); got != 1 {
+		t.Fatalf("prometheus inflight during turn = %v, want 1", got)
+	}
+
+	close(release)
+	_ = mustReadWebSocketJSON(t, clientConn)
+	_ = mustReadWebSocketJSON(t, clientConn)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("handleCreateRequest() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("websocket turn did not finish")
+	}
+	if got := handler.stats.snapshot().Inflight; got != 0 {
+		t.Fatalf("dashboard inflight after turn = %d, want 0", got)
+	}
+	families, err = handler.metrics.registry.Gather()
+	if err != nil {
+		t.Fatalf("gather final inflight metrics: %v", err)
+	}
+	if got := getPlainGaugeValue(families, "vekil_inflight_requests"); got != 0 {
+		t.Fatalf("prometheus inflight after turn = %v, want 0", got)
+	}
+}
+
 func TestResponsesWebSocketSetInflightCancelAfterClosingCancelsImmediately(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	session := &responsesWebSocketSession{ctx: ctx, cancel: cancel}
