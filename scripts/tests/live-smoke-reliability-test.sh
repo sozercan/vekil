@@ -236,7 +236,18 @@ case "\${mode}" in
     printf '%s|%s\n' "\$(cat left.txt)" "\$(cat right.txt)"
     ;;
   wrapped-output)
-    printf '{"output":"%s"}|{"output":"%s"}\n' "\$(cat left.txt)" "\$(cat right.txt)"
+    python3 - <<'PY_WRAPPED_OUTPUT'
+import json
+import pathlib
+
+left = pathlib.Path("left.txt").read_text()
+right = pathlib.Path("right.txt").read_text()
+print(
+    json.dumps({"output": left}, separators=(",", ":"))
+    + "|"
+    + json.dumps({"output": right}, separators=(",", ":"))
+)
+PY_WRAPPED_OUTPUT
     ;;
   exit42)
     exit 42
@@ -667,6 +678,33 @@ expect_success "Gemini wrapped Read outputs normalize to exact fixture text" 10 
     LIVE_CLI_SMOKE_DIR="${wrapped_gemini_dir}/smoke" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
     SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+
+wrapped_escape_dir="${TMP_ROOT}/setup/gemini-wrapped-json-escaping"
+mkdir -p "${wrapped_escape_dir}/bin" "${wrapped_escape_dir}/case"
+write_fake_client "${wrapped_escape_dir}/bin/gemini" wrapped-output
+printf '%s' 'left"\line' > "${wrapped_escape_dir}/case/left.txt"
+printf 'right\nline' > "${wrapped_escape_dir}/case/right.txt"
+if (
+  cd "${wrapped_escape_dir}/case"
+  "${wrapped_escape_dir}/bin/gemini" > output.txt
+  python3 - <<'PY_WRAPPED_ASSERT'
+import json
+import pathlib
+
+raw = pathlib.Path("output.txt").read_text().strip()
+decoder = json.JSONDecoder()
+left, offset = decoder.raw_decode(raw)
+assert raw[offset:offset + 1] == "|"
+right, end = decoder.raw_decode(raw, offset + 1)
+assert end == len(raw)
+assert left == {"output": 'left"\\line'}
+assert right == {"output": "right\nline"}
+PY_WRAPPED_ASSERT
+); then
+  record_success "Gemini wrapped Read outputs JSON-escape quotes, backslashes, and newlines"
+else
+  record_failure "Gemini wrapped Read output escaping" "generated wrapper was not valid compact JSON"
+fi
 
 run_zen_classification_case "canary 404 plus transient text is hard" 404 \
   "service temporarily unavailable" 0
