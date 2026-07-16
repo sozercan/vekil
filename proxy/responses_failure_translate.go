@@ -1580,9 +1580,9 @@ func responsesQuotaRemaining(headers http.Header, dimension string) (int64, bool
 	return remaining, true
 }
 
-func responsesQuotaResetSeconds(headers http.Header, dimension string) int {
+func responsesQuotaResetSeconds(headers http.Header, dimension string) int64 {
 	value := strings.TrimSpace(headerGetCI(headers, "x-ratelimit-reset-"+dimension))
-	if seconds, err := strconv.Atoi(value); err == nil {
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
 		if seconds > 0 {
 			return seconds
 		}
@@ -1592,7 +1592,7 @@ func responsesQuotaResetSeconds(headers http.Header, dimension string) int {
 	if err != nil || delay <= 0 {
 		return 0
 	}
-	return int((delay + time.Second - 1) / time.Second)
+	return int64((delay + time.Second - 1) / time.Second)
 }
 
 func classifyPrecommitResponsesFailure(event responsesWebSocketStreamEvent) (int, string, bool) {
@@ -1644,7 +1644,7 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 		return strconv.Itoa(int(delay / time.Second)), "Retry-After"
 	}
 
-	resetSeconds := 0
+	var resetSeconds int64
 	resetSource := ""
 	for _, dimension := range []string{"tokens", "requests"} {
 		remaining, exhausted := responsesQuotaRemaining(headers, dimension)
@@ -1659,11 +1659,8 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 		resetSource = "x-ratelimit-reset-" + dimension
 	}
 	if resetSeconds > 0 {
-		maxSec := int(maxRetryAfter / time.Second)
-		if resetSeconds > maxSec {
-			resetSeconds = maxSec
-		}
-		return strconv.Itoa(resetSeconds), resetSource
+		delay := retryAfterDurationFromSeconds(resetSeconds)
+		return strconv.Itoa(int(delay / time.Second)), resetSource
 	}
 
 	return "", ""

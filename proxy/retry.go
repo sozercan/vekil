@@ -77,12 +77,12 @@ func parseRetryAfter(value string) (time.Duration, bool) {
 	if value == "" {
 		return 0, false
 	}
-	seconds, err := strconv.Atoi(value)
+	seconds, err := strconv.ParseInt(value, 10, 64)
 	if err == nil {
 		if seconds <= 0 {
 			return 0, false
 		}
-		return clampRetryAfter(time.Duration(seconds) * time.Second), true
+		return retryAfterDurationFromSeconds(seconds), true
 	}
 
 	retryAt, err := http.ParseTime(value)
@@ -101,6 +101,17 @@ func clampRetryAfter(delay time.Duration) time.Duration {
 		return maxRetryAfter
 	}
 	return delay
+}
+
+func retryAfterDurationFromSeconds(seconds int64) time.Duration {
+	if seconds <= 0 {
+		return 0
+	}
+	maxSeconds := int64(maxRetryAfter / time.Second)
+	if seconds >= maxSeconds {
+		return maxRetryAfter
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // drainAndClose discards up to 4 KB from the body before closing it so that
