@@ -1755,11 +1755,12 @@ func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx conte
 	// Clear it before the full-replay fallback so a failed fallback cannot leave
 	// the websocket session primed to resend the same invalid state on the next
 	// client retry. A successful fallback may install a fresh state later.
+	hadTurnState := s.turnState != ""
 	s.turnState = ""
 	h.log.Debug("responses websocket delta replay failed; retrying full history",
 		logger.F("model", request.Model),
 		logger.F("previous_response_id", request.PreviousResponseID),
-		logger.F("had_turn_state", s.turnState != ""),
+		logger.F("had_turn_state", hadTurnState),
 		logger.F("delta_attempted", true),
 		logger.F("delta_fallback", true),
 	)
@@ -1776,15 +1777,19 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 	if err != nil {
 		return nil, err
 	}
-	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, bodyBytes, request.Model, "responses/websocket", true, s.toolContexts, s.toolScope)
 	headers := s.requestHeaders(request, includeTurnState)
 	operation := routeOperationFromContext(ctx)
 	if operation != nil {
-		validationBody, err := responsesWebSocketStateValidationBody(bodyBytes, request.PreviousResponseID)
+		// Preserve the logical request before compatibility rewrites sanitize
+		// provider-issued compaction state. The validation helper adds only
+		// provider-visible response lineage; websocket-local and proxy-generated
+		// synthetic response IDs intentionally remain local.
+		stateBindingBody := append([]byte(nil), bodyBytes...)
+		stateBindingBody, err = responsesWebSocketStateValidationBody(stateBindingBody, request.PreviousResponseID)
 		if err != nil {
 			return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 		}
-		if err := h.applyExplicitRequestStateBinding(operation, validationBody, headers); err != nil {
+		if err := h.applyExplicitRequestStateBinding(operation, stateBindingBody, headers); err != nil {
 			return nil, err
 		}
 		if operation.pinnedTarget() != "" {
@@ -1794,6 +1799,7 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 			operation.setCommitment(downstreamCommitmentProtocolFrame)
 		}
 	}
+	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, bodyBytes, request.Model, "responses/websocket", true, s.toolContexts, s.toolScope)
 	// The websocket bridge records each turn's usage downstream from the streamed
 	// response body (recordTurnStats), so the per-turn usage total returned here
 	// is not observed separately — discard it.

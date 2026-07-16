@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -932,6 +933,124 @@ func TestHandleResponsesWebSocket_ExplicitRouteRejectsUnknownStateBeforeDispatch
 	if got := upstreamCalls.Load(); got != 0 {
 		t.Fatalf("upstream calls = %d, unknown state must fail before dispatch", got)
 	}
+}
+
+func TestHandleResponsesWebSocket_ExplicitRouteValidatesContextCompactionStateBeforeRewrite(t *testing.T) {
+	writeCompleted := func(w http.ResponseWriter, responseID, model string) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Openai-Model", model)
+		_, _ = fmt.Fprintf(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":%q,\"model\":%q}}\n\n", responseID, model)
+		_, _ = fmt.Fprintf(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":%q,\"model\":%q,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n", responseID, model)
+	}
+	requestWithState := func(token string) map[string]interface{} {
+		request := newResponsesWebSocketCreateRequest([]interface{}{
+			map[string]interface{}{
+				"type":              "context_compaction",
+				"encrypted_content": token,
+			},
+			map[string]interface{}{
+				"type":    "message",
+				"role":    "user",
+				"content": []map[string]string{{"type": "input_text", "text": "continue"}},
+			},
+		})
+		request["model"] = "public-ws-model"
+		return request
+	}
+
+	t.Run("unknown state fails closed without dispatch", func(t *testing.T) {
+		var upstreamCalls atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			upstreamCalls.Add(1)
+			writeCompleted(w, "resp_unexpected", "physical-primary")
+		}))
+		defer upstream.Close()
+
+		handler := newExplicitRouteResponsesWebSocketHandler(t, upstream.URL, upstream.URL)
+		server := startResponsesWebSocketProxyServer(t, handler)
+		conn := mustDialResponsesWebSocket(t, server, nil)
+		defer func() { _ = conn.Close() }()
+
+		if err := conn.WriteJSON(requestWithState("unknown provider context checkpoint")); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+		errorFrame := mustReadWebSocketJSON(t, conn)
+		if errorFrame["type"] != "error" || int(errorFrame["status_code"].(float64)) != http.StatusBadRequest {
+			t.Fatalf("unknown context-compaction frame = %+v", errorFrame)
+		}
+		if got := upstreamCalls.Load(); got != 0 {
+			t.Fatalf("upstream calls = %d, unknown context-compaction state must fail before dispatch", got)
+		}
+	})
+
+	t.Run("known state pins exact owner and sends rewritten body", func(t *testing.T) {
+		const token = "provider context checkpoint owned by secondary"
+		var primaryCalls atomic.Int32
+		primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			primaryCalls.Add(1)
+			writeCompleted(w, "resp_primary_unexpected", "physical-primary")
+		}))
+		defer primary.Close()
+
+		var secondaryCalls atomic.Int32
+		secondaryBodies := make(chan []byte, 1)
+		secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			secondaryCalls.Add(1)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read secondary body: %v", err)
+			}
+			secondaryBodies <- append([]byte(nil), body...)
+			writeCompleted(w, "resp_secondary_state", "physical-secondary")
+		}))
+		defer secondary.Close()
+
+		handler := newExplicitRouteResponsesWebSocketHandler(t, primary.URL, secondary.URL)
+		route, known := handler.resolveModelRouteForRequest("public-ws-model", providerEndpointResponses)
+		if !known || route == nil || route.legacy {
+			t.Fatal("explicit websocket route was not resolved")
+		}
+		bindExplicitEncryptedContentForTest(t, handler, route, route.targets[1].id, token)
+
+		server := startResponsesWebSocketProxyServer(t, handler)
+		conn := mustDialResponsesWebSocket(t, server, nil)
+		defer func() { _ = conn.Close() }()
+
+		if err := conn.WriteJSON(requestWithState(token)); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+		created := mustReadWebSocketJSONSkipMetadata(t, conn)
+		if created["type"] != "response.created" {
+			t.Fatalf("created frame = %+v", created)
+		}
+		completed := mustReadWebSocketJSON(t, conn)
+		if completed["type"] != "response.completed" {
+			t.Fatalf("completed frame = %+v", completed)
+		}
+
+		if got := primaryCalls.Load(); got != 0 {
+			t.Fatalf("primary calls = %d, state-bound websocket request must not use primary", got)
+		}
+		if got := secondaryCalls.Load(); got != 1 {
+			t.Fatalf("secondary calls = %d, want exact state owner once", got)
+		}
+
+		var body []byte
+		select {
+		case body = <-secondaryBodies:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for secondary request body")
+		}
+		if bytes.Contains(body, []byte(`"type":"context_compaction"`)) || bytes.Contains(body, []byte(`"encrypted_content"`)) {
+			t.Fatalf("upstream body retained provider context-compaction shape: %s", body)
+		}
+		if !bytes.Contains(body, []byte(proxyCompactionContextIntro)) {
+			t.Fatalf("upstream body did not contain rewritten checkpoint context: %s", body)
+		}
+		if !bytes.Contains(body, []byte(`"model":"physical-secondary"`)) {
+			t.Fatalf("upstream body did not use state-bound physical model: %s", body)
+		}
+	})
 }
 
 func TestHandleResponsesWebSocket_ExplicitRoutePreservesLocalWarmupReplay(t *testing.T) {
@@ -6171,6 +6290,7 @@ func inputTextFromMessage(t *testing.T, item map[string]interface{}) string {
 
 func TestResponsesWebSocketInvalidTurnStateClearsBeforeFailedFullReplay(t *testing.T) {
 	var calls atomic.Int32
+	var logs bytes.Buffer
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		switch call := calls.Add(1); call {
 		case 1:
@@ -6191,6 +6311,7 @@ func TestResponsesWebSocketInvalidTurnStateClearsBeforeFailedFullReplay(t *testi
 			t.Fatalf("unexpected upstream call %d", call)
 		}
 	})
+	handler.log = logger.NewWithWriter(logger.LevelDebug, &logs)
 
 	request := &responsesWebSocketCreateRequest{
 		Type:               "response.create",
@@ -6240,6 +6361,27 @@ func TestResponsesWebSocketInvalidTurnStateClearsBeforeFailedFullReplay(t *testi
 	}
 	if nextPlan.useTurnStateDelta {
 		t.Fatal("next retry unexpectedly reused rejected turn state")
+	}
+
+	foundFallbackDiagnostic := false
+	decoder := json.NewDecoder(bytes.NewReader(logs.Bytes()))
+	for {
+		var entry map[string]interface{}
+		if err := decoder.Decode(&entry); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			t.Fatalf("decode websocket fallback log: %v", err)
+		}
+		if entry["msg"] != "responses websocket delta replay failed; retrying full history" {
+			continue
+		}
+		foundFallbackDiagnostic = true
+		if got, ok := entry["had_turn_state"].(bool); !ok || !got {
+			t.Fatalf("fallback had_turn_state = %#v, want true", entry["had_turn_state"])
+		}
+	}
+	if !foundFallbackDiagnostic {
+		t.Fatal("missing websocket invalid-turn-state fallback diagnostic")
 	}
 }
 
