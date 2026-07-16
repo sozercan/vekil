@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"sync/atomic"
 )
@@ -442,7 +443,7 @@ func providerModelFromRouteTarget(route *modelRoute, target targetBinding) provi
 	return owner
 }
 
-func (r *modelRouteRegistry) replaceLegacyProviders(providers map[string]*providerRuntime, replacements map[string][]providerModel) error {
+func (r *modelRouteRegistry) replaceLegacyProviders(providers map[string]*providerRuntime, providerOrder []string, replacements map[string][]providerModel) error {
 	if r == nil || len(replacements) == 0 {
 		return nil
 	}
@@ -454,7 +455,7 @@ func (r *modelRouteRegistry) replaceLegacyProviders(providers map[string]*provid
 		byPublicID:       make(map[string]*modelRoute, len(current.byPublicID)),
 		aliases:          make(map[string]*modelRoute, len(current.aliases)),
 		explicit:         append([]*modelRoute(nil), current.explicit...),
-		legacyByProvider: make(map[string][]*modelRoute, len(current.legacyByProvider)),
+		legacyByProvider: make(map[string][]*modelRoute, len(current.legacyByProvider)+len(replacements)),
 		strictAliases:    current.strictAliases,
 	}
 	for _, route := range next.explicit {
@@ -464,54 +465,91 @@ func (r *modelRouteRegistry) replaceLegacyProviders(providers map[string]*provid
 	}
 
 	seenProviders := make(map[string]struct{}, len(current.legacyByProvider)+len(replacements))
-	for _, route := range current.legacyOrder {
-		if route == nil || len(route.targets) == 0 || route.targets[0].provider == nil {
-			continue
+	emitProvider := func(providerID string) error {
+		if _, emitted := seenProviders[providerID]; emitted {
+			return nil
 		}
-		providerID := route.targets[0].provider.id
-		if _, replaced := replacements[providerID]; replaced {
-			if _, emitted := seenProviders[providerID]; emitted {
-				continue
-			}
-			compiled, err := compileLegacyProviderRoutes(providers[providerID], replacements[providerID])
+
+		var routes []*modelRoute
+		if models, replacing := replacements[providerID]; replacing {
+			compiled, err := compileLegacyProviderRoutes(providers[providerID], models)
 			if err != nil {
 				return err
 			}
-			next.legacyByProvider[providerID] = compiled
-			for _, replacement := range compiled {
-				if err := addRouteToSnapshot(next, replacement); err != nil {
-					return err
-				}
-				next.legacyOrder = append(next.legacyOrder, replacement)
+			routes = compiled
+		} else {
+			currentRoutes, exists := current.legacyByProvider[providerID]
+			if !exists {
+				return nil
 			}
-			seenProviders[providerID] = struct{}{}
-			continue
+			routes = append([]*modelRoute(nil), currentRoutes...)
 		}
-		if _, emitted := seenProviders[providerID]; !emitted {
-			next.legacyByProvider[providerID] = append([]*modelRoute(nil), current.legacyByProvider[providerID]...)
-			seenProviders[providerID] = struct{}{}
-		}
-		if err := addRouteToSnapshot(next, route); err != nil {
-			return err
-		}
-		next.legacyOrder = append(next.legacyOrder, route)
-	}
-	for providerID, models := range replacements {
-		if _, emitted := seenProviders[providerID]; emitted {
-			continue
-		}
-		compiled, err := compileLegacyProviderRoutes(providers[providerID], models)
-		if err != nil {
-			return err
-		}
-		next.legacyByProvider[providerID] = compiled
-		for _, route := range compiled {
+
+		for _, route := range routes {
 			if err := addRouteToSnapshot(next, route); err != nil {
 				return err
 			}
 			next.legacyOrder = append(next.legacyOrder, route)
 		}
+		next.legacyByProvider[providerID] = routes
+		seenProviders[providerID] = struct{}{}
+		return nil
 	}
+
+	// Rebuild configured providers in their original order. This matches normal
+	// startup and preserves version-1's historical first-alias winner when a
+	// deferred catalog introduces normalized Messages aliases. Strict version-2
+	// snapshots still reject the same collision before this snapshot is stored.
+	for _, providerID := range providerOrder {
+		if err := emitProvider(providerID); err != nil {
+			return err
+		}
+	}
+
+	// Preserve the established order of unchanged providers that are not present
+	// in providerOrder. Replaced providers wait for the sorted fallback below.
+	for _, route := range current.legacyOrder {
+		if route == nil || len(route.targets) == 0 || route.targets[0].provider == nil {
+			continue
+		}
+		providerID := route.targets[0].provider.id
+		if _, replacing := replacements[providerID]; replacing {
+			continue
+		}
+		if err := emitProvider(providerID); err != nil {
+			return err
+		}
+	}
+
+	remainingReplacementIDs := make([]string, 0, len(replacements))
+	for providerID := range replacements {
+		if _, emitted := seenProviders[providerID]; !emitted {
+			remainingReplacementIDs = append(remainingReplacementIDs, providerID)
+		}
+	}
+	sort.Strings(remainingReplacementIDs)
+	for _, providerID := range remainingReplacementIDs {
+		if err := emitProvider(providerID); err != nil {
+			return err
+		}
+	}
+
+	// Empty legacy-provider entries do not appear in legacyOrder. Retain any
+	// remaining unchanged entries deterministically so later refreshes keep the
+	// same registry shape.
+	remainingCurrentProviderIDs := make([]string, 0, len(current.legacyByProvider))
+	for providerID := range current.legacyByProvider {
+		if _, emitted := seenProviders[providerID]; !emitted {
+			remainingCurrentProviderIDs = append(remainingCurrentProviderIDs, providerID)
+		}
+	}
+	sort.Strings(remainingCurrentProviderIDs)
+	for _, providerID := range remainingCurrentProviderIDs {
+		if err := emitProvider(providerID); err != nil {
+			return err
+		}
+	}
+
 	r.snapshot.Store(next)
 	return nil
 }

@@ -519,7 +519,7 @@ func (ps *providerSetup) replaceProviderModelsBatch(replacements map[string][]pr
 		}
 		ps.routes = routes
 	}
-	if err := ps.routes.replaceLegacyProviders(ps.providers, filtered); err != nil {
+	if err := ps.routes.replaceLegacyProviders(ps.providers, ps.providerOrder, filtered); err != nil {
 		return err
 	}
 	ps.models = next
