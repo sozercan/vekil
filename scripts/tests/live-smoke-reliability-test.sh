@@ -240,6 +240,9 @@ case "\${mode}" in
     printf '|'
     jq -cn --arg output "\$(cat right.txt)" '{output: \$output}'
     ;;
+  json-wrapped-whole)
+    jq -cn --arg output "\$(cat left.txt)|\$(cat right.txt)" '{output: \$output}'
+    ;;
   exit42)
     exit 42
     ;;
@@ -713,7 +716,8 @@ expect_hard_failure_with_stderr "hanging chat canary is hard via raw Zen smoke" 
     LIVE_ZEN_SMOKE_DIR="${hanging_chat_dir}/raw-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
     SMOKE_CURL_MAX_TIME_SECONDS=1 "${REPO_ROOT}/scripts/live-zen-smoke.sh"
 
-run_zen_case_expect_success "Gemini strict JSON wrappers normalize to exact text" pass pass json-wrapped
+run_zen_case_expect_success "Gemini strict JSON wrapper around complete result normalizes to exact text" pass pass json-wrapped-whole
+run_zen_case_expect_success "Gemini strict JSON wrapper sequence normalizes to exact text" pass pass json-wrapped
 
 run_zen_case_expect_failure "canary 200 plus CLI exit 42" 200 exit42 exit42 exit42
 run_zen_case_expect_failure "canary 404 is a hard failure" 404 pass pass pass

@@ -377,6 +377,19 @@ read_gemini_normalized_output() {
   local raw part value normalized="" separator=""
   local parts=()
   raw="$(read_normalized_output "$1")"
+
+  # Prefer one strict wrapper around the complete result; its output string may
+  # legitimately contain the pipe separator used by the smoke fixture.
+  if value="$(jq -er '
+    if type == "object" and keys == ["output"] and (.output | type == "string")
+    then .output
+    else error("not a strict Gemini output wrapper")
+    end
+  ' <<< "${raw}" 2>/dev/null)"; then
+    printf '%s' "${value}"
+    return
+  fi
+
   IFS='|' read -r -a parts <<< "${raw}"
   [[ "${#parts[@]}" -gt 0 ]] || { printf '%s' "${raw}"; return; }
 
