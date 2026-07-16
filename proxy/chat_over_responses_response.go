@@ -86,6 +86,9 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 			}
 			switch strings.TrimSpace(header.Type) {
 			case "reasoning":
+				if err := validateResponsesChatReasoningStatus(envelope.Status, header.Status); err != nil {
+					return responsesChatJSONResult{}, err
+				}
 				// Hidden from Chat. Exact bytes are retained only when a later
 				// function-call group is published for replay.
 			case "message":
@@ -208,6 +211,37 @@ func validateResponsesChatMessageStatus(responseStatus, messageStatus string) er
 			return newChatServerError(
 				"unsupported_responses_output",
 				fmt.Sprintf("assistant message status %q is incompatible with Responses status %q", messageStatus, responseStatus),
+			)
+		}
+	}
+	return nil
+}
+
+func validateResponsesChatReasoningStatus(responseStatus, reasoningStatus string) error {
+	responseStatus = strings.TrimSpace(responseStatus)
+	reasoningStatus = strings.TrimSpace(reasoningStatus)
+	if reasoningStatus == "" {
+		return nil
+	}
+	if reasoningStatus != "completed" && reasoningStatus != "incomplete" && reasoningStatus != "in_progress" {
+		return newChatServerError(
+			"unsupported_responses_output",
+			fmt.Sprintf("reasoning item status %q is not supported", reasoningStatus),
+		)
+	}
+	switch responseStatus {
+	case "completed":
+		if reasoningStatus != "completed" {
+			return newChatServerError(
+				"unsupported_responses_output",
+				fmt.Sprintf("reasoning item status %q is incompatible with Responses status %q", reasoningStatus, responseStatus),
+			)
+		}
+	case "incomplete":
+		if reasoningStatus == "in_progress" {
+			return newChatServerError(
+				"unsupported_responses_output",
+				fmt.Sprintf("reasoning item status %q is incompatible with terminal Responses status %q", reasoningStatus, responseStatus),
 			)
 		}
 	}

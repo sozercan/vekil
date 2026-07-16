@@ -196,3 +196,218 @@ func mustHandleResponsesChatStatusTransition(
 		t.Fatalf("stream transition error = %v", err)
 	}
 }
+
+func TestResponsesChatStreamValidatesTerminalReasoningStatus(t *testing.T) {
+	tests := []struct {
+		name                    string
+		responseStatus          string
+		outputItemDoneStatus    string
+		terminalReasoningStatus string
+		wantFinish              string
+		wantError               bool
+	}{
+		{name: "completed response with completed reasoning", responseStatus: "completed", outputItemDoneStatus: "completed", terminalReasoningStatus: "completed", wantFinish: "stop"},
+		{name: "incomplete response with incomplete reasoning", responseStatus: "incomplete", outputItemDoneStatus: "incomplete", terminalReasoningStatus: "incomplete", wantFinish: "length"},
+		{name: "completed response accepts omitted reasoning status", responseStatus: "completed", outputItemDoneStatus: "", terminalReasoningStatus: "", wantFinish: "stop"},
+		{name: "incomplete response accepts omitted reasoning status", responseStatus: "incomplete", outputItemDoneStatus: "", terminalReasoningStatus: "", wantFinish: "length"},
+		{name: "completed response rejects in progress reasoning", responseStatus: "completed", outputItemDoneStatus: "in_progress", terminalReasoningStatus: "in_progress", wantError: true},
+		{name: "completed response rejects incomplete reasoning", responseStatus: "completed", outputItemDoneStatus: "incomplete", terminalReasoningStatus: "incomplete", wantError: true},
+		{name: "incomplete response accepts completed reasoning", responseStatus: "incomplete", outputItemDoneStatus: "completed", terminalReasoningStatus: "completed", wantFinish: "length"},
+		{name: "incomplete response rejects in progress reasoning", responseStatus: "incomplete", outputItemDoneStatus: "in_progress", terminalReasoningStatus: "in_progress", wantError: true},
+		{name: "terminal reasoning may omit status when done status is completed", responseStatus: "completed", outputItemDoneStatus: "completed", terminalReasoningStatus: "", wantFinish: "stop"},
+		{name: "done reasoning may omit status when terminal status is completed", responseStatus: "completed", outputItemDoneStatus: "", terminalReasoningStatus: "completed", wantFinish: "stop"},
+		{name: "terminal reasoning must match output item done", responseStatus: "completed", outputItemDoneStatus: "in_progress", terminalReasoningStatus: "completed", wantError: true},
+		{name: "unknown reasoning status is rejected", responseStatus: "completed", outputItemDoneStatus: "mystery", terminalReasoningStatus: "mystery", wantError: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := newResponsesChatStreamState(responsesChatStreamConfig{PublicModel: "gpt-public", Now: time.Now})
+			mustHandleResponsesChatStatusTransition(t, state.handleCreated, map[string]any{
+				"type": "response.created",
+				"response": map[string]any{
+					"id":         "resp-stream-reasoning-status",
+					"created_at": int64(1_700_000_000),
+					"status":     "in_progress",
+				},
+			})
+			mustHandleResponsesChatStatusTransition(t, state.handleOutputItemAdded, map[string]any{
+				"type":         "response.output_item.added",
+				"output_index": 0,
+				"item": map[string]any{
+					"type":   "reasoning",
+					"id":     "rs-stream-reasoning-status-added",
+					"status": "in_progress",
+				},
+			})
+			mustHandleResponsesChatStatusTransition(t, state.handleOutputItemDone, map[string]any{
+				"type":         "response.output_item.done",
+				"output_index": 0,
+				"item": map[string]any{
+					"type":              "reasoning",
+					"id":                "rs-stream-reasoning-status-done",
+					"status":            tt.outputItemDoneStatus,
+					"encrypted_content": "synthetic-encrypted-content",
+					"summary":           []any{},
+				},
+			})
+
+			terminal := map[string]any{
+				"type": "response." + tt.responseStatus,
+				"response": map[string]any{
+					"id":     "resp-stream-reasoning-status",
+					"status": tt.responseStatus,
+					"output": []any{map[string]any{
+						"type":              "reasoning",
+						"id":                "rs-stream-reasoning-status-terminal",
+						"status":            tt.terminalReasoningStatus,
+						"encrypted_content": "synthetic-encrypted-content",
+						"summary":           []any{},
+					}},
+					"usage": map[string]any{"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+				},
+			}
+			if tt.responseStatus == "incomplete" {
+				terminal["response"].(map[string]any)["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+			}
+			data, err := json.Marshal(terminal)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var transition responsesChatStreamTransition
+			if tt.responseStatus == "completed" {
+				transition, err = state.handleCompleted(data)
+			} else {
+				transition, err = state.handleIncomplete(data)
+			}
+			if tt.wantError {
+				var executionErr *chatExecutionError
+				if !errors.As(err, &executionErr) || executionErr.Code != "unsupported_responses_output" {
+					t.Fatalf("error = %#v, want unsupported_responses_output", err)
+				}
+				if executionErr.Usage == nil || executionErr.Usage.TotalTokens != 10 {
+					t.Fatalf("error usage = %#v", executionErr.Usage)
+				}
+				if len(transition.chunks) != 1 || transition.chunks[0].Usage == nil || transition.chunks[0].Usage.TotalTokens != 10 {
+					t.Fatalf("transition = %#v", transition)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("terminal transition error = %v", err)
+			}
+			if !transition.terminal || len(transition.chunks) != 2 {
+				t.Fatalf("transition = %#v", transition)
+			}
+			finish := transition.chunks[0].Choices[0].FinishReason
+			if finish == nil || *finish != tt.wantFinish {
+				t.Fatalf("finish reason = %#v, want %q", finish, tt.wantFinish)
+			}
+		})
+	}
+}
+
+func TestResponsesChatStreamInvalidReasoningStatusDoesNotPublishReplay(t *testing.T) {
+	store := newResponsesChatReplayStore()
+	t.Cleanup(func() { _ = store.Close() })
+	state := newResponsesChatStreamState(responsesChatStreamConfig{
+		PublicModel: "gpt-public",
+		ReplayStore: store,
+		ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
+		Now:         time.Now,
+	})
+	mustHandleResponsesChatStatusTransition(t, state.handleCreated, map[string]any{
+		"type": "response.created",
+		"response": map[string]any{
+			"id":         "resp-stream-invalid-reasoning-replay",
+			"created_at": int64(1_700_000_000),
+			"status":     "in_progress",
+		},
+	})
+	mustHandleResponsesChatStatusTransition(t, state.handleOutputItemAdded, map[string]any{
+		"type":         "response.output_item.added",
+		"output_index": 0,
+		"item": map[string]any{
+			"type":      "function_call",
+			"id":        "fc-stream-invalid-reasoning-replay",
+			"call_id":   "call-stream-invalid-reasoning-replay",
+			"name":      "lookup",
+			"arguments": "",
+			"status":    "in_progress",
+		},
+	})
+	mustHandleResponsesChatStatusTransition(t, state.handleFunctionArgumentsDone, map[string]any{
+		"type":         "response.function_call_arguments.done",
+		"item_id":      "fc-stream-invalid-reasoning-replay",
+		"output_index": 0,
+		"arguments":    `{}`,
+	})
+	mustHandleResponsesChatStatusTransition(t, state.handleOutputItemDone, map[string]any{
+		"type":         "response.output_item.done",
+		"output_index": 0,
+		"item": map[string]any{
+			"type":      "function_call",
+			"id":        "fc-stream-invalid-reasoning-replay",
+			"call_id":   "call-stream-invalid-reasoning-replay",
+			"name":      "lookup",
+			"arguments": `{}`,
+			"status":    "completed",
+		},
+	})
+	mustHandleResponsesChatStatusTransition(t, state.handleOutputItemAdded, map[string]any{
+		"type":         "response.output_item.added",
+		"output_index": 1,
+		"item": map[string]any{
+			"type":   "reasoning",
+			"id":     "rs-stream-invalid-reasoning-replay",
+			"status": "in_progress",
+		},
+	})
+	mustHandleResponsesChatStatusTransition(t, state.handleOutputItemDone, map[string]any{
+		"type":         "response.output_item.done",
+		"output_index": 1,
+		"item": map[string]any{
+			"type":              "reasoning",
+			"id":                "rs-stream-invalid-reasoning-replay",
+			"status":            "in_progress",
+			"encrypted_content": "synthetic-encrypted-content",
+			"summary":           []any{},
+		},
+	})
+	terminal, err := json.Marshal(map[string]any{
+		"type": "response.completed",
+		"response": map[string]any{
+			"id":     "resp-stream-invalid-reasoning-replay",
+			"status": "completed",
+			"output": []any{
+				map[string]any{
+					"type":      "function_call",
+					"id":        "fc-stream-invalid-reasoning-replay-terminal",
+					"call_id":   "call-stream-invalid-reasoning-replay",
+					"name":      "lookup",
+					"arguments": `{}`,
+					"status":    "completed",
+				},
+				map[string]any{
+					"type":              "reasoning",
+					"id":                "rs-stream-invalid-reasoning-replay-terminal",
+					"status":            "in_progress",
+					"encrypted_content": "synthetic-encrypted-content",
+					"summary":           []any{},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = state.handleCompleted(terminal)
+	var executionErr *chatExecutionError
+	if !errors.As(err, &executionErr) || executionErr.Code != "unsupported_responses_output" {
+		t.Fatalf("error = %#v, want unsupported_responses_output", err)
+	}
+	if stats := store.Stats(); stats.Groups != 0 || stats.Calls != 0 || stats.TotalBytes != 0 {
+		t.Fatalf("replay state was published before reasoning validation: %#v", stats)
+	}
+}

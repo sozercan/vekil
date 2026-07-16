@@ -355,33 +355,35 @@ type responsesChatStreamState struct {
 	model   string
 	locked  bool
 
-	hasSequence         bool
-	sequence            int64
-	createdSeen         bool
-	progressSeen        bool
-	terminalSeen        bool
-	messagesByIndex     map[int]*responsesChatMessageState
-	itemsByIndex        map[int]string
-	doneByIndex         map[int]bool
-	tools               []*responsesChatToolState
-	toolsByIndex        map[int]*responsesChatToolState
-	replayBytes         int
-	hasIncompleteTool   bool
-	contentParts        int
-	visibleBytes        int
-	visibleBytesCharged bool
+	hasSequence            bool
+	sequence               int64
+	createdSeen            bool
+	progressSeen           bool
+	terminalSeen           bool
+	messagesByIndex        map[int]*responsesChatMessageState
+	itemsByIndex           map[int]string
+	doneByIndex            map[int]bool
+	reasoningStatusByIndex map[int]string
+	tools                  []*responsesChatToolState
+	toolsByIndex           map[int]*responsesChatToolState
+	replayBytes            int
+	hasIncompleteTool      bool
+	contentParts           int
+	visibleBytes           int
+	visibleBytesCharged    bool
 }
 
 func newResponsesChatStreamState(config responsesChatStreamConfig) *responsesChatStreamState {
 	return &responsesChatStreamState{
-		config:          config,
-		chatID:          responsesChatCompletionID(""),
-		created:         config.Now().Unix(),
-		model:           strings.TrimSpace(config.PublicModel),
-		messagesByIndex: make(map[int]*responsesChatMessageState),
-		itemsByIndex:    make(map[int]string),
-		doneByIndex:     make(map[int]bool),
-		toolsByIndex:    make(map[int]*responsesChatToolState),
+		config:                 config,
+		chatID:                 responsesChatCompletionID(""),
+		created:                config.Now().Unix(),
+		model:                  strings.TrimSpace(config.PublicModel),
+		messagesByIndex:        make(map[int]*responsesChatMessageState),
+		itemsByIndex:           make(map[int]string),
+		doneByIndex:            make(map[int]bool),
+		reasoningStatusByIndex: make(map[int]string),
+		toolsByIndex:           make(map[int]*responsesChatToolState),
 	}
 }
 
@@ -929,8 +931,9 @@ func (s *responsesChatStreamState) handleOutputItemDone(data []byte) (responsesC
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "completed output item is malformed")
 	}
 	var header struct {
-		Type string `json:"type"`
-		ID   string `json:"id"`
+		Type   string `json:"type"`
+		ID     string `json:"id"`
+		Status string `json:"status"`
 	}
 	if err := json.Unmarshal(event.Item, &header); err != nil || header.ID == "" || s.itemsByIndex[*event.OutputIndex] != header.Type || s.doneByIndex[*event.OutputIndex] {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "completed output item correlation is invalid")
@@ -976,7 +979,9 @@ func (s *responsesChatStreamState) handleOutputItemDone(data []byte) (responsesC
 		}
 		tool.done = true
 	case "reasoning":
-		// Hidden, but completion is still required before the terminal output.
+		// Hidden, but completion and terminal-status correlation are still
+		// required before replay state can be published.
+		s.reasoningStatusByIndex[*event.OutputIndex] = strings.TrimSpace(header.Status)
 	default:
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", fmt.Sprintf("Responses output item type %q is not supported", header.Type))
 	}
@@ -1031,8 +1036,9 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 	publishCalls := make([]responsesChatReplayPublishCall, 0, len(s.tools))
 	for outputIndex, raw := range event.Response.Output {
 		var header struct {
-			Type string `json:"type"`
-			ID   string `json:"id"`
+			Type   string `json:"type"`
+			ID     string `json:"id"`
+			Status string `json:"status"`
 		}
 		if err := json.Unmarshal(raw, &header); err != nil || s.itemsByIndex[outputIndex] != header.Type {
 			return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "terminal output does not match streamed item order")
@@ -1087,6 +1093,21 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 				UpstreamCallID: call.CallID, Name: call.Name, VisibleArguments: call.Arguments, OutputItemIndex: outputIndex,
 			})
 		case "reasoning":
+			terminalItemStatus := strings.TrimSpace(header.Status)
+			doneStatus, ok := s.reasoningStatusByIndex[outputIndex]
+			if !ok {
+				return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "terminal reasoning item has no response.output_item.done state")
+			}
+			if doneStatus != "" && terminalItemStatus != "" && terminalItemStatus != doneStatus {
+				return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "terminal reasoning status does not match response.output_item.done")
+			}
+			effectiveStatus := terminalItemStatus
+			if effectiveStatus == "" {
+				effectiveStatus = doneStatus
+			}
+			if err := validateResponsesChatReasoningStatus(terminalStatus, effectiveStatus); err != nil {
+				return responsesChatStreamTransition{}, err
+			}
 		default:
 			return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", fmt.Sprintf("Responses output item type %q is not supported", header.Type))
 		}
