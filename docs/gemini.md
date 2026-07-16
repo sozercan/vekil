@@ -1,12 +1,12 @@
 # Gemini Compatibility
 
-Gemini endpoints are implemented as a translation layer, not zero-copy passthrough. Requests are translated to OpenAI Chat Completions, routed through the route that owns the selected public model, and translated back into Gemini responses.
+Gemini endpoints are implemented as a translation layer, not zero-copy passthrough. Requests are translated to canonical OpenAI Chat Completions, resolved through the route that owns the selected public model, executed through native `/chat/completions` or native `/responses`, and translated back into Gemini responses. Native Chat is preferred when both native endpoints are available.
 
 ## Model routes and failover
 
-For a schema-version-2 explicit route, Gemini `generateContent`, `streamGenerateContent`, and `countTokens` use the route's canonical `/chat/completions` operation. Translation and opt-in tool optimization run once on an immutable logical request; target-specific model rewrite, URL construction, wire policy, and authentication are applied only after a target is selected. Gemini routing and catalog identity remain the requested public ID; Vekil does not add a physical deployment name to the Gemini response payload.
+For a schema-version-2 explicit route, Gemini `generateContent`, `streamGenerateContent`, and `countTokens` submit one canonical Chat operation. Translation and opt-in tool optimization run once on an immutable logical request; backend selection, target-specific model rewrite, URL construction, wire policy, and authentication stay behind the Chat execution and route-executor seams. Gemini routing and catalog identity remain the requested public ID; Vekil does not expose a physical deployment name in the Gemini response payload.
 
-`primary_only` uses the first configured target. `priority_failover` can select the next equivalent target only before request delivery/progress is ambiguous and before any Gemini response is committed. For the canonical Chat operation, safe candidates are limited to prewrite transport failures and adapter-certified `429` or overload/unavailable rejections before semantic progress. It is not cross-model fallback, and one route cannot mix a native-Anthropic target with an OpenAI-translated target.
+`primary_only` uses the first configured target. `priority_failover` can select the next equivalent target only before request delivery or semantic progress is ambiguous and before any Gemini response is committed. Native Chat attempts can switch after prewrite transport failures or adapter-certified `429`/overload rejections. Responses-backed attempts may also switch after an adapter-certified pre-output terminal admission failure that proves no semantic or tool execution occurred. This is not cross-model fallback, and one route cannot mix a native-Anthropic target with an OpenAI-translated target.
 
 Commitment rules are surface-specific:
 
@@ -15,7 +15,19 @@ Commitment rules are surface-specific:
 - `streamGenerateContent` holds only a nonsemantic upstream prefix, bounded by `750 ms` and `64 KiB`, before committing Gemini SSE headers/frames. An adapter-certified admission failure inside that window may use the next target. Text, reasoning, tool activity, usage/accounting output, unknown/malformed events, either precommit bound, or a client write permanently disables target failover. Postcommit failures remain Gemini error frames on the already-committed HTTP `200`.
 - Each dispatched upstream `countTokens` probe is subject to the explicit route's target/send limits. A cache hit or dependency-free local estimate does not create an upstream attempt.
 
-The running binary validates supported provider/surface/mode combinations at configuration time. Unsupported explicit-route combinations are rejected rather than silently downgraded. See [Provider Routing](provider-routing.md#supported-route-surfaces) for the current matrix and [Architecture](architecture.md#attempt-execution-and-replay-safety) for the shared safety gate.
+The running binary validates supported provider/native-endpoint/surface/mode combinations at configuration time. Unsupported explicit-route combinations are rejected rather than silently downgraded. See [Provider Routing](provider-routing.md#supported-route-surfaces) for the current matrix and [Architecture](architecture.md#attempt-execution-and-replay-safety) for the shared safety gate.
+
+## Responses-native model restrictions
+
+The Gemini decoder and translation rules below run first. If the selected model is Responses-native, the resulting Chat request must also fit the strict [Responses-backed Chat subset](api.md#responses-backed-chat-request-subset). Notable Gemini consequences are:
+
+- text, supported image `inlineData`, function declarations/calls/responses, `temperature`, `topP`, `maxOutputTokens`, structured text output, and function-calling modes map through the adapter;
+- non-empty `generationConfig.stopSequences` is rejected because Vekil does not implement local stop matching;
+- `generationConfig.presencePenalty`, `frequencyPenalty`, and `seed` are rejected on this route;
+- only function tools are supported; Gemini built-in/hosted tools remain unsupported; and
+- unknown or unsupported translated fields fail explicitly rather than being dropped.
+
+These extra restrictions do not apply to a model served through native Chat. Native endpoint metadata also remains unchanged: a model can report only `/responses` in `/v1/models` while serving these Gemini compatibility routes through translation.
 
 ## `POST /v1beta/models/{model}:generateContent`, `POST /v1/models/{model}:generateContent`, and `POST /models/{model}:generateContent` (Gemini)
 
@@ -79,7 +91,7 @@ Use `curl -N` or another SSE-capable client so streamed frames are not buffered 
 
 ## `POST /v1beta/models/{model}:countTokens`, `POST /v1/models/{model}:countTokens`, and `POST /models/{model}:countTokens` (Gemini)
 
-`countTokens` uses the same accepted route prefixes, omitted-role default, and content validation as the other Gemini compatibility routes. It normalizes the Gemini request into the same prompt/tool payload used by `generateContent`, performs a minimal upstream `/chat/completions` probe, and returns `usage.prompt_tokens` as Gemini `totalTokens`. Normalized successful requests are cached for 60 seconds; expired entries are pruned globally and the cache is capped at 1,024 request hashes with deterministic oldest-entry eviction. If the probe hits a transient transport error, 429, 5xx, or a 200 response with missing usage, the proxy returns a dependency-free local token estimate instead of failing the counting request. It still surfaces permanent client/configuration failures such as 400, 401, and 403 without estimating.
+`countTokens` uses the same accepted route prefixes, omitted-role default, and content validation as the other Gemini compatibility routes. It normalizes the Gemini request into the same canonical Chat prompt/tool payload used by `generateContent`, performs a minimal non-streaming probe through the selected native backend (`/chat/completions` or `/responses`), and returns `usage.prompt_tokens` as Gemini `totalTokens`. Native Chat uses a one-output-token probe; Responses-backed counting uses the upstream minimum of 16 output tokens, strips probe-only sampling controls, consumes usage only, and never publishes replay state from the discarded completion. Normalized successful requests are cached for 60 seconds; expired entries are pruned globally and the cache is capped at 1,024 request hashes with deterministic oldest-entry eviction. If the probe hits a transient transport error, 429, 5xx, or a 200 response with missing usage, the proxy returns a dependency-free local token estimate instead of failing the counting request. It still surfaces permanent client/configuration failures such as 400, 401, and 403 without estimating.
 
 ### Function calling modes
 

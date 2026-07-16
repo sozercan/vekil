@@ -2,6 +2,18 @@
 
 These examples all target the same local proxy. Replace model IDs with public IDs from `/v1/models` in your deployment; client setup does not need to change when a model is backed by GitHub Copilot, Azure OpenAI, OpenAI Codex, or a generic compatible provider.
 
+## Responses-native models on Chat-compatible clients
+
+A model whose native catalog endpoint is only `/responses` can still serve OpenAI Chat Completions, Claude Code through Anthropic Messages, and Gemini-compatible generation through Vekil's Chat-over-Responses adapter. Native Chat is preferred when a model supports both. The model catalog intentionally remains native, so a Responses-backed model can continue to show only `/responses` in `supported_endpoints`; this does not mean the documented Vekil compatibility routes are unavailable.
+
+The adapter is strict. It supports the mapped Chat field subset in [API Reference](api.md#responses-backed-chat-request-subset), rejects unknown fields instead of dropping them, does not emulate non-empty stop sequences, and accepts only function tools. Hosted tools such as web search, computer use, code execution, and image generation are not supported through Chat compatibility. Direct `/v1/responses` clients remain on the native path.
+
+Tool continuations returned by a Responses-native model can expose IDs such as `call_vekil_<22-character-base64url>` (including Anthropic `tool_use.id` or Gemini `functionCall.id`). Treat them as opaque and return them unchanged. Preserve the complete assistant tool-call list in its original order; tool-result messages for a complete parallel group may be returned in any order. When only a non-empty subset of results is available, Vekil replays only the matching calls because the verified upstream rejected a complete call group paired with partial outputs; missing calls may be reissued.
+
+Replay state is byte-bounded, process-local, and expires one hour after the tool-call response. It is lost on restart. If a continuation receives `responses_replay_state_missing`, restart that assistant tool-call turn rather than inventing or editing the call ID.
+
+Claude Code and Gemini `countTokens` calls also use the selected model's native backend. Anthropic counting requires reported upstream usage; Gemini counting retains its existing cache and can use a local estimate for transient failures or missing usage.
+
 ## Claude Code
 
 ```bash

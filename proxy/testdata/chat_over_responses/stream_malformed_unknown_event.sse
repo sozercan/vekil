@@ -1,0 +1,8 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_synth_unknown_stream_001","object":"response","created_at":1700000000,"status":"in_progress","error":null,"incomplete_details":null,"model":"gpt-synthetic-responses","output":[],"parallel_tool_calls":true,"usage":null,"metadata":{"fixture":"stream-malformed-unknown-event"}}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_synth_unknown_stream_001","object":"response","created_at":1700000000,"status":"in_progress","error":null,"incomplete_details":null,"model":"gpt-synthetic-responses","output":[],"parallel_tool_calls":true,"usage":null,"metadata":{"fixture":"stream-malformed-unknown-event"}}}
+
+event: response.synthetic_unknown_delta
+data: {"type":"response.synthetic_unknown_delta","sequence_number":2,"payload":{"note":"Intentionally unsupported synthetic fixture event."}}

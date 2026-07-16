@@ -34,6 +34,7 @@ type StreamOptions struct {
 type OpenAIMessage struct {
 	Role       string           `json:"role"`
 	Content    json.RawMessage  `json:"content,omitempty"`
+	Refusal    json.RawMessage  `json:"refusal,omitempty"`
 	Name       string           `json:"name,omitempty"`
 	ToolCalls  []OpenAIToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`

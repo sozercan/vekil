@@ -120,7 +120,7 @@ The two targets must implement the same public contract. If endpoint support, re
 
 ### Route schema and validation
 
-Required route fields are `id`, `public_id`, an explicit nonempty `endpoints` allowlist, and at least one target. Each target requires a route-local `id`, `provider`, and `upstream_model`. Provider, route, and target operational IDs in schema version 2 are limited to 128 bytes and restricted to bounded ASCII identifier characters. The initial implementation accepts at most 256 routes, 32 targets per route, and 1,024 explicit targets total.
+Required route fields are `id`, `public_id`, an explicit nonempty `endpoints` allowlist of verified native upstream operations, and at least one target. Each target requires a route-local `id`, `provider`, and `upstream_model`. Provider, route, and target operational IDs in schema version 2 are limited to 128 bytes and restricted to bounded ASCII identifier characters. The initial implementation accepts at most 256 routes, 32 targets per route, and 1,024 explicit targets total.
 
 Public IDs are globally unique across explicit routes, static provider models, and dynamically discovered models, including supported normalized aliases. A public ID cannot be declared in both `providers[].models[]` and `model_routes[]`. Explicit routes reserve their IDs against later discovery; a dynamic refresh collision rejects that whole refresh and retains the last-known-good registry. Duplicate route IDs, target IDs, endpoints, or reasoning efforts are errors rather than silently deduplicated values. Route-only static Azure or generic providers may omit `models`; unreferenced static providers still need their normal model declarations. Dynamic providers keep their existing omission and discovery rules.
 
@@ -128,7 +128,7 @@ Catalog metadata belongs to the route, not to whichever target answered last. Ex
 
 Request-policy fields are intentionally narrow. Route-level `drop_sampling_params` applies uniformly to every target. Target-level `use_max_completion_tokens` is available only as a semantics-preserving Chat Completions wire rewrite (`max_tokens` to `max_completion_tokens`). Do not use per-target fields to create different public behavior inside one route.
 
-The binary validates a compiled provider/surface/mode feature matrix. A provider kind, canonical endpoint, public translation surface, or routing mode that the running binary does not implement is rejected during validation rather than accepted with degraded behavior. Canonical route endpoints remain `/responses`, `/chat/completions`, and `/v1/messages`; Anthropic and Gemini public routes map to the canonical operation after translation. See [Supported route surfaces](#supported-route-surfaces) below.
+The binary validates a compiled provider/native-endpoint/surface/mode feature matrix. A provider kind, native endpoint, public translation surface, or routing mode that the running binary does not implement is rejected during validation rather than accepted with degraded behavior. Native route endpoints remain `/responses`, `/chat/completions`, and `/v1/messages`. OpenAI Chat plus translated Anthropic and Gemini requests enter canonical Chat execution, which prefers a route's `/chat/completions` endpoint and otherwise uses `/responses`; direct `anthropic-compatible` Messages uses `/v1/messages`. See [Supported route surfaces](#supported-route-surfaces) below.
 
 Validate a file without serving or modifying it:
 
@@ -172,13 +172,13 @@ When several attempts fail, error selection is deterministic: ambiguous delivery
 
 The current explicit-target matrix is intentionally static:
 
-| Canonical route endpoint | Allowed explicit target providers | Public surfaces using the operation | `priority_failover` boundary |
+| Native route endpoint | Allowed explicit target providers | Public surfaces using the operation | `priority_failover` boundary |
 |--------------------------|-----------------------------------|-------------------------------------|------------------------------|
-| `/responses` | `azure-openai`; static `openai-compatible` | `POST /v1/responses`; route-aware compact/memory/replay helpers; optional proxy-owned `GET /v1/responses` websocket bridge | Prewrite or adapter-certified pre-execution rejection; streaming may also switch after a held Responses preamble and certified non-executing terminal admission failure |
-| `/chat/completions` | `azure-openai`; static `openai-compatible` | OpenAI Chat Completions; translated Anthropic Messages; Gemini `generateContent` / `streamGenerateContent`; token-count probes that use Chat | Prewrite or adapter-certified `429`/overload rejection; client streams can switch only while the held prefix is nonsemantic, and forced-stream aggregation only before text/reasoning/tool progress |
+| `/responses` | `azure-openai`; static `openai-compatible` | Direct `POST /v1/responses`; route-aware compact/memory/replay helpers; optional proxy-owned `GET /v1/responses` websocket bridge; OpenAI Chat, translated Anthropic/Gemini, token probes, and dashboard insights through Chat-over-Responses when the request subset permits | Prewrite or adapter-certified pre-execution rejection; direct Responses and Responses-backed Chat streams may also switch after a held Responses preamble and a certified non-executing terminal admission failure, but never after semantic/tool progress or downstream commitment |
+| `/chat/completions` | `azure-openai`; static `openai-compatible` | OpenAI Chat Completions; translated Anthropic Messages; Gemini `generateContent` / `streamGenerateContent`; Chat-based token probes and dashboard insights | Prewrite or adapter-certified `429`/overload rejection; client streams can switch only while the held prefix is nonsemantic, and forced-stream aggregation only before text/reasoning/tool progress |
 | `/v1/messages` | static `anthropic-compatible` | Direct native Anthropic Messages | Prewrite or adapter-certified `429`/overload rejection while only a nonsemantic Anthropic preamble is held; no mixing with OpenAI-translated targets |
 
-Native Anthropic `POST /v1/messages/count_tokens` is a bounded compatibility operation in the selected public route. In `priority_failover` mode it may switch targets only under the same replay-safe, precommit, adapter-certified rejection rules and shared target/send budgets as other route operations; protocol-recovery child sends remain pinned to their selected target. Chat-based Anthropic/Gemini token probes continue to use the canonical `/chat/completions` route.
+Native Anthropic `POST /v1/messages/count_tokens` is a bounded compatibility operation in the selected public route. In `priority_failover` mode it may switch targets only under the same replay-safe, precommit, adapter-certified rejection rules and shared target/send budgets as other route operations; protocol-recovery child sends remain pinned to their selected target. Chat-based Anthropic/Gemini token probes use canonical Chat execution and therefore the native `/chat/completions` or `/responses` endpoint selected from the route allowlist.
 
 For explicit client streams, Vekil bounds precommit inspection with the existing `750 ms` timeout and `64 KiB` prefix limit. Reaching either bound commits the current target and forwards the buffered prefix; unknown/malformed events, semantic output, tool activity, usage/accounting frames, or a client write also prohibit switching.
 
@@ -201,6 +201,19 @@ Schema version 2 deliberately does not include active-active/weighted routing, a
 A conservative rollout is: validate the version-2 file, run a one-target route in `primary_only`, add the secondary while still `primary_only`, verify catalog identity and attempt metrics, then enable `priority_failover` with explicit budgets for one canary route. Inject only replay-safe failures such as a primary `429` or prewrite dial failure when testing the switch.
 
 To stop automatic switching, restore `mode: primary_only` and restart the same schema-version-2 binary. That changes availability behavior immediately while preserving exact state interpretation. Do **not** restore a version-1 file or downgrade to an older binary while state issued by a secondary may still be presented. First fence new stateful continuations, drain WebSocket sessions, wait at least the 24-hour binding TTL plus any longer provider replay window, and perform an atomic no-mixed-version cutover. If that fence cannot be guaranteed, keep the version-2 binary in `primary_only`. There is no automatic configuration migration in either direction.
+
+### Native endpoints and Chat compatibility
+
+For canonical Chat requests, Vekil first prefers native `/chat/completions` when both provider policy and the selected model or explicit-route allowlist permit it. If native Chat is unavailable but native `/responses` is allowed, Vekil executes the request through its Chat-over-Responses adapter. This makes these public compatibility surfaces available to a Responses-native model without changing provider ownership:
+
+- `POST /v1/chat/completions`;
+- translated `POST /v1/messages` and `/v1/messages/count_tokens`;
+- Gemini `generateContent`, `streamGenerateContent`, and `countTokens`;
+- the dashboard insight call.
+
+This is served compatibility, not native capability metadata. Keep `models[].endpoints` and `model_routes[].endpoints` limited to verified native upstream routes. A Responses-only model or explicit route must remain configured with only `/responses`, and `/v1/models` continues to render only that native endpoint even though Vekil can translate Chat-compatible traffic to it. Do not add `/chat/completions` merely to advertise the adapter. See the [Responses-backed Chat request subset](api.md#responses-backed-chat-request-subset) for the strict translation boundary.
+
+On an unknown model routed to an unfiltered dynamic provider, the first Chat-compatible request may perform one provider-local model refresh before choosing a backend. Discovery is coalesced per provider, bounded to two seconds, cached for five minutes after success, and backed off for five seconds after failure. It does not require or populate the merged public `/v1/models` cache.
 
 ### Azure-Only Example
 
@@ -276,7 +289,7 @@ JSON configs use the same snake_case field names as YAML.
 
 ### Generic Provider Behavior
 
-OpenAI-compatible providers route `POST /v1/chat/completions` to `chat_completions_path`. Anthropic `POST /v1/messages` requests for these models are translated through the existing OpenAI Chat Completions adapter. `POST /v1/responses` is never inferred; add `/responses` to a model only after validating the upstream model and path.
+OpenAI-compatible providers use `chat_completions_path` for models with native `/chat/completions` support. If a model is configured as `/responses`-only, OpenAI Chat plus translated Anthropic and Gemini traffic is converted and sent to `responses_path` instead. `POST /v1/responses` support itself is never inferred; add `/responses` to a model only after validating the upstream model and path.
 
 Anthropic-compatible providers directly forward Anthropic `POST /v1/messages` to `messages_path`. They do not serve OpenAI Chat Completions or Responses routes.
 
@@ -294,12 +307,12 @@ Successful decoded dynamic model catalogs are capped at 4 MiB before JSON decodi
 | `auth_type` | generic providers | `bearer`, `api-key-header`, or `none`. Defaults to `bearer` when a key is present, otherwise `none`. |
 | `auth_header`, `auth_prefix` | generic providers | Header name and optional prefix for `api-key-header`, or overrides for bearer auth. |
 | `extra_headers` | generic providers | Fixed headers to add to every upstream request after client Copilot headers are stripped. |
-| `chat_completions_path` | `openai-compatible` | Upstream path for public `POST /v1/chat/completions`. Defaults to `/chat/completions`. |
-| `responses_path` | `openai-compatible` | Upstream path for public `POST /v1/responses`. Defaults to `/responses`; models must still opt in with `/responses`. |
+| `chat_completions_path` | `openai-compatible` | Upstream native Chat path, used when the selected model allows `/chat/completions`. Defaults to `/chat/completions`. |
+| `responses_path` | `openai-compatible` | Upstream native Responses path for direct Responses and Responses-backed Chat. Defaults to `/responses`; models must still opt in with `/responses`. |
 | `messages_path` | `anthropic-compatible` | Upstream path for public `POST /v1/messages`. Defaults to `/v1/messages`. |
 | `models_path` | generic providers | Upstream path for dynamic model discovery and readiness probes. Defaults to `/models`. |
 | `model_discovery` | generic providers | `static`, `openai`, `ollama`, or `openrouter-tools`. |
-| `models[].endpoints` | all static models | Public endpoint allowlist. This remains the source of truth for what Vekil advertises and routes. |
+| `models[].endpoints` | all static models | Verified native upstream endpoint allowlist. It controls rendered capability metadata and native backend selection; Vekil does not add served compatibility routes. |
 | `models[].use_max_completion_tokens` | static models with `/chat/completions` | When `true`, rewrite translated Chat/Anthropic `max_tokens` to `max_completion_tokens` before forwarding. Use only for deployments that reject the legacy field. |
 
 ### Generic Provider Cookbook
@@ -457,7 +470,7 @@ Routing rules:
 - Azure `models[]` remains the routing source of truth. The proxy does not autodiscover new Azure deployments for inference.
 - Azure is treated as a static provider for `/readyz`: readiness does not depend on Azure's optional `/models` endpoint. `GET /v1/models` may still probe Azure `/models` for best-effort metadata enrichment.
 - OpenAI Codex discovers models dynamically from its upstream `/models` endpoint and exposes only models that are listed and supported in the API.
-- OpenAI Codex models are `/responses`-only. The proxy rejects `/chat/completions` for those models instead of probing an unsupported route.
+- OpenAI Codex models are `/responses`-only natively. Vekil may serve `/v1/chat/completions`, translated Anthropic, Gemini, count-token probes, and dashboard insights through Chat-over-Responses, while `/v1/models` still reports only native `/responses` support.
 - Azure `auth_mode` is optional and defaults to `api_key`. Supported values are `api_key` and `azure_identity`.
 - `openai-compatible` models default to `/chat/completions` when `models[].endpoints` is omitted. Add `/responses` only for models you have validated on `responses_path`.
 - `anthropic-compatible` models default to `/v1/messages` when `models[].endpoints` is omitted. OpenAI Chat Completions and Responses requests for those models fail fast.
@@ -474,12 +487,12 @@ Routing rules:
 - Only a queryless canonical `/v1/models` build may refresh global dynamic model ownership. If the first caller request has a query string, the proxy performs and caches an internal queryless canonical build before returning the query-specific variant; the variant itself never replaces routing state.
 - Only one Copilot provider is supported in a config today.
 - For Copilot-discovered models, Codex-compatible `/v1/models` metadata treats `capabilities.limits.max_prompt_tokens` as the active `context_window` and keeps `max_context_window_tokens` as `max_context_window`. If Copilot omits the prompt cap, the proxy falls back to the total context window.
-- `models[].endpoints` and `model_routes[].endpoints` are allowlists, not guesses. Keep them limited to operations validated for the provider model or every target in the route.
+- `models[].endpoints` and `model_routes[].endpoints` are native endpoint allowlists, not guesses. Keep them limited to operations validated for the provider model or every target in the route; served Chat compatibility through `/responses` does not add `/chat/completions` to either allowlist.
 - `models[].use_max_completion_tokens: true` is a request policy for `/chat/completions`; it rewrites `max_tokens` to `max_completion_tokens` after translation without changing the value. Use it for deployments that reject the legacy field, including when Anthropic-compatible clients such as Claude Code supply `max_tokens`. It does not affect `/responses` requests.
 - Static provider models can also advertise richer Codex `/v1/models` metadata via optional fields on each `models[]` entry: `model_picker_category`, `reasoning_effort`, `vision`, `parallel_tool_calls`, and `context_window`. Without those fields, the proxy exposes a minimal but valid model entry.
 - For Azure OpenAI, `/v1/models` only does a best-effort metadata overlay for each configured `models[]` entry by probing Azure's upstream `/models` response. The proxy matches by `public_id` first, then by `deployment` for aliased models.
 - Azure's upstream `/models` catalog can omit Codex-style fields entirely. The proxy only copies fields that Azure already returns; it does not derive reasoning levels, vision, parallel tool calls, model picker metadata, or context window from other Azure docs or capability hints.
 - Explicit `models[]` metadata overrides Azure `/models` overlay metadata. Configured public IDs and endpoint allowlists always win, and the proxy falls back to the static entry if the Azure `/models` probe fails or returns a sparse payload.
-- The example Azure `gpt-5.4-pro` model shown above is `/responses`-only. Do not advertise `/chat/completions` for that model unless you have verified native support.
+- The example Azure `gpt-5.4-pro` model shown above is `/responses`-only natively. Chat-compatible clients can use Vekil's adapter, but do not advertise `/chat/completions` in its endpoint allowlist unless the Azure deployment itself has verified native Chat support.
 
 Use the examples above as a starting point for your local providers config file. JSON and YAML use the same snake_case field names.

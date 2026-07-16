@@ -235,6 +235,20 @@ case "\${mode}" in
   pass)
     printf '%s|%s\n' "\$(cat left.txt)" "\$(cat right.txt)"
     ;;
+  wrapped-output)
+    python3 - <<'PY_WRAPPED_OUTPUT'
+import json
+import pathlib
+
+left = pathlib.Path("left.txt").read_text()
+right = pathlib.Path("right.txt").read_text()
+print(
+    json.dumps({"output": left}, separators=(",", ":"))
+    + "|"
+    + json.dumps({"output": right}, separators=(",", ":"))
+)
+PY_WRAPPED_OUTPUT
+    ;;
   json-wrapped)
     jq -cn --arg output "\$(cat left.txt)" '{output: \$output}'
     printf '|'
@@ -242,6 +256,19 @@ case "\${mode}" in
     ;;
   json-wrapped-whole)
     jq -cn --arg output "\$(cat left.txt)|\$(cat right.txt)" '{output: \$output}'
+    ;;
+  json-wrapped-trailing-separator)
+    jq -cn --arg output "\$(cat left.txt)" '{output: \$output}'
+    printf '|'
+    jq -cn --arg output "\$(cat right.txt)" '{output: \$output}'
+    printf '|'
+    ;;
+  json-wrapped-three)
+    jq -cn --arg output "\$(cat left.txt)" '{output: \$output}'
+    printf '|'
+    jq -cn --arg output 'unexpected-third-wrapper' '{output: \$output}'
+    printf '|'
+    jq -cn --arg output "\$(cat right.txt)" '{output: \$output}'
     ;;
   exit42)
     exit 42
@@ -694,6 +721,44 @@ expect_success "second canary transient permits retry but every client still pas
     SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 
+wrapped_gemini_dir="${TMP_ROOT}/setup/gemini-wrapped-read-output"
+start_mock_server "${wrapped_gemini_dir}/server" 200
+wrapped_gemini_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${wrapped_gemini_dir}/bin" pass pass wrapped-output
+expect_success "Gemini wrapped Read outputs normalize to exact fixture text" 10 \
+  env PATH="${wrapped_gemini_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${wrapped_gemini_port}" \
+    LIVE_CLI_SMOKE_DIR="${wrapped_gemini_dir}/smoke" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+
+wrapped_escape_dir="${TMP_ROOT}/setup/gemini-wrapped-json-escaping"
+mkdir -p "${wrapped_escape_dir}/bin" "${wrapped_escape_dir}/case"
+write_fake_client "${wrapped_escape_dir}/bin/gemini" wrapped-output
+printf '%s' 'left"\line' > "${wrapped_escape_dir}/case/left.txt"
+printf 'right\nline' > "${wrapped_escape_dir}/case/right.txt"
+if (
+  cd "${wrapped_escape_dir}/case"
+  "${wrapped_escape_dir}/bin/gemini" > output.txt
+  python3 - <<'PY_WRAPPED_ASSERT'
+import json
+import pathlib
+
+raw = pathlib.Path("output.txt").read_text().strip()
+decoder = json.JSONDecoder()
+left, offset = decoder.raw_decode(raw)
+assert raw[offset:offset + 1] == "|"
+right, end = decoder.raw_decode(raw, offset + 1)
+assert end == len(raw)
+assert left == {"output": 'left"\\line'}
+assert right == {"output": "right\nline"}
+PY_WRAPPED_ASSERT
+); then
+  record_success "Gemini wrapped Read outputs JSON-escape quotes, backslashes, and newlines"
+else
+  record_failure "Gemini wrapped Read output escaping" "generated wrapper was not valid compact JSON"
+fi
+
 run_zen_classification_case "canary 404 plus transient text is hard" 404 \
   "service temporarily unavailable" 0
 run_zen_classification_case "canary 200 bad shape plus transient text is hard" 200 \
@@ -718,6 +783,8 @@ expect_hard_failure_with_stderr "hanging chat canary is hard via raw Zen smoke" 
 
 run_zen_case_expect_success "Gemini strict JSON wrapper around complete result normalizes to exact text" pass pass json-wrapped-whole
 run_zen_case_expect_success "Gemini strict JSON wrapper sequence normalizes to exact text" pass pass json-wrapped
+run_zen_case_expect_failure "Gemini dangling JSON wrapper separator is rejected" 200 pass pass json-wrapped-trailing-separator
+run_zen_case_expect_failure "Gemini three-wrapper sequence is rejected" 200 pass pass json-wrapped-three
 
 run_zen_case_expect_failure "canary 200 plus CLI exit 42" 200 exit42 exit42 exit42
 run_zen_case_expect_failure "canary 404 is a hard failure" 404 pass pass pass

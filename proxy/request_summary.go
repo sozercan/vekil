@@ -560,3 +560,25 @@ func observeUpstreamHeaders(ctx context.Context, headers http.Header) {
 		summary.setUpstreamRequestID(UpstreamRequestID(headers))
 	}
 }
+
+func observeChatExecutionRoute(ctx context.Context, result chatExecutionResult) {
+	summary := RequestSummaryFromContext(ctx)
+	if summary == nil || result.route.provider == nil {
+		return
+	}
+	summary.setProvider(result.route.provider.id, string(result.route.provider.kind))
+}
+
+func observeChatExecutionError(ctx context.Context, executionErr *chatExecutionError) {
+	if executionErr == nil {
+		return
+	}
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		if executionErr.route.provider != nil {
+			summary.setProvider(executionErr.route.provider.id, string(executionErr.route.provider.kind))
+		}
+		if len(executionErr.Headers) > 0 {
+			summary.setUpstreamRequestID(UpstreamRequestID(executionErr.Headers))
+		}
+	}
+}

@@ -1,0 +1,38 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_synth_parallel_stream_001","object":"response","created_at":1700000000,"status":"in_progress","error":null,"incomplete_details":null,"model":"gpt-synthetic-responses","output":[],"parallel_tool_calls":true,"usage":null,"metadata":{"fixture":"stream-parallel-interleaved-tool-calls"}}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_synth_parallel_stream_001","object":"response","created_at":1700000000,"status":"in_progress","error":null,"incomplete_details":null,"model":"gpt-synthetic-responses","output":[],"parallel_tool_calls":true,"usage":null,"metadata":{"fixture":"stream-parallel-interleaved-tool-calls"}}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"function_call","id":"fc_synth_parallel_alpha_stream_001","call_id":"call_synth_parallel_alpha_stream_001","name":"lookup_synthetic_widget","arguments":"","status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":3,"output_index":1,"item":{"type":"function_call","id":"fc_synth_parallel_beta_stream_001","call_id":"call_synth_parallel_beta_stream_001","name":"inspect_synthetic_region","arguments":"","status":"in_progress"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":4,"item_id":"fc_synth_parallel_alpha_stream_001","output_index":0,"delta":"{\"widget\":\""}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":5,"item_id":"fc_synth_parallel_beta_stream_001","output_index":1,"delta":"{\"region\":\""}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":6,"item_id":"fc_synth_parallel_beta_stream_001","output_index":1,"delta":"beta-fixture\"}"}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","sequence_number":7,"item_id":"fc_synth_parallel_beta_stream_001","output_index":1,"arguments":"{\"region\":\"beta-fixture\"}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":8,"output_index":1,"item":{"type":"function_call","id":"fc_synth_parallel_beta_stream_001","call_id":"call_synth_parallel_beta_stream_001","name":"inspect_synthetic_region","arguments":"{\"region\":\"beta-fixture\"}","status":"completed"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":9,"item_id":"fc_synth_parallel_alpha_stream_001","output_index":0,"delta":"alpha-fixture\"}"}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","sequence_number":10,"item_id":"fc_synth_parallel_alpha_stream_001","output_index":0,"arguments":"{\"widget\":\"alpha-fixture\"}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":11,"output_index":0,"item":{"type":"function_call","id":"fc_synth_parallel_alpha_stream_001","call_id":"call_synth_parallel_alpha_stream_001","name":"lookup_synthetic_widget","arguments":"{\"widget\":\"alpha-fixture\"}","status":"completed"}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":12,"response":{"id":"resp_synth_parallel_stream_001","object":"response","created_at":1700000000,"status":"completed","error":null,"incomplete_details":null,"model":"gpt-synthetic-responses","output":[{"type":"function_call","id":"fc_synth_parallel_alpha_stream_001","call_id":"call_synth_parallel_alpha_stream_001","name":"lookup_synthetic_widget","arguments":"{\"widget\":\"alpha-fixture\"}","status":"completed"},{"type":"function_call","id":"fc_synth_parallel_beta_stream_001","call_id":"call_synth_parallel_beta_stream_001","name":"inspect_synthetic_region","arguments":"{\"region\":\"beta-fixture\"}","status":"completed"}],"parallel_tool_calls":true,"usage":{"input_tokens":24,"input_tokens_details":{"cached_tokens":0},"output_tokens":18,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":42},"metadata":{"fixture":"stream-parallel-interleaved-tool-calls"}}}

@@ -1,0 +1,29 @@
+{
+  "id": "resp_synth_failure_001",
+  "object": "response",
+  "created_at": 1700000000,
+  "status": "failed",
+  "error": {
+    "type": "server_error",
+    "code": "model_overloaded",
+    "message": "Synthetic fixture failure before visible output."
+  },
+  "incomplete_details": null,
+  "model": "gpt-synthetic-responses",
+  "output": [],
+  "parallel_tool_calls": true,
+  "usage": {
+    "input_tokens": 5,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens": 0,
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "total_tokens": 5
+  },
+  "metadata": {
+    "fixture": "nonstream-immediate-failure"
+  }
+}

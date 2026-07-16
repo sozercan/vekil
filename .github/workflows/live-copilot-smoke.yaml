@@ -71,6 +71,12 @@ jobs:
           LIVE_COMPACT_SMOKE_DIR: ${{ runner.temp }}/live-compact-smoke
         run: scripts/live-compact-smoke.sh
 
+      - name: Run live Chat-over-Responses smoke check
+        if: steps.gate.outputs.run == 'true'
+        env:
+          LIVE_CHAT_OVER_RESPONSES_SMOKE_DIR: ${{ runner.temp }}/live-chat-over-responses-smoke
+        run: scripts/live-chat-over-responses-smoke.sh
+
       - name: Install Codex CLI
         if: steps.gate.outputs.run == 'true'
         run: npm install -g @openai/codex@latest
@@ -111,7 +117,10 @@ jobs:
               -e 's/("encrypted_content"[[:space:]]*:[[:space:]]*")[^"]*(")/\1[REDACTED]\2/g' \
               -e 's/(Please visit https:\/\/github\.com\/login\/device and enter code: )[A-Z0-9-]+/\1[REDACTED]/g'
           }
-          for log in "$RUNNER_TEMP/live-compact-smoke/proxy.log" "$RUNNER_TEMP/live-cli-smoke/proxy.log"; do
+          for log in \
+            "$RUNNER_TEMP/live-compact-smoke/proxy.log" \
+            "$RUNNER_TEMP/live-chat-over-responses-smoke/proxy.log" \
+            "$RUNNER_TEMP/live-cli-smoke/proxy.log"; do
             if [ -f "$log" ]; then
               echo "--- $log ---"
               redact < "$log"
@@ -136,6 +145,13 @@ jobs:
               \( -name '*.json' -o -name '*.txt' \) -print0 | while IFS= read -r -d '' file; do
               echo "--- $file ---"
               redact < "$file"
+            done
+          fi
+          if [ -d "$RUNNER_TEMP/live-chat-over-responses-smoke" ]; then
+            find "$RUNNER_TEMP/live-chat-over-responses-smoke" -maxdepth 1 -type f \
+              \( -name '*.json' -o -name '*.txt' -o -name '*.err' \) -print0 | while IFS= read -r -d '' file; do
+              echo "--- $file ---"
+              head -c 32768 "$file" | redact
             done
           fi
           if [ -d "$RUNNER_TEMP/live-cli-smoke/outputs" ]; then

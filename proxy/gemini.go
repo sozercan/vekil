@@ -1106,6 +1106,12 @@ func TranslateOpenAIToGemini(resp *models.OpenAIResponse) *models.GeminiGenerate
 			content.Parts = append(content.Parts, models.GeminiPart{Text: stringPtr(text)})
 		}
 	}
+	if len(choice.Message.Refusal) > 0 {
+		var refusal string
+		if err := json.Unmarshal(choice.Message.Refusal, &refusal); err == nil && refusal != "" {
+			content.Parts = append(content.Parts, models.GeminiPart{Text: stringPtr(refusal)})
+		}
+	}
 
 	for _, toolCall := range choice.Message.ToolCalls {
 		args, err := canonicalizeJSON(json.RawMessage(toolCall.Function.Arguments))

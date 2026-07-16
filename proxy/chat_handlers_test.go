@@ -124,11 +124,17 @@ func TestValidateAnthropicMessageTokenLimits(t *testing.T) {
 		{name: "negative max_tokens", req: &models.AnthropicRequest{MaxTokens: intPtr(-1)}, wantErr: "max_tokens must be greater than or equal to 0"},
 		{name: "zero max_tokens is valid for non-streaming prewarm", req: &models.AnthropicRequest{MaxTokens: intPtr(0)}},
 		{name: "zero max_tokens rejects streaming", req: &models.AnthropicRequest{MaxTokens: intPtr(0), Stream: true}, wantErr: "max_tokens must be greater than 0 when stream is true"},
+		{name: "zero max_tokens rejects thinking", req: &models.AnthropicRequest{MaxTokens: intPtr(0), Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(1024)}}, wantErr: "max_tokens must be greater than 0 when thinking is enabled"},
+		{name: "zero max_tokens rejects required tool choice", req: &models.AnthropicRequest{MaxTokens: intPtr(0), ToolChoice: &models.AnthropicToolChoice{Type: "any"}}, wantErr: "max_tokens must be greater than 0 when tool_choice forces tool use"},
+		{name: "zero max_tokens rejects named tool choice", req: &models.AnthropicRequest{MaxTokens: intPtr(0), ToolChoice: &models.AnthropicToolChoice{Type: "tool", Name: "lookup"}}, wantErr: "max_tokens must be greater than 0 when tool_choice forces tool use"},
 		{name: "enabled thinking requires budget", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled"}}, wantErr: "thinking.budget_tokens is required"},
 		{name: "enabled thinking requires minimum budget", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(1023)}}, wantErr: "thinking.budget_tokens must be greater than or equal to 1024"},
+		{name: "enabled thinking rejects required tool choice", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(1024)}, ToolChoice: &models.AnthropicToolChoice{Type: "any"}}, wantErr: "thinking is not compatible with forced tool_choice"},
+		{name: "enabled thinking rejects named tool choice", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(1024)}, ToolChoice: &models.AnthropicToolChoice{Type: "tool", Name: "lookup"}}, wantErr: "thinking is not compatible with forced tool_choice"},
 		{name: "enabled thinking budget must fit total", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(4096)}}, wantErr: "thinking.budget_tokens must be less than max_tokens"},
 		{name: "interleaved thinking with tools permits larger budget", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(8192)}, Tools: []models.AnthropicTool{{Name: "lookup", InputSchema: json.RawMessage(`{"type":"object"}`)}}}, headers: http.Header{"Anthropic-Beta": []string{anthropicInterleavedThinkingBeta}}},
-		{name: "streaming interleaved thinking uses positive budget above zero max tokens", req: &models.AnthropicRequest{MaxTokens: intPtr(0), Stream: true, Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(8192)}, Tools: []models.AnthropicTool{{Name: "lookup", InputSchema: json.RawMessage(`{"type":"object"}`)}}}, headers: http.Header{"Anthropic-Beta": []string{anthropicInterleavedThinkingBeta}}},
+		{name: "interleaved thinking with explicit auto permits larger budget", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(8192)}, Tools: []models.AnthropicTool{{Name: "lookup", InputSchema: json.RawMessage(`{"type":"object"}`)}}, ToolChoice: &models.AnthropicToolChoice{Type: "auto"}}, headers: http.Header{"Anthropic-Beta": []string{anthropicInterleavedThinkingBeta}}},
+		{name: "streaming interleaved thinking uses budget above positive max tokens", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Stream: true, Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(8192)}, Tools: []models.AnthropicTool{{Name: "lookup", InputSchema: json.RawMessage(`{"type":"object"}`)}}}, headers: http.Header{"Anthropic-Beta": []string{anthropicInterleavedThinkingBeta}}},
 		{name: "interleaved thinking without tools does not bypass validation", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(8192)}}, headers: http.Header{"Anthropic-Beta": []string{anthropicInterleavedThinkingBeta}}, wantErr: "thinking.budget_tokens must be less than max_tokens"},
 		{name: "interleaved thinking with disabled tools does not bypass validation", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(8192)}, Tools: []models.AnthropicTool{{Name: "lookup", InputSchema: json.RawMessage(`{"type":"object"}`)}}, ToolChoice: &models.AnthropicToolChoice{Type: "none"}}, headers: http.Header{"Anthropic-Beta": []string{anthropicInterleavedThinkingBeta}}, wantErr: "thinking.budget_tokens must be less than max_tokens"},
 		{name: "unknown interleaved beta does not bypass validation", req: &models.AnthropicRequest{MaxTokens: intPtr(4096), Thinking: &models.AnthropicThinking{Type: "enabled", BudgetTokens: intPtr(8192)}, Tools: []models.AnthropicTool{{Name: "lookup", InputSchema: json.RawMessage(`{"type":"object"}`)}}}, headers: http.Header{"Anthropic-Beta": []string{"interleaved-thinking-disabled"}}, wantErr: "thinking.budget_tokens must be less than max_tokens"},
@@ -184,12 +190,12 @@ func TestPrepareAnthropicChatCompletionsRequest_PrewarmStaysNonStreaming(t *test
 	}
 }
 
-func TestPrepareAnthropicChatCompletionsRequest_InterleavedThinkingZeroMaxStillStreams(t *testing.T) {
-	zero := 0
+func TestPrepareAnthropicChatCompletionsRequest_InterleavedThinkingPreservesPerResponseLimit(t *testing.T) {
+	maxTokens := 4096
 	budget := 8192
 	req := &models.AnthropicRequest{
 		Model:     "claude-opus-4-5",
-		MaxTokens: &zero,
+		MaxTokens: &maxTokens,
 		Messages: []models.AnthropicMessage{
 			{Role: "user", Content: json.RawMessage(`"use tools"`)},
 		},
@@ -215,8 +221,8 @@ func TestPrepareAnthropicChatCompletionsRequest_InterleavedThinkingZeroMaxStillS
 	if oaiReq.Stream == nil || !*oaiReq.Stream {
 		t.Fatalf("stream = %v, want true", oaiReq.Stream)
 	}
-	if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != budget {
-		t.Fatalf("max_completion_tokens = %v, want %d", oaiReq.MaxCompletionTokens, budget)
+	if oaiReq.MaxCompletionTokens == nil || *oaiReq.MaxCompletionTokens != maxTokens {
+		t.Fatalf("max_completion_tokens = %v, want per-response max_tokens %d", oaiReq.MaxCompletionTokens, maxTokens)
 	}
 	if oaiReq.MaxTokens != nil {
 		t.Fatalf("max_tokens = %v, want nil", oaiReq.MaxTokens)

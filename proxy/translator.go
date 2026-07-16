@@ -100,15 +100,12 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 	// MaxTokens
 	oaiReq.MaxTokens = req.MaxTokens
 
-	// Anthropic's thinking budget is normally part of max_tokens, while OpenAI's
-	// max_completion_tokens caps reasoning plus visible output together. Preserve
-	// max_tokens as the total limit for ordinary thinking, but never cap below an
-	// interleaved-thinking budget that Anthropic allows to exceed max_tokens.
+	// Anthropic max_tokens is the hard per-response limit, including current-turn
+	// thinking. An interleaved thinking budget may exceed it because that budget
+	// is cumulative across thinking blocks, not because one response may exceed
+	// the caller's max_tokens ceiling.
 	if req.Thinking != nil && req.Thinking.Type == "enabled" && req.MaxTokens != nil {
 		tokens := *req.MaxTokens
-		if req.Thinking.BudgetTokens != nil && *req.Thinking.BudgetTokens > tokens {
-			tokens = *req.Thinking.BudgetTokens
-		}
 		oaiReq.MaxCompletionTokens = &tokens
 		oaiReq.MaxTokens = nil
 	}
@@ -422,6 +419,12 @@ func TranslateOpenAIToAnthropic(resp *models.OpenAIResponse, model string) *mode
 					Type: "text",
 					Text: stringPtr(text),
 				})
+			}
+		}
+		if len(msg.Refusal) > 0 {
+			var refusal string
+			if err := json.Unmarshal(msg.Refusal, &refusal); err == nil && strings.TrimSpace(refusal) != "" {
+				content = append(content, models.ContentBlock{Type: "text", Text: stringPtr(refusal)})
 			}
 		}
 

@@ -1,0 +1,53 @@
+{
+  "id": "resp_synth_continuation_001",
+  "object": "response",
+  "created_at": 1700000000,
+  "status": "completed",
+  "error": null,
+  "incomplete_details": null,
+  "model": "gpt-synthetic-responses",
+  "output": [
+    {
+      "type": "reasoning",
+      "id": "rs_synth_continuation_001",
+      "status": "completed",
+      "encrypted_content": "synthetic_encrypted_content_not_replayable",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "Synthetic reasoning summary for fixture coverage only."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "msg_synth_continuation_001",
+      "status": "completed",
+      "role": "assistant",
+      "phase": "final_answer",
+      "content": [
+        {
+          "type": "output_text",
+          "annotations": [],
+          "logprobs": [],
+          "text": "Synthetic continuation finished."
+        }
+      ]
+    }
+  ],
+  "parallel_tool_calls": true,
+  "usage": {
+    "input_tokens": 33,
+    "input_tokens_details": {
+      "cached_tokens": 8
+    },
+    "output_tokens": 14,
+    "output_tokens_details": {
+      "reasoning_tokens": 7
+    },
+    "total_tokens": 47
+  },
+  "metadata": {
+    "fixture": "nonstream-reasoning-message-continuation"
+  }
+}

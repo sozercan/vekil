@@ -402,8 +402,8 @@ func TestTranslateAnthropicToOpenAI(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if got.MaxCompletionTokens == nil || *got.MaxCompletionTokens != 8192 {
-			t.Errorf("MaxCompletionTokens = %v, want interleaved thinking budget 8192", got.MaxCompletionTokens)
+		if got.MaxCompletionTokens == nil || *got.MaxCompletionTokens != 4096 {
+			t.Errorf("MaxCompletionTokens = %v, want per-response max_tokens limit 4096", got.MaxCompletionTokens)
 		}
 		if got.MaxTokens != nil {
 			t.Errorf("MaxTokens should be nil when thinking is enabled, got %v", *got.MaxTokens)

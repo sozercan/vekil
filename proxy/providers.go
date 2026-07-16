@@ -670,6 +670,7 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 	}
 
 	h.dynamicProviderValidationPending.Store(false)
+	h.validateInsightModel()
 	return nil
 }
 
