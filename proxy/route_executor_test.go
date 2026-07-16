@@ -175,6 +175,25 @@ func (t *routeTraceTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	return t.fallback.RoundTrip(req)
 }
 
+type routeExecutorRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f routeExecutorRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func routeExecutorTestResponse(req *http.Request, statusCode int, header http.Header, body string) *http.Response {
+	if header == nil {
+		header = make(http.Header)
+	}
+	return &http.Response{
+		StatusCode:    statusCode,
+		Header:        header,
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+	}
+}
+
 func TestExplicitRoutePrewriteFailureCanSwitchButAmbiguousCannot(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -216,6 +235,246 @@ func TestExplicitRoutePrewriteFailureCanSwitchButAmbiguousCannot(t *testing.T) {
 			}
 			if got := secondaryCalls.Load(); got != tc.wantSecondary {
 				t.Fatalf("secondary calls = %d, want %d", got, tc.wantSecondary)
+			}
+		})
+	}
+}
+
+func TestExplicitRouteExhaustionAccountingRequiresBudgetOrNoTarget(t *testing.T) {
+	tests := []struct {
+		name               string
+		endpoint           string
+		stream             bool
+		body               string
+		maxTargets         int
+		maxSends           int
+		configureProviders func(primary, secondary *providerRuntime)
+		prepareOperation   func(t *testing.T, operation *routeOperation)
+		roundTrip          func(t *testing.T, secondaryCalls *atomic.Int32) routeExecutorRoundTripFunc
+		wantErr            bool
+		wantStatus         int
+		wantSends          int
+		wantExhaustions    int64
+		wantTrace          bool
+		wantTraceDecision  routeRetryDecision
+	}{
+		{
+			name:       "no eligible target",
+			endpoint:   providerEndpointMessages,
+			body:       `{"model":"public-model"}`,
+			maxTargets: 2,
+			maxSends:   2,
+			configureProviders: func(_ *providerRuntime, secondary *providerRuntime) {
+				secondary.kind = providerTypeOpenAICompatible
+			},
+			roundTrip: func(_ *testing.T, secondaryCalls *atomic.Int32) routeExecutorRoundTripFunc {
+				return func(req *http.Request) (*http.Response, error) {
+					if req.URL.Hostname() == "secondary.example" {
+						secondaryCalls.Add(1)
+					}
+					return routeExecutorTestResponse(req, http.StatusTooManyRequests, nil, `{"error":{"code":"rate_limit_exceeded"}}`), nil
+				}
+			},
+			wantStatus:        http.StatusTooManyRequests,
+			wantSends:         1,
+			wantExhaustions:   1,
+			wantTrace:         true,
+			wantTraceDecision: routeRetrySwitchTarget,
+		},
+		{
+			name:       "target budget exhausted",
+			endpoint:   providerEndpointResponses,
+			body:       `{"model":"public-model"}`,
+			maxTargets: 1,
+			maxSends:   2,
+			roundTrip: func(_ *testing.T, secondaryCalls *atomic.Int32) routeExecutorRoundTripFunc {
+				return func(req *http.Request) (*http.Response, error) {
+					if req.URL.Hostname() == "secondary.example" {
+						secondaryCalls.Add(1)
+					}
+					return routeExecutorTestResponse(req, http.StatusTooManyRequests, nil, `{"error":{"code":"rate_limit_exceeded"}}`), nil
+				}
+			},
+			wantStatus:        http.StatusTooManyRequests,
+			wantSends:         1,
+			wantExhaustions:   1,
+			wantTrace:         true,
+			wantTraceDecision: routeRetrySuppressedMode,
+		},
+		{
+			name:       "send budget exhausted",
+			endpoint:   providerEndpointResponses,
+			body:       `{"model":"public-model"}`,
+			maxTargets: 2,
+			maxSends:   2,
+			prepareOperation: func(t *testing.T, operation *routeOperation) {
+				for range 2 {
+					if reserved, decision := operation.reserveSendAtDispatch(context.Background(), false); !reserved || decision != routeRetryAccepted {
+						t.Fatalf("preconsume send = reserved:%v decision:%q", reserved, decision)
+					}
+				}
+			},
+			roundTrip: func(t *testing.T, _ *atomic.Int32) routeExecutorRoundTripFunc {
+				return func(*http.Request) (*http.Response, error) {
+					t.Fatal("unexpected upstream dispatch")
+					return nil, nil
+				}
+			},
+			wantErr:           true,
+			wantSends:         2,
+			wantExhaustions:   1,
+			wantTrace:         true,
+			wantTraceDecision: routeRetrySuppressedBudget,
+		},
+		{
+			name:       "ambiguous delivery leaves target",
+			endpoint:   providerEndpointResponses,
+			body:       `{"model":"public-model"}`,
+			maxTargets: 2,
+			maxSends:   2,
+			roundTrip: func(_ *testing.T, secondaryCalls *atomic.Int32) routeExecutorRoundTripFunc {
+				return func(req *http.Request) (*http.Response, error) {
+					if req.URL.Hostname() == "secondary.example" {
+						secondaryCalls.Add(1)
+						return routeExecutorTestResponse(req, http.StatusOK, nil, `{}`), nil
+					}
+					if trace := httptrace.ContextClientTrace(req.Context()); trace != nil && trace.WroteHeaders != nil {
+						trace.WroteHeaders()
+					}
+					return nil, errors.New("ambiguous transport failure")
+				}
+			},
+			wantErr:           true,
+			wantSends:         1,
+			wantTrace:         true,
+			wantTraceDecision: routeRetrySuppressedDelivery,
+		},
+		{
+			name:       "semantic progress leaves target",
+			endpoint:   providerEndpointResponses,
+			stream:     true,
+			body:       `{"model":"public-model","stream":true}`,
+			maxTargets: 2,
+			maxSends:   2,
+			roundTrip: func(_ *testing.T, secondaryCalls *atomic.Int32) routeExecutorRoundTripFunc {
+				return func(req *http.Request) (*http.Response, error) {
+					if req.URL.Hostname() == "secondary.example" {
+						secondaryCalls.Add(1)
+						return routeExecutorTestResponse(req, http.StatusOK, nil, `{}`), nil
+					}
+					header := make(http.Header)
+					header.Set("Content-Type", "text/event-stream")
+					body := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-progress\"}}\n\n" +
+						"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-progress\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"quota\"},\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n"
+					return routeExecutorTestResponse(req, http.StatusOK, header, body), nil
+				}
+			},
+			wantErr:           true,
+			wantSends:         1,
+			wantTrace:         true,
+			wantTraceDecision: routeRetrySuppressedProgress,
+		},
+		{
+			name:       "nonretryable preparation failure leaves target",
+			endpoint:   providerEndpointResponses,
+			body:       `{"model":`,
+			maxTargets: 2,
+			maxSends:   2,
+			roundTrip: func(t *testing.T, _ *atomic.Int32) routeExecutorRoundTripFunc {
+				return func(*http.Request) (*http.Response, error) {
+					t.Fatal("unexpected upstream dispatch")
+					return nil, nil
+				}
+			},
+			wantErr:           true,
+			wantTrace:         true,
+			wantTraceDecision: routeRetrySuppressedNonretryable,
+		},
+		{
+			name:       "state binding failure leaves target",
+			endpoint:   providerEndpointChatCompletions,
+			body:       `{"model":"public-model"}`,
+			maxTargets: 2,
+			maxSends:   2,
+			roundTrip: func(_ *testing.T, secondaryCalls *atomic.Int32) routeExecutorRoundTripFunc {
+				return func(req *http.Request) (*http.Response, error) {
+					if req.URL.Hostname() == "secondary.example" {
+						secondaryCalls.Add(1)
+						return routeExecutorTestResponse(req, http.StatusOK, nil, `{}`), nil
+					}
+					header := make(http.Header)
+					header.Add("X-Codex-Turn-State", "state-one")
+					header.Add("X-Codex-Turn-State", "state-two")
+					return routeExecutorTestResponse(req, http.StatusOK, header, `{}`), nil
+				}
+			},
+			wantErr:           true,
+			wantSends:         1,
+			wantTrace:         true,
+			wantTraceDecision: routeRetrySuppressedState,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var secondaryCalls atomic.Int32
+			primary := explicitRouteTestProvider("primary", "https://primary.example", "one")
+			secondary := explicitRouteTestProvider("secondary", "https://secondary.example", "two")
+			if tc.configureProviders != nil {
+				tc.configureProviders(primary, secondary)
+			}
+			client := &http.Client{Transport: tc.roundTrip(t, &secondaryCalls)}
+			h, route := explicitRouteTestHandler(t, client, routeModePriorityFailover, tc.maxTargets, tc.maxSends, primary, secondary)
+			h.stats = newStatsCollector()
+			operation := newRouteOperation(route, context.Background())
+			if tc.prepareOperation != nil {
+				tc.prepareOperation(t, operation)
+			}
+			ctx := withRouteOperation(context.Background(), operation)
+
+			resp, err := h.executeExplicitRouteRequest(ctx, route, tc.endpoint, []byte(tc.body), nil, "public-model", tc.stream)
+			if resp != nil {
+				defer func() { _ = resp.Body.Close() }()
+			}
+			if tc.wantErr && err == nil {
+				t.Fatal("error = nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("error = %v", err)
+			}
+			if tc.wantStatus != 0 {
+				if resp == nil || resp.StatusCode != tc.wantStatus {
+					t.Fatalf("response = %#v, want status %d", resp, tc.wantStatus)
+				}
+			}
+			if got := secondaryCalls.Load(); got != 0 {
+				t.Fatalf("secondary calls = %d, want 0", got)
+			}
+
+			sends, _, trace := operation.snapshot()
+			if sends != tc.wantSends {
+				t.Fatalf("upstream sends = %d, want %d", sends, tc.wantSends)
+			}
+			if tc.wantTrace {
+				if len(trace) == 0 {
+					t.Fatal("attempt trace is empty")
+				}
+				if got := trace[len(trace)-1].Decision; got != tc.wantTraceDecision {
+					t.Fatalf("last trace decision = %q, want %q (trace=%+v)", got, tc.wantTraceDecision, trace)
+				}
+			} else if len(trace) != 0 {
+				t.Fatalf("attempt trace = %+v, want empty", trace)
+			}
+
+			if got := h.stats.snapshot().RouteExhaustions; got != tc.wantExhaustions {
+				t.Fatalf("route exhaustions after execute = %d, want %d", got, tc.wantExhaustions)
+			}
+			// Re-evaluating the terminal operation must neither invent an exhaustion
+			// nor double-count a real one.
+			h.recordExplicitRouteExhaustion(operation, tc.endpoint)
+			h.recordExplicitRouteExhaustion(operation, tc.endpoint)
+			if got := h.stats.snapshot().RouteExhaustions; got != tc.wantExhaustions {
+				t.Fatalf("route exhaustions after repeated accounting = %d, want %d", got, tc.wantExhaustions)
 			}
 		})
 	}

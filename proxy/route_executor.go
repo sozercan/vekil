@@ -363,6 +363,52 @@ func (o *routeOperation) markExhausted() bool {
 	return true
 }
 
+func (o *routeOperation) exhaustionDecision(endpoint string) (routeRetryDecision, bool) {
+	if o == nil || o.route == nil {
+		return "", false
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if o.remainingTargetAttempts <= 0 || o.remainingUpstreamSends <= 0 {
+		return routeRetrySuppressedBudget, true
+	}
+	if o.pinnedTargetID != "" {
+		target, ok := o.route.targetByID(o.pinnedTargetID)
+		if !ok || target.provider == nil || !target.provider.supportsEndpoint(endpoint) {
+			return routeRetrySuppressedNoTarget, true
+		}
+		return "", false
+	}
+
+	maxTargets := len(o.route.targets)
+	if o.route.policy.mode == routeModePrimaryOnly {
+		maxTargets = min(maxTargets, 1)
+	}
+	for i := 0; i < maxTargets; i++ {
+		target := o.route.targets[i]
+		if target.provider == nil || !target.provider.supportsEndpoint(endpoint) {
+			continue
+		}
+		if _, attempted := o.attemptedTargets[target.id]; !attempted {
+			return "", false
+		}
+	}
+	return routeRetrySuppressedNoTarget, true
+}
+
+func (h *ProxyHandler) recordExplicitRouteExhaustion(operation *routeOperation, endpoint string) {
+	if operation == nil || routeAttemptStatsSuppressed(operation.inbound) {
+		return
+	}
+	decision, exhausted := operation.exhaustionDecision(endpoint)
+	if !exhausted {
+		return
+	}
+	h.recordManualRouteExhaustion(operation, decision)
+}
+
 func (o *routeOperation) appendTrace(trace routeAttemptTrace) {
 	if o == nil {
 		return
@@ -754,9 +800,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		return resp, nil
 	}
 
-	if operation.markExhausted() && !routeAttemptStatsSuppressed(operation.inbound) {
-		h.RecordRouteExhaustion(operation.inbound)
-	}
+	h.recordExplicitRouteExhaustion(operation, endpoint)
 	failure := selectFinalRouteFailure(failures)
 	if failure.response != nil {
 		return failure.response.response(), nil
