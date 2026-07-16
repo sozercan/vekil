@@ -1057,6 +1057,52 @@ func TestStreamResponsesPipeNormalizesEventNameForUntypedNestedError(t *testing.
 	}
 }
 
+func TestStreamResponsesPipeFinalizesTerminalAtEOFWithoutDelimiter(t *testing.T) {
+	tests := []struct {
+		name       string
+		sse        string
+		wantStatus int
+		wantUsage  responsesUsage
+	}{
+		{
+			name:      "completed",
+			sse:       "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-eof-completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3,\"total_tokens\":10}}}",
+			wantUsage: responsesUsage{InputTokens: 7, OutputTokens: 3, TotalTokens: 10},
+		},
+		{
+			name:       "failed",
+			sse:        "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-eof-failed\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"}}}",
+			wantStatus: http.StatusTooManyRequests,
+		},
+		{
+			name:       "incomplete",
+			sse:        "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-eof-incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}",
+			wantStatus: http.StatusConflict,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, summary := WithRequestSummary(context.Background())
+			rec := httptest.NewRecorder()
+			streamResponsesPipeWithFailureLog(ctx, &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, rec, strings.NewReader(tt.sse), nil, nil, "")
+
+			if got := summary.FailureStatus(); got != tt.wantStatus {
+				t.Fatalf("FailureStatus = %d, want %d", got, tt.wantStatus)
+			}
+			if got := rec.Body.String(); got != tt.sse {
+				t.Fatalf("stream body altered. got %q want %q", got, tt.sse)
+			}
+			if !tt.wantUsage.isZero() {
+				usage := readSummaryForStats(summary)
+				if usage.prompt != tt.wantUsage.InputTokens || usage.completion != tt.wantUsage.OutputTokens || usage.total != tt.wantUsage.TotalTokens {
+					t.Fatalf("usage = prompt:%d completion:%d total:%d, want %d/%d/%d", usage.prompt, usage.completion, usage.total, tt.wantUsage.InputTokens, tt.wantUsage.OutputTokens, tt.wantUsage.TotalTokens)
+				}
+			}
+		})
+	}
+}
+
 func TestStreamResponsesPipeRecordsUsageFromFailedAndIncomplete(t *testing.T) {
 	for _, tt := range []struct {
 		name       string

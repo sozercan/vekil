@@ -1714,6 +1714,7 @@ func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w h
 		}
 		return
 	}
+	tap.finalizeEOF()
 
 	if ctx.Err() == nil && !tap.completedCleanly() {
 		if lifecycle.suppressTransportCancellation(true) {
@@ -1970,6 +1971,27 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 		p = p[chunkSize:]
 	}
 	return total, nil
+}
+
+func (t *responsesFailureTap) finalizeEOF() {
+	if t == nil || t.terminalSeen || t.overflowActive {
+		return
+	}
+	// A valid final SSE event is dispatched at EOF even when the provider omits
+	// the conventional blank-line delimiter. Add parser-only framing and route the
+	// event through the same terminal/accounting path without altering wire bytes.
+	t.parser.finalizeEOF()
+	for {
+		msg, ok := t.parser.nextSemantic()
+		if !ok {
+			return
+		}
+		if strings.TrimSpace(msg.data) == "[DONE]" {
+			t.parser.done = true
+			return
+		}
+		t.maybeProcess(msg)
+	}
 }
 
 func (t *responsesFailureTap) writeChunk(p []byte) {
