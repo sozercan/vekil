@@ -203,14 +203,11 @@ func (m *MetricsCollector) modelLabel(provider, model string, modelKnown bool) s
 		return ""
 	}
 	model = boundStatLabel(model)
-	if model == "" {
-		return ""
-	}
 	// Only models resolved from the configured/dynamic catalog enter the
 	// persistent budget. Default-provider fallbacks and locally unrouted client
 	// values share one stable label so invalid names cannot force configured
 	// models into the overflow bucket until restart.
-	if provider == "" || !modelKnown {
+	if provider == "" || !modelKnown || model == "" {
 		return metricsUnroutedModel
 	}
 

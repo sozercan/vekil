@@ -157,6 +157,7 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 		admitted := handler == nil || !handler.ShuttingDown() || r.URL.Path == "/healthz"
 		tracked := admitted && handler != nil && handler.TracksRequest(r.Method, r.URL.Path)
 		if tracked {
+			handler.InitializeRequestSummaryForRoute(ctx, r.Method, r.URL.Path)
 			handler.IncInflight()
 			defer handler.DecInflight()
 		}

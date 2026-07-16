@@ -260,6 +260,38 @@ func TestServerBlocksNonHealthRoutesWhileProviderValidationPending(t *testing.T)
 	}
 }
 
+func TestServerLocalValidationMetricsKeepRouteLabels(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.4","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(w, req)
+	if got, want := w.Code, http.StatusBadRequest; got != want {
+		t.Fatalf("local validation status = %d, want %d", got, want)
+	}
+
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsW := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(metricsW, metricsReq)
+	body := metricsW.Body.String()
+	wantMetric := `vekil_requests_total{endpoint="openai_chat",provider="",public_model="unrouted",status="400"} 1`
+	if !strings.Contains(body, wantMetric) {
+		t.Fatalf("metrics missing %q:\n%s", wantMetric, body)
+	}
+	if strings.Contains(body, `vekil_upstream_errors_total{code="400"`) {
+		t.Fatalf("local validation unexpectedly incremented upstream errors:\n%s", body)
+	}
+}
+
 func TestServerMetricsCanBeDisabled(t *testing.T) {
 	srv, err := New(
 		auth.NewTestAuthenticator("test-token"),

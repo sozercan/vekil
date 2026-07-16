@@ -878,29 +878,41 @@ func boundStatLabel(s string) string {
 // zero-token requests (and, for count_tokens, latency samples) that skew the
 // dashboard's average-tokens/request and latency metrics. Keep this in sync with
 // the inference routes registered in server/server.go.
+func inferenceEndpointLabel(method, path string) string {
+	if method != http.MethodPost {
+		return ""
+	}
+	switch path {
+	case "/v1/messages":
+		return "anthropic"
+	case "/v1/chat/completions":
+		return "openai_chat"
+	case "/v1/responses":
+		return "responses"
+	}
+	if isGeminiModelsPath(path) && (strings.HasSuffix(path, ":generateContent") || strings.HasSuffix(path, ":streamGenerateContent")) {
+		return "gemini"
+	}
+	return ""
+}
+
 func isInferenceRoute(method, path string) bool {
-	switch method {
-	case http.MethodPost:
-		switch path {
-		case "/v1/messages",
-			"/v1/chat/completions",
-			"/v1/responses":
-			return true
-		}
-		// Gemini routes are registered as path prefixes ({model}:{action}). Track
-		// only the generating actions HandleGeminiModels actually serves; the
-		// action is the suffix after the last colon (parseGeminiPath), and
-		// r.URL.Path carries no query string, so a suffix match is exact. This
-		// excludes :countTokens (a sizing probe) and any unsupported/typo action
-		// (e.g. :embedContent, :generateContentt) that the handler rejects with a
-		// 400 before any upstream completion — those must not skew the metrics.
-		if isGeminiModelsPath(path) {
-			return strings.HasSuffix(path, ":generateContent") ||
-				strings.HasSuffix(path, ":streamGenerateContent")
-		}
-		return false
-	default:
-		return false
+	return inferenceEndpointLabel(method, path) != ""
+}
+
+// InitializeRequestSummaryForRoute records the stable endpoint label before
+// body parsing or handler validation. Handlers later enrich the same summary
+// with model, provider, streaming, usage, and upstream-attempt details.
+func (h *ProxyHandler) InitializeRequestSummaryForRoute(ctx context.Context, method, path string) {
+	if h == nil {
+		return
+	}
+	label := inferenceEndpointLabel(method, path)
+	if label == "" {
+		return
+	}
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		summary.setRoute(label, "", false)
 	}
 }
 
