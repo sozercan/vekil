@@ -174,7 +174,17 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	if err := h.validateRouteAwareRequestJSON(bodyBytes, extractResponsesRequestModel(bodyBytes), providerEndpointResponses); err != nil {
+	requestedModel := extractResponsesRequestModel(bodyBytes)
+	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), requestedModel, providerEndpointResponses)
+	if err != nil {
+		h.writeResponsesUpstreamRequestFailure(w, r, nil, "responses_admission", err)
+		return
+	}
+	if admittedOperation != nil {
+		r = r.WithContext(admissionCtx)
+		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
+	}
+	if err := h.validateRouteAwareRequestJSON(bodyBytes, requestedModel, providerEndpointResponses); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
@@ -184,6 +194,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), prepared.streaming)
 	defer upstreamCancel()
+	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), prepared.model, providerEndpointResponses)
 	if err != nil {
 		h.writeResponsesUpstreamRequestFailure(w, r, upstreamCtx, "responses", err)
@@ -547,7 +558,19 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	if err := h.validateRouteAwareRequestJSON(bodyBytes, extractResponsesRequestModel(bodyBytes), providerEndpointResponses); err != nil {
+	requestedModel := extractResponsesRequestModel(bodyBytes)
+	admissionInbound := suppressRouteAttemptStats(r.Context())
+	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), admissionInbound, requestedModel, providerEndpointResponses)
+	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+		return
+	}
+	if admittedOperation != nil {
+		r = r.WithContext(admissionCtx)
+		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
+	}
+	if err := h.validateRouteAwareRequestJSON(bodyBytes, requestedModel, providerEndpointResponses); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
@@ -577,6 +600,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
 	defer upstreamCancel()
 	model := rawJSONString(body["model"])
+	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), model, providerEndpointResponses)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
@@ -644,7 +668,19 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	if err := h.validateRouteAwareRequestJSON(bodyBytes, extractResponsesRequestModel(bodyBytes), providerEndpointResponses); err != nil {
+	requestedModel := extractResponsesRequestModel(bodyBytes)
+	admissionInbound := suppressRouteAttemptStats(r.Context())
+	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), admissionInbound, requestedModel, providerEndpointResponses)
+	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+		return
+	}
+	if admittedOperation != nil {
+		r = r.WithContext(admissionCtx)
+		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
+	}
+	if err := h.validateRouteAwareRequestJSON(bodyBytes, requestedModel, providerEndpointResponses); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
@@ -689,6 +725,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
 	extraHeaders := responsesExtraHeadersFromRequest(r)
+	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), memReq.Model, providerEndpointResponses)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
@@ -1042,13 +1079,121 @@ func (r compactInflightResult) clone() (string, *http.Response, error) {
 	return r.summary, cloneHTTPResponseWithBody(r.resp, r.respBody), r.err
 }
 
-func compactInflightKey(requestFields map[string]json.RawMessage, extraHeaders http.Header) (string, bool) {
-	h := sha256.New()
-	writeCompactInflightKeyPart(h, []byte("request"))
-	writeCompactInflightKeyRawMap(h, requestFields)
-	writeCompactInflightKeyPart(h, []byte("headers"))
-	writeCompactInflightKeyHeaders(h, extraHeaders)
-	return hex.EncodeToString(h.Sum(nil)), true
+func compactInflightKey(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header) (string, bool) {
+	digest := sha256.New()
+	writeCompactInflightKeyPart(digest, []byte("request"))
+	writeCompactInflightKeyRawMap(digest, requestFields)
+	writeCompactInflightKeyPart(digest, []byte("headers"))
+	writeCompactInflightKeyHeaders(digest, extraHeaders)
+
+	operation := routeOperationFromContext(ctx)
+	if operation != nil && operation.route != nil && !operation.route.legacy {
+		// Keep the legacy key byte-for-byte unchanged, but bind explicit-route
+		// coalescing to the exact dispatch boundary. A compact summary produced
+		// with another target's model, credentials, or provider-owned headers is
+		// not interchangeable even when the logical request body is identical.
+		if !writeCompactInflightExplicitRouteIdentity(digest, ctx, operation) {
+			return "", false
+		}
+	}
+
+	return hex.EncodeToString(digest.Sum(nil)), true
+}
+
+func writeCompactInflightExplicitRouteIdentity(w io.Writer, ctx context.Context, operation *routeOperation) bool {
+	if operation == nil || operation.route == nil || operation.route.legacy {
+		return true
+	}
+
+	route := operation.route
+	operation.mu.Lock()
+	pinnedTargetID := strings.TrimSpace(operation.pinnedTargetID)
+	hardPinned := operation.hardPinned
+	remainingTargetAttempts := operation.remainingTargetAttempts
+	remainingUpstreamSends := operation.remainingUpstreamSends
+	commitment := operation.commitment
+	attemptedTargetIDs := make([]string, 0, len(operation.attemptedTargets))
+	for targetID := range operation.attemptedTargets {
+		attemptedTargetIDs = append(attemptedTargetIDs, targetID)
+	}
+	operation.mu.Unlock()
+	sort.Strings(attemptedTargetIDs)
+
+	writeCompactInflightKeyPart(w, []byte("explicit-route"))
+	writeCompactInflightKeyPart(w, []byte(fmt.Sprintf("%p", route)))
+	writeCompactInflightKeyPart(w, []byte(route.public.routeID))
+	writeCompactInflightKeyPart(w, []byte(route.public.id))
+	writeCompactInflightKeyPart(w, []byte(route.policy.mode))
+	writeCompactInflightKeyPart(w, []byte(strconv.Itoa(route.policy.maxTargetAttempts)))
+	writeCompactInflightKeyPart(w, []byte(strconv.Itoa(route.policy.maxUpstreamSends)))
+	writeCompactInflightKeyPart(w, []byte(strconv.FormatBool(route.policy.legacyRetry)))
+	writeCompactInflightKeyRequestPolicy(w, route.public.policy)
+
+	writeCompactInflightKeyPart(w, []byte(pinnedTargetID))
+	writeCompactInflightKeyPart(w, []byte(strconv.FormatBool(hardPinned)))
+	writeCompactInflightKeyPart(w, []byte(strconv.Itoa(remainingTargetAttempts)))
+	writeCompactInflightKeyPart(w, []byte(strconv.Itoa(remainingUpstreamSends)))
+	writeCompactInflightKeyPart(w, []byte(commitment))
+	for _, targetID := range attemptedTargetIDs {
+		writeCompactInflightKeyPart(w, []byte(targetID))
+	}
+
+	targets := orderedRouteTargets(route, operation, providerEndpointResponses)
+	if len(targets) == 0 {
+		return false
+	}
+	writeCompactInflightKeyPart(w, []byte(strconv.Itoa(len(targets))))
+	upstreamModelOverride := routeUpstreamModelOverrideFromContext(ctx)
+	for _, target := range targets {
+		if target.provider == nil {
+			return false
+		}
+		upstreamModel := strings.TrimSpace(target.upstreamModel)
+		if upstreamModelOverride != "" {
+			upstreamModel = upstreamModelOverride
+		}
+		writeCompactInflightKeyPart(w, []byte("target"))
+		writeCompactInflightKeyPart(w, []byte(target.id))
+		writeCompactInflightKeyPart(w, []byte(upstreamModel))
+		writeCompactInflightKeyRequestPolicy(w, target.wirePolicy)
+		writeCompactInflightKeyProvider(w, target.provider)
+	}
+	return true
+}
+
+func writeCompactInflightKeyRequestPolicy(w io.Writer, policy providerRequestPolicy) {
+	parallelToolCalls := "unset"
+	if policy.parallelToolCalls != nil {
+		parallelToolCalls = strconv.FormatBool(*policy.parallelToolCalls)
+	}
+	writeCompactInflightKeyPart(w, []byte(parallelToolCalls))
+	writeCompactInflightKeyPart(w, []byte(strconv.FormatBool(policy.dropSamplingParams)))
+	writeCompactInflightKeyPart(w, []byte(strconv.FormatBool(policy.useMaxCompletionTokens)))
+}
+
+func writeCompactInflightKeyProvider(w io.Writer, provider *providerRuntime) {
+	writeCompactInflightKeyPart(w, []byte(fmt.Sprintf("%p", provider)))
+	writeCompactInflightKeyPart(w, []byte(provider.id))
+	writeCompactInflightKeyPart(w, []byte(provider.kind))
+	writeCompactInflightKeyPart(w, []byte(provider.baseURL))
+	writeCompactInflightKeyPart(w, []byte(provider.paths.responses))
+	writeCompactInflightKeyPart(w, []byte(provider.apiVersion))
+	writeCompactInflightKeyPart(w, []byte(provider.authMode))
+	writeCompactInflightKeyPart(w, []byte(provider.tokenScope))
+	writeCompactInflightKeyPart(w, []byte(provider.authType))
+	writeCompactInflightKeyPart(w, []byte(provider.authHeader))
+	writeCompactInflightKeyPart(w, []byte(provider.authPrefix))
+	writeCompactInflightKeyPart(w, []byte(provider.apiKey))
+	writeCompactInflightKeyHeaders(w, provider.extraHeaders)
+	writeCompactInflightKeyPart(w, []byte(fmt.Sprintf("%T:%p", provider.azureToken, provider.azureToken)))
+	writeCompactInflightKeyPart(w, []byte(fmt.Sprintf("%p", provider.codexAuth)))
+	if provider.codexAuth != nil {
+		writeCompactInflightKeyPart(w, []byte(provider.codexAuth.path))
+		writeCompactInflightKeyPart(w, []byte(provider.codexAuth.sharedStateKey))
+	}
+	if encoded, err := json.Marshal(provider.headerProfiles); err == nil {
+		writeCompactInflightKeyPart(w, encoded)
+	}
 }
 
 func writeCompactInflightKeyRawMap(w io.Writer, values map[string]json.RawMessage) {
@@ -1148,7 +1293,7 @@ func waitCompactInflight(ctx context.Context, call *compactInflightCall) (string
 }
 
 func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header) (string, *http.Response, error) {
-	key, ok := compactInflightKey(requestFields, extraHeaders)
+	key, ok := compactInflightKey(ctx, requestFields, extraHeaders)
 	if !ok {
 		budget := newCompactBudget(h.effectiveCompactMaxAttempts())
 		return h.compactResponsesRequestWithBudget(ctx, requestFields, extraHeaders, budget)

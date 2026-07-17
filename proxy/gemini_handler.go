@@ -49,6 +49,20 @@ func (h *ProxyHandler) HandleGeminiModels(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	admissionInbound := r.Context()
+	if action == "countTokens" {
+		admissionInbound = suppressRouteAttemptStats(admissionInbound)
+	}
+	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), admissionInbound, normalizeGeminiModelName(model), providerEndpointChatCompletions)
+	if err != nil {
+		h.writeGeminiUpstreamFailure(w, err)
+		return
+	}
+	if admittedOperation != nil {
+		r = r.WithContext(admissionCtx)
+		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
+	}
+
 	switch action {
 	case "generateContent":
 		h.handleGeminiGenerateContent(w, r, model, false)
@@ -123,6 +137,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), stream || forceStream)
 	defer upstreamCancel()
+	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), oaiReq.Model, providerEndpointChatCompletions)
 	if err != nil {
 		h.writeGeminiUpstreamFailure(w, err)
@@ -413,6 +428,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
+	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, route, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), oaiReq.Model, providerEndpointChatCompletions)
 	if err != nil {
 		h.writeGeminiUpstreamFailure(w, err)

@@ -219,6 +219,24 @@ func TestRouteObservabilityJSONFields(t *testing.T) {
 		StateBindingEvictions: 6,
 		ByRoute:               []statsBreakdown{{Route: "route-a", Requests: 1}},
 		ByTarget:              []statsTargetBreakdown{{Route: "route-a", Target: "target-a", Attempts: 2}},
+		PhysicalUsage:         statsTokenUsage{PromptTokens: 8, CompletionTokens: 2, TotalTokens: 10},
+		WastedUsage:           statsTokenUsage{PromptTokens: 3, CompletionTokens: 1, TotalTokens: 4},
+		RecentAttempts: []recentRouteAttempt{{
+			OperationID:          "op-a",
+			RouteID:              "route-a",
+			TargetID:             "target-a",
+			ProviderID:           "provider-a",
+			Sequence:             1,
+			AttemptKind:          routeAttemptNormal,
+			Status:               "429",
+			StatusCode:           http.StatusTooManyRequests,
+			Outcome:              routeAttemptOutcomeRejected,
+			Delivery:             requestExplicitlyRejected,
+			SemanticProgress:     upstreamProgressNone,
+			DownstreamCommitment: downstreamCommitmentNone,
+			RetryDecision:        routeRetrySwitchTarget,
+			CleanupComplete:      true,
+		}},
 		Recent: []recentRequest{{
 			OperationID:    "op-a",
 			RouteID:        "route-a",
@@ -238,7 +256,8 @@ func TestRouteObservabilityJSONFields(t *testing.T) {
 	}
 	for _, key := range []string{
 		"upstream_attempts", "target_switches", "requests_with_failover", "successful_failovers", "route_exhaustions",
-		"state_binding_hits", "state_binding_misses", "state_binding_evictions", "by_route", "by_target", "recent",
+		"state_binding_hits", "state_binding_misses", "state_binding_evictions", "by_route", "by_target",
+		"physical_usage", "wasted_usage", "recent_attempts", "recent",
 	} {
 		if _, ok := root[key]; !ok {
 			t.Errorf("stats JSON missing %q: %s", key, encoded)
@@ -250,6 +269,14 @@ func TestRouteObservabilityJSONFields(t *testing.T) {
 	}
 	if len(byTarget) != 1 || byTarget[0]["attempts"] != float64(2) {
 		t.Fatalf("by_target attempts JSON = %+v, want attempts=2", byTarget)
+	}
+
+	var recentAttempts []map[string]any
+	if err := json.Unmarshal(root["recent_attempts"], &recentAttempts); err != nil {
+		t.Fatalf("json.Unmarshal recent_attempts: %v", err)
+	}
+	if len(recentAttempts) != 1 || recentAttempts[0]["outcome"] != string(routeAttemptOutcomeRejected) || recentAttempts[0]["retry_decision"] != string(routeRetrySwitchTarget) {
+		t.Fatalf("recent_attempts JSON = %+v", recentAttempts)
 	}
 
 	var recent []map[string]any
@@ -269,5 +296,122 @@ func TestRouteObservabilityJSONFields(t *testing.T) {
 		if got := recent[0][key]; got != want {
 			t.Errorf("recent JSON %s = %#v, want %#v (payload %s)", key, got, want, string(encoded))
 		}
+	}
+}
+
+func TestRouteAttemptConcurrentPublicationDoesNotOverwriteNewerRow(t *testing.T) {
+	collector := newStatsCollector()
+	record := collector.beginRouteAttempt(nil, RouteAttemptObservation{
+		OperationID:  "operation-publication-order",
+		RouteID:      "route-publication-order",
+		TargetID:     "target-publication-order",
+		ProviderID:   "provider-publication-order",
+		ProviderKind: "test",
+		Sequence:     1,
+		AttemptKind:  routeAttemptNormal,
+	})
+	state := record.state
+
+	older := state.row
+	older.Status = http.StatusText(http.StatusOK)
+	older.StatusCode = http.StatusOK
+	older.Outcome = routeAttemptOutcomeSucceeded
+	older.SemanticProgress = upstreamProgressTerminalSuccess
+	older.UpstreamRequestID = "request-older"
+	olderUsage := statsTokenUsage{PromptTokens: 3, CompletionTokens: 1, TotalTokens: 4}
+	older.ReportedUsage = &olderUsage
+
+	newer := older
+	newer.Status = strconv.Itoa(http.StatusBadGateway)
+	newer.StatusCode = http.StatusBadGateway
+	newer.Outcome = routeAttemptOutcomeFailed
+	newer.SemanticProgress = upstreamProgressTerminalFailure
+	newer.RetryDecision = routeRetrySuppressedProgress
+	newer.UpstreamRequestID = "request-newer"
+	newerUsage := statsTokenUsage{PromptTokens: 8, CompletionTokens: 2, TotalTokens: 10}
+	newer.ReportedUsage = &newerUsage
+
+	olderReady := make(chan struct{})
+	publishOlder := make(chan struct{})
+	olderDone := make(chan struct{})
+	go func() {
+		close(olderReady)
+		<-publishOlder
+		collector.applyRouteAttemptCompletion(state, routeAttemptPublication{
+			version:           1,
+			row:               older,
+			physicalAccounted: olderUsage,
+		})
+		close(olderDone)
+	}()
+	<-olderReady
+
+	collector.applyRouteAttemptCompletion(state, routeAttemptPublication{
+		version:           2,
+		row:               newer,
+		physicalAccounted: newerUsage,
+		wastedAccounted:   newerUsage,
+	})
+	close(publishOlder)
+	<-olderDone
+
+	snap := collector.snapshot()
+	attempt := routeAttemptBySequence(t, snap.RecentAttempts, 1)
+	if attempt.Outcome != routeAttemptOutcomeFailed || attempt.StatusCode != http.StatusBadGateway || attempt.UpstreamRequestID != "request-newer" {
+		t.Fatalf("concurrent publication regressed newer row = %+v", attempt)
+	}
+	if snap.PhysicalUsage != newerUsage || snap.WastedUsage != newerUsage {
+		t.Fatalf("concurrent publication accounting = physical:%+v wasted:%+v, want %+v", snap.PhysicalUsage, snap.WastedUsage, newerUsage)
+	}
+}
+
+func TestRouteAttemptTraceReconciliationPreservesStrongerTerminalDiagnostics(t *testing.T) {
+	collector := newStatsCollector()
+	record := collector.beginRouteAttempt(nil, RouteAttemptObservation{
+		OperationID:  "operation-terminal-diagnostics",
+		RouteID:      "route-terminal-diagnostics",
+		TargetID:     "target-terminal-diagnostics",
+		ProviderID:   "provider-terminal-diagnostics",
+		ProviderKind: "test",
+		Sequence:     1,
+		AttemptKind:  routeAttemptNormal,
+	})
+	record.complete(routeAttemptCompletion{
+		StatusCode:           http.StatusBadGateway,
+		Outcome:              routeAttemptOutcomeFailed,
+		Delivery:             requestDeliveredOrAmbiguous,
+		SemanticProgress:     upstreamProgressTerminalFailure,
+		DownstreamCommitment: downstreamCommitmentNone,
+		RetryDecision:        routeRetrySuppressedProgress,
+		UpstreamRequestID:    "terminal-event-request",
+		CleanupComplete:      true,
+	})
+
+	weakTrace := routeAttemptTrace{
+		Sequence:    1,
+		TargetID:    "target-terminal-diagnostics",
+		ProviderID:  "provider-terminal-diagnostics",
+		Kind:        routeAttemptNormal,
+		StatusCode:  http.StatusOK,
+		Delivery:    requestDeliveredOrAmbiguous,
+		Progress:    upstreamProgressAllowedPreamble,
+		Commitment:  downstreamCommitmentNone,
+		Decision:    routeRetryAccepted,
+		CleanupDone: false,
+	}
+	record.reconcileTrace(weakTrace, 1)
+	weakTrace.UpstreamID = "preamble-header-request"
+	record.reconcileTrace(weakTrace, 2)
+
+	snap := collector.snapshot()
+	attempt := routeAttemptBySequence(t, snap.RecentAttempts, 1)
+	if attempt.Outcome != routeAttemptOutcomeFailed || attempt.StatusCode != http.StatusBadGateway || attempt.Status != strconv.Itoa(http.StatusBadGateway) {
+		t.Fatalf("weak trace downgraded terminal status = %+v", attempt)
+	}
+	if attempt.UpstreamRequestID != "terminal-event-request" {
+		t.Fatalf("weak trace downgraded terminal request ID = %+v", attempt)
+	}
+	if attempt.SemanticProgress != upstreamProgressTerminalFailure || attempt.RetryDecision != routeRetrySuppressedProgress || !attempt.CleanupComplete {
+		t.Fatalf("weak trace downgraded terminal diagnostics = %+v", attempt)
 	}
 }

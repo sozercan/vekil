@@ -637,6 +637,35 @@ func attachExplicitChatExecutionErrorRoute(err error, route *modelRoute, target 
 	attachChatExecutionErrorRoute(err, explicitResolvedChatRouteForTarget(route, target, endpoint, backend))
 }
 
+// withAdmittedExplicitRouteOperation establishes an explicit-route operation as
+// soon as the HTTP surface can resolve the requested model. Admission does not
+// require the surface endpoint to be supported: endpoint eligibility and strict
+// request validation must still return the proxy-owned operation ID. Later
+// execution attaches this operation to its upstream context and reuses it via
+// withExplicitRouteOperation.
+func (h *ProxyHandler) withAdmittedExplicitRouteOperation(ctx, inbound context.Context, model, endpoint string) (context.Context, *routeOperation, *modelRoute, error) {
+	route, known := h.resolveModelRouteForRequest(model, endpoint)
+	if !known || route == nil || route.legacy {
+		return ctx, nil, route, nil
+	}
+
+	operation := routeOperationFromContext(ctx)
+	if operation != nil {
+		if operation.route != route {
+			return ctx, nil, route, fmt.Errorf("route operation for %q cannot execute route %q", operation.route.public.id, route.public.id)
+		}
+	} else {
+		operation = newRouteOperation(route, inbound)
+		ctx = withRouteOperation(ctx, operation)
+	}
+
+	if summary := RequestSummaryFromContext(inbound); summary != nil {
+		summary.SetOperationID(operation.operationID())
+		summary.SetRouteID(route.public.routeID)
+	}
+	return ctx, operation, route, nil
+}
+
 func (h *ProxyHandler) withChatExecutionRoute(ctx, inbound context.Context, model string, body []byte) (context.Context, *routeOperation, *modelRoute, error) {
 	route, known := h.resolveModelRouteForRequest(model, providerEndpointChatCompletions)
 	if !known || route == nil || route.legacy {
@@ -1098,6 +1127,7 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), streaming)
 	defer upstreamCancel()
+	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, route, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), publicModel, providerEndpointMessages)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
@@ -1174,6 +1204,7 @@ func (h *ProxyHandler) postAnthropicMessagesCountTokensForModel(ctx context.Cont
 func (h *ProxyHandler) forwardAnthropicCountTokensDirect(w http.ResponseWriter, r *http.Request, body []byte, model string) {
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
+	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), model, providerEndpointMessages)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
@@ -1381,6 +1412,18 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	}
 	defer func() { _ = r.Body.Close() }()
 
+	admissionModel := extractOpenAIChatCompletionsRequestModel(body)
+	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), admissionModel, providerEndpointMessages)
+	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
+		return
+	}
+	if admittedOperation != nil {
+		r = r.WithContext(admissionCtx)
+		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
+	}
+
 	var req models.AnthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		message, _ := jsonDecodeErrorDetails(err, "invalid JSON in request body")
@@ -1431,6 +1474,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
+	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, route, err := h.withChatExecutionRoute(upstreamCtx, r.Context(), providerModel, oaiBody)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
@@ -1628,6 +1672,19 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 	}
 	defer func() { _ = r.Body.Close() }()
 
+	admissionModel := extractOpenAIChatCompletionsRequestModel(body)
+	admissionInbound := suppressRouteAttemptStats(r.Context())
+	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), admissionInbound, admissionModel, providerEndpointMessages)
+	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
+		return
+	}
+	if admittedOperation != nil {
+		r = r.WithContext(admissionCtx)
+		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
+	}
+
 	var req models.AnthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		message, _ := jsonDecodeErrorDetails(err, "invalid JSON in request body")
@@ -1665,6 +1722,7 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
+	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, _, err := h.withChatExecutionRoute(upstreamCtx, suppressRouteAttemptStats(r.Context()), providerModel, nil)
 	if err != nil {
 		var executionErr *chatExecutionError
@@ -1830,6 +1888,16 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 	defer func() { _ = r.Body.Close() }()
 	requestedModel := extractOpenAIChatCompletionsRequestModel(bodyBytes)
+	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), requestedModel, providerEndpointChatCompletions)
+	if err != nil {
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+		return
+	}
+	if admittedOperation != nil {
+		r = r.WithContext(admissionCtx)
+		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
+	}
 	if err := h.validateRouteAwareRequestJSON(bodyBytes, requestedModel, providerEndpointChatCompletions); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
@@ -1847,6 +1915,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
+	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, route, err := h.withChatExecutionRoute(upstreamCtx, r.Context(), requestedModel, bodyBytes)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {

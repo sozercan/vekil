@@ -2472,9 +2472,10 @@ func TestHandleGeminiModelsCountTokensRejectsIneligibleExplicitRoute(t *testing.
 	}
 	t.Cleanup(handler.BeginShutdown)
 
+	ctx, summary := WithRequestSummary(context.Background())
 	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/public-model:countTokens", strings.NewReader(`{
 		"contents": [{"role":"user","parts":[{"text":"Count this"}]}]
-	}`))
+	}`)).WithContext(ctx)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -2501,6 +2502,7 @@ func TestHandleGeminiModelsCountTokensRejectsIneligibleExplicitRoute(t *testing.
 	if got := upstreamCalls.Load(); got != 0 {
 		t.Fatalf("upstream calls = %d, want 0", got)
 	}
+	assertExplicitAdmissionOperationID(t, w, summary, "responses-route")
 }
 
 func newGeminiCountTokensRouteTestHandler(t testing.TB, providers []ProviderConfig, targets []ModelRouteTargetConfig, routing ModelRouteRoutingConfig) *ProxyHandler {

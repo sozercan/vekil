@@ -1114,7 +1114,8 @@ func TestExplicitRouteSurfacesRejectAmbiguousJSONBeforeTranslation(t *testing.T)
 			defer secondary.Close()
 
 			h := newExplicitRouteSurfaceHandler(t, providerTypeAzureOpenAI, providerEndpointChatCompletions, primary.URL, secondary.URL)
-			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			ctx, summary := WithRequestSummary(context.Background())
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body)).WithContext(ctx)
 			w := httptest.NewRecorder()
 			tt.run(h, w, req)
 			if w.Code != http.StatusBadRequest {
@@ -1126,6 +1127,7 @@ func TestExplicitRouteSurfacesRejectAmbiguousJSONBeforeTranslation(t *testing.T)
 			if !strings.Contains(w.Body.String(), "duplicate") {
 				t.Fatalf("body = %s, want duplicate-key detail", w.Body.String())
 			}
+			assertExplicitAdmissionOperationID(t, w, summary, "route-public")
 		})
 	}
 }
@@ -1210,6 +1212,9 @@ func TestAnthropicDuplicateModelSelectionPreservesLegacyForwarding(t *testing.T)
 			}
 			if calls.Load() != 1 {
 				t.Fatalf("upstream calls = %d, want 1", calls.Load())
+			}
+			if got := w.Header().Get("X-Vekil-Request-ID"); got != "" {
+				t.Fatalf("legacy X-Vekil-Request-ID = %q, want empty", got)
 			}
 			select {
 			case model := <-seenModel:
@@ -1302,6 +1307,9 @@ func TestMixedRouteConfigScopesAmbiguousJSONValidationToExplicitRoutes(t *testin
 		if legacyCalls.Load() != 1 || explicitCalls.Load() != 0 {
 			t.Fatalf("legacy calls = %d, explicit calls = %d", legacyCalls.Load(), explicitCalls.Load())
 		}
+		if got := w.Header().Get("X-Vekil-Request-ID"); got != "" {
+			t.Fatalf("legacy X-Vekil-Request-ID = %q, want empty", got)
+		}
 	})
 
 	t.Run("explicit route rejects before dispatch", func(t *testing.T) {
@@ -1315,6 +1323,9 @@ func TestMixedRouteConfigScopesAmbiguousJSONValidationToExplicitRoutes(t *testin
 		if !strings.Contains(w.Body.String(), "duplicate") {
 			t.Fatalf("body = %s, want duplicate-key detail", w.Body.String())
 		}
+		if got := w.Header().Get("X-Vekil-Request-ID"); got == "" {
+			t.Fatal("explicit route response missing X-Vekil-Request-ID")
+		}
 	})
 
 	t.Run("explicit route alias rejects before dispatch", func(t *testing.T) {
@@ -1327,6 +1338,9 @@ func TestMixedRouteConfigScopesAmbiguousJSONValidationToExplicitRoutes(t *testin
 		}
 		if !strings.Contains(w.Body.String(), "duplicate") {
 			t.Fatalf("body = %s, want duplicate-key detail", w.Body.String())
+		}
+		if got := w.Header().Get("X-Vekil-Request-ID"); got == "" {
+			t.Fatal("explicit route alias response missing X-Vekil-Request-ID")
 		}
 	})
 }
@@ -1406,13 +1420,15 @@ func TestMixedRouteConfigOpenAIChatDuplicateModelValidationUsesForwardingSemanti
 		wantLegacyCalls   int32
 		wantExplicitCalls int32
 		wantResponseModel string
+		wantOperationID   bool
 		stream            bool
 	}{
 		{
-			name:       "first legacy last explicit rejects",
-			models:     `"model":"legacy-first","model":"explicit-model"`,
-			wantStatus: http.StatusBadRequest,
-			stream:     true,
+			name:            "first legacy last explicit rejects",
+			models:          `"model":"legacy-first","model":"explicit-model"`,
+			wantStatus:      http.StatusBadRequest,
+			wantOperationID: true,
+			stream:          true,
 		},
 		{
 			name:              "first explicit last legacy follows last decoded model",
@@ -1422,9 +1438,10 @@ func TestMixedRouteConfigOpenAIChatDuplicateModelValidationUsesForwardingSemanti
 			wantResponseModel: lastLegacyModel,
 		},
 		{
-			name:       "same explicit duplicates reject",
-			models:     `"model":"explicit-model","model":"explicit-model"`,
-			wantStatus: http.StatusBadRequest,
+			name:            "same explicit duplicates reject",
+			models:          `"model":"explicit-model","model":"explicit-model"`,
+			wantStatus:      http.StatusBadRequest,
+			wantOperationID: true,
 		},
 		{
 			name:              "purely legacy duplicates keep provider behavior",
@@ -1455,6 +1472,13 @@ func TestMixedRouteConfigOpenAIChatDuplicateModelValidationUsesForwardingSemanti
 			}
 			if got := explicitCalls.Load() - explicitBefore; got != tt.wantExplicitCalls {
 				t.Fatalf("explicit calls = %d, want %d", got, tt.wantExplicitCalls)
+			}
+			operationID := w.Header().Get("X-Vekil-Request-ID")
+			if tt.wantOperationID && operationID == "" {
+				t.Fatal("explicit route response missing X-Vekil-Request-ID")
+			}
+			if !tt.wantOperationID && operationID != "" {
+				t.Fatalf("legacy route X-Vekil-Request-ID = %q, want empty", operationID)
 			}
 			if tt.wantStatus == http.StatusBadRequest {
 				if !strings.Contains(w.Body.String(), "duplicate") {

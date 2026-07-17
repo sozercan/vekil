@@ -1377,6 +1377,8 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return err
 	}
 	metrics := responsesWebSocketRequestMetrics{}
+	var routeOperation *routeOperation
+	var explicitRoute *modelRoute
 	turnRecorded := false
 	var turnStatsRecord responsesTurnStatsRecord
 	recordTurn := func(status int, usage responsesUsage) {
@@ -1384,7 +1386,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			return
 		}
 		turnRecorded = true
-		turnStatsRecord = s.recordTurnStats(h, request.Model, metrics.providerID, metrics.providerKind, status, metrics.totalUsage(usage))
+		turnStatsRecord = s.recordTurnStats(h, request.Model, metrics.providerID, metrics.providerKind, status, metrics.totalUsage(usage), routeOperation)
 	}
 	var peek *peekResult
 	var resp *http.Response
@@ -1476,8 +1478,6 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	// never marks it; do it explicitly here.
 	upstreamCtx = markRetryStatsTracked(upstreamCtx)
 	upstreamCtx, routeObserver := withProviderRouteObserver(upstreamCtx)
-	var routeOperation *routeOperation
-	var explicitRoute *modelRoute
 	upstreamCtx, routeOperation, explicitRoute, err = s.prepareExplicitRouteOperation(h, upstreamCtx, request.Model)
 	if err != nil {
 		upstreamCancel()
@@ -1708,7 +1708,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 // recordTurnStats records one websocket-bridge turn into traffic stats,
 // resolving the provider for attribution. status is the turn outcome (200 for a
 // completed turn, an error status for a failed one).
-func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model, providerID, providerKind string, status int, usage responsesUsage) responsesTurnStatsRecord {
+func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model, providerID, providerKind string, status int, usage responsesUsage, operation *routeOperation) responsesTurnStatsRecord {
 	if h == nil {
 		return responsesTurnStatsRecord{}
 	}
@@ -1717,7 +1717,11 @@ func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model, prov
 			providerID, providerKind = provider.id, string(provider.kind)
 		}
 	}
-	return h.RecordResponsesTurn(model, providerID, providerKind, classifyAgent(s.userAgent), status, usage)
+	operationID := ""
+	if operation != nil {
+		operationID = operation.operationID()
+	}
+	return h.RecordResponsesTurn(model, providerID, providerKind, classifyAgent(s.userAgent), status, usage, operationID)
 }
 
 func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) (responsesWebSocketRequestPlan, error) {

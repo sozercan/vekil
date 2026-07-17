@@ -89,11 +89,78 @@ type statsBreakdown struct {
 // statsTargetBreakdown is one physical-attempt row. Attempts are actual
 // upstream sends, not client requests and not legacy same-target retries.
 type statsTargetBreakdown struct {
-	Route    string `json:"route,omitempty"`
-	Target   string `json:"target"`
-	Provider string `json:"provider,omitempty"`
-	Kind     string `json:"kind,omitempty"`
-	Attempts int64  `json:"attempts"`
+	Route         string          `json:"route,omitempty"`
+	Target        string          `json:"target"`
+	Provider      string          `json:"provider,omitempty"`
+	Kind          string          `json:"kind,omitempty"`
+	Attempts      int64           `json:"attempts"`
+	PhysicalUsage statsTokenUsage `json:"physical_usage"`
+	WastedUsage   statsTokenUsage `json:"wasted_usage"`
+}
+
+// statsTokenUsage is the normalized token shape shared by physical-attempt
+// diagnostics and aggregate physical/wasted accounting. It deliberately uses
+// the public prompt/completion vocabulary so callers can compare it directly
+// with the existing client-request totals without retaining provider payloads.
+type statsTokenUsage struct {
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	TotalTokens      int64 `json:"total_tokens"`
+	CachedTokens     int64 `json:"cached_tokens"`
+	ReasoningTokens  int64 `json:"reasoning_tokens"`
+}
+
+func (u statsTokenUsage) isZero() bool {
+	return u.PromptTokens == 0 && u.CompletionTokens == 0 && u.TotalTokens == 0 &&
+		u.CachedTokens == 0 && u.ReasoningTokens == 0
+}
+
+func (u statsTokenUsage) normalized() statsTokenUsage {
+	u.PromptTokens = max(u.PromptTokens, 0)
+	u.CompletionTokens = max(u.CompletionTokens, 0)
+	u.CachedTokens = max(u.CachedTokens, 0)
+	u.ReasoningTokens = max(u.ReasoningTokens, 0)
+	if u.TotalTokens < 0 {
+		u.TotalTokens = 0
+	}
+	if u.TotalTokens == 0 {
+		u.TotalTokens = u.PromptTokens + u.CompletionTokens
+	}
+	return u
+}
+
+func (u *statsTokenUsage) add(other statsTokenUsage) {
+	if u == nil {
+		return
+	}
+	other = other.normalized()
+	u.PromptTokens += other.PromptTokens
+	u.CompletionTokens += other.CompletionTokens
+	u.TotalTokens += other.TotalTokens
+	u.CachedTokens += other.CachedTokens
+	u.ReasoningTokens += other.ReasoningTokens
+}
+
+func statsTokenUsageFromResponses(usage responsesUsage) statsTokenUsage {
+	return statsTokenUsage{
+		PromptTokens:     int64(usage.InputTokens),
+		CompletionTokens: int64(usage.OutputTokens),
+		TotalTokens:      int64(usage.totalTokens()),
+		CachedTokens:     int64(usage.InputTokensDetails.CachedTokens),
+		ReasoningTokens:  int64(usage.OutputTokensDetails.ReasoningTokens),
+	}.normalized()
+}
+
+func statsTokenUsageDelta(current, accounted statsTokenUsage) statsTokenUsage {
+	current = current.normalized()
+	accounted = accounted.normalized()
+	return statsTokenUsage{
+		PromptTokens:     max(current.PromptTokens-accounted.PromptTokens, 0),
+		CompletionTokens: max(current.CompletionTokens-accounted.CompletionTokens, 0),
+		TotalTokens:      max(current.TotalTokens-accounted.TotalTokens, 0),
+		CachedTokens:     max(current.CachedTokens-accounted.CachedTokens, 0),
+		ReasoningTokens:  max(current.ReasoningTokens-accounted.ReasoningTokens, 0),
+	}
 }
 
 // statsErrorRow is one row in the error-by-status or error-by-target lists.
@@ -116,6 +183,12 @@ type statsSnapshot struct {
 	ByAgent       []statsBreakdown       `json:"by_agent"`
 	ByRoute       []statsBreakdown       `json:"by_route"`
 	ByTarget      []statsTargetBreakdown `json:"by_target"`
+	// PhysicalUsage counts usage reported by explicit-route upstream sends.
+	// WastedUsage is the subset reported by attempts that did not become an
+	// accepted client-visible result. Both ledgers are additive to, and do not
+	// redefine, the legacy client-request totals above.
+	PhysicalUsage statsTokenUsage `json:"physical_usage"`
+	WastedUsage   statsTokenUsage `json:"wasted_usage"`
 	// Route/failover counters are additive to the legacy client-request totals.
 	// Physical attempts and target switches never increment Totals.Requests or
 	// Retries; the latter retains its same-target legacy retry meaning.
@@ -133,6 +206,9 @@ type statsSnapshot struct {
 	RetriesByCode []statsErrorRow `json:"retries_by_code"`
 	// Recent is the most-recent completed requests (newest first) for drill-down.
 	Recent []recentRequest `json:"recent"`
+	// RecentAttempts is a separately bounded, redacted physical-send trace. It
+	// never carries request/response bodies, raw errors, model rewrites, or state.
+	RecentAttempts []recentRouteAttempt `json:"recent_attempts"`
 	// InsightsEnabled reports whether a model is configured for on-demand
 	// LLM-generated insights (drives the dashboard's "Generate insights" button).
 	InsightsEnabled bool `json:"insights_enabled"`
@@ -160,11 +236,13 @@ type breakdownCounter struct {
 }
 
 type targetAttemptCounter struct {
-	route    string
-	target   string
-	provider string
-	kind     string
-	attempts int64
+	route         string
+	target        string
+	provider      string
+	kind          string
+	attempts      int64
+	physicalUsage statsTokenUsage
+	wastedUsage   statsTokenUsage
 }
 
 // statsCollector aggregates per-request traffic in memory for the dashboard.
@@ -194,6 +272,8 @@ type statsCollector struct {
 	stateBindingHits      int64
 	stateBindingMisses    int64
 	stateBindingEvictions int64
+	physicalUsage         statsTokenUsage
+	wastedUsage           statsTokenUsage
 
 	// retries counts upstream retry attempts the proxy made (transient 429/503,
 	// transport errors). These are usually invisible to clients because the
@@ -207,6 +287,13 @@ type statsCollector struct {
 	recentIdx      int
 	recentSize     int
 	recentSequence uint64
+
+	// recentAttempts is an independently bounded physical-send ring. A request
+	// can produce several entries here but still exactly one row in recent.
+	recentAttempts        []recentRouteAttempt
+	recentAttemptIdx      int
+	recentAttemptSize     int
+	recentAttemptSequence uint64
 
 	// latencies is a bounded ring of recent request durations (ms) used to
 	// compute p50/p95/p99 without retaining every sample forever.
@@ -240,6 +327,87 @@ type recentRequest struct {
 // websocket create turn. It lets post-terminal internal compaction add token
 // usage without incrementing request/error counts or attributing the delta to a
 // provider/model that changed after the upstream route was selected.
+// recentRouteAttempt is one production-visible physical-attempt row. The
+// unexported state pointer lets the attempt lifecycle update a still-retained
+// ring row after late route reclassification without exposing or retaining any
+// provider payload.
+type recentRouteAttempt struct {
+	recordID             uint64
+	state                *routeAttemptRecordState
+	T                    int64                    `json:"t"`
+	OperationID          string                   `json:"operation_id,omitempty"`
+	RouteID              string                   `json:"route_id,omitempty"`
+	TargetID             string                   `json:"target_id,omitempty"`
+	ProviderID           string                   `json:"provider_id,omitempty"`
+	ProviderKind         string                   `json:"provider_kind,omitempty"`
+	Sequence             int                      `json:"sequence"`
+	AttemptKind          routeAttemptKind         `json:"attempt_kind"`
+	Status               string                   `json:"status"`
+	StatusCode           int                      `json:"status_code,omitempty"`
+	Outcome              routeAttemptOutcome      `json:"outcome"`
+	Delivery             requestDelivery          `json:"delivery,omitempty"`
+	SemanticProgress     upstreamSemanticProgress `json:"semantic_progress,omitempty"`
+	DownstreamCommitment downstreamCommitment     `json:"downstream_commitment,omitempty"`
+	RetryDecision        routeRetryDecision       `json:"retry_decision,omitempty"`
+	TTFTMs               *int64                   `json:"ttft_ms,omitempty"`
+	RetryAfterSeconds    *int64                   `json:"retry_after_seconds,omitempty"`
+	UpstreamRequestID    string                   `json:"upstream_request_id,omitempty"`
+	CleanupComplete      bool                     `json:"cleanup_complete"`
+	ReportedUsage        *statsTokenUsage         `json:"reported_usage,omitempty"`
+}
+
+// routeAttemptRecordState is the mutable accounting handle associated with one
+// dispatched attempt. Updates are idempotent and can enrich a terminal row (for
+// example cleanup completion arriving after the terminal event) without
+// double-counting usage.
+type routeAttemptRecordState struct {
+	mu sync.Mutex
+
+	collector *statsCollector
+	targetKey string
+	recentIdx int
+	recordID  uint64
+
+	row                recentRouteAttempt
+	physicalAccounted  statsTokenUsage
+	wastedAccounted    statsTokenUsage
+	traceVersion       uint64
+	publicationVersion uint64
+
+	// published* is guarded by collector.mu rather than state.mu. Publications
+	// carry cumulative accounting snapshots, so a newer publication can safely
+	// subsume an older one that reaches the collector later.
+	publishedVersion  uint64
+	physicalPublished statsTokenUsage
+	wastedPublished   statsTokenUsage
+}
+
+type routeAttemptRecord struct {
+	state *routeAttemptRecordState
+}
+
+type routeAttemptPublication struct {
+	version           uint64
+	row               recentRouteAttempt
+	physicalAccounted statsTokenUsage
+	wastedAccounted   statsTokenUsage
+}
+
+type routeAttemptCompletion struct {
+	StatusCode           int
+	Outcome              routeAttemptOutcome
+	Delivery             requestDelivery
+	SemanticProgress     upstreamSemanticProgress
+	DownstreamCommitment downstreamCommitment
+	RetryDecision        routeRetryDecision
+	TTFTMs               *int64
+	RetryAfterSeconds    *int64
+	UpstreamRequestID    string
+	CleanupComplete      bool
+	ReportedUsage        *statsTokenUsage
+	Wasted               bool
+}
+
 type responsesTurnStatsRecord struct {
 	valid       bool
 	sec         int64
@@ -255,23 +423,26 @@ const (
 	statsLatencySamples = 2048
 	// statsRecentRequests bounds the recent-requests drill-down log.
 	statsRecentRequests = 80
+	// statsRecentRouteAttempts independently bounds the physical-attempt trace.
+	statsRecentRouteAttempts = 256
 )
 
 func newStatsCollector() *statsCollector {
 	c := &statsCollector{
-		now:           time.Now,
-		ring:          make([]secondBucket, statsRingSeconds),
-		status:        make(map[string]int64, 4),
-		statusCodes:   make(map[int]int64),
-		errTargets:    make(map[string]int64),
-		byModel:       make(map[string]*breakdownCounter),
-		byProvider:    make(map[string]*breakdownCounter),
-		byAgent:       make(map[string]*breakdownCounter),
-		byRoute:       make(map[string]*breakdownCounter),
-		byTarget:      make(map[string]*targetAttemptCounter),
-		retriesByCode: make(map[int]int64),
-		recent:        make([]recentRequest, statsRecentRequests),
-		latencies:     make([]int64, statsLatencySamples),
+		now:            time.Now,
+		ring:           make([]secondBucket, statsRingSeconds),
+		status:         make(map[string]int64, 4),
+		statusCodes:    make(map[int]int64),
+		errTargets:     make(map[string]int64),
+		byModel:        make(map[string]*breakdownCounter),
+		byProvider:     make(map[string]*breakdownCounter),
+		byAgent:        make(map[string]*breakdownCounter),
+		byRoute:        make(map[string]*breakdownCounter),
+		byTarget:       make(map[string]*targetAttemptCounter),
+		retriesByCode:  make(map[int]int64),
+		recent:         make([]recentRequest, statsRecentRequests),
+		recentAttempts: make([]recentRouteAttempt, statsRecentRouteAttempts),
+		latencies:      make([]int64, statsLatencySamples),
 	}
 	c.start = c.now()
 	return c
@@ -291,26 +462,246 @@ func (c *statsCollector) incRetry(status int) {
 
 // RouteAttemptObservation identifies one actual physical upstream send. All
 // labels are operational IDs from validated configuration; no upstream model,
-// response ID, state token, or raw error text is retained.
+// response ID, state token, raw error, or body content is retained.
 type RouteAttemptObservation struct {
 	OperationID  string
 	RouteID      string
 	TargetID     string
 	ProviderID   string
 	ProviderKind string
+	Sequence     int
+	AttemptKind  routeAttemptKind
+
+	// operation and startedAt are route-executor-owned metadata. They stay
+	// unexported so callers cannot inject arbitrary trace state into /stats.json.
+	operation *routeOperation
+	startedAt time.Time
 }
 
 // RecordUpstreamAttempt records one actual physical upstream dispatch for the
-// route executor. It updates the per-request summary and physical-attempt
-// ledger without incrementing client request totals or legacy retry counters.
-func (h *ProxyHandler) RecordUpstreamAttempt(ctx context.Context, attempt RouteAttemptObservation) {
-	if summary := RequestSummaryFromContext(ctx); summary != nil {
+// route executor. It updates the per-request summary and aggregate attempt
+// counters immediately, then returns a bounded record that the executor can
+// enrich with the normalized outcome once the attempt resolves. Callers that
+// only need the legacy aggregate side effect may ignore the return value.
+func (h *ProxyHandler) RecordUpstreamAttempt(ctx context.Context, attempt RouteAttemptObservation) *routeAttemptRecord {
+	summary := RequestSummaryFromContext(ctx)
+	if summary != nil {
 		summary.recordUpstreamAttempt(attempt.OperationID, attempt.RouteID, attempt.TargetID, attempt.ProviderID, attempt.ProviderKind)
 	}
+	var record *routeAttemptRecord
 	if h == nil || h.stats == nil {
+		record = &routeAttemptRecord{state: &routeAttemptRecordState{}}
+	} else {
+		record = h.stats.beginRouteAttempt(summary, attempt)
+	}
+	if attempt.operation != nil {
+		attempt.operation.registerAttemptRecord(attempt.Sequence, record)
+	}
+	return record
+}
+
+func (c *statsCollector) beginRouteAttempt(summary *RequestSummary, attempt RouteAttemptObservation) *routeAttemptRecord {
+	if c == nil {
+		return &routeAttemptRecord{state: &routeAttemptRecordState{}}
+	}
+
+	attempt.OperationID = boundOperationalStatLabel(attempt.OperationID)
+	attempt.RouteID = boundOperationalStatLabel(attempt.RouteID)
+	attempt.TargetID = boundOperationalStatLabel(attempt.TargetID)
+	attempt.ProviderID = boundOperationalStatLabel(attempt.ProviderID)
+	attempt.ProviderKind = boundOperationalStatLabel(attempt.ProviderKind)
+	if attempt.Sequence < 0 {
+		attempt.Sequence = 0
+	}
+	if attempt.AttemptKind == "" {
+		attempt.AttemptKind = routeAttemptNormal
+	}
+	startedAt := attempt.startedAt
+	if startedAt.IsZero() {
+		startedAt = c.now()
+	}
+
+	state := &routeAttemptRecordState{
+		collector: c,
+	}
+
+	c.mu.Lock()
+	state.targetKey = c.recordUpstreamAttemptLocked(attempt.RouteID, attempt.TargetID, attempt.ProviderID, attempt.ProviderKind)
+	if c.recentAttemptSequence == ^uint64(0) {
+		c.mu.Unlock()
+		panic("stats recent attempt sequence exhausted")
+	}
+	c.recentAttemptSequence++
+	state.recentIdx = c.recentAttemptIdx
+	state.recordID = c.recentAttemptSequence
+	state.row = recentRouteAttempt{
+		recordID:     state.recordID,
+		state:        state,
+		T:            startedAt.Unix(),
+		OperationID:  attempt.OperationID,
+		RouteID:      attempt.RouteID,
+		TargetID:     attempt.TargetID,
+		ProviderID:   attempt.ProviderID,
+		ProviderKind: attempt.ProviderKind,
+		Sequence:     attempt.Sequence,
+		AttemptKind:  attempt.AttemptKind,
+		Status:       string(routeAttemptOutcomeInFlight),
+		Outcome:      routeAttemptOutcomeInFlight,
+	}
+	c.recentAttempts[state.recentIdx] = state.row
+	c.recentAttemptIdx = (c.recentAttemptIdx + 1) % len(c.recentAttempts)
+	if c.recentAttemptSize < len(c.recentAttempts) {
+		c.recentAttemptSize++
+	}
+	c.mu.Unlock()
+
+	return &routeAttemptRecord{state: state}
+}
+
+func (r *routeAttemptRecord) complete(completion routeAttemptCompletion) {
+	if r == nil || r.state == nil {
 		return
 	}
-	h.stats.recordUpstreamAttempt(attempt.RouteID, attempt.TargetID, attempt.ProviderID, attempt.ProviderKind)
+	state := r.state
+	completion.UpstreamRequestID = boundOperationalStatLabel(completion.UpstreamRequestID)
+	if completion.StatusCode < 0 || completion.StatusCode > 999 {
+		completion.StatusCode = 0
+	}
+	if completion.ReportedUsage != nil {
+		normalized := completion.ReportedUsage.normalized()
+		completion.ReportedUsage = &normalized
+	}
+
+	state.mu.Lock()
+	row := state.row
+	classificationNotWeaker := completion.Outcome == "" || routeAttemptOutcomeRank(completion.Outcome) >= routeAttemptOutcomeRank(row.Outcome)
+	if completion.StatusCode != 0 && classificationNotWeaker {
+		row.StatusCode = completion.StatusCode
+	}
+	if completion.Outcome != "" {
+		row.Outcome = mergeRouteAttemptOutcome(row.Outcome, completion.Outcome)
+	}
+	row.Status = normalizedRouteAttemptStatus(row.StatusCode, row.Outcome)
+	if completion.Delivery != "" && classificationNotWeaker {
+		row.Delivery = completion.Delivery
+	}
+	row.SemanticProgress = mergeUpstreamSemanticProgress(row.SemanticProgress, completion.SemanticProgress)
+	if routeCommitmentRank(completion.DownstreamCommitment) > routeCommitmentRank(row.DownstreamCommitment) {
+		row.DownstreamCommitment = completion.DownstreamCommitment
+	}
+	if completion.RetryDecision != "" && (row.RetryDecision == "" || row.RetryDecision == routeRetryAccepted || completion.RetryDecision != routeRetryAccepted) {
+		row.RetryDecision = completion.RetryDecision
+	}
+	if row.TTFTMs == nil && completion.TTFTMs != nil {
+		value := max(*completion.TTFTMs, 0)
+		row.TTFTMs = &value
+	}
+	if completion.RetryAfterSeconds != nil {
+		value := max(*completion.RetryAfterSeconds, 0)
+		maxSeconds := int64(maxRetryAfter / time.Second)
+		if value > maxSeconds {
+			value = maxSeconds
+		}
+		if value > 0 {
+			row.RetryAfterSeconds = &value
+		}
+	}
+	if completion.UpstreamRequestID != "" {
+		row.UpstreamRequestID = completion.UpstreamRequestID
+	}
+	row.CleanupComplete = row.CleanupComplete || completion.CleanupComplete
+	if completion.ReportedUsage != nil {
+		usage := completion.ReportedUsage.normalized()
+		row.ReportedUsage = &usage
+	}
+	state.row = row
+
+	if row.ReportedUsage != nil {
+		physicalDelta := statsTokenUsageDelta(*row.ReportedUsage, state.physicalAccounted)
+		state.physicalAccounted.add(physicalDelta)
+		if completion.Wasted || routeAttemptOutcomeIsWasted(row.Outcome) {
+			wastedDelta := statsTokenUsageDelta(*row.ReportedUsage, state.wastedAccounted)
+			state.wastedAccounted.add(wastedDelta)
+		}
+	}
+	publication := state.nextPublicationLocked(row)
+	collector := state.collector
+	state.mu.Unlock()
+
+	if collector != nil {
+		collector.applyRouteAttemptCompletion(state, publication)
+	}
+}
+
+// reconcileTrace applies a route-operation trace mutation directly to the
+// attempt record. Usage deltas remain idempotent in the record state, so a late
+// success-to-failure transition accounts wasted spend exactly once even after
+// the diagnostic ring row has been evicted and without waiting for /stats.json.
+func (r *routeAttemptRecord) reconcileTrace(trace routeAttemptTrace, version uint64) {
+	if r == nil || r.state == nil {
+		return
+	}
+	state := r.state
+	state.mu.Lock()
+	if version <= state.traceVersion {
+		state.mu.Unlock()
+		return
+	}
+	state.traceVersion = version
+	row := applyRouteAttemptTrace(state.row, trace)
+	if row.ReportedUsage != nil && routeAttemptOutcomeIsWasted(row.Outcome) {
+		wastedDelta := statsTokenUsageDelta(*row.ReportedUsage, state.wastedAccounted)
+		state.wastedAccounted.add(wastedDelta)
+	}
+	state.row = row
+	publication := state.nextPublicationLocked(row)
+	collector := state.collector
+	state.mu.Unlock()
+
+	if collector != nil {
+		collector.applyRouteAttemptCompletion(state, publication)
+	}
+}
+
+func (s *routeAttemptRecordState) nextPublicationLocked(row recentRouteAttempt) routeAttemptPublication {
+	if s.publicationVersion == ^uint64(0) {
+		panic("route attempt publication sequence exhausted")
+	}
+	s.publicationVersion++
+	return routeAttemptPublication{
+		version:           s.publicationVersion,
+		row:               row,
+		physicalAccounted: s.physicalAccounted,
+		wastedAccounted:   s.wastedAccounted,
+	}
+}
+
+func (c *statsCollector) applyRouteAttemptCompletion(state *routeAttemptRecordState, publication routeAttemptPublication) {
+	if c == nil || state == nil || publication.version == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if publication.version <= state.publishedVersion {
+		return
+	}
+	physicalDelta := statsTokenUsageDelta(publication.physicalAccounted, state.physicalPublished)
+	wastedDelta := statsTokenUsageDelta(publication.wastedAccounted, state.wastedPublished)
+	state.physicalPublished.add(physicalDelta)
+	state.wastedPublished.add(wastedDelta)
+	state.publishedVersion = publication.version
+
+	c.physicalUsage.add(physicalDelta)
+	c.wastedUsage.add(wastedDelta)
+	if counter := c.byTarget[state.targetKey]; counter != nil {
+		counter.physicalUsage.add(physicalDelta)
+		counter.wastedUsage.add(wastedDelta)
+	}
+	if state.recentIdx >= 0 && state.recentIdx < len(c.recentAttempts) && c.recentAttempts[state.recentIdx].recordID == state.recordID {
+		publication.row.state = state
+		c.recentAttempts[state.recentIdx] = publication.row
+	}
 }
 
 // RecordTargetSwitch records selection of a distinct target in the same route.
@@ -368,10 +759,17 @@ func (c *statsCollector) recordUpstreamAttempt(routeID, targetID, providerID, pr
 	providerKind = boundOperationalStatLabel(strings.TrimSpace(providerKind))
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.recordUpstreamAttemptLocked(routeID, targetID, providerID, providerKind)
+	c.mu.Unlock()
+}
+
+// recordUpstreamAttemptLocked increments the dispatch ledger and returns the
+// bounded aggregate key used for later physical/wasted usage attribution.
+// Caller must hold c.mu.
+func (c *statsCollector) recordUpstreamAttemptLocked(routeID, targetID, providerID, providerKind string) string {
 	c.upstreamAttempts++
 	if targetID == "" {
-		return
+		return ""
 	}
 	key := capKey(c.byTarget, targetAttemptKey(routeID, targetID))
 	counter := c.byTarget[key]
@@ -396,6 +794,7 @@ func (c *statsCollector) recordUpstreamAttempt(routeID, targetID, providerID, pr
 		}
 	}
 	counter.attempts++
+	return key
 }
 
 func targetAttemptKey(routeID, targetID string) string {
@@ -464,28 +863,35 @@ func (c *statsCollector) record(summary *RequestSummary, status int, userAgent s
 // or an upstream error status for failed/non-200) so failures show up in error
 // counts and the recent log. Streamed turns carry no latency sample. Every turn
 // is counted as one request even with zero/absent usage, matching the HTTP path.
-func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage) responsesTurnStatsRecord {
+func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, operationIDs ...string) responsesTurnStatsRecord {
+	if status == 0 {
+		status = http.StatusOK
+	}
+	operationID := ""
+	if len(operationIDs) > 0 {
+		operationID = strings.TrimSpace(operationIDs[0])
+	}
+	// Physical/wasted usage belongs exclusively to explicit-route attempt
+	// records. Legacy websocket turns still contribute to the client request
+	// ledger, but must never synthesize explicit-route physical spend.
 	total := usage.totalTokens()
 	d := summaryStats{
-		model:      boundStatLabel(model),
-		provider:   provider,
-		kind:       kind,
-		endpoint:   "responses_ws",
-		stream:     true, // streamed: excluded from latency
-		prompt:     usage.InputTokens,
-		completion: usage.OutputTokens,
-		total:      total,
-		cached:     usage.InputTokensDetails.CachedTokens,
-		reasoning:  usage.OutputTokensDetails.ReasoningTokens,
+		model:       boundStatLabel(model),
+		operationID: boundOperationalStatLabel(operationID),
+		provider:    provider,
+		kind:        kind,
+		endpoint:    "responses_ws",
+		stream:      true, // streamed: excluded from latency
+		prompt:      usage.InputTokens,
+		completion:  usage.OutputTokens,
+		total:       total,
+		cached:      usage.InputTokensDetails.CachedTokens,
+		reasoning:   usage.OutputTokensDetails.ReasoningTokens,
 	}
 	agent := agentLabel
 	if agent == "" {
 		agent = "unknown"
 	}
-	if status == 0 {
-		status = http.StatusOK
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.recordLocked(d, agent, status, 0)
@@ -729,6 +1135,8 @@ func (c *statsCollector) snapshot() statsSnapshot {
 		ByAgent:               topBreakdowns(c.byAgent, breakdownKindAgent),
 		ByRoute:               topBreakdowns(c.byRoute, breakdownKindRoute),
 		ByTarget:              topTargetBreakdowns(c.byTarget),
+		PhysicalUsage:         c.physicalUsage,
+		WastedUsage:           c.wastedUsage,
 		UpstreamAttempts:      c.upstreamAttempts,
 		TargetSwitches:        c.targetSwitches,
 		RequestsWithFailover:  c.requestsWithFailover,
@@ -740,6 +1148,7 @@ func (c *statsCollector) snapshot() statsSnapshot {
 		Retries:               c.retries,
 		RetriesByCode:         retriesRows(c.retriesByCode),
 		Recent:                c.recentSnapshot(),
+		RecentAttempts:        c.recentAttemptsSnapshot(),
 	}
 }
 
@@ -776,6 +1185,90 @@ func (c *statsCollector) recentSnapshot() []recentRequest {
 		out = append(out, c.recent[idx])
 	}
 	return out
+}
+
+// recentAttemptsSnapshot returns the physical-attempt ring newest-first. Caller holds c.mu.
+func (c *statsCollector) recentAttemptsSnapshot() []recentRouteAttempt {
+	out := make([]recentRouteAttempt, 0, c.recentAttemptSize)
+	for i := 0; i < c.recentAttemptSize; i++ {
+		idx := (c.recentAttemptIdx - 1 - i + len(c.recentAttempts)) % len(c.recentAttempts)
+		row := c.recentAttempts[idx]
+		row.state = nil
+		row.recordID = 0
+		out = append(out, row)
+	}
+	return out
+}
+
+func applyRouteAttemptTrace(row recentRouteAttempt, trace routeAttemptTrace) recentRouteAttempt {
+	traceOutcome := routeAttemptOutcomeFromTrace(trace)
+	diagnosticsNotWeaker := routeAttemptDiagnosticsCompare(
+		traceOutcome, trace.Progress, trace.StatusCode,
+		row.Outcome, row.SemanticProgress, row.StatusCode,
+	) >= 0
+	if trace.StatusCode != 0 && diagnosticsNotWeaker {
+		row.StatusCode = trace.StatusCode
+	}
+	if trace.Delivery != "" && diagnosticsNotWeaker {
+		row.Delivery = trace.Delivery
+	}
+	row.SemanticProgress = mergeUpstreamSemanticProgress(row.SemanticProgress, trace.Progress)
+	if routeCommitmentRank(trace.Commitment) > routeCommitmentRank(row.DownstreamCommitment) {
+		row.DownstreamCommitment = trace.Commitment
+	}
+	if trace.Decision != "" && (row.RetryDecision == "" || row.RetryDecision == routeRetryAccepted || trace.Decision != routeRetryAccepted) {
+		row.RetryDecision = trace.Decision
+	}
+	if trace.UpstreamID != "" && diagnosticsNotWeaker {
+		row.UpstreamRequestID = boundOperationalStatLabel(trace.UpstreamID)
+	}
+	row.CleanupComplete = row.CleanupComplete || trace.CleanupDone
+	row.Outcome = mergeRouteAttemptOutcome(row.Outcome, traceOutcome)
+	row.Status = normalizedRouteAttemptStatus(row.StatusCode, row.Outcome)
+	return row
+}
+
+func routeAttemptDiagnosticsCompare(leftOutcome routeAttemptOutcome, leftProgress upstreamSemanticProgress, leftStatus int, rightOutcome routeAttemptOutcome, rightProgress upstreamSemanticProgress, rightStatus int) int {
+	if left, right := routeAttemptOutcomeRank(leftOutcome), routeAttemptOutcomeRank(rightOutcome); left != right {
+		return left - right
+	}
+	if left, right := routeAttemptProgressDiagnosticRank(leftProgress), routeAttemptProgressDiagnosticRank(rightProgress); left != right {
+		return left - right
+	}
+	return routeAttemptStatusDiagnosticRank(leftStatus) - routeAttemptStatusDiagnosticRank(rightStatus)
+}
+
+func routeAttemptProgressDiagnosticRank(progress upstreamSemanticProgress) int {
+	// Keep this order aligned with mergeUpstreamSemanticProgress: more
+	// conservative evidence of execution must never be replaced by a weaker
+	// preamble or terminal-only trace.
+	switch progress {
+	case upstreamProgressUnknown:
+		return 6
+	case upstreamProgressToolActivity:
+		return 5
+	case upstreamProgressSemanticOutput:
+		return 4
+	case upstreamProgressTerminalSuccess:
+		return 3
+	case upstreamProgressTerminalFailure:
+		return 2
+	case upstreamProgressAllowedPreamble:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func routeAttemptStatusDiagnosticRank(status int) int {
+	switch {
+	case status >= http.StatusBadRequest:
+		return 2
+	case status > 0:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // latencyPercentiles returns p50/p95/p99 over the bounded recent-latency
@@ -853,11 +1346,13 @@ func topTargetBreakdowns(m map[string]*targetAttemptCounter) []statsTargetBreakd
 			continue
 		}
 		out = append(out, statsTargetBreakdown{
-			Route:    counter.route,
-			Target:   counter.target,
-			Provider: counter.provider,
-			Kind:     counter.kind,
-			Attempts: counter.attempts,
+			Route:         counter.route,
+			Target:        counter.target,
+			Provider:      counter.provider,
+			Kind:          counter.kind,
+			Attempts:      counter.attempts,
+			PhysicalUsage: counter.physicalUsage,
+			WastedUsage:   counter.wastedUsage,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -1327,11 +1822,11 @@ func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAg
 // accumulated before the terminal outcome; the returned record accepts bounded
 // post-terminal usage amendments without creating synthetic requests. status is
 // the client turn outcome so failed turns appear in error counts.
-func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage) responsesTurnStatsRecord {
+func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, operationIDs ...string) responsesTurnStatsRecord {
 	if h == nil || h.stats == nil {
 		return responsesTurnStatsRecord{}
 	}
-	return h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage)
+	return h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage, operationIDs...)
 }
 
 func (h *ProxyHandler) AddResponsesTurnUsage(record responsesTurnStatsRecord, usage responsesUsage) {

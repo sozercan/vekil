@@ -267,6 +267,67 @@ func TestExplicitRoutePrewriteFailureCanSwitchButAmbiguousCannot(t *testing.T) {
 	}
 }
 
+func TestExplicitRouteSendContextErrorsAreCanceledAttempts(t *testing.T) {
+	tests := []struct {
+		name    string
+		context func() (context.Context, context.CancelFunc)
+		wantErr error
+	}{
+		{
+			name: "canceled",
+			context: func() (context.Context, context.CancelFunc) {
+				return context.WithCancel(context.Background())
+			},
+			wantErr: context.Canceled,
+		},
+		{
+			name: "deadline exceeded",
+			context: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 10*time.Millisecond)
+			},
+			wantErr: context.DeadlineExceeded,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := tc.context()
+			defer cancel()
+			transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if errors.Is(tc.wantErr, context.Canceled) {
+					cancel()
+				}
+				<-req.Context().Done()
+				return nil, errors.Join(errors.New("send stopped"), req.Context().Err())
+			})
+			h, route := explicitRouteTestHandler(t, &http.Client{Transport: transport}, routeModePrimaryOnly, 1, 1,
+				explicitRouteTestProvider("primary", "https://primary.example", "one"),
+			)
+			h.stats = newStatsCollector()
+			operation := newRouteOperation(route, ctx)
+			ctx = withRouteOperation(ctx, operation)
+
+			resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model"}`), nil, "public-model", false)
+			if resp != nil {
+				_ = resp.Body.Close()
+				t.Fatalf("response = %#v, want nil", resp)
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+
+			snap := h.stats.snapshot()
+			if len(snap.RecentAttempts) != 1 {
+				t.Fatalf("recent attempts = %+v, want one", snap.RecentAttempts)
+			}
+			attempt := snap.RecentAttempts[0]
+			if attempt.Outcome != routeAttemptOutcomeCanceled || attempt.Status != string(routeAttemptOutcomeCanceled) {
+				t.Fatalf("attempt outcome/status = %q/%q, want canceled", attempt.Outcome, attempt.Status)
+			}
+		})
+	}
+}
+
 func TestExplicitRouteFinalAttributionFollowsReturnedResult(t *testing.T) {
 	tests := []struct {
 		name              string

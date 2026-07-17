@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -76,14 +77,16 @@ func bindExplicitEncryptedContentForTest(t *testing.T, h *ProxyHandler, route *m
 	}
 }
 
-func contextCompactionStateRequestBody(t *testing.T, token string) []byte {
+func contextCompactionStateRequestBody(t *testing.T, tokens ...string) []byte {
 	t.Helper()
+	input := make([]any, 0, len(tokens)+1)
+	for _, token := range tokens {
+		input = append(input, map[string]any{"type": "context_compaction", "encrypted_content": token})
+	}
+	input = append(input, map[string]any{"type": "message", "role": "user", "content": "continue"})
 	body, err := json.Marshal(map[string]any{
 		"model": "public-model",
-		"input": []any{
-			map[string]any{"type": "context_compaction", "encrypted_content": token},
-			map[string]any{"type": "message", "role": "user", "content": "continue"},
-		},
+		"input": input,
 	})
 	if err != nil {
 		t.Fatalf("json.Marshal() error = %v", err)
@@ -145,9 +148,11 @@ func TestHandleResponsesValidatesContextCompactionStateBeforeSanitizing(t *testi
 	const knownToken = "provider encrypted checkpoint owned by secondary"
 
 	t.Run("unknown state fails closed without dispatch", func(t *testing.T) {
-		h, _, primary, secondary := newExplicitResponsesStateBindingHandler(t)
+		h, route, primary, secondary := newExplicitResponsesStateBindingHandler(t)
+		ctx, summary := WithRequestSummary(context.Background())
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(contextCompactionStateRequestBody(t, "unknown provider encrypted checkpoint"))).WithContext(ctx)
 		w := httptest.NewRecorder()
-		h.HandleResponses(w, httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(contextCompactionStateRequestBody(t, "unknown provider encrypted checkpoint"))))
+		h.HandleResponses(w, req)
 
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("status = %d body=%s, want 400", w.Code, w.Body.String())
@@ -155,6 +160,31 @@ func TestHandleResponsesValidatesContextCompactionStateBeforeSanitizing(t *testi
 		if primary.calls.Load() != 0 || secondary.calls.Load() != 0 {
 			t.Fatalf("unknown state reached upstream: primary=%d secondary=%d", primary.calls.Load(), secondary.calls.Load())
 		}
+		assertExplicitAdmissionOperationID(t, w, summary, route.public.routeID)
+	})
+
+	t.Run("conflicting state fails closed without dispatch", func(t *testing.T) {
+		const primaryToken = "provider encrypted checkpoint owned by primary"
+		const secondaryToken = "provider encrypted checkpoint owned by secondary"
+		h, route, primary, secondary := newExplicitResponsesStateBindingHandler(t)
+		bindExplicitEncryptedContentForTest(t, h, route, route.targets[0].id, primaryToken)
+		bindExplicitEncryptedContentForTest(t, h, route, route.targets[1].id, secondaryToken)
+
+		ctx, summary := WithRequestSummary(context.Background())
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(contextCompactionStateRequestBody(t, primaryToken, secondaryToken))).WithContext(ctx)
+		w := httptest.NewRecorder()
+		h.HandleResponses(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d body=%s, want 400", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "conflicting provider-bound state") {
+			t.Fatalf("body = %s, want conflicting state detail", w.Body.String())
+		}
+		if primary.calls.Load() != 0 || secondary.calls.Load() != 0 {
+			t.Fatalf("conflicting state reached upstream: primary=%d secondary=%d", primary.calls.Load(), secondary.calls.Load())
+		}
+		assertExplicitAdmissionOperationID(t, w, summary, route.public.routeID)
 	})
 
 	t.Run("known state pins exact owner", func(t *testing.T) {
@@ -210,9 +240,11 @@ func TestHandleCompactValidatesContextCompactionStateBeforeSanitizing(t *testing
 	const knownToken = "provider encrypted compact checkpoint owned by secondary"
 
 	t.Run("unknown state fails closed without dispatch", func(t *testing.T) {
-		h, _, primary, secondary := newExplicitResponsesStateBindingHandler(t)
+		h, route, primary, secondary := newExplicitResponsesStateBindingHandler(t)
+		ctx, summary := WithRequestSummary(context.Background())
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(contextCompactionStateRequestBody(t, "unknown provider compact checkpoint"))).WithContext(ctx)
 		w := httptest.NewRecorder()
-		h.HandleCompact(w, httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(contextCompactionStateRequestBody(t, "unknown provider compact checkpoint"))))
+		h.HandleCompact(w, req)
 
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("status = %d body=%s, want 400", w.Code, w.Body.String())
@@ -220,6 +252,7 @@ func TestHandleCompactValidatesContextCompactionStateBeforeSanitizing(t *testing
 		if primary.calls.Load() != 0 || secondary.calls.Load() != 0 {
 			t.Fatalf("unknown compact state reached upstream: primary=%d secondary=%d", primary.calls.Load(), secondary.calls.Load())
 		}
+		assertExplicitAdmissionOperationID(t, w, summary, route.public.routeID)
 	})
 
 	t.Run("known state pins exact owner", func(t *testing.T) {
