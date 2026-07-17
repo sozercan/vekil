@@ -26,6 +26,7 @@ const (
 	cliCommandLogin
 	cliCommandLogout
 	cliCommandLaunch
+	cliCommandConfig
 )
 
 func main() {
@@ -39,6 +40,9 @@ func main() {
 		return
 	case cliCommandLaunch:
 		runLaunch(os.Args[2:])
+		return
+	case cliCommandConfig:
+		runConfig(os.Args[2:])
 		return
 	}
 
@@ -57,6 +61,8 @@ func commandFromArgs(args []string) cliCommand {
 		return cliCommandLogout
 	case "launch":
 		return cliCommandLaunch
+	case "config":
+		return cliCommandConfig
 	default:
 		return cliCommandServe
 	}
@@ -215,6 +221,126 @@ func runLogout(args []string) {
 	}
 
 	_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
+}
+
+var errProvidersConfigRequired = errors.New("--providers-config PATH is required")
+
+type configValidateOptions struct {
+	providersConfigPath string
+}
+
+type configValidateDeps struct {
+	stdout                      io.Writer
+	stderr                      io.Writer
+	validateProvidersConfigFile func(string) error
+}
+
+func runConfig(args []string) {
+	if code := runConfigWithDeps(args, defaultConfigValidateDeps()); code != 0 {
+		os.Exit(code)
+	}
+}
+
+func defaultConfigValidateDeps() configValidateDeps {
+	return configValidateDeps{
+		stdout:                      os.Stdout,
+		stderr:                      os.Stderr,
+		validateProvidersConfigFile: proxy.ValidateProvidersConfigFile,
+	}
+}
+
+func runConfigWithDeps(args []string, deps configValidateDeps) int {
+	deps = normalizeConfigValidateDeps(deps)
+
+	if len(args) == 0 {
+		_, _ = fmt.Fprintln(deps.stderr, "error: config command is required")
+		writeConfigUsage(deps.stderr)
+		return 2
+	}
+
+	switch args[0] {
+	case "-h", "--help", "help":
+		writeConfigUsage(deps.stderr)
+		return 0
+	case "validate":
+		return runConfigValidateWithDeps(args[1:], deps)
+	default:
+		_, _ = fmt.Fprintf(deps.stderr, "error: unknown config command %q\n", args[0])
+		writeConfigUsage(deps.stderr)
+		return 2
+	}
+}
+
+func runConfigValidateWithDeps(args []string, deps configValidateDeps) int {
+	deps = normalizeConfigValidateDeps(deps)
+
+	opts, err := parseConfigValidateOptions(args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			writeConfigValidateUsage(deps.stderr)
+			return 0
+		}
+		_, _ = fmt.Fprintf(deps.stderr, "error: %v\n", err)
+		writeConfigValidateUsage(deps.stderr)
+		return 2
+	}
+
+	if err := deps.validateProvidersConfigFile(opts.providersConfigPath); err != nil {
+		_, _ = fmt.Fprintf(deps.stderr, "error: providers config validation failed: %v\n", err)
+		return 1
+	}
+
+	_, _ = fmt.Fprintf(deps.stdout, "Providers config is valid: %s\n", opts.providersConfigPath)
+	return 0
+}
+
+func normalizeConfigValidateDeps(deps configValidateDeps) configValidateDeps {
+	defaults := defaultConfigValidateDeps()
+	if deps.stdout == nil {
+		deps.stdout = io.Discard
+	}
+	if deps.stderr == nil {
+		deps.stderr = io.Discard
+	}
+	if deps.validateProvidersConfigFile == nil {
+		deps.validateProvidersConfigFile = defaults.validateProvidersConfigFile
+	}
+	return deps
+}
+
+func parseConfigValidateOptions(args []string) (configValidateOptions, error) {
+	var opts configValidateOptions
+	fs := flag.NewFlagSet("config validate", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	providersConfigPath := fs.String("providers-config", "", "Path to JSON or YAML provider configuration")
+	if err := fs.Parse(args); err != nil {
+		return opts, err
+	}
+	if fs.NArg() != 0 {
+		return opts, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	if *providersConfigPath == "" {
+		return opts, errProvidersConfigRequired
+	}
+
+	opts.providersConfigPath = *providersConfigPath
+	return opts, nil
+}
+
+func writeConfigUsage(w io.Writer) {
+	_, _ = fmt.Fprintln(w, "Usage: vekil config validate --providers-config PATH")
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "Commands:")
+	_, _ = fmt.Fprintln(w, "  validate    Validate a provider configuration without starting the server")
+}
+
+func writeConfigValidateUsage(w io.Writer) {
+	_, _ = fmt.Fprintln(w, "Usage: vekil config validate --providers-config PATH")
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "Validate a provider configuration without starting the server or contacting inference upstreams.")
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "Options:")
+	_, _ = fmt.Fprintln(w, "  --providers-config PATH    Path to a JSON or YAML provider configuration (required)")
 }
 
 type serveFlags struct {

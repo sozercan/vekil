@@ -1,10 +1,12 @@
 # API Reference
 
-Concise endpoint map for Vekil's public API surface. Provider routing is always by public `model` ID; provider-specific upstream model/deployment names stay internal to the proxy. See [Provider Routing](provider-routing.md) for ownership rules and endpoint allowlists.
+Concise endpoint map for Vekil's public API surface. Provider routing is always by public `model` ID; target selection and model/deployment rewriting are internal. Legacy raw OpenAI Chat routes may preserve a nonempty provider-supplied `model`, while explicit routes normalize it to the route public ID. See [Provider Routing](provider-routing.md) for version-2 model routes, ownership rules, native endpoint allowlists, budgets, and failover safety.
+
+For an explicit `model_routes` entry, Vekil returns one proxy-owned `X-Vekil-Request-ID` for the logical HTTP operation. Every target attempt remains inside the same requested public route; `priority_failover` can switch only between ordered, semantically equivalent targets before delivery/progress/commitment becomes ambiguous and never selects another public model route. Legacy provider-only routes retain their existing retry and fallback behavior.
 
 ## `POST /v1/messages` (Anthropic)
 
-Anthropic Messages compatibility for the supported content and tool subset. Requests are normally translated to canonical OpenAI Chat Completions, sent through Vekil's Chat execution layer, and translated back to Anthropic. The selected model may be backed natively by `/chat/completions` or by `/responses`; native Chat is preferred when both are available. For `anthropic-compatible` providers, the proxy instead forwards Messages requests directly to the configured `messages_path`.
+Anthropic Messages compatibility for the supported content and tool subset. Except for direct `anthropic-compatible` forwarding, requests are translated to canonical OpenAI Chat Completions, resolved through the route that owns the selected public model, executed by Vekil's shared Chat layer, and translated back to Anthropic. Native `/chat/completions` is preferred when allowed; otherwise a native `/responses` model is served through Chat-over-Responses. For `anthropic-compatible` providers, Vekil forwards Messages requests directly to the configured `messages_path`. An explicit route can switch only among its ordered equivalent targets and only before an Anthropic protocol preamble or semantic block is committed.
 
 The native-Chat path supports the existing text/image/tool-use subset, system messages, tool choice, stop sequences, extended thinking via `thinking.type: "enabled"`, and streaming Anthropic SSE translation. Extended thinking preserves `max_tokens` as the hard per-response limit. An interleaved thinking budget may exceed that limit only with the exact interleaved-thinking beta, active tools, and omitted or `auto` tool choice; forced `any` or named-tool choices are rejected with thinking. When the selected model is Responses-native, the translated request must also fit the strict [Responses-backed Chat field subset](#responses-backed-chat-request-subset). In particular, non-empty Anthropic `stop_sequences` are rejected because the initial adapter does not emulate stop sequences locally.
 
@@ -18,17 +20,17 @@ This endpoint is a compatibility probe rather than a local tokenizer. It can mak
 
 ## `GET /v1/models`
 
-The proxy builds a merged catalog across active providers. It preserves OpenAI-style `data` and also adds a Codex-compatible top-level `models` array.
+The proxy builds a merged logical catalog across legacy provider models and explicit routes. It preserves OpenAI-style `data` and also adds a Codex-compatible top-level `models` array.
 
 ```bash
 curl http://localhost:1337/v1/models
 ```
 
-When multiple providers are configured, each public model ID must have one owner. Dynamic providers can be narrowed with `include_models` or `exclude_models`; static providers such as Azure OpenAI can expose a deployment under a different public ID while the proxy rewrites the upstream `model` field.
+Each public model ID has one logical owner. Dynamic providers can be narrowed with `include_models` or `exclude_models`; static providers such as Azure OpenAI can expose a deployment under a different public ID while the proxy rewrites the upstream `model` field. A version-2 explicit route appears exactly once in both catalog views, in route configuration order, with `owned_by` set to the route ID. Its physical target IDs and upstream deployment names are not emitted as models.
 
-Endpoint metadata remains **native upstream capability metadata**. A Responses-native model continues to report `/responses` in `supported_endpoints` even though Vekil can serve `/v1/chat/completions`, Anthropic Messages, and Gemini compatibility through its Chat-over-Responses adapter. Vekil does not add emulated Chat routes to `models[].endpoints` or the rendered catalog.
+For an explicit route, catalog identity is configuration-owned: temporary target failure does not remove or rewrite the route entry. Endpoint metadata remains **native upstream capability metadata**. A Responses-native model continues to report only `/responses` in `supported_endpoints` even when Vekil serves `/v1/chat/completions`, Anthropic Messages, and Gemini compatibility through Chat-over-Responses.
 
-The exact catalog depends on configured providers and current upstream availability. Query `/v1/models` in your deployment instead of hard-coding one global model list.
+The exact catalog still depends on configured routes/providers and dynamic discovery. Query `/v1/models` in your deployment instead of hard-coding one global model list.
 
 ## Gemini Compatibility Endpoints
 
@@ -40,7 +42,7 @@ Supported operations:
 - `streamGenerateContent`
 - `countTokens`
 
-Gemini compatibility is a translation layer over canonical Chat Completions. The translated request can be executed through native Chat or native Responses, with the route-specific restrictions described in [Gemini Compatibility](gemini.md).
+Gemini compatibility is a translation layer over canonical Chat Completions. For explicit routes, target selection and any safe failover stay inside the route that owns the requested public model. The translated request may use native `/chat/completions` or native `/responses`, with native Chat preferred when both are available. See [Gemini Compatibility](gemini.md) for the Responses-native restrictions, route commitment rules, ignored fields, explicit `501 UNIMPLEMENTED` cases, validation behavior, and streaming details.
 
 ## `POST /v1/chat/completions` (OpenAI)
 
@@ -50,7 +52,9 @@ Vekil resolves the public model once and chooses its native backend:
 2. otherwise use native `/responses` and convert the request and result through the Chat-over-Responses adapter;
 3. reject the request locally when neither native endpoint is allowed.
 
-A native Chat request remains near-zero-copy. Successful non-streaming responses are conservatively normalized when upstreams omit required compatibility fields, and streamed chunks are similarly repaired only where required. When tools are present, Vekil injects `parallel_tool_calls: true`, may force upstream streaming for reliable parallel calls, and aggregates back to non-streaming JSON when the client did not request a stream.
+Provider policy plus the selected model's or explicit route's native endpoint allowlist control this choice. A `/responses`-only model is served through the adapter rather than probed at an unsupported Chat path; Vekil fails locally with `400` only when neither native endpoint is allowed. Explicit route targets remain ordered and bounded by the route's target-attempt and upstream-send budgets.
+
+A native Chat request remains near-zero-copy. Successful non-streaming responses are conservatively normalized to strict OpenAI Chat Completions shape when upstreams omit required compatibility fields: missing `object` becomes `"chat.completion"`, missing `created`/`id`/`usage` are filled, requested `model` is used when absent, and choice `message`/`index`/`finish_reason` gaps are repaired while vendor-specific metadata is preserved. Streaming chunks are similarly repaired only for missing envelope fields such as `object: "chat.completion.chunk"`, `id`, `created`, `model`, `choices[].index`, and `choices[].delta`. Legacy raw Chat routes preserve a nonempty upstream `model`; explicit routes replace physical model/deployment values with the route public ID in supported JSON and SSE responses. When tools are present, Vekil injects `parallel_tool_calls: true`, may force upstream streaming for reliable parallel calls, and aggregates back to non-streaming JSON when the client did not request a stream.
 
 A Responses-backed request is not passthrough. Vekil validates the supported Chat request shape, converts it to Responses input, converts the result to one canonical Chat choice, and rejects unsupported fields rather than silently dropping them. Direct `/v1/responses` behavior is separate; the adapter does not invoke the public Responses handler, compaction shims, or websocket bridge.
 
@@ -115,7 +119,7 @@ Supported OpenAI/Codex-style routes:
 - `POST /v1/responses/compact` — compatibility shim that rewrites compact requests into upstream `/responses` calls and returns a proxy-owned opaque compaction item.
 - `POST /v1/memories/trace_summarize` — compatibility shim for trace and memory summaries.
 
-Responses requests are routed by public `model` ID. Unsupported-model fallbacks stay within the selected provider; the proxy does not silently switch providers. For responses-only Azure deployments, `POST /v1/responses` remains the canonical native inference path even when Chat-compatible surfaces are also available through translation.
+Responses requests are routed by public `model` ID. A version-2 `priority_failover` route may switch among equivalent targets in that same public route only while replay is definitely safe and no provider-bound state or downstream commitment prevents it. Legacy unsupported-model compatibility fallback remains distinct, stays within the selected provider/target, and never becomes configured cross-route or cross-provider fallback. For Responses-only Azure deployments, `POST /v1/responses` remains the canonical native inference path even when Chat-compatible surfaces are available through translation.
 
 See [OpenAI Responses Compatibility](responses.md) for compaction, oversized replay, transient streaming failure, websocket semantics, and the separation between native Responses and Chat-over-Responses compatibility. See [Responses WebSocket Bridge](responses-websocket.md) for websocket tuning flags.
 
@@ -125,12 +129,12 @@ Returns `{"status":"ok"}` as soon as the HTTP listener is serving. This endpoint
 
 ## `GET /readyz`
 
-Validates that the proxy can authenticate to and successfully probe the configured upstream providers. On success it returns `{"status":"ready"}`. On failure it returns `503` with `{"status":"not_ready","error":"..."}`.
+Validates compiled configuration, required startup authentication/catalog initialization, admission state, and shutdown state. On success it returns `{"status":"ready"}`. On failure it returns `503` with `{"status":"not_ready","error":"..."}`. Transient failure of one route target does not by itself make the whole process unready.
 
 ## Traffic Dashboard Endpoints
 
 - `GET /dashboard` — live, browser-based traffic dashboard served from the proxy (available wherever the proxy runs).
-- `GET /stats.json` — in-memory traffic snapshot (totals, latency percentiles, per-second series, by-model/provider/agent breakdowns, upstream retries, and a recent-requests log) polled by the dashboard.
+- `GET /stats.json` — in-memory traffic snapshot (client-request totals, latency percentiles, per-second series, by-model/provider/agent/route/target breakdowns, physical upstream attempts, target switches, state-binding counters, legacy upstream retries, and a recent-requests log) polled by the dashboard.
 - `POST /dashboard/insight` — optional AI-generated traffic summary. Active only when `insight_model` is set in providers config; single-flight with a cooldown; fails open. The insight model may be native Chat or native Responses as long as Vekil can serve it through Chat compatibility.
 
 These endpoints are unauthenticated like `/healthz` and are excluded from their own stats. See [Traffic Dashboard](dashboard.md) for the payload shape, agent classification, AI insights, and access/security notes.

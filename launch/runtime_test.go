@@ -576,7 +576,7 @@ func TestLaunchHelperProcess(t *testing.T) {
 			os.Exit(97)
 		}
 		if os.Getenv("LAUNCH_HELPER_WAIT_GRANDCHILD_READY") == "1" {
-			deadline := time.Now().Add(2 * time.Second)
+			deadline := time.Now().Add(launcherTestTimeout(2 * time.Second))
 			for time.Now().Before(deadline) {
 				if _, err := os.Stat(os.Getenv("LAUNCH_GRANDCHILD_PID_FILE")); err == nil {
 					time.Sleep(150 * time.Millisecond)

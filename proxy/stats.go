@@ -30,7 +30,7 @@ const (
 	// statsTopN caps the number of rows returned per error list (status codes
 	// and error targets).
 	statsTopN = 10
-	// statsBreakdownRows caps the rows returned per model/provider/agent
+	// statsBreakdownRows caps the rows returned per model/provider/agent/route
 	// breakdown. It is larger than statsTopN so the dashboard can re-sort or
 	// filter client-side (e.g. rank by errors) and still see rows that fall
 	// outside the top-by-requests.
@@ -67,17 +67,100 @@ type statsSeriesPoint struct {
 	Completion int64 `json:"completion"`
 }
 
-// statsBreakdown is one row in a by-model / by-provider / by-agent list. Only
-// the label field relevant to the list is populated (omitempty hides the rest).
+// statsBreakdown is one row in a client-request breakdown. Only the label field
+// relevant to the list is populated (omitempty hides the rest). Route-only
+// failover fields remain omitted from legacy model/provider/agent rows.
 type statsBreakdown struct {
-	Model    string `json:"model,omitempty"`
-	Provider string `json:"provider,omitempty"`
-	Kind     string `json:"kind,omitempty"`
-	Agent    string `json:"agent,omitempty"`
-	Requests int64  `json:"requests"`
-	Tokens   int64  `json:"tokens"`
-	Errors   int64  `json:"errors"`
-	AvgMs    int64  `json:"avg_ms"`
+	Model                string `json:"model,omitempty"`
+	Provider             string `json:"provider,omitempty"`
+	Kind                 string `json:"kind,omitempty"`
+	Agent                string `json:"agent,omitempty"`
+	Route                string `json:"route,omitempty"`
+	Requests             int64  `json:"requests"`
+	Tokens               int64  `json:"tokens"`
+	Errors               int64  `json:"errors"`
+	AvgMs                int64  `json:"avg_ms"`
+	TargetSwitches       int64  `json:"target_switches,omitempty"`
+	RequestsWithFailover int64  `json:"requests_with_failover,omitempty"`
+	SuccessfulFailovers  int64  `json:"successful_failovers,omitempty"`
+	RouteExhaustions     int64  `json:"route_exhaustions,omitempty"`
+}
+
+// statsTargetBreakdown is one physical-attempt row. Attempts are actual
+// upstream sends, not client requests and not legacy same-target retries.
+type statsTargetBreakdown struct {
+	Route         string          `json:"route,omitempty"`
+	Target        string          `json:"target"`
+	Provider      string          `json:"provider,omitempty"`
+	Kind          string          `json:"kind,omitempty"`
+	Attempts      int64           `json:"attempts"`
+	PhysicalUsage statsTokenUsage `json:"physical_usage"`
+	WastedUsage   statsTokenUsage `json:"wasted_usage"`
+}
+
+// statsTokenUsage is the normalized token shape shared by physical-attempt
+// diagnostics and aggregate physical/wasted accounting. It deliberately uses
+// the public prompt/completion vocabulary so callers can compare it directly
+// with the existing client-request totals without retaining provider payloads.
+type statsTokenUsage struct {
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	TotalTokens      int64 `json:"total_tokens"`
+	CachedTokens     int64 `json:"cached_tokens"`
+	ReasoningTokens  int64 `json:"reasoning_tokens"`
+}
+
+func (u statsTokenUsage) isZero() bool {
+	return u.PromptTokens == 0 && u.CompletionTokens == 0 && u.TotalTokens == 0 &&
+		u.CachedTokens == 0 && u.ReasoningTokens == 0
+}
+
+func (u statsTokenUsage) normalized() statsTokenUsage {
+	u.PromptTokens = max(u.PromptTokens, 0)
+	u.CompletionTokens = max(u.CompletionTokens, 0)
+	u.CachedTokens = max(u.CachedTokens, 0)
+	u.ReasoningTokens = max(u.ReasoningTokens, 0)
+	if u.TotalTokens < 0 {
+		u.TotalTokens = 0
+	}
+	if u.TotalTokens == 0 {
+		u.TotalTokens = u.PromptTokens + u.CompletionTokens
+	}
+	return u
+}
+
+func (u *statsTokenUsage) add(other statsTokenUsage) {
+	if u == nil {
+		return
+	}
+	other = other.normalized()
+	u.PromptTokens += other.PromptTokens
+	u.CompletionTokens += other.CompletionTokens
+	u.TotalTokens += other.TotalTokens
+	u.CachedTokens += other.CachedTokens
+	u.ReasoningTokens += other.ReasoningTokens
+}
+
+func statsTokenUsageFromResponses(usage responsesUsage) statsTokenUsage {
+	return statsTokenUsage{
+		PromptTokens:     int64(usage.InputTokens),
+		CompletionTokens: int64(usage.OutputTokens),
+		TotalTokens:      int64(usage.totalTokens()),
+		CachedTokens:     int64(usage.InputTokensDetails.CachedTokens),
+		ReasoningTokens:  int64(usage.OutputTokensDetails.ReasoningTokens),
+	}.normalized()
+}
+
+func statsTokenUsageDelta(current, accounted statsTokenUsage) statsTokenUsage {
+	current = current.normalized()
+	accounted = accounted.normalized()
+	return statsTokenUsage{
+		PromptTokens:     max(current.PromptTokens-accounted.PromptTokens, 0),
+		CompletionTokens: max(current.CompletionTokens-accounted.CompletionTokens, 0),
+		TotalTokens:      max(current.TotalTokens-accounted.TotalTokens, 0),
+		CachedTokens:     max(current.CachedTokens-accounted.CachedTokens, 0),
+		ReasoningTokens:  max(current.ReasoningTokens-accounted.ReasoningTokens, 0),
+	}
 }
 
 // statsErrorRow is one row in the error-by-status or error-by-target lists.
@@ -88,22 +171,44 @@ type statsErrorRow struct {
 
 // statsSnapshot is the payload served at GET /stats.json.
 type statsSnapshot struct {
-	UptimeSeconds int64              `json:"uptime_seconds"`
-	Inflight      int64              `json:"inflight"`
-	Totals        statsTotals        `json:"totals"`
-	Status        map[string]int64   `json:"status"`
-	StatusCodes   []statsErrorRow    `json:"status_codes"`
-	Errors        []statsErrorRow    `json:"errors"`
-	Series        []statsSeriesPoint `json:"series"`
-	ByModel       []statsBreakdown   `json:"by_model"`
-	ByProvider    []statsBreakdown   `json:"by_provider"`
-	ByAgent       []statsBreakdown   `json:"by_agent"`
+	UptimeSeconds int64                  `json:"uptime_seconds"`
+	Inflight      int64                  `json:"inflight"`
+	Totals        statsTotals            `json:"totals"`
+	Status        map[string]int64       `json:"status"`
+	StatusCodes   []statsErrorRow        `json:"status_codes"`
+	Errors        []statsErrorRow        `json:"errors"`
+	Series        []statsSeriesPoint     `json:"series"`
+	ByModel       []statsBreakdown       `json:"by_model"`
+	ByProvider    []statsBreakdown       `json:"by_provider"`
+	ByAgent       []statsBreakdown       `json:"by_agent"`
+	ByRoute       []statsBreakdown       `json:"by_route"`
+	ByTarget      []statsTargetBreakdown `json:"by_target"`
+	// PhysicalUsage counts usage reported by explicit-route upstream sends.
+	// WastedUsage is the subset reported by attempts that did not become an
+	// accepted client-visible result. Both ledgers are additive to, and do not
+	// redefine, the legacy client-request totals above.
+	PhysicalUsage statsTokenUsage `json:"physical_usage"`
+	WastedUsage   statsTokenUsage `json:"wasted_usage"`
+	// Route/failover counters are additive to the legacy client-request totals.
+	// Physical attempts and target switches never increment Totals.Requests or
+	// Retries; the latter retains its same-target legacy retry meaning.
+	UpstreamAttempts      int64 `json:"upstream_attempts"`
+	TargetSwitches        int64 `json:"target_switches"`
+	RequestsWithFailover  int64 `json:"requests_with_failover"`
+	SuccessfulFailovers   int64 `json:"successful_failovers"`
+	RouteExhaustions      int64 `json:"route_exhaustions"`
+	StateBindingHits      int64 `json:"state_binding_hits"`
+	StateBindingMisses    int64 `json:"state_binding_misses"`
+	StateBindingEvictions int64 `json:"state_binding_evictions"`
 	// Retries is the total upstream retry attempts and the breakdown by the
 	// status that triggered them (surfaces flakiness the proxy absorbed).
 	Retries       int64           `json:"retries"`
 	RetriesByCode []statsErrorRow `json:"retries_by_code"`
 	// Recent is the most-recent completed requests (newest first) for drill-down.
 	Recent []recentRequest `json:"recent"`
+	// RecentAttempts is a separately bounded, redacted physical-send trace. It
+	// never carries request/response bodies, raw errors, model rewrites, or state.
+	RecentAttempts []recentRouteAttempt `json:"recent_attempts"`
 	// InsightsEnabled reports whether a model is configured for on-demand
 	// LLM-generated insights (drives the dashboard's "Generate insights" button).
 	InsightsEnabled bool `json:"insights_enabled"`
@@ -118,12 +223,26 @@ type secondBucket struct {
 }
 
 type breakdownCounter struct {
-	requests   int64
-	tokens     int64
-	errors     int64
-	durMs      int64 // sum of request durations in ms, for avg latency
-	durSamples int64 // count of requests that contributed a duration (non-stream)
-	kind       string
+	requests             int64
+	tokens               int64
+	errors               int64
+	durMs                int64 // sum of request durations in ms, for avg latency
+	durSamples           int64 // count of requests that contributed a duration (non-stream)
+	kind                 string
+	targetSwitches       int64
+	requestsWithFailover int64
+	successfulFailovers  int64
+	routeExhaustions     int64
+}
+
+type targetAttemptCounter struct {
+	route         string
+	target        string
+	provider      string
+	kind          string
+	attempts      int64
+	physicalUsage statsTokenUsage
+	wastedUsage   statsTokenUsage
 }
 
 // statsCollector aggregates per-request traffic in memory for the dashboard.
@@ -142,6 +261,19 @@ type statsCollector struct {
 	byModel     map[string]*breakdownCounter
 	byProvider  map[string]*breakdownCounter
 	byAgent     map[string]*breakdownCounter
+	byRoute     map[string]*breakdownCounter
+	byTarget    map[string]*targetAttemptCounter
+
+	upstreamAttempts      int64
+	targetSwitches        int64
+	requestsWithFailover  int64
+	successfulFailovers   int64
+	routeExhaustions      int64
+	stateBindingHits      int64
+	stateBindingMisses    int64
+	stateBindingEvictions int64
+	physicalUsage         statsTokenUsage
+	wastedUsage           statsTokenUsage
 
 	// retries counts upstream retry attempts the proxy made (transient 429/503,
 	// transport errors). These are usually invisible to clients because the
@@ -155,6 +287,13 @@ type statsCollector struct {
 	recentIdx      int
 	recentSize     int
 	recentSequence uint64
+
+	// recentAttempts is an independently bounded physical-send ring. A request
+	// can produce several entries here but still exactly one row in recent.
+	recentAttempts        []recentRouteAttempt
+	recentAttemptIdx      int
+	recentAttemptSize     int
+	recentAttemptSequence uint64
 
 	// latencies is a bounded ring of recent request durations (ms) used to
 	// compute p50/p95/p99 without retaining every sample forever.
@@ -172,6 +311,11 @@ type recentRequest struct {
 	Endpoint          string `json:"endpoint,omitempty"`
 	Model             string `json:"model,omitempty"`
 	Provider          string `json:"provider,omitempty"`
+	OperationID       string `json:"operation_id,omitempty"`
+	RouteID           string `json:"route_id,omitempty"`
+	FinalTarget       string `json:"final_target,omitempty"`
+	UpstreamSends     int64  `json:"upstream_sends,omitempty"`
+	TargetSwitches    int64  `json:"target_switches,omitempty"`
 	Agent             string `json:"agent"`
 	Status            int    `json:"status"`
 	DurMs             int64  `json:"dur_ms"`
@@ -183,6 +327,87 @@ type recentRequest struct {
 // websocket create turn. It lets post-terminal internal compaction add token
 // usage without incrementing request/error counts or attributing the delta to a
 // provider/model that changed after the upstream route was selected.
+// recentRouteAttempt is one production-visible physical-attempt row. The
+// unexported state pointer lets the attempt lifecycle update a still-retained
+// ring row after late route reclassification without exposing or retaining any
+// provider payload.
+type recentRouteAttempt struct {
+	recordID             uint64
+	state                *routeAttemptRecordState
+	T                    int64                    `json:"t"`
+	OperationID          string                   `json:"operation_id,omitempty"`
+	RouteID              string                   `json:"route_id,omitempty"`
+	TargetID             string                   `json:"target_id,omitempty"`
+	ProviderID           string                   `json:"provider_id,omitempty"`
+	ProviderKind         string                   `json:"provider_kind,omitempty"`
+	Sequence             int                      `json:"sequence"`
+	AttemptKind          routeAttemptKind         `json:"attempt_kind"`
+	Status               string                   `json:"status"`
+	StatusCode           int                      `json:"status_code,omitempty"`
+	Outcome              routeAttemptOutcome      `json:"outcome"`
+	Delivery             requestDelivery          `json:"delivery,omitempty"`
+	SemanticProgress     upstreamSemanticProgress `json:"semantic_progress,omitempty"`
+	DownstreamCommitment downstreamCommitment     `json:"downstream_commitment,omitempty"`
+	RetryDecision        routeRetryDecision       `json:"retry_decision,omitempty"`
+	TTFTMs               *int64                   `json:"ttft_ms,omitempty"`
+	RetryAfterSeconds    *int64                   `json:"retry_after_seconds,omitempty"`
+	UpstreamRequestID    string                   `json:"upstream_request_id,omitempty"`
+	CleanupComplete      bool                     `json:"cleanup_complete"`
+	ReportedUsage        *statsTokenUsage         `json:"reported_usage,omitempty"`
+}
+
+// routeAttemptRecordState is the mutable accounting handle associated with one
+// dispatched attempt. Updates are idempotent and can enrich a terminal row (for
+// example cleanup completion arriving after the terminal event) without
+// double-counting usage.
+type routeAttemptRecordState struct {
+	mu sync.Mutex
+
+	collector *statsCollector
+	targetKey string
+	recentIdx int
+	recordID  uint64
+
+	row                recentRouteAttempt
+	physicalAccounted  statsTokenUsage
+	wastedAccounted    statsTokenUsage
+	traceVersion       uint64
+	publicationVersion uint64
+
+	// published* is guarded by collector.mu rather than state.mu. Publications
+	// carry cumulative accounting snapshots, so a newer publication can safely
+	// subsume an older one that reaches the collector later.
+	publishedVersion  uint64
+	physicalPublished statsTokenUsage
+	wastedPublished   statsTokenUsage
+}
+
+type routeAttemptRecord struct {
+	state *routeAttemptRecordState
+}
+
+type routeAttemptPublication struct {
+	version           uint64
+	row               recentRouteAttempt
+	physicalAccounted statsTokenUsage
+	wastedAccounted   statsTokenUsage
+}
+
+type routeAttemptCompletion struct {
+	StatusCode           int
+	Outcome              routeAttemptOutcome
+	Delivery             requestDelivery
+	SemanticProgress     upstreamSemanticProgress
+	DownstreamCommitment downstreamCommitment
+	RetryDecision        routeRetryDecision
+	TTFTMs               *int64
+	RetryAfterSeconds    *int64
+	UpstreamRequestID    string
+	CleanupComplete      bool
+	ReportedUsage        *statsTokenUsage
+	Wasted               bool
+}
+
 type responsesTurnStatsRecord struct {
 	valid       bool
 	sec         int64
@@ -198,21 +423,26 @@ const (
 	statsLatencySamples = 2048
 	// statsRecentRequests bounds the recent-requests drill-down log.
 	statsRecentRequests = 80
+	// statsRecentRouteAttempts independently bounds the physical-attempt trace.
+	statsRecentRouteAttempts = 256
 )
 
 func newStatsCollector() *statsCollector {
 	c := &statsCollector{
-		now:           time.Now,
-		ring:          make([]secondBucket, statsRingSeconds),
-		status:        make(map[string]int64, 4),
-		statusCodes:   make(map[int]int64),
-		errTargets:    make(map[string]int64),
-		byModel:       make(map[string]*breakdownCounter),
-		byProvider:    make(map[string]*breakdownCounter),
-		byAgent:       make(map[string]*breakdownCounter),
-		retriesByCode: make(map[int]int64),
-		recent:        make([]recentRequest, statsRecentRequests),
-		latencies:     make([]int64, statsLatencySamples),
+		now:            time.Now,
+		ring:           make([]secondBucket, statsRingSeconds),
+		status:         make(map[string]int64, 4),
+		statusCodes:    make(map[int]int64),
+		errTargets:     make(map[string]int64),
+		byModel:        make(map[string]*breakdownCounter),
+		byProvider:     make(map[string]*breakdownCounter),
+		byAgent:        make(map[string]*breakdownCounter),
+		byRoute:        make(map[string]*breakdownCounter),
+		byTarget:       make(map[string]*targetAttemptCounter),
+		retriesByCode:  make(map[int]int64),
+		recent:         make([]recentRequest, statsRecentRequests),
+		recentAttempts: make([]recentRouteAttempt, statsRecentRouteAttempts),
+		latencies:      make([]int64, statsLatencySamples),
 	}
 	c.start = c.now()
 	return c
@@ -228,6 +458,389 @@ func (c *statsCollector) incRetry(status int) {
 	c.retries++
 	c.retriesByCode[status]++
 	c.mu.Unlock()
+}
+
+// RouteAttemptObservation identifies one actual physical upstream send. All
+// labels are operational IDs from validated configuration; no upstream model,
+// response ID, state token, raw error, or body content is retained.
+type RouteAttemptObservation struct {
+	OperationID  string
+	RouteID      string
+	TargetID     string
+	ProviderID   string
+	ProviderKind string
+	Sequence     int
+	AttemptKind  routeAttemptKind
+
+	// operation and startedAt are route-executor-owned metadata. They stay
+	// unexported so callers cannot inject arbitrary trace state into /stats.json.
+	operation *routeOperation
+	startedAt time.Time
+}
+
+// RecordUpstreamAttempt records one actual physical upstream dispatch for the
+// route executor. It updates the per-request summary and aggregate attempt
+// counters immediately, then returns a bounded record that the executor can
+// enrich with the normalized outcome once the attempt resolves. Callers that
+// only need the legacy aggregate side effect may ignore the return value.
+func (h *ProxyHandler) RecordUpstreamAttempt(ctx context.Context, attempt RouteAttemptObservation) *routeAttemptRecord {
+	summary := RequestSummaryFromContext(ctx)
+	if summary != nil {
+		summary.recordUpstreamAttempt(attempt.OperationID, attempt.RouteID, attempt.TargetID, attempt.ProviderID, attempt.ProviderKind)
+	}
+	var record *routeAttemptRecord
+	if h == nil || h.stats == nil {
+		record = &routeAttemptRecord{state: &routeAttemptRecordState{}}
+	} else {
+		record = h.stats.beginRouteAttempt(summary, attempt)
+	}
+	if attempt.operation != nil {
+		attempt.operation.registerAttemptRecord(attempt.Sequence, record)
+	}
+	return record
+}
+
+func (c *statsCollector) beginRouteAttempt(summary *RequestSummary, attempt RouteAttemptObservation) *routeAttemptRecord {
+	if c == nil {
+		return &routeAttemptRecord{state: &routeAttemptRecordState{}}
+	}
+
+	attempt.OperationID = boundOperationalStatLabel(attempt.OperationID)
+	attempt.RouteID = boundOperationalStatLabel(attempt.RouteID)
+	attempt.TargetID = boundOperationalStatLabel(attempt.TargetID)
+	attempt.ProviderID = boundOperationalStatLabel(attempt.ProviderID)
+	attempt.ProviderKind = boundOperationalStatLabel(attempt.ProviderKind)
+	if attempt.Sequence < 0 {
+		attempt.Sequence = 0
+	}
+	if attempt.AttemptKind == "" {
+		attempt.AttemptKind = routeAttemptNormal
+	}
+	startedAt := attempt.startedAt
+	if startedAt.IsZero() {
+		startedAt = c.now()
+	}
+
+	state := &routeAttemptRecordState{
+		collector: c,
+	}
+
+	c.mu.Lock()
+	state.targetKey = c.recordUpstreamAttemptLocked(attempt.RouteID, attempt.TargetID, attempt.ProviderID, attempt.ProviderKind)
+	if c.recentAttemptSequence == ^uint64(0) {
+		c.mu.Unlock()
+		panic("stats recent attempt sequence exhausted")
+	}
+	c.recentAttemptSequence++
+	state.recentIdx = c.recentAttemptIdx
+	state.recordID = c.recentAttemptSequence
+	state.row = recentRouteAttempt{
+		recordID:     state.recordID,
+		state:        state,
+		T:            startedAt.Unix(),
+		OperationID:  attempt.OperationID,
+		RouteID:      attempt.RouteID,
+		TargetID:     attempt.TargetID,
+		ProviderID:   attempt.ProviderID,
+		ProviderKind: attempt.ProviderKind,
+		Sequence:     attempt.Sequence,
+		AttemptKind:  attempt.AttemptKind,
+		Status:       string(routeAttemptOutcomeInFlight),
+		Outcome:      routeAttemptOutcomeInFlight,
+	}
+	c.recentAttempts[state.recentIdx] = state.row
+	c.recentAttemptIdx = (c.recentAttemptIdx + 1) % len(c.recentAttempts)
+	if c.recentAttemptSize < len(c.recentAttempts) {
+		c.recentAttemptSize++
+	}
+	c.mu.Unlock()
+
+	return &routeAttemptRecord{state: state}
+}
+
+func (r *routeAttemptRecord) complete(completion routeAttemptCompletion) {
+	if r == nil || r.state == nil {
+		return
+	}
+	state := r.state
+	completion.UpstreamRequestID = boundOperationalStatLabel(completion.UpstreamRequestID)
+	if completion.StatusCode < 0 || completion.StatusCode > 999 {
+		completion.StatusCode = 0
+	}
+	if completion.ReportedUsage != nil {
+		normalized := completion.ReportedUsage.normalized()
+		completion.ReportedUsage = &normalized
+	}
+
+	state.mu.Lock()
+	row := state.row
+	classificationNotWeaker := completion.Outcome == "" || routeAttemptOutcomeRank(completion.Outcome) >= routeAttemptOutcomeRank(row.Outcome)
+	if completion.StatusCode != 0 && classificationNotWeaker {
+		row.StatusCode = completion.StatusCode
+	}
+	if completion.Outcome != "" {
+		row.Outcome = mergeRouteAttemptOutcome(row.Outcome, completion.Outcome)
+	}
+	row.Status = normalizedRouteAttemptStatus(row.StatusCode, row.Outcome)
+	if completion.Delivery != "" && classificationNotWeaker {
+		row.Delivery = completion.Delivery
+	}
+	row.SemanticProgress = mergeUpstreamSemanticProgress(row.SemanticProgress, completion.SemanticProgress)
+	if routeCommitmentRank(completion.DownstreamCommitment) > routeCommitmentRank(row.DownstreamCommitment) {
+		row.DownstreamCommitment = completion.DownstreamCommitment
+	}
+	if completion.RetryDecision != "" && (row.RetryDecision == "" || row.RetryDecision == routeRetryAccepted || completion.RetryDecision != routeRetryAccepted) {
+		row.RetryDecision = completion.RetryDecision
+	}
+	if row.TTFTMs == nil && completion.TTFTMs != nil {
+		value := max(*completion.TTFTMs, 0)
+		row.TTFTMs = &value
+	}
+	if completion.RetryAfterSeconds != nil {
+		value := max(*completion.RetryAfterSeconds, 0)
+		maxSeconds := int64(maxRetryAfter / time.Second)
+		if value > maxSeconds {
+			value = maxSeconds
+		}
+		if value > 0 {
+			row.RetryAfterSeconds = &value
+		}
+	}
+	if completion.UpstreamRequestID != "" {
+		row.UpstreamRequestID = completion.UpstreamRequestID
+	}
+	row.CleanupComplete = row.CleanupComplete || completion.CleanupComplete
+	if completion.ReportedUsage != nil {
+		usage := completion.ReportedUsage.normalized()
+		row.ReportedUsage = &usage
+	}
+	state.row = row
+
+	if row.ReportedUsage != nil {
+		physicalDelta := statsTokenUsageDelta(*row.ReportedUsage, state.physicalAccounted)
+		state.physicalAccounted.add(physicalDelta)
+		if completion.Wasted || routeAttemptOutcomeIsWasted(row.Outcome) {
+			wastedDelta := statsTokenUsageDelta(*row.ReportedUsage, state.wastedAccounted)
+			state.wastedAccounted.add(wastedDelta)
+		}
+	}
+	publication := state.nextPublicationLocked(row)
+	collector := state.collector
+	state.mu.Unlock()
+
+	if collector != nil {
+		collector.applyRouteAttemptCompletion(state, publication)
+	}
+}
+
+// reconcileTrace applies a route-operation trace mutation directly to the
+// attempt record. Usage deltas remain idempotent in the record state, so a late
+// success-to-failure transition accounts wasted spend exactly once even after
+// the diagnostic ring row has been evicted and without waiting for /stats.json.
+func (r *routeAttemptRecord) reconcileTrace(trace routeAttemptTrace, version uint64) {
+	if r == nil || r.state == nil {
+		return
+	}
+	state := r.state
+	state.mu.Lock()
+	if version <= state.traceVersion {
+		state.mu.Unlock()
+		return
+	}
+	state.traceVersion = version
+	row := applyRouteAttemptTrace(state.row, trace)
+	if row.ReportedUsage != nil && routeAttemptOutcomeIsWasted(row.Outcome) {
+		wastedDelta := statsTokenUsageDelta(*row.ReportedUsage, state.wastedAccounted)
+		state.wastedAccounted.add(wastedDelta)
+	}
+	state.row = row
+	publication := state.nextPublicationLocked(row)
+	collector := state.collector
+	state.mu.Unlock()
+
+	if collector != nil {
+		collector.applyRouteAttemptCompletion(state, publication)
+	}
+}
+
+func (s *routeAttemptRecordState) nextPublicationLocked(row recentRouteAttempt) routeAttemptPublication {
+	if s.publicationVersion == ^uint64(0) {
+		panic("route attempt publication sequence exhausted")
+	}
+	s.publicationVersion++
+	return routeAttemptPublication{
+		version:           s.publicationVersion,
+		row:               row,
+		physicalAccounted: s.physicalAccounted,
+		wastedAccounted:   s.wastedAccounted,
+	}
+}
+
+func (c *statsCollector) applyRouteAttemptCompletion(state *routeAttemptRecordState, publication routeAttemptPublication) {
+	if c == nil || state == nil || publication.version == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if publication.version <= state.publishedVersion {
+		return
+	}
+	physicalDelta := statsTokenUsageDelta(publication.physicalAccounted, state.physicalPublished)
+	wastedDelta := statsTokenUsageDelta(publication.wastedAccounted, state.wastedPublished)
+	state.physicalPublished.add(physicalDelta)
+	state.wastedPublished.add(wastedDelta)
+	state.publishedVersion = publication.version
+
+	c.physicalUsage.add(physicalDelta)
+	c.wastedUsage.add(wastedDelta)
+	if counter := c.byTarget[state.targetKey]; counter != nil {
+		counter.physicalUsage.add(physicalDelta)
+		counter.wastedUsage.add(wastedDelta)
+	}
+	if state.recentIdx >= 0 && state.recentIdx < len(c.recentAttempts) && c.recentAttempts[state.recentIdx].recordID == state.recordID {
+		publication.row.state = state
+		c.recentAttempts[state.recentIdx] = publication.row
+	}
+}
+
+// RecordTargetSwitch records selection of a distinct target in the same route.
+// Same-target protocol recovery must not call this API.
+func (h *ProxyHandler) RecordTargetSwitch(ctx context.Context) {
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		summary.RecordTargetSwitch()
+	}
+	if h == nil || h.stats == nil {
+		return
+	}
+	h.stats.recordTargetSwitch()
+}
+
+// RecordRouteExhaustion records one logical operation that exhausted its
+// eligible route targets. A request summary makes repeated calls idempotent.
+func (h *ProxyHandler) RecordRouteExhaustion(ctx context.Context) {
+	if summary := RequestSummaryFromContext(ctx); summary != nil && !summary.MarkRouteExhausted() {
+		return
+	}
+	if h == nil || h.stats == nil {
+		return
+	}
+	h.stats.recordRouteExhaustion()
+}
+
+// RecordStateBindingHit records a successful exact state-to-target lookup.
+func (h *ProxyHandler) RecordStateBindingHit() {
+	if h != nil && h.stats != nil {
+		h.stats.recordStateBindingEvent(stateBindingHit)
+	}
+}
+
+// RecordStateBindingMiss records an exact state lookup with no live binding.
+func (h *ProxyHandler) RecordStateBindingMiss() {
+	if h != nil && h.stats != nil {
+		h.stats.recordStateBindingEvent(stateBindingMiss)
+	}
+}
+
+// RecordStateBindingEviction records one binding removed by the bounded store.
+func (h *ProxyHandler) RecordStateBindingEviction() {
+	if h != nil && h.stats != nil {
+		h.stats.recordStateBindingEvent(stateBindingEviction)
+	}
+}
+
+func (c *statsCollector) recordUpstreamAttempt(routeID, targetID, providerID, providerKind string) {
+	if c == nil {
+		return
+	}
+	routeID = boundOperationalStatLabel(strings.TrimSpace(routeID))
+	targetID = boundOperationalStatLabel(strings.TrimSpace(targetID))
+	providerID = boundOperationalStatLabel(strings.TrimSpace(providerID))
+	providerKind = boundOperationalStatLabel(strings.TrimSpace(providerKind))
+
+	c.mu.Lock()
+	c.recordUpstreamAttemptLocked(routeID, targetID, providerID, providerKind)
+	c.mu.Unlock()
+}
+
+// recordUpstreamAttemptLocked increments the dispatch ledger and returns the
+// bounded aggregate key used for later physical/wasted usage attribution.
+// Caller must hold c.mu.
+func (c *statsCollector) recordUpstreamAttemptLocked(routeID, targetID, providerID, providerKind string) string {
+	c.upstreamAttempts++
+	if targetID == "" {
+		return ""
+	}
+	key := capKey(c.byTarget, targetAttemptKey(routeID, targetID))
+	counter := c.byTarget[key]
+	if counter == nil {
+		counter = &targetAttemptCounter{}
+		if key == statsOtherKey {
+			counter.target = statsOtherKey
+		} else {
+			counter.route = routeID
+			counter.target = targetID
+			counter.provider = providerID
+			counter.kind = providerKind
+		}
+		c.byTarget[key] = counter
+	}
+	if key != statsOtherKey {
+		if providerID != "" {
+			counter.provider = providerID
+		}
+		if providerKind != "" {
+			counter.kind = providerKind
+		}
+	}
+	counter.attempts++
+	return key
+}
+
+func targetAttemptKey(routeID, targetID string) string {
+	return routeID + "\x00" + targetID
+}
+
+func (c *statsCollector) recordTargetSwitch() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.targetSwitches++
+	c.mu.Unlock()
+}
+
+func (c *statsCollector) recordRouteExhaustion() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.routeExhaustions++
+	c.mu.Unlock()
+}
+
+type stateBindingStatsEvent uint8
+
+const (
+	stateBindingHit stateBindingStatsEvent = iota + 1
+	stateBindingMiss
+	stateBindingEviction
+)
+
+func (c *statsCollector) recordStateBindingEvent(event stateBindingStatsEvent) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch event {
+	case stateBindingHit:
+		c.stateBindingHits++
+	case stateBindingMiss:
+		c.stateBindingMisses++
+	case stateBindingEviction:
+		c.stateBindingEvictions++
+	}
 }
 
 // record folds one completed HTTP request into the aggregates.
@@ -250,28 +863,35 @@ func (c *statsCollector) record(summary *RequestSummary, status int, userAgent s
 // or an upstream error status for failed/non-200) so failures show up in error
 // counts and the recent log. Streamed turns carry no latency sample. Every turn
 // is counted as one request even with zero/absent usage, matching the HTTP path.
-func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage) responsesTurnStatsRecord {
+func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, operationIDs ...string) responsesTurnStatsRecord {
+	if status == 0 {
+		status = http.StatusOK
+	}
+	operationID := ""
+	if len(operationIDs) > 0 {
+		operationID = strings.TrimSpace(operationIDs[0])
+	}
+	// Physical/wasted usage belongs exclusively to explicit-route attempt
+	// records. Legacy websocket turns still contribute to the client request
+	// ledger, but must never synthesize explicit-route physical spend.
 	total := usage.totalTokens()
 	d := summaryStats{
-		model:      boundStatLabel(model),
-		provider:   provider,
-		kind:       kind,
-		endpoint:   "responses_ws",
-		stream:     true, // streamed: excluded from latency
-		prompt:     usage.InputTokens,
-		completion: usage.OutputTokens,
-		total:      total,
-		cached:     usage.InputTokensDetails.CachedTokens,
-		reasoning:  usage.OutputTokensDetails.ReasoningTokens,
+		model:       boundStatLabel(model),
+		operationID: boundOperationalStatLabel(operationID),
+		provider:    provider,
+		kind:        kind,
+		endpoint:    "responses_ws",
+		stream:      true, // streamed: excluded from latency
+		prompt:      usage.InputTokens,
+		completion:  usage.OutputTokens,
+		total:       total,
+		cached:      usage.InputTokensDetails.CachedTokens,
+		reasoning:   usage.OutputTokensDetails.ReasoningTokens,
 	}
 	agent := agentLabel
 	if agent == "" {
 		agent = "unknown"
 	}
-	if status == 0 {
-		status = http.StatusOK
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.recordLocked(d, agent, status, 0)
@@ -326,6 +946,8 @@ func (c *statsCollector) addResponsesTurnUsage(record responsesTurnStatsRecord, 
 func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, durMs int64) responsesTurnStatsRecord {
 	sec := c.now().Unix()
 	isErr := status >= http.StatusBadRequest
+	hasFailover := d.targetSwitches > 0
+	successfulFailover := hasFailover && !isErr
 
 	idx := ringIndex(sec, len(c.ring))
 	b := &c.ring[idx]
@@ -348,6 +970,12 @@ func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, 
 	c.totals.TotalTokens += int64(d.total)
 	c.totals.CachedTokens += int64(d.cached)
 	c.totals.ReasoningTokens += int64(d.reasoning)
+	if hasFailover {
+		c.requestsWithFailover++
+		if successfulFailover {
+			c.successfulFailovers++
+		}
+	}
 
 	// Latency: only non-streaming requests carry a meaningful end-to-end
 	// duration. A streamed response (SSE chat, or a GET /v1/responses websocket
@@ -381,6 +1009,21 @@ func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, 
 	}
 	agentKey := capKey(c.byAgent, agent)
 	addBreakdown(c.byAgent, agentKey, int64(d.total), "", isErr, durMs, measureLatency)
+	if d.routeID != "" {
+		routeKey := capKey(c.byRoute, d.routeID)
+		addBreakdown(c.byRoute, routeKey, int64(d.total), "", isErr, durMs, measureLatency)
+		counter := c.byRoute[routeKey]
+		counter.targetSwitches += d.targetSwitches
+		if hasFailover {
+			counter.requestsWithFailover++
+			if successfulFailover {
+				counter.successfulFailovers++
+			}
+		}
+		if d.routeExhausted {
+			counter.routeExhaustions++
+		}
+	}
 
 	// Append to the recent-requests drill-down ring (newest overwrites oldest).
 	if c.recentSequence == ^uint64(0) {
@@ -394,6 +1037,11 @@ func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, 
 		Endpoint:          d.endpoint,
 		Model:             d.model,
 		Provider:          d.provider,
+		OperationID:       d.operationID,
+		RouteID:           d.routeID,
+		FinalTarget:       d.finalTarget,
+		UpstreamSends:     d.upstreamSends,
+		TargetSwitches:    d.targetSwitches,
 		Agent:             agent,
 		Status:            status,
 		DurMs:             durMs,
@@ -475,19 +1123,32 @@ func (c *statsCollector) snapshot() statsSnapshot {
 	totals.LatencyP50, totals.LatencyP95, totals.LatencyP99 = c.latencyPercentiles()
 
 	return statsSnapshot{
-		UptimeSeconds: int64(now.Sub(c.start).Seconds()),
-		Inflight:      c.inflight.Load(),
-		Totals:        totals,
-		Status:        status,
-		StatusCodes:   topStatusCodes(c.statusCodes),
-		Errors:        topErrorTargets(c.errTargets),
-		Series:        series,
-		ByModel:       topBreakdowns(c.byModel, breakdownKindModel),
-		ByProvider:    topBreakdowns(c.byProvider, breakdownKindProvider),
-		ByAgent:       topBreakdowns(c.byAgent, breakdownKindAgent),
-		Retries:       c.retries,
-		RetriesByCode: retriesRows(c.retriesByCode),
-		Recent:        c.recentSnapshot(),
+		UptimeSeconds:         int64(now.Sub(c.start).Seconds()),
+		Inflight:              c.inflight.Load(),
+		Totals:                totals,
+		Status:                status,
+		StatusCodes:           topStatusCodes(c.statusCodes),
+		Errors:                topErrorTargets(c.errTargets),
+		Series:                series,
+		ByModel:               topBreakdowns(c.byModel, breakdownKindModel),
+		ByProvider:            topBreakdowns(c.byProvider, breakdownKindProvider),
+		ByAgent:               topBreakdowns(c.byAgent, breakdownKindAgent),
+		ByRoute:               topBreakdowns(c.byRoute, breakdownKindRoute),
+		ByTarget:              topTargetBreakdowns(c.byTarget),
+		PhysicalUsage:         c.physicalUsage,
+		WastedUsage:           c.wastedUsage,
+		UpstreamAttempts:      c.upstreamAttempts,
+		TargetSwitches:        c.targetSwitches,
+		RequestsWithFailover:  c.requestsWithFailover,
+		SuccessfulFailovers:   c.successfulFailovers,
+		RouteExhaustions:      c.routeExhaustions,
+		StateBindingHits:      c.stateBindingHits,
+		StateBindingMisses:    c.stateBindingMisses,
+		StateBindingEvictions: c.stateBindingEvictions,
+		Retries:               c.retries,
+		RetriesByCode:         retriesRows(c.retriesByCode),
+		Recent:                c.recentSnapshot(),
+		RecentAttempts:        c.recentAttemptsSnapshot(),
 	}
 }
 
@@ -524,6 +1185,90 @@ func (c *statsCollector) recentSnapshot() []recentRequest {
 		out = append(out, c.recent[idx])
 	}
 	return out
+}
+
+// recentAttemptsSnapshot returns the physical-attempt ring newest-first. Caller holds c.mu.
+func (c *statsCollector) recentAttemptsSnapshot() []recentRouteAttempt {
+	out := make([]recentRouteAttempt, 0, c.recentAttemptSize)
+	for i := 0; i < c.recentAttemptSize; i++ {
+		idx := (c.recentAttemptIdx - 1 - i + len(c.recentAttempts)) % len(c.recentAttempts)
+		row := c.recentAttempts[idx]
+		row.state = nil
+		row.recordID = 0
+		out = append(out, row)
+	}
+	return out
+}
+
+func applyRouteAttemptTrace(row recentRouteAttempt, trace routeAttemptTrace) recentRouteAttempt {
+	traceOutcome := routeAttemptOutcomeFromTrace(trace)
+	diagnosticsNotWeaker := routeAttemptDiagnosticsCompare(
+		traceOutcome, trace.Progress, trace.StatusCode,
+		row.Outcome, row.SemanticProgress, row.StatusCode,
+	) >= 0
+	if trace.StatusCode != 0 && diagnosticsNotWeaker {
+		row.StatusCode = trace.StatusCode
+	}
+	if trace.Delivery != "" && diagnosticsNotWeaker {
+		row.Delivery = trace.Delivery
+	}
+	row.SemanticProgress = mergeUpstreamSemanticProgress(row.SemanticProgress, trace.Progress)
+	if routeCommitmentRank(trace.Commitment) > routeCommitmentRank(row.DownstreamCommitment) {
+		row.DownstreamCommitment = trace.Commitment
+	}
+	if trace.Decision != "" && (row.RetryDecision == "" || row.RetryDecision == routeRetryAccepted || trace.Decision != routeRetryAccepted) {
+		row.RetryDecision = trace.Decision
+	}
+	if trace.UpstreamID != "" && diagnosticsNotWeaker {
+		row.UpstreamRequestID = boundOperationalStatLabel(trace.UpstreamID)
+	}
+	row.CleanupComplete = row.CleanupComplete || trace.CleanupDone
+	row.Outcome = mergeRouteAttemptOutcome(row.Outcome, traceOutcome)
+	row.Status = normalizedRouteAttemptStatus(row.StatusCode, row.Outcome)
+	return row
+}
+
+func routeAttemptDiagnosticsCompare(leftOutcome routeAttemptOutcome, leftProgress upstreamSemanticProgress, leftStatus int, rightOutcome routeAttemptOutcome, rightProgress upstreamSemanticProgress, rightStatus int) int {
+	if left, right := routeAttemptOutcomeRank(leftOutcome), routeAttemptOutcomeRank(rightOutcome); left != right {
+		return left - right
+	}
+	if left, right := routeAttemptProgressDiagnosticRank(leftProgress), routeAttemptProgressDiagnosticRank(rightProgress); left != right {
+		return left - right
+	}
+	return routeAttemptStatusDiagnosticRank(leftStatus) - routeAttemptStatusDiagnosticRank(rightStatus)
+}
+
+func routeAttemptProgressDiagnosticRank(progress upstreamSemanticProgress) int {
+	// Keep this order aligned with mergeUpstreamSemanticProgress: more
+	// conservative evidence of execution must never be replaced by a weaker
+	// preamble or terminal-only trace.
+	switch progress {
+	case upstreamProgressUnknown:
+		return 6
+	case upstreamProgressToolActivity:
+		return 5
+	case upstreamProgressSemanticOutput:
+		return 4
+	case upstreamProgressTerminalSuccess:
+		return 3
+	case upstreamProgressTerminalFailure:
+		return 2
+	case upstreamProgressAllowedPreamble:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func routeAttemptStatusDiagnosticRank(status int) int {
+	switch {
+	case status >= http.StatusBadRequest:
+		return 2
+	case status > 0:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // latencyPercentiles returns p50/p95/p99 over the bounded recent-latency
@@ -592,6 +1337,42 @@ func topErrorTargets(m map[string]int64) []statsErrorRow {
 	return out
 }
 
+// topTargetBreakdowns returns physical-attempt rows sorted by attempt count.
+// Both the backing map and returned rows are bounded independently.
+func topTargetBreakdowns(m map[string]*targetAttemptCounter) []statsTargetBreakdown {
+	out := make([]statsTargetBreakdown, 0, len(m))
+	for _, counter := range m {
+		if counter == nil {
+			continue
+		}
+		out = append(out, statsTargetBreakdown{
+			Route:         counter.route,
+			Target:        counter.target,
+			Provider:      counter.provider,
+			Kind:          counter.kind,
+			Attempts:      counter.attempts,
+			PhysicalUsage: counter.physicalUsage,
+			WastedUsage:   counter.wastedUsage,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Attempts != out[j].Attempts {
+			return out[i].Attempts > out[j].Attempts
+		}
+		if out[i].Route != out[j].Route {
+			return out[i].Route < out[j].Route
+		}
+		if out[i].Target != out[j].Target {
+			return out[i].Target < out[j].Target
+		}
+		return out[i].Provider < out[j].Provider
+	})
+	if len(out) > statsBreakdownRows {
+		out = out[:statsBreakdownRows]
+	}
+	return out
+}
+
 func ringIndex(sec int64, n int) int {
 	if n <= 0 {
 		return 0
@@ -636,12 +1417,21 @@ const (
 	breakdownKindModel    = "model"
 	breakdownKindProvider = "provider"
 	breakdownKindAgent    = "agent"
+	breakdownKindRoute    = "route"
 )
 
 func topBreakdowns(m map[string]*breakdownCounter, kind string) []statsBreakdown {
 	out := make([]statsBreakdown, 0, len(m))
 	for key, e := range m {
-		b := statsBreakdown{Requests: e.requests, Tokens: e.tokens, Errors: e.errors}
+		b := statsBreakdown{
+			Requests:             e.requests,
+			Tokens:               e.tokens,
+			Errors:               e.errors,
+			TargetSwitches:       e.targetSwitches,
+			RequestsWithFailover: e.requestsWithFailover,
+			SuccessfulFailovers:  e.successfulFailovers,
+			RouteExhaustions:     e.routeExhaustions,
+		}
 		if e.durSamples > 0 {
 			b.AvgMs = e.durMs / e.durSamples
 		}
@@ -653,6 +1443,8 @@ func topBreakdowns(m map[string]*breakdownCounter, kind string) []statsBreakdown
 			b.Kind = e.kind
 		case breakdownKindAgent:
 			b.Agent = key
+		case breakdownKindRoute:
+			b.Route = key
 		}
 		out = append(out, b)
 	}
@@ -684,9 +1476,10 @@ func sortBreakdownsByRequests(out []statsBreakdown) {
 }
 
 // unionTopBreakdowns returns the union of the top-n rows by each metric the
-// dashboard can sort by (requests, tokens, errors, latency). The result is
+// dashboard can sort by (requests, tokens, errors, latency) plus route
+// failover signals. The result is
 // deduplicated by label and ordered by the default requests-desc sort, so it is
-// at most 4*n rows but usually far fewer (the same heavy hitters top multiple
+// at most 8*n rows but usually far fewer (the same heavy hitters top multiple
 // metrics). Rows with a zero value for a metric never enter that metric's top
 // set, so error/latency dimensions only contribute rows that actually have
 // errors/latency.
@@ -699,6 +1492,10 @@ func unionTopBreakdowns(rows []statsBreakdown, n int) []statsBreakdown {
 		func(b statsBreakdown) int64 { return b.Tokens },
 		func(b statsBreakdown) int64 { return b.Errors },
 		func(b statsBreakdown) int64 { return b.AvgMs },
+		func(b statsBreakdown) int64 { return b.TargetSwitches },
+		func(b statsBreakdown) int64 { return b.RequestsWithFailover },
+		func(b statsBreakdown) int64 { return b.SuccessfulFailovers },
+		func(b statsBreakdown) int64 { return b.RouteExhaustions },
 	}
 	keep := make(map[string]struct{}, n)
 	ordered := make([]statsBreakdown, len(rows))
@@ -734,23 +1531,31 @@ func breakdownLabel(b statsBreakdown) string {
 		return b.Provider
 	case b.Agent != "":
 		return b.Agent
+	case b.Route != "":
+		return b.Route
 	}
 	return ""
 }
 
 // summaryStats is the subset of a RequestSummary the collector folds in.
 type summaryStats struct {
-	model      string
-	provider   string
-	kind       string
-	endpoint   string
-	upstreamID string
-	stream     bool
-	prompt     int
-	completion int
-	total      int
-	cached     int
-	reasoning  int
+	model          string
+	provider       string
+	kind           string
+	endpoint       string
+	upstreamID     string
+	operationID    string
+	routeID        string
+	finalTarget    string
+	upstreamSends  int64
+	targetSwitches int64
+	routeExhausted bool
+	stream         bool
+	prompt         int
+	completion     int
+	total          int
+	cached         int
+	reasoning      int
 }
 
 func readSummaryForStats(summary *RequestSummary) summaryStats {
@@ -765,10 +1570,19 @@ func readSummaryForStats(summary *RequestSummary) summaryStats {
 	// stats (the cardinality cap limits count, not size). provider/kind are
 	// configured server-side, so they are trusted.
 	d.model = boundStatLabel(summary.model)
-	d.provider = summary.provider
-	d.kind = summary.providerKind
+	d.provider = boundOperationalStatLabel(summary.provider)
+	d.kind = boundOperationalStatLabel(summary.providerKind)
 	d.endpoint = summary.endpoint
 	d.upstreamID = summary.upstreamRequestID
+	// Operational IDs are proxy/configuration derived, but still length-bound in
+	// the recent log and aggregate keys so future callers cannot accidentally
+	// retain or serve unbounded strings.
+	d.operationID = boundOperationalStatLabel(summary.operationID)
+	d.routeID = boundOperationalStatLabel(summary.routeID)
+	d.finalTarget = boundOperationalStatLabel(summary.finalTarget)
+	d.upstreamSends = summary.upstreamSendCount
+	d.targetSwitches = summary.targetSwitchCount
+	d.routeExhausted = summary.routeExhausted
 	d.stream = summary.stream
 	if summary.promptTokens != nil {
 		d.prompt = *summary.promptTokens
@@ -838,16 +1652,39 @@ func classifyAgent(userAgent string) string {
 // breakdown/recent stats and have them served back via /stats.json.
 const statLabelMaxLen = 64
 
+// statOperationalLabelMaxLen matches the validated route/target ID limit while
+// keeping operation/configuration-derived labels bounded independently from
+// the stricter client-controlled label limit above.
+const statOperationalLabelMaxLen = 128
+
 // boundStatLabel truncates an over-long label to statLabelMaxLen runes.
 func boundStatLabel(s string) string {
-	if len(s) <= statLabelMaxLen {
+	return boundStatLabelRunes(s, statLabelMaxLen)
+}
+
+func boundOperationalStatLabel(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+	s = strings.TrimSpace(s)
+	return boundStatLabelRunes(s, statOperationalLabelMaxLen)
+}
+
+func boundStatLabelRunes(s string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	if len(s) <= maxLen {
 		return s
 	}
 	r := []rune(s)
-	if len(r) <= statLabelMaxLen {
+	if len(r) <= maxLen {
 		return s
 	}
-	return string(r[:statLabelMaxLen]) + "…"
+	return string(r[:maxLen]) + "…"
 }
 
 // isInferenceRoute reports whether method+path is one of the inference /
@@ -985,11 +1822,11 @@ func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAg
 // accumulated before the terminal outcome; the returned record accepts bounded
 // post-terminal usage amendments without creating synthetic requests. status is
 // the client turn outcome so failed turns appear in error counts.
-func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage) responsesTurnStatsRecord {
+func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, operationIDs ...string) responsesTurnStatsRecord {
 	if h == nil || h.stats == nil {
 		return responsesTurnStatsRecord{}
 	}
-	return h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage)
+	return h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage, operationIDs...)
 }
 
 func (h *ProxyHandler) AddResponsesTurnUsage(record responsesTurnStatsRecord, usage responsesUsage) {

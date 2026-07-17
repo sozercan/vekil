@@ -53,17 +53,20 @@ const (
 )
 
 type peekResult struct {
-	decision         responsesPeekDecision
-	status           int
-	errType          string
-	message          string
-	retryAfter       string
-	retryAfterSource string
-	failure          *responsesWebSocketStreamEvent
-	terminal         *responsesWebSocketStreamEvent
-	bufferedBytes    int
-	peekDuration     time.Duration
-	preamble         bool
+	decision            responsesPeekDecision
+	status              int
+	errType             string
+	message             string
+	retryAfter          string
+	retryAfterSource    string
+	failure             *responsesWebSocketStreamEvent
+	terminal            *responsesWebSocketStreamEvent
+	bufferedBytes       int
+	peekDuration        time.Duration
+	preamble            bool
+	eventOutputProgress bool
+	eventUsageProgress  bool
+	precommitReplaySafe bool
 }
 
 type responsesPeekChunk struct {
@@ -84,9 +87,10 @@ type responsesSSEMessage struct {
 }
 
 type responsesSSEParser struct {
-	pending  []byte
-	allowBOM bool
-	done     bool
+	pending           []byte
+	allowBOM          bool
+	done              bool
+	sawUnsafeProgress bool
 }
 
 // responsesTerminalObserver incrementally inspects committed Responses SSE
@@ -685,6 +689,7 @@ type responsesPreparedStream struct {
 	peekState     *responsesPeekState
 	commitCh      chan struct{}
 	abortCh       chan struct{}
+	doneCh        chan struct{}
 	commitFn      func()
 	abortFn       func()
 	observeOnlyFn func()
@@ -692,6 +697,7 @@ type responsesPreparedStream struct {
 
 type responsesPeekState struct {
 	observeTerminal         bool
+	holdPreamble            bool
 	mu                      sync.Mutex
 	terminal                peekResult
 	hasTerminal             bool
@@ -703,6 +709,7 @@ type responsesPeekState struct {
 	outcomeOnce             sync.Once
 	recoveredUsage          responsesUsage
 	hasRecoveredUsage       bool
+	heldPreambleMaxBytes    int
 	stopTerminalObservation chan struct{}
 	stopTerminalOnce        sync.Once
 }
@@ -845,10 +852,19 @@ func (b *responsesPreparedBody) Close() error {
 }
 
 func newResponsesPreparedStream(resp *http.Response, maxPeekBytes int, observeTerminal bool) *responsesPreparedStream {
+	return newResponsesPreparedStreamConfigured(resp, maxPeekBytes, observeTerminal, false, responsesPrecommitHeldPreambleMaxBytes)
+}
+
+func newResponsesPreparedStreamConfigured(resp *http.Response, maxPeekBytes int, observeTerminal, holdPreamble bool, heldPreambleMaxBytes int) *responsesPreparedStream {
 	pr, pw := io.Pipe()
 	peekDone := make(chan peekResult, 1)
 	peekState := newResponsesPeekState()
 	peekState.observeTerminal = observeTerminal
+	peekState.holdPreamble = holdPreamble
+	if heldPreambleMaxBytes <= 0 {
+		heldPreambleMaxBytes = responsesPrecommitHeldPreambleMaxBytes
+	}
+	peekState.heldPreambleMaxBytes = heldPreambleMaxBytes
 	commitCh := make(chan struct{})
 	abortCh := make(chan struct{})
 	observeOnlyCh := make(chan struct{})
@@ -865,7 +881,7 @@ func newResponsesPreparedStream(resp *http.Response, maxPeekBytes int, observeTe
 	abort := func() {
 		abortOnce.Do(func() {
 			close(abortCh)
-			_ = upstreamBody.Close()
+			go func() { _ = upstreamBody.Close() }()
 		})
 	}
 	var observeOnlyOnce sync.Once
@@ -873,7 +889,11 @@ func newResponsesPreparedStream(resp *http.Response, maxPeekBytes int, observeTe
 		observeOnlyOnce.Do(func() { close(observeOnlyCh) })
 	}
 
-	go runResponsesPeekPump(upstreamBody, pw, resp.Header, peekDone, peekState, commitCh, abortCh, observeOnlyCh, maxPeekBytes)
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		runResponsesPeekPump(upstreamBody, pw, resp.Header, peekDone, peekState, commitCh, abortCh, observeOnlyCh, maxPeekBytes)
+	}()
 
 	return &responsesPreparedStream{
 		resp:          resp,
@@ -882,6 +902,7 @@ func newResponsesPreparedStream(resp *http.Response, maxPeekBytes int, observeTe
 		peekState:     peekState,
 		commitCh:      commitCh,
 		abortCh:       abortCh,
+		doneCh:        doneCh,
 		commitFn:      commit,
 		abortFn:       abort,
 		observeOnlyFn: observeOnly,
@@ -1233,6 +1254,11 @@ func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.He
 
 		select {
 		case <-abortCh:
+			// The abort function closes the upstream body. Wait for the read pump
+			// to observe that close before publishing cleanup completion so a new
+			// route target cannot overlap the abandoned attempt.
+			for range chunkCh {
+			}
 			_ = pw.CloseWithError(context.Canceled)
 			return
 		case <-commitCh:
@@ -1250,14 +1276,24 @@ func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.He
 			if len(chunk.data) > 0 {
 				_, _ = prefix.Write(chunk.data)
 				parser.push(chunk.data)
-				holdPreamble := shouldHoldResponsesPrecommitPreamble(headers)
+				holdPreamble := peekState != nil && peekState.holdPreamble
+				if !holdPreamble {
+					holdPreamble = shouldHoldResponsesPrecommitPreamble(headers)
+				}
 				result, sawSemantic, sawBeyondPreamble := inspectResponsesPeekMessages(&parser, headers, peekState, holdPreamble)
 				result.bufferedBytes = prefix.Len()
 				result.peekDuration = time.Since(start)
 				if !decisionSent {
+					heldPreambleMaxBytes := responsesPrecommitHeldPreambleMaxBytes
+					if peekState != nil && peekState.heldPreambleMaxBytes > 0 {
+						heldPreambleMaxBytes = peekState.heldPreambleMaxBytes
+					}
+					if heldPreambleMaxBytes < maxPeekBytes {
+						heldPreambleMaxBytes = maxPeekBytes
+					}
 					if result.decision == responsesPeekDecisionTranslate {
 						sendResult(result)
-					} else if prefix.Len() >= maxPeekBytes && (!holdPreamble || sawBeyondPreamble || prefix.Len() >= max(responsesPrecommitHeldPreambleMaxBytes, maxPeekBytes)) {
+					} else if prefix.Len() >= maxPeekBytes && (!holdPreamble || sawBeyondPreamble || prefix.Len() >= heldPreambleMaxBytes) {
 						if sawSemantic {
 							sendResult(result)
 						} else {
@@ -1294,6 +1330,19 @@ func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.He
 	}
 }
 
+func responsesOutputHasProgress(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var items []json.RawMessage
+	// Decoding into a slice accepts only null or an array. Any other shape or
+	// malformed JSON is ambiguous progress and must suppress replay/failover.
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &items); err != nil {
+		return true
+	}
+	return len(items) > 0
+}
+
 func inspectResponsesPeekMessages(parser *responsesSSEParser, headers http.Header, peekState *responsesPeekState, preferTranslatedFailure bool) (peekResult, bool, bool) {
 	result := peekResult{decision: responsesPeekDecisionPassthrough}
 	sawSemantic := false
@@ -1308,12 +1357,31 @@ func inspectResponsesPeekMessages(parser *responsesSSEParser, headers http.Heade
 			break
 		}
 		classified := classifyResponsesPeekMessage(msg, headers)
+		unsafeBeforeMessage := parser.sawUnsafeProgress
+		if classified.failure != nil && !unsafeBeforeMessage && !classified.eventOutputProgress && !classified.eventUsageProgress {
+			classified.precommitReplaySafe = true
+		}
+		if classified.eventOutputProgress || classified.eventUsageProgress {
+			// Output and usage on any parsed event, including a nominal preamble,
+			// prove or ambiguously suggest semantic progress. Another target must
+			// not be attempted. Usage carried by the terminal failure itself still
+			// permits HTTP error translation; embedded output does not, because
+			// translation would drop client-visible model output.
+			parser.sawUnsafeProgress = true
+		}
+		if classified.eventOutputProgress {
+			classified.decision = responsesPeekDecisionPassthrough
+		}
 		peekState.publishTerminal(classified)
-		if !sawSemantic || (preferTranslatedFailure && !sawBeyondPreamble && classified.decision == responsesPeekDecisionTranslate) {
+		preserveUnsafeStream := unsafeBeforeMessage && classified.decision == responsesPeekDecisionTranslate
+		if (!sawSemantic && !preserveUnsafeStream) || (preferTranslatedFailure && !unsafeBeforeMessage && !classified.eventOutputProgress && classified.decision == responsesPeekDecisionTranslate) {
 			result = classified
 		}
 		if !classified.preamble {
 			sawBeyondPreamble = true
+			if classified.terminal == nil || classified.failure == nil {
+				parser.sawUnsafeProgress = true
+			}
 		}
 		sawSemantic = true
 	}
@@ -1428,7 +1496,11 @@ func classifyResponsesPeekMessage(msg responsesSSEMessage, headers http.Header) 
 }
 
 func classifyResponsesPeekEvent(event responsesWebSocketStreamEvent, eventName string, headers http.Header) peekResult {
-	result := peekResult{decision: responsesPeekDecisionPassthrough}
+	result := peekResult{
+		decision:            responsesPeekDecisionPassthrough,
+		eventOutputProgress: responsesOutputHasProgress(event.Response.Output),
+		eventUsageProgress:  !event.Response.Usage.isZero(),
+	}
 	eventName = strings.TrimSpace(eventName)
 	terminalType := strings.TrimSpace(event.Type)
 	if terminalType == "" {
@@ -1583,16 +1655,113 @@ func responsesQuotaRemaining(headers http.Header, dimension string) (int64, bool
 	return remaining, true
 }
 
-func responsesQuotaResetSeconds(headers http.Header, dimension string) int64 {
+func normalizePositiveDecimal(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", false
+	}
+	firstNonZero := -1
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return "", false
+		}
+		if firstNonZero == -1 && value[i] != '0' {
+			firstNonZero = i
+		}
+	}
+	if firstNonZero == -1 {
+		return "", false
+	}
+	return value[firstNonZero:], true
+}
+
+// incrementPositiveDecimal adds one without converting an unbounded upstream
+// value into a machine or arbitrary-precision integer. The returned decimal
+// requires at most one allocation, which is unavoidable when a carry changes
+// its digits.
+func incrementPositiveDecimal(value string) string {
+	carryIndex := len(value) - 1
+	for carryIndex >= 0 && value[carryIndex] == '9' {
+		carryIndex--
+	}
+
+	var incremented strings.Builder
+	if carryIndex < 0 {
+		incremented.Grow(len(value) + 1)
+		incremented.WriteByte('1')
+		for range len(value) {
+			incremented.WriteByte('0')
+		}
+		return incremented.String()
+	}
+
+	incremented.Grow(len(value))
+	incremented.WriteString(value[:carryIndex])
+	incremented.WriteByte(value[carryIndex] + 1)
+	for i := carryIndex + 1; i < len(value); i++ {
+		incremented.WriteByte('0')
+	}
+	return incremented.String()
+}
+
+func decimalMillisecondsToRetryAfterSeconds(value string) (string, bool) {
+	normalized, ok := normalizePositiveDecimal(value)
+	if !ok {
+		return "", false
+	}
+	if len(normalized) <= 3 {
+		return "1", true
+	}
+
+	secondsEnd := len(normalized) - 3
+	seconds := normalized[:secondsEnd]
+	if normalized[secondsEnd:] == "000" {
+		return seconds, true
+	}
+	return incrementPositiveDecimal(seconds), true
+}
+
+func retryAfterHeaderSeconds(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if normalized, ok := normalizePositiveDecimal(value); ok {
+		return normalized, true
+	}
+	retryAt, err := http.ParseTime(value)
+	if err != nil {
+		return "", false
+	}
+	now := time.Now()
+	if !retryAt.After(now) {
+		return "", false
+	}
+	seconds := retryAt.Unix() - now.Unix()
+	if seconds <= 0 {
+		seconds = 1
+	}
+	return strconv.FormatInt(seconds, 10), true
+}
+
+func responsesQuotaResetRetryAfter(headers http.Header, dimension string) (string, bool) {
 	value := strings.TrimSpace(headerGetCI(headers, "x-ratelimit-reset-"+dimension))
-	if seconds, ok := parsePositiveDecimalClamped(value, int64(maxRetryAfter/time.Second)); ok {
-		return seconds
+	if normalized, ok := normalizePositiveDecimal(value); ok {
+		return normalized, true
 	}
 	delay, err := time.ParseDuration(value)
 	if err != nil || delay <= 0 {
-		return 0
+		return "", false
 	}
-	return durationSecondsCeil(delay)
+	seconds := durationSecondsCeil(delay)
+	if seconds <= 0 {
+		return "", false
+	}
+	return strconv.FormatInt(seconds, 10), true
+}
+
+func positiveDecimalGreater(left, right string) bool {
+	if len(left) != len(right) {
+		return len(left) > len(right)
+	}
+	return left > right
 }
 
 func classifyPrecommitResponsesFailure(event responsesWebSocketStreamEvent) (int, string, bool) {
@@ -1633,37 +1802,32 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 		return "", ""
 	}
 
-	if value := strings.TrimSpace(headerGetCI(headers, "retry-after-ms")); value != "" {
-		if ms, ok := parsePositiveDecimalClamped(value, int64(maxRetryAfter/time.Millisecond)); ok {
-			delay := retryAfterDurationFromMilliseconds(ms)
-			seconds := durationSecondsCeil(delay)
-			if seconds > 0 {
-				return strconv.FormatInt(seconds, 10), "retry-after-ms"
-			}
-		}
+	// This value is forwarded to the client. Keep the proxy's bounded internal
+	// sleep policy separate so an authoritative provider delay is never shortened.
+	if seconds, ok := decimalMillisecondsToRetryAfterSeconds(headerGetCI(headers, "retry-after-ms")); ok {
+		return seconds, "retry-after-ms"
 	}
 
-	if delay, ok := parseRetryAfter(strings.TrimSpace(headerGetCI(headers, "Retry-After"))); ok && delay > 0 {
-		return strconv.FormatInt(durationSecondsCeil(delay), 10), "Retry-After"
+	if seconds, ok := retryAfterHeaderSeconds(headerGetCI(headers, "Retry-After")); ok {
+		return seconds, "Retry-After"
 	}
 
-	var resetSeconds int64
+	resetValue := ""
 	resetSource := ""
 	for _, dimension := range []string{"tokens", "requests"} {
 		remaining, exhausted := responsesQuotaRemaining(headers, dimension)
 		if !exhausted || remaining == -1 {
 			continue
 		}
-		seconds := responsesQuotaResetSeconds(headers, dimension)
-		if seconds <= resetSeconds {
+		value, ok := responsesQuotaResetRetryAfter(headers, dimension)
+		if !ok || (resetValue != "" && !positiveDecimalGreater(value, resetValue)) {
 			continue
 		}
-		resetSeconds = seconds
+		resetValue = value
 		resetSource = "x-ratelimit-reset-" + dimension
 	}
-	if resetSeconds > 0 {
-		delay := retryAfterDurationFromSeconds(resetSeconds)
-		return strconv.Itoa(int(delay / time.Second)), resetSource
+	if resetValue != "" {
+		return resetValue, resetSource
 	}
 
 	return "", ""

@@ -225,6 +225,53 @@ func TestResolveStaticProviderModelHonorsFiltersAndRejectsCollisions(t *testing.
 	}
 }
 
+func TestResolveStaticProviderModelResolvesExplicitRouteMetadata(t *testing.T) {
+	parallelToolCalls := true
+	contextWindow := int64(200000)
+	cfg := ProvidersConfig{
+		SchemaVersion: ProvidersConfigSchemaVersion2,
+		Providers: []ProviderConfig{{
+			ID:      "azure",
+			Type:    "azure-openai",
+			BaseURL: "https://x.openai.azure.com/openai/v1",
+			APIKey:  "test-key",
+		}},
+		ModelRoutes: []ModelRouteConfig{{
+			ID:                "route",
+			PublicID:          "public-model",
+			Name:              "Public Model",
+			Endpoints:         []string{"/responses"},
+			ReasoningEffort:   []string{"low", "high"},
+			ParallelToolCalls: &parallelToolCalls,
+			ContextWindow:     &contextWindow,
+			Targets: []ModelRouteTargetConfig{{
+				ID:            "primary",
+				Provider:      "azure",
+				UpstreamModel: "deployment",
+			}},
+		}},
+	}
+
+	got, ok, err := ResolveStaticProviderModel(cfg, "public-model")
+	if err != nil {
+		t.Fatalf("ResolveStaticProviderModel() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("ResolveStaticProviderModel() found = false, want explicit route metadata")
+	}
+	if got.PublicID != "public-model" || got.Name != "Public Model" {
+		t.Fatalf("resolved identity = %#v", got)
+	}
+	if !reflect.DeepEqual(got.Endpoints, []string{"/responses"}) ||
+		!reflect.DeepEqual(got.ReasoningEffort, []string{"low", "high"}) {
+		t.Fatalf("resolved route metadata = %#v", got)
+	}
+	if got.ParallelToolCalls == nil || !*got.ParallelToolCalls ||
+		got.ContextWindow == nil || *got.ContextWindow != contextWindow {
+		t.Fatalf("resolved route capabilities = %#v", got)
+	}
+}
+
 func TestLoadProvidersConfigFileYAML(t *testing.T) {
 	t.Parallel()
 
@@ -945,6 +992,168 @@ func TestReplaceProviderModelsFiltersBeforeCollisionCheck(t *testing.T) {
 	}
 }
 
+func TestReplaceProviderModelsBatchVersion1DeferredAliasesFollowProviderOrder(t *testing.T) {
+	const alias = "claude-sonnet-4.5"
+	tests := []struct {
+		name          string
+		providerOrder []string
+		wantProvider  string
+	}{
+		{
+			name:          "first configured provider wins",
+			providerOrder: []string{"dynamic-a", "dynamic-b"},
+			wantProvider:  "dynamic-a",
+		},
+		{
+			name:          "reversed configured provider wins",
+			providerOrder: []string{"dynamic-b", "dynamic-a"},
+			wantProvider:  "dynamic-b",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for iteration := 0; iteration < 256; iteration++ {
+				setup := newDeferredAliasProviderSetup(t, tt.providerOrder, false, "dynamic-a", "dynamic-b")
+				replacements := make(map[string][]providerModel, 2)
+				if iteration%2 == 0 {
+					replacements["dynamic-b"] = deferredAliasModels("dynamic-b", "claude-sonnet-4-5-20260202")
+					replacements["dynamic-a"] = deferredAliasModels("dynamic-a", "claude-sonnet-4-5-20260101")
+				} else {
+					replacements["dynamic-a"] = deferredAliasModels("dynamic-a", "claude-sonnet-4-5-20260101")
+					replacements["dynamic-b"] = deferredAliasModels("dynamic-b", "claude-sonnet-4-5-20260202")
+				}
+
+				if err := setup.replaceProviderModelsBatch(replacements); err != nil {
+					t.Fatalf("iteration %d: replaceProviderModelsBatch() error = %v", iteration, err)
+				}
+				assertLegacyAliasProvider(t, setup, alias, tt.wantProvider, iteration)
+			}
+		})
+	}
+}
+
+func TestReplaceProviderModelsBatchVersion1DeferredAliasesUseSortedUnknownProviderFallback(t *testing.T) {
+	const alias = "claude-sonnet-4.5"
+	for iteration := 0; iteration < 256; iteration++ {
+		setup := newDeferredAliasProviderSetup(t, []string{"configured"}, false, "configured", "unknown-a", "unknown-z")
+		replacements := make(map[string][]providerModel, 2)
+		if iteration%2 == 0 {
+			replacements["unknown-z"] = deferredAliasModels("unknown-z", "claude-sonnet-4-5-20260202")
+			replacements["unknown-a"] = deferredAliasModels("unknown-a", "claude-sonnet-4-5-20260101")
+		} else {
+			replacements["unknown-a"] = deferredAliasModels("unknown-a", "claude-sonnet-4-5-20260101")
+			replacements["unknown-z"] = deferredAliasModels("unknown-z", "claude-sonnet-4-5-20260202")
+		}
+
+		if err := setup.replaceProviderModelsBatch(replacements); err != nil {
+			t.Fatalf("iteration %d: replaceProviderModelsBatch() error = %v", iteration, err)
+		}
+		assertLegacyAliasProvider(t, setup, alias, "unknown-a", iteration)
+	}
+}
+
+func TestReplaceProviderModelsBatchVersion2RejectsDeferredAliasCollisionAtomically(t *testing.T) {
+	setup := newDeferredAliasProviderSetup(t, []string{"stable", "dynamic-a", "dynamic-b"}, true, "stable", "dynamic-a", "dynamic-b")
+	stableModels := []providerModel{{
+		publicID:           "stable-model",
+		upstreamModel:      "stable-model",
+		providerID:         "stable",
+		supportedEndpoints: []string{providerEndpointResponses},
+	}}
+	if err := setup.addProviderModels("stable", stableModels); err != nil {
+		t.Fatalf("add stable provider models: %v", err)
+	}
+	beforeRoutes := setup.routes.load()
+	beforeModels := map[string]providerModel{}
+	for publicID, model := range setup.models {
+		beforeModels[publicID] = model
+	}
+
+	err := setup.replaceProviderModelsBatch(map[string][]providerModel{
+		"dynamic-b": deferredAliasModels("dynamic-b", "claude-sonnet-4-5-20260202"),
+		"dynamic-a": deferredAliasModels("dynamic-a", "claude-sonnet-4-5-20260101"),
+	})
+	if err == nil {
+		t.Fatal("replaceProviderModelsBatch() error = nil, want normalized alias collision")
+	}
+	if !strings.Contains(err.Error(), "claude-sonnet-4.5") || !strings.Contains(err.Error(), "dynamic-a") || !strings.Contains(err.Error(), "dynamic-b") {
+		t.Fatalf("collision error = %v, want alias and both provider ids", err)
+	}
+	if got := setup.routes.load(); got != beforeRoutes {
+		t.Fatal("route registry snapshot changed after rejected batch collision")
+	}
+	if !reflect.DeepEqual(setup.models, beforeModels) {
+		t.Fatalf("provider models changed after rejected batch collision: got %+v, want %+v", setup.models, beforeModels)
+	}
+	if _, ok := setup.lookupRoute("claude-sonnet-4-5-20260101"); ok {
+		t.Fatal("first colliding deferred model was published")
+	}
+	if _, ok := setup.lookupRoute("claude-sonnet-4-5-20260202"); ok {
+		t.Fatal("second colliding deferred model was published")
+	}
+}
+
+func newDeferredAliasProviderSetup(t *testing.T, providerOrder []string, strictAliases bool, providerIDs ...string) *providerSetup {
+	t.Helper()
+
+	registry, err := newModelRouteRegistry(nil)
+	if err != nil {
+		t.Fatalf("newModelRouteRegistry() error = %v", err)
+	}
+	registry.setStrictAliases(strictAliases)
+
+	providers := make(map[string]*providerRuntime, len(providerIDs))
+	for _, providerID := range providerIDs {
+		providers[providerID] = &providerRuntime{
+			id:             providerID,
+			kind:           providerTypeOpenAICompatible,
+			modelDiscovery: providerModelDiscoveryOpenAI,
+		}
+	}
+	setup := &providerSetup{
+		providers:     providers,
+		routes:        registry,
+		providerOrder: append([]string(nil), providerOrder...),
+		models:        make(map[string]providerModel),
+	}
+	for _, providerID := range providerOrder {
+		provider := providers[providerID]
+		if provider == nil {
+			continue
+		}
+		if err := registry.addLegacyProvider(provider, nil); err != nil {
+			t.Fatalf("register empty deferred provider %q: %v", providerID, err)
+		}
+	}
+	return setup
+}
+
+func deferredAliasModels(providerID, publicID string) []providerModel {
+	return []providerModel{{
+		publicID:           publicID,
+		upstreamModel:      publicID,
+		providerID:         providerID,
+		supportedEndpoints: []string{providerEndpointMessages},
+	}}
+}
+
+func assertLegacyAliasProvider(t *testing.T, setup *providerSetup, alias, wantProvider string, iteration int) {
+	t.Helper()
+
+	route, ok := setup.lookupRouteAlias(alias)
+	if !ok {
+		t.Fatalf("iteration %d: lookupRouteAlias(%q) = false", iteration, alias)
+	}
+	target, ok := route.primaryTarget()
+	if !ok || target.provider == nil {
+		t.Fatalf("iteration %d: alias route has no provider target: %+v", iteration, route)
+	}
+	if got := target.provider.id; got != wantProvider {
+		t.Fatalf("iteration %d: alias provider = %q, want %q (provider order %v)", iteration, got, wantProvider, setup.providerOrder)
+	}
+}
+
 func TestBuildProvidersOpenAICodexDefaultBaseURLAndFilters(t *testing.T) {
 	t.Parallel()
 
@@ -1612,6 +1821,62 @@ func TestModelUsesCopilotHonorsProviderFiltersDuringDeferredDiscovery(t *testing
 		}
 		if !h.ModelUsesCopilot("shared-model") {
 			t.Fatal("unrestricted Copilot collision candidate did not require authentication")
+		}
+	})
+
+	t.Run("explicit route scopes readiness to its target", func(t *testing.T) {
+		cfg := ProvidersConfig{
+			SchemaVersion: ProvidersConfigSchemaVersion2,
+			Providers: []ProviderConfig{
+				{
+					ID:      "azure",
+					Type:    "azure-openai",
+					Default: true,
+					BaseURL: "https://x.openai.azure.com/openai/v1",
+					APIKey:  "test-key",
+				},
+				{
+					ID:             "unrelated",
+					Type:           "openai-compatible",
+					BaseURL:        "http://127.0.0.1:9/v1",
+					AuthType:       "none",
+					ModelDiscovery: "static",
+					Models: []ProviderModelConfig{{
+						PublicID:  "other-model",
+						Endpoints: []string{"/responses"},
+					}},
+				},
+			},
+			ModelRoutes: []ModelRouteConfig{{
+				ID:        "route",
+				PublicID:  "public-model",
+				Endpoints: []string{"/responses"},
+				Targets: []ModelRouteTargetConfig{{
+					ID:            "primary",
+					Provider:      "azure",
+					UpstreamModel: "physical-model",
+				}},
+			}},
+		}
+		h, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.NewWithWriter(logger.LevelError, io.Discard),
+			WithProvidersConfig(cfg),
+			WithAllowedModels("public-model"),
+			WithDeferredDynamicProviderModelValidation(true),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler() error = %v", err)
+		}
+		if h.ModelUsesCopilot("public-model") {
+			t.Fatal("non-Copilot explicit route unexpectedly required Copilot authentication")
+		}
+		setup := h.providerSetup()
+		if !h.providerWithinAllowedModelScope(setup.providerByID("azure")) {
+			t.Fatal("explicit route target was excluded from launcher readiness scope")
+		}
+		if h.providerWithinAllowedModelScope(setup.providerByID("unrelated")) {
+			t.Fatal("unrelated provider remained in launcher readiness scope")
 		}
 	})
 }

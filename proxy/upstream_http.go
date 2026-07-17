@@ -366,6 +366,65 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 }
 
 func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, path string, body []byte, extraHeaders http.Header, model string) (*http.Response, error) {
+	if operation := routeOperationFromContext(ctx); operation != nil && operation.route != nil && !operation.route.legacy {
+		route := operation.route
+		requestedModel := strings.TrimSpace(model)
+		if requestedModel == "" {
+			requestedModel = route.public.id
+		}
+		if requestedModel != route.public.id {
+			resolvedAlias := false
+			if resolved, known := h.resolveModelRouteForRequest(requestedModel, path); known && resolved == route {
+				// Keep the actual alias as the rewrite source. Using the canonical
+				// public ID here can leave the alias in the immutable request body
+				// when the target upstream model is already canonical.
+				resolvedAlias = true
+			}
+			attemptKind := routeAttemptKindFromContext(ctx)
+			if !resolvedAlias && attemptKind != routeAttemptCompatibilityFallback && attemptKind != routeAttemptCompaction {
+				return nil, &providerRequestError{
+					statusCode: http.StatusBadRequest,
+					err:        fmt.Errorf("explicit model route %q cannot change model to %q", route.public.id, requestedModel),
+				}
+			}
+			if !resolvedAlias {
+				upstreamModel := requestedModel
+				if pinned := operation.pinnedTarget(); pinned != "" {
+					if target, ok := route.targetByID(pinned); ok && target.provider != nil {
+						if configured, exists := target.provider.staticModels[upstreamModel]; exists && configured.upstreamModel != "" {
+							upstreamModel = configured.upstreamModel
+						}
+					}
+				}
+				// Keep requestedModel as the model present in the immutable fallback
+				// body. The override carries only the physical model selected for the
+				// pinned target, so prepareRouteTargetBody can still rewrite from the
+				// actual fallback model to that upstream model.
+				ctx = withRouteUpstreamModelOverride(ctx, upstreamModel)
+			}
+		}
+		if !route.supportsEndpoint(path) {
+			return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("model %q does not support %s", route.public.id, path)}
+		}
+		stream := path == providerEndpointResponses && parseResponsesRequestMetadata(body).Stream
+		return h.executeExplicitRouteRequest(ctx, route, path, body, extraHeaders, requestedModel, stream)
+	}
+
+	route, known := h.resolveModelRouteForRequest(model, path)
+	if known && route != nil && !route.legacy {
+		if err := rejectDuplicateJSONMappingKeys(body); err != nil {
+			return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("invalid ambiguous JSON request: %w", err)}
+		}
+		if !route.supportsEndpoint(path) {
+			return nil, &providerRequestError{
+				statusCode: http.StatusBadRequest,
+				err:        fmt.Errorf("model %q does not support %s", model, path),
+			}
+		}
+		stream := path == providerEndpointResponses && parseResponsesRequestMetadata(body).Stream
+		return h.executeExplicitRouteRequest(ctx, route, path, body, extraHeaders, model, stream)
+	}
+
 	provider, owner, rewrittenBody, err := h.resolveProviderRequestForModel(body, path, model)
 	if err != nil {
 		return nil, err
@@ -380,6 +439,14 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, 
 	})
 }
 
+func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
+	return h.postJSONEndpoint(ctx, providerEndpointChatCompletions, body)
+}
+
+func (h *ProxyHandler) postChatCompletionsForModel(ctx context.Context, body []byte, model string) (*http.Response, error) {
+	return h.postJSONEndpointWithHeadersForModel(ctx, providerEndpointChatCompletions, body, nil, model)
+}
+
 func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
 	return h.postResponsesWithHeadersForModel(ctx, body, extraHeaders, extractRequestModel(body))
 }
@@ -392,11 +459,15 @@ func (h *ProxyHandler) postResponsesWithHeadersForModel(ctx context.Context, bod
 	return h.maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx, body, extraHeaders, resp)
 }
 
-func (h *ProxyHandler) postAnthropicMessages(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
-	return h.postJSONEndpointWithHeaders(ctx, providerEndpointMessages, body, extraHeaders)
-}
-
 func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
+	model := extractRequestModel(body)
+	if operation := routeOperationFromContext(ctx); operation != nil && operation.route != nil && !operation.route.legacy {
+		return h.executeExplicitRouteRequestPath(ctx, operation.route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)
+	}
+	if route, known := h.resolveModelRouteForRequest(model, providerEndpointMessages); known && route != nil && !route.legacy {
+		return h.executeExplicitRouteRequestPath(ctx, route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)
+	}
+
 	provider, owner, rewrittenBody, err := h.resolveProviderRequest(body, providerEndpointMessages)
 	if err != nil {
 		return nil, err
@@ -602,24 +673,46 @@ func sniffOpenAIUsage(body []byte) *models.OpenAIUsage {
 }
 
 func writeDirectAnthropicJSONResponse(ctx, upstreamCtx context.Context, w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) error {
+	info, explicitRoute := explicitRouteResponseInfoFromResponse(resp)
+	if explicitRoute {
+		publicModel = info.publicID
+		upstreamModel = ""
+	}
 	bodyReader := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
 	defer func() { _ = bodyReader.Close() }()
 
-	body, err := io.ReadAll(bodyReader)
+	maxBodySize := int64(0)
+	if explicitRoute {
+		maxBodySize = maxLargeRequestBodySize
+	}
+	body, err := readDirectAnthropicJSONBody(bodyReader, maxBodySize)
 	if bodyReader.canceledAtFailure() {
 		return newResponseBodyWriteError(resp, context.Canceled, false, true, bodyReader.canceledAtFailure())
 	}
 	if err != nil {
 		return newResponseBodyWriteError(resp, err, false, true, bodyReader.canceledAtFailure())
 	}
+
+	var rewritten []byte
+	var changed bool
+	if explicitRoute {
+		rewritten, changed, err = normalizeExplicitAnthropicResponseModelJSON(body, publicModel)
+		if err != nil {
+			return newResponseBodyWriteError(resp, err, false, true, false)
+		}
+	} else {
+		rewritten, changed = rewriteAnthropicResponseModelJSON(body, publicModel, upstreamModel)
+	}
 	if resp.StatusCode == http.StatusOK {
 		observeAnthropicUsageBody(ctx, body)
 	}
-	rewritten, changed := rewriteAnthropicResponseModelJSON(body, publicModel, upstreamModel)
 
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	if changed {
 		w.Header().Del("Content-Length")
+	}
+	if explicitRoute {
+		markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 	}
 	w.WriteHeader(resp.StatusCode)
 	if _, err := w.Write(rewritten); err != nil {
@@ -628,7 +721,66 @@ func writeDirectAnthropicJSONResponse(ctx, upstreamCtx context.Context, w http.R
 	return nil
 }
 
+// readDirectAnthropicJSONBody keeps the historical unbounded legacy read when
+// maxBodySize is zero. Explicit routes pass a positive bound so a successful
+// response cannot bypass public-model normalization by exceeding the buffer.
+func readDirectAnthropicJSONBody(body io.Reader, maxBodySize int64) ([]byte, error) {
+	if maxBodySize <= 0 {
+		return io.ReadAll(body)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(body, maxBodySize+1))
+	if err != nil {
+		return data, err
+	}
+	if int64(len(data)) > maxBodySize {
+		return nil, errors.New("explicit route anthropic response exceeds model-normalization limit")
+	}
+	return data, nil
+}
+
+// normalizeExplicitAnthropicResponseModelJSON is the fail-closed counterpart
+// to rewriteAnthropicResponseModelJSON. Explicit routes must not forward a
+// successful body unless it is a complete JSON object that can be normalized.
+func normalizeExplicitAnthropicResponseModelJSON(body []byte, publicModel string) ([]byte, bool, error) {
+	publicModel = strings.TrimSpace(publicModel)
+	if publicModel == "" {
+		return body, false, nil
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, false, fmt.Errorf("malformed explicit route anthropic response: %w", err)
+	}
+	if payload == nil {
+		return nil, false, errors.New("malformed explicit route anthropic response: expected JSON object")
+	}
+
+	changed := rewriteAnthropicModelFields(payload, publicModel)
+	if rawJSONString(payload["model"]) != publicModel {
+		rawPublicModel, err := json.Marshal(publicModel)
+		if err != nil {
+			return nil, false, fmt.Errorf("normalize explicit route anthropic response model: %w", err)
+		}
+		payload["model"] = rawPublicModel
+		changed = true
+	}
+	if !changed {
+		return body, false, nil
+	}
+
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false, fmt.Errorf("normalize explicit route anthropic response model: %w", err)
+	}
+	return rewritten, true, nil
+}
+
 func (h *ProxyHandler) writeDirectAnthropicStreamResponse(ctx, upstreamCtx context.Context, w http.ResponseWriter, resp *http.Response, publicModel, upstreamModel string) {
+	if info, ok := explicitRouteResponseInfoFromResponse(resp); ok {
+		publicModel = info.publicID
+		upstreamModel = ""
+	}
 	defer func() { _ = resp.Body.Close() }()
 
 	copyPassthroughHeaders(w.Header(), resp.Header)

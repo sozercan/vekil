@@ -75,7 +75,7 @@ func TestRunBoundsInheritedPipeWaitBeforeCleanup(t *testing.T) {
 	if !errors.Is(err, exec.ErrWaitDelay) {
 		t.Fatalf("Run() error = %v, want exec.ErrWaitDelay", err)
 	}
-	if elapsed := time.Since(started); elapsed > 2*time.Second {
+	if elapsed := time.Since(started); elapsed > launcherTestTimeout(2*time.Second) {
 		t.Fatalf("inherited pipe cleanup took %s", elapsed)
 	}
 	assertProcessGone(t, pidPath)
@@ -124,7 +124,21 @@ func TestRunCancellationTerminatesGrandchildProcess(t *testing.T) {
 		t.Fatalf("os.Executable(): %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	time.AfterFunc(500*time.Millisecond, cancel)
+	defer cancel()
+	grandchildReady := make(chan bool, 1)
+	go func() {
+		deadline := time.Now().Add(launcherTestTimeout(2 * time.Second))
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(pidPath); err == nil {
+				grandchildReady <- true
+				cancel()
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		grandchildReady <- false
+		cancel()
+	}()
 	result, err := Run(ctx, proxy, ClaudeAdapter{}, Options{
 		Model:         "claude-public",
 		LocalToken:    "test-token-placeholder",
@@ -146,6 +160,9 @@ func TestRunCancellationTerminatesGrandchildProcess(t *testing.T) {
 	if result.ExitCode != 130 {
 		t.Fatalf("ExitCode = %d, want 130", result.ExitCode)
 	}
+	if !<-grandchildReady {
+		t.Fatal("grandchild did not become ready before cancellation deadline")
+	}
 	assertProcessGone(t, pidPath)
 }
 
@@ -159,7 +176,7 @@ func assertProcessGone(t *testing.T, pidPath string) {
 	if err != nil {
 		t.Fatalf("parse grandchild pid: %v", err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(launcherTestTimeout(2 * time.Second))
 	for time.Now().Before(deadline) {
 		err := syscall.Kill(pid, 0)
 		if errors.Is(err, syscall.ESRCH) {
