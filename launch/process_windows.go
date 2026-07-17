@@ -135,14 +135,13 @@ func (c *windowsProcessController) kill() error {
 		return os.ErrProcessDone
 	}
 	c.mu.Lock()
-	job := c.job
-	closed := c.closed
-	c.mu.Unlock()
-
 	var jobErr error
-	if !closed && job != 0 {
-		jobErr = windows.TerminateJobObject(job, 1)
+	if !c.closed && c.job != 0 {
+		// Keep the Job Object handle protected through termination so close cannot
+		// release or recycle it between the state check and the system call.
+		jobErr = windows.TerminateJobObject(c.job, 1)
 	}
+	c.mu.Unlock()
 	var processErr error
 	if c.cmd != nil && c.cmd.Process != nil {
 		processErr = c.cmd.Process.Kill()
