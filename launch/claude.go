@@ -209,9 +209,10 @@ func claudeOptionRequiresValue(arg string) bool {
 	switch arg {
 	case "--add-dir", "--allowedTools", "--allowed-tools", "--append-system-prompt",
 		"--betas", "--debug-file", "--disallowedTools", "--disallowed-tools",
-		"--effort", "--file", "--input-format", "--json-schema", "--max-budget-usd",
+		"--effort", "--file", "--input-format", "--json-schema", "--max-budget-usd", "--max-turns",
 		"--mcp-config", "--output-format", "--permission-mode", "--plugin-dir",
-		"--plugin-marketplace", "--plugin-url", "--prompt-suggestions", "--session-id",
+		"--plugin-marketplace", "--plugin-url", "--prompt-suggestions", "--session-id", "--name", "-n",
+		"--remote-control-session-name-prefix",
 		"--system-prompt", "--tools":
 		return true
 	default:

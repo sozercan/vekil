@@ -245,6 +245,9 @@ func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
 		{name: "custom agent", args: []string{"--agent", "reviewer"}, want: "model or session overrides"},
 		{name: "teleport", args: []string{"--teleport", "session"}, want: "model or session overrides"},
 		{name: "subcommand after option", args: []string{"--verbose", "remote-control"}, want: "agent-management commands"},
+		{name: "subcommand after max turns", args: []string{"--max-turns", "5", "agents"}, want: "agent-management commands"},
+		{name: "subcommand after name", args: []string{"--name", "session", "agents"}, want: "agent-management commands"},
+		{name: "subcommand after short name", args: []string{"-n", "session", "agents"}, want: "agent-management commands"},
 		{name: "subcommand after delimiter", args: []string{"--", "remote-control"}, want: "agent-management commands"},
 	}
 	for _, tc := range tests {

@@ -123,6 +123,13 @@ func TestCodexCatalogClearsUnsupportedDonorCapabilities(t *testing.T) {
 	if got, _ := model["supports_parallel_tool_calls"].(bool); got {
 		t.Fatal("text-only model inherited parallel tool-call support")
 	}
+	reasoningLevels, ok := model["supported_reasoning_levels"].([]interface{})
+	if !ok || len(reasoningLevels) != 0 {
+		t.Fatalf("non-reasoning model supported_reasoning_levels = %#v, want empty", model["supported_reasoning_levels"])
+	}
+	if got := model["default_reasoning_level"]; got != "none" {
+		t.Fatalf("non-reasoning model default_reasoning_level = %#v, want none", got)
+	}
 	modalities, ok := model["input_modalities"].([]interface{})
 	if !ok || !reflect.DeepEqual(modalities, []interface{}{"text"}) {
 		t.Fatalf("text-only model input_modalities = %#v, want [text]", model["input_modalities"])

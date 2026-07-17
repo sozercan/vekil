@@ -108,22 +108,25 @@ func buildCodexModelCatalog(executable resolvedExecutable, environment []string,
 	if model.EffectiveContextWindowPercentage > 0 {
 		template["effective_context_window_percent"] = model.EffectiveContextWindowPercentage
 	}
-	if efforts := model.Capabilities.Supports.ReasoningEffort; len(efforts) > 0 {
-		levels := make([]map[string]string, 0, len(efforts))
-		for _, effort := range efforts {
-			effort = strings.TrimSpace(effort)
-			if effort == "" {
-				continue
-			}
-			levels = append(levels, map[string]string{
-				"effort":      effort,
-				"description": "Use " + effort + " reasoning effort",
-			})
+	efforts := model.Capabilities.Supports.ReasoningEffort
+	levels := make([]map[string]string, 0, len(efforts))
+	validEfforts := make([]string, 0, len(efforts))
+	for _, effort := range efforts {
+		effort = strings.TrimSpace(effort)
+		if effort == "" {
+			continue
 		}
-		if len(levels) > 0 {
-			template["supported_reasoning_levels"] = levels
-			template["default_reasoning_level"] = defaultReasoningEffort(efforts)
-		}
+		validEfforts = append(validEfforts, effort)
+		levels = append(levels, map[string]string{
+			"effort":      effort,
+			"description": "Use " + effort + " reasoning effort",
+		})
+	}
+	template["supported_reasoning_levels"] = levels
+	if len(validEfforts) > 0 {
+		template["default_reasoning_level"] = defaultReasoningEffort(validEfforts)
+	} else {
+		template["default_reasoning_level"] = "none"
 	}
 	template["supports_parallel_tool_calls"] = model.Capabilities.Supports.ParallelToolCalls
 	template["supports_image_detail_original"] = false
