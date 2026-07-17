@@ -5,8 +5,8 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -32,14 +32,27 @@ func TestOpenLaunchLogUsesRestrictedWindowsACL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTokenUser() error = %v", err)
 	}
-	sddl := descriptor.String()
-	if !strings.Contains(sddl, user.User.Sid.String()) {
-		t.Fatalf("DACL %q does not grant the current user", sddl)
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		t.Fatalf("read DACL: %v", err)
 	}
-	for _, broad := range []string{";;;WD", ";;;BU", ";;;AU"} {
-		if strings.Contains(sddl, broad) {
-			t.Fatalf("DACL %q contains broad trustee %q", sddl, broad)
-		}
+	aceCount := uint16(0)
+	if dacl != nil {
+		aceCount = dacl.AceCount
+	}
+	if aceCount != 1 {
+		t.Fatalf("DACL ACE count = %d, want 1; DACL=%q", aceCount, descriptor.String())
+	}
+	var ace *windows.ACCESS_ALLOWED_ACE
+	if err := windows.GetAce(dacl, 0, &ace); err != nil {
+		t.Fatalf("GetAce() error = %v", err)
+	}
+	if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
+		t.Fatalf("ACE type = %d, want allow", ace.Header.AceType)
+	}
+	aceSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+	if !user.User.Sid.Equals(aceSID) {
+		t.Fatalf("DACL grants %s, want current user %s", aceSID.String(), user.User.Sid.String())
 	}
 }
 
