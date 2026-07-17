@@ -41,7 +41,8 @@ func (CopilotAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	if err != nil {
 		return PreparedProcess{}, err
 	}
-	if err := validateCopilotForwardedArgs(input.ForwardedArgs); err != nil {
+	forwardedArgs, userSecretNames, err := prepareCopilotForwardedArgs(input.ForwardedArgs)
+	if err != nil {
 		return PreparedProcess{}, err
 	}
 
@@ -103,7 +104,7 @@ func (CopilotAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		}
 	}
 
-	secretNames := sortedEnvironmentNames([]string{"COPILOT_PROVIDER_BEARER_TOKEN"}, envUnset)
+	secretNames := sortedEnvironmentNames([]string{"COPILOT_PROVIDER_BEARER_TOKEN"}, envUnset, userSecretNames)
 	args := append([]string(nil), executable.prefixArgs...)
 	args = append(args,
 		"--no-auto-update",
@@ -112,13 +113,61 @@ func (CopilotAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		"--disable-builtin-mcps",
 		"--secret-env-vars="+strings.Join(secretNames, ","),
 	)
-	args = append(args, input.ForwardedArgs...)
+	args = append(args, forwardedArgs...)
 	return PreparedProcess{
 		Path:     executable.path,
 		Args:     args,
 		EnvSet:   envSet,
 		EnvUnset: envUnset,
 	}, nil
+}
+
+func prepareCopilotForwardedArgs(args []string) ([]string, []string, error) {
+	forwarded := make([]string, 0, len(args))
+	var secretNames []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			forwarded = append(forwarded, args[i:]...)
+			break
+		}
+		var value string
+		switch {
+		case arg == "--secret-env-vars":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return nil, nil, fmt.Errorf("copilot --secret-env-vars is missing its value")
+			}
+			i++
+			value = args[i]
+		case strings.HasPrefix(arg, "--secret-env-vars="):
+			value = strings.TrimPrefix(arg, "--secret-env-vars=")
+		default:
+			forwarded = append(forwarded, arg)
+			continue
+		}
+		parsed, err := parseCopilotSecretEnvironmentNames(value)
+		if err != nil {
+			return nil, nil, err
+		}
+		secretNames = append(secretNames, parsed...)
+	}
+	if err := validateCopilotForwardedArgs(forwarded); err != nil {
+		return nil, nil, err
+	}
+	return forwarded, sortedEnvironmentNames(secretNames), nil
+}
+
+func parseCopilotSecretEnvironmentNames(value string) ([]string, error) {
+	parts := strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' })
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("copilot --secret-env-vars requires at least one environment name")
+	}
+	for _, name := range parts {
+		if !environmentNamePattern.MatchString(name) {
+			return nil, fmt.Errorf("invalid Copilot secret environment name %q", name)
+		}
+	}
+	return parts, nil
 }
 
 func copilotWireAPI(model ModelInfo, dryRun bool) (string, error) {
@@ -153,7 +202,6 @@ func validateCopilotForwardedArgs(args []string) error {
 		if !endOptions && strings.HasPrefix(arg, "-") {
 			switch {
 			case arg == "--model" || strings.HasPrefix(arg, "--model="),
-				arg == "--secret-env-vars" || strings.HasPrefix(arg, "--secret-env-vars="),
 				arg == "--agent" || strings.HasPrefix(arg, "--agent="):
 				return fmt.Errorf("copilot model, agent, or environment overrides are not supported by the managed Vekil launcher")
 			case arg == "--no-auto-update" || strings.HasPrefix(arg, "--no-auto-update="),

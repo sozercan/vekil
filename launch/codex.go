@@ -78,12 +78,6 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	}
 
 	providerID := codexProviderID(localToken)
-	shellExcluded := sortedEnvironmentNames([]string{codexLocalTokenEnv}, envUnset)
-	excludedJSON, err := json.Marshal(shellExcluded)
-	if err != nil {
-		_ = cleanup()
-		return PreparedProcess{}, fmt.Errorf("encode Codex shell environment exclusions: %w", err)
-	}
 	args := append([]string(nil), executable.prefixArgs...)
 	for _, override := range []string{
 		`model_provider=` + configString(providerID),
@@ -94,7 +88,7 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		`model_providers.` + providerID + `.requires_openai_auth=false`,
 		`model_providers.` + providerID + `.supports_websockets=false`,
 		`model_catalog_json=` + configString(catalogPath),
-		`shell_environment_policy.exclude=` + string(excludedJSON),
+		`shell_environment_policy.set.` + codexLocalTokenEnv + `=""`,
 	} {
 		args = append(args, "-c", override)
 	}

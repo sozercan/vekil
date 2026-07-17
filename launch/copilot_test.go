@@ -25,7 +25,7 @@ func TestCopilotAdapterPrepareResponses(t *testing.T) {
 			},
 		},
 		Binary:        binary,
-		ForwardedArgs: []string{"--allow-all-tools", "-p", "hello", "-s"},
+		ForwardedArgs: []string{"--secret-env-vars=DATABASE_PASSWORD,API_TOKEN", "--allow-all-tools", "-p", "hello", "-s"},
 		LocalToken:    "test-token-placeholder",
 		SensitiveEnv:  []string{"MY_PROVIDER_TOKEN"},
 		DryRun:        true,
@@ -67,8 +67,11 @@ func TestCopilotAdapterPrepareResponses(t *testing.T) {
 	if strings.Contains(joined, "test-token-placeholder") {
 		t.Fatal("Copilot argv exposed the local proxy token")
 	}
-	if !strings.Contains(joined, "--secret-env-vars=") || !strings.Contains(joined, "COPILOT_PROVIDER_BEARER_TOKEN") || !strings.Contains(joined, "MY_PROVIDER_TOKEN") {
+	if !strings.Contains(joined, "--secret-env-vars=") || !strings.Contains(joined, "COPILOT_PROVIDER_BEARER_TOKEN") || !strings.Contains(joined, "MY_PROVIDER_TOKEN") || !strings.Contains(joined, "DATABASE_PASSWORD") || !strings.Contains(joined, "API_TOKEN") {
 		t.Fatalf("Copilot secret environment scrub is incomplete: %#v", prepared.Args)
+	}
+	if strings.Contains(joined, "--secret-env-vars=DATABASE_PASSWORD,API_TOKEN") {
+		t.Fatalf("user secret flag was forwarded instead of merged: %#v", prepared.Args)
 	}
 	if got := prepared.Args[len(prepared.Args)-4:]; strings.Join(got, "|") != "--allow-all-tools|-p|hello|-s" {
 		t.Fatalf("forwarded args changed: %#v", prepared.Args)
@@ -129,7 +132,6 @@ func TestCopilotAdapterRejectsManagedOverridesAndRemoteModes(t *testing.T) {
 	}{
 		{name: "model", args: []string{"--model", "other"}, want: "model, agent, or environment"},
 		{name: "agent", args: []string{"--agent", "other"}, want: "model, agent, or environment"},
-		{name: "secrets", args: []string{"--secret-env-vars=OTHER"}, want: "model, agent, or environment"},
 		{name: "managed safety", args: []string{"--no-remote=false"}, want: "safety overrides"},
 		{name: "connect", args: []string{"--connect=session"}, want: "remote, resumed, or shared"},
 		{name: "continue", args: []string{"--continue"}, want: "remote, resumed, or shared"},
@@ -156,5 +158,29 @@ func TestCopilotAdapterRejectsManagedOverridesAndRemoteModes(t *testing.T) {
 		if err := validateCopilotForwardedArgs(args); err != nil {
 			t.Fatalf("validateCopilotForwardedArgs(%#v) = %v", args, err)
 		}
+	}
+}
+
+func TestPrepareCopilotForwardedArgsMergesSecretNames(t *testing.T) {
+	forwarded, secretNames, err := prepareCopilotForwardedArgs([]string{
+		"--secret-env-vars=DATABASE_PASSWORD,API_TOKEN",
+		"--secret-env-vars", "EXTRA_SECRET",
+		"-p", "hello",
+	})
+	if err != nil {
+		t.Fatalf("prepareCopilotForwardedArgs() error = %v", err)
+	}
+	if got := strings.Join(forwarded, "|"); got != "-p|hello" {
+		t.Fatalf("forwarded args = %q", got)
+	}
+	if got := strings.Join(secretNames, ","); got != "API_TOKEN,DATABASE_PASSWORD,EXTRA_SECRET" {
+		t.Fatalf("secret names = %q", got)
+	}
+}
+
+func TestPrepareCopilotForwardedArgsRejectsInvalidSecretName(t *testing.T) {
+	_, _, err := prepareCopilotForwardedArgs([]string{"--secret-env-vars=GOOD,BAD-NAME", "-p", "hello"})
+	if err == nil || !strings.Contains(err.Error(), "BAD-NAME") {
+		t.Fatalf("prepareCopilotForwardedArgs() error = %v, want invalid-name error", err)
 	}
 }

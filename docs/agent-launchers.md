@@ -117,8 +117,9 @@ this flow. Vekil instead injects a transient, per-launch
 - `env_key="VEKIL_CODEX_API_KEY"` reads the random local bearer token;
 - `requires_openai_auth=false` prevents Codex/ChatGPT login fallback;
 - `supports_websockets=false` keeps the launcher on deterministic HTTP Responses;
-- `shell_environment_policy.exclude` removes the local token and upstream
-  credential names from model-invoked shell commands.
+- an additive `shell_environment_policy.set` override masks the local token in
+  model-invoked shells without replacing user-configured exclusions; upstream
+  credential names are removed from the Codex process environment.
 
 A private temporary one-model Codex catalog is generated from the installed
 CLI's bundled catalog, with Vekil model context, reasoning, vision, and tool

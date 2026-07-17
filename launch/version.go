@@ -40,9 +40,7 @@ func runContainedCommand(ctx context.Context, path string, args, environment []s
 	}
 	waitCh := make(chan commandOutcome, 1)
 	go func() {
-		outcome := controller.wait()
-		_ = controller.close()
-		waitCh <- outcome
+		waitCh <- waitAndCloseController(controller)
 	}()
 	select {
 	case outcome := <-waitCh:
@@ -61,7 +59,7 @@ func runContainedCommand(ctx context.Context, path string, args, environment []s
 
 func reapFailedContainedCommand(controller processController, cause error) error {
 	killErr := controller.kill()
-	outcome := controller.wait()
+	outcome := waitAndCloseController(controller)
 	return errors.Join(cause, killErr, outcome.err)
 }
 

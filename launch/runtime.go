@@ -246,16 +246,12 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 		return result, fmt.Errorf("start %s: %w", adapter.Name(), err)
 	}
 	if err := controller.afterStart(); err != nil {
-		killErr := controller.kill()
-		waitOutcome := controller.wait()
-		return result, errors.Join(fmt.Errorf("initialize %s process: %w", adapter.Name(), err), killErr, waitOutcome.err)
+		return result, reapFailedContainedCommand(controller, fmt.Errorf("initialize %s process: %w", adapter.Name(), err))
 	}
 
 	waitCh := make(chan commandOutcome, 1)
 	go func() {
-		outcome := controller.wait()
-		_ = controller.close()
-		waitCh <- outcome
+		waitCh <- waitAndCloseController(controller)
 	}()
 
 	select {

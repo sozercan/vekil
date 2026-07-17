@@ -67,10 +67,14 @@ func TestCodexAdapterPrepare(t *testing.T) {
 		`model_providers.` + providerID + `.env_key="` + codexLocalTokenEnv + `"`,
 		`model_providers.` + providerID + `.requires_openai_auth=false`,
 		`model_providers.` + providerID + `.supports_websockets=false`,
+		`shell_environment_policy.set.` + codexLocalTokenEnv + `=""`,
 	} {
 		if !containsString(prepared.Args, want) {
 			t.Fatalf("Codex args missing %q: %#v", want, prepared.Args)
 		}
+	}
+	if strings.Contains(joined, "shell_environment_policy.exclude=") {
+		t.Fatalf("Codex args replaced user shell exclusions: %#v", prepared.Args)
 	}
 	if !containsAdjacent(prepared.Args, "-m", "gpt-public") {
 		t.Fatalf("Codex args did not pin model: %#v", prepared.Args)
