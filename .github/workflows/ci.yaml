@@ -59,7 +59,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Test Windows launcher lifecycle
-        run: go test ./launch -count=1
+        run: go test . ./launch -count=1
 
   build:
     runs-on: ubuntu-latest

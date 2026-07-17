@@ -36,8 +36,7 @@ func runContainedCommand(ctx context.Context, path string, args, environment []s
 		return nil, err
 	}
 	if err := controller.afterStart(); err != nil {
-		_ = controller.kill()
-		return nil, err
+		return []byte(output.String()), reapFailedContainedCommand(controller, err)
 	}
 	waitCh := make(chan commandOutcome, 1)
 	go func() {
@@ -58,6 +57,12 @@ func runContainedCommand(ctx context.Context, path string, args, environment []s
 		outcome := stopCommand(controller, waitCh, time.Second, os.Interrupt, false)
 		return []byte(output.String()), errors.Join(ctx.Err(), outcome.err)
 	}
+}
+
+func reapFailedContainedCommand(controller processController, cause error) error {
+	killErr := controller.kill()
+	outcome := controller.wait()
+	return errors.Join(cause, killErr, outcome.err)
 }
 
 func validateExecutableVersion(
