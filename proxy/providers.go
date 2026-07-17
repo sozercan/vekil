@@ -1371,29 +1371,25 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 	return ok
 }
 
-// ModelUsesCopilot reports whether the selected public model currently resolves
-// to the Copilot provider. Unknown models follow the configured default provider.
+// ModelUsesCopilot reports whether startup must authenticate Copilot to resolve
+// or collision-check the selected public model. Provider filters exclude
+// Copilot from this decision when it cannot expose the model.
 func (h *ProxyHandler) ModelUsesCopilot(model string) bool {
 	setup := h.providerSetup()
 	model = strings.TrimSpace(model)
-	if owner, ok := setup.lookupModel(model); ok {
-		provider := setup.providerByID(owner.providerID)
-		return provider != nil && provider.kind == providerTypeCopilot
-	}
 	for _, providerID := range setup.providerOrder {
 		provider := setup.providerByID(providerID)
-		if provider == nil {
+		if provider == nil || provider.kind != providerTypeCopilot {
 			continue
 		}
-		if _, ok := provider.staticConfigs[model]; ok {
-			return provider.kind == providerTypeCopilot
+		if owner, ok := setup.lookupModel(model); ok && owner.providerID == provider.id {
+			return true
 		}
-		if _, ok := provider.includeModels[model]; ok {
-			return provider.kind == providerTypeCopilot
+		if providerCanExposeModel(provider, model) {
+			return true
 		}
 	}
-	provider := setup.defaultProvider()
-	return provider != nil && provider.kind == providerTypeCopilot
+	return false
 }
 
 func modelNotAllowedRequestError(model string) error {

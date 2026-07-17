@@ -1,10 +1,12 @@
 package launch
 
 import (
+	"context"
 	"errors"
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 type failedStartProcessController struct {
@@ -112,5 +114,21 @@ func TestWaitAndCloseControllerPropagatesCleanupError(t *testing.T) {
 		if !errors.Is(outcome.err, want) {
 			t.Fatalf("outcome error = %v, missing %v", outcome.err, want)
 		}
+	}
+}
+
+func TestRunContainedCommandCancellationDiscardsConcurrentOutput(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	output, err := runContainedCommand(ctx, binary, []string{"--vekil-test-hang"}, os.Environ())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runContainedCommand() error = %v, want deadline exceeded", err)
+	}
+	if output != nil {
+		t.Fatalf("runContainedCommand() output = %q, want nil after cancellation", output)
 	}
 }

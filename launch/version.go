@@ -53,7 +53,11 @@ func runContainedCommand(ctx context.Context, path string, args, environment []s
 		return []byte(output.String()), nil
 	case <-ctx.Done():
 		outcome := stopCommand(controller, waitCh, time.Second, os.Interrupt, false)
-		return []byte(output.String()), errors.Join(ctx.Err(), outcome.err)
+		// Forced termination can itself fail or time out, leaving the wait/pipe
+		// goroutine alive. Do not read output while that goroutine may still be
+		// writing to the non-concurrency-safe builder. Callers discard command
+		// output whenever cancellation returns an error.
+		return nil, errors.Join(ctx.Err(), outcome.err)
 	}
 }
 

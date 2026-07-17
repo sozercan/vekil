@@ -361,7 +361,8 @@ func (s *Server) Done() <-chan error {
 	return s.serveDone
 }
 
-// ModelUsesCopilot reports whether model currently resolves to the Copilot provider.
+// ModelUsesCopilot reports whether launcher startup needs Copilot authentication
+// to resolve or collision-check model.
 func (s *Server) ModelUsesCopilot(model string) bool {
 	return s != nil && s.proxyHandler != nil && s.proxyHandler.ModelUsesCopilot(model)
 }

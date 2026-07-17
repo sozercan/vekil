@@ -5,9 +5,15 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 )
 
 func TestMain(m *testing.M) {
+	if len(os.Args) == 2 && os.Args[1] == "--vekil-test-hang" {
+		_, _ = fmt.Fprintln(os.Stdout, "partial output")
+		time.Sleep(time.Hour)
+		os.Exit(0)
+	}
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
 		if capturePath := os.Getenv("LAUNCH_VERSION_ENV_CAPTURE"); capturePath != "" {
 			body, err := json.Marshal(map[string]string{

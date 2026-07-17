@@ -1541,3 +1541,72 @@ func TestModelUsesCopilotFollowsSelectedStaticOwner(t *testing.T) {
 		t.Fatal("zero-config model did not require Copilot authentication")
 	}
 }
+
+func TestModelUsesCopilotHonorsProviderFiltersDuringDeferredDiscovery(t *testing.T) {
+	t.Run("filtered default Copilot provider is skipped", func(t *testing.T) {
+		cfg := ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:            "copilot",
+				Type:          "copilot",
+				Default:       true,
+				IncludeModels: []string{"copilot-only"},
+			},
+			{
+				ID:             "dynamic",
+				Type:           "openai-compatible",
+				BaseURL:        "http://127.0.0.1:9/v1",
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			},
+		}}
+		h, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.NewWithWriter(logger.LevelError, io.Discard),
+			WithProvidersConfig(cfg),
+			WithAllowedModels("dynamic-model"),
+			WithDeferredDynamicProviderModelValidation(true),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler() error = %v", err)
+		}
+		if h.ModelUsesCopilot("dynamic-model") {
+			t.Fatal("filtered default Copilot provider unexpectedly required authentication")
+		}
+		if !h.ModelUsesCopilot("copilot-only") {
+			t.Fatal("explicitly included Copilot model did not require authentication")
+		}
+	})
+
+	t.Run("unrestricted Copilot collision candidate requires authentication", func(t *testing.T) {
+		cfg := ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:             "local-static",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        "http://127.0.0.1:9/v1",
+				AuthType:       "none",
+				ModelDiscovery: "static",
+				Models: []ProviderModelConfig{{
+					PublicID: "shared-model",
+					Endpoints: []string{
+						"/responses",
+					},
+				}},
+			},
+			{ID: "copilot", Type: "copilot"},
+		}}
+		h, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.NewWithWriter(logger.LevelError, io.Discard),
+			WithProvidersConfig(cfg),
+			WithAllowedModels("shared-model"),
+			WithDeferredDynamicProviderModelValidation(true),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler() error = %v", err)
+		}
+		if !h.ModelUsesCopilot("shared-model") {
+			t.Fatal("unrestricted Copilot collision candidate did not require authentication")
+		}
+	})
+}
