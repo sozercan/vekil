@@ -1,0 +1,285 @@
+package launch
+
+import (
+	"encoding/json"
+	"errors"
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func TestClaudeAdapterPrepare(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	adapter := ClaudeAdapter{}
+	prepared, err := adapter.Prepare(PrepareInput{
+		BaseURL: "http://127.0.0.1:43210/",
+		Model: ModelInfo{
+			ID:                 "claude-public",
+			Name:               "Claude Public",
+			SupportedEndpoints: []string{"/chat/completions"},
+		},
+		Binary:        binary,
+		ForwardedArgs: []string{"--print", "hello"},
+		LocalToken:    "test-token-placeholder",
+		SensitiveEnv:  []string{"MY_PROVIDER_TOKEN"},
+		NoProxy:       "internal.example,127.0.0.1,localhost",
+	})
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if prepared.Path != binary {
+		t.Fatalf("Path = %q, want %q", prepared.Path, binary)
+	}
+	if len(prepared.Args) != 4 || prepared.Args[0] != "--settings" ||
+		!reflect.DeepEqual(prepared.Args[2:], []string{"--print", "hello"}) {
+		t.Fatalf("Args = %#v", prepared.Args)
+	}
+	if strings.Contains(prepared.Args[1], "test-token-placeholder") {
+		t.Fatal("managed settings exposed the local proxy token in argv")
+	}
+	if prepared.Cleanup == nil {
+		t.Fatal("managed settings did not register cleanup")
+	}
+	settingsPath := prepared.Args[1]
+	settingsBody, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("read managed settings file: %v", err)
+	}
+	var managedSettings struct {
+		Env                  map[string]string `json:"env"`
+		DisableRemoteControl bool              `json:"disableRemoteControl"`
+	}
+	if err := json.Unmarshal(settingsBody, &managedSettings); err != nil {
+		t.Fatalf("decode managed settings: %v", err)
+	}
+	for _, key := range []string{"ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FOUNDRY_AUTH_TOKEN", "ANTHROPIC_AWS_API_KEY", "MY_PROVIDER_TOKEN"} {
+		if value, ok := managedSettings.Env[key]; !ok || value != "" {
+			t.Fatalf("managed settings env[%q] = %q, present=%v", key, value, ok)
+		}
+	}
+	if got := managedSettings.Env["NO_PROXY"]; got != "internal.example,127.0.0.1,localhost" {
+		t.Fatalf("managed NO_PROXY = %q", got)
+	}
+	if !managedSettings.DisableRemoteControl {
+		t.Fatal("managed settings did not disable remote control")
+	}
+	for _, key := range []string{"CLAUDE_CODE_DISABLE_AGENT_VIEW", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "CLAUDE_CODE_DISABLE_CRON"} {
+		if got := managedSettings.Env[key]; got != "1" {
+			t.Fatalf("managed settings env[%q] = %q, want 1", key, got)
+		}
+	}
+	for key, want := range map[string]string{
+		"ANTHROPIC_BASE_URL":                        "http://127.0.0.1:43210",
+		"ANTHROPIC_AUTH_TOKEN":                      "test-token-placeholder",
+		"ANTHROPIC_API_KEY":                         "",
+		"ANTHROPIC_MODEL":                           "claude-public",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL":             "claude-public",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL":            "claude-public",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL":              "claude-public",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL":             "claude-public",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION":             "claude-public",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME":        "Claude Public",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Routed through Vekil",
+		"CLAUDE_CODE_SUBAGENT_MODEL":                "claude-public",
+		"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST":      "vekil",
+		"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB":          "1",
+	} {
+		if got := managedSettings.Env[key]; got != want {
+			t.Errorf("managed settings env[%q] = %q, want %q", key, got, want)
+		}
+	}
+	for key, want := range map[string]string{
+		"ANTHROPIC_BASE_URL":                        "http://127.0.0.1:43210",
+		"ANTHROPIC_AUTH_TOKEN":                      "test-token-placeholder",
+		"ANTHROPIC_API_KEY":                         "",
+		"ANTHROPIC_MODEL":                           "claude-public",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL":             "claude-public",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL":            "claude-public",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL":              "claude-public",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL":             "claude-public",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION":             "claude-public",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME":        "Claude Public",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Routed through Vekil",
+		"CLAUDE_CODE_SUBAGENT_MODEL":                "claude-public",
+		"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST":      "vekil",
+		"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB":          "1",
+	} {
+		if got := prepared.EnvSet[key]; got != want {
+			t.Errorf("EnvSet[%q] = %q, want %q", key, got, want)
+		}
+	}
+	if containsString(prepared.EnvUnset, "ANTHROPIC_AUTH_TOKEN") {
+		t.Fatal("ANTHROPIC_AUTH_TOKEN must carry the local proxy token")
+	}
+	for _, key := range []string{
+		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+		"MY_PROVIDER_TOKEN",
+		"CLAUDE_CODE_USE_BEDROCK",
+		"CLAUDE_CODE_USE_MANTLE",
+		"CLAUDE_CODE_USE_ANTHROPIC_AWS",
+		"CLAUDE_CODE_OAUTH_TOKEN",
+		"ANTHROPIC_CUSTOM_HEADERS",
+	} {
+		if !containsString(prepared.EnvUnset, key) {
+			t.Fatalf("expected %s to be removed", key)
+		}
+	}
+	if err := prepared.Cleanup(); err != nil {
+		t.Fatalf("cleanup managed settings: %v", err)
+	}
+	if _, err := os.Stat(settingsPath); !os.IsNotExist(err) {
+		t.Fatalf("managed settings file still exists after cleanup: %v", err)
+	}
+}
+
+func TestClaudeAdapterRejectsIncompatibleModel(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	_, err = (ClaudeAdapter{}).Prepare(PrepareInput{
+		BaseURL: "http://127.0.0.1:43210",
+		Model: ModelInfo{
+			ID:                 "responses-only",
+			SupportedEndpoints: []string{"/responses"},
+		},
+		Binary:     binary,
+		LocalToken: "test-token-placeholder",
+	})
+	if err == nil || !strings.Contains(err.Error(), "not Claude-compatible") {
+		t.Fatalf("Prepare() error = %v, want compatibility error", err)
+	}
+}
+
+func TestClaudeAdapterRejectsMissingEndpointMetadata(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	_, err = (ClaudeAdapter{}).Prepare(PrepareInput{
+		BaseURL: "http://127.0.0.1:43210",
+		Model:   ModelInfo{ID: "missing-endpoints"},
+		Binary:  binary,
+	})
+	if err == nil || !strings.Contains(err.Error(), "not Claude-compatible") {
+		t.Fatalf("Prepare() error = %v, want endpoint metadata error", err)
+	}
+}
+
+func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "settings", args: []string{"--settings", "{}"}, want: "settings-source overrides"},
+		{name: "background", args: []string{"--background"}, want: "detached Claude sessions"},
+		{name: "tmux", args: []string{"--tmux"}, want: "detached Claude sessions"},
+		{name: "model", args: []string{"--model", "responses-only"}, want: "model or session overrides"},
+		{name: "model after prompt", args: []string{"--print", "hello", "--model", "responses-only"}, want: "model or session overrides"},
+		{name: "fallback model", args: []string{"--fallback-model", "other"}, want: "model or session overrides"},
+		{name: "resume", args: []string{"--resume"}, want: "model or session overrides"},
+		{name: "attached short resume", args: []string{"-rsession-id"}, want: "model or session overrides"},
+		{name: "custom agent", args: []string{"--agent", "reviewer"}, want: "model or session overrides"},
+		{name: "teleport", args: []string{"--teleport", "session"}, want: "model or session overrides"},
+		{name: "subcommand after option", args: []string{"--verbose", "remote-control"}, want: "agent-management commands"},
+		{name: "subcommand after delimiter", args: []string{"--", "remote-control"}, want: "agent-management commands"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := (ClaudeAdapter{}).Prepare(PrepareInput{
+				BaseURL:       "http://127.0.0.1:43210",
+				Model:         ModelInfo{ID: "claude-public", SupportedEndpoints: []string{"/chat/completions"}},
+				Binary:        binary,
+				LocalToken:    "test-token-placeholder",
+				ForwardedArgs: tc.args,
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Prepare() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestClaudeAdapterTreatsAgentsAsPrintPrompt(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	prepared, err := (ClaudeAdapter{}).Prepare(PrepareInput{
+		BaseURL:       "http://127.0.0.1:43210",
+		Model:         ModelInfo{ID: "claude-public", SupportedEndpoints: []string{"/chat/completions"}},
+		Binary:        binary,
+		LocalToken:    "test-token-placeholder",
+		ForwardedArgs: []string{"--print", "agents"},
+	})
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	t.Cleanup(func() { _ = prepared.Cleanup() })
+}
+
+func TestClaudeAdapterHonorsEndOfOptionsDelimiter(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	prepared, err := (ClaudeAdapter{}).Prepare(PrepareInput{
+		BaseURL:       "http://127.0.0.1:43210",
+		Model:         ModelInfo{ID: "claude-public", SupportedEndpoints: []string{"/chat/completions"}},
+		Binary:        binary,
+		LocalToken:    "test-token-placeholder",
+		ForwardedArgs: []string{"--print", "--", "--model=literal", "agents"},
+	})
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	t.Cleanup(func() { _ = prepared.Cleanup() })
+	if got := prepared.Args[len(prepared.Args)-2:]; !reflect.DeepEqual(got, []string{"--model=literal", "agents"}) {
+		t.Fatalf("literal args = %#v", got)
+	}
+}
+
+func TestClaudeAdapterReportsMissingBinary(t *testing.T) {
+	_, err := (ClaudeAdapter{}).Prepare(PrepareInput{
+		BaseURL: "http://127.0.0.1:43210",
+		Model: ModelInfo{
+			ID:                 "claude-public",
+			SupportedEndpoints: []string{"/chat/completions"},
+		},
+		Binary:     "/definitely/not/a/claude/binary",
+		LocalToken: "test-token-placeholder",
+	})
+	if !errors.Is(err, ErrBinaryNotFound) {
+		t.Fatalf("Prepare() error = %v, want ErrBinaryNotFound", err)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCompareClaudeVersion(t *testing.T) {
+	if got := compareVersion(2, 1, 82, 2, 1, 83); got >= 0 {
+		t.Fatalf("old version comparison = %d", got)
+	}
+	if got := compareVersion(2, 1, 83, 2, 1, 83); got != 0 {
+		t.Fatalf("minimum version comparison = %d", got)
+	}
+	if got := compareVersion(2, 2, 0, 2, 1, 83); got <= 0 {
+		t.Fatalf("new version comparison = %d", got)
+	}
+}

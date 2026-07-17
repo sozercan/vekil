@@ -27,6 +27,7 @@ Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Az
 - **Optional tool optimizers** for opt-in shell command rewrites and tool-output reduction across supported API surfaces; see [Tool Optimizers](docs/tool-optimizers.md)
 - **Codex compatibility shims** for compaction and memory summarization
 - **Streaming**, tool use, parallel tool calls, compressed request bodies, and auth/token caching
+- **One-command Claude Code, Codex CLI, and GitHub Copilot CLI launchers** with ephemeral loopback proxies and no persistent client routing changes
 
 ## Quick Start
 
@@ -48,6 +49,16 @@ brew install --cask sozercan/repo/vekil
 > The app is not signed. Clear quarantine with `xattr -cr /Applications/Vekil.app`. Manual `vekil-macos-arm64.zip` downloads are also on [Releases](https://github.com/sozercan/vekil/releases/latest). See [Tray App (macOS/Linux)](docs/menubar.md).
 
 For explicit provider routing, start the proxy with `--providers-config /path/to/providers.{json,yaml}`.
+
+Launch a coding agent through an ephemeral Vekil instance:
+
+```bash
+vekil launch claude --model claude-sonnet-4.5
+vekil launch codex --model gpt-5.4-mini
+vekil launch copilot --model gpt-5.4-mini
+```
+
+See [Agent Launchers](docs/agent-launchers.md) for provider configs, forwarded agent arguments, logs, and credential isolation.
 
 **First-run auth** depends on your providers:
 
@@ -71,6 +82,7 @@ Documentation lives under [`docs/`](docs/README.md); start with these:
 | [Tool Optimizers](docs/tool-optimizers.md)                   | Shell rewrite/output reduction      |
 | [Responses WebSocket](docs/responses-websocket.md)           | Websocket bridge tuning             |
 | [Client Examples](docs/clients.md)                           | Copy-paste snippets per client      |
+| [Agent Launchers](docs/agent-launchers.md)                   | One-command coding-agent sessions   |
 | [API Reference](docs/api.md)                                 | Endpoint behavior and compatibility |
 | [Architecture](docs/architecture.md)                         | Package layout and design notes     |
 | [Traffic Dashboard](docs/dashboard.md)                       | Live browser dashboard and stats    |

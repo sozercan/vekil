@@ -38,7 +38,8 @@ Documentation update rules:
 
 | Area | Purpose |
 |------|---------|
-| `main.go`, `server/`, `auth/`, `logger/`, `models/`, `cmd/menubar/` | CLI/server lifecycle, GitHub auth, structured logging, data-only API structs, tray app |
+| `main.go`, `launch_command.go`, `server/`, `auth/`, `logger/`, `models/`, `cmd/menubar/` | CLI/server lifecycle, GitHub auth, structured logging, data-only API structs, tray app |
+| `launch/` | Ephemeral proxy supervision, agent adapters, child environment sanitization, and session summaries |
 | `proxy/chat_handlers.go`, `proxy/translator.go`, `proxy/streaming.go`, `proxy/openai_stream_reader.go` | Anthropic/OpenAI chat translation, native-Chat forced-stream aggregation, SSE translation and passthrough |
 | `proxy/chat_execution.go`, `proxy/chat_route*.go`, `proxy/chat_over_responses_*.go`, `proxy/responses_chat_*.go`, `proxy/chat_stream_events.go` | Deep Chat execution seam, native-Chat/Responses selection, strict Chat-to-Responses conversion, typed canonical stream events, and bounded tool replay |
 | `proxy/gemini*.go` | Gemini-native handlers plus Gemini↔OpenAI request/response and streaming translation |

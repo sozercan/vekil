@@ -1169,6 +1169,11 @@ func synthesizeProviderModelRaw(providerID, publicID, name string, endpoints []s
 func (h *ProxyHandler) resolveProviderModel(model, endpoint string) (*providerRuntime, providerModel, bool) {
 	setup := h.providerSetup()
 	model = strings.TrimSpace(model)
+	if len(h.allowedModels) > 0 {
+		if _, ok := h.allowedModels[model]; !ok {
+			return nil, providerModel{publicID: model, upstreamModel: model}, false
+		}
+	}
 	if model != "" {
 		if providerModel, ok := setup.lookupModel(model); ok {
 			provider := setup.providerByID(providerModel.providerID)

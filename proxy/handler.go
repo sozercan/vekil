@@ -250,6 +250,7 @@ type ProxyHandler struct {
 	copilotURL                       string
 	copilotHeaders                   CopilotHeaderConfig
 	providersConfig                  ProvidersConfig
+	allowedModels                    map[string]struct{}
 	providersState                   *providerSetup
 	deferDynamicProviderModelRefresh bool
 	draining                         atomic.Bool
@@ -677,6 +678,21 @@ type Option func(*ProxyHandler)
 func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
 	return func(h *ProxyHandler) {
 		h.copilotHeaders = cfg
+	}
+}
+
+// WithAllowedModels restricts request routing to the listed public model IDs.
+// Empty keeps the normal global model namespace available.
+func WithAllowedModels(models ...string) Option {
+	return func(h *ProxyHandler) {
+		if h.allowedModels == nil {
+			h.allowedModels = make(map[string]struct{})
+		}
+		for _, model := range models {
+			if model = strings.TrimSpace(model); model != "" {
+				h.allowedModels[model] = struct{}{}
+			}
+		}
 	}
 }
 

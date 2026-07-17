@@ -2,11 +2,15 @@ package proxy
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 var benchmarkProviderSetupSink *providerSetup
@@ -1283,5 +1287,34 @@ func BenchmarkDefaultProviderSetup(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		benchmarkProviderSetupSink = handler.providerSetup()
+	}
+}
+
+func TestAllowedModelsRestrictsCentralModelResolution(t *testing.T) {
+	cfg := ProvidersConfig{Providers: []ProviderConfig{{
+		ID:             "local",
+		Type:           "openai-compatible",
+		BaseURL:        "http://127.0.0.1:9/v1",
+		AuthType:       "none",
+		ModelDiscovery: "static",
+		Models: []ProviderModelConfig{
+			{PublicID: "allowed", Endpoints: []string{"/chat/completions"}},
+			{PublicID: "other", Endpoints: []string{"/chat/completions"}},
+		},
+	}}}
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("allowed"),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	if provider, _, _ := h.resolveProviderModel("allowed", providerEndpointChatCompletions); provider == nil {
+		t.Fatal("allowed model did not resolve")
+	}
+	if provider, _, _ := h.resolveProviderModel("other", providerEndpointChatCompletions); provider != nil {
+		t.Fatal("disallowed model resolved")
 	}
 }
