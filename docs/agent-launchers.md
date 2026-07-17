@@ -209,3 +209,7 @@ permission and sandbox settings.
 Agent launchers are intended for the native Vekil binary. The distroless Vekil
 container does not contain agent executables or a shell and is not a launcher
 environment.
+
+Launcher process containment is supported on macOS, Linux, and Windows. Other
+operating-system targets reject launcher startup rather than running with only
+immediate-child supervision.
