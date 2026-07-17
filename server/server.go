@@ -366,11 +366,6 @@ func (s *Server) ModelUsesCopilot(model string) bool {
 	return s != nil && s.proxyHandler != nil && s.proxyHandler.ModelUsesCopilot(model)
 }
 
-// ModelKnown reports whether model is already available before dynamic refresh.
-func (s *Server) ModelKnown(model string) bool {
-	return s != nil && s.proxyHandler != nil && s.proxyHandler.ModelKnown(model)
-}
-
 // SetStartupAuthenticationPending gates non-health routes while startup auth is in progress.
 func (s *Server) SetStartupAuthenticationPending(pending bool) {
 	if s.proxyHandler != nil {

@@ -1412,6 +1412,7 @@ func TestModelUsesCopilotFollowsSelectedStaticOwner(t *testing.T) {
 		auth.NewTestAuthenticator("test-token"),
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		WithProvidersConfig(cfg),
+		WithAllowedModels("local-model"),
 		WithDeferredDynamicProviderModelValidation(true),
 	)
 	if err != nil {
@@ -1420,14 +1421,15 @@ func TestModelUsesCopilotFollowsSelectedStaticOwner(t *testing.T) {
 	if h.ModelUsesCopilot("local-model") {
 		t.Fatal("static non-Copilot model unexpectedly requires Copilot authentication")
 	}
-	if !h.ModelKnown("local-model") {
-		t.Fatal("static non-Copilot model was not known before dynamic validation")
-	}
 	if !h.ModelUsesCopilot("copilot-model") {
 		t.Fatal("static Copilot model did not require Copilot authentication")
 	}
-	if h.ModelKnown("copilot-model") {
-		t.Fatal("filtered Copilot model unexpectedly appeared before dynamic validation")
+	setup := h.providerSetup()
+	if !h.providerWithinAllowedModelScope(setup.providerByID("local-static")) {
+		t.Fatal("selected static provider was excluded from launcher model scope")
+	}
+	if h.providerWithinAllowedModelScope(setup.providerByID("copilot")) {
+		t.Fatal("unselected Copilot provider remained in launcher model scope")
 	}
 	if h.ModelUsesCopilot("unknown-model") {
 		t.Fatal("unknown model did not follow the non-Copilot default provider")

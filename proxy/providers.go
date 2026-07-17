@@ -508,7 +508,7 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 
 	for _, providerID := range setup.providerOrder {
 		provider := setup.providerByID(providerID)
-		if !providerUsesDynamicModels(provider) {
+		if !h.providerWithinAllowedModelScope(provider) || !providerUsesDynamicModels(provider) {
 			continue
 		}
 
@@ -524,6 +524,47 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 	h.dynamicProviderValidationPending.Store(false)
 	h.validateInsightModel()
 	return nil
+}
+
+func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime) bool {
+	if provider == nil {
+		return false
+	}
+	if len(h.allowedModels) == 0 {
+		return true
+	}
+	setup := h.providerSetup()
+	for model := range h.allowedModels {
+		if owner, ok := setup.lookupModel(model); ok {
+			if owner.providerID == provider.id {
+				return true
+			}
+			continue
+		}
+		if _, ok := provider.staticConfigs[model]; ok {
+			return true
+		}
+		if _, ok := provider.includeModels[model]; ok {
+			return true
+		}
+		if providerUsesDynamicModels(provider) && provider.allowsModel(model) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *ProxyHandler) filterAllowedModels(models []providerModel) []providerModel {
+	if len(h.allowedModels) == 0 {
+		return models
+	}
+	filtered := make([]providerModel, 0, len(models))
+	for _, model := range models {
+		if _, ok := h.allowedModels[model.publicID]; ok {
+			filtered = append(filtered, model)
+		}
+	}
+	return filtered
 }
 
 func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*providerRuntime, []string, string, error) {
@@ -1240,13 +1281,6 @@ func (h *ProxyHandler) ModelUsesCopilot(model string) bool {
 	}
 	provider := setup.defaultProvider()
 	return provider != nil && provider.kind == providerTypeCopilot
-}
-
-// ModelKnown reports whether model is already present in the initialized model
-// table, before any deferred dynamic provider refresh.
-func (h *ProxyHandler) ModelKnown(model string) bool {
-	_, ok := h.providerSetup().lookupModel(strings.TrimSpace(model))
-	return ok
 }
 
 func modelNotAllowedRequestError(model string) error {

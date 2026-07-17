@@ -1183,9 +1183,8 @@ func TestAgentLaunchProxySkipsCopilotForKnownNonCopilotModel(t *testing.T) {
 			called = true
 			return "", errors.New("Copilot auth should not run")
 		}},
-		usesCopilot:                   srv.ModelUsesCopilot("local-model"),
-		validateDynamicProviderModels: !srv.ModelKnown("local-model"),
-		log:                           log,
+		usesCopilot: srv.ModelUsesCopilot("local-model"),
+		log:         log,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -1199,5 +1198,28 @@ func TestAgentLaunchProxySkipsCopilotForKnownNonCopilotModel(t *testing.T) {
 	}()
 	if called {
 		t.Fatal("known non-Copilot model triggered Copilot authentication")
+	}
+	baseURL := "http://" + runtime.Addr()
+	for _, path := range []string{"/readyz", "/v1/models"} {
+		resp, err := http.Get(baseURL + path) //nolint:gosec // loopback test server
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			t.Fatalf("read %s: %v", path, readErr)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200; body=%s", path, resp.StatusCode, body)
+		}
+		if path == "/v1/models" {
+			if !bytes.Contains(body, []byte(`"id":"local-model"`)) {
+				t.Fatalf("models response missing selected model: %s", body)
+			}
+			if bytes.Contains(body, []byte("copilot-model")) {
+				t.Fatalf("models response included unrelated Copilot model: %s", body)
+			}
+		}
 	}
 }

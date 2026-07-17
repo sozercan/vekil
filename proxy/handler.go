@@ -1231,7 +1231,7 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 	setup := h.providerSetup()
 	for _, providerID := range setup.providerOrder {
 		provider := setup.providerByID(providerID)
-		if provider == nil {
+		if !h.providerWithinAllowedModelScope(provider) {
 			continue
 		}
 		if err := h.checkProviderReady(ctx, provider); err != nil {
@@ -1502,7 +1502,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 
 	for _, providerID := range setup.providerOrder {
 		provider := setup.providerByID(providerID)
-		if provider == nil {
+		if !h.providerWithinAllowedModelScope(provider) {
 			continue
 		}
 
@@ -1511,10 +1511,10 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 			return cachedModelsResponse{}, false, err
 		}
 
-		models := filterProviderModels(provider, result.models)
+		models := h.filterAllowedModels(filterProviderModels(provider, result.models))
 
 		if result.notModified {
-			models = filterProviderModels(provider, setup.modelsForProvider(provider.id))
+			models = h.filterAllowedModels(filterProviderModels(provider, setup.modelsForProvider(provider.id)))
 			for _, model := range models {
 				if existingProvider, exists := owners[model.publicID]; exists {
 					if existingProvider == model.providerID {
