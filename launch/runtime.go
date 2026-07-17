@@ -514,8 +514,20 @@ func stopCommand(
 		return outcome
 	case <-time.After(timeout):
 	}
-	_ = controller.kill()
-	return <-waitCh
+	killErr := controller.kill()
+	select {
+	case outcome := <-waitCh:
+		outcome.err = errors.Join(outcome.err, killErr)
+		return outcome
+	case <-time.After(timeout):
+		return commandOutcome{
+			code: 1,
+			err: errors.Join(
+				killErr,
+				fmt.Errorf("agent process did not exit within %s after forced termination", timeout),
+			),
+		}
+	}
 }
 
 func cleanupPreparedProcess(prepared PreparedProcess, stderr io.Writer) {

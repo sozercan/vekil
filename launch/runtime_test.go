@@ -435,6 +435,22 @@ func TestPollProxyFailureIgnoresRunningProxy(t *testing.T) {
 	}
 }
 
+func TestStopCommandBoundsWaitAfterFailedKill(t *testing.T) {
+	killErr := errors.New("forced termination failed")
+	controller := &failedStartProcessController{killErr: killErr}
+	started := time.Now()
+	outcome := stopCommand(controller, make(chan commandOutcome), 20*time.Millisecond, os.Interrupt, false)
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("stopCommand() took %s, want bounded post-kill wait", elapsed)
+	}
+	if !controller.killCalled {
+		t.Fatal("stopCommand() did not attempt forced termination")
+	}
+	if !errors.Is(outcome.err, killErr) || !strings.Contains(outcome.err.Error(), "did not exit") {
+		t.Fatalf("stopCommand() error = %v, want kill and timeout errors", outcome.err)
+	}
+}
+
 func launcherTestProxy() *fakeProxy {
 	return newFakeProxy(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
