@@ -260,10 +260,11 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 	}
 
 	proxyRuntime := &agentLaunchProxy{
-		srv:           srv,
-		authenticator: authenticator,
-		usesCopilot:   providersCfg.UsesCopilot(),
-		log:           log,
+		srv:                           srv,
+		authenticator:                 authenticator,
+		usesCopilot:                   srv.ModelUsesCopilot(opts.model),
+		validateDynamicProviderModels: !srv.ModelKnown(opts.model),
+		log:                           log,
 	}
 	launchOpts.LogPath = logPath
 	signals := make(chan os.Signal, 2)
@@ -285,17 +286,18 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 }
 
 type agentLaunchProxy struct {
-	srv           *server.Server
-	authenticator serveStartupAuthenticator
-	usesCopilot   bool
-	log           *logger.Logger
+	srv                           *server.Server
+	authenticator                 serveStartupAuthenticator
+	usesCopilot                   bool
+	validateDynamicProviderModels bool
+	log                           *logger.Logger
 }
 
 func (p *agentLaunchProxy) Start(ctx context.Context) error {
 	if err := startServeServer(ctx, p.srv, p.authenticator, p.usesCopilot, p.log); err != nil {
 		return err
 	}
-	if p.usesCopilot {
+	if p.usesCopilot || !p.validateDynamicProviderModels {
 		return nil
 	}
 	if err := p.srv.ValidateDynamicProviderModels(ctx); err != nil {

@@ -63,6 +63,26 @@ func TestValidateVersionOutputEnforcesMinimum(t *testing.T) {
 	}
 }
 
+func TestValidateVersionOutputIgnoresUnrelatedWarningVersion(t *testing.T) {
+	err := validateVersionOutput(
+		"Node 22.1.0 is deprecated\nClaude Code 2.1.82",
+		"Claude Code",
+		"Claude Code",
+		minimumVersion{major: 2, minor: 1, patch: 83},
+	)
+	if err == nil || !strings.Contains(err.Error(), "2.1.82") {
+		t.Fatalf("validateVersionOutput() error = %v, want Claude 2.1.82 minimum failure", err)
+	}
+	if err := validateVersionOutput(
+		"Node 22.1.0 is deprecated\nClaude Code 2.1.83",
+		"Claude Code",
+		"Claude Code",
+		minimumVersion{major: 2, minor: 1, patch: 83},
+	); err != nil {
+		t.Fatalf("validateVersionOutput() = %v", err)
+	}
+}
+
 func TestReapFailedContainedCommandKillsAndWaits(t *testing.T) {
 	cause := errors.New("initialize controller")
 	killErr := errors.New("kill child")

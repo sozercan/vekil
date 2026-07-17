@@ -319,7 +319,14 @@ func (e *serveStartupCancellation) Error() string {
 }
 
 func (e *serveStartupCancellation) Unwrap() []error {
-	return []error{e.cause, e.stopErr}
+	errs := make([]error, 0, 2)
+	if e.cause != nil {
+		errs = append(errs, e.cause)
+	}
+	if e.stopErr != nil {
+		errs = append(errs, e.stopErr)
+	}
+	return errs
 }
 
 func cancelServeStartup(ctx context.Context, srv serveLifecycleServer, log *logger.Logger) error {

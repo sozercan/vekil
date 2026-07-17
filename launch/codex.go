@@ -63,7 +63,7 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	probeEnvironment := applyEnvironment(input.Environment, envUnset, nil)
 	probeEnvironment = ensureLoopbackNoProxy(probeEnvironment, baseURL)
 	if !input.DryRun {
-		if err := validateExecutableVersion(executable, probeEnvironment, "Codex CLI", "codex", minimumVersion{major: 0, minor: 137, patch: 0}); err != nil {
+		if err := validateExecutableVersion(executable, probeEnvironment, "Codex CLI", "codex-cli", minimumVersion{major: 0, minor: 137, patch: 0}); err != nil {
 			return PreparedProcess{}, err
 		}
 	}

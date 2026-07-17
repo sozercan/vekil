@@ -378,6 +378,20 @@ func TestStartServeServerReturnsCancellationCause(t *testing.T) {
 	}
 }
 
+func TestServeStartupCancellationUnwrapOmitsNilErrors(t *testing.T) {
+	cause := errors.New("startup canceled")
+	err := &serveStartupCancellation{cause: cause}
+	unwrapped := err.Unwrap()
+	if len(unwrapped) != 1 || !errors.Is(unwrapped[0], cause) {
+		t.Fatalf("Unwrap() = %#v, want only cause", unwrapped)
+	}
+	for i, item := range unwrapped {
+		if item == nil {
+			t.Fatalf("Unwrap()[%d] is nil", i)
+		}
+	}
+}
+
 func TestServeUntilContextDoneStartsServerBeforeCopilotAuthCompletes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1125,4 +1139,65 @@ func (f *fakeLoginAuthenticator) PollForAuthorization(_ context.Context, dcResp 
 	f.pollForAuthorizationCalls++
 	f.polledDeviceCode = dcResp
 	return f.pollForAuthorizationErr
+}
+
+func TestAgentLaunchProxySkipsCopilotForKnownNonCopilotModel(t *testing.T) {
+	cfg := proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{
+		{
+			ID:             "local-static",
+			Type:           "openai-compatible",
+			BaseURL:        "http://127.0.0.1:9/v1",
+			AuthType:       "none",
+			Default:        true,
+			ModelDiscovery: "static",
+			Models: []proxy.ProviderModelConfig{{
+				PublicID:  "local-model",
+				Endpoints: []string{"/responses"},
+			}},
+		},
+		{
+			ID:            "copilot",
+			Type:          "copilot",
+			IncludeModels: []string{"copilot-model"},
+		},
+	}}
+	log := logger.NewWithWriter(logger.LevelError, io.Discard)
+	srv, err := server.New(
+		auth.NewTestAuthenticator("test-token"),
+		log,
+		"127.0.0.1",
+		"0",
+		server.WithProxyOptions(
+			proxy.WithProvidersConfig(cfg),
+			proxy.WithAllowedModels("local-model"),
+			proxy.WithDeferredDynamicProviderModelValidation(true),
+		),
+	)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+	called := false
+	runtime := &agentLaunchProxy{
+		srv: srv,
+		authenticator: &fakeServeStartupAuthenticator{getTokenFn: func(context.Context) (string, error) {
+			called = true
+			return "", errors.New("Copilot auth should not run")
+		}},
+		usesCopilot:                   srv.ModelUsesCopilot("local-model"),
+		validateDynamicProviderModels: !srv.ModelKnown("local-model"),
+		log:                           log,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := runtime.Start(ctx); err != nil {
+		t.Fatalf("agentLaunchProxy.Start() error = %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+		defer stopCancel()
+		_ = runtime.Stop(stopCtx)
+	}()
+	if called {
+		t.Fatal("known non-Copilot model triggered Copilot authentication")
+	}
 }

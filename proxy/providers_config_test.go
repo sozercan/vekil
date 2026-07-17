@@ -1387,3 +1387,60 @@ func TestAllowedModelsDoesNotNormalizeKnownDisallowedModel(t *testing.T) {
 		t.Fatalf("known disallowed raw model status = %d, want %d; err=%v", got, http.StatusBadRequest, err)
 	}
 }
+
+func TestModelUsesCopilotFollowsSelectedStaticOwner(t *testing.T) {
+	cfg := ProvidersConfig{Providers: []ProviderConfig{
+		{
+			ID:             "local-static",
+			Type:           "openai-compatible",
+			BaseURL:        "http://127.0.0.1:9/v1",
+			AuthType:       "none",
+			Default:        true,
+			ModelDiscovery: "static",
+			Models: []ProviderModelConfig{{
+				PublicID:  "local-model",
+				Endpoints: []string{"/responses"},
+			}},
+		},
+		{
+			ID:            "copilot",
+			Type:          "copilot",
+			IncludeModels: []string{"copilot-model"},
+		},
+	}}
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(cfg),
+		WithDeferredDynamicProviderModelValidation(true),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	if h.ModelUsesCopilot("local-model") {
+		t.Fatal("static non-Copilot model unexpectedly requires Copilot authentication")
+	}
+	if !h.ModelKnown("local-model") {
+		t.Fatal("static non-Copilot model was not known before dynamic validation")
+	}
+	if !h.ModelUsesCopilot("copilot-model") {
+		t.Fatal("static Copilot model did not require Copilot authentication")
+	}
+	if h.ModelKnown("copilot-model") {
+		t.Fatal("filtered Copilot model unexpectedly appeared before dynamic validation")
+	}
+	if h.ModelUsesCopilot("unknown-model") {
+		t.Fatal("unknown model did not follow the non-Copilot default provider")
+	}
+
+	defaultHandler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler(default) error = %v", err)
+	}
+	if !defaultHandler.ModelUsesCopilot("any-model") {
+		t.Fatal("zero-config model did not require Copilot authentication")
+	}
+}

@@ -1217,6 +1217,38 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 	return ok
 }
 
+// ModelUsesCopilot reports whether the selected public model currently resolves
+// to the Copilot provider. Unknown models follow the configured default provider.
+func (h *ProxyHandler) ModelUsesCopilot(model string) bool {
+	setup := h.providerSetup()
+	model = strings.TrimSpace(model)
+	if owner, ok := setup.lookupModel(model); ok {
+		provider := setup.providerByID(owner.providerID)
+		return provider != nil && provider.kind == providerTypeCopilot
+	}
+	for _, providerID := range setup.providerOrder {
+		provider := setup.providerByID(providerID)
+		if provider == nil {
+			continue
+		}
+		if _, ok := provider.staticConfigs[model]; ok {
+			return provider.kind == providerTypeCopilot
+		}
+		if _, ok := provider.includeModels[model]; ok {
+			return provider.kind == providerTypeCopilot
+		}
+	}
+	provider := setup.defaultProvider()
+	return provider != nil && provider.kind == providerTypeCopilot
+}
+
+// ModelKnown reports whether model is already present in the initialized model
+// table, before any deferred dynamic provider refresh.
+func (h *ProxyHandler) ModelKnown(model string) bool {
+	_, ok := h.providerSetup().lookupModel(strings.TrimSpace(model))
+	return ok
+}
+
 func modelNotAllowedRequestError(model string) error {
 	return &providerRequestError{
 		statusCode: http.StatusBadRequest,

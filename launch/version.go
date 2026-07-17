@@ -82,10 +82,7 @@ func validateExecutableVersion(
 
 func validateVersionOutput(output, displayName, requiredOutput string, minimum minimumVersion) error {
 	trimmedOutput := strings.TrimSpace(output)
-	if requiredOutput != "" && !strings.Contains(strings.ToLower(trimmedOutput), strings.ToLower(requiredOutput)) {
-		return fmt.Errorf("check %s version: unrecognized output %q", displayName, trimmedOutput)
-	}
-	match := semanticVersionPattern.FindStringSubmatch(trimmedOutput)
+	match := productVersionMatch(trimmedOutput, requiredOutput)
 	if match == nil {
 		return fmt.Errorf("check %s version: unrecognized output %q", displayName, trimmedOutput)
 	}
@@ -103,6 +100,22 @@ func validateVersionOutput(output, displayName, requiredOutput string, minimum m
 			minimum.minor,
 			minimum.patch,
 		)
+	}
+	return nil
+}
+
+func productVersionMatch(output, requiredOutput string) []string {
+	if strings.TrimSpace(requiredOutput) == "" {
+		return semanticVersionPattern.FindStringSubmatch(output)
+	}
+	required := strings.ToLower(strings.TrimSpace(requiredOutput))
+	for _, line := range strings.Split(output, "\n") {
+		if !strings.Contains(strings.ToLower(line), required) {
+			continue
+		}
+		if match := semanticVersionPattern.FindStringSubmatch(line); match != nil {
+			return match
+		}
 	}
 	return nil
 }
