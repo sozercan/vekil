@@ -286,6 +286,8 @@ func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
 	}{
 		{name: "settings", args: []string{"--settings", "{}"}, want: "settings-source overrides"},
 		{name: "managed settings", args: []string{"--managed-settings", "{}"}, want: "settings-source overrides"},
+		{name: "init only", args: []string{"--init-only"}, want: "initialization-only"},
+		{name: "attached init only", args: []string{"--init-only=true"}, want: "initialization-only"},
 		{name: "background", args: []string{"--background"}, want: "detached Claude sessions"},
 		{name: "tmux", args: []string{"--tmux"}, want: "detached Claude sessions"},
 		{name: "model", args: []string{"--model", "responses-only"}, want: "model or session overrides"},
@@ -308,6 +310,7 @@ func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
 		{name: "gateway subcommand", args: []string{"gateway"}, want: "agent-management commands"},
 		{name: "auth subcommand", args: []string{"auth"}, want: "agent-management commands"},
 		{name: "doctor subcommand", args: []string{"doctor"}, want: "agent-management commands"},
+		{name: "install subcommand", args: []string{"install"}, want: "agent-management commands"},
 		{name: "subcommand after delimiter", args: []string{"--", "remote-control"}, want: "agent-management commands"},
 	}
 	for _, tc := range tests {

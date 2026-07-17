@@ -9396,6 +9396,59 @@ func TestHandleModels_CanonicalCatalogOwnsRoutingAcrossQueryVariants(t *testing.
 	}
 }
 
+func TestHandleModelsFiltersExplicitRoutesByAllowedModels(t *testing.T) {
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithAllowedModels("selected-model"),
+		WithProvidersConfig(ProvidersConfig{
+			SchemaVersion: ProvidersConfigSchemaVersion2,
+			Providers: []ProviderConfig{{
+				ID:             "local",
+				Type:           string(providerTypeOpenAICompatible),
+				Default:        true,
+				BaseURL:        "http://127.0.0.1:9/v1",
+				AuthType:       "none",
+				ModelDiscovery: string(providerModelDiscoveryStatic),
+			}},
+			ModelRoutes: []ModelRouteConfig{
+				{
+					ID: "selected-route", PublicID: "selected-model", Endpoints: []string{providerEndpointResponses},
+					Targets: []ModelRouteTargetConfig{{ID: "selected", Provider: "local", UpstreamModel: "physical-selected"}},
+				},
+				{
+					ID: "other-route", PublicID: "other-model", Endpoints: []string{providerEndpointResponses},
+					Targets: []ModelRouteTargetConfig{{ID: "other", Provider: "local", UpstreamModel: "physical-other"}},
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	defer h.BeginShutdown()
+
+	w := httptest.NewRecorder()
+	h.HandleModels(w, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("models status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	var catalog struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	if len(catalog.Data) != 1 || catalog.Data[0].ID != "selected-model" {
+		t.Fatalf("scoped model catalog = %+v, want only selected-model", catalog.Data)
+	}
+}
+
 func TestHandleModels_QueryVariantRejectsExplicitRouteAliasCollisions(t *testing.T) {
 	const (
 		explicitModel = "claude-sonnet-4.5"

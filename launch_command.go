@@ -14,7 +14,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/sozercan/vekil/auth"
@@ -275,8 +274,9 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		log:           log,
 	}
 	launchOpts.LogPath = logPath
-	signals := make(chan os.Signal, 2)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	managedSignals := managedLaunchSignals()
+	signals := make(chan os.Signal, len(managedSignals))
+	signal.Notify(signals, managedSignals...)
 	defer signal.Stop(signals)
 	launchOpts.Signals = signals
 	result, err := launch.Run(context.Background(), proxyRuntime, target.adapter, launchOpts)

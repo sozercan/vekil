@@ -1507,9 +1507,15 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 			if route == nil {
 				continue
 			}
+			publicID := strings.TrimSpace(route.public.id)
+			if len(h.allowedModels) > 0 {
+				if _, allowed := h.allowedModels[publicID]; !allowed {
+					continue
+				}
+			}
 			reservation := mergedModelReservation{
 				ownerID:     route.public.routeID,
-				rawPublicID: strings.TrimSpace(route.public.id),
+				rawPublicID: publicID,
 				ownerType:   mergedModelOwnerExplicitRoute,
 			}
 			for _, alias := range configuredPublicModelAliases(reservation.rawPublicID) {

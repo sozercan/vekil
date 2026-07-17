@@ -175,6 +175,8 @@ func validateClaudeForwardedArgs(args []string) error {
 				printMode = true
 			}
 			switch {
+			case arg == "--init-only" || strings.HasPrefix(arg, "--init-only="):
+				return fmt.Errorf("Claude initialization-only mode is not supported by an ephemeral Vekil launcher")
 			case arg == "--settings" || strings.HasPrefix(arg, "--settings="),
 				arg == "--setting-sources" || strings.HasPrefix(arg, "--setting-sources="),
 				arg == "--managed-settings" || strings.HasPrefix(arg, "--managed-settings="):
