@@ -10,7 +10,7 @@
 
 ---
 
-Vekil is a Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs behind one local endpoint. Run it in zero-config mode against GitHub Copilot, or route selected models to providers like Azure OpenAI, OpenAI Codex, and generic OpenAI-compatible or Anthropic-compatible upstreams. The client-facing API surface stays the same while model ownership is configured behind the proxy.
+Vekil is a Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs behind one local endpoint. Run it in zero-config mode against GitHub Copilot, or route selected models to providers like Azure OpenAI, OpenAI Codex, and generic OpenAI-compatible or Anthropic-compatible upstreams. The client-facing API surface stays the same while model ownership is configured behind the proxy. Vekil can also launch Claude Code, Codex CLI, or GitHub Copilot CLI through short-lived, model-scoped proxy sessions.
 
 ## Why Vekil?
 
@@ -50,7 +50,11 @@ brew install --cask sozercan/repo/vekil
 
 For explicit provider routing, start the proxy with `--providers-config /path/to/providers.{json,yaml}`.
 
-Launch a coding agent through an ephemeral Vekil instance:
+### Launch a coding agent
+
+The native binary can start a loopback-only proxy, validate one selected model,
+configure the agent for that session, and clean everything up when the agent
+exits:
 
 ```bash
 vekil launch claude --model claude-sonnet-4.5
@@ -58,7 +62,22 @@ vekil launch codex --model gpt-5.4-mini
 vekil launch copilot --model gpt-5.4-mini
 ```
 
-See [Agent Launchers](docs/agent-launchers.md) for provider configs, forwarded agent arguments, logs, and credential isolation.
+Use `--providers-config` with the same JSON/YAML routing file accepted by the
+server. Arguments after `--` are forwarded to the agent:
+
+```bash
+vekil launch codex \
+  --providers-config /path/to/providers.yaml \
+  --model my-responses-model -- \
+  exec --ephemeral "Review this workspace"
+```
+
+The launcher keeps upstream credentials in the proxy, gives the child a random
+session token, restricts it to the selected public model, and supervises the
+child process tree. Use `--dry-run` to inspect the plan without starting the
+proxy or agent. See [Agent Launchers](docs/agent-launchers.md) for supported CLI
+versions, endpoint requirements, forwarded arguments, logs, and isolation
+details.
 
 **First-run auth** depends on your providers:
 
