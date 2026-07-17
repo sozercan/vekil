@@ -260,10 +260,11 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 
 	select {
 	case outcome := <-waitCh:
-		if outcome.err != nil {
-			return result, outcome.err
-		}
 		result.ExitCode = outcome.code
+		proxyErr := pollProxyFailure(proxy.Done())
+		if outcome.err != nil || proxyErr != nil {
+			return result, errors.Join(outcome.err, proxyErr)
+		}
 	case <-runCtx.Done():
 		signalValue := signalFromContext(runCtx)
 		if signalValue == nil {
@@ -287,6 +288,15 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 		}
 	}
 	return result, nil
+}
+
+func pollProxyFailure(done <-chan error) error {
+	select {
+	case proxyErr, ok := <-done:
+		return fmt.Errorf("launch proxy failed: %w", normalizedProxyDoneError(proxyErr, ok))
+	default:
+		return nil
+	}
 }
 
 const dryRunBaseURL = "http://127.0.0.1:<dynamic>"

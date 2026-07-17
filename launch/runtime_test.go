@@ -419,6 +419,22 @@ func TestRunProxyFailureStopsChild(t *testing.T) {
 	}
 }
 
+func TestPollProxyFailureReportsReadyFailure(t *testing.T) {
+	want := errors.New("listener failed after child exit")
+	done := make(chan error, 1)
+	done <- want
+	err := pollProxyFailure(done)
+	if !errors.Is(err, want) {
+		t.Fatalf("pollProxyFailure() error = %v, want %v", err, want)
+	}
+}
+
+func TestPollProxyFailureIgnoresRunningProxy(t *testing.T) {
+	if err := pollProxyFailure(make(chan error)); err != nil {
+		t.Fatalf("pollProxyFailure() error = %v, want nil", err)
+	}
+}
+
 func launcherTestProxy() *fakeProxy {
 	return newFakeProxy(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

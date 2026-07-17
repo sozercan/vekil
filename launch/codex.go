@@ -123,17 +123,15 @@ func codexProviderID(localToken string) string {
 func validateCodexForwardedArgs(args []string) error {
 	var positionals []string
 	expectValue := false
-	endOptions := false
 	for _, arg := range args {
 		if expectValue {
 			expectValue = false
 			continue
 		}
-		if !endOptions && arg == "--" {
-			endOptions = true
-			continue
+		if arg == "--" {
+			break
 		}
-		if !endOptions && strings.HasPrefix(arg, "-") {
+		if strings.HasPrefix(arg, "-") {
 			switch {
 			case arg == "-m" || strings.HasPrefix(arg, "-m=") || (strings.HasPrefix(arg, "-m") && len(arg) > 2) || strings.HasPrefix(arg, "--model="), arg == "--model",
 				arg == "-c" || strings.HasPrefix(arg, "-c=") || (strings.HasPrefix(arg, "-c") && len(arg) > 2) || strings.HasPrefix(arg, "--config="), arg == "--config",

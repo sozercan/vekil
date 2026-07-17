@@ -190,7 +190,14 @@ func TestCodexAdapterRejectsManagedOverridesAndNonAgentModes(t *testing.T) {
 			}
 		})
 	}
-	for _, args := range [][]string{{"exec", "--ephemeral", "hello"}, {"e", "--ephemeral", "hello"}, {"review", "--uncommitted"}, {"hello"}} {
+	for _, args := range [][]string{
+		{"exec", "--ephemeral", "hello"},
+		{"e", "--ephemeral", "hello"},
+		{"review", "--uncommitted"},
+		{"hello"},
+		{"exec", "--", "resume"},
+		{"exec", "--", "app-server"},
+	} {
 		if err := validateCodexForwardedArgs(args); err != nil {
 			t.Fatalf("validateCodexForwardedArgs(%#v) = %v", args, err)
 		}
