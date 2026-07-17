@@ -215,6 +215,110 @@ func TestExplicitRouteOperationAdmissionCoversRouteLocalValidation(t *testing.T)
 	}
 }
 
+func TestExplicitRoutesRespectAllowedModelScopeAcrossHTTPHandlers(t *testing.T) {
+	tests := []struct {
+		name         string
+		providerKind providerType
+		endpoint     string
+		path         string
+		body         string
+		handle       func(*ProxyHandler, http.ResponseWriter, *http.Request)
+	}{
+		{
+			name:         "Responses",
+			providerKind: providerTypeOpenAICompatible,
+			endpoint:     providerEndpointResponses,
+			path:         "/v1/responses",
+			body:         `{"model":"other-model","input":"hi"}`,
+			handle:       (*ProxyHandler).HandleResponses,
+		},
+		{
+			name:         "OpenAI Chat",
+			providerKind: providerTypeOpenAICompatible,
+			endpoint:     providerEndpointChatCompletions,
+			path:         "/v1/chat/completions",
+			body:         `{"model":"other-model","messages":[{"role":"user","content":"hi"}]}`,
+			handle:       (*ProxyHandler).HandleOpenAIChatCompletions,
+		},
+		{
+			name:         "Anthropic Messages",
+			providerKind: providerTypeAnthropicCompatible,
+			endpoint:     providerEndpointMessages,
+			path:         "/v1/messages",
+			body:         `{"model":"other-model","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`,
+			handle:       (*ProxyHandler).HandleAnthropicMessages,
+		},
+		{
+			name:         "Anthropic Count Tokens",
+			providerKind: providerTypeAnthropicCompatible,
+			endpoint:     providerEndpointMessages,
+			path:         "/v1/messages/count_tokens",
+			body:         `{"model":"other-model","messages":[{"role":"user","content":"hi"}]}`,
+			handle:       (*ProxyHandler).HandleAnthropicMessagesCountTokens,
+		},
+		{
+			name:         "Gemini",
+			providerKind: providerTypeOpenAICompatible,
+			endpoint:     providerEndpointChatCompletions,
+			path:         "/v1beta/models/other-model:generateContent",
+			body:         `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
+			handle:       (*ProxyHandler).HandleGeminiModels,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var upstreamCalls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				upstreamCalls.Add(1)
+				http.Error(w, "unexpected upstream request", http.StatusInternalServerError)
+			}))
+			defer upstream.Close()
+
+			h, err := NewProxyHandler(
+				auth.NewTestAuthenticator("test-token"),
+				logger.NewWithWriter(logger.LevelError, io.Discard),
+				WithAllowedModels("selected-model"),
+				WithProvidersConfig(ProvidersConfig{
+					SchemaVersion: ProvidersConfigSchemaVersion2,
+					Providers: []ProviderConfig{{
+						ID: "upstream", Type: string(tt.providerKind), Default: true,
+						BaseURL: upstream.URL, AuthType: "none",
+					}},
+					ModelRoutes: []ModelRouteConfig{
+						{
+							ID: "selected-route", PublicID: "selected-model", Endpoints: []string{tt.endpoint},
+							Targets: []ModelRouteTargetConfig{{ID: "selected", Provider: "upstream", UpstreamModel: "physical-selected"}},
+						},
+						{
+							ID: "other-route", PublicID: "other-model", Endpoints: []string{tt.endpoint},
+							Targets: []ModelRouteTargetConfig{{ID: "other", Provider: "upstream", UpstreamModel: "physical-other"}},
+						},
+					},
+				}),
+			)
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+			defer h.BeginShutdown()
+
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			tt.handle(h, w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "not allowed") {
+				t.Fatalf("body = %s, want model-not-allowed detail", w.Body.String())
+			}
+			if upstreamCalls.Load() != 0 {
+				t.Fatalf("upstream calls = %d, want 0", upstreamCalls.Load())
+			}
+		})
+	}
+}
+
 func TestExplicitRouteOperationAdmissionCoversUnsupportedEndpoints(t *testing.T) {
 	tests := []struct {
 		name         string
