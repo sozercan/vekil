@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-var npmWindowsShimScriptPattern = regexp.MustCompile(`(?i)%dp0%[\\/]([^"\r\n]+?\.js)`)
+var npmWindowsShimScriptPattern = regexp.MustCompile(`(?i)%(?:~dp0|dp0%)[\\/]([^"\r\n]+?\.js)`)
 
 func normalizeResolvedExecutable(path string) (resolvedExecutable, error) {
 	extension := strings.ToLower(filepath.Ext(path))

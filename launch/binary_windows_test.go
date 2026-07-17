@@ -24,7 +24,7 @@ func TestResolveExecutableUsesPATHEXTAndUnwrapsNPMShim(t *testing.T) {
 		t.Fatalf("write script: %v", err)
 	}
 	shim := `@ECHO off
-"%dp0%\node.exe" "%dp0%\node_modules\@anthropic-ai\claude-code\cli.js" %*
+"%~dp0\node.exe" "%~dp0\node_modules\@anthropic-ai\claude-code\cli.js" %*
 `
 	if err := os.WriteFile(base+".cmd", []byte(shim), 0o600); err != nil {
 		t.Fatalf("write fallback: %v", err)
