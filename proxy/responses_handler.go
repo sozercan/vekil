@@ -1172,6 +1172,10 @@ func writeCompactInflightKeyRequestPolicy(w io.Writer, policy providerRequestPol
 }
 
 func writeCompactInflightKeyProvider(w io.Writer, provider *providerRuntime) {
+	// The runtime pointer identifies the exact immutable provider configuration,
+	// including its credential and fixed-header sources, without copying secrets
+	// into the coalescing digest input. Provider shells are rebuilt rather than
+	// mutated when configuration changes.
 	writeCompactInflightKeyPart(w, []byte(fmt.Sprintf("%p", provider)))
 	writeCompactInflightKeyPart(w, []byte(provider.id))
 	writeCompactInflightKeyPart(w, []byte(provider.kind))
@@ -1183,17 +1187,8 @@ func writeCompactInflightKeyProvider(w io.Writer, provider *providerRuntime) {
 	writeCompactInflightKeyPart(w, []byte(provider.authType))
 	writeCompactInflightKeyPart(w, []byte(provider.authHeader))
 	writeCompactInflightKeyPart(w, []byte(provider.authPrefix))
-	writeCompactInflightKeyPart(w, []byte(provider.apiKey))
-	writeCompactInflightKeyHeaders(w, provider.extraHeaders)
 	writeCompactInflightKeyPart(w, []byte(fmt.Sprintf("%T:%p", provider.azureToken, provider.azureToken)))
 	writeCompactInflightKeyPart(w, []byte(fmt.Sprintf("%p", provider.codexAuth)))
-	if provider.codexAuth != nil {
-		writeCompactInflightKeyPart(w, []byte(provider.codexAuth.path))
-		writeCompactInflightKeyPart(w, []byte(provider.codexAuth.sharedStateKey))
-	}
-	if encoded, err := json.Marshal(provider.headerProfiles); err == nil {
-		writeCompactInflightKeyPart(w, encoded)
-	}
 }
 
 func writeCompactInflightKeyRawMap(w io.Writer, values map[string]json.RawMessage) {
