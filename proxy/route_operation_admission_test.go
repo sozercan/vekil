@@ -72,6 +72,7 @@ func latestAccountedRouteAttempt(t testing.TB, h *ProxyHandler, operation *route
 	}
 	if operation == nil {
 		t.Fatal("admitted route operation is unavailable")
+		return recentRouteAttempt{}
 	}
 
 	h.stats.mu.Lock()

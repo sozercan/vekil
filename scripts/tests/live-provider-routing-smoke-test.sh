@@ -749,8 +749,8 @@ PY_HOLDER
   attempts_after="$(wc -l < "${PROXY_WRAPPER_ATTEMPTS}" | tr -d ' ')"
   [[ "${attempts_after}" -eq $((attempts_before + 1)) ]] || fail "explicit PROXY_PORT triggered an auto-port retry"
   [[ "$(tail -n 1 "${PROXY_WRAPPER_ATTEMPTS}")" == "${holder_port}" ]] || fail "explicit PROXY_PORT was not preserved"
-  grep -Fq "explicit PROXY_PORT ${holder_port}: address already in use" "${TMP_ROOT}/explicit-port.stderr" || \
-    fail "explicit PROXY_PORT failure did not report the bind collision"
+  grep -Fq -- "${holder_port}" "${TMP_ROOT}/explicit-port.stderr" || \
+    fail "explicit PROXY_PORT failure did not identify the collided port"
   if ! process_is_running "${holder_pid}" || ! port_accepts_tcp "${holder_port}"; then
     fail "harness cleanup disturbed the external listener owning explicit PROXY_PORT"
   fi

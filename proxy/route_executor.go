@@ -597,20 +597,6 @@ func (o *routeOperation) snapshot() (sends, switches int, trace []routeAttemptTr
 	return o.upstreamSends, o.targetSwitches, append([]routeAttemptTrace(nil), o.trace...)
 }
 
-func (o *routeOperation) traceForSequence(sequence int) (routeAttemptTrace, bool) {
-	if o == nil || sequence <= 0 {
-		return routeAttemptTrace{}, false
-	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	for i := len(o.trace) - 1; i >= 0; i-- {
-		if o.trace[i].Sequence == sequence {
-			return o.trace[i], true
-		}
-	}
-	return routeAttemptTrace{}, false
-}
-
 func (o *routeOperation) commitmentSnapshot() downstreamCommitment {
 	if o == nil {
 		return downstreamCommitmentNone
