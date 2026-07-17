@@ -135,6 +135,11 @@ func TestResolveStaticProviderModelNormalizesConfiguredMetadata(t *testing.T) {
 			Type:           "openai-compatible",
 			BaseURL:        "https://dynamic.example/v1",
 			ModelDiscovery: "openai",
+			Models: []ProviderModelConfig{{
+				PublicID:   "dynamic-only",
+				Deployment: "upstream-dynamic",
+				Endpoints:  []string{"/responses"},
+			}},
 		},
 		{
 			ID:             "static",
@@ -178,8 +183,8 @@ func TestResolveStaticProviderModelNormalizesConfiguredMetadata(t *testing.T) {
 		t.Fatalf("context_window = %v, want %d", got.ContextWindow, contextWindow)
 	}
 
-	if _, ok, err := ResolveStaticProviderModel(cfg, "dynamic-only"); err != nil || ok {
-		t.Fatalf("dynamic-only resolution = found %v, err %v; want unresolved", ok, err)
+	if dynamic, ok, err := ResolveStaticProviderModel(cfg, "dynamic-only"); err != nil || ok {
+		t.Fatalf("dynamic overlay resolution = %#v, found %v, err %v; want unresolved", dynamic, ok, err)
 	}
 }
 

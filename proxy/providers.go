@@ -263,7 +263,18 @@ func ResolveStaticProviderModel(cfg ProvidersConfig, modelID string) (ProviderMo
 		}
 		kind := providerType(strings.TrimSpace(providerCfg.Type))
 		switch kind {
-		case providerTypeAzureOpenAI, providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+		case providerTypeAzureOpenAI:
+		case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+			discovery, err := configuredProviderModelDiscovery(kind, providerCfg.ModelDiscovery)
+			if err != nil {
+				return ProviderModelConfig{}, false, fmt.Errorf("provider %q: %w", providerID, err)
+			}
+			if discovery != providerModelDiscoveryStatic {
+				// Models on dynamic generic providers are metadata overlays. They
+				// materialize only when the upstream/deployment appears in the
+				// discovered catalog, so dry-run cannot resolve them statically.
+				continue
+			}
 		case providerTypeCopilot, providerTypeOpenAICodex:
 			// These providers are catalog-driven; their Models fields are not
 			// part of the configured static model table.
