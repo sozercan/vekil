@@ -183,6 +183,7 @@ func validateClaudeForwardedArgs(args []string) error {
 				arg == "--fallback-model" || strings.HasPrefix(arg, "--fallback-model="),
 				arg == "--continue" || arg == "-c",
 				arg == "--resume" || strings.HasPrefix(arg, "--resume=") || arg == "-r" || strings.HasPrefix(arg, "-r"),
+				arg == "--session-id" || strings.HasPrefix(arg, "--session-id="),
 				arg == "--from-pr" || strings.HasPrefix(arg, "--from-pr="),
 				arg == "--teleport" || strings.HasPrefix(arg, "--teleport="),
 				arg == "--agent" || strings.HasPrefix(arg, "--agent="),
@@ -195,13 +196,23 @@ func validateClaudeForwardedArgs(args []string) error {
 			continue
 		}
 		if !seenPositional {
-			if !printMode && (arg == "agents" || arg == "remote-control") {
+			if !printMode && claudeNonAgentCommand(arg) {
 				return fmt.Errorf("detached Claude agent-management commands are not supported by an ephemeral Vekil launcher")
 			}
 			seenPositional = true
 		}
 	}
 	return nil
+}
+
+func claudeNonAgentCommand(command string) bool {
+	switch command {
+	case "agents", "attach", "auth", "auto-mode", "doctor", "gateway", "install", "mcp",
+		"plugin", "plugins", "project", "remote-control", "setup-token", "ultrareview", "update", "upgrade":
+		return true
+	default:
+		return false
+	}
 }
 
 func claudeOptionRequiresValue(arg string) bool {

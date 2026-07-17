@@ -267,6 +267,8 @@ func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
 		{name: "fallback model", args: []string{"--fallback-model", "other"}, want: "model or session overrides"},
 		{name: "resume", args: []string{"--resume"}, want: "model or session overrides"},
 		{name: "attached short resume", args: []string{"-rsession-id"}, want: "model or session overrides"},
+		{name: "session id", args: []string{"--session-id", "00000000-0000-0000-0000-000000000000"}, want: "model or session overrides"},
+		{name: "attached session id", args: []string{"--session-id=00000000-0000-0000-0000-000000000000"}, want: "model or session overrides"},
 		{name: "custom agent", args: []string{"--agent", "reviewer"}, want: "model or session overrides"},
 		{name: "teleport", args: []string{"--teleport", "session"}, want: "model or session overrides"},
 		{name: "subcommand after option", args: []string{"--verbose", "remote-control"}, want: "agent-management commands"},
@@ -276,6 +278,10 @@ func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
 		{name: "subcommand after permission prompt tool", args: []string{"--permission-prompt-tool", "mcp__permissions", "agents"}, want: "agent-management commands"},
 		{name: "subcommand after system prompt file", args: []string{"--system-prompt-file", "prompt.txt", "agents"}, want: "agent-management commands"},
 		{name: "subcommand after appended system prompt file", args: []string{"--append-system-prompt-file", "prompt.txt", "agents"}, want: "agent-management commands"},
+		{name: "attach subcommand", args: []string{"attach", "session-id"}, want: "agent-management commands"},
+		{name: "gateway subcommand", args: []string{"gateway"}, want: "agent-management commands"},
+		{name: "auth subcommand", args: []string{"auth"}, want: "agent-management commands"},
+		{name: "doctor subcommand", args: []string{"doctor"}, want: "agent-management commands"},
 		{name: "subcommand after delimiter", args: []string{"--", "remote-control"}, want: "agent-management commands"},
 	}
 	for _, tc := range tests {
