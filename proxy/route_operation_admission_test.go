@@ -319,6 +319,27 @@ func TestExplicitRoutesRespectAllowedModelScopeAcrossHTTPHandlers(t *testing.T) 
 	}
 }
 
+func TestWithExplicitRouteOperationRejectsDisallowedRouteWithoutPriorAdmission(t *testing.T) {
+	h := newOperationAdmissionTestHandler(t, providerTypeOpenAICompatible, []string{providerEndpointResponses}, "https://upstream.invalid")
+	h.allowedModels = map[string]struct{}{"selected-model": {}}
+
+	ctx, operation, route, err := h.withExplicitRouteOperation(
+		context.Background(),
+		context.Background(),
+		"public-model",
+		providerEndpointResponses,
+	)
+	if err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("withExplicitRouteOperation() error = %v, want model-not-allowed", err)
+	}
+	if operation != nil || route != nil {
+		t.Fatalf("disallowed route operation = %p, route = %p; want nil", operation, route)
+	}
+	if routeOperationFromContext(ctx) != nil {
+		t.Fatal("disallowed route was attached to context")
+	}
+}
+
 func TestExplicitRouteOperationAdmissionCoversUnsupportedEndpoints(t *testing.T) {
 	tests := []struct {
 		name         string

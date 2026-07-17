@@ -66,6 +66,23 @@ func TestHandleResponsesWebSocket_DisabledByDefaultReturnsUpgradeRequired(t *tes
 	}
 }
 
+func TestResponsesWebSocketPrepareExplicitRouteOperationRejectsDisallowedModel(t *testing.T) {
+	handler := newOperationAdmissionTestHandler(t, providerTypeOpenAICompatible, []string{providerEndpointResponses}, "https://upstream.invalid")
+	handler.allowedModels = map[string]struct{}{"selected-model": {}}
+	session := &responsesWebSocketSession{ctx: context.Background()}
+
+	ctx, operation, route, err := session.prepareExplicitRouteOperation(handler, context.Background(), "public-model")
+	if err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("prepareExplicitRouteOperation() error = %v, want model-not-allowed", err)
+	}
+	if operation != nil || route != nil {
+		t.Fatalf("disallowed websocket operation = %p, route = %p; want nil", operation, route)
+	}
+	if routeOperationFromContext(ctx) != nil {
+		t.Fatal("disallowed websocket route was attached to context")
+	}
+}
+
 func TestResponsesWebSocketCreateRequest_IgnoresInitiatorForSignatureAndUpstream(t *testing.T) {
 	base := map[string]interface{}{
 		"type":                 "response.create",

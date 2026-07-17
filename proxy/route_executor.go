@@ -3604,6 +3604,11 @@ func routeErrorStatus(err error) int {
 }
 
 func (h *ProxyHandler) withExplicitRouteOperation(ctx, inbound context.Context, model, endpoint string) (context.Context, *routeOperation, *modelRoute, error) {
+	existing := routeOperationFromContext(ctx)
+	model = strings.TrimSpace(model)
+	if existing == nil && model != "" && !h.modelAllowedForRequest(model, endpoint) {
+		return ctx, nil, nil, modelNotAllowedRequestError(model)
+	}
 	route, known := h.resolveModelRouteForRequest(model, endpoint)
 	if !known || route == nil || route.legacy {
 		return ctx, nil, route, nil
@@ -3614,7 +3619,7 @@ func (h *ProxyHandler) withExplicitRouteOperation(ctx, inbound context.Context, 
 			err:        fmt.Errorf("model %q does not support %s", model, endpoint),
 		}
 	}
-	if existing := routeOperationFromContext(ctx); existing != nil {
+	if existing != nil {
 		if existing.route != route {
 			return ctx, nil, route, fmt.Errorf("route operation for %q cannot execute route %q", existing.route.public.id, route.public.id)
 		}

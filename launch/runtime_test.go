@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -511,6 +512,55 @@ func TestRunDryRunDoesNotStartProxy(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "unresolved: model endpoint compatibility") {
 		t.Fatalf("dry-run did not disclose unresolved catalog metadata: %s", stderr.String())
+	}
+}
+
+func TestFetchSettledStatsWaitsForInflightRequests(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer local-token" {
+			t.Fatalf("Authorization = %q, want local bearer token", got)
+		}
+		call := calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if call < 3 {
+			_, _ = fmt.Fprint(w, `{"inflight":1,"totals":{"requests":0}}`)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"inflight":0,"totals":{"requests":1,"prompt_tokens":7,"completion_tokens":3}}`)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	snapshot, err := fetchSettledStats(ctx, server.URL, "local-token")
+	if err != nil {
+		t.Fatalf("fetchSettledStats() error = %v", err)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("stats calls = %d, want 3", got)
+	}
+	if snapshot.Inflight != 0 || snapshot.Totals.Requests != 1 || snapshot.Totals.PromptTokens != 7 || snapshot.Totals.CompletionTokens != 3 {
+		t.Fatalf("settled snapshot = %+v", snapshot)
+	}
+}
+
+func TestFetchSettledStatsBoundsInflightWait(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"inflight":1,"totals":{"requests":0}}`)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := fetchSettledStats(ctx, server.URL, "local-token")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("fetchSettledStats() error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("settled stats wait took %s, want bounded", elapsed)
 	}
 }
 

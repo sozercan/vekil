@@ -21,6 +21,8 @@ const (
 	defaultChildStopTimeout = 3 * time.Second
 	readyRequestTimeout     = 15 * time.Second
 	modelRequestTimeout     = 15 * time.Second
+	statsSettleTimeout      = 2 * time.Second
+	statsSettlePollInterval = 25 * time.Millisecond
 	maxLauncherResponseBody = 8 << 20
 )
 
@@ -46,6 +48,7 @@ type statsBreakdown struct {
 }
 
 type statsSnapshot struct {
+	Inflight   int64            `json:"inflight"`
 	Totals     statsTotals      `json:"totals"`
 	ByModel    []statsBreakdown `json:"by_model"`
 	ByProvider []statsBreakdown `json:"by_provider"`
@@ -294,9 +297,11 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 	}
 
 	if !opts.NoSummary {
-		if snapshot, err := fetchStats(context.Background(), baseURL, localToken); err == nil {
+		summaryCtx, summaryCancel := context.WithTimeout(context.Background(), statsSettleTimeout)
+		if snapshot, err := fetchSettledStats(summaryCtx, baseURL, localToken); err == nil {
 			printSessionSummary(opts.Stderr, snapshot)
 		}
+		summaryCancel()
 	}
 	return result, nil
 }
@@ -656,6 +661,28 @@ func fetchStats(ctx context.Context, baseURL, localToken string) (statsSnapshot,
 		return statsSnapshot{}, err
 	}
 	return snapshot, nil
+}
+
+func fetchSettledStats(ctx context.Context, baseURL, localToken string) (statsSnapshot, error) {
+	for {
+		snapshot, err := fetchStats(ctx, baseURL, localToken)
+		if err != nil {
+			return statsSnapshot{}, err
+		}
+		if snapshot.Inflight <= 0 {
+			return snapshot, nil
+		}
+
+		timer := time.NewTimer(statsSettlePollInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return statsSnapshot{}, context.Cause(ctx)
+		case <-timer.C:
+		}
+	}
 }
 
 func printSessionSummary(w io.Writer, snapshot statsSnapshot) {
