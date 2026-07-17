@@ -28,6 +28,13 @@ func TestOpenLaunchLogUsesRestrictedWindowsACL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetNamedSecurityInfo() error = %v", err)
 	}
+	control, _, err := descriptor.Control()
+	if err != nil {
+		t.Fatalf("read security descriptor control: %v", err)
+	}
+	if control&windows.SE_DACL_PROTECTED == 0 {
+		t.Fatalf("DACL is not protected: control=%#x", control)
+	}
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
 		t.Fatalf("GetTokenUser() error = %v", err)

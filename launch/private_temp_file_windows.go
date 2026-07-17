@@ -36,6 +36,9 @@ func openPrivateTempFile(path string) (*os.File, error) {
 	if err := descriptor.SetDACL(acl, true, false); err != nil {
 		return nil, err
 	}
+	if err := descriptor.SetControl(windows.SE_DACL_PROTECTED, windows.SE_DACL_PROTECTED); err != nil {
+		return nil, err
+	}
 	securityAttributes := &windows.SecurityAttributes{
 		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
 		SecurityDescriptor: descriptor,
