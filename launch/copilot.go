@@ -243,7 +243,7 @@ func validateCopilotForwardedArgs(args []string) error {
 		return nil
 	}
 	switch positionals[0] {
-	case "completion", "help", "init", "login", "mcp", "plugin", "plugins", "skill", "update", "version":
+	case "completion", "help", "init", "login", "logout", "mcp", "plugin", "plugins", "skill", "update", "version":
 		return fmt.Errorf("copilot command %q is not an agent session", positionals[0])
 	default:
 		return nil
