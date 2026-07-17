@@ -16,6 +16,8 @@ Claude Code and Gemini `countTokens` calls also use the selected model's native 
 
 ## Claude Code
 
+Use [`vekil launch claude`](agent-launchers.md) to start an ephemeral proxy and Claude Code together, or configure an already-running proxy manually:
+
 ```bash
 env ANTHROPIC_BASE_URL=http://localhost:1337 \
   ANTHROPIC_API_KEY=dummy \
@@ -24,6 +26,9 @@ env ANTHROPIC_BASE_URL=http://localhost:1337 \
 
 ## OpenAI Codex CLI
 
+Use [`vekil launch codex`](agent-launchers.md) for an ephemeral supervised
+session, or configure an already-running proxy manually:
+
 ```bash
 env OPENAI_API_KEY=dummy \
   OPENAI_BASE_URL=http://localhost:1337/v1 \
@@ -31,6 +36,9 @@ env OPENAI_API_KEY=dummy \
 ```
 
 ## GitHub Copilot CLI
+
+Use [`vekil launch copilot`](agent-launchers.md) for an ephemeral offline/BYOK
+session, or configure an already-running proxy manually:
 
 ```bash
 env COPILOT_PROVIDER_BASE_URL=http://localhost:1337/v1 \

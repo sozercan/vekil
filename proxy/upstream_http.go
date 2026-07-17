@@ -162,6 +162,9 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 }
 
 func (h *ProxyHandler) resolveProviderRequestForModel(body []byte, endpoint string, model string) (*providerRuntime, providerModel, []byte, error) {
+	if !h.modelAllowedForRequest(model, endpoint) {
+		return nil, providerModel{}, nil, modelNotAllowedRequestError(model)
+	}
 	provider, owner, known := h.resolveProviderModelForRequest(model, endpoint)
 	if provider == nil {
 		return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no provider available for endpoint %s", endpoint)}
@@ -363,7 +366,14 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 }
 
 func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, path string, body []byte, extraHeaders http.Header, model string) (*http.Response, error) {
-	if operation := routeOperationFromContext(ctx); operation != nil && operation.route != nil && !operation.route.legacy {
+	operation := routeOperationFromContext(ctx)
+	if operation == nil {
+		requestedModel := strings.TrimSpace(model)
+		if requestedModel != "" && !h.modelAllowedForRequest(requestedModel, path) {
+			return nil, modelNotAllowedRequestError(requestedModel)
+		}
+	}
+	if operation != nil && operation.route != nil && !operation.route.legacy {
 		route := operation.route
 		requestedModel := strings.TrimSpace(model)
 		if requestedModel == "" {
@@ -458,7 +468,14 @@ func (h *ProxyHandler) postResponsesWithHeadersForModel(ctx context.Context, bod
 
 func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, body []byte, extraHeaders http.Header) (*http.Response, error) {
 	model := extractRequestModel(body)
-	if operation := routeOperationFromContext(ctx); operation != nil && operation.route != nil && !operation.route.legacy {
+	operation := routeOperationFromContext(ctx)
+	if operation == nil {
+		requestedModel := strings.TrimSpace(model)
+		if requestedModel != "" && !h.modelAllowedForRequest(requestedModel, providerEndpointMessages) {
+			return nil, modelNotAllowedRequestError(requestedModel)
+		}
+	}
+	if operation != nil && operation.route != nil && !operation.route.legacy {
 		return h.executeExplicitRouteRequestPath(ctx, operation.route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)
 	}
 	if route, known := h.resolveModelRouteForRequest(model, providerEndpointMessages); known && route != nil && !route.legacy {

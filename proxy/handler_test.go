@@ -4244,6 +4244,47 @@ func TestHandleCompact_FallsBackWhenModelUnsupported(t *testing.T) {
 	}
 }
 
+func TestHandleCompactDoesNotFallbackOutsideAllowedModels(t *testing.T) {
+	responsesRequests := 0
+	modelsRequests := 0
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/responses":
+			responsesRequests++
+			if responsesRequests > 1 {
+				t.Fatalf("unexpected fallback /responses request %d", responsesRequests)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"model selected-model is not supported via Responses API.","code":"unsupported_api_for_model","param":"model","type":"invalid_request_error"}}`))
+		case "/models":
+			modelsRequests++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"other-model","supported_endpoints":["/responses"]}]}`))
+		default:
+			t.Fatalf("unexpected upstream path %q", r.URL.Path)
+		}
+	})
+	handler.allowedModels = map[string]struct{}{"selected-model": {}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"selected-model","input":"Hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	if responsesRequests != 1 {
+		t.Fatalf("responses requests = %d, want 1 unsupported-model attempt", responsesRequests)
+	}
+	if modelsRequests != 1 {
+		t.Fatalf("models requests = %d, want 1 fallback lookup", modelsRequests)
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want original 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestHandleResponses_RewritesSyntheticCompaction(t *testing.T) {
 	summary := "Synthetic compacted summary"
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -8354,6 +8395,147 @@ func TestValidateDynamicProviderModelsLoadsDeferredSingleFilteredProvider(t *tes
 	}
 }
 
+func TestValidateDynamicProviderModelsDetectsAllowedModelCollisionAcrossDynamicProviders(t *testing.T) {
+	var firstHits atomic.Int32
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/models" {
+			t.Fatalf("first provider path = %q, want /models", got)
+		}
+		firstHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"shared","object":"model","owned_by":"first"}]}`))
+	}))
+	defer first.Close()
+
+	var secondHits atomic.Int32
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/models" {
+			t.Fatalf("second provider path = %q, want /models", got)
+		}
+		secondHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"shared","object":"model","owned_by":"second"}]}`))
+	}))
+	defer second.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithAllowedModels("shared"),
+		WithDeferredDynamicProviderModelValidation(true),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:             "first",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        first.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			},
+			{
+				ID:             "second",
+				Type:           "openai-compatible",
+				BaseURL:        second.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			},
+		}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	err = handler.ValidateDynamicProviderModels(context.Background())
+	if err == nil {
+		t.Fatal("ValidateDynamicProviderModels error = nil, want collision")
+	}
+	if !strings.Contains(err.Error(), `model "shared"`) ||
+		!strings.Contains(err.Error(), `provider "first"`) ||
+		!strings.Contains(err.Error(), `provider "second"`) {
+		t.Fatalf("collision error = %v, want model and both provider IDs", err)
+	}
+	if got := firstHits.Load(); got != 1 {
+		t.Fatalf("first provider /models hits = %d, want 1", got)
+	}
+	if got := secondHits.Load(); got != 1 {
+		t.Fatalf("second provider /models hits = %d, want 1", got)
+	}
+	if !handler.DynamicProviderValidationPending() {
+		t.Fatal("failed collision unexpectedly cleared validation pending state")
+	}
+}
+
+func TestValidateDynamicProviderModelsScopesResolvedAllowedModelOwner(t *testing.T) {
+	var firstHits atomic.Int32
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"selected","object":"model","owned_by":"first"},{"id":"first-other","object":"model","owned_by":"first"}]}`))
+	}))
+	defer first.Close()
+
+	var secondHits atomic.Int32
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"second-other","object":"model","owned_by":"second"}]}`))
+	}))
+	defer second.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithAllowedModels("selected"),
+		WithDeferredDynamicProviderModelValidation(true),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:             "first",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        first.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			},
+			{
+				ID:             "second",
+				Type:           "openai-compatible",
+				BaseURL:        second.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			},
+		}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+	if err := handler.ValidateDynamicProviderModels(context.Background()); err != nil {
+		t.Fatalf("ValidateDynamicProviderModels returned error: %v", err)
+	}
+	if got := firstHits.Load(); got != 1 {
+		t.Fatalf("first provider /models hits = %d, want 1", got)
+	}
+	if got := secondHits.Load(); got != 1 {
+		t.Fatalf("second provider /models hits = %d, want 1", got)
+	}
+
+	setup := handler.providerSetup()
+	owner, ok := setup.lookupModel("selected")
+	if !ok || owner.providerID != "first" {
+		t.Fatalf("selected owner = %+v, %v; want first", owner, ok)
+	}
+	for _, disallowed := range []string{"first-other", "second-other"} {
+		if _, ok := setup.lookupModel(disallowed); ok {
+			t.Fatalf("disallowed model %q leaked into scoped model map", disallowed)
+		}
+	}
+	if !handler.providerWithinAllowedModelScope(setup.providerByID("first")) {
+		t.Fatal("resolved owner was excluded from runtime scope")
+	}
+	if handler.providerWithinAllowedModelScope(setup.providerByID("second")) {
+		t.Fatal("non-owner dynamic provider remained in runtime scope")
+	}
+}
+
 func TestNewProxyHandler_FailsWhenOpenAICodexModelCollidesWithAzure(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 	codexHome := t.TempDir()
@@ -9252,6 +9434,59 @@ func TestHandleModels_CanonicalCatalogOwnsRoutingAcrossQueryVariants(t *testing.
 	}
 	if got := fallbackChatHits.Load(); got != 0 {
 		t.Fatalf("fallback chat hits = %d, want 0", got)
+	}
+}
+
+func TestHandleModelsFiltersExplicitRoutesByAllowedModels(t *testing.T) {
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithAllowedModels("selected-model"),
+		WithProvidersConfig(ProvidersConfig{
+			SchemaVersion: ProvidersConfigSchemaVersion2,
+			Providers: []ProviderConfig{{
+				ID:             "local",
+				Type:           string(providerTypeOpenAICompatible),
+				Default:        true,
+				BaseURL:        "http://127.0.0.1:9/v1",
+				AuthType:       "none",
+				ModelDiscovery: string(providerModelDiscoveryStatic),
+			}},
+			ModelRoutes: []ModelRouteConfig{
+				{
+					ID: "selected-route", PublicID: "selected-model", Endpoints: []string{providerEndpointResponses},
+					Targets: []ModelRouteTargetConfig{{ID: "selected", Provider: "local", UpstreamModel: "physical-selected"}},
+				},
+				{
+					ID: "other-route", PublicID: "other-model", Endpoints: []string{providerEndpointResponses},
+					Targets: []ModelRouteTargetConfig{{ID: "other", Provider: "local", UpstreamModel: "physical-other"}},
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	defer h.BeginShutdown()
+
+	w := httptest.NewRecorder()
+	h.HandleModels(w, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("models status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	var catalog struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	if len(catalog.Data) != 1 || catalog.Data[0].ID != "selected-model" {
+		t.Fatalf("scoped model catalog = %+v, want only selected-model", catalog.Data)
 	}
 }
 

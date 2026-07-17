@@ -1753,3 +1753,83 @@ func TestConcurrentStopShortWaiterCannotForceCloseOwnerShutdown(t *testing.T) {
 		t.Fatalf("completed Stop with canceled waiter context = %v, want shared nil result", err)
 	}
 }
+
+func TestDoneReportsNormalShutdown(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := srv.Stop(ctx); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	select {
+	case err := <-srv.Done():
+		if err != nil {
+			t.Fatalf("Done() error = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Done() did not report server completion")
+	}
+}
+
+func TestInboundAuthProtectsLaunchRoutes(t *testing.T) {
+	cfg := proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{{
+		ID:             "local",
+		Type:           "openai-compatible",
+		BaseURL:        "http://127.0.0.1:9/v1",
+		AuthType:       "none",
+		ModelDiscovery: "static",
+		Models: []proxy.ProviderModelConfig{{
+			PublicID:  "test-model",
+			Endpoints: []string{"/chat/completions"},
+		}},
+	}}}
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		"127.0.0.1",
+		"0",
+		WithInboundAuthToken("session-token"),
+		WithProxyOptions(proxy.WithProvidersConfig(cfg)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		path       string
+		headerName string
+		header     string
+		wantStatus int
+	}{
+		{name: "health exempt", path: "/healthz", wantStatus: http.StatusOK},
+		{name: "missing token", path: "/v1/models", wantStatus: http.StatusUnauthorized},
+		{name: "wrong token", path: "/v1/models", headerName: "Authorization", header: "Bearer wrong", wantStatus: http.StatusUnauthorized},
+		{name: "bearer token", path: "/v1/models", headerName: "Authorization", header: "Bearer session-token", wantStatus: http.StatusOK},
+		{name: "anthropic key", path: "/v1/models", headerName: "x-api-key", header: "session-token", wantStatus: http.StatusOK},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			if tc.headerName != "" {
+				req.Header.Set(tc.headerName, tc.header)
+			}
+			recorder := httptest.NewRecorder()
+			srv.httpServer.Handler.ServeHTTP(recorder, req)
+			if recorder.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, tc.wantStatus, recorder.Body.String())
+			}
+		})
+	}
+}

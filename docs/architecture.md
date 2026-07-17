@@ -28,7 +28,8 @@ Chat-compatible ingress converges before provider I/O: public OpenAI Chat, trans
 
 | Package | Responsibility |
 |---------|---------------|
-| `main` | CLI flags, HTTP server setup, graceful shutdown |
+| `main` | CLI dispatch, server setup, shared startup authentication, graceful shutdown |
+| `launch/` | ephemeral proxy supervision, agent adapters, child environment sanitization, and session summaries |
 | `auth/` | GitHub OAuth device code flow, Copilot token exchange, disk caching, auto-refresh |
 | `proxy/` | HTTP handlers, provider routing, Anthropic/OpenAI and Gemini/OpenAI translation, Responses compatibility, optional tool optimizer hooks, SSE streaming, retry logic, and provider-specific request/auth helpers outside GitHub OAuth |
 | `models/` | Request and response type definitions only |

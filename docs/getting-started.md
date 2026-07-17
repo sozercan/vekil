@@ -5,6 +5,10 @@ Vekil commonly runs in one of two modes:
 - **Zero-config mode**: no `--providers-config`; uses the built-in GitHub Copilot upstream.
 - **Explicit provider routing**: pass `--providers-config` to expose any mix of `copilot`, `azure-openai`, `openai-codex`, `openai-compatible`, and `anthropic-compatible` providers behind the same local API surface.
 
+The native binary also supports **managed agent launches**: `vekil launch`
+starts a short-lived proxy and a supported coding agent together, scoped to one
+public model.
+
 ## Install Or Build
 
 Download a binary from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest). Release binaries are published for Linux, macOS, and Windows on `amd64` and `arm64`.
@@ -24,6 +28,38 @@ Build from source:
 go build -o vekil .
 ./vekil
 ```
+
+## Launch A Coding Agent
+
+Use a managed launcher when you want Vekil to configure and supervise the
+client for a single session instead of maintaining client-specific environment
+variables:
+
+```bash
+vekil launch claude --model claude-sonnet-4.5
+vekil launch codex --model gpt-5.4-mini
+vekil launch copilot --model gpt-5.4-mini
+```
+
+For explicit routing, pass the same provider file used by the server:
+
+```bash
+vekil launch codex \
+  --providers-config /path/to/providers.yaml \
+  --model my-responses-model -- \
+  exec --ephemeral "Reply with exactly OK"
+```
+
+The launcher binds an ephemeral loopback proxy, authenticates the child with a
+random session token, restricts requests to the selected model, removes
+upstream credentials from the child environment, and shuts down with the agent.
+Use `--dry-run` to inspect statically known routing while catalog-discovered
+metadata is clearly marked unresolved.
+
+Agent executables are not included in the distroless container image, so this
+workflow is intended for the native Vekil binary. See [Agent
+Launchers](agent-launchers.md) for supported versions, required model endpoints,
+argument forwarding, logs, and process-containment details.
 
 ## Docker
 

@@ -2,11 +2,16 @@ package proxy
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
 
 var benchmarkProviderSetupSink *providerSetup
@@ -117,6 +122,153 @@ func TestLoadProvidersConfigFileAzureV1BaseURLAndModelMetadata(t *testing.T) {
 	}
 	if cfgModel.ContextWindow == nil || *cfgModel.ContextWindow != 400000 {
 		t.Fatalf("context_window = %v, want 400000", cfgModel.ContextWindow)
+	}
+}
+
+func TestResolveStaticProviderModelNormalizesConfiguredMetadata(t *testing.T) {
+	vision := true
+	parallelToolCalls := true
+	contextWindow := int64(200000)
+	cfg := ProvidersConfig{Providers: []ProviderConfig{
+		{
+			ID:             "dynamic",
+			Type:           "openai-compatible",
+			BaseURL:        "https://dynamic.example/v1",
+			ModelDiscovery: "openai",
+			Models: []ProviderModelConfig{{
+				PublicID:   "dynamic-only",
+				Deployment: "upstream-dynamic",
+				Endpoints:  []string{"/responses"},
+			}},
+		},
+		{
+			ID:             "static",
+			Type:           "openai-compatible",
+			BaseURL:        "https://static.example/v1",
+			ModelDiscovery: "static",
+			Models: []ProviderModelConfig{
+				{
+					PublicID:            "default-chat",
+					Name:                "Default Chat",
+					ReasoningEffort:     []string{"low", "high"},
+					Vision:              &vision,
+					ParallelToolCalls:   &parallelToolCalls,
+					ContextWindow:       &contextWindow,
+					ModelPickerCategory: "fast",
+				},
+			},
+		},
+	}}
+
+	got, ok, err := ResolveStaticProviderModel(cfg, "default-chat")
+	if err != nil {
+		t.Fatalf("ResolveStaticProviderModel() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("ResolveStaticProviderModel() found = false, want true")
+	}
+	if got.PublicID != "default-chat" || got.Deployment != "default-chat" || got.Name != "Default Chat" {
+		t.Fatalf("resolved identity = %#v", got)
+	}
+	if !reflect.DeepEqual(got.Endpoints, []string{"/chat/completions"}) {
+		t.Fatalf("resolved endpoints = %v, want [/chat/completions]", got.Endpoints)
+	}
+	if !reflect.DeepEqual(got.ReasoningEffort, []string{"low", "high"}) {
+		t.Fatalf("reasoning_effort = %v", got.ReasoningEffort)
+	}
+	if got.Vision == nil || !*got.Vision || got.ParallelToolCalls == nil || !*got.ParallelToolCalls {
+		t.Fatalf("resolved capability flags = vision %v, parallel_tool_calls %v", got.Vision, got.ParallelToolCalls)
+	}
+	if got.ContextWindow == nil || *got.ContextWindow != contextWindow {
+		t.Fatalf("context_window = %v, want %d", got.ContextWindow, contextWindow)
+	}
+
+	if dynamic, ok, err := ResolveStaticProviderModel(cfg, "dynamic-only"); err != nil || ok {
+		t.Fatalf("dynamic overlay resolution = %#v, found %v, err %v; want unresolved", dynamic, ok, err)
+	}
+}
+
+func TestResolveStaticProviderModelHonorsFiltersAndRejectsCollisions(t *testing.T) {
+	cfg := ProvidersConfig{Providers: []ProviderConfig{
+		{
+			ID:            "excluded",
+			Type:          "anthropic-compatible",
+			ExcludeModels: []string{"shared"},
+			Models: []ProviderModelConfig{{
+				PublicID: "shared",
+			}},
+		},
+		{
+			ID:   "first",
+			Type: "anthropic-compatible",
+			Models: []ProviderModelConfig{{
+				PublicID: "shared",
+			}},
+		},
+		{
+			ID:   "second",
+			Type: "openai-compatible",
+			Models: []ProviderModelConfig{{
+				PublicID: "shared",
+			}},
+		},
+	}}
+
+	_, _, err := ResolveStaticProviderModel(cfg, "shared")
+	if err == nil {
+		t.Fatal("ResolveStaticProviderModel() error = nil, want collision")
+	}
+	if !strings.Contains(err.Error(), `model "shared"`) ||
+		!strings.Contains(err.Error(), `provider "first"`) ||
+		!strings.Contains(err.Error(), `provider "second"`) {
+		t.Fatalf("collision error = %v, want model and both unfiltered providers", err)
+	}
+}
+
+func TestResolveStaticProviderModelResolvesExplicitRouteMetadata(t *testing.T) {
+	parallelToolCalls := true
+	contextWindow := int64(200000)
+	cfg := ProvidersConfig{
+		SchemaVersion: ProvidersConfigSchemaVersion2,
+		Providers: []ProviderConfig{{
+			ID:      "azure",
+			Type:    "azure-openai",
+			BaseURL: "https://x.openai.azure.com/openai/v1",
+			APIKey:  "test-key",
+		}},
+		ModelRoutes: []ModelRouteConfig{{
+			ID:                "route",
+			PublicID:          "public-model",
+			Name:              "Public Model",
+			Endpoints:         []string{"/responses"},
+			ReasoningEffort:   []string{"low", "high"},
+			ParallelToolCalls: &parallelToolCalls,
+			ContextWindow:     &contextWindow,
+			Targets: []ModelRouteTargetConfig{{
+				ID:            "primary",
+				Provider:      "azure",
+				UpstreamModel: "deployment",
+			}},
+		}},
+	}
+
+	got, ok, err := ResolveStaticProviderModel(cfg, "public-model")
+	if err != nil {
+		t.Fatalf("ResolveStaticProviderModel() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("ResolveStaticProviderModel() found = false, want explicit route metadata")
+	}
+	if got.PublicID != "public-model" || got.Name != "Public Model" {
+		t.Fatalf("resolved identity = %#v", got)
+	}
+	if !reflect.DeepEqual(got.Endpoints, []string{"/responses"}) ||
+		!reflect.DeepEqual(got.ReasoningEffort, []string{"low", "high"}) {
+		t.Fatalf("resolved route metadata = %#v", got)
+	}
+	if got.ParallelToolCalls == nil || !*got.ParallelToolCalls ||
+		got.ContextWindow == nil || *got.ContextWindow != contextWindow {
+		t.Fatalf("resolved route capabilities = %#v", got)
 	}
 }
 
@@ -1446,4 +1598,285 @@ func BenchmarkDefaultProviderSetup(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		benchmarkProviderSetupSink = handler.providerSetup()
 	}
+}
+
+func TestAllowedModelsRestrictsCentralModelResolution(t *testing.T) {
+	cfg := ProvidersConfig{Providers: []ProviderConfig{{
+		ID:             "local",
+		Type:           "openai-compatible",
+		BaseURL:        "http://127.0.0.1:9/v1",
+		AuthType:       "none",
+		ModelDiscovery: "static",
+		Models: []ProviderModelConfig{
+			{PublicID: "allowed", Endpoints: []string{"/chat/completions"}},
+			{PublicID: "other", Endpoints: []string{"/chat/completions"}},
+		},
+	}}}
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("allowed"),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	if provider, _, _ := h.resolveProviderModel("allowed", providerEndpointChatCompletions); provider == nil {
+		t.Fatal("allowed model did not resolve")
+	}
+	if provider, _, _ := h.resolveProviderModel("other", providerEndpointChatCompletions); provider != nil {
+		t.Fatal("disallowed model resolved")
+	}
+
+	_, _, _, err = h.resolveProviderRequestForModel(
+		[]byte(`{"model":"other"}`),
+		providerEndpointResponses,
+		"other",
+	)
+	if got := upstreamStatusCode(err, http.StatusInternalServerError); got != http.StatusBadRequest {
+		t.Fatalf("disallowed Responses model status = %d, want %d; err=%v", got, http.StatusBadRequest, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("disallowed Responses model error = %v, want model-not-allowed error", err)
+	}
+
+	_, err = h.resolveChatRoute(context.Background(), "other")
+	if got := upstreamStatusCode(err, http.StatusInternalServerError); got != http.StatusBadRequest {
+		t.Fatalf("disallowed Chat model status = %d, want %d; err=%v", got, http.StatusBadRequest, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("disallowed Chat model error = %v, want model-not-allowed error", err)
+	}
+}
+
+func TestAllowedModelsDoesNotNormalizeKnownDisallowedModel(t *testing.T) {
+	cfg := ProvidersConfig{Providers: []ProviderConfig{
+		{
+			ID:             "raw-owner",
+			Type:           "anthropic-compatible",
+			BaseURL:        "http://127.0.0.1:9/v1",
+			AuthType:       "none",
+			Default:        true,
+			ModelDiscovery: "static",
+			Models: []ProviderModelConfig{{
+				PublicID:  "claude-sonnet-4-5",
+				Endpoints: []string{"/v1/messages"},
+			}},
+		},
+		{
+			ID:             "normalized-owner",
+			Type:           "anthropic-compatible",
+			BaseURL:        "http://127.0.0.1:10/v1",
+			AuthType:       "none",
+			ModelDiscovery: "static",
+			Models: []ProviderModelConfig{{
+				PublicID:  "claude-sonnet-4.5",
+				Endpoints: []string{"/v1/messages"},
+			}},
+		},
+	}}
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("claude-sonnet-4.5"),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	if h.modelAllowedForRequest("claude-sonnet-4-5", providerEndpointMessages) {
+		t.Fatal("known disallowed raw model was accepted as a normalized alias")
+	}
+	_, _, _, err = h.resolveProviderRequestForModel(
+		[]byte(`{"model":"claude-sonnet-4-5"}`),
+		providerEndpointMessages,
+		"claude-sonnet-4-5",
+	)
+	if got := upstreamStatusCode(err, http.StatusInternalServerError); got != http.StatusBadRequest {
+		t.Fatalf("known disallowed raw model status = %d, want %d; err=%v", got, http.StatusBadRequest, err)
+	}
+}
+
+func TestModelUsesCopilotFollowsSelectedStaticOwner(t *testing.T) {
+	cfg := ProvidersConfig{Providers: []ProviderConfig{
+		{
+			ID:             "local-static",
+			Type:           "openai-compatible",
+			BaseURL:        "http://127.0.0.1:9/v1",
+			AuthType:       "none",
+			Default:        true,
+			ModelDiscovery: "static",
+			Models: []ProviderModelConfig{{
+				PublicID:  "local-model",
+				Endpoints: []string{"/responses"},
+			}},
+		},
+		{
+			ID:            "copilot",
+			Type:          "copilot",
+			IncludeModels: []string{"copilot-model"},
+		},
+	}}
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("local-model"),
+		WithDeferredDynamicProviderModelValidation(true),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	if h.ModelUsesCopilot("local-model") {
+		t.Fatal("static non-Copilot model unexpectedly requires Copilot authentication")
+	}
+	if !h.ModelUsesCopilot("copilot-model") {
+		t.Fatal("static Copilot model did not require Copilot authentication")
+	}
+	setup := h.providerSetup()
+	if !h.providerWithinAllowedModelScope(setup.providerByID("local-static")) {
+		t.Fatal("selected static provider was excluded from launcher model scope")
+	}
+	if h.providerWithinAllowedModelScope(setup.providerByID("copilot")) {
+		t.Fatal("unselected Copilot provider remained in launcher model scope")
+	}
+	if h.ModelUsesCopilot("unknown-model") {
+		t.Fatal("unknown model did not follow the non-Copilot default provider")
+	}
+
+	defaultHandler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler(default) error = %v", err)
+	}
+	if !defaultHandler.ModelUsesCopilot("any-model") {
+		t.Fatal("zero-config model did not require Copilot authentication")
+	}
+}
+
+func TestModelUsesCopilotHonorsProviderFiltersDuringDeferredDiscovery(t *testing.T) {
+	t.Run("filtered default Copilot provider is skipped", func(t *testing.T) {
+		cfg := ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:            "copilot",
+				Type:          "copilot",
+				Default:       true,
+				IncludeModels: []string{"copilot-only"},
+			},
+			{
+				ID:             "dynamic",
+				Type:           "openai-compatible",
+				BaseURL:        "http://127.0.0.1:9/v1",
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			},
+		}}
+		h, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.NewWithWriter(logger.LevelError, io.Discard),
+			WithProvidersConfig(cfg),
+			WithAllowedModels("dynamic-model"),
+			WithDeferredDynamicProviderModelValidation(true),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler() error = %v", err)
+		}
+		if h.ModelUsesCopilot("dynamic-model") {
+			t.Fatal("filtered default Copilot provider unexpectedly required authentication")
+		}
+		if !h.ModelUsesCopilot("copilot-only") {
+			t.Fatal("explicitly included Copilot model did not require authentication")
+		}
+	})
+
+	t.Run("unrestricted Copilot collision candidate requires authentication", func(t *testing.T) {
+		cfg := ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:             "local-static",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        "http://127.0.0.1:9/v1",
+				AuthType:       "none",
+				ModelDiscovery: "static",
+				Models: []ProviderModelConfig{{
+					PublicID: "shared-model",
+					Endpoints: []string{
+						"/responses",
+					},
+				}},
+			},
+			{ID: "copilot", Type: "copilot"},
+		}}
+		h, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.NewWithWriter(logger.LevelError, io.Discard),
+			WithProvidersConfig(cfg),
+			WithAllowedModels("shared-model"),
+			WithDeferredDynamicProviderModelValidation(true),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler() error = %v", err)
+		}
+		if !h.ModelUsesCopilot("shared-model") {
+			t.Fatal("unrestricted Copilot collision candidate did not require authentication")
+		}
+	})
+
+	t.Run("explicit route scopes readiness to its target", func(t *testing.T) {
+		cfg := ProvidersConfig{
+			SchemaVersion: ProvidersConfigSchemaVersion2,
+			Providers: []ProviderConfig{
+				{
+					ID:      "azure",
+					Type:    "azure-openai",
+					Default: true,
+					BaseURL: "https://x.openai.azure.com/openai/v1",
+					APIKey:  "test-key",
+				},
+				{
+					ID:             "unrelated",
+					Type:           "openai-compatible",
+					BaseURL:        "http://127.0.0.1:9/v1",
+					AuthType:       "none",
+					ModelDiscovery: "static",
+					Models: []ProviderModelConfig{{
+						PublicID:  "other-model",
+						Endpoints: []string{"/responses"},
+					}},
+				},
+			},
+			ModelRoutes: []ModelRouteConfig{{
+				ID:        "route",
+				PublicID:  "public-model",
+				Endpoints: []string{"/responses"},
+				Targets: []ModelRouteTargetConfig{{
+					ID:            "primary",
+					Provider:      "azure",
+					UpstreamModel: "physical-model",
+				}},
+			}},
+		}
+		h, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.NewWithWriter(logger.LevelError, io.Discard),
+			WithProvidersConfig(cfg),
+			WithAllowedModels("public-model"),
+			WithDeferredDynamicProviderModelValidation(true),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler() error = %v", err)
+		}
+		if h.ModelUsesCopilot("public-model") {
+			t.Fatal("non-Copilot explicit route unexpectedly required Copilot authentication")
+		}
+		setup := h.providerSetup()
+		if !h.providerWithinAllowedModelScope(setup.providerByID("azure")) {
+			t.Fatal("explicit route target was excluded from launcher readiness scope")
+		}
+		if h.providerWithinAllowedModelScope(setup.providerByID("unrelated")) {
+			t.Fatal("unrelated provider remained in launcher readiness scope")
+		}
+	})
 }

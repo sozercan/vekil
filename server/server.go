@@ -3,8 +3,10 @@ package server
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -28,16 +30,26 @@ type Server struct {
 	stopMu       sync.Mutex
 	stopDone     chan struct{}
 	stopErr      error
+	serveDone    chan error
 }
 
 type options struct {
-	proxyOptions []proxy.Option
+	proxyOptions     []proxy.Option
+	inboundAuthToken string
 }
 
 type serverConnContextKey struct{}
 
 // Option customizes server creation.
 type Option func(*options)
+
+// WithInboundAuthToken requires this bearer or x-api-key token on every route
+// except health and readiness probes. Empty keeps the public server behavior.
+func WithInboundAuthToken(token string) Option {
+	return func(o *options) {
+		o.inboundAuthToken = strings.TrimSpace(token)
+	}
+}
 
 // WithProxyOptions forwards proxy-level options to the underlying handler.
 func WithProxyOptions(opts ...proxy.Option) Option {
@@ -130,6 +142,34 @@ func (r *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 func (r *responseRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
+}
+
+func withInboundAuth(next http.Handler, token string) http.Handler {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		provided := strings.TrimSpace(r.Header.Get("x-api-key"))
+		if provided == "" {
+			authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+			if len(authorization) > len("Bearer ") && strings.EqualFold(authorization[:len("Bearer ")], "Bearer ") {
+				provided = strings.TrimSpace(authorization[len("Bearer "):])
+			}
+		}
+		if len(provided) != len(token) || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":{"message":"unauthorized"}}`)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func withProviderValidationGate(next http.Handler, handler *proxy.ProxyHandler) http.Handler {
@@ -263,10 +303,12 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /favicon.ico", handler.HandleFavicon)
 
 	addr := fmt.Sprintf("%s:%s", host, port)
+	httpHandler := withRequestLog(withProviderValidationGate(mux, handler), log, handler)
+	httpHandler = withInboundAuth(httpHandler, cfg.inboundAuthToken)
 	return &Server{
 		httpServer: &http.Server{
 			Addr:         addr,
-			Handler:      withRequestLog(withProviderValidationGate(mux, handler), log, handler),
+			Handler:      httpHandler,
 			ReadTimeout:  30 * time.Second,
 			WriteTimeout: handler.ServerWriteTimeout(),
 			IdleTimeout:  120 * time.Second,
@@ -277,6 +319,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 		proxyHandler: handler,
 		log:          log,
 		dynamicAddr:  strings.TrimSpace(port) == "0",
+		serveDone:    make(chan error, 1),
 	}, nil
 }
 
@@ -295,12 +338,33 @@ func (s *Server) Start() error {
 
 	go func() {
 		defer s.running.Store(false)
-		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+		err := s.httpServer.Serve(ln)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		if err != nil {
 			s.log.Error("server error", logger.Err(err))
 		}
+		s.serveDone <- err
+		close(s.serveDone)
 	}()
 
 	return nil
+}
+
+// Done reports the terminal Serve result. It yields nil after a normal
+// shutdown and a non-nil error when the listener stops unexpectedly.
+func (s *Server) Done() <-chan error {
+	if s == nil {
+		return nil
+	}
+	return s.serveDone
+}
+
+// ModelUsesCopilot reports whether launcher startup needs Copilot authentication
+// to resolve or collision-check model.
+func (s *Server) ModelUsesCopilot(model string) bool {
+	return s != nil && s.proxyHandler != nil && s.proxyHandler.ModelUsesCopilot(model)
 }
 
 // SetStartupAuthenticationPending gates non-health routes while startup auth is in progress.

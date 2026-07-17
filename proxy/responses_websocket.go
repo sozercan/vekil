@@ -1148,6 +1148,10 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 	if h == nil {
 		return ctx, nil, nil, fmt.Errorf("proxy handler is required")
 	}
+	model = strings.TrimSpace(model)
+	if model != "" && !h.modelAllowedForRequest(model, providerEndpointResponses) {
+		return ctx, nil, nil, modelNotAllowedRequestError(model)
+	}
 
 	resolved, known := h.resolveModelRouteForRequest(model, providerEndpointResponses)
 	if s != nil && s.explicitRouteID != "" {
