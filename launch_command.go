@@ -131,7 +131,7 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	proxyLog := fs.String("proxy-log", "", fmt.Sprintf("Proxy JSON log path (default: ~/.config/vekil/logs/launch-%s-*.jsonl)", target.name))
 	startupTimeout := fs.Duration("startup-timeout", getEnvDuration("LAUNCH_STARTUP_TIMEOUT", 2*time.Minute), "Maximum time to authenticate and become ready")
 	streamingTimeout := fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
-	dryRun := fs.Bool("dry-run", false, "Print the resolved child-process plan without starting a proxy")
+	dryRun := fs.Bool("dry-run", false, "Print the child-process plan without starting a proxy; dynamic model metadata remains unresolved")
 	noSummary := fs.Bool("no-summary", false, "Do not print an end-of-session usage summary")
 
 	if err := fs.Parse(args); err != nil {
@@ -215,6 +215,15 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		NoSummary:      opts.noSummary,
 	}
 	if opts.dryRun {
+		configuredModel, found, resolveErr := proxy.ResolveStaticProviderModel(providersCfg, opts.model)
+		if resolveErr != nil {
+			_, _ = fmt.Fprintf(stderr, "error: resolve dry-run model metadata: %v\n", resolveErr)
+			return 1
+		}
+		if found {
+			model := launchModelInfoFromProviderConfig(configuredModel)
+			launchOpts.DryRunModel = &model
+		}
 		result, runErr := launch.Run(context.Background(), nil, target.adapter, launchOpts)
 		if runErr != nil {
 			if errors.Is(runErr, launch.ErrBinaryNotFound) {
@@ -282,6 +291,32 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		return 1
 	}
 	return result.ExitCode
+}
+
+func launchModelInfoFromProviderConfig(cfg proxy.ProviderModelConfig) launch.ModelInfo {
+	model := launch.ModelInfo{
+		ID:                 strings.TrimSpace(cfg.PublicID),
+		Name:               strings.TrimSpace(cfg.Name),
+		SupportedEndpoints: append([]string(nil), cfg.Endpoints...),
+		Capabilities: launch.ModelCapabilities{
+			Supports: launch.ModelCapabilitySupports{
+				ReasoningEffort: append([]string(nil), cfg.ReasoningEffort...),
+			},
+		},
+	}
+	if model.Name == "" {
+		model.Name = model.ID
+	}
+	if cfg.ContextWindow != nil {
+		model.Capabilities.Limits.MaxContextWindowTokens = *cfg.ContextWindow
+	}
+	if cfg.ParallelToolCalls != nil {
+		model.Capabilities.Supports.ParallelToolCalls = *cfg.ParallelToolCalls
+	}
+	if cfg.Vision != nil {
+		model.Capabilities.Supports.Vision = *cfg.Vision
+	}
+	return model
 }
 
 type agentLaunchProxy struct {

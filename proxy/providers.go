@@ -245,6 +245,96 @@ func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
 	return cfg, nil
 }
 
+// ResolveStaticProviderModel returns normalized metadata for an explicitly
+// configured static model without contacting an upstream provider. Dynamic
+// catalog entries are intentionally unresolved until provider discovery runs.
+func ResolveStaticProviderModel(cfg ProvidersConfig, modelID string) (ProviderModelConfig, bool, error) {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return ProviderModelConfig{}, false, nil
+	}
+
+	var resolved ProviderModelConfig
+	resolvedProviderID := ""
+	for _, providerCfg := range cfg.Providers {
+		providerID := strings.TrimSpace(providerCfg.ID)
+		if providerID == "" {
+			return ProviderModelConfig{}, false, fmt.Errorf("provider id is required")
+		}
+		kind := providerType(strings.TrimSpace(providerCfg.Type))
+		switch kind {
+		case providerTypeAzureOpenAI, providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+		case providerTypeCopilot, providerTypeOpenAICodex:
+			// These providers are catalog-driven; their Models fields are not
+			// part of the configured static model table.
+			continue
+		default:
+			return ProviderModelConfig{}, false, fmt.Errorf("provider %q has unsupported type %q", providerID, providerCfg.Type)
+		}
+		if !configuredProviderAllowsModel(providerCfg, modelID) {
+			continue
+		}
+
+		matchedProvider := false
+		for _, rawModel := range providerCfg.Models {
+			if strings.TrimSpace(rawModel.PublicID) != modelID {
+				continue
+			}
+			if matchedProvider {
+				return ProviderModelConfig{}, false, fmt.Errorf("provider %q configures model %q more than once", providerID, modelID)
+			}
+			matchedProvider = true
+
+			model, err := buildStaticProviderModel(
+				providerID,
+				rawModel,
+				providerEndpointPolicyFor(kind).defaultStaticEndpoints(),
+			)
+			if err != nil {
+				return ProviderModelConfig{}, false, err
+			}
+			if resolvedProviderID != "" {
+				return ProviderModelConfig{}, false, providerModelCollisionError(modelID, resolvedProviderID, providerID)
+			}
+
+			resolved = normalizeProviderModelConfig(rawModel)
+			resolved.PublicID = model.publicID
+			resolved.Deployment = model.upstreamModel
+			if resolved.Name == "" {
+				resolved.Name = model.publicID
+			}
+			resolved.Endpoints = append([]string(nil), model.supportedEndpoints...)
+			resolvedProviderID = providerID
+		}
+	}
+
+	return resolved, resolvedProviderID != "", nil
+}
+
+func configuredProviderAllowsModel(cfg ProviderConfig, model string) bool {
+	hasIncludes := false
+	included := false
+	for _, candidate := range cfg.IncludeModels {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		hasIncludes = true
+		if candidate == model {
+			included = true
+		}
+	}
+	if hasIncludes && !included {
+		return false
+	}
+	for _, candidate := range cfg.ExcludeModels {
+		if strings.TrimSpace(candidate) == model {
+			return false
+		}
+	}
+	return true
+}
+
 func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) error {
 	if len(bytes.TrimSpace(body)) == 0 {
 		return fmt.Errorf("providers config %q is empty", path)
@@ -508,7 +598,7 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 
 	for _, providerID := range setup.providerOrder {
 		provider := setup.providerByID(providerID)
-		if !h.providerWithinAllowedModelScope(provider) || !providerUsesDynamicModels(provider) {
+		if !h.providerMayExposeAllowedModel(provider) || !providerUsesDynamicModels(provider) {
 			continue
 		}
 
@@ -516,7 +606,7 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 		if err != nil {
 			return fmt.Errorf("load models for provider %q: %w", provider.id, err)
 		}
-		if err := setup.replaceProviderModels(providerID, result.models); err != nil {
+		if err := setup.replaceProviderModels(providerID, h.filterAllowedModels(result.models)); err != nil {
 			return err
 		}
 	}
@@ -524,6 +614,25 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 	h.dynamicProviderValidationPending.Store(false)
 	h.validateInsightModel()
 	return nil
+}
+
+// providerMayExposeAllowedModel reports whether provider must participate in
+// allowed-model discovery. Unlike providerWithinAllowedModelScope, it ignores
+// current ownership so every dynamic candidate is checked for collisions
+// before the selected model is trusted.
+func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) bool {
+	if provider == nil {
+		return false
+	}
+	if len(h.allowedModels) == 0 {
+		return true
+	}
+	for model := range h.allowedModels {
+		if providerCanExposeModel(provider, model) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime) bool {
@@ -541,17 +650,21 @@ func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime
 			}
 			continue
 		}
-		if _, ok := provider.staticConfigs[model]; ok {
-			return true
-		}
-		if _, ok := provider.includeModels[model]; ok {
-			return true
-		}
-		if providerUsesDynamicModels(provider) && provider.allowsModel(model) {
+		if providerCanExposeModel(provider, model) {
 			return true
 		}
 	}
 	return false
+}
+
+func providerCanExposeModel(provider *providerRuntime, model string) bool {
+	if provider == nil || !provider.allowsModel(model) {
+		return false
+	}
+	if _, ok := provider.staticConfigs[model]; ok {
+		return true
+	}
+	return providerUsesDynamicModels(provider)
 }
 
 func (h *ProxyHandler) filterAllowedModels(models []providerModel) []providerModel {

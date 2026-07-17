@@ -157,14 +157,40 @@ func TestCodexAdapterRejectsIncompatibleModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = (CodexAdapter{}).Prepare(PrepareInput{
+	for _, dryRun := range []bool{false, true} {
+		_, err = (CodexAdapter{}).Prepare(PrepareInput{
+			BaseURL:    "http://127.0.0.1:43210",
+			Model:      ModelInfo{ID: "chat-only", SupportedEndpoints: []string{"/chat/completions"}},
+			Binary:     binary,
+			LocalToken: "token",
+			DryRun:     dryRun,
+		})
+		if err == nil || !strings.Contains(err.Error(), "expected /responses") {
+			t.Fatalf("Prepare(dryRun=%v) error = %v, want Responses compatibility error", dryRun, err)
+		}
+	}
+}
+
+func TestCodexAdapterDryRunMarksUnknownEndpointCompatibilityUnresolved(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := (CodexAdapter{}).Prepare(PrepareInput{
 		BaseURL:    "http://127.0.0.1:43210",
-		Model:      ModelInfo{ID: "chat-only", SupportedEndpoints: []string{"/chat/completions"}},
+		Model:      ModelInfo{ID: "catalog-model"},
 		Binary:     binary,
 		LocalToken: "token",
+		DryRun:     true,
 	})
-	if err == nil || !strings.Contains(err.Error(), "expected /responses") {
-		t.Fatalf("Prepare() error = %v, want Responses compatibility error", err)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if prepared.Cleanup != nil {
+		defer func() { _ = prepared.Cleanup() }()
+	}
+	if got := strings.Join(prepared.Unresolved, "\n"); !strings.Contains(got, "/responses") {
+		t.Fatalf("unresolved metadata = %q, want Responses compatibility disclosure", got)
 	}
 }
 

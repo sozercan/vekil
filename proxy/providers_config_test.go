@@ -125,6 +125,101 @@ func TestLoadProvidersConfigFileAzureV1BaseURLAndModelMetadata(t *testing.T) {
 	}
 }
 
+func TestResolveStaticProviderModelNormalizesConfiguredMetadata(t *testing.T) {
+	vision := true
+	parallelToolCalls := true
+	contextWindow := int64(200000)
+	cfg := ProvidersConfig{Providers: []ProviderConfig{
+		{
+			ID:             "dynamic",
+			Type:           "openai-compatible",
+			BaseURL:        "https://dynamic.example/v1",
+			ModelDiscovery: "openai",
+		},
+		{
+			ID:             "static",
+			Type:           "openai-compatible",
+			BaseURL:        "https://static.example/v1",
+			ModelDiscovery: "static",
+			Models: []ProviderModelConfig{
+				{
+					PublicID:            "default-chat",
+					Name:                "Default Chat",
+					ReasoningEffort:     []string{"low", "high"},
+					Vision:              &vision,
+					ParallelToolCalls:   &parallelToolCalls,
+					ContextWindow:       &contextWindow,
+					ModelPickerCategory: "fast",
+				},
+			},
+		},
+	}}
+
+	got, ok, err := ResolveStaticProviderModel(cfg, "default-chat")
+	if err != nil {
+		t.Fatalf("ResolveStaticProviderModel() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("ResolveStaticProviderModel() found = false, want true")
+	}
+	if got.PublicID != "default-chat" || got.Deployment != "default-chat" || got.Name != "Default Chat" {
+		t.Fatalf("resolved identity = %#v", got)
+	}
+	if !reflect.DeepEqual(got.Endpoints, []string{"/chat/completions"}) {
+		t.Fatalf("resolved endpoints = %v, want [/chat/completions]", got.Endpoints)
+	}
+	if !reflect.DeepEqual(got.ReasoningEffort, []string{"low", "high"}) {
+		t.Fatalf("reasoning_effort = %v", got.ReasoningEffort)
+	}
+	if got.Vision == nil || !*got.Vision || got.ParallelToolCalls == nil || !*got.ParallelToolCalls {
+		t.Fatalf("resolved capability flags = vision %v, parallel_tool_calls %v", got.Vision, got.ParallelToolCalls)
+	}
+	if got.ContextWindow == nil || *got.ContextWindow != contextWindow {
+		t.Fatalf("context_window = %v, want %d", got.ContextWindow, contextWindow)
+	}
+
+	if _, ok, err := ResolveStaticProviderModel(cfg, "dynamic-only"); err != nil || ok {
+		t.Fatalf("dynamic-only resolution = found %v, err %v; want unresolved", ok, err)
+	}
+}
+
+func TestResolveStaticProviderModelHonorsFiltersAndRejectsCollisions(t *testing.T) {
+	cfg := ProvidersConfig{Providers: []ProviderConfig{
+		{
+			ID:            "excluded",
+			Type:          "anthropic-compatible",
+			ExcludeModels: []string{"shared"},
+			Models: []ProviderModelConfig{{
+				PublicID: "shared",
+			}},
+		},
+		{
+			ID:   "first",
+			Type: "anthropic-compatible",
+			Models: []ProviderModelConfig{{
+				PublicID: "shared",
+			}},
+		},
+		{
+			ID:   "second",
+			Type: "openai-compatible",
+			Models: []ProviderModelConfig{{
+				PublicID: "shared",
+			}},
+		},
+	}}
+
+	_, _, err := ResolveStaticProviderModel(cfg, "shared")
+	if err == nil {
+		t.Fatal("ResolveStaticProviderModel() error = nil, want collision")
+	}
+	if !strings.Contains(err.Error(), `model "shared"`) ||
+		!strings.Contains(err.Error(), `provider "first"`) ||
+		!strings.Contains(err.Error(), `provider "second"`) {
+		t.Fatalf("collision error = %v, want model and both unfiltered providers", err)
+	}
+}
+
 func TestLoadProvidersConfigFileYAML(t *testing.T) {
 	t.Parallel()
 

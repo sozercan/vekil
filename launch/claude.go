@@ -17,7 +17,8 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	if model == "" {
 		return PreparedProcess{}, fmt.Errorf("claude launch requires a model")
 	}
-	if !input.DryRun &&
+	endpointMetadataKnown := !input.DryRun || input.Model.SupportedEndpoints != nil
+	if endpointMetadataKnown &&
 		!modelSupportsEndpoint(input.Model, "/v1/messages") &&
 		!modelSupportsEndpoint(input.Model, "/chat/completions") &&
 		!modelSupportsEndpoint(input.Model, "/responses") {
@@ -136,13 +137,19 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	args = append(args, "--settings", settingsPath)
 	args = append(args, input.ForwardedArgs...)
 
-	return PreparedProcess{
+	prepared := PreparedProcess{
 		Path:     executable.path,
 		Args:     args,
 		EnvSet:   envSet,
 		EnvUnset: envUnset,
 		Cleanup:  cleanup,
-	}, nil
+	}
+	if !endpointMetadataKnown {
+		prepared.Unresolved = append(prepared.Unresolved,
+			"model endpoint compatibility (/v1/messages, /chat/completions, or /responses) requires live /v1/models metadata",
+		)
+	}
+	return prepared, nil
 }
 
 func validateClaudeVersion(executable resolvedExecutable, environment []string) error {

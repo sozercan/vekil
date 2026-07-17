@@ -67,12 +67,18 @@ Every launcher:
 | `--startup-timeout DURATION` | Maximum startup/authentication/readiness time. |
 | `--streaming-upstream-timeout DURATION` | Upstream streaming timeout. |
 | `--proxy-log PATH` | New JSON proxy log path; existing files and links are rejected. |
-| `--dry-run` | Print the resolved child-process plan without starting a proxy or agent. |
+| `--dry-run` | Print the child-process plan without starting a proxy or agent. Static model metadata is resolved; catalog-only metadata is marked unresolved. |
 | `--no-summary` | Suppress the end-of-session request/token summary. |
 
 ```bash
 vekil launch codex --model gpt-5.4-mini --dry-run
 ```
+
+Dry-run never contacts provider model catalogs. When `--model` is declared in
+the providers file, Vekil uses its configured endpoint and capability metadata
+and rejects an incompatible target exactly as a real launch would. For
+catalog-discovered models, endpoint compatibility and endpoint-dependent child
+settings are printed as `unresolved` instead of being guessed.
 
 ## Claude Code
 

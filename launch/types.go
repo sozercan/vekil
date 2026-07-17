@@ -59,11 +59,12 @@ type PrepareInput struct {
 // applied over a sanitized copy of the parent environment immediately before
 // the child is started.
 type PreparedProcess struct {
-	Path     string
-	Args     []string
-	EnvSet   map[string]string
-	EnvUnset []string
-	Cleanup  func() error
+	Path       string
+	Args       []string
+	EnvSet     map[string]string
+	EnvUnset   []string
+	Unresolved []string
+	Cleanup    func() error
 }
 
 // Adapter prepares one supported agent CLI for a Vekil-backed launch.
@@ -98,6 +99,7 @@ type Options struct {
 	Stderr           io.Writer
 	LogPath          string
 	DryRunBaseURL    string
+	DryRunModel      *ModelInfo
 	Signals          <-chan os.Signal
 	DryRun           bool
 	NoSummary        bool

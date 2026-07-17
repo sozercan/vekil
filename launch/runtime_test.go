@@ -509,6 +509,9 @@ func TestRunDryRunDoesNotStartProxy(t *testing.T) {
 	if !strings.Contains(stderr.String(), "set:    ANTHROPIC_AUTH_TOKEN=[local placeholder]") {
 		t.Fatalf("dry-run did not redact the local Claude auth token: %s", stderr.String())
 	}
+	if !strings.Contains(stderr.String(), "unresolved: model endpoint compatibility") {
+		t.Fatalf("dry-run did not disclose unresolved catalog metadata: %s", stderr.String())
+	}
 }
 
 func TestRunRejectsUnknownModelAndStopsProxy(t *testing.T) {

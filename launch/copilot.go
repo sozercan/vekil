@@ -37,7 +37,8 @@ func (CopilotAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	if model == "" {
 		return PreparedProcess{}, fmt.Errorf("copilot launch requires a model")
 	}
-	wireAPI, err := copilotWireAPI(input.Model, input.DryRun)
+	endpointMetadataKnown := !input.DryRun || input.Model.SupportedEndpoints != nil
+	wireAPI, err := copilotWireAPI(input.Model, endpointMetadataKnown)
 	if err != nil {
 		return PreparedProcess{}, err
 	}
@@ -82,8 +83,10 @@ func (CopilotAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		"COPILOT_PROVIDER_MODEL_ID":     modelID,
 		"COPILOT_PROVIDER_TRANSPORT":    "http",
 		"COPILOT_PROVIDER_TYPE":         "openai",
-		"COPILOT_PROVIDER_WIRE_API":     wireAPI,
 		"COPILOT_PROVIDER_WIRE_MODEL":   model,
+	}
+	if wireAPI != "" {
+		envSet["COPILOT_PROVIDER_WIRE_API"] = wireAPI
 	}
 	if value := input.Model.Capabilities.Limits.MaxPromptTokens; value > 0 {
 		envSet["COPILOT_PROVIDER_MAX_PROMPT_TOKENS"] = strconv.FormatInt(value, 10)
@@ -114,12 +117,18 @@ func (CopilotAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		"--secret-env-vars="+strings.Join(secretNames, ","),
 	)
 	args = append(args, forwardedArgs...)
-	return PreparedProcess{
+	prepared := PreparedProcess{
 		Path:     executable.path,
 		Args:     args,
 		EnvSet:   envSet,
 		EnvUnset: envUnset,
-	}, nil
+	}
+	if !endpointMetadataKnown {
+		prepared.Unresolved = append(prepared.Unresolved,
+			"COPILOT_PROVIDER_WIRE_API and model endpoint compatibility require live /v1/models metadata",
+		)
+	}
+	return prepared, nil
 }
 
 func prepareCopilotForwardedArgs(args []string) ([]string, []string, error) {
@@ -170,15 +179,15 @@ func parseCopilotSecretEnvironmentNames(value string) ([]string, error) {
 	return parts, nil
 }
 
-func copilotWireAPI(model ModelInfo, dryRun bool) (string, error) {
+func copilotWireAPI(model ModelInfo, endpointMetadataKnown bool) (string, error) {
 	if modelSupportsEndpoint(model, "/responses") {
 		return "responses", nil
 	}
 	if modelSupportsEndpoint(model, "/chat/completions") {
 		return "completions", nil
 	}
-	if dryRun {
-		return "responses", nil
+	if !endpointMetadataKnown {
+		return "", nil
 	}
 	return "", fmt.Errorf(
 		"model %q is not GitHub Copilot CLI-compatible: expected /responses or /chat/completions support",

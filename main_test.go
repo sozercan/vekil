@@ -663,8 +663,76 @@ func TestRunLaunchCommandDispatchesSupportedTargets(t *testing.T) {
 			if !strings.Contains(stderr.String(), "agent:  "+target) {
 				t.Fatalf("dry-run did not dispatch %s: %s", target, stderr.String())
 			}
+			if !strings.Contains(stderr.String(), "unresolved:") {
+				t.Fatalf("catalog-only dry-run did not mark endpoint metadata unresolved for %s: %s", target, stderr.String())
+			}
+			if target == "copilot" && strings.Contains(stderr.String(), "COPILOT_PROVIDER_WIRE_API=") {
+				t.Fatalf("Copilot dry-run guessed a wire API without model metadata: %s", stderr.String())
+			}
 		})
 	}
+}
+
+func TestRunLaunchCommandDryRunUsesConfiguredStaticModelMetadata(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	providersPath := filepath.Join(t.TempDir(), "providers.json")
+	if err := os.WriteFile(providersPath, []byte(`{
+  "providers": [{
+    "id": "local",
+    "type": "openai-compatible",
+    "default": true,
+    "base_url": "http://127.0.0.1:9/v1",
+    "auth_type": "none",
+    "model_discovery": "static",
+    "models": [{
+      "public_id": "chat-only",
+      "name": "Chat Only",
+      "endpoints": ["/chat/completions"]
+    }]
+  }]
+}`), 0o600); err != nil {
+		t.Fatalf("write providers config: %v", err)
+	}
+
+	t.Run("Copilot resolves completions wire API", func(t *testing.T) {
+		var stderr bytes.Buffer
+		code := runLaunchCommand([]string{
+			"copilot",
+			"--providers-config", providersPath,
+			"--model", "chat-only",
+			"--binary", binary,
+			"--dry-run",
+		}, &stderr)
+		if code != 0 {
+			t.Fatalf("runLaunchCommand() code = %d; stderr=%s", code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "COPILOT_PROVIDER_WIRE_API=completions") {
+			t.Fatalf("dry-run did not resolve configured chat endpoint: %s", stderr.String())
+		}
+		if strings.Contains(stderr.String(), "unresolved:") {
+			t.Fatalf("static model metadata was reported unresolved: %s", stderr.String())
+		}
+	})
+
+	t.Run("Codex rejects configured incompatible endpoint", func(t *testing.T) {
+		var stderr bytes.Buffer
+		code := runLaunchCommand([]string{
+			"codex",
+			"--providers-config", providersPath,
+			"--model", "chat-only",
+			"--binary", binary,
+			"--dry-run",
+		}, &stderr)
+		if code != 1 {
+			t.Fatalf("runLaunchCommand() code = %d, want 1; stderr=%s", code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "not Codex-compatible") {
+			t.Fatalf("dry-run did not reject configured incompatible endpoint: %s", stderr.String())
+		}
+	})
 }
 
 func TestNewLaunchTokenIsRandomAndHighEntropy(t *testing.T) {

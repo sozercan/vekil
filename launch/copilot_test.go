@@ -98,6 +98,29 @@ func TestCopilotAdapterSelectsChatCompletions(t *testing.T) {
 	}
 }
 
+func TestCopilotAdapterDryRunLeavesUnknownWireAPIUnresolved(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := (CopilotAdapter{}).Prepare(PrepareInput{
+		BaseURL:    "http://127.0.0.1:43210",
+		Model:      ModelInfo{ID: "catalog-model"},
+		Binary:     binary,
+		LocalToken: "token",
+		DryRun:     true,
+	})
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if _, ok := prepared.EnvSet["COPILOT_PROVIDER_WIRE_API"]; ok {
+		t.Fatalf("unknown model metadata produced a wire API: %#v", prepared.EnvSet)
+	}
+	if got := strings.Join(prepared.Unresolved, "\n"); !strings.Contains(got, "COPILOT_PROVIDER_WIRE_API") {
+		t.Fatalf("unresolved metadata = %q, want wire API disclosure", got)
+	}
+}
+
 func TestCopilotAdapterPrefersResponses(t *testing.T) {
 	got, err := copilotWireAPI(ModelInfo{
 		ID:                 "both",
@@ -113,14 +136,17 @@ func TestCopilotAdapterRejectsIncompatibleModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = (CopilotAdapter{}).Prepare(PrepareInput{
-		BaseURL:    "http://127.0.0.1:43210",
-		Model:      ModelInfo{ID: "messages-only", SupportedEndpoints: []string{"/v1/messages"}},
-		Binary:     binary,
-		LocalToken: "token",
-	})
-	if err == nil || !strings.Contains(err.Error(), "expected /responses or /chat/completions") {
-		t.Fatalf("Prepare() error = %v, want compatibility error", err)
+	for _, dryRun := range []bool{false, true} {
+		_, err = (CopilotAdapter{}).Prepare(PrepareInput{
+			BaseURL:    "http://127.0.0.1:43210",
+			Model:      ModelInfo{ID: "messages-only", SupportedEndpoints: []string{"/v1/messages"}},
+			Binary:     binary,
+			LocalToken: "token",
+			DryRun:     dryRun,
+		})
+		if err == nil || !strings.Contains(err.Error(), "expected /responses or /chat/completions") {
+			t.Fatalf("Prepare(dryRun=%v) error = %v, want compatibility error", dryRun, err)
+		}
 	}
 }
 

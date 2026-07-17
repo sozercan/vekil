@@ -32,7 +32,8 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	if model == "" {
 		return PreparedProcess{}, fmt.Errorf("codex launch requires a model")
 	}
-	if !input.DryRun && !modelSupportsEndpoint(input.Model, "/responses") {
+	endpointMetadataKnown := !input.DryRun || input.Model.SupportedEndpoints != nil
+	if endpointMetadataKnown && !modelSupportsEndpoint(input.Model, "/responses") {
 		return PreparedProcess{}, fmt.Errorf(
 			"model %q is not Codex-compatible: expected /responses support",
 			model,
@@ -95,13 +96,19 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	args = append(args, "-m", model)
 	args = append(args, input.ForwardedArgs...)
 
-	return PreparedProcess{
+	prepared := PreparedProcess{
 		Path:     executable.path,
 		Args:     args,
 		EnvSet:   envSet,
 		EnvUnset: envUnset,
 		Cleanup:  cleanup,
-	}, nil
+	}
+	if !endpointMetadataKnown {
+		prepared.Unresolved = append(prepared.Unresolved,
+			"model endpoint compatibility (/responses) requires live /v1/models metadata",
+		)
+	}
+	return prepared, nil
 }
 
 func configString(value string) string {

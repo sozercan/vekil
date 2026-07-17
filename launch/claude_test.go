@@ -219,17 +219,43 @@ func TestClaudeAdapterRejectsIncompatibleModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Executable(): %v", err)
 	}
-	_, err = (ClaudeAdapter{}).Prepare(PrepareInput{
-		BaseURL: "http://127.0.0.1:43210",
-		Model: ModelInfo{
-			ID:                 "embeddings-only",
-			SupportedEndpoints: []string{"/embeddings"},
-		},
+	for _, dryRun := range []bool{false, true} {
+		_, err = (ClaudeAdapter{}).Prepare(PrepareInput{
+			BaseURL: "http://127.0.0.1:43210",
+			Model: ModelInfo{
+				ID:                 "embeddings-only",
+				SupportedEndpoints: []string{"/embeddings"},
+			},
+			Binary:     binary,
+			LocalToken: "test-token-placeholder",
+			DryRun:     dryRun,
+		})
+		if err == nil || !strings.Contains(err.Error(), "not Claude-compatible") {
+			t.Fatalf("Prepare(dryRun=%v) error = %v, want compatibility error", dryRun, err)
+		}
+	}
+}
+
+func TestClaudeAdapterDryRunMarksUnknownEndpointCompatibilityUnresolved(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	prepared, err := (ClaudeAdapter{}).Prepare(PrepareInput{
+		BaseURL:    "http://127.0.0.1:43210",
+		Model:      ModelInfo{ID: "catalog-model"},
 		Binary:     binary,
 		LocalToken: "test-token-placeholder",
+		DryRun:     true,
 	})
-	if err == nil || !strings.Contains(err.Error(), "not Claude-compatible") {
-		t.Fatalf("Prepare() error = %v, want compatibility error", err)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if prepared.Cleanup != nil {
+		defer func() { _ = prepared.Cleanup() }()
+	}
+	if got := strings.Join(prepared.Unresolved, "\n"); !strings.Contains(got, "/v1/messages") {
+		t.Fatalf("unresolved metadata = %q, want Claude endpoint disclosure", got)
 	}
 }
 

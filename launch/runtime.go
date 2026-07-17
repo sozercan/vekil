@@ -110,9 +110,24 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 		if baseURL == "" {
 			baseURL = dryRunBaseURL
 		}
+		model := ModelInfo{ID: modelID, Name: modelID}
+		if opts.DryRunModel != nil {
+			model = *opts.DryRunModel
+			resolvedID := strings.TrimSpace(model.ID)
+			if resolvedID == "" {
+				resolvedID = modelID
+			}
+			if resolvedID != modelID {
+				return result, fmt.Errorf("dry-run model metadata is for %q, want %q", resolvedID, modelID)
+			}
+			model.ID = resolvedID
+			if strings.TrimSpace(model.Name) == "" {
+				model.Name = resolvedID
+			}
+		}
 		prepared, err := adapter.Prepare(PrepareInput{
 			BaseURL:       baseURL,
-			Model:         ModelInfo{ID: modelID, Name: modelID},
+			Model:         model,
 			Binary:        opts.Binary,
 			ForwardedArgs: opts.ForwardedArgs,
 			LocalToken:    localToken,
@@ -126,7 +141,7 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 		}
 		defer cleanupPreparedProcess(prepared, opts.Stderr)
 		printDryRun(opts.Stderr, adapter.Name(), modelID, baseURL, opts.SensitiveEnv, prepared)
-		return Result{ExitCode: 0, BaseURL: baseURL, Model: ModelInfo{ID: modelID}}, nil
+		return Result{ExitCode: 0, BaseURL: baseURL, Model: model}, nil
 	}
 	if proxy == nil {
 		return result, fmt.Errorf("launch proxy is nil")
@@ -563,6 +578,13 @@ func printDryRun(
 	_, _ = fmt.Fprintf(w, "  binary: %s\n", prepared.Path)
 	if len(prepared.Args) > 0 {
 		_, _ = fmt.Fprintf(w, "  args:   %q\n", prepared.Args)
+	}
+	unresolved := append([]string(nil), prepared.Unresolved...)
+	sort.Strings(unresolved)
+	for _, item := range unresolved {
+		if item = strings.TrimSpace(item); item != "" {
+			_, _ = fmt.Fprintf(w, "  unresolved: %s\n", item)
+		}
 	}
 
 	setKeys := make([]string, 0, len(prepared.EnvSet))
