@@ -53,7 +53,7 @@ func TestCopilotAdapterPrepareResponses(t *testing.T) {
 			t.Errorf("EnvSet[%q] = %q, want %q", key, got, want)
 		}
 	}
-	for _, key := range []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "OPENAI_API_KEY", "MY_PROVIDER_TOKEN", "COPILOT_ALLOW_ALL", "OTEL_EXPORTER_OTLP_ENDPOINT"} {
+	for _, key := range []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MY_PROVIDER_TOKEN", "COPILOT_ALLOW_ALL", "OTEL_EXPORTER_OTLP_ENDPOINT"} {
 		if !containsString(prepared.EnvUnset, key) {
 			t.Fatalf("EnvUnset missing %q: %#v", key, prepared.EnvUnset)
 		}

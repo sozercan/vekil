@@ -112,9 +112,6 @@ func TestClaudeAdapterPrepare(t *testing.T) {
 			t.Errorf("EnvSet[%q] = %q, want %q", key, got, want)
 		}
 	}
-	if containsString(prepared.EnvUnset, "ANTHROPIC_AUTH_TOKEN") {
-		t.Fatal("ANTHROPIC_AUTH_TOKEN must carry the local proxy token")
-	}
 	for _, key := range []string{
 		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
 		"MY_PROVIDER_TOKEN",
@@ -123,6 +120,11 @@ func TestClaudeAdapterPrepare(t *testing.T) {
 		"CLAUDE_CODE_USE_ANTHROPIC_AWS",
 		"CLAUDE_CODE_OAUTH_TOKEN",
 		"ANTHROPIC_CUSTOM_HEADERS",
+		"OPENAI_API_KEY",
+		"CODEX_API_KEY",
+		"COPILOT_GITHUB_TOKEN",
+		"GH_TOKEN",
+		"GITHUB_TOKEN",
 	} {
 		if !containsString(prepared.EnvUnset, key) {
 			t.Fatalf("expected %s to be removed", key)

@@ -46,7 +46,11 @@ func TestCodexAdapterPrepare(t *testing.T) {
 	if got := prepared.EnvSet[codexLocalTokenEnv]; got != "test-token-placeholder" {
 		t.Fatalf("EnvSet[%q] = %q", codexLocalTokenEnv, got)
 	}
-	for _, key := range []string{"OPENAI_API_KEY", "OPENAI_BASE_URL", "MY_PROVIDER_TOKEN"} {
+	for _, key := range []string{
+		"OPENAI_API_KEY", "OPENAI_BASE_URL", "MY_PROVIDER_TOKEN",
+		"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+		"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN",
+	} {
 		if !containsString(prepared.EnvUnset, key) {
 			t.Fatalf("EnvUnset missing %q: %#v", key, prepared.EnvUnset)
 		}

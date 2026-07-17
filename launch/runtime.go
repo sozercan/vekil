@@ -576,6 +576,16 @@ func printDryRun(
 		if _, ok := unsetSeen[canonical]; ok {
 			continue
 		}
+		setByAdapter := false
+		for setKey := range prepared.EnvSet {
+			if canonicalEnvironmentKey(setKey) == canonical {
+				setByAdapter = true
+				break
+			}
+		}
+		if setByAdapter {
+			continue
+		}
 		unsetSeen[canonical] = struct{}{}
 		unset = append(unset, key)
 	}

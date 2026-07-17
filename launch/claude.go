@@ -94,7 +94,7 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		"ANTHROPIC_AWS_API_KEY",
 		"AWS_BEARER_TOKEN_BEDROCK",
 	}
-	envUnset = mergeEnvironmentKeys(envUnset, input.SensitiveEnv)
+	envUnset = mergeEnvironmentKeys(commonAgentCredentialEnvironment, envUnset, input.SensitiveEnv)
 
 	settingsEnv := make(map[string]string, len(envUnset)+len(envSet)+2)
 	for _, key := range envUnset {

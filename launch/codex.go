@@ -58,7 +58,7 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		return PreparedProcess{}, fmt.Errorf("codex launch requires a local proxy token")
 	}
 
-	envUnset := mergeEnvironmentKeys(codexCredentialEnvironment, input.SensitiveEnv)
+	envUnset := mergeEnvironmentKeys(commonAgentCredentialEnvironment, codexCredentialEnvironment, input.SensitiveEnv)
 	envSet := map[string]string{codexLocalTokenEnv: localToken}
 	probeEnvironment := applyEnvironment(input.Environment, envUnset, nil)
 	probeEnvironment = ensureLoopbackNoProxy(probeEnvironment, baseURL)

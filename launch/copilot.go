@@ -65,7 +65,7 @@ func (CopilotAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	if modelID == "" {
 		modelID = model
 	}
-	envUnset := mergeEnvironmentKeys(copilotCredentialEnvironment, input.SensitiveEnv, []string{
+	envUnset := mergeEnvironmentKeys(commonAgentCredentialEnvironment, copilotCredentialEnvironment, input.SensitiveEnv, []string{
 		"COPILOT_PROVIDER_AZURE_API_VERSION",
 		"COPILOT_PROVIDER_MAX_OUTPUT_TOKENS",
 		"COPILOT_PROVIDER_MAX_PROMPT_TOKENS",
