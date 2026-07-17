@@ -192,6 +192,28 @@ func TestClaudeAdapterSanitizesVersionProbeEnvironment(t *testing.T) {
 	}
 }
 
+func TestClaudeAdapterAcceptsResponsesBackedModel(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	prepared, err := (ClaudeAdapter{}).Prepare(PrepareInput{
+		BaseURL: "http://127.0.0.1:43210",
+		Model: ModelInfo{
+			ID:                 "responses-only",
+			SupportedEndpoints: []string{"/responses"},
+		},
+		Binary:     binary,
+		LocalToken: "test-token-placeholder",
+	})
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if prepared.Cleanup != nil {
+		defer func() { _ = prepared.Cleanup() }()
+	}
+}
+
 func TestClaudeAdapterRejectsIncompatibleModel(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
@@ -200,8 +222,8 @@ func TestClaudeAdapterRejectsIncompatibleModel(t *testing.T) {
 	_, err = (ClaudeAdapter{}).Prepare(PrepareInput{
 		BaseURL: "http://127.0.0.1:43210",
 		Model: ModelInfo{
-			ID:                 "responses-only",
-			SupportedEndpoints: []string{"/responses"},
+			ID:                 "embeddings-only",
+			SupportedEndpoints: []string{"/embeddings"},
 		},
 		Binary:     binary,
 		LocalToken: "test-token-placeholder",

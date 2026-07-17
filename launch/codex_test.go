@@ -134,6 +134,14 @@ func TestCodexCatalogClearsUnsupportedDonorCapabilities(t *testing.T) {
 	if got := model["default_reasoning_level"]; got != "none" {
 		t.Fatalf("non-reasoning model default_reasoning_level = %#v, want none", got)
 	}
+	for _, key := range []string{"supports_reasoning_summaries", "support_verbosity", "supports_search_tool"} {
+		if got, _ := model[key].(bool); got {
+			t.Fatalf("non-reasoning model inherited %s", key)
+		}
+	}
+	if tools, ok := model["experimental_supported_tools"].([]interface{}); !ok || len(tools) != 0 {
+		t.Fatalf("non-reasoning model experimental_supported_tools = %#v, want empty", model["experimental_supported_tools"])
+	}
 	modalities, ok := model["input_modalities"].([]interface{})
 	if !ok || !reflect.DeepEqual(modalities, []interface{}{"text"}) {
 		t.Fatalf("text-only model input_modalities = %#v, want [text]", model["input_modalities"])

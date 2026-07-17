@@ -10,7 +10,7 @@ exits.
 
 | Target | Command | Minimum tested contract | Required model endpoint |
 |--------|---------|-------------------------|-------------------------|
-| Claude Code | `vekil launch claude` | Claude Code 2.1.83+ | `/v1/messages` or `/chat/completions` |
+| Claude Code | `vekil launch claude` | Claude Code 2.1.83+ | `/v1/messages`, `/chat/completions`, or `/responses` |
 | OpenAI Codex CLI | `vekil launch codex` | Codex CLI 0.137.0+ | `/responses` |
 | GitHub Copilot CLI | `vekil launch copilot` | GitHub Copilot CLI 1.0.0+ | `/responses` or `/chat/completions` |
 

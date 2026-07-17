@@ -128,6 +128,10 @@ func buildCodexModelCatalog(executable resolvedExecutable, environment []string,
 	} else {
 		template["default_reasoning_level"] = "none"
 	}
+	template["supports_reasoning_summaries"] = false
+	template["support_verbosity"] = false
+	template["supports_search_tool"] = false
+	template["experimental_supported_tools"] = []interface{}{}
 	template["supports_parallel_tool_calls"] = model.Capabilities.Supports.ParallelToolCalls
 	template["supports_image_detail_original"] = false
 	template["input_modalities"] = []string{"text"}

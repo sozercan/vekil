@@ -19,9 +19,10 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	}
 	if !input.DryRun &&
 		!modelSupportsEndpoint(input.Model, "/v1/messages") &&
-		!modelSupportsEndpoint(input.Model, "/chat/completions") {
+		!modelSupportsEndpoint(input.Model, "/chat/completions") &&
+		!modelSupportsEndpoint(input.Model, "/responses") {
 		return PreparedProcess{}, fmt.Errorf(
-			"model %q is not Claude-compatible: expected /v1/messages or /chat/completions support",
+			"model %q is not Claude-compatible: expected /v1/messages, /chat/completions, or /responses support",
 			model,
 		)
 	}
