@@ -139,6 +139,10 @@ func TestCopilotAdapterRejectsManagedOverridesAndRemoteModes(t *testing.T) {
 		{name: "share", args: []string{"--share-gist"}, want: "remote, resumed, or shared"},
 		{name: "acp", args: []string{"--acp"}, want: "ACP server"},
 		{name: "login", args: []string{"login"}, want: "not an agent session"},
+		{name: "login after config dir", args: []string{"--config-dir", "/tmp/config", "login"}, want: "not an agent session"},
+		{name: "login after log file", args: []string{"--log-file", "/tmp/copilot.log", "login"}, want: "not an agent session"},
+		{name: "login after extension path", args: []string{"--extension-sdk-path", "/tmp/sdk", "login"}, want: "not an agent session"},
+		{name: "login after short name", args: []string{"-n", "session", "login"}, want: "not an agent session"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

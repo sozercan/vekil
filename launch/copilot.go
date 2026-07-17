@@ -199,9 +199,9 @@ func copilotOptionRequiresValue(arg string) bool {
 	}
 	switch arg {
 	case "--add-dir", "--add-github-mcp-tool", "--add-github-mcp-toolset", "--additional-mcp-config",
-		"--agent", "--allow-url", "--attachment", "-C", "--context", "--deny-url", "--disable-mcp-server",
-		"--effort", "--reasoning-effort", "-i", "--interactive", "--log-dir", "--log-level",
-		"--max-ai-credits", "--model", "--name", "--output-format", "-p", "--prompt", "--plugin-dir",
+		"--agent", "--allow-url", "--attachment", "-C", "--config-dir", "--context", "--deny-url", "--disable-mcp-server",
+		"--effort", "--reasoning-effort", "--extension-sdk-path", "-i", "--interactive", "--log-dir", "--log-file", "--log-level",
+		"--max-ai-credits", "--max-autopilot-continues", "--mode", "--model", "--name", "-n", "--output-format", "-p", "--prompt", "--plugin-dir",
 		"--secret-env-vars", "--session-id", "--stream":
 		return true
 	default:
