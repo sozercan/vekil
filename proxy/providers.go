@@ -1206,6 +1206,9 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 	if endpoint != providerEndpointMessages {
 		return false
 	}
+	if _, rawKnown := h.providerSetup().lookupModel(model); rawKnown {
+		return false
+	}
 	normalizedModel := NormalizeModelName(model)
 	if normalizedModel == model {
 		return false

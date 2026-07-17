@@ -1339,3 +1339,51 @@ func TestAllowedModelsRestrictsCentralModelResolution(t *testing.T) {
 		t.Fatalf("disallowed Chat model error = %v, want model-not-allowed error", err)
 	}
 }
+
+func TestAllowedModelsDoesNotNormalizeKnownDisallowedModel(t *testing.T) {
+	cfg := ProvidersConfig{Providers: []ProviderConfig{
+		{
+			ID:             "raw-owner",
+			Type:           "anthropic-compatible",
+			BaseURL:        "http://127.0.0.1:9/v1",
+			AuthType:       "none",
+			Default:        true,
+			ModelDiscovery: "static",
+			Models: []ProviderModelConfig{{
+				PublicID:  "claude-sonnet-4-5",
+				Endpoints: []string{"/v1/messages"},
+			}},
+		},
+		{
+			ID:             "normalized-owner",
+			Type:           "anthropic-compatible",
+			BaseURL:        "http://127.0.0.1:10/v1",
+			AuthType:       "none",
+			ModelDiscovery: "static",
+			Models: []ProviderModelConfig{{
+				PublicID:  "claude-sonnet-4.5",
+				Endpoints: []string{"/v1/messages"},
+			}},
+		},
+	}}
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("claude-sonnet-4.5"),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	if h.modelAllowedForRequest("claude-sonnet-4-5", providerEndpointMessages) {
+		t.Fatal("known disallowed raw model was accepted as a normalized alias")
+	}
+	_, _, _, err = h.resolveProviderRequestForModel(
+		[]byte(`{"model":"claude-sonnet-4-5"}`),
+		providerEndpointMessages,
+		"claude-sonnet-4-5",
+	)
+	if got := upstreamStatusCode(err, http.StatusInternalServerError); got != http.StatusBadRequest {
+		t.Fatalf("known disallowed raw model status = %d, want %d; err=%v", got, http.StatusBadRequest, err)
+	}
+}
