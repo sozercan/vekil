@@ -183,6 +183,11 @@ func TestCodexAdapterRejectsManagedOverridesAndNonAgentModes(t *testing.T) {
 		{name: "exec resume", args: []string{"exec", "resume", "last"}, want: "resumed Codex sessions"},
 		{name: "alias exec resume", args: []string{"e", "resume", "last"}, want: "resumed Codex sessions"},
 		{name: "app server", args: []string{"app-server"}, want: "detached or server"},
+		{name: "cloud tasks", args: []string{"cloud-tasks"}, want: "detached or server"},
+		{name: "responses proxy", args: []string{"responses-api-proxy"}, want: "detached or server"},
+		{name: "stdio relay", args: []string{"stdio-to-uds"}, want: "detached or server"},
+		{name: "apply alias", args: []string{"a"}, want: "not an agent session"},
+		{name: "execpolicy", args: []string{"execpolicy"}, want: "not an agent session"},
 		{name: "login", args: []string{"login"}, want: "not an agent session"},
 		{name: "help", args: []string{"help"}, want: "not an agent session"},
 	}
