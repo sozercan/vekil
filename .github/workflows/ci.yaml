@@ -48,6 +48,19 @@ jobs:
       - name: Compaction lab
         run: make compaction-lab
 
+  windows-launch:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Test Windows launcher lifecycle
+        run: go test ./launch -count=1
+
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 15

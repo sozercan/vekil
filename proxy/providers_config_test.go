@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1316,5 +1317,25 @@ func TestAllowedModelsRestrictsCentralModelResolution(t *testing.T) {
 	}
 	if provider, _, _ := h.resolveProviderModel("other", providerEndpointChatCompletions); provider != nil {
 		t.Fatal("disallowed model resolved")
+	}
+
+	_, _, _, err = h.resolveProviderRequestForModel(
+		[]byte(`{"model":"other"}`),
+		providerEndpointResponses,
+		"other",
+	)
+	if got := upstreamStatusCode(err, http.StatusInternalServerError); got != http.StatusBadRequest {
+		t.Fatalf("disallowed Responses model status = %d, want %d; err=%v", got, http.StatusBadRequest, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("disallowed Responses model error = %v, want model-not-allowed error", err)
+	}
+
+	_, err = h.resolveChatRoute(context.Background(), "other")
+	if got := upstreamStatusCode(err, http.StatusInternalServerError); got != http.StatusBadRequest {
+		t.Fatalf("disallowed Chat model status = %d, want %d; err=%v", got, http.StatusBadRequest, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("disallowed Chat model error = %v, want model-not-allowed error", err)
 	}
 }

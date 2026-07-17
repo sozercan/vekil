@@ -162,6 +162,9 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 }
 
 func (h *ProxyHandler) resolveProviderRequestForModel(body []byte, endpoint string, model string) (*providerRuntime, providerModel, []byte, error) {
+	if !h.modelAllowedForRequest(model, endpoint) {
+		return nil, providerModel{}, nil, modelNotAllowedRequestError(model)
+	}
 	provider, owner, known := h.resolveProviderModelForRequest(model, endpoint)
 	if provider == nil {
 		return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no provider available for endpoint %s", endpoint)}

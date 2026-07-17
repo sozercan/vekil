@@ -52,7 +52,7 @@ Every launcher:
 4. waits for `/readyz` and verifies that `--model` appears in `/v1/models`;
 5. validates the installed agent binary and model endpoint compatibility;
 6. starts the agent with target-specific temporary routing configuration;
-7. forwards signals and supervises the complete child process tree;
+7. forwards signals and supervises the managed child process group or Job Object;
 8. prints a usage summary and stops the proxy when the agent exits.
 
 ## Common options
@@ -194,7 +194,10 @@ Interactive macOS and Linux launches hand the terminal to a dedicated agent
 process group while Vekil mirrors stop/continue state to the shell-visible job,
 so `Ctrl-Z` and `fg` continue to work. Non-interactive launches use the same
 process-group containment. Windows uses a kill-on-close Job Object. Remaining
-child processes are terminated during cleanup.
+processes in the managed group or Job Object are terminated during cleanup.
+On Unix, a descendant that deliberately creates a new session or process group
+can leave that portable containment boundary; Vekil rejects known detached
+agent modes but is not an operating-system sandbox.
 
 This is environment and process isolation, not a filesystem sandbox. Agents
 retain their normal workspace and home-directory access according to their own

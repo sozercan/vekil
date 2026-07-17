@@ -204,6 +204,9 @@ func signalUnixGroup(pgid int, sig syscall.Signal) error {
 }
 
 func terminateUnixGroup(pgid int) error {
+	// Unix launcher containment is process-group scoped. A descendant that
+	// deliberately creates a new session or process group is outside this
+	// portable boundary; adapters separately reject known detached agent modes.
 	if err := signalUnixGroup(pgid, syscall.SIGTERM); err != nil {
 		return err
 	}

@@ -107,6 +107,28 @@ func TestCodexAdapterPrepare(t *testing.T) {
 	}
 }
 
+func TestCodexCatalogClearsUnsupportedDonorCapabilities(t *testing.T) {
+	body, err := buildCodexModelCatalog(resolvedExecutable{}, nil, ModelInfo{ID: "text-only"}, true)
+	if err != nil {
+		t.Fatalf("buildCodexModelCatalog() error = %v", err)
+	}
+	var catalog codexCatalog
+	if err := json.Unmarshal(body, &catalog); err != nil {
+		t.Fatalf("decode catalog: %v", err)
+	}
+	if len(catalog.Models) != 1 {
+		t.Fatalf("catalog models = %#v", catalog.Models)
+	}
+	model := catalog.Models[0]
+	if got, _ := model["supports_parallel_tool_calls"].(bool); got {
+		t.Fatal("text-only model inherited parallel tool-call support")
+	}
+	modalities, ok := model["input_modalities"].([]interface{})
+	if !ok || !reflect.DeepEqual(modalities, []interface{}{"text"}) {
+		t.Fatalf("text-only model input_modalities = %#v, want [text]", model["input_modalities"])
+	}
+}
+
 func TestCodexAdapterRejectsIncompatibleModel(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {

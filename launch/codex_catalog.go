@@ -125,9 +125,9 @@ func buildCodexModelCatalog(executable resolvedExecutable, environment []string,
 			template["default_reasoning_level"] = defaultReasoningEffort(efforts)
 		}
 	}
-	if model.Capabilities.Supports.ParallelToolCalls {
-		template["supports_parallel_tool_calls"] = true
-	}
+	template["supports_parallel_tool_calls"] = model.Capabilities.Supports.ParallelToolCalls
+	template["supports_image_detail_original"] = false
+	template["input_modalities"] = []string{"text"}
 	if model.Capabilities.Supports.Vision {
 		template["input_modalities"] = []string{"text", "image"}
 	}

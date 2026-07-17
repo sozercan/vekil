@@ -1195,6 +1195,32 @@ func (h *ProxyHandler) resolveProviderModel(model, endpoint string) (*providerRu
 	}, false
 }
 
+func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
+	if h == nil || len(h.allowedModels) == 0 {
+		return true
+	}
+	model = strings.TrimSpace(model)
+	if _, ok := h.allowedModels[model]; ok {
+		return true
+	}
+	if endpoint != providerEndpointMessages {
+		return false
+	}
+	normalizedModel := NormalizeModelName(model)
+	if normalizedModel == model {
+		return false
+	}
+	_, ok := h.allowedModels[normalizedModel]
+	return ok
+}
+
+func modelNotAllowedRequestError(model string) error {
+	return &providerRequestError{
+		statusCode: http.StatusBadRequest,
+		err:        fmt.Errorf("model %q is not allowed by this proxy", strings.TrimSpace(model)),
+	}
+}
+
 func (h *ProxyHandler) resolveProviderModelForRequest(model, endpoint string) (*providerRuntime, providerModel, bool) {
 	rawModel := strings.TrimSpace(model)
 	rawProvider, rawOwner, rawKnown := h.resolveProviderModel(rawModel, endpoint)

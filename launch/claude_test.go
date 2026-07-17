@@ -136,6 +136,60 @@ func TestClaudeAdapterPrepare(t *testing.T) {
 	}
 }
 
+func TestClaudeAdapterSanitizesVersionProbeEnvironment(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	capturePath := t.TempDir() + "/version-env.json"
+	prepared, err := (ClaudeAdapter{}).Prepare(PrepareInput{
+		BaseURL: "http://127.0.0.1:43210",
+		Model: ModelInfo{
+			ID:                 "claude-public",
+			SupportedEndpoints: []string{"/v1/messages"},
+		},
+		Binary:     binary,
+		LocalToken: "local-session-token",
+		SensitiveEnv: []string{
+			"MY_PROVIDER_TOKEN",
+		},
+		Environment: []string{
+			"LAUNCH_VERSION_ENV_CAPTURE=" + capturePath,
+			"ANTHROPIC_API_KEY=upstream-api-key",
+			"ANTHROPIC_AUTH_TOKEN=upstream-auth-token",
+			"ANTHROPIC_BASE_URL=https://upstream.example",
+			"ANTHROPIC_CUSTOM_HEADERS=X-Secret: upstream",
+			"MY_PROVIDER_TOKEN=upstream-provider-token",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	defer func() {
+		if prepared.Cleanup != nil {
+			_ = prepared.Cleanup()
+		}
+	}()
+	body, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatalf("read version probe environment: %v", err)
+	}
+	var captured map[string]string
+	if err := json.Unmarshal(body, &captured); err != nil {
+		t.Fatalf("decode version probe environment: %v", err)
+	}
+	want := map[string]string{
+		"api_key":        "",
+		"auth_token":     "local-session-token",
+		"base_url":       "http://127.0.0.1:43210",
+		"custom_headers": "",
+		"provider_token": "",
+	}
+	if !reflect.DeepEqual(captured, want) {
+		t.Fatalf("version probe environment = %#v, want %#v", captured, want)
+	}
+}
+
 func TestClaudeAdapterRejectsIncompatibleModel(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {

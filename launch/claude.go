@@ -114,10 +114,7 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	settingsEnv["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
 	settingsEnv["CLAUDE_CODE_DISABLE_CRON"] = "1"
 	if !input.DryRun {
-		probeEnvironment := applyEnvironment(input.Environment, envUnset, map[string]string{
-			"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "vekil",
-			"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB":     "1",
-		})
+		probeEnvironment := applyEnvironment(input.Environment, envUnset, envSet)
 		probeEnvironment = ensureLoopbackNoProxy(probeEnvironment, baseURL)
 		if err := validateClaudeVersion(executable, probeEnvironment); err != nil {
 			return PreparedProcess{}, err
