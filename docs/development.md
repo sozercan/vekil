@@ -27,6 +27,45 @@ scripts/tests/live-chat-over-responses-smoke-test.sh  # deterministic Chat-over-
 
 `cmd/compaction-lab` starts an in-process proxy and fake `/responses` upstream, then exercises the compact-response shape, opaque compaction replay, remote compaction v2 trigger handling, and websocket `response.processed` control frames. It is intended as a quick deterministic check for compaction regressions before running live Copilot smoke tests.
 
+### Model-route safety suite
+
+Provider-agnostic model-route implementation started from repository baseline `3388071`. Verify that the baseline is reachable from the revision under test before comparing behavior or performance:
+
+```bash
+git merge-base --is-ancestor 3388071 HEAD
+printf 'baseline=%s head=%s\n' "$(git rev-parse 3388071)" "$(git rev-parse HEAD)"
+```
+
+The production-phase gate is:
+
+```bash
+make test
+make vet
+make build
+go test -race ./... -count=1
+```
+
+For a fast route-focused pass before the full suite:
+
+```bash
+go test ./proxy/ -run 'Test(LoadProvidersConfigFile|ValidateModelRoutes|RouteReferenced|UnreferencedStatic|CompileExplicit|ExplicitRoute|ConfiguredExplicitRoute|StateBindingStore|RouteObservability|RequestSummary)' -count=1
+```
+
+Route-specific deterministic tests use local upstream servers plus injected transports/clocks; live provider credentials are not the merge gate. Coverage should include:
+
+- strict version-1/version-2 decoding, duplicate-key rejection, limits, feature-matrix rejection, two-pass provider/route references, normalized public-ID collisions, and `vekil config validate`;
+- legacy route catalog/unknown-model/retry compatibility and explicit route ordering/catalog identity;
+- pristine request body/header/auth construction for every target, including API-key, Entra, bearer, and custom-header switches;
+- exact target-attempt and network-send counts for normal attempts, redirects, prewrite failures, ambiguous delivery, protocol recovery, compaction/replay, and compatibility fallback;
+- Responses preamble commitment, partial/malformed streams, forced-stream semantic/tool progress, translated Anthropic/Gemini preambles, and client-write races;
+- exact state binding before exposure, known/unknown/conflicting state, expiry/eviction/restart/second-process behavior, and pinned WebSocket first-turn/later-turn behavior with no cross-target migration;
+- client-request versus physical-attempt accounting, final target attribution, bounded-cardinality/redaction rules, and failed-attempt usage isolation; and
+- client disconnect, total deadline, shutdown, response-body cleanup, goroutine termination, and no-overlap/no-new-attempt races.
+
+For large request and replay paths, keep the `64 MiB` request boundary in the deterministic matrix and verify that operation/send budgets prevent compaction, recovery, or fallback from creating an unbounded tree.
+
+### Chat-over-Responses suite
+
 For the Chat-over-Responses routing, conversion, replay, streaming, and public-ingress matrix, use:
 
 ```bash
@@ -48,6 +87,39 @@ go test ./proxy/ -run '^$' -bench 'BenchmarkChatOverResponses' -benchmem -count=
 
 The Chat-over-Responses benchmark regex includes permanent text-stream, fragmented function-argument, and interleaved parallel-tool cases. It also keeps the Phase 0 transport comparison available for regression work; review `ns/op`, `B/op`, and `allocs/op`, and do not introduce buffering proportional to the completed stream size.
 
+### Model-route benchmark baseline
+
+For the model-route change, compare at least ten controlled samples against baseline `3388071`. Keep the Go version, fixtures, target count, and machine load identical, and set an explicit `GOMAXPROCS` instead of relying on the machine default:
+
+```bash
+export GOMAXPROCS=8  # choose one fixed value for both baseline and candidate
+go version
+go env GOOS GOARCH
+printf 'GOMAXPROCS=%s\n' "$GOMAXPROCS"
+
+go test ./proxy/ -run '^$' -bench 'BenchmarkChatRoute' -benchmem -count=10
+go test ./proxy/ -run '^$' -bench 'BenchmarkDefaultProviderSetup' -benchmem -count=10
+go test ./proxy/ -run '^$' -bench 'BenchmarkOpenAIResponseAggregatorToolCallArguments' -benchmem -count=10
+go test ./proxy/ -run '^$' -bench 'BenchmarkGeminiStreamSparseToolCall' -benchmem -count=10
+go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesTransport' -benchmem -count=10
+go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesSession' -benchmem -count=10
+go test ./proxy/ -run '^$' -bench 'BenchmarkResponsesWebSocketRequestBuild' -benchmem -count=10
+go test ./proxy/ -run '^$' -bench 'BenchmarkExplicitRoutePreparedStreamTTFT|BenchmarkRouteAttemptStatsConcurrentContention|BenchmarkExplicitRouteTwoTargetFailover64MiB' -benchmem -count=10
+```
+
+Capture baseline and candidate output separately, then compare `ns/op`, `B/op`, and `allocs/op` with `benchstat`:
+
+```bash
+# Run the same benchmark command from a clean checkout/worktree at 3388071.
+GOMAXPROCS="$GOMAXPROCS" go test ./proxy/ -run '^$' -bench '<same-regex>' -benchmem -count=10 > baseline-3388071.txt
+GOMAXPROCS="$GOMAXPROCS" go test ./proxy/ -run '^$' -bench '<same-regex>' -benchmem -count=10 > candidate.txt
+benchstat baseline-3388071.txt candidate.txt
+```
+
+Record the full baseline SHA, candidate SHA, Go version, OS/architecture, `GOMAXPROCS`, fixture/body size, stream mode, and target count with the results. Do not use the unrelated `fca0b12` commit as the route baseline; it is not an ancestor of `3388071` in this worktree. Credentialed Azure pool smoke is supplementary only and never replaces deterministic local tests or controlled benchmarks.
+
+`BenchmarkChatRouteLegacyDirectResolutionRequestBuild` and `BenchmarkChatRouteExplicitPriorityOneTargetRequestBuild` provide the direct legacy-versus-route request-build baseline. `BenchmarkChatRouteLegacyDirectTransport` and `BenchmarkChatRouteExplicitPrimaryOnlyTransport` add deterministic `http.Client`/`RoundTripper` dispatch coverage without network variability. `BenchmarkExplicitRoutePreparedStreamTTFT` measures held-preamble handoff and reports `ttft-ns/op`; `BenchmarkRouteAttemptStatsConcurrentContention` measures concurrent physical-attempt accounting; and `BenchmarkExplicitRouteTwoTargetFailover64MiB` verifies exactly two sends and reports allocation pressure at the maximum request boundary. These checked-in benchmarks provide the scenarios, but the ten-sample baseline/candidate `benchstat` comparison remains release evidence that must be captured on a controlled machine rather than asserted from one local run.
+
 ## Lint
 
 ```bash
@@ -57,7 +129,7 @@ make lint
 
 ## CI
 
-GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs lint, tests, build, vet, a Kubernetes/kind operational smoke, and e2e validation before merge. Every core job has a job-level deadline, and the test job also runs [`scripts/tests/live-smoke-reliability-test.sh`](../scripts/tests/live-smoke-reliability-test.sh) with local mock servers and fake CLIs so stale-listener, timeout, per-client, and descendant-cleanup failures are deterministic.
+GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs lint, tests, the full race detector, build, vet, a Kubernetes/kind operational smoke, and e2e validation before merge. Every core job has a job-level deadline. The test job runs [`scripts/tests/live-smoke-reliability-test.sh`](../scripts/tests/live-smoke-reliability-test.sh) with local mock servers and fake CLIs so stale-listener, timeout, per-client, and descendant-cleanup failures are deterministic, plus [`scripts/tests/live-provider-routing-smoke-test.sh`](../scripts/tests/live-provider-routing-smoke-test.sh), which builds the real binary and exercises schema-v2 two-target failover against controlled loopback Responses servers.
 
 The kind smoke builds the PR image and renders the checked-in [`k8s/vekil.yaml`](../k8s/vekil.yaml), patching only the test namespace, local image/pull policy, and the deterministic provider config used in its second phase. It verifies that the `/healthz` startup probe has a coherent 60–90 second failure budget before liveness/readiness begin. It then deploys without Copilot credentials and verifies that `/healthz` remains live, the liveness probe causes zero restarts, `/readyz` stays gated, the Pod is not Ready, and the Service has no ready endpoint. Finally it rolls out a static configured provider and verifies that the same readiness probe admits the Pod and Service endpoint. The script uses an isolated kubeconfig, bounds cluster/API/port-forward work, and requires the live `kubectl port-forward` PID plus its exact listener log before accepting HTTP responses.
 
@@ -110,6 +182,23 @@ The CLI smoke script starts the proxy with the same token pattern, waits for `/r
 
 This workflow is intentionally provider-specific: it exercises a live Copilot-backed deployment because zero-config startup is the simplest upstream path to run in GitHub Actions. It is useful as a real integration smoke test, but it is not the complete provider matrix for Azure OpenAI, OpenAI Codex, or generic compatible provider configs.
 
+## Live Provider Routing Smoke Workflow
+
+The [`Live Provider Routing Smoke`](../.github/workflows/live-provider-routing-smoke.yaml) workflow runs [`scripts/live-provider-routing-smoke.sh`](../scripts/live-provider-routing-smoke.sh) against two controlled, semantically equivalent, API-key-backed targets that both support native `/responses`. Each target may be `azure-openai` or static `openai-compatible`; Azure URLs must use the OpenAI v1 form ending in `/openai/v1`, while generic targets use bearer auth. Configure these repository variables:
+
+- `LIVE_PROVIDER_ROUTING_PRIMARY_TYPE`, `LIVE_PROVIDER_ROUTING_SECONDARY_TYPE` — `azure-openai` or `openai-compatible`
+- `LIVE_PROVIDER_ROUTING_PRIMARY_BASE_URL`, `LIVE_PROVIDER_ROUTING_SECONDARY_BASE_URL` — API bases before `/responses`
+- `LIVE_PROVIDER_ROUTING_PRIMARY_MODEL`, `LIVE_PROVIDER_ROUTING_SECONDARY_MODEL` — physical deployment/model names for the same public contract
+
+Configure these repository secrets explicitly:
+
+- `LIVE_PROVIDER_ROUTING_PRIMARY_API_KEY`
+- `LIVE_PROVIDER_ROUTING_SECONDARY_API_KEY`
+
+The harness generates and validates a schema-version-2 config with one fixed public model and an ordered two-target `priority_failover` route. A loopback control proxy first forwards a real request to the primary, then injects an authoritative precommit `429`; the next fresh request must make exactly two upstream sends and complete on the real secondary. It also verifies that `/v1/models` and successful Responses output expose only the public model identity, a primary response ID pins a later request back to that exact target rather than migrating on `429`, unknown state fails locally with no upstream send, and `/stats.json` records the exact target attempts, switch, successful failover, and state-binding hit/miss.
+
+Fork and Dependabot pull requests neutral-skip because GitHub withholds repository secrets. Pull requests also neutral-skip until all eight repository variables/secrets are installed; a manual dispatch with missing configuration fails so it cannot look like a completed live run. Once configured, any controlled-target or routing failure is a hard failure—unlike the rotating Zen free tier, a configured target outage is not treated as neutral. The workflow is separate from deterministic CI. Run the same harness locally after `make build` by exporting the eight variables/secrets above.
+
 For a credential-free generic-provider check, [`scripts/live-zen-smoke.sh`](../scripts/live-zen-smoke.sh) starts the proxy on a non-default port with [`examples/opencode-zen-free.yaml`](../examples/opencode-zen-free.yaml), waits for `/readyz`, and sends one tiny chat completion per OpenCode Zen free model. It needs `curl`, `jq`, and Python for isolated automatic port allocation. Because the Zen free set rotates, the script skips only recognized transient statuses/messages and passes as long as at least one free model responds; unknown statuses and proxy-side faults are hard failures.
 
 ## Live OpenCode Zen CLI Smoke Workflow
@@ -160,8 +249,8 @@ You can also run the same smoke scripts locally after building `vekil`; the CLI 
 
 - Register the provider kind in `proxy/providers.go` and its endpoint policy in `proxy/provider_endpoint_policy.go`.
 - Keep upstream deployment names internal to provider config; public model IDs remain global.
-- Treat `models[].endpoints` as a verified **native** allowlist. Do not add `/chat/completions` merely because Vekil can emulate Chat through a native Responses model.
+- Treat `models[].endpoints` and `model_routes[].endpoints` as verified **native** allowlists. Do not advertise untested upstream routes or add `/chat/completions` merely because Vekil can emulate Chat through native Responses.
 - Keep Chat backend selection and Responses conversion inside the deep execution seam (`chat_execution.go`, `chat_route*.go`, and `chat_over_responses_*.go`); Anthropic and Gemini handlers should consume canonical Chat results rather than Responses events directly.
 - Responses-backed Chat must reject unsupported fields instead of silently dropping them, preserve opaque replay IDs/state bounds, and use the typed internal Chat event transport for streams.
-- Preserve startup failure on public-model-ID collisions.
+- Preserve startup failure on public-model-ID collisions. For schema version 2, add new provider/native-endpoint/surface/mode support to the compiled route feature matrix and reject unsupported combinations rather than accepting degraded routes.
 - Cross-link config examples in [`provider-routing.md`](provider-routing.md) instead of duplicating YAML here.

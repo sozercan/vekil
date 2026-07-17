@@ -1,0 +1,143 @@
+name: Live Provider Routing Smoke
+
+# Credentialed end-to-end coverage for schema-v2 provider-agnostic model
+# routes. The primary and secondary are controlled Responses-capable Azure
+# OpenAI or generic OpenAI-compatible targets. The harness forwards one request
+# to the real primary, injects a safe primary 429, observes ordered failover to
+# the real secondary, then verifies state pinning and fail-closed behavior.
+#
+# Required repository variables and secrets are documented in
+# docs/development.md. Fork and Dependabot pull requests neutral-skip because
+# GitHub does not expose repository secrets to them. Once credentials are
+# available, target or routing failures are hard failures.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-provider-routing-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LIVE_PROVIDER_ROUTING_PRIMARY_TYPE: ${{ vars.LIVE_PROVIDER_ROUTING_PRIMARY_TYPE }}
+      LIVE_PROVIDER_ROUTING_PRIMARY_BASE_URL: ${{ vars.LIVE_PROVIDER_ROUTING_PRIMARY_BASE_URL }}
+      LIVE_PROVIDER_ROUTING_PRIMARY_MODEL: ${{ vars.LIVE_PROVIDER_ROUTING_PRIMARY_MODEL }}
+      LIVE_PROVIDER_ROUTING_PRIMARY_API_KEY: ${{ secrets.LIVE_PROVIDER_ROUTING_PRIMARY_API_KEY }}
+      LIVE_PROVIDER_ROUTING_SECONDARY_TYPE: ${{ vars.LIVE_PROVIDER_ROUTING_SECONDARY_TYPE }}
+      LIVE_PROVIDER_ROUTING_SECONDARY_BASE_URL: ${{ vars.LIVE_PROVIDER_ROUTING_SECONDARY_BASE_URL }}
+      LIVE_PROVIDER_ROUTING_SECONDARY_MODEL: ${{ vars.LIVE_PROVIDER_ROUTING_SECONDARY_MODEL }}
+      LIVE_PROVIDER_ROUTING_SECONDARY_API_KEY: ${{ secrets.LIVE_PROVIDER_ROUTING_SECONDARY_API_KEY }}
+    steps:
+      - name: Decide whether live provider-routing smoke can run
+        id: gate
+        env:
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork || false }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ "${IS_FORK}" = "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping live provider-routing smoke for fork pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${ACTOR}" = "dependabot[bot]" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping live provider-routing smoke for Dependabot pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          missing=()
+          for name in \
+            LIVE_PROVIDER_ROUTING_PRIMARY_TYPE \
+            LIVE_PROVIDER_ROUTING_PRIMARY_BASE_URL \
+            LIVE_PROVIDER_ROUTING_PRIMARY_MODEL \
+            LIVE_PROVIDER_ROUTING_PRIMARY_API_KEY \
+            LIVE_PROVIDER_ROUTING_SECONDARY_TYPE \
+            LIVE_PROVIDER_ROUTING_SECONDARY_BASE_URL \
+            LIVE_PROVIDER_ROUTING_SECONDARY_MODEL \
+            LIVE_PROVIDER_ROUTING_SECONDARY_API_KEY; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              printf 'Missing required live provider-routing repository variables/secrets:\n' >&2
+              printf '  - %s\n' "${missing[@]}" >&2
+              exit 1
+            fi
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            printf -v missing_csv '%s, ' "${missing[@]}"
+            echo "reason=Skipping live provider-routing smoke until repository configuration is installed: ${missing_csv%, }." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Explain skipped live provider-routing smoke
+        if: steps.gate.outputs.run != 'true'
+        run: echo "${{ steps.gate.outputs.reason }}"
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        if: steps.gate.outputs.run == 'true'
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        if: steps.gate.outputs.run == 'true'
+        run: make build
+
+      - name: Run live provider-routing smoke
+        if: steps.gate.outputs.run == 'true'
+        env:
+          LIVE_PROVIDER_ROUTING_SMOKE_DIR: ${{ runner.temp }}/live-provider-routing-smoke
+        run: scripts/live-provider-routing-smoke.sh
+
+      - name: Show provider-routing diagnostics on failure
+        if: failure() && steps.gate.outputs.run == 'true'
+        run: |
+          redact() {
+            sed -E \
+              -e 's/(Authorization: (Bearer|token) )[[:graph:]]+/\1[REDACTED]/Ig' \
+              -e 's/(api-key: )[[:graph:]]+/\1[REDACTED]/Ig' \
+              -e 's/("encrypted_content"[[:space:]]*:[[:space:]]*")[^"]*(")/\1[REDACTED]\2/g' \
+              -e 's/("previous_response_id"[[:space:]]*:[[:space:]]*")[^"]*(")/\1[REDACTED]\2/g' \
+              -e 's/("id"[[:space:]]*:[[:space:]]*"resp_)[^"]*(")/\1[REDACTED]\2/g'
+          }
+
+          dir="$RUNNER_TEMP/live-provider-routing-smoke"
+          if [ ! -d "$dir" ]; then
+            exit 0
+          fi
+          redaction_dir="$(mktemp -d "$RUNNER_TEMP/live-provider-routing-redacted.XXXXXX")"
+          trap 'rm -rf "$redaction_dir"' EXIT
+          for file in \
+            "$dir/proxy.log" \
+            "$dir/primary-shim.log" \
+            "$dir/summary.txt" \
+            "$dir/models.json" \
+            "$dir/healthy-primary.response.json" \
+            "$dir/failover.response.json" \
+            "$dir/pinned-primary.response.json" \
+            "$dir/unknown-state.response.json" \
+            "$dir/after-unknown-state.stats.json"; do
+            if [ -f "$file" ]; then
+              echo "--- $file ---"
+              redacted="$redaction_dir/$(basename "$file").redacted"
+              redact < "$file" > "$redacted"
+              head -c 32768 "$redacted"
+              echo
+            fi
+          done

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
 
@@ -2429,6 +2432,329 @@ func TestHandleGeminiModelsPost200StreamErrorMatrix(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestHandleGeminiModelsCountTokensRejectsIneligibleExplicitRoute(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(upstream.Close)
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(ProvidersConfig{
+			SchemaVersion: ProvidersConfigSchemaVersion2,
+			Providers: []ProviderConfig{{
+				ID:      "azure",
+				Type:    string(providerTypeAzureOpenAI),
+				Default: true,
+				BaseURL: upstream.URL + "/openai/v1",
+				APIKey:  "azure-key",
+			}},
+			ModelRoutes: []ModelRouteConfig{{
+				ID:        "responses-route",
+				PublicID:  "public-model",
+				Endpoints: []string{providerEndpointResponses},
+				Targets: []ModelRouteTargetConfig{{
+					ID:            "primary",
+					Provider:      "azure",
+					UpstreamModel: "physical-model",
+				}},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	t.Cleanup(handler.BeginShutdown)
+
+	ctx, summary := WithRequestSummary(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/public-model:countTokens", strings.NewReader(`{
+		"contents": [{"role":"user","parts":[{"text":"Count this"}]}]
+	}`)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleGeminiModels(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("StatusCode = %d, want 400; body=%s", resp.StatusCode, w.Body.String())
+	}
+
+	var errResp models.GeminiErrorResponse
+	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode Gemini error response: %v", err)
+	}
+	if errResp.Error.Code != http.StatusBadRequest {
+		t.Errorf("Error.Code = %d, want 400", errResp.Error.Code)
+	}
+	if errResp.Error.Status != "INVALID_ARGUMENT" {
+		t.Errorf("Error.Status = %q, want INVALID_ARGUMENT", errResp.Error.Status)
+	}
+	if !strings.Contains(errResp.Error.Message, `model "public-model" does not support /chat/completions`) {
+		t.Errorf("Error.Message = %q, want unsupported endpoint detail", errResp.Error.Message)
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Fatalf("upstream calls = %d, want 0", got)
+	}
+	assertExplicitAdmissionOperationID(t, w, summary, "responses-route")
+}
+
+func newGeminiCountTokensRouteTestHandler(t testing.TB, providers []ProviderConfig, targets []ModelRouteTargetConfig, routing ModelRouteRoutingConfig) *ProxyHandler {
+	t.Helper()
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(ProvidersConfig{
+			SchemaVersion: ProvidersConfigSchemaVersion2,
+			Providers:     providers,
+			ModelRoutes: []ModelRouteConfig{{
+				ID:        "gemini-count-route",
+				PublicID:  "public-model",
+				Endpoints: []string{providerEndpointChatCompletions},
+				Targets:   targets,
+				Routing:   routing,
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	return h
+}
+
+func TestHandleGeminiModelsCountTokensRouteCacheTracksFailoverTargetAndPrimaryRecovery(t *testing.T) {
+	var primaryCalls, secondaryCalls atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := primaryCalls.Add(1)
+		var request models.OpenAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode primary request: %v", err)
+		} else if request.Model != "physical-primary" {
+			t.Errorf("primary model = %q, want physical-primary", request.Model)
+		}
+		if call == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"message":"primary quota","type":"rate_limit_error","code":"rate_limit_exceeded"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+			ID:      "chatcmpl-primary",
+			Object:  "chat.completion",
+			Model:   "physical-primary",
+			Choices: []models.OpenAIChoice{{Index: 0, Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)}}},
+			Usage:   &models.OpenAIUsage{PromptTokens: 11, CompletionTokens: 1, TotalTokens: 12},
+		})
+	}))
+	t.Cleanup(primary.Close)
+
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondaryCalls.Add(1)
+		var request models.OpenAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode secondary request: %v", err)
+		} else if request.Model != "physical-secondary" {
+			t.Errorf("secondary model = %q, want physical-secondary", request.Model)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+			ID:      "chatcmpl-secondary",
+			Object:  "chat.completion",
+			Model:   "physical-secondary",
+			Choices: []models.OpenAIChoice{{Index: 0, Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)}}},
+			Usage:   &models.OpenAIUsage{PromptTokens: 29, CompletionTokens: 1, TotalTokens: 30},
+		})
+	}))
+	t.Cleanup(secondary.Close)
+
+	handler := newGeminiCountTokensRouteTestHandler(t,
+		[]ProviderConfig{
+			{ID: "primary", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: primary.URL, AuthType: "none"},
+			{ID: "secondary", Type: string(providerTypeOpenAICompatible), BaseURL: secondary.URL, AuthType: "none"},
+		},
+		[]ModelRouteTargetConfig{
+			{ID: "target-primary", Provider: "primary", UpstreamModel: "physical-primary"},
+			{ID: "target-secondary", Provider: "secondary", UpstreamModel: "physical-secondary"},
+		},
+		ModelRouteRoutingConfig{Mode: string(routeModePriorityFailover), MaxTargetAttempts: 2, MaxUpstreamSends: 2},
+	)
+
+	requestBody := `{"contents":[{"role":"user","parts":[{"text":"count the recovered route"}]}]}`
+	countTokens := func() int {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/public-model:countTokens", strings.NewReader(requestBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.HandleGeminiModels(w, req)
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, body)
+		}
+		var result models.GeminiCountTokensResponse
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode countTokens response: %v", err)
+		}
+		return result.TotalTokens
+	}
+
+	if got := countTokens(); got != 29 {
+		t.Fatalf("failover TotalTokens = %d, want secondary count 29", got)
+	}
+	if got := countTokens(); got != 11 {
+		t.Fatalf("recovered TotalTokens = %d, want primary count 11", got)
+	}
+
+	handler.geminiCounts.mu.RLock()
+	cacheEntries := len(handler.geminiCounts.entries)
+	handler.geminiCounts.mu.RUnlock()
+	if cacheEntries != 2 {
+		t.Fatalf("countTokens cache entries = %d, want distinct primary and secondary entries", cacheEntries)
+	}
+
+	if got := countTokens(); got != 11 {
+		t.Fatalf("primary cache hit TotalTokens = %d, want 11", got)
+	}
+	if primaryCalls.Load() != 2 || secondaryCalls.Load() != 1 {
+		t.Fatalf("upstream calls primary=%d secondary=%d, want 2/1", primaryCalls.Load(), secondaryCalls.Load())
+	}
+}
+
+func TestGeminiCountTokensRouteCacheKeySeparatesTargets(t *testing.T) {
+	route := &modelRoute{
+		public: publicModelContract{id: "public-model", routeID: "route-id"},
+		targets: []targetBinding{
+			{id: "primary", provider: &providerRuntime{id: "provider-a"}, upstreamModel: "model-a"},
+			{id: "secondary", provider: &providerRuntime{id: "provider-b"}, upstreamModel: "model-b"},
+		},
+	}
+	primaryKey, ok := geminiCountTokensRouteCacheKey("request-key", route, "primary")
+	if !ok {
+		t.Fatal("primary cache key was not generated")
+	}
+	secondaryKey, ok := geminiCountTokensRouteCacheKey("request-key", route, "secondary")
+	if !ok {
+		t.Fatal("secondary cache key was not generated")
+	}
+	if primaryKey == secondaryKey {
+		t.Fatalf("explicit route target cache keys collided: %q", primaryKey)
+	}
+	repeatedPrimaryKey, ok := geminiCountTokensRouteCacheKey("request-key", route, "primary")
+	if !ok || repeatedPrimaryKey != primaryKey {
+		t.Fatalf("primary cache key = %q, %v; want stable %q", repeatedPrimaryKey, ok, primaryKey)
+	}
+	otherRoute := *route
+	otherRoute.public.routeID = "other-route-id"
+	otherRouteKey, ok := geminiCountTokensRouteCacheKey("request-key", &otherRoute, "primary")
+	if !ok {
+		t.Fatal("other route cache key was not generated")
+	}
+	if otherRouteKey == primaryKey {
+		t.Fatalf("explicit route cache keys collided across routes: %q", primaryKey)
+	}
+}
+
+func TestHandleGeminiModelsCountTokensExplicitRouteCacheHitHasOperationIDAndSuppressesStats(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		var request models.OpenAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+		} else if request.Model != "physical-model" {
+			t.Errorf("upstream model = %q, want physical-model", request.Model)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+			ID:      "chatcmpl-count",
+			Object:  "chat.completion",
+			Model:   "physical-model",
+			Choices: []models.OpenAIChoice{{Index: 0, Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)}}},
+			Usage:   &models.OpenAIUsage{PromptTokens: 7, CompletionTokens: 1, TotalTokens: 8},
+		})
+	}))
+	t.Cleanup(upstream.Close)
+
+	handler := newGeminiCountTokensRouteTestHandler(t,
+		[]ProviderConfig{{ID: "upstream", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: upstream.URL, AuthType: "none"}},
+		[]ModelRouteTargetConfig{{ID: "target-upstream", Provider: "upstream", UpstreamModel: "physical-model"}},
+		ModelRouteRoutingConfig{Mode: string(routeModePrimaryOnly), MaxTargetAttempts: 1, MaxUpstreamSends: 1},
+	)
+
+	requestBody := `{"contents":[{"role":"user","parts":[{"text":"count cached route"}]}]}`
+	operationIDs := make([]string, 0, 2)
+	for i := 0; i < 2; i++ {
+		ctx, summary := WithRequestSummary(context.Background())
+		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/public-model:countTokens", strings.NewReader(requestBody)).WithContext(ctx)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.HandleGeminiModels(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("iteration %d status = %d, want 200; body=%s", i, w.Code, w.Body.String())
+		}
+		operationID := w.Header().Get("X-Vekil-Request-ID")
+		if operationID == "" || operationID != summary.OperationID() {
+			t.Fatalf("iteration %d request ID = %q, summary operation = %q", i, operationID, summary.OperationID())
+		}
+		operationIDs = append(operationIDs, operationID)
+		if summary.RouteID() != "gemini-count-route" || summary.UpstreamSendCount() != 0 || summary.TargetSwitchCount() != 0 || summary.RouteExhausted() {
+			t.Fatalf("iteration %d summary route=%q sends=%d switches=%d exhausted=%v, want suppressed route stats",
+				i, summary.RouteID(), summary.UpstreamSendCount(), summary.TargetSwitchCount(), summary.RouteExhausted())
+		}
+	}
+	if operationIDs[0] == operationIDs[1] {
+		t.Fatalf("cache hit reused operation ID %q", operationIDs[0])
+	}
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1 after cache hit", upstreamCalls.Load())
+	}
+	assertNoRouteAttemptStats(t, handler)
+}
+
+func TestHandleGeminiModelsCountTokensLegacyCacheBehavior(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+			ID:      "chatcmpl-legacy-count",
+			Object:  "chat.completion",
+			Model:   "gemini-2.5-pro",
+			Choices: []models.OpenAIChoice{{Index: 0, Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)}}},
+			Usage:   &models.OpenAIUsage{PromptTokens: 13, CompletionTokens: 1, TotalTokens: 14},
+		})
+	})
+
+	requestBody := `{"contents":[{"role":"user","parts":[{"text":"count legacy cache"}]}]}`
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:countTokens", strings.NewReader(requestBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.HandleGeminiModels(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("iteration %d status = %d, want 200; body=%s", i, w.Code, w.Body.String())
+		}
+		if got := w.Header().Get("X-Vekil-Request-ID"); got != "" {
+			t.Fatalf("iteration %d legacy request ID = %q, want empty", i, got)
+		}
+		var result models.GeminiCountTokensResponse
+		if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
+			t.Fatalf("iteration %d decode countTokens response: %v", i, err)
+		}
+		if result.TotalTokens != 13 {
+			t.Fatalf("iteration %d TotalTokens = %d, want 13", i, result.TotalTokens)
+		}
+	}
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1 after legacy cache hit", upstreamCalls.Load())
 	}
 }
 

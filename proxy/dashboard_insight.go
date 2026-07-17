@@ -201,6 +201,7 @@ func (h *ProxyHandler) HandleDashboardInsight(w http.ResponseWriter, r *http.Req
 		writeInsightError(w, "failed to build insight request")
 		return
 	}
+	innerReq = innerReq.WithContext(suppressRouteAttemptStats(innerReq.Context()))
 	innerReq.Header.Set("Content-Type", "application/json")
 	innerReq.Header.Set("User-Agent", "vekil-dashboard-insight")
 

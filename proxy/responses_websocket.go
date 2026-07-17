@@ -22,6 +22,7 @@ import (
 )
 
 const responsesWebSocketRequestHeaderPrefix = "ws_request_header_"
+const responsesWebSocketOperationHeader = "X-Vekil-Request-ID"
 
 var responsesLifecycleOrder = struct {
 	sync.Mutex
@@ -148,6 +149,7 @@ type responsesWebSocketStreamEvent struct {
 		Error             responsesWebSocketStreamError             `json:"error"`
 		IncompleteDetails responsesWebSocketStreamIncompleteDetails `json:"incomplete_details"`
 		Usage             responsesUsage                            `json:"usage"`
+		Output            json.RawMessage                           `json:"output,omitempty"`
 	} `json:"response,omitempty"`
 	Error responsesWebSocketStreamError `json:"error,omitempty"`
 	Item  json.RawMessage               `json:"item,omitempty"`
@@ -218,6 +220,10 @@ type responsesWebSocketSession struct {
 	cancel                  context.CancelFunc
 	baseHeaders             http.Header
 	userAgent               string
+	explicitRouteID         string
+	explicitTargetID        string
+	operationConnectionID   string
+	operationSequence       uint64
 	turnState               string
 	turnMetadata            string
 	lastResponseID          string
@@ -254,16 +260,17 @@ type responsesWebSocketRequestPlan struct {
 }
 
 type responsesWebSocketRequestMetrics struct {
-	deltaAttempted     bool
-	deltaFallback      bool
-	autoCompacted      bool
-	compactedFromItems int
-	compactedFromBytes int
-	compactedToItems   int
-	compactedToBytes   int
-	internalUsage      responsesUsage
-	providerID         string
-	providerKind       string
+	deltaAttempted          bool
+	deltaFallback           bool
+	autoCompacted           bool
+	compactedFromItems      int
+	compactedFromBytes      int
+	compactedToItems        int
+	compactedToBytes        int
+	internalUsage           responsesUsage
+	providerID              string
+	providerKind            string
+	pendingCompactedHistory []json.RawMessage
 }
 
 func (m *responsesWebSocketRequestMetrics) captureObservedProvider(observer *providerRouteObserver) {
@@ -1126,6 +1133,233 @@ func (r *responsesWebSocketCreateRequest) upstreamBody(inputSegments ...[]json.R
 	return buf.Bytes(), nil
 }
 
+func (s *responsesWebSocketSession) nextExplicitRouteOperationID() string {
+	if s == nil {
+		return ""
+	}
+	if strings.TrimSpace(s.operationConnectionID) == "" {
+		s.operationConnectionID = "vekil-ws-" + uuid.NewString()
+	}
+	s.operationSequence++
+	return s.operationConnectionID + ":" + strconv.FormatUint(s.operationSequence, 10)
+}
+
+func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandler, ctx context.Context, model string) (context.Context, *routeOperation, *modelRoute, error) {
+	if h == nil {
+		return ctx, nil, nil, fmt.Errorf("proxy handler is required")
+	}
+
+	resolved, known := h.resolveModelRouteForRequest(model, providerEndpointResponses)
+	if s != nil && s.explicitRouteID != "" {
+		if !known || resolved == nil || resolved.legacy || resolved.public.routeID != s.explicitRouteID {
+			return ctx, nil, resolved, &providerRequestError{
+				statusCode: http.StatusBadRequest,
+				err:        fmt.Errorf("responses websocket session is pinned to model route %q", s.explicitRouteID),
+			}
+		}
+	}
+
+	if !known || resolved == nil || resolved.legacy {
+		return h.withExplicitRouteOperation(ctx, s.ctx, model, providerEndpointResponses)
+	}
+
+	operation := newRouteOperation(resolved, s.ctx)
+	operationID := s.nextExplicitRouteOperationID()
+	operation.mu.Lock()
+	operation.id = operationID
+	operation.mu.Unlock()
+	routedCtx, operation, route, err := h.withExplicitRouteOperation(withRouteOperation(ctx, operation), s.ctx, model, providerEndpointResponses)
+	if err != nil {
+		return routedCtx, operation, route, err
+	}
+	if summary := RequestSummaryFromContext(s.ctx); summary != nil {
+		summary.SetOperationID(operationID)
+		summary.SetRouteID(route.public.routeID)
+	}
+
+	if s.explicitTargetID == "" {
+		return routedCtx, operation, route, nil
+	}
+	if route == nil || route.public.routeID != s.explicitRouteID {
+		return routedCtx, operation, route, &providerRequestError{
+			statusCode: http.StatusBadRequest,
+			err:        fmt.Errorf("responses websocket session route changed after target pinning"),
+		}
+	}
+	if _, ok := route.targetByID(s.explicitTargetID); !ok {
+		return routedCtx, operation, route, &providerRequestError{
+			statusCode: http.StatusServiceUnavailable,
+			err:        fmt.Errorf("pinned responses websocket route target %q is unavailable", s.explicitTargetID),
+		}
+	}
+	if err := operation.forcePinnedTarget(s.explicitTargetID); err != nil {
+		return routedCtx, operation, route, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+	}
+	// Prior websocket frames commit the session to this exact target. Mark the
+	// per-turn operation committed before dispatch so the shared executor cannot
+	// admit an automatic target switch (or same-target loop) on a later turn.
+	operation.setCommitment(downstreamCommitmentProtocolFrame)
+	return routedCtx, operation, route, nil
+}
+
+func (s *responsesWebSocketSession) pinExplicitRouteTarget(route *modelRoute, operation *routeOperation) error {
+	if operation == nil {
+		return nil
+	}
+	if route == nil || route.legacy {
+		return fmt.Errorf("explicit responses websocket route is unavailable")
+	}
+	targetID := operation.pinnedTarget()
+	if targetID == "" {
+		return fmt.Errorf("explicit responses websocket route did not select a target")
+	}
+	if _, ok := route.targetByID(targetID); !ok {
+		return fmt.Errorf("selected responses websocket route target %q is unavailable", targetID)
+	}
+	if s.explicitRouteID != "" && s.explicitRouteID != route.public.routeID {
+		return fmt.Errorf("responses websocket session route changed after target pinning")
+	}
+	if s.explicitTargetID != "" && s.explicitTargetID != targetID {
+		return fmt.Errorf("responses websocket session target changed from %q to %q", s.explicitTargetID, targetID)
+	}
+	operation.pinTarget(targetID)
+	s.explicitRouteID = route.public.routeID
+	s.explicitTargetID = targetID
+	return nil
+}
+
+func responsesWebSocketOperationHeaders(headers http.Header, operation *routeOperation) http.Header {
+	if operation == nil || operation.operationID() == "" {
+		return headers
+	}
+	cloned := headers.Clone()
+	if cloned == nil {
+		cloned = make(http.Header)
+	}
+	cloned.Set(responsesWebSocketOperationHeader, operation.operationID())
+	return cloned
+}
+
+func attachResponsesWebSocketOperationID(resp *http.Response, operation *routeOperation) {
+	if resp == nil || operation == nil || operation.operationID() == "" {
+		return
+	}
+	if resp.Header == nil {
+		resp.Header = make(http.Header)
+	}
+	resp.Header.Set(responsesWebSocketOperationHeader, operation.operationID())
+	if operation.route != nil {
+		if resp.Header.Get("Openai-Model") != "" {
+			resp.Header.Set("Openai-Model", operation.route.public.id)
+		}
+		if resp.Header.Get("X-Openai-Model") != "" {
+			resp.Header.Set("X-Openai-Model", operation.route.public.id)
+		}
+	}
+}
+
+func (s *responsesWebSocketSession) sendExplicitRouteError(operation *routeOperation, status int, message, code string, headers http.Header) error {
+	return s.sendExplicitRouteErrorDetails(operation, status, message, "", code, "", headers)
+}
+
+func (s *responsesWebSocketSession) sendExplicitRouteErrorDetails(operation *routeOperation, status int, message, errType, code, param string, headers http.Header) error {
+	if operation != nil {
+		operation.setCommitment(downstreamCommitmentProtocolFrame)
+		headers = responsesWebSocketOperationHeaders(headers, operation)
+	}
+	return s.sendWrappedErrorDetails(status, message, errType, code, param, headers)
+}
+
+func responsesWebSocketStateValidationBody(body []byte, previousResponseID string) ([]byte, error) {
+	previousResponseID = strings.TrimSpace(previousResponseID)
+	if previousResponseID == "" || strings.HasPrefix(previousResponseID, "vekil-ws-") || strings.HasPrefix(previousResponseID, syntheticCompactionResponseIDPrefix) {
+		return body, nil
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(previousResponseID)
+	if err != nil {
+		return nil, err
+	}
+	payload["previous_response_id"] = encoded
+	return json.Marshal(payload)
+}
+
+func explicitResponsesWebSocketResponseInfo(resp *http.Response, route *modelRoute, operation *routeOperation) (explicitRouteResponseInfo, error) {
+	info, ok := explicitRouteResponseInfoFromResponse(resp)
+	if !ok && route != nil && operation != nil {
+		targetID := operation.pinnedTarget()
+		if target, exists := route.targetByID(targetID); exists && target.provider != nil {
+			info = explicitRouteResponseInfo{
+				routeID:    route.public.routeID,
+				publicID:   route.public.id,
+				targetID:   targetID,
+				providerID: target.provider.id,
+			}
+			ok = true
+		}
+	}
+	if !ok {
+		return explicitRouteResponseInfo{}, fmt.Errorf("explicit responses websocket response is missing route ownership")
+	}
+	if route != nil && (info.routeID != route.public.routeID || info.publicID != route.public.id) {
+		return explicitRouteResponseInfo{}, fmt.Errorf("explicit responses websocket response route ownership changed")
+	}
+	if operation != nil && info.targetID != operation.pinnedTarget() {
+		return explicitRouteResponseInfo{}, fmt.Errorf("explicit responses websocket response target ownership changed")
+	}
+	return info, nil
+}
+
+func prepareExplicitResponsesWebSocketResponse(h *ProxyHandler, resp *http.Response, route *modelRoute, operation *routeOperation) error {
+	if resp == nil || operation == nil {
+		return nil
+	}
+	info, err := explicitResponsesWebSocketResponseInfo(resp, route, operation)
+	if err != nil {
+		return err
+	}
+	if resp.Header == nil {
+		resp.Header = make(http.Header)
+	}
+	if resp.Header.Get("Openai-Model") != "" {
+		resp.Header.Set("Openai-Model", info.publicID)
+	}
+	if resp.Header.Get("X-Openai-Model") != "" {
+		resp.Header.Set("X-Openai-Model", info.publicID)
+	}
+	resp.Body = normalizeResponsesStreamBodyWithBinding(h, resp.Body, info)
+	return nil
+}
+
+func isLocalResponsesWebSocketCompactionResponse(plan responsesWebSocketRequestPlan, operation *routeOperation) bool {
+	if operation == nil || !plan.hasCompactionTrigger() || operation.pinnedTarget() != "" {
+		return false
+	}
+	sends, _, _ := operation.snapshot()
+	return sends == 0
+}
+
+func (s *responsesWebSocketSession) prepareExplicitRouteSuccessResponse(h *ProxyHandler, resp *http.Response, route *modelRoute, operation *routeOperation, plan responsesWebSocketRequestPlan) error {
+	if resp == nil || operation == nil || resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	// An identical compaction trigger can join another request's in-flight compact
+	// call and build its synthetic success entirely in-process. That operation did
+	// not select a provider target and therefore has no provider response ownership
+	// to validate or pin onto the websocket session. A compaction operation that
+	// actually sent upstream has a send/target and still follows the normal path.
+	if isLocalResponsesWebSocketCompactionResponse(plan, operation) {
+		return nil
+	}
+	if err := s.pinExplicitRouteTarget(route, operation); err != nil {
+		return err
+	}
+	return prepareExplicitResponsesWebSocketResponse(h, resp, route, operation)
+}
+
 func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) error {
 	if s == nil || s.isClosing() || (s.ctx != nil && s.ctx.Err() != nil) || h.upstreamShutdownStarted() {
 		return context.Canceled
@@ -1143,6 +1377,8 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return err
 	}
 	metrics := responsesWebSocketRequestMetrics{}
+	var routeOperation *routeOperation
+	var explicitRoute *modelRoute
 	turnRecorded := false
 	var turnStatsRecord responsesTurnStatsRecord
 	recordTurn := func(status int, usage responsesUsage) {
@@ -1150,7 +1386,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			return
 		}
 		turnRecorded = true
-		turnStatsRecord = s.recordTurnStats(h, request.Model, metrics.providerID, metrics.providerKind, status, metrics.totalUsage(usage))
+		turnStatsRecord = s.recordTurnStats(h, request.Model, metrics.providerID, metrics.providerKind, status, metrics.totalUsage(usage), routeOperation)
 	}
 	var peek *peekResult
 	var resp *http.Response
@@ -1242,6 +1478,23 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	// never marks it; do it explicitly here.
 	upstreamCtx = markRetryStatsTracked(upstreamCtx)
 	upstreamCtx, routeObserver := withProviderRouteObserver(upstreamCtx)
+	upstreamCtx, routeOperation, explicitRoute, err = s.prepareExplicitRouteOperation(h, upstreamCtx, request.Model)
+	if err != nil {
+		upstreamCancel()
+		status := upstreamStatusCode(err, http.StatusBadGateway)
+		recordTurn(status, responsesUsage{})
+		if s.isClosing() || h.upstreamShutdownStarted() {
+			return err
+		}
+		code := "server_error"
+		if status == http.StatusBadRequest {
+			code = "invalid_request_error"
+		}
+		if writeErr := s.sendExplicitRouteError(routeOperation, status, fmt.Sprintf("upstream request failed: %v", err), code, nil); writeErr != nil {
+			return writeErr
+		}
+		return err
+	}
 	inflightGen := s.setInflightCancel(upstreamCancel)
 	var finishUpstreamOnce sync.Once
 	finishUpstream := func() {
@@ -1295,7 +1548,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		if s.isClosing() || h.upstreamShutdownStarted() {
 			return err
 		}
-		if writeErr := s.sendWrappedError(status, fmt.Sprintf("upstream request failed: %v", err), "server_error", nil); writeErr != nil {
+		code := "server_error"
+		if status == http.StatusBadRequest {
+			code = "invalid_request_error"
+		}
+		if writeErr := s.sendExplicitRouteError(routeOperation, status, fmt.Sprintf("upstream request failed: %v", err), code, nil); writeErr != nil {
 			return writeErr
 		}
 		return err
@@ -1317,7 +1574,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		if s.isClosing() || h.upstreamShutdownStarted() {
 			return context.Canceled
 		}
-		if writeErr := s.sendWrappedErrorDetails(peek.status, peek.message, peek.errType, code, param, translatedHeaders); writeErr != nil {
+		if writeErr := s.sendExplicitRouteErrorDetails(routeOperation, peek.status, peek.message, peek.errType, code, param, translatedHeaders); writeErr != nil {
 			return writeErr
 		}
 		return nil
@@ -1331,7 +1588,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			if s.isClosing() || h.upstreamShutdownStarted() {
 				return context.Canceled
 			}
-			if writeErr := s.sendWrappedError(http.StatusBadGateway, "upstream stream canceled before terminal delivery", "server_error", translatedHeaders); writeErr != nil {
+			if writeErr := s.sendExplicitRouteError(routeOperation, http.StatusBadGateway, "upstream stream canceled before terminal delivery", "server_error", translatedHeaders); writeErr != nil {
 				return writeErr
 			}
 			return fmt.Errorf("upstream stream canceled before terminal delivery")
@@ -1340,7 +1597,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			recordDisconnected(0, responsesUsage{}, s.clientClosePrecedesShutdown(h))
 			return context.Canceled
 		}
-		if writeErr := s.sendWrappedError(http.StatusBadGateway, "upstream request failed", "server_error", nil); writeErr != nil {
+		if writeErr := s.sendExplicitRouteError(routeOperation, http.StatusBadGateway, "upstream request failed", "server_error", nil); writeErr != nil {
 			return writeErr
 		}
 		return fmt.Errorf("upstream websocket bridge returned no response")
@@ -1352,7 +1609,24 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		}
 	}()
 
-	s.updateTurnState(resp.Header)
+	if err := s.prepareExplicitRouteSuccessResponse(h, resp, explicitRoute, routeOperation, plan); err != nil {
+		recordTurn(http.StatusBadGateway, responsesUsage{})
+		if s.isClosing() || h.upstreamShutdownStarted() {
+			return err
+		}
+		if writeErr := s.sendExplicitRouteError(routeOperation, http.StatusBadGateway, err.Error(), "server_error", resp.Header); writeErr != nil {
+			return writeErr
+		}
+		return err
+	}
+	var pendingExplicitTurnState string
+	if routeOperation == nil {
+		s.updateTurnState(resp.Header)
+	} else if resp.StatusCode == http.StatusOK {
+		// Keep server-issued turn state attempt-local until the selected target
+		// reaches terminal success. A failed stream must not poison the next turn.
+		pendingExplicitTurnState = strings.TrimSpace(resp.Header.Get("X-Codex-Turn-State"))
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -1364,12 +1638,15 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		if s.isClosing() || h.upstreamShutdownStarted() {
 			return context.Canceled
 		}
-		if writeErr := s.sendWrappedError(resp.StatusCode, message, code, resp.Header); writeErr != nil {
+		if writeErr := s.sendExplicitRouteError(routeOperation, resp.StatusCode, message, code, resp.Header); writeErr != nil {
 			return writeErr
 		}
 		return fmt.Errorf("upstream websocket bridge status %d", resp.StatusCode)
 	}
 
+	if routeOperation != nil {
+		routeOperation.setCommitment(downstreamCommitmentProtocolFrame)
+	}
 	streamResult, err := s.streamUpstreamResponse(h, resp.Body, resp.Header, recordTurn)
 	if err != nil {
 		if errors.Is(err, errResponsesWebSocketClientWrite) ||
@@ -1397,7 +1674,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		if s.isClosing() || h.upstreamShutdownStarted() {
 			return err
 		}
-		if writeErr := s.sendWrappedError(http.StatusBadGateway, err.Error(), "server_error", nil); writeErr != nil {
+		if writeErr := s.sendExplicitRouteError(routeOperation, http.StatusBadGateway, err.Error(), "server_error", nil); writeErr != nil {
 			return writeErr
 		}
 		return err
@@ -1406,9 +1683,16 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	bodyClosed = true
 	finishUpstream()
 
+	if metrics.pendingCompactedHistory != nil {
+		s.historyItems = cloneRawMessages(metrics.pendingCompactedHistory)
+		s.historyBytes = rawMessagesSize(s.historyItems)
+	}
+	if pendingExplicitTurnState != "" {
+		s.turnState = pendingExplicitTurnState
+	}
 	s.rememberPlannedResponse(plan, streamResult.responseID, streamResult.outputItems)
 	var autoCompactionUsage responsesUsage
-	metrics, autoCompactionUsage = s.maybeAutoCompactHistory(h, request, metrics)
+	metrics, autoCompactionUsage = s.maybeAutoCompactHistory(h, request, metrics, routeOperation)
 	h.AddResponsesTurnUsage(turnStatsRecord, autoCompactionUsage)
 
 	// streamUpstreamResponse records a structurally valid completion before
@@ -1424,7 +1708,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 // recordTurnStats records one websocket-bridge turn into traffic stats,
 // resolving the provider for attribution. status is the turn outcome (200 for a
 // completed turn, an error status for a failed one).
-func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model, providerID, providerKind string, status int, usage responsesUsage) responsesTurnStatsRecord {
+func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model, providerID, providerKind string, status int, usage responsesUsage, operation *routeOperation) responsesTurnStatsRecord {
 	if h == nil {
 		return responsesTurnStatsRecord{}
 	}
@@ -1433,7 +1717,11 @@ func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model, prov
 			providerID, providerKind = provider.id, string(provider.kind)
 		}
 	}
-	return h.RecordResponsesTurn(model, providerID, providerKind, classifyAgent(s.userAgent), status, usage)
+	operationID := ""
+	if operation != nil {
+		operationID = operation.operationID()
+	}
+	return h.RecordResponsesTurn(model, providerID, providerKind, classifyAgent(s.userAgent), status, usage, operationID)
 }
 
 func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) (responsesWebSocketRequestPlan, error) {
@@ -1481,15 +1769,19 @@ func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx conte
 		resp.Body = io.NopCloser(bytes.NewReader(respBody))
 		return resp, true, false, nil
 	}
+	// The provider has authoritatively rejected this opaque continuation state.
+	// Clear it before the full-replay fallback so a failed fallback cannot leave
+	// the websocket session primed to resend the same invalid state on the next
+	// client retry. A successful fallback may install a fresh state later.
+	hadTurnState := s.turnState != ""
+	s.turnState = ""
 	h.log.Debug("responses websocket delta replay failed; retrying full history",
 		logger.F("model", request.Model),
 		logger.F("previous_response_id", request.PreviousResponseID),
-		logger.F("had_turn_state", s.turnState != ""),
+		logger.F("had_turn_state", hadTurnState),
 		logger.F("delta_attempted", true),
 		logger.F("delta_fallback", true),
 	)
-	s.turnState = ""
-
 	resp, err = s.postCreateRequestSegments(h, ctx, request, plan.fullReplaySegments, false)
 	if err != nil || resp == nil {
 		return resp, true, true, err
@@ -1503,15 +1795,45 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 	if err != nil {
 		return nil, err
 	}
-	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, bodyBytes, request.Model, "responses/websocket", true, s.toolContexts, s.toolScope)
 	headers := s.requestHeaders(request, includeTurnState)
+	operation := routeOperationFromContext(ctx)
+	if operation != nil {
+		// Preserve the logical request before compatibility rewrites sanitize
+		// provider-issued compaction state. The validation helper adds only
+		// provider-visible response lineage; websocket-local and proxy-generated
+		// synthetic response IDs intentionally remain local.
+		stateBindingBody := append([]byte(nil), bodyBytes...)
+		stateBindingBody, err = responsesWebSocketStateValidationBody(stateBindingBody, request.PreviousResponseID)
+		if err != nil {
+			return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+		}
+		if err := h.applyExplicitRequestStateBinding(operation, stateBindingBody, headers); err != nil {
+			return nil, err
+		}
+		if operation.pinnedTarget() != "" {
+			// A state-bound or session-pinned request cannot retry onto another
+			// target. The executor still permits explicitly requested same-target
+			// child sends within this operation budget.
+			operation.setCommitment(downstreamCommitmentProtocolFrame)
+		}
+	}
+	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, bodyBytes, request.Model, "responses/websocket", true, s.toolContexts, s.toolScope)
 	// The websocket bridge records each turn's usage downstream from the streamed
 	// response body (recordTurnStats), so the per-turn usage total returned here
 	// is not observed separately — discard it.
 	if compactionResp, handled, _, err := h.maybeBuildResponsesCompactionTriggerResponse(ctx, bodyBytes, headers, true); handled || err != nil {
+		attachResponsesWebSocketOperationID(compactionResp, operation)
+		if operation != nil && operation.pinnedTarget() != "" {
+			operation.setCommitment(downstreamCommitmentProtocolFrame)
+		}
 		return compactionResp, err
 	}
-	return h.postResponsesWithHeadersForModel(ctx, bodyBytes, headers, request.Model)
+	resp, err := h.postResponsesWithHeadersForModel(ctx, bodyBytes, headers, request.Model)
+	attachResponsesWebSocketOperationID(resp, operation)
+	if operation != nil && operation.pinnedTarget() != "" {
+		operation.setCommitment(downstreamCommitmentProtocolFrame)
+	}
+	return resp, err
 }
 
 func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCreateRequest, includeTurnState bool) http.Header {
@@ -1631,7 +1953,7 @@ func (s *responsesWebSocketSession) rememberPlannedResponse(plan responsesWebSoc
 	s.rememberResponse(resetHistory, responseID, plan.signature, historyInput, outputItems)
 }
 
-func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, request *responsesWebSocketCreateRequest, metrics responsesWebSocketRequestMetrics) (responsesWebSocketRequestMetrics, responsesUsage) {
+func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, request *responsesWebSocketCreateRequest, metrics responsesWebSocketRequestMetrics, operation *routeOperation) (responsesWebSocketRequestMetrics, responsesUsage) {
 	if s == nil || s.isClosing() || (s.ctx != nil && s.ctx.Err() != nil) {
 		return metrics, responsesUsage{}
 	}
@@ -1639,6 +1961,18 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, req
 	// Mark the compaction upstream context as retry-trackable, like the turn
 	// itself, so retries during auto-compaction are counted in retry stats.
 	ctx = markRetryStatsTracked(ctx)
+	if operation != nil {
+		if s.explicitTargetID != "" {
+			if err := operation.forcePinnedTarget(s.explicitTargetID); err != nil {
+				cancel()
+				h.log.Debug("responses websocket auto-compaction target pin failed", logger.Err(err))
+				return metrics, responsesUsage{}
+			}
+		}
+		operation.setCommitment(downstreamCommitmentProtocolFrame)
+		ctx = withRouteOperation(ctx, operation)
+		ctx = withRouteAttemptKind(ctx, routeAttemptCompaction)
+	}
 	inflightGen := s.setInflightCancel(cancel)
 	defer func() {
 		s.clearInflightCancel(inflightGen)
@@ -1736,8 +2070,6 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 			continue
 		}
 
-		s.historyItems = compactedHistory
-		s.historyBytes = rawMessagesSize(compactedHistory)
 		h.log.Debug("responses websocket compacted oversized replay; retrying request",
 			logger.F("model", request.Model),
 			logger.F("previous_response_id", request.PreviousResponseID),
@@ -1750,7 +2082,7 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 			logger.F("tail_attempts", len(keepTailSchedule)),
 		)
 
-		retryResp, retryErr := s.postCreateRequestSegments(h, ctx, request, [][]json.RawMessage{s.historyItems, request.Input}, false)
+		retryResp, retryErr := s.postCreateRequestSegments(h, ctx, request, [][]json.RawMessage{compactedHistory, request.Input}, false)
 		if retryErr != nil {
 			h.log.Debug("responses websocket 413 retry request failed", logger.F("keep_tail", keepTail), logger.Err(retryErr))
 			return lastResp, nil
@@ -1759,6 +2091,9 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 			return lastResp, nil
 		}
 		if retryResp.StatusCode != http.StatusRequestEntityTooLarge {
+			if retryResp.StatusCode == http.StatusOK && metrics != nil {
+				metrics.pendingCompactedHistory = cloneRawMessages(compactedHistory)
+			}
 			return retryResp, nil
 		}
 
@@ -2339,7 +2674,7 @@ func responsesWebSocketErrorHeaders(status int, headers http.Header) http.Header
 	if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable && status != http.StatusGatewayTimeout {
 		return headers
 	}
-	// selectResponsesRetryAfter centralizes Retry-After normalization and clamping.
+	// selectResponsesRetryAfter normalizes provider retry metadata without applying the internal retry-sleep cap.
 	retryAfter, _ := selectResponsesRetryAfter(headers)
 	if retryAfter == "" {
 		return headers
@@ -2387,7 +2722,7 @@ func responsesWebSocketMetadataHeaders(headers http.Header) map[string]interface
 		return nil
 	}
 
-	result := make(map[string]interface{}, 2)
+	result := make(map[string]interface{}, 3)
 	// Go's Header.Get is case-insensitive, but we store the JSON key in
 	// lowercase to match what the real OpenAI backend sends.
 	if value := headers.Get("Openai-Model"); value != "" {
@@ -2395,6 +2730,9 @@ func responsesWebSocketMetadataHeaders(headers http.Header) map[string]interface
 	}
 	if value := headers.Get("X-Openai-Model"); value != "" {
 		result["x-openai-model"] = value
+	}
+	if value := headers.Get(responsesWebSocketOperationHeader); value != "" {
+		result["x-vekil-request-id"] = value
 	}
 
 	if len(result) == 0 {

@@ -6,6 +6,9 @@ import (
 )
 
 func (h *ProxyHandler) writeResponsesUpstreamResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, store *ToolExecutionContextStore, scope string) error {
+	if info, ok := explicitRouteResponseInfoFromResponse(resp); ok {
+		return writeExplicitResponsesResponse(ctx, h, w, resp, info, store, scope)
+	}
 	if h == nil || h.toolOptimizers == nil || !h.toolOptimizers.ShouldInspectNonStreamingResponses() || resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK {
 		// Optimizers off (the default) or a non-OK/empty response: stream the body
 		// through verbatim while sniffing usage tokens for traffic stats.

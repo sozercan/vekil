@@ -567,6 +567,14 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
+func TestParseRetryAfterVeryLongDecimalRemainsInternallyCapped(t *testing.T) {
+	value := strings.Repeat("9", 64*1024)
+	delay, ok := parseRetryAfter(value)
+	if !ok || delay != maxRetryAfter {
+		t.Fatalf("parseRetryAfter(%d-digit decimal) = (%v, %v), want (%v, true)", len(value), delay, ok, maxRetryAfter)
+	}
+}
+
 func TestParseRetryAfter_HTTPDateAndClamp(t *testing.T) {
 	future := time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat)
 	dur, ok := parseRetryAfter(future)

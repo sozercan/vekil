@@ -49,6 +49,20 @@ func (h *ProxyHandler) HandleGeminiModels(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	admissionInbound := r.Context()
+	if action == "countTokens" {
+		admissionInbound = suppressRouteAttemptStats(admissionInbound)
+	}
+	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), admissionInbound, normalizeGeminiModelName(model), providerEndpointChatCompletions)
+	if err != nil {
+		h.writeGeminiUpstreamFailure(w, err)
+		return
+	}
+	if admittedOperation != nil {
+		r = r.WithContext(admissionCtx)
+		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
+	}
+
 	switch action {
 	case "generateContent":
 		h.handleGeminiGenerateContent(w, r, model, false)
@@ -72,6 +86,10 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+	if err := h.validateRouteAwareRequestJSON(body, normalizeGeminiModelName(pathModel), providerEndpointChatCompletions); err != nil {
+		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
+	}
 
 	req, err := decodeGeminiGenerateContentRequest(body)
 	if err != nil {
@@ -119,6 +137,115 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), stream || forceStream)
 	defer upstreamCancel()
+	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
+	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), oaiReq.Model, providerEndpointChatCompletions)
+	if err != nil {
+		h.writeGeminiUpstreamFailure(w, err)
+		return
+	}
+	if routeOperation != nil {
+		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
+	}
+
+	mode := chatCompletionsMode{
+		clientRequestedStream: stream,
+		forceUpstreamStream:   forceStream,
+		injectedStreamUsage:   streamUsageInjected,
+	}
+
+	if routeOperation != nil {
+		resp, err := h.executeChatCompletionsRouteRequest(upstreamCtx, oaiBody, mode)
+		if err != nil {
+			if h.handleShutdownError(w, r, upstreamCtx, err) {
+				return
+			}
+			h.writeGeminiUpstreamFailure(w, err)
+			return
+		}
+
+		resp, oaiBody, mode = h.retryChatCompletionsWithoutInjectedStreamOptions(upstreamCtx, resp, oaiBody, mode)
+		observeUpstreamHeaders(r.Context(), resp.Header)
+
+		writeAggregatedResponse := func(oaiResp *models.OpenAIResponse) {
+			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
+			observeOpenAIUsage(r.Context(), oaiResp.Usage)
+			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(oaiResp))
+		}
+
+		if mode.forceUpstreamStream {
+			oaiResp, finalResp, aggregateErr := h.aggregateExplicitChatCompletionsResponse(upstreamCtx, resp, oaiBody, mode, aggregateGeminiStreamToResponseWithProgress)
+			if aggregateErr != nil {
+				if h.handleShutdownError(w, r, upstreamCtx, aggregateErr) {
+					return
+				}
+				status := http.StatusBadGateway
+				message := aggregateErr.Error()
+				var streamErr *openAIStreamError
+				if errors.As(aggregateErr, &streamErr) {
+					status = streamErr.httpStatus()
+					message = streamErr.Error()
+				}
+				writeGeminiError(w, status, mapGeminiUpstreamStatus(status), message)
+				return
+			}
+			if finalResp != nil {
+				resp = finalResp
+			} else {
+				writeAggregatedResponse(oaiResp)
+				return
+			}
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			defer func() { _ = resp.Body.Close() }()
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
+			h.log.Error("upstream error",
+				logger.F("endpoint", "gemini"),
+				logger.F("status", resp.StatusCode),
+				logger.F("detail", detail),
+				logger.F("request_bytes", len(oaiBody)),
+			)
+			h.log.Debug("upstream error body", logger.F("endpoint", "gemini"), logger.F("status", resp.StatusCode), logger.F("body", string(errBody)))
+			writeGeminiError(w, resp.StatusCode, mapGeminiUpstreamStatus(resp.StatusCode), detail)
+			return
+		}
+
+		err = h.routeChatCompletionsResponse(w, resp, upstreamCtx, mode, chatCompletionsResponseHandlers{
+			stream: func(resp *http.Response) {
+				markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentProtocolFrame)
+				body := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
+				streamOpenAIToGeminiWithLifecycle(w, body, func(status int) { observeResponseFailureStatus(r.Context(), status) }, h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope), h.lifecycleStreamHooks(r.Context(), body.canceledAtFailure, func() { h.WriteShutdownServiceUnavailable(w, r) }), openAIChatStreamUsageCallback(r.Context()))
+			},
+			passthrough: func(resp *http.Response) error {
+				body := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
+				defer func() { _ = body.Close() }()
+				var parsed models.OpenAIResponse
+				if err := json.NewDecoder(body).Decode(&parsed); err != nil {
+					if body.canceledAtFailure() {
+						return context.Canceled
+					}
+					return err
+				}
+				observeOpenAIUsage(r.Context(), parsed.Usage)
+				h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), &parsed, h.toolContexts, scope, false)
+
+				markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(&parsed))
+				return nil
+			},
+		})
+		if err != nil {
+			if h.handleShutdownError(w, r, upstreamCtx, err) {
+				return
+			}
+			writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", "failed to parse upstream response")
+		}
+		return
+	}
 
 	result, err := h.executeChatCompletions(upstreamCtx, oaiBody, chatExecutionOptions{})
 	if err != nil {
@@ -139,11 +266,6 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		return
 	}
 
-	mode := chatCompletionsMode{
-		clientRequestedStream: stream,
-		forceUpstreamStream:   forceStream,
-		injectedStreamUsage:   streamUsageInjected,
-	}
 	result, oaiBody, mode = h.retryChatExecutionWithoutInjectedStreamOptions(upstreamCtx, result, oaiBody, mode)
 	observeChatExecutionRoute(r.Context(), result)
 	observeUpstreamHeaders(r.Context(), result.Headers)
@@ -181,7 +303,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 			oaiResp, aggregateErr = aggregateChatStreamEvents(result.Stream)
 		} else if result.Response != nil {
 			body := newLifecycleAwareReadCloser(result.Response.Body, upstreamCtx)
-			oaiResp, aggregateErr = aggregateGeminiStreamToResponse(body)
+			oaiResp, _, aggregateErr = aggregateGeminiStreamToResponseWithProgress(body)
 			if aggregateErr != nil && body.canceledAtFailure() {
 				aggregateErr = context.Canceled
 			}
@@ -286,6 +408,10 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
+	if err := h.validateRouteAwareRequestJSON(body, normalizeGeminiModelName(pathModel), providerEndpointChatCompletions); err != nil {
+		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
+	}
 
 	req, err := decodeGeminiCountTokensRequest(body)
 	if err != nil {
@@ -300,20 +426,32 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 	}
 	h.observeRequestSummary(r.Context(), "gemini_count_tokens", pathModel, false, providerEndpointChatCompletions)
 
-	cacheKey, err := hashOpenAIRequest(oaiReq)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
+	defer upstreamCancel()
+	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
+	upstreamCtx, routeOperation, route, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), oaiReq.Model, providerEndpointChatCompletions)
+	if err != nil {
+		h.writeGeminiUpstreamFailure(w, err)
+		return
+	}
+	if routeOperation != nil {
+		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
+	}
+
+	requestCacheKey, err := hashOpenAIRequest(oaiReq)
 	if err != nil {
 		writeGeminiError(w, http.StatusInternalServerError, "INTERNAL", "failed to hash countTokens request")
 		return
 	}
 
-	if cached, ok := h.getGeminiCountTokensCache(cacheKey); ok {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(cached)
-		return
+	lookupTargetID := geminiCountTokensSelectedTargetID(route, routeOperation)
+	if cacheKey, ok := geminiCountTokensRouteCacheKey(requestCacheKey, route, lookupTargetID); ok {
+		if cached, hit := h.getGeminiCountTokensCache(cacheKey); hit {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(cached)
+			return
+		}
 	}
-
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
-	defer upstreamCancel()
 
 	oaiResp, err := h.runGeminiCountTokensProbeWithContext(upstreamCtx, oaiReq)
 	if err != nil {
@@ -335,7 +473,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 	if oaiResp.Usage == nil {
 		estimated := buildEstimatedGeminiCountTokensResult(req, estimateOpenAIRequestTokens(oaiReq))
 		h.log.Debug("using estimated Gemini token count", logger.F("reason", "missing_usage"), logger.F("total_tokens", estimated.TotalTokens))
-		h.setGeminiCountTokensCache(cacheKey, estimated)
+		h.cacheGeminiCountTokensResult(requestCacheKey, route, routeOperation, estimated)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(estimated)
 		return
@@ -352,10 +490,54 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 		}}
 	}
 
-	h.setGeminiCountTokensCache(cacheKey, result)
+	h.cacheGeminiCountTokensResult(requestCacheKey, route, routeOperation, result)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(result)
+}
+
+// geminiCountTokensSelectedTargetID mirrors the next target dispatch would choose
+// without consuming any route-attempt budget.
+func geminiCountTokensSelectedTargetID(route *modelRoute, operation *routeOperation) string {
+	if route == nil || route.legacy || operation == nil {
+		return ""
+	}
+	targets := orderedRouteTargets(route, operation, providerEndpointChatCompletions)
+	if len(targets) == 0 {
+		return ""
+	}
+	return targets[0].id
+}
+
+// geminiCountTokensRouteCacheKey preserves the legacy request-only key while
+// isolating explicit-route entries by their physical tokenizer/model owner.
+func geminiCountTokensRouteCacheKey(requestKey string, route *modelRoute, targetID string) (string, bool) {
+	if route == nil || route.legacy {
+		return requestKey, true
+	}
+	target, ok := route.targetByID(targetID)
+	if !ok || target.provider == nil {
+		return "", false
+	}
+	return strings.Join([]string{
+		requestKey,
+		route.public.routeID,
+		target.id,
+		target.provider.id,
+		target.upstreamModel,
+	}, "\x00"), true
+}
+
+func (h *ProxyHandler) cacheGeminiCountTokensResult(requestKey string, route *modelRoute, operation *routeOperation, response models.GeminiCountTokensResponse) {
+	targetID := ""
+	if operation != nil {
+		targetID = operation.pinnedTarget()
+	}
+	cacheKey, ok := geminiCountTokensRouteCacheKey(requestKey, route, targetID)
+	if !ok {
+		return
+	}
+	h.setGeminiCountTokensCache(cacheKey, response)
 }
 
 func buildEstimatedGeminiCountTokensResult(req *models.GeminiGenerateContentRequest, total int) models.GeminiCountTokensResponse {
@@ -451,6 +633,16 @@ func (h *ProxyHandler) runGeminiCountTokensProbeWithContext(upstreamCtx context.
 	probeReq.MaxCompletionTokens = &one
 	probeReq.MaxTokens = nil
 
+	if routeOperationFromContext(upstreamCtx) != nil {
+		oaiResp, fallback, err := h.executeGeminiCountTokensProbe(upstreamCtx, probeReq)
+		if fallback {
+			probeReq.MaxCompletionTokens = nil
+			probeReq.MaxTokens = &one
+			return h.executeGeminiCountTokensProbeFinal(withRouteAttemptKind(upstreamCtx, routeAttemptProtocolRecovery), probeReq)
+		}
+		return oaiResp, err
+	}
+
 	body, err := json.Marshal(probeReq)
 	if err != nil {
 		return nil, &geminiProtocolError{statusCode: http.StatusInternalServerError, status: "INTERNAL", message: "failed to marshal countTokens probe request"}
@@ -484,6 +676,48 @@ func copyOpenAIRequestForGeminiCountTokensProbe(baseReq *models.OpenAIRequest) *
 	}
 	probeReq := *baseReq
 	return &probeReq
+}
+
+func (h *ProxyHandler) executeGeminiCountTokensProbe(upstreamCtx context.Context, probeReq *models.OpenAIRequest) (*models.OpenAIResponse, bool, error) {
+	body, err := json.Marshal(probeReq)
+	if err != nil {
+		return nil, false, &geminiProtocolError{
+			statusCode: http.StatusInternalServerError,
+			status:     "INTERNAL",
+			message:    "failed to marshal countTokens probe request",
+		}
+	}
+
+	resp, err := h.postChatCompletions(upstreamCtx, body)
+	if err != nil {
+		return nil, false, mapGeminiCountTokensTransportError(err)
+	}
+
+	if resp.StatusCode == http.StatusBadRequest && probeReq.MaxCompletionTokens != nil {
+		_ = resp.Body.Close()
+		return nil, true, nil
+	}
+
+	return h.decodeGeminiProbeResponse(resp)
+}
+
+func (h *ProxyHandler) executeGeminiCountTokensProbeFinal(upstreamCtx context.Context, probeReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
+	body, err := json.Marshal(probeReq)
+	if err != nil {
+		return nil, &geminiProtocolError{
+			statusCode: http.StatusInternalServerError,
+			status:     "INTERNAL",
+			message:    "failed to marshal countTokens probe request",
+		}
+	}
+
+	resp, err := h.postChatCompletions(upstreamCtx, body)
+	if err != nil {
+		return nil, mapGeminiCountTokensTransportError(err)
+	}
+
+	oaiResp, _, err := h.decodeGeminiProbeResponse(resp)
+	return oaiResp, err
 }
 
 func (h *ProxyHandler) decodeGeminiProbeExecution(result chatExecutionResult) (*models.OpenAIResponse, error) {

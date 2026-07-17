@@ -92,14 +92,14 @@ A sample manifest is included at [`k8s/vekil.yaml`](../k8s/vekil.yaml).
 kubectl apply -f k8s/vekil.yaml
 ```
 
-The manifest first uses `/healthz` as a startup probe with a 90-second failure budget. This covers synchronous dynamic-provider model initialization, which can take up to 30 seconds before the HTTP listener exists; Kubernetes suppresses liveness and readiness checks until startup succeeds. Afterward, `/healthz` provides liveness and `/readyz` provides readiness. The readiness probe allows 12 seconds, leaving margin over Vekil's 10-second provider readiness check, and runs every 15 seconds with a single failure threshold. With the default zero-config Copilot startup, the process can therefore stay live while device-code authentication is pending, but the Pod remains not Ready and the Service has no ready endpoint until authentication succeeds.
+The manifest first uses `/healthz` as a startup probe with a 90-second failure budget. This covers synchronous dynamic-provider model initialization, which can take up to 30 seconds before the HTTP listener exists; Kubernetes suppresses liveness and readiness checks until startup succeeds. Afterward, `/healthz` provides liveness and `/readyz` provides readiness. The readiness probe allows 12 seconds, leaving margin over Vekil's 10-second readiness checks, and runs every 15 seconds with a single failure threshold. With the default zero-config Copilot startup, the process can therefore stay live while device-code authentication is pending, but the Pod remains not Ready and the Service has no ready endpoint until authentication succeeds. Static Azure and generic compatible providers are not actively probed by `/readyz`; for routes composed only of those providers, readiness confirms compiled configuration, locally available startup credentials, admission state, and shutdown state—not target reachability or credential acceptance.
 
 The example token cache is an `emptyDir`. It survives a container restart inside the same Pod, but **does not survive Pod replacement, rescheduling, or a Deployment rollout**. For a durable deployment, either:
 
 - inject `COPILOT_GITHUB_TOKEN` from a Kubernetes Secret so every replacement can authenticate non-interactively, or
 - replace the `emptyDir` with persistent storage if you rely on Vekil-managed cached credentials.
 
-Explicit provider routing also needs the provider file to exist in the container. Mount the JSON/YAML config from a Secret or ConfigMap and add `--providers-config /path/in/container/providers.yaml` to the container args. Any `api_key_env` or other credential environment variables referenced by that file must be supplied separately, normally from Secrets. Do not assume the example `emptyDir` persists either provider credentials or configuration.
+Explicit provider routing also needs the provider file to exist in the container. Mount the JSON/YAML config from a Secret or ConfigMap and add `--providers-config /path/in/container/providers.yaml` to the container args. Any `api_key_env` or other credential environment variables referenced by that file must be supplied separately, normally from Secrets. Do not assume the example `emptyDir` persists either provider credentials or configuration. Provider-state bindings and Responses-backed Chat replay state are memory-only: use one replica or session affinity to the same Pod for stateful explicit Responses traffic, and drain those continuations before rolling or replacing Pods.
 
 ## First Run And Authentication
 
@@ -138,5 +138,5 @@ curl http://localhost:1337/v1/models
 ```
 
 - `/healthz` confirms the process is serving HTTP.
-- `/readyz` verifies provider auth and upstream probes.
+- `/readyz` verifies compiled configuration, required startup auth/catalog initialization where supported, admission state, and shutdown state. It is not a health probe for static Azure or generic route targets.
 - `/v1/models` shows the merged public model catalog clients will see.
