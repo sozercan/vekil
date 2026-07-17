@@ -168,7 +168,8 @@ func validateClaudeForwardedArgs(args []string) error {
 			}
 			switch {
 			case arg == "--settings" || strings.HasPrefix(arg, "--settings="),
-				arg == "--setting-sources" || strings.HasPrefix(arg, "--setting-sources="):
+				arg == "--setting-sources" || strings.HasPrefix(arg, "--setting-sources="),
+				arg == "--managed-settings" || strings.HasPrefix(arg, "--managed-settings="):
 				return fmt.Errorf("claude settings-source overrides are not supported by the managed Vekil launcher")
 			case arg == "--bg" || arg == "--background" || strings.HasPrefix(arg, "--background="),
 				arg == "--tmux" || strings.HasPrefix(arg, "--tmux="),
@@ -207,13 +208,13 @@ func claudeOptionRequiresValue(arg string) bool {
 		return false
 	}
 	switch arg {
-	case "--add-dir", "--allowedTools", "--allowed-tools", "--append-system-prompt",
+	case "--add-dir", "--allowedTools", "--allowed-tools", "--append-system-prompt", "--append-system-prompt-file",
 		"--betas", "--debug-file", "--disallowedTools", "--disallowed-tools",
 		"--effort", "--file", "--input-format", "--json-schema", "--max-budget-usd", "--max-turns",
 		"--mcp-config", "--output-format", "--permission-mode", "--plugin-dir",
-		"--plugin-marketplace", "--plugin-url", "--prompt-suggestions", "--session-id", "--name", "-n",
+		"--permission-prompt-tool", "--plugin-marketplace", "--plugin-url", "--prompt-suggestions", "--session-id", "--name", "-n",
 		"--remote-control-session-name-prefix",
-		"--system-prompt", "--tools":
+		"--system-prompt", "--system-prompt-file", "--tools":
 		return true
 	default:
 		return false

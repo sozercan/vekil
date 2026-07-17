@@ -237,6 +237,7 @@ func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
 		want string
 	}{
 		{name: "settings", args: []string{"--settings", "{}"}, want: "settings-source overrides"},
+		{name: "managed settings", args: []string{"--managed-settings", "{}"}, want: "settings-source overrides"},
 		{name: "background", args: []string{"--background"}, want: "detached Claude sessions"},
 		{name: "tmux", args: []string{"--tmux"}, want: "detached Claude sessions"},
 		{name: "model", args: []string{"--model", "responses-only"}, want: "model or session overrides"},
@@ -250,6 +251,9 @@ func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
 		{name: "subcommand after max turns", args: []string{"--max-turns", "5", "agents"}, want: "agent-management commands"},
 		{name: "subcommand after name", args: []string{"--name", "session", "agents"}, want: "agent-management commands"},
 		{name: "subcommand after short name", args: []string{"-n", "session", "agents"}, want: "agent-management commands"},
+		{name: "subcommand after permission prompt tool", args: []string{"--permission-prompt-tool", "mcp__permissions", "agents"}, want: "agent-management commands"},
+		{name: "subcommand after system prompt file", args: []string{"--system-prompt-file", "prompt.txt", "agents"}, want: "agent-management commands"},
+		{name: "subcommand after appended system prompt file", args: []string{"--append-system-prompt-file", "prompt.txt", "agents"}, want: "agent-management commands"},
 		{name: "subcommand after delimiter", args: []string{"--", "remote-control"}, want: "agent-management commands"},
 	}
 	for _, tc := range tests {
