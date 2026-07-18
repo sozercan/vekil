@@ -2,6 +2,23 @@
 
 These examples all target the same local proxy. Replace model IDs with public IDs from `/v1/models` in your deployment; client setup does not need to change when a model is backed by GitHub Copilot, Azure OpenAI, OpenAI Codex, or a generic compatible provider.
 
+## Schema-v3 policy profile IDs
+
+A semantic policy profile such as `coding-economy` is a narrower public model contract than a direct model ID. In v1 it is accepted only by text/function-tool `POST /v1/chat/completions`. It is not accepted by Anthropic Messages (including Claude Code), Gemini routes/CLI, OpenAI Responses, the Responses websocket bridge, compact/memory endpoints, or token-counting routes. Responses-native terminal routes are also ineligible policy destinations.
+
+Clients that can explicitly use the OpenAI Chat Completions wire API may request a policy profile. The returned Chat JSON/SSE model identity remains the policy public ID; internal lightweight/powerful provider and route IDs are not a client contract. Exposed direct terminal routes and other public models remain independently requestable, so use `exposure: internal` when bypass must not be offered.
+
+```bash
+curl http://localhost:1337/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "coding-economy",
+    "messages": [{"role": "user", "content": "Review this function"}]
+  }'
+```
+
+The profile's effective mode is capped by `--policy-routing` / `POLICY_ROUTING_MODE`, which defaults to `off`. See [Semantic Policy Routing](policy-routing.md) before enabling observe or enforce.
+
 ## Responses-native models on Chat-compatible clients
 
 A model whose native catalog endpoint is only `/responses` can still serve OpenAI Chat Completions, Claude Code through Anthropic Messages, and Gemini-compatible generation through Vekil's Chat-over-Responses adapter. Native Chat is preferred when a model supports both. The model catalog intentionally remains native, so a Responses-backed model can continue to show only `/responses` in `supported_endpoints`; this does not mean the documented Vekil compatibility routes are unavailable.
@@ -24,6 +41,8 @@ env ANTHROPIC_BASE_URL=http://localhost:1337 \
 
 ## OpenAI Codex CLI
 
+The Codex CLI example uses the Responses API, so select a direct Responses-capable model rather than a v1 policy profile.
+
 ```bash
 env OPENAI_API_KEY=dummy \
   OPENAI_BASE_URL=http://localhost:1337/v1 \
@@ -31,6 +50,8 @@ env OPENAI_API_KEY=dummy \
 ```
 
 ## GitHub Copilot CLI
+
+This example uses `COPILOT_PROVIDER_WIRE_API=responses`, so its model must be a direct Responses-capable model. A policy profile requires the completions wire API and must still fit the v1 text/function-tool Chat contract.
 
 ```bash
 env COPILOT_PROVIDER_BASE_URL=http://localhost:1337/v1 \
@@ -42,6 +63,8 @@ env COPILOT_PROVIDER_BASE_URL=http://localhost:1337/v1 \
 ```
 
 ## Gemini CLI
+
+Gemini endpoints do not accept v1 policy profile IDs; select a direct public model/route.
 
 ```bash
 env GEMINI_API_KEY=dummy \
@@ -94,6 +117,8 @@ curl http://localhost:1337/v1/chat/completions \
 ```
 
 ## OpenAI Responses API
+
+Use a direct Responses-capable public model. V1 policy profile IDs fail locally on this endpoint.
 
 ```bash
 curl http://localhost:1337/v1/responses \

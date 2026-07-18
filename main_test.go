@@ -172,6 +172,69 @@ func TestServeFlagsCopilotHeaderCLIOverridesEnv(t *testing.T) {
 	}
 }
 
+func TestServeFlagsPolicyRoutingDefaultsAndOverrides(t *testing.T) {
+	t.Run("defaults off and disallows remote", func(t *testing.T) {
+		t.Setenv("POLICY_ROUTING_MODE", "")
+		t.Setenv("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", "")
+
+		serve := parseServeFlagsForTest(t)
+		mode, err := serve.parsedPolicyRoutingMode()
+		if err != nil {
+			t.Fatalf("parsedPolicyRoutingMode() error = %v", err)
+		}
+		if mode != proxy.PolicyRoutingModeOff {
+			t.Fatalf("policy routing mode = %q, want off", mode)
+		}
+		if *serve.policyRoutingAllowRemote {
+			t.Fatal("remote single-tenant acknowledgement should default to false")
+		}
+	})
+
+	t.Run("environment defaults", func(t *testing.T) {
+		t.Setenv("POLICY_ROUTING_MODE", "observe")
+		t.Setenv("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", "true")
+
+		serve := parseServeFlagsForTest(t)
+		mode, err := serve.parsedPolicyRoutingMode()
+		if err != nil {
+			t.Fatalf("parsedPolicyRoutingMode() error = %v", err)
+		}
+		if mode != proxy.PolicyRoutingModeObserve {
+			t.Fatalf("policy routing mode = %q, want observe", mode)
+		}
+		if !*serve.policyRoutingAllowRemote {
+			t.Fatal("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT=true should be honored")
+		}
+	})
+
+	t.Run("CLI overrides environment", func(t *testing.T) {
+		t.Setenv("POLICY_ROUTING_MODE", "observe")
+		t.Setenv("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", "true")
+
+		serve := parseServeFlagsForTest(t,
+			"--policy-routing", "enforce",
+			"--policy-routing-allow-remote-single-tenant=false",
+		)
+		mode, err := serve.parsedPolicyRoutingMode()
+		if err != nil {
+			t.Fatalf("parsedPolicyRoutingMode() error = %v", err)
+		}
+		if mode != proxy.PolicyRoutingModeEnforce {
+			t.Fatalf("policy routing mode = %q, want enforce", mode)
+		}
+		if *serve.policyRoutingAllowRemote {
+			t.Fatal("CLI false should override remote acknowledgement environment default")
+		}
+	})
+}
+
+func TestServeFlagsRejectInvalidPolicyRoutingMode(t *testing.T) {
+	serve := parseServeFlagsForTest(t, "--policy-routing", "sometimes")
+	if _, err := serve.parsedPolicyRoutingMode(); err == nil {
+		t.Fatal("parsedPolicyRoutingMode() error = nil, want invalid mode error")
+	}
+}
+
 func TestServeFlagsResponsesWebSocketDisabledByDefault(t *testing.T) {
 	serve := parseServeFlagsForTest(t)
 	cfg := serve.responsesWebSocketConfig()
@@ -432,6 +495,83 @@ func TestServeUntilContextDoneStopsServerOnCopilotAuthFailure(t *testing.T) {
 	}
 }
 
+func TestServeUntilContextDoneInitializesPolicyRoutingAfterAuthAndValidation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	events := make(chan string, 5)
+	server := &fakeServeLifecycleServer{
+		startFn: func() error {
+			events <- "start"
+			return nil
+		},
+		validateFn: func(context.Context) error {
+			events <- "validate"
+			return nil
+		},
+		initializePolicyFn: func(context.Context) error {
+			events <- "policy"
+			cancel()
+			return nil
+		},
+		stopFn: func(context.Context) error {
+			events <- "stop"
+			return nil
+		},
+	}
+	authenticator := &fakeServeStartupAuthenticator{
+		getTokenFn: func(context.Context) (string, error) {
+			events <- "auth"
+			return "test-token", nil
+		},
+	}
+
+	if err := serveUntilContextDone(ctx, server, authenticator, true, logger.NewWithWriter(logger.LevelError, io.Discard)); err != nil {
+		t.Fatalf("serveUntilContextDone() error = %v", err)
+	}
+	for _, want := range []string{"start", "auth", "validate", "policy", "stop"} {
+		assertNextServeEvent(t, events, want)
+	}
+}
+
+func TestServeUntilContextDoneInitializesPolicyRoutingWithoutCopilot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	server := &fakeServeLifecycleServer{
+		initializePolicyFn: func(context.Context) error {
+			cancel()
+			return nil
+		},
+	}
+
+	if err := serveUntilContextDone(ctx, server, nil, false, logger.NewWithWriter(logger.LevelError, io.Discard)); err != nil {
+		t.Fatalf("serveUntilContextDone() error = %v", err)
+	}
+	if !server.policyInitialized {
+		t.Fatal("policy routing initialization was not called")
+	}
+	if !server.stopped {
+		t.Fatal("server was not stopped after context cancellation")
+	}
+}
+
+func TestServeUntilContextDoneStopsServerOnPolicyRoutingInitializationFailure(t *testing.T) {
+	initializationErr := errors.New("classifier preflight failed")
+	server := &fakeServeLifecycleServer{
+		initializePolicyFn: func(context.Context) error {
+			return initializationErr
+		},
+	}
+
+	err := serveUntilContextDone(context.Background(), server, nil, false, logger.NewWithWriter(logger.LevelError, io.Discard))
+	if !errors.Is(err, initializationErr) {
+		t.Fatalf("serveUntilContextDone() error = %v, want wrapped initialization error", err)
+	}
+	if !strings.Contains(err.Error(), "policy routing initialization failed") {
+		t.Fatalf("serveUntilContextDone() error = %v, want policy routing context", err)
+	}
+	if !server.stopped {
+		t.Fatal("server was not stopped after policy routing initialization failure")
+	}
+}
+
 func assertNextServeEvent(t *testing.T, events <-chan string, want string) {
 	t.Helper()
 	select {
@@ -448,10 +588,12 @@ type fakeServeLifecycleServer struct {
 	startFn            func() error
 	stopFn             func(context.Context) error
 	validateFn         func(context.Context) error
+	initializePolicyFn func(context.Context) error
 	authPending        bool
 	authPendingUpdates []bool
 	started            bool
 	stopped            bool
+	policyInitialized  bool
 }
 
 func (f *fakeServeLifecycleServer) Start() error {
@@ -473,6 +615,14 @@ func (f *fakeServeLifecycleServer) Stop(ctx context.Context) error {
 func (f *fakeServeLifecycleServer) ValidateDynamicProviderModels(ctx context.Context) error {
 	if f.validateFn != nil {
 		return f.validateFn(ctx)
+	}
+	return nil
+}
+
+func (f *fakeServeLifecycleServer) InitializePolicyRouting(ctx context.Context) error {
+	f.policyInitialized = true
+	if f.initializePolicyFn != nil {
+		return f.initializePolicyFn(ctx)
 	}
 	return nil
 }
@@ -566,6 +716,48 @@ func TestRunConfigValidateSuccess(t *testing.T) {
 		t.Fatalf("ValidateProvidersConfigFile path = %q, want %q", gotPath, "/tmp/provider config.yaml")
 	}
 	if got := stdout.String(); got != "Providers config is valid: /tmp/provider config.yaml\n" {
+		t.Fatalf("stdout = %q, want success message", got)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty", got)
+	}
+}
+
+func TestRunConfigValidateLive(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	offlineCalled := false
+	liveCalls := 0
+
+	code := runConfigWithDeps([]string{"validate", "--live", "--providers-config", "/tmp/providers.yaml"}, configValidateDeps{
+		stdout: &stdout,
+		stderr: &stderr,
+		validateProvidersConfigFile: func(string) error {
+			offlineCalled = true
+			return nil
+		},
+		validateProvidersConfigFileLive: func(ctx context.Context, path string) error {
+			liveCalls++
+			if ctx == nil {
+				t.Fatal("live validation context is nil")
+			}
+			if path != "/tmp/providers.yaml" {
+				t.Fatalf("live validation path = %q, want /tmp/providers.yaml", path)
+			}
+			return nil
+		},
+	})
+
+	if code != 0 {
+		t.Fatalf("runConfigWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if offlineCalled {
+		t.Fatal("--live called the offline-only validator")
+	}
+	if liveCalls != 1 {
+		t.Fatalf("ValidateProvidersConfigFileLive calls = %d, want 1", liveCalls)
+	}
+	if got := stdout.String(); got != "Providers config is valid: /tmp/providers.yaml\n" {
 		t.Fatalf("stdout = %q, want success message", got)
 	}
 	if got := stderr.String(); got != "" {

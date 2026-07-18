@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -191,12 +192,21 @@ func startProxy() {
 		}
 	}
 
+	policyMode, err := proxy.ParsePolicyRoutingMode(os.Getenv("POLICY_ROUTING_MODE"))
+	if err != nil {
+		log.Error("invalid policy routing mode", logger.Err(err))
+		showErrorDialog("Vekil Start Failed", fmt.Sprintf("Invalid POLICY_ROUTING_MODE.\n\n%v", err))
+		return
+	}
 	nextSrv, err := server.New(
 		authenticator,
 		log,
 		proxyHost,
 		proxyPort,
-		server.WithProxyOptions(proxy.WithProvidersConfig(providersCfg)),
+		server.WithProxyOptions(
+			proxy.WithProvidersConfig(providersCfg),
+			proxy.WithPolicyRoutingMode(policyMode),
+		),
 	)
 	if err != nil {
 		log.Error("server init failed", logger.Err(err))
@@ -206,6 +216,17 @@ func startProxy() {
 	if err := nextSrv.Start(); err != nil {
 		log.Error("server start failed", logger.Err(err))
 		showErrorDialog("Vekil Start Failed", fmt.Sprintf("Could not start Vekil on port 1337.\n\n%v", err))
+		return
+	}
+	// Each classifier route already has its own configured timeout. Do not place
+	// one short aggregate deadline over a sequence of otherwise healthy routes.
+	preflightErr := nextSrv.InitializePolicyRouting(context.Background())
+	if preflightErr != nil {
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = nextSrv.Stop(stopCtx)
+		cancelStop()
+		log.Error("policy routing initialization failed", logger.Err(preflightErr))
+		showErrorDialog("Vekil Start Failed", fmt.Sprintf("Policy routing preflight failed.\n\n%v", preflightErr))
 		return
 	}
 	srv = nextSrv

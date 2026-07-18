@@ -55,8 +55,8 @@ func TestLoadProvidersConfigFileSchemaVersionsAndDefaults(t *testing.T) {
 		{
 			name:    "unsupported schema version",
 			ext:     ".yaml",
-			body:    "schema_version: 3\nproviders: []\n",
-			wantErr: "schema_version: unsupported schema version 3",
+			body:    "schema_version: 4\nproviders: []\n",
+			wantErr: "schema_version: unsupported schema version 4",
 		},
 		{
 			name: "version 2 defaults route metadata and budgets",

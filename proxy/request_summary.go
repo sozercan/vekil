@@ -17,27 +17,35 @@ type requestSummaryContextKey struct{}
 type RequestSummary struct {
 	mu sync.Mutex
 
-	endpoint          string
-	model             string
-	provider          string
-	providerKind      string
-	operationID       string
-	routeID           string
-	finalTarget       string
-	lastTarget        string
-	lastProvider      string
-	lastProviderKind  string
-	upstreamSendCount int64
-	targetSwitchCount int64
-	routeExhausted    bool
-	streamSet         bool
-	stream            bool
-	upstreamRequestID string
-	promptTokens      *int
-	completionTokens  *int
-	totalTokens       *int
-	cachedTokens      *int
-	reasoningTokens   *int
+	endpoint             string
+	model                string
+	provider             string
+	providerKind         string
+	operationID          string
+	routeID              string
+	policyID             string
+	policyMode           string
+	policyTier           string
+	policyDecision       string
+	configGeneration     string
+	profileGeneration    string
+	classifierGeneration string
+	binaryGeneration     string
+	finalTarget          string
+	lastTarget           string
+	lastProvider         string
+	lastProviderKind     string
+	upstreamSendCount    int64
+	targetSwitchCount    int64
+	routeExhausted       bool
+	streamSet            bool
+	stream               bool
+	upstreamRequestID    string
+	promptTokens         *int
+	completionTokens     *int
+	totalTokens          *int
+	cachedTokens         *int
+	reasoningTokens      *int
 	// extraPromptTokens / extraCompletionTokens accumulate out-of-band token
 	// spend that is separate from the turn's own reported usage — e.g. an
 	// internal /responses compaction call made while serving a 413 oversized-
@@ -135,6 +143,25 @@ func (s *RequestSummary) RouteID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.routeID
+}
+
+// SetPolicyDecision records bounded, content-free routing provenance for a
+// policy-selected request. Generation values are hashes and never include
+// secrets or request content.
+func (s *RequestSummary) SetPolicyDecision(plan chatOperationPlan) {
+	if s == nil || strings.TrimSpace(plan.policyID) == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.policyID = plan.policyID
+	s.policyMode = plan.effectiveMode.String()
+	s.policyTier = plan.selectedTier.String()
+	s.policyDecision = plan.decision.Category
+	s.configGeneration = plan.configGeneration
+	s.profileGeneration = plan.profileGeneration
+	s.classifierGeneration = plan.classifierGeneration
+	s.binaryGeneration = plan.binaryGeneration
 }
 
 // SetFinalTarget records the final/canonical physical target selected for the
@@ -480,12 +507,22 @@ func (s *RequestSummary) LoggerFields() []logger.Field {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	fields := make([]logger.Field, 0, 14)
+	fields := make([]logger.Field, 0, 24)
 	if s.operationID != "" {
 		fields = append(fields, logger.F("operation_id", s.operationID))
 	}
 	if s.routeID != "" {
 		fields = append(fields, logger.F("route_id", s.routeID))
+	}
+	if s.policyID != "" {
+		fields = append(fields, logger.F("policy_id", s.policyID))
+		fields = append(fields, logger.F("policy_mode", s.policyMode))
+		fields = append(fields, logger.F("policy_tier", s.policyTier))
+		fields = append(fields, logger.F("policy_decision", s.policyDecision))
+		fields = append(fields, logger.F("config_generation", s.configGeneration))
+		fields = append(fields, logger.F("profile_generation", s.profileGeneration))
+		fields = append(fields, logger.F("classifier_generation", s.classifierGeneration))
+		fields = append(fields, logger.F("binary_generation", s.binaryGeneration))
 	}
 	if s.finalTarget != "" {
 		fields = append(fields, logger.F("final_target", s.finalTarget))

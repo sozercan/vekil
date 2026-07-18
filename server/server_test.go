@@ -141,6 +141,139 @@ func TestAddrPreservesConfiguredFixedPort(t *testing.T) {
 	}
 }
 
+func TestValidatePolicyRoutingListenHost(t *testing.T) {
+	tests := []struct {
+		name        string
+		host        string
+		active      bool
+		allow       bool
+		wantErr     bool
+		wantErrText string
+	}{
+		{name: "inactive policy allows remote", host: "0.0.0.0", active: false},
+		{name: "loopback IPv4", host: "127.0.0.2", active: true},
+		{name: "loopback IPv6", host: "[::1]", active: true},
+		{name: "localhost name", host: "LOCALHOST.", active: true},
+		{name: "acknowledged remote", host: "0.0.0.0", active: true, allow: true},
+		{name: "remote IPv4 rejected", host: "0.0.0.0", active: true, wantErr: true, wantErrText: "--policy-routing-allow-remote-single-tenant"},
+		{name: "wildcard host rejected", host: "", active: true, wantErr: true, wantErrText: "non-loopback"},
+		{name: "unresolved hostname rejected", host: "proxy.internal", active: true, wantErr: true, wantErrText: "non-loopback"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validatePolicyRoutingListenHost(tc.host, tc.active, tc.allow)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("validatePolicyRoutingListenHost() error = nil, want rejection")
+				}
+				if !strings.Contains(err.Error(), tc.wantErrText) {
+					t.Fatalf("validatePolicyRoutingListenHost() error = %q, want %q", err, tc.wantErrText)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validatePolicyRoutingListenHost() error = %v", err)
+			}
+		})
+	}
+}
+
+type fakeStartupReadinessGate struct {
+	authPending       bool
+	validationPending bool
+	policyPending     bool
+	policyDiagnostic  string
+}
+
+func (f fakeStartupReadinessGate) StartupAuthenticationPending() bool {
+	return f.authPending
+}
+
+func (f fakeStartupReadinessGate) DynamicProviderValidationPending() bool {
+	return f.validationPending
+}
+
+func (f fakeStartupReadinessGate) PolicyRoutingPreflightPending() bool {
+	return f.policyPending
+}
+
+func (f fakeStartupReadinessGate) PolicyRoutingReadinessDiagnostic() string {
+	return f.policyDiagnostic
+}
+
+func TestProviderValidationGateIncludesPolicyPreflight(t *testing.T) {
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	handler := withProviderValidationGate(next, fakeStartupReadinessGate{
+		policyPending:    true,
+		policyDiagnostic: "policy classifier preflight pending",
+	})
+
+	for _, tc := range []struct {
+		path       string
+		wantStatus int
+		wantBody   string
+	}{
+		{path: "/healthz", wantStatus: http.StatusNoContent},
+		{path: "/readyz", wantStatus: http.StatusNoContent},
+		{path: "/v1/models", wantStatus: http.StatusServiceUnavailable, wantBody: "policy classifier preflight pending"},
+		{path: "/v1/chat/completions", wantStatus: http.StatusServiceUnavailable, wantBody: "policy classifier preflight pending"},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			if got := w.Code; got != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", got, tc.wantStatus, w.Body.String())
+			}
+			if tc.wantBody != "" && !strings.Contains(w.Body.String(), tc.wantBody) {
+				t.Fatalf("body = %q, want %q", w.Body.String(), tc.wantBody)
+			}
+		})
+	}
+}
+
+func TestProviderValidationGatePreservesStartupPrecedence(t *testing.T) {
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	tests := []struct {
+		name string
+		gate fakeStartupReadinessGate
+		want string
+	}{
+		{
+			name: "authentication before other preflight",
+			gate: fakeStartupReadinessGate{authPending: true, validationPending: true, policyPending: true, policyDiagnostic: "policy pending"},
+			want: "startup authentication pending",
+		},
+		{
+			name: "dynamic validation before policy preflight",
+			gate: fakeStartupReadinessGate{validationPending: true, policyPending: true, policyDiagnostic: "policy pending"},
+			want: "provider model validation pending",
+		},
+		{
+			name: "empty policy diagnostic has fallback",
+			gate: fakeStartupReadinessGate{policyPending: true},
+			want: "policy routing preflight pending",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			withProviderValidationGate(next, tc.gate).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+			if got := w.Code; got != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503; body=%s", got, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), tc.want) {
+				t.Fatalf("body = %q, want %q", w.Body.String(), tc.want)
+			}
+		})
+	}
+}
+
 func TestServerBlocksNonHealthRoutesWhileStartupAuthenticationPending(t *testing.T) {
 	srv, err := New(
 		auth.NewTestAuthenticator("test-token"),
@@ -261,6 +394,26 @@ func copilotChatProxyOptionWithModelDiscovery(baseURL string) proxy.Option {
 			Endpoints: []string{"/chat/completions"},
 		}},
 	}}})
+}
+
+func TestServerInitializePolicyRoutingDelegatesWhenDisabled(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.ParseLevel("error")),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := srv.InitializePolicyRouting(context.Background()); err != nil {
+		t.Fatalf("InitializePolicyRouting() error = %v", err)
+	}
+
+	var nilServer *Server
+	if err := nilServer.InitializePolicyRouting(context.Background()); err != nil {
+		t.Fatalf("nil Server InitializePolicyRouting() error = %v", err)
+	}
 }
 
 func TestNew_ConfiguresExtendedWriteTimeout(t *testing.T) {

@@ -2,6 +2,8 @@
 
 Detailed behavior for Vekil-owned Responses compatibility features. For the generic endpoint list, see [API Reference](api.md). For websocket tuning flags, see [Responses WebSocket Bridge](responses-websocket.md).
 
+> **Policy-routing boundary:** schema-v3 policy profile IDs are not accepted by `POST /v1/responses`, the websocket bridge, `/v1/responses/compact`, `/v1/memories/trace_summarize`, or Responses-backed Chat in v1. A policy's lightweight/powerful destinations must both expose native `/chat/completions`. Use a direct public model/route ID for every Responses surface; existing direct-route behavior is unchanged.
+
 ## `POST /v1/responses` and `GET /v1/responses` (OpenAI)
 
 `POST /v1/responses` is a near zero-copy passthrough for the OpenAI Responses API. Proxy-owned synthetic compaction items are expanded back into normal context before forwarding so resumed Codex sessions continue through the standard `/v1/responses` path. When a follow-up carries both a proxy-generated response ID (`resp-vekil-compact-*`) and its proxy-owned checkpoint, Vekil removes that synthetic `previous_response_id` and stale `X-Codex-Turn-State` before forwarding because neither value exists upstream; ordinary upstream response IDs and turn state remain unchanged. For provider routes other than the OpenAI Codex backend, Vekil also removes Codex client-only `internal_chat_message_metadata_passthrough` fields from `input` items before forwarding because Copilot, Azure, and compatible upstreams reject that internal metadata as an unknown Responses parameter.
@@ -63,6 +65,8 @@ For a schema-version-2 route, the first provider-backed websocket turn may use s
 See [responses-websocket.md](responses-websocket.md) for tuning flags.
 
 ## Chat compatibility over a native Responses model
+
+This adapter is outside v1 semantic policy routing. A Responses-native model may still serve direct public Chat-compatible traffic as documented here, but it cannot be a v1 policy destination and a policy public ID never enters this path.
 
 A model that natively allows `/responses` but not `/chat/completions` can also serve Vekil's Chat-compatible public surfaces: OpenAI Chat Completions, translated Anthropic Messages, translated Gemini generation, both translated count-token probes, and dashboard insights. Native Chat remains preferred when a model supports both endpoints.
 

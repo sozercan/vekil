@@ -18,6 +18,7 @@ The dashboard polls `GET /stats.json` once per second and renders:
 - **Time series** — requests/sec (with an errors/sec overlay) and tokens/sec (prompt vs. completion) over a rolling window, drawn with [uPlot](https://github.com/leeoniya/uPlot).
 - **Total usage** — cumulative requests, total/prompt/completion tokens, cached-prompt %, reasoning tokens, average tokens per request, and errors.
 - **Breakdowns** — top models, providers, and agents, each with request count, token volume, error count, and average latency. A controls bar lets you **sort by** requests / tokens / errors / latency and **filter** by name (e.g. `gpt-5.4-pro` to inspect one model). Sorting by errors or latency hides rows with none. The JSON snapshot additionally includes `by_route` client-request rows and `by_target` physical-attempt rows for external tooling.
+- **Policy routing** — per-profile eligibility, observe sampling/admission, capacity drops, classifier outcomes/latency/cost, selected/fallback tier distribution, and classifier-route health for schema-v3 policy profiles.
 - **Errors** — a status-class distribution (2xx/3xx/4xx/5xx) plus exact error status codes and error-by-provider/model attribution.
 - **Recent requests** — a drill-down log of the most recent logical requests (newest first) with status, model, agent, latency, tokens, and the final/canonical upstream request ID. Has an *errors only* toggle, honors the breakdown filter, and lets you click a request ID to copy it for correlating with upstream logs. Each JSON row also carries `operation_id`, `route_id`, `final_target`, `upstream_sends`, and `target_switches` when route data exists.
 
@@ -26,6 +27,23 @@ The dashboard polls `GET /stats.json` once per second and renders:
 **Upstream retries** retain their existing meaning: same-target retries performed by legacy provider routes on transient upstream failures. A version-2 route target switch is counted separately in `target_switches`; it does not redefine or inflate `retries`.
 
 Route/failover metrics are additive in `GET /stats.json`: `upstream_attempts`, `target_switches`, `requests_with_failover`, `successful_failovers`, `route_exhaustions`, `state_binding_hits`, `state_binding_misses`, and `state_binding_evictions`. `by_route` adds client-request aggregates plus failover counters; `by_target` reports physical send counts. The websocket bridge still records each provider-backed `response.create` once in client totals, but its route-level client row/recent-row enrichment is limited: websocket physical sends and switches appear in `upstream_attempts`, `target_switches`, and `by_target`, while `requests_with_failover`, `successful_failovers`, and `by_route` are populated from HTTP request summaries.
+
+### Policy-routing telemetry
+
+Policy telemetry is additive and bounded. It is grouped by policy profile plus declared request-size and tool-count traffic buckets, and reports:
+
+- eligible, deterministically sampled, and admitted requests;
+- exact not-sampled and non-blocking capacity-drop reasons;
+- classifier completion, infrastructure failure, timeout, abstention, and invalid-output categories;
+- baseline, lightweight, powerful, unavailable-fallback, and uncertain-fallback decisions;
+- classifier latency and usage/cost; and
+- classifier-route breaker state and health outcomes.
+
+Observe mode always dispatches the baseline tier and therefore cannot establish causal quality improvement by itself. Its rollout analysis is valid only when classifier admission is at least 95% in every declared traffic bucket or the missing population is evaluated separately.
+
+Classifier calls are auxiliary policy operations: they have separate admission/send budgets and cost accounting rather than appearing as synthetic client inference requests. For a policy-served request, aggregate model identity remains the policy profile's public ID. Internal classifier/destination route IDs, target IDs, provider deployment names, raw prompts, raw classifier output, tool arguments, credentials, and classifier rationale are not exposed as policy metric labels or recent-request fields.
+
+Bounded decision provenance includes config, profile, classifier, and binary generation hashes plus enums/counts/latency/failure categories. Secret values do not enter generation hashes. See [Semantic Policy Routing](policy-routing.md#metrics-and-decision-provenance) for the generation definitions and operator gates.
 
 ## AI insights (optional)
 
@@ -45,6 +63,7 @@ See [`examples/anthropic-with-insights.yaml`](../examples/anthropic-with-insight
 Notes:
 
 - **Opt-in.** No model is called unless you configure one. The button does not appear otherwise. The model must be servable through native Chat or Chat-over-Responses; native `/v1/models` endpoint metadata is not expanded just for insights.
+- **Internal routes are ineligible.** Schema-v3 internal policy destinations and classifier routes never appear in the model picker and cannot be selected as `insight_model`.
 - **It spends tokens.** Each click is one short chat-completion against the configured model.
 - **Rate-limited.** The endpoint is single-flight (one generation at a time) with a short cooldown between generations, so repeat or concurrent clicks cannot fan out billable calls.
 - **Fails open.** Any error (no model, timeout, upstream failure, rate-limit) returns a soft error and the dashboard keeps showing its templated narrative.
@@ -60,6 +79,8 @@ Routing observability has two related ledgers:
 A successful failover still increments client request totals once. Existing token totals remain client-request/accepted-turn accounting rather than physical-send totals; failed-attempt usage is kept in the physical ledger instead of being attributed to the final provider. The recent-request row exposes only the final/canonical upstream request ID.
 
 Metrics are aggregated in memory in the proxy and reset when the process restarts; nothing is persisted. Only inference and compatibility endpoints that produce model completions are counted. The dashboard's own requests (`/dashboard`, its assets, `/stats.json`, `/dashboard/insight`) and the `/healthz` and `/readyz` probes are excluded so the dashboard does not measure itself. Also excluded are non-generating or metadata routes whose traffic would otherwise dilute completion-oriented metrics: model-catalog reads (`GET /v1/models`), token-counting probes (`POST /v1/messages/count_tokens` and Gemini `:countTokens`, which may still call an upstream model and incur latency or cost), and the proxy-owned compatibility shims (`POST /v1/responses/compact`, `POST /v1/memories/trace_summarize`). These standalone exclusions apply to both the client-request and physical-attempt ledgers. Internal compaction, replay, and protocol-recovery sends spawned under a counted inference request remain attributed to that owning operation and stay in the physical-attempt ledger.
+
+Policy classifier telemetry is maintained alongside, not inside, the ordinary client-request ledger. This preserves one client request and one selected terminal operation while still accounting for classifier admission, latency, usage/cost, decisions, and failures.
 
 Token usage is captured across all inference surfaces: OpenAI chat completions (streaming and non-streaming), Anthropic messages, Gemini, and the OpenAI Responses API used by Codex — including the proxy-owned `GET /v1/responses` websocket bridge. Chat-compatible requests executed through native Responses retain their public endpoint label (`openai_chat`, `anthropic`, or `gemini`), while provider attribution comes from the immutable route that actually served the request. A structurally valid provider terminal outcome is recorded immediately and exactly once; a client-first abort without a terminal outcome is one 499, while shutdown-first lifecycle cancellation is intentionally excluded from provider traffic. The Responses `input_tokens`/`output_tokens` shape (with cached and reasoning details) is mapped onto the same prompt/completion fields as chat. Tokens spent by proxy-internal websocket auto-compaction or replay `413` compaction are folded into the owning create turn, including spend accumulated before a later compaction parse/merge failure; post-terminal auto-compaction amends the existing turn instead of creating another request. Failed provider turns retain terminal partial usage, and provider attribution remains tied to the route that actually served the turn even if a dynamic catalog changes before completion. The long-lived `GET /v1/responses` websocket connection itself is not counted as a request (it would otherwise pin the in-flight gauge and skew latency); its individual turns are.
 
@@ -132,7 +153,7 @@ Failure/suppression reasons are closed enums. Raw error text, provider state, re
 
 ## Access and security
 
-`/dashboard`, `/stats.json`, and `/dashboard/insight` are **unauthenticated**, like `/healthz`. Vekil binds to `127.0.0.1` by default, so they are reachable only from the local machine. If you bind to a non-loopback address (for example `0.0.0.0` in a container with a published port), these become reachable by anyone who can reach that port — put it behind your own network controls in that case. This matters most for `/dashboard/insight`, which spends tokens; it is rate-limited but still unauthenticated, so do not expose it publicly without your own access controls.
+`/dashboard`, `/stats.json`, and `/dashboard/insight` are **unauthenticated**, like `/healthz`. Vekil binds to `127.0.0.1` by default, so they are reachable only from the local machine. If you bind to a non-loopback address (for example `0.0.0.0` in a container with a published port), these become reachable by anyone who can reach that port — put it behind your own network controls in that case. This matters most for `/dashboard/insight`, which spends tokens; it is rate-limited but still unauthenticated, so do not expose it publicly without your own access controls. Policy `observe`/`enforce` additionally requires the explicit remote-single-tenant acknowledgement, but that acknowledgement does not authenticate these endpoints or provide tenant isolation.
 
 ## Charting dependency
 

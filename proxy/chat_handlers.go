@@ -666,7 +666,41 @@ func (h *ProxyHandler) withAdmittedExplicitRouteOperation(ctx, inbound context.C
 	return ctx, operation, route, nil
 }
 
+func withPlannedChatOperation(ctx, inbound context.Context, plan chatOperationPlan) (context.Context, *routeOperation, error) {
+	if !plan.valid() {
+		return ctx, nil, fmt.Errorf("policy planner returned an invalid Chat operation plan")
+	}
+	if existing := routeOperationFromContext(ctx); existing != nil {
+		return ctx, nil, fmt.Errorf("route operation for %q was admitted before policy planning", existing.route.public.id)
+	}
+	operation := newRouteOperationFromChatPlan(plan, inbound)
+	if operation == nil {
+		return ctx, nil, fmt.Errorf("policy planner returned an unusable Chat operation plan")
+	}
+	if summary := RequestSummaryFromContext(inbound); summary != nil {
+		summary.SetOperationID(operation.operationID())
+		summary.SetRouteID(plan.routeID)
+		summary.SetPolicyDecision(plan)
+	}
+	return withRouteOperation(ctx, operation), operation, nil
+}
+
 func (h *ProxyHandler) withChatExecutionRoute(ctx, inbound context.Context, model string, body []byte) (context.Context, *routeOperation, *modelRoute, error) {
+	if operation := routeOperationFromContext(ctx); operation != nil {
+		if _, planned := operation.policyPlan(); planned {
+			endpoint, err := explicitChatExecutionEndpoint(operation.route, body)
+			if err != nil {
+				attachExplicitChatExecutionErrorRoute(err, operation.route, targetBinding{}, endpoint, chatBackendNativeChat)
+				return ctx, nil, operation.route, err
+			}
+			if endpoint != providerEndpointChatCompletions {
+				err := &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("policy model %q supports native %s only", operation.route.public.id, providerEndpointChatCompletions)}
+				attachExplicitChatExecutionErrorRoute(err, operation.route, targetBinding{}, endpoint, chatBackendNativeChat)
+				return ctx, nil, operation.route, err
+			}
+			return ctx, operation, operation.route, nil
+		}
+	}
 	route, known := h.resolveModelRouteForRequest(model, providerEndpointChatCompletions)
 	if !known || route == nil || route.legacy {
 		return ctx, nil, route, nil
@@ -1906,6 +1940,32 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	if message, param, ok := validateOpenAIChatRequest(bodyBytes); ok {
 		writeOpenAIErrorWithDetails(w, http.StatusBadRequest, message, "invalid_request_error", param, "")
 		return
+	}
+
+	policyPlan, err := h.planOpenAIChatPolicy(r.Context(), requestedModel, bodyBytes)
+	if err != nil {
+		if h.handleShutdownError(w, r, nil, err) {
+			return
+		}
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+		return
+	}
+	if policyPlan.valid() {
+		if admittedOperation != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "policy model was also admitted as a direct route", "server_error")
+			return
+		}
+		plannedCtx, plannedOperation, planErr := withPlannedChatOperation(r.Context(), r.Context(), policyPlan)
+		if planErr != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, planErr.Error(), "server_error")
+			return
+		}
+		r = r.WithContext(plannedCtx)
+		w.Header().Set("X-Vekil-Request-ID", plannedOperation.operationID())
+		// Canonicalize aliases at the policy boundary so request metrics and every
+		// downstream identity surface use the profile's declared public ID.
+		requestedModel = policyPlan.publicID
 	}
 
 	scope := chatToolExecutionScopeFromHeaders(r.Header)

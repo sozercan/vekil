@@ -211,7 +211,8 @@ type statsSnapshot struct {
 	RecentAttempts []recentRouteAttempt `json:"recent_attempts"`
 	// InsightsEnabled reports whether a model is configured for on-demand
 	// LLM-generated insights (drives the dashboard's "Generate insights" button).
-	InsightsEnabled bool `json:"insights_enabled"`
+	InsightsEnabled bool                `json:"insights_enabled"`
+	PolicyRouting   policyStatsSnapshot `json:"policy_routing"`
 }
 
 type secondBucket struct {
@@ -1842,8 +1843,12 @@ func (h *ProxyHandler) HandleStatsJSON(w http.ResponseWriter, r *http.Request) {
 	if h != nil && h.stats != nil {
 		snap = h.stats.snapshot()
 	}
+	snap.PolicyRouting = emptyPolicyStatsSnapshot()
 	if h != nil {
 		snap.InsightsEnabled = strings.TrimSpace(h.providersConfig.InsightModel) != ""
+		if controller, ok := h.policyRoutingController.(*chatPolicyRoutingController); ok {
+			snap.PolicyRouting = controller.PolicyStatsSnapshot()
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")

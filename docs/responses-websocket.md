@@ -2,6 +2,8 @@
 
 These settings affect the Codex-style `GET /v1/responses` websocket bridge. The bridge is disabled by default; when disabled, websocket upgrade attempts receive `426 Upgrade Required` so Codex-style clients can fall back to HTTP `/v1/responses`.
 
+Schema-v3 policy profile IDs are unsupported on this bridge in v1. Policy routing is stateless native OpenAI Chat only and provides no websocket first-turn selection, policy affinity, replay ownership, or shared session state. Use a direct Responses-capable public model/route; its existing exact-target pinning rules below remain unchanged.
+
 Important:
 
 - This websocket bridge is proxy-owned and still forwards upstream over HTTP `/responses`.

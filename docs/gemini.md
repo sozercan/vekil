@@ -2,6 +2,8 @@
 
 Gemini endpoints are implemented as a translation layer, not zero-copy passthrough. Requests are translated to canonical OpenAI Chat Completions, resolved through the route that owns the selected public model, executed through native `/chat/completions` or native `/responses`, and translated back into Gemini responses. Native Chat is preferred when both native endpoints are available.
 
+Schema-v3 policy profile IDs are unsupported on Gemini `generateContent`, `streamGenerateContent`, and `countTokens` routes in v1. Policy selection is entered only by text/function-tool `POST /v1/chat/completions`; use a direct public model/route ID for Gemini. Existing direct Gemini translation and failover behavior below is unchanged.
+
 ## Model routes and failover
 
 For a schema-version-2 explicit route, Gemini `generateContent`, `streamGenerateContent`, and `countTokens` submit one canonical Chat operation. Translation and opt-in tool optimization run once on an immutable logical request; backend selection, target-specific model rewrite, URL construction, wire policy, and authentication stay behind the Chat execution and route-executor seams. Gemini routing and catalog identity remain the requested public ID; Vekil does not expose a physical deployment name in the Gemini response payload.

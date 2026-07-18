@@ -221,12 +221,14 @@ var errProvidersConfigRequired = errors.New("--providers-config PATH is required
 
 type configValidateOptions struct {
 	providersConfigPath string
+	live                bool
 }
 
 type configValidateDeps struct {
-	stdout                      io.Writer
-	stderr                      io.Writer
-	validateProvidersConfigFile func(string) error
+	stdout                          io.Writer
+	stderr                          io.Writer
+	validateProvidersConfigFile     func(string) error
+	validateProvidersConfigFileLive func(context.Context, string) error
 }
 
 func runConfig(args []string) {
@@ -237,9 +239,10 @@ func runConfig(args []string) {
 
 func defaultConfigValidateDeps() configValidateDeps {
 	return configValidateDeps{
-		stdout:                      os.Stdout,
-		stderr:                      os.Stderr,
-		validateProvidersConfigFile: proxy.ValidateProvidersConfigFile,
+		stdout:                          os.Stdout,
+		stderr:                          os.Stderr,
+		validateProvidersConfigFile:     proxy.ValidateProvidersConfigFile,
+		validateProvidersConfigFileLive: proxy.ValidateProvidersConfigFileLive,
 	}
 }
 
@@ -279,8 +282,14 @@ func runConfigValidateWithDeps(args []string, deps configValidateDeps) int {
 		return 2
 	}
 
-	if err := deps.validateProvidersConfigFile(opts.providersConfigPath); err != nil {
-		_, _ = fmt.Fprintf(deps.stderr, "error: providers config validation failed: %v\n", err)
+	var validationErr error
+	if opts.live {
+		validationErr = deps.validateProvidersConfigFileLive(context.Background(), opts.providersConfigPath)
+	} else {
+		validationErr = deps.validateProvidersConfigFile(opts.providersConfigPath)
+	}
+	if validationErr != nil {
+		_, _ = fmt.Fprintf(deps.stderr, "error: providers config validation failed: %v\n", validationErr)
 		return 1
 	}
 
@@ -299,6 +308,9 @@ func normalizeConfigValidateDeps(deps configValidateDeps) configValidateDeps {
 	if deps.validateProvidersConfigFile == nil {
 		deps.validateProvidersConfigFile = defaults.validateProvidersConfigFile
 	}
+	if deps.validateProvidersConfigFileLive == nil {
+		deps.validateProvidersConfigFileLive = defaults.validateProvidersConfigFileLive
+	}
 	return deps
 }
 
@@ -307,6 +319,7 @@ func parseConfigValidateOptions(args []string) (configValidateOptions, error) {
 	fs := flag.NewFlagSet("config validate", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	providersConfigPath := fs.String("providers-config", "", "Path to JSON or YAML provider configuration")
+	live := fs.Bool("live", false, "Validate configured providers and policy-routing dependencies with live upstream requests")
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
@@ -318,23 +331,25 @@ func parseConfigValidateOptions(args []string) (configValidateOptions, error) {
 	}
 
 	opts.providersConfigPath = *providersConfigPath
+	opts.live = *live
 	return opts, nil
 }
 
 func writeConfigUsage(w io.Writer) {
-	_, _ = fmt.Fprintln(w, "Usage: vekil config validate --providers-config PATH")
+	_, _ = fmt.Fprintln(w, "Usage: vekil config validate --providers-config PATH [--live]")
 	_, _ = fmt.Fprintln(w)
 	_, _ = fmt.Fprintln(w, "Commands:")
 	_, _ = fmt.Fprintln(w, "  validate    Validate a provider configuration without starting the server")
 }
 
 func writeConfigValidateUsage(w io.Writer) {
-	_, _ = fmt.Fprintln(w, "Usage: vekil config validate --providers-config PATH")
+	_, _ = fmt.Fprintln(w, "Usage: vekil config validate --providers-config PATH [--live]")
 	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "Validate a provider configuration without starting the server or contacting inference upstreams.")
+	_, _ = fmt.Fprintln(w, "Validate a provider configuration without starting the server. Validation is offline unless --live is set.")
 	_, _ = fmt.Fprintln(w)
 	_, _ = fmt.Fprintln(w, "Options:")
 	_, _ = fmt.Fprintln(w, "  --providers-config PATH    Path to a JSON or YAML provider configuration (required)")
+	_, _ = fmt.Fprintln(w, "  --live                     Probe configured providers and policy-routing dependencies")
 }
 
 type serveFlags struct {
@@ -342,6 +357,8 @@ type serveFlags struct {
 	host                            *string
 	tokenDir                        *string
 	providersConfigPath             *string
+	policyRoutingMode               *string
+	policyRoutingAllowRemote        *bool
 	logLevel                        *string
 	streamingUpstreamTimeout        *time.Duration
 	copilotEditorVersion            *string
@@ -367,6 +384,8 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
+		policyRoutingMode:               fs.String("policy-routing", getEnv("POLICY_ROUTING_MODE", "off"), "Policy routing mode: off, observe, or enforce"),
+		policyRoutingAllowRemote:        fs.Bool("policy-routing-allow-remote-single-tenant", getEnvBool("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", false), "Acknowledge single-tenant operation when policy routing listens beyond loopback"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
 		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
@@ -385,6 +404,13 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		compactUpstreamChunkConcurrency: fs.Int("compact-upstream-chunk-concurrency", getEnvInt("COMPACT_UPSTREAM_CHUNK_CONCURRENCY", proxy.DefaultCompactUpstreamChunkConcurrency()), "Maximum sibling chunk compaction calls to run concurrently after the first chunk succeeds"),
 		compactUpstreamMaxAttempts:      fs.Int("compact-upstream-max-attempts", getEnvInt("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts()), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy"),
 	}
+}
+
+func (f serveFlags) parsedPolicyRoutingMode() (proxy.PolicyRoutingMode, error) {
+	if f.policyRoutingMode == nil {
+		return proxy.PolicyRoutingModeOff, nil
+	}
+	return proxy.ParsePolicyRoutingMode(*f.policyRoutingMode)
 }
 
 func (f serveFlags) copilotHeaderConfig() proxy.CopilotHeaderConfig {
@@ -412,6 +438,7 @@ func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 type serveLifecycleServer interface {
 	Start() error
 	Stop(context.Context) error
+	InitializePolicyRouting(context.Context) error
 }
 
 type serveStartupAuthenticator interface {
@@ -479,6 +506,17 @@ func serveUntilContextDone(ctx context.Context, srv serveLifecycleServer, authen
 		}
 	}
 
+	if err := srv.InitializePolicyRouting(ctx); err != nil {
+		if ctx.Err() != nil {
+			return stopServeServer(srv, log)
+		}
+		initializationErr := fmt.Errorf("policy routing initialization failed: %w", err)
+		if stopErr := stopServeServer(srv, log); stopErr != nil {
+			return errors.Join(initializationErr, stopErr)
+		}
+		return initializationErr
+	}
+
 	<-ctx.Done()
 	return stopServeServer(srv, log)
 }
@@ -513,6 +551,11 @@ func runServe() {
 
 	log := logger.New(logger.ParseLevel(*serve.logLevel))
 
+	policyRoutingMode, err := serve.parsedPolicyRoutingMode()
+	if err != nil {
+		log.Fatal("invalid policy routing mode", logger.Err(err))
+	}
+
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
 		log.Fatal("failed to initialize authenticator", logger.Err(err))
@@ -534,8 +577,10 @@ func runServe() {
 		server.WithCompactUpstreamChunkBytes(*serve.compactUpstreamChunkBytes),
 		server.WithCompactUpstreamChunkConcurrency(*serve.compactUpstreamChunkConcurrency),
 		server.WithCompactUpstreamMaxAttempts(*serve.compactUpstreamMaxAttempts),
+		server.WithPolicyRoutingAllowRemoteSingleTenant(*serve.policyRoutingAllowRemote),
 		server.WithProxyOptions(
 			proxy.WithProvidersConfig(providersCfg),
+			proxy.WithPolicyRoutingMode(policyRoutingMode),
 			proxy.WithDeferredDynamicProviderModelValidation(providersCfg.UsesCopilot()),
 		),
 	)

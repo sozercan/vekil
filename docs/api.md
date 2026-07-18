@@ -1,10 +1,12 @@
 # API Reference
 
-Concise endpoint map for Vekil's public API surface. Provider routing is always by public `model` ID; target selection and model/deployment rewriting are internal. Legacy raw OpenAI Chat routes may preserve a nonempty provider-supplied `model`, while explicit routes normalize it to the route public ID. See [Provider Routing](provider-routing.md) for version-2 model routes, ownership rules, native endpoint allowlists, budgets, and failover safety.
+Concise endpoint map for Vekil's public API surface. Provider routing is always by public `model` ID; target selection and model/deployment rewriting are internal. Legacy raw OpenAI Chat routes may preserve a nonempty provider-supplied `model`, while explicit routes normalize it to the route public ID. See [Provider Routing](provider-routing.md) for model routes, ownership rules, native endpoint allowlists, budgets, and failover safety, and [Semantic Policy Routing](policy-routing.md) for the narrower schema-v3 policy contract.
 
-For an explicit `model_routes` entry, Vekil returns one proxy-owned `X-Vekil-Request-ID` for the logical HTTP operation. Every target attempt remains inside the same requested public route; `priority_failover` can switch only between ordered, semantically equivalent targets before delivery/progress/commitment becomes ambiguous and never selects another public model route. Legacy provider-only routes retain their existing retry and fallback behavior.
+For an explicit `model_routes` entry, Vekil returns one proxy-owned `X-Vekil-Request-ID` for the logical HTTP operation. Every target attempt remains inside the same requested public route; `priority_failover` can switch only between ordered, semantically equivalent targets before delivery/progress/commitment becomes ambiguous and never selects another public model route. A schema-v3 policy first seals one terminal route, then uses the same executor only inside that route. Legacy provider-only routes retain their existing retry and fallback behavior.
 
 ## `POST /v1/messages` (Anthropic)
+
+Schema-v3 policy public IDs are unsupported on this endpoint in v1 and fail locally. Use a direct public model/route ID for Anthropic Messages.
 
 Anthropic Messages compatibility for the supported content and tool subset. Except for direct `anthropic-compatible` forwarding, requests are translated to canonical OpenAI Chat Completions, resolved through the route that owns the selected public model, executed by Vekil's shared Chat layer, and translated back to Anthropic. Native `/chat/completions` is preferred when allowed; otherwise a native `/responses` model is served through Chat-over-Responses. For `anthropic-compatible` providers, Vekil forwards Messages requests directly to the configured `messages_path`. An explicit route can switch only among its ordered equivalent targets and only before an Anthropic protocol preamble or semantic block is committed.
 
@@ -13,6 +15,8 @@ The native-Chat path supports the existing text/image/tool-use subset, system me
 Model normalization strips dated suffixes such as `claude-sonnet-4-20250514` and maps hyphenated version numbers to dotted form, for example `claude-sonnet-4-5` to `claude-sonnet-4.5`.
 
 ## `POST /v1/messages/count_tokens` (Anthropic)
+
+Schema-v3 policy public IDs are unsupported on count-token endpoints in v1. Policy routing does not make a classifier or terminal probe for this request.
 
 Anthropic count-tokens compatibility for clients such as Claude Code. For Chat-compatible providers, Vekil translates the Messages request to Chat Completions, sends a small non-streaming probe through the same Chat execution layer, and returns reported `usage.prompt_tokens` as Anthropic `input_tokens`. A native Chat model uses a one-output-token probe. Responses-native models require `max_output_tokens: 16`, so Vekil uses that upstream minimum, omits unsupported sampling controls, consumes usage only, and does not publish any tool replay state from the discarded probe completion. For `anthropic-compatible` providers, Vekil directly forwards count-tokens requests to `{messages_path}/count_tokens`.
 
@@ -26,13 +30,17 @@ The proxy builds a merged logical catalog across legacy provider models and expl
 curl http://localhost:1337/v1/models
 ```
 
-Each public model ID has one logical owner. Dynamic providers can be narrowed with `include_models` or `exclude_models`; static providers such as Azure OpenAI can expose a deployment under a different public ID while the proxy rewrites the upstream `model` field. A version-2 explicit route appears exactly once in both catalog views, in route configuration order, with `owned_by` set to the route ID. Its physical target IDs and upstream deployment names are not emitted as models.
+Each public model ID has one logical owner. Dynamic providers can be narrowed with `include_models` or `exclude_models`; static providers such as Azure OpenAI can expose a deployment under a different public ID while the proxy rewrites the upstream `model` field. A public explicit route appears exactly once in both catalog views, in route configuration order, with `owned_by` set to the route ID. Its physical target IDs and upstream deployment names are not emitted as models.
+
+A schema-v3 policy profile also appears exactly once, with `id` equal to its `public_id`, `owned_by: "vekil-policy"`, and `supported_endpoints: ["/chat/completions"]`. Its published reasoning/tool/context contract is the conservative intersection of the two terminal routes, and `vision` is always false in v1. Internal destination and classifier routes do not appear in either catalog view and their operational IDs are not client aliases.
 
 For an explicit route, catalog identity is configuration-owned: temporary target failure does not remove or rewrite the route entry. Endpoint metadata remains **native upstream capability metadata**. A Responses-native model continues to report only `/responses` in `supported_endpoints` even when Vekil serves `/v1/chat/completions`, Anthropic Messages, and Gemini compatibility through Chat-over-Responses.
 
 The exact catalog still depends on configured routes/providers and dynamic discovery. Query `/v1/models` in your deployment instead of hard-coding one global model list.
 
 ## Gemini Compatibility Endpoints
+
+Schema-v3 policy public IDs are unsupported on Gemini routes in v1 and fail locally. Use a direct public model/route ID for `generateContent`, `streamGenerateContent`, or `countTokens`.
 
 The proxy accepts all three Gemini route prefixes: `/v1beta/models/{model}:...`, `/v1/models/{model}:...`, and `/models/{model}:...`.
 
@@ -45,6 +53,12 @@ Supported operations:
 Gemini compatibility is a translation layer over canonical Chat Completions. For explicit routes, target selection and any safe failover stay inside the route that owns the requested public model. The translated request may use native `/chat/completions` or native `/responses`, with native Chat preferred when both are available. See [Gemini Compatibility](gemini.md) for the Responses-native restrictions, route commitment rules, ignored fields, explicit `501 UNIMPLEMENTED` cases, validation behavior, and streaming details.
 
 ## `POST /v1/chat/completions` (OpenAI)
+
+When `model` resolves to a schema-v3 policy profile, Vekil applies the policy before normal route execution. V1 policy requests must be text-only and may use only standard function tools. Both policy destinations must expose native `/chat/completions`; policy selection never chooses a Responses-backed Chat route. Unsupported content or fields fail locally instead of falling through to a direct route.
+
+The policy's effective `off`/`observe`/`enforce` mode is bounded by the process-wide `--policy-routing` / `POLICY_ROUTING_MODE` ceiling. `off` and `observe` execute `baseline_tier`; observe classification is asynchronous and cannot change the response path. `enforce` selects one terminal tier synchronously, then seals that route before the first terminal send. Classifier admission/infrastructure failure uses `classifier_unavailable_tier`; abstention or invalid structured output uses `classifier_uncertain_tier`.
+
+Physical failover remains inside the selected terminal route. A failed lightweight route never invokes powerful, a failed powerful route never downgrades, and no quality retry occurs after semantic output. Successful JSON/SSE, safe model headers, errors, and client-facing metrics retain the policy profile public ID; terminal provider/route/target/deployment IDs are not exposed. Direct public route behavior is unchanged.
 
 Vekil resolves the public model once and chooses its native backend:
 
@@ -112,6 +126,8 @@ The client should restart that assistant tool-call turn rather than attempting t
 
 ## Responses Compatibility Endpoints
 
+Schema-v3 policy public IDs are unsupported on every Responses compatibility route in v1, including direct HTTP, the websocket bridge, compact, memory summarization, and Responses-backed Chat selection. Use a direct public model/route ID. Existing direct Responses behavior is unchanged.
+
 Supported OpenAI/Codex-style routes:
 
 - `POST /v1/responses` — near zero-copy Responses passthrough with proxy-owned compaction item expansion.
@@ -129,12 +145,12 @@ Returns `{"status":"ok"}` as soon as the HTTP listener is serving. This endpoint
 
 ## `GET /readyz`
 
-Validates compiled configuration, required startup authentication/catalog initialization, admission state, and shutdown state. On success it returns `{"status":"ready"}`. On failure it returns `503` with `{"status":"not_ready","error":"..."}`. Transient failure of one route target does not by itself make the whole process unready.
+Validates compiled configuration, required startup authentication/catalog initialization, admission state, policy classifier preflight where required, and shutdown state. On success it returns `{"status":"ready"}`. On failure it returns `503` with `{"status":"not_ready","error":"..."}`. Transient failure of one terminal route target does not by itself make the whole process unready. An effective policy `enforce` profile must pass live classifier preflight before startup/readiness completes; an effective `observe` profile that fails preflight is kept off and reports a readiness/configuration diagnostic.
 
 ## Traffic Dashboard Endpoints
 
 - `GET /dashboard` — live, browser-based traffic dashboard served from the proxy (available wherever the proxy runs).
-- `GET /stats.json` — in-memory traffic snapshot (client-request totals, latency percentiles, per-second series, by-model/provider/agent/route/target breakdowns, physical upstream attempts, target switches, state-binding counters, legacy upstream retries, and a recent-requests log) polled by the dashboard.
+- `GET /stats.json` — in-memory traffic snapshot (client-request totals, latency percentiles, per-second series, by-model/provider/agent/route/target breakdowns, physical upstream attempts, target switches, state-binding counters, legacy upstream retries, policy eligibility/admission/decision/classifier metrics, and a recent-requests log) polled by the dashboard.
 - `POST /dashboard/insight` — optional AI-generated traffic summary. Active only when `insight_model` is set in providers config; single-flight with a cooldown; fails open. The insight model may be native Chat or native Responses as long as Vekil can serve it through Chat compatibility.
 
 These endpoints are unauthenticated like `/healthz` and are excluded from their own stats. See [Traffic Dashboard](dashboard.md) for the payload shape, agent classification, AI insights, and access/security notes.
