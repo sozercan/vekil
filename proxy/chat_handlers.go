@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/sozercan/vekil/logger"
@@ -1949,13 +1950,36 @@ func policyChatSafeHeaders(src http.Header, publicModel string) http.Header {
 	dst := make(http.Header)
 	for key, values := range src {
 		lower := strings.ToLower(strings.TrimSpace(key))
-		allowed := lower == "x-request-id" || lower == "request-id" || lower == "retry-after" ||
-			strings.HasPrefix(lower, "x-ratelimit-") || strings.HasPrefix(lower, "ratelimit-")
-		if !allowed {
-			continue
-		}
 		for _, value := range values {
-			dst.Add(key, value)
+			value = strings.TrimSpace(value)
+			switch lower {
+			case "x-request-id", "request-id":
+				if value != "" {
+					dst.Add(key, value)
+				}
+			case "retry-after":
+				if policyChatRetryAfter(value) {
+					dst.Add(key, value)
+				}
+			case "ratelimit-limit":
+				if policyChatRateLimitLimit(value) {
+					dst.Add(key, value)
+				}
+			case "ratelimit-remaining", "ratelimit-reset",
+				"x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset",
+				"x-ratelimit-limit-requests", "x-ratelimit-limit-tokens":
+				if policyChatNonNegativeInteger(value) {
+					dst.Add(key, value)
+				}
+			case "x-ratelimit-remaining-requests", "x-ratelimit-remaining-tokens":
+				if policyChatInteger(value) {
+					dst.Add(key, value)
+				}
+			case "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens":
+				if policyChatResetValue(value) {
+					dst.Add(key, value)
+				}
+			}
 		}
 	}
 	for _, name := range []string{"Openai-Model", "X-Openai-Model"} {
@@ -1968,6 +1992,61 @@ func policyChatSafeHeaders(src http.Header, publicModel string) http.Header {
 		return nil
 	}
 	return dst
+}
+
+func policyChatInteger(value string) bool {
+	if value == "" {
+		return false
+	}
+	_, err := strconv.ParseInt(value, 10, 64)
+	return err == nil
+}
+
+func policyChatNonNegativeInteger(value string) bool {
+	if value == "" {
+		return false
+	}
+	_, err := strconv.ParseUint(value, 10, 64)
+	return err == nil
+}
+
+func policyChatRetryAfter(value string) bool {
+	if policyChatNonNegativeInteger(value) {
+		return true
+	}
+	_, err := http.ParseTime(value)
+	return err == nil
+}
+
+func policyChatResetValue(value string) bool {
+	if policyChatNonNegativeInteger(value) {
+		return true
+	}
+	delay, err := time.ParseDuration(value)
+	return err == nil && delay >= 0
+}
+
+func policyChatRateLimitLimit(value string) bool {
+	items := strings.Split(value, ",")
+	if len(items) == 0 {
+		return false
+	}
+	for _, item := range items {
+		parts := strings.Split(item, ";")
+		if !policyChatNonNegativeInteger(strings.TrimSpace(parts[0])) {
+			return false
+		}
+		seenWindow := false
+		for _, parameter := range parts[1:] {
+			name, rawValue, ok := strings.Cut(strings.TrimSpace(parameter), "=")
+			if !ok || seenWindow || !strings.EqualFold(strings.TrimSpace(name), "w") ||
+				!policyChatNonNegativeInteger(strings.TrimSpace(rawValue)) {
+				return false
+			}
+			seenWindow = true
+		}
+	}
+	return true
 }
 
 func policyChatUpstreamErrorDetails(status int) (message, errType, code string) {

@@ -93,6 +93,11 @@ func newPolicyIntegrationUpstream(t *testing.T, signals policyClassifierSignals)
 			w.Header().Set("X-Request-ID", "terminal-request")
 			w.Header().Set("X-Azure-Request-ID", "azure-terminal-request")
 			w.Header().Set("OpenAI-Processing-Ms", "17")
+			w.Header().Set("X-RateLimit-Limit", "100")
+			w.Header().Set("X-RateLimit-Remaining", "42")
+			w.Header().Set("X-RateLimit-Reset", "123456")
+			w.Header().Set("X-RateLimit-Model", "power-model")
+			w.Header().Set("RateLimit-Policy", "power-provider")
 			w.Header().Set("X-Vekil-Internal-Route", "power-route")
 			http.Error(w, fmt.Sprintf("terminal unavailable for %s via power-route/power-provider", request.Model), status)
 			return
@@ -1221,6 +1226,21 @@ func TestPolicyTerminalHTTPErrorIsSanitized(t *testing.T) {
 	}
 	if got := recorder.Header().Get("OpenAI-Processing-Ms"); got != "" {
 		t.Fatalf("OpenAI-Processing-Ms=%q", got)
+	}
+	for name, want := range map[string]string{
+		"X-RateLimit-Limit":     "100",
+		"X-RateLimit-Remaining": "42",
+		"X-RateLimit-Reset":     "123456",
+	} {
+		if got := recorder.Header().Get(name); got != want {
+			t.Fatalf("%s=%q, want %q", name, got, want)
+		}
+	}
+	if got := recorder.Header().Get("X-RateLimit-Model"); got != "" {
+		t.Fatalf("X-RateLimit-Model=%q", got)
+	}
+	if got := recorder.Header().Get("RateLimit-Policy"); got != "" {
+		t.Fatalf("RateLimit-Policy=%q", got)
 	}
 }
 
