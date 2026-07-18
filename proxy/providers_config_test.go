@@ -1756,6 +1756,36 @@ func TestModelUsesCopilotFollowsSelectedStaticOwner(t *testing.T) {
 	}
 }
 
+func TestModelUsesCopilotTreatsPolicyEntryAsNonCopilotInMixedProviderConfig(t *testing.T) {
+	cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeOff)
+	cfg.Providers = append(cfg.Providers, ProviderConfig{ID: "copilot", Type: "copilot"})
+
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("coding-economy"),
+		WithDeferredDynamicProviderModelValidation(true),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	if h.ModelUsesCopilot("coding-economy") {
+		t.Fatal("policy public entry unexpectedly required Copilot authentication")
+	}
+	if !h.ModelUsesCopilot("copilot-direct") {
+		t.Fatal("direct unrestricted Copilot model did not require authentication")
+	}
+	setup := h.providerSetup()
+	copilot := setup.providerByID("copilot")
+	if h.providerMayExposeAllowedModel(copilot) {
+		t.Fatal("policy public entry kept unrelated Copilot provider in dynamic discovery scope")
+	}
+	if h.providerWithinAllowedModelScope(copilot) {
+		t.Fatal("policy public entry kept unrelated Copilot provider in readiness scope")
+	}
+}
+
 func TestModelUsesCopilotHonorsProviderFiltersDuringDeferredDiscovery(t *testing.T) {
 	t.Run("filtered default Copilot provider is skipped", func(t *testing.T) {
 		cfg := ProvidersConfig{Providers: []ProviderConfig{

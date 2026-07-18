@@ -839,7 +839,11 @@ func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) 
 	if len(h.allowedModels) == 0 {
 		return true
 	}
+	setup := h.providerSetup()
 	for model := range h.allowedModels {
+		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+			continue
+		}
 		if providerCanExposeModel(provider, model) {
 			return true
 		}
@@ -856,6 +860,9 @@ func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime
 	}
 	setup := h.providerSetup()
 	for model := range h.allowedModels {
+		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+			continue
+		}
 		if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
 			for _, target := range route.targets {
 				if target.provider != nil && target.provider.id == provider.id {
@@ -1682,6 +1689,9 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 func (h *ProxyHandler) ModelUsesCopilot(model string) bool {
 	setup := h.providerSetup()
 	model = strings.TrimSpace(model)
+	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+		return false
+	}
 	if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
 		for _, target := range route.targets {
 			if target.provider != nil && target.provider.kind == providerTypeCopilot {

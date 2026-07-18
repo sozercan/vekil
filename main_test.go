@@ -1978,6 +1978,64 @@ func TestAgentLaunchProxyStartStopsWhenPolicyRoutingInitializationIsCanceled(t *
 	}
 }
 
+func TestAgentLaunchProxySkipsCopilotForPolicyModel(t *testing.T) {
+	cfg, err := proxy.LoadProvidersConfigFile(writeStaticPolicyLaunchProvidersConfig(t))
+	if err != nil {
+		t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+	}
+	cfg.Providers = append(cfg.Providers, proxy.ProviderConfig{ID: "copilot", Type: "copilot"})
+	log := logger.NewWithWriter(logger.LevelError, io.Discard)
+	srv, err := server.New(
+		auth.NewTestAuthenticator("test-token"),
+		log,
+		"127.0.0.1",
+		"0",
+		server.WithProxyOptions(
+			proxy.WithProvidersConfig(cfg),
+			proxy.WithAllowedModels("policy-launch-test"),
+			proxy.WithDeferredDynamicProviderModelValidation(true),
+		),
+	)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+	called := false
+	runtime := &agentLaunchProxy{
+		srv: srv,
+		authenticator: &fakeServeStartupAuthenticator{getTokenFn: func(context.Context) (string, error) {
+			called = true
+			return "", errors.New("Copilot auth should not run")
+		}},
+		usesCopilot: srv.ModelUsesCopilot("policy-launch-test"),
+		log:         log,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := runtime.Start(ctx); err != nil {
+		t.Fatalf("agentLaunchProxy.Start() error = %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+		defer stopCancel()
+		_ = runtime.Stop(stopCtx)
+	}()
+	if called {
+		t.Fatal("policy model triggered Copilot authentication")
+	}
+	resp, err := http.Get("http://" + runtime.Addr() + "/readyz") //nolint:gosec // loopback test server
+	if err != nil {
+		t.Fatalf("GET /readyz: %v", err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if readErr != nil {
+		t.Fatalf("read /readyz: %v", readErr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /readyz status = %d, want 200; body=%s", resp.StatusCode, body)
+	}
+}
+
 func TestAgentLaunchProxySkipsCopilotForKnownNonCopilotModel(t *testing.T) {
 	cfg := proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{
 		{
