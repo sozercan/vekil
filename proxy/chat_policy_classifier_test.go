@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -349,6 +350,27 @@ func TestPolicyHTTPClassifierBuildsForcedSingleToolRequest(t *testing.T) {
 	}
 	if sends.Load() != 1 {
 		t.Fatalf("send count = %d, want 1", sends.Load())
+	}
+}
+
+func TestPolicyHTTPClassifierWrappedCanceledSendUsesTransportUnlessContextCanceled(t *testing.T) {
+	facts := policyClassifierFacts{SchemaVersion: policyFactSchemaVersion}
+	wrapper := fmt.Errorf("classifier transport: %w", context.Canceled)
+	classifier, err := newPolicyHTTPClassifier(policyHTTPClassifierOptions{}, func(context.Context, []byte, http.Header) (policyClassifierHTTPResponse, error) {
+		return policyClassifierHTTPResponse{}, wrapper
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = classifier.Classify(context.Background(), facts)
+	if failure := policyClassifierFailureFromError(err); failure.Category != policyClassifierFailureTransport {
+		t.Fatalf("live-context failure = %#v, want transport", failure)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = classifier.Classify(canceled, facts)
+	if failure := policyClassifierFailureFromError(err); failure.Category != policyClassifierFailureCanceled {
+		t.Fatalf("canceled-context failure = %#v, want canceled", failure)
 	}
 }
 

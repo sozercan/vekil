@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +53,12 @@ func (h *ProxyHandler) resolveChatRoute(ctx context.Context, model string) (reso
 		return resolvedChatRoute{}, modelNotAllowedRequestError(model)
 	}
 	provider, owner, known := h.resolveProviderModelForRequest(model, providerEndpointChatCompletions)
+	if provider == nil && !known && h.hasClosedConfiguredModelRegistry() {
+		return resolvedChatRoute{}, &providerRequestError{
+			statusCode: http.StatusBadRequest,
+			err:        fmt.Errorf("model %q does not support %s", model, providerEndpointChatCompletions),
+		}
+	}
 	if model != "" && !known && providerUsesDynamicModels(provider) {
 		if err := h.refreshUnknownChatRouteProvider(ctx, provider); err != nil {
 			return resolvedChatRoute{}, err

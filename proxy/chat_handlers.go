@@ -683,7 +683,7 @@ func withPlannedChatOperation(ctx, inbound context.Context, plan chatOperationPl
 	}
 	if summary := RequestSummaryFromContext(inbound); summary != nil {
 		summary.SetOperationID(operation.operationID())
-		summary.SetRouteID(plan.routeID)
+		summary.SetRouteID(plan.publicID)
 		summary.SetPolicyDecision(plan)
 	}
 	return withRouteOperation(ctx, operation), operation, nil
@@ -1926,6 +1926,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 	defer func() { _ = r.Body.Close() }()
 	requestedModel := extractOpenAIChatCompletionsRequestModel(bodyBytes)
+	publicModel := requestedModel
 	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), requestedModel, providerEndpointChatCompletions)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
@@ -1967,14 +1968,14 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		}
 		r = r.WithContext(plannedCtx)
 		w.Header().Set("X-Vekil-Request-ID", plannedOperation.operationID())
-		// Canonicalize aliases at the policy boundary so request metrics and every
-		// downstream identity surface use the profile's declared public ID.
-		requestedModel = policyPlan.publicID
+		// Preserve the actual body model for provider rewrite. Public metrics and
+		// response identity use the canonical policy profile ID separately.
+		publicModel = policyPlan.publicID
 	}
 
 	scope := chatToolExecutionScopeFromHeaders(r.Header)
 	bodyBytes, mode := prepareOpenAIChatCompletionsRequest(bodyBytes)
-	h.observeRequestSummary(r.Context(), "openai_chat", requestedModel, mode.clientRequestedStream, providerEndpointChatCompletions)
+	h.observeRequestSummary(r.Context(), "openai_chat", publicModel, mode.clientRequestedStream, providerEndpointChatCompletions)
 	bodyBytes = h.rewriteOpenAIChatRequestBodyWithToolOptimizers(r.Context(), bodyBytes, h.toolContexts, scope)
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
@@ -1999,7 +2000,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
 	}
 
-	responseModel := explicitRoutePublicModel(route, requestedModel)
+	responseModel := explicitRoutePublicModel(route, publicModel)
 	result, err := h.executeRoutedChatCompletions(upstreamCtx, bodyBytes, mode, chatExecutionOptions{}, requestedModel)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {

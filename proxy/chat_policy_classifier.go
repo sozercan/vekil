@@ -703,7 +703,7 @@ func (c *policyHTTPClassifier) Classify(ctx context.Context, facts policyClassif
 	}
 	response, err := c.send(ctx, requestBody, http.Header{"Content-Type": []string{"application/json"}})
 	if err != nil {
-		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+		if errors.Is(ctx.Err(), context.Canceled) {
 			return policyClassifierSignals{}, newPolicyClassifierError(policyClassifierFailure{Category: policyClassifierFailureCanceled}, context.Canceled)
 		}
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {

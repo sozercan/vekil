@@ -704,7 +704,7 @@ func TestPolicyRoutingPreDispatchClassifierFailureDoesNotCountPhysicalSend(t *te
 	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
 	cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)
 	cfg.PolicyProfiles[0].ClassifierUnavailableTier = policyConfigTierPowerful
-	h, err := NewProxyHandler(nil, nil, WithProvidersConfig(cfg), WithPolicyRoutingMode(PolicyRoutingModeEnforce))
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")), WithProvidersConfig(cfg), WithPolicyRoutingMode(PolicyRoutingModeEnforce))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -812,5 +812,91 @@ func TestPolicyRoutingValidatesSharedPublicContractBeforeClassifierSend(t *testi
 				t.Fatalf("powerful sends=%d, want zero", sends)
 			}
 		})
+	}
+}
+
+func TestPolicyAliasIsRewrittenWhilePublicIdentityStaysCanonical(t *testing.T) {
+	upstream := newPolicyIntegrationUpstream(t, policyClassifierSignals{
+		TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow,
+	})
+	cfg := policyIntegrationConfig(upstream.server.URL, upstream.server.URL, policyConfigModeEnforce)
+	cfg.PolicyProfiles[0].PublicID = "claude-sonnet-4.5"
+	cfg.ModelRoutes[0].Targets[0].UpstreamModel = "claude-sonnet-4.5"
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")), WithProvidersConfig(cfg), WithPolicyRoutingMode(PolicyRoutingModeEnforce))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"claude-sonnet-4-5-20250514","messages":[{"role":"user","content":"hello"}]}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Model != "claude-sonnet-4.5" {
+		t.Fatalf("response model=%q", response.Model)
+	}
+	_, models := upstream.snapshot()
+	if got := strings.Join(models, ","); got != "classifier-model,classifier-model,claude-sonnet-4.5" {
+		t.Fatalf("upstream models=%q", got)
+	}
+}
+
+func TestRouteOnlyPolicyConfigRejectsUnknownChatModelLocally(t *testing.T) {
+	var sends atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { sends.Add(1) }))
+	defer upstream.Close()
+	cfg := policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")), WithProvidersConfig(cfg), WithPolicyRoutingMode(PolicyRoutingModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"typo-model","messages":[{"role":"user","content":"hello"}]}`)))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if sends.Load() != 0 {
+		t.Fatalf("upstream sends=%d", sends.Load())
+	}
+}
+
+func TestPolicyClientStatsUsePublicIDNotTerminalRouteID(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	h, err := NewProxyHandler(nil, nil, WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)), WithPolicyRoutingMode(PolicyRoutingModeEnforce))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, summary := WithRequestSummary(t.Context())
+	recorder := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"coding-economy","messages":[{"role":"user","content":"hello"}]}`)).WithContext(ctx))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := summary.RouteID(); got != "coding-economy" {
+		t.Fatalf("summary route=%q", got)
+	}
+	h.stats.record(summary, recorder.Code, "test", time.Millisecond)
+	snapshot := h.stats.snapshot()
+	if len(snapshot.ByRoute) != 1 || snapshot.ByRoute[0].Route != "coding-economy" {
+		t.Fatalf("by_route=%+v", snapshot.ByRoute)
+	}
+	if len(snapshot.Recent) != 1 || snapshot.Recent[0].RouteID != "coding-economy" {
+		t.Fatalf("recent=%+v", snapshot.Recent)
+	}
+	if snapshot.ByRoute[0].Route == "light-route" || snapshot.ByRoute[0].Route == "power-route" ||
+		snapshot.Recent[0].RouteID == "light-route" || snapshot.Recent[0].RouteID == "power-route" {
+		t.Fatalf("client request stats leaked terminal route: by_route=%+v recent=%+v", snapshot.ByRoute, snapshot.Recent)
 	}
 }

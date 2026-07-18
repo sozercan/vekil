@@ -512,6 +512,11 @@ func (h *ProxyHandler) providerSetup() *providerSetup {
 	return defaultProviderSetup(h)
 }
 
+func (h *ProxyHandler) hasClosedConfiguredModelRegistry() bool {
+	setup := h.providerSetup()
+	return setup != nil && setup.hasConfiguredState && strings.TrimSpace(setup.defaultProviderID) == "" && setup.routeRegistry() != nil
+}
+
 func (ps *providerSetup) defaultProvider() *providerRuntime {
 	if ps == nil {
 		return nil
