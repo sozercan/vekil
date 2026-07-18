@@ -207,7 +207,7 @@ This lets profiles graduate independently while preserving one emergency rollbac
 1. Build and validate canonical Chat facts.
 2. Attempt global and per-profile classifier admission without waiting.
 3. On admission or infrastructure-health failure, choose `classifier_unavailable_tier`.
-4. Otherwise classify synchronously.
+4. On successful admission, classify synchronously.
 5. On abstention or missing/malformed/schema-invalid output, choose `classifier_uncertain_tier`.
 6. Otherwise apply the deterministic tier mapper.
 7. Compile and seal the selected terminal route plan.

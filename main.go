@@ -325,7 +325,7 @@ func parseConfigValidateOptions(args []string) (configValidateOptions, error) {
 	fs := flag.NewFlagSet("config validate", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	providersConfigPath := fs.String("providers-config", "", "Path to JSON or YAML provider configuration")
-	live := fs.Bool("live", false, "Validate configured providers and policy-routing dependencies with live upstream requests")
+	live := fs.Bool("live", false, "Run live policy-classifier protocol preflight for configured policy routes")
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}

@@ -23,6 +23,9 @@ func ValidateProvidersConfigFileLive(ctx context.Context, path string) error {
 	h, err := NewProxyHandler(authenticator, nil,
 		WithProvidersConfig(cfg),
 		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+		// Live validation is deliberately limited to classifier protocol
+		// preflight; unrelated dynamic provider catalogs remain offline.
+		WithDeferredDynamicProviderModelValidation(true),
 	)
 	if err != nil {
 		return err
