@@ -1181,6 +1181,51 @@ func TestRunLaunchCommandDryRunUsesConfiguredStaticModelMetadata(t *testing.T) {
 	})
 }
 
+func TestRunLaunchCommandDryRunUsesPolicyOwnershipMetadata(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	providersPath := writeStaticPolicyLaunchProvidersConfig(t)
+
+	t.Run("Claude rejects policy model", func(t *testing.T) {
+		var stderr bytes.Buffer
+		code := runLaunchCommand([]string{
+			"claude",
+			"--providers-config", providersPath,
+			"--model", "policy-launch-test",
+			"--binary", binary,
+			"--dry-run",
+		}, &stderr)
+		if code != 1 {
+			t.Fatalf("runLaunchCommand() code = %d, want 1; stderr=%s", code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "policy") || !strings.Contains(stderr.String(), "Anthropic ingress") {
+			t.Fatalf("dry-run missing policy-model Anthropic-ingress rejection: %s", stderr.String())
+		}
+	})
+
+	t.Run("Copilot resolves policy Chat endpoint", func(t *testing.T) {
+		var stderr bytes.Buffer
+		code := runLaunchCommand([]string{
+			"copilot",
+			"--providers-config", providersPath,
+			"--model", "policy-launch-test",
+			"--binary", binary,
+			"--dry-run",
+		}, &stderr)
+		if code != 0 {
+			t.Fatalf("runLaunchCommand() code = %d; stderr=%s", code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "COPILOT_PROVIDER_WIRE_API=completions") {
+			t.Fatalf("dry-run did not resolve policy Chat endpoint: %s", stderr.String())
+		}
+		if strings.Contains(stderr.String(), "unresolved:") {
+			t.Fatalf("configured policy metadata was reported unresolved: %s", stderr.String())
+		}
+	})
+}
+
 func TestNewLaunchTokenIsRandomAndHighEntropy(t *testing.T) {
 	first, err := newLaunchToken()
 	if err != nil {
@@ -1508,6 +1553,81 @@ policy_profiles:
 				t.Fatalf("policy classifier preflight calls = %d, want 1", got)
 			}
 		})
+	}
+}
+
+func writeStaticPolicyLaunchProvidersConfig(t *testing.T) string {
+	t.Helper()
+	providersPath := filepath.Join(t.TempDir(), "providers.yaml")
+	providersBody := `schema_version: 3
+providers:
+  - id: policy-provider
+    type: openai-compatible
+    base_url: http://127.0.0.1:9
+    auth_type: none
+    model_discovery: static
+    trust_domain: org
+    classifier_no_store_supported: true
+model_routes:
+  - id: light-route
+    exposure: internal
+    endpoints: [/chat/completions]
+    targets: [{id: light, provider: policy-provider, upstream_model: light-model}]
+  - id: power-route
+    exposure: internal
+    endpoints: [/chat/completions]
+    targets: [{id: power, provider: policy-provider, upstream_model: power-model}]
+  - id: classifier-route
+    exposure: internal
+    internal_purpose: policy_classifier
+    endpoints: [/chat/completions]
+    targets: [{id: classifier, provider: policy-provider, upstream_model: classifier-model}]
+policy_profiles:
+  - id: policy-launch
+    public_id: policy-launch-test
+    mode: off
+    lightweight_route: light-route
+    powerful_route: power-route
+    classifier: {route: classifier-route}
+    data_policy: {content_forwarding_acknowledged: true}
+`
+	if err := os.WriteFile(providersPath, []byte(providersBody), 0o600); err != nil {
+		t.Fatalf("write providers config: %v", err)
+	}
+	return providersPath
+}
+
+func TestRunLaunchClaudeRejectsPolicyModelBeforeChildStart(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tmp := t.TempDir()
+	providersPath := writeStaticPolicyLaunchProvidersConfig(t)
+	capturePath := filepath.Join(tmp, "capture.json")
+	t.Setenv("GO_WANT_MAIN_LAUNCH_HELPER", "1")
+	t.Setenv("MAIN_LAUNCH_HELPER_CAPTURE", capturePath)
+	t.Setenv("MAIN_LAUNCH_HELPER_TARGET", "claude")
+
+	var stderr bytes.Buffer
+	code := runLaunchClaude([]string{
+		"--providers-config", providersPath,
+		"--model", "policy-launch-test",
+		"--binary", binary,
+		"--startup-timeout", "2s",
+		"--proxy-log", filepath.Join(tmp, "proxy.jsonl"),
+		"--",
+		"-test.run=TestMainLaunchHelperProcess",
+	}, &stderr)
+	if code != 1 {
+		t.Fatalf("runLaunchClaude() code = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "policy") || !strings.Contains(stderr.String(), "Anthropic ingress") {
+		t.Fatalf("stderr missing policy-model Anthropic-ingress rejection: %s", stderr.String())
+	}
+	if _, err := os.Stat(capturePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Claude child started for unsupported policy model: stat error = %v", err)
 	}
 }
 

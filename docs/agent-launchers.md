@@ -106,6 +106,12 @@ values are removed from the child environment. Gateway catalog discovery is
 disabled, and the proxy independently rejects requests for any model other than
 the selected public model.
 
+Policy-routing public model IDs (`owned_by: vekil-policy`) are rejected for
+Claude Code even though they advertise `/chat/completions`: policy routing is
+not supported on the Anthropic ingress used by this launcher. Use
+`vekil launch copilot` for those Chat-completions policy models. Direct models
+with `/v1/messages`, `/chat/completions`, or `/responses` remain supported.
+
 Forwarded settings-source, detached-session, resume, model/fallback, and custom
 agent overrides are rejected.
 

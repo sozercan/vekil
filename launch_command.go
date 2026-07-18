@@ -221,13 +221,12 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		NoSummary:      opts.noSummary,
 	}
 	if opts.dryRun {
-		configuredModel, found, resolveErr := proxy.ResolveStaticProviderModel(providersCfg, opts.model)
+		model, found, resolveErr := resolveLaunchDryRunModelInfo(providersCfg, opts.model)
 		if resolveErr != nil {
 			_, _ = fmt.Fprintf(stderr, "error: resolve dry-run model metadata: %v\n", resolveErr)
 			return 1
 		}
 		if found {
-			model := launchModelInfoFromProviderConfig(configuredModel)
 			launchOpts.DryRunModel = &model
 		}
 		result, runErr := launch.Run(context.Background(), nil, target.adapter, launchOpts)
@@ -299,6 +298,31 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		return 1
 	}
 	return result.ExitCode
+}
+
+func resolveLaunchDryRunModelInfo(cfg proxy.ProvidersConfig, modelID string) (launch.ModelInfo, bool, error) {
+	configuredModel, found, err := proxy.ResolveStaticProviderModel(cfg, modelID)
+	if err != nil || found {
+		return launchModelInfoFromProviderConfig(configuredModel), found, err
+	}
+
+	modelID = strings.TrimSpace(modelID)
+	for _, profile := range cfg.PolicyProfiles {
+		if strings.TrimSpace(profile.PublicID) != modelID {
+			continue
+		}
+		name := strings.TrimSpace(profile.Name)
+		if name == "" {
+			name = modelID
+		}
+		return launch.ModelInfo{
+			ID:                 modelID,
+			Name:               name,
+			OwnedBy:            launch.PolicyModelOwner,
+			SupportedEndpoints: []string{"/chat/completions"},
+		}, true, nil
+	}
+	return launch.ModelInfo{}, false, nil
 }
 
 func launchModelInfoFromProviderConfig(cfg proxy.ProviderModelConfig) launch.ModelInfo {

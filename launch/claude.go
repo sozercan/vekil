@@ -17,6 +17,12 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	if model == "" {
 		return PreparedProcess{}, fmt.Errorf("claude launch requires a model")
 	}
+	if strings.TrimSpace(input.Model.OwnedBy) == PolicyModelOwner {
+		return PreparedProcess{}, fmt.Errorf(
+			"model %q is not Claude-compatible: policy-routed model IDs are not supported on Anthropic ingress; use vekil launch copilot instead",
+			model,
+		)
+	}
 	endpointMetadataKnown := !input.DryRun || input.Model.SupportedEndpoints != nil
 	if endpointMetadataKnown &&
 		!modelSupportsEndpoint(input.Model, "/v1/messages") &&
