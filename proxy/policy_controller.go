@@ -27,13 +27,61 @@ func (h *ProxyHandler) PolicyRoutingReadinessDiagnostic() string {
 	return h.policyRoutingController.ReadinessDiagnostic()
 }
 
-func (h *ProxyHandler) InitializePolicyRouting(ctx context.Context) error {
-	if h == nil || h.policyRoutingController == nil || !h.policyRoutingController.Active() {
-		if h != nil {
-			h.policyPreflightPending.Store(false)
-		}
+func (h *ProxyHandler) policyPreflightSemaphore() chan struct{} {
+	h.policyPreflightPermitOnce.Do(func() {
+		h.policyPreflightPermit = make(chan struct{}, 1)
+		h.policyPreflightPermit <- struct{}{}
+	})
+	return h.policyPreflightPermit
+}
+
+func (h *ProxyHandler) beginPolicyPreflightAttempt() {
+	h.policyPreflightStateMu.Lock()
+	h.policyPreflightAttempts++
+	h.policyPreflightPending.Store(true)
+	h.policyPreflightStateMu.Unlock()
+}
+
+func (h *ProxyHandler) finishPolicyPreflightAttempt(success bool) {
+	h.policyPreflightStateMu.Lock()
+	if h.policyPreflightAttempts > 0 {
+		h.policyPreflightAttempts--
+	}
+	if success && h.policyPreflightAttempts == 0 {
+		h.policyPreflightPending.Store(false)
+	}
+	h.policyPreflightStateMu.Unlock()
+}
+
+func (h *ProxyHandler) InitializePolicyRouting(ctx context.Context) (err error) {
+	if h == nil {
 		return nil
 	}
-	defer h.policyPreflightPending.Store(false)
-	return h.policyRoutingController.Initialize(ctx)
+	if h.policyRoutingController == nil || !h.policyRoutingController.Active() {
+		h.policyPreflightPending.Store(false)
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	h.beginPolicyPreflightAttempt()
+	success := false
+	defer func() { h.finishPolicyPreflightAttempt(success) }()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	permit := h.policyPreflightSemaphore()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-permit:
+	}
+	defer func() { permit <- struct{}{} }()
+
+	if err := h.policyRoutingController.Initialize(ctx); err != nil {
+		return err
+	}
+	success = true
+	return nil
 }

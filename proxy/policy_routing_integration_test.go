@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -531,6 +532,13 @@ func TestPolicyRoutingPreflightFailureObserveDisablesProfileAndEnforceFails(t *t
 		if ready.Code != http.StatusServiceUnavailable {
 			t.Fatalf("ready status = %d body=%s", ready.Code, ready.Body.String())
 		}
+		diagnostic := h.PolicyRoutingReadinessDiagnostic()
+		if err := h.InitializePolicyRouting(t.Context()); err != nil {
+			t.Fatalf("observe retry InitializePolicyRouting() error = %v", err)
+		}
+		if got := h.PolicyRoutingReadinessDiagnostic(); got != diagnostic {
+			t.Fatalf("observe retry diagnostic = %q, want preserved %q", got, diagnostic)
+		}
 		light.classifierFailureStatus.Store(0)
 		recorder := httptest.NewRecorder()
 		h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"coding-economy","messages":[{"role":"user","content":"hello"}]}`)))
@@ -544,7 +552,7 @@ func TestPolicyRoutingPreflightFailureObserveDisablesProfileAndEnforceFails(t *t
 	})
 
 	t.Run("enforce", func(t *testing.T) {
-		light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+		light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
 		powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
 		light.classifierFailureStatus.Store(http.StatusServiceUnavailable)
 		h, err := NewProxyHandler(nil, nil,
@@ -557,14 +565,144 @@ func TestPolicyRoutingPreflightFailureObserveDisablesProfileAndEnforceFails(t *t
 		if err := h.InitializePolicyRouting(t.Context()); err == nil {
 			t.Fatal("enforce preflight error = nil")
 		}
-		if h.PolicyRoutingPreflightPending() {
-			t.Fatal("preflight pending remained set after failure")
+		if !h.PolicyRoutingPreflightPending() {
+			t.Fatal("preflight pending cleared after failure")
 		}
 		stats := h.policyRoutingController.(*chatPolicyRoutingController).PolicyStatsSnapshot()
 		if len(stats.Profiles) != 1 || stats.Profiles[0].PreflightState != policyStatsPreflightFailed || stats.Profiles[0].Totals.PhysicalClassifierSends != 1 {
 			t.Fatalf("enforce preflight failure stats = %+v", stats)
 		}
+		diagnostic := h.PolicyRoutingReadinessDiagnostic()
+		canceledCtx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if err := h.InitializePolicyRouting(canceledCtx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled retry error = %v, want context canceled", err)
+		}
+		if got := h.PolicyRoutingReadinessDiagnostic(); got != diagnostic {
+			t.Fatalf("canceled retry diagnostic = %q, want preserved %q", got, diagnostic)
+		}
+		light.classifierFailureStatus.Store(0)
+		if err := h.InitializePolicyRouting(t.Context()); err != nil {
+			t.Fatalf("retry InitializePolicyRouting() error = %v", err)
+		}
+		if h.PolicyRoutingPreflightPending() {
+			t.Fatal("preflight pending remained set after successful retry")
+		}
+		if diagnostic := h.PolicyRoutingReadinessDiagnostic(); diagnostic != "" {
+			t.Fatalf("readiness diagnostic remained after successful retry: %q", diagnostic)
+		}
+		ready := httptest.NewRecorder()
+		h.HandleReadyz(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		if ready.Code != http.StatusOK {
+			t.Fatalf("ready status after retry=%d body=%s", ready.Code, ready.Body.String())
+		}
 	})
+}
+
+func TestPolicyRoutingCanceledPreflightKeepsStartupGatePending(t *testing.T) {
+	block := make(chan struct{})
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+	light.classifierBlock = block
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	h, err := NewProxyHandler(nil, nil,
+		WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- h.InitializePolicyRouting(ctx) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		requests, _ := light.snapshot()
+		if requests >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("classifier preflight did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("InitializePolicyRouting() error = %v, want context canceled", err)
+	}
+	if !h.PolicyRoutingPreflightPending() {
+		t.Fatal("preflight pending cleared after cancellation")
+	}
+	ready := httptest.NewRecorder()
+	h.HandleReadyz(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if ready.Code != http.StatusServiceUnavailable || !strings.Contains(ready.Body.String(), "policy routing preflight pending") {
+		t.Fatalf("ready status=%d body=%s", ready.Code, ready.Body.String())
+	}
+
+	close(block)
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatalf("retry InitializePolicyRouting() error = %v", err)
+	}
+	if h.PolicyRoutingPreflightPending() {
+		t.Fatal("preflight pending remained set after successful retry")
+	}
+	if diagnostic := h.PolicyRoutingReadinessDiagnostic(); diagnostic != "" {
+		t.Fatalf("readiness diagnostic remained after successful retry: %q", diagnostic)
+	}
+	ready = httptest.NewRecorder()
+	h.HandleReadyz(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if ready.Code != http.StatusOK {
+		t.Fatalf("ready status after retry=%d body=%s", ready.Code, ready.Body.String())
+	}
+}
+
+func TestPolicyRoutingObserveFailureAfterSuccessDoesNotRestoreReadinessWithoutProbe(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	h, err := NewProxyHandler(nil, nil,
+		WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeObserve)),
+		WithPolicyRoutingMode(PolicyRoutingModeObserve),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatalf("initial InitializePolicyRouting() error = %v", err)
+	}
+	if h.PolicyRoutingPreflightPending() || h.PolicyRoutingReadinessDiagnostic() != "" {
+		t.Fatalf("initial pending=%v diagnostic=%q", h.PolicyRoutingPreflightPending(), h.PolicyRoutingReadinessDiagnostic())
+	}
+
+	light.classifierFailureStatus.Store(http.StatusServiceUnavailable)
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatalf("failed observe InitializePolicyRouting() error = %v", err)
+	}
+	diagnostic := h.PolicyRoutingReadinessDiagnostic()
+	if diagnostic == "" {
+		t.Fatal("observe failure did not publish a readiness diagnostic")
+	}
+	profile := h.policyRoutingController.(*chatPolicyRoutingController).profiles["coding-policy"]
+	if profile == nil || profile.preflightReady.Load() {
+		t.Fatalf("failed observe profile remained ready: %+v", profile)
+	}
+	requestsBeforeRetry, _ := light.snapshot()
+
+	light.classifierFailureStatus.Store(0)
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatalf("disabled observe retry InitializePolicyRouting() error = %v", err)
+	}
+	requestsAfterRetry, _ := light.snapshot()
+	if requestsAfterRetry != requestsBeforeRetry {
+		t.Fatalf("disabled observe retry sent classifier request: before=%d after=%d", requestsBeforeRetry, requestsAfterRetry)
+	}
+	if got := h.PolicyRoutingReadinessDiagnostic(); got != diagnostic {
+		t.Fatalf("disabled observe retry diagnostic=%q, want preserved %q", got, diagnostic)
+	}
+	ready := httptest.NewRecorder()
+	h.HandleReadyz(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if ready.Code != http.StatusServiceUnavailable {
+		t.Fatalf("ready status=%d body=%s", ready.Code, ready.Body.String())
+	}
 }
 
 func TestPolicyRoutingSelectedRouteFailureNeverCrossesTiers(t *testing.T) {

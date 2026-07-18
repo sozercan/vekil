@@ -29,8 +29,9 @@ type compiledPolicyProfile struct {
 	unavailableTier policyTier
 	uncertainTier   policyTier
 
-	mode           atomic.Uint32
-	preflightReady atomic.Bool
+	mode              atomic.Uint32
+	preflightRequired bool
+	preflightReady    atomic.Bool
 
 	classifierAdapter policyClassifier
 	classifierRuntime *policyClassifierRuntime
@@ -171,6 +172,7 @@ func newChatPolicyRoutingController(h *ProxyHandler, cfg ProvidersConfig, global
 		profile.classifierRuntime = newPolicyClassifierRuntime(classifierAdapter, admission, breaker)
 		effectiveMode := effectivePolicyMode(globalMode, profileMode)
 		profile.setEffectiveMode(effectiveMode)
+		profile.preflightRequired = effectiveMode != policyModeOff
 		if effectiveMode != policyModeOff {
 			controller.active = true
 		}
@@ -289,6 +291,7 @@ func (c *chatPolicyRoutingController) Initialize(ctx context.Context) error {
 		detailMessage := fmt.Sprintf("policy classifier preflight failed for route %q", routeID)
 		failureCategory := policyFailureStatsReason(policyClassifierFailureFromError(err).Category)
 		for profileIndex, candidate := range profiles {
+			candidate.preflightReady.Store(false)
 			if !hasEnforce {
 				candidate.setEffectiveMode(policyModeOff)
 			}
@@ -315,6 +318,17 @@ func (c *chatPolicyRoutingController) Initialize(ctx context.Context) error {
 	}
 	if len(observeFailures) > 0 {
 		c.setDiagnostic(strings.Join(observeFailures, "; "))
+		return nil
+	}
+	allRequiredReady := true
+	for _, profile := range c.ordered {
+		if profile.preflightRequired && !profile.preflightReady.Load() {
+			allRequiredReady = false
+			break
+		}
+	}
+	if allRequiredReady {
+		c.setDiagnostic("")
 	}
 	return nil
 }

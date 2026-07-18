@@ -288,6 +288,10 @@ type ProxyHandler struct {
 	chatRoutes                       chatRouteDiscoveryCache
 	chatPolicyPlanner                chatPolicyPlanner
 	policyRoutingController          policyRoutingController
+	policyPreflightStateMu           sync.Mutex
+	policyPreflightAttempts          int
+	policyPreflightPermitOnce        sync.Once
+	policyPreflightPermit            chan struct{}
 	policyPreflightPending           atomic.Bool
 	responsesChatReplayMu            sync.Mutex
 	responsesChatReplay              *responsesChatReplayStore
