@@ -33,7 +33,7 @@ func newPolicyIntegrationUpstream(t *testing.T, signals policyClassifierSignals)
 	t.Helper()
 	u := &policyIntegrationUpstream{classifierSignals: signals}
 	u.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
+		defer func() { _ = r.Body.Close() }()
 		var request struct {
 			Model  string `json:"model"`
 			Stream bool   `json:"stream"`

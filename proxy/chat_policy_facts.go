@@ -123,14 +123,6 @@ func (f policyClassifierFacts) taskOrContextTruncated() bool {
 	return f.Truncation.Anchors || f.Truncation.FirstUserTask || f.Truncation.RecentMessages
 }
 
-func (f policyClassifierFacts) messageCount() int {
-	return f.Counts.Messages
-}
-
-func (f policyClassifierFacts) toolCount() int {
-	return f.Counts.FunctionTools
-}
-
 func (f policyClassifierFacts) inputBytes() int {
 	return f.Counts.RequestOriginalBytes
 }

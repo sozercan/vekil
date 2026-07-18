@@ -445,9 +445,10 @@ func (c *chatPolicyRoutingController) enforce(ctx context.Context, profile *comp
 		return chatOperationPlan{}, context.Canceled
 	}
 	category := "classified"
-	if result.Category == policyClassifierResultUnavailable {
+	switch result.Category {
+	case policyClassifierResultUnavailable:
 		category = "unavailable_fallback"
-	} else if result.Category == policyClassifierResultUncertain {
+	case policyClassifierResultUncertain:
 		category = "uncertain_fallback"
 	}
 	decision := policyDecisionRecord{
@@ -710,7 +711,7 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 			preSend := !observation.wroteHeaders.Load() && !observation.wroteRequest.Load()
 			return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(err, preSend)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, policyClassifierResponseLimit+1))
 		if readErr != nil && resp.StatusCode >= 200 && resp.StatusCode <= 299 {
 			return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(readErr, false)

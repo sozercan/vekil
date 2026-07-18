@@ -113,21 +113,6 @@ func (r *publicModelEntryRegistry) configuredEntries() []*publicModelEntry {
 	return append([]*publicModelEntry(nil), snapshot.configured...)
 }
 
-func (r *publicModelEntryRegistry) policyProfileConfigs() []PolicyProfileConfig {
-	snapshot := r.load()
-	if snapshot == nil {
-		return nil
-	}
-	profiles := make([]PolicyProfileConfig, 0, len(snapshot.policyByID))
-	for _, entry := range snapshot.configured {
-		if entry == nil || entry.kind != publicEntryPolicy {
-			continue
-		}
-		profiles = append(profiles, clonePolicyProfileConfig(entry.policyConfig))
-	}
-	return profiles
-}
-
 func newStaticPublicModelEntry(route *modelRoute) *publicModelEntry {
 	if route == nil || !route.isPublic() {
 		return nil

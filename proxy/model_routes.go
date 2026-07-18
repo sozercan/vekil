@@ -229,14 +229,6 @@ func (r *modelRouteRegistry) explicitRoutes() []*modelRoute {
 	return routes
 }
 
-func (r *modelRouteRegistry) terminalRoutes() []*modelRoute {
-	snapshot := r.load()
-	if snapshot == nil {
-		return nil
-	}
-	return append([]*modelRoute(nil), snapshot.explicit...)
-}
-
 func (r *modelRouteRegistry) replaceLegacyProvider(provider *providerRuntime, models []providerModel) error {
 	if provider == nil {
 		return fmt.Errorf("provider is required")
@@ -509,14 +501,6 @@ func (ps *providerSetup) lookupTerminalRoute(routeID string) (*modelRoute, bool)
 		return nil, false
 	}
 	return registry.lookupTerminalRoute(routeID)
-}
-
-func (ps *providerSetup) policyProfileConfigs() []PolicyProfileConfig {
-	registry := ps.routeRegistry()
-	if registry == nil || registry.publicEntries == nil {
-		return nil
-	}
-	return registry.publicEntries.policyProfileConfigs()
 }
 
 func (h *ProxyHandler) resolveModelRouteForRequest(model, endpoint string) (*modelRoute, bool) {
