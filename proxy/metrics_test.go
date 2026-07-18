@@ -3,8 +3,12 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -850,5 +854,140 @@ func TestDoWithRetryKeepsExplicitRouteModelLabel(t *testing.T) {
 	labels["public_model"] = metricsUnroutedModel
 	if got := getCounterValue(families, "vekil_retries_total", labels); got != 0 {
 		t.Fatalf("unrouted explicit route retry metric = %v, want 0", got)
+	}
+}
+
+func TestChatMetricsPromoteColdDiscoveredModel(t *testing.T) {
+	tests := []struct {
+		name              string
+		model             string
+		catalogModels     string
+		upstreamStatus    int
+		wantMetricModel   string
+		wantUpstreamError float64
+	}{
+		{
+			name:            "discovered success",
+			model:           "dynamic-model",
+			catalogModels:   `{"object":"list","data":[{"id":"dynamic-model","supported_endpoints":["/chat/completions"]}]}`,
+			upstreamStatus:  http.StatusOK,
+			wantMetricModel: "dynamic-model",
+		},
+		{
+			name:              "discovered upstream failure",
+			model:             "dynamic-model",
+			catalogModels:     `{"object":"list","data":[{"id":"dynamic-model","supported_endpoints":["/chat/completions"]}]}`,
+			upstreamStatus:    http.StatusServiceUnavailable,
+			wantMetricModel:   "dynamic-model",
+			wantUpstreamError: 1,
+		},
+		{
+			name:            "undiscovered model stays unrouted",
+			model:           "client-controlled-unknown",
+			catalogModels:   `{"object":"list","data":[]}`,
+			upstreamStatus:  http.StatusOK,
+			wantMetricModel: metricsUnroutedModel,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var modelHits atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case providerEndpointModels:
+					modelHits.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, tt.catalogModels)
+				case providerEndpointChatCompletions:
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(tt.upstreamStatus)
+					if tt.upstreamStatus == http.StatusOK {
+						_, _ = io.WriteString(w, `{"id":"chatcmpl-dynamic","object":"chat.completion","model":"`+tt.model+`","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+					} else {
+						_, _ = io.WriteString(w, `{"error":{"message":"unavailable","type":"server_error"}}`)
+					}
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer upstream.Close()
+
+			handler, err := NewProxyHandler(
+				auth.NewTestAuthenticator("fixture"),
+				logger.New(logger.LevelError),
+				WithDeferredDynamicProviderModelValidation(true),
+				WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+					ID:             "dynamic-provider",
+					Type:           "openai-compatible",
+					Default:        true,
+					BaseURL:        upstream.URL,
+					AuthType:       "none",
+					ModelDiscovery: "openai",
+				}}}),
+			)
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+			defer handler.BeginShutdown()
+			handler.maxRetries = 1
+
+			ctx, summary := WithRequestSummary(context.Background())
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"`+tt.model+`","messages":[{"role":"user","content":"hello"}]}`)).WithContext(ctx)
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			handler.HandleOpenAIChatCompletions(recorder, req)
+			status := recorder.Code
+			if status != tt.upstreamStatus {
+				t.Fatalf("response status = %d, want %d; body=%s", status, tt.upstreamStatus, recorder.Body.String())
+			}
+			handler.RecordRequest(summary, status, "test-client", time.Millisecond)
+
+			if got := modelHits.Load(); got != 1 {
+				t.Fatalf("model discovery hits = %d, want 1", got)
+			}
+			stats := readSummaryForStats(summary)
+			wantKnown := tt.wantMetricModel != metricsUnroutedModel
+			if stats.modelKnown != wantKnown {
+				t.Fatalf("summary modelKnown = %t, want %t (metric model %q)", stats.modelKnown, wantKnown, stats.metricModel)
+			}
+			if wantKnown && stats.metricModel != tt.wantMetricModel {
+				t.Fatalf("summary metric model = %q, want %q", stats.metricModel, tt.wantMetricModel)
+			}
+
+			families, err := handler.metrics.registry.Gather()
+			if err != nil {
+				t.Fatalf("gather metrics: %v", err)
+			}
+			labels := map[string]string{
+				"provider":     "dynamic-provider",
+				"public_model": tt.wantMetricModel,
+				"endpoint":     "openai_chat",
+				"status":       strconv.Itoa(tt.upstreamStatus),
+			}
+			if got := getCounterValue(families, "vekil_requests_total", labels); got != 1 {
+				t.Fatalf("request metric = %v, want 1 for labels %+v", got, labels)
+			}
+			if tt.wantMetricModel != metricsUnroutedModel {
+				labels["public_model"] = metricsUnroutedModel
+				if got := getCounterValue(families, "vekil_requests_total", labels); got != 0 {
+					t.Fatalf("unrouted request metric = %v, want 0", got)
+				}
+			} else {
+				labels["public_model"] = tt.model
+				if got := getCounterValue(families, "vekil_requests_total", labels); got != 0 {
+					t.Fatalf("client-controlled model metric = %v, want 0", got)
+				}
+			}
+
+			errorLabels := map[string]string{
+				"provider":     "dynamic-provider",
+				"public_model": tt.wantMetricModel,
+				"code":         strconv.Itoa(tt.upstreamStatus),
+			}
+			if got := getCounterValue(families, "vekil_upstream_errors_total", errorLabels); got != tt.wantUpstreamError {
+				t.Fatalf("upstream error metric = %v, want %v for labels %+v", got, tt.wantUpstreamError, errorLabels)
+			}
+		})
 	}
 }

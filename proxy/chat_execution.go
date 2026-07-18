@@ -58,6 +58,10 @@ func (h *ProxyHandler) executeChatCompletions(ctx context.Context, chatBody []by
 	if err != nil {
 		return chatExecutionResult{}, err
 	}
+	// Cold dynamic discovery may resolve the canonical owner only here, after
+	// the inbound summary was initialized. Promote it before any upstream send
+	// so raw transport/status failures retain the canonical metric identity.
+	observeResolvedChatRoute(RequestSummaryFromContext(ctx), route)
 	if chatRequestContainsResponsesReplayID(chatBody) && route.backend != chatBackendResponses {
 		if !chatRouteAllowsEndpoint(route.provider, route.owner, route.known, providerEndpointResponses) {
 			replayErr := missingResponsesChatReplayError()

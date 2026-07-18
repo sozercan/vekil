@@ -622,12 +622,25 @@ func observeUpstreamHeaders(ctx context.Context, headers http.Header) {
 	}
 }
 
-func observeChatExecutionRoute(ctx context.Context, result chatExecutionResult) {
-	summary := RequestSummaryFromContext(ctx)
-	if summary == nil || result.route.provider == nil {
+func observeResolvedChatRoute(summary *RequestSummary, route resolvedChatRoute) {
+	if summary == nil || route.provider == nil {
 		return
 	}
-	summary.setProvider(result.route.provider.id, string(result.route.provider.kind))
+	providerID, providerKind := route.provider.id, string(route.provider.kind)
+	if route.known {
+		if canonicalModel := strings.TrimSpace(route.owner.publicID); canonicalModel != "" {
+			summary.setProviderModel(providerID, providerKind, true, canonicalModel)
+			return
+		}
+	}
+	// Unknown models may still be served by a permissive default provider. Keep
+	// the final provider attribution without promoting a client-controlled model
+	// into the bounded persistent label set.
+	summary.setProvider(providerID, providerKind)
+}
+
+func observeChatExecutionRoute(ctx context.Context, result chatExecutionResult) {
+	observeResolvedChatRoute(RequestSummaryFromContext(ctx), result.route)
 }
 
 func observeChatExecutionError(ctx context.Context, executionErr *chatExecutionError) {
@@ -635,9 +648,7 @@ func observeChatExecutionError(ctx context.Context, executionErr *chatExecutionE
 		return
 	}
 	if summary := RequestSummaryFromContext(ctx); summary != nil {
-		if executionErr.route.provider != nil {
-			summary.setProvider(executionErr.route.provider.id, string(executionErr.route.provider.kind))
-		}
+		observeResolvedChatRoute(summary, executionErr.route)
 		if len(executionErr.Headers) > 0 {
 			summary.setUpstreamRequestID(UpstreamRequestID(executionErr.Headers))
 		}
