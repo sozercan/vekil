@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,7 +91,7 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantErrorMessage: "capacity exhausted",
 		},
 		{
-			name: "huge retry-after-ms is safely clamped",
+			name: "huge retry-after-ms preserves client delay",
 			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-huge-retry-ms\",\"error\":{\"type\":\"server_error\",\"code\":\"too_many_requests\",\"message\":\"slow down\"}}}\n\n",
 			headers: http.Header{
 				"Content-Type":   []string{"text/event-stream"},
@@ -98,7 +99,7 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			},
 			wantStatus:       http.StatusTooManyRequests,
 			wantContentType:  "application/json",
-			wantRetryAfter:   "300",
+			wantRetryAfter:   "9223372036854776",
 			wantErrorType:    "rate_limit_error",
 			wantErrorMessage: "slow down",
 		},
@@ -330,7 +331,7 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			},
 			wantStatus:       http.StatusTooManyRequests,
 			wantContentType:  "application/json",
-			wantRetryAfter:   "300",
+			wantRetryAfter:   "9223372037",
 			wantErrorType:    "rate_limit_error",
 			wantErrorMessage: "Your requests have exceeded rate limit.",
 		},
@@ -403,7 +404,7 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantErrorMessage: "Request rate limit exceeded.",
 		},
 		{
-			name: "overflow-sized reset value is clamped to five minutes",
+			name: "overflow-sized reset value preserves client delay",
 			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-overflow-reset\",\"error\":{\"message\":\"Request rate limit exceeded.\"}}}\n\n",
 			headers: http.Header{
 				"Content-Type":                   []string{"text/event-stream"},
@@ -412,7 +413,7 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			},
 			wantStatus:       http.StatusTooManyRequests,
 			wantContentType:  "application/json",
-			wantRetryAfter:   "300",
+			wantRetryAfter:   "9223372036854775808",
 			wantErrorType:    "rate_limit_error",
 			wantErrorMessage: "Request rate limit exceeded.",
 		},
@@ -432,7 +433,7 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			wantErrorMessage: "Your requests to gpt-5.6-sol for gpt-5.6-sol in westus3 have exceeded rate limit.",
 		},
 		{
-			name: "overflow-sized retry-after-ms is clamped to five minutes",
+			name: "overflow-sized retry-after-ms preserves client delay",
 			body: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-retry-ms-overflow\",\"error\":{\"message\":\"Your requests have exceeded rate limit.\"}}}\n\n",
 			headers: http.Header{
 				"Content-Type":                 []string{"text/event-stream"},
@@ -441,7 +442,7 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 			},
 			wantStatus:       http.StatusTooManyRequests,
 			wantContentType:  "application/json",
-			wantRetryAfter:   "300",
+			wantRetryAfter:   "10000000",
 			wantErrorType:    "rate_limit_error",
 			wantErrorMessage: "Your requests have exceeded rate limit.",
 		},
@@ -643,6 +644,215 @@ func TestHandleResponses_PrecommitFailureTranslation(t *testing.T) {
 	}
 }
 
+func TestResponsesOutputHasProgress(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  json.RawMessage
+		want bool
+	}{
+		{name: "absent", raw: nil, want: false},
+		{name: "null", raw: json.RawMessage(`null`), want: false},
+		{name: "whitespace padded null", raw: json.RawMessage(" \n null\t"), want: false},
+		{name: "empty array", raw: json.RawMessage(`[]`), want: false},
+		{name: "whitespace padded empty array", raw: json.RawMessage(" \n [ ]\t"), want: false},
+		{name: "non-empty array", raw: json.RawMessage(`[{}]`), want: true},
+		{name: "object", raw: json.RawMessage(`{}`), want: true},
+		{name: "empty string", raw: json.RawMessage(`""`), want: true},
+		{name: "whitespace string", raw: json.RawMessage(`"   "`), want: true},
+		{name: "non-empty string", raw: json.RawMessage(`"partial"`), want: true},
+		{name: "number scalar", raw: json.RawMessage(`0`), want: true},
+		{name: "boolean scalar", raw: json.RawMessage(`false`), want: true},
+		{name: "whitespace only invalid json", raw: json.RawMessage(" \n\t"), want: true},
+		{name: "truncated invalid json", raw: json.RawMessage(`{`), want: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := responsesOutputHasProgress(tt.raw); got != tt.want {
+				t.Fatalf("responsesOutputHasProgress(%q) = %t, want %t", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExplicitRouteStreamingPreambleProgressDoesNotSwitch(t *testing.T) {
+	tests := []struct {
+		name          string
+		preambleType  string
+		responseField string
+	}{
+		{name: "created with output", preambleType: "response.created", responseField: `"output":[{"type":"message"}]`},
+		{name: "created with usage", preambleType: "response.created", responseField: `"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}`},
+		{name: "created with malformed output", preambleType: "response.created", responseField: `"output":{}`},
+		{name: "in progress with output", preambleType: "response.in_progress", responseField: `"output":[{"type":"message"}]`},
+		{name: "in progress with usage", preambleType: "response.in_progress", responseField: `"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}`},
+		{name: "in progress with malformed output", preambleType: "response.in_progress", responseField: `"output":{}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			preamble := fmt.Sprintf("event: %s\ndata: {\"type\":%q,\"response\":{\"id\":\"resp-primary\",%s}}\n\n", tt.preambleType, tt.preambleType, tt.responseField)
+			failure := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-primary\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"quota\"}}}\n\n"
+			secondary := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-secondary\",\"output\":[]}}\n\n"
+
+			var secondaryCalls atomic.Int32
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var body io.ReadCloser
+				switch req.URL.Hostname() {
+				case "primary.example":
+					body = newSplitChunkEOFReadCloser(preamble, failure)
+				case "secondary.example":
+					secondaryCalls.Add(1)
+					body = io.NopCloser(strings.NewReader(secondary))
+				default:
+					t.Fatalf("unexpected target host %q", req.URL.Hostname())
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       body,
+					Request:    req,
+				}, nil
+			})}
+
+			h, route := explicitRouteTestHandler(t, client, routeModePriorityFailover, 2, 2,
+				explicitRouteTestProvider("primary", "https://primary.example", "one"),
+				explicitRouteTestProvider("secondary", "https://secondary.example", "two"),
+			)
+			requestCtx, summary := WithRequestSummary(context.Background())
+			ctx := withRouteOperation(requestCtx, newRouteOperation(route, requestCtx))
+			resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model","stream":true}`), nil, "public-model", true)
+			if err != nil {
+				t.Fatalf("error = %v", err)
+			}
+			if resp == nil {
+				t.Fatal("response = nil, want original primary stream")
+			}
+			defer func() { _ = resp.Body.Close() }()
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				t.Fatalf("read response: %v", readErr)
+			}
+			if !strings.Contains(string(body), "resp-primary") || !strings.Contains(string(body), "response.failed") {
+				t.Fatalf("body = %s, want original primary preamble and failure", body)
+			}
+			if strings.Contains(string(body), "resp-secondary") {
+				t.Fatalf("body = %s, unexpectedly contains secondary response", body)
+			}
+			if got := secondaryCalls.Load(); got != 0 {
+				t.Fatalf("secondary calls = %d, want 0", got)
+			}
+			if got := summary.TargetSwitchCount(); got != 0 {
+				t.Fatalf("target switches = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestExplicitRouteStreamingCleanPreambleStillSwitchesAcrossChunks(t *testing.T) {
+	created := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-primary\",\"output\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n"
+	inProgress := "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp-primary\",\"output\":null}}\n\n"
+	failure := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-primary\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"quota\"}}}\n\n"
+	secondary := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-secondary\",\"output\":[]}}\n\n"
+
+	var secondaryCalls atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var body io.ReadCloser
+		switch req.URL.Hostname() {
+		case "primary.example":
+			body = newSplitChunkEOFReadCloser(created, inProgress, failure)
+		case "secondary.example":
+			secondaryCalls.Add(1)
+			body = io.NopCloser(strings.NewReader(secondary))
+		default:
+			t.Fatalf("unexpected target host %q", req.URL.Hostname())
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       body,
+			Request:    req,
+		}, nil
+	})}
+
+	h, route := explicitRouteTestHandler(t, client, routeModePriorityFailover, 2, 2,
+		explicitRouteTestProvider("primary", "https://primary.example", "one"),
+		explicitRouteTestProvider("secondary", "https://secondary.example", "two"),
+	)
+	requestCtx, summary := WithRequestSummary(context.Background())
+	ctx := withRouteOperation(requestCtx, newRouteOperation(route, requestCtx))
+	resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model","stream":true}`), nil, "public-model", true)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if resp == nil {
+		t.Fatal("response = nil, want secondary stream")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		t.Fatalf("read response: %v", readErr)
+	}
+	if strings.Contains(string(body), "resp-primary") || !strings.Contains(string(body), "resp-secondary") {
+		t.Fatalf("body = %s, want only secondary response", body)
+	}
+	if got := secondaryCalls.Load(); got != 1 {
+		t.Fatalf("secondary calls = %d, want 1", got)
+	}
+	if got := summary.TargetSwitchCount(); got != 1 {
+		t.Fatalf("target switches = %d, want 1", got)
+	}
+}
+
+func TestExplicitRouteStreamingFailureWithNonArrayOutputDoesNotSwitch(t *testing.T) {
+	t.Parallel()
+
+	var secondaryCalls atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"output\":{},\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"late quota\"}}}\n\n")
+	}))
+	defer primary.Close()
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondaryCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-secondary\",\"output\":[]}}\n\n")
+	}))
+	defer secondary.Close()
+
+	h, route := explicitRouteTestHandler(t, http.DefaultClient, routeModePriorityFailover, 2, 2,
+		explicitRouteTestProvider("primary", primary.URL, "one"),
+		explicitRouteTestProvider("secondary", secondary.URL, "two"),
+	)
+	requestCtx, summary := WithRequestSummary(context.Background())
+	ctx := withRouteOperation(requestCtx, newRouteOperation(route, requestCtx))
+	resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model","stream":true}`), nil, "public-model", true)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if resp == nil {
+		t.Fatal("response = nil, want original failed stream")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		t.Fatalf("read response: %v", readErr)
+	}
+	if !strings.Contains(string(body), `"output":{}`) {
+		t.Fatalf("body = %s, want original ambiguous output", body)
+	}
+	if got := secondaryCalls.Load(); got != 0 {
+		t.Fatalf("secondary calls = %d, want 0", got)
+	}
+	if got := summary.TargetSwitchCount(); got != 0 {
+		t.Fatalf("target switches = %d, want 0", got)
+	}
+}
+
 func TestHandleResponses_PrecommitFailureTranslationRecordsUsage(t *testing.T) {
 	handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{
@@ -705,6 +915,109 @@ func TestResponsesFailureHeadersEventValuesReplaceUpstreamCaseInsensitively(t *t
 	}
 }
 
+func TestDecimalMillisecondsToRetryAfterSeconds(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+		ok    bool
+	}{
+		{name: "empty", value: "", ok: false},
+		{name: "zero", value: "000", ok: false},
+		{name: "invalid", value: "1000ms", ok: false},
+		{name: "subsecond", value: "1", want: "1", ok: true},
+		{name: "last subsecond millisecond", value: "999", want: "1", ok: true},
+		{name: "exact second", value: "1000", want: "1", ok: true},
+		{name: "round up", value: "1001", want: "2", ok: true},
+		{name: "carry across prefix", value: "999999", want: "1000", ok: true},
+		{name: "leading zeros", value: " 000001001 ", want: "2", ok: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := decimalMillisecondsToRetryAfterSeconds(tt.value)
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("decimalMillisecondsToRetryAfterSeconds(%q) = (%q, %v), want (%q, %v)", tt.value, got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
+func TestSelectResponsesRetryAfterPreservesVeryLongDecimalHeaders(t *testing.T) {
+	const digits = 64 * 1024
+
+	t.Run("retry-after-ms rounds an arbitrary-length carry", func(t *testing.T) {
+		milliseconds := strings.Repeat("9", digits) + "001"
+		want := "1" + strings.Repeat("0", digits)
+		headers := http.Header{"retry-after-ms": []string{milliseconds}}
+
+		got, source := selectResponsesRetryAfter(headers)
+		if got != want || source != "retry-after-ms" {
+			t.Fatalf("selectResponsesRetryAfter() returned length/source %d/%q, want %d/%q", len(got), source, len(want), "retry-after-ms")
+		}
+	})
+
+	t.Run("retry-after seconds strips zeros without a client clamp", func(t *testing.T) {
+		want := "8" + strings.Repeat("7", digits-1)
+		headers := http.Header{"Retry-After": []string{"000" + want}}
+
+		got, source := selectResponsesRetryAfter(headers)
+		if got != want || source != "Retry-After" {
+			t.Fatalf("selectResponsesRetryAfter() returned length/source %d/%q, want %d/%q", len(got), source, len(want), "Retry-After")
+		}
+	})
+
+	t.Run("reset with more digits wins", func(t *testing.T) {
+		tokenReset := strings.Repeat("9", digits)
+		requestReset := "1" + strings.Repeat("0", digits)
+		headers := http.Header{
+			"x-ratelimit-remaining-tokens":   []string{"0"},
+			"x-ratelimit-reset-tokens":       []string{tokenReset},
+			"x-ratelimit-remaining-requests": []string{"0"},
+			"x-ratelimit-reset-requests":     []string{"000" + requestReset},
+		}
+
+		got, source := selectResponsesRetryAfter(headers)
+		if got != requestReset || source != "x-ratelimit-reset-requests" {
+			t.Fatalf("selectResponsesRetryAfter() returned length/source %d/%q, want %d/%q", len(got), source, len(requestReset), "x-ratelimit-reset-requests")
+		}
+	})
+
+	t.Run("lexicographically larger equal-length reset wins", func(t *testing.T) {
+		tokenReset := "8" + strings.Repeat("0", digits-1)
+		requestReset := "7" + strings.Repeat("9", digits-1)
+		headers := http.Header{
+			"x-ratelimit-remaining-tokens":   []string{"0"},
+			"x-ratelimit-reset-tokens":       []string{tokenReset},
+			"x-ratelimit-remaining-requests": []string{"0"},
+			"x-ratelimit-reset-requests":     []string{requestReset},
+		}
+
+		got, source := selectResponsesRetryAfter(headers)
+		if got != tokenReset || source != "x-ratelimit-reset-tokens" {
+			t.Fatalf("selectResponsesRetryAfter() returned length/source %d/%q, want %d/%q", len(got), source, len(tokenReset), "x-ratelimit-reset-tokens")
+		}
+	})
+}
+
+func TestDecimalMillisecondsToRetryAfterSecondsVeryLongInputUsesBoundedAllocations(t *testing.T) {
+	const digits = 64 * 1024
+	value := strings.Repeat("9", digits) + "001"
+	want := "1" + strings.Repeat("0", digits)
+
+	var got string
+	var ok bool
+	allocations := testing.AllocsPerRun(10, func() {
+		got, ok = decimalMillisecondsToRetryAfterSeconds(value)
+	})
+	if !ok || got != want {
+		t.Fatalf("very long millisecond conversion returned length/ok %d/%v, want %d/true", len(got), ok, len(want))
+	}
+	if allocations > 2 {
+		t.Fatalf("very long millisecond conversion allocations = %.1f, want at most 2 fixed output allocations", allocations)
+	}
+}
+
 func TestSelectResponsesRetryAfterRoundsUpHTTPDate(t *testing.T) {
 	var now time.Time
 	for {
@@ -727,6 +1040,43 @@ func TestSelectResponsesRetryAfterRoundsUpHTTPDate(t *testing.T) {
 	retryAfter, source := selectResponsesRetryAfter(headers)
 	if retryAfter != "1" || source != "Retry-After" {
 		t.Fatalf("selectResponsesRetryAfter() = (%q, %q), want (\"1\", \"Retry-After\")", retryAfter, source)
+	}
+}
+
+var benchmarkRetryAfterSeconds string
+var benchmarkRetryAfterOK bool
+var benchmarkRetryAfterSource string
+
+func BenchmarkDecimalMillisecondsToRetryAfterSecondsVeryLong(b *testing.B) {
+	for _, digits := range []int{1024, 64 * 1024} {
+		value := strings.Repeat("9", digits) + "001"
+		b.Run(strconv.Itoa(digits)+"-digit-prefix", func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(value)))
+			for b.Loop() {
+				benchmarkRetryAfterSeconds, benchmarkRetryAfterOK = decimalMillisecondsToRetryAfterSeconds(value)
+			}
+		})
+	}
+}
+
+func BenchmarkSelectResponsesRetryAfterVeryLongReset(b *testing.B) {
+	for _, digits := range []int{1024, 64 * 1024} {
+		tokenReset := "8" + strings.Repeat("0", digits-1)
+		requestReset := "7" + strings.Repeat("9", digits-1)
+		headers := http.Header{
+			"x-ratelimit-remaining-tokens":   []string{"0"},
+			"x-ratelimit-reset-tokens":       []string{tokenReset},
+			"x-ratelimit-remaining-requests": []string{"0"},
+			"x-ratelimit-reset-requests":     []string{requestReset},
+		}
+		b.Run(strconv.Itoa(digits)+"-digit-resets", func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(tokenReset) + len(requestReset)))
+			for b.Loop() {
+				benchmarkRetryAfterSeconds, benchmarkRetryAfterSource = selectResponsesRetryAfter(headers)
+			}
+		})
 	}
 }
 

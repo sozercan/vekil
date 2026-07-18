@@ -29,6 +29,15 @@ type RequestSummary struct {
 	provider          string
 	providerKind      string
 	modelKnown        bool
+	operationID       string
+	routeID           string
+	finalTarget       string
+	lastTarget        string
+	lastProvider      string
+	lastProviderKind  string
+	upstreamSendCount int64
+	targetSwitchCount int64
+	routeExhausted    bool
 	streamSet         bool
 	stream            bool
 	upstreamRequestID string
@@ -106,6 +115,245 @@ func observeUpstreamAttempt(ctx context.Context) {
 	}
 }
 
+// SetOperationID records the stable proxy-owned logical operation ID. The
+// first non-empty value wins so retries and target switches cannot replace the
+// identity established at admission.
+func (s *RequestSummary) SetOperationID(operationID string) {
+	if s == nil {
+		return
+	}
+	operationID = strings.TrimSpace(operationID)
+	if operationID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.operationID == "" {
+		s.operationID = operationID
+	}
+}
+
+// OperationID returns the stable logical operation ID, if one was recorded.
+func (s *RequestSummary) OperationID() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.operationID
+}
+
+// SetRouteID records the logical model-route ID. The first non-empty value wins
+// because one client request must not move between public model routes.
+func (s *RequestSummary) SetRouteID(routeID string) {
+	if s == nil {
+		return
+	}
+	routeID = strings.TrimSpace(routeID)
+	if routeID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.routeID == "" {
+		s.routeID = routeID
+	}
+}
+
+// RouteID returns the logical model-route ID, if one was recorded.
+func (s *RequestSummary) RouteID() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.routeID
+}
+
+// SetFinalTarget records the final/canonical physical target selected for the
+// logical operation. Unlike operation and route IDs, the target is intentionally
+// replaceable because a later result-selection step can supersede an earlier
+// provisional result.
+func (s *RequestSummary) SetFinalTarget(targetID string) {
+	if s == nil {
+		return
+	}
+	targetID = strings.TrimSpace(targetID)
+	if targetID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finalTarget = targetID
+}
+
+// setFinalRouteAttribution atomically records the target/provider attribution
+// for the response or error the route executor actually returns. A result with
+// no physical target leaves canonical attribution unchanged rather than
+// promoting the most recently dispatched attempt.
+func (s *RequestSummary) setFinalRouteAttribution(targetID, provider, kind string) {
+	if s == nil {
+		return
+	}
+	targetID = strings.TrimSpace(targetID)
+	provider = strings.TrimSpace(provider)
+	kind = strings.TrimSpace(kind)
+	if targetID == "" {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finalTarget = targetID
+	s.provider = provider
+	s.providerKind = kind
+}
+
+// setFinalRouteResult atomically restores the complete attribution for the
+// response or error selected for return. Unlike setUpstreamRequestID, an empty
+// upstream request ID is meaningful here: it clears correlation metadata left
+// by a later attempt when an earlier canonical result wins precedence.
+func (s *RequestSummary) setFinalRouteResult(targetID, provider, kind, upstreamRequestID string) {
+	if s == nil {
+		return
+	}
+	targetID = strings.TrimSpace(targetID)
+	if targetID == "" {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finalTarget = targetID
+	s.provider = strings.TrimSpace(provider)
+	s.providerKind = strings.TrimSpace(kind)
+	s.upstreamRequestID = strings.TrimSpace(upstreamRequestID)
+}
+
+// FinalTarget returns the final/canonical physical target ID, if known.
+func (s *RequestSummary) FinalTarget() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.finalTarget
+}
+
+// RecordUpstreamSend records one actual physical upstream dispatch. Target
+// attempts that fail before network dispatch must not call this method.
+func (s *RequestSummary) RecordUpstreamSend() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.upstreamSendCount++
+}
+
+// recordUpstreamAttempt applies one physical-send observation atomically. The
+// latest dispatched target/provider is kept separate from final attribution so
+// a later prewrite failure cannot overwrite an earlier response selected for
+// return by the route executor.
+func (s *RequestSummary) recordUpstreamAttempt(operationID, routeID, targetID, provider, kind string) {
+	if s == nil {
+		return
+	}
+	operationID = strings.TrimSpace(operationID)
+	routeID = strings.TrimSpace(routeID)
+	targetID = strings.TrimSpace(targetID)
+	provider = strings.TrimSpace(provider)
+	kind = strings.TrimSpace(kind)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.operationID == "" && operationID != "" {
+		s.operationID = operationID
+	}
+	if s.routeID == "" && routeID != "" {
+		s.routeID = routeID
+	}
+	if targetID != "" {
+		s.lastTarget = targetID
+	}
+	if provider != "" {
+		s.lastProvider = provider
+	}
+	if kind != "" {
+		s.lastProviderKind = kind
+	}
+	s.upstreamSendCount++
+}
+
+func (s *RequestSummary) lastUpstreamAttempt() (targetID, provider, kind string) {
+	if s == nil {
+		return "", "", ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastTarget, s.lastProvider, s.lastProviderKind
+}
+
+// UpstreamSendCount returns the number of physical upstream dispatches made for
+// this client request or turn.
+func (s *RequestSummary) UpstreamSendCount() int64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.upstreamSendCount
+}
+
+// RecordTargetSwitch records one selection of a distinct target in the same
+// logical model route. Same-target protocol recovery is not a target switch.
+func (s *RequestSummary) RecordTargetSwitch() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.targetSwitchCount++
+}
+
+// TargetSwitchCount returns the number of distinct-target switches made for
+// this client request or turn.
+func (s *RequestSummary) TargetSwitchCount() int64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.targetSwitchCount
+}
+
+// MarkRouteExhausted marks this logical operation as having exhausted its
+// eligible route targets. It returns true only for the first call so aggregate
+// accounting can remain one-per-operation.
+func (s *RequestSummary) MarkRouteExhausted() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.routeExhausted {
+		return false
+	}
+	s.routeExhausted = true
+	return true
+}
+
+// RouteExhausted reports whether the logical operation exhausted its eligible
+// route targets.
+func (s *RequestSummary) RouteExhausted() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.routeExhausted
+}
+
 func (s *RequestSummary) setRoute(endpoint, model string, stream bool) {
 	if s == nil {
 		return
@@ -124,7 +372,17 @@ func (s *RequestSummary) setRoute(endpoint, model string, stream bool) {
 }
 
 func (s *RequestSummary) setProvider(provider, kind string) {
-	s.setProviderModel(provider, kind, true, "")
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if provider = strings.TrimSpace(provider); provider != "" {
+		s.provider = provider
+	}
+	if kind = strings.TrimSpace(kind); kind != "" {
+		s.providerKind = kind
+	}
 }
 
 func (s *RequestSummary) setProviderModel(provider, kind string, modelKnown bool, canonicalModel string) {
@@ -283,7 +541,25 @@ func (s *RequestSummary) LoggerFields() []logger.Field {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	fields := make([]logger.Field, 0, 8)
+	fields := make([]logger.Field, 0, 14)
+	if s.operationID != "" {
+		fields = append(fields, logger.F("operation_id", s.operationID))
+	}
+	if s.routeID != "" {
+		fields = append(fields, logger.F("route_id", s.routeID))
+	}
+	if s.finalTarget != "" {
+		fields = append(fields, logger.F("final_target", s.finalTarget))
+	}
+	if s.upstreamSendCount != 0 {
+		fields = append(fields, logger.F("upstream_sends", s.upstreamSendCount))
+	}
+	if s.targetSwitchCount != 0 {
+		fields = append(fields, logger.F("target_switches", s.targetSwitchCount))
+	}
+	if s.routeExhausted {
+		fields = append(fields, logger.F("route_exhausted", true))
+	}
 	if s.endpoint != "" {
 		fields = append(fields, logger.F("endpoint", s.endpoint))
 	}

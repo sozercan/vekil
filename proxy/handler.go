@@ -251,6 +251,7 @@ type ProxyHandler struct {
 	copilotURL                       string
 	copilotHeaders                   CopilotHeaderConfig
 	providersConfig                  ProvidersConfig
+	allowedModels                    map[string]struct{}
 	providersState                   *providerSetup
 	deferDynamicProviderModelRefresh bool
 	draining                         atomic.Bool
@@ -294,6 +295,9 @@ type ProxyHandler struct {
 	buildVersion                     string
 	buildCommit                      string
 	buildGoVersion                   string
+	stateBindingsOnce                sync.Once
+	stateBindings                    *stateBindingStore
+	stateBindingsErr                 error
 	insightGate                      *insightGate
 	insightGateOnce                  sync.Once
 }
@@ -686,6 +690,21 @@ func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
 	}
 }
 
+// WithAllowedModels restricts request routing to the listed public model IDs.
+// Empty keeps the normal global model namespace available.
+func WithAllowedModels(models ...string) Option {
+	return func(h *ProxyHandler) {
+		if h.allowedModels == nil {
+			h.allowedModels = make(map[string]struct{})
+		}
+		for _, model := range models {
+			if model = strings.TrimSpace(model); model != "" {
+				h.allowedModels[model] = struct{}{}
+			}
+		}
+	}
+}
+
 // WithProvidersConfig enables multi-provider model routing. When unset, the
 // proxy keeps its legacy single-upstream Copilot behavior.
 func WithProvidersConfig(cfg ProvidersConfig) Option {
@@ -859,6 +878,10 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 	if h.metricsEnabled {
 		h.metrics = NewMetricsCollector()
 		h.metrics.SetBuildInfo(h.buildVersion, h.buildCommit, h.buildGoVersion)
+	}
+	if _, err := h.ensureStateBindingStore(); err != nil {
+		h.BeginShutdown()
+		return nil, err
 	}
 	h.initializeToolOptimizers()
 	if err := h.initializeProviders(); err != nil {
@@ -1247,7 +1270,7 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 	setup := h.providerSetup()
 	for _, providerID := range setup.providerOrder {
 		provider := setup.providerByID(providerID)
-		if provider == nil {
+		if !h.providerWithinAllowedModelScope(provider) {
 			continue
 		}
 		if err := h.checkProviderReady(ctx, provider); err != nil {
@@ -1510,7 +1533,29 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 	setup := h.providerSetup()
 	canonicalRefresh := isCanonicalModelsQuery(rawQuery)
 	rawEntries := make([]json.RawMessage, 0)
-	owners := make(map[string]string)
+	owners := make(map[string]mergedModelReservation)
+	if registry := setup.routeRegistry(); registry != nil {
+		for _, route := range registry.explicitRoutes() {
+			if route == nil {
+				continue
+			}
+			publicID := strings.TrimSpace(route.public.id)
+			if len(h.allowedModels) > 0 {
+				if _, allowed := h.allowedModels[publicID]; !allowed {
+					continue
+				}
+			}
+			reservation := mergedModelReservation{
+				ownerID:     route.public.routeID,
+				rawPublicID: publicID,
+				ownerType:   mergedModelOwnerExplicitRoute,
+			}
+			for _, alias := range configuredPublicModelAliases(reservation.rawPublicID) {
+				owners[alias] = reservation
+			}
+			rawEntries = append(rawEntries, append(json.RawMessage(nil), route.public.raw...))
+		}
+	}
 	refreshedDynamicModels := make(map[string][]providerModel)
 	mergedETag := ""
 	sawDynamicProvider := false
@@ -1518,7 +1563,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 
 	for _, providerID := range setup.providerOrder {
 		provider := setup.providerByID(providerID)
-		if provider == nil {
+		if !h.providerWithinAllowedModelScope(provider) {
 			continue
 		}
 
@@ -1527,19 +1572,18 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 			return cachedModelsResponse{}, false, err
 		}
 
-		models := filterProviderModels(provider, result.models)
+		models := h.filterAllowedModels(filterProviderModels(provider, result.models))
 
 		if result.notModified {
-			models = filterProviderModels(provider, setup.modelsForProvider(provider.id))
+			models = h.filterAllowedModels(filterProviderModels(provider, setup.modelsForProvider(provider.id)))
 			for _, model := range models {
-				if existingProvider, exists := owners[model.publicID]; exists {
-					if existingProvider == model.providerID {
-						continue
-					}
-					return cachedModelsResponse{}, false, providerModelCollisionError(model.publicID, existingProvider, model.providerID)
+				appendModel, err := reserveMergedModelOwner(owners, model)
+				if err != nil {
+					return cachedModelsResponse{}, false, err
 				}
-				owners[model.publicID] = model.providerID
-				rawEntries = append(rawEntries, model.raw)
+				if appendModel {
+					rawEntries = append(rawEntries, model.raw)
+				}
 			}
 		}
 
@@ -1558,14 +1602,13 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 		}
 
 		for _, model := range models {
-			if existingProvider, exists := owners[model.publicID]; exists {
-				if existingProvider == model.providerID {
-					continue
-				}
-				return cachedModelsResponse{}, false, providerModelCollisionError(model.publicID, existingProvider, model.providerID)
+			appendModel, err := reserveMergedModelOwner(owners, model)
+			if err != nil {
+				return cachedModelsResponse{}, false, err
 			}
-			owners[model.publicID] = model.providerID
-			rawEntries = append(rawEntries, model.raw)
+			if appendModel {
+				rawEntries = append(rawEntries, model.raw)
+			}
 		}
 	}
 
@@ -1584,10 +1627,8 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 		return cachedModelsResponse{}, false, err
 	}
 
-	for providerID, models := range refreshedDynamicModels {
-		if err := setup.replaceProviderModels(providerID, models); err != nil {
-			return cachedModelsResponse{}, false, err
-		}
+	if err := setup.replaceProviderModelsBatch(refreshedDynamicModels); err != nil {
+		return cachedModelsResponse{}, false, err
 	}
 
 	return cachedModelsResponse{
@@ -1596,6 +1637,55 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 		expiry:     h.models.nowTime().Add(modelsCacheTTL),
 		etag:       mergedETag,
 	}, false, nil
+}
+
+type mergedModelOwnerType uint8
+
+const (
+	mergedModelOwnerProvider mergedModelOwnerType = iota
+	mergedModelOwnerExplicitRoute
+)
+
+type mergedModelReservation struct {
+	ownerID     string
+	rawPublicID string
+	ownerType   mergedModelOwnerType
+}
+
+// reserveMergedModelOwner reserves both the raw public ID and every normalized
+// request alias before a provider model is exposed in any /models response.
+// Exact duplicates from the same provider retain the historical first-entry
+// behavior; distinct IDs that share an alias are collisions even within one
+// provider, matching the strict version-2 route registry.
+func reserveMergedModelOwner(owners map[string]mergedModelReservation, model providerModel) (bool, error) {
+	publicID := strings.TrimSpace(model.publicID)
+	reservation := mergedModelReservation{
+		ownerID:     model.providerID,
+		rawPublicID: publicID,
+		ownerType:   mergedModelOwnerProvider,
+	}
+	aliases := configuredPublicModelAliases(publicID)
+	duplicate := false
+	for _, alias := range aliases {
+		existing, exists := owners[alias]
+		if !exists {
+			continue
+		}
+		if existing.ownerType == reservation.ownerType &&
+			existing.ownerID == reservation.ownerID &&
+			existing.rawPublicID == reservation.rawPublicID {
+			duplicate = true
+			continue
+		}
+		return false, providerModelCollisionError(alias, existing.ownerID, model.providerID)
+	}
+	if duplicate {
+		return false, nil
+	}
+	for _, alias := range aliases {
+		owners[alias] = reservation
+	}
+	return true, nil
 }
 
 // transformModelsResponse adds a Codex-compatible "models" field to the

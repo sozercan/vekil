@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -61,13 +62,18 @@ var openAICodexProviderEndpoints = []string{providerEndpointResponses}
 // ProvidersConfig configures optional non-Copilot upstream providers.
 // When empty, the proxy keeps its legacy zero-config Copilot behavior.
 type ProvidersConfig struct {
+	SchemaVersion  int                  `json:"schema_version,omitempty" yaml:"schema_version,omitempty"`
 	Providers      []ProviderConfig     `json:"providers" yaml:"providers"`
+	ModelRoutes    []ModelRouteConfig   `json:"model_routes,omitempty" yaml:"model_routes,omitempty"`
 	ToolOptimizers ToolOptimizersConfig `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
 	// InsightModel is the public model ID the dashboard uses to generate
 	// natural-language traffic insights on demand. Empty disables the feature
 	// (the dashboard's "Generate insights" button is hidden). The model must be
 	// one served by the configured providers.
 	InsightModel string `json:"insight_model,omitempty" yaml:"insight_model,omitempty"`
+
+	schemaVersionSet bool
+	modelRoutesSet   bool
 }
 
 // ProviderConfig configures one upstream provider instance.
@@ -159,6 +165,7 @@ type providerModel struct {
 
 type providerSetup struct {
 	providers          map[string]*providerRuntime
+	routes             *modelRouteRegistry
 	providerOrder      []string
 	defaultProviderID  string
 	modelsMu           sync.RWMutex
@@ -242,7 +249,150 @@ func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
 	if err := decodeProvidersConfigFile(path, body, &cfg); err != nil {
 		return cfg, err
 	}
-	return cfg, nil
+	validated, err := validateAndNormalizeProvidersConfig(cfg)
+	if err != nil {
+		return cfg, fmt.Errorf("validate providers config %q: %w", path, err)
+	}
+	return validated.config, nil
+}
+
+func sniffProvidersConfigSchemaVersionYAML(body []byte) int {
+	var header struct {
+		SchemaVersion int `yaml:"schema_version"`
+	}
+	if yaml.Unmarshal(body, &header) != nil {
+		return 0
+	}
+	return header.SchemaVersion
+}
+
+// ResolveStaticProviderModel returns normalized metadata for an explicitly
+// configured static model without contacting an upstream provider. Dynamic
+// catalog entries are intentionally unresolved until provider discovery runs.
+func ResolveStaticProviderModel(cfg ProvidersConfig, modelID string) (ProviderModelConfig, bool, error) {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return ProviderModelConfig{}, false, nil
+	}
+	if cfg.EffectiveSchemaVersion() == ProvidersConfigSchemaVersion2 {
+		validated, err := validateAndNormalizeProvidersConfig(cfg)
+		if err != nil {
+			return ProviderModelConfig{}, false, err
+		}
+		cfg = validated.config
+		for _, route := range cfg.ModelRoutes {
+			if strings.TrimSpace(route.PublicID) != modelID {
+				continue
+			}
+			resolved := ProviderModelConfig{
+				PublicID:            modelID,
+				Name:                strings.TrimSpace(route.Name),
+				Endpoints:           append([]string(nil), route.Endpoints...),
+				ModelPickerEnabled:  cloneBoolPtr(route.ModelPickerEnabled),
+				ModelPickerCategory: strings.TrimSpace(route.ModelPickerCategory),
+				ReasoningEffort:     append([]string(nil), route.ReasoningEffort...),
+				Vision:              cloneBoolPtr(route.Vision),
+				ParallelToolCalls:   cloneBoolPtr(route.ParallelToolCalls),
+				DropSamplingParams:  cloneBoolPtr(route.DropSamplingParams),
+				ContextWindow:       route.ContextWindow,
+			}
+			if resolved.Name == "" {
+				resolved.Name = modelID
+			}
+			return resolved, true, nil
+		}
+	}
+
+	var resolved ProviderModelConfig
+	resolvedProviderID := ""
+	for _, providerCfg := range cfg.Providers {
+		providerID := strings.TrimSpace(providerCfg.ID)
+		if providerID == "" {
+			return ProviderModelConfig{}, false, fmt.Errorf("provider id is required")
+		}
+		kind := providerType(strings.TrimSpace(providerCfg.Type))
+		switch kind {
+		case providerTypeAzureOpenAI:
+		case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+			discovery, err := configuredProviderModelDiscovery(kind, providerCfg.ModelDiscovery)
+			if err != nil {
+				return ProviderModelConfig{}, false, fmt.Errorf("provider %q: %w", providerID, err)
+			}
+			if discovery != providerModelDiscoveryStatic {
+				// Models on dynamic generic providers are metadata overlays. They
+				// materialize only when the upstream/deployment appears in the
+				// discovered catalog, so dry-run cannot resolve them statically.
+				continue
+			}
+		case providerTypeCopilot, providerTypeOpenAICodex:
+			// These providers are catalog-driven; their Models fields are not
+			// part of the configured static model table.
+			continue
+		default:
+			return ProviderModelConfig{}, false, fmt.Errorf("provider %q has unsupported type %q", providerID, providerCfg.Type)
+		}
+		if !configuredProviderAllowsModel(providerCfg, modelID) {
+			continue
+		}
+
+		matchedProvider := false
+		for _, rawModel := range providerCfg.Models {
+			if strings.TrimSpace(rawModel.PublicID) != modelID {
+				continue
+			}
+			if matchedProvider {
+				return ProviderModelConfig{}, false, fmt.Errorf("provider %q configures model %q more than once", providerID, modelID)
+			}
+			matchedProvider = true
+
+			model, err := buildStaticProviderModel(
+				providerID,
+				rawModel,
+				providerEndpointPolicyFor(kind).defaultStaticEndpoints(),
+			)
+			if err != nil {
+				return ProviderModelConfig{}, false, err
+			}
+			if resolvedProviderID != "" {
+				return ProviderModelConfig{}, false, providerModelCollisionError(modelID, resolvedProviderID, providerID)
+			}
+
+			resolved = normalizeProviderModelConfig(rawModel)
+			resolved.PublicID = model.publicID
+			resolved.Deployment = model.upstreamModel
+			if resolved.Name == "" {
+				resolved.Name = model.publicID
+			}
+			resolved.Endpoints = append([]string(nil), model.supportedEndpoints...)
+			resolvedProviderID = providerID
+		}
+	}
+
+	return resolved, resolvedProviderID != "", nil
+}
+
+func configuredProviderAllowsModel(cfg ProviderConfig, model string) bool {
+	hasIncludes := false
+	included := false
+	for _, candidate := range cfg.IncludeModels {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		hasIncludes = true
+		if candidate == model {
+			included = true
+		}
+	}
+	if hasIncludes && !included {
+		return false
+	}
+	for _, candidate := range cfg.ExcludeModels {
+		if strings.TrimSpace(candidate) == model {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) error {
@@ -252,6 +402,15 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".yaml", ".yml":
+		allowMergeKeys := sniffProvidersConfigSchemaVersionYAML(body) != ProvidersConfigSchemaVersion2
+		if err := rejectDuplicateYAMLMappingKeys(body, allowMergeKeys); err != nil {
+			return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
+		}
+		if !allowMergeKeys {
+			if err := validateYAMLConfigFieldPaths(body); err != nil {
+				return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
+			}
+		}
 		decoder := yaml.NewDecoder(bytes.NewReader(body))
 		decoder.KnownFields(true)
 		if err := decoder.Decode(cfg); err != nil {
@@ -264,7 +423,19 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 			}
 			return fmt.Errorf("decode providers config %q as YAML: more than one YAML document", path)
 		}
+		present, err := yamlTopLevelConfigFields(body)
+		if err != nil {
+			return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
+		}
+		cfg.schemaVersionSet = present["schema_version"]
+		cfg.modelRoutesSet = present["model_routes"]
 	default:
+		if err := rejectDuplicateJSONMappingKeys(body); err != nil {
+			return fmt.Errorf("decode providers config %q as JSON: %w", path, err)
+		}
+		if err := validateJSONConfigFieldPaths(body); err != nil {
+			return fmt.Errorf("decode providers config %q as JSON: %w", path, err)
+		}
 		decoder := json.NewDecoder(bytes.NewReader(body))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(cfg); err != nil {
@@ -277,6 +448,12 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 			}
 			return fmt.Errorf("decode providers config %q as JSON: more than one JSON value", path)
 		}
+		present, err := jsonTopLevelConfigFields(body)
+		if err != nil {
+			return fmt.Errorf("decode providers config %q as JSON: %w", path, err)
+		}
+		cfg.schemaVersionSet = present["schema_version"]
+		cfg.modelRoutesSet = present["model_routes"]
 	}
 	return nil
 }
@@ -294,7 +471,9 @@ func (c ProvidersConfig) UsesCopilot() bool {
 }
 
 func defaultProviderSetup(h *ProxyHandler) *providerSetup {
+	routes, _ := newModelRouteRegistry(nil)
 	return &providerSetup{
+		routes: routes,
 		providers: map[string]*providerRuntime{
 			"copilot": {
 				id:            "copilot",
@@ -355,7 +534,25 @@ func (ps *providerSetup) addProviderModels(providerID string, models []providerM
 	ps.modelsMu.Lock()
 	defer ps.modelsMu.Unlock()
 
-	return mergeProviderModels(ps.models, models)
+	next := make(map[string]providerModel, len(ps.models)+len(models))
+	for publicID, model := range ps.models {
+		next[publicID] = model
+	}
+	if err := mergeProviderModels(next, models); err != nil {
+		return err
+	}
+	if ps.routes == nil {
+		var err error
+		ps.routes, err = newModelRouteRegistry(nil)
+		if err != nil {
+			return err
+		}
+	}
+	if err := ps.routes.addLegacyProvider(provider, models); err != nil {
+		return err
+	}
+	ps.models = next
+	return nil
 }
 
 func (ps *providerSetup) addStaticProviderModels(providerID string) error {
@@ -366,28 +563,94 @@ func (ps *providerSetup) addStaticProviderModels(providerID string) error {
 }
 
 func (ps *providerSetup) replaceProviderModels(providerID string, models []providerModel) error {
-	if ps == nil {
+	return ps.replaceProviderModelsBatch(map[string][]providerModel{providerID: models})
+}
+
+func (ps *providerSetup) replaceProviderModelsBatch(replacements map[string][]providerModel) error {
+	if ps == nil || len(replacements) == 0 {
 		return nil
 	}
 
-	provider := ps.providerByID(providerID)
-	models = filterProviderModels(provider, models)
+	filtered := make(map[string][]providerModel, len(replacements))
+	for providerID, models := range replacements {
+		provider := ps.providerByID(providerID)
+		if provider == nil {
+			return fmt.Errorf("provider %q is not configured", providerID)
+		}
+		filtered[providerID] = filterProviderModels(provider, models)
+	}
 
 	ps.modelsMu.Lock()
 	defer ps.modelsMu.Unlock()
 
-	next := make(map[string]providerModel, len(ps.models)+len(models))
+	next := make(map[string]providerModel, len(ps.models))
 	for publicID, model := range ps.models {
-		if model.providerID == providerID {
+		if _, replacing := filtered[model.providerID]; replacing {
 			continue
 		}
 		next[publicID] = model
 	}
-
-	if err := mergeProviderModels(next, models); err != nil {
+	mergedProviders := make(map[string]struct{}, len(filtered))
+	for _, providerID := range ps.providerOrder {
+		models, replacing := filtered[providerID]
+		if !replacing {
+			continue
+		}
+		if err := mergeProviderModels(next, models); err != nil {
+			return err
+		}
+		mergedProviders[providerID] = struct{}{}
+	}
+	remainingProviderIDs := make([]string, 0, len(filtered)-len(mergedProviders))
+	for providerID := range filtered {
+		if _, merged := mergedProviders[providerID]; !merged {
+			remainingProviderIDs = append(remainingProviderIDs, providerID)
+		}
+	}
+	sort.Strings(remainingProviderIDs)
+	for _, providerID := range remainingProviderIDs {
+		if err := mergeProviderModels(next, filtered[providerID]); err != nil {
+			return err
+		}
+	}
+	if ps.routes == nil {
+		routes, err := newModelRouteRegistry(nil)
+		if err != nil {
+			return err
+		}
+		orderedProviderIDs := append([]string(nil), ps.providerOrder...)
+		seenProviderIDs := make(map[string]struct{}, len(orderedProviderIDs))
+		for _, providerID := range orderedProviderIDs {
+			seenProviderIDs[providerID] = struct{}{}
+		}
+		remaining := make([]string, 0, len(ps.providers)-len(seenProviderIDs))
+		for providerID := range ps.providers {
+			if _, seen := seenProviderIDs[providerID]; !seen {
+				remaining = append(remaining, providerID)
+			}
+		}
+		sort.Strings(remaining)
+		orderedProviderIDs = append(orderedProviderIDs, remaining...)
+		for _, providerID := range orderedProviderIDs {
+			provider := ps.providerByID(providerID)
+			if provider == nil {
+				continue
+			}
+			existing := make([]providerModel, 0)
+			for _, model := range ps.models {
+				if model.providerID == providerID {
+					existing = append(existing, model)
+				}
+			}
+			if err := routes.addLegacyProvider(provider, existing); err != nil {
+				return err
+			}
+		}
+		ps.routes = routes
+	}
+	if err := ps.routes.replaceLegacyProviders(ps.providers, ps.providerOrder, filtered); err != nil {
 		return err
 	}
-
 	ps.models = next
 	return nil
 }
@@ -446,8 +709,20 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 		return nil, err
 	}
 
+	explicitRoutes, err := compileExplicitModelRoutes(cfg, providers)
+	if err != nil {
+		return nil, err
+	}
+	routes, err := newModelRouteRegistry(explicitRoutes)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.EffectiveSchemaVersion() == ProvidersConfigSchemaVersion2 {
+		routes.setStrictAliases(true)
+	}
 	setup := &providerSetup{
 		providers:          providers,
+		routes:             routes,
 		providerOrder:      providerOrder,
 		defaultProviderID:  defaultProviderID,
 		models:             make(map[string]providerModel),
@@ -506,9 +781,10 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 	ctx, cancel := context.WithTimeout(ctx, modelsUpstreamTimeout)
 	defer cancel()
 
+	replacements := make(map[string][]providerModel)
 	for _, providerID := range setup.providerOrder {
 		provider := setup.providerByID(providerID)
-		if !providerUsesDynamicModels(provider) {
+		if !h.providerMayExposeAllowedModel(provider) || !providerUsesDynamicModels(provider) {
 			continue
 		}
 
@@ -516,9 +792,10 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 		if err != nil {
 			return fmt.Errorf("load models for provider %q: %w", provider.id, err)
 		}
-		if err := setup.replaceProviderModels(providerID, result.models); err != nil {
-			return err
-		}
+		replacements[providerID] = h.filterAllowedModels(result.models)
+	}
+	if err := setup.replaceProviderModelsBatch(replacements); err != nil {
+		return err
 	}
 
 	h.dynamicProviderValidationPending.Store(false)
@@ -526,15 +803,102 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 	return nil
 }
 
+// providerMayExposeAllowedModel reports whether provider must participate in
+// allowed-model discovery. Unlike providerWithinAllowedModelScope, it ignores
+// current ownership so every dynamic candidate is checked for collisions
+// before the selected model is trusted.
+func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) bool {
+	if provider == nil {
+		return false
+	}
+	if len(h.allowedModels) == 0 {
+		return true
+	}
+	for model := range h.allowedModels {
+		if providerCanExposeModel(provider, model) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime) bool {
+	if provider == nil {
+		return false
+	}
+	if len(h.allowedModels) == 0 {
+		return true
+	}
+	setup := h.providerSetup()
+	for model := range h.allowedModels {
+		if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
+			for _, target := range route.targets {
+				if target.provider != nil && target.provider.id == provider.id {
+					return true
+				}
+			}
+			continue
+		}
+		if owner, ok := setup.lookupModel(model); ok {
+			if owner.providerID == provider.id {
+				return true
+			}
+			continue
+		}
+		if providerCanExposeModel(provider, model) {
+			return true
+		}
+	}
+	return false
+}
+
+func providerCanExposeModel(provider *providerRuntime, model string) bool {
+	if provider == nil || !provider.allowsModel(model) {
+		return false
+	}
+	if _, ok := provider.staticConfigs[model]; ok {
+		return true
+	}
+	return providerUsesDynamicModels(provider)
+}
+
+func (h *ProxyHandler) filterAllowedModels(models []providerModel) []providerModel {
+	if len(h.allowedModels) == 0 {
+		return models
+	}
+	filtered := make([]providerModel, 0, len(models))
+	for _, model := range models {
+		if _, ok := h.allowedModels[model.publicID]; ok {
+			filtered = append(filtered, model)
+		}
+	}
+	return filtered
+}
+
 func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*providerRuntime, []string, string, error) {
+	validated, err := validateAndNormalizeProvidersConfig(cfg)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	cfg = validated.config
+
 	providers := make(map[string]*providerRuntime, len(cfg.Providers))
 	providerOrder := make([]string, 0, len(cfg.Providers))
 	defaultProviderID := ""
 	copilotProviders := 0
 
-	for _, raw := range cfg.Providers {
-		provider, err := buildProviderRuntime(raw, h.copilotURL, h.azureIdentityTokenSourceFactory)
+	for providerIndex, raw := range cfg.Providers {
+		if validated.schemaVersion == ProvidersConfigSchemaVersion2 {
+			if err := validateProviderRuntimeEnvironment(raw, providerIndex); err != nil {
+				return nil, nil, "", err
+			}
+		}
+		_, allowEmptyStaticModels := validated.routeReferencedProviders[strings.TrimSpace(raw.ID)]
+		provider, err := buildProviderRuntimeForProvidersConfig(raw, h.copilotURL, h.azureIdentityTokenSourceFactory, allowEmptyStaticModels)
 		if err != nil {
+			if validated.schemaVersion == ProvidersConfigSchemaVersion2 {
+				return nil, nil, "", configPathError(fmt.Sprintf("providers[%d]", providerIndex), "%v", err)
+			}
 			return nil, nil, "", err
 		}
 		if _, exists := providers[provider.id]; exists {
@@ -586,6 +950,10 @@ func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*provider
 }
 
 func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIdentityFactory azureIdentityTokenSourceFactory) (*providerRuntime, error) {
+	return buildProviderRuntimeForProvidersConfig(cfg, defaultCopilotURL, azureIdentityFactory, false)
+}
+
+func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotURL string, azureIdentityFactory azureIdentityTokenSourceFactory, allowEmptyStaticModels bool) (*providerRuntime, error) {
 	id := strings.TrimSpace(cfg.ID)
 	if id == "" {
 		return nil, fmt.Errorf("provider id is required")
@@ -685,7 +1053,7 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		default:
 			return nil, fmt.Errorf("provider %q has unsupported auth_mode %q", id, cfg.AuthMode)
 		}
-		if len(cfg.Models) == 0 {
+		if len(cfg.Models) == 0 && !allowEmptyStaticModels {
 			return nil, fmt.Errorf("provider %q must configure at least one model", id)
 		}
 		if err := addStaticProviderModels(runtime, cfg.Models, runtime.defaultStaticModelEndpoints()); err != nil {
@@ -739,7 +1107,7 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 		runtime.extraHeaders = extraHeaders
 		runtime.modelDiscovery = modelDiscovery
 
-		if modelDiscovery == providerModelDiscoveryStatic && len(cfg.Models) == 0 {
+		if modelDiscovery == providerModelDiscoveryStatic && len(cfg.Models) == 0 && !allowEmptyStaticModels {
 			return nil, fmt.Errorf("provider %q must configure at least one model when model_discovery is static", id)
 		}
 		if err := addStaticProviderModels(runtime, cfg.Models, runtime.defaultStaticModelEndpoints()); err != nil {
@@ -1152,21 +1520,24 @@ func synthesizeProviderModelRaw(providerID, publicID, name string, endpoints []s
 }
 
 func (h *ProxyHandler) resolveProviderModel(model, endpoint string) (*providerRuntime, providerModel, bool) {
-	setup := h.providerSetup()
 	model = strings.TrimSpace(model)
-	if model != "" {
-		if providerModel, ok := setup.lookupModel(model); ok {
-			provider := setup.providerByID(providerModel.providerID)
-			if provider != nil {
-				return provider, providerModel, true
-			}
+	if !h.modelAllowedForRequest(model, endpoint) {
+		return nil, providerModel{publicID: model, upstreamModel: model}, false
+	}
+	if route, known := h.resolveModelRouteForRequest(model, endpoint); known && route != nil {
+		target, ok := route.primaryTarget()
+		if !ok || target.provider == nil {
+			return nil, providerModel{}, true
 		}
+		return target.provider, providerModelFromRouteTarget(route, target), true
 	}
 
+	setup := h.providerSetup()
 	defaultProvider := setup.defaultProvider()
 	if defaultProvider == nil {
 		return nil, providerModel{}, false
 	}
+	model = strings.TrimSpace(model)
 	return defaultProvider, providerModel{
 		publicID:           model,
 		upstreamModel:      model,
@@ -1175,18 +1546,65 @@ func (h *ProxyHandler) resolveProviderModel(model, endpoint string) (*providerRu
 	}, false
 }
 
-func (h *ProxyHandler) resolveProviderModelForRequest(model, endpoint string) (*providerRuntime, providerModel, bool) {
-	rawModel := strings.TrimSpace(model)
-	rawProvider, rawOwner, rawKnown := h.resolveProviderModel(rawModel, endpoint)
-	if rawKnown || endpoint != providerEndpointMessages {
-		return rawProvider, rawOwner, rawKnown
+func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
+	if h == nil || len(h.allowedModels) == 0 {
+		return true
 	}
+	model = strings.TrimSpace(model)
+	if _, ok := h.allowedModels[model]; ok {
+		return true
+	}
+	if endpoint != providerEndpointMessages {
+		return false
+	}
+	if _, rawKnown := h.providerSetup().lookupModel(model); rawKnown {
+		return false
+	}
+	normalizedModel := NormalizeModelName(model)
+	if normalizedModel == model {
+		return false
+	}
+	_, ok := h.allowedModels[normalizedModel]
+	return ok
+}
 
-	normalizedModel := NormalizeModelName(rawModel)
-	if normalizedModel == rawModel {
-		return rawProvider, rawOwner, false
+// ModelUsesCopilot reports whether startup must authenticate Copilot to resolve
+// or collision-check the selected public model. Provider filters exclude
+// Copilot from this decision when it cannot expose the model.
+func (h *ProxyHandler) ModelUsesCopilot(model string) bool {
+	setup := h.providerSetup()
+	model = strings.TrimSpace(model)
+	if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
+		for _, target := range route.targets {
+			if target.provider != nil && target.provider.kind == providerTypeCopilot {
+				return true
+			}
+		}
 	}
-	return h.resolveProviderModel(normalizedModel, endpoint)
+	for _, providerID := range setup.providerOrder {
+		provider := setup.providerByID(providerID)
+		if provider == nil || provider.kind != providerTypeCopilot {
+			continue
+		}
+		if owner, ok := setup.lookupModel(model); ok && owner.providerID == provider.id {
+			return true
+		}
+		if providerCanExposeModel(provider, model) {
+			return true
+		}
+	}
+	return false
+}
+
+func modelNotAllowedRequestError(model string) error {
+	return &providerRequestError{
+		statusCode: http.StatusBadRequest,
+		err:        fmt.Errorf("model %q is not allowed by this proxy", strings.TrimSpace(model)),
+	}
+}
+
+func (h *ProxyHandler) resolveProviderModelForRequest(model, endpoint string) (*providerRuntime, providerModel, bool) {
+	return h.resolveProviderModel(model, endpoint)
 }
 
 func providerModelSupportsEndpoint(model providerModel, endpoint string) bool {

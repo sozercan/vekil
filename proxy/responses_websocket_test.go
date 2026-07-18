@@ -1,10 +1,14 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -59,6 +63,23 @@ func TestHandleResponsesWebSocket_DisabledByDefaultReturnsUpgradeRequired(t *tes
 	}
 	if resp.Header.Get("Upgrade") != "websocket" {
 		t.Fatalf("expected Upgrade header to be websocket, got %q", resp.Header.Get("Upgrade"))
+	}
+}
+
+func TestResponsesWebSocketPrepareExplicitRouteOperationRejectsDisallowedModel(t *testing.T) {
+	handler := newOperationAdmissionTestHandler(t, providerTypeOpenAICompatible, []string{providerEndpointResponses}, "https://upstream.invalid")
+	handler.allowedModels = map[string]struct{}{"selected-model": {}}
+	session := &responsesWebSocketSession{ctx: context.Background()}
+
+	ctx, operation, route, err := session.prepareExplicitRouteOperation(handler, context.Background(), "public-model")
+	if err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("prepareExplicitRouteOperation() error = %v, want model-not-allowed", err)
+	}
+	if operation != nil || route != nil {
+		t.Fatalf("disallowed websocket operation = %p, route = %p; want nil", operation, route)
+	}
+	if routeOperationFromContext(ctx) != nil {
+		t.Fatal("disallowed websocket route was attached to context")
 	}
 }
 
@@ -703,6 +724,762 @@ func TestHandleResponsesWebSocket_RoutesConfiguredAzureIdentityProvider(t *testi
 	}
 }
 
+func TestPrepareExplicitResponsesWebSocketSuccessResponse_ConcurrentCompactionWaiterStaysLocal(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	var releaseOnce sync.Once
+	releaseLeader := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseLeader()
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read compact request: %v", err)
+		}
+		if !strings.Contains(string(body), `"model":"physical-primary"`) {
+			t.Errorf("compact request did not use primary physical model: %s", body)
+		}
+		startedOnce.Do(func() { close(started) })
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_compact","object":"response","model":"physical-primary","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"shared checkpoint"}]}],"usage":{"input_tokens":13,"output_tokens":2,"total_tokens":15}}`)
+	}))
+	defer upstream.Close()
+
+	handler := newExplicitRouteResponsesWebSocketHandler(t, upstream.URL, upstream.URL)
+	route, known := handler.resolveModelRouteForRequest("public-ws-model", providerEndpointResponses)
+	if !known || route == nil || route.legacy {
+		t.Fatal("explicit websocket route was not resolved")
+	}
+
+	turn := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type":    "message",
+			"role":    "user",
+			"content": []map[string]string{{"type": "input_text", "text": "compact me"}},
+		},
+		map[string]interface{}{"type": "compaction_trigger"},
+	})
+	turn["model"] = "public-ws-model"
+	parsedTurn := mustParseResponsesWebSocketCreateRequest(t, turn)
+	turnBody, err := parsedTurn.upstreamBody(parsedTurn.Input)
+	if err != nil {
+		t.Fatalf("build compaction turn body: %v", err)
+	}
+	requestFields, handled, err := compactTriggerRequestFields(turnBody)
+	if err != nil || !handled {
+		t.Fatalf("extract compaction turn fields: handled=%t err=%v", handled, err)
+	}
+	type compactResult struct {
+		summary string
+		resp    *http.Response
+		err     error
+	}
+	runCompact := func(operation *routeOperation, done chan<- compactResult) {
+		summary, resp, err := handler.compactResponsesRequest(
+			withRouteOperation(context.Background(), operation),
+			copyResponsesRequestFields(requestFields),
+			nil,
+		)
+		done <- compactResult{summary: summary, resp: resp, err: err}
+	}
+
+	leaderOperation := newRouteOperation(route, context.Background())
+	leaderDone := make(chan compactResult, 1)
+	go runCompact(leaderOperation, leaderDone)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for compact singleflight leader")
+	}
+
+	waiterOperation := newRouteOperation(route, context.Background())
+	waiterDone := make(chan compactResult, 1)
+	go runCompact(waiterOperation, waiterDone)
+	waitForCompactInflightWaiters(t, handler, 1)
+	releaseLeader()
+
+	leader := <-leaderDone
+	waiter := <-waiterDone
+	for _, result := range []struct {
+		name string
+		compactResult
+	}{
+		{name: "leader", compactResult: leader},
+		{name: "waiter", compactResult: waiter},
+	} {
+		if result.err != nil {
+			t.Fatalf("%s compact request failed: %v", result.name, result.err)
+		}
+		if result.resp != nil {
+			_ = result.resp.Body.Close()
+			t.Fatalf("%s compact response = %v, want synthetic summary", result.name, result.resp.StatusCode)
+		}
+		if result.summary != "shared checkpoint" {
+			t.Fatalf("%s compact summary = %q, want shared checkpoint", result.name, result.summary)
+		}
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream compact calls = %d, want one singleflight leader", got)
+	}
+	stats := handler.stats.snapshot()
+	if stats.UpstreamAttempts != 1 || stats.TargetSwitches != 0 {
+		t.Fatalf("route metrics = attempts:%d switches:%d, want 1/0", stats.UpstreamAttempts, stats.TargetSwitches)
+	}
+
+	leaderSends, _, _ := leaderOperation.snapshot()
+	if leaderSends != 1 || leaderOperation.pinnedTarget() != "primary" {
+		t.Fatalf("leader operation = sends:%d target:%q, want one send pinned to primary", leaderSends, leaderOperation.pinnedTarget())
+	}
+	waiterSends, _, _ := waiterOperation.snapshot()
+	if waiterSends != 0 || waiterOperation.pinnedTarget() != "" {
+		t.Fatalf("waiter operation = sends:%d target:%q, want local result with no selected target", waiterSends, waiterOperation.pinnedTarget())
+	}
+
+	plan := responsesWebSocketRequestPlan{compactionChecked: true, compactionTrigger: true}
+	t.Run("joined local response does not require target ownership", func(t *testing.T) {
+		resp := syntheticCompactionTriggerResponse(waiter.summary, true, zeroResponsesUsage())
+		defer func() { _ = resp.Body.Close() }()
+		session := &responsesWebSocketSession{}
+		if err := session.prepareExplicitRouteSuccessResponse(handler, resp, route, waiterOperation, plan); err != nil {
+			t.Fatalf("prepare local compaction response: %v", err)
+		}
+		if session.explicitRouteID != "" || session.explicitTargetID != "" {
+			t.Fatalf("local compaction response pinned session to route=%q target=%q", session.explicitRouteID, session.explicitTargetID)
+		}
+	})
+
+	t.Run("upstream compaction still pins selected target", func(t *testing.T) {
+		resp := syntheticCompactionTriggerResponse(leader.summary, true, zeroResponsesUsage())
+		defer func() { _ = resp.Body.Close() }()
+		session := &responsesWebSocketSession{}
+		if err := session.prepareExplicitRouteSuccessResponse(handler, resp, route, leaderOperation, plan); err != nil {
+			t.Fatalf("prepare upstream compaction response: %v", err)
+		}
+		if session.explicitRouteID != route.public.routeID || session.explicitTargetID != "primary" {
+			t.Fatalf("upstream compaction response pinned route=%q target=%q, want %q/primary", session.explicitRouteID, session.explicitTargetID, route.public.routeID)
+		}
+	})
+}
+
+func TestCompactResponsesRequest_ExplicitPinnedTargetsKeepProviderCredentialsAndHeadersIsolated(t *testing.T) {
+	type upstreamExpectation struct {
+		name           string
+		apiKey         string
+		providerHeader string
+		upstreamModel  string
+		summary        string
+		started        chan struct{}
+		startedOnce    sync.Once
+		calls          atomic.Int32
+	}
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseUpstreams := func() { releaseOnce.Do(func() { close(release) }) }
+
+	newUpstream := func(expectation *upstreamExpectation) *httptest.Server {
+		t.Helper()
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			expectation.calls.Add(1)
+			if got := r.Header.Get("Authorization"); got != "Bearer "+expectation.apiKey {
+				t.Errorf("%s Authorization = %q, want bearer credential", expectation.name, got)
+			}
+			if got := r.Header.Get("X-Provider-Scope"); got != expectation.providerHeader {
+				t.Errorf("%s X-Provider-Scope = %q, want %q", expectation.name, got, expectation.providerHeader)
+			}
+			if got := r.Header.Get("X-Codex-Turn-Metadata"); got != `{"turn_id":"shared"}` {
+				t.Errorf("%s X-Codex-Turn-Metadata = %q, want shared caller header", expectation.name, got)
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read %s compact request: %v", expectation.name, err)
+			}
+			if !strings.Contains(string(body), `"model":"`+expectation.upstreamModel+`"`) {
+				t.Errorf("%s compact request did not use upstream model %q: %s", expectation.name, expectation.upstreamModel, body)
+			}
+			expectation.startedOnce.Do(func() { close(expectation.started) })
+			<-release
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"resp_%s","object":"response","model":%q,"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":%q}]}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}`, expectation.name, expectation.upstreamModel, expectation.summary)
+		}))
+	}
+
+	primaryExpectation := &upstreamExpectation{
+		name:           "primary",
+		apiKey:         "primary-secret",
+		providerHeader: "primary-scope",
+		upstreamModel:  "physical-primary",
+		summary:        "primary checkpoint",
+		started:        make(chan struct{}),
+	}
+	secondaryExpectation := &upstreamExpectation{
+		name:           "secondary",
+		apiKey:         "secondary-secret",
+		providerHeader: "secondary-scope",
+		upstreamModel:  "physical-secondary",
+		summary:        "secondary checkpoint",
+		started:        make(chan struct{}),
+	}
+	primary := newUpstream(primaryExpectation)
+	defer primary.Close()
+	secondary := newUpstream(secondaryExpectation)
+	defer secondary.Close()
+	defer releaseUpstreams()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{
+			SchemaVersion: 2,
+			Providers: []ProviderConfig{
+				{
+					ID:           "compact-primary",
+					Type:         string(providerTypeOpenAICompatible),
+					Default:      true,
+					BaseURL:      primary.URL,
+					AuthType:     string(providerAuthTypeBearer),
+					APIKey:       primaryExpectation.apiKey,
+					ExtraHeaders: map[string]string{"X-Provider-Scope": primaryExpectation.providerHeader},
+				},
+				{
+					ID:           "compact-secondary",
+					Type:         string(providerTypeOpenAICompatible),
+					BaseURL:      secondary.URL,
+					AuthType:     string(providerAuthTypeBearer),
+					APIKey:       secondaryExpectation.apiKey,
+					ExtraHeaders: map[string]string{"X-Provider-Scope": secondaryExpectation.providerHeader},
+				},
+			},
+			ModelRoutes: []ModelRouteConfig{{
+				ID:        "compact-route",
+				PublicID:  "public-compact-model",
+				Name:      "Public Compact Model",
+				Endpoints: []string{providerEndpointResponses},
+				Targets: []ModelRouteTargetConfig{
+					{ID: "primary", Provider: "compact-primary", UpstreamModel: primaryExpectation.upstreamModel},
+					{ID: "secondary", Provider: "compact-secondary", UpstreamModel: secondaryExpectation.upstreamModel},
+				},
+				Routing: ModelRouteRoutingConfig{
+					Mode:              string(routeModePriorityFailover),
+					MaxTargetAttempts: 2,
+					MaxUpstreamSends:  2,
+				},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler explicit compact route: %v", err)
+	}
+	defer handler.BeginShutdown()
+
+	route, known := handler.resolveModelRouteForRequest("public-compact-model", providerEndpointResponses)
+	if !known || route == nil || route.legacy {
+		t.Fatal("explicit compact route was not resolved")
+	}
+	requestFields := map[string]json.RawMessage{
+		"model": json.RawMessage(`"public-compact-model"`),
+		"input": json.RawMessage(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"same history"}]}]`),
+	}
+	callerHeaders := http.Header{"X-Codex-Turn-Metadata": {`{"turn_id":"shared"}`}}
+
+	type compactResult struct {
+		summary string
+		resp    *http.Response
+		err     error
+	}
+	runCompact := func(targetID string, done chan<- compactResult) {
+		operation := newRouteOperation(route, context.Background())
+		if err := operation.forcePinnedTarget(targetID); err != nil {
+			done <- compactResult{err: err}
+			return
+		}
+		summary, resp, err := handler.compactResponsesRequest(
+			withRouteOperation(context.Background(), operation),
+			copyResponsesRequestFields(requestFields),
+			callerHeaders.Clone(),
+		)
+		done <- compactResult{summary: summary, resp: resp, err: err}
+	}
+
+	primaryDone := make(chan compactResult, 1)
+	go runCompact("primary", primaryDone)
+	select {
+	case <-primaryExpectation.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for primary compact request")
+	}
+
+	secondaryDone := make(chan compactResult, 1)
+	go runCompact("secondary", secondaryDone)
+	secondaryDispatched := false
+	select {
+	case <-secondaryExpectation.started:
+		secondaryDispatched = true
+	case <-time.After(time.Second):
+	}
+	releaseUpstreams()
+
+	primaryResult := <-primaryDone
+	secondaryResult := <-secondaryDone
+	if !secondaryDispatched {
+		t.Fatalf("secondary pinned compact request coalesced with primary; calls primary=%d secondary=%d, summaries primary=%q secondary=%q", primaryExpectation.calls.Load(), secondaryExpectation.calls.Load(), primaryResult.summary, secondaryResult.summary)
+	}
+	for _, result := range []struct {
+		name        string
+		wantSummary string
+		compactResult
+	}{
+		{name: "primary", wantSummary: primaryExpectation.summary, compactResult: primaryResult},
+		{name: "secondary", wantSummary: secondaryExpectation.summary, compactResult: secondaryResult},
+	} {
+		if result.err != nil {
+			t.Fatalf("%s compact request failed: %v", result.name, result.err)
+		}
+		if result.resp != nil {
+			_ = result.resp.Body.Close()
+			t.Fatalf("%s compact response = %v, want synthetic summary", result.name, result.resp.StatusCode)
+		}
+		if result.summary != result.wantSummary {
+			t.Fatalf("%s compact summary = %q, want %q", result.name, result.summary, result.wantSummary)
+		}
+	}
+	if got := primaryExpectation.calls.Load(); got != 1 {
+		t.Fatalf("primary upstream compact calls = %d, want 1", got)
+	}
+	if got := secondaryExpectation.calls.Load(); got != 1 {
+		t.Fatalf("secondary upstream compact calls = %d, want 1", got)
+	}
+}
+
+func TestHandleResponsesWebSocket_ExplicitRouteFirstTurnFailsOverThenPinsSession(t *testing.T) {
+	var primaryCalls atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryCalls.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read primary body: %v", err)
+		}
+		if !strings.Contains(string(body), `"model":"physical-primary"`) {
+			t.Errorf("primary body did not use physical model: %s", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Openai-Model", "physical-primary")
+		w.Header().Set("X-Codex-Turn-State", "primary-hidden-state")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_primary_hidden\",\"model\":\"physical-primary\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_primary_hidden\",\"model\":\"physical-primary\",\"error\":{\"type\":\"server_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"primary overloaded\"}}}\n\n")
+	}))
+	defer primary.Close()
+
+	var secondaryCalls atomic.Int32
+	secondTurnState := make(chan string, 1)
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := secondaryCalls.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read secondary body: %v", err)
+		}
+		if !strings.Contains(string(body), `"model":"physical-secondary"`) {
+			t.Errorf("secondary body did not use physical model: %s", body)
+		}
+		if strings.Contains(string(body), "resp_primary_hidden") || strings.Contains(string(body), "primary-hidden-state") {
+			t.Errorf("failed primary leaked into secondary request: %s", body)
+		}
+		if call == 2 {
+			secondTurnState <- r.Header.Get("X-Codex-Turn-State")
+		}
+
+		responseID := fmt.Sprintf("resp_secondary_%d", call)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Openai-Model", "physical-secondary")
+		w.Header().Set("X-Codex-Turn-State", fmt.Sprintf("secondary-state-%d", call))
+		_, _ = fmt.Fprintf(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":%q,\"model\":\"physical-secondary\"}}\n\n", responseID)
+		if call == 1 {
+			_, _ = fmt.Fprint(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_secondary\",\"content\":[{\"type\":\"output_text\",\"text\":\"secondary only\"}]}}\n\n")
+		}
+		_, _ = fmt.Fprintf(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":%q,\"model\":\"physical-secondary\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n", responseID)
+	}))
+	defer secondary.Close()
+
+	handler := newExplicitRouteResponsesWebSocketHandler(t, primary.URL, secondary.URL)
+	handler.responsesWS.TurnStateDelta = true
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	first := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type":    "message",
+			"role":    "user",
+			"content": []map[string]string{{"type": "input_text", "text": "first"}},
+		},
+	})
+	first["model"] = "public-ws-model"
+	first["client_metadata"] = map[string]string{"x-codex-turn-metadata": `{"turn_id":"route-turn"}`}
+	if err := conn.WriteJSON(first); err != nil {
+		t.Fatalf("write first request: %v", err)
+	}
+
+	firstMetadata := mustReadWebSocketJSON(t, conn)
+	firstOperationID := explicitResponsesWebSocketOperationID(t, firstMetadata)
+	if got := explicitResponsesWebSocketMetadataHeader(t, firstMetadata, "openai-model"); got != "public-ws-model" {
+		t.Fatalf("first metadata model = %q, want public-ws-model", got)
+	}
+	firstCreated := mustReadWebSocketJSON(t, conn)
+	if firstCreated["type"] != "response.created" {
+		t.Fatalf("first visible event = %v, want response.created", firstCreated["type"])
+	}
+	if responseID := websocketResponseID(t, firstCreated); responseID != "resp_secondary_1" {
+		t.Fatalf("first visible response id = %q, want secondary response", responseID)
+	}
+	firstResponse, ok := firstCreated["response"].(map[string]interface{})
+	if !ok || firstResponse["model"] != "public-ws-model" {
+		t.Fatalf("first visible response model = %+v, want public model", firstCreated["response"])
+	}
+	firstOutput := mustReadWebSocketJSON(t, conn)
+	if firstOutput["type"] != "response.output_item.done" {
+		t.Fatalf("first output event = %v", firstOutput["type"])
+	}
+	firstCompleted := mustReadWebSocketJSON(t, conn)
+	if firstCompleted["type"] != "response.completed" {
+		t.Fatalf("first terminal event = %v", firstCompleted["type"])
+	}
+
+	second := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type":    "message",
+			"role":    "user",
+			"content": []map[string]string{{"type": "input_text", "text": "second"}},
+		},
+	})
+	second["model"] = "public-ws-model"
+	second["previous_response_id"] = websocketResponseID(t, firstCreated)
+	second["client_metadata"] = map[string]string{"x-codex-turn-metadata": `{"turn_id":"route-turn"}`}
+	if err := conn.WriteJSON(second); err != nil {
+		t.Fatalf("write second request: %v", err)
+	}
+
+	secondMetadata := mustReadWebSocketJSON(t, conn)
+	secondOperationID := explicitResponsesWebSocketOperationID(t, secondMetadata)
+	secondCreated := mustReadWebSocketJSON(t, conn)
+	if secondCreated["type"] != "response.created" || websocketResponseID(t, secondCreated) != "resp_secondary_2" {
+		t.Fatalf("second created event = %+v", secondCreated)
+	}
+	secondCompleted := mustReadWebSocketJSON(t, conn)
+	if secondCompleted["type"] != "response.completed" {
+		t.Fatalf("second terminal event = %v", secondCompleted["type"])
+	}
+
+	if got := primaryCalls.Load(); got != 1 {
+		t.Fatalf("primary calls = %d, want only failed first-turn attempt", got)
+	}
+	if got := secondaryCalls.Load(); got != 2 {
+		t.Fatalf("secondary calls = %d, want first-turn success plus pinned follow-up", got)
+	}
+	if got := <-secondTurnState; got != "secondary-state-1" {
+		t.Fatalf("second turn state = %q, want committed secondary state", got)
+	}
+	assertResponsesWebSocketOperationSequence(t, firstOperationID, secondOperationID)
+}
+
+func TestHandleResponsesWebSocket_ExplicitRoutePinnedTargetFailureDoesNotMigrate(t *testing.T) {
+	var primaryCalls atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		call := primaryCalls.Add(1)
+		if call == 2 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"message":"primary unavailable","code":"rate_limit_exceeded"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Openai-Model", "physical-primary")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_primary_1\",\"model\":\"physical-primary\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_primary_1\",\"model\":\"physical-primary\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n")
+	}))
+	defer primary.Close()
+
+	var secondaryCalls atomic.Int32
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondaryCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_secondary_unexpected\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_secondary_unexpected\"}}\n\n")
+	}))
+	defer secondary.Close()
+
+	handler := newExplicitRouteResponsesWebSocketHandler(t, primary.URL, secondary.URL)
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	first := newResponsesWebSocketCreateRequest([]interface{}{})
+	first["model"] = "public-ws-model"
+	if err := conn.WriteJSON(first); err != nil {
+		t.Fatalf("write first request: %v", err)
+	}
+	firstMetadata := mustReadWebSocketJSON(t, conn)
+	firstOperationID := explicitResponsesWebSocketOperationID(t, firstMetadata)
+	firstCreated := mustReadWebSocketJSON(t, conn)
+	if firstCreated["type"] != "response.created" {
+		t.Fatalf("first created event = %v", firstCreated["type"])
+	}
+	if completed := mustReadWebSocketJSON(t, conn); completed["type"] != "response.completed" {
+		t.Fatalf("first terminal event = %v", completed["type"])
+	}
+
+	second := newResponsesWebSocketCreateRequest([]interface{}{})
+	second["model"] = "public-ws-model"
+	second["previous_response_id"] = websocketResponseID(t, firstCreated)
+	if err := conn.WriteJSON(second); err != nil {
+		t.Fatalf("write second request: %v", err)
+	}
+	errorFrame := mustReadWebSocketJSON(t, conn)
+	if errorFrame["type"] != "error" || int(errorFrame["status_code"].(float64)) != http.StatusTooManyRequests {
+		t.Fatalf("pinned failure frame = %+v", errorFrame)
+	}
+	secondOperationID := explicitResponsesWebSocketErrorHeader(t, errorFrame, responsesWebSocketOperationHeader)
+
+	if got := primaryCalls.Load(); got != 2 {
+		t.Fatalf("primary calls = %d, want one call per turn with no automatic same-target retry", got)
+	}
+	if got := secondaryCalls.Load(); got != 0 {
+		t.Fatalf("secondary calls = %d, pinned session must fail closed", got)
+	}
+	assertResponsesWebSocketOperationSequence(t, firstOperationID, secondOperationID)
+}
+
+func TestHandleResponsesWebSocket_ExplicitRouteRejectsUnknownStateBeforeDispatch(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		upstreamCalls.Add(1)
+	}))
+	defer upstream.Close()
+
+	handler := newExplicitRouteResponsesWebSocketHandler(t, upstream.URL, upstream.URL)
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type":              "reasoning",
+			"encrypted_content": "unknown-provider-state",
+		},
+	})
+	request["model"] = "public-ws-model"
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	errorFrame := mustReadWebSocketJSON(t, conn)
+	if errorFrame["type"] != "error" || int(errorFrame["status_code"].(float64)) != http.StatusBadRequest {
+		t.Fatalf("unknown-state frame = %+v", errorFrame)
+	}
+	if got := explicitResponsesWebSocketErrorHeader(t, errorFrame, responsesWebSocketOperationHeader); !strings.HasSuffix(got, ":1") {
+		t.Fatalf("operation id = %q, want first turn suffix", got)
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Fatalf("upstream calls = %d, unknown state must fail before dispatch", got)
+	}
+}
+
+func TestHandleResponsesWebSocket_ExplicitRouteValidatesContextCompactionStateBeforeRewrite(t *testing.T) {
+	writeCompleted := func(w http.ResponseWriter, responseID, model string) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Openai-Model", model)
+		_, _ = fmt.Fprintf(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":%q,\"model\":%q}}\n\n", responseID, model)
+		_, _ = fmt.Fprintf(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":%q,\"model\":%q,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n", responseID, model)
+	}
+	requestWithState := func(token string) map[string]interface{} {
+		request := newResponsesWebSocketCreateRequest([]interface{}{
+			map[string]interface{}{
+				"type":              "context_compaction",
+				"encrypted_content": token,
+			},
+			map[string]interface{}{
+				"type":    "message",
+				"role":    "user",
+				"content": []map[string]string{{"type": "input_text", "text": "continue"}},
+			},
+		})
+		request["model"] = "public-ws-model"
+		return request
+	}
+
+	t.Run("unknown state fails closed without dispatch", func(t *testing.T) {
+		var upstreamCalls atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			upstreamCalls.Add(1)
+			writeCompleted(w, "resp_unexpected", "physical-primary")
+		}))
+		defer upstream.Close()
+
+		handler := newExplicitRouteResponsesWebSocketHandler(t, upstream.URL, upstream.URL)
+		server := startResponsesWebSocketProxyServer(t, handler)
+		conn := mustDialResponsesWebSocket(t, server, nil)
+		defer func() { _ = conn.Close() }()
+
+		if err := conn.WriteJSON(requestWithState("unknown provider context checkpoint")); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+		errorFrame := mustReadWebSocketJSON(t, conn)
+		if errorFrame["type"] != "error" || int(errorFrame["status_code"].(float64)) != http.StatusBadRequest {
+			t.Fatalf("unknown context-compaction frame = %+v", errorFrame)
+		}
+		if got := upstreamCalls.Load(); got != 0 {
+			t.Fatalf("upstream calls = %d, unknown context-compaction state must fail before dispatch", got)
+		}
+	})
+
+	t.Run("known state pins exact owner and sends rewritten body", func(t *testing.T) {
+		const token = "provider context checkpoint owned by secondary"
+		var primaryCalls atomic.Int32
+		primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			primaryCalls.Add(1)
+			writeCompleted(w, "resp_primary_unexpected", "physical-primary")
+		}))
+		defer primary.Close()
+
+		var secondaryCalls atomic.Int32
+		secondaryBodies := make(chan []byte, 1)
+		secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			secondaryCalls.Add(1)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read secondary body: %v", err)
+			}
+			secondaryBodies <- append([]byte(nil), body...)
+			writeCompleted(w, "resp_secondary_state", "physical-secondary")
+		}))
+		defer secondary.Close()
+
+		handler := newExplicitRouteResponsesWebSocketHandler(t, primary.URL, secondary.URL)
+		route, known := handler.resolveModelRouteForRequest("public-ws-model", providerEndpointResponses)
+		if !known || route == nil || route.legacy {
+			t.Fatal("explicit websocket route was not resolved")
+		}
+		bindExplicitEncryptedContentForTest(t, handler, route, route.targets[1].id, token)
+
+		server := startResponsesWebSocketProxyServer(t, handler)
+		conn := mustDialResponsesWebSocket(t, server, nil)
+		defer func() { _ = conn.Close() }()
+
+		if err := conn.WriteJSON(requestWithState(token)); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+		created := mustReadWebSocketJSONSkipMetadata(t, conn)
+		if created["type"] != "response.created" {
+			t.Fatalf("created frame = %+v", created)
+		}
+		completed := mustReadWebSocketJSON(t, conn)
+		if completed["type"] != "response.completed" {
+			t.Fatalf("completed frame = %+v", completed)
+		}
+
+		if got := primaryCalls.Load(); got != 0 {
+			t.Fatalf("primary calls = %d, state-bound websocket request must not use primary", got)
+		}
+		if got := secondaryCalls.Load(); got != 1 {
+			t.Fatalf("secondary calls = %d, want exact state owner once", got)
+		}
+
+		var body []byte
+		select {
+		case body = <-secondaryBodies:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for secondary request body")
+		}
+		if bytes.Contains(body, []byte(`"type":"context_compaction"`)) || bytes.Contains(body, []byte(`"encrypted_content"`)) {
+			t.Fatalf("upstream body retained provider context-compaction shape: %s", body)
+		}
+		if !bytes.Contains(body, []byte(proxyCompactionContextIntro)) {
+			t.Fatalf("upstream body did not contain rewritten checkpoint context: %s", body)
+		}
+		if !bytes.Contains(body, []byte(`"model":"physical-secondary"`)) {
+			t.Fatalf("upstream body did not use state-bound physical model: %s", body)
+		}
+	})
+}
+
+func TestHandleResponsesWebSocket_ExplicitRoutePreservesLocalWarmupReplay(t *testing.T) {
+	var primaryCalls atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryCalls.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read primary body: %v", err)
+		}
+		if !strings.Contains(string(body), "local warmup") || !strings.Contains(string(body), "provider turn") {
+			t.Errorf("provider replay body = %s, want local warmup plus current input", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_primary_warmup\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_primary_warmup\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n")
+	}))
+	defer primary.Close()
+
+	var secondaryCalls atomic.Int32
+	secondary := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		secondaryCalls.Add(1)
+	}))
+	defer secondary.Close()
+
+	handler := newExplicitRouteResponsesWebSocketHandler(t, primary.URL, secondary.URL)
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	warmup := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type":    "message",
+			"role":    "user",
+			"content": []map[string]string{{"type": "input_text", "text": "local warmup"}},
+		},
+	})
+	warmup["model"] = "public-ws-model"
+	warmup["generate"] = false
+	if err := conn.WriteJSON(warmup); err != nil {
+		t.Fatalf("write warmup request: %v", err)
+	}
+	warmupCreated := mustReadWebSocketJSON(t, conn)
+	if warmupCreated["type"] != "response.created" {
+		t.Fatalf("warmup created event = %v", warmupCreated["type"])
+	}
+	if completed := mustReadWebSocketJSON(t, conn); completed["type"] != "response.completed" {
+		t.Fatalf("warmup terminal event = %v", completed["type"])
+	}
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type":    "message",
+			"role":    "user",
+			"content": []map[string]string{{"type": "input_text", "text": "provider turn"}},
+		},
+	})
+	request["model"] = "public-ws-model"
+	request["previous_response_id"] = websocketResponseID(t, warmupCreated)
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("write provider request: %v", err)
+	}
+	if metadata := mustReadWebSocketJSON(t, conn); !strings.HasSuffix(explicitResponsesWebSocketOperationID(t, metadata), ":1") {
+		t.Fatalf("provider operation metadata = %+v", metadata)
+	}
+	if created := mustReadWebSocketJSON(t, conn); created["type"] != "response.created" {
+		t.Fatalf("provider created event = %v", created["type"])
+	}
+	if completed := mustReadWebSocketJSON(t, conn); completed["type"] != "response.completed" {
+		t.Fatalf("provider terminal event = %v", completed["type"])
+	}
+	if got := primaryCalls.Load(); got != 1 {
+		t.Fatalf("primary calls = %d, want one provider-backed turn", got)
+	}
+	if got := secondaryCalls.Load(); got != 0 {
+		t.Fatalf("secondary calls = %d, warmup replay should use primary", got)
+	}
+}
+
 func TestHandleResponsesWebSocket_CreateRequestUsesStreamingUpstreamTimeout(t *testing.T) {
 	deadlineCh := make(chan time.Duration, 1)
 	handler := newRoundTripTestProxyHandler(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -1162,7 +1939,7 @@ func TestResponsesWebSocketAutoCompactionRetryMetricsKeepFallbackModel(t *testin
 	payload["model"] = "gpt-unsupported"
 	request := mustParseResponsesWebSocketCreateRequest(t, payload)
 
-	result, usage := session.maybeAutoCompactHistory(handler, request, responsesWebSocketRequestMetrics{})
+	result, usage := session.maybeAutoCompactHistory(handler, request, responsesWebSocketRequestMetrics{}, nil)
 	if !result.autoCompacted {
 		t.Fatalf("auto-compaction did not complete: responses_posts=%d fallback_posts=%d usage=%+v logs=%s", responsePosts.Load(), fallbackPosts.Load(), usage, logs.String())
 	}
@@ -1249,6 +2026,7 @@ func TestResponsesWebSocketTurnKeepsRawStatsAndCanonicalMetricsModel(t *testing.
 		responsesUsage{InputTokens: 2, OutputTokens: 1},
 		true,
 		true,
+		nil,
 	)
 
 	snap := handler.stats.snapshot()
@@ -3004,7 +3782,7 @@ func TestHandleResponsesWebSocket_TurnStateDeltaKeepsStateWhenTurnMetadataEnrich
 
 func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing.T) {
 	var upstreamRequestsMu sync.Mutex
-	upstreamRequests := make([]map[string]interface{}, 0, 3)
+	upstreamRequests := make([]map[string]interface{}, 0, 4)
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -3038,8 +3816,17 @@ func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing
 				t.Fatalf("expected full replay fallback to omit turn state, got %q", got)
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("X-Codex-Turn-State", "turn-state-2")
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n")
 			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
+		case 4:
+			if got := r.Header.Get("X-Codex-Turn-State"); got != "turn-state-2" {
+				t.Fatalf("expected next delta to reuse fallback turn state, got %q", got)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("X-Codex-Turn-State", "turn-state-3")
+			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-3\"}}\n\n")
+			_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-3\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n")
 		default:
 			t.Fatalf("unexpected upstream request count %d", requestCount)
 		}
@@ -3107,6 +3894,41 @@ func TestHandleResponsesWebSocket_TurnStateDeltaFallsBackToFullReplay(t *testing
 	}
 	if got := inputTextFromMessage(t, fallbackInput[2]); got != "follow up" {
 		t.Fatalf("expected fallback replay to include latest user turn, got %q", got)
+	}
+
+	third := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "after fallback"},
+			},
+		},
+	})
+	third["previous_response_id"] = websocketResponseID(t, created)
+	if err := conn.WriteJSON(third); err != nil {
+		t.Fatalf("failed to write third request: %v", err)
+	}
+
+	thirdCreated := mustReadWebSocketJSONSkipMetadata(t, conn)
+	thirdCompleted := mustReadWebSocketJSON(t, conn)
+	if thirdCreated["type"] != "response.created" {
+		t.Fatalf("expected subsequent response.created event, got %v", thirdCreated["type"])
+	}
+	if thirdCompleted["type"] != "response.completed" {
+		t.Fatalf("expected subsequent response.completed event, got %v", thirdCompleted["type"])
+	}
+
+	requests = snapshotResponsesWebSocketRequests(&upstreamRequestsMu, upstreamRequests)
+	if len(requests) != 4 {
+		t.Fatalf("expected 4 upstream requests including subsequent delta, got %d", len(requests))
+	}
+	subsequentInput := upstreamInputItems(t, requests[3])
+	if len(subsequentInput) != 1 {
+		t.Fatalf("expected subsequent request to use delta replay, got %d input items", len(subsequentInput))
+	}
+	if got := inputTextFromMessage(t, subsequentInput[0]); got != "after fallback" {
+		t.Fatalf("expected subsequent delta to include only latest input, got %q", got)
 	}
 }
 
@@ -3486,13 +4308,13 @@ func TestResponsesWebSocketErrorHeadersPreservesExistingRetryAfter(t *testing.T)
 	}
 }
 
-func TestResponsesWebSocketErrorHeadersClampsMassiveRetryAfter(t *testing.T) {
+func TestResponsesWebSocketErrorHeadersPreservesMassiveRetryAfter(t *testing.T) {
 	headers := http.Header{
 		"Retry-After": []string{"10000000000"},
 	}
 	got := responsesWebSocketErrorHeaders(http.StatusTooManyRequests, headers)
-	if retryAfter := got.Get("Retry-After"); retryAfter != "300" {
-		t.Fatalf("Retry-After = %q, want clamped value 300", retryAfter)
+	if retryAfter := got.Get("Retry-After"); retryAfter != "10000000000" {
+		t.Fatalf("Retry-After = %q, want preserved value 10000000000", retryAfter)
 	}
 }
 
@@ -5070,6 +5892,39 @@ func TestHandleResponsesWebSocket_FailureStatsSurviveImmediateClientWriteFailure
 	}
 }
 
+func TestHandleResponsesWebSocket_LegacyFailureUsageDoesNotAffectExplicitRoutePhysicalLedger(t *testing.T) {
+	handler := newRoundTripTestProxyHandler(t, func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(
+				"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-legacy-failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"quota\"},\"usage\":{\"input_tokens\":7,\"output_tokens\":2,\"total_tokens\":9}}}\n\n")),
+			Request: req,
+		}, nil
+	})
+	handler.stats = newStatsCollector()
+	serverConn, clientConn := newResponsesWebSocketConnPair(t)
+	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	_ = clientConn.Close()
+	_ = serverConn.Close()
+
+	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
+	if err := session.handleCreateRequest(handler, request); !errors.Is(err, errResponsesWebSocketClientWrite) {
+		t.Fatalf("handleCreateRequest error = %v, want client write failure", err)
+	}
+
+	snap := handler.stats.snapshot()
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 1 || snap.Totals.TotalTokens != 9 {
+		t.Fatalf("legacy websocket client ledger = %+v, want one 9-token failure", snap.Totals)
+	}
+	if !snap.PhysicalUsage.isZero() || !snap.WastedUsage.isZero() {
+		t.Fatalf("legacy websocket contaminated explicit route ledger: physical:%+v wasted:%+v", snap.PhysicalUsage, snap.WastedUsage)
+	}
+	if snap.UpstreamAttempts != 0 || len(snap.ByTarget) != 0 || len(snap.RecentAttempts) != 0 {
+		t.Fatalf("legacy websocket created explicit route attempts: attempts:%d by_target:%+v recent:%+v", snap.UpstreamAttempts, snap.ByTarget, snap.RecentAttempts)
+	}
+}
+
 func TestHandleResponsesWebSocket_StreamFailureStatsSurviveClientCloseAtDelivery(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -5895,6 +6750,110 @@ func newResponsesWebSocketConnPair(t *testing.T) (*websocket.Conn, *websocket.Co
 	}
 }
 
+func newExplicitRouteResponsesWebSocketHandler(t *testing.T, primaryURL, secondaryURL string) *ProxyHandler {
+	t.Helper()
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelError),
+		WithProvidersConfig(ProvidersConfig{
+			SchemaVersion: 2,
+			Providers: []ProviderConfig{
+				{
+					ID:      "ws-primary",
+					Type:    string(providerTypeAzureOpenAI),
+					Default: true,
+					BaseURL: primaryURL + "/openai/v1",
+					APIKey:  "primary-key",
+				},
+				{
+					ID:      "ws-secondary",
+					Type:    string(providerTypeAzureOpenAI),
+					BaseURL: secondaryURL + "/openai/v1",
+					APIKey:  "secondary-key",
+				},
+			},
+			ModelRoutes: []ModelRouteConfig{{
+				ID:        "public-ws-route",
+				PublicID:  "public-ws-model",
+				Name:      "Public WebSocket Model",
+				Endpoints: []string{providerEndpointResponses},
+				Targets: []ModelRouteTargetConfig{
+					{ID: "primary", Provider: "ws-primary", UpstreamModel: "physical-primary"},
+					{ID: "secondary", Provider: "ws-secondary", UpstreamModel: "physical-secondary"},
+				},
+				Routing: ModelRouteRoutingConfig{
+					Mode:              string(routeModePriorityFailover),
+					MaxTargetAttempts: 2,
+					MaxUpstreamSends:  2,
+				},
+			}},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler explicit websocket route: %v", err)
+	}
+	t.Cleanup(handler.BeginShutdown)
+	return handler
+}
+
+func explicitResponsesWebSocketMetadataHeader(t *testing.T, payload map[string]interface{}, name string) string {
+	t.Helper()
+	if payload["type"] != "codex.response.metadata" {
+		t.Fatalf("frame type = %v, want codex.response.metadata", payload["type"])
+	}
+	headers, ok := payload["headers"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("metadata headers = %T, want object", payload["headers"])
+	}
+	for key, value := range headers {
+		if strings.EqualFold(key, name) {
+			text, ok := value.(string)
+			if !ok {
+				t.Fatalf("metadata header %q = %T, want string", key, value)
+			}
+			return text
+		}
+	}
+	t.Fatalf("metadata header %q missing from %+v", name, headers)
+	return ""
+}
+
+func explicitResponsesWebSocketOperationID(t *testing.T, payload map[string]interface{}) string {
+	t.Helper()
+	return explicitResponsesWebSocketMetadataHeader(t, payload, "x-vekil-request-id")
+}
+
+func explicitResponsesWebSocketErrorHeader(t *testing.T, payload map[string]interface{}, name string) string {
+	t.Helper()
+	headers, ok := payload["headers"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("error headers = %T, want object in %+v", payload["headers"], payload)
+	}
+	for key, value := range headers {
+		if strings.EqualFold(key, name) {
+			text, ok := value.(string)
+			if !ok {
+				t.Fatalf("error header %q = %T, want string", key, value)
+			}
+			return text
+		}
+	}
+	t.Fatalf("error header %q missing from %+v", name, headers)
+	return ""
+}
+
+func assertResponsesWebSocketOperationSequence(t *testing.T, first, second string) {
+	t.Helper()
+	firstPrefix, firstSequence, ok := strings.Cut(first, ":")
+	if !ok || firstPrefix == "" || firstSequence != "1" {
+		t.Fatalf("first operation id = %q, want <connection>:1", first)
+	}
+	secondPrefix, secondSequence, ok := strings.Cut(second, ":")
+	if !ok || secondPrefix != firstPrefix || secondSequence != "2" {
+		t.Fatalf("operation ids = %q, %q, want one connection with turns 1 and 2", first, second)
+	}
+}
+
 func startResponsesWebSocketProxyServer(t *testing.T, handler *ProxyHandler) *httptest.Server {
 	t.Helper()
 	handler.responsesWS.Enabled = true
@@ -6065,6 +7024,103 @@ func inputTextFromMessage(t *testing.T, item map[string]interface{}) string {
 		t.Fatalf("expected first message content text, got %v", first["text"])
 	}
 	return text
+}
+
+func TestResponsesWebSocketInvalidTurnStateClearsBeforeFailedFullReplay(t *testing.T) {
+	var calls atomic.Int32
+	var logs bytes.Buffer
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		switch call := calls.Add(1); call {
+		case 1:
+			if got := r.Header.Get("X-Codex-Turn-State"); got != "turn-state-1" {
+				t.Fatalf("delta turn state = %q, want turn-state-1", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"stale turn state","code":"invalid_turn_state"}}`)
+		case 2:
+			if got := r.Header.Get("X-Codex-Turn-State"); got != "" {
+				t.Fatalf("full replay turn state = %q, want empty", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"full replay rejected","code":"invalid_request_error"}}`)
+		default:
+			t.Fatalf("unexpected upstream call %d", call)
+		}
+	})
+	handler.log = logger.NewWithWriter(logger.LevelDebug, &logs)
+
+	request := &responsesWebSocketCreateRequest{
+		Type:               "response.create",
+		Model:              "gpt-5.4",
+		PreviousResponseID: "resp-1",
+		Input:              []json.RawMessage{json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"retry"}]}`)},
+		signatureValue:     "sig-1",
+		upstreamFields: []responsesWebSocketJSONField{
+			{key: "model", value: json.RawMessage(`"gpt-5.4"`)},
+		},
+	}
+	session := &responsesWebSocketSession{
+		turnState:      "turn-state-1",
+		lastResponseID: "resp-1",
+		lastSignature:  "sig-1",
+		historyItems:   []json.RawMessage{json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"original"}]}`)},
+	}
+	plan := responsesWebSocketRequestPlan{
+		signature:          "sig-1",
+		currentInput:       request.Input,
+		fullReplaySegments: [][]json.RawMessage{session.historyItems, request.Input},
+		useTurnStateDelta:  true,
+		compactionChecked:  true,
+	}
+
+	resp, deltaAttempted, deltaFallback, err := session.postCreateRequest(handler, context.Background(), request, plan, &responsesWebSocketRequestMetrics{})
+	if err != nil {
+		t.Fatalf("postCreateRequest() error = %v", err)
+	}
+	if resp == nil {
+		t.Fatal("postCreateRequest() response = nil")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("fallback status = %d, want 400", resp.StatusCode)
+	}
+	if !deltaAttempted || !deltaFallback {
+		t.Fatalf("delta attempted/fallback = %v/%v, want true/true", deltaAttempted, deltaFallback)
+	}
+	if session.turnState != "" {
+		t.Fatalf("turnState = %q after failed full replay, want cleared", session.turnState)
+	}
+
+	nextPlan, err := session.planRequest(handler, request)
+	if err != nil {
+		t.Fatalf("planRequest() error = %v", err)
+	}
+	if nextPlan.useTurnStateDelta {
+		t.Fatal("next retry unexpectedly reused rejected turn state")
+	}
+
+	foundFallbackDiagnostic := false
+	decoder := json.NewDecoder(bytes.NewReader(logs.Bytes()))
+	for {
+		var entry map[string]interface{}
+		if err := decoder.Decode(&entry); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			t.Fatalf("decode websocket fallback log: %v", err)
+		}
+		if entry["msg"] != "responses websocket delta replay failed; retrying full history" {
+			continue
+		}
+		foundFallbackDiagnostic = true
+		if got, ok := entry["had_turn_state"].(bool); !ok || !got {
+			t.Fatalf("fallback had_turn_state = %#v, want true", entry["had_turn_state"])
+		}
+	}
+	if !foundFallbackDiagnostic {
+		t.Fatal("missing websocket invalid-turn-state fallback diagnostic")
+	}
 }
 
 func TestResponsesWebSocketRememberPlannedResponseAppendsInputAndOutput(t *testing.T) {
@@ -7105,5 +8161,143 @@ func TestHandleResponsesWebSocket_DoneMarkerPreventsTrailingTerminalAccounting(t
 	snap := handler.stats.snapshot()
 	if snap.Totals.Requests != 1 || snap.Totals.Errors != 1 || snap.Totals.TotalTokens != 0 {
 		t.Fatalf("[DONE] stats = requests:%d errors:%d total:%d, want 1/1/0", snap.Totals.Requests, snap.Totals.Errors, snap.Totals.TotalTokens)
+	}
+}
+
+func TestResponsesWebSocketRecordTurnStatsUsesExactOperationID(t *testing.T) {
+	assertResponsesWebSocketTurnAccountingForwardsExactOperationID(t)
+
+	h := &ProxyHandler{stats: newStatsCollector()}
+	recordAttempt := func(operationID, targetID string, status int, outcome routeAttemptOutcome, usage statsTokenUsage) *routeOperation {
+		operation := &routeOperation{id: operationID}
+		record := h.RecordUpstreamAttempt(context.Background(), RouteAttemptObservation{
+			OperationID:  operationID,
+			RouteID:      "route-websocket-operation-correlation",
+			TargetID:     targetID,
+			ProviderID:   "shared-provider",
+			ProviderKind: "test",
+			Sequence:     1,
+			AttemptKind:  routeAttemptNormal,
+			operation:    operation,
+		})
+		record.complete(routeAttemptCompletion{
+			StatusCode:           status,
+			Outcome:              outcome,
+			Delivery:             requestDeliveredOrAmbiguous,
+			SemanticProgress:     upstreamProgressTerminalSuccess,
+			DownstreamCommitment: downstreamCommitmentNone,
+			RetryDecision:        routeRetryAccepted,
+			CleanupComplete:      true,
+			ReportedUsage:        &usage,
+			Wasted:               routeAttemptOutcomeIsWasted(outcome),
+		})
+		return operation
+	}
+
+	recordAttempt("operation-stale-websocket", "target-stale", http.StatusOK, routeAttemptOutcomeSucceeded, statsTokenUsage{PromptTokens: 3, CompletionTokens: 1, TotalTokens: 4})
+	current := recordAttempt("operation-current-websocket", "target-current", http.StatusTooManyRequests, routeAttemptOutcomeFailed, statsTokenUsage{PromptTokens: 7, CompletionTokens: 2, TotalTokens: 9})
+
+	session := &responsesWebSocketSession{userAgent: "codex/1"}
+	session.recordTurnStats(h, "public-model", "public-model", "shared-provider", "test", http.StatusTooManyRequests, responsesUsage{InputTokens: 7, OutputTokens: 2, TotalTokens: 9}, true, true, current)
+
+	snap := h.stats.snapshot()
+	if snap.PhysicalUsage.TotalTokens != 13 || snap.WastedUsage.TotalTokens != 9 {
+		t.Fatalf("websocket operation correlation = physical:%+v wasted:%+v, want 13/9", snap.PhysicalUsage, snap.WastedUsage)
+	}
+}
+
+func assertResponsesWebSocketTurnAccountingForwardsExactOperationID(t *testing.T) {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "responses_websocket.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse responses_websocket.go: %v", err)
+	}
+
+	var recordTurnStats *ast.FuncDecl
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Name.Name == "recordTurnStats" {
+			recordTurnStats = fn
+			break
+		}
+	}
+	if recordTurnStats == nil {
+		t.Fatal("responsesWebSocketSession.recordTurnStats declaration not found")
+	}
+
+	operationIDWrites := 0
+	emptyOperationIDInitializations := 0
+	operationIDReads := 0
+	unexpectedOperationIDWrites := 0
+	var operationIDReadPos token.Pos
+	accountingCalls := 0
+	var accountingCallPos token.Pos
+	exactOperationIDForwarded := false
+	ast.Inspect(recordTurnStats.Body, func(node ast.Node) bool {
+		switch node := node.(type) {
+		case *ast.AssignStmt:
+			for i, lhs := range node.Lhs {
+				ident, ok := lhs.(*ast.Ident)
+				if !ok || ident.Name != "operationID" || i >= len(node.Rhs) {
+					continue
+				}
+				operationIDWrites++
+				if literal, ok := node.Rhs[i].(*ast.BasicLit); ok && literal.Kind == token.STRING && literal.Value == `""` {
+					emptyOperationIDInitializations++
+					continue
+				}
+				call, ok := node.Rhs[i].(*ast.CallExpr)
+				if !ok || len(call.Args) != 0 {
+					unexpectedOperationIDWrites++
+					continue
+				}
+				selector, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					unexpectedOperationIDWrites++
+					continue
+				}
+				operation, operationOK := selector.X.(*ast.Ident)
+				if operationOK && operation.Name == "operation" && selector.Sel.Name == "operationID" {
+					operationIDReads++
+					operationIDReadPos = node.Pos()
+					continue
+				}
+				unexpectedOperationIDWrites++
+			}
+		case *ast.CallExpr:
+			selector, ok := node.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			receiver, receiverOK := selector.X.(*ast.Ident)
+			if !receiverOK || receiver.Name != "h" || selector.Sel.Name != "recordResponsesTurn" {
+				return true
+			}
+			accountingCalls++
+			accountingCallPos = node.Pos()
+			if len(node.Args) == 10 {
+				operationID, ok := node.Args[9].(*ast.Ident)
+				exactOperationIDForwarded = ok && operationID.Name == "operationID"
+			}
+		}
+		return true
+	})
+
+	if operationIDWrites != 2 || emptyOperationIDInitializations != 1 || unexpectedOperationIDWrites != 0 {
+		t.Fatalf("recordTurnStats operationID writes = total:%d empty-init:%d unexpected:%d, want 2/1/0", operationIDWrites, emptyOperationIDInitializations, unexpectedOperationIDWrites)
+	}
+	if operationIDReads != 1 {
+		t.Fatalf("recordTurnStats operation.operationID() reads = %d, want exactly 1", operationIDReads)
+	}
+	if accountingCalls != 1 {
+		t.Fatalf("recordTurnStats recordResponsesTurn calls = %d, want exactly 1", accountingCalls)
+	}
+	if !exactOperationIDForwarded {
+		t.Fatal("recordTurnStats must pass the exact operation.operationID() value into recordResponsesTurn")
+	}
+	if operationIDReadPos >= accountingCallPos {
+		t.Fatalf("recordTurnStats reads operation ID at %s after accounting call at %s", fset.Position(operationIDReadPos), fset.Position(accountingCallPos))
 	}
 }

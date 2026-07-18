@@ -4244,6 +4244,47 @@ func TestHandleCompact_FallsBackWhenModelUnsupported(t *testing.T) {
 	}
 }
 
+func TestHandleCompactDoesNotFallbackOutsideAllowedModels(t *testing.T) {
+	responsesRequests := 0
+	modelsRequests := 0
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/responses":
+			responsesRequests++
+			if responsesRequests > 1 {
+				t.Fatalf("unexpected fallback /responses request %d", responsesRequests)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"model selected-model is not supported via Responses API.","code":"unsupported_api_for_model","param":"model","type":"invalid_request_error"}}`))
+		case "/models":
+			modelsRequests++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"other-model","supported_endpoints":["/responses"]}]}`))
+		default:
+			t.Fatalf("unexpected upstream path %q", r.URL.Path)
+		}
+	})
+	handler.allowedModels = map[string]struct{}{"selected-model": {}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"selected-model","input":"Hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	if responsesRequests != 1 {
+		t.Fatalf("responses requests = %d, want 1 unsupported-model attempt", responsesRequests)
+	}
+	if modelsRequests != 1 {
+		t.Fatalf("models requests = %d, want 1 fallback lookup", modelsRequests)
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want original 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestHandleResponses_RewritesSyntheticCompaction(t *testing.T) {
 	summary := "Synthetic compacted summary"
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -8354,6 +8395,147 @@ func TestValidateDynamicProviderModelsLoadsDeferredSingleFilteredProvider(t *tes
 	}
 }
 
+func TestValidateDynamicProviderModelsDetectsAllowedModelCollisionAcrossDynamicProviders(t *testing.T) {
+	var firstHits atomic.Int32
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/models" {
+			t.Fatalf("first provider path = %q, want /models", got)
+		}
+		firstHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"shared","object":"model","owned_by":"first"}]}`))
+	}))
+	defer first.Close()
+
+	var secondHits atomic.Int32
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/models" {
+			t.Fatalf("second provider path = %q, want /models", got)
+		}
+		secondHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"shared","object":"model","owned_by":"second"}]}`))
+	}))
+	defer second.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithAllowedModels("shared"),
+		WithDeferredDynamicProviderModelValidation(true),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:             "first",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        first.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			},
+			{
+				ID:             "second",
+				Type:           "openai-compatible",
+				BaseURL:        second.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			},
+		}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+
+	err = handler.ValidateDynamicProviderModels(context.Background())
+	if err == nil {
+		t.Fatal("ValidateDynamicProviderModels error = nil, want collision")
+	}
+	if !strings.Contains(err.Error(), `model "shared"`) ||
+		!strings.Contains(err.Error(), `provider "first"`) ||
+		!strings.Contains(err.Error(), `provider "second"`) {
+		t.Fatalf("collision error = %v, want model and both provider IDs", err)
+	}
+	if got := firstHits.Load(); got != 1 {
+		t.Fatalf("first provider /models hits = %d, want 1", got)
+	}
+	if got := secondHits.Load(); got != 1 {
+		t.Fatalf("second provider /models hits = %d, want 1", got)
+	}
+	if !handler.DynamicProviderValidationPending() {
+		t.Fatal("failed collision unexpectedly cleared validation pending state")
+	}
+}
+
+func TestValidateDynamicProviderModelsScopesResolvedAllowedModelOwner(t *testing.T) {
+	var firstHits atomic.Int32
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"selected","object":"model","owned_by":"first"},{"id":"first-other","object":"model","owned_by":"first"}]}`))
+	}))
+	defer first.Close()
+
+	var secondHits atomic.Int32
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"second-other","object":"model","owned_by":"second"}]}`))
+	}))
+	defer second.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.New(logger.LevelInfo),
+		WithAllowedModels("selected"),
+		WithDeferredDynamicProviderModelValidation(true),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID:             "first",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        first.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			},
+			{
+				ID:             "second",
+				Type:           "openai-compatible",
+				BaseURL:        second.URL,
+				AuthType:       "none",
+				ModelDiscovery: "openai",
+			},
+		}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler returned error: %v", err)
+	}
+	if err := handler.ValidateDynamicProviderModels(context.Background()); err != nil {
+		t.Fatalf("ValidateDynamicProviderModels returned error: %v", err)
+	}
+	if got := firstHits.Load(); got != 1 {
+		t.Fatalf("first provider /models hits = %d, want 1", got)
+	}
+	if got := secondHits.Load(); got != 1 {
+		t.Fatalf("second provider /models hits = %d, want 1", got)
+	}
+
+	setup := handler.providerSetup()
+	owner, ok := setup.lookupModel("selected")
+	if !ok || owner.providerID != "first" {
+		t.Fatalf("selected owner = %+v, %v; want first", owner, ok)
+	}
+	for _, disallowed := range []string{"first-other", "second-other"} {
+		if _, ok := setup.lookupModel(disallowed); ok {
+			t.Fatalf("disallowed model %q leaked into scoped model map", disallowed)
+		}
+	}
+	if !handler.providerWithinAllowedModelScope(setup.providerByID("first")) {
+		t.Fatal("resolved owner was excluded from runtime scope")
+	}
+	if handler.providerWithinAllowedModelScope(setup.providerByID("second")) {
+		t.Fatal("non-owner dynamic provider remained in runtime scope")
+	}
+}
+
 func TestNewProxyHandler_FailsWhenOpenAICodexModelCollidesWithAzure(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "azure-test-key")
 	codexHome := t.TempDir()
@@ -8648,6 +8830,202 @@ func TestNewProxyHandler_RejectsMultipleCopilotProviders(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "multiple copilot providers configured") {
 		t.Fatalf("expected multiple copilot providers error, got %v", err)
+	}
+}
+
+func TestReserveMergedModelOwner_IsOrderIndependent(t *testing.T) {
+	model := func(providerID, publicID, marker string) providerModel {
+		return providerModel{
+			providerID: providerID,
+			publicID:   publicID,
+			raw:        json.RawMessage(fmt.Sprintf(`{"id":%q,"marker":%q}`, publicID, marker)),
+		}
+	}
+
+	tests := []struct {
+		name            string
+		models          []providerModel
+		wantErr         bool
+		wantCollisionID string
+		wantOwners      []string
+	}{
+		{
+			name: "same provider normalized aliases",
+			models: []providerModel{
+				model("dynamic", "claude-sonnet-4-5", "dashed"),
+				model("dynamic", "claude-sonnet-4.5", "dotted"),
+			},
+			wantErr:         true,
+			wantCollisionID: "claude-sonnet-4.5",
+			wantOwners:      []string{"dynamic"},
+		},
+		{
+			name: "true exact duplicates",
+			models: []providerModel{
+				model("dynamic", "claude-sonnet-4-5", "first"),
+				model("dynamic", "claude-sonnet-4-5", "second"),
+			},
+		},
+		{
+			name: "different provider exact collision",
+			models: []providerModel{
+				model("first", "gpt-5.4", "first"),
+				model("second", "gpt-5.4", "second"),
+			},
+			wantErr:         true,
+			wantCollisionID: "gpt-5.4",
+			wantOwners:      []string{"first", "second"},
+		},
+		{
+			name: "different provider normalized alias collision",
+			models: []providerModel{
+				model("first", "claude-sonnet-4-5", "dashed"),
+				model("second", "claude-sonnet-4.5", "dotted"),
+			},
+			wantErr:         true,
+			wantCollisionID: "claude-sonnet-4.5",
+			wantOwners:      []string{"first", "second"},
+		},
+	}
+
+	for _, tc := range tests {
+		for _, reversed := range []bool{false, true} {
+			orderName := "forward"
+			ordered := append([]providerModel(nil), tc.models...)
+			if reversed {
+				orderName = "reversed"
+				ordered[0], ordered[1] = ordered[1], ordered[0]
+			}
+			t.Run(tc.name+"/"+orderName, func(t *testing.T) {
+				owners := make(map[string]mergedModelReservation)
+				appended := make([]json.RawMessage, 0, len(ordered))
+				var gotErr error
+				for _, candidate := range ordered {
+					appendModel, err := reserveMergedModelOwner(owners, candidate)
+					if err != nil {
+						gotErr = err
+						break
+					}
+					if appendModel {
+						appended = append(appended, candidate.raw)
+					}
+				}
+
+				if tc.wantErr {
+					if gotErr == nil {
+						t.Fatal("reserveMergedModelOwner() error = nil, want collision")
+					}
+					if !strings.Contains(gotErr.Error(), tc.wantCollisionID) {
+						t.Fatalf("collision error = %v, want model %q", gotErr, tc.wantCollisionID)
+					}
+					for _, owner := range tc.wantOwners {
+						if !strings.Contains(gotErr.Error(), owner) {
+							t.Fatalf("collision error = %v, want owner %q", gotErr, owner)
+						}
+					}
+				} else if gotErr != nil {
+					t.Fatalf("reserveMergedModelOwner() error = %v, want exact duplicate to be skipped", gotErr)
+				}
+				if len(appended) != 1 {
+					t.Fatalf("appended entries = %d, want first entry only", len(appended))
+				}
+				if got, want := string(appended[0]), string(ordered[0].raw); got != want {
+					t.Fatalf("appended entry = %s, want first catalog entry %s", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestHandleModels_RejectsSameProviderAliasCollisionsInAnyCatalogOrder(t *testing.T) {
+	orders := [][]string{
+		{"claude-sonnet-4-5", "claude-sonnet-4.5"},
+		{"claude-sonnet-4.5", "claude-sonnet-4-5"},
+	}
+	requests := []struct {
+		name string
+		path string
+	}{
+		{name: "canonical", path: "/v1/models"},
+		{name: "query variant", path: "/v1/models?view=variant"},
+	}
+
+	for _, request := range requests {
+		for orderIndex, order := range orders {
+			orderName := "dashed first"
+			if orderIndex == 1 {
+				orderName = "dotted first"
+			}
+			t.Run(request.name+"/"+orderName, func(t *testing.T) {
+				var queriesMu sync.Mutex
+				queries := make([]string, 0, 2)
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path != providerEndpointModels {
+						t.Fatalf("upstream path = %q, want %q", r.URL.Path, providerEndpointModels)
+					}
+					queriesMu.Lock()
+					queries = append(queries, r.URL.RawQuery)
+					queriesMu.Unlock()
+
+					modelIDs := order
+					if request.path != "/v1/models" && r.URL.RawQuery == "" {
+						modelIDs = []string{"safe-canonical-model"}
+					}
+					data := make([]map[string]any, 0, len(modelIDs))
+					for _, modelID := range modelIDs {
+						data = append(data, map[string]any{
+							"id":                  modelID,
+							"object":              "model",
+							"owned_by":            "dynamic",
+							"supported_endpoints": []string{providerEndpointResponses},
+						})
+					}
+					w.Header().Set("Content-Type", "application/json")
+					if err := json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data}); err != nil {
+						t.Errorf("encode model catalog: %v", err)
+					}
+				}))
+				defer upstream.Close()
+
+				h, err := NewProxyHandler(
+					auth.NewTestAuthenticator("test-token"),
+					logger.NewWithWriter(logger.LevelError, io.Discard),
+					WithDeferredDynamicProviderModelValidation(true),
+					WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+						ID:             "dynamic",
+						Type:           string(providerTypeOpenAICompatible),
+						Default:        true,
+						BaseURL:        upstream.URL,
+						AuthType:       "none",
+						ModelDiscovery: string(providerModelDiscoveryOpenAI),
+					}}}),
+				)
+				if err != nil {
+					t.Fatalf("NewProxyHandler() error = %v", err)
+				}
+				defer h.BeginShutdown()
+
+				w := httptest.NewRecorder()
+				h.HandleModels(w, httptest.NewRequest(http.MethodGet, request.path, nil))
+				resp := w.Result()
+				defer func() { _ = resp.Body.Close() }()
+				if resp.StatusCode != http.StatusBadGateway {
+					body, _ := io.ReadAll(resp.Body)
+					t.Fatalf("HandleModels() status = %d, want %d: %s", resp.StatusCode, http.StatusBadGateway, body)
+				}
+
+				queriesMu.Lock()
+				gotQueries := append([]string(nil), queries...)
+				queriesMu.Unlock()
+				wantQueries := []string{""}
+				if request.path != "/v1/models" {
+					wantQueries = append(wantQueries, "view=variant")
+				}
+				if !reflect.DeepEqual(gotQueries, wantQueries) {
+					t.Fatalf("upstream queries = %v, want %v", gotQueries, wantQueries)
+				}
+			})
+		}
 	}
 }
 
@@ -9056,6 +9434,171 @@ func TestHandleModels_CanonicalCatalogOwnsRoutingAcrossQueryVariants(t *testing.
 	}
 	if got := fallbackChatHits.Load(); got != 0 {
 		t.Fatalf("fallback chat hits = %d, want 0", got)
+	}
+}
+
+func TestHandleModelsFiltersExplicitRoutesByAllowedModels(t *testing.T) {
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithAllowedModels("selected-model"),
+		WithProvidersConfig(ProvidersConfig{
+			SchemaVersion: ProvidersConfigSchemaVersion2,
+			Providers: []ProviderConfig{{
+				ID:             "local",
+				Type:           string(providerTypeOpenAICompatible),
+				Default:        true,
+				BaseURL:        "http://127.0.0.1:9/v1",
+				AuthType:       "none",
+				ModelDiscovery: string(providerModelDiscoveryStatic),
+			}},
+			ModelRoutes: []ModelRouteConfig{
+				{
+					ID: "selected-route", PublicID: "selected-model", Endpoints: []string{providerEndpointResponses},
+					Targets: []ModelRouteTargetConfig{{ID: "selected", Provider: "local", UpstreamModel: "physical-selected"}},
+				},
+				{
+					ID: "other-route", PublicID: "other-model", Endpoints: []string{providerEndpointResponses},
+					Targets: []ModelRouteTargetConfig{{ID: "other", Provider: "local", UpstreamModel: "physical-other"}},
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	defer h.BeginShutdown()
+
+	w := httptest.NewRecorder()
+	h.HandleModels(w, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("models status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	var catalog struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	if len(catalog.Data) != 1 || catalog.Data[0].ID != "selected-model" {
+		t.Fatalf("scoped model catalog = %+v, want only selected-model", catalog.Data)
+	}
+}
+
+func TestHandleModels_QueryVariantRejectsExplicitRouteAliasCollisions(t *testing.T) {
+	const (
+		explicitModel = "claude-sonnet-4.5"
+		explicitAlias = "claude-sonnet-4-5"
+	)
+
+	tests := []struct {
+		name         string
+		variantModel string
+		wantStatus   int
+	}{
+		{name: "exact public id collision", variantModel: explicitModel, wantStatus: http.StatusBadGateway},
+		{name: "normalized alias collision", variantModel: explicitAlias, wantStatus: http.StatusBadGateway},
+		{name: "noncolliding model", variantModel: "variant-model", wantStatus: http.StatusOK},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var modelQueriesMu sync.Mutex
+			modelQueries := make([]string, 0, 2)
+			dynamic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != providerEndpointModels {
+					t.Fatalf("dynamic path = %q, want %q", r.URL.Path, providerEndpointModels)
+				}
+				modelQueriesMu.Lock()
+				modelQueries = append(modelQueries, r.URL.RawQuery)
+				modelQueriesMu.Unlock()
+				model := "safe-canonical-model"
+				if r.URL.RawQuery != "" {
+					model = tc.variantModel
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"object":"list","data":[{"id":%q,"object":"model","owned_by":"dynamic","supported_endpoints":["/responses"]}]}`, model)
+			}))
+			defer dynamic.Close()
+
+			explicit := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != providerEndpointResponses {
+					t.Fatalf("explicit path = %q, want %q", r.URL.Path, providerEndpointResponses)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"resp-explicit","object":"response","status":"completed","model":"physical-explicit","output":[]}`)
+			}))
+			defer explicit.Close()
+
+			h, err := NewProxyHandler(
+				auth.NewTestAuthenticator("test-token"),
+				logger.NewWithWriter(logger.LevelError, io.Discard),
+				WithDeferredDynamicProviderModelValidation(true),
+				WithProvidersConfig(ProvidersConfig{
+					SchemaVersion: ProvidersConfigSchemaVersion2,
+					Providers: []ProviderConfig{
+						{ID: "dynamic", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: dynamic.URL, AuthType: "none", ModelDiscovery: string(providerModelDiscoveryOpenAI)},
+						{ID: "explicit", Type: string(providerTypeOpenAICompatible), BaseURL: explicit.URL, AuthType: "none"},
+					},
+					ModelRoutes: []ModelRouteConfig{{
+						ID: "explicit-route", PublicID: explicitModel, Endpoints: []string{providerEndpointResponses},
+						Targets: []ModelRouteTargetConfig{{ID: "target", Provider: "explicit", UpstreamModel: "physical-explicit"}},
+					}},
+				}),
+			)
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+			defer h.BeginShutdown()
+
+			w := httptest.NewRecorder()
+			h.HandleModels(w, httptest.NewRequest(http.MethodGet, "/v1/models?view=variant", nil))
+			resp := w.Result()
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != tc.wantStatus {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("variant status = %d, want %d: %s", resp.StatusCode, tc.wantStatus, body)
+			}
+			if tc.wantStatus == http.StatusOK {
+				var catalog struct {
+					Data []struct {
+						ID string `json:"id"`
+					} `json:"data"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
+					t.Fatalf("decode variant catalog: %v", err)
+				}
+				ids := make([]string, 0, len(catalog.Data))
+				for _, model := range catalog.Data {
+					ids = append(ids, model.ID)
+				}
+				if len(ids) != 2 || ids[0] != explicitModel || ids[1] != tc.variantModel {
+					t.Fatalf("variant catalog ids = %v, want [%s %s]", ids, explicitModel, tc.variantModel)
+				}
+			}
+
+			for _, requested := range []string{explicitModel, explicitAlias} {
+				route, known := h.resolveModelRouteForRequest(requested, providerEndpointResponses)
+				if !known || route == nil || route.legacy || route.public.routeID != "explicit-route" {
+					t.Fatalf("route for %q = %+v, known=%v; want explicit-route", requested, route, known)
+				}
+			}
+			owner, ok := h.providerSetup().lookupModel("safe-canonical-model")
+			if !ok || owner.providerID != "dynamic" {
+				t.Fatalf("canonical dynamic owner = %+v, ok=%v; want dynamic", owner, ok)
+			}
+			modelQueriesMu.Lock()
+			queries := append([]string(nil), modelQueries...)
+			modelQueriesMu.Unlock()
+			if len(queries) != 2 || queries[0] != "" || queries[1] != "view=variant" {
+				t.Fatalf("models queries = %v, want canonical then variant", queries)
+			}
+		})
 	}
 }
 

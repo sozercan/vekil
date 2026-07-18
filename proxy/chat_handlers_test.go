@@ -1,10 +1,13 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sozercan/vekil/models"
 )
@@ -255,5 +258,101 @@ func TestPrepareAnthropicChatCompletionsRequest_ForcesStreaming(t *testing.T) {
 	}
 	if oaiReq.StreamOptions == nil || !oaiReq.StreamOptions.IncludeUsage {
 		t.Fatalf("stream_options = %+v, want include_usage=true", oaiReq.StreamOptions)
+	}
+}
+
+func TestAggregateStreamToResponseWithProgress(t *testing.T) {
+	tests := []struct {
+		name         string
+		stream       string
+		wantProgress upstreamSemanticProgress
+	}{
+		{
+			name: "role preamble before rate limit remains replay safe",
+			stream: "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+				"event: error\ndata: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}\n\n",
+			wantProgress: upstreamProgressAllowedPreamble,
+		},
+		{
+			name: "text before rate limit is semantic progress",
+			stream: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n" +
+				"event: error\ndata: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}\n\n",
+			wantProgress: upstreamProgressSemanticOutput,
+		},
+		{
+			name: "tool call before reset is tool progress",
+			stream: "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+				"event: error\ndata: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}\n\n",
+			wantProgress: upstreamProgressToolActivity,
+		},
+		{
+			name: "malformed event makes progress unknown",
+			stream: "data: not-json\n\n" +
+				"event: error\ndata: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}\n\n",
+			wantProgress: upstreamProgressUnknown,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, progress, err := aggregateStreamToResponseWithProgress(io.NopCloser(strings.NewReader(tt.stream)))
+			if err == nil {
+				t.Fatal("aggregate error = nil")
+			}
+			if progress != tt.wantProgress {
+				t.Fatalf("progress = %q want %q", progress, tt.wantProgress)
+			}
+		})
+	}
+}
+
+func TestInspectOpenAIChatStreamEventUnknownTopLevelIsNotReplaySafe(t *testing.T) {
+	result := inspectOpenAIChatStreamEvent("", `{"id":"chat","choices":[],"vendor_tool_progress":{"started":true}}`)
+	if result.progress != upstreamProgressUnknown {
+		t.Fatalf("progress = %q, want unknown", result.progress)
+	}
+}
+
+func TestConsumeOpenAIStreamChunksWithProgressEventOnlyIsUnknown(t *testing.T) {
+	_, progress, err := consumeOpenAIStreamChunksWithProgress(strings.NewReader("event: vendor.tool.started\n\n"), nil)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if progress != upstreamProgressUnknown {
+		t.Fatalf("progress = %q, want unknown", progress)
+	}
+}
+
+func TestExplicitRoutePreparedStreamTimeoutFlushesBufferedPreamble(t *testing.T) {
+	body := newBlockingSSEReadCloser("data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n")
+	resp := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body}
+	prepared := newExplicitRoutePreparedStream(resp, explicitRouteStreamOpenAIChat, responsesPrecommitMaxPeekBytes)
+	if _, hasResult, err := prepared.await(context.Background(), context.Background(), 10*time.Millisecond); err != nil || hasResult {
+		t.Fatalf("await result has=%v err=%v, want timeout without decision", hasResult, err)
+	}
+	committed := prepared.commitResponse()
+	readDone := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 256)
+		n, _ := committed.Body.Read(buf)
+		readDone <- string(buf[:n])
+	}()
+	select {
+	case got := <-readDone:
+		if !strings.Contains(got, `"role":"assistant"`) {
+			t.Fatalf("flushed prefix = %q", got)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("committed preamble did not flush after timeout")
+	}
+	_ = committed.Body.Close()
+}
+
+func TestInspectOpenAIChatErrorWithEmbeddedProgressIsNotReplaySafe(t *testing.T) {
+	result := inspectOpenAIChatStreamEvent("error", `{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"late"},"choices":[{"delta":{"content":"partial"}}]}`)
+	if result.failure == nil {
+		t.Fatal("failure = nil")
+	}
+	if upstreamProgressAllowsTargetSwitch(result.progress) {
+		t.Fatalf("progress = %q unexpectedly replay safe", result.progress)
 	}
 }

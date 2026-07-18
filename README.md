@@ -10,7 +10,7 @@
 
 ---
 
-Vekil is a Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs behind one local endpoint. Run it in zero-config mode against GitHub Copilot, or route selected models to providers like Azure OpenAI, OpenAI Codex, and generic OpenAI-compatible or Anthropic-compatible upstreams. The client-facing API surface stays the same while model ownership is configured behind the proxy.
+Vekil is a Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs behind one local endpoint. Run it in zero-config mode against GitHub Copilot, or route selected models to providers like Azure OpenAI, OpenAI Codex, and generic OpenAI-compatible or Anthropic-compatible upstreams. The client-facing API surface stays the same while model ownership is configured behind the proxy. Vekil can also launch Claude Code, Codex CLI, or GitHub Copilot CLI through short-lived, model-scoped proxy sessions.
 
 ## Why Vekil?
 
@@ -23,10 +23,11 @@ Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Az
 - **Anthropic Messages API** — drop-in compatible with Claude clients
 - **Gemini API** — Generate Content, Stream Generate Content, and Count Tokens
 - **OpenAI Chat Completions** and **Responses** APIs, including optional Codex websocket bridging
-- **Multi-provider routing** across GitHub Copilot, Azure OpenAI, OpenAI Codex, and generic compatible providers
+- **Multi-provider routing** across GitHub Copilot, Azure OpenAI, OpenAI Codex, and generic compatible providers; schema-v2 ordered failover is available for supported static Azure/generic targets
 - **Optional tool optimizers** for opt-in shell command rewrites and tool-output reduction across supported API surfaces; see [Tool Optimizers](docs/tool-optimizers.md)
 - **Codex compatibility shims** for compaction and memory summarization
 - **Streaming**, tool use, parallel tool calls, compressed request bodies, and auth/token caching
+- **One-command Claude Code, Codex CLI, and GitHub Copilot CLI launchers** with ephemeral loopback proxies and no persistent client routing changes
 
 ## Quick Start
 
@@ -49,6 +50,35 @@ brew install --cask sozercan/repo/vekil
 
 For explicit provider routing, start the proxy with `--providers-config /path/to/providers.{json,yaml}`.
 
+### Launch a coding agent
+
+The native binary can start a loopback-only proxy, validate one selected model,
+configure the agent for that session, and clean everything up when the agent
+exits:
+
+```bash
+vekil launch claude --model claude-sonnet-4.5
+vekil launch codex --model gpt-5.4-mini
+vekil launch copilot --model gpt-5.4-mini
+```
+
+Use `--providers-config` with the same JSON/YAML routing file accepted by the
+server. Arguments after `--` are forwarded to the agent:
+
+```bash
+vekil launch codex \
+  --providers-config /path/to/providers.yaml \
+  --model my-responses-model -- \
+  exec --ephemeral "Review this workspace"
+```
+
+The launcher keeps upstream credentials in the proxy, gives the child a random
+session token, restricts it to the selected public model, and supervises the
+child process tree. Use `--dry-run` to inspect the plan without starting the
+proxy or agent. See [Agent Launchers](docs/agent-launchers.md) for supported CLI
+versions, endpoint requirements, forwarded arguments, logs, and isolation
+details.
+
 **First-run auth** depends on your providers:
 
 - **Copilot** — `vekil login` uses Vekil-managed GitHub device-code sign-in; first proxy startup starts the same flow when needed. To use your current GitHub CLI account instead, opt in with `vekil login --github-cli` (or `--gh`). `vekil logout` clears cached auth and disables future silent `gh` reuse until you opt in again. `COPILOT_GITHUB_TOKEN` remains the explicit non-interactive override.
@@ -66,11 +96,12 @@ Documentation lives under [`docs/`](docs/README.md); start with these:
 | ------------------------------------------------------------ | ----------------------------------- |
 | [Getting Started](docs/getting-started.md)                   | Install, run, first auth            |
 | [Configuration](docs/configuration.md)                       | Config map and generic flags        |
-| [Provider Routing](docs/provider-routing.md)                 | Provider auth and model ownership   |
+| [Provider Routing](docs/provider-routing.md)                 | Provider auth and route failover    |
 | [Provider API Keys](docs/provider-api-keys.md)               | Where to get provider keys          |
 | [Tool Optimizers](docs/tool-optimizers.md)                   | Shell rewrite/output reduction      |
 | [Responses WebSocket](docs/responses-websocket.md)           | Websocket bridge tuning             |
 | [Client Examples](docs/clients.md)                           | Copy-paste snippets per client      |
+| [Agent Launchers](docs/agent-launchers.md)                   | One-command coding-agent sessions   |
 | [API Reference](docs/api.md)                                 | Endpoint behavior and compatibility |
 | [Architecture](docs/architecture.md)                         | Package layout and design notes     |
 | [Traffic Dashboard](docs/dashboard.md)                       | Live browser dashboard and stats    |

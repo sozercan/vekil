@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
@@ -32,15 +32,18 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
       - name: Shell smoke reliability tests
         run: |
-          bash -n scripts/live-cli-smoke.sh scripts/live-zen-smoke.sh scripts/live-compact-smoke.sh scripts/live-chat-over-responses-smoke.sh scripts/k8s-kind-smoke.sh scripts/tests/live-smoke-reliability-test.sh scripts/tests/live-chat-over-responses-smoke-test.sh
+          bash -n scripts/live-cli-smoke.sh scripts/live-zen-smoke.sh scripts/live-compact-smoke.sh scripts/live-chat-over-responses-smoke.sh scripts/live-provider-routing-smoke.sh scripts/k8s-kind-smoke.sh scripts/tests/live-smoke-reliability-test.sh scripts/tests/live-chat-over-responses-smoke-test.sh scripts/tests/live-provider-routing-smoke-test.sh
           scripts/tests/live-smoke-reliability-test.sh
           scripts/tests/live-chat-over-responses-smoke-test.sh
+
+      - name: Provider routing process smoke
+        run: scripts/tests/live-provider-routing-smoke-test.sh
 
       - name: Test
         run: make test
@@ -48,13 +51,52 @@ jobs:
       - name: Compaction lab
         run: make compaction-lab
 
+  race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Race detector
+        run: go test -race ./... -count=1
+
+  windows-launch:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Test Windows launcher lifecycle
+        run: go test . ./launch -count=1
+
+  darwin-launch:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Test Darwin launcher lifecycle
+        run: go test . ./launch -count=1
+
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
@@ -67,7 +109,7 @@ jobs:
   k8s-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    needs: [lint, build, test]
+    needs: [lint, build, test, race]
     env:
       KIND_VERSION: v0.32.0
       KUBECTL_VERSION: v1.36.1
@@ -95,11 +137,11 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [lint, build, test]
+    needs: [lint, build, test, race]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 

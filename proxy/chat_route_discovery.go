@@ -47,6 +47,9 @@ func newChatRouteDiscoveryCache() chatRouteDiscoveryCache {
 
 func (h *ProxyHandler) resolveChatRoute(ctx context.Context, model string) (resolvedChatRoute, error) {
 	model = strings.TrimSpace(model)
+	if !h.modelAllowedForRequest(model, providerEndpointChatCompletions) {
+		return resolvedChatRoute{}, modelNotAllowedRequestError(model)
+	}
 	provider, owner, known := h.resolveProviderModelForRequest(model, providerEndpointChatCompletions)
 	if model != "" && !known && providerUsesDynamicModels(provider) {
 		if err := h.refreshUnknownChatRouteProvider(ctx, provider); err != nil {

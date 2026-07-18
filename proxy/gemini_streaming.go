@@ -146,14 +146,12 @@ func streamOpenAIToGeminiWithLifecycle(
 	onFinalResponse(aggregator.buildResponse())
 }
 
-// aggregateGeminiStreamToResponse collects a force-streamed Gemini upstream
-// response while applying Gemini-specific validation before aggregation.
-func aggregateGeminiStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, error) {
+func aggregateGeminiStreamToResponseWithProgress(body io.ReadCloser) (*models.OpenAIResponse, upstreamSemanticProgress, error) {
 	defer func() { _ = body.Close() }()
 
 	aggregator := newOpenAIResponseAggregator()
 	var protocolErr error
-	sawDone, err := consumeOpenAIStreamChunks(body, func(chunk models.OpenAIStreamChunk) bool {
+	sawDone, progress, err := consumeOpenAIStreamChunksWithProgress(body, func(chunk models.OpenAIStreamChunk) bool {
 		for _, choice := range chunk.Choices {
 			if err := validateGeminiToolCallIndexes(choice.Delta.ToolCalls); err != nil {
 				protocolErr = err
@@ -164,16 +162,16 @@ func aggregateGeminiStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse
 		return true
 	})
 	if protocolErr != nil {
-		return nil, protocolErr
+		return nil, progress, protocolErr
 	}
 	if err != nil {
-		return nil, err
+		return nil, progress, err
 	}
 	if !sawDone {
-		return nil, fmt.Errorf("stream ended before [DONE]")
+		return nil, progress, fmt.Errorf("stream ended before [DONE]")
 	}
 
-	return aggregator.buildResponse(), nil
+	return aggregator.buildResponse(), progress, nil
 }
 
 type geminiStreamState struct {

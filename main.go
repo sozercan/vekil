@@ -33,6 +33,8 @@ const (
 	cliCommandServe cliCommand = iota
 	cliCommandLogin
 	cliCommandLogout
+	cliCommandLaunch
+	cliCommandConfig
 	cliCommandVersion
 )
 
@@ -44,6 +46,12 @@ func main() {
 		return
 	case cliCommandLogout:
 		runLogout(os.Args[2:])
+		return
+	case cliCommandLaunch:
+		runLaunch(os.Args[2:])
+		return
+	case cliCommandConfig:
+		runConfig(os.Args[2:])
 		return
 	case cliCommandVersion:
 		writeVersion(os.Stdout)
@@ -63,6 +71,10 @@ func commandFromArgs(args []string) cliCommand {
 		return cliCommandLogin
 	case "logout":
 		return cliCommandLogout
+	case "launch":
+		return cliCommandLaunch
+	case "config":
+		return cliCommandConfig
 	case "version", "--version", "-version":
 		return cliCommandVersion
 	default:
@@ -232,6 +244,126 @@ func runLogout(args []string) {
 	_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
 }
 
+var errProvidersConfigRequired = errors.New("--providers-config PATH is required")
+
+type configValidateOptions struct {
+	providersConfigPath string
+}
+
+type configValidateDeps struct {
+	stdout                      io.Writer
+	stderr                      io.Writer
+	validateProvidersConfigFile func(string) error
+}
+
+func runConfig(args []string) {
+	if code := runConfigWithDeps(args, defaultConfigValidateDeps()); code != 0 {
+		os.Exit(code)
+	}
+}
+
+func defaultConfigValidateDeps() configValidateDeps {
+	return configValidateDeps{
+		stdout:                      os.Stdout,
+		stderr:                      os.Stderr,
+		validateProvidersConfigFile: proxy.ValidateProvidersConfigFile,
+	}
+}
+
+func runConfigWithDeps(args []string, deps configValidateDeps) int {
+	deps = normalizeConfigValidateDeps(deps)
+
+	if len(args) == 0 {
+		_, _ = fmt.Fprintln(deps.stderr, "error: config command is required")
+		writeConfigUsage(deps.stderr)
+		return 2
+	}
+
+	switch args[0] {
+	case "-h", "--help", "help":
+		writeConfigUsage(deps.stderr)
+		return 0
+	case "validate":
+		return runConfigValidateWithDeps(args[1:], deps)
+	default:
+		_, _ = fmt.Fprintf(deps.stderr, "error: unknown config command %q\n", args[0])
+		writeConfigUsage(deps.stderr)
+		return 2
+	}
+}
+
+func runConfigValidateWithDeps(args []string, deps configValidateDeps) int {
+	deps = normalizeConfigValidateDeps(deps)
+
+	opts, err := parseConfigValidateOptions(args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			writeConfigValidateUsage(deps.stderr)
+			return 0
+		}
+		_, _ = fmt.Fprintf(deps.stderr, "error: %v\n", err)
+		writeConfigValidateUsage(deps.stderr)
+		return 2
+	}
+
+	if err := deps.validateProvidersConfigFile(opts.providersConfigPath); err != nil {
+		_, _ = fmt.Fprintf(deps.stderr, "error: providers config validation failed: %v\n", err)
+		return 1
+	}
+
+	_, _ = fmt.Fprintf(deps.stdout, "Providers config is valid: %s\n", opts.providersConfigPath)
+	return 0
+}
+
+func normalizeConfigValidateDeps(deps configValidateDeps) configValidateDeps {
+	defaults := defaultConfigValidateDeps()
+	if deps.stdout == nil {
+		deps.stdout = io.Discard
+	}
+	if deps.stderr == nil {
+		deps.stderr = io.Discard
+	}
+	if deps.validateProvidersConfigFile == nil {
+		deps.validateProvidersConfigFile = defaults.validateProvidersConfigFile
+	}
+	return deps
+}
+
+func parseConfigValidateOptions(args []string) (configValidateOptions, error) {
+	var opts configValidateOptions
+	fs := flag.NewFlagSet("config validate", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	providersConfigPath := fs.String("providers-config", "", "Path to JSON or YAML provider configuration")
+	if err := fs.Parse(args); err != nil {
+		return opts, err
+	}
+	if fs.NArg() != 0 {
+		return opts, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	if *providersConfigPath == "" {
+		return opts, errProvidersConfigRequired
+	}
+
+	opts.providersConfigPath = *providersConfigPath
+	return opts, nil
+}
+
+func writeConfigUsage(w io.Writer) {
+	_, _ = fmt.Fprintln(w, "Usage: vekil config validate --providers-config PATH")
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "Commands:")
+	_, _ = fmt.Fprintln(w, "  validate    Validate a provider configuration without starting the server")
+}
+
+func writeConfigValidateUsage(w io.Writer) {
+	_, _ = fmt.Fprintln(w, "Usage: vekil config validate --providers-config PATH")
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "Validate a provider configuration without starting the server or contacting inference upstreams.")
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "Options:")
+	_, _ = fmt.Fprintln(w, "  --providers-config PATH    Path to a JSON or YAML provider configuration (required)")
+}
+
 type serveFlags struct {
 	port                            *string
 	host                            *string
@@ -323,7 +455,41 @@ type startupAuthenticationGate interface {
 	SetStartupAuthenticationPending(bool)
 }
 
-func serveUntilContextDone(ctx context.Context, srv serveLifecycleServer, authenticator serveStartupAuthenticator, usesCopilot bool, log *logger.Logger) error {
+type serveStartupCancellation struct {
+	cause   error
+	stopErr error
+}
+
+func (e *serveStartupCancellation) Error() string {
+	if e.stopErr != nil {
+		return fmt.Sprintf("startup canceled: %v; shutdown error: %v", e.cause, e.stopErr)
+	}
+	return fmt.Sprintf("startup canceled: %v", e.cause)
+}
+
+func (e *serveStartupCancellation) Unwrap() []error {
+	errs := make([]error, 0, 2)
+	if e.cause != nil {
+		errs = append(errs, e.cause)
+	}
+	if e.stopErr != nil {
+		errs = append(errs, e.stopErr)
+	}
+	return errs
+}
+
+func cancelServeStartup(ctx context.Context, srv serveLifecycleServer, log *logger.Logger) error {
+	cause := context.Cause(ctx)
+	if cause == nil {
+		cause = ctx.Err()
+	}
+	return &serveStartupCancellation{
+		cause:   cause,
+		stopErr: stopServeServer(srv, log),
+	}
+}
+
+func startServeServer(ctx context.Context, srv serveLifecycleServer, authenticator serveStartupAuthenticator, usesCopilot bool, log *logger.Logger) error {
 	if gate, ok := srv.(startupAuthenticationGate); ok {
 		gate.SetStartupAuthenticationPending(usesCopilot)
 	}
@@ -331,51 +497,63 @@ func serveUntilContextDone(ctx context.Context, srv serveLifecycleServer, authen
 		return fmt.Errorf("server start error: %w", err)
 	}
 
-	if usesCopilot {
-		authDone := make(chan error, 1)
-		go func() {
-			if log != nil {
-				log.Info("authenticating with GitHub Copilot...")
-			}
-			_, err := authenticator.GetToken(ctx)
-			if err == nil && log != nil {
-				log.Info("authenticated successfully")
-			}
-			authDone <- err
-		}()
+	if !usesCopilot {
+		return nil
+	}
 
-		select {
-		case <-ctx.Done():
-			return stopServeServer(srv, log)
-		case err := <-authDone:
-			if err != nil {
-				if ctx.Err() != nil && errors.Is(err, context.Canceled) {
-					return stopServeServer(srv, log)
+	authDone := make(chan error, 1)
+	go func() {
+		if log != nil {
+			log.Info("authenticating with GitHub Copilot...")
+		}
+		_, err := authenticator.GetToken(ctx)
+		if err == nil && log != nil {
+			log.Info("authenticated successfully")
+		}
+		authDone <- err
+	}()
+
+	select {
+	case <-ctx.Done():
+		return cancelServeStartup(ctx, srv, log)
+	case err := <-authDone:
+		if err != nil {
+			if ctx.Err() != nil {
+				return cancelServeStartup(ctx, srv, log)
+			}
+			authErr := fmt.Errorf("authentication failed: %w", err)
+			if stopErr := stopServeServer(srv, log); stopErr != nil {
+				return errors.Join(authErr, stopErr)
+			}
+			return authErr
+		}
+		if gate, ok := srv.(startupAuthenticationGate); ok {
+			gate.SetStartupAuthenticationPending(false)
+		}
+		if validator, ok := srv.(dynamicProviderModelValidator); ok {
+			if err := validator.ValidateDynamicProviderModels(ctx); err != nil {
+				if ctx.Err() != nil {
+					return cancelServeStartup(ctx, srv, log)
 				}
-				authErr := fmt.Errorf("authentication failed: %w", err)
+				validationErr := fmt.Errorf("provider model validation failed: %w", err)
 				if stopErr := stopServeServer(srv, log); stopErr != nil {
-					return errors.Join(authErr, stopErr)
+					return errors.Join(validationErr, stopErr)
 				}
-				return authErr
-			}
-			if gate, ok := srv.(startupAuthenticationGate); ok {
-				gate.SetStartupAuthenticationPending(false)
-			}
-			if validator, ok := srv.(dynamicProviderModelValidator); ok {
-				if err := validator.ValidateDynamicProviderModels(ctx); err != nil {
-					if ctx.Err() != nil {
-						return stopServeServer(srv, log)
-					}
-					validationErr := fmt.Errorf("provider model validation failed: %w", err)
-					if stopErr := stopServeServer(srv, log); stopErr != nil {
-						return errors.Join(validationErr, stopErr)
-					}
-					return validationErr
-				}
+				return validationErr
 			}
 		}
 	}
+	return nil
+}
 
+func serveUntilContextDone(ctx context.Context, srv serveLifecycleServer, authenticator serveStartupAuthenticator, usesCopilot bool, log *logger.Logger) error {
+	if err := startServeServer(ctx, srv, authenticator, usesCopilot, log); err != nil {
+		var canceled *serveStartupCancellation
+		if errors.As(err, &canceled) {
+			return canceled.stopErr
+		}
+		return err
+	}
 	<-ctx.Done()
 	return stopServeServer(srv, log)
 }

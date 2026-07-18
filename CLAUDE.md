@@ -38,12 +38,13 @@ Documentation update rules:
 
 | Area | Purpose |
 |------|---------|
-| `main.go`, `server/`, `auth/`, `logger/`, `models/`, `cmd/menubar/` | CLI/server lifecycle, GitHub auth, structured logging, data-only API structs, tray app |
+| `main.go`, `launch_command.go`, `server/`, `auth/`, `logger/`, `models/`, `cmd/menubar/` | CLI/server lifecycle, GitHub auth, structured logging, data-only API structs, tray app |
+| `launch/` | Ephemeral proxy supervision, agent adapters, child environment sanitization, and session summaries |
 | `proxy/chat_handlers.go`, `proxy/translator.go`, `proxy/streaming.go`, `proxy/openai_stream_reader.go` | Anthropic/OpenAI chat translation, native-Chat forced-stream aggregation, SSE translation and passthrough |
 | `proxy/chat_execution.go`, `proxy/chat_route*.go`, `proxy/chat_over_responses_*.go`, `proxy/responses_chat_*.go`, `proxy/chat_stream_events.go` | Deep Chat execution seam, native-Chat/Responses selection, strict Chat-to-Responses conversion, typed canonical stream events, and bounded tool replay |
 | `proxy/gemini*.go` | Gemini-native handlers plus Gemini↔OpenAI request/response and streaming translation |
-| `proxy/providers.go`, `proxy/provider_endpoint_policy.go`, `proxy/upstream_http.go`, `proxy/openai_codex_auth.go`, `proxy/azure_identity_auth.go` | Provider config, model ownership, endpoint allowlists, model rewrite, provider auth, upstream request construction |
-| `proxy/responses_handler.go`, `proxy/responses_websocket.go`, `proxy/responses_failure_translate.go`, `proxy/compaction.go` | OpenAI Responses passthrough, compact/memory shims, proxy-owned websocket bridge, compaction/replay behavior, Responses failure translation |
+| `proxy/providers.go`, `proxy/model_routes.go`, `proxy/model_routes_config.go`, `proxy/route_executor.go`, `proxy/provider_endpoint_policy.go`, `proxy/upstream_http.go`, `proxy/openai_codex_auth.go`, `proxy/azure_identity_auth.go` | Provider config, logical route ownership, ordered target execution, endpoint allowlists, model rewrite, provider auth, upstream request construction |
+| `proxy/responses_handler.go`, `proxy/responses_websocket.go`, `proxy/responses_failure_translate.go`, `proxy/response_model_normalization.go`, `proxy/route_state_binding.go`, `proxy/state_binding.go`, `proxy/compaction.go` | OpenAI Responses passthrough, compact/memory shims, proxy-owned websocket bridge, exact target state binding, compaction/replay behavior, Responses failure translation |
 | `proxy/tool_optimizer*.go`, `proxy/optimizer_*.go`, `proxy/tool_output_context.go`, `proxy/tool_shapes.go`, `proxy/filter_hint.go` | Optional fail-open tool command/output optimizers and tool-shape/context helpers |
 | `proxy/retry.go`, `proxy/upstream_error_detail.go`, shared helpers in `proxy/handler.go` | Retry/backoff, upstream error summaries, request body limits, headers, health/ready/models handlers, caches |
 

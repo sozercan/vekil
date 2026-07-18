@@ -163,17 +163,6 @@ func parsePositiveDecimalClamped(value string, max int64) (int64, bool) {
 	return parsed, true
 }
 
-func retryAfterDurationFromMilliseconds(milliseconds int64) time.Duration {
-	if milliseconds <= 0 {
-		return 0
-	}
-	maxMilliseconds := int64(maxRetryAfter / time.Millisecond)
-	if milliseconds >= maxMilliseconds {
-		return maxRetryAfter
-	}
-	return time.Duration(milliseconds) * time.Millisecond
-}
-
 func durationSecondsCeil(delay time.Duration) int64 {
 	if delay <= 0 {
 		return 0

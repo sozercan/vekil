@@ -259,7 +259,7 @@ func TestMetricsCollector_UnroutedModelsDoNotConsumeBudget(t *testing.T) {
 
 	valid := &RequestSummary{}
 	valid.setRoute("openai_chat", "valid-after-invalid", false)
-	valid.setProvider("copilot", "copilot")
+	valid.setProviderModel("copilot", "copilot", true, "valid-after-invalid")
 	m.Record(valid, http.StatusOK, time.Millisecond)
 	if _, ok := m.modelLabels["valid-after-invalid"]; !ok {
 		t.Fatal("routed model was not admitted after invalid-model traffic")
@@ -349,7 +349,7 @@ func TestMetricsCollector_ModelCardinalityBoundedAcrossFamilies(t *testing.T) {
 	for i := 0; i < statsMaxKeys+5; i++ {
 		summary := &RequestSummary{}
 		summary.setRoute("openai_chat", fmt.Sprintf("model-%03d", i), false)
-		summary.setProvider("copilot", "copilot")
+		summary.setProviderModel("copilot", "copilot", true, fmt.Sprintf("model-%03d", i))
 		m.Record(summary, http.StatusOK, time.Millisecond)
 	}
 
@@ -443,7 +443,7 @@ func TestMetricsCollector_DurationBucketsCoverLongInference(t *testing.T) {
 	m := NewMetricsCollector()
 	summary := &RequestSummary{}
 	summary.setRoute("openai_chat", "gpt-5.4", false)
-	summary.setProvider("azure", "azure")
+	summary.setProviderModel("azure", "azure", true, "gpt-5.4")
 	m.Record(summary, http.StatusOK, 2*time.Minute)
 
 	metrics, err := m.registry.Gather()
@@ -629,7 +629,7 @@ func TestLogRetryAttemptRecordsResolvedMetricLabels(t *testing.T) {
 	h := &ProxyHandler{metrics: m}
 	ctx, summary := WithRequestSummary(context.Background())
 	summary.setRoute("openai_chat", "gpt-5.4", false)
-	summary.setProvider("azure-prod", "azure-openai")
+	summary.setProviderModel("azure-prod", "azure-openai", true, "gpt-5.4")
 	ctx = markRetryStatsTracked(ctx)
 
 	h.logRetryAttempt(ctx, 0, http.StatusServiceUnavailable, "", time.Second, nil)

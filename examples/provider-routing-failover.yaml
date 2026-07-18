@@ -1,0 +1,49 @@
+# Schema-v2 ordered failover for two semantically equivalent Responses targets.
+# Set both environment variables before validating or starting Vekil:
+#   export AZURE_PRIMARY_API_KEY=...
+#   export AZURE_SECONDARY_API_KEY=...
+# Validate without serving:
+#   vekil config validate --providers-config examples/provider-routing-failover.yaml
+
+schema_version: 2
+
+providers:
+  - id: azure-primary
+    type: azure-openai
+    default: true
+    base_url: https://primary-resource.cognitiveservices.azure.com/openai/v1
+    api_key_env: AZURE_PRIMARY_API_KEY
+
+  - id: azure-secondary
+    type: azure-openai
+    base_url: https://secondary-resource.cognitiveservices.azure.com/openai/v1
+    api_key_env: AZURE_SECONDARY_API_KEY
+
+model_routes:
+  - id: gpt-5-4-pro-route
+    public_id: gpt-5.4-pro
+    name: GPT-5.4 Pro
+    endpoints:
+      - /responses
+    reasoning_effort:
+      - low
+      - medium
+      - high
+    parallel_tool_calls: true
+    vision: false
+    context_window: 200000
+    model_picker_enabled: true
+    model_picker_category: versatile
+
+    targets:
+      - id: primary
+        provider: azure-primary
+        upstream_model: gpt-5.4-pro
+      - id: secondary
+        provider: azure-secondary
+        upstream_model: gpt-5.4-pro
+
+    routing:
+      mode: priority_failover
+      max_target_attempts: 2
+      max_upstream_sends: 2
