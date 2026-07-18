@@ -1939,6 +1939,16 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 		owner := owners[0]
 		publicID := strings.TrimSpace(owner.publicID)
 		known := inherited.known && inherited.model == publicID
+		if explicitRoute, ok := h.providerSetup().lookupRoute(publicID); ok && explicitRoute != nil && !explicitRoute.legacy {
+			for _, target := range explicitRoute.targets {
+				if target.provider != nil && target.provider.id == provider.id {
+					// Explicit route public IDs are validated, globally owned labels.
+					// They do not appear in the legacy provider model catalog.
+					known = true
+					break
+				}
+			}
+		}
 		if catalogOwner, ok := h.providerSetup().lookupModel(publicID); ok &&
 			catalogOwner.providerID == provider.id && !catalogOwner.disabled {
 			publicID = catalogOwner.publicID

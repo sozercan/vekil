@@ -792,3 +792,63 @@ func matchLabels(metricLabels []*io_prometheus_client.LabelPair, want map[string
 
 // Ensure prometheus package is used in test (compilation check).
 var _ prometheus.Registerer = (*prometheus.Registry)(nil)
+
+func TestDoWithRetryKeepsExplicitRouteModelLabel(t *testing.T) {
+	m := NewMetricsCollector()
+	provider := explicitRouteTestProvider("route-provider", "http://upstream.test", "key")
+	h, route := explicitRouteTestHandler(t, nil, routeModePrimaryOnly, 1, 1, provider)
+	h.metrics = m
+	h.maxRetries = 2
+	h.retryBaseDelay = time.Nanosecond
+
+	attempt := 0
+	h.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		attempt++
+		status := http.StatusServiceUnavailable
+		if attempt > 1 {
+			status = http.StatusOK
+		}
+		return &http.Response{
+			StatusCode: status,
+			Header:     make(http.Header),
+			Body:       http.NoBody,
+			Request:    req,
+		}, nil
+	})}
+
+	ctx, summary := WithRequestSummary(markRetryStatsTracked(context.Background()))
+	h.observeRequestSummary(ctx, "responses", route.public.id, false, providerEndpointResponses)
+	if got := readSummaryForStats(summary); !got.modelKnown || got.metricModel != route.public.id {
+		t.Fatalf("explicit route summary = known:%t model:%q, want true/%q", got.modelKnown, got.metricModel, route.public.id)
+	}
+
+	target, ok := route.primaryTarget()
+	if !ok {
+		t.Fatal("explicit route has no primary target")
+	}
+	owner := providerModelFromRouteTarget(route, target)
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		return h.newProviderJSONRequest(ctx, provider, http.MethodPost, providerEndpointResponses, []byte(`{"model":"deployment-a"}`), nil, "", owner)
+	})
+	if err != nil {
+		t.Fatalf("doWithRetry() error = %v", err)
+	}
+	_ = resp.Body.Close()
+
+	families, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	labels := map[string]string{
+		"provider":     provider.id,
+		"public_model": route.public.id,
+		"reason":       "5xx",
+	}
+	if got := getCounterValue(families, "vekil_retries_total", labels); got != 1 {
+		t.Fatalf("explicit route retry metric = %v, want 1", got)
+	}
+	labels["public_model"] = metricsUnroutedModel
+	if got := getCounterValue(families, "vekil_retries_total", labels); got != 0 {
+		t.Fatalf("unrouted explicit route retry metric = %v, want 0", got)
+	}
+}
