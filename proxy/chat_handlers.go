@@ -1020,8 +1020,38 @@ func parseOpenAIChatCompletionsMode(body []byte) chatCompletionsMode {
 }
 
 func prepareOpenAIChatCompletionsRequest(body []byte) ([]byte, chatCompletionsMode) {
+	return prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body, chatParallelToolCallsDefault)
+}
+
+type chatParallelToolCallsPreparation uint8
+
+const (
+	chatParallelToolCallsDefault chatParallelToolCallsPreparation = iota
+	chatParallelToolCallsForceFalse
+	chatParallelToolCallsOmit
+)
+
+func preparePolicyOpenAIChatCompletionsRequest(body []byte, contract publicModelContract, terminalParallelToolCalls *bool) ([]byte, chatCompletionsMode) {
+	preparation := chatParallelToolCallsDefault
+	if contract.policy.parallelToolCalls == nil || !*contract.policy.parallelToolCalls {
+		preparation = chatParallelToolCallsOmit
+		if terminalParallelToolCalls != nil && *terminalParallelToolCalls {
+			preparation = chatParallelToolCallsForceFalse
+		}
+	}
+	return prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body, preparation)
+}
+
+func prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body []byte, preparation chatParallelToolCallsPreparation) ([]byte, chatCompletionsMode) {
 	mode := parseOpenAIChatCompletionsMode(body)
-	body = injectParallelToolCalls(body)
+	switch preparation {
+	case chatParallelToolCallsForceFalse:
+		body = enforceParallelToolCallsFalse(body)
+	case chatParallelToolCallsOmit:
+		body = omitParallelToolCalls(body)
+	default:
+		body = injectParallelToolCalls(body)
+	}
 	if mode.forceUpstreamStream {
 		body = injectForceStream(body)
 		mode.injectedStreamUsage = true
@@ -2023,6 +2053,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
 		return
 	}
+	terminalParallelToolCalls := cloneBoolPtr(policyPlan.terminalParallelToolCalls)
 	if policyPlan.valid() {
 		if admittedOperation != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, "policy model was also admitted as a direct route", "server_error")
@@ -2041,7 +2072,12 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 
 	scope := chatToolExecutionScopeFromHeaders(r.Header)
-	bodyBytes, mode := prepareOpenAIChatCompletionsRequest(bodyBytes)
+	var mode chatCompletionsMode
+	if policyPlan.valid() {
+		bodyBytes, mode = preparePolicyOpenAIChatCompletionsRequest(bodyBytes, policyPlan.contract, terminalParallelToolCalls)
+	} else {
+		bodyBytes, mode = prepareOpenAIChatCompletionsRequest(bodyBytes)
+	}
 	h.observeRequestSummary(r.Context(), "openai_chat", publicModel, mode.clientRequestedStream, providerEndpointChatCompletions)
 	bodyBytes = h.rewriteOpenAIChatRequestBodyWithToolOptimizers(r.Context(), bodyBytes, h.toolContexts, scope)
 
@@ -2371,6 +2407,48 @@ func injectParallelToolCalls(body []byte) []byte {
 		return body
 	}
 	m["parallel_tool_calls"] = json.RawMessage("true")
+	result, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return result
+}
+
+// enforceParallelToolCallsFalse preserves an explicit false value and adds it
+// when tools are present so a capable terminal cannot fall back to parallel
+// execution under a false public policy contract.
+func enforceParallelToolCallsFalse(body []byte) []byte {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	raw, hasPTC := m["parallel_tool_calls"]
+	tools, hasTools := m["tools"]
+	if !hasPTC && (!hasTools || !hasNonEmptyTools(tools)) {
+		return body
+	}
+	if hasPTC && bytes.Equal(bytes.TrimSpace(raw), []byte("false")) {
+		return body
+	}
+	m["parallel_tool_calls"] = json.RawMessage("false")
+	result, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return result
+}
+
+// omitParallelToolCalls removes the field for terminals that do not support
+// it, including when a policy client explicitly supplied false.
+func omitParallelToolCalls(body []byte) []byte {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	if _, ok := m["parallel_tool_calls"]; !ok {
+		return body
+	}
+	delete(m, "parallel_tool_calls")
 	result, err := json.Marshal(m)
 	if err != nil {
 		return body

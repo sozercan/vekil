@@ -27,9 +27,10 @@ type chatOperationPlan struct {
 	publicID string
 	routeID  string
 
-	candidates  []targetBinding
-	routePolicy routePolicy
-	contract    publicModelContract
+	candidates                []targetBinding
+	routePolicy               routePolicy
+	contract                  publicModelContract
+	terminalParallelToolCalls *bool
 
 	policyID             string
 	selectedTier         policyTier
@@ -77,23 +78,32 @@ func newChatOperationPlan(options chatOperationPlanOptions) chatOperationPlan {
 	}
 	contract.routeID = routeID
 
+	var terminalParallelToolCalls *bool
+	if options.Route != nil {
+		terminalParallelToolCalls = cloneBoolPtr(options.Route.public.policy.parallelToolCalls)
+	}
+
 	plan := chatOperationPlan{
-		operationID:          strings.TrimSpace(options.OperationID),
-		entryID:              entryID,
-		publicID:             publicID,
-		routeID:              routeID,
-		contract:             contract,
-		policyID:             strings.TrimSpace(options.PolicyID),
-		selectedTier:         options.SelectedTier,
-		effectiveMode:        options.EffectiveMode,
-		configGeneration:     strings.TrimSpace(options.ConfigGeneration),
-		profileGeneration:    strings.TrimSpace(options.ProfileGeneration),
-		classifierGeneration: strings.TrimSpace(options.ClassifierGeneration),
-		binaryGeneration:     strings.TrimSpace(options.BinaryGeneration),
-		decision:             options.Decision,
+		operationID:               strings.TrimSpace(options.OperationID),
+		terminalParallelToolCalls: terminalParallelToolCalls,
+		entryID:                   entryID,
+		publicID:                  publicID,
+		routeID:                   routeID,
+		contract:                  contract,
+		policyID:                  strings.TrimSpace(options.PolicyID),
+		selectedTier:              options.SelectedTier,
+		effectiveMode:             options.EffectiveMode,
+		configGeneration:          strings.TrimSpace(options.ConfigGeneration),
+		profileGeneration:         strings.TrimSpace(options.ProfileGeneration),
+		classifierGeneration:      strings.TrimSpace(options.ClassifierGeneration),
+		binaryGeneration:          strings.TrimSpace(options.BinaryGeneration),
+		decision:                  options.Decision,
 	}
 	if options.Route != nil {
 		plan.candidates = cloneTargetBindings(options.Route.targets)
+		for index := range plan.candidates {
+			plan.candidates[index].wirePolicy.parallelToolCalls = cloneBoolPtr(terminalParallelToolCalls)
+		}
 		plan.routePolicy = options.Route.policy
 		plan.operationRoute = clonePolicyOperationRoute(options.Route, contract, plan.candidates)
 	}

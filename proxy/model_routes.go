@@ -536,11 +536,15 @@ func providerModelFromRouteTarget(route *modelRoute, target targetBinding) provi
 		}
 		return owner
 	}
+	parallelToolCalls := route.public.policy.parallelToolCalls
+	if target.wirePolicy.parallelToolCalls != nil {
+		parallelToolCalls = target.wirePolicy.parallelToolCalls
+	}
 	owner := providerModel{
 		publicID:               route.public.id,
 		upstreamModel:          target.upstreamModel,
 		supportedEndpoints:     append([]string(nil), route.public.endpoints...),
-		parallelToolCalls:      cloneBoolPtr(route.public.policy.parallelToolCalls),
+		parallelToolCalls:      cloneBoolPtr(parallelToolCalls),
 		dropSamplingParams:     route.public.policy.dropSamplingParams,
 		useMaxCompletionTokens: target.wirePolicy.useMaxCompletionTokens,
 		raw:                    append(json.RawMessage(nil), route.public.raw...),

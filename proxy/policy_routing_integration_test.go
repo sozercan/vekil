@@ -21,6 +21,7 @@ type policyIntegrationUpstream struct {
 
 	mu       sync.Mutex
 	models   []string
+	parallel []json.RawMessage
 	requests int
 
 	classifierSignals        policyClassifierSignals
@@ -37,8 +38,9 @@ func newPolicyIntegrationUpstream(t *testing.T, signals policyClassifierSignals)
 	u.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() { _ = r.Body.Close() }()
 		var request struct {
-			Model  string `json:"model"`
-			Stream bool   `json:"stream"`
+			Model             string          `json:"model"`
+			Stream            bool            `json:"stream"`
+			ParallelToolCalls json.RawMessage `json:"parallel_tool_calls"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -47,6 +49,7 @@ func newPolicyIntegrationUpstream(t *testing.T, signals policyClassifierSignals)
 		u.mu.Lock()
 		u.requests++
 		u.models = append(u.models, request.Model)
+		u.parallel = append(u.parallel, append(json.RawMessage(nil), request.ParallelToolCalls...))
 		u.mu.Unlock()
 		if request.Model == "classifier-model" {
 			if status := int(u.classifierFailureStatus.Load()); status != 0 {
@@ -133,6 +136,16 @@ func (u *policyIntegrationUpstream) snapshot() (int, []string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.requests, append([]string(nil), u.models...)
+}
+
+func (u *policyIntegrationUpstream) parallelToolCallsSnapshot() []json.RawMessage {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	parallel := make([]json.RawMessage, len(u.parallel))
+	for index := range u.parallel {
+		parallel[index] = append(json.RawMessage(nil), u.parallel[index]...)
+	}
+	return parallel
 }
 
 func policyIntegrationConfig(lightURL, powerfulURL, profileMode string) ProvidersConfig {
@@ -305,7 +318,7 @@ func TestPolicyRoutingEnforceCancellationAuthorizesNoTerminalSend(t *testing.T) 
 func TestChatOperationPlanDefensivelyCopiesCandidates(t *testing.T) {
 	parallel := true
 	route := &modelRoute{
-		public: publicModelContract{id: "internal", routeID: "route-a", endpoints: []string{providerEndpointChatCompletions}},
+		public: publicModelContract{id: "internal", routeID: "route-a", endpoints: []string{providerEndpointChatCompletions}, policy: providerRequestPolicy{parallelToolCalls: &parallel}},
 		targets: []targetBinding{{
 			id: "target-a", upstreamModel: "model-a",
 			wirePolicy:  providerRequestPolicy{parallelToolCalls: &parallel},
@@ -316,11 +329,13 @@ func TestChatOperationPlanDefensivelyCopiesCandidates(t *testing.T) {
 	contract := publicModelContract{id: "policy", endpoints: []string{providerEndpointChatCompletions}}
 	plan := newChatOperationPlan(chatOperationPlanOptions{OperationID: "operation", PublicID: "policy", RouteID: "route-a", Route: route, Contract: contract, SelectedTier: policyTierLightweight, EffectiveMode: policyModeOff})
 	route.targets[0].id = "mutated"
+	*route.public.policy.parallelToolCalls = false
 	*route.targets[0].wirePolicy.parallelToolCalls = false
 	route.targets[0].legacyOwner.supportedEndpoints[0] = "/responses"
 	contract.endpoints[0] = "/responses"
 	operation := newRouteOperationFromChatPlan(plan, t.Context())
 	if operation == nil || operation.route.targets[0].id != "target-a" || operation.route.public.endpoints[0] != providerEndpointChatCompletions ||
+		plan.terminalParallelToolCalls == nil || !*plan.terminalParallelToolCalls ||
 		operation.route.targets[0].wirePolicy.parallelToolCalls == nil || !*operation.route.targets[0].wirePolicy.parallelToolCalls ||
 		operation.route.targets[0].legacyOwner.supportedEndpoints[0] != providerEndpointChatCompletions {
 		t.Fatalf("sealed operation mutated: %+v", operation)
@@ -831,6 +846,57 @@ func TestPolicyRoutingValidatesSharedPublicContractBeforeClassifierSend(t *testi
 			}
 			if sends, _ := powerful.snapshot(); sends != 0 {
 				t.Fatalf("powerful sends=%d, want zero", sends)
+			}
+		})
+	}
+}
+
+func TestPolicyRoutingNativeChatHonorsFalseParallelToolCallsContract(t *testing.T) {
+	tests := []struct {
+		name                     string
+		requestField             string
+		selectedTerminalSupports bool
+		wantParallelToolCalls    string
+	}{
+		{name: "omitted/capable terminal", selectedTerminalSupports: true, wantParallelToolCalls: "false"},
+		{name: "explicit false/capable terminal", requestField: `,"parallel_tool_calls":false`, selectedTerminalSupports: true, wantParallelToolCalls: "false"},
+		{name: "omitted/unsupported terminal", selectedTerminalSupports: false},
+		{name: "explicit false/unsupported terminal", requestField: `,"parallel_tool_calls":false`, selectedTerminalSupports: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)
+			cfg.ModelRoutes[0].ParallelToolCalls = boolPointer(tc.selectedTerminalSupports)
+			cfg.ModelRoutes[1].ParallelToolCalls = boolPointer(!tc.selectedTerminalSupports)
+
+			h, err := NewProxyHandler(nil, nil, WithProvidersConfig(cfg), WithPolicyRoutingMode(PolicyRoutingModeOff))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+
+			body := `{"model":"coding-economy","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]` + tc.requestField + `}`
+			recorder := httptest.NewRecorder()
+			h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+
+			requests, models := light.snapshot()
+			if requests != 1 || strings.Join(models, ",") != "light-model" {
+				t.Fatalf("selected terminal requests=%d models=%v, want one light-model request", requests, models)
+			}
+			parallel := light.parallelToolCallsSnapshot()
+			if len(parallel) != 1 {
+				t.Fatalf("parallel_tool_calls snapshots=%d, want one", len(parallel))
+			}
+			if got := string(parallel[0]); got != tc.wantParallelToolCalls {
+				t.Fatalf("parallel_tool_calls=%q, want %q", got, tc.wantParallelToolCalls)
 			}
 		})
 	}
