@@ -760,6 +760,18 @@ func TestCommandFromArgs(t *testing.T) {
 	}
 }
 
+func TestConfigValidateUsageDescribesNarrowLivePreflight(t *testing.T) {
+	var usage bytes.Buffer
+	writeConfigValidateUsage(&usage)
+	got := usage.String()
+	if !strings.Contains(got, "Run fixed policy-classifier protocol preflights") {
+		t.Fatalf("config validate usage missing narrow live preflight: %q", got)
+	}
+	if strings.Contains(got, "Probe configured providers") {
+		t.Fatalf("config validate usage overstates live validation scope: %q", got)
+	}
+}
+
 func TestRunConfigValidateSuccess(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer

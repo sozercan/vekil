@@ -355,7 +355,7 @@ func writeConfigValidateUsage(w io.Writer) {
 	_, _ = fmt.Fprintln(w)
 	_, _ = fmt.Fprintln(w, "Options:")
 	_, _ = fmt.Fprintln(w, "  --providers-config PATH    Path to a JSON or YAML provider configuration (required)")
-	_, _ = fmt.Fprintln(w, "  --live                     Probe configured providers and policy-routing dependencies")
+	_, _ = fmt.Fprintln(w, "  --live                     Run fixed policy-classifier protocol preflights")
 }
 
 type serveFlags struct {
