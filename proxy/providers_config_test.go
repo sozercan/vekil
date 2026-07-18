@@ -970,6 +970,25 @@ func TestBuildConfiguredProviderSetupRejectsStaticModelCollision(t *testing.T) {
 	}
 }
 
+func TestFilterProviderModelsNoFiltersReturnsOriginalSlice(t *testing.T) {
+	models := []providerModel{
+		{publicID: "model-a"},
+		{publicID: "model-b"},
+	}
+	provider := &providerRuntime{
+		includeModels: map[string]struct{}{},
+		excludeModels: map[string]struct{}{},
+	}
+
+	got := filterProviderModels(provider, models)
+	if len(got) != len(models) {
+		t.Fatalf("filtered models len = %d, want %d", len(got), len(models))
+	}
+	if &got[0] != &models[0] {
+		t.Fatal("filterProviderModels allocated a new slice without configured filters")
+	}
+}
+
 func TestReplaceProviderModelsFiltersBeforeCollisionCheck(t *testing.T) {
 	ps := &providerSetup{
 		providers: map[string]*providerRuntime{

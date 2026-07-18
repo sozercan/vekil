@@ -1284,6 +1284,9 @@ func filterProviderModels(provider *providerRuntime, models []providerModel) []p
 	if provider == nil || len(models) == 0 {
 		return models
 	}
+	if len(provider.includeModels) == 0 && len(provider.excludeModels) == 0 {
+		return models
+	}
 	filtered := make([]providerModel, 0, len(models))
 	for _, model := range models {
 		if !provider.allowsModel(model.publicID) {
