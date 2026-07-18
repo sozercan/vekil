@@ -33,6 +33,7 @@ type launchAgentOptions struct {
 	proxyLogPath             string
 	startupTimeout           time.Duration
 	streamingUpstreamTimeout time.Duration
+	policyRoutingMode        proxy.PolicyRoutingMode
 	dryRun                   bool
 	noSummary                bool
 	forwardedArgs            []string
@@ -130,6 +131,7 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	proxyLog := fs.String("proxy-log", "", fmt.Sprintf("Proxy JSON log path (default: ~/.config/vekil/logs/launch-%s-*.jsonl)", target.name))
 	startupTimeout := fs.Duration("startup-timeout", getEnvDuration("LAUNCH_STARTUP_TIMEOUT", 2*time.Minute), "Maximum time to authenticate and become ready")
 	streamingTimeout := fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
+	policyRoutingMode := fs.String("policy-routing", getEnv("POLICY_ROUTING_MODE", "off"), "Policy routing mode: off, observe, or enforce")
 	dryRun := fs.Bool("dry-run", false, "Print the child-process plan without starting a proxy; dynamic model metadata remains unresolved")
 	noSummary := fs.Bool("no-summary", false, "Do not print an end-of-session usage summary")
 
@@ -143,6 +145,10 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	if err != nil || portNumber < 0 || portNumber > 65535 {
 		return opts, fmt.Errorf("--port must be an integer between 0 and 65535")
 	}
+	parsedPolicyRoutingMode, err := proxy.ParsePolicyRoutingMode(*policyRoutingMode)
+	if err != nil {
+		return opts, fmt.Errorf("--policy-routing: %w", err)
+	}
 
 	return launchAgentOptions{
 		model:                    strings.TrimSpace(*model),
@@ -154,6 +160,7 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 		proxyLogPath:             strings.TrimSpace(*proxyLog),
 		startupTimeout:           *startupTimeout,
 		streamingUpstreamTimeout: *streamingTimeout,
+		policyRoutingMode:        parsedPolicyRoutingMode,
 		dryRun:                   *dryRun,
 		noSummary:                *noSummary,
 		forwardedArgs:            append([]string(nil), fs.Args()...),
@@ -259,6 +266,7 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		server.WithProxyOptions(
 			proxy.WithProvidersConfig(providersCfg),
 			proxy.WithAllowedModels(opts.model),
+			proxy.WithPolicyRoutingMode(opts.policyRoutingMode),
 			proxy.WithDeferredDynamicProviderModelValidation(true),
 		),
 	)
@@ -319,8 +327,15 @@ func launchModelInfoFromProviderConfig(cfg proxy.ProviderModelConfig) launch.Mod
 	return model
 }
 
+type agentLaunchServer interface {
+	serveLifecycleServer
+	dynamicProviderModelValidator
+	Addr() string
+	Done() <-chan error
+}
+
 type agentLaunchProxy struct {
-	srv           *server.Server
+	srv           agentLaunchServer
 	authenticator serveStartupAuthenticator
 	usesCopilot   bool
 	log           *logger.Logger
@@ -330,14 +345,23 @@ func (p *agentLaunchProxy) Start(ctx context.Context) error {
 	if err := startServeServer(ctx, p.srv, p.authenticator, p.usesCopilot, p.log); err != nil {
 		return err
 	}
-	if p.usesCopilot {
-		return nil
+	if !p.usesCopilot {
+		if err := p.srv.ValidateDynamicProviderModels(ctx); err != nil {
+			validationErr := fmt.Errorf("provider model validation failed: %w", err)
+			stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return errors.Join(validationErr, p.srv.Stop(stopCtx))
+		}
 	}
-	if err := p.srv.ValidateDynamicProviderModels(ctx); err != nil {
-		validationErr := fmt.Errorf("provider model validation failed: %w", err)
-		stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return errors.Join(validationErr, p.srv.Stop(stopCtx))
+	if err := p.srv.InitializePolicyRouting(ctx); err != nil {
+		if ctx.Err() != nil {
+			return cancelServeStartup(ctx, p.srv, p.log)
+		}
+		initializationErr := fmt.Errorf("policy routing initialization failed: %w", err)
+		if stopErr := stopServeServer(p.srv, p.log); stopErr != nil {
+			return errors.Join(initializationErr, stopErr)
+		}
+		return initializationErr
 	}
 	return nil
 }

@@ -17,35 +17,41 @@ type requestSummaryContextKey struct{}
 type RequestSummary struct {
 	mu sync.Mutex
 
-	endpoint             string
-	model                string
-	provider             string
-	providerKind         string
-	operationID          string
-	routeID              string
-	policyID             string
-	policyMode           string
-	policyTier           string
-	policyDecision       string
-	configGeneration     string
-	profileGeneration    string
-	classifierGeneration string
-	binaryGeneration     string
-	finalTarget          string
-	lastTarget           string
-	lastProvider         string
-	lastProviderKind     string
-	upstreamSendCount    int64
-	targetSwitchCount    int64
-	routeExhausted       bool
-	streamSet            bool
-	stream               bool
-	upstreamRequestID    string
-	promptTokens         *int
-	completionTokens     *int
-	totalTokens          *int
-	cachedTokens         *int
-	reasoningTokens      *int
+	endpoint                  string
+	model                     string
+	provider                  string
+	providerKind              string
+	operationID               string
+	routeID                   string
+	policyID                  string
+	policyMode                string
+	policyTier                string
+	policyDecision            string
+	policyFailureCategory     string
+	policyClassifierLatencyMS int64
+	policyMessageCount        int
+	policyToolCount           int
+	policyInputBytes          int
+	policyTruncated           bool
+	configGeneration          string
+	profileGeneration         string
+	classifierGeneration      string
+	binaryGeneration          string
+	finalTarget               string
+	lastTarget                string
+	lastProvider              string
+	lastProviderKind          string
+	upstreamSendCount         int64
+	targetSwitchCount         int64
+	routeExhausted            bool
+	streamSet                 bool
+	stream                    bool
+	upstreamRequestID         string
+	promptTokens              *int
+	completionTokens          *int
+	totalTokens               *int
+	cachedTokens              *int
+	reasoningTokens           *int
 	// extraPromptTokens / extraCompletionTokens accumulate out-of-band token
 	// spend that is separate from the turn's own reported usage — e.g. an
 	// internal /responses compaction call made while serving a 413 oversized-
@@ -158,6 +164,12 @@ func (s *RequestSummary) SetPolicyDecision(plan chatOperationPlan) {
 	s.policyMode = plan.effectiveMode.String()
 	s.policyTier = plan.selectedTier.String()
 	s.policyDecision = plan.decision.Category
+	s.policyFailureCategory = plan.decision.FailureCategory
+	s.policyClassifierLatencyMS = plan.decision.ClassifierLatency
+	s.policyMessageCount = plan.decision.MessageCount
+	s.policyToolCount = plan.decision.ToolCount
+	s.policyInputBytes = plan.decision.InputBytes
+	s.policyTruncated = plan.decision.Truncated
 	s.configGeneration = plan.configGeneration
 	s.profileGeneration = plan.profileGeneration
 	s.classifierGeneration = plan.classifierGeneration
@@ -507,7 +519,7 @@ func (s *RequestSummary) LoggerFields() []logger.Field {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	fields := make([]logger.Field, 0, 24)
+	fields := make([]logger.Field, 0, 30)
 	if s.operationID != "" {
 		fields = append(fields, logger.F("operation_id", s.operationID))
 	}
@@ -519,6 +531,12 @@ func (s *RequestSummary) LoggerFields() []logger.Field {
 		fields = append(fields, logger.F("policy_mode", s.policyMode))
 		fields = append(fields, logger.F("policy_tier", s.policyTier))
 		fields = append(fields, logger.F("policy_decision", s.policyDecision))
+		fields = append(fields, logger.F("policy_failure_category", s.policyFailureCategory))
+		fields = append(fields, logger.F("policy_classifier_latency_ms", s.policyClassifierLatencyMS))
+		fields = append(fields, logger.F("policy_message_count", s.policyMessageCount))
+		fields = append(fields, logger.F("policy_tool_count", s.policyToolCount))
+		fields = append(fields, logger.F("policy_input_bytes", s.policyInputBytes))
+		fields = append(fields, logger.F("policy_truncated", s.policyTruncated))
 		fields = append(fields, logger.F("config_generation", s.configGeneration))
 		fields = append(fields, logger.F("profile_generation", s.profileGeneration))
 		fields = append(fields, logger.F("classifier_generation", s.classifierGeneration))

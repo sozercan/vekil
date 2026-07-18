@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -639,7 +640,10 @@ type fakeServeLifecycleServer struct {
 	authPendingUpdates []bool
 	started            bool
 	stopped            bool
+	stopCalls          int
 	policyInitialized  bool
+	addr               string
+	done               chan error
 }
 
 func (f *fakeServeLifecycleServer) Start() error {
@@ -652,6 +656,7 @@ func (f *fakeServeLifecycleServer) Start() error {
 
 func (f *fakeServeLifecycleServer) Stop(ctx context.Context) error {
 	f.stopped = true
+	f.stopCalls++
 	if f.stopFn != nil {
 		return f.stopFn(ctx)
 	}
@@ -676,6 +681,20 @@ func (f *fakeServeLifecycleServer) InitializePolicyRouting(ctx context.Context) 
 func (f *fakeServeLifecycleServer) SetStartupAuthenticationPending(pending bool) {
 	f.authPending = pending
 	f.authPendingUpdates = append(f.authPendingUpdates, pending)
+}
+
+func (f *fakeServeLifecycleServer) Addr() string {
+	if f.addr != "" {
+		return f.addr
+	}
+	return "127.0.0.1:0"
+}
+
+func (f *fakeServeLifecycleServer) Done() <-chan error {
+	if f.done == nil {
+		f.done = make(chan error)
+	}
+	return f.done
 }
 
 type fakeServeStartupAuthenticator struct {
@@ -1004,6 +1023,29 @@ func TestParseLaunchClaudeOptions(t *testing.T) {
 	}
 	if got := strings.Join(opts.forwardedArgs, "|"); got != "--print|hello" {
 		t.Fatalf("forwarded args = %q", got)
+	}
+}
+
+func TestParseLaunchAgentOptionsPolicyRoutingMode(t *testing.T) {
+	target, _ := launchTarget("copilot")
+	tests := []struct {
+		mode string
+		want proxy.PolicyRoutingMode
+	}{
+		{mode: "observe", want: proxy.PolicyRoutingModeObserve},
+		{mode: "enforce", want: proxy.PolicyRoutingModeEnforce},
+	}
+	for _, tc := range tests {
+		t.Run(tc.mode, func(t *testing.T) {
+			t.Setenv("POLICY_ROUTING_MODE", tc.mode)
+			opts, err := parseLaunchAgentOptions(target, []string{"--model", "policy-launch-test"}, io.Discard)
+			if err != nil {
+				t.Fatalf("parseLaunchAgentOptions() error = %v", err)
+			}
+			if opts.policyRoutingMode != tc.want {
+				t.Fatalf("policy routing mode = %q, want %q", opts.policyRoutingMode, tc.want)
+			}
+		})
 	}
 }
 
@@ -1370,6 +1412,105 @@ func readMainLaunchCapture(t *testing.T, path string) map[string]string {
 	return capture
 }
 
+func TestRunLaunchAgentInitializesConfiguredPolicyRouting(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, mode := range []string{"observe", "enforce"} {
+		t.Run(mode, func(t *testing.T) {
+			var classifierCalls atomic.Int64
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer func() { _ = r.Body.Close() }()
+				var request struct {
+					Model string `json:"model"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				if request.Model != "classifier-model" {
+					http.Error(w, "unexpected model "+request.Model, http.StatusBadRequest)
+					return
+				}
+				classifierCalls.Add(1)
+				arguments := `{"abstain":false,"turn_type":"lookup","code_scope":"none","tool_call_count_estimate":0,"modifying_tool_call_count_estimate":0,"requires_codebase_context":false,"risk_level":"low"}`
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"choices": []any{map[string]any{"message": map[string]any{
+						"role": "assistant",
+						"tool_calls": []any{map[string]any{"type": "function", "function": map[string]any{
+							"name": "emit_policy_signals", "arguments": arguments,
+						}}},
+					}}},
+				})
+			}))
+			defer upstream.Close()
+
+			tmp := t.TempDir()
+			providersPath := filepath.Join(tmp, "providers.yaml")
+			providersBody := fmt.Sprintf(`schema_version: 3
+providers:
+  - id: policy-provider
+    type: openai-compatible
+    base_url: %s
+    auth_type: none
+    trust_domain: org
+    classifier_no_store_supported: true
+model_routes:
+  - id: light-route
+    exposure: internal
+    endpoints: [/chat/completions]
+    targets: [{id: light, provider: policy-provider, upstream_model: light-model}]
+  - id: power-route
+    exposure: internal
+    endpoints: [/chat/completions]
+    targets: [{id: power, provider: policy-provider, upstream_model: power-model}]
+  - id: classifier-route
+    exposure: internal
+    internal_purpose: policy_classifier
+    endpoints: [/chat/completions]
+    targets: [{id: classifier, provider: policy-provider, upstream_model: classifier-model}]
+policy_profiles:
+  - id: policy-launch
+    public_id: policy-launch-test
+    mode: %s
+    lightweight_route: light-route
+    powerful_route: power-route
+    classifier: {route: classifier-route}
+    data_policy: {content_forwarding_acknowledged: true}
+`, upstream.URL, mode)
+			if err := os.WriteFile(providersPath, []byte(providersBody), 0o600); err != nil {
+				t.Fatalf("write providers config: %v", err)
+			}
+
+			capturePath := filepath.Join(tmp, "capture.json")
+			t.Setenv("POLICY_ROUTING_MODE", mode)
+			t.Setenv("GO_WANT_MAIN_LAUNCH_HELPER", "1")
+			t.Setenv("MAIN_LAUNCH_HELPER_CAPTURE", capturePath)
+			t.Setenv("MAIN_LAUNCH_HELPER_TARGET", "copilot")
+
+			var stderr bytes.Buffer
+			code := runLaunchCopilot([]string{
+				"--providers-config", providersPath,
+				"--model", "policy-launch-test",
+				"--binary", binary,
+				"--startup-timeout", "2s",
+				"--proxy-log", filepath.Join(tmp, "proxy.jsonl"),
+				"--",
+				"-test.run=TestMainLaunchHelperProcess",
+			}, &stderr)
+			if code != 9 {
+				t.Fatalf("runLaunchCopilot() code = %d, want 9; stderr=%s", code, stderr.String())
+			}
+			if got := classifierCalls.Load(); got != 1 {
+				t.Fatalf("policy classifier preflight calls = %d, want 1", got)
+			}
+		})
+	}
+}
+
 func TestRunLaunchClaudeDefersDynamicValidationUnderStartupTimeout(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
@@ -1611,6 +1752,110 @@ func (f *fakeLoginAuthenticator) PollForAuthorization(_ context.Context, dcResp 
 	f.pollForAuthorizationCalls++
 	f.polledDeviceCode = dcResp
 	return f.pollForAuthorizationErr
+}
+
+func TestAgentLaunchProxyStartInitializesPolicyRoutingAfterStartup(t *testing.T) {
+	tests := []struct {
+		name        string
+		usesCopilot bool
+		wantEvents  []string
+	}{
+		{name: "static provider", wantEvents: []string{"start", "validate", "policy"}},
+		{name: "Copilot provider", usesCopilot: true, wantEvents: []string{"start", "auth", "validate", "policy"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			events := make(chan string, 5)
+			srv := &fakeServeLifecycleServer{
+				startFn: func() error {
+					events <- "start"
+					return nil
+				},
+				validateFn: func(context.Context) error {
+					events <- "validate"
+					return nil
+				},
+				initializePolicyFn: func(context.Context) error {
+					events <- "policy"
+					return nil
+				},
+				stopFn: func(context.Context) error {
+					events <- "stop"
+					return nil
+				},
+			}
+			var authenticator serveStartupAuthenticator
+			if tc.usesCopilot {
+				authenticator = &fakeServeStartupAuthenticator{getTokenFn: func(context.Context) (string, error) {
+					events <- "auth"
+					return "test-token", nil
+				}}
+			}
+			runtime := &agentLaunchProxy{
+				srv:           srv,
+				authenticator: authenticator,
+				usesCopilot:   tc.usesCopilot,
+				log:           logger.NewWithWriter(logger.LevelError, io.Discard),
+			}
+
+			if err := runtime.Start(context.Background()); err != nil {
+				t.Fatalf("agentLaunchProxy.Start() error = %v", err)
+			}
+			for _, want := range tc.wantEvents {
+				assertNextServeEvent(t, events, want)
+			}
+			if err := runtime.Stop(context.Background()); err != nil {
+				t.Fatalf("agentLaunchProxy.Stop() error = %v", err)
+			}
+			assertNextServeEvent(t, events, "stop")
+		})
+	}
+}
+
+func TestAgentLaunchProxyStartStopsOnPolicyRoutingInitializationFailure(t *testing.T) {
+	initializationErr := errors.New("classifier preflight failed")
+	stopErr := errors.New("stop failed")
+	srv := &fakeServeLifecycleServer{
+		initializePolicyFn: func(context.Context) error { return initializationErr },
+		stopFn:             func(context.Context) error { return stopErr },
+	}
+	runtime := &agentLaunchProxy{
+		srv: srv,
+		log: logger.NewWithWriter(logger.LevelError, io.Discard),
+	}
+
+	err := runtime.Start(context.Background())
+	if !errors.Is(err, initializationErr) || !errors.Is(err, stopErr) {
+		t.Fatalf("agentLaunchProxy.Start() error = %v, want initialization and stop errors", err)
+	}
+	if !strings.Contains(err.Error(), "policy routing initialization failed") {
+		t.Fatalf("agentLaunchProxy.Start() error = %v, want policy routing context", err)
+	}
+	if srv.stopCalls != 1 {
+		t.Fatalf("server stop calls = %d, want 1", srv.stopCalls)
+	}
+}
+
+func TestAgentLaunchProxyStartStopsWhenPolicyRoutingInitializationIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := &fakeServeLifecycleServer{
+		initializePolicyFn: func(context.Context) error {
+			cancel()
+			return ctx.Err()
+		},
+	}
+	runtime := &agentLaunchProxy{
+		srv: srv,
+		log: logger.NewWithWriter(logger.LevelError, io.Discard),
+	}
+
+	err := runtime.Start(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("agentLaunchProxy.Start() error = %v, want context cancellation", err)
+	}
+	if srv.stopCalls != 1 {
+		t.Fatalf("server stop calls = %d, want 1", srv.stopCalls)
+	}
 }
 
 func TestAgentLaunchProxySkipsCopilotForKnownNonCopilotModel(t *testing.T) {

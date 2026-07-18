@@ -59,6 +59,79 @@ func TestRequestSummaryRouteObservability(t *testing.T) {
 	}
 }
 
+func TestRequestSummaryPolicyDecisionProvenance(t *testing.T) {
+	tests := []struct {
+		name     string
+		decision policyDecisionRecord
+		want     map[string]any
+	}{
+		{
+			name: "classifier fallback",
+			decision: policyDecisionRecord{
+				Category:          "unavailable_fallback",
+				FailureCategory:   string(policyClassifierFailureTimeout),
+				ActualTier:        policyTierPowerful,
+				ClassifierLatency: 237,
+				MessageCount:      11,
+				ToolCount:         4,
+				InputBytes:        8192,
+				Truncated:         true,
+			},
+			want: map[string]any{
+				"policy_decision":              "unavailable_fallback",
+				"policy_failure_category":      string(policyClassifierFailureTimeout),
+				"policy_classifier_latency_ms": int64(237),
+				"policy_message_count":         11,
+				"policy_tool_count":            4,
+				"policy_input_bytes":           8192,
+				"policy_truncated":             true,
+			},
+		},
+		{
+			name: "zero values remain explicit",
+			decision: policyDecisionRecord{
+				Category:   "baseline",
+				ActualTier: policyTierLightweight,
+			},
+			want: map[string]any{
+				"policy_decision":              "baseline",
+				"policy_failure_category":      "",
+				"policy_classifier_latency_ms": int64(0),
+				"policy_message_count":         0,
+				"policy_tool_count":            0,
+				"policy_input_bytes":           0,
+				"policy_truncated":             false,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			summary := &RequestSummary{}
+			summary.SetPolicyDecision(chatOperationPlan{
+				policyID:             "coding-policy",
+				selectedTier:         tt.decision.ActualTier,
+				effectiveMode:        policyModeEnforce,
+				configGeneration:     "config-generation",
+				profileGeneration:    "profile-generation",
+				classifierGeneration: "classifier-generation",
+				binaryGeneration:     "binary-generation",
+				decision:             tt.decision,
+			})
+
+			fields := make(map[string]any)
+			for _, field := range summary.LoggerFields() {
+				fields[field.Key] = field.Value
+			}
+			for key, want := range tt.want {
+				if got, ok := fields[key]; !ok || got != want {
+					t.Errorf("LoggerFields[%q] = %#v, %t; want %#v, true", key, got, ok, want)
+				}
+			}
+		})
+	}
+}
+
 func TestRequestSummarySeparatesLastAttemptFromFinalRouteAttribution(t *testing.T) {
 	summary := &RequestSummary{}
 
@@ -107,6 +180,7 @@ func TestRequestSummaryRouteObservabilityNilSafe(t *testing.T) {
 	var summary *RequestSummary
 	summary.SetOperationID("op")
 	summary.SetRouteID("route")
+	summary.SetPolicyDecision(chatOperationPlan{policyID: "policy"})
 	summary.SetFinalTarget("target")
 	summary.setFinalRouteAttribution("target", "provider", "kind")
 	summary.recordUpstreamAttempt("op", "route", "target", "provider", "kind")

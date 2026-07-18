@@ -311,7 +311,7 @@ func (c *chatPolicyRoutingController) Initialize(ctx context.Context) error {
 			c.setDiagnostic(readinessMessage)
 			return fmt.Errorf("%s: %w", detailMessage, err)
 		}
-		observeFailures = append(observeFailures, readinessMessage)
+		observeFailures = append(observeFailures, fmt.Sprintf("%s: %v", detailMessage, err))
 	}
 	if len(observeFailures) > 0 {
 		c.setDiagnostic(strings.Join(observeFailures, "; "))

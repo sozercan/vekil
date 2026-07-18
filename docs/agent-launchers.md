@@ -49,11 +49,12 @@ Every launcher:
 1. loads Vekil provider configuration and credentials;
 2. starts a proxy on `127.0.0.1:0` unless `--port` is provided;
 3. completes startup authentication and provider-model validation;
-4. waits for `/readyz` and verifies that `--model` appears in `/v1/models`;
-5. validates the installed agent binary and model endpoint compatibility;
-6. starts the agent with target-specific temporary routing configuration;
-7. forwards signals and supervises the managed child process group or Job Object;
-8. prints a usage summary and stops the proxy when the agent exits.
+4. initializes configured policy routing using the `--policy-routing` / `POLICY_ROUTING_MODE` safety ceiling;
+5. waits for `/readyz` and verifies that `--model` appears in `/v1/models`;
+6. validates the installed agent binary and model endpoint compatibility;
+7. starts the agent with target-specific temporary routing configuration;
+8. forwards signals and supervises the managed child process group or Job Object;
+9. prints a usage summary and stops the proxy when the agent exits.
 
 ## Common options
 
@@ -66,6 +67,7 @@ Every launcher:
 | `--binary PATH` | Agent executable override. |
 | `--startup-timeout DURATION` | Maximum startup/authentication/readiness time. |
 | `--streaming-upstream-timeout DURATION` | Upstream streaming timeout. |
+| `--policy-routing off|observe|enforce` | Process-wide policy-routing safety ceiling. Defaults to `POLICY_ROUTING_MODE` or `off`. |
 | `--proxy-log PATH` | New JSON proxy log path; existing files and links are rejected. |
 | `--dry-run` | Print the child-process plan without starting a proxy or agent. Static model metadata is resolved; catalog-only metadata is marked unresolved. |
 | `--no-summary` | Suppress the end-of-session request/token summary. |
