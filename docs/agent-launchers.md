@@ -69,6 +69,7 @@ Every launcher:
 | `--proxy-log PATH` | New JSON proxy log path; existing files and links are rejected. |
 | `--dry-run` | Print the child-process plan without starting a proxy or agent. Static model metadata is resolved; catalog-only metadata is marked unresolved. |
 | `--no-summary` | Suppress the end-of-session request/token summary. |
+| `--no-metrics` | Disable the enabled-by-default Prometheus `/metrics` endpoint for the ephemeral proxy. `NO_METRICS=true` provides the same default. |
 
 ```bash
 vekil launch codex --model gpt-5.4-mini --dry-run
