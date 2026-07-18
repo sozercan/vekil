@@ -79,25 +79,41 @@ func (h *ProxyHandler) executeChatCompletions(ctx context.Context, chatBody []by
 }
 
 func chatRequestContainsResponsesReplayID(body []byte) bool {
-	var request struct {
-		Messages []struct {
-			Role       string `json:"role"`
-			ToolCallID string `json:"tool_call_id"`
-			ToolCalls  []struct {
-				ID string `json:"id"`
-			} `json:"tool_calls"`
-		} `json:"messages"`
-	}
+	var request map[string]json.RawMessage
 	if json.Unmarshal(body, &request) != nil {
 		return false
 	}
-	for _, message := range request.Messages {
-		if strings.TrimSpace(message.Role) == "tool" && isResponsesChatReplayCallID(message.ToolCallID) {
-			return true
+	var messages []json.RawMessage
+	if json.Unmarshal(request["messages"], &messages) != nil {
+		return false
+	}
+	for _, rawMessage := range messages {
+		var message map[string]json.RawMessage
+		if json.Unmarshal(rawMessage, &message) != nil {
+			continue
 		}
-		if strings.TrimSpace(message.Role) == "assistant" {
-			for _, call := range message.ToolCalls {
-				if isResponsesChatReplayCallID(call.ID) {
+		var role string
+		if json.Unmarshal(message["role"], &role) != nil {
+			continue
+		}
+		switch strings.TrimSpace(role) {
+		case "tool":
+			var callID string
+			if json.Unmarshal(message["tool_call_id"], &callID) == nil && isResponsesChatReplayCallID(callID) {
+				return true
+			}
+		case "assistant":
+			var calls []json.RawMessage
+			if json.Unmarshal(message["tool_calls"], &calls) != nil {
+				continue
+			}
+			for _, rawCall := range calls {
+				var call map[string]json.RawMessage
+				if json.Unmarshal(rawCall, &call) != nil {
+					continue
+				}
+				var callID string
+				if json.Unmarshal(call["id"], &callID) == nil && isResponsesChatReplayCallID(callID) {
 					return true
 				}
 			}

@@ -1912,6 +1912,73 @@ func (h *ProxyHandler) decodeAnthropicCountTokensProbeResponse(resp *http.Respon
 	return &oaiResp, nil
 }
 
+func policyChatSafeHeaders(src http.Header, publicModel string) http.Header {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(http.Header)
+	for key, values := range src {
+		lower := strings.ToLower(strings.TrimSpace(key))
+		allowed := lower == "x-request-id" || lower == "request-id" || lower == "retry-after" ||
+			strings.HasPrefix(lower, "x-ratelimit-") || strings.HasPrefix(lower, "ratelimit-")
+		if !allowed {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+	for _, name := range []string{"Openai-Model", "X-Openai-Model"} {
+		if src.Get(name) == "" {
+			continue
+		}
+		dst.Set(name, publicModel)
+	}
+	if len(dst) == 0 {
+		return nil
+	}
+	return dst
+}
+
+func policyChatUpstreamErrorDetails(status int) (message, errType, code string) {
+	return "upstream request failed", openAIErrorTypeForHTTPStatus(status), "upstream_error"
+}
+
+func policyChatErrorHeaders(err error) http.Header {
+	var executionErr *chatExecutionError
+	if errors.As(err, &executionErr) {
+		return executionErr.Headers
+	}
+	var upstreamErr *upstreamError
+	if errors.As(err, &upstreamErr) {
+		return upstreamErr.headers
+	}
+	return nil
+}
+
+func writePolicyChatSanitizedError(w http.ResponseWriter, status int, headers http.Header, publicModel string) {
+	if safeHeaders := policyChatSafeHeaders(headers, publicModel); len(safeHeaders) > 0 {
+		mergeHeaderValues(w.Header(), safeHeaders)
+	}
+	w.Header().Del("Content-Length")
+	if status < http.StatusBadRequest {
+		status = http.StatusBadGateway
+	}
+	message, errType, code := policyChatUpstreamErrorDetails(status)
+	writeOpenAIErrorWithDetails(w, status, message, errType, "", code)
+}
+
+func writePolicyChatTerminalError(w http.ResponseWriter, resp *http.Response, publicModel string) error {
+	if resp == nil {
+		return &responseBodyWriteError{err: fmt.Errorf("upstream response is unavailable"), upstream: true}
+	}
+	if resp.Body != nil {
+		defer func() { _ = readRetryableUpstreamErrorBody(resp.Body) }()
+	}
+	writePolicyChatSanitizedError(w, resp.StatusCode, resp.Header, publicModel)
+	return nil
+}
+
 // HandleOpenAIChatCompletions handles POST /v1/chat/completions by forwarding the
 // request to Copilot with only auth headers injected (near zero-copy passthrough).
 func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -1989,11 +2056,19 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		var executionErr *chatExecutionError
 		if errors.As(err, &executionErr) {
 			observeChatExecutionError(r.Context(), executionErr)
-			writeOpenAIChatExecutionError(w, executionErr)
+			if policyPlan.valid() {
+				writePolicyChatSanitizedError(w, executionErr.StatusCode, executionErr.Headers, publicModel)
+			} else {
+				writeOpenAIChatExecutionError(w, executionErr)
+			}
 			return
 		}
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
-		writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+		if policyPlan.valid() {
+			writePolicyChatSanitizedError(w, statusCode, policyChatErrorHeaders(err), publicModel)
+		} else {
+			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+		}
 		return
 	}
 	if routeOperation != nil {
@@ -2004,6 +2079,17 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	result, err := h.executeRoutedChatCompletions(upstreamCtx, bodyBytes, mode, chatExecutionOptions{}, requestedModel)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
+			return
+		}
+		if policyPlan.valid() {
+			var executionErr *chatExecutionError
+			if errors.As(err, &executionErr) {
+				observeChatExecutionError(r.Context(), executionErr)
+				observeOpenAIUsage(r.Context(), executionErr.Usage)
+			}
+			statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+			h.log.Error("policy terminal request failed", logger.F("endpoint", "openai"), logger.Err(err))
+			writePolicyChatSanitizedError(w, statusCode, policyChatErrorHeaders(err), responseModel)
 			return
 		}
 		var executionErr *chatExecutionError
@@ -2040,7 +2126,11 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		if errors.As(err, &executionErr) {
 			observeChatExecutionError(r.Context(), executionErr)
 			observeOpenAIUsage(r.Context(), executionErr.Usage)
-			writeOpenAIChatExecutionError(w, executionErr)
+			if policyPlan.valid() {
+				writePolicyChatSanitizedError(w, executionErr.StatusCode, executionErr.Headers, responseModel)
+			} else {
+				writeOpenAIChatExecutionError(w, executionErr)
+			}
 			return
 		}
 		status := http.StatusBadGateway
@@ -2055,6 +2145,9 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 				errType = streamErr.Type
 			}
 			code = streamErr.Code
+			if policyPlan.valid() {
+				message, errType, code = policyChatUpstreamErrorDetails(status)
+			}
 		}
 		writeOpenAIErrorWithDetails(w, status, message, errType, "", code)
 		return
@@ -2079,7 +2172,11 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 
 	err = h.routeChatExecutionResult(w, result, upstreamCtx, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			copyPassthroughHeaders(w.Header(), resp.Header)
+			if policyPlan.valid() {
+				mergeHeaderValues(w.Header(), policyChatSafeHeaders(resp.Header, responseModel))
+			} else {
+				copyPassthroughHeaders(w.Header(), resp.Header)
+			}
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentProtocolFrame)
 			body := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
 			finalResponse := h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope)
@@ -2092,7 +2189,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			// for when the client did not opt into stream_options.include_usage.
 			lifecycle := h.lifecycleStreamHooks(r.Context(), body.canceledAtFailure, func() { h.WriteShutdownServiceUnavailable(w, r) })
 			if routeOperation != nil {
-				streamExplicitRouteOpenAIChatPassthroughWithLifecycle(w, body, responseModel, mode.injectedClientStreamUsage, onError, finalResponse, lifecycle, usage)
+				streamExplicitRouteOpenAIChatPassthroughWithLifecycle(w, body, responseModel, policyPlan.valid(), mode.injectedClientStreamUsage, onError, finalResponse, lifecycle, usage)
 			} else {
 				streamOpenAIChatPassthroughWithLifecycle(w, body, responseModel, mode.injectedClientStreamUsage, onError, finalResponse, lifecycle, usage)
 			}
@@ -2138,6 +2235,9 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		},
 		passthrough: func(resp *http.Response) error {
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentProtocolFrame)
+			if policyPlan.valid() && resp != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices) {
+				return writePolicyChatTerminalError(w, resp, responseModel)
+			}
 			return h.maybeWriteOptimizedOpenAIChatPassthrough(r.Context(), w, resp, responseModel, h.toolContexts, scope)
 		},
 	})
@@ -2152,7 +2252,11 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		if errors.As(err, &executionErr) {
 			observeChatExecutionError(r.Context(), executionErr)
 			observeOpenAIUsage(r.Context(), executionErr.Usage)
-			writeOpenAIChatExecutionError(w, executionErr)
+			if policyPlan.valid() {
+				writePolicyChatSanitizedError(w, executionErr.StatusCode, executionErr.Headers, responseModel)
+			} else {
+				writeOpenAIChatExecutionError(w, executionErr)
+			}
 			return
 		}
 		status := http.StatusBadGateway
@@ -2167,6 +2271,9 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 				errType = streamErr.Type
 			}
 			code = streamErr.Code
+			if policyPlan.valid() {
+				message, errType, code = policyChatUpstreamErrorDetails(status)
+			}
 		}
 		writeOpenAIErrorWithDetails(w, status, message, errType, "", code)
 	}

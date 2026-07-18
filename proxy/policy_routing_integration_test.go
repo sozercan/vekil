@@ -23,10 +23,12 @@ type policyIntegrationUpstream struct {
 	models   []string
 	requests int
 
-	classifierSignals       policyClassifierSignals
-	classifierBlock         <-chan struct{}
-	classifierFailureStatus atomic.Int64
-	terminalFailureStatus   atomic.Int64
+	classifierSignals        policyClassifierSignals
+	classifierBlock          <-chan struct{}
+	classifierFailureStatus  atomic.Int64
+	terminalFailureStatus    atomic.Int64
+	terminalStreamFailure    atomic.Bool
+	terminalRateLimitFailure atomic.Bool
 }
 
 func newPolicyIntegrationUpstream(t *testing.T, signals policyClassifierSignals) *policyIntegrationUpstream {
@@ -81,11 +83,29 @@ func newPolicyIntegrationUpstream(t *testing.T, signals policyClassifierSignals)
 			return
 		}
 		if status := int(u.terminalFailureStatus.Load()); status != 0 {
-			http.Error(w, "terminal unavailable", status)
+			w.Header().Set("Openai-Model", request.Model)
+			w.Header().Set("X-Openai-Model", request.Model)
+			w.Header().Set("X-Request-ID", "terminal-request")
+			w.Header().Set("X-Azure-Request-ID", "azure-terminal-request")
+			w.Header().Set("OpenAI-Processing-Ms", "17")
+			w.Header().Set("X-Vekil-Internal-Route", "power-route")
+			http.Error(w, fmt.Sprintf("terminal unavailable for %s via power-route/power-provider", request.Model), status)
 			return
 		}
 		if request.Stream {
 			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Openai-Model", request.Model)
+			w.Header().Set("X-Request-ID", "terminal-stream-request")
+			w.Header().Set("X-Azure-Request-ID", "azure-terminal-stream-request")
+			w.Header().Set("OpenAI-Processing-Ms", "19")
+			if u.terminalRateLimitFailure.Load() {
+				_, _ = fmt.Fprint(w, "event: error\ndata: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"power-model quota failed via power-route/power-provider\"}}\n\n")
+				return
+			}
+			if u.terminalStreamFailure.Load() {
+				_, _ = fmt.Fprint(w, "event: error\ndata: {\"error\":{\"type\":\"server_error\",\"code\":\"power-route\",\"message\":\"power-model failed via power-provider\"}}\n\n")
+				return
+			}
 			_, _ = fmt.Fprintf(w, "data: {\"id\":\"terminal-stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}\n\n", request.Model)
 			_, _ = fmt.Fprintf(w, "data: {\"id\":\"terminal-stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n", request.Model)
 			_, _ = fmt.Fprint(w, "data: {\"id\":\"terminal-stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"ignored\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n")
@@ -898,5 +918,188 @@ func TestPolicyClientStatsUsePublicIDNotTerminalRouteID(t *testing.T) {
 	if snapshot.ByRoute[0].Route == "light-route" || snapshot.ByRoute[0].Route == "power-route" ||
 		snapshot.Recent[0].RouteID == "light-route" || snapshot.Recent[0].RouteID == "power-route" {
 		t.Fatalf("client request stats leaked terminal route: by_route=%+v recent=%+v", snapshot.ByRoute, snapshot.Recent)
+	}
+}
+
+func TestPolicyResponsesReplayIDRejectedBeforeClassifierSend(t *testing.T) {
+	modes := []struct {
+		name        string
+		profileMode string
+		runtimeMode PolicyRoutingMode
+	}{
+		{name: "observe", profileMode: policyConfigModeObserve, runtimeMode: PolicyRoutingModeObserve},
+		{name: "enforce", profileMode: policyConfigModeEnforce, runtimeMode: PolicyRoutingModeEnforce},
+	}
+	bodies := []struct {
+		name string
+		body string
+	}{
+		{name: "well_typed", body: `{"model":"coding-economy","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`},
+		{name: "unrelated_type_error", body: `{"model":"coding-economy","messages":[{"role":"user","content":"hello","tool_call_id":123},{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`},
+		{name: "case_folded_siblings", body: `{"model":"coding-economy","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","ID":123,"type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}],"MESSAGES":123}`},
+	}
+	for _, mode := range modes {
+		for _, request := range bodies {
+			t.Run(mode.name+"/"+request.name, func(t *testing.T) {
+				light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+				powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+				h, err := NewProxyHandler(nil, nil, WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, mode.profileMode)), WithPolicyRoutingMode(mode.runtimeMode))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := h.InitializePolicyRouting(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				before, _ := light.snapshot()
+				recorder := httptest.NewRecorder()
+				h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(request.body)))
+				if recorder.Code != http.StatusBadRequest {
+					t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+				}
+				after, _ := light.snapshot()
+				if after != before {
+					t.Fatalf("classifier/terminal sends before=%d after=%d", before, after)
+				}
+				if sends, _ := powerful.snapshot(); sends != 0 {
+					t.Fatalf("powerful sends=%d", sends)
+				}
+			})
+		}
+	}
+}
+
+func TestPolicyTerminalHTTPErrorIsSanitized(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypePlanning, CodeScope: policyCodeScopeMultiFile, RiskLevel: policyRiskLevelHigh})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")), WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)), WithPolicyRoutingMode(PolicyRoutingModeEnforce))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	powerful.terminalFailureStatus.Store(http.StatusBadGateway)
+	recorder := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"coding-economy","messages":[{"role":"user","content":"plan"}]}`)))
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"message":"upstream request failed"`) || !strings.Contains(body, `"code":"upstream_error"`) ||
+		strings.Contains(body, "terminal unavailable") || strings.Contains(body, "power-model") || strings.Contains(body, "power-route") || strings.Contains(body, "power-provider") {
+		t.Fatalf("unsanitized policy error body: %s", body)
+	}
+	if got := recorder.Header().Get("Openai-Model"); got != "coding-economy" {
+		t.Fatalf("Openai-Model=%q", got)
+	}
+	if got := recorder.Header().Get("X-Openai-Model"); got != "coding-economy" {
+		t.Fatalf("X-Openai-Model=%q", got)
+	}
+	if got := recorder.Header().Get("X-Request-ID"); got != "terminal-request" {
+		t.Fatalf("X-Request-ID=%q", got)
+	}
+	if got := recorder.Header().Get("X-Vekil-Internal-Route"); got != "" {
+		t.Fatalf("X-Vekil-Internal-Route=%q", got)
+	}
+	if got := recorder.Header().Get("X-Azure-Request-ID"); got != "" {
+		t.Fatalf("X-Azure-Request-ID=%q", got)
+	}
+	if got := recorder.Header().Get("OpenAI-Processing-Ms"); got != "" {
+		t.Fatalf("OpenAI-Processing-Ms=%q", got)
+	}
+}
+
+func TestPolicyTerminalStreamErrorIsSanitized(t *testing.T) {
+	tests := []struct {
+		name            string
+		body            string
+		wantStatus      int
+		wantStreamHeads bool
+	}{
+		{
+			name:            "client_stream",
+			body:            `{"model":"coding-economy","stream":true,"messages":[{"role":"user","content":"plan"}]}`,
+			wantStatus:      http.StatusOK,
+			wantStreamHeads: true,
+		},
+		{
+			name:       "forced_stream",
+			body:       `{"model":"coding-economy","messages":[{"role":"user","content":"plan"}],"tools":[{"type":"function","function":{"name":"lookup","description":"look up data","parameters":{"type":"object","properties":{}}}}]}`,
+			wantStatus: http.StatusBadGateway,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypePlanning, CodeScope: policyCodeScopeMultiFile, RiskLevel: policyRiskLevelHigh})
+			powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")), WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)), WithPolicyRoutingMode(PolicyRoutingModeEnforce))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			powerful.terminalStreamFailure.Store(true)
+			recorder := httptest.NewRecorder()
+			h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tt.body)))
+			if recorder.Code != tt.wantStatus {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			body := recorder.Body.String()
+			if !strings.Contains(body, `"message":"upstream request failed"`) || !strings.Contains(body, `"code":"upstream_error"`) ||
+				strings.Contains(body, "power-model") || strings.Contains(body, "power-route") || strings.Contains(body, "power-provider") {
+				t.Fatalf("unsanitized policy stream error: %s", body)
+			}
+			if got := recorder.Header().Get("X-Azure-Request-ID"); got != "" {
+				t.Fatalf("X-Azure-Request-ID=%q", got)
+			}
+			if got := recorder.Header().Get("OpenAI-Processing-Ms"); got != "" {
+				t.Fatalf("OpenAI-Processing-Ms=%q", got)
+			}
+			if tt.wantStreamHeads {
+				if got := recorder.Header().Get("Openai-Model"); got != "coding-economy" {
+					t.Fatalf("Openai-Model=%q", got)
+				}
+				if got := recorder.Header().Get("X-Request-ID"); got != "terminal-stream-request" {
+					t.Fatalf("X-Request-ID=%q", got)
+				}
+			}
+		})
+	}
+}
+
+func TestPolicyPrecommitStreamErrorIsSanitized(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypePlanning, CodeScope: policyCodeScopeMultiFile, RiskLevel: policyRiskLevelHigh})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")), WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)), WithPolicyRoutingMode(PolicyRoutingModeEnforce))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	powerful.terminalRateLimitFailure.Store(true)
+	recorder := httptest.NewRecorder()
+	body := `{"model":"coding-economy","stream":true,"messages":[{"role":"user","content":"plan"}]}`
+	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	responseBody := recorder.Body.String()
+	if !strings.Contains(responseBody, `"message":"upstream request failed"`) || !strings.Contains(responseBody, `"code":"upstream_error"`) ||
+		strings.Contains(responseBody, "power-model") || strings.Contains(responseBody, "power-route") || strings.Contains(responseBody, "power-provider") {
+		t.Fatalf("unsanitized precommit policy stream error: %s", responseBody)
+	}
+	if got := recorder.Header().Get("Openai-Model"); got != "coding-economy" {
+		t.Fatalf("Openai-Model=%q", got)
+	}
+	if got := recorder.Header().Get("X-Request-ID"); got != "terminal-stream-request" {
+		t.Fatalf("X-Request-ID=%q", got)
+	}
+	if got := recorder.Header().Get("X-Azure-Request-ID"); got != "" {
+		t.Fatalf("X-Azure-Request-ID=%q", got)
+	}
+	if got := recorder.Header().Get("OpenAI-Processing-Ms"); got != "" {
+		t.Fatalf("OpenAI-Processing-Ms=%q", got)
 	}
 }

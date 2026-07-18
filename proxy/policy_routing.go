@@ -349,6 +349,12 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 		}
 		return chatOperationPlan{}, &providerRequestError{statusCode: http.StatusServiceUnavailable, err: fmt.Errorf("%s for policy model %q", message, entry.id)}
 	}
+	if chatRequestContainsResponsesReplayID(input.OriginalBody) {
+		return chatOperationPlan{}, &providerRequestError{
+			statusCode: http.StatusBadRequest,
+			err:        fmt.Errorf("policy model %q does not support Responses replay continuations", entry.id),
+		}
+	}
 	facts, err := buildPolicyClassifierFacts(input.OriginalBody, policyFactOptions{
 		RecentTurns:     profile.config.Classifier.RecentTurns,
 		MaxRequestBytes: profile.config.Classifier.MaxRequestBytes,
