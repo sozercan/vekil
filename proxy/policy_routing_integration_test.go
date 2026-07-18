@@ -233,7 +233,10 @@ func TestPolicyRoutingEnforceSelectsPowerfulAndPreservesPublicIdentity(t *testin
 	}
 
 	policyStats := h.policyRoutingController.(*chatPolicyRoutingController).PolicyStatsSnapshot()
-	if len(policyStats.Profiles) != 1 || policyStats.Profiles[0].Totals.ActualTiers.Powerful != 1 {
+	if len(policyStats.Profiles) != 1 || policyStats.Profiles[0].Profile != "coding-economy" {
+		t.Fatalf("policy stats exposed internal profile id: %+v", policyStats.Profiles)
+	}
+	if policyStats.Profiles[0].Totals.ActualTiers.Powerful != 1 {
 		t.Fatalf("policy stats = %+v", policyStats)
 	}
 	if got := policyStats.Profiles[0].Totals.PhysicalClassifierSends; got != 2 {
@@ -827,6 +830,9 @@ func TestPolicyRoutingSharedClassifierPreflightCountsOnePhysicalSend(t *testing.
 		t.Fatalf("preflight requests = %d %v, want one shared send", requests, models)
 	}
 	stats := h.policyRoutingController.(*chatPolicyRoutingController).PolicyStatsSnapshot()
+	if len(stats.Profiles) != 2 || stats.Profiles[0].Profile != "coding-economy" || stats.Profiles[1].Profile != "coding-economy-two" {
+		t.Fatalf("shared preflight stats exposed internal profile ids: %+v", stats.Profiles)
+	}
 	if stats.Totals.PhysicalClassifierSends != 1 {
 		t.Fatalf("global preflight physical sends = %d", stats.Totals.PhysicalClassifierSends)
 	}

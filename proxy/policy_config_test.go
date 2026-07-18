@@ -404,6 +404,14 @@ policy_profiles:
 	}
 }
 
+func TestPolicyProfilePublicIDIsBoundedForMetricsIdentity(t *testing.T) {
+	cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeOff)
+	cfg.PolicyProfiles[0].PublicID = strings.Repeat("a", policyStatsLabelMaxLen+1)
+	if err := ValidateProvidersConfig(cfg); err == nil || !strings.Contains(err.Error(), "public_id") || !strings.Contains(err.Error(), "at most") {
+		t.Fatalf("ValidateProvidersConfig() error = %v, want bounded public_id error", err)
+	}
+}
+
 func TestProgrammaticPublicRouteRejectsInternalPurpose(t *testing.T) {
 	cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeOff)
 	cfg.ModelRoutes[0].Exposure = modelRouteExposurePublic

@@ -110,6 +110,9 @@ func normalizeAndValidatePolicyProfileConfig(profile *PolicyProfileConfig, path 
 	if containsControlCharacter(profile.PublicID) {
 		return configPathError(path+".public_id", "must not contain control characters")
 	}
+	if len(profile.PublicID) > policyStatsLabelMaxLen {
+		return configPathError(path+".public_id", "must be at most %d bytes", policyStatsLabelMaxLen)
+	}
 	if profile.Name = strings.TrimSpace(profile.Name); profile.Name == "" {
 		profile.Name = profile.PublicID
 	}

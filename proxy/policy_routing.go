@@ -51,6 +51,16 @@ func (p *compiledPolicyProfile) effectiveMode() policyMode {
 	return policyMode(p.mode.Load())
 }
 
+func (p *compiledPolicyProfile) statsID() string {
+	if p == nil {
+		return ""
+	}
+	if p.entry != nil && strings.TrimSpace(p.entry.id) != "" {
+		return p.entry.id
+	}
+	return strings.TrimSpace(p.config.PublicID)
+}
+
 func (p *compiledPolicyProfile) setEffectiveMode(mode policyMode) {
 	if p != nil {
 		p.mode.Store(uint32(mode))
@@ -183,7 +193,7 @@ func newChatPolicyRoutingController(h *ProxyHandler, cfg ProvidersConfig, global
 		if effectiveMode != policyModeOff {
 			preflightState = policyStatsPreflightPending
 		}
-		controller.stats.setProfileState(profileCfg.ID, policyStatsProfileState{
+		controller.stats.setProfileState(entry.id, policyStatsProfileState{
 			EffectiveMode:            effectiveMode.String(),
 			PreflightState:           preflightState,
 			BreakerState:             policyStatsBreakerClosed,
@@ -263,7 +273,7 @@ func (c *chatPolicyRoutingController) Initialize(ctx context.Context) error {
 		if err == nil {
 			for profileIndex, candidate := range profiles {
 				candidate.preflightReady.Store(true)
-				c.stats.setProfileState(candidate.config.ID, policyStatsProfileState{
+				c.stats.setProfileState(candidate.statsID(), policyStatsProfileState{
 					EffectiveMode:            candidate.effectiveMode().String(),
 					PreflightState:           policyStatsPreflightReady,
 					BreakerState:             policyStatsBreakerClosed,
@@ -276,7 +286,7 @@ func (c *chatPolicyRoutingController) Initialize(ctx context.Context) error {
 				if profileIndex == 0 && dispatchEvidence.dispatched.Load() {
 					physicalSends = 1
 				}
-				c.stats.record(policyStatsObservation{Profile: candidate.config.ID, TrafficBucket: policyStatsTrafficBucketPreflight, ClassifierOutcome: policyStatsClassifierCompletion, ClassifierLatency: latency, PhysicalClassifierSends: physicalSends})
+				c.stats.record(policyStatsObservation{Profile: candidate.statsID(), TrafficBucket: policyStatsTrafficBucketPreflight, ClassifierOutcome: policyStatsClassifierCompletion, ClassifierLatency: latency, PhysicalClassifierSends: physicalSends})
 			}
 			continue
 		}
@@ -295,7 +305,7 @@ func (c *chatPolicyRoutingController) Initialize(ctx context.Context) error {
 			if !hasEnforce {
 				candidate.setEffectiveMode(policyModeOff)
 			}
-			c.stats.setProfileState(candidate.config.ID, policyStatsProfileState{
+			c.stats.setProfileState(candidate.statsID(), policyStatsProfileState{
 				EffectiveMode:            candidate.effectiveMode().String(),
 				PreflightState:           policyStatsPreflightFailed,
 				BreakerState:             policyStatsBreakerClosed,
@@ -308,7 +318,7 @@ func (c *chatPolicyRoutingController) Initialize(ctx context.Context) error {
 			if profileIndex == 0 && dispatchEvidence.dispatched.Load() {
 				physicalSends = 1
 			}
-			c.stats.record(policyStatsObservation{Profile: candidate.config.ID, TrafficBucket: policyStatsTrafficBucketPreflight, ClassifierOutcome: policyStatsClassifierUnavailable, DropReason: failureCategory, ClassifierLatency: latency, PhysicalClassifierSends: physicalSends})
+			c.stats.record(policyStatsObservation{Profile: candidate.statsID(), TrafficBucket: policyStatsTrafficBucketPreflight, ClassifierOutcome: policyStatsClassifierUnavailable, DropReason: failureCategory, ClassifierLatency: latency, PhysicalClassifierSends: physicalSends})
 		}
 		if hasEnforce {
 			c.setDiagnostic(readinessMessage)
@@ -384,7 +394,7 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 	}
 	bucket := policyTrafficBucket(len(input.OriginalBody), facts.Counts.FunctionTools)
 	if mode == policyModeOff {
-		c.stats.record(policyStatsObservation{Profile: profile.config.ID, TrafficBucket: bucket, Eligible: true, ActualTier: profile.baselineTier.String()})
+		c.stats.record(policyStatsObservation{Profile: profile.statsID(), TrafficBucket: bucket, Eligible: true, ActualTier: profile.baselineTier.String()})
 		return c.sealPlan(profile, input, facts, profile.baselineTier, policyDecisionRecord{Category: "baseline", ActualTier: profile.baselineTier}), nil
 	}
 	if mode == policyModeObserve {
@@ -486,32 +496,32 @@ func (c *chatPolicyRoutingController) enforce(ctx context.Context, profile *comp
 
 func (c *chatPolicyRoutingController) launchObservation(ctx context.Context, profile *compiledPolicyProfile, input chatPolicyInput, facts policyClassifierFacts, bucket string) {
 	if ctx == nil || ctx.Err() != nil {
-		c.stats.record(policyStatsObservation{Profile: profile.config.ID, TrafficBucket: bucket, Eligible: true, DropReason: policyStatsDropReasonCanceled, ActualTier: profile.baselineTier.String()})
+		c.stats.record(policyStatsObservation{Profile: profile.statsID(), TrafficBucket: bucket, Eligible: true, DropReason: policyStatsDropReasonCanceled, ActualTier: profile.baselineTier.String()})
 		return
 	}
 	if !deterministicPolicySample(input.OperationID, profile.config.ID, profile.config.Classifier.ObserveSampleRate) {
-		c.stats.record(policyStatsObservation{Profile: profile.config.ID, TrafficBucket: bucket, Eligible: true, DropReason: policyStatsDropReasonNotSampled, ActualTier: profile.baselineTier.String()})
+		c.stats.record(policyStatsObservation{Profile: profile.statsID(), TrafficBucket: bucket, Eligible: true, DropReason: policyStatsDropReasonNotSampled, ActualTier: profile.baselineTier.String()})
 		return
 	}
 	lease, failure := profile.admission.tryAcquire()
 	if failure != policyClassifierFailureNone {
-		c.stats.record(policyStatsObservation{Profile: profile.config.ID, TrafficBucket: bucket, Eligible: true, Sampled: true, DropReason: policyFailureStatsReason(failure), ActualTier: profile.baselineTier.String()})
+		c.stats.record(policyStatsObservation{Profile: profile.statsID(), TrafficBucket: bucket, Eligible: true, Sampled: true, DropReason: policyFailureStatsReason(failure), ActualTier: profile.baselineTier.String()})
 		return
 	}
 	permit, ok := profile.breaker.tryAcquire()
 	if !ok {
 		lease.release()
 		c.refreshBreakerStats(profile.classifier.public.routeID)
-		c.stats.record(policyStatsObservation{Profile: profile.config.ID, TrafficBucket: bucket, Eligible: true, Sampled: true, DropReason: policyStatsDropReasonBreakerOpen, ActualTier: profile.baselineTier.String()})
+		c.stats.record(policyStatsObservation{Profile: profile.statsID(), TrafficBucket: bucket, Eligible: true, Sampled: true, DropReason: policyStatsDropReasonBreakerOpen, ActualTier: profile.baselineTier.String()})
 		return
 	}
 	if !c.h.beginLifecycleWorker() {
 		permit.releaseNeutral()
 		lease.release()
-		c.stats.record(policyStatsObservation{Profile: profile.config.ID, TrafficBucket: bucket, Eligible: true, Sampled: true, DropReason: policyStatsDropReasonCanceled, ActualTier: profile.baselineTier.String()})
+		c.stats.record(policyStatsObservation{Profile: profile.statsID(), TrafficBucket: bucket, Eligible: true, Sampled: true, DropReason: policyStatsDropReasonCanceled, ActualTier: profile.baselineTier.String()})
 		return
 	}
-	c.stats.record(policyStatsObservation{Profile: profile.config.ID, TrafficBucket: bucket, Eligible: true, Sampled: true, Admitted: true, ActualTier: profile.baselineTier.String()})
+	c.stats.record(policyStatsObservation{Profile: profile.statsID(), TrafficBucket: bucket, Eligible: true, Sampled: true, Admitted: true, ActualTier: profile.baselineTier.String()})
 	go func() {
 		defer c.h.endLifecycleWorker()
 		defer lease.release()
@@ -552,7 +562,7 @@ func completePolicyBreakerPermit(permit *policyBreakerPermit, result policyClass
 }
 
 func policyObservationForResult(profile *compiledPolicyProfile, bucket string, result policyClassifierResult, latency time.Duration, dispatched bool) policyStatsObservation {
-	observation := policyStatsObservation{Profile: profile.config.ID, TrafficBucket: bucket, ClassifierLatency: latency}
+	observation := policyStatsObservation{Profile: profile.statsID(), TrafficBucket: bucket, ClassifierLatency: latency}
 	if dispatched {
 		observation.PhysicalClassifierSends = 1
 	}
@@ -670,7 +680,7 @@ func (c *chatPolicyRoutingController) refreshBreakerStats(routeID string) {
 	}
 	state := profiles[0].breaker.state()
 	for _, profile := range profiles {
-		c.stats.setBreakerState(profile.config.ID, state)
+		c.stats.setBreakerState(profile.statsID(), state)
 	}
 }
 
@@ -738,7 +748,7 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 		}
 		if stats != nil {
 			if usage := readPolicyClassifierUsage(responseBody); !usage.isZero() {
-				stats.record(policyStatsObservation{Profile: profile.ID, TrafficBucket: policyStatsBucketFromContext(ctx), ClassifierUsage: usage})
+				stats.record(policyStatsObservation{Profile: profile.PublicID, TrafficBucket: policyStatsBucketFromContext(ctx), ClassifierUsage: usage})
 			}
 		}
 		return policyClassifierHTTPResponse{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: responseBody}, nil

@@ -361,7 +361,7 @@ func (c *policyStatsCollector) setProfileState(profile string, state policyStats
 	if c == nil {
 		return
 	}
-	profile = normalizePolicyStatsLabel(profile, policyStatsUnknownProfile)
+	profile = normalizePolicyStatsProfileLabel(profile, policyStatsUnknownProfile)
 	state = normalizePolicyStatsProfileState(state)
 
 	c.mu.Lock()
@@ -590,7 +590,7 @@ func (l policyStatsLatencyCounter) snapshot() policyStatsLatencySnapshot {
 
 func normalizePolicyStatsObservation(observation policyStatsObservation) (policyStatsNormalizedObservation, bool) {
 	normalized := policyStatsNormalizedObservation{
-		profile:                 normalizePolicyStatsLabel(observation.Profile, policyStatsUnknownProfile),
+		profile:                 normalizePolicyStatsProfileLabel(observation.Profile, policyStatsUnknownProfile),
 		trafficBucket:           normalizePolicyStatsLabel(observation.TrafficBucket, policyStatsUnspecifiedBucket),
 		eligible:                observation.Eligible,
 		sampled:                 observation.Sampled,
@@ -800,6 +800,22 @@ func normalizePolicyStatsGenerationHash(value string) string {
 	return strings.ToLower(value)
 }
 
+func normalizePolicyStatsProfileLabel(value, empty string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return empty
+	}
+	if len(value) > policyStatsLabelMaxLen {
+		return policyStatsInvalidLabel
+	}
+	for _, char := range value {
+		if char < 0x20 || char == 0x7f {
+			return policyStatsInvalidLabel
+		}
+	}
+	return value
+}
+
 func normalizePolicyStatsLabel(value, empty string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -875,7 +891,7 @@ func (c *policyStatsCollector) setBreakerState(profile, state string) {
 	if c == nil {
 		return
 	}
-	profile = normalizePolicyStatsLabel(profile, policyStatsUnknownProfile)
+	profile = normalizePolicyStatsProfileLabel(profile, policyStatsUnknownProfile)
 	state = normalizePolicyStatsBreakerState(state)
 	c.mu.Lock()
 	defer c.mu.Unlock()

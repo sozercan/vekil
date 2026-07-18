@@ -169,6 +169,27 @@ func TestPolicyStatsCollectorUsesFixedDropClassifierAndTierEnums(t *testing.T) {
 	}
 }
 
+func TestPolicyStatsCollectorPreservesLegalPublicProfileIDs(t *testing.T) {
+	collector := newPolicyStatsCollector()
+	for _, profile := range []string{"coding economy", "编码 模型"} {
+		collector.setProfileState(profile, policyStatsProfileState{EffectiveMode: policyStatsModeObserve})
+		collector.record(policyStatsObservation{Profile: profile, TrafficBucket: "bytes_le_4k/tools_0", Eligible: true})
+	}
+	snapshot := collector.snapshot()
+	if len(snapshot.Profiles) != 2 {
+		t.Fatalf("profiles = %+v", snapshot.Profiles)
+	}
+	got := map[string]bool{}
+	for _, profile := range snapshot.Profiles {
+		got[profile.Profile] = true
+	}
+	for _, want := range []string{"coding economy", "编码 模型"} {
+		if !got[want] {
+			t.Fatalf("profiles = %+v, missing %q", snapshot.Profiles, want)
+		}
+	}
+}
+
 func TestPolicyStatsCollectorValidatesProfileStateAndGenerationHashes(t *testing.T) {
 	collector := newPolicyStatsCollector()
 	collector.setProfileState(" p ", policyStatsProfileState{
@@ -289,7 +310,7 @@ func TestPolicyStatsCollectorBoundsProfileAndTrafficBucketCardinality(t *testing
 func TestPolicyStatsCollectorValidatesAndBoundsLabels(t *testing.T) {
 	collector := newPolicyStatsCollector()
 	collector.record(policyStatsObservation{
-		Profile:       "profile with spaces and RAW-CONTENT-SENTINEL",
+		Profile:       "profile\x00RAW-CONTENT-SENTINEL",
 		TrafficBucket: "bucket\nRAW-OUTPUT",
 		Eligible:      true,
 	})
@@ -439,7 +460,7 @@ func TestPolicyStatsCollectorNilZeroValueAndEmptyObservationAreSafe(t *testing.T
 
 func TestPolicyStatsCollectorSnapshotNeverRetainsContentFieldsOrInvalidValues(t *testing.T) {
 	collector := newPolicyStatsCollector()
-	collector.setProfileState("profile RAW_CONTENT_SENTINEL", policyStatsProfileState{
+	collector.setProfileState("profile\x00RAW_CONTENT_SENTINEL", policyStatsProfileState{
 		EffectiveMode:            "rationale from model",
 		ConfigGenerationHash:     "invalid-generation-value",
 		ProfileGenerationHash:    "raw classifier output",
@@ -447,7 +468,7 @@ func TestPolicyStatsCollectorSnapshotNeverRetainsContentFieldsOrInvalidValues(t 
 		BinaryGenerationHash:     "facts from user",
 	})
 	collector.record(policyStatsObservation{
-		Profile:           "profile RAW_CONTENT_SENTINEL",
+		Profile:           "profile\x00RAW_CONTENT_SENTINEL",
 		TrafficBucket:     "bucket RAW_OUTPUT",
 		DropReason:        "rationale-from-model",
 		ClassifierOutcome: "classifier-output: powerful",
