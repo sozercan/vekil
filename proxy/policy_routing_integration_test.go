@@ -1082,7 +1082,7 @@ func TestPolicyTerminalStreamErrorIsSanitized(t *testing.T) {
 func TestPolicyPrecommitStreamErrorIsSanitized(t *testing.T) {
 	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypePlanning, CodeScope: policyCodeScopeMultiFile, RiskLevel: policyRiskLevelHigh})
 	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
-	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")), WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)), WithPolicyRoutingMode(PolicyRoutingModeEnforce))
+	h, err := NewProxyHandler(nil, nil, WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)), WithPolicyRoutingMode(PolicyRoutingModeEnforce))
 	if err != nil {
 		t.Fatal(err)
 	}

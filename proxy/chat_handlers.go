@@ -2088,7 +2088,9 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 				observeOpenAIUsage(r.Context(), executionErr.Usage)
 			}
 			statusCode := upstreamStatusCode(err, http.StatusBadGateway)
-			h.log.Error("policy terminal request failed", logger.F("endpoint", "openai"), logger.Err(err))
+			if h.log != nil {
+				h.log.Error("policy terminal request failed", logger.F("endpoint", "openai"), logger.Err(err))
+			}
 			writePolicyChatSanitizedError(w, statusCode, policyChatErrorHeaders(err), responseModel)
 			return
 		}
