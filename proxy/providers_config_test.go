@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -226,49 +227,82 @@ func TestResolveStaticProviderModelHonorsFiltersAndRejectsCollisions(t *testing.
 }
 
 func TestResolveStaticProviderModelResolvesExplicitRouteMetadata(t *testing.T) {
-	parallelToolCalls := true
-	contextWindow := int64(200000)
+	for _, schemaVersion := range []int{ProvidersConfigSchemaVersion2, ProvidersConfigSchemaVersion3} {
+		t.Run(fmt.Sprintf("schema_%d", schemaVersion), func(t *testing.T) {
+			parallelToolCalls := true
+			contextWindow := int64(200000)
+			route := ModelRouteConfig{
+				ID:                "route",
+				PublicID:          "public-model",
+				Name:              "Public Model",
+				Endpoints:         []string{"/responses"},
+				ReasoningEffort:   []string{"low", "high"},
+				ParallelToolCalls: &parallelToolCalls,
+				ContextWindow:     &contextWindow,
+				Targets: []ModelRouteTargetConfig{{
+					ID:            "primary",
+					Provider:      "azure",
+					UpstreamModel: "deployment",
+				}},
+			}
+			if schemaVersion == ProvidersConfigSchemaVersion3 {
+				route.Exposure = modelRouteExposurePublic
+			}
+			cfg := ProvidersConfig{
+				SchemaVersion: schemaVersion,
+				Providers: []ProviderConfig{{
+					ID:      "azure",
+					Type:    "azure-openai",
+					BaseURL: "https://x.openai.azure.com/openai/v1",
+					APIKey:  "test-key",
+				}},
+				ModelRoutes: []ModelRouteConfig{route},
+			}
+
+			got, ok, err := ResolveStaticProviderModel(cfg, "public-model")
+			if err != nil {
+				t.Fatalf("ResolveStaticProviderModel() error = %v", err)
+			}
+			if !ok {
+				t.Fatal("ResolveStaticProviderModel() found = false, want explicit route metadata")
+			}
+			if got.PublicID != "public-model" || got.Name != "Public Model" {
+				t.Fatalf("resolved identity = %#v", got)
+			}
+			if !reflect.DeepEqual(got.Endpoints, []string{"/responses"}) ||
+				!reflect.DeepEqual(got.ReasoningEffort, []string{"low", "high"}) {
+				t.Fatalf("resolved route metadata = %#v", got)
+			}
+			if got.ParallelToolCalls == nil || !*got.ParallelToolCalls ||
+				got.ContextWindow == nil || *got.ContextWindow != contextWindow {
+				t.Fatalf("resolved route capabilities = %#v", got)
+			}
+		})
+	}
+}
+
+func TestResolveStaticProviderModelExcludesSchemaV3InternalRoute(t *testing.T) {
 	cfg := ProvidersConfig{
-		SchemaVersion: ProvidersConfigSchemaVersion2,
+		SchemaVersion: ProvidersConfigSchemaVersion3,
 		Providers: []ProviderConfig{{
-			ID:      "azure",
-			Type:    "azure-openai",
-			BaseURL: "https://x.openai.azure.com/openai/v1",
-			APIKey:  "test-key",
+			ID:       "upstream",
+			Type:     "openai-compatible",
+			BaseURL:  "https://upstream.example.test/v1",
+			AuthType: "none",
 		}},
 		ModelRoutes: []ModelRouteConfig{{
-			ID:                "route",
-			PublicID:          "public-model",
-			Name:              "Public Model",
-			Endpoints:         []string{"/responses"},
-			ReasoningEffort:   []string{"low", "high"},
-			ParallelToolCalls: &parallelToolCalls,
-			ContextWindow:     &contextWindow,
+			ID:        "internal-route",
+			Exposure:  modelRouteExposureInternal,
+			Endpoints: []string{"/chat/completions"},
 			Targets: []ModelRouteTargetConfig{{
 				ID:            "primary",
-				Provider:      "azure",
-				UpstreamModel: "deployment",
+				Provider:      "upstream",
+				UpstreamModel: "physical-model",
 			}},
 		}},
 	}
-
-	got, ok, err := ResolveStaticProviderModel(cfg, "public-model")
-	if err != nil {
-		t.Fatalf("ResolveStaticProviderModel() error = %v", err)
-	}
-	if !ok {
-		t.Fatal("ResolveStaticProviderModel() found = false, want explicit route metadata")
-	}
-	if got.PublicID != "public-model" || got.Name != "Public Model" {
-		t.Fatalf("resolved identity = %#v", got)
-	}
-	if !reflect.DeepEqual(got.Endpoints, []string{"/responses"}) ||
-		!reflect.DeepEqual(got.ReasoningEffort, []string{"low", "high"}) {
-		t.Fatalf("resolved route metadata = %#v", got)
-	}
-	if got.ParallelToolCalls == nil || !*got.ParallelToolCalls ||
-		got.ContextWindow == nil || *got.ContextWindow != contextWindow {
-		t.Fatalf("resolved route capabilities = %#v", got)
+	if _, ok, err := ResolveStaticProviderModel(cfg, "internal-route"); err != nil || ok {
+		t.Fatalf("ResolveStaticProviderModel(internal) = ok %v, err %v; want false, nil", ok, err)
 	}
 }
 

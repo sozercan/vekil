@@ -283,13 +283,17 @@ func ResolveStaticProviderModel(cfg ProvidersConfig, modelID string) (ProviderMo
 	if modelID == "" {
 		return ProviderModelConfig{}, false, nil
 	}
-	if cfg.EffectiveSchemaVersion() == ProvidersConfigSchemaVersion2 {
+	schemaVersion := cfg.EffectiveSchemaVersion()
+	if schemaVersion == ProvidersConfigSchemaVersion2 || providersConfigSchemaSupportsPolicyRouting(schemaVersion) {
 		validated, err := validateAndNormalizeProvidersConfig(cfg)
 		if err != nil {
 			return ProviderModelConfig{}, false, err
 		}
 		cfg = validated.config
 		for _, route := range cfg.ModelRoutes {
+			if providersConfigSchemaSupportsPolicyRouting(schemaVersion) && route.Exposure != modelRouteExposurePublic {
+				continue
+			}
 			if strings.TrimSpace(route.PublicID) != modelID {
 				continue
 			}
@@ -830,8 +834,9 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 
 // providerMayExposeAllowedModel reports whether provider must participate in
 // allowed-model discovery. Unlike providerWithinAllowedModelScope, it ignores
-// current ownership so every dynamic candidate is checked for collisions
-// before the selected model is trusted.
+// current ownership so dynamic candidates are checked for collisions before the
+// selected model is trusted. Explicitly reserved policy owners are the exception:
+// managed launches do not discover unrelated providers for those IDs.
 func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) bool {
 	if provider == nil {
 		return false
@@ -842,6 +847,9 @@ func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) 
 	setup := h.providerSetup()
 	for model := range h.allowedModels {
 		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+			// A policy public ID is an explicit reserved owner in launcher scope.
+			// Unrelated dynamic providers cannot displace it and must not force
+			// provider discovery or credentials for the managed launch.
 			continue
 		}
 		if providerCanExposeModel(provider, model) {
@@ -861,6 +869,8 @@ func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime
 	setup := h.providerSetup()
 	for model := range h.allowedModels {
 		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+			// Policy readiness is owned by the policy preflight, not by unrelated
+			// dynamic-provider catalogs.
 			continue
 		}
 		if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
@@ -1690,6 +1700,8 @@ func (h *ProxyHandler) ModelUsesCopilot(model string) bool {
 	setup := h.providerSetup()
 	model = strings.TrimSpace(model)
 	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+		// Policy destinations and classifiers cannot be Copilot providers. The
+		// reserved policy owner therefore never requires Copilot authentication.
 		return false
 	}
 	if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {

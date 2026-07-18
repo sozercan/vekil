@@ -1181,6 +1181,56 @@ func TestRunLaunchCommandDryRunUsesConfiguredStaticModelMetadata(t *testing.T) {
 	})
 }
 
+func TestResolveLaunchDryRunModelInfoResolvesSchemaV3PublicRoute(t *testing.T) {
+	parallel := true
+	cfg := proxy.ProvidersConfig{
+		SchemaVersion: 3,
+		Providers: []proxy.ProviderConfig{{
+			ID:       "upstream",
+			Type:     "openai-compatible",
+			BaseURL:  "https://upstream.example.test/v1",
+			AuthType: "none",
+		}},
+		ModelRoutes: []proxy.ModelRouteConfig{
+			{
+				ID:                "public-route",
+				Exposure:          "public",
+				PublicID:          "public-route-model",
+				Name:              "Public Route Model",
+				Endpoints:         []string{"/responses"},
+				ParallelToolCalls: &parallel,
+				Targets: []proxy.ModelRouteTargetConfig{{
+					ID:            "primary",
+					Provider:      "upstream",
+					UpstreamModel: "physical-model",
+				}},
+			},
+			{
+				ID:        "internal-route",
+				Exposure:  "internal",
+				Endpoints: []string{"/chat/completions"},
+				Targets: []proxy.ModelRouteTargetConfig{{
+					ID:            "internal",
+					Provider:      "upstream",
+					UpstreamModel: "internal-model",
+				}},
+			},
+		},
+	}
+
+	model, found, err := resolveLaunchDryRunModelInfo(cfg, "public-route-model")
+	if err != nil {
+		t.Fatalf("resolveLaunchDryRunModelInfo() error = %v", err)
+	}
+	if !found || model.ID != "public-route-model" || model.Name != "Public Route Model" ||
+		!slices.Equal(model.SupportedEndpoints, []string{"/responses"}) || !model.Capabilities.Supports.ParallelToolCalls {
+		t.Fatalf("resolved schema-v3 route metadata = %+v, found=%v", model, found)
+	}
+	if _, found, err := resolveLaunchDryRunModelInfo(cfg, "internal-route"); err != nil || found {
+		t.Fatalf("internal route dry-run resolution = found %v, err %v; want false, nil", found, err)
+	}
+}
+
 func TestRunLaunchCommandDryRunUsesPolicyOwnershipMetadata(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
