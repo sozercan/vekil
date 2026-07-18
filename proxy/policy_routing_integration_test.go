@@ -121,6 +121,11 @@ func newPolicyIntegrationUpstream(t *testing.T, signals policyClassifierSignals)
 			_, _ = fmt.Fprint(w, "data: {\"id\":\"terminal-stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"ignored\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n")
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Openai-Model", request.Model)
+		w.Header().Set("X-Azure-Request-ID", "azure-terminal-success")
+		w.Header().Set("OpenAI-Processing-Ms", "21")
+		w.Header().Set("X-Vekil-Internal-Route", "terminal-route")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id":      "terminal-response",
 			"object":  "chat.completion",
@@ -1184,6 +1189,37 @@ func TestPolicyResponsesReplayIDRejectedBeforeClassifierSend(t *testing.T) {
 					t.Fatalf("powerful sends=%d", sends)
 				}
 			})
+		}
+	}
+}
+
+func TestPolicyTerminalSuccessHeadersAreSanitized(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	h, err := NewProxyHandler(nil, nil, WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)), WithPolicyRoutingMode(PolicyRoutingModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"coding-economy","messages":[{"role":"user","content":"hello"}]}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type=%q", got)
+	}
+	if got := recorder.Header().Get("Openai-Model"); got != "coding-economy" {
+		t.Fatalf("Openai-Model=%q", got)
+	}
+	if got := recorder.Header().Get("X-Request-ID"); got != "terminal-provider-region-request" {
+		t.Fatalf("X-Request-ID=%q", got)
+	}
+	for _, name := range []string{"X-Azure-Request-ID", "OpenAI-Processing-Ms", "X-Vekil-Internal-Route"} {
+		if got := recorder.Header().Get(name); got != "" {
+			t.Fatalf("%s=%q", name, got)
 		}
 	}
 }

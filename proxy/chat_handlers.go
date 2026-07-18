@@ -1994,6 +1994,23 @@ func policyChatSafeHeaders(src http.Header, publicModel string) http.Header {
 	return dst
 }
 
+func policyChatSuccessHeaders(src http.Header, publicModel string) http.Header {
+	dst := policyChatSafeHeaders(src, publicModel)
+	for _, name := range []string{"Content-Type", "Content-Length", "Content-Encoding"} {
+		values := src.Values(name)
+		if len(values) == 0 {
+			continue
+		}
+		if dst == nil {
+			dst = make(http.Header)
+		}
+		for _, value := range values {
+			dst.Add(name, value)
+		}
+	}
+	return dst
+}
+
 func policyChatInteger(value string) bool {
 	if value == "" {
 		return false
@@ -2352,8 +2369,11 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		},
 		passthrough: func(resp *http.Response) error {
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentProtocolFrame)
-			if policyPlan.valid() && resp != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices) {
-				return writePolicyChatTerminalError(w, resp, responseModel)
+			if policyPlan.valid() && resp != nil {
+				if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+					return writePolicyChatTerminalError(w, resp, responseModel)
+				}
+				resp.Header = policyChatSuccessHeaders(resp.Header, responseModel)
 			}
 			return h.maybeWriteOptimizedOpenAIChatPassthrough(r.Context(), w, resp, responseModel, h.toolContexts, scope)
 		},
