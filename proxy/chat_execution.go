@@ -78,43 +78,66 @@ func (h *ProxyHandler) executeChatCompletions(ctx context.Context, chatBody []by
 	return result, err
 }
 
+func rawJSONFieldsExactOrFold(object map[string]json.RawMessage, name string) []json.RawMessage {
+	if raw, ok := object[name]; ok {
+		return []json.RawMessage{raw}
+	}
+	var matches []json.RawMessage
+	for candidate, raw := range object {
+		if strings.EqualFold(candidate, name) {
+			matches = append(matches, raw)
+		}
+	}
+	return matches
+}
+
 func chatRequestContainsResponsesReplayID(body []byte) bool {
 	var request map[string]json.RawMessage
 	if json.Unmarshal(body, &request) != nil {
 		return false
 	}
-	var messages []json.RawMessage
-	if json.Unmarshal(request["messages"], &messages) != nil {
-		return false
-	}
-	for _, rawMessage := range messages {
-		var message map[string]json.RawMessage
-		if json.Unmarshal(rawMessage, &message) != nil {
+	for _, rawMessages := range rawJSONFieldsExactOrFold(request, "messages") {
+		var messages []json.RawMessage
+		if json.Unmarshal(rawMessages, &messages) != nil {
 			continue
 		}
-		var role string
-		if json.Unmarshal(message["role"], &role) != nil {
-			continue
-		}
-		switch strings.TrimSpace(role) {
-		case "tool":
-			var callID string
-			if json.Unmarshal(message["tool_call_id"], &callID) == nil && isResponsesChatReplayCallID(callID) {
-				return true
-			}
-		case "assistant":
-			var calls []json.RawMessage
-			if json.Unmarshal(message["tool_calls"], &calls) != nil {
+		for _, rawMessage := range messages {
+			var message map[string]json.RawMessage
+			if json.Unmarshal(rawMessage, &message) != nil {
 				continue
 			}
-			for _, rawCall := range calls {
-				var call map[string]json.RawMessage
-				if json.Unmarshal(rawCall, &call) != nil {
+			for _, rawRole := range rawJSONFieldsExactOrFold(message, "role") {
+				var role string
+				if json.Unmarshal(rawRole, &role) != nil {
 					continue
 				}
-				var callID string
-				if json.Unmarshal(call["id"], &callID) == nil && isResponsesChatReplayCallID(callID) {
-					return true
+				switch strings.TrimSpace(role) {
+				case "tool":
+					for _, rawCallID := range rawJSONFieldsExactOrFold(message, "tool_call_id") {
+						var callID string
+						if json.Unmarshal(rawCallID, &callID) == nil && isResponsesChatReplayCallID(callID) {
+							return true
+						}
+					}
+				case "assistant":
+					for _, rawCalls := range rawJSONFieldsExactOrFold(message, "tool_calls") {
+						var calls []json.RawMessage
+						if json.Unmarshal(rawCalls, &calls) != nil {
+							continue
+						}
+						for _, rawCall := range calls {
+							var call map[string]json.RawMessage
+							if json.Unmarshal(rawCall, &call) != nil {
+								continue
+							}
+							for _, rawCallID := range rawJSONFieldsExactOrFold(call, "id") {
+								var callID string
+								if json.Unmarshal(rawCallID, &callID) == nil && isResponsesChatReplayCallID(callID) {
+									return true
+								}
+							}
+						}
+					}
 				}
 			}
 		}

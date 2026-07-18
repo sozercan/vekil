@@ -1162,6 +1162,7 @@ func TestPolicyResponsesReplayIDRejectedBeforeClassifierSend(t *testing.T) {
 		{name: "well_typed", body: `{"model":"coding-economy","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`},
 		{name: "unrelated_type_error", body: `{"model":"coding-economy","messages":[{"role":"user","content":"hello","tool_call_id":123},{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`},
 		{name: "case_folded_siblings", body: `{"model":"coding-economy","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","ID":123,"type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}],"MESSAGES":123}`},
+		{name: "case_insensitive_keys", body: `{"model":"coding-economy","messages":[{"Role":"assistant","Tool_Calls":[{"ID":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"Role":"tool","Tool_Call_ID":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`},
 	}
 	for _, mode := range modes {
 		for _, request := range bodies {
