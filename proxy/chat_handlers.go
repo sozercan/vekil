@@ -644,6 +644,10 @@ func attachExplicitChatExecutionErrorRoute(err error, route *modelRoute, target 
 // execution attaches this operation to its upstream context and reuses it via
 // withExplicitRouteOperation.
 func (h *ProxyHandler) withAdmittedExplicitRouteOperation(ctx, inbound context.Context, model, endpoint string) (context.Context, *routeOperation, *modelRoute, error) {
+	model = strings.TrimSpace(model)
+	if model != "" && !h.modelAllowedForRequest(model, endpoint) {
+		return ctx, nil, nil, modelNotAllowedRequestError(model)
+	}
 	route, known := h.resolveModelRouteForRequest(model, endpoint)
 	if !known || route == nil || route.legacy {
 		return ctx, nil, route, nil

@@ -18,7 +18,7 @@ The dashboard polls `GET /stats.json` once per second and renders:
 - **Time series** — requests/sec (with an errors/sec overlay) and tokens/sec (prompt vs. completion) over a rolling window, drawn with [uPlot](https://github.com/leeoniya/uPlot).
 - **Total usage** — cumulative requests, total/prompt/completion tokens, cached-prompt %, reasoning tokens, average tokens per request, and errors.
 - **Breakdowns** — top models, providers, and agents, each with request count, token volume, error count, and average latency. A controls bar lets you **sort by** requests / tokens / errors / latency and **filter** by name (e.g. `gpt-5.4-pro` to inspect one model). Sorting by errors or latency hides rows with none. The JSON snapshot additionally includes `by_route` client-request rows and `by_target` physical-attempt rows for external tooling.
-- **Policy routing** — per-profile eligibility, observe sampling/admission, capacity drops, classifier outcomes/latency/cost, selected/fallback tier distribution, and classifier-route health for schema-v3 policy profiles.
+- **Policy routing JSON telemetry** — `GET /stats.json` exposes per-profile eligibility, observe sampling/admission, capacity drops, classifier outcomes/latency/token usage, selected/fallback tier distribution, and classifier-route health for schema-v3 policy profiles. The browser dashboard does not yet render a dedicated policy-routing panel.
 - **Errors** — a status-class distribution (2xx/3xx/4xx/5xx) plus exact error status codes and error-by-provider/model attribution.
 - **Recent requests** — a drill-down log of the most recent logical requests (newest first) with status, model, agent, latency, tokens, and the final/canonical upstream request ID. Has an *errors only* toggle, honors the breakdown filter, and lets you click a request ID to copy it for correlating with upstream logs. Each JSON row also carries `operation_id`, `route_id`, `final_target`, `upstream_sends`, and `target_switches` when route data exists.
 
@@ -28,9 +28,9 @@ The dashboard polls `GET /stats.json` once per second and renders:
 
 Route/failover metrics are additive in `GET /stats.json`: `upstream_attempts`, `target_switches`, `requests_with_failover`, `successful_failovers`, `route_exhaustions`, `state_binding_hits`, `state_binding_misses`, and `state_binding_evictions`. `by_route` adds client-request aggregates plus failover counters; `by_target` reports physical send counts. The websocket bridge still records each provider-backed `response.create` once in client totals, but its route-level client row/recent-row enrichment is limited: websocket physical sends and switches appear in `upstream_attempts`, `target_switches`, and `by_target`, while `requests_with_failover`, `successful_failovers`, and `by_route` are populated from HTTP request summaries.
 
-### Policy-routing telemetry
+### Policy-routing telemetry (`GET /stats.json`)
 
-Policy telemetry is additive and bounded. It is grouped by policy profile plus declared request-size and tool-count traffic buckets, and reports:
+Policy telemetry is currently JSON-only; the browser dashboard does not render a dedicated policy panel. It is additive and bounded. It is grouped by policy profile plus declared request-size and tool-count traffic buckets, and reports:
 
 - eligible, deterministically sampled, and admitted requests;
 - exact not-sampled and non-blocking capacity-drop reasons;

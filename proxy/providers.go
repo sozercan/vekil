@@ -275,6 +275,135 @@ func sniffProvidersConfigSchemaVersionYAML(body []byte) int {
 	return header.SchemaVersion
 }
 
+// ResolveStaticProviderModel returns normalized metadata for an explicitly
+// configured static model without contacting an upstream provider. Dynamic
+// catalog entries are intentionally unresolved until provider discovery runs.
+func ResolveStaticProviderModel(cfg ProvidersConfig, modelID string) (ProviderModelConfig, bool, error) {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return ProviderModelConfig{}, false, nil
+	}
+	if cfg.EffectiveSchemaVersion() == ProvidersConfigSchemaVersion2 {
+		validated, err := validateAndNormalizeProvidersConfig(cfg)
+		if err != nil {
+			return ProviderModelConfig{}, false, err
+		}
+		cfg = validated.config
+		for _, route := range cfg.ModelRoutes {
+			if strings.TrimSpace(route.PublicID) != modelID {
+				continue
+			}
+			resolved := ProviderModelConfig{
+				PublicID:            modelID,
+				Name:                strings.TrimSpace(route.Name),
+				Endpoints:           append([]string(nil), route.Endpoints...),
+				ModelPickerEnabled:  cloneBoolPtr(route.ModelPickerEnabled),
+				ModelPickerCategory: strings.TrimSpace(route.ModelPickerCategory),
+				ReasoningEffort:     append([]string(nil), route.ReasoningEffort...),
+				Vision:              cloneBoolPtr(route.Vision),
+				ParallelToolCalls:   cloneBoolPtr(route.ParallelToolCalls),
+				DropSamplingParams:  cloneBoolPtr(route.DropSamplingParams),
+				ContextWindow:       route.ContextWindow,
+			}
+			if resolved.Name == "" {
+				resolved.Name = modelID
+			}
+			return resolved, true, nil
+		}
+	}
+
+	var resolved ProviderModelConfig
+	resolvedProviderID := ""
+	for _, providerCfg := range cfg.Providers {
+		providerID := strings.TrimSpace(providerCfg.ID)
+		if providerID == "" {
+			return ProviderModelConfig{}, false, fmt.Errorf("provider id is required")
+		}
+		kind := providerType(strings.TrimSpace(providerCfg.Type))
+		switch kind {
+		case providerTypeAzureOpenAI:
+		case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+			discovery, err := configuredProviderModelDiscovery(kind, providerCfg.ModelDiscovery)
+			if err != nil {
+				return ProviderModelConfig{}, false, fmt.Errorf("provider %q: %w", providerID, err)
+			}
+			if discovery != providerModelDiscoveryStatic {
+				// Models on dynamic generic providers are metadata overlays. They
+				// materialize only when the upstream/deployment appears in the
+				// discovered catalog, so dry-run cannot resolve them statically.
+				continue
+			}
+		case providerTypeCopilot, providerTypeOpenAICodex:
+			// These providers are catalog-driven; their Models fields are not
+			// part of the configured static model table.
+			continue
+		default:
+			return ProviderModelConfig{}, false, fmt.Errorf("provider %q has unsupported type %q", providerID, providerCfg.Type)
+		}
+		if !configuredProviderAllowsModel(providerCfg, modelID) {
+			continue
+		}
+
+		matchedProvider := false
+		for _, rawModel := range providerCfg.Models {
+			if strings.TrimSpace(rawModel.PublicID) != modelID {
+				continue
+			}
+			if matchedProvider {
+				return ProviderModelConfig{}, false, fmt.Errorf("provider %q configures model %q more than once", providerID, modelID)
+			}
+			matchedProvider = true
+
+			model, err := buildStaticProviderModel(
+				providerID,
+				rawModel,
+				providerEndpointPolicyFor(kind).defaultStaticEndpoints(),
+			)
+			if err != nil {
+				return ProviderModelConfig{}, false, err
+			}
+			if resolvedProviderID != "" {
+				return ProviderModelConfig{}, false, providerModelCollisionError(modelID, resolvedProviderID, providerID)
+			}
+
+			resolved = normalizeProviderModelConfig(rawModel)
+			resolved.PublicID = model.publicID
+			resolved.Deployment = model.upstreamModel
+			if resolved.Name == "" {
+				resolved.Name = model.publicID
+			}
+			resolved.Endpoints = append([]string(nil), model.supportedEndpoints...)
+			resolvedProviderID = providerID
+		}
+	}
+
+	return resolved, resolvedProviderID != "", nil
+}
+
+func configuredProviderAllowsModel(cfg ProviderConfig, model string) bool {
+	hasIncludes := false
+	included := false
+	for _, candidate := range cfg.IncludeModels {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		hasIncludes = true
+		if candidate == model {
+			included = true
+		}
+	}
+	if hasIncludes && !included {
+		return false
+	}
+	for _, candidate := range cfg.ExcludeModels {
+		if strings.TrimSpace(candidate) == model {
+			return false
+		}
+	}
+	return true
+}
+
 func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) error {
 	if len(bytes.TrimSpace(body)) == 0 {
 		return fmt.Errorf("providers config %q is empty", path)
@@ -675,7 +804,7 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 	replacements := make(map[string][]providerModel)
 	for _, providerID := range setup.providerOrder {
 		provider := setup.providerByID(providerID)
-		if !providerUsesDynamicModels(provider) {
+		if !h.providerMayExposeAllowedModel(provider) || !providerUsesDynamicModels(provider) {
 			continue
 		}
 
@@ -683,7 +812,7 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 		if err != nil {
 			return fmt.Errorf("load models for provider %q: %w", provider.id, err)
 		}
-		replacements[providerID] = result.models
+		replacements[providerID] = h.filterAllowedModels(result.models)
 	}
 	if err := setup.replaceProviderModelsBatch(replacements); err != nil {
 		return err
@@ -692,6 +821,78 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 	h.dynamicProviderValidationPending.Store(false)
 	h.validateInsightModel()
 	return nil
+}
+
+// providerMayExposeAllowedModel reports whether provider must participate in
+// allowed-model discovery. Unlike providerWithinAllowedModelScope, it ignores
+// current ownership so every dynamic candidate is checked for collisions
+// before the selected model is trusted.
+func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) bool {
+	if provider == nil {
+		return false
+	}
+	if len(h.allowedModels) == 0 {
+		return true
+	}
+	for model := range h.allowedModels {
+		if providerCanExposeModel(provider, model) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime) bool {
+	if provider == nil {
+		return false
+	}
+	if len(h.allowedModels) == 0 {
+		return true
+	}
+	setup := h.providerSetup()
+	for model := range h.allowedModels {
+		if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
+			for _, target := range route.targets {
+				if target.provider != nil && target.provider.id == provider.id {
+					return true
+				}
+			}
+			continue
+		}
+		if owner, ok := setup.lookupModel(model); ok {
+			if owner.providerID == provider.id {
+				return true
+			}
+			continue
+		}
+		if providerCanExposeModel(provider, model) {
+			return true
+		}
+	}
+	return false
+}
+
+func providerCanExposeModel(provider *providerRuntime, model string) bool {
+	if provider == nil || !provider.allowsModel(model) {
+		return false
+	}
+	if _, ok := provider.staticConfigs[model]; ok {
+		return true
+	}
+	return providerUsesDynamicModels(provider)
+}
+
+func (h *ProxyHandler) filterAllowedModels(models []providerModel) []providerModel {
+	if len(h.allowedModels) == 0 {
+		return models
+	}
+	filtered := make([]providerModel, 0, len(models))
+	for _, model := range models {
+		if _, ok := h.allowedModels[model.publicID]; ok {
+			filtered = append(filtered, model)
+		}
+	}
+	return filtered
 }
 
 func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*providerRuntime, []string, string, error) {
@@ -1358,6 +1559,10 @@ func synthesizeProviderModelRaw(providerID, publicID, name string, endpoints []s
 }
 
 func (h *ProxyHandler) resolveProviderModel(model, endpoint string) (*providerRuntime, providerModel, bool) {
+	model = strings.TrimSpace(model)
+	if !h.modelAllowedForRequest(model, endpoint) {
+		return nil, providerModel{publicID: model, upstreamModel: model}, false
+	}
 	if route, known := h.resolveModelRouteForRequest(model, endpoint); known && route != nil {
 		target, ok := route.primaryTarget()
 		if !ok || target.provider == nil {
@@ -1442,6 +1647,64 @@ func (ps *providerSetup) resolveReservedModelIdentity(model string) (*providerRu
 		owner.providerID = provider.id
 	}
 	return provider, owner, true
+}
+
+func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
+	if h == nil || len(h.allowedModels) == 0 {
+		return true
+	}
+	model = strings.TrimSpace(model)
+	if _, ok := h.allowedModels[model]; ok {
+		return true
+	}
+	if endpoint != providerEndpointMessages {
+		return false
+	}
+	if _, rawKnown := h.providerSetup().lookupModel(model); rawKnown {
+		return false
+	}
+	normalizedModel := NormalizeModelName(model)
+	if normalizedModel == model {
+		return false
+	}
+	_, ok := h.allowedModels[normalizedModel]
+	return ok
+}
+
+// ModelUsesCopilot reports whether startup must authenticate Copilot to resolve
+// or collision-check the selected public model. Provider filters exclude
+// Copilot from this decision when it cannot expose the model.
+func (h *ProxyHandler) ModelUsesCopilot(model string) bool {
+	setup := h.providerSetup()
+	model = strings.TrimSpace(model)
+	if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
+		for _, target := range route.targets {
+			if target.provider != nil && target.provider.kind == providerTypeCopilot {
+				return true
+			}
+		}
+	}
+	for _, providerID := range setup.providerOrder {
+		provider := setup.providerByID(providerID)
+		if provider == nil || provider.kind != providerTypeCopilot {
+			continue
+		}
+		if owner, ok := setup.lookupModel(model); ok && owner.providerID == provider.id {
+			return true
+		}
+		if providerCanExposeModel(provider, model) {
+			return true
+		}
+	}
+	return false
+}
+
+func modelNotAllowedRequestError(model string) error {
+	return &providerRequestError{
+		statusCode: http.StatusBadRequest,
+		err:        fmt.Errorf("model %q is not allowed by this proxy", strings.TrimSpace(model)),
+	}
+
 }
 
 func (h *ProxyHandler) resolveProviderModelForRequest(model, endpoint string) (*providerRuntime, providerModel, bool) {

@@ -68,8 +68,23 @@ func (r *publicModelEntryRegistry) lookup(model string) (*publicModelEntry, bool
 	if entry, ok := snapshot.byID[model]; ok {
 		return entry, true
 	}
-	entry, ok := snapshot.aliases[model]
-	return entry, ok
+	if entry, ok := snapshot.aliases[model]; ok {
+		return entry, true
+	}
+	// Match direct-route resolution: request-side normalization strips dated
+	// suffixes and maps separator variants before the final alias lookup. Policy
+	// entries must use the same public namespace or a normalized policy alias can
+	// fall through to unknown-model/default-provider routing.
+	normalized := NormalizeModelName(model)
+	if normalized != model {
+		if entry, ok := snapshot.byID[normalized]; ok {
+			return entry, true
+		}
+		if entry, ok := snapshot.aliases[normalized]; ok {
+			return entry, true
+		}
+	}
+	return nil, false
 }
 
 func (r *publicModelEntryRegistry) lookupExact(model string) (*publicModelEntry, bool) {

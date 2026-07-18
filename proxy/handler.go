@@ -250,6 +250,7 @@ type ProxyHandler struct {
 	copilotURL                       string
 	copilotHeaders                   CopilotHeaderConfig
 	providersConfig                  ProvidersConfig
+	allowedModels                    map[string]struct{}
 	providersState                   *providerSetup
 	deferDynamicProviderModelRefresh bool
 	policyRoutingMode                PolicyRoutingMode
@@ -684,6 +685,21 @@ type Option func(*ProxyHandler)
 func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
 	return func(h *ProxyHandler) {
 		h.copilotHeaders = cfg
+	}
+}
+
+// WithAllowedModels restricts request routing to the listed public model IDs.
+// Empty keeps the normal global model namespace available.
+func WithAllowedModels(models ...string) Option {
+	return func(h *ProxyHandler) {
+		if h.allowedModels == nil {
+			h.allowedModels = make(map[string]struct{})
+		}
+		for _, model := range models {
+			if model = strings.TrimSpace(model); model != "" {
+				h.allowedModels[model] = struct{}{}
+			}
+		}
 	}
 }
 
@@ -1270,7 +1286,7 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 	setup := h.providerSetup()
 	for _, providerID := range setup.providerOrder {
 		provider := setup.providerByID(providerID)
-		if provider == nil {
+		if !h.providerWithinAllowedModelScope(provider) {
 			continue
 		}
 		if err := h.checkProviderReady(ctx, provider); err != nil {
@@ -1539,9 +1555,15 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 			if route == nil {
 				continue
 			}
+			publicID := strings.TrimSpace(route.public.id)
+			if len(h.allowedModels) > 0 {
+				if _, allowed := h.allowedModels[publicID]; !allowed {
+					continue
+				}
+			}
 			reservation := mergedModelReservation{
 				ownerID:     route.public.routeID,
-				rawPublicID: strings.TrimSpace(route.public.id),
+				rawPublicID: publicID,
 				ownerType:   mergedModelOwnerExplicitRoute,
 			}
 			for _, alias := range configuredPublicModelAliases(reservation.rawPublicID) {
@@ -1557,7 +1579,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 
 	for _, providerID := range setup.providerOrder {
 		provider := setup.providerByID(providerID)
-		if provider == nil {
+		if !h.providerWithinAllowedModelScope(provider) {
 			continue
 		}
 
@@ -1566,10 +1588,10 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 			return cachedModelsResponse{}, false, err
 		}
 
-		models := filterProviderModels(provider, result.models)
+		models := h.filterAllowedModels(filterProviderModels(provider, result.models))
 
 		if result.notModified {
-			models = filterProviderModels(provider, setup.modelsForProvider(provider.id))
+			models = h.filterAllowedModels(filterProviderModels(provider, setup.modelsForProvider(provider.id)))
 			for _, model := range models {
 				appendModel, err := reserveMergedModelOwner(owners, model)
 				if err != nil {

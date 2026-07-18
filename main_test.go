@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,17 @@ import (
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
 	"github.com/sozercan/vekil/server"
+)
+
+var (
+	_ = flag.String("settings", "", "test-only Claude settings argument")
+	_ = flag.String("c", "", "test-only Codex config argument")
+	_ = flag.String("m", "", "test-only Codex model argument")
+	_ = flag.Bool("no-auto-update", false, "test-only Copilot argument")
+	_ = flag.Bool("no-remote", false, "test-only Copilot argument")
+	_ = flag.Bool("no-remote-export", false, "test-only Copilot argument")
+	_ = flag.Bool("disable-builtin-mcps", false, "test-only Copilot argument")
+	_ = flag.String("secret-env-vars", "", "test-only Copilot argument")
 )
 
 func TestGetEnvDuration(t *testing.T) {
@@ -409,6 +422,39 @@ func TestServeUntilContextDoneCancelsActiveUpstreamWork(t *testing.T) {
 	}
 }
 
+func TestStartServeServerReturnsCancellationCause(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	server := &fakeServeLifecycleServer{}
+	authenticator := &fakeServeStartupAuthenticator{
+		getTokenFn: func(ctx context.Context) (string, error) {
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+	}
+	err := startServeServer(ctx, server, authenticator, true, logger.NewWithWriter(logger.LevelError, io.Discard))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("startServeServer() error = %v, want deadline exceeded", err)
+	}
+	if !server.stopped {
+		t.Fatal("expected canceled startup to stop the server")
+	}
+}
+
+func TestServeStartupCancellationUnwrapOmitsNilErrors(t *testing.T) {
+	cause := errors.New("startup canceled")
+	err := &serveStartupCancellation{cause: cause}
+	unwrapped := err.Unwrap()
+	if len(unwrapped) != 1 || !errors.Is(unwrapped[0], cause) {
+		t.Fatalf("Unwrap() = %#v, want only cause", unwrapped)
+	}
+	for i, item := range unwrapped {
+		if item == nil {
+			t.Fatalf("Unwrap()[%d] is nil", i)
+		}
+	}
+}
+
 func TestServeUntilContextDoneStartsServerBeforeCopilotAuthCompletes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -651,32 +697,37 @@ func TestCommandFromArgs(t *testing.T) {
 	}{
 		{
 			name: "no subcommand falls back to serve",
-			args: []string{"vekil"},
+			args: []string{"placeholder"},
 			want: cliCommandServe,
 		},
 		{
 			name: "login subcommand dispatches",
-			args: []string{"vekil", "login"},
+			args: []string{"placeholder", "login"},
 			want: cliCommandLogin,
 		},
 		{
 			name: "logout subcommand dispatches",
-			args: []string{"vekil", "logout"},
+			args: []string{"placeholder", "logout"},
 			want: cliCommandLogout,
 		},
 		{
+			name: "launch subcommand dispatches",
+			args: []string{"placeholder", "launch", "claude"},
+			want: cliCommandLaunch,
+		},
+		{
 			name: "config namespace dispatches without serving",
-			args: []string{"vekil", "config"},
+			args: []string{"placeholder", "config"},
 			want: cliCommandConfig,
 		},
 		{
 			name: "config validate dispatches without serving",
-			args: []string{"vekil", "config", "validate", "--providers-config", "/tmp/providers.yaml"},
+			args: []string{"placeholder", "config", "validate", "--providers-config", "/tmp/providers.yaml"},
 			want: cliCommandConfig,
 		},
 		{
 			name: "unknown subcommand falls back to serve",
-			args: []string{"vekil", "serve"},
+			args: []string{"placeholder", "serve"},
 			want: cliCommandServe,
 		},
 	}
@@ -934,6 +985,455 @@ func TestRunConfigRejectsMissingOrUnknownCommand(t *testing.T) {
 	}
 }
 
+func TestParseLaunchClaudeOptions(t *testing.T) {
+	var stderr bytes.Buffer
+	opts, err := parseLaunchClaudeOptions([]string{
+		"--model", "claude-public",
+		"--port", "0",
+		"--binary", "/tmp/claude",
+		"--dry-run",
+		"--",
+		"--print",
+		"hello",
+	}, &stderr)
+	if err != nil {
+		t.Fatalf("parseLaunchClaudeOptions() error = %v", err)
+	}
+	if opts.model != "claude-public" || opts.port != "0" || opts.binary != "/tmp/claude" || !opts.dryRun {
+		t.Fatalf("unexpected parsed options: %#v", opts)
+	}
+	if got := strings.Join(opts.forwardedArgs, "|"); got != "--print|hello" {
+		t.Fatalf("forwarded args = %q", got)
+	}
+}
+
+func TestParseLaunchClaudeOptionsValidatesRequiredFields(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "missing model", args: nil, want: "--model is required"},
+		{name: "bad port", args: []string{"--model", "claude-public", "--port", "70000"}, want: "--port must be"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			_, err := parseLaunchClaudeOptions(tc.args, &stderr)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunLaunchCommandHelpAndUnsupportedTarget(t *testing.T) {
+	var help bytes.Buffer
+	if code := runLaunchCommand([]string{"--help"}, &help); code != 0 {
+		t.Fatalf("help code = %d, want 0", code)
+	}
+	for _, target := range []string{"claude", "codex", "copilot"} {
+		if !strings.Contains(help.String(), "launch "+target) {
+			t.Fatalf("help output missing %s = %q", target, help.String())
+		}
+	}
+
+	var unsupported bytes.Buffer
+	if code := runLaunchCommand([]string{"unknown"}, &unsupported); code != 2 {
+		t.Fatalf("unsupported code = %d, want 2", code)
+	}
+	if !strings.Contains(unsupported.String(), "unsupported launch target") {
+		t.Fatalf("unsupported output = %q", unsupported.String())
+	}
+}
+
+func TestRunLaunchCommandDispatchesSupportedTargets(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{"claude", "codex", "copilot"} {
+		t.Run(target, func(t *testing.T) {
+			var stderr bytes.Buffer
+			code := runLaunchCommand([]string{
+				target,
+				"--model", "test-model",
+				"--binary", binary,
+				"--dry-run",
+			}, &stderr)
+			if code != 0 {
+				t.Fatalf("runLaunchCommand() code = %d; stderr=%s", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "agent:  "+target) {
+				t.Fatalf("dry-run did not dispatch %s: %s", target, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "unresolved:") {
+				t.Fatalf("catalog-only dry-run did not mark endpoint metadata unresolved for %s: %s", target, stderr.String())
+			}
+			if target == "copilot" && strings.Contains(stderr.String(), "COPILOT_PROVIDER_WIRE_API=") {
+				t.Fatalf("Copilot dry-run guessed a wire API without model metadata: %s", stderr.String())
+			}
+		})
+	}
+}
+
+func TestRunLaunchCommandDryRunUsesConfiguredStaticModelMetadata(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	providersPath := filepath.Join(t.TempDir(), "providers.json")
+	if err := os.WriteFile(providersPath, []byte(`{
+  "providers": [{
+    "id": "local",
+    "type": "openai-compatible",
+    "default": true,
+    "base_url": "http://127.0.0.1:9/v1",
+    "auth_type": "none",
+    "model_discovery": "static",
+    "models": [{
+      "public_id": "chat-only",
+      "name": "Chat Only",
+      "endpoints": ["/chat/completions"]
+    }]
+  }]
+}`), 0o600); err != nil {
+		t.Fatalf("write providers config: %v", err)
+	}
+
+	t.Run("Copilot resolves completions wire API", func(t *testing.T) {
+		var stderr bytes.Buffer
+		code := runLaunchCommand([]string{
+			"copilot",
+			"--providers-config", providersPath,
+			"--model", "chat-only",
+			"--binary", binary,
+			"--dry-run",
+		}, &stderr)
+		if code != 0 {
+			t.Fatalf("runLaunchCommand() code = %d; stderr=%s", code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "COPILOT_PROVIDER_WIRE_API=completions") {
+			t.Fatalf("dry-run did not resolve configured chat endpoint: %s", stderr.String())
+		}
+		if strings.Contains(stderr.String(), "unresolved:") {
+			t.Fatalf("static model metadata was reported unresolved: %s", stderr.String())
+		}
+	})
+
+	t.Run("Codex rejects configured incompatible endpoint", func(t *testing.T) {
+		var stderr bytes.Buffer
+		code := runLaunchCommand([]string{
+			"codex",
+			"--providers-config", providersPath,
+			"--model", "chat-only",
+			"--binary", binary,
+			"--dry-run",
+		}, &stderr)
+		if code != 1 {
+			t.Fatalf("runLaunchCommand() code = %d, want 1; stderr=%s", code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "not Codex-compatible") {
+			t.Fatalf("dry-run did not reject configured incompatible endpoint: %s", stderr.String())
+		}
+	})
+}
+
+func TestNewLaunchTokenIsRandomAndHighEntropy(t *testing.T) {
+	first, err := newLaunchToken()
+	if err != nil {
+		t.Fatalf("newLaunchToken() error = %v", err)
+	}
+	second, err := newLaunchToken()
+	if err != nil {
+		t.Fatalf("newLaunchToken() second error = %v", err)
+	}
+	if first == second {
+		t.Fatal("newLaunchToken() returned the same value twice")
+	}
+	if len(first) < 40 || len(second) < 40 {
+		t.Fatalf("launch token lengths = %d, %d, want at least 40", len(first), len(second))
+	}
+}
+
+func TestLaunchLoopbackBaseURL(t *testing.T) {
+	if got := launchLoopbackBaseURL("0"); got != "http://127.0.0.1:<dynamic>" {
+		t.Fatalf("dynamic URL = %q", got)
+	}
+	if got := launchLoopbackBaseURL("4242"); got != "http://127.0.0.1:4242" {
+		t.Fatalf("fixed URL = %q", got)
+	}
+}
+
+func TestLaunchSensitiveEnvironment(t *testing.T) {
+	cfg := proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{
+		{APIKeyEnv: "OPENAI_API_KEY"},
+		{APIKeyEnv: "ANTHROPIC_API_KEY", AuthMode: "azure_identity"},
+	}}
+	got := launchSensitiveEnvironment(cfg)
+	for _, want := range []string{
+		"ANTHROPIC_API_KEY",
+		"AZURE_CLIENT_SECRET",
+		"AZURE_CLIENT_CERTIFICATE_PATH",
+		"IDENTITY_HEADER",
+		"MSI_SECRET",
+		"COPILOT_GITHUB_TOKEN",
+		"OPENAI_API_KEY",
+	} {
+		if !slices.Contains(got, want) {
+			t.Fatalf("sensitive env = %#v, missing %q", got, want)
+		}
+	}
+}
+
+func TestRunLaunchClaudeEndToEndWithStaticProvider(t *testing.T) {
+	tmp := t.TempDir()
+	providersPath := filepath.Join(tmp, "providers.yaml")
+	providersBody := `providers:
+  - id: local-static
+    type: openai-compatible
+    base_url: http://127.0.0.1:9/v1
+    auth_type: bearer
+    api_key_env: TEST_LAUNCH_PROVIDER_SECRET
+    model_discovery: static
+    models:
+      - public_id: claude-launch-test
+        name: Claude Launch Test
+        endpoints:
+          - /chat/completions
+`
+	if err := os.WriteFile(providersPath, []byte(providersBody), 0o600); err != nil {
+		t.Fatalf("write providers config: %v", err)
+	}
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	capturePath := filepath.Join(tmp, "capture.json")
+	t.Setenv("GO_WANT_MAIN_LAUNCH_HELPER", "1")
+	t.Setenv("MAIN_LAUNCH_HELPER_CAPTURE", capturePath)
+	t.Setenv("MAIN_LAUNCH_HELPER_TARGET", "claude")
+	t.Setenv("TEST_LAUNCH_PROVIDER_SECRET", "redacted")
+
+	var stderr bytes.Buffer
+	code := runLaunchClaude([]string{
+		"--providers-config", providersPath,
+		"--model", "claude-launch-test",
+		"--binary", binary,
+		"--proxy-log", filepath.Join(tmp, "proxy.jsonl"),
+		"--",
+		"-test.run=TestMainLaunchHelperProcess",
+	}, &stderr)
+	if code != 9 {
+		t.Fatalf("runLaunchClaude() code = %d, want 9; stderr=%s", code, stderr.String())
+	}
+	body, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatalf("read helper capture: %v", err)
+	}
+	var capture map[string]string
+	if err := json.Unmarshal(body, &capture); err != nil {
+		t.Fatalf("decode helper capture: %v", err)
+	}
+	if capture["api_value"] != "" {
+		t.Fatalf("child ANTHROPIC_API_KEY = %q, want empty", capture["api_value"])
+	}
+	if len(capture["auth_value"]) < 32 {
+		t.Fatalf("child local authentication value was too short: length=%d", len(capture["auth_value"]))
+	}
+	if capture["removed_value"] != "" {
+		t.Fatalf("provider secret leaked to child: %q", capture["removed_value"])
+	}
+	if !strings.HasPrefix(capture["base_url"], "http://127.0.0.1:") {
+		t.Fatalf("child base URL = %q", capture["base_url"])
+	}
+}
+
+func TestRunLaunchCodexEndToEndWithStaticProvider(t *testing.T) {
+	tmp := t.TempDir()
+	providersPath := filepath.Join(tmp, "providers.yaml")
+	providersBody := `providers:
+  - id: local-static
+    type: openai-compatible
+    base_url: http://127.0.0.1:9/v1
+    auth_type: bearer
+    api_key_env: TEST_LAUNCH_PROVIDER_SECRET
+    model_discovery: static
+    models:
+      - public_id: codex-launch-test
+        name: Codex Launch Test
+        endpoints:
+          - /responses
+`
+	if err := os.WriteFile(providersPath, []byte(providersBody), 0o600); err != nil {
+		t.Fatalf("write providers config: %v", err)
+	}
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturePath := filepath.Join(tmp, "capture.json")
+	t.Setenv("GO_WANT_MAIN_LAUNCH_HELPER", "1")
+	t.Setenv("MAIN_LAUNCH_HELPER_CAPTURE", capturePath)
+	t.Setenv("MAIN_LAUNCH_HELPER_TARGET", "codex")
+	t.Setenv("TEST_LAUNCH_PROVIDER_SECRET", "redacted")
+	t.Setenv("OPENAI_API_KEY", "redacted-openai")
+
+	var stderr bytes.Buffer
+	code := runLaunchCodex([]string{
+		"--providers-config", providersPath,
+		"--model", "codex-launch-test",
+		"--binary", binary,
+		"--proxy-log", filepath.Join(tmp, "proxy.jsonl"),
+		"--",
+		"-test.run=TestMainLaunchHelperProcess",
+	}, &stderr)
+	if code != 9 {
+		t.Fatalf("runLaunchCodex() code = %d, want 9; stderr=%s", code, stderr.String())
+	}
+	capture := readMainLaunchCapture(t, capturePath)
+	if len(capture["codex_token"]) < 32 {
+		t.Fatalf("child Codex local token was too short: %d", len(capture["codex_token"]))
+	}
+	if capture["openai_api_key"] != "" || capture["removed_value"] != "" {
+		t.Fatalf("credential leaked to Codex child: %#v", capture)
+	}
+}
+
+func TestRunLaunchCopilotEndToEndWithStaticProvider(t *testing.T) {
+	tmp := t.TempDir()
+	providersPath := filepath.Join(tmp, "providers.yaml")
+	providersBody := `providers:
+  - id: local-static
+    type: openai-compatible
+    base_url: http://127.0.0.1:9/v1
+    auth_type: bearer
+    api_key_env: TEST_LAUNCH_PROVIDER_SECRET
+    model_discovery: static
+    models:
+      - public_id: copilot-launch-test
+        name: Copilot Launch Test
+        endpoints:
+          - /responses
+`
+	if err := os.WriteFile(providersPath, []byte(providersBody), 0o600); err != nil {
+		t.Fatalf("write providers config: %v", err)
+	}
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturePath := filepath.Join(tmp, "capture.json")
+	t.Setenv("GO_WANT_MAIN_LAUNCH_HELPER", "1")
+	t.Setenv("MAIN_LAUNCH_HELPER_CAPTURE", capturePath)
+	t.Setenv("MAIN_LAUNCH_HELPER_TARGET", "copilot")
+	t.Setenv("TEST_LAUNCH_PROVIDER_SECRET", "redacted")
+	t.Setenv("GITHUB_TOKEN", "redacted-github")
+
+	var stderr bytes.Buffer
+	code := runLaunchCopilot([]string{
+		"--providers-config", providersPath,
+		"--model", "copilot-launch-test",
+		"--binary", binary,
+		"--proxy-log", filepath.Join(tmp, "proxy.jsonl"),
+		"--",
+		"-test.run=TestMainLaunchHelperProcess",
+	}, &stderr)
+	if code != 9 {
+		t.Fatalf("runLaunchCopilot() code = %d, want 9; stderr=%s", code, stderr.String())
+	}
+	capture := readMainLaunchCapture(t, capturePath)
+	if len(capture["copilot_token"]) < 32 {
+		t.Fatalf("child Copilot local token was too short: %d", len(capture["copilot_token"]))
+	}
+	if capture["copilot_offline"] != "true" || capture["copilot_wire_api"] != "responses" {
+		t.Fatalf("Copilot routing environment = %#v", capture)
+	}
+	if !strings.HasPrefix(capture["copilot_base_url"], "http://127.0.0.1:") || !strings.HasSuffix(capture["copilot_base_url"], "/v1") {
+		t.Fatalf("Copilot base URL = %q", capture["copilot_base_url"])
+	}
+	if capture["github_token"] != "" || capture["removed_value"] != "" {
+		t.Fatalf("credential leaked to Copilot child: %#v", capture)
+	}
+}
+
+func readMainLaunchCapture(t *testing.T, path string) map[string]string {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read helper capture: %v", err)
+	}
+	var capture map[string]string
+	if err := json.Unmarshal(body, &capture); err != nil {
+		t.Fatalf("decode helper capture: %v", err)
+	}
+	return capture
+}
+
+func TestRunLaunchClaudeDefersDynamicValidationUnderStartupTimeout(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+
+	tmp := t.TempDir()
+	providersPath := filepath.Join(tmp, "providers.yaml")
+	providersBody := fmt.Sprintf(`providers:
+  - id: dynamic
+    type: openai-compatible
+    base_url: %s
+    auth_type: none
+    model_discovery: openai
+`, upstream.URL)
+	if err := os.WriteFile(providersPath, []byte(providersBody), 0o600); err != nil {
+		t.Fatalf("write providers config: %v", err)
+	}
+	started := time.Now()
+	var stderr bytes.Buffer
+	code := runLaunchClaude([]string{
+		"--providers-config", providersPath,
+		"--model", "dynamic-model",
+		"--startup-timeout", "50ms",
+		"--proxy-log", filepath.Join(tmp, "proxy.jsonl"),
+	}, &stderr)
+	if code != 1 {
+		t.Fatalf("runLaunchClaude() code = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("dynamic validation exceeded launch timeout: %s", elapsed)
+	}
+	if !strings.Contains(stderr.String(), "deadline exceeded") {
+		t.Fatalf("stderr missing deadline cause: %s", stderr.String())
+	}
+}
+
+func TestMainLaunchHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_MAIN_LAUNCH_HELPER") != "1" {
+		return
+	}
+	capture := map[string]string{
+		"api_value":        os.Getenv("ANTHROPIC_API_KEY"),
+		"auth_value":       os.Getenv("ANTHROPIC_AUTH_TOKEN"),
+		"base_url":         os.Getenv("ANTHROPIC_BASE_URL"),
+		"codex_token":      os.Getenv("VEKIL_CODEX_API_KEY"),
+		"openai_api_key":   os.Getenv("OPENAI_API_KEY"),
+		"copilot_token":    os.Getenv("COPILOT_PROVIDER_BEARER_TOKEN"),
+		"copilot_base_url": os.Getenv("COPILOT_PROVIDER_BASE_URL"),
+		"copilot_offline":  os.Getenv("COPILOT_OFFLINE"),
+		"copilot_wire_api": os.Getenv("COPILOT_PROVIDER_WIRE_API"),
+		"github_token":     os.Getenv("GITHUB_TOKEN"),
+		"removed_value":    os.Getenv("TEST_LAUNCH_PROVIDER_SECRET"),
+	}
+	body, err := json.Marshal(capture)
+	if err != nil {
+		os.Exit(98)
+	}
+	if err := os.WriteFile(os.Getenv("MAIN_LAUNCH_HELPER_CAPTURE"), body, 0o600); err != nil {
+		os.Exit(99)
+	}
+	os.Exit(9)
+}
+
 func TestRunLoginHelpIncludesAuthFlags(t *testing.T) {
 	for _, helpArg := range []string{"-h", "--help"} {
 		t.Run(helpArg, func(t *testing.T) {
@@ -1111,4 +1611,87 @@ func (f *fakeLoginAuthenticator) PollForAuthorization(_ context.Context, dcResp 
 	f.pollForAuthorizationCalls++
 	f.polledDeviceCode = dcResp
 	return f.pollForAuthorizationErr
+}
+
+func TestAgentLaunchProxySkipsCopilotForKnownNonCopilotModel(t *testing.T) {
+	cfg := proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{
+		{
+			ID:             "local-static",
+			Type:           "openai-compatible",
+			BaseURL:        "http://127.0.0.1:9/v1",
+			AuthType:       "none",
+			Default:        true,
+			ModelDiscovery: "static",
+			Models: []proxy.ProviderModelConfig{{
+				PublicID:  "local-model",
+				Endpoints: []string{"/responses"},
+			}},
+		},
+		{
+			ID:            "copilot",
+			Type:          "copilot",
+			IncludeModels: []string{"copilot-model"},
+		},
+	}}
+	log := logger.NewWithWriter(logger.LevelError, io.Discard)
+	srv, err := server.New(
+		auth.NewTestAuthenticator("test-token"),
+		log,
+		"127.0.0.1",
+		"0",
+		server.WithProxyOptions(
+			proxy.WithProvidersConfig(cfg),
+			proxy.WithAllowedModels("local-model"),
+			proxy.WithDeferredDynamicProviderModelValidation(true),
+		),
+	)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+	called := false
+	runtime := &agentLaunchProxy{
+		srv: srv,
+		authenticator: &fakeServeStartupAuthenticator{getTokenFn: func(context.Context) (string, error) {
+			called = true
+			return "", errors.New("Copilot auth should not run")
+		}},
+		usesCopilot: srv.ModelUsesCopilot("local-model"),
+		log:         log,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := runtime.Start(ctx); err != nil {
+		t.Fatalf("agentLaunchProxy.Start() error = %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+		defer stopCancel()
+		_ = runtime.Stop(stopCtx)
+	}()
+	if called {
+		t.Fatal("known non-Copilot model triggered Copilot authentication")
+	}
+	baseURL := "http://" + runtime.Addr()
+	for _, path := range []string{"/readyz", "/v1/models"} {
+		resp, err := http.Get(baseURL + path) //nolint:gosec // loopback test server
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			t.Fatalf("read %s: %v", path, readErr)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200; body=%s", path, resp.StatusCode, body)
+		}
+		if path == "/v1/models" {
+			if !bytes.Contains(body, []byte(`"id":"local-model"`)) {
+				t.Fatalf("models response missing selected model: %s", body)
+			}
+			if bytes.Contains(body, []byte("copilot-model")) {
+				t.Fatalf("models response included unrelated Copilot model: %s", body)
+			}
+		}
+	}
 }

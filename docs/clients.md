@@ -33,6 +33,8 @@ Claude Code and Gemini `countTokens` calls also use the selected model's native 
 
 ## Claude Code
 
+Use [`vekil launch claude`](agent-launchers.md) to start an ephemeral proxy and Claude Code together, or configure an already-running proxy manually:
+
 ```bash
 env ANTHROPIC_BASE_URL=http://localhost:1337 \
   ANTHROPIC_API_KEY=dummy \
@@ -41,7 +43,7 @@ env ANTHROPIC_BASE_URL=http://localhost:1337 \
 
 ## OpenAI Codex CLI
 
-The Codex CLI example uses the Responses API, so select a direct Responses-capable model rather than a v1 policy profile.
+Use [`vekil launch codex`](agent-launchers.md) for an ephemeral supervised session, or configure an already-running proxy manually. The manual example below uses the Responses API, so select a direct Responses-capable model rather than a v1 policy profile:
 
 ```bash
 env OPENAI_API_KEY=dummy \
@@ -51,7 +53,7 @@ env OPENAI_API_KEY=dummy \
 
 ## GitHub Copilot CLI
 
-This example uses `COPILOT_PROVIDER_WIRE_API=responses`, so its model must be a direct Responses-capable model. A policy profile requires the completions wire API and must still fit the v1 text/function-tool Chat contract.
+Use [`vekil launch copilot`](agent-launchers.md) for an ephemeral offline/BYOK session, or configure an already-running proxy manually. The manual example below sets `COPILOT_PROVIDER_WIRE_API=responses`, so select a direct Responses-capable model. A v1 policy profile instead requires the completions wire API and a request within the v1 text/function-tool Chat contract:
 
 ```bash
 env COPILOT_PROVIDER_BASE_URL=http://localhost:1337/v1 \

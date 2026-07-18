@@ -157,6 +157,26 @@ func TestSchemaV3PolicyConfigCompilesTerminalAndPublicRegistries(t *testing.T) {
 	}
 }
 
+func TestPolicyPublicEntryLookupUsesRequestSideNormalization(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	if err := os.WriteFile(path, []byte(validSchemaV3PolicyYAML()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadProvidersConfigFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &ProxyHandler{copilotURL: "https://api.githubcopilot.com"}
+	setup, err := h.buildConfiguredProviderSetupWithDynamicValidation(t.Context(), cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := setup.lookupPublicModelEntry("coding-policy-20260717-20250514")
+	if !ok || entry == nil || entry.policyID != "coding-policy" {
+		t.Fatalf("normalized policy lookup = (%+v, %v)", entry, ok)
+	}
+}
+
 func TestSchemaV3PolicyValidationRejectsPrivacyAndExposureViolations(t *testing.T) {
 	tests := []struct {
 		name    string
