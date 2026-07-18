@@ -364,10 +364,11 @@ type recentRouteAttempt struct {
 type routeAttemptRecordState struct {
 	mu sync.Mutex
 
-	collector *statsCollector
-	targetKey string
-	recentIdx int
-	recordID  uint64
+	collector      *statsCollector
+	targetKey      string
+	recentIdx      int
+	recordID       uint64
+	policyRedacted bool
 
 	row                recentRouteAttempt
 	physicalAccounted  statsTokenUsage
@@ -475,8 +476,9 @@ type RouteAttemptObservation struct {
 
 	// operation and startedAt are route-executor-owned metadata. They stay
 	// unexported so callers cannot inject arbitrary trace state into /stats.json.
-	operation *routeOperation
-	startedAt time.Time
+	operation      *routeOperation
+	startedAt      time.Time
+	policyRedacted bool
 }
 
 // RecordUpstreamAttempt records one actual physical upstream dispatch for the
@@ -486,6 +488,13 @@ type RouteAttemptObservation struct {
 // only need the legacy aggregate side effect may ignore the return value.
 func (h *ProxyHandler) RecordUpstreamAttempt(ctx context.Context, attempt RouteAttemptObservation) *routeAttemptRecord {
 	summary := RequestSummaryFromContext(ctx)
+	if publicID := summary.policyPublicIDForStats(); publicID != "" {
+		attempt.RouteID = publicID
+		attempt.TargetID = publicID
+		attempt.ProviderID = ""
+		attempt.ProviderKind = ""
+		attempt.policyRedacted = true
+	}
 	if summary != nil {
 		summary.recordUpstreamAttempt(attempt.OperationID, attempt.RouteID, attempt.TargetID, attempt.ProviderID, attempt.ProviderKind)
 	}
@@ -523,7 +532,8 @@ func (c *statsCollector) beginRouteAttempt(summary *RequestSummary, attempt Rout
 	}
 
 	state := &routeAttemptRecordState{
-		collector: c,
+		collector:      c,
+		policyRedacted: attempt.policyRedacted,
 	}
 
 	c.mu.Lock()
@@ -607,7 +617,7 @@ func (r *routeAttemptRecord) complete(completion routeAttemptCompletion) {
 			row.RetryAfterSeconds = &value
 		}
 	}
-	if completion.UpstreamRequestID != "" {
+	if completion.UpstreamRequestID != "" && !state.policyRedacted {
 		row.UpstreamRequestID = completion.UpstreamRequestID
 	}
 	row.CleanupComplete = row.CleanupComplete || completion.CleanupComplete
@@ -650,6 +660,9 @@ func (r *routeAttemptRecord) reconcileTrace(trace routeAttemptTrace, version uin
 	}
 	state.traceVersion = version
 	row := applyRouteAttemptTrace(state.row, trace)
+	if state.policyRedacted {
+		row.UpstreamRequestID = ""
+	}
 	if row.ReportedUsage != nil && routeAttemptOutcomeIsWasted(row.Outcome) {
 		wastedDelta := statsTokenUsageDelta(*row.ReportedUsage, state.wastedAccounted)
 		state.wastedAccounted.add(wastedDelta)
@@ -1581,6 +1594,17 @@ func readSummaryForStats(summary *RequestSummary) summaryStats {
 	d.operationID = boundOperationalStatLabel(summary.operationID)
 	d.routeID = boundOperationalStatLabel(summary.routeID)
 	d.finalTarget = boundOperationalStatLabel(summary.finalTarget)
+	if strings.TrimSpace(summary.policyID) != "" {
+		publicID := d.routeID
+		if publicID == "" {
+			publicID = d.model
+		}
+		d.routeID = publicID
+		d.finalTarget = publicID
+		d.provider = ""
+		d.kind = ""
+		d.upstreamID = ""
+	}
 	d.upstreamSends = summary.upstreamSendCount
 	d.targetSwitches = summary.targetSwitchCount
 	d.routeExhausted = summary.routeExhausted

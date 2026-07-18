@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net/url"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -87,6 +88,7 @@ func sanitizedPolicyGenerationConfig(cfg ProvidersConfig) ProvidersConfig {
 	for providerIndex := range cfg.Providers {
 		provider := &cfg.Providers[providerIndex]
 		provider.APIKey = ""
+		provider.BaseURL = sanitizedPolicyGenerationBaseURL(provider.BaseURL)
 		if provider.ExtraHeaders != nil {
 			redacted := make(map[string]string, len(provider.ExtraHeaders))
 			for key := range provider.ExtraHeaders {
@@ -104,6 +106,16 @@ func sanitizedPolicyGenerationConfig(cfg ProvidersConfig) ProvidersConfig {
 		sort.Strings(cfg.ModelRoutes[routeIndex].Endpoints)
 	}
 	return cfg
+}
+
+func sanitizedPolicyGenerationBaseURL(baseURL string) string {
+	trimmed := strings.TrimSpace(baseURL)
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.User == nil {
+		return baseURL
+	}
+	parsed.User = nil
+	return parsed.String()
 }
 
 func policyHashValue(value interface{}) string {

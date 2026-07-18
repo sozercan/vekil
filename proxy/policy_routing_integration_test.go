@@ -82,6 +82,7 @@ func newPolicyIntegrationUpstream(t *testing.T, signals policyClassifierSignals)
 			})
 			return
 		}
+		w.Header().Set("X-Request-ID", "terminal-provider-region-request")
 		if status := int(u.terminalFailureStatus.Load()); status != 0 {
 			w.Header().Set("Openai-Model", request.Model)
 			w.Header().Set("X-Openai-Model", request.Model)
@@ -915,9 +916,19 @@ func TestPolicyClientStatsUsePublicIDNotTerminalRouteID(t *testing.T) {
 	if len(snapshot.Recent) != 1 || snapshot.Recent[0].RouteID != "coding-economy" {
 		t.Fatalf("recent=%+v", snapshot.Recent)
 	}
-	if snapshot.ByRoute[0].Route == "light-route" || snapshot.ByRoute[0].Route == "power-route" ||
-		snapshot.Recent[0].RouteID == "light-route" || snapshot.Recent[0].RouteID == "power-route" {
-		t.Fatalf("client request stats leaked terminal route: by_route=%+v recent=%+v", snapshot.ByRoute, snapshot.Recent)
+	if snapshot.Recent[0].FinalTarget != "coding-economy" || snapshot.Recent[0].Provider != "" {
+		t.Fatalf("recent policy attribution leaked terminal topology: %+v", snapshot.Recent[0])
+	}
+	if len(snapshot.ByProvider) != 0 {
+		t.Fatalf("by_provider leaked policy terminal provider: %+v", snapshot.ByProvider)
+	}
+	if len(snapshot.ByTarget) != 1 || snapshot.ByTarget[0].Route != "coding-economy" || snapshot.ByTarget[0].Target != "coding-economy" ||
+		snapshot.ByTarget[0].Provider != "" || snapshot.ByTarget[0].Kind != "" {
+		t.Fatalf("by_target leaked policy terminal topology: %+v", snapshot.ByTarget)
+	}
+	if len(snapshot.RecentAttempts) != 1 || snapshot.RecentAttempts[0].RouteID != "coding-economy" || snapshot.RecentAttempts[0].TargetID != "coding-economy" ||
+		snapshot.RecentAttempts[0].ProviderID != "" || snapshot.RecentAttempts[0].ProviderKind != "" || snapshot.RecentAttempts[0].UpstreamRequestID != "" {
+		t.Fatalf("recent_attempts leaked policy terminal topology: %+v", snapshot.RecentAttempts)
 	}
 }
 

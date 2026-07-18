@@ -176,6 +176,21 @@ func (s *RequestSummary) SetPolicyDecision(plan chatOperationPlan) {
 	s.binaryGeneration = plan.binaryGeneration
 }
 
+func (s *RequestSummary) policyPublicIDForStats() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(s.policyID) == "" {
+		return ""
+	}
+	if publicID := strings.TrimSpace(s.routeID); publicID != "" {
+		return publicID
+	}
+	return strings.TrimSpace(s.model)
+}
+
 // SetFinalTarget records the final/canonical physical target selected for the
 // logical operation. Unlike operation and route IDs, the target is intentionally
 // replaceable because a later result-selection step can supersede an earlier
