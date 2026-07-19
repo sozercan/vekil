@@ -18,7 +18,7 @@ The dashboard polls `GET /stats.json` once per second and renders:
 - **Time series** — requests/sec (with an errors/sec overlay) and tokens/sec (prompt vs. completion) over a rolling window, drawn with [uPlot](https://github.com/leeoniya/uPlot).
 - **Total usage** — cumulative requests, total/prompt/completion tokens, cached-prompt %, reasoning tokens, average tokens per request, and errors.
 - **Breakdowns** — top models, providers, and agents, each with request count, token volume, error count, and average latency. A controls bar lets you **sort by** requests / tokens / errors / latency and **filter** by name (e.g. `gpt-5.4-pro` to inspect one model). Sorting by errors or latency hides rows with none. The JSON snapshot additionally includes `by_route` client-request rows and `by_target` physical-attempt rows for external tooling.
-- **Policy routing JSON telemetry** — `GET /stats.json` exposes per-profile eligibility, observe sampling/admission, capacity drops, classifier outcomes/latency/token usage, selected/fallback tier distribution, and classifier-route health for schema-v3 policy profiles. The browser dashboard does not yet render a dedicated policy-routing panel.
+- **Policy routing JSON telemetry** — `GET /stats.json` exposes per-profile eligibility, observe sampling/admission, capacity drops, classifier outcomes/latency/token usage, selected/fallback tier distribution, and classifier-route health for schema-v2 policy profiles. The browser dashboard does not yet render a dedicated policy-routing panel.
 - **Errors** — a status-class distribution (2xx/3xx/4xx/5xx) plus exact error status codes and error-by-provider/model attribution.
 - **Recent requests** — a drill-down log of the most recent logical requests (newest first) with status, model, agent, latency, tokens, and the final/canonical upstream request ID. Has an *errors only* toggle, honors the breakdown filter, and lets you click a request ID to copy it for correlating with upstream logs. Each JSON row also carries `operation_id`, `route_id`, `final_target`, `upstream_sends`, and `target_switches` when route data exists.
 
@@ -63,7 +63,7 @@ See [`examples/anthropic-with-insights.yaml`](../examples/anthropic-with-insight
 Notes:
 
 - **Opt-in.** No model is called unless you configure one. The button does not appear otherwise. The model must be servable through native Chat or Chat-over-Responses; native `/v1/models` endpoint metadata is not expanded just for insights.
-- **Internal routes are ineligible.** Schema-v3 internal policy destinations and classifier routes never appear in the model picker and cannot be selected as `insight_model`.
+- **Internal routes are ineligible.** Schema-v2 internal policy destinations and classifier routes never appear in the model picker and cannot be selected as `insight_model`.
 - **It spends tokens.** Each click is one short chat-completion against the configured model.
 - **Rate-limited.** The endpoint is single-flight (one generation at a time) with a short cooldown between generations, so repeat or concurrent clicks cannot fan out billable calls.
 - **Fails open.** Any error (no model, timeout, upstream failure, rate-limit) returns a soft error and the dashboard keeps showing its templated narrative.

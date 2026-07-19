@@ -1193,10 +1193,10 @@ func TestRunLaunchCommandDryRunUsesConfiguredStaticModelMetadata(t *testing.T) {
 	})
 }
 
-func TestResolveLaunchDryRunModelInfoResolvesSchemaV3PublicRoute(t *testing.T) {
+func TestResolveLaunchDryRunModelInfoResolvesSchemaV2PublicRoute(t *testing.T) {
 	parallel := true
 	cfg := proxy.ProvidersConfig{
-		SchemaVersion: 3,
+		SchemaVersion: proxy.ProvidersConfigSchemaVersion2,
 		Providers: []proxy.ProviderConfig{{
 			ID:       "upstream",
 			Type:     "openai-compatible",
@@ -1236,7 +1236,7 @@ func TestResolveLaunchDryRunModelInfoResolvesSchemaV3PublicRoute(t *testing.T) {
 	}
 	if !found || model.ID != "public-route-model" || model.Name != "Public Route Model" ||
 		!slices.Equal(model.SupportedEndpoints, []string{"/responses"}) || !model.Capabilities.Supports.ParallelToolCalls {
-		t.Fatalf("resolved schema-v3 route metadata = %+v, found=%v", model, found)
+		t.Fatalf("resolved schema-v2 route metadata = %+v, found=%v", model, found)
 	}
 	if _, found, err := resolveLaunchDryRunModelInfo(cfg, "internal-route"); err != nil || found {
 		t.Fatalf("internal route dry-run resolution = found %v, err %v; want false, nil", found, err)
@@ -1557,7 +1557,7 @@ func TestRunLaunchAgentInitializesConfiguredPolicyRouting(t *testing.T) {
 
 			tmp := t.TempDir()
 			providersPath := filepath.Join(tmp, "providers.yaml")
-			providersBody := fmt.Sprintf(`schema_version: 3
+			providersBody := fmt.Sprintf(`schema_version: 2
 providers:
   - id: policy-provider
     type: openai-compatible
@@ -1621,7 +1621,7 @@ policy_profiles:
 func writeStaticPolicyLaunchProvidersConfig(t *testing.T) string {
 	t.Helper()
 	providersPath := filepath.Join(t.TempDir(), "providers.yaml")
-	providersBody := `schema_version: 3
+	providersBody := `schema_version: 2
 providers:
   - id: policy-provider
     type: openai-compatible

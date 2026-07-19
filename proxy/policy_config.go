@@ -404,7 +404,7 @@ func boolConfigValue(value *bool) bool {
 	return value != nil && *value
 }
 
-// SetRecentTurns preserves an explicit zero for programmatic schema-v3
+// SetRecentTurns preserves an explicit zero for programmatic schema-v2
 // configurations. JSON/YAML decoding tracks the same presence automatically.
 func (c *PolicyClassifierConfig) SetRecentTurns(value int) {
 	if c == nil {
@@ -414,7 +414,7 @@ func (c *PolicyClassifierConfig) SetRecentTurns(value int) {
 	c.recentTurnsSet = true
 }
 
-// SetObserveSampleRate preserves an explicit zero for programmatic schema-v3
+// SetObserveSampleRate preserves an explicit zero for programmatic schema-v2
 // configurations. JSON/YAML decoding tracks the same presence automatically.
 func (c *PolicyClassifierConfig) SetObserveSampleRate(value float64) {
 	if c == nil {

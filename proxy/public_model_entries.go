@@ -135,7 +135,7 @@ func compilePolicyPublicModelEntries(cfg ProvidersConfig) ([]*publicModelEntry, 
 	if err != nil {
 		return nil, err
 	}
-	if validated.schemaVersion != ProvidersConfigSchemaVersion3 || len(validated.config.PolicyProfiles) == 0 {
+	if !providersConfigSchemaSupportsPolicyRouting(validated.schemaVersion) || len(validated.config.PolicyProfiles) == 0 {
 		return nil, nil
 	}
 

@@ -15,7 +15,6 @@ import (
 const (
 	ProvidersConfigSchemaVersion1 = 1
 	ProvidersConfigSchemaVersion2 = 2
-	ProvidersConfigSchemaVersion3 = 3
 
 	maxExplicitModelRoutes          = 256
 	maxExplicitTargetsPerRoute      = 32
@@ -201,7 +200,7 @@ func providersConfigSchemaUsesStrictDecoding(version int) bool {
 }
 
 func providersConfigSchemaSupportsPolicyRouting(version int) bool {
-	return version == ProvidersConfigSchemaVersion3
+	return version == ProvidersConfigSchemaVersion2
 }
 
 func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvidersConfig, error) {
@@ -212,7 +211,7 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 	}
 
 	if cfg.schemaVersionSet && cfg.SchemaVersion == 0 {
-		return validatedProvidersConfig{}, configPathError("schema_version", "unsupported schema version 0; supported versions are 1, 2, and 3")
+		return validatedProvidersConfig{}, configPathError("schema_version", "unsupported schema version 0; supported versions are 1 and 2")
 	}
 
 	switch validated.schemaVersion {
@@ -220,19 +219,19 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 		if cfg.modelRoutesSet || cfg.ModelRoutes != nil {
 			return validatedProvidersConfig{}, configPathError("model_routes", "requires schema_version: 2")
 		}
-		if err := validateSchemaV3FeatureFields(cfg, validated.schemaVersion); err != nil {
+		if err := validateSchemaV2FeatureFields(cfg, validated.schemaVersion); err != nil {
 			return validatedProvidersConfig{}, err
 		}
 		return validated, nil
-	case ProvidersConfigSchemaVersion2, ProvidersConfigSchemaVersion3:
+	case ProvidersConfigSchemaVersion2:
 	case 0:
 		// EffectiveSchemaVersion maps zero to version 1, so this is unreachable.
-		return validatedProvidersConfig{}, configPathError("schema_version", "must be 1, 2, or 3")
+		return validatedProvidersConfig{}, configPathError("schema_version", "must be 1 or 2")
 	default:
-		return validatedProvidersConfig{}, configPathError("schema_version", "unsupported schema version %d; supported versions are 1, 2, and 3", cfg.SchemaVersion)
+		return validatedProvidersConfig{}, configPathError("schema_version", "unsupported schema version %d; supported versions are 1 and 2", cfg.SchemaVersion)
 	}
 
-	if err := validateSchemaV3FeatureFields(cfg, validated.schemaVersion); err != nil {
+	if err := validateSchemaV2FeatureFields(cfg, validated.schemaVersion); err != nil {
 		return validatedProvidersConfig{}, err
 	}
 	if len(validated.config.ModelRoutes) > maxExplicitModelRoutes {
@@ -435,27 +434,27 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 	return validated, nil
 }
 
-func validateSchemaV3FeatureFields(cfg ProvidersConfig, schemaVersion int) error {
+func validateSchemaV2FeatureFields(cfg ProvidersConfig, schemaVersion int) error {
 	if providersConfigSchemaSupportsPolicyRouting(schemaVersion) {
 		return nil
 	}
 	if cfg.policyProfilesSet || cfg.PolicyProfiles != nil {
-		return configPathError("policy_profiles", "requires schema_version: 3")
+		return configPathError("policy_profiles", "requires schema_version: 2")
 	}
 	for providerIndex, provider := range cfg.Providers {
 		if provider.trustDomainSet || strings.TrimSpace(provider.TrustDomain) != "" {
-			return configPathError(fmt.Sprintf("providers[%d].trust_domain", providerIndex), "requires schema_version: 3")
+			return configPathError(fmt.Sprintf("providers[%d].trust_domain", providerIndex), "requires schema_version: 2")
 		}
 		if provider.classifierNoStoreSupportedSet || provider.ClassifierNoStoreSupported != nil {
-			return configPathError(fmt.Sprintf("providers[%d].classifier_no_store_supported", providerIndex), "requires schema_version: 3")
+			return configPathError(fmt.Sprintf("providers[%d].classifier_no_store_supported", providerIndex), "requires schema_version: 2")
 		}
 	}
 	for routeIndex, route := range cfg.ModelRoutes {
 		if route.exposureSet || strings.TrimSpace(route.Exposure) != "" {
-			return configPathError(fmt.Sprintf("model_routes[%d].exposure", routeIndex), "requires schema_version: 3")
+			return configPathError(fmt.Sprintf("model_routes[%d].exposure", routeIndex), "requires schema_version: 2")
 		}
 		if route.internalPurposeSet || strings.TrimSpace(route.InternalPurpose) != "" {
-			return configPathError(fmt.Sprintf("model_routes[%d].internal_purpose", routeIndex), "requires schema_version: 3")
+			return configPathError(fmt.Sprintf("model_routes[%d].internal_purpose", routeIndex), "requires schema_version: 2")
 		}
 	}
 	return nil
@@ -1164,7 +1163,7 @@ func compileExplicitModelRoutes(cfg ProvidersConfig, providers map[string]*provi
 	if err != nil {
 		return nil, err
 	}
-	if validated.schemaVersion != ProvidersConfigSchemaVersion2 && validated.schemaVersion != ProvidersConfigSchemaVersion3 || len(validated.config.ModelRoutes) == 0 {
+	if validated.schemaVersion != ProvidersConfigSchemaVersion2 || len(validated.config.ModelRoutes) == 0 {
 		return nil, nil
 	}
 

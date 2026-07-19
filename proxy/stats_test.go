@@ -8,11 +8,181 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
+
+func TestRejectedPolicySurfacesKeepStatsOnPublicPolicyIdentity(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		handle func(*ProxyHandler, http.ResponseWriter, *http.Request)
+	}{
+		{
+			name:   "responses",
+			method: http.MethodPost,
+			path:   "/v1/responses",
+			body:   `{"model":"coding-economy","input":"hello"}`,
+			handle: (*ProxyHandler).HandleResponses,
+		},
+		{
+			name:   "responses alias",
+			method: http.MethodPost,
+			path:   "/v1/responses",
+			body:   `{"model":"coding-economy-20260717","input":"hello"}`,
+			handle: (*ProxyHandler).HandleResponses,
+		},
+		{
+			name:   "responses compact",
+			method: http.MethodPost,
+			path:   "/v1/responses/compact",
+			body:   `{"model":"coding-economy","input":[{"role":"user","content":"hello"}]}`,
+			handle: (*ProxyHandler).HandleCompact,
+		},
+		{
+			name:   "memory summarize",
+			method: http.MethodPost,
+			path:   "/v1/memories/trace_summarize",
+			body:   `{"model":"coding-economy","traces":[{"id":"trace-1","items":[]}]}`,
+			handle: (*ProxyHandler).HandleMemorySummarize,
+		},
+		{
+			name:   "anthropic",
+			method: http.MethodPost,
+			path:   "/v1/messages",
+			body:   `{"model":"coding-economy","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`,
+			handle: (*ProxyHandler).HandleAnthropicMessages,
+		},
+		{
+			name:   "anthropic count tokens",
+			method: http.MethodPost,
+			path:   "/v1/messages/count_tokens",
+			body:   `{"model":"coding-economy","messages":[{"role":"user","content":"hello"}]}`,
+			handle: (*ProxyHandler).HandleAnthropicMessagesCountTokens,
+		},
+		{
+			name:   "gemini",
+			method: http.MethodPost,
+			path:   "/v1beta/models/coding-economy:generateContent",
+			body:   `{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`,
+			handle: (*ProxyHandler).HandleGeminiModels,
+		},
+		{
+			name:   "gemini stream",
+			method: http.MethodPost,
+			path:   "/v1beta/models/coding-economy:streamGenerateContent",
+			body:   `{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`,
+			handle: (*ProxyHandler).HandleGeminiModels,
+		},
+		{
+			name:   "gemini count tokens",
+			method: http.MethodPost,
+			path:   "/v1beta/models/coding-economy:countTokens",
+			body:   `{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`,
+			handle: (*ProxyHandler).HandleGeminiModels,
+		},
+		{
+			name:   "gemini malformed body",
+			method: http.MethodPost,
+			path:   "/v1beta/models/coding-economy:generateContent",
+			body:   `{"contents":[`,
+			handle: (*ProxyHandler).HandleGeminiModels,
+		},
+		{
+			name:   "chat image",
+			method: http.MethodPost,
+			path:   "/v1/chat/completions",
+			body:   `{"model":"coding-economy","messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}`,
+			handle: (*ProxyHandler).HandleOpenAIChatCompletions,
+		},
+		{
+			name:   "chat hosted tool alias",
+			method: http.MethodPost,
+			path:   "/v1/chat/completions",
+			body:   `{"model":"coding-economy-20260717","messages":[{"role":"user","content":"search"}],"tools":[{"type":"web_search"}]}`,
+			handle: (*ProxyHandler).HandleOpenAIChatCompletions,
+		},
+		{
+			name:   "chat responses replay",
+			method: http.MethodPost,
+			path:   "/v1/chat/completions",
+			body:   `{"model":"coding-economy","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`,
+			handle: (*ProxyHandler).HandleOpenAIChatCompletions,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var sends atomic.Int64
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sends.Add(1)
+				http.Error(w, "unexpected upstream request", http.StatusBadGateway)
+			}))
+			defer upstream.Close()
+
+			h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+				WithProvidersConfig(policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)),
+				WithPolicyRoutingMode(PolicyRoutingModeOff),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
+			ctx, summary := WithRequestSummary(req.Context())
+			req = req.WithContext(ctx)
+			recorder := httptest.NewRecorder()
+
+			tt.handle(h, recorder, req)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if strings.HasPrefix(tt.name, "gemini") && strings.Contains(recorder.Body.String(), "upstream request failed") {
+				t.Fatalf("local Gemini rejection used upstream wording: %s", recorder.Body.String())
+			}
+			if got := sends.Load(); got != 0 {
+				t.Fatalf("upstream sends = %d, want zero", got)
+			}
+			if got := summary.UpstreamSendCount(); got != 0 {
+				t.Fatalf("summary upstream sends = %d, want zero", got)
+			}
+
+			h.RecordRequest(summary, recorder.Code, "test", time.Millisecond)
+			snapshot := h.stats.snapshot()
+			if len(snapshot.ByProvider) != 0 {
+				t.Fatalf("by_provider leaked policy topology: %+v", snapshot.ByProvider)
+			}
+			if len(snapshot.ByRoute) != 1 || snapshot.ByRoute[0].Route != "coding-economy" || snapshot.ByRoute[0].Errors != 1 {
+				t.Fatalf("by_route = %+v, want one public policy error", snapshot.ByRoute)
+			}
+			if len(snapshot.ByModel) != 1 || snapshot.ByModel[0].Model != "coding-economy" || snapshot.ByModel[0].Errors != 1 {
+				t.Fatalf("by_model = %+v, want one public policy error", snapshot.ByModel)
+			}
+			if len(snapshot.ByTarget) != 0 || len(snapshot.RecentAttempts) != 0 {
+				t.Fatalf("physical topology recorded without an upstream send: targets=%+v attempts=%+v", snapshot.ByTarget, snapshot.RecentAttempts)
+			}
+			if len(snapshot.Recent) != 1 {
+				t.Fatalf("recent = %+v, want one request", snapshot.Recent)
+			}
+			recent := snapshot.Recent[0]
+			if recent.Model != "coding-economy" || recent.RouteID != "coding-economy" || recent.FinalTarget != "coding-economy" {
+				t.Fatalf("recent public attribution = %+v", recent)
+			}
+			if recent.Provider != "" || recent.UpstreamRequestID != "" || recent.UpstreamSends != 0 {
+				t.Fatalf("recent leaked policy topology: %+v", recent)
+			}
+			if len(snapshot.Errors) != 1 || snapshot.Errors[0].Label != "coding-economy" || snapshot.Errors[0].Count != 1 {
+				t.Fatalf("errors = %+v, want public policy identity only", snapshot.Errors)
+			}
+		})
+	}
+}
 
 // newStatsRequestSummary builds a populated RequestSummary using the in-package
 // setters, as handlers do at runtime.

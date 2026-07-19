@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	// policyStatsMaxProfiles matches the schema-v3 policy-profile limit. One
+	// policyStatsMaxProfiles matches the schema-v2 policy-profile limit. One
 	// additional fixed "other" row receives observations whose profile label
 	// arrives after the cap, so arbitrary labels cannot grow memory.
 	policyStatsMaxProfiles = 128

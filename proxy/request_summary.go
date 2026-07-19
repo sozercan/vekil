@@ -23,6 +23,7 @@ type RequestSummary struct {
 	providerKind              string
 	operationID               string
 	routeID                   string
+	policyPublicID            string
 	policyID                  string
 	policyMode                string
 	policyTier                string
@@ -151,6 +152,33 @@ func (s *RequestSummary) RouteID() string {
 	return s.routeID
 }
 
+// SetPolicyIdentity records the canonical public identity of a policy model
+// before a classifier decision exists. Unsupported protocol surfaces use this
+// path so request logging and traffic statistics stay attributed to the public
+// policy model without resolving or retaining terminal-provider topology.
+func (s *RequestSummary) SetPolicyIdentity(publicID string) {
+	if s == nil {
+		return
+	}
+	publicID = strings.TrimSpace(publicID)
+	if publicID == "" {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.policyPublicID = publicID
+	s.model = publicID
+	s.routeID = publicID
+	s.finalTarget = publicID
+	s.provider = ""
+	s.providerKind = ""
+	s.lastTarget = ""
+	s.lastProvider = ""
+	s.lastProviderKind = ""
+	s.upstreamRequestID = ""
+}
+
 // SetPolicyDecision records bounded, content-free routing provenance for a
 // policy-selected request. Generation values are hashes and never include
 // secrets or request content.
@@ -160,6 +188,9 @@ func (s *RequestSummary) SetPolicyDecision(plan chatOperationPlan) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if publicID := strings.TrimSpace(plan.publicID); publicID != "" {
+		s.policyPublicID = publicID
+	}
 	s.policyID = plan.policyID
 	s.policyMode = plan.effectiveMode.String()
 	s.policyTier = plan.selectedTier.String()
@@ -182,6 +213,16 @@ func (s *RequestSummary) policyPublicIDForStats() string {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.policyPublicIDForStatsLocked()
+}
+
+func (s *RequestSummary) policyPublicIDForStatsLocked() string {
+	if s == nil {
+		return ""
+	}
+	if publicID := strings.TrimSpace(s.policyPublicID); publicID != "" {
+		return publicID
+	}
 	if strings.TrimSpace(s.policyID) == "" {
 		return ""
 	}
@@ -205,6 +246,10 @@ func (s *RequestSummary) SetFinalTarget(targetID string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.policyIdentityOnlyLocked() {
+		s.finalTarget = s.policyPublicID
+		return
+	}
 	s.finalTarget = targetID
 }
 
@@ -225,6 +270,12 @@ func (s *RequestSummary) setFinalRouteAttribution(targetID, provider, kind strin
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.policyIdentityOnlyLocked() {
+		s.finalTarget = s.policyPublicID
+		s.provider = ""
+		s.providerKind = ""
+		return
+	}
 	s.finalTarget = targetID
 	s.provider = provider
 	s.providerKind = kind
@@ -245,6 +296,13 @@ func (s *RequestSummary) setFinalRouteResult(targetID, provider, kind, upstreamR
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.policyIdentityOnlyLocked() {
+		s.finalTarget = s.policyPublicID
+		s.provider = ""
+		s.providerKind = ""
+		s.upstreamRequestID = ""
+		return
+	}
 	s.finalTarget = targetID
 	s.provider = strings.TrimSpace(provider)
 	s.providerKind = strings.TrimSpace(kind)
@@ -288,6 +346,12 @@ func (s *RequestSummary) recordUpstreamAttempt(operationID, routeID, targetID, p
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.policyIdentityOnlyLocked() {
+		routeID = s.policyPublicID
+		targetID = s.policyPublicID
+		provider = ""
+		kind = ""
+	}
 	if s.operationID == "" && operationID != "" {
 		s.operationID = operationID
 	}
@@ -397,6 +461,9 @@ func (s *RequestSummary) setProvider(provider, kind string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.policyIdentityOnlyLocked() {
+		return
+	}
 	if provider = strings.TrimSpace(provider); provider != "" {
 		s.provider = provider
 	}
@@ -415,7 +482,14 @@ func (s *RequestSummary) setUpstreamRequestID(requestID string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.policyIdentityOnlyLocked() {
+		return
+	}
 	s.upstreamRequestID = requestID
+}
+
+func (s *RequestSummary) policyIdentityOnlyLocked() bool {
+	return s != nil && strings.TrimSpace(s.policyPublicID) != "" && strings.TrimSpace(s.policyID) == ""
 }
 
 func (s *RequestSummary) setOpenAIUsage(usage *models.OpenAIUsage) {
@@ -606,12 +680,59 @@ func (h *ProxyHandler) observeRequestSummary(ctx context.Context, endpoint, mode
 	h.observeRequestSummaryWithProviderModel(ctx, endpoint, model, model, stream, providerEndpoint)
 }
 
+func (h *ProxyHandler) policyPublicModelID(model string) (string, bool) {
+	if h == nil {
+		return "", false
+	}
+	entry, known := h.providerSetup().lookupPublicModelEntry(model)
+	if !known || entry == nil || entry.kind != publicEntryPolicy {
+		return "", false
+	}
+	publicID := strings.TrimSpace(entry.id)
+	return publicID, publicID != ""
+}
+
+// observePolicyRequestSummary establishes canonical policy ownership as soon as
+// a protocol surface can identify the requested model. This must happen before
+// body-shape or endpoint validation so local rejections cannot fall through to
+// default-provider or unrouted statistics.
+func (h *ProxyHandler) observePolicyRequestSummary(ctx context.Context, endpoint, model string, stream bool) bool {
+	publicID, ok := h.policyPublicModelID(model)
+	if !ok {
+		return false
+	}
+	summary := RequestSummaryFromContext(ctx)
+	if summary == nil {
+		return true
+	}
+	summary.setRoute(endpoint, model, stream)
+	summary.SetPolicyIdentity(publicID)
+	return true
+}
+
 func (h *ProxyHandler) observeRequestSummaryWithProviderModel(ctx context.Context, endpoint, model, providerModel string, stream bool, providerEndpoint string) {
 	summary := RequestSummaryFromContext(ctx)
 	if summary == nil {
 		return
 	}
 	summary.setRoute(endpoint, model, stream)
+	if publicID, ok := h.policyPublicModelID(model); ok {
+		summary.SetPolicyIdentity(publicID)
+		return
+	}
+	providerModel = strings.TrimSpace(providerModel)
+	if providerModel == "" {
+		return
+	}
+	// Operational IDs for internal terminal/classifier routes are never public
+	// model identities. If a client guesses one, reject it without confirming
+	// the owning provider through logs or traffic statistics.
+	if route, known := h.providerSetup().lookupTerminalRoute(strings.TrimSpace(model)); known && route != nil && !route.isPublic() {
+		return
+	}
+	if route, known := h.providerSetup().lookupTerminalRoute(providerModel); known && route != nil && !route.isPublic() {
+		return
+	}
 	provider, _, _ := h.resolveProviderModelForRequest(providerModel, providerEndpoint)
 	if provider == nil {
 		return

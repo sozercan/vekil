@@ -13,6 +13,7 @@ import (
 const (
 	policyFactGenerationVersion     = "coding-agent-facts-v1"
 	policyFunctionGenerationVersion = "emit-policy-signals-v1"
+	policyPromptGenerationVersion   = "coding-agent-classifier-prompt-v2"
 	policyMapperGenerationVersion   = "coding-agent-mapper-v1"
 )
 
@@ -59,8 +60,9 @@ func policyClassifierGeneration(route *modelRoute) string {
 		Target         interface{} `json:"target"`
 		FactSchema     string      `json:"fact_schema"`
 		FunctionSchema string      `json:"function_schema"`
+		Prompt         string      `json:"prompt"`
 		Mapper         string      `json:"mapper"`
-	}{routeID, target, policyFactGenerationVersion, policyFunctionGenerationVersion, policyMapperGenerationVersion})
+	}{routeID, target, policyFactGenerationVersion, policyFunctionGenerationVersion, policyPromptGenerationVersion, policyMapperGenerationVersion})
 }
 
 func policyBinaryGeneration() string {

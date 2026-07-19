@@ -34,7 +34,7 @@ func TestValidateProvidersConfigFileLiveSkipsUnrelatedDynamicDiscovery(t *testin
 	}))
 	defer upstream.Close()
 
-	body := `schema_version: 3
+	body := `schema_version: 2
 providers:
   - id: dynamic
     type: openai-compatible

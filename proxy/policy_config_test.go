@@ -8,8 +8,8 @@ import (
 	"testing"
 )
 
-func validSchemaV3PolicyYAML() string {
-	return `schema_version: 3
+func validSchemaV2PolicyYAML() string {
+	return `schema_version: 2
 providers:
   - id: light-provider
     type: openai-compatible
@@ -68,17 +68,17 @@ policy_profiles:
 `
 }
 
-func TestSchemaV3PolicyConfigCompilesTerminalAndPublicRegistries(t *testing.T) {
+func TestSchemaV2PolicyConfigCompilesTerminalAndPublicRegistries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "providers.yaml")
-	if err := os.WriteFile(path, []byte(validSchemaV3PolicyYAML()), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(validSchemaV2PolicyYAML()), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := LoadProvidersConfigFile(path)
 	if err != nil {
 		t.Fatalf("LoadProvidersConfigFile() error = %v", err)
 	}
-	if got := cfg.EffectiveSchemaVersion(); got != ProvidersConfigSchemaVersion3 {
-		t.Fatalf("schema version = %d, want 3", got)
+	if got := cfg.EffectiveSchemaVersion(); got != ProvidersConfigSchemaVersion2 {
+		t.Fatalf("schema version = %d, want 2", got)
 	}
 	profile := cfg.PolicyProfiles[0]
 	if profile.Mode != policyConfigModeOff || profile.Name != profile.PublicID {
@@ -97,7 +97,7 @@ func TestSchemaV3PolicyConfigCompilesTerminalAndPublicRegistries(t *testing.T) {
 		t.Fatalf("buildConfiguredProviderSetupWithDynamicValidation() error = %v", err)
 	}
 	if setup.defaultProviderID != "" {
-		t.Fatalf("default provider = %q, want empty for route-only schema v3 config", setup.defaultProviderID)
+		t.Fatalf("default provider = %q, want empty for policy-owned schema v2 config", setup.defaultProviderID)
 	}
 	for _, routeID := range []string{"light-route", "powerful-route", "classifier-route"} {
 		route, ok := setup.lookupTerminalRoute(routeID)
@@ -157,9 +157,53 @@ func TestSchemaV3PolicyConfigCompilesTerminalAndPublicRegistries(t *testing.T) {
 	}
 }
 
+func TestSchemaV1RejectsSchemaV2PolicyFeatureFields(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ext  string
+		body string
+		want string
+	}{
+		{
+			name: "yaml policy profiles",
+			ext:  ".yaml",
+			body: "schema_version: 1\nproviders: []\npolicy_profiles: []\n",
+			want: "policy_profiles: requires schema_version: 2",
+		},
+		{
+			name: "json policy profiles",
+			ext:  ".json",
+			body: `{"schema_version":1,"providers":[],"policy_profiles":[]}`,
+			want: "policy_profiles: requires schema_version: 2",
+		},
+		{
+			name: "provider trust domain",
+			ext:  ".yaml",
+			body: "schema_version: 1\nproviders:\n  - id: upstream\n    type: openai-compatible\n    base_url: https://example.test/v1\n    auth_type: none\n    trust_domain: org\n",
+			want: "providers[0].trust_domain: requires schema_version: 2",
+		},
+		{
+			name: "classifier no-store capability",
+			ext:  ".yaml",
+			body: "schema_version: 1\nproviders:\n  - id: upstream\n    type: openai-compatible\n    base_url: https://example.test/v1\n    auth_type: none\n    classifier_no_store_supported: true\n",
+			want: "providers[0].classifier_no_store_supported: requires schema_version: 2",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "providers"+tc.ext)
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadProvidersConfigFile(path); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadProvidersConfigFile() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestPolicyPublicEntryLookupUsesRequestSideNormalization(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "providers.yaml")
-	if err := os.WriteFile(path, []byte(validSchemaV3PolicyYAML()), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(validSchemaV2PolicyYAML()), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := LoadProvidersConfigFile(path)
@@ -177,19 +221,12 @@ func TestPolicyPublicEntryLookupUsesRequestSideNormalization(t *testing.T) {
 	}
 }
 
-func TestSchemaV3PolicyValidationRejectsPrivacyAndExposureViolations(t *testing.T) {
+func TestSchemaV2PolicyValidationRejectsPrivacyAndExposureViolations(t *testing.T) {
 	tests := []struct {
 		name    string
 		rewrite func(string) string
 		want    string
 	}{
-		{
-			name: "v3 field in v2",
-			rewrite: func(body string) string {
-				return strings.Replace(body, "schema_version: 3", "schema_version: 2", 1)
-			},
-			want: "policy_profiles: requires schema_version: 3",
-		},
 		{
 			name: "internal public id",
 			rewrite: func(body string) string {
@@ -223,7 +260,7 @@ func TestSchemaV3PolicyValidationRejectsPrivacyAndExposureViolations(t *testing.
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "providers.yaml")
-			if err := os.WriteFile(path, []byte(tc.rewrite(validSchemaV3PolicyYAML())), 0o600); err != nil {
+			if err := os.WriteFile(path, []byte(tc.rewrite(validSchemaV2PolicyYAML())), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			_, err := LoadProvidersConfigFile(path)
@@ -234,9 +271,9 @@ func TestSchemaV3PolicyValidationRejectsPrivacyAndExposureViolations(t *testing.
 	}
 }
 
-func TestSchemaV3RejectsMoreThanMaximumPolicyProfiles(t *testing.T) {
+func TestSchemaV2RejectsMoreThanMaximumPolicyProfiles(t *testing.T) {
 	cfg := ProvidersConfig{
-		SchemaVersion:  ProvidersConfigSchemaVersion3,
+		SchemaVersion:  ProvidersConfigSchemaVersion2,
 		PolicyProfiles: make([]PolicyProfileConfig, maxPolicyProfiles+1),
 	}
 	if err := ValidateProvidersConfig(cfg); err == nil || !strings.Contains(err.Error(), "maximum is 128") {
@@ -252,14 +289,14 @@ func TestPolicyRoutingExampleConfigValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadProvidersConfigFile(%q) error = %v", path, err)
 	}
-	if cfg.EffectiveSchemaVersion() != ProvidersConfigSchemaVersion3 || len(cfg.PolicyProfiles) != 1 {
+	if cfg.EffectiveSchemaVersion() != ProvidersConfigSchemaVersion2 || len(cfg.PolicyProfiles) != 1 {
 		t.Fatalf("example config = schema %d profiles %d", cfg.EffectiveSchemaVersion(), len(cfg.PolicyProfiles))
 	}
 }
 
-func TestSchemaV3RejectsPolicyPublicInsightModelOnly(t *testing.T) {
+func TestSchemaV2RejectsPolicyPublicInsightModelOnly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "providers.yaml")
-	body := validSchemaV3PolicyYAML() + "insight_model: coding-policy-20260717\n"
+	body := validSchemaV2PolicyYAML() + "insight_model: coding-policy-20260717\n"
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -268,8 +305,8 @@ func TestSchemaV3RejectsPolicyPublicInsightModelOnly(t *testing.T) {
 	}
 }
 
-func TestSchemaV3AllowsInsightPublicIDEqualToOperationalID(t *testing.T) {
-	body := strings.Replace(validSchemaV3PolicyYAML(), "model_routes:\n", `model_routes:
+func TestSchemaV2AllowsInsightPublicIDEqualToOperationalID(t *testing.T) {
+	body := strings.Replace(validSchemaV2PolicyYAML(), "model_routes:\n", `model_routes:
   - id: public-insight-route
     public_id: classifier-route
     endpoints: [/chat/completions]
@@ -323,17 +360,17 @@ func TestPolicyClassifierZeroValidFieldsRejectNull(t *testing.T) {
 		{
 			name: "yaml recent turns",
 			ext:  ".yaml",
-			body: strings.Replace(validSchemaV3PolicyYAML(), "      recent_turns: 0", "      recent_turns: null", 1),
+			body: strings.Replace(validSchemaV2PolicyYAML(), "      recent_turns: 0", "      recent_turns: null", 1),
 		},
 		{
 			name: "yaml sample rate",
 			ext:  ".yaml",
-			body: strings.Replace(validSchemaV3PolicyYAML(), "      observe_sample_rate: 0", "      observe_sample_rate: null", 1),
+			body: strings.Replace(validSchemaV2PolicyYAML(), "      observe_sample_rate: 0", "      observe_sample_rate: null", 1),
 		},
 		{
 			name: "json recent turns",
 			ext:  ".json",
-			body: `{"schema_version":3,"providers":[{"id":"p","type":"openai-compatible","base_url":"https://example.test","auth_type":"none","trust_domain":"org","classifier_no_store_supported":true}],"model_routes":[{"id":"l","exposure":"internal","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"l"}]},{"id":"h","exposure":"internal","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"h"}]},{"id":"c","exposure":"internal","internal_purpose":"policy_classifier","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"c"}]}],"policy_profiles":[{"id":"policy","public_id":"policy","lightweight_route":"l","powerful_route":"h","classifier":{"route":"c","recent_turns":null},"data_policy":{"content_forwarding_acknowledged":true}}]}`,
+			body: `{"schema_version":2,"providers":[{"id":"p","type":"openai-compatible","base_url":"https://example.test","auth_type":"none","trust_domain":"org","classifier_no_store_supported":true}],"model_routes":[{"id":"l","exposure":"internal","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"l"}]},{"id":"h","exposure":"internal","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"h"}]},{"id":"c","exposure":"internal","internal_purpose":"policy_classifier","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"c"}]}],"policy_profiles":[{"id":"policy","public_id":"policy","lightweight_route":"l","powerful_route":"h","classifier":{"route":"c","recent_turns":null},"data_policy":{"content_forwarding_acknowledged":true}}]}`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -349,7 +386,7 @@ func TestPolicyClassifierZeroValidFieldsRejectNull(t *testing.T) {
 }
 
 func TestPolicyClassifierZeroValuesPreservedThroughYAMLAlias(t *testing.T) {
-	body := `schema_version: 3
+	body := `schema_version: 2
 providers:
   - id: provider
     type: openai-compatible

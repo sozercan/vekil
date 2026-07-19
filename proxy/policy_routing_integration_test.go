@@ -163,7 +163,7 @@ func policyIntegrationConfig(lightURL, powerfulURL, profileMode string) Provider
 	trueValue := true
 	parallel := true
 	return ProvidersConfig{
-		SchemaVersion: ProvidersConfigSchemaVersion3,
+		SchemaVersion: ProvidersConfigSchemaVersion2,
 		Providers: []ProviderConfig{
 			{ID: "light-provider", Type: string(providerTypeOpenAICompatible), BaseURL: lightURL, AuthType: string(providerAuthTypeNone), TrustDomain: "org-ai", ClassifierNoStoreSupported: &trueValue},
 			{ID: "power-provider", Type: string(providerTypeOpenAICompatible), BaseURL: powerfulURL, AuthType: string(providerAuthTypeNone), TrustDomain: "org-ai"},
@@ -1200,6 +1200,57 @@ func TestPolicyResponsesReplayIDRejectedBeforeClassifierSend(t *testing.T) {
 	}
 }
 
+func TestPolicyInvalidNativeToolHistoryRejectedBeforeClassifierSend(t *testing.T) {
+	bodies := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "unknown tool result",
+			body: `{"model":"coding-economy","messages":[{"role":"user","content":"task"},{"role":"assistant","tool_calls":[{"id":"call-known","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call-unknown","content":"result"}]}`,
+		},
+		{
+			name: "duplicate tool result",
+			body: `{"model":"coding-economy","messages":[{"role":"user","content":"task"},{"role":"assistant","tool_calls":[{"id":"call-dup","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call-dup","content":"first"},{"role":"tool","tool_call_id":"call-dup","content":"second"}]}`,
+		},
+		{
+			name: "duplicate assistant tool call ID",
+			body: `{"model":"coding-economy","messages":[{"role":"user","content":"task"},{"role":"assistant","tool_calls":[{"id":"call-same","type":"function","function":{"name":"one","arguments":"{}"}},{"id":"call-same","type":"function","function":{"name":"two","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call-same","content":"result"}]}`,
+		},
+		{
+			name: "missing tool result",
+			body: `{"model":"coding-economy","messages":[{"role":"user","content":"task"},{"role":"assistant","tool_calls":[{"id":"call-pending","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"user","content":"continue"}]}`,
+		},
+	}
+
+	for _, test := range bodies {
+		t.Run(test.name, func(t *testing.T) {
+			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+			powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			h, err := NewProxyHandler(nil, nil, WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)), WithPolicyRoutingMode(PolicyRoutingModeEnforce))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := light.snapshot()
+			recorder := httptest.NewRecorder()
+			h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(test.body)))
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			after, _ := light.snapshot()
+			if after != before {
+				t.Fatalf("classifier/terminal sends before=%d after=%d", before, after)
+			}
+			if sends, _ := powerful.snapshot(); sends != 0 {
+				t.Fatalf("powerful sends=%d", sends)
+			}
+		})
+	}
+}
+
 func TestPolicyTerminalSuccessHeadersAreSanitized(t *testing.T) {
 	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
 	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
@@ -1221,8 +1272,11 @@ func TestPolicyTerminalSuccessHeadersAreSanitized(t *testing.T) {
 	if got := recorder.Header().Get("Openai-Model"); got != "coding-economy" {
 		t.Fatalf("Openai-Model=%q", got)
 	}
-	if got := recorder.Header().Get("X-Request-ID"); got != "terminal-provider-region-request" {
-		t.Fatalf("X-Request-ID=%q", got)
+	if got := recorder.Header().Get("X-Request-ID"); got != "" {
+		t.Fatalf("X-Request-ID=%q, want omitted", got)
+	}
+	if got := recorder.Header().Get("X-Vekil-Request-ID"); got == "" {
+		t.Fatal("X-Vekil-Request-ID is missing")
 	}
 	for _, name := range []string{"X-Azure-Request-ID", "OpenAI-Processing-Ms", "X-Vekil-Internal-Route"} {
 		if got := recorder.Header().Get(name); got != "" {
@@ -1258,8 +1312,11 @@ func TestPolicyTerminalHTTPErrorIsSanitized(t *testing.T) {
 	if got := recorder.Header().Get("X-Openai-Model"); got != "coding-economy" {
 		t.Fatalf("X-Openai-Model=%q", got)
 	}
-	if got := recorder.Header().Get("X-Request-ID"); got != "terminal-request" {
-		t.Fatalf("X-Request-ID=%q", got)
+	if got := recorder.Header().Get("X-Request-ID"); got != "" {
+		t.Fatalf("X-Request-ID=%q, want omitted", got)
+	}
+	if got := recorder.Header().Get("X-Vekil-Request-ID"); got == "" {
+		t.Fatal("X-Vekil-Request-ID is missing")
 	}
 	if got := recorder.Header().Get("X-Vekil-Internal-Route"); got != "" {
 		t.Fatalf("X-Vekil-Internal-Route=%q", got)
@@ -1338,8 +1395,11 @@ func TestPolicyTerminalStreamErrorIsSanitized(t *testing.T) {
 				if got := recorder.Header().Get("Openai-Model"); got != "coding-economy" {
 					t.Fatalf("Openai-Model=%q", got)
 				}
-				if got := recorder.Header().Get("X-Request-ID"); got != "terminal-stream-request" {
-					t.Fatalf("X-Request-ID=%q", got)
+				if got := recorder.Header().Get("X-Request-ID"); got != "" {
+					t.Fatalf("X-Request-ID=%q, want omitted", got)
+				}
+				if got := recorder.Header().Get("X-Vekil-Request-ID"); got == "" {
+					t.Fatal("X-Vekil-Request-ID is missing")
 				}
 			}
 		})
@@ -1371,8 +1431,11 @@ func TestPolicyPrecommitStreamErrorIsSanitized(t *testing.T) {
 	if got := recorder.Header().Get("Openai-Model"); got != "coding-economy" {
 		t.Fatalf("Openai-Model=%q", got)
 	}
-	if got := recorder.Header().Get("X-Request-ID"); got != "terminal-stream-request" {
-		t.Fatalf("X-Request-ID=%q", got)
+	if got := recorder.Header().Get("X-Request-ID"); got != "" {
+		t.Fatalf("X-Request-ID=%q, want omitted", got)
+	}
+	if got := recorder.Header().Get("X-Vekil-Request-ID"); got == "" {
+		t.Fatal("X-Vekil-Request-ID is missing")
 	}
 	if got := recorder.Header().Get("X-Azure-Request-ID"); got != "" {
 		t.Fatalf("X-Azure-Request-ID=%q", got)

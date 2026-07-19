@@ -23,6 +23,8 @@ func TestPolicyChatSafeHeadersQuotaAllowlist(t *testing.T) {
 		{name: "retry after zero", header: "Retry-After", value: "0", want: true},
 		{name: "retry after past date", header: "Retry-After", value: pastHTTPDate, want: true},
 		{name: "retry after malformed", header: "Retry-After", value: "power-provider", want: false},
+		{name: "upstream request id omitted", header: "X-Request-ID", value: "opaque-upstream-id", want: false},
+		{name: "topology-bearing request id omitted", header: "Request-ID", value: "westus3-power-provider", want: false},
 		{name: "standard limit window", header: "RateLimit-Limit", value: "100;w=60, 20;w=1", want: true},
 		{name: "standard limit arbitrary parameter", header: "RateLimit-Limit", value: "100;policy=power-provider", want: false},
 		{name: "standard remaining", header: "RateLimit-Remaining", value: "42", want: true},

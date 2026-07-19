@@ -2,7 +2,7 @@
 
 These examples all target the same local proxy. Replace model IDs with public IDs from `/v1/models` in your deployment; client setup does not need to change when a model is backed by GitHub Copilot, Azure OpenAI, OpenAI Codex, or a generic compatible provider.
 
-## Schema-v3 policy profile IDs
+## Schema-v2 policy profile IDs
 
 A semantic policy profile such as `coding-economy` is a narrower public model contract than a direct model ID. In v1 it is accepted only by text/function-tool `POST /v1/chat/completions`. It is not accepted by Anthropic Messages (including Claude Code), Gemini routes/CLI, OpenAI Responses, the Responses websocket bridge, compact/memory endpoints, or token-counting routes. Responses-native terminal routes are also ineligible policy destinations.
 

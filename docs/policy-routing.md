@@ -1,6 +1,6 @@
 # Semantic Policy Routing
 
-Semantic policy routing lets one public OpenAI Chat model ID choose between a `lightweight` and a `powerful` terminal route for each root request. It is a schema-version-3 feature layered above Vekil's provider-agnostic route executor: the policy chooses one terminal route, then the existing executor owns target ordering, provider auth, model rewriting, safe physical failover, streaming, and response normalization.
+Semantic policy routing lets one public OpenAI Chat model ID choose between a `lightweight` and a `powerful` terminal route for each root request. It is a schema-version-2 feature layered above Vekil's provider-agnostic route executor: the policy chooses one terminal route, then the existing executor owns target ordering, provider auth, model rewriting, safe physical failover, streaming, and response normalization.
 
 The first release is intentionally narrow. Treat the limits and operator gates in this document as part of the public contract, not as temporary suggestions.
 
@@ -48,6 +48,8 @@ The following are explicitly unsupported for policy public IDs in v1 and fail lo
 
 Direct public models and direct exposed terminal routes retain their existing endpoint behavior. `/v1/models` lists a policy profile as catalog metadata, but that does not extend its inference support beyond `POST /v1/chat/completions`.
 
+Native Chat tool history must be complete and internally consistent before classifier admission. Assistant tool-call IDs must be unique, every tool result must reference one pending prior call exactly once, and all pending calls must receive results before the next non-tool message. Parallel results may arrive in any order. Malformed, missing, unknown, or duplicate tool-call relationships fail locally with no classifier or terminal-model send.
+
 ## Quick start
 
 Start from [`examples/policy-routing-coding-economy.yaml`](../examples/policy-routing-coding-economy.yaml), replace the placeholder URLs/models, and export the referenced credentials.
@@ -78,9 +80,9 @@ The global policy ceiling defaults to `off`, so a profile configured as `observe
 
 > **Single-tenant warning:** v1 policy `observe` and `enforce` support one trusted user or tenant per Vekil process/deployment. Loopback is the default supported topology. A non-loopback bind requires `--policy-routing-allow-remote-single-tenant` or `POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT=true`. That acknowledgement adds no authentication or tenant isolation; use a trusted external access layer and do not expose the port publicly.
 
-## Schema-version-3 model
+## Schema-version-2 model
 
-Schema v3 separates two registries:
+Schema v2 separates two registries:
 
 - The **public model-entry registry** resolves exact public model IDs and supported normalized aliases to either a static route or a policy profile.
 - The **terminal route registry** contains public and internal operational routes. Operational provider, route, target, and deployment IDs are never public aliases.
@@ -89,7 +91,7 @@ A policy profile references terminal routes by operational `id`. It cannot refer
 
 ### Route exposure
 
-For schema v3, `model_routes[].exposure` is `public` or `internal`; omission defaults to `public`.
+For schema v2, `model_routes[].exposure` is `public` or `internal`; omission defaults to `public`.
 
 - A public route requires `public_id` and may publish normal picker/catalog metadata.
 - An internal route must omit `public_id`, `model_picker_enabled`, and `model_picker_category`.
@@ -152,7 +154,7 @@ Valid classifier profile ranges are:
 | `max_concurrency` | `1..32` |
 | `observe_sample_rate` | finite number in `[0, 1]` |
 
-At most 128 policy profiles may be configured. Schema-v3-only fields are rejected in schema v1/v2 files, and v1/v2 decoding, aliases, dynamic refresh, catalog output, retries, and YAML behavior remain unchanged.
+At most 128 policy profiles may be configured. Policy routing requires `schema_version: 2`; schema-version-1 files reject explicit-route and policy-routing fields. Existing route-only schema-version-2 configurations remain valid without `policy_profiles`, and their aliases, dynamic refresh, catalog output, retries, and YAML behavior remain unchanged.
 
 Validation also rejects:
 
@@ -262,7 +264,7 @@ After fallback precedence, the mapper selects `powerful` when any of these is tr
 - `requires_codebase_context` is true; or
 - the local fact builder truncated task/context content.
 
-Otherwise it selects `lightweight`.
+Otherwise it selects `lightweight`. The built-in classifier calibration treats an explicit low- or medium-risk edit bounded to one file or one function as `edit` with `file`/`function` scope and no broad codebase-context requirement unless the request actually depends on cross-file or cross-module information. Inspecting the named target and nearby lines does not by itself make the request codebase-wide.
 
 Classifier output is advisory data, not a trusted control plane. Malformed or adversarial content can affect only the current request's uncertain fallback; it cannot authorize actions, change another request's route, consume unbounded capacity, or open an infrastructure breaker.
 
@@ -336,7 +338,7 @@ A policy profile appears exactly once in `/v1/models` with:
 
 Both destinations must accept the same published Chat semantics. Per-target wire adaptations may differ only when they do not alter that public contract.
 
-For a policy request, public JSON, SSE, safe model headers, errors, and client-facing metrics use the policy profile's public ID. Provider, terminal route, target, and deployment IDs do not leak through normalized policy output. Direct-route output behavior remains unchanged.
+For a policy request, public JSON, SSE, safe model headers, errors, and client-facing metrics use the policy profile's public ID. This identity rule also applies when an unsupported Responses, Anthropic, or Gemini surface is rejected locally before classification. Provider, terminal route, target, and deployment IDs do not leak through normalized policy output. Upstream `X-Request-ID` and `Request-ID` values are omitted; clients receive only the proxy-owned `X-Vekil-Request-ID` correlation header. Direct-route output behavior remains unchanged.
 
 ## Metrics and decision provenance
 
@@ -355,7 +357,7 @@ Each bounded decision record carries IDs/enums/counts, latency/failure categorie
 
 - `configGeneration`: canonical normalized complete providers configuration;
 - `profileGeneration`: normalized profile, derived public contract, and terminal route IDs;
-- `classifierGeneration`: classifier route/target/model plus fact schema, forced-function schema, and mapper versions; and
+- `classifierGeneration`: classifier route/target/model plus fact schema, forced-function schema, classifier-prompt, and mapper versions; and
 - `binaryGeneration`: build version plus Git commit when available.
 
 Generation hashes use normalized values and exclude secret values. Decision records, logs, and aggregate labels never contain prompt text, raw classifier output, tool arguments, credentials, or classifier rationale.

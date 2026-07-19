@@ -155,9 +155,11 @@ func newPolicyFactBuildError(param, message string) error {
 }
 
 type parsedPolicyFactMessage struct {
-	role      policyFactRole
-	text      string
-	textBytes int
+	role        policyFactRole
+	text        string
+	textBytes   int
+	toolCallIDs []string
+	toolCallID  string
 }
 
 // buildPolicyClassifierFacts validates the supported first-release Chat shape
@@ -240,6 +242,9 @@ func buildPolicyClassifierFacts(body []byte, opts policyFactOptions) (policyClas
 			facts.Counts.TextMessages++
 		}
 	}
+	if err := validatePolicyFactToolHistory(parsedMessages); err != nil {
+		return policyClassifierFacts{}, err
+	}
 
 	buildPolicyAnchorFacts(&facts, parsedMessages)
 	buildPolicyTaskFact(&facts, parsedMessages, firstUserIndex)
@@ -299,28 +304,28 @@ func parsePolicyFactMessage(raw json.RawMessage, index int) (parsedPolicyFactMes
 		}
 	}
 
-	toolCallCount := 0
+	var toolCallIDs []string
 	if rawToolCalls, ok := object["tool_calls"]; ok {
-		toolCallCount, err = validatePolicyFactToolCalls(rawToolCalls, param+".tool_calls")
+		toolCallIDs, err = validatePolicyFactToolCalls(rawToolCalls, param+".tool_calls")
 		if err != nil {
 			return parsedPolicyFactMessage{}, 0, err
 		}
-		if role != policyFactRoleAssistant && toolCallCount > 0 {
+		if role != policyFactRoleAssistant && len(toolCallIDs) > 0 {
 			return parsedPolicyFactMessage{}, 0, newPolicyFactBuildError(param+".tool_calls", "tool_calls is supported only on assistant messages")
 		}
 	}
+	toolCallID := ""
 	if role == policyFactRoleTool {
 		rawID, ok := object["tool_call_id"]
 		if !ok {
 			return parsedPolicyFactMessage{}, 0, newPolicyFactBuildError(param+".tool_call_id", "tool_call_id is required for tool messages")
 		}
-		var callID string
-		if err := json.Unmarshal(rawID, &callID); err != nil || strings.TrimSpace(callID) == "" {
+		if err := json.Unmarshal(rawID, &toolCallID); err != nil || strings.TrimSpace(toolCallID) == "" {
 			return parsedPolicyFactMessage{}, 0, newPolicyFactBuildError(param+".tool_call_id", "tool_call_id must be a non-empty string")
 		}
 	}
 
-	return parsedPolicyFactMessage{role: role, text: text, textBytes: len(text)}, toolCallCount, nil
+	return parsedPolicyFactMessage{role: role, text: text, textBytes: len(text), toolCallIDs: toolCallIDs, toolCallID: toolCallID}, len(toolCallIDs), nil
 }
 
 func decodePolicyFactTextContent(raw json.RawMessage, param string) (string, error) {
@@ -361,53 +366,114 @@ func decodePolicyFactTextContent(raw json.RawMessage, param string) (string, err
 	return combined.String(), nil
 }
 
-func validatePolicyFactToolCalls(raw json.RawMessage, param string) (int, error) {
+func validatePolicyFactToolCalls(raw json.RawMessage, param string) ([]string, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
-		return 0, nil
+		return nil, nil
 	}
 	calls, err := decodePolicyFactArray(trimmed, param, true)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
+	ids := make([]string, 0, len(calls))
 	for index, rawCall := range calls {
 		callParam := fmt.Sprintf("%s[%d]", param, index)
 		call, err := decodePolicyFactObject(rawCall, callParam)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 		if rawType, ok := call["type"]; ok {
 			var callType string
 			if json.Unmarshal(rawType, &callType) != nil || (callType != "" && callType != "function") {
-				return 0, newPolicyFactBuildError(callParam+".type", "only function tool calls are supported")
+				return nil, newPolicyFactBuildError(callParam+".type", "only function tool calls are supported")
 			}
 		}
 		var callID string
 		if rawID, ok := call["id"]; !ok || json.Unmarshal(rawID, &callID) != nil || strings.TrimSpace(callID) == "" {
-			return 0, newPolicyFactBuildError(callParam+".id", "tool call ID is required")
+			return nil, newPolicyFactBuildError(callParam+".id", "tool call ID is required")
 		}
+		ids = append(ids, callID)
 		rawFunction, ok := call["function"]
 		if !ok {
-			return 0, newPolicyFactBuildError(callParam+".function", "function is required")
+			return nil, newPolicyFactBuildError(callParam+".function", "function is required")
 		}
 		function, err := decodePolicyFactObject(rawFunction, callParam+".function")
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 		var name string
 		if rawName, ok := function["name"]; !ok || json.Unmarshal(rawName, &name) != nil || strings.TrimSpace(name) == "" {
-			return 0, newPolicyFactBuildError(callParam+".function.name", "function name is required")
+			return nil, newPolicyFactBuildError(callParam+".function.name", "function name is required")
 		}
 		rawArguments, ok := function["arguments"]
 		if !ok {
-			return 0, newPolicyFactBuildError(callParam+".function.arguments", "function arguments string is required")
+			return nil, newPolicyFactBuildError(callParam+".function.arguments", "function arguments string is required")
 		}
 		var arguments string
 		if json.Unmarshal(rawArguments, &arguments) != nil {
-			return 0, newPolicyFactBuildError(callParam+".function.arguments", "function arguments must be a string")
+			return nil, newPolicyFactBuildError(callParam+".function.arguments", "function arguments must be a string")
 		}
 	}
-	return len(calls), nil
+	return ids, nil
+}
+
+type policyFactPendingToolCall struct {
+	id    string
+	param string
+}
+
+func validatePolicyFactToolHistory(messages []parsedPolicyFactMessage) error {
+	pending := make(map[string]string)
+	completed := make(map[string]struct{})
+	pendingOrder := make([]policyFactPendingToolCall, 0)
+
+	firstPending := func() (policyFactPendingToolCall, bool) {
+		for _, call := range pendingOrder {
+			if _, ok := pending[call.id]; ok {
+				return call, true
+			}
+		}
+		return policyFactPendingToolCall{}, false
+	}
+
+	for messageIndex, message := range messages {
+		if message.role == policyFactRoleTool {
+			param := fmt.Sprintf("messages[%d].tool_call_id", messageIndex)
+			if _, ok := completed[message.toolCallID]; ok {
+				return newPolicyFactBuildError(param, "duplicate tool result")
+			}
+			if _, ok := pending[message.toolCallID]; !ok {
+				return newPolicyFactBuildError(param, "tool result references no pending assistant tool call")
+			}
+			delete(pending, message.toolCallID)
+			completed[message.toolCallID] = struct{}{}
+			continue
+		}
+
+		if call, ok := firstPending(); ok {
+			return newPolicyFactBuildError(call.param, "tool call is missing tool result before the next non-tool message")
+		}
+
+		// Tool-call IDs correlate one completed assistant/tool round. Providers
+		// may reuse turn-local IDs in a later completed round, so reset the prior
+		// round before accepting another non-tool message.
+		clear(completed)
+		clear(pending)
+		pendingOrder = pendingOrder[:0]
+		for callIndex, callID := range message.toolCallIDs {
+			param := fmt.Sprintf("messages[%d].tool_calls[%d].id", messageIndex, callIndex)
+			if prior, ok := pending[callID]; ok {
+				return newPolicyFactBuildError(param, fmt.Sprintf("duplicate tool call ID (already declared at %s)", prior))
+			}
+			pending[callID] = param
+			pendingOrder = append(pendingOrder, policyFactPendingToolCall{id: callID, param: param})
+		}
+	}
+
+	if call, ok := firstPending(); ok {
+		return newPolicyFactBuildError(call.param, "tool call has no matching tool result")
+	}
+	return nil
 }
 
 func buildPolicyAnchorFacts(facts *policyClassifierFacts, messages []parsedPolicyFactMessage) {

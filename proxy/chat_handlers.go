@@ -1482,6 +1482,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	defer func() { _ = r.Body.Close() }()
 
 	admissionModel := extractOpenAIChatCompletionsRequestModel(body)
+	h.observePolicyRequestSummary(r.Context(), "anthropic", admissionModel, false)
 	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), admissionModel, providerEndpointMessages)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
@@ -1742,6 +1743,7 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 	defer func() { _ = r.Body.Close() }()
 
 	admissionModel := extractOpenAIChatCompletionsRequestModel(body)
+	h.observePolicyRequestSummary(r.Context(), "anthropic_count_tokens", admissionModel, false)
 	admissionInbound := suppressRouteAttemptStats(r.Context())
 	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), admissionInbound, admissionModel, providerEndpointMessages)
 	if err != nil {
@@ -1953,10 +1955,6 @@ func policyChatSafeHeaders(src http.Header, publicModel string) http.Header {
 		for _, value := range values {
 			value = strings.TrimSpace(value)
 			switch lower {
-			case "x-request-id", "request-id":
-				if value != "" {
-					dst.Add(key, value)
-				}
 			case "retry-after":
 				if policyChatRetryAfter(value) {
 					dst.Add(key, value)
@@ -2119,6 +2117,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 	defer func() { _ = r.Body.Close() }()
 	requestedModel := extractOpenAIChatCompletionsRequestModel(bodyBytes)
+	h.observePolicyRequestSummary(r.Context(), "openai_chat", requestedModel, false)
 	publicModel := requestedModel
 	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), requestedModel, providerEndpointChatCompletions)
 	if err != nil {

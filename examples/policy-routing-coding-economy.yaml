@@ -1,4 +1,4 @@
-# Schema-v3 semantic policy routing for a coding workload.
+# Schema-v2 semantic policy routing for a coding workload.
 #
 # Replace the placeholder URLs and upstream model IDs, then set:
 #   export LIGHTWEIGHT_API_KEY=...
@@ -21,7 +21,7 @@
 # loopback bind. A remote bind requires an explicit acknowledgement and a
 # trusted external access layer; the acknowledgement does not add auth.
 
-schema_version: 3
+schema_version: 2
 
 providers:
   - id: lightweight-provider

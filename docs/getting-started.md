@@ -5,7 +5,7 @@ Vekil commonly runs in one of two modes:
 - **Zero-config mode**: no `--providers-config`; uses the built-in GitHub Copilot upstream.
 - **Explicit provider routing**: pass `--providers-config` to expose any mix of `copilot`, `azure-openai`, `openai-codex`, `openai-compatible`, and `anthropic-compatible` providers behind the same local API surface.
 
-Schema-v3 explicit configs can define semantic policy profiles. Policy routing defaults globally to `off`; v1 profiles support only text/function-tool `POST /v1/chat/completions` requests and one trusted user/tenant per deployment. See [Semantic Policy Routing](policy-routing.md).
+Schema version 2 is the complete explicit-routing format: it supports public and internal routes, ordered failover, and optional semantic policy profiles. Existing route-only version-2 files remain valid. Policy routing defaults globally to `off`; v1 profiles support only text/function-tool `POST /v1/chat/completions` requests and one trusted user/tenant per deployment. See [Semantic Policy Routing](policy-routing.md).
 
 With either routing mode, the native binary also supports **managed agent launches**: `vekil launch` starts a short-lived proxy and a supported coding agent together, scoped to one public model.
 
@@ -92,7 +92,7 @@ vekil config validate --providers-config /path/to/providers.yaml
 vekil config validate --live --providers-config /path/to/providers.yaml
 ```
 
-The published container binds to `0.0.0.0`. A schema-v3 policy profile in effective `observe` or `enforce` therefore also requires `--policy-routing-allow-remote-single-tenant` (or `POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT=true`). This is only an acknowledgement: it does not add authentication, authorize multiple tenants, or make a published port safe. Put the deployment behind a trusted external access layer.
+The published container binds to `0.0.0.0`. A schema-v2 policy profile in effective `observe` or `enforce` therefore also requires `--policy-routing-allow-remote-single-tenant` (or `POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT=true`). This is only an acknowledgement: it does not add authentication, authorize multiple tenants, or make a published port safe. Put the deployment behind a trusted external access layer.
 
 If the config includes `type: "openai-codex"`, also mount the Codex home read-write so Vekil can journal and persist rotated refresh tokens back to the Codex-owned `auth.json`. The `--user` setting above is required for normal host files/directories owned by your UID/GID; alternatively, arrange equivalent ownership and permissions explicitly:
 
@@ -176,7 +176,7 @@ Generic `openai-compatible` and `anthropic-compatible` providers use the auth fi
 
 If your provider config omits Copilot, startup skips GitHub authentication entirely.
 
-For an effective schema-v3 policy `observe` or `enforce` profile, startup also performs one live fixed-fixture preflight per distinct classifier route. Enforce preflight failure prevents startup/readiness completion. Observe preflight failure keeps that profile off and reports a readiness/configuration diagnostic. Effective off mode sends no classifier preflight.
+For an effective schema-v2 policy `observe` or `enforce` profile, startup also performs one live fixed-fixture preflight per distinct classifier route. Enforce preflight failure prevents startup/readiness completion. Observe preflight failure keeps that profile off and reports a readiness/configuration diagnostic. Effective off mode sends no classifier preflight.
 
 ## Verify The Proxy Is Up
 

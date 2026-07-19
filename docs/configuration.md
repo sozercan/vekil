@@ -5,7 +5,7 @@ Vekil supports two runtime patterns:
 - **Zero-config mode**: no `--providers-config`; the proxy uses its built-in GitHub Copilot upstream.
 - **Explicit provider routing**: pass `--providers-config` with any mix of `copilot`, `azure-openai`, `openai-codex`, `openai-compatible`, and `anthropic-compatible`. If the config omits Copilot, GitHub auth is not used.
 
-Schema-version-3 explicit configs can additionally define [semantic policy profiles](policy-routing.md) that select one native-Chat terminal route per request. Policy routing is opt-in at runtime and defaults to globally off.
+Schema version 2 is the complete explicit-routing format: it supports public and internal routes, ordered failover, and optional [semantic policy profiles](policy-routing.md) that select one native-Chat terminal route per request. Existing route-only version-2 files remain valid. Policy routing is opt-in at runtime and defaults to globally off.
 
 ## Topic Map
 
@@ -13,7 +13,7 @@ Schema-version-3 explicit configs can additionally define [semantic policy profi
 |------|-----|
 | Runtime flags, env vars, and Copilot header overrides | This file |
 | Provider auth, JSON/YAML routing examples, model ownership, and provider metadata | [Provider Routing](provider-routing.md) |
-| Schema-v3 semantic policy profiles, privacy/trust acknowledgements, and rollout gates | [Semantic Policy Routing](policy-routing.md) |
+| Schema-v2 semantic policy profiles, privacy/trust acknowledgements, and rollout gates | [Semantic Policy Routing](policy-routing.md) |
 | Provider console links and API-key setup patterns | [Provider API Keys](provider-api-keys.md) |
 | Optional shell command rewrite and tool-output reduction config | [Tool Optimizers](tool-optimizers.md) |
 | Codex-style `GET /v1/responses` websocket bridge and compaction tuning | [Responses WebSocket Bridge](responses-websocket.md) |
@@ -53,7 +53,7 @@ These overrides only affect Copilot-backed upstream requests. For provider-level
 Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership of public model IDs across providers. Provider config files can be JSON (`.json`) or YAML (`.yaml`/`.yml`).
 
 - See [Provider Routing](provider-routing.md) for auth notes, generic-compatible provider fields, provider examples, routing rules, endpoint allowlists, and model metadata.
-- See [Semantic Policy Routing](policy-routing.md) for the schema-v3 `exposure`, `policy_profiles`, provider trust metadata, and classifier data-policy contract. A complete example is checked in at [`examples/policy-routing-coding-economy.yaml`](../examples/policy-routing-coding-economy.yaml).
+- See [Semantic Policy Routing](policy-routing.md) for the schema-v2 `exposure`, `policy_profiles`, provider trust metadata, and classifier data-policy contract. A complete example is checked in at [`examples/policy-routing-coding-economy.yaml`](../examples/policy-routing-coding-economy.yaml).
 - See [Provider API Keys](provider-api-keys.md) for provider console links and key-to-config mapping.
 - See [Tool Optimizers](tool-optimizers.md) for the optional `tool_optimizers` block that can live alongside `providers` in the same config file.
 - Set the optional top-level `insight_model` key to a public model ID the config serves to enable the dashboard's AI insights button. See [Traffic Dashboard](dashboard.md#ai-insights-optional).
@@ -66,7 +66,7 @@ Validate strict JSON/YAML decoding, references, collisions, route contracts, pol
 vekil config validate --providers-config /path/to/providers.yaml
 ```
 
-For a schema-v3 policy config, add `--live` to perform one fixed non-user classifier protocol preflight per distinct classifier route selected by the policy config:
+For a schema-v2 policy config, add `--live` to perform one fixed non-user classifier protocol preflight per distinct classifier route selected by the policy config:
 
 ```bash
 vekil config validate --live --providers-config /path/to/providers.yaml

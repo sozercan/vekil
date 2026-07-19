@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -226,64 +225,56 @@ func TestResolveStaticProviderModelHonorsFiltersAndRejectsCollisions(t *testing.
 	}
 }
 
-func TestResolveStaticProviderModelResolvesExplicitRouteMetadata(t *testing.T) {
-	for _, schemaVersion := range []int{ProvidersConfigSchemaVersion2, ProvidersConfigSchemaVersion3} {
-		t.Run(fmt.Sprintf("schema_%d", schemaVersion), func(t *testing.T) {
-			parallelToolCalls := true
-			contextWindow := int64(200000)
-			route := ModelRouteConfig{
-				ID:                "route",
-				PublicID:          "public-model",
-				Name:              "Public Model",
-				Endpoints:         []string{"/responses"},
-				ReasoningEffort:   []string{"low", "high"},
-				ParallelToolCalls: &parallelToolCalls,
-				ContextWindow:     &contextWindow,
-				Targets: []ModelRouteTargetConfig{{
-					ID:            "primary",
-					Provider:      "azure",
-					UpstreamModel: "deployment",
-				}},
-			}
-			if schemaVersion == ProvidersConfigSchemaVersion3 {
-				route.Exposure = modelRouteExposurePublic
-			}
-			cfg := ProvidersConfig{
-				SchemaVersion: schemaVersion,
-				Providers: []ProviderConfig{{
-					ID:      "azure",
-					Type:    "azure-openai",
-					BaseURL: "https://x.openai.azure.com/openai/v1",
-					APIKey:  "test-key",
-				}},
-				ModelRoutes: []ModelRouteConfig{route},
-			}
+func TestResolveStaticProviderModelResolvesSchemaV2ExplicitRouteMetadata(t *testing.T) {
+	parallelToolCalls := true
+	contextWindow := int64(200000)
+	cfg := ProvidersConfig{
+		SchemaVersion: ProvidersConfigSchemaVersion2,
+		Providers: []ProviderConfig{{
+			ID:      "azure",
+			Type:    "azure-openai",
+			BaseURL: "https://x.openai.azure.com/openai/v1",
+			APIKey:  "test-key",
+		}},
+		ModelRoutes: []ModelRouteConfig{{
+			ID:                "route",
+			PublicID:          "public-model",
+			Name:              "Public Model",
+			Endpoints:         []string{"/responses"},
+			ReasoningEffort:   []string{"low", "high"},
+			ParallelToolCalls: &parallelToolCalls,
+			ContextWindow:     &contextWindow,
+			Targets: []ModelRouteTargetConfig{{
+				ID:            "primary",
+				Provider:      "azure",
+				UpstreamModel: "deployment",
+			}},
+		}},
+	}
 
-			got, ok, err := ResolveStaticProviderModel(cfg, "public-model")
-			if err != nil {
-				t.Fatalf("ResolveStaticProviderModel() error = %v", err)
-			}
-			if !ok {
-				t.Fatal("ResolveStaticProviderModel() found = false, want explicit route metadata")
-			}
-			if got.PublicID != "public-model" || got.Name != "Public Model" {
-				t.Fatalf("resolved identity = %#v", got)
-			}
-			if !reflect.DeepEqual(got.Endpoints, []string{"/responses"}) ||
-				!reflect.DeepEqual(got.ReasoningEffort, []string{"low", "high"}) {
-				t.Fatalf("resolved route metadata = %#v", got)
-			}
-			if got.ParallelToolCalls == nil || !*got.ParallelToolCalls ||
-				got.ContextWindow == nil || *got.ContextWindow != contextWindow {
-				t.Fatalf("resolved route capabilities = %#v", got)
-			}
-		})
+	got, ok, err := ResolveStaticProviderModel(cfg, "public-model")
+	if err != nil {
+		t.Fatalf("ResolveStaticProviderModel() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("ResolveStaticProviderModel() found = false, want explicit route metadata")
+	}
+	if got.PublicID != "public-model" || got.Name != "Public Model" {
+		t.Fatalf("resolved identity = %#v", got)
+	}
+	if !reflect.DeepEqual(got.Endpoints, []string{"/responses"}) ||
+		!reflect.DeepEqual(got.ReasoningEffort, []string{"low", "high"}) {
+		t.Fatalf("resolved route metadata = %#v", got)
+	}
+	if got.ParallelToolCalls == nil || !*got.ParallelToolCalls ||
+		got.ContextWindow == nil || *got.ContextWindow != contextWindow {
+		t.Fatalf("resolved route capabilities = %#v", got)
 	}
 }
 
-func TestResolveStaticProviderModelExcludesSchemaV3InternalRoute(t *testing.T) {
+func TestResolveStaticProviderModelExcludesSchemaV2InternalRoute(t *testing.T) {
 	cfg := ProvidersConfig{
-		SchemaVersion: ProvidersConfigSchemaVersion3,
+		SchemaVersion: ProvidersConfigSchemaVersion2,
 		Providers: []ProviderConfig{{
 			ID:       "upstream",
 			Type:     "openai-compatible",

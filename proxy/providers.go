@@ -284,14 +284,16 @@ func ResolveStaticProviderModel(cfg ProvidersConfig, modelID string) (ProviderMo
 		return ProviderModelConfig{}, false, nil
 	}
 	schemaVersion := cfg.EffectiveSchemaVersion()
-	if schemaVersion == ProvidersConfigSchemaVersion2 || providersConfigSchemaSupportsPolicyRouting(schemaVersion) {
+	if schemaVersion != ProvidersConfigSchemaVersion1 {
 		validated, err := validateAndNormalizeProvidersConfig(cfg)
 		if err != nil {
 			return ProviderModelConfig{}, false, err
 		}
 		cfg = validated.config
+	}
+	if schemaVersion == ProvidersConfigSchemaVersion2 {
 		for _, route := range cfg.ModelRoutes {
-			if providersConfigSchemaSupportsPolicyRouting(schemaVersion) && route.Exposure != modelRouteExposurePublic {
+			if route.Exposure != modelRouteExposurePublic {
 				continue
 			}
 			if strings.TrimSpace(route.PublicID) != modelID {

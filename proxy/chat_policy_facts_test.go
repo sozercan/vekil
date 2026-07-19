@@ -325,6 +325,155 @@ func TestBuildPolicyClassifierFactsAcceptsDeclaredForcedFunction(t *testing.T) {
 	}
 }
 
+func TestBuildPolicyClassifierFactsValidatesNativeToolHistory(t *testing.T) {
+	toolCall := func(id, name, arguments string) map[string]any {
+		return map[string]any{
+			"id":   id,
+			"type": "function",
+			"function": map[string]any{
+				"name":      name,
+				"arguments": arguments,
+			},
+		}
+	}
+	assistantCalls := func(calls ...any) map[string]any {
+		return map[string]any{"role": "assistant", "content": nil, "tool_calls": calls}
+	}
+
+	valid := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "compare both results"},
+			assistantCalls(
+				toolCall("call-a", "lookup", `{"key":"a"}`),
+				toolCall("call-b", "lookup", `{"key":"b"}`),
+			),
+			map[string]any{"role": "tool", "tool_call_id": "call-b", "content": "result b"},
+			map[string]any{"role": "tool", "tool_call_id": "call-a", "content": "result a"},
+			map[string]any{"role": "user", "content": "now summarize"},
+		},
+	}
+	if _, err := buildPolicyClassifierFacts(marshalPolicyFactTestBody(t, valid), policyFactOptions{RecentTurns: 4}); err != nil {
+		t.Fatalf("valid reverse-order tool history error = %v", err)
+	}
+
+	validCases := []struct {
+		name string
+		body map[string]any
+	}{
+		{
+			name: "multiple completed rounds",
+			body: map[string]any{"messages": []any{
+				map[string]any{"role": "user", "content": "task"},
+				assistantCalls(toolCall("call-1", "first", `{}`)),
+				map[string]any{"role": "tool", "tool_call_id": "call-1", "content": "one"},
+				assistantCalls(toolCall("call-2", "second", `{}`)),
+				map[string]any{"role": "tool", "tool_call_id": "call-2", "content": "two"},
+				map[string]any{"role": "user", "content": "continue"},
+			}},
+		},
+		{
+			name: "later round reuses completed ID",
+			body: map[string]any{"messages": []any{
+				map[string]any{"role": "user", "content": "task"},
+				assistantCalls(toolCall("call-1", "first", `{}`)),
+				map[string]any{"role": "tool", "tool_call_id": "call-1", "content": "one"},
+				map[string]any{"role": "assistant", "content": "next round", "tool_calls": []any{toolCall("call-1", "second", `{}`)}},
+				map[string]any{"role": "tool", "tool_call_id": "call-1", "content": "two"},
+			}},
+		},
+		{
+			name: "assistant text with parallel calls",
+			body: map[string]any{"messages": []any{
+				map[string]any{"role": "user", "content": "task"},
+				map[string]any{"role": "assistant", "content": "checking both", "tool_calls": []any{
+					toolCall("call-a", "alpha", `{}`), toolCall("call-b", "beta", `{}`),
+				}},
+				map[string]any{"role": "tool", "tool_call_id": "call-b", "content": "b"},
+				map[string]any{"role": "tool", "tool_call_id": "call-a", "content": "a"},
+			}},
+		},
+		{
+			name: "empty and null tool calls",
+			body: map[string]any{"messages": []any{
+				map[string]any{"role": "user", "content": "task"},
+				map[string]any{"role": "assistant", "content": "empty", "tool_calls": []any{}},
+				map[string]any{"role": "assistant", "content": "null", "tool_calls": nil},
+			}},
+		},
+	}
+	for _, test := range validCases {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := buildPolicyClassifierFacts(marshalPolicyFactTestBody(t, test.body), policyFactOptions{RecentTurns: 8}); err != nil {
+				t.Fatalf("buildPolicyClassifierFacts() error = %v", err)
+			}
+		})
+	}
+
+	tests := []struct {
+		name    string
+		body    map[string]any
+		wantErr string
+	}{
+		{
+			name: "unknown tool result",
+			body: map[string]any{"messages": []any{
+				map[string]any{"role": "user", "content": "task"},
+				assistantCalls(toolCall("call-known", "lookup", `{}`)),
+				map[string]any{"role": "tool", "tool_call_id": "call-unknown", "content": "result"},
+			}},
+			wantErr: "references no pending assistant tool call",
+		},
+		{
+			name: "duplicate tool result",
+			body: map[string]any{"messages": []any{
+				map[string]any{"role": "user", "content": "task"},
+				assistantCalls(toolCall("call-dup", "lookup", `{}`)),
+				map[string]any{"role": "tool", "tool_call_id": "call-dup", "content": "first"},
+				map[string]any{"role": "tool", "tool_call_id": "call-dup", "content": "second"},
+			}},
+			wantErr: "duplicate tool result",
+		},
+		{
+			name: "duplicate assistant tool call ID",
+			body: map[string]any{"messages": []any{
+				map[string]any{"role": "user", "content": "task"},
+				assistantCalls(
+					toolCall("call-same", "one", `{}`),
+					toolCall("call-same", "two", `{}`),
+				),
+				map[string]any{"role": "tool", "tool_call_id": "call-same", "content": "result"},
+			}},
+			wantErr: "duplicate tool call ID",
+		},
+		{
+			name: "missing tool result before next message",
+			body: map[string]any{"messages": []any{
+				map[string]any{"role": "user", "content": "task"},
+				assistantCalls(toolCall("call-pending", "lookup", `{}`)),
+				map[string]any{"role": "user", "content": "continue anyway"},
+			}},
+			wantErr: "missing tool result before the next non-tool message",
+		},
+		{
+			name: "missing tool result at end",
+			body: map[string]any{"messages": []any{
+				map[string]any{"role": "user", "content": "task"},
+				assistantCalls(toolCall("call-pending", "lookup", `{}`)),
+			}},
+			wantErr: "has no matching tool result",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := buildPolicyClassifierFacts(marshalPolicyFactTestBody(t, test.body), policyFactOptions{RecentTurns: 4})
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("buildPolicyClassifierFacts() error = %v, want substring %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestBuildPolicyClassifierFactsRejectsInvalidOptionsAndJSON(t *testing.T) {
 	validBody := []byte(`{"messages":[{"role":"user","content":"task"}]}`)
 	for _, opts := range []policyFactOptions{

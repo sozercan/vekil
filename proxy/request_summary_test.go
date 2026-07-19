@@ -132,6 +132,48 @@ func TestRequestSummaryPolicyDecisionProvenance(t *testing.T) {
 	}
 }
 
+func TestRequestSummaryPolicyIdentityOnlyRedactsTopology(t *testing.T) {
+	summary := &RequestSummary{}
+	summary.setRoute("responses", "policy-alias", false)
+	summary.setProvider("light-provider", "openai-compatible")
+	summary.SetFinalTarget("light-target")
+	summary.setUpstreamRequestID("upstream-request")
+
+	summary.SetPolicyIdentity("coding-economy")
+	// Late error attribution must not reintroduce topology for a request rejected
+	// before any policy decision or terminal send.
+	summary.setProvider("power-provider", "azure-openai")
+	summary.setFinalRouteResult("power-target", "power-provider", "azure-openai", "late-upstream-request")
+	summary.setUpstreamRequestID("late-upstream-request")
+
+	stats := readSummaryForStats(summary)
+	if stats.model != "coding-economy" || stats.routeID != "coding-economy" || stats.finalTarget != "coding-economy" {
+		t.Fatalf("public policy attribution = model:%q route:%q target:%q", stats.model, stats.routeID, stats.finalTarget)
+	}
+	if stats.provider != "" || stats.kind != "" || stats.upstreamID != "" {
+		t.Fatalf("policy identity leaked topology = provider:%q kind:%q upstream:%q", stats.provider, stats.kind, stats.upstreamID)
+	}
+
+	fields := make(map[string]any)
+	for _, field := range summary.LoggerFields() {
+		fields[field.Key] = field.Value
+	}
+	for key, want := range map[string]any{
+		"model":        "coding-economy",
+		"route_id":     "coding-economy",
+		"final_target": "coding-economy",
+	} {
+		if got := fields[key]; got != want {
+			t.Errorf("LoggerFields[%q] = %#v, want %#v", key, got, want)
+		}
+	}
+	for _, key := range []string{"provider", "provider_kind", "upstream_request_id"} {
+		if got, ok := fields[key]; ok {
+			t.Errorf("LoggerFields[%q] = %#v, want absent", key, got)
+		}
+	}
+}
+
 func TestRequestSummarySeparatesLastAttemptFromFinalRouteAttribution(t *testing.T) {
 	summary := &RequestSummary{}
 
@@ -176,10 +218,45 @@ func TestRequestSummaryFinalRouteResultRestoresCanonicalAttribution(t *testing.T
 	}
 }
 
+func TestRequestSummaryPolicyDecisionPreservesOperatorTopologyWhileStatsStayPublic(t *testing.T) {
+	summary := &RequestSummary{}
+	summary.SetPolicyIdentity("coding-economy")
+	summary.SetPolicyDecision(chatOperationPlan{
+		publicID: "coding-economy",
+		policyID: "coding-policy",
+	})
+	summary.recordUpstreamAttempt("op", "light-route", "light-target", "light-provider", "azure-openai")
+	summary.setFinalRouteResult("light-target", "light-provider", "azure-openai", "upstream-request")
+
+	fields := make(map[string]any)
+	for _, field := range summary.LoggerFields() {
+		fields[field.Key] = field.Value
+	}
+	for key, want := range map[string]any{
+		"provider":            "light-provider",
+		"provider_kind":       "azure-openai",
+		"final_target":        "light-target",
+		"upstream_request_id": "upstream-request",
+	} {
+		if got := fields[key]; got != want {
+			t.Errorf("LoggerFields[%q] = %#v, want %#v", key, got, want)
+		}
+	}
+
+	stats := readSummaryForStats(summary)
+	if stats.model != "coding-economy" || stats.routeID != "coding-economy" || stats.finalTarget != "coding-economy" {
+		t.Fatalf("public policy stats attribution = model:%q route:%q target:%q", stats.model, stats.routeID, stats.finalTarget)
+	}
+	if stats.provider != "" || stats.kind != "" || stats.upstreamID != "" {
+		t.Fatalf("policy stats leaked topology = provider:%q kind:%q upstream:%q", stats.provider, stats.kind, stats.upstreamID)
+	}
+}
+
 func TestRequestSummaryRouteObservabilityNilSafe(t *testing.T) {
 	var summary *RequestSummary
 	summary.SetOperationID("op")
 	summary.SetRouteID("route")
+	summary.SetPolicyIdentity("public-policy")
 	summary.SetPolicyDecision(chatOperationPlan{policyID: "policy"})
 	summary.SetFinalTarget("target")
 	summary.setFinalRouteAttribution("target", "provider", "kind")
@@ -197,5 +274,37 @@ func TestRequestSummaryRouteObservabilityNilSafe(t *testing.T) {
 	}
 	if summary.UpstreamSendCount() != 0 || summary.TargetSwitchCount() != 0 || summary.RouteExhausted() {
 		t.Fatal("nil request summary returned non-zero route counters")
+	}
+}
+
+func TestObserveRequestSummaryDoesNotAttributeEmptyOrInternalModelsToProvider(t *testing.T) {
+	h, err := NewProxyHandler(nil, nil,
+		WithProvidersConfig(policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeOff)),
+		WithPolicyRoutingMode(PolicyRoutingModeOff),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name  string
+		model string
+	}{
+		{name: "empty model"},
+		{name: "internal destination route", model: "light-route"},
+		{name: "internal classifier route", model: "classifier-route"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, summary := WithRequestSummary(t.Context())
+			h.observeRequestSummary(ctx, "responses", test.model, false, providerEndpointResponses)
+			stats := readSummaryForStats(summary)
+			if stats.provider != "" || stats.kind != "" || stats.upstreamID != "" {
+				t.Fatalf("summary leaked provider topology: %+v", stats)
+			}
+			if test.model != "" && stats.model != test.model {
+				t.Fatalf("model = %q, want caller-supplied %q", stats.model, test.model)
+			}
+		})
 	}
 }

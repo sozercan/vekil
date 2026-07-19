@@ -877,7 +877,7 @@ func (c *statsCollector) record(summary *RequestSummary, status int, userAgent s
 // or an upstream error status for failed/non-200) so failures show up in error
 // counts and the recent log. Streamed turns carry no latency sample. Every turn
 // is counted as one request even with zero/absent usage, matching the HTTP path.
-func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, operationIDs ...string) responsesTurnStatsRecord {
+func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, policyPublicID string, operationIDs ...string) responsesTurnStatsRecord {
 	if status == 0 {
 		status = http.StatusOK
 	}
@@ -901,6 +901,13 @@ func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel s
 		total:       total,
 		cached:      usage.InputTokensDetails.CachedTokens,
 		reasoning:   usage.OutputTokensDetails.ReasoningTokens,
+	}
+	if policyPublicID = boundStatLabel(policyPublicID); policyPublicID != "" {
+		d.model = policyPublicID
+		d.routeID = policyPublicID
+		d.finalTarget = policyPublicID
+		d.provider = ""
+		d.kind = ""
 	}
 	agent := agentLabel
 	if agent == "" {
@@ -1594,11 +1601,8 @@ func readSummaryForStats(summary *RequestSummary) summaryStats {
 	d.operationID = boundOperationalStatLabel(summary.operationID)
 	d.routeID = boundOperationalStatLabel(summary.routeID)
 	d.finalTarget = boundOperationalStatLabel(summary.finalTarget)
-	if strings.TrimSpace(summary.policyID) != "" {
-		publicID := d.routeID
-		if publicID == "" {
-			publicID = d.model
-		}
+	if publicID := boundStatLabel(summary.policyPublicIDForStatsLocked()); publicID != "" {
+		d.model = publicID
 		d.routeID = publicID
 		d.finalTarget = publicID
 		d.provider = ""
@@ -1851,7 +1855,14 @@ func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel str
 	if h == nil || h.stats == nil {
 		return responsesTurnStatsRecord{}
 	}
-	return h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage, operationIDs...)
+	policyPublicID := ""
+	if publicID, ok := h.policyPublicModelID(model); ok {
+		policyPublicID = publicID
+		model = publicID
+		provider = ""
+		kind = ""
+	}
+	return h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage, policyPublicID, operationIDs...)
 }
 
 func (h *ProxyHandler) AddResponsesTurnUsage(record responsesTurnStatsRecord, usage responsesUsage) {

@@ -53,7 +53,7 @@ go test ./proxy/ -run 'Test(LoadProvidersConfigFile|ValidateModelRoutes|RouteRef
 
 Route-specific deterministic tests use local upstream servers plus injected transports/clocks; live provider credentials are not the merge gate. Coverage should include:
 
-- strict version-1/version-2/version-3 decoding, duplicate-key rejection, limits, feature-matrix rejection, two-pass provider/route/policy references, normalized public-ID collisions, and offline `vekil config validate`;
+- strict version-1/version-2 decoding, duplicate-key rejection, limits, feature-matrix rejection, two-pass provider/route/policy references, normalized public-ID collisions, and offline `vekil config validate`;
 - legacy route catalog/unknown-model/retry compatibility and explicit route ordering/catalog identity;
 - pristine request body/header/auth construction for every target, including API-key, Entra, bearer, and custom-header switches;
 - exact target-attempt and network-send counts for normal attempts, redirects, prewrite failures, ambiguous delivery, protocol recovery, compaction/replay, and compatibility fallback;
@@ -66,11 +66,11 @@ For large request and replay paths, keep the `64 MiB` request boundary in the de
 
 ### Policy-routing safety suite
 
-Schema-v3 policy routing adds a pre-dispatch planner above native OpenAI Chat. The deterministic merge gate must use in-memory classifier adapters and local `httptest` providers; live credentials and provider availability are supplementary, never substitutes for local tests.
+Schema-v2 policy routing adds a pre-dispatch planner above native OpenAI Chat. The deterministic merge gate must use in-memory classifier adapters and local `httptest` providers; live credentials and provider availability are supplementary, never substitutes for local tests.
 
 Coverage should include:
 
-- schema-v3 route exposure, internal-route non-resolution/catalog exclusion, public-entry/operational-ID collisions, maximum profile count, field ranges, recursive-policy rejection, and schema-v3 field rejection in v1/v2;
+- schema-v2 route exposure, internal-route non-resolution/catalog exclusion, public-entry/operational-ID collisions, maximum profile count, field ranges, recursive-policy rejection, and schema-v2 feature-field rejection in v1;
 - terminal contract intersection, native `/chat/completions`-only destination validation, dynamic/unsupported provider rejection, and classifier one-target/one-attempt/one-send enforcement;
 - exact global/profile mode ceiling behavior, including `off` making zero preflight/classifier calls and observe never changing dispatch;
 - bounded canonical facts, UTF-8 truncation, non-text rejection, tool-name-only forwarding, total request cap, and exclusion of credentials, auth headers, provider state, replay IDs, physical routing metadata, parameter schemas, and tool arguments;
@@ -303,6 +303,6 @@ You can also run the same smoke scripts locally after building `vekil`; the CLI 
 - Treat `models[].endpoints` and `model_routes[].endpoints` as verified **native** allowlists. Do not advertise untested upstream routes or add `/chat/completions` merely because Vekil can emulate Chat through native Responses.
 - Keep Chat backend selection and Responses conversion inside the deep execution seam (`chat_execution.go`, `chat_route*.go`, and `chat_over_responses_*.go`); Anthropic and Gemini handlers should consume canonical Chat results rather than Responses events directly.
 - Responses-backed Chat must reject unsupported fields instead of silently dropping them, preserve opaque replay IDs/state bounds, and use the typed internal Chat event transport for streams.
-- Preserve startup failure on public-model-ID collisions. For schema version 2 or 3, add new provider/native-endpoint/surface/mode support to the compiled route feature matrix and reject unsupported combinations rather than accepting degraded routes.
+- Preserve startup failure on public-model-ID collisions. For schema version 2, add new provider/native-endpoint/surface/mode support to the compiled route feature matrix and reject unsupported combinations rather than accepting degraded routes.
 - If the provider participates in policy routing, define and validate its `trust_domain`, classifier non-storage capability, forced function-tool support, and live-preflight behavior. V1 policy destinations remain static native-Chat routes; do not silently admit dynamic, Responses-backed, Anthropic, Gemini, multimodal, or multi-tenant policy behavior.
 - Cross-link config examples in [`provider-routing.md`](provider-routing.md) instead of duplicating YAML here.
