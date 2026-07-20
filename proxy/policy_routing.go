@@ -97,10 +97,11 @@ func newChatPolicyRoutingController(h *ProxyHandler, cfg ProvidersConfig, global
 		return nil, err
 	}
 	cfg = validated.config
+	setup := h.providerSetup()
+	cfg.PolicyProfiles = policyProfilesWithinAllowedModelScope(h, setup, cfg.PolicyProfiles)
 	if len(cfg.PolicyProfiles) == 0 {
 		return nil, nil
 	}
-	setup := h.providerSetup()
 	controller := &chatPolicyRoutingController{
 		h:               h,
 		profiles:        make(map[string]*compiledPolicyProfile, len(cfg.PolicyProfiles)),
@@ -204,6 +205,32 @@ func newChatPolicyRoutingController(h *ProxyHandler, cfg ProvidersConfig, global
 		})
 	}
 	return controller, nil
+}
+
+func policyProfilesWithinAllowedModelScope(h *ProxyHandler, setup *providerSetup, profiles []PolicyProfileConfig) []PolicyProfileConfig {
+	if h == nil || setup == nil || len(h.allowedModels) == 0 {
+		return profiles
+	}
+
+	allowedPolicyIDs := make(map[string]struct{}, len(h.allowedModels))
+	for model := range h.allowedModels {
+		entry, ok := setup.lookupPublicModelEntry(model)
+		if !ok || entry == nil || entry.kind != publicEntryPolicy {
+			continue
+		}
+		allowedPolicyIDs[entry.policyID] = struct{}{}
+	}
+	if len(allowedPolicyIDs) == 0 {
+		return nil
+	}
+
+	filtered := make([]PolicyProfileConfig, 0, len(allowedPolicyIDs))
+	for _, profile := range profiles {
+		if _, ok := allowedPolicyIDs[profile.ID]; ok {
+			filtered = append(filtered, profile)
+		}
+	}
+	return filtered
 }
 
 func (c *chatPolicyRoutingController) Active() bool { return c != nil && c.active }

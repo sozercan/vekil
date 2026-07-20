@@ -183,6 +183,69 @@ func policyIntegrationConfig(lightURL, powerfulURL, profileMode string) Provider
 	}
 }
 
+func TestPolicyRoutingAllowedModelsScopesProfilesAndPreflightThroughAliases(t *testing.T) {
+	selected := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+	unrelated := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypePlanning, CodeScope: policyCodeScopeMultiFile, RiskLevel: policyRiskLevelHigh})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+
+	cfg := policyIntegrationConfig(selected.server.URL, powerful.server.URL, policyConfigModeEnforce)
+	cfg.PolicyProfiles[0].PublicID = "coding-economy-20260717"
+	trueValue := true
+	cfg.Providers = append(cfg.Providers, ProviderConfig{
+		ID:                         "unrelated-classifier-provider",
+		Type:                       string(providerTypeOpenAICompatible),
+		BaseURL:                    unrelated.server.URL,
+		AuthType:                   string(providerAuthTypeNone),
+		TrustDomain:                "org-ai",
+		ClassifierNoStoreSupported: &trueValue,
+	})
+	cfg.ModelRoutes = append(cfg.ModelRoutes, ModelRouteConfig{
+		ID:              "unrelated-classifier-route",
+		Exposure:        modelRouteExposureInternal,
+		InternalPurpose: modelRouteInternalPurposePolicyClassifier,
+		Name:            "Unrelated Classifier",
+		Endpoints:       []string{providerEndpointChatCompletions},
+		Targets: []ModelRouteTargetConfig{{
+			ID:            "unrelated-classifier",
+			Provider:      "unrelated-classifier-provider",
+			UpstreamModel: "classifier-model",
+		}},
+	})
+	unrelatedProfile := cfg.PolicyProfiles[0]
+	unrelatedProfile.ID = "unrelated-policy"
+	unrelatedProfile.PublicID = "unrelated-economy"
+	unrelatedProfile.Name = "Unrelated Economy"
+	unrelatedProfile.Classifier.Route = "unrelated-classifier-route"
+	cfg.PolicyProfiles = append(cfg.PolicyProfiles, unrelatedProfile)
+
+	h, err := NewProxyHandler(nil, nil,
+		WithProvidersConfig(cfg),
+		WithAllowedModels("coding-economy"),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, ok := h.policyRoutingController.(*chatPolicyRoutingController)
+	if !ok || controller == nil {
+		t.Fatalf("policy controller = %T, want scoped controller", h.policyRoutingController)
+	}
+	if len(controller.ordered) != 1 || controller.ordered[0].config.ID != "coding-policy" {
+		t.Fatalf("scoped profiles = %+v, want coding-policy only", controller.ordered)
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatalf("InitializePolicyRouting() error = %v", err)
+	}
+	selectedRequests, _ := selected.snapshot()
+	if selectedRequests != 1 {
+		t.Fatalf("selected classifier requests = %d, want 1", selectedRequests)
+	}
+	unrelatedRequests, _ := unrelated.snapshot()
+	if unrelatedRequests != 0 {
+		t.Fatalf("unrelated classifier requests = %d, want 0", unrelatedRequests)
+	}
+}
+
 func TestPolicyRoutingEnforceSelectsPowerfulAndPreservesPublicIdentity(t *testing.T) {
 	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{
 		TurnType: policyTurnTypePlanning, CodeScope: policyCodeScopeMultiFile,
