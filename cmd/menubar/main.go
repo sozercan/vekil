@@ -28,8 +28,8 @@ func dashboardURL() string {
 }
 
 var (
-	srv           *server.Server
-	authenticator *auth.Authenticator
+	proxyLifecycle menubarProxyLifecycle
+	authenticator  *auth.Authenticator
 
 	// Menu items kept at package level so helpers can update them.
 	mAuthMenu        *systray.MenuItem
@@ -126,7 +126,10 @@ func onReady() {
 		for {
 			select {
 			case <-mToggle.ClickedCh:
-				if srv != nil && srv.IsRunning() {
+				if cancelProxyStartup() {
+					continue
+				}
+				if proxyLifecycle.isRunning() {
 					stopProxy()
 				} else {
 					startProxy()
@@ -163,7 +166,8 @@ func onReady() {
 					showErrorDialog("Update Check Failed", err.Error())
 				}
 			case <-mQuit.ClickedCh:
-				if srv != nil && srv.IsRunning() {
+				_ = cancelProxyStartup()
+				if proxyLifecycle.isRunning() {
 					stopProxy()
 				}
 				systray.Quit()
@@ -173,95 +177,233 @@ func onReady() {
 	}()
 }
 
+type proxyStartResult struct {
+	server     menubarProxyServer
+	err        error
+	logMessage string
+	title      string
+	message    string
+}
+
 func startProxy() {
-	if providersConfigErr != nil {
-		title, message := providersConfigStartDialog(providersConfigErr)
-		showErrorDialog(title, fmt.Sprintf("%s\n\n%v", message, providersConfigErr))
+	ctx, generation, ok := proxyLifecycle.beginStartup(context.Background())
+	if !ok {
 		return
 	}
 
-	if providersRequireGitHubAuth(providersCfg, providersConfigErr) {
-		if _, err := authenticator.GetToken(context.Background()); err != nil {
-			log.Error("auth failed", logger.Err(err))
-			showErrorDialog(
+	setProxyStartingUI()
+	cfg := providersCfg
+	configErr := providersConfigErr
+	authn := authenticator
+	go func() {
+		completeProxyStartup(generation, runProxyStartup(ctx, authn, cfg, configErr))
+	}()
+}
+
+func runProxyStartup(
+	ctx context.Context,
+	authn *auth.Authenticator,
+	cfg proxy.ProvidersConfig,
+	configErr error,
+) proxyStartResult {
+	if configErr != nil {
+		title, message := providersConfigStartDialog(configErr)
+		return proxyStartFailure(
+			"providers config unavailable",
+			title,
+			fmt.Sprintf("%s\n\n%v", message, configErr),
+			configErr,
+		)
+	}
+
+	if providersRequireGitHubAuth(cfg, configErr) {
+		if _, err := authn.GetToken(ctx); err != nil {
+			if ctx.Err() != nil {
+				return proxyStartResult{err: ctx.Err()}
+			}
+			return proxyStartFailure(
+				"auth failed",
 				"GitHub Sign In Required",
 				fmt.Sprintf("The active providers config uses GitHub Copilot, but Vekil could not refresh authentication.\n\nOpen ‘GitHub Auth’ and choose ‘Sign In with GitHub’ or ‘Use GitHub CLI Account’, then start Vekil again.\n\n%v", err),
+				err,
 			)
-			refreshSessionUI()
-			return
 		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return proxyStartResult{err: err}
 	}
 
 	policyMode, err := proxy.ParsePolicyRoutingMode(os.Getenv("POLICY_ROUTING_MODE"))
 	if err != nil {
-		log.Error("invalid policy routing mode", logger.Err(err))
-		showErrorDialog("Vekil Start Failed", fmt.Sprintf("Invalid POLICY_ROUTING_MODE.\n\n%v", err))
-		return
+		return proxyStartFailure(
+			"invalid policy routing mode",
+			"Vekil Start Failed",
+			fmt.Sprintf("Invalid POLICY_ROUTING_MODE.\n\n%v", err),
+			err,
+		)
 	}
 	nextSrv, err := server.New(
-		authenticator,
+		authn,
 		log,
 		proxyHost,
 		proxyPort,
 		server.WithProxyOptions(
-			proxy.WithProvidersConfig(providersCfg),
+			proxy.WithProvidersConfig(cfg),
 			proxy.WithPolicyRoutingMode(policyMode),
 		),
 	)
 	if err != nil {
-		log.Error("server init failed", logger.Err(err))
-		showErrorDialog("Vekil Start Failed", fmt.Sprintf("Could not initialize Vekil.\n\n%v", err))
-		return
+		return proxyStartFailure(
+			"server init failed",
+			"Vekil Start Failed",
+			fmt.Sprintf("Could not initialize Vekil.\n\n%v", err),
+			err,
+		)
 	}
 	if err := nextSrv.Start(); err != nil {
-		log.Error("server start failed", logger.Err(err))
-		showErrorDialog("Vekil Start Failed", fmt.Sprintf("Could not start Vekil on port 1337.\n\n%v", err))
+		return proxyStartFailure(
+			"server start failed",
+			"Vekil Start Failed",
+			fmt.Sprintf("Could not start Vekil on port 1337.\n\n%v", err),
+			err,
+		)
+	}
+
+	// Each classifier route already has its own configured timeout. The startup
+	// worker keeps the aggregate operation cancellable without imposing a second,
+	// shorter deadline over a sequence of otherwise healthy routes.
+	if err := initializeProxyPolicyRouting(ctx, nextSrv); err != nil {
+		if ctx.Err() != nil {
+			return proxyStartResult{err: ctx.Err()}
+		}
+		return proxyStartFailure(
+			"policy routing initialization failed",
+			"Vekil Start Failed",
+			fmt.Sprintf("Policy routing preflight failed.\n\n%v", err),
+			err,
+		)
+	}
+
+	return proxyStartResult{server: nextSrv}
+}
+
+func initializeProxyPolicyRouting(ctx context.Context, current menubarProxyServer) error {
+	err := current.InitializePolicyRouting(ctx)
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		_ = stopMenubarProxyServer(current, 10*time.Second)
+	}
+	return err
+}
+
+func proxyStartFailure(logMessage, title, message string, err error) proxyStartResult {
+	return proxyStartResult{
+		err:        err,
+		logMessage: logMessage,
+		title:      title,
+		message:    message,
+	}
+}
+
+func completeProxyStartup(generation uint64, result proxyStartResult) {
+	completion, restart := proxyLifecycle.finishStartup(generation, result.server)
+	if completion != proxyStartupCurrent {
+		if result.server != nil {
+			_ = stopMenubarProxyServer(result.server, 10*time.Second)
+		}
+		if completion == proxyStartupCanceled {
+			refreshSessionUI()
+			log.Info("proxy startup canceled")
+			if restart {
+				startProxy()
+			}
+		}
 		return
 	}
-	// Each classifier route already has its own configured timeout. Do not place
-	// one short aggregate deadline over a sequence of otherwise healthy routes.
-	preflightErr := nextSrv.InitializePolicyRouting(context.Background())
-	if preflightErr != nil {
-		stopCtx, cancelStop := context.WithTimeout(context.Background(), 10*time.Second)
-		_ = nextSrv.Stop(stopCtx)
-		cancelStop()
-		log.Error("policy routing initialization failed", logger.Err(preflightErr))
-		showErrorDialog("Vekil Start Failed", fmt.Sprintf("Policy routing preflight failed.\n\n%v", preflightErr))
+
+	if result.err != nil {
+		refreshSessionUI()
+		if !errors.Is(result.err, context.Canceled) {
+			log.Error(result.logMessage, logger.Err(result.err))
+			showErrorDialog(result.title, result.message)
+		}
 		return
 	}
-	srv = nextSrv
 
 	mToggle.SetTitle("Stop Vekil")
 	systray.SetIcon(iconOn)
 	systray.SetTooltip("Vekil - Running on :1337")
-	if mDashboard != nil {
-		mDashboard.Enable()
-	}
+	refreshSessionUI()
 	log.Info("proxy started")
 }
 
-func stopProxy() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+func cancelProxyStartup() bool {
+	return cancelProxyStartupWithRestart(false)
+}
 
-	if err := srv.Stop(ctx); err != nil {
-		log.Error("server stop failed", logger.Err(err))
+func cancelProxyStartupWithRestart(restart bool) bool {
+	if !proxyLifecycle.cancelStartup(restart) {
+		return false
 	}
-
-	mToggle.SetTitle("Start Vekil")
-	systray.SetIcon(iconOff)
-	systray.SetTooltip("Vekil - Stopped")
+	if mToggle != nil {
+		mToggle.SetTitle("Stopping Vekil…")
+		mToggle.Disable()
+	}
 	if mDashboard != nil {
 		mDashboard.Disable()
 	}
+	return true
+}
+
+func setProxyStartingUI() {
+	mToggle.SetTitle("Cancel Starting Vekil")
+	mToggle.Enable()
+	systray.SetIcon(iconOff)
+	systray.SetTooltip("Vekil - Starting")
+	if mDashboard != nil {
+		mDashboard.Disable()
+	}
+	if mProvidersChoose != nil {
+		mProvidersChoose.Disable()
+	}
+	if mProvidersClear != nil {
+		mProvidersClear.Disable()
+	}
+	setAuthActionsEnabled(false)
+}
+
+func stopProxy() {
+	if cancelProxyStartup() {
+		return
+	}
+
+	current := proxyLifecycle.detachServer()
+	if current == nil {
+		refreshSessionUI()
+		return
+	}
+	if err := stopMenubarProxyServer(current, 10*time.Second); err != nil {
+		log.Error("server stop failed", logger.Err(err))
+	}
+
+	refreshSessionUI()
 	log.Info("proxy stopped")
+}
+
+func stopMenubarProxyServer(current menubarProxyServer, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return current.Stop(ctx)
 }
 
 // openDashboard opens the live traffic dashboard in the default browser. It is a
 // convenience shortcut; the dashboard is served by the proxy itself and is also
 // reachable directly at the dashboard URL.
 func openDashboard() {
-	if srv == nil || !srv.IsRunning() {
+	if !proxyLifecycle.isRunning() {
 		showErrorDialog("Vekil Not Running", "Start Vekil before opening the dashboard.")
 		return
 	}
@@ -381,8 +523,11 @@ func signOut() {
 	}
 	signInMu.Unlock()
 
-	if providersRequireGitHubAuth(providersCfg, providersConfigErr) && srv != nil && srv.IsRunning() {
-		stopProxy()
+	if providersRequireGitHubAuth(providersCfg, providersConfigErr) {
+		_ = cancelProxyStartup()
+		if proxyLifecycle.isRunning() {
+			stopProxy()
+		}
 	}
 
 	if err := authenticator.SignOut(); err != nil {
@@ -431,7 +576,8 @@ func applyProvidersConfigPath(path string) error {
 	providersCfg = loadedProvidersCfg
 	providersConfigErr = nil
 
-	wasRunning := srv != nil && srv.IsRunning()
+	_ = cancelProxyStartupWithRestart(true)
+	wasRunning := proxyLifecycle.isRunning()
 	if wasRunning {
 		stopProxy()
 	}
@@ -446,15 +592,37 @@ func applyProvidersConfigPath(path string) error {
 }
 
 func refreshSessionUI() {
-	refreshProvidersMenu()
-
 	status := auth.AuthStatus{Source: auth.AuthSourceNone}
 	if authenticator != nil {
 		status = authenticator.Status()
 	}
 	refreshAuthMenu(status)
 
-	running := srv != nil && srv.IsRunning()
+	starting, canceling := proxyLifecycle.startupState()
+	if starting {
+		if mDashboard != nil {
+			mDashboard.Disable()
+		}
+		if mProvidersChoose != nil {
+			mProvidersChoose.Disable()
+		}
+		if mProvidersClear != nil {
+			mProvidersClear.Disable()
+		}
+		if canceling {
+			mToggle.SetTitle("Stopping Vekil…")
+			mToggle.Disable()
+			systray.SetTooltip("Vekil - Stopping")
+		} else {
+			mToggle.SetTitle("Cancel Starting Vekil")
+			mToggle.Enable()
+			systray.SetTooltip("Vekil - Starting")
+		}
+		return
+	}
+
+	refreshProvidersMenu()
+	running := proxyLifecycle.isRunning()
 	if mDashboard != nil {
 		if running {
 			mDashboard.Enable()
@@ -555,6 +723,9 @@ func setAuthActionsEnabled(enabled bool) {
 
 func refreshProvidersMenu() {
 	mProvidersStatus.SetTitle(providersMenuTitle())
+	if mProvidersChoose != nil {
+		mProvidersChoose.Enable()
+	}
 	if menubarCfg.ProvidersConfigPath == "" {
 		mProvidersClear.Disable()
 		return
@@ -611,9 +782,7 @@ func providersRequireGitHubAuth(cfg proxy.ProvidersConfig, err error) bool {
 }
 
 func onExit() {
-	if srv != nil && srv.IsRunning() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Stop(ctx)
+	if current := proxyLifecycle.shutdown(); current != nil && current.IsRunning() {
+		_ = stopMenubarProxyServer(current, 5*time.Second)
 	}
 }
