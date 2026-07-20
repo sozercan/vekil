@@ -2388,7 +2388,7 @@
     var eligibleIDs = new Set((Array.isArray(metadataRows) ? metadataRows : []).map(function (entry) {
       return String(isPlainObject(entry) ? entry.id : entry || "");
     }).filter(Boolean));
-    var hasServerEligibility = eligibleIDs.size > 0;
+    var hasServerEligibility = Array.isArray(metadataRows);
     var filtered = routes.filter(function (route) {
       if (!isPlainObject(route)) return false;
       var classifier = route.internal_purpose === "policy_classifier";

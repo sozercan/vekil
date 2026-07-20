@@ -421,12 +421,17 @@ func dashboardPolicyEligibilityForSnapshot(snapshot *runtimeSnapshot) *dashboard
 		if !ok || route == nil {
 			continue
 		}
-		entry := dashboardEligibleRoute{ID: configured.ID, PublicID: configured.PublicID, Exposure: route.exposure}
-		if route.internalPurpose == modelRouteInternalPurposePolicyClassifier && route.exposure == modelRouteExposureInternal && route.supportsEndpoint(providerEndpointChatCompletions) {
-			view.ClassifierRoutes = append(view.ClassifierRoutes, entry)
+		if !route.supportsEndpoint(providerEndpointChatCompletions) {
 			continue
 		}
-		if route.isPublic() && route.supportsEndpoint(providerEndpointChatCompletions) {
+		entry := dashboardEligibleRoute{ID: configured.ID, PublicID: configured.PublicID, Exposure: route.exposure}
+		if route.internalPurpose == modelRouteInternalPurposePolicyClassifier {
+			if route.exposure == modelRouteExposureInternal {
+				view.ClassifierRoutes = append(view.ClassifierRoutes, entry)
+			}
+			continue
+		}
+		if route.internalPurpose == "" {
 			view.TerminalRoutes = append(view.TerminalRoutes, entry)
 		}
 	}

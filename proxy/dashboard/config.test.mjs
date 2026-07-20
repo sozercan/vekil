@@ -106,6 +106,26 @@ test("ordered target movement is deterministic and non-mutating", () => {
   assert.deepEqual(helpers.moveArrayItem(original, -1, 1), original);
 });
 
+test("present empty policy eligibility filters unchanged routes but keeps draft additions and edits", () => {
+  const unchanged = { id: "unchanged", public_id: "unchanged", endpoints: ["/responses"] };
+  const editedBase = { id: "edited", public_id: "edited", endpoints: ["/responses"] };
+  const editor = new helpers.ConfigEditor({});
+  editor.state.baseConfig = { model_routes: [unchanged, editedBase] };
+  editor.state.draft = {
+    model_routes: [
+      { ...unchanged },
+      { ...editedBase, endpoints: ["/chat/completions"] },
+      { id: "new-route", public_id: "new-route", endpoints: ["/chat/completions"] }
+    ]
+  };
+  editor.state.policyEligibility = { terminal_routes: [], classifier_routes: [] };
+
+  assert.deepEqual(
+    editor.policyRouteChoices("terminal").map((choice) => choice[0]),
+    ["", "edited", "new-route"]
+  );
+});
+
 test("secret operations serialize deterministically and reject unsafe placeholder sets", () => {
   const valid = helpers.buildSecretOperations([
     { path: "/providers/z/api_key", operation: "set", value: "actual-secret", canKeep: false },

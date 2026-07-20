@@ -113,6 +113,40 @@ func TestDashboardConfigReadRedactsSecrets(t *testing.T) {
 	}
 }
 
+func TestDashboardConfigPolicyEligibilityIncludesInternalTerminalRoutes(t *testing.T) {
+	h, _ := newDashboardConfigTestHandlerWithManagedStartup(t, func(cfg *ProvidersConfig) {
+		cfg.SchemaVersion = ProvidersConfigSchemaVersion2
+		routing := ModelRouteRoutingConfig{Mode: string(routeModePrimaryOnly), MaxTargetAttempts: 1, MaxUpstreamSends: 1}
+		target := func(id string) []ModelRouteTargetConfig {
+			return []ModelRouteTargetConfig{{ID: id, Provider: "local", UpstreamModel: "demo-upstream"}}
+		}
+		cfg.ModelRoutes = []ModelRouteConfig{
+			{ID: "public-chat", PublicID: "public-chat", Endpoints: []string{providerEndpointChatCompletions}, Targets: target("public"), Routing: routing},
+			{ID: "internal-chat", Exposure: modelRouteExposureInternal, Endpoints: []string{providerEndpointChatCompletions}, Targets: target("internal"), Routing: routing},
+			{ID: "classifier-route", Exposure: modelRouteExposureInternal, InternalPurpose: modelRouteInternalPurposePolicyClassifier, Endpoints: []string{providerEndpointChatCompletions}, Targets: target("classifier"), Routing: routing},
+			{ID: "responses-only", PublicID: "responses-only", Endpoints: []string{providerEndpointResponses}, Targets: target("responses"), Routing: routing},
+		}
+	})
+
+	eligibility := readDashboardConfig(t, h).PolicyEligibility
+	if eligibility == nil {
+		t.Fatal("policy eligibility metadata is missing")
+	}
+	terminalIDs := make([]string, 0, len(eligibility.TerminalRoutes))
+	for _, route := range eligibility.TerminalRoutes {
+		terminalIDs = append(terminalIDs, route.ID)
+		if route.ID == "internal-chat" && route.Exposure != modelRouteExposureInternal {
+			t.Fatalf("internal terminal exposure = %q, want %q", route.Exposure, modelRouteExposureInternal)
+		}
+	}
+	if got, want := strings.Join(terminalIDs, ","), "public-chat,internal-chat"; got != want {
+		t.Fatalf("terminal eligibility = %q, want %q", got, want)
+	}
+	if len(eligibility.ClassifierRoutes) != 1 || eligibility.ClassifierRoutes[0].ID != "classifier-route" {
+		t.Fatalf("classifier eligibility = %+v, want classifier-route only", eligibility.ClassifierRoutes)
+	}
+}
+
 func TestDashboardConfigApplyPersistsThenPublishes(t *testing.T) {
 	h, resolved := newDashboardConfigTestHandler(t)
 	current := h.currentRuntime()

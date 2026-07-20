@@ -57,17 +57,33 @@ func dashboardConfigHostMatchesListener(r *http.Request, configuredPort string) 
 	if r == nil {
 		return false
 	}
-	host, port, err := net.SplitHostPort(strings.TrimSpace(r.Host))
-	if err != nil || port == "" || !isLiteralLoopbackRequestHost(host) {
-		return false
-	}
 	expectedPort := strings.TrimSpace(configuredPort)
 	if conn, ok := r.Context().Value(serverConnContextKey{}).(net.Conn); ok && conn != nil {
 		if _, localPort, splitErr := net.SplitHostPort(conn.LocalAddr().String()); splitErr == nil && localPort != "" {
 			expectedPort = localPort
 		}
 	}
-	return expectedPort != "" && expectedPort != "0" && port == expectedPort
+	if expectedPort == "" || expectedPort == "0" {
+		return false
+	}
+
+	requestHost := strings.TrimSpace(r.Host)
+	host, port, err := net.SplitHostPort(requestHost)
+	if err != nil {
+		if expectedPort != "80" {
+			return false
+		}
+		switch {
+		case strings.HasPrefix(requestHost, "[") && strings.HasSuffix(requestHost, "]"):
+			host = strings.TrimSuffix(strings.TrimPrefix(requestHost, "["), "]")
+		case !strings.ContainsAny(requestHost, "[]:"):
+			host = requestHost
+		default:
+			return false
+		}
+		port = expectedPort
+	}
+	return port != "" && port == expectedPort && isLiteralLoopbackRequestHost(host)
 }
 
 func isLiteralLoopbackRequestHost(host string) bool {

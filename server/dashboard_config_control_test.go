@@ -81,6 +81,44 @@ func TestDashboardConfigSecurity(t *testing.T) {
 	}
 }
 
+func TestDashboardConfigHostMatchesListener(t *testing.T) {
+	tests := []struct {
+		name           string
+		host           string
+		configuredPort string
+		local          string
+		want           bool
+	}{
+		{name: "localhost omitted port at configured HTTP default", host: "localhost", configuredPort: "80", want: true},
+		{name: "ipv4 omitted port at configured HTTP default", host: "127.0.0.2", configuredPort: "80", want: true},
+		{name: "ipv6 omitted port at configured HTTP default", host: "[::1]", configuredPort: "80", want: true},
+		{name: "localhost omitted port rejected at non-default", host: "localhost", configuredPort: "1337", want: false},
+		{name: "ipv4 omitted port rejected at non-default", host: "127.0.0.2", configuredPort: "1337", want: false},
+		{name: "ipv6 omitted port rejected at non-default", host: "[::1]", configuredPort: "1337", want: false},
+		{name: "actual HTTP default overrides configured port", host: "localhost", configuredPort: "1337", local: "127.0.0.1:80", want: true},
+		{name: "actual non-default port rejects omitted port", host: "localhost", configuredPort: "80", local: "127.0.0.1:1337", want: false},
+		{name: "explicit non-default port still matches exactly", host: "[::1]:1337", configuredPort: "1337", want: true},
+		{name: "explicit non-default port mismatch", host: "127.0.0.1:7331", configuredPort: "1337", want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "http://example.test/dashboard/config", nil)
+			r.Host = tc.host
+			if tc.local != "" {
+				addr, err := net.ResolveTCPAddr("tcp", tc.local)
+				if err != nil {
+					t.Fatal(err)
+				}
+				r = r.WithContext(context.WithValue(r.Context(), serverConnContextKey{}, dashboardConfigTestConn{local: addr}))
+			}
+			if got := dashboardConfigHostMatchesListener(r, tc.configuredPort); got != tc.want {
+				t.Fatalf("dashboardConfigHostMatchesListener() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDashboardConfigCapabilityByServerMode(t *testing.T) {
 	root := t.TempDir()
 	resolved, err := proxy.ResolveProvidersConfig(proxy.ProvidersConfigResolveOptions{UserConfigDir: root, Mode: proxy.ProvidersConfigUseManaged})
