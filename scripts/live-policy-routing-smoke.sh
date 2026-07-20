@@ -23,7 +23,10 @@
 #   LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL
 #   LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY
 #   LIVE_POLICY_ROUTING_CLASSIFIER_MODEL
-#   LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED=true
+#   LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED=true|false
+#
+# When classifier no-store support is false, the synthetic smoke must explicitly
+# acknowledge retention with LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION=true.
 #
 # Provider types are azure-openai or openai-compatible. Azure bases must use
 # their OpenAI-v1 form ending in /openai/v1. Generic compatible bases use bearer
@@ -37,6 +40,7 @@
 #   LIVE_POLICY_ROUTING_TMP_PARENT              artifact parent
 #   LIVE_POLICY_ROUTING_ALLOW_INSECURE_HTTP=1   local development only
 #   LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=0        delete artifacts after success
+#   LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION=false
 #   SMOKE_*                                     bounded timeout overrides
 
 set -euo pipefail
@@ -346,8 +350,19 @@ validate_inputs() {
   for role in "${required[@]}"; do
     require_env "${role}"
   done
-  [[ "${LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED}" == "true" ]] || \
-    die "LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED must be exactly true"
+  local classifier_no_store_supported="${LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED}"
+  local allow_provider_retention="${LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION:-false}"
+  case "${classifier_no_store_supported}" in
+    true|false) ;;
+    *) die "LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED must be true or false" ;;
+  esac
+  case "${allow_provider_retention}" in
+    true|false) ;;
+    *) die "LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION must be true or false" ;;
+  esac
+  if [[ "${classifier_no_store_supported}" != "true" && "${allow_provider_retention}" != "true" ]]; then
+    die "LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION must be true when classifier no-store support is false"
+  fi
 
   for role in LIGHTWEIGHT POWERFUL_PRIMARY POWERFUL_SECONDARY; do
     type_var="LIVE_POLICY_ROUTING_${role}_TYPE"
@@ -587,8 +602,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not no_sampling:
                 errors.append("sampling_fields_not_dropped")
             if kind == "classifier":
-                if body.get("store") is not False:
-                    errors.append("classifier_store_not_false")
+                if self.server.classifier_no_store_supported:
+                    if body.get("store") is not False:
+                        errors.append("classifier_store_not_false")
+                elif "store" in body:
+                    errors.append("classifier_store_not_removed")
                 if body.get("stream") not in (None, False):
                     errors.append("classifier_stream_invalid")
                 if body.get("max_completion_tokens") != self.server.classifier_max_tokens:
@@ -747,6 +765,7 @@ def main():
     parser.add_argument("--primary-model", required=True)
     parser.add_argument("--classifier-model", required=True)
     parser.add_argument("--classifier-max-tokens", type=int, required=True)
+    parser.add_argument("--classifier-no-store-supported", choices=("true", "false"), required=True)
     parser.add_argument("--expected-auth-header", choices=("api-key", "authorization"), required=True)
     parser.add_argument("--expected-auth-sha256", required=True)
     parser.add_argument("--injected-request-id", required=True)
@@ -760,6 +779,7 @@ def main():
     server.primary_model = args.primary_model
     server.classifier_model = args.classifier_model
     server.classifier_max_tokens = args.classifier_max_tokens
+    server.classifier_no_store_supported = args.classifier_no_store_supported == "true"
     server.expected_auth_header = args.expected_auth_header
     server.expected_auth_sha256 = args.expected_auth_sha256
     server.injected_request_id = args.injected_request_id
@@ -820,6 +840,7 @@ start_powerful_primary_shim() {
         --primary-model "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL}" \
         --classifier-model "${LIVE_POLICY_ROUTING_CLASSIFIER_MODEL}" \
         --classifier-max-tokens 256 \
+        --classifier-no-store-supported "${LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED}" \
         --expected-auth-header "${expected_auth_header}" \
         --expected-auth-sha256 "${expected_auth_sha256}" \
         --injected-request-id "${INJECTED_REQUEST_ID}" \
@@ -880,7 +901,7 @@ def provider(provider_id, provider_type, base_url, key_env, classifier=False):
         value["auth_type"] = "bearer"
         value["model_discovery"] = "static"
     if classifier:
-        value["classifier_no_store_supported"] = True
+        value["classifier_no_store_supported"] = os.environ["LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED"] == "true"
     return value
 
 
@@ -987,7 +1008,7 @@ config = {
             "data_policy": {
                 "content_forwarding_acknowledged": True,
                 "allow_cross_trust_domain": False,
-                "allow_provider_retention": False,
+                "allow_provider_retention": os.environ.get("LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION", "false") == "true",
             },
         }
     ],
@@ -1002,7 +1023,17 @@ import os
 import pathlib
 import sys
 
-text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+config = __import__("json").loads(text)
+expected_no_store = os.environ["LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED"] == "true"
+expected_retention = os.environ.get("LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION", "false") == "true"
+classifier_provider = next(provider for provider in config["providers"] if provider["id"] == "live-powerful-primary-provider")
+profile = config["policy_profiles"][0]
+if classifier_provider.get("classifier_no_store_supported") is not expected_no_store:
+    raise SystemExit("generated config has the wrong classifier_no_store_supported value")
+if profile["data_policy"].get("allow_provider_retention") is not expected_retention:
+    raise SystemExit("generated config has the wrong allow_provider_retention value")
 for name in (
     "LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY",
     "LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY",

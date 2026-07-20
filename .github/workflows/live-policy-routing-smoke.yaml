@@ -1,32 +1,29 @@
-name: Live Semantic Policy Routing Smoke
+name: Live Multi-Provider Semantic Policy Routing Smoke
 
-# Credentialed end-to-end coverage for schema-v2 semantic policy routing.
+# Optional manual cross-provider coverage for schema-v2 semantic policy routing.
 # The harness generates a temporary policy config, validates the classifier
 # contract, exercises off/observe/enforce behavior against real native-Chat
 # targets, and injects one retry-safe primary failure to verify sealed
 # within-tier failover. Deterministic process/cleanup coverage stays in ci.yaml.
 #
 # Required repository variables and secrets are documented in
-# docs/development.md. Fork and Dependabot pull requests neutral-skip because
-# GitHub does not expose repository secrets to them. Pull requests also
-# neutral-skip until the repository configuration is installed; manual runs
-# fail when configuration is missing.
+# docs/development.md. The default pull-request gate uses the separate
+# Copilot-backed workflow; this workflow remains manual so operators can verify
+# genuine cross-provider behavior when independent provider credentials exist.
 
 on:
   workflow_dispatch:
-  pull_request:
-    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: live-policy-routing-smoke-${{ github.event.pull_request.number || github.ref }}
+  group: live-multi-provider-policy-routing-smoke-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   semantic-policy:
-    name: semantic-policy-e2e
+    name: semantic-policy-multiprovider-e2e
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -44,6 +41,7 @@ jobs:
       LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY: ${{ secrets.LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY }}
       LIVE_POLICY_ROUTING_CLASSIFIER_MODEL: ${{ vars.LIVE_POLICY_ROUTING_CLASSIFIER_MODEL }}
       LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED: ${{ vars.LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED }}
+      LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION: ${{ vars.LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION }}
     steps:
       - name: Decide whether live semantic policy-routing smoke can run
         id: gate

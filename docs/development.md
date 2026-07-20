@@ -25,6 +25,7 @@ go test ./proxy/ -run TestMapStopReason/stop -v
 scripts/tests/live-smoke-reliability-test.sh  # deterministic mock-server/fake-CLI gates
 scripts/tests/live-chat-over-responses-smoke-test.sh  # deterministic Chat-over-Responses live-harness gates
 scripts/tests/live-policy-routing-smoke-test.sh  # deterministic semantic-policy process/cleanup gates
+scripts/tests/live-policy-routing-copilot-smoke-test.sh  # deterministic Copilot bridge/model-selection wrapper gate
 ```
 
 `make test` requires a current Node.js runtime with the built-in `node:test` module in addition to Go. Running `go test ./...` remains Go-only.
@@ -219,7 +220,7 @@ make lint
 
 ## CI
 
-GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs lint, frontend plus Go tests, the full race detector, build, vet, a Kubernetes/kind operational smoke, and e2e validation before merge. `make test` runs the dashboard config JavaScript syntax check and `node:test` suite before `go test ./...`. Dedicated Windows and macOS jobs run the managed config source/codec/store tests on native filesystems in addition to launcher lifecycle coverage. Every core job has a job-level deadline. The Linux test job runs [`scripts/tests/live-smoke-reliability-test.sh`](../scripts/tests/live-smoke-reliability-test.sh) with local mock servers and fake CLIs so stale-listener, timeout, per-client, and descendant-cleanup failures are deterministic, plus two real-binary process harnesses: [`scripts/tests/live-provider-routing-smoke-test.sh`](../scripts/tests/live-provider-routing-smoke-test.sh) exercises schema-v2 two-target failover against controlled loopback Responses servers, and [`scripts/tests/live-policy-routing-smoke-test.sh`](../scripts/tests/live-policy-routing-smoke-test.sh) exercises semantic-policy modes, classifier/terminal accounting, controlled failover, automatic non-default port selection, redaction, and process-group cleanup against local Chat-compatible shims.
+GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs lint, frontend plus Go tests, the full race detector, build, vet, a Kubernetes/kind operational smoke, and e2e validation before merge. `make test` runs the dashboard config JavaScript syntax check and `node:test` suite before `go test ./...`. Dedicated Windows and macOS jobs run the managed config source/codec/store tests on native filesystems in addition to launcher lifecycle coverage. Every core job has a job-level deadline. The Linux test job runs [`scripts/tests/live-smoke-reliability-test.sh`](../scripts/tests/live-smoke-reliability-test.sh) with local mock servers and fake CLIs so stale-listener, timeout, per-client, and descendant-cleanup failures are deterministic, plus three real-binary process harnesses: [`scripts/tests/live-provider-routing-smoke-test.sh`](../scripts/tests/live-provider-routing-smoke-test.sh) exercises schema-v2 two-target failover against controlled loopback Responses servers; [`scripts/tests/live-policy-routing-smoke-test.sh`](../scripts/tests/live-policy-routing-smoke-test.sh) exercises semantic-policy modes, classifier/terminal accounting, controlled failover, automatic non-default port selection, redaction, and process-group cleanup against local Chat-compatible shims; and [`scripts/tests/live-policy-routing-copilot-smoke-test.sh`](../scripts/tests/live-policy-routing-copilot-smoke-test.sh) verifies Copilot bridge catalog selection, secret isolation, non-default ports, and descendant cleanup without contacting Copilot.
 
 The kind smoke builds the PR image and renders the checked-in [`k8s/vekil.yaml`](../k8s/vekil.yaml), patching only the test namespace, local image/pull policy, and the deterministic provider config used in its second phase. It verifies that the `/healthz` startup probe has a coherent 60–90 second failure budget before liveness/readiness begin. It then deploys without Copilot credentials and verifies that `/healthz` remains live, the liveness probe causes zero restarts, `/readyz` stays gated, the Pod is not Ready, and the Service has no ready endpoint. Finally it rolls out a static configured provider and verifies that the same readiness probe admits the Pod and Service endpoint. The script uses an isolated kubeconfig, bounds cluster/API/port-forward work, and requires the live `kubectl port-forward` PID plus its exact listener log before accepting HTTP responses.
 
@@ -289,11 +290,43 @@ The harness generates and validates a schema-version-2 config with one fixed pub
 
 Fork and Dependabot pull requests neutral-skip because GitHub withholds repository secrets. Pull requests also neutral-skip until all eight repository variables/secrets are installed; a manual dispatch with missing configuration fails so it cannot look like a completed live run. Once configured, any controlled-target or routing failure is a hard failure—unlike the rotating Zen free tier, a configured target outage is not treated as neutral. The workflow is separate from deterministic CI. Run the same harness locally after `make build` by exporting the eight variables/secrets above.
 
-## Live Semantic Policy Routing Smoke Workflow
+## Live Semantic Policy Routing Smoke Workflows
 
-The [`Live Semantic Policy Routing Smoke`](../.github/workflows/live-policy-routing-smoke.yaml) workflow runs [`scripts/live-policy-routing-smoke.sh`](../scripts/live-policy-routing-smoke.sh) as the uniquely named `semantic-policy-e2e` check on pull requests to `main` and by manual dispatch. It is a separate credentialed workflow rather than part of deterministic CI: the harness sends bounded but paid requests to real native-Chat providers, while the companion process smoke above covers controllable failure and cleanup paths without credentials.
+The default pull-request check is [`Live Copilot Semantic Policy Routing Smoke`](../.github/workflows/live-policy-routing-copilot-smoke.yaml), whose uniquely named job is `semantic-policy-e2e`. It reuses the repository's existing `COPILOT_GITHUB_TOKEN` rather than requiring a second set of provider credentials. [`scripts/live-policy-routing-copilot-smoke.sh`](../scripts/live-policy-routing-copilot-smoke.sh) starts a private zero-config Vekil bridge backed by Copilot, reads its `/v1/models` catalog, selects native-Chat models, and delegates to the common [`scripts/live-policy-routing-smoke.sh`](../scripts/live-policy-routing-smoke.sh) acceptance harness.
 
-Configure these repository variables:
+The bridge is intentional: schema-v2 policy profiles continue to reject direct dynamic `type: copilot` destinations and classifiers. The policy proxy sees only static `openai-compatible` loopback targets, so CI exercises the production policy contract without expanding the supported policy-provider matrix. The wrapper removes `COPILOT_GITHUB_TOKEN` from the delegated harness environment, gives the bridge a private token directory, auto-selects a non-default loopback port, and verifies bridge/process-group cleanup.
+
+By default the wrapper prefers these currently available model families, always requiring advertised native `/chat/completions` support and falling back to another catalog model when a preferred ID is absent:
+
+- lightweight: `gpt-5.4-mini`, `gpt-5-mini`, `gpt-4.1`, `gpt-4o`, then `claude-haiku-4.5`;
+- classifier: `gpt-4.1`, `claude-sonnet-4.6`, `claude-haiku-4.5`, then GPT-5 mini/full variants;
+- powerful primary: `gpt-5.4`, `claude-sonnet-4.6`, Codex variants, then `gpt-4.1`; and
+- powerful secondary: the first distinct compatible model from the same powerful preference set.
+
+Optional repository variables pin a model instead of using dynamic selection:
+
+- `LIVE_POLICY_ROUTING_COPILOT_LIGHTWEIGHT_MODEL`
+- `LIVE_POLICY_ROUTING_COPILOT_CLASSIFIER_MODEL`
+- `LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL`
+- `LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL`
+
+Because Vekil cannot independently attest Copilot's retention behavior, the Copilot wrapper declares `classifier_no_store_supported: false`, strips the classifier `store` field, and sets the synthetic test profile's explicit `allow_provider_retention: true` acknowledgement. The test sends only fixed synthetic content. This acknowledgement is not evidence of a provider retention guarantee.
+
+The common live matrix covers:
+
+- offline config validation followed by the explicit one-send live classifier preflight;
+- `off` mode using the configured lightweight baseline without a runtime classifier send;
+- `observe` mode serving the baseline while recording a bounded asynchronous shadow decision;
+- `enforce` mode routing a bounded one-file task to lightweight and a complex or truncated task to powerful;
+- forced function tools, tool-result continuation, and parallel distinct function calls;
+- powerful streaming with canonical public model identity and exactly one `[DONE]`;
+- retry-safe within-powerful-tier failover through a loopback validation shim that injects an authoritative precommit `429`;
+- representative local rejections with zero classifier and terminal sends; and
+- `/stats.json`, response, header, log, generation-hash, prompt/tool sentinel, upstream request-ID, and internal-topology redaction checks.
+
+In the Copilot PR gate, the powerful targets are distinct models but share one Copilot service and loopback bridge. That proves sealed tier selection, retry accounting, target switching, and public-identity behavior; it does **not** prove independent cross-provider availability.
+
+True cross-provider coverage remains available through the manual [`Live Multi-Provider Semantic Policy Routing Smoke`](../.github/workflows/live-policy-routing-smoke.yaml) workflow and its `semantic-policy-multiprovider-e2e` job. Configure these repository variables for that workflow:
 
 - `LIVE_POLICY_ROUTING_LIGHTWEIGHT_TYPE` — `azure-openai` or `openai-compatible`
 - `LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL` — the lightweight provider API base before `/chat/completions`; Azure uses the OpenAI v1 form ending in `/openai/v1`
@@ -304,36 +337,29 @@ Configure these repository variables:
 - `LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_TYPE` — `azure-openai` or `openai-compatible`
 - `LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL` — the secondary powerful provider API base before `/chat/completions`
 - `LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL` — the semantically equivalent secondary powerful model/deployment name
-- `LIVE_POLICY_ROUTING_CLASSIFIER_MODEL` — the classifier deployment on the powerful-primary provider; it must support the forced strict function-tool contract used by live preflight
-- `LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED` — set explicitly to `true` only after confirming that the classifier endpoint accepts Vekil's non-storage request option
+- `LIVE_POLICY_ROUTING_CLASSIFIER_MODEL` — the classifier deployment on the powerful-primary provider
+- `LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED` — `true` only after confirming support; otherwise set `false` and explicitly set `LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION=true`
+- `LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION` — optional, defaults to `false`
 
-Configure these repository secrets:
+Configure these repository secrets for the manual workflow:
 
 - `LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY`
 - `LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY`
 - `LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY`
 
-The classifier uses the powerful-primary provider credential. Secrets are passed to the harness as environment variables; the generated temporary schema-v2 config references `api_key_env` names and never embeds credential values. Keep the powerful primary and secondary on the same public Chat contract. A configured target outage, protocol incompatibility, classifier failure, privacy leak, wrong tier, or accounting mismatch is a hard failure rather than a neutral provider transient.
+The generated temporary schema-v2 config references `api_key_env` names and never embeds credential values. The powerful primary and secondary must share the same public Chat contract. A configured target outage, protocol incompatibility, classifier failure, privacy leak, wrong tier, or accounting mismatch is a hard failure.
 
-The live matrix covers:
+Both workflows use isolated loopback ports, reject port `1337`, retry bounded address-in-use races, and verify that every proxy, bridge, and shim listener is released. Do not change either workflow to `pull_request_target`: executing pull-request code with provider credentials would expose secrets to untrusted code. Fork PRs and Dependabot neutral-skip the Copilot check because GitHub withholds secrets; a same-repository run without `COPILOT_GITHUB_TOKEN` fails instead of looking like completed coverage. The manual multi-provider workflow fails when its configuration is missing.
 
-- offline config validation followed by the explicit one-send live classifier preflight;
-- `off` mode using the configured lightweight baseline without a runtime classifier send;
-- `observe` mode serving the baseline while recording a bounded asynchronous shadow decision;
-- `enforce` mode routing a bounded one-file task to lightweight and a complex or truncated task to powerful;
-- forced function tools, tool-result continuation, and parallel distinct function calls;
-- powerful streaming with canonical public model identity and exactly one `[DONE]`;
-- retry-safe within-powerful-tier failover through a loopback validation shim that injects an authoritative precommit `429`, followed by success on the real secondary;
-- representative local rejections with zero classifier and terminal sends; and
-- `/stats.json`, response, header, log, generation-hash, prompt/tool sentinel, upstream request-ID, and internal topology redaction checks.
+These smokes incur real provider cost and are bounded acceptance coverage, not the 75-task pilot/holdout or 5,000-observation production-enforcement evaluation described in the policy-routing release gate. Failure diagnostics are allowlisted, redacted, and truncated; raw generated provider configs are not uploaded.
 
-When `PROXY_PORT` is unset, the harness binds only to `127.0.0.1`, asks the operating system for isolated ports, rejects port `1337`, retries bounded address-in-use races, and verifies that every proxy and shim listener is released during cleanup. Do not set the workflow to a shared/default port. The deterministic companion test deliberately injects a startup collision and checks process-group/descendant cleanup so the live workflow does not rely on timing alone.
+Run the Copilot-backed gate locally after `make build`:
 
-Fork pull requests and Dependabot neutral-skip because repository secrets are unavailable. Same-repository pull requests also neutral-skip until all variables and secrets above are installed, matching the existing live-provider-routing installation behavior. A manual dispatch with missing configuration fails. Do not change this workflow to `pull_request_target`: executing pull-request code with provider credentials would expose secrets to untrusted code.
+```bash
+COPILOT_GITHUB_TOKEN=... scripts/live-policy-routing-copilot-smoke.sh
+```
 
-This smoke incurs real provider cost: it performs classifier preflight plus multiple classifier and terminal requests, including one two-attempt powerful failover. Keep prompts synthetic, never include customer data or real credentials in request content, and monitor provider budgets. The smoke is bounded acceptance coverage, not the 75-task pilot/holdout or 5,000-observation production-enforcement evaluation described in the policy-routing release gate. Failure diagnostics print only a fixed allowlist of files, replace configured keys, base URLs, physical model IDs, request/replay IDs, tool arguments, and sentinels before truncation, and do not upload raw artifacts or the generated provider config.
-
-Run the same live harness locally after `make build` by exporting all variables and secrets above:
+Run the true multi-provider harness locally by exporting its variables and secrets:
 
 ```bash
 scripts/live-policy-routing-smoke.sh
@@ -362,16 +388,16 @@ SMOKE_PROVIDER=zen PROVIDERS_CONFIG=examples/opencode-zen-free.yaml \
   scripts/live-cli-smoke.sh
 ```
 
-## Live Copilot Smoke setup
+## Live Copilot workflows setup
 
-To use the `Live Copilot Smoke` workflow:
+The `Live Copilot Smoke` and `Live Copilot Semantic Policy Routing Smoke` workflows share one credential:
 
 1. Create a GitHub token for a user that has GitHub Copilot access.
 2. Grant that token the `Copilot Requests` permission.
 3. Save it as the repository secret `COPILOT_GITHUB_TOKEN`.
-4. Run the `Live Copilot Smoke` workflow from the Actions tab.
+4. Run either workflow from the Actions tab; same-repository pull requests run both automatically.
 
-This workflow is intentionally separate from the normal CI workflow so pull requests and forked builds remain deterministic and do not depend on live provider credentials.
+These workflows remain separate from deterministic core CI. Fork pull requests neutral-skip because GitHub does not expose repository secrets to untrusted pull-request code.
 
 You can also run the same smoke scripts locally after building `vekil`; the CLI smoke script additionally requires those three CLIs to be installed.
 
