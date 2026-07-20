@@ -5,12 +5,111 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
+
+func TestHandleAnthropicMessages_CopilotNativeMessages(t *testing.T) {
+	t.Run("a model advertising native Messages preserves the Anthropic request", func(t *testing.T) {
+		var modelFetches, messagesPosts, chatPosts int
+		var upstreamReq models.AnthropicRequest
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == providerEndpointModels:
+				modelFetches++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"claude-sonnet-5","supported_endpoints":["/chat/completions","/v1/messages"]},{"id":"claude-chat-only","supported_endpoints":["/chat/completions"]}]}`)
+			case r.Method == http.MethodPost && r.URL.Path == providerEndpointMessages:
+				messagesPosts++
+				if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+					t.Errorf("decode upstream request: %v", err)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"msg-native","type":"message","role":"assistant","model":"claude-sonnet-5","content":[{"type":"text","text":"<block>no</block>"}],"stop_reason":"stop_sequence","stop_sequence":"</block>","usage":{"input_tokens":12,"output_tokens":3}}`)
+			case r.Method == http.MethodPost && r.URL.Path == providerEndpointChatCompletions:
+				chatPosts++
+				http.Error(w, "unexpected Chat translation", http.StatusInternalServerError)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer upstream.Close()
+
+		handler, err := NewProxyHandler(
+			auth.NewTestAuthenticator("test-token"),
+			logger.NewWithWriter(logger.LevelError, io.Discard),
+			WithCopilotBaseURL(upstream.URL),
+		)
+		if err != nil {
+			t.Fatalf("NewProxyHandler() error = %v", err)
+		}
+		modelsReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		modelsWriter := httptest.NewRecorder()
+		handler.HandleModels(modelsWriter, modelsReq)
+		if modelsWriter.Code != http.StatusOK {
+			t.Fatalf("models status = %d, want 200: %s", modelsWriter.Code, modelsWriter.Body.String())
+		}
+		owner, known := handler.providerSetup().lookupModel("claude-sonnet-5")
+		if !known {
+			t.Fatal("claude-sonnet-5 was not loaded from the Copilot catalog")
+		}
+		if !supportsEndpoint(owner.supportedEndpoints, providerEndpointMessages) {
+			t.Fatalf("discovered endpoints = %v, want /v1/messages", owner.supportedEndpoints)
+		}
+		if !handler.shouldForwardAnthropicMessagesDirect("claude-sonnet-5") {
+			t.Fatal("Copilot model advertising /v1/messages did not select direct forwarding")
+		}
+		if handler.shouldForwardAnthropicMessagesDirect("claude-chat-only") {
+			t.Fatal("Chat-only Copilot model selected direct Messages forwarding")
+		}
+		if handler.shouldForwardAnthropicMessagesDirect("claude-unknown") {
+			t.Fatal("unknown Copilot model selected direct Messages forwarding")
+		}
+
+		req := httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(`{
+			"model":"claude-sonnet-5",
+			"messages":[{"role":"user","content":"Classify this action"}],
+			"max_tokens":64,
+			"stream":false,
+			"stop_sequences":["</block>"],
+			"thinking":{"type":"disabled"}
+		}`))
+		req.Header.Set("Anthropic-Version", "2023-06-01")
+		w := httptest.NewRecorder()
+
+		handler.HandleAnthropicMessages(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+		}
+		if modelFetches != 1 || messagesPosts != 1 || chatPosts != 0 {
+			t.Fatalf("upstream requests models/messages/chat = %d/%d/%d, want 1/1/0", modelFetches, messagesPosts, chatPosts)
+		}
+		if upstreamReq.Stream {
+			t.Fatal("upstream stream = true, want the client's non-streaming request preserved")
+		}
+		if upstreamReq.Thinking == nil || upstreamReq.Thinking.Type != "disabled" {
+			t.Fatalf("upstream thinking = %+v, want disabled", upstreamReq.Thinking)
+		}
+		if len(upstreamReq.StopSequences) != 1 || upstreamReq.StopSequences[0] != "</block>" {
+			t.Fatalf("upstream stop_sequences = %v, want [</block>]", upstreamReq.StopSequences)
+		}
+
+		var response models.AnthropicResponse
+		if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if response.StopReason == nil || *response.StopReason != "stop_sequence" || response.StopSequence == nil || *response.StopSequence != "</block>" {
+			t.Fatalf("response stop reason/sequence = %v/%v, want stop_sequence/</block>", response.StopReason, response.StopSequence)
+		}
+	})
+}
 
 func TestPrepareOpenAIChatCompletionsRequest_ForceStreamWithTools(t *testing.T) {
 	input := []byte(`{

@@ -1116,8 +1116,20 @@ func anthropicExtraHeadersFromRequest(r *http.Request) http.Header {
 }
 
 func (h *ProxyHandler) shouldForwardAnthropicMessagesDirect(model string) bool {
-	provider, _, _ := h.resolveProviderModelForRequest(model, providerEndpointMessages)
-	return provider != nil && provider.kind == providerTypeAnthropicCompatible
+	provider, owner, known := h.resolveProviderModelForRequest(model, providerEndpointMessages)
+	if provider == nil {
+		return false
+	}
+	if provider.kind == providerTypeAnthropicCompatible {
+		return true
+	}
+	// Copilot's Claude models natively serve Anthropic Messages. Forward directly
+	// only when the catalog explicitly advertises /v1/messages so unknown models
+	// (empty endpoint list = "supports everything") still translate through Chat.
+	if provider.kind == providerTypeCopilot && known && supportsEndpoint(owner.supportedEndpoints, providerEndpointMessages) {
+		return true
+	}
+	return false
 }
 
 func (h *ProxyHandler) shouldForwardAnthropicCountTokensDirect(model string) bool {
