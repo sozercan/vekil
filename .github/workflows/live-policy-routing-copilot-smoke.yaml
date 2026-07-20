@@ -1,0 +1,78 @@
+name: Live Copilot Semantic Policy Routing Smoke
+
+# Default credentialed PR acceptance coverage for schema-v2 semantic routing.
+# The wrapper starts a private zero-config Vekil bridge using the repository's
+# existing Copilot token, discovers native-Chat models, and presents them to the
+# unchanged policy harness as static openai-compatible loopback targets. This
+# preserves the product restriction against direct dynamic Copilot policy routes.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-copilot-policy-routing-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semantic-policy:
+    name: semantic-policy-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      LIVE_POLICY_ROUTING_COPILOT_LIGHTWEIGHT_MODEL: ${{ vars.LIVE_POLICY_ROUTING_COPILOT_LIGHTWEIGHT_MODEL }}
+      LIVE_POLICY_ROUTING_COPILOT_CLASSIFIER_MODEL: ${{ vars.LIVE_POLICY_ROUTING_COPILOT_CLASSIFIER_MODEL }}
+      LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL: ${{ vars.LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL }}
+      LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL: ${{ vars.LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL }}
+    steps:
+      - name: Decide whether Copilot semantic policy-routing smoke can run
+        id: gate
+        env:
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork || false }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ "${IS_FORK}" = "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping Copilot semantic policy-routing smoke for fork pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${ACTOR}" = "dependabot[bot]" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping Copilot semantic policy-routing smoke for Dependabot because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
+            echo "COPILOT_GITHUB_TOKEN repository secret is required for the Copilot semantic policy-routing smoke." >&2
+            exit 1
+          fi
+
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Explain skipped Copilot semantic policy-routing smoke
+        if: steps.gate.outputs.run != 'true'
+        run: echo "${{ steps.gate.outputs.reason }}"
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.gate.outputs.run == 'true'
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        if: steps.gate.outputs.run == 'true'
+        run: make build
+
+      - name: Run Copilot-backed semantic policy-routing E2E
+        if: steps.gate.outputs.run == 'true'
+        env:
+          LIVE_POLICY_ROUTING_SMOKE_DIR: ${{ runner.temp }}/live-policy-routing-copilot-smoke
+        run: scripts/live-policy-routing-copilot-smoke.sh

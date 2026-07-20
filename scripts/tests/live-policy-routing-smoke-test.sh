@@ -642,6 +642,8 @@ assert_generated_config() {
         "LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY",
         "LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY"
       ]
+      and (.providers[] | select(.id == "live-powerful-primary-provider").classifier_no_store_supported) == true
+      and .policy_profiles[0].data_policy.allow_provider_retention == false
       and (.model_routes | length) == 3
       and (.model_routes[] | select(.id == "live-semantic-lightweight").targets[0].upstream_model) == $lightweight_model
       and (.model_routes[] | select(.id == "live-semantic-powerful").targets | map(.upstream_model)) == [$primary_model,$secondary_model]

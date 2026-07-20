@@ -85,4 +85,6 @@ GitHub Actions in `.github/workflows/ci.yaml` runs `golangci-lint` (only new iss
 Live smoke workflows are separate from `ci.yaml` so the core gate stays deterministic and credential-free:
 
 - `live-copilot-smoke.yaml` — credentialed Copilot smoke for compaction, Responses-backed Chat text/tool replay, and Codex/Claude/Gemini CLIs. Needs `COPILOT_GITHUB_TOKEN`; self-skips on fork PRs and Dependabot.
+- `live-policy-routing-copilot-smoke.yaml` — default credentialed semantic-policy PR gate. It reuses `COPILOT_GITHUB_TOKEN`, discovers Copilot native-Chat models through a loopback Vekil bridge, and runs the full policy harness without admitting direct dynamic Copilot policy routes.
+- `live-policy-routing-smoke.yaml` — manual true multi-provider semantic-policy smoke for independently configured Azure/OpenAI-compatible lightweight, powerful-primary, powerful-secondary, and classifier targets.
 - `live-zen-smoke.yaml` — credential-free OpenCode Zen free-tier smoke. Runs `scripts/live-cli-smoke.sh` in `SMOKE_PROVIDER=zen` mode (Copilot CLI offline, Claude, Gemini) and runs on every PR including forks. Neutral-skips when the Zen free tier is unreachable so it never blocks unrelated PRs.
