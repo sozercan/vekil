@@ -451,7 +451,7 @@ func writeServeUsage(fs *flag.FlagSet, w io.Writer) {
 	fs.SetOutput(w)
 	defer fs.SetOutput(previous)
 
-	_, _ = fmt.Fprintln(w, "Usage: vekil [options]")
+	_, _ = fmt.Fprintf(w, "Usage of %s:\n", fs.Name())
 	fs.PrintDefaults()
 }
 

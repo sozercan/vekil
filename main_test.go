@@ -323,7 +323,7 @@ func TestServeUsageIncludesManagedRecoveryFlags(t *testing.T) {
 	writeServeUsage(fs, &output)
 
 	for _, want := range []string{
-		"Usage: vekil [options]",
+		"Usage of serve:",
 		"-ignore-managed",
 		"-reset-managed",
 		"read-only recovery",
