@@ -602,8 +602,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not no_sampling:
                 errors.append("sampling_fields_not_dropped")
             if kind == "classifier":
-                if body.get("store") is not False:
-                    errors.append("classifier_store_not_false")
+                if self.server.classifier_no_store_supported:
+                    if body.get("store") is not False:
+                        errors.append("classifier_store_not_false")
+                elif "store" in body:
+                    errors.append("classifier_store_not_removed")
                 if body.get("stream") not in (None, False):
                     errors.append("classifier_stream_invalid")
                 if body.get("max_completion_tokens") != self.server.classifier_max_tokens:
@@ -762,6 +765,7 @@ def main():
     parser.add_argument("--primary-model", required=True)
     parser.add_argument("--classifier-model", required=True)
     parser.add_argument("--classifier-max-tokens", type=int, required=True)
+    parser.add_argument("--classifier-no-store-supported", choices=("true", "false"), required=True)
     parser.add_argument("--expected-auth-header", choices=("api-key", "authorization"), required=True)
     parser.add_argument("--expected-auth-sha256", required=True)
     parser.add_argument("--injected-request-id", required=True)
@@ -775,6 +779,7 @@ def main():
     server.primary_model = args.primary_model
     server.classifier_model = args.classifier_model
     server.classifier_max_tokens = args.classifier_max_tokens
+    server.classifier_no_store_supported = args.classifier_no_store_supported == "true"
     server.expected_auth_header = args.expected_auth_header
     server.expected_auth_sha256 = args.expected_auth_sha256
     server.injected_request_id = args.injected_request_id
@@ -835,6 +840,7 @@ start_powerful_primary_shim() {
         --primary-model "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL}" \
         --classifier-model "${LIVE_POLICY_ROUTING_CLASSIFIER_MODEL}" \
         --classifier-max-tokens 256 \
+        --classifier-no-store-supported "${LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED}" \
         --expected-auth-header "${expected_auth_header}" \
         --expected-auth-sha256 "${expected_auth_sha256}" \
         --injected-request-id "${INJECTED_REQUEST_ID}" \
