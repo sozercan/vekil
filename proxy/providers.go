@@ -417,35 +417,9 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".yaml", ".yml":
-		allowMergeKeys := !providersConfigSchemaUsesStrictDecoding(sniffProvidersConfigSchemaVersionYAML(body))
-		if err := rejectDuplicateYAMLMappingKeys(body, allowMergeKeys); err != nil {
+		if err := decodeProvidersConfigYAML(body, cfg); err != nil {
 			return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
 		}
-		if !allowMergeKeys {
-			if err := validateYAMLConfigFieldPaths(body); err != nil {
-				return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
-			}
-		}
-		decoder := yaml.NewDecoder(bytes.NewReader(body))
-		decoder.KnownFields(true)
-		if err := decoder.Decode(cfg); err != nil {
-			return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
-		}
-		var extra interface{}
-		if err := decoder.Decode(&extra); err != io.EOF {
-			if err != nil {
-				return fmt.Errorf("decode providers config %q as YAML: trailing document: %w", path, err)
-			}
-			return fmt.Errorf("decode providers config %q as YAML: more than one YAML document", path)
-		}
-		present, err := yamlTopLevelConfigFields(body)
-		if err != nil {
-			return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
-		}
-		cfg.schemaVersionSet = present["schema_version"]
-		cfg.modelRoutesSet = present["model_routes"]
-		cfg.policyProfilesSet = present["policy_profiles"]
-		markYAMLProvidersConfigFieldPresence(body, cfg)
 	default:
 		if err := rejectDuplicateJSONMappingKeys(body); err != nil {
 			return fmt.Errorf("decode providers config %q as JSON: %w", path, err)
@@ -474,6 +448,45 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 		cfg.policyProfilesSet = present["policy_profiles"]
 		markJSONProvidersConfigFieldPresence(body, cfg)
 	}
+	return nil
+}
+
+func decodeProvidersConfigYAML(body []byte, cfg *ProvidersConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("providers config destination is required")
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return fmt.Errorf("providers config YAML is empty")
+	}
+	allowMergeKeys := !providersConfigSchemaUsesStrictDecoding(sniffProvidersConfigSchemaVersionYAML(body))
+	if err := rejectDuplicateYAMLMappingKeys(body, allowMergeKeys); err != nil {
+		return err
+	}
+	if !allowMergeKeys {
+		if err := validateYAMLConfigFieldPaths(body); err != nil {
+			return err
+		}
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(body))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(cfg); err != nil {
+		return err
+	}
+	var extra interface{}
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err != nil {
+			return fmt.Errorf("trailing YAML document: %w", err)
+		}
+		return fmt.Errorf("more than one YAML document")
+	}
+	present, err := yamlTopLevelConfigFields(body)
+	if err != nil {
+		return err
+	}
+	cfg.schemaVersionSet = present["schema_version"]
+	cfg.modelRoutesSet = present["model_routes"]
+	cfg.policyProfilesSet = present["policy_profiles"]
+	markYAMLProvidersConfigFieldPresence(body, cfg)
 	return nil
 }
 
@@ -512,15 +525,7 @@ func defaultProviderSetup(h *ProxyHandler) *providerSetup {
 }
 
 func (h *ProxyHandler) providerSetup() *providerSetup {
-	if h != nil && h.providersState != nil {
-		return h.providersState
-	}
-	return defaultProviderSetup(h)
-}
-
-func (h *ProxyHandler) hasClosedConfiguredModelRegistry() bool {
-	setup := h.providerSetup()
-	return setup != nil && setup.hasConfiguredState && strings.TrimSpace(setup.defaultProviderID) == "" && setup.routeRegistry() != nil
+	return h.providerSetupForContext(context.Background())
 }
 
 func (ps *providerSetup) defaultProvider() *providerRuntime {
@@ -709,11 +714,6 @@ func (ps *providerSetup) modelsForProvider(providerID string) []providerModel {
 }
 
 func (h *ProxyHandler) initializeProviders() error {
-	if len(h.providersConfig.Providers) == 0 {
-		h.providersState = defaultProviderSetup(h)
-		return nil
-	}
-
 	setup, err := h.buildConfiguredProviderSetupWithDynamicValidation(context.Background(), h.providersConfig, !h.deferDynamicProviderModelRefresh)
 	if err != nil {
 		return err
@@ -728,6 +728,9 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 }
 
 func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx context.Context, cfg ProvidersConfig, validateDynamicModels bool) (*providerSetup, error) {
+	if len(cfg.Providers) == 0 {
+		return defaultProviderSetup(h), nil
+	}
 	providers, providerOrder, defaultProviderID, err := h.buildProviders(cfg)
 	if err != nil {
 		return nil, err
@@ -1736,10 +1739,6 @@ func modelNotAllowedRequestError(model string) error {
 
 }
 
-func (h *ProxyHandler) resolveProviderModelForRequest(model, endpoint string) (*providerRuntime, providerModel, bool) {
-	return h.resolveProviderModel(model, endpoint)
-}
-
 func providerModelSupportsEndpoint(model providerModel, endpoint string) bool {
 	if len(model.supportedEndpoints) == 0 {
 		return true
@@ -1918,16 +1917,17 @@ func appendRawQuery(rawURL, rawQuery string) string {
 	return rawURL + separator + rawQuery
 }
 
-func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *providerRuntime, endpoint string) error {
+func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *providerRuntime, endpoint string) (providerRequestAuthIdentity, error) {
+	identity := providerRequestAuthIdentity{}
 	if provider == nil {
-		return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider is required")}
+		return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider is required")}
 	}
 
 	switch provider.kind {
 	case providerTypeCopilot:
 		token, err := h.auth.GetToken(req.Context())
 		if err != nil {
-			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
+			return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
 		}
 		h.setCopilotHeadersForProvider(req, token, provider, endpoint)
 	case providerTypeAzureOpenAI:
@@ -1939,25 +1939,25 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 			req.Header.Set("api-key", provider.apiKey)
 		case providerAuthModeAzureIdentity:
 			if provider.azureToken == nil {
-				return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no Azure identity token source configured", provider.id)}
+				return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no Azure identity token source configured", provider.id)}
 			}
 			token, err := provider.azureToken.AccessToken(req.Context())
 			if err != nil {
-				return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q Azure identity auth failed: %w", provider.id, err)}
+				return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q Azure identity auth failed: %w", provider.id, err)}
 			}
 			req.Header.Set("Authorization", "Bearer "+token)
 		default:
-			return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has unsupported auth mode %q", provider.id, provider.authMode)}
+			return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has unsupported auth mode %q", provider.id, provider.authMode)}
 		}
 		req.Header.Set("Content-Type", "application/json")
 	case providerTypeOpenAICodex:
 		clearCopilotHeaders(req.Header)
 		if provider.codexAuth == nil {
-			return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no OpenAI Codex auth configured", provider.id)}
+			return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no OpenAI Codex auth configured", provider.id)}
 		}
 		credentials, err := provider.codexAuth.credentials(req.Context(), h.client)
 		if err != nil {
-			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
+			return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
 		}
 		req.Header.Set("Authorization", "Bearer "+credentials.accessToken)
 		if credentials.accountID != "" {
@@ -1967,19 +1967,20 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 			req.Header.Set("X-OpenAI-Fedramp", "true")
 		}
 		req.Header.Set("Content-Type", "application/json")
+		identity.credentialFingerprint = targetOpenAICodexCredentialsFingerprint(credentials)
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		clearCopilotHeaders(req.Header)
 		mergeHeaderValues(req.Header, provider.extraHeaders)
 		if err := applyGenericProviderAuth(req, provider); err != nil {
-			return err
+			return identity, err
 		}
 		if req.Method != http.MethodGet {
 			req.Header.Set("Content-Type", "application/json")
 		}
 	default:
-		return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("unsupported provider type %q", provider.kind)}
+		return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("unsupported provider type %q", provider.kind)}
 	}
-	return nil
+	return identity, nil
 }
 
 func applyGenericProviderAuth(req *http.Request, provider *providerRuntime) error {
@@ -2078,10 +2079,11 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 	if len(extraHeaders) > 0 {
 		mergeHeaderValues(req.Header, extraHeaders)
 	}
-	if err := h.applyProviderHeaders(req, provider, path); err != nil {
+	authIdentity, err := h.applyProviderHeaders(req, provider, path)
+	if err != nil {
 		return nil, err
 	}
-	return req, nil
+	return finalizeTargetRevisionRequest(req, authIdentity)
 }
 
 func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *providerRuntime, rawQuery, ifNoneMatch string) (providerModelsFetchResult, error) {

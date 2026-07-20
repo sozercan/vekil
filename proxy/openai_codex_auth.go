@@ -99,6 +99,7 @@ type openAICodexAuthState struct {
 type openAICodexCredentials struct {
 	accessToken string
 	accountID   string
+	subject     string
 	fedRAMP     bool
 }
 
@@ -612,6 +613,41 @@ func (a *openAICodexAuth) read() (openAICodexAuthState, error) {
 	}
 	defer closeOpenAICodexAuthoritative(authoritative)
 	return authoritative.state, nil
+}
+
+// readIdentityState returns the authoritative auth state used to fence
+// stateful continuations. During Vekil's in-place refresh commit, auth.json is
+// briefly truncated before the replacement bytes are written; fall back to the
+// last synchronized state so that routine refresh never creates a transient
+// "unavailable" identity. Successful reads refresh that fallback when no
+// refresh is currently publishing.
+func (a *openAICodexAuth) readIdentityState() (openAICodexAuthState, error) {
+	if a == nil {
+		return openAICodexAuthState{}, fmt.Errorf("OpenAI Codex auth is not configured")
+	}
+
+	shared := a.sharedState()
+	shared.mu.Lock()
+	fallback := openAICodexCloneStatePtr(shared.state)
+	if fallback == nil && shared.refresh != nil && !shared.refresh.abandoned {
+		fallback = openAICodexCloneStatePtr(shared.refresh.candidateState)
+	}
+	shared.mu.Unlock()
+
+	state, err := a.read()
+	if err != nil {
+		if fallback != nil {
+			return *fallback, nil
+		}
+		return openAICodexAuthState{}, err
+	}
+
+	shared.mu.Lock()
+	if shared.refresh == nil || shared.refresh.abandoned {
+		shared.state = openAICodexCloneStatePtr(&state)
+	}
+	shared.mu.Unlock()
+	return state, nil
 }
 
 func (a *openAICodexAuth) readAuthoritative() (*openAICodexAuthoritativeState, error) {
@@ -1311,9 +1347,14 @@ func openAICodexCredentialsFromTokens(tokens openAICodexTokenData) openAICodexCr
 	if accountID == "" {
 		accountID = idClaims.chatGPTAccountID
 	}
+	subject := idClaims.subject
+	if subject == "" {
+		subject = openAICodexJWTClaims(tokens.AccessToken).subject
+	}
 	return openAICodexCredentials{
 		accessToken: strings.TrimSpace(tokens.AccessToken),
 		accountID:   accountID,
+		subject:     subject,
 		fedRAMP:     idClaims.fedRAMP,
 	}
 }
@@ -1426,6 +1467,7 @@ func openAICodexJWTExpiration(token string) (time.Time, bool) {
 
 type openAICodexClaims struct {
 	exp              int64
+	subject          string
 	chatGPTAccountID string
 	fedRAMP          bool
 }
@@ -1437,7 +1479,8 @@ func openAICodexJWTClaims(token string) openAICodexClaims {
 	}
 
 	var claims struct {
-		Exp  int64 `json:"exp"`
+		Exp  int64  `json:"exp"`
+		Sub  string `json:"sub"`
 		Auth struct {
 			ChatGPTAccountID      string `json:"chatgpt_account_id"`
 			ChatGPTAccountFedRAMP bool   `json:"chatgpt_account_is_fedramp"`
@@ -1448,6 +1491,7 @@ func openAICodexJWTClaims(token string) openAICodexClaims {
 	}
 	return openAICodexClaims{
 		exp:              claims.Exp,
+		subject:          strings.TrimSpace(claims.Sub),
 		chatGPTAccountID: strings.TrimSpace(claims.Auth.ChatGPTAccountID),
 		fedRAMP:          claims.Auth.ChatGPTAccountFedRAMP,
 	}

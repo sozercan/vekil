@@ -95,7 +95,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	if err := h.validateRouteAwareRequestJSON(body, normalizeGeminiModelName(pathModel), providerEndpointChatCompletions); err != nil {
+	if err := h.validateRouteAwareRequestJSONForContext(r.Context(), body, normalizeGeminiModelName(pathModel), providerEndpointChatCompletions); err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
@@ -417,7 +417,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	if err := h.validateRouteAwareRequestJSON(body, normalizeGeminiModelName(pathModel), providerEndpointChatCompletions); err != nil {
+	if err := h.validateRouteAwareRequestJSONForContext(r.Context(), body, normalizeGeminiModelName(pathModel), providerEndpointChatCompletions); err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
@@ -435,7 +435,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 	}
 	h.observeRequestSummary(r.Context(), "gemini_count_tokens", pathModel, false, providerEndpointChatCompletions)
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), false)
 	defer upstreamCancel()
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, route, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), oaiReq.Model, providerEndpointChatCompletions)

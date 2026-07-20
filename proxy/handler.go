@@ -246,6 +246,7 @@ func (c ResponsesWebSocketConfig) autoCompactEnabled() bool {
 // ProxyHandler holds dependencies for all HTTP handlers.
 type ProxyHandler struct {
 	auth                             *auth.Authenticator
+	runtime                          atomic.Pointer[runtimeSnapshot]
 	client                           *http.Client
 	copilotURL                       string
 	copilotHeaders                   CopilotHeaderConfig
@@ -302,6 +303,13 @@ type ProxyHandler struct {
 	stateBindingsErr                 error
 	insightGate                      *insightGate
 	insightGateOnce                  sync.Once
+	dashboardConfigAccess            atomic.Pointer[dashboardConfigAccessState]
+	dashboardConfigCSRFOnce          sync.Once
+	dashboardConfigCSRF              string
+	dashboardConfigSource            *dashboardConfigSourceState
+	initialRuntimeRevision           string
+	runtimeControl                   RuntimeControl
+	runtimeCommitMu                  sync.Mutex
 }
 
 // initializeLifecycle installs the proxy-owned cancellation root used by
@@ -359,6 +367,12 @@ func (h *ProxyHandler) BeginShutdown() {
 	if h == nil {
 		return
 	}
+	// Ask an active candidate to stop before waiting at the persistence/
+	// publication gate. If it has already committed its rename, it completes
+	// publication; otherwise cancellation prevents the rename.
+	if control, ok := h.runtimeControl.(interface{ cancelForShutdown() }); ok {
+		control.cancelForShutdown()
+	}
 	h.shutdownSequenceOnce.Do(func() {
 		publishResponsesLifecycleSequence(func(sequence uint64) {
 			h.shutdownSequence.Store(sequence)
@@ -369,6 +383,32 @@ func (h *ProxyHandler) BeginShutdown() {
 	h.lifecycleCancel(errProxyLifecycleShutdown)
 	if h.client != nil {
 		h.client.CloseIdleConnections()
+	}
+}
+
+// WaitRuntimeCommit waits for any persistence/publication transaction that
+// already crossed the commit fence. The wait is context-bounded so Server.Stop
+// continues to honor its shutdown deadline even if filesystem I/O stalls.
+func (h *ProxyHandler) WaitRuntimeCommit(ctx context.Context) error {
+	if h == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		h.runtimeCommitMu.Lock()
+		_ = h.runtime.Load()
+		h.runtimeCommitMu.Unlock()
+		close(done)
+	}()
+	if ctx == nil {
+		<-done
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -896,6 +936,35 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		h.chatPolicyPlanner = controller
 		h.policyPreflightPending.Store(controller.Active())
 	}
+	initialConfig := cloneProvidersConfigForValidation(h.providersConfig)
+	if validated, validateErr := validateAndNormalizeProvidersConfig(initialConfig); validateErr == nil {
+		initialConfig = validated.config
+	}
+	initialRevision := strings.TrimSpace(h.initialRuntimeRevision)
+	if initialRevision == "" {
+		initialRevision = runtimeRevisionFromConfig(initialConfig)
+	}
+	initialManagedActive := h.dashboardConfigSource != nil && h.dashboardConfigSource.resolved.Managed
+	initialSnapshot := &runtimeSnapshot{
+		generation:    1,
+		revision:      initialRevision,
+		config:        initialConfig,
+		managedActive: initialManagedActive,
+		providers:     h.providersState,
+		policy: &policyBinding{
+			planner:    h.chatPolicyPlanner,
+			controller: h.policyRoutingController,
+		},
+		readiness: activeRuntimeReadiness{
+			policyPreflightComplete: controller == nil || !controller.Active(),
+			policyDiagnostic:        h.PolicyRoutingReadinessDiagnostic(),
+		},
+		caches: &runtimeCaches{models: &h.models, chatRoutes: &h.chatRoutes},
+	}
+	h.publishRuntime(initialSnapshot)
+	if h.dashboardConfigSource != nil {
+		h.runtimeControl = newRuntimeControl(h, h.dashboardConfigSource)
+	}
 	h.validateInsightModel()
 	return h, nil
 }
@@ -905,7 +974,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 // route may use native /chat/completions or the Chat-over-Responses adapter; only
 // models that support neither native endpoint are startup misconfigurations.
 func (h *ProxyHandler) validateInsightModel() {
-	model := strings.TrimSpace(h.providersConfig.InsightModel)
+	model := strings.TrimSpace(h.currentProvidersConfig().InsightModel)
 	if model == "" || h.log == nil || h.DynamicProviderValidationPending() {
 		return
 	}
@@ -1114,38 +1183,42 @@ func writeCachedModelsResponse(w http.ResponseWriter, entry cachedModelsResponse
 }
 
 func (h *ProxyHandler) storeModelsCacheEntry(cacheKey string, entry cachedModelsResponse) {
-	if h == nil {
+	h.storeModelsCacheEntryFor(h.modelsCacheForContext(context.Background()), cacheKey, entry)
+}
+
+func (h *ProxyHandler) storeModelsCacheEntryFor(cache *modelsCache, cacheKey string, entry cachedModelsResponse) {
+	if h == nil || cache == nil {
 		return
 	}
 
-	now := h.models.nowTime()
-	h.models.mu.Lock()
-	defer h.models.mu.Unlock()
+	now := cache.nowTime()
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
 
-	if h.models.entries == nil {
-		h.models.entries = make(map[string]cachedModelsResponse)
+	if cache.entries == nil {
+		cache.entries = make(map[string]cachedModelsResponse)
 	}
-	for key, cached := range h.models.entries {
+	for key, cached := range cache.entries {
 		if key == "" {
 			continue
 		}
 		if !cached.expiry.IsZero() && !now.Before(cached.expiry) {
-			delete(h.models.entries, key)
+			delete(cache.entries, key)
 		}
 	}
 
-	delete(h.models.entries, cacheKey)
-	for len(h.models.entries) >= modelsCacheMaxEntries {
-		evictionKey, ok := oldestModelsCacheEntry(h.models.entries, true)
+	delete(cache.entries, cacheKey)
+	for len(cache.entries) >= modelsCacheMaxEntries {
+		evictionKey, ok := oldestModelsCacheEntry(cache.entries, true)
 		if !ok {
-			evictionKey, ok = oldestModelsCacheEntry(h.models.entries, false)
+			evictionKey, ok = oldestModelsCacheEntry(cache.entries, false)
 		}
 		if !ok {
 			break
 		}
-		delete(h.models.entries, evictionKey)
+		delete(cache.entries, evictionKey)
 	}
-	h.models.entries[cacheKey] = entry
+	cache.entries[cacheKey] = entry
 }
 
 func oldestModelsCacheEntry(entries map[string]cachedModelsResponse, skipCanonical bool) (string, bool) {
@@ -1169,31 +1242,36 @@ func isCanonicalModelsQuery(rawQuery string) bool {
 	return strings.TrimSpace(rawQuery) == ""
 }
 
-func (h *ProxyHandler) replaceModelsCacheWithCanonical(entry cachedModelsResponse) {
-	if h == nil {
+func (h *ProxyHandler) replaceModelsCacheWithCanonicalFor(cache *modelsCache, entry cachedModelsResponse) {
+	if h == nil || cache == nil {
 		return
 	}
-	h.models.mu.Lock()
-	h.models.entries = map[string]cachedModelsResponse{"": entry}
-	h.models.canonicalFailureUntil = time.Time{}
-	h.models.canonicalFailureErr = nil
-	h.models.mu.Unlock()
+	cache.mu.Lock()
+	cache.entries = map[string]cachedModelsResponse{"": entry}
+	cache.canonicalFailureUntil = time.Time{}
+	cache.canonicalFailureErr = nil
+	cache.mu.Unlock()
 }
 
 func (h *ProxyHandler) ensureCanonicalModelsCacheEntry(ctx, waitCtx context.Context) (cachedModelsResponse, bool, error) {
-	if h == nil {
+	cache := h.modelsCacheForContext(waitCtx)
+	return h.ensureCanonicalModelsCacheEntryFor(cache, ctx, waitCtx)
+}
+
+func (h *ProxyHandler) ensureCanonicalModelsCacheEntryFor(cache *modelsCache, ctx, waitCtx context.Context) (cachedModelsResponse, bool, error) {
+	if h == nil || cache == nil {
 		return cachedModelsResponse{}, false, fmt.Errorf("proxy handler is required")
 	}
 
-	now := h.models.nowTime()
-	entry, ok, failureErr := h.canonicalModelsCacheState(now)
+	now := cache.nowTime()
+	entry, ok, failureErr := canonicalModelsCacheStateFor(cache, now)
 	if failureErr != nil || (ok && now.Before(entry.expiry)) {
 		return entry, ok, failureErr
 	}
 
-	result := h.models.doFlight(waitCtx, "", func() modelsCacheFlightResult {
-		now := h.models.nowTime()
-		entry, ok, failureErr := h.canonicalModelsCacheState(now)
+	result := cache.doFlight(waitCtx, "", func() modelsCacheFlightResult {
+		now := cache.nowTime()
+		entry, ok, failureErr := canonicalModelsCacheStateFor(cache, now)
 		if failureErr != nil || (ok && now.Before(entry.expiry)) {
 			return modelsCacheFlightResult{entry: entry, hasEntry: ok, err: failureErr}
 		}
@@ -1204,55 +1282,64 @@ func (h *ProxyHandler) ensureCanonicalModelsCacheEntry(ctx, waitCtx context.Cont
 		}
 		refreshed, notModified, err := h.buildMergedModelsEntry(ctx, "", ifNoneMatch)
 		if err != nil {
-			h.recordCanonicalModelsRefreshFailure(h.models.nowTime(), err)
+			recordCanonicalModelsRefreshFailureFor(cache, cache.nowTime(), err)
 			return modelsCacheFlightResult{entry: entry, hasEntry: ok, err: err}
 		}
 		if notModified {
 			if !ok {
 				err := fmt.Errorf("canonical models request unexpectedly returned not modified without a cached entry")
-				h.recordCanonicalModelsRefreshFailure(h.models.nowTime(), err)
+				recordCanonicalModelsRefreshFailureFor(cache, cache.nowTime(), err)
 				return modelsCacheFlightResult{err: err}
 			}
-			entry.expiry = h.models.nowTime().Add(modelsCacheTTL)
-			h.storeModelsCacheEntry("", entry)
-			h.clearCanonicalModelsRefreshFailure()
+			entry.expiry = cache.nowTime().Add(modelsCacheTTL)
+			h.storeModelsCacheEntryFor(cache, "", entry)
+			clearCanonicalModelsRefreshFailureFor(cache)
 			return modelsCacheFlightResult{entry: entry, hasEntry: true}
 		}
 		if refreshed.statusCode != http.StatusOK {
 			err := fmt.Errorf("canonical models request returned status %d", refreshed.statusCode)
-			h.recordCanonicalModelsRefreshFailure(h.models.nowTime(), err)
+			recordCanonicalModelsRefreshFailureFor(cache, cache.nowTime(), err)
 			return modelsCacheFlightResult{entry: entry, hasEntry: ok, err: err}
 		}
-		h.replaceModelsCacheWithCanonical(refreshed)
+		h.replaceModelsCacheWithCanonicalFor(cache, refreshed)
 		return modelsCacheFlightResult{entry: refreshed, hasEntry: true}
 	})
 
 	return result.entry, result.hasEntry, result.err
 }
 
-func (h *ProxyHandler) canonicalModelsCacheState(now time.Time) (cachedModelsResponse, bool, error) {
-	h.models.mu.RLock()
-	defer h.models.mu.RUnlock()
+func canonicalModelsCacheStateFor(cache *modelsCache, now time.Time) (cachedModelsResponse, bool, error) {
+	if cache == nil {
+		return cachedModelsResponse{}, false, nil
+	}
+	cache.mu.RLock()
+	defer cache.mu.RUnlock()
 
-	entry, ok := h.models.entries[""]
-	if h.models.canonicalFailureErr != nil && now.Before(h.models.canonicalFailureUntil) {
-		return entry, ok, h.models.canonicalFailureErr
+	entry, ok := cache.entries[""]
+	if cache.canonicalFailureErr != nil && now.Before(cache.canonicalFailureUntil) {
+		return entry, ok, cache.canonicalFailureErr
 	}
 	return entry, ok, nil
 }
 
-func (h *ProxyHandler) recordCanonicalModelsRefreshFailure(now time.Time, err error) {
-	h.models.mu.Lock()
-	h.models.canonicalFailureUntil = now.Add(modelsCacheFailureBackoff)
-	h.models.canonicalFailureErr = err
-	h.models.mu.Unlock()
+func recordCanonicalModelsRefreshFailureFor(cache *modelsCache, now time.Time, err error) {
+	if cache == nil {
+		return
+	}
+	cache.mu.Lock()
+	cache.canonicalFailureUntil = now.Add(modelsCacheFailureBackoff)
+	cache.canonicalFailureErr = err
+	cache.mu.Unlock()
 }
 
-func (h *ProxyHandler) clearCanonicalModelsRefreshFailure() {
-	h.models.mu.Lock()
-	h.models.canonicalFailureUntil = time.Time{}
-	h.models.canonicalFailureErr = nil
-	h.models.mu.Unlock()
+func clearCanonicalModelsRefreshFailureFor(cache *modelsCache) {
+	if cache == nil {
+		return
+	}
+	cache.mu.Lock()
+	cache.canonicalFailureUntil = time.Time{}
+	cache.canonicalFailureErr = nil
+	cache.mu.Unlock()
 }
 
 // HandleHealthz handles GET /healthz and returns {"status":"ok"}.
@@ -1282,15 +1369,15 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 		writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", "policy routing preflight pending")
 		return
 	}
-	if diagnostic := h.PolicyRoutingReadinessDiagnostic(); diagnostic != "" {
+	if diagnostic := h.policyRoutingReadinessDiagnosticForContext(r.Context()); diagnostic != "" {
 		writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", diagnostic)
 		return
 	}
 
-	setup := h.providerSetup()
+	setup := h.providerSetupForContext(r.Context())
 	for _, providerID := range setup.providerOrder {
 		provider := setup.providerByID(providerID)
-		if !h.providerWithinAllowedModelScope(provider) {
+		if !h.providerWithinAllowedModelScopeForSetup(setup, provider) {
 			continue
 		}
 		if err := h.checkProviderReady(ctx, provider); err != nil {
@@ -1433,9 +1520,11 @@ func writeReadyzStatus(w http.ResponseWriter, statusCode int, status string, err
 // repeated upstream calls.
 func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	cacheKey := r.URL.RawQuery
+	cache := h.modelsCacheForContext(r.Context())
 	canonicalQuery := isCanonicalModelsQuery(cacheKey)
 
 	ctx, cancel := h.newLifecycleUpstreamContext(modelsUpstreamTimeout)
+	ctx = inheritRuntimeContext(ctx, r.Context())
 	defer cancel()
 
 	canonicalEntry, hasCanonicalEntry, err := h.ensureCanonicalModelsCacheEntry(ctx, r.Context())
@@ -1452,9 +1541,9 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !canonicalQuery && hasCanonicalEntry {
-			h.models.mu.RLock()
-			cachedEntry, hasCachedEntry := h.models.entries[cacheKey]
-			h.models.mu.RUnlock()
+			cache.mu.RLock()
+			cachedEntry, hasCachedEntry := cache.entries[cacheKey]
+			cache.mu.RUnlock()
 			if hasCachedEntry {
 				writeCachedModelsResponse(w, cachedEntry)
 				return
@@ -1471,14 +1560,14 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 
 	var cachedEntry cachedModelsResponse
 	var hasCachedEntry bool
-	h.models.mu.RLock()
-	if h.models.entries != nil {
-		cachedEntry, hasCachedEntry = h.models.entries[cacheKey]
+	cache.mu.RLock()
+	if cache.entries != nil {
+		cachedEntry, hasCachedEntry = cache.entries[cacheKey]
 	}
-	h.models.mu.RUnlock()
+	cache.mu.RUnlock()
 
 	// Without an ETag we cannot safely revalidate, so honor the TTL-based cache.
-	if hasCachedEntry && cachedEntry.etag == "" && h.models.nowTime().Before(cachedEntry.expiry) {
+	if hasCachedEntry && cachedEntry.etag == "" && cache.nowTime().Before(cachedEntry.expiry) {
 		writeCachedModelsResponse(w, cachedEntry)
 		return
 	}
@@ -1511,14 +1600,19 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ProxyHandler) refreshModelsCacheVariant(waitCtx context.Context, cacheKey string) modelsCacheFlightResult {
-	return h.models.doFlight(waitCtx, cacheKey, func() modelsCacheFlightResult {
+	cache := h.modelsCacheForContext(waitCtx)
+	if cache == nil {
+		return modelsCacheFlightResult{err: fmt.Errorf("models cache is unavailable")}
+	}
+	return cache.doFlight(waitCtx, cacheKey, func() modelsCacheFlightResult {
 		ctx, cancel := h.newLifecycleUpstreamContext(modelsUpstreamTimeout)
+		ctx = inheritRuntimeContext(ctx, waitCtx)
 		defer cancel()
 
-		now := h.models.nowTime()
-		h.models.mu.RLock()
-		cachedEntry, hasCachedEntry := h.models.entries[cacheKey]
-		h.models.mu.RUnlock()
+		now := cache.nowTime()
+		cache.mu.RLock()
+		cachedEntry, hasCachedEntry := cache.entries[cacheKey]
+		cache.mu.RUnlock()
 
 		// Query variants intentionally do not send conditional ETags because a
 		// provider-local 304 cannot safely reconstruct a merged multi-provider
@@ -1538,19 +1632,20 @@ func (h *ProxyHandler) refreshModelsCacheVariant(waitCtx context.Context, cacheK
 			if !hasCachedEntry {
 				return modelsCacheFlightResult{err: fmt.Errorf("models query variant %q unexpectedly returned not modified without a cached entry", cacheKey)}
 			}
-			cachedEntry.expiry = h.models.nowTime().Add(modelsCacheTTL)
-			h.storeModelsCacheEntry(cacheKey, cachedEntry)
+			cachedEntry.expiry = cache.nowTime().Add(modelsCacheTTL)
+			h.storeModelsCacheEntryFor(cache, cacheKey, cachedEntry)
 			return modelsCacheFlightResult{entry: cachedEntry, hasEntry: true}
 		}
 		if entry.statusCode == http.StatusOK {
-			h.storeModelsCacheEntry(cacheKey, entry)
+			h.storeModelsCacheEntryFor(cache, cacheKey, entry)
 		}
 		return modelsCacheFlightResult{entry: entry, hasEntry: entry.statusCode == http.StatusOK}
 	})
 }
 
 func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifNoneMatch string) (cachedModelsResponse, bool, error) {
-	setup := h.providerSetup()
+	setup := h.providerSetupForContext(ctx)
+	cache := h.modelsCacheForContext(ctx)
 	canonicalRefresh := isCanonicalModelsQuery(rawQuery)
 	rawEntries := make([]json.RawMessage, 0)
 	owners := make(map[string]mergedModelReservation)
@@ -1583,7 +1678,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 
 	for _, providerID := range setup.providerOrder {
 		provider := setup.providerByID(providerID)
-		if !h.providerWithinAllowedModelScope(provider) {
+		if !h.providerWithinAllowedModelScopeForSetup(setup, provider) {
 			continue
 		}
 
@@ -1654,7 +1749,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 	return cachedModelsResponse{
 		body:       transformModelsResponse(body),
 		statusCode: http.StatusOK,
-		expiry:     h.models.nowTime().Add(modelsCacheTTL),
+		expiry:     cache.nowTime().Add(modelsCacheTTL),
 		etag:       mergedETag,
 	}, false, nil
 }

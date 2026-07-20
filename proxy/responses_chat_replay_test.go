@@ -925,3 +925,42 @@ func TestResponsesChatReplayPublishesOnlyStructurallyCompleteGroups(t *testing.T
 		t.Fatalf("invalid group was partially published: %+v", stats)
 	}
 }
+
+func TestResponsesChatReplayRequiresSameTargetRevision(t *testing.T) {
+	store := newResponsesChatReplayStore()
+	defer func() { _ = store.Close() }()
+
+	contract := publicModelContract{endpoints: []string{providerEndpointResponses}}
+	originalTarget := targetBinding{
+		provider:      targetRevisionTestProvider(),
+		upstreamModel: "deployment-a",
+	}
+	changedTarget := cloneTargetBindingForRevisionTest(originalTarget)
+	changedTarget.provider.baseURL = "https://changed.example.invalid/v1"
+	originalRevision := deriveTargetRevision(contract, originalTarget)
+	changedRevision := deriveTargetRevision(contract, changedTarget)
+	if originalRevision == changedRevision {
+		t.Fatal("changed physical target retained the original revision")
+	}
+
+	request := newResponsesChatReplayTestRequest("target-revision", replayTestCallSpec{
+		upstreamID: "upstream-target-revision",
+		name:       "lookup",
+		visible:    `{}`,
+	})
+	request.Route.TargetRevision = originalRevision
+	published, err := store.Publish(request)
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+
+	compatibleRoute := request.Route
+	if _, err := store.Resolve(compatibleRoute, published.Projection); err != nil {
+		t.Fatalf("Resolve() with unchanged revision error = %v", err)
+	}
+
+	incompatibleRoute := request.Route
+	incompatibleRoute.TargetRevision = changedRevision
+	_, err = store.Resolve(incompatibleRoute, published.Projection)
+	assertResponsesChatReplayMissing(t, err)
+}

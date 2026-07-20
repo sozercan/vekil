@@ -417,7 +417,7 @@ func (h *ProxyHandler) maybeReduceResponsesToolOutputsInRequestBody(ctx context.
 }
 
 func (h *ProxyHandler) rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx context.Context, bodyBytes []byte, requestedModel string, endpoint string, injectResumePrompt bool, store *ToolExecutionContextStore, scope string) []byte {
-	bodyBytes = h.rewriteResponsesRequestBodyForModel(bodyBytes, requestedModel, endpoint, injectResumePrompt)
+	bodyBytes = h.rewriteResponsesRequestBodyForContext(ctx, bodyBytes, requestedModel, endpoint, injectResumePrompt)
 	rewritten, count := h.maybeReduceResponsesToolOutputsInRequestBody(ctx, bodyBytes, store, scope)
 	if count > 0 {
 		h.log.Debug("reduced responses tool outputs", logger.F("endpoint", endpoint), logger.F("count", count))

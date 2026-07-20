@@ -79,9 +79,6 @@ func (h *ProxyHandler) executeChatCompletions(ctx context.Context, chatBody []by
 }
 
 func rawJSONFieldsExactOrFold(object map[string]json.RawMessage, name string) []json.RawMessage {
-	if raw, ok := object[name]; ok {
-		return []json.RawMessage{raw}
-	}
 	var matches []json.RawMessage
 	for candidate, raw := range object {
 		if strings.EqualFold(candidate, name) {
@@ -166,11 +163,14 @@ func (h *ProxyHandler) retryResolvedNativeChat(ctx context.Context, prior chatEx
 }
 
 func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route resolvedChatRoute, chatBody []byte, options chatExecutionOptions) (chatExecutionResult, error) {
+	targetContract, targetBinding := targetRevisionBindingForResolvedChatRoute(route)
 	replayRoute := responsesChatReplayRoute{
-		ProviderID:    route.provider.id,
-		PublicModel:   route.publicModel,
-		UpstreamModel: route.upstreamModel,
+		ProviderID:     route.provider.id,
+		PublicModel:    route.publicModel,
+		UpstreamModel:  route.upstreamModel,
+		TargetRevision: deriveTargetRevision(targetContract, targetBinding),
 	}
+	requestCtx := withTargetRevisionRequest(ctx, targetContract, targetBinding, replayRoute.TargetRevision)
 	plan, err := translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
 		UpstreamModel:       route.upstreamModel,
 		ReplayStore:         h.responsesChatReplayStore(),
@@ -187,12 +187,12 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 		headers = make(http.Header)
 		headers.Set("Accept", "text/event-stream")
 	}
-	resp, err := h.postResolvedProviderRequest(ctx, route.provider, route.owner, route.nativeEndpoint, requestBody, headers)
+	resp, err := h.postResolvedProviderRequest(requestCtx, route.provider, route.owner, route.nativeEndpoint, requestBody, headers)
 	if err != nil {
 		return chatExecutionResult{}, responsesChatExecutionErrorFromUpstream(err)
 	}
 	resp, err = h.maybeRetryResolvedResponsesWithoutUnverifiableEncryptedContent(
-		ctx,
+		requestCtx,
 		route.provider,
 		route.owner,
 		route.nativeEndpoint,
@@ -203,6 +203,12 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 	if err != nil {
 		return chatExecutionResult{}, responsesChatExecutionErrorFromUpstream(err)
 	}
+	requestRevision, ok := targetRevisionFromResponse(resp)
+	if !ok {
+		_ = resp.Body.Close()
+		return chatExecutionResult{}, fmt.Errorf("responses-backed Chat response has no target revision attribution")
+	}
+	replayRoute.TargetRevision = requestRevision
 	result := chatExecutionResult{
 		Response:     resp,
 		Headers:      convertedChatSafeHeaders(resp.Header),

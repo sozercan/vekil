@@ -221,6 +221,19 @@ func TestServeFlagsPolicyRoutingDefaultsAndOverrides(t *testing.T) {
 		}
 	})
 
+	t.Run("environment selects reset recovery", func(t *testing.T) {
+		t.Setenv("PROVIDERS_CONFIG_IGNORE_MANAGED", "false")
+		t.Setenv("PROVIDERS_CONFIG_RESET_MANAGED", "true")
+		serve := parseServeFlagsForTest(t)
+		mode, err := serve.providersConfigResolveMode()
+		if err != nil {
+			t.Fatalf("providersConfigResolveMode() error = %v", err)
+		}
+		if mode != proxy.ProvidersConfigResetManaged {
+			t.Fatalf("providersConfigResolveMode() = %q, want %q", mode, proxy.ProvidersConfigResetManaged)
+		}
+	})
+
 	t.Run("CLI overrides environment", func(t *testing.T) {
 		t.Setenv("POLICY_ROUTING_MODE", "observe")
 		t.Setenv("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", "true")
@@ -247,6 +260,312 @@ func TestServeFlagsRejectInvalidPolicyRoutingMode(t *testing.T) {
 	if _, err := serve.parsedPolicyRoutingMode(); err == nil {
 		t.Fatal("parsedPolicyRoutingMode() error = nil, want invalid mode error")
 	}
+}
+
+func TestServeFlagsManagedRecoveryMode(t *testing.T) {
+	t.Run("default uses managed override", func(t *testing.T) {
+		t.Setenv("PROVIDERS_CONFIG_IGNORE_MANAGED", "")
+		t.Setenv("PROVIDERS_CONFIG_RESET_MANAGED", "")
+		serve := parseServeFlagsForTest(t)
+		mode, err := serve.providersConfigResolveMode()
+		if err != nil {
+			t.Fatalf("providersConfigResolveMode() error = %v", err)
+		}
+		if mode != proxy.ProvidersConfigUseManaged {
+			t.Fatalf("providersConfigResolveMode() = %q, want %q", mode, proxy.ProvidersConfigUseManaged)
+		}
+	})
+
+	t.Run("environment selects ignore recovery", func(t *testing.T) {
+		t.Setenv("PROVIDERS_CONFIG_IGNORE_MANAGED", "true")
+		t.Setenv("PROVIDERS_CONFIG_RESET_MANAGED", "false")
+		serve := parseServeFlagsForTest(t)
+		mode, err := serve.providersConfigResolveMode()
+		if err != nil {
+			t.Fatalf("providersConfigResolveMode() error = %v", err)
+		}
+		if mode != proxy.ProvidersConfigIgnoreManaged {
+			t.Fatalf("providersConfigResolveMode() = %q, want %q", mode, proxy.ProvidersConfigIgnoreManaged)
+		}
+	})
+
+	t.Run("CLI overrides environment", func(t *testing.T) {
+		t.Setenv("PROVIDERS_CONFIG_IGNORE_MANAGED", "true")
+		t.Setenv("PROVIDERS_CONFIG_RESET_MANAGED", "false")
+		serve := parseServeFlagsForTest(t, "--ignore-managed=false", "--reset-managed=true")
+		mode, err := serve.providersConfigResolveMode()
+		if err != nil {
+			t.Fatalf("providersConfigResolveMode() error = %v", err)
+		}
+		if mode != proxy.ProvidersConfigResetManaged {
+			t.Fatalf("providersConfigResolveMode() = %q, want %q", mode, proxy.ProvidersConfigResetManaged)
+		}
+	})
+
+	t.Run("conflicting recovery controls fail clearly", func(t *testing.T) {
+		t.Setenv("PROVIDERS_CONFIG_IGNORE_MANAGED", "")
+		t.Setenv("PROVIDERS_CONFIG_RESET_MANAGED", "")
+		serve := parseServeFlagsForTest(t, "--ignore-managed", "--reset-managed")
+		_, err := serve.providersConfigResolveMode()
+		if !errors.Is(err, errConflictingManagedRecoveryFlags) {
+			t.Fatalf("providersConfigResolveMode() error = %v, want %v", err, errConflictingManagedRecoveryFlags)
+		}
+		if !strings.Contains(err.Error(), "mutually exclusive") {
+			t.Fatalf("providersConfigResolveMode() error = %q, want clear conflict text", err)
+		}
+	})
+}
+
+func TestServeUsageIncludesManagedRecoveryFlags(t *testing.T) {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	registerServeFlags(fs)
+	var output bytes.Buffer
+	writeServeUsage(fs, &output)
+
+	for _, want := range []string{
+		"Usage of serve:",
+		"-ignore-managed",
+		"-reset-managed",
+		"read-only recovery",
+		"Delete the matching dashboard-managed providers override",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("serve usage missing %q:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestResolveProvidersConfigForStartupSourceIsolation(t *testing.T) {
+	configDir := t.TempDir()
+	bootstrapDir := t.TempDir()
+	pathA := filepath.Join(bootstrapDir, "a.json")
+	pathB := filepath.Join(bootstrapDir, "b.json")
+	writeStartupProvidersBootstrap(t, pathA, "bootstrap-a")
+	writeStartupProvidersBootstrap(t, pathB, "bootstrap-b")
+	commitStartupManagedOverride(t, pathA, configDir, "managed-a")
+	commitStartupManagedOverride(t, pathB, configDir, "managed-b")
+
+	getConfigDir := func() (string, error) { return configDir, nil }
+	resolvedA, err := resolveProvidersConfigForStartup(pathA, proxy.ProvidersConfigUseManaged, getConfigDir, func(string) error { return nil })
+	if err != nil {
+		t.Fatalf("resolveProvidersConfigForStartup(a) error = %v", err)
+	}
+	resolvedB, err := resolveProvidersConfigForStartup(pathB, proxy.ProvidersConfigUseManaged, getConfigDir, func(string) error { return nil })
+	if err != nil {
+		t.Fatalf("resolveProvidersConfigForStartup(b) error = %v", err)
+	}
+	sharedA, err := proxy.ResolveProvidersConfig(proxy.ProvidersConfigResolveOptions{
+		BootstrapPath: pathA,
+		UserConfigDir: configDir,
+		Mode:          proxy.ProvidersConfigUseManaged,
+	})
+	if err != nil {
+		t.Fatalf("ResolveProvidersConfig(a) error = %v", err)
+	}
+	if resolvedA.Resolved.Revision != sharedA.Revision || resolvedA.Resolved.Bootstrap.Source != sharedA.Bootstrap.Source {
+		t.Fatalf("CLI resolution = %+v, shared = %+v", resolvedA.Resolved, sharedA)
+	}
+
+	if got := resolvedA.Resolved.Config.Providers[0].ID; got != "managed-a" {
+		t.Fatalf("source A provider = %q, want managed-a", got)
+	}
+	if got := resolvedB.Resolved.Config.Providers[0].ID; got != "managed-b" {
+		t.Fatalf("source B provider = %q, want managed-b", got)
+	}
+	if resolvedA.Resolved.Bootstrap.Source.ID == resolvedB.Resolved.Bootstrap.Source.ID {
+		t.Fatalf("source identities collided: %q", resolvedA.Resolved.Bootstrap.Source.ID)
+	}
+	if resolvedA.Resolved.Bootstrap.Source.ManagedPath == resolvedB.Resolved.Bootstrap.Source.ManagedPath {
+		t.Fatalf("managed paths collided: %q", resolvedA.Resolved.Bootstrap.Source.ManagedPath)
+	}
+	if resolvedA.Store == nil || resolvedB.Store == nil {
+		t.Fatal("writable source resolutions should construct managed stores")
+	}
+}
+
+func TestResolveProvidersConfigForStartupRecoveryModes(t *testing.T) {
+	configDir := t.TempDir()
+	bootstrapPath := filepath.Join(t.TempDir(), "providers.json")
+	writeStartupProvidersBootstrap(t, bootstrapPath, "bootstrap-before")
+	managedPath := commitStartupManagedOverride(t, bootstrapPath, configDir, "managed")
+	writeStartupProvidersBootstrap(t, bootstrapPath, "bootstrap-after")
+	getConfigDir := func() (string, error) { return configDir, nil }
+
+	_, err := resolveProvidersConfigForStartup(bootstrapPath, proxy.ProvidersConfigUseManaged, getConfigDir, func(string) error { return nil })
+	var configErr *proxy.ConfigError
+	if !errors.As(err, &configErr) || configErr.Code != proxy.ConfigErrorManagedSourceConflict {
+		t.Fatalf("use-managed conflict error = %v, want managed source conflict", err)
+	}
+
+	ignored, err := resolveProvidersConfigForStartup(bootstrapPath, proxy.ProvidersConfigIgnoreManaged, getConfigDir, func(string) error { return nil })
+	if err != nil {
+		t.Fatalf("ignore-managed error = %v", err)
+	}
+	if got := ignored.Resolved.Config.Providers[0].ID; got != "bootstrap-after" {
+		t.Fatalf("ignore-managed provider = %q, want bootstrap-after", got)
+	}
+	if ignored.Store != nil || ignored.ReadOnlyReason == nil {
+		t.Fatalf("ignore-managed startup = %+v, want read-only bootstrap", ignored)
+	}
+	if _, err := os.Stat(managedPath); err != nil {
+		t.Fatalf("ignore-managed should preserve override: %v", err)
+	}
+
+	reset, err := resolveProvidersConfigForStartup(bootstrapPath, proxy.ProvidersConfigResetManaged, getConfigDir, func(string) error { return nil })
+	if err != nil {
+		t.Fatalf("reset-managed error = %v", err)
+	}
+	if got := reset.Resolved.Config.Providers[0].ID; got != "bootstrap-after" {
+		t.Fatalf("reset-managed provider = %q, want bootstrap-after", got)
+	}
+	if reset.Store == nil || reset.ReadOnlyReason != nil {
+		t.Fatalf("reset-managed startup = %+v, want writable bootstrap", reset)
+	}
+	if _, err := os.Stat(managedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reset-managed override remains: %v", err)
+	}
+}
+
+func TestResolveProvidersConfigForStartupReadOnlyFallback(t *testing.T) {
+	bootstrapPath := filepath.Join(t.TempDir(), "providers.json")
+	writeStartupProvidersBootstrap(t, bootstrapPath, "bootstrap")
+
+	t.Run("unwritable managed directory", func(t *testing.T) {
+		probeErr := errors.New("read-only filesystem")
+		startup, err := resolveProvidersConfigForStartup(
+			bootstrapPath,
+			proxy.ProvidersConfigUseManaged,
+			func() (string, error) { return t.TempDir(), nil },
+			func(string) error { return probeErr },
+		)
+		if err != nil {
+			t.Fatalf("resolveProvidersConfigForStartup() error = %v", err)
+		}
+		if startup.Store != nil || !errors.Is(startup.ReadOnlyReason, probeErr) {
+			t.Fatalf("startup = %+v, want read-only persistence error", startup)
+		}
+		if got := startup.Resolved.Config.Providers[0].ID; got != "bootstrap" {
+			t.Fatalf("startup provider = %q, want bootstrap", got)
+		}
+	})
+
+	t.Run("unresolvable user config directory", func(t *testing.T) {
+		dirErr := errors.New("no user config directory")
+		startup, err := resolveProvidersConfigForStartup(
+			bootstrapPath,
+			proxy.ProvidersConfigUseManaged,
+			func() (string, error) { return "", dirErr },
+			func(string) error { t.Fatal("probe should not run"); return nil },
+		)
+		if err != nil {
+			t.Fatalf("resolveProvidersConfigForStartup() error = %v", err)
+		}
+		if startup.Store != nil || !errors.Is(startup.ReadOnlyReason, dirErr) {
+			t.Fatalf("startup = %+v, want read-only directory resolution error", startup)
+		}
+		if startup.Resolved.Bootstrap.Source.ManagedPath != "" {
+			t.Fatalf("read-only fallback managed path = %q, want empty", startup.Resolved.Bootstrap.Source.ManagedPath)
+		}
+
+		_, err = resolveProvidersConfigForStartup(
+			bootstrapPath,
+			proxy.ProvidersConfigResetManaged,
+			func() (string, error) { return "", dirErr },
+			nil,
+		)
+		if err == nil || !strings.Contains(err.Error(), "reset managed providers config") {
+			t.Fatalf("reset with unresolved directory error = %v, want actionable failure", err)
+		}
+	})
+}
+
+func TestNewServeServerWiresDashboardConfigSourceAndMode(t *testing.T) {
+	configDir := t.TempDir()
+	providers, err := resolveProvidersConfigForStartup(
+		"",
+		proxy.ProvidersConfigUseManaged,
+		func() (string, error) { return configDir, nil },
+		func(string) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("resolveProvidersConfigForStartup() error = %v", err)
+	}
+	serve := parseServeFlagsForTest(t, "--host", "127.0.0.1", "--port", "0")
+	srv, err := newServeServer(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		serve,
+		proxy.PolicyRoutingModeOff,
+		providers,
+	)
+	if err != nil {
+		t.Fatalf("newServeServer() error = %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = srv.Stop(ctx)
+	})
+
+	resp, err := http.Get("http://" + srv.Addr() + "/dashboard/api/v1/config")
+	if err != nil {
+		t.Fatalf("GET dashboard config: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("close dashboard config response body: %v", err)
+		}
+	}()
+	var body struct {
+		Capability struct {
+			Available bool   `json:"available"`
+			Writable  bool   `json:"writable"`
+			Mode      string `json:"mode"`
+		} `json:"capability"`
+		Source struct {
+			ID string `json:"id"`
+		} `json:"source"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode dashboard config: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || !body.Capability.Available || !body.Capability.Writable {
+		t.Fatalf("dashboard capability status=%d body=%+v", resp.StatusCode, body)
+	}
+	if body.Capability.Mode != server.DashboardConfigModeCLI {
+		t.Fatalf("dashboard mode = %q, want %q", body.Capability.Mode, server.DashboardConfigModeCLI)
+	}
+	if body.Source.ID != string(proxy.ProvidersConfigSourceImplicitCopilot) {
+		t.Fatalf("dashboard source = %q, want implicit Copilot", body.Source.ID)
+	}
+}
+
+func writeStartupProvidersBootstrap(t *testing.T, path, providerID string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"providers":[{"id":%q,"type":"copilot","default":true}]}`, providerID)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write bootstrap %q: %v", path, err)
+	}
+}
+
+func commitStartupManagedOverride(t *testing.T, bootstrapPath, configDir, providerID string) string {
+	t.Helper()
+	bootstrap, err := proxy.LoadProvidersConfigBootstrap(bootstrapPath, configDir)
+	if err != nil {
+		t.Fatalf("LoadProvidersConfigBootstrap() error = %v", err)
+	}
+	store, err := proxy.NewManagedProvidersConfigStore(bootstrap)
+	if err != nil {
+		t.Fatalf("NewManagedProvidersConfigStore() error = %v", err)
+	}
+	managed := proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{{ID: providerID, Type: "copilot", Default: true}}}
+	if _, err := store.Commit(context.Background(), bootstrap.Revision, managed); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	return store.Path()
 }
 
 func TestServeFlagsResponsesWebSocketDisabledByDefault(t *testing.T) {

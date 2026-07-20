@@ -14,6 +14,12 @@ Provider portals, free tiers, and model catalogs change frequently. Treat the li
 - Keep `models[].endpoints` limited to routes you have validated for that model. Vekil does not infer `/responses` from OpenAI compatibility.
 - Do not paste provider keys into client configs. Clients point at Vekil with dummy local keys; Vekil holds the upstream provider credentials.
 
+### Dashboard-managed secrets
+
+The local dashboard editor never returns raw API-key or `extra_headers` values. Reads expose only secret-state metadata; writes use explicit `keep`, `set`, or `clear` operations. Changing a provider's ID, type, destination, or auth identity makes `keep` incompatible and requires a new value or an explicit clear. Every extra-header value is handled as a secret.
+
+Secrets entered with `set` are stored **in plaintext** in the source-scoped managed JSON file under `<UserConfigDir>/vekil/dashboard-config/`; they are not written back to the original JSON/YAML bootstrap. Unix managed directories/files use owner-only `0700`/`0600` modes, while Windows relies on the current user's configuration-directory ACL. Prefer `api_key_env` for credentials you do not want persisted in the managed document. See [Secret handling](dashboard-config.md#secret-handling).
+
 ## Built-In Provider Auth
 
 | Provider | How To Authenticate | Vekil Config |
@@ -70,7 +76,7 @@ Use `auth_type: api-key-header` and `auth_header` for providers that do not acce
 After exporting the environment variables referenced by `api_key_env`, start Vekil with the config and check:
 
 ```bash
-vekil serve --providers-config ./providers.yaml
+vekil --providers-config ./providers.yaml
 curl http://localhost:1337/readyz
 curl http://localhost:1337/v1/models
 ```

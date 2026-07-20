@@ -25,6 +25,7 @@
 │                                                                      │
 │  /v1/responses/compact + /v1/memories/... ─► Responses shims         │
 │  auth + provider state ─► login/token caches + exact state binding   │
+│  local config control ──► managed store ──► runtime generation       │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -34,14 +35,34 @@ Chat-compatible ingress converges before provider I/O: public OpenAI Chat, trans
 
 | Package | Responsibility |
 |---------|---------------|
-| `main` | CLI dispatch, server setup, shared startup authentication, graceful shutdown |
+| `main` | CLI dispatch, bootstrap/managed config resolution, server setup, shared startup authentication, graceful shutdown |
 | `launch/` | ephemeral proxy supervision, agent adapters, child environment sanitization, and session summaries |
 | `auth/` | GitHub OAuth device code flow, Copilot token exchange, disk caching, auto-refresh |
-| `proxy/` | HTTP handlers, public-entry/terminal-route registries, policy planning/classification, provider routing, Anthropic/OpenAI and Gemini/OpenAI translation, Responses compatibility, optional tool optimizer hooks, SSE streaming, retry logic, and provider-specific request/auth helpers outside GitHub OAuth |
+| `proxy/` | HTTP handlers, runtime snapshots/control, strict config codec and managed store, public-entry/terminal-route registries, policy planning/classification, provider routing, Anthropic/OpenAI and Gemini/OpenAI translation, Responses compatibility, optional tool optimizer hooks, SSE streaming, retry logic, and provider-specific request/auth helpers outside GitHub OAuth |
 | `models/` | Request and response type definitions only |
 | `logger/` | Structured JSON logging |
-| `server/` | Reusable HTTP server lifecycle |
+| `server/` | Reusable HTTP server lifecycle, request-generation pinning, inbound auth, and local dashboard-config access/origin/CSRF enforcement |
 | `cmd/menubar/` | macOS/Linux tray app |
+
+## Runtime generations and configuration commit boundary
+
+All config-dependent serving state is published as one immutable `runtimeSnapshot`: canonical provider config, provider setup, route/catalog registries, policy binding, active readiness metadata, and generation-owned model/Chat discovery caches. The handler owns one atomic pointer to the current snapshot. HTTP admission loads it once into request context; a Responses WebSocket keeps that pinned context for the session. Helpers consume the pinned snapshot rather than independently loading current state, so one operation cannot mix provider setup from G1 with routes or policy from G2.
+
+The local config control plane owns one source-scoped transaction:
+
+1. strict request decode, optimistic revision check, secret merge, protected-field restoration, and offline validation;
+2. private candidate provider construction and dynamic discovery;
+3. private policy compilation and required classifier preflight;
+4. canonical encoding;
+5. commit-fence rechecks for shutdown, active job, revision, and bootstrap fingerprint;
+6. owner-restricted temporary-file write, sync, strict readback, and atomic managed-file replacement; and
+7. one non-failing atomic snapshot publication.
+
+Persistence is the commit point and precedes publication. Every failure before the atomic replacement leaves the old managed file and old runtime active. A post-replacement directory-sync failure is a durability warning; the process must not publish and then attempt an unsafe runtime rollback. Candidate discovery/preflight never toggles the active snapshot's readiness gates.
+
+The bootstrap source is either `implicit-copilot` or `file:<absolute-clean-path>`. A managed envelope is accepted only when its source ID and canonical bootstrap digest match. The resolver is shared by CLI and menubar startup. Managed-agent launch servers intentionally omit this persistent control plane, and non-loopback servers return capability metadata only. See [Local Dashboard Configuration](dashboard-config.md) for the external contract.
+
+Each published snapshot receives a monotonically increasing process-local generation and a deterministic secretful-config revision used only as an opaque ETag/concurrency token. `/stats.json` exposes the numeric active generation; the config read exposes both generation and revision. In-flight G1 operations may finish after G2 publishes, while later operations use G2. Generation-owned caches prevent late G1 discovery from populating G2.
 
 ## Public Entry and Terminal Route Registries
 
@@ -108,15 +129,19 @@ Only a definitely-not-delivered or adapter-certified explicit rejection, with pr
 
 ## Exact Provider-State Binding
 
-Provider-issued continuation state is an exact ownership constraint, not a routing hint. Adapter-marked values such as `previous_response_id`, trusted `X-Codex-Turn-State`, non-proxy opaque `encrypted_content`, and other opaque reasoning/session artifacts are bound to `{route_id, target_id}` immediately before exposure.
+Provider-issued continuation state is an exact ownership constraint, not a routing hint. Adapter-marked values such as `previous_response_id`, trusted `X-Codex-Turn-State`, non-proxy opaque `encrypted_content`, and other opaque reasoning/session artifacts are bound to `{route_id, target_id, target_revision}` immediately before exposure.
 
-All state inputs on a request must resolve together to the same route and target. Known state pins the exact target and disables failover. Conflicting, malformed, cross-route, mixed known/unknown, or unknown state on an explicit route fails locally without an upstream call. If the same token is ever observed with different owners, the store records a conflict tombstone and continues to fail it closed rather than choosing one owner. An unavailable bound target also fails closed; Vekil does not guess another owner or migrate provider state.
+The target revision is an internal process-keyed fingerprint of physical destination/auth identity, credential and extra-header fingerprints, endpoint paths, API version/scope, trust metadata, upstream model, native endpoint contract, and relevant request policy. It contains no raw credential material. The same logical route/target IDs remain compatible across a hot apply only when this revision is unchanged.
+
+All state inputs on a request must resolve together to the same route and target revision. Known state pins the exact target and disables failover. Conflicting, malformed, cross-route, mixed known/unknown, or unknown state on an explicit route fails locally without an upstream call. If the same token is ever observed with different owners, the store records a conflict tombstone and continues to fail it closed rather than choosing one owner. An unavailable bound target also fails closed; Vekil does not guess another owner or migrate provider state.
 
 Bindings use keyed digests and live in a process-local index capped at 32,768 entries with a 24-hour absolute TTL. Raw state is not used as a log field or metrics label. Expiry, eviction, process restart, or routing a continuation to another Vekil process turns the binding into unknown state. Stateful multi-target routes therefore require a single Vekil process or sticky ingress to the process that owns the binding map. Durable/shared bindings and cross-target replay or session migration are not implemented.
 
 ## Key Decisions
 
 - Pure `net/http` with Go `ServeMux` routing; no web framework.
+- The dashboard config editor is a local long-lived CLI/menubar control plane. It is not exposed as remote administration on non-loopback listeners or managed-agent launches, and it provides no RBAC, audit history, version history, or arbitrary rollback.
+- Runtime changes are persistence-before-publication transactions over one immutable generation; requests and WebSockets pin a generation, and stateful continuations also require an unchanged physical target revision.
 - Vekil is a multi-provider proxy. Zero-config startup currently uses GitHub Copilot, but explicit provider config can extend or replace that default behind the same public surface.
 - Public model IDs are a single namespace across legacy provider models and explicit model routes. The proxy validates normalized ownership during startup and fails fast on collisions.
 - Schema-v2 policy profiles share that public namespace but select only between `lightweight` and `powerful` native-Chat terminal routes. Internal routes are operational-only and exposed public terminal routes deliberately bypass policy.

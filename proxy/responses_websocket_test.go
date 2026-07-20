@@ -8134,13 +8134,13 @@ func assertResponsesWebSocketTurnAccountingForwardsExactOperationID(t *testing.T
 				return true
 			}
 			receiver, receiverOK := selector.X.(*ast.Ident)
-			if !receiverOK || receiver.Name != "h" || selector.Sel.Name != "RecordResponsesTurn" {
+			if !receiverOK || receiver.Name != "h" || selector.Sel.Name != "RecordResponsesTurnForContext" {
 				return true
 			}
 			accountingCalls++
 			accountingCallPos = node.Pos()
-			if len(node.Args) == 7 {
-				operationID, ok := node.Args[6].(*ast.Ident)
+			if len(node.Args) == 8 {
+				operationID, ok := node.Args[7].(*ast.Ident)
 				exactOperationIDForwarded = ok && operationID.Name == "operationID"
 			}
 		}
@@ -8154,12 +8154,73 @@ func assertResponsesWebSocketTurnAccountingForwardsExactOperationID(t *testing.T
 		t.Fatalf("recordTurnStats operation.operationID() reads = %d, want exactly 1", operationIDReads)
 	}
 	if accountingCalls != 1 {
-		t.Fatalf("recordTurnStats RecordResponsesTurn calls = %d, want exactly 1", accountingCalls)
+		t.Fatalf("recordTurnStats RecordResponsesTurnForContext calls = %d, want exactly 1", accountingCalls)
 	}
 	if !exactOperationIDForwarded {
-		t.Fatal("recordTurnStats must pass the exact operation.operationID() value into RecordResponsesTurn")
+		t.Fatal("recordTurnStats must pass the exact operation.operationID() value into RecordResponsesTurnForContext")
 	}
 	if operationIDReadPos >= accountingCallPos {
 		t.Fatalf("recordTurnStats reads operation ID at %s after accounting call at %s", fset.Position(operationIDReadPos), fset.Position(accountingCallPos))
+	}
+}
+
+func TestResponsesWebSocketTargetPinValidatesPhysicalRevision(t *testing.T) {
+	newRoute := func(baseURL string) *modelRoute {
+		route := &modelRoute{
+			public: publicModelContract{
+				id:        "public-model",
+				routeID:   "route-a",
+				endpoints: []string{providerEndpointResponses},
+			},
+			targets: []targetBinding{{
+				id: "target-a",
+				provider: &providerRuntime{
+					id:       "provider-a",
+					kind:     providerTypeOpenAICompatible,
+					baseURL:  baseURL,
+					authType: providerAuthTypeNone,
+					paths: providerEndpointPaths{
+						responses: providerEndpointResponses,
+					},
+				},
+				upstreamModel: "physical-model",
+			}},
+		}
+		ensureModelRouteTargetRevisions(route)
+		return route
+	}
+	pinOperation := func(t *testing.T, route *modelRoute) *routeOperation {
+		t.Helper()
+		operation := newRouteOperation(route, context.Background())
+		if err := operation.forcePinnedTarget("target-a"); err != nil {
+			t.Fatalf("forcePinnedTarget() error = %v", err)
+		}
+		return operation
+	}
+
+	session := &responsesWebSocketSession{}
+	original := newRoute("https://same.example.invalid/v1")
+	if err := session.pinExplicitRouteTarget(original, pinOperation(t, original), targetRevisionForBinding(original.public, original.targets[0])); err != nil {
+		t.Fatalf("initial pin error = %v", err)
+	}
+	if session.explicitTargetRevision == "" || session.explicitTargetRevision != original.targets[0].revision {
+		t.Fatalf("session target revision = %q, want %q", session.explicitTargetRevision, original.targets[0].revision)
+	}
+
+	compatible := newRoute("https://same.example.invalid/v1")
+	if err := session.pinExplicitRouteTarget(compatible, pinOperation(t, compatible), targetRevisionForBinding(compatible.public, compatible.targets[0])); err != nil {
+		t.Fatalf("compatible pin error = %v", err)
+	}
+
+	changed := newRoute("https://changed.example.invalid/v1")
+	if changed.targets[0].revision == session.explicitTargetRevision {
+		t.Fatal("changed physical target retained the pinned revision")
+	}
+	err := session.pinExplicitRouteTarget(changed, pinOperation(t, changed), targetRevisionForBinding(changed.public, changed.targets[0]))
+	if err == nil || !strings.Contains(err.Error(), "physical target changed") {
+		t.Fatalf("changed target pin error = %v, want physical-target mismatch", err)
+	}
+	if session.explicitTargetRevision != original.targets[0].revision {
+		t.Fatalf("failed pin changed session revision to %q", session.explicitTargetRevision)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -363,6 +364,8 @@ type serveFlags struct {
 	host                            *string
 	tokenDir                        *string
 	providersConfigPath             *string
+	ignoreManaged                   *bool
+	resetManaged                    *bool
 	policyRoutingMode               *string
 	policyRoutingAllowRemote        *bool
 	logLevel                        *string
@@ -390,6 +393,8 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
+		ignoreManaged:                   fs.Bool("ignore-managed", getEnvBool("PROVIDERS_CONFIG_IGNORE_MANAGED", false), "Ignore the matching dashboard-managed providers override for this startup (read-only recovery)"),
+		resetManaged:                    fs.Bool("reset-managed", getEnvBool("PROVIDERS_CONFIG_RESET_MANAGED", false), "Delete the matching dashboard-managed providers override before startup"),
 		policyRoutingMode:               fs.String("policy-routing", getEnv("POLICY_ROUTING_MODE", "off"), "Policy routing mode: off, observe, or enforce"),
 		policyRoutingAllowRemote:        fs.Bool("policy-routing-allow-remote-single-tenant", getEnvBool("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", false), "Acknowledge single-tenant operation when policy routing listens beyond loopback"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
@@ -410,6 +415,123 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		compactUpstreamChunkConcurrency: fs.Int("compact-upstream-chunk-concurrency", getEnvInt("COMPACT_UPSTREAM_CHUNK_CONCURRENCY", proxy.DefaultCompactUpstreamChunkConcurrency()), "Maximum sibling chunk compaction calls to run concurrently after the first chunk succeeds"),
 		compactUpstreamMaxAttempts:      fs.Int("compact-upstream-max-attempts", getEnvInt("COMPACT_UPSTREAM_MAX_ATTEMPTS", proxy.DefaultCompactUpstreamMaxAttempts()), "Maximum logical compaction calls the /v1/responses/compact 413 fallback may issue per inbound request. Each call may add one extra HTTP POST for model-fallback and is subject to the shared transport-retry policy"),
 	}
+}
+
+var errConflictingManagedRecoveryFlags = errors.New("--ignore-managed and --reset-managed are mutually exclusive")
+
+type providersConfigStartup struct {
+	Resolved       proxy.ResolvedProvidersConfig
+	Store          *proxy.ManagedProvidersConfigStore
+	ReadOnlyReason error
+}
+
+func (f serveFlags) providersConfigResolveMode() (proxy.ProvidersConfigResolveMode, error) {
+	ignoreManaged := f.ignoreManaged != nil && *f.ignoreManaged
+	resetManaged := f.resetManaged != nil && *f.resetManaged
+	if ignoreManaged && resetManaged {
+		return "", errConflictingManagedRecoveryFlags
+	}
+	if ignoreManaged {
+		return proxy.ProvidersConfigIgnoreManaged, nil
+	}
+	if resetManaged {
+		return proxy.ProvidersConfigResetManaged, nil
+	}
+	return proxy.ProvidersConfigUseManaged, nil
+}
+
+func writeServeUsage(fs *flag.FlagSet, w io.Writer) {
+	if fs == nil {
+		return
+	}
+	if w == nil {
+		w = io.Discard
+	}
+	previous := fs.Output()
+	fs.SetOutput(w)
+	defer fs.SetOutput(previous)
+
+	_, _ = fmt.Fprintf(w, "Usage of %s:\n", fs.Name())
+	fs.PrintDefaults()
+}
+
+func resolveProvidersConfigForStartup(
+	bootstrapPath string,
+	mode proxy.ProvidersConfigResolveMode,
+	getUserConfigDir func() (string, error),
+	probeWritable func(string) error,
+) (providersConfigStartup, error) {
+	if getUserConfigDir == nil {
+		getUserConfigDir = os.UserConfigDir
+	}
+	if probeWritable == nil {
+		probeWritable = probeManagedProvidersConfigWritable
+	}
+	if mode == "" {
+		mode = proxy.ProvidersConfigUseManaged
+	}
+
+	userConfigDir, err := getUserConfigDir()
+	if err != nil {
+		if mode == proxy.ProvidersConfigResetManaged {
+			return providersConfigStartup{}, fmt.Errorf("reset managed providers config: resolve user config directory: %w", err)
+		}
+		resolved, bootstrapErr := resolveReadOnlyProvidersConfigBootstrap(bootstrapPath)
+		if bootstrapErr != nil {
+			return providersConfigStartup{}, bootstrapErr
+		}
+		return providersConfigStartup{
+			Resolved:       resolved,
+			ReadOnlyReason: fmt.Errorf("resolve managed providers config directory: %w", err),
+		}, nil
+	}
+
+	resolved, err := proxy.ResolveProvidersConfig(proxy.ProvidersConfigResolveOptions{
+		BootstrapPath: bootstrapPath,
+		UserConfigDir: userConfigDir,
+		Mode:          mode,
+	})
+	if err != nil {
+		return providersConfigStartup{}, err
+	}
+
+	startup := providersConfigStartup{Resolved: resolved}
+	store, err := proxy.NewManagedProvidersConfigStore(resolved.Bootstrap)
+	if err != nil {
+		var configErr *proxy.ConfigError
+		if errors.As(err, &configErr) && configErr.Code == proxy.ConfigErrorManagedStore {
+			startup.ReadOnlyReason = err
+			return startup, nil
+		}
+		return providersConfigStartup{}, err
+	}
+	if mode == proxy.ProvidersConfigIgnoreManaged {
+		startup.ReadOnlyReason = errors.New("managed providers config override is ignored for this startup")
+		return startup, nil
+	}
+	if err := probeWritable(store.Path()); err != nil {
+		startup.ReadOnlyReason = fmt.Errorf("managed providers config persistence is unavailable: %w", err)
+		return startup, nil
+	}
+	startup.Store = store
+	return startup, nil
+}
+
+func resolveReadOnlyProvidersConfigBootstrap(bootstrapPath string) (proxy.ResolvedProvidersConfig, error) {
+	resolved, err := proxy.ResolveProvidersConfig(proxy.ProvidersConfigResolveOptions{
+		BootstrapPath: bootstrapPath,
+		UserConfigDir: filepath.Join(os.TempDir(), "vekil-read-only-dashboard-config"),
+		Mode:          proxy.ProvidersConfigIgnoreManaged,
+	})
+	if err != nil {
+		return proxy.ResolvedProvidersConfig{}, err
+	}
+	resolved.Bootstrap.Source.ManagedPath = ""
+	return resolved, nil
+}
+
+func probeManagedProvidersConfigWritable(path string) error {
+	return proxy.ProbeManagedProvidersConfigWritable(path)
 }
 
 func (f serveFlags) parsedPolicyRoutingMode() (proxy.PolicyRoutingMode, error) {
@@ -598,9 +720,49 @@ func stopServeServer(srv serveLifecycleServer, log *logger.Logger) error {
 	return nil
 }
 
+func newServeServer(
+	authenticator *auth.Authenticator,
+	log *logger.Logger,
+	serve serveFlags,
+	policyRoutingMode proxy.PolicyRoutingMode,
+	providers providersConfigStartup,
+) (*server.Server, error) {
+	return server.New(
+		authenticator,
+		log,
+		*serve.host,
+		*serve.port,
+		server.WithDashboardConfigControl(server.DashboardConfigModeCLI),
+		server.WithStreamingUpstreamTimeout(*serve.streamingUpstreamTimeout),
+		server.WithCopilotHeaderConfig(serve.copilotHeaderConfig()),
+		server.WithResponsesWebSocketConfig(serve.responsesWebSocketConfig()),
+		server.WithCompactUpstreamChunkBytes(*serve.compactUpstreamChunkBytes),
+		server.WithCompactUpstreamChunkConcurrency(*serve.compactUpstreamChunkConcurrency),
+		server.WithCompactUpstreamMaxAttempts(*serve.compactUpstreamMaxAttempts),
+		server.WithPolicyRoutingAllowRemoteSingleTenant(*serve.policyRoutingAllowRemote),
+		server.WithProxyOptions(
+			proxy.WithProvidersConfig(providers.Resolved.Config),
+			proxy.WithDashboardConfigSource(providers.Resolved, providers.Store),
+			proxy.WithDashboardConfigReadOnlyReason(providers.ReadOnlyReason),
+			proxy.WithPolicyRoutingMode(policyRoutingMode),
+			proxy.WithDeferredDynamicProviderModelValidation(providers.Resolved.Config.UsesCopilot()),
+		),
+	)
+}
+
 func runServe() {
 	serve := registerServeFlags(flag.CommandLine)
+	flag.Usage = func() {
+		writeServeUsage(flag.CommandLine, os.Stderr)
+	}
 	flag.Parse()
+
+	resolveMode, err := serve.providersConfigResolveMode()
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "error: %v\n\n", err)
+		flag.Usage()
+		os.Exit(2)
+	}
 
 	log := logger.New(logger.ParseLevel(*serve.logLevel))
 
@@ -614,29 +776,18 @@ func runServe() {
 		log.Fatal("failed to initialize authenticator", logger.Err(err))
 	}
 
-	providersCfg, err := proxy.LoadProvidersConfigFile(*serve.providersConfigPath)
+	providers, err := resolveProvidersConfigForStartup(*serve.providersConfigPath, resolveMode, os.UserConfigDir, probeManagedProvidersConfigWritable)
 	if err != nil {
-		log.Fatal("failed to load providers config", logger.Err(err))
+		log.Fatal("failed to resolve providers config", logger.Err(err))
+	}
+	if providers.Resolved.PersistenceWarning != nil {
+		log.Info("managed providers config recovery completed with a durability warning", logger.Err(providers.Resolved.PersistenceWarning))
+	}
+	if providers.ReadOnlyReason != nil {
+		log.Info("dashboard providers config editor is read-only", logger.Err(providers.ReadOnlyReason))
 	}
 
-	srv, err := server.New(
-		authenticator,
-		log,
-		*serve.host,
-		*serve.port,
-		server.WithStreamingUpstreamTimeout(*serve.streamingUpstreamTimeout),
-		server.WithCopilotHeaderConfig(serve.copilotHeaderConfig()),
-		server.WithResponsesWebSocketConfig(serve.responsesWebSocketConfig()),
-		server.WithCompactUpstreamChunkBytes(*serve.compactUpstreamChunkBytes),
-		server.WithCompactUpstreamChunkConcurrency(*serve.compactUpstreamChunkConcurrency),
-		server.WithCompactUpstreamMaxAttempts(*serve.compactUpstreamMaxAttempts),
-		server.WithPolicyRoutingAllowRemoteSingleTenant(*serve.policyRoutingAllowRemote),
-		server.WithProxyOptions(
-			proxy.WithProvidersConfig(providersCfg),
-			proxy.WithPolicyRoutingMode(policyRoutingMode),
-			proxy.WithDeferredDynamicProviderModelValidation(providersCfg.UsesCopilot()),
-		),
-	)
+	srv, err := newServeServer(authenticator, log, serve, policyRoutingMode, providers)
 	if err != nil {
 		log.Fatal("failed to initialize server", logger.Err(err))
 	}
@@ -644,7 +795,7 @@ func runServe() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := serveUntilContextDone(ctx, srv, authenticator, providersCfg.UsesCopilot(), log); err != nil {
+	if err := serveUntilContextDone(ctx, srv, authenticator, providers.Resolved.Config.UsesCopilot(), log); err != nil {
 		log.Fatal("serve error", logger.Err(err))
 	}
 }

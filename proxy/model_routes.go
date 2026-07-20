@@ -3,7 +3,6 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -33,6 +32,7 @@ type providerRequestPolicy struct {
 
 type targetBinding struct {
 	id            string
+	revision      targetRevision
 	provider      *providerRuntime
 	upstreamModel string
 	wirePolicy    providerRequestPolicy
@@ -116,6 +116,7 @@ func newModelRouteRegistry(explicit []*modelRoute) (*modelRouteRegistry, error) 
 		if route == nil {
 			continue
 		}
+		ensureModelRouteTargetRevisions(route)
 		routeID := strings.TrimSpace(route.public.routeID)
 		if routeID == "" {
 			return nil, fmt.Errorf("model route operational id is required")
@@ -417,7 +418,7 @@ func compileLegacyModelRoute(model providerModel, provider *providerRuntime) (*m
 	if targetID == "" {
 		targetID = "legacy"
 	}
-	return &modelRoute{
+	route := &modelRoute{
 		public: publicModelContract{
 			id:        model.publicID,
 			routeID:   routeID,
@@ -448,7 +449,9 @@ func compileLegacyModelRoute(model providerModel, provider *providerRuntime) (*m
 		},
 		exposure: modelRouteExposurePublic,
 		legacy:   true,
-	}, nil
+	}
+	ensureModelRouteTargetRevisions(route)
+	return route, nil
 }
 
 func (ps *providerSetup) routeRegistry() *modelRouteRegistry {
@@ -459,7 +462,12 @@ func (ps *providerSetup) routeRegistry() *modelRouteRegistry {
 }
 
 func (ps *providerSetup) lookupRoute(publicID string) (*modelRoute, bool) {
-	registry := ps.routeRegistry()
+	if ps == nil {
+		return nil, false
+	}
+	ps.modelsMu.RLock()
+	defer ps.modelsMu.RUnlock()
+	registry := ps.routes
 	if registry == nil {
 		return nil, false
 	}
@@ -467,7 +475,12 @@ func (ps *providerSetup) lookupRoute(publicID string) (*modelRoute, bool) {
 }
 
 func (ps *providerSetup) lookupRouteAlias(publicID string) (*modelRoute, bool) {
-	registry := ps.routeRegistry()
+	if ps == nil {
+		return nil, false
+	}
+	ps.modelsMu.RLock()
+	defer ps.modelsMu.RUnlock()
+	registry := ps.routes
 	if registry == nil {
 		return nil, false
 	}
@@ -477,7 +490,12 @@ func (ps *providerSetup) lookupRouteAlias(publicID string) (*modelRoute, bool) {
 // lookupPublicModelEntry resolves exact public IDs and their configured
 // normalized aliases across static and policy entries.
 func (ps *providerSetup) lookupPublicModelEntry(model string) (*publicModelEntry, bool) {
-	registry := ps.routeRegistry()
+	if ps == nil {
+		return nil, false
+	}
+	ps.modelsMu.RLock()
+	defer ps.modelsMu.RUnlock()
+	registry := ps.routes
 	if registry == nil {
 		return nil, false
 	}
@@ -488,7 +506,12 @@ func (ps *providerSetup) lookupPublicModelEntry(model string) (*publicModelEntry
 // Internal routes are intentionally available here but never through the
 // client-facing static route resolver.
 func (ps *providerSetup) lookupTerminalRoute(routeID string) (*modelRoute, bool) {
-	registry := ps.routeRegistry()
+	if ps == nil {
+		return nil, false
+	}
+	ps.modelsMu.RLock()
+	defer ps.modelsMu.RUnlock()
+	registry := ps.routes
 	if registry == nil {
 		return nil, false
 	}
@@ -655,16 +678,3 @@ func compileLegacyProviderRoutes(provider *providerRuntime, models []providerMod
 // validateRouteAwareRequestJSON keeps strict duplicate-key rejection scoped to
 // proxy-owned explicit routes; legacy and provider-owned requests retain their
 // existing decoder and upstream behavior.
-func (h *ProxyHandler) validateRouteAwareRequestJSON(body []byte, model, endpoint string) error {
-	if h == nil {
-		return nil
-	}
-	route, known := h.resolveModelRouteForRequest(model, endpoint)
-	if !known || route == nil || route.legacy {
-		return nil
-	}
-	if err := rejectDuplicateJSONMappingKeys(body); err != nil {
-		return &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("invalid ambiguous JSON request: %w", err)}
-	}
-	return nil
-}

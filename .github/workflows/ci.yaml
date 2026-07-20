@@ -83,6 +83,9 @@ jobs:
       - name: Test Windows launcher lifecycle
         run: go test . ./launch -count=1
 
+      - name: Test Windows managed config store
+        run: go test ./proxy -run 'ManagedProvidersConfig|ProvidersConfigSource|ProvidersConfigJSON' -count=1
+
   darwin-launch:
     runs-on: macos-latest
     timeout-minutes: 15
@@ -95,6 +98,9 @@ jobs:
 
       - name: Test Darwin launcher lifecycle
         run: go test . ./launch -count=1
+
+      - name: Test Darwin managed config store
+        run: go test ./proxy -run 'ManagedProvidersConfig|ProvidersConfigSource|ProvidersConfigJSON' -count=1
 
   build:
     runs-on: ubuntu-latest

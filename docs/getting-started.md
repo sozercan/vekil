@@ -29,6 +29,16 @@ go build -o vekil .
 ./vekil
 ```
 
+## Edit A Running Local Configuration
+
+A long-lived native server on the default loopback listener exposes the local provider-config editor at:
+
+```text
+http://localhost:1337/dashboard/config
+```
+
+It stages provider, schema-v2 model-route, and policy-profile changes, persists them to a source-scoped managed JSON file, and publishes one new runtime generation only after discovery, policy preflight, and persistence succeed. The selected JSON/YAML bootstrap is never modified. If a bootstrap/managed conflict prevents startup, use `--ignore-managed` for a read-only inspection start or `--reset-managed` to delete the matching override. See [Local Dashboard Configuration](dashboard-config.md) before storing inline secrets or scripting the API.
+
 ## Launch A Coding Agent
 
 Use a managed launcher when you want Vekil to configure and supervise the
@@ -53,6 +63,9 @@ vekil launch codex \
 The launcher binds an ephemeral loopback proxy, authenticates the child with a
 random session token, restricts requests to the selected model, removes
 upstream credentials from the child environment, and shuts down with the agent.
+Managed launch proxies expose only dashboard-config capability metadata: they do
+not consume, display, persist, or mutate the long-lived dashboard-managed
+override.
 Use `--dry-run` to inspect statically known routing while catalog-discovered
 metadata is clearly marked unresolved.
 
@@ -73,6 +86,10 @@ docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot -p 1337:1337 \
 ```
 
 The image sets `HOST=0.0.0.0` so published Docker ports work. Native binary and tray-app runs default to `127.0.0.1`; bind to `0.0.0.0` only when you intentionally need network access.
+
+Because the official container is non-loopback, `/dashboard/api/v1/config` returns capability metadata only and provider configuration cannot be edited through the browser, even when `~/.config/vekil` is mounted read-write. This is deliberate: the current control plane is local-only, not a remote admin API. Keep the provider bootstrap mounted read-only, update it through your deployment workflow, and roll/restart the container.
+
+The source-scoped managed store also needs a writable user configuration directory. On an immutable/read-only filesystem, native loopback deployments fall back to a redacted read-only editor. If a persisted managed override conflicts with a changed bootstrap, `--ignore-managed` can start from the bootstrap without deleting the override; `--reset-managed` requires writable storage. See [Containers and read-only filesystems](dashboard-config.md#containers-and-read-only-filesystems).
 
 With explicit provider routing:
 
@@ -144,7 +161,11 @@ The example token cache is an `emptyDir`. It survives a container restart inside
 - inject `COPILOT_GITHUB_TOKEN` from a Kubernetes Secret so every replacement can authenticate non-interactively, or
 - replace the `emptyDir` with persistent storage if you rely on Vekil-managed cached credentials.
 
-Explicit provider routing also needs the provider file to exist in the container. Mount the JSON/YAML config from a Secret or ConfigMap and add `--providers-config /path/in/container/providers.yaml` to the container args. Any `api_key_env` or other credential environment variables referenced by that file must be supplied separately, normally from Secrets. Do not assume the example `emptyDir` persists either provider credentials or configuration. Provider-state bindings and Responses-backed Chat replay state are memory-only: use one replica or session affinity to the same Pod for stateful explicit Responses traffic, and drain those continuations before rolling or replacing Pods.
+Explicit provider routing also needs the provider file to exist in the container. Mount the JSON/YAML config from a Secret or ConfigMap and add `--providers-config /path/in/container/providers.yaml` to the container args. Any `api_key_env` or other credential environment variables referenced by that file must be supplied separately, normally from Secrets. Do not assume the example `emptyDir` persists either provider credentials or configuration.
+
+The sample Pod is non-loopback, so the dashboard config endpoint is capability-only and must not be exposed through an Ingress as a remote editor. Manage provider config through the ConfigMap/Secret and Deployment rollout. If you deliberately persist `<UserConfigDir>/vekil/dashboard-config/`, remember that it can take precedence over the mounted bootstrap only while the source fingerprint still matches; a changed bootstrap plus old managed override fails closed until ignored or reset.
+
+Provider-state bindings and Responses-backed Chat replay state are memory-only: use one replica or session affinity to the same Pod for stateful explicit Responses traffic, and drain those continuations before rolling or replacing Pods.
 
 Policy v1 has a separate deployment restriction: one trusted user/tenant per Vekil process/deployment, no downstream identity or tenant quotas, and no policy affinity/shared state. A non-loopback Pod requires the explicit remote-single-tenant acknowledgement plus external authentication/network isolation. Use stateless Chat traffic canaries for policy rollout; keep direct stateful Responses/websocket traffic on its existing sticky topology.
 

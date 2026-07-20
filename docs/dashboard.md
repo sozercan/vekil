@@ -10,11 +10,14 @@ http://<host>:<port>/dashboard
 
 For a default local run that is <http://localhost:1337/dashboard>. In the tray app, **Open Dashboard** launches the same URL in your browser once Vekil is running.
 
+The traffic page links to **Provider configuration** at `/dashboard/config`. That separate page is a local control plane for providers, schema-v2 routes, and policy profiles. Unlike the observability dashboard, its full reads and writes are limited to supported long-lived loopback CLI/menubar servers; see [Local Dashboard Configuration](dashboard-config.md).
+
 ## What it shows
 
 The dashboard polls `GET /stats.json` once per second and renders:
 
 - **Cards** — in-flight requests, requests/sec, tokens/sec, error rate, latency p50/p95, upstream retries, and cumulative tokens.
+- **Active config generation** — `GET /stats.json` includes the numeric `config_generation` for the currently published runtime, so external tools can correlate traffic with a dashboard apply.
 - **Time series** — requests/sec (with an errors/sec overlay) and tokens/sec (prompt vs. completion) over a rolling window, drawn with [uPlot](https://github.com/leeoniya/uPlot).
 - **Total usage** — cumulative requests, total/prompt/completion tokens, cached-prompt %, reasoning tokens, average tokens per request, and errors.
 - **Breakdowns** — top models, providers, and agents, each with request count, token volume, error count, and average latency. A controls bar lets you **sort by** requests / tokens / errors / latency and **filter** by name (e.g. `gpt-5.4-pro` to inspect one model). Sorting by errors or latency hides rows with none. The JSON snapshot additionally includes `by_route` client-request rows and `by_target` physical-attempt rows for external tooling.
@@ -78,7 +81,7 @@ Routing observability has two related ledgers:
 
 A successful failover still increments client request totals once. Existing token totals remain client-request/accepted-turn accounting rather than physical-send totals; failed-attempt usage is kept in the physical ledger instead of being attributed to the final provider. The recent-request row exposes only the final/canonical upstream request ID.
 
-Metrics are aggregated in memory in the proxy and reset when the process restarts; nothing is persisted. Only inference and compatibility endpoints that produce model completions are counted. The dashboard's own requests (`/dashboard`, its assets, `/stats.json`, `/dashboard/insight`) and the `/healthz` and `/readyz` probes are excluded so the dashboard does not measure itself. Also excluded are non-generating or metadata routes whose traffic would otherwise dilute completion-oriented metrics: model-catalog reads (`GET /v1/models`), token-counting probes (`POST /v1/messages/count_tokens` and Gemini `:countTokens`, which may still call an upstream model and incur latency or cost), and the proxy-owned compatibility shims (`POST /v1/responses/compact`, `POST /v1/memories/trace_summarize`). These standalone exclusions apply to both the client-request and physical-attempt ledgers. Internal compaction, replay, and protocol-recovery sends spawned under a counted inference request remain attributed to that owning operation and stay in the physical-attempt ledger.
+Metrics are aggregated in memory in the proxy and reset when the process restarts; nothing is persisted. Only inference and compatibility endpoints that produce model completions are counted. The dashboard's own requests (`/dashboard`, `/dashboard/config`, their assets and config API calls, `/stats.json`, `/dashboard/insight`) and the `/healthz` and `/readyz` probes are excluded so the dashboard does not measure itself. Also excluded are non-generating or metadata routes whose traffic would otherwise dilute completion-oriented metrics: model-catalog reads (`GET /v1/models`), token-counting probes (`POST /v1/messages/count_tokens` and Gemini `:countTokens`, which may still call an upstream model and incur latency or cost), and the proxy-owned compatibility shims (`POST /v1/responses/compact`, `POST /v1/memories/trace_summarize`). These standalone exclusions apply to both the client-request and physical-attempt ledgers. Internal compaction, replay, and protocol-recovery sends spawned under a counted inference request remain attributed to that owning operation and stay in the physical-attempt ledger.
 
 Policy classifier telemetry is maintained alongside, not inside, the ordinary client-request ledger. This preserves one client request and one selected terminal operation while still accounting for classifier admission, latency, usage/cost, decisions, and failures.
 
@@ -89,6 +92,7 @@ Token usage is captured across all inference surfaces: OpenAI chat completions (
 ```json
 {
   "uptime_seconds": 1234,
+  "config_generation": 3,
   "inflight": 3,
   "totals": {
     "requests": 5000, "errors": 12,
@@ -146,14 +150,18 @@ Failure/suppression reasons are closed enums. Raw error text, provider state, re
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | `/dashboard` | The dashboard HTML page |
+| `GET` | `/dashboard` | The traffic dashboard HTML page |
 | `GET` | `/dashboard/{asset}` | Vendored uPlot assets (`uPlot.min.js`, `uPlot.min.css`) |
 | `GET` | `/stats.json` | The traffic snapshot above |
 | `POST` | `/dashboard/insight` | Generate an AI insight (only when `insight_model` is configured) |
+| `GET` | `/dashboard/config` | Local provider/route/policy editor; availability is listener- and mode-scoped |
+| various | `/dashboard/api/v1/config...` | Versioned local config API; see [Local Dashboard Configuration](dashboard-config.md#versioned-api) |
 
 ## Access and security
 
-`/dashboard`, `/stats.json`, and `/dashboard/insight` are **unauthenticated**, like `/healthz`. Vekil binds to `127.0.0.1` by default, so they are reachable only from the local machine. If you bind to a non-loopback address (for example `0.0.0.0` in a container with a published port), these become reachable by anyone who can reach that port — put it behind your own network controls in that case. This matters most for `/dashboard/insight`, which spends tokens; it is rate-limited but still unauthenticated, so do not expose it publicly without your own access controls. Policy `observe`/`enforce` additionally requires the explicit remote-single-tenant acknowledgement, but that acknowledgement does not authenticate these endpoints or provide tenant isolation.
+`/dashboard`, `/stats.json`, and `/dashboard/insight` have no dedicated dashboard login, like `/healthz`. Vekil binds to `127.0.0.1` by default, so they are normally local. If you bind to a non-loopback address (for example `0.0.0.0` in a container with a published port), these traffic endpoints become reachable by anyone who can reach that port unless the embedding server or an external layer adds access control. This matters most for `/dashboard/insight`, which spends tokens; it is rate-limited but still should not be exposed publicly. Policy `observe`/`enforce` additionally requires the explicit remote-single-tenant acknowledgement, but that acknowledgement does not authenticate traffic-dashboard endpoints or provide tenant isolation.
+
+The provider-config control plane is stricter and separate: non-loopback and managed-launch servers return capability metadata only. Full local access requires a literal loopback `Host` with the actual port; mutations also require same-origin checks and a process-local CSRF nonce. Any server-level inbound auth still applies. See [Dashboard config security](dashboard-config.md#browser-and-http-security).
 
 ## Charting dependency
 

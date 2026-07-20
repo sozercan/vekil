@@ -185,7 +185,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(admissionCtx)
 		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
 	}
-	if err := h.validateRouteAwareRequestJSON(bodyBytes, requestedModel, providerEndpointResponses); err != nil {
+	if err := h.validateRouteAwareRequestJSONForContext(r.Context(), bodyBytes, requestedModel, providerEndpointResponses); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
@@ -572,7 +572,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(admissionCtx)
 		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
 	}
-	if err := h.validateRouteAwareRequestJSON(bodyBytes, requestedModel, providerEndpointResponses); err != nil {
+	if err := h.validateRouteAwareRequestJSONForContext(r.Context(), bodyBytes, requestedModel, providerEndpointResponses); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
@@ -591,7 +591,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	// after synthetic response lineage is reset, while the dispatch body still
 	// applies context sanitization and proxy-owned checkpoint expansion.
 	stateBindingBody := bodyBytes
-	bodyBytes = h.rewriteResponsesRequestBody(bodyBytes, "responses/compact", false)
+	bodyBytes = h.rewriteResponsesRequestBodyForContext(r.Context(), bodyBytes, extractResponsesRequestModel(bodyBytes), "responses/compact", false)
 
 	var body map[string]json.RawMessage
 	if err := json.Unmarshal(bodyBytes, &body); err != nil {
@@ -599,7 +599,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), true)
 	defer upstreamCancel()
 	model := rawJSONString(body["model"])
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
@@ -683,7 +683,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 		r = r.WithContext(admissionCtx)
 		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
 	}
-	if err := h.validateRouteAwareRequestJSON(bodyBytes, requestedModel, providerEndpointResponses); err != nil {
+	if err := h.validateRouteAwareRequestJSONForContext(r.Context(), bodyBytes, requestedModel, providerEndpointResponses); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
@@ -717,7 +717,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 			},
 		},
 	}
-	if h.shouldSetSyntheticResponsesStoreFalse(memReq.Model) {
+	if h.shouldSetSyntheticResponsesStoreFalseForContext(r.Context(), memReq.Model) {
 		responsesReq["store"] = false
 	}
 	if len(memReq.Reasoning) > 0 && string(memReq.Reasoning) != "null" {
@@ -725,7 +725,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	}
 	reqBody, _ := json.Marshal(responsesReq)
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), false)
 	defer upstreamCancel()
 	extraHeaders := responsesExtraHeadersFromRequest(r)
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
@@ -1046,14 +1046,18 @@ func compactRetryCancellation(ctx context.Context, retryErr error) error {
 }
 
 func (h *ProxyHandler) setSyntheticResponsesStoreFalse(requestFields map[string]json.RawMessage) {
-	if requestFields == nil || !h.shouldSetSyntheticResponsesStoreFalse(rawJSONString(requestFields["model"])) {
+	h.setSyntheticResponsesStoreFalseForContext(context.Background(), requestFields)
+}
+
+func (h *ProxyHandler) setSyntheticResponsesStoreFalseForContext(ctx context.Context, requestFields map[string]json.RawMessage) {
+	if requestFields == nil || !h.shouldSetSyntheticResponsesStoreFalseForContext(ctx, rawJSONString(requestFields["model"])) {
 		return
 	}
 	requestFields["store"] = json.RawMessage("false")
 }
 
-func (h *ProxyHandler) shouldSetSyntheticResponsesStoreFalse(model string) bool {
-	provider, _, _ := h.resolveProviderModel(strings.TrimSpace(model), providerEndpointResponses)
+func (h *ProxyHandler) shouldSetSyntheticResponsesStoreFalseForContext(ctx context.Context, model string) bool {
+	provider, _, _ := h.resolveProviderModelForContext(ctx, strings.TrimSpace(model), providerEndpointResponses)
 	if provider == nil {
 		return false
 	}
@@ -1339,17 +1343,17 @@ func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestField
 	return summary, resp, err
 }
 
-func (h *ProxyHandler) learnedCompactTargetForRequest(requestFields map[string]json.RawMessage, configuredTarget int) (int, bool) {
-	key, ok := h.compactLearnedTargetKeyForRequest(requestFields, "/responses")
+func (h *ProxyHandler) learnedCompactTargetForRequestContext(ctx context.Context, requestFields map[string]json.RawMessage, configuredTarget int) (int, bool) {
+	key, ok := h.compactLearnedTargetKeyForRequestContext(ctx, requestFields, "/responses")
 	if !ok {
 		return configuredTarget, false
 	}
 	return h.learnedCompactTarget(key, configuredTarget)
 }
 
-func (h *ProxyHandler) compactLearnedTargetKeyForRequest(requestFields map[string]json.RawMessage, endpoint string) (compactLearnedTargetKey, bool) {
+func (h *ProxyHandler) compactLearnedTargetKeyForRequestContext(ctx context.Context, requestFields map[string]json.RawMessage, endpoint string) (compactLearnedTargetKey, bool) {
 	model := rawJSONString(requestFields["model"])
-	provider, owner, known := h.resolveProviderModel(model, endpoint)
+	provider, owner, known := h.resolveProviderModelForContext(ctx, model, endpoint)
 	if provider == nil {
 		return compactLearnedTargetKey{}, false
 	}
@@ -1392,9 +1396,9 @@ func (h *ProxyHandler) compactResponsesRequestWithBudget(ctx context.Context, re
 		)
 	}
 
-	h.setSyntheticResponsesStoreFalse(requestFields)
+	h.setSyntheticResponsesStoreFalseForContext(ctx, requestFields)
 	targetBodySize := h.effectiveCompactChunkBodyBytes()
-	learnedTarget, learned := h.learnedCompactTargetForRequest(requestFields, targetBodySize)
+	learnedTarget, learned := h.learnedCompactTargetForRequestContext(ctx, requestFields, targetBodySize)
 	if learned {
 		targetBodySize = learnedTarget
 	}
@@ -1417,7 +1421,7 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 	bodyBytes = applyResolvedCompactModel(bodyBytes, budget)
 
 	requestedModel := extractResponsesRequestModel(bodyBytes)
-	provider, _, _ := h.resolveProviderModel(requestedModel, providerEndpointResponses)
+	provider, _, _ := h.resolveProviderModelForContext(ctx, requestedModel, providerEndpointResponses)
 	if rewrittenBody, strippedFields := stripUnsupportedResponsesRequestFields(bodyBytes, provider); len(strippedFields) > 0 {
 		bodyBytes = rewrittenBody
 		h.log.Debug("stripped unsupported responses request fields",
@@ -1540,7 +1544,7 @@ func (h *ProxyHandler) compactResponsesRequestDepth(ctx context.Context, request
 	// outer fanout (if any) shrink to this value before they POST and burn
 	// their own discovery 413 at the larger size.
 	budget.recordLearnedTarget(nextTarget)
-	if key, ok := h.compactLearnedTargetKeyForRequest(requestFields, "/responses"); ok && h.recordLearnedCompactTarget(key, nextTarget) {
+	if key, ok := h.compactLearnedTargetKeyForRequestContext(ctx, requestFields, "/responses"); ok && h.recordLearnedCompactTarget(key, nextTarget) {
 		h.log.Debug("recorded learned compact chunk target after 413",
 			logger.F("provider_id", key.ProviderID),
 			logger.F("model", key.Model),
@@ -1629,7 +1633,7 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 	// 413 forces re-splitting) inherit prior shrinkage instead of replanning
 	// at the original too-large size.
 	targetBodySize = budget.adjustTarget(targetBodySize)
-	if learnedTarget, learned := h.learnedCompactTargetForRequest(requestFields, targetBodySize); learned {
+	if learnedTarget, learned := h.learnedCompactTargetForRequestContext(ctx, requestFields, targetBodySize); learned {
 		targetBodySize = learnedTarget
 	}
 
@@ -2427,12 +2431,12 @@ func fallbackMergedCompactionSummaries(summaries []string) string {
 }
 
 func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint string, injectResumePrompt bool) []byte {
-	return h.rewriteResponsesRequestBodyForModel(bodyBytes, extractResponsesRequestModel(bodyBytes), endpoint, injectResumePrompt)
+	return h.rewriteResponsesRequestBodyForContext(context.Background(), bodyBytes, extractResponsesRequestModel(bodyBytes), endpoint, injectResumePrompt)
 }
 
-func (h *ProxyHandler) rewriteResponsesRequestBodyForModel(bodyBytes []byte, requestedModel string, endpoint string, injectResumePrompt bool) []byte {
-	provider, _, _ := h.resolveProviderModel(requestedModel, "/responses")
-	if route, known := h.resolveModelRouteForRequest(requestedModel, providerEndpointResponses); known && route != nil && !route.legacy {
+func (h *ProxyHandler) rewriteResponsesRequestBodyForContext(ctx context.Context, bodyBytes []byte, requestedModel string, endpoint string, injectResumePrompt bool) []byte {
+	provider, _, _ := h.resolveProviderModelForContext(ctx, requestedModel, "/responses")
+	if route, known := resolveModelRouteForSetup(h.providerSetupForContext(ctx), requestedModel, providerEndpointResponses); known && route != nil && !route.legacy {
 		// Keep explicit-route requests provider-neutral until the executor selects
 		// a physical target. Each attempt will apply that target's policy from
 		// this logical request, including replay and compatibility child sends.
@@ -3004,7 +3008,7 @@ func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Conte
 	}
 
 	requestedModel := extractResponsesRequestModel(bodyBytes)
-	provider, _, _ := h.resolveProviderModel(requestedModel, "/responses")
+	provider, _, _ := h.resolveProviderModelForContext(ctx, requestedModel, "/responses")
 	if operation := routeOperationFromContext(ctx); operation != nil {
 		if target, ok := operation.route.targetByID(operation.pinnedTarget()); ok && target.provider != nil {
 			provider = target.provider

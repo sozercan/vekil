@@ -15,10 +15,11 @@ import (
 )
 
 type explicitRouteResponseInfo struct {
-	routeID    string
-	publicID   string
-	targetID   string
-	providerID string
+	routeID        string
+	publicID       string
+	targetID       string
+	providerID     string
+	targetRevision targetRevision
 }
 
 type explicitRouteResponseContextKey struct{}

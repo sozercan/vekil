@@ -222,6 +222,7 @@ type responsesWebSocketSession struct {
 	userAgent               string
 	explicitRouteID         string
 	explicitTargetID        string
+	explicitTargetRevision  targetRevision
 	operationConnectionID   string
 	operationSequence       uint64
 	turnState               string
@@ -445,7 +446,7 @@ func (s *responsesWebSocketSession) handleFrame(h *ProxyHandler, frame responses
 
 	request, err := parseResponsesWebSocketCreateRequest(frame.payload)
 	if err != nil {
-		if publicID, ok := h.policyPublicModelID(extractResponsesRequestModel(frame.payload)); ok {
+		if publicID, ok := h.policyPublicModelIDForContext(s.ctx, extractResponsesRequestModel(frame.payload)); ok {
 			message := fmt.Sprintf("model %q does not support %s", publicID, providerEndpointResponses)
 			s.recordTurnStats(h, publicID, "", "", http.StatusBadRequest, responsesUsage{}, nil)
 			return s.sendWrappedError(http.StatusBadRequest, message, "invalid_request_error", nil)
@@ -1153,13 +1154,16 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 	if h == nil {
 		return ctx, nil, nil, fmt.Errorf("proxy handler is required")
 	}
+	if s == nil {
+		return ctx, nil, nil, fmt.Errorf("responses websocket session is required")
+	}
 	model = strings.TrimSpace(model)
-	if model != "" && !h.modelAllowedForRequest(model, providerEndpointResponses) {
+	if model != "" && !h.modelAllowedForContext(s.ctx, model, providerEndpointResponses) {
 		return ctx, nil, nil, modelNotAllowedRequestError(model)
 	}
 
-	resolved, known := h.resolveModelRouteForRequest(model, providerEndpointResponses)
-	if s != nil && s.explicitRouteID != "" {
+	resolved, known := resolveModelRouteForSetup(h.providerSetupForContext(s.ctx), model, providerEndpointResponses)
+	if s.explicitRouteID != "" {
 		if !known || resolved == nil || resolved.legacy || resolved.public.routeID != s.explicitRouteID {
 			return ctx, nil, resolved, &providerRequestError{
 				statusCode: http.StatusBadRequest,
@@ -1195,13 +1199,24 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 			err:        fmt.Errorf("responses websocket session route changed after target pinning"),
 		}
 	}
-	if _, ok := route.targetByID(s.explicitTargetID); !ok {
+	target, ok := route.targetByID(s.explicitTargetID)
+	if !ok {
 		return routedCtx, operation, route, &providerRequestError{
 			statusCode: http.StatusServiceUnavailable,
 			err:        fmt.Errorf("pinned responses websocket route target %q is unavailable", s.explicitTargetID),
 		}
 	}
-	if err := operation.forcePinnedTarget(s.explicitTargetID); err != nil {
+	currentRevision := targetRevisionForBinding(route.public, target)
+	if s.explicitTargetRevision != "" && s.explicitTargetRevision != currentRevision {
+		return routedCtx, operation, route, &providerRequestError{
+			statusCode: http.StatusServiceUnavailable,
+			err:        fmt.Errorf("pinned responses websocket route target %q changed", s.explicitTargetID),
+		}
+	}
+	if s.explicitTargetRevision == "" {
+		s.explicitTargetRevision = currentRevision
+	}
+	if err := operation.forcePinnedTargetRevision(s.explicitTargetID, s.explicitTargetRevision); err != nil {
 		return routedCtx, operation, route, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
 	// Prior websocket frames commit the session to this exact target. Mark the
@@ -1211,7 +1226,7 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 	return routedCtx, operation, route, nil
 }
 
-func (s *responsesWebSocketSession) pinExplicitRouteTarget(route *modelRoute, operation *routeOperation) error {
+func (s *responsesWebSocketSession) pinExplicitRouteTarget(route *modelRoute, operation *routeOperation, requestRevision targetRevision) error {
 	if operation == nil {
 		return nil
 	}
@@ -1225,15 +1240,22 @@ func (s *responsesWebSocketSession) pinExplicitRouteTarget(route *modelRoute, op
 	if _, ok := route.targetByID(targetID); !ok {
 		return fmt.Errorf("selected responses websocket route target %q is unavailable", targetID)
 	}
+	if requestRevision == "" {
+		return fmt.Errorf("selected responses websocket route target %q has no request revision", targetID)
+	}
 	if s.explicitRouteID != "" && s.explicitRouteID != route.public.routeID {
 		return fmt.Errorf("responses websocket session route changed after target pinning")
 	}
 	if s.explicitTargetID != "" && s.explicitTargetID != targetID {
 		return fmt.Errorf("responses websocket session target changed from %q to %q", s.explicitTargetID, targetID)
 	}
+	if s.explicitTargetRevision != "" && s.explicitTargetRevision != requestRevision {
+		return fmt.Errorf("responses websocket session physical target changed after target pinning")
+	}
 	operation.pinTarget(targetID)
 	s.explicitRouteID = route.public.routeID
 	s.explicitTargetID = targetID
+	s.explicitTargetRevision = requestRevision
 	return nil
 }
 
@@ -1302,10 +1324,11 @@ func explicitResponsesWebSocketResponseInfo(resp *http.Response, route *modelRou
 		targetID := operation.pinnedTarget()
 		if target, exists := route.targetByID(targetID); exists && target.provider != nil {
 			info = explicitRouteResponseInfo{
-				routeID:    route.public.routeID,
-				publicID:   route.public.id,
-				targetID:   targetID,
-				providerID: target.provider.id,
+				routeID:        route.public.routeID,
+				publicID:       route.public.id,
+				targetID:       targetID,
+				providerID:     target.provider.id,
+				targetRevision: targetRevisionForBinding(route.public, target),
 			}
 			ok = true
 		}
@@ -1363,7 +1386,11 @@ func (s *responsesWebSocketSession) prepareExplicitRouteSuccessResponse(h *Proxy
 	if isLocalResponsesWebSocketCompactionResponse(plan, operation) {
 		return nil
 	}
-	if err := s.pinExplicitRouteTarget(route, operation); err != nil {
+	info, err := explicitResponsesWebSocketResponseInfo(resp, route, operation)
+	if err != nil {
+		return err
+	}
+	if err := s.pinExplicitRouteTarget(route, operation, info.targetRevision); err != nil {
 		return err
 	}
 	return prepareExplicitResponsesWebSocketResponse(h, resp, route, operation)
@@ -1385,7 +1412,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return err
 	}
 	if request != nil {
-		if publicID, ok := h.policyPublicModelID(request.Model); ok {
+		if publicID, ok := h.policyPublicModelIDForContext(s.ctx, request.Model); ok {
 			err := &providerRequestError{
 				statusCode: http.StatusBadRequest,
 				err:        fmt.Errorf("model %q does not support %s", publicID, providerEndpointResponses),
@@ -1503,7 +1530,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		})
 	}
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(s.ctx, true)
 	// The websocket bridge records each turn as tracked traffic (recordTurnStats),
 	// so mark the per-turn upstream context as retry-trackable too — otherwise a
 	// retryable 429/503 on a turn would be invisible in the dashboard retry
@@ -1749,7 +1776,7 @@ func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model, prov
 	if operation != nil {
 		operationID = operation.operationID()
 	}
-	return h.RecordResponsesTurn(model, providerID, providerKind, classifyAgent(s.userAgent), status, usage, operationID)
+	return h.RecordResponsesTurnForContext(s.ctx, model, providerID, providerKind, classifyAgent(s.userAgent), status, usage, operationID)
 }
 
 func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) (responsesWebSocketRequestPlan, error) {
@@ -1985,13 +2012,13 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, req
 	if s == nil || s.isClosing() || (s.ctx != nil && s.ctx.Err() != nil) {
 		return metrics, responsesUsage{}
 	}
-	ctx, cancel := h.newInferenceUpstreamContext(false)
+	ctx, cancel := h.newInferenceUpstreamContextFrom(s.ctx, false)
 	// Mark the compaction upstream context as retry-trackable, like the turn
 	// itself, so retries during auto-compaction are counted in retry stats.
 	ctx = markRetryStatsTracked(ctx)
 	if operation != nil {
 		if s.explicitTargetID != "" {
-			if err := operation.forcePinnedTarget(s.explicitTargetID); err != nil {
+			if err := operation.forcePinnedTargetRevision(s.explicitTargetID, s.explicitTargetRevision); err != nil {
 				cancel()
 				h.log.Debug("responses websocket auto-compaction target pin failed", logger.Err(err))
 				return metrics, responsesUsage{}

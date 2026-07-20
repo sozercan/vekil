@@ -37,12 +37,22 @@ type options struct {
 	proxyOptions                         []proxy.Option
 	inboundAuthToken                     string
 	policyRoutingAllowRemoteSingleTenant bool
+	dashboardConfigMode                  string
 }
 
 type serverConnContextKey struct{}
 
 // Option customizes server creation.
 type Option func(*options)
+
+// WithDashboardConfigControl enables the local provider-config control plane
+// for an explicitly supported long-lived server mode. Managed launch servers
+// intentionally omit this option.
+func WithDashboardConfigControl(mode string) Option {
+	return func(o *options) {
+		o.dashboardConfigMode = strings.TrimSpace(mode)
+	}
+}
 
 // WithInboundAuthToken requires this bearer or x-api-key token on every route
 // except health and readiness probes. Empty keeps the public server behavior.
@@ -217,6 +227,9 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		recorder := &responseRecorder{ResponseWriter: w}
+		if handler != nil {
+			r = handler.PinRuntimeRequest(r)
+		}
 		ctx, summary := proxy.WithRequestSummary(r.Context())
 
 		admitted := handler == nil || !handler.ShuttingDown() || r.URL.Path == "/healthz"
@@ -309,6 +322,19 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	if err := validatePolicyRoutingListenHost(host, handler.PolicyRoutingActive(), cfg.policyRoutingAllowRemoteSingleTenant); err != nil {
 		return nil, err
 	}
+	dashboardConfigEnabled := cfg.dashboardConfigMode != "" && isLoopbackListenHost(host)
+	dashboardConfigReason := ""
+	if cfg.dashboardConfigMode == "" {
+		dashboardConfigReason = "configuration control is not enabled for this server mode"
+	} else if !isLoopbackListenHost(host) {
+		dashboardConfigReason = "configuration control is available only on a loopback listener"
+	} else if !handler.DashboardConfigPersistenceWritable() {
+		dashboardConfigReason = handler.DashboardConfigReadOnlyReason()
+		if dashboardConfigReason == "" {
+			dashboardConfigReason = "managed configuration persistence is unavailable; the editor is read-only"
+		}
+	}
+	handler.ConfigureDashboardConfigAccess(dashboardConfigEnabled, dashboardConfigEnabled && handler.DashboardConfigPersistenceWritable(), dashboardConfigReason, cfg.dashboardConfigMode)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/messages/count_tokens", handler.HandleAnthropicMessagesCountTokens)
@@ -325,13 +351,23 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)
 	mux.HandleFunc("GET /dashboard", handler.HandleDashboard)
+	mux.HandleFunc("GET /dashboard/config", handler.HandleDashboardConfig)
+	mux.HandleFunc("GET /dashboard/config.js", handler.HandleDashboardAsset)
+	mux.HandleFunc("GET /dashboard/config.css", handler.HandleDashboardAsset)
+	mux.HandleFunc("GET /dashboard/api/v1/config", handler.HandleDashboardConfigRead)
+	mux.HandleFunc("POST /dashboard/api/v1/config/import", handler.HandleDashboardConfigImport)
+	mux.HandleFunc("POST /dashboard/api/v1/config/validate", handler.HandleDashboardConfigValidate)
+	mux.HandleFunc("POST /dashboard/api/v1/config/applies", handler.HandleDashboardConfigApply)
+	mux.HandleFunc("GET /dashboard/api/v1/config/applies/{id}", handler.HandleDashboardConfigApplyStatus)
+	mux.HandleFunc("DELETE /dashboard/api/v1/config/managed", handler.HandleDashboardConfigReset)
 	mux.HandleFunc("GET /dashboard/{asset}", handler.HandleDashboardAsset)
 	mux.HandleFunc("POST /dashboard/insight", handler.HandleDashboardInsight)
 	mux.HandleFunc("GET /stats.json", handler.HandleStatsJSON)
 	mux.HandleFunc("GET /favicon.ico", handler.HandleFavicon)
 
 	addr := fmt.Sprintf("%s:%s", host, port)
-	httpHandler := withRequestLog(withProviderValidationGate(mux, handler), log, handler)
+	securedMux := withDashboardConfigSecurity(mux, handler, dashboardConfigEnabled, strings.TrimSpace(port))
+	httpHandler := withRequestLog(withProviderValidationGate(securedMux, handler), log, handler)
 	httpHandler = withInboundAuth(httpHandler, cfg.inboundAuthToken)
 	return &Server{
 		httpServer: &http.Server{
@@ -486,6 +522,7 @@ func (s *Server) Stop(ctx context.Context) error {
 func (s *Server) stop(ctx context.Context) error {
 	var websocketErr error
 	var workerErr error
+	var runtimeCommitErr error
 	var forceCloseErr error
 	if s.proxyHandler != nil {
 		s.proxyHandler.BeginShutdown()
@@ -503,10 +540,21 @@ func (s *Server) stop(ctx context.Context) error {
 		}
 	}
 	if s.proxyHandler != nil {
+		runtimeCommitErr = s.proxyHandler.WaitRuntimeCommit(ctx)
 		workerErr = s.proxyHandler.WaitLifecycleWorkers(ctx)
 	}
 	s.running.Store(false)
-	return errors.Join(websocketErr, shutdownErr, forceCloseErr, workerErr)
+	return errors.Join(websocketErr, shutdownErr, forceCloseErr, runtimeCommitErr, workerErr)
+}
+
+// WaitForLifecycleWorkers allows a caller recovering from a timed-out Stop to
+// confirm that no proxy-owned background worker can still persist or publish
+// state. It does not reopen HTTP admission.
+func (s *Server) WaitForLifecycleWorkers(ctx context.Context) error {
+	if s == nil || s.proxyHandler == nil {
+		return nil
+	}
+	return s.proxyHandler.WaitLifecycleWorkers(ctx)
 }
 
 // IsRunning returns whether the server is currently running.

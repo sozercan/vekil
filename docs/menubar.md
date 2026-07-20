@@ -39,6 +39,7 @@ Release asset and updater-secret details live in [Development](development.md#re
 - current app version
 - choose and persist a providers config file
 - return to default Copilot routing
+- reset the dashboard-managed override for the selected source
 - GitHub auth actions: sign in, use GitHub CLI account, sign out
 - optional launch-at-login integration
 - Sparkle `Check for Updates…` in packaged macOS builds
@@ -53,7 +54,11 @@ The `GitHub Auth` submenu exposes the same auth choices as the CLI:
 
 Copilot-backed configs require GitHub auth or `COPILOT_GITHUB_TOKEN`. Provider-only configs that omit Copilot do not require GitHub auth and can keep running after sign-out. See [Provider Routing](provider-routing.md) for provider-specific auth details.
 
-Use `Choose Providers Config…` to select the same JSON/YAML file you would pass with `--providers-config`. The app saves the selected path for future launches and launch-at-login starts. `Use Default Copilot Routing` clears the saved path.
+Use `Choose Providers Config…` to select the same JSON/YAML file you would pass with `--providers-config`. The app saves the selected path for future launches and launch-at-login starts. That path is the **bootstrap source**; if a matching dashboard-managed override exists, the managed config is the active runtime while the selected source remains unchanged. The Providers menu title identifies the selected bootstrap file, not whether a managed override is active. Open the dashboard's **Provider configuration** page to see source ID, bootstrap digest, managed path, revision, and `managed_active`.
+
+`Reset Dashboard Override` deletes only the source-scoped managed override for the selected bootstrap, reloads the bootstrap, and restarts Vekil if it was running. It is also the pre-start recovery action for a managed/bootstrap conflict or malformed managed envelope. `Use Default Copilot Routing` is different: it clears the selected file and changes the bootstrap identity to `implicit-copilot`, which has its own independent managed override.
+
+The menubar server exposes full config reads/writes only while it is running on its loopback listener and the user configuration directory is writable. If persistence is unavailable, the editor remains available as a redacted read-only view. See [Local Dashboard Configuration](dashboard-config.md) for managed precedence, secret storage, optimistic apply/reset, and security rules.
 
 Startup authentication and semantic-policy classifier preflight run in a cancellable worker. Provider-config and authentication actions are temporarily disabled while that worker is active, while Quit and the other tray events remain responsive. Use **Cancel Starting Vekil** to abort startup; Vekil closes any listener opened by the canceled attempt before an automatic config restart can begin.
 

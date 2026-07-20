@@ -140,7 +140,13 @@ func (h *ProxyHandler) HandleDashboardInsight(w http.ResponseWriter, r *http.Req
 		writeInsightError(w, "stats unavailable")
 		return
 	}
-	model := strings.TrimSpace(h.providersConfig.InsightModel)
+	model := strings.TrimSpace(h.providersConfigForContext(r.Context()).InsightModel)
+	// Focused legacy tests and zero-value integrations may still set the
+	// construction-only field directly after NewProxyHandler. Long-lived
+	// control-plane servers always use the pinned runtime snapshot.
+	if model == "" && h.dashboardConfigSource == nil {
+		model = strings.TrimSpace(h.providersConfig.InsightModel)
+	}
 	if model == "" {
 		writeInsightError(w, "no insight model configured")
 		return
@@ -201,7 +207,8 @@ func (h *ProxyHandler) HandleDashboardInsight(w http.ResponseWriter, r *http.Req
 		writeInsightError(w, "failed to build insight request")
 		return
 	}
-	innerReq = innerReq.WithContext(suppressRouteAttemptStats(innerReq.Context()))
+	innerCtx := inheritRuntimeContext(innerReq.Context(), r.Context())
+	innerReq = innerReq.WithContext(suppressRouteAttemptStats(innerCtx))
 	innerReq.Header.Set("Content-Type", "application/json")
 	innerReq.Header.Set("User-Agent", "vekil-dashboard-insight")
 

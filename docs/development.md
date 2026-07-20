@@ -16,6 +16,7 @@ make docker-rtk-e2e     # verifies bundled RTK reduces tool output through Vekil
 
 ```bash
 go test ./... -count=1
+make test           # includes dashboard config JS syntax + node:test coverage
 make compaction-lab    # fast in-process compaction regression harness
 make test-app          # macOS only; builds and verifies Vekil.app
 scripts/macos-app-smoke.sh  # macOS only; build + launch smoke for Vekil.app
@@ -26,6 +27,8 @@ scripts/tests/live-chat-over-responses-smoke-test.sh  # deterministic Chat-over-
 scripts/tests/live-policy-routing-smoke-test.sh  # deterministic semantic-policy process/cleanup gates
 scripts/tests/live-policy-routing-copilot-smoke-test.sh  # deterministic Copilot bridge/model-selection wrapper gate
 ```
+
+`make test` requires a current Node.js runtime with the built-in `node:test` module in addition to Go. Running `go test ./...` remains Go-only.
 
 `cmd/compaction-lab` starts an in-process proxy and fake `/responses` upstream, then exercises the compact-response shape, opaque compaction replay, remote compaction v2 trigger handling, and websocket `response.processed` control frames. It is intended as a quick deterministic check for compaction regressions before running live Copilot smoke tests.
 
@@ -65,6 +68,41 @@ Route-specific deterministic tests use local upstream servers plus injected tran
 - client disconnect, total deadline, shutdown, response-body cleanup, goroutine termination, and no-overlap/no-new-attempt races.
 
 For large request and replay paths, keep the `64 MiB` request boundary in the deterministic matrix and verify that operation/send budgets prevent compaction, recovery, or fallback from creating an unbounded tree.
+
+### Dashboard config control-plane suite
+
+The local editor crosses strict decoding, filesystem persistence, HTTP security, asynchronous lifecycle, runtime publication, and stateful routing. Keep these checks deterministic and credential-free:
+
+```bash
+make test
+go test -race ./... -count=1
+
+# Focused Go coverage
+go test . ./proxy ./server ./cmd/menubar \
+  -run 'DashboardConfig|ProvidersConfig(JSON|Source|Bootstrap|Managed)|RuntimeSnapshot|TargetRevision|Resolve.*ProvidersConfig|StateBindingTargetRevision|ReplayRequiresSameTargetRevision|WebSocketTargetPin' \
+  -count=1
+
+# Frontend serialization/state helpers (also run by make test)
+node --check proxy/dashboard/config.js
+node --test proxy/dashboard/config.test.mjs
+```
+
+Required matrix:
+
+| Area | Required coverage |
+|---|---|
+| Strict codec | duplicate keys, nested unknown fields, trailing values, null/presence rules, explicit zero/false, v1/v2 semantic round trip, managed-envelope source/revision self-check |
+| Source resolver | implicit/file identities, per-source path isolation, managed precedence, formatting-only bootstrap changes, semantic conflicts, malformed envelope, ignore/reset recovery, unchanged bootstrap bytes |
+| Persistence | optimistic stale revision, owner-restricted Unix mode, Windows/macOS native replacement behavior, sync/readback, temporary cleanup, source recheck, symlink/hardlink/bootstrap-alias rejection, reset |
+| Access/security | long-lived CLI/menubar capability, managed-launch/non-loopback capability-only reads, read-only persistence, actual-port literal loopback Host (IPv4/IPv6), DNS/wrong-port rejection, inbound auth, Fetch Metadata/Origin/Referer, CSRF |
+| Secret contract | read redaction, API-key env metadata, extra-header redaction, required explicit operations, deterministic `keep`/`set`/`clear`, placeholder rejection, provider identity incompatibility, URL-userinfo rejection, no secret text in errors/logs/revisions |
+| Apply lifecycle | synchronous validation, one active job, `412` stale draft, every async phase/terminal state, two-minute timeout, 15-minute/64-entry retention, shutdown cancellation, persistence-before-publication, post-commit durability warning |
+| Runtime isolation | one generation per request/WebSocket, old-generation completion after publish, active `/readyz` isolation during candidate work, generation-owned model/Chat caches, immediate new `/v1/models` catalog |
+| Continuations | unchanged versus changed physical target revision for explicit Responses state, Responses-backed Chat replay, and WebSocket target pins; restart/expiry/eviction behavior remains fail-closed |
+| Frontend | protected-path restoration, schema promotion without downgrade, explicit zero/false preservation, ordered target controls, secret operation serialization, stale draft/apply-state handling, keyboard/focus/status semantics |
+| Process smoke | successful apply survives restart, failed apply leaves runtime/file unchanged, reset restores bootstrap, zero-config implicit Copilot, read-only config directory, conflict recovery, no secret leakage |
+
+The merge gate must not depend on a live provider. Use local `httptest` upstreams and injected failure points for discovery, preflight, persistence, cancellation, and target-revision cases. Live-provider smoke is supplemental. When changing snapshot lookup or apply construction, compare the existing provider lookup, Chat-over-Responses, Responses transport/session, and WebSocket benchmarks and add a bounded maximum-size config apply benchmark if the change affects apply scaling.
 
 ### Policy-routing safety suite
 
@@ -182,7 +220,7 @@ make lint
 
 ## CI
 
-GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs lint, tests, the full race detector, build, vet, a Kubernetes/kind operational smoke, and e2e validation before merge. Every core job has a job-level deadline. The test job runs [`scripts/tests/live-smoke-reliability-test.sh`](../scripts/tests/live-smoke-reliability-test.sh) with local mock servers and fake CLIs so stale-listener, timeout, per-client, and descendant-cleanup failures are deterministic, plus real-binary process harnesses: [`scripts/tests/live-provider-routing-smoke-test.sh`](../scripts/tests/live-provider-routing-smoke-test.sh) exercises schema-v2 two-target failover against controlled loopback Responses servers; [`scripts/tests/live-policy-routing-smoke-test.sh`](../scripts/tests/live-policy-routing-smoke-test.sh) exercises semantic-policy modes, classifier/terminal accounting, controlled failover, automatic non-default port selection, redaction, and process-group cleanup against local Chat-compatible shims; and [`scripts/tests/live-policy-routing-copilot-smoke-test.sh`](../scripts/tests/live-policy-routing-copilot-smoke-test.sh) verifies Copilot bridge catalog selection, secret isolation, non-default ports, and descendant cleanup without contacting Copilot.
+GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs lint, frontend plus Go tests, the full race detector, build, vet, a Kubernetes/kind operational smoke, and e2e validation before merge. `make test` runs the dashboard config JavaScript syntax check and `node:test` suite before `go test ./...`. Dedicated Windows and macOS jobs run the managed config source/codec/store tests on native filesystems in addition to launcher lifecycle coverage. Every core job has a job-level deadline. The Linux test job runs [`scripts/tests/live-smoke-reliability-test.sh`](../scripts/tests/live-smoke-reliability-test.sh) with local mock servers and fake CLIs so stale-listener, timeout, per-client, and descendant-cleanup failures are deterministic, plus three real-binary process harnesses: [`scripts/tests/live-provider-routing-smoke-test.sh`](../scripts/tests/live-provider-routing-smoke-test.sh) exercises schema-v2 two-target failover against controlled loopback Responses servers; [`scripts/tests/live-policy-routing-smoke-test.sh`](../scripts/tests/live-policy-routing-smoke-test.sh) exercises semantic-policy modes, classifier/terminal accounting, controlled failover, automatic non-default port selection, redaction, and process-group cleanup against local Chat-compatible shims; and [`scripts/tests/live-policy-routing-copilot-smoke-test.sh`](../scripts/tests/live-policy-routing-copilot-smoke-test.sh) verifies Copilot bridge catalog selection, secret isolation, non-default ports, and descendant cleanup without contacting Copilot.
 
 The kind smoke builds the PR image and renders the checked-in [`k8s/vekil.yaml`](../k8s/vekil.yaml), patching only the test namespace, local image/pull policy, and the deterministic provider config used in its second phase. It verifies that the `/healthz` startup probe has a coherent 60–90 second failure budget before liveness/readiness begin. It then deploys without Copilot credentials and verifies that `/healthz` remains live, the liveness probe causes zero restarts, `/readyz` stays gated, the Pod is not Ready, and the Service has no ready endpoint. Finally it rolls out a static configured provider and verifies that the same readiness probe admits the Pod and Service endpoint. The script uses an isolated kubeconfig, bounds cluster/API/port-forward work, and requires the live `kubectl port-forward` PID plus its exact listener log before accepting HTTP responses.
 

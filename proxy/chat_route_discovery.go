@@ -49,26 +49,27 @@ func newChatRouteDiscoveryCache() chatRouteDiscoveryCache {
 
 func (h *ProxyHandler) resolveChatRoute(ctx context.Context, model string) (resolvedChatRoute, error) {
 	model = strings.TrimSpace(model)
-	if !h.modelAllowedForRequest(model, providerEndpointChatCompletions) {
+	if !h.modelAllowedForContext(ctx, model, providerEndpointChatCompletions) {
 		return resolvedChatRoute{}, modelNotAllowedRequestError(model)
 	}
-	provider, owner, known := h.resolveProviderModelForRequest(model, providerEndpointChatCompletions)
-	if provider == nil && !known && h.hasClosedConfiguredModelRegistry() {
+	setup := h.providerSetupForContext(ctx)
+	provider, owner, known := h.resolveProviderModelForContext(ctx, model, providerEndpointChatCompletions)
+	if provider == nil && !known && setup != nil && setup.hasConfiguredState && strings.TrimSpace(setup.defaultProviderID) == "" && setup.routeRegistry() != nil {
 		return resolvedChatRoute{}, &providerRequestError{
 			statusCode: http.StatusBadRequest,
 			err:        fmt.Errorf("model %q does not support %s", model, providerEndpointChatCompletions),
 		}
 	}
 	if model != "" && !known && providerUsesDynamicModels(provider) {
-		if err := h.refreshUnknownChatRouteProvider(ctx, provider); err != nil {
+		if err := h.refreshUnknownChatRouteProvider(ctx, setup, provider); err != nil {
 			return resolvedChatRoute{}, err
 		}
-		provider, owner, known = h.resolveProviderModelForRequest(model, providerEndpointChatCompletions)
+		provider, owner, known = h.resolveProviderModelForContext(ctx, model, providerEndpointChatCompletions)
 	}
 	return chooseChatRoute(provider, owner, known, model)
 }
 
-func (h *ProxyHandler) refreshUnknownChatRouteProvider(waitCtx context.Context, provider *providerRuntime) error {
+func (h *ProxyHandler) refreshUnknownChatRouteProvider(waitCtx context.Context, setup *providerSetup, provider *providerRuntime) error {
 	if waitCtx == nil {
 		waitCtx = context.Background()
 	}
@@ -79,7 +80,10 @@ func (h *ProxyHandler) refreshUnknownChatRouteProvider(waitCtx context.Context, 
 		return nil
 	}
 
-	cache := &h.chatRoutes
+	cache := h.chatRouteCacheForContext(waitCtx)
+	if cache == nil {
+		return fmt.Errorf("chat route discovery cache is unavailable")
+	}
 	cache.mu.Lock()
 	cache.ensureDefaultsLocked()
 	state := cache.providers[provider.id]
@@ -109,12 +113,12 @@ func (h *ProxyHandler) refreshUnknownChatRouteProvider(waitCtx context.Context, 
 	cache.mu.Unlock()
 
 	if !h.beginLifecycleWorker() {
-		h.completeChatRouteProviderRefresh(state, flight, errProxyLifecycleShutdown, nil)
+		h.completeChatRouteProviderRefresh(cache, state, flight, errProxyLifecycleShutdown, nil)
 		return waitForChatRouteDiscovery(waitCtx, flight)
 	}
 	go func() {
 		defer h.endLifecycleWorker()
-		h.runChatRouteProviderRefresh(provider, state, flight, timeout)
+		h.runChatRouteProviderRefresh(setup, cache, provider, state, flight, timeout)
 	}()
 	return waitForChatRouteDiscovery(waitCtx, flight)
 }
@@ -135,6 +139,8 @@ func waitForChatRouteDiscovery(ctx context.Context, flight *chatRouteDiscoveryFl
 }
 
 func (h *ProxyHandler) runChatRouteProviderRefresh(
+	setup *providerSetup,
+	cache *chatRouteDiscoveryCache,
 	provider *providerRuntime,
 	state *chatRouteProviderDiscovery,
 	flight *chatRouteDiscoveryFlight,
@@ -146,19 +152,22 @@ func (h *ProxyHandler) runChatRouteProviderRefresh(
 
 	var installErr error
 	if fetchErr == nil && !result.notModified {
-		installErr = h.providerSetup().replaceProviderModels(provider.id, result.models)
+		installErr = setup.replaceProviderModels(provider.id, result.models)
 	}
 
-	h.completeChatRouteProviderRefresh(state, flight, fetchErr, installErr)
+	h.completeChatRouteProviderRefresh(cache, state, flight, fetchErr, installErr)
 }
 
 func (h *ProxyHandler) completeChatRouteProviderRefresh(
+	cache *chatRouteDiscoveryCache,
 	state *chatRouteProviderDiscovery,
 	flight *chatRouteDiscoveryFlight,
 	fetchErr error,
 	installErr error,
 ) {
-	cache := &h.chatRoutes
+	if cache == nil {
+		return
+	}
 	cache.mu.Lock()
 	cache.ensureDefaultsLocked()
 	now := cache.nowLocked()
