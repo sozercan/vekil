@@ -346,7 +346,7 @@ select_copilot_models() {
     classifier \
     "${LIVE_POLICY_ROUTING_COPILOT_CLASSIFIER_MODEL:-}" \
     "" \
-    gpt-5.4-mini gpt-5-mini gpt-5.4 claude-sonnet-4.6 gpt-4.1)"
+    gpt-4.1 claude-sonnet-4.6 claude-haiku-4.5 gpt-5.4-mini gpt-5-mini gpt-5.4)"
   selected_primary="$(pick_copilot_model \
     powerful-primary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL:-}" \

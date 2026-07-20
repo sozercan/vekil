@@ -101,6 +101,7 @@ pathlib.Path(os.environ["FAKE_BRIDGE_CHILD_PID_FILE"]).write_text(str(child.pid)
 models = [
     {"id": "gpt-5.4-mini", "supported_endpoints": ["/chat/completions"]},
     {"id": "gpt-5.4", "supported_endpoints": ["/chat/completions", "/responses"]},
+    {"id": "gpt-4.1", "supported_endpoints": ["/chat/completions"]},
     {"id": "claude-sonnet-4.6", "supported_endpoints": ["/chat/completions"]},
     {"id": "responses-only", "supported_endpoints": ["/responses"]},
 ]
@@ -165,7 +166,7 @@ set -euo pipefail
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL}" == "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL}" ]]
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL}" == http://127.0.0.1:*/v1 ]]
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL}" == "gpt-5.4-mini" ]]
-[[ "${LIVE_POLICY_ROUTING_CLASSIFIER_MODEL}" == "gpt-5.4-mini" ]]
+[[ "${LIVE_POLICY_ROUTING_CLASSIFIER_MODEL}" == "gpt-4.1" ]]
 [[ "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL}" == "gpt-5.4" ]]
 [[ "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL}" == "claude-sonnet-4.6" ]]
 [[ "${LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED}" == "false" ]]
@@ -214,7 +215,7 @@ main() {
   [[ -s "${RECORD}" ]] || fail "fake harness did not record selected Copilot topology"
   jq -e '
     .lightweight == "gpt-5.4-mini"
-    and .classifier == "gpt-5.4-mini"
+    and .classifier == "gpt-4.1"
     and .primary == "gpt-5.4"
     and .secondary == "claude-sonnet-4.6"
   ' "${RECORD}" >/dev/null || fail "wrapper selected unexpected Copilot models"
