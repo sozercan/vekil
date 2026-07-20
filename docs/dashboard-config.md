@@ -30,7 +30,7 @@ The page has four views:
 - **Providers** — provider type, destination, auth source, model discovery, endpoint paths, custom headers, static models, trust metadata, and provider-specific fields.
 - **Model routes** — public or internal schema-v2 contracts, ordered targets, upstream model rewrites, endpoint metadata, request policy, and `primary_only` or bounded `priority_failover` routing.
 - **Policy profiles** — profile identity, configured mode, terminal routes, classifier route and limits, fallback tiers, sampling, and required data-policy acknowledgements.
-- **Structured JSON** — the complete non-secret editable document for lossless review/import when a field is easier to edit directly.
+- **Structured JSON** — the complete non-secret editable document for lossless review/import when a field is easier to edit directly. Local JSON files are parsed in the browser; YAML files are strictly converted to canonical redacted JSON by the loopback server.
 
 Only provider config schema versions 1 and 2 are accepted. The editor promotes a draft to schema v2 when a v2-only feature is used and does not auto-downgrade an existing v2 document. Schema version 3 is rejected.
 
@@ -173,6 +173,7 @@ All config API responses are JSON with `Cache-Control: no-store`.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/dashboard/api/v1/config` | Read capability and, when available, the redacted active document, source, revision, generation, policy modes, secret states, preserved paths, provider capabilities, and CSRF token |
+| `POST` | `/dashboard/api/v1/config/import` | Strictly decode one YAML provider document and return canonical redacted JSON for the browser draft; does not validate, persist, or publish |
 | `POST` | `/dashboard/api/v1/config/validate` | Strictly decode, merge secret operations, preserve protected fields, and perform offline semantic validation without changing the runtime |
 | `POST` | `/dashboard/api/v1/config/applies` | Submit one validated candidate for asynchronous discovery, policy preflight, persistence, and publication |
 | `GET` | `/dashboard/api/v1/config/applies/{id}` | Poll a retained apply/reset status |
@@ -185,6 +186,12 @@ GET /dashboard/config
 GET /dashboard/config.js
 GET /dashboard/config.css
 ```
+
+### YAML import
+
+The Structured JSON view accepts `.yaml` and `.yml` files. The browser sends the selected text only to the same-origin loopback import endpoint with the process-local CSRF token. Vekil applies the same strict YAML decoder used at startup, including duplicate-key, unknown-field, merge-key, and single-document checks, then returns canonical JSON for review. Import alone does not change the active runtime, write a managed override, or modify the bootstrap file.
+
+Inline `api_key` values and non-empty `extra_headers` values are removed from the response. The response lists only their JSON Pointer paths in `stripped_secret_paths`; use the Providers view to explicitly keep, set, or clear those secrets before validation or apply. YAML comments, anchors, and formatting are not preserved after conversion to structured JSON.
 
 ### Read response
 

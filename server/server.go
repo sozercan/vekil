@@ -355,6 +355,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /dashboard/config.js", handler.HandleDashboardAsset)
 	mux.HandleFunc("GET /dashboard/config.css", handler.HandleDashboardAsset)
 	mux.HandleFunc("GET /dashboard/api/v1/config", handler.HandleDashboardConfigRead)
+	mux.HandleFunc("POST /dashboard/api/v1/config/import", handler.HandleDashboardConfigImport)
 	mux.HandleFunc("POST /dashboard/api/v1/config/validate", handler.HandleDashboardConfigValidate)
 	mux.HandleFunc("POST /dashboard/api/v1/config/applies", handler.HandleDashboardConfigApply)
 	mux.HandleFunc("GET /dashboard/api/v1/config/applies/{id}", handler.HandleDashboardConfigApplyStatus)

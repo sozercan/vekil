@@ -148,7 +148,7 @@
           <div>
             <p class="eyebrow">Lossless fallback</p>
             <h2>Structured JSON</h2>
-            <p>Edit or import the complete non-secret document. Unknown fields remain intact, and server-preserved paths are restored from the base revision before requests are sent.</p>
+            <p>Edit or import the complete non-secret document. JSON stays in the browser; YAML is converted to canonical JSON by the server. Unknown fields remain intact, and server-preserved paths are restored from the base revision before requests are sent.</p>
           </div>
         </div>
 
@@ -159,8 +159,8 @@
 
         <div class="raw-toolbar" aria-label="Structured JSON tools">
           <label class="file-button">
-            <span>Import JSON file</span>
-            <input id="rawFileInput" type="file" accept="application/json,.json">
+            <span>Import JSON or YAML</span>
+            <input id="rawFileInput" type="file" accept="application/json,application/yaml,text/yaml,.json,.yaml,.yml">
           </label>
           <button id="formatRawButton" class="button button-secondary" type="button">Format JSON</button>
           <button id="updateFromRawButton" class="button button-primary" type="button">Update forms from JSON</button>

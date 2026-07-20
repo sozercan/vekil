@@ -417,35 +417,9 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".yaml", ".yml":
-		allowMergeKeys := !providersConfigSchemaUsesStrictDecoding(sniffProvidersConfigSchemaVersionYAML(body))
-		if err := rejectDuplicateYAMLMappingKeys(body, allowMergeKeys); err != nil {
+		if err := decodeProvidersConfigYAML(body, cfg); err != nil {
 			return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
 		}
-		if !allowMergeKeys {
-			if err := validateYAMLConfigFieldPaths(body); err != nil {
-				return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
-			}
-		}
-		decoder := yaml.NewDecoder(bytes.NewReader(body))
-		decoder.KnownFields(true)
-		if err := decoder.Decode(cfg); err != nil {
-			return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
-		}
-		var extra interface{}
-		if err := decoder.Decode(&extra); err != io.EOF {
-			if err != nil {
-				return fmt.Errorf("decode providers config %q as YAML: trailing document: %w", path, err)
-			}
-			return fmt.Errorf("decode providers config %q as YAML: more than one YAML document", path)
-		}
-		present, err := yamlTopLevelConfigFields(body)
-		if err != nil {
-			return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
-		}
-		cfg.schemaVersionSet = present["schema_version"]
-		cfg.modelRoutesSet = present["model_routes"]
-		cfg.policyProfilesSet = present["policy_profiles"]
-		markYAMLProvidersConfigFieldPresence(body, cfg)
 	default:
 		if err := rejectDuplicateJSONMappingKeys(body); err != nil {
 			return fmt.Errorf("decode providers config %q as JSON: %w", path, err)
@@ -474,6 +448,45 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 		cfg.policyProfilesSet = present["policy_profiles"]
 		markJSONProvidersConfigFieldPresence(body, cfg)
 	}
+	return nil
+}
+
+func decodeProvidersConfigYAML(body []byte, cfg *ProvidersConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("providers config destination is required")
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return fmt.Errorf("providers config YAML is empty")
+	}
+	allowMergeKeys := !providersConfigSchemaUsesStrictDecoding(sniffProvidersConfigSchemaVersionYAML(body))
+	if err := rejectDuplicateYAMLMappingKeys(body, allowMergeKeys); err != nil {
+		return err
+	}
+	if !allowMergeKeys {
+		if err := validateYAMLConfigFieldPaths(body); err != nil {
+			return err
+		}
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(body))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(cfg); err != nil {
+		return err
+	}
+	var extra interface{}
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err != nil {
+			return fmt.Errorf("trailing YAML document: %w", err)
+		}
+		return fmt.Errorf("more than one YAML document")
+	}
+	present, err := yamlTopLevelConfigFields(body)
+	if err != nil {
+		return err
+	}
+	cfg.schemaVersionSet = present["schema_version"]
+	cfg.modelRoutesSet = present["model_routes"]
+	cfg.policyProfilesSet = present["policy_profiles"]
+	markYAMLProvidersConfigFieldPresence(body, cfg)
 	return nil
 }
 

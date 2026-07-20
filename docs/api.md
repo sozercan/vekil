@@ -155,10 +155,13 @@ The versioned dashboard config API manages the active providers document only on
 |---|---|---|
 | `GET` | `/dashboard/config` | Local editor page |
 | `GET` | `/dashboard/api/v1/config` | Capability plus, when available, redacted config/source/policy data, active `revision`, numeric `generation`, `ETag`, and CSRF nonce |
+| `POST` | `/dashboard/api/v1/config/import` | Parse one strict YAML provider document into canonical redacted JSON without changing runtime or persistence |
 | `POST` | `/dashboard/api/v1/config/validate` | Strict offline validation of a mutation envelope against the active revision |
 | `POST` | `/dashboard/api/v1/config/applies` | `202` asynchronous apply receipt and `Location` |
 | `GET` | `/dashboard/api/v1/config/applies/{id}` | Retained apply/reset status |
 | `DELETE` | `/dashboard/api/v1/config/managed` | `202` asynchronous reset to the bootstrap source |
+
+YAML import requires `Content-Type: application/yaml` or `text/yaml`, same-origin checks, and `X-Vekil-CSRF`. It uses the same 1 MiB limit and strict YAML decoder as startup, returns canonical JSON with inline API keys removed and extra-header values blanked, and lists only omitted secret paths. It does not validate, persist, or publish the imported draft.
 
 Validation/apply bodies use `base_revision`, a complete non-secret `config`, and explicit `secret_operations` (`keep`, `set`, or `clear`). Validation and apply require `Content-Type: application/json`, `If-Match` equal to the body and active revision, same-origin checks, and `X-Vekil-CSRF`. Reset requires the active `If-Match` and CSRF nonce. The mutation body limit is 1 MiB. Reads omit inline API keys, blank every `extra_headers` value, and return `Cache-Control: no-store`.
 

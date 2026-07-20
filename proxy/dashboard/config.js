@@ -415,6 +415,44 @@
     return normalized || fallback;
   }
 
+  function importedFileFormat(file) {
+    var name = String(file && file.name || "").toLowerCase();
+    var type = String(file && file.type || "").toLowerCase().split(";", 1)[0].trim();
+    if (/\.ya?ml$/.test(name)) return "yaml";
+    if (/\.json$/.test(name)) return "json";
+    if (["application/yaml", "application/x-yaml", "text/yaml", "text/x-yaml"].indexOf(type) !== -1) return "yaml";
+    if (type === "application/json") return "json";
+    return "";
+  }
+
+  function readImportedFile(file) {
+    return new Promise(function (resolve, reject) {
+      if (typeof globalScope.FileReader !== "function") {
+        reject(new Error("File import is unavailable in this browser."));
+        return;
+      }
+      var reader = new globalScope.FileReader();
+      reader.addEventListener("load", function () { resolve(String(reader.result || "")); });
+      reader.addEventListener("error", function () { reject(new Error("Unable to read " + String(file && file.name || "the selected file") + ".")); });
+      reader.addEventListener("abort", function () { reject(new Error("Reading " + String(file && file.name || "the selected file") + " was canceled.")); });
+      reader.readAsText(file);
+    });
+  }
+
+  function canonicalImportedConfig(config) {
+    if (!isPlainObject(config)) throw new Error("The imported configuration must be a JSON object.");
+    var sanitized = stripSecretValues(config);
+    return {
+      text: JSON.stringify(sanitized.config, null, 2) + "\n",
+      strippedSecrets: sanitized.stripped
+    };
+  }
+
+  function omittedSecretSummary(count) {
+    var normalized = Number.isFinite(Number(count)) ? Math.max(0, Math.floor(Number(count))) : 0;
+    return normalized + " secret value" + (normalized === 1 ? " was" : "s were") + " omitted";
+  }
+
   var exportedHelpers = Object.freeze({
     deepClone: deepClone,
     jsonPointerEscape: jsonPointerEscape,
@@ -436,7 +474,10 @@
     buildSecretOperations: buildSecretOperations,
     deriveWriteCapability: deriveWriteCapability,
     isTerminalApplyStatus: isTerminalApplyStatus,
-    isSuccessfulApplyStatus: isSuccessfulApplyStatus
+    isSuccessfulApplyStatus: isSuccessfulApplyStatus,
+    importedFileFormat: importedFileFormat,
+    canonicalImportedConfig: canonicalImportedConfig,
+    omittedSecretSummary: omittedSecretSummary
   });
 
   if (typeof module !== "undefined" && module.exports) {
@@ -919,24 +960,73 @@
     }
   };
 
-  ConfigEditor.prototype.importRawFile = function (event) {
-    var self = this;
+  ConfigEditor.prototype.importRawFile = async function (event) {
     var file = event.target.files && event.target.files[0];
     if (!file) return;
-    var reader = new FileReader();
-    reader.addEventListener("load", function () {
-      self.byId("rawConfig").value = String(reader.result || "");
-      self.state.rawDirty = true;
-      self.state.dirty = true;
-      self.selectTab("raw", false);
-      self.updateActionState();
-      self.announce("Imported " + file.name + ". Review it, then update the forms or validate.");
-    });
-    reader.addEventListener("error", function () {
-      self.showErrors([{ path: "/", message: "Unable to read " + file.name + "." }]);
-    });
-    reader.readAsText(file);
     event.target.value = "";
+
+    var format = importedFileFormat(file);
+    if (!format) {
+      this.showErrors([{ path: "/", message: "Choose a .json, .yaml, or .yml provider configuration file." }]);
+      this.announce("The selected file was not imported. The current draft was not changed.");
+      return false;
+    }
+
+    this.announce("Reading " + file.name + "…");
+    var imported;
+    var omittedSecrets = 0;
+    try {
+      var text = await readImportedFile(file);
+      if (format === "yaml") {
+        this.announce("Converting " + file.name + " to structured JSON…");
+        var response = await fetch(API_ROOT + "/import", {
+          method: "POST",
+          headers: {
+            "Accept": "application/json",
+            "Content-Type": "application/yaml",
+            "X-Vekil-CSRF": this.state.csrfToken
+          },
+          body: text,
+          cache: "no-store",
+          credentials: "same-origin"
+        });
+        var payload = await this.readJSONResponse(response);
+        if (!response.ok) {
+          var responseErrors = this.extractErrors(payload, response.status);
+          this.showErrors(responseErrors.length ? responseErrors : [{ path: "/", message: "YAML import failed with HTTP " + response.status + "." }]);
+          this.announce("YAML import failed. The current draft was not changed.");
+          return false;
+        }
+        if (!payload || !isPlainObject(payload.config)) {
+          throw new Error("The YAML import response did not include a provider configuration object.");
+        }
+        imported = canonicalImportedConfig(payload.config);
+        omittedSecrets = (Array.isArray(payload.stripped_secret_paths) ? payload.stripped_secret_paths.length : 0) + imported.strippedSecrets;
+      } else {
+        var parsed;
+        try {
+          parsed = JSON.parse(text);
+        } catch (error) {
+          throw new Error("Imported JSON is invalid: " + error.message);
+        }
+        imported = canonicalImportedConfig(parsed);
+        omittedSecrets = imported.strippedSecrets;
+      }
+    } catch (error) {
+      this.showErrors([{ path: "/", message: error.message || ("Unable to import " + file.name + ".") }]);
+      this.announce("Import failed. The current draft was not changed.");
+      return false;
+    }
+
+    this.byId("rawConfig").value = imported.text;
+    this.state.rawDirty = true;
+    this.state.dirty = true;
+    this.selectTab("raw", false);
+    this.clearErrors();
+    this.updateActionState();
+    var secretNote = omittedSecretSummary(omittedSecrets);
+    this.announce("Imported " + file.name + " as structured JSON. " + secretNote + "." + (omittedSecrets ? " Use the Providers secret controls to keep, set, or clear them." : "") + " Review it, then update the forms or validate.");
+    return true;
   };
 
   ConfigEditor.prototype.nextFieldID = function (prefix) {

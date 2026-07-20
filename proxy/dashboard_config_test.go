@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -110,6 +111,131 @@ func TestDashboardConfigReadRedactsSecrets(t *testing.T) {
 	}
 	if etag := w.Header().Get("ETag"); etag == "" {
 		t.Fatal("missing ETag")
+	}
+}
+
+func TestDashboardConfigImportYAMLReturnsRedactedDraftWithoutMutation(t *testing.T) {
+	h, resolved := newDashboardConfigTestHandler(t)
+	initialGeneration := h.runtimeGeneration()
+	initialRevision := h.runtimeRevision()
+	bootstrapBefore, err := os.ReadFile(resolved.Bootstrap.Source.BootstrapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	yamlBody := `schema_version: 2
+providers:
+  - id: imported
+    type: openai-compatible
+    default: true
+    base_url: https://provider.example/v1
+    api_key: fixture-a
+    auth_type: bearer
+    extra_headers:
+      X-Secret: fixture-b
+    model_discovery: static
+    models:
+      - public_id: demo
+        deployment: demo-upstream
+        endpoints: [/chat/completions]
+model_routes: []
+policy_profiles: []
+`
+	r := httptest.NewRequest(http.MethodPost, "/dashboard/api/v1/config/import", strings.NewReader(yamlBody))
+	r.Header.Set("Content-Type", "application/yaml; charset=utf-8")
+	w := httptest.NewRecorder()
+	h.HandleDashboardConfigImport(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	for _, secret := range []string{"fixture-a", "fixture-b"} {
+		if strings.Contains(w.Body.String(), secret) {
+			t.Fatalf("import response leaked %q: %s", secret, w.Body.String())
+		}
+	}
+	var response dashboardConfigImportResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.SchemaVersion != ProvidersConfigSchemaVersion2 {
+		t.Fatalf("schema version = %d, want 2", response.SchemaVersion)
+	}
+	if got, want := response.StrippedSecretPaths, []string{"/providers/imported/api_key", "/providers/imported/extra_headers/X-Secret"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("stripped secret paths = %v, want %v", got, want)
+	}
+	var imported map[string]any
+	if err := json.Unmarshal(response.Config, &imported); err != nil {
+		t.Fatal(err)
+	}
+	providers, _ := imported["providers"].([]any)
+	provider, _ := providers[0].(map[string]any)
+	if _, ok := provider["api_key"]; ok {
+		t.Fatalf("redacted import retained api_key: %v", provider)
+	}
+	headers, _ := provider["extra_headers"].(map[string]any)
+	if headers["X-Secret"] != "" {
+		t.Fatalf("redacted header = %#v, want empty", headers["X-Secret"])
+	}
+	if h.runtimeGeneration() != initialGeneration || h.runtimeRevision() != initialRevision {
+		t.Fatalf("import changed runtime: generation=%d revision=%s", h.runtimeGeneration(), h.runtimeRevision())
+	}
+	bootstrapAfter, err := os.ReadFile(resolved.Bootstrap.Source.BootstrapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(bootstrapBefore, bootstrapAfter) {
+		t.Fatal("YAML import changed the bootstrap file")
+	}
+	if _, err := os.Stat(resolved.Bootstrap.Source.ManagedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("YAML import created a managed override: %v", err)
+	}
+}
+
+func TestDashboardConfigImportYAMLRejectsInvalidRequests(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		wantStatus  int
+		wantCode    ConfigErrorCode
+	}{
+		{name: "wrong content type", contentType: "application/json", body: `{}`, wantStatus: http.StatusUnsupportedMediaType, wantCode: ConfigErrorInvalidSource},
+		{name: "empty", contentType: "application/yaml", body: " \n", wantStatus: http.StatusBadRequest, wantCode: ConfigErrorEmpty},
+		{name: "duplicate", contentType: "text/yaml", body: "providers:\n  - id: p\n    id: q\n    type: copilot\n", wantStatus: http.StatusBadRequest, wantCode: ConfigErrorDuplicateField},
+		{name: "multiple documents", contentType: "application/x-yaml", body: "providers: []\n---\nproviders: []\n", wantStatus: http.StatusBadRequest, wantCode: ConfigErrorTrailingValue},
+		{name: "oversized", contentType: "application/yaml", body: strings.Repeat("x", dashboardConfigBodyLimit+1), wantStatus: http.StatusRequestEntityTooLarge, wantCode: ConfigErrorInvalidYAML},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _ := newDashboardConfigTestHandler(t)
+			r := httptest.NewRequest(http.MethodPost, "/dashboard/api/v1/config/import", strings.NewReader(tc.body))
+			r.Header.Set("Content-Type", tc.contentType)
+			w := httptest.NewRecorder()
+			h.HandleDashboardConfigImport(w, r)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d body=%s, want %d", w.Code, w.Body.String(), tc.wantStatus)
+			}
+			var response struct {
+				Error DashboardConfigError `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.Error.Code != tc.wantCode {
+				t.Fatalf("error code = %q, want %q (body=%s)", response.Error.Code, tc.wantCode, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestDashboardConfigImportYAMLRequiresWritableCapability(t *testing.T) {
+	h, _ := newDashboardConfigTestHandler(t)
+	h.ConfigureDashboardConfigAccess(true, false, "read only", "test")
+	r := httptest.NewRequest(http.MethodPost, "/dashboard/api/v1/config/import", strings.NewReader("providers: []\n"))
+	r.Header.Set("Content-Type", "application/yaml")
+	w := httptest.NewRecorder()
+	h.HandleDashboardConfigImport(w, r)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
 	}
 }
 

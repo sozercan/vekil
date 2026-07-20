@@ -17,6 +17,7 @@ type ConfigErrorCode string
 const (
 	ConfigErrorEmpty                    ConfigErrorCode = "config_empty"
 	ConfigErrorInvalidJSON              ConfigErrorCode = "invalid_json"
+	ConfigErrorInvalidYAML              ConfigErrorCode = "invalid_yaml"
 	ConfigErrorDuplicateField           ConfigErrorCode = "duplicate_field"
 	ConfigErrorUnknownField             ConfigErrorCode = "unknown_field"
 	ConfigErrorTrailingValue            ConfigErrorCode = "trailing_value"
@@ -238,6 +239,25 @@ func classifyJSONDecodeError(err error, fallback ConfigErrorCode) ConfigErrorCod
 	}
 }
 
+func classifyYAMLDecodeError(err error) ConfigErrorCode {
+	if err == nil {
+		return ConfigErrorInvalidYAML
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "is empty"):
+		return ConfigErrorEmpty
+	case strings.Contains(message, "duplicate mapping key"):
+		return ConfigErrorDuplicateField
+	case strings.Contains(message, "unknown field"), strings.Contains(message, "field ") && strings.Contains(message, " not found"):
+		return ConfigErrorUnknownField
+	case strings.Contains(message, "more than one yaml document"), strings.Contains(message, "trailing yaml document"):
+		return ConfigErrorTrailingValue
+	default:
+		return ConfigErrorInvalidYAML
+	}
+}
+
 // DecodeProvidersConfigJSON strictly decodes one provider-config JSON object.
 // It preserves the same duplicate-key, nested unknown-field, trailing-value,
 // and field-presence behavior as the JSON branch of LoadProvidersConfigFile.
@@ -293,6 +313,24 @@ func DecodeProvidersConfigJSON(body []byte) (ProvidersConfig, error) {
 	cfg.modelRoutesSet = present["model_routes"]
 	cfg.policyProfilesSet = present["policy_profiles"]
 	markJSONProvidersConfigFieldPresence(body, &cfg)
+	return cfg, nil
+}
+
+// DecodeProvidersConfigYAML strictly decodes one provider-config YAML document.
+// It shares the file-loader decoder so duplicate keys, schema-aware merge keys,
+// nested unknown fields, document count, and field-presence semantics cannot
+// drift between dashboard imports and startup. Semantic validation remains
+// separate so imported drafts can still be corrected in the editor.
+func DecodeProvidersConfigYAML(body []byte) (ProvidersConfig, error) {
+	var cfg ProvidersConfig
+	if err := decodeProvidersConfigYAML(body, &cfg); err != nil {
+		return ProvidersConfig{}, NewConfigError(
+			classifyYAMLDecodeError(err),
+			legacyConfigErrorPointer(err),
+			err.Error(),
+			err,
+		)
+	}
 	return cfg, nil
 }
 

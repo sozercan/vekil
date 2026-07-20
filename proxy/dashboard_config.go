@@ -81,6 +81,12 @@ type dashboardConfigMutationEnvelope struct {
 	SecretOperations []SecretOperation `json:"secret_operations,omitempty"`
 }
 
+type dashboardConfigImportResponse struct {
+	Config              json.RawMessage `json:"config"`
+	SchemaVersion       int             `json:"schema_version"`
+	StrippedSecretPaths []string        `json:"stripped_secret_paths,omitempty"`
+}
+
 func (h *ProxyHandler) HandleDashboardConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -128,6 +134,51 @@ func (h *ProxyHandler) HandleDashboardConfigRead(w http.ResponseWriter, r *http.
 	}
 	w.Header().Set("ETag", strconv.Quote(snapshot.revision))
 	writeDashboardConfigJSON(w, http.StatusOK, response)
+}
+
+func (h *ProxyHandler) HandleDashboardConfigImport(w http.ResponseWriter, r *http.Request) {
+	if !h.requireDashboardConfigWritable(w) {
+		return
+	}
+	mediaType, _, err := mime.ParseMediaType(strings.TrimSpace(r.Header.Get("Content-Type")))
+	if err != nil || !dashboardConfigYAMLMediaType(mediaType) {
+		writeDashboardConfigAPIError(w, http.StatusUnsupportedMediaType, NewConfigError(ConfigErrorInvalidSource, "", "Content-Type must be application/yaml or text/yaml", err))
+		return
+	}
+	limited := &io.LimitedReader{R: r.Body, N: dashboardConfigBodyLimit + 1}
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		writeDashboardConfigAPIError(w, http.StatusBadRequest, NewConfigError(ConfigErrorInvalidYAML, "", "YAML import body is unreadable", err))
+		return
+	}
+	if len(body) > dashboardConfigBodyLimit {
+		writeDashboardConfigAPIError(w, http.StatusRequestEntityTooLarge, NewConfigError(ConfigErrorInvalidYAML, "", "YAML import exceeds the size limit", nil))
+		return
+	}
+	cfg, err := DecodeProvidersConfigYAML(body)
+	if err != nil {
+		writeDashboardConfigAPIError(w, http.StatusBadRequest, err)
+		return
+	}
+	redacted, err := redactedProvidersConfigJSON(cfg)
+	if err != nil {
+		writeDashboardConfigAPIError(w, http.StatusInternalServerError, NewConfigError(ConfigErrorCode("encoding_failed"), "", "imported config could not be encoded", err))
+		return
+	}
+	writeDashboardConfigJSON(w, http.StatusOK, dashboardConfigImportResponse{
+		Config:              redacted,
+		SchemaVersion:       cfg.EffectiveSchemaVersion(),
+		StrippedSecretPaths: dashboardImportedSecretPaths(cfg),
+	})
+}
+
+func dashboardConfigYAMLMediaType(mediaType string) bool {
+	switch strings.ToLower(strings.TrimSpace(mediaType)) {
+	case "application/yaml", "application/x-yaml", "text/yaml", "text/x-yaml":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *ProxyHandler) HandleDashboardConfigValidate(w http.ResponseWriter, r *http.Request) {
@@ -359,6 +410,31 @@ func redactedProvidersConfigJSON(cfg ProvidersConfig) (json.RawMessage, error) {
 	}
 	redacted, err := json.Marshal(document)
 	return json.RawMessage(redacted), err
+}
+
+func dashboardImportedSecretPaths(cfg ProvidersConfig) []string {
+	paths := make([]string, 0)
+	for providerIndex, provider := range cfg.Providers {
+		providerID := strings.TrimSpace(provider.ID)
+		if providerID == "" {
+			providerID = strconv.Itoa(providerIndex)
+		}
+		if provider.APIKey != "" {
+			paths = append(paths, dashboardProviderSecretPath(providerID, "api_key"))
+		}
+		headerNames := make([]string, 0, len(provider.ExtraHeaders))
+		for name, value := range provider.ExtraHeaders {
+			if value != "" {
+				headerNames = append(headerNames, name)
+			}
+		}
+		sort.Strings(headerNames)
+		for _, name := range headerNames {
+			paths = append(paths, dashboardProviderSecretPath(providerID, "extra_headers", name))
+		}
+	}
+	sort.Strings(paths)
+	return paths
 }
 
 func dashboardConfigSecretStates(cfg ProvidersConfig) []dashboardSecretState {

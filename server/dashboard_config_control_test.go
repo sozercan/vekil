@@ -47,12 +47,14 @@ func TestDashboardConfigSecurity(t *testing.T) {
 		wantStatus int
 	}{
 		{name: "valid localhost", host: "localhost:1337", local: "127.0.0.1:1337", method: http.MethodPost, fetchSite: "same-origin", origin: "http://localhost:1337", token: token, path: "/dashboard/api/v1/config/validate", wantStatus: http.StatusNoContent},
+		{name: "valid YAML import", host: "localhost:1337", local: "127.0.0.1:1337", method: http.MethodPost, fetchSite: "same-origin", origin: "http://localhost:1337", token: token, path: "/dashboard/api/v1/config/import", wantStatus: http.StatusNoContent},
 		{name: "valid ipv4", host: "127.0.0.2:1337", local: "127.0.0.1:1337", method: http.MethodGet, path: "/dashboard/api/v1/config", wantStatus: http.StatusNoContent},
 		{name: "valid ipv6", host: "[::1]:1337", local: "[::1]:1337", method: http.MethodGet, path: "/dashboard/config", wantStatus: http.StatusNoContent},
 		{name: "dns rebinding host", host: "proxy.example:1337", local: "127.0.0.1:1337", method: http.MethodGet, path: "/dashboard/api/v1/config", wantStatus: http.StatusForbidden},
 		{name: "wrong port", host: "localhost:7331", local: "127.0.0.1:1337", method: http.MethodGet, path: "/dashboard/api/v1/config", wantStatus: http.StatusForbidden},
 		{name: "cross site", host: "localhost:1337", local: "127.0.0.1:1337", method: http.MethodPost, fetchSite: "cross-site", token: token, path: "/dashboard/api/v1/config/applies", wantStatus: http.StatusForbidden},
 		{name: "missing csrf", host: "localhost:1337", local: "127.0.0.1:1337", method: http.MethodDelete, fetchSite: "same-origin", origin: "http://localhost:1337", path: "/dashboard/api/v1/config/managed", wantStatus: http.StatusForbidden},
+		{name: "YAML import missing csrf", host: "localhost:1337", local: "127.0.0.1:1337", method: http.MethodPost, fetchSite: "same-origin", origin: "http://localhost:1337", path: "/dashboard/api/v1/config/import", wantStatus: http.StatusForbidden},
 		{name: "unrelated path bypass", host: "proxy.example:9000", local: "127.0.0.1:1337", method: http.MethodPost, path: "/v1/responses", wantStatus: http.StatusNoContent},
 	}
 

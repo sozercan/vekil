@@ -1,9 +1,232 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
 
 const require = createRequire(import.meta.url);
 const helpers = require("./config.js");
+
+class ImportFileReader {
+  constructor() {
+    this.listeners = new Map();
+    this.result = "";
+  }
+
+  addEventListener(type, listener) {
+    this.listeners.set(type, listener);
+  }
+
+  readAsText(file) {
+    queueMicrotask(() => {
+      if (file.readError) {
+        const listener = this.listeners.get("error");
+        if (listener) listener();
+        return;
+      }
+      this.result = file.contents;
+      const listener = this.listeners.get("load");
+      if (listener) listener();
+    });
+  }
+}
+
+async function withImportGlobals(fetchImplementation, callback) {
+  const hadFileReader = Object.hasOwn(globalThis, "FileReader");
+  const previousFileReader = globalThis.FileReader;
+  const hadFetch = Object.hasOwn(globalThis, "fetch");
+  const previousFetch = globalThis.fetch;
+  globalThis.FileReader = ImportFileReader;
+  if (fetchImplementation) globalThis.fetch = fetchImplementation;
+  try {
+    return await callback();
+  } finally {
+    if (hadFileReader) globalThis.FileReader = previousFileReader;
+    else delete globalThis.FileReader;
+    if (hadFetch) globalThis.fetch = previousFetch;
+    else delete globalThis.fetch;
+  }
+}
+
+function makeImportEditor(initialRaw = "existing raw text\n") {
+  const rawConfig = { value: initialRaw };
+  const editor = new helpers.ConfigEditor({
+    getElementById(id) {
+      assert.equal(id, "rawConfig");
+      return rawConfig;
+    }
+  });
+  const draft = { existing: true };
+  const calls = {
+    announcements: [],
+    errors: [],
+    selectedTabs: [],
+    clearErrors: 0,
+    updateActionState: 0
+  };
+  editor.state.draft = draft;
+  editor.state.csrfToken = "csrf-token";
+  editor.announce = (message) => calls.announcements.push(message);
+  editor.showErrors = (errors) => calls.errors.push(errors);
+  editor.selectTab = (name, commitRaw) => {
+    calls.selectedTabs.push([name, commitRaw]);
+    editor.state.currentTab = name;
+    return true;
+  };
+  editor.clearErrors = () => { calls.clearErrors++; };
+  editor.updateActionState = () => { calls.updateActionState++; };
+  return { editor, rawConfig, draft, calls };
+}
+
+test("raw import control accepts JSON and YAML", () => {
+  const html = readFileSync(new URL("./config.html", import.meta.url), "utf8");
+  assert.match(html, />Import JSON or YAML</);
+  assert.match(html, /accept="[^"]*\.json[^"]*\.yaml[^"]*\.yml[^"]*"/);
+});
+
+test("JSON import stays client-side and stages canonical non-secret JSON", async () => {
+  await withImportGlobals(() => assert.fail("JSON import must not call fetch"), async () => {
+    const { editor, rawConfig, draft, calls } = makeImportEditor();
+    const input = {
+      files: [{
+        name: "providers.json",
+        type: "application/json",
+        contents: JSON.stringify({
+          schema_version: 2,
+          providers: [{
+            id: "example",
+            type: "openai-compatible",
+            api_key: "fixture-a",
+            extra_headers: { Authorization: "fixture-b" }
+          }],
+          future: { enabled: false, limit: 0 }
+        })
+      }],
+      value: "/fake/providers.json"
+    };
+
+    assert.equal(await editor.importRawFile({ target: input }), true);
+    assert.equal(input.value, "");
+    assert.equal(rawConfig.value, JSON.stringify({
+      schema_version: 2,
+      providers: [{
+        id: "example",
+        type: "openai-compatible",
+        extra_headers: { Authorization: "" }
+      }],
+      future: { enabled: false, limit: 0 }
+    }, null, 2) + "\n");
+    assert.strictEqual(editor.state.draft, draft, "import must not bypass commitRawEditor");
+    assert.equal(editor.state.rawDirty, true);
+    assert.equal(editor.state.dirty, true);
+    assert.deepEqual(calls.selectedTabs, [["raw", false]]);
+    assert.equal(calls.clearErrors, 1);
+    assert.equal(calls.updateActionState, 1);
+    assert.deepEqual(calls.errors, []);
+    assert.match(calls.announcements.at(-1), /2 secret values were omitted/);
+  });
+});
+
+test("YAML and YML imports use the conversion endpoint and stage its canonical JSON", async () => {
+  for (const filename of ["providers.yaml", "providers.yml"]) {
+    const requests = [];
+    await withImportGlobals(async (url, options) => {
+      requests.push([url, options]);
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({
+            config: {
+              schema_version: 2,
+              providers: [{ id: "yaml-provider", type: "copilot" }],
+              future: { enabled: false, limit: 0 }
+            },
+            stripped_secret_paths: ["/providers/yaml-provider/api_key", "/providers/yaml-provider/extra_headers/X-Key"]
+          });
+        }
+      };
+    }, async () => {
+      const { editor, rawConfig, draft, calls } = makeImportEditor();
+      const yaml = "schema_version: 2\nproviders:\n  - id: yaml-provider\n    type: copilot\n";
+      const input = {
+        files: [{ name: filename, type: "", contents: yaml }],
+        value: "/fake/" + filename
+      };
+
+      assert.equal(await editor.importRawFile({ target: input }), true);
+      assert.equal(input.value, "");
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0][0], "/dashboard/api/v1/config/import");
+      assert.equal(requests[0][1].method, "POST");
+      assert.equal(requests[0][1].headers.Accept, "application/json");
+      assert.equal(requests[0][1].headers["Content-Type"], "application/yaml");
+      assert.equal(requests[0][1].headers["X-Vekil-CSRF"], "csrf-token");
+      assert.equal(requests[0][1].body, yaml);
+      assert.equal(requests[0][1].cache, "no-store");
+      assert.equal(requests[0][1].credentials, "same-origin");
+      assert.deepEqual(JSON.parse(rawConfig.value), {
+        schema_version: 2,
+        providers: [{ id: "yaml-provider", type: "copilot" }],
+        future: { enabled: false, limit: 0 }
+      });
+      assert.ok(rawConfig.value.endsWith("\n"));
+      assert.strictEqual(editor.state.draft, draft, "import must not bypass commitRawEditor");
+      assert.equal(editor.state.rawDirty, true);
+      assert.equal(editor.state.dirty, true);
+      assert.deepEqual(calls.selectedTabs, [["raw", false]]);
+      assert.match(calls.announcements.at(-1), /2 secret values were omitted/);
+    });
+  }
+});
+
+test("failed YAML import preserves the existing raw text and draft and displays server errors", async () => {
+  await withImportGlobals(async () => ({
+    ok: false,
+    status: 400,
+    async text() {
+      return JSON.stringify({ error: { path: "/providers/0", message: "duplicate YAML key: id", code: "duplicate_field" } });
+    }
+  }), async () => {
+    const { editor, rawConfig, draft, calls } = makeImportEditor("keep this raw draft\n");
+    editor.state.rawDirty = false;
+    editor.state.dirty = false;
+    const input = {
+      files: [{ name: "invalid.yaml", type: "application/yaml", contents: "providers:\n  - id: one\n    id: two\n" }],
+      value: "/fake/invalid.yaml"
+    };
+
+    assert.equal(await editor.importRawFile({ target: input }), false);
+    assert.equal(rawConfig.value, "keep this raw draft\n");
+    assert.strictEqual(editor.state.draft, draft);
+    assert.equal(editor.state.rawDirty, false);
+    assert.equal(editor.state.dirty, false);
+    assert.deepEqual(calls.selectedTabs, []);
+    assert.equal(calls.clearErrors, 0);
+    assert.equal(calls.updateActionState, 0);
+    assert.equal(calls.errors.length, 1);
+    assert.deepEqual(calls.errors[0], [{ path: "/providers/0", message: "duplicate YAML key: id", code: "duplicate_field" }]);
+    assert.match(calls.announcements.at(-1), /current draft was not changed/i);
+  });
+});
+
+test("invalid client-side JSON import preserves the existing raw text and draft", async () => {
+  await withImportGlobals(() => assert.fail("invalid JSON import must not call fetch"), async () => {
+    const { editor, rawConfig, draft, calls } = makeImportEditor("keep this JSON draft\n");
+    const input = {
+      files: [{ name: "invalid.json", type: "application/json", contents: "{not-json" }],
+      value: "/fake/invalid.json"
+    };
+
+    assert.equal(await editor.importRawFile({ target: input }), false);
+    assert.equal(rawConfig.value, "keep this JSON draft\n");
+    assert.strictEqual(editor.state.draft, draft);
+    assert.equal(editor.state.rawDirty, false);
+    assert.equal(editor.state.dirty, false);
+    assert.deepEqual(calls.selectedTabs, []);
+    assert.equal(calls.errors.length, 1);
+    assert.match(calls.errors[0][0].message, /Imported JSON is invalid/);
+  });
+});
 
 test("normalizes typed and JSON-pointer field paths", () => {
   assert.equal(helpers.normalizeConfigPath("config.providers[2].models[1].public_id"), "/providers/2/models/1/public_id");

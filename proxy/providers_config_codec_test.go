@@ -83,6 +83,83 @@ func TestDecodeProvidersConfigJSONMatchesFileJSONDecoder(t *testing.T) {
 	}
 }
 
+func TestDecodeProvidersConfigYAMLMatchesFileYAMLDecoder(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		body     string
+		wantCode ConfigErrorCode
+	}{
+		{
+			name: "explicit presence and zeros",
+			body: `schema_version: 2
+providers:
+  - id: p
+    type: copilot
+    trust_domain: ""
+    classifier_no_store_supported: false
+model_routes: []
+policy_profiles: []
+tool_optimizers:
+  enabled: false
+  output_reduce:
+    enabled: false
+    timeout_ms: 0
+    min_input_bytes: 0
+    max_input_bytes: 0
+`,
+		},
+		{
+			name:     "duplicate nested field",
+			body:     "providers:\n  - id: p\n    id: q\n    type: copilot\n",
+			wantCode: ConfigErrorDuplicateField,
+		},
+		{
+			name:     "unknown nested field",
+			body:     "schema_version: 2\nproviders:\n  - id: p\n    type: copilot\n    mystery: true\n",
+			wantCode: ConfigErrorUnknownField,
+		},
+		{
+			name:     "multiple documents",
+			body:     "providers: []\n---\nproviders: []\n",
+			wantCode: ConfigErrorTrailingValue,
+		},
+		{
+			name:     "empty",
+			body:     " \n\t\n",
+			wantCode: ConfigErrorEmpty,
+		},
+		{
+			name:     "schema v2 merge key",
+			body:     "schema_version: 2\nproviders:\n  - &base\n    id: p\n    type: copilot\n  - <<: *base\n    id: q\n",
+			wantCode: ConfigErrorInvalidYAML,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var legacy ProvidersConfig
+			legacyErr := decodeProvidersConfigFile("providers.yaml", []byte(tc.body), &legacy)
+			got, gotErr := DecodeProvidersConfigYAML([]byte(tc.body))
+			if (legacyErr != nil) != (gotErr != nil) {
+				t.Fatalf("error parity mismatch: legacy=%v exported=%v", legacyErr, gotErr)
+			}
+			if gotErr != nil {
+				var typed *ConfigError
+				if !errors.As(gotErr, &typed) {
+					t.Fatalf("DecodeProvidersConfigYAML() error = %T, want *ConfigError", gotErr)
+				}
+				if typed.Code != tc.wantCode {
+					t.Fatalf("error code = %q, want %q (error %v)", typed.Code, tc.wantCode, gotErr)
+				}
+				return
+			}
+			assertProvidersConfigPresenceEqual(t, legacy, got)
+		})
+	}
+}
+
 func TestDecodeProvidersConfigJSONTypedPaths(t *testing.T) {
 	t.Parallel()
 
