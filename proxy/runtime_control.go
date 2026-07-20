@@ -320,6 +320,10 @@ func (c *runtimeControl) runApply(id, baseRevision string, cfg ProvidersConfig, 
 	}
 
 	c.setState(id, ApplyStatePersisting, "")
+	if err := ctx.Err(); err != nil {
+		c.fail(id, ctx, ApplyStateCanceled, "candidate apply canceled before persistence", err)
+		return
+	}
 	var revision string
 	var warning error
 	if reset {

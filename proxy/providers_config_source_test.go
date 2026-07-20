@@ -423,3 +423,61 @@ func TestProbeManagedProvidersConfigWritableRejectsSymlinkDirectory(t *testing.T
 		t.Fatal("ProbeManagedProvidersConfigWritable accepted a symlink directory")
 	}
 }
+
+func TestManagedProvidersConfigStoreCancellationAtIrreversibleFence(t *testing.T) {
+	t.Run("commit leaves destination unchanged", func(t *testing.T) {
+		bootstrap, err := LoadProvidersConfigBootstrap("", t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, err := NewManagedProvidersConfigStore(bootstrap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		store.beforeIrreversible = cancel
+		_, err = store.Commit(ctx, bootstrap.Revision, ProvidersConfig{Providers: []ProviderConfig{{ID: "copilot", Type: "copilot", Default: true}}})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Commit() error = %v, want context.Canceled", err)
+		}
+		if _, err := os.Stat(store.Path()); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("canceled commit replaced destination: %v", err)
+		}
+		matches, err := filepath.Glob(filepath.Join(filepath.Dir(store.Path()), ".providers-config-*.tmp"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(matches) != 0 {
+			t.Fatalf("canceled commit left temporary files: %v", matches)
+		}
+	})
+
+	t.Run("reset preserves existing override", func(t *testing.T) {
+		bootstrap, err := LoadProvidersConfigBootstrap("", t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, err := NewManagedProvidersConfigStore(bootstrap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		managed := ProvidersConfig{Providers: []ProviderConfig{{ID: "copilot", Type: "copilot", Default: true}}}
+		commit, err := store.Commit(context.Background(), bootstrap.Revision, managed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		store.beforeIrreversible = cancel
+		_, err = store.Reset(ctx, commit.Envelope.Revision)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Reset() error = %v, want context.Canceled", err)
+		}
+		resolved, err := ResolveProvidersConfig(ProvidersConfigResolveOptions{UserConfigDir: filepath.Dir(filepath.Dir(filepath.Dir(store.Path()))), Mode: ProvidersConfigUseManaged})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !resolved.Managed || resolved.Revision != commit.Envelope.Revision {
+			t.Fatalf("canceled reset changed managed state: %+v", resolved)
+		}
+	})
+}

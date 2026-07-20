@@ -112,7 +112,8 @@ type ManagedProvidersConfigResetResult struct {
 // ManagedProvidersConfigStore performs optimistic, source-fenced managed-file
 // commits for one immutable bootstrap snapshot.
 type ManagedProvidersConfigStore struct {
-	bootstrap ProvidersConfigBootstrap
+	bootstrap          ProvidersConfigBootstrap
+	beforeIrreversible func()
 }
 
 // LoadProvidersConfigBootstrap resolves an implicit-Copilot or absolute-clean
@@ -544,6 +545,9 @@ func (s *ManagedProvidersConfigStore) Commit(ctx context.Context, expectedRevisi
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	if !validSHA256Value(expectedRevision, "cfg_") {
 		err := fmt.Errorf("expected revision must use cfg_ followed by a SHA-256 hex digest")
 		return result, NewConfigError(ConfigErrorRevisionMismatch, "/revision", err.Error(), err)
@@ -652,6 +656,12 @@ func (s *ManagedProvidersConfigStore) Commit(ctx context.Context, expectedRevisi
 	if err := rejectManagedProvidersConfigDestinationAlias(s.Path(), s.bootstrap.Source.BootstrapPath); err != nil {
 		return result, err
 	}
+	if s.beforeIrreversible != nil {
+		s.beforeIrreversible()
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	if err := replaceManagedProvidersConfigFile(tmpPath, s.Path()); err != nil {
 		wrapped := fmt.Errorf("replace managed providers config %q: %w", s.Path(), err)
 		return result, NewConfigError(ConfigErrorManagedStore, "", wrapped.Error(), wrapped)
@@ -674,6 +684,9 @@ func (s *ManagedProvidersConfigStore) Reset(ctx context.Context, expectedRevisio
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
 	}
 	if !validSHA256Value(expectedRevision, "cfg_") {
 		err := fmt.Errorf("expected revision must use cfg_ followed by a SHA-256 hex digest")
@@ -710,6 +723,12 @@ func (s *ManagedProvidersConfigStore) Reset(ctx context.Context, expectedRevisio
 	}
 	if current.revision != expectedRevision {
 		return result, revisionMismatchError(expectedRevision, current.revision)
+	}
+	if s.beforeIrreversible != nil {
+		s.beforeIrreversible()
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
 	}
 	if current.envelope != nil {
 		if err := os.Remove(s.Path()); err != nil {
@@ -945,6 +964,9 @@ func resetManagedProvidersConfigUnconditionally(ctx context.Context, path string
 	if pathInfo.IsDir() {
 		err := fmt.Errorf("managed providers config %q is a directory", path)
 		return nil, NewConfigError(ConfigErrorManagedStore, "", err.Error(), err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if err := os.Remove(path); err != nil {
 		wrapped := fmt.Errorf("remove managed providers config %q: %w", path, err)
