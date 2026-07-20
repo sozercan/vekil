@@ -596,7 +596,6 @@ func refreshSessionUI() {
 	if authenticator != nil {
 		status = authenticator.Status()
 	}
-	refreshAuthMenu(status)
 
 	starting, canceling := proxyLifecycle.startupState()
 	if starting {
@@ -609,6 +608,7 @@ func refreshSessionUI() {
 		if mProvidersClear != nil {
 			mProvidersClear.Disable()
 		}
+		setAuthActionsEnabled(false)
 		if canceling {
 			mToggle.SetTitle("Stopping Vekil…")
 			mToggle.Disable()
@@ -621,6 +621,7 @@ func refreshSessionUI() {
 		return
 	}
 
+	refreshAuthMenu(status)
 	refreshProvidersMenu()
 	running := proxyLifecycle.isRunning()
 	if mDashboard != nil {
