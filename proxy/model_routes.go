@@ -396,10 +396,6 @@ func addPublicModelEntryToSnapshot(snapshot *publicModelEntryRegistrySnapshot, e
 	return nil
 }
 
-func modelRouteAliases(publicID string) []string {
-	return configuredPublicModelAliases(publicID)
-}
-
 func publicModelEntryCollisionError(alias string, existing, incoming *publicModelEntry) error {
 	return fmt.Errorf(
 		"model %q is exposed by both route %q and route %q",
@@ -407,10 +403,6 @@ func publicModelEntryCollisionError(alias string, existing, incoming *publicMode
 		publicModelEntryOwnerID(existing),
 		publicModelEntryOwnerID(incoming),
 	)
-}
-
-func modelRouteCollisionError(alias string, existing, incoming *modelRoute) error {
-	return publicModelEntryCollisionError(alias, newStaticPublicModelEntry(existing), newStaticPublicModelEntry(incoming))
 }
 
 func compileLegacyModelRoute(model providerModel, provider *providerRuntime) (*modelRoute, error) {

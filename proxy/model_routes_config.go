@@ -849,10 +849,6 @@ func providerConfigRequiresStaticModels(provider providerConfigDescriptor) bool 
 	}
 }
 
-func normalizeAndValidateModelRoute(route *ModelRouteConfig, path string) error {
-	return normalizeAndValidateModelRouteForSchema(route, path, ProvidersConfigSchemaVersion2)
-}
-
 func normalizeAndValidateModelRouteForSchema(route *ModelRouteConfig, path string, schemaVersion int) error {
 	if route == nil {
 		return configPathError(path, "is required")
