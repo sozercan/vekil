@@ -141,7 +141,7 @@ func onReady() {
 					continue
 				}
 				if proxyLifecycle.isRunning() {
-					stopProxy()
+					_ = stopProxy()
 				} else {
 					startProxy()
 				}
@@ -181,7 +181,7 @@ func onReady() {
 			case <-mQuit.ClickedCh:
 				_ = cancelProxyStartup()
 				if proxyLifecycle.isRunning() {
-					stopProxy()
+					_ = stopProxy()
 				}
 				systray.Quit()
 				return
