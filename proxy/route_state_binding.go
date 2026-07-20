@@ -41,7 +41,11 @@ func (h *ProxyHandler) applyExplicitRequestStateBinding(operation *routeOperatio
 		bootstrapOwner := stateBindingOwner{}
 		if target, ok := explicitConversationBootstrapTarget(operation.route); ok {
 			if pinned := operation.pinnedTarget(); pinned == "" || pinned == target.id {
-				bootstrapOwner = stateBindingOwner{routeID: operation.route.public.routeID, targetID: target.id, targetRevision: target.revision}
+				targetRevision := target.revision
+				if targetRevision != "" {
+					targetRevision = targetRevisionForBinding(operation.route.public, target)
+				}
+				bootstrapOwner = stateBindingOwner{routeID: operation.route.public.routeID, targetID: target.id, targetRevision: targetRevision}
 			}
 		}
 		result, bootstrapped, evictions = store.resolveOrBindConversationForRoute(
@@ -63,7 +67,7 @@ func (h *ProxyHandler) applyExplicitRequestStateBinding(operation *routeOperatio
 			h.RecordStateBindingMiss()
 			return &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("provider state is bound to an unavailable route target")}
 		}
-		if err := operation.forcePinnedTarget(result.owner.targetID); err != nil {
+		if err := operation.forcePinnedTargetRevision(result.owner.targetID, result.owner.targetRevision); err != nil {
 			return &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 		}
 		if bootstrapped {

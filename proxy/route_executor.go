@@ -205,6 +205,7 @@ type routeOperation struct {
 	remainingUpstreamSends  int
 	attemptedTargets        map[string]struct{}
 	pinnedTargetID          string
+	targetRevisions         map[string]targetRevision
 	hardPinned              bool
 	sequence                int
 	upstreamSends           int
@@ -252,6 +253,7 @@ func newRouteOperationWithID(route *modelRoute, inbound context.Context, operati
 		remainingTargetAttempts: maxTargets,
 		remainingUpstreamSends:  maxSends,
 		attemptedTargets:        make(map[string]struct{}, maxTargets),
+		targetRevisions:         make(map[string]targetRevision, maxTargets),
 		commitment:              downstreamCommitmentNone,
 		trace:                   make([]routeAttemptTrace, 0, min(maxTargets, maxRouteAttemptTrace)),
 	}
@@ -434,6 +436,10 @@ func (o *routeOperation) pinTarget(targetID string) {
 }
 
 func (o *routeOperation) forcePinnedTarget(targetID string) error {
+	return o.forcePinnedTargetRevision(targetID, "")
+}
+
+func (o *routeOperation) forcePinnedTargetRevision(targetID string, revision targetRevision) error {
 	if o == nil || strings.TrimSpace(targetID) == "" {
 		return nil
 	}
@@ -442,8 +448,42 @@ func (o *routeOperation) forcePinnedTarget(targetID string) error {
 	if o.pinnedTargetID != "" && o.pinnedTargetID != targetID {
 		return fmt.Errorf("route operation is bound to target %q, not %q", o.pinnedTargetID, targetID)
 	}
+	if revision != "" {
+		if o.targetRevisions == nil {
+			o.targetRevisions = make(map[string]targetRevision)
+		}
+		if existing := o.targetRevisions[targetID]; existing != "" && existing != revision {
+			return fmt.Errorf("route operation target %q revision changed", targetID)
+		}
+		o.targetRevisions[targetID] = revision
+	}
 	o.pinnedTargetID = targetID
 	o.hardPinned = true
+	return nil
+}
+
+func (o *routeOperation) targetRevisionExpectation(targetID string) targetRevision {
+	if o == nil {
+		return ""
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.targetRevisions[targetID]
+}
+
+func (o *routeOperation) recordTargetRevision(targetID string, revision targetRevision) error {
+	if o == nil || strings.TrimSpace(targetID) == "" || revision == "" {
+		return nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.targetRevisions == nil {
+		o.targetRevisions = make(map[string]targetRevision)
+	}
+	if existing := o.targetRevisions[targetID]; existing != "" && existing != revision {
+		return fmt.Errorf("route operation target %q revision changed", targetID)
+	}
+	o.targetRevisions[targetID] = revision
 	return nil
 }
 
@@ -3011,7 +3051,18 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			break
 		}
 
-		req, err := h.newProviderJSONRequest(ctx, target.provider, http.MethodPost, dispatchPath, preparedBody, cloneSanitizedRouteHeaders(extraHeaders), "", owner)
+		requestCtx := withTargetRevisionRequest(ctx, route.public, target, operation.targetRevisionExpectation(target.id))
+		req, err := h.newProviderJSONRequest(requestCtx, target.provider, http.MethodPost, dispatchPath, preparedBody, cloneSanitizedRouteHeaders(extraHeaders), "", owner)
+		requestRevision := targetRevision("")
+		if err == nil {
+			var ok bool
+			requestRevision, ok = targetRevisionFromRequest(req)
+			if !ok {
+				err = &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("explicit route request is missing target revision attribution")}
+			} else if revisionErr := operation.recordTargetRevision(target.id, requestRevision); revisionErr != nil {
+				err = &providerRequestError{statusCode: http.StatusServiceUnavailable, err: revisionErr}
+			}
+		}
 		if err != nil {
 			failure := routeAttemptFailure{err: err, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedNonretryable}
 			failures = append(failures, failure)
@@ -3023,7 +3074,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			publicID:       route.public.id,
 			targetID:       target.id,
 			providerID:     target.provider.id,
-			targetRevision: targetRevisionForBinding(route.public, target),
+			targetRevision: requestRevision,
 		}))
 		req.GetBody = nil
 

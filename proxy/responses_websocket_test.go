@@ -8200,7 +8200,7 @@ func TestResponsesWebSocketTargetPinValidatesPhysicalRevision(t *testing.T) {
 
 	session := &responsesWebSocketSession{}
 	original := newRoute("https://same.example.invalid/v1")
-	if err := session.pinExplicitRouteTarget(original, pinOperation(t, original)); err != nil {
+	if err := session.pinExplicitRouteTarget(original, pinOperation(t, original), targetRevisionForBinding(original.public, original.targets[0])); err != nil {
 		t.Fatalf("initial pin error = %v", err)
 	}
 	if session.explicitTargetRevision == "" || session.explicitTargetRevision != original.targets[0].revision {
@@ -8208,7 +8208,7 @@ func TestResponsesWebSocketTargetPinValidatesPhysicalRevision(t *testing.T) {
 	}
 
 	compatible := newRoute("https://same.example.invalid/v1")
-	if err := session.pinExplicitRouteTarget(compatible, pinOperation(t, compatible)); err != nil {
+	if err := session.pinExplicitRouteTarget(compatible, pinOperation(t, compatible), targetRevisionForBinding(compatible.public, compatible.targets[0])); err != nil {
 		t.Fatalf("compatible pin error = %v", err)
 	}
 
@@ -8216,7 +8216,7 @@ func TestResponsesWebSocketTargetPinValidatesPhysicalRevision(t *testing.T) {
 	if changed.targets[0].revision == session.explicitTargetRevision {
 		t.Fatal("changed physical target retained the pinned revision")
 	}
-	err := session.pinExplicitRouteTarget(changed, pinOperation(t, changed))
+	err := session.pinExplicitRouteTarget(changed, pinOperation(t, changed), targetRevisionForBinding(changed.public, changed.targets[0]))
 	if err == nil || !strings.Contains(err.Error(), "physical target changed") {
 		t.Fatalf("changed target pin error = %v, want physical-target mismatch", err)
 	}

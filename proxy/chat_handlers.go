@@ -740,6 +740,13 @@ func convertedExplicitChatSafeHeaders(resp *http.Response, publicModel string) h
 }
 
 func explicitResponsesChatReplayRoute(route *modelRoute, target targetBinding) responsesChatReplayRoute {
+	if route == nil {
+		return responsesChatReplayRoute{}
+	}
+	return explicitResponsesChatReplayRouteWithRevision(route, target, targetRevisionForBinding(route.public, target))
+}
+
+func explicitResponsesChatReplayRouteWithRevision(route *modelRoute, target targetBinding, revision targetRevision) responsesChatReplayRoute {
 	if route == nil || target.provider == nil {
 		return responsesChatReplayRoute{}
 	}
@@ -751,7 +758,7 @@ func explicitResponsesChatReplayRoute(route *modelRoute, target targetBinding) r
 		ProviderID:     target.provider.id,
 		PublicModel:    route.public.id,
 		UpstreamModel:  upstreamModel,
-		TargetRevision: targetRevisionForBinding(route.public, target),
+		TargetRevision: revision,
 	}
 }
 
@@ -761,19 +768,21 @@ func isMissingResponsesChatReplayError(err error) bool {
 }
 
 func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOperation, route *modelRoute, chatBody []byte, options chatExecutionOptions) (responsesChatRequestPlan, targetBinding, error) {
-	translateForTarget := func(target targetBinding) (responsesChatRequestPlan, error) {
-		return translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
+	translateForTarget := func(target targetBinding) (responsesChatRequestPlan, responsesChatReplayRoute, error) {
+		replayRoute := explicitResponsesChatReplayRoute(route, target)
+		plan, err := translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
 			UpstreamModel:       route.public.id,
 			ReplayStore:         h.responsesChatReplayStore(),
-			ReplayRoute:         explicitResponsesChatReplayRoute(route, target),
+			ReplayRoute:         replayRoute,
 			MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
 			DropSamplingParams:  options.ResponsesDropSamplingParams,
 		})
+		return plan, replayRoute, err
 	}
 
 	if !chatRequestContainsResponsesReplayID(chatBody) {
 		target, _ := route.primaryTarget()
-		plan, err := translateForTarget(target)
+		plan, _, err := translateForTarget(target)
 		return plan, target, err
 	}
 
@@ -792,10 +801,10 @@ func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOpera
 		if target.provider == nil || !target.provider.supportsEndpoint(providerEndpointResponses) {
 			continue
 		}
-		plan, err := translateForTarget(target)
+		plan, replayRoute, err := translateForTarget(target)
 		if err == nil {
 			if operation != nil {
-				if pinErr := operation.forcePinnedTarget(target.id); pinErr != nil {
+				if pinErr := operation.forcePinnedTargetRevision(target.id, replayRoute.TargetRevision); pinErr != nil {
 					return responsesChatRequestPlan{}, target, pinErr
 				}
 			}
@@ -851,10 +860,15 @@ func (h *ProxyHandler) executeExplicitResponsesChat(ctx context.Context, route *
 		return result, nil
 	}
 
+	responseInfo, ok := explicitRouteResponseInfoFromResponse(resp)
+	if !ok || responseInfo.targetRevision == "" {
+		_ = resp.Body.Close()
+		return chatExecutionResult{}, fmt.Errorf("explicit Responses-backed Chat response has no target revision attribution")
+	}
 	responseOptions := responsesChatResponseOptions{
 		PublicModel: route.public.id,
 		ReplayStore: h.responsesChatReplayStore(),
-		ReplayRoute: explicitResponsesChatReplayRoute(route, target),
+		ReplayRoute: explicitResponsesChatReplayRouteWithRevision(route, target, responseInfo.targetRevision),
 		UsageOnly:   options.ResponsesUsageOnly,
 	}
 	if plan.Stream {

@@ -2585,6 +2585,75 @@ func TestCompactResponsesRequestInChunks_PreservesWorkerErrorAfterShutdown(t *te
 	}
 }
 
+func TestCompactResponsesRequestInChunks_UsesPinnedRuntimeForLearnedTarget(t *testing.T) {
+	const (
+		configuredTarget = 256 << 10
+		pinnedTarget     = compactUpstreamChunkBodyFloor
+	)
+
+	var calls atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary"}]}]}`))
+	})
+
+	runtimeWithProviderID := func(generation uint64, providerID string) *runtimeSnapshot {
+		setup := defaultProviderSetup(handler)
+		provider := setup.providers["copilot"]
+		delete(setup.providers, "copilot")
+		provider.id = providerID
+		setup.providers[providerID] = provider
+		setup.providerOrder = []string{providerID}
+		setup.defaultProviderID = providerID
+		return &runtimeSnapshot{
+			generation: generation,
+			providers:  setup,
+			caches:     newRuntimeCaches(),
+		}
+	}
+
+	handler.publishRuntime(runtimeWithProviderID(1, "generation-one"))
+	pinnedCtx := handler.PinRuntimeContext(context.Background())
+	handler.publishRuntime(runtimeWithProviderID(2, "generation-two"))
+
+	texts := []string{
+		"first: " + strings.Repeat("a", 40<<10),
+		"second: " + strings.Repeat("b", 40<<10),
+	}
+	requestFields, configuredChunks := compactChunkTestRequestFields(t, configuredTarget, texts)
+	_, pinnedChunks := compactChunkTestRequestFields(t, pinnedTarget, texts)
+	if len(configuredChunks) != 1 || len(pinnedChunks) != 2 {
+		t.Fatalf("test setup chunks = configured:%d pinned:%d, want 1 and 2", len(configuredChunks), len(pinnedChunks))
+	}
+
+	pinnedKey, ok := handler.compactLearnedTargetKeyForRequestContext(pinnedCtx, requestFields, providerEndpointResponses)
+	if !ok {
+		t.Fatal("expected learned-target key for pinned runtime")
+	}
+	currentKey, ok := handler.compactLearnedTargetKeyForRequestContext(context.Background(), requestFields, providerEndpointResponses)
+	if !ok {
+		t.Fatal("expected learned-target key for current runtime")
+	}
+	if pinnedKey.ProviderID != "generation-one" || currentKey.ProviderID != "generation-two" {
+		t.Fatalf("provider keys = pinned:%q current:%q", pinnedKey.ProviderID, currentKey.ProviderID)
+	}
+	if !handler.recordLearnedCompactTarget(pinnedKey, pinnedTarget) {
+		t.Fatal("expected pinned runtime learned target to be recorded")
+	}
+
+	summary, err := handler.compactResponsesRequestInChunks(pinnedCtx, requestFields, nil, 0, configuredTarget, newCompactBudget(8))
+	if err != nil {
+		t.Fatalf("compact chunk request failed: %v", err)
+	}
+	if summary != "summary" {
+		t.Fatalf("summary = %q, want summary", summary)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("upstream calls = %d, want 2 pinned-target chunks plus merge", got)
+	}
+}
+
 func TestCompactResponsesRequestInChunks_ResplitsUnsentFanoutAfterLearnedTarget(t *testing.T) {
 	const targetBodySize = 160 << 10
 	rejectAbove := targetBodySize / 2

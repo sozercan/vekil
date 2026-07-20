@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -91,7 +92,116 @@ func targetCredentialFingerprint(value string) string {
 	return base64.RawURLEncoding.EncodeToString(encoder.sum())
 }
 
+// targetOpenAICodexCredentialsFingerprint binds the exact account/principal
+// identity used to authenticate one request behind the process-keyed HMAC used
+// by target revisions. Access-token rotation stays stable when a durable
+// account or subject is available; otherwise the exact bearer token is the
+// fail-closed identity fallback.
+func targetOpenAICodexCredentialsFingerprint(credentials openAICodexCredentials) string {
+	encoder := newTargetRevisionEncoder("openai-codex-auth-fingerprint-v1")
+	encoder.writeString("status", "loaded")
+	encoder.writeString("account_id", credentials.accountID)
+	encoder.writeString("subject", credentials.subject)
+	encoder.writeBool("fedramp", credentials.fedRAMP)
+	if credentials.accountID == "" && credentials.subject == "" {
+		encoder.writeString("credential_fallback", targetCredentialFingerprint(credentials.accessToken))
+	}
+	return base64.RawURLEncoding.EncodeToString(encoder.sum())
+}
+
+// targetOpenAICodexAuthFingerprint resolves the current file-backed identity for
+// pre-dispatch continuation validation. The final request revision is derived
+// again from the exact credentials acquired for that request.
+func targetOpenAICodexAuthFingerprint(auth *openAICodexAuth) string {
+	if auth == nil {
+		return ""
+	}
+
+	state, err := auth.readIdentityState()
+	if err != nil {
+		encoder := newTargetRevisionEncoder("openai-codex-auth-fingerprint-v1")
+		encoder.writeString("status", "unavailable")
+		return base64.RawURLEncoding.EncodeToString(encoder.sum())
+	}
+	return targetOpenAICodexCredentialsFingerprint(openAICodexCredentialsFromTokens(state.tokens))
+}
+
+type providerRequestAuthIdentity struct {
+	credentialFingerprint string
+}
+
+type targetRevisionRequestBinding struct {
+	contract publicModelContract
+	target   targetBinding
+	expected targetRevision
+}
+
+type targetRevisionRequestBindingContextKey struct{}
+type targetRevisionRequestValueContextKey struct{}
+
+func withTargetRevisionRequest(ctx context.Context, contract publicModelContract, target targetBinding, expected targetRevision) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, targetRevisionRequestBindingContextKey{}, targetRevisionRequestBinding{
+		contract: contract,
+		target:   target,
+		expected: expected,
+	})
+}
+
+func finalizeTargetRevisionRequest(req *http.Request, identity providerRequestAuthIdentity) (*http.Request, error) {
+	if req == nil {
+		return nil, fmt.Errorf("provider request is required")
+	}
+	binding, ok := req.Context().Value(targetRevisionRequestBindingContextKey{}).(targetRevisionRequestBinding)
+	if !ok {
+		return req, nil
+	}
+
+	revision := targetRevisionForBinding(binding.contract, binding.target)
+	if binding.target.provider != nil && binding.target.provider.kind == providerTypeOpenAICodex {
+		if identity.credentialFingerprint == "" {
+			return nil, &providerRequestError{
+				statusCode: http.StatusInternalServerError,
+				err:        fmt.Errorf("OpenAI Codex request auth identity is unavailable"),
+			}
+		}
+		revision = deriveTargetRevisionWithCredentialFingerprint(binding.contract, binding.target, identity.credentialFingerprint)
+	}
+	if binding.expected != "" && revision != binding.expected {
+		return nil, &providerRequestError{
+			statusCode: http.StatusServiceUnavailable,
+			err:        fmt.Errorf("route target auth identity changed before upstream dispatch"),
+		}
+	}
+	return req.WithContext(context.WithValue(req.Context(), targetRevisionRequestValueContextKey{}, revision)), nil
+}
+
+func targetRevisionFromRequest(req *http.Request) (targetRevision, bool) {
+	if req == nil {
+		return "", false
+	}
+	revision, ok := req.Context().Value(targetRevisionRequestValueContextKey{}).(targetRevision)
+	return revision, ok && revision != ""
+}
+
+func targetRevisionFromResponse(resp *http.Response) (targetRevision, bool) {
+	if resp == nil {
+		return "", false
+	}
+	return targetRevisionFromRequest(resp.Request)
+}
+
 func deriveTargetRevision(contract publicModelContract, target targetBinding) targetRevision {
+	return deriveTargetRevisionWithAuthOverride(contract, target, nil)
+}
+
+func deriveTargetRevisionWithCredentialFingerprint(contract publicModelContract, target targetBinding, fingerprint string) targetRevision {
+	return deriveTargetRevisionWithAuthOverride(contract, target, &fingerprint)
+}
+
+func deriveTargetRevisionWithAuthOverride(contract publicModelContract, target targetBinding, credentialFingerprint *string) targetRevision {
 	encoder := newTargetRevisionEncoder("physical-target-revision-v1")
 	provider := target.provider
 	if provider == nil {
@@ -100,7 +210,7 @@ func deriveTargetRevision(contract publicModelContract, target targetBinding) ta
 	} else {
 		encoder.writeString("provider.kind", string(provider.kind))
 		encoder.writeString("provider.destination", normalizeTargetRevisionDestination(provider.baseURL))
-		writeTargetRevisionAuth(encoder, provider)
+		writeTargetRevisionAuth(encoder, provider, credentialFingerprint)
 		encoder.writeString("provider.api_version", strings.TrimSpace(provider.apiVersion))
 		encoder.writeString("provider.token_scope", strings.TrimSpace(provider.tokenScope))
 		encoder.writeString("provider.path.chat_completions", normalizeTargetRevisionPath(provider.paths.chatCompletions))
@@ -123,6 +233,12 @@ func deriveTargetRevision(contract publicModelContract, target targetBinding) ta
 }
 
 func targetRevisionForBinding(contract publicModelContract, target targetBinding) targetRevision {
+	// Codex credentials are file-backed and may be replaced independently of a
+	// runtime config generation. Recompute their identity fence so continuations
+	// cannot cross an account/principal change at the same auth-file path.
+	if target.provider != nil && target.provider.kind == providerTypeOpenAICodex {
+		return deriveTargetRevision(contract, target)
+	}
 	if target.revision != "" {
 		return target.revision
 	}
@@ -173,27 +289,24 @@ func (h *ProxyHandler) explicitRouteTargetRevision(routeID, targetID string) (ta
 	return targetRevisionForBinding(route.public, target), true
 }
 
-func targetRevisionForResolvedChatRoute(route resolvedChatRoute) targetRevision {
+func targetRevisionBindingForResolvedChatRoute(route resolvedChatRoute) (publicModelContract, targetBinding) {
 	policy := providerRequestPolicy{
 		parallelToolCalls:      cloneBoolPtr(route.owner.parallelToolCalls),
 		dropSamplingParams:     route.owner.dropSamplingParams,
 		useMaxCompletionTokens: route.owner.useMaxCompletionTokens,
 	}
-	return deriveTargetRevision(
-		publicModelContract{
+	return publicModelContract{
 			id:        route.publicModel,
 			endpoints: append([]string(nil), route.owner.supportedEndpoints...),
 			policy:    policy,
-		},
-		targetBinding{
+		}, targetBinding{
 			provider:      route.provider,
 			upstreamModel: route.upstreamModel,
 			wirePolicy:    policy,
-		},
-	)
+		}
 }
 
-func writeTargetRevisionAuth(encoder *targetRevisionEncoder, provider *providerRuntime) {
+func writeTargetRevisionAuth(encoder *targetRevisionEncoder, provider *providerRuntime, credentialFingerprintOverride *string) {
 	if encoder == nil || provider == nil {
 		return
 	}
@@ -204,6 +317,7 @@ func writeTargetRevisionAuth(encoder *targetRevisionEncoder, provider *providerR
 	authPrefix := strings.TrimSpace(provider.authPrefix)
 	authSource := ""
 	authSourceDetail := ""
+	credentialFingerprint := targetCredentialFingerprint(provider.apiKey)
 
 	switch provider.kind {
 	case providerTypeCopilot:
@@ -238,6 +352,11 @@ func writeTargetRevisionAuth(encoder *targetRevisionEncoder, provider *providerR
 		if provider.codexAuth != nil {
 			authSourceDetail = normalizeTargetRevisionFileSource(provider.codexAuth.path)
 		}
+		if credentialFingerprintOverride != nil {
+			credentialFingerprint = *credentialFingerprintOverride
+		} else if provider.codexAuth != nil {
+			credentialFingerprint = targetOpenAICodexAuthFingerprint(provider.codexAuth)
+		}
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		if authType == "" {
 			authType = string(providerAuthTypeNone)
@@ -257,7 +376,7 @@ func writeTargetRevisionAuth(encoder *targetRevisionEncoder, provider *providerR
 	encoder.writeString("provider.auth.source_detail", authSourceDetail)
 	encoder.writeString("provider.auth.header", strings.ToLower(http.CanonicalHeaderKey(authHeader)))
 	encoder.writeString("provider.auth.prefix", authPrefix)
-	encoder.writeString("provider.auth.credential_fingerprint", targetCredentialFingerprint(provider.apiKey))
+	encoder.writeString("provider.auth.credential_fingerprint", credentialFingerprint)
 }
 
 func writeTargetRevisionExtraHeaders(encoder *targetRevisionEncoder, headers http.Header) {

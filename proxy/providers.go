@@ -1904,16 +1904,17 @@ func appendRawQuery(rawURL, rawQuery string) string {
 	return rawURL + separator + rawQuery
 }
 
-func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *providerRuntime, endpoint string) error {
+func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *providerRuntime, endpoint string) (providerRequestAuthIdentity, error) {
+	identity := providerRequestAuthIdentity{}
 	if provider == nil {
-		return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider is required")}
+		return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider is required")}
 	}
 
 	switch provider.kind {
 	case providerTypeCopilot:
 		token, err := h.auth.GetToken(req.Context())
 		if err != nil {
-			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
+			return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
 		}
 		h.setCopilotHeadersForProvider(req, token, provider, endpoint)
 	case providerTypeAzureOpenAI:
@@ -1925,25 +1926,25 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 			req.Header.Set("api-key", provider.apiKey)
 		case providerAuthModeAzureIdentity:
 			if provider.azureToken == nil {
-				return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no Azure identity token source configured", provider.id)}
+				return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no Azure identity token source configured", provider.id)}
 			}
 			token, err := provider.azureToken.AccessToken(req.Context())
 			if err != nil {
-				return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q Azure identity auth failed: %w", provider.id, err)}
+				return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q Azure identity auth failed: %w", provider.id, err)}
 			}
 			req.Header.Set("Authorization", "Bearer "+token)
 		default:
-			return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has unsupported auth mode %q", provider.id, provider.authMode)}
+			return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has unsupported auth mode %q", provider.id, provider.authMode)}
 		}
 		req.Header.Set("Content-Type", "application/json")
 	case providerTypeOpenAICodex:
 		clearCopilotHeaders(req.Header)
 		if provider.codexAuth == nil {
-			return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no OpenAI Codex auth configured", provider.id)}
+			return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no OpenAI Codex auth configured", provider.id)}
 		}
 		credentials, err := provider.codexAuth.credentials(req.Context(), h.client)
 		if err != nil {
-			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
+			return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
 		}
 		req.Header.Set("Authorization", "Bearer "+credentials.accessToken)
 		if credentials.accountID != "" {
@@ -1953,19 +1954,20 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 			req.Header.Set("X-OpenAI-Fedramp", "true")
 		}
 		req.Header.Set("Content-Type", "application/json")
+		identity.credentialFingerprint = targetOpenAICodexCredentialsFingerprint(credentials)
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		clearCopilotHeaders(req.Header)
 		mergeHeaderValues(req.Header, provider.extraHeaders)
 		if err := applyGenericProviderAuth(req, provider); err != nil {
-			return err
+			return identity, err
 		}
 		if req.Method != http.MethodGet {
 			req.Header.Set("Content-Type", "application/json")
 		}
 	default:
-		return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("unsupported provider type %q", provider.kind)}
+		return identity, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("unsupported provider type %q", provider.kind)}
 	}
-	return nil
+	return identity, nil
 }
 
 func applyGenericProviderAuth(req *http.Request, provider *providerRuntime) error {
@@ -2064,10 +2066,11 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 	if len(extraHeaders) > 0 {
 		mergeHeaderValues(req.Header, extraHeaders)
 	}
-	if err := h.applyProviderHeaders(req, provider, path); err != nil {
+	authIdentity, err := h.applyProviderHeaders(req, provider, path)
+	if err != nil {
 		return nil, err
 	}
-	return req, nil
+	return finalizeTargetRevisionRequest(req, authIdentity)
 }
 
 func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *providerRuntime, rawQuery, ifNoneMatch string) (providerModelsFetchResult, error) {

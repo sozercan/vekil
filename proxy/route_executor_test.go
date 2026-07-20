@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1574,4 +1576,107 @@ func TestExplicitRouteDispatchGateClosesOnInboundCancellation(t *testing.T) {
 	if calls.Load() != 0 {
 		t.Fatalf("upstream calls = %d", calls.Load())
 	}
+}
+
+func TestExplicitRouteCodexRequestIdentityFence(t *testing.T) {
+	newFixture := func(t *testing.T, transport http.RoundTripper) (*ProxyHandler, *modelRoute, string, []byte) {
+		t.Helper()
+		codexHome := t.TempDir()
+		initial := targetRevisionCodexTokens(t, time.Now().Add(time.Hour), "principal-a", "account-a", false, "fixture-a")
+		authPath := writeTestOpenAICodexAuth(t, codexHome, initial)
+		replacementHome := t.TempDir()
+		replacement := targetRevisionCodexTokens(t, time.Now().Add(time.Hour), "principal-b", "account-b", false, "fixture-b")
+		replacementPath := writeTestOpenAICodexAuth(t, replacementHome, replacement)
+		replacementBody, err := os.ReadFile(replacementPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		provider := &providerRuntime{
+			id:        "codex",
+			kind:      providerTypeOpenAICodex,
+			baseURL:   "https://codex.example.invalid",
+			codexAuth: &openAICodexAuth{path: authPath, sharedStateKey: t.Name()},
+			paths: providerEndpointPaths{
+				responses: providerEndpointResponses,
+				models:    providerEndpointModels,
+			},
+		}
+		client := &http.Client{Transport: transport}
+		h, route := explicitRouteTestHandler(t, client, routeModePrimaryOnly, 1, 1, provider)
+		return h, route, authPath, replacementBody
+	}
+
+	t.Run("rejects identity switch after continuation validation", func(t *testing.T) {
+		var calls atomic.Int32
+		h, route, authPath, replacementBody := newFixture(t, routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return nil, errors.New("request must not be dispatched")
+		}))
+		target := route.targets[0]
+		expected := targetRevisionForBinding(route.public, target)
+		operation := newRouteOperation(route, context.Background())
+		if err := operation.forcePinnedTargetRevision(target.id, expected); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(authPath, replacementBody, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx := withRouteOperation(context.Background(), operation)
+		resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model","input":"hello"}`), nil, "public-model", false)
+		if resp != nil {
+			_ = resp.Body.Close()
+			t.Fatalf("response = %#v, want none", resp)
+		}
+		if err == nil || !strings.Contains(err.Error(), "auth identity changed before upstream dispatch") {
+			t.Fatalf("execute error = %v, want auth-identity fence", err)
+		}
+		if got := calls.Load(); got != 0 {
+			t.Fatalf("upstream calls = %d, want 0", got)
+		}
+	})
+
+	t.Run("response attribution retains acquired identity", func(t *testing.T) {
+		var authPath string
+		var replacementBody []byte
+		var switchErr error
+		transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if got := req.Header.Get("ChatGPT-Account-ID"); got != "account-a" {
+				return nil, fmt.Errorf("ChatGPT-Account-ID = %q, want account-a", got)
+			}
+			switchErr = os.WriteFile(authPath, replacementBody, 0o600)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"id":"resp","object":"response","status":"completed","model":"physical-model","output":[]}`)),
+				Request:    req,
+			}, nil
+		})
+		h, route, fixtureAuthPath, fixtureReplacementBody := newFixture(t, transport)
+		authPath = fixtureAuthPath
+		replacementBody = fixtureReplacementBody
+		target := route.targets[0]
+		acquiredRevision := targetRevisionForBinding(route.public, target)
+		operation := newRouteOperation(route, context.Background())
+		ctx := withRouteOperation(context.Background(), operation)
+
+		resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model","input":"hello"}`), nil, "public-model", false)
+		if err != nil {
+			t.Fatalf("executeExplicitRouteRequest() error = %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if switchErr != nil {
+			t.Fatal(switchErr)
+		}
+		info, ok := explicitRouteResponseInfoFromResponse(resp)
+		if !ok {
+			t.Fatal("response is missing explicit route attribution")
+		}
+		if info.targetRevision != acquiredRevision {
+			t.Fatalf("response target revision = %q, want acquired %q", info.targetRevision, acquiredRevision)
+		}
+		if current := targetRevisionForBinding(route.public, target); current == acquiredRevision {
+			t.Fatalf("current target revision = %q, want switched identity", current)
+		}
+	})
 }

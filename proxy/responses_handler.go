@@ -1343,10 +1343,6 @@ func (h *ProxyHandler) compactResponsesRequest(ctx context.Context, requestField
 	return summary, resp, err
 }
 
-func (h *ProxyHandler) learnedCompactTargetForRequest(requestFields map[string]json.RawMessage, configuredTarget int) (int, bool) {
-	return h.learnedCompactTargetForRequestContext(context.Background(), requestFields, configuredTarget)
-}
-
 func (h *ProxyHandler) learnedCompactTargetForRequestContext(ctx context.Context, requestFields map[string]json.RawMessage, configuredTarget int) (int, bool) {
 	key, ok := h.compactLearnedTargetKeyForRequestContext(ctx, requestFields, "/responses")
 	if !ok {
@@ -1637,7 +1633,7 @@ func (h *ProxyHandler) compactResponsesRequestInChunks(ctx context.Context, requ
 	// 413 forces re-splitting) inherit prior shrinkage instead of replanning
 	// at the original too-large size.
 	targetBodySize = budget.adjustTarget(targetBodySize)
-	if learnedTarget, learned := h.learnedCompactTargetForRequest(requestFields, targetBodySize); learned {
+	if learnedTarget, learned := h.learnedCompactTargetForRequestContext(ctx, requestFields, targetBodySize); learned {
 		targetBodySize = learnedTarget
 	}
 

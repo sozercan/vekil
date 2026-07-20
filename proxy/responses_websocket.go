@@ -1213,11 +1213,11 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 			err:        fmt.Errorf("pinned responses websocket route target %q changed", s.explicitTargetID),
 		}
 	}
-	if err := operation.forcePinnedTarget(s.explicitTargetID); err != nil {
-		return routedCtx, operation, route, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
-	}
 	if s.explicitTargetRevision == "" {
 		s.explicitTargetRevision = currentRevision
+	}
+	if err := operation.forcePinnedTargetRevision(s.explicitTargetID, s.explicitTargetRevision); err != nil {
+		return routedCtx, operation, route, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
 	// Prior websocket frames commit the session to this exact target. Mark the
 	// per-turn operation committed before dispatch so the shared executor cannot
@@ -1226,7 +1226,7 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 	return routedCtx, operation, route, nil
 }
 
-func (s *responsesWebSocketSession) pinExplicitRouteTarget(route *modelRoute, operation *routeOperation) error {
+func (s *responsesWebSocketSession) pinExplicitRouteTarget(route *modelRoute, operation *routeOperation, requestRevision targetRevision) error {
 	if operation == nil {
 		return nil
 	}
@@ -1237,24 +1237,25 @@ func (s *responsesWebSocketSession) pinExplicitRouteTarget(route *modelRoute, op
 	if targetID == "" {
 		return fmt.Errorf("explicit responses websocket route did not select a target")
 	}
-	target, ok := route.targetByID(targetID)
-	if !ok {
+	if _, ok := route.targetByID(targetID); !ok {
 		return fmt.Errorf("selected responses websocket route target %q is unavailable", targetID)
 	}
-	currentRevision := targetRevisionForBinding(route.public, target)
+	if requestRevision == "" {
+		return fmt.Errorf("selected responses websocket route target %q has no request revision", targetID)
+	}
 	if s.explicitRouteID != "" && s.explicitRouteID != route.public.routeID {
 		return fmt.Errorf("responses websocket session route changed after target pinning")
 	}
 	if s.explicitTargetID != "" && s.explicitTargetID != targetID {
 		return fmt.Errorf("responses websocket session target changed from %q to %q", s.explicitTargetID, targetID)
 	}
-	if s.explicitTargetRevision != "" && s.explicitTargetRevision != currentRevision {
+	if s.explicitTargetRevision != "" && s.explicitTargetRevision != requestRevision {
 		return fmt.Errorf("responses websocket session physical target changed after target pinning")
 	}
 	operation.pinTarget(targetID)
 	s.explicitRouteID = route.public.routeID
 	s.explicitTargetID = targetID
-	s.explicitTargetRevision = currentRevision
+	s.explicitTargetRevision = requestRevision
 	return nil
 }
 
@@ -1385,7 +1386,11 @@ func (s *responsesWebSocketSession) prepareExplicitRouteSuccessResponse(h *Proxy
 	if isLocalResponsesWebSocketCompactionResponse(plan, operation) {
 		return nil
 	}
-	if err := s.pinExplicitRouteTarget(route, operation); err != nil {
+	info, err := explicitResponsesWebSocketResponseInfo(resp, route, operation)
+	if err != nil {
+		return err
+	}
+	if err := s.pinExplicitRouteTarget(route, operation, info.targetRevision); err != nil {
 		return err
 	}
 	return prepareExplicitResponsesWebSocketResponse(h, resp, route, operation)
@@ -2013,7 +2018,7 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, req
 	ctx = markRetryStatsTracked(ctx)
 	if operation != nil {
 		if s.explicitTargetID != "" {
-			if err := operation.forcePinnedTarget(s.explicitTargetID); err != nil {
+			if err := operation.forcePinnedTargetRevision(s.explicitTargetID, s.explicitTargetRevision); err != nil {
 				cancel()
 				h.log.Debug("responses websocket auto-compaction target pin failed", logger.Err(err))
 				return metrics, responsesUsage{}
