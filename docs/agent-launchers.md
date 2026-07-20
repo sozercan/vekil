@@ -58,6 +58,8 @@ Every launcher:
 8. forwards signals and supervises the managed child process group or Job Object;
 9. prints a usage summary and stops the proxy when the agent exits.
 
+The ephemeral proxy scopes policy-controller construction and live classifier preflight to the selected public model (including its configured aliases). Unrelated policy profiles cannot require credentials, send classifier preflights, or fail startup for that managed session.
+
 ## Common options
 
 | Flag | Purpose |

@@ -33,7 +33,7 @@ Release asset and updater-secret details live in [Development](development.md#re
 
 ## Menu Features
 
-- start/stop the proxy
+- start/stop the proxy; while authentication or policy preflight is running, the item changes to **Cancel Starting Vekil** so startup can be aborted without blocking Quit or other tray events
 - status icon and tooltip for running/stopped state
 - **Open Dashboard** — opens the live [traffic dashboard](dashboard.md) in your browser (enabled while Vekil is running)
 - current app version
@@ -59,6 +59,8 @@ Use `Choose Providers Config…` to select the same JSON/YAML file you would pas
 `Reset Dashboard Override` deletes only the source-scoped managed override for the selected bootstrap, reloads the bootstrap, and restarts Vekil if it was running. It is also the pre-start recovery action for a managed/bootstrap conflict or malformed managed envelope. `Use Default Copilot Routing` is different: it clears the selected file and changes the bootstrap identity to `implicit-copilot`, which has its own independent managed override.
 
 The menubar server exposes full config reads/writes only while it is running on its loopback listener and the user configuration directory is writable. If persistence is unavailable, the editor remains available as a redacted read-only view. See [Local Dashboard Configuration](dashboard-config.md) for managed precedence, secret storage, optimistic apply/reset, and security rules.
+
+Startup authentication and semantic-policy classifier preflight run in a cancellable worker. Provider-config and authentication actions are temporarily disabled while that worker is active, while Quit and the other tray events remain responsive. Use **Cancel Starting Vekil** to abort startup; Vekil closes any listener opened by the canceled attempt before an automatic config restart can begin.
 
 ## Linux Tray
 

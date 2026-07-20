@@ -206,7 +206,7 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 	requestRevision, ok := targetRevisionFromResponse(resp)
 	if !ok {
 		_ = resp.Body.Close()
-		return chatExecutionResult{}, fmt.Errorf("Responses-backed Chat response has no target revision attribution")
+		return chatExecutionResult{}, fmt.Errorf("responses-backed Chat response has no target revision attribution")
 	}
 	replayRoute.TargetRevision = requestRevision
 	result := chatExecutionResult{
