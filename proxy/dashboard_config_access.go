@@ -2,13 +2,9 @@ package proxy
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/base64"
-	"net/http"
 	"strings"
 )
-
-const dashboardConfigCSRFHeader = "X-Vekil-CSRF"
 
 type dashboardConfigAccessState struct {
 	available bool
@@ -75,15 +71,6 @@ func (h *ProxyHandler) dashboardConfigCSRFToken() string {
 // no-store same-origin config response.
 func (h *ProxyHandler) DashboardConfigCSRFToken() string {
 	return h.dashboardConfigCSRFToken()
-}
-
-func (h *ProxyHandler) dashboardConfigCSRFMatches(r *http.Request) bool {
-	if h == nil || r == nil {
-		return false
-	}
-	expected := h.dashboardConfigCSRFToken()
-	provided := strings.TrimSpace(r.Header.Get(dashboardConfigCSRFHeader))
-	return expected != "" && len(expected) == len(provided) && subtle.ConstantTimeCompare([]byte(expected), []byte(provided)) == 1
 }
 
 func (h *ProxyHandler) DashboardConfigPersistenceWritable() bool {

@@ -396,6 +396,7 @@ func (h *ProxyHandler) WaitRuntimeCommit(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
 		h.runtimeCommitMu.Lock()
+		_ = h.runtime.Load()
 		h.runtimeCommitMu.Unlock()
 		close(done)
 	}()
@@ -943,11 +944,13 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 	if initialRevision == "" {
 		initialRevision = runtimeRevisionFromConfig(initialConfig)
 	}
+	initialManagedActive := h.dashboardConfigSource != nil && h.dashboardConfigSource.resolved.Managed
 	initialSnapshot := &runtimeSnapshot{
-		generation: 1,
-		revision:   initialRevision,
-		config:     initialConfig,
-		providers:  h.providersState,
+		generation:    1,
+		revision:      initialRevision,
+		config:        initialConfig,
+		managedActive: initialManagedActive,
+		providers:     h.providersState,
 		policy: &policyBinding{
 			planner:    h.chatPolicyPlanner,
 			controller: h.policyRoutingController,
@@ -1180,7 +1183,7 @@ func writeCachedModelsResponse(w http.ResponseWriter, entry cachedModelsResponse
 }
 
 func (h *ProxyHandler) storeModelsCacheEntry(cacheKey string, entry cachedModelsResponse) {
-	h.storeModelsCacheEntryFor(h.modelsCacheForContext(nil), cacheKey, entry)
+	h.storeModelsCacheEntryFor(h.modelsCacheForContext(context.Background()), cacheKey, entry)
 }
 
 func (h *ProxyHandler) storeModelsCacheEntryFor(cache *modelsCache, cacheKey string, entry cachedModelsResponse) {
@@ -1240,7 +1243,7 @@ func isCanonicalModelsQuery(rawQuery string) bool {
 }
 
 func (h *ProxyHandler) replaceModelsCacheWithCanonical(entry cachedModelsResponse) {
-	h.replaceModelsCacheWithCanonicalFor(h.modelsCacheForContext(nil), entry)
+	h.replaceModelsCacheWithCanonicalFor(h.modelsCacheForContext(context.Background()), entry)
 }
 
 func (h *ProxyHandler) replaceModelsCacheWithCanonicalFor(cache *modelsCache, entry cachedModelsResponse) {
@@ -1310,7 +1313,7 @@ func (h *ProxyHandler) ensureCanonicalModelsCacheEntryFor(cache *modelsCache, ct
 }
 
 func (h *ProxyHandler) canonicalModelsCacheState(now time.Time) (cachedModelsResponse, bool, error) {
-	return canonicalModelsCacheStateFor(h.modelsCacheForContext(nil), now)
+	return canonicalModelsCacheStateFor(h.modelsCacheForContext(context.Background()), now)
 }
 
 func canonicalModelsCacheStateFor(cache *modelsCache, now time.Time) (cachedModelsResponse, bool, error) {
@@ -1328,7 +1331,7 @@ func canonicalModelsCacheStateFor(cache *modelsCache, now time.Time) (cachedMode
 }
 
 func (h *ProxyHandler) recordCanonicalModelsRefreshFailure(now time.Time, err error) {
-	recordCanonicalModelsRefreshFailureFor(h.modelsCacheForContext(nil), now, err)
+	recordCanonicalModelsRefreshFailureFor(h.modelsCacheForContext(context.Background()), now, err)
 }
 
 func recordCanonicalModelsRefreshFailureFor(cache *modelsCache, now time.Time, err error) {
@@ -1342,7 +1345,7 @@ func recordCanonicalModelsRefreshFailureFor(cache *modelsCache, now time.Time, e
 }
 
 func (h *ProxyHandler) clearCanonicalModelsRefreshFailure() {
-	clearCanonicalModelsRefreshFailureFor(h.modelsCacheForContext(nil))
+	clearCanonicalModelsRefreshFailureFor(h.modelsCacheForContext(context.Background()))
 }
 
 func clearCanonicalModelsRefreshFailureFor(cache *modelsCache) {

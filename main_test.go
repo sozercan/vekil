@@ -514,7 +514,11 @@ func TestNewServeServerWiresDashboardConfigSourceAndMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET dashboard config: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("close dashboard config response body: %v", err)
+		}
+	}()
 	var body struct {
 		Capability struct {
 			Available bool   `json:"available"`

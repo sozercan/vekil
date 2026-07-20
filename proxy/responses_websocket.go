@@ -1154,13 +1154,16 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 	if h == nil {
 		return ctx, nil, nil, fmt.Errorf("proxy handler is required")
 	}
+	if s == nil {
+		return ctx, nil, nil, fmt.Errorf("responses websocket session is required")
+	}
 	model = strings.TrimSpace(model)
 	if model != "" && !h.modelAllowedForContext(s.ctx, model, providerEndpointResponses) {
 		return ctx, nil, nil, modelNotAllowedRequestError(model)
 	}
 
 	resolved, known := resolveModelRouteForSetup(h.providerSetupForContext(s.ctx), model, providerEndpointResponses)
-	if s != nil && s.explicitRouteID != "" {
+	if s.explicitRouteID != "" {
 		if !known || resolved == nil || resolved.legacy || resolved.public.routeID != s.explicitRouteID {
 			return ctx, nil, resolved, &providerRequestError{
 				statusCode: http.StatusBadRequest,

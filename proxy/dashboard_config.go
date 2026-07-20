@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -124,7 +123,7 @@ func (h *ProxyHandler) HandleDashboardConfigRead(w http.ResponseWriter, r *http.
 			BootstrapPath:   source.BootstrapPath,
 			BootstrapDigest: source.BootstrapDigest,
 			ManagedPath:     source.ManagedPath,
-			ManagedActive:   h.dashboardConfigSource.resolved.Managed || snapshot.revision != h.dashboardConfigSource.resolved.Bootstrap.Revision,
+			ManagedActive:   snapshot.managedActive,
 		}
 	}
 	w.Header().Set("ETag", strconv.Quote(snapshot.revision))
@@ -410,10 +409,6 @@ func (h *ProxyHandler) dashboardPolicyView(snapshot *runtimeSnapshot) *dashboard
 		view.Profiles = append(view.Profiles, dashboardConfigPolicyProfile{ID: profile.ID, PublicID: profile.PublicID, ConfiguredMode: profile.Mode, EffectiveMode: effective})
 	}
 	return view
-}
-
-func (h *ProxyHandler) dashboardConfigDebugString() string {
-	return fmt.Sprintf("generation=%d revision=%s", h.runtimeGeneration(), h.runtimeRevision())
 }
 
 func dashboardPolicyEligibilityForSnapshot(snapshot *runtimeSnapshot) *dashboardPolicyEligibility {

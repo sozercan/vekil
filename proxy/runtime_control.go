@@ -330,6 +330,7 @@ func (c *runtimeControl) runApply(id, baseRevision string, cfg ProvidersConfig, 
 		}
 		revision = result.Revision
 		warning = result.DurabilityWarning
+		candidate.managedActive = false
 	} else {
 		result, err := c.source.store.Commit(ctx, baseRevision, candidate.config)
 		if err != nil {
@@ -338,6 +339,7 @@ func (c *runtimeControl) runApply(id, baseRevision string, cfg ProvidersConfig, 
 		}
 		revision = result.Envelope.Revision
 		warning = result.DurabilityWarning
+		candidate.managedActive = true
 	}
 
 	candidate.revision = revision

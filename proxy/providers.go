@@ -512,7 +512,7 @@ func defaultProviderSetup(h *ProxyHandler) *providerSetup {
 }
 
 func (h *ProxyHandler) providerSetup() *providerSetup {
-	return h.providerSetupForContext(nil)
+	return h.providerSetupForContext(context.Background())
 }
 
 func (h *ProxyHandler) hasClosedConfiguredModelRegistry() bool {

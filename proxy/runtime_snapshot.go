@@ -17,11 +17,12 @@ type runtimeSnapshot struct {
 	generation uint64
 	revision   string
 
-	config    ProvidersConfig
-	providers *providerSetup
-	policy    *policyBinding
-	readiness activeRuntimeReadiness
-	caches    *runtimeCaches
+	config        ProvidersConfig
+	managedActive bool
+	providers     *providerSetup
+	policy        *policyBinding
+	readiness     activeRuntimeReadiness
+	caches        *runtimeCaches
 }
 
 type policyBinding struct {
@@ -230,14 +231,19 @@ func (h *ProxyHandler) buildRuntimeSnapshot(ctx context.Context, cfg ProvidersCo
 	if revision == "" {
 		revision = runtimeRevisionFromConfig(cfg)
 	}
+	managedActive := false
+	if current := h.currentRuntime(); current != nil {
+		managedActive = current.managedActive
+	}
 	return &runtimeSnapshot{
-		generation: generation,
-		revision:   revision,
-		config:     cloneProvidersConfigForValidation(cfg),
-		providers:  setup,
-		policy:     binding,
-		readiness:  readiness,
-		caches:     newRuntimeCaches(),
+		generation:    generation,
+		revision:      revision,
+		config:        cloneProvidersConfigForValidation(cfg),
+		managedActive: managedActive,
+		providers:     setup,
+		policy:        binding,
+		readiness:     readiness,
+		caches:        newRuntimeCaches(),
 	}, nil
 }
 

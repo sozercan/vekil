@@ -19,9 +19,14 @@ import (
 )
 
 func newDashboardConfigTestHandler(t *testing.T) (*ProxyHandler, ResolvedProvidersConfig) {
+	return newDashboardConfigTestHandlerWithManagedStartup(t, nil)
+}
+
+func newDashboardConfigTestHandlerWithManagedStartup(t *testing.T, mutate func(*ProvidersConfig)) (*ProxyHandler, ResolvedProvidersConfig) {
 	t.Helper()
 	root := t.TempDir()
 	bootstrapPath := filepath.Join(root, "providers.json")
+	userConfigDir := filepath.Join(root, "config")
 	body := `{
   "providers": [{
     "id": "local",
@@ -38,9 +43,28 @@ func newDashboardConfigTestHandler(t *testing.T) (*ProxyHandler, ResolvedProvide
 	if err := os.WriteFile(bootstrapPath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := ResolveProvidersConfig(ProvidersConfigResolveOptions{BootstrapPath: bootstrapPath, UserConfigDir: filepath.Join(root, "config"), Mode: ProvidersConfigUseManaged})
+	resolveOptions := ProvidersConfigResolveOptions{BootstrapPath: bootstrapPath, UserConfigDir: userConfigDir, Mode: ProvidersConfigUseManaged}
+	resolved, err := ResolveProvidersConfig(resolveOptions)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if mutate != nil {
+		store, err := NewManagedProvidersConfigStore(resolved.Bootstrap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		managed := cloneProvidersConfigForValidation(resolved.Config)
+		mutate(&managed)
+		if _, err := store.Commit(context.Background(), resolved.Revision, managed); err != nil {
+			t.Fatal(err)
+		}
+		resolved, err = ResolveProvidersConfig(resolveOptions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !resolved.Managed {
+			t.Fatal("managed startup override was not resolved")
+		}
 	}
 	store, err := NewManagedProvidersConfigStore(resolved.Bootstrap)
 	if err != nil {
@@ -138,6 +162,9 @@ func TestDashboardConfigApplyPersistsThenPublishes(t *testing.T) {
 	if _, err := os.Stat(resolved.Bootstrap.Source.ManagedPath); err != nil {
 		t.Fatalf("managed file not committed: %v", err)
 	}
+	if response := readDashboardConfig(t, h); response.Source == nil || !response.Source.ManagedActive {
+		t.Fatalf("managed_active after apply = %+v, want true", response.Source)
+	}
 }
 
 func TestDashboardConfigRejectsStaleRevision(t *testing.T) {
@@ -171,6 +198,22 @@ func waitDashboardConfigApply(t *testing.T, control RuntimeControl, id string) A
 	}
 	t.Fatalf("apply %s did not finish", id)
 	return ApplyStatus{}
+}
+
+func readDashboardConfig(t *testing.T, h *ProxyHandler) dashboardConfigReadResponse {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodGet, "/dashboard/api/v1/config", nil)
+	r = h.PinRuntimeRequest(r)
+	w := httptest.NewRecorder()
+	h.HandleDashboardConfigRead(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("config read status = %d body=%s", w.Code, w.Body.String())
+	}
+	var response dashboardConfigReadResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	return response
 }
 
 func TestDashboardConfigPendingApplyKeepsActiveRuntimeAndRejectsSecondApply(t *testing.T) {
@@ -268,6 +311,30 @@ func TestDashboardConfigResetRestoresBootstrapGeneration(t *testing.T) {
 	}
 	if _, err := os.Stat(resolved.Bootstrap.Source.ManagedPath); !os.IsNotExist(err) {
 		t.Fatalf("managed override still exists after reset: %v", err)
+	}
+}
+
+func TestDashboardConfigResetClearsManagedActiveFromStartupOverride(t *testing.T) {
+	h, resolved := newDashboardConfigTestHandlerWithManagedStartup(t, func(cfg *ProvidersConfig) {
+		cfg.Providers[0].Models[0].Name = "Managed Startup Name"
+	})
+	if response := readDashboardConfig(t, h); response.Source == nil || !response.Source.ManagedActive {
+		t.Fatalf("managed_active at managed startup = %+v, want true", response.Source)
+	}
+
+	current := h.currentRuntime()
+	resetReceipt, err := h.runtimeControl.Reset(ResetRequest{BaseRevision: current.revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := waitDashboardConfigApply(t, h.runtimeControl, resetReceipt.ID); status.State != ApplyStateSucceeded {
+		t.Fatalf("reset status = %+v", status)
+	}
+	if reset := h.currentRuntime(); reset.revision != resolved.Bootstrap.Revision {
+		t.Fatalf("reset revision = %q, want %q", reset.revision, resolved.Bootstrap.Revision)
+	}
+	if response := readDashboardConfig(t, h); response.Source == nil || response.Source.ManagedActive {
+		t.Fatalf("managed_active after reset = %+v, want false", response.Source)
 	}
 }
 

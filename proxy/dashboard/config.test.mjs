@@ -144,6 +144,71 @@ test("provider secret identity normalizes the base URL and detects auth changes"
   assert.notEqual(helpers.providerSecretFingerprint(base), helpers.providerSecretFingerprint(changed));
 });
 
+
+test("provider credential change callback retains the editor instance", () => {
+  class FakeElement {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.children = [];
+      this.dataset = {};
+      this.listeners = new Map();
+      this.classList = { add() {} };
+    }
+
+    append(...children) {
+      this.children.push(...children);
+    }
+
+    appendChild(child) {
+      this.children.push(child);
+      return child;
+    }
+
+    addEventListener(type, listener) {
+      this.listeners.set(type, listener);
+    }
+
+    setAttribute(name, value) {
+      this[name] = value;
+    }
+
+    dispatch(type) {
+      const listener = this.listeners.get(type);
+      assert.ok(listener, `expected ${type} listener`);
+      listener();
+    }
+  }
+
+  const elements = [];
+  const document = {
+    createElement(tagName) {
+      const element = new FakeElement(tagName);
+      elements.push(element);
+      return element;
+    }
+  };
+  const editor = new helpers.ConfigEditor(document);
+  const provider = { id: "provider", api_key_env: "OLD_KEY" };
+  const calls = [];
+
+  editor.providerFieldSupported = (_providerType, field) => field === "api_key_env";
+  editor.providerFieldReadOnly = () => false;
+  editor.reconcileProviderSecretCompatibility = (candidate) => calls.push(["reconcile", candidate]);
+  editor.renderProviders = (index) => calls.push(["render", index]);
+
+  editor.renderProviderCredentialSection(provider, 2, "openai-compatible");
+  const input = elements.find((element) => element.tagName === "input");
+  assert.ok(input, "expected API key environment input");
+
+  input.value = "NEW_KEY";
+  input.dispatch("change");
+
+  assert.deepEqual(calls, [
+    ["reconcile", provider],
+    ["render", 2]
+  ]);
+});
+
 test("capability and apply-state helpers match the wire contract", () => {
   assert.equal(helpers.deriveWriteCapability({ available: true, writable: true, mode: "cli" }), true);
   assert.equal(helpers.deriveWriteCapability({ available: true, writable: false, reason: "read only" }), false);

@@ -440,11 +440,9 @@
   });
 
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = exportedHelpers;
+    module.exports = Object.freeze(Object.assign({}, exportedHelpers, { ConfigEditor: ConfigEditor }));
   }
   globalScope.VekilConfigHelpers = exportedHelpers;
-
-  if (typeof document === "undefined") return;
 
   function ConfigEditor(doc) {
     this.document = doc;
@@ -1532,6 +1530,7 @@
   };
 
   ConfigEditor.prototype.renderProviderCredentialSection = function (provider, index, providerType) {
+    var self = this;
     var section = this.makeElement("section", "subsection");
     var heading = this.makeElement("div", "subsection-heading");
     var headingCopy = this.makeElement("div");
@@ -3150,8 +3149,10 @@
     else this.byId("actionHint").textContent = "Validation does not change the active runtime.";
   };
 
-  document.addEventListener("DOMContentLoaded", function () {
-    var editor = new ConfigEditor(document);
-    editor.init();
-  });
+  if (typeof document !== "undefined") {
+    document.addEventListener("DOMContentLoaded", function () {
+      var editor = new ConfigEditor(document);
+      editor.init();
+    });
+  }
 })(typeof globalThis !== "undefined" ? globalThis : this);

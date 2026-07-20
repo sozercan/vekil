@@ -13,7 +13,7 @@ type policyRoutingController interface {
 }
 
 func (h *ProxyHandler) PolicyRoutingActive() bool {
-	binding := h.policyBindingForContext(nil)
+	binding := h.policyBindingForContext(context.Background())
 	return binding != nil && binding.controller != nil && binding.controller.Active()
 }
 
@@ -63,13 +63,13 @@ func (h *ProxyHandler) InitializePolicyRouting(ctx context.Context) (err error) 
 	if h == nil {
 		return nil
 	}
-	binding := h.policyBindingForContext(nil)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	binding := h.policyBindingForContext(ctx)
 	if binding == nil || binding.controller == nil || !binding.controller.Active() {
 		h.policyPreflightPending.Store(false)
 		return nil
-	}
-	if ctx == nil {
-		ctx = context.Background()
 	}
 	h.beginPolicyPreflightAttempt()
 	success := false
