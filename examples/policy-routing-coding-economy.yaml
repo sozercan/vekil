@@ -1,0 +1,117 @@
+# Schema-v2 semantic policy routing for a coding workload.
+#
+# Replace the placeholder URLs and upstream model IDs, then set:
+#   export LIGHTWEIGHT_API_KEY=...
+#   export POWERFUL_API_KEY=...
+#
+# Validate the static contract without contacting inference endpoints:
+#   vekil config validate \
+#     --providers-config examples/policy-routing-coding-economy.yaml
+#
+# Validate classifier auth, forced-tool output, and no-store behavior live:
+#   vekil config validate --live \
+#     --providers-config examples/policy-routing-coding-economy.yaml
+#
+# Observe first; the global ceiling defaults to off:
+#   vekil \
+#     --providers-config examples/policy-routing-coding-economy.yaml \
+#     --policy-routing=observe
+#
+# Policy observe/enforce is v1 single-tenant functionality. Keep the default
+# loopback bind. A remote bind requires an explicit acknowledgement and a
+# trusted external access layer; the acknowledgement does not add auth.
+
+schema_version: 2
+
+providers:
+  - id: lightweight-provider
+    type: openai-compatible
+    trust_domain: organization-ai
+    base_url: https://lightweight.example.com/v1
+    api_key_env: LIGHTWEIGHT_API_KEY
+    # The classifier uses this provider. This declaration means Vekil can send
+    # its supported non-storage option; it is not proof of provider retention.
+    classifier_no_store_supported: true
+
+  - id: powerful-provider
+    type: azure-openai
+    trust_domain: organization-ai
+    base_url: https://powerful.example.com/openai/v1
+    api_key_env: POWERFUL_API_KEY
+
+model_routes:
+  # Internal destinations prevent clients from requesting a terminal tier
+  # directly. Make a destination public only when bypass is intentional.
+  - id: lightweight-route
+    exposure: internal
+    name: Coding Lightweight
+    endpoints:
+      - /chat/completions
+    targets:
+      - id: lightweight-primary
+        provider: lightweight-provider
+        upstream_model: lightweight-model
+    routing:
+      mode: primary_only
+
+  - id: powerful-route
+    exposure: internal
+    name: Coding Powerful
+    endpoints:
+      - /chat/completions
+    targets:
+      - id: powerful-primary
+        provider: powerful-provider
+        upstream_model: powerful-model
+    routing:
+      mode: primary_only
+
+  # Classifier routes are internal-only auxiliary operations with exactly one
+  # target, one target attempt, and one physical send.
+  - id: classifier-route
+    exposure: internal
+    internal_purpose: policy_classifier
+    name: Internal Coding Classifier
+    endpoints:
+      - /chat/completions
+    targets:
+      - id: classifier-primary
+        provider: lightweight-provider
+        upstream_model: classifier-model
+    routing:
+      mode: primary_only
+      max_target_attempts: 1
+      max_upstream_sends: 1
+
+policy_profiles:
+  - id: coding-economy-policy
+    public_id: coding-economy
+    name: Coding Economy
+    # The profile may not exceed the process-wide --policy-routing ceiling.
+    mode: observe
+    model_picker_enabled: true
+    model_picker_category: versatile
+
+    lightweight_route: lightweight-route
+    powerful_route: powerful-route
+
+    baseline_tier: lightweight
+    classifier_unavailable_tier: lightweight
+    classifier_uncertain_tier: powerful
+
+    classifier:
+      route: classifier-route
+      profile: coding_agent_v1
+      timeout_ms: 3000
+      max_completion_tokens: 256
+      max_request_bytes: 16000
+      recent_turns: 4
+      max_concurrency: 4
+      observe_sample_rate: 1.0
+
+    data_policy:
+      # Classifier facts include bounded user/system text. No general redactor
+      # can guarantee that secrets embedded in that content are removed.
+      content_forwarding_acknowledged: true
+      allow_cross_trust_domain: false
+      allow_provider_retention: false

@@ -23,6 +23,8 @@ go test ./proxy/ -run TestHandle -v
 go test ./proxy/ -run TestMapStopReason/stop -v
 scripts/tests/live-smoke-reliability-test.sh  # deterministic mock-server/fake-CLI gates
 scripts/tests/live-chat-over-responses-smoke-test.sh  # deterministic Chat-over-Responses live-harness gates
+scripts/tests/live-policy-routing-smoke-test.sh  # deterministic semantic-policy process/cleanup gates
+scripts/tests/live-policy-routing-copilot-smoke-test.sh  # deterministic Copilot bridge/model-selection wrapper gate
 ```
 
 `cmd/compaction-lab` starts an in-process proxy and fake `/responses` upstream, then exercises the compact-response shape, opaque compaction replay, remote compaction v2 trigger handling, and websocket `response.processed` control frames. It is intended as a quick deterministic check for compaction regressions before running live Copilot smoke tests.
@@ -53,7 +55,7 @@ go test ./proxy/ -run 'Test(LoadProvidersConfigFile|ValidateModelRoutes|RouteRef
 
 Route-specific deterministic tests use local upstream servers plus injected transports/clocks; live provider credentials are not the merge gate. Coverage should include:
 
-- strict version-1/version-2 decoding, duplicate-key rejection, limits, feature-matrix rejection, two-pass provider/route references, normalized public-ID collisions, and `vekil config validate`;
+- strict version-1/version-2 decoding, duplicate-key rejection, limits, feature-matrix rejection, two-pass provider/route/policy references, normalized public-ID collisions, and offline `vekil config validate`;
 - legacy route catalog/unknown-model/retry compatibility and explicit route ordering/catalog identity;
 - pristine request body/header/auth construction for every target, including API-key, Entra, bearer, and custom-header switches;
 - exact target-attempt and network-send counts for normal attempts, redirects, prewrite failures, ambiguous delivery, protocol recovery, compaction/replay, and compatibility fallback;
@@ -63,6 +65,36 @@ Route-specific deterministic tests use local upstream servers plus injected tran
 - client disconnect, total deadline, shutdown, response-body cleanup, goroutine termination, and no-overlap/no-new-attempt races.
 
 For large request and replay paths, keep the `64 MiB` request boundary in the deterministic matrix and verify that operation/send budgets prevent compaction, recovery, or fallback from creating an unbounded tree.
+
+### Policy-routing safety suite
+
+Schema-v2 policy routing adds a pre-dispatch planner above native OpenAI Chat. The deterministic merge gate must use in-memory classifier adapters and local `httptest` providers; live credentials and provider availability are supplementary, never substitutes for local tests.
+
+Coverage should include:
+
+- schema-v2 route exposure, internal-route non-resolution/catalog exclusion, public-entry/operational-ID collisions, maximum profile count, field ranges, recursive-policy rejection, and schema-v2 feature-field rejection in v1;
+- terminal contract intersection, native `/chat/completions`-only destination validation, dynamic/unsupported provider rejection, and classifier one-target/one-attempt/one-send enforcement;
+- exact global/profile mode ceiling behavior, including `off` making zero preflight/classifier calls and observe never changing dispatch;
+- bounded canonical facts, UTF-8 truncation, non-text rejection, tool-name-only forwarding, total request cap, and exclusion of credentials, auth headers, provider state, replay IDs, physical routing metadata, parameter schemas, and tool arguments;
+- mandatory content-forwarding, trust-domain, cross-domain, non-storage, and retention acknowledgements;
+- strict forced `emit_policy_signals` parsing, duplicate-key/extra-field/enum/integer/trailing-content rejection, abstention, and exhaustive deterministic mapper precedence;
+- non-blocking per-profile plus global admission, no queue/backlog, partial-admission release, per-profile fairness, cancellation before terminal dispatch, and shutdown cleanup;
+- unavailable versus uncertain fallback separation, no fallback caching, infrastructure-only breaker transitions, timeout/content-output immunity, `Retry-After`, cooldown, and one half-open probe;
+- sealed operation-plan immutability, classifier/terminal budget separation, exact selected-route sends, no cross-tier fallback, and preservation of forced-stream/aggregation behavior for both tiers;
+- normalized public policy identity in Chat JSON/SSE, safe headers, errors, and metrics, with no terminal provider/route/target/deployment leakage; and
+- adversarial prompt injection, malformed output, saturation, privacy, and cross-request isolation.
+
+Run the full production gate under the race detector:
+
+```bash
+make test
+make vet
+make lint
+make build
+go test -race ./... -count=1
+```
+
+`vekil config validate` must remain offline. `vekil config validate --live` is an explicit operator smoke that uses a fixed non-user fixture to verify classifier auth/reachability, forced strict function output, non-storage request acceptance, and one physical send. Tests for that command should use controlled local providers so CI remains deterministic.
 
 ### Chat-over-Responses suite
 
@@ -86,6 +118,8 @@ go test ./proxy/ -run '^$' -bench 'BenchmarkChatOverResponses' -benchmem -count=
 ```
 
 The Chat-over-Responses benchmark regex includes permanent text-stream, fragmented function-argument, and interleaved parallel-tool cases. It also keeps the Phase 0 transport comparison available for regression work; review `ns/op`, `B/op`, and `allocs/op`, and do not introduce buffering proportional to the completed stream size.
+
+Policy-routing benchmark evidence must compare native Chat request build, forced-stream aggregation, and transport before/after the planner change. Measure `off`, admitted/dropped `observe`, and synchronous `enforce` separately. The release gate is no measurable observe-mode p95 latency regression beyond bounded fact construction, and no more than 5% p95 proxy overhead beyond synchronous classifier time. Policy selection must not add terminal execution sends.
 
 ### Model-route benchmark baseline
 
@@ -120,6 +154,25 @@ Record the full baseline SHA, candidate SHA, Go version, OS/architecture, `GOMAX
 
 `BenchmarkChatRouteLegacyDirectResolutionRequestBuild` and `BenchmarkChatRouteExplicitPriorityOneTargetRequestBuild` provide the direct legacy-versus-route request-build baseline. `BenchmarkChatRouteLegacyDirectTransport` and `BenchmarkChatRouteExplicitPrimaryOnlyTransport` add deterministic `http.Client`/`RoundTripper` dispatch coverage without network variability. `BenchmarkExplicitRoutePreparedStreamTTFT` measures held-preamble handoff and reports `ttft-ns/op`; `BenchmarkRouteAttemptStatsConcurrentContention` measures concurrent physical-attempt accounting; and `BenchmarkExplicitRouteTwoTargetFailover64MiB` verifies exactly two sends and reports allocation pressure at the maximum request boundary. These checked-in benchmarks provide the scenarios, but the ten-sample baseline/candidate `benchstat` comparison remains release evidence that must be captured on a controlled machine rather than asserted from one local run.
 
+## Policy evaluation and release evidence
+
+Policy enforcement is an operator release gate, not an automatic consequence of merging the implementation. Keep the global ceiling `off` until all evaluation criteria in [Semantic Policy Routing](policy-routing.md#evaluation-gates-before-enforcement) pass.
+
+At minimum, release evidence must include:
+
+- separate development, pilot/calibration, untouched holdout, and adversarial datasets;
+- at least 75 pilot tasks across always-lightweight, always-powerful, and the actual end-to-end policy path;
+- a documented power analysis followed by at least three independent holdout executions per task/model/policy unless more are required;
+- deterministic acceptance checks for objective coding tasks and blinded independent adjudication for subjective tasks;
+- cost including classifier/terminal calls, retries, failures, and preflight amortization;
+- at least 80% power at one-sided alpha `0.05`, a 2-point task-success non-inferiority margin, and a 0.5-point tool-validity margin versus always-powerful;
+- at least 15% mean total cost improvement, at most 5% unavailable-plus-uncertain fallback, no extra terminal sends, and zero route/credential/cancellation/budget/identity invariant failures; and
+- generation-attributable decisions plus observe sampling/admission-bias reporting.
+
+Do not use holdout results to choose the classifier, modify its prompt/schema, or tune mapping thresholds. Do not splice multi-turn policy results from independent baseline trajectories; execute the real policy end to end.
+
+After the release gate passes, require at least 5,000 completed observations per profile and 95% admission in every declared traffic bucket, then enforce one profile at a time with deployment-level 5% → 25% → 100% stateless Chat canaries. Roll back all profiles with `POLICY_ROUTING_MODE=off`. Keep direct stateful Responses/websocket traffic outside the policy canary pool or on its existing sticky topology.
+
 ## Lint
 
 ```bash
@@ -129,7 +182,7 @@ make lint
 
 ## CI
 
-GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs lint, tests, the full race detector, build, vet, a Kubernetes/kind operational smoke, and e2e validation before merge. Every core job has a job-level deadline. The test job runs [`scripts/tests/live-smoke-reliability-test.sh`](../scripts/tests/live-smoke-reliability-test.sh) with local mock servers and fake CLIs so stale-listener, timeout, per-client, and descendant-cleanup failures are deterministic, plus [`scripts/tests/live-provider-routing-smoke-test.sh`](../scripts/tests/live-provider-routing-smoke-test.sh), which builds the real binary and exercises schema-v2 two-target failover against controlled loopback Responses servers.
+GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs lint, tests, the full race detector, build, vet, a Kubernetes/kind operational smoke, and e2e validation before merge. Every core job has a job-level deadline. The test job runs [`scripts/tests/live-smoke-reliability-test.sh`](../scripts/tests/live-smoke-reliability-test.sh) with local mock servers and fake CLIs so stale-listener, timeout, per-client, and descendant-cleanup failures are deterministic, plus real-binary process harnesses: [`scripts/tests/live-provider-routing-smoke-test.sh`](../scripts/tests/live-provider-routing-smoke-test.sh) exercises schema-v2 two-target failover against controlled loopback Responses servers; [`scripts/tests/live-policy-routing-smoke-test.sh`](../scripts/tests/live-policy-routing-smoke-test.sh) exercises semantic-policy modes, classifier/terminal accounting, controlled failover, automatic non-default port selection, redaction, and process-group cleanup against local Chat-compatible shims; and [`scripts/tests/live-policy-routing-copilot-smoke-test.sh`](../scripts/tests/live-policy-routing-copilot-smoke-test.sh) verifies Copilot bridge catalog selection, secret isolation, non-default ports, and descendant cleanup without contacting Copilot.
 
 The kind smoke builds the PR image and renders the checked-in [`k8s/vekil.yaml`](../k8s/vekil.yaml), patching only the test namespace, local image/pull policy, and the deterministic provider config used in its second phase. It verifies that the `/healthz` startup probe has a coherent 60–90 second failure budget before liveness/readiness begin. It then deploys without Copilot credentials and verifies that `/healthz` remains live, the liveness probe causes zero restarts, `/readyz` stays gated, the Pod is not Ready, and the Service has no ready endpoint. Finally it rolls out a static configured provider and verifies that the same readiness probe admits the Pod and Service endpoint. The script uses an isolated kubeconfig, bounds cluster/API/port-forward work, and requires the live `kubectl port-forward` PID plus its exact listener log before accepting HTTP responses.
 
@@ -199,6 +252,81 @@ The harness generates and validates a schema-version-2 config with one fixed pub
 
 Fork and Dependabot pull requests neutral-skip because GitHub withholds repository secrets. Pull requests also neutral-skip until all eight repository variables/secrets are installed; a manual dispatch with missing configuration fails so it cannot look like a completed live run. Once configured, any controlled-target or routing failure is a hard failure—unlike the rotating Zen free tier, a configured target outage is not treated as neutral. The workflow is separate from deterministic CI. Run the same harness locally after `make build` by exporting the eight variables/secrets above.
 
+## Live Semantic Policy Routing Smoke Workflows
+
+The default pull-request check is [`Live Copilot Semantic Policy Routing Smoke`](../.github/workflows/live-policy-routing-copilot-smoke.yaml), whose uniquely named job is `semantic-policy-e2e`. It reuses the repository's existing `COPILOT_GITHUB_TOKEN` rather than requiring a second set of provider credentials. [`scripts/live-policy-routing-copilot-smoke.sh`](../scripts/live-policy-routing-copilot-smoke.sh) starts a private zero-config Vekil bridge backed by Copilot, reads its `/v1/models` catalog, selects native-Chat models, and delegates to the common [`scripts/live-policy-routing-smoke.sh`](../scripts/live-policy-routing-smoke.sh) acceptance harness.
+
+The bridge is intentional: schema-v2 policy profiles continue to reject direct dynamic `type: copilot` destinations and classifiers. The policy proxy sees only static `openai-compatible` loopback targets, so CI exercises the production policy contract without expanding the supported policy-provider matrix. The wrapper removes `COPILOT_GITHUB_TOKEN` from the delegated harness environment, gives the bridge a private token directory, auto-selects a non-default loopback port, and verifies bridge/process-group cleanup.
+
+By default the wrapper prefers these currently available model families, always requiring advertised native `/chat/completions` support and falling back to another catalog model when a preferred ID is absent:
+
+- lightweight: `gpt-5.4-mini`, `gpt-5-mini`, `gpt-4.1`, `gpt-4o`, then `claude-haiku-4.5`;
+- classifier: `gpt-4.1`, `claude-sonnet-4.6`, `claude-haiku-4.5`, then GPT-5 mini/full variants;
+- powerful primary: `gpt-5.4`, `claude-sonnet-4.6`, Codex variants, then `gpt-4.1`; and
+- powerful secondary: the first distinct compatible model from the same powerful preference set.
+
+Optional repository variables pin a model instead of using dynamic selection:
+
+- `LIVE_POLICY_ROUTING_COPILOT_LIGHTWEIGHT_MODEL`
+- `LIVE_POLICY_ROUTING_COPILOT_CLASSIFIER_MODEL`
+- `LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL`
+- `LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL`
+
+Because Vekil cannot independently attest Copilot's retention behavior, the Copilot wrapper declares `classifier_no_store_supported: false`, strips the classifier `store` field, and sets the synthetic test profile's explicit `allow_provider_retention: true` acknowledgement. The test sends only fixed synthetic content. This acknowledgement is not evidence of a provider retention guarantee.
+
+The common live matrix covers:
+
+- offline config validation followed by the explicit one-send live classifier preflight;
+- `off` mode using the configured lightweight baseline without a runtime classifier send;
+- `observe` mode serving the baseline while recording a bounded asynchronous shadow decision;
+- `enforce` mode routing a bounded one-file task to lightweight and a complex or truncated task to powerful;
+- forced function tools, tool-result continuation, and parallel distinct function calls;
+- powerful streaming with canonical public model identity and exactly one `[DONE]`;
+- retry-safe within-powerful-tier failover through a loopback validation shim that injects an authoritative precommit `429`;
+- representative local rejections with zero classifier and terminal sends; and
+- `/stats.json`, response, header, log, generation-hash, prompt/tool sentinel, upstream request-ID, and internal-topology redaction checks.
+
+In the Copilot PR gate, the powerful targets are distinct models but share one Copilot service and loopback bridge. That proves sealed tier selection, retry accounting, target switching, and public-identity behavior; it does **not** prove independent cross-provider availability.
+
+True cross-provider coverage remains available through the manual [`Live Multi-Provider Semantic Policy Routing Smoke`](../.github/workflows/live-policy-routing-smoke.yaml) workflow and its `semantic-policy-multiprovider-e2e` job. Configure these repository variables for that workflow:
+
+- `LIVE_POLICY_ROUTING_LIGHTWEIGHT_TYPE` — `azure-openai` or `openai-compatible`
+- `LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL` — the lightweight provider API base before `/chat/completions`; Azure uses the OpenAI v1 form ending in `/openai/v1`
+- `LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL` — the physical lightweight model/deployment name
+- `LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_TYPE` — `azure-openai` or `openai-compatible`
+- `LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL` — the primary powerful provider API base before `/chat/completions`
+- `LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL` — the physical primary powerful model/deployment name
+- `LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_TYPE` — `azure-openai` or `openai-compatible`
+- `LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL` — the secondary powerful provider API base before `/chat/completions`
+- `LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL` — the semantically equivalent secondary powerful model/deployment name
+- `LIVE_POLICY_ROUTING_CLASSIFIER_MODEL` — the classifier deployment on the powerful-primary provider
+- `LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED` — `true` only after confirming support; otherwise set `false` and explicitly set `LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION=true`
+- `LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION` — optional, defaults to `false`
+
+Configure these repository secrets for the manual workflow:
+
+- `LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY`
+- `LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY`
+- `LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY`
+
+The generated temporary schema-v2 config references `api_key_env` names and never embeds credential values. The powerful primary and secondary must share the same public Chat contract. A configured target outage, protocol incompatibility, classifier failure, privacy leak, wrong tier, or accounting mismatch is a hard failure.
+
+Both workflows use isolated loopback ports, reject port `1337`, retry bounded address-in-use races, and verify that every proxy, bridge, and shim listener is released. Do not change either workflow to `pull_request_target`: executing pull-request code with provider credentials would expose secrets to untrusted code. Fork PRs and Dependabot neutral-skip the Copilot check because GitHub withholds secrets; a same-repository run without `COPILOT_GITHUB_TOKEN` fails instead of looking like completed coverage. The manual multi-provider workflow fails when its configuration is missing.
+
+These smokes incur real provider cost and are bounded acceptance coverage, not the 75-task pilot/holdout or 5,000-observation production-enforcement evaluation described in the policy-routing release gate. Failure diagnostics are allowlisted, redacted, and truncated; raw generated provider configs are not uploaded.
+
+Run the Copilot-backed gate locally after `make build`:
+
+```bash
+COPILOT_GITHUB_TOKEN=... scripts/live-policy-routing-copilot-smoke.sh
+```
+
+Run the true multi-provider harness locally by exporting its variables and secrets:
+
+```bash
+scripts/live-policy-routing-smoke.sh
+```
+
 For a credential-free generic-provider check, [`scripts/live-zen-smoke.sh`](../scripts/live-zen-smoke.sh) starts the proxy on a non-default port with [`examples/opencode-zen-free.yaml`](../examples/opencode-zen-free.yaml), waits for `/readyz`, and sends one tiny chat completion per OpenCode Zen free model. It needs `curl`, `jq`, and Python for isolated automatic port allocation. Because the Zen free set rotates, the script skips only recognized transient statuses/messages and passes as long as at least one free model responds; unknown statuses and proxy-side faults are hard failures.
 
 ## Live OpenCode Zen CLI Smoke Workflow
@@ -222,16 +350,16 @@ SMOKE_PROVIDER=zen PROVIDERS_CONFIG=examples/opencode-zen-free.yaml \
   scripts/live-cli-smoke.sh
 ```
 
-## Live Copilot Smoke setup
+## Live Copilot workflows setup
 
-To use the `Live Copilot Smoke` workflow:
+The `Live Copilot Smoke` and `Live Copilot Semantic Policy Routing Smoke` workflows share one credential:
 
 1. Create a GitHub token for a user that has GitHub Copilot access.
 2. Grant that token the `Copilot Requests` permission.
 3. Save it as the repository secret `COPILOT_GITHUB_TOKEN`.
-4. Run the `Live Copilot Smoke` workflow from the Actions tab.
+4. Run either workflow from the Actions tab; same-repository pull requests run both automatically.
 
-This workflow is intentionally separate from the normal CI workflow so pull requests and forked builds remain deterministic and do not depend on live provider credentials.
+These workflows remain separate from deterministic core CI. Fork pull requests neutral-skip because GitHub does not expose repository secrets to untrusted pull-request code.
 
 You can also run the same smoke scripts locally after building `vekil`; the CLI smoke script additionally requires those three CLIs to be installed.
 
@@ -253,4 +381,5 @@ You can also run the same smoke scripts locally after building `vekil`; the CLI 
 - Keep Chat backend selection and Responses conversion inside the deep execution seam (`chat_execution.go`, `chat_route*.go`, and `chat_over_responses_*.go`); Anthropic and Gemini handlers should consume canonical Chat results rather than Responses events directly.
 - Responses-backed Chat must reject unsupported fields instead of silently dropping them, preserve opaque replay IDs/state bounds, and use the typed internal Chat event transport for streams.
 - Preserve startup failure on public-model-ID collisions. For schema version 2, add new provider/native-endpoint/surface/mode support to the compiled route feature matrix and reject unsupported combinations rather than accepting degraded routes.
+- If the provider participates in policy routing, define and validate its `trust_domain`, classifier non-storage capability, forced function-tool support, and live-preflight behavior. V1 policy destinations remain static native-Chat routes; do not silently admit dynamic, Responses-backed, Anthropic, Gemini, multimodal, or multi-tenant policy behavior.
 - Cross-link config examples in [`provider-routing.md`](provider-routing.md) instead of duplicating YAML here.

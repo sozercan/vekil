@@ -381,7 +381,13 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, 
 		}
 		if requestedModel != route.public.id {
 			resolvedAlias := false
-			if resolved, known := h.resolveModelRouteForRequest(requestedModel, path); known && resolved == route {
+			if plan, planned := operation.policyPlan(); planned {
+				if entry, known := h.providerSetup().lookupPublicModelEntry(requestedModel); known && entry != nil && entry.kind == publicEntryPolicy && entry.id == plan.publicID {
+					// Keep the request alias as the rewrite source while authorizing it
+					// against the sealed policy public identity.
+					resolvedAlias = true
+				}
+			} else if resolved, known := h.resolveModelRouteForRequest(requestedModel, path); known && resolved == route {
 				// Keep the actual alias as the rewrite source. Using the canonical
 				// public ID here can leave the alias in the immutable request body
 				// when the target upstream model is already canonical.

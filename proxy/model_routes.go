@@ -47,10 +47,19 @@ type routePolicy struct {
 }
 
 type modelRoute struct {
-	public  publicModelContract
-	targets []targetBinding
-	policy  routePolicy
-	legacy  bool
+	public          publicModelContract
+	targets         []targetBinding
+	policy          routePolicy
+	exposure        string
+	internalPurpose string
+	legacy          bool
+}
+
+func (r *modelRoute) isPublic() bool {
+	if r == nil || strings.TrimSpace(r.public.id) == "" {
+		return false
+	}
+	return r.exposure != modelRouteExposureInternal
 }
 
 func (r *modelRoute) supportsEndpoint(endpoint string) bool {
@@ -80,31 +89,44 @@ func (r *modelRoute) targetByID(id string) (targetBinding, bool) {
 }
 
 type modelRouteRegistrySnapshot struct {
-	byPublicID       map[string]*modelRoute
-	aliases          map[string]*modelRoute
+	byRouteID        map[string]*modelRoute
 	explicit         []*modelRoute
 	legacyOrder      []*modelRoute
 	legacyByProvider map[string][]*modelRoute
 	strictAliases    bool
+	policyEntries    []*publicModelEntry
+	publicEntries    *publicModelEntryRegistrySnapshot
 }
 
 type modelRouteRegistry struct {
-	snapshot atomic.Pointer[modelRouteRegistrySnapshot]
+	snapshot      atomic.Pointer[modelRouteRegistrySnapshot]
+	publicEntries *publicModelEntryRegistry
 }
 
 func newModelRouteRegistry(explicit []*modelRoute) (*modelRouteRegistry, error) {
 	registry := &modelRouteRegistry{}
+	registry.publicEntries = &publicModelEntryRegistry{routes: registry}
 	snapshot := &modelRouteRegistrySnapshot{
-		byPublicID:       make(map[string]*modelRoute, len(explicit)),
-		aliases:          make(map[string]*modelRoute, len(explicit)*2),
+		byRouteID:        make(map[string]*modelRoute, len(explicit)),
 		explicit:         append([]*modelRoute(nil), explicit...),
 		legacyByProvider: make(map[string][]*modelRoute),
 		strictAliases:    len(explicit) > 0,
 	}
 	for _, route := range explicit {
-		if err := addRouteToSnapshot(snapshot, route); err != nil {
-			return nil, err
+		if route == nil {
+			continue
 		}
+		routeID := strings.TrimSpace(route.public.routeID)
+		if routeID == "" {
+			return nil, fmt.Errorf("model route operational id is required")
+		}
+		if existing, ok := snapshot.byRouteID[routeID]; ok && existing != route {
+			return nil, fmt.Errorf("terminal route %q is declared more than once", routeID)
+		}
+		snapshot.byRouteID[routeID] = route
+	}
+	if err := rebuildPublicModelEntrySnapshot(snapshot); err != nil {
+		return nil, err
 	}
 	registry.snapshot.Store(snapshot)
 	return registry, nil
@@ -123,6 +145,28 @@ func (r *modelRouteRegistry) setStrictAliases(strict bool) {
 	r.snapshot.Store(next)
 }
 
+func (r *modelRouteRegistry) setPolicyEntries(entries []*publicModelEntry) error {
+	if r == nil {
+		return nil
+	}
+	current := r.load()
+	if current == nil {
+		return fmt.Errorf("model route registry is not initialized")
+	}
+	next := cloneRouteRegistrySnapshot(current, 0)
+	next.policyEntries = make([]*publicModelEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry != nil {
+			next.policyEntries = append(next.policyEntries, clonePublicModelEntry(entry))
+		}
+	}
+	if err := rebuildPublicModelEntrySnapshot(next); err != nil {
+		return err
+	}
+	r.snapshot.Store(next)
+	return nil
+}
+
 func (r *modelRouteRegistry) load() *modelRouteRegistrySnapshot {
 	if r == nil {
 		return nil
@@ -131,40 +175,58 @@ func (r *modelRouteRegistry) load() *modelRouteRegistrySnapshot {
 }
 
 func (r *modelRouteRegistry) lookup(publicID string) (*modelRoute, bool) {
-	snapshot := r.load()
-	if snapshot == nil {
+	if r == nil || r.publicEntries == nil {
 		return nil, false
 	}
-	publicID = strings.TrimSpace(publicID)
-	if publicID == "" {
+	entry, ok := r.publicEntries.lookupExact(publicID)
+	if !ok || entry == nil || entry.kind != publicEntryStatic || entry.route == nil {
 		return nil, false
 	}
-	route, ok := snapshot.byPublicID[publicID]
-	return route, ok
+	return entry.route, true
 }
 
 func (r *modelRouteRegistry) lookupAlias(publicID string) (*modelRoute, bool) {
+	if r == nil || r.publicEntries == nil {
+		return nil, false
+	}
+	entry, ok := r.publicEntries.lookup(publicID)
+	if !ok || entry == nil || entry.kind != publicEntryStatic || entry.route == nil {
+		return nil, false
+	}
+	return entry.route, true
+}
+
+func (r *modelRouteRegistry) lookupPublicModelEntry(model string) (*publicModelEntry, bool) {
+	if r == nil || r.publicEntries == nil {
+		return nil, false
+	}
+	return r.publicEntries.lookup(model)
+}
+
+func (r *modelRouteRegistry) lookupTerminalRoute(routeID string) (*modelRoute, bool) {
 	snapshot := r.load()
 	if snapshot == nil {
 		return nil, false
 	}
-	publicID = strings.TrimSpace(publicID)
-	if publicID == "" {
-		return nil, false
-	}
-	if route, ok := snapshot.byPublicID[publicID]; ok {
-		return route, true
-	}
-	route, ok := snapshot.aliases[publicID]
+	route, ok := snapshot.byRouteID[strings.TrimSpace(routeID)]
 	return route, ok
 }
 
+// explicitRoutes retains the catalog-facing behavior expected by the existing
+// /v1/models merger. It returns public static routes plus synthetic catalog
+// routes for policy entries, never internal terminal routes.
 func (r *modelRouteRegistry) explicitRoutes() []*modelRoute {
-	snapshot := r.load()
-	if snapshot == nil {
+	if r == nil || r.publicEntries == nil {
 		return nil
 	}
-	return append([]*modelRoute(nil), snapshot.explicit...)
+	entries := r.publicEntries.configuredEntries()
+	routes := make([]*modelRoute, 0, len(entries))
+	for _, entry := range entries {
+		if entry != nil && entry.catalogRoute != nil {
+			routes = append(routes, entry.catalogRoute)
+		}
+	}
+	return routes
 }
 
 func (r *modelRouteRegistry) replaceLegacyProvider(provider *providerRuntime, models []providerModel) error {
@@ -180,45 +242,27 @@ func (r *modelRouteRegistry) replaceLegacyProvider(provider *providerRuntime, mo
 		return fmt.Errorf("model route registry is not initialized")
 	}
 
-	next := &modelRouteRegistrySnapshot{
-		byPublicID:       make(map[string]*modelRoute, len(current.byPublicID)+len(models)),
-		aliases:          make(map[string]*modelRoute, len(current.aliases)+len(models)*2),
-		explicit:         append([]*modelRoute(nil), current.explicit...),
-		legacyByProvider: make(map[string][]*modelRoute, len(current.legacyByProvider)+1),
-		strictAliases:    current.strictAliases,
-	}
-	for _, route := range next.explicit {
-		if err := addRouteToSnapshot(next, route); err != nil {
-			return err
-		}
-	}
+	next := cloneRouteRegistrySnapshot(current, len(models))
+	next.legacyOrder = nil
+	next.legacyByProvider = make(map[string][]*modelRoute, len(current.legacyByProvider)+1)
 	for id, routes := range current.legacyByProvider {
 		if id == providerID {
 			continue
 		}
 		cloned := append([]*modelRoute(nil), routes...)
 		next.legacyByProvider[id] = cloned
-		for _, route := range cloned {
-			if err := addRouteToSnapshot(next, route); err != nil {
-				return err
-			}
-			next.legacyOrder = append(next.legacyOrder, route)
-		}
+		next.legacyOrder = append(next.legacyOrder, cloned...)
 	}
 
-	compiled := make([]*modelRoute, 0, len(models))
-	for _, model := range models {
-		route, err := compileLegacyModelRoute(model, provider)
-		if err != nil {
-			return err
-		}
-		compiled = append(compiled, route)
-		if err := addRouteToSnapshot(next, route); err != nil {
-			return err
-		}
-		next.legacyOrder = append(next.legacyOrder, route)
+	compiled, err := compileLegacyProviderRoutes(provider, models)
+	if err != nil {
+		return err
 	}
 	next.legacyByProvider[providerID] = compiled
+	next.legacyOrder = append(next.legacyOrder, compiled...)
+	if err := rebuildPublicModelEntrySnapshot(next); err != nil {
+		return err
+	}
 	r.snapshot.Store(next)
 	return nil
 }
@@ -236,37 +280,31 @@ func (r *modelRouteRegistry) addLegacyProvider(provider *providerRuntime, models
 	}
 
 	next := cloneRouteRegistrySnapshot(current, len(models))
-	compiled := make([]*modelRoute, 0, len(models))
-	for _, model := range models {
-		route, err := compileLegacyModelRoute(model, provider)
-		if err != nil {
-			return err
-		}
-		if err := addRouteToSnapshot(next, route); err != nil {
-			return err
-		}
-		compiled = append(compiled, route)
-		next.legacyOrder = append(next.legacyOrder, route)
+	compiled, err := compileLegacyProviderRoutes(provider, models)
+	if err != nil {
+		return err
 	}
 	next.legacyByProvider[provider.id] = compiled
+	next.legacyOrder = append(next.legacyOrder, compiled...)
+	if err := rebuildPublicModelEntrySnapshot(next); err != nil {
+		return err
+	}
 	r.snapshot.Store(next)
 	return nil
 }
 
 func cloneRouteRegistrySnapshot(current *modelRouteRegistrySnapshot, extra int) *modelRouteRegistrySnapshot {
 	next := &modelRouteRegistrySnapshot{
-		byPublicID:       make(map[string]*modelRoute, len(current.byPublicID)+extra),
-		aliases:          make(map[string]*modelRoute, len(current.aliases)+extra*2),
+		byRouteID:        make(map[string]*modelRoute, len(current.byRouteID)),
 		explicit:         append([]*modelRoute(nil), current.explicit...),
 		legacyOrder:      append([]*modelRoute(nil), current.legacyOrder...),
 		legacyByProvider: make(map[string][]*modelRoute, len(current.legacyByProvider)+1),
 		strictAliases:    current.strictAliases,
+		policyEntries:    append([]*publicModelEntry(nil), current.policyEntries...),
+		publicEntries:    current.publicEntries,
 	}
-	for key, route := range current.byPublicID {
-		next.byPublicID[key] = route
-	}
-	for key, route := range current.aliases {
-		next.aliases[key] = route
+	for routeID, route := range current.byRouteID {
+		next.byRouteID[routeID] = route
 	}
 	for providerID, routes := range current.legacyByProvider {
 		next.legacyByProvider[providerID] = append([]*modelRoute(nil), routes...)
@@ -274,57 +312,97 @@ func cloneRouteRegistrySnapshot(current *modelRouteRegistrySnapshot, extra int) 
 	return next
 }
 
-func addRouteToSnapshot(snapshot *modelRouteRegistrySnapshot, route *modelRoute) error {
-	if snapshot == nil || route == nil {
+func rebuildPublicModelEntrySnapshot(snapshot *modelRouteRegistrySnapshot) error {
+	if snapshot == nil {
 		return nil
 	}
-	publicID := strings.TrimSpace(route.public.id)
-	if publicID == "" {
-		return fmt.Errorf("model route public id is required")
+	public := &publicModelEntryRegistrySnapshot{
+		byID:          make(map[string]*publicModelEntry, len(snapshot.explicit)+len(snapshot.policyEntries)+len(snapshot.legacyOrder)),
+		aliases:       make(map[string]*publicModelEntry, (len(snapshot.explicit)+len(snapshot.policyEntries)+len(snapshot.legacyOrder))*2),
+		configured:    make([]*publicModelEntry, 0, len(snapshot.explicit)+len(snapshot.policyEntries)),
+		policyByID:    make(map[string]*publicModelEntry, len(snapshot.policyEntries)),
+		strictAliases: snapshot.strictAliases || len(snapshot.explicit) > 0,
 	}
-	if existing, ok := snapshot.byPublicID[publicID]; ok && existing != route {
-		return modelRouteCollisionError(publicID, existing, route)
-	}
-	strictAliases := snapshot.strictAliases || len(snapshot.explicit) > 0
-	for _, alias := range modelRouteAliases(publicID) {
-		if existing, ok := snapshot.aliases[alias]; ok && existing != route {
-			// Version-1 legacy catalogs historically allow an exact raw model and
-			// its Anthropic-normalized spelling to coexist. Preserve exact-match
-			// precedence only for provider-only snapshots. A version-2 snapshot
-			// with explicit routes enforces the global normalized namespace during
-			// dynamic refresh as well as startup validation.
-			if strictAliases || !existing.legacy || !route.legacy {
-				return modelRouteCollisionError(alias, existing, route)
-			}
-		}
-		if existing, ok := snapshot.byPublicID[alias]; ok && existing != route && (strictAliases || !existing.legacy || !route.legacy) {
-			return modelRouteCollisionError(alias, existing, route)
-		}
-	}
-	snapshot.byPublicID[publicID] = route
-	for _, alias := range modelRouteAliases(publicID) {
-		if existing, ok := snapshot.aliases[alias]; ok && existing != route && existing.legacy && route.legacy && !strictAliases {
+	for _, route := range snapshot.explicit {
+		entry := newStaticPublicModelEntry(route)
+		if entry == nil {
 			continue
 		}
-		snapshot.aliases[alias] = route
+		if err := addPublicModelEntryToSnapshot(public, entry); err != nil {
+			return err
+		}
+		public.configured = append(public.configured, entry)
+	}
+	for _, configured := range snapshot.policyEntries {
+		entry := clonePublicModelEntry(configured)
+		if entry == nil {
+			continue
+		}
+		if existing, ok := public.policyByID[entry.policyID]; ok && existing != entry {
+			return fmt.Errorf("policy profile %q is declared more than once", entry.policyID)
+		}
+		if err := addPublicModelEntryToSnapshot(public, entry); err != nil {
+			return err
+		}
+		public.policyByID[entry.policyID] = entry
+		public.configured = append(public.configured, entry)
+	}
+	for _, route := range snapshot.legacyOrder {
+		entry := newStaticPublicModelEntry(route)
+		if entry == nil {
+			continue
+		}
+		if err := addPublicModelEntryToSnapshot(public, entry); err != nil {
+			return err
+		}
+	}
+	snapshot.publicEntries = public
+	return nil
+}
+
+func addPublicModelEntryToSnapshot(snapshot *publicModelEntryRegistrySnapshot, entry *publicModelEntry) error {
+	if snapshot == nil || entry == nil {
+		return nil
+	}
+	publicID := strings.TrimSpace(entry.id)
+	if publicID == "" {
+		return fmt.Errorf("public model entry id is required")
+	}
+	if existing, ok := snapshot.byID[publicID]; ok && existing != entry {
+		return publicModelEntryCollisionError(publicID, existing, entry)
+	}
+	strictAliases := snapshot.strictAliases
+	for _, alias := range entry.aliases {
+		if existing, ok := snapshot.aliases[alias]; ok && existing != entry {
+			// Version-1 legacy catalogs historically allow an exact raw model and
+			// its Anthropic-normalized spelling to coexist. Preserve exact-match
+			// precedence only for provider-only snapshots. Version-2/3 snapshots
+			// enforce the global normalized namespace during refresh as well.
+			if strictAliases || !existing.legacy || !entry.legacy {
+				return publicModelEntryCollisionError(alias, existing, entry)
+			}
+		}
+		if existing, ok := snapshot.byID[alias]; ok && existing != entry && (strictAliases || !existing.legacy || !entry.legacy) {
+			return publicModelEntryCollisionError(alias, existing, entry)
+		}
+	}
+	snapshot.byID[publicID] = entry
+	for _, alias := range entry.aliases {
+		if existing, ok := snapshot.aliases[alias]; ok && existing != entry && existing.legacy && entry.legacy && !strictAliases {
+			continue
+		}
+		snapshot.aliases[alias] = entry
 	}
 	return nil
 }
 
-func modelRouteAliases(publicID string) []string {
-	return configuredPublicModelAliases(publicID)
-}
-
-func modelRouteCollisionError(alias string, existing, incoming *modelRoute) error {
-	existingOwner := "unknown"
-	incomingOwner := "unknown"
-	if existing != nil {
-		existingOwner = existing.public.routeID
-	}
-	if incoming != nil {
-		incomingOwner = incoming.public.routeID
-	}
-	return fmt.Errorf("model %q is exposed by both route %q and route %q", alias, existingOwner, incomingOwner)
+func publicModelEntryCollisionError(alias string, existing, incoming *publicModelEntry) error {
+	return fmt.Errorf(
+		"model %q is exposed by both route %q and route %q",
+		alias,
+		publicModelEntryOwnerID(existing),
+		publicModelEntryOwnerID(incoming),
+	)
 }
 
 func compileLegacyModelRoute(model providerModel, provider *providerRuntime) (*modelRoute, error) {
@@ -368,7 +446,8 @@ func compileLegacyModelRoute(model providerModel, provider *providerRuntime) (*m
 			maxUpstreamSends:  1,
 			legacyRetry:       true,
 		},
-		legacy: true,
+		exposure: modelRouteExposurePublic,
+		legacy:   true,
 	}, nil
 }
 
@@ -393,6 +472,27 @@ func (ps *providerSetup) lookupRouteAlias(publicID string) (*modelRoute, bool) {
 		return nil, false
 	}
 	return registry.lookupAlias(publicID)
+}
+
+// lookupPublicModelEntry resolves exact public IDs and their configured
+// normalized aliases across static and policy entries.
+func (ps *providerSetup) lookupPublicModelEntry(model string) (*publicModelEntry, bool) {
+	registry := ps.routeRegistry()
+	if registry == nil {
+		return nil, false
+	}
+	return registry.lookupPublicModelEntry(model)
+}
+
+// lookupTerminalRoute resolves an explicit terminal route by operational ID.
+// Internal routes are intentionally available here but never through the
+// client-facing static route resolver.
+func (ps *providerSetup) lookupTerminalRoute(routeID string) (*modelRoute, bool) {
+	registry := ps.routeRegistry()
+	if registry == nil {
+		return nil, false
+	}
+	return registry.lookupTerminalRoute(routeID)
 }
 
 func (h *ProxyHandler) resolveModelRouteForRequest(model, endpoint string) (*modelRoute, bool) {
@@ -428,11 +528,15 @@ func providerModelFromRouteTarget(route *modelRoute, target targetBinding) provi
 		}
 		return owner
 	}
+	parallelToolCalls := route.public.policy.parallelToolCalls
+	if target.wirePolicy.parallelToolCalls != nil {
+		parallelToolCalls = target.wirePolicy.parallelToolCalls
+	}
 	owner := providerModel{
 		publicID:               route.public.id,
 		upstreamModel:          target.upstreamModel,
 		supportedEndpoints:     append([]string(nil), route.public.endpoints...),
-		parallelToolCalls:      cloneBoolPtr(route.public.policy.parallelToolCalls),
+		parallelToolCalls:      cloneBoolPtr(parallelToolCalls),
 		dropSamplingParams:     route.public.policy.dropSamplingParams,
 		useMaxCompletionTokens: target.wirePolicy.useMaxCompletionTokens,
 		raw:                    append(json.RawMessage(nil), route.public.raw...),
@@ -451,18 +555,9 @@ func (r *modelRouteRegistry) replaceLegacyProviders(providers map[string]*provid
 	if current == nil {
 		return fmt.Errorf("model route registry is not initialized")
 	}
-	next := &modelRouteRegistrySnapshot{
-		byPublicID:       make(map[string]*modelRoute, len(current.byPublicID)),
-		aliases:          make(map[string]*modelRoute, len(current.aliases)),
-		explicit:         append([]*modelRoute(nil), current.explicit...),
-		legacyByProvider: make(map[string][]*modelRoute, len(current.legacyByProvider)+len(replacements)),
-		strictAliases:    current.strictAliases,
-	}
-	for _, route := range next.explicit {
-		if err := addRouteToSnapshot(next, route); err != nil {
-			return err
-		}
-	}
+	next := cloneRouteRegistrySnapshot(current, 0)
+	next.legacyOrder = nil
+	next.legacyByProvider = make(map[string][]*modelRoute, len(current.legacyByProvider)+len(replacements))
 
 	seenProviders := make(map[string]struct{}, len(current.legacyByProvider)+len(replacements))
 	emitProvider := func(providerID string) error {
@@ -485,29 +580,17 @@ func (r *modelRouteRegistry) replaceLegacyProviders(providers map[string]*provid
 			routes = append([]*modelRoute(nil), currentRoutes...)
 		}
 
-		for _, route := range routes {
-			if err := addRouteToSnapshot(next, route); err != nil {
-				return err
-			}
-			next.legacyOrder = append(next.legacyOrder, route)
-		}
+		next.legacyOrder = append(next.legacyOrder, routes...)
 		next.legacyByProvider[providerID] = routes
 		seenProviders[providerID] = struct{}{}
 		return nil
 	}
 
-	// Rebuild configured providers in their original order. This matches normal
-	// startup and preserves version-1's historical first-alias winner when a
-	// deferred catalog introduces normalized Messages aliases. Strict version-2
-	// snapshots still reject the same collision before this snapshot is stored.
 	for _, providerID := range providerOrder {
 		if err := emitProvider(providerID); err != nil {
 			return err
 		}
 	}
-
-	// Preserve the established order of unchanged providers that are not present
-	// in providerOrder. Replaced providers wait for the sorted fallback below.
 	for _, route := range current.legacyOrder {
 		if route == nil || len(route.targets) == 0 || route.targets[0].provider == nil {
 			continue
@@ -534,9 +617,6 @@ func (r *modelRouteRegistry) replaceLegacyProviders(providers map[string]*provid
 		}
 	}
 
-	// Empty legacy-provider entries do not appear in legacyOrder. Retain any
-	// remaining unchanged entries deterministically so later refreshes keep the
-	// same registry shape.
 	remainingCurrentProviderIDs := make([]string, 0, len(current.legacyByProvider))
 	for providerID := range current.legacyByProvider {
 		if _, emitted := seenProviders[providerID]; !emitted {
@@ -550,6 +630,9 @@ func (r *modelRouteRegistry) replaceLegacyProviders(providers map[string]*provid
 		}
 	}
 
+	if err := rebuildPublicModelEntrySnapshot(next); err != nil {
+		return err
+	}
 	r.snapshot.Store(next)
 	return nil
 }

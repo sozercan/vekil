@@ -78,27 +78,66 @@ func (h *ProxyHandler) executeChatCompletions(ctx context.Context, chatBody []by
 	return result, err
 }
 
-func chatRequestContainsResponsesReplayID(body []byte) bool {
-	var request struct {
-		Messages []struct {
-			Role       string `json:"role"`
-			ToolCallID string `json:"tool_call_id"`
-			ToolCalls  []struct {
-				ID string `json:"id"`
-			} `json:"tool_calls"`
-		} `json:"messages"`
+func rawJSONFieldsExactOrFold(object map[string]json.RawMessage, name string) []json.RawMessage {
+	if raw, ok := object[name]; ok {
+		return []json.RawMessage{raw}
 	}
+	var matches []json.RawMessage
+	for candidate, raw := range object {
+		if strings.EqualFold(candidate, name) {
+			matches = append(matches, raw)
+		}
+	}
+	return matches
+}
+
+func chatRequestContainsResponsesReplayID(body []byte) bool {
+	var request map[string]json.RawMessage
 	if json.Unmarshal(body, &request) != nil {
 		return false
 	}
-	for _, message := range request.Messages {
-		if strings.TrimSpace(message.Role) == "tool" && isResponsesChatReplayCallID(message.ToolCallID) {
-			return true
+	for _, rawMessages := range rawJSONFieldsExactOrFold(request, "messages") {
+		var messages []json.RawMessage
+		if json.Unmarshal(rawMessages, &messages) != nil {
+			continue
 		}
-		if strings.TrimSpace(message.Role) == "assistant" {
-			for _, call := range message.ToolCalls {
-				if isResponsesChatReplayCallID(call.ID) {
-					return true
+		for _, rawMessage := range messages {
+			var message map[string]json.RawMessage
+			if json.Unmarshal(rawMessage, &message) != nil {
+				continue
+			}
+			for _, rawRole := range rawJSONFieldsExactOrFold(message, "role") {
+				var role string
+				if json.Unmarshal(rawRole, &role) != nil {
+					continue
+				}
+				switch strings.TrimSpace(role) {
+				case "tool":
+					for _, rawCallID := range rawJSONFieldsExactOrFold(message, "tool_call_id") {
+						var callID string
+						if json.Unmarshal(rawCallID, &callID) == nil && isResponsesChatReplayCallID(callID) {
+							return true
+						}
+					}
+				case "assistant":
+					for _, rawCalls := range rawJSONFieldsExactOrFold(message, "tool_calls") {
+						var calls []json.RawMessage
+						if json.Unmarshal(rawCalls, &calls) != nil {
+							continue
+						}
+						for _, rawCall := range calls {
+							var call map[string]json.RawMessage
+							if json.Unmarshal(rawCall, &call) != nil {
+								continue
+							}
+							for _, rawCallID := range rawJSONFieldsExactOrFold(call, "id") {
+								var callID string
+								if json.Unmarshal(rawCallID, &callID) == nil && isResponsesChatReplayCallID(callID) {
+									return true
+								}
+							}
+						}
+					}
 				}
 			}
 		}

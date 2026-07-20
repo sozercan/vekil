@@ -175,6 +175,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = r.Body.Close() }()
 	requestedModel := extractResponsesRequestModel(bodyBytes)
+	h.observePolicyRequestSummary(r.Context(), "responses", requestedModel, parseResponsesRequestMetadata(bodyBytes).Stream)
 	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), requestedModel, providerEndpointResponses)
 	if err != nil {
 		h.writeResponsesUpstreamRequestFailure(w, r, nil, "responses_admission", err)
@@ -559,6 +560,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = r.Body.Close() }()
 	requestedModel := extractResponsesRequestModel(bodyBytes)
+	h.observePolicyRequestSummary(r.Context(), "responses_compact", requestedModel, false)
 	admissionInbound := suppressRouteAttemptStats(r.Context())
 	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), admissionInbound, requestedModel, providerEndpointResponses)
 	if err != nil {
@@ -669,6 +671,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	}
 	defer func() { _ = r.Body.Close() }()
 	requestedModel := extractResponsesRequestModel(bodyBytes)
+	h.observePolicyRequestSummary(r.Context(), "memory_summarize", requestedModel, false)
 	admissionInbound := suppressRouteAttemptStats(r.Context())
 	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), admissionInbound, requestedModel, providerEndpointResponses)
 	if err != nil {

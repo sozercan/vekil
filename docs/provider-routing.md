@@ -1,6 +1,6 @@
 # Provider Routing and Authentication
 
-Use this file when editing provider credentials, model ownership, JSON/YAML provider configs, provider header profiles, or provider-specific model metadata. For where to obtain provider keys, see [Provider API Keys](provider-api-keys.md). For global flags and env vars, see [Configuration](configuration.md).
+Use this file when editing provider credentials, model ownership, JSON/YAML provider configs, provider header profiles, route exposure, or provider-specific model metadata. For schema-v2 classifier policy, privacy, and rollout details, see [Semantic Policy Routing](policy-routing.md). For where to obtain provider keys, see [Provider API Keys](provider-api-keys.md). For global flags and env vars, see [Configuration](configuration.md).
 
 ## Provider Authentication
 
@@ -58,9 +58,9 @@ You can run Azure-only or Codex-only configs, or mix those providers with Copilo
 
 ### Configuration versions
 
-A provider file with no `schema_version` is version 1. Explicitly setting `schema_version: 0` is invalid. Version-1 files keep the existing provider-owned `models[]`, dynamic discovery, default-provider, unknown-model, catalog, and retry behavior. A new binary does not rewrite those files.
+A provider file with no `schema_version` is version 1. Explicitly setting `schema_version: 0` is invalid. Only schema versions 1 and 2 are supported. Version-1 files keep the existing provider-owned `models[]`, dynamic discovery, default-provider, unknown-model, catalog, and retry behavior. A new binary does not rewrite those files.
 
-`model_routes` is available only in a version-2 file. When a file contains more than one non-Copilot provider, exactly one provider must remain `default: true` even if every intended model is owned by an explicit route; the default still defines legacy unknown-model behavior outside those routes. A complete environment-variable example is checked in at [`examples/provider-routing-failover.yaml`](../examples/provider-routing-failover.yaml).
+Schema version 2 is the complete explicit-routing schema. It adds public and internal `model_routes`, ordered target failover, provider trust metadata, internal classifier routes, and optional semantic `policy_profiles`. A route-only version-2 file remains valid without policy fields. A sole provider is the implicit default, and in a multi-provider configuration a single Copilot provider is the implicit default. Multiple non-Copilot providers may omit `default: true` only when none exposes a legacy static or dynamic model catalog and client-visible models are owned by public routes or policies. If any such provider exposes legacy/catalog models, configure exactly one explicit default provider. A complete route-only environment-variable example is checked in at [`examples/provider-routing-failover.yaml`](../examples/provider-routing-failover.yaml).
 
 ```yaml
 schema_version: 2
@@ -118,11 +118,20 @@ routing:
 
 The two targets must implement the same public contract. If endpoint support, reasoning behavior, tool semantics, vision support, context limits, or other client-visible behavior differs, expose separate public routes instead of putting the targets in one pool. Target order is failover order; schema version 2 has no weights, random picker, affinity, or sticky-routing field.
 
+The same schema-version-2 contract also includes:
+
+- `model_routes[].exposure: public|internal`, with omitted exposure defaulting to `public`;
+- internal-purpose classifier routes;
+- provider `trust_domain` and classifier non-storage capability metadata; and
+- top-level `policy_profiles` that publish one Chat model ID and select a `lightweight` or `powerful` native-Chat terminal route.
+
+These fields are additive: existing route-only version-2 configurations remain valid, while version-1 files reject explicit-route and policy-routing fields. Internal routes have no public ID, aliases, picker metadata, `/v1/models` entry, dashboard insight-model eligibility, or direct client resolution. Policy destinations may be public or internal; exposed public destinations are deliberate policy bypasses. The recommended policy configuration keeps both destinations and the classifier internal. See [`examples/policy-routing-coding-economy.yaml`](../examples/policy-routing-coding-economy.yaml) and [Semantic Policy Routing](policy-routing.md).
+
 ### Route schema and validation
 
-Required route fields are `id`, `public_id`, an explicit nonempty `endpoints` allowlist of verified native upstream operations, and at least one target. Each target requires a route-local `id`, `provider`, and `upstream_model`. Provider, route, and target operational IDs in schema version 2 are limited to 128 bytes and restricted to bounded ASCII identifier characters. The initial implementation accepts at most 256 routes, 32 targets per route, and 1,024 explicit targets total.
+For a public version-2 route, required route fields are `id`, `public_id`, an explicit nonempty `endpoints` allowlist of verified native upstream operations, and at least one target. A version-2 internal route requires `id`, `exposure: internal`, endpoints, and targets but must omit `public_id` and picker metadata. Each target requires a route-local `id`, `provider`, and `upstream_model`. Provider, route, and target operational IDs in schema version 2 are limited to 128 bytes and restricted to bounded ASCII identifier characters. The initial implementation accepts at most 256 routes, 32 targets per route, and 1,024 explicit targets total.
 
-Public IDs are globally unique across explicit routes, static provider models, and dynamically discovered models, including supported normalized aliases. A public ID cannot be declared in both `providers[].models[]` and `model_routes[]`. Explicit routes reserve their IDs against later discovery; a dynamic refresh collision rejects that whole refresh and retains the last-known-good registry. Duplicate route IDs, target IDs, endpoints, or reasoning efforts are errors rather than silently deduplicated values. Route-only static Azure or generic providers may omit `models`; unreferenced static providers still need their normal model declarations. Dynamic providers keep their existing omission and discovery rules.
+Public IDs are globally unique across explicit routes, policy profiles, static provider models, and dynamically discovered models, including supported normalized aliases. A public ID cannot be declared in more than one of `providers[].models[]`, public `model_routes[]`, or `policy_profiles[]`. Explicit public entries reserve their IDs against later discovery; a dynamic refresh collision rejects that whole refresh and retains the last-known-good registry. Duplicate route IDs, target IDs, endpoints, or reasoning efforts are errors rather than silently deduplicated values. Route-only static Azure or generic providers may omit `models`; unreferenced static providers still need their normal model declarations. Dynamic providers keep their existing omission and discovery rules, but v1 policy destinations themselves cannot use dynamic providers.
 
 Catalog metadata belongs to the route, not to whichever target answered last. Explicit Responses output, OpenAI Chat JSON/SSE, websocket metadata, and translated Anthropic/Gemini output normalize to the public route ID. Legacy raw OpenAI Chat routes retain their existing conservative model-field behavior. The configurable route metadata is `name`, `endpoints`, `reasoning_effort`, `parallel_tool_calls`, `vision`, `context_window`, `model_picker_enabled`, and `model_picker_category`. Omitted values use deterministic static-catalog defaults: `name` equals `public_id`, picker enabled, category `versatile`, false booleans, and no published numeric limit. Temporary target failure never removes or changes the catalog entry.
 
@@ -136,7 +145,15 @@ Validate a file without serving or modifying it:
 vekil config validate --providers-config /path/to/providers.yaml
 ```
 
-The command performs strict JSON/YAML decoding, provider/target reference checks, collision and limit checks, adapter compatibility checks, route-budget validation, and catalog compilation. It does not start the HTTP server or contact model/inference endpoints. Local auth configuration must still be usable: for example, a referenced `api_key_env` must be populated, and local credential construction may fail validation before any network request. Configuration reload is not part of schema version 2; apply changes by restarting Vekil.
+The command performs strict JSON/YAML decoding, provider/target reference checks, collision and limit checks, adapter compatibility checks, route-budget validation, and catalog compilation. It does not start the HTTP server or contact model/inference endpoints. Local auth configuration must still be usable: for example, a referenced `api_key_env` must be populated, and local credential construction may fail validation before any network request.
+
+For schema-v2 policies, explicitly request classifier protocol preflight with:
+
+```bash
+vekil config validate --live --providers-config /path/to/providers.yaml
+```
+
+`--live` sends one fixed non-user fixture per distinct classifier route selected by the policy config to verify authentication/reachability, forced strict function output, configured non-storage behavior, and the one-send contract. It does not prove the provider's retention policy. Configuration reload is not part of schema version 2; apply changes by restarting Vekil.
 
 ### Routing modes and budgets
 
@@ -184,6 +201,8 @@ For explicit client streams, Vekil bounds precommit inspection with the existing
 
 An OpenAI-family route may combine Azure and static OpenAI-compatible targets only when all targets implement every advertised endpoint with equivalent semantics. An Anthropic-family route contains only static Anthropic-compatible targets. Copilot, OpenAI Codex, dynamically discovered generic providers, native `/realtime`, and heterogeneous OpenAI/native-Anthropic target sets are rejected as explicit route targets. Provider-only version-1 routing for those providers remains available.
 
+Schema-v2 policy selection is narrower than this general explicit-route matrix. In v1, both terminal routes and the classifier route must use supported OpenAI-compatible native `/chat/completions` execution. The policy public ID is accepted only by `POST /v1/chat/completions` with text and standard function tools. It is rejected on direct Responses HTTP/websocket, Responses-backed Chat, Anthropic, Gemini, count-token, compaction, memory, replay-recovery, and multimodal paths. Direct public routes keep the general matrix above.
+
 The optional websocket bridge is still transport adaptation over HTTP `/responses`. Its first provider-backed `response.create` may use the same safe precommit route failover; after a successful target is exposed, the session is pinned to that exact route/target and later turns fail closed rather than migrate. See [Responses WebSocket Bridge](responses-websocket.md).
 
 ### Exact state binding and process-local limits
@@ -194,13 +213,17 @@ There is one narrow first-use exception for a client-supplied Responses `convers
 
 The binding index is bounded to 32,768 entries with a 24-hour absolute TTL and is process-local. Capacity eviction, expiry, restart, or sending the next request to another Vekil process makes a prior binding unknown. For ordinary provider state that fails closed. A conversation-only request on a currently deterministic route can instead take the bootstrap path, which cannot distinguish genuine first use from a lost prior binding; keep the process affinity and deterministic target stable for the lifetime of active conversations. Lookups update recency for eviction but do not extend the absolute TTL; observing the same token again from the same owner refreshes it. **Every explicit Responses route that accepts provider-issued state requires one Vekil process or sticky ingress to the process that owns the binding**, including one-target and `primary_only` routes. Responses-backed Chat tool continuations use a separate process-local replay store and have the same affinity/restart constraint. Vekil does not migrate Responses state, replay a WebSocket session onto another target, or infer portability from user-provided strings. Durable/shared bindings and proxy-signed target hints are future work.
 
-### No balancing or circuit breaker
+### No terminal-route balancing or circuit breaker
 
-Schema version 2 deliberately does not include active-active/weighted routing, automatic affinity extraction, bounded-load selection, active health probes, user-defined quota/cache/failure domains, half-open circuit-breaker state, configured cross-model fallback, or cross-route fallback. Temporary target errors also do not change `/readyz`. Any future exact-target cooldown based on authoritative `Retry-After` data requires separate implementation; no generic circuit-breaker framework is implied by `priority_failover`.
+Schema version 2 deliberately does not include active-active/weighted routing, automatic affinity extraction, bounded-load selection, active health probes, user-defined quota/cache/failure domains, half-open terminal-target circuit-breaker state, configured cross-model fallback, or cross-route fallback. Temporary target errors also do not change `/readyz`. Any future exact-target cooldown based on authoritative `Retry-After` data requires separate implementation; no generic circuit-breaker framework is implied by `priority_failover`.
+
+Schema-v2 policy routing adds a separate infrastructure-only breaker for the **classifier route**, not for terminal target selection. Only pre-inference transport failures, `429`, and upstream `5xx` affect it. Timeouts, malformed classifier output, missing forced calls, abstention, content-dependent latency, and user validation errors do not change shared health. A selected terminal route still follows only its own configured `primary_only` or replay-safe `priority_failover` behavior; classifier failure selects the profile's configured unavailable tier and never creates cross-tier failover.
 
 ### Rollout and rollback
 
 A conservative rollout is: validate the version-2 file, run a one-target route in `primary_only`, add the secondary while still `primary_only`, verify catalog identity and attempt metrics, then enable `priority_failover` with explicit budgets for one canary route. Inject only replay-safe failures such as a primary `429` or prewrite dial failure when testing the switch.
+
+Policy profiles have a separate operator gate: keep the global ceiling `off`, complete the powered end-to-end evaluation, graduate profiles independently through `observe`, require at least 5,000 completed observations and 95% admission in every declared traffic bucket, then enforce one profile at a time. See [Policy evaluation gates](policy-routing.md#evaluation-gates-before-enforcement) and [Policy rollout and rollback](policy-routing.md#rollout-and-rollback).
 
 To stop automatic switching, restore `mode: primary_only` and restart the same schema-version-2 binary. This is availability-safe but **not continuity-preserving**: restart clears process-local state bindings, Responses-backed Chat replay state, and WebSocket sessions, so drain stateful traffic first or accept deterministic continuation failures. The new process still interprets newly issued state with the same version-2 fail-closed rules. Do **not** restore a version-1 file or downgrade to an older binary while state issued by a secondary may still be presented. First fence new stateful continuations, drain WebSocket sessions, wait at least the 24-hour binding TTL plus any longer provider replay window, and perform an atomic no-mixed-version cutover. If that fence cannot be guaranteed, keep the running version-2 process in `primary_only` until the fence is complete. There is no automatic configuration migration in either direction.
 
@@ -314,6 +337,8 @@ Successful decoded dynamic model catalogs are capped at 4 MiB before JSON decodi
 | `messages_path` | `anthropic-compatible` | Upstream path for public `POST /v1/messages`. Defaults to `/v1/messages`. |
 | `models_path` | generic providers | Upstream path for dynamic model discovery and readiness probes. Defaults to `/models`. |
 | `model_discovery` | generic providers | `static`, `openai`, `ollama`, or `openrouter-tools`. |
+| `trust_domain` | providers used by schema-v2 policy destinations/classifiers | Operator-defined data-governance domain. Required for every provider referenced by a policy; matching is enforced unless the profile acknowledges cross-domain forwarding. |
+| `classifier_no_store_supported` | provider used by a schema-v2 classifier route | Declares that Vekil can send the provider's supported non-storage option for classifier requests. This is a capability declaration, not proof of retention behavior. |
 | `models[].endpoints` | all static models | Verified native upstream endpoint allowlist. It controls rendered capability metadata and native backend selection; Vekil does not add served compatibility routes. |
 | `models[].use_max_completion_tokens` | static models with `/chat/completions` | When `true`, rewrite translated Chat/Anthropic `max_tokens` to `max_completion_tokens` before forwarding. Use only for deployments that reject the legacy field. |
 

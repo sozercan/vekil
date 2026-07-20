@@ -12,6 +12,49 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
+func TestPolicyChatSafeHeadersQuotaAllowlist(t *testing.T) {
+	pastHTTPDate := time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat)
+	tests := []struct {
+		name   string
+		header string
+		value  string
+		want   bool
+	}{
+		{name: "retry after zero", header: "Retry-After", value: "0", want: true},
+		{name: "retry after past date", header: "Retry-After", value: pastHTTPDate, want: true},
+		{name: "retry after malformed", header: "Retry-After", value: "power-provider", want: false},
+		{name: "upstream request id omitted", header: "X-Request-ID", value: "opaque-upstream-id", want: false},
+		{name: "topology-bearing request id omitted", header: "Request-ID", value: "westus3-power-provider", want: false},
+		{name: "standard limit window", header: "RateLimit-Limit", value: "100;w=60, 20;w=1", want: true},
+		{name: "standard limit arbitrary parameter", header: "RateLimit-Limit", value: "100;policy=power-provider", want: false},
+		{name: "standard remaining", header: "RateLimit-Remaining", value: "42", want: true},
+		{name: "standard reset", header: "RateLimit-Reset", value: "0", want: true},
+		{name: "openai request limit", header: "X-RateLimit-Limit-Requests", value: "100", want: true},
+		{name: "openai token remaining", header: "X-RateLimit-Remaining-Tokens", value: "42", want: true},
+		{name: "openai negative token remaining", header: "X-RateLimit-Remaining-Tokens", value: "-36161", want: true},
+		{name: "standard negative remaining rejected", header: "RateLimit-Remaining", value: "-1", want: false},
+		{name: "openai request reset duration", header: "X-RateLimit-Reset-Requests", value: "250ms", want: true},
+		{name: "openai token reset seconds", header: "X-RateLimit-Reset-Tokens", value: "7", want: true},
+		{name: "openai invalid numeric", header: "X-RateLimit-Limit-Requests", value: "power-model", want: false},
+		{name: "provider model header", header: "X-RateLimit-Model", value: "power-model", want: false},
+		{name: "provider policy header", header: "RateLimit-Policy", value: "power-provider", want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			src := http.Header{tc.header: []string{tc.value}}
+			got := policyChatSafeHeaders(src, "public-model")
+			values := got.Values(tc.header)
+			if tc.want {
+				if len(values) != 1 || values[0] != tc.value {
+					t.Fatalf("safe header values = %q, want [%q]", values, tc.value)
+				}
+			} else if len(values) != 0 {
+				t.Fatalf("unsafe header values = %q, want omitted", values)
+			}
+		})
+	}
+}
+
 func TestPrepareOpenAIChatCompletionsRequest_ForceStreamWithTools(t *testing.T) {
 	input := []byte(`{
 		"model":"gpt-4.1",

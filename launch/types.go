@@ -8,10 +8,14 @@ import (
 	"time"
 )
 
+// PolicyModelOwner is the /v1/models owner for policy-routing public IDs.
+const PolicyModelOwner = "vekil-policy"
+
 // ModelInfo is the launcher-relevant subset of one /v1/models entry.
 type ModelInfo struct {
 	ID                               string            `json:"id"`
 	Name                             string            `json:"name,omitempty"`
+	OwnedBy                          string            `json:"owned_by,omitempty"`
 	SupportedEndpoints               []string          `json:"supported_endpoints,omitempty"`
 	Capabilities                     ModelCapabilities `json:"capabilities,omitempty"`
 	ContextWindow                    *int64            `json:"context_window,omitempty"`

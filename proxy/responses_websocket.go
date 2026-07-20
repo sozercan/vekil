@@ -445,6 +445,11 @@ func (s *responsesWebSocketSession) handleFrame(h *ProxyHandler, frame responses
 
 	request, err := parseResponsesWebSocketCreateRequest(frame.payload)
 	if err != nil {
+		if publicID, ok := h.policyPublicModelID(extractResponsesRequestModel(frame.payload)); ok {
+			message := fmt.Sprintf("model %q does not support %s", publicID, providerEndpointResponses)
+			s.recordTurnStats(h, publicID, "", "", http.StatusBadRequest, responsesUsage{}, nil)
+			return s.sendWrappedError(http.StatusBadRequest, message, "invalid_request_error", nil)
+		}
 		return s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
 	}
 	return s.handleCreateRequest(h, request)
@@ -1368,6 +1373,30 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	if s == nil || s.isClosing() || (s.ctx != nil && s.ctx.Err() != nil) || h.upstreamShutdownStarted() {
 		return context.Canceled
 	}
+	if request == nil || strings.TrimSpace(request.Model) == "" {
+		err := &providerRequestError{
+			statusCode: http.StatusBadRequest,
+			err:        fmt.Errorf("model is required"),
+		}
+		s.recordTurnStats(h, "", "", "", http.StatusBadRequest, responsesUsage{}, nil)
+		if writeErr := s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil); writeErr != nil {
+			return writeErr
+		}
+		return err
+	}
+	if request != nil {
+		if publicID, ok := h.policyPublicModelID(request.Model); ok {
+			err := &providerRequestError{
+				statusCode: http.StatusBadRequest,
+				err:        fmt.Errorf("model %q does not support %s", publicID, providerEndpointResponses),
+			}
+			s.recordTurnStats(h, publicID, "", "", http.StatusBadRequest, responsesUsage{}, nil)
+			if writeErr := s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil); writeErr != nil {
+				return writeErr
+			}
+			return err
+		}
+	}
 	s.syncTurnMetadata(request)
 	if request.PreviousResponseID == "" {
 		s.turnState = ""
@@ -1709,17 +1738,12 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	return nil
 }
 
-// recordTurnStats records one websocket-bridge turn into traffic stats,
-// resolving the provider for attribution. status is the turn outcome (200 for a
-// completed turn, an error status for a failed one).
+// recordTurnStats records one websocket-bridge turn into traffic stats. Callers
+// provide provider attribution only after an actual routed attempt; local
+// pre-routing rejections must not infer a default or internal-route provider.
 func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model, providerID, providerKind string, status int, usage responsesUsage, operation *routeOperation) responsesTurnStatsRecord {
 	if h == nil {
 		return responsesTurnStatsRecord{}
-	}
-	if providerID == "" {
-		if provider, _, _ := h.resolveProviderModel(model, providerEndpointResponses); provider != nil {
-			providerID, providerKind = provider.id, string(provider.kind)
-		}
 	}
 	operationID := ""
 	if operation != nil {

@@ -196,9 +196,10 @@ func (m *routeOperationMutex) Unlock() {
 type routeOperation struct {
 	mu routeOperationMutex
 
-	id      string
-	route   *modelRoute
-	inbound context.Context
+	id       string
+	route    *modelRoute
+	inbound  context.Context
+	chatPlan *chatOperationPlan
 
 	remainingTargetAttempts int
 	remainingUpstreamSends  int
@@ -222,6 +223,10 @@ type routeUpstreamModelOverrideContextKey struct{}
 type routeAttemptStatsSuppressedContextKey struct{}
 
 func newRouteOperation(route *modelRoute, inbound context.Context) *routeOperation {
+	return newRouteOperationWithID(route, inbound, "")
+}
+
+func newRouteOperationWithID(route *modelRoute, inbound context.Context, operationID string) *routeOperation {
 	if route == nil || route.legacy {
 		return nil
 	}
@@ -236,8 +241,12 @@ func newRouteOperation(route *modelRoute, inbound context.Context) *routeOperati
 	if inbound == nil {
 		inbound = context.Background()
 	}
+	operationID = strings.TrimSpace(operationID)
+	if operationID == "" {
+		operationID = uuid.NewString()
+	}
 	operation := &routeOperation{
-		id:                      uuid.NewString(),
+		id:                      operationID,
 		route:                   route,
 		inbound:                 inbound,
 		remainingTargetAttempts: maxTargets,
@@ -248,6 +257,35 @@ func newRouteOperation(route *modelRoute, inbound context.Context) *routeOperati
 	}
 	operation.mu.bind(operation)
 	return operation
+}
+
+func newRouteOperationFromChatPlan(plan chatOperationPlan, inbound context.Context) *routeOperation {
+	if !plan.valid() {
+		return nil
+	}
+	sealed := plan
+	sealed.candidates = plan.candidateSnapshot()
+	sealed.contract = clonePublicModelContract(plan.contract)
+	sealed.terminalParallelToolCalls = cloneBoolPtr(plan.terminalParallelToolCalls)
+	sealed.operationRoute = plan.routeSnapshot()
+	operation := newRouteOperationWithID(sealed.operationRoute, inbound, sealed.operationID)
+	if operation == nil {
+		return nil
+	}
+	operation.chatPlan = &sealed
+	return operation
+}
+
+func (o *routeOperation) policyPlan() (chatOperationPlan, bool) {
+	if o == nil || o.chatPlan == nil {
+		return chatOperationPlan{}, false
+	}
+	plan := *o.chatPlan
+	plan.candidates = o.chatPlan.candidateSnapshot()
+	plan.contract = clonePublicModelContract(o.chatPlan.contract)
+	plan.terminalParallelToolCalls = cloneBoolPtr(o.chatPlan.terminalParallelToolCalls)
+	plan.operationRoute = o.chatPlan.routeSnapshot()
+	return plan, true
 }
 
 func suppressRouteAttemptStats(ctx context.Context) context.Context {

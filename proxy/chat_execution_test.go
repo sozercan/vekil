@@ -162,6 +162,37 @@ func TestExecuteChatCompletionsDoesNotRerouteReplayLikeNativeIDs(t *testing.T) {
 	}
 }
 
+func TestChatRequestContainsResponsesReplayIDCaseInsensitiveFallback(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "nested fallback",
+			body: `{"messages":[{"Role":"assistant","Tool_Calls":[{"ID":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA"}]},{"Role":"tool","Tool_Call_ID":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA"}]}`,
+			want: true,
+		},
+		{
+			name: "top-level fallback",
+			body: `{"Messages":[{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA"}]}`,
+			want: true,
+		},
+		{
+			name: "exact key preferred over folded sibling",
+			body: `{"messages":[{"role":"user","content":"hello"}],"MESSAGES":[{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA"}]}`,
+			want: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := chatRequestContainsResponsesReplayID([]byte(tc.body)); got != tc.want {
+				t.Fatalf("chatRequestContainsResponsesReplayID(%s) = %v, want %v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestChatExecutionErrorFromStreamTermination(t *testing.T) {
 	if got := chatExecutionErrorFromStreamTermination(context.DeadlineExceeded); got == nil || got.StatusCode != http.StatusGatewayTimeout || got.Code != "gateway_timeout" {
 		t.Fatalf("deadline mapping = %#v", got)
