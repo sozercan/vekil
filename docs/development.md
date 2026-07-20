@@ -24,6 +24,7 @@ go test ./proxy/ -run TestHandle -v
 go test ./proxy/ -run TestMapStopReason/stop -v
 scripts/tests/live-smoke-reliability-test.sh  # deterministic mock-server/fake-CLI gates
 scripts/tests/live-chat-over-responses-smoke-test.sh  # deterministic Chat-over-Responses live-harness gates
+scripts/tests/live-policy-routing-smoke-test.sh  # deterministic semantic-policy process/cleanup gates
 ```
 
 `make test` requires a current Node.js runtime with the built-in `node:test` module in addition to Go. Running `go test ./...` remains Go-only.
@@ -218,7 +219,7 @@ make lint
 
 ## CI
 
-GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs lint, frontend plus Go tests, the full race detector, build, vet, a Kubernetes/kind operational smoke, and e2e validation before merge. `make test` runs the dashboard config JavaScript syntax check and `node:test` suite before `go test ./...`. Dedicated Windows and macOS jobs run the managed config source/codec/store tests on native filesystems in addition to launcher lifecycle coverage. Every core job has a job-level deadline. The Linux test job runs [`scripts/tests/live-smoke-reliability-test.sh`](../scripts/tests/live-smoke-reliability-test.sh) with local mock servers and fake CLIs so stale-listener, timeout, per-client, and descendant-cleanup failures are deterministic, plus [`scripts/tests/live-provider-routing-smoke-test.sh`](../scripts/tests/live-provider-routing-smoke-test.sh), which builds the real binary and exercises schema-v2 two-target failover against controlled loopback Responses servers.
+GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs lint, frontend plus Go tests, the full race detector, build, vet, a Kubernetes/kind operational smoke, and e2e validation before merge. `make test` runs the dashboard config JavaScript syntax check and `node:test` suite before `go test ./...`. Dedicated Windows and macOS jobs run the managed config source/codec/store tests on native filesystems in addition to launcher lifecycle coverage. Every core job has a job-level deadline. The Linux test job runs [`scripts/tests/live-smoke-reliability-test.sh`](../scripts/tests/live-smoke-reliability-test.sh) with local mock servers and fake CLIs so stale-listener, timeout, per-client, and descendant-cleanup failures are deterministic, plus two real-binary process harnesses: [`scripts/tests/live-provider-routing-smoke-test.sh`](../scripts/tests/live-provider-routing-smoke-test.sh) exercises schema-v2 two-target failover against controlled loopback Responses servers, and [`scripts/tests/live-policy-routing-smoke-test.sh`](../scripts/tests/live-policy-routing-smoke-test.sh) exercises semantic-policy modes, classifier/terminal accounting, controlled failover, automatic non-default port selection, redaction, and process-group cleanup against local Chat-compatible shims.
 
 The kind smoke builds the PR image and renders the checked-in [`k8s/vekil.yaml`](../k8s/vekil.yaml), patching only the test namespace, local image/pull policy, and the deterministic provider config used in its second phase. It verifies that the `/healthz` startup probe has a coherent 60–90 second failure budget before liveness/readiness begin. It then deploys without Copilot credentials and verifies that `/healthz` remains live, the liveness probe causes zero restarts, `/readyz` stays gated, the Pod is not Ready, and the Service has no ready endpoint. Finally it rolls out a static configured provider and verifies that the same readiness probe admits the Pod and Service endpoint. The script uses an isolated kubeconfig, bounds cluster/API/port-forward work, and requires the live `kubectl port-forward` PID plus its exact listener log before accepting HTTP responses.
 
@@ -287,6 +288,56 @@ Configure these repository secrets explicitly:
 The harness generates and validates a schema-version-2 config with one fixed public model and an ordered two-target `priority_failover` route. A loopback control proxy first forwards a real request to the primary, then injects an authoritative precommit `429`; the next fresh request must make exactly two upstream sends and complete on the real secondary. It also verifies that `/v1/models` and successful Responses output expose only the public model identity, a primary response ID pins a later request back to that exact target rather than migrating on `429`, unknown state fails locally with no upstream send, and `/stats.json` records the exact target attempts, switch, successful failover, and state-binding hit/miss.
 
 Fork and Dependabot pull requests neutral-skip because GitHub withholds repository secrets. Pull requests also neutral-skip until all eight repository variables/secrets are installed; a manual dispatch with missing configuration fails so it cannot look like a completed live run. Once configured, any controlled-target or routing failure is a hard failure—unlike the rotating Zen free tier, a configured target outage is not treated as neutral. The workflow is separate from deterministic CI. Run the same harness locally after `make build` by exporting the eight variables/secrets above.
+
+## Live Semantic Policy Routing Smoke Workflow
+
+The [`Live Semantic Policy Routing Smoke`](../.github/workflows/live-policy-routing-smoke.yaml) workflow runs [`scripts/live-policy-routing-smoke.sh`](../scripts/live-policy-routing-smoke.sh) as the uniquely named `semantic-policy-e2e` check on pull requests to `main` and by manual dispatch. It is a separate credentialed workflow rather than part of deterministic CI: the harness sends bounded but paid requests to real native-Chat providers, while the companion process smoke above covers controllable failure and cleanup paths without credentials.
+
+Configure these repository variables:
+
+- `LIVE_POLICY_ROUTING_LIGHTWEIGHT_TYPE` — `azure-openai` or `openai-compatible`
+- `LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL` — the lightweight provider API base before `/chat/completions`; Azure uses the OpenAI v1 form ending in `/openai/v1`
+- `LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL` — the physical lightweight model/deployment name
+- `LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_TYPE` — `azure-openai` or `openai-compatible`
+- `LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL` — the primary powerful provider API base before `/chat/completions`
+- `LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL` — the physical primary powerful model/deployment name
+- `LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_TYPE` — `azure-openai` or `openai-compatible`
+- `LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL` — the secondary powerful provider API base before `/chat/completions`
+- `LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL` — the semantically equivalent secondary powerful model/deployment name
+- `LIVE_POLICY_ROUTING_CLASSIFIER_MODEL` — the classifier deployment on the powerful-primary provider; it must support the forced strict function-tool contract used by live preflight
+- `LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED` — set explicitly to `true` only after confirming that the classifier endpoint accepts Vekil's non-storage request option
+
+Configure these repository secrets:
+
+- `LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY`
+- `LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY`
+- `LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY`
+
+The classifier uses the powerful-primary provider credential. Secrets are passed to the harness as environment variables; the generated temporary schema-v2 config references `api_key_env` names and never embeds credential values. Keep the powerful primary and secondary on the same public Chat contract. A configured target outage, protocol incompatibility, classifier failure, privacy leak, wrong tier, or accounting mismatch is a hard failure rather than a neutral provider transient.
+
+The live matrix covers:
+
+- offline config validation followed by the explicit one-send live classifier preflight;
+- `off` mode using the configured lightweight baseline without a runtime classifier send;
+- `observe` mode serving the baseline while recording a bounded asynchronous shadow decision;
+- `enforce` mode routing a bounded one-file task to lightweight and a complex or truncated task to powerful;
+- forced function tools, tool-result continuation, and parallel distinct function calls;
+- powerful streaming with canonical public model identity and exactly one `[DONE]`;
+- retry-safe within-powerful-tier failover through a loopback validation shim that injects an authoritative precommit `429`, followed by success on the real secondary;
+- representative local rejections with zero classifier and terminal sends; and
+- `/stats.json`, response, header, log, generation-hash, prompt/tool sentinel, upstream request-ID, and internal topology redaction checks.
+
+When `PROXY_PORT` is unset, the harness binds only to `127.0.0.1`, asks the operating system for isolated ports, rejects port `1337`, retries bounded address-in-use races, and verifies that every proxy and shim listener is released during cleanup. Do not set the workflow to a shared/default port. The deterministic companion test deliberately injects a startup collision and checks process-group/descendant cleanup so the live workflow does not rely on timing alone.
+
+Fork pull requests and Dependabot neutral-skip because repository secrets are unavailable. Same-repository pull requests also neutral-skip until all variables and secrets above are installed, matching the existing live-provider-routing installation behavior. A manual dispatch with missing configuration fails. Do not change this workflow to `pull_request_target`: executing pull-request code with provider credentials would expose secrets to untrusted code.
+
+This smoke incurs real provider cost: it performs classifier preflight plus multiple classifier and terminal requests, including one two-attempt powerful failover. Keep prompts synthetic, never include customer data or real credentials in request content, and monitor provider budgets. The smoke is bounded acceptance coverage, not the 75-task pilot/holdout or 5,000-observation production-enforcement evaluation described in the policy-routing release gate. Failure diagnostics print only a fixed allowlist of files, replace configured keys, base URLs, physical model IDs, request/replay IDs, tool arguments, and sentinels before truncation, and do not upload raw artifacts or the generated provider config.
+
+Run the same live harness locally after `make build` by exporting all variables and secrets above:
+
+```bash
+scripts/live-policy-routing-smoke.sh
+```
 
 For a credential-free generic-provider check, [`scripts/live-zen-smoke.sh`](../scripts/live-zen-smoke.sh) starts the proxy on a non-default port with [`examples/opencode-zen-free.yaml`](../examples/opencode-zen-free.yaml), waits for `/readyz`, and sends one tiny chat completion per OpenCode Zen free model. It needs `curl`, `jq`, and Python for isolated automatic port allocation. Because the Zen free set rotates, the script skips only recognized transient statuses/messages and passes as long as at least one free model responds; unknown statuses and proxy-side faults are hard failures.
 
