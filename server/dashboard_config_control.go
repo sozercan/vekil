@@ -87,7 +87,7 @@ func dashboardConfigHostMatchesListener(r *http.Request, configuredPort string) 
 }
 
 func isLiteralLoopbackRequestHost(host string) bool {
-	host = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(host, "["), "]"))
+	host = strings.TrimSuffix(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")), ".")
 	if strings.EqualFold(host, "localhost") {
 		return true
 	}

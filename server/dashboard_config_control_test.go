@@ -90,6 +90,8 @@ func TestDashboardConfigHostMatchesListener(t *testing.T) {
 		want           bool
 	}{
 		{name: "localhost omitted port at configured HTTP default", host: "localhost", configuredPort: "80", want: true},
+		{name: "localhost root dot omitted port at configured HTTP default", host: "localhost.", configuredPort: "80", want: true},
+		{name: "localhost root dot explicit port", host: "localhost.:1337", configuredPort: "1337", want: true},
 		{name: "ipv4 omitted port at configured HTTP default", host: "127.0.0.2", configuredPort: "80", want: true},
 		{name: "ipv6 omitted port at configured HTTP default", host: "[::1]", configuredPort: "80", want: true},
 		{name: "localhost omitted port rejected at non-default", host: "localhost", configuredPort: "1337", want: false},

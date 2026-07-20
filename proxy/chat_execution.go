@@ -79,9 +79,6 @@ func (h *ProxyHandler) executeChatCompletions(ctx context.Context, chatBody []by
 }
 
 func rawJSONFieldsExactOrFold(object map[string]json.RawMessage, name string) []json.RawMessage {
-	if raw, ok := object[name]; ok {
-		return []json.RawMessage{raw}
-	}
 	var matches []json.RawMessage
 	for candidate, raw := range object {
 		if strings.EqualFold(candidate, name) {

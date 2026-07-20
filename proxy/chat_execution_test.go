@@ -179,9 +179,14 @@ func TestChatRequestContainsResponsesReplayIDCaseInsensitiveFallback(t *testing.
 			want: true,
 		},
 		{
-			name: "exact key preferred over folded sibling",
+			name: "later folded sibling with replay is detected",
 			body: `{"messages":[{"role":"user","content":"hello"}],"MESSAGES":[{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA"}]}`,
-			want: false,
+			want: true,
+		},
+		{
+			name: "earlier replay sibling is conservatively detected",
+			body: `{"messages":[{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA"}],"MESSAGES":[{"role":"user","content":"hello"}]}`,
+			want: true,
 		},
 	}
 	for _, tc := range tests {
