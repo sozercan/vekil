@@ -5,6 +5,8 @@ Vekil supports two runtime patterns:
 - **Zero-config mode**: no `--providers-config`; the proxy uses its built-in GitHub Copilot upstream.
 - **Explicit provider routing**: pass `--providers-config` with any mix of `copilot`, `azure-openai`, `openai-codex`, `openai-compatible`, and `anthropic-compatible`. If the config omits Copilot, GitHub auth is not used.
 
+A long-lived loopback CLI or menubar server can also stage and atomically publish provider, route, and policy edits through the [local dashboard configuration](dashboard-config.md) control plane. Those edits are stored in a source-scoped managed JSON file; the original JSON/YAML bootstrap is never modified.
+
 Schema version 2 is the complete explicit-routing format: it supports public and internal routes, ordered failover, and optional [semantic policy profiles](policy-routing.md) that select one native-Chat terminal route per request. Existing route-only version-2 files remain valid. Policy routing is opt-in at runtime and defaults to globally off.
 
 ## Topic Map
@@ -13,6 +15,7 @@ Schema version 2 is the complete explicit-routing format: it supports public and
 |------|-----|
 | Runtime flags, env vars, and Copilot header overrides | This file |
 | Provider auth, JSON/YAML routing examples, model ownership, and provider metadata | [Provider Routing](provider-routing.md) |
+| Local editor, managed source precedence, optimistic revisions, apply/reset, and security | [Local Dashboard Configuration](dashboard-config.md) |
 | Schema-v2 semantic policy profiles, privacy/trust acknowledgements, and rollout gates | [Semantic Policy Routing](policy-routing.md) |
 | Provider console links and API-key setup patterns | [Provider API Keys](provider-api-keys.md) |
 | Optional shell command rewrite and tool-output reduction config | [Tool Optimizers](tool-optimizers.md) |
@@ -26,6 +29,8 @@ Schema version 2 is the complete explicit-routing format: it supports public and
 | `--host` | `HOST` | `127.0.0.1` | Listen host |
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
+| `--ignore-managed` | `PROVIDERS_CONFIG_IGNORE_MANAGED` | `false` | Start from the selected bootstrap source without reading or deleting its dashboard-managed override. This is a read-only recovery startup. |
+| `--reset-managed` | `PROVIDERS_CONFIG_RESET_MANAGED` | `false` | Delete the selected source's dashboard-managed override before startup, then use the current bootstrap. Mutually exclusive with `--ignore-managed`. |
 | `--policy-routing` | `POLICY_ROUTING_MODE` | `off` | Process-wide policy-routing ceiling: `off`, `observe`, or `enforce`. A profile cannot run above this ceiling. |
 | `--policy-routing-allow-remote-single-tenant` | `POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT` | `false` | Acknowledge running policy `observe`/`enforce` on a non-loopback bind for one trusted tenant. This adds no authentication or tenant isolation. |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
@@ -34,6 +39,24 @@ Schema version 2 is the complete explicit-routing format: it supports public and
 Native CLI and tray-app runs default to `127.0.0.1`. Container deployments that publish the proxy port must bind to `0.0.0.0`; the official image and sample Kubernetes manifest set `HOST=0.0.0.0` for that path.
 
 Policy `observe` and `enforce` are a v1 single-tenant feature. Loopback is the default supported topology. A non-loopback bind requires the explicit remote-single-tenant acknowledgement above, but that acknowledgement does not protect the proxy; put remote deployments behind a trusted external authentication and network boundary.
+
+## Bootstrap and dashboard-managed configuration
+
+The selected bootstrap has a stable source identity:
+
+- no file: `implicit-copilot`;
+- file selection: `file:<absolute-clean-path>`.
+
+Vekil looks for a matching managed envelope below `<UserConfigDir>/vekil/dashboard-config/`. The implicit source uses `implicit-copilot.json`; file sources use a SHA-256-derived filename. Startup uses the managed document only when its source ID and canonical bootstrap digest match the current bootstrap. A semantic bootstrap change with an existing managed override is a conflict and stops startup; formatting/comment-only changes do not conflict.
+
+Recovery options are intentionally different:
+
+- `--ignore-managed` uses the bootstrap for this process, preserves the override, and disables managed writes.
+- `--reset-managed` removes the override and returns to a normally writable bootstrap-backed startup when the config directory is writable.
+- The tray app exposes **Reset Dashboard Override** for the currently selected bootstrap source.
+- The running local editor exposes an optimistic, asynchronous **Reset managed override** action.
+
+The original bootstrap file remains byte-for-byte unchanged across dashboard applies and resets. Inline secrets written through the editor live in plaintext in the owner-restricted managed file; prefer `api_key_env` where practical. See [Local Dashboard Configuration](dashboard-config.md#bootstrap-source-and-managed-override) for precedence, conflicts, paths, permissions, and container behavior.
 
 ## Copilot Header Overrides
 
@@ -59,6 +82,8 @@ Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership 
 - Set the optional top-level `insight_model` key to a public model ID the config serves to enable the dashboard's AI insights button. See [Traffic Dashboard](dashboard.md#ai-insights-optional).
 
 ## Config validation
+
+The dashboard's `POST /dashboard/api/v1/config/validate` path performs the same strict JSON and semantic checks against the active base revision, including secret-operation and preserved-field rules. It is offline and does not publish a generation. The CLI commands below remain the file-oriented validation path.
 
 Validate strict JSON/YAML decoding, references, collisions, route contracts, policy bounds, and local credential construction without starting the server or contacting inference endpoints:
 

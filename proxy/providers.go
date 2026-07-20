@@ -512,10 +512,7 @@ func defaultProviderSetup(h *ProxyHandler) *providerSetup {
 }
 
 func (h *ProxyHandler) providerSetup() *providerSetup {
-	if h != nil && h.providersState != nil {
-		return h.providersState
-	}
-	return defaultProviderSetup(h)
+	return h.providerSetupForContext(nil)
 }
 
 func (h *ProxyHandler) hasClosedConfiguredModelRegistry() bool {
@@ -709,11 +706,6 @@ func (ps *providerSetup) modelsForProvider(providerID string) []providerModel {
 }
 
 func (h *ProxyHandler) initializeProviders() error {
-	if len(h.providersConfig.Providers) == 0 {
-		h.providersState = defaultProviderSetup(h)
-		return nil
-	}
-
 	setup, err := h.buildConfiguredProviderSetupWithDynamicValidation(context.Background(), h.providersConfig, !h.deferDynamicProviderModelRefresh)
 	if err != nil {
 		return err
@@ -728,6 +720,9 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 }
 
 func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx context.Context, cfg ProvidersConfig, validateDynamicModels bool) (*providerSetup, error) {
+	if len(cfg.Providers) == 0 {
+		return defaultProviderSetup(h), nil
+	}
 	providers, providerOrder, defaultProviderID, err := h.buildProviders(cfg)
 	if err != nil {
 		return nil, err

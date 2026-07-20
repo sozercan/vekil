@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Vekil Provider Configuration</title>
+  <link rel="stylesheet" href="/dashboard/config.css">
+  <script src="/dashboard/config.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#configEditor">Skip to configuration editor</a>
+
+  <header class="topbar">
+    <div>
+      <a class="brand" href="/dashboard" aria-label="Vekil traffic dashboard">Vekil</a>
+      <span class="topbar-divider" aria-hidden="true">/</span>
+      <span class="topbar-title">Provider configuration</span>
+    </div>
+    <nav aria-label="Dashboard navigation">
+      <a href="/dashboard">Traffic dashboard</a>
+    </nav>
+  </header>
+
+  <main id="configEditor" class="page-shell" tabindex="-1">
+    <section class="hero" aria-labelledby="pageTitle">
+      <div>
+        <p class="eyebrow">Local control plane</p>
+        <h1 id="pageTitle">Provider configuration</h1>
+        <p class="hero-copy">Stage, validate, and atomically apply provider, model-route, and policy-profile changes. The active runtime keeps serving while a candidate is built.</p>
+      </div>
+      <div id="liveStatus" class="live-status" role="status" aria-live="polite" aria-atomic="true">Loading active configuration…</div>
+    </section>
+
+    <section id="availabilityBanner" class="notice notice-warning" aria-labelledby="availabilityTitle" hidden>
+      <h2 id="availabilityTitle">Configuration editing is unavailable</h2>
+      <p id="availabilityReason"></p>
+    </section>
+
+    <section id="staleBanner" class="notice notice-error" aria-labelledby="staleTitle" hidden>
+      <h2 id="staleTitle">This draft is based on an older revision</h2>
+      <p>The active configuration changed after this page loaded. Copy any draft JSON you need, then reload before applying.</p>
+    </section>
+
+    <section id="errorSummary" class="error-summary" role="alert" tabindex="-1" aria-labelledby="errorSummaryTitle" hidden>
+      <h2 id="errorSummaryTitle">Review the following problems</h2>
+      <ul id="errorSummaryList"></ul>
+    </section>
+
+    <section class="overview-card" aria-labelledby="overviewTitle">
+      <div class="section-heading compact-heading">
+        <div>
+          <p class="eyebrow">Active generation</p>
+          <h2 id="overviewTitle">Source and policy status</h2>
+        </div>
+        <button id="reloadButton" class="button button-secondary" type="button">Reload active configuration</button>
+      </div>
+
+      <dl class="status-grid">
+        <div>
+          <dt>Write capability</dt>
+          <dd id="capabilityValue">Checking…</dd>
+        </div>
+        <div>
+          <dt>Source</dt>
+          <dd id="sourceValue">—</dd>
+        </div>
+        <div>
+          <dt>Revision</dt>
+          <dd><code id="revisionValue">—</code></dd>
+        </div>
+        <div>
+          <dt>Draft schema</dt>
+          <dd id="schemaValue">—</dd>
+        </div>
+        <div>
+          <dt>Configured policy mode</dt>
+          <dd id="policyConfiguredValue">—</dd>
+        </div>
+        <div>
+          <dt>Effective policy mode</dt>
+          <dd id="policyEffectiveValue">—</dd>
+        </div>
+        <div>
+          <dt>Process ceiling</dt>
+          <dd id="policyCeilingValue">—</dd>
+        </div>
+      </dl>
+
+      <details id="sourceDetailsWrap" class="details-block">
+        <summary>Source details</summary>
+        <dl id="sourceDetails" class="detail-list"></dl>
+      </details>
+
+      <details id="preservedDetails" class="details-block">
+        <summary><span id="preservedSummary">Server-preserved paths</span></summary>
+        <p>These values are shown in structured JSON for context but cannot be changed by this editor.</p>
+        <ul id="preservedPathsList" class="code-list"></ul>
+      </details>
+    </section>
+
+    <form id="configForm" novalidate>
+      <div class="tabs" role="tablist" aria-label="Configuration sections">
+        <button id="providersTab" class="tab" type="button" role="tab" aria-selected="true" aria-controls="providersPanel" tabindex="0" data-tab="providers">Providers</button>
+        <button id="routesTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="routesPanel" tabindex="-1" data-tab="routes">Model routes</button>
+        <button id="policiesTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="policiesPanel" tabindex="-1" data-tab="policies">Policy profiles</button>
+        <button id="rawTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="rawPanel" tabindex="-1" data-tab="raw">Structured JSON</button>
+      </div>
+
+      <section id="providersPanel" class="tab-panel" role="tabpanel" aria-labelledby="providersTab" data-panel="providers">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Upstream ownership</p>
+            <h2>Providers</h2>
+            <p>Configure provider destinations, authentication sources, secret operations, model discovery, and static model metadata.</p>
+          </div>
+          <button id="addProviderButton" class="button button-primary" type="button">Add provider</button>
+        </div>
+        <div id="providersList" class="stack-list" aria-live="polite"></div>
+      </section>
+
+      <section id="routesPanel" class="tab-panel" role="tabpanel" aria-labelledby="routesTab" data-panel="routes" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Public and internal contracts</p>
+            <h2>Model routes</h2>
+            <p>Define explicit schema-v2 model contracts and ordered, semantically equivalent provider targets.</p>
+          </div>
+          <button id="addRouteButton" class="button button-primary" type="button">Add model route</button>
+        </div>
+        <div id="routesList" class="stack-list" aria-live="polite"></div>
+      </section>
+
+      <section id="policiesPanel" class="tab-panel" role="tabpanel" aria-labelledby="policiesTab" data-panel="policies" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Semantic routing</p>
+            <h2>Policy profiles</h2>
+            <p>Use the guided steps to bind terminal routes, classifier limits, fallback tiers, and required data-policy acknowledgements.</p>
+          </div>
+          <button id="addPolicyButton" class="button button-primary" type="button">Add policy profile</button>
+        </div>
+        <div id="policiesList" class="stack-list" aria-live="polite"></div>
+      </section>
+
+      <section id="rawPanel" class="tab-panel" role="tabpanel" aria-labelledby="rawTab" data-panel="raw" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Lossless fallback</p>
+            <h2>Structured JSON</h2>
+            <p>Edit or import the complete non-secret document. Unknown fields remain intact, and server-preserved paths are restored from the base revision before requests are sent.</p>
+          </div>
+        </div>
+
+        <div class="notice notice-info">
+          <h3>Secrets are separate</h3>
+          <p>API keys and extra-header values are never loaded into this editor. JSON values such as <code>***</code> are not interpreted as stored secrets. Use the explicit keep, set, or clear controls in Providers.</p>
+        </div>
+
+        <div class="raw-toolbar" aria-label="Structured JSON tools">
+          <label class="file-button">
+            <span>Import JSON file</span>
+            <input id="rawFileInput" type="file" accept="application/json,.json">
+          </label>
+          <button id="formatRawButton" class="button button-secondary" type="button">Format JSON</button>
+          <button id="updateFromRawButton" class="button button-primary" type="button">Update forms from JSON</button>
+          <button id="copyRawButton" class="button button-secondary" type="button">Copy JSON</button>
+        </div>
+
+        <div class="field field-wide">
+          <label for="rawConfig">Non-secret provider configuration JSON</label>
+          <textarea id="rawConfig" class="code-editor" rows="30" spellcheck="false" autocomplete="off" aria-describedby="rawConfigHint" data-config-path="/"></textarea>
+          <p id="rawConfigHint" class="field-hint">The server performs strict decoding and authoritative semantic validation. Duplicate keys cannot be represented after JSON is parsed in the browser.</p>
+        </div>
+      </section>
+
+      <section id="applyStatusCard" class="apply-status-card" aria-labelledby="applyStatusTitle" hidden>
+        <div>
+          <p class="eyebrow">Candidate generation</p>
+          <h2 id="applyStatusTitle">Apply status</h2>
+        </div>
+        <dl class="apply-status-grid">
+          <div><dt>Apply ID</dt><dd><code id="applyIdValue">—</code></dd></div>
+          <div><dt>State</dt><dd id="applyStateValue">—</dd></div>
+          <div><dt>Detail</dt><dd id="applyMessageValue">—</dd></div>
+        </dl>
+      </section>
+
+      <div class="action-bar" aria-label="Configuration actions">
+        <div class="action-bar-copy">
+          <strong id="draftState">No draft changes</strong>
+          <span id="actionHint">Validation does not change the active runtime.</span>
+        </div>
+        <div class="button-row">
+          <button id="resetButton" class="button button-danger-secondary" type="button">Reset managed override</button>
+          <button id="validateButton" class="button button-secondary" type="button">Validate</button>
+          <button id="applyButton" class="button button-primary" type="button">Apply configuration</button>
+        </div>
+      </div>
+    </form>
+  </main>
+
+  <dialog id="resetDialog" aria-labelledby="resetDialogTitle" aria-describedby="resetDialogDescription">
+    <form method="dialog" class="dialog-card">
+      <h2 id="resetDialogTitle">Reset the managed override?</h2>
+      <p id="resetDialogDescription">Vekil will stage the bootstrap provider configuration as a new runtime generation. The original JSON or YAML source is not modified.</p>
+      <div class="button-row dialog-actions">
+        <button class="button button-secondary" value="cancel">Cancel</button>
+        <button id="confirmResetButton" class="button button-danger" value="confirm">Reset managed override</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

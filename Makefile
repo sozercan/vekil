@@ -15,7 +15,7 @@ SPARKLE_DOWNLOAD_URL := https://github.com/sparkle-project/Sparkle/releases/down
 SPARKLE_FEED_URL ?= https://github.com/sozercan/vekil/releases/latest/download/appcast.xml
 SPARKLE_PUBLIC_ED_KEY ?=
 
-.PHONY: build build-app build-tray-linux test-app test compaction-lab vet lint clean docker-build docker-build-rtk docker-rtk-e2e
+.PHONY: build build-app build-tray-linux test-app test test-frontend compaction-lab vet lint clean docker-build docker-build-rtk docker-rtk-e2e
 
 build:
 	go build -ldflags="$(LDFLAGS)" -o $(BINARY) .
@@ -96,8 +96,12 @@ build-tray-linux:
 	CGO_ENABLED=0 GOOS=linux \
 		go build -ldflags="$(LDFLAGS) -X main.buildVersion=$(APP_VERSION)" -o $(TRAY_LINUX_BINARY) ./cmd/menubar/
 
-test:
+test: test-frontend
 	go test ./... -count=1
+
+test-frontend:
+	node --check proxy/dashboard/config.js
+	node --test proxy/dashboard/config.test.mjs
 
 compaction-lab:
 	go run ./cmd/compaction-lab

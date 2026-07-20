@@ -28,6 +28,8 @@ vekil launch codex \
   --model my-responses-model
 ```
 
+Launchers intentionally use the selected bootstrap file directly. They do **not** consume, expose, persist, or reset the source-scoped dashboard-managed override used by a long-lived CLI/menubar server. Their `/dashboard/api/v1/config` response is capability-only, even though the ephemeral proxy is loopback. This prevents a short-lived agent session from becoming a persistent config administrator.
+
 Arguments after `--` are forwarded to the selected agent:
 
 ```bash
@@ -46,7 +48,7 @@ outside the ephemeral proxy lifecycle.
 
 Every launcher:
 
-1. loads Vekil provider configuration and credentials;
+1. loads the explicitly selected/implicit bootstrap provider configuration and credentials without dashboard-managed precedence;
 2. starts a proxy on `127.0.0.1:0` unless `--port` is provided;
 3. completes startup authentication and provider-model validation;
 4. initializes configured policy routing using the `--policy-routing` / `POLICY_ROUTING_MODE` safety ceiling;

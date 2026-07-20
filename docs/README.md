@@ -20,6 +20,7 @@ This folder is intentionally split into small, single-purpose files so humans an
 | [`responses.md`](responses.md) | native Responses behavior, the Chat-over-Responses boundary, compact, and memory shims | Responses passthrough, Chat adaptation, compaction, or shim behavior changes |
 | [`architecture.md`](architecture.md) | package responsibilities, route registry/executor, Chat execution seam, replay safety, and data flow | implementation boundaries or design decisions change |
 | [`dashboard.md`](dashboard.md) | live browser traffic dashboard, route/attempt metrics, AI insights, and `/stats.json` | dashboard metrics, endpoints, insight routing, or stats behavior change |
+| [`dashboard-config.md`](dashboard-config.md) | local provider/route/policy editor, managed source precedence, security, optimistic apply/reset API, and runtime-generation behavior | dashboard config UI, API, persistence, access, apply lifecycle, or generation semantics change |
 | [`menubar.md`](menubar.md) | macOS/Linux tray app usage | tray behavior or packaging changes |
 | [`development.md`](development.md) | build, test, route-safety, policy-routing, and Chat-over-Responses matrices, benchmark/evaluation baselines, and CI workflows | local dev, test gates, benchmark commands, evaluation gates, or CI change |
 

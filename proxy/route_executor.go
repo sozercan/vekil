@@ -3019,10 +3019,11 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			break
 		}
 		req = req.WithContext(withExplicitRouteResponseInfo(req.Context(), explicitRouteResponseInfo{
-			routeID:    route.public.routeID,
-			publicID:   route.public.id,
-			targetID:   target.id,
-			providerID: target.provider.id,
+			routeID:        route.public.routeID,
+			publicID:       route.public.id,
+			targetID:       target.id,
+			providerID:     target.provider.id,
+			targetRevision: targetRevisionForBinding(route.public, target),
 		}))
 		req.GetBody = nil
 
@@ -3644,10 +3645,10 @@ func routeErrorStatus(err error) int {
 func (h *ProxyHandler) withExplicitRouteOperation(ctx, inbound context.Context, model, endpoint string) (context.Context, *routeOperation, *modelRoute, error) {
 	existing := routeOperationFromContext(ctx)
 	model = strings.TrimSpace(model)
-	if existing == nil && model != "" && !h.modelAllowedForRequest(model, endpoint) {
+	if existing == nil && model != "" && !h.modelAllowedForContext(inbound, model, endpoint) {
 		return ctx, nil, nil, modelNotAllowedRequestError(model)
 	}
-	route, known := h.resolveModelRouteForRequest(model, endpoint)
+	route, known := resolveModelRouteForSetup(h.providerSetupForContext(inbound), model, endpoint)
 	if !known || route == nil || route.legacy {
 		return ctx, nil, route, nil
 	}

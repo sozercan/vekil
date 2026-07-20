@@ -145,7 +145,24 @@ Returns `{"status":"ok"}` as soon as the HTTP listener is serving. This endpoint
 
 ## `GET /readyz`
 
-Validates compiled configuration, required startup authentication/catalog initialization, admission state, policy classifier preflight where required, and shutdown state. On success it returns `{"status":"ready"}`. On failure it returns `503` with `{"status":"not_ready","error":"..."}`. Transient failure of one terminal route target does not by itself make the whole process unready. An effective policy `enforce` profile must pass live classifier preflight before startup/readiness completes; an effective `observe` profile that fails preflight is kept off and reports a readiness/configuration diagnostic.
+Validates compiled configuration, required startup authentication/catalog initialization, admission state, policy classifier preflight where required, and shutdown state. On success it returns `{"status":"ready"}`. On failure it returns `503` with `{"status":"not_ready","error":"..."}`. Transient failure of one terminal route target does not by itself make the whole process unready. An effective policy `enforce` profile must pass live classifier preflight before startup/readiness completes; an effective `observe` profile that fails preflight is kept off and reports a readiness/configuration diagnostic. A pending or failed dashboard candidate does not alter active readiness; `/readyz` changes only when a completed candidate is published.
+
+## Dashboard Configuration Control Plane
+
+The versioned dashboard config API manages the active providers document only on supported long-lived loopback CLI/menubar servers. Non-loopback and managed-launch servers return capability metadata without the provider document; they do not expose a remote admin API. Complete semantics and examples are in [Local Dashboard Configuration](dashboard-config.md).
+
+| Method | Path | Result |
+|---|---|---|
+| `GET` | `/dashboard/config` | Local editor page |
+| `GET` | `/dashboard/api/v1/config` | Capability plus, when available, redacted config/source/policy data, active `revision`, numeric `generation`, `ETag`, and CSRF nonce |
+| `POST` | `/dashboard/api/v1/config/validate` | Strict offline validation of a mutation envelope against the active revision |
+| `POST` | `/dashboard/api/v1/config/applies` | `202` asynchronous apply receipt and `Location` |
+| `GET` | `/dashboard/api/v1/config/applies/{id}` | Retained apply/reset status |
+| `DELETE` | `/dashboard/api/v1/config/managed` | `202` asynchronous reset to the bootstrap source |
+
+Validation/apply bodies use `base_revision`, a complete non-secret `config`, and explicit `secret_operations` (`keep`, `set`, or `clear`). Validation and apply require `Content-Type: application/json`, `If-Match` equal to the body and active revision, same-origin checks, and `X-Vekil-CSRF`. Reset requires the active `If-Match` and CSRF nonce. The mutation body limit is 1 MiB. Reads omit inline API keys, blank every `extra_headers` value, and return `Cache-Control: no-store`.
+
+Only one apply/reset runs at once (`409` otherwise); stale revisions return `412`. Accepted work privately builds/discovers/preflights the candidate, persists it, and publishes one runtime generation. The old generation remains active until persistence succeeds. Statuses expire 15 minutes after reaching a terminal state and the in-memory store is capped at 64 entries.
 
 ## Traffic Dashboard Endpoints
 
@@ -153,4 +170,4 @@ Validates compiled configuration, required startup authentication/catalog initia
 - `GET /stats.json` — in-memory traffic snapshot (client-request totals, latency percentiles, per-second series, by-model/provider/agent/route/target breakdowns, physical upstream attempts, target switches, state-binding counters, legacy upstream retries, policy eligibility/admission/decision/classifier metrics, and a recent-requests log) polled by the dashboard.
 - `POST /dashboard/insight` — optional AI-generated traffic summary. Active only when `insight_model` is set in providers config; single-flight with a cooldown; fails open. The insight model may be native Chat or native Responses as long as Vekil can serve it through Chat compatibility.
 
-These endpoints are unauthenticated like `/healthz` and are excluded from their own stats. See [Traffic Dashboard](dashboard.md) for the payload shape, agent classification, AI insights, and access/security notes.
+These traffic endpoints have no dedicated dashboard login and are excluded from their own stats. Any server-level inbound auth still wraps them, and non-loopback deployments should add an external access boundary. The provider-config routes above have additional loopback Host, same-origin, and CSRF restrictions. See [Traffic Dashboard](dashboard.md) for the payload shape, agent classification, AI insights, and traffic-endpoint security notes.

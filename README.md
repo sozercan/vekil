@@ -108,6 +108,7 @@ Documentation lives under [`docs/`](docs/README.md); start with these:
 | [API Reference](docs/api.md)                                 | Endpoint behavior and compatibility |
 | [Architecture](docs/architecture.md)                         | Package layout and design notes     |
 | [Traffic Dashboard](docs/dashboard.md)                       | Live browser dashboard and stats    |
+| [Dashboard Configuration](docs/dashboard-config.md)          | Local provider/route/policy editor  |
 | [Tray App](docs/menubar.md)                                  | macOS/Linux menubar usage           |
 | [Development](docs/development.md)                           | Build, test, benchmarks, CI         |
 

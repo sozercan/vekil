@@ -167,7 +167,7 @@ Validation also rejects:
 - classifier routes that are public, have the wrong internal purpose, or can send more than once;
 - classifiers that cannot perform the forced function-tool protocol;
 - missing trust-domain or data-policy acknowledgements; and
-- unsupported custom prompts, custom output schemas, arbitrary routing languages, or config hot reload.
+- unsupported custom prompts, custom output schemas, or arbitrary routing languages.
 
 ## Profile mode and global ceiling
 
@@ -177,6 +177,8 @@ Each profile has `mode: off|observe|enforce`, defaulting to `off`. The process-w
 --policy-routing=off|observe|enforce
 POLICY_ROUTING_MODE=off|observe|enforce
 ```
+
+The local dashboard editor shows all three values separately: the profile's configured mode, the immutable process ceiling selected at startup, and the currently effective mode. Applying a document can change profile modes but cannot raise the process ceiling.
 
 Effective mode is the lower of the global ceiling and the profile mode:
 
@@ -311,13 +313,17 @@ When any profile's **effective** mode is `observe` or `enforce`, startup perform
 - acceptance of the configured non-storage behavior; and
 - a maximum of one physical send.
 
-Mode-specific behavior:
+Mode-specific startup behavior:
 
 - `enforce`: failed preflight prevents readiness and startup completion;
 - `observe`: failed preflight keeps the profile off and reports a readiness/configuration diagnostic rather than silently observing; and
 - `off`: no live preflight or classifier send.
 
-`vekil config validate` remains offline. Use `vekil config validate --live` when an operator wants the same protocol preflight without starting the server. A successful preflight proves protocol acceptance only; it does not prove external provider retention behavior.
+A dashboard apply performs the same work against the **staged candidate provider/route setup** before publication. Candidate preflight never toggles the active generation's pending/readiness state. An effective-enforce failure ends the job as `failed_preflight` and leaves the old generation active. If an observe-only classifier route fails, the affected candidate profile is kept effectively off with a diagnostic; the candidate may publish with configured mode still `observe` and effective mode reported as `off`. After any successful publication, `/readyz`, policy stats, and the config read describe only the new active controller.
+
+The editor is writable only on a supported long-lived loopback server. A non-loopback policy deployment, even one started with `--policy-routing-allow-remote-single-tenant`, receives config capability metadata only and cannot activate or edit profiles remotely. The acknowledgement is not remote-admin authorization.
+
+`vekil config validate` remains offline. Use `vekil config validate --live` when an operator wants the same protocol preflight without starting the server. A successful preflight proves protocol acceptance only; it does not prove external provider retention behavior. See [Local Dashboard Configuration](dashboard-config.md#policy-modes-during-hot-apply) for apply states, optimistic revisions, and persistence/publication ordering.
 
 ## Catalog and output identity
 
@@ -401,13 +407,13 @@ Keep the global ceiling `off` until the evaluation gates pass. Then:
 4. When multiple replicas are available, canary stateless Chat traffic at 5% → 25% → 100% by deployment.
 5. Keep direct stateful Responses/websocket traffic outside the policy canary pool or on its existing sticky topology.
 
-Emergency rollback is process-wide:
+For a running supported loopback server, the dashboard can set selected profile modes to `off` and atomically publish that config after optimistic validation. It cannot change the process ceiling. Emergency process-wide rollback still requires starting/restarting with the ceiling off:
 
 ```bash
 POLICY_ROUTING_MODE=off vekil --providers-config /path/to/providers.yaml
 ```
 
-V1 stores no policy affinity, so policy rollback requires no policy-session migration. Existing direct Responses/websocket state retains its separate process-local restart and affinity limitations.
+If a source-scoped managed override exists, that restart still resolves it after the bootstrap; use `--ignore-managed` or `--reset-managed` only when the managed document itself must be bypassed or removed. V1 stores no policy affinity, so policy rollback requires no policy-session migration. Existing direct Responses/websocket state retains its separate process-local restart and affinity limitations. There is no policy configuration history or arbitrary rollback UI.
 
 ## Deferred work
 

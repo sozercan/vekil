@@ -171,18 +171,19 @@ type statsErrorRow struct {
 
 // statsSnapshot is the payload served at GET /stats.json.
 type statsSnapshot struct {
-	UptimeSeconds int64                  `json:"uptime_seconds"`
-	Inflight      int64                  `json:"inflight"`
-	Totals        statsTotals            `json:"totals"`
-	Status        map[string]int64       `json:"status"`
-	StatusCodes   []statsErrorRow        `json:"status_codes"`
-	Errors        []statsErrorRow        `json:"errors"`
-	Series        []statsSeriesPoint     `json:"series"`
-	ByModel       []statsBreakdown       `json:"by_model"`
-	ByProvider    []statsBreakdown       `json:"by_provider"`
-	ByAgent       []statsBreakdown       `json:"by_agent"`
-	ByRoute       []statsBreakdown       `json:"by_route"`
-	ByTarget      []statsTargetBreakdown `json:"by_target"`
+	UptimeSeconds    int64                  `json:"uptime_seconds"`
+	ConfigGeneration uint64                 `json:"config_generation,omitempty"`
+	Inflight         int64                  `json:"inflight"`
+	Totals           statsTotals            `json:"totals"`
+	Status           map[string]int64       `json:"status"`
+	StatusCodes      []statsErrorRow        `json:"status_codes"`
+	Errors           []statsErrorRow        `json:"errors"`
+	Series           []statsSeriesPoint     `json:"series"`
+	ByModel          []statsBreakdown       `json:"by_model"`
+	ByProvider       []statsBreakdown       `json:"by_provider"`
+	ByAgent          []statsBreakdown       `json:"by_agent"`
+	ByRoute          []statsBreakdown       `json:"by_route"`
+	ByTarget         []statsTargetBreakdown `json:"by_target"`
 	// PhysicalUsage counts usage reported by explicit-route upstream sends.
 	// WastedUsage is the subset reported by attempts that did not become an
 	// accepted client-visible result. Both ledgers are additive to, and do not
@@ -1852,11 +1853,15 @@ func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAg
 // post-terminal usage amendments without creating synthetic requests. status is
 // the client turn outcome so failed turns appear in error counts.
 func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, operationIDs ...string) responsesTurnStatsRecord {
+	return h.RecordResponsesTurnForContext(context.Background(), model, provider, kind, agentLabel, status, usage, operationIDs...)
+}
+
+func (h *ProxyHandler) RecordResponsesTurnForContext(ctx context.Context, model, provider, kind, agentLabel string, status int, usage responsesUsage, operationIDs ...string) responsesTurnStatsRecord {
 	if h == nil || h.stats == nil {
 		return responsesTurnStatsRecord{}
 	}
 	policyPublicID := ""
-	if publicID, ok := h.policyPublicModelID(model); ok {
+	if publicID, ok := h.policyPublicModelIDForContext(ctx, model); ok {
 		policyPublicID = publicID
 		model = publicID
 		provider = ""
@@ -1880,9 +1885,20 @@ func (h *ProxyHandler) HandleStatsJSON(w http.ResponseWriter, r *http.Request) {
 	}
 	snap.PolicyRouting = emptyPolicyStatsSnapshot()
 	if h != nil {
-		snap.InsightsEnabled = strings.TrimSpace(h.providersConfig.InsightModel) != ""
-		if controller, ok := h.policyRoutingController.(*chatPolicyRoutingController); ok {
-			snap.PolicyRouting = controller.PolicyStatsSnapshot()
+		runtime := h.currentRuntime()
+		if runtime != nil {
+			snap.ConfigGeneration = runtime.generation
+			snap.InsightsEnabled = strings.TrimSpace(runtime.config.InsightModel) != ""
+			if runtime.policy != nil {
+				if controller, ok := runtime.policy.controller.(*chatPolicyRoutingController); ok {
+					snap.PolicyRouting = controller.PolicyStatsSnapshot()
+				}
+			}
+		} else {
+			snap.InsightsEnabled = strings.TrimSpace(h.providersConfig.InsightModel) != ""
+			if controller, ok := h.policyRoutingController.(*chatPolicyRoutingController); ok {
+				snap.PolicyRouting = controller.PolicyStatsSnapshot()
+			}
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1910,6 +1926,10 @@ func (h *ProxyHandler) HandleDashboardAsset(w http.ResponseWriter, r *http.Reque
 		serveDashboardFile(w, "dashboard/uPlot.min.js", "text/javascript; charset=utf-8", true)
 	case "uPlot.min.css":
 		serveDashboardFile(w, "dashboard/uPlot.min.css", "text/css; charset=utf-8", true)
+	case "config.js":
+		serveDashboardFile(w, "dashboard/config.js", "text/javascript; charset=utf-8", false)
+	case "config.css":
+		serveDashboardFile(w, "dashboard/config.css", "text/css; charset=utf-8", false)
 	default:
 		http.NotFound(w, r)
 	}

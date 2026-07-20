@@ -41,7 +41,7 @@ func (h *ProxyHandler) applyExplicitRequestStateBinding(operation *routeOperatio
 		bootstrapOwner := stateBindingOwner{}
 		if target, ok := explicitConversationBootstrapTarget(operation.route); ok {
 			if pinned := operation.pinnedTarget(); pinned == "" || pinned == target.id {
-				bootstrapOwner = stateBindingOwner{routeID: operation.route.public.routeID, targetID: target.id}
+				bootstrapOwner = stateBindingOwner{routeID: operation.route.public.routeID, targetID: target.id, targetRevision: target.revision}
 			}
 		}
 		result, bootstrapped, evictions = store.resolveOrBindConversationForRoute(
@@ -58,7 +58,8 @@ func (h *ProxyHandler) applyExplicitRequestStateBinding(operation *routeOperatio
 
 	switch result.outcome {
 	case stateBindingLookupKnown:
-		if _, ok := operation.route.targetByID(result.owner.targetID); !ok {
+		target, ok := operation.route.targetByID(result.owner.targetID)
+		if !ok || !stateBindingOwnerMatchesTarget(result.owner, operation.route, target) {
 			h.RecordStateBindingMiss()
 			return &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("provider state is bound to an unavailable route target")}
 		}
@@ -394,7 +395,15 @@ func (h *ProxyHandler) bindExplicitStateTokens(info explicitRouteResponseInfo, t
 	if err != nil {
 		return err
 	}
-	owner := stateBindingOwner{routeID: info.routeID, targetID: info.targetID}
+	targetRevision := info.targetRevision
+	if targetRevision == "" {
+		var found bool
+		targetRevision, found = h.explicitRouteTargetRevision(info.routeID, info.targetID)
+		if !found && h != nil && h.providersState != nil {
+			return fmt.Errorf("provider state route target is unavailable")
+		}
+	}
+	owner := stateBindingOwner{routeID: info.routeID, targetID: info.targetID, targetRevision: targetRevision}
 	result, evictions := store.bindAllWithEvictionDelta(tokens, owner)
 	if result.outcome == stateBindingLookupConflict {
 		return fmt.Errorf("provider state token collided with another route target")

@@ -1,0 +1,431 @@
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
+)
+
+func newDashboardConfigTestHandler(t *testing.T) (*ProxyHandler, ResolvedProvidersConfig) {
+	t.Helper()
+	root := t.TempDir()
+	bootstrapPath := filepath.Join(root, "providers.json")
+	body := `{
+  "providers": [{
+    "id": "local",
+    "type": "openai-compatible",
+    "default": true,
+    "base_url": "https://provider.example/v1",
+    "api_key": "top-secret-key",
+    "auth_type": "bearer",
+    "extra_headers": {"X-Secret-Header": "header-secret"},
+    "model_discovery": "static",
+    "models": [{"public_id": "demo", "deployment": "demo-upstream", "endpoints": ["/chat/completions"], "name": "Demo"}]
+  }]
+}`
+	if err := os.WriteFile(bootstrapPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := ResolveProvidersConfig(ProvidersConfigResolveOptions{BootstrapPath: bootstrapPath, UserConfigDir: filepath.Join(root, "config"), Mode: ProvidersConfigUseManaged})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewManagedProvidersConfigStore(resolved.Bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(resolved.Config),
+		WithDashboardConfigSource(resolved, store),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.ConfigureDashboardConfigAccess(true, true, "", "test")
+	return h, resolved
+}
+
+func TestDashboardConfigReadRedactsSecrets(t *testing.T) {
+	h, _ := newDashboardConfigTestHandler(t)
+	r := httptest.NewRequest(http.MethodGet, "/dashboard/api/v1/config", nil)
+	r = h.PinRuntimeRequest(r)
+	w := httptest.NewRecorder()
+	h.HandleDashboardConfigRead(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, secret := range []string{"top-secret-key", "header-secret"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("read response leaked %q: %s", secret, body)
+		}
+	}
+	var response dashboardConfigReadResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Capability.Available || !response.Capability.Writable {
+		t.Fatalf("capability = %+v", response.Capability)
+	}
+	if response.Revision == "" || response.CSRFToken == "" || len(response.SecretStates) < 2 {
+		t.Fatalf("incomplete config response: %+v", response)
+	}
+	if etag := w.Header().Get("ETag"); etag == "" {
+		t.Fatal("missing ETag")
+	}
+}
+
+func TestDashboardConfigApplyPersistsThenPublishes(t *testing.T) {
+	h, resolved := newDashboardConfigTestHandler(t)
+	current := h.currentRuntime()
+	candidate := cloneProvidersConfigForValidation(current.config)
+	candidate.Providers[0].APIKey = ""
+	candidate.Providers[0].ExtraHeaders["X-Secret-Header"] = ""
+	candidate.Providers[0].Models[0].Name = "Demo Updated"
+	// The HTTP wire config is allowed to be temporarily secretless; encode it
+	// as ordinary JSON and let the server strict decoder plus secret merge
+	// reconstruct the candidate from the exact base revision.
+	configBody, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := map[string]any{
+		"base_revision": current.revision,
+		"config":        json.RawMessage(configBody),
+		"secret_operations": []SecretOperation{
+			{Path: "/providers/local/api_key", Operation: "keep"},
+			{Path: "/providers/local/extra_headers/X-Secret-Header", Operation: "keep"},
+		},
+	}
+	requestBody, _ := json.Marshal(envelope)
+	r := httptest.NewRequest(http.MethodPost, "/dashboard/api/v1/config/applies", bytes.NewReader(requestBody))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("If-Match", `"`+current.revision+`"`)
+	w := httptest.NewRecorder()
+	h.HandleDashboardConfigApply(w, r)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	var receipt ApplyReceipt
+	if err := json.Unmarshal(w.Body.Bytes(), &receipt); err != nil {
+		t.Fatal(err)
+	}
+	status := waitDashboardConfigApply(t, h.runtimeControl, receipt.ID)
+	if status.State != ApplyStateSucceeded {
+		t.Fatalf("apply status = %+v", status)
+	}
+	if h.runtimeGeneration() != current.generation+1 || h.runtimeRevision() == current.revision {
+		t.Fatalf("runtime did not publish one new generation: generation=%d revision=%s", h.runtimeGeneration(), h.runtimeRevision())
+	}
+	active := h.currentProvidersConfig()
+	if active.Providers[0].Models[0].Name != "Demo Updated" || active.Providers[0].APIKey != "top-secret-key" || active.Providers[0].ExtraHeaders["X-Secret-Header"] != "header-secret" {
+		t.Fatalf("active config lost edits or secrets: %+v", active.Providers[0])
+	}
+	if _, err := os.Stat(resolved.Bootstrap.Source.ManagedPath); err != nil {
+		t.Fatalf("managed file not committed: %v", err)
+	}
+}
+
+func TestDashboardConfigRejectsStaleRevision(t *testing.T) {
+	h, _ := newDashboardConfigTestHandler(t)
+	cfg, err := json.Marshal(h.currentProvidersConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]any{"base_revision": "cfg_stale", "config": json.RawMessage(cfg)})
+	r := httptest.NewRequest(http.MethodPost, "/dashboard/api/v1/config/validate", bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("If-Match", `"cfg_stale"`)
+	w := httptest.NewRecorder()
+	h.HandleDashboardConfigValidate(w, r)
+	if w.Code != http.StatusPreconditionFailed {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	if h.runtimeGeneration() != 1 {
+		t.Fatal("stale validation changed the active runtime")
+	}
+}
+
+func waitDashboardConfigApply(t *testing.T, control RuntimeControl, id string) ApplyStatus {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if status, ok := control.Status(id); ok && applyStateTerminal(status.State) {
+			return status
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("apply %s did not finish", id)
+	return ApplyStatus{}
+}
+
+func TestDashboardConfigPendingApplyKeepsActiveRuntimeAndRejectsSecondApply(t *testing.T) {
+	h, _ := newDashboardConfigTestHandler(t)
+	current := h.currentRuntime()
+	candidate := cloneProvidersConfigForValidation(current.config)
+	candidate.Providers[0].APIKey = ""
+	candidate.Providers[0].ExtraHeaders["X-Secret-Header"] = ""
+	candidate.Providers[0].ModelDiscovery = "openai"
+	operations := []SecretOperation{
+		{Path: "/providers/local/api_key", Operation: "keep"},
+		{Path: "/providers/local/extra_headers/X-Secret-Header", Operation: "keep"},
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	h.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		select {
+		case <-release:
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"object":"list","data":[]}`)),
+			Request:    req,
+		}, nil
+	})}
+
+	receipt, err := h.runtimeControl.Submit(ApplyRequest{BaseRevision: current.revision, Config: candidate, SecretOperations: operations})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		status, _ := h.runtimeControl.Status(receipt.ID)
+		t.Fatalf("candidate discovery did not start; status=%+v", status)
+	}
+	if got := h.currentRuntime(); got != current {
+		t.Fatal("pending candidate replaced the active runtime")
+	}
+	if _, err := h.runtimeControl.Submit(ApplyRequest{BaseRevision: current.revision, Config: candidate, SecretOperations: operations}); !errors.Is(err, errConfigApplyInProgress) {
+		t.Fatalf("second apply error = %v, want apply_in_progress", err)
+	}
+	close(release)
+	status := waitDashboardConfigApply(t, h.runtimeControl, receipt.ID)
+	if status.State != ApplyStateSucceeded {
+		t.Fatalf("apply status = %+v", status)
+	}
+}
+
+func TestDashboardConfigResetRestoresBootstrapGeneration(t *testing.T) {
+	h, resolved := newDashboardConfigTestHandler(t)
+	base := h.currentRuntime()
+	candidate := cloneProvidersConfigForValidation(base.config)
+	candidate.Providers[0].APIKey = ""
+	candidate.Providers[0].ExtraHeaders["X-Secret-Header"] = ""
+	candidate.Providers[0].Models[0].Name = "Managed Name"
+	operations := []SecretOperation{
+		{Path: "/providers/local/api_key", Operation: "keep"},
+		{Path: "/providers/local/extra_headers/X-Secret-Header", Operation: "keep"},
+	}
+	receipt, err := h.runtimeControl.Submit(ApplyRequest{BaseRevision: base.revision, Config: candidate, SecretOperations: operations})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := waitDashboardConfigApply(t, h.runtimeControl, receipt.ID); status.State != ApplyStateSucceeded {
+		t.Fatalf("apply status = %+v", status)
+	}
+	managed := h.currentRuntime()
+	if managed.config.Providers[0].Models[0].Name != "Managed Name" {
+		t.Fatal("managed generation was not published")
+	}
+
+	resetReceipt, err := h.runtimeControl.Reset(ResetRequest{BaseRevision: managed.revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := waitDashboardConfigApply(t, h.runtimeControl, resetReceipt.ID); status.State != ApplyStateSucceeded {
+		t.Fatalf("reset status = %+v", status)
+	}
+	reset := h.currentRuntime()
+	if reset.generation != managed.generation+1 || reset.revision != resolved.Bootstrap.Revision {
+		t.Fatalf("reset runtime = generation %d revision %s", reset.generation, reset.revision)
+	}
+	if reset.config.Providers[0].Models[0].Name != "Demo" {
+		t.Fatalf("reset config name = %q, want Demo", reset.config.Providers[0].Models[0].Name)
+	}
+	if _, err := os.Stat(resolved.Bootstrap.Source.ManagedPath); !os.IsNotExist(err) {
+		t.Fatalf("managed override still exists after reset: %v", err)
+	}
+}
+
+func TestDashboardConfigAssetsAreAllowlistedAndNoStore(t *testing.T) {
+	h := &ProxyHandler{}
+	page := httptest.NewRecorder()
+	h.HandleDashboardConfig(page, httptest.NewRequest(http.MethodGet, "/dashboard/config", nil))
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "/dashboard/config.js") {
+		t.Fatalf("config page status=%d body=%s", page.Code, page.Body.String())
+	}
+	if page.Header().Get("Cache-Control") != "no-store" || page.Header().Get("Content-Security-Policy") == "" {
+		t.Fatalf("config page headers = %v", page.Header())
+	}
+	for _, path := range []string{"/dashboard/config.js", "/dashboard/config.css"} {
+		w := httptest.NewRecorder()
+		h.HandleDashboardAsset(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusOK || w.Header().Get("Cache-Control") != "no-store" || w.Body.Len() == 0 {
+			t.Fatalf("asset %s status=%d headers=%v bytes=%d", path, w.Code, w.Header(), w.Body.Len())
+		}
+	}
+	unknown := httptest.NewRecorder()
+	h.HandleDashboardAsset(unknown, httptest.NewRequest(http.MethodGet, "/dashboard/secrets.json", nil))
+	if unknown.Code != http.StatusNotFound {
+		t.Fatalf("unknown asset status=%d", unknown.Code)
+	}
+}
+
+func TestDashboardSecretOperationsRequireCompatibleExplicitIntent(t *testing.T) {
+	base := ProvidersConfig{Providers: []ProviderConfig{{
+		ID:           "p",
+		Type:         string(providerTypeOpenAICompatible),
+		BaseURL:      "https://provider.example/v1",
+		AuthType:     string(providerAuthTypeBearer),
+		APIKey:       "secret",
+		ExtraHeaders: map[string]string{"X-Secret": "header"},
+	}}}
+	redacted := cloneProvidersConfigForValidation(base)
+	redacted.Providers[0].APIKey = ""
+	redacted.Providers[0].ExtraHeaders["X-Secret"] = ""
+
+	tests := []struct {
+		name       string
+		mutate     func(*ProvidersConfig)
+		operations []SecretOperation
+		wantCode   ConfigErrorCode
+	}{
+		{name: "missing operations", wantCode: ConfigErrorCode("missing_secret_operation")},
+		{name: "destination change cannot keep", mutate: func(cfg *ProvidersConfig) { cfg.Providers[0].BaseURL = "https://other.example/v1" }, operations: []SecretOperation{{Path: "/providers/p/api_key", Operation: "keep"}, {Path: "/providers/p/extra_headers/X-Secret", Operation: "keep"}}, wantCode: ConfigErrorCode("incompatible_secret_keep")},
+		{name: "placeholder cannot be set", operations: []SecretOperation{{Path: "/providers/p/api_key", Operation: "set", Value: "***"}, {Path: "/providers/p/extra_headers/X-Secret", Operation: "clear"}}, wantCode: ConfigErrorCode("invalid_secret_operation")},
+		{name: "raw secret rejected", mutate: func(cfg *ProvidersConfig) { cfg.Providers[0].APIKey = "new-secret" }, operations: []SecretOperation{{Path: "/providers/p/api_key", Operation: "clear"}, {Path: "/providers/p/extra_headers/X-Secret", Operation: "clear"}}, wantCode: ConfigErrorCode("secret_in_config")},
+		{name: "url userinfo rejected", mutate: func(cfg *ProvidersConfig) { cfg.Providers[0].BaseURL = "https://user:pass@provider.example/v1" }, operations: []SecretOperation{{Path: "/providers/p/api_key", Operation: "set", Value: "replacement"}, {Path: "/providers/p/extra_headers/X-Secret", Operation: "clear"}}, wantCode: ConfigErrorInvalidConfig},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := cloneProvidersConfigForValidation(redacted)
+			if tc.mutate != nil {
+				tc.mutate(&candidate)
+			}
+			_, err := mergeDashboardConfigCandidate(base, candidate, tc.operations)
+			var configErr *ConfigError
+			if !errors.As(err, &configErr) || configErr.Code != tc.wantCode {
+				t.Fatalf("error = %v, want code %q", err, tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestDashboardConfigShutdownCancelsBeforePersistencePublication(t *testing.T) {
+	h, resolved := newDashboardConfigTestHandler(t)
+	base := h.currentRuntime()
+	candidate := cloneProvidersConfigForValidation(base.config)
+	candidate.Providers[0].APIKey = ""
+	candidate.Providers[0].ExtraHeaders["X-Secret-Header"] = ""
+	candidate.Providers[0].Models[0].Name = "Must Not Publish"
+	operations := []SecretOperation{
+		{Path: "/providers/local/api_key", Operation: "keep"},
+		{Path: "/providers/local/extra_headers/X-Secret-Header", Operation: "keep"},
+	}
+	if err := ensureManagedProvidersConfigDirectory(filepath.Dir(resolved.Bootstrap.Source.ManagedPath)); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := acquireManagedProvidersConfigFileLock(context.Background(), resolved.Bootstrap.Source.ManagedPath+".lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lock.release() }()
+
+	receipt, err := h.runtimeControl.Submit(ApplyRequest{BaseRevision: base.revision, Config: candidate, SecretOperations: operations})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		status, _ := h.runtimeControl.Status(receipt.ID)
+		if status.State == ApplyStatePersisting {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	shutdownDone := make(chan struct{})
+	go func() {
+		h.BeginShutdown()
+		close(shutdownDone)
+	}()
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not wait for the canceled commit transaction")
+	}
+	status := waitDashboardConfigApply(t, h.runtimeControl, receipt.ID)
+	if status.State != ApplyStateCanceledShutdown {
+		t.Fatalf("apply status = %+v, want canceled_shutdown", status)
+	}
+	if h.currentRuntime() != base {
+		t.Fatal("shutdown-raced candidate was published")
+	}
+	if _, err := os.Stat(resolved.Bootstrap.Source.ManagedPath); !os.IsNotExist(err) {
+		t.Fatalf("shutdown-raced candidate was persisted: %v", err)
+	}
+}
+
+func TestDashboardConfigRouteApplyUpdatesModelsImmediately(t *testing.T) {
+	h, _ := newDashboardConfigTestHandler(t)
+	base := h.currentRuntime()
+	candidate := cloneProvidersConfigForValidation(base.config)
+	candidate.SchemaVersion = ProvidersConfigSchemaVersion2
+	candidate.Providers[0].APIKey = ""
+	candidate.Providers[0].ExtraHeaders["X-Secret-Header"] = ""
+	candidate.ModelRoutes = []ModelRouteConfig{{
+		ID:        "route-demo",
+		PublicID:  "route-demo",
+		Name:      "Routed Demo",
+		Endpoints: []string{providerEndpointChatCompletions},
+		Targets: []ModelRouteTargetConfig{{
+			ID:            "primary",
+			Provider:      "local",
+			UpstreamModel: "demo-upstream",
+		}},
+		Routing: ModelRouteRoutingConfig{Mode: string(routeModePrimaryOnly), MaxTargetAttempts: 1, MaxUpstreamSends: 1},
+	}}
+	operations := []SecretOperation{
+		{Path: "/providers/local/api_key", Operation: "keep"},
+		{Path: "/providers/local/extra_headers/X-Secret-Header", Operation: "keep"},
+	}
+	receipt, err := h.runtimeControl.Submit(ApplyRequest{BaseRevision: base.revision, Config: candidate, SecretOperations: operations})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := waitDashboardConfigApply(t, h.runtimeControl, receipt.ID); status.State != ApplyStateSucceeded {
+		t.Fatalf("apply status = %+v", status)
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	r = h.PinRuntimeRequest(r)
+	w := httptest.NewRecorder()
+	h.HandleModels(w, r)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"id":"route-demo"`) {
+		t.Fatalf("models status=%d body=%s", w.Code, w.Body.String())
+	}
+}

@@ -681,10 +681,14 @@ func (h *ProxyHandler) observeRequestSummary(ctx context.Context, endpoint, mode
 }
 
 func (h *ProxyHandler) policyPublicModelID(model string) (string, bool) {
+	return h.policyPublicModelIDForContext(context.Background(), model)
+}
+
+func (h *ProxyHandler) policyPublicModelIDForContext(ctx context.Context, model string) (string, bool) {
 	if h == nil {
 		return "", false
 	}
-	entry, known := h.providerSetup().lookupPublicModelEntry(model)
+	entry, known := h.providerSetupForContext(ctx).lookupPublicModelEntry(model)
 	if !known || entry == nil || entry.kind != publicEntryPolicy {
 		return "", false
 	}
@@ -697,7 +701,7 @@ func (h *ProxyHandler) policyPublicModelID(model string) (string, bool) {
 // body-shape or endpoint validation so local rejections cannot fall through to
 // default-provider or unrouted statistics.
 func (h *ProxyHandler) observePolicyRequestSummary(ctx context.Context, endpoint, model string, stream bool) bool {
-	publicID, ok := h.policyPublicModelID(model)
+	publicID, ok := h.policyPublicModelIDForContext(ctx, model)
 	if !ok {
 		return false
 	}
@@ -716,7 +720,7 @@ func (h *ProxyHandler) observeRequestSummaryWithProviderModel(ctx context.Contex
 		return
 	}
 	summary.setRoute(endpoint, model, stream)
-	if publicID, ok := h.policyPublicModelID(model); ok {
+	if publicID, ok := h.policyPublicModelIDForContext(ctx, model); ok {
 		summary.SetPolicyIdentity(publicID)
 		return
 	}
@@ -727,13 +731,13 @@ func (h *ProxyHandler) observeRequestSummaryWithProviderModel(ctx context.Contex
 	// Operational IDs for internal terminal/classifier routes are never public
 	// model identities. If a client guesses one, reject it without confirming
 	// the owning provider through logs or traffic statistics.
-	if route, known := h.providerSetup().lookupTerminalRoute(strings.TrimSpace(model)); known && route != nil && !route.isPublic() {
+	if route, known := h.providerSetupForContext(ctx).lookupTerminalRoute(strings.TrimSpace(model)); known && route != nil && !route.isPublic() {
 		return
 	}
-	if route, known := h.providerSetup().lookupTerminalRoute(providerModel); known && route != nil && !route.isPublic() {
+	if route, known := h.providerSetupForContext(ctx).lookupTerminalRoute(providerModel); known && route != nil && !route.isPublic() {
 		return
 	}
-	provider, _, _ := h.resolveProviderModelForRequest(providerModel, providerEndpoint)
+	provider, _, _ := h.resolveProviderModelForContext(ctx, providerModel, providerEndpoint)
 	if provider == nil {
 		return
 	}

@@ -30,9 +30,10 @@ func (i chatPolicyInput) normalized() chatPolicyInput {
 }
 
 func (h *ProxyHandler) planOpenAIChatPolicy(ctx context.Context, model string, originalBody []byte) (chatOperationPlan, error) {
-	if h == nil || h.chatPolicyPlanner == nil {
+	binding := h.policyBindingForContext(ctx)
+	if binding == nil || binding.planner == nil {
 		return chatOperationPlan{}, nil
 	}
 	input := (chatPolicyInput{Model: model, OriginalBody: originalBody}).normalized()
-	return h.chatPolicyPlanner.Plan(ctx, input)
+	return binding.planner.Plan(ctx, input)
 }

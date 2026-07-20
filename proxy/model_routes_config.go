@@ -508,6 +508,18 @@ func cloneProvidersConfigForValidation(cfg ProvidersConfig) ProvidersConfig {
 			cloned.PolicyProfiles[index] = clonePolicyProfileConfig(cfg.PolicyProfiles[index])
 		}
 	}
+	cloned.ToolOptimizers.Tools.ShellFunctionCalls.Enabled = cloneBoolPtr(cfg.ToolOptimizers.Tools.ShellFunctionCalls.Enabled)
+	cloned.ToolOptimizers.Tools.ShellFunctionCalls.Names = append([]string(nil), cfg.ToolOptimizers.Tools.ShellFunctionCalls.Names...)
+	if cfg.ToolOptimizers.Providers != nil {
+		cloned.ToolOptimizers.Providers = make([]ToolOptimizerProviderConfig, len(cfg.ToolOptimizers.Providers))
+		for index := range cfg.ToolOptimizers.Providers {
+			provider := cfg.ToolOptimizers.Providers[index]
+			provider.Enabled = cloneBoolPtr(provider.Enabled)
+			provider.Args = append([]string(nil), provider.Args...)
+			provider.Stages = append([]string(nil), provider.Stages...)
+			cloned.ToolOptimizers.Providers[index] = provider
+		}
+	}
 	return cloned
 }
 
@@ -1208,7 +1220,7 @@ func compileExplicitModelRoutes(cfg ProvidersConfig, providers map[string]*provi
 		if providersConfigSchemaSupportsPolicyRouting(validated.schemaVersion) {
 			exposure = routeCfg.Exposure
 		}
-		routes = append(routes, &modelRoute{
+		compiledRoute := &modelRoute{
 			public: publicModelContract{
 				id:        routeCfg.PublicID,
 				routeID:   routeCfg.ID,
@@ -1228,7 +1240,9 @@ func compileExplicitModelRoutes(cfg ProvidersConfig, providers map[string]*provi
 			},
 			exposure:        exposure,
 			internalPurpose: routeCfg.InternalPurpose,
-		})
+		}
+		ensureModelRouteTargetRevisions(compiledRoute)
+		routes = append(routes, compiledRoute)
 	}
 	return routes, nil
 }

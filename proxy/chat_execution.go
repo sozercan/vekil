@@ -167,9 +167,10 @@ func (h *ProxyHandler) retryResolvedNativeChat(ctx context.Context, prior chatEx
 
 func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route resolvedChatRoute, chatBody []byte, options chatExecutionOptions) (chatExecutionResult, error) {
 	replayRoute := responsesChatReplayRoute{
-		ProviderID:    route.provider.id,
-		PublicModel:   route.publicModel,
-		UpstreamModel: route.upstreamModel,
+		ProviderID:     route.provider.id,
+		PublicModel:    route.publicModel,
+		UpstreamModel:  route.upstreamModel,
+		TargetRevision: targetRevisionForResolvedChatRoute(route),
 	}
 	plan, err := translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
 		UpstreamModel:       route.upstreamModel,

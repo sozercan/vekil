@@ -120,9 +120,10 @@ var (
 )
 
 type responsesChatReplayRoute struct {
-	ProviderID    string
-	PublicModel   string
-	UpstreamModel string
+	ProviderID     string
+	PublicModel    string
+	UpstreamModel  string
+	TargetRevision targetRevision
 }
 
 type responsesChatReplayProjectedCall struct {
@@ -730,7 +731,18 @@ func (s *responsesChatReplayStore) removeGroupLocked(groupID uint64) {
 }
 
 func (r responsesChatReplayRoute) equal(other responsesChatReplayRoute) bool {
-	return r.ProviderID == other.ProviderID && r.PublicModel == other.PublicModel && r.UpstreamModel == other.UpstreamModel
+	if r.ProviderID != other.ProviderID ||
+		r.PublicModel != other.PublicModel ||
+		r.UpstreamModel != other.UpstreamModel {
+		return false
+	}
+	if r.TargetRevision == other.TargetRevision {
+		return true
+	}
+	// Direct replay-store fixtures historically omitted a physical revision.
+	// Production replay creation always supplies one, so zero remains a
+	// test-only compatibility wildcard while two concrete revisions must match.
+	return r.TargetRevision == "" || other.TargetRevision == ""
 }
 
 func (g *responsesChatReplayGroup) matchesProjection(content []byte, projected []responsesChatReplayProjectedCall, original bool) bool {
@@ -782,7 +794,7 @@ func cloneResponsesChatReplayResolution(group *responsesChatReplayGroup, match r
 }
 
 func replayGroupByteSize(route responsesChatReplayRoute, content []byte, outputItems []json.RawMessage, calls []responsesChatReplayPreparedCall) int {
-	size := len(route.ProviderID) + len(route.PublicModel) + len(route.UpstreamModel) + len(content)
+	size := len(route.ProviderID) + len(route.PublicModel) + len(route.UpstreamModel) + len(route.TargetRevision) + len(content)
 	for _, item := range outputItems {
 		size += len(item)
 	}

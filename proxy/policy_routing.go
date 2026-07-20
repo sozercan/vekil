@@ -78,7 +78,8 @@ func (p *compiledPolicyProfile) routeForTier(tier policyTier) *modelRoute {
 }
 
 type chatPolicyRoutingController struct {
-	h *ProxyHandler
+	h     *ProxyHandler
+	setup *providerSetup
 
 	profiles        map[string]*compiledPolicyProfile
 	ordered         []*compiledPolicyProfile
@@ -92,6 +93,10 @@ type chatPolicyRoutingController struct {
 }
 
 func newChatPolicyRoutingController(h *ProxyHandler, cfg ProvidersConfig, global PolicyRoutingMode) (*chatPolicyRoutingController, error) {
+	return newChatPolicyRoutingControllerForSetup(h, cfg, global, h.providerSetup())
+}
+
+func newChatPolicyRoutingControllerForSetup(h *ProxyHandler, cfg ProvidersConfig, global PolicyRoutingMode, setup *providerSetup) (*chatPolicyRoutingController, error) {
 	validated, err := validateAndNormalizeProvidersConfig(cfg)
 	if err != nil {
 		return nil, err
@@ -100,9 +105,12 @@ func newChatPolicyRoutingController(h *ProxyHandler, cfg ProvidersConfig, global
 	if len(cfg.PolicyProfiles) == 0 {
 		return nil, nil
 	}
-	setup := h.providerSetup()
+	if setup == nil {
+		return nil, fmt.Errorf("provider setup is required")
+	}
 	controller := &chatPolicyRoutingController{
 		h:               h,
+		setup:           setup,
 		profiles:        make(map[string]*compiledPolicyProfile, len(cfg.PolicyProfiles)),
 		ordered:         make([]*compiledPolicyProfile, 0, len(cfg.PolicyProfiles)),
 		breakerProfiles: make(map[string][]*compiledPolicyProfile),
@@ -357,7 +365,7 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 		return chatOperationPlan{}, nil
 	}
 	input = input.normalized()
-	entry, known := c.h.providerSetup().lookupPublicModelEntry(input.Model)
+	entry, known := c.setup.lookupPublicModelEntry(input.Model)
 	if !known || entry == nil || entry.kind != publicEntryPolicy {
 		return chatOperationPlan{}, nil
 	}

@@ -13,7 +13,8 @@ type policyRoutingController interface {
 }
 
 func (h *ProxyHandler) PolicyRoutingActive() bool {
-	return h != nil && h.policyRoutingController != nil && h.policyRoutingController.Active()
+	binding := h.policyBindingForContext(nil)
+	return binding != nil && binding.controller != nil && binding.controller.Active()
 }
 
 func (h *ProxyHandler) PolicyRoutingPreflightPending() bool {
@@ -21,10 +22,15 @@ func (h *ProxyHandler) PolicyRoutingPreflightPending() bool {
 }
 
 func (h *ProxyHandler) PolicyRoutingReadinessDiagnostic() string {
-	if h == nil || h.policyRoutingController == nil {
+	return h.policyRoutingReadinessDiagnosticForContext(context.Background())
+}
+
+func (h *ProxyHandler) policyRoutingReadinessDiagnosticForContext(ctx context.Context) string {
+	binding := h.policyBindingForContext(ctx)
+	if binding == nil || binding.controller == nil {
 		return ""
 	}
-	return h.policyRoutingController.ReadinessDiagnostic()
+	return binding.controller.ReadinessDiagnostic()
 }
 
 func (h *ProxyHandler) policyPreflightSemaphore() chan struct{} {
@@ -57,7 +63,8 @@ func (h *ProxyHandler) InitializePolicyRouting(ctx context.Context) (err error) 
 	if h == nil {
 		return nil
 	}
-	if h.policyRoutingController == nil || !h.policyRoutingController.Active() {
+	binding := h.policyBindingForContext(nil)
+	if binding == nil || binding.controller == nil || !binding.controller.Active() {
 		h.policyPreflightPending.Store(false)
 		return nil
 	}
@@ -79,7 +86,7 @@ func (h *ProxyHandler) InitializePolicyRouting(ctx context.Context) (err error) 
 	}
 	defer func() { permit <- struct{}{} }()
 
-	if err := h.policyRoutingController.Initialize(ctx); err != nil {
+	if err := binding.controller.Initialize(ctx); err != nil {
 		return err
 	}
 	success = true

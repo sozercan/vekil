@@ -222,6 +222,7 @@ type responsesWebSocketSession struct {
 	userAgent               string
 	explicitRouteID         string
 	explicitTargetID        string
+	explicitTargetRevision  targetRevision
 	operationConnectionID   string
 	operationSequence       uint64
 	turnState               string
@@ -445,7 +446,7 @@ func (s *responsesWebSocketSession) handleFrame(h *ProxyHandler, frame responses
 
 	request, err := parseResponsesWebSocketCreateRequest(frame.payload)
 	if err != nil {
-		if publicID, ok := h.policyPublicModelID(extractResponsesRequestModel(frame.payload)); ok {
+		if publicID, ok := h.policyPublicModelIDForContext(s.ctx, extractResponsesRequestModel(frame.payload)); ok {
 			message := fmt.Sprintf("model %q does not support %s", publicID, providerEndpointResponses)
 			s.recordTurnStats(h, publicID, "", "", http.StatusBadRequest, responsesUsage{}, nil)
 			return s.sendWrappedError(http.StatusBadRequest, message, "invalid_request_error", nil)
@@ -1154,11 +1155,11 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 		return ctx, nil, nil, fmt.Errorf("proxy handler is required")
 	}
 	model = strings.TrimSpace(model)
-	if model != "" && !h.modelAllowedForRequest(model, providerEndpointResponses) {
+	if model != "" && !h.modelAllowedForContext(s.ctx, model, providerEndpointResponses) {
 		return ctx, nil, nil, modelNotAllowedRequestError(model)
 	}
 
-	resolved, known := h.resolveModelRouteForRequest(model, providerEndpointResponses)
+	resolved, known := resolveModelRouteForSetup(h.providerSetupForContext(s.ctx), model, providerEndpointResponses)
 	if s != nil && s.explicitRouteID != "" {
 		if !known || resolved == nil || resolved.legacy || resolved.public.routeID != s.explicitRouteID {
 			return ctx, nil, resolved, &providerRequestError{
@@ -1195,14 +1196,25 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 			err:        fmt.Errorf("responses websocket session route changed after target pinning"),
 		}
 	}
-	if _, ok := route.targetByID(s.explicitTargetID); !ok {
+	target, ok := route.targetByID(s.explicitTargetID)
+	if !ok {
 		return routedCtx, operation, route, &providerRequestError{
 			statusCode: http.StatusServiceUnavailable,
 			err:        fmt.Errorf("pinned responses websocket route target %q is unavailable", s.explicitTargetID),
 		}
 	}
+	currentRevision := targetRevisionForBinding(route.public, target)
+	if s.explicitTargetRevision != "" && s.explicitTargetRevision != currentRevision {
+		return routedCtx, operation, route, &providerRequestError{
+			statusCode: http.StatusServiceUnavailable,
+			err:        fmt.Errorf("pinned responses websocket route target %q changed", s.explicitTargetID),
+		}
+	}
 	if err := operation.forcePinnedTarget(s.explicitTargetID); err != nil {
 		return routedCtx, operation, route, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+	}
+	if s.explicitTargetRevision == "" {
+		s.explicitTargetRevision = currentRevision
 	}
 	// Prior websocket frames commit the session to this exact target. Mark the
 	// per-turn operation committed before dispatch so the shared executor cannot
@@ -1222,18 +1234,24 @@ func (s *responsesWebSocketSession) pinExplicitRouteTarget(route *modelRoute, op
 	if targetID == "" {
 		return fmt.Errorf("explicit responses websocket route did not select a target")
 	}
-	if _, ok := route.targetByID(targetID); !ok {
+	target, ok := route.targetByID(targetID)
+	if !ok {
 		return fmt.Errorf("selected responses websocket route target %q is unavailable", targetID)
 	}
+	currentRevision := targetRevisionForBinding(route.public, target)
 	if s.explicitRouteID != "" && s.explicitRouteID != route.public.routeID {
 		return fmt.Errorf("responses websocket session route changed after target pinning")
 	}
 	if s.explicitTargetID != "" && s.explicitTargetID != targetID {
 		return fmt.Errorf("responses websocket session target changed from %q to %q", s.explicitTargetID, targetID)
 	}
+	if s.explicitTargetRevision != "" && s.explicitTargetRevision != currentRevision {
+		return fmt.Errorf("responses websocket session physical target changed after target pinning")
+	}
 	operation.pinTarget(targetID)
 	s.explicitRouteID = route.public.routeID
 	s.explicitTargetID = targetID
+	s.explicitTargetRevision = currentRevision
 	return nil
 }
 
@@ -1302,10 +1320,11 @@ func explicitResponsesWebSocketResponseInfo(resp *http.Response, route *modelRou
 		targetID := operation.pinnedTarget()
 		if target, exists := route.targetByID(targetID); exists && target.provider != nil {
 			info = explicitRouteResponseInfo{
-				routeID:    route.public.routeID,
-				publicID:   route.public.id,
-				targetID:   targetID,
-				providerID: target.provider.id,
+				routeID:        route.public.routeID,
+				publicID:       route.public.id,
+				targetID:       targetID,
+				providerID:     target.provider.id,
+				targetRevision: targetRevisionForBinding(route.public, target),
 			}
 			ok = true
 		}
@@ -1385,7 +1404,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		return err
 	}
 	if request != nil {
-		if publicID, ok := h.policyPublicModelID(request.Model); ok {
+		if publicID, ok := h.policyPublicModelIDForContext(s.ctx, request.Model); ok {
 			err := &providerRequestError{
 				statusCode: http.StatusBadRequest,
 				err:        fmt.Errorf("model %q does not support %s", publicID, providerEndpointResponses),
@@ -1503,7 +1522,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		})
 	}
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(s.ctx, true)
 	// The websocket bridge records each turn as tracked traffic (recordTurnStats),
 	// so mark the per-turn upstream context as retry-trackable too — otherwise a
 	// retryable 429/503 on a turn would be invisible in the dashboard retry
@@ -1749,7 +1768,7 @@ func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model, prov
 	if operation != nil {
 		operationID = operation.operationID()
 	}
-	return h.RecordResponsesTurn(model, providerID, providerKind, classifyAgent(s.userAgent), status, usage, operationID)
+	return h.RecordResponsesTurnForContext(s.ctx, model, providerID, providerKind, classifyAgent(s.userAgent), status, usage, operationID)
 }
 
 func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *responsesWebSocketCreateRequest) (responsesWebSocketRequestPlan, error) {
@@ -1985,7 +2004,7 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, req
 	if s == nil || s.isClosing() || (s.ctx != nil && s.ctx.Err() != nil) {
 		return metrics, responsesUsage{}
 	}
-	ctx, cancel := h.newInferenceUpstreamContext(false)
+	ctx, cancel := h.newInferenceUpstreamContextFrom(s.ctx, false)
 	// Mark the compaction upstream context as retry-trackable, like the turn
 	// itself, so retries during auto-compaction are counted in retry stats.
 	ctx = markRetryStatsTracked(ctx)

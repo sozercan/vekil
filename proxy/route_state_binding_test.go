@@ -1167,3 +1167,106 @@ func requireStateBindingTokens(t *testing.T, got, want []stateBindingToken) {
 		}
 	}
 }
+
+func TestExplicitStateBindingTargetRevisionCompatibility(t *testing.T) {
+	newRoute := func(baseURL string) *modelRoute {
+		route := &modelRoute{
+			public: publicModelContract{
+				id:        "public-model",
+				routeID:   "route-a",
+				endpoints: []string{providerEndpointResponses},
+			},
+			targets: []targetBinding{{
+				id: "target-a",
+				provider: &providerRuntime{
+					id:       "provider-a",
+					kind:     providerTypeOpenAICompatible,
+					baseURL:  baseURL,
+					authType: providerAuthTypeNone,
+					paths: providerEndpointPaths{
+						responses: providerEndpointResponses,
+					},
+				},
+				upstreamModel: "physical-model",
+			}},
+			policy: routePolicy{
+				mode:              routeModePrimaryOnly,
+				maxTargetAttempts: 1,
+				maxUpstreamSends:  1,
+			},
+		}
+		ensureModelRouteTargetRevisions(route)
+		return route
+	}
+	installRoute := func(t *testing.T, h *ProxyHandler, route *modelRoute) {
+		t.Helper()
+		registry, err := newModelRouteRegistry([]*modelRoute{route})
+		if err != nil {
+			t.Fatalf("newModelRouteRegistry() error = %v", err)
+		}
+		h.providersState = &providerSetup{routes: registry}
+	}
+	requestBody := []byte(`{"model":"public-model","input":[{"type":"reasoning","encrypted_content":"state-token"}]}`)
+
+	t.Run("bootstrap and publication carry revision", func(t *testing.T) {
+		h := newRouteStateBindingTestHandler(t, 8)
+		route := newRoute("https://same.example.invalid/v1")
+		installRoute(t, h, route)
+
+		conversationOperation := newRouteOperation(route, context.Background())
+		if err := h.applyExplicitRequestStateBinding(conversationOperation, []byte(`{"model":"public-model","conversation":"conversation-revision"}`), nil); err != nil {
+			t.Fatalf("conversation bootstrap error = %v", err)
+		}
+		conversationOwner, ok := h.stateBindings.lookup(stateBindingTypeConversationID, "conversation-revision").knownOwner()
+		if !ok || conversationOwner.targetRevision == "" || conversationOwner.targetRevision != route.targets[0].revision {
+			t.Fatalf("conversation owner = %#v, want target revision %q", conversationOwner, route.targets[0].revision)
+		}
+
+		if err := h.bindExplicitStateTokens(explicitRouteResponseInfo{
+			routeID:  route.public.routeID,
+			targetID: route.targets[0].id,
+		}, []stateBindingToken{{stateType: stateBindingTypeEncryptedContent, value: "state-token"}}); err != nil {
+			t.Fatalf("bindExplicitStateTokens() error = %v", err)
+		}
+		publishedOwner, ok := h.stateBindings.lookup(stateBindingTypeEncryptedContent, "state-token").knownOwner()
+		if !ok || publishedOwner.targetRevision == "" || publishedOwner.targetRevision != route.targets[0].revision {
+			t.Fatalf("published owner = %#v, want target revision %q", publishedOwner, route.targets[0].revision)
+		}
+	})
+
+	t.Run("unchanged target resolves and changed target fails closed", func(t *testing.T) {
+		h := newRouteStateBindingTestHandler(t, 8)
+		original := newRoute("https://same.example.invalid/v1")
+		owner := stateBindingOwner{
+			routeID:        original.public.routeID,
+			targetID:       original.targets[0].id,
+			targetRevision: original.targets[0].revision,
+		}
+		if result := h.stateBindings.bind(stateBindingTypeEncryptedContent, "state-token", owner); result.outcome != stateBindingLookupKnown {
+			t.Fatalf("bind original state outcome = %s", result.outcome)
+		}
+
+		compatible := newRoute("https://same.example.invalid/v1")
+		compatibleOperation := newRouteOperation(compatible, context.Background())
+		if err := h.applyExplicitRequestStateBinding(compatibleOperation, requestBody, nil); err != nil {
+			t.Fatalf("compatible revision error = %v", err)
+		}
+		if got := compatibleOperation.pinnedTarget(); got != owner.targetID {
+			t.Fatalf("compatible pinned target = %q, want %q", got, owner.targetID)
+		}
+
+		changed := newRoute("https://changed.example.invalid/v1")
+		if changed.targets[0].revision == owner.targetRevision {
+			t.Fatal("changed physical target retained the original revision")
+		}
+		changedOperation := newRouteOperation(changed, context.Background())
+		err := h.applyExplicitRequestStateBinding(changedOperation, requestBody, nil)
+		var requestErr *providerRequestError
+		if !errors.As(err, &requestErr) || requestErr.statusCode != http.StatusBadRequest {
+			t.Fatalf("changed revision error = %v, want provider 400", err)
+		}
+		if got := changedOperation.pinnedTarget(); got != "" {
+			t.Fatalf("changed revision pinned target = %q, want none", got)
+		}
+	})
+}

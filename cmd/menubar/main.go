@@ -41,14 +41,19 @@ var (
 	mProvidersStatus *systray.MenuItem
 	mProvidersChoose *systray.MenuItem
 	mProvidersClear  *systray.MenuItem
+	mProvidersReset  *systray.MenuItem
 
 	// signInMu guards signInCancel to prevent concurrent sign-in flows.
 	signInMu     sync.Mutex
 	signInCancel context.CancelFunc
 
-	menubarCfg         menubarConfig
-	providersCfg       proxy.ProvidersConfig
-	providersConfigErr error
+	menubarCfg                    menubarConfig
+	providersCfg                  proxy.ProvidersConfig
+	providersResolvedConfig       proxy.ResolvedProvidersConfig
+	providersConfigStore          *proxy.ManagedProvidersConfigStore
+	providersConfigReadOnlyReason error
+	providersConfigErr            error
+	proxyShutdownIncomplete       bool
 )
 
 func main() {
@@ -59,9 +64,13 @@ func main() {
 	}
 	authenticator.DisableAutoDeviceFlow = true
 
-	menubarCfg, providersCfg, providersConfigErr = loadProvidersConfigForMenubar()
-	if providersConfigErr != nil {
-		logProvidersConfigLoadError(providersConfigErr)
+	loadedMenubarCfg, loadedProviders, loadErr := loadProvidersConfigForMenubar()
+	menubarCfg = loadedMenubarCfg
+	providersConfigErr = loadErr
+	if loadErr != nil {
+		logProvidersConfigLoadError(loadErr)
+	} else {
+		setActiveProvidersConfig(loadedProviders)
 	}
 
 	systray.Run(onReady, onExit)
@@ -85,6 +94,7 @@ func onReady() {
 	mProvidersStatus.Disable()
 	mProvidersChoose = systray.AddMenuItem("Choose Providers Config…", "Select a providers JSON or YAML file")
 	mProvidersClear = systray.AddMenuItem("Use Default Copilot Routing", "Clear custom providers config")
+	mProvidersReset = systray.AddMenuItem("Reset Dashboard Override", "Delete the dashboard-managed override for the selected providers source")
 	systray.AddSeparator()
 
 	mToggle = systray.AddMenuItem("Start Vekil", "Start or stop Vekil")
@@ -127,7 +137,7 @@ func onReady() {
 			select {
 			case <-mToggle.ClickedCh:
 				if srv != nil && srv.IsRunning() {
-					stopProxy()
+					_ = stopProxy()
 				} else {
 					startProxy()
 				}
@@ -137,6 +147,8 @@ func onReady() {
 				selectProvidersConfig()
 			case <-mProvidersClear.ClickedCh:
 				clearProvidersConfig()
+			case <-mProvidersReset.ClickedCh:
+				resetDashboardProvidersOverride()
 			case <-mLaunch.ClickedCh:
 				if mLaunch.Checked() {
 					if err := removeLaunchAgent(); err != nil {
@@ -164,7 +176,7 @@ func onReady() {
 				}
 			case <-mQuit.ClickedCh:
 				if srv != nil && srv.IsRunning() {
-					stopProxy()
+					_ = stopProxy()
 				}
 				systray.Quit()
 				return
@@ -173,10 +185,78 @@ func onReady() {
 	}()
 }
 
+func setActiveProvidersConfig(providers providersConfigStartup) {
+	providersCfg = providers.Resolved.Config
+	providersResolvedConfig = providers.Resolved
+	providersConfigStore = providers.Store
+	providersConfigReadOnlyReason = providers.ReadOnlyReason
+	providersConfigErr = nil
+
+	if providers.Resolved.PersistenceWarning != nil {
+		log.Info("managed providers config recovery completed with a durability warning", logger.Err(providers.Resolved.PersistenceWarning))
+	}
+	if providers.ReadOnlyReason != nil {
+		log.Info("dashboard providers config editor is read-only", logger.Err(providers.ReadOnlyReason))
+	}
+}
+
+func reloadActiveProvidersConfig(mode proxy.ProvidersConfigResolveMode) error {
+	providers, err := resolveMenubarProvidersConfig(menubarCfg, mode)
+	if err != nil {
+		wrapped := fmt.Errorf("%w: %w", errProvidersConfigLoad, err)
+		providersConfigErr = wrapped
+		return wrapped
+	}
+	setActiveProvidersConfig(providers)
+	return nil
+}
+
+func currentProvidersConfigStartup() providersConfigStartup {
+	return providersConfigStartup{
+		Resolved:       providersResolvedConfig,
+		Store:          providersConfigStore,
+		ReadOnlyReason: providersConfigReadOnlyReason,
+	}
+}
+
+func newMenubarServer(
+	authenticator *auth.Authenticator,
+	log *logger.Logger,
+	host, port string,
+	policyMode proxy.PolicyRoutingMode,
+	providers providersConfigStartup,
+) (*server.Server, error) {
+	return server.New(
+		authenticator,
+		log,
+		host,
+		port,
+		server.WithDashboardConfigControl(server.DashboardConfigModeMenubar),
+		server.WithProxyOptions(
+			proxy.WithProvidersConfig(providers.Resolved.Config),
+			proxy.WithDashboardConfigSource(providers.Resolved, providers.Store),
+			proxy.WithDashboardConfigReadOnlyReason(providers.ReadOnlyReason),
+			proxy.WithPolicyRoutingMode(policyMode),
+		),
+	)
+}
+
 func startProxy() {
-	if providersConfigErr != nil {
+	if err := ensureProxyShutdownComplete(); err != nil {
+		log.Error("previous proxy shutdown is still incomplete", logger.Err(err))
+		showErrorDialog("Vekil Start Failed", fmt.Sprintf("The previous proxy generation still has background work shutting down. Try again after it finishes.\n\n%v", err))
+		return
+	}
+	if isMenubarConfigLoadError(providersConfigErr) {
 		title, message := providersConfigStartDialog(providersConfigErr)
 		showErrorDialog(title, fmt.Sprintf("%s\n\n%v", message, providersConfigErr))
+		return
+	}
+	if err := reloadActiveProvidersConfig(proxy.ProvidersConfigUseManaged); err != nil {
+		logProvidersConfigLoadError(err)
+		title, message := providersConfigStartDialog(err)
+		showErrorDialog(title, fmt.Sprintf("%s\n\n%v", message, err))
+		refreshSessionUI()
 		return
 	}
 
@@ -198,16 +278,7 @@ func startProxy() {
 		showErrorDialog("Vekil Start Failed", fmt.Sprintf("Invalid POLICY_ROUTING_MODE.\n\n%v", err))
 		return
 	}
-	nextSrv, err := server.New(
-		authenticator,
-		log,
-		proxyHost,
-		proxyPort,
-		server.WithProxyOptions(
-			proxy.WithProvidersConfig(providersCfg),
-			proxy.WithPolicyRoutingMode(policyMode),
-		),
-	)
+	nextSrv, err := newMenubarServer(authenticator, log, proxyHost, proxyPort, policyMode, currentProvidersConfigStartup())
 	if err != nil {
 		log.Error("server init failed", logger.Err(err))
 		showErrorDialog("Vekil Start Failed", fmt.Sprintf("Could not initialize Vekil.\n\n%v", err))
@@ -240,13 +311,17 @@ func startProxy() {
 	log.Info("proxy started")
 }
 
-func stopProxy() {
+func stopProxy() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := srv.Stop(ctx); err != nil {
+		proxyShutdownIncomplete = true
 		log.Error("server stop failed", logger.Err(err))
+		refreshSessionUI()
+		return err
 	}
+	proxyShutdownIncomplete = false
 
 	mToggle.SetTitle("Start Vekil")
 	systray.SetIcon(iconOff)
@@ -255,6 +330,23 @@ func stopProxy() {
 		mDashboard.Disable()
 	}
 	log.Info("proxy stopped")
+	return nil
+}
+
+func ensureProxyShutdownComplete() error {
+	if !proxyShutdownIncomplete {
+		return nil
+	}
+	if srv == nil {
+		return errors.New("previous proxy shutdown did not complete")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.WaitForLifecycleWorkers(ctx); err != nil {
+		return err
+	}
+	proxyShutdownIncomplete = false
+	return nil
 }
 
 // openDashboard opens the live traffic dashboard in the default browser. It is a
@@ -382,7 +474,7 @@ func signOut() {
 	signInMu.Unlock()
 
 	if providersRequireGitHubAuth(providersCfg, providersConfigErr) && srv != nil && srv.IsRunning() {
-		stopProxy()
+		_ = stopProxy()
 	}
 
 	if err := authenticator.SignOut(); err != nil {
@@ -418,24 +510,30 @@ func clearProvidersConfig() {
 }
 
 func applyProvidersConfigPath(path string) error {
+	if err := ensureProxyShutdownComplete(); err != nil {
+		return fmt.Errorf("previous proxy shutdown is incomplete: %w", err)
+	}
 	nextCfg := menubarConfig{ProvidersConfigPath: path}
-	loadedProvidersCfg, err := proxy.LoadProvidersConfigFile(path)
+	providers, err := resolveMenubarProvidersConfig(nextCfg, proxy.ProvidersConfigUseManaged)
 	if err != nil {
 		return err
 	}
+
+	wasRunning := srv != nil && srv.IsRunning()
+	if wasRunning {
+		if err := stopProxy(); err != nil {
+			return fmt.Errorf("stop active proxy before changing providers config: %w", err)
+		}
+	}
 	if err := saveMenubarConfig(nextCfg); err != nil {
+		if wasRunning {
+			startProxy()
+		}
 		return err
 	}
 
 	menubarCfg = nextCfg
-	providersCfg = loadedProvidersCfg
-	providersConfigErr = nil
-
-	wasRunning := srv != nil && srv.IsRunning()
-	if wasRunning {
-		stopProxy()
-	}
-
+	setActiveProvidersConfig(providers)
 	refreshSessionUI()
 
 	if wasRunning {
@@ -443,6 +541,49 @@ func applyProvidersConfigPath(path string) error {
 	}
 
 	return nil
+}
+
+func resetDashboardProvidersOverride() {
+	if isMenubarConfigLoadError(providersConfigErr) {
+		title, message := providersConfigStartDialog(providersConfigErr)
+		showErrorDialog(title, fmt.Sprintf("%s\n\n%v", message, providersConfigErr))
+		return
+	}
+
+	if err := ensureProxyShutdownComplete(); err != nil {
+		showErrorDialog("Reset Dashboard Override", fmt.Sprintf("The previous proxy generation still has background work shutting down; the override was not changed.\n\n%v", err))
+		return
+	}
+
+	// Stop the long-lived control plane before the pre-start recovery delete.
+	// Otherwise a dashboard apply could commit concurrently with the menu action
+	// and repopulate the file after reset.
+	wasRunning := srv != nil && srv.IsRunning()
+	if wasRunning {
+		if err := stopProxy(); err != nil {
+			showErrorDialog("Reset Dashboard Override", fmt.Sprintf("Could not stop the active proxy safely; the dashboard override was not changed.\n\n%v", err))
+			return
+		}
+	}
+	providers, err := resolveMenubarProvidersConfig(menubarCfg, proxy.ProvidersConfigResetManaged)
+	if err != nil {
+		wrapped := fmt.Errorf("%w: %w", errProvidersConfigLoad, err)
+		providersConfigErr = wrapped
+		log.Error("failed to reset dashboard providers override", logger.Err(err), logger.F("path", menubarCfg.ProvidersConfigPath))
+		showErrorDialog("Reset Dashboard Override", fmt.Sprintf("Could not reset the dashboard override for the selected providers source.\n\n%v", err))
+		refreshSessionUI()
+		if wasRunning {
+			startProxy()
+		}
+		return
+	}
+
+	setActiveProvidersConfig(providers)
+	refreshSessionUI()
+	if wasRunning {
+		startProxy()
+	}
+	showNotification("Vekil", "Dashboard providers override reset to the selected bootstrap source.")
 }
 
 func refreshSessionUI() {
@@ -555,6 +696,13 @@ func setAuthActionsEnabled(enabled bool) {
 
 func refreshProvidersMenu() {
 	mProvidersStatus.SetTitle(providersMenuTitle())
+	if mProvidersReset != nil {
+		if isMenubarConfigLoadError(providersConfigErr) {
+			mProvidersReset.Disable()
+		} else {
+			mProvidersReset.Enable()
+		}
+	}
 	if menubarCfg.ProvidersConfigPath == "" {
 		mProvidersClear.Disable()
 		return

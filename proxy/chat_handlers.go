@@ -646,10 +646,10 @@ func attachExplicitChatExecutionErrorRoute(err error, route *modelRoute, target 
 // withExplicitRouteOperation.
 func (h *ProxyHandler) withAdmittedExplicitRouteOperation(ctx, inbound context.Context, model, endpoint string) (context.Context, *routeOperation, *modelRoute, error) {
 	model = strings.TrimSpace(model)
-	if model != "" && !h.modelAllowedForRequest(model, endpoint) {
+	if model != "" && !h.modelAllowedForContext(inbound, model, endpoint) {
 		return ctx, nil, nil, modelNotAllowedRequestError(model)
 	}
-	route, known := h.resolveModelRouteForRequest(model, endpoint)
+	route, known := resolveModelRouteForSetup(h.providerSetupForContext(inbound), model, endpoint)
 	if !known || route == nil || route.legacy {
 		return ctx, nil, route, nil
 	}
@@ -706,7 +706,7 @@ func (h *ProxyHandler) withChatExecutionRoute(ctx, inbound context.Context, mode
 			return ctx, operation, operation.route, nil
 		}
 	}
-	route, known := h.resolveModelRouteForRequest(model, providerEndpointChatCompletions)
+	route, known := resolveModelRouteForSetup(h.providerSetupForContext(inbound), model, providerEndpointChatCompletions)
 	if !known || route == nil || route.legacy {
 		return ctx, nil, route, nil
 	}
@@ -748,9 +748,10 @@ func explicitResponsesChatReplayRoute(route *modelRoute, target targetBinding) r
 		upstreamModel = strings.TrimSpace(route.public.id)
 	}
 	return responsesChatReplayRoute{
-		ProviderID:    target.provider.id,
-		PublicModel:   route.public.id,
-		UpstreamModel: upstreamModel,
+		ProviderID:     target.provider.id,
+		PublicModel:    route.public.id,
+		UpstreamModel:  upstreamModel,
+		TargetRevision: targetRevisionForBinding(route.public, target),
 	}
 }
 
@@ -1127,9 +1128,13 @@ func prepareAnthropicChatCompletionsRequestWithModelOverride(req *models.Anthrop
 }
 
 func (h *ProxyHandler) anthropicChatTranslationModel(model string) string {
+	return h.anthropicChatTranslationModelForContext(context.Background(), model)
+}
+
+func (h *ProxyHandler) anthropicChatTranslationModelForContext(ctx context.Context, model string) string {
 	rawModel := strings.TrimSpace(model)
 	if rawModel != "" {
-		if setup := h.providerSetup(); setup != nil {
+		if setup := h.providerSetupForContext(ctx); setup != nil {
 			if _, known := setup.lookupRoute(rawModel); known {
 				return rawModel
 			}
@@ -1180,19 +1185,19 @@ func anthropicExtraHeadersFromRequest(r *http.Request) http.Header {
 	return headers
 }
 
-func (h *ProxyHandler) shouldForwardAnthropicMessagesDirect(model string) bool {
-	provider, _, _ := h.resolveProviderModelForRequest(model, providerEndpointMessages)
+func (h *ProxyHandler) shouldForwardAnthropicMessagesDirect(ctx context.Context, model string) bool {
+	provider, _, _ := h.resolveProviderModelForContext(ctx, model, providerEndpointMessages)
 	return provider != nil && provider.kind == providerTypeAnthropicCompatible
 }
 
-func (h *ProxyHandler) shouldForwardAnthropicCountTokensDirect(model string) bool {
-	provider, _, _ := h.resolveProviderModelForRequest(model, providerEndpointMessages)
+func (h *ProxyHandler) shouldForwardAnthropicCountTokensDirect(ctx context.Context, model string) bool {
+	provider, _, _ := h.resolveProviderModelForContext(ctx, model, providerEndpointMessages)
 	return provider != nil && provider.kind == providerTypeAnthropicCompatible
 }
 
 func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *http.Request, body []byte, req *models.AnthropicRequest) {
 	streaming := req != nil && req.Stream
-	publicModel, upstreamModel := h.directAnthropicResponseModels(req)
+	publicModel, upstreamModel := h.directAnthropicResponseModelsForContext(r.Context(), req)
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), streaming)
 	defer upstreamCancel()
@@ -1250,11 +1255,11 @@ func (h *ProxyHandler) postAnthropicMessagesCountTokensForModel(ctx context.Cont
 	if operation := routeOperationFromContext(ctx); operation != nil && operation.route != nil && !operation.route.legacy {
 		return h.executeExplicitRouteRequestPath(ctx, operation.route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)
 	}
-	if route, known := h.resolveModelRouteForRequest(model, providerEndpointMessages); known && route != nil && !route.legacy {
+	if route, known := resolveModelRouteForSetup(h.providerSetupForContext(ctx), model, providerEndpointMessages); known && route != nil && !route.legacy {
 		return h.executeExplicitRouteRequestPath(ctx, route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)
 	}
 
-	provider, owner, rewrittenBody, err := h.resolveProviderRequestForModel(body, providerEndpointMessages, model)
+	provider, owner, rewrittenBody, err := h.resolveProviderRequestForContext(ctx, body, providerEndpointMessages, model)
 	if err != nil {
 		return nil, err
 	}
@@ -1271,7 +1276,7 @@ func (h *ProxyHandler) postAnthropicMessagesCountTokensForModel(ctx context.Cont
 }
 
 func (h *ProxyHandler) forwardAnthropicCountTokensDirect(w http.ResponseWriter, r *http.Request, body []byte, model string) {
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), false)
 	defer upstreamCancel()
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), model, providerEndpointMessages)
@@ -1314,12 +1319,16 @@ func (h *ProxyHandler) forwardAnthropicCountTokensDirect(w http.ResponseWriter, 
 }
 
 func (h *ProxyHandler) directAnthropicResponseModels(req *models.AnthropicRequest) (string, string) {
+	return h.directAnthropicResponseModelsForContext(context.Background(), req)
+}
+
+func (h *ProxyHandler) directAnthropicResponseModelsForContext(ctx context.Context, req *models.AnthropicRequest) (string, string) {
 	if req == nil {
 		return "", ""
 	}
 	publicModel := strings.TrimSpace(req.Model)
 	upstreamModel := publicModel
-	_, owner, known := h.resolveProviderModelForRequest(req.Model, providerEndpointMessages)
+	_, owner, known := h.resolveProviderModelForContext(ctx, req.Model, providerEndpointMessages)
 	if !known {
 		return publicModel, upstreamModel
 	}
@@ -1503,7 +1512,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	// Route-aware duplicate-key validation must use the same selected model as
 	// handler forwarding. encoding/json resolves duplicate struct fields with the
 	// last occurrence, so validate only after decoding req.Model.
-	if err := h.validateRouteAwareRequestJSON(body, req.Model, providerEndpointMessages); err != nil {
+	if err := h.validateRouteAwareRequestJSONForContext(r.Context(), body, req.Model, providerEndpointMessages); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
@@ -1519,13 +1528,13 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		logger.F("tools", len(req.Tools)),
 	)
 
-	directAnthropic := h.shouldForwardAnthropicMessagesDirect(req.Model)
+	directAnthropic := h.shouldForwardAnthropicMessagesDirect(r.Context(), req.Model)
 	providerEndpoint := providerEndpointChatCompletions
 	providerModel := req.Model
 	if directAnthropic {
 		providerEndpoint = providerEndpointMessages
 	} else {
-		providerModel = h.anthropicChatTranslationModel(req.Model)
+		providerModel = h.anthropicChatTranslationModelForContext(r.Context(), req.Model)
 	}
 	h.observeRequestSummaryWithProviderModel(r.Context(), "anthropic", req.Model, providerModel, req.Stream, providerEndpoint)
 
@@ -1765,18 +1774,18 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 	// Route-aware duplicate-key validation must use the same selected model as
 	// handler forwarding. encoding/json resolves duplicate struct fields with the
 	// last occurrence, so validate only after decoding req.Model.
-	if err := h.validateRouteAwareRequestJSON(body, req.Model, providerEndpointMessages); err != nil {
+	if err := h.validateRouteAwareRequestJSONForContext(r.Context(), body, req.Model, providerEndpointMessages); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 
-	directAnthropic := h.shouldForwardAnthropicCountTokensDirect(req.Model)
+	directAnthropic := h.shouldForwardAnthropicCountTokensDirect(r.Context(), req.Model)
 	providerEndpoint := providerEndpointChatCompletions
 	providerModel := req.Model
 	if directAnthropic {
 		providerEndpoint = providerEndpointMessages
 	} else {
-		providerModel = h.anthropicChatTranslationModel(req.Model)
+		providerModel = h.anthropicChatTranslationModelForContext(r.Context(), req.Model)
 	}
 	h.observeRequestSummaryWithProviderModel(r.Context(), "anthropic_count_tokens", req.Model, providerModel, false, providerEndpoint)
 
@@ -1791,7 +1800,7 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		return
 	}
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), false)
 	defer upstreamCancel()
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, _, err := h.withChatExecutionRoute(upstreamCtx, suppressRouteAttemptStats(r.Context()), providerModel, nil)
@@ -2129,7 +2138,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		r = r.WithContext(admissionCtx)
 		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
 	}
-	if err := h.validateRouteAwareRequestJSON(bodyBytes, requestedModel, providerEndpointChatCompletions); err != nil {
+	if err := h.validateRouteAwareRequestJSONForContext(r.Context(), bodyBytes, requestedModel, providerEndpointChatCompletions); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}

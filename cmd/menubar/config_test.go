@@ -71,15 +71,18 @@ func TestLoadProvidersConfigForMenubar(t *testing.T) {
 	t.Run("missing menubar file uses default config", func(t *testing.T) {
 		stubUserConfigDir(t)
 
-		cfg, providersCfg, err := loadProvidersConfigForMenubar()
+		cfg, providers, err := loadProvidersConfigForMenubar()
 		if err != nil {
 			t.Fatalf("loadProvidersConfigForMenubar() error = %v", err)
 		}
 		if cfg.ProvidersConfigPath != "" {
 			t.Fatalf("loadProvidersConfigForMenubar() ProvidersConfigPath = %q, want empty", cfg.ProvidersConfigPath)
 		}
-		if len(providersCfg.Providers) != 0 {
-			t.Fatalf("loadProvidersConfigForMenubar() Providers = %v, want empty", providersCfg.Providers)
+		if len(providers.Resolved.Config.Providers) != 0 {
+			t.Fatalf("loadProvidersConfigForMenubar() Providers = %v, want empty", providers.Resolved.Config.Providers)
+		}
+		if providers.Store == nil {
+			t.Fatal("loadProvidersConfigForMenubar() Store = nil, want writable managed store")
 		}
 	})
 
@@ -119,7 +122,7 @@ func TestLoadProvidersConfigForMenubar(t *testing.T) {
 		stubUserConfigDir(t)
 
 		providersPath := filepath.Join(t.TempDir(), "providers.json")
-		body := []byte(`{"providers":[{"id":"azure","type":"azure-openai"}]}`)
+		body := []byte(`{"providers":[{"id":"custom-copilot","type":"copilot","default":true}]}`)
 		if err := os.WriteFile(providersPath, body, 0o644); err != nil {
 			t.Fatalf("WriteFile() error = %v", err)
 		}
@@ -127,15 +130,16 @@ func TestLoadProvidersConfigForMenubar(t *testing.T) {
 			t.Fatalf("saveMenubarConfig() error = %v", err)
 		}
 
-		cfg, providersCfg, err := loadProvidersConfigForMenubar()
+		cfg, providers, err := loadProvidersConfigForMenubar()
 		if err != nil {
 			t.Fatalf("loadProvidersConfigForMenubar() error = %v", err)
 		}
 		if cfg.ProvidersConfigPath != providersPath {
 			t.Fatalf("loadProvidersConfigForMenubar() ProvidersConfigPath = %q, want %q", cfg.ProvidersConfigPath, providersPath)
 		}
-		if len(providersCfg.Providers) != 1 || providersCfg.Providers[0].ID != "azure" {
-			t.Fatalf("loadProvidersConfigForMenubar() Providers = %v, want azure provider", providersCfg.Providers)
+		providersCfg := providers.Resolved.Config
+		if len(providersCfg.Providers) != 1 || providersCfg.Providers[0].ID != "custom-copilot" {
+			t.Fatalf("loadProvidersConfigForMenubar() Providers = %v, want custom Copilot provider", providersCfg.Providers)
 		}
 	})
 }
@@ -288,4 +292,159 @@ func stubUserConfigDir(t *testing.T) string {
 	})
 
 	return tmpDir
+}
+
+func TestResolveMenubarProvidersConfigMatchesSharedResolver(t *testing.T) {
+	configDir := stubUserConfigDir(t)
+	bootstrapPath := filepath.Join(t.TempDir(), "providers.json")
+	writeMenubarStartupBootstrap(t, bootstrapPath, "bootstrap")
+	commitMenubarManagedOverride(t, bootstrapPath, configDir, "managed")
+
+	shared, err := proxy.ResolveProvidersConfig(proxy.ProvidersConfigResolveOptions{
+		BootstrapPath: bootstrapPath,
+		UserConfigDir: configDir,
+		Mode:          proxy.ProvidersConfigUseManaged,
+	})
+	if err != nil {
+		t.Fatalf("ResolveProvidersConfig() error = %v", err)
+	}
+	menubar, err := resolveMenubarProvidersConfig(menubarConfig{ProvidersConfigPath: bootstrapPath}, proxy.ProvidersConfigUseManaged)
+	if err != nil {
+		t.Fatalf("resolveMenubarProvidersConfig() error = %v", err)
+	}
+	if menubar.Resolved.Revision != shared.Revision || menubar.Resolved.Bootstrap.Source != shared.Bootstrap.Source {
+		t.Fatalf("menubar resolution = %+v, shared = %+v", menubar.Resolved, shared)
+	}
+	if got := menubar.Resolved.Config.Providers[0].ID; got != "managed" {
+		t.Fatalf("menubar provider = %q, want managed", got)
+	}
+	if menubar.Store == nil {
+		t.Fatal("resolveMenubarProvidersConfig() Store = nil, want writable store")
+	}
+}
+
+func TestResolveMenubarProvidersConfigSourceIsolation(t *testing.T) {
+	configDir := stubUserConfigDir(t)
+	bootstrapDir := t.TempDir()
+	pathA := filepath.Join(bootstrapDir, "a.json")
+	pathB := filepath.Join(bootstrapDir, "b.json")
+	writeMenubarStartupBootstrap(t, pathA, "bootstrap-a")
+	writeMenubarStartupBootstrap(t, pathB, "bootstrap-b")
+	commitMenubarManagedOverride(t, pathA, configDir, "managed-a")
+	commitMenubarManagedOverride(t, pathB, configDir, "managed-b")
+
+	resolvedA, err := resolveMenubarProvidersConfig(menubarConfig{ProvidersConfigPath: pathA}, proxy.ProvidersConfigUseManaged)
+	if err != nil {
+		t.Fatalf("resolveMenubarProvidersConfig(a) error = %v", err)
+	}
+	resolvedB, err := resolveMenubarProvidersConfig(menubarConfig{ProvidersConfigPath: pathB}, proxy.ProvidersConfigUseManaged)
+	if err != nil {
+		t.Fatalf("resolveMenubarProvidersConfig(b) error = %v", err)
+	}
+
+	if got := resolvedA.Resolved.Config.Providers[0].ID; got != "managed-a" {
+		t.Fatalf("source A provider = %q, want managed-a", got)
+	}
+	if got := resolvedB.Resolved.Config.Providers[0].ID; got != "managed-b" {
+		t.Fatalf("source B provider = %q, want managed-b", got)
+	}
+	if resolvedA.Resolved.Bootstrap.Source.ID == resolvedB.Resolved.Bootstrap.Source.ID {
+		t.Fatalf("source identities collided: %q", resolvedA.Resolved.Bootstrap.Source.ID)
+	}
+	if resolvedA.Resolved.Bootstrap.Source.ManagedPath == resolvedB.Resolved.Bootstrap.Source.ManagedPath {
+		t.Fatalf("managed paths collided: %q", resolvedA.Resolved.Bootstrap.Source.ManagedPath)
+	}
+}
+
+func TestResolveMenubarProvidersConfigRecoveryModes(t *testing.T) {
+	configDir := stubUserConfigDir(t)
+	bootstrapPath := filepath.Join(t.TempDir(), "providers.json")
+	selected := menubarConfig{ProvidersConfigPath: bootstrapPath}
+	writeMenubarStartupBootstrap(t, bootstrapPath, "bootstrap-before")
+	managedPath := commitMenubarManagedOverride(t, bootstrapPath, configDir, "managed")
+	writeMenubarStartupBootstrap(t, bootstrapPath, "bootstrap-after")
+
+	_, err := resolveMenubarProvidersConfig(selected, proxy.ProvidersConfigUseManaged)
+	var configErr *proxy.ConfigError
+	if !errors.As(err, &configErr) || configErr.Code != proxy.ConfigErrorManagedSourceConflict {
+		t.Fatalf("use-managed conflict error = %v, want managed source conflict", err)
+	}
+
+	ignored, err := resolveMenubarProvidersConfig(selected, proxy.ProvidersConfigIgnoreManaged)
+	if err != nil {
+		t.Fatalf("ignore-managed error = %v", err)
+	}
+	if got := ignored.Resolved.Config.Providers[0].ID; got != "bootstrap-after" {
+		t.Fatalf("ignore-managed provider = %q, want bootstrap-after", got)
+	}
+	if ignored.Store != nil || ignored.ReadOnlyReason == nil {
+		t.Fatalf("ignore-managed startup = %+v, want read-only bootstrap", ignored)
+	}
+	if _, err := os.Stat(managedPath); err != nil {
+		t.Fatalf("ignore-managed should preserve override: %v", err)
+	}
+
+	reset, err := resolveMenubarProvidersConfig(selected, proxy.ProvidersConfigResetManaged)
+	if err != nil {
+		t.Fatalf("reset-managed error = %v", err)
+	}
+	if got := reset.Resolved.Config.Providers[0].ID; got != "bootstrap-after" {
+		t.Fatalf("reset-managed provider = %q, want bootstrap-after", got)
+	}
+	if reset.Store == nil || reset.ReadOnlyReason != nil {
+		t.Fatalf("reset-managed startup = %+v, want writable bootstrap", reset)
+	}
+	if selected.ProvidersConfigPath != bootstrapPath {
+		t.Fatalf("reset changed selected bootstrap path = %q, want %q", selected.ProvidersConfigPath, bootstrapPath)
+	}
+	if _, err := os.Stat(managedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reset-managed override remains: %v", err)
+	}
+}
+
+func TestResolveMenubarProvidersConfigReadOnlyFallback(t *testing.T) {
+	bootstrapPath := filepath.Join(t.TempDir(), "providers.json")
+	writeMenubarStartupBootstrap(t, bootstrapPath, "bootstrap")
+
+	probeErr := errors.New("read-only filesystem")
+	startup, err := resolveProvidersConfigForStartup(
+		bootstrapPath,
+		proxy.ProvidersConfigUseManaged,
+		func() (string, error) { return t.TempDir(), nil },
+		func(string) error { return probeErr },
+	)
+	if err != nil {
+		t.Fatalf("resolveProvidersConfigForStartup() error = %v", err)
+	}
+	if startup.Store != nil || !errors.Is(startup.ReadOnlyReason, probeErr) {
+		t.Fatalf("startup = %+v, want read-only persistence error", startup)
+	}
+	if got := startup.Resolved.Config.Providers[0].ID; got != "bootstrap" {
+		t.Fatalf("startup provider = %q, want bootstrap", got)
+	}
+}
+
+func writeMenubarStartupBootstrap(t *testing.T, path, providerID string) {
+	t.Helper()
+	body := []byte(`{"providers":[{"id":"` + providerID + `","type":"copilot","default":true}]}`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write bootstrap %q: %v", path, err)
+	}
+}
+
+func commitMenubarManagedOverride(t *testing.T, bootstrapPath, configDir, providerID string) string {
+	t.Helper()
+	bootstrap, err := proxy.LoadProvidersConfigBootstrap(bootstrapPath, configDir)
+	if err != nil {
+		t.Fatalf("LoadProvidersConfigBootstrap() error = %v", err)
+	}
+	store, err := proxy.NewManagedProvidersConfigStore(bootstrap)
+	if err != nil {
+		t.Fatalf("NewManagedProvidersConfigStore() error = %v", err)
+	}
+	managed := proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{{ID: providerID, Type: "copilot", Default: true}}}
+	if _, err := store.Commit(t.Context(), bootstrap.Revision, managed); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	return store.Path()
 }

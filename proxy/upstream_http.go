@@ -58,6 +58,9 @@ func (h *ProxyHandler) newInferenceUpstreamContextFrom(inbound context.Context, 
 	if isRetryStatsTracked(inbound) {
 		ctx = markRetryStatsTracked(ctx)
 	}
+	if snapshot := runtimeFromContext(inbound); snapshot != nil {
+		ctx = context.WithValue(ctx, runtimeSnapshotContextKey{}, snapshot)
+	}
 	return ctx, cancel
 }
 
@@ -158,14 +161,18 @@ func mergeHeaderValues(dst, src http.Header) {
 }
 
 func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*providerRuntime, providerModel, []byte, error) {
-	return h.resolveProviderRequestForModel(body, endpoint, extractRequestModel(body))
+	return h.resolveProviderRequestForContext(context.Background(), body, endpoint, extractRequestModel(body))
 }
 
 func (h *ProxyHandler) resolveProviderRequestForModel(body []byte, endpoint string, model string) (*providerRuntime, providerModel, []byte, error) {
-	if !h.modelAllowedForRequest(model, endpoint) {
+	return h.resolveProviderRequestForContext(context.Background(), body, endpoint, model)
+}
+
+func (h *ProxyHandler) resolveProviderRequestForContext(ctx context.Context, body []byte, endpoint string, model string) (*providerRuntime, providerModel, []byte, error) {
+	if !h.modelAllowedForContext(ctx, model, endpoint) {
 		return nil, providerModel{}, nil, modelNotAllowedRequestError(model)
 	}
-	provider, owner, known := h.resolveProviderModelForRequest(model, endpoint)
+	provider, owner, known := h.resolveProviderModelForContext(ctx, model, endpoint)
 	if provider == nil {
 		return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no provider available for endpoint %s", endpoint)}
 	}
@@ -369,7 +376,7 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, 
 	operation := routeOperationFromContext(ctx)
 	if operation == nil {
 		requestedModel := strings.TrimSpace(model)
-		if requestedModel != "" && !h.modelAllowedForRequest(requestedModel, path) {
+		if requestedModel != "" && !h.modelAllowedForContext(ctx, requestedModel, path) {
 			return nil, modelNotAllowedRequestError(requestedModel)
 		}
 	}
@@ -382,12 +389,12 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, 
 		if requestedModel != route.public.id {
 			resolvedAlias := false
 			if plan, planned := operation.policyPlan(); planned {
-				if entry, known := h.providerSetup().lookupPublicModelEntry(requestedModel); known && entry != nil && entry.kind == publicEntryPolicy && entry.id == plan.publicID {
+				if entry, known := h.providerSetupForContext(ctx).lookupPublicModelEntry(requestedModel); known && entry != nil && entry.kind == publicEntryPolicy && entry.id == plan.publicID {
 					// Keep the request alias as the rewrite source while authorizing it
 					// against the sealed policy public identity.
 					resolvedAlias = true
 				}
-			} else if resolved, known := h.resolveModelRouteForRequest(requestedModel, path); known && resolved == route {
+			} else if resolved, known := resolveModelRouteForSetup(h.providerSetupForContext(ctx), requestedModel, path); known && resolved == route {
 				// Keep the actual alias as the rewrite source. Using the canonical
 				// public ID here can leave the alias in the immutable request body
 				// when the target upstream model is already canonical.
@@ -423,7 +430,7 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, 
 		return h.executeExplicitRouteRequest(ctx, route, path, body, extraHeaders, requestedModel, stream)
 	}
 
-	route, known := h.resolveModelRouteForRequest(model, path)
+	route, known := resolveModelRouteForSetup(h.providerSetupForContext(ctx), model, path)
 	if known && route != nil && !route.legacy {
 		if err := rejectDuplicateJSONMappingKeys(body); err != nil {
 			return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("invalid ambiguous JSON request: %w", err)}
@@ -438,7 +445,7 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, 
 		return h.executeExplicitRouteRequest(ctx, route, path, body, extraHeaders, model, stream)
 	}
 
-	provider, owner, rewrittenBody, err := h.resolveProviderRequestForModel(body, path, model)
+	provider, owner, rewrittenBody, err := h.resolveProviderRequestForContext(ctx, body, path, model)
 	if err != nil {
 		return nil, err
 	}
@@ -477,18 +484,18 @@ func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, bod
 	operation := routeOperationFromContext(ctx)
 	if operation == nil {
 		requestedModel := strings.TrimSpace(model)
-		if requestedModel != "" && !h.modelAllowedForRequest(requestedModel, providerEndpointMessages) {
+		if requestedModel != "" && !h.modelAllowedForContext(ctx, requestedModel, providerEndpointMessages) {
 			return nil, modelNotAllowedRequestError(requestedModel)
 		}
 	}
 	if operation != nil && operation.route != nil && !operation.route.legacy {
 		return h.executeExplicitRouteRequestPath(ctx, operation.route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)
 	}
-	if route, known := h.resolveModelRouteForRequest(model, providerEndpointMessages); known && route != nil && !route.legacy {
+	if route, known := resolveModelRouteForSetup(h.providerSetupForContext(ctx), model, providerEndpointMessages); known && route != nil && !route.legacy {
 		return h.executeExplicitRouteRequestPath(ctx, route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)
 	}
 
-	provider, owner, rewrittenBody, err := h.resolveProviderRequest(body, providerEndpointMessages)
+	provider, owner, rewrittenBody, err := h.resolveProviderRequestForContext(ctx, body, providerEndpointMessages, model)
 	if err != nil {
 		return nil, err
 	}

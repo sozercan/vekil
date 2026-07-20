@@ -39,8 +39,9 @@ const (
 )
 
 type stateBindingOwner struct {
-	routeID  string
-	targetID string
+	routeID        string
+	targetID       string
+	targetRevision targetRevision
 }
 
 func (o stateBindingOwner) valid() bool {
