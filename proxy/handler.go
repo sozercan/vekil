@@ -1242,10 +1242,6 @@ func isCanonicalModelsQuery(rawQuery string) bool {
 	return strings.TrimSpace(rawQuery) == ""
 }
 
-func (h *ProxyHandler) replaceModelsCacheWithCanonical(entry cachedModelsResponse) {
-	h.replaceModelsCacheWithCanonicalFor(h.modelsCacheForContext(context.Background()), entry)
-}
-
 func (h *ProxyHandler) replaceModelsCacheWithCanonicalFor(cache *modelsCache, entry cachedModelsResponse) {
 	if h == nil || cache == nil {
 		return
@@ -1312,10 +1308,6 @@ func (h *ProxyHandler) ensureCanonicalModelsCacheEntryFor(cache *modelsCache, ct
 	return result.entry, result.hasEntry, result.err
 }
 
-func (h *ProxyHandler) canonicalModelsCacheState(now time.Time) (cachedModelsResponse, bool, error) {
-	return canonicalModelsCacheStateFor(h.modelsCacheForContext(context.Background()), now)
-}
-
 func canonicalModelsCacheStateFor(cache *modelsCache, now time.Time) (cachedModelsResponse, bool, error) {
 	if cache == nil {
 		return cachedModelsResponse{}, false, nil
@@ -1330,10 +1322,6 @@ func canonicalModelsCacheStateFor(cache *modelsCache, now time.Time) (cachedMode
 	return entry, ok, nil
 }
 
-func (h *ProxyHandler) recordCanonicalModelsRefreshFailure(now time.Time, err error) {
-	recordCanonicalModelsRefreshFailureFor(h.modelsCacheForContext(context.Background()), now, err)
-}
-
 func recordCanonicalModelsRefreshFailureFor(cache *modelsCache, now time.Time, err error) {
 	if cache == nil {
 		return
@@ -1342,10 +1330,6 @@ func recordCanonicalModelsRefreshFailureFor(cache *modelsCache, now time.Time, e
 	cache.canonicalFailureUntil = now.Add(modelsCacheFailureBackoff)
 	cache.canonicalFailureErr = err
 	cache.mu.Unlock()
-}
-
-func (h *ProxyHandler) clearCanonicalModelsRefreshFailure() {
-	clearCanonicalModelsRefreshFailureFor(h.modelsCacheForContext(context.Background()))
 }
 
 func clearCanonicalModelsRefreshFailureFor(cache *modelsCache) {

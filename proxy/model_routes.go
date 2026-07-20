@@ -3,7 +3,6 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -398,10 +397,6 @@ func addPublicModelEntryToSnapshot(snapshot *publicModelEntryRegistrySnapshot, e
 	return nil
 }
 
-func modelRouteAliases(publicID string) []string {
-	return configuredPublicModelAliases(publicID)
-}
-
 func publicModelEntryCollisionError(alias string, existing, incoming *publicModelEntry) error {
 	return fmt.Errorf(
 		"model %q is exposed by both route %q and route %q",
@@ -409,10 +404,6 @@ func publicModelEntryCollisionError(alias string, existing, incoming *publicMode
 		publicModelEntryOwnerID(existing),
 		publicModelEntryOwnerID(incoming),
 	)
-}
-
-func modelRouteCollisionError(alias string, existing, incoming *modelRoute) error {
-	return publicModelEntryCollisionError(alias, newStaticPublicModelEntry(existing), newStaticPublicModelEntry(incoming))
 }
 
 func compileLegacyModelRoute(model providerModel, provider *providerRuntime) (*modelRoute, error) {
@@ -687,16 +678,3 @@ func compileLegacyProviderRoutes(provider *providerRuntime, models []providerMod
 // validateRouteAwareRequestJSON keeps strict duplicate-key rejection scoped to
 // proxy-owned explicit routes; legacy and provider-owned requests retain their
 // existing decoder and upstream behavior.
-func (h *ProxyHandler) validateRouteAwareRequestJSON(body []byte, model, endpoint string) error {
-	if h == nil {
-		return nil
-	}
-	route, known := h.resolveModelRouteForRequest(model, endpoint)
-	if !known || route == nil || route.legacy {
-		return nil
-	}
-	if err := rejectDuplicateJSONMappingKeys(body); err != nil {
-		return &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("invalid ambiguous JSON request: %w", err)}
-	}
-	return nil
-}

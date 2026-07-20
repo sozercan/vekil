@@ -1056,10 +1056,6 @@ func (h *ProxyHandler) setSyntheticResponsesStoreFalseForContext(ctx context.Con
 	requestFields["store"] = json.RawMessage("false")
 }
 
-func (h *ProxyHandler) shouldSetSyntheticResponsesStoreFalse(model string) bool {
-	return h.shouldSetSyntheticResponsesStoreFalseForContext(context.Background(), model)
-}
-
 func (h *ProxyHandler) shouldSetSyntheticResponsesStoreFalseForContext(ctx context.Context, model string) bool {
 	provider, _, _ := h.resolveProviderModelForContext(ctx, strings.TrimSpace(model), providerEndpointResponses)
 	if provider == nil {
@@ -1357,10 +1353,6 @@ func (h *ProxyHandler) learnedCompactTargetForRequestContext(ctx context.Context
 		return configuredTarget, false
 	}
 	return h.learnedCompactTarget(key, configuredTarget)
-}
-
-func (h *ProxyHandler) compactLearnedTargetKeyForRequest(requestFields map[string]json.RawMessage, endpoint string) (compactLearnedTargetKey, bool) {
-	return h.compactLearnedTargetKeyForRequestContext(context.Background(), requestFields, endpoint)
 }
 
 func (h *ProxyHandler) compactLearnedTargetKeyForRequestContext(ctx context.Context, requestFields map[string]json.RawMessage, endpoint string) (compactLearnedTargetKey, bool) {
@@ -2444,10 +2436,6 @@ func fallbackMergedCompactionSummaries(summaries []string) string {
 
 func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint string, injectResumePrompt bool) []byte {
 	return h.rewriteResponsesRequestBodyForContext(context.Background(), bodyBytes, extractResponsesRequestModel(bodyBytes), endpoint, injectResumePrompt)
-}
-
-func (h *ProxyHandler) rewriteResponsesRequestBodyForModel(bodyBytes []byte, requestedModel string, endpoint string, injectResumePrompt bool) []byte {
-	return h.rewriteResponsesRequestBodyForContext(context.Background(), bodyBytes, requestedModel, endpoint, injectResumePrompt)
 }
 
 func (h *ProxyHandler) rewriteResponsesRequestBodyForContext(ctx context.Context, bodyBytes []byte, requestedModel string, endpoint string, injectResumePrompt bool) []byte {

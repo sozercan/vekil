@@ -1127,10 +1127,6 @@ func prepareAnthropicChatCompletionsRequestWithModelOverride(req *models.Anthrop
 	return body, mode, nil
 }
 
-func (h *ProxyHandler) anthropicChatTranslationModel(model string) string {
-	return h.anthropicChatTranslationModelForContext(context.Background(), model)
-}
-
 func (h *ProxyHandler) anthropicChatTranslationModelForContext(ctx context.Context, model string) string {
 	rawModel := strings.TrimSpace(model)
 	if rawModel != "" {

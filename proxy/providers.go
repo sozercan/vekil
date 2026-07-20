@@ -515,11 +515,6 @@ func (h *ProxyHandler) providerSetup() *providerSetup {
 	return h.providerSetupForContext(context.Background())
 }
 
-func (h *ProxyHandler) hasClosedConfiguredModelRegistry() bool {
-	setup := h.providerSetup()
-	return setup != nil && setup.hasConfiguredState && strings.TrimSpace(setup.defaultProviderID) == "" && setup.routeRegistry() != nil
-}
-
 func (ps *providerSetup) defaultProvider() *providerRuntime {
 	if ps == nil {
 		return nil
@@ -1729,10 +1724,6 @@ func modelNotAllowedRequestError(model string) error {
 		err:        fmt.Errorf("model %q is not allowed by this proxy", strings.TrimSpace(model)),
 	}
 
-}
-
-func (h *ProxyHandler) resolveProviderModelForRequest(model, endpoint string) (*providerRuntime, providerModel, bool) {
-	return h.resolveProviderModel(model, endpoint)
 }
 
 func providerModelSupportsEndpoint(model providerModel, endpoint string) bool {

@@ -680,10 +680,6 @@ func (h *ProxyHandler) observeRequestSummary(ctx context.Context, endpoint, mode
 	h.observeRequestSummaryWithProviderModel(ctx, endpoint, model, model, stream, providerEndpoint)
 }
 
-func (h *ProxyHandler) policyPublicModelID(model string) (string, bool) {
-	return h.policyPublicModelIDForContext(context.Background(), model)
-}
-
 func (h *ProxyHandler) policyPublicModelIDForContext(ctx context.Context, model string) (string, bool) {
 	if h == nil {
 		return "", false
