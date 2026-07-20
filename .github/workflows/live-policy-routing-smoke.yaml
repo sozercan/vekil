@@ -1,0 +1,251 @@
+name: Live Semantic Policy Routing Smoke
+
+# Credentialed end-to-end coverage for schema-v2 semantic policy routing.
+# The harness generates a temporary policy config, validates the classifier
+# contract, exercises off/observe/enforce behavior against real native-Chat
+# targets, and injects one retry-safe primary failure to verify sealed
+# within-tier failover. Deterministic process/cleanup coverage stays in ci.yaml.
+#
+# Required repository variables and secrets are documented in
+# docs/development.md. Fork and Dependabot pull requests neutral-skip because
+# GitHub does not expose repository secrets to them. Pull requests also
+# neutral-skip until the repository configuration is installed; manual runs
+# fail when configuration is missing.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-policy-routing-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semantic-policy:
+    name: semantic-policy-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LIVE_POLICY_ROUTING_LIGHTWEIGHT_TYPE: ${{ vars.LIVE_POLICY_ROUTING_LIGHTWEIGHT_TYPE }}
+      LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL: ${{ vars.LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL }}
+      LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL: ${{ vars.LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL }}
+      LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY: ${{ secrets.LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY }}
+      LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_TYPE: ${{ vars.LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_TYPE }}
+      LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL: ${{ vars.LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL }}
+      LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL: ${{ vars.LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL }}
+      LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY: ${{ secrets.LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY }}
+      LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_TYPE: ${{ vars.LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_TYPE }}
+      LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL: ${{ vars.LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL }}
+      LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL: ${{ vars.LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL }}
+      LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY: ${{ secrets.LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY }}
+      LIVE_POLICY_ROUTING_CLASSIFIER_MODEL: ${{ vars.LIVE_POLICY_ROUTING_CLASSIFIER_MODEL }}
+      LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED: ${{ vars.LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED }}
+    steps:
+      - name: Decide whether live semantic policy-routing smoke can run
+        id: gate
+        env:
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork || false }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ "${IS_FORK}" = "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping live semantic policy-routing smoke for fork pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${ACTOR}" = "dependabot[bot]" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping live semantic policy-routing smoke for Dependabot because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          missing=()
+          for name in \
+            LIVE_POLICY_ROUTING_LIGHTWEIGHT_TYPE \
+            LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL \
+            LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL \
+            LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY \
+            LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_TYPE \
+            LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL \
+            LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL \
+            LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY \
+            LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_TYPE \
+            LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL \
+            LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL \
+            LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY \
+            LIVE_POLICY_ROUTING_CLASSIFIER_MODEL \
+            LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+
+          if [ "${#missing[@]}" -ne 0 ]; then
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              printf 'Missing required live semantic policy-routing repository variables/secrets:\n' >&2
+              printf '  - %s\n' "${missing[@]}" >&2
+              exit 1
+            fi
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            printf -v missing_csv '%s, ' "${missing[@]}"
+            echo "reason=Skipping live semantic policy-routing smoke until repository configuration is installed: ${missing_csv%, }." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Explain skipped live semantic policy-routing smoke
+        if: steps.gate.outputs.run != 'true'
+        run: echo "${{ steps.gate.outputs.reason }}"
+
+      - name: Mask live semantic policy-routing configuration
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          for name in \
+            LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY \
+            LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY \
+            LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY \
+            LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL \
+            LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL \
+            LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL \
+            LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL \
+            LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL \
+            LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL \
+            LIVE_POLICY_ROUTING_CLASSIFIER_MODEL; do
+            value="${!name:-}"
+            if [ -n "$value" ]; then
+              echo "::add-mask::$value"
+            fi
+          done
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.gate.outputs.run == 'true'
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        if: steps.gate.outputs.run == 'true'
+        run: make build
+
+      - name: Run live semantic policy-routing E2E
+        if: steps.gate.outputs.run == 'true'
+        env:
+          LIVE_POLICY_ROUTING_SMOKE_DIR: ${{ runner.temp }}/live-policy-routing-smoke
+        run: scripts/live-policy-routing-smoke.sh
+
+      - name: Show redacted semantic policy-routing diagnostics on failure
+        if: failure() && steps.gate.outputs.run == 'true'
+        run: |
+          dir="$RUNNER_TEMP/live-policy-routing-smoke"
+          if [ ! -d "$dir" ]; then
+            exit 0
+          fi
+
+          redaction_dir="$(mktemp -d "$RUNNER_TEMP/live-policy-routing-redacted.XXXXXX")"
+          trap 'rm -rf "$redaction_dir"' EXIT
+
+          redact_file() {
+            local source="$1"
+            local destination="$2"
+            python3 - "$source" "$destination" <<'PY'
+          import os
+          import re
+          import sys
+
+          source, destination = sys.argv[1:]
+          with open(source, "r", encoding="utf-8", errors="replace") as handle:
+              text = handle.read()
+
+          sensitive_names = (
+              "LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY",
+              "LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY",
+              "LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY",
+              "LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL",
+              "LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL",
+              "LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL",
+              "LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL",
+              "LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL",
+              "LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL",
+              "LIVE_POLICY_ROUTING_CLASSIFIER_MODEL",
+          )
+          values = sorted(
+              {os.environ.get(name, "") for name in sensitive_names} - {""},
+              key=len,
+              reverse=True,
+          )
+          for value in values:
+              text = text.replace(value, "[REDACTED]")
+
+          substitutions = (
+              (r"(?im)^(authorization\s*:\s*(?:bearer|token)\s+)\S+", r"\1[REDACTED]"),
+              (r"(?im)^((?:api-key|x-api-key)\s*:\s*)\S+", r"\1[REDACTED]"),
+              (r'(?i)("(?:api_key|api-key|authorization)"\s*:\s*)"(?:\\.|[^"\\])*"', r'\1"[REDACTED]"'),
+              (r'(?i)("(?:arguments|tool_arguments)"\s*:\s*)"(?:\\.|[^"\\])*"', r'\1"[REDACTED]"'),
+              (r'(?i)("(?:previous_response_id|response_id|upstream_request_id)"\s*:\s*)"(?:\\.|[^"\\])*"', r'\1"[REDACTED]"'),
+              (r"(?im)^((?:x-request-id|request-id)\s*:\s*)\S+", r"\1[REDACTED]"),
+              (r'\b(?:resp|call|chatcmpl)_[A-Za-z0-9_-]+\b', "[REDACTED_ID]"),
+              (r'\b[A-Z][A-Z0-9_]*SENTINEL[A-Z0-9_]*\b', "[REDACTED_SENTINEL]"),
+          )
+          for pattern, replacement in substitutions:
+              text = re.sub(pattern, replacement, text)
+
+          with open(destination, "w", encoding="utf-8") as handle:
+              handle.write(text)
+          PY
+          }
+
+          for name in \
+            summary.txt \
+            preflight-offline.log \
+            preflight-live.log \
+            powerful-primary-shim.log \
+            off/proxy.log \
+            off/models.json \
+            off/initial.stats.json \
+            off/final.stats.json \
+            off/baseline.headers.txt \
+            off/baseline.response.json \
+            observe/proxy.log \
+            observe/models.json \
+            observe/initial.stats.json \
+            observe/final.stats.json \
+            observe/complex-shadow.headers.txt \
+            observe/complex-shadow.response.json \
+            enforce/proxy.log \
+            enforce/models.json \
+            enforce/initial.stats.json \
+            enforce/final.stats.json \
+            enforce/enforce-lightweight.headers.txt \
+            enforce/enforce-lightweight.response.json \
+            enforce/enforce-powerful.headers.txt \
+            enforce/enforce-powerful.response.json \
+            enforce/forced-tool.headers.txt \
+            enforce/forced-tool.response.json \
+            enforce/tool-continuation.headers.txt \
+            enforce/tool-continuation.response.json \
+            enforce/parallel-tools.headers.txt \
+            enforce/parallel-tools.response.json \
+            enforce/powerful-stream.headers.txt \
+            enforce/powerful-stream.sse \
+            enforce/powerful-failover.headers.txt \
+            enforce/powerful-failover.response.json \
+            enforce/reject-responses.response.json \
+            enforce/reject-image.response.json \
+            enforce/reject-tool-history.response.json; do
+            file="$dir/$name"
+            if [ -f "$file" ]; then
+              echo "--- $name (redacted, first 32768 bytes) ---"
+              safe_name="${name//\//_}"
+              redacted="$redaction_dir/$safe_name.redacted"
+              redact_file "$file" "$redacted"
+              head -c 32768 "$redacted"
+              echo
+            fi
+          done
