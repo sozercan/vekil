@@ -464,6 +464,8 @@ providers:
 
 If LM Studio, llama.cpp, or Ollama exposes a native Anthropic Messages endpoint in your local setup, configure it as a separate `anthropic-compatible` provider with `messages_path`. Do not rely on `openai-compatible` to direct-forward Messages; that type translates Anthropic requests through Chat Completions.
 
+Dynamic Copilot catalog entries are also eligible for native Anthropic Messages forwarding when their `supported_endpoints` explicitly includes `/v1/messages`. Vekil performs bounded catalog discovery before routing the first Messages request for an unknown Copilot model, then forwards the original Anthropic request directly so fields such as `thinking` and `stop_sequences` retain their native semantics. Chat-only, endpoint-less, and still-unknown Copilot models continue through Chat translation instead of assuming native Messages support.
+
 ### Copilot Provider Header Profiles
 
 `type: copilot` providers can define a `headers` block with a provider-wide `default` profile and endpoint-specific `chat_completions` and `responses` profiles. Endpoint-specific values override `headers.default`, which overrides the global Copilot header flags/environment variables, which then fall back to the built-in defaults. Omitted fields inherit from the lower-precedence profile. The built-in `openai-intent: conversation-panel` fallback is endpoint-aware: it is applied to upstream `/chat/completions` and `/responses` calls, while upstream `/models` calls send `openai-intent` only when you configure it explicitly through `--copilot-openai-intent`, `COPILOT_OPENAI_INTENT`, or a provider header profile.
