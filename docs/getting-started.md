@@ -7,7 +7,7 @@ Vekil commonly runs in one of two modes:
 
 Schema version 2 is the complete explicit-routing format: it supports public and internal routes, ordered failover, and optional semantic policy profiles. Existing route-only version-2 files remain valid. Policy routing defaults globally to `off`; v1 profiles support only text/function-tool `POST /v1/chat/completions` requests and one trusted user/tenant per deployment. See [Semantic Policy Routing](policy-routing.md).
 
-With either routing mode, the native binary also supports **managed agent launches**: `vekil launch` starts a short-lived proxy and a supported coding agent together, scoped to one public model.
+With either routing mode, the native binary also supports **managed agent launches**: `vekil launch` starts a short-lived proxy and a supported coding agent together. Claude Code and Codex CLI may delegate model selection to their normal CLI default or be pinned to one public model; GitHub Copilot CLI requires a pinned model.
 
 ## Install Or Build
 
@@ -36,8 +36,8 @@ client for a single session instead of maintaining client-specific environment
 variables:
 
 ```bash
-vekil launch claude --model claude-sonnet-4.5
-vekil launch codex --model gpt-5.4-mini
+vekil launch claude
+vekil launch codex
 vekil launch copilot --model gpt-5.4-mini
 ```
 
@@ -51,9 +51,13 @@ vekil launch codex \
 ```
 
 The launcher binds an ephemeral loopback proxy, authenticates the child with a
-random session token, restricts requests to the selected model, removes
-upstream credentials from the child environment, and shuts down with the agent.
-Use `--dry-run` to inspect statically known routing while catalog-discovered
+random session token, removes upstream credentials from the child environment,
+and shuts down with the agent. Supplying `--model` validates compatibility at
+startup, restricts requests to that model, and pins the agent to it. Omitting
+`--model` for Claude Code or Codex CLI leaves model selection to the CLI's
+configured or built-in default and exposes the proxy's normal global public
+model namespace. Dry-run reports that delegated choice as `CLI default`; for a
+pinned model, it resolves statically known routing while catalog-discovered
 metadata is clearly marked unresolved.
 
 Agent executables are not included in the distroless container image, so this

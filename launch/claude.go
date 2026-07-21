@@ -14,17 +14,15 @@ func (ClaudeAdapter) Name() string { return "claude" }
 
 func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	model := strings.TrimSpace(input.Model.ID)
-	if model == "" {
-		return PreparedProcess{}, fmt.Errorf("claude launch requires a model")
-	}
-	if strings.TrimSpace(input.Model.OwnedBy) == PolicyModelOwner {
+	hasModel := model != ""
+	if hasModel && strings.TrimSpace(input.Model.OwnedBy) == PolicyModelOwner {
 		return PreparedProcess{}, fmt.Errorf(
 			"model %q is not Claude-compatible: policy-routed model IDs are not supported on Anthropic ingress; use vekil launch copilot instead",
 			model,
 		)
 	}
 	endpointMetadataKnown := !input.DryRun || input.Model.SupportedEndpoints != nil
-	if endpointMetadataKnown &&
+	if hasModel && endpointMetadataKnown &&
 		!modelSupportsEndpoint(input.Model, "/v1/messages") &&
 		!modelSupportsEndpoint(input.Model, "/chat/completions") &&
 		!modelSupportsEndpoint(input.Model, "/responses") {
@@ -49,37 +47,41 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	if localToken == "" {
 		return PreparedProcess{}, fmt.Errorf("claude launch requires a local proxy token")
 	}
-	name := strings.TrimSpace(input.Model.Name)
-	if name == "" {
-		name = model
-	}
 	if err := validateClaudeForwardedArgs(input.ForwardedArgs); err != nil {
 		return PreparedProcess{}, err
 	}
 
 	envSet := map[string]string{
-		"ANTHROPIC_BASE_URL":                        baseURL,
-		"ANTHROPIC_AUTH_TOKEN":                      localToken,
-		"ANTHROPIC_API_KEY":                         "",
-		"ANTHROPIC_MODEL":                           model,
-		"ANTHROPIC_DEFAULT_HAIKU_MODEL":             model,
-		"ANTHROPIC_DEFAULT_SONNET_MODEL":            model,
-		"ANTHROPIC_DEFAULT_OPUS_MODEL":              model,
-		"ANTHROPIC_DEFAULT_FABLE_MODEL":             model,
-		"ANTHROPIC_CUSTOM_MODEL_OPTION":             model,
-		"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME":        name,
-		"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Routed through Vekil",
-		"CLAUDE_CODE_SUBAGENT_MODEL":                model,
-		"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST":      "vekil",
-		"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB":          "1",
+		"ANTHROPIC_BASE_URL":                   baseURL,
+		"ANTHROPIC_AUTH_TOKEN":                 localToken,
+		"ANTHROPIC_API_KEY":                    "",
+		"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "vekil",
+		"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB":     "1",
+	}
+	if hasModel {
+		name := strings.TrimSpace(input.Model.Name)
+		if name == "" {
+			name = model
+		}
+		for key, value := range map[string]string{
+			"ANTHROPIC_MODEL":                           model,
+			"ANTHROPIC_DEFAULT_HAIKU_MODEL":             model,
+			"ANTHROPIC_DEFAULT_SONNET_MODEL":            model,
+			"ANTHROPIC_DEFAULT_OPUS_MODEL":              model,
+			"ANTHROPIC_DEFAULT_FABLE_MODEL":             model,
+			"ANTHROPIC_CUSTOM_MODEL_OPTION":             model,
+			"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME":        name,
+			"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Routed through Vekil",
+			"CLAUDE_CODE_SUBAGENT_MODEL":                model,
+		} {
+			envSet[key] = value
+		}
 	}
 	envUnset := []string{
 		"ANTHROPIC_CUSTOM_HEADERS",
 		"CLAUDE_CODE_OAUTH_TOKEN",
 		"CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
 		"CLAUDE_CODE_OAUTH_SCOPES",
-		"ANTHROPIC_SMALL_FAST_MODEL",
-		"ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
 		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
 		"CLAUDE_AUTO_BACKGROUND_TASKS",
 		"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
@@ -101,6 +103,12 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		"ANTHROPIC_AWS_WORKSPACE_ID",
 		"ANTHROPIC_AWS_API_KEY",
 		"AWS_BEARER_TOKEN_BEDROCK",
+	}
+	if hasModel {
+		envUnset = append(envUnset,
+			"ANTHROPIC_SMALL_FAST_MODEL",
+			"ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+		)
 	}
 	envUnset = mergeEnvironmentKeys(commonAgentCredentialEnvironment, envUnset, input.SensitiveEnv)
 
@@ -150,7 +158,7 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		EnvUnset: envUnset,
 		Cleanup:  cleanup,
 	}
-	if !endpointMetadataKnown {
+	if hasModel && !endpointMetadataKnown {
 		prepared.Unresolved = append(prepared.Unresolved,
 			"model endpoint compatibility (/v1/messages, /chat/completions, or /responses) requires live /v1/models metadata",
 		)

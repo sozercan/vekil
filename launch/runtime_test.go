@@ -80,6 +80,21 @@ func (a delayedAdapter) Prepare(PrepareInput) (PreparedProcess, error) {
 	return PreparedProcess{Path: a.binary, Args: append([]string(nil), a.args...)}, nil
 }
 
+type recordingAdapter struct {
+	binary string
+	args   []string
+	input  PrepareInput
+	called bool
+}
+
+func (*recordingAdapter) Name() string { return "recording" }
+
+func (a *recordingAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
+	a.input = input
+	a.called = true
+	return PreparedProcess{Path: a.binary, Args: append([]string(nil), a.args...)}, nil
+}
+
 func TestRunDoesNotStartAgentAfterCancellationDuringPrepare(t *testing.T) {
 	capturePath := t.TempDir() + "/child.json"
 	binary, err := os.Executable()
@@ -512,6 +527,61 @@ func TestRunDryRunDoesNotStartProxy(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "unresolved: model endpoint compatibility") {
 		t.Fatalf("dry-run did not disclose unresolved catalog metadata: %s", stderr.String())
+	}
+}
+
+func TestRunDelegatesModelSelectionWithoutFetchingModels(t *testing.T) {
+	capturePath := t.TempDir() + "/child.json"
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	var modelRequests atomic.Int32
+	proxy := newFakeProxy(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/readyz":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ready"}`))
+		case "/v1/models":
+			modelRequests.Add(1)
+			http.Error(w, "model lookup should be skipped", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	adapter := &recordingAdapter{
+		binary: binary,
+		args:   []string{"-test.run=TestLaunchHelperProcess"},
+	}
+	var stderr bytes.Buffer
+	result, err := Run(context.Background(), proxy, adapter, Options{
+		LocalToken: "test-token-placeholder",
+		Environment: []string{
+			"GO_WANT_LAUNCH_HELPER=1",
+			"LAUNCH_HELPER_CAPTURE=" + capturePath,
+		},
+		StartupTimeout: time.Second,
+		Stderr:         &stderr,
+		Stdout:         &bytes.Buffer{},
+		NoSummary:      true,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.ExitCode != 0 || result.Model.ID != "" {
+		t.Fatalf("Run() result = %+v, want successful CLI-default launch", result)
+	}
+	if got := modelRequests.Load(); got != 0 {
+		t.Fatalf("/v1/models requests = %d, want 0", got)
+	}
+	if !adapter.called || adapter.input.Model.ID != "" {
+		t.Fatalf("adapter input = %+v, want empty model metadata", adapter.input)
+	}
+	if !strings.Contains(stderr.String(), "vekil ready: recording -> CLI default") {
+		t.Fatalf("ready banner did not report delegated selection: %s", stderr.String())
+	}
+	if _, err := os.Stat(capturePath); err != nil {
+		t.Fatalf("agent did not start: %v", err)
 	}
 }
 

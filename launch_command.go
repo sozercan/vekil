@@ -41,11 +41,16 @@ type launchAgentOptions struct {
 
 type launchClaudeOptions = launchAgentOptions
 
+type launchCopilotModelChecker interface {
+	ModelUsesCopilot(string) bool
+}
+
 type launchTargetSpec struct {
-	name        string
-	displayName string
-	installHelp string
-	adapter     launch.Adapter
+	name          string
+	displayName   string
+	installHelp   string
+	requiresModel bool
+	adapter       launch.Adapter
 }
 
 func launchTarget(name string) (launchTargetSpec, bool) {
@@ -66,10 +71,11 @@ func launchTarget(name string) (launchTargetSpec, bool) {
 		}, true
 	case "copilot":
 		return launchTargetSpec{
-			name:        "copilot",
-			displayName: "GitHub Copilot CLI",
-			installHelp: "install GitHub Copilot CLI",
-			adapter:     launch.CopilotAdapter{},
+			name:          "copilot",
+			displayName:   "GitHub Copilot CLI",
+			installHelp:   "install GitHub Copilot CLI",
+			requiresModel: true,
+			adapter:       launch.CopilotAdapter{},
 		}, true
 	default:
 		return launchTargetSpec{}, false
@@ -103,8 +109,8 @@ func runLaunchCommand(args []string, stderr io.Writer) int {
 
 func printLaunchUsage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "Usage:")
-	_, _ = fmt.Fprintln(w, "  vekil launch claude --model MODEL [options] -- [claude args...]")
-	_, _ = fmt.Fprintln(w, "  vekil launch codex --model MODEL [options] -- [codex args...]")
+	_, _ = fmt.Fprintln(w, "  vekil launch claude [--model MODEL] [options] -- [claude args...]")
+	_, _ = fmt.Fprintln(w, "  vekil launch codex [--model MODEL] [options] -- [codex args...]")
 	_, _ = fmt.Fprintln(w, "  vekil launch copilot --model MODEL [options] -- [copilot args...]")
 	_, _ = fmt.Fprintln(w)
 	_, _ = fmt.Fprintln(w, "Supported launch targets:")
@@ -118,11 +124,19 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	fs := flag.NewFlagSet("launch "+target.name, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
-		_, _ = fmt.Fprintf(stderr, "Usage: vekil launch %s --model MODEL [options] -- [%s args...]\n", target.name, target.name)
+		modelUsage := "[--model MODEL]"
+		if target.requiresModel {
+			modelUsage = "--model MODEL"
+		}
+		_, _ = fmt.Fprintf(stderr, "Usage: vekil launch %s %s [options] -- [%s args...]\n", target.name, modelUsage, target.name)
 		fs.PrintDefaults()
 	}
 
-	model := fs.String("model", "", "Public Vekil model ID to use")
+	modelHelp := "Public Vekil model ID to pin (omit to let " + target.displayName + " choose its default)"
+	if target.requiresModel {
+		modelHelp = "Public Vekil model ID to use (required by " + target.displayName + " custom-provider mode)"
+	}
+	model := fs.String("model", "", modelHelp)
 	binary := fs.String("binary", "", "Path or command name for "+target.displayName)
 	port := fs.String("port", "0", "Ephemeral proxy listen port (0 lets the OS choose)")
 	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
@@ -138,7 +152,16 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
-	if strings.TrimSpace(*model) == "" {
+	modelWasSet := false
+	fs.Visit(func(flagValue *flag.Flag) {
+		if flagValue.Name == "model" {
+			modelWasSet = true
+		}
+	})
+	if modelWasSet && strings.TrimSpace(*model) == "" {
+		return opts, fmt.Errorf("--model must not be empty")
+	}
+	if target.requiresModel && strings.TrimSpace(*model) == "" {
 		return opts, fmt.Errorf("--model is required")
 	}
 	portNumber, err := strconv.Atoi(strings.TrimSpace(*port))
@@ -221,13 +244,15 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		NoSummary:      opts.noSummary,
 	}
 	if opts.dryRun {
-		model, found, resolveErr := resolveLaunchDryRunModelInfo(providersCfg, opts.model)
-		if resolveErr != nil {
-			_, _ = fmt.Fprintf(stderr, "error: resolve dry-run model metadata: %v\n", resolveErr)
-			return 1
-		}
-		if found {
-			launchOpts.DryRunModel = &model
+		if opts.model != "" {
+			model, found, resolveErr := resolveLaunchDryRunModelInfo(providersCfg, opts.model)
+			if resolveErr != nil {
+				_, _ = fmt.Fprintf(stderr, "error: resolve dry-run model metadata: %v\n", resolveErr)
+				return 1
+			}
+			if found {
+				launchOpts.DryRunModel = &model
+			}
 		}
 		result, runErr := launch.Run(context.Background(), nil, target.adapter, launchOpts)
 		if runErr != nil {
@@ -277,7 +302,7 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 	proxyRuntime := &agentLaunchProxy{
 		srv:           srv,
 		authenticator: authenticator,
-		usesCopilot:   srv.ModelUsesCopilot(opts.model),
+		usesCopilot:   launchUsesCopilot(providersCfg, opts.model, srv),
 		log:           log,
 	}
 	launchOpts.LogPath = logPath
@@ -298,6 +323,14 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		return 1
 	}
 	return result.ExitCode
+}
+
+func launchUsesCopilot(cfg proxy.ProvidersConfig, model string, checker launchCopilotModelChecker) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return cfg.UsesCopilot()
+	}
+	return checker.ModelUsesCopilot(model)
 }
 
 func resolveLaunchDryRunModelInfo(cfg proxy.ProvidersConfig, modelID string) (launch.ModelInfo, bool, error) {

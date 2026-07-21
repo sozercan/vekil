@@ -47,6 +47,7 @@ type ModelCapabilitySupports struct {
 
 // PrepareInput contains the resolved values an agent adapter needs to construct
 // its child process. BaseURL is the root Vekil URL without a trailing slash.
+// Model is zero-valued when selection is delegated to the agent CLI.
 type PrepareInput struct {
 	BaseURL       string
 	Model         ModelInfo
@@ -111,6 +112,7 @@ type Options struct {
 
 // Result is the completed launcher outcome. A non-zero child exit is represented
 // by ExitCode rather than an error so callers can preserve the agent's status.
+// Model is zero-valued when the agent CLI selected its own model.
 type Result struct {
 	ExitCode int
 	BaseURL  string

@@ -29,11 +29,9 @@ func (CodexAdapter) Name() string { return "codex" }
 
 func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	model := strings.TrimSpace(input.Model.ID)
-	if model == "" {
-		return PreparedProcess{}, fmt.Errorf("codex launch requires a model")
-	}
+	hasModel := model != ""
 	endpointMetadataKnown := !input.DryRun || input.Model.SupportedEndpoints != nil
-	if endpointMetadataKnown && !modelSupportsEndpoint(input.Model, "/responses") {
+	if hasModel && endpointMetadataKnown && !modelSupportsEndpoint(input.Model, "/responses") {
 		return PreparedProcess{}, fmt.Errorf(
 			"model %q is not Codex-compatible: expected /responses support",
 			model,
@@ -69,18 +67,22 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		}
 	}
 
-	catalogJSON, err := buildCodexModelCatalog(executable, probeEnvironment, input.Model, input.DryRun)
-	if err != nil {
-		return PreparedProcess{}, fmt.Errorf("build Codex model catalog: %w", err)
-	}
-	catalogPath, cleanup, err := writePrivateTempFile("vekil-codex-models-", append(catalogJSON, '\n'))
-	if err != nil {
-		return PreparedProcess{}, fmt.Errorf("write Codex model catalog: %w", err)
+	var catalogPath string
+	var cleanup func() error
+	if hasModel {
+		catalogJSON, err := buildCodexModelCatalog(executable, probeEnvironment, input.Model, input.DryRun)
+		if err != nil {
+			return PreparedProcess{}, fmt.Errorf("build Codex model catalog: %w", err)
+		}
+		catalogPath, cleanup, err = writePrivateTempFile("vekil-codex-models-", append(catalogJSON, '\n'))
+		if err != nil {
+			return PreparedProcess{}, fmt.Errorf("write Codex model catalog: %w", err)
+		}
 	}
 
 	providerID := codexProviderID(localToken)
 	args := append([]string(nil), executable.prefixArgs...)
-	for _, override := range []string{
+	overrides := []string{
 		`model_provider=` + configString(providerID),
 		`model_providers.` + providerID + `.name="Vekil"`,
 		`model_providers.` + providerID + `.base_url=` + configString(openAIBaseURL(baseURL)),
@@ -88,12 +90,17 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		`model_providers.` + providerID + `.env_key=` + configString(codexLocalTokenEnv),
 		`model_providers.` + providerID + `.requires_openai_auth=false`,
 		`model_providers.` + providerID + `.supports_websockets=false`,
-		`model_catalog_json=` + configString(catalogPath),
-		`shell_environment_policy.set.` + codexLocalTokenEnv + `=""`,
-	} {
+	}
+	if hasModel {
+		overrides = append(overrides, `model_catalog_json=`+configString(catalogPath))
+	}
+	overrides = append(overrides, `shell_environment_policy.set.`+codexLocalTokenEnv+`=""`)
+	for _, override := range overrides {
 		args = append(args, "-c", override)
 	}
-	args = append(args, "-m", model)
+	if hasModel {
+		args = append(args, "-m", model)
+	}
 	args = append(args, input.ForwardedArgs...)
 
 	prepared := PreparedProcess{
@@ -103,7 +110,7 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		EnvUnset: envUnset,
 		Cleanup:  cleanup,
 	}
-	if !endpointMetadataKnown {
+	if hasModel && !endpointMetadataKnown {
 		prepared.Unresolved = append(prepared.Unresolved,
 			"model endpoint compatibility (/responses) requires live /v1/models metadata",
 		)
