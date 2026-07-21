@@ -245,7 +245,7 @@ func TestResolveStaticProviderModelResolvesSchemaV2ExplicitRouteMetadata(t *test
 			ID:                "route",
 			PublicID:          "public-model",
 			Name:              "Public Model",
-			Endpoints:         []string{"/responses"},
+			Endpoints:         []string{"/responses", "/chat/completions"},
 			ReasoningEffort:   []string{"low", "high"},
 			ParallelToolCalls: &parallelToolCalls,
 			DropStopSequences: &dropStopSequences,
@@ -268,7 +268,7 @@ func TestResolveStaticProviderModelResolvesSchemaV2ExplicitRouteMetadata(t *test
 	if got.PublicID != "public-model" || got.Name != "Public Model" {
 		t.Fatalf("resolved identity = %#v", got)
 	}
-	if !reflect.DeepEqual(got.Endpoints, []string{"/responses"}) ||
+	if !reflect.DeepEqual(got.Endpoints, []string{"/responses", "/chat/completions"}) ||
 		!reflect.DeepEqual(got.ReasoningEffort, []string{"low", "high"}) {
 		t.Fatalf("resolved route metadata = %#v", got)
 	}

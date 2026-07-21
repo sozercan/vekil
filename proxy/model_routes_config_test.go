@@ -450,6 +450,7 @@ func TestValidateModelRoutesPathSpecificErrors(t *testing.T) {
 		{name: "missing provider", mutate: func(c *ProvidersConfig) { c.ModelRoutes[0].Targets[0].Provider = "" }, want: "model_routes[0].targets[0].provider"},
 		{name: "unknown provider", mutate: func(c *ProvidersConfig) { c.ModelRoutes[0].Targets[0].Provider = "missing" }, want: "model_routes[0].targets[0].provider"},
 		{name: "missing upstream model", mutate: func(c *ProvidersConfig) { c.ModelRoutes[0].Targets[0].UpstreamModel = "" }, want: "model_routes[0].targets[0].upstream_model"},
+		{name: "chat-only route policy on responses route", mutate: func(c *ProvidersConfig) { c.ModelRoutes[0].DropStopSequences = boolPointer(true) }, want: "model_routes[0].drop_stop_sequences"},
 		{name: "chat-only wire policy on responses route", mutate: func(c *ProvidersConfig) { c.ModelRoutes[0].Targets[0].UseMaxCompletionTokens = boolPointer(true) }, want: "model_routes[0].targets[0].use_max_completion_tokens"},
 		{name: "unsupported mode", mutate: func(c *ProvidersConfig) { c.ModelRoutes[0].Routing.Mode = "weighted" }, want: "model_routes[0].routing.mode"},
 		{name: "negative target attempts", mutate: func(c *ProvidersConfig) { c.ModelRoutes[0].Routing.MaxTargetAttempts = -1 }, want: "model_routes[0].routing.max_target_attempts"},
@@ -580,6 +581,13 @@ func TestValidateModelRoutesRejectsDuplicatesAndCollisions(t *testing.T) {
 		{name: "duplicate provider model reasoning", mutate: func(c *ProvidersConfig) {
 			c.Providers[0].Models = []ProviderModelConfig{{PublicID: "legacy", ReasoningEffort: []string{"high", " high "}}}
 		}, want: "providers[0].models[0].reasoning_effort[1]"},
+		{name: "chat-only provider model policy on responses model", mutate: func(c *ProvidersConfig) {
+			c.Providers[0].Models = []ProviderModelConfig{{
+				PublicID:          "legacy",
+				Endpoints:         []string{providerEndpointResponses},
+				DropStopSequences: boolPointer(true),
+			}}
+		}, want: "providers[0].models[0].drop_stop_sequences"},
 		{name: "duplicate provider public aliases", mutate: func(c *ProvidersConfig) {
 			c.Providers[0].Models = []ProviderModelConfig{{PublicID: "claude-sonnet-4-5"}, {PublicID: "claude-sonnet-4.5"}}
 		}, want: "providers[0].models[1].public_id"},

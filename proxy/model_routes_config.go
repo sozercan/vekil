@@ -699,6 +699,10 @@ func validateProviderShellWithoutSecrets(cfg ProviderConfig, kind providerType, 
 		if strings.TrimSpace(model.PublicID) == "" {
 			return configPathError(modelPath+".public_id", "is required")
 		}
+		supportsChatCompletions := len(model.Endpoints) == 0 && supportsEndpoint(
+			providerEndpointPolicyFor(kind).defaultStaticEndpoints(),
+			providerEndpointChatCompletions,
+		)
 		seenEndpoints := make(map[string]int, len(model.Endpoints))
 		for endpointIndex, rawEndpoint := range model.Endpoints {
 			endpoint := strings.TrimSpace(rawEndpoint)
@@ -710,6 +714,12 @@ func validateProviderShellWithoutSecrets(cfg ProviderConfig, kind providerType, 
 				return configPathError(endpointPath, "duplicates %s.endpoints[%d]", modelPath, prior)
 			}
 			seenEndpoints[endpoint] = endpointIndex
+			if endpoint == providerEndpointChatCompletions {
+				supportsChatCompletions = true
+			}
+		}
+		if model.DropStopSequences != nil && !supportsChatCompletions {
+			return configPathError(modelPath+".drop_stop_sequences", "is only valid when the model supports %q", providerEndpointChatCompletions)
 		}
 		seenReasoning := make(map[string]int, len(model.ReasoningEffort))
 		for effortIndex, rawEffort := range model.ReasoningEffort {
@@ -978,6 +988,9 @@ func normalizeAndValidateModelRouteForSchema(route *ModelRouteConfig, path strin
 			supportsChatCompletions = true
 			break
 		}
+	}
+	if route.DropStopSequences != nil && !supportsChatCompletions {
+		return configPathError(path+".drop_stop_sequences", "is only valid when the route advertises %q", providerEndpointChatCompletions)
 	}
 	seenTargets := make(map[string]int, len(route.Targets))
 	for index := range route.Targets {
