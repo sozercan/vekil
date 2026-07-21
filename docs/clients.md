@@ -38,7 +38,16 @@ Use [`vekil launch claude`](agent-launchers.md) to start an ephemeral proxy and 
 ```bash
 env ANTHROPIC_BASE_URL=http://localhost:1337 \
   ANTHROPIC_API_KEY=dummy \
-  claude --model claude-sonnet-4 --print --output-format text "Reply with exactly PROXY_OK"
+  claude --model claude-sonnet-5 --print --output-format text "Reply with exactly PROXY_OK"
+```
+
+When zero-config Copilot rejects `advisor-tool-2026-03-01` as an unsupported beta header, disable Claude Code's experimental Advisor Tool for that invocation:
+
+```bash
+env CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1 \
+  ANTHROPIC_BASE_URL=http://localhost:1337 \
+  ANTHROPIC_API_KEY=dummy \
+  claude --model claude-sonnet-5 --print --output-format text "Reply with exactly PROXY_OK"
 ```
 
 ## OpenAI Codex CLI

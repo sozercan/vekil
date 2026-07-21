@@ -573,9 +573,12 @@ run_claude_command() {
   local output_file="$3"
   local model="$4"
   cd "${case_dir}"
+  # This baseline compatibility smoke does not exercise Claude's experimental
+  # Advisor Tool, whose beta header is not accepted by the Copilot endpoint.
   HOME="${home_dir}" \
   ANTHROPIC_BASE_URL="${PROXY_BASE_URL}" \
   ANTHROPIC_API_KEY=dummy \
+  CLAUDE_CODE_DISABLE_ADVISOR_TOOL="${CLAUDE_CODE_DISABLE_ADVISOR_TOOL:-1}" \
   claude \
     --dangerously-skip-permissions \
     --print \
@@ -1061,7 +1064,7 @@ main() {
   fetch_models
 
   CODEX_MODEL="$(pick_model "Codex/OpenAI" gpt-5.4 gpt-5.3-codex gpt-5.2-codex gpt-5.1-codex gpt-5.1 gpt-5-mini gpt-4.1 gpt-4o)"
-  CLAUDE_MODEL="$(pick_model "Claude" claude-sonnet-4.6 claude-sonnet-4.5 claude-sonnet-4 claude-opus-4.6)"
+  CLAUDE_MODEL="$(pick_model "Claude" claude-sonnet-5 claude-opus-4.8 claude-opus-4.7 claude-opus-4.6 claude-sonnet-4.6 claude-sonnet-4.5 claude-haiku-4.5 claude-sonnet-4)"
   GEMINI_MODEL="$(pick_optional_gemini_model gemini-3.1-pro-preview gemini-3-pro-preview gemini-2.5-pro gemini-3-flash-preview)"
 
   if [[ -n "${GEMINI_MODEL}" ]]; then

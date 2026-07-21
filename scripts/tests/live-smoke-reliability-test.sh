@@ -101,6 +101,8 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": MODEL, "supported_endpoints": ["/chat/completions", "/responses"]},
                 {"id": "mimo-v2.5-free", "supported_endpoints": ["/chat/completions"]},
                 {"id": "gpt-5.4", "supported_endpoints": ["/responses"]},
+                {"id": "claude-sonnet-4.6", "supported_endpoints": ["/chat/completions"]},
+                {"id": "claude-sonnet-5", "supported_endpoints": ["/chat/completions"]},
             ]})
             return
         self.send_json(404, {"error": {"message": "not found"}})
@@ -301,6 +303,59 @@ PY_WRAPPED_OUTPUT
 esac
 EOF_CLIENT
   chmod +x "${path}"
+}
+
+write_fake_default_smoke_clients() {
+  local bin_dir="$1"
+  mkdir -p "${bin_dir}"
+
+  cat > "${bin_dir}/codex" <<'EOF_CODEX'
+#!/usr/bin/env bash
+set -euo pipefail
+case_dir=""
+output_file=""
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --cd)
+      case_dir="$2"
+      shift 2
+      ;;
+    -o)
+      output_file="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+[[ -n "${case_dir}" && -n "${output_file}" ]]
+printf '%s|%s\n' "$(cat "${case_dir}/left.txt")" "$(cat "${case_dir}/right.txt")" > "${output_file}"
+EOF_CODEX
+
+  cat > "${bin_dir}/claude" <<'EOF_CLAUDE'
+#!/usr/bin/env bash
+set -euo pipefail
+capture_dir="${FAKE_CLAUDE_CAPTURE_DIR:?}"
+mkdir -p "${capture_dir}"
+printf '%s' "${CLAUDE_CODE_DISABLE_ADVISOR_TOOL-}" > "${capture_dir}/disable-advisor-tool"
+model=""
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --model)
+      model="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf '%s' "${model}" > "${capture_dir}/model"
+printf '%s|%s\n' "$(cat left.txt)" "$(cat right.txt)"
+EOF_CLAUDE
+
+  chmod +x "${bin_dir}/codex" "${bin_dir}/claude"
 }
 
 write_bind_failure_proxy() {
@@ -559,6 +614,36 @@ run_zen_classification_case() {
 }
 
 log "Running deterministic smoke reliability regressions"
+
+claude_contract_dir="${TMP_ROOT}/setup/claude-defaults-and-model-preference"
+start_mock_server "${claude_contract_dir}/server" 200
+claude_contract_port="${MOCK_SERVER_PORT}"
+write_fake_default_smoke_clients "${claude_contract_dir}/bin"
+claude_capture_dir="${claude_contract_dir}/capture"
+if expect_success "Claude subprocess defaults and model preference" 8 \
+  env -u CLAUDE_CODE_DISABLE_ADVISOR_TOOL \
+    PATH="${claude_contract_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=copilot START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${claude_contract_port}" \
+    LIVE_CLI_SMOKE_DIR="${claude_contract_dir}/smoke" \
+    FAKE_CLAUDE_CAPTURE_DIR="${claude_capture_dir}" \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"; then
+  captured_advisor_default="$(cat "${claude_capture_dir}/disable-advisor-tool" 2>/dev/null || true)"
+  if [[ "${captured_advisor_default}" == "1" ]]; then
+    record_success "Claude subprocess disables the advisor tool by default"
+  else
+    record_failure "Claude subprocess disables the advisor tool by default" \
+      "captured CLAUDE_CODE_DISABLE_ADVISOR_TOOL=${captured_advisor_default:-<missing>}"
+  fi
+
+  captured_claude_model="$(cat "${claude_capture_dir}/model" 2>/dev/null || true)"
+  if [[ "${captured_claude_model}" == "claude-sonnet-5" ]]; then
+    record_success "Claude model selection prefers Sonnet 5 over catalogued Sonnet 4"
+  else
+    record_failure "Claude model selection prefers Sonnet 5 over catalogued Sonnet 4" \
+      "captured model=${captured_claude_model:-<missing>}"
+  fi
+fi
 
 escape_client="${TMP_ROOT}/json-wrapped-client"
 write_fake_client "${escape_client}" json-wrapped
