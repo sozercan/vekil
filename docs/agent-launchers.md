@@ -2,19 +2,23 @@
 
 Vekil can start a short-lived loopback proxy and run a supported coding agent
 against it in one command. The proxy uses an OS-selected port by default,
-authenticates the child with a random per-launch token, restricts routing to the
-selected public model, prints a request/token summary, and stops when the agent
-exits.
+authenticates the child with a random per-launch token, prints a request/token
+summary, and stops when the agent exits. Claude Code and Codex CLI can either
+choose their normal CLI default through the global public model namespace or be
+pinned to one validated model. GitHub Copilot CLI always requires a pinned
+model.
 
 ## Supported targets
 
-| Target | Command | Minimum tested contract | Required model endpoint |
-|--------|---------|-------------------------|-------------------------|
-| Claude Code | `vekil launch claude` | Claude Code 2.1.83+ | `/v1/messages`, `/chat/completions`, or `/responses` |
-| OpenAI Codex CLI | `vekil launch codex` | Codex CLI 0.137.0+ | `/responses` |
-| GitHub Copilot CLI | `vekil launch copilot` | GitHub Copilot CLI 1.0.0+ | `/responses` or `/chat/completions` |
+| Target | Model selection | Minimum tested contract | Compatible model endpoint |
+|--------|-----------------|-------------------------|---------------------------|
+| Claude Code | Optional `--model`; otherwise Claude's CLI default | Claude Code 2.1.83+ | `/v1/messages`, `/chat/completions`, or `/responses` |
+| OpenAI Codex CLI | Optional `--model`; otherwise Codex's CLI default | Codex CLI 0.137.0+ | `/responses` |
+| GitHub Copilot CLI | `--model` required | GitHub Copilot CLI 1.0.0+ | `/responses` or `/chat/completions` |
 
 ```bash
+vekil launch claude
+vekil launch codex
 vekil launch claude --model claude-sonnet-4.5
 vekil launch codex --model gpt-5.4-mini
 vekil launch copilot --model gpt-5.4-mini
@@ -31,7 +35,7 @@ vekil launch codex \
 Arguments after `--` are forwarded to the selected agent:
 
 ```bash
-vekil launch codex --model gpt-5.4-mini -- \
+vekil launch codex -- \
   exec --ephemeral --skip-git-repo-check "Review this workspace"
 
 vekil launch copilot --model gpt-5.4-mini -- \
@@ -40,7 +44,28 @@ vekil launch copilot --model gpt-5.4-mini -- \
 
 Each launcher reserves model, provider, remote-session, resume, and other
 arguments that could replace the validated routing layer or leave work running
-outside the ephemeral proxy lifecycle.
+outside the ephemeral proxy lifecycle. To pin Claude Code or Codex CLI, use the
+launcher's `--model` before `--`; forwarded model overrides remain rejected.
+
+## Model selection modes
+
+Claude Code and Codex CLI support two launch modes:
+
+- **Delegated CLI default**: omit `--model`. Vekil does not choose or pin a
+  model; the agent resolves its normal configured or built-in default. The
+  ephemeral proxy exposes the same global public model namespace as a normal
+  Vekil server. Because there is no concrete model to inspect at startup, Vekil
+  does not perform model-specific existence, endpoint-compatibility, or
+  capability checks. The CLI's eventual model must exist in that public
+  namespace and be compatible with the target's endpoint, or the request fails
+  when the agent uses it.
+- **Pinned model**: supply `--model ID`. Vekil validates that public model at
+  startup, checks target compatibility, narrows the ephemeral proxy to that one
+  model and its configured aliases, and pins the agent's model selection.
+
+GitHub Copilot CLI has no delegated mode. Its custom-provider/BYOK contract
+requires an explicit model, so `vekil launch copilot` rejects startup unless
+`--model` is supplied.
 
 ## Lifecycle
 
@@ -50,19 +75,24 @@ Every launcher:
 2. starts a proxy on `127.0.0.1:0` unless `--port` is provided;
 3. completes startup authentication and provider-model validation;
 4. initializes configured policy routing using the `--policy-routing` / `POLICY_ROUTING_MODE` safety ceiling;
-5. waits for `/readyz` and verifies that `--model` appears in `/v1/models`;
-6. validates the installed agent binary and model endpoint compatibility;
-7. starts the agent with target-specific temporary routing configuration;
+5. waits for `/readyz` and, when `--model` is supplied, verifies that model in `/v1/models`;
+6. validates the installed agent binary and, for a pinned model, endpoint compatibility;
+7. starts the agent with target-specific temporary routing configuration and either delegated or pinned model selection;
 8. forwards signals and supervises the managed child process group or Job Object;
 9. prints a usage summary and stops the proxy when the agent exits.
 
-The ephemeral proxy scopes policy-controller construction and live classifier preflight to the selected public model (including its configured aliases). Unrelated policy profiles cannot require credentials, send classifier preflights, or fail startup for that managed session.
+With `--model`, the ephemeral proxy scopes policy-controller construction and
+live classifier preflight to the selected public model, including its configured
+aliases. Unrelated policy profiles cannot require credentials, send classifier
+preflights, or fail startup for that pinned session. Without `--model`, Claude
+Code and Codex CLI use the normal global public namespace and therefore the
+normal global policy-controller startup behavior.
 
 ## Common options
 
 | Flag | Purpose |
 |------|---------|
-| `--model ID` | Required public Vekil model ID. |
+| `--model ID` | Public Vekil model ID to validate, scope, and pin. Optional for Claude Code and Codex CLI; required for GitHub Copilot CLI. |
 | `--providers-config PATH` | JSON or YAML provider configuration. |
 | `--token-dir PATH` | Copilot token storage directory used by Vekil. |
 | `--port PORT` | Local proxy port. Default `0` lets the OS allocate one. |
@@ -75,51 +105,67 @@ The ephemeral proxy scopes policy-controller construction and live classifier pr
 | `--no-summary` | Suppress the end-of-session request/token summary. |
 
 ```bash
+vekil launch codex --dry-run
 vekil launch codex --model gpt-5.4-mini --dry-run
 ```
 
-Dry-run never contacts provider model catalogs. When `--model` is declared in
+For Claude Code and Codex CLI without `--model`, dry-run describes model
+selection as `CLI default`. It does not invent a concrete model or perform
+model-specific checks. GitHub Copilot CLI dry-run still requires `--model`.
+
+Dry-run never contacts provider model catalogs. For a pinned model declared in
 the providers file, Vekil uses its configured endpoint and capability metadata
-and rejects an incompatible target exactly as a real launch would. For
-catalog-discovered models, endpoint compatibility and endpoint-dependent child
+and rejects an incompatible target exactly as a real launch would. For a pinned
+catalog-discovered model, endpoint compatibility and endpoint-dependent child
 settings are printed as `unresolved` instead of being guessed.
 
 ## Claude Code
 
 ```bash
+vekil launch claude -- --dangerously-skip-permissions
+
 vekil launch claude --model claude-sonnet-4.5 -- \
   --dangerously-skip-permissions
 ```
 
 The launcher supplies an owner-only temporary `--settings` overlay so user or
-project settings cannot replace its gateway, token, or model. The file is
-removed during cleanup. Its routing values include:
+project settings cannot replace its gateway or token. When `--model` is
+supplied, the overlay also pins model selection. The file is removed during
+cleanup. Its routing values include:
 
 - `ANTHROPIC_BASE_URL`;
 - a random `ANTHROPIC_AUTH_TOKEN`;
 - an empty `ANTHROPIC_API_KEY` to avoid conflicting persisted API-key auth;
-- `ANTHROPIC_MODEL` and the default Haiku, Sonnet, Opus, and Fable aliases;
-- `CLAUDE_CODE_SUBAGENT_MODEL` and the custom model-picker entry;
+- when pinned, `ANTHROPIC_MODEL`, the default Haiku, Sonnet, Opus, and Fable
+  aliases, `CLAUDE_CODE_SUBAGENT_MODEL`, and the custom model-picker entry;
 - host-managed provider and subprocess-environment scrubbing flags;
 - disabled background-task, agent-view, cron, agent-team, tmux, and remote-control surfaces.
 
 Provider-specific Bedrock, Vertex, Foundry, Mantle, AWS, OAuth, and custom-header
 values are removed from the child environment. Gateway catalog discovery is
-disabled, and the proxy independently rejects requests for any model other than
-the selected public model.
+disabled. With `--model`, the proxy independently rejects requests for any model
+other than the selected public model. Without `--model`, Claude resolves its
+normal configured or built-in default and the proxy accepts requests across the
+global public model namespace.
 
 Policy-routing public model IDs (`owned_by: vekil-policy`) are rejected for
-Claude Code even though they advertise `/chat/completions`: policy routing is
-not supported on the Anthropic ingress used by this launcher. Use
-`vekil launch copilot` for those Chat-completions policy models. Direct models
-with `/v1/messages`, `/chat/completions`, or `/responses` remain supported.
+Claude Code in pinned mode even though they advertise `/chat/completions`:
+policy routing is not supported on the Anthropic ingress used by this launcher.
+In delegated mode, a Claude default that resolves to one of those models fails
+when requested. Use `vekil launch copilot` for those Chat-completions policy
+models. Direct models with `/v1/messages`, `/chat/completions`, or `/responses`
+remain supported.
 
 Forwarded settings-source, detached-session, resume, model/fallback, and custom
-agent overrides are rejected.
+agent overrides are rejected. Use the launcher-level `--model` to pin a model;
+otherwise model selection remains delegated to Claude's normal default.
 
 ## OpenAI Codex CLI
 
 ```bash
+vekil launch codex -- \
+  exec --ephemeral --skip-git-repo-check "Reply with exactly OK"
+
 vekil launch codex --model gpt-5.4-mini -- \
   exec --ephemeral --skip-git-repo-check "Reply with exactly OK"
 ```
@@ -137,15 +183,24 @@ this flow. Vekil instead injects a transient, per-launch
   model-invoked shells without replacing user-configured exclusions; upstream
   credential names are removed from the Codex process environment.
 
-A private temporary one-model Codex catalog is generated from the installed
-CLI's bundled catalog, with Vekil model context, reasoning, vision, and tool
-metadata overlaid when advertised by `/v1/models`. This keeps the picker and
-reasoning controls scoped to the selected route without editing
+With `--model`, a private temporary one-model Codex catalog is generated from
+the installed CLI's bundled catalog, with Vekil model context, reasoning,
+vision, and tool metadata overlaid when advertised by `/v1/models`. This keeps
+the picker and reasoning controls scoped to the selected route without editing
 `~/.codex/config.toml`. The catalog is removed during cleanup.
+
+Without `--model`, the launcher does not add a Codex `-m` override or narrow the
+proxy namespace. Codex resolves the model from its normal configuration or
+built-in default, and that public model ID is sent through the transient Vekil
+provider. The selected default must exist in Vekil's global public namespace and
+support `/responses`. Because the launcher cannot know the choice in advance,
+an unknown or incompatible default fails when Codex requests it rather than
+during launcher startup.
 
 Forwarded `-m`/`--model`, `-c`/`--config`, profile, OSS/local-provider, remote,
 resume/fork, app-server, remote-control, cloud, and non-agent command modes are
-rejected.
+rejected. Use the launcher-level `--model` to pin a model; otherwise selection
+remains delegated to Codex's normal default.
 
 ## GitHub Copilot CLI
 
@@ -154,7 +209,8 @@ vekil launch copilot --model gpt-5.4-mini -- \
   --allow-all-tools -p "Reply with exactly OK" -s
 ```
 
-The launcher uses Copilot CLI's custom-provider mode:
+`--model` is required because Copilot CLI's custom-provider/BYOK mode needs an
+explicit model ID. The launcher uses that mode as follows:
 
 - `COPILOT_PROVIDER_BASE_URL` points to the ephemeral proxy's `/v1` root;
 - `COPILOT_PROVIDER_TYPE=openai`;
@@ -197,10 +253,12 @@ The child receives a sanitized copy of the parent environment. Vekil removes:
 - common Azure Identity secret variables when Entra authentication is active;
 - target-specific upstream, OAuth, GitHub, and provider credential variables.
 
-Only a random loopback session token is passed to the agent. It is restricted
-server-side to the selected public model and grants no direct upstream access.
-Real provider credentials remain owned by the proxy process. Temporary files use
-mode `0600` on Unix and an owner-only protected ACL on Windows.
+Only a random loopback session token is passed to the agent. In pinned mode it
+is restricted server-side to the selected public model. In delegated Claude or
+Codex mode it can reach the proxy's normal global public model namespace. It
+grants no direct upstream access in either mode; real provider credentials
+remain owned by the proxy process. Temporary files use mode `0600` on Unix and
+an owner-only protected ACL on Windows.
 
 The launcher appends the loopback host, `localhost`, `127.0.0.1`, and `::1` to
 both `NO_PROXY` and `no_proxy`. Existing proxy configuration is preserved, but

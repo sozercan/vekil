@@ -115,6 +115,60 @@ func TestCodexAdapterPrepare(t *testing.T) {
 	}
 }
 
+func TestCodexAdapterPrepareWithoutModelUsesCodexDefault(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	prepared, err := (CodexAdapter{}).Prepare(PrepareInput{
+		BaseURL: "http://127.0.0.1:43210/",
+		Model: ModelInfo{
+			ID:                 " \t ",
+			SupportedEndpoints: []string{"/chat/completions"},
+		},
+		Binary:        binary,
+		ForwardedArgs: []string{"exec", "--ephemeral", "hello"},
+		LocalToken:    "test-token-placeholder",
+		DryRun:        true,
+	})
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if prepared.Cleanup != nil {
+		t.Fatal("model-less Codex launch unexpectedly registered catalog cleanup")
+	}
+	if len(prepared.Unresolved) != 0 {
+		t.Fatalf("Unresolved = %#v, want no model compatibility checks", prepared.Unresolved)
+	}
+	if got := prepared.EnvSet[codexLocalTokenEnv]; got != "test-token-placeholder" {
+		t.Fatalf("EnvSet[%q] = %q", codexLocalTokenEnv, got)
+	}
+
+	providerID := codexProviderID("test-token-placeholder")
+	for _, want := range []string{
+		`model_provider="` + providerID + `"`,
+		`model_providers.` + providerID + `.name="Vekil"`,
+		`model_providers.` + providerID + `.base_url="http://127.0.0.1:43210/v1"`,
+		`model_providers.` + providerID + `.wire_api="responses"`,
+		`model_providers.` + providerID + `.env_key="` + codexLocalTokenEnv + `"`,
+		`model_providers.` + providerID + `.requires_openai_auth=false`,
+		`model_providers.` + providerID + `.supports_websockets=false`,
+		`shell_environment_policy.set.` + codexLocalTokenEnv + `=""`,
+	} {
+		if !containsString(prepared.Args, want) {
+			t.Fatalf("Codex args missing %q: %#v", want, prepared.Args)
+		}
+	}
+	for _, arg := range prepared.Args {
+		if arg == "-m" || strings.HasPrefix(arg, "model_catalog_json=") {
+			t.Fatalf("model-less Codex launch unexpectedly pinned a model: %#v", prepared.Args)
+		}
+	}
+	if !reflect.DeepEqual(prepared.Args[len(prepared.Args)-3:], []string{"exec", "--ephemeral", "hello"}) {
+		t.Fatalf("forwarded args changed: %#v", prepared.Args)
+	}
+}
+
 func TestCodexCatalogClearsUnsupportedDonorCapabilities(t *testing.T) {
 	body, err := buildCodexModelCatalog(resolvedExecutable{}, nil, ModelInfo{ID: "text-only"}, true)
 	if err != nil {

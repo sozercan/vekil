@@ -10,7 +10,7 @@
 
 ---
 
-Vekil is a Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs behind one local endpoint. Run it in zero-config mode against GitHub Copilot, or route selected models to providers like Azure OpenAI, OpenAI Codex, and generic OpenAI-compatible or Anthropic-compatible upstreams. The client-facing API surface stays the same while model ownership is configured behind the proxy. Vekil can also launch Claude Code, Codex CLI, or GitHub Copilot CLI through short-lived, model-scoped proxy sessions.
+Vekil is a Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs behind one local endpoint. Run it in zero-config mode against GitHub Copilot, or route selected models to providers like Azure OpenAI, OpenAI Codex, and generic OpenAI-compatible or Anthropic-compatible upstreams. The client-facing API surface stays the same while model ownership is configured behind the proxy. Vekil can also launch Claude Code, Codex CLI, or GitHub Copilot CLI through short-lived proxy sessions, optionally pinned to one model.
 
 ## Why Vekil?
 
@@ -54,15 +54,19 @@ Schema-v2 policy routing defaults globally to `off`. V1 policy profiles support 
 
 ### Launch a coding agent
 
-The native binary can start a loopback-only proxy, validate one selected model,
-configure the agent for that session, and clean everything up when the agent
-exits:
+The native binary can start a loopback-only proxy, configure the agent for that
+session, and clean everything up when the agent exits. Claude Code and Codex
+CLI can use their normal configured or built-in default; Copilot CLI requires an
+explicit model:
 
 ```bash
-vekil launch claude --model claude-sonnet-4.5
-vekil launch codex --model gpt-5.4-mini
+vekil launch claude
+vekil launch codex
 vekil launch copilot --model gpt-5.4-mini
 ```
+
+Pass `--model` to Claude Code or Codex CLI when you want Vekil to validate,
+scope, and pin the session to one public model.
 
 Use `--providers-config` with the same JSON/YAML routing file accepted by the
 server. Arguments after `--` are forwarded to the agent:
@@ -75,11 +79,12 @@ vekil launch codex \
 ```
 
 The launcher keeps upstream credentials in the proxy, gives the child a random
-session token, restricts it to the selected public model, and supervises the
-child process tree. Use `--dry-run` to inspect the plan without starting the
-proxy or agent. See [Agent Launchers](docs/agent-launchers.md) for supported CLI
-versions, endpoint requirements, forwarded arguments, logs, and isolation
-details.
+session token, and supervises the child process tree. Without `--model`, Claude
+Code and Codex CLI select their CLI default through the normal global public
+model namespace; with `--model`, Vekil restricts the session to that model. Use
+`--dry-run` to inspect the plan without starting the proxy or agent. See [Agent
+Launchers](docs/agent-launchers.md) for supported CLI versions, endpoint
+requirements, forwarded arguments, logs, and isolation details.
 
 **First-run auth** depends on your providers:
 

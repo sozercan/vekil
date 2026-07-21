@@ -1061,19 +1061,78 @@ func TestParseLaunchAgentOptionsPolicyRoutingMode(t *testing.T) {
 	}
 }
 
-func TestParseLaunchClaudeOptionsValidatesRequiredFields(t *testing.T) {
+type fakeLaunchCopilotModelChecker struct {
+	result bool
+	calls  []string
+}
+
+func (c *fakeLaunchCopilotModelChecker) ModelUsesCopilot(model string) bool {
+	c.calls = append(c.calls, model)
+	return c.result
+}
+
+func TestLaunchUsesCopilotDelegatesUnscopedStartupToProviderConfig(t *testing.T) {
+	checker := &fakeLaunchCopilotModelChecker{result: false}
+	if !launchUsesCopilot(proxy.ProvidersConfig{}, "", checker) {
+		t.Fatal("zero-config delegated launch did not require Copilot authentication")
+	}
+	if len(checker.calls) != 0 {
+		t.Fatalf("empty model unexpectedly used model-specific lookup: %#v", checker.calls)
+	}
+
+	checker = &fakeLaunchCopilotModelChecker{result: true}
+	nonCopilotConfig := proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{{
+		ID:      "local",
+		Type:    "openai-compatible",
+		BaseURL: "http://127.0.0.1:9/v1",
+	}}}
+	if launchUsesCopilot(nonCopilotConfig, " ", checker) {
+		t.Fatal("delegated non-Copilot launch unexpectedly required Copilot authentication")
+	}
+	if len(checker.calls) != 0 {
+		t.Fatalf("empty model unexpectedly used model-specific lookup: %#v", checker.calls)
+	}
+
+	checker = &fakeLaunchCopilotModelChecker{result: true}
+	if !launchUsesCopilot(nonCopilotConfig, "selected-model", checker) {
+		t.Fatal("pinned launch ignored model-specific Copilot ownership")
+	}
+	if !slices.Equal(checker.calls, []string{"selected-model"}) {
+		t.Fatalf("model-specific lookup calls = %#v", checker.calls)
+	}
+}
+
+func TestParseLaunchAgentOptionsAllowsSupportedCLIDefaults(t *testing.T) {
+	for _, name := range []string{"claude", "codex"} {
+		t.Run(name, func(t *testing.T) {
+			target, _ := launchTarget(name)
+			opts, err := parseLaunchAgentOptions(target, nil, io.Discard)
+			if err != nil {
+				t.Fatalf("parseLaunchAgentOptions() error = %v", err)
+			}
+			if opts.model != "" {
+				t.Fatalf("model = %q, want CLI default", opts.model)
+			}
+		})
+	}
+}
+
+func TestParseLaunchAgentOptionsValidatesFields(t *testing.T) {
 	tests := []struct {
-		name string
-		args []string
-		want string
+		name   string
+		target string
+		args   []string
+		want   string
 	}{
-		{name: "missing model", args: nil, want: "--model is required"},
-		{name: "bad port", args: []string{"--model", "claude-public", "--port", "70000"}, want: "--port must be"},
+		{name: "Copilot missing model", target: "copilot", args: nil, want: "--model is required"},
+		{name: "explicit empty optional model", target: "codex", args: []string{"--model="}, want: "--model must not be empty"},
+		{name: "bad port", target: "claude", args: []string{"--port", "70000"}, want: "--port must be"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			target, _ := launchTarget(tc.target)
 			var stderr bytes.Buffer
-			_, err := parseLaunchClaudeOptions(tc.args, &stderr)
+			_, err := parseLaunchAgentOptions(target, tc.args, &stderr)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error = %v, want substring %q", err, tc.want)
 			}
@@ -1091,6 +1150,15 @@ func TestRunLaunchCommandHelpAndUnsupportedTarget(t *testing.T) {
 			t.Fatalf("help output missing %s = %q", target, help.String())
 		}
 	}
+	for _, want := range []string{
+		"launch claude [--model MODEL]",
+		"launch codex [--model MODEL]",
+		"launch copilot --model MODEL",
+	} {
+		if !strings.Contains(help.String(), want) {
+			t.Fatalf("help output missing %q = %q", want, help.String())
+		}
+	}
 
 	var unsupported bytes.Buffer
 	if code := runLaunchCommand([]string{"unknown"}, &unsupported); code != 2 {
@@ -1098,6 +1166,32 @@ func TestRunLaunchCommandHelpAndUnsupportedTarget(t *testing.T) {
 	}
 	if !strings.Contains(unsupported.String(), "unsupported launch target") {
 		t.Fatalf("unsupported output = %q", unsupported.String())
+	}
+}
+
+func TestRunLaunchCommandDryRunDelegatesModelSelection(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{"claude", "codex"} {
+		t.Run(target, func(t *testing.T) {
+			var stderr bytes.Buffer
+			code := runLaunchCommand([]string{
+				target,
+				"--binary", binary,
+				"--dry-run",
+			}, &stderr)
+			if code != 0 {
+				t.Fatalf("runLaunchCommand() code = %d; stderr=%s", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "model:  CLI default") {
+				t.Fatalf("dry-run did not delegate model selection: %s", stderr.String())
+			}
+			if strings.Contains(stderr.String(), "unresolved: model endpoint compatibility") {
+				t.Fatalf("dry-run tried to validate an unselected model: %s", stderr.String())
+			}
+		})
 	}
 }
 
@@ -1398,7 +1492,7 @@ func TestRunLaunchClaudeEndToEndWithStaticProvider(t *testing.T) {
 	}
 }
 
-func TestRunLaunchCodexEndToEndWithStaticProvider(t *testing.T) {
+func TestRunLaunchCodexEndToEndUsesCLIDefaultModel(t *testing.T) {
 	tmp := t.TempDir()
 	providersPath := filepath.Join(tmp, "providers.yaml")
 	providersBody := `providers:
@@ -1431,7 +1525,6 @@ func TestRunLaunchCodexEndToEndWithStaticProvider(t *testing.T) {
 	var stderr bytes.Buffer
 	code := runLaunchCodex([]string{
 		"--providers-config", providersPath,
-		"--model", "codex-launch-test",
 		"--binary", binary,
 		"--proxy-log", filepath.Join(tmp, "proxy.jsonl"),
 		"--",
@@ -1439,6 +1532,9 @@ func TestRunLaunchCodexEndToEndWithStaticProvider(t *testing.T) {
 	}, &stderr)
 	if code != 9 {
 		t.Fatalf("runLaunchCodex() code = %d, want 9; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "vekil ready: codex -> CLI default") {
+		t.Fatalf("ready banner did not report delegated model selection: %s", stderr.String())
 	}
 	capture := readMainLaunchCapture(t, capturePath)
 	if len(capture["codex_token"]) < 32 {

@@ -138,6 +138,104 @@ func TestClaudeAdapterPrepare(t *testing.T) {
 	}
 }
 
+func TestClaudeAdapterPrepareWithoutModelUsesClaudeDefault(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	prepared, err := (ClaudeAdapter{}).Prepare(PrepareInput{
+		BaseURL: "http://127.0.0.1:43210/",
+		Model: ModelInfo{
+			ID:                 " \t ",
+			OwnedBy:            PolicyModelOwner,
+			SupportedEndpoints: []string{"/embeddings"},
+		},
+		Binary:        binary,
+		ForwardedArgs: []string{"--print", "hello"},
+		LocalToken:    "test-token-placeholder",
+		DryRun:        true,
+	})
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if prepared.Cleanup == nil {
+		t.Fatal("managed settings did not register cleanup")
+	}
+	t.Cleanup(func() { _ = prepared.Cleanup() })
+	if len(prepared.Unresolved) != 0 {
+		t.Fatalf("Unresolved = %#v, want no model compatibility checks", prepared.Unresolved)
+	}
+	if got := prepared.Args[len(prepared.Args)-2:]; !reflect.DeepEqual(got, []string{"--print", "hello"}) {
+		t.Fatalf("forwarded args changed: %#v", prepared.Args)
+	}
+
+	for key, want := range map[string]string{
+		"ANTHROPIC_BASE_URL":                   "http://127.0.0.1:43210",
+		"ANTHROPIC_AUTH_TOKEN":                 "test-token-placeholder",
+		"ANTHROPIC_API_KEY":                    "",
+		"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "vekil",
+		"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB":     "1",
+	} {
+		if got := prepared.EnvSet[key]; got != want {
+			t.Errorf("EnvSet[%q] = %q, want %q", key, got, want)
+		}
+	}
+
+	modelKeys := []string{
+		"ANTHROPIC_MODEL",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION",
+		"CLAUDE_CODE_SUBAGENT_MODEL",
+	}
+	for _, key := range modelKeys {
+		if _, ok := prepared.EnvSet[key]; ok {
+			t.Errorf("EnvSet unexpectedly pins %q", key)
+		}
+		if containsString(prepared.EnvUnset, key) {
+			t.Errorf("EnvUnset unexpectedly removes configured default %q", key)
+		}
+	}
+
+	settingsBody, err := os.ReadFile(prepared.Args[1])
+	if err != nil {
+		t.Fatalf("read managed settings file: %v", err)
+	}
+	var managedSettings struct {
+		Env                  map[string]string `json:"env"`
+		DisableRemoteControl bool              `json:"disableRemoteControl"`
+	}
+	if err := json.Unmarshal(settingsBody, &managedSettings); err != nil {
+		t.Fatalf("decode managed settings: %v", err)
+	}
+	if !managedSettings.DisableRemoteControl {
+		t.Fatal("managed settings did not disable remote control")
+	}
+	for _, key := range modelKeys {
+		if _, ok := managedSettings.Env[key]; ok {
+			t.Errorf("managed settings unexpectedly pin %q", key)
+		}
+	}
+	for key, want := range map[string]string{
+		"ANTHROPIC_BASE_URL":                   "http://127.0.0.1:43210",
+		"ANTHROPIC_AUTH_TOKEN":                 "test-token-placeholder",
+		"ANTHROPIC_API_KEY":                    "",
+		"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "vekil",
+		"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB":     "1",
+		"CLAUDE_CODE_DISABLE_AGENT_VIEW":       "1",
+		"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+		"CLAUDE_CODE_DISABLE_CRON":             "1",
+	} {
+		if got := managedSettings.Env[key]; got != want {
+			t.Errorf("managed settings env[%q] = %q, want %q", key, got, want)
+		}
+	}
+}
+
 func TestClaudeAdapterSanitizesVersionProbeEnvironment(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {

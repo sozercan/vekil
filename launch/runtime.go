@@ -72,8 +72,9 @@ type startupOperationResult[T any] struct {
 	err   error
 }
 
-// Run starts proxy, validates the requested model, prepares the agent process,
-// supervises it, prints a session summary, and tears everything down.
+// Run starts proxy, validates a requested model when one is provided, prepares
+// the agent process, supervises it, prints a session summary, and tears
+// everything down. An empty model delegates selection to the agent CLI.
 func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (result Result, returnErr error) {
 	if parent == nil {
 		parent = context.Background()
@@ -83,9 +84,6 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 	}
 	opts = normalizeOptions(opts)
 	modelID := strings.TrimSpace(opts.Model)
-	if modelID == "" {
-		return result, fmt.Errorf("launch %s requires --model", adapter.Name())
-	}
 	localToken := strings.TrimSpace(opts.LocalToken)
 	if opts.DryRun && localToken == "" {
 		localToken = "placeholder"
@@ -113,8 +111,14 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 		if baseURL == "" {
 			baseURL = dryRunBaseURL
 		}
-		model := ModelInfo{ID: modelID, Name: modelID}
+		var model ModelInfo
+		if modelID != "" {
+			model = ModelInfo{ID: modelID, Name: modelID}
+		}
 		if opts.DryRunModel != nil {
+			if modelID == "" {
+				return result, fmt.Errorf("dry-run model metadata requires an explicit model")
+			}
 			model = *opts.DryRunModel
 			resolvedID := strings.TrimSpace(model.ID)
 			if resolvedID == "" {
@@ -194,19 +198,22 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 		}
 		return result, err
 	}
-	models, err := runStartupOperation(startupCtx, proxy.Done(), func(ctx context.Context) ([]ModelInfo, error) {
-		return fetchModels(ctx, baseURL, localToken)
-	})
-	if err != nil {
-		if runCtx.Err() != nil {
-			result.ExitCode = cancellationExitCode(runCtx)
-			return result, nil
+	var model ModelInfo
+	if modelID != "" {
+		models, fetchErr := runStartupOperation(startupCtx, proxy.Done(), func(ctx context.Context) ([]ModelInfo, error) {
+			return fetchModels(ctx, baseURL, localToken)
+		})
+		if fetchErr != nil {
+			if runCtx.Err() != nil {
+				result.ExitCode = cancellationExitCode(runCtx)
+				return result, nil
+			}
+			return result, fetchErr
 		}
-		return result, err
-	}
-	model, err := selectModel(models, modelID)
-	if err != nil {
-		return result, err
+		model, err = selectModel(models, modelID)
+		if err != nil {
+			return result, err
+		}
 	}
 	result.Model = model
 	startupCancel()
@@ -560,7 +567,7 @@ func cleanupPreparedProcess(prepared PreparedProcess, stderr io.Writer) {
 }
 
 func printReadyBanner(w io.Writer, agent string, model ModelInfo, baseURL, logPath string) {
-	_, _ = fmt.Fprintf(w, "\nvekil ready: %s -> %s\n", agent, model.ID)
+	_, _ = fmt.Fprintf(w, "\nvekil ready: %s -> %s\n", agent, launchModelLabel(model.ID))
 	_, _ = fmt.Fprintf(w, "  proxy:     %s\n", baseURL)
 	if strings.TrimSpace(logPath) != "" {
 		_, _ = fmt.Fprintf(w, "  proxy log: %s\n", logPath)
@@ -578,7 +585,7 @@ func printDryRun(
 ) {
 	_, _ = fmt.Fprintln(w, "vekil launch dry-run")
 	_, _ = fmt.Fprintf(w, "  agent:  %s\n", agent)
-	_, _ = fmt.Fprintf(w, "  model:  %s\n", model)
+	_, _ = fmt.Fprintf(w, "  model:  %s\n", launchModelLabel(model))
 	_, _ = fmt.Fprintf(w, "  proxy:  %s\n", baseURL)
 	_, _ = fmt.Fprintf(w, "  binary: %s\n", prepared.Path)
 	if len(prepared.Args) > 0 {
@@ -638,6 +645,13 @@ func printDryRun(
 	for _, key := range unset {
 		_, _ = fmt.Fprintf(w, "  unset:  %s\n", key)
 	}
+}
+
+func launchModelLabel(model string) string {
+	if strings.TrimSpace(model) == "" {
+		return "CLI default"
+	}
+	return model
 }
 
 func fetchStats(ctx context.Context, baseURL, localToken string) (statsSnapshot, error) {
