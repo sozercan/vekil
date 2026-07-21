@@ -28,6 +28,7 @@ type publicModelContract struct {
 type providerRequestPolicy struct {
 	parallelToolCalls      *bool
 	dropSamplingParams     bool
+	dropStopSequences      bool
 	useMaxCompletionTokens bool
 }
 
@@ -426,6 +427,7 @@ func compileLegacyModelRoute(model providerModel, provider *providerRuntime) (*m
 			policy: providerRequestPolicy{
 				parallelToolCalls:      cloneBoolPtr(model.parallelToolCalls),
 				dropSamplingParams:     model.dropSamplingParams,
+				dropStopSequences:      model.dropStopSequences,
 				useMaxCompletionTokens: model.useMaxCompletionTokens,
 			},
 		},
@@ -436,6 +438,7 @@ func compileLegacyModelRoute(model providerModel, provider *providerRuntime) (*m
 			wirePolicy: providerRequestPolicy{
 				parallelToolCalls:      cloneBoolPtr(model.parallelToolCalls),
 				dropSamplingParams:     model.dropSamplingParams,
+				dropStopSequences:      model.dropStopSequences,
 				useMaxCompletionTokens: model.useMaxCompletionTokens,
 			},
 			legacyOwner: model,
@@ -538,6 +541,7 @@ func providerModelFromRouteTarget(route *modelRoute, target targetBinding) provi
 		supportedEndpoints:     append([]string(nil), route.public.endpoints...),
 		parallelToolCalls:      cloneBoolPtr(parallelToolCalls),
 		dropSamplingParams:     route.public.policy.dropSamplingParams,
+		dropStopSequences:      route.public.policy.dropStopSequences,
 		useMaxCompletionTokens: target.wirePolicy.useMaxCompletionTokens,
 		raw:                    append(json.RawMessage(nil), route.public.raw...),
 	}

@@ -105,6 +105,48 @@ func TestPolicyProfileAndClassifierGenerationsChangeWithRelevantInputs(t *testin
 	}
 }
 
+func TestPolicyProfileGenerationChangesWithDropStopSequencesContract(t *testing.T) {
+	cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeEnforce)
+	validated, err := validateAndNormalizeProvidersConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := compilePolicyPublicModelEntries(validated.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("policy entries = %d, want 1", len(entries))
+	}
+	firstContract := entries[0].contract
+	firstGeneration := policyProfileGeneration(validated.config.PolicyProfiles[0], firstContract)
+
+	dropStopSequences := true
+	cfg.ModelRoutes[0].DropStopSequences = &dropStopSequences
+	cfg.ModelRoutes[1].DropStopSequences = &dropStopSequences
+	validated, err = validateAndNormalizeProvidersConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err = compilePolicyPublicModelEntries(validated.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("policy entries = %d, want 1", len(entries))
+	}
+	secondContract := entries[0].contract
+	if string(secondContract.raw) != string(firstContract.raw) {
+		t.Fatalf("catalog contract changed with request policy:\nfirst:  %s\nsecond: %s", firstContract.raw, secondContract.raw)
+	}
+	if !secondContract.policy.dropStopSequences {
+		t.Fatal("derived request policy did not enable drop_stop_sequences")
+	}
+	if secondGeneration := policyProfileGeneration(validated.config.PolicyProfiles[0], secondContract); secondGeneration == firstGeneration {
+		t.Fatal("profile generation did not change with drop_stop_sequences request policy")
+	}
+}
+
 func policyGenerationHashesForTest(t *testing.T, cfg ProvidersConfig) [3]string {
 	t.Helper()
 	validated, err := validateAndNormalizeProvidersConfig(cfg)

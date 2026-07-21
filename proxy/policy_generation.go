@@ -26,15 +26,29 @@ func policyConfigGeneration(cfg ProvidersConfig) string {
 	return policyHashValue(cfg)
 }
 
+type policyProfileGenerationRequestPolicy struct {
+	ParallelToolCalls      *bool `json:"parallel_tool_calls"`
+	DropSamplingParams     bool  `json:"drop_sampling_params"`
+	DropStopSequences      bool  `json:"drop_stop_sequences"`
+	UseMaxCompletionTokens bool  `json:"use_max_completion_tokens"`
+}
+
 func policyProfileGeneration(profile PolicyProfileConfig, contract publicModelContract) string {
 	return policyHashValue(struct {
-		Profile  PolicyProfileConfig `json:"profile"`
-		Contract json.RawMessage     `json:"contract"`
-		Routes   []string            `json:"routes"`
+		Profile       PolicyProfileConfig                  `json:"profile"`
+		Contract      json.RawMessage                      `json:"contract"`
+		RequestPolicy policyProfileGenerationRequestPolicy `json:"request_policy"`
+		Routes        []string                             `json:"routes"`
 	}{
 		Profile:  clonePolicyProfileConfig(profile),
 		Contract: append(json.RawMessage(nil), contract.raw...),
-		Routes:   []string{profile.LightweightRoute, profile.PowerfulRoute},
+		RequestPolicy: policyProfileGenerationRequestPolicy{
+			ParallelToolCalls:      cloneBoolPtr(contract.policy.parallelToolCalls),
+			DropSamplingParams:     contract.policy.dropSamplingParams,
+			DropStopSequences:      contract.policy.dropStopSequences,
+			UseMaxCompletionTokens: contract.policy.useMaxCompletionTokens,
+		},
+		Routes: []string{profile.LightweightRoute, profile.PowerfulRoute},
 	})
 }
 

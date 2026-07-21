@@ -1171,6 +1171,7 @@ func writeCompactInflightKeyRequestPolicy(w io.Writer, policy providerRequestPol
 	}
 	writeCompactInflightKeyPart(w, []byte(parallelToolCalls))
 	writeCompactInflightKeyPart(w, []byte(strconv.FormatBool(policy.dropSamplingParams)))
+	writeCompactInflightKeyPart(w, []byte(strconv.FormatBool(policy.dropStopSequences)))
 	writeCompactInflightKeyPart(w, []byte(strconv.FormatBool(policy.useMaxCompletionTokens)))
 }
 

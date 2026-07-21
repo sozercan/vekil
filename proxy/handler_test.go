@@ -7122,9 +7122,10 @@ func TestHandleAnthropicMessages_ResponsesOnlyInterleavedThinkingPreservesPerRes
 	}
 }
 
-func TestHandleAnthropicMessages_AzureUsesConfiguredMaxCompletionTokens(t *testing.T) {
+func TestHandleAnthropicMessages_AzureAppliesConfiguredChatWirePolicy(t *testing.T) {
 	t.Setenv("TEST_AZURE_API_KEY", "test-value")
 	useMaxCompletionTokens := true
+	dropStopSequences := true
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Path; got != "/openai/v1/chat/completions" {
 			t.Fatalf("expected Azure path /openai/v1/chat/completions, got %s", got)
@@ -7142,6 +7143,9 @@ func TestHandleAnthropicMessages_AzureUsesConfiguredMaxCompletionTokens(t *testi
 		}
 		if upstreamReq.MaxTokens != nil {
 			t.Fatalf("max_tokens = %v, want nil", upstreamReq.MaxTokens)
+		}
+		if len(upstreamReq.Stop) != 0 {
+			t.Fatalf("stop = %s, want omitted", upstreamReq.Stop)
 		}
 
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -7164,6 +7168,7 @@ func TestHandleAnthropicMessages_AzureUsesConfiguredMaxCompletionTokens(t *testi
 					PublicID:               "gpt-5.6-sol",
 					Deployment:             "gpt-5.6-sol",
 					Endpoints:              []string{"/chat/completions"},
+					DropStopSequences:      &dropStopSequences,
 					UseMaxCompletionTokens: &useMaxCompletionTokens,
 				}},
 			}},
@@ -7176,6 +7181,7 @@ func TestHandleAnthropicMessages_AzureUsesConfiguredMaxCompletionTokens(t *testi
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
 		"model": "gpt-5.6-sol",
 		"max_tokens": 64,
+		"stop_sequences": ["</decision>"],
 		"messages": [{"role": "user", "content": "Hello"}]
 	}`))
 	req.Header.Set("Content-Type", "application/json")
