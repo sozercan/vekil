@@ -784,6 +784,7 @@ func TestCompileExplicitModelRouteUsesValidatedContractAndBudgets(t *testing.T) 
 	cfg.ModelRoutes[0].Name = "Public GPT"
 	cfg.ModelRoutes[0].Endpoints = []string{providerEndpointChatCompletions}
 	cfg.ModelRoutes[0].ReasoningEffort = []string{"low", "high"}
+	cfg.ModelRoutes[0].DropStopSequences = boolPointer(true)
 	cfg.ModelRoutes[0].Targets = append(cfg.ModelRoutes[0].Targets, ModelRouteTargetConfig{
 		ID: "east", Provider: "azure-east", UpstreamModel: "east-deployment", UseMaxCompletionTokens: boolPointer(true),
 	})
@@ -806,8 +807,14 @@ func TestCompileExplicitModelRouteUsesValidatedContractAndBudgets(t *testing.T) 
 	if route.policy.mode != routeModePriorityFailover || route.policy.maxTargetAttempts != 2 || route.policy.maxUpstreamSends != 3 {
 		t.Fatalf("route policy = %+v", route.policy)
 	}
+	if !route.public.policy.dropStopSequences {
+		t.Fatal("route public policy did not retain drop_stop_sequences")
+	}
 	if len(route.targets) != 2 || route.targets[1].provider.id != "azure-east" || !route.targets[1].wirePolicy.useMaxCompletionTokens {
 		t.Fatalf("targets = %+v", route.targets)
+	}
+	if owner := providerModelFromRouteTarget(route, route.targets[0]); !owner.dropStopSequences {
+		t.Fatal("route target owner did not inherit drop_stop_sequences")
 	}
 	var catalog struct {
 		ID      string `json:"id"`
@@ -982,5 +989,32 @@ func TestSchemaVersion2RejectsGeminiAliasCollision(t *testing.T) {
 	err := ValidateProvidersConfig(cfg)
 	if err == nil || !strings.Contains(err.Error(), "gemini-3-pro-preview") || !strings.Contains(err.Error(), "providers[0].models[0].public_id") {
 		t.Fatalf("error = %v, want Gemini alias collision", err)
+	}
+}
+
+func TestLoadProvidersConfigFileAllowsDropStopSequences(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	body := `schema_version: 2
+providers:
+  - id: azure
+    type: azure-openai
+    base_url: https://example.openai.azure.com/openai/v1
+    api_key: test-key
+model_routes:
+  - id: sol-route
+    public_id: gpt-5.6-sol
+    endpoints: [/chat/completions]
+    drop_stop_sequences: true
+    targets:
+      - id: west
+        provider: azure
+        upstream_model: gpt-5.6-sol
+        use_max_completion_tokens: true
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if _, err := LoadProvidersConfigFile(path); err != nil {
+		t.Fatalf("LoadProvidersConfigFile() error = %v", err)
 	}
 }

@@ -122,6 +122,7 @@ type ProviderModelConfig struct {
 	Vision                 *bool    `json:"vision,omitempty" yaml:"vision,omitempty"`
 	ParallelToolCalls      *bool    `json:"parallel_tool_calls,omitempty" yaml:"parallel_tool_calls,omitempty"`
 	DropSamplingParams     *bool    `json:"drop_sampling_params,omitempty" yaml:"drop_sampling_params,omitempty"`
+	DropStopSequences      *bool    `json:"drop_stop_sequences,omitempty" yaml:"drop_stop_sequences,omitempty"`
 	UseMaxCompletionTokens *bool    `json:"use_max_completion_tokens,omitempty" yaml:"use_max_completion_tokens,omitempty"`
 	ContextWindow          *int64   `json:"context_window,omitempty" yaml:"context_window,omitempty"`
 }
@@ -167,6 +168,7 @@ type providerModel struct {
 	supportedEndpoints     []string
 	parallelToolCalls      *bool
 	dropSamplingParams     bool
+	dropStopSequences      bool
 	useMaxCompletionTokens bool
 	disabled               bool
 	raw                    json.RawMessage
@@ -309,6 +311,7 @@ func ResolveStaticProviderModel(cfg ProvidersConfig, modelID string) (ProviderMo
 				Vision:              cloneBoolPtr(route.Vision),
 				ParallelToolCalls:   cloneBoolPtr(route.ParallelToolCalls),
 				DropSamplingParams:  cloneBoolPtr(route.DropSamplingParams),
+				DropStopSequences:   cloneBoolPtr(route.DropStopSequences),
 				ContextWindow:       route.ContextWindow,
 			}
 			if resolved.Name == "" {
@@ -1452,6 +1455,7 @@ func buildStaticProviderModel(providerID string, cfg ProviderModelConfig, defaul
 		supportedEndpoints:     endpoints,
 		parallelToolCalls:      cloneBoolPtr(cfg.ParallelToolCalls),
 		dropSamplingParams:     cfg.DropSamplingParams != nil && *cfg.DropSamplingParams,
+		dropStopSequences:      cfg.DropStopSequences != nil && *cfg.DropStopSequences,
 		useMaxCompletionTokens: cfg.UseMaxCompletionTokens != nil && *cfg.UseMaxCompletionTokens,
 		raw:                    raw,
 	}, nil

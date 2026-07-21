@@ -207,6 +207,7 @@ func derivePolicyPublicModelContract(profile PolicyProfileConfig, lightweight, p
 			// Validation requires equal public request semantics today. OR keeps
 			// the derived contract conservative if that invariant is ever relaxed.
 			dropSamplingParams: boolConfigValue(lightweight.DropSamplingParams) || boolConfigValue(powerful.DropSamplingParams),
+			dropStopSequences:  boolConfigValue(lightweight.DropStopSequences) || boolConfigValue(powerful.DropStopSequences),
 		},
 	}, nil
 }

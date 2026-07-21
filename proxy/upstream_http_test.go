@@ -412,6 +412,26 @@ func TestApplyProviderModelRequestPolicy_UsesMaxCompletionTokensOnlyForChatCompl
 	}
 }
 
+func TestApplyProviderModelRequestPolicy_DropsConfiguredStopSequences(t *testing.T) {
+	body := applyProviderModelRequestPolicy(
+		[]byte(`{"model":"gpt-5.6-sol","max_tokens":64,"stop":["</decision>"],"messages":[{"role":"user","content":"hello"}]}`),
+		providerEndpointChatCompletions,
+		providerModel{dropStopSequences: true},
+	)
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("json.Unmarshal(body) error = %v", err)
+	}
+	if _, ok := payload["stop"]; ok {
+		t.Fatalf("payload retained stop: %s", body)
+	}
+
+	responsesBody := []byte(`{"model":"gpt-5.6-sol","stop":["</decision>"],"input":"hello"}`)
+	if got := applyProviderModelRequestPolicy(responsesBody, providerEndpointResponses, providerModel{dropStopSequences: true}); string(got) != string(responsesBody) {
+		t.Fatalf("Responses payload changed = %s, want original %s", got, responsesBody)
+	}
+}
+
 func TestApplyProviderModelRequestPolicy_TreatsNullMaxCompletionTokensAsAbsent(t *testing.T) {
 	for _, legacyValue := range []string{"0", "64"} {
 		t.Run(legacyValue, func(t *testing.T) {

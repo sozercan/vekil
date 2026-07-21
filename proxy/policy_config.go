@@ -275,6 +275,9 @@ func validatePolicyProfileConfigReferences(
 	if boolConfigValue(lightweight.DropSamplingParams) != boolConfigValue(powerful.DropSamplingParams) {
 		return configPathError(path+".powerful_route", "route %q differs from lightweight route %q in drop_sampling_params public Chat semantics", profile.PowerfulRoute, profile.LightweightRoute)
 	}
+	if boolConfigValue(lightweight.DropStopSequences) != boolConfigValue(powerful.DropStopSequences) {
+		return configPathError(path+".powerful_route", "route %q differs from lightweight route %q in drop_stop_sequences public Chat semantics", profile.PowerfulRoute, profile.LightweightRoute)
+	}
 
 	classifierProvider, err := validatePolicyClassifierRoute(classifier, path+".classifier.route", providers)
 	if err != nil {

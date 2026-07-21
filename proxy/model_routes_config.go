@@ -38,6 +38,7 @@ type ModelRouteConfig struct {
 	ModelPickerEnabled  *bool                    `json:"model_picker_enabled,omitempty" yaml:"model_picker_enabled,omitempty"`
 	ModelPickerCategory string                   `json:"model_picker_category,omitempty" yaml:"model_picker_category,omitempty"`
 	DropSamplingParams  *bool                    `json:"drop_sampling_params,omitempty" yaml:"drop_sampling_params,omitempty"`
+	DropStopSequences   *bool                    `json:"drop_stop_sequences,omitempty" yaml:"drop_stop_sequences,omitempty"`
 	Targets             []ModelRouteTargetConfig `json:"targets" yaml:"targets"`
 	Routing             ModelRouteRoutingConfig  `json:"routing,omitempty" yaml:"routing,omitempty"`
 
@@ -485,6 +486,7 @@ func cloneProvidersConfigForValidation(cfg ProvidersConfig) ProvidersConfig {
 					model.Vision = cloneBoolPtr(model.Vision)
 					model.ParallelToolCalls = cloneBoolPtr(model.ParallelToolCalls)
 					model.DropSamplingParams = cloneBoolPtr(model.DropSamplingParams)
+					model.DropStopSequences = cloneBoolPtr(model.DropStopSequences)
 					model.UseMaxCompletionTokens = cloneBoolPtr(model.UseMaxCompletionTokens)
 					if model.ContextWindow != nil {
 						value := *model.ContextWindow
@@ -520,6 +522,7 @@ func cloneModelRouteConfig(route ModelRouteConfig) ModelRouteConfig {
 	cloned.Vision = cloneBoolPtr(route.Vision)
 	cloned.ModelPickerEnabled = cloneBoolPtr(route.ModelPickerEnabled)
 	cloned.DropSamplingParams = cloneBoolPtr(route.DropSamplingParams)
+	cloned.DropStopSequences = cloneBoolPtr(route.DropStopSequences)
 	if route.ContextWindow != nil {
 		value := *route.ContextWindow
 		cloned.ContextWindow = &value
@@ -1214,6 +1217,7 @@ func compileExplicitModelRoutes(cfg ProvidersConfig, providers map[string]*provi
 				policy: providerRequestPolicy{
 					parallelToolCalls:  cloneBoolPtr(routeCfg.ParallelToolCalls),
 					dropSamplingParams: routeCfg.DropSamplingParams != nil && *routeCfg.DropSamplingParams,
+					dropStopSequences:  routeCfg.DropStopSequences != nil && *routeCfg.DropStopSequences,
 				},
 			},
 			targets: targets,
@@ -1242,13 +1246,13 @@ var providerConfigFields = configFieldSet(
 
 var providerModelConfigFields = configFieldSet(
 	"public_id", "deployment", "name", "endpoints", "model_picker_enabled", "model_picker_category",
-	"reasoning_effort", "vision", "parallel_tool_calls", "drop_sampling_params",
+	"reasoning_effort", "vision", "parallel_tool_calls", "drop_sampling_params", "drop_stop_sequences",
 	"use_max_completion_tokens", "context_window",
 )
 
 var modelRouteConfigFields = configFieldSet(
 	"id", "exposure", "internal_purpose", "public_id", "name", "endpoints", "reasoning_effort", "parallel_tool_calls", "vision",
-	"context_window", "model_picker_enabled", "model_picker_category", "drop_sampling_params",
+	"context_window", "model_picker_enabled", "model_picker_category", "drop_sampling_params", "drop_stop_sequences",
 	"targets", "routing",
 )
 

@@ -325,6 +325,17 @@ func TestSchemaV2AllowsInsightPublicIDEqualToOperationalID(t *testing.T) {
 	}
 }
 
+func TestPolicyProfileRequiresMatchingDropStopSequences(t *testing.T) {
+	body := strings.Replace(validSchemaV2PolicyYAML(), "    context_window: 64000\n", "    context_window: 64000\n    drop_stop_sequences: true\n", 1)
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadProvidersConfigFile(path); err == nil || !strings.Contains(err.Error(), "drop_stop_sequences public Chat semantics") {
+		t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+	}
+}
+
 func TestProgrammaticPolicyClassifierZeroSettersPreserveExplicitValues(t *testing.T) {
 	cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeObserve)
 	cfg.PolicyProfiles[0].Classifier.SetRecentTurns(0)

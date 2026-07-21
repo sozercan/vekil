@@ -219,7 +219,8 @@ func prepareResolvedProviderRequestBody(
 
 func applyProviderModelRequestPolicy(body []byte, endpoint string, owner providerModel) []byte {
 	rewriteMaxTokens := endpoint == providerEndpointChatCompletions && owner.useMaxCompletionTokens
-	if !owner.dropSamplingParams && !rewriteMaxTokens && (owner.parallelToolCalls == nil || *owner.parallelToolCalls) {
+	dropStopSequences := endpoint == providerEndpointChatCompletions && owner.dropStopSequences
+	if !owner.dropSamplingParams && !dropStopSequences && !rewriteMaxTokens && (owner.parallelToolCalls == nil || *owner.parallelToolCalls) {
 		return body
 	}
 	var payload map[string]json.RawMessage
@@ -233,6 +234,12 @@ func applyProviderModelRequestPolicy(body []byte, endpoint string, owner provide
 				delete(payload, field)
 				changed = true
 			}
+		}
+	}
+	if dropStopSequences {
+		if _, ok := payload["stop"]; ok {
+			delete(payload, "stop")
+			changed = true
 		}
 	}
 	if rewriteMaxTokens {

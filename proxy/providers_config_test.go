@@ -50,6 +50,7 @@ func TestLoadProvidersConfigFileAzureV1BaseURLAndModelMetadata(t *testing.T) {
           "reasoning_effort": ["low", "medium", "high"],
           "vision": true,
           "parallel_tool_calls": true,
+          "drop_stop_sequences": true,
           "use_max_completion_tokens": true,
           "context_window": 400000
         }
@@ -116,6 +117,9 @@ func TestLoadProvidersConfigFileAzureV1BaseURLAndModelMetadata(t *testing.T) {
 	}
 	if cfgModel.ParallelToolCalls == nil || !*cfgModel.ParallelToolCalls {
 		t.Fatalf("parallel_tool_calls = %v, want true", cfgModel.ParallelToolCalls)
+	}
+	if cfgModel.DropStopSequences == nil || !*cfgModel.DropStopSequences {
+		t.Fatalf("drop_stop_sequences = %v, want true", cfgModel.DropStopSequences)
 	}
 	if cfgModel.UseMaxCompletionTokens == nil || !*cfgModel.UseMaxCompletionTokens {
 		t.Fatalf("use_max_completion_tokens = %v, want true", cfgModel.UseMaxCompletionTokens)
@@ -227,6 +231,7 @@ func TestResolveStaticProviderModelHonorsFiltersAndRejectsCollisions(t *testing.
 
 func TestResolveStaticProviderModelResolvesSchemaV2ExplicitRouteMetadata(t *testing.T) {
 	parallelToolCalls := true
+	dropStopSequences := true
 	contextWindow := int64(200000)
 	cfg := ProvidersConfig{
 		SchemaVersion: ProvidersConfigSchemaVersion2,
@@ -243,6 +248,7 @@ func TestResolveStaticProviderModelResolvesSchemaV2ExplicitRouteMetadata(t *test
 			Endpoints:         []string{"/responses"},
 			ReasoningEffort:   []string{"low", "high"},
 			ParallelToolCalls: &parallelToolCalls,
+			DropStopSequences: &dropStopSequences,
 			ContextWindow:     &contextWindow,
 			Targets: []ModelRouteTargetConfig{{
 				ID:            "primary",
@@ -267,6 +273,7 @@ func TestResolveStaticProviderModelResolvesSchemaV2ExplicitRouteMetadata(t *test
 		t.Fatalf("resolved route metadata = %#v", got)
 	}
 	if got.ParallelToolCalls == nil || !*got.ParallelToolCalls ||
+		got.DropStopSequences == nil || !*got.DropStopSequences ||
 		got.ContextWindow == nil || *got.ContextWindow != contextWindow {
 		t.Fatalf("resolved route capabilities = %#v", got)
 	}
