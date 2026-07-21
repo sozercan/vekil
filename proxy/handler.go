@@ -253,6 +253,7 @@ type ProxyHandler struct {
 	allowedModels                    map[string]struct{}
 	providersState                   *providerSetup
 	deferDynamicProviderModelRefresh bool
+	policyRoutingMode                PolicyRoutingMode
 	draining                         atomic.Bool
 	lifecycleOnce                    sync.Once
 	lifecycleCtx                     context.Context
@@ -285,6 +286,13 @@ type ProxyHandler struct {
 	retryBaseDelay                   time.Duration
 	models                           modelsCache
 	chatRoutes                       chatRouteDiscoveryCache
+	chatPolicyPlanner                chatPolicyPlanner
+	policyRoutingController          policyRoutingController
+	policyPreflightStateMu           sync.Mutex
+	policyPreflightAttempts          int
+	policyPreflightPermitOnce        sync.Once
+	policyPreflightPermit            chan struct{}
+	policyPreflightPending           atomic.Bool
 	responsesChatReplayMu            sync.Mutex
 	responsesChatReplay              *responsesChatReplayStore
 	geminiCounts                     geminiCountTokensCache
@@ -707,6 +715,23 @@ func WithProvidersConfig(cfg ProvidersConfig) Option {
 	}
 }
 
+// WithPolicyRoutingMode sets the process-wide policy safety ceiling. The zero
+// value is treated as off.
+func WithPolicyRoutingMode(mode PolicyRoutingMode) Option {
+	return func(h *ProxyHandler) {
+		h.policyRoutingMode = mode
+	}
+}
+
+// WithChatPolicyPlanner installs a planner seam for focused tests. Production
+// policy configuration replaces this with the compiled planner during handler
+// initialization.
+func WithChatPolicyPlanner(planner chatPolicyPlanner) Option {
+	return func(h *ProxyHandler) {
+		h.chatPolicyPlanner = planner
+	}
+}
+
 // WithDeferredDynamicProviderModelValidation skips startup-time dynamic model
 // discovery. Call ValidateDynamicProviderModels after any required interactive
 // auth has completed to preserve collision checks without blocking liveness.
@@ -837,6 +862,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		responsesWS:                     DefaultResponsesWebSocketConfig(),
 		streamingUpstreamTimeout:        streamingUpstreamTimeout,
 		chatRoutes:                      newChatRouteDiscoveryCache(),
+		policyRoutingMode:               PolicyRoutingModeOff,
 		responsesChatReplay:             newResponsesChatReplayStore(),
 		log:                             log,
 		stats:                           newStatsCollector(),
@@ -847,6 +873,10 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 			opt(h)
 		}
 	}
+	if !h.policyRoutingMode.valid() {
+		h.BeginShutdown()
+		return nil, fmt.Errorf("invalid policy routing mode %q", h.policyRoutingMode)
+	}
 	if _, err := h.ensureStateBindingStore(); err != nil {
 		h.BeginShutdown()
 		return nil, err
@@ -855,6 +885,16 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 	if err := h.initializeProviders(); err != nil {
 		h.BeginShutdown()
 		return nil, err
+	}
+	controller, err := newChatPolicyRoutingController(h, h.providersConfig, h.policyRoutingMode)
+	if err != nil {
+		h.BeginShutdown()
+		return nil, err
+	}
+	if controller != nil {
+		h.policyRoutingController = controller
+		h.chatPolicyPlanner = controller
+		h.policyPreflightPending.Store(controller.Active())
 	}
 	h.validateInsightModel()
 	return h, nil
@@ -867,6 +907,10 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 func (h *ProxyHandler) validateInsightModel() {
 	model := strings.TrimSpace(h.providersConfig.InsightModel)
 	if model == "" || h.log == nil || h.DynamicProviderValidationPending() {
+		return
+	}
+	if entry, known := h.providerSetup().lookupPublicModelEntry(model); known && entry != nil && entry.kind == publicEntryPolicy {
+		h.log.Info("dashboard insight_model cannot use a policy profile in policy-routing v1; insights will not work", logger.F("insight_model", model))
 		return
 	}
 	provider, owner, known := h.resolveProviderModel(model, providerEndpointChatCompletions)
@@ -1232,6 +1276,14 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.dynamicProviderValidationPending.Load() {
 		writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", "provider model validation pending")
+		return
+	}
+	if h.PolicyRoutingPreflightPending() {
+		writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", "policy routing preflight pending")
+		return
+	}
+	if diagnostic := h.PolicyRoutingReadinessDiagnostic(); diagnostic != "" {
+		writeReadyzStatus(w, http.StatusServiceUnavailable, "not_ready", diagnostic)
 		return
 	}
 

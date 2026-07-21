@@ -48,12 +48,21 @@ func (h *ProxyHandler) HandleGeminiModels(w http.ResponseWriter, r *http.Request
 		h.writeGeminiProtocolError(w, err)
 		return
 	}
+	normalizedModel := normalizeGeminiModelName(model)
+	switch action {
+	case "generateContent":
+		h.observePolicyRequestSummary(r.Context(), "gemini", normalizedModel, false)
+	case "streamGenerateContent":
+		h.observePolicyRequestSummary(r.Context(), "gemini", normalizedModel, true)
+	case "countTokens":
+		h.observePolicyRequestSummary(r.Context(), "gemini_count_tokens", normalizedModel, false)
+	}
 
 	admissionInbound := r.Context()
 	if action == "countTokens" {
 		admissionInbound = suppressRouteAttemptStats(admissionInbound)
 	}
-	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), admissionInbound, normalizeGeminiModelName(model), providerEndpointChatCompletions)
+	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), admissionInbound, normalizedModel, providerEndpointChatCompletions)
 	if err != nil {
 		h.writeGeminiUpstreamFailure(w, err)
 		return
@@ -845,7 +854,7 @@ func mapGeminiTransportError(err error) error {
 		return &geminiProtocolError{
 			statusCode: providerErr.statusCode,
 			status:     mapGeminiUpstreamStatus(providerErr.statusCode),
-			message:    fmt.Sprintf("upstream request failed: %v", err),
+			message:    err.Error(),
 			cause:      err,
 		}
 	}

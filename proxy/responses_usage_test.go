@@ -97,7 +97,7 @@ func TestRecordResponsesTurn(t *testing.T) {
 	u.InputTokensDetails.CachedTokens = 20
 	u.OutputTokensDetails.ReasoningTokens = 10
 
-	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 200, u)
+	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 200, u, "")
 
 	snap := c.snapshot()
 	if snap.Totals.Requests != 1 {
@@ -124,7 +124,7 @@ func TestRecordResponsesTurn(t *testing.T) {
 	}
 	// A zero-usage turn is still counted as a request (matching the HTTP path),
 	// just with zero tokens.
-	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 200, responsesUsage{})
+	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 200, responsesUsage{}, "")
 	after := c.snapshot()
 	if after.Totals.Requests != 2 {
 		t.Fatalf("zero-usage turn should still be counted: got %d requests want 2", after.Totals.Requests)
@@ -139,7 +139,7 @@ func TestRecordResponsesTurn(t *testing.T) {
 // recorded, and lands in the error counts so the dashboard reflects it.
 func TestRecordResponsesTurnCountsFailures(t *testing.T) {
 	c := newStatsCollector()
-	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", http.StatusBadGateway, responsesUsage{})
+	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", http.StatusBadGateway, responsesUsage{}, "")
 
 	snap := c.snapshot()
 	if snap.Totals.Requests != 1 {
@@ -152,7 +152,7 @@ func TestRecordResponsesTurnCountsFailures(t *testing.T) {
 		t.Fatalf("failed turn should land in 5xx status class: got %+v", snap.Status)
 	}
 	// Default status 0 is treated as a successful (200) turn, not an error.
-	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 0, responsesUsage{})
+	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 0, responsesUsage{}, "")
 	snap2 := c.snapshot()
 	if snap2.Totals.Errors != 1 {
 		t.Fatalf("status 0 should default to success, errors stayed: got %d want 1", snap2.Totals.Errors)
@@ -177,7 +177,7 @@ func TestRecordResponsesTurnAddsPostTerminalUsageWithoutAnotherRequest(t *testin
 	c := newStatsCollector()
 	turn := responsesUsage{InputTokens: 7, OutputTokens: 3, TotalTokens: 10}
 	turn.InputTokensDetails.CachedTokens = 2
-	record := c.recordResponsesTurn("gpt-5.4", "copilot", "copilot", "Codex CLI", http.StatusOK, turn)
+	record := c.recordResponsesTurn("gpt-5.4", "copilot", "copilot", "Codex CLI", http.StatusOK, turn, "")
 
 	internal := responsesUsage{InputTokens: 100, OutputTokens: 20}
 	internal.InputTokensDetails.CachedTokens = 11

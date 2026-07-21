@@ -53,10 +53,22 @@ func TestLoadProvidersConfigFileSchemaVersionsAndDefaults(t *testing.T) {
 			wantErr: "model_routes: requires schema_version: 2",
 		},
 		{
-			name:    "unsupported schema version",
+			name:    "schema version 3 is unsupported in JSON",
+			ext:     ".json",
+			body:    `{"schema_version":3,"providers":[]}`,
+			wantErr: "schema_version: unsupported schema version 3",
+		},
+		{
+			name:    "schema version 3 is unsupported in YAML",
 			ext:     ".yaml",
 			body:    "schema_version: 3\nproviders: []\n",
 			wantErr: "schema_version: unsupported schema version 3",
+		},
+		{
+			name:    "unsupported schema version",
+			ext:     ".yaml",
+			body:    "schema_version: 4\nproviders: []\n",
+			wantErr: "schema_version: unsupported schema version 4",
 		},
 		{
 			name: "version 2 defaults route metadata and budgets",
@@ -113,6 +125,9 @@ model_routes:
 			if route.Name != "gpt-public" {
 				t.Fatalf("route name = %q, want public id", route.Name)
 			}
+			if route.Exposure != modelRouteExposurePublic {
+				t.Fatalf("route exposure = %q, want public for route-only schema v2 config", route.Exposure)
+			}
 			if route.ModelPickerEnabled == nil || !*route.ModelPickerEnabled {
 				t.Fatalf("model_picker_enabled = %v, want true", route.ModelPickerEnabled)
 			}
@@ -123,6 +138,78 @@ model_routes:
 				t.Fatalf("routing defaults = %+v", route.Routing)
 			}
 		})
+	}
+}
+
+func TestValidateProvidersConfigRejectsProgrammaticSchemaVersion3(t *testing.T) {
+	err := ValidateProvidersConfig(ProvidersConfig{SchemaVersion: 3})
+	if err == nil || !strings.Contains(err.Error(), "schema_version: unsupported schema version 3") {
+		t.Fatalf("ValidateProvidersConfig() error = %v", err)
+	}
+}
+
+func TestSchemaV2RouteOnlyMultipleProvidersMayOmitDefaultWithoutLegacyCatalog(t *testing.T) {
+	cfg := ProvidersConfig{
+		SchemaVersion: ProvidersConfigSchemaVersion2,
+		Providers: []ProviderConfig{
+			{ID: "primary", Type: "openai-compatible", BaseURL: "https://primary.example.test/v1", AuthType: "none"},
+			{ID: "secondary", Type: "openai-compatible", BaseURL: "https://secondary.example.test/v1", AuthType: "none"},
+		},
+		ModelRoutes: []ModelRouteConfig{{
+			ID:        "route",
+			PublicID:  "public-model",
+			Endpoints: []string{providerEndpointChatCompletions},
+			Targets: []ModelRouteTargetConfig{
+				{ID: "primary-target", Provider: "primary", UpstreamModel: "deployment"},
+				{ID: "secondary-target", Provider: "secondary", UpstreamModel: "deployment"},
+			},
+		}},
+	}
+
+	h, err := NewProxyHandler(nil, nil, WithProvidersConfig(cfg))
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	if got := h.providerSetup().defaultProviderID; got != "" {
+		t.Fatalf("default provider = %q, want empty for closed route-only config", got)
+	}
+	if route, ok := h.providerSetup().lookupRouteAlias("public-model"); !ok || route == nil {
+		t.Fatal("public route was not compiled")
+	}
+}
+
+func TestSchemaV2MultipleProvidersWithLegacyCatalogRequireDefault(t *testing.T) {
+	cfg := ProvidersConfig{
+		SchemaVersion: ProvidersConfigSchemaVersion2,
+		Providers: []ProviderConfig{
+			{
+				ID:       "catalog-provider",
+				Type:     "openai-compatible",
+				BaseURL:  "https://catalog.example.test/v1",
+				AuthType: "none",
+				Models: []ProviderModelConfig{{
+					PublicID:   "legacy-model",
+					Deployment: "legacy-model",
+					Endpoints:  []string{providerEndpointChatCompletions},
+				}},
+			},
+			{ID: "route-provider", Type: "openai-compatible", BaseURL: "https://route.example.test/v1", AuthType: "none"},
+		},
+		ModelRoutes: []ModelRouteConfig{{
+			ID:        "route",
+			PublicID:  "public-model",
+			Endpoints: []string{providerEndpointChatCompletions},
+			Targets: []ModelRouteTargetConfig{{
+				ID:            "route-target",
+				Provider:      "route-provider",
+				UpstreamModel: "deployment",
+			}},
+		}},
+	}
+
+	err := ValidateProvidersConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "multiple providers are configured but no default provider is selected") {
+		t.Fatalf("ValidateProvidersConfig() error = %v", err)
 	}
 }
 

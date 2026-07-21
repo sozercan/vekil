@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/sozercan/vekil/logger"
@@ -670,7 +671,41 @@ func (h *ProxyHandler) withAdmittedExplicitRouteOperation(ctx, inbound context.C
 	return ctx, operation, route, nil
 }
 
+func withPlannedChatOperation(ctx, inbound context.Context, plan chatOperationPlan) (context.Context, *routeOperation, error) {
+	if !plan.valid() {
+		return ctx, nil, fmt.Errorf("policy planner returned an invalid Chat operation plan")
+	}
+	if existing := routeOperationFromContext(ctx); existing != nil {
+		return ctx, nil, fmt.Errorf("route operation for %q was admitted before policy planning", existing.route.public.id)
+	}
+	operation := newRouteOperationFromChatPlan(plan, inbound)
+	if operation == nil {
+		return ctx, nil, fmt.Errorf("policy planner returned an unusable Chat operation plan")
+	}
+	if summary := RequestSummaryFromContext(inbound); summary != nil {
+		summary.SetOperationID(operation.operationID())
+		summary.SetRouteID(plan.publicID)
+		summary.SetPolicyDecision(plan)
+	}
+	return withRouteOperation(ctx, operation), operation, nil
+}
+
 func (h *ProxyHandler) withChatExecutionRoute(ctx, inbound context.Context, model string, body []byte) (context.Context, *routeOperation, *modelRoute, error) {
+	if operation := routeOperationFromContext(ctx); operation != nil {
+		if _, planned := operation.policyPlan(); planned {
+			endpoint, err := explicitChatExecutionEndpoint(operation.route, body)
+			if err != nil {
+				attachExplicitChatExecutionErrorRoute(err, operation.route, targetBinding{}, endpoint, chatBackendNativeChat)
+				return ctx, nil, operation.route, err
+			}
+			if endpoint != providerEndpointChatCompletions {
+				err := &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("policy model %q supports native %s only", operation.route.public.id, providerEndpointChatCompletions)}
+				attachExplicitChatExecutionErrorRoute(err, operation.route, targetBinding{}, endpoint, chatBackendNativeChat)
+				return ctx, nil, operation.route, err
+			}
+			return ctx, operation, operation.route, nil
+		}
+	}
 	route, known := h.resolveModelRouteForRequest(model, providerEndpointChatCompletions)
 	if !known || route == nil || route.legacy {
 		return ctx, nil, route, nil
@@ -986,8 +1021,38 @@ func parseOpenAIChatCompletionsMode(body []byte) chatCompletionsMode {
 }
 
 func prepareOpenAIChatCompletionsRequest(body []byte) ([]byte, chatCompletionsMode) {
+	return prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body, chatParallelToolCallsDefault)
+}
+
+type chatParallelToolCallsPreparation uint8
+
+const (
+	chatParallelToolCallsDefault chatParallelToolCallsPreparation = iota
+	chatParallelToolCallsForceFalse
+	chatParallelToolCallsOmit
+)
+
+func preparePolicyOpenAIChatCompletionsRequest(body []byte, contract publicModelContract, terminalParallelToolCalls *bool) ([]byte, chatCompletionsMode) {
+	preparation := chatParallelToolCallsDefault
+	if contract.policy.parallelToolCalls == nil || !*contract.policy.parallelToolCalls {
+		preparation = chatParallelToolCallsOmit
+		if terminalParallelToolCalls != nil && *terminalParallelToolCalls {
+			preparation = chatParallelToolCallsForceFalse
+		}
+	}
+	return prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body, preparation)
+}
+
+func prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body []byte, preparation chatParallelToolCallsPreparation) ([]byte, chatCompletionsMode) {
 	mode := parseOpenAIChatCompletionsMode(body)
-	body = injectParallelToolCalls(body)
+	switch preparation {
+	case chatParallelToolCallsForceFalse:
+		body = enforceParallelToolCallsFalse(body)
+	case chatParallelToolCallsOmit:
+		body = omitParallelToolCalls(body)
+	default:
+		body = injectParallelToolCalls(body)
+	}
 	if mode.forceUpstreamStream {
 		body = injectForceStream(body)
 		mode.injectedStreamUsage = true
@@ -1429,6 +1494,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	defer func() { _ = r.Body.Close() }()
 
 	admissionModel := extractOpenAIChatCompletionsRequestModel(body)
+	h.observePolicyRequestSummary(r.Context(), "anthropic", admissionModel, false)
 	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), admissionModel, providerEndpointMessages)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
@@ -1701,6 +1767,7 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 	defer func() { _ = r.Body.Close() }()
 
 	admissionModel := extractOpenAIChatCompletionsRequestModel(body)
+	h.observePolicyRequestSummary(r.Context(), "anthropic_count_tokens", admissionModel, false)
 	admissionInbound := suppressRouteAttemptStats(r.Context())
 	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), admissionInbound, admissionModel, providerEndpointMessages)
 	if err != nil {
@@ -1902,6 +1969,164 @@ func (h *ProxyHandler) decodeAnthropicCountTokensProbeResponse(resp *http.Respon
 	return &oaiResp, nil
 }
 
+func policyChatSafeHeaders(src http.Header, publicModel string) http.Header {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(http.Header)
+	for key, values := range src {
+		lower := strings.ToLower(strings.TrimSpace(key))
+		for _, value := range values {
+			value = strings.TrimSpace(value)
+			switch lower {
+			case "retry-after":
+				if policyChatRetryAfter(value) {
+					dst.Add(key, value)
+				}
+			case "ratelimit-limit":
+				if policyChatRateLimitLimit(value) {
+					dst.Add(key, value)
+				}
+			case "ratelimit-remaining", "ratelimit-reset",
+				"x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset",
+				"x-ratelimit-limit-requests", "x-ratelimit-limit-tokens":
+				if policyChatNonNegativeInteger(value) {
+					dst.Add(key, value)
+				}
+			case "x-ratelimit-remaining-requests", "x-ratelimit-remaining-tokens":
+				if policyChatInteger(value) {
+					dst.Add(key, value)
+				}
+			case "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens":
+				if policyChatResetValue(value) {
+					dst.Add(key, value)
+				}
+			}
+		}
+	}
+	for _, name := range []string{"Openai-Model", "X-Openai-Model"} {
+		if src.Get(name) == "" {
+			continue
+		}
+		dst.Set(name, publicModel)
+	}
+	if len(dst) == 0 {
+		return nil
+	}
+	return dst
+}
+
+func policyChatSuccessHeaders(src http.Header, publicModel string) http.Header {
+	dst := policyChatSafeHeaders(src, publicModel)
+	for _, name := range []string{"Content-Type", "Content-Length", "Content-Encoding"} {
+		values := src.Values(name)
+		if len(values) == 0 {
+			continue
+		}
+		if dst == nil {
+			dst = make(http.Header)
+		}
+		for _, value := range values {
+			dst.Add(name, value)
+		}
+	}
+	return dst
+}
+
+func policyChatInteger(value string) bool {
+	if value == "" {
+		return false
+	}
+	_, err := strconv.ParseInt(value, 10, 64)
+	return err == nil
+}
+
+func policyChatNonNegativeInteger(value string) bool {
+	if value == "" {
+		return false
+	}
+	_, err := strconv.ParseUint(value, 10, 64)
+	return err == nil
+}
+
+func policyChatRetryAfter(value string) bool {
+	if policyChatNonNegativeInteger(value) {
+		return true
+	}
+	_, err := http.ParseTime(value)
+	return err == nil
+}
+
+func policyChatResetValue(value string) bool {
+	if policyChatNonNegativeInteger(value) {
+		return true
+	}
+	delay, err := time.ParseDuration(value)
+	return err == nil && delay >= 0
+}
+
+func policyChatRateLimitLimit(value string) bool {
+	items := strings.Split(value, ",")
+	if len(items) == 0 {
+		return false
+	}
+	for _, item := range items {
+		parts := strings.Split(item, ";")
+		if !policyChatNonNegativeInteger(strings.TrimSpace(parts[0])) {
+			return false
+		}
+		seenWindow := false
+		for _, parameter := range parts[1:] {
+			name, rawValue, ok := strings.Cut(strings.TrimSpace(parameter), "=")
+			if !ok || seenWindow || !strings.EqualFold(strings.TrimSpace(name), "w") ||
+				!policyChatNonNegativeInteger(strings.TrimSpace(rawValue)) {
+				return false
+			}
+			seenWindow = true
+		}
+	}
+	return true
+}
+
+func policyChatUpstreamErrorDetails(status int) (message, errType, code string) {
+	return "upstream request failed", openAIErrorTypeForHTTPStatus(status), "upstream_error"
+}
+
+func policyChatErrorHeaders(err error) http.Header {
+	var executionErr *chatExecutionError
+	if errors.As(err, &executionErr) {
+		return executionErr.Headers
+	}
+	var upstreamErr *upstreamError
+	if errors.As(err, &upstreamErr) {
+		return upstreamErr.headers
+	}
+	return nil
+}
+
+func writePolicyChatSanitizedError(w http.ResponseWriter, status int, headers http.Header, publicModel string) {
+	if safeHeaders := policyChatSafeHeaders(headers, publicModel); len(safeHeaders) > 0 {
+		mergeHeaderValues(w.Header(), safeHeaders)
+	}
+	w.Header().Del("Content-Length")
+	if status < http.StatusBadRequest {
+		status = http.StatusBadGateway
+	}
+	message, errType, code := policyChatUpstreamErrorDetails(status)
+	writeOpenAIErrorWithDetails(w, status, message, errType, "", code)
+}
+
+func writePolicyChatTerminalError(w http.ResponseWriter, resp *http.Response, publicModel string) error {
+	if resp == nil {
+		return &responseBodyWriteError{err: fmt.Errorf("upstream response is unavailable"), upstream: true}
+	}
+	if resp.Body != nil {
+		defer func() { _ = readRetryableUpstreamErrorBody(resp.Body) }()
+	}
+	writePolicyChatSanitizedError(w, resp.StatusCode, resp.Header, publicModel)
+	return nil
+}
+
 // HandleOpenAIChatCompletions handles POST /v1/chat/completions by forwarding the
 // request to Copilot with only auth headers injected (near zero-copy passthrough).
 func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -1916,6 +2141,8 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 	defer func() { _ = r.Body.Close() }()
 	requestedModel := extractOpenAIChatCompletionsRequestModel(bodyBytes)
+	h.observePolicyRequestSummary(r.Context(), "openai_chat", requestedModel, false)
+	publicModel := requestedModel
 	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), requestedModel, providerEndpointChatCompletions)
 	if err != nil {
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
@@ -1936,9 +2163,41 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 
+	policyPlan, err := h.planOpenAIChatPolicy(r.Context(), requestedModel, bodyBytes)
+	if err != nil {
+		if h.handleShutdownError(w, r, nil, err) {
+			return
+		}
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+		return
+	}
+	terminalParallelToolCalls := cloneBoolPtr(policyPlan.terminalParallelToolCalls)
+	if policyPlan.valid() {
+		if admittedOperation != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "policy model was also admitted as a direct route", "server_error")
+			return
+		}
+		plannedCtx, plannedOperation, planErr := withPlannedChatOperation(r.Context(), r.Context(), policyPlan)
+		if planErr != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, planErr.Error(), "server_error")
+			return
+		}
+		r = r.WithContext(plannedCtx)
+		w.Header().Set("X-Vekil-Request-ID", plannedOperation.operationID())
+		// Preserve the actual body model for provider rewrite. Public metrics and
+		// response identity use the canonical policy profile ID separately.
+		publicModel = policyPlan.publicID
+	}
+
 	scope := chatToolExecutionScopeFromHeaders(r.Header)
-	bodyBytes, mode := prepareOpenAIChatCompletionsRequest(bodyBytes)
-	h.observeRequestSummary(r.Context(), "openai_chat", requestedModel, mode.clientRequestedStream, providerEndpointChatCompletions)
+	var mode chatCompletionsMode
+	if policyPlan.valid() {
+		bodyBytes, mode = preparePolicyOpenAIChatCompletionsRequest(bodyBytes, policyPlan.contract, terminalParallelToolCalls)
+	} else {
+		bodyBytes, mode = prepareOpenAIChatCompletionsRequest(bodyBytes)
+	}
+	h.observeRequestSummary(r.Context(), "openai_chat", publicModel, mode.clientRequestedStream, providerEndpointChatCompletions)
 	bodyBytes = h.rewriteOpenAIChatRequestBodyWithToolOptimizers(r.Context(), bodyBytes, h.toolContexts, scope)
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
@@ -1952,21 +2211,42 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		var executionErr *chatExecutionError
 		if errors.As(err, &executionErr) {
 			observeChatExecutionError(r.Context(), executionErr)
-			writeOpenAIChatExecutionError(w, executionErr)
+			if policyPlan.valid() {
+				writePolicyChatSanitizedError(w, executionErr.StatusCode, executionErr.Headers, publicModel)
+			} else {
+				writeOpenAIChatExecutionError(w, executionErr)
+			}
 			return
 		}
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
-		writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+		if policyPlan.valid() {
+			writePolicyChatSanitizedError(w, statusCode, policyChatErrorHeaders(err), publicModel)
+		} else {
+			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
+		}
 		return
 	}
 	if routeOperation != nil {
 		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
 	}
 
-	responseModel := explicitRoutePublicModel(route, requestedModel)
+	responseModel := explicitRoutePublicModel(route, publicModel)
 	result, err := h.executeRoutedChatCompletions(upstreamCtx, bodyBytes, mode, chatExecutionOptions{}, requestedModel)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
+			return
+		}
+		if policyPlan.valid() {
+			var executionErr *chatExecutionError
+			if errors.As(err, &executionErr) {
+				observeChatExecutionError(r.Context(), executionErr)
+				observeOpenAIUsage(r.Context(), executionErr.Usage)
+			}
+			statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+			if h.log != nil {
+				h.log.Error("policy terminal request failed", logger.F("endpoint", "openai"), logger.Err(err))
+			}
+			writePolicyChatSanitizedError(w, statusCode, policyChatErrorHeaders(err), responseModel)
 			return
 		}
 		var executionErr *chatExecutionError
@@ -2003,7 +2283,11 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		if errors.As(err, &executionErr) {
 			observeChatExecutionError(r.Context(), executionErr)
 			observeOpenAIUsage(r.Context(), executionErr.Usage)
-			writeOpenAIChatExecutionError(w, executionErr)
+			if policyPlan.valid() {
+				writePolicyChatSanitizedError(w, executionErr.StatusCode, executionErr.Headers, responseModel)
+			} else {
+				writeOpenAIChatExecutionError(w, executionErr)
+			}
 			return
 		}
 		status := http.StatusBadGateway
@@ -2018,6 +2302,9 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 				errType = streamErr.Type
 			}
 			code = streamErr.Code
+			if policyPlan.valid() {
+				message, errType, code = policyChatUpstreamErrorDetails(status)
+			}
 		}
 		writeOpenAIErrorWithDetails(w, status, message, errType, "", code)
 		return
@@ -2042,7 +2329,11 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 
 	err = h.routeChatExecutionResult(w, result, upstreamCtx, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
-			copyPassthroughHeaders(w.Header(), resp.Header)
+			if policyPlan.valid() {
+				mergeHeaderValues(w.Header(), policyChatSafeHeaders(resp.Header, responseModel))
+			} else {
+				copyPassthroughHeaders(w.Header(), resp.Header)
+			}
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentProtocolFrame)
 			body := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
 			finalResponse := h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope)
@@ -2055,7 +2346,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			// for when the client did not opt into stream_options.include_usage.
 			lifecycle := h.lifecycleStreamHooks(r.Context(), body.canceledAtFailure, func() { h.WriteShutdownServiceUnavailable(w, r) })
 			if routeOperation != nil {
-				streamExplicitRouteOpenAIChatPassthroughWithLifecycle(w, body, responseModel, mode.injectedClientStreamUsage, onError, finalResponse, lifecycle, usage)
+				streamExplicitRouteOpenAIChatPassthroughWithLifecycle(w, body, responseModel, policyPlan.valid(), mode.injectedClientStreamUsage, onError, finalResponse, lifecycle, usage)
 			} else {
 				streamOpenAIChatPassthroughWithLifecycle(w, body, responseModel, mode.injectedClientStreamUsage, onError, finalResponse, lifecycle, usage)
 			}
@@ -2101,6 +2392,12 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		},
 		passthrough: func(resp *http.Response) error {
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentProtocolFrame)
+			if policyPlan.valid() && resp != nil {
+				if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+					return writePolicyChatTerminalError(w, resp, responseModel)
+				}
+				resp.Header = policyChatSuccessHeaders(resp.Header, responseModel)
+			}
 			return h.maybeWriteOptimizedOpenAIChatPassthrough(r.Context(), w, resp, responseModel, h.toolContexts, scope)
 		},
 	})
@@ -2115,7 +2412,11 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		if errors.As(err, &executionErr) {
 			observeChatExecutionError(r.Context(), executionErr)
 			observeOpenAIUsage(r.Context(), executionErr.Usage)
-			writeOpenAIChatExecutionError(w, executionErr)
+			if policyPlan.valid() {
+				writePolicyChatSanitizedError(w, executionErr.StatusCode, executionErr.Headers, responseModel)
+			} else {
+				writeOpenAIChatExecutionError(w, executionErr)
+			}
 			return
 		}
 		status := http.StatusBadGateway
@@ -2130,6 +2431,9 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 				errType = streamErr.Type
 			}
 			code = streamErr.Code
+			if policyPlan.valid() {
+				message, errType, code = policyChatUpstreamErrorDetails(status)
+			}
 		}
 		writeOpenAIErrorWithDetails(w, status, message, errType, "", code)
 	}
@@ -2225,6 +2529,48 @@ func injectParallelToolCalls(body []byte) []byte {
 		return body
 	}
 	m["parallel_tool_calls"] = json.RawMessage("true")
+	result, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return result
+}
+
+// enforceParallelToolCallsFalse preserves an explicit false value and adds it
+// when tools are present so a capable terminal cannot fall back to parallel
+// execution under a false public policy contract.
+func enforceParallelToolCallsFalse(body []byte) []byte {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	raw, hasPTC := m["parallel_tool_calls"]
+	tools, hasTools := m["tools"]
+	if !hasPTC && (!hasTools || !hasNonEmptyTools(tools)) {
+		return body
+	}
+	if hasPTC && bytes.Equal(bytes.TrimSpace(raw), []byte("false")) {
+		return body
+	}
+	m["parallel_tool_calls"] = json.RawMessage("false")
+	result, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return result
+}
+
+// omitParallelToolCalls removes the field for terminals that do not support
+// it, including when a policy client explicitly supplied false.
+func omitParallelToolCalls(body []byte) []byte {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	if _, ok := m["parallel_tool_calls"]; !ok {
+		return body
+	}
+	delete(m, "parallel_tool_calls")
 	result, err := json.Marshal(m)
 	if err != nil {
 		return body

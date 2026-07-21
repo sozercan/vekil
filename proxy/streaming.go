@@ -888,6 +888,7 @@ func streamExplicitRouteOpenAIChatPassthroughWithLifecycle(
 	w http.ResponseWriter,
 	body io.ReadCloser,
 	publicModel string,
+	sanitizeErrors bool,
 	dropInjectedUsage bool,
 	onError func(status int),
 	onFinalResponse func(*models.OpenAIResponse),
@@ -897,6 +898,17 @@ func streamExplicitRouteOpenAIChatPassthroughWithLifecycle(
 	normalizer := newOpenAIChatCompletionChunkNormalizer(publicModel)
 	transform := func(eventType, data string) (string, bool) {
 		normalized, changed := normalizer.normalize(eventType, data)
+		if sanitizeErrors {
+			if streamErr, ok := parseOpenAIStreamError(eventType, normalized); ok {
+				message, errType, code := policyChatUpstreamErrorDetails(streamErr.httpStatus())
+				sanitized, err := json.Marshal(openAIChatStreamErrorEnvelope{Error: openAIChatStreamErrorBody{
+					Type: errType, Code: code, Message: message,
+				}})
+				if err == nil {
+					return string(sanitized), true
+				}
+			}
+		}
 		if !openAIChatStreamEventMayCarryChunk(eventType) || strings.TrimSpace(normalized) == "" || strings.TrimSpace(normalized) == "[DONE]" {
 			return normalized, changed
 		}
@@ -985,6 +997,12 @@ func streamOpenAIPassthrough(
 		// failure even though the client already received a 200 header, with the
 		// error's classified status (e.g. 429 for a rate limit) rather than 502.
 		if streamErr, isErr := parseOpenAIStreamError(eventType, data); isErr {
+			if transformData != nil {
+				if transformed, changed := transformData(eventType, data); changed {
+					data = transformed
+					transformedCurrentData = &data
+				}
+			}
 			sawTerminalError = true
 			if onError != nil && !errorReported {
 				onError(streamErr.httpStatus())

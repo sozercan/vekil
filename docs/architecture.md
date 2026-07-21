@@ -3,26 +3,32 @@
 ## System Shape
 
 ```text
-┌──────────────────────────────────────────────────────────────────┐
-│                              vekil                               │
-│                                                                  │
-│  /v1/messages ─┐                                                 │
-│  /v1beta/... ──┼─► Translate to OpenAI payloads ─► Provider router│
-│  /models/... ──┤                                   │             │
-│  /v1/chat/... ─┤                                   ├─► Copilot   │
-│  /v1/responses ┘                                   ├─► Azure     │
-│                                                      ├─► Codex   │
-│                                                      └─► Generic │
-│                                                                  │
-│  /v1/responses/compact ─┐                                        │
-│  /v1/memories/... ──────┴─► Proxy-owned Responses compatibility  │
-│                                                                  │
-│  auth + provider state ─► GitHub device flow, token caches,      │
-│                           Codex auth.json refresh helpers         │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                                vekil                                 │
+│                                                                      │
+│  OpenAI Chat ───────────► Public model-entry registry                │
+│                                  │                                   │
+│                      ┌───────────┴───────────┐                       │
+│                      │                       │                       │
+│                 static entry          policy profile                │
+│                      │             facts + off/observe/enforce       │
+│                      │                       │                       │
+│                      └───────────┬───────────┘                       │
+│                                  ▼                                   │
+│                         Sealed terminal route                        │
+│                                  ▼                                   │
+│                         Shared route executor                        │
+│                                  ├─► Copilot                         │
+│  Anthropic/Gemini ─► canonical Chat ├─► Azure                       │
+│  Direct Responses ─► native path    ├─► Codex                       │
+│                                      └─► Generic                     │
+│                                                                      │
+│  /v1/responses/compact + /v1/memories/... ─► Responses shims         │
+│  auth + provider state ─► login/token caches + exact state binding   │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-Chat-compatible ingress converges before provider I/O: public OpenAI Chat, translated Anthropic Messages, translated Gemini generation, their count-token probes, and dashboard insights all submit canonical Chat requests to the same execution layer. Direct `anthropic-compatible` forwarding and direct `/v1/responses` remain separate paths.
+Chat-compatible ingress converges before provider I/O: public OpenAI Chat, translated Anthropic Messages, translated Gemini generation, their count-token probes, and dashboard insights all submit canonical Chat requests to the same execution layer. Schema-v2 policy resolution is deliberately narrower in v1 and is entered only by public `POST /v1/chat/completions`; translated protocols, token probes, Responses-backed Chat, and direct Responses remain outside policy selection. Direct `anthropic-compatible` forwarding and direct `/v1/responses` remain separate paths.
 
 ## Package Responsibilities
 
@@ -31,13 +37,13 @@ Chat-compatible ingress converges before provider I/O: public OpenAI Chat, trans
 | `main` | CLI dispatch, server setup, shared startup authentication, graceful shutdown |
 | `launch/` | ephemeral proxy supervision, agent adapters, child environment sanitization, and session summaries |
 | `auth/` | GitHub OAuth device code flow, Copilot token exchange, disk caching, auto-refresh |
-| `proxy/` | HTTP handlers, provider routing, Anthropic/OpenAI and Gemini/OpenAI translation, Responses compatibility, optional tool optimizer hooks, SSE streaming, retry logic, and provider-specific request/auth helpers outside GitHub OAuth |
+| `proxy/` | HTTP handlers, public-entry/terminal-route registries, policy planning/classification, provider routing, Anthropic/OpenAI and Gemini/OpenAI translation, Responses compatibility, optional tool optimizer hooks, SSE streaming, retry logic, and provider-specific request/auth helpers outside GitHub OAuth |
 | `models/` | Request and response type definitions only |
 | `logger/` | Structured JSON logging |
 | `server/` | Reusable HTTP server lifecycle |
 | `cmd/menubar/` | macOS/Linux tray app |
 
-## Model Route Registry
+## Public Entry and Terminal Route Registries
 
 Routing resolves a client-visible model ID to a logical model route rather than directly to one provider model. A route separates:
 
@@ -47,9 +53,28 @@ Routing resolves a client-visible model ID to a logical model route rather than 
 - target-specific, semantics-preserving wire adaptation; and
 - legacy retry compatibility.
 
-Provider-only version-1 configuration remains compatible. Static and dynamically discovered provider models compile to one-target legacy routes, preserving their existing ownership, unknown-model, catalog, and same-target retry behavior. A version-2 `model_routes` entry compiles to an explicit route whose target order is configuration-owned. Registry snapshots are immutable after publication; a dynamic legacy-catalog refresh that would collide with an explicit route is rejected as a whole, leaving the last-known-good snapshot active.
+Provider-only version-1 configuration remains compatible. Static and dynamically discovered provider models compile to one-target legacy routes, preserving their existing ownership, unknown-model, catalog, and same-target retry behavior. A version-2 `model_routes` entry compiles to an explicit route whose target order is configuration-owned. Registry snapshots are immutable after publication; a dynamic legacy-catalog refresh that would collide with an explicit public entry is rejected as a whole, leaving the last-known-good snapshot active.
+
+Schema v2 makes the registry split explicit:
+
+- The **terminal route registry** is keyed by operational route ID and contains both public and internal routes.
+- The **public model-entry registry** is keyed by public ID/alias and contains static route entries plus policy profile entries.
+
+Only the public registry resolves client model IDs. Internal routes have no public aliases, do not appear in `/v1/models`, and cannot be used as dashboard insight models. A policy profile references terminal route IDs, but a policy may not reference another policy. This prevents operational provider/route/target/deployment IDs from accidentally becoming public model aliases.
 
 Public identity stays route-owned in the catalog: `/v1/models` exposes one entry for an explicit route, and target IDs, deployment names, and temporary target availability do not become separate public models or mutate catalog metadata. Explicit Responses output, websocket metadata, and translated Anthropic/Gemini output use the public ID. Legacy OpenAI Chat normalization remains conservative and can preserve a nonempty provider-supplied `model`. Explicit routes normalize supported Chat JSON and SSE model fields and model headers to the route public ID.
+
+For a policy entry, public identity is profile-owned. `/v1/models` exposes one `owned_by: vekil-policy` entry with only `/chat/completions`; normalized Chat JSON/SSE, safe model headers, errors, and metrics retain the profile public ID even though execution uses an internal terminal route. Internal provider, terminal-route, target, and deployment identities are bounded operational provenance and do not leak through normalized output.
+
+## Policy Planning Seam
+
+The OpenAI Chat handler sees policy routing through one planner seam. The planner owns public-entry lookup, effective mode resolution, bounded fact construction, observer/classifier admission, classifier-route health, deterministic signal mapping, terminal route selection, and bounded decision provenance. It returns a sealed operation plan containing copied candidate bindings and separate public-profile and terminal-route identity.
+
+The plan is sealed before first-send admission and contains no prompt text, tool arguments, credentials, or classifier rationale. The handler executes the returned plan rather than rescanning route targets or reading terminal public identity independently.
+
+Classifier sends reuse provider request/auth primitives but are separate auxiliary operations with their own timeout, non-blocking global/per-profile concurrency admission, infrastructure breaker, and one-send budget. They do not consume the selected terminal route's target-attempt or upstream-send budgets. After selection, the existing route executor remains the sole owner of physical target ordering, request/model rewriting, replay-safe failover, forced streaming/aggregation, cleanup, error selection, and response normalization.
+
+V1 policy planning is stateless and single-tenant: no downstream identity, tenant isolation, session header, affinity cache, or shared cross-process policy state exists. A non-loopback policy deployment is accepted only with the explicit remote-single-tenant acknowledgement, which adds no authentication.
 
 ## Attempt Execution and Replay Safety
 
@@ -64,6 +89,8 @@ Each logical operation has one total inference deadline and two independent hard
 
 - `max_target_attempts` counts distinct target selections, including the first target;
 - `max_upstream_sends` counts every physical inference POST, including bounded same-target protocol recovery and integrated compaction or compatibility calls.
+
+Policy classifier sends are outside these terminal budgets. The selected terminal operation still has exactly the same route-executor budget and replay-safety rules as a direct request to that route. Failure never crosses from lightweight to powerful or vice versa.
 
 The deadline is not restarted per target. A hanging primary can consume the total deadline; the initial implementation does not promise a secondary attempt in that case. An ordinary HTTP client disconnect closes admission for any *new* attempt without changing the established cancellation behavior of the active attempt. WebSocket close, missed pong, deadline, and process shutdown cancel active session work and prevent another attempt.
 
@@ -92,6 +119,9 @@ Bindings use keyed digests and live in a process-local index capped at 32,768 en
 - Pure `net/http` with Go `ServeMux` routing; no web framework.
 - Vekil is a multi-provider proxy. Zero-config startup currently uses GitHub Copilot, but explicit provider config can extend or replace that default behind the same public surface.
 - Public model IDs are a single namespace across legacy provider models and explicit model routes. The proxy validates normalized ownership during startup and fails fast on collisions.
+- Schema-v2 policy profiles share that public namespace but select only between `lightweight` and `powerful` native-Chat terminal routes. Internal routes are operational-only and exposed public terminal routes deliberately bypass policy.
+- Policy routing is quality/cost optimization, not authorization or spend enforcement. V1 is text/function-tool OpenAI Chat only, per-turn, stateless, and limited to one trusted user/tenant per deployment.
+- Classifier content forwarding, trust-domain crossing, and provider retention require explicit operator acknowledgements. Those acknowledgements and live protocol preflight do not prove an external provider's retention behavior.
 - Provider endpoint support is explicit. `models[].endpoints` and `model_routes[].endpoints` are allowlists, so do not expose `/chat/completions` or other routes until every target in the public contract has verified equivalent behavior.
 - Gemini is a translation path like Anthropic, not a passthrough path.
 - OpenAI Chat Completions is near-zero-copy when the selected model has native Chat support. Responses-native models use an explicit conversion path; unsupported input is rejected rather than silently dropped.
@@ -102,7 +132,7 @@ Bindings use keyed digests and live in a process-local index capped at 32,768 en
 - Azure OpenAI support is implemented as an OpenAI-compatible provider behind the existing proxy surface; Azure deployment names are internal to provider config.
 - Generic provider support is config-driven. `openai-compatible` providers use OpenAI Chat Completions and optional Responses paths, while `anthropic-compatible` providers directly forward native Anthropic Messages requests.
 - OpenAI Codex subscription support is a Responses-only dynamic provider backed by Codex CLI ChatGPT credentials.
-- Explicit routes provide ordered `primary_only` or bounded `priority_failover`, not active-active balancing. There are no weights, affinity/stickiness policy, active health probes, shared circuit-breaker domains, automatic cross-route fallback, or cross-target state migration.
+- Explicit terminal routes provide ordered `primary_only` or bounded `priority_failover`, not active-active balancing. There are no weights, affinity/stickiness policy, active terminal health probes, automatic cross-route/tier fallback, or cross-target state migration. The policy classifier has a separate infrastructure-only breaker that does not rank or reroute terminal targets.
 - Production dependencies stay minimal.
 
 ## Chat Completions over Responses design gate

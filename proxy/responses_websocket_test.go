@@ -66,6 +66,139 @@ func TestHandleResponsesWebSocket_DisabledByDefaultReturnsUpgradeRequired(t *tes
 	}
 }
 
+func TestHandleResponsesWebSocketRejectsPolicyModelWithCanonicalStats(t *testing.T) {
+	tests := []struct {
+		name  string
+		model string
+		input interface{}
+	}{
+		{
+			name:  "normalized alias",
+			model: "coding-economy-20260717",
+			input: []interface{}{map[string]interface{}{
+				"type": "message", "role": "user",
+				"content": []map[string]string{{"type": "input_text", "text": "hello"}},
+			}},
+		},
+		{name: "malformed body with known model", model: "coding-economy", input: "not-an-array"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var sends atomic.Int64
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sends.Add(1)
+				http.Error(w, "unexpected upstream request", http.StatusBadGateway)
+			}))
+			defer upstream.Close()
+
+			h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+				WithProvidersConfig(policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)),
+				WithPolicyRoutingMode(PolicyRoutingModeOff),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := startResponsesWebSocketProxyServer(t, h)
+			conn := mustDialResponsesWebSocket(t, server, nil)
+			defer func() { _ = conn.Close() }()
+
+			request := newResponsesWebSocketCreateRequest(nil)
+			request["model"] = test.model
+			request["input"] = test.input
+			if err := conn.WriteJSON(request); err != nil {
+				t.Fatal(err)
+			}
+			payload := mustReadWebSocketJSON(t, conn)
+			if payload["type"] != "error" || payload["status_code"] != float64(http.StatusBadRequest) {
+				t.Fatalf("websocket response = %+v", payload)
+			}
+			encoded, _ := json.Marshal(payload)
+			if strings.Contains(string(encoded), "upstream request failed") || strings.Contains(string(encoded), "light-provider") {
+				t.Fatalf("local policy rejection leaked upstream wording/topology: %s", encoded)
+			}
+			if got := sends.Load(); got != 0 {
+				t.Fatalf("upstream sends = %d, want zero", got)
+			}
+
+			snapshot := h.stats.snapshot()
+			if len(snapshot.ByProvider) != 0 || len(snapshot.ByTarget) != 0 || len(snapshot.RecentAttempts) != 0 {
+				t.Fatalf("websocket rejection leaked physical topology: providers=%+v targets=%+v attempts=%+v", snapshot.ByProvider, snapshot.ByTarget, snapshot.RecentAttempts)
+			}
+			if len(snapshot.Recent) != 1 {
+				t.Fatalf("recent = %+v, want one rejected turn", snapshot.Recent)
+			}
+			recent := snapshot.Recent[0]
+			if recent.Model != "coding-economy" || recent.RouteID != "coding-economy" || recent.FinalTarget != "coding-economy" || recent.Status != http.StatusBadRequest {
+				t.Fatalf("recent policy attribution = %+v", recent)
+			}
+			if recent.Provider != "" || recent.UpstreamRequestID != "" || recent.UpstreamSends != 0 {
+				t.Fatalf("recent policy rejection leaked topology: %+v", recent)
+			}
+			if len(snapshot.Errors) != 1 || snapshot.Errors[0].Label != "coding-economy" || snapshot.Errors[0].Count != 1 {
+				t.Fatalf("errors = %+v, want canonical policy identity", snapshot.Errors)
+			}
+		})
+	}
+}
+
+func TestHandleResponsesWebSocketLocalRejectionDoesNotInferProvider(t *testing.T) {
+	tests := []struct {
+		name  string
+		model string
+	}{
+		{name: "empty model"},
+		{name: "internal classifier route", model: "classifier-route"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var sends atomic.Int64
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sends.Add(1)
+				http.Error(w, "unexpected upstream request", http.StatusBadGateway)
+			}))
+			defer upstream.Close()
+
+			h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+				WithProvidersConfig(policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)),
+				WithPolicyRoutingMode(PolicyRoutingModeOff),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := startResponsesWebSocketProxyServer(t, h)
+			conn := mustDialResponsesWebSocket(t, server, nil)
+			defer func() { _ = conn.Close() }()
+
+			request := newResponsesWebSocketCreateRequest(nil)
+			request["model"] = test.model
+			if err := conn.WriteJSON(request); err != nil {
+				t.Fatal(err)
+			}
+			payload := mustReadWebSocketJSON(t, conn)
+			if payload["type"] != "error" || payload["status_code"] != float64(http.StatusBadRequest) {
+				t.Fatalf("websocket response = %+v", payload)
+			}
+			if got := sends.Load(); got != 0 {
+				t.Fatalf("upstream sends = %d, want zero", got)
+			}
+
+			snapshot := h.stats.snapshot()
+			if len(snapshot.ByProvider) != 0 || len(snapshot.ByTarget) != 0 || len(snapshot.RecentAttempts) != 0 {
+				t.Fatalf("local rejection inferred physical topology: providers=%+v targets=%+v attempts=%+v", snapshot.ByProvider, snapshot.ByTarget, snapshot.RecentAttempts)
+			}
+			if len(snapshot.Recent) != 1 {
+				t.Fatalf("recent = %+v, want one rejected turn", snapshot.Recent)
+			}
+			recent := snapshot.Recent[0]
+			if recent.Provider != "" || recent.UpstreamRequestID != "" || recent.UpstreamSends != 0 {
+				t.Fatalf("local rejection leaked provider attribution: %+v", recent)
+			}
+		})
+	}
+}
+
 func TestResponsesWebSocketPrepareExplicitRouteOperationRejectsDisallowedModel(t *testing.T) {
 	handler := newOperationAdmissionTestHandler(t, providerTypeOpenAICompatible, []string{providerEndpointResponses}, "https://upstream.invalid")
 	handler.allowedModels = map[string]struct{}{"selected-model": {}}

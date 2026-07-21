@@ -225,7 +225,7 @@ func TestResolveStaticProviderModelHonorsFiltersAndRejectsCollisions(t *testing.
 	}
 }
 
-func TestResolveStaticProviderModelResolvesExplicitRouteMetadata(t *testing.T) {
+func TestResolveStaticProviderModelResolvesSchemaV2ExplicitRouteMetadata(t *testing.T) {
 	parallelToolCalls := true
 	contextWindow := int64(200000)
 	cfg := ProvidersConfig{
@@ -269,6 +269,31 @@ func TestResolveStaticProviderModelResolvesExplicitRouteMetadata(t *testing.T) {
 	if got.ParallelToolCalls == nil || !*got.ParallelToolCalls ||
 		got.ContextWindow == nil || *got.ContextWindow != contextWindow {
 		t.Fatalf("resolved route capabilities = %#v", got)
+	}
+}
+
+func TestResolveStaticProviderModelExcludesSchemaV2InternalRoute(t *testing.T) {
+	cfg := ProvidersConfig{
+		SchemaVersion: ProvidersConfigSchemaVersion2,
+		Providers: []ProviderConfig{{
+			ID:       "upstream",
+			Type:     "openai-compatible",
+			BaseURL:  "https://upstream.example.test/v1",
+			AuthType: "none",
+		}},
+		ModelRoutes: []ModelRouteConfig{{
+			ID:        "internal-route",
+			Exposure:  modelRouteExposureInternal,
+			Endpoints: []string{"/chat/completions"},
+			Targets: []ModelRouteTargetConfig{{
+				ID:            "primary",
+				Provider:      "upstream",
+				UpstreamModel: "physical-model",
+			}},
+		}},
+	}
+	if _, ok, err := ResolveStaticProviderModel(cfg, "internal-route"); err != nil || ok {
+		t.Fatalf("ResolveStaticProviderModel(internal) = ok %v, err %v; want false, nil", ok, err)
 	}
 }
 
@@ -1753,6 +1778,36 @@ func TestModelUsesCopilotFollowsSelectedStaticOwner(t *testing.T) {
 	}
 	if !defaultHandler.ModelUsesCopilot("any-model") {
 		t.Fatal("zero-config model did not require Copilot authentication")
+	}
+}
+
+func TestModelUsesCopilotTreatsPolicyEntryAsNonCopilotInMixedProviderConfig(t *testing.T) {
+	cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeOff)
+	cfg.Providers = append(cfg.Providers, ProviderConfig{ID: "copilot", Type: "copilot"})
+
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("coding-economy"),
+		WithDeferredDynamicProviderModelValidation(true),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	if h.ModelUsesCopilot("coding-economy") {
+		t.Fatal("policy public entry unexpectedly required Copilot authentication")
+	}
+	if !h.ModelUsesCopilot("copilot-direct") {
+		t.Fatal("direct unrestricted Copilot model did not require authentication")
+	}
+	setup := h.providerSetup()
+	copilot := setup.providerByID("copilot")
+	if h.providerMayExposeAllowedModel(copilot) {
+		t.Fatal("policy public entry kept unrelated Copilot provider in dynamic discovery scope")
+	}
+	if h.providerWithinAllowedModelScope(copilot) {
+		t.Fatal("policy public entry kept unrelated Copilot provider in readiness scope")
 	}
 }
 

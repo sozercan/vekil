@@ -211,7 +211,8 @@ type statsSnapshot struct {
 	RecentAttempts []recentRouteAttempt `json:"recent_attempts"`
 	// InsightsEnabled reports whether a model is configured for on-demand
 	// LLM-generated insights (drives the dashboard's "Generate insights" button).
-	InsightsEnabled bool `json:"insights_enabled"`
+	InsightsEnabled bool                `json:"insights_enabled"`
+	PolicyRouting   policyStatsSnapshot `json:"policy_routing"`
 }
 
 type secondBucket struct {
@@ -363,10 +364,11 @@ type recentRouteAttempt struct {
 type routeAttemptRecordState struct {
 	mu sync.Mutex
 
-	collector *statsCollector
-	targetKey string
-	recentIdx int
-	recordID  uint64
+	collector      *statsCollector
+	targetKey      string
+	recentIdx      int
+	recordID       uint64
+	policyRedacted bool
 
 	row                recentRouteAttempt
 	physicalAccounted  statsTokenUsage
@@ -474,8 +476,9 @@ type RouteAttemptObservation struct {
 
 	// operation and startedAt are route-executor-owned metadata. They stay
 	// unexported so callers cannot inject arbitrary trace state into /stats.json.
-	operation *routeOperation
-	startedAt time.Time
+	operation      *routeOperation
+	startedAt      time.Time
+	policyRedacted bool
 }
 
 // RecordUpstreamAttempt records one actual physical upstream dispatch for the
@@ -485,6 +488,13 @@ type RouteAttemptObservation struct {
 // only need the legacy aggregate side effect may ignore the return value.
 func (h *ProxyHandler) RecordUpstreamAttempt(ctx context.Context, attempt RouteAttemptObservation) *routeAttemptRecord {
 	summary := RequestSummaryFromContext(ctx)
+	if publicID := summary.policyPublicIDForStats(); publicID != "" {
+		attempt.RouteID = publicID
+		attempt.TargetID = publicID
+		attempt.ProviderID = ""
+		attempt.ProviderKind = ""
+		attempt.policyRedacted = true
+	}
 	if summary != nil {
 		summary.recordUpstreamAttempt(attempt.OperationID, attempt.RouteID, attempt.TargetID, attempt.ProviderID, attempt.ProviderKind)
 	}
@@ -522,7 +532,8 @@ func (c *statsCollector) beginRouteAttempt(summary *RequestSummary, attempt Rout
 	}
 
 	state := &routeAttemptRecordState{
-		collector: c,
+		collector:      c,
+		policyRedacted: attempt.policyRedacted,
 	}
 
 	c.mu.Lock()
@@ -606,7 +617,7 @@ func (r *routeAttemptRecord) complete(completion routeAttemptCompletion) {
 			row.RetryAfterSeconds = &value
 		}
 	}
-	if completion.UpstreamRequestID != "" {
+	if completion.UpstreamRequestID != "" && !state.policyRedacted {
 		row.UpstreamRequestID = completion.UpstreamRequestID
 	}
 	row.CleanupComplete = row.CleanupComplete || completion.CleanupComplete
@@ -649,6 +660,9 @@ func (r *routeAttemptRecord) reconcileTrace(trace routeAttemptTrace, version uin
 	}
 	state.traceVersion = version
 	row := applyRouteAttemptTrace(state.row, trace)
+	if state.policyRedacted {
+		row.UpstreamRequestID = ""
+	}
 	if row.ReportedUsage != nil && routeAttemptOutcomeIsWasted(row.Outcome) {
 		wastedDelta := statsTokenUsageDelta(*row.ReportedUsage, state.wastedAccounted)
 		state.wastedAccounted.add(wastedDelta)
@@ -863,7 +877,7 @@ func (c *statsCollector) record(summary *RequestSummary, status int, userAgent s
 // or an upstream error status for failed/non-200) so failures show up in error
 // counts and the recent log. Streamed turns carry no latency sample. Every turn
 // is counted as one request even with zero/absent usage, matching the HTTP path.
-func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, operationIDs ...string) responsesTurnStatsRecord {
+func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, policyPublicID string, operationIDs ...string) responsesTurnStatsRecord {
 	if status == 0 {
 		status = http.StatusOK
 	}
@@ -887,6 +901,13 @@ func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel s
 		total:       total,
 		cached:      usage.InputTokensDetails.CachedTokens,
 		reasoning:   usage.OutputTokensDetails.ReasoningTokens,
+	}
+	if policyPublicID = boundStatLabel(policyPublicID); policyPublicID != "" {
+		d.model = policyPublicID
+		d.routeID = policyPublicID
+		d.finalTarget = policyPublicID
+		d.provider = ""
+		d.kind = ""
 	}
 	agent := agentLabel
 	if agent == "" {
@@ -1580,6 +1601,14 @@ func readSummaryForStats(summary *RequestSummary) summaryStats {
 	d.operationID = boundOperationalStatLabel(summary.operationID)
 	d.routeID = boundOperationalStatLabel(summary.routeID)
 	d.finalTarget = boundOperationalStatLabel(summary.finalTarget)
+	if publicID := boundStatLabel(summary.policyPublicIDForStatsLocked()); publicID != "" {
+		d.model = publicID
+		d.routeID = publicID
+		d.finalTarget = publicID
+		d.provider = ""
+		d.kind = ""
+		d.upstreamID = ""
+	}
 	d.upstreamSends = summary.upstreamSendCount
 	d.targetSwitches = summary.targetSwitchCount
 	d.routeExhausted = summary.routeExhausted
@@ -1826,7 +1855,14 @@ func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel str
 	if h == nil || h.stats == nil {
 		return responsesTurnStatsRecord{}
 	}
-	return h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage, operationIDs...)
+	policyPublicID := ""
+	if publicID, ok := h.policyPublicModelID(model); ok {
+		policyPublicID = publicID
+		model = publicID
+		provider = ""
+		kind = ""
+	}
+	return h.stats.recordResponsesTurn(model, provider, kind, agentLabel, status, usage, policyPublicID, operationIDs...)
 }
 
 func (h *ProxyHandler) AddResponsesTurnUsage(record responsesTurnStatsRecord, usage responsesUsage) {
@@ -1842,8 +1878,12 @@ func (h *ProxyHandler) HandleStatsJSON(w http.ResponseWriter, r *http.Request) {
 	if h != nil && h.stats != nil {
 		snap = h.stats.snapshot()
 	}
+	snap.PolicyRouting = emptyPolicyStatsSnapshot()
 	if h != nil {
 		snap.InsightsEnabled = strings.TrimSpace(h.providersConfig.InsightModel) != ""
+		if controller, ok := h.policyRoutingController.(*chatPolicyRoutingController); ok {
+			snap.PolicyRouting = controller.PolicyStatsSnapshot()
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")

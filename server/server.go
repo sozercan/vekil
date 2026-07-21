@@ -34,8 +34,9 @@ type Server struct {
 }
 
 type options struct {
-	proxyOptions     []proxy.Option
-	inboundAuthToken string
+	proxyOptions                         []proxy.Option
+	inboundAuthToken                     string
+	policyRoutingAllowRemoteSingleTenant bool
 }
 
 type serverConnContextKey struct{}
@@ -55,6 +56,14 @@ func WithInboundAuthToken(token string) Option {
 func WithProxyOptions(opts ...proxy.Option) Option {
 	return func(o *options) {
 		o.proxyOptions = append(o.proxyOptions, opts...)
+	}
+}
+
+// WithPolicyRoutingAllowRemoteSingleTenant acknowledges that a policy-routing
+// server bound beyond loopback is operated as a trusted single-tenant service.
+func WithPolicyRoutingAllowRemoteSingleTenant(allow bool) Option {
+	return func(o *options) {
+		o.policyRoutingAllowRemoteSingleTenant = allow
 	}
 }
 
@@ -144,6 +153,13 @@ func (r *responseRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
 
+type startupReadinessGate interface {
+	StartupAuthenticationPending() bool
+	DynamicProviderValidationPending() bool
+	PolicyRoutingPreflightPending() bool
+	PolicyRoutingReadinessDiagnostic() string
+}
+
 func withInboundAuth(next http.Handler, token string) http.Handler {
 	token = strings.TrimSpace(token)
 	if token == "" {
@@ -172,12 +188,21 @@ func withInboundAuth(next http.Handler, token string) http.Handler {
 	})
 }
 
-func withProviderValidationGate(next http.Handler, handler *proxy.ProxyHandler) http.Handler {
+func withProviderValidationGate(next http.Handler, handler startupReadinessGate) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if handler != nil && (handler.StartupAuthenticationPending() || handler.DynamicProviderValidationPending()) && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" {
+		if handler != nil && (handler.StartupAuthenticationPending() || handler.DynamicProviderValidationPending() || handler.PolicyRoutingPreflightPending()) && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" {
 			message := "provider model validation pending"
-			if handler.StartupAuthenticationPending() {
+			switch {
+			case handler.StartupAuthenticationPending():
 				message = "startup authentication pending"
+			case handler.DynamicProviderValidationPending():
+				// Preserve provider-validation precedence when both startup
+				// validations are pending.
+			case handler.PolicyRoutingPreflightPending():
+				message = strings.TrimSpace(handler.PolicyRoutingReadinessDiagnostic())
+				if message == "" {
+					message = "policy routing preflight pending"
+				}
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -281,6 +306,9 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	if err != nil {
 		return nil, err
 	}
+	if err := validatePolicyRoutingListenHost(host, handler.PolicyRoutingActive(), cfg.policyRoutingAllowRemoteSingleTenant); err != nil {
+		return nil, err
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/messages/count_tokens", handler.HandleAnthropicMessagesCountTokens)
@@ -321,6 +349,24 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 		dynamicAddr:  strings.TrimSpace(port) == "0",
 		serveDone:    make(chan error, 1),
 	}, nil
+}
+
+func validatePolicyRoutingListenHost(host string, policyActive, allowRemoteSingleTenant bool) error {
+	if !policyActive || allowRemoteSingleTenant || isLoopbackListenHost(host) {
+		return nil
+	}
+	return fmt.Errorf("policy routing on non-loopback host %q requires --policy-routing-allow-remote-single-tenant", host)
+}
+
+func isLoopbackListenHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+		return true
+	}
+	host = strings.TrimPrefix(host, "[")
+	host = strings.TrimSuffix(host, "]")
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Start begins listening in a goroutine. It returns an error if the listener
@@ -380,6 +426,14 @@ func (s *Server) ValidateDynamicProviderModels(ctx context.Context) error {
 		return nil
 	}
 	return s.proxyHandler.ValidateDynamicProviderModels(ctx)
+}
+
+// InitializePolicyRouting performs any configured policy-routing preflight.
+func (s *Server) InitializePolicyRouting(ctx context.Context) error {
+	if s == nil || s.proxyHandler == nil {
+		return nil
+	}
+	return s.proxyHandler.InitializePolicyRouting(ctx)
 }
 
 // Stop performs a graceful shutdown of the server.

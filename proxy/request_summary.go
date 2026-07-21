@@ -17,27 +17,42 @@ type requestSummaryContextKey struct{}
 type RequestSummary struct {
 	mu sync.Mutex
 
-	endpoint          string
-	model             string
-	provider          string
-	providerKind      string
-	operationID       string
-	routeID           string
-	finalTarget       string
-	lastTarget        string
-	lastProvider      string
-	lastProviderKind  string
-	upstreamSendCount int64
-	targetSwitchCount int64
-	routeExhausted    bool
-	streamSet         bool
-	stream            bool
-	upstreamRequestID string
-	promptTokens      *int
-	completionTokens  *int
-	totalTokens       *int
-	cachedTokens      *int
-	reasoningTokens   *int
+	endpoint                  string
+	model                     string
+	provider                  string
+	providerKind              string
+	operationID               string
+	routeID                   string
+	policyPublicID            string
+	policyID                  string
+	policyMode                string
+	policyTier                string
+	policyDecision            string
+	policyFailureCategory     string
+	policyClassifierLatencyMS int64
+	policyMessageCount        int
+	policyToolCount           int
+	policyInputBytes          int
+	policyTruncated           bool
+	configGeneration          string
+	profileGeneration         string
+	classifierGeneration      string
+	binaryGeneration          string
+	finalTarget               string
+	lastTarget                string
+	lastProvider              string
+	lastProviderKind          string
+	upstreamSendCount         int64
+	targetSwitchCount         int64
+	routeExhausted            bool
+	streamSet                 bool
+	stream                    bool
+	upstreamRequestID         string
+	promptTokens              *int
+	completionTokens          *int
+	totalTokens               *int
+	cachedTokens              *int
+	reasoningTokens           *int
 	// extraPromptTokens / extraCompletionTokens accumulate out-of-band token
 	// spend that is separate from the turn's own reported usage — e.g. an
 	// internal /responses compaction call made while serving a 413 oversized-
@@ -137,6 +152,86 @@ func (s *RequestSummary) RouteID() string {
 	return s.routeID
 }
 
+// SetPolicyIdentity records the canonical public identity of a policy model
+// before a classifier decision exists. Unsupported protocol surfaces use this
+// path so request logging and traffic statistics stay attributed to the public
+// policy model without resolving or retaining terminal-provider topology.
+func (s *RequestSummary) SetPolicyIdentity(publicID string) {
+	if s == nil {
+		return
+	}
+	publicID = strings.TrimSpace(publicID)
+	if publicID == "" {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.policyPublicID = publicID
+	s.model = publicID
+	s.routeID = publicID
+	s.finalTarget = publicID
+	s.provider = ""
+	s.providerKind = ""
+	s.lastTarget = ""
+	s.lastProvider = ""
+	s.lastProviderKind = ""
+	s.upstreamRequestID = ""
+}
+
+// SetPolicyDecision records bounded, content-free routing provenance for a
+// policy-selected request. Generation values are hashes and never include
+// secrets or request content.
+func (s *RequestSummary) SetPolicyDecision(plan chatOperationPlan) {
+	if s == nil || strings.TrimSpace(plan.policyID) == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if publicID := strings.TrimSpace(plan.publicID); publicID != "" {
+		s.policyPublicID = publicID
+	}
+	s.policyID = plan.policyID
+	s.policyMode = plan.effectiveMode.String()
+	s.policyTier = plan.selectedTier.String()
+	s.policyDecision = plan.decision.Category
+	s.policyFailureCategory = plan.decision.FailureCategory
+	s.policyClassifierLatencyMS = plan.decision.ClassifierLatency
+	s.policyMessageCount = plan.decision.MessageCount
+	s.policyToolCount = plan.decision.ToolCount
+	s.policyInputBytes = plan.decision.InputBytes
+	s.policyTruncated = plan.decision.Truncated
+	s.configGeneration = plan.configGeneration
+	s.profileGeneration = plan.profileGeneration
+	s.classifierGeneration = plan.classifierGeneration
+	s.binaryGeneration = plan.binaryGeneration
+}
+
+func (s *RequestSummary) policyPublicIDForStats() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.policyPublicIDForStatsLocked()
+}
+
+func (s *RequestSummary) policyPublicIDForStatsLocked() string {
+	if s == nil {
+		return ""
+	}
+	if publicID := strings.TrimSpace(s.policyPublicID); publicID != "" {
+		return publicID
+	}
+	if strings.TrimSpace(s.policyID) == "" {
+		return ""
+	}
+	if publicID := strings.TrimSpace(s.routeID); publicID != "" {
+		return publicID
+	}
+	return strings.TrimSpace(s.model)
+}
+
 // SetFinalTarget records the final/canonical physical target selected for the
 // logical operation. Unlike operation and route IDs, the target is intentionally
 // replaceable because a later result-selection step can supersede an earlier
@@ -151,6 +246,10 @@ func (s *RequestSummary) SetFinalTarget(targetID string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.policyIdentityOnlyLocked() {
+		s.finalTarget = s.policyPublicID
+		return
+	}
 	s.finalTarget = targetID
 }
 
@@ -171,6 +270,12 @@ func (s *RequestSummary) setFinalRouteAttribution(targetID, provider, kind strin
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.policyIdentityOnlyLocked() {
+		s.finalTarget = s.policyPublicID
+		s.provider = ""
+		s.providerKind = ""
+		return
+	}
 	s.finalTarget = targetID
 	s.provider = provider
 	s.providerKind = kind
@@ -191,6 +296,13 @@ func (s *RequestSummary) setFinalRouteResult(targetID, provider, kind, upstreamR
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.policyIdentityOnlyLocked() {
+		s.finalTarget = s.policyPublicID
+		s.provider = ""
+		s.providerKind = ""
+		s.upstreamRequestID = ""
+		return
+	}
 	s.finalTarget = targetID
 	s.provider = strings.TrimSpace(provider)
 	s.providerKind = strings.TrimSpace(kind)
@@ -234,6 +346,12 @@ func (s *RequestSummary) recordUpstreamAttempt(operationID, routeID, targetID, p
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.policyIdentityOnlyLocked() {
+		routeID = s.policyPublicID
+		targetID = s.policyPublicID
+		provider = ""
+		kind = ""
+	}
 	if s.operationID == "" && operationID != "" {
 		s.operationID = operationID
 	}
@@ -343,6 +461,9 @@ func (s *RequestSummary) setProvider(provider, kind string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.policyIdentityOnlyLocked() {
+		return
+	}
 	if provider = strings.TrimSpace(provider); provider != "" {
 		s.provider = provider
 	}
@@ -361,7 +482,14 @@ func (s *RequestSummary) setUpstreamRequestID(requestID string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.policyIdentityOnlyLocked() {
+		return
+	}
 	s.upstreamRequestID = requestID
+}
+
+func (s *RequestSummary) policyIdentityOnlyLocked() bool {
+	return s != nil && strings.TrimSpace(s.policyPublicID) != "" && strings.TrimSpace(s.policyID) == ""
 }
 
 func (s *RequestSummary) setOpenAIUsage(usage *models.OpenAIUsage) {
@@ -480,12 +608,28 @@ func (s *RequestSummary) LoggerFields() []logger.Field {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	fields := make([]logger.Field, 0, 14)
+	fields := make([]logger.Field, 0, 30)
 	if s.operationID != "" {
 		fields = append(fields, logger.F("operation_id", s.operationID))
 	}
 	if s.routeID != "" {
 		fields = append(fields, logger.F("route_id", s.routeID))
+	}
+	if s.policyID != "" {
+		fields = append(fields, logger.F("policy_id", s.policyID))
+		fields = append(fields, logger.F("policy_mode", s.policyMode))
+		fields = append(fields, logger.F("policy_tier", s.policyTier))
+		fields = append(fields, logger.F("policy_decision", s.policyDecision))
+		fields = append(fields, logger.F("policy_failure_category", s.policyFailureCategory))
+		fields = append(fields, logger.F("policy_classifier_latency_ms", s.policyClassifierLatencyMS))
+		fields = append(fields, logger.F("policy_message_count", s.policyMessageCount))
+		fields = append(fields, logger.F("policy_tool_count", s.policyToolCount))
+		fields = append(fields, logger.F("policy_input_bytes", s.policyInputBytes))
+		fields = append(fields, logger.F("policy_truncated", s.policyTruncated))
+		fields = append(fields, logger.F("config_generation", s.configGeneration))
+		fields = append(fields, logger.F("profile_generation", s.profileGeneration))
+		fields = append(fields, logger.F("classifier_generation", s.classifierGeneration))
+		fields = append(fields, logger.F("binary_generation", s.binaryGeneration))
 	}
 	if s.finalTarget != "" {
 		fields = append(fields, logger.F("final_target", s.finalTarget))
@@ -536,12 +680,59 @@ func (h *ProxyHandler) observeRequestSummary(ctx context.Context, endpoint, mode
 	h.observeRequestSummaryWithProviderModel(ctx, endpoint, model, model, stream, providerEndpoint)
 }
 
+func (h *ProxyHandler) policyPublicModelID(model string) (string, bool) {
+	if h == nil {
+		return "", false
+	}
+	entry, known := h.providerSetup().lookupPublicModelEntry(model)
+	if !known || entry == nil || entry.kind != publicEntryPolicy {
+		return "", false
+	}
+	publicID := strings.TrimSpace(entry.id)
+	return publicID, publicID != ""
+}
+
+// observePolicyRequestSummary establishes canonical policy ownership as soon as
+// a protocol surface can identify the requested model. This must happen before
+// body-shape or endpoint validation so local rejections cannot fall through to
+// default-provider or unrouted statistics.
+func (h *ProxyHandler) observePolicyRequestSummary(ctx context.Context, endpoint, model string, stream bool) bool {
+	publicID, ok := h.policyPublicModelID(model)
+	if !ok {
+		return false
+	}
+	summary := RequestSummaryFromContext(ctx)
+	if summary == nil {
+		return true
+	}
+	summary.setRoute(endpoint, model, stream)
+	summary.SetPolicyIdentity(publicID)
+	return true
+}
+
 func (h *ProxyHandler) observeRequestSummaryWithProviderModel(ctx context.Context, endpoint, model, providerModel string, stream bool, providerEndpoint string) {
 	summary := RequestSummaryFromContext(ctx)
 	if summary == nil {
 		return
 	}
 	summary.setRoute(endpoint, model, stream)
+	if publicID, ok := h.policyPublicModelID(model); ok {
+		summary.SetPolicyIdentity(publicID)
+		return
+	}
+	providerModel = strings.TrimSpace(providerModel)
+	if providerModel == "" {
+		return
+	}
+	// Operational IDs for internal terminal/classifier routes are never public
+	// model identities. If a client guesses one, reject it without confirming
+	// the owning provider through logs or traffic statistics.
+	if route, known := h.providerSetup().lookupTerminalRoute(strings.TrimSpace(model)); known && route != nil && !route.isPublic() {
+		return
+	}
+	if route, known := h.providerSetup().lookupTerminalRoute(providerModel); known && route != nil && !route.isPublic() {
+		return
+	}
 	provider, _, _ := h.resolveProviderModelForRequest(providerModel, providerEndpoint)
 	if provider == nil {
 		return

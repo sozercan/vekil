@@ -23,7 +23,7 @@ Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Az
 - **Anthropic Messages API** — drop-in compatible with Claude clients
 - **Gemini API** — Generate Content, Stream Generate Content, and Count Tokens
 - **OpenAI Chat Completions** and **Responses** APIs, including optional Codex websocket bridging
-- **Multi-provider routing** across GitHub Copilot, Azure OpenAI, OpenAI Codex, and generic compatible providers; schema-v2 ordered failover is available for supported static Azure/generic targets
+- **Multi-provider routing** across GitHub Copilot, Azure OpenAI, OpenAI Codex, and generic compatible providers; schema v2 provides explicit routes, ordered failover, internal routes, and semantic policy routing
 - **Optional tool optimizers** for opt-in shell command rewrites and tool-output reduction across supported API surfaces; see [Tool Optimizers](docs/tool-optimizers.md)
 - **Codex compatibility shims** for compaction and memory summarization
 - **Streaming**, tool use, parallel tool calls, compressed request bodies, and auth/token caching
@@ -49,6 +49,8 @@ brew install --cask sozercan/repo/vekil
 > The app is not signed. Clear quarantine with `xattr -cr /Applications/Vekil.app`. Manual `vekil-macos-arm64.zip` downloads are also on [Releases](https://github.com/sozercan/vekil/releases/latest). See [Tray App (macOS/Linux)](docs/menubar.md).
 
 For explicit provider routing, start the proxy with `--providers-config /path/to/providers.{json,yaml}`.
+
+Schema-v2 policy routing defaults globally to `off`. V1 policy profiles support only text/function-tool `POST /v1/chat/completions` requests and one trusted user/tenant per deployment; see [Semantic Policy Routing](docs/policy-routing.md) before enabling `observe` or `enforce`.
 
 ### Launch a coding agent
 
@@ -97,6 +99,7 @@ Documentation lives under [`docs/`](docs/README.md); start with these:
 | [Getting Started](docs/getting-started.md)                   | Install, run, first auth            |
 | [Configuration](docs/configuration.md)                       | Config map and generic flags        |
 | [Provider Routing](docs/provider-routing.md)                 | Provider auth and route failover    |
+| [Semantic Policy Routing](docs/policy-routing.md)            | Schema-v2 policy selection and gates |
 | [Provider API Keys](docs/provider-api-keys.md)               | Where to get provider keys          |
 | [Tool Optimizers](docs/tool-optimizers.md)                   | Shell rewrite/output reduction      |
 | [Responses WebSocket](docs/responses-websocket.md)           | Websocket bridge tuning             |

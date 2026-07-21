@@ -1,6 +1,7 @@
 package launch
 
 import (
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -86,6 +87,31 @@ func TestCopilotAdapterSelectsChatCompletions(t *testing.T) {
 	prepared, err := (CopilotAdapter{}).Prepare(PrepareInput{
 		BaseURL:    "http://127.0.0.1:43210",
 		Model:      ModelInfo{ID: "chat-model", SupportedEndpoints: []string{"/chat/completions"}},
+		Binary:     binary,
+		LocalToken: "token",
+		DryRun:     true,
+	})
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if got := prepared.EnvSet["COPILOT_PROVIDER_WIRE_API"]; got != "completions" {
+		t.Fatalf("wire API = %q, want completions", got)
+	}
+}
+
+func TestCopilotAdapterAcceptsPolicyOwnedChatModel(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var model ModelInfo
+	if err := json.Unmarshal([]byte(`{"id":"policy-public","owned_by":"vekil-policy","supported_endpoints":["/chat/completions"]}`), &model); err != nil {
+		t.Fatalf("decode model metadata: %v", err)
+	}
+
+	prepared, err := (CopilotAdapter{}).Prepare(PrepareInput{
+		BaseURL:    "http://127.0.0.1:43210",
+		Model:      model,
 		Binary:     binary,
 		LocalToken: "token",
 		DryRun:     true,

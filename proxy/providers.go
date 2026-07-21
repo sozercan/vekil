@@ -62,44 +62,51 @@ var openAICodexProviderEndpoints = []string{providerEndpointResponses}
 // ProvidersConfig configures optional non-Copilot upstream providers.
 // When empty, the proxy keeps its legacy zero-config Copilot behavior.
 type ProvidersConfig struct {
-	SchemaVersion  int                  `json:"schema_version,omitempty" yaml:"schema_version,omitempty"`
-	Providers      []ProviderConfig     `json:"providers" yaml:"providers"`
-	ModelRoutes    []ModelRouteConfig   `json:"model_routes,omitempty" yaml:"model_routes,omitempty"`
-	ToolOptimizers ToolOptimizersConfig `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
+	SchemaVersion  int                   `json:"schema_version,omitempty" yaml:"schema_version,omitempty"`
+	Providers      []ProviderConfig      `json:"providers" yaml:"providers"`
+	ModelRoutes    []ModelRouteConfig    `json:"model_routes,omitempty" yaml:"model_routes,omitempty"`
+	PolicyProfiles []PolicyProfileConfig `json:"policy_profiles,omitempty" yaml:"policy_profiles,omitempty"`
+	ToolOptimizers ToolOptimizersConfig  `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
 	// InsightModel is the public model ID the dashboard uses to generate
 	// natural-language traffic insights on demand. Empty disables the feature
 	// (the dashboard's "Generate insights" button is hidden). The model must be
 	// one served by the configured providers.
 	InsightModel string `json:"insight_model,omitempty" yaml:"insight_model,omitempty"`
 
-	schemaVersionSet bool
-	modelRoutesSet   bool
+	schemaVersionSet  bool
+	modelRoutesSet    bool
+	policyProfilesSet bool
 }
 
 // ProviderConfig configures one upstream provider instance.
 type ProviderConfig struct {
-	ID                  string                      `json:"id" yaml:"id"`
-	Type                string                      `json:"type" yaml:"type"`
-	Default             bool                        `json:"default,omitempty" yaml:"default,omitempty"`
-	IncludeModels       []string                    `json:"include_models,omitempty" yaml:"include_models,omitempty"`
-	ExcludeModels       []string                    `json:"exclude_models,omitempty" yaml:"exclude_models,omitempty"`
-	BaseURL             string                      `json:"base_url,omitempty" yaml:"base_url,omitempty"`
-	AuthMode            string                      `json:"auth_mode,omitempty" yaml:"auth_mode,omitempty"`
-	APIKey              string                      `json:"api_key,omitempty" yaml:"api_key,omitempty"`
-	APIKeyEnv           string                      `json:"api_key_env,omitempty" yaml:"api_key_env,omitempty"`
-	APIVersion          string                      `json:"api_version,omitempty" yaml:"api_version,omitempty"`
-	TokenScope          string                      `json:"token_scope,omitempty" yaml:"token_scope,omitempty"`
-	AuthType            string                      `json:"auth_type,omitempty" yaml:"auth_type,omitempty"`
-	AuthHeader          string                      `json:"auth_header,omitempty" yaml:"auth_header,omitempty"`
-	AuthPrefix          string                      `json:"auth_prefix,omitempty" yaml:"auth_prefix,omitempty"`
-	ExtraHeaders        map[string]string           `json:"extra_headers,omitempty" yaml:"extra_headers,omitempty"`
-	ChatCompletionsPath string                      `json:"chat_completions_path,omitempty" yaml:"chat_completions_path,omitempty"`
-	ResponsesPath       string                      `json:"responses_path,omitempty" yaml:"responses_path,omitempty"`
-	MessagesPath        string                      `json:"messages_path,omitempty" yaml:"messages_path,omitempty"`
-	ModelsPath          string                      `json:"models_path,omitempty" yaml:"models_path,omitempty"`
-	ModelDiscovery      string                      `json:"model_discovery,omitempty" yaml:"model_discovery,omitempty"`
-	Headers             CopilotHeaderProfilesConfig `json:"headers,omitempty" yaml:"headers,omitempty"`
-	Models              []ProviderModelConfig       `json:"models,omitempty" yaml:"models,omitempty"`
+	ID                         string                      `json:"id" yaml:"id"`
+	Type                       string                      `json:"type" yaml:"type"`
+	Default                    bool                        `json:"default,omitempty" yaml:"default,omitempty"`
+	IncludeModels              []string                    `json:"include_models,omitempty" yaml:"include_models,omitempty"`
+	ExcludeModels              []string                    `json:"exclude_models,omitempty" yaml:"exclude_models,omitempty"`
+	BaseURL                    string                      `json:"base_url,omitempty" yaml:"base_url,omitempty"`
+	AuthMode                   string                      `json:"auth_mode,omitempty" yaml:"auth_mode,omitempty"`
+	APIKey                     string                      `json:"api_key,omitempty" yaml:"api_key,omitempty"`
+	APIKeyEnv                  string                      `json:"api_key_env,omitempty" yaml:"api_key_env,omitempty"`
+	APIVersion                 string                      `json:"api_version,omitempty" yaml:"api_version,omitempty"`
+	TokenScope                 string                      `json:"token_scope,omitempty" yaml:"token_scope,omitempty"`
+	AuthType                   string                      `json:"auth_type,omitempty" yaml:"auth_type,omitempty"`
+	AuthHeader                 string                      `json:"auth_header,omitempty" yaml:"auth_header,omitempty"`
+	AuthPrefix                 string                      `json:"auth_prefix,omitempty" yaml:"auth_prefix,omitempty"`
+	ExtraHeaders               map[string]string           `json:"extra_headers,omitempty" yaml:"extra_headers,omitempty"`
+	ChatCompletionsPath        string                      `json:"chat_completions_path,omitempty" yaml:"chat_completions_path,omitempty"`
+	ResponsesPath              string                      `json:"responses_path,omitempty" yaml:"responses_path,omitempty"`
+	MessagesPath               string                      `json:"messages_path,omitempty" yaml:"messages_path,omitempty"`
+	ModelsPath                 string                      `json:"models_path,omitempty" yaml:"models_path,omitempty"`
+	ModelDiscovery             string                      `json:"model_discovery,omitempty" yaml:"model_discovery,omitempty"`
+	TrustDomain                string                      `json:"trust_domain,omitempty" yaml:"trust_domain,omitempty"`
+	ClassifierNoStoreSupported *bool                       `json:"classifier_no_store_supported,omitempty" yaml:"classifier_no_store_supported,omitempty"`
+	Headers                    CopilotHeaderProfilesConfig `json:"headers,omitempty" yaml:"headers,omitempty"`
+	Models                     []ProviderModelConfig       `json:"models,omitempty" yaml:"models,omitempty"`
+
+	trustDomainSet                bool
+	classifierNoStoreSupportedSet bool
 }
 
 // ProviderModelConfig maps a public model ID exposed by this proxy to the
@@ -120,28 +127,30 @@ type ProviderModelConfig struct {
 }
 
 type providerRuntime struct {
-	id             string
-	kind           providerType
-	isDefault      bool
-	baseURL        string
-	authMode       providerAuthMode
-	apiKey         string
-	apiVersion     string
-	tokenScope     string
-	azureToken     azureTokenSource
-	authType       providerAuthType
-	authHeader     string
-	authPrefix     string
-	extraHeaders   http.Header
-	paths          providerEndpointPaths
-	modelDiscovery providerModelDiscovery
-	includeModels  map[string]struct{}
-	excludeModels  map[string]struct{}
-	staticModels   map[string]providerModel
-	staticConfigs  map[string]ProviderModelConfig
-	staticOrder    []string
-	codexAuth      *openAICodexAuth
-	headerProfiles CopilotHeaderProfilesConfig
+	id                         string
+	kind                       providerType
+	isDefault                  bool
+	baseURL                    string
+	authMode                   providerAuthMode
+	apiKey                     string
+	apiVersion                 string
+	tokenScope                 string
+	azureToken                 azureTokenSource
+	authType                   providerAuthType
+	authHeader                 string
+	authPrefix                 string
+	extraHeaders               http.Header
+	paths                      providerEndpointPaths
+	modelDiscovery             providerModelDiscovery
+	trustDomain                string
+	classifierNoStoreSupported *bool
+	includeModels              map[string]struct{}
+	excludeModels              map[string]struct{}
+	staticModels               map[string]providerModel
+	staticConfigs              map[string]ProviderModelConfig
+	staticOrder                []string
+	codexAuth                  *openAICodexAuth
+	headerProfiles             CopilotHeaderProfilesConfig
 }
 
 type providerEndpointPaths struct {
@@ -274,13 +283,19 @@ func ResolveStaticProviderModel(cfg ProvidersConfig, modelID string) (ProviderMo
 	if modelID == "" {
 		return ProviderModelConfig{}, false, nil
 	}
-	if cfg.EffectiveSchemaVersion() == ProvidersConfigSchemaVersion2 {
+	schemaVersion := cfg.EffectiveSchemaVersion()
+	if schemaVersion != ProvidersConfigSchemaVersion1 {
 		validated, err := validateAndNormalizeProvidersConfig(cfg)
 		if err != nil {
 			return ProviderModelConfig{}, false, err
 		}
 		cfg = validated.config
+	}
+	if schemaVersion == ProvidersConfigSchemaVersion2 {
 		for _, route := range cfg.ModelRoutes {
+			if route.Exposure != modelRouteExposurePublic {
+				continue
+			}
 			if strings.TrimSpace(route.PublicID) != modelID {
 				continue
 			}
@@ -402,7 +417,7 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".yaml", ".yml":
-		allowMergeKeys := sniffProvidersConfigSchemaVersionYAML(body) != ProvidersConfigSchemaVersion2
+		allowMergeKeys := !providersConfigSchemaUsesStrictDecoding(sniffProvidersConfigSchemaVersionYAML(body))
 		if err := rejectDuplicateYAMLMappingKeys(body, allowMergeKeys); err != nil {
 			return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
 		}
@@ -429,6 +444,8 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 		}
 		cfg.schemaVersionSet = present["schema_version"]
 		cfg.modelRoutesSet = present["model_routes"]
+		cfg.policyProfilesSet = present["policy_profiles"]
+		markYAMLProvidersConfigFieldPresence(body, cfg)
 	default:
 		if err := rejectDuplicateJSONMappingKeys(body); err != nil {
 			return fmt.Errorf("decode providers config %q as JSON: %w", path, err)
@@ -454,6 +471,8 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 		}
 		cfg.schemaVersionSet = present["schema_version"]
 		cfg.modelRoutesSet = present["model_routes"]
+		cfg.policyProfilesSet = present["policy_profiles"]
+		markJSONProvidersConfigFieldPresence(body, cfg)
 	}
 	return nil
 }
@@ -497,6 +516,11 @@ func (h *ProxyHandler) providerSetup() *providerSetup {
 		return h.providersState
 	}
 	return defaultProviderSetup(h)
+}
+
+func (h *ProxyHandler) hasClosedConfiguredModelRegistry() bool {
+	setup := h.providerSetup()
+	return setup != nil && setup.hasConfiguredState && strings.TrimSpace(setup.defaultProviderID) == "" && setup.routeRegistry() != nil
 }
 
 func (ps *providerSetup) defaultProvider() *providerRuntime {
@@ -713,12 +737,19 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 	if err != nil {
 		return nil, err
 	}
+	policyEntries, err := compilePolicyPublicModelEntries(cfg)
+	if err != nil {
+		return nil, err
+	}
 	routes, err := newModelRouteRegistry(explicitRoutes)
 	if err != nil {
 		return nil, err
 	}
-	if cfg.EffectiveSchemaVersion() == ProvidersConfigSchemaVersion2 {
+	if providersConfigSchemaUsesStrictDecoding(cfg.EffectiveSchemaVersion()) {
 		routes.setStrictAliases(true)
+	}
+	if err := routes.setPolicyEntries(policyEntries); err != nil {
+		return nil, err
 	}
 	setup := &providerSetup{
 		providers:          providers,
@@ -805,8 +836,9 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 
 // providerMayExposeAllowedModel reports whether provider must participate in
 // allowed-model discovery. Unlike providerWithinAllowedModelScope, it ignores
-// current ownership so every dynamic candidate is checked for collisions
-// before the selected model is trusted.
+// current ownership so dynamic candidates are checked for collisions before the
+// selected model is trusted. Explicitly reserved policy owners are the exception:
+// managed launches do not discover unrelated providers for those IDs.
 func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) bool {
 	if provider == nil {
 		return false
@@ -814,7 +846,14 @@ func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) 
 	if len(h.allowedModels) == 0 {
 		return true
 	}
+	setup := h.providerSetup()
 	for model := range h.allowedModels {
+		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+			// A policy public ID is an explicit reserved owner in launcher scope.
+			// Unrelated dynamic providers cannot displace it and must not force
+			// provider discovery or credentials for the managed launch.
+			continue
+		}
 		if providerCanExposeModel(provider, model) {
 			return true
 		}
@@ -831,6 +870,11 @@ func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime
 	}
 	setup := h.providerSetup()
 	for model := range h.allowedModels {
+		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+			// Policy readiness is owned by the policy preflight, not by unrelated
+			// dynamic-provider catalogs.
+			continue
+		}
 		if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
 			for _, target := range route.targets {
 				if target.provider != nil && target.provider.id == provider.id {
@@ -888,7 +932,7 @@ func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*provider
 	copilotProviders := 0
 
 	for providerIndex, raw := range cfg.Providers {
-		if validated.schemaVersion == ProvidersConfigSchemaVersion2 {
+		if providersConfigSchemaUsesStrictDecoding(validated.schemaVersion) {
 			if err := validateProviderRuntimeEnvironment(raw, providerIndex); err != nil {
 				return nil, nil, "", err
 			}
@@ -896,7 +940,7 @@ func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*provider
 		_, allowEmptyStaticModels := validated.routeReferencedProviders[strings.TrimSpace(raw.ID)]
 		provider, err := buildProviderRuntimeForProvidersConfig(raw, h.copilotURL, h.azureIdentityTokenSourceFactory, allowEmptyStaticModels)
 		if err != nil {
-			if validated.schemaVersion == ProvidersConfigSchemaVersion2 {
+			if providersConfigSchemaUsesStrictDecoding(validated.schemaVersion) {
 				return nil, nil, "", configPathError(fmt.Sprintf("providers[%d]", providerIndex), "%v", err)
 			}
 			return nil, nil, "", err
@@ -938,7 +982,9 @@ func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*provider
 				}
 			}
 		default:
-			return nil, nil, "", fmt.Errorf("multiple providers configured but no default provider selected")
+			if !validated.defaultProviderOptional {
+				return nil, nil, "", fmt.Errorf("multiple providers configured but no default provider selected")
+			}
 		}
 	}
 
@@ -967,15 +1013,17 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 	}
 
 	runtime := &providerRuntime{
-		id:             id,
-		kind:           kind,
-		isDefault:      cfg.Default,
-		paths:          providerEndpointPolicyFor(kind).defaultEndpointPaths(),
-		modelDiscovery: providerModelDiscoveryStatic,
-		includeModels:  make(map[string]struct{}, len(cfg.IncludeModels)),
-		excludeModels:  make(map[string]struct{}, len(cfg.ExcludeModels)),
-		staticModels:   make(map[string]providerModel, len(cfg.Models)),
-		staticConfigs:  make(map[string]ProviderModelConfig, len(cfg.Models)),
+		id:                         id,
+		kind:                       kind,
+		isDefault:                  cfg.Default,
+		paths:                      providerEndpointPolicyFor(kind).defaultEndpointPaths(),
+		modelDiscovery:             providerModelDiscoveryStatic,
+		trustDomain:                strings.TrimSpace(cfg.TrustDomain),
+		classifierNoStoreSupported: cloneBoolPtr(cfg.ClassifierNoStoreSupported),
+		includeModels:              make(map[string]struct{}, len(cfg.IncludeModels)),
+		excludeModels:              make(map[string]struct{}, len(cfg.ExcludeModels)),
+		staticModels:               make(map[string]providerModel, len(cfg.Models)),
+		staticConfigs:              make(map[string]ProviderModelConfig, len(cfg.Models)),
 	}
 
 	for _, included := range cfg.IncludeModels {
@@ -1548,6 +1596,9 @@ func (h *ProxyHandler) resolveProviderModel(model, endpoint string) (*providerRu
 	}
 
 	setup := h.providerSetup()
+	if provider, owner, reserved := setup.resolveReservedModelIdentity(model); reserved {
+		return provider, owner, true
+	}
 	defaultProvider := setup.defaultProvider()
 	if defaultProvider == nil {
 		return nil, providerModel{}, false
@@ -1559,6 +1610,67 @@ func (h *ProxyHandler) resolveProviderModel(model, endpoint string) (*providerRu
 		providerID:         defaultProvider.id,
 		supportedEndpoints: nil,
 	}, false
+}
+
+var reservedModelIdentityEndpoints = []string{"__vekil_reserved_model_identity__"}
+
+func (ps *providerSetup) resolveReservedModelIdentity(model string) (*providerRuntime, providerModel, bool) {
+	if ps == nil {
+		return nil, providerModel{}, false
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil, providerModel{}, false
+	}
+
+	var route *modelRoute
+	if entry, ok := ps.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+		profile := entry.policyConfig
+		routeID := profile.LightweightRoute
+		if profile.BaselineTier == policyConfigTierPowerful {
+			routeID = profile.PowerfulRoute
+		}
+		route, _ = ps.lookupTerminalRoute(routeID)
+	} else if registry := ps.routeRegistry(); registry != nil && registry.publicEntries != nil {
+		if entry, ok := registry.publicEntries.lookupPolicyID(model); ok && entry != nil {
+			profile := entry.policyConfig
+			routeID := profile.LightweightRoute
+			if profile.BaselineTier == policyConfigTierPowerful {
+				routeID = profile.PowerfulRoute
+			}
+			route, _ = ps.lookupTerminalRoute(routeID)
+		} else {
+			route, _ = ps.lookupTerminalRoute(model)
+		}
+	} else {
+		route, _ = ps.lookupTerminalRoute(model)
+	}
+	if route == nil {
+		return nil, providerModel{}, false
+	}
+
+	target, _ := route.primaryTarget()
+	provider := target.provider
+	if provider == nil {
+		provider = ps.defaultProvider()
+	}
+	if provider == nil {
+		for _, providerID := range ps.providerOrder {
+			if candidate := ps.providerByID(providerID); candidate != nil {
+				provider = candidate
+				break
+			}
+		}
+	}
+	owner := providerModel{
+		publicID:           model,
+		providerID:         "vekil-internal",
+		supportedEndpoints: append([]string(nil), reservedModelIdentityEndpoints...),
+	}
+	if provider != nil {
+		owner.providerID = provider.id
+	}
+	return provider, owner, true
 }
 
 func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
@@ -1589,6 +1701,11 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 func (h *ProxyHandler) ModelUsesCopilot(model string) bool {
 	setup := h.providerSetup()
 	model = strings.TrimSpace(model)
+	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+		// Policy destinations and classifiers cannot be Copilot providers. The
+		// reserved policy owner therefore never requires Copilot authentication.
+		return false
+	}
 	if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
 		for _, target := range route.targets {
 			if target.provider != nil && target.provider.kind == providerTypeCopilot {
@@ -1616,6 +1733,7 @@ func modelNotAllowedRequestError(model string) error {
 		statusCode: http.StatusBadRequest,
 		err:        fmt.Errorf("model %q is not allowed by this proxy", strings.TrimSpace(model)),
 	}
+
 }
 
 func (h *ProxyHandler) resolveProviderModelForRequest(model, endpoint string) (*providerRuntime, providerModel, bool) {
