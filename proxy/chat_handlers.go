@@ -1465,6 +1465,18 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		logger.F("tools", len(req.Tools)),
 	)
 
+	provider, _, known := h.resolveProviderModelForRequest(req.Model, providerEndpointMessages)
+	if strings.TrimSpace(req.Model) != "" && !known && providerUsesDynamicModels(provider) {
+		if err := h.refreshUnknownChatRouteProvider(r.Context(), provider); err != nil {
+			if h.handleShutdownError(w, r, r.Context(), err) {
+				return
+			}
+			statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+			writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
+			return
+		}
+	}
+
 	directAnthropic := h.shouldForwardAnthropicMessagesDirect(req.Model)
 	providerEndpoint := providerEndpointChatCompletions
 	providerModel := req.Model

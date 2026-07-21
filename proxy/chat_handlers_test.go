@@ -24,7 +24,7 @@ func TestHandleAnthropicMessages_CopilotNativeMessages(t *testing.T) {
 			case r.Method == http.MethodGet && r.URL.Path == providerEndpointModels:
 				modelFetches++
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"claude-sonnet-5","supported_endpoints":["/chat/completions","/v1/messages"]},{"id":"claude-chat-only","supported_endpoints":["/chat/completions"]}]}`)
+				_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"claude-sonnet-5","supported_endpoints":["/chat/completions","/v1/messages"]},{"id":"claude-chat-only","supported_endpoints":["/chat/completions"]},{"id":"claude-no-endpoints"}]}`)
 			case r.Method == http.MethodPost && r.URL.Path == providerEndpointMessages:
 				messagesPosts++
 				if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
@@ -49,28 +49,6 @@ func TestHandleAnthropicMessages_CopilotNativeMessages(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewProxyHandler() error = %v", err)
 		}
-		modelsReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-		modelsWriter := httptest.NewRecorder()
-		handler.HandleModels(modelsWriter, modelsReq)
-		if modelsWriter.Code != http.StatusOK {
-			t.Fatalf("models status = %d, want 200: %s", modelsWriter.Code, modelsWriter.Body.String())
-		}
-		owner, known := handler.providerSetup().lookupModel("claude-sonnet-5")
-		if !known {
-			t.Fatal("claude-sonnet-5 was not loaded from the Copilot catalog")
-		}
-		if !supportsEndpoint(owner.supportedEndpoints, providerEndpointMessages) {
-			t.Fatalf("discovered endpoints = %v, want /v1/messages", owner.supportedEndpoints)
-		}
-		if !handler.shouldForwardAnthropicMessagesDirect("claude-sonnet-5") {
-			t.Fatal("Copilot model advertising /v1/messages did not select direct forwarding")
-		}
-		if handler.shouldForwardAnthropicMessagesDirect("claude-chat-only") {
-			t.Fatal("Chat-only Copilot model selected direct Messages forwarding")
-		}
-		if handler.shouldForwardAnthropicMessagesDirect("claude-unknown") {
-			t.Fatal("unknown Copilot model selected direct Messages forwarding")
-		}
 
 		req := httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(`{
 			"model":"claude-sonnet-5",
@@ -85,11 +63,31 @@ func TestHandleAnthropicMessages_CopilotNativeMessages(t *testing.T) {
 
 		handler.HandleAnthropicMessages(w, req)
 
+		if modelFetches != 1 || messagesPosts != 1 || chatPosts != 0 {
+			t.Fatalf("upstream requests models/messages/chat = %d/%d/%d, want 1/1/0", modelFetches, messagesPosts, chatPosts)
+		}
 		if w.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
 		}
-		if modelFetches != 1 || messagesPosts != 1 || chatPosts != 0 {
-			t.Fatalf("upstream requests models/messages/chat = %d/%d/%d, want 1/1/0", modelFetches, messagesPosts, chatPosts)
+
+		owner, known := handler.providerSetup().lookupModel("claude-sonnet-5")
+		if !known {
+			t.Fatal("claude-sonnet-5 was not loaded from the Copilot catalog")
+		}
+		if !supportsEndpoint(owner.supportedEndpoints, providerEndpointMessages) {
+			t.Fatalf("discovered endpoints = %v, want /v1/messages", owner.supportedEndpoints)
+		}
+		if !handler.shouldForwardAnthropicMessagesDirect("claude-sonnet-5") {
+			t.Fatal("Copilot model advertising /v1/messages did not select direct forwarding")
+		}
+		if handler.shouldForwardAnthropicMessagesDirect("claude-chat-only") {
+			t.Fatal("Chat-only Copilot model selected direct Messages forwarding")
+		}
+		if handler.shouldForwardAnthropicMessagesDirect("claude-no-endpoints") {
+			t.Fatal("Copilot model without advertised endpoints selected direct Messages forwarding")
+		}
+		if handler.shouldForwardAnthropicMessagesDirect("claude-unknown") {
+			t.Fatal("unknown Copilot model selected direct Messages forwarding")
 		}
 		if upstreamReq.Stream {
 			t.Fatal("upstream stream = true, want the client's non-streaming request preserved")
