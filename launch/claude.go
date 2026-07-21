@@ -82,8 +82,6 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		"CLAUDE_CODE_OAUTH_TOKEN",
 		"CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
 		"CLAUDE_CODE_OAUTH_SCOPES",
-		"ANTHROPIC_SMALL_FAST_MODEL",
-		"ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
 		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
 		"CLAUDE_AUTO_BACKGROUND_TASKS",
 		"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
@@ -105,6 +103,12 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		"ANTHROPIC_AWS_WORKSPACE_ID",
 		"ANTHROPIC_AWS_API_KEY",
 		"AWS_BEARER_TOKEN_BEDROCK",
+	}
+	if hasModel {
+		envUnset = append(envUnset,
+			"ANTHROPIC_SMALL_FAST_MODEL",
+			"ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+		)
 	}
 	envUnset = mergeEnvironmentKeys(commonAgentCredentialEnvironment, envUnset, input.SensitiveEnv)
 
