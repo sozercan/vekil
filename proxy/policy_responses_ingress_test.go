@@ -376,6 +376,78 @@ func TestPolicyResponsesChatUpstreamErrorDrainsAndClosesBody(t *testing.T) {
 	}
 }
 
+func TestPolicyResponsesIngressRejectsMalformedTerminalCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		requestBody    string
+		upstreamStream bool
+		contentType    string
+		responseBody   string
+	}{
+		{
+			name:         "non-streaming missing finish reason",
+			requestBody:  `{"model":"coding-economy","input":"hello","store":false}`,
+			contentType:  "application/json",
+			responseBody: `{"id":"chat-missing-finish","object":"chat.completion","created":1,"model":"light-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`,
+		},
+		{
+			name:           "streaming missing finish reason",
+			requestBody:    `{"model":"coding-economy","input":"hello","store":false,"stream":true}`,
+			upstreamStream: true,
+			contentType:    "text/event-stream",
+			responseBody: "data: {\"id\":\"chat-missing-finish\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}\n\n" +
+				"data: {\"id\":\"chat-missing-finish\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n" +
+				"data: [DONE]\n\n",
+		},
+		{
+			name:           "streaming non-function tool call",
+			requestBody:    `{"model":"coding-economy","input":"use lookup","store":false,"stream":true,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`,
+			upstreamStream: true,
+			contentType:    "text/event-stream",
+			responseBody: "data: {\"id\":\"chat-custom-call\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-custom\",\"type\":\"custom\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+				"data: {\"id\":\"chat-custom-call\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+				"data: {\"id\":\"chat-custom-call\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n" +
+				"data: [DONE]\n\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer func() { _ = r.Body.Close() }()
+				var request models.OpenAIRequest
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				gotStream := request.Stream != nil && *request.Stream
+				if gotStream != tc.upstreamStream {
+					t.Errorf("upstream stream = %v, want %v", gotStream, tc.upstreamStream)
+				}
+				w.Header().Set("Content-Type", tc.contentType)
+				_, _ = fmt.Fprint(w, tc.responseBody)
+			}))
+			defer upstream.Close()
+
+			h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+				WithProvidersConfig(policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)),
+				WithPolicyRoutingMode(PolicyRoutingModeOff),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			recorder := httptest.NewRecorder()
+			h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(tc.requestBody)))
+
+			if recorder.Code != http.StatusBadGateway {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			body := recorder.Body.String()
+			if !strings.Contains(body, "failed to translate policy response") || strings.Contains(body, `"type":"function_call"`) || strings.Contains(body, "call-custom") {
+				t.Fatalf("unsafe policy translation error: %s", body)
+			}
+		})
+	}
+}
+
 func TestPolicyResponsesIngressSanitizesTerminalFailure(t *testing.T) {
 	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
 	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})

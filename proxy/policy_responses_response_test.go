@@ -155,6 +155,56 @@ func TestPolicyResponsesTextOutputCanBeReplayedAsStatelessInput(t *testing.T) {
 	}
 }
 
+func TestPolicyResponsesRejectsMalformedTerminalFinishReason(t *testing.T) {
+	call := models.OpenAIToolCall{
+		ID:   "call-lookup",
+		Type: "function",
+		Function: models.OpenAIFunctionCall{
+			Name:      "lookup",
+			Arguments: `{}`,
+		},
+	}
+	tools := policyResponsesToolMap{"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction}}
+	for _, tc := range []struct {
+		name            string
+		finishReason    string
+		hasFinishReason bool
+		withCall        bool
+		wantError       string
+	}{
+		{name: "missing", wantError: "no finish reason"},
+		{name: "empty", finishReason: "  ", hasFinishReason: true, wantError: "no finish reason"},
+		{name: "unknown", finishReason: "mystery", hasFinishReason: true, wantError: "unsupported finish reason"},
+		{name: "stop with call", finishReason: "stop", hasFinishReason: true, withCall: true, wantError: "function calls with finish reason"},
+		{name: "tool calls without call", finishReason: "tool_calls", hasFinishReason: true, wantError: "without function calls"},
+		{name: "legacy function call without call", finishReason: "function_call", hasFinishReason: true, wantError: "without function calls"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var finishReason *string
+			if tc.hasFinishReason {
+				value := tc.finishReason
+				finishReason = &value
+			}
+			var calls []models.OpenAIToolCall
+			if tc.withCall {
+				calls = []models.OpenAIToolCall{call}
+			}
+			_, err := buildPolicyResponsesResponse(&models.OpenAIResponse{Choices: []models.OpenAIChoice{{
+				Index: 0,
+				Message: models.OpenAIMessage{
+					Role:      "assistant",
+					Content:   json.RawMessage(`"ok"`),
+					ToolCalls: calls,
+				},
+				FinishReason: finishReason,
+			}}}, "policy", tools)
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("error = %v, want %q", err, tc.wantError)
+			}
+		})
+	}
+}
+
 func TestPolicyResponsesIncompleteDoesNotCompleteOrDispatchPartialToolCall(t *testing.T) {
 	for _, tc := range []struct {
 		finishReason string
@@ -264,6 +314,47 @@ func TestPolicyResponsesRejectsTerminalCallsOutsideRequestCapability(t *testing.
 		})
 		if err == nil || !strings.Contains(err.Error(), "duplicate function call ID") {
 			t.Fatalf("error = %v", err)
+		}
+	})
+	for _, callType := range []string{"custom", "Function", " ", " function "} {
+		t.Run("unsupported tool call type "+callType, func(t *testing.T) {
+			invalid := call("call-invalid", "lookup")
+			invalid.Type = callType
+			_, err := buildPolicyResponsesResponse(completion(invalid), "policy", policyResponsesToolMap{
+				"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction},
+			})
+			if err == nil || !strings.Contains(err.Error(), "unsupported tool call type") {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+	t.Run("omitted tool call type on wire", func(t *testing.T) {
+		var omitted models.OpenAIResponse
+		if err := json.Unmarshal([]byte(`{"choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"call-omitted","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`), &omitted); err != nil {
+			t.Fatal(err)
+		}
+		response, err := buildPolicyResponsesResponse(&omitted, "policy", policyResponsesToolMap{
+			"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(response.Output) != 1 || response.Output[0]["type"] != "function_call" {
+			t.Fatalf("output = %+v", response.Output)
+		}
+	})
+	t.Run("legacy function call finish reason", func(t *testing.T) {
+		legacyFinishReason := "function_call"
+		response, err := buildPolicyResponsesResponse(&models.OpenAIResponse{Choices: []models.OpenAIChoice{{
+			Index: 0, Message: models.OpenAIMessage{Role: "assistant", ToolCalls: []models.OpenAIToolCall{call("call-legacy", "lookup")}}, FinishReason: &legacyFinishReason,
+		}}}, "policy", policyResponsesToolMap{
+			"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(response.Output) != 1 || response.Output[0]["call_id"] != "call-legacy" {
+			t.Fatalf("output = %+v", response.Output)
 		}
 	})
 }

@@ -77,15 +77,29 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 	if response.Model == "" {
 		response.Model = strings.TrimSpace(completion.Model)
 	}
+	finishReason := ""
 	if choice.FinishReason != nil {
-		switch strings.TrimSpace(*choice.FinishReason) {
-		case "length":
-			response.Status = "incomplete"
-			response.IncompleteDetails = map[string]any{"reason": "max_output_tokens"}
-		case "content_filter":
-			response.Status = "incomplete"
-			response.IncompleteDetails = map[string]any{"reason": "content_filter"}
+		finishReason = strings.TrimSpace(*choice.FinishReason)
+	}
+	switch finishReason {
+	case "stop":
+		if len(choice.Message.ToolCalls) > 0 {
+			return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned function calls with finish reason %q", finishReason)
 		}
+	case "tool_calls", "function_call":
+		if len(choice.Message.ToolCalls) == 0 {
+			return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned finish reason %q without function calls", finishReason)
+		}
+	case "length":
+		response.Status = "incomplete"
+		response.IncompleteDetails = map[string]any{"reason": "max_output_tokens"}
+	case "content_filter":
+		response.Status = "incomplete"
+		response.IncompleteDetails = map[string]any{"reason": "content_filter"}
+	case "":
+		return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned no finish reason")
+	default:
+		return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned unsupported finish reason %q", finishReason)
 	}
 
 	text, textPresent, err := policyResponsesTextFromChatContent(choice.Message.Content)
@@ -117,9 +131,12 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 	// Never expose a function call as executable when Chat terminated before a
 	// complete answer. Codex consumes output_item.done calls before the terminal
 	// event, so a length/content-filter truncation must not dispatch partial JSON.
-	if response.Status == "completed" {
+	if finishReason == "tool_calls" || finishReason == "function_call" {
 		seenCallIDs := make(map[string]struct{}, len(choice.Message.ToolCalls))
 		for _, call := range choice.Message.ToolCalls {
+			if call.Type != "" && call.Type != policyResponsesToolKindFunction {
+				return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned unsupported tool call type %q", call.Type)
+			}
 			callID := strings.TrimSpace(call.ID)
 			if callID == "" {
 				callID = newPolicyResponsesID("call")
