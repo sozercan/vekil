@@ -1344,7 +1344,7 @@ func TestRunLaunchCommandDryRunUsesPolicyOwnershipMetadata(t *testing.T) {
 	}
 	providersPath := writeStaticPolicyLaunchProvidersConfig(t)
 
-	t.Run("Claude rejects policy model", func(t *testing.T) {
+	t.Run("Claude resolves policy Chat compatibility", func(t *testing.T) {
 		var stderr bytes.Buffer
 		code := runLaunchCommand([]string{
 			"claude",
@@ -1353,11 +1353,28 @@ func TestRunLaunchCommandDryRunUsesPolicyOwnershipMetadata(t *testing.T) {
 			"--binary", binary,
 			"--dry-run",
 		}, &stderr)
-		if code != 1 {
-			t.Fatalf("runLaunchCommand() code = %d, want 1; stderr=%s", code, stderr.String())
+		if code != 0 {
+			t.Fatalf("runLaunchCommand() code = %d; stderr=%s", code, stderr.String())
 		}
-		if !strings.Contains(stderr.String(), "policy") || !strings.Contains(stderr.String(), "Anthropic ingress") {
-			t.Fatalf("dry-run missing policy-model Anthropic-ingress rejection: %s", stderr.String())
+		if !strings.Contains(stderr.String(), "ANTHROPIC_MODEL=policy-launch-test") || strings.Contains(stderr.String(), "unresolved:") {
+			t.Fatalf("dry-run did not resolve policy Claude compatibility: %s", stderr.String())
+		}
+	})
+
+	t.Run("Codex resolves policy Responses compatibility", func(t *testing.T) {
+		var stderr bytes.Buffer
+		code := runLaunchCommand([]string{
+			"codex",
+			"--providers-config", providersPath,
+			"--model", "policy-launch-test",
+			"--binary", binary,
+			"--dry-run",
+		}, &stderr)
+		if code != 0 {
+			t.Fatalf("runLaunchCommand() code = %d; stderr=%s", code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), `web_search=\"disabled\"`) || !strings.Contains(stderr.String(), "features.remote_compaction_v2=false") || strings.Contains(stderr.String(), "unresolved:") {
+			t.Fatalf("dry-run did not resolve policy Codex compatibility: %s", stderr.String())
 		}
 	})
 
@@ -1755,7 +1772,7 @@ policy_profiles:
 	return providersPath
 }
 
-func TestRunLaunchClaudeRejectsPolicyModelBeforeChildStart(t *testing.T) {
+func TestRunLaunchClaudeStartsPolicyModelChild(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -1778,14 +1795,11 @@ func TestRunLaunchClaudeRejectsPolicyModelBeforeChildStart(t *testing.T) {
 		"--",
 		"-test.run=TestMainLaunchHelperProcess",
 	}, &stderr)
-	if code != 1 {
-		t.Fatalf("runLaunchClaude() code = %d, want 1; stderr=%s", code, stderr.String())
+	if code != 9 {
+		t.Fatalf("runLaunchClaude() code = %d, want 9; stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "policy") || !strings.Contains(stderr.String(), "Anthropic ingress") {
-		t.Fatalf("stderr missing policy-model Anthropic-ingress rejection: %s", stderr.String())
-	}
-	if _, err := os.Stat(capturePath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("Claude child started for unsupported policy model: stat error = %v", err)
+	if _, err := os.Stat(capturePath); err != nil {
+		t.Fatalf("policy Claude child did not write its capture: %v", err)
 	}
 }
 

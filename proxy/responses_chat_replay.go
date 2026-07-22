@@ -136,12 +136,16 @@ type responsesChatReplayAssistantProjection struct {
 	Calls   []responsesChatReplayProjectedCall
 }
 
+type responsesChatReplayOptionalDefaults map[string]json.RawMessage
+type responsesChatReplayToolDefaults map[string]responsesChatReplayOptionalDefaults
+
 type responsesChatReplayPublishCall struct {
 	UpstreamCallID    string
 	Name              string
 	VisibleArguments  string
 	OriginalArguments *string
 	OutputItemIndex   int
+	OptionalDefaults  responsesChatReplayOptionalDefaults
 }
 
 type responsesChatReplayPublishRequest struct {
@@ -204,12 +208,13 @@ type responsesChatReplayStoreOptions struct {
 }
 
 type responsesChatReplayStoredCall struct {
-	proxyCallID     string
-	upstreamCallID  string
-	name            string
-	visibleHash     [sha256.Size]byte
-	originalHash    [sha256.Size]byte
-	outputItemIndex int
+	proxyCallID      string
+	upstreamCallID   string
+	name             string
+	visibleHash      [sha256.Size]byte
+	originalHash     [sha256.Size]byte
+	optionalDefaults responsesChatReplayOptionalDefaults
+	outputItemIndex  int
 }
 
 type responsesChatReplayGroup struct {
@@ -235,6 +240,7 @@ type responsesChatReplayPreparedCall struct {
 	originalArguments string
 	visibleHash       [sha256.Size]byte
 	originalHash      [sha256.Size]byte
+	optionalDefaults  responsesChatReplayOptionalDefaults
 	outputItemIndex   int
 }
 
@@ -349,12 +355,13 @@ func (s *responsesChatReplayStore) Publish(request responsesChatReplayPublishReq
 	resolvedCalls := make([]responsesChatReplayResolvedCall, len(prepared.calls))
 	for i, call := range prepared.calls {
 		storedCalls[i] = responsesChatReplayStoredCall{
-			proxyCallID:     proxyIDs[i],
-			upstreamCallID:  call.upstreamCallID,
-			name:            call.name,
-			visibleHash:     call.visibleHash,
-			originalHash:    call.originalHash,
-			outputItemIndex: call.outputItemIndex,
+			proxyCallID:      proxyIDs[i],
+			upstreamCallID:   call.upstreamCallID,
+			name:             call.name,
+			visibleHash:      call.visibleHash,
+			originalHash:     call.originalHash,
+			optionalDefaults: cloneReplayOptionalDefaults(call.optionalDefaults),
+			outputItemIndex:  call.outputItemIndex,
 		}
 		visibleCalls[i] = responsesChatReplayProjectedCall{
 			ID:        proxyIDs[i],
@@ -610,6 +617,10 @@ func (s *responsesChatReplayStore) preparePublish(request responsesChatReplayPub
 		if err != nil {
 			return responsesChatReplayPreparedGroup{}, newResponsesChatReplayProjectionError("invalid original function arguments")
 		}
+		optionalDefaults, err := canonicalReplayOptionalDefaults(call.OptionalDefaults)
+		if err != nil {
+			return responsesChatReplayPreparedGroup{}, newResponsesChatReplayProjectionError("invalid optional function defaults")
+		}
 		calls[i] = responsesChatReplayPreparedCall{
 			upstreamCallID:    call.UpstreamCallID,
 			name:              call.Name,
@@ -617,6 +628,7 @@ func (s *responsesChatReplayStore) preparePublish(request responsesChatReplayPub
 			originalArguments: originalArguments,
 			visibleHash:       sha256.Sum256(canonicalVisibleArguments),
 			originalHash:      sha256.Sum256(canonicalOriginalArguments),
+			optionalDefaults:  optionalDefaults,
 			outputItemIndex:   call.OutputItemIndex,
 		}
 	}
@@ -747,11 +759,18 @@ func (g *responsesChatReplayGroup) matchesProjection(content []byte, projected [
 			return false
 		}
 		hash := sha256.Sum256(canonicalArguments)
+		matchesHash := func(want [sha256.Size]byte) bool {
+			if hash == want {
+				return true
+			}
+			normalized, changed, normalizeErr := canonicalReplayArgumentsWithoutOptionalDefaults(got.Arguments, stored.optionalDefaults)
+			return normalizeErr == nil && changed && sha256.Sum256(normalized) == want
+		}
 		if original {
-			if hash != stored.originalHash {
+			if !matchesHash(stored.originalHash) {
 				return false
 			}
-		} else if hash != stored.visibleHash {
+		} else if !matchesHash(stored.visibleHash) {
 			return false
 		}
 	}
@@ -790,6 +809,9 @@ func replayGroupByteSize(route responsesChatReplayRoute, content []byte, outputI
 		size += responsesChatReplayIDLength
 		size += len(call.upstreamCallID) + len(call.name)
 		size += sha256.Size * 2
+		for name, value := range call.optionalDefaults {
+			size += len(name) + len(value)
+		}
 		size += 8 // output item index accounting
 	}
 	return size
@@ -800,6 +822,67 @@ func canonicalReplayArguments(arguments string) ([]byte, error) {
 		return []byte(arguments), nil
 	}
 	return canonicalReplayJSONValue(json.RawMessage(arguments))
+}
+
+func canonicalReplayOptionalDefaults(defaults responsesChatReplayOptionalDefaults) (responsesChatReplayOptionalDefaults, error) {
+	if len(defaults) == 0 {
+		return nil, nil
+	}
+	canonical := make(responsesChatReplayOptionalDefaults, len(defaults))
+	for name, value := range defaults {
+		if strings.TrimSpace(name) == "" {
+			return nil, fmt.Errorf("empty default name")
+		}
+		encoded, err := canonicalReplayJSONValue(value)
+		if err != nil {
+			return nil, err
+		}
+		canonical[name] = cloneReplayRawMessage(encoded)
+	}
+	return canonical, nil
+}
+
+func cloneReplayOptionalDefaults(defaults responsesChatReplayOptionalDefaults) responsesChatReplayOptionalDefaults {
+	if len(defaults) == 0 {
+		return nil
+	}
+	cloned := make(responsesChatReplayOptionalDefaults, len(defaults))
+	for name, value := range defaults {
+		cloned[name] = cloneReplayRawMessage(value)
+	}
+	return cloned
+}
+
+func canonicalReplayArgumentsWithoutOptionalDefaults(arguments string, defaults responsesChatReplayOptionalDefaults) ([]byte, bool, error) {
+	canonical, err := canonicalReplayArguments(arguments)
+	if err != nil || len(defaults) == 0 || !json.Valid([]byte(arguments)) {
+		return canonical, false, err
+	}
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(arguments), &values); err != nil || values == nil {
+		return canonical, false, err
+	}
+	changed := false
+	for name, defaultValue := range defaults {
+		value, ok := values[name]
+		if !ok {
+			continue
+		}
+		canonicalValue, valueErr := canonicalReplayJSONValue(value)
+		if valueErr == nil && bytes.Equal(canonicalValue, defaultValue) {
+			delete(values, name)
+			changed = true
+		}
+	}
+	if !changed {
+		return canonical, false, nil
+	}
+	encoded, err := json.Marshal(values)
+	if err != nil {
+		return nil, false, err
+	}
+	normalized, err := canonicalReplayJSONValue(encoded)
+	return normalized, true, err
 }
 
 func canonicalReplayJSONValue(raw json.RawMessage) ([]byte, error) {

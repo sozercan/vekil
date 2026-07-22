@@ -585,3 +585,130 @@ func TestTranslateChatRequestToResponsesRejectsNullJSONSchema(t *testing.T) {
 		t.Fatalf("error = %#v", err)
 	}
 }
+
+func TestTranslateChatRequestToResponsesRestoresReplayBackedCustomToolCall(t *testing.T) {
+	store := newResponsesChatReplayStore()
+	defer func() { _ = store.Close() }()
+	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "policy", UpstreamModel: "deployment-a"}
+	patch := "*** Begin Patch\n*** Update File: calc.go\n*** End Patch"
+	functionArguments, _ := json.Marshal(map[string]string{"input": patch})
+	outputItem, _ := json.Marshal(map[string]any{
+		"type": "function_call", "id": "item-apply", "call_id": "upstream-apply", "name": "apply_patch", "arguments": string(functionArguments),
+	})
+	published, err := store.Publish(responsesChatReplayPublishRequest{
+		Route: route, AssistantContent: json.RawMessage(`null`),
+		OutputItems: []json.RawMessage{outputItem},
+		Calls: []responsesChatReplayPublishCall{{
+			UpstreamCallID: "upstream-apply", Name: "apply_patch", VisibleArguments: string(functionArguments), OutputItemIndex: 0,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyID := published.Projection.Calls[0].ID
+	body, _ := json.Marshal(map[string]any{
+		"model": "policy",
+		"messages": []any{
+			map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{
+				"id": proxyID, "type": "custom", "custom": map[string]any{"name": "apply_patch", "input": patch},
+			}}},
+			map[string]any{"role": "tool", "tool_call_id": proxyID, "content": "Modified 1 file"},
+		},
+	})
+	plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{ReplayStore: store, ReplayRoute: route})
+	if err != nil {
+		t.Fatalf("translateChatRequestToResponses() error = %v", err)
+	}
+	var request struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(plan.Body, &request); err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Input) != 2 {
+		t.Fatalf("input=%+v", request.Input)
+	}
+	if request.Input[0]["type"] != "function_call" || request.Input[0]["call_id"] != "upstream-apply" || request.Input[0]["arguments"] != string(functionArguments) {
+		t.Fatalf("restored custom call=%+v", request.Input[0])
+	}
+	if request.Input[1]["type"] != "function_call_output" || request.Input[1]["call_id"] != "upstream-apply" {
+		t.Fatalf("custom output=%+v", request.Input[1])
+	}
+}
+
+func TestTranslateChatRequestToResponsesRejectsNullReplayCustomInput(t *testing.T) {
+	body := []byte(`{
+		"model":"policy",
+		"messages":[
+			{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"custom","custom":{"name":"apply_patch","input":null}}]},
+			{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"done"}
+		]
+	}`)
+	_, err := translateChatRequestToResponses(body, responsesChatRequestOptions{ReplayStore: newResponsesChatReplayStore()})
+	var executionErr *chatExecutionError
+	if !errors.As(err, &executionErr) || executionErr.Param != "messages[0].tool_calls[0].custom.input" {
+		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestTranslateChatRequestToResponsesCapturesOriginalOptionalToolDefaults(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt",
+		"messages":[{"role":"user","content":"edit"}],
+		"tools":[{"type":"function","function":{
+			"name":"Edit",
+			"parameters":{"type":"object","properties":{
+				"file_path":{"type":"string","default":"ignored-required-default"},
+				"replace_all":{"type":"boolean","default":false}
+			},"required":["file_path"]}
+		}}]
+	}`)
+	plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaults := plan.ReplayToolDefaults["Edit"]
+	if string(defaults["replace_all"]) != "false" {
+		t.Fatalf("replace_all default = %s", defaults["replace_all"])
+	}
+	if _, exists := defaults["file_path"]; exists {
+		t.Fatalf("required property default was captured: %+v", defaults)
+	}
+}
+
+func TestTranslateChatRequestToResponsesIgnoresContinuationOnlyDefaultsForReplay(t *testing.T) {
+	store := newResponsesChatReplayStore()
+	defer func() { _ = store.Close() }()
+	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "policy", UpstreamModel: "deployment-a"}
+	outputItem := json.RawMessage(`{"type":"function_call","call_id":"upstream-edit","name":"Edit","arguments":"{}"}`)
+	published, err := store.Publish(responsesChatReplayPublishRequest{
+		Route: route, AssistantContent: json.RawMessage(`null`), OutputItems: []json.RawMessage{outputItem},
+		Calls: []responsesChatReplayPublishCall{{
+			UpstreamCallID: "upstream-edit", Name: "Edit", VisibleArguments: `{}`, OutputItemIndex: 0,
+			OptionalDefaults: responsesChatReplayOptionalDefaults{"replace_all": json.RawMessage("false")},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	callID := published.Projection.Calls[0].ID
+	body, _ := json.Marshal(map[string]any{
+		"model": "policy",
+		"messages": []any{
+			map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{
+				"id": callID, "type": "function", "function": map[string]any{"name": "Edit", "arguments": `{"admin":true}`},
+			}}},
+			map[string]any{"role": "tool", "tool_call_id": callID, "content": "done"},
+		},
+		"tools": []any{map[string]any{"type": "function", "function": map[string]any{
+			"name": "Edit", "parameters": map[string]any{"type": "object", "properties": map[string]any{
+				"admin": map[string]any{"type": "boolean", "default": true},
+			}},
+		}}},
+	})
+	_, err = translateChatRequestToResponses(body, responsesChatRequestOptions{ReplayStore: store, ReplayRoute: route})
+	var executionErr *chatExecutionError
+	if !errors.As(err, &executionErr) || executionErr.Code != responsesChatReplayProjectionCode {
+		t.Fatalf("error = %#v, want replay projection mismatch", err)
+	}
+}

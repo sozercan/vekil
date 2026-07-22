@@ -1,0 +1,474 @@
+package proxy
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/models"
+)
+
+func TestPolicyResponsesIngressStreamsTextThroughBaselineChatRoute(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+		WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)),
+		WithPolicyRoutingMode(PolicyRoutingModeOff),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"coding-economy",
+		"instructions":"You are a coding assistant.",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"say ok"}]}],
+		"store":false,
+		"stream":true,
+		"include":[]
+	}`))
+	ctx, summary := WithRequestSummary(t.Context())
+	request = request.WithContext(ctx)
+	h.HandleResponses(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("Content-Type=%q", got)
+	}
+	var sawCreated, sawText, sawCompleted bool
+	if err := consumeResponsesSSEMessages(strings.NewReader(recorder.Body.String()), func(msg responsesSSEMessage) error {
+		var event map[string]any
+		if err := json.Unmarshal([]byte(msg.data), &event); err != nil {
+			return err
+		}
+		switch event["type"] {
+		case "response.created":
+			sawCreated = true
+		case "response.output_item.done":
+			item, _ := event["item"].(map[string]any)
+			if item["type"] == "message" && item["role"] == "assistant" {
+				content, _ := item["content"].([]any)
+				if len(content) == 1 {
+					part, _ := content[0].(map[string]any)
+					sawText = part["type"] == "output_text" && part["text"] == "ok"
+				}
+			}
+		case "response.completed":
+			sawCompleted = true
+			response, _ := event["response"].(map[string]any)
+			if response["model"] != "coding-economy" {
+				t.Fatalf("completed response model=%v", response["model"])
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("decode response SSE: %v\n%s", err, recorder.Body.String())
+	}
+	if !sawCreated || !sawText || !sawCompleted {
+		t.Fatalf("events created=%v text=%v completed=%v body=%s", sawCreated, sawText, sawCompleted, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("X-Vekil-Request-ID"); got == "" {
+		t.Fatal("missing X-Vekil-Request-ID")
+	}
+	lightRequests, lightModels := light.snapshot()
+	if lightRequests != 1 || strings.Join(lightModels, ",") != "light-model" {
+		t.Fatalf("light requests=%d models=%v", lightRequests, lightModels)
+	}
+	if powerfulRequests, _ := powerful.snapshot(); powerfulRequests != 0 {
+		t.Fatalf("powerful requests=%d", powerfulRequests)
+	}
+	h.RecordRequest(summary, recorder.Code, "codex", 0)
+	snapshot := h.stats.snapshot()
+	if snapshot.Totals.Requests != 1 || len(snapshot.ByRoute) != 1 || snapshot.ByRoute[0].Route != "coding-economy" {
+		t.Fatalf("policy Responses request was not recorded exactly once: %+v", snapshot)
+	}
+}
+
+func TestPolicyResponsesIngressAcceptsCodexReasoningSummary(t *testing.T) {
+	var captured map[string]json.RawMessage
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"chat-summary","object":"chat.completion","created":1,"model":"light-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`)
+	}))
+	defer upstream.Close()
+	cfg := policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)
+	cfg.ModelRoutes[0].ReasoningEffort = []string{"low", "medium", "high"}
+	cfg.ModelRoutes[1].ReasoningEffort = []string{"low", "medium", "high"}
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+		WithProvidersConfig(cfg),
+		WithPolicyRoutingMode(PolicyRoutingModeOff),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"coding-economy",
+		"input":"say ok",
+		"reasoning":{"effort":"high","summary":"auto"},
+		"store":false,
+		"stream":false
+	}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var effort string
+	if err := json.Unmarshal(captured["reasoning_effort"], &effort); err != nil || effort != "high" {
+		t.Fatalf("reasoning_effort=%q raw=%s", effort, captured["reasoning_effort"])
+	}
+	if _, exists := captured["reasoning"]; exists {
+		t.Fatalf("reasoning summary leaked upstream: %+v", captured)
+	}
+	if _, exists := captured["reasoning_summary"]; exists {
+		t.Fatalf("reasoning_summary leaked upstream: %+v", captured)
+	}
+}
+
+func TestPolicyResponsesIngressRoundTripsNamespacedToolContinuation(t *testing.T) {
+	const replayID = "call_vekil_AAAAAAAAAAAAAAAAAAAAAA"
+	type capturedRequest struct {
+		Model    string `json:"model"`
+		Messages []struct {
+			Role       string `json:"role"`
+			ToolCallID string `json:"tool_call_id"`
+			ToolCalls  []struct {
+				ID       string `json:"id"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"messages"`
+		Tools []struct {
+			Type     string `json:"type"`
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+	}
+	var mu sync.Mutex
+	var requests []capturedRequest
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		var request capturedRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, request)
+		requestNumber := len(requests)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		if requestNumber == 1 {
+			if len(request.Tools) != 1 || request.Tools[0].Type != "function" || request.Tools[0].Function.Name == "" {
+				http.Error(w, "namespace tool was not flattened", http.StatusBadRequest)
+				return
+			}
+			name := request.Tools[0].Function.Name
+			_, _ = fmt.Fprintf(w, "data: {\"id\":\"terminal-stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":%q,\"type\":\"function\",\"function\":{\"name\":%q,\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]}}]}\n\n", request.Model, replayID, name)
+			_, _ = fmt.Fprintf(w, "data: {\"id\":\"terminal-stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n", request.Model)
+		} else {
+			_, _ = fmt.Fprintf(w, "data: {\"id\":\"terminal-stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"done\"}}]}\n\n", request.Model)
+			_, _ = fmt.Fprintf(w, "data: {\"id\":\"terminal-stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n", request.Model)
+		}
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"terminal-stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"ignored\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	cfg := policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")), WithProvidersConfig(cfg), WithPolicyRoutingMode(PolicyRoutingModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstBody := `{
+		"model":"coding-economy",
+		"input":"inspect the readme",
+			"tools":[{"type":"namespace","name":"mcp__files","description":"File tools","tools":[{"type":"function","name":"read_file","description":"Read a file","strict":false,"parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}]}],
+		"tool_choice":"auto",
+		"parallel_tool_calls":true,
+		"store":false,
+		"stream":true,
+		"include":[]
+	}`
+	first := httptest.NewRecorder()
+	h.HandleResponses(first, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(firstBody)))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
+	}
+	var sawNamespacedCall bool
+	if err := consumeResponsesSSEMessages(strings.NewReader(first.Body.String()), func(msg responsesSSEMessage) error {
+		var event map[string]any
+		if err := json.Unmarshal([]byte(msg.data), &event); err != nil {
+			return err
+		}
+		if event["type"] != "response.output_item.done" {
+			return nil
+		}
+		item, _ := event["item"].(map[string]any)
+		sawNamespacedCall = item["type"] == "function_call" && item["call_id"] == replayID && item["namespace"] == "mcp__files" && item["name"] == "read_file"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !sawNamespacedCall {
+		t.Fatalf("first response missing namespaced function call: %s", first.Body.String())
+	}
+
+	secondBody := `{
+		"model":"coding-economy",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect the readme"}]},
+			{"type":"function_call","namespace":"mcp__files","name":"read_file","arguments":"{\"path\":\"README.md\"}","call_id":"` + replayID + `"},
+			{"type":"function_call_output","call_id":"` + replayID + `","output":"contents"}
+		],
+			"tools":[
+				{"type":"namespace","name":"mcp__files","description":"File tools","tools":[{"type":"function","name":"read_file","description":"Read a file","strict":false,"parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}]},
+				{"type":"function","name":"mcp__files__read_file","description":"Colliding top-level tool added on the continuation","strict":false,"parameters":{"type":"object","properties":{}}}
+			],
+		"tool_choice":"auto",
+		"parallel_tool_calls":true,
+		"store":false,
+		"stream":true,
+		"include":[]
+	}`
+	second := httptest.NewRecorder()
+	h.HandleResponses(second, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(secondBody)))
+	if second.Code != http.StatusOK || !strings.Contains(second.Body.String(), `"text":"done"`) {
+		t.Fatalf("second status=%d body=%s", second.Code, second.Body.String())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) != 2 {
+		t.Fatalf("upstream requests=%d", len(requests))
+	}
+	firstToolName := requests[0].Tools[0].Function.Name
+	if firstToolName == "read_file" || strings.Contains(firstToolName, ".") || len(firstToolName) > 64 {
+		t.Fatalf("flattened tool name=%q", firstToolName)
+	}
+	if len(requests[1].Messages) < 3 {
+		t.Fatalf("continuation messages=%+v", requests[1].Messages)
+	}
+	var sawAssistantCall, sawToolOutput bool
+	for _, message := range requests[1].Messages {
+		if message.Role == "assistant" && len(message.ToolCalls) == 1 {
+			sawAssistantCall = message.ToolCalls[0].ID == replayID && message.ToolCalls[0].Function.Name == firstToolName
+		}
+		if message.Role == "tool" {
+			sawToolOutput = message.ToolCallID == replayID
+		}
+	}
+	if !sawAssistantCall || !sawToolOutput {
+		t.Fatalf("continuation assistant=%v tool=%v messages=%+v", sawAssistantCall, sawToolOutput, requests[1].Messages)
+	}
+}
+
+func TestPolicyResponsesIngressRejectsStoredRequestsBeforeUpstreamSend(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+		WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)),
+		WithPolicyRoutingMode(PolicyRoutingModeOff),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"coding-economy","input":"hello","store":true}`)))
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "store") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if sends, _ := light.snapshot(); sends != 0 {
+		t.Fatalf("light sends=%d", sends)
+	}
+	if sends, _ := powerful.snapshot(); sends != 0 {
+		t.Fatalf("powerful sends=%d", sends)
+	}
+}
+
+func TestPolicyResponsesIngressEnforceSelectsPowerfulAndReturnsJSON(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{
+		TurnType:  policyTurnTypePlanning,
+		CodeScope: policyCodeScopeMultiFile,
+		RiskLevel: policyRiskLevelHigh,
+	})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+		WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"coding-economy",
+		"input":"plan a multi-file refactor",
+		"store":false,
+		"stream":false
+	}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); !strings.Contains(got, "application/json") {
+		t.Fatalf("Content-Type=%q", got)
+	}
+	var response policyResponsesResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Model != "coding-economy" || response.Status != "completed" || len(response.Output) != 1 {
+		t.Fatalf("response=%+v", response)
+	}
+	content, _ := response.Output[0]["content"].([]any)
+	if len(content) != 1 || content[0].(map[string]any)["text"] != "ok" {
+		t.Fatalf("output=%+v", response.Output)
+	}
+	lightRequests, lightModels := light.snapshot()
+	if lightRequests != 2 || strings.Join(lightModels, ",") != "classifier-model,classifier-model" {
+		t.Fatalf("light requests=%d models=%v", lightRequests, lightModels)
+	}
+	powerfulRequests, powerfulModels := powerful.snapshot()
+	if powerfulRequests != 1 || strings.Join(powerfulModels, ",") != "power-model" {
+		t.Fatalf("powerful requests=%d models=%v", powerfulRequests, powerfulModels)
+	}
+}
+
+func TestPolicyResponsesIngressSanitizesTerminalFailure(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+		WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)),
+		WithPolicyRoutingMode(PolicyRoutingModeOff),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	light.terminalFailureStatus.Store(http.StatusBadGateway)
+
+	recorder := httptest.NewRecorder()
+	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"coding-economy",
+		"input":"hello",
+		"store":false
+	}`)))
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"message":"upstream request failed"`) || !strings.Contains(body, `"code":"upstream_error"`) {
+		t.Fatalf("unsanitized policy error: %s", body)
+	}
+	for _, leaked := range []string{"terminal unavailable", "light-model", "light-route", "light-provider"} {
+		if strings.Contains(body, leaked) {
+			t.Fatalf("policy error leaked %q: %s", leaked, body)
+		}
+	}
+	for _, header := range []string{"X-Request-ID", "X-Azure-Request-ID", "OpenAI-Processing-Ms", "X-Vekil-Internal-Route"} {
+		if got := recorder.Header().Get(header); got != "" {
+			t.Fatalf("%s=%q, want omitted", header, got)
+		}
+	}
+}
+
+func TestPolicyResponsesIngressCapturesToolOptimizerContext(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		var request models.OpenAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "data: {\"id\":\"chat-tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-shell\",\"type\":\"function\",\"function\":{\"name\":\"shell_command\",\"arguments\":\"{\\\"command\\\":\\\"grep foo big.log\\\"}\"}}]}}]}\n\n", request.Model)
+		_, _ = fmt.Fprintf(w, "data: {\"id\":\"chat-tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n", request.Model)
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"chat-tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"ignored\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	cfg := policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")), WithProvidersConfig(cfg), WithPolicyRoutingMode(PolicyRoutingModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &recordingToolOptimizer{}
+	configureRecordingToolOptimizer(h, fake)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"coding-economy",
+		"input":"run a command",
+		"tools":[{"type":"function","name":"shell_command","description":"Run shell","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}],
+		"store":false,
+		"stream":false
+	}`))
+	request.Header.Set("session_id", "policy-optimizer")
+	h.HandleResponses(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	toolContext, ok := h.toolContexts.Get("session:policy-optimizer", "call-shell")
+	if !ok {
+		t.Fatal("policy Responses completion did not capture tool context")
+	}
+	if toolContext.ToolName != "shell_command" || toolContext.OriginalCommand != "grep foo big.log" {
+		t.Fatalf("captured tool context=%+v", toolContext)
+	}
+}
+
+func TestPolicyResponsesIngressPlannerUnavailableUsesServerError(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+		WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately do not initialize policy routing: enforce requests must fail as
+	// transient server unavailability, not as a permanent invalid client request.
+	recorder := httptest.NewRecorder()
+	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"coding-economy","input":"hello","store":false}`)))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, `"type":"invalid_request_error"`) || !strings.Contains(body, `"message":"upstream request failed"`) {
+		t.Fatalf("planner outage used client-error semantics: %s", body)
+	}
+}
+
+func TestObservePolicyResponsesExecutionErrorRecordsUsage(t *testing.T) {
+	ctx, summary := WithRequestSummary(t.Context())
+	observePolicyResponsesExecutionError(ctx, &chatExecutionError{
+		StatusCode: http.StatusTooManyRequests,
+		Usage: &models.OpenAIUsage{
+			PromptTokens:     17,
+			CompletionTokens: 3,
+			TotalTokens:      20,
+		},
+	})
+	stats := readSummaryForStats(summary)
+	if stats.prompt != 17 || stats.completion != 3 || stats.total != 20 {
+		t.Fatalf("failed execution usage=%+v", stats)
+	}
+}

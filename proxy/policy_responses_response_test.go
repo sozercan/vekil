@@ -1,0 +1,328 @@
+package proxy
+
+import (
+	"encoding/json"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/sozercan/vekil/models"
+)
+
+func TestPolicyResponsesRefusalUsesPortableOutputText(t *testing.T) {
+	finishReason := "stop"
+	response, err := buildPolicyResponsesResponse(&models.OpenAIResponse{
+		ID: "chat-refusal", Created: 1, Model: "terminal",
+		Choices: []models.OpenAIChoice{{
+			Index:        0,
+			Message:      models.OpenAIMessage{Role: "assistant", Refusal: json.RawMessage(`"cannot comply"`)},
+			FinishReason: &finishReason,
+		}},
+	}, "policy", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := response.Output[0]["content"].([]any)
+	part := content[0].(map[string]any)
+	if part["type"] != "output_text" || part["text"] != "cannot comply" {
+		t.Fatalf("refusal output=%+v", response.Output)
+	}
+	body, err := json.Marshal(map[string]any{"model": "policy", "input": response.Output, "store": false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	translated, err := translatePolicyResponsesRequestToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat models.OpenAIRequest
+	if err := json.Unmarshal(translated.Body, &chat); err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.Messages) != 1 || string(chat.Messages[0].Content) != `"cannot comply"` {
+		t.Fatalf("replayed refusal=%+v", chat.Messages)
+	}
+}
+
+func TestPolicyResponsesPreservesEmptyAssistantText(t *testing.T) {
+	finishReason := "stop"
+	response, err := buildPolicyResponsesResponse(&models.OpenAIResponse{
+		ID: "chat-empty", Created: 1, Model: "terminal",
+		Choices: []models.OpenAIChoice{{
+			Index:        0,
+			Message:      models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`""`)},
+			FinishReason: &finishReason,
+		}},
+	}, "policy", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Output) != 1 || response.Output[0]["type"] != "message" {
+		t.Fatalf("empty assistant output=%+v", response.Output)
+	}
+	content := response.Output[0]["content"].([]any)
+	if len(content) != 1 || content[0].(map[string]any)["text"] != "" {
+		t.Fatalf("empty assistant content=%+v", content)
+	}
+}
+
+func TestPolicyResponsesResponseIncludesNormalizedToolMetadata(t *testing.T) {
+	finishReason := "stop"
+	response, err := buildPolicyResponsesResponse(&models.OpenAIResponse{
+		Choices: []models.OpenAIChoice{{
+			Index: 0, Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)}, FinishReason: &finishReason,
+		}},
+		Usage: &models.OpenAIUsage{PromptTokens: 2, CompletionTokens: 1, TotalTokens: 3},
+	}, "policy", nil, policyResponsesResponseConfig{
+		Tools:             json.RawMessage(`[{"type":"function","name":"lookup","parameters":{"type":"object"}}]`),
+		ToolChoice:        json.RawMessage(`{"type":"function","name":"lookup"}`),
+		ParallelToolCalls: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	if err := writePolicyResponsesResult(recorder, response, false); err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["parallel_tool_calls"] != false {
+		t.Fatalf("parallel_tool_calls = %#v", decoded["parallel_tool_calls"])
+	}
+	if tools, ok := decoded["tools"].([]any); !ok || len(tools) != 1 {
+		t.Fatalf("tools = %#v", decoded["tools"])
+	}
+	choice, _ := decoded["tool_choice"].(map[string]any)
+	if choice["type"] != "function" || choice["name"] != "lookup" {
+		t.Fatalf("tool_choice = %#v", decoded["tool_choice"])
+	}
+
+	stream := httptest.NewRecorder()
+	if err := writePolicyResponsesResult(stream, response, true); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stream.Body.String(), `"parallel_tool_calls":false`) || !strings.Contains(stream.Body.String(), `"tool_choice":{"type":"function","name":"lookup"}`) {
+		t.Fatalf("stream metadata missing: %s", stream.Body.String())
+	}
+}
+
+func TestPolicyResponsesResponseRejectsMissingUsageForWireResponse(t *testing.T) {
+	finishReason := "stop"
+	_, err := buildPolicyResponsesResponse(&models.OpenAIResponse{Choices: []models.OpenAIChoice{{
+		Index: 0, Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)}, FinishReason: &finishReason,
+	}}}, "policy", nil, policyResponsesResponseConfig{})
+	if err == nil || !strings.Contains(err.Error(), "no token usage") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestPolicyResponsesTextOutputCanBeReplayedAsStatelessInput(t *testing.T) {
+	finishReason := "stop"
+	response, err := buildPolicyResponsesResponse(&models.OpenAIResponse{
+		ID: "chat-text", Created: 1, Model: "terminal",
+		Choices: []models.OpenAIChoice{{
+			Index:        0,
+			Message:      models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"hello"`)},
+			FinishReason: &finishReason,
+		}},
+	}, "policy", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := append([]map[string]any{}, response.Output...)
+	input = append(input, map[string]any{
+		"type":    "message",
+		"role":    "user",
+		"content": []any{map[string]any{"type": "input_text", "text": "continue"}},
+	})
+	body, err := json.Marshal(map[string]any{"model": "policy", "input": input, "store": false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	translated, err := translatePolicyResponsesRequestToChat(body)
+	if err != nil {
+		t.Fatalf("replay adapter output: %v", err)
+	}
+	var chat models.OpenAIRequest
+	if err := json.Unmarshal(translated.Body, &chat); err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.Messages) != 2 || chat.Messages[0].Role != "assistant" || chat.Messages[1].Role != "user" {
+		t.Fatalf("replayed messages=%+v", chat.Messages)
+	}
+}
+
+func TestPolicyResponsesIncompleteDoesNotCompleteOrDispatchPartialToolCall(t *testing.T) {
+	for _, tc := range []struct {
+		finishReason string
+		wantReason   string
+	}{
+		{finishReason: "length", wantReason: "max_output_tokens"},
+		{finishReason: "content_filter", wantReason: "content_filter"},
+	} {
+		t.Run(tc.finishReason, func(t *testing.T) {
+			finishReason := tc.finishReason
+			completion := &models.OpenAIResponse{
+				ID:      "chat-partial",
+				Created: 1,
+				Model:   "terminal-model",
+				Choices: []models.OpenAIChoice{{
+					Index: 0,
+					Message: models.OpenAIMessage{
+						Role:    "assistant",
+						Content: json.RawMessage(`"partial"`),
+						ToolCalls: []models.OpenAIToolCall{{
+							ID:   "call-partial",
+							Type: "function",
+							Function: models.OpenAIFunctionCall{
+								Name:      "tool_alias",
+								Arguments: `{"unterminated":`,
+							},
+						}},
+					},
+					FinishReason: &finishReason,
+				}},
+			}
+			response, err := buildPolicyResponsesResponse(completion, "policy-model", policyResponsesToolMap{
+				"tool_alias": {Name: "run", Namespace: "tools", Kind: policyResponsesToolKindFunction},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.Status != "incomplete" {
+				t.Fatalf("status=%q", response.Status)
+			}
+			details, _ := response.IncompleteDetails.(map[string]any)
+			if details["reason"] != tc.wantReason {
+				t.Fatalf("incomplete_details=%+v", response.IncompleteDetails)
+			}
+			if len(response.Output) != 1 || response.Output[0]["type"] != "message" {
+				t.Fatalf("partial function call was exposed: %+v", response.Output)
+			}
+
+			recorder := httptest.NewRecorder()
+			if err := writePolicyResponsesResult(recorder, response, true); err != nil {
+				t.Fatal(err)
+			}
+			body := recorder.Body.String()
+			sawCreatedSequenceZero := false
+			if err := consumeResponsesSSEMessages(strings.NewReader(body), func(msg responsesSSEMessage) error {
+				if msg.event != "response.created" {
+					return nil
+				}
+				var event struct {
+					SequenceNumber int `json:"sequence_number"`
+				}
+				if err := json.Unmarshal([]byte(msg.data), &event); err != nil {
+					return err
+				}
+				sawCreatedSequenceZero = event.SequenceNumber == 0
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if !sawCreatedSequenceZero {
+				t.Fatalf("created event is missing sequence zero: %s", body)
+			}
+			if !strings.Contains(body, "event: response.incomplete") || strings.Contains(body, "event: response.completed") || strings.Contains(body, `"type":"function_call"`) {
+				t.Fatalf("invalid incomplete SSE: %s", body)
+			}
+		})
+	}
+}
+
+func TestPolicyResponsesRejectsTerminalCallsOutsideRequestCapability(t *testing.T) {
+	finishReason := "tool_calls"
+	completion := func(calls ...models.OpenAIToolCall) *models.OpenAIResponse {
+		return &models.OpenAIResponse{Choices: []models.OpenAIChoice{{
+			Index: 0, Message: models.OpenAIMessage{Role: "assistant", ToolCalls: calls}, FinishReason: &finishReason,
+		}}}
+	}
+	call := func(id, name string) models.OpenAIToolCall {
+		return models.OpenAIToolCall{ID: id, Type: "function", Function: models.OpenAIFunctionCall{Name: name, Arguments: `{}`}}
+	}
+	t.Run("undeclared tool", func(t *testing.T) {
+		_, err := buildPolicyResponsesResponse(completion(call("call-shell", "shell")), "policy", policyResponsesToolMap{
+			"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction},
+		})
+		if err == nil || !strings.Contains(err.Error(), "undeclared function tool") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("tool choice none", func(t *testing.T) {
+		_, err := buildPolicyResponsesResponse(completion(call("call-lookup", "lookup")), "policy", nil)
+		if err == nil || !strings.Contains(err.Error(), "undeclared function tool") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("duplicate call id", func(t *testing.T) {
+		_, err := buildPolicyResponsesResponse(completion(call("call-dup", "lookup"), call("call-dup", "lookup")), "policy", policyResponsesToolMap{
+			"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction},
+		})
+		if err == nil || !strings.Contains(err.Error(), "duplicate function call ID") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+}
+
+func TestPolicyResponsesMixedTextToolReplayMatchesInnerStore(t *testing.T) {
+	store := newResponsesChatReplayStore()
+	defer func() { _ = store.Close() }()
+	route := responsesChatReplayRoute{ProviderID: "bridge", PublicModel: "light-model", UpstreamModel: "gpt-5.6-luna"}
+	arguments := `{"cmd":"ls"}`
+	outputItem, _ := json.Marshal(map[string]any{
+		"type": "function_call", "id": "fc-upstream", "call_id": "upstream-call", "name": "exec_command", "arguments": arguments,
+	})
+	published, err := store.Publish(responsesChatReplayPublishRequest{
+		Route: route, AssistantContent: json.RawMessage(`"I will inspect first."`),
+		OutputItems: []json.RawMessage{outputItem},
+		Calls: []responsesChatReplayPublishCall{{
+			UpstreamCallID: "upstream-call", Name: "exec_command", VisibleArguments: arguments, OutputItemIndex: 0,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyID := published.Projection.Calls[0].ID
+	finishReason := "tool_calls"
+	adapted, err := buildPolicyResponsesResponse(&models.OpenAIResponse{
+		ID: "chat-mixed", Created: 1, Model: "policy",
+		Choices: []models.OpenAIChoice{{
+			Index: 0,
+			Message: models.OpenAIMessage{
+				Role:    "assistant",
+				Content: json.RawMessage(`"I will inspect first."`),
+				ToolCalls: []models.OpenAIToolCall{{
+					ID: proxyID, Type: "function", Function: models.OpenAIFunctionCall{Name: "exec_command", Arguments: arguments},
+				}},
+			},
+			FinishReason: &finishReason,
+		}},
+	}, "policy", policyResponsesToolMap{"exec_command": {Name: "exec_command", Kind: policyResponsesToolKindFunction}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := append([]map[string]any{}, adapted.Output...)
+	input = append(input, map[string]any{"type": "function_call_output", "call_id": proxyID, "output": "ok"})
+	requestBody, _ := json.Marshal(map[string]any{
+		"model": "policy", "input": input, "store": false,
+		"tools": []any{map[string]any{"type": "function", "name": "exec_command", "parameters": map[string]any{"type": "object"}}},
+	})
+	translated, err := translatePolicyResponsesRequestToChat(requestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat models.OpenAIRequest
+	if err := json.Unmarshal(translated.Body, &chat); err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.Messages) != 2 || string(chat.Messages[0].Content) != `"I will inspect first."` || len(chat.Messages[0].ToolCalls) != 1 {
+		t.Fatalf("mixed Chat reconstruction=%+v", chat.Messages)
+	}
+	if _, err := translateChatRequestToResponses(translated.Body, responsesChatRequestOptions{ReplayStore: store, ReplayRoute: route}); err != nil {
+		t.Fatalf("inner replay projection mismatch: %v", err)
+	}
+}

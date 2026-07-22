@@ -380,6 +380,31 @@ func TestResponsesChatReplayValidatesVisibleAndOriginalOptimizerProjections(t *t
 	assertResponsesChatReplayProjection(t, err)
 }
 
+func TestResponsesChatReplayOptionalDefaultsArePublicationOwned(t *testing.T) {
+	store := newResponsesChatReplayStore()
+	defer func() { _ = store.Close() }()
+	defaults := responsesChatReplayOptionalDefaults{"replace_all": json.RawMessage("false")}
+	request := newResponsesChatReplayTestRequest("defaults", replayTestCallSpec{
+		upstreamID: "upstream-default", name: "edit", visible: `{}`,
+	})
+	request.Calls[0].OptionalDefaults = defaults
+	published, err := store.Publish(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaults["replace_all"] = json.RawMessage("true")
+	call := published.Projection.Calls[0]
+	call.Arguments = `{"replace_all":false}`
+	if _, err := store.Resolve(request.Route, responsesChatReplayAssistantProjection{Content: published.Projection.Content, Calls: []responsesChatReplayProjectedCall{call}}); err != nil {
+		t.Fatalf("published optional default was not accepted: %v", err)
+	}
+	for _, arguments := range []string{`{"replace_all":true}`, `{"admin":true}`} {
+		call.Arguments = arguments
+		_, err := store.Resolve(request.Route, responsesChatReplayAssistantProjection{Content: published.Projection.Content, Calls: []responsesChatReplayProjectedCall{call}})
+		assertResponsesChatReplayProjection(t, err)
+	}
+}
+
 func TestResponsesChatReplayResolutionSupportsFullOrPerCallPartialReplay(t *testing.T) {
 	store := newResponsesChatReplayStore()
 	defer func() { _ = store.Close() }()

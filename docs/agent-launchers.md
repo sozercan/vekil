@@ -13,7 +13,7 @@ model.
 | Target | Model selection | Minimum tested contract | Compatible model endpoint |
 |--------|-----------------|-------------------------|---------------------------|
 | Claude Code | Optional `--model`; otherwise Claude's CLI default | Claude Code 2.1.83+ | `/v1/messages`, `/chat/completions`, or `/responses` |
-| OpenAI Codex CLI | Optional `--model`; otherwise Codex's CLI default | Codex CLI 0.137.0+ | `/responses` |
+| OpenAI Codex CLI | Optional `--model`; otherwise Codex's CLI default | Codex CLI 0.137.0+ | `/responses`, or a policy-owned `/chat/completions` model through bounded stateless compatibility |
 | GitHub Copilot CLI | `--model` required | GitHub Copilot CLI 1.0.0+ | `/responses` or `/chat/completions` |
 
 ```bash
@@ -66,6 +66,13 @@ Claude Code and Codex CLI support two launch modes:
 GitHub Copilot CLI has no delegated mode. Its custom-provider/BYOK contract
 requires an explicit model, so `vekil launch copilot` rejects startup unless
 `--model` is supplied.
+
+Policy-owned Codex compatibility also requires launcher-level `--model`. A
+delegated Codex session can use normal direct Responses models, but Vekil cannot
+know its eventual CLI-selected model early enough to conditionally disable
+hosted web search, remote compaction, freeform apply-patch, and inherited speed
+tiers. If a delegated Codex default resolves to `owned_by: vekil-policy`, pin
+that ID explicitly instead.
 
 ## Lifecycle
 
@@ -148,13 +155,19 @@ other than the selected public model. Without `--model`, Claude resolves its
 normal configured or built-in default and the proxy accepts requests across the
 global public model namespace.
 
-Policy-routing public model IDs (`owned_by: vekil-policy`) are rejected for
-Claude Code in pinned mode even though they advertise `/chat/completions`:
-policy routing is not supported on the Anthropic ingress used by this launcher.
-In delegated mode, a Claude default that resolves to one of those models fails
-when requested. Use `vekil launch copilot` for those Chat-completions policy
-models. Direct models with `/v1/messages`, `/chat/completions`, or `/responses`
-remain supported.
+Policy-routing public model IDs (`owned_by: vekil-policy`) are supported in
+pinned mode. Vekil translates Claude's Messages and count-token requests to the
+same canonical Chat request used by OpenAI Chat policy planning, then translates
+the selected terminal response back to Anthropic. The policy profile remains
+advertised as native `/chat/completions` metadata; the launcher compatibility
+path does not change terminal endpoint ownership.
+
+The global policy ceiling still defaults to `off`, so the command uses the
+profile's deterministic baseline unless `--policy-routing observe` or
+`--policy-routing enforce` is supplied. Opaque `call_vekil_*` continuations from
+a downstream Responses-backed bridge are accepted only for a single-target
+baseline in `off` or `observe`; `enforce` rejects those stateful continuations
+until policy route affinity is implemented.
 
 Forwarded settings-source, detached-session, resume, model/fallback, and custom
 agent overrides are rejected. Use the launcher-level `--model` to pin a model;
@@ -179,9 +192,26 @@ this flow. Vekil instead injects a transient, per-launch
 - `env_key="VEKIL_CODEX_API_KEY"` reads the random local bearer token;
 - `requires_openai_auth=false` prevents Codex/ChatGPT login fallback;
 - `supports_websockets=false` keeps the launcher on deterministic HTTP Responses;
+- for a policy-owned Chat model, Vekil disables hosted web search, remote
+  compaction, Responses Lite, and code-only tool modes; removes Codex's freeform `apply_patch` declaration; and translates
+  stateless Responses messages plus function/namespace tools through canonical
+  Chat; namespace children receive deterministic Chat-safe aliases and are
+  restored in Responses function-call output;
 - an additive `shell_environment_policy.set` override masks the local token in
   model-invoked shells without replacing user-configured exclusions; upstream
   credential names are removed from the Codex process environment.
+
+
+Pinned policy-owned Codex turns require `store: false` (Codex's launcher
+default), no `previous_response_id`, text input, and function or
+namespace-child function tools. Hosted/custom tools, images, the Responses websocket, compact/memory
+routes, deferred tool discovery (`defer_loading` / `tool_search`), and provider-specific speed tiers remain unsupported. The launcher
+disables the hosted/custom features it controls. As with Copilot and Claude,
+opaque downstream replay IDs can continue only in `off` or `observe` with one
+baseline target; `enforce` tool continuations remain rejected without affinity.
+Large direct Codex tool catalogs require a downstream Chat bridge that accepts
+more than the native OpenAI/Azure 128-function ceiling; operators using a
+narrower terminal must reduce the enabled client catalog.
 
 With `--model`, a private temporary one-model Codex catalog is generated from
 the installed CLI's bundled catalog, with Vekil model context, reasoning,

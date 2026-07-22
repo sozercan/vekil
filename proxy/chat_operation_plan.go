@@ -132,6 +132,17 @@ func (p chatOperationPlan) valid() bool {
 	return p.operationRoute != nil && p.publicID != "" && p.routeID != "" && len(p.candidates) > 0
 }
 
+// allowsResponsesReplayPassthrough reports whether a policy-planned Chat
+// continuation can safely preserve replay state owned by a downstream bridge.
+// Off and observe always select the baseline tier; requiring one sealed target
+// keeps that continuation pinned to the same deterministic route destination.
+func (p chatOperationPlan) allowsResponsesReplayPassthrough() bool {
+	if !p.valid() || len(p.candidates) != 1 {
+		return false
+	}
+	return p.effectiveMode == policyModeOff || p.effectiveMode == policyModeObserve
+}
+
 func (p chatOperationPlan) routeSnapshot() *modelRoute {
 	if p.operationRoute == nil {
 		return nil

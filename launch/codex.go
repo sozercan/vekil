@@ -30,8 +30,9 @@ func (CodexAdapter) Name() string { return "codex" }
 func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	model := strings.TrimSpace(input.Model.ID)
 	hasModel := model != ""
+	policyModel := hasModel && strings.TrimSpace(input.Model.OwnedBy) == PolicyModelOwner
 	endpointMetadataKnown := !input.DryRun || input.Model.SupportedEndpoints != nil
-	if hasModel && endpointMetadataKnown && !modelSupportsEndpoint(input.Model, "/responses") {
+	if hasModel && !policyModel && endpointMetadataKnown && !modelSupportsEndpoint(input.Model, "/responses") {
 		return PreparedProcess{}, fmt.Errorf(
 			"model %q is not Codex-compatible: expected /responses support",
 			model,
@@ -94,6 +95,17 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	if hasModel {
 		overrides = append(overrides, `model_catalog_json=`+configString(catalogPath))
 	}
+	if policyModel {
+		// Policy models are served by Vekil's bounded Responses-to-Chat
+		// compatibility path. Keep Codex on stateless turns and suppress hosted
+		// tools that cannot be represented by the policy Chat contract.
+		overrides = append(overrides,
+			`web_search="disabled"`,
+			`features.remote_compaction_v2=false`,
+			`features.code_mode=false`,
+			`features.code_mode_only=false`,
+		)
+	}
 	overrides = append(overrides, `shell_environment_policy.set.`+codexLocalTokenEnv+`=""`)
 	for _, override := range overrides {
 		args = append(args, "-c", override)
@@ -110,7 +122,7 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		EnvUnset: envUnset,
 		Cleanup:  cleanup,
 	}
-	if hasModel && !endpointMetadataKnown {
+	if hasModel && !policyModel && !endpointMetadataKnown {
 		prepared.Unresolved = append(prepared.Unresolved,
 			"model endpoint compatibility (/responses) requires live /v1/models metadata",
 		)

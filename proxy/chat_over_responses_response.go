@@ -15,10 +15,11 @@ import (
 const responsesChatMaxJSONBodyBytes = 16 << 20
 
 type responsesChatResponseOptions struct {
-	PublicModel string
-	ReplayStore *responsesChatReplayStore
-	ReplayRoute responsesChatReplayRoute
-	UsageOnly   bool
+	PublicModel        string
+	ReplayStore        *responsesChatReplayStore
+	ReplayRoute        responsesChatReplayRoute
+	ReplayToolDefaults responsesChatReplayToolDefaults
+	UsageOnly          bool
 }
 
 type responsesChatJSONResult struct {
@@ -152,6 +153,7 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 				UpstreamCallID:   call.UpstreamCallID,
 				Name:             call.Name,
 				VisibleArguments: call.Arguments,
+				OptionalDefaults: options.ReplayToolDefaults[call.Name],
 				OutputItemIndex:  call.OutputItemIndex,
 			}
 		}

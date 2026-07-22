@@ -401,9 +401,12 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 		return chatOperationPlan{}, &providerRequestError{statusCode: http.StatusServiceUnavailable, err: fmt.Errorf("%s for policy model %q", message, entry.id)}
 	}
 	if chatRequestContainsResponsesReplayID(input.OriginalBody) {
-		return chatOperationPlan{}, &providerRequestError{
-			statusCode: http.StatusBadRequest,
-			err:        fmt.Errorf("policy model %q does not support Responses replay continuations", entry.id),
+		baselineRoute := profile.routeForTier(profile.baselineTier)
+		if (mode != policyModeOff && mode != policyModeObserve) || baselineRoute == nil || len(baselineRoute.targets) != 1 {
+			return chatOperationPlan{}, &providerRequestError{
+				statusCode: http.StatusBadRequest,
+				err:        fmt.Errorf("policy model %q does not support Responses replay continuations", entry.id),
+			}
 		}
 	}
 	facts, err := buildPolicyClassifierFacts(input.OriginalBody, policyFactOptions{

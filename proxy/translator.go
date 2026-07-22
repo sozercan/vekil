@@ -66,6 +66,7 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 		}
 		oaiReq.Messages = append(oaiReq.Messages, translated...)
 	}
+	oaiReq.Messages = mergeSplitAnthropicReplayAssistantTurns(oaiReq.Messages)
 
 	// Tools
 	for _, t := range req.Tools {
@@ -127,6 +128,37 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 	}
 
 	return oaiReq, nil
+}
+
+func mergeSplitAnthropicReplayAssistantTurns(messages []models.OpenAIMessage) []models.OpenAIMessage {
+	if len(messages) < 2 {
+		return messages
+	}
+	merged := make([]models.OpenAIMessage, 0, len(messages))
+	for _, message := range messages {
+		if len(merged) > 0 && shouldMergeSplitAnthropicReplayAssistantTurn(merged[len(merged)-1], message) {
+			message.Content = append(json.RawMessage(nil), merged[len(merged)-1].Content...)
+			merged[len(merged)-1] = message
+			continue
+		}
+		merged = append(merged, message)
+	}
+	return merged
+}
+
+func shouldMergeSplitAnthropicReplayAssistantTurn(previous, current models.OpenAIMessage) bool {
+	if previous.Role != "assistant" || current.Role != "assistant" || len(previous.ToolCalls) != 0 || len(current.ToolCalls) == 0 {
+		return false
+	}
+	if len(previous.Content) == 0 || len(current.Content) != 0 || previous.ToolCallID != "" || current.ToolCallID != "" {
+		return false
+	}
+	for _, call := range current.ToolCalls {
+		if !isResponsesChatReplayCallID(call.ID) {
+			return false
+		}
+	}
+	return true
 }
 
 func parseSystemMessage(raw json.RawMessage) (*models.OpenAIMessage, error) {

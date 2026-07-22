@@ -50,6 +50,9 @@ func TestTranslateResponsesJSONToChatPublishesFunctionCallReplay(t *testing.T) {
 		PublicModel: "gpt-public",
 		ReplayStore: store,
 		ReplayRoute: route,
+		ReplayToolDefaults: responsesChatReplayToolDefaults{
+			"lookup_synthetic_widget": {"mode": json.RawMessage(`"standard"`)},
+		},
 	})
 	if err != nil {
 		t.Fatalf("translateResponsesJSONToChat() error = %v", err)
@@ -65,7 +68,7 @@ func TestTranslateResponsesJSONToChatPublishesFunctionCallReplay(t *testing.T) {
 	resolution, err := store.Resolve(route, responsesChatReplayAssistantProjection{
 		Content: choice.Message.Content,
 		Calls: []responsesChatReplayProjectedCall{{
-			ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments,
+			ID: call.ID, Name: call.Function.Name, Arguments: `{"widget":"alpha-fixture","mode":"standard"}`,
 		}},
 	})
 	if err != nil {

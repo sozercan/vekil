@@ -100,9 +100,12 @@ func TestResponsesChatStream_OneToolPublishesReplayBeforeProxyID(t *testing.T) {
 	route := responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
 
 	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{
-		PublicModel:      "gpt-public",
-		ReplayStore:      store,
-		ReplayRoute:      route,
+		PublicModel: "gpt-public",
+		ReplayStore: store,
+		ReplayRoute: route,
+		ReplayToolDefaults: responsesChatReplayToolDefaults{
+			"lookup_synthetic_widget": {"mode": json.RawMessage(`"standard"`)},
+		},
 		PrecommitTimeout: time.Second,
 	})
 	if err != nil {
@@ -129,7 +132,7 @@ func TestResponsesChatStream_OneToolPublishesReplayBeforeProxyID(t *testing.T) {
 	resolved, err := store.Resolve(route, responsesChatReplayAssistantProjection{
 		Content: json.RawMessage(`""`),
 		Calls: []responsesChatReplayProjectedCall{{
-			ID: start[0].ID, Name: start[0].Function.Name, Arguments: args[0].Function.Arguments,
+			ID: start[0].ID, Name: start[0].Function.Name, Arguments: `{"widget":"alpha-fixture","mode":"standard"}`,
 		}},
 	})
 	if err != nil {

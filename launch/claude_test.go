@@ -359,23 +359,31 @@ func TestClaudeAdapterDryRunMarksUnknownEndpointCompatibilityUnresolved(t *testi
 	}
 }
 
-func TestClaudeAdapterRejectsPolicyOwnedModelBeforeBinaryResolution(t *testing.T) {
+func TestClaudeAdapterAcceptsPolicyOwnedChatModel(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
 	var model ModelInfo
 	if err := json.Unmarshal([]byte(`{"id":"policy-public","owned_by":"vekil-policy","supported_endpoints":["/chat/completions"]}`), &model); err != nil {
 		t.Fatalf("decode model metadata: %v", err)
 	}
 
-	_, err := (ClaudeAdapter{}).Prepare(PrepareInput{
+	prepared, err := (ClaudeAdapter{}).Prepare(PrepareInput{
 		BaseURL:    "http://127.0.0.1:43210",
 		Model:      model,
-		Binary:     "vekil-test-missing-claude-policy-binary",
+		Binary:     binary,
 		LocalToken: "test-token-placeholder",
+		DryRun:     true,
 	})
-	if err == nil || !strings.Contains(err.Error(), "policy") || !strings.Contains(err.Error(), "Anthropic ingress") {
-		t.Fatalf("Prepare() error = %v, want policy model Anthropic-ingress rejection", err)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
 	}
-	if errors.Is(err, ErrBinaryNotFound) {
-		t.Fatalf("Prepare() resolved the child binary before rejecting policy ownership: %v", err)
+	if prepared.Cleanup != nil {
+		t.Cleanup(func() { _ = prepared.Cleanup() })
+	}
+	if got := prepared.EnvSet["ANTHROPIC_MODEL"]; got != "policy-public" {
+		t.Fatalf("ANTHROPIC_MODEL = %q, want policy-public", got)
 	}
 }
 

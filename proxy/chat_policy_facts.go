@@ -382,36 +382,79 @@ func validatePolicyFactToolCalls(raw json.RawMessage, param string) ([]string, e
 		if err != nil {
 			return nil, err
 		}
-		if rawType, ok := call["type"]; ok {
-			var callType string
-			if json.Unmarshal(rawType, &callType) != nil || (callType != "" && callType != "function") {
-				return nil, newPolicyFactBuildError(callParam+".type", "only function tool calls are supported")
+		for field := range call {
+			if field != "id" && field != "type" && field != "function" && field != "custom" {
+				return nil, newPolicyFactBuildError(callParam+"."+field, "tool calls may contain only id, type, function, and custom")
 			}
 		}
 		var callID string
 		if rawID, ok := call["id"]; !ok || json.Unmarshal(rawID, &callID) != nil || strings.TrimSpace(callID) == "" {
 			return nil, newPolicyFactBuildError(callParam+".id", "tool call ID is required")
 		}
+		callID = strings.TrimSpace(callID)
+		callType := "function"
+		if rawType, ok := call["type"]; ok {
+			if json.Unmarshal(rawType, &callType) != nil || strings.TrimSpace(callType) == "" {
+				return nil, newPolicyFactBuildError(callParam+".type", "tool call type must be a string")
+			}
+			callType = strings.TrimSpace(callType)
+		}
 		ids = append(ids, callID)
-		rawFunction, ok := call["function"]
-		if !ok {
-			return nil, newPolicyFactBuildError(callParam+".function", "function is required")
-		}
-		function, err := decodePolicyFactObject(rawFunction, callParam+".function")
-		if err != nil {
-			return nil, err
-		}
-		var name string
-		if rawName, ok := function["name"]; !ok || json.Unmarshal(rawName, &name) != nil || strings.TrimSpace(name) == "" {
-			return nil, newPolicyFactBuildError(callParam+".function.name", "function name is required")
-		}
-		rawArguments, ok := function["arguments"]
-		if !ok {
-			return nil, newPolicyFactBuildError(callParam+".function.arguments", "function arguments string is required")
-		}
-		var arguments string
-		if json.Unmarshal(rawArguments, &arguments) != nil {
-			return nil, newPolicyFactBuildError(callParam+".function.arguments", "function arguments must be a string")
+
+		switch callType {
+		case "function":
+			if rawCustom, ok := call["custom"]; ok && !bytes.Equal(bytes.TrimSpace(rawCustom), []byte("null")) {
+				return nil, newPolicyFactBuildError(callParam+".custom", "custom is not valid for a function tool call")
+			}
+			rawFunction, ok := call["function"]
+			if !ok {
+				return nil, newPolicyFactBuildError(callParam+".function", "function is required")
+			}
+			function, err := decodePolicyFactObject(rawFunction, callParam+".function")
+			if err != nil {
+				return nil, err
+			}
+			var name string
+			if rawName, ok := function["name"]; !ok || json.Unmarshal(rawName, &name) != nil || strings.TrimSpace(name) == "" {
+				return nil, newPolicyFactBuildError(callParam+".function.name", "function name is required")
+			}
+			rawArguments, ok := function["arguments"]
+			if !ok {
+				return nil, newPolicyFactBuildError(callParam+".function.arguments", "function arguments string is required")
+			}
+			var arguments string
+			if json.Unmarshal(rawArguments, &arguments) != nil {
+				return nil, newPolicyFactBuildError(callParam+".function.arguments", "function arguments must be a string")
+			}
+		case "custom":
+			if !isResponsesChatReplayCallID(callID) {
+				return nil, newPolicyFactBuildError(callParam+".type", "custom tool-call history is supported only for Responses replay IDs")
+			}
+			if rawFunction, ok := call["function"]; ok && !bytes.Equal(bytes.TrimSpace(rawFunction), []byte("null")) {
+				return nil, newPolicyFactBuildError(callParam+".function", "function is not valid for a custom tool call")
+			}
+			rawCustom, ok := call["custom"]
+			if !ok {
+				return nil, newPolicyFactBuildError(callParam+".custom", "custom is required")
+			}
+			custom, err := decodePolicyFactObject(rawCustom, callParam+".custom")
+			if err != nil {
+				return nil, err
+			}
+			for field := range custom {
+				if field != "name" && field != "input" {
+					return nil, newPolicyFactBuildError(callParam+".custom."+field, "custom tool calls may contain only name and input")
+				}
+			}
+			var name, input string
+			if rawName, ok := custom["name"]; !ok || json.Unmarshal(rawName, &name) != nil || strings.TrimSpace(name) == "" {
+				return nil, newPolicyFactBuildError(callParam+".custom.name", "custom tool name is required")
+			}
+			if rawInput, ok := custom["input"]; !ok || bytes.Equal(bytes.TrimSpace(rawInput), []byte("null")) || json.Unmarshal(rawInput, &input) != nil {
+				return nil, newPolicyFactBuildError(callParam+".custom.input", "custom tool input must be a string")
+			}
+		default:
+			return nil, newPolicyFactBuildError(callParam+".type", "only function tool calls and replay-backed custom tool calls are supported")
 		}
 	}
 	return ids, nil

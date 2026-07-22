@@ -419,7 +419,7 @@ func TestChatOperationPlanDefensivelyCopiesCandidates(t *testing.T) {
 	}
 }
 
-func TestPolicyPublicIDRejectedOnResponsesWithoutUpstreamSend(t *testing.T) {
+func TestPolicyPublicIDRejectsStatefulResponsesWithoutUpstreamSend(t *testing.T) {
 	var sends atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sends.Add(1)
@@ -432,7 +432,7 @@ func TestPolicyPublicIDRejectedOnResponsesWithoutUpstreamSend(t *testing.T) {
 		t.Fatal(err)
 	}
 	recorder := httptest.NewRecorder()
-	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"coding-economy","input":"hello"}`)))
+	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"coding-economy","input":"hello","previous_response_id":"resp-upstream"}`)))
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -1215,15 +1215,7 @@ func TestPolicyClientStatsUsePublicIDNotTerminalRouteID(t *testing.T) {
 	}
 }
 
-func TestPolicyResponsesReplayIDRejectedBeforeClassifierSend(t *testing.T) {
-	modes := []struct {
-		name        string
-		profileMode string
-		runtimeMode PolicyRoutingMode
-	}{
-		{name: "observe", profileMode: policyConfigModeObserve, runtimeMode: PolicyRoutingModeObserve},
-		{name: "enforce", profileMode: policyConfigModeEnforce, runtimeMode: PolicyRoutingModeEnforce},
-	}
+func TestPolicyResponsesReplayIDRejectedInEnforceBeforeClassifierSend(t *testing.T) {
 	bodies := []struct {
 		name string
 		body string
@@ -1233,33 +1225,168 @@ func TestPolicyResponsesReplayIDRejectedBeforeClassifierSend(t *testing.T) {
 		{name: "case_folded_siblings", body: `{"model":"coding-economy","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","ID":123,"type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}],"MESSAGES":123}`},
 		{name: "case_insensitive_keys", body: `{"model":"coding-economy","messages":[{"Role":"assistant","Tool_Calls":[{"ID":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"Role":"tool","Tool_Call_ID":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`},
 	}
+	for _, request := range bodies {
+		t.Run(request.name, func(t *testing.T) {
+			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+			powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			h, err := NewProxyHandler(nil, nil, WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)), WithPolicyRoutingMode(PolicyRoutingModeEnforce))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := light.snapshot()
+			recorder := httptest.NewRecorder()
+			h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(request.body)))
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			after, _ := light.snapshot()
+			if after != before {
+				t.Fatalf("classifier/terminal sends before=%d after=%d", before, after)
+			}
+			if sends, _ := powerful.snapshot(); sends != 0 {
+				t.Fatalf("powerful sends=%d", sends)
+			}
+		})
+	}
+}
+
+func TestPolicyAmbiguousCustomReplayRejectedBeforeObserveClassifierSend(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	h, err := NewProxyHandler(nil, nil,
+		WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeObserve)),
+		WithPolicyRoutingMode(PolicyRoutingModeObserve),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := light.snapshot()
+	body := `{
+		"model":"coding-economy",
+		"messages":[
+			{"role":"assistant","tool_calls":[{
+				"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA",
+				"type":"custom",
+				"custom":{"name":"apply_patch","input":"patch"},
+				"function":{"name":"apply_patch","arguments":"{}"}
+			}]},
+			{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"done"}
+		]
+	}`
+	recorder := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	waitCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := h.WaitLifecycleWorkers(waitCtx); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := light.snapshot()
+	if after != before {
+		t.Fatalf("classifier/terminal sends before=%d after=%d", before, after)
+	}
+	if sends, _ := powerful.snapshot(); sends != 0 {
+		t.Fatalf("powerful sends=%d", sends)
+	}
+}
+
+func TestPolicyResponsesReplayContinuationPlansDeterministicBaseline(t *testing.T) {
+	modes := []struct {
+		name        string
+		profileMode string
+		runtimeMode PolicyRoutingMode
+	}{
+		{name: "off", profileMode: policyConfigModeEnforce, runtimeMode: PolicyRoutingModeOff},
+		{name: "observe", profileMode: policyConfigModeObserve, runtimeMode: PolicyRoutingModeObserve},
+	}
+	body := []byte(`{"model":"coding-economy","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`)
 	for _, mode := range modes {
-		for _, request := range bodies {
-			t.Run(mode.name+"/"+request.name, func(t *testing.T) {
-				light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
-				powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
-				h, err := NewProxyHandler(nil, nil, WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, mode.profileMode)), WithPolicyRoutingMode(mode.runtimeMode))
-				if err != nil {
-					t.Fatal(err)
+		t.Run(mode.name, func(t *testing.T) {
+			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+			powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			h, err := NewProxyHandler(nil, nil, WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, mode.profileMode)), WithPolicyRoutingMode(mode.runtimeMode))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+
+			plan, err := h.planOpenAIChatPolicy(t.Context(), "coding-economy", body)
+			if err != nil {
+				t.Fatalf("planOpenAIChatPolicy() error = %v", err)
+			}
+			if !plan.valid() {
+				t.Fatalf("plan = %+v, want valid baseline plan", plan)
+			}
+			if plan.selectedTier != policyTierLightweight || len(plan.candidateSnapshot()) != 1 {
+				t.Fatalf("plan tier/candidates = %s/%d, want lightweight/1", plan.selectedTier, len(plan.candidateSnapshot()))
+			}
+			if !plan.allowsResponsesReplayPassthrough() {
+				t.Fatalf("plan = %+v, want Responses replay passthrough", plan)
+			}
+			if mode.runtimeMode == PolicyRoutingModeObserve {
+				waitCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				if err := h.WaitLifecycleWorkers(waitCtx); err != nil {
+					t.Fatalf("WaitLifecycleWorkers() error = %v", err)
 				}
-				if err := h.InitializePolicyRouting(t.Context()); err != nil {
-					t.Fatal(err)
-				}
-				before, _ := light.snapshot()
-				recorder := httptest.NewRecorder()
-				h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(request.body)))
-				if recorder.Code != http.StatusBadRequest {
-					t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
-				}
-				after, _ := light.snapshot()
-				if after != before {
-					t.Fatalf("classifier/terminal sends before=%d after=%d", before, after)
-				}
-				if sends, _ := powerful.snapshot(); sends != 0 {
-					t.Fatalf("powerful sends=%d", sends)
-				}
+			}
+		})
+	}
+}
+
+func TestPolicyResponsesReplayContinuationRejectsNondeterministicBaseline(t *testing.T) {
+	modes := []struct {
+		name        string
+		profileMode string
+		runtimeMode PolicyRoutingMode
+	}{
+		{name: "off", profileMode: policyConfigModeEnforce, runtimeMode: PolicyRoutingModeOff},
+		{name: "observe", profileMode: policyConfigModeObserve, runtimeMode: PolicyRoutingModeObserve},
+	}
+	body := []byte(`{"model":"coding-economy","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`)
+	for _, mode := range modes {
+		t.Run(mode.name, func(t *testing.T) {
+			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+			powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, mode.profileMode)
+			cfg.ModelRoutes[0].Targets = append(cfg.ModelRoutes[0].Targets, ModelRouteTargetConfig{
+				ID: "light-secondary", Provider: "light-provider", UpstreamModel: "light-model-secondary",
 			})
-		}
+			h, err := NewProxyHandler(nil, nil, WithProvidersConfig(cfg), WithPolicyRoutingMode(mode.runtimeMode))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := light.snapshot()
+
+			plan, err := h.planOpenAIChatPolicy(t.Context(), "coding-economy", body)
+			if err == nil {
+				t.Fatalf("planOpenAIChatPolicy() plan = %+v, want replay rejection", plan)
+			}
+			var requestErr *providerRequestError
+			if !errors.As(err, &requestErr) || requestErr.statusCode != http.StatusBadRequest {
+				t.Fatalf("planOpenAIChatPolicy() error = %T %v, want 400 providerRequestError", err, err)
+			}
+			after, _ := light.snapshot()
+			if after != before {
+				t.Fatalf("classifier/terminal sends before=%d after=%d", before, after)
+			}
+			if sends, _ := powerful.snapshot(); sends != 0 {
+				t.Fatalf("powerful sends=%d", sends)
+			}
+		})
 	}
 }
 
