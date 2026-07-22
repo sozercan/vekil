@@ -126,7 +126,7 @@ The client should restart that assistant tool-call turn rather than attempting t
 
 ## Responses Compatibility Endpoints
 
-Schema-v2 policy public IDs are accepted by bounded stateless `POST /v1/responses` compatibility. It requires `store: false` or omitted, rejects `previous_response_id`, accepts text plus function/namespace-child tools, converts the request to canonical Chat for policy planning, and converts the aggregated Chat result back to Responses JSON/SSE. Hosted/custom tools, images, the websocket bridge, compact, memory summarization, and native Responses terminal selection remain unsupported for policy IDs. Existing direct Responses behavior is unchanged.
+Schema-v2 policy public IDs are accepted by bounded stateless `POST /v1/responses` compatibility. It requires `store: false` or omitted, rejects `previous_response_id`, accepts text, bounded `text.format` (`text`, `json_object`, or `json_schema`) structured output, and function/namespace-child tools, converts the request to canonical Chat for policy planning, and converts the aggregated Chat result back to Responses JSON/SSE. Completed terminal output must honor required or forced `tool_choice` constraints. Hosted/custom tools, images, the websocket bridge, compact, memory summarization, and native Responses terminal selection remain unsupported for policy IDs. Existing direct Responses behavior is unchanged.
 
 Supported OpenAI/Codex-style routes:
 

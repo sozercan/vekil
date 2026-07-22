@@ -19,6 +19,7 @@ type policyResponsesResponse struct {
 	Status            string                       `json:"status"`
 	Model             string                       `json:"model"`
 	ParallelToolCalls bool                         `json:"parallel_tool_calls"`
+	Text              json.RawMessage              `json:"text,omitempty"`
 	ToolChoice        json.RawMessage              `json:"tool_choice"`
 	Tools             json.RawMessage              `json:"tools"`
 	Output            []map[string]any             `json:"output"`
@@ -65,6 +66,7 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 		Status:            "completed",
 		Model:             strings.TrimSpace(publicModel),
 		ParallelToolCalls: responseConfig.ParallelToolCalls,
+		Text:              cloneReplayRawMessage(responseConfig.Text),
 		ToolChoice:        cloneReplayRawMessage(responseConfig.ToolChoice),
 		Tools:             cloneReplayRawMessage(responseConfig.Tools),
 		Output:            make([]map[string]any, 0, 1+len(choice.Message.ToolCalls)),
@@ -82,6 +84,9 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 	case "stop":
 		if len(choice.Message.ToolCalls) > 0 {
 			return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned function calls with finish reason %q", finishReason)
+		}
+		if responseConfig.RequiresToolCall {
+			return policyResponsesResponse{}, fmt.Errorf("policy Chat completion stopped without the required function call")
 		}
 	case "tool_calls", "function_call":
 		if len(choice.Message.ToolCalls) == 0 {

@@ -194,17 +194,19 @@ this flow. Vekil instead injects a transient, per-launch
 - `supports_websockets=false` keeps the launcher on deterministic HTTP Responses;
 - for a policy-owned Chat model, Vekil disables hosted web search, remote
   compaction, Responses Lite, and code-only tool modes; removes Codex's freeform `apply_patch` declaration; and translates
-  stateless Responses messages plus function/namespace tools through canonical
-  Chat; namespace children receive deterministic Chat-safe aliases and are
-  restored in Responses function-call output;
+  stateless Responses messages, bounded `text.format` structured-output schemas,
+  and function/namespace tools through canonical Chat; namespace children receive
+  deterministic Chat-safe aliases and are restored in Responses function-call
+  output;
 - an additive `shell_environment_policy.set` override masks the local token in
   model-invoked shells without replacing user-configured exclusions; upstream
   credential names are removed from the Codex process environment.
 
 
 Pinned policy-owned Codex turns require `store: false` (Codex's launcher
-default), no `previous_response_id`, text input, and function or
-namespace-child function tools. Hosted/custom tools, images, the Responses websocket, compact/memory
+default), no `previous_response_id`, text input, optional bounded structured
+output via `codex exec --output-schema`, and function or namespace-child function
+tools. Hosted/custom tools, images, the Responses websocket, compact/memory
 routes, deferred tool discovery (`defer_loading` / `tool_search`), and provider-specific speed tiers remain unsupported. The launcher
 disables the hosted/custom features it controls. As with Copilot and Claude,
 opaque downstream replay IDs can continue only in `off` or `observe` with one

@@ -54,10 +54,14 @@ Direct public models and direct exposed terminal routes retain their existing en
 Policy Responses compatibility is deliberately not near-zero-copy passthrough.
 It converts bounded Responses input into canonical Chat, applies policy planning,
 executes the selected native-Chat terminal, aggregates the terminal result, and
-emits Responses JSON/SSE. It accepts Codex-style full stateless history,
+emits Responses JSON/SSE. Bounded `text.format` values are mapped to Chat
+`response_format`, including Codex `--output-schema` JSON schemas. It accepts
+Codex-style full stateless history,
 including prior `function_call` plus `function_call_output` items. Namespace
 children are flattened to deterministic names of at most 64 characters and
-mapped back to `namespace` plus `name` in the returned function call. The
+mapped back to `namespace` plus `name` in the returned function call. Completed
+terminal output is checked against `tool_choice`; required or forced choices
+cannot complete without a matching function call. The
 launcher disables hosted web search, remote compaction, freeform apply-patch,
 Responses Lite, code-only tool modes, and inherited speed tiers for policy-owned
 Codex models. Deferred tool discovery remains unsupported: `defer_loading: true`

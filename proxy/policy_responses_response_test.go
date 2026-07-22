@@ -172,16 +172,18 @@ func TestPolicyResponsesRejectsMalformedTerminalFinishReason(t *testing.T) {
 	}
 	tools := policyResponsesToolMap{"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction}}
 	for _, tc := range []struct {
-		name            string
-		finishReason    string
-		hasFinishReason bool
-		withCall        bool
-		wantError       string
+		name             string
+		finishReason     string
+		hasFinishReason  bool
+		withCall         bool
+		requiresToolCall bool
+		wantError        string
 	}{
 		{name: "missing", wantError: "no finish reason"},
 		{name: "empty", finishReason: "  ", hasFinishReason: true, wantError: "no finish reason"},
 		{name: "unknown", finishReason: "mystery", hasFinishReason: true, wantError: "unsupported finish reason"},
 		{name: "stop with call", finishReason: "stop", hasFinishReason: true, withCall: true, wantError: "function calls with finish reason"},
+		{name: "required call omitted", finishReason: "stop", hasFinishReason: true, requiresToolCall: true, wantError: "required function call"},
 		{name: "tool calls without call", finishReason: "tool_calls", hasFinishReason: true, wantError: "without function calls"},
 		{name: "legacy function call without call", finishReason: "function_call", hasFinishReason: true, wantError: "without function calls"},
 	} {
@@ -195,6 +197,10 @@ func TestPolicyResponsesRejectsMalformedTerminalFinishReason(t *testing.T) {
 			if tc.withCall {
 				calls = []models.OpenAIToolCall{call}
 			}
+			var config []policyResponsesResponseConfig
+			if tc.requiresToolCall {
+				config = append(config, policyResponsesResponseConfig{RequiresToolCall: true, ParallelToolCalls: true})
+			}
 			_, err := buildPolicyResponsesResponse(&models.OpenAIResponse{Choices: []models.OpenAIChoice{{
 				Index: 0,
 				Message: models.OpenAIMessage{
@@ -203,7 +209,7 @@ func TestPolicyResponsesRejectsMalformedTerminalFinishReason(t *testing.T) {
 					ToolCalls: calls,
 				},
 				FinishReason: finishReason,
-			}}}, "policy", tools)
+			}}}, "policy", tools, config...)
 			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
 				t.Fatalf("error = %v, want %q", err, tc.wantError)
 			}
@@ -288,6 +294,18 @@ func TestPolicyResponsesIncompleteDoesNotCompleteOrDispatchPartialToolCall(t *te
 			}
 		})
 	}
+	t.Run("required tool choice remains incomplete", func(t *testing.T) {
+		finishReason := "length"
+		response, err := buildPolicyResponsesResponse(&models.OpenAIResponse{Choices: []models.OpenAIChoice{{
+			Index: 0, Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"partial"`)}, FinishReason: &finishReason,
+		}}}, "policy", nil, policyResponsesResponseConfig{RequiresToolCall: true, ParallelToolCalls: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.Status != "incomplete" {
+			t.Fatalf("status = %q, want incomplete", response.Status)
+		}
+	})
 }
 
 func TestPolicyResponsesRejectsTerminalCallsOutsideRequestCapability(t *testing.T) {
@@ -320,6 +338,17 @@ func TestPolicyResponsesRejectsTerminalCallsOutsideRequestCapability(t *testing.
 		})
 		if err == nil || !strings.Contains(err.Error(), "duplicate function call ID") {
 			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("required call satisfied", func(t *testing.T) {
+		response, err := buildPolicyResponsesResponse(completion(call("call-required", "lookup")), "policy", policyResponsesToolMap{
+			"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction},
+		}, policyResponsesResponseConfig{RequiresToolCall: true, ParallelToolCalls: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(response.Output) != 1 || response.Output[0]["call_id"] != "call-required" {
+			t.Fatalf("output = %+v", response.Output)
 		}
 	})
 	t.Run("parallel calls disabled", func(t *testing.T) {

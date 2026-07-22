@@ -82,6 +82,91 @@ func TestTranslatePolicyResponsesRequestToChatBasicCodexRequest(t *testing.T) {
 	}
 }
 
+func TestTranslatePolicyResponsesRequestToChatStructuredOutput(t *testing.T) {
+	body := []byte(`{
+		"model":"policy",
+		"input":"return JSON",
+		"store":false,
+		"text":{"format":{"type":"json_schema","name":"result","description":"result shape","schema":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false},"strict":true}}
+	}`)
+	got, err := translatePolicyResponsesRequestToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat models.OpenAIRequest
+	if err := json.Unmarshal(got.Body, &chat); err != nil {
+		t.Fatal(err)
+	}
+	var format struct {
+		Type       string `json:"type"`
+		JSONSchema struct {
+			Name        string          `json:"name"`
+			Description string          `json:"description"`
+			Schema      json.RawMessage `json:"schema"`
+			Strict      *bool           `json:"strict"`
+		} `json:"json_schema"`
+	}
+	if err := json.Unmarshal(chat.ResponseFormat, &format); err != nil {
+		t.Fatalf("decode response_format: %v; body=%s", err, got.Body)
+	}
+	if format.Type != "json_schema" || format.JSONSchema.Name != "result" || format.JSONSchema.Description != "result shape" || format.JSONSchema.Strict == nil || !*format.JSONSchema.Strict {
+		t.Fatalf("response_format = %+v", format)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(format.JSONSchema.Schema, &schema); err != nil || schema["type"] != "object" {
+		t.Fatalf("schema = %#v, error = %v", schema, err)
+	}
+	if !strings.Contains(string(got.Response.Text), `"type":"json_schema"`) || !strings.Contains(string(got.Response.Text), `"name":"result"`) {
+		t.Fatalf("response text metadata = %s", got.Response.Text)
+	}
+}
+
+func TestTranslatePolicyResponsesRequestToChatSimpleTextFormats(t *testing.T) {
+	for _, formatType := range []string{"text", "json_object"} {
+		t.Run(formatType, func(t *testing.T) {
+			body := []byte(`{"model":"policy","input":"hi","text":{"format":{"type":` + string(policyResponsesJSONString(formatType)) + `}}}`)
+			got, err := translatePolicyResponsesRequestToChat(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var chat models.OpenAIRequest
+			if err := json.Unmarshal(got.Body, &chat); err != nil {
+				t.Fatal(err)
+			}
+			var format map[string]any
+			if err := json.Unmarshal(chat.ResponseFormat, &format); err != nil {
+				t.Fatal(err)
+			}
+			if format["type"] != formatType {
+				t.Fatalf("response_format = %#v", format)
+			}
+		})
+	}
+}
+
+func TestTranslatePolicyResponsesRequestToChatTracksRequiredToolChoice(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		choice   string
+		required bool
+	}{
+		{name: "auto", choice: `"auto"`},
+		{name: "required", choice: `"required"`, required: true},
+		{name: "forced function", choice: `{"type":"function","name":"lookup"}`, required: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"policy","input":"hi","tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":` + tc.choice + `}`)
+			got, err := translatePolicyResponsesRequestToChat(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Response.RequiresToolCall != tc.required {
+				t.Fatalf("RequiresToolCall = %v, want %v", got.Response.RequiresToolCall, tc.required)
+			}
+		})
+	}
+}
+
 func TestTranslatePolicyResponsesRequestToChatAcceptsNullReasoningFromCodex(t *testing.T) {
 	got, err := translatePolicyResponsesRequestToChat([]byte(`{"model":"policy","input":"hi","reasoning":null,"store":false,"stream":true}`))
 	if err != nil {
@@ -409,6 +494,11 @@ func TestTranslatePolicyResponsesRequestToChatRejectsUnsupportedOrAmbiguousReque
 		{name: "unknown reasoning field", body: `{"model":"policy","input":"hi","reasoning":{"effort":"high","context":"large"}}`, wantParam: "reasoning.context", wantText: "unsupported"},
 		{name: "invalid reasoning summary type", body: `{"model":"policy","input":"hi","reasoning":{"summary":true}}`, wantParam: "reasoning.summary", wantText: "auto, concise, or detailed"},
 		{name: "invalid reasoning summary value", body: `{"model":"policy","input":"hi","reasoning":{"summary":"verbose"}}`, wantParam: "reasoning.summary", wantText: "auto, concise, or detailed"},
+		{name: "unknown text field", body: `{"model":"policy","input":"hi","text":{"verbosity":"high"}}`, wantParam: "text.verbosity", wantText: "unsupported"},
+		{name: "unknown text format field", body: `{"model":"policy","input":"hi","text":{"format":{"type":"json_object","extra":true}}}`, wantParam: "text.format.extra", wantText: "unsupported"},
+		{name: "unsupported text format", body: `{"model":"policy","input":"hi","text":{"format":{"type":"regex"}}}`, wantParam: "text.format.type", wantText: "unsupported"},
+		{name: "missing schema name", body: `{"model":"policy","input":"hi","text":{"format":{"type":"json_schema","schema":{}}}}`, wantParam: "text.format.name", wantText: "required"},
+		{name: "null schema", body: `{"model":"policy","input":"hi","text":{"format":{"type":"json_schema","name":"result","schema":null}}}`, wantParam: "text.format.schema", wantText: "object"},
 		{name: "invalid include", body: `{"model":"policy","input":"hi","include":["response.output_text.logprobs"]}`, wantParam: "include[0]", wantText: "reasoning.encrypted_content"},
 		{name: "invalid metadata value", body: `{"model":"policy","input":"hi","client_metadata":{"attempt":1}}`, wantParam: "client_metadata.attempt", wantText: "bounded strings"},
 		{name: "zero max output", body: `{"model":"policy","input":"hi","max_output_tokens":0}`, wantParam: "max_output_tokens", wantText: "positive integer"},

@@ -55,9 +55,11 @@ type policyResponsesChatRequest struct {
 }
 
 type policyResponsesResponseConfig struct {
+	Text              json.RawMessage
 	Tools             json.RawMessage
 	ToolChoice        json.RawMessage
 	ParallelToolCalls bool
+	RequiresToolCall  bool
 }
 
 type policyResponsesParsedTool struct {
@@ -93,6 +95,7 @@ type policyResponsesCanonicalChatRequest struct {
 	Tools               []models.OpenAITool    `json:"tools,omitempty"`
 	ToolChoice          json.RawMessage        `json:"tool_choice,omitempty"`
 	ParallelToolCalls   *bool                  `json:"parallel_tool_calls,omitempty"`
+	ResponseFormat      json.RawMessage        `json:"response_format,omitempty"`
 	ReasoningEffort     string                 `json:"reasoning_effort,omitempty"`
 }
 
@@ -138,6 +141,10 @@ func translatePolicyResponsesRequestToChat(body []byte) (policyResponsesChatRequ
 		return policyResponsesChatRequest{}, err
 	}
 	toolChoice, err := parsePolicyResponsesToolChoice(root["tool_choice"])
+	if err != nil {
+		return policyResponsesChatRequest{}, err
+	}
+	responseFormat, responseText, err := translatePolicyResponsesTextConfiguration(root["text"])
 	if err != nil {
 		return policyResponsesChatRequest{}, err
 	}
@@ -231,6 +238,7 @@ func translatePolicyResponsesRequestToChat(body []byte) (policyResponsesChatRequ
 		Tools:               chatTools,
 		ToolChoice:          chatToolChoice,
 		ParallelToolCalls:   parallel,
+		ResponseFormat:      responseFormat,
 		ReasoningEffort:     reasoningEffort,
 	}
 	chatBody, err := json.Marshal(canonical)
@@ -247,7 +255,8 @@ func translatePolicyResponsesRequestToChat(body []byte) (policyResponsesChatRequ
 		Tools:         reverseTools,
 		CallableTools: callableTools,
 		Response: policyResponsesResponseConfig{
-			Tools: responseTools, ToolChoice: responseToolChoice, ParallelToolCalls: responseParallel,
+			Text: responseText, Tools: responseTools, ToolChoice: responseToolChoice, ParallelToolCalls: responseParallel,
+			RequiresToolCall: toolChoice.mode == "required" || toolChoice.descriptor != nil,
 		},
 	}, nil
 }
@@ -274,9 +283,77 @@ func policyResponsesCallableTools(parsed []policyResponsesParsedTool, aliases ma
 	return callable
 }
 
+func translatePolicyResponsesTextConfiguration(raw json.RawMessage) (json.RawMessage, json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, nil, nil
+	}
+	text, err := decodeChatJSONObject(raw, "text")
+	if err != nil {
+		return nil, nil, newChatInvalidRequest("text", "text must be an object")
+	}
+	if err := validatePolicyResponsesObjectFields(text, "text", "format"); err != nil {
+		return nil, nil, err
+	}
+	formatRaw, ok := text["format"]
+	if !ok || bytes.Equal(bytes.TrimSpace(formatRaw), []byte("null")) {
+		return nil, cloneReplayRawMessage(raw), nil
+	}
+	format, err := decodeChatJSONObject(formatRaw, "text.format")
+	if err != nil {
+		return nil, nil, newChatInvalidRequest("text.format", "format must be an object")
+	}
+	formatType, err := requiredPolicyResponsesStringAt(format, "type", "text.format.type", 128)
+	if err != nil {
+		return nil, nil, err
+	}
+	switch formatType {
+	case "text", "json_object":
+		if err := validatePolicyResponsesObjectFields(format, "text.format", "type"); err != nil {
+			return nil, nil, err
+		}
+		chatFormat, _ := json.Marshal(map[string]string{"type": formatType})
+		return chatFormat, cloneReplayRawMessage(raw), nil
+	case "json_schema":
+		if err := validatePolicyResponsesObjectFields(format, "text.format", "type", "name", "description", "schema", "strict"); err != nil {
+			return nil, nil, err
+		}
+		name, err := requiredPolicyResponsesStringAt(format, "name", "text.format.name", policyResponsesMaxToolNameLen)
+		if err != nil {
+			return nil, nil, err
+		}
+		description, err := optionalPolicyResponsesTextAt(format, "description", "text.format.description", policyResponsesMaxDescriptionLen)
+		if err != nil {
+			return nil, nil, err
+		}
+		schemaRaw, ok := format["schema"]
+		if !ok {
+			return nil, nil, newChatInvalidRequest("text.format.schema", "schema is required")
+		}
+		if _, err := decodeChatJSONObject(schemaRaw, "text.format.schema"); err != nil {
+			return nil, nil, newChatInvalidRequest("text.format.schema", "schema must be an object")
+		}
+		strict, err := policyResponsesOptionalBool(format, "strict")
+		if err != nil {
+			return nil, nil, prefixPolicyResponsesError(err, "text.format")
+		}
+		jsonSchema := map[string]any{"name": name, "schema": cloneReplayRawMessage(schemaRaw)}
+		if description != "" {
+			jsonSchema["description"] = description
+		}
+		if strict != nil {
+			jsonSchema["strict"] = *strict
+		}
+		chatFormat, _ := json.Marshal(map[string]any{"type": "json_schema", "json_schema": jsonSchema})
+		return chatFormat, cloneReplayRawMessage(raw), nil
+	default:
+		return nil, nil, newChatInvalidRequest("text.format.type", "unsupported text format type")
+	}
+}
+
 func validatePolicyResponsesTopLevel(root map[string]json.RawMessage) error {
 	allowed := map[string]struct{}{
-		"model": {}, "instructions": {}, "input": {}, "tools": {}, "tool_choice": {},
+		"model": {}, "instructions": {}, "input": {}, "text": {}, "tools": {}, "tool_choice": {},
 		"parallel_tool_calls": {}, "reasoning": {}, "store": {}, "stream": {},
 		"max_output_tokens": {}, "temperature": {}, "top_p": {}, "previous_response_id": {},
 		"include": {}, "prompt_cache_key": {}, "client_metadata": {}, "metadata": {},

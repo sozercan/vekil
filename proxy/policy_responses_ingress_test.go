@@ -376,6 +376,61 @@ func TestPolicyResponsesChatUpstreamErrorDrainsAndClosesBody(t *testing.T) {
 	}
 }
 
+func TestPolicyResponsesIngressTranslatesStructuredOutput(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		var request models.OpenAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var format struct {
+			Type       string `json:"type"`
+			JSONSchema struct {
+				Name   string          `json:"name"`
+				Schema json.RawMessage `json:"schema"`
+				Strict *bool           `json:"strict"`
+			} `json:"json_schema"`
+		}
+		if err := json.Unmarshal(request.ResponseFormat, &format); err != nil {
+			t.Errorf("decode response_format: %v", err)
+		}
+		if format.Type != "json_schema" || format.JSONSchema.Name != "result" || format.JSONSchema.Strict == nil || !*format.JSONSchema.Strict {
+			t.Errorf("response_format = %+v", format)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"chat-schema\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"{\\\"ok\\\":true}\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"chat-schema\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"chat-schema\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+		WithProvidersConfig(policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)),
+		WithPolicyRoutingMode(PolicyRoutingModeOff),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"coding-economy",
+		"input":"return JSON",
+		"store":false,
+		"stream":true,
+		"text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false},"strict":true}}
+	}`)))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: response.completed") || !strings.Contains(body, `"text":{"format":{"type":"json_schema"`) || !strings.Contains(body, `{\"ok\":true}`) {
+		t.Fatalf("structured policy response is incomplete: %s", body)
+	}
+}
+
 func TestPolicyResponsesIngressAllowsStreamWithoutUsage(t *testing.T) {
 	var request map[string]json.RawMessage
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -469,6 +524,16 @@ func TestPolicyResponsesIngressRejectsMalformedTerminalCompletion(t *testing.T) 
 			responseBody: "data: {\"id\":\"chat-custom-call\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-custom\",\"type\":\"custom\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n" +
 				"data: {\"id\":\"chat-custom-call\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
 				"data: {\"id\":\"chat-custom-call\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n" +
+				"data: [DONE]\n\n",
+		},
+		{
+			name:           "required tool choice ignored",
+			requestBody:    `{"model":"coding-economy","input":"use lookup","store":false,"stream":true,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"required"}`,
+			upstreamStream: true,
+			contentType:    "text/event-stream",
+			responseBody: "data: {\"id\":\"chat-required-stop\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"no tool\"}}]}\n\n" +
+				"data: {\"id\":\"chat-required-stop\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+				"data: {\"id\":\"chat-required-stop\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n" +
 				"data: [DONE]\n\n",
 		},
 		{
