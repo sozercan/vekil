@@ -300,7 +300,7 @@ func TestTranslatePolicyResponsesRequestToChatAliasesAreDeterministicAndBounded(
 			t.Fatalf("alias length = %d for %q", len(alias), alias)
 		}
 		for _, r := range alias {
-			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+			if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '_' && r != '-' {
 				t.Fatalf("alias %q contains non-Chat-safe rune %q", alias, r)
 			}
 		}

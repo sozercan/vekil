@@ -353,6 +353,29 @@ func TestPolicyResponsesIngressEnforceSelectsPowerfulAndReturnsJSON(t *testing.T
 	}
 }
 
+func TestPolicyResponsesChatUpstreamErrorDrainsAndClosesBody(t *testing.T) {
+	body := newTrackingReadCloser(strings.Repeat("x", upstreamErrorDetailMaxBodyBytes*2))
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Retry-After": []string{"1"}},
+		Body:       body,
+	}
+
+	got := policyResponsesChatUpstreamError(response)
+	if got.StatusCode != http.StatusTooManyRequests || got.Type != "rate_limit_error" || got.Message != "upstream request failed" {
+		t.Fatalf("error = %+v", got)
+	}
+	if got.Headers.Get("Retry-After") != "1" {
+		t.Fatalf("Retry-After = %q, want 1", got.Headers.Get("Retry-After"))
+	}
+	if body.bytesRead != upstreamErrorDetailMaxBodyBytes {
+		t.Fatalf("body bytes read = %d, want bounded drain of %d", body.bytesRead, upstreamErrorDetailMaxBodyBytes)
+	}
+	if !body.closed {
+		t.Fatal("upstream error body was not closed")
+	}
+}
+
 func TestPolicyResponsesIngressSanitizesTerminalFailure(t *testing.T) {
 	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
 	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})

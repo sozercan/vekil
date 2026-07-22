@@ -137,13 +137,7 @@ func (h *ProxyHandler) collectPolicyResponsesChatCompletion(ctx context.Context,
 		return nil, fmt.Errorf("policy Chat execution returned no response")
 	}
 	if result.Response.StatusCode != http.StatusOK {
-		defer func() { _ = result.Response.Body.Close() }()
-		return nil, &chatExecutionError{
-			StatusCode: result.Response.StatusCode,
-			Type:       openAIErrorTypeForHTTPStatus(result.Response.StatusCode),
-			Message:    "upstream request failed",
-			Headers:    result.Response.Header.Clone(),
-		}
+		return nil, policyResponsesChatUpstreamError(result.Response)
 	}
 	if mode.clientRequestedStream || mode.forceUpstreamStream || strings.Contains(strings.ToLower(result.Response.Header.Get("Content-Type")), "text/event-stream") {
 		completion, terminalResponse, err := h.aggregateExplicitChatCompletionsResponse(ctx, result.Response, body, mode, aggregateStreamToResponseWithProgress)
@@ -151,13 +145,7 @@ func (h *ProxyHandler) collectPolicyResponsesChatCompletion(ctx context.Context,
 			return nil, err
 		}
 		if terminalResponse != nil {
-			defer func() { _ = terminalResponse.Body.Close() }()
-			return nil, &chatExecutionError{
-				StatusCode: terminalResponse.StatusCode,
-				Type:       openAIErrorTypeForHTTPStatus(terminalResponse.StatusCode),
-				Message:    "upstream request failed",
-				Headers:    terminalResponse.Header.Clone(),
-			}
+			return nil, policyResponsesChatUpstreamError(terminalResponse)
 		}
 		if completion == nil {
 			return nil, fmt.Errorf("policy Chat stream returned no completion")
@@ -178,6 +166,18 @@ func (h *ProxyHandler) collectPolicyResponsesChatCompletion(ctx context.Context,
 		return nil, fmt.Errorf("decode policy Chat completion: %w", err)
 	}
 	return &completion, nil
+}
+
+func policyResponsesChatUpstreamError(response *http.Response) *chatExecutionError {
+	status := response.StatusCode
+	headers := response.Header.Clone()
+	drainAndClose(response.Body)
+	return &chatExecutionError{
+		StatusCode: status,
+		Type:       openAIErrorTypeForHTTPStatus(status),
+		Message:    "upstream request failed",
+		Headers:    headers,
+	}
 }
 
 func observePolicyResponsesExecutionError(ctx context.Context, err error) {
