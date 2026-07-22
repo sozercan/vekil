@@ -42,9 +42,6 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 	if len(completion.Choices) == 0 {
 		return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned no choices")
 	}
-	if completion.Usage == nil && len(config) > 0 {
-		return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned no token usage")
-	}
 	choice := completion.Choices[0]
 	responseConfig := policyResponsesResponseConfig{Tools: json.RawMessage(`[]`), ToolChoice: json.RawMessage(`"auto"`), ParallelToolCalls: true}
 	if len(config) > 0 {
@@ -89,6 +86,9 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 	case "tool_calls", "function_call":
 		if len(choice.Message.ToolCalls) == 0 {
 			return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned finish reason %q without function calls", finishReason)
+		}
+		if !responseConfig.ParallelToolCalls && len(choice.Message.ToolCalls) > 1 {
+			return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned parallel function calls while parallel_tool_calls is false")
 		}
 	case "length":
 		response.Status = "incomplete"

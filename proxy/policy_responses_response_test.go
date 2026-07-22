@@ -109,13 +109,19 @@ func TestPolicyResponsesResponseIncludesNormalizedToolMetadata(t *testing.T) {
 	}
 }
 
-func TestPolicyResponsesResponseRejectsMissingUsageForWireResponse(t *testing.T) {
+func TestPolicyResponsesResponseNormalizesMissingUsage(t *testing.T) {
 	finishReason := "stop"
-	_, err := buildPolicyResponsesResponse(&models.OpenAIResponse{Choices: []models.OpenAIChoice{{
+	response, err := buildPolicyResponsesResponse(&models.OpenAIResponse{Choices: []models.OpenAIChoice{{
 		Index: 0, Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)}, FinishReason: &finishReason,
 	}}}, "policy", nil, policyResponsesResponseConfig{})
-	if err == nil || !strings.Contains(err.Error(), "no token usage") {
-		t.Fatalf("error = %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Usage.InputTokens != 0 || response.Usage.OutputTokens != 0 || response.Usage.TotalTokens != 0 {
+		t.Fatalf("usage = %+v, want zero-valued fallback", response.Usage)
+	}
+	if response.Usage.InputTokensDetails["cached_tokens"] != 0 || response.Usage.OutputTokensDetails["reasoning_tokens"] != 0 {
+		t.Fatalf("usage details = %+v/%+v", response.Usage.InputTokensDetails, response.Usage.OutputTokensDetails)
 	}
 }
 
@@ -314,6 +320,36 @@ func TestPolicyResponsesRejectsTerminalCallsOutsideRequestCapability(t *testing.
 		})
 		if err == nil || !strings.Contains(err.Error(), "duplicate function call ID") {
 			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("parallel calls disabled", func(t *testing.T) {
+		_, err := buildPolicyResponsesResponse(completion(call("call-a", "lookup"), call("call-b", "lookup")), "policy", policyResponsesToolMap{
+			"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction},
+		}, policyResponsesResponseConfig{ParallelToolCalls: false})
+		if err == nil || !strings.Contains(err.Error(), "parallel function calls") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("single call with parallel calls disabled", func(t *testing.T) {
+		response, err := buildPolicyResponsesResponse(completion(call("call-a", "lookup")), "policy", policyResponsesToolMap{
+			"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction},
+		}, policyResponsesResponseConfig{ParallelToolCalls: false})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(response.Output) != 1 || response.ParallelToolCalls {
+			t.Fatalf("response = %+v, want one call with parallel metadata false", response)
+		}
+	})
+	t.Run("parallel calls enabled", func(t *testing.T) {
+		response, err := buildPolicyResponsesResponse(completion(call("call-a", "lookup"), call("call-b", "lookup")), "policy", policyResponsesToolMap{
+			"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction},
+		}, policyResponsesResponseConfig{ParallelToolCalls: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(response.Output) != 2 {
+			t.Fatalf("output = %+v, want two function calls", response.Output)
 		}
 	})
 	for _, callType := range []string{"custom", "Function", " ", " function "} {

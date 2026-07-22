@@ -376,13 +376,75 @@ func TestPolicyResponsesChatUpstreamErrorDrainsAndClosesBody(t *testing.T) {
 	}
 }
 
+func TestPolicyResponsesIngressAllowsStreamWithoutUsage(t *testing.T) {
+	var request map[string]json.RawMessage
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if _, ok := request["stream_options"]; !ok {
+			t.Errorf("request is missing injected stream_options: %v", request)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"chat-no-usage\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"chat-no-usage\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+		WithProvidersConfig(policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)),
+		WithPolicyRoutingMode(PolicyRoutingModeOff),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"coding-economy",
+		"input":"hello",
+		"store":false,
+		"stream":true
+	}`)))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var completed *policyResponsesResponse
+	if err := consumeResponsesSSEMessages(strings.NewReader(recorder.Body.String()), func(msg responsesSSEMessage) error {
+		var event struct {
+			Type     string                  `json:"type"`
+			Response policyResponsesResponse `json:"response"`
+		}
+		if err := json.Unmarshal([]byte(msg.data), &event); err != nil {
+			return err
+		}
+		if event.Type == "response.completed" {
+			value := event.Response
+			completed = &value
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if completed == nil {
+		t.Fatalf("missing response.completed event: %s", recorder.Body.String())
+	}
+	if completed.Usage.InputTokens != 0 || completed.Usage.OutputTokens != 0 || completed.Usage.TotalTokens != 0 {
+		t.Fatalf("usage = %+v, want zero-valued fallback", completed.Usage)
+	}
+}
+
 func TestPolicyResponsesIngressRejectsMalformedTerminalCompletion(t *testing.T) {
 	for _, tc := range []struct {
-		name           string
-		requestBody    string
-		upstreamStream bool
-		contentType    string
-		responseBody   string
+		name              string
+		requestBody       string
+		upstreamStream    bool
+		wantParallelFalse bool
+		contentType       string
+		responseBody      string
 	}{
 		{
 			name:         "non-streaming missing finish reason",
@@ -409,6 +471,17 @@ func TestPolicyResponsesIngressRejectsMalformedTerminalCompletion(t *testing.T) 
 				"data: {\"id\":\"chat-custom-call\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n" +
 				"data: [DONE]\n\n",
 		},
+		{
+			name:              "parallel tool calls while disabled",
+			requestBody:       `{"model":"coding-economy","input":"use both","store":false,"stream":true,"parallel_tool_calls":false,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}},{"type":"function","name":"search","parameters":{"type":"object"}}]}`,
+			upstreamStream:    true,
+			wantParallelFalse: true,
+			contentType:       "text/event-stream",
+			responseBody: "data: {\"id\":\"chat-parallel-calls\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"call-b\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+				"data: {\"id\":\"chat-parallel-calls\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+				"data: {\"id\":\"chat-parallel-calls\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n" +
+				"data: [DONE]\n\n",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -421,6 +494,9 @@ func TestPolicyResponsesIngressRejectsMalformedTerminalCompletion(t *testing.T) 
 				gotStream := request.Stream != nil && *request.Stream
 				if gotStream != tc.upstreamStream {
 					t.Errorf("upstream stream = %v, want %v", gotStream, tc.upstreamStream)
+				}
+				if tc.wantParallelFalse && (request.ParallelToolCalls == nil || *request.ParallelToolCalls) {
+					t.Errorf("upstream parallel_tool_calls = %v, want false", request.ParallelToolCalls)
 				}
 				w.Header().Set("Content-Type", tc.contentType)
 				_, _ = fmt.Fprint(w, tc.responseBody)
