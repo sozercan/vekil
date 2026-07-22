@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -106,6 +108,109 @@ func TestPolicyResponsesResponseIncludesNormalizedToolMetadata(t *testing.T) {
 	}
 	if !strings.Contains(stream.Body.String(), `"parallel_tool_calls":false`) || !strings.Contains(stream.Body.String(), `"tool_choice":{"type":"function","name":"lookup"}`) {
 		t.Fatalf("stream metadata missing: %s", stream.Body.String())
+	}
+}
+
+func TestPolicyResponsesStreamEmitsCoherentEvents(t *testing.T) {
+	finishReason := "tool_calls"
+	response, err := buildPolicyResponsesResponse(&models.OpenAIResponse{
+		ID: "chat-stream", Created: 1, Model: "terminal",
+		Choices: []models.OpenAIChoice{{
+			Index: 0,
+			Message: models.OpenAIMessage{
+				Role:    "assistant",
+				Content: json.RawMessage(`"working"`),
+				ToolCalls: []models.OpenAIToolCall{{
+					ID: "call-lookup", Type: "function", Function: models.OpenAIFunctionCall{Name: "lookup", Arguments: `{"q":"x"}`},
+				}},
+			},
+			FinishReason: &finishReason,
+		}},
+		Usage: &models.OpenAIUsage{PromptTokens: 2, CompletionTokens: 1, TotalTokens: 3},
+	}, "policy", policyResponsesToolMap{"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction}}, policyResponsesResponseConfig{ParallelToolCalls: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	if err := writePolicyResponsesResult(recorder, response, true); err != nil {
+		t.Fatal(err)
+	}
+	var gotTypes []string
+	sequence := 0
+	if err := consumeResponsesSSEMessages(strings.NewReader(recorder.Body.String()), func(msg responsesSSEMessage) error {
+		var event struct {
+			Type           string `json:"type"`
+			SequenceNumber int    `json:"sequence_number"`
+		}
+		if err := json.Unmarshal([]byte(msg.data), &event); err != nil {
+			return err
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(msg.data), &payload); err != nil {
+			return err
+		}
+		switch event.Type {
+		case "response.output_text.delta", "response.output_text.done":
+			if logprobs, ok := payload["logprobs"].([]any); !ok || len(logprobs) != 0 {
+				t.Fatalf("%s logprobs = %#v, want empty array", event.Type, payload["logprobs"])
+			}
+		case "response.function_call_arguments.done":
+			if payload["name"] != "lookup" {
+				t.Fatalf("function arguments done name = %#v, want lookup", payload["name"])
+			}
+		}
+		if event.SequenceNumber != sequence {
+			t.Fatalf("sequence for %s = %d, want %d", event.Type, event.SequenceNumber, sequence)
+		}
+		sequence++
+		gotTypes = append(gotTypes, event.Type)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantTypes := []string{
+		"response.created",
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.output_text.delta",
+		"response.output_text.done",
+		"response.content_part.done",
+		"response.output_item.done",
+		"response.output_item.added",
+		"response.function_call_arguments.delta",
+		"response.function_call_arguments.done",
+		"response.output_item.done",
+		"response.completed",
+	}
+	if strings.Join(gotTypes, ",") != strings.Join(wantTypes, ",") {
+		t.Fatalf("event types = %v, want %v\n%s", gotTypes, wantTypes, recorder.Body.String())
+	}
+
+	store := newResponsesChatReplayStore()
+	defer func() { _ = store.Close() }()
+	stream, err := translateResponsesSSEToChat(context.Background(), io.NopCloser(strings.NewReader(recorder.Body.String())), responsesChatResponseOptions{
+		PublicModel: "policy",
+		ReplayStore: store,
+		ReplayRoute: responsesChatReplayRoute{ProviderID: "bridge", PublicModel: "policy", UpstreamModel: "terminal"},
+	})
+	if err != nil {
+		t.Fatalf("strict Responses stream parser rejected synthetic stream: %v\n%s", err, recorder.Body.String())
+	}
+	chunks := collectResponsesChatStreamChunks(t, stream)
+	var text strings.Builder
+	toolCalls := 0
+	for _, chunk := range chunks {
+		for _, choice := range chunk.Choices {
+			if len(choice.Delta.Content) > 0 {
+				var delta string
+				_ = json.Unmarshal(choice.Delta.Content, &delta)
+				text.WriteString(delta)
+			}
+			toolCalls += len(choice.Delta.ToolCalls)
+		}
+	}
+	if text.String() != "working" || toolCalls == 0 {
+		t.Fatalf("round-trip text/tool calls = %q/%d; chunks=%#v", text.String(), toolCalls, chunks)
 	}
 }
 

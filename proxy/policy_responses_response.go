@@ -247,6 +247,104 @@ func newPolicyResponsesID(prefix string) string {
 	return strings.TrimSpace(prefix) + "_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 }
 
+func writePolicyResponsesStreamEvent(w http.ResponseWriter, eventType string, sequence *int, payload map[string]any) error {
+	payload["type"] = eventType
+	payload["sequence_number"] = *sequence
+	if err := writeSSEEvent(w, eventType, payload); err != nil {
+		return err
+	}
+	*sequence = *sequence + 1
+	return nil
+}
+
+func writePolicyResponsesOutputEvents(w http.ResponseWriter, item map[string]any, outputIndex int, sequence *int) error {
+	itemType, _ := item["type"].(string)
+	itemID, _ := item["id"].(string)
+	if strings.TrimSpace(itemID) == "" {
+		return fmt.Errorf("policy Responses output item is missing an ID")
+	}
+	switch itemType {
+	case "message":
+		role, _ := item["role"].(string)
+		content, ok := item["content"].([]any)
+		if role != "assistant" || !ok {
+			return fmt.Errorf("policy Responses message output is malformed")
+		}
+		if err := writePolicyResponsesStreamEvent(w, "response.output_item.added", sequence, map[string]any{
+			"output_index": outputIndex,
+			"item":         map[string]any{"id": itemID, "type": "message", "status": "in_progress", "role": "assistant", "content": []any{}},
+		}); err != nil {
+			return err
+		}
+		for contentIndex, rawPart := range content {
+			part, ok := rawPart.(map[string]any)
+			if !ok || part["type"] != "output_text" {
+				return fmt.Errorf("policy Responses message content is malformed")
+			}
+			text, ok := part["text"].(string)
+			if !ok {
+				return fmt.Errorf("policy Responses message text is malformed")
+			}
+			emptyPart := map[string]any{"type": "output_text", "text": "", "annotations": []any{}}
+			finalPart := map[string]any{"type": "output_text", "text": text, "annotations": []any{}}
+			base := map[string]any{"item_id": itemID, "output_index": outputIndex, "content_index": contentIndex}
+			if err := writePolicyResponsesStreamEvent(w, "response.content_part.added", sequence, map[string]any{
+				"item_id": itemID, "output_index": outputIndex, "content_index": contentIndex, "part": emptyPart,
+			}); err != nil {
+				return err
+			}
+			if err := writePolicyResponsesStreamEvent(w, "response.output_text.delta", sequence, map[string]any{
+				"item_id": base["item_id"], "output_index": base["output_index"], "content_index": base["content_index"], "delta": text, "logprobs": []any{},
+			}); err != nil {
+				return err
+			}
+			if err := writePolicyResponsesStreamEvent(w, "response.output_text.done", sequence, map[string]any{
+				"item_id": base["item_id"], "output_index": base["output_index"], "content_index": base["content_index"], "text": text, "logprobs": []any{},
+			}); err != nil {
+				return err
+			}
+			if err := writePolicyResponsesStreamEvent(w, "response.content_part.done", sequence, map[string]any{
+				"item_id": base["item_id"], "output_index": base["output_index"], "content_index": base["content_index"], "part": finalPart,
+			}); err != nil {
+				return err
+			}
+		}
+	case "function_call":
+		callID, _ := item["call_id"].(string)
+		name, _ := item["name"].(string)
+		arguments, ok := item["arguments"].(string)
+		if strings.TrimSpace(callID) == "" || strings.TrimSpace(name) == "" || !ok {
+			return fmt.Errorf("policy Responses function-call output is malformed")
+		}
+		added := map[string]any{
+			"id": itemID, "type": "function_call", "status": "in_progress", "call_id": callID, "name": name, "arguments": "",
+		}
+		if namespace, _ := item["namespace"].(string); namespace != "" {
+			added["namespace"] = namespace
+		}
+		if err := writePolicyResponsesStreamEvent(w, "response.output_item.added", sequence, map[string]any{
+			"output_index": outputIndex, "item": added,
+		}); err != nil {
+			return err
+		}
+		if err := writePolicyResponsesStreamEvent(w, "response.function_call_arguments.delta", sequence, map[string]any{
+			"item_id": itemID, "output_index": outputIndex, "delta": arguments,
+		}); err != nil {
+			return err
+		}
+		if err := writePolicyResponsesStreamEvent(w, "response.function_call_arguments.done", sequence, map[string]any{
+			"item_id": itemID, "output_index": outputIndex, "name": name, "arguments": arguments,
+		}); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("policy Responses output item type %q is unsupported", itemType)
+	}
+	return writePolicyResponsesStreamEvent(w, "response.output_item.done", sequence, map[string]any{
+		"output_index": outputIndex, "item": item,
+	})
+}
+
 func writePolicyResponsesResult(w http.ResponseWriter, response policyResponsesResponse, stream bool) error {
 	if !stream {
 		w.Header().Set("Content-Type", "application/json")
@@ -269,13 +367,9 @@ func writePolicyResponsesResult(w http.ResponseWriter, response policyResponsesR
 	}); err != nil {
 		return err
 	}
+	sequence := 1
 	for index, item := range response.Output {
-		if err := writeSSEEvent(w, "response.output_item.done", map[string]any{
-			"type":            "response.output_item.done",
-			"sequence_number": index + 1,
-			"output_index":    index,
-			"item":            item,
-		}); err != nil {
+		if err := writePolicyResponsesOutputEvents(w, item, index, &sequence); err != nil {
 			return err
 		}
 	}
@@ -285,7 +379,7 @@ func writePolicyResponsesResult(w http.ResponseWriter, response policyResponsesR
 	}
 	return writeSSEEvent(w, terminalEvent, map[string]any{
 		"type":            terminalEvent,
-		"sequence_number": len(response.Output) + 1,
+		"sequence_number": sequence,
 		"response":        response,
 	})
 }
