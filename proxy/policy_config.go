@@ -311,6 +311,23 @@ func validatePolicyProfileConfigReferences(
 	return nil
 }
 
+func policyTerminalRouteReferences(profiles []PolicyProfileConfig) map[string]struct{} {
+	references := make(map[string]struct{}, len(profiles)*3)
+	for _, profile := range profiles {
+		for _, routeID := range []string{
+			profile.LightweightRoute,
+			profile.PowerfulRoute,
+			profile.Classifier.Route,
+		} {
+			routeID = strings.TrimSpace(routeID)
+			if routeID != "" {
+				references[routeID] = struct{}{}
+			}
+		}
+	}
+	return references
+}
+
 func resolvePolicyTerminalRoute(routeID, path string, routes map[string]*ModelRouteConfig, policyReferences map[string]string) (*ModelRouteConfig, error) {
 	if route := routes[routeID]; route != nil {
 		return route, nil
@@ -328,8 +345,8 @@ func validatePolicyDestinationRoute(route *ModelRouteConfig, path string, provid
 	if route.InternalPurpose != "" {
 		return nil, configPathError(path, "route %q is reserved for internal purpose %q", route.ID, route.InternalPurpose)
 	}
-	if !configRouteSupportsEndpoint(route, providerEndpointChatCompletions) {
-		return nil, configPathError(path, "route %q must expose native %s", route.ID, providerEndpointChatCompletions)
+	if !configRouteSupportsEndpoint(route, providerEndpointChatCompletions) && !configRouteSupportsEndpoint(route, providerEndpointResponses) {
+		return nil, configPathError(path, "route %q must expose %s or %s for Chat execution", route.ID, providerEndpointChatCompletions, providerEndpointResponses)
 	}
 
 	resolved := make([]providerConfigDescriptor, 0, len(route.Targets))
@@ -338,10 +355,10 @@ func validatePolicyDestinationRoute(route *ModelRouteConfig, path string, provid
 		if !ok {
 			return nil, configPathError(path, "route %q target %d references unknown provider %q", route.ID, targetIndex, target.Provider)
 		}
-		if descriptor.kind != providerTypeAzureOpenAI && descriptor.kind != providerTypeOpenAICompatible {
-			return nil, configPathError(path, "route %q target provider %q does not use the supported native OpenAI Chat execution family", route.ID, descriptor.id)
+		if descriptor.kind != providerTypeCopilot && descriptor.kind != providerTypeAzureOpenAI && descriptor.kind != providerTypeOpenAICompatible {
+			return nil, configPathError(path, "route %q target provider %q does not use the supported OpenAI Chat execution family", route.ID, descriptor.id)
 		}
-		if descriptor.modelDiscovery != providerModelDiscoveryStatic {
+		if descriptor.kind != providerTypeCopilot && descriptor.modelDiscovery != providerModelDiscoveryStatic {
 			return nil, configPathError(path, "route %q target provider %q uses unsupported dynamic model_discovery %q", route.ID, descriptor.id, descriptor.modelDiscovery)
 		}
 		if descriptor.trustDomain == "" {
@@ -362,8 +379,8 @@ func validatePolicyClassifierRoute(route *ModelRouteConfig, path string, provide
 	if route.InternalPurpose != modelRouteInternalPurposePolicyClassifier {
 		return providerConfigDescriptor{}, configPathError(path, "route %q must set internal_purpose: %s", route.ID, modelRouteInternalPurposePolicyClassifier)
 	}
-	if !configRouteSupportsEndpoint(route, providerEndpointChatCompletions) {
-		return providerConfigDescriptor{}, configPathError(path, "route %q must expose native %s", route.ID, providerEndpointChatCompletions)
+	if !configRouteSupportsEndpoint(route, providerEndpointChatCompletions) && !configRouteSupportsEndpoint(route, providerEndpointResponses) {
+		return providerConfigDescriptor{}, configPathError(path, "route %q must expose %s or %s for forced function-tool classification", route.ID, providerEndpointChatCompletions, providerEndpointResponses)
 	}
 	if len(route.Targets) != 1 {
 		return providerConfigDescriptor{}, configPathError(path, "route %q must contain exactly one target", route.ID)
@@ -379,10 +396,10 @@ func validatePolicyClassifierRoute(route *ModelRouteConfig, path string, provide
 	if !ok {
 		return providerConfigDescriptor{}, configPathError(path, "route %q references unknown provider %q", route.ID, route.Targets[0].Provider)
 	}
-	if descriptor.kind != providerTypeAzureOpenAI && descriptor.kind != providerTypeOpenAICompatible {
+	if descriptor.kind != providerTypeCopilot && descriptor.kind != providerTypeAzureOpenAI && descriptor.kind != providerTypeOpenAICompatible {
 		return providerConfigDescriptor{}, configPathError(path, "classifier provider %q does not support forced function-tool classification", descriptor.id)
 	}
-	if descriptor.modelDiscovery != providerModelDiscoveryStatic {
+	if descriptor.kind != providerTypeCopilot && descriptor.modelDiscovery != providerModelDiscoveryStatic {
 		return providerConfigDescriptor{}, configPathError(path, "classifier provider %q uses unsupported dynamic model_discovery %q", descriptor.id, descriptor.modelDiscovery)
 	}
 	if descriptor.trustDomain == "" {

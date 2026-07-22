@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -200,6 +201,16 @@ func startProxy() {
 	}()
 }
 
+// menubarPolicyRoutingMode follows the providers YAML unless a non-empty
+// process override was explicitly supplied.
+func menubarPolicyRoutingMode() (proxy.PolicyRoutingMode, error) {
+	value, ok := os.LookupEnv("POLICY_ROUTING_MODE")
+	if !ok || strings.TrimSpace(value) == "" {
+		return proxy.PolicyRoutingModeConfig, nil
+	}
+	return proxy.ParsePolicyRoutingMode(value)
+}
+
 func runProxyStartup(
 	ctx context.Context,
 	authn *auth.Authenticator,
@@ -234,7 +245,7 @@ func runProxyStartup(
 		return proxyStartResult{err: err}
 	}
 
-	policyMode, err := proxy.ParsePolicyRoutingMode(os.Getenv("POLICY_ROUTING_MODE"))
+	policyMode, err := menubarPolicyRoutingMode()
 	if err != nil {
 		return proxyStartFailure(
 			"invalid policy routing mode",

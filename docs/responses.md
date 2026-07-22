@@ -2,7 +2,7 @@
 
 Detailed behavior for Vekil-owned Responses compatibility features. For the generic endpoint list, see [API Reference](api.md). For websocket tuning flags, see [Responses WebSocket Bridge](responses-websocket.md).
 
-> **Policy-routing boundary:** schema-v2 policy profile IDs are not accepted by `POST /v1/responses`, the websocket bridge, `/v1/responses/compact`, `/v1/memories/trace_summarize`, or Responses-backed Chat in v1. A policy's lightweight/powerful destinations must both expose native `/chat/completions`. Use a direct public model/route ID for every Responses surface; existing direct-route behavior is unchanged.
+> **Policy-routing boundary:** schema-v2 policy profile IDs are not accepted by `POST /v1/responses`, the websocket bridge, `/v1/responses/compact`, or `/v1/memories/trace_summarize` in v1. A policy entered through `POST /v1/chat/completions` may select an internal Responses-backed Chat destination, including a pinned Copilot model. Use a direct public model/route ID for every public Responses surface; existing direct-route behavior is unchanged.
 
 ## `POST /v1/responses` and `GET /v1/responses` (OpenAI)
 
@@ -66,7 +66,7 @@ See [responses-websocket.md](responses-websocket.md) for tuning flags.
 
 ## Chat compatibility over a native Responses model
 
-This adapter is outside v1 semantic policy routing. A Responses-native model may still serve direct public Chat-compatible traffic as documented here, but it cannot be a v1 policy destination and a policy public ID never enters this path.
+This adapter also serves internal v1 policy destinations selected from the public Chat surface. A policy public ID never becomes a public Responses model ID, but its selected internal terminal route may use the same process-owned conversion and replay store.
 
 A model that natively allows `/responses` but not `/chat/completions` can also serve Vekil's Chat-compatible public surfaces: OpenAI Chat Completions, translated Anthropic Messages, translated Gemini generation, both translated count-token probes, and dashboard insights. Native Chat remains preferred when a model supports both endpoints.
 

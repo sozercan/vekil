@@ -390,7 +390,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
-		policyRoutingMode:               fs.String("policy-routing", getEnv("POLICY_ROUTING_MODE", "off"), "Policy routing mode: off, observe, or enforce"),
+		policyRoutingMode:               fs.String("policy-routing", getEnv("POLICY_ROUTING_MODE", "config"), "Policy routing mode: config (follow providers YAML), off, observe, or enforce"),
 		policyRoutingAllowRemote:        fs.Bool("policy-routing-allow-remote-single-tenant", getEnvBool("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", false), "Acknowledge single-tenant operation when policy routing listens beyond loopback"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
 		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
@@ -414,7 +414,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 
 func (f serveFlags) parsedPolicyRoutingMode() (proxy.PolicyRoutingMode, error) {
 	if f.policyRoutingMode == nil {
-		return proxy.PolicyRoutingModeOff, nil
+		return proxy.PolicyRoutingModeConfig, nil
 	}
 	return proxy.ParsePolicyRoutingMode(*f.policyRoutingMode)
 }

@@ -4,7 +4,7 @@ These examples all target the same local proxy. Replace model IDs with public ID
 
 ## Schema-v2 policy profile IDs
 
-A semantic policy profile such as `coding-economy` is a narrower public model contract than a direct model ID. In v1 it is accepted only by text/function-tool `POST /v1/chat/completions`. It is not accepted by Anthropic Messages (including Claude Code), Gemini routes/CLI, OpenAI Responses, the Responses websocket bridge, compact/memory endpoints, or token-counting routes. Responses-native terminal routes are also ineligible policy destinations.
+A semantic policy profile such as `coding-economy` is a narrower public model contract than a direct model ID. In v1 it is accepted only by text/function-tool `POST /v1/chat/completions`. It is not accepted by Anthropic Messages (including Claude Code), Gemini routes/CLI, OpenAI Responses, the Responses websocket bridge, compact/memory endpoints, or token-counting routes. Internal Responses-native terminal routes are eligible policy destinations even though the policy public ID remains unavailable on Responses surfaces.
 
 Clients that can explicitly use the OpenAI Chat Completions wire API may request a policy profile. The returned Chat JSON/SSE model identity remains the policy public ID; internal lightweight/powerful provider and route IDs are not a client contract. Exposed direct terminal routes and other public models remain independently requestable, so use `exposure: internal` when bypass must not be offered.
 
@@ -17,7 +17,7 @@ curl http://localhost:1337/v1/chat/completions \
   }'
 ```
 
-The profile's effective mode is capped by `--policy-routing` / `POLICY_ROUTING_MODE`, which defaults to `off`. See [Semantic Policy Routing](policy-routing.md) before enabling observe or enforce.
+The profile follows its YAML `mode` by default. `--policy-routing` / `POLICY_ROUTING_MODE` can explicitly lower every profile to `off` or `observe` for rollout and rollback. See [Semantic Policy Routing](policy-routing.md) before enabling observe or enforce.
 
 ## Responses-native models on Chat-compatible clients
 

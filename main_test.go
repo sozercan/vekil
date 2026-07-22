@@ -24,6 +24,21 @@ import (
 	"github.com/sozercan/vekil/server"
 )
 
+func unsetEnvForTest(t *testing.T, key string) {
+	t.Helper()
+	previous, wasSet := os.LookupEnv(key)
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if wasSet {
+			_ = os.Setenv(key, previous)
+			return
+		}
+		_ = os.Unsetenv(key)
+	})
+}
+
 var (
 	_ = flag.String("settings", "", "test-only Claude settings argument")
 	_ = flag.String("c", "", "test-only Codex config argument")
@@ -187,8 +202,8 @@ func TestServeFlagsCopilotHeaderCLIOverridesEnv(t *testing.T) {
 }
 
 func TestServeFlagsPolicyRoutingDefaultsAndOverrides(t *testing.T) {
-	t.Run("defaults off and disallows remote", func(t *testing.T) {
-		t.Setenv("POLICY_ROUTING_MODE", "")
+	t.Run("defaults to config and disallows remote", func(t *testing.T) {
+		unsetEnvForTest(t, "POLICY_ROUTING_MODE")
 		t.Setenv("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", "")
 
 		serve := parseServeFlagsForTest(t)
@@ -196,8 +211,8 @@ func TestServeFlagsPolicyRoutingDefaultsAndOverrides(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parsedPolicyRoutingMode() error = %v", err)
 		}
-		if mode != proxy.PolicyRoutingModeOff {
-			t.Fatalf("policy routing mode = %q, want off", mode)
+		if mode != proxy.PolicyRoutingModeConfig {
+			t.Fatalf("policy routing mode = %q, want config", mode)
 		}
 		if *serve.policyRoutingAllowRemote {
 			t.Fatal("remote single-tenant acknowledgement should default to false")
@@ -240,6 +255,23 @@ func TestServeFlagsPolicyRoutingDefaultsAndOverrides(t *testing.T) {
 			t.Fatal("CLI false should override remote acknowledgement environment default")
 		}
 	})
+}
+
+func TestServePolicyRoutingHelpDescribesConfigFollowingDefault(t *testing.T) {
+	unsetEnvForTest(t, "POLICY_ROUTING_MODE")
+	var output bytes.Buffer
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(&output)
+	registerServeFlags(fs)
+	fs.PrintDefaults()
+
+	help := output.String()
+	if !strings.Contains(help, "config (follow providers YAML), off, observe, or enforce") {
+		t.Fatalf("serve policy-routing help did not describe config-following mode:\n%s", help)
+	}
+	if !strings.Contains(help, `(default "config")`) {
+		t.Fatalf("serve policy-routing help did not show config default:\n%s", help)
+	}
 }
 
 func TestServeFlagsRejectInvalidPolicyRoutingMode(t *testing.T) {
@@ -1038,17 +1070,37 @@ func TestParseLaunchClaudeOptions(t *testing.T) {
 	}
 }
 
+func TestLaunchPolicyRoutingHelpDescribesConfigFollowingDefault(t *testing.T) {
+	unsetEnvForTest(t, "POLICY_ROUTING_MODE")
+	target, _ := launchTarget("copilot")
+	var stderr bytes.Buffer
+	_, err := parseLaunchAgentOptions(target, []string{"--help"}, &stderr)
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("parseLaunchAgentOptions(--help) error = %v, want flag.ErrHelp", err)
+	}
+	help := stderr.String()
+	if !strings.Contains(help, "config (follow providers YAML), off, observe, or enforce") {
+		t.Fatalf("launch policy-routing help did not describe config-following mode:\n%s", help)
+	}
+	if !strings.Contains(help, `(default "config")`) {
+		t.Fatalf("launch policy-routing help did not show config default:\n%s", help)
+	}
+}
+
 func TestParseLaunchAgentOptionsPolicyRoutingMode(t *testing.T) {
 	target, _ := launchTarget("copilot")
 	tests := []struct {
+		name string
 		mode string
 		want proxy.PolicyRoutingMode
 	}{
-		{mode: "observe", want: proxy.PolicyRoutingModeObserve},
-		{mode: "enforce", want: proxy.PolicyRoutingModeEnforce},
+		{name: "follows providers config by default", mode: "", want: proxy.PolicyRoutingModeConfig},
+		{name: "honors explicit off", mode: "off", want: proxy.PolicyRoutingModeOff},
+		{name: "honors explicit observe", mode: "observe", want: proxy.PolicyRoutingModeObserve},
+		{name: "honors explicit enforce", mode: "enforce", want: proxy.PolicyRoutingModeEnforce},
 	}
 	for _, tc := range tests {
-		t.Run(tc.mode, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("POLICY_ROUTING_MODE", tc.mode)
 			opts, err := parseLaunchAgentOptions(target, []string{"--model", "policy-launch-test"}, io.Discard)
 			if err != nil {
@@ -1621,8 +1673,20 @@ func TestRunLaunchAgentInitializesConfiguredPolicyRouting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, mode := range []string{"observe", "enforce"} {
-		t.Run(mode, func(t *testing.T) {
+	tests := []struct {
+		name          string
+		profileMode   string
+		overrideMode  string
+		overrideSet   bool
+		wantPreflight int64
+	}{
+		{name: "config follows observe profile", profileMode: "observe", wantPreflight: 1},
+		{name: "config follows enforce profile", profileMode: "enforce", wantPreflight: 1},
+		{name: "explicit off disables enforce profile", profileMode: "enforce", overrideMode: "off", overrideSet: true, wantPreflight: 0},
+		{name: "explicit observe caps enforce profile", profileMode: "enforce", overrideMode: "observe", overrideSet: true, wantPreflight: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
 			var classifierCalls atomic.Int64
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				defer func() { _ = r.Body.Close() }()
@@ -1683,13 +1747,17 @@ policy_profiles:
     powerful_route: power-route
     classifier: {route: classifier-route}
     data_policy: {content_forwarding_acknowledged: true}
-`, upstream.URL, mode)
+`, upstream.URL, tc.profileMode)
 			if err := os.WriteFile(providersPath, []byte(providersBody), 0o600); err != nil {
 				t.Fatalf("write providers config: %v", err)
 			}
 
 			capturePath := filepath.Join(tmp, "capture.json")
-			t.Setenv("POLICY_ROUTING_MODE", mode)
+			if tc.overrideSet {
+				t.Setenv("POLICY_ROUTING_MODE", tc.overrideMode)
+			} else {
+				unsetEnvForTest(t, "POLICY_ROUTING_MODE")
+			}
 			t.Setenv("GO_WANT_MAIN_LAUNCH_HELPER", "1")
 			t.Setenv("MAIN_LAUNCH_HELPER_CAPTURE", capturePath)
 			t.Setenv("MAIN_LAUNCH_HELPER_TARGET", "copilot")
@@ -1707,8 +1775,8 @@ policy_profiles:
 			if code != 9 {
 				t.Fatalf("runLaunchCopilot() code = %d, want 9; stderr=%s", code, stderr.String())
 			}
-			if got := classifierCalls.Load(); got != 1 {
-				t.Fatalf("policy classifier preflight calls = %d, want 1", got)
+			if got := classifierCalls.Load(); got != tc.wantPreflight {
+				t.Fatalf("policy classifier preflight calls = %d, want %d", got, tc.wantPreflight)
 			}
 		})
 	}

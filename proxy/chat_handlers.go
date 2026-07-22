@@ -695,12 +695,11 @@ func (h *ProxyHandler) withChatExecutionRoute(ctx, inbound context.Context, mode
 		if _, planned := operation.policyPlan(); planned {
 			endpoint, err := explicitChatExecutionEndpoint(operation.route, body)
 			if err != nil {
-				attachExplicitChatExecutionErrorRoute(err, operation.route, targetBinding{}, endpoint, chatBackendNativeChat)
-				return ctx, nil, operation.route, err
-			}
-			if endpoint != providerEndpointChatCompletions {
-				err := &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("policy model %q supports native %s only", operation.route.public.id, providerEndpointChatCompletions)}
-				attachExplicitChatExecutionErrorRoute(err, operation.route, targetBinding{}, endpoint, chatBackendNativeChat)
+				backend := chatBackendNativeChat
+				if endpoint == providerEndpointResponses || operation.route.supportsEndpoint(providerEndpointResponses) && !operation.route.supportsEndpoint(providerEndpointChatCompletions) {
+					backend = chatBackendResponses
+				}
+				attachExplicitChatExecutionErrorRoute(err, operation.route, targetBinding{}, endpoint, backend)
 				return ctx, nil, operation.route, err
 			}
 			return ctx, operation, operation.route, nil
@@ -751,6 +750,7 @@ func explicitResponsesChatReplayRoute(route *modelRoute, target targetBinding) r
 		ProviderID:    target.provider.id,
 		PublicModel:   route.public.id,
 		UpstreamModel: upstreamModel,
+		RouteID:       route.public.routeID,
 	}
 }
 

@@ -4,7 +4,7 @@ name: Live Copilot Semantic Policy Routing Smoke
 # The wrapper starts a private zero-config Vekil bridge using the repository's
 # existing Copilot token, discovers native-Chat models, and presents them to the
 # unchanged policy harness as static openai-compatible loopback targets. This
-# preserves the product restriction against direct dynamic Copilot policy routes.
+# keeps the common smoke harness on controllable static loopback targets.
 
 on:
   workflow_dispatch:

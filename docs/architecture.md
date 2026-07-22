@@ -28,7 +28,7 @@
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-Chat-compatible ingress converges before provider I/O: public OpenAI Chat, translated Anthropic Messages, translated Gemini generation, their count-token probes, and dashboard insights all submit canonical Chat requests to the same execution layer. Schema-v2 policy resolution is deliberately narrower in v1 and is entered only by public `POST /v1/chat/completions`; translated protocols, token probes, Responses-backed Chat, and direct Responses remain outside policy selection. Direct `anthropic-compatible` forwarding and direct `/v1/responses` remain separate paths.
+Chat-compatible ingress converges before provider I/O: public OpenAI Chat, translated Anthropic Messages, translated Gemini generation, their count-token probes, and dashboard insights all submit canonical Chat requests to the same execution layer. Schema-v2 policy resolution is deliberately narrower in v1 and is entered only by public `POST /v1/chat/completions`; translated protocols, token probes, and direct Responses remain outside policy selection. The selected internal terminal route may use native Chat or process-owned Chat-over-Responses. Direct `anthropic-compatible` forwarding and direct `/v1/responses` remain separate paths.
 
 ## Package Responsibilities
 
@@ -119,7 +119,7 @@ Bindings use keyed digests and live in a process-local index capped at 32,768 en
 - Pure `net/http` with Go `ServeMux` routing; no web framework.
 - Vekil is a multi-provider proxy. Zero-config startup currently uses GitHub Copilot, but explicit provider config can extend or replace that default behind the same public surface.
 - Public model IDs are a single namespace across legacy provider models and explicit model routes. The proxy validates normalized ownership during startup and fails fast on collisions.
-- Schema-v2 policy profiles share that public namespace but select only between `lightweight` and `powerful` native-Chat terminal routes. Internal routes are operational-only and exposed public terminal routes deliberately bypass policy.
+- Schema-v2 policy profiles share that public namespace but select only between `lightweight` and `powerful` OpenAI-family Chat execution routes. Internal routes are operational-only and exposed public terminal routes deliberately bypass policy.
 - Policy routing is quality/cost optimization, not authorization or spend enforcement. V1 is text/function-tool OpenAI Chat only, per-turn, stateless, and limited to one trusted user/tenant per deployment.
 - Classifier content forwarding, trust-domain crossing, and provider retention require explicit operator acknowledgements. Those acknowledgements and live protocol preflight do not prove an external provider's retention behavior.
 - Provider endpoint support is explicit. `models[].endpoints` and `model_routes[].endpoints` are allowlists, so do not expose `/chat/completions` or other routes until every target in the public contract has verified equivalent behavior.

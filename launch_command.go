@@ -145,7 +145,7 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	proxyLog := fs.String("proxy-log", "", fmt.Sprintf("Proxy JSON log path (default: ~/.config/vekil/logs/launch-%s-*.jsonl)", target.name))
 	startupTimeout := fs.Duration("startup-timeout", getEnvDuration("LAUNCH_STARTUP_TIMEOUT", 2*time.Minute), "Maximum time to authenticate and become ready")
 	streamingTimeout := fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
-	policyRoutingMode := fs.String("policy-routing", getEnv("POLICY_ROUTING_MODE", "off"), "Policy routing mode: off, observe, or enforce")
+	policyRoutingMode := fs.String("policy-routing", getEnv("POLICY_ROUTING_MODE", "config"), "Policy routing mode: config (follow providers YAML), off, observe, or enforce")
 	dryRun := fs.Bool("dry-run", false, "Print the child-process plan without starting a proxy; dynamic model metadata remains unresolved")
 	noSummary := fs.Bool("no-summary", false, "Do not print an end-of-session usage summary")
 

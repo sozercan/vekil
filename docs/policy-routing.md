@@ -24,7 +24,7 @@ A policy public ID is supported only for:
 - `POST /v1/chat/completions`;
 - text-only Chat messages;
 - standard function tools;
-- native `/chat/completions` terminal routes;
+- OpenAI-family terminal routes served by native `/chat/completions` or proxy-owned Chat-over-Responses;
 - one per-turn decision with no affinity or session cache; and
 - the built-in `coding_agent_v1` classifier profile.
 
@@ -38,7 +38,7 @@ The following are explicitly unsupported for policy public IDs in v1 and fail lo
 | Proxy-owned `GET /v1/responses` websocket bridge | Unsupported |
 | `POST /v1/responses/compact` | Unsupported |
 | `POST /v1/memories/trace_summarize` | Unsupported |
-| Responses-backed Chat terminal routes | Unsupported; both destinations must expose native `/chat/completions` |
+| Responses-backed Chat terminal routes | Supported for OpenAI-family targets, including pinned models on a dynamic `type: copilot` provider |
 | `POST /v1/messages` and `/v1/messages/count_tokens` | Unsupported |
 | Gemini `generateContent`, `streamGenerateContent`, and `countTokens` routes | Unsupported |
 | Image, audio, file, or any other non-text Chat input | Unsupported |
@@ -68,15 +68,14 @@ vekil config validate --live \
   --providers-config examples/policy-routing-coding-economy.yaml
 ```
 
-Run on loopback in observe mode first:
+Run on loopback. With the default `--policy-routing=config`, each profile follows its YAML `mode`:
 
 ```bash
 vekil \
-  --providers-config examples/policy-routing-coding-economy.yaml \
-  --policy-routing=observe
+  --providers-config examples/policy-routing-coding-economy.yaml
 ```
 
-The global policy ceiling defaults to `off`, so a profile configured as `observe` or `enforce` does not classify until the runtime ceiling permits it.
+Use `--policy-routing=observe` for an explicit process-wide rollout cap, or `--policy-routing=off` as an emergency downgrade. An explicit process ceiling can lower a profile's configured mode but cannot raise it. For a GitHub-authenticated Copilot example with direct Responses-backed destinations, see [`examples/policy-routing-copilot.yaml`](../examples/policy-routing-copilot.yaml).
 
 > **Single-tenant warning:** v1 policy `observe` and `enforce` support one trusted user or tenant per Vekil process/deployment. Loopback is the default supported topology. A non-loopback bind requires `--policy-routing-allow-remote-single-tenant` or `POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT=true`. That acknowledgement adds no authentication or tenant isolation; use a trusted external access layer and do not expose the port publicly.
 
@@ -161,8 +160,8 @@ Validation also rejects:
 - public/operational ID collisions in their applicable namespaces;
 - public metadata on an internal route;
 - recursive policy references;
-- destination routes without native `/chat/completions` support;
-- unsupported or dynamic destination providers;
+- destination routes without `/chat/completions` or `/responses` Chat execution support;
+- unsupported provider families or dynamic providers other than pinned `type: copilot` targets;
 - destination routes with different public Chat request semantics;
 - classifier routes that are public, have the wrong internal purpose, or can send more than once;
 - classifiers that cannot perform the forced function-tool protocol;
@@ -174,14 +173,15 @@ Validation also rejects:
 Each profile has `mode: off|observe|enforce`, defaulting to `off`. The process-wide setting is a safety ceiling:
 
 ```text
---policy-routing=off|observe|enforce
-POLICY_ROUTING_MODE=off|observe|enforce
+--policy-routing=config|off|observe|enforce
+POLICY_ROUTING_MODE=config|off|observe|enforce
 ```
 
-Effective mode is the lower of the global ceiling and the profile mode:
+`config` follows the YAML profile exactly. An explicit `off`, `observe`, or `enforce` value acts as the process-wide ceiling:
 
-| Global ceiling | Profile `off` | Profile `observe` | Profile `enforce` |
+| Process mode | Profile `off` | Profile `observe` | Profile `enforce` |
 |---|---|---|---|
+| `config` | off | observe | enforce |
 | `off` | off | off | off |
 | `observe` | off | observe | observe |
 | `enforce` | off | observe | enforce |
@@ -291,7 +291,7 @@ A classifier-local timeout uses `classifier_unavailable_tier` for that request b
 
 Classifier sends have their own timeout, concurrency admission, operation, and one-send budget. They do not consume the selected terminal route's target-attempt or upstream-send budgets.
 
-After selection, all terminal failure behavior remains inside the chosen route:
+After selection, all terminal failure behavior remains inside the chosen route. A Responses-backed tool-result continuation first resolves its process-local replay owner and remains bound to the originating terminal tier/target; it does not run a new classifier decision that could migrate the replay state.
 
 - a failed lightweight route never invokes powerful;
 - a failed powerful route never downgrades;
@@ -303,7 +303,7 @@ After selection, all terminal failure behavior remains inside the chosen route:
 
 Endpoint metadata alone does not prove that a classifier accepts forced strict function output or non-storage request options.
 
-When any profile's **effective** mode is `observe` or `enforce`, startup performs one live preflight per distinct classifier route using fixed non-user content. It verifies:
+When any profile's **effective** mode is `observe` or `enforce`, startup performs one live preflight per distinct classifier route using fixed non-user content. With the default process mode `config`, effective mode comes directly from each profile's YAML `mode`; explicit `off` or `observe` process ceilings remain available for rollback. It verifies:
 
 - authentication and endpoint reachability;
 - forced `emit_policy_signals` selection;
@@ -411,6 +411,6 @@ V1 stores no policy affinity, so policy rollback requires no policy-session migr
 
 ## Deferred work
 
-Future releases may add translated Anthropic/Gemini adapters, explicit Chat affinity, Responses-backed Chat, native Responses/websocket first-turn selection, shared state, policy token counting, mixed Chat/Responses destinations, a local deterministic first stage, passive ranking, or a `versatile` middle tier.
+Future releases may add translated Anthropic/Gemini adapters, explicit Chat affinity, native Responses/websocket first-turn selection, shared state, policy token counting, mixed-provider destination families, a local deterministic first stage, passive ranking, or a `versatile` middle tier.
 
 Vekil continues to forbid arbitrary routing DSLs, recursive policies, post-output quality retries, cross-tier failure fallback, transparent provider-state migration, classifier-driven authorization, model-reported confidence as an enforcement input, content-derived shared breaker state, implicit prompt fingerprints as session identity, and public access to classifier routes.

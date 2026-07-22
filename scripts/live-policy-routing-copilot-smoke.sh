@@ -2,11 +2,11 @@
 
 # Copilot-backed entrypoint for the schema-v2 semantic-policy smoke.
 #
-# Policy profiles intentionally accept only static Azure/OpenAI-compatible
-# destinations and classifiers. This wrapper preserves that product contract by
-# starting a private zero-config Vekil bridge backed by GitHub Copilot, selecting
-# live Chat-capable models from its catalog, and presenting the loopback bridge
-# to scripts/live-policy-routing-smoke.sh as static openai-compatible targets.
+# Production policy profiles can target pinned Copilot models directly. This
+# wrapper still starts a private zero-config Vekil bridge because the shared live
+# harness needs independently controllable static targets and fault injection. It
+# selects live Chat-capable models from the Copilot catalog and presents the
+# loopback bridge to scripts/live-policy-routing-smoke.sh as static targets.
 #
 # Required environment:
 #   COPILOT_GITHUB_TOKEN
