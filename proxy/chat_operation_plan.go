@@ -136,6 +136,9 @@ func (p chatOperationPlan) valid() bool {
 // continuation can safely preserve replay state owned by a downstream bridge.
 // Off and observe always select the baseline tier; requiring one sealed target
 // keeps that continuation pinned to the same deterministic route destination.
+// Target determinism does not create replica affinity: deployments that accept
+// downstream process-local replay IDs must use one bridge process or sticky
+// ingress to the replay-owning bridge, as documented for replay state.
 func (p chatOperationPlan) allowsResponsesReplayPassthrough() bool {
 	if !p.valid() || len(p.candidates) != 1 {
 		return false

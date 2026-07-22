@@ -341,7 +341,7 @@ func TestCodexAdapterAcceptsPolicyOwnedChatModelThroughResponsesCompatibility(t 
 		},
 		Binary:        binary,
 		LocalToken:    "token",
-		ForwardedArgs: []string{"exec", "--ephemeral", "hello"},
+		ForwardedArgs: []string{"exec", "--ephemeral", "--output-schema", "schema.json", "hello"},
 		DryRun:        true,
 	})
 	if err != nil {
@@ -362,6 +362,9 @@ func TestCodexAdapterAcceptsPolicyOwnedChatModelThroughResponsesCompatibility(t 
 	}
 	if !containsAdjacent(prepared.Args, "-m", "policy-model") {
 		t.Fatalf("policy model was not pinned: %#v", prepared.Args)
+	}
+	if !containsAdjacent(prepared.Args, "--output-schema", "schema.json") {
+		t.Fatalf("policy Codex output schema args were not forwarded: %#v", prepared.Args)
 	}
 	catalogPath := codexCatalogPathFromArgs(t, prepared.Args)
 	body, err := os.ReadFile(catalogPath)

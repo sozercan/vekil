@@ -395,7 +395,7 @@ func TestPolicyResponsesIngressTranslatesStructuredOutput(t *testing.T) {
 		if err := json.Unmarshal(request.ResponseFormat, &format); err != nil {
 			t.Errorf("decode response_format: %v", err)
 		}
-		if format.Type != "json_schema" || format.JSONSchema.Name != "result" || format.JSONSchema.Strict == nil || !*format.JSONSchema.Strict {
+		if format.Type != "json_schema" || format.JSONSchema.Name != "codex_output_schema" || format.JSONSchema.Strict == nil || !*format.JSONSchema.Strict {
 			t.Errorf("response_format = %+v", format)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -419,7 +419,7 @@ func TestPolicyResponsesIngressTranslatesStructuredOutput(t *testing.T) {
 		"input":"return JSON",
 		"store":false,
 		"stream":true,
-		"text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false},"strict":true}}
+		"text":{"format":{"type":"json_schema","name":"codex_output_schema","schema":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false},"strict":true}}
 	}`)))
 
 	if recorder.Code != http.StatusOK {

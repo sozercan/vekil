@@ -87,7 +87,7 @@ func TestTranslatePolicyResponsesRequestToChatStructuredOutput(t *testing.T) {
 		"model":"policy",
 		"input":"return JSON",
 		"store":false,
-		"text":{"format":{"type":"json_schema","name":"result","description":"result shape","schema":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false},"strict":true}}
+		"text":{"format":{"type":"json_schema","name":"codex_output_schema","description":"result shape","schema":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false},"strict":true}}
 	}`)
 	got, err := translatePolicyResponsesRequestToChat(body)
 	if err != nil {
@@ -109,14 +109,14 @@ func TestTranslatePolicyResponsesRequestToChatStructuredOutput(t *testing.T) {
 	if err := json.Unmarshal(chat.ResponseFormat, &format); err != nil {
 		t.Fatalf("decode response_format: %v; body=%s", err, got.Body)
 	}
-	if format.Type != "json_schema" || format.JSONSchema.Name != "result" || format.JSONSchema.Description != "result shape" || format.JSONSchema.Strict == nil || !*format.JSONSchema.Strict {
+	if format.Type != "json_schema" || format.JSONSchema.Name != "codex_output_schema" || format.JSONSchema.Description != "result shape" || format.JSONSchema.Strict == nil || !*format.JSONSchema.Strict {
 		t.Fatalf("response_format = %+v", format)
 	}
 	var schema map[string]any
 	if err := json.Unmarshal(format.JSONSchema.Schema, &schema); err != nil || schema["type"] != "object" {
 		t.Fatalf("schema = %#v, error = %v", schema, err)
 	}
-	if !strings.Contains(string(got.Response.Text), `"type":"json_schema"`) || !strings.Contains(string(got.Response.Text), `"name":"result"`) {
+	if !strings.Contains(string(got.Response.Text), `"type":"json_schema"`) || !strings.Contains(string(got.Response.Text), `"name":"codex_output_schema"`) {
 		t.Fatalf("response text metadata = %s", got.Response.Text)
 	}
 }
@@ -499,6 +499,9 @@ func TestTranslatePolicyResponsesRequestToChatRejectsUnsupportedOrAmbiguousReque
 		{name: "unsupported text format", body: `{"model":"policy","input":"hi","text":{"format":{"type":"regex"}}}`, wantParam: "text.format.type", wantText: "unsupported"},
 		{name: "missing schema name", body: `{"model":"policy","input":"hi","text":{"format":{"type":"json_schema","schema":{}}}}`, wantParam: "text.format.name", wantText: "required"},
 		{name: "null schema", body: `{"model":"policy","input":"hi","text":{"format":{"type":"json_schema","name":"result","schema":null}}}`, wantParam: "text.format.schema", wantText: "object"},
+		{name: "long schema name", body: `{"model":"policy","input":"hi","text":{"format":{"type":"json_schema","name":"` + strings.Repeat("a", policyResponsesMaxSchemaNameLen+1) + `","schema":{}}}}`, wantParam: "text.format.name", wantText: "bounded"},
+		{name: "dotted schema name", body: `{"model":"policy","input":"hi","text":{"format":{"type":"json_schema","name":"result.schema","schema":{}}}}`, wantParam: "text.format.name", wantText: "ASCII letters"},
+		{name: "non ascii schema name", body: `{"model":"policy","input":"hi","text":{"format":{"type":"json_schema","name":"résultat","schema":{}}}}`, wantParam: "text.format.name", wantText: "ASCII letters"},
 		{name: "invalid include", body: `{"model":"policy","input":"hi","include":["response.output_text.logprobs"]}`, wantParam: "include[0]", wantText: "reasoning.encrypted_content"},
 		{name: "invalid metadata value", body: `{"model":"policy","input":"hi","client_metadata":{"attempt":1}}`, wantParam: "client_metadata.attempt", wantText: "bounded strings"},
 		{name: "zero max output", body: `{"model":"policy","input":"hi","max_output_tokens":0}`, wantParam: "max_output_tokens", wantText: "positive integer"},

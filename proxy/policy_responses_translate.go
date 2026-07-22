@@ -33,6 +33,7 @@ const (
 	policyResponsesMaxToolNameLen     = 512
 	policyResponsesMaxDescriptionLen  = 64 << 10
 	policyResponsesMaxChatToolNameLen = 64
+	policyResponsesMaxSchemaNameLen   = 64
 	policyResponsesAliasPrefix        = "vkl1__"
 	policyResponsesAliasStemLen       = 13
 )
@@ -318,9 +319,14 @@ func translatePolicyResponsesTextConfiguration(raw json.RawMessage) (json.RawMes
 		if err := validatePolicyResponsesObjectFields(format, "text.format", "type", "name", "description", "schema", "strict"); err != nil {
 			return nil, nil, err
 		}
-		name, err := requiredPolicyResponsesStringAt(format, "name", "text.format.name", policyResponsesMaxToolNameLen)
+		name, err := requiredPolicyResponsesStringAt(format, "name", "text.format.name", policyResponsesMaxSchemaNameLen)
 		if err != nil {
 			return nil, nil, err
+		}
+		for _, r := range name {
+			if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '_' && r != '-' {
+				return nil, nil, newChatInvalidRequest("text.format.name", "name may contain only ASCII letters, digits, underscore, or hyphen")
+			}
 		}
 		description, err := optionalPolicyResponsesTextAt(format, "description", "text.format.description", policyResponsesMaxDescriptionLen)
 		if err != nil {

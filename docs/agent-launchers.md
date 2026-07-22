@@ -166,8 +166,10 @@ The global policy ceiling still defaults to `off`, so the command uses the
 profile's deterministic baseline unless `--policy-routing observe` or
 `--policy-routing enforce` is supplied. Opaque `call_vekil_*` continuations from
 a downstream Responses-backed bridge are accepted only for a single-target
-baseline in `off` or `observe`; `enforce` rejects those stateful continuations
-until policy route affinity is implemented.
+baseline in `off` or `observe`, and that bridge must be one process (the normal
+loopback launcher topology) or use sticky ingress to the replay-owning replica;
+`enforce` rejects those stateful continuations until policy route affinity is
+implemented.
 
 Forwarded settings-source, detached-session, resume, model/fallback, and custom
 agent overrides are rejected. Use the launcher-level `--model` to pin a model;
@@ -210,7 +212,9 @@ tools. Hosted/custom tools, images, the Responses websocket, compact/memory
 routes, deferred tool discovery (`defer_loading` / `tool_search`), and provider-specific speed tiers remain unsupported. The launcher
 disables the hosted/custom features it controls. As with Copilot and Claude,
 opaque downstream replay IDs can continue only in `off` or `observe` with one
-baseline target; `enforce` tool continuations remain rejected without affinity.
+baseline target and one downstream bridge process (or sticky ingress to its
+replay-owning replica); `enforce` tool continuations remain rejected without
+affinity.
 Large direct Codex tool catalogs require a downstream Chat bridge that accepts
 more than the native OpenAI/Azure 128-function ceiling; operators using a
 narrower terminal must reduce the enabled client catalog.

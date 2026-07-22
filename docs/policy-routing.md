@@ -74,10 +74,12 @@ client catalog accordingly.
 A downstream Chat-compatible bridge may itself serve a Responses-only model and
 return `call_vekil_*` IDs. Because `off` and `observe` always execute the
 baseline tier, Vekil permits those continuations only when that baseline has one
-target. `enforce` still rejects them before classifier dispatch: selecting a
-different tier would send process-local replay state to the wrong model. Full
-enforce-mode tool continuation requires explicit route affinity and remains
-deferred.
+target **and the deployment keeps requests on the same downstream bridge process**
+through a single bridge instance or sticky ingress. One configured target proves
+route determinism, not replica affinity. `enforce` still rejects continuations
+before classifier dispatch: selecting a different tier would send process-local
+replay state to the wrong model. Full enforce-mode tool continuation requires
+explicit route affinity and remains deferred.
 
 Native Chat tool history must be complete and internally consistent before classifier admission. Assistant tool-call IDs must be unique, every tool result must reference one pending prior call exactly once, and all pending calls must receive results before the next non-tool message. Parallel results may arrive in any order. Malformed, missing, unknown, or duplicate tool-call relationships fail locally with no classifier or terminal-model send.
 
@@ -198,7 +200,7 @@ Validation also rejects:
 - classifier routes that are public, have the wrong internal purpose, or can send more than once;
 - classifiers that cannot perform the forced function-tool protocol;
 - missing trust-domain or data-policy acknowledgements; and
-- unsupported custom prompts, custom output schemas, arbitrary routing languages, or config hot reload.
+- unsupported custom classifier prompts, custom classifier output schemas, arbitrary routing languages, or config hot reload.
 
 ## Profile mode and global ceiling
 
