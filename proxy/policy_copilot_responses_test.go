@@ -741,6 +741,7 @@ func TestPolicyResponsesContractRejectsBeforeClassifierDispatch(t *testing.T) {
 	}{
 		{name: "stop", field: "stop", value: []string{"END"}},
 		{name: "multiple choices", field: "n", value: 2},
+		{name: "invalid stream", field: "stream", value: "yes"},
 		{name: "unknown field", field: "unsupported_field", value: true},
 	}
 	for _, tc := range tests {
@@ -822,4 +823,13 @@ func TestPolicyCopilotSynchronousValidationSkipsInactiveTierRoutes(t *testing.T)
 		t.Fatalf("NewProxyHandler() rejected inactive powerful route: %v", err)
 	}
 	defer h.BeginShutdown()
+}
+
+func TestReadPolicyClassifierUsageForResponsesShape(t *testing.T) {
+	body := []byte(`{"status":"completed","output":[{"type":"unknown"}],"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":5}}}`)
+	usage := readPolicyClassifierUsageForEndpoint(body, providerEndpointResponses)
+	want := policyStatsTokenUsage{InputTokens: 11, OutputTokens: 7, TotalTokens: 18, CachedInputTokens: 3, ReasoningTokens: 5}
+	if usage != want {
+		t.Fatalf("usage = %+v, want %+v", usage, want)
+	}
 }

@@ -420,11 +420,12 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 		return chatOperationPlan{}, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("policy model %q request is outside its public contract: %w", entry.id, err)}
 	}
 	if replayRoute == nil && policyProfilePrefersResponsesBackend(profile) {
-		raw, err := decodeChatJSONObject(input.OriginalBody, "")
+		_, err := translateChatRequestToResponses(input.OriginalBody, responsesChatRequestOptions{
+			UpstreamModel:       profile.entry.id,
+			MinimumOutputTokens: responsesChatMinimumOutputTokens,
+			DropSamplingParams:  profile.lightweight.public.policy.dropSamplingParams,
+		})
 		if err != nil {
-			return chatOperationPlan{}, err
-		}
-		if err := validateChatResponsesTopLevel(raw); err != nil {
 			return chatOperationPlan{}, err
 		}
 	}
@@ -866,13 +867,15 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 		if readErr != nil && resp.StatusCode >= 200 && resp.StatusCode <= 299 {
 			return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(readErr, false)
 		}
+		classifierUsage := readPolicyClassifierUsageForEndpoint(responseBody, endpoint)
 		if endpoint == providerEndpointResponses && resp.StatusCode >= 200 && resp.StatusCode <= 299 {
 			responseBody = convertPolicyClassifierResponsesBody(responseBody, target)
 		}
-		if stats != nil {
-			if usage := readPolicyClassifierUsage(responseBody); !usage.isZero() {
-				stats.record(policyStatsObservation{Profile: profile.PublicID, TrafficBucket: policyStatsBucketFromContext(ctx), ClassifierUsage: usage})
-			}
+		if classifierUsage.isZero() {
+			classifierUsage = readPolicyClassifierUsage(responseBody)
+		}
+		if stats != nil && !classifierUsage.isZero() {
+			stats.record(policyStatsObservation{Profile: profile.PublicID, TrafficBucket: policyStatsBucketFromContext(ctx), ClassifierUsage: classifierUsage})
 		}
 		return policyClassifierHTTPResponse{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: responseBody}, nil
 	})
@@ -963,6 +966,23 @@ func (c *chatPolicyRoutingController) PolicyStatsSnapshot() policyStatsSnapshot 
 		c.refreshBreakerStats(routeID)
 	}
 	return c.stats.snapshot()
+}
+
+func readPolicyClassifierUsageForEndpoint(body []byte, endpoint string) policyStatsTokenUsage {
+	if endpoint != providerEndpointResponses {
+		return policyStatsTokenUsage{}
+	}
+	usage := sniffResponsesUsageBody(body)
+	if usage.isZero() {
+		return policyStatsTokenUsage{}
+	}
+	return policyStatsTokenUsage{
+		InputTokens:       int64(usage.InputTokens),
+		OutputTokens:      int64(usage.OutputTokens),
+		TotalTokens:       int64(usage.totalTokens()),
+		CachedInputTokens: int64(usage.InputTokensDetails.CachedTokens),
+		ReasoningTokens:   int64(usage.OutputTokensDetails.ReasoningTokens),
+	}.normalized()
 }
 
 func readPolicyClassifierUsage(body []byte) policyStatsTokenUsage {
