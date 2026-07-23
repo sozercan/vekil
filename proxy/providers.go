@@ -1866,9 +1866,13 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 	}
 	model = strings.TrimSpace(model)
 	setup := h.providerSetup()
-	for _, providerID := range setup.providerOrder {
-		if provider := setup.providerByID(providerID); provider != nil && provider.hidesModel(model) {
-			return false
+	entry, knownPublicEntry := setup.lookupPublicModelEntry(model)
+	publicPolicyModel := knownPublicEntry && entry != nil && entry.kind == publicEntryPolicy
+	if !publicPolicyModel {
+		for _, providerID := range setup.providerOrder {
+			if provider := setup.providerByID(providerID); provider != nil && provider.hidesModel(model) {
+				return false
+			}
 		}
 	}
 	if len(h.allowedModels) == 0 {

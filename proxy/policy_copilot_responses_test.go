@@ -97,6 +97,9 @@ func newCopilotResponsesPolicyUpstream(t *testing.T, signals policyClassifierSig
 			upstream.mu.Lock()
 			upstream.terminalModels = append(upstream.terminalModels, request.Model)
 			upstream.mu.Unlock()
+			w.Header().Set("Openai-Model", request.Model)
+			w.Header().Set("X-Github-Request-ID", "github-upstream-request")
+			w.Header().Set("X-Request-ID", "upstream-request")
 			if lookupTool {
 				w.Header().Set("Content-Type", "text/event-stream")
 				writeCopilotResponsesToolCallStream(w)
@@ -359,6 +362,14 @@ func TestPolicyRoutingSelectsCopilotResponsesLightweightRoute(t *testing.T) {
 	if response.Model != "gpt-5.6-semantic" || len(response.Choices) != 1 || response.Choices[0].Message.Content != "answered by Luna" {
 		t.Fatalf("response = %+v", response)
 	}
+	if got := recorder.Header().Get("Openai-Model"); got != "gpt-5.6-semantic" {
+		t.Fatalf("Openai-Model = %q, want public policy model", got)
+	}
+	for _, name := range []string{"X-Github-Request-ID", "X-Request-ID"} {
+		if got := recorder.Header().Get(name); got != "" {
+			t.Fatalf("%s = %q, want omitted", name, got)
+		}
+	}
 	modelRequests, classifierRequests, terminalModels, paths := upstream.snapshot()
 	if modelRequests != 1 || classifierRequests != 2 || strings.Join(terminalModels, ",") != "gpt-5.6-luna" {
 		t.Fatalf("upstream requests: models=%d classifiers=%d terminals=%v paths=%v", modelRequests, classifierRequests, terminalModels, paths)
@@ -366,6 +377,53 @@ func TestPolicyRoutingSelectsCopilotResponsesLightweightRoute(t *testing.T) {
 	stats := h.policyRoutingController.(*chatPolicyRoutingController).PolicyStatsSnapshot()
 	if len(stats.Profiles) != 1 || stats.Profiles[0].Totals.ActualTiers.Lightweight != 1 {
 		t.Fatalf("policy stats = %+v", stats)
+	}
+}
+
+func TestPolicyPublicIDMayMatchHiddenCopilotTargetModel(t *testing.T) {
+	upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{
+		TurnType:  policyTurnTypeLookup,
+		CodeScope: policyCodeScopeNone,
+		RiskLevel: policyRiskLevelLow,
+	})
+	cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+	cfg.PolicyProfiles[0].PublicID = "gpt-5.6-luna"
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("fixture-token"),
+		nil,
+		WithCopilotBaseURL(upstream.server.URL),
+		WithProvidersConfig(cfg),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatalf("InitializePolicyRouting() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, providerEndpointChatCompletions, strings.NewReader(`{
+		"model":"gpt-5.6-luna",
+		"messages":[{"role":"user","content":"Explain one symbol."}],
+		"max_completion_tokens":256
+	}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Model != "gpt-5.6-luna" {
+		t.Fatalf("response model = %q, want policy public ID", response.Model)
+	}
+	_, classifierRequests, terminalModels, _ := upstream.snapshot()
+	if classifierRequests != 2 || strings.Join(terminalModels, ",") != "gpt-5.6-luna" {
+		t.Fatalf("classifier requests = %d, terminal models = %v", classifierRequests, terminalModels)
 	}
 }
 

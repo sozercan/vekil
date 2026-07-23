@@ -2314,6 +2314,9 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	if len(result.Headers) > 0 {
 		observeUpstreamHeaders(r.Context(), result.Headers)
 	}
+	if policyPlan.valid() {
+		result.Headers = policyChatSafeHeaders(result.Headers, responseModel)
+	}
 
 	if routeOperation != nil && result.Backend == chatBackendNativeChat && result.Response != nil && !mode.clientRequestedStream && !mode.forceUpstreamStream {
 		if normalizeErr := normalizeExplicitOpenAIChatResponseModel(result.Response, responseModel); normalizeErr != nil {
