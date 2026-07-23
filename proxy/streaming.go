@@ -277,7 +277,7 @@ func classifyOpenAIChatChunkProgress(raw map[string]json.RawMessage) upstreamSem
 	}
 	knownTopLevel := map[string]struct{}{
 		"id": {}, "object": {}, "created": {}, "model": {}, "choices": {},
-		"system_fingerprint": {}, "service_tier": {}, "usage": {},
+		"moderation": {}, "system_fingerprint": {}, "service_tier": {}, "usage": {},
 	}
 	for key, value := range raw {
 		if _, known := knownTopLevel[key]; !known && !rawJSONIsNullOrEmpty(value) {

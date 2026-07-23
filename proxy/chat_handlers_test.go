@@ -152,6 +152,37 @@ func TestPolicyChatSafeHeadersQuotaAllowlist(t *testing.T) {
 	}
 }
 
+func TestRecognizedPolicyOpenAIStreamChunk(t *testing.T) {
+	tests := []struct {
+		name      string
+		eventType string
+		data      string
+		want      bool
+	}{
+		{name: "content", data: `{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}`, want: true},
+		{name: "finish", eventType: "chat.completion.chunk", data: `{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`, want: true},
+		{name: "usage only", data: `{"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`, want: true},
+		{name: "foundry prompt filter", data: `{"id":"","object":"","created":0,"model":"","prompt_filter_results":[{"prompt_index":0,"content_filter_results":{}}],"choices":[],"usage":null}`, want: true},
+		{name: "foundry prompt annotations", data: `{"id":"","object":"","created":0,"model":"","prompt_annotations":[{"prompt_index":0,"content_filter_results":{}}],"choices":[],"usage":null}`, want: true},
+		{name: "OpenAI moderation", data: `{"id":"chat","object":"chat.completion.chunk","created":1,"model":"gpt","choices":[],"usage":null,"moderation":{"input":{"type":"moderation_results","model":"omni-moderation-latest","results":[]},"output":{"type":"moderation_results","model":"omni-moderation-latest","results":[]}}}`, want: true},
+		{name: "malformed OpenAI moderation", data: `{"id":"chat","object":"chat.completion.chunk","created":1,"model":"gpt","choices":[],"usage":null,"moderation":{}}`},
+		{name: "malformed foundry envelope", data: `{"object":[],"prompt_filter_results":[{}],"choices":[],"usage":null}`},
+		{name: "empty object", data: `{}`},
+		{name: "null choices", data: `{"choices":null}`},
+		{name: "empty choices without usage", data: `{"choices":[]}`},
+		{name: "empty choice", data: `{"choices":[{}]}`},
+		{name: "unknown event", eventType: "vendor.chunk", data: `{"choices":[{"index":0,"delta":{"content":"ok"}}]}`},
+		{name: "wrong object", data: `{"object":"vendor.chunk","choices":[{"index":0,"delta":{"content":"ok"}}]}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := recognizedPolicyOpenAIStreamChunk(tc.eventType, tc.data); got != tc.want {
+				t.Fatalf("recognizedPolicyOpenAIStreamChunk() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestPrepareOpenAIChatCompletionsRequest_ForceStreamWithTools(t *testing.T) {
 	input := []byte(`{
 		"model":"gpt-4.1",

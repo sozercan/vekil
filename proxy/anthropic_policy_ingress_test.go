@@ -71,6 +71,38 @@ func TestPolicySanitizedOpenAIStreamTransportErrorMapsToAnthropicError(t *testin
 	}
 }
 
+func TestPolicySanitizedOpenAIStreamAllowsFoundryFilterAnnotations(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"","object":"","created":0,"model":"","prompt_filter_results":[{"prompt_index":0,"content_filter_results":{"hate":{"filtered":false,"severity":"safe"}}}],"choices":[],"usage":null}`,
+		`data: {"id":"chat","object":"chat.completion.chunk","created":1,"model":"light-model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null,"content_filter_results":{"hate":{"filtered":false,"severity":"safe"}}}],"usage":null}`,
+		`data: {"id":"","object":"","created":0,"model":"","choices":[{"index":0,"delta":{},"finish_reason":"stop","content_filter_results":{},"content_filter_offsets":{"check_offset":4,"start_offset":0,"end_offset":2}}],"usage":null}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	recorder := httptest.NewRecorder()
+	StreamOpenAIToAnthropic(recorder, newPolicySanitizedOpenAIStream(io.NopCloser(strings.NewReader(stream))), "coding-economy", "msg-foundry-filter")
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"text":"ok"`) || !strings.Contains(body, "event: message_stop") || strings.Contains(body, `"message":"upstream request failed"`) {
+		t.Fatalf("Foundry filter annotations were not preserved as a valid stream: %s", body)
+	}
+}
+
+func TestPolicySanitizedOpenAIStreamAllowsOpenAIModerationChunk(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"chat","object":"chat.completion.chunk","created":1,"model":"gpt","choices":[],"usage":null,"moderation":{"input":{"type":"moderation_results","model":"omni-moderation-latest","results":[]},"output":{"type":"moderation_results","model":"omni-moderation-latest","results":[]}}}`,
+		`data: {"id":"chat","object":"chat.completion.chunk","created":1,"model":"light-model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}],"usage":null}`,
+		`data: {"id":"chat","object":"chat.completion.chunk","created":1,"model":"light-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	recorder := httptest.NewRecorder()
+	StreamOpenAIToAnthropic(recorder, newPolicySanitizedOpenAIStream(io.NopCloser(strings.NewReader(stream))), "coding-economy", "msg-openai-moderation")
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"text":"ok"`) || !strings.Contains(body, "event: message_stop") || strings.Contains(body, `"message":"upstream request failed"`) {
+		t.Fatalf("OpenAI moderation chunk was not preserved as a valid stream: %s", body)
+	}
+}
+
 func TestHandleAnthropicMessagesPolicyIngressPreservesForcedStreamAndPublicContract(t *testing.T) {
 	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
 	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
@@ -624,7 +656,7 @@ func TestHandleAnthropicMessagesPolicyIngressSanitizesMalformedStreamError(t *te
 }
 
 func TestHandleAnthropicMessagesPolicyIngressSanitizesMalformedClientStreamError(t *testing.T) {
-	for _, malformed := range []string{"not-json", `{"choices":"not-an-array"}`} {
+	for _, malformed := range []string{"not-json", `{}`, `{"choices":null}`, `{"choices":[]}`, `{"choices":[{}]}`, `{"choices":"not-an-array"}`} {
 		t.Run(malformed, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				defer func() { _ = r.Body.Close() }()

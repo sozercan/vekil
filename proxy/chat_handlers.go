@@ -135,8 +135,7 @@ func sanitizePolicyOpenAIStreamEvent(raw []byte, eventType string, dataLines []s
 	}
 	streamErr, ok := parseOpenAIStreamError(eventType, data)
 	if !ok {
-		var chunk models.OpenAIStreamChunk
-		if json.Unmarshal([]byte(data), &chunk) != nil {
+		if !recognizedPolicyOpenAIStreamChunk(eventType, data) {
 			return policySanitizedOpenAIStreamErrorEvent(http.StatusBadGateway)
 		}
 		return append([]byte(nil), raw...)
@@ -149,6 +148,151 @@ func sanitizePolicyOpenAIStreamEvent(raw []byte, eventType string, dataLines []s
 		return append([]byte(nil), raw...)
 	}
 	return []byte("event: error\ndata: " + string(payload) + "\n\n")
+}
+
+func recognizedPolicyOpenAIStreamChunk(eventType, data string) bool {
+	switch strings.ToLower(strings.TrimSpace(eventType)) {
+	case "", "message", "completion", "chat.completion.chunk":
+	default:
+		return false
+	}
+
+	var raw map[string]json.RawMessage
+	if json.Unmarshal([]byte(data), &raw) != nil || raw == nil {
+		return false
+	}
+	var chunk models.OpenAIStreamChunk
+	if json.Unmarshal([]byte(data), &chunk) != nil {
+		return false
+	}
+	if object := strings.TrimSpace(chunk.Object); object != "" && object != "chat.completion.chunk" {
+		return false
+	}
+	if recognizedFoundryPromptFilterAnnotation(raw) {
+		return true
+	}
+	if recognizedOpenAIModerationChunk(raw) {
+		return true
+	}
+	inspection := inspectOpenAIChatStreamEvent(eventType, data)
+	if inspection.chunk == nil || inspection.progress == upstreamProgressUnknown {
+		return false
+	}
+	choicesRaw, hasChoices := raw["choices"]
+	if hasChoices {
+		if rawJSONIsNullOrEmpty(choicesRaw) {
+			return false
+		}
+		var choices []json.RawMessage
+		if json.Unmarshal(choicesRaw, &choices) != nil {
+			return false
+		}
+		if len(choices) > 0 {
+			for _, choiceRaw := range choices {
+				var choice map[string]json.RawMessage
+				if json.Unmarshal(choiceRaw, &choice) != nil || choice == nil {
+					return false
+				}
+				recognized := false
+				if deltaRaw, ok := choice["delta"]; ok && !rawJSONIsNullOrEmpty(deltaRaw) {
+					var delta map[string]json.RawMessage
+					if json.Unmarshal(deltaRaw, &delta) != nil || delta == nil {
+						return false
+					}
+					recognized = true
+				}
+				if finishRaw, ok := choice["finish_reason"]; ok {
+					if !rawJSONIsNullOrEmpty(finishRaw) {
+						var finish string
+						if json.Unmarshal(finishRaw, &finish) != nil || strings.TrimSpace(finish) == "" {
+							return false
+						}
+					}
+					recognized = true
+				}
+				if !recognized {
+					return false
+				}
+			}
+			return true
+		}
+	}
+
+	usageRaw, hasUsage := raw["usage"]
+	if !hasUsage || rawJSONIsNullOrEmpty(usageRaw) {
+		return false
+	}
+	var usage models.OpenAIUsage
+	return json.Unmarshal(usageRaw, &usage) == nil
+}
+
+func recognizedFoundryPromptFilterAnnotation(raw map[string]json.RawMessage) bool {
+	choicesRaw, ok := raw["choices"]
+	if !ok || rawJSONIsNullOrEmpty(choicesRaw) {
+		return false
+	}
+	var choices []json.RawMessage
+	if json.Unmarshal(choicesRaw, &choices) != nil || len(choices) != 0 {
+		return false
+	}
+	if usageRaw, ok := raw["usage"]; ok && !rawJSONIsNullOrEmpty(usageRaw) {
+		return false
+	}
+
+	recognized := false
+	for _, name := range []string{"prompt_filter_results", "prompt_annotations"} {
+		annotationsRaw, ok := raw[name]
+		if !ok || rawJSONIsNullOrEmpty(annotationsRaw) {
+			continue
+		}
+		var annotations []json.RawMessage
+		if json.Unmarshal(annotationsRaw, &annotations) != nil || len(annotations) == 0 {
+			return false
+		}
+		for _, annotationRaw := range annotations {
+			var annotation map[string]json.RawMessage
+			if json.Unmarshal(annotationRaw, &annotation) != nil || annotation == nil {
+				return false
+			}
+		}
+		recognized = true
+	}
+	return recognized
+}
+
+func recognizedOpenAIModerationChunk(raw map[string]json.RawMessage) bool {
+	choicesRaw, ok := raw["choices"]
+	if !ok || rawJSONIsNullOrEmpty(choicesRaw) {
+		return false
+	}
+	var choices []json.RawMessage
+	if json.Unmarshal(choicesRaw, &choices) != nil || len(choices) != 0 {
+		return false
+	}
+	if usageRaw, ok := raw["usage"]; ok && !rawJSONIsNullOrEmpty(usageRaw) {
+		return false
+	}
+	moderationRaw, ok := raw["moderation"]
+	if !ok || rawJSONIsNullOrEmpty(moderationRaw) {
+		return false
+	}
+	var moderation map[string]json.RawMessage
+	if json.Unmarshal(moderationRaw, &moderation) != nil || moderation == nil {
+		return false
+	}
+	for _, name := range []string{"input", "output"} {
+		partRaw, ok := moderation[name]
+		if !ok || rawJSONIsNullOrEmpty(partRaw) {
+			return false
+		}
+		var part struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(partRaw, &part) != nil || (part.Type != "moderation_results" && part.Type != "error") {
+			return false
+		}
+	}
+	return true
 }
 
 func policySanitizedOpenAIStreamErrorEvent(status int) []byte {
