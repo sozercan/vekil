@@ -1974,14 +1974,16 @@ func TestPolicyCopilotProviderScopeFollowsEffectiveMode(t *testing.T) {
 	makeConfig := func(copilotClassifier bool) ProvidersConfig {
 		powerProvider := "copilot"
 		classifierProvider := "local"
+		includeModels := []string{"power"}
 		if copilotClassifier {
 			powerProvider = "local"
 			classifierProvider = "copilot"
+			includeModels = []string{"classifier"}
 		}
 		return ProvidersConfig{
 			SchemaVersion: 2,
 			Providers: []ProviderConfig{
-				{ID: "copilot", Type: "copilot", Default: true, TrustDomain: "org"},
+				{ID: "copilot", Type: "copilot", Default: true, TrustDomain: "org", IncludeModels: includeModels},
 				{ID: "local", Type: "openai-compatible", BaseURL: "https://local.example.test/v1", AuthType: "none", ModelDiscovery: "static", TrustDomain: "org", ClassifierNoStoreSupported: &classifierNoStore},
 			},
 			ModelRoutes: []ModelRouteConfig{
@@ -2000,6 +2002,7 @@ func TestPolicyCopilotProviderScopeFollowsEffectiveMode(t *testing.T) {
 	tests := []struct {
 		name              string
 		copilotClassifier bool
+		unscoped          bool
 		mode              PolicyRoutingMode
 		want              bool
 	}{
@@ -2009,17 +2012,24 @@ func TestPolicyCopilotProviderScopeFollowsEffectiveMode(t *testing.T) {
 		{name: "off excludes Copilot classifier", copilotClassifier: true, mode: PolicyRoutingModeOff, want: false},
 		{name: "observe includes Copilot classifier", copilotClassifier: true, mode: PolicyRoutingModeObserve, want: true},
 		{name: "enforce includes Copilot classifier", copilotClassifier: true, mode: PolicyRoutingModeEnforce, want: true},
+		{name: "unscoped off excludes non-baseline Copilot", unscoped: true, mode: PolicyRoutingModeOff, want: false},
+		{name: "unscoped observe includes Copilot classifier", copilotClassifier: true, unscoped: true, mode: PolicyRoutingModeObserve, want: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := makeConfig(tc.copilotClassifier)
+			options := []Option{
+				WithProvidersConfig(cfg),
+				WithDeferredDynamicProviderModelValidation(true),
+				WithPolicyRoutingMode(tc.mode),
+			}
+			if !tc.unscoped {
+				options = append(options, WithAllowedModels("semantic"))
+			}
 			h, err := NewProxyHandler(
 				auth.NewTestAuthenticator("test-token"),
 				logger.NewWithWriter(logger.LevelError, io.Discard),
-				WithProvidersConfig(cfg),
-				WithAllowedModels("semantic"),
-				WithDeferredDynamicProviderModelValidation(true),
-				WithPolicyRoutingMode(tc.mode),
+				options...,
 			)
 			if err != nil {
 				t.Fatalf("NewProxyHandler() error = %v", err)

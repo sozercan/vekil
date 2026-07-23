@@ -833,3 +833,48 @@ func TestReadPolicyClassifierUsageForResponsesShape(t *testing.T) {
 		t.Fatalf("usage = %+v, want %+v", usage, want)
 	}
 }
+
+func TestPolicyCopilotInternalTargetsAreNotPublicModels(t *testing.T) {
+	upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("fixture-token"),
+		nil,
+		WithCopilotBaseURL(upstream.server.URL),
+		WithProvidersConfig(directCopilotResponsesPolicyConfig(policyConfigModeEnforce)),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	defer h.BeginShutdown()
+
+	modelsRecorder := httptest.NewRecorder()
+	h.HandleModels(modelsRecorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if modelsRecorder.Code != http.StatusOK {
+		t.Fatalf("models status = %d, body = %s", modelsRecorder.Code, modelsRecorder.Body.String())
+	}
+	var catalog struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(modelsRecorder.Body.Bytes(), &catalog); err != nil {
+		t.Fatal(err)
+	}
+	ids := make(map[string]bool, len(catalog.Data))
+	for _, model := range catalog.Data {
+		ids[model.ID] = true
+	}
+	if !ids["gpt-5.6-semantic"] || ids["gpt-5.6-luna"] || ids["gpt-5.6-sol"] {
+		t.Fatalf("public model ids = %v", ids)
+	}
+
+	for _, model := range []string{"gpt-5.6-luna", "gpt-5.6-sol"} {
+		recorder := httptest.NewRecorder()
+		body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hello"}]}`, model)
+		h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, providerEndpointChatCompletions, strings.NewReader(body)))
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("direct %s status = %d, body = %s", model, recorder.Code, recorder.Body.String())
+		}
+	}
+}
