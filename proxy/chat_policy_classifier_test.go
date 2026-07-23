@@ -36,6 +36,32 @@ func TestEffectivePolicyModeMatrix(t *testing.T) {
 	}
 }
 
+func TestValidatePolicyClassifierNoStore(t *testing.T) {
+	supported := true
+	provider := &providerRuntime{classifierNoStoreSupported: &supported}
+	for _, tc := range []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{name: "false retained", body: `{"store":false}`},
+		{name: "missing", body: `{}`, wantErr: true},
+		{name: "true", body: `{"store":true}`, wantErr: true},
+		{name: "null", body: `{"store":null}`, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validatePolicyClassifierNoStore([]byte(tc.body), provider)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validatePolicyClassifierNoStore() error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+	supported = false
+	if err := validatePolicyClassifierNoStore([]byte(`{}`), provider); err != nil {
+		t.Fatalf("unsupported no-store provider error = %v", err)
+	}
+}
+
 func TestPolicyModeAndTierParsing(t *testing.T) {
 	for value, want := range map[string]policyMode{"": policyModeOff, "off": policyModeOff, "observe": policyModeObserve, "enforce": policyModeEnforce} {
 		got, err := parsePolicyMode(value)

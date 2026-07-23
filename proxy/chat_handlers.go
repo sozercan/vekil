@@ -2232,7 +2232,11 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 
 	responseModel := explicitRoutePublicModel(route, publicModel)
-	result, err := h.executeRoutedChatCompletions(upstreamCtx, bodyBytes, mode, chatExecutionOptions{}, requestedModel)
+	executionOptions := chatExecutionOptions{}
+	if policyPlan.valid() {
+		executionOptions.ResponsesMinimumOutputTokens = responsesChatMinimumOutputTokens
+	}
+	result, err := h.executeRoutedChatCompletions(upstreamCtx, bodyBytes, mode, executionOptions, requestedModel)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return

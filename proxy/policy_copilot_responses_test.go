@@ -413,6 +413,42 @@ func TestPolicyRoutingSelectsCopilotResponsesLightweightRoute(t *testing.T) {
 	}
 }
 
+func TestPolicyResponsesMinimumOutputTokensCarryIntoTerminalExecution(t *testing.T) {
+	upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{
+		TurnType:  policyTurnTypeLookup,
+		CodeScope: policyCodeScopeNone,
+		RiskLevel: policyRiskLevelLow,
+	})
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("fixture-token"),
+		nil,
+		WithCopilotBaseURL(upstream.server.URL),
+		WithProvidersConfig(directCopilotResponsesPolicyConfig(policyConfigModeEnforce)),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatalf("InitializePolicyRouting() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, providerEndpointChatCompletions, strings.NewReader(`{
+		"model":"gpt-5.6-semantic",
+		"messages":[{"role":"user","content":"Explain one symbol."}],
+		"max_completion_tokens":1
+	}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	_, classifierRequests, terminalModels, _ := upstream.snapshot()
+	if classifierRequests != 2 || strings.Join(terminalModels, ",") != "gpt-5.6-luna" {
+		t.Fatalf("classifier requests = %d, terminal models = %v", classifierRequests, terminalModels)
+	}
+}
+
 func TestPolicyPublicIDMayMatchHiddenCopilotTargetModel(t *testing.T) {
 	upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{
 		TurnType:  policyTurnTypeLookup,
@@ -633,7 +669,7 @@ func TestPolicyRoutingCopilotResponsesToolContinuationUsesSameProcessReplay(t *t
 			json.RawMessage(initialResponse.Choices[0].Message),
 			map[string]any{"role": "tool", "tool_call_id": assistant.ToolCalls[0].ID, "content": "main is a function"},
 		},
-		"max_completion_tokens": 256,
+		"max_completion_tokens": 1,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -887,7 +887,11 @@ func preparePolicyClassifierRequest(body []byte, route *modelRoute, target targe
 		return nil, err
 	}
 	if endpoint == providerEndpointChatCompletions {
-		return applyProviderModelRequestPolicy(prepared, endpoint, owner), nil
+		prepared = applyProviderModelRequestPolicy(prepared, endpoint, owner)
+		if err := validatePolicyClassifierNoStore(prepared, target.provider); err != nil {
+			return nil, err
+		}
+		return prepared, nil
 	}
 	if endpoint != providerEndpointResponses {
 		return nil, fmt.Errorf("unsupported classifier endpoint %q", endpoint)
@@ -918,7 +922,29 @@ func preparePolicyClassifierRequest(body []byte, route *modelRoute, target targe
 			return nil, err
 		}
 	}
-	return applyProviderModelRequestPolicy(prepared, endpoint, owner), nil
+	prepared = applyProviderModelRequestPolicy(prepared, endpoint, owner)
+	if err := validatePolicyClassifierNoStore(prepared, target.provider); err != nil {
+		return nil, err
+	}
+	return prepared, nil
+}
+
+func validatePolicyClassifierNoStore(body []byte, provider *providerRuntime) error {
+	if provider == nil || provider.classifierNoStoreSupported == nil || !*provider.classifierNoStoreSupported {
+		return nil
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return fmt.Errorf("decode final classifier request: %w", err)
+	}
+	raw, ok := payload["store"]
+	if !ok {
+		return fmt.Errorf("classifier request lost required store: false control")
+	}
+	if !bytes.Equal(bytes.TrimSpace(raw), []byte("false")) {
+		return fmt.Errorf("classifier request must retain store: false")
+	}
+	return nil
 }
 
 func convertPolicyClassifierResponsesBody(body []byte, target targetBinding) []byte {
