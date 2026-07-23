@@ -86,15 +86,17 @@ func TestHandleAnthropicMessagesPolicyIngressPreservesForcedStreamAndPublicContr
 		t.Fatal(err)
 	}
 
+	ctx, summary := WithRequestSummary(t.Context())
 	recorder := httptest.NewRecorder()
-	h.HandleAnthropicMessages(recorder, httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(`{
+	request := httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(`{
 		"model":"coding-economy",
 		"max_tokens":64,
 		"stream":false,
 		"messages":[{"role":"user","content":"inspect the repository"}],
 		"tools":[{"name":"read_file","description":"Read a file","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}],
 		"tool_choice":{"type":"none"}
-	}`)))
+	}`)).WithContext(ctx)
+	h.HandleAnthropicMessages(recorder, request)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
@@ -102,8 +104,9 @@ func TestHandleAnthropicMessagesPolicyIngressPreservesForcedStreamAndPublicContr
 	if got := recorder.Header().Get("Content-Type"); !strings.Contains(got, "application/json") {
 		t.Fatalf("Content-Type=%q, want non-streaming Anthropic JSON", got)
 	}
-	if got := recorder.Header().Get("X-Vekil-Request-ID"); got == "" {
-		t.Fatal("missing X-Vekil-Request-ID")
+	operationID := recorder.Header().Get("X-Vekil-Request-ID")
+	if operationID == "" || operationID != summary.OperationID() {
+		t.Fatalf("request ID/header = %q/%q", operationID, summary.OperationID())
 	}
 	var response models.AnthropicResponse
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
@@ -122,6 +125,14 @@ func TestHandleAnthropicMessagesPolicyIngressPreservesForcedStreamAndPublicContr
 	}
 	if powerfulRequests, _ := powerful.snapshot(); powerfulRequests != 0 {
 		t.Fatalf("powerful requests=%d, want zero", powerfulRequests)
+	}
+	h.RecordRequest(summary, recorder.Code, "claude", 0)
+	snapshot := h.stats.snapshot()
+	if len(snapshot.Recent) != 1 || snapshot.Recent[0].OperationID != operationID {
+		t.Fatalf("request stats operation ID = %+v, want %q", snapshot.Recent, operationID)
+	}
+	if len(snapshot.RecentAttempts) != 1 || snapshot.RecentAttempts[0].OperationID != operationID {
+		t.Fatalf("route attempt operation ID = %+v, want %q", snapshot.RecentAttempts, operationID)
 	}
 	parallel := light.parallelToolCallsSnapshot()
 	if len(parallel) != 1 || string(parallel[0]) != "false" {

@@ -33,6 +33,13 @@ func (h *ProxyHandler) planOpenAIChatPolicy(ctx context.Context, model string, o
 	if h == nil || h.chatPolicyPlanner == nil {
 		return chatOperationPlan{}, nil
 	}
-	input := (chatPolicyInput{Model: model, OriginalBody: originalBody}).normalized()
+	input := chatPolicyInput{Model: model, OriginalBody: originalBody}
+	// Policy ingress may establish a client-visible request identity before
+	// translation and planning. Reuse it so sampling, route attempts, response
+	// headers, and request summaries all describe the same logical operation.
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		input.OperationID = summary.OperationID()
+	}
+	input = input.normalized()
 	return h.chatPolicyPlanner.Plan(ctx, input)
 }

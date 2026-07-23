@@ -76,8 +76,9 @@ func TestPolicyResponsesIngressStreamsTextThroughBaselineChatRoute(t *testing.T)
 	if !sawCreated || !sawText || !sawCompleted {
 		t.Fatalf("events created=%v text=%v completed=%v body=%s", sawCreated, sawText, sawCompleted, recorder.Body.String())
 	}
-	if got := recorder.Header().Get("X-Vekil-Request-ID"); got == "" {
-		t.Fatal("missing X-Vekil-Request-ID")
+	operationID := recorder.Header().Get("X-Vekil-Request-ID")
+	if operationID == "" || operationID != summary.OperationID() {
+		t.Fatalf("request ID/header = %q/%q", operationID, summary.OperationID())
 	}
 	lightRequests, lightModels := light.snapshot()
 	if lightRequests != 1 || strings.Join(lightModels, ",") != "light-model" {
@@ -90,6 +91,12 @@ func TestPolicyResponsesIngressStreamsTextThroughBaselineChatRoute(t *testing.T)
 	snapshot := h.stats.snapshot()
 	if snapshot.Totals.Requests != 1 || len(snapshot.ByRoute) != 1 || snapshot.ByRoute[0].Route != "coding-economy" {
 		t.Fatalf("policy Responses request was not recorded exactly once: %+v", snapshot)
+	}
+	if len(snapshot.Recent) != 1 || snapshot.Recent[0].OperationID != operationID {
+		t.Fatalf("request stats operation ID = %+v, want %q", snapshot.Recent, operationID)
+	}
+	if len(snapshot.RecentAttempts) != 1 || snapshot.RecentAttempts[0].OperationID != operationID {
+		t.Fatalf("route attempt operation ID = %+v, want %q", snapshot.RecentAttempts, operationID)
 	}
 }
 
