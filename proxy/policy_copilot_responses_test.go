@@ -985,6 +985,51 @@ func TestPolicyCopilotSynchronousAllowedModelValidationUsesLocalSetup(t *testing
 	}
 }
 
+func TestPolicyCopilotSynchronousValidationFiltersUnrelatedCatalogModels(t *testing.T) {
+	cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+	cfg.Providers[0].IncludeModels = nil
+	cfg.Providers = append(cfg.Providers, ProviderConfig{
+		ID:             "local",
+		Type:           "openai-compatible",
+		BaseURL:        "https://local.example.test/v1",
+		AuthType:       "none",
+		ModelDiscovery: "static",
+		Default:        true,
+		Models: []ProviderModelConfig{{
+			PublicID:  "shared-model",
+			Endpoints: []string{providerEndpointChatCompletions},
+		}},
+	})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != providerEndpointModels {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": []any{
+			map[string]any{"id": "gpt-5.6-luna", "object": "model", "supported_endpoints": []string{providerEndpointResponses}},
+			map[string]any{"id": "gpt-5.6-sol", "object": "model", "supported_endpoints": []string{providerEndpointResponses}},
+			map[string]any{"id": "shared-model", "object": "model", "supported_endpoints": []string{providerEndpointChatCompletions}},
+		}})
+	}))
+	defer upstream.Close()
+
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("fixture-token"),
+		nil,
+		WithCopilotBaseURL(upstream.URL),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("gpt-5.6-semantic"),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() rejected unrelated Copilot catalog collision: %v", err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	if owner, ok := h.providerSetup().lookupModel("shared-model"); !ok || owner.providerID != "local" {
+		t.Fatalf("shared-model owner = %+v, ok = %v, want local", owner, ok)
+	}
+}
+
 func TestPolicyResponsesContractRejectsBeforeClassifierDispatch(t *testing.T) {
 	tests := []struct {
 		name  string

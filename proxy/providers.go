@@ -800,7 +800,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 		if err := h.validateDynamicExplicitRouteTargets(setup, provider, result.models); err != nil {
 			return nil, err
 		}
-		if err := setup.addProviderModels(providerID, result.models); err != nil {
+		if err := setup.addProviderModels(providerID, h.filterAllowedModels(result.models)); err != nil {
 			return nil, err
 		}
 	}
