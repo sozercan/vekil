@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +20,17 @@ type policyCloseTrackingReader struct {
 }
 
 func (r *policyCloseTrackingReader) Close() error {
+	r.closed = true
+	return nil
+}
+
+type policyErrorReadCloser struct {
+	err    error
+	closed bool
+}
+
+func (r *policyErrorReadCloser) Read([]byte) (int, error) { return 0, r.err }
+func (r *policyErrorReadCloser) Close() error {
 	r.closed = true
 	return nil
 }
@@ -39,6 +52,22 @@ func TestPolicySanitizedOpenAIStreamBoundsOneEvent(t *testing.T) {
 	}
 	if !upstream.closed {
 		t.Fatal("oversized policy SSE event did not close upstream body")
+	}
+}
+
+func TestPolicySanitizedOpenAIStreamTransportErrorMapsToAnthropicError(t *testing.T) {
+	upstream := &policyErrorReadCloser{err: errors.New("secret transport detail")}
+	recorder := httptest.NewRecorder()
+	StreamOpenAIToAnthropic(recorder, newPolicySanitizedOpenAIStream(upstream), "coding-economy", "msg-policy-transport")
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"message":"upstream request failed"`) {
+		t.Fatalf("transport failure was not sanitized: %s", body)
+	}
+	if strings.Contains(body, "secret transport detail") || strings.Contains(body, "upstream stream read failed") {
+		t.Fatalf("transport failure detail leaked: %s", body)
+	}
+	if !upstream.closed {
+		t.Fatal("transport failure did not close upstream body")
 	}
 }
 
@@ -530,6 +559,40 @@ func TestHandleAnthropicMessagesPolicyIngressSanitizesMalformedStreamError(t *te
 	}
 	if response.Error.Message != "upstream request failed" || strings.Contains(recorder.Body.String(), "invalid character") || strings.Contains(recorder.Body.String(), "not-json") {
 		t.Fatalf("malformed upstream detail leaked: %s", recorder.Body.String())
+	}
+}
+
+func TestHandleAnthropicMessagesPolicyIngressSanitizesMalformedClientStreamError(t *testing.T) {
+	for _, malformed := range []string{"not-json", `{"choices":"not-an-array"}`} {
+		t.Run(malformed, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer func() { _ = r.Body.Close() }()
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", malformed)
+			}))
+			defer upstream.Close()
+			h, err := NewProxyHandler(nil, logger.NewWithWriter(logger.LevelError, io.Discard),
+				WithProvidersConfig(policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)),
+				WithPolicyRoutingMode(PolicyRoutingModeOff),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			recorder := httptest.NewRecorder()
+			h.HandleAnthropicMessages(recorder, httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(`{
+				"model":"coding-economy",
+				"max_tokens":64,
+				"stream":true,
+				"messages":[{"role":"user","content":"hello"}]
+			}`)))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			body := recorder.Body.String()
+			if !strings.Contains(body, `"message":"upstream request failed"`) || strings.Contains(body, malformed) || strings.Contains(body, "invalid character") || strings.Contains(body, "cannot unmarshal") {
+				t.Fatalf("malformed client stream detail leaked: %s", body)
+			}
+		})
 	}
 }
 

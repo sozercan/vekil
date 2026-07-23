@@ -353,6 +353,25 @@ func TestPolicyResponsesIngressEnforceSelectsPowerfulAndReturnsJSON(t *testing.T
 	}
 }
 
+func TestCollectPolicyResponsesRejectsPreAggregatedNativeCompletion(t *testing.T) {
+	finishReason := "tool_calls"
+	completion := &models.OpenAIResponse{Choices: []models.OpenAIChoice{{
+		Index: 0,
+		Message: models.OpenAIMessage{Role: "assistant", ToolCalls: []models.OpenAIToolCall{{
+			ID: "call-repaired", Type: "function", Function: models.OpenAIFunctionCall{Name: "lookup", Arguments: `{}`},
+		}}},
+		FinishReason: &finishReason,
+	}}}
+	h := &ProxyHandler{}
+	if _, err := h.collectPolicyResponsesChatCompletion(t.Context(), chatExecutionResult{Completion: completion}, nil, chatCompletionsMode{}); err == nil || !strings.Contains(err.Error(), "unsupported pre-aggregated native completion") {
+		t.Fatalf("error = %v", err)
+	}
+	got, err := h.collectPolicyResponsesChatCompletion(t.Context(), chatExecutionResult{Completion: completion, Backend: chatBackendResponses}, nil, chatCompletionsMode{})
+	if err != nil || got != completion {
+		t.Fatalf("Responses-backed completion = %#v, error = %v", got, err)
+	}
+}
+
 func TestPolicyResponsesChatUpstreamErrorDrainsAndClosesBody(t *testing.T) {
 	body := newTrackingReadCloser(strings.Repeat("x", upstreamErrorDetailMaxBodyBytes*2))
 	response := &http.Response{

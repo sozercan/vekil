@@ -124,9 +124,15 @@ func (h *ProxyHandler) collectPolicyResponsesChatCompletion(ctx context.Context,
 		return aggregatePolicyChatStreamEvents(result.Stream)
 	}
 	if result.Completion != nil {
+		if result.Backend != chatBackendResponses {
+			return nil, fmt.Errorf("policy Chat execution returned an unsupported pre-aggregated native completion")
+		}
 		return result.Completion, nil
 	}
 	if len(result.CompletionBody) > 0 {
+		if result.Backend != chatBackendResponses {
+			return nil, fmt.Errorf("policy Chat execution returned an unsupported pre-aggregated native completion body")
+		}
 		var completion models.OpenAIResponse
 		if err := json.Unmarshal(result.CompletionBody, &completion); err != nil {
 			return nil, fmt.Errorf("decode policy Chat completion: %w", err)

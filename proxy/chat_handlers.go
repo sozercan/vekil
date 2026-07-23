@@ -88,6 +88,10 @@ func (s *policySanitizedOpenAIStream) readEvent() ([]byte, error) {
 	dataLines := make([]string, 0, 1)
 	for {
 		line, err := readOpenAISSELine(s.reader)
+		if err != nil && !errors.Is(err, io.EOF) {
+			_ = s.body.Close()
+			return policySanitizedOpenAIStreamErrorEvent(http.StatusBadGateway), io.EOF
+		}
 		if line != "" {
 			limit := s.maxEventBytes
 			if limit <= 0 {
@@ -122,8 +126,19 @@ func sanitizePolicyOpenAIStreamEvent(raw []byte, eventType string, dataLines []s
 	if len(dataLines) == 0 {
 		return append([]byte(nil), raw...)
 	}
-	streamErr, ok := parseOpenAIStreamError(eventType, strings.Join(dataLines, "\n"))
+	data := strings.Join(dataLines, "\n")
+	if strings.TrimSpace(data) == "[DONE]" {
+		return append([]byte(nil), raw...)
+	}
+	if !json.Valid([]byte(data)) {
+		return policySanitizedOpenAIStreamErrorEvent(http.StatusBadGateway)
+	}
+	streamErr, ok := parseOpenAIStreamError(eventType, data)
 	if !ok {
+		var chunk models.OpenAIStreamChunk
+		if json.Unmarshal([]byte(data), &chunk) != nil {
+			return policySanitizedOpenAIStreamErrorEvent(http.StatusBadGateway)
+		}
 		return append([]byte(nil), raw...)
 	}
 	message, errType, code := policyChatUpstreamErrorDetails(streamErr.httpStatus())
