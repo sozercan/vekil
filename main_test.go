@@ -1154,6 +1154,47 @@ func TestLaunchUsesCopilotDelegatesUnscopedStartupToProviderConfig(t *testing.T)
 	}
 }
 
+func TestLaunchUsesCopilotForDirectPolicyModel(t *testing.T) {
+	parallel := true
+	classifierNoStore := false
+	cfg := proxy.ProvidersConfig{
+		SchemaVersion: 2,
+		Providers: []proxy.ProviderConfig{{
+			ID:                         "copilot",
+			Type:                       "copilot",
+			TrustDomain:                "github-copilot",
+			ClassifierNoStoreSupported: &classifierNoStore,
+		}},
+		ModelRoutes: []proxy.ModelRouteConfig{
+			{ID: "light", Exposure: "internal", Endpoints: []string{"/responses"}, ParallelToolCalls: &parallel, Targets: []proxy.ModelRouteTargetConfig{{ID: "light", Provider: "copilot", UpstreamModel: "gpt-5.6-luna"}}},
+			{ID: "power", Exposure: "internal", Endpoints: []string{"/responses"}, ParallelToolCalls: &parallel, Targets: []proxy.ModelRouteTargetConfig{{ID: "power", Provider: "copilot", UpstreamModel: "gpt-5.6-sol"}}},
+			{ID: "classifier", Exposure: "internal", InternalPurpose: "policy_classifier", Endpoints: []string{"/responses"}, Targets: []proxy.ModelRouteTargetConfig{{ID: "classifier", Provider: "copilot", UpstreamModel: "gpt-5.6-sol"}}},
+		},
+		PolicyProfiles: []proxy.PolicyProfileConfig{{
+			ID: "policy", PublicID: "semantic", Mode: "enforce", LightweightRoute: "light", PowerfulRoute: "power",
+			Classifier: proxy.PolicyClassifierConfig{Route: "classifier"},
+			DataPolicy: proxy.PolicyDataPolicyConfig{ContentForwardingAcknowledged: true, AllowProviderRetention: true},
+		}},
+	}
+	srv, err := server.New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		"127.0.0.1",
+		"0",
+		server.WithProxyOptions(
+			proxy.WithProvidersConfig(cfg),
+			proxy.WithAllowedModels("semantic"),
+			proxy.WithDeferredDynamicProviderModelValidation(true),
+		),
+	)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+	if !launchUsesCopilot(cfg, "semantic", srv) {
+		t.Fatal("direct Copilot policy launch did not request startup authentication")
+	}
+}
+
 func TestParseLaunchAgentOptionsAllowsSupportedCLIDefaults(t *testing.T) {
 	for _, name := range []string{"claude", "codex"} {
 		t.Run(name, func(t *testing.T) {

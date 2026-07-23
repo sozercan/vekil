@@ -38,7 +38,6 @@ The following are explicitly unsupported for policy public IDs in v1 and fail lo
 | Proxy-owned `GET /v1/responses` websocket bridge | Unsupported |
 | `POST /v1/responses/compact` | Unsupported |
 | `POST /v1/memories/trace_summarize` | Unsupported |
-| Responses-backed Chat terminal routes | Supported for OpenAI-family targets, including pinned models on a dynamic `type: copilot` provider |
 | `POST /v1/messages` and `/v1/messages/count_tokens` | Unsupported |
 | Gemini `generateContent`, `streamGenerateContent`, and `countTokens` routes | Unsupported |
 | Image, audio, file, or any other non-text Chat input | Unsupported |

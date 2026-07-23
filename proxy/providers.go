@@ -840,8 +840,8 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 // providerMayExposeAllowedModel reports whether provider must participate in
 // allowed-model discovery. Unlike providerWithinAllowedModelScope, it ignores
 // current ownership so dynamic candidates are checked for collisions before the
-// selected model is trusted. Explicitly reserved policy owners are the exception:
-// managed launches do not discover unrelated providers for those IDs.
+// selected model is trusted. Policy owners include only providers referenced by
+// their terminal/classifier routes; unrelated providers remain out of scope.
 func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) bool {
 	if provider == nil {
 		return false
@@ -852,9 +852,11 @@ func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) 
 	setup := h.providerSetup()
 	for model := range h.allowedModels {
 		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+			if h.policyEntryReferencesProvider(entry, provider) {
+				return true
+			}
 			// A policy public ID is an explicit reserved owner in launcher scope.
-			// Unrelated dynamic providers cannot displace it and must not force
-			// provider discovery or credentials for the managed launch.
+			// Unrelated dynamic providers cannot displace it or force credentials.
 			continue
 		}
 		if providerCanExposeModel(provider, model) {
@@ -874,8 +876,10 @@ func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime
 	setup := h.providerSetup()
 	for model := range h.allowedModels {
 		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
-			// Policy readiness is owned by the policy preflight, not by unrelated
-			// dynamic-provider catalogs.
+			if h.policyEntryReferencesProvider(entry, provider) {
+				return true
+			}
+			// Policy readiness excludes unrelated provider catalogs.
 			continue
 		}
 		if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
@@ -1699,15 +1703,45 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 	return ok
 }
 
+func (h *ProxyHandler) policyEntryReferencesProvider(entry *publicModelEntry, provider *providerRuntime) bool {
+	if h == nil || entry == nil || entry.kind != publicEntryPolicy || provider == nil {
+		return false
+	}
+	setup := h.providerSetup()
+	for _, profile := range h.providersConfig.PolicyProfiles {
+		if strings.TrimSpace(profile.ID) != entry.policyID {
+			continue
+		}
+		for _, routeID := range []string{profile.LightweightRoute, profile.PowerfulRoute, profile.Classifier.Route} {
+			route, ok := setup.lookupTerminalRoute(strings.TrimSpace(routeID))
+			if !ok || route == nil {
+				continue
+			}
+			for _, target := range route.targets {
+				if target.provider != nil && target.provider.id == provider.id {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return false
+}
+
 // ModelUsesCopilot reports whether startup must authenticate Copilot to resolve
-// or collision-check the selected public model. Provider filters exclude
-// Copilot from this decision when it cannot expose the model.
+// or execute the selected public model. Provider filters exclude Copilot from
+// this decision when neither the public owner nor a policy terminal/classifier
+// route references it.
 func (h *ProxyHandler) ModelUsesCopilot(model string) bool {
 	setup := h.providerSetup()
 	model = strings.TrimSpace(model)
 	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
-		// Policy destinations and classifiers cannot be Copilot providers. The
-		// reserved policy owner therefore never requires Copilot authentication.
+		for _, providerID := range setup.providerOrder {
+			provider := setup.providerByID(providerID)
+			if provider != nil && provider.kind == providerTypeCopilot && h.policyEntryReferencesProvider(entry, provider) {
+				return true
+			}
+		}
 		return false
 	}
 	if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {

@@ -1818,6 +1818,31 @@ func TestModelUsesCopilotTreatsPolicyEntryAsNonCopilotInMixedProviderConfig(t *t
 	}
 }
 
+func TestModelUsesCopilotAuthenticatesDirectPolicyTargets(t *testing.T) {
+	cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("gpt-5.6-semantic"),
+		WithDeferredDynamicProviderModelValidation(true),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	if !h.ModelUsesCopilot("gpt-5.6-semantic") {
+		t.Fatal("direct Copilot policy model did not require authentication")
+	}
+	setup := h.providerSetup()
+	copilot := setup.providerByID("copilot")
+	if !h.providerMayExposeAllowedModel(copilot) {
+		t.Fatal("direct Copilot policy provider was excluded from dynamic validation")
+	}
+	if !h.providerWithinAllowedModelScope(copilot) {
+		t.Fatal("direct Copilot policy provider was excluded from readiness scope")
+	}
+}
+
 func TestModelUsesCopilotHonorsProviderFiltersDuringDeferredDiscovery(t *testing.T) {
 	t.Run("filtered default Copilot provider is skipped", func(t *testing.T) {
 		cfg := ProvidersConfig{Providers: []ProviderConfig{
