@@ -558,7 +558,7 @@ func (ps *providerSetup) addProviderModels(providerID string, models []providerM
 	}
 
 	provider := ps.providerByID(providerID)
-	models = filterProviderModels(provider, models)
+	models = filterHiddenProviderModels(provider, filterProviderModels(provider, models))
 
 	ps.modelsMu.Lock()
 	defer ps.modelsMu.Unlock()
@@ -606,7 +606,7 @@ func (ps *providerSetup) replaceProviderModelsBatch(replacements map[string][]pr
 		if provider == nil {
 			return fmt.Errorf("provider %q is not configured", providerID)
 		}
-		filtered[providerID] = filterProviderModels(provider, models)
+		filtered[providerID] = filterHiddenProviderModels(provider, filterProviderModels(provider, models))
 	}
 
 	ps.modelsMu.Lock()
@@ -800,7 +800,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 		if err := h.validateDynamicExplicitRouteTargets(setup, provider, result.models); err != nil {
 			return nil, err
 		}
-		if err := setup.addProviderModels(providerID, filterHiddenProviderModels(provider, result.models)); err != nil {
+		if err := setup.addProviderModels(providerID, result.models); err != nil {
 			return nil, err
 		}
 	}
@@ -835,7 +835,7 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 		if err := h.validateDynamicExplicitRouteTargets(setup, provider, result.models); err != nil {
 			return err
 		}
-		replacements[providerID] = h.filterAllowedModels(filterHiddenProviderModels(provider, result.models))
+		replacements[providerID] = h.filterAllowedModels(result.models)
 	}
 	if err := setup.replaceProviderModelsBatch(replacements); err != nil {
 		return err
@@ -2053,6 +2053,23 @@ func (h *ProxyHandler) ModelUsesCopilot(model string) bool {
 			return true
 		}
 		if providerCanExposeModel(provider, model) {
+			return true
+		}
+	}
+	return false
+}
+
+// UsesCopilot reports whether the current public/provider scope or an active
+// policy route requires Copilot authentication. Inactive hidden policy targets
+// do not force authentication on an otherwise local serve process.
+func (h *ProxyHandler) UsesCopilot() bool {
+	if h == nil {
+		return false
+	}
+	setup := h.providerSetup()
+	for _, providerID := range setup.providerOrder {
+		provider := setup.providerByID(providerID)
+		if provider != nil && provider.kind == providerTypeCopilot && h.providerMayExposeAllowedModel(provider) {
 			return true
 		}
 	}

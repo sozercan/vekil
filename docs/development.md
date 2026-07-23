@@ -73,7 +73,7 @@ Schema-v2 policy routing adds a pre-dispatch planner above native OpenAI Chat. T
 Coverage should include:
 
 - schema-v2 route exposure, internal-route non-resolution/catalog exclusion, public-entry/operational-ID collisions, maximum profile count, field ranges, recursive-policy rejection, and schema-v2 feature-field rejection in v1;
-- terminal contract intersection, native `/chat/completions`-only destination validation, dynamic/unsupported provider rejection, and classifier one-target/one-attempt/one-send enforcement;
+- terminal contract intersection across native `/chat/completions` and Responses-backed Chat, pinned internal Copilot destination validation, rejection of other dynamic/unsupported provider kinds, and classifier one-target/one-attempt/one-send enforcement;
 - exact global/profile mode ceiling behavior, including `off` making zero preflight/classifier calls and observe never changing dispatch;
 - bounded canonical facts, UTF-8 truncation, non-text rejection, tool-name-only forwarding, total request cap, and exclusion of credentials, auth headers, provider state, replay IDs, physical routing metadata, parameter schemas, and tool arguments;
 - mandatory content-forwarding, trust-domain, cross-domain, non-storage, and retention acknowledgements;

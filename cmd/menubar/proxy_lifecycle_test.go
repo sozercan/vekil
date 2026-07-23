@@ -14,6 +14,10 @@ type fakeMenubarProxyServer struct {
 
 func (s *fakeMenubarProxyServer) Start() error { return nil }
 
+func (s *fakeMenubarProxyServer) UsesCopilot() bool { return false }
+
+func (s *fakeMenubarProxyServer) ValidateDynamicProviderModels(context.Context) error { return nil }
+
 func (s *fakeMenubarProxyServer) InitializePolicyRouting(context.Context) error { return nil }
 
 func (s *fakeMenubarProxyServer) Stop(context.Context) error {
@@ -127,6 +131,12 @@ type blockingPolicyMenubarServer struct {
 }
 
 func (s *blockingPolicyMenubarServer) Start() error { return nil }
+
+func (s *blockingPolicyMenubarServer) UsesCopilot() bool { return false }
+
+func (s *blockingPolicyMenubarServer) ValidateDynamicProviderModels(context.Context) error {
+	return nil
+}
 
 func (s *blockingPolicyMenubarServer) InitializePolicyRouting(ctx context.Context) error {
 	close(s.preflightStarted)

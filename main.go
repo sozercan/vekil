@@ -456,6 +456,14 @@ type dynamicProviderModelValidator interface {
 	ValidateDynamicProviderModels(context.Context) error
 }
 
+type dynamicProviderModelValidationState interface {
+	DynamicProviderValidationPending() bool
+}
+
+type serveCopilotUsageChecker interface {
+	UsesCopilot() bool
+}
+
 type startupAuthenticationGate interface {
 	SetStartupAuthenticationPending(bool)
 }
@@ -502,39 +510,44 @@ func startServeServer(ctx context.Context, srv serveLifecycleServer, authenticat
 		return fmt.Errorf("server start error: %w", err)
 	}
 
-	if !usesCopilot {
-		return nil
+	if usesCopilot {
+		authDone := make(chan error, 1)
+		go func() {
+			if log != nil {
+				log.Info("authenticating with GitHub Copilot...")
+			}
+			_, err := authenticator.GetToken(ctx)
+			if err == nil && log != nil {
+				log.Info("authenticated successfully")
+			}
+			authDone <- err
+		}()
+
+		select {
+		case <-ctx.Done():
+			return cancelServeStartup(ctx, srv, log)
+		case err := <-authDone:
+			if err != nil {
+				if ctx.Err() != nil {
+					return cancelServeStartup(ctx, srv, log)
+				}
+				authErr := fmt.Errorf("authentication failed: %w", err)
+				if stopErr := stopServeServer(srv, log); stopErr != nil {
+					return errors.Join(authErr, stopErr)
+				}
+				return authErr
+			}
+			if gate, ok := srv.(startupAuthenticationGate); ok {
+				gate.SetStartupAuthenticationPending(false)
+			}
+		}
 	}
 
-	authDone := make(chan error, 1)
-	go func() {
-		if log != nil {
-			log.Info("authenticating with GitHub Copilot...")
-		}
-		_, err := authenticator.GetToken(ctx)
-		if err == nil && log != nil {
-			log.Info("authenticated successfully")
-		}
-		authDone <- err
-	}()
-
-	select {
-	case <-ctx.Done():
-		return cancelServeStartup(ctx, srv, log)
-	case err := <-authDone:
-		if err != nil {
-			if ctx.Err() != nil {
-				return cancelServeStartup(ctx, srv, log)
-			}
-			authErr := fmt.Errorf("authentication failed: %w", err)
-			if stopErr := stopServeServer(srv, log); stopErr != nil {
-				return errors.Join(authErr, stopErr)
-			}
-			return authErr
-		}
-		if gate, ok := srv.(startupAuthenticationGate); ok {
-			gate.SetStartupAuthenticationPending(false)
-		}
+	validateDynamicModels := usesCopilot
+	if state, ok := srv.(dynamicProviderModelValidationState); ok {
+		validateDynamicModels = state.DynamicProviderValidationPending()
+	}
+	if validateDynamicModels {
 		if validator, ok := srv.(dynamicProviderModelValidator); ok {
 			if err := validator.ValidateDynamicProviderModels(ctx); err != nil {
 				if ctx.Err() != nil {
@@ -549,6 +562,13 @@ func startServeServer(ctx context.Context, srv serveLifecycleServer, authenticat
 		}
 	}
 	return nil
+}
+
+func serveUsesCopilot(srv serveLifecycleServer, fallback bool) bool {
+	if checker, ok := srv.(serveCopilotUsageChecker); ok {
+		return checker.UsesCopilot()
+	}
+	return fallback
 }
 
 func serveUntilContextDone(ctx context.Context, srv serveLifecycleServer, authenticator serveStartupAuthenticator, usesCopilot bool, log *logger.Logger) error {
@@ -645,7 +665,7 @@ func runServe() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := serveUntilContextDone(ctx, srv, authenticator, providersCfg.UsesCopilot(), log); err != nil {
+	if err := serveUntilContextDone(ctx, srv, authenticator, serveUsesCopilot(srv, providersCfg.UsesCopilot()), log); err != nil {
 		log.Fatal("serve error", logger.Err(err))
 	}
 }

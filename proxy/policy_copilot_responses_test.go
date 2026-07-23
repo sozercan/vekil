@@ -526,6 +526,42 @@ func TestHiddenCopilotTargetRejectsNormalizedAliases(t *testing.T) {
 	}
 }
 
+func TestProviderModelReplacementKeepsInternalCopilotTargetsHidden(t *testing.T) {
+	cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+	cfg.Providers[0].IncludeModels = nil
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("fixture-token"),
+		nil,
+		WithProvidersConfig(cfg),
+		WithDeferredDynamicProviderModelValidation(true),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	t.Cleanup(h.BeginShutdown)
+
+	models := []providerModel{
+		{publicID: "gpt-5.6-luna", upstreamModel: "gpt-5.6-luna", providerID: "copilot", supportedEndpoints: []string{providerEndpointChatCompletions}},
+		{publicID: "gpt-5.6-sol", upstreamModel: "gpt-5.6-sol", providerID: "copilot", supportedEndpoints: []string{providerEndpointResponses}},
+		{publicID: "visible-model", upstreamModel: "visible-model", providerID: "copilot", supportedEndpoints: []string{providerEndpointChatCompletions}},
+	}
+	if err := h.providerSetup().replaceProviderModels("copilot", models); err != nil {
+		t.Fatalf("replaceProviderModels() error = %v", err)
+	}
+	for _, model := range []string{"gpt-5.6-luna", "gpt-5.6-sol"} {
+		if _, ok := h.providerSetup().lookupPublicModelEntry(model); ok {
+			t.Fatalf("hidden model %q was republished by provider replacement", model)
+		}
+		if h.modelAllowedForRequest(model, providerEndpointChatCompletions) {
+			t.Fatalf("hidden model %q became directly requestable after provider replacement", model)
+		}
+	}
+	if _, ok := h.providerSetup().lookupPublicModelEntry("visible-model"); !ok {
+		t.Fatal("visible provider model was not installed")
+	}
+}
+
 func TestPolicyRoutingCopilotResponsesToolContinuationUsesSameProcessReplay(t *testing.T) {
 	upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{
 		TurnType:                policyTurnTypePlanning,

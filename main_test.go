@@ -690,6 +690,57 @@ type fakeServeLifecycleServer struct {
 	done               chan error
 }
 
+type fakeScopedServeLifecycleServer struct {
+	*fakeServeLifecycleServer
+	usesCopilot       bool
+	dynamicValidation bool
+}
+
+func (f *fakeScopedServeLifecycleServer) UsesCopilot() bool {
+	return f != nil && f.usesCopilot
+}
+
+func (f *fakeScopedServeLifecycleServer) DynamicProviderValidationPending() bool {
+	return f != nil && f.dynamicValidation
+}
+
+func TestServeUsesCopilotPrefersRuntimeScope(t *testing.T) {
+	plain := &fakeServeLifecycleServer{}
+	if !serveUsesCopilot(plain, true) {
+		t.Fatal("serveUsesCopilot() ignored fallback for server without runtime scope")
+	}
+	if serveUsesCopilot(&fakeScopedServeLifecycleServer{fakeServeLifecycleServer: plain}, true) {
+		t.Fatal("serveUsesCopilot() ignored runtime false scope")
+	}
+	if !serveUsesCopilot(&fakeScopedServeLifecycleServer{fakeServeLifecycleServer: plain, usesCopilot: true}, false) {
+		t.Fatal("serveUsesCopilot() ignored runtime true scope")
+	}
+}
+
+func TestStartServeServerValidatesDeferredModelsWithoutCopilotAuth(t *testing.T) {
+	validateCalls := 0
+	base := &fakeServeLifecycleServer{validateFn: func(context.Context) error {
+		validateCalls++
+		return nil
+	}}
+	srv := &fakeScopedServeLifecycleServer{fakeServeLifecycleServer: base, dynamicValidation: true}
+	authCalls := 0
+	authenticator := &fakeServeStartupAuthenticator{getTokenFn: func(context.Context) (string, error) {
+		authCalls++
+		return "", errors.New("unexpected Copilot auth")
+	}}
+
+	if err := startServeServer(context.Background(), srv, authenticator, false, logger.NewWithWriter(logger.LevelError, io.Discard)); err != nil {
+		t.Fatalf("startServeServer() error = %v", err)
+	}
+	if authCalls != 0 {
+		t.Fatalf("Copilot auth calls = %d, want 0", authCalls)
+	}
+	if validateCalls != 1 {
+		t.Fatalf("dynamic validation calls = %d, want 1", validateCalls)
+	}
+}
+
 func (f *fakeServeLifecycleServer) Start() error {
 	f.started = true
 	if f.startFn != nil {
@@ -1131,6 +1182,15 @@ type fakeLaunchCopilotModelChecker struct {
 	calls  []string
 }
 
+type fakeLaunchCopilotScopeChecker struct {
+	*fakeLaunchCopilotModelChecker
+	scope bool
+}
+
+func (c *fakeLaunchCopilotScopeChecker) UsesCopilot() bool {
+	return c != nil && c.scope
+}
+
 func (c *fakeLaunchCopilotModelChecker) ModelUsesCopilot(model string) bool {
 	c.calls = append(c.calls, model)
 	return c.result
@@ -1144,13 +1204,25 @@ func TestLaunchUsesCopilotDelegatesUnscopedStartupToProviderConfig(t *testing.T)
 	if len(checker.calls) != 0 {
 		t.Fatalf("empty model unexpectedly used model-specific lookup: %#v", checker.calls)
 	}
-
-	checker = &fakeLaunchCopilotModelChecker{result: true}
 	nonCopilotConfig := proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{{
 		ID:      "local",
 		Type:    "openai-compatible",
 		BaseURL: "http://127.0.0.1:9/v1",
 	}}}
+
+	scoped := &fakeLaunchCopilotScopeChecker{
+		fakeLaunchCopilotModelChecker: &fakeLaunchCopilotModelChecker{result: true},
+		scope:                         false,
+	}
+	if launchUsesCopilot(proxy.ProvidersConfig{}, "", scoped) {
+		t.Fatal("runtime launch scope was ignored for inactive Copilot routes")
+	}
+	scoped.scope = true
+	if !launchUsesCopilot(nonCopilotConfig, "", scoped) {
+		t.Fatal("runtime launch scope was ignored for active Copilot routes")
+	}
+
+	checker = &fakeLaunchCopilotModelChecker{result: true}
 	if launchUsesCopilot(nonCopilotConfig, " ", checker) {
 		t.Fatal("delegated non-Copilot launch unexpectedly required Copilot authentication")
 	}

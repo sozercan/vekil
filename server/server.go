@@ -413,6 +413,11 @@ func (s *Server) ModelUsesCopilot(model string) bool {
 	return s != nil && s.proxyHandler != nil && s.proxyHandler.ModelUsesCopilot(model)
 }
 
+// UsesCopilot reports whether the active serve scope needs Copilot auth.
+func (s *Server) UsesCopilot() bool {
+	return s != nil && s.proxyHandler != nil && s.proxyHandler.UsesCopilot()
+}
+
 // SetStartupAuthenticationPending gates non-health routes while startup auth is in progress.
 func (s *Server) SetStartupAuthenticationPending(pending bool) {
 	if s.proxyHandler != nil {
@@ -426,6 +431,11 @@ func (s *Server) ValidateDynamicProviderModels(ctx context.Context) error {
 		return nil
 	}
 	return s.proxyHandler.ValidateDynamicProviderModels(ctx)
+}
+
+// DynamicProviderValidationPending reports whether deferred discovery remains.
+func (s *Server) DynamicProviderValidationPending() bool {
+	return s != nil && s.proxyHandler != nil && s.proxyHandler.DynamicProviderValidationPending()
 }
 
 // InitializePolicyRouting performs any configured policy-routing preflight.

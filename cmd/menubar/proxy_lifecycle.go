@@ -7,6 +7,8 @@ import (
 
 type menubarProxyServer interface {
 	Start() error
+	UsesCopilot() bool
+	ValidateDynamicProviderModels(context.Context) error
 	InitializePolicyRouting(context.Context) error
 	Stop(context.Context) error
 	IsRunning() bool

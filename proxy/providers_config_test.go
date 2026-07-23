@@ -2044,6 +2044,9 @@ func TestPolicyCopilotProviderScopeFollowsEffectiveMode(t *testing.T) {
 			if got := h.providerWithinAllowedModelScope(copilot); got != tc.want {
 				t.Fatalf("providerWithinAllowedModelScope() = %v, want %v", got, tc.want)
 			}
+			if got := h.UsesCopilot(); got != tc.want {
+				t.Fatalf("UsesCopilot() = %v, want %v", got, tc.want)
+			}
 		})
 	}
 }

@@ -45,6 +45,10 @@ type launchCopilotModelChecker interface {
 	ModelUsesCopilot(string) bool
 }
 
+type launchCopilotScopeChecker interface {
+	UsesCopilot() bool
+}
+
 type launchTargetSpec struct {
 	name          string
 	displayName   string
@@ -328,6 +332,9 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 func launchUsesCopilot(cfg proxy.ProvidersConfig, model string, checker launchCopilotModelChecker) bool {
 	model = strings.TrimSpace(model)
 	if model == "" {
+		if scoped, ok := checker.(launchCopilotScopeChecker); ok {
+			return scoped.UsesCopilot()
+		}
 		return cfg.UsesCopilot()
 	}
 	return checker.ModelUsesCopilot(model)
@@ -403,11 +410,17 @@ func (p *agentLaunchProxy) Start(ctx context.Context) error {
 		return err
 	}
 	if !p.usesCopilot {
-		if err := p.srv.ValidateDynamicProviderModels(ctx); err != nil {
-			validationErr := fmt.Errorf("provider model validation failed: %w", err)
-			stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			return errors.Join(validationErr, p.srv.Stop(stopCtx))
+		shouldValidate := true
+		if state, ok := p.srv.(dynamicProviderModelValidationState); ok {
+			shouldValidate = state.DynamicProviderValidationPending()
+		}
+		if shouldValidate {
+			if err := p.srv.ValidateDynamicProviderModels(ctx); err != nil {
+				validationErr := fmt.Errorf("provider model validation failed: %w", err)
+				stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				return errors.Join(validationErr, p.srv.Stop(stopCtx))
+			}
 		}
 	}
 	if err := p.srv.InitializePolicyRouting(ctx); err != nil {

@@ -227,20 +227,6 @@ func runProxyStartup(
 		)
 	}
 
-	if providersRequireGitHubAuth(cfg, configErr) {
-		if _, err := authn.GetToken(ctx); err != nil {
-			if ctx.Err() != nil {
-				return proxyStartResult{err: ctx.Err()}
-			}
-			return proxyStartFailure(
-				"auth failed",
-				"GitHub Sign In Required",
-				fmt.Sprintf("The active providers config uses GitHub Copilot, but Vekil could not refresh authentication.\n\nOpen ‘GitHub Auth’ and choose ‘Sign In with GitHub’ or ‘Use GitHub CLI Account’, then start Vekil again.\n\n%v", err),
-				err,
-			)
-		}
-	}
-
 	if err := ctx.Err(); err != nil {
 		return proxyStartResult{err: err}
 	}
@@ -262,6 +248,7 @@ func runProxyStartup(
 		server.WithProxyOptions(
 			proxy.WithProvidersConfig(cfg),
 			proxy.WithPolicyRoutingMode(policyMode),
+			proxy.WithDeferredDynamicProviderModelValidation(cfg.UsesCopilot()),
 		),
 	)
 	if err != nil {
@@ -271,6 +258,38 @@ func runProxyStartup(
 			fmt.Sprintf("Could not initialize Vekil.\n\n%v", err),
 			err,
 		)
+	}
+	if nextSrv.UsesCopilot() {
+		if _, err := authn.GetToken(ctx); err != nil {
+			_ = stopMenubarProxyServer(nextSrv, 10*time.Second)
+			if ctx.Err() != nil {
+				return proxyStartResult{err: ctx.Err()}
+			}
+			return proxyStartFailure(
+				"auth failed",
+				"GitHub Sign In Required",
+				fmt.Sprintf("The active provider scope uses GitHub Copilot, but Vekil could not refresh authentication.\n\nOpen ‘GitHub Auth’ and choose ‘Sign In with GitHub’ or ‘Use GitHub CLI Account’, then start Vekil again.\n\n%v", err),
+				err,
+			)
+		}
+	}
+	if cfg.UsesCopilot() {
+		if err := nextSrv.ValidateDynamicProviderModels(ctx); err != nil {
+			_ = stopMenubarProxyServer(nextSrv, 10*time.Second)
+			if ctx.Err() != nil {
+				return proxyStartResult{err: ctx.Err()}
+			}
+			return proxyStartFailure(
+				"provider model validation failed",
+				"Vekil Start Failed",
+				fmt.Sprintf("Provider model validation failed.\n\n%v", err),
+				err,
+			)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		_ = stopMenubarProxyServer(nextSrv, 10*time.Second)
+		return proxyStartResult{err: err}
 	}
 	if err := nextSrv.Start(); err != nil {
 		return proxyStartFailure(
