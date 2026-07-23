@@ -466,6 +466,25 @@ func TestResponsesChatReplayOptionalDefaultsAreProjectionSpecific(t *testing.T) 
 	}
 }
 
+func TestResponsesChatReplayOptionalDefaultsAllowOpaquePropertyNames(t *testing.T) {
+	store := newResponsesChatReplayStore()
+	defer func() { _ = store.Close() }()
+	request := newResponsesChatReplayTestRequest("opaque-default-names", replayTestCallSpec{
+		upstreamID: "upstream-opaque-default-names", name: "edit", visible: `{"":false,"   ":"standard"}`,
+	})
+	request.Calls[0].OptionalDefaults = responsesChatReplayOptionalDefaults{
+		"":    json.RawMessage("false"),
+		"   ": json.RawMessage(`"standard"`),
+	}
+	published, err := store.Publish(request)
+	if err != nil {
+		t.Fatalf("Publish() rejected opaque JSON property names: %v", err)
+	}
+	if _, err := store.Resolve(request.Route, published.Projection); err != nil {
+		t.Fatalf("Resolve() rejected exact opaque-name projection: %v", err)
+	}
+}
+
 func TestResponsesChatReplayResolutionSupportsFullOrPerCallPartialReplay(t *testing.T) {
 	store := newResponsesChatReplayStore()
 	defer func() { _ = store.Close() }()

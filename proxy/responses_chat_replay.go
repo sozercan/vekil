@@ -833,9 +833,6 @@ func canonicalReplayOptionalDefaults(defaults responsesChatReplayOptionalDefault
 	}
 	canonical := make(responsesChatReplayOptionalDefaults, len(defaults))
 	for name, value := range defaults {
-		if strings.TrimSpace(name) == "" {
-			return nil, fmt.Errorf("empty default name")
-		}
 		encoded, err := canonicalReplayJSONValue(value)
 		if err != nil {
 			return nil, err
