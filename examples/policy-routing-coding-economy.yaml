@@ -13,10 +13,9 @@
 #     --providers-config examples/policy-routing-coding-economy.yaml
 #
 # The default process mode follows the profile's YAML mode. This example sets
-# mode: observe below; pass an explicit ceiling only when overriding that rollout:
+# mode: observe below, so no separate process override is required:
 #   vekil \
-#     --providers-config examples/policy-routing-coding-economy.yaml \
-#     --policy-routing=observe
+#     --providers-config examples/policy-routing-coding-economy.yaml
 #
 # Policy observe/enforce is v1 single-tenant functionality. Keep the default
 # loopback bind. A remote bind requires an explicit acknowledgement and a

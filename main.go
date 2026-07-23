@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -390,7 +391,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
-		policyRoutingMode:               fs.String("policy-routing", getEnv("POLICY_ROUTING_MODE", "config"), "Policy routing mode: config (follow providers YAML), off, observe, or enforce"),
+		policyRoutingMode:               fs.String("policy-routing", getPolicyRoutingModeEnv(), "Policy routing mode: config (follow providers YAML), off, observe, or enforce"),
 		policyRoutingAllowRemote:        fs.Bool("policy-routing-allow-remote-single-tenant", getEnvBool("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", false), "Acknowledge single-tenant operation when policy routing listens beyond loopback"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
 		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
@@ -647,6 +648,14 @@ func runServe() {
 	if err := serveUntilContextDone(ctx, srv, authenticator, providersCfg.UsesCopilot(), log); err != nil {
 		log.Fatal("serve error", logger.Err(err))
 	}
+}
+
+func getPolicyRoutingModeEnv() string {
+	value := strings.TrimSpace(os.Getenv("POLICY_ROUTING_MODE"))
+	if value == "" {
+		return string(proxy.PolicyRoutingModeConfig)
+	}
+	return value
 }
 
 func getEnv(key, fallback string) string {

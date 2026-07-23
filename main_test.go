@@ -219,6 +219,18 @@ func TestServeFlagsPolicyRoutingDefaultsAndOverrides(t *testing.T) {
 		}
 	})
 
+	t.Run("blank environment follows config", func(t *testing.T) {
+		t.Setenv("POLICY_ROUTING_MODE", "  \t  ")
+		serve := parseServeFlagsForTest(t)
+		mode, err := serve.parsedPolicyRoutingMode()
+		if err != nil {
+			t.Fatalf("parsedPolicyRoutingMode() error = %v", err)
+		}
+		if mode != proxy.PolicyRoutingModeConfig {
+			t.Fatalf("policy routing mode = %q, want config", mode)
+		}
+	})
+
 	t.Run("environment defaults", func(t *testing.T) {
 		t.Setenv("POLICY_ROUTING_MODE", "observe")
 		t.Setenv("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", "true")
@@ -1095,6 +1107,7 @@ func TestParseLaunchAgentOptionsPolicyRoutingMode(t *testing.T) {
 		want proxy.PolicyRoutingMode
 	}{
 		{name: "follows providers config by default", mode: "", want: proxy.PolicyRoutingModeConfig},
+		{name: "blank environment follows providers config", mode: "  \t  ", want: proxy.PolicyRoutingModeConfig},
 		{name: "honors explicit off", mode: "off", want: proxy.PolicyRoutingModeOff},
 		{name: "honors explicit observe", mode: "observe", want: proxy.PolicyRoutingModeObserve},
 		{name: "honors explicit enforce", mode: "enforce", want: proxy.PolicyRoutingModeEnforce},
