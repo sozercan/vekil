@@ -64,7 +64,7 @@ Only the public registry resolves client model IDs. Internal routes have no publ
 
 Public identity stays route-owned in the catalog: `/v1/models` exposes one entry for an explicit route, and target IDs, deployment names, and temporary target availability do not become separate public models or mutate catalog metadata. Explicit Responses output, websocket metadata, and translated Anthropic/Gemini output use the public ID. Legacy OpenAI Chat normalization remains conservative and can preserve a nonempty provider-supplied `model`. Explicit routes normalize supported Chat JSON and SSE model fields and model headers to the route public ID.
 
-For a policy entry, public identity is profile-owned. `/v1/models` exposes one `owned_by: vekil-policy` entry with only native `/chat/completions` metadata; normalized Chat, translated Anthropic, and adapted stateless Responses output, safe model headers, errors, and metrics retain the profile public ID even though execution uses an internal terminal route. Internal provider, terminal-route, target, and deployment identities are bounded operational provenance and do not leak through normalized output.
+For a policy entry, public identity is profile-owned. `/v1/models` exposes one `owned_by: vekil-policy` entry with `/chat/completions` metadata; normalized Chat, translated Anthropic, and adapted stateless Responses output, safe model headers, errors, and metrics retain the profile public ID even when an internal terminal route executes through Responses-backed Chat. Internal provider, terminal-route, target, and deployment identities are bounded operational provenance and do not leak through normalized output.
 
 ## Policy Planning Seam
 

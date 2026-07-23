@@ -201,6 +201,33 @@ func TestSchemaV1RejectsSchemaV2PolicyFeatureFields(t *testing.T) {
 	}
 }
 
+func TestSchemaV2AllowsCopilotPolicyDestinationsAndClassifier(t *testing.T) {
+	noStore := false
+	cfg := policyIntegrationConfig("", "", policyConfigModeEnforce)
+	cfg.Providers = []ProviderConfig{{
+		ID:                         "copilot",
+		Type:                       string(providerTypeCopilot),
+		Default:                    true,
+		TrustDomain:                "github-copilot",
+		ClassifierNoStoreSupported: &noStore,
+	}}
+	for routeIndex := range cfg.ModelRoutes {
+		cfg.ModelRoutes[routeIndex].Endpoints = []string{providerEndpointResponses}
+		for targetIndex := range cfg.ModelRoutes[routeIndex].Targets {
+			cfg.ModelRoutes[routeIndex].Targets[targetIndex].Provider = "copilot"
+		}
+	}
+	cfg.PolicyProfiles[0].DataPolicy.AllowProviderRetention = true
+
+	validated, err := validateAndNormalizeProvidersConfig(cfg)
+	if err != nil {
+		t.Fatalf("validateAndNormalizeProvidersConfig() error = %v", err)
+	}
+	if got := validated.config.ModelRoutes[0].Targets[0].Provider; got != "copilot" {
+		t.Fatalf("lightweight target provider = %q, want copilot", got)
+	}
+}
+
 func TestPolicyPublicEntryLookupUsesRequestSideNormalization(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "providers.yaml")
 	if err := os.WriteFile(path, []byte(validSchemaV2PolicyYAML()), 0o600); err != nil {
@@ -291,6 +318,25 @@ func TestPolicyRoutingExampleConfigValid(t *testing.T) {
 	}
 	if cfg.EffectiveSchemaVersion() != ProvidersConfigSchemaVersion2 || len(cfg.PolicyProfiles) != 1 {
 		t.Fatalf("example config = schema %d profiles %d", cfg.EffectiveSchemaVersion(), len(cfg.PolicyProfiles))
+	}
+}
+
+func TestCopilotPolicyRoutingExampleConfigValid(t *testing.T) {
+	path := filepath.Join("..", "examples", "policy-routing-copilot.yaml")
+	cfg, err := LoadProvidersConfigFile(path)
+	if err != nil {
+		t.Fatalf("LoadProvidersConfigFile(%q) error = %v", path, err)
+	}
+	if cfg.EffectiveSchemaVersion() != ProvidersConfigSchemaVersion2 || len(cfg.PolicyProfiles) != 1 {
+		t.Fatalf("example config = schema %d profiles %d", cfg.EffectiveSchemaVersion(), len(cfg.PolicyProfiles))
+	}
+	if len(cfg.Providers) != 1 || providerType(cfg.Providers[0].Type) != providerTypeCopilot {
+		t.Fatalf("example providers = %+v, want one Copilot provider", cfg.Providers)
+	}
+	for _, route := range cfg.ModelRoutes {
+		if !configRouteSupportsEndpoint(&route, providerEndpointResponses) {
+			t.Fatalf("route %q does not use Responses-backed Chat", route.ID)
+		}
 	}
 }
 

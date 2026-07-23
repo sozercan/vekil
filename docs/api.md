@@ -54,7 +54,7 @@ Gemini compatibility is a translation layer over canonical Chat Completions. For
 
 ## `POST /v1/chat/completions` (OpenAI)
 
-When `model` resolves to a schema-v2 policy profile, Vekil applies the policy before normal route execution. V1 policy requests must be text-only and may use only standard function tools. Both policy destinations must expose native `/chat/completions`; policy selection never chooses a Responses-backed Chat route. Unsupported content or fields fail locally instead of falling through to a direct route.
+When `model` resolves to a schema-v2 policy profile, Vekil applies the policy before normal route execution. Policy requests must be text-only and may use only standard function tools. Both policy destinations must support canonical Chat through native `/chat/completions` or bounded Chat-over-Responses execution. Unsupported content or fields fail locally instead of falling through to a direct route.
 
 The policy's effective `off`/`observe`/`enforce` mode is bounded by the process-wide `--policy-routing` / `POLICY_ROUTING_MODE` ceiling. `off` and `observe` execute `baseline_tier`; observe classification is asynchronous and cannot change the response path. `enforce` selects one terminal tier synchronously, then seals that route before the first terminal send. Classifier admission/infrastructure failure uses `classifier_unavailable_tier`; abstention or invalid structured output uses `classifier_uncertain_tier`.
 

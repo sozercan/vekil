@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 )
 
@@ -23,6 +25,7 @@ type policyIntegrationUpstream struct {
 	mu       sync.Mutex
 	models   []string
 	parallel []json.RawMessage
+	auth     []string
 	requests int
 
 	classifierSignals        policyClassifierSignals
@@ -51,6 +54,7 @@ func newPolicyIntegrationUpstream(t *testing.T, signals policyClassifierSignals)
 		u.requests++
 		u.models = append(u.models, request.Model)
 		u.parallel = append(u.parallel, append(json.RawMessage(nil), request.ParallelToolCalls...))
+		u.auth = append(u.auth, r.Header.Get("Authorization"))
 		u.mu.Unlock()
 		if request.Model == "classifier-model" {
 			if status := int(u.classifierFailureStatus.Load()); status != 0 {
@@ -147,6 +151,12 @@ func (u *policyIntegrationUpstream) snapshot() (int, []string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.requests, append([]string(nil), u.models...)
+}
+
+func (u *policyIntegrationUpstream) authSnapshot() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]string(nil), u.auth...)
 }
 
 func (u *policyIntegrationUpstream) parallelToolCallsSnapshot() []json.RawMessage {
@@ -337,6 +347,134 @@ func TestPolicyRoutingGlobalOffUsesBaselineWithoutClassifier(t *testing.T) {
 	}
 	if powerRequests, _ := powerful.snapshot(); powerRequests != 0 {
 		t.Fatalf("powerful requests = %d, want zero", powerRequests)
+	}
+}
+
+func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	var models []string
+	var authorizations []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		var request map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var model string
+		_ = json.Unmarshal(request["model"], &model)
+		tools := string(request["tools"])
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		models = append(models, model)
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(tools, policyClassifierToolName) {
+			arguments, _ := json.Marshal(policyClassifierSignals{
+				TurnType:  policyTurnTypePlanning,
+				CodeScope: policyCodeScopeMultiFile,
+				RiskLevel: policyRiskLevelHigh,
+			})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":     "resp-classifier",
+				"object": "response",
+				"status": "completed",
+				"model":  model,
+				"output": []any{map[string]any{
+					"type":      "function_call",
+					"id":        "fc-classifier",
+					"call_id":   "call-classifier",
+					"name":      policyClassifierToolName,
+					"arguments": string(arguments),
+					"status":    "completed",
+				}},
+				"usage": map[string]any{"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":     "resp-terminal",
+			"object": "response",
+			"status": "completed",
+			"model":  model,
+			"output": []any{map[string]any{
+				"type":   "message",
+				"id":     "msg-terminal",
+				"status": "completed",
+				"role":   "assistant",
+				"content": []any{map[string]any{
+					"type": "output_text",
+					"text": "COPILOT_POLICY_OK",
+				}},
+			}},
+			"usage": map[string]any{"input_tokens": 20, "output_tokens": 5, "total_tokens": 25},
+		})
+	}))
+	t.Cleanup(upstream.Close)
+
+	noStore := false
+	cfg := policyIntegrationConfig("", "", policyConfigModeEnforce)
+	cfg.Providers = []ProviderConfig{{
+		ID:                         "copilot",
+		Type:                       string(providerTypeCopilot),
+		Default:                    true,
+		TrustDomain:                "github-copilot",
+		ClassifierNoStoreSupported: &noStore,
+	}}
+	for routeIndex := range cfg.ModelRoutes {
+		cfg.ModelRoutes[routeIndex].Endpoints = []string{providerEndpointResponses}
+		for targetIndex := range cfg.ModelRoutes[routeIndex].Targets {
+			cfg.ModelRoutes[routeIndex].Targets[targetIndex].Provider = "copilot"
+		}
+	}
+	cfg.PolicyProfiles[0].DataPolicy.AllowProviderRetention = true
+
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("copilot-test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithCopilotBaseURL(upstream.URL),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("coding-economy"),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !h.ModelUsesCopilot("coding-economy") {
+		t.Fatal("Copilot-backed policy entry did not require authentication")
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"coding-economy","messages":[{"role":"user","content":"plan a risky multi-file change"}]}`),
+	))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "COPILOT_POLICY_OK") {
+		t.Fatalf("response body = %s", recorder.Body.String())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := strings.Join(paths, ","); got != "/responses,/responses,/responses" {
+		t.Fatalf("Copilot policy paths = %q, want three Responses sends", got)
+	}
+	if got := strings.Join(models, ","); got != "classifier-model,classifier-model,power-model" {
+		t.Fatalf("Copilot policy models = %q", got)
+	}
+	for index, authorization := range authorizations {
+		if authorization != "Bearer copilot-test-token" {
+			t.Fatalf("Copilot Authorization[%d] = %q", index, authorization)
+		}
 	}
 }
 

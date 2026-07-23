@@ -129,10 +129,10 @@ settings are printed as `unresolved` instead of being guessed.
 ## Claude Code
 
 ```bash
-vekil launch claude -- --dangerously-skip-permissions
+vekil launch claude -- --allowed-tools Read
 
 vekil launch claude --model claude-sonnet-4.5 -- \
-  --dangerously-skip-permissions
+  --allowed-tools "Read,Bash(git status:*)"
 ```
 
 The launcher supplies an owner-only temporary `--settings` overlay so user or
@@ -155,12 +155,25 @@ other than the selected public model. Without `--model`, Claude resolves its
 normal configured or built-in default and the proxy accepts requests across the
 global public model namespace.
 
+Subprocess credential scrubbing keeps Claude in its default (`manual`)
+permission mode. Current Claude Code releases ignore other explicit permission
+modes when that hardening is enabled, so Vekil rejects
+`--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, and
+non-`manual` `--permission-mode` values instead of silently weakening or
+misrepresenting the requested policy. Use `--allowed-tools` and
+`--disallowed-tools` for managed non-interactive tool permissions.
+
 Policy-routing public model IDs (`owned_by: vekil-policy`) are supported in
 pinned mode. Vekil translates Claude's Messages and count-token requests to the
 same canonical Chat request used by OpenAI Chat policy planning, then translates
 the selected terminal response back to Anthropic. The policy profile remains
 advertised as native `/chat/completions` metadata; the launcher compatibility
 path does not change terminal endpoint ownership.
+
+When a selected policy profile targets a configured `copilot` provider, the
+ephemeral launch proxy authenticates and sends those terminal/classifier Chat
+requests to Copilot in process. No separately started loopback bridge is
+required.
 
 The global policy ceiling still defaults to `off`, so the command uses the
 profile's deterministic baseline unless `--policy-routing observe` or
@@ -171,9 +184,10 @@ loopback launcher topology) or use sticky ingress to the replay-owning replica;
 `enforce` rejects those stateful continuations until policy route affinity is
 implemented.
 
-Forwarded settings-source, detached-session, resume, model/fallback, and custom
-agent overrides are rejected. Use the launcher-level `--model` to pin a model;
-otherwise model selection remains delegated to Claude's normal default.
+Forwarded settings-source, detached-session, resume, model/fallback, incompatible
+permission-mode, and custom-agent overrides are rejected. Use the
+launcher-level `--model` to pin a model; otherwise model selection remains
+delegated to Claude's normal default.
 
 ## OpenAI Codex CLI
 

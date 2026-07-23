@@ -122,7 +122,13 @@ func clonePolicyOperationRoute(route *modelRoute, contract publicModelContract, 
 		return nil
 	}
 	cloned := *route
+	physicalEndpoints := append([]string(nil), route.public.endpoints...)
 	cloned.public = clonePublicModelContract(contract)
+	// The policy contract remains the client-visible Chat identity, while the
+	// sealed operation must retain the selected terminal route's physical wire
+	// endpoints so a Responses-backed target can execute Chat compatibility in
+	// process.
+	cloned.public.endpoints = physicalEndpoints
 	cloned.targets = cloneTargetBindings(candidates)
 	cloned.legacy = false
 	return &cloned

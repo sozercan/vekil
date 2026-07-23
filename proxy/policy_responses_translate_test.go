@@ -167,17 +167,21 @@ func TestTranslatePolicyResponsesRequestToChatTracksRequiredToolChoice(t *testin
 	}
 }
 
-func TestTranslatePolicyResponsesRequestToChatAcceptsNullReasoningFromCodex(t *testing.T) {
-	got, err := translatePolicyResponsesRequestToChat([]byte(`{"model":"policy","input":"hi","reasoning":null,"store":false,"stream":true}`))
-	if err != nil {
-		t.Fatalf("translatePolicyResponsesRequestToChat() error = %v", err)
-	}
-	var chat map[string]any
-	if err := json.Unmarshal(got.Body, &chat); err != nil {
-		t.Fatal(err)
-	}
-	if _, exists := chat["reasoning_effort"]; exists {
-		t.Fatalf("null reasoning produced reasoning_effort: %#v", chat)
+func TestTranslatePolicyResponsesRequestToChatAcceptsUnsetReasoningFromCodex(t *testing.T) {
+	for _, reasoning := range []string{"null", `{}`} {
+		t.Run(reasoning, func(t *testing.T) {
+			got, err := translatePolicyResponsesRequestToChat([]byte(`{"model":"policy","input":"hi","reasoning":` + reasoning + `,"store":false,"stream":true}`))
+			if err != nil {
+				t.Fatalf("translatePolicyResponsesRequestToChat() error = %v", err)
+			}
+			var chat map[string]any
+			if err := json.Unmarshal(got.Body, &chat); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := chat["reasoning_effort"]; exists {
+				t.Fatalf("unset reasoning produced reasoning_effort: %#v", chat)
+			}
+		})
 	}
 }
 

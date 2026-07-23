@@ -48,7 +48,7 @@ The following are explicitly unsupported for policy public IDs in v1 and fail lo
 | Sticky affinity, policy session headers, or shared policy state | Unsupported; opaque downstream replay IDs are accepted only in `off`/`observe` for a single-target baseline |
 | Multi-tenant policy deployments | Unsupported |
 
-Direct public models and direct exposed terminal routes retain their existing endpoint behavior. `/v1/models` keeps a policy profile's native metadata at `/chat/completions`; translated Anthropic and policy Responses compatibility do not claim that the terminal route natively owns those endpoints.
+Direct public models and direct exposed terminal routes retain their existing endpoint behavior. `/v1/models` keeps a policy profile's public metadata at `/chat/completions`; translated Anthropic, policy Responses compatibility, and an internal Responses-backed terminal do not change that public contract.
 
 
 Policy Responses compatibility is deliberately not near-zero-copy passthrough.
@@ -86,6 +86,17 @@ Native Chat tool history must be complete and internally consistent before class
 ## Quick start
 
 Start from [`examples/policy-routing-coding-economy.yaml`](../examples/policy-routing-coding-economy.yaml), replace the placeholder URLs/models, and export the referenced credentials.
+
+For a single-process GitHub Copilot setup, use
+[`examples/policy-routing-copilot.yaml`](../examples/policy-routing-copilot.yaml).
+Its pinned Copilot Responses targets are adapted to canonical policy Chat in
+process, including classifier execution, so no second Vekil listener is needed:
+
+```bash
+vekil launch claude \
+  --model gpt-5.6-semantic \
+  --providers-config examples/policy-routing-copilot.yaml
+```
 
 Offline validation performs strict decoding and local contract checks without sending classifier traffic:
 

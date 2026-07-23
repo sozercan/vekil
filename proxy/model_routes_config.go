@@ -1133,7 +1133,7 @@ func configuredPublicModelAliases(publicID string) []string {
 
 func providerKindSupportsExplicitRoutes(kind providerType) bool {
 	switch kind {
-	case providerTypeAzureOpenAI, providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		return true
 	default:
 		return false
@@ -1144,7 +1144,7 @@ func explicitRouteProviderFamily(kind providerType) string {
 	switch kind {
 	case providerTypeAnthropicCompatible:
 		return "anthropic"
-	case providerTypeAzureOpenAI, providerTypeOpenAICompatible:
+	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICompatible:
 		return "openai"
 	default:
 		return ""
@@ -1153,7 +1153,7 @@ func explicitRouteProviderFamily(kind providerType) string {
 
 func providerKindSupportsExplicitEndpoint(kind providerType, endpoint string) bool {
 	switch kind {
-	case providerTypeAzureOpenAI, providerTypeOpenAICompatible:
+	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICompatible:
 		return endpoint == providerEndpointResponses || endpoint == providerEndpointChatCompletions
 	case providerTypeAnthropicCompatible:
 		return endpoint == providerEndpointMessages

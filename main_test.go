@@ -1772,6 +1772,47 @@ policy_profiles:
 	return providersPath
 }
 
+func writeCopilotPolicyLaunchProvidersConfig(t *testing.T) string {
+	t.Helper()
+	providersPath := filepath.Join(t.TempDir(), "providers.yaml")
+	providersBody := `schema_version: 2
+providers:
+  - id: copilot
+    type: copilot
+    default: true
+    trust_domain: github-copilot
+    classifier_no_store_supported: false
+model_routes:
+  - id: light-route
+    exposure: internal
+    endpoints: [/responses]
+    targets: [{id: light, provider: copilot, upstream_model: gpt-5.6-luna}]
+  - id: power-route
+    exposure: internal
+    endpoints: [/responses]
+    targets: [{id: power, provider: copilot, upstream_model: gpt-5.6-sol}]
+  - id: classifier-route
+    exposure: internal
+    internal_purpose: policy_classifier
+    endpoints: [/responses]
+    targets: [{id: classifier, provider: copilot, upstream_model: gpt-5.6-sol}]
+policy_profiles:
+  - id: policy-launch
+    public_id: policy-launch-test
+    mode: off
+    lightweight_route: light-route
+    powerful_route: power-route
+    classifier: {route: classifier-route}
+    data_policy:
+      content_forwarding_acknowledged: true
+      allow_provider_retention: true
+`
+	if err := os.WriteFile(providersPath, []byte(providersBody), 0o600); err != nil {
+		t.Fatalf("write providers config: %v", err)
+	}
+	return providersPath
+}
+
 func TestRunLaunchClaudeStartsPolicyModelChild(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
@@ -2205,6 +2246,52 @@ func TestAgentLaunchProxySkipsCopilotForPolicyModel(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /readyz status = %d, want 200; body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestAgentLaunchProxyAuthenticatesCopilotForCopilotBackedPolicyModel(t *testing.T) {
+	providersPath := writeCopilotPolicyLaunchProvidersConfig(t)
+	cfg, err := proxy.LoadProvidersConfigFile(providersPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := logger.NewWithWriter(logger.LevelError, io.Discard)
+	srv, err := server.New(
+		auth.NewTestAuthenticator("test-token"),
+		log,
+		"127.0.0.1",
+		"0",
+		server.WithProxyOptions(
+			proxy.WithProvidersConfig(cfg),
+			proxy.WithAllowedModels("policy-launch-test"),
+			proxy.WithDeferredDynamicProviderModelValidation(true),
+		),
+	)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+	called := false
+	runtime := &agentLaunchProxy{
+		srv: srv,
+		authenticator: &fakeServeStartupAuthenticator{getTokenFn: func(context.Context) (string, error) {
+			called = true
+			return "copilot-token", nil
+		}},
+		usesCopilot: srv.ModelUsesCopilot("policy-launch-test"),
+		log:         log,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := runtime.Start(ctx); err != nil {
+		t.Fatalf("agentLaunchProxy.Start() error = %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+		defer stopCancel()
+		_ = runtime.Stop(stopCtx)
+	}()
+	if !runtime.usesCopilot || !called {
+		t.Fatalf("Copilot-backed policy startup usesCopilot=%v authCalled=%v", runtime.usesCopilot, called)
 	}
 }
 

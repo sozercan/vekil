@@ -126,7 +126,12 @@ func buildCodexModelCatalog(executable resolvedExecutable, environment []string,
 	if len(validEfforts) > 0 {
 		template["default_reasoning_level"] = defaultReasoningEffort(validEfforts)
 	} else {
-		template["default_reasoning_level"] = "none"
+		// An explicit "none" default makes Codex serialize
+		// reasoning:{effort:"none"}. Policy models whose public contract does
+		// not advertise reasoning controls must instead leave the effort unset;
+		// Codex then emits an empty reasoning object, which the compatibility
+		// translator correctly treats as no reasoning_effort override.
+		delete(template, "default_reasoning_level")
 	}
 	template["supports_reasoning_summaries"] = false
 	template["support_verbosity"] = false

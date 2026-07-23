@@ -1706,8 +1706,21 @@ func (h *ProxyHandler) ModelUsesCopilot(model string) bool {
 	setup := h.providerSetup()
 	model = strings.TrimSpace(model)
 	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
-		// Policy destinations and classifiers cannot be Copilot providers. The
-		// reserved policy owner therefore never requires Copilot authentication.
+		for _, routeID := range []string{
+			entry.policyConfig.LightweightRoute,
+			entry.policyConfig.PowerfulRoute,
+			entry.policyConfig.Classifier.Route,
+		} {
+			route, known := setup.lookupTerminalRoute(routeID)
+			if !known || route == nil {
+				continue
+			}
+			for _, target := range route.targets {
+				if target.provider != nil && target.provider.kind == providerTypeCopilot {
+					return true
+				}
+			}
+		}
 		return false
 	}
 	if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
