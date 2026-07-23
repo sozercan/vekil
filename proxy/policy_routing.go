@@ -419,6 +419,15 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 	if err := validatePolicyPublicRequestContract(input.OriginalBody, profile.entry.contract); err != nil {
 		return chatOperationPlan{}, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("policy model %q request is outside its public contract: %w", entry.id, err)}
 	}
+	if replayRoute == nil && policyProfilePrefersResponsesBackend(profile) {
+		raw, err := decodeChatJSONObject(input.OriginalBody, "")
+		if err != nil {
+			return chatOperationPlan{}, err
+		}
+		if err := validateChatResponsesTopLevel(raw); err != nil {
+			return chatOperationPlan{}, err
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return chatOperationPlan{}, err
 	}
@@ -436,6 +445,14 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 		return c.sealPlan(profile, input, facts, profile.baselineTier, policyDecisionRecord{Category: "observe_baseline", ActualTier: profile.baselineTier}), nil
 	}
 	return c.enforce(ctx, profile, input, facts, bucket)
+}
+
+func policyProfilePrefersResponsesBackend(profile *compiledPolicyProfile) bool {
+	if profile == nil || profile.lightweight == nil {
+		return false
+	}
+	return !explicitRouteHasChatBackend(profile.lightweight, providerEndpointChatCompletions) &&
+		explicitRouteHasChatBackend(profile.lightweight, providerEndpointResponses)
 }
 
 func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile *compiledPolicyProfile, body []byte) (*modelRoute, policyTier, error) {

@@ -171,6 +171,7 @@ type providerModel struct {
 	dropStopSequences      bool
 	useMaxCompletionTokens bool
 	disabled               bool
+	endpointsAdvertised    bool
 	raw                    json.RawMessage
 }
 
@@ -722,7 +723,7 @@ func (h *ProxyHandler) initializeProviders() error {
 		return err
 	}
 	h.providersState = setup
-	h.dynamicProviderValidationPending.Store(h.deferDynamicProviderModelRefresh && needsDynamicProviderModelValidation(setup.providers))
+	h.dynamicProviderValidationPending.Store(h.deferDynamicProviderModelRefresh && providerSetupNeedsDynamicModelValidation(setup))
 	return nil
 }
 
@@ -763,7 +764,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 		hasConfiguredState: true,
 	}
 
-	needsDynamicModelValidation := needsDynamicProviderModelValidation(providers)
+	needsDynamicModelValidation := providerSetupNeedsDynamicModelValidation(setup)
 
 	if !needsDynamicModelValidation || !validateDynamicModels {
 		for _, providerID := range providerOrder {
@@ -810,7 +811,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 // model-map updates are applied through providerSetup's locked replacement path.
 func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error {
 	setup := h.providerSetup()
-	if setup == nil || !setup.hasConfiguredState || !needsDynamicProviderModelValidation(setup.providers) {
+	if setup == nil || !setup.hasConfiguredState || !providerSetupNeedsDynamicModelValidation(setup) {
 		h.dynamicProviderValidationPending.Store(false)
 		return nil
 	}
@@ -849,6 +850,9 @@ func (h *ProxyHandler) validateDynamicExplicitRouteTargets(setup *providerSetup,
 	}
 	available := make(map[string]providerModel, len(models)*2)
 	for _, model := range models {
+		if model.disabled {
+			continue
+		}
 		available[strings.TrimSpace(model.publicID)] = model
 		if upstream := strings.TrimSpace(model.upstreamModel); upstream != "" {
 			available[upstream] = model
@@ -871,6 +875,9 @@ func (h *ProxyHandler) validateDynamicExplicitRouteTargets(setup *providerSetup,
 			if !ok {
 				return configPathError("providers", "pinned model %q for route %q was not retained by Copilot discovery", modelID, route.public.routeID)
 			}
+			if !model.endpointsAdvertised {
+				return configPathError("providers", "pinned model %q for route %q did not advertise supported_endpoints", modelID, route.public.routeID)
+			}
 			for _, endpoint := range route.public.endpoints {
 				if !providerModelSupportsEndpoint(model, endpoint) {
 					return configPathError("providers", "pinned model %q for route %q does not advertise endpoint %q", modelID, route.public.routeID, endpoint)
@@ -891,7 +898,7 @@ func (h *ProxyHandler) explicitRouteWithinAllowedPolicyScope(setup *providerSetu
 		if !ok || entry == nil || entry.kind != publicEntryPolicy {
 			continue
 		}
-		for _, route := range h.policyEntryRequiredRoutes(entry) {
+		for _, route := range h.policyEntryRequiredRoutesForSetup(entry, setup) {
 			if route != nil && route.public.routeID == routeID {
 				return true
 			}
@@ -1437,6 +1444,30 @@ func needsDynamicProviderModelValidation(providers map[string]*providerRuntime) 
 	return false
 }
 
+func providerSetupNeedsDynamicModelValidation(setup *providerSetup) bool {
+	if setup == nil {
+		return false
+	}
+	if needsDynamicProviderModelValidation(setup.providers) {
+		return true
+	}
+	snapshot := setup.routeRegistry().load()
+	if snapshot == nil {
+		return false
+	}
+	for _, route := range snapshot.explicit {
+		if route == nil {
+			continue
+		}
+		for _, target := range route.targets {
+			if providerUsesDynamicModels(target.provider) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func providerHasModelFilters(provider *providerRuntime) bool {
 	return provider != nil && (len(provider.includeModels) > 0 || len(provider.excludeModels) > 0)
 }
@@ -1767,7 +1798,11 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 }
 
 func (h *ProxyHandler) policyEntryRequiredRoutes(entry *publicModelEntry) []*modelRoute {
-	if h == nil || entry == nil || entry.kind != publicEntryPolicy {
+	return h.policyEntryRequiredRoutesForSetup(entry, h.providerSetup())
+}
+
+func (h *ProxyHandler) policyEntryRequiredRoutesForSetup(entry *publicModelEntry, setup *providerSetup) []*modelRoute {
+	if h == nil || entry == nil || entry.kind != publicEntryPolicy || setup == nil {
 		return nil
 	}
 	if controller, ok := h.policyRoutingController.(*chatPolicyRoutingController); ok {
@@ -1783,7 +1818,6 @@ func (h *ProxyHandler) policyEntryRequiredRoutes(entry *publicModelEntry) []*mod
 		}
 	}
 
-	setup := h.providerSetup()
 	for _, profile := range h.providersConfig.PolicyProfiles {
 		if strings.TrimSpace(profile.ID) != entry.policyID {
 			continue
@@ -2628,6 +2662,7 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			continue
 		}
 
+		endpointsAdvertised := len(parsed.SupportedEndpoints) > 0
 		supportedEndpoints := normalizeDynamicProviderEndpoints(provider, parsed.SupportedEndpoints)
 		if len(supportedEndpoints) == 0 {
 			supportedEndpoints = provider.defaultDynamicModelEndpoints()
@@ -2636,6 +2671,7 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 		if index, duplicate := indexByID[publicID]; duplicate {
 			merged := models[index]
 			merged.supportedEndpoints = mergeDynamicProviderEndpoints(merged.supportedEndpoints, supportedEndpoints)
+			merged.endpointsAdvertised = merged.endpointsAdvertised || endpointsAdvertised
 			merged.disabled = merged.disabled && disabled
 			baseRaw := merged.raw
 			if merged.disabled != models[index].disabled && !merged.disabled {
@@ -2648,13 +2684,14 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 
 		indexByID[publicID] = len(models)
 		models = append(models, providerModel{
-			publicID:           publicID,
-			upstreamModel:      publicID,
-			providerID:         provider.id,
-			supportedEndpoints: supportedEndpoints,
-			parallelToolCalls:  providerModelParallelToolCallsFromRaw(raw),
-			disabled:           disabled,
-			raw:                mergeProviderModelRaw(raw, supportedEndpoints),
+			publicID:            publicID,
+			upstreamModel:       publicID,
+			providerID:          provider.id,
+			supportedEndpoints:  supportedEndpoints,
+			parallelToolCalls:   providerModelParallelToolCallsFromRaw(raw),
+			disabled:            disabled,
+			endpointsAdvertised: endpointsAdvertised,
+			raw:                 mergeProviderModelRaw(raw, supportedEndpoints),
 		})
 	}
 

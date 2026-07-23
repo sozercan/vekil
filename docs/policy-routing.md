@@ -45,7 +45,7 @@ The following are explicitly unsupported for policy public IDs in v1 and fail lo
 | Sticky Chat affinity, policy session headers, or shared policy state | Unsupported |
 | Multi-tenant policy deployments | Unsupported |
 
-Direct public models and direct exposed terminal routes retain their existing endpoint behavior. `/v1/models` lists a policy profile as catalog metadata, but that does not extend its inference support beyond `POST /v1/chat/completions`.
+Direct public models and direct exposed terminal routes retain their existing endpoint behavior. `/v1/models` lists a policy profile as catalog metadata, but that does not extend its inference support beyond `POST /v1/chat/completions`. When both terminal routes prefer Responses-backed Chat, the strict Responses request subset is validated before classifier admission so requests guaranteed to fail never forward classifier content.
 
 Native Chat tool history must be complete and internally consistent before classifier admission. Assistant tool-call IDs must be unique, every tool result must reference one pending prior call exactly once, and all pending calls must receive results before the next non-tool message. Parallel results may arrive in any order. Malformed, missing, unknown, or duplicate tool-call relationships fail locally with no classifier or terminal-model send.
 

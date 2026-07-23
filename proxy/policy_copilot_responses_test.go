@@ -582,6 +582,22 @@ func TestPolicyCopilotPinnedTargetsMustSurviveDynamicDiscovery(t *testing.T) {
 			},
 			want: `does not advertise endpoint "/responses"`,
 		},
+		{
+			name: "omitted endpoint advertisement",
+			models: []map[string]any{
+				{"id": "gpt-5.6-luna", "object": "model"},
+				{"id": "gpt-5.6-sol", "object": "model", "supported_endpoints": []string{providerEndpointResponses}},
+			},
+			want: "did not advertise supported_endpoints",
+		},
+		{
+			name: "disabled pinned model",
+			models: []map[string]any{
+				{"id": "gpt-5.6-luna", "object": "model", "supported_endpoints": []string{providerEndpointResponses}, "policy": map[string]any{"state": "disabled"}},
+				{"id": "gpt-5.6-sol", "object": "model", "supported_endpoints": []string{providerEndpointResponses}},
+			},
+			want: `pinned model "gpt-5.6-luna"`,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -664,5 +680,106 @@ func TestPolicyCopilotDynamicValidationSkipsInactiveTierRoutes(t *testing.T) {
 	defer h.BeginShutdown()
 	if err := h.ValidateDynamicProviderModels(t.Context()); err != nil {
 		t.Fatalf("ValidateDynamicProviderModels() rejected inactive powerful route: %v", err)
+	}
+}
+
+func TestPolicyCopilotExplicitTargetsForceDynamicValidation(t *testing.T) {
+	upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+	cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+	cfg.Providers[0].IncludeModels = nil
+	cfg.Providers[0].ExcludeModels = nil
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("fixture-token"),
+		nil,
+		WithCopilotBaseURL(upstream.server.URL),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("gpt-5.6-semantic"),
+		WithDeferredDynamicProviderModelValidation(true),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	defer h.BeginShutdown()
+	if !h.DynamicProviderValidationPending() {
+		t.Fatal("direct Copilot policy targets did not require dynamic validation")
+	}
+	if err := h.ValidateDynamicProviderModels(t.Context()); err != nil {
+		t.Fatalf("ValidateDynamicProviderModels() error = %v", err)
+	}
+	modelRequests, _, _, _ := upstream.snapshot()
+	if modelRequests != 1 {
+		t.Fatalf("model discovery requests = %d, want 1", modelRequests)
+	}
+}
+
+func TestPolicyCopilotSynchronousAllowedModelValidationUsesLocalSetup(t *testing.T) {
+	upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("fixture-token"),
+		nil,
+		WithCopilotBaseURL(upstream.server.URL),
+		WithProvidersConfig(directCopilotResponsesPolicyConfig(policyConfigModeEnforce)),
+		WithAllowedModels("gpt-5.6-semantic"),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	defer h.BeginShutdown()
+	modelRequests, _, _, _ := upstream.snapshot()
+	if modelRequests != 1 {
+		t.Fatalf("model discovery requests = %d, want 1", modelRequests)
+	}
+}
+
+func TestPolicyResponsesContractRejectsBeforeClassifierDispatch(t *testing.T) {
+	tests := []struct {
+		name  string
+		field string
+		value any
+	}{
+		{name: "stop", field: "stop", value: []string{"END"}},
+		{name: "multiple choices", field: "n", value: 2},
+		{name: "unknown field", field: "unsupported_field", value: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+			h, err := NewProxyHandler(
+				auth.NewTestAuthenticator("fixture-token"),
+				nil,
+				WithCopilotBaseURL(upstream.server.URL),
+				WithProvidersConfig(directCopilotResponsesPolicyConfig(policyConfigModeEnforce)),
+				WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+			)
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+			defer h.BeginShutdown()
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatalf("InitializePolicyRouting() error = %v", err)
+			}
+			_, before, _, _ := upstream.snapshot()
+			payload := map[string]any{
+				"model":                 "gpt-5.6-semantic",
+				"messages":              []any{map[string]any{"role": "user", "content": "hello"}},
+				"max_completion_tokens": 256,
+				tc.field:                tc.value,
+			}
+			body, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			recorder := httptest.NewRecorder()
+			h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, providerEndpointChatCompletions, strings.NewReader(string(body))))
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			_, after, terminalModels, _ := upstream.snapshot()
+			if after != before || len(terminalModels) != 0 {
+				t.Fatalf("upstream requests changed: classifiers %d->%d terminals=%v", before, after, terminalModels)
+			}
+		})
 	}
 }
