@@ -405,6 +405,67 @@ func TestResponsesChatReplayOptionalDefaultsArePublicationOwned(t *testing.T) {
 	}
 }
 
+func TestResponsesChatReplayOptionalDefaultsPreserveStoredDefaultValues(t *testing.T) {
+	store := newResponsesChatReplayStore()
+	defer func() { _ = store.Close() }()
+	request := newResponsesChatReplayTestRequest("stored-default", replayTestCallSpec{
+		upstreamID: "upstream-stored-default", name: "edit", visible: `{"mode":"standard"}`,
+	})
+	request.Calls[0].OptionalDefaults = responsesChatReplayOptionalDefaults{
+		"mode":    json.RawMessage(`"standard"`),
+		"verbose": json.RawMessage("false"),
+	}
+	published, err := store.Publish(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := published.Projection.Calls[0]
+	call.Arguments = `{"mode":"standard","verbose":false}`
+	if _, err := store.Resolve(request.Route, responsesChatReplayAssistantProjection{Content: published.Projection.Content, Calls: []responsesChatReplayProjectedCall{call}}); err != nil {
+		t.Fatalf("inserted optional default changed a stored default-valued property: %v", err)
+	}
+	for _, arguments := range []string{
+		`{"verbose":false}`,
+		`{"mode":"other","verbose":false}`,
+		`{"mode":"standard","verbose":true}`,
+	} {
+		call.Arguments = arguments
+		_, err = store.Resolve(request.Route, responsesChatReplayAssistantProjection{Content: published.Projection.Content, Calls: []responsesChatReplayProjectedCall{call}})
+		assertResponsesChatReplayProjection(t, err)
+	}
+}
+
+func TestResponsesChatReplayOptionalDefaultsAreProjectionSpecific(t *testing.T) {
+	store := newResponsesChatReplayStore()
+	defer func() { _ = store.Close() }()
+	original := `{"mode":"standard"}`
+	request := newResponsesChatReplayTestRequest("projection-defaults", replayTestCallSpec{
+		upstreamID: "upstream-projection-defaults", name: "edit", visible: `{"view":"optimized"}`, original: &original,
+	})
+	request.Calls[0].OptionalDefaults = responsesChatReplayOptionalDefaults{
+		"mode":    json.RawMessage(`"standard"`),
+		"verbose": json.RawMessage("false"),
+	}
+	published, err := store.Publish(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	visible := published.Projection
+	visible.Calls[0].Arguments = `{"view":"optimized","mode":"standard"}`
+	visibleResolution, err := store.Resolve(request.Route, visible)
+	if err != nil || visibleResolution.ProjectionMatch != responsesChatReplayProjectionVisible {
+		t.Fatalf("visible projection default resolution = match:%v error:%v", visibleResolution.ProjectionMatch, err)
+	}
+
+	originalProjection := published.OriginalProjection
+	originalProjection.Calls[0].Arguments = `{"mode":"standard","verbose":false}`
+	originalResolution, err := store.Resolve(request.Route, originalProjection)
+	if err != nil || originalResolution.ProjectionMatch != responsesChatReplayProjectionOriginal {
+		t.Fatalf("original projection default resolution = match:%v error:%v", originalResolution.ProjectionMatch, err)
+	}
+}
+
 func TestResponsesChatReplayResolutionSupportsFullOrPerCallPartialReplay(t *testing.T) {
 	store := newResponsesChatReplayStore()
 	defer func() { _ = store.Close() }()

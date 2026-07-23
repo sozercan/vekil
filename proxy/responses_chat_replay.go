@@ -208,13 +208,14 @@ type responsesChatReplayStoreOptions struct {
 }
 
 type responsesChatReplayStoredCall struct {
-	proxyCallID      string
-	upstreamCallID   string
-	name             string
-	visibleHash      [sha256.Size]byte
-	originalHash     [sha256.Size]byte
-	optionalDefaults responsesChatReplayOptionalDefaults
-	outputItemIndex  int
+	proxyCallID              string
+	upstreamCallID           string
+	name                     string
+	visibleHash              [sha256.Size]byte
+	originalHash             [sha256.Size]byte
+	visibleOptionalDefaults  responsesChatReplayOptionalDefaults
+	originalOptionalDefaults responsesChatReplayOptionalDefaults
+	outputItemIndex          int
 }
 
 type responsesChatReplayGroup struct {
@@ -234,14 +235,15 @@ type responsesChatReplayCallRef struct {
 }
 
 type responsesChatReplayPreparedCall struct {
-	upstreamCallID    string
-	name              string
-	visibleArguments  string
-	originalArguments string
-	visibleHash       [sha256.Size]byte
-	originalHash      [sha256.Size]byte
-	optionalDefaults  responsesChatReplayOptionalDefaults
-	outputItemIndex   int
+	upstreamCallID           string
+	name                     string
+	visibleArguments         string
+	originalArguments        string
+	visibleHash              [sha256.Size]byte
+	originalHash             [sha256.Size]byte
+	visibleOptionalDefaults  responsesChatReplayOptionalDefaults
+	originalOptionalDefaults responsesChatReplayOptionalDefaults
+	outputItemIndex          int
 }
 
 type responsesChatReplayPreparedGroup struct {
@@ -355,13 +357,14 @@ func (s *responsesChatReplayStore) Publish(request responsesChatReplayPublishReq
 	resolvedCalls := make([]responsesChatReplayResolvedCall, len(prepared.calls))
 	for i, call := range prepared.calls {
 		storedCalls[i] = responsesChatReplayStoredCall{
-			proxyCallID:      proxyIDs[i],
-			upstreamCallID:   call.upstreamCallID,
-			name:             call.name,
-			visibleHash:      call.visibleHash,
-			originalHash:     call.originalHash,
-			optionalDefaults: cloneReplayOptionalDefaults(call.optionalDefaults),
-			outputItemIndex:  call.outputItemIndex,
+			proxyCallID:              proxyIDs[i],
+			upstreamCallID:           call.upstreamCallID,
+			name:                     call.name,
+			visibleHash:              call.visibleHash,
+			originalHash:             call.originalHash,
+			visibleOptionalDefaults:  cloneReplayOptionalDefaults(call.visibleOptionalDefaults),
+			originalOptionalDefaults: cloneReplayOptionalDefaults(call.originalOptionalDefaults),
+			outputItemIndex:          call.outputItemIndex,
 		}
 		visibleCalls[i] = responsesChatReplayProjectedCall{
 			ID:        proxyIDs[i],
@@ -622,14 +625,15 @@ func (s *responsesChatReplayStore) preparePublish(request responsesChatReplayPub
 			return responsesChatReplayPreparedGroup{}, newResponsesChatReplayProjectionError("invalid optional function defaults")
 		}
 		calls[i] = responsesChatReplayPreparedCall{
-			upstreamCallID:    call.UpstreamCallID,
-			name:              call.Name,
-			visibleArguments:  call.VisibleArguments,
-			originalArguments: originalArguments,
-			visibleHash:       sha256.Sum256(canonicalVisibleArguments),
-			originalHash:      sha256.Sum256(canonicalOriginalArguments),
-			optionalDefaults:  optionalDefaults,
-			outputItemIndex:   call.OutputItemIndex,
+			upstreamCallID:           call.UpstreamCallID,
+			name:                     call.Name,
+			visibleArguments:         call.VisibleArguments,
+			originalArguments:        originalArguments,
+			visibleHash:              sha256.Sum256(canonicalVisibleArguments),
+			originalHash:             sha256.Sum256(canonicalOriginalArguments),
+			visibleOptionalDefaults:  replayOptionalDefaultsAbsentFromArguments(call.VisibleArguments, optionalDefaults),
+			originalOptionalDefaults: replayOptionalDefaultsAbsentFromArguments(originalArguments, optionalDefaults),
+			outputItemIndex:          call.OutputItemIndex,
 		}
 	}
 	if len(functionItemIndexes) != 0 {
@@ -759,18 +763,18 @@ func (g *responsesChatReplayGroup) matchesProjection(content []byte, projected [
 			return false
 		}
 		hash := sha256.Sum256(canonicalArguments)
-		matchesHash := func(want [sha256.Size]byte) bool {
+		matchesHash := func(want [sha256.Size]byte, defaults responsesChatReplayOptionalDefaults) bool {
 			if hash == want {
 				return true
 			}
-			normalized, changed, normalizeErr := canonicalReplayArgumentsWithoutOptionalDefaults(got.Arguments, stored.optionalDefaults)
+			normalized, changed, normalizeErr := canonicalReplayArgumentsWithoutOptionalDefaults(got.Arguments, defaults)
 			return normalizeErr == nil && changed && sha256.Sum256(normalized) == want
 		}
 		if original {
-			if !matchesHash(stored.originalHash) {
+			if !matchesHash(stored.originalHash, stored.originalOptionalDefaults) {
 				return false
 			}
-		} else if !matchesHash(stored.visibleHash) {
+		} else if !matchesHash(stored.visibleHash, stored.visibleOptionalDefaults) {
 			return false
 		}
 	}
@@ -809,9 +813,8 @@ func replayGroupByteSize(route responsesChatReplayRoute, content []byte, outputI
 		size += responsesChatReplayIDLength
 		size += len(call.upstreamCallID) + len(call.name)
 		size += sha256.Size * 2
-		for name, value := range call.optionalDefaults {
-			size += len(name) + len(value)
-		}
+		size += replayOptionalDefaultsByteSize(call.visibleOptionalDefaults)
+		size += replayOptionalDefaultsByteSize(call.originalOptionalDefaults)
 		size += 8 // output item index accounting
 	}
 	return size
@@ -851,6 +854,35 @@ func cloneReplayOptionalDefaults(defaults responsesChatReplayOptionalDefaults) r
 		cloned[name] = cloneReplayRawMessage(value)
 	}
 	return cloned
+}
+
+func replayOptionalDefaultsAbsentFromArguments(arguments string, defaults responsesChatReplayOptionalDefaults) responsesChatReplayOptionalDefaults {
+	if len(defaults) == 0 || !json.Valid([]byte(arguments)) {
+		return nil
+	}
+	var values map[string]json.RawMessage
+	if json.Unmarshal([]byte(arguments), &values) != nil || values == nil {
+		return nil
+	}
+	absent := make(responsesChatReplayOptionalDefaults)
+	for name, value := range defaults {
+		if _, exists := values[name]; exists {
+			continue
+		}
+		absent[name] = cloneReplayRawMessage(value)
+	}
+	if len(absent) == 0 {
+		return nil
+	}
+	return absent
+}
+
+func replayOptionalDefaultsByteSize(defaults responsesChatReplayOptionalDefaults) int {
+	size := 0
+	for name, value := range defaults {
+		size += len(name) + len(value)
+	}
+	return size
 }
 
 func canonicalReplayArgumentsWithoutOptionalDefaults(arguments string, defaults responsesChatReplayOptionalDefaults) ([]byte, bool, error) {
