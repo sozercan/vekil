@@ -398,6 +398,66 @@ func TestCodexAdapterAcceptsPolicyOwnedChatModelThroughResponsesCompatibility(t 
 	}
 }
 
+func TestCodexAdapterRejectsPolicyFeatureOverrides(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		feature string
+		args    []string
+	}{
+		{name: "code mode", feature: "code_mode", args: []string{"--enable", "code_mode", "exec", "hello"}},
+		{name: "code mode only", feature: "code_mode_only", args: []string{"exec", "--enable=code_mode_only", "hello"}},
+		{name: "remote compaction", feature: "remote_compaction_v2", args: []string{"exec", "hello", "--enable", "remote_compaction_v2"}},
+		{name: "web search request", feature: "web_search_request", args: []string{"--enable=web_search_request", "exec", "hello"}},
+		{name: "legacy web search spaced", feature: "web_search", args: []string{"--enable", "web_search", "exec", "hello"}},
+		{name: "legacy web search equals", feature: "web_search", args: []string{"exec", "--enable=web_search", "hello"}},
+		{name: "cached web search", feature: "web_search_cached", args: []string{"--enable", "web_search_cached", "exec", "hello"}},
+		{name: "standalone web search", feature: "standalone_web_search", args: []string{"exec", "--enable=standalone_web_search", "hello"}},
+		{name: "legacy search tool", feature: "search_tool", args: []string{"exec", "hello", "--enable", "search_tool"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := (CodexAdapter{}).Prepare(PrepareInput{
+				BaseURL: "http://127.0.0.1:43210",
+				Model: ModelInfo{
+					ID:      "policy-model",
+					OwnedBy: PolicyModelOwner,
+				},
+				Binary:        binary,
+				LocalToken:    "token",
+				ForwardedArgs: tc.args,
+				DryRun:        true,
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.feature) || !strings.Contains(err.Error(), "policy-routed") {
+				t.Fatalf("Prepare() error = %v, want rejected policy feature override", err)
+			}
+		})
+	}
+}
+
+func TestCodexAdapterRejectsPolicySearchOverride(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (CodexAdapter{}).Prepare(PrepareInput{
+		BaseURL: "http://127.0.0.1:43210",
+		Model: ModelInfo{
+			ID:      "policy-model",
+			OwnedBy: PolicyModelOwner,
+		},
+		Binary:        binary,
+		LocalToken:    "token",
+		ForwardedArgs: []string{"--search", "exec", "hello"},
+		DryRun:        true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "--search") || !strings.Contains(err.Error(), "policy-routed") {
+		t.Fatalf("Prepare() error = %v, want rejected policy search override", err)
+	}
+}
+
 func TestPolicyCodexCatalogRestrictionsClearDonorProtocolModes(t *testing.T) {
 	template := map[string]interface{}{
 		"use_responses_lite": true,

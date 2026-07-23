@@ -618,7 +618,7 @@ func TestHandleAnthropicMessagesPolicyIngressSanitizesMalformedClientStreamError
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				defer func() { _ = r.Body.Close() }()
 				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = fmt.Fprintf(w, "data: %s\n\n", malformed)
+				_, _ = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", malformed)
 			}))
 			defer upstream.Close()
 			h, err := NewProxyHandler(nil, logger.NewWithWriter(logger.LevelError, io.Discard),
@@ -639,7 +639,7 @@ func TestHandleAnthropicMessagesPolicyIngressSanitizesMalformedClientStreamError
 				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 			}
 			body := recorder.Body.String()
-			if !strings.Contains(body, `"message":"upstream request failed"`) || strings.Contains(body, malformed) || strings.Contains(body, "invalid character") || strings.Contains(body, "cannot unmarshal") {
+			if !strings.Contains(body, `"message":"upstream request failed"`) || strings.Contains(body, malformed) || strings.Contains(body, "invalid character") || strings.Contains(body, "cannot unmarshal") || strings.Contains(body, "event: message_stop") {
 				t.Fatalf("malformed client stream detail leaked: %s", body)
 			}
 		})

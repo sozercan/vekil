@@ -235,8 +235,12 @@ during launcher startup.
 
 Forwarded `-m`/`--model`, `-c`/`--config`, profile, OSS/local-provider, remote,
 resume/fork, app-server, remote-control, cloud, and non-agent command modes are
-rejected. Use the launcher-level `--model` to pin a model; otherwise selection
-remains delegated to Codex's normal default.
+rejected. For a pinned policy-owned model, forwarded `--search`, equivalent
+web-search feature toggles, and attempts to re-enable `code_mode`,
+`code_mode_only`, or `remote_compaction_v2` are also rejected so the
+compatibility safeguards remain authoritative. Use the launcher-level
+`--model` to pin a model; otherwise selection remains delegated to Codex's
+normal default.
 
 ## GitHub Copilot CLI
 

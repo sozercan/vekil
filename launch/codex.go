@@ -41,6 +41,11 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	if err := validateCodexForwardedArgs(input.ForwardedArgs); err != nil {
 		return PreparedProcess{}, err
 	}
+	if policyModel {
+		if err := validatePolicyCodexForwardedArgs(input.ForwardedArgs); err != nil {
+			return PreparedProcess{}, err
+		}
+	}
 
 	executable, err := resolveExecutable(input.Binary, "codex", []string{
 		"~/.npm-global/bin/codex",
@@ -192,6 +197,39 @@ func validateCodexForwardedArgs(args []string) error {
 	default:
 		return nil
 	}
+}
+
+func validatePolicyCodexForwardedArgs(args []string) error {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if arg == "--search" {
+			return fmt.Errorf("codex option %q is not supported for policy-routed models", arg)
+		}
+
+		var feature string
+		switch {
+		case arg == "--enable":
+			if i+1 >= len(args) {
+				return nil // validateCodexForwardedArgs reports the missing value.
+			}
+			i++
+			feature = args[i]
+		case strings.HasPrefix(arg, "--enable="):
+			feature = strings.TrimPrefix(arg, "--enable=")
+		default:
+			continue
+		}
+
+		switch strings.TrimSpace(feature) {
+		case "remote_compaction_v2", "code_mode", "code_mode_only",
+			"web_search", "web_search_request", "web_search_cached", "standalone_web_search", "search_tool":
+			return fmt.Errorf("codex feature %q cannot be enabled for policy-routed models", feature)
+		}
+	}
+	return nil
 }
 
 func codexOptionRequiresValue(arg string) bool {
