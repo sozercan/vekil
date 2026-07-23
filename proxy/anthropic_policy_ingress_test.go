@@ -228,6 +228,56 @@ func TestHandleAnthropicMessagesCountTokensPolicyIngressUsesPlannedProbe(t *test
 	assertNoRouteAttemptStats(t, h)
 }
 
+func TestAnthropicPolicyLocalTranslationErrorsPreserveIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		path   string
+		body   string
+		handle func(*ProxyHandler, http.ResponseWriter, *http.Request)
+	}{
+		{
+			name: "messages", path: providerEndpointMessages,
+			body:   `{"model":"coding-economy","max_tokens":64,"messages":[{"role":"user","content":[{"type":"unknown"}]}]}`,
+			handle: (*ProxyHandler).HandleAnthropicMessages,
+		},
+		{
+			name: "count_tokens", path: providerEndpointMessagesCount,
+			body:   `{"model":"coding-economy","messages":[{"role":"user","content":[{"type":"unknown"}]}]}`,
+			handle: (*ProxyHandler).HandleAnthropicMessagesCountTokens,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			h, err := NewProxyHandler(nil, logger.NewWithWriter(logger.LevelError, io.Discard),
+				WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)),
+				WithPolicyRoutingMode(PolicyRoutingModeOff),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, summary := WithRequestSummary(t.Context())
+			request := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body)).WithContext(ctx)
+			recorder := httptest.NewRecorder()
+			tc.handle(h, recorder, request)
+			if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "translation error") {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			if got := recorder.Header().Get("X-Vekil-Request-ID"); got == "" || got != summary.OperationID() {
+				t.Fatalf("request ID/header = %q/%q", got, summary.OperationID())
+			}
+			for _, name := range []string{"Openai-Model", "X-Openai-Model"} {
+				if got := recorder.Header().Get(name); got != "coding-economy" {
+					t.Fatalf("%s = %q, want policy public ID", name, got)
+				}
+			}
+			if sends, _ := light.snapshot(); sends != 0 {
+				t.Fatalf("light sends = %d, want zero", sends)
+			}
+		})
+	}
+}
+
 func TestHandleAnthropicMessagesPolicyIngressKeepsPrewarmNonStreaming(t *testing.T) {
 	var probe models.OpenAIRequest
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

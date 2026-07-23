@@ -499,6 +499,15 @@ func TestPolicyResponsesRejectsTerminalCallsOutsideRequestCapability(t *testing.
 			t.Fatalf("error = %v", err)
 		}
 	})
+	t.Run("overlong call id", func(t *testing.T) {
+		overlong := call(strings.Repeat("c", policyResponsesMaxToolNameLen+1), "lookup")
+		_, err := buildPolicyResponsesResponse(completion(overlong), "policy", policyResponsesToolMap{
+			"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction},
+		})
+		if err == nil || !strings.Contains(err.Error(), "call ID longer") {
+			t.Fatalf("error = %v", err)
+		}
+	})
 	t.Run("required call satisfied", func(t *testing.T) {
 		response, err := buildPolicyResponsesResponse(completion(call("call-required", "lookup")), "policy", policyResponsesToolMap{
 			"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction},

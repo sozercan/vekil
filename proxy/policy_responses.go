@@ -19,6 +19,7 @@ import (
 // still consumes canonical Chat facts and the selected terminal route remains a
 // native Chat route; only the public ingress and egress protocol are adapted.
 func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Request, body []byte, canonicalPublicID string) {
+	ensurePolicyLocalRequestIdentity(w, r, canonicalPublicID)
 	requestedModel := extractResponsesRequestModel(body)
 	if !h.modelAllowedForRequest(requestedModel, providerEndpointResponses) {
 		writeOpenAIError(w, http.StatusBadRequest, modelNotAllowedRequestError(requestedModel).Error(), "invalid_request_error")

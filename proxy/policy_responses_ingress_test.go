@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -278,6 +279,30 @@ func TestPolicyResponsesIngressRoundTripsNamespacedToolContinuation(t *testing.T
 	}
 }
 
+func TestPolicyResponsesIngressPreservesEmptyStreamedText(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chat-empty\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chat-empty\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chat-empty\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":0,\"total_tokens\":1}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")), WithProvidersConfig(policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)), WithPolicyRoutingMode(PolicyRoutingModeOff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"coding-economy","input":"hello","store":false,"stream":true}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"text":""`) || !strings.Contains(recorder.Body.String(), "event: response.completed") {
+		t.Fatalf("empty streamed text was not preserved: %s", recorder.Body.String())
+	}
+}
+
 func TestPolicyResponsesIngressRejectsStoredRequestsBeforeUpstreamSend(t *testing.T) {
 	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
 	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
@@ -289,9 +314,19 @@ func TestPolicyResponsesIngressRejectsStoredRequestsBeforeUpstreamSend(t *testin
 		t.Fatal(err)
 	}
 	recorder := httptest.NewRecorder()
-	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"coding-economy","input":"hello","store":true}`)))
+	ctx, summary := WithRequestSummary(t.Context())
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"coding-economy","input":"hello","store":true}`)).WithContext(ctx)
+	h.HandleResponses(recorder, request)
 	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "store") {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("X-Vekil-Request-ID"); got == "" || got != summary.OperationID() {
+		t.Fatalf("request ID/header = %q/%q", got, summary.OperationID())
+	}
+	for _, name := range []string{"Openai-Model", "X-Openai-Model"} {
+		if got := recorder.Header().Get(name); got != "coding-economy" {
+			t.Fatalf("%s = %q, want policy public ID", name, got)
+		}
 	}
 	if sends, _ := light.snapshot(); sends != 0 {
 		t.Fatalf("light sends=%d", sends)

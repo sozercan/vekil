@@ -1659,6 +1659,11 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", message)
 		return
 	}
+	publicModel := req.Model
+	if canonicalPolicyID, ok := h.policyPublicModelID(req.Model); ok {
+		publicModel = canonicalPolicyID
+		ensurePolicyLocalRequestIdentity(w, r, publicModel)
+	}
 	// Route-aware duplicate-key validation must use the same selected model as
 	// handler forwarding. encoding/json resolves duplicate struct fields with the
 	// last occurrence, so validate only after decoding req.Model.
@@ -1710,10 +1715,6 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("translation error: %v", err))
 		return
-	}
-	publicModel := req.Model
-	if canonicalPolicyID, ok := h.policyPublicModelID(req.Model); ok {
-		publicModel = canonicalPolicyID
 	}
 	policyPlan, err := h.planOpenAIChatPolicy(r.Context(), req.Model, oaiBody)
 	if err != nil {
@@ -2022,6 +2023,11 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", message)
 		return
 	}
+	publicModel := req.Model
+	if canonicalPolicyID, ok := h.policyPublicModelID(req.Model); ok {
+		publicModel = canonicalPolicyID
+		ensurePolicyLocalRequestIdentity(w, r, publicModel)
+	}
 	// Route-aware duplicate-key validation must use the same selected model as
 	// handler forwarding. encoding/json resolves duplicate struct fields with the
 	// last occurrence, so validate only after decoding req.Model.
@@ -2061,10 +2067,6 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 	if err != nil {
 		writeAnthropicError(w, http.StatusInternalServerError, "api_error", "failed to prepare count_tokens policy request")
 		return
-	}
-	publicModel := req.Model
-	if canonicalPolicyID, ok := h.policyPublicModelID(req.Model); ok {
-		publicModel = canonicalPolicyID
 	}
 	policyPlan, err := h.planOpenAIChatPolicy(r.Context(), req.Model, policyBody)
 	if err != nil {
@@ -2278,6 +2280,26 @@ func (h *ProxyHandler) decodeAnthropicCountTokensProbeResponse(resp *http.Respon
 	}
 
 	return &oaiResp, nil
+}
+
+func ensurePolicyLocalRequestIdentity(w http.ResponseWriter, r *http.Request, publicModel string) {
+	publicModel = strings.TrimSpace(publicModel)
+	if publicModel == "" {
+		return
+	}
+	for _, name := range []string{"Openai-Model", "X-Openai-Model"} {
+		w.Header().Set(name, publicModel)
+	}
+	if w.Header().Get("X-Vekil-Request-ID") != "" {
+		return
+	}
+	operationID := uuid.NewString()
+	w.Header().Set("X-Vekil-Request-ID", operationID)
+	if r != nil {
+		if summary := RequestSummaryFromContext(r.Context()); summary != nil {
+			summary.SetOperationID(operationID)
+		}
+	}
 }
 
 func policyChatSafeHeaders(src http.Header, publicModel string) http.Header {

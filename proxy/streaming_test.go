@@ -2020,6 +2020,37 @@ func TestAggregateStreamToResponse_ParallelToolCalls(t *testing.T) {
 	}
 }
 
+func TestAggregateStreamToResponse_NullContentDoesNotCreateText(t *testing.T) {
+	body := buildSSEStream(
+		`{"id":"c-null","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":null,"refusal":null}}]}`,
+		`{"id":"c-null","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		"[DONE]",
+	)
+	response, err := aggregateStreamToResponse(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := response.Choices[0].Message
+	if message.Content != nil || message.Refusal != nil {
+		t.Fatalf("null deltas became content/refusal: %+v", message)
+	}
+}
+
+func TestAggregateStreamToResponse_PreservesEmptyText(t *testing.T) {
+	body := buildSSEStream(
+		`{"id":"c-empty","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}`,
+		`{"id":"c-empty","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		"[DONE]",
+	)
+	response, err := aggregateStreamToResponse(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(response.Choices[0].Message.Content); got != `""` {
+		t.Fatalf("content = %s, want explicit empty JSON string", got)
+	}
+}
+
 func TestAggregateStreamToResponse_TextOnly(t *testing.T) {
 	body := buildSSEStream(
 		`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"}}]}`,

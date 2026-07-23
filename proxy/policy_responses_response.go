@@ -154,6 +154,9 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 			if callID == "" {
 				callID = newPolicyResponsesID("call")
 			}
+			if len(callID) > policyResponsesMaxToolNameLen {
+				return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned function call ID longer than %d bytes", policyResponsesMaxToolNameLen)
+			}
 			if _, duplicate := seenCallIDs[callID]; duplicate {
 				return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned duplicate function call ID %q", callID)
 			}

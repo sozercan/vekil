@@ -2010,7 +2010,9 @@ func (s *anthropicStreamState) finish() bool {
 type aggregatedOpenAIChoice struct {
 	role              string
 	content           strings.Builder
+	contentPresent    bool
 	refusal           strings.Builder
+	refusalPresent    bool
 	toolCalls         map[int]*models.OpenAIToolCall
 	toolCallArguments map[int]*strings.Builder
 	finishReason      *string
@@ -2057,15 +2059,17 @@ func (a *openAIResponseAggregator) addChoice(choice models.OpenAIStreamChoice) {
 		aggChoice.role = choice.Delta.Role
 	}
 
-	if choice.Delta.Content != nil {
+	if choice.Delta.Content != nil && !bytes.Equal(bytes.TrimSpace(choice.Delta.Content), []byte("null")) {
 		var text string
 		if err := json.Unmarshal(choice.Delta.Content, &text); err == nil {
+			aggChoice.contentPresent = true
 			aggChoice.content.WriteString(text)
 		}
 	}
-	if choice.Delta.Refusal != nil {
+	if choice.Delta.Refusal != nil && !bytes.Equal(bytes.TrimSpace(choice.Delta.Refusal), []byte("null")) {
 		var refusal string
 		if err := json.Unmarshal(choice.Delta.Refusal, &refusal); err == nil {
+			aggChoice.refusalPresent = true
 			aggChoice.refusal.WriteString(refusal)
 		}
 	}
@@ -2159,11 +2163,11 @@ func (a *openAIResponseAggregator) buildResponseWithOptions(options openAIRespon
 
 func (a *openAIResponseAggregator) buildMessage(choice *aggregatedOpenAIChoice, options openAIResponseBuildOptions) models.OpenAIMessage {
 	message := models.OpenAIMessage{Role: choice.role}
-	if choice.content.Len() > 0 {
+	if choice.contentPresent {
 		content, _ := json.Marshal(choice.content.String())
 		message.Content = content
 	}
-	if choice.refusal.Len() > 0 {
+	if choice.refusalPresent {
 		refusal, _ := json.Marshal(choice.refusal.String())
 		message.Refusal = refusal
 	}
