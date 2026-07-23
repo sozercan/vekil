@@ -508,6 +508,12 @@ func TestPolicyResponsesIngressRejectsMalformedTerminalCompletion(t *testing.T) 
 			responseBody: `{"id":"chat-missing-finish","object":"chat.completion","created":1,"model":"light-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`,
 		},
 		{
+			name:         "non-streaming non-assistant role",
+			requestBody:  `{"model":"coding-economy","input":"hello","store":false}`,
+			contentType:  "application/json",
+			responseBody: `{"id":"chat-wrong-role","object":"chat.completion","created":1,"model":"light-model","choices":[{"index":0,"message":{"role":"user","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`,
+		},
+		{
 			name:           "streaming missing finish reason",
 			requestBody:    `{"model":"coding-economy","input":"hello","store":false,"stream":true}`,
 			upstreamStream: true,
@@ -524,6 +530,26 @@ func TestPolicyResponsesIngressRejectsMalformedTerminalCompletion(t *testing.T) 
 			responseBody: "data: {\"id\":\"chat-custom-call\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-custom\",\"type\":\"custom\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n" +
 				"data: {\"id\":\"chat-custom-call\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
 				"data: {\"id\":\"chat-custom-call\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n" +
+				"data: [DONE]\n\n",
+		},
+		{
+			name:           "streaming refusal with tool call",
+			requestBody:    `{"model":"coding-economy","input":"use lookup","store":false,"stream":true,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`,
+			upstreamStream: true,
+			contentType:    "text/event-stream",
+			responseBody: "data: {\"id\":\"chat-refusal-call\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"refusal\":\"cannot comply\",\"tool_calls\":[{\"index\":0,\"id\":\"call-refusal\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+				"data: {\"id\":\"chat-refusal-call\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+				"data: {\"id\":\"chat-refusal-call\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n" +
+				"data: [DONE]\n\n",
+		},
+		{
+			name:           "streaming invalid function arguments",
+			requestBody:    `{"model":"coding-economy","input":"use lookup","store":false,"stream":true,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`,
+			upstreamStream: true,
+			contentType:    "text/event-stream",
+			responseBody: "data: {\"id\":\"chat-invalid-args\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-invalid-args\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{not-json\"}}]}}]}\n\n" +
+				"data: {\"id\":\"chat-invalid-args\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+				"data: {\"id\":\"chat-invalid-args\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n" +
 				"data: [DONE]\n\n",
 		},
 		{

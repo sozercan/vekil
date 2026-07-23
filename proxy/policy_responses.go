@@ -121,7 +121,7 @@ func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Requ
 
 func (h *ProxyHandler) collectPolicyResponsesChatCompletion(ctx context.Context, result chatExecutionResult, body []byte, mode chatCompletionsMode) (*models.OpenAIResponse, error) {
 	if result.Stream != nil {
-		return aggregateChatStreamEvents(result.Stream)
+		return aggregatePolicyChatStreamEvents(result.Stream)
 	}
 	if result.Completion != nil {
 		return result.Completion, nil
@@ -140,7 +140,7 @@ func (h *ProxyHandler) collectPolicyResponsesChatCompletion(ctx context.Context,
 		return nil, policyResponsesChatUpstreamError(result.Response)
 	}
 	if mode.clientRequestedStream || mode.forceUpstreamStream || strings.Contains(strings.ToLower(result.Response.Header.Get("Content-Type")), "text/event-stream") {
-		completion, terminalResponse, err := h.aggregateExplicitChatCompletionsResponse(ctx, result.Response, body, mode, aggregateStreamToResponseWithProgress)
+		completion, terminalResponse, err := h.aggregateExplicitChatCompletionsResponse(ctx, result.Response, body, mode, aggregatePolicyStreamToResponseWithProgress)
 		if err != nil {
 			return nil, err
 		}

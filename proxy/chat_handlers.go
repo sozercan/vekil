@@ -40,8 +40,6 @@ type chatCompletionsResponseHandlers struct {
 	passthrough  func(*http.Response) error
 }
 
-var errPolicySanitizedSSEEventTooLarge = errors.New("policy upstream SSE event exceeds maximum buffer")
-
 type policySanitizedOpenAIStream struct {
 	body          io.ReadCloser
 	reader        *bufio.Reader
@@ -97,7 +95,7 @@ func (s *policySanitizedOpenAIStream) readEvent() ([]byte, error) {
 			}
 			if len(line) > limit-raw.Len() {
 				_ = s.body.Close()
-				return nil, errPolicySanitizedSSEEventTooLarge
+				return policySanitizedOpenAIStreamErrorEvent(http.StatusBadGateway), io.EOF
 			}
 			raw.WriteString(line)
 			content, _ := splitSSELineEnding(line)
@@ -135,6 +133,14 @@ func sanitizePolicyOpenAIStreamEvent(raw []byte, eventType string, dataLines []s
 	if err != nil {
 		return append([]byte(nil), raw...)
 	}
+	return []byte("event: error\ndata: " + string(payload) + "\n\n")
+}
+
+func policySanitizedOpenAIStreamErrorEvent(status int) []byte {
+	message, errType, code := policyChatUpstreamErrorDetails(status)
+	payload, _ := json.Marshal(openAIChatStreamErrorEnvelope{Error: openAIChatStreamErrorBody{
+		Type: errType, Code: code, Message: message,
+	}})
 	return []byte("event: error\ndata: " + string(payload) + "\n\n")
 }
 
@@ -1726,8 +1732,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		// Apply only the policy request contract from the returned body; the mode
 		// parsed by the OpenAI helper would misclassify an injected stream as a
 		// client-requested stream and leak SSE to a non-streaming Anthropic client.
-		preparedBody, _ := preparePolicyOpenAIChatCompletionsRequest(oaiBody, policyPlan.contract, cloneBoolPtr(policyPlan.terminalParallelToolCalls))
-		oaiBody = preparedBody
+		oaiBody = applyPolicyOpenAIChatParallelToolCalls(oaiBody, policyPlan.contract, cloneBoolPtr(policyPlan.terminalParallelToolCalls))
 	}
 	oaiBody = h.rewriteOpenAIChatRequestBodyWithToolOptimizers(r.Context(), oaiBody, h.toolContexts, scope)
 

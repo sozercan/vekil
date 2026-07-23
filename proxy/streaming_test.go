@@ -2102,27 +2102,31 @@ func TestAggregateStreamToResponse_MultipleChoices(t *testing.T) {
 }
 
 func TestAggregateStreamToResponse_InvalidToolArgs(t *testing.T) {
-	// Simulate concatenated JSON objects in tool call arguments (LiteLLM bug #20543)
-	body := buildSSEStream(
-		`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":""}}]}}]}`,
-		`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"ls\"}"}}]}}]}`,
-		`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"pwd\"}"}}]}}]}`,
-		`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
-		"[DONE]",
-	)
+	// Simulate concatenated JSON objects in tool call arguments (LiteLLM bug #20543).
+	stream := func() io.ReadCloser {
+		return buildSSEStream(
+			`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":""}}]}}]}`,
+			`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"ls\"}"}}]}}]}`,
+			`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"pwd\"}"}}]}}]}`,
+			`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			"[DONE]",
+		)
+	}
 
-	resp, err := aggregateStreamToResponse(body)
+	generic, err := aggregateStreamToResponse(stream())
 	if err != nil {
 		t.Fatalf("aggregateStreamToResponse: %v", err)
 	}
-
-	if len(resp.Choices[0].Message.ToolCalls) != 1 {
-		t.Fatalf("expected 1 tool call, got %d", len(resp.Choices[0].Message.ToolCalls))
+	if got := generic.Choices[0].Message.ToolCalls[0].Function.Arguments; got != "{}" {
+		t.Fatalf("generic tool arguments = %q, want compatibility fallback {}", got)
 	}
-	tc := resp.Choices[0].Message.ToolCalls[0]
-	// The concatenated arguments are invalid JSON, should be replaced with {}
-	if !json.Valid([]byte(tc.Function.Arguments)) {
-		t.Errorf("tool call arguments should be valid JSON, got %q", tc.Function.Arguments)
+
+	policy, _, err := aggregatePolicyStreamToResponseWithProgress(stream())
+	if err != nil {
+		t.Fatalf("aggregatePolicyStreamToResponseWithProgress: %v", err)
+	}
+	if got := policy.Choices[0].Message.ToolCalls[0].Function.Arguments; got != `{"cmd":"ls"}{"cmd":"pwd"}` {
+		t.Fatalf("policy tool arguments = %q, want original malformed fragments", got)
 	}
 }
 

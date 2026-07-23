@@ -1680,6 +1680,14 @@ func aggregateStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, erro
 // before an error. Callers may only switch targets when the returned progress is
 // none or an allowed role/preamble chunk.
 func aggregateStreamToResponseWithProgress(body io.ReadCloser) (*models.OpenAIResponse, upstreamSemanticProgress, error) {
+	return aggregateStreamToResponseWithProgressOptions(body, openAIResponseBuildOptions{})
+}
+
+func aggregatePolicyStreamToResponseWithProgress(body io.ReadCloser) (*models.OpenAIResponse, upstreamSemanticProgress, error) {
+	return aggregateStreamToResponseWithProgressOptions(body, openAIResponseBuildOptions{preserveInvalidToolArguments: true})
+}
+
+func aggregateStreamToResponseWithProgressOptions(body io.ReadCloser, options openAIResponseBuildOptions) (*models.OpenAIResponse, upstreamSemanticProgress, error) {
 	defer func() { _ = body.Close() }()
 
 	aggregator := newOpenAIResponseAggregator()
@@ -1694,7 +1702,7 @@ func aggregateStreamToResponseWithProgress(body io.ReadCloser) (*models.OpenAIRe
 		return nil, progress, fmt.Errorf("stream ended before [DONE]")
 	}
 
-	return aggregator.buildResponse(), progress, nil
+	return aggregator.buildResponseWithOptions(options), progress, nil
 }
 
 type anthropicStreamState struct {
@@ -2008,6 +2016,10 @@ type aggregatedOpenAIChoice struct {
 	finishReason      *string
 }
 
+type openAIResponseBuildOptions struct {
+	preserveInvalidToolArguments bool
+}
+
 type openAIResponseAggregator struct {
 	response       models.OpenAIResponse
 	choicesByIndex map[int]*aggregatedOpenAIChoice
@@ -2122,6 +2134,10 @@ func (c *aggregatedOpenAIChoice) appendToolCallArguments(index int, arguments st
 }
 
 func (a *openAIResponseAggregator) buildResponse() *models.OpenAIResponse {
+	return a.buildResponseWithOptions(openAIResponseBuildOptions{})
+}
+
+func (a *openAIResponseAggregator) buildResponseWithOptions(options openAIResponseBuildOptions) *models.OpenAIResponse {
 	choiceIndexes := make([]int, 0, len(a.choicesByIndex))
 	for choiceIndex := range a.choicesByIndex {
 		choiceIndexes = append(choiceIndexes, choiceIndex)
@@ -2133,7 +2149,7 @@ func (a *openAIResponseAggregator) buildResponse() *models.OpenAIResponse {
 		aggChoice := a.choicesByIndex[choiceIndex]
 		a.response.Choices = append(a.response.Choices, models.OpenAIChoice{
 			Index:        choiceIndex,
-			Message:      a.buildMessage(aggChoice),
+			Message:      a.buildMessage(aggChoice, options),
 			FinishReason: aggChoice.finishReason,
 		})
 	}
@@ -2141,7 +2157,7 @@ func (a *openAIResponseAggregator) buildResponse() *models.OpenAIResponse {
 	return &a.response
 }
 
-func (a *openAIResponseAggregator) buildMessage(choice *aggregatedOpenAIChoice) models.OpenAIMessage {
+func (a *openAIResponseAggregator) buildMessage(choice *aggregatedOpenAIChoice, options openAIResponseBuildOptions) models.OpenAIMessage {
 	message := models.OpenAIMessage{Role: choice.role}
 	if choice.content.Len() > 0 {
 		content, _ := json.Marshal(choice.content.String())
@@ -2167,7 +2183,7 @@ func (a *openAIResponseAggregator) buildMessage(choice *aggregatedOpenAIChoice) 
 		if argumentBuilder := choice.toolCallArguments[toolIndex]; argumentBuilder != nil {
 			toolCall.Function.Arguments = argumentBuilder.String()
 		}
-		if !json.Valid([]byte(toolCall.Function.Arguments)) {
+		if !options.preserveInvalidToolArguments && !json.Valid([]byte(toolCall.Function.Arguments)) {
 			toolCall.Function.Arguments = "{}"
 		}
 		message.ToolCalls = append(message.ToolCalls, toolCall)

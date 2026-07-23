@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -27,9 +26,16 @@ func TestPolicySanitizedOpenAIStreamBoundsOneEvent(t *testing.T) {
 	upstream := &policyCloseTrackingReader{Reader: strings.NewReader("data: one\ndata: two\ndata: three\ndata: four\ndata: five\n\n")}
 	stream := newPolicySanitizedOpenAIStream(upstream).(*policySanitizedOpenAIStream)
 	stream.maxEventBytes = 32
-	_, err := io.ReadAll(stream)
-	if !errors.Is(err, errPolicySanitizedSSEEventTooLarge) {
-		t.Fatalf("ReadAll() error = %v, want event-too-large", err)
+	recorder := httptest.NewRecorder()
+	StreamOpenAIToAnthropic(recorder, stream, "coding-economy", "msg-policy-oversize")
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"message":"upstream request failed"`) {
+		t.Fatalf("oversized policy stream was not sanitized: %s", body)
+	}
+	for _, leaked := range []string{"exceeds maximum buffer", "upstream stream read failed", "data: one"} {
+		if strings.Contains(body, leaked) {
+			t.Fatalf("oversized policy stream leaked %q: %s", leaked, body)
+		}
 	}
 	if !upstream.closed {
 		t.Fatal("oversized policy SSE event did not close upstream body")
@@ -191,6 +197,40 @@ func TestHandleAnthropicMessagesCountTokensPolicyIngressUsesPlannedProbe(t *test
 		t.Fatalf("powerful requests=%d, want zero", powerfulRequests)
 	}
 	assertNoRouteAttemptStats(t, h)
+}
+
+func TestHandleAnthropicMessagesPolicyIngressKeepsPrewarmNonStreaming(t *testing.T) {
+	var probe models.OpenAIRequest
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		if err := json.NewDecoder(r.Body).Decode(&probe); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"prewarm","object":"chat.completion","model":"light-model","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":0,"total_tokens":1}}`)
+	}))
+	defer upstream.Close()
+	h, err := NewProxyHandler(nil, logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)),
+		WithPolicyRoutingMode(PolicyRoutingModeOff),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	h.HandleAnthropicMessages(recorder, httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(`{
+		"model":"coding-economy",
+		"max_tokens":0,
+		"messages":[{"role":"user","content":"warm cache"}],
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}}]
+	}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if probe.Stream != nil || probe.StreamOptions != nil {
+		t.Fatalf("prewarm stream/stream_options = %v/%+v, want omitted", probe.Stream, probe.StreamOptions)
+	}
 }
 
 func TestHandleAnthropicMessagesPolicyIngressAllowsDeterministicReplayContinuation(t *testing.T) {

@@ -356,6 +356,14 @@ func writeOpenAIChatSSEError(w http.ResponseWriter, streamErr *chatStreamError) 
 }
 
 func aggregateChatStreamEvents(stream *chatStreamEventStream) (*models.OpenAIResponse, error) {
+	return aggregateChatStreamEventsWithOptions(stream, openAIResponseBuildOptions{})
+}
+
+func aggregatePolicyChatStreamEvents(stream *chatStreamEventStream) (*models.OpenAIResponse, error) {
+	return aggregateChatStreamEventsWithOptions(stream, openAIResponseBuildOptions{preserveInvalidToolArguments: true})
+}
+
+func aggregateChatStreamEventsWithOptions(stream *chatStreamEventStream, options openAIResponseBuildOptions) (*models.OpenAIResponse, error) {
 	aggregator := newOpenAIResponseAggregator()
 	if err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
 		aggregator.addChunk(chunk)
@@ -363,7 +371,7 @@ func aggregateChatStreamEvents(stream *chatStreamEventStream) (*models.OpenAIRes
 	}); err != nil {
 		return nil, err
 	}
-	return aggregator.buildResponse(), nil
+	return aggregator.buildResponseWithOptions(options), nil
 }
 
 func streamChatEventsToAnthropic(

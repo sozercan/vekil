@@ -289,6 +289,40 @@ func TestAggregateChatStreamEventsBuildsOpenAIResponse(t *testing.T) {
 	}
 }
 
+func TestAggregatePolicyChatStreamEventsPreservesInvalidToolArguments(t *testing.T) {
+	toolIndex := 0
+	finishReason := "tool_calls"
+	chunks := []models.OpenAIStreamChunk{
+		{ID: "chatcmpl-invalid", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{Role: "assistant", ToolCalls: []models.OpenAIToolCall{{ID: "call", Type: "function", Index: &toolIndex, Function: models.OpenAIFunctionCall{Name: "lookup", Arguments: `{"q":"a"}`}}}}}}},
+		{ID: "chatcmpl-invalid", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{Index: &toolIndex, Function: models.OpenAIFunctionCall{Arguments: `{"q":"b"}`}}}}}}},
+		{ID: "chatcmpl-invalid", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{}, FinishReason: &finishReason}}},
+	}
+	aggregate := func(policy bool) *models.OpenAIResponse {
+		writer, stream := newChatStreamEventPipe(context.Background())
+		producerDone := produceSuccessfulChatStream(writer, chunks)
+		var response *models.OpenAIResponse
+		var err error
+		if policy {
+			response, err = aggregatePolicyChatStreamEvents(stream)
+		} else {
+			response, err = aggregateChatStreamEvents(stream)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := <-producerDone; err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	if got := aggregate(false).Choices[0].Message.ToolCalls[0].Function.Arguments; got != "{}" {
+		t.Fatalf("generic typed arguments = %q, want compatibility fallback {}", got)
+	}
+	if got := aggregate(true).Choices[0].Message.ToolCalls[0].Function.Arguments; got != `{"q":"a"}{"q":"b"}` {
+		t.Fatalf("policy typed arguments = %q, want original malformed fragments", got)
+	}
+}
+
 func TestStreamChatEventsToAnthropicMatchesNativeTranslation(t *testing.T) {
 	toolIndex := 0
 	finishReason := "tool_calls"

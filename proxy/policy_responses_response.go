@@ -44,6 +44,9 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 		return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned no choices")
 	}
 	choice := completion.Choices[0]
+	if strings.TrimSpace(choice.Message.Role) != "assistant" {
+		return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned non-assistant role %q", choice.Message.Role)
+	}
 	responseConfig := policyResponsesResponseConfig{Tools: json.RawMessage(`[]`), ToolChoice: json.RawMessage(`"auto"`), ParallelToolCalls: true}
 	if len(config) > 0 {
 		responseConfig = config[0]
@@ -77,6 +80,7 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 		response.Model = strings.TrimSpace(completion.Model)
 	}
 	finishReason := ""
+	executableToolCalls := false
 	if choice.FinishReason != nil {
 		finishReason = strings.TrimSpace(*choice.FinishReason)
 	}
@@ -95,6 +99,7 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 		if !responseConfig.ParallelToolCalls && len(choice.Message.ToolCalls) > 1 {
 			return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned parallel function calls while parallel_tool_calls is false")
 		}
+		executableToolCalls = true
 	case "length":
 		response.Status = "incomplete"
 		response.IncompleteDetails = map[string]any{"reason": "max_output_tokens"}
@@ -114,6 +119,9 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 	refusal, refusalPresent, err := policyResponsesRefusalFromChatContent(choice.Message.Refusal)
 	if err != nil {
 		return policyResponsesResponse{}, err
+	}
+	if refusalPresent && refusal != "" && executableToolCalls {
+		return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned refusal with executable function calls")
 	}
 	messageContent := make([]any, 0, 2)
 	if textPresent {
@@ -136,7 +144,7 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 	// Never expose a function call as executable when Chat terminated before a
 	// complete answer. Codex consumes output_item.done calls before the terminal
 	// event, so a length/content-filter truncation must not dispatch partial JSON.
-	if finishReason == "tool_calls" || finishReason == "function_call" {
+	if executableToolCalls {
 		seenCallIDs := make(map[string]struct{}, len(choice.Message.ToolCalls))
 		for _, call := range choice.Message.ToolCalls {
 			if call.Type != "" && call.Type != policyResponsesToolKindFunction {
@@ -154,6 +162,9 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 			descriptor, known := tools[chatName]
 			if !known {
 				return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned undeclared function tool %q", chatName)
+			}
+			if !json.Valid([]byte(call.Function.Arguments)) {
+				return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned invalid JSON arguments for function tool %q", chatName)
 			}
 			name := strings.TrimSpace(descriptor.Name)
 			namespace := strings.TrimSpace(descriptor.Namespace)

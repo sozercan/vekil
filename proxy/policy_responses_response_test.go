@@ -269,6 +269,57 @@ func TestPolicyResponsesTextOutputCanBeReplayedAsStatelessInput(t *testing.T) {
 	}
 }
 
+func TestPolicyResponsesRejectsMalformedTerminalChoice(t *testing.T) {
+	finishStop := "stop"
+	for _, role := range []string{"", "user", "tool", "system", "Assistant"} {
+		t.Run("role "+role, func(t *testing.T) {
+			_, err := buildPolicyResponsesResponse(&models.OpenAIResponse{Choices: []models.OpenAIChoice{{
+				Index: 0, Message: models.OpenAIMessage{Role: role, Content: json.RawMessage(`"ok"`)}, FinishReason: &finishStop,
+			}}}, "policy", nil)
+			if err == nil || !strings.Contains(err.Error(), "non-assistant role") {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+
+	finishCalls := "tool_calls"
+	_, err := buildPolicyResponsesResponse(&models.OpenAIResponse{Choices: []models.OpenAIChoice{{
+		Index: 0,
+		Message: models.OpenAIMessage{
+			Role:    "assistant",
+			Refusal: json.RawMessage(`"cannot comply"`),
+			ToolCalls: []models.OpenAIToolCall{{
+				ID: "call-lookup", Type: "function", Function: models.OpenAIFunctionCall{Name: "lookup", Arguments: `{}`},
+			}},
+		},
+		FinishReason: &finishCalls,
+	}}}, "policy", policyResponsesToolMap{"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction}})
+	if err == nil || !strings.Contains(err.Error(), "refusal with executable function calls") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestPolicyResponsesIncompleteAllowsRefusalWithSuppressedPartialCall(t *testing.T) {
+	finishReason := "length"
+	response, err := buildPolicyResponsesResponse(&models.OpenAIResponse{Choices: []models.OpenAIChoice{{
+		Index: 0,
+		Message: models.OpenAIMessage{
+			Role:    "assistant",
+			Refusal: json.RawMessage(`"cannot finish"`),
+			ToolCalls: []models.OpenAIToolCall{{
+				ID: "call-partial", Type: "function", Function: models.OpenAIFunctionCall{Name: "lookup", Arguments: `{"unterminated":`},
+			}},
+		},
+		FinishReason: &finishReason,
+	}}}, "policy", policyResponsesToolMap{"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != "incomplete" || len(response.Output) != 1 || response.Output[0]["type"] != "message" {
+		t.Fatalf("response = %+v, want incomplete refusal without executable call", response)
+	}
+}
+
 func TestPolicyResponsesRejectsMalformedTerminalFinishReason(t *testing.T) {
 	call := models.OpenAIToolCall{
 		ID:   "call-lookup",
@@ -489,6 +540,18 @@ func TestPolicyResponsesRejectsTerminalCallsOutsideRequestCapability(t *testing.
 			t.Fatalf("output = %+v, want two function calls", response.Output)
 		}
 	})
+	for _, arguments := range []string{"", "{not-json"} {
+		t.Run("invalid arguments "+arguments, func(t *testing.T) {
+			invalid := call("call-invalid-arguments", "lookup")
+			invalid.Function.Arguments = arguments
+			_, err := buildPolicyResponsesResponse(completion(invalid), "policy", policyResponsesToolMap{
+				"lookup": {Name: "lookup", Kind: policyResponsesToolKindFunction},
+			})
+			if err == nil || !strings.Contains(err.Error(), "invalid JSON arguments") {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
 	for _, callType := range []string{"custom", "Function", " ", " function "} {
 		t.Run("unsupported tool call type "+callType, func(t *testing.T) {
 			invalid := call("call-invalid", "lookup")
