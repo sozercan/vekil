@@ -464,7 +464,7 @@ func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
 	}
 }
 
-func TestClaudeAdapterAllowsManualPermissionMode(t *testing.T) {
+func TestClaudeAdapterAllowsDefaultPermissionModes(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable(): %v", err)
@@ -472,6 +472,8 @@ func TestClaudeAdapterAllowsManualPermissionMode(t *testing.T) {
 	for _, args := range [][]string{
 		{"--permission-mode", "manual", "--print", "hello"},
 		{"--permission-mode=manual", "--print", "hello"},
+		{"--permission-mode", "default", "--print", "hello"},
+		{"--permission-mode=default", "--print", "hello"},
 	} {
 		prepared, err := (ClaudeAdapter{}).Prepare(PrepareInput{
 			BaseURL:       "http://127.0.0.1:43210",

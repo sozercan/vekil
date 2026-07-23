@@ -242,11 +242,11 @@ func validateClaudePermissionArgs(args []string) error {
 				return nil
 			}
 			index++
-			if mode := strings.TrimSpace(args[index]); mode != "manual" {
+			if mode := strings.TrimSpace(args[index]); mode != "manual" && mode != "default" {
 				return unsupportedClaudePermissionMode(mode)
 			}
 		case strings.HasPrefix(arg, "--permission-mode="):
-			if mode := strings.TrimSpace(strings.TrimPrefix(arg, "--permission-mode=")); mode != "manual" {
+			if mode := strings.TrimSpace(strings.TrimPrefix(arg, "--permission-mode=")); mode != "manual" && mode != "default" {
 				return unsupportedClaudePermissionMode(mode)
 			}
 		}
@@ -256,7 +256,7 @@ func validateClaudePermissionArgs(args []string) error {
 
 func unsupportedClaudePermissionMode(mode string) error {
 	return fmt.Errorf(
-		"claude permission mode %q is not supported by the managed Vekil launcher while subprocess credential scrubbing is enabled; use manual mode with explicit --allowed-tools/--disallowed-tools rules",
+		"claude permission mode %q is not supported by the managed Vekil launcher while subprocess credential scrubbing is enabled; use default/manual mode with explicit --allowed-tools/--disallowed-tools rules",
 		mode,
 	)
 }
