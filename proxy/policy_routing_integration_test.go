@@ -345,6 +345,95 @@ func TestPolicyRoutingGlobalOffUsesBaselineWithoutClassifier(t *testing.T) {
 	}
 }
 
+func TestPolicyRoutingValidatesResponsesBackedSubsetBeforeClassifier(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{
+		TurnType:  policyTurnTypePlanning,
+		CodeScope: policyCodeScopeMultiFile,
+		RiskLevel: policyRiskLevelHigh,
+	})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)
+	cfg.ModelRoutes[1].Endpoints = []string{providerEndpointResponses}
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+		WithProvidersConfig(cfg),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	lightBefore, _ := light.snapshot()
+	powerfulBefore, _ := powerful.snapshot()
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "small output", body: `{"model":"coding-economy","messages":[{"role":"user","content":"plan"}],"max_tokens":15}`},
+		{name: "multiple choices", body: `{"model":"coding-economy","messages":[{"role":"user","content":"plan"}],"n":2}`},
+		{name: "stop sequence", body: `{"model":"coding-economy","messages":[{"role":"user","content":"plan"}],"stop":"END"}`},
+		{name: "unsupported field", body: `{"model":"coding-economy","messages":[{"role":"user","content":"plan"}],"logprobs":true}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := h.planOpenAIChatPolicy(t.Context(), "coding-economy", []byte(tc.body)); err == nil {
+				t.Fatal("expected shared Responses-backed contract rejection")
+			}
+			lightAfter, _ := light.snapshot()
+			powerfulAfter, _ := powerful.snapshot()
+			if lightAfter != lightBefore || powerfulAfter != powerfulBefore {
+				t.Fatalf("invalid request dispatched classifier/terminal traffic: light %d->%d powerful %d->%d", lightBefore, lightAfter, powerfulBefore, powerfulAfter)
+			}
+		})
+	}
+}
+
+func TestResponsesClassifierMalformedAcceptedOutputIsUncertain(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"resp-malformed","status":"completed","output":[{"type":"unsupported"}]}`)
+	}))
+	t.Cleanup(upstream.Close)
+	trueValue := true
+	provider := &providerRuntime{
+		id:                         "classifier-provider",
+		kind:                       providerTypeOpenAICompatible,
+		baseURL:                    upstream.URL,
+		paths:                      providerEndpointPolicyFor(providerTypeOpenAICompatible).defaultEndpointPaths(),
+		authType:                   providerAuthTypeNone,
+		classifierNoStoreSupported: &trueValue,
+	}
+	route := &modelRoute{
+		public: publicModelContract{
+			id:        "classifier-route",
+			routeID:   "classifier-route",
+			endpoints: []string{providerEndpointResponses},
+		},
+		targets: []targetBinding{{id: "classifier", provider: provider, upstreamModel: "classifier-model"}},
+		policy:  routePolicy{mode: routeModePrimaryOnly, maxTargetAttempts: 1, maxUpstreamSends: 1},
+	}
+	h := &ProxyHandler{}
+	classifier, err := newRoutePolicyClassifier(h, route, PolicyProfileConfig{
+		PublicID: "policy",
+		Classifier: PolicyClassifierConfig{
+			MaxCompletionTokens: 64,
+			MaxRequestBytes:     4096,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, classifyErr := classifier.Classify(t.Context(), policyPreflightFacts())
+	result := newPolicyClassifierResult(policyClassifierSignals{}, classifyErr)
+	if result.Category != policyClassifierResultUncertain ||
+		(result.Failure.Category != policyClassifierFailureMissingToolCall && result.Failure.Category != policyClassifierFailureInvalidOutput) ||
+		!result.Failure.HTTPAccepted {
+		t.Fatalf("malformed accepted classifier result = %+v, error=%v", result, classifyErr)
+	}
+}
+
 func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
 	streamFixture := readResponsesChatStreamFixture(t, "stream_text.sse")
 	var mu sync.Mutex

@@ -409,6 +409,12 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 			}
 		}
 	}
+	if err := c.validateResponsesBackedPolicyRequest(profile, input.OriginalBody); err != nil {
+		return chatOperationPlan{}, &providerRequestError{
+			statusCode: http.StatusBadRequest,
+			err:        fmt.Errorf("policy model %q request is outside its shared terminal contract: %w", entry.id, err),
+		}
+	}
 	facts, err := buildPolicyClassifierFacts(input.OriginalBody, policyFactOptions{
 		RecentTurns:     profile.config.Classifier.RecentTurns,
 		MaxRequestBytes: profile.config.Classifier.MaxRequestBytes,
@@ -432,6 +438,30 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 		return c.sealPlan(profile, input, facts, profile.baselineTier, policyDecisionRecord{Category: "observe_baseline", ActualTier: profile.baselineTier}), nil
 	}
 	return c.enforce(ctx, profile, input, facts, bucket)
+}
+
+func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profile *compiledPolicyProfile, body []byte) error {
+	if c == nil || c.h == nil || profile == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, 2)
+	for _, route := range []*modelRoute{profile.lightweight, profile.powerful} {
+		if route == nil {
+			continue
+		}
+		routeID := strings.TrimSpace(route.public.routeID)
+		if _, duplicate := seen[routeID]; duplicate {
+			continue
+		}
+		seen[routeID] = struct{}{}
+		if explicitRouteHasChatBackend(route, providerEndpointChatCompletions) || !explicitRouteHasChatBackend(route, providerEndpointResponses) {
+			continue
+		}
+		if _, _, err := c.h.prepareExplicitResponsesChatRequest(nil, route, body, chatExecutionOptions{}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validatePolicyPublicRequestContract(body []byte, contract publicModelContract) error {
@@ -857,7 +887,15 @@ func (h *ProxyHandler) sendPolicyClassifierOverResponses(ctx context.Context, ro
 		ReplayToolDefaults: plan.ReplayToolDefaults,
 	})
 	if err != nil {
-		return policyClassifierHTTPResponse{}, err
+		// The provider accepted and completed the HTTP request, but its terminal
+		// payload could not be represented as canonical Chat. Return an accepted
+		// malformed classifier envelope so policyHTTPClassifier classifies this as
+		// uncertain invalid output rather than as an infrastructure outage.
+		return policyClassifierHTTPResponse{
+			StatusCode: http.StatusOK,
+			Header:     convertedChatSafeHeaders(resp.Header),
+			Body:       []byte(`{"choices":[]}`),
+		}, nil
 	}
 	return policyClassifierHTTPResponse{StatusCode: http.StatusOK, Header: convertedChatSafeHeaders(resp.Header), Body: converted.Body}, nil
 }

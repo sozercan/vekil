@@ -93,7 +93,6 @@ func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	result, chatBody, mode = h.retryRoutedChatExecutionWithoutInjectedStreamOptions(upstreamCtx, result, chatBody, mode, translated.PublicModel)
-	observeUpstreamHeaders(r.Context(), result.Headers)
 
 	completion, err := h.collectPolicyResponsesChatCompletion(upstreamCtx, &result, chatBody, mode)
 	if err != nil {
@@ -104,6 +103,7 @@ func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Requ
 		writePolicyResponsesExecutionError(w, err, publicModel)
 		return
 	}
+	observeUpstreamHeaders(r.Context(), result.Headers)
 	completion.Model = publicModel
 	observeOpenAIUsage(r.Context(), completion.Usage)
 	h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), completion, h.toolContexts, toolScope, false)
