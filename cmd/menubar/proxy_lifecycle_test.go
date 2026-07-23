@@ -8,13 +8,14 @@ import (
 )
 
 type fakeMenubarProxyServer struct {
-	mu      sync.Mutex
-	running bool
+	mu          sync.Mutex
+	running     bool
+	usesCopilot bool
 }
 
 func (s *fakeMenubarProxyServer) Start() error { return nil }
 
-func (s *fakeMenubarProxyServer) UsesCopilot() bool { return false }
+func (s *fakeMenubarProxyServer) UsesCopilot() bool { return s.usesCopilot }
 
 func (s *fakeMenubarProxyServer) ValidateDynamicProviderModels(context.Context) error { return nil }
 
@@ -59,6 +60,25 @@ func TestMenubarProxyLifecycleCancelStartup(t *testing.T) {
 	}
 	if lifecycle.isRunning() {
 		t.Fatal("canceled startup published a running server")
+	}
+}
+
+func TestMenubarProxyLifecycleUsesPublishedServerScope(t *testing.T) {
+	var lifecycle menubarProxyLifecycle
+	_, generation, ok := lifecycle.beginStartup(t.Context())
+	if !ok {
+		t.Fatal("beginStartup() = false, want true")
+	}
+	server := &fakeMenubarProxyServer{running: true, usesCopilot: true}
+	if got, restart := lifecycle.finishStartup(generation, server); got != proxyStartupCurrent || restart {
+		t.Fatalf("finishStartup() = (%v, %v), want (current, false)", got, restart)
+	}
+	if !lifecycle.usesCopilot() {
+		t.Fatal("usesCopilot() = false, want published server scope")
+	}
+	server.usesCopilot = false
+	if lifecycle.usesCopilot() {
+		t.Fatal("usesCopilot() = true after runtime scope changed")
 	}
 }
 

@@ -117,6 +117,12 @@ func (l *menubarProxyLifecycle) isRunning() bool {
 	return l.server != nil && l.server.IsRunning()
 }
 
+func (l *menubarProxyLifecycle) usesCopilot() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.server != nil && l.server.UsesCopilot()
+}
+
 func (l *menubarProxyLifecycle) detachServer() menubarProxyServer {
 	l.mu.Lock()
 	defer l.mu.Unlock()

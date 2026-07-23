@@ -555,9 +555,9 @@ func signOut() {
 
 	if providersRequireGitHubAuth(providersCfg, providersConfigErr) {
 		_ = cancelProxyStartup()
-		if proxyLifecycle.isRunning() {
-			stopProxy()
-		}
+	}
+	if proxyLifecycle.usesCopilot() && proxyLifecycle.isRunning() {
+		stopProxy()
 	}
 
 	if err := authenticator.SignOut(); err != nil {
@@ -669,22 +669,8 @@ func refreshSessionUI() {
 			systray.SetIcon(iconOff)
 			systray.SetTooltip("Vekil - Stopped")
 		}
-	case !providersRequireGitHubAuth(providersCfg, providersConfigErr):
-		mToggle.Enable()
-		if !running {
-			mToggle.SetTitle("Start Vekil")
-			systray.SetIcon(iconOff)
-			systray.SetTooltip("Vekil - Stopped")
-		}
-	case status.SignedIn:
-		mToggle.Enable()
-		if !running {
-			mToggle.SetTitle("Start Vekil")
-			systray.SetIcon(iconOff)
-			systray.SetTooltip("Vekil - Stopped")
-		}
 	default:
-		mToggle.Disable()
+		mToggle.Enable()
 		if !running {
 			mToggle.SetTitle("Start Vekil")
 			systray.SetIcon(iconOff)
