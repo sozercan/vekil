@@ -1818,12 +1818,39 @@ func (h *ProxyHandler) policyEntryRequiredRoutesForSetup(entry *publicModelEntry
 		}
 	}
 
-	for _, profile := range h.providersConfig.PolicyProfiles {
-		if strings.TrimSpace(profile.ID) != entry.policyID {
+	for profileIndex, configured := range h.providersConfig.PolicyProfiles {
+		if strings.TrimSpace(configured.ID) != entry.policyID {
 			continue
 		}
-		routes := make([]*modelRoute, 0, 3)
-		for _, routeID := range []string{profile.LightweightRoute, profile.PowerfulRoute, profile.Classifier.Route} {
+		profile := clonePolicyProfileConfig(configured)
+		if err := normalizeAndValidatePolicyProfileConfig(&profile, fmt.Sprintf("policy_profiles[%d]", profileIndex)); err != nil {
+			return nil
+		}
+		profileMode, err := parsePolicyMode(profile.Mode)
+		if err != nil {
+			return nil
+		}
+		effectiveMode := effectivePolicyMode(h.policyRoutingMode.internal(), profileMode)
+		routeIDs := make([]string, 0, 3)
+		switch effectiveMode {
+		case policyModeOff:
+			if profile.BaselineTier == policyConfigTierPowerful {
+				routeIDs = append(routeIDs, profile.PowerfulRoute)
+			} else {
+				routeIDs = append(routeIDs, profile.LightweightRoute)
+			}
+		case policyModeObserve:
+			if profile.BaselineTier == policyConfigTierPowerful {
+				routeIDs = append(routeIDs, profile.PowerfulRoute)
+			} else {
+				routeIDs = append(routeIDs, profile.LightweightRoute)
+			}
+			routeIDs = append(routeIDs, profile.Classifier.Route)
+		case policyModeEnforce:
+			routeIDs = append(routeIDs, profile.LightweightRoute, profile.PowerfulRoute, profile.Classifier.Route)
+		}
+		routes := make([]*modelRoute, 0, len(routeIDs))
+		for _, routeID := range routeIDs {
 			if route, ok := setup.lookupTerminalRoute(strings.TrimSpace(routeID)); ok && route != nil {
 				routes = append(routes, route)
 			}
@@ -2670,7 +2697,14 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 		disabled := strings.EqualFold(parsed.Policy.State, "disabled")
 		if index, duplicate := indexByID[publicID]; duplicate {
 			merged := models[index]
-			merged.supportedEndpoints = mergeDynamicProviderEndpoints(merged.supportedEndpoints, supportedEndpoints)
+			switch {
+			case merged.endpointsAdvertised && !endpointsAdvertised:
+				// Keep the explicitly advertised endpoint set.
+			case !merged.endpointsAdvertised && endpointsAdvertised:
+				merged.supportedEndpoints = append([]string(nil), supportedEndpoints...)
+			default:
+				merged.supportedEndpoints = mergeDynamicProviderEndpoints(merged.supportedEndpoints, supportedEndpoints)
+			}
 			merged.endpointsAdvertised = merged.endpointsAdvertised || endpointsAdvertised
 			merged.disabled = merged.disabled && disabled
 			baseRaw := merged.raw

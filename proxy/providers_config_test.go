@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"os"
@@ -2032,6 +2033,37 @@ func TestPolicyCopilotProviderScopeFollowsEffectiveMode(t *testing.T) {
 			}
 			if got := h.providerWithinAllowedModelScope(copilot); got != tc.want {
 				t.Fatalf("providerWithinAllowedModelScope() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDecodeProviderModelsDuplicatePreservesAdvertisedEndpoints(t *testing.T) {
+	provider := &providerRuntime{
+		id:    "copilot",
+		kind:  providerTypeCopilot,
+		paths: providerEndpointPolicyFor(providerTypeCopilot).defaultEndpointPaths(),
+	}
+	advertised := json.RawMessage(`{"id":"model","supported_endpoints":["/responses"]}`)
+	omitted := json.RawMessage(`{"id":"model"}`)
+	for _, tc := range []struct {
+		name string
+		data []json.RawMessage
+	}{
+		{name: "advertised first", data: []json.RawMessage{advertised, omitted}},
+		{name: "advertised last", data: []json.RawMessage{omitted, advertised}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(map[string]any{"data": tc.data})
+			if err != nil {
+				t.Fatal(err)
+			}
+			models, err := decodeProviderModelsFromBody(provider, body)
+			if err != nil {
+				t.Fatalf("decodeProviderModelsFromBody() error = %v", err)
+			}
+			if len(models) != 1 || !models[0].endpointsAdvertised || !reflect.DeepEqual(models[0].supportedEndpoints, []string{providerEndpointResponses}) {
+				t.Fatalf("decoded models = %+v", models)
 			}
 		})
 	}
