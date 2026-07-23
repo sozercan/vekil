@@ -466,13 +466,24 @@ func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
 	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(
 		http.MethodPost,
 		"/v1/chat/completions",
-		strings.NewReader(`{"model":"coding-economy","messages":[{"role":"user","content":"plan a risky multi-file change"}]}`),
+		strings.NewReader(`{"model":"coding-economy","messages":[{"role":"user","content":"plan a risky multi-file change"}],"stream":true}`),
 	))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
 	}
-	if !strings.Contains(recorder.Body.String(), "COPILOT_POLICY_OK") {
+	if !strings.Contains(recorder.Body.String(), "Synthetic fixture") {
 		t.Fatalf("response body = %s", recorder.Body.String())
+	}
+	for _, name := range []string{"X-Request-ID", "X-Azure-Request-ID", "OpenAI-Request-ID"} {
+		if value := recorder.Header().Get(name); value != "" {
+			t.Fatalf("policy Chat stream leaked %s=%q", name, value)
+		}
+	}
+	if got := recorder.Header().Get("RateLimit-Remaining"); got != "7" {
+		t.Fatalf("policy Chat RateLimit-Remaining = %q, want 7", got)
+	}
+	if got := recorder.Header().Get("Openai-Model"); got != "coding-economy" {
+		t.Fatalf("policy Chat Openai-Model = %q, want policy public id", got)
 	}
 	if stats := h.responsesChatReplayStore().Stats(); stats.Groups != 0 || stats.Calls != 0 || stats.TotalBytes != 0 {
 		t.Fatalf("classifier request polluted client replay state: %+v", stats)

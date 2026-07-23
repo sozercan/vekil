@@ -2880,6 +2880,13 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	result, bodyBytes, mode = h.retryRoutedChatExecutionWithoutInjectedStreamOptions(upstreamCtx, result, bodyBytes, mode, requestedModel)
 	observeChatExecutionRoute(r.Context(), result)
 	observeUpstreamHeaders(r.Context(), result.Headers)
+	if policyPlan.valid() && result.Backend == chatBackendResponses && len(result.Headers) > 0 {
+		// routeChatExecutionResult merges Responses-backed headers before its
+		// protocol-specific callbacks run. Replace them with the policy allowlist
+		// first so request/provider identifiers cannot escape through Chat JSON or
+		// the canonical streamEvents path.
+		result.Headers = policyChatSafeHeaders(result.Headers, responseModel)
+	}
 
 	result, err = h.aggregateExplicitRoutedChatExecution(upstreamCtx, result, bodyBytes, mode)
 	if err != nil {
