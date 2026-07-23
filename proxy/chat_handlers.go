@@ -316,9 +316,9 @@ func inspectPolicyOpenAIStreamChunk(eventType, data string) (*policyOpenAIStream
 
 func terminatePolicySSEEvent(event []byte) []byte {
 	trimmed := bytes.TrimRight(event, "\r\n")
-	terminated := make([]byte, 0, len(trimmed)+2)
-	terminated = append(terminated, trimmed...)
-	return append(terminated, '\n', '\n')
+	terminated := bytes.Clone(trimmed)
+	terminated = append(terminated, '\n')
+	return append(terminated, '\n')
 }
 
 func hasCaseFoldedJSONFieldAlias(object map[string]json.RawMessage, canonical ...string) bool {

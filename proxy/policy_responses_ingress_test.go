@@ -19,6 +19,7 @@ func TestPolicyResponsesIngressStreamsTextThroughBaselineChatRoute(t *testing.T)
 	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
 	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
 		WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)),
+		WithAllowedModels("coding-economy"),
 		WithPolicyRoutingMode(PolicyRoutingModeOff),
 	)
 	if err != nil {
