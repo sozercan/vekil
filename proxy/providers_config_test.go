@@ -443,6 +443,166 @@ func TestLoadProvidersConfigFileYAML(t *testing.T) {
 	}
 }
 
+func TestLoadProvidersConfigFileOpenAICodexAccounts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		ext  string
+		body string
+	}{
+		{
+			name: "JSON",
+			ext:  ".json",
+			body: `{
+  "schema_version": 2,
+  "providers": [{
+    "id": "codex",
+    "type": "openai-codex",
+    "default": true,
+    "codex_accounts": {
+      "strategy": "round_robin",
+      "max_account_attempts": 2,
+      "session_affinity": false,
+      "session_affinity_ttl": "45m",
+      "accounts": [
+        {"id":"personal","auth_file":"~/.codex-personal/auth.json"},
+        {"id":"work","auth_file":"~/.codex-work/auth.json"}
+      ]
+    }
+  }]
+}`,
+		},
+		{
+			name: "YAML",
+			ext:  ".yaml",
+			body: `schema_version: 2
+providers:
+  - id: codex
+    type: openai-codex
+    default: true
+    codex_accounts:
+      strategy: fill_first
+      max_account_attempts: 2
+      session_affinity: false
+      session_affinity_ttl: 45m
+      accounts:
+        - id: personal
+          auth_file: ~/.codex-personal/auth.json
+        - id: work
+          auth_file: ~/.codex-work/auth.json
+`,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "providers"+tc.ext)
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+			cfg, err := LoadProvidersConfigFile(path)
+			if err != nil {
+				t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+			}
+			if got := cfg.EffectiveSchemaVersion(); got != ProvidersConfigSchemaVersion2 {
+				t.Fatalf("EffectiveSchemaVersion() = %d, want 2", got)
+			}
+			if len(cfg.Providers) != 1 || cfg.Providers[0].CodexAccounts == nil {
+				t.Fatalf("providers = %+v, want one Codex provider with an account pool", cfg.Providers)
+			}
+			pool := cfg.Providers[0].CodexAccounts
+			wantStrategy := openAICodexAccountStrategyRoundRobin
+			if tc.name == "YAML" {
+				wantStrategy = openAICodexAccountStrategyFillFirst
+			}
+			if pool.Strategy != wantStrategy {
+				t.Fatalf("strategy = %q, want %q", pool.Strategy, wantStrategy)
+			}
+			if pool.MaxAccountAttempts != 2 {
+				t.Fatalf("max_account_attempts = %d, want 2", pool.MaxAccountAttempts)
+			}
+			if pool.SessionAffinity == nil || *pool.SessionAffinity {
+				t.Fatalf("session_affinity = %v, want false", pool.SessionAffinity)
+			}
+			if pool.SessionAffinityTTL != "45m" {
+				t.Fatalf("session_affinity_ttl = %q, want 45m", pool.SessionAffinityTTL)
+			}
+			wantAccounts := []OpenAICodexAccountConfig{
+				{ID: "personal", AuthFile: "~/.codex-personal/auth.json"},
+				{ID: "work", AuthFile: "~/.codex-work/auth.json"},
+			}
+			if !reflect.DeepEqual(pool.Accounts, wantAccounts) {
+				t.Fatalf("accounts = %#v, want %#v", pool.Accounts, wantAccounts)
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileOpenAICodexAccountDefaults(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	body := `schema_version: 2
+providers:
+  - id: codex
+    type: openai-codex
+    codex_accounts:
+      strategy: round_robin
+      accounts:
+        - id: personal
+          auth_file: ~/.codex-personal/auth.json
+        - id: work
+          auth_file: ~/.codex-work/auth.json
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	cfg, err := LoadProvidersConfigFile(path)
+	if err != nil {
+		t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+	}
+	pool := cfg.Providers[0].CodexAccounts
+	if pool == nil {
+		t.Fatal("CodexAccounts = nil")
+	}
+	if pool.MaxAccountAttempts != 0 {
+		t.Fatalf("max_account_attempts = %d, want 0", pool.MaxAccountAttempts)
+	}
+	if pool.SessionAffinity == nil || !*pool.SessionAffinity {
+		t.Fatalf("session_affinity = %v, want default true for a multi-account pool", pool.SessionAffinity)
+	}
+	if pool.SessionAffinityTTL != defaultOpenAICodexAffinityTTL {
+		t.Fatalf("session_affinity_ttl = %q, want %q", pool.SessionAffinityTTL, defaultOpenAICodexAffinityTTL)
+	}
+}
+
+func TestLoadProvidersConfigFileWithoutOpenAICodexAccountsRemainsCompatible(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	body := `providers:
+  - id: codex
+    type: openai-codex
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	cfg, err := LoadProvidersConfigFile(path)
+	if err != nil {
+		t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+	}
+	if cfg.EffectiveSchemaVersion() != ProvidersConfigSchemaVersion1 {
+		t.Fatalf("EffectiveSchemaVersion() = %d, want 1", cfg.EffectiveSchemaVersion())
+	}
+	if len(cfg.Providers) != 1 || cfg.Providers[0].CodexAccounts != nil {
+		t.Fatalf("providers = %+v, want legacy Codex config without account pool", cfg.Providers)
+	}
+}
+
 func TestLoadProvidersConfigFileCopilotHeaderProfiles(t *testing.T) {
 	t.Parallel()
 
@@ -818,6 +978,18 @@ func TestLoadProvidersConfigFileRejectsUnknownFieldsAndExtraDocuments(t *testing
 			ext:  ".yaml",
 			body: "providers:" + validProviderYAML + "\n    timeout_ms: 1000\n",
 			want: "timeout_ms",
+		},
+		{
+			name: "JSON unknown Codex accounts field",
+			ext:  ".json",
+			body: `{"schema_version":2,"providers":[{"id":"codex","type":"openai-codex","codex_accounts":{"strategy":"round_robin","accounts":[{"id":"personal","auth_file":"/tmp/auth.json"}],"weight":1}}]}`,
+			want: "providers[0].codex_accounts.weight",
+		},
+		{
+			name: "YAML unknown Codex account field",
+			ext:  ".yaml",
+			body: "schema_version: 2\nproviders:\n  - id: codex\n    type: openai-codex\n    codex_accounts:\n      strategy: round_robin\n      accounts:\n        - id: personal\n          auth_file: /tmp/auth.json\n          email: person@example.com\n",
+			want: "providers[0].codex_accounts.accounts[0].email",
 		},
 		{
 			name: "JSON model endpoint typo",
@@ -1941,4 +2113,26 @@ func TestModelUsesCopilotHonorsProviderFiltersDuringDeferredDiscovery(t *testing
 			t.Fatal("unrelated provider remained in launcher readiness scope")
 		}
 	})
+}
+
+func TestLoadProvidersConfigRejectsNullCodexAccounts(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ext  string
+		body string
+	}{
+		{name: "json", ext: ".json", body: `{"schema_version":2,"providers":[{"id":"codex","type":"openai-codex","default":true,"codex_accounts":null}]}`},
+		{name: "yaml", ext: ".yaml", body: "schema_version: 2\nproviders:\n  - id: codex\n    type: openai-codex\n    default: true\n    codex_accounts: null\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "providers"+tc.ext)
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadProvidersConfigFile(path)
+			if err == nil || !strings.Contains(err.Error(), "codex_accounts: must be an object") {
+				t.Fatalf("LoadProvidersConfigFile() error = %v, want null-object rejection", err)
+			}
+		})
+	}
 }

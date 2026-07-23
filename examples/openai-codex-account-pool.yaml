@@ -1,0 +1,23 @@
+schema_version: 2
+
+providers:
+  - id: codex
+    type: openai-codex
+    default: true
+    include_models:
+      - gpt-5.5
+      - gpt-5.4
+
+    # Create each auth file independently, for example:
+    #   CODEX_HOME="$HOME/.codex-personal" codex login
+    #   CODEX_HOME="$HOME/.codex-work" codex login
+    codex_accounts:
+      strategy: round_robin # round_robin | fill_first
+      max_account_attempts: 0 # 0 = every eligible account once
+      session_affinity: true
+      session_affinity_ttl: 1h
+      accounts:
+        - id: personal
+          auth_file: ~/.codex-personal/auth.json
+        - id: work
+          auth_file: ~/.codex-work/auth.json

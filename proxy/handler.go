@@ -1306,6 +1306,12 @@ func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ProxyHandler) checkProviderReady(ctx context.Context, provider *providerRuntime) error {
+	if provider != nil && provider.kind == providerTypeOpenAICodex && provider.codexPool != nil && provider.codexPool.configured {
+		if _, err := provider.codexPool.fetchModels(ctx, h, provider, "", ""); err != nil {
+			return fmt.Errorf("provider %q has no usable OpenAI Codex account: %w", provider.id, err)
+		}
+		return nil
+	}
 	if providerSkipsReadyzProbe(provider) {
 		return nil
 	}

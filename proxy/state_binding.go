@@ -38,12 +38,15 @@ const (
 	stateBindingTypeEncryptedContent stateBindingType = "encrypted_content"
 )
 
-type stateBindingOwner struct {
-	routeID  string
-	targetID string
+type executionOwner struct {
+	routeID      string
+	targetID     string
+	credentialID string
 }
 
-func (o stateBindingOwner) valid() bool {
+type stateBindingOwner = executionOwner
+
+func (o executionOwner) valid() bool {
 	return o.routeID != "" && o.targetID != ""
 }
 

@@ -15,10 +15,15 @@ import (
 )
 
 type explicitRouteResponseInfo struct {
-	routeID    string
-	publicID   string
-	targetID   string
-	providerID string
+	routeID      string
+	publicID     string
+	targetID     string
+	providerID   string
+	credentialID string
+}
+
+func (i explicitRouteResponseInfo) owner() executionOwner {
+	return executionOwner{routeID: i.routeID, targetID: i.targetID, credentialID: i.credentialID}
 }
 
 type explicitRouteResponseContextKey struct{}

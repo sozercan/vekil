@@ -2,12 +2,15 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 )
 
 const stateBindingTypeConversationID stateBindingType = "conversation_id"
+
+var errConversationCredentialRebind = errors.New("conversation credential owner changed before dispatch")
 
 func (h *ProxyHandler) ensureStateBindingStore() (*stateBindingStore, error) {
 	if h == nil {
@@ -20,7 +23,7 @@ func (h *ProxyHandler) ensureStateBindingStore() (*stateBindingStore, error) {
 }
 
 func (h *ProxyHandler) applyExplicitRequestStateBinding(operation *routeOperation, body []byte, headers http.Header) error {
-	if operation == nil || operation.route == nil || operation.route.legacy {
+	if operation == nil || operation.route == nil || !operation.route.usesManagedExecution() {
 		return nil
 	}
 	tokens, err := extractExplicitResponsesRequestState(body, headers)
@@ -38,17 +41,30 @@ func (h *ProxyHandler) applyExplicitRequestStateBinding(operation *routeOperatio
 	bootstrapped := false
 	var evictions uint64
 	if len(tokens) == 1 && tokens[0].stateType == stateBindingTypeConversationID {
-		bootstrapOwner := stateBindingOwner{}
-		if target, ok := explicitConversationBootstrapTarget(operation.route); ok {
-			if pinned := operation.pinnedTarget(); pinned == "" || pinned == target.id {
-				bootstrapOwner = stateBindingOwner{routeID: operation.route.public.routeID, targetID: target.id}
-			}
+		pooledCodex := false
+		if target, ok := operation.route.primaryTarget(); ok && target.provider != nil && target.provider.codexPool != nil && target.provider.codexPool.configured {
+			pooledCodex = true
 		}
-		result, bootstrapped, evictions = store.resolveOrBindConversationForRoute(
-			operation.route.public.routeID,
-			tokens[0],
-			bootstrapOwner,
-		)
+		if pooledCodex && operation.pinnedCredential() == "" {
+			result = store.resolveForRoute(operation.route.public.routeID, tokens)
+			if result.outcome == stateBindingLookupUnknown {
+				operation.setPendingConversationToken(tokens[0])
+				h.RecordStateBindingMiss()
+				return nil
+			}
+		} else {
+			bootstrapOwner := stateBindingOwner{}
+			if target, ok := explicitConversationBootstrapTarget(operation.route); ok {
+				if pinned := operation.pinnedTarget(); pinned == "" || pinned == target.id {
+					bootstrapOwner = stateBindingOwner{routeID: operation.route.public.routeID, targetID: target.id, credentialID: operation.pinnedCredential()}
+				}
+			}
+			result, bootstrapped, evictions = store.resolveOrBindConversationForRoute(
+				operation.route.public.routeID,
+				tokens[0],
+				bootstrapOwner,
+			)
+		}
 	} else {
 		result = store.resolveForRoute(operation.route.public.routeID, tokens)
 	}
@@ -62,7 +78,7 @@ func (h *ProxyHandler) applyExplicitRequestStateBinding(operation *routeOperatio
 			h.RecordStateBindingMiss()
 			return &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("provider state is bound to an unavailable route target")}
 		}
-		if err := operation.forcePinnedTarget(result.owner.targetID); err != nil {
+		if err := operation.forcePinnedOwner(result.owner); err != nil {
 			return &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 		}
 		if bootstrapped {
@@ -78,6 +94,39 @@ func (h *ProxyHandler) applyExplicitRequestStateBinding(operation *routeOperatio
 		h.RecordStateBindingMiss()
 		return &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("conflicting provider-bound state for explicit model route")}
 	}
+}
+
+func (h *ProxyHandler) bindPendingConversationForLease(operation *routeOperation, target targetBinding, credentialID string) error {
+	if operation == nil || credentialID == "" {
+		return nil
+	}
+	token, ok := operation.pendingConversation()
+	if !ok {
+		return nil
+	}
+	store, err := h.ensureStateBindingStore()
+	if err != nil {
+		return err
+	}
+	owner := stateBindingOwner{routeID: operation.route.public.routeID, targetID: target.id, credentialID: credentialID}
+	result, _, evictions := store.resolveOrBindConversationForRoute(operation.route.public.routeID, token, owner)
+	for count := uint64(0); count < evictions; count++ {
+		h.RecordStateBindingEviction()
+	}
+	if result.outcome != stateBindingLookupKnown {
+		return &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("conversation is bound to a conflicting provider credential")}
+	}
+	operation.clearPendingConversation()
+	if result.owner != owner {
+		if err := operation.forcePinnedOwner(result.owner); err != nil {
+			return &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+		}
+		return errConversationCredentialRebind
+	}
+	if err := operation.forcePinnedOwner(owner); err != nil {
+		return &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+	}
+	return nil
 }
 
 // resolveOrBindConversationForRoute atomically resolves an existing conversation
@@ -394,7 +443,7 @@ func (h *ProxyHandler) bindExplicitStateTokens(info explicitRouteResponseInfo, t
 	if err != nil {
 		return err
 	}
-	owner := stateBindingOwner{routeID: info.routeID, targetID: info.targetID}
+	owner := info.owner()
 	result, evictions := store.bindAllWithEvictionDelta(tokens, owner)
 	if result.outcome == stateBindingLookupConflict {
 		return fmt.Errorf("provider state token collided with another route target")

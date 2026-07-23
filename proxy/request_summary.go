@@ -39,11 +39,14 @@ type RequestSummary struct {
 	classifierGeneration      string
 	binaryGeneration          string
 	finalTarget               string
+	finalAccessMemberID       string
 	lastTarget                string
 	lastProvider              string
 	lastProviderKind          string
 	upstreamSendCount         int64
 	targetSwitchCount         int64
+	accountSwitchCount        int64
+	cooldownExhausted         bool
 	routeExhausted            bool
 	streamSet                 bool
 	stream                    bool
@@ -307,6 +310,39 @@ func (s *RequestSummary) setFinalRouteResult(targetID, provider, kind, upstreamR
 	s.provider = strings.TrimSpace(provider)
 	s.providerKind = strings.TrimSpace(kind)
 	s.upstreamRequestID = strings.TrimSpace(upstreamRequestID)
+}
+
+func (s *RequestSummary) setFinalAccessMemberID(memberID string) {
+	if s == nil {
+		return
+	}
+	memberID = strings.TrimSpace(memberID)
+	if memberID == "" {
+		return
+	}
+	s.mu.Lock()
+	if !s.policyIdentityOnlyLocked() {
+		s.finalAccessMemberID = memberID
+	}
+	s.mu.Unlock()
+}
+
+func (s *RequestSummary) recordAccountSwitch() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.accountSwitchCount++
+	s.mu.Unlock()
+}
+
+func (s *RequestSummary) markCooldownExhausted() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.cooldownExhausted = true
+	s.mu.Unlock()
 }
 
 // FinalTarget returns the final/canonical physical target ID, if known.
@@ -634,11 +670,20 @@ func (s *RequestSummary) LoggerFields() []logger.Field {
 	if s.finalTarget != "" {
 		fields = append(fields, logger.F("final_target", s.finalTarget))
 	}
+	if s.finalAccessMemberID != "" {
+		fields = append(fields, logger.F("access_member_id", s.finalAccessMemberID))
+	}
 	if s.upstreamSendCount != 0 {
 		fields = append(fields, logger.F("upstream_sends", s.upstreamSendCount))
 	}
 	if s.targetSwitchCount != 0 {
 		fields = append(fields, logger.F("target_switches", s.targetSwitchCount))
+	}
+	if s.accountSwitchCount != 0 {
+		fields = append(fields, logger.F("account_switches", s.accountSwitchCount))
+	}
+	if s.cooldownExhausted {
+		fields = append(fields, logger.F("cooldown_exhausted", true))
 	}
 	if s.routeExhausted {
 		fields = append(fields, logger.F("route_exhausted", true))

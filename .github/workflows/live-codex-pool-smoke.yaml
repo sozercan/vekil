@@ -1,0 +1,52 @@
+name: OpenAI Codex Account Pool Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Model advertised by both Codex accounts (optional)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Require and materialize Codex auth files
+        env:
+          AUTH_1_B64: ${{ secrets.CODEX_AUTH_FILE_1_B64 }}
+          AUTH_2_B64: ${{ secrets.CODEX_AUTH_FILE_2_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$AUTH_1_B64" || { echo "CODEX_AUTH_FILE_1_B64 is required" >&2; exit 1; }
+          test -n "$AUTH_2_B64" || { echo "CODEX_AUTH_FILE_2_B64 is required" >&2; exit 1; }
+          mkdir -p "$RUNNER_TEMP/codex-pool-auth/member-1" "$RUNNER_TEMP/codex-pool-auth/member-2"
+          printf '%s' "$AUTH_1_B64" | base64 --decode > "$RUNNER_TEMP/codex-pool-auth/member-1/auth.json"
+          printf '%s' "$AUTH_2_B64" | base64 --decode > "$RUNNER_TEMP/codex-pool-auth/member-2/auth.json"
+          chmod 600 "$RUNNER_TEMP/codex-pool-auth/member-1/auth.json" "$RUNNER_TEMP/codex-pool-auth/member-2/auth.json"
+
+      - name: Build
+        run: make build
+
+      - name: Run pooled Codex smoke
+        env:
+          CODEX_POOL_AUTH_FILE_1: ${{ runner.temp }}/codex-pool-auth/member-1/auth.json
+          CODEX_POOL_AUTH_FILE_2: ${{ runner.temp }}/codex-pool-auth/member-2/auth.json
+          CODEX_POOL_MODEL: ${{ inputs.model || vars.CODEX_POOL_MODEL }}
+          LIVE_CODEX_POOL_SMOKE_DIR: ${{ runner.temp }}/live-codex-pool
+        run: scripts/live-codex-pool-smoke.sh
+
+      - name: Explain protected failure diagnostics
+        if: failure()
+        run: |
+          echo "Pooled Codex smoke failed. Proxy/auth diagnostics are intentionally not printed because they may contain account-bound data."

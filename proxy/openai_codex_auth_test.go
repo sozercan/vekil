@@ -143,6 +143,74 @@ func requireOpenAICodexRefresh(t testing.TB) {
 	}
 }
 
+func TestNewOpenAICodexAuthPreservesDefaultPathBehavior(t *testing.T) {
+	t.Run("CODEX_HOME", func(t *testing.T) {
+		codexHome := filepath.Join(t.TempDir(), "configured-codex-home")
+		t.Setenv("CODEX_HOME", " \t"+codexHome+"\n")
+
+		auth, err := newOpenAICodexAuth()
+		if err != nil {
+			t.Fatalf("newOpenAICodexAuth() error = %v", err)
+		}
+		if got, want := auth.path, filepath.Join(codexHome, "auth.json"); got != want {
+			t.Fatalf("path = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("user home fallback", func(t *testing.T) {
+		t.Setenv("CODEX_HOME", "")
+		home, err := os.UserHomeDir()
+		if err != nil {
+			t.Fatalf("os.UserHomeDir() error = %v", err)
+		}
+
+		auth, err := newOpenAICodexAuth()
+		if err != nil {
+			t.Fatalf("newOpenAICodexAuth() error = %v", err)
+		}
+		if got, want := auth.path, filepath.Join(home, ".codex", "auth.json"); got != want {
+			t.Fatalf("path = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestNewOpenAICodexAuthAtUsesExplicitPath(t *testing.T) {
+	t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), "ignored-codex-home"))
+	explicitPath := filepath.Join(t.TempDir(), "account", "auth.json")
+
+	auth := newOpenAICodexAuthAt(explicitPath)
+	if got := auth.path; got != explicitPath {
+		t.Fatalf("path = %q, want explicit path %q", got, explicitPath)
+	}
+}
+
+func TestNewOpenAICodexAuthAtKeysSharedStateByCanonicalPath(t *testing.T) {
+	dir := t.TempDir()
+	authPath := filepath.Join(dir, "auth.json")
+	aliasPath := filepath.Join(dir, "unused") + string(os.PathSeparator) + ".." + string(os.PathSeparator) + "auth.json"
+	otherPath := filepath.Join(dir, "other-auth.json")
+
+	for _, path := range []string{authPath, aliasPath, otherPath} {
+		openAICodexAuthSharedStates.Delete(openAICodexAuthPathKey(path))
+	}
+	t.Cleanup(func() {
+		for _, path := range []string{authPath, aliasPath, otherPath} {
+			openAICodexAuthSharedStates.Delete(openAICodexAuthPathKey(path))
+		}
+	})
+
+	primary := newOpenAICodexAuthAt(authPath).sharedState()
+	alias := newOpenAICodexAuthAt(aliasPath).sharedState()
+	other := newOpenAICodexAuthAt(otherPath).sharedState()
+
+	if primary != alias {
+		t.Fatal("canonical aliases did not share OpenAI Codex auth state")
+	}
+	if primary == other {
+		t.Fatal("distinct explicit auth paths unexpectedly shared OpenAI Codex auth state")
+	}
+}
+
 func TestOpenAICodexAuthCredentialsUsesValidAuthJSON(t *testing.T) {
 	t.Parallel()
 

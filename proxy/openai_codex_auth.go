@@ -97,9 +97,11 @@ type openAICodexAuthState struct {
 }
 
 type openAICodexCredentials struct {
-	accessToken string
-	accountID   string
-	fedRAMP     bool
+	accessToken  string
+	accountID    string
+	email        string
+	fedRAMP      bool
+	sourceDigest string
 }
 
 type openAICodexRefreshResponse struct {
@@ -117,7 +119,21 @@ func newOpenAICodexAuth() (*openAICodexAuth, error) {
 		}
 		codexHome = filepath.Join(home, ".codex")
 	}
-	return &openAICodexAuth{path: filepath.Join(codexHome, "auth.json")}, nil
+	return newOpenAICodexAuthAt(filepath.Join(codexHome, "auth.json")), nil
+}
+
+func newOpenAICodexAuthAt(path string) *openAICodexAuth {
+	return &openAICodexAuth{path: path}
+}
+
+func (a *openAICodexAuth) invalidateCachedCredentials() {
+	if a == nil {
+		return
+	}
+	shared := a.sharedState()
+	shared.mu.Lock()
+	shared.state = nil
+	shared.mu.Unlock()
 }
 
 func (a *openAICodexAuth) platform() string {
@@ -158,7 +174,7 @@ func (a *openAICodexAuth) credentials(ctx context.Context, client *http.Client) 
 				state.sourceDigest = current.digest
 				shared.state = openAICodexCloneStatePtr(&state)
 				shared.mu.Unlock()
-				return openAICodexCredentialsFromTokens(state.tokens), nil
+				return openAICodexCredentialsFromTokens(state.tokens, state.sourceDigest), nil
 			}
 		}
 		refresh.waiters++
@@ -180,7 +196,7 @@ func (a *openAICodexAuth) credentials(ctx context.Context, client *http.Client) 
 			!a.hasApplicableJournalReadOnly(authoritative.body)
 	}
 	if loadErr == nil && !openAICodexNeedsRefresh(state.tokens.AccessToken, state.lastRefresh, now) && (!artifacts || freshWithArtifacts) {
-		credentials := openAICodexCredentialsFromTokens(state.tokens)
+		credentials := openAICodexCredentialsFromTokens(state.tokens, state.sourceDigest)
 		shared.mu.Unlock()
 		closeOpenAICodexAuthoritative(authoritative)
 		if artifacts {
@@ -255,7 +271,7 @@ func (a *openAICodexAuth) executeRefresh(
 			} else {
 				state := current.state
 				state.sourceDigest = current.digest
-				credentials = openAICodexCredentialsFromTokens(state.tokens)
+				credentials = openAICodexCredentialsFromTokens(state.tokens, state.sourceDigest)
 				cacheState = &state
 			}
 		}
@@ -278,7 +294,7 @@ func (a *openAICodexAuth) executeRefresh(
 			if openAICodexNeedsRefresh(state.tokens.AccessToken, state.lastRefresh, time.Now().UTC()) {
 				refreshErr = fmt.Errorf("OpenAI Codex auth changed after refresh and still requires refresh; retry")
 			} else {
-				credentials = openAICodexCredentialsFromTokens(state.tokens)
+				credentials = openAICodexCredentialsFromTokens(state.tokens, state.sourceDigest)
 				cacheState = &state
 			}
 		}
@@ -327,7 +343,7 @@ func (a *openAICodexAuth) executeRefreshLocked(
 	}
 	now := time.Now().UTC()
 	if !openAICodexNeedsRefresh(state.tokens.AccessToken, state.lastRefresh, now) {
-		return openAICodexCredentialsFromTokens(state.tokens), &state, false, nil
+		return openAICodexCredentialsFromTokens(state.tokens, state.sourceDigest), &state, false, nil
 	}
 	if strings.TrimSpace(state.tokens.RefreshToken) == "" {
 		return openAICodexCredentials{}, &state, false, fmt.Errorf("OpenAI Codex access token expired or stale and auth.json has no refresh_token; run `codex login`")
@@ -345,7 +361,7 @@ func (a *openAICodexAuth) executeRefreshLocked(
 	}
 	now = time.Now().UTC()
 	if !openAICodexNeedsRefresh(state.tokens.AccessToken, state.lastRefresh, now) {
-		return openAICodexCredentialsFromTokens(state.tokens), &state, false, nil
+		return openAICodexCredentialsFromTokens(state.tokens, state.sourceDigest), &state, false, nil
 	}
 	if strings.TrimSpace(state.tokens.RefreshToken) == "" {
 		return openAICodexCredentials{}, &state, false, fmt.Errorf("OpenAI Codex access token expired or stale and auth.json has no refresh_token; run `codex login`")
@@ -374,7 +390,7 @@ func (a *openAICodexAuth) recoverAuthoritativeAfterRefreshFailureLocked(previous
 	if openAICodexNeedsRefresh(current.tokens.AccessToken, current.lastRefresh, time.Now().UTC()) {
 		return openAICodexCredentials{}, nil, false
 	}
-	return openAICodexCredentialsFromTokens(current.tokens), current, true
+	return openAICodexCredentialsFromTokens(current.tokens, current.sourceDigest), current, true
 }
 
 func (a *openAICodexAuth) waitForRefresh(
@@ -437,7 +453,7 @@ func (a *openAICodexAuth) applyRefresh(
 		// The authoritative credentials are already fresh. Cleanup/directory-sync
 		// errors must not make current requests fail; the remaining journal is retried
 		// under the process lock on a later load.
-		return openAICodexCredentialsFromTokens(currentState.tokens), currentState, false, nil
+		return openAICodexCredentialsFromTokens(currentState.tokens, currentState.sourceDigest), currentState, false, nil
 	}
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -448,11 +464,11 @@ func (a *openAICodexAuth) applyRefresh(
 		// journal persistence fails, so the running proxy does not immediately lose
 		// the only usable token. A later request retries persistence/refresh.
 		state.sourceDigest = authoritative.digest
-		return openAICodexCredentialsFromTokens(state.tokens), &state, false, nil
+		return openAICodexCredentialsFromTokens(state.tokens, state.sourceDigest), &state, false, nil
 	}
 
 	state.sourceDigest = openAICodexSourceDigest(targetBody)
-	return openAICodexCredentialsFromTokens(state.tokens), &state, false, nil
+	return openAICodexCredentialsFromTokens(state.tokens, state.sourceDigest), &state, false, nil
 }
 
 func (a *openAICodexAuth) loadState(
@@ -1305,16 +1321,19 @@ func syncOpenAICodexDirectory(dir string) error {
 	return nil
 }
 
-func openAICodexCredentialsFromTokens(tokens openAICodexTokenData) openAICodexCredentials {
+func openAICodexCredentialsFromTokens(tokens openAICodexTokenData, sourceDigest string) openAICodexCredentials {
 	accountID := strings.TrimSpace(tokens.AccountID)
 	idClaims := openAICodexJWTClaims(tokens.IDToken)
 	if accountID == "" {
 		accountID = idClaims.chatGPTAccountID
 	}
+	digest := strings.TrimSpace(sourceDigest)
 	return openAICodexCredentials{
-		accessToken: strings.TrimSpace(tokens.AccessToken),
-		accountID:   accountID,
-		fedRAMP:     idClaims.fedRAMP,
+		accessToken:  strings.TrimSpace(tokens.AccessToken),
+		accountID:    accountID,
+		email:        idClaims.email,
+		fedRAMP:      idClaims.fedRAMP,
+		sourceDigest: digest,
 	}
 }
 
@@ -1427,6 +1446,7 @@ func openAICodexJWTExpiration(token string) (time.Time, bool) {
 type openAICodexClaims struct {
 	exp              int64
 	chatGPTAccountID string
+	email            string
 	fedRAMP          bool
 }
 
@@ -1437,8 +1457,9 @@ func openAICodexJWTClaims(token string) openAICodexClaims {
 	}
 
 	var claims struct {
-		Exp  int64 `json:"exp"`
-		Auth struct {
+		Exp   int64  `json:"exp"`
+		Email string `json:"email"`
+		Auth  struct {
 			ChatGPTAccountID      string `json:"chatgpt_account_id"`
 			ChatGPTAccountFedRAMP bool   `json:"chatgpt_account_is_fedramp"`
 		} `json:"https://api.openai.com/auth"`
@@ -1449,6 +1470,7 @@ func openAICodexJWTClaims(token string) openAICodexClaims {
 	return openAICodexClaims{
 		exp:              claims.Exp,
 		chatGPTAccountID: strings.TrimSpace(claims.Auth.ChatGPTAccountID),
+		email:            strings.TrimSpace(claims.Email),
 		fedRAMP:          claims.Auth.ChatGPTAccountFedRAMP,
 	}
 }

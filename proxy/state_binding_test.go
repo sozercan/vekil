@@ -503,3 +503,19 @@ func TestExtractExplicitResponsesRequestStateRejectsMalformedEncryptedContent(t 
 		t.Fatalf("error = %v, want encrypted_content validation", err)
 	}
 }
+
+func TestStateBindingOwnerCredentialGenerationConflicts(t *testing.T) {
+	store := newTestStateBindingStore(t, 16, time.Hour, time.Now)
+	token := stateBindingToken{stateType: stateBindingTypeResponseID, value: "resp-credential"}
+	ownerA := stateBindingOwner{routeID: "route", targetID: "target", credentialID: "credential-a"}
+	ownerB := stateBindingOwner{routeID: "route", targetID: "target", credentialID: "credential-b"}
+	if result := store.bind(token.stateType, token.value, ownerA); result.outcome != stateBindingLookupKnown {
+		t.Fatalf("first bind outcome = %s, want known", result.outcome)
+	}
+	if result := store.bind(token.stateType, token.value, ownerB); result.outcome != stateBindingLookupConflict {
+		t.Fatalf("cross-credential bind outcome = %s, want conflict", result.outcome)
+	}
+	if result := store.resolveForRoute("route", []stateBindingToken{token}); result.outcome != stateBindingLookupConflict {
+		t.Fatalf("conflicted credential lookup outcome = %s, want conflict", result.outcome)
+	}
+}

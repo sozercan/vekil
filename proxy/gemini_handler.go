@@ -508,7 +508,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 // geminiCountTokensSelectedTargetID mirrors the next target dispatch would choose
 // without consuming any route-attempt budget.
 func geminiCountTokensSelectedTargetID(route *modelRoute, operation *routeOperation) string {
-	if route == nil || route.legacy || operation == nil {
+	if route == nil || !route.usesManagedExecution() || operation == nil {
 		return ""
 	}
 	targets := orderedRouteTargets(route, operation, providerEndpointChatCompletions)
@@ -521,7 +521,7 @@ func geminiCountTokensSelectedTargetID(route *modelRoute, operation *routeOperat
 // geminiCountTokensRouteCacheKey preserves the legacy request-only key while
 // isolating explicit-route entries by their physical tokenizer/model owner.
 func geminiCountTokensRouteCacheKey(requestKey string, route *modelRoute, targetID string) (string, bool) {
-	if route == nil || route.legacy {
+	if route == nil || !route.usesManagedExecution() {
 		return requestKey, true
 	}
 	target, ok := route.targetByID(targetID)

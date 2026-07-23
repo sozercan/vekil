@@ -24,6 +24,39 @@ OpenAI Codex requires file-based ChatGPT auth from `codex login`; API-key auth a
 
 Concurrent refresh callers share one token refresh while retaining independent deadlines. On POSIX systems, Vekil persists rotated tokens back to the authoritative `auth.json` through a mode-`0600` `.vekil-cache` transaction journal: the journal is synced before the in-place auth update, removed only after the updated file is synced, and used to recover interrupted writes. Source-digest and inode checks keep an atomic external `codex login` replacement authoritative. On Windows, Vekil reads fresh `auth.json` credentials but does not perform token refresh; run `codex login` when the file becomes stale until equivalent secure journal and atomic-update semantics are available.
 
+### OpenAI Codex account pools
+
+A schema-v2 `openai-codex` provider can opt into multiple Codex subscription accounts behind the same public model owner. Account selection happens only after routing has selected the provider/model target; accounts are not separate providers and never create duplicate public model ownership. Without `codex_accounts`, Vekil keeps the existing `${CODEX_HOME:-~/.codex}/auth.json` behavior.
+
+```yaml
+schema_version: 2
+
+providers:
+  - id: codex
+    type: openai-codex
+    default: true
+    include_models: [gpt-5.5, gpt-5.4]
+
+    codex_accounts:
+      strategy: round_robin       # round_robin | fill_first
+      max_account_attempts: 0     # 0/omitted = every eligible account once
+      session_affinity: true
+      session_affinity_ttl: 1h
+      accounts:
+        - id: personal
+          auth_file: ~/.codex-personal/auth.json
+        - id: work
+          auth_file: ~/.codex-work/auth.json
+```
+
+Create every file with a separate Codex login, such as `CODEX_HOME="$HOME/.codex-personal" codex login`. Membership is explicit: Vekil does not scan directories, and adding or removing paths requires a restart. The pool accepts at most 32 unique aliases and canonical auth paths. Startup rejects duplicate underlying ChatGPT accounts and a mix of FedRAMP and non-FedRAMP accounts.
+
+`round_robin` advances independently per model; `fill_first` follows configured order. Accounts that did not advertise the requested model, are unavailable, or are already cooling down are skipped without an upstream send. Authoritative quota failures create model-scoped cooldowns using provider retry/reset headers, and expired cooldowns admit one half-open probe. Safe account switching is limited to pre-dispatch auth failures, persistent `401` after one credential reload, authoritative quota failures before semantic output, and narrowly recognized model-entitlement failures. Generic `403`, generic `5xx`, ambiguous delivery, semantic/tool/usage progress, downstream commitment, and hard-pinned continuation state never migrate accounts. Physical sends are capped at the effective account-attempt count plus one shared same-account retry allowance.
+
+Multi-account pools enable bounded, process-local soft session affinity by default for one hour. Stable session, thread, user, and Codex parent-thread/window identifiers are stored only as keyed digests. Provider-issued response IDs, conversation IDs, turn state, encrypted reasoning, Chat-over-Responses replay groups, compaction work, and committed websocket sessions are hard-bound to the exact credential generation that created them. Replacing an auth file with a different ChatGPT account changes that generation, so old continuation state fails locally instead of moving to the replacement account.
+
+Codex `/models` discovery runs independently per usable account with separate ETags. Vekil publishes the union catalog, routes each model only to accounts that advertised it, and merges conflicting metadata conservatively. Temporary discovery failures retain the last known catalog for that account; readiness requires at least one usable fresh or stale account catalog. See [`examples/openai-codex-account-pool.yaml`](../examples/openai-codex-account-pool.yaml) for a complete example.
+
 ### Azure OpenAI and Microsoft Foundry
 
 Azure providers support two auth modes:

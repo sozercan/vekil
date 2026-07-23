@@ -380,7 +380,7 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, 
 			return nil, modelNotAllowedRequestError(requestedModel)
 		}
 	}
-	if operation != nil && operation.route != nil && !operation.route.legacy {
+	if operation != nil && operation.route != nil && operation.route.usesManagedExecution() {
 		route := operation.route
 		requestedModel := strings.TrimSpace(model)
 		if requestedModel == "" {
@@ -431,7 +431,7 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, 
 	}
 
 	route, known := h.resolveModelRouteForRequest(model, path)
-	if known && route != nil && !route.legacy {
+	if known && route != nil && route.usesManagedExecution() {
 		if err := rejectDuplicateJSONMappingKeys(body); err != nil {
 			return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("invalid ambiguous JSON request: %w", err)}
 		}
@@ -488,10 +488,10 @@ func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, bod
 			return nil, modelNotAllowedRequestError(requestedModel)
 		}
 	}
-	if operation != nil && operation.route != nil && !operation.route.legacy {
+	if operation != nil && operation.route != nil && operation.route.usesManagedExecution() {
 		return h.executeExplicitRouteRequestPath(ctx, operation.route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)
 	}
-	if route, known := h.resolveModelRouteForRequest(model, providerEndpointMessages); known && route != nil && !route.legacy {
+	if route, known := h.resolveModelRouteForRequest(model, providerEndpointMessages); known && route != nil && route.usesManagedExecution() {
 		return h.executeExplicitRouteRequestPath(ctx, route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)
 	}
 

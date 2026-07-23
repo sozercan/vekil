@@ -96,6 +96,17 @@ go test -race ./... -count=1
 
 `vekil config validate` must remain offline. `vekil config validate --live` is an explicit operator smoke that uses a fixed non-user fixture to verify classifier auth/reachability, forced strict function output, non-storage request acceptance, and one physical send. Tests for that command should use controlled local providers so CI remains deterministic.
 
+### OpenAI Codex account-pool suite
+
+For the provider-internal scheduler, auth isolation, catalog union, send-safety, and credential-ownership matrix, use:
+
+```bash
+go test ./proxy/ -run 'OpenAICodexAccountPool|CodexAccount|StateBinding|ResponsesChatReplay|ResponsesWebSocket' -count=1
+go test -race ./proxy/ -run 'OpenAICodexAccountPool|CodexAccount|StateBinding|ResponsesChatReplay|ResponsesWebSocket' -count=1
+```
+
+The focused tests cover unpooled Codex compatibility, deterministic round-robin/fill-first order, concurrent candidate initialization, model eligibility, cooldown and half-open admission, duplicate identity/FedRAMP rejection, per-account ETags, stale-catalog handling, conservative catalog merging, transport replay safety, persistent-`401` reload, quota failover, generic-`403` suppression, credential-aware state and Chat replay binding, stale auth generation rejection, compaction-key separation, WebSocket owner pinning, and sanitized account observability. Existing generic route/state/WebSocket suites continue to cover the shared commitment and no-post-semantic-failover machinery.
+
 ### Chat-over-Responses suite
 
 For the Chat-over-Responses routing, conversion, replay, streaming, and public-ingress matrix, use:
@@ -234,6 +245,12 @@ The Chat-over-Responses smoke selects a model whose native metadata advertises `
 The CLI smoke script starts the proxy with the same token pattern, waits for `/readyz`, selects currently available OpenAI, Anthropic, and Gemini models from `/v1/models`, and runs one file-reading headless check per CLI using isolated temp-home config directories. It prefers `claude-sonnet-5` over older Claude model IDs and defaults `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` for the isolated Claude process because Copilot does not accept the Advisor Tool beta header. When a smoke script starts Vekil and `PROXY_PORT` is not set, it allocates an isolated non-default port. Readiness is accepted only after the spawned PID is still live and its log contains the exact `vekil listening` address; every HTTP request and CLI has a deadline, and EXIT/INT/TERM cleanup terminates the whole process group and verifies that the port was released.
 
 This workflow is intentionally provider-specific: it exercises a live Copilot-backed deployment because zero-config startup is the simplest upstream path to run in GitHub Actions. It is useful as a real integration smoke test, but it is not the complete provider matrix for Azure OpenAI, OpenAI Codex, or generic compatible provider configs.
+
+## Manual OpenAI Codex Pool Smoke
+
+The opt-in [`OpenAI Codex Account Pool Smoke`](../.github/workflows/live-codex-pool-smoke.yaml) workflow exercises two separately mounted Codex auth files through [`scripts/live-codex-pool-smoke.sh`](../scripts/live-codex-pool-smoke.sh). It is `workflow_dispatch`-only and is not part of the credential-free core CI gate. Configure `CODEX_AUTH_FILE_1_B64` and `CODEX_AUTH_FILE_2_B64` as base64-encoded `auth.json` secrets; optionally set the `CODEX_POOL_MODEL` repository variable to a model advertised by both accounts.
+
+The script builds a temporary schema-v2 provider config, waits for readiness, sends two stateless `/v1/responses` requests, and verifies through the redacted physical-attempt trace that both configured account aliases were selected. It never prints auth-file contents, raw ChatGPT account IDs, tokens, or auth paths.
 
 ## Live Provider Routing Smoke Workflow
 

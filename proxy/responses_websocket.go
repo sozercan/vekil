@@ -222,6 +222,7 @@ type responsesWebSocketSession struct {
 	userAgent               string
 	explicitRouteID         string
 	explicitTargetID        string
+	explicitCredentialID    string
 	operationConnectionID   string
 	operationSequence       uint64
 	turnState               string
@@ -1160,7 +1161,7 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 
 	resolved, known := h.resolveModelRouteForRequest(model, providerEndpointResponses)
 	if s != nil && s.explicitRouteID != "" {
-		if !known || resolved == nil || resolved.legacy || resolved.public.routeID != s.explicitRouteID {
+		if !known || resolved == nil || !resolved.usesManagedExecution() || resolved.public.routeID != s.explicitRouteID {
 			return ctx, nil, resolved, &providerRequestError{
 				statusCode: http.StatusBadRequest,
 				err:        fmt.Errorf("responses websocket session is pinned to model route %q", s.explicitRouteID),
@@ -1168,7 +1169,7 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 		}
 	}
 
-	if !known || resolved == nil || resolved.legacy {
+	if !known || resolved == nil || !resolved.usesManagedExecution() {
 		return h.withExplicitRouteOperation(ctx, s.ctx, model, providerEndpointResponses)
 	}
 
@@ -1201,7 +1202,14 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 			err:        fmt.Errorf("pinned responses websocket route target %q is unavailable", s.explicitTargetID),
 		}
 	}
-	if err := operation.forcePinnedTarget(s.explicitTargetID); err != nil {
+	if s.explicitCredentialID != "" {
+		target, _ := route.targetByID(s.explicitTargetID)
+		if target.provider != nil && target.provider.codexPool != nil && target.provider.codexPool.memberIDForCredential(s.explicitCredentialID) == "" {
+			return routedCtx, operation, route, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("responses websocket credential generation is no longer available")}
+		}
+	}
+	owner := executionOwner{routeID: route.public.routeID, targetID: s.explicitTargetID, credentialID: s.explicitCredentialID}
+	if err := operation.forcePinnedOwner(owner); err != nil {
 		return routedCtx, operation, route, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
 	// Prior websocket frames commit the session to this exact target. Mark the
@@ -1215,7 +1223,7 @@ func (s *responsesWebSocketSession) pinExplicitRouteTarget(route *modelRoute, op
 	if operation == nil {
 		return nil
 	}
-	if route == nil || route.legacy {
+	if route == nil || !route.usesManagedExecution() {
 		return fmt.Errorf("explicit responses websocket route is unavailable")
 	}
 	targetID := operation.pinnedTarget()
@@ -1231,9 +1239,17 @@ func (s *responsesWebSocketSession) pinExplicitRouteTarget(route *modelRoute, op
 	if s.explicitTargetID != "" && s.explicitTargetID != targetID {
 		return fmt.Errorf("responses websocket session target changed from %q to %q", s.explicitTargetID, targetID)
 	}
-	operation.pinTarget(targetID)
+	credentialID := operation.pinnedCredential()
+	operation.pinOwner(executionOwner{routeID: route.public.routeID, targetID: targetID, credentialID: credentialID})
+	if target, ok := route.targetByID(targetID); ok && target.provider != nil && target.provider.codexPool != nil && target.provider.codexPool.configured && credentialID == "" {
+		return fmt.Errorf("explicit responses websocket route did not select a credential")
+	}
+	if s.explicitCredentialID != "" && s.explicitCredentialID != credentialID {
+		return fmt.Errorf("responses websocket session credential changed after pinning")
+	}
 	s.explicitRouteID = route.public.routeID
 	s.explicitTargetID = targetID
+	s.explicitCredentialID = credentialID
 	return nil
 }
 
@@ -1302,10 +1318,11 @@ func explicitResponsesWebSocketResponseInfo(resp *http.Response, route *modelRou
 		targetID := operation.pinnedTarget()
 		if target, exists := route.targetByID(targetID); exists && target.provider != nil {
 			info = explicitRouteResponseInfo{
-				routeID:    route.public.routeID,
-				publicID:   route.public.id,
-				targetID:   targetID,
-				providerID: target.provider.id,
+				routeID:      route.public.routeID,
+				publicID:     route.public.id,
+				targetID:     targetID,
+				providerID:   target.provider.id,
+				credentialID: operation.pinnedCredential(),
 			}
 			ok = true
 		}
@@ -1318,6 +1335,9 @@ func explicitResponsesWebSocketResponseInfo(resp *http.Response, route *modelRou
 	}
 	if operation != nil && info.targetID != operation.pinnedTarget() {
 		return explicitRouteResponseInfo{}, fmt.Errorf("explicit responses websocket response target ownership changed")
+	}
+	if operation != nil && info.credentialID != operation.pinnedCredential() {
+		return explicitRouteResponseInfo{}, fmt.Errorf("explicit responses websocket response credential ownership changed")
 	}
 	return info, nil
 }
@@ -1352,7 +1372,7 @@ func isLocalResponsesWebSocketCompactionResponse(plan responsesWebSocketRequestP
 }
 
 func (s *responsesWebSocketSession) prepareExplicitRouteSuccessResponse(h *ProxyHandler, resp *http.Response, route *modelRoute, operation *routeOperation, plan responsesWebSocketRequestPlan) error {
-	if resp == nil || operation == nil || resp.StatusCode != http.StatusOK {
+	if resp == nil || operation == nil {
 		return nil
 	}
 	// An identical compaction trigger can join another request's in-flight compact
@@ -1363,8 +1383,16 @@ func (s *responsesWebSocketSession) prepareExplicitRouteSuccessResponse(h *Proxy
 	if isLocalResponsesWebSocketCompactionResponse(plan, operation) {
 		return nil
 	}
+	if operation.pinnedTarget() == "" {
+		// Certified pre-execution rejections do not select an owner and remain
+		// eligible for a later turn to choose an account.
+		return nil
+	}
 	if err := s.pinExplicitRouteTarget(route, operation); err != nil {
 		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil
 	}
 	return prepareExplicitResponsesWebSocketResponse(h, resp, route, operation)
 }
@@ -1991,9 +2019,10 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, req
 	ctx = markRetryStatsTracked(ctx)
 	if operation != nil {
 		if s.explicitTargetID != "" {
-			if err := operation.forcePinnedTarget(s.explicitTargetID); err != nil {
+			owner := executionOwner{routeID: operation.route.public.routeID, targetID: s.explicitTargetID, credentialID: s.explicitCredentialID}
+			if err := operation.forcePinnedOwner(owner); err != nil {
 				cancel()
-				h.log.Debug("responses websocket auto-compaction target pin failed", logger.Err(err))
+				h.log.Debug("responses websocket auto-compaction owner pin failed", logger.Err(err))
 				return metrics, responsesUsage{}
 			}
 		}
