@@ -2074,7 +2074,12 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	observeChatExecutionRoute(r.Context(), result)
 	observeUpstreamHeaders(r.Context(), result.Headers)
 	if result.Backend == chatBackendResponses && len(result.Headers) > 0 {
-		mergeHeaderValues(w.Header(), result.Headers)
+		if policyPlan.valid() {
+			result.Headers = policyChatSafeHeaders(result.Headers, publicModel)
+			mergeHeaderValues(w.Header(), result.Headers)
+		} else {
+			mergeHeaderValues(w.Header(), result.Headers)
+		}
 	}
 
 	result, err = h.aggregateExplicitRoutedChatExecution(upstreamCtx, result, oaiBody, mode)

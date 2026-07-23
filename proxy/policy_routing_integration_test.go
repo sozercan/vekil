@@ -25,7 +25,6 @@ type policyIntegrationUpstream struct {
 	mu       sync.Mutex
 	models   []string
 	parallel []json.RawMessage
-	auth     []string
 	requests int
 
 	classifierSignals        policyClassifierSignals
@@ -54,7 +53,6 @@ func newPolicyIntegrationUpstream(t *testing.T, signals policyClassifierSignals)
 		u.requests++
 		u.models = append(u.models, request.Model)
 		u.parallel = append(u.parallel, append(json.RawMessage(nil), request.ParallelToolCalls...))
-		u.auth = append(u.auth, r.Header.Get("Authorization"))
 		u.mu.Unlock()
 		if request.Model == "classifier-model" {
 			if status := int(u.classifierFailureStatus.Load()); status != 0 {
@@ -151,12 +149,6 @@ func (u *policyIntegrationUpstream) snapshot() (int, []string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.requests, append([]string(nil), u.models...)
-}
-
-func (u *policyIntegrationUpstream) authSnapshot() []string {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return append([]string(nil), u.auth...)
 }
 
 func (u *policyIntegrationUpstream) parallelToolCallsSnapshot() []json.RawMessage {
@@ -336,6 +328,9 @@ func TestPolicyRoutingGlobalOffUsesBaselineWithoutClassifier(t *testing.T) {
 	if err := h.InitializePolicyRouting(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	if stats := h.responsesChatReplayStore().Stats(); stats.Groups != 0 || stats.Calls != 0 || stats.TotalBytes != 0 {
+		t.Fatalf("classifier preflight polluted client replay state: %+v", stats)
+	}
 	recorder := httptest.NewRecorder()
 	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"coding-economy","messages":[{"role":"user","content":"hello"}]}`)))
 	if recorder.Code != http.StatusOK {
@@ -351,6 +346,7 @@ func TestPolicyRoutingGlobalOffUsesBaselineWithoutClassifier(t *testing.T) {
 }
 
 func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
+	streamFixture := readResponsesChatStreamFixture(t, "stream_text.sse")
 	var mu sync.Mutex
 	var paths []string
 	var models []string
@@ -364,6 +360,8 @@ func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
 		}
 		var model string
 		_ = json.Unmarshal(request["model"], &model)
+		var stream bool
+		_ = json.Unmarshal(request["stream"], &stream)
 		tools := string(request["tools"])
 		mu.Lock()
 		paths = append(paths, r.URL.Path)
@@ -372,6 +370,11 @@ func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
 		mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Request-ID", "terminal-request-secret")
+		w.Header().Set("X-Azure-Request-ID", "terminal-azure-secret")
+		w.Header().Set("OpenAI-Request-ID", "terminal-openai-secret")
+		w.Header().Set("Openai-Model", model)
+		w.Header().Set("RateLimit-Remaining", "7")
 		if strings.Contains(tools, policyClassifierToolName) {
 			arguments, _ := json.Marshal(policyClassifierSignals{
 				TurnType:  policyTurnTypePlanning,
@@ -393,6 +396,11 @@ func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
 				}},
 				"usage": map[string]any{"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
 			})
+			return
+		}
+		if stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write(streamFixture)
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -462,13 +470,37 @@ func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
 	if !strings.Contains(recorder.Body.String(), "COPILOT_POLICY_OK") {
 		t.Fatalf("response body = %s", recorder.Body.String())
 	}
+	if stats := h.responsesChatReplayStore().Stats(); stats.Groups != 0 || stats.Calls != 0 || stats.TotalBytes != 0 {
+		t.Fatalf("classifier request polluted client replay state: %+v", stats)
+	}
+
+	anthropicRecorder := httptest.NewRecorder()
+	h.HandleAnthropicMessages(anthropicRecorder, httptest.NewRequest(
+		http.MethodPost,
+		providerEndpointMessages,
+		strings.NewReader(`{"model":"coding-economy","max_tokens":64,"messages":[{"role":"user","content":"plan another risky multi-file change"}]}`),
+	))
+	if anthropicRecorder.Code != http.StatusOK {
+		t.Fatalf("Anthropic status = %d body=%s", anthropicRecorder.Code, anthropicRecorder.Body.String())
+	}
+	for _, name := range []string{"X-Request-ID", "X-Azure-Request-ID", "OpenAI-Request-ID"} {
+		if value := anthropicRecorder.Header().Get(name); value != "" {
+			t.Fatalf("policy Anthropic response leaked %s=%q", name, value)
+		}
+	}
+	if got := anthropicRecorder.Header().Get("RateLimit-Remaining"); got != "7" {
+		t.Fatalf("RateLimit-Remaining = %q, want 7", got)
+	}
+	if got := anthropicRecorder.Header().Get("Openai-Model"); got != "coding-economy" {
+		t.Fatalf("Openai-Model = %q, want policy public id", got)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	if got := strings.Join(paths, ","); got != "/responses,/responses,/responses" {
-		t.Fatalf("Copilot policy paths = %q, want three Responses sends", got)
+	if got := strings.Join(paths, ","); got != "/responses,/responses,/responses,/responses,/responses" {
+		t.Fatalf("Copilot policy paths = %q, want five Responses sends", got)
 	}
-	if got := strings.Join(models, ","); got != "classifier-model,classifier-model,power-model" {
+	if got := strings.Join(models, ","); got != "classifier-model,classifier-model,power-model,classifier-model,power-model" {
 		t.Fatalf("Copilot policy models = %q", got)
 	}
 	for index, authorization := range authorizations {

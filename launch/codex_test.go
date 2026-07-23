@@ -189,8 +189,8 @@ func TestCodexCatalogClearsUnsupportedDonorCapabilities(t *testing.T) {
 	if !ok || len(reasoningLevels) != 0 {
 		t.Fatalf("non-reasoning model supported_reasoning_levels = %#v, want empty", model["supported_reasoning_levels"])
 	}
-	if got, ok := model["default_reasoning_level"]; ok {
-		t.Fatalf("non-reasoning model default_reasoning_level = %#v, want omitted", got)
+	if got := model["default_reasoning_level"]; got != "none" {
+		t.Fatalf("direct non-reasoning model default_reasoning_level = %#v, want none", got)
 	}
 	for _, key := range []string{"supports_reasoning_summaries", "support_verbosity", "supports_search_tool"} {
 		if got, _ := model[key].(bool); got {
@@ -389,6 +389,9 @@ func TestCodexAdapterAcceptsPolicyOwnedChatModelThroughResponsesCompatibility(t 
 	}
 	if value, _ := catalog.Models[0]["supports_search_tool"].(bool); value {
 		t.Fatalf("policy supports_search_tool = true, want false")
+	}
+	if value, exists := catalog.Models[0]["default_reasoning_level"]; exists {
+		t.Fatalf("policy default_reasoning_level = %#v, want omitted", value)
 	}
 	for _, key := range []string{"additional_speed_tiers", "service_tiers"} {
 		values, ok := catalog.Models[0][key].([]interface{})

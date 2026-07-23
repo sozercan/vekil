@@ -101,6 +101,41 @@ func TestPolicyResponsesIngressStreamsTextThroughBaselineChatRoute(t *testing.T)
 	}
 }
 
+func TestPolicyResponsesIngressAllowsResolvedPolicyAliasWithinLaunchScope(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)
+	cfg.PolicyProfiles[0].PublicID = "coding-economy-20260717"
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("coding-economy"),
+		WithPolicyRoutingMode(PolicyRoutingModeOff),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"coding-economy-20260717",
+		"input":"say ok",
+		"store":false,
+		"stream":false
+	}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Model != "coding-economy-20260717" {
+		t.Fatalf("response model=%q, want canonical policy id", response.Model)
+	}
+}
+
 func TestPolicyResponsesIngressAcceptsCodexReasoningSummary(t *testing.T) {
 	var captured map[string]json.RawMessage
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

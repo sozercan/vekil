@@ -40,7 +40,7 @@ The following are explicitly unsupported for policy public IDs in v1 and fail lo
 | Proxy-owned `GET /v1/responses` websocket bridge | Unsupported |
 | `POST /v1/responses/compact` | Unsupported |
 | `POST /v1/memories/trace_summarize` | Unsupported |
-| Responses-backed Chat terminal routes | Unsupported; both destinations must expose native `/chat/completions` |
+| Responses-backed Chat terminal routes | Supported through the bounded Chat-over-Responses adapter; destination and classifier routes may expose `/responses` |
 | `POST /v1/messages` and `/v1/messages/count_tokens` | Translated to canonical Chat, planned by the policy, and translated back to Anthropic |
 | Gemini `generateContent`, `streamGenerateContent`, and `countTokens` routes | Unsupported |
 | Image, audio, file, or any other non-text Chat input | Unsupported |
@@ -53,7 +53,7 @@ Direct public models and direct exposed terminal routes retain their existing en
 
 Policy Responses compatibility is deliberately not near-zero-copy passthrough.
 It converts bounded Responses input into canonical Chat, applies policy planning,
-executes the selected native-Chat terminal, aggregates the terminal result, and
+executes the selected native or Responses-backed Chat terminal, aggregates the terminal result, and
 emits Responses JSON/SSE. Bounded `text.format` values are mapped to Chat
 `response_format`, including Codex `--output-schema` JSON schemas. It accepts
 Codex-style full stateless history,

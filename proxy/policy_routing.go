@@ -800,6 +800,8 @@ func (h *ProxyHandler) sendPolicyClassifierNativeChat(ctx context.Context, targe
 
 func (h *ProxyHandler) sendPolicyClassifierOverResponses(ctx context.Context, route *modelRoute, target targetBinding, owner providerModel, chatBody []byte, headers http.Header) (policyClassifierHTTPResponse, error) {
 	upstreamModel := strings.TrimSpace(target.upstreamModel)
+	classifierReplay := newResponsesChatReplayStore()
+	defer func() { _ = classifierReplay.Close() }()
 	replayRoute := responsesChatReplayRoute{
 		ProviderID:    target.provider.id,
 		PublicModel:   upstreamModel,
@@ -807,7 +809,7 @@ func (h *ProxyHandler) sendPolicyClassifierOverResponses(ctx context.Context, ro
 	}
 	plan, err := translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
 		UpstreamModel:       upstreamModel,
-		ReplayStore:         h.responsesChatReplayStore(),
+		ReplayStore:         classifierReplay,
 		ReplayRoute:         replayRoute,
 		MinimumOutputTokens: responsesChatMinimumOutputTokens,
 		DropSamplingParams:  route.public.policy.dropSamplingParams,
@@ -846,7 +848,7 @@ func (h *ProxyHandler) sendPolicyClassifierOverResponses(ctx context.Context, ro
 	}
 	converted, err := translateResponsesJSONToChat(responseBody, responsesChatResponseOptions{
 		PublicModel:        upstreamModel,
-		ReplayStore:        h.responsesChatReplayStore(),
+		ReplayStore:        classifierReplay,
 		ReplayRoute:        replayRoute,
 		ReplayToolDefaults: plan.ReplayToolDefaults,
 	})

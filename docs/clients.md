@@ -4,10 +4,7 @@ These examples all target the same local proxy. Replace model IDs with public ID
 
 ## Schema-v2 policy profile IDs
 
-A semantic policy profile such as `coding-economy` is a narrower public model contract than a direct model ID. It accepts text/function-tool OpenAI Chat, translated Anthropic Messages and count-token probes, and bounded stateless OpenAI Responses—including structured text output—for Responses-only agents such as Codex. It is not accepted by Gemini routes/CLI, the Responses websocket bridge, compact/memory endpoints, images, hosted/custom tools, or stateful `previous_response_id` requests. Responses-native terminal routes remain ineligible policy destinations. Opaque
-`call_vekil_*` continuations admitted through a single policy target still require
-one downstream bridge process or sticky ingress to the bridge replica that owns
-the process-local replay state.
+A semantic policy profile such as `coding-economy` is a narrower public model contract than a direct model ID. It accepts text/function-tool OpenAI Chat, translated Anthropic Messages and count-token probes, and bounded stateless OpenAI Responses—including structured text output—for Responses-only agents such as Codex. It is not accepted by Gemini routes/CLI, the Responses websocket bridge, compact/memory endpoints, images, hosted/custom tools, or stateful `previous_response_id` requests. Policy destinations may use native Chat or bounded Responses-backed Chat. Opaque `call_vekil_*` continuations must remain on the process that owns their replay state; direct in-process Copilot targets satisfy that requirement, while an external downstream bridge still requires a single instance or sticky ingress to the owning replica.
 
 Chat clients and the supported translated agent surfaces may request a policy profile. The returned Chat JSON/SSE model identity remains the policy public ID; internal lightweight/powerful provider and route IDs are not a client contract. Exposed direct terminal routes and other public models remain independently requestable, so use `exposure: internal` when bypass must not be offered.
 

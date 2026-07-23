@@ -1685,10 +1685,19 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 	if _, ok := h.allowedModels[model]; ok {
 		return true
 	}
+	setup := h.providerSetup()
+	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+		for allowedModel := range h.allowedModels {
+			allowedEntry, allowed := setup.lookupPublicModelEntry(allowedModel)
+			if allowed && allowedEntry != nil && allowedEntry.kind == publicEntryPolicy && allowedEntry.policyID == entry.policyID {
+				return true
+			}
+		}
+	}
 	if endpoint != providerEndpointMessages {
 		return false
 	}
-	if _, rawKnown := h.providerSetup().lookupModel(model); rawKnown {
+	if _, rawKnown := setup.lookupModel(model); rawKnown {
 		return false
 	}
 	normalizedModel := NormalizeModelName(model)
