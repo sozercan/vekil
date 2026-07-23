@@ -1687,19 +1687,27 @@ func aggregatePolicyStreamToResponseWithProgress(body io.ReadCloser) (*models.Op
 	return aggregateStreamToResponseWithProgressOptions(body, openAIResponseBuildOptions{
 		preserveInvalidToolArguments: true,
 		rejectInvalidTextDeltas:      true,
+		maxAccumulatedBytes:          maxLargeRequestBodySize,
 	})
 }
 
 func aggregateStreamToResponseWithProgressOptions(body io.ReadCloser, options openAIResponseBuildOptions) (*models.OpenAIResponse, upstreamSemanticProgress, error) {
 	defer func() { _ = body.Close() }()
 
-	aggregator := newOpenAIResponseAggregator()
+	aggregator := newOpenAIResponseAggregatorWithOptions(options)
+	var addErr error
 	sawDone, progress, err := consumeOpenAIStreamChunksWithProgress(body, func(chunk models.OpenAIStreamChunk) bool {
-		aggregator.addChunk(chunk)
+		if err := aggregator.addChunkBounded(chunk); err != nil {
+			addErr = err
+			return false
+		}
 		return true
 	})
 	if err != nil {
 		return nil, progress, err
+	}
+	if addErr != nil {
+		return nil, progress, addErr
 	}
 	if !sawDone {
 		return nil, progress, fmt.Errorf("stream ended before [DONE]")
@@ -2029,19 +2037,45 @@ type aggregatedOpenAIChoice struct {
 type openAIResponseBuildOptions struct {
 	preserveInvalidToolArguments bool
 	rejectInvalidTextDeltas      bool
+	maxAccumulatedBytes          int
 }
 
 type openAIResponseAggregator struct {
-	response            models.OpenAIResponse
-	choicesByIndex      map[int]*aggregatedOpenAIChoice
-	invalidContentDelta bool
-	invalidRefusalDelta bool
+	response              models.OpenAIResponse
+	choicesByIndex        map[int]*aggregatedOpenAIChoice
+	invalidContentDelta   bool
+	invalidRefusalDelta   bool
+	maxAccumulatedBytes   int
+	accumulatedChunkBytes int
 }
 
 func newOpenAIResponseAggregator() *openAIResponseAggregator {
+	return newOpenAIResponseAggregatorWithOptions(openAIResponseBuildOptions{})
+}
+
+func newOpenAIResponseAggregatorWithOptions(options openAIResponseBuildOptions) *openAIResponseAggregator {
 	return &openAIResponseAggregator{
-		choicesByIndex: make(map[int]*aggregatedOpenAIChoice),
+		choicesByIndex:      make(map[int]*aggregatedOpenAIChoice),
+		maxAccumulatedBytes: options.maxAccumulatedBytes,
 	}
+}
+
+func (a *openAIResponseAggregator) addChunkBounded(chunk models.OpenAIStreamChunk) error {
+	if a == nil {
+		return nil
+	}
+	if a.maxAccumulatedBytes > 0 {
+		encoded, err := json.Marshal(chunk)
+		if err != nil {
+			return fmt.Errorf("measure streamed Chat chunk: %w", err)
+		}
+		if len(encoded) > a.maxAccumulatedBytes-a.accumulatedChunkBytes {
+			return fmt.Errorf("policy Chat stream exceeds the %d-byte response limit", a.maxAccumulatedBytes)
+		}
+		a.accumulatedChunkBytes += len(encoded)
+	}
+	a.addChunk(chunk)
+	return nil
 }
 
 func (a *openAIResponseAggregator) addChunk(chunk models.OpenAIStreamChunk) {

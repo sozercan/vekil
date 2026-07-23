@@ -136,6 +136,64 @@ func TestPolicyResponsesIngressAllowsResolvedPolicyAliasWithinLaunchScope(t *tes
 	}
 }
 
+func TestPolicyResponsesIngressUsesSuccessfulFailoverHeaders(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("RateLimit-Remaining", "1")
+		w.Header().Set("X-Request-ID", "primary-request")
+		_, _ = fmt.Fprint(w, "data: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"quota\"}}\n\n")
+	}))
+	t.Cleanup(primary.Close)
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("RateLimit-Remaining", "9")
+		w.Header().Set("X-Request-ID", "secondary-request")
+		_, _ = fmt.Fprint(w, strings.Join([]string{
+			`data: {"id":"chat-secondary","object":"chat.completion.chunk","created":1,"model":"secondary-model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"}}]}`,
+			`data: {"id":"chat-secondary","object":"chat.completion.chunk","created":1,"model":"secondary-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`data: [DONE]`,
+			"",
+		}, "\n\n"))
+	}))
+	t.Cleanup(secondary.Close)
+
+	cfg := policyIntegrationConfig(primary.URL, secondary.URL, policyConfigModeOff)
+	cfg.ModelRoutes[0].Targets = []ModelRouteTargetConfig{
+		{ID: "primary", Provider: "light-provider", UpstreamModel: "primary-model"},
+		{ID: "secondary", Provider: "power-provider", UpstreamModel: "secondary-model"},
+	}
+	cfg.ModelRoutes[0].Routing = ModelRouteRoutingConfig{
+		Mode:              string(routeModePriorityFailover),
+		MaxTargetAttempts: 2,
+		MaxUpstreamSends:  2,
+	}
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+		WithProvidersConfig(cfg),
+		WithPolicyRoutingMode(PolicyRoutingModeOff),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"coding-economy",
+		"input":"say ok",
+		"store":false,
+		"stream":false
+	}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("RateLimit-Remaining"); got != "9" {
+		t.Fatalf("RateLimit-Remaining=%q, want successful secondary value 9", got)
+	}
+	if got := recorder.Header().Get("X-Request-ID"); got != "" {
+		t.Fatalf("X-Request-ID=%q, want policy-filtered", got)
+	}
+}
+
 func TestPolicyResponsesIngressAcceptsCodexReasoningSummary(t *testing.T) {
 	var captured map[string]json.RawMessage
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -441,10 +499,10 @@ func TestCollectPolicyResponsesRejectsPreAggregatedNativeCompletion(t *testing.T
 		FinishReason: &finishReason,
 	}}}
 	h := &ProxyHandler{}
-	if _, err := h.collectPolicyResponsesChatCompletion(t.Context(), chatExecutionResult{Completion: completion}, nil, chatCompletionsMode{}); err == nil || !strings.Contains(err.Error(), "unsupported pre-aggregated native completion") {
+	if _, err := h.collectPolicyResponsesChatCompletion(t.Context(), &chatExecutionResult{Completion: completion}, nil, chatCompletionsMode{}); err == nil || !strings.Contains(err.Error(), "unsupported pre-aggregated native completion") {
 		t.Fatalf("error = %v", err)
 	}
-	got, err := h.collectPolicyResponsesChatCompletion(t.Context(), chatExecutionResult{Completion: completion, Backend: chatBackendResponses}, nil, chatCompletionsMode{})
+	got, err := h.collectPolicyResponsesChatCompletion(t.Context(), &chatExecutionResult{Completion: completion, Backend: chatBackendResponses}, nil, chatCompletionsMode{})
 	if err != nil || got != completion {
 		t.Fatalf("Responses-backed completion = %#v, error = %v", got, err)
 	}

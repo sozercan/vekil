@@ -2283,3 +2283,18 @@ func TestAggregatePolicyStreamRejectsMalformedTextDelta(t *testing.T) {
 		t.Fatalf("policy aggregation error = %v, want malformed content rejection", err)
 	}
 }
+
+func TestAggregatePolicyStreamEnforcesCumulativeResponseLimit(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"chat","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"` + strings.Repeat("x", 256) + `"}}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	_, _, err := aggregateStreamToResponseWithProgressOptions(
+		io.NopCloser(strings.NewReader(stream)),
+		openAIResponseBuildOptions{maxAccumulatedBytes: 128},
+	)
+	if err == nil || !strings.Contains(err.Error(), "128-byte response limit") {
+		t.Fatalf("aggregation error = %v, want cumulative response limit", err)
+	}
+}

@@ -95,7 +95,7 @@ func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Requ
 	result, chatBody, mode = h.retryRoutedChatExecutionWithoutInjectedStreamOptions(upstreamCtx, result, chatBody, mode, translated.PublicModel)
 	observeUpstreamHeaders(r.Context(), result.Headers)
 
-	completion, err := h.collectPolicyResponsesChatCompletion(upstreamCtx, result, chatBody, mode)
+	completion, err := h.collectPolicyResponsesChatCompletion(upstreamCtx, &result, chatBody, mode)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -121,7 +121,10 @@ func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Requ
 	}
 }
 
-func (h *ProxyHandler) collectPolicyResponsesChatCompletion(ctx context.Context, result chatExecutionResult, body []byte, mode chatCompletionsMode) (*models.OpenAIResponse, error) {
+func (h *ProxyHandler) collectPolicyResponsesChatCompletion(ctx context.Context, result *chatExecutionResult, body []byte, mode chatCompletionsMode) (*models.OpenAIResponse, error) {
+	if result == nil {
+		return nil, fmt.Errorf("policy Chat execution returned no result")
+	}
 	if result.Stream != nil {
 		return aggregatePolicyChatStreamEvents(result.Stream)
 	}
@@ -148,7 +151,7 @@ func (h *ProxyHandler) collectPolicyResponsesChatCompletion(ctx context.Context,
 		return nil, policyResponsesChatUpstreamError(result.Response)
 	}
 	if mode.clientRequestedStream || mode.forceUpstreamStream || strings.Contains(strings.ToLower(result.Response.Header.Get("Content-Type")), "text/event-stream") {
-		completion, terminalResponse, err := h.aggregateExplicitChatCompletionsResponse(ctx, result.Response, body, mode, aggregatePolicyStreamToResponseWithProgress)
+		completion, terminalResponse, err := h.aggregateExplicitChatCompletionsResponse(ctx, result.Response, body, mode, aggregatePolicyStreamToResponseWithProgress, &result.Headers)
 		if err != nil {
 			return nil, err
 		}

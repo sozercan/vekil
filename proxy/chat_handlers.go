@@ -595,10 +595,16 @@ func (h *ProxyHandler) executeExplicitRouteSurfaceRequest(ctx context.Context, e
 	}
 }
 
-func (h *ProxyHandler) aggregateExplicitChatCompletionsResponse(ctx context.Context, initialResp *http.Response, body []byte, mode chatCompletionsMode, aggregate explicitRouteStreamAggregator) (*models.OpenAIResponse, *http.Response, error) {
+func (h *ProxyHandler) aggregateExplicitChatCompletionsResponse(ctx context.Context, initialResp *http.Response, body []byte, mode chatCompletionsMode, aggregate explicitRouteStreamAggregator, successfulHeaders ...*http.Header) (*models.OpenAIResponse, *http.Response, error) {
 	resp := initialResp
 	operation := routeOperationFromContext(ctx)
 	var canonical *explicitRouteCanonicalFailure
+	captureSuccessfulHeaders := func(resp *http.Response) {
+		if len(successfulHeaders) == 0 || successfulHeaders[0] == nil || resp == nil {
+			return
+		}
+		*successfulHeaders[0] = resp.Header.Clone()
+	}
 
 	for {
 		if resp == nil {
@@ -624,6 +630,9 @@ func (h *ProxyHandler) aggregateExplicitChatCompletionsResponse(ctx context.Cont
 			aggregateErr = context.Canceled
 		}
 		if operation == nil || operation.route == nil || operation.route.legacy {
+			if aggregateErr == nil {
+				captureSuccessfulHeaders(resp)
+			}
 			return response, nil, aggregateErr
 		}
 
@@ -634,6 +643,7 @@ func (h *ProxyHandler) aggregateExplicitChatCompletionsResponse(ctx context.Cont
 		if aggregateErr == nil {
 			progress = mergeUpstreamSemanticProgress(progress, upstreamProgressTerminalSuccess)
 			operation.updateAcceptedRouteAttempt(info.targetID, progress, downstreamCommitmentNone)
+			captureSuccessfulHeaders(resp)
 			return response, nil, nil
 		}
 

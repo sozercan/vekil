@@ -733,3 +733,20 @@ func TestAggregatePolicyChatStreamEventsRejectsMalformedTextDelta(t *testing.T) 
 		t.Fatalf("policy aggregation error = %v, want malformed content rejection", err)
 	}
 }
+
+func TestAggregatePolicyChatStreamEventsEnforcesCumulativeResponseLimit(t *testing.T) {
+	writer, stream := newChatStreamEventPipe(t.Context())
+	if err := writer.sendChunk(models.OpenAIStreamChunk{
+		ID: "chat", Object: openAIChatCompletionChunkObject,
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{Content: json.RawMessage(`"` + strings.Repeat("x", 256) + `"`)}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.succeed(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := aggregateChatStreamEventsWithOptions(stream, openAIResponseBuildOptions{maxAccumulatedBytes: 128})
+	if err == nil || !strings.Contains(err.Error(), "128-byte response limit") {
+		t.Fatalf("aggregation error = %v, want cumulative response limit", err)
+	}
+}

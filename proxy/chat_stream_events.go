@@ -363,14 +363,14 @@ func aggregatePolicyChatStreamEvents(stream *chatStreamEventStream) (*models.Ope
 	return aggregateChatStreamEventsWithOptions(stream, openAIResponseBuildOptions{
 		preserveInvalidToolArguments: true,
 		rejectInvalidTextDeltas:      true,
+		maxAccumulatedBytes:          maxLargeRequestBodySize,
 	})
 }
 
 func aggregateChatStreamEventsWithOptions(stream *chatStreamEventStream, options openAIResponseBuildOptions) (*models.OpenAIResponse, error) {
-	aggregator := newOpenAIResponseAggregator()
+	aggregator := newOpenAIResponseAggregatorWithOptions(options)
 	if err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
-		aggregator.addChunk(chunk)
-		return nil
+		return aggregator.addChunkBounded(chunk)
 	}); err != nil {
 		return nil, err
 	}
