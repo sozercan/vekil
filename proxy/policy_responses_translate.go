@@ -701,8 +701,19 @@ func parsePolicyResponsesTextContent(raw json.RawMessage, role, param string, to
 		if !validType {
 			return "", newChatInvalidRequest(partParam+".type", fmt.Sprintf("text content type %q is not valid for role %q", partType, role))
 		}
-		if err := validatePolicyResponsesObjectFields(part, partParam, "type", "text"); err != nil {
+		allowedFields := []string{"type", "text"}
+		if partType == "output_text" {
+			allowedFields = append(allowedFields, "annotations")
+		}
+		if err := validatePolicyResponsesObjectFields(part, partParam, allowedFields...); err != nil {
 			return "", err
+		}
+		if annotationsRaw, ok := part["annotations"]; ok {
+			trimmedAnnotations := bytes.TrimSpace(annotationsRaw)
+			var annotations []json.RawMessage
+			if len(trimmedAnnotations) < 2 || trimmedAnnotations[0] != '[' || json.Unmarshal(annotationsRaw, &annotations) != nil || len(annotations) != 0 {
+				return "", newChatInvalidRequest(partParam+".annotations", "only an empty annotations array is supported")
+			}
 		}
 		partText, err := requiredPolicyResponsesStringValue(part, "text", partParam+".text", policyResponsesMaxRequestBytes, true)
 		if err != nil {

@@ -117,12 +117,12 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 	}
 	messageContent := make([]any, 0, 2)
 	if textPresent {
-		messageContent = append(messageContent, map[string]any{"type": "output_text", "text": text})
+		messageContent = append(messageContent, map[string]any{"type": "output_text", "text": text, "annotations": []any{}})
 	}
 	if refusalPresent {
 		// Codex CLI's Responses decoder accepts output_text but not the newer
 		// refusal content variant. Preserve the refusal text in the portable shape.
-		messageContent = append(messageContent, map[string]any{"type": "output_text", "text": refusal})
+		messageContent = append(messageContent, map[string]any{"type": "output_text", "text": refusal, "annotations": []any{}})
 	}
 	if len(messageContent) > 0 {
 		response.Output = append(response.Output, map[string]any{
@@ -222,7 +222,7 @@ func policyResponsesRefusalFromChatContent(raw json.RawMessage) (string, bool, e
 
 func policyResponsesUsageFromChat(usage *models.OpenAIUsage) policyResponsesResponseUsage {
 	converted := policyResponsesResponseUsage{
-		InputTokensDetails:  map[string]int{"cached_tokens": 0},
+		InputTokensDetails:  map[string]int{"cache_write_tokens": 0, "cached_tokens": 0},
 		OutputTokensDetails: map[string]int{"reasoning_tokens": 0},
 	}
 	if usage == nil {
@@ -356,7 +356,7 @@ func writePolicyResponsesResult(w http.ResponseWriter, response policyResponsesR
 	created.Status = "in_progress"
 	created.Output = []map[string]any{}
 	created.Usage = policyResponsesResponseUsage{
-		InputTokensDetails:  map[string]int{"cached_tokens": 0},
+		InputTokensDetails:  map[string]int{"cache_write_tokens": 0, "cached_tokens": 0},
 		OutputTokensDetails: map[string]int{"reasoning_tokens": 0},
 	}
 	created.IncompleteDetails = nil

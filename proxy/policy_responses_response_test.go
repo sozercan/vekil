@@ -29,6 +29,9 @@ func TestPolicyResponsesRefusalUsesPortableOutputText(t *testing.T) {
 	if part["type"] != "output_text" || part["text"] != "cannot comply" {
 		t.Fatalf("refusal output=%+v", response.Output)
 	}
+	if annotations, ok := part["annotations"].([]any); !ok || len(annotations) != 0 {
+		t.Fatalf("refusal annotations = %#v, want empty array", part["annotations"])
+	}
 	body, err := json.Marshal(map[string]any{"model": "policy", "input": response.Output, "store": false})
 	if err != nil {
 		t.Fatal(err)
@@ -225,7 +228,7 @@ func TestPolicyResponsesResponseNormalizesMissingUsage(t *testing.T) {
 	if response.Usage.InputTokens != 0 || response.Usage.OutputTokens != 0 || response.Usage.TotalTokens != 0 {
 		t.Fatalf("usage = %+v, want zero-valued fallback", response.Usage)
 	}
-	if response.Usage.InputTokensDetails["cached_tokens"] != 0 || response.Usage.OutputTokensDetails["reasoning_tokens"] != 0 {
+	if response.Usage.InputTokensDetails["cached_tokens"] != 0 || response.Usage.InputTokensDetails["cache_write_tokens"] != 0 || response.Usage.OutputTokensDetails["reasoning_tokens"] != 0 {
 		t.Fatalf("usage details = %+v/%+v", response.Usage.InputTokensDetails, response.Usage.OutputTokensDetails)
 	}
 }
