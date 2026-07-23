@@ -272,6 +272,11 @@ func validatePolicyProfileConfigReferences(
 	if err != nil {
 		return err
 	}
+	lightweightPrefersNativeChat := configRouteSupportsEndpoint(lightweight, providerEndpointChatCompletions)
+	powerfulPrefersNativeChat := configRouteSupportsEndpoint(powerful, providerEndpointChatCompletions)
+	if lightweightPrefersNativeChat != powerfulPrefersNativeChat {
+		return configPathError(path+".powerful_route", "route %q differs from lightweight route %q in preferred Chat backend", profile.PowerfulRoute, profile.LightweightRoute)
+	}
 	if boolConfigValue(lightweight.DropSamplingParams) != boolConfigValue(powerful.DropSamplingParams) {
 		return configPathError(path+".powerful_route", "route %q differs from lightweight route %q in drop_sampling_params public Chat semantics", profile.PowerfulRoute, profile.LightweightRoute)
 	}

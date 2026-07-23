@@ -1967,3 +1967,72 @@ func TestModelUsesCopilotHonorsProviderFiltersDuringDeferredDiscovery(t *testing
 		}
 	})
 }
+
+func TestPolicyCopilotProviderScopeFollowsEffectiveMode(t *testing.T) {
+	classifierNoStore := true
+	makeConfig := func(copilotClassifier bool) ProvidersConfig {
+		powerProvider := "copilot"
+		classifierProvider := "local"
+		if copilotClassifier {
+			powerProvider = "local"
+			classifierProvider = "copilot"
+		}
+		return ProvidersConfig{
+			SchemaVersion: 2,
+			Providers: []ProviderConfig{
+				{ID: "copilot", Type: "copilot", Default: true, TrustDomain: "org"},
+				{ID: "local", Type: "openai-compatible", BaseURL: "https://local.example.test/v1", AuthType: "none", ModelDiscovery: "static", TrustDomain: "org", ClassifierNoStoreSupported: &classifierNoStore},
+			},
+			ModelRoutes: []ModelRouteConfig{
+				{ID: "light", Exposure: "internal", Endpoints: []string{"/responses"}, Targets: []ModelRouteTargetConfig{{ID: "light", Provider: "local", UpstreamModel: "light"}}},
+				{ID: "power", Exposure: "internal", Endpoints: []string{"/responses"}, Targets: []ModelRouteTargetConfig{{ID: "power", Provider: powerProvider, UpstreamModel: "power"}}},
+				{ID: "classifier", Exposure: "internal", InternalPurpose: "policy_classifier", Endpoints: []string{"/responses"}, Targets: []ModelRouteTargetConfig{{ID: "classifier", Provider: classifierProvider, UpstreamModel: "classifier"}}},
+			},
+			PolicyProfiles: []PolicyProfileConfig{{
+				ID: "policy", PublicID: "semantic", Mode: "enforce", LightweightRoute: "light", PowerfulRoute: "power",
+				Classifier: PolicyClassifierConfig{Route: "classifier"},
+				DataPolicy: PolicyDataPolicyConfig{ContentForwardingAcknowledged: true, AllowProviderRetention: true},
+			}},
+		}
+	}
+
+	tests := []struct {
+		name              string
+		copilotClassifier bool
+		mode              PolicyRoutingMode
+		want              bool
+	}{
+		{name: "off excludes non-baseline powerful Copilot", mode: PolicyRoutingModeOff, want: false},
+		{name: "observe excludes non-baseline powerful Copilot", mode: PolicyRoutingModeObserve, want: false},
+		{name: "enforce includes powerful Copilot", mode: PolicyRoutingModeEnforce, want: true},
+		{name: "off excludes Copilot classifier", copilotClassifier: true, mode: PolicyRoutingModeOff, want: false},
+		{name: "observe includes Copilot classifier", copilotClassifier: true, mode: PolicyRoutingModeObserve, want: true},
+		{name: "enforce includes Copilot classifier", copilotClassifier: true, mode: PolicyRoutingModeEnforce, want: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := makeConfig(tc.copilotClassifier)
+			h, err := NewProxyHandler(
+				auth.NewTestAuthenticator("test-token"),
+				logger.NewWithWriter(logger.LevelError, io.Discard),
+				WithProvidersConfig(cfg),
+				WithAllowedModels("semantic"),
+				WithDeferredDynamicProviderModelValidation(true),
+				WithPolicyRoutingMode(tc.mode),
+			)
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+			copilot := h.providerSetup().providerByID("copilot")
+			if got := h.ModelUsesCopilot("semantic"); got != tc.want {
+				t.Fatalf("ModelUsesCopilot() = %v, want %v", got, tc.want)
+			}
+			if got := h.providerMayExposeAllowedModel(copilot); got != tc.want {
+				t.Fatalf("providerMayExposeAllowedModel() = %v, want %v", got, tc.want)
+			}
+			if got := h.providerWithinAllowedModelScope(copilot); got != tc.want {
+				t.Fatalf("providerWithinAllowedModelScope() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

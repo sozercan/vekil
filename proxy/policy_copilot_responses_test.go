@@ -377,9 +377,6 @@ func TestPolicyRoutingCopilotResponsesToolContinuationUsesSameProcessReplay(t *t
 		RequiresCodebaseContext: true,
 	})
 	cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
-	// A replay produced by the powerful Responses tier must stay on that tier;
-	// the unrelated lightweight tier may remain native Chat-only.
-	cfg.ModelRoutes[0].Endpoints = []string{providerEndpointChatCompletions}
 	h, err := NewProxyHandler(
 		auth.NewTestAuthenticator("fixture-token"),
 		nil,
@@ -542,5 +539,82 @@ func TestPolicyResponsesReplayPreservesPowerfulTierWhenRoutesShareTerminal(t *te
 	}
 	if route == nil || route.public.routeID != "sol-route" || tier != policyTierPowerful {
 		t.Fatalf("resolved route/tier = (%v, %v), want sol-route/powerful", route, tier)
+	}
+}
+
+func TestPolicyConfigRejectsCopilotTargetsOutsideProviderFilters(t *testing.T) {
+	t.Run("include models", func(t *testing.T) {
+		cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+		cfg.Providers[0].IncludeModels = []string{"gpt-5.6-sol"}
+		err := ValidateProvidersConfig(cfg)
+		if err == nil || !strings.Contains(err.Error(), "gpt-5.6-luna") || !strings.Contains(err.Error(), "include_models/exclude_models") {
+			t.Fatalf("ValidateProvidersConfig() error = %v", err)
+		}
+	})
+	t.Run("exclude models", func(t *testing.T) {
+		cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+		cfg.Providers[0].ExcludeModels = []string{"gpt-5.6-sol"}
+		err := ValidateProvidersConfig(cfg)
+		if err == nil || !strings.Contains(err.Error(), "gpt-5.6-sol") || !strings.Contains(err.Error(), "include_models/exclude_models") {
+			t.Fatalf("ValidateProvidersConfig() error = %v", err)
+		}
+	})
+}
+
+func TestPolicyCopilotPinnedTargetsMustSurviveDynamicDiscovery(t *testing.T) {
+	tests := []struct {
+		name   string
+		models []map[string]any
+		want   string
+	}{
+		{
+			name: "missing pinned model",
+			models: []map[string]any{
+				{"id": "gpt-5.6-sol", "object": "model", "supported_endpoints": []string{providerEndpointResponses}},
+			},
+			want: `pinned model "gpt-5.6-luna"`,
+		},
+		{
+			name: "missing pinned endpoint",
+			models: []map[string]any{
+				{"id": "gpt-5.6-luna", "object": "model", "supported_endpoints": []string{providerEndpointChatCompletions}},
+				{"id": "gpt-5.6-sol", "object": "model", "supported_endpoints": []string{providerEndpointResponses}},
+			},
+			want: `does not advertise endpoint "/responses"`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != providerEndpointModels {
+					http.NotFound(w, r)
+					return
+				}
+				if got := r.Header.Get("Authorization"); got != "Bearer fixture-token" {
+					http.Error(w, "missing auth", http.StatusUnauthorized)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": tc.models})
+			}))
+			defer upstream.Close()
+
+			h, err := NewProxyHandler(
+				auth.NewTestAuthenticator("fixture-token"),
+				nil,
+				WithCopilotBaseURL(upstream.URL),
+				WithProvidersConfig(directCopilotResponsesPolicyConfig(policyConfigModeEnforce)),
+				WithAllowedModels("gpt-5.6-semantic"),
+				WithDeferredDynamicProviderModelValidation(true),
+				WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+			)
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+			defer h.BeginShutdown()
+			err = h.ValidateDynamicProviderModels(t.Context())
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidateDynamicProviderModels() error = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }

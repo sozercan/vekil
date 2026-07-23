@@ -161,7 +161,7 @@ Validation also rejects:
 - recursive policy references;
 - destination routes without `/chat/completions` or `/responses` Chat execution support;
 - unsupported provider families or dynamic providers other than pinned `type: copilot` targets;
-- destination routes with different public Chat request semantics;
+- terminal routes with different preferred Chat backends or other public Chat request semantics;
 - classifier routes that are public, have the wrong internal purpose, or can send more than once;
 - classifiers that cannot perform the forced function-tool protocol;
 - missing trust-domain or data-policy acknowledgements; and

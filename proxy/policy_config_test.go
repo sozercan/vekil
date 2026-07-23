@@ -508,3 +508,12 @@ func TestPolicyReferencedInternalCopilotRoutesValidate(t *testing.T) {
 		t.Fatalf("ValidateProvidersConfig() error = %v", err)
 	}
 }
+
+func TestPolicyProfileRejectsMixedPreferredChatBackends(t *testing.T) {
+	cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+	cfg.ModelRoutes[0].Endpoints = []string{providerEndpointChatCompletions}
+	err := ValidateProvidersConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "preferred Chat backend") {
+		t.Fatalf("ValidateProvidersConfig() error = %v, want preferred backend mismatch", err)
+	}
+}

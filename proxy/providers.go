@@ -794,6 +794,9 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 		if err != nil {
 			return nil, fmt.Errorf("load models for provider %q: %w", provider.id, err)
 		}
+		if err := h.validateDynamicExplicitRouteTargets(setup, provider, result.models); err != nil {
+			return nil, err
+		}
 		if err := setup.addProviderModels(providerID, result.models); err != nil {
 			return nil, err
 		}
@@ -826,6 +829,9 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 		if err != nil {
 			return fmt.Errorf("load models for provider %q: %w", provider.id, err)
 		}
+		if err := h.validateDynamicExplicitRouteTargets(setup, provider, result.models); err != nil {
+			return err
+		}
 		replacements[providerID] = h.filterAllowedModels(result.models)
 	}
 	if err := setup.replaceProviderModelsBatch(replacements); err != nil {
@@ -835,6 +841,68 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 	h.dynamicProviderValidationPending.Store(false)
 	h.validateInsightModel()
 	return nil
+}
+
+func (h *ProxyHandler) validateDynamicExplicitRouteTargets(setup *providerSetup, provider *providerRuntime, models []providerModel) error {
+	if h == nil || setup == nil || provider == nil || provider.kind != providerTypeCopilot {
+		return nil
+	}
+	available := make(map[string]providerModel, len(models)*2)
+	for _, model := range models {
+		available[strings.TrimSpace(model.publicID)] = model
+		if upstream := strings.TrimSpace(model.upstreamModel); upstream != "" {
+			available[upstream] = model
+		}
+	}
+	snapshot := setup.routeRegistry().load()
+	if snapshot == nil {
+		return nil
+	}
+	for _, route := range snapshot.explicit {
+		if route == nil || !h.explicitRouteWithinAllowedPolicyScope(setup, route.public.routeID) {
+			continue
+		}
+		for _, target := range route.targets {
+			if target.provider == nil || target.provider.id != provider.id {
+				continue
+			}
+			modelID := strings.TrimSpace(target.upstreamModel)
+			model, ok := available[modelID]
+			if !ok {
+				return configPathError("providers", "pinned model %q for route %q was not retained by Copilot discovery", modelID, route.public.routeID)
+			}
+			for _, endpoint := range route.public.endpoints {
+				if !providerModelSupportsEndpoint(model, endpoint) {
+					return configPathError("providers", "pinned model %q for route %q does not advertise endpoint %q", modelID, route.public.routeID, endpoint)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (h *ProxyHandler) explicitRouteWithinAllowedPolicyScope(setup *providerSetup, routeID string) bool {
+	if h == nil || len(h.allowedModels) == 0 {
+		return true
+	}
+	routeID = strings.TrimSpace(routeID)
+	for model := range h.allowedModels {
+		entry, ok := setup.lookupPublicModelEntry(model)
+		if !ok || entry == nil || entry.kind != publicEntryPolicy {
+			continue
+		}
+		for _, profile := range h.providersConfig.PolicyProfiles {
+			if strings.TrimSpace(profile.ID) != entry.policyID {
+				continue
+			}
+			for _, referenced := range []string{profile.LightweightRoute, profile.PowerfulRoute, profile.Classifier.Route} {
+				if strings.TrimSpace(referenced) == routeID {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // providerMayExposeAllowedModel reports whether provider must participate in
@@ -1703,27 +1771,52 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 	return ok
 }
 
-func (h *ProxyHandler) policyEntryReferencesProvider(entry *publicModelEntry, provider *providerRuntime) bool {
-	if h == nil || entry == nil || entry.kind != publicEntryPolicy || provider == nil {
-		return false
+func (h *ProxyHandler) policyEntryRequiredRoutes(entry *publicModelEntry) []*modelRoute {
+	if h == nil || entry == nil || entry.kind != publicEntryPolicy {
+		return nil
 	}
+	if controller, ok := h.policyRoutingController.(*chatPolicyRoutingController); ok {
+		if profile := controller.profiles[entry.policyID]; profile != nil {
+			switch profile.effectiveMode() {
+			case policyModeOff:
+				return []*modelRoute{profile.routeForTier(profile.baselineTier)}
+			case policyModeObserve:
+				return []*modelRoute{profile.routeForTier(profile.baselineTier), profile.classifier}
+			case policyModeEnforce:
+				return []*modelRoute{profile.lightweight, profile.powerful, profile.classifier}
+			}
+		}
+	}
+
 	setup := h.providerSetup()
 	for _, profile := range h.providersConfig.PolicyProfiles {
 		if strings.TrimSpace(profile.ID) != entry.policyID {
 			continue
 		}
+		routes := make([]*modelRoute, 0, 3)
 		for _, routeID := range []string{profile.LightweightRoute, profile.PowerfulRoute, profile.Classifier.Route} {
-			route, ok := setup.lookupTerminalRoute(strings.TrimSpace(routeID))
-			if !ok || route == nil {
-				continue
-			}
-			for _, target := range route.targets {
-				if target.provider != nil && target.provider.id == provider.id {
-					return true
-				}
+			if route, ok := setup.lookupTerminalRoute(strings.TrimSpace(routeID)); ok && route != nil {
+				routes = append(routes, route)
 			}
 		}
+		return routes
+	}
+	return nil
+}
+
+func (h *ProxyHandler) policyEntryReferencesProvider(entry *publicModelEntry, provider *providerRuntime) bool {
+	if provider == nil {
 		return false
+	}
+	for _, route := range h.policyEntryRequiredRoutes(entry) {
+		if route == nil {
+			continue
+		}
+		for _, target := range route.targets {
+			if target.provider != nil && target.provider.id == provider.id {
+				return true
+			}
+		}
 	}
 	return false
 }
