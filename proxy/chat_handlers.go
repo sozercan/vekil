@@ -256,52 +256,50 @@ func inspectPolicyOpenAIStreamChunk(eventType, data string) (*policyOpenAIStream
 			if len(choices) != 1 {
 				return nil, false
 			}
-			for _, choiceRaw := range choices {
-				choice, err := decodeChatJSONObject(choiceRaw, "")
-				if err != nil || choice == nil {
-					return nil, false
-				}
-				if hasCaseFoldedJSONFieldAlias(choice, "index", "delta", "finish_reason") {
-					return nil, false
-				}
-				var index int
-				indexRaw, ok := choice["index"]
-				if !ok || rawJSONIsNullOrEmpty(indexRaw) || json.Unmarshal(indexRaw, &index) != nil || index != 0 {
-					return nil, false
-				}
-				recognized := false
-				finished := false
-				outputBearing := false
-				if deltaRaw, ok := choice["delta"]; ok && !rawJSONIsNullOrEmpty(deltaRaw) {
-					delta, err := decodeChatJSONObject(deltaRaw, "")
-					if err != nil || delta == nil {
-						return nil, false
-					}
-					if hasCaseFoldedJSONFieldAlias(delta,
-						"role", "content", "refusal", "name", "tool_calls", "tool_call_id",
-						"function_call", "reasoning", "reasoning_content", "reasoning_text", "audio",
-					) {
-						return nil, false
-					}
-					deltaProgress := classifyOpenAIChatDeltaProgress(delta)
-					outputBearing = deltaProgress == upstreamProgressSemanticOutput || deltaProgress == upstreamProgressToolActivity
-					recognized = true
-				}
-				if finishRaw, ok := choice["finish_reason"]; ok {
-					if !rawJSONIsNullOrEmpty(finishRaw) {
-						var finish string
-						if json.Unmarshal(finishRaw, &finish) != nil || strings.TrimSpace(finish) == "" {
-							return nil, false
-						}
-						finished = true
-					}
-					recognized = true
-				}
-				if !recognized {
-					return nil, false
-				}
-				return &policyOpenAIStreamChoiceState{finished: finished, outputBearing: outputBearing}, true
+			choice, err := decodeChatJSONObject(choices[0], "")
+			if err != nil || choice == nil {
+				return nil, false
 			}
+			if hasCaseFoldedJSONFieldAlias(choice, "index", "delta", "finish_reason") {
+				return nil, false
+			}
+			var index int
+			indexRaw, ok := choice["index"]
+			if !ok || rawJSONIsNullOrEmpty(indexRaw) || json.Unmarshal(indexRaw, &index) != nil || index != 0 {
+				return nil, false
+			}
+			recognized := false
+			finished := false
+			outputBearing := false
+			if deltaRaw, ok := choice["delta"]; ok && !rawJSONIsNullOrEmpty(deltaRaw) {
+				delta, err := decodeChatJSONObject(deltaRaw, "")
+				if err != nil || delta == nil {
+					return nil, false
+				}
+				if hasCaseFoldedJSONFieldAlias(delta,
+					"role", "content", "refusal", "name", "tool_calls", "tool_call_id",
+					"function_call", "reasoning", "reasoning_content", "reasoning_text", "audio",
+				) {
+					return nil, false
+				}
+				deltaProgress := classifyOpenAIChatDeltaProgress(delta)
+				outputBearing = deltaProgress == upstreamProgressSemanticOutput || deltaProgress == upstreamProgressToolActivity
+				recognized = true
+			}
+			if finishRaw, ok := choice["finish_reason"]; ok {
+				if !rawJSONIsNullOrEmpty(finishRaw) {
+					var finish string
+					if json.Unmarshal(finishRaw, &finish) != nil || strings.TrimSpace(finish) == "" {
+						return nil, false
+					}
+					finished = true
+				}
+				recognized = true
+			}
+			if !recognized {
+				return nil, false
+			}
+			return &policyOpenAIStreamChoiceState{finished: finished, outputBearing: outputBearing}, true
 		}
 	}
 
