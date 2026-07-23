@@ -1684,7 +1684,10 @@ func aggregateStreamToResponseWithProgress(body io.ReadCloser) (*models.OpenAIRe
 }
 
 func aggregatePolicyStreamToResponseWithProgress(body io.ReadCloser) (*models.OpenAIResponse, upstreamSemanticProgress, error) {
-	return aggregateStreamToResponseWithProgressOptions(body, openAIResponseBuildOptions{preserveInvalidToolArguments: true})
+	return aggregateStreamToResponseWithProgressOptions(body, openAIResponseBuildOptions{
+		preserveInvalidToolArguments: true,
+		rejectInvalidTextDeltas:      true,
+	})
 }
 
 func aggregateStreamToResponseWithProgressOptions(body io.ReadCloser, options openAIResponseBuildOptions) (*models.OpenAIResponse, upstreamSemanticProgress, error) {
@@ -1700,6 +1703,11 @@ func aggregateStreamToResponseWithProgressOptions(body io.ReadCloser, options op
 	}
 	if !sawDone {
 		return nil, progress, fmt.Errorf("stream ended before [DONE]")
+	}
+	if options.rejectInvalidTextDeltas {
+		if err := aggregator.policyTextDeltaError(); err != nil {
+			return nil, progress, err
+		}
 	}
 
 	return aggregator.buildResponseWithOptions(options), progress, nil
@@ -2020,11 +2028,14 @@ type aggregatedOpenAIChoice struct {
 
 type openAIResponseBuildOptions struct {
 	preserveInvalidToolArguments bool
+	rejectInvalidTextDeltas      bool
 }
 
 type openAIResponseAggregator struct {
-	response       models.OpenAIResponse
-	choicesByIndex map[int]*aggregatedOpenAIChoice
+	response            models.OpenAIResponse
+	choicesByIndex      map[int]*aggregatedOpenAIChoice
+	invalidContentDelta bool
+	invalidRefusalDelta bool
 }
 
 func newOpenAIResponseAggregator() *openAIResponseAggregator {
@@ -2064,6 +2075,8 @@ func (a *openAIResponseAggregator) addChoice(choice models.OpenAIStreamChoice) {
 		if err := json.Unmarshal(choice.Delta.Content, &text); err == nil {
 			aggChoice.contentPresent = true
 			aggChoice.content.WriteString(text)
+		} else {
+			a.invalidContentDelta = true
 		}
 	}
 	if choice.Delta.Refusal != nil && !bytes.Equal(bytes.TrimSpace(choice.Delta.Refusal), []byte("null")) {
@@ -2071,6 +2084,8 @@ func (a *openAIResponseAggregator) addChoice(choice models.OpenAIStreamChoice) {
 		if err := json.Unmarshal(choice.Delta.Refusal, &refusal); err == nil {
 			aggChoice.refusalPresent = true
 			aggChoice.refusal.WriteString(refusal)
+		} else {
+			a.invalidRefusalDelta = true
 		}
 	}
 
@@ -2103,6 +2118,19 @@ func (a *openAIResponseAggregator) addChoice(choice models.OpenAIStreamChoice) {
 		finishReason := *choice.FinishReason
 		aggChoice.finishReason = &finishReason
 	}
+}
+
+func (a *openAIResponseAggregator) policyTextDeltaError() error {
+	if a == nil {
+		return nil
+	}
+	if a.invalidContentDelta {
+		return fmt.Errorf("policy Chat stream contained a malformed content delta")
+	}
+	if a.invalidRefusalDelta {
+		return fmt.Errorf("policy Chat stream contained a malformed refusal delta")
+	}
+	return nil
 }
 
 func (a *openAIResponseAggregator) choice(index int) *aggregatedOpenAIChoice {

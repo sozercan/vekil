@@ -360,7 +360,10 @@ func aggregateChatStreamEvents(stream *chatStreamEventStream) (*models.OpenAIRes
 }
 
 func aggregatePolicyChatStreamEvents(stream *chatStreamEventStream) (*models.OpenAIResponse, error) {
-	return aggregateChatStreamEventsWithOptions(stream, openAIResponseBuildOptions{preserveInvalidToolArguments: true})
+	return aggregateChatStreamEventsWithOptions(stream, openAIResponseBuildOptions{
+		preserveInvalidToolArguments: true,
+		rejectInvalidTextDeltas:      true,
+	})
 }
 
 func aggregateChatStreamEventsWithOptions(stream *chatStreamEventStream, options openAIResponseBuildOptions) (*models.OpenAIResponse, error) {
@@ -370,6 +373,11 @@ func aggregateChatStreamEventsWithOptions(stream *chatStreamEventStream, options
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+	if options.rejectInvalidTextDeltas {
+		if err := aggregator.policyTextDeltaError(); err != nil {
+			return nil, err
+		}
 	}
 	return aggregator.buildResponseWithOptions(options), nil
 }

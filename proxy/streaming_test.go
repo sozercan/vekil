@@ -2263,3 +2263,23 @@ func TestClassifyOpenAIChatChunkProgressTreatsModerationAsIrreversible(t *testin
 		t.Fatalf("empty moderation progress = %q, want %q", got, upstreamProgressUnknown)
 	}
 }
+
+func TestAggregatePolicyStreamRejectsMalformedTextDelta(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"chat","object":"chat.completion.chunk","model":"upstream","choices":[{"index":0,"delta":{"role":"assistant","content":"safe"}}]}`,
+		`data: {"id":"chat","object":"chat.completion.chunk","model":"upstream","choices":[{"index":0,"delta":{"content":{"unexpected":true}}}]}`,
+		`data: {"id":"chat","object":"chat.completion.chunk","model":"upstream","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+
+	if response, _, err := aggregateStreamToResponseWithProgress(io.NopCloser(strings.NewReader(stream))); err != nil {
+		t.Fatalf("generic aggregation error = %v", err)
+	} else if got := response.Choices[0].Message.Content; string(got) != `"safe"` {
+		t.Fatalf("generic content = %s, want safe prefix", got)
+	}
+
+	if _, _, err := aggregatePolicyStreamToResponseWithProgress(io.NopCloser(strings.NewReader(stream))); err == nil || !strings.Contains(err.Error(), "malformed content delta") {
+		t.Fatalf("policy aggregation error = %v, want malformed content rejection", err)
+	}
+}
