@@ -1548,10 +1548,7 @@ func hideInternalCopilotRouteModels(routes []*modelRoute) {
 			if target.provider == nil || target.provider.kind != providerTypeCopilot {
 				continue
 			}
-			model := strings.TrimSpace(target.upstreamModel)
-			if model != "" {
-				target.provider.hiddenModels[model] = struct{}{}
-			}
+			target.provider.hideModel(target.upstreamModel)
 		}
 	}
 }
@@ -1574,8 +1571,33 @@ func (p *providerRuntime) hidesModel(model string) bool {
 	if p == nil {
 		return false
 	}
-	_, hidden := p.hiddenModels[strings.TrimSpace(model)]
+	model = strings.TrimSpace(model)
+	if _, hidden := p.hiddenModels[model]; hidden {
+		return true
+	}
+	normalized := NormalizeModelName(model)
+	if normalized == model {
+		return false
+	}
+	_, hidden := p.hiddenModels[normalized]
 	return hidden
+}
+
+func (p *providerRuntime) hideModel(model string) {
+	if p == nil {
+		return
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	if p.hiddenModels == nil {
+		p.hiddenModels = make(map[string]struct{})
+	}
+	p.hiddenModels[model] = struct{}{}
+	if normalized := NormalizeModelName(model); normalized != "" {
+		p.hiddenModels[normalized] = struct{}{}
+	}
 }
 
 func providerHasModelFilters(provider *providerRuntime) bool {

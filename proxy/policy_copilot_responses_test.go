@@ -242,6 +242,39 @@ func TestPolicyConfigAcceptsPinnedDynamicCopilotResponsesRoutes(t *testing.T) {
 	}
 }
 
+func TestProxyHandlerPolicyRoutingDefaultsToConfigMode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []Option
+		want policyMode
+	}{
+		{name: "default follows profile", want: policyModeEnforce},
+		{name: "explicit off remains off", opts: []Option{WithPolicyRoutingMode(PolicyRoutingModeOff)}, want: policyModeOff},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options := []Option{
+				WithProvidersConfig(directCopilotResponsesPolicyConfig(policyConfigModeEnforce)),
+				WithDeferredDynamicProviderModelValidation(true),
+			}
+			options = append(options, tc.opts...)
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("fixture-token"), nil, options...)
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			controller := h.policyRoutingController.(*chatPolicyRoutingController)
+			profile := controller.profiles["semantic-policy"]
+			if profile == nil || profile.effectiveMode() != tc.want {
+				t.Fatalf("effective mode = %v, want %v", profile.effectiveMode(), tc.want)
+			}
+			wantActive := tc.want != policyModeOff
+			if h.PolicyRoutingActive() != wantActive || h.PolicyRoutingPreflightPending() != wantActive {
+				t.Fatalf("active = %v, preflight pending = %v, want both %v", h.PolicyRoutingActive(), h.PolicyRoutingPreflightPending(), wantActive)
+			}
+		})
+	}
+}
+
 func TestPolicyConfigDirectCopilotRetainsTrustAndRetentionChecks(t *testing.T) {
 	t.Run("retention acknowledgement", func(t *testing.T) {
 		cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
@@ -465,6 +498,31 @@ func TestPublicExplicitRouteMayMatchHiddenCopilotTargetModel(t *testing.T) {
 	route, ok := h.resolveModelRouteForRequest("gpt-5.6-luna", providerEndpointChatCompletions)
 	if !ok || route == nil || route.public.id != "gpt-5.6-luna" || route.public.routeID != "public-luna-route" {
 		t.Fatalf("resolved route = %+v, known = %v", route, ok)
+	}
+}
+
+func TestHiddenCopilotTargetRejectsNormalizedAliases(t *testing.T) {
+	cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+	cfg.Providers[0].IncludeModels = []string{"claude-sonnet-4.6", "gpt-5.6-sol"}
+	cfg.ModelRoutes[0].Targets[0].UpstreamModel = "claude-sonnet-4.6"
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("fixture-token"),
+		nil,
+		WithProvidersConfig(cfg),
+		WithDeferredDynamicProviderModelValidation(true),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	t.Cleanup(h.BeginShutdown)
+
+	for _, model := range []string{"claude-sonnet-4.6", "claude-sonnet-4-6", "claude-sonnet-4-6-20260101"} {
+		t.Run(model, func(t *testing.T) {
+			if h.modelAllowedForRequest(model, providerEndpointChatCompletions) {
+				t.Fatalf("hidden Copilot target alias %q was allowed for direct routing", model)
+			}
+		})
 	}
 }
 

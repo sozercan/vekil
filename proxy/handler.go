@@ -715,8 +715,9 @@ func WithProvidersConfig(cfg ProvidersConfig) Option {
 	}
 }
 
-// WithPolicyRoutingMode sets the process-wide policy safety ceiling. The zero
-// value is treated as off.
+// WithPolicyRoutingMode sets the process-wide policy safety ceiling. New
+// handlers follow configured profile modes by default; an explicit off (or
+// zero) value preserves the rollback ceiling.
 func WithPolicyRoutingMode(mode PolicyRoutingMode) Option {
 	return func(h *ProxyHandler) {
 		h.policyRoutingMode = mode
@@ -862,7 +863,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		responsesWS:                     DefaultResponsesWebSocketConfig(),
 		streamingUpstreamTimeout:        streamingUpstreamTimeout,
 		chatRoutes:                      newChatRouteDiscoveryCache(),
-		policyRoutingMode:               PolicyRoutingModeOff,
+		policyRoutingMode:               PolicyRoutingModeConfig,
 		responsesChatReplay:             newResponsesChatReplayStore(),
 		log:                             log,
 		stats:                           newStatsCollector(),
