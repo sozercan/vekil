@@ -40,12 +40,21 @@ type chatCompletionsResponseHandlers struct {
 	passthrough  func(*http.Response) error
 }
 
+type policyOpenAIStreamChoiceState struct {
+	finished      bool
+	outputBearing bool
+}
+
 type policySanitizedOpenAIStream struct {
-	body          io.ReadCloser
-	reader        *bufio.Reader
-	maxEventBytes int
-	pending       []byte
-	pendingErr    error
+	body           io.ReadCloser
+	reader         *bufio.Reader
+	maxEventBytes  int
+	pending        []byte
+	pendingErr     error
+	sourceEOF      bool
+	terminal       bool
+	sawChoice      bool
+	choiceFinished bool
 }
 
 func newPolicySanitizedOpenAIStream(body io.ReadCloser) io.ReadCloser {
@@ -66,6 +75,9 @@ func (s *policySanitizedOpenAIStream) Read(p []byte) (int, error) {
 			s.pendingErr = nil
 			return 0, err
 		}
+		if s.terminal {
+			return 0, io.EOF
+		}
 		event, err := s.readEvent()
 		s.pending = event
 		s.pendingErr = err
@@ -83,14 +95,16 @@ func (s *policySanitizedOpenAIStream) Close() error {
 }
 
 func (s *policySanitizedOpenAIStream) readEvent() ([]byte, error) {
+	if s.sourceEOF {
+		return s.failEvent(http.StatusBadGateway), nil
+	}
 	var raw bytes.Buffer
 	eventType := ""
 	dataLines := make([]string, 0, 1)
 	for {
 		line, err := readOpenAISSELine(s.reader)
 		if err != nil && !errors.Is(err, io.EOF) {
-			_ = s.body.Close()
-			return policySanitizedOpenAIStreamErrorEvent(http.StatusBadGateway), io.EOF
+			return s.failEvent(http.StatusBadGateway), nil
 		}
 		if line != "" {
 			limit := s.maxEventBytes
@@ -98,8 +112,7 @@ func (s *policySanitizedOpenAIStream) readEvent() ([]byte, error) {
 				limit = openAIStreamScannerMaxBuffer
 			}
 			if len(line) > limit-raw.Len() {
-				_ = s.body.Close()
-				return policySanitizedOpenAIStreamErrorEvent(http.StatusBadGateway), io.EOF
+				return s.failEvent(http.StatusBadGateway), nil
 			}
 			raw.WriteString(line)
 			content, _ := splitSSELineEnding(line)
@@ -110,120 +123,215 @@ func (s *policySanitizedOpenAIStream) readEvent() ([]byte, error) {
 				dataLines = append(dataLines, data)
 			}
 			if strings.TrimSpace(content) == "" {
-				return sanitizePolicyOpenAIStreamEvent(raw.Bytes(), eventType, dataLines), err
+				if errors.Is(err, io.EOF) {
+					s.sourceEOF = true
+				}
+				return s.sanitizeEvent(raw.Bytes(), eventType, dataLines), nil
 			}
 		}
-		if err != nil {
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			s.sourceEOF = true
 			if raw.Len() > 0 {
-				return sanitizePolicyOpenAIStreamEvent(raw.Bytes(), eventType, dataLines), err
+				event := s.sanitizeEvent(raw.Bytes(), eventType, dataLines)
+				if s.terminal {
+					return terminatePolicySSEEvent(event), nil
+				}
+				return s.failEvent(http.StatusBadGateway), nil
 			}
-			return nil, err
+			return s.failEvent(http.StatusBadGateway), nil
 		}
+		return s.failEvent(http.StatusBadGateway), nil
 	}
 }
 
-func sanitizePolicyOpenAIStreamEvent(raw []byte, eventType string, dataLines []string) []byte {
+func (s *policySanitizedOpenAIStream) sanitizeEvent(raw []byte, eventType string, dataLines []string) []byte {
 	if len(dataLines) == 0 {
 		return append([]byte(nil), raw...)
 	}
 	data := strings.Join(dataLines, "\n")
 	if strings.TrimSpace(data) == "[DONE]" {
+		if !s.allChoicesFinished() {
+			return s.failEvent(http.StatusBadGateway)
+		}
+		s.terminal = true
+		_ = s.body.Close()
 		return append([]byte(nil), raw...)
 	}
 	if !json.Valid([]byte(data)) {
-		return policySanitizedOpenAIStreamErrorEvent(http.StatusBadGateway)
+		return s.failEvent(http.StatusBadGateway)
 	}
-	streamErr, ok := parseOpenAIStreamError(eventType, data)
-	if !ok {
-		if !recognizedPolicyOpenAIStreamChunk(eventType, data) {
-			return policySanitizedOpenAIStreamErrorEvent(http.StatusBadGateway)
-		}
-		return append([]byte(nil), raw...)
+	if streamErr, ok := parseOpenAIStreamError(eventType, data); ok {
+		return s.failEvent(streamErr.httpStatus())
 	}
-	message, errType, code := policyChatUpstreamErrorDetails(streamErr.httpStatus())
-	payload, err := json.Marshal(openAIChatStreamErrorEnvelope{Error: openAIChatStreamErrorBody{
-		Type: errType, Code: code, Message: message,
-	}})
-	if err != nil {
-		return append([]byte(nil), raw...)
+	choice, recognized := inspectPolicyOpenAIStreamChunk(eventType, data)
+	if !recognized {
+		return s.failEvent(http.StatusBadGateway)
 	}
-	return []byte("event: error\ndata: " + string(payload) + "\n\n")
+	if !s.observeChunkChoice(choice) {
+		return s.failEvent(http.StatusBadGateway)
+	}
+	return append([]byte(nil), raw...)
+}
+
+func (s *policySanitizedOpenAIStream) failEvent(status int) []byte {
+	s.terminal = true
+	if s.body != nil {
+		_ = s.body.Close()
+	}
+	return policySanitizedOpenAIStreamErrorEvent(status)
+}
+
+func (s *policySanitizedOpenAIStream) observeChunkChoice(choice *policyOpenAIStreamChoiceState) bool {
+	if choice == nil {
+		return true
+	}
+	if s.choiceFinished && choice.outputBearing {
+		return false
+	}
+	s.sawChoice = true
+	if choice.finished {
+		s.choiceFinished = true
+	}
+	return true
+}
+
+func (s *policySanitizedOpenAIStream) allChoicesFinished() bool {
+	return s != nil && s.sawChoice && s.choiceFinished
 }
 
 func recognizedPolicyOpenAIStreamChunk(eventType, data string) bool {
+	_, ok := inspectPolicyOpenAIStreamChunk(eventType, data)
+	return ok
+}
+
+func inspectPolicyOpenAIStreamChunk(eventType, data string) (*policyOpenAIStreamChoiceState, bool) {
 	switch strings.ToLower(strings.TrimSpace(eventType)) {
 	case "", "message", "completion", "chat.completion.chunk":
 	default:
-		return false
+		return nil, false
 	}
 
-	var raw map[string]json.RawMessage
-	if json.Unmarshal([]byte(data), &raw) != nil || raw == nil {
-		return false
+	raw, err := decodeChatJSONObject([]byte(data), "")
+	if err != nil || raw == nil {
+		return nil, false
+	}
+	if hasCaseFoldedJSONFieldAlias(raw,
+		"id", "object", "created", "model", "choices", "usage", "moderation",
+		"system_fingerprint", "service_tier", "prompt_filter_results", "prompt_annotations",
+	) {
+		return nil, false
 	}
 	var chunk models.OpenAIStreamChunk
 	if json.Unmarshal([]byte(data), &chunk) != nil {
-		return false
+		return nil, false
 	}
 	if object := strings.TrimSpace(chunk.Object); object != "" && object != "chat.completion.chunk" {
-		return false
+		return nil, false
 	}
 	if recognizedFoundryPromptFilterAnnotation(raw) {
-		return true
+		return nil, true
 	}
 	if recognizedOpenAIModerationChunk(raw) {
-		return true
+		return nil, true
 	}
 	inspection := inspectOpenAIChatStreamEvent(eventType, data)
 	if inspection.chunk == nil || inspection.progress == upstreamProgressUnknown {
-		return false
+		return nil, false
 	}
 	choicesRaw, hasChoices := raw["choices"]
 	if hasChoices {
 		if rawJSONIsNullOrEmpty(choicesRaw) {
-			return false
+			return nil, false
 		}
 		var choices []json.RawMessage
 		if json.Unmarshal(choicesRaw, &choices) != nil {
-			return false
+			return nil, false
 		}
 		if len(choices) > 0 {
+			// Anthropic ingress represents one assistant message and never requests
+			// multiple Chat choices, so only a single choice at index zero is safe.
+			if len(choices) != 1 {
+				return nil, false
+			}
 			for _, choiceRaw := range choices {
-				var choice map[string]json.RawMessage
-				if json.Unmarshal(choiceRaw, &choice) != nil || choice == nil {
-					return false
+				choice, err := decodeChatJSONObject(choiceRaw, "")
+				if err != nil || choice == nil {
+					return nil, false
+				}
+				if hasCaseFoldedJSONFieldAlias(choice, "index", "delta", "finish_reason") {
+					return nil, false
+				}
+				var index int
+				indexRaw, ok := choice["index"]
+				if !ok || rawJSONIsNullOrEmpty(indexRaw) || json.Unmarshal(indexRaw, &index) != nil || index != 0 {
+					return nil, false
 				}
 				recognized := false
+				finished := false
+				outputBearing := false
 				if deltaRaw, ok := choice["delta"]; ok && !rawJSONIsNullOrEmpty(deltaRaw) {
-					var delta map[string]json.RawMessage
-					if json.Unmarshal(deltaRaw, &delta) != nil || delta == nil {
-						return false
+					delta, err := decodeChatJSONObject(deltaRaw, "")
+					if err != nil || delta == nil {
+						return nil, false
 					}
+					if hasCaseFoldedJSONFieldAlias(delta,
+						"role", "content", "refusal", "name", "tool_calls", "tool_call_id",
+						"function_call", "reasoning", "reasoning_content", "reasoning_text", "audio",
+					) {
+						return nil, false
+					}
+					deltaProgress := classifyOpenAIChatDeltaProgress(delta)
+					outputBearing = deltaProgress == upstreamProgressSemanticOutput || deltaProgress == upstreamProgressToolActivity
 					recognized = true
 				}
 				if finishRaw, ok := choice["finish_reason"]; ok {
 					if !rawJSONIsNullOrEmpty(finishRaw) {
 						var finish string
 						if json.Unmarshal(finishRaw, &finish) != nil || strings.TrimSpace(finish) == "" {
-							return false
+							return nil, false
 						}
+						finished = true
 					}
 					recognized = true
 				}
 				if !recognized {
-					return false
+					return nil, false
 				}
+				return &policyOpenAIStreamChoiceState{finished: finished, outputBearing: outputBearing}, true
 			}
-			return true
 		}
 	}
 
 	usageRaw, hasUsage := raw["usage"]
 	if !hasUsage || rawJSONIsNullOrEmpty(usageRaw) {
-		return false
+		return nil, false
 	}
 	var usage models.OpenAIUsage
-	return json.Unmarshal(usageRaw, &usage) == nil
+	if json.Unmarshal(usageRaw, &usage) != nil {
+		return nil, false
+	}
+	return nil, true
+}
+
+func terminatePolicySSEEvent(event []byte) []byte {
+	trimmed := bytes.TrimRight(event, "\r\n")
+	terminated := make([]byte, 0, len(trimmed)+2)
+	terminated = append(terminated, trimmed...)
+	return append(terminated, '\n', '\n')
+}
+
+func hasCaseFoldedJSONFieldAlias(object map[string]json.RawMessage, canonical ...string) bool {
+	for key := range object {
+		for _, name := range canonical {
+			if key != name && strings.EqualFold(key, name) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func recognizedFoundryPromptFilterAnnotation(raw map[string]json.RawMessage) bool {

@@ -75,7 +75,7 @@ func TestPolicySanitizedOpenAIStreamAllowsFoundryFilterAnnotations(t *testing.T)
 	stream := strings.Join([]string{
 		`data: {"id":"","object":"","created":0,"model":"","prompt_filter_results":[{"prompt_index":0,"content_filter_results":{"hate":{"filtered":false,"severity":"safe"}}}],"choices":[],"usage":null}`,
 		`data: {"id":"chat","object":"chat.completion.chunk","created":1,"model":"light-model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null,"content_filter_results":{"hate":{"filtered":false,"severity":"safe"}}}],"usage":null}`,
-		`data: {"id":"","object":"","created":0,"model":"","choices":[{"index":0,"delta":{},"finish_reason":"stop","content_filter_results":{},"content_filter_offsets":{"check_offset":4,"start_offset":0,"end_offset":2}}],"usage":null}`,
+		`data: {"id":"","object":"","created":0,"model":"","choices":[{"index":0,"delta":{},"finish_reason":"content_filter","content_filter_results":{},"content_filter_offsets":{"check_offset":4,"start_offset":0,"end_offset":2}}],"usage":null}`,
 		`data: [DONE]`,
 		"",
 	}, "\n\n")
@@ -100,6 +100,79 @@ func TestPolicySanitizedOpenAIStreamAllowsOpenAIModerationChunk(t *testing.T) {
 	body := recorder.Body.String()
 	if !strings.Contains(body, `"text":"ok"`) || !strings.Contains(body, "event: message_stop") || strings.Contains(body, `"message":"upstream request failed"`) {
 		t.Fatalf("OpenAI moderation chunk was not preserved as a valid stream: %s", body)
+	}
+}
+
+func TestPolicySanitizedOpenAIStreamRejectsMultipleChoices(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"chat","object":"chat.completion.chunk","created":1,"model":"light-model","choices":[{"index":0,"delta":{"role":"assistant","content":"first"},"finish_reason":null},{"index":1,"delta":{"role":"assistant","content":"second"},"finish_reason":null}],"usage":null}`,
+		`data: {"id":"chat","object":"chat.completion.chunk","created":1,"model":"light-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delta":{},"finish_reason":null}],"usage":null}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	recorder := httptest.NewRecorder()
+	StreamOpenAIToAnthropic(recorder, newPolicySanitizedOpenAIStream(io.NopCloser(strings.NewReader(stream))), "coding-economy", "msg-unfinished-choice")
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"message":"upstream request failed"`) || strings.Contains(body, "event: message_stop") {
+		t.Fatalf("unfinished policy stream was accepted: %s", body)
+	}
+}
+
+func TestPolicySanitizedOpenAIStreamLatchesIncompleteDone(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"chat","object":"chat.completion.chunk","created":1,"model":"light-model","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}],"usage":null}`,
+		`data: [DONE]`,
+		`data: {"id":"chat","object":"chat.completion.chunk","created":1,"model":"light-model","choices":[{"index":0,"delta":{"content":"late"},"finish_reason":"stop"}],"usage":null}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	filtered, err := io.ReadAll(newPolicySanitizedOpenAIStream(io.NopCloser(strings.NewReader(stream))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(filtered)
+	if !strings.Contains(body, `"message":"upstream request failed"`) || strings.Contains(body, `"content":"late"`) || strings.Contains(body, "[DONE]") {
+		t.Fatalf("incomplete terminal did not latch the sanitized stream: %s", body)
+	}
+}
+
+func TestPolicySanitizedOpenAIStreamRejectsEOFBeforeDone(t *testing.T) {
+	stream := "data: {\"id\":\"chat\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"light-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}],\"usage\":null}\n\n"
+	filtered, err := io.ReadAll(newPolicySanitizedOpenAIStream(io.NopCloser(strings.NewReader(stream))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := string(filtered); !strings.Contains(body, `"message":"upstream request failed"`) {
+		t.Fatalf("EOF before [DONE] was not sanitized: %s", body)
+	}
+}
+
+func TestPolicySanitizedOpenAIStreamRejectsUnterminatedEventAtEOF(t *testing.T) {
+	stream := `data: {"id":"chat","object":"chat.completion.chunk","created":1,"model":"light-model","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}],"usage":null}`
+	filtered, err := io.ReadAll(newPolicySanitizedOpenAIStream(io.NopCloser(strings.NewReader(stream))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(filtered)
+	if !strings.HasPrefix(body, "event: error\ndata: ") || strings.Contains(body, `"content":"partial"`) {
+		t.Fatalf("unterminated EOF event was not replaced by a framed error: %s", body)
+	}
+}
+
+func TestPolicySanitizedOpenAIStreamRejectsOutputAfterFinish(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"chat","object":"chat.completion.chunk","created":1,"model":"light-model","choices":[{"index":0,"delta":{"content":"first"},"finish_reason":"stop"}],"usage":null}`,
+		`data: {"id":"chat","object":"chat.completion.chunk","created":1,"model":"light-model","choices":[{"index":0,"delta":{"content":"late"},"finish_reason":null}],"usage":null}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	filtered, err := io.ReadAll(newPolicySanitizedOpenAIStream(io.NopCloser(strings.NewReader(stream))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(filtered)
+	if !strings.Contains(body, `"message":"upstream request failed"`) || strings.Contains(body, `"content":"late"`) || strings.Contains(body, "[DONE]") {
+		t.Fatalf("post-finish output was accepted: %s", body)
 	}
 }
 
@@ -656,7 +729,17 @@ func TestHandleAnthropicMessagesPolicyIngressSanitizesMalformedStreamError(t *te
 }
 
 func TestHandleAnthropicMessagesPolicyIngressSanitizesMalformedClientStreamError(t *testing.T) {
-	for _, malformed := range []string{"not-json", `{}`, `{"choices":null}`, `{"choices":[]}`, `{"choices":[{}]}`, `{"choices":"not-an-array"}`} {
+	for _, malformed := range []string{
+		"not-json",
+		`{}`,
+		`{"choices":null}`,
+		`{"choices":[]}`,
+		`{"choices":[{}]}`,
+		`{"choices":"not-an-array"}`,
+		`{"choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":null}]}`,
+		`{"choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":null,"Finish_Reason":"stop"}]}`,
+		`{"choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":"stop","Finish_Reason":null}]}`,
+	} {
 		t.Run(malformed, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				defer func() { _ = r.Body.Close() }()
