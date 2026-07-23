@@ -427,6 +427,47 @@ func TestPolicyPublicIDMayMatchHiddenCopilotTargetModel(t *testing.T) {
 	}
 }
 
+func TestPublicExplicitRouteMayMatchHiddenCopilotTargetModel(t *testing.T) {
+	cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+	cfg.Providers = append(cfg.Providers, ProviderConfig{
+		ID:             "local",
+		Type:           "openai-compatible",
+		BaseURL:        "https://local.example.test/v1",
+		AuthType:       "none",
+		ModelDiscovery: "static",
+		TrustDomain:    "org",
+	})
+	cfg.ModelRoutes = append(cfg.ModelRoutes, ModelRouteConfig{
+		ID:        "public-luna-route",
+		PublicID:  "gpt-5.6-luna",
+		Endpoints: []string{providerEndpointChatCompletions},
+		Targets: []ModelRouteTargetConfig{{
+			ID:            "local-luna",
+			Provider:      "local",
+			UpstreamModel: "local-luna",
+		}},
+	})
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("fixture-token"),
+		nil,
+		WithProvidersConfig(cfg),
+		WithDeferredDynamicProviderModelValidation(true),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	t.Cleanup(h.BeginShutdown)
+
+	if !h.modelAllowedForRequest("gpt-5.6-luna", providerEndpointChatCompletions) {
+		t.Fatal("public explicit route was blocked by a provider-local hidden model")
+	}
+	route, ok := h.resolveModelRouteForRequest("gpt-5.6-luna", providerEndpointChatCompletions)
+	if !ok || route == nil || route.public.id != "gpt-5.6-luna" || route.public.routeID != "public-luna-route" {
+		t.Fatalf("resolved route = %+v, known = %v", route, ok)
+	}
+}
+
 func TestPolicyRoutingCopilotResponsesToolContinuationUsesSameProcessReplay(t *testing.T) {
 	upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{
 		TurnType:                policyTurnTypePlanning,
@@ -649,6 +690,14 @@ func TestPolicyCopilotPinnedTargetsMustSurviveDynamicDiscovery(t *testing.T) {
 			want: "did not advertise supported_endpoints",
 		},
 		{
+			name: "invalid endpoint advertisement",
+			models: []map[string]any{
+				{"id": "gpt-5.6-luna", "object": "model", "supported_endpoints": []string{"", "   "}},
+				{"id": "gpt-5.6-sol", "object": "model", "supported_endpoints": []string{providerEndpointResponses}},
+			},
+			want: "did not advertise supported_endpoints",
+		},
+		{
 			name: "disabled pinned model",
 			models: []map[string]any{
 				{"id": "gpt-5.6-luna", "object": "model", "supported_endpoints": []string{providerEndpointResponses}, "policy": map[string]any{"state": "disabled"}},
@@ -723,21 +772,36 @@ func TestPolicyCopilotDynamicValidationSkipsInactiveTierRoutes(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h, err := NewProxyHandler(
-		auth.NewTestAuthenticator("fixture-token"),
-		nil,
-		WithCopilotBaseURL(upstream.URL),
-		WithProvidersConfig(cfg),
-		WithAllowedModels("semantic"),
-		WithDeferredDynamicProviderModelValidation(true),
-		WithPolicyRoutingMode(PolicyRoutingModeObserve),
-	)
-	if err != nil {
-		t.Fatalf("NewProxyHandler() error = %v", err)
-	}
-	defer h.BeginShutdown()
-	if err := h.ValidateDynamicProviderModels(t.Context()); err != nil {
-		t.Fatalf("ValidateDynamicProviderModels() rejected inactive powerful route: %v", err)
+	for _, tc := range []struct {
+		name          string
+		allowedModels []string
+	}{
+		{name: "allowed model scope", allowedModels: []string{"semantic"}},
+		{name: "unscoped serve"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options := []Option{
+				WithCopilotBaseURL(upstream.URL),
+				WithProvidersConfig(cfg),
+				WithDeferredDynamicProviderModelValidation(true),
+				WithPolicyRoutingMode(PolicyRoutingModeObserve),
+			}
+			if len(tc.allowedModels) > 0 {
+				options = append(options, WithAllowedModels(tc.allowedModels...))
+			}
+			h, err := NewProxyHandler(
+				auth.NewTestAuthenticator("fixture-token"),
+				nil,
+				options...,
+			)
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			if err := h.ValidateDynamicProviderModels(t.Context()); err != nil {
+				t.Fatalf("ValidateDynamicProviderModels() rejected inactive powerful route: %v", err)
+			}
+		})
 	}
 }
 
@@ -869,18 +933,33 @@ func TestPolicyCopilotSynchronousValidationSkipsInactiveTierRoutes(t *testing.T)
 	}))
 	defer upstream.Close()
 
-	h, err := NewProxyHandler(
-		auth.NewTestAuthenticator("fixture-token"),
-		nil,
-		WithCopilotBaseURL(upstream.URL),
-		WithProvidersConfig(cfg),
-		WithAllowedModels("semantic"),
-		WithPolicyRoutingMode(PolicyRoutingModeObserve),
-	)
-	if err != nil {
-		t.Fatalf("NewProxyHandler() rejected inactive powerful route: %v", err)
+	for _, tc := range []struct {
+		name          string
+		allowedModels []string
+	}{
+		{name: "allowed model scope", allowedModels: []string{"semantic"}},
+		{name: "unscoped serve"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options := []Option{
+				WithCopilotBaseURL(upstream.URL),
+				WithProvidersConfig(cfg),
+				WithPolicyRoutingMode(PolicyRoutingModeObserve),
+			}
+			if len(tc.allowedModels) > 0 {
+				options = append(options, WithAllowedModels(tc.allowedModels...))
+			}
+			h, err := NewProxyHandler(
+				auth.NewTestAuthenticator("fixture-token"),
+				nil,
+				options...,
+			)
+			if err != nil {
+				t.Fatalf("NewProxyHandler() rejected inactive powerful route: %v", err)
+			}
+			t.Cleanup(h.BeginShutdown)
+		})
 	}
-	defer h.BeginShutdown()
 }
 
 func TestReadPolicyClassifierUsageForResponsesShape(t *testing.T) {

@@ -891,19 +891,44 @@ func (h *ProxyHandler) validateDynamicExplicitRouteTargets(setup *providerSetup,
 }
 
 func (h *ProxyHandler) explicitRouteWithinAllowedPolicyScope(setup *providerSetup, routeID string) bool {
-	if h == nil || len(h.allowedModels) == 0 {
-		return true
+	if h == nil || setup == nil {
+		return false
 	}
 	routeID = strings.TrimSpace(routeID)
+	if routeID == "" {
+		return false
+	}
+	referencesRoute := func(entry *publicModelEntry) bool {
+		for _, route := range h.policyEntryRequiredRoutesForSetup(entry, setup) {
+			if route != nil && route.public.routeID == routeID {
+				return true
+			}
+		}
+		return false
+	}
+	if len(h.allowedModels) == 0 {
+		registry := setup.routeRegistry()
+		if registry == nil {
+			return false
+		}
+		snapshot := registry.load()
+		if snapshot == nil {
+			return false
+		}
+		for _, entry := range snapshot.policyEntries {
+			if referencesRoute(entry) {
+				return true
+			}
+		}
+		return false
+	}
 	for model := range h.allowedModels {
 		entry, ok := setup.lookupPublicModelEntry(model)
 		if !ok || entry == nil || entry.kind != publicEntryPolicy {
 			continue
 		}
-		for _, route := range h.policyEntryRequiredRoutesForSetup(entry, setup) {
-			if route != nil && route.public.routeID == routeID {
-				return true
-			}
+		if referencesRoute(entry) {
+			return true
 		}
 	}
 	return false
@@ -1867,8 +1892,7 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 	model = strings.TrimSpace(model)
 	setup := h.providerSetup()
 	entry, knownPublicEntry := setup.lookupPublicModelEntry(model)
-	publicPolicyModel := knownPublicEntry && entry != nil && entry.kind == publicEntryPolicy
-	if !publicPolicyModel {
+	if !knownPublicEntry || entry == nil {
 		for _, providerID := range setup.providerOrder {
 			if provider := setup.providerByID(providerID); provider != nil && provider.hidesModel(model) {
 				return false
@@ -2787,8 +2811,8 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			continue
 		}
 
-		endpointsAdvertised := len(parsed.SupportedEndpoints) > 0
 		supportedEndpoints := normalizeDynamicProviderEndpoints(provider, parsed.SupportedEndpoints)
+		endpointsAdvertised := len(supportedEndpoints) > 0
 		if len(supportedEndpoints) == 0 {
 			supportedEndpoints = provider.defaultDynamicModelEndpoints()
 		}
