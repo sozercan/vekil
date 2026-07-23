@@ -260,7 +260,7 @@ The wrapper still uses a private loopback bridge because the common smoke harnes
 
 By default the wrapper prefers these currently available model families, always requiring advertised native `/chat/completions` support and falling back to another catalog model when a preferred ID is absent:
 
-- lightweight: `gpt-5.4-mini`, `gpt-5-mini`, `gpt-4.1`, `gpt-4o`, then `claude-haiku-4.5`;
+- lightweight: `gpt-5.4-mini`, `claude-haiku-4.5`, `gpt-5-mini`, `gpt-4.1`, then `gpt-4o`;
 - classifier: `gpt-4.1`, `claude-sonnet-4.6`, `claude-haiku-4.5`, then GPT-5 mini/full variants;
 - powerful primary: `gpt-5.4`, `claude-sonnet-4.6`, Codex variants, then `gpt-4.1`; and
 - powerful secondary: the first distinct compatible model from the same powerful preference set.
