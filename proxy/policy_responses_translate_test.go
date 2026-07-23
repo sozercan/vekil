@@ -511,6 +511,7 @@ func TestTranslatePolicyResponsesRequestToChatRejectsUnsupportedOrAmbiguousReque
 		{name: "invalid include", body: `{"model":"policy","input":"hi","include":["response.output_text.logprobs"]}`, wantParam: "include[0]", wantText: "reasoning.encrypted_content"},
 		{name: "invalid metadata value", body: `{"model":"policy","input":"hi","client_metadata":{"attempt":1}}`, wantParam: "client_metadata.attempt", wantText: "bounded strings"},
 		{name: "zero max output", body: `{"model":"policy","input":"hi","max_output_tokens":0}`, wantParam: "max_output_tokens", wantText: "positive integer"},
+		{name: "below minimum max output", body: `{"model":"policy","input":"hi","max_output_tokens":15}`, wantParam: "max_output_tokens", wantText: "at least 16"},
 		{name: "temperature out of range", body: `{"model":"policy","input":"hi","temperature":2.1}`, wantParam: "temperature", wantText: "[0, 2]"},
 		{name: "top p out of range", body: `{"model":"policy","input":"hi","top_p":1.1}`, wantParam: "top_p", wantText: "[0, 1]"},
 		{name: "unknown call output", body: `{"model":"policy","input":[{"type":"function_call_output","call_id":"missing","output":"x"}]}`, wantParam: "input[0].call_id", wantText: "unknown prior call"},

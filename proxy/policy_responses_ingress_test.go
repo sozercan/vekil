@@ -136,6 +136,43 @@ func TestPolicyResponsesIngressAllowsResolvedPolicyAliasWithinLaunchScope(t *tes
 	}
 }
 
+func TestPolicyResponsesIngressRejectsSmallOutputLimitBeforePolicySelection(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{
+		TurnType:  policyTurnTypePlanning,
+		CodeScope: policyCodeScopeMultiFile,
+		RiskLevel: policyRiskLevelHigh,
+	})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+		WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	lightBefore, _ := light.snapshot()
+	powerfulBefore, _ := powerful.snapshot()
+
+	recorder := httptest.NewRecorder()
+	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"coding-economy",
+		"input":"plan a risky multi-file change",
+		"max_output_tokens":15,
+		"store":false
+	}`)))
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "at least 16") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	lightAfter, _ := light.snapshot()
+	powerfulAfter, _ := powerful.snapshot()
+	if lightAfter != lightBefore || powerfulAfter != powerfulBefore {
+		t.Fatalf("small output limit dispatched policy traffic: light %d->%d powerful %d->%d", lightBefore, lightAfter, powerfulBefore, powerfulAfter)
+	}
+}
+
 func TestPolicyResponsesIngressUsesSuccessfulFailoverHeaders(t *testing.T) {
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() { _ = r.Body.Close() }()

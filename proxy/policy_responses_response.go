@@ -40,10 +40,13 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 	if completion == nil {
 		return policyResponsesResponse{}, fmt.Errorf("policy Chat completion is unavailable")
 	}
-	if len(completion.Choices) == 0 {
-		return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned no choices")
+	if len(completion.Choices) != 1 {
+		return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned %d choices; expected exactly one", len(completion.Choices))
 	}
 	choice := completion.Choices[0]
+	if choice.Index != 0 {
+		return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned choice index %d; expected 0", choice.Index)
+	}
 	if strings.TrimSpace(choice.Message.Role) != "assistant" {
 		return policyResponsesResponse{}, fmt.Errorf("policy Chat completion returned non-assistant role %q", choice.Message.Role)
 	}

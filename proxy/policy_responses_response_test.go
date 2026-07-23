@@ -271,6 +271,27 @@ func TestPolicyResponsesTextOutputCanBeReplayedAsStatelessInput(t *testing.T) {
 
 func TestPolicyResponsesRejectsMalformedTerminalChoice(t *testing.T) {
 	finishStop := "stop"
+	for _, tc := range []struct {
+		name       string
+		completion *models.OpenAIResponse
+		want       string
+	}{
+		{name: "no choices", completion: &models.OpenAIResponse{}, want: "expected exactly one"},
+		{name: "multiple choices", completion: &models.OpenAIResponse{Choices: []models.OpenAIChoice{
+			{Index: 0, Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"first"`)}, FinishReason: &finishStop},
+			{Index: 1, Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"second"`)}, FinishReason: &finishStop},
+		}}, want: "expected exactly one"},
+		{name: "nonzero index", completion: &models.OpenAIResponse{Choices: []models.OpenAIChoice{{
+			Index: 1, Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"only"`)}, FinishReason: &finishStop,
+		}}}, want: "expected 0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := buildPolicyResponsesResponse(tc.completion, "policy", nil)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
+	}
 	for _, role := range []string{"", "user", "tool", "system", "Assistant"} {
 		t.Run("role "+role, func(t *testing.T) {
 			_, err := buildPolicyResponsesResponse(&models.OpenAIResponse{Choices: []models.OpenAIChoice{{

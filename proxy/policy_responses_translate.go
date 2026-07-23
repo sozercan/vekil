@@ -200,6 +200,12 @@ func translatePolicyResponsesRequestToChat(body []byte) (policyResponsesChatRequ
 	if err != nil {
 		return policyResponsesChatRequest{}, err
 	}
+	if maxTokens != nil && *maxTokens < responsesChatMinimumOutputTokens {
+		return policyResponsesChatRequest{}, newChatInvalidRequest(
+			"max_output_tokens",
+			fmt.Sprintf("max_output_tokens must be at least %d for policy models", responsesChatMinimumOutputTokens),
+		)
+	}
 	temperature, err := policyResponsesFloat(root, "temperature", 0, 2)
 	if err != nil {
 		return policyResponsesChatRequest{}, err
