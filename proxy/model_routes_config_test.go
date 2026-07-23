@@ -41,6 +41,21 @@ func TestLoadProvidersConfigFileSchemaVersionsAndDefaults(t *testing.T) {
 			wantErr: "model_routes: requires schema_version: 2",
 		},
 		{
+			name: "Codex accounts require version 2",
+			ext:  ".yaml",
+			body: `schema_version: 1
+providers:
+  - id: codex
+    type: openai-codex
+    codex_accounts:
+      strategy: round_robin
+      accounts:
+        - id: personal
+          auth_file: ~/.codex/auth.json
+`,
+			wantErr: "providers[0].codex_accounts: requires schema_version: 2",
+		},
+		{
 			name:    "explicit schema version zero is invalid",
 			ext:     ".json",
 			body:    `{"schema_version":0,"providers":[]}`,
@@ -145,6 +160,214 @@ func TestValidateProvidersConfigRejectsProgrammaticSchemaVersion3(t *testing.T) 
 	err := ValidateProvidersConfig(ProvidersConfig{SchemaVersion: 3})
 	if err == nil || !strings.Contains(err.Error(), "schema_version: unsupported schema version 3") {
 		t.Fatalf("ValidateProvidersConfig() error = %v", err)
+	}
+}
+
+func TestValidateProvidersConfigOpenAICodexAccounts(t *testing.T) {
+	t.Parallel()
+
+	for _, strategy := range []string{openAICodexAccountStrategyRoundRobin, openAICodexAccountStrategyFillFirst} {
+		strategy := strategy
+		t.Run(strategy, func(t *testing.T) {
+			t.Parallel()
+			cfg := validOpenAICodexAccountsConfig()
+			cfg.Providers[0].CodexAccounts.Strategy = strategy
+			if err := ValidateProvidersConfig(cfg); err != nil {
+				t.Fatalf("ValidateProvidersConfig() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateProvidersConfigRejectsInvalidOpenAICodexAccounts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*ProvidersConfig)
+		want   string
+	}{
+		{
+			name: "unsupported strategy",
+			mutate: func(cfg *ProvidersConfig) {
+				cfg.Providers[0].CodexAccounts.Strategy = "random"
+			},
+			want: "providers[0].codex_accounts.strategy: unsupported strategy",
+		},
+		{
+			name: "empty pool",
+			mutate: func(cfg *ProvidersConfig) {
+				cfg.Providers[0].CodexAccounts.Accounts = nil
+			},
+			want: "providers[0].codex_accounts.accounts: must contain at least one account",
+		},
+		{
+			name: "pool too large",
+			mutate: func(cfg *ProvidersConfig) {
+				accounts := make([]OpenAICodexAccountConfig, maxOpenAICodexAccounts+1)
+				for index := range accounts {
+					accounts[index] = OpenAICodexAccountConfig{
+						ID:       fmt.Sprintf("account-%d", index),
+						AuthFile: filepath.Join(os.TempDir(), fmt.Sprintf("vekil-codex-auth-%d.json", index)),
+					}
+				}
+				cfg.Providers[0].CodexAccounts.Accounts = accounts
+			},
+			want: fmt.Sprintf("maximum is %d", maxOpenAICodexAccounts),
+		},
+		{
+			name: "negative max attempts",
+			mutate: func(cfg *ProvidersConfig) {
+				cfg.Providers[0].CodexAccounts.MaxAccountAttempts = -1
+			},
+			want: "providers[0].codex_accounts.max_account_attempts: must be zero or greater",
+		},
+		{
+			name: "attempts exceed pool",
+			mutate: func(cfg *ProvidersConfig) {
+				cfg.Providers[0].CodexAccounts.MaxAccountAttempts = 3
+			},
+			want: "providers[0].codex_accounts.max_account_attempts: is 3 but the pool has only 2 accounts",
+		},
+		{
+			name: "duplicate account ID",
+			mutate: func(cfg *ProvidersConfig) {
+				cfg.Providers[0].CodexAccounts.Accounts[1].ID = cfg.Providers[0].CodexAccounts.Accounts[0].ID
+			},
+			want: "providers[0].codex_accounts.accounts[1].id: duplicates providers[0].codex_accounts.accounts[0].id",
+		},
+		{
+			name: "account ID too long",
+			mutate: func(cfg *ProvidersConfig) {
+				cfg.Providers[0].CodexAccounts.Accounts[0].ID = strings.Repeat("a", maxModelRouteOperationalIDBytes+1)
+			},
+			want: "providers[0].codex_accounts.accounts[0].id",
+		},
+		{
+			name: "missing auth file",
+			mutate: func(cfg *ProvidersConfig) {
+				cfg.Providers[0].CodexAccounts.Accounts[0].AuthFile = " "
+			},
+			want: "providers[0].codex_accounts.accounts[0].auth_file: is required",
+		},
+		{
+			name: "invalid affinity TTL",
+			mutate: func(cfg *ProvidersConfig) {
+				cfg.Providers[0].CodexAccounts.SessionAffinityTTL = "tomorrow"
+			},
+			want: "providers[0].codex_accounts.session_affinity_ttl: must be a positive duration",
+		},
+		{
+			name: "zero affinity TTL",
+			mutate: func(cfg *ProvidersConfig) {
+				cfg.Providers[0].CodexAccounts.SessionAffinityTTL = "0s"
+			},
+			want: "providers[0].codex_accounts.session_affinity_ttl: must be a positive duration",
+		},
+		{
+			name: "negative affinity TTL",
+			mutate: func(cfg *ProvidersConfig) {
+				cfg.Providers[0].CodexAccounts.SessionAffinityTTL = "-1s"
+			},
+			want: "providers[0].codex_accounts.session_affinity_ttl: must be a positive duration",
+		},
+		{
+			name: "non-Codex provider",
+			mutate: func(cfg *ProvidersConfig) {
+				cfg.Providers[0].Type = string(providerTypeOpenAICompatible)
+				cfg.Providers[0].BaseURL = "https://example.test/v1"
+				cfg.Providers[0].AuthType = string(providerAuthTypeNone)
+			},
+			want: `providers[0].codex_accounts: is only supported for providers of type "openai-codex"`,
+		},
+		{
+			name: "schema version 1",
+			mutate: func(cfg *ProvidersConfig) {
+				cfg.SchemaVersion = ProvidersConfigSchemaVersion1
+			},
+			want: "providers[0].codex_accounts: requires schema_version: 2",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validOpenAICodexAccountsConfig()
+			tc.mutate(&cfg)
+			err := ValidateProvidersConfig(cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidateProvidersConfig() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateProvidersConfigRejectsCanonicalDuplicateOpenAICodexAuthPaths(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := validOpenAICodexAccountsConfig()
+	cfg.Providers[0].CodexAccounts.Accounts[0].AuthFile = filepath.Join(dir, "auth.json")
+	cfg.Providers[0].CodexAccounts.Accounts[1].AuthFile = filepath.Join(dir, "nested", "..", "auth.json")
+	err := ValidateProvidersConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "providers[0].codex_accounts.accounts[1].auth_file") ||
+		!strings.Contains(err.Error(), "after path canonicalization") {
+		t.Fatalf("ValidateProvidersConfig() error = %v, want canonical duplicate path", err)
+	}
+}
+
+func TestLoadProvidersConfigFileRejectsExplicitEmptyOpenAICodexAffinityTTL(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		ext  string
+		body string
+	}{
+		{
+			name: "JSON",
+			ext:  ".json",
+			body: `{"schema_version":2,"providers":[{"id":"codex","type":"openai-codex","codex_accounts":{"strategy":"round_robin","session_affinity_ttl":"","accounts":[{"id":"personal","auth_file":"/tmp/auth.json"}]}}]}`,
+		},
+		{
+			name: "YAML",
+			ext:  ".yaml",
+			body: "schema_version: 2\nproviders:\n  - id: codex\n    type: openai-codex\n    codex_accounts:\n      strategy: round_robin\n      session_affinity_ttl: ''\n      accounts:\n        - id: personal\n          auth_file: /tmp/auth.json\n",
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "providers"+tc.ext)
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+			_, err := LoadProvidersConfigFile(path)
+			if err == nil || !strings.Contains(err.Error(), "providers[0].codex_accounts.session_affinity_ttl") {
+				t.Fatalf("LoadProvidersConfigFile() error = %v, want positive TTL validation", err)
+			}
+		})
+	}
+}
+
+func TestValidateProvidersConfigNormalizesOpenAICodexAccountDefaultsWithoutMutatingInput(t *testing.T) {
+	t.Parallel()
+
+	cfg := validOpenAICodexAccountsConfig()
+	pool := cfg.Providers[0].CodexAccounts
+	pool.SessionAffinity = nil
+	pool.SessionAffinityTTL = ""
+	validated, err := validateAndNormalizeProvidersConfig(cfg)
+	if err != nil {
+		t.Fatalf("validateAndNormalizeProvidersConfig() error = %v", err)
+	}
+	if pool.SessionAffinity != nil || pool.SessionAffinityTTL != "" {
+		t.Fatalf("input pool mutated = %+v", pool)
+	}
+	normalized := validated.config.Providers[0].CodexAccounts
+	if normalized == nil || normalized.SessionAffinity == nil || !*normalized.SessionAffinity || normalized.SessionAffinityTTL != defaultOpenAICodexAffinityTTL {
+		t.Fatalf("normalized pool = %+v, want enabled affinity with %q TTL", normalized, defaultOpenAICodexAffinityTTL)
 	}
 }
 
@@ -914,6 +1137,26 @@ func validAzureRouteConfig() ProvidersConfig {
 			Targets: []ModelRouteTargetConfig{{
 				ID: "primary", Provider: "azure", UpstreamModel: "deployment",
 			}},
+		}},
+	}
+}
+
+func validOpenAICodexAccountsConfig() ProvidersConfig {
+	return ProvidersConfig{
+		SchemaVersion: ProvidersConfigSchemaVersion2,
+		Providers: []ProviderConfig{{
+			ID:      "codex",
+			Type:    string(providerTypeOpenAICodex),
+			Default: true,
+			CodexAccounts: &OpenAICodexAccountsConfig{
+				Strategy:           openAICodexAccountStrategyRoundRobin,
+				MaxAccountAttempts: 2,
+				SessionAffinityTTL: defaultOpenAICodexAffinityTTL,
+				Accounts: []OpenAICodexAccountConfig{
+					{ID: "personal", AuthFile: filepath.Join(os.TempDir(), "vekil-codex-personal-auth.json")},
+					{ID: "work", AuthFile: filepath.Join(os.TempDir(), "vekil-codex-work-auth.json")},
+				},
+			},
 		}},
 	}
 }

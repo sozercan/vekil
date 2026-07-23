@@ -123,6 +123,9 @@ type responsesChatReplayRoute struct {
 	ProviderID    string
 	PublicModel   string
 	UpstreamModel string
+	RouteID       string
+	TargetID      string
+	CredentialID  string
 }
 
 type responsesChatReplayProjectedCall struct {
@@ -730,7 +733,19 @@ func (s *responsesChatReplayStore) removeGroupLocked(groupID uint64) {
 }
 
 func (r responsesChatReplayRoute) equal(other responsesChatReplayRoute) bool {
-	return r.ProviderID == other.ProviderID && r.PublicModel == other.PublicModel && r.UpstreamModel == other.UpstreamModel
+	if r.ProviderID != other.ProviderID || r.PublicModel != other.PublicModel || r.UpstreamModel != other.UpstreamModel {
+		return false
+	}
+	if other.RouteID != "" && r.RouteID != other.RouteID {
+		return false
+	}
+	if other.TargetID != "" && r.TargetID != other.TargetID {
+		return false
+	}
+	if other.CredentialID != "" && r.CredentialID != other.CredentialID {
+		return false
+	}
+	return true
 }
 
 func (g *responsesChatReplayGroup) matchesProjection(content []byte, projected []responsesChatReplayProjectedCall, original bool) bool {
@@ -782,7 +797,7 @@ func cloneResponsesChatReplayResolution(group *responsesChatReplayGroup, match r
 }
 
 func replayGroupByteSize(route responsesChatReplayRoute, content []byte, outputItems []json.RawMessage, calls []responsesChatReplayPreparedCall) int {
-	size := len(route.ProviderID) + len(route.PublicModel) + len(route.UpstreamModel) + len(content)
+	size := len(route.ProviderID) + len(route.PublicModel) + len(route.UpstreamModel) + len(route.RouteID) + len(route.TargetID) + len(route.CredentialID) + len(content)
 	for _, item := range outputItems {
 		size += len(item)
 	}

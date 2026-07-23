@@ -31,6 +31,7 @@ func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
 		"OpenAI-Beta",
 		"session_id",
 		"session-id",
+		"X-Session-ID",
 		"thread-id",
 		"X-Client-Request-Id",
 		"X-Codex-Installation-Id",
@@ -1090,7 +1091,7 @@ func compactInflightKey(ctx context.Context, requestFields map[string]json.RawMe
 	writeCompactInflightKeyHeaders(digest, extraHeaders)
 
 	operation := routeOperationFromContext(ctx)
-	if operation != nil && operation.route != nil && !operation.route.legacy {
+	if operation != nil && operation.route != nil && operation.route.usesManagedExecution() {
 		// Keep the legacy key byte-for-byte unchanged, but bind explicit-route
 		// coalescing to the exact dispatch boundary. A compact summary produced
 		// with another target's model, credentials, or provider-owned headers is
@@ -1104,14 +1105,16 @@ func compactInflightKey(ctx context.Context, requestFields map[string]json.RawMe
 }
 
 func writeCompactInflightExplicitRouteIdentity(w io.Writer, ctx context.Context, operation *routeOperation) bool {
-	if operation == nil || operation.route == nil || operation.route.legacy {
+	if operation == nil || operation.route == nil || !operation.route.usesManagedExecution() {
 		return true
 	}
 
 	route := operation.route
 	operation.mu.Lock()
 	pinnedTargetID := strings.TrimSpace(operation.pinnedTargetID)
+	pinnedCredentialID := strings.TrimSpace(operation.pinnedCredentialID)
 	hardPinned := operation.hardPinned
+	hardPinnedCredential := operation.hardPinnedCredential
 	remainingTargetAttempts := operation.remainingTargetAttempts
 	remainingUpstreamSends := operation.remainingUpstreamSends
 	commitment := operation.commitment
@@ -1133,12 +1136,18 @@ func writeCompactInflightExplicitRouteIdentity(w io.Writer, ctx context.Context,
 	writeCompactInflightKeyRequestPolicy(w, route.public.policy)
 
 	writeCompactInflightKeyPart(w, []byte(pinnedTargetID))
+	writeCompactInflightKeyPart(w, []byte(pinnedCredentialID))
 	writeCompactInflightKeyPart(w, []byte(strconv.FormatBool(hardPinned)))
+	writeCompactInflightKeyPart(w, []byte(strconv.FormatBool(hardPinnedCredential)))
 	writeCompactInflightKeyPart(w, []byte(strconv.Itoa(remainingTargetAttempts)))
 	writeCompactInflightKeyPart(w, []byte(strconv.Itoa(remainingUpstreamSends)))
 	writeCompactInflightKeyPart(w, []byte(commitment))
 	for _, targetID := range attemptedTargetIDs {
 		writeCompactInflightKeyPart(w, []byte(targetID))
+	}
+
+	if target, ok := route.primaryTarget(); ok && target.provider != nil && target.provider.codexPool != nil && target.provider.codexPool.configured && pinnedCredentialID == "" {
+		return false
 	}
 
 	targets := orderedRouteTargets(route, operation, providerEndpointResponses)
@@ -1192,7 +1201,7 @@ func writeCompactInflightKeyProvider(w io.Writer, provider *providerRuntime) {
 	writeCompactInflightKeyPart(w, []byte(provider.authHeader))
 	writeCompactInflightKeyPart(w, []byte(provider.authPrefix))
 	writeCompactInflightKeyPart(w, []byte(fmt.Sprintf("%T:%p", provider.azureToken, provider.azureToken)))
-	writeCompactInflightKeyPart(w, []byte(fmt.Sprintf("%p", provider.codexAuth)))
+	writeCompactInflightKeyPart(w, []byte(fmt.Sprintf("%p", provider.codexPool)))
 }
 
 func writeCompactInflightKeyRawMap(w io.Writer, values map[string]json.RawMessage) {
@@ -2433,7 +2442,7 @@ func (h *ProxyHandler) rewriteResponsesRequestBody(bodyBytes []byte, endpoint st
 
 func (h *ProxyHandler) rewriteResponsesRequestBodyForModel(bodyBytes []byte, requestedModel string, endpoint string, injectResumePrompt bool) []byte {
 	provider, _, _ := h.resolveProviderModel(requestedModel, "/responses")
-	if route, known := h.resolveModelRouteForRequest(requestedModel, providerEndpointResponses); known && route != nil && !route.legacy {
+	if route, known := h.resolveModelRouteForRequest(requestedModel, providerEndpointResponses); known && route != nil && route.usesManagedExecution() {
 		// Keep explicit-route requests provider-neutral until the executor selects
 		// a physical target. Each attempt will apply that target's policy from
 		// this logical request, including replay and compatibility child sends.

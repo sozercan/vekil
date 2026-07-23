@@ -90,7 +90,7 @@ requirements, forwarded arguments, logs, and isolation details.
 
 - **Copilot** — `vekil login` uses Vekil-managed GitHub device-code sign-in; first proxy startup starts the same flow when needed. To use your current GitHub CLI account instead, opt in with `vekil login --github-cli` (or `--gh`). `vekil logout` clears cached auth and disables future silent `gh` reuse until you opt in again. `COPILOT_GITHUB_TOKEN` remains the explicit non-interactive override.
 - **Azure OpenAI and generic hosted providers** — use `api_key` or `api_key_env` in your provider config.
-- **OpenAI Codex** — requires `codex login` so `~/.codex/auth.json` exists. In Docker, mount your Codex home into `CODEX_HOME` (default `/home/nonroot/.codex`).
+- **OpenAI Codex** — requires `codex login` so `~/.codex/auth.json` exists. In Docker, mount your Codex home into `CODEX_HOME` (default `/home/nonroot/.codex`). A schema-v2 provider can optionally pool several explicit Codex auth files; see [Provider Routing and Authentication](docs/provider-routing.md#openai-codex-account-pools).
 - **Local generic providers** — use `auth_type: none`.
 
 For full setup details, see [Getting Started](docs/getting-started.md), [Configuration](docs/configuration.md), and [Provider Routing](docs/provider-routing.md).

@@ -20,13 +20,13 @@ The dashboard polls `GET /stats.json` once per second and renders:
 - **Breakdowns** — top models, providers, and agents, each with request count, token volume, error count, and average latency. A controls bar lets you **sort by** requests / tokens / errors / latency and **filter** by name (e.g. `gpt-5.4-pro` to inspect one model). Sorting by errors or latency hides rows with none. The JSON snapshot additionally includes `by_route` client-request rows and `by_target` physical-attempt rows for external tooling.
 - **Policy routing JSON telemetry** — `GET /stats.json` exposes per-profile eligibility, observe sampling/admission, capacity drops, classifier outcomes/latency/token usage, selected/fallback tier distribution, and classifier-route health for schema-v2 policy profiles. The browser dashboard does not yet render a dedicated policy-routing panel.
 - **Errors** — a status-class distribution (2xx/3xx/4xx/5xx) plus exact error status codes and error-by-provider/model attribution.
-- **Recent requests** — a drill-down log of the most recent logical requests (newest first) with status, model, agent, latency, tokens, and the final/canonical upstream request ID. Has an *errors only* toggle, honors the breakdown filter, and lets you click a request ID to copy it for correlating with upstream logs. Each JSON row also carries `operation_id`, `route_id`, `final_target`, `upstream_sends`, and `target_switches` when route data exists.
+- **Recent requests** — a drill-down log of the most recent logical requests (newest first) with status, model, agent, latency, tokens, and the final/canonical upstream request ID. Has an *errors only* toggle, honors the breakdown filter, and lets you click a request ID to copy it for correlating with upstream logs. Each JSON row also carries `operation_id`, `route_id`, `final_target`, `access_member_id`, `upstream_sends`, `target_switches`, and `account_switches` when route data exists. `access_member_id` is only the bounded configured pool alias, never an auth path or ChatGPT account identity.
 
 **Agents** are classified from the request `User-Agent` (for example Claude Code, Codex CLI, Gemini CLI, GitHub Copilot, curl) so you can see which client is driving traffic. Only the friendly label is retained, never the raw `User-Agent`.
 
 **Upstream retries** retain their existing meaning: same-target retries performed by legacy provider routes on transient upstream failures. A version-2 route target switch is counted separately in `target_switches`; it does not redefine or inflate `retries`.
 
-Route/failover metrics are additive in `GET /stats.json`: `upstream_attempts`, `target_switches`, `requests_with_failover`, `successful_failovers`, `route_exhaustions`, `state_binding_hits`, `state_binding_misses`, and `state_binding_evictions`. `by_route` adds client-request aggregates plus failover counters; `by_target` reports physical send counts. The websocket bridge still records each provider-backed `response.create` once in client totals, but its route-level client row/recent-row enrichment is limited: websocket physical sends and switches appear in `upstream_attempts`, `target_switches`, and `by_target`, while `requests_with_failover`, `successful_failovers`, and `by_route` are populated from HTTP request summaries.
+Route/failover metrics are additive in `GET /stats.json`: `upstream_attempts`, `target_switches`, `account_switches`, `requests_with_failover`, `requests_with_account_failover`, `successful_failovers`, `successful_account_failovers`, `cooldown_exhaustions`, `route_exhaustions`, `state_binding_hits`, `state_binding_misses`, and `state_binding_evictions`. `by_route` adds client-request aggregates plus failover counters; `by_target` reports physical send counts. The websocket bridge still records each provider-backed `response.create` once in client totals, but its route-level client row/recent-row enrichment is limited: websocket physical sends and switches appear in `upstream_attempts`, `target_switches`, and `by_target`, while `requests_with_failover`, `successful_failovers`, and `by_route` are populated from HTTP request summaries.
 
 ### Policy-routing telemetry (`GET /stats.json`)
 
@@ -74,7 +74,7 @@ Notes:
 Routing observability has two related ledgers:
 
 1. The **client-request ledger** records exactly one row/outcome for an inbound HTTP request or WebSocket `response.create` turn. It owns client-visible status, latency, requested public model, provider, and accepted-turn usage. HTTP explicit-route summaries also carry route, final target, send count, and switch count; websocket turns currently expose their route topology through the physical-attempt counters instead.
-2. The **physical-attempt ledger** increments `upstream_attempts` for each explicit-route inference send and `by_target[].attempts` for the selected route/target/provider. Target switches and route exhaustion are separate from legacy same-target retries. `physical_usage` records usage reported by those sends, while `wasted_usage` is the subset from attempts that did not become the accepted client result. A separately bounded `recent_attempts` trace retains normalized outcome, delivery/progress/commitment, retry decision, TTFT, sanitized retry timing, cleanup state, reported usage, and per-attempt request IDs for diagnostics.
+2. The **physical-attempt ledger** increments `upstream_attempts` for each explicit-route inference send and `by_target[].attempts` for the selected route/target/provider. Target switches and route exhaustion are separate from legacy same-target retries. `physical_usage` records usage reported by those sends, while `wasted_usage` is the subset from attempts that did not become the accepted client result. A separately bounded `recent_attempts` trace retains normalized outcome, delivery/progress/commitment, retry decision, TTFT, sanitized retry timing, cleanup state, reported usage, per-attempt request IDs, and—when Codex pooling is enabled—the sanitized `access_member_id` and fixed `selection_reason` for diagnostics.
 
 A successful failover still increments client request totals once. Existing token totals remain client-request/accepted-turn accounting rather than physical-send totals; failed-attempt usage is kept in the physical ledger instead of being attributed to the final provider. The recent-request row exposes only the final/canonical upstream request ID.
 
@@ -114,8 +114,12 @@ Token usage is captured across all inference surfaces: OpenAI chat completions (
   "wasted_usage": { "prompt_tokens": 12000, "completion_tokens": 4000, "total_tokens": 16000, "cached_tokens": 1000, "reasoning_tokens": 1000 },
   "upstream_attempts": 5012,
   "target_switches": 12,
+  "account_switches": 7,
   "requests_with_failover": 10,
+  "requests_with_account_failover": 6,
   "successful_failovers": 8,
+  "successful_account_failovers": 5,
+  "cooldown_exhaustions": 1,
   "route_exhaustions": 2,
   "state_binding_hits": 120,
   "state_binding_misses": 3,
@@ -124,10 +128,12 @@ Token usage is captured across all inference surfaces: OpenAI chat completions (
                "operation_id": "5dc6cb8d-3e12-43a5-a822-5e89c68c7a40", "route_id": "gpt-5-4-route", "final_target": "secondary",
                "provider": "azure-east", "agent": "Codex CLI", "status": 200, "dur_ms": 1234,
                "total_tokens": 900, "upstream_sends": 2, "target_switches": 1,
+               "access_member_id": "work", "account_switches": 1,
                "upstream_request_id": "req-abc" } ],
   "recent_attempts": [ { "t": 1718900000, "operation_id": "5dc6cb8d-3e12-43a5-a822-5e89c68c7a40",
                           "route_id": "gpt-5-4-route", "target_id": "primary", "provider_id": "azure-west",
-                          "provider_kind": "azure-openai", "sequence": 1, "attempt_kind": "normal",
+                          "provider_kind": "azure-openai", "access_member_id": "work",
+                          "selection_reason": "account_failover", "sequence": 1, "attempt_kind": "normal",
                           "status": "429", "status_code": 429, "outcome": "rejected",
                           "delivery": "explicitly_rejected", "semantic_progress": "terminal_failure",
                           "downstream_commitment": "none", "retry_decision": "switch_target",

@@ -28,12 +28,14 @@ type responsesChatRequestOptions struct {
 	ReplayRoute         responsesChatReplayRoute
 	MinimumOutputTokens int
 	DropSamplingParams  bool
+	ResolvedReplayRoute *responsesChatReplayRoute
 }
 
 type responsesChatRequestPlan struct {
 	Body         []byte
 	Stream       bool
 	IncludeUsage bool
+	ReplayRoute  responsesChatReplayRoute
 }
 
 type responsesChatRequestEnvelope struct {
@@ -72,6 +74,11 @@ func translateChatRequestToResponses(chatBody []byte, options responsesChatReque
 	upstreamModel := strings.TrimSpace(options.UpstreamModel)
 	if upstreamModel == "" {
 		upstreamModel = model
+	}
+
+	var resolvedReplayRoute responsesChatReplayRoute
+	if options.ResolvedReplayRoute == nil {
+		options.ResolvedReplayRoute = &resolvedReplayRoute
 	}
 
 	messagesRaw, ok := raw["messages"]
@@ -207,7 +214,7 @@ func translateChatRequestToResponses(chatBody []byte, options responsesChatReque
 	if marshalErr != nil {
 		return responsesChatRequestPlan{}, fmt.Errorf("marshal Responses request: %w", marshalErr)
 	}
-	return responsesChatRequestPlan{Body: body, Stream: stream, IncludeUsage: includeUsage}, nil
+	return responsesChatRequestPlan{Body: body, Stream: stream, IncludeUsage: includeUsage, ReplayRoute: *options.ResolvedReplayRoute}, nil
 }
 
 func requiredJSONString(raw map[string]json.RawMessage, field string) (string, error) {
@@ -378,6 +385,12 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 			resolution, err := resolveResponsesChatReplay(options.ReplayStore, options.ReplayRoute, responsesChatReplayAssistantProjection{Content: projectionContent, Calls: projected})
 			if err != nil {
 				return nil, mapResponsesChatReplayResolveError(err)
+			}
+			if options.ResolvedReplayRoute != nil {
+				if options.ResolvedReplayRoute.ProviderID != "" && !resolution.Route.equal(*options.ResolvedReplayRoute) {
+					return nil, replayChatExecutionError(responsesChatReplayMixedCode, responsesChatReplayMixedMessage)
+				}
+				*options.ResolvedReplayRoute = resolution.Route
 			}
 			if _, duplicate := restoredGroups[resolution.GroupID]; duplicate {
 				return nil, replayChatExecutionError(responsesChatReplayProjectionCode, "Responses replay group appears more than once in the request.")

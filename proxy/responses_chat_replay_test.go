@@ -925,3 +925,32 @@ func TestResponsesChatReplayPublishesOnlyStructurallyCompleteGroups(t *testing.T
 		t.Fatalf("invalid group was partially published: %+v", stats)
 	}
 }
+
+func TestResponsesChatReplayCredentialOwnership(t *testing.T) {
+	store := newResponsesChatReplayStore()
+	request := newResponsesChatReplayTestRequest("credential-owner", replayTestCallSpec{
+		upstreamID: "upstream-credential", name: "lookup", visible: `{}`,
+	})
+	request.Route = responsesChatReplayRoute{
+		ProviderID: "codex", PublicModel: "gpt-pool", UpstreamModel: "gpt-pool",
+		RouteID: "codex/catalog/model", TargetID: "codex", CredentialID: "credential-a",
+	}
+	published, err := store.Publish(request)
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	wildcard := request.Route
+	wildcard.CredentialID = ""
+	resolution, err := store.Resolve(wildcard, published.Projection)
+	if err != nil {
+		t.Fatalf("Resolve(wildcard) error = %v", err)
+	}
+	if resolution.Route.CredentialID != "credential-a" {
+		t.Fatalf("resolved credential = %q, want credential-a", resolution.Route.CredentialID)
+	}
+	wrong := request.Route
+	wrong.CredentialID = "credential-b"
+	if _, err := store.Resolve(wrong, published.Projection); !errors.Is(err, errResponsesChatReplayMissing) {
+		t.Fatalf("Resolve(wrong credential) error = %v, want missing replay state", err)
+	}
+}

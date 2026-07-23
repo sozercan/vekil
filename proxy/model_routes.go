@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -54,6 +56,15 @@ type modelRoute struct {
 	exposure        string
 	internalPurpose string
 	legacy          bool
+	managedCatalog  bool
+}
+
+// usesManagedExecution separates catalog origin from execution behavior.
+// Configured routes are managed by definition; opt-in pooled Codex catalog
+// routes are also managed even though their public models were discovered from
+// a provider-owned catalog.
+func (r *modelRoute) usesManagedExecution() bool {
+	return r != nil && (!r.legacy || r.managedCatalog)
 }
 
 func (r *modelRoute) isPublic() bool {
@@ -415,6 +426,10 @@ func compileLegacyModelRoute(model providerModel, provider *providerRuntime) (*m
 	}
 	routeID := strings.TrimSpace(model.providerID)
 	targetID := routeID
+	if provider != nil && provider.codexPool != nil && provider.codexPool.configured {
+		digest := sha256.Sum256([]byte(strings.TrimSpace(model.publicID)))
+		routeID = provider.id + "/catalog/" + base64.RawURLEncoding.EncodeToString(digest[:12])
+	}
 	if targetID == "" {
 		targetID = "legacy"
 	}
@@ -443,14 +458,25 @@ func compileLegacyModelRoute(model providerModel, provider *providerRuntime) (*m
 			},
 			legacyOwner: model,
 		}},
-		policy: routePolicy{
-			mode:              routeModePrimaryOnly,
-			maxTargetAttempts: 1,
-			maxUpstreamSends:  1,
-			legacyRetry:       true,
-		},
-		exposure: modelRouteExposurePublic,
-		legacy:   true,
+		policy: func() routePolicy {
+			if provider != nil && provider.codexPool != nil && provider.codexPool.configured {
+				attempts := provider.codexPool.effectiveAccountAttempts()
+				return routePolicy{
+					mode:              routeModePriorityFailover,
+					maxTargetAttempts: 1,
+					maxUpstreamSends:  attempts + 1,
+				}
+			}
+			return routePolicy{
+				mode:              routeModePrimaryOnly,
+				maxTargetAttempts: 1,
+				maxUpstreamSends:  1,
+				legacyRetry:       true,
+			}
+		}(),
+		exposure:       modelRouteExposurePublic,
+		legacy:         true,
+		managedCatalog: provider != nil && provider.codexPool != nil && provider.codexPool.configured,
 	}, nil
 }
 
@@ -664,7 +690,7 @@ func (h *ProxyHandler) validateRouteAwareRequestJSON(body []byte, model, endpoin
 		return nil
 	}
 	route, known := h.resolveModelRouteForRequest(model, endpoint)
-	if !known || route == nil || route.legacy {
+	if !known || route == nil || !route.usesManagedExecution() {
 		return nil
 	}
 	if err := rejectDuplicateJSONMappingKeys(body); err != nil {

@@ -106,7 +106,7 @@ func (h *ProxyHandler) executeExplicitRouteSurfaceRequest(ctx context.Context, e
 		return nil, err
 	}
 	operation := routeOperationFromContext(ctx)
-	if operation == nil || operation.route == nil || operation.route.legacy {
+	if operation == nil || operation.route == nil || !operation.route.usesManagedExecution() {
 		return resp, nil
 	}
 
@@ -253,7 +253,7 @@ func (h *ProxyHandler) aggregateExplicitChatCompletionsResponse(ctx context.Cont
 		if aggregateErr != nil && lifecycleBody.canceledAtFailure() {
 			aggregateErr = context.Canceled
 		}
-		if operation == nil || operation.route == nil || operation.route.legacy {
+		if operation == nil || operation.route == nil || !operation.route.usesManagedExecution() {
 			return response, nil, aggregateErr
 		}
 
@@ -495,7 +495,7 @@ func markExplicitRouteDownstreamCommitment(ctx context.Context, commitment downs
 }
 
 func explicitRoutePublicModel(route *modelRoute, fallback string) string {
-	if route != nil && !route.legacy && strings.TrimSpace(route.public.id) != "" {
+	if route != nil && route.usesManagedExecution() && strings.TrimSpace(route.public.id) != "" {
 		return route.public.id
 	}
 	return fallback
@@ -566,7 +566,7 @@ func explicitAnthropicResponseModels(operation *routeOperation, resp *http.Respo
 }
 
 func explicitRouteHasChatBackend(route *modelRoute, endpoint string) bool {
-	if route == nil || route.legacy || !route.supportsEndpoint(endpoint) {
+	if route == nil || !route.usesManagedExecution() || !route.supportsEndpoint(endpoint) {
 		return false
 	}
 	for _, target := range route.targets {
@@ -578,7 +578,7 @@ func explicitRouteHasChatBackend(route *modelRoute, endpoint string) bool {
 }
 
 func explicitChatExecutionEndpoint(route *modelRoute, body []byte) (string, error) {
-	if route == nil || route.legacy {
+	if route == nil || !route.usesManagedExecution() {
 		return "", nil
 	}
 	if chatRequestContainsResponsesReplayID(body) {
@@ -650,7 +650,7 @@ func (h *ProxyHandler) withAdmittedExplicitRouteOperation(ctx, inbound context.C
 		return ctx, nil, nil, modelNotAllowedRequestError(model)
 	}
 	route, known := h.resolveModelRouteForRequest(model, endpoint)
-	if !known || route == nil || route.legacy {
+	if !known || route == nil || !route.usesManagedExecution() {
 		return ctx, nil, route, nil
 	}
 
@@ -707,7 +707,7 @@ func (h *ProxyHandler) withChatExecutionRoute(ctx, inbound context.Context, mode
 		}
 	}
 	route, known := h.resolveModelRouteForRequest(model, providerEndpointChatCompletions)
-	if !known || route == nil || route.legacy {
+	if !known || route == nil || !route.usesManagedExecution() {
 		return ctx, nil, route, nil
 	}
 	endpoint, err := explicitChatExecutionEndpoint(route, body)
@@ -739,7 +739,7 @@ func convertedExplicitChatSafeHeaders(resp *http.Response, publicModel string) h
 	return headers
 }
 
-func explicitResponsesChatReplayRoute(route *modelRoute, target targetBinding) responsesChatReplayRoute {
+func explicitResponsesChatReplayRoute(route *modelRoute, target targetBinding, credentialID string) responsesChatReplayRoute {
 	if route == nil || target.provider == nil {
 		return responsesChatReplayRoute{}
 	}
@@ -751,6 +751,9 @@ func explicitResponsesChatReplayRoute(route *modelRoute, target targetBinding) r
 		ProviderID:    target.provider.id,
 		PublicModel:   route.public.id,
 		UpstreamModel: upstreamModel,
+		RouteID:       route.public.routeID,
+		TargetID:      target.id,
+		CredentialID:  credentialID,
 	}
 }
 
@@ -764,7 +767,7 @@ func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOpera
 		return translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
 			UpstreamModel:       route.public.id,
 			ReplayStore:         h.responsesChatReplayStore(),
-			ReplayRoute:         explicitResponsesChatReplayRoute(route, target),
+			ReplayRoute:         explicitResponsesChatReplayRoute(route, target, ""),
 			MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
 			DropSamplingParams:  options.ResponsesDropSamplingParams,
 		})
@@ -794,8 +797,18 @@ func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOpera
 		plan, err := translateForTarget(target)
 		if err == nil {
 			if operation != nil {
-				if pinErr := operation.forcePinnedTarget(target.id); pinErr != nil {
-					return responsesChatRequestPlan{}, target, pinErr
+				targetID := target.id
+				if plan.ReplayRoute.TargetID != "" {
+					targetID = plan.ReplayRoute.TargetID
+				}
+				owner := executionOwner{routeID: route.public.routeID, targetID: targetID, credentialID: plan.ReplayRoute.CredentialID}
+				if plan.ReplayRoute.CredentialID != "" {
+					if target.provider != nil && target.provider.codexPool != nil && target.provider.codexPool.memberIDForCredential(plan.ReplayRoute.CredentialID) == "" {
+						return responsesChatRequestPlan{}, target, missingResponsesChatReplayError()
+					}
+				}
+				if pinErr := operation.forcePinnedOwner(owner); pinErr != nil {
+					return responsesChatRequestPlan{}, target, missingResponsesChatReplayError()
 				}
 			}
 			return plan, target, nil
@@ -827,6 +840,11 @@ func (h *ProxyHandler) executeExplicitResponsesChat(ctx context.Context, route *
 	}
 	resp, err := h.postResponsesWithHeadersForModel(ctx, plan.Body, headers, requestedModel)
 	if err != nil {
+		if plan.ReplayRoute.CredentialID != "" && errors.Is(err, errOpenAICodexStaleCredentialGeneration) {
+			replayErr := missingResponsesChatReplayError()
+			attachExplicitChatExecutionErrorRoute(replayErr, route, plannedTarget, providerEndpointResponses, chatBackendResponses)
+			return chatExecutionResult{}, replayErr
+		}
 		return chatExecutionResult{}, err
 	}
 
@@ -850,10 +868,14 @@ func (h *ProxyHandler) executeExplicitResponsesChat(ctx context.Context, route *
 		return result, nil
 	}
 
+	credentialID := ""
+	if info, ok := explicitRouteResponseInfoFromResponse(resp); ok {
+		credentialID = info.credentialID
+	}
 	responseOptions := responsesChatResponseOptions{
 		PublicModel: route.public.id,
 		ReplayStore: h.responsesChatReplayStore(),
-		ReplayRoute: explicitResponsesChatReplayRoute(route, target),
+		ReplayRoute: explicitResponsesChatReplayRoute(route, target, credentialID),
 		UsageOnly:   options.ResponsesUsageOnly,
 	}
 	if plan.Stream {
@@ -918,7 +940,7 @@ func (h *ProxyHandler) executeChatCompletionsForRequestedModel(ctx context.Conte
 
 func (h *ProxyHandler) executeRoutedChatCompletions(ctx context.Context, body []byte, mode chatCompletionsMode, options chatExecutionOptions, requestedModel string) (chatExecutionResult, error) {
 	operation := routeOperationFromContext(ctx)
-	if operation == nil || operation.route == nil || operation.route.legacy {
+	if operation == nil || operation.route == nil || !operation.route.usesManagedExecution() {
 		return h.executeChatCompletionsForRequestedModel(ctx, body, options, requestedModel)
 	}
 
@@ -948,7 +970,7 @@ func (h *ProxyHandler) executeRoutedChatCompletions(ctx context.Context, body []
 
 func (h *ProxyHandler) retryRoutedChatExecutionWithoutInjectedStreamOptions(ctx context.Context, result chatExecutionResult, body []byte, mode chatCompletionsMode, requestedModel string) (chatExecutionResult, []byte, chatCompletionsMode) {
 	operation := routeOperationFromContext(ctx)
-	if operation == nil || operation.route == nil || operation.route.legacy || result.Backend != chatBackendNativeChat || result.Response == nil {
+	if operation == nil || operation.route == nil || !operation.route.usesManagedExecution() || result.Backend != chatBackendNativeChat || result.Response == nil {
 		return h.retryChatExecutionWithoutInjectedStreamOptions(ctx, result, body, mode)
 	}
 
@@ -963,7 +985,7 @@ func (h *ProxyHandler) retryRoutedChatExecutionWithoutInjectedStreamOptions(ctx 
 
 func (h *ProxyHandler) aggregateExplicitRoutedChatExecution(ctx context.Context, result chatExecutionResult, body []byte, mode chatCompletionsMode) (chatExecutionResult, error) {
 	operation := routeOperationFromContext(ctx)
-	if operation == nil || operation.route == nil || operation.route.legacy || result.Backend != chatBackendNativeChat || result.Response == nil || !mode.forceUpstreamStream {
+	if operation == nil || operation.route == nil || !operation.route.usesManagedExecution() || result.Backend != chatBackendNativeChat || result.Response == nil || !mode.forceUpstreamStream {
 		return result, nil
 	}
 
@@ -1259,10 +1281,10 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 }
 
 func (h *ProxyHandler) postAnthropicMessagesCountTokensForModel(ctx context.Context, body []byte, extraHeaders http.Header, model string) (*http.Response, error) {
-	if operation := routeOperationFromContext(ctx); operation != nil && operation.route != nil && !operation.route.legacy {
+	if operation := routeOperationFromContext(ctx); operation != nil && operation.route != nil && operation.route.usesManagedExecution() {
 		return h.executeExplicitRouteRequestPath(ctx, operation.route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)
 	}
-	if route, known := h.resolveModelRouteForRequest(model, providerEndpointMessages); known && route != nil && !route.legacy {
+	if route, known := h.resolveModelRouteForRequest(model, providerEndpointMessages); known && route != nil && route.usesManagedExecution() {
 		return h.executeExplicitRouteRequestPath(ctx, route, providerEndpointMessages, providerEndpointMessagesCount, body, extraHeaders, model, false)
 	}
 

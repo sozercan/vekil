@@ -10684,12 +10684,20 @@ func TestFetchProviderModelsRejectsOversizedSuccessfulCatalogs(t *testing.T) {
 		},
 		{
 			name: "OpenAI Codex",
-			provider: &providerRuntime{
-				id:        "codex",
-				kind:      providerTypeOpenAICodex,
-				baseURL:   "http://upstream.test",
-				codexAuth: &openAICodexAuth{path: codexAuthPath},
-			},
+			provider: func() *providerRuntime {
+				pool, err := newOpenAICodexAccountPool("codex", nil)
+				if err != nil {
+					t.Fatalf("newOpenAICodexAccountPool() error = %v", err)
+				}
+				pool.members[0].authPath = codexAuthPath
+				pool.members[0].auth = newOpenAICodexAuthAt(codexAuthPath)
+				return &providerRuntime{
+					id:        "codex",
+					kind:      providerTypeOpenAICodex,
+					baseURL:   "http://upstream.test",
+					codexPool: pool,
+				}
+			}(),
 		},
 		{
 			name: "generic OpenAI discovery",

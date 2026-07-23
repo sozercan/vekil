@@ -100,13 +100,34 @@ type ProviderConfig struct {
 	MessagesPath               string                      `json:"messages_path,omitempty" yaml:"messages_path,omitempty"`
 	ModelsPath                 string                      `json:"models_path,omitempty" yaml:"models_path,omitempty"`
 	ModelDiscovery             string                      `json:"model_discovery,omitempty" yaml:"model_discovery,omitempty"`
+	CodexAccounts              *OpenAICodexAccountsConfig  `json:"codex_accounts,omitempty" yaml:"codex_accounts,omitempty"`
 	TrustDomain                string                      `json:"trust_domain,omitempty" yaml:"trust_domain,omitempty"`
 	ClassifierNoStoreSupported *bool                       `json:"classifier_no_store_supported,omitempty" yaml:"classifier_no_store_supported,omitempty"`
 	Headers                    CopilotHeaderProfilesConfig `json:"headers,omitempty" yaml:"headers,omitempty"`
 	Models                     []ProviderModelConfig       `json:"models,omitempty" yaml:"models,omitempty"`
 
+	codexAccountsSet              bool
 	trustDomainSet                bool
 	classifierNoStoreSupportedSet bool
+}
+
+// OpenAICodexAccountsConfig configures an opt-in pool of ChatGPT subscription
+// accounts behind one openai-codex provider.
+type OpenAICodexAccountsConfig struct {
+	Strategy           string                     `json:"strategy" yaml:"strategy"`
+	MaxAccountAttempts int                        `json:"max_account_attempts,omitempty" yaml:"max_account_attempts,omitempty"`
+	SessionAffinity    *bool                      `json:"session_affinity,omitempty" yaml:"session_affinity,omitempty"`
+	SessionAffinityTTL string                     `json:"session_affinity_ttl,omitempty" yaml:"session_affinity_ttl,omitempty"`
+	Accounts           []OpenAICodexAccountConfig `json:"accounts" yaml:"accounts"`
+
+	sessionAffinityTTLSet bool
+}
+
+// OpenAICodexAccountConfig identifies one configured Codex auth file within a
+// provider-internal account pool.
+type OpenAICodexAccountConfig struct {
+	ID       string `json:"id" yaml:"id"`
+	AuthFile string `json:"auth_file" yaml:"auth_file"`
 }
 
 // ProviderModelConfig maps a public model ID exposed by this proxy to the
@@ -150,7 +171,7 @@ type providerRuntime struct {
 	staticModels               map[string]providerModel
 	staticConfigs              map[string]ProviderModelConfig
 	staticOrder                []string
-	codexAuth                  *openAICodexAuth
+	codexPool                  *openAICodexAccountPool
 	headerProfiles             CopilotHeaderProfilesConfig
 }
 
@@ -878,7 +899,7 @@ func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime
 			// dynamic-provider catalogs.
 			continue
 		}
-		if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
+		if route, ok := setup.lookupRoute(model); ok && route != nil && route.usesManagedExecution() {
 			for _, target := range route.targets {
 				if target.provider != nil && target.provider.id == provider.id {
 					return true
@@ -1118,12 +1139,12 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 		if err := validateGenericProviderBaseURL(id, "OpenAI Codex", baseURL); err != nil {
 			return nil, err
 		}
-		codexAuth, err := newOpenAICodexAuth()
+		codexPool, err := newOpenAICodexAccountPool(id, cfg.CodexAccounts)
 		if err != nil {
 			return nil, fmt.Errorf("provider %q: %w", id, err)
 		}
 		runtime.baseURL = baseURL
-		runtime.codexAuth = codexAuth
+		runtime.codexPool = codexPool
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 		if baseURL == "" {
@@ -1363,7 +1384,8 @@ func filterProviderModels(provider *providerRuntime, models []providerModel) []p
 func needsDynamicProviderModelValidation(providers map[string]*providerRuntime) bool {
 	multipleProviders := len(providers) > 1
 	for _, provider := range providers {
-		if providerUsesDynamicModels(provider) && (multipleProviders || providerHasModelFilters(provider)) {
+		pooledCodex := provider != nil && provider.codexPool != nil && provider.codexPool.configured
+		if providerUsesDynamicModels(provider) && (multipleProviders || providerHasModelFilters(provider) || pooledCodex) {
 			return true
 		}
 	}
@@ -1710,7 +1732,7 @@ func (h *ProxyHandler) ModelUsesCopilot(model string) bool {
 		// reserved policy owner therefore never requires Copilot authentication.
 		return false
 	}
-	if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
+	if route, ok := setup.lookupRoute(model); ok && route != nil && route.usesManagedExecution() {
 		for _, target := range route.targets {
 			if target.provider != nil && target.provider.kind == providerTypeCopilot {
 				return true
@@ -1956,19 +1978,11 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 		req.Header.Set("Content-Type", "application/json")
 	case providerTypeOpenAICodex:
 		clearCopilotHeaders(req.Header)
-		if provider.codexAuth == nil {
+		if provider.codexPool == nil {
 			return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no OpenAI Codex auth configured", provider.id)}
 		}
-		credentials, err := provider.codexAuth.credentials(req.Context(), h.client)
-		if err != nil {
+		if err := provider.codexPool.authorizeRequest(req, h.client); err != nil {
 			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
-		}
-		req.Header.Set("Authorization", "Bearer "+credentials.accessToken)
-		if credentials.accountID != "" {
-			req.Header.Set("ChatGPT-Account-ID", credentials.accountID)
-		}
-		if credentials.fedRAMP {
-			req.Header.Set("X-OpenAI-Fedramp", "true")
 		}
 		req.Header.Set("Content-Type", "application/json")
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
@@ -2189,9 +2203,16 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 		result.models = filterProviderModels(provider, models)
 		return result, nil
 	case providerTypeOpenAICodex:
+		if provider.codexPool == nil {
+			return providerModelsFetchResult{}, fmt.Errorf("provider %q has no OpenAI Codex account pool configured", provider.id)
+		}
+		if provider.codexPool.configured {
+			return provider.codexPool.fetchModels(ctx, h, provider, rawQuery, ifNoneMatch)
+		}
+
 		modelsQuery := openAICodexModelsRawQuery(rawQuery)
 		resp, err := h.doWithRetry(func() (*http.Request, error) {
-			req, err := h.newProviderJSONRequest(ctx, provider, http.MethodGet, "/models", nil, nil, modelsQuery)
+			req, err := h.newProviderJSONRequest(ctx, provider, http.MethodGet, providerEndpointModels, nil, nil, modelsQuery)
 			if err != nil {
 				return nil, err
 			}
@@ -2222,7 +2243,6 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 		if err != nil {
 			return providerModelsFetchResult{}, err
 		}
-
 		models, err := decodeOpenAICodexModelsFromBody(provider, body)
 		if err != nil {
 			return providerModelsFetchResult{}, err

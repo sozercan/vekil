@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,6 +64,8 @@ type routeRetryDecision string
 const (
 	routeRetryAccepted               routeRetryDecision = "accepted"
 	routeRetrySwitchTarget           routeRetryDecision = "switch_target"
+	routeRetrySameCredential         routeRetryDecision = "retry_same_credential"
+	routeRetrySwitchCredential       routeRetryDecision = "switch_credential"
 	routeRetrySuppressedMode         routeRetryDecision = "suppressed_mode"
 	routeRetrySuppressedDelivery     routeRetryDecision = "suppressed_delivery"
 	routeRetrySuppressedProgress     routeRetryDecision = "suppressed_progress"
@@ -74,6 +77,15 @@ const (
 	routeRetrySuppressedNoTarget     routeRetryDecision = "suppressed_no_target"
 	routeRetrySuppressedNonretryable routeRetryDecision = "suppressed_nonretryable"
 )
+
+func routeRetryDecisionContinues(decision routeRetryDecision) bool {
+	switch decision {
+	case routeRetrySwitchTarget, routeRetrySameCredential, routeRetrySwitchCredential:
+		return true
+	default:
+		return false
+	}
+}
 
 type routeAttemptOutcome string
 
@@ -215,6 +227,23 @@ type routeOperation struct {
 	attemptRecords          map[int]*routeAttemptRecord
 	attemptPublished        map[int]routeAttemptTrace
 	attemptUpdateVersion    uint64
+
+	pinnedCredentialID        string
+	hardPinnedCredential      bool
+	codexCandidateOrder       []string
+	codexCandidateInitialized bool
+	codexCandidateOnce        sync.Once
+	codexAttemptedMembers     map[string]struct{}
+	codexAccountAttempts      int
+	codexLastCredentialID     string
+	codexLastAccessMemberID   string
+	codexAccountSwitches      int
+	codexRetryMemberID        string
+	codexTransportRetryUsed   bool
+	codexAuthReloaded         map[string]struct{}
+	codexAffinityKey          [sha256.Size]byte
+	codexHasAffinityKey       bool
+	pendingConversationToken  *stateBindingToken
 }
 
 type routeOperationContextKey struct{}
@@ -227,7 +256,7 @@ func newRouteOperation(route *modelRoute, inbound context.Context) *routeOperati
 }
 
 func newRouteOperationWithID(route *modelRoute, inbound context.Context, operationID string) *routeOperation {
-	if route == nil || route.legacy {
+	if route == nil || !route.usesManagedExecution() {
 		return nil
 	}
 	maxTargets := route.policy.maxTargetAttempts
@@ -252,6 +281,8 @@ func newRouteOperationWithID(route *modelRoute, inbound context.Context, operati
 		remainingTargetAttempts: maxTargets,
 		remainingUpstreamSends:  maxSends,
 		attemptedTargets:        make(map[string]struct{}, maxTargets),
+		codexAttemptedMembers:   make(map[string]struct{}),
+		codexAuthReloaded:       make(map[string]struct{}),
 		commitment:              downstreamCommitmentNone,
 		trace:                   make([]routeAttemptTrace, 0, min(maxTargets, maxRouteAttemptTrace)),
 	}
@@ -422,6 +453,51 @@ func (o *routeOperation) operationID() string {
 	return o.id
 }
 
+func (o *routeOperation) pinOwner(owner executionOwner) {
+	if o == nil || !owner.valid() || o.route == nil || owner.routeID != o.route.public.routeID {
+		return
+	}
+	o.mu.Lock()
+	if o.pinnedTargetID == "" {
+		o.pinnedTargetID = owner.targetID
+	}
+	if o.pinnedCredentialID == "" && owner.credentialID != "" {
+		o.pinnedCredentialID = owner.credentialID
+	}
+	o.mu.Unlock()
+}
+
+func (o *routeOperation) forcePinnedOwner(owner executionOwner) error {
+	if o == nil || !owner.valid() {
+		return nil
+	}
+	if o.route == nil || owner.routeID != o.route.public.routeID {
+		return fmt.Errorf("route operation owner belongs to a different route")
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.pinnedTargetID != "" && o.pinnedTargetID != owner.targetID {
+		return fmt.Errorf("route operation is bound to target %q, not %q", o.pinnedTargetID, owner.targetID)
+	}
+	if o.pinnedCredentialID != "" && o.pinnedCredentialID != owner.credentialID {
+		return fmt.Errorf("route operation is bound to a different credential generation")
+	}
+	o.pinnedTargetID = owner.targetID
+	o.pinnedCredentialID = owner.credentialID
+	o.hardPinned = true
+	o.hardPinnedCredential = owner.credentialID != ""
+	return nil
+}
+
+func (o *routeOperation) pinnedOwner() executionOwner {
+	if o == nil || o.route == nil {
+		return executionOwner{}
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return executionOwner{routeID: o.route.public.routeID, targetID: o.pinnedTargetID, credentialID: o.pinnedCredentialID}
+}
+
 func (o *routeOperation) pinTarget(targetID string) {
 	if o == nil || strings.TrimSpace(targetID) == "" {
 		return
@@ -454,6 +530,166 @@ func (o *routeOperation) pinnedTarget() string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.pinnedTargetID
+}
+
+func (o *routeOperation) pinnedCredential() string {
+	if o == nil {
+		return ""
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.pinnedCredentialID
+}
+
+func (o *routeOperation) initializeCodexCandidates(pool *openAICodexAccountPool, model string, headers http.Header, body []byte) {
+	if o == nil || pool == nil {
+		return
+	}
+	o.codexCandidateOnce.Do(func() {
+		affinityKey, hasAffinity := pool.affinityDigest(headers, body)
+		order := pool.candidateOrder(model, affinityKey, hasAffinity)
+		o.mu.Lock()
+		o.codexAffinityKey = affinityKey
+		o.codexHasAffinityKey = hasAffinity
+		o.codexCandidateOrder = append([]string(nil), order...)
+		o.codexCandidateInitialized = true
+		o.mu.Unlock()
+	})
+}
+
+func (o *routeOperation) markCodexMemberConsidered(memberID string) bool {
+	if o == nil || memberID == "" {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if _, attempted := o.codexAttemptedMembers[memberID]; attempted {
+		return false
+	}
+	o.codexAttemptedMembers[memberID] = struct{}{}
+	return true
+}
+
+func (o *routeOperation) codexLeaseWouldSwitch(lease *openAICodexAccountLease) bool {
+	if o == nil || lease == nil {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.codexLastCredentialID != "" && o.codexLastCredentialID != lease.credentialID
+}
+
+func (o *routeOperation) markCodexLeaseSelected(lease *openAICodexAccountLease) {
+	if o == nil || lease == nil {
+		return
+	}
+	o.mu.Lock()
+	if _, considered := o.codexAttemptedMembers[lease.accessMemberID]; !considered {
+		o.codexAttemptedMembers[lease.accessMemberID] = struct{}{}
+		o.codexAccountAttempts++
+	}
+	switched := o.codexLastCredentialID != "" && o.codexLastCredentialID != lease.credentialID
+	if switched {
+		o.codexAccountSwitches++
+	}
+	o.codexLastCredentialID = lease.credentialID
+	o.codexLastAccessMemberID = lease.accessMemberID
+	if o.codexRetryMemberID == lease.accessMemberID {
+		o.codexRetryMemberID = ""
+	}
+	o.mu.Unlock()
+	if switched {
+		if summary := RequestSummaryFromContext(o.inbound); summary != nil {
+			summary.recordAccountSwitch()
+		}
+	}
+}
+
+func (o *routeOperation) lastCodexAccessMemberID() string {
+	if o == nil {
+		return ""
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.codexLastAccessMemberID
+}
+
+func (o *routeOperation) requestCodexTransportRetry(lease *openAICodexAccountLease) bool {
+	if o == nil || lease == nil {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.codexTransportRetryUsed {
+		return false
+	}
+	o.codexTransportRetryUsed = true
+	o.codexRetryMemberID = lease.accessMemberID
+	return true
+}
+
+func (o *routeOperation) requestCodexAuthReloadRetry(lease *openAICodexAccountLease) bool {
+	if o == nil || lease == nil {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if _, used := o.codexAuthReloaded[lease.accessMemberID]; used {
+		return false
+	}
+	o.codexAuthReloaded[lease.accessMemberID] = struct{}{}
+	o.codexRetryMemberID = lease.accessMemberID
+	return true
+}
+
+func (o *routeOperation) setPendingConversationToken(token stateBindingToken) {
+	if o == nil || token.stateType != stateBindingTypeConversationID || token.value == "" {
+		return
+	}
+	o.mu.Lock()
+	copy := token
+	o.pendingConversationToken = &copy
+	o.mu.Unlock()
+}
+
+func (o *routeOperation) pendingConversation() (stateBindingToken, bool) {
+	if o == nil {
+		return stateBindingToken{}, false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.pendingConversationToken == nil {
+		return stateBindingToken{}, false
+	}
+	return *o.pendingConversationToken, true
+}
+
+func (o *routeOperation) clearPendingConversation() {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	o.pendingConversationToken = nil
+	o.mu.Unlock()
+}
+
+func (o *routeOperation) codexAccountSwitchAllowed(kind routeAttemptKind) bool {
+	if o == nil {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.hardPinned || o.hardPinnedCredential || o.commitment != downstreamCommitmentNone {
+		return false
+	}
+	switch kind {
+	case routeAttemptProtocolRecovery, routeAttemptCompatibilityFallback:
+		return false
+	case routeAttemptCompaction:
+		return o.pinnedCredentialID == ""
+	default:
+		return true
+	}
 }
 
 func (o *routeOperation) allowsAutomaticTargetSwitch(kind routeAttemptKind) bool {
@@ -517,6 +753,30 @@ func (o *routeOperation) reserveSendAtDispatch(ctx context.Context, shuttingDown
 	o.remainingUpstreamSends--
 	o.upstreamSends++
 	return true, routeRetryAccepted
+}
+
+func (o *routeOperation) codexSameCredentialRetryAdmissionOpen(ctx context.Context, shuttingDown bool) bool {
+	if o == nil {
+		return true
+	}
+	if shuttingDown || (ctx != nil && ctx.Err() != nil) || (o.inbound != nil && o.inbound.Err() != nil) {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.remainingUpstreamSends > 0 && (o.commitment == downstreamCommitmentNone || o.pinnedCredentialID != "")
+}
+
+func (o *routeOperation) codexAccountSwitchAdmissionOpen(ctx context.Context, shuttingDown bool) bool {
+	if o == nil {
+		return true
+	}
+	if shuttingDown || (ctx != nil && ctx.Err() != nil) || (o.inbound != nil && o.inbound.Err() != nil) {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.commitment == downstreamCommitmentNone && o.remainingUpstreamSends > 0
 }
 
 func (o *routeOperation) retryAdmissionOpen(ctx context.Context, shuttingDown bool) bool {
@@ -697,7 +957,8 @@ func orderedRouteTargets(route *modelRoute, operation *routeOperation, endpoint 
 			operation.mu.Lock()
 			_, attempted := operation.attemptedTargets[target.id]
 			operation.mu.Unlock()
-			if attempted {
+			pooledCodex := target.provider != nil && target.provider.codexPool != nil && target.provider.codexPool.configured
+			if attempted && !pooledCodex {
 				continue
 			}
 		}
@@ -769,7 +1030,10 @@ func (o *routeSendObservation) deliveryForError() requestDelivery {
 
 func sanitizeExplicitRouteResponseHeaders(headers http.Header) {
 	for name := range headers {
-		if strings.EqualFold(name, "X-Vekil-Request-ID") {
+		switch {
+		case strings.EqualFold(name, "X-Vekil-Request-ID"),
+			strings.EqualFold(name, "ChatGPT-Account-ID"),
+			strings.EqualFold(name, "X-OpenAI-Fedramp"):
 			delete(headers, name)
 		}
 	}
@@ -997,6 +1261,8 @@ func captureRouteResponse(resp *http.Response) (*capturedRouteResponse, bool) {
 		"Proxy-Authorization",
 		"Api-Key",
 		"X-Api-Key",
+		"ChatGPT-Account-ID",
+		"X-OpenAI-Fedramp",
 	} {
 		deleteHeaderCI(header, name)
 	}
@@ -2037,33 +2303,38 @@ func routeAttemptDiagnosticHeaders(headers http.Header) http.Header {
 type routeAttemptResponseObserver struct {
 	mu sync.Mutex
 
-	record          *routeAttemptRecord
-	operation       *routeOperation
-	inboundCtx      context.Context
-	attemptCtx      context.Context
-	trace           routeAttemptTrace
-	send            *routeSendObservation
-	endpoint        string
-	streaming       bool
-	headers         http.Header
-	statusCode      int
-	outcome         routeAttemptOutcome
-	progress        upstreamSemanticProgress
-	commitment      downstreamCommitment
-	decision        routeRetryDecision
-	retryAfter      *int64
-	upstreamID      string
-	usage           statsTokenUsage
-	haveUsage       bool
-	terminal        bool
-	cleanupTimedOut bool
-	line            []byte
-	lineOverflow    bool
-	linePendingCR   bool
-	sse             sseDataAccumulator
-	tail            routeAttemptTailBuffer
-	envelope        *routeAttemptEnvelopeExtractor
-	anthropic       anthropicStreamUsageAccumulator
+	record            *routeAttemptRecord
+	operation         *routeOperation
+	inboundCtx        context.Context
+	attemptCtx        context.Context
+	trace             routeAttemptTrace
+	send              *routeSendObservation
+	endpoint          string
+	streaming         bool
+	headers           http.Header
+	statusCode        int
+	outcome           routeAttemptOutcome
+	progress          upstreamSemanticProgress
+	commitment        downstreamCommitment
+	decision          routeRetryDecision
+	retryAfter        *int64
+	upstreamID        string
+	usage             statsTokenUsage
+	haveUsage         bool
+	terminal          bool
+	cleanupTimedOut   bool
+	line              []byte
+	lineOverflow      bool
+	linePendingCR     bool
+	sse               sseDataAccumulator
+	tail              routeAttemptTailBuffer
+	envelope          *routeAttemptEnvelopeExtractor
+	anthropic         anthropicStreamUsageAccumulator
+	codexLease        *openAICodexAccountLease
+	codexModel        string
+	codexFailureClass openAICodexAccountFailureClass
+	codexFailureHeads http.Header
+	codexDone         sync.Once
 }
 
 func newRouteAttemptResponseObserver(record *routeAttemptRecord, operation *routeOperation, trace routeAttemptTrace, send *routeSendObservation, endpoint string, streaming bool, headers http.Header) *routeAttemptResponseObserver {
@@ -2333,6 +2604,12 @@ func (o *routeAttemptResponseObserver) observeResponsesEvent(eventType, data str
 		}
 		o.statusCode = status
 		o.retryAfter = sanitizedRouteAttemptRetryAfter(failureHeaders, "")
+		if o.codexLease != nil {
+			streamErr := responsesStreamEventError(event)
+			body, _ := json.Marshal(map[string]any{"error": streamErr})
+			o.codexFailureClass = classifyOpenAICodexAccountHTTPFailure(status, body)
+			o.codexFailureHeads = failureHeaders.Clone()
+		}
 		if requestID := responsesUpstreamRequestID(failureHeaders); requestID != "" {
 			o.upstreamID = boundOperationalStatLabel(requestID)
 		}
@@ -2385,8 +2662,25 @@ func routeAttemptResponsesEventProgress(event responsesWebSocketStreamEvent) ups
 	return upstreamProgressUnknown
 }
 
+func (o *routeAttemptResponseObserver) finishCodexLease(completion routeAttemptCompletion) {
+	if o == nil || o.codexLease == nil || o.codexLease.pool == nil {
+		return
+	}
+	o.codexDone.Do(func() {
+		if completion.Outcome == routeAttemptOutcomeSucceeded {
+			o.codexLease.pool.reportSuccess(o.codexLease, o.codexModel)
+			return
+		}
+		if o.codexFailureClass != openAICodexAccountFailureNone {
+			o.codexLease.pool.reportFailure(o.codexLease, o.codexModel, o.codexFailureClass, o.codexFailureHeads)
+			return
+		}
+		o.codexLease.pool.releaseLease(o.codexLease, o.codexModel)
+	})
+}
+
 func (o *routeAttemptResponseObserver) publishCleanupTimeout() {
-	if o == nil || o.record == nil {
+	if o == nil {
 		return
 	}
 	o.mu.Lock()
@@ -2398,6 +2692,7 @@ func (o *routeAttemptResponseObserver) publishCleanupTimeout() {
 	}
 	completion := o.completionLocked(false)
 	o.mu.Unlock()
+	o.finishCodexLease(completion)
 	o.record.complete(completion)
 }
 
@@ -2440,6 +2735,10 @@ func (o *routeAttemptResponseObserver) finish(cleanupComplete bool, readErr erro
 		}
 	} else {
 		o.inspectNonStreamingLocked()
+		if o.codexLease != nil && o.codexFailureClass == openAICodexAccountFailureNone && o.outcome == routeAttemptOutcomeFailed {
+			o.codexFailureClass = classifyOpenAICodexAccountHTTPFailure(o.statusCode, o.tail.bytes())
+			o.codexFailureHeads = o.headers.Clone()
+		}
 		if !o.terminal {
 			switch {
 			case errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded):
@@ -2460,6 +2759,7 @@ func (o *routeAttemptResponseObserver) finish(cleanupComplete bool, readErr erro
 	}
 	completion := o.completionLocked(cleanupComplete)
 	o.mu.Unlock()
+	o.finishCodexLease(completion)
 	o.record.complete(completion)
 }
 
@@ -2804,7 +3104,7 @@ func (b *routeAttemptObservedBody) canceledAtFailure() bool {
 }
 
 func observeRouteAttemptResponse(resp *http.Response, record *routeAttemptRecord, operation *routeOperation, trace routeAttemptTrace, send *routeSendObservation, endpoint string, streaming bool) *http.Response {
-	if resp == nil || record == nil {
+	if resp == nil {
 		return resp
 	}
 	if resp.Body == nil {
@@ -2829,6 +3129,16 @@ func observeRouteAttemptResponse(resp *http.Response, record *routeAttemptRecord
 			CleanupComplete:      true,
 		}
 		completion.Wasted = routeAttemptOutcomeIsWasted(completion.Outcome)
+		if resp.Request != nil {
+			if lease := openAICodexAccountLeaseFromContext(resp.Request.Context()); lease != nil && lease.pool != nil {
+				info, _ := explicitRouteResponseInfoFromResponse(resp)
+				if completion.Outcome == routeAttemptOutcomeSucceeded {
+					lease.pool.reportSuccess(lease, info.publicID)
+				} else {
+					lease.pool.releaseLease(lease, info.publicID)
+				}
+			}
+		}
 		record.complete(completion)
 		return resp
 	}
@@ -2836,6 +3146,10 @@ func observeRouteAttemptResponse(resp *http.Response, record *routeAttemptRecord
 	observer := newRouteAttemptResponseObserver(record, operation, trace, send, endpoint, streaming, resp.Header)
 	if resp.Request != nil {
 		observer.attemptCtx = resp.Request.Context()
+		observer.codexLease = openAICodexAccountLeaseFromContext(resp.Request.Context())
+		if info, ok := explicitRouteResponseInfoFromResponse(resp); ok {
+			observer.codexModel = info.publicID
+		}
 	}
 	if terminal, ok := routeAttemptPreparedTerminalFromResponse(resp); ok && endpoint == providerEndpointResponses && !terminal.Response.Usage.isZero() {
 		observer.mu.Lock()
@@ -2886,12 +3200,14 @@ type routeAttemptFailure struct {
 	usage         statsTokenUsage
 	usageReported bool
 	outcome       routeAttemptOutcome
+	poolExhausted bool
 }
 
 type routeResultAttribution struct {
-	targetID     string
-	providerID   string
-	providerKind string
+	targetID       string
+	providerID     string
+	providerKind   string
+	accessMemberID string
 }
 
 func routeResultAttributionForTarget(target targetBinding) routeResultAttribution {
@@ -2906,12 +3222,16 @@ func routeResultAttributionForTarget(target targetBinding) routeResultAttributio
 func (a routeResultAttribution) recordFinal(ctx context.Context) {
 	if summary := RequestSummaryFromContext(ctx); summary != nil {
 		summary.setFinalRouteAttribution(a.targetID, a.providerID, a.providerKind)
+		summary.setFinalAccessMemberID(a.accessMemberID)
 	}
 }
 
 func (f routeAttemptFailure) precedence() int {
 	if f.delivery == requestDeliveredOrAmbiguous {
 		return 4
+	}
+	if f.poolExhausted {
+		return 3
 	}
 	if f.decision == routeRetrySuppressedNonretryable || f.decision == routeRetrySuppressedState ||
 		f.decision == routeRetrySuppressedLifecycle || errors.Is(f.err, context.Canceled) || errors.Is(f.err, context.DeadlineExceeded) {
@@ -2959,7 +3279,7 @@ func (h *ProxyHandler) executeExplicitRouteRequest(ctx context.Context, route *m
 }
 
 func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, route *modelRoute, endpoint, dispatchPath string, body []byte, extraHeaders http.Header, requestedModel string, stream bool) (*http.Response, error) {
-	if route == nil || route.legacy {
+	if route == nil || !route.usesManagedExecution() {
 		return nil, fmt.Errorf("explicit model route is required")
 	}
 	operation := routeOperationFromContext(ctx)
@@ -3011,22 +3331,67 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			break
 		}
 
-		req, err := h.newProviderJSONRequest(ctx, target.provider, http.MethodPost, dispatchPath, preparedBody, cloneSanitizedRouteHeaders(extraHeaders), "", owner)
+		requestCtx := ctx
+		var codexLease *openAICodexAccountLease
+		if target.provider != nil && target.provider.codexPool != nil && target.provider.codexPool.configured {
+			codexLease, err = target.provider.codexPool.acquireForOperation(ctx, h.client, operation, owner.publicID, extraHeaders, preparedBody)
+			if err != nil {
+				attribution.accessMemberID = operation.lastCodexAccessMemberID()
+				retryAfter := ""
+				if routeErrorStatus(err) == http.StatusTooManyRequests {
+					if summary := RequestSummaryFromContext(operation.inbound); summary != nil {
+						summary.markCooldownExhausted()
+					}
+				}
+				if headers, _ := openAICodexFailureDetails(err); headers != nil {
+					retryAfter, _ = selectResponsesRetryAfter(headers)
+				}
+				failure := routeAttemptFailure{err: err, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedNoTarget, statusCode: routeErrorStatus(err), retryAfter: retryAfter, poolExhausted: true}
+				failures = append(failures, failure)
+				operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
+				break
+			}
+			if err := h.bindPendingConversationForLease(operation, target, codexLease.credentialID); err != nil {
+				target.provider.codexPool.releaseLease(codexLease, owner.publicID)
+				if errors.Is(err, errConversationCredentialRebind) {
+					continue
+				}
+				failure := routeAttemptFailure{err: err, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedState}
+				failures = append(failures, failure)
+				operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
+				break
+			}
+			attribution.accessMemberID = codexLease.accessMemberID
+			requestCtx = withOpenAICodexAccountLease(requestCtx, codexLease)
+		}
+
+		req, err := h.newProviderJSONRequest(requestCtx, target.provider, http.MethodPost, dispatchPath, preparedBody, cloneSanitizedRouteHeaders(extraHeaders), "", owner)
 		if err != nil {
+			if codexLease != nil {
+				target.provider.codexPool.releaseLease(codexLease, owner.publicID)
+			}
 			failure := routeAttemptFailure{err: err, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedNonretryable}
 			failures = append(failures, failure)
 			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
 			break
 		}
+		credentialID := ""
+		if codexLease != nil {
+			credentialID = codexLease.credentialID
+		}
 		req = req.WithContext(withExplicitRouteResponseInfo(req.Context(), explicitRouteResponseInfo{
-			routeID:    route.public.routeID,
-			publicID:   route.public.id,
-			targetID:   target.id,
-			providerID: target.provider.id,
+			routeID:      route.public.routeID,
+			publicID:     route.public.id,
+			targetID:     target.id,
+			providerID:   target.provider.id,
+			credentialID: credentialID,
 		}))
 		req.GetBody = nil
 
 		if reserved, decision := operation.reserveSendAtDispatch(ctx, h.ShuttingDown()); !reserved {
+			if codexLease != nil {
+				target.provider.codexPool.releaseLease(codexLease, owner.publicID)
+			}
 			message := "route upstream-send budget exhausted"
 			switch decision {
 			case routeRetrySuppressedAdmission:
@@ -3051,10 +3416,22 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				TargetID:     target.id,
 				ProviderID:   target.provider.id,
 				ProviderKind: string(target.provider.kind),
-				Sequence:     sequence,
-				AttemptKind:  attemptKind,
-				operation:    operation,
-				startedAt:    startedAt,
+				AccessMemberID: func() string {
+					if codexLease != nil {
+						return codexLease.accessMemberID
+					}
+					return ""
+				}(),
+				SelectionReason: func() string {
+					if codexLease != nil {
+						return string(codexLease.selectionReason)
+					}
+					return ""
+				}(),
+				Sequence:    sequence,
+				AttemptKind: attemptKind,
+				operation:   operation,
+				startedAt:   startedAt,
 			})
 		}
 
@@ -3072,8 +3449,14 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				outcome = routeAttemptOutcomeCanceled
 			}
 			decision := routeRetrySuppressedDelivery
-			if delivery == requestDefinitelyNotDelivered && operation.allowsAutomaticTargetSwitch(kind) && operation.retryAdmissionOpen(ctx, h.ShuttingDown()) && route.policy.mode == routeModePriorityFailover {
-				decision = routeRetrySwitchTarget
+			if delivery == requestDefinitelyNotDelivered {
+				if codexLease != nil {
+					if operation.codexSameCredentialRetryAdmissionOpen(ctx, h.ShuttingDown()) && operation.requestCodexTransportRetry(codexLease) {
+						decision = routeRetrySameCredential
+					}
+				} else if operation.retryAdmissionOpen(ctx, h.ShuttingDown()) && operation.allowsAutomaticTargetSwitch(kind) && route.policy.mode == routeModePriorityFailover {
+					decision = routeRetrySwitchTarget
+				}
 			}
 			var captured *capturedRouteResponse
 			cleanupDone := true
@@ -3106,8 +3489,11 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 					Wasted:               true,
 				})
 			}
-			if decision == routeRetrySwitchTarget {
+			if routeRetryDecisionContinues(decision) {
 				continue
+			}
+			if codexLease != nil {
+				target.provider.codexPool.releaseLease(codexLease, owner.publicID)
 			}
 			break
 		}
@@ -3116,11 +3502,40 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			accepted, streamFailure := h.prepareExplicitResponsesStream(ctx, operation, route, target, resp)
 			if streamFailure != nil {
 				streamFailure.attribution = attribution
+				if codexLease != nil {
+					sanitizeOpenAICodexAccountFailureError(streamFailure.err, codexLease)
+				}
 				if streamFailure.decision == "" {
 					streamFailure.decision = routeRetrySuppressedProgress
 				}
-				if streamFailure.delivery == requestExplicitlyRejected && operation.allowsAutomaticTargetSwitch(kind) && operation.retryAdmissionOpen(ctx, h.ShuttingDown()) && route.policy.mode == routeModePriorityFailover {
-					streamFailure.decision = routeRetrySwitchTarget
+				streamRetryOpen := operation.retryAdmissionOpen(ctx, h.ShuttingDown())
+				if codexLease != nil {
+					streamRetryOpen = operation.codexSameCredentialRetryAdmissionOpen(ctx, h.ShuttingDown()) || operation.codexAccountSwitchAdmissionOpen(ctx, h.ShuttingDown())
+				}
+				if streamFailure.delivery == requestExplicitlyRejected && streamRetryOpen {
+					if codexLease != nil {
+						headers, failureBody := openAICodexFailureDetails(streamFailure.err)
+						failureClass := classifyOpenAICodexAccountHTTPFailure(streamFailure.statusCode, failureBody)
+						switch failureClass {
+						case openAICodexAccountFailureAuth:
+							if operation.codexSameCredentialRetryAdmissionOpen(ctx, h.ShuttingDown()) && operation.requestCodexAuthReloadRetry(codexLease) {
+								codexLease.member.auth.invalidateCachedCredentials()
+								streamFailure.decision = routeRetrySameCredential
+							} else {
+								target.provider.codexPool.reportFailure(codexLease, owner.publicID, failureClass, headers)
+								if operation.codexAccountSwitchAllowed(kind) {
+									streamFailure.decision = routeRetrySwitchCredential
+								}
+							}
+						case openAICodexAccountFailureQuota, openAICodexAccountFailureEntitlement:
+							target.provider.codexPool.reportFailure(codexLease, owner.publicID, failureClass, headers)
+							if operation.codexAccountSwitchAdmissionOpen(ctx, h.ShuttingDown()) && operation.codexAccountSwitchAllowed(kind) {
+								streamFailure.decision = routeRetrySwitchCredential
+							}
+						}
+					} else if operation.allowsAutomaticTargetSwitch(kind) && route.policy.mode == routeModePriorityFailover {
+						streamFailure.decision = routeRetrySwitchTarget
+					}
 				}
 				failures = append(failures, *streamFailure)
 				upstreamID := streamFailure.upstreamID
@@ -3149,8 +3564,11 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 					}
 					attemptRecord.complete(completion)
 				}
-				if streamFailure.decision == routeRetrySwitchTarget {
+				if routeRetryDecisionContinues(streamFailure.decision) {
 					continue
+				}
+				if codexLease != nil {
+					target.provider.codexPool.releaseLease(codexLease, owner.publicID)
 				}
 				break
 			}
@@ -3171,9 +3589,16 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				if attemptRecord != nil {
 					attemptRecord.complete(routeAttemptCompletion{StatusCode: accepted.StatusCode, Outcome: routeAttemptOutcomeFailed, Delivery: failure.delivery, SemanticProgress: failure.progress, DownstreamCommitment: failure.commitment, RetryDecision: failure.decision, TTFTMs: observation.ttftMillis(), UpstreamRequestID: failure.upstreamID, CleanupComplete: cleanupDone, Wasted: true})
 				}
+				if codexLease != nil {
+					target.provider.codexPool.releaseLease(codexLease, owner.publicID)
+				}
 				break
 			}
-			operation.pinTarget(target.id)
+			acceptedOwner := executionOwner{routeID: route.public.routeID, targetID: target.id}
+			if codexLease != nil {
+				acceptedOwner.credentialID = codexLease.credentialID
+			}
+			operation.pinOwner(acceptedOwner)
 			trace := routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: accepted.StatusCode, Delivery: requestDeliveredOrAmbiguous, Progress: upstreamProgressAllowedPreamble, Commitment: downstreamCommitmentNone, Decision: routeRetryAccepted, UpstreamID: responsesUpstreamRequestID(accepted.Header), CleanupDone: false}
 			operation.appendTrace(trace)
 			accepted = observeRouteAttemptResponse(accepted, attemptRecord, operation, trace, observation, endpoint, true)
@@ -3185,6 +3610,9 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		var capturedObservation *capturedRouteResponse
 		if routeAdapterMayExplicitlyReject(target, endpoint, resp.StatusCode) {
 			captured, cleanupDone := captureRouteResponse(resp)
+			if codexLease != nil && captured != nil {
+				captured.body = sanitizeOpenAICodexAccountFailureBody(captured.body, codexLease)
+			}
 			responseUpstreamID = captured.upstreamID
 			if !cleanupDone {
 				failure := routeAttemptFailure{err: fmt.Errorf("route attempt cleanup did not complete"), attribution: attribution, delivery: requestDeliveredOrAmbiguous, progress: upstreamProgressUnknown, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedLifecycle, statusCode: resp.StatusCode, upstreamID: captured.upstreamID, cleanupDone: false, outcome: routeAttemptOutcomeFailed}
@@ -3192,19 +3620,42 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				trace := routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: resp.StatusCode, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, UpstreamID: captured.upstreamID, CleanupDone: false}
 				operation.appendTrace(trace)
 				completeCapturedRouteAttempt(attemptRecord, operation, trace, observation, endpoint, captured, false, routeAttemptOutcomeFailed)
+				if codexLease != nil {
+					target.provider.codexPool.releaseLease(codexLease, owner.publicID)
+				}
 				break
 			}
 			if routeAdapterCertifiesHTTPRejection(target, endpoint, captured) {
 				decision := routeRetrySuppressedMode
-				if route.policy.mode == routeModePriorityFailover && operation.allowsAutomaticTargetSwitch(kind) && operation.retryAdmissionOpen(ctx, h.ShuttingDown()) {
+				if codexLease != nil {
+					failureClass := classifyOpenAICodexAccountHTTPFailure(captured.statusCode, captured.body)
+					switch failureClass {
+					case openAICodexAccountFailureAuth:
+						if operation.codexSameCredentialRetryAdmissionOpen(ctx, h.ShuttingDown()) && operation.requestCodexAuthReloadRetry(codexLease) {
+							codexLease.member.auth.invalidateCachedCredentials()
+							decision = routeRetrySameCredential
+						} else {
+							target.provider.codexPool.reportFailure(codexLease, owner.publicID, failureClass, captured.header)
+							if operation.codexAccountSwitchAdmissionOpen(ctx, h.ShuttingDown()) && operation.codexAccountSwitchAllowed(kind) {
+								decision = routeRetrySwitchCredential
+							}
+						}
+					case openAICodexAccountFailureQuota, openAICodexAccountFailureEntitlement:
+						target.provider.codexPool.reportFailure(codexLease, owner.publicID, failureClass, captured.header)
+						if operation.codexAccountSwitchAdmissionOpen(ctx, h.ShuttingDown()) && operation.codexAccountSwitchAllowed(kind) {
+							decision = routeRetrySwitchCredential
+						}
+					}
+				} else if route.policy.mode == routeModePriorityFailover && operation.allowsAutomaticTargetSwitch(kind) && operation.retryAdmissionOpen(ctx, h.ShuttingDown()) {
 					decision = routeRetrySwitchTarget
 				}
-				failure := routeAttemptFailure{response: captured, attribution: attribution, delivery: requestExplicitlyRejected, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: decision, statusCode: captured.statusCode, retryAfter: headerGetCI(captured.header, "Retry-After"), upstreamID: captured.upstreamID, cleanupDone: true, outcome: routeAttemptOutcomeRejected}
+				retryAfter, _ := selectResponsesRetryAfter(captured.header)
+				failure := routeAttemptFailure{response: captured, attribution: attribution, delivery: requestExplicitlyRejected, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: decision, statusCode: captured.statusCode, retryAfter: retryAfter, upstreamID: captured.upstreamID, cleanupDone: true, outcome: routeAttemptOutcomeRejected}
 				failures = append(failures, failure)
 				trace := routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: captured.statusCode, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: decision, UpstreamID: captured.upstreamID, CleanupDone: true}
 				operation.appendTrace(trace)
 				completeCapturedRouteAttempt(attemptRecord, operation, trace, observation, endpoint, captured, true, routeAttemptOutcomeRejected)
-				if decision == routeRetrySwitchTarget {
+				if routeRetryDecisionContinues(decision) {
 					continue
 				}
 				break
@@ -3242,10 +3693,22 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				} else if attemptRecord != nil {
 					attemptRecord.complete(routeAttemptCompletion{StatusCode: resp.StatusCode, Outcome: routeAttemptOutcomeFailed, Delivery: failure.delivery, SemanticProgress: failure.progress, DownstreamCommitment: failure.commitment, RetryDecision: failure.decision, TTFTMs: observation.ttftMillis(), UpstreamRequestID: responseUpstreamID, CleanupComplete: cleanupDone, Wasted: true})
 				}
+				if codexLease != nil {
+					target.provider.codexPool.releaseLease(codexLease, owner.publicID)
+				}
 				break
 			}
 		}
-		operation.pinTarget(target.id)
+		acceptedOwner := executionOwner{routeID: route.public.routeID, targetID: target.id}
+		if codexLease != nil {
+			acceptedOwner.credentialID = codexLease.credentialID
+		}
+		operation.pinOwner(acceptedOwner)
+		if codexLease != nil {
+			if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+				target.provider.codexPool.releaseLease(codexLease, owner.publicID)
+			}
+		}
 		trace := routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: resp.StatusCode, Delivery: requestDeliveredOrAmbiguous, Progress: upstreamProgressNone, Commitment: downstreamCommitmentNone, Decision: routeRetryAccepted, UpstreamID: responseUpstreamID, CleanupDone: capturedObservation != nil}
 		operation.appendTrace(trace)
 		if capturedObservation != nil {
@@ -3359,6 +3822,12 @@ func routeAdapterMayExplicitlyReject(target targetBinding, endpoint string, stat
 	if target.provider == nil {
 		return false
 	}
+	if target.provider.kind == providerTypeOpenAICodex && target.provider.codexPool != nil && target.provider.codexPool.configured {
+		switch statusCode {
+		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests:
+			return true
+		}
+	}
 	if statusCode == http.StatusTooManyRequests {
 		return true
 	}
@@ -3378,6 +3847,9 @@ func routeAdapterMayExplicitlyReject(target targetBinding, endpoint string, stat
 func routeAdapterCertifiesHTTPRejection(target targetBinding, endpoint string, response *capturedRouteResponse) bool {
 	if response == nil || target.provider == nil {
 		return false
+	}
+	if target.provider.kind == providerTypeOpenAICodex && target.provider.codexPool != nil && target.provider.codexPool.configured {
+		return classifyOpenAICodexAccountHTTPFailure(response.statusCode, response.body) != openAICodexAccountFailureNone
 	}
 	if response.statusCode == http.StatusTooManyRequests {
 		return true
@@ -3428,6 +3900,21 @@ func routeAdapterCertifiesStreamFailure(target targetBinding, event responsesWeb
 	streamErr := responsesStreamEventError(event)
 	code := strings.ToLower(strings.TrimSpace(streamErr.Code))
 	errType := strings.ToLower(strings.TrimSpace(streamErr.Type))
+	if target.provider.kind == providerTypeOpenAICodex && target.provider.codexPool != nil && target.provider.codexPool.configured {
+		status, _, ok := classifyResponsesFailure(event, responsesFailureHeaders(event, nil))
+		if !ok || status == 0 {
+			switch code {
+			case "invalid_token", "unauthorized", "authentication_error":
+				status = http.StatusUnauthorized
+			case "model_not_found", "not_entitled", "unsupported_model":
+				status = http.StatusBadRequest
+			}
+		}
+		body, _ := json.Marshal(map[string]any{"error": streamErr})
+		if status != 0 && classifyOpenAICodexAccountHTTPFailure(status, body) != openAICodexAccountFailureNone {
+			return status, true
+		}
+	}
 	switch code {
 	case "too_many_requests", "rate_limit_exceeded":
 		return http.StatusTooManyRequests, true
@@ -3648,7 +4135,7 @@ func (h *ProxyHandler) withExplicitRouteOperation(ctx, inbound context.Context, 
 		return ctx, nil, nil, modelNotAllowedRequestError(model)
 	}
 	route, known := h.resolveModelRouteForRequest(model, endpoint)
-	if !known || route == nil || route.legacy {
+	if !known || route == nil || !route.usesManagedExecution() {
 		return ctx, nil, route, nil
 	}
 	if !route.supportsEndpoint(endpoint) {

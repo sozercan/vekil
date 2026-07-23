@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -20,6 +23,11 @@ const (
 	maxExplicitTargetsPerRoute      = 32
 	maxExplicitModelRouteTargets    = 1024
 	maxModelRouteOperationalIDBytes = 128
+	maxOpenAICodexAccounts          = 32
+
+	openAICodexAccountStrategyRoundRobin = "round_robin"
+	openAICodexAccountStrategyFillFirst  = "fill_first"
+	defaultOpenAICodexAffinityTTL        = "1h"
 )
 
 // ModelRouteConfig maps one public model contract to an ordered set of
@@ -443,6 +451,9 @@ func validateSchemaV2FeatureFields(cfg ProvidersConfig, schemaVersion int) error
 		return configPathError("policy_profiles", "requires schema_version: 2")
 	}
 	for providerIndex, provider := range cfg.Providers {
+		if provider.codexAccountsSet || provider.CodexAccounts != nil {
+			return configPathError(fmt.Sprintf("providers[%d].codex_accounts", providerIndex), "requires schema_version: 2")
+		}
 		if provider.trustDomainSet || strings.TrimSpace(provider.TrustDomain) != "" {
 			return configPathError(fmt.Sprintf("providers[%d].trust_domain", providerIndex), "requires schema_version: 2")
 		}
@@ -470,6 +481,12 @@ func cloneProvidersConfigForValidation(cfg ProvidersConfig) ProvidersConfig {
 			provider.IncludeModels = append([]string(nil), cfg.Providers[index].IncludeModels...)
 			provider.ExcludeModels = append([]string(nil), cfg.Providers[index].ExcludeModels...)
 			provider.ClassifierNoStoreSupported = cloneBoolPtr(cfg.Providers[index].ClassifierNoStoreSupported)
+			if cfg.Providers[index].CodexAccounts != nil {
+				codexAccounts := *cfg.Providers[index].CodexAccounts
+				codexAccounts.SessionAffinity = cloneBoolPtr(codexAccounts.SessionAffinity)
+				codexAccounts.Accounts = append([]OpenAICodexAccountConfig(nil), codexAccounts.Accounts...)
+				provider.CodexAccounts = &codexAccounts
+			}
 			if cfg.Providers[index].ExtraHeaders != nil {
 				provider.ExtraHeaders = make(map[string]string, len(cfg.Providers[index].ExtraHeaders))
 				for key, value := range cfg.Providers[index].ExtraHeaders {
@@ -539,7 +556,8 @@ func validateProviderConfigDescriptors(configured []ProviderConfig, allowRouteOn
 	defaultIndex := -1
 	copilotCount := 0
 
-	for index, provider := range configured {
+	for index := range configured {
+		provider := &configured[index]
 		path := fmt.Sprintf("providers[%d]", index)
 		id, err := normalizeOperationalID(provider.ID, path+".id")
 		if err != nil {
@@ -555,12 +573,15 @@ func validateProviderConfigDescriptors(configured []ProviderConfig, allowRouteOn
 		default:
 			return nil, nil, false, configPathError(path+".type", "unsupported provider type %q", provider.Type)
 		}
+		if err := normalizeAndValidateOpenAICodexAccountsConfig(provider, kind, path); err != nil {
+			return nil, nil, false, err
+		}
 
 		discovery, err := configuredProviderModelDiscovery(kind, provider.ModelDiscovery)
 		if err != nil {
 			return nil, nil, false, configPathError(path+".model_discovery", "%v", err)
 		}
-		if err := validateProviderShellWithoutSecrets(provider, kind, path); err != nil {
+		if err := validateProviderShellWithoutSecrets(*provider, kind, path); err != nil {
 			return nil, nil, false, err
 		}
 
@@ -573,7 +594,7 @@ func validateProviderConfigDescriptors(configured []ProviderConfig, allowRouteOn
 			trustDomain:                strings.TrimSpace(provider.TrustDomain),
 			classifierNoStoreSupported: cloneBoolPtr(provider.ClassifierNoStoreSupported),
 		}
-		descriptor.legacyCatalog = providerConfigHasLegacyCatalog(descriptor, provider)
+		descriptor.legacyCatalog = providerConfigHasLegacyCatalog(descriptor, *provider)
 		providers[id] = descriptor
 		ordered = append(ordered, descriptor)
 
@@ -607,6 +628,154 @@ func validateProviderConfigDescriptors(configured []ProviderConfig, allowRouteOn
 		}
 	}
 	return providers, ordered, defaultOptional, nil
+}
+
+func normalizeAndValidateOpenAICodexAccountsConfig(provider *ProviderConfig, kind providerType, path string) error {
+	if provider == nil {
+		return nil
+	}
+	configured := provider.codexAccountsSet || provider.CodexAccounts != nil
+	if !configured {
+		return nil
+	}
+	if kind != providerTypeOpenAICodex {
+		return configPathError(path+".codex_accounts", "is only supported for providers of type %q", providerTypeOpenAICodex)
+	}
+	if provider.CodexAccounts == nil {
+		return configPathError(path+".codex_accounts", "must be an object")
+	}
+
+	pool := provider.CodexAccounts
+	pool.Strategy = strings.TrimSpace(pool.Strategy)
+	switch pool.Strategy {
+	case openAICodexAccountStrategyRoundRobin, openAICodexAccountStrategyFillFirst:
+	default:
+		return configPathError(
+			path+".codex_accounts.strategy",
+			"unsupported strategy %q; supported strategies are %q and %q",
+			pool.Strategy,
+			openAICodexAccountStrategyRoundRobin,
+			openAICodexAccountStrategyFillFirst,
+		)
+	}
+
+	poolPath := path + ".codex_accounts"
+	if len(pool.Accounts) == 0 {
+		return configPathError(poolPath+".accounts", "must contain at least one account")
+	}
+	if len(pool.Accounts) > maxOpenAICodexAccounts {
+		return configPathError(poolPath+".accounts", "contains %d accounts; maximum is %d", len(pool.Accounts), maxOpenAICodexAccounts)
+	}
+	if pool.MaxAccountAttempts < 0 {
+		return configPathError(poolPath+".max_account_attempts", "must be zero or greater")
+	}
+	if pool.MaxAccountAttempts > len(pool.Accounts) {
+		return configPathError(
+			poolPath+".max_account_attempts",
+			"is %d but the pool has only %d accounts",
+			pool.MaxAccountAttempts,
+			len(pool.Accounts),
+		)
+	}
+
+	if pool.SessionAffinity == nil {
+		enabled := len(pool.Accounts) > 1
+		pool.SessionAffinity = &enabled
+	}
+	ttl := strings.TrimSpace(pool.SessionAffinityTTL)
+	if ttl == "" {
+		if pool.sessionAffinityTTLSet {
+			return configPathError(poolPath+".session_affinity_ttl", "must be a positive duration")
+		}
+		ttl = defaultOpenAICodexAffinityTTL
+	}
+	parsedTTL, err := time.ParseDuration(ttl)
+	if err != nil || parsedTTL <= 0 {
+		return configPathError(poolPath+".session_affinity_ttl", "must be a positive duration")
+	}
+	pool.SessionAffinityTTL = ttl
+
+	seenIDs := make(map[string]string, len(pool.Accounts))
+	seenPaths := make(map[string]string, len(pool.Accounts))
+	for accountIndex := range pool.Accounts {
+		account := &pool.Accounts[accountIndex]
+		accountPath := fmt.Sprintf("%s.accounts[%d]", poolPath, accountIndex)
+		accountID, err := normalizeOperationalID(account.ID, accountPath+".id")
+		if err != nil {
+			return err
+		}
+		if prior, exists := seenIDs[accountID]; exists {
+			return configPathError(accountPath+".id", "duplicates %s", prior)
+		}
+		account.ID = accountID
+		seenIDs[accountID] = accountPath + ".id"
+
+		account.AuthFile = strings.TrimSpace(account.AuthFile)
+		if account.AuthFile == "" {
+			return configPathError(accountPath+".auth_file", "is required")
+		}
+		canonicalPath, err := canonicalOpenAICodexAuthFilePath(account.AuthFile)
+		if err != nil {
+			return configPathError(accountPath+".auth_file", "%v", err)
+		}
+		if prior, exists := seenPaths[canonicalPath]; exists {
+			return configPathError(accountPath+".auth_file", "duplicates %s after path canonicalization", prior)
+		}
+		seenPaths[canonicalPath] = accountPath + ".auth_file"
+	}
+	return nil
+}
+
+func canonicalOpenAICodexAuthFilePath(configured string) (string, error) {
+	path := strings.TrimSpace(configured)
+	if path == "" {
+		return "", fmt.Errorf("is required")
+	}
+	if path == "~" || strings.HasPrefix(path, "~/") || runtime.GOOS == "windows" && strings.HasPrefix(path, `~\`) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home directory: %w", err)
+		}
+		switch {
+		case path == "~":
+			path = home
+		case strings.HasPrefix(path, "~/"):
+			path = filepath.Join(home, path[2:])
+		default:
+			path = filepath.Join(home, path[2:])
+		}
+	} else if strings.HasPrefix(path, "~") {
+		return "", fmt.Errorf("unsupported home-directory path %q; use ~/...", configured)
+	}
+
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve absolute path: %w", err)
+	}
+	canonical := resolveSymlinksWithMissingLeaf(filepath.Clean(abs))
+	if runtime.GOOS == "windows" {
+		canonical = strings.ToLower(canonical)
+	}
+	return canonical, nil
+}
+
+func resolveSymlinksWithMissingLeaf(path string) string {
+	current := filepath.Clean(path)
+	missing := make([]string, 0, 1)
+	for {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			for index := len(missing) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, missing[index])
+			}
+			return filepath.Clean(resolved)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return filepath.Clean(path)
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
 }
 
 func validateProviderRuntimeEnvironment(cfg ProviderConfig, providerIndex int) error {
@@ -1254,7 +1423,15 @@ var providerConfigFields = configFieldSet(
 	"id", "type", "default", "include_models", "exclude_models", "base_url", "auth_mode",
 	"api_key", "api_key_env", "api_version", "token_scope", "auth_type", "auth_header",
 	"auth_prefix", "extra_headers", "chat_completions_path", "responses_path", "messages_path",
-	"models_path", "model_discovery", "trust_domain", "classifier_no_store_supported", "headers", "models",
+	"models_path", "model_discovery", "codex_accounts", "trust_domain", "classifier_no_store_supported", "headers", "models",
+)
+
+var openAICodexAccountsConfigFields = configFieldSet(
+	"strategy", "max_account_attempts", "session_affinity", "session_affinity_ttl", "accounts",
+)
+
+var openAICodexAccountConfigFields = configFieldSet(
+	"id", "auth_file",
 )
 
 var providerModelConfigFields = configFieldSet(
@@ -1323,6 +1500,23 @@ func validateJSONConfigFieldPaths(body []byte) error {
 			path := fmt.Sprintf("providers[%d]", index)
 			if err := validateJSONKnownFields(provider, providerConfigFields, path); err != nil {
 				return err
+			}
+			if pool, ok := provider["codex_accounts"].(map[string]interface{}); ok {
+				poolPath := path + ".codex_accounts"
+				if err := validateJSONKnownFields(pool, openAICodexAccountsConfigFields, poolPath); err != nil {
+					return err
+				}
+				if accounts, ok := pool["accounts"].([]interface{}); ok {
+					for accountIndex, rawAccount := range accounts {
+						account, ok := rawAccount.(map[string]interface{})
+						if !ok {
+							continue
+						}
+						if err := validateJSONKnownFields(account, openAICodexAccountConfigFields, fmt.Sprintf("%s.accounts[%d]", poolPath, accountIndex)); err != nil {
+							return err
+						}
+					}
+				}
 			}
 			if models, ok := provider["models"].([]interface{}); ok {
 				for modelIndex, rawModel := range models {
@@ -1430,6 +1624,22 @@ func validateYAMLConfigFieldPaths(body []byte) error {
 			if err := validateYAMLKnownFields(provider, providerConfigFields, path); err != nil {
 				return err
 			}
+			if pool := yamlMappingValue(provider, "codex_accounts"); pool != nil && pool.Kind == yaml.MappingNode {
+				poolPath := path + ".codex_accounts"
+				if err := validateYAMLKnownFields(pool, openAICodexAccountsConfigFields, poolPath); err != nil {
+					return err
+				}
+				if accounts := yamlMappingValue(pool, "accounts"); accounts != nil && accounts.Kind == yaml.SequenceNode {
+					for accountIndex, account := range accounts.Content {
+						if account.Kind != yaml.MappingNode {
+							continue
+						}
+						if err := validateYAMLKnownFields(account, openAICodexAccountConfigFields, fmt.Sprintf("%s.accounts[%d]", poolPath, accountIndex)); err != nil {
+							return err
+						}
+					}
+				}
+			}
 			if models := yamlMappingValue(provider, "models"); models != nil && models.Kind == yaml.SequenceNode {
 				for modelIndex, model := range models.Content {
 					if model.Kind != yaml.MappingNode {
@@ -1530,8 +1740,15 @@ func markJSONProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 			if index >= len(cfg.Providers) {
 				break
 			}
+			_, cfg.Providers[index].codexAccountsSet = providers[index]["codex_accounts"]
 			_, cfg.Providers[index].trustDomainSet = providers[index]["trust_domain"]
 			_, cfg.Providers[index].classifierNoStoreSupportedSet = providers[index]["classifier_no_store_supported"]
+			if cfg.Providers[index].CodexAccounts != nil {
+				var codexAccounts map[string]json.RawMessage
+				if json.Unmarshal(providers[index]["codex_accounts"], &codexAccounts) == nil {
+					_, cfg.Providers[index].CodexAccounts.sessionAffinityTTLSet = codexAccounts["session_affinity_ttl"]
+				}
+			}
 		}
 	}
 
@@ -1590,8 +1807,15 @@ func markYAMLProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 			if index >= len(cfg.Providers) || provider == nil || provider.Kind != yaml.MappingNode {
 				continue
 			}
+			cfg.Providers[index].codexAccountsSet = yamlMappingHasField(provider, "codex_accounts")
 			cfg.Providers[index].trustDomainSet = yamlMappingHasField(provider, "trust_domain")
 			cfg.Providers[index].classifierNoStoreSupportedSet = yamlMappingHasField(provider, "classifier_no_store_supported")
+			if cfg.Providers[index].CodexAccounts != nil {
+				codexAccounts := yamlDereferenceAlias(yamlMappingValue(provider, "codex_accounts"))
+				if codexAccounts != nil && codexAccounts.Kind == yaml.MappingNode {
+					cfg.Providers[index].CodexAccounts.sessionAffinityTTLSet = yamlMappingHasField(codexAccounts, "session_affinity_ttl")
+				}
+			}
 		}
 	}
 	if routes := yamlMappingValue(root, "model_routes"); routes != nil && routes.Kind == yaml.SequenceNode {
