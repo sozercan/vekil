@@ -618,3 +618,51 @@ func TestPolicyCopilotPinnedTargetsMustSurviveDynamicDiscovery(t *testing.T) {
 		})
 	}
 }
+
+func TestPolicyCopilotDynamicValidationSkipsInactiveTierRoutes(t *testing.T) {
+	classifierNoStore := true
+	cfg := ProvidersConfig{
+		SchemaVersion: 2,
+		Providers: []ProviderConfig{
+			{ID: "copilot", Type: "copilot", Default: true, TrustDomain: "org", IncludeModels: []string{"classifier", "power"}},
+			{ID: "local", Type: "openai-compatible", BaseURL: "https://local.example.test/v1", AuthType: "none", ModelDiscovery: "static", TrustDomain: "org", ClassifierNoStoreSupported: &classifierNoStore},
+		},
+		ModelRoutes: []ModelRouteConfig{
+			{ID: "light", Exposure: "internal", Endpoints: []string{providerEndpointResponses}, Targets: []ModelRouteTargetConfig{{ID: "light", Provider: "local", UpstreamModel: "light"}}},
+			{ID: "power", Exposure: "internal", Endpoints: []string{providerEndpointResponses}, Targets: []ModelRouteTargetConfig{{ID: "power", Provider: "copilot", UpstreamModel: "power"}}},
+			{ID: "classifier", Exposure: "internal", InternalPurpose: modelRouteInternalPurposePolicyClassifier, Endpoints: []string{providerEndpointResponses}, Targets: []ModelRouteTargetConfig{{ID: "classifier", Provider: "copilot", UpstreamModel: "classifier"}}},
+		},
+		PolicyProfiles: []PolicyProfileConfig{{
+			ID: "policy", PublicID: "semantic", Mode: policyConfigModeEnforce, LightweightRoute: "light", PowerfulRoute: "power",
+			Classifier: PolicyClassifierConfig{Route: "classifier"},
+			DataPolicy: PolicyDataPolicyConfig{ContentForwardingAcknowledged: true, AllowProviderRetention: true},
+		}},
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != providerEndpointModels {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": []any{
+			map[string]any{"id": "classifier", "object": "model", "supported_endpoints": []string{providerEndpointResponses}},
+		}})
+	}))
+	defer upstream.Close()
+
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("fixture-token"),
+		nil,
+		WithCopilotBaseURL(upstream.URL),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("semantic"),
+		WithDeferredDynamicProviderModelValidation(true),
+		WithPolicyRoutingMode(PolicyRoutingModeObserve),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	defer h.BeginShutdown()
+	if err := h.ValidateDynamicProviderModels(t.Context()); err != nil {
+		t.Fatalf("ValidateDynamicProviderModels() rejected inactive powerful route: %v", err)
+	}
+}

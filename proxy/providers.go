@@ -891,14 +891,9 @@ func (h *ProxyHandler) explicitRouteWithinAllowedPolicyScope(setup *providerSetu
 		if !ok || entry == nil || entry.kind != publicEntryPolicy {
 			continue
 		}
-		for _, profile := range h.providersConfig.PolicyProfiles {
-			if strings.TrimSpace(profile.ID) != entry.policyID {
-				continue
-			}
-			for _, referenced := range []string{profile.LightweightRoute, profile.PowerfulRoute, profile.Classifier.Route} {
-				if strings.TrimSpace(referenced) == routeID {
-					return true
-				}
+		for _, route := range h.policyEntryRequiredRoutes(entry) {
+			if route != nil && route.public.routeID == routeID {
+				return true
 			}
 		}
 	}
