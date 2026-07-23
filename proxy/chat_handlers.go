@@ -751,6 +751,7 @@ func explicitResponsesChatReplayRoute(route *modelRoute, target targetBinding) r
 		PublicModel:   route.public.id,
 		UpstreamModel: upstreamModel,
 		RouteID:       route.public.routeID,
+		PolicyTier:    route.policyTier.String(),
 	}
 }
 

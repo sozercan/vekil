@@ -51,6 +51,7 @@ type modelRoute struct {
 	public          publicModelContract
 	targets         []targetBinding
 	policy          routePolicy
+	policyTier      policyTier
 	exposure        string
 	internalPurpose string
 	legacy          bool

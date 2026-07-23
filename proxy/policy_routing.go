@@ -470,6 +470,7 @@ func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile 
 					PublicModel:   profile.entry.id,
 					UpstreamModel: upstreamModel,
 					RouteID:       candidate.route.public.routeID,
+					PolicyTier:    candidate.tier.String(),
 				},
 				MinimumOutputTokens: responsesChatMinimumOutputTokens,
 				DropSamplingParams:  candidate.route.public.policy.dropSamplingParams,

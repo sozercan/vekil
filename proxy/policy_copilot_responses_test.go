@@ -477,3 +477,70 @@ func TestPolicyRoutingCopilotResponsesToolContinuationUsesSameProcessReplay(t *t
 		t.Fatalf("policy stats = %+v", stats)
 	}
 }
+
+func TestPolicyResponsesReplayPreservesPowerfulTierWhenRoutesShareTerminal(t *testing.T) {
+	cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+	cfg.PolicyProfiles[0].LightweightRoute = "sol-route"
+	cfg.ModelRoutes = cfg.ModelRoutes[1:]
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("fixture-token"),
+		nil,
+		WithProvidersConfig(cfg),
+		WithDeferredDynamicProviderModelValidation(true),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	t.Cleanup(h.BeginShutdown)
+
+	controller := h.policyRoutingController.(*chatPolicyRoutingController)
+	profile := controller.profiles["semantic-policy"]
+	if profile == nil || profile.lightweight != profile.powerful {
+		t.Fatal("test profile did not compile both tiers to the same route")
+	}
+
+	publish := newResponsesChatReplayTestRequest("shared-route", replayTestCallSpec{
+		upstreamID: "upstream-shared",
+		name:       "lookup_symbol",
+		visible:    `{"symbol":"main"}`,
+	})
+	publish.Route = responsesChatReplayRoute{
+		ProviderID:    "copilot",
+		PublicModel:   "gpt-5.6-semantic",
+		UpstreamModel: "gpt-5.6-sol",
+		RouteID:       "sol-route",
+		PolicyTier:    policyTierPowerful.String(),
+	}
+	published, err := h.responsesChatReplayStore().Publish(publish)
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	call := published.Projection.Calls[0]
+	body, err := json.Marshal(map[string]any{
+		"model": "gpt-5.6-semantic",
+		"messages": []any{
+			map[string]any{
+				"role":    "assistant",
+				"content": published.Projection.Content,
+				"tool_calls": []any{map[string]any{
+					"id": call.ID, "type": "function",
+					"function": map[string]any{"name": call.Name, "arguments": call.Arguments},
+				}},
+			},
+			map[string]any{"role": "tool", "tool_call_id": call.ID, "content": "main is a function"},
+		},
+		"max_completion_tokens": 256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	route, tier, err := controller.resolvePolicyResponsesReplayRoute(profile, body)
+	if err != nil {
+		t.Fatalf("resolvePolicyResponsesReplayRoute() error = %v", err)
+	}
+	if route == nil || route.public.routeID != "sol-route" || tier != policyTierPowerful {
+		t.Fatalf("resolved route/tier = (%v, %v), want sol-route/powerful", route, tier)
+	}
+}
