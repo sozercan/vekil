@@ -376,6 +376,10 @@ func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
 		w.Header().Set("Openai-Model", model)
 		w.Header().Set("RateLimit-Remaining", "7")
 		if strings.Contains(tools, policyClassifierToolName) {
+			if _, exists := request["store"]; exists {
+				http.Error(w, "classifier store field was not removed", http.StatusUnprocessableEntity)
+				return
+			}
 			arguments, _ := json.Marshal(policyClassifierSignals{
 				TurnType:  policyTurnTypePlanning,
 				CodeScope: policyCodeScopeMultiFile,
@@ -507,6 +511,38 @@ func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
 		if authorization != "Bearer copilot-test-token" {
 			t.Fatalf("Copilot Authorization[%d] = %q", index, authorization)
 		}
+	}
+}
+
+func TestPreparePolicyClassifierResponsesBodyHonorsNoStoreCapability(t *testing.T) {
+	trueValue := true
+	falseValue := false
+	for _, tc := range []struct {
+		name       string
+		capability *bool
+		wantStore  bool
+	}{
+		{name: "supported", capability: &trueValue, wantStore: true},
+		{name: "unsupported", capability: &falseValue},
+		{name: "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := preparePolicyClassifierResponsesBody(
+				[]byte(`{"model":"classifier","store":false,"input":"classify"}`),
+				targetBinding{provider: &providerRuntime{classifierNoStoreSupported: tc.capability}},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]json.RawMessage
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatal(err)
+			}
+			_, hasStore := payload["store"]
+			if hasStore != tc.wantStore {
+				t.Fatalf("store present = %v, want %v; body=%s", hasStore, tc.wantStore, body)
+			}
+		})
 	}
 }
 

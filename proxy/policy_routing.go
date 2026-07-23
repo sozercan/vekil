@@ -821,6 +821,10 @@ func (h *ProxyHandler) sendPolicyClassifierOverResponses(ctx context.Context, ro
 		return policyClassifierHTTPResponse{}, fmt.Errorf("policy classifier Responses request unexpectedly enabled streaming")
 	}
 	requestBody, _ := stripUnsupportedResponsesRequestFields(plan.Body, target.provider)
+	requestBody, err = preparePolicyClassifierResponsesBody(requestBody, target)
+	if err != nil {
+		return policyClassifierHTTPResponse{}, err
+	}
 	req, err := h.newProviderJSONRequest(ctx, target.provider, http.MethodPost, providerEndpointResponses, requestBody, headers, "", owner)
 	if err != nil {
 		return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(err, true)
@@ -884,6 +888,21 @@ func preparePolicyClassifierBody(body []byte, target targetBinding) ([]byte, err
 			delete(payload, "max_completion_tokens")
 		}
 	}
+	return json.Marshal(payload)
+}
+
+func preparePolicyClassifierResponsesBody(body []byte, target targetBinding) ([]byte, error) {
+	if target.provider != nil && target.provider.classifierNoStoreSupported != nil && *target.provider.classifierNoStoreSupported {
+		return body, nil
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	if _, exists := payload["store"]; !exists {
+		return body, nil
+	}
+	delete(payload, "store")
 	return json.Marshal(payload)
 }
 

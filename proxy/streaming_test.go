@@ -2245,3 +2245,21 @@ func TestConsumeOpenAIStreamChunks_ErrorsOnOverLimitSSELine(t *testing.T) {
 		t.Fatalf("error = %v, want SSE line limit", err)
 	}
 }
+
+func TestClassifyOpenAIChatChunkProgressTreatsModerationAsIrreversible(t *testing.T) {
+	var moderation map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(`{"id":"chat","object":"chat.completion.chunk","choices":[],"moderation":{"input":{"results":[]}}}`), &moderation); err != nil {
+		t.Fatal(err)
+	}
+	if got := classifyOpenAIChatChunkProgress(moderation); got != upstreamProgressUnknown {
+		t.Fatalf("moderation progress = %q, want %q", got, upstreamProgressUnknown)
+	}
+
+	var empty map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(`{"id":"chat","object":"chat.completion.chunk","choices":[],"moderation":{}}`), &empty); err != nil {
+		t.Fatal(err)
+	}
+	if got := classifyOpenAIChatChunkProgress(empty); got != upstreamProgressUnknown {
+		t.Fatalf("empty moderation progress = %q, want %q", got, upstreamProgressUnknown)
+	}
+}

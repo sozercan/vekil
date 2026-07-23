@@ -123,7 +123,7 @@ The same schema-version-2 contract also includes:
 - `model_routes[].exposure: public|internal`, with omitted exposure defaulting to `public`;
 - internal-purpose classifier routes;
 - provider `trust_domain` and classifier non-storage capability metadata; and
-- top-level `policy_profiles` that publish one Chat model ID and select a `lightweight` or `powerful` native-Chat terminal route.
+- top-level `policy_profiles` that publish one Chat model ID and select a `lightweight` or `powerful` canonical-Chat terminal route backed by native Chat or bounded Chat-over-Responses.
 
 These fields are additive: existing route-only version-2 configurations remain valid, while version-1 files reject explicit-route and policy-routing fields. Internal routes have no public ID, aliases, picker metadata, `/v1/models` entry, dashboard insight-model eligibility, or direct client resolution. Policy destinations may be public or internal; exposed public destinations are deliberate policy bypasses. The recommended policy configuration keeps both destinations and the classifier internal. See [`examples/policy-routing-coding-economy.yaml`](../examples/policy-routing-coding-economy.yaml), the single-process [`examples/policy-routing-copilot.yaml`](../examples/policy-routing-copilot.yaml), and [Semantic Policy Routing](policy-routing.md).
 
