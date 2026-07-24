@@ -1891,6 +1891,98 @@ func TestPolicyResponsesReplayContinuationPlansDeterministicBaseline(t *testing.
 	}
 }
 
+func TestPolicyResponsesReplayBoundPlanCarriesTierReasoningEffort(t *testing.T) {
+	tests := []struct {
+		name       string
+		routeIndex int
+		tier       policyTier
+		effort     string
+	}{
+		{name: "lightweight", routeIndex: 0, tier: policyTierLightweight, effort: "low"},
+		{name: "powerful", routeIndex: 1, tier: policyTierPowerful, effort: "max"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+			powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)
+			cfg.ModelRoutes[0].Endpoints = []string{providerEndpointResponses}
+			cfg.ModelRoutes[0].ReasoningEffort = []string{"low"}
+			cfg.ModelRoutes[1].Endpoints = []string{providerEndpointResponses}
+			cfg.ModelRoutes[1].ReasoningEffort = []string{"max"}
+			cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = "low"
+			cfg.PolicyProfiles[0].Powerful.ReasoningEffort = "max"
+
+			h, err := NewProxyHandler(nil, nil,
+				WithProvidersConfig(cfg),
+				WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+
+			routeConfig := cfg.ModelRoutes[tc.routeIndex]
+			targetConfig := routeConfig.Targets[0]
+			published, err := h.responsesChatReplayStore().Publish(responsesChatReplayPublishRequest{
+				Route: responsesChatReplayRoute{
+					ProviderID:    targetConfig.Provider,
+					PublicModel:   "coding-economy",
+					UpstreamModel: targetConfig.UpstreamModel,
+					RouteID:       routeConfig.ID,
+					PolicyTier:    tc.tier.String(),
+				},
+				AssistantContent: json.RawMessage(`null`),
+				OutputItems: []json.RawMessage{
+					json.RawMessage(`{"type":"function_call","id":"item-replay","call_id":"upstream-replay","name":"lookup","arguments":"{}","status":"completed"}`),
+				},
+				Calls: []responsesChatReplayPublishCall{{
+					UpstreamCallID:   "upstream-replay",
+					Name:             "lookup",
+					VisibleArguments: `{}`,
+					OutputItemIndex:  0,
+				}},
+			})
+			if err != nil {
+				t.Fatalf("Publish() error = %v", err)
+			}
+			call := published.Projection.Calls[0]
+			body, err := json.Marshal(map[string]any{
+				"model": "coding-economy",
+				"messages": []any{
+					map[string]any{
+						"role":    "assistant",
+						"content": published.Projection.Content,
+						"tool_calls": []any{map[string]any{
+							"id": call.ID, "type": "function",
+							"function": map[string]any{"name": call.Name, "arguments": call.Arguments},
+						}},
+					},
+					map[string]any{"role": "tool", "tool_call_id": call.ID, "content": "done"},
+				},
+				"reasoning_effort": "medium",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			plan, err := h.planOpenAIChatPolicy(t.Context(), "coding-economy", body)
+			if err != nil {
+				t.Fatalf("planOpenAIChatPolicy() error = %v", err)
+			}
+			if plan.decision.Category != "replay_binding" || plan.selectedTier != tc.tier {
+				t.Fatalf("plan decision/tier = %q/%s, want replay_binding/%s", plan.decision.Category, plan.selectedTier, tc.tier)
+			}
+			if plan.selectedReasoningEffort != tc.effort {
+				t.Fatalf("selected reasoning effort = %q, want %q", plan.selectedReasoningEffort, tc.effort)
+			}
+		})
+	}
+}
+
 func TestPolicyResponsesReplayContinuationRejectsNondeterministicBaseline(t *testing.T) {
 	modes := []struct {
 		name        string

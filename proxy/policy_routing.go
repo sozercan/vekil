@@ -783,20 +783,21 @@ func (c *chatPolicyRoutingController) sealRoutePlan(profile *compiledPolicyProfi
 	decision.InputBytes = len(input.OriginalBody)
 	decision.Truncated = decision.Truncated || facts.truncated()
 	return newChatOperationPlan(chatOperationPlanOptions{
-		OperationID:          input.OperationID,
-		EntryID:              profile.entry.id,
-		PublicID:             profile.entry.id,
-		RouteID:              route.public.routeID,
-		Route:                route,
-		Contract:             contract,
-		PolicyID:             profile.config.ID,
-		SelectedTier:         tier,
-		EffectiveMode:        profile.effectiveMode(),
-		ConfigGeneration:     profile.configGeneration,
-		ProfileGeneration:    profile.profileGeneration,
-		ClassifierGeneration: profile.classifierGeneration,
-		BinaryGeneration:     profile.binaryGeneration,
-		Decision:             decision,
+		OperationID:             input.OperationID,
+		EntryID:                 profile.entry.id,
+		PublicID:                profile.entry.id,
+		RouteID:                 route.public.routeID,
+		Route:                   route,
+		Contract:                contract,
+		SelectedReasoningEffort: profile.reasoningEffortForTier(tier),
+		PolicyID:                profile.config.ID,
+		SelectedTier:            tier,
+		EffectiveMode:           profile.effectiveMode(),
+		ConfigGeneration:        profile.configGeneration,
+		ProfileGeneration:       profile.profileGeneration,
+		ClassifierGeneration:    profile.classifierGeneration,
+		BinaryGeneration:        profile.binaryGeneration,
+		Decision:                decision,
 	})
 }
 
