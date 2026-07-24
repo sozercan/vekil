@@ -21,6 +21,8 @@ type copilotResponsesPolicyUpstream struct {
 	terminalModels     []string
 	paths              []string
 	classifierSignals  policyClassifierSignals
+	toolFailureModel   string
+	toolFailuresLeft   int
 }
 
 func newCopilotResponsesPolicyUpstream(t *testing.T, signals policyClassifierSignals) *copilotResponsesPolicyUpstream {
@@ -96,7 +98,17 @@ func newCopilotResponsesPolicyUpstream(t *testing.T, signals policyClassifierSig
 
 			upstream.mu.Lock()
 			upstream.terminalModels = append(upstream.terminalModels, request.Model)
+			failToolRequest := lookupTool && request.Model == upstream.toolFailureModel && upstream.toolFailuresLeft > 0
+			if failToolRequest {
+				upstream.toolFailuresLeft--
+			}
 			upstream.mu.Unlock()
+			if failToolRequest {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"error":{"message":"forced tool target failure","type":"rate_limit_error","code":"rate_limit_exceeded"}}`))
+				return
+			}
 			w.Header().Set("Openai-Model", request.Model)
 			w.Header().Set("X-Github-Request-ID", "github-upstream-request")
 			w.Header().Set("X-Request-ID", "upstream-request")
@@ -177,6 +189,13 @@ func (u *copilotResponsesPolicyUpstream) snapshot() (int, int, []string, []strin
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.modelRequests, u.classifierRequests, append([]string(nil), u.terminalModels...), append([]string(nil), u.paths...)
+}
+
+func (u *copilotResponsesPolicyUpstream) failNextToolRequest(model string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.toolFailureModel = model
+	u.toolFailuresLeft = 1
 }
 
 func directCopilotResponsesPolicyConfig(profileMode string) ProvidersConfig {
@@ -615,7 +634,7 @@ func TestProviderModelReplacementKeepsInternalCopilotTargetsHidden(t *testing.T)
 	}
 }
 
-func TestPolicyRoutingCopilotResponsesToolContinuationUsesSameProcessReplay(t *testing.T) {
+func TestPolicyRoutingCopilotResponsesToolContinuationPinsSecondaryTarget(t *testing.T) {
 	upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{
 		TurnType:                policyTurnTypePlanning,
 		CodeScope:               policyCodeScopeMultiFile,
@@ -623,6 +642,16 @@ func TestPolicyRoutingCopilotResponsesToolContinuationUsesSameProcessReplay(t *t
 		RequiresCodebaseContext: true,
 	})
 	cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+	cfg.ModelRoutes[1].Targets = []ModelRouteTargetConfig{
+		{ID: "luna-primary", Provider: "copilot", UpstreamModel: "gpt-5.6-luna"},
+		{ID: "sol-secondary", Provider: "copilot", UpstreamModel: "gpt-5.6-sol"},
+	}
+	cfg.ModelRoutes[1].Routing = ModelRouteRoutingConfig{
+		Mode:              string(routeModePriorityFailover),
+		MaxTargetAttempts: 2,
+		MaxUpstreamSends:  2,
+	}
+	upstream.failNextToolRequest("gpt-5.6-luna")
 	h, err := NewProxyHandler(
 		auth.NewTestAuthenticator("fixture-token"),
 		nil,
@@ -712,7 +741,7 @@ func TestPolicyRoutingCopilotResponsesToolContinuationUsesSameProcessReplay(t *t
 	}
 
 	modelRequests, classifierRequests, terminalModels, paths := upstream.snapshot()
-	if modelRequests != 1 || classifierRequests != 2 || strings.Join(terminalModels, ",") != "gpt-5.6-sol,gpt-5.6-sol" {
+	if modelRequests != 1 || classifierRequests != 2 || strings.Join(terminalModels, ",") != "gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-sol" {
 		t.Fatalf("upstream requests: models=%d classifiers=%d terminals=%v paths=%v", modelRequests, classifierRequests, terminalModels, paths)
 	}
 	stats := h.policyRoutingController.(*chatPolicyRoutingController).PolicyStatsSnapshot()
