@@ -113,6 +113,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path != "/v1/responses":
+            with lock:
+                state["errors"].append("path_invalid")
+                state["requests"].append({"kind": "invalid", "path": self.path})
+                save()
+            self.send_json(404, {"error": "not found"})
+            return
         length = int(self.headers.get("content-length", "0"))
         try:
             body = json.loads(self.rfile.read(length))
@@ -133,7 +140,7 @@ class Handler(BaseHTTPRequestHandler):
             errors.append("terminal_effort_invalid")
         with lock:
             state["errors"].extend(errors)
-            state["requests"].append({"kind": "classifier" if is_classifier else "terminal", "effort": effort, "model": body.get("model")})
+            state["requests"].append({"kind": "classifier" if is_classifier else "terminal", "path": self.path, "effort": effort, "model": body.get("model")})
             save()
         if errors:
             self.send_json(422, {"error": errors})
@@ -230,6 +237,7 @@ main() {
     (.errors | length) == 0
     and ([.requests[] | select(.kind == "classifier" and .effort != null)] | length) == 0
     and ([.requests[] | select(.kind == "terminal") | .effort] | sort) == ["low", "max"]
+    and ([.requests[] | select(.path != "/v1/responses")] | length) == 0
     and ([.requests[] | select(.model != "gpt-5.6-sol")] | length) == 0
   ' "${BRIDGE_STATE}" >/dev/null || fail "fake bridge observed invalid classifier or terminal requests"
 
