@@ -515,7 +515,7 @@ func TestPublicCopilotExplicitRouteValidatesPinnedModelWithoutLegacyExposure(t *
 	cfg := ProvidersConfig{
 		SchemaVersion: 2,
 		Providers: []ProviderConfig{{
-			ID: "copilot", Type: "copilot", Default: true, TrustDomain: "github-copilot",
+			ID: "copilot", Type: "copilot", Default: true, TrustDomain: "github-copilot", IncludeModels: []string{"gpt-5.6-sol"},
 		}},
 		ModelRoutes: []ModelRouteConfig{{
 			ID: "public-sol-route", PublicID: "semantic-model", Endpoints: []string{providerEndpointResponses},
@@ -528,6 +528,7 @@ func TestPublicCopilotExplicitRouteValidatesPinnedModelWithoutLegacyExposure(t *
 		WithCopilotBaseURL(upstream.URL),
 		WithProvidersConfig(cfg),
 		WithAllowedModels("semantic-model"),
+		WithDeferredDynamicProviderModelValidation(true),
 	)
 	if err != nil {
 		t.Fatalf("NewProxyHandler() error = %v", err)
@@ -535,6 +536,12 @@ func TestPublicCopilotExplicitRouteValidatesPinnedModelWithoutLegacyExposure(t *
 	t.Cleanup(h.BeginShutdown)
 	if !h.ModelUsesCopilot("semantic-model") {
 		t.Fatal("public Copilot route did not require Copilot authentication")
+	}
+	if !h.UsesCopilot() || !h.DynamicProviderValidationPending() {
+		t.Fatalf("runtime Copilot scope = %v, dynamic validation pending = %v, want both true", h.UsesCopilot(), h.DynamicProviderValidationPending())
+	}
+	if err := h.ValidateDynamicProviderModels(t.Context()); err != nil {
+		t.Fatalf("ValidateDynamicProviderModels() error = %v", err)
 	}
 	if _, ok := h.providerSetup().lookupPublicModelEntry("semantic-model"); !ok {
 		t.Fatal("public Copilot route was not registered")

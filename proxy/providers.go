@@ -950,13 +950,23 @@ func (h *ProxyHandler) explicitRouteWithinDynamicValidationScope(setup *provider
 	return false
 }
 
-func (h *ProxyHandler) policyProviderRequiredWithoutAllowedScope(setup *providerSetup, provider *providerRuntime) bool {
+func (h *ProxyHandler) providerRequiredWithoutAllowedScope(setup *providerSetup, provider *providerRuntime) bool {
 	if h == nil || setup == nil || provider == nil {
 		return false
 	}
 	snapshot := setup.routeRegistry().load()
 	if snapshot == nil {
 		return false
+	}
+	for _, route := range snapshot.explicit {
+		if route == nil || !route.isPublic() {
+			continue
+		}
+		for _, target := range route.targets {
+			if target.provider != nil && target.provider.id == provider.id {
+				return true
+			}
+		}
 	}
 	for _, entry := range snapshot.policyEntries {
 		if h.policyEntryReferencesProvider(entry, provider) {
@@ -980,7 +990,7 @@ func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) 
 		if !providerUsesDynamicModels(provider) || providerHasPublicDynamicModels(provider) {
 			return true
 		}
-		return h.policyProviderRequiredWithoutAllowedScope(setup, provider)
+		return h.providerRequiredWithoutAllowedScope(setup, provider)
 	}
 	for model := range h.allowedModels {
 		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
@@ -989,6 +999,16 @@ func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) 
 			}
 			// A policy public ID is an explicit reserved owner in launcher scope.
 			// Unrelated dynamic providers cannot displace it or force credentials.
+			continue
+		}
+		if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
+			for _, target := range route.targets {
+				if target.provider != nil && target.provider.id == provider.id {
+					return true
+				}
+			}
+			// An explicit public route is a reserved owner. Unrelated dynamic
+			// providers cannot displace it or force credentials.
 			continue
 		}
 		if providerCanExposeModel(provider, model) {
@@ -1007,7 +1027,7 @@ func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime
 		if !providerUsesDynamicModels(provider) || providerHasPublicDynamicModels(provider) {
 			return true
 		}
-		return h.policyProviderRequiredWithoutAllowedScope(setup, provider)
+		return h.providerRequiredWithoutAllowedScope(setup, provider)
 	}
 	for model := range h.allowedModels {
 		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
