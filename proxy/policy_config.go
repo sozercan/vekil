@@ -311,23 +311,6 @@ func validatePolicyProfileConfigReferences(
 	return nil
 }
 
-func policyTerminalRouteReferences(profiles []PolicyProfileConfig) map[string]struct{} {
-	references := make(map[string]struct{}, len(profiles)*3)
-	for _, profile := range profiles {
-		for _, routeID := range []string{
-			profile.LightweightRoute,
-			profile.PowerfulRoute,
-			profile.Classifier.Route,
-		} {
-			routeID = strings.TrimSpace(routeID)
-			if routeID != "" {
-				references[routeID] = struct{}{}
-			}
-		}
-	}
-	return references
-}
-
 func resolvePolicyTerminalRoute(routeID, path string, routes map[string]*ModelRouteConfig, policyReferences map[string]string) (*ModelRouteConfig, error) {
 	if route := routes[routeID]; route != nil {
 		return route, nil
