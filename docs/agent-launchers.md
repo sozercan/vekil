@@ -174,9 +174,10 @@ Claude's `output_config.effort` is carried into canonical Chat
 `reasoning_effort`. Direct routes preserve supported client effort. A policy
 profile never advertises client-selectable reasoning effort: an incoming value
 is accepted only when both tier objects configure `reasoning_effort`, and the
-classifier-selected `lightweight` or `powerful` value then replaces it. If both
-tier objects omit effort, incoming effort is rejected as unsupported and omitted
-effort proceeds without a policy-owned override. Current Claude releases
+effective `lightweight` or `powerful` value then replaces it. If both
+tier objects omit effort, a valid present effort is rejected as unsupported and
+an unset effort proceeds without a policy-owned override. Malformed or blank
+effort fails locally before policy execution. Current Claude releases
 may emit effort even when the user did not pass `--effort`, so managed Claude
 policy launches that need to accept that wire field should configure both tier
 values.
@@ -245,9 +246,10 @@ narrower terminal must reduce the enabled client catalog.
 
 Policy-owned models never advertise client-selectable reasoning effort. If
 Codex sends `reasoning.effort`, Vekil accepts it only when both profile tiers
-configure `reasoning_effort`; the classifier-selected tier value then replaces
-it. If both tiers omit effort, an incoming value is rejected as unsupported and
-an omitted value remains omitted.
+configure `reasoning_effort`; the effective selected tier value then replaces
+it. If both tiers omit effort, a valid present value is rejected as unsupported
+and an unset value remains unset. Malformed or blank effort fails locally before
+policy execution.
 
 With `--model`, a private temporary one-model Codex catalog is generated from
 the installed CLI's bundled catalog, with Vekil model context, reasoning,

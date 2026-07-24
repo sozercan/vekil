@@ -1263,7 +1263,7 @@ func TestLaunchUsesCopilotForDirectPolicyModel(t *testing.T) {
 			{ID: "classifier", Exposure: "internal", InternalPurpose: "policy_classifier", Endpoints: []string{"/responses"}, Targets: []proxy.ModelRouteTargetConfig{{ID: "classifier", Provider: "copilot", UpstreamModel: "gpt-5.6-sol"}}},
 		},
 		PolicyProfiles: []proxy.PolicyProfileConfig{{
-			ID: "policy", PublicID: "semantic", Mode: "enforce", LightweightRoute: "light", PowerfulRoute: "power",
+			ID: "policy", PublicID: "semantic", Mode: "enforce", Lightweight: proxy.PolicyTierConfig{Route: "light"}, Powerful: proxy.PolicyTierConfig{Route: "power"},
 			Classifier: proxy.PolicyClassifierConfig{Route: "classifier"},
 			DataPolicy: proxy.PolicyDataPolicyConfig{ContentForwardingAcknowledged: true, AllowProviderRetention: true},
 		}},

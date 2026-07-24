@@ -110,8 +110,8 @@ policy_profiles:
 
     # Optional as a whole. When present, both policy-owned values are required
     # and must appear in the corresponding terminal route's allowlist. Incoming
-    # client effort is accepted for this mapped profile, then replaced after the
-    # classifier selects a tier.
+    # client effort is accepted for this mapped profile, then replaced with the
+    # effective tier value (baseline in off/observe; selected/fallback in enforce).
 
     baseline_tier: lightweight
     classifier_unavailable_tier: lightweight

@@ -99,7 +99,7 @@ policy_profiles:
     # Optional as a whole. When present, both values are required and must
     # appear in the corresponding terminal route's reasoning_effort allowlist.
     # Incoming Claude/Codex effort is accepted for this mapped profile, then the
-    # classifier-selected tier value replaces it before terminal execution.
+    # effective selected-tier value replaces it before terminal execution.
     classifier:
       route: semantic-classifier-gpt-5-6-sol-route
       timeout_ms: 10000

@@ -32,11 +32,21 @@ curl http://localhost:1337/v1/models
 
 Each public model ID has one logical owner. Dynamic providers can be narrowed with `include_models` or `exclude_models`; static providers such as Azure OpenAI can expose a deployment under a different public ID while the proxy rewrites the upstream `model` field. A public explicit route appears exactly once in both catalog views, in route configuration order, with `owned_by` set to the route ID. Its physical target IDs and upstream deployment names are not emitted as models.
 
-A schema-v2 policy profile also appears exactly once, with `id` equal to its `public_id`, `owned_by: "vekil-policy"`, and `supported_endpoints: ["/chat/completions"]`. Its published tool/context contract is the conservative intersection of the two terminal routes, `vision` is always false in v1, and client-selectable `reasoning_effort` metadata is always omitted. Optional private `reasoning_effort` values inside the required `lightweight` and `powerful` tier objects select the effective effort after classification and are not published. Internal destination and classifier routes do not appear in either catalog view and their operational IDs are not client aliases.
+A schema-v2 policy profile also appears exactly once, with `id` equal to its `public_id`, `owned_by: "vekil-policy"`, and `supported_endpoints: ["/chat/completions"]`. Its published tool/context contract is the conservative intersection of the two terminal routes, `vision` is always false in v1, and client-selectable `reasoning_effort` metadata is always omitted. Optional private `reasoning_effort` values inside the required `lightweight` and `powerful` tier objects select the effort after effective tier selection and are not published. Internal destination and classifier routes do not appear in either catalog view and their operational IDs are not client aliases.
 
 For an explicit route, catalog identity is configuration-owned: temporary target failure does not remove or rewrite the route entry. Endpoint metadata remains **native upstream capability metadata**. A Responses-native model continues to report only `/responses` in `supported_endpoints` even when Vekil serves `/v1/chat/completions`, Anthropic Messages, and Gemini compatibility through Chat-over-Responses.
 
 The exact catalog still depends on configured routes/providers and dynamic discovery. Query `/v1/models` in your deployment instead of hard-coding one global model list.
+
+## Policy reasoning effort contract
+
+Policy profiles never advertise client-selectable reasoning effort. When both tier objects configure `reasoning_effort`, policy planning selects the effective tier and replaces any valid client value with that tier's configured value before terminal execution. When both tiers omit effort, a valid present client value is rejected before classifier or terminal dispatch. Client effort cannot force a tier; direct non-policy routes retain supported client-controlled effort.
+
+Unset and malformed representations are surface-specific:
+
+- OpenAI Chat treats omitted or top-level `reasoning_effort: null` as unset; a present value must be a non-empty string.
+- Policy Responses treats omitted `reasoning`, `reasoning: null`, and `reasoning: {}` as unset; a present `reasoning.effort` must be a bounded non-empty string.
+- Anthropic Messages and count-tokens treat omitted/null `output_config`, or an object without `effort`, as unset. A present `output_config.effort` must be a non-empty string; null, empty, and whitespace-only values fail locally.
 
 ## Gemini Compatibility Endpoints
 
@@ -88,7 +98,6 @@ The following matrix applies only when the selected model is executed through na
 Additional rules:
 
 - `model` is required and `messages` must be a non-empty array.
-- For a policy public ID, incoming Chat `reasoning_effort`, Anthropic `output_config.effort`, or Responses `reasoning.effort` is accepted only when both tier objects configure `reasoning_effort`; the selected tier value then replaces it before terminal execution. If both tier objects omit effort, incoming effort is rejected as unsupported and omitted effort remains omitted. Client effort cannot force a tier or override configured tier effort. Direct non-policy routes continue to preserve supported client effort.
 - `max_tokens` and `max_completion_tokens` both map to `max_output_tokens`; if both are present they must be equal.
 - Because the native Responses endpoint requires at least 16 output tokens, a client-supplied limit from 0 through 15 is rejected locally on Responses-backed routes rather than silently clamped beyond the Chat upper bound. Native Chat routes retain non-streaming `max_tokens: 0` prewarm requests when thinking is disabled; Vekil returns empty content with `stop_reason: "max_tokens"`, and rejects zero-token requests that enable streaming or thinking.
 - `response_format` accepts `text`, `json_object`, and `json_schema`.

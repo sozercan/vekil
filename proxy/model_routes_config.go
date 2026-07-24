@@ -1489,7 +1489,7 @@ func validateYAMLConfigFieldPaths(body []byte) error {
 				return err
 			}
 			for _, tierName := range []string{"lightweight", "powerful"} {
-				if tier := yamlMappingValue(profile, tierName); tier != nil && tier.Kind == yaml.MappingNode {
+				if tier := yamlDereferenceAlias(yamlMappingValue(profile, tierName)); tier != nil && tier.Kind == yaml.MappingNode {
 					if err := validateYAMLKnownFields(tier, policyTierConfigFields, path+"."+tierName); err != nil {
 						return err
 					}

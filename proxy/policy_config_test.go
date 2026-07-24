@@ -257,6 +257,47 @@ func TestPolicyTierReasoningEffortValidatesTerminalAllowlists(t *testing.T) {
 	}
 }
 
+func TestProgrammaticPolicyTierReasoningEffortRejectsWhitespaceOnly(t *testing.T) {
+	cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeOff)
+	cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = " \t\n "
+
+	_, err := validateAndNormalizeProvidersConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "policy_profiles[0].lightweight.reasoning_effort") {
+		t.Fatalf("validateAndNormalizeProvidersConfig() error = %v, want lightweight reasoning_effort path", err)
+	}
+}
+
+func TestPolicyTierReasoningEffortMismatchReportsMissingTier(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		lightweight string
+		powerful    string
+		wantPath    string
+	}{
+		{
+			name:     "missing lightweight",
+			powerful: "max",
+			wantPath: "policy_profiles[0].lightweight.reasoning_effort",
+		},
+		{
+			name:        "missing powerful",
+			lightweight: "low",
+			wantPath:    "policy_profiles[0].powerful.reasoning_effort",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeOff)
+			cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = tc.lightweight
+			cfg.PolicyProfiles[0].Powerful.ReasoningEffort = tc.powerful
+
+			_, err := validateAndNormalizeProvidersConfig(cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.wantPath) {
+				t.Fatalf("validateAndNormalizeProvidersConfig() error = %v, want path %q", err, tc.wantPath)
+			}
+		})
+	}
+}
+
 func TestSchemaV1RejectsSchemaV2PolicyFeatureFields(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -649,7 +690,7 @@ func TestPolicyReferencedInternalCopilotRoutesValidate(t *testing.T) {
 		},
 		PolicyProfiles: []PolicyProfileConfig{{
 			ID: "policy", PublicID: "policy-model",
-			LightweightRoute: "light-route", PowerfulRoute: "power-route",
+			Lightweight: PolicyTierConfig{Route: "light-route"}, Powerful: PolicyTierConfig{Route: "power-route"},
 			Classifier: PolicyClassifierConfig{Route: "classifier-route"},
 			DataPolicy: PolicyDataPolicyConfig{ContentForwardingAcknowledged: true},
 		}},

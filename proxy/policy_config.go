@@ -156,8 +156,14 @@ func normalizeAndValidatePolicyProfileConfig(profile *PolicyProfileConfig, path 
 	if err := normalizeAndValidatePolicyTierConfig(&profile.Powerful, path+".powerful", profile.powerfulSet, profile.powerfulNull); err != nil {
 		return err
 	}
-	if policyTierConfigHasReasoningEffort(profile.Lightweight) != policyTierConfigHasReasoningEffort(profile.Powerful) {
-		return configPathError(path+".powerful.reasoning_effort", "must be configured for both lightweight and powerful tiers or omitted from both")
+	lightweightControlsReasoning := policyTierConfigHasReasoningEffort(profile.Lightweight)
+	powerfulControlsReasoning := policyTierConfigHasReasoningEffort(profile.Powerful)
+	if lightweightControlsReasoning != powerfulControlsReasoning {
+		missingTier := policyConfigTierPowerful
+		if !lightweightControlsReasoning {
+			missingTier = policyConfigTierLightweight
+		}
+		return configPathError(path+"."+missingTier+".reasoning_effort", "must be configured for both lightweight and powerful tiers or omitted from both")
 	}
 
 	profile.BaselineTier = strings.TrimSpace(profile.BaselineTier)
@@ -274,8 +280,9 @@ func normalizeAndValidatePolicyTierConfig(tier *PolicyTierConfig, path string, s
 	if tier.reasoningEffortNull {
 		return configPathError(path+".reasoning_effort", "must not be null")
 	}
+	rawReasoningEffort := tier.ReasoningEffort
 	tier.ReasoningEffort = strings.TrimSpace(tier.ReasoningEffort)
-	if tier.reasoningEffortSet && tier.ReasoningEffort == "" {
+	if tier.ReasoningEffort == "" && (tier.reasoningEffortSet || rawReasoningEffort != "") {
 		return configPathError(path+".reasoning_effort", "must not be empty")
 	}
 	return nil

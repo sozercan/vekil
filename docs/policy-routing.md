@@ -32,7 +32,7 @@ A policy public ID is supported for:
 
 The policy can run in `off`, asynchronous `observe`, or synchronous `enforce` mode. One root request resolves one policy profile and selects one terminal route. Physical failover, if configured, stays inside that selected route.
 
-The following are explicitly unsupported for policy public IDs in v1 and fail locally rather than silently bypassing classification:
+The following matrix defines the supported and unsupported v1 behavior for policy public IDs. Unsupported shapes fail locally rather than silently bypassing policy planning:
 
 | Surface or request shape | v1 policy behavior |
 |---|---|
@@ -105,6 +105,8 @@ Schema v2 separates two registries:
 
 A policy profile references terminal routes by operational `id`. It cannot reference another policy profile.
 
+> **Breaking schema change:** replace legacy `lightweight_route` and `powerful_route` fields with the required `lightweight` and `powerful` objects shown below. Strict decoding rejects the legacy split fields; Vekil does not migrate them automatically.
+
 ### Route exposure
 
 For schema v2, `model_routes[].exposure` is `public` or `internal`; omission defaults to `public`.
@@ -148,6 +150,10 @@ powerful:
 
 `reasoning_effort` is optional only as a pair: both tier objects configure it, or both omit it. Each value must appear in its tier route's `model_routes[].reasoning_effort` allowlist.
 
+When the pair is configured, it is authoritative policy execution state rather than a client preference. A client may still send Chat `reasoning_effort`, Anthropic `output_config.effort`, or Responses `reasoning.effort` for harness compatibility, but policy planning selects the effective tier and its configured value replaces the incoming value before Vekil chooses native Chat versus Responses-backed execution. `off` and `observe` use the baseline tier; `enforce` uses the classifier-selected tier or the configured unavailable/uncertain fallback. The classifier request never inherits either tier's effort, and every physical attempt inside the selected terminal route uses the same sealed value. Direct non-policy routes remain client-controlled.
+
+When both tier values are omitted, the policy profile does not control or advertise reasoning effort. Requests must omit an explicit non-null effort; Vekil rejects one locally instead of forwarding it or letting it influence tier selection.
+
 The v1 defaults are economy-oriented:
 
 - baseline: `lightweight`;
@@ -190,7 +196,7 @@ Validation also rejects:
 - public/operational ID collisions in their applicable namespaces;
 - public metadata on an internal route;
 - recursive policy references;
-- a null or non-object `lightweight`/`powerful` tier object, missing or unknown tier fields, or `reasoning_effort` configured on only one tier;
+- a null or non-object `lightweight`/`powerful` tier object, missing or unknown tier fields, a null/empty/whitespace-only tier `reasoning_effort`, or effort configured on only one tier;
 - a tier reasoning value absent from its referenced terminal route's `reasoning_effort` allowlist;
 - destination routes without `/chat/completions` or `/responses` Chat execution support;
 - unsupported provider families or dynamic providers other than pinned `type: copilot` targets;
@@ -199,6 +205,8 @@ Validation also rejects:
 - classifiers that cannot perform the forced function-tool protocol;
 - missing trust-domain or data-policy acknowledgements; and
 - unsupported custom classifier prompts, custom classifier output schemas, arbitrary routing languages, or config hot reload.
+
+Strict field validation also dereferences YAML aliases, so an anchored tier mapping cannot hide unknown fields and errors retain the full `policy_profiles[index].<tier>.<field>` path.
 
 ## Profile mode and global ceiling
 
@@ -383,7 +391,7 @@ Both destinations must accept the same published Chat semantics. Per-target wire
 
 `model_routes[].reasoning_effort` remains each terminal route's capability allowlist. Optional `reasoning_effort` values inside the required `lightweight` and `powerful` tier objects select one allowed value for each tier. When both values are configured, the planner seals the selected route and effort together; request preparation then writes that value into canonical Chat before native-Chat or Chat-over-Responses execution. Every target attempt inside the selected route is rebuilt with the same sealed effort, while policy fallback never crosses tiers. When both tier values are omitted, the profile injects no effort.
 
-When tier effort is configured, the selected value is authoritative. A caller-supplied OpenAI Chat `reasoning_effort`, Anthropic `output_config.effort`, or Responses `reasoning.effort` is accepted and normalized into canonical Chat for compatibility, but the selected profile value replaces it after classification. Client effort cannot force a tier or override the profile. When both tier objects omit effort, incoming effort is rejected as unsupported and omitted effort proceeds without a policy-owned override. Direct non-policy routes retain their ordinary client-controlled reasoning behavior.
+When tier effort is configured, the selected value is authoritative. A caller-supplied OpenAI Chat `reasoning_effort`, Anthropic `output_config.effort`, or Responses `reasoning.effort` is accepted and normalized into canonical Chat for compatibility, but the selected profile value replaces it after effective tier selection. Client effort cannot force a tier or override the profile. When both tier objects omit effort, a valid present client effort is rejected as unsupported and an unset effort proceeds without a policy-owned override. Direct non-policy routes retain their ordinary client-controlled reasoning behavior.
 
 Private tier effort is not published in `/v1/models` and does not change the policy model's public identity. Some terminal models reject reasoning effort together with function tools, so each configured tier value is an operator assertion about the corresponding route contract; Vekil does not infer compatibility from model names or silently remove the field when tools are present. Classifier requests never receive a terminal tier's effort.
 
@@ -460,6 +468,6 @@ V1 stores no policy affinity, so policy rollback requires no policy-session migr
 
 ## Deferred work
 
-Future releases may add translated Gemini adapters, explicit cross-process Chat/Responses affinity, native Responses/websocket terminal selection, shared state, mixed Chat/Responses destinations, a local deterministic first stage, passive ranking, or a `versatile` middle tier.
+Future releases may add translated Gemini adapters, explicit cross-process Chat/Responses affinity, zero-copy policy Responses passthrough, policy websocket routing, shared state, mixed Chat/Responses destinations, a local deterministic first stage, passive ranking, or a `versatile` middle tier.
 
 Vekil continues to forbid arbitrary routing DSLs, recursive policies, post-output quality retries, cross-tier failure fallback, transparent provider-state migration, classifier-driven authorization, model-reported confidence as an enforcement input, content-derived shared breaker state, implicit prompt fingerprints as session identity, and public access to classifier routes.

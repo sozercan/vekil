@@ -530,6 +530,59 @@ func TestPolicyRoutingAppliesProfileTierReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestPolicyRoutingWithoutTierReasoningAcceptsOmissionAndRejectsClientEffort(t *testing.T) {
+	tests := []struct {
+		name            string
+		requestField    string
+		wantStatus      int
+		wantLightSends  int
+		wantErrorDetail string
+	}{
+		{
+			name:           "omitted effort is accepted",
+			wantStatus:     http.StatusOK,
+			wantLightSends: 1,
+		},
+		{
+			name:            "explicit non-null effort is rejected locally",
+			requestField:    `,"reasoning_effort":"low"`,
+			wantStatus:      http.StatusBadRequest,
+			wantErrorDetail: "reasoning_effort is not supported",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)
+			if policyProfileControlsReasoning(cfg.PolicyProfiles[0]) {
+				t.Fatal("fixture unexpectedly configures tier reasoning effort")
+			}
+
+			h, err := NewProxyHandler(nil, nil, WithProvidersConfig(cfg), WithPolicyRoutingMode(PolicyRoutingModeOff))
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := `{"model":"coding-economy","messages":[{"role":"user","content":"hello"}]` + tc.requestField + `}`
+			recorder := httptest.NewRecorder()
+			h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+			if recorder.Code != tc.wantStatus {
+				t.Fatalf("status=%d body=%s, want %d", recorder.Code, recorder.Body.String(), tc.wantStatus)
+			}
+			if tc.wantErrorDetail != "" && !strings.Contains(recorder.Body.String(), tc.wantErrorDetail) {
+				t.Fatalf("body=%s, want %q", recorder.Body.String(), tc.wantErrorDetail)
+			}
+			if sends, _ := light.snapshot(); sends != tc.wantLightSends {
+				t.Fatalf("light/classifier sends=%d, want %d", sends, tc.wantLightSends)
+			}
+			if sends, _ := powerful.snapshot(); sends != 0 {
+				t.Fatalf("powerful sends=%d, want zero", sends)
+			}
+		})
+	}
+}
+
 func TestPolicyRoutingFailoverRetainsSelectedProfileTierReasoningEffort(t *testing.T) {
 	primary := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
 	primary.terminalFailureStatus.Store(http.StatusTooManyRequests)

@@ -413,6 +413,40 @@ func TestLoadProvidersConfigFileRejectsUnknownModelRouteFields(t *testing.T) {
 	}
 }
 
+func TestLoadProvidersConfigFileRejectsUnknownPolicyTierFieldsThroughYAMLAlias(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	body := `schema_version: 2
+providers:
+  - id: upstream
+    type: openai-compatible
+    base_url: https://example.test/v1
+    auth_type: none
+    extra_headers: &tier
+      route: light-route
+      reasoning_effort: low
+      unexpected: typo
+model_routes: []
+policy_profiles:
+  - id: policy
+    public_id: policy
+    lightweight: *tier
+    powerful:
+      route: power-route
+      reasoning_effort: max
+    classifier:
+      route: classifier-route
+    data_policy:
+      content_forwarding_acknowledged: true
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadProvidersConfigFile(path)
+	if err == nil || !strings.Contains(err.Error(), `policy_profiles[0].lightweight.unexpected: unknown field "unexpected"`) {
+		t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+	}
+}
+
 func TestLoadProvidersConfigFileRejectsExplicitZeroRouteBudgets(t *testing.T) {
 	tests := []struct {
 		name string
