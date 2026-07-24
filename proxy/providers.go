@@ -1991,10 +1991,6 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 	return ok
 }
 
-func (h *ProxyHandler) policyEntryRequiredRoutes(entry *publicModelEntry) []*modelRoute {
-	return h.policyEntryRequiredRoutesForSetup(entry, h.providerSetup())
-}
-
 func (h *ProxyHandler) policyEntryRequiredRoutesForSetup(entry *publicModelEntry, setup *providerSetup) []*modelRoute {
 	if h == nil || entry == nil || entry.kind != publicEntryPolicy || setup == nil {
 		return nil
