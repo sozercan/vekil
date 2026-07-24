@@ -183,7 +183,6 @@ func derivePolicyPublicModelContract(profile PolicyProfileConfig, lightweight, p
 		Endpoints:           []string{providerEndpointChatCompletions},
 		ModelPickerEnabled:  cloneBoolPtr(profile.ModelPickerEnabled),
 		ModelPickerCategory: profile.ModelPickerCategory,
-		ReasoningEffort:     intersectPolicyReasoningEffort(lightweight.ReasoningEffort, powerful.ReasoningEffort),
 		Vision:              &vision,
 		ParallelToolCalls:   &parallelToolCalls,
 		ContextWindow:       minimumKnownPolicyContextWindow(lightweight.ContextWindow, powerful.ContextWindow),
@@ -210,23 +209,6 @@ func derivePolicyPublicModelContract(profile PolicyProfileConfig, lightweight, p
 			dropStopSequences:  boolConfigValue(lightweight.DropStopSequences) || boolConfigValue(powerful.DropStopSequences),
 		},
 	}, nil
-}
-
-func intersectPolicyReasoningEffort(lightweight, powerful []string) []string {
-	if len(lightweight) == 0 || len(powerful) == 0 {
-		return nil
-	}
-	available := make(map[string]struct{}, len(powerful))
-	for _, effort := range powerful {
-		available[effort] = struct{}{}
-	}
-	intersection := make([]string, 0, len(lightweight))
-	for _, effort := range lightweight {
-		if _, ok := available[effort]; ok {
-			intersection = append(intersection, effort)
-		}
-	}
-	return intersection
 }
 
 func minimumKnownPolicyContextWindow(lightweight, powerful *int64) *int64 {

@@ -953,7 +953,7 @@ func normalizeAndValidateModelRouteForSchema(route *ModelRouteConfig, path strin
 		seenEndpoints[endpoint] = index
 		route.Endpoints[index] = endpoint
 	}
-
+	_, supportsChatCompletions := seenEndpoints[providerEndpointChatCompletions]
 	seenReasoning := make(map[string]int, len(route.ReasoningEffort))
 	for index, rawEffort := range route.ReasoningEffort {
 		effort := strings.TrimSpace(rawEffort)
@@ -988,13 +988,6 @@ func normalizeAndValidateModelRouteForSchema(route *ModelRouteConfig, path strin
 	}
 	if len(route.Targets) > maxExplicitTargetsPerRoute {
 		return configPathError(path+".targets", "contains %d targets; maximum is %d", len(route.Targets), maxExplicitTargetsPerRoute)
-	}
-	supportsChatCompletions := false
-	for _, endpoint := range route.Endpoints {
-		if endpoint == providerEndpointChatCompletions {
-			supportsChatCompletions = true
-			break
-		}
 	}
 	if route.DropStopSequences != nil && !supportsChatCompletions {
 		return configPathError(path+".drop_stop_sequences", "is only valid when the route advertises %q", providerEndpointChatCompletions)
@@ -1287,7 +1280,11 @@ var modelRouteRoutingConfigFields = configFieldSet(
 var policyProfileConfigFields = configFieldSet(
 	"id", "public_id", "name", "mode", "model_picker_enabled", "model_picker_category",
 	"lightweight_route", "powerful_route", "baseline_tier", "classifier_unavailable_tier",
-	"classifier_uncertain_tier", "classifier", "data_policy",
+	"classifier_uncertain_tier", "tier_reasoning_effort", "classifier", "data_policy",
+)
+
+var policyTierReasoningEffortConfigFields = configFieldSet(
+	"lightweight", "powerful",
 )
 
 var policyClassifierConfigFields = configFieldSet(
@@ -1381,6 +1378,11 @@ func validateJSONConfigFieldPaths(body []byte) error {
 			path := fmt.Sprintf("policy_profiles[%d]", index)
 			if err := validateJSONKnownFields(profile, policyProfileConfigFields, path); err != nil {
 				return err
+			}
+			if tierReasoning, ok := profile["tier_reasoning_effort"].(map[string]interface{}); ok {
+				if err := validateJSONKnownFields(tierReasoning, policyTierReasoningEffortConfigFields, path+".tier_reasoning_effort"); err != nil {
+					return err
+				}
 			}
 			if classifier, ok := profile["classifier"].(map[string]interface{}); ok {
 				if err := validateJSONKnownFields(classifier, policyClassifierConfigFields, path+".classifier"); err != nil {
@@ -1484,6 +1486,11 @@ func validateYAMLConfigFieldPaths(body []byte) error {
 			if err := validateYAMLKnownFields(profile, policyProfileConfigFields, path); err != nil {
 				return err
 			}
+			if tierReasoning := yamlMappingValue(profile, "tier_reasoning_effort"); tierReasoning != nil && tierReasoning.Kind == yaml.MappingNode {
+				if err := validateYAMLKnownFields(tierReasoning, policyTierReasoningEffortConfigFields, path+".tier_reasoning_effort"); err != nil {
+					return err
+				}
+			}
 			if classifier := yamlMappingValue(profile, "classifier"); classifier != nil && classifier.Kind == yaml.MappingNode {
 				if err := validateYAMLKnownFields(classifier, policyClassifierConfigFields, path+".classifier"); err != nil {
 					return err
@@ -1562,6 +1569,9 @@ func markJSONProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 			if index >= len(cfg.PolicyProfiles) {
 				break
 			}
+			rawTierReasoning, tierReasoningSet := profiles[index]["tier_reasoning_effort"]
+			cfg.PolicyProfiles[index].tierReasoningEffortSet = tierReasoningSet
+			cfg.PolicyProfiles[index].tierReasoningEffortNull = tierReasoningSet && bytes.Equal(bytes.TrimSpace(rawTierReasoning), []byte("null"))
 			var classifier map[string]json.RawMessage
 			if json.Unmarshal(profiles[index]["classifier"], &classifier) != nil {
 				continue
@@ -1620,6 +1630,8 @@ func markYAMLProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 			if index >= len(cfg.PolicyProfiles) || profile == nil || profile.Kind != yaml.MappingNode {
 				continue
 			}
+			cfg.PolicyProfiles[index].tierReasoningEffortSet = yamlMappingHasField(profile, "tier_reasoning_effort")
+			cfg.PolicyProfiles[index].tierReasoningEffortNull = yamlMappingFieldIsNull(profile, "tier_reasoning_effort")
 			classifier := yamlDereferenceAlias(yamlMappingValue(profile, "classifier"))
 			if classifier == nil || classifier.Kind != yaml.MappingNode {
 				continue

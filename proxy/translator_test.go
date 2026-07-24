@@ -47,6 +47,32 @@ func TestNormalizeModelName(t *testing.T) {
 }
 
 func TestTranslateAnthropicToOpenAI(t *testing.T) {
+	t.Run("output config effort becomes canonical reasoning effort", func(t *testing.T) {
+		req := &models.AnthropicRequest{
+			Model:        "claude-3-opus",
+			MaxTokens:    intPtr(100),
+			OutputConfig: &models.AnthropicOutputConfig{Effort: " max "},
+			Messages: []models.AnthropicMessage{
+				{Role: "user", Content: json.RawMessage(`"Hello"`)},
+			},
+		}
+		got, err := TranslateAnthropicToOpenAI(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		body, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["reasoning_effort"] != "max" {
+			t.Fatalf("reasoning_effort = %#v, want max; body=%s", payload["reasoning_effort"], body)
+		}
+	})
+
 	t.Run("simple text message", func(t *testing.T) {
 		req := &models.AnthropicRequest{
 			Model:     "claude-3-opus",

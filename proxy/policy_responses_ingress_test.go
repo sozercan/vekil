@@ -231,7 +231,7 @@ func TestPolicyResponsesIngressUsesSuccessfulFailoverHeaders(t *testing.T) {
 	}
 }
 
-func TestPolicyResponsesIngressAcceptsCodexReasoningSummary(t *testing.T) {
+func TestPolicyResponsesIngressOverridesCodexEffortAndDropsReasoningSummary(t *testing.T) {
 	var captured map[string]json.RawMessage
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() { _ = r.Body.Close() }()
@@ -244,8 +244,9 @@ func TestPolicyResponsesIngressAcceptsCodexReasoningSummary(t *testing.T) {
 	}))
 	defer upstream.Close()
 	cfg := policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)
-	cfg.ModelRoutes[0].ReasoningEffort = []string{"low", "medium", "high"}
-	cfg.ModelRoutes[1].ReasoningEffort = []string{"low", "medium", "high"}
+	cfg.ModelRoutes[0].ReasoningEffort = []string{"low"}
+	cfg.ModelRoutes[1].ReasoningEffort = []string{"max"}
+	cfg.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "max"}
 	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
 		WithProvidersConfig(cfg),
 		WithPolicyRoutingMode(PolicyRoutingModeOff),
@@ -265,7 +266,7 @@ func TestPolicyResponsesIngressAcceptsCodexReasoningSummary(t *testing.T) {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	var effort string
-	if err := json.Unmarshal(captured["reasoning_effort"], &effort); err != nil || effort != "high" {
+	if err := json.Unmarshal(captured["reasoning_effort"], &effort); err != nil || effort != "low" {
 		t.Fatalf("reasoning_effort=%q raw=%s", effort, captured["reasoning_effort"])
 	}
 	if _, exists := captured["reasoning"]; exists {
@@ -273,6 +274,46 @@ func TestPolicyResponsesIngressAcceptsCodexReasoningSummary(t *testing.T) {
 	}
 	if _, exists := captured["reasoning_summary"]; exists {
 		t.Fatalf("reasoning_summary leaked upstream: %+v", captured)
+	}
+}
+
+func TestPolicyResponsesIngressAppliesProfileTierEffortWhenReasoningUnset(t *testing.T) {
+	var captured map[string]json.RawMessage
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"chat-default","object":"chat.completion","created":1,"model":"light-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`)
+	}))
+	defer upstream.Close()
+	cfg := policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)
+	cfg.ModelRoutes[0].ReasoningEffort = []string{"low"}
+	cfg.ModelRoutes[1].ReasoningEffort = []string{"max"}
+	cfg.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "max"}
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+		WithProvidersConfig(cfg),
+		WithPolicyRoutingMode(PolicyRoutingModeOff),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"coding-economy",
+		"input":"say ok",
+		"reasoning":{},
+		"store":false,
+		"stream":false
+	}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var effort string
+	if err := json.Unmarshal(captured["reasoning_effort"], &effort); err != nil || effort != "low" {
+		t.Fatalf("reasoning_effort=%q raw=%s", effort, captured["reasoning_effort"])
 	}
 }
 

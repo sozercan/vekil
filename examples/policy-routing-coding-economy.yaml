@@ -47,6 +47,11 @@ model_routes:
     name: Coding Lightweight
     endpoints:
       - /chat/completions
+    # The route allowlist declares values this terminal can execute. The policy
+    # profile below selects the value for the lightweight tier.
+    reasoning_effort:
+      - low
+      - medium
     targets:
       - id: lightweight-primary
         provider: lightweight-provider
@@ -59,6 +64,10 @@ model_routes:
     name: Coding Powerful
     endpoints:
       - /chat/completions
+    reasoning_effort:
+      - medium
+      - high
+      - max
     targets:
       - id: powerful-primary
         provider: powerful-provider
@@ -94,6 +103,14 @@ policy_profiles:
 
     lightweight_route: lightweight-route
     powerful_route: powerful-route
+
+    # Optional as a whole. When present, both policy-owned values are required
+    # and must appear in the corresponding terminal route's allowlist. Incoming
+    # client effort is accepted for this mapped profile, then replaced after the
+    # classifier selects a tier.
+    tier_reasoning_effort:
+      lightweight: low
+      powerful: max
 
     baseline_tier: lightweight
     classifier_unavailable_tier: lightweight

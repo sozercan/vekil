@@ -73,14 +73,14 @@ Schema-v2 policy routing adds a pre-dispatch planner above native OpenAI Chat. T
 Coverage should include:
 
 - schema-v2 route exposure, internal-route non-resolution/catalog exclusion, public-entry/operational-ID collisions, maximum profile count, field ranges, recursive-policy rejection, and schema-v2 feature-field rejection in v1;
-- terminal contract intersection across native `/chat/completions` and Responses-backed Chat, pinned internal Copilot destination validation, rejection of other dynamic/unsupported provider kinds, and classifier one-target/one-attempt/one-send enforcement;
+- terminal contract intersection across native `/chat/completions` and Responses-backed Chat, profile tier-reasoning membership validation, pinned internal Copilot destination validation, rejection of other dynamic/unsupported provider kinds, and classifier one-target/one-attempt/one-send enforcement;
 - exact global/profile mode ceiling behavior, including `off` making zero preflight/classifier calls and observe never changing dispatch;
 - bounded canonical facts, UTF-8 truncation, non-text rejection, tool-name-only forwarding, total request cap, and exclusion of credentials, auth headers, provider state, replay IDs, physical routing metadata, parameter schemas, and tool arguments;
 - mandatory content-forwarding, trust-domain, cross-domain, non-storage, and retention acknowledgements;
 - strict forced `emit_policy_signals` parsing, duplicate-key/extra-field/enum/integer/trailing-content rejection, abstention, and exhaustive deterministic mapper precedence;
 - non-blocking per-profile plus global admission, no queue/backlog, partial-admission release, per-profile fairness, cancellation before terminal dispatch, and shutdown cleanup;
 - unavailable versus uncertain fallback separation, no fallback caching, infrastructure-only breaker transitions, timeout/content-output immunity, `Retry-After`, cooldown, and one half-open probe;
-- sealed operation-plan immutability, classifier/terminal budget separation, exact selected-route sends, no cross-tier fallback, and preservation of forced-stream/aggregation behavior for both tiers;
+- sealed operation-plan immutability, classifier/terminal budget separation, exact selected-route sends, selected-tier reasoning override for omitted and explicit client values, function-tool compatibility, identical failover values, translated Anthropic/Responses policy ingress and direct-route non-injection coverage, no cross-tier fallback, and preservation of forced-stream/aggregation behavior for both tiers;
 - normalized public policy identity in Chat JSON/SSE, safe headers, errors, and metrics, with no terminal provider/route/target/deployment leakage; and
 - adversarial prompt injection, malformed output, saturation, privacy, and cross-request isolation.
 
@@ -293,12 +293,14 @@ True cross-provider coverage remains available through the manual [`Live Multi-P
 - `LIVE_POLICY_ROUTING_LIGHTWEIGHT_TYPE` — `azure-openai` or `openai-compatible`
 - `LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL` — the lightweight provider API base before `/chat/completions`; Azure uses the OpenAI v1 form ending in `/openai/v1`
 - `LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL` — the physical lightweight model/deployment name
+- `LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT` — the policy-owned effort forced after the lightweight tier is selected, for example `low`
 - `LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_TYPE` — `azure-openai` or `openai-compatible`
 - `LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL` — the primary powerful provider API base before `/chat/completions`
 - `LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL` — the physical primary powerful model/deployment name
 - `LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_TYPE` — `azure-openai` or `openai-compatible`
 - `LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL` — the secondary powerful provider API base before `/chat/completions`
 - `LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL` — the semantically equivalent secondary powerful model/deployment name
+- `LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT` — the policy-owned effort forced after the powerful tier is selected, for example `max`; both powerful targets must support it
 - `LIVE_POLICY_ROUTING_CLASSIFIER_MODEL` — the classifier deployment on the powerful-primary provider
 - `LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED` — `true` only after confirming support; otherwise set `false` and explicitly set `LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION=true`
 - `LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION` — optional, defaults to `false`

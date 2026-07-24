@@ -1314,6 +1314,13 @@ func (h *ProxyHandler) executeRoutedChatCompletions(ctx context.Context, body []
 	if operation == nil || operation.route == nil || operation.route.legacy {
 		return h.executeChatCompletionsForRequestedModel(ctx, body, options, requestedModel)
 	}
+	if plan, planned := operation.policyPlan(); planned && plan.selectedReasoningEffort != "" {
+		var err error
+		body, err = forcePolicyOpenAIChatReasoningEffort(body, plan.selectedReasoningEffort)
+		if err != nil {
+			return chatExecutionResult{}, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+		}
+	}
 
 	endpoint, err := policyAwareChatExecutionEndpoint(operation, body)
 	if err != nil {
@@ -1337,6 +1344,34 @@ func (h *ProxyHandler) executeRoutedChatCompletions(ctx context.Context, body []
 		result.route = resolved
 	}
 	return result, nil
+}
+
+// forcePolicyOpenAIChatReasoningEffort applies the policy-selected tier value
+// to canonical Chat before native-Chat versus Responses-backed execution is
+// chosen. Replacing an incoming value is deliberate: policy profiles that set
+// tier_reasoning_effort, rather than the client harness, own reasoning policy.
+func forcePolicyOpenAIChatReasoningEffort(body []byte, effort string) ([]byte, error) {
+	effort = strings.TrimSpace(effort)
+	if effort == "" {
+		return body, nil
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("decode policy Chat request to apply reasoning effort: %w", err)
+	}
+	if payload == nil {
+		return nil, fmt.Errorf("policy Chat request must be a JSON object to apply reasoning effort")
+	}
+	rawEffort, err := json.Marshal(effort)
+	if err != nil {
+		return nil, fmt.Errorf("encode policy reasoning effort: %w", err)
+	}
+	payload["reasoning_effort"] = rawEffort
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("rewrite policy Chat request with reasoning effort: %w", err)
+	}
+	return rewritten, nil
 }
 
 func (h *ProxyHandler) retryRoutedChatExecutionWithoutInjectedStreamOptions(ctx context.Context, result chatExecutionResult, body []byte, mode chatCompletionsMode, requestedModel string) (chatExecutionResult, []byte, chatCompletionsMode) {
@@ -2003,6 +2038,11 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		r = r.WithContext(plannedCtx)
 		w.Header().Set("X-Vekil-Request-ID", plannedOperation.operationID())
 		publicModel = policyPlan.publicID
+		oaiBody, err = forcePolicyOpenAIChatReasoningEffort(oaiBody, policyPlan.selectedReasoningEffort)
+		if err != nil {
+			writeAnthropicError(w, http.StatusInternalServerError, "api_error", "failed to apply policy reasoning effort")
+			return
+		}
 
 		// The translated Anthropic request has already established whether the
 		// client asked for streaming and whether Vekil must force-stream upstream.
@@ -2350,6 +2390,11 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 	if policyPlan.valid() {
 		if admittedOperation != nil {
 			writeAnthropicError(w, http.StatusInternalServerError, "api_error", "policy model was also admitted as a direct route")
+			return
+		}
+		policyBody, err = forcePolicyOpenAIChatReasoningEffort(policyBody, policyPlan.selectedReasoningEffort)
+		if err != nil {
+			writeAnthropicError(w, http.StatusInternalServerError, "api_error", "failed to apply count_tokens policy reasoning effort")
 			return
 		}
 		policyBody = applyPolicyOpenAIChatParallelToolCalls(policyBody, policyPlan.contract, cloneBoolPtr(policyPlan.terminalParallelToolCalls))
@@ -2810,6 +2855,11 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		// Preserve the actual body model for provider rewrite. Public metrics and
 		// response identity use the canonical policy profile ID separately.
 		publicModel = policyPlan.publicID
+		bodyBytes, err = forcePolicyOpenAIChatReasoningEffort(bodyBytes, policyPlan.selectedReasoningEffort)
+		if err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "failed to apply policy reasoning effort", "server_error")
+			return
+		}
 	}
 
 	scope := chatToolExecutionScopeFromHeaders(r.Header)

@@ -170,6 +170,17 @@ the selected terminal response back to Anthropic. The policy profile remains
 advertised as native `/chat/completions` metadata; the launcher compatibility
 path does not change terminal endpoint ownership.
 
+Claude's `output_config.effort` is carried into canonical Chat
+`reasoning_effort`. Direct routes preserve supported client effort. A policy
+profile never advertises client-selectable reasoning effort: an incoming value
+is accepted only when that profile configures `tier_reasoning_effort`, and the
+classifier-selected `lightweight` or `powerful` value then replaces it. If the
+tier block is omitted, an incoming effort is rejected as unsupported and an
+omitted effort proceeds without a policy-owned override. Current Claude releases
+may emit effort even when the user did not pass `--effort`, so managed Claude
+policy launches that need to accept that wire field should configure both tier
+values.
+
 When a selected policy profile targets a configured `copilot` provider, the
 ephemeral launch proxy authenticates and sends those terminal/classifier Chat
 requests to Copilot in process. No separately started loopback bridge is
@@ -231,6 +242,12 @@ affinity.
 Large direct Codex tool catalogs require a downstream Chat bridge that accepts
 more than the native OpenAI/Azure 128-function ceiling; operators using a
 narrower terminal must reduce the enabled client catalog.
+
+Policy-owned models never advertise client-selectable reasoning effort. If
+Codex sends `reasoning.effort`, Vekil accepts it only for a profile with
+`tier_reasoning_effort`; the classifier-selected tier value then replaces it.
+An unmapped profile rejects incoming effort as unsupported and injects no effort
+when the field is omitted.
 
 With `--model`, a private temporary one-model Codex catalog is generated from
 the installed CLI's bundled catalog, with Vekil model context, reasoning,

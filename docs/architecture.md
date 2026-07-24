@@ -81,7 +81,7 @@ V1 policy planning is stateless and single-tenant: no downstream identity, tenan
 Explicit routes use one route executor beneath the public handlers. Request handling has two isolation boundaries:
 
 1. **Once per logical operation:** parse and validate one canonical request, run route-agnostic translation and opt-in tool optimization once, apply uniform route policy, and retain immutable body bytes plus sanitized client headers.
-2. **Once per target attempt:** start from those immutable inputs, rewrite the physical model/deployment, apply only semantics-preserving target policy, construct a fresh URL/request, and add only that target's authentication and headers.
+2. **Once per target attempt:** start from those immutable inputs, apply the already-selected route's native-Chat defaults, rewrite the physical model/deployment, apply only semantics-preserving target policy, construct a fresh URL/request, and add only that target's authentication and headers. Route defaults are private execution state, not part of a policy profile's public catalog contract.
 
 A body, header map, credential, response header, or upstream request ID from one target is never reused for another target. Attempts are serialized; a failed body and its local reader/pump must be closed before another target can be selected. Inference dispatch also rejects redirects and disables implicit request-body replay so one reserved send corresponds to one physical dispatch.
 

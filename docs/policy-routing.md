@@ -131,9 +131,20 @@ A policy profile binds:
 
 - a public identity: `id`, `public_id`, and optional `name`/picker metadata;
 - the `lightweight_route` and `powerful_route` terminal IDs;
+- an optional policy-owned `tier_reasoning_effort` map;
 - `baseline_tier`, `classifier_unavailable_tier`, and `classifier_uncertain_tier`;
 - one internal classifier route plus the built-in classifier profile and bounds; and
 - mandatory data-policy acknowledgements.
+
+The tier reasoning map is policy-owned execution configuration:
+
+```yaml
+tier_reasoning_effort:
+  lightweight: low
+  powerful: max
+```
+
+The block is optional as a whole. When present, both values are required, are trimmed but otherwise case-sensitive, and must be non-empty. `lightweight` must appear in the referenced lightweight route's `reasoning_effort` allowlist, and `powerful` must appear in the referenced powerful route's allowlist. A shared terminal route may serve both tiers only when its allowlist contains both configured values. Route allowlists describe terminal capability; a mapped profile chooses the value used for each policy decision.
 
 The v1 defaults are economy-oriented:
 
@@ -177,6 +188,8 @@ Validation also rejects:
 - public/operational ID collisions in their applicable namespaces;
 - public metadata on an internal route;
 - recursive policy references;
+- a null or non-object `tier_reasoning_effort`, or a present block with missing, empty, null, or unknown tier fields;
+- a tier reasoning value absent from its referenced terminal route's `reasoning_effort` allowlist;
 - destination routes without `/chat/completions` or `/responses` Chat execution support;
 - unsupported provider families or dynamic providers other than pinned `type: copilot` targets;
 - terminal routes with different preferred Chat backends or other public Chat request semantics;
@@ -346,7 +359,7 @@ A policy profile appears exactly once in `/v1/models` with:
 | `name` | profile `name`, defaulting to `public_id` |
 | `owned_by` | `vekil-policy` |
 | `supported_endpoints` | `[/chat/completions]` |
-| `reasoning_effort` | lightweight route order, filtered to values also supported by powerful |
+| `reasoning_effort` | omitted; tier effort is private policy-controlled execution state, not a client-selectable capability |
 | `parallel_tool_calls` | true only when both terminal contracts support it |
 | `vision` | always false in v1 |
 | `context_window` | minimum positive value when both are known; otherwise omitted |
@@ -354,6 +367,12 @@ A policy profile appears exactly once in `/v1/models` with:
 | `model_picker_category` | profile value, default `versatile` |
 
 Both destinations must accept the same published Chat semantics. Per-target wire adaptations may differ only when they do not alter that public contract.
+
+`model_routes[].reasoning_effort` remains each terminal route's capability allowlist. An optional `policy_profiles[].tier_reasoning_effort` block selects one allowed value for each tier. For a mapped profile, the planner seals the selected route and its configured effort together; request preparation then writes that value into canonical Chat before native-Chat or Chat-over-Responses execution. Every target attempt inside the selected route is rebuilt with the same sealed effort, while policy fallback never crosses tiers. An unmapped profile injects no effort.
+
+For a mapped profile, the selected tier effort is authoritative. A caller-supplied OpenAI Chat `reasoning_effort`, Anthropic `output_config.effort`, or Responses `reasoning.effort` is accepted and normalized into canonical Chat for compatibility, but the selected profile value replaces it after classification. Client effort cannot force a tier or override the profile. For an unmapped profile, an incoming effort is rejected as unsupported; an omitted effort proceeds without a policy-owned override. Direct non-policy routes retain their ordinary client-controlled reasoning behavior.
+
+The private tier map is not published in `/v1/models` and does not change the policy model's public identity. Some terminal models reject reasoning effort together with function tools, so each configured tier value is an operator assertion about the corresponding route contract; Vekil does not infer compatibility from model names or silently remove the field when tools are present. Classifier requests never receive a terminal tier's effort.
 
 For a policy request, public JSON, SSE, safe model headers, errors, and client-facing metrics use the policy profile's public ID. This identity rule also applies when an unsupported request shape or Gemini surface is rejected locally before classification. Provider, terminal route, target, and deployment IDs do not leak through normalized policy output. Upstream `X-Request-ID` and `Request-ID` values are omitted; clients receive only the proxy-owned `X-Vekil-Request-ID` correlation header. Direct-route output behavior remains unchanged.
 
@@ -373,7 +392,7 @@ Observe analysis is not representative unless admission is at least 95% in every
 Each bounded decision record carries IDs/enums/counts, latency/failure categories, and these generations:
 
 - `configGeneration`: canonical normalized complete providers configuration;
-- `profileGeneration`: normalized profile, derived public contract, and terminal route IDs;
+- `profileGeneration`: normalized profile, including its tier reasoning map, derived public contract, terminal route IDs, and effective profile-wide request policy;
 - `classifierGeneration`: classifier route/target/model plus fact schema, forced-function schema, classifier-prompt, and mapper versions; and
 - `binaryGeneration`: build version plus Git commit when available.
 

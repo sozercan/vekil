@@ -98,6 +98,13 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 		oaiReq.ParallelToolCalls = &parallelToolCalls
 	}
 
+	// Claude's explicit output effort is the Anthropic equivalent of Chat's
+	// reasoning_effort. Preserve it before policy validation and route-default
+	// injection so an operator default can never replace a client choice.
+	if req.OutputConfig != nil {
+		oaiReq.ReasoningEffort = strings.TrimSpace(req.OutputConfig.Effort)
+	}
+
 	// MaxTokens
 	oaiReq.MaxTokens = req.MaxTokens
 

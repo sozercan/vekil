@@ -22,10 +22,12 @@ import (
 type policyIntegrationUpstream struct {
 	server *httptest.Server
 
-	mu       sync.Mutex
-	models   []string
-	parallel []json.RawMessage
-	requests int
+	mu        sync.Mutex
+	models    []string
+	parallel  []json.RawMessage
+	reasoning []json.RawMessage
+	auth      []string
+	requests  int
 
 	classifierSignals        policyClassifierSignals
 	classifierBlock          <-chan struct{}
@@ -44,6 +46,7 @@ func newPolicyIntegrationUpstream(t *testing.T, signals policyClassifierSignals)
 			Model             string          `json:"model"`
 			Stream            bool            `json:"stream"`
 			ParallelToolCalls json.RawMessage `json:"parallel_tool_calls"`
+			ReasoningEffort   json.RawMessage `json:"reasoning_effort"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -53,6 +56,8 @@ func newPolicyIntegrationUpstream(t *testing.T, signals policyClassifierSignals)
 		u.requests++
 		u.models = append(u.models, request.Model)
 		u.parallel = append(u.parallel, append(json.RawMessage(nil), request.ParallelToolCalls...))
+		u.reasoning = append(u.reasoning, append(json.RawMessage(nil), request.ReasoningEffort...))
+		u.auth = append(u.auth, r.Header.Get("Authorization"))
 		u.mu.Unlock()
 		if request.Model == "classifier-model" {
 			if status := int(u.classifierFailureStatus.Load()); status != 0 {
@@ -161,6 +166,16 @@ func (u *policyIntegrationUpstream) parallelToolCallsSnapshot() []json.RawMessag
 	return parallel
 }
 
+func (u *policyIntegrationUpstream) reasoningEffortSnapshot() []json.RawMessage {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	reasoning := make([]json.RawMessage, len(u.reasoning))
+	for index := range u.reasoning {
+		reasoning[index] = append(json.RawMessage(nil), u.reasoning[index]...)
+	}
+	return reasoning
+}
+
 func policyIntegrationConfig(lightURL, powerfulURL, profileMode string) ProvidersConfig {
 	trueValue := true
 	parallel := true
@@ -255,8 +270,12 @@ func TestPolicyRoutingEnforceSelectsPowerfulAndPreservesPublicIdentity(t *testin
 	})
 	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
 
+	cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)
+	cfg.ModelRoutes[0].ReasoningEffort = []string{"low"}
+	cfg.ModelRoutes[1].ReasoningEffort = []string{"max"}
+	cfg.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "max"}
 	h, err := NewProxyHandler(nil, nil,
-		WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)),
+		WithProvidersConfig(cfg),
 		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
 	)
 	if err != nil {
@@ -295,6 +314,14 @@ func TestPolicyRoutingEnforceSelectsPowerfulAndPreservesPublicIdentity(t *testin
 	}
 	if powerRequests != 1 || strings.Join(powerModels, ",") != "power-model" {
 		t.Fatalf("power requests = %d %v, want one terminal send", powerRequests, powerModels)
+	}
+	if efforts := powerful.reasoningEffortSnapshot(); len(efforts) != 1 || string(efforts[0]) != `"max"` {
+		t.Fatalf("powerful reasoning efforts = %q, want max", efforts)
+	}
+	for _, effort := range light.reasoningEffortSnapshot() {
+		if len(effort) != 0 {
+			t.Fatalf("classifier received terminal reasoning effort: %q", effort)
+		}
 	}
 
 	policyStats := h.policyRoutingController.(*chatPolicyRoutingController).PolicyStatsSnapshot()
@@ -438,11 +465,117 @@ func TestResponsesClassifierMalformedAcceptedOutputIsUncertain(t *testing.T) {
 	}
 }
 
+func TestPolicyRoutingAppliesProfileTierReasoningEffort(t *testing.T) {
+	tests := []struct {
+		name             string
+		baselineTier     string
+		requestField     string
+		withFunctionTool bool
+		wantEffort       string
+	}{
+		{name: "lightweight omitted", baselineTier: policyConfigTierLightweight, wantEffort: `"low"`},
+		{name: "powerful omitted", baselineTier: policyConfigTierPowerful, wantEffort: `"max"`},
+		{name: "lightweight overrides explicit client max", baselineTier: policyConfigTierLightweight, requestField: `,"reasoning_effort":"max"`, wantEffort: `"low"`},
+		{name: "powerful overrides explicit client low", baselineTier: policyConfigTierPowerful, requestField: `,"reasoning_effort":"low"`, wantEffort: `"max"`},
+		{name: "explicit null is replaced", baselineTier: policyConfigTierLightweight, requestField: `,"reasoning_effort":null`, wantEffort: `"low"`},
+		{name: "function tools keep policy effort", baselineTier: policyConfigTierLightweight, withFunctionTool: true, wantEffort: `"low"`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)
+			cfg.ModelRoutes[0].ReasoningEffort = []string{"low", "medium"}
+			cfg.ModelRoutes[1].ReasoningEffort = []string{"medium", "max"}
+			cfg.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "max"}
+			cfg.PolicyProfiles[0].BaselineTier = tc.baselineTier
+
+			h, err := NewProxyHandler(nil, nil,
+				WithProvidersConfig(cfg),
+				WithPolicyRoutingMode(PolicyRoutingModeOff),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+
+			body := `{"model":"coding-economy","messages":[{"role":"user","content":"hello"}]`
+			if tc.withFunctionTool {
+				body += `,"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]`
+			}
+			body += tc.requestField + `}`
+			recorder := httptest.NewRecorder()
+			h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+
+			selected := light
+			if tc.baselineTier == policyConfigTierPowerful {
+				selected = powerful
+			}
+			reasoning := selected.reasoningEffortSnapshot()
+			if len(reasoning) != 1 {
+				t.Fatalf("selected route requests = %d, want 1", len(reasoning))
+			}
+			if got := string(reasoning[0]); got != tc.wantEffort {
+				t.Fatalf("reasoning_effort = %q, want %q", got, tc.wantEffort)
+			}
+		})
+	}
+}
+
+func TestPolicyRoutingFailoverRetainsSelectedProfileTierReasoningEffort(t *testing.T) {
+	primary := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	primary.terminalFailureStatus.Store(http.StatusTooManyRequests)
+	secondary := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	cfg := policyIntegrationConfig(primary.server.URL, secondary.server.URL, policyConfigModeOff)
+	cfg.ModelRoutes[0].ReasoningEffort = []string{"low"}
+	cfg.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "low"}
+	cfg.ModelRoutes[0].Targets = append(cfg.ModelRoutes[0].Targets, ModelRouteTargetConfig{
+		ID: "light-secondary", Provider: "power-provider", UpstreamModel: "light-failover-model",
+	})
+	cfg.ModelRoutes[0].Routing = ModelRouteRoutingConfig{
+		Mode: string(routeModePriorityFailover), MaxTargetAttempts: 2, MaxUpstreamSends: 2,
+	}
+	cfg.ModelRoutes[1].ReasoningEffort = []string{"low"}
+
+	h, err := NewProxyHandler(nil, nil,
+		WithProvidersConfig(cfg),
+		WithPolicyRoutingMode(PolicyRoutingModeOff),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"coding-economy","messages":[{"role":"user","content":"hello"}]}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := primary.reasoningEffortSnapshot(); len(got) != 1 || string(got[0]) != `"low"` {
+		t.Fatalf("primary reasoning efforts = %q", got)
+	}
+	if got := secondary.reasoningEffortSnapshot(); len(got) != 1 || string(got[0]) != `"low"` {
+		t.Fatalf("secondary reasoning efforts = %q", got)
+	}
+	_, models := secondary.snapshot()
+	if strings.Join(models, ",") != "light-failover-model" {
+		t.Fatalf("secondary models = %v", models)
+	}
+}
+
 func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
 	streamFixture := readResponsesChatStreamFixture(t, "stream_text.sse")
 	var mu sync.Mutex
 	var paths []string
 	var models []string
+	var reasoningEfforts []string
 	var authorizations []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == providerEndpointModels {
@@ -463,10 +596,15 @@ func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
 		_ = json.Unmarshal(request["model"], &model)
 		var stream bool
 		_ = json.Unmarshal(request["stream"], &stream)
+		var reasoning struct {
+			Effort string `json:"effort"`
+		}
+		_ = json.Unmarshal(request["reasoning"], &reasoning)
 		tools := string(request["tools"])
 		mu.Lock()
 		paths = append(paths, r.URL.Path)
 		models = append(models, model)
+		reasoningEfforts = append(reasoningEfforts, reasoning.Effort)
 		authorizations = append(authorizations, r.Header.Get("Authorization"))
 		mu.Unlock()
 
@@ -539,10 +677,17 @@ func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
 	}}
 	for routeIndex := range cfg.ModelRoutes {
 		cfg.ModelRoutes[routeIndex].Endpoints = []string{providerEndpointResponses}
+		switch routeIndex {
+		case 0:
+			cfg.ModelRoutes[routeIndex].ReasoningEffort = []string{"low"}
+		case 1:
+			cfg.ModelRoutes[routeIndex].ReasoningEffort = []string{"max"}
+		}
 		for targetIndex := range cfg.ModelRoutes[routeIndex].Targets {
 			cfg.ModelRoutes[routeIndex].Targets[targetIndex].Provider = "copilot"
 		}
 	}
+	cfg.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "max"}
 	cfg.PolicyProfiles[0].DataPolicy.AllowProviderRetention = true
 
 	h, err := NewProxyHandler(
@@ -618,6 +763,9 @@ func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
 	}
 	if got := strings.Join(models, ","); got != "classifier-model,classifier-model,power-model,classifier-model,power-model" {
 		t.Fatalf("Copilot policy models = %q", got)
+	}
+	if got := strings.Join(reasoningEfforts, ","); got != ",,max,,max" {
+		t.Fatalf("Copilot policy Responses reasoning efforts = %q, want classifier omissions then powerful max for both terminal sends", got)
 	}
 	for index, authorization := range authorizations {
 		if authorization != "Bearer copilot-test-token" {
@@ -722,15 +870,17 @@ func TestChatOperationPlanDefensivelyCopiesCandidates(t *testing.T) {
 		policy: routePolicy{mode: routeModePrimaryOnly, maxTargetAttempts: 1, maxUpstreamSends: 1},
 	}
 	contract := publicModelContract{id: "policy", endpoints: []string{providerEndpointChatCompletions}}
-	plan := newChatOperationPlan(chatOperationPlanOptions{OperationID: "operation", PublicID: "policy", RouteID: "route-a", Route: route, Contract: contract, SelectedTier: policyTierLightweight, EffectiveMode: policyModeOff})
+	plan := newChatOperationPlan(chatOperationPlanOptions{OperationID: "operation", PublicID: "policy", RouteID: "route-a", Route: route, Contract: contract, SelectedReasoningEffort: "low", SelectedTier: policyTierLightweight, EffectiveMode: policyModeOff})
 	route.targets[0].id = "mutated"
 	*route.public.policy.parallelToolCalls = false
 	*route.targets[0].wirePolicy.parallelToolCalls = false
 	route.targets[0].legacyOwner.supportedEndpoints[0] = "/responses"
 	contract.endpoints[0] = "/responses"
 	operation := newRouteOperationFromChatPlan(plan, t.Context())
-	if operation == nil || operation.route.targets[0].id != "target-a" || operation.route.public.endpoints[0] != providerEndpointChatCompletions ||
-		plan.terminalParallelToolCalls == nil || !*plan.terminalParallelToolCalls ||
+	plan.selectedReasoningEffort = "high"
+	sealedPlan, planned := operation.policyPlan()
+	if operation == nil || !planned || sealedPlan.selectedReasoningEffort != "low" || operation.route.targets[0].id != "target-a" || operation.route.public.endpoints[0] != providerEndpointChatCompletions ||
+		sealedPlan.terminalParallelToolCalls == nil || !*sealedPlan.terminalParallelToolCalls ||
 		operation.route.targets[0].wirePolicy.parallelToolCalls == nil || !*operation.route.targets[0].wirePolicy.parallelToolCalls ||
 		operation.route.targets[0].legacyOwner.supportedEndpoints[0] != providerEndpointChatCompletions {
 		t.Fatalf("sealed operation mutated: %+v", operation)
@@ -1345,14 +1495,6 @@ func TestPolicyRoutingValidatesSharedPublicContractBeforeClassifierSend(t *testi
 		field  string
 	}{
 		{
-			name: "reasoning effort outside intersection",
-			mutate: func(cfg *ProvidersConfig) {
-				cfg.ModelRoutes[0].ReasoningEffort = []string{"low", "medium"}
-				cfg.ModelRoutes[1].ReasoningEffort = []string{"medium", "high"}
-			},
-			field: `"reasoning_effort":"high"`,
-		},
-		{
 			name: "parallel tools outside intersection",
 			mutate: func(cfg *ProvidersConfig) {
 				cfg.ModelRoutes[1].ParallelToolCalls = &falseValue
@@ -1378,6 +1520,35 @@ func TestPolicyRoutingValidatesSharedPublicContractBeforeClassifierSend(t *testi
 			}
 			if sends, _ := light.snapshot(); sends != 0 {
 				t.Fatalf("light/classifier sends=%d, want zero", sends)
+			}
+			if sends, _ := powerful.snapshot(); sends != 0 {
+				t.Fatalf("powerful sends=%d, want zero", sends)
+			}
+		})
+	}
+}
+
+func TestPolicyRoutingRejectsMalformedClientReasoningBeforeTerminalSend(t *testing.T) {
+	for _, requestField := range []string{`"reasoning_effort":123`, `"reasoning_effort":""`} {
+		t.Run(requestField, func(t *testing.T) {
+			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)
+			cfg.ModelRoutes[0].ReasoningEffort = []string{"low"}
+			cfg.ModelRoutes[1].ReasoningEffort = []string{"max"}
+			cfg.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "max"}
+			h, err := NewProxyHandler(nil, nil, WithProvidersConfig(cfg), WithPolicyRoutingMode(PolicyRoutingModeOff))
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := `{"model":"coding-economy","messages":[{"role":"user","content":"hello"}],` + requestField + `}`
+			recorder := httptest.NewRecorder()
+			h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+			if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "reasoning_effort") {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			if sends, _ := light.snapshot(); sends != 0 {
+				t.Fatalf("light sends=%d, want zero", sends)
 			}
 			if sends, _ := powerful.snapshot(); sends != 0 {
 				t.Fatalf("powerful sends=%d, want zero", sends)

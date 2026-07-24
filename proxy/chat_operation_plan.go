@@ -31,6 +31,7 @@ type chatOperationPlan struct {
 	routePolicy               routePolicy
 	contract                  publicModelContract
 	terminalParallelToolCalls *bool
+	selectedReasoningEffort   string
 
 	policyID             string
 	selectedTier         policyTier
@@ -51,6 +52,9 @@ type chatOperationPlanOptions struct {
 	RouteID     string
 	Route       *modelRoute
 	Contract    publicModelContract
+	// SelectedReasoningEffort is the policy-owned canonical Chat value sealed
+	// for the selected tier. Empty preserves ordinary non-managed behavior.
+	SelectedReasoningEffort string
 
 	PolicyID             string
 	SelectedTier         policyTier
@@ -90,6 +94,7 @@ func newChatOperationPlan(options chatOperationPlanOptions) chatOperationPlan {
 		publicID:                  publicID,
 		routeID:                   routeID,
 		contract:                  contract,
+		selectedReasoningEffort:   strings.TrimSpace(options.SelectedReasoningEffort),
 		policyID:                  strings.TrimSpace(options.PolicyID),
 		selectedTier:              options.SelectedTier,
 		effectiveMode:             options.EffectiveMode,

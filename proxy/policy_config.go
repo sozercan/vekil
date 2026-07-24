@@ -44,6 +44,10 @@ type PolicyProfileConfig struct {
 
 	LightweightRoute string `json:"lightweight_route" yaml:"lightweight_route"`
 	PowerfulRoute    string `json:"powerful_route" yaml:"powerful_route"`
+	// TierReasoningEffort makes the selected policy tier authoritative for
+	// canonical Chat reasoning effort. When omitted, the policy retains the
+	// ordinary client-selectable intersection contract.
+	TierReasoningEffort *PolicyTierReasoningEffortConfig `json:"tier_reasoning_effort,omitempty" yaml:"tier_reasoning_effort,omitempty"`
 
 	BaselineTier              string `json:"baseline_tier,omitempty" yaml:"baseline_tier,omitempty"`
 	ClassifierUnavailableTier string `json:"classifier_unavailable_tier,omitempty" yaml:"classifier_unavailable_tier,omitempty"`
@@ -51,6 +55,17 @@ type PolicyProfileConfig struct {
 
 	Classifier PolicyClassifierConfig `json:"classifier" yaml:"classifier"`
 	DataPolicy PolicyDataPolicyConfig `json:"data_policy" yaml:"data_policy"`
+
+	tierReasoningEffortSet  bool
+	tierReasoningEffortNull bool
+}
+
+// PolicyTierReasoningEffortConfig binds one canonical reasoning effort to each
+// terminal tier. Values are validated against the corresponding route's
+// reasoning_effort allowlist after route references are resolved.
+type PolicyTierReasoningEffortConfig struct {
+	Lightweight string `json:"lightweight" yaml:"lightweight"`
+	Powerful    string `json:"powerful" yaml:"powerful"`
 }
 
 // PolicyClassifierConfig bounds one profile's internal classifier operation.
@@ -92,6 +107,10 @@ type PolicyDataPolicyConfig struct {
 func clonePolicyProfileConfig(profile PolicyProfileConfig) PolicyProfileConfig {
 	cloned := profile
 	cloned.ModelPickerEnabled = cloneBoolPtr(profile.ModelPickerEnabled)
+	if profile.TierReasoningEffort != nil {
+		tierReasoning := *profile.TierReasoningEffort
+		cloned.TierReasoningEffort = &tierReasoning
+	}
 	return cloned
 }
 
@@ -140,6 +159,23 @@ func normalizeAndValidatePolicyProfileConfig(profile *PolicyProfileConfig, path 
 	}
 	if profile.PowerfulRoute, err = normalizeOperationalID(profile.PowerfulRoute, path+".powerful_route"); err != nil {
 		return err
+	}
+	if profile.tierReasoningEffortNull {
+		return configPathError(path+".tier_reasoning_effort", "must not be null")
+	}
+	if profile.tierReasoningEffortSet && profile.TierReasoningEffort == nil {
+		return configPathError(path+".tier_reasoning_effort", "must be an object")
+	}
+	if profile.TierReasoningEffort != nil {
+		tierPath := path + ".tier_reasoning_effort"
+		profile.TierReasoningEffort.Lightweight = strings.TrimSpace(profile.TierReasoningEffort.Lightweight)
+		if profile.TierReasoningEffort.Lightweight == "" {
+			return configPathError(tierPath+".lightweight", "is required")
+		}
+		profile.TierReasoningEffort.Powerful = strings.TrimSpace(profile.TierReasoningEffort.Powerful)
+		if profile.TierReasoningEffort.Powerful == "" {
+			return configPathError(tierPath+".powerful", "is required")
+		}
 	}
 
 	profile.BaselineTier = strings.TrimSpace(profile.BaselineTier)
@@ -272,6 +308,24 @@ func validatePolicyProfileConfigReferences(
 	if err != nil {
 		return err
 	}
+	if profile.TierReasoningEffort != nil {
+		if err := validatePolicyTierReasoningEffort(
+			profile.TierReasoningEffort.Lightweight,
+			path+".tier_reasoning_effort.lightweight",
+			lightweight,
+			profile.LightweightRoute,
+		); err != nil {
+			return err
+		}
+		if err := validatePolicyTierReasoningEffort(
+			profile.TierReasoningEffort.Powerful,
+			path+".tier_reasoning_effort.powerful",
+			powerful,
+			profile.PowerfulRoute,
+		); err != nil {
+			return err
+		}
+	}
 	if boolConfigValue(lightweight.DropSamplingParams) != boolConfigValue(powerful.DropSamplingParams) {
 		return configPathError(path+".powerful_route", "route %q differs from lightweight route %q in drop_sampling_params public Chat semantics", profile.PowerfulRoute, profile.LightweightRoute)
 	}
@@ -309,6 +363,18 @@ func validatePolicyProfileConfigReferences(
 	}
 
 	return nil
+}
+
+func validatePolicyTierReasoningEffort(effort, path string, route *ModelRouteConfig, routeID string) error {
+	if route == nil {
+		return configPathError(path, "cannot be validated because route %q is unavailable", routeID)
+	}
+	for _, allowed := range route.ReasoningEffort {
+		if allowed == effort {
+			return nil
+		}
+	}
+	return configPathError(path, "value %q must appear in model route %q reasoning_effort", effort, routeID)
 }
 
 func resolvePolicyTerminalRoute(routeID, path string, routes map[string]*ModelRouteConfig, policyReferences map[string]string) (*ModelRouteConfig, error) {

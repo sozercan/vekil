@@ -59,6 +59,9 @@ policy_profiles:
     public_id: coding-policy-20260717
     lightweight_route: light-route
     powerful_route: powerful-route
+    tier_reasoning_effort:
+      lightweight: low
+      powerful: high
     classifier:
       route: classifier-route
       recent_turns: 0
@@ -66,6 +69,39 @@ policy_profiles:
     data_policy:
       content_forwarding_acknowledged: true
 `
+}
+
+func loadPolicyTierReasoningConfigForTest(t *testing.T, cfg ProvidersConfig, lightweight, powerful any) (ProvidersConfig, error) {
+	t.Helper()
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal providers config: %v", err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(body, &document); err != nil {
+		t.Fatalf("decode providers config fixture: %v", err)
+	}
+	profiles, ok := document["policy_profiles"].([]any)
+	if !ok || len(profiles) == 0 {
+		t.Fatal("providers config fixture has no policy profile")
+	}
+	profile, ok := profiles[0].(map[string]any)
+	if !ok {
+		t.Fatal("policy profile fixture is not an object")
+	}
+	profile["tier_reasoning_effort"] = map[string]any{
+		"lightweight": lightweight,
+		"powerful":    powerful,
+	}
+	body, err = json.Marshal(document)
+	if err != nil {
+		t.Fatalf("marshal tier reasoning fixture: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "providers.json")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write tier reasoning fixture: %v", err)
+	}
+	return LoadProvidersConfigFile(path)
 }
 
 func TestSchemaV2PolicyConfigCompilesTerminalAndPublicRegistries(t *testing.T) {
@@ -111,6 +147,22 @@ func TestSchemaV2PolicyConfigCompilesTerminalAndPublicRegistries(t *testing.T) {
 			t.Fatalf("internal route %q resolved through public static lookup", routeID)
 		}
 	}
+	var normalizedProfile struct {
+		TierReasoningEffort struct {
+			Lightweight string `json:"lightweight"`
+			Powerful    string `json:"powerful"`
+		} `json:"tier_reasoning_effort"`
+	}
+	profileBody, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(profileBody, &normalizedProfile); err != nil {
+		t.Fatal(err)
+	}
+	if normalizedProfile.TierReasoningEffort.Lightweight != "low" || normalizedProfile.TierReasoningEffort.Powerful != "high" {
+		t.Fatalf("tier reasoning effort = %+v", normalizedProfile.TierReasoningEffort)
+	}
 
 	entry, ok := setup.lookupPublicModelEntry(profile.PublicID)
 	if !ok || entry == nil || entry.kind != publicEntryPolicy || entry.policyID != profile.ID {
@@ -152,8 +204,59 @@ func TestSchemaV2PolicyConfigCompilesTerminalAndPublicRegistries(t *testing.T) {
 	if raw.OwnedBy != "vekil-policy" || len(raw.SupportedEndpoints) != 1 || raw.SupportedEndpoints[0] != providerEndpointChatCompletions {
 		t.Fatalf("policy catalog contract = %+v", raw)
 	}
-	if raw.Capabilities.Limits.Context != 64000 || raw.Capabilities.Supports.Parallel || raw.Capabilities.Supports.Vision || strings.Join(raw.Capabilities.Supports.Reasoning, ",") != "medium" {
-		t.Fatalf("conservative capabilities = %+v", raw.Capabilities)
+	if raw.Capabilities.Limits.Context != 64000 || raw.Capabilities.Supports.Parallel || raw.Capabilities.Supports.Vision || len(raw.Capabilities.Supports.Reasoning) != 0 {
+		t.Fatalf("policy-owned capabilities = %+v", raw.Capabilities)
+	}
+	if strings.Contains(string(entry.contract.raw), "tier_reasoning_effort") {
+		t.Fatalf("policy catalog leaked private tier reasoning policy: %s", entry.contract.raw)
+	}
+}
+
+func TestPolicyTierReasoningEffortValidatesTerminalAllowlists(t *testing.T) {
+	base := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeOff)
+	base.ModelRoutes[0].ReasoningEffort = []string{"low", "medium"}
+	base.ModelRoutes[1].ReasoningEffort = []string{"high", "max"}
+
+	t.Run("normalizes independent tier values", func(t *testing.T) {
+		cfg, err := loadPolicyTierReasoningConfigForTest(t, base, " low ", " max ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(cfg.PolicyProfiles[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var profile struct {
+			TierReasoningEffort struct {
+				Lightweight string `json:"lightweight"`
+				Powerful    string `json:"powerful"`
+			} `json:"tier_reasoning_effort"`
+		}
+		if err := json.Unmarshal(body, &profile); err != nil {
+			t.Fatal(err)
+		}
+		if profile.TierReasoningEffort.Lightweight != "low" || profile.TierReasoningEffort.Powerful != "max" {
+			t.Fatalf("tier reasoning effort = %+v", profile.TierReasoningEffort)
+		}
+	})
+
+	for _, tc := range []struct {
+		name        string
+		lightweight any
+		powerful    any
+		want        string
+	}{
+		{name: "lightweight outside route allowlist", lightweight: "max", powerful: "max", want: "policy_profiles[0].tier_reasoning_effort.lightweight"},
+		{name: "powerful outside route allowlist", lightweight: "low", powerful: "low", want: "policy_profiles[0].tier_reasoning_effort.powerful"},
+		{name: "empty lightweight", lightweight: "", powerful: "max", want: "policy_profiles[0].tier_reasoning_effort.lightweight"},
+		{name: "null powerful", lightweight: "low", powerful: nil, want: "policy_profiles[0].tier_reasoning_effort.powerful"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadPolicyTierReasoningConfigForTest(t, base, tc.lightweight, tc.powerful)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadProvidersConfigFile() error = %v, want path %q", err, tc.want)
+			}
+		})
 	}
 }
 
