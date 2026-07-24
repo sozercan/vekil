@@ -147,8 +147,8 @@ func compilePolicyPublicModelEntries(cfg ProvidersConfig) ([]*publicModelEntry, 
 
 	entries := make([]*publicModelEntry, 0, len(validated.config.PolicyProfiles))
 	for profileIndex, profile := range validated.config.PolicyProfiles {
-		lightweight := routes[profile.LightweightRoute]
-		powerful := routes[profile.PowerfulRoute]
+		lightweight := routes[profile.Lightweight.Route]
+		powerful := routes[profile.Powerful.Route]
 		contract, err := derivePolicyPublicModelContract(profile, lightweight, powerful)
 		if err != nil {
 			return nil, configPathError(fmt.Sprintf("policy_profiles[%d]", profileIndex), "derive public model contract: %v", err)

@@ -192,7 +192,7 @@ func policyIntegrationConfig(lightURL, powerfulURL, profileMode string) Provider
 		},
 		PolicyProfiles: []PolicyProfileConfig{{
 			ID: "coding-policy", PublicID: "coding-economy", Mode: profileMode,
-			LightweightRoute: "light-route", PowerfulRoute: "power-route",
+			Lightweight: PolicyTierConfig{Route: "light-route"}, Powerful: PolicyTierConfig{Route: "power-route"},
 			BaselineTier: policyConfigTierLightweight, ClassifierUnavailableTier: policyConfigTierLightweight, ClassifierUncertainTier: policyConfigTierPowerful,
 			Classifier: PolicyClassifierConfig{Route: "classifier-route", Profile: policyConfigClassifierProfileCodingAgentV1, TimeoutMS: 1000, MaxCompletionTokens: 64, MaxRequestBytes: 4096, RecentTurns: 2, MaxConcurrency: 2, ObserveSampleRate: 1},
 			DataPolicy: PolicyDataPolicyConfig{ContentForwardingAcknowledged: true},
@@ -273,7 +273,8 @@ func TestPolicyRoutingEnforceSelectsPowerfulAndPreservesPublicIdentity(t *testin
 	cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)
 	cfg.ModelRoutes[0].ReasoningEffort = []string{"low"}
 	cfg.ModelRoutes[1].ReasoningEffort = []string{"max"}
-	cfg.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "max"}
+	cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = "low"
+	cfg.PolicyProfiles[0].Powerful.ReasoningEffort = "max"
 	h, err := NewProxyHandler(nil, nil,
 		WithProvidersConfig(cfg),
 		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
@@ -488,7 +489,8 @@ func TestPolicyRoutingAppliesProfileTierReasoningEffort(t *testing.T) {
 			cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)
 			cfg.ModelRoutes[0].ReasoningEffort = []string{"low", "medium"}
 			cfg.ModelRoutes[1].ReasoningEffort = []string{"medium", "max"}
-			cfg.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "max"}
+			cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = "low"
+			cfg.PolicyProfiles[0].Powerful.ReasoningEffort = "max"
 			cfg.PolicyProfiles[0].BaselineTier = tc.baselineTier
 
 			h, err := NewProxyHandler(nil, nil,
@@ -534,7 +536,8 @@ func TestPolicyRoutingFailoverRetainsSelectedProfileTierReasoningEffort(t *testi
 	secondary := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
 	cfg := policyIntegrationConfig(primary.server.URL, secondary.server.URL, policyConfigModeOff)
 	cfg.ModelRoutes[0].ReasoningEffort = []string{"low"}
-	cfg.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "low"}
+	cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = "low"
+	cfg.PolicyProfiles[0].Powerful.ReasoningEffort = "low"
 	cfg.ModelRoutes[0].Targets = append(cfg.ModelRoutes[0].Targets, ModelRouteTargetConfig{
 		ID: "light-secondary", Provider: "power-provider", UpstreamModel: "light-failover-model",
 	})
@@ -687,7 +690,8 @@ func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
 			cfg.ModelRoutes[routeIndex].Targets[targetIndex].Provider = "copilot"
 		}
 	}
-	cfg.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "max"}
+	cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = "low"
+	cfg.PolicyProfiles[0].Powerful.ReasoningEffort = "max"
 	cfg.PolicyProfiles[0].DataPolicy.AllowProviderRetention = true
 
 	h, err := NewProxyHandler(
@@ -1536,7 +1540,8 @@ func TestPolicyRoutingRejectsMalformedClientReasoningBeforeTerminalSend(t *testi
 			cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)
 			cfg.ModelRoutes[0].ReasoningEffort = []string{"low"}
 			cfg.ModelRoutes[1].ReasoningEffort = []string{"max"}
-			cfg.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "max"}
+			cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = "low"
+			cfg.PolicyProfiles[0].Powerful.ReasoningEffort = "max"
 			h, err := NewProxyHandler(nil, nil, WithProvidersConfig(cfg), WithPolicyRoutingMode(PolicyRoutingModeOff))
 			if err != nil {
 				t.Fatal(err)

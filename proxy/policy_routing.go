@@ -78,13 +78,13 @@ func (p *compiledPolicyProfile) routeForTier(tier policyTier) *modelRoute {
 }
 
 func (p *compiledPolicyProfile) reasoningEffortForTier(tier policyTier) string {
-	if p == nil || p.config.TierReasoningEffort == nil {
+	if p == nil || !policyProfileControlsReasoning(p.config) {
 		return ""
 	}
 	if tier == policyTierPowerful {
-		return p.config.TierReasoningEffort.Powerful
+		return p.config.Powerful.ReasoningEffort
 	}
-	return p.config.TierReasoningEffort.Lightweight
+	return p.config.Lightweight.ReasoningEffort
 }
 
 type chatPolicyRoutingController struct {
@@ -130,13 +130,13 @@ func newChatPolicyRoutingController(h *ProxyHandler, cfg ProvidersConfig, global
 		if !ok || entry == nil || entry.kind != publicEntryPolicy {
 			return nil, configPathError(fmt.Sprintf("policy_profiles[%d].public_id", index), "compiled public policy entry %q is unavailable", profileCfg.PublicID)
 		}
-		lightweight, ok := setup.lookupTerminalRoute(profileCfg.LightweightRoute)
+		lightweight, ok := setup.lookupTerminalRoute(profileCfg.Lightweight.Route)
 		if !ok || lightweight == nil {
-			return nil, configPathError(fmt.Sprintf("policy_profiles[%d].lightweight_route", index), "compiled terminal route %q is unavailable", profileCfg.LightweightRoute)
+			return nil, configPathError(fmt.Sprintf("policy_profiles[%d].lightweight.route", index), "compiled terminal route %q is unavailable", profileCfg.Lightweight.Route)
 		}
-		powerful, ok := setup.lookupTerminalRoute(profileCfg.PowerfulRoute)
+		powerful, ok := setup.lookupTerminalRoute(profileCfg.Powerful.Route)
 		if !ok || powerful == nil {
-			return nil, configPathError(fmt.Sprintf("policy_profiles[%d].powerful_route", index), "compiled terminal route %q is unavailable", profileCfg.PowerfulRoute)
+			return nil, configPathError(fmt.Sprintf("policy_profiles[%d].powerful.route", index), "compiled terminal route %q is unavailable", profileCfg.Powerful.Route)
 		}
 		classifierRoute, ok := setup.lookupTerminalRoute(profileCfg.Classifier.Route)
 		if !ok || classifierRoute == nil {
@@ -442,7 +442,7 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 	if err != nil {
 		return chatOperationPlan{}, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("policy model %q supports text and standard function tools only: %w", entry.id, err)}
 	}
-	if err := validatePolicyPublicRequestContract(input.OriginalBody, profile.entry.contract, profile.config.TierReasoningEffort != nil); err != nil {
+	if err := validatePolicyPublicRequestContract(input.OriginalBody, profile.entry.contract, policyProfileControlsReasoning(profile.config)); err != nil {
 		return chatOperationPlan{}, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("policy model %q request is outside its public contract: %w", entry.id, err)}
 	}
 	if err := ctx.Err(); err != nil {

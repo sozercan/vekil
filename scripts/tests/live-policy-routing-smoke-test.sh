@@ -663,7 +663,8 @@ assert_generated_config() {
       and (.model_routes[] | select(.id == "live-semantic-powerful").reasoning_effort) == [$powerful_effort]
       and ([.model_routes[] | select(has("default_reasoning_effort"))] | length) == 0
       and .policy_profiles[0].public_id == $public_model
-      and .policy_profiles[0].tier_reasoning_effort == {lightweight:$lightweight_effort,powerful:$powerful_effort}
+      and .policy_profiles[0].lightweight == {route:"live-semantic-lightweight",reasoning_effort:$lightweight_effort}
+      and .policy_profiles[0].powerful == {route:"live-semantic-powerful",reasoning_effort:$powerful_effort}
       and .policy_profiles[0].baseline_tier == "lightweight"
       and .policy_profiles[0].classifier_unavailable_tier == "lightweight"
       and .policy_profiles[0].classifier_uncertain_tier == "powerful"

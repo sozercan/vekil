@@ -130,21 +130,23 @@ These fields are operator acknowledgements and capability declarations. They do 
 A policy profile binds:
 
 - a public identity: `id`, `public_id`, and optional `name`/picker metadata;
-- the `lightweight_route` and `powerful_route` terminal IDs;
-- an optional policy-owned `tier_reasoning_effort` map;
+- required `lightweight` and `powerful` objects pairing each terminal `route` with optional `reasoning_effort`;
 - `baseline_tier`, `classifier_unavailable_tier`, and `classifier_uncertain_tier`;
 - one internal classifier route plus the built-in classifier profile and bounds; and
 - mandatory data-policy acknowledgements.
 
-The tier reasoning map is policy-owned execution configuration:
+Tier reasoning is policy-owned execution configuration:
 
 ```yaml
-tier_reasoning_effort:
-  lightweight: low
-  powerful: max
+lightweight:
+  route: lightweight-route
+  reasoning_effort: low
+powerful:
+  route: powerful-route
+  reasoning_effort: max
 ```
 
-The block is optional as a whole. When present, both values are required, are trimmed but otherwise case-sensitive, and must be non-empty. `lightweight` must appear in the referenced lightweight route's `reasoning_effort` allowlist, and `powerful` must appear in the referenced powerful route's allowlist. A shared terminal route may serve both tiers only when its allowlist contains both configured values. Route allowlists describe terminal capability; a mapped profile chooses the value used for each policy decision.
+`reasoning_effort` is optional only as a pair: both tier objects configure it, or both omit it. Each value must appear in its tier route's `model_routes[].reasoning_effort` allowlist.
 
 The v1 defaults are economy-oriented:
 
@@ -188,7 +190,7 @@ Validation also rejects:
 - public/operational ID collisions in their applicable namespaces;
 - public metadata on an internal route;
 - recursive policy references;
-- a null or non-object `tier_reasoning_effort`, or a present block with missing, empty, null, or unknown tier fields;
+- a null or non-object tier `reasoning_effort`, or a present block with missing, empty, null, or unknown tier fields;
 - a tier reasoning value absent from its referenced terminal route's `reasoning_effort` allowlist;
 - destination routes without `/chat/completions` or `/responses` Chat execution support;
 - unsupported provider families or dynamic providers other than pinned `type: copilot` targets;
@@ -368,7 +370,7 @@ A policy profile appears exactly once in `/v1/models` with:
 
 Both destinations must accept the same published Chat semantics. Per-target wire adaptations may differ only when they do not alter that public contract.
 
-`model_routes[].reasoning_effort` remains each terminal route's capability allowlist. An optional `policy_profiles[].tier_reasoning_effort` block selects one allowed value for each tier. For a mapped profile, the planner seals the selected route and its configured effort together; request preparation then writes that value into canonical Chat before native-Chat or Chat-over-Responses execution. Every target attempt inside the selected route is rebuilt with the same sealed effort, while policy fallback never crosses tiers. An unmapped profile injects no effort.
+`model_routes[].reasoning_effort` remains each terminal route's capability allowlist. An optional the `lightweight` and `powerful` tier objects selects one allowed value for each tier. For a mapped profile, the planner seals the selected route and its configured effort together; request preparation then writes that value into canonical Chat before native-Chat or Chat-over-Responses execution. Every target attempt inside the selected route is rebuilt with the same sealed effort, while policy fallback never crosses tiers. An unmapped profile injects no effort.
 
 For a mapped profile, the selected tier effort is authoritative. A caller-supplied OpenAI Chat `reasoning_effort`, Anthropic `output_config.effort`, or Responses `reasoning.effort` is accepted and normalized into canonical Chat for compatibility, but the selected profile value replaces it after classification. Client effort cannot force a tier or override the profile. For an unmapped profile, an incoming effort is rejected as unsupported; an omitted effort proceeds without a policy-owned override. Direct non-policy routes retain their ordinary client-controlled reasoning behavior.
 

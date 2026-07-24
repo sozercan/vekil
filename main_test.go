@@ -1893,8 +1893,10 @@ policy_profiles:
   - id: policy-launch
     public_id: policy-launch-test
     mode: %s
-    lightweight_route: light-route
-    powerful_route: power-route
+    lightweight:
+      route: light-route
+    powerful:
+      route: power-route
     classifier: {route: classifier-route}
     data_policy: {content_forwarding_acknowledged: true}
 `, upstream.URL, tc.profileMode)
@@ -1962,8 +1964,10 @@ policy_profiles:
   - id: policy-launch
     public_id: policy-launch-test
     mode: off
-    lightweight_route: light-route
-    powerful_route: power-route
+    lightweight:
+      route: light-route
+    powerful:
+      route: power-route
     classifier: {route: classifier-route}
     data_policy: {content_forwarding_acknowledged: true}
 `
@@ -2001,8 +2005,10 @@ policy_profiles:
   - id: policy-launch
     public_id: policy-launch-test
     mode: off
-    lightweight_route: light-route
-    powerful_route: power-route
+    lightweight:
+      route: light-route
+    powerful:
+      route: power-route
     classifier: {route: classifier-route}
     data_policy:
       content_forwarding_acknowledged: true

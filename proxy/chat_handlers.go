@@ -1349,7 +1349,7 @@ func (h *ProxyHandler) executeRoutedChatCompletions(ctx context.Context, body []
 // forcePolicyOpenAIChatReasoningEffort applies the policy-selected tier value
 // to canonical Chat before native-Chat versus Responses-backed execution is
 // chosen. Replacing an incoming value is deliberate: policy profiles that set
-// tier_reasoning_effort, rather than the client harness, own reasoning policy.
+// tier reasoning_effort, rather than the client harness, owns reasoning policy.
 func forcePolicyOpenAIChatReasoningEffort(body []byte, effort string) ([]byte, error) {
 	effort = strings.TrimSpace(effort)
 	if effort == "" {

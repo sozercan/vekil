@@ -260,7 +260,8 @@ func TestHandleAnthropicMessagesPolicyIngressUsesProfileTierReasoningEffort(t *t
 			cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)
 			cfg.ModelRoutes[0].ReasoningEffort = []string{"low"}
 			cfg.ModelRoutes[1].ReasoningEffort = []string{"max"}
-			cfg.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "max"}
+			cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = "low"
+			cfg.PolicyProfiles[0].Powerful.ReasoningEffort = "max"
 
 			h, err := NewProxyHandler(nil, logger.NewWithWriter(logger.LevelError, io.Discard),
 				WithProvidersConfig(cfg),
@@ -289,7 +290,8 @@ func TestHandleAnthropicMessagesPolicyIngressOverridesEffortOutsideRouteIntersec
 	cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)
 	cfg.ModelRoutes[0].ReasoningEffort = []string{"low"}
 	cfg.ModelRoutes[1].ReasoningEffort = []string{"max"}
-	cfg.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "max"}
+	cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = "low"
+	cfg.PolicyProfiles[0].Powerful.ReasoningEffort = "max"
 
 	h, err := NewProxyHandler(nil, logger.NewWithWriter(logger.LevelError, io.Discard),
 		WithProvidersConfig(cfg),

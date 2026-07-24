@@ -66,8 +66,10 @@ policy_profiles:
   - id: policy
     public_id: policy
     mode: enforce
-    lightweight_route: light-route
-    powerful_route: power-route
+    lightweight:
+      route: light-route
+    powerful:
+      route: power-route
     classifier: {route: classifier-route}
     data_policy: {content_forwarding_acknowledged: true}
 `

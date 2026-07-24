@@ -90,15 +90,16 @@ policy_profiles:
     public_id: gpt-5.6-semantic
     name: GPT-5.6 Semantic
     mode: enforce
-    lightweight_route: semantic-lightweight-gpt-5-6-luna-route
-    powerful_route: semantic-powerful-gpt-5-6-sol-route
+    lightweight:
+      route: semantic-lightweight-gpt-5-6-luna-route
+      reasoning_effort: low
+    powerful:
+      route: semantic-powerful-gpt-5-6-sol-route
+      reasoning_effort: max
     # Optional as a whole. When present, both values are required and must
     # appear in the corresponding terminal route's reasoning_effort allowlist.
     # Incoming Claude/Codex effort is accepted for this mapped profile, then the
     # classifier-selected tier value replaces it before terminal execution.
-    tier_reasoning_effort:
-      lightweight: low
-      powerful: max
     classifier:
       route: semantic-classifier-gpt-5-6-sol-route
       timeout_ms: 10000

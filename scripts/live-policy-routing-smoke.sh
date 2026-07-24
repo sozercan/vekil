@@ -1007,12 +1007,14 @@ config = {
             "mode": "enforce",
             "model_picker_enabled": True,
             "model_picker_category": "versatile",
-	            "lightweight_route": "live-semantic-lightweight",
-	            "powerful_route": "live-semantic-powerful",
-	            "tier_reasoning_effort": {
-	                "lightweight": os.environ["LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT"],
-	                "powerful": os.environ["LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT"],
-	            },
+            "lightweight": {
+                "route": "live-semantic-lightweight",
+                "reasoning_effort": os.environ["LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT"],
+            },
+            "powerful": {
+                "route": "live-semantic-powerful",
+                "reasoning_effort": os.environ["LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT"],
+            },
             "baseline_tier": "lightweight",
             "classifier_unavailable_tier": "lightweight",
             "classifier_uncertain_tier": "powerful",
@@ -1057,11 +1059,16 @@ if classifier_provider.get("classifier_no_store_supported") is not expected_no_s
     raise SystemExit("generated config has the wrong classifier_no_store_supported value")
 if profile["data_policy"].get("allow_provider_retention") is not expected_retention:
     raise SystemExit("generated config has the wrong allow_provider_retention value")
-if profile.get("tier_reasoning_effort") != {
-    "lightweight": expected_lightweight_effort,
-    "powerful": expected_powerful_effort,
+if profile.get("lightweight") != {
+    "route": "live-semantic-lightweight",
+    "reasoning_effort": expected_lightweight_effort,
 }:
-    raise SystemExit("generated config has the wrong tier_reasoning_effort values")
+    raise SystemExit("generated config has the wrong lightweight tier")
+if profile.get("powerful") != {
+    "route": "live-semantic-powerful",
+    "reasoning_effort": expected_powerful_effort,
+}:
+    raise SystemExit("generated config has the wrong powerful tier")
 routes = {route["id"]: route for route in config["model_routes"]}
 if routes["live-semantic-lightweight"].get("reasoning_effort") != [expected_lightweight_effort]:
     raise SystemExit("generated config has the wrong lightweight reasoning_effort allowlist")

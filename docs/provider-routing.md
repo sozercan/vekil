@@ -137,7 +137,7 @@ Catalog metadata belongs to the route, not to whichever target answered last. Ex
 
 Request-policy fields are intentionally narrow. `model_routes[].reasoning_effort` is a route capability allowlist and, for a direct public route, catalog metadata; it does not inject a value. There is no route-level reasoning default.
 
-Policy profiles may instead opt into policy-owned reasoning by configuring the whole `tier_reasoning_effort` block. Omission preserves ordinary policy execution with no injected effort and rejects an incoming effort as unsupported. When the block is present, both `lightweight` and `powerful` are required, each must name a value in its corresponding terminal route's allowlist, and the selected tier value replaces any incoming OpenAI Chat, Anthropic, or Responses effort before native-Chat or Chat-over-Responses execution. The sealed value is rebuilt identically for every target attempt, so failover inside the selected route cannot change it. Policy public catalog metadata never advertises client-selectable reasoning effort, whether or not the block is configured.
+Policy profiles may instead opt into policy-owned reasoning by configuring the whole tier objects. Omission preserves ordinary policy execution with no injected effort and rejects an incoming effort as unsupported. When the block is present, both `lightweight` and `powerful` are required, each must name a value in its corresponding terminal route's allowlist, and the selected tier value replaces any incoming OpenAI Chat, Anthropic, or Responses effort before native-Chat or Chat-over-Responses execution. The sealed value is rebuilt identically for every target attempt, so failover inside the selected route cannot change it. Policy public catalog metadata never advertises client-selectable reasoning effort, whether or not the block is configured.
 
 For example, terminal routes declare capability while the profile owns the selected values:
 
@@ -154,11 +154,12 @@ model_routes:
 
 policy_profiles:
   - id: semantic-policy
-    lightweight_route: lightweight-route
-    powerful_route: powerful-route
-    tier_reasoning_effort:
-      lightweight: low
-      powerful: max
+	lightweight:
+	  route: lightweight-route
+	  reasoning_effort: low
+	powerful:
+	  route: powerful-route
+	  reasoning_effort: max
     # classifier/data_policy: ...
 ```
 

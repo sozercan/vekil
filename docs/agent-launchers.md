@@ -173,7 +173,7 @@ path does not change terminal endpoint ownership.
 Claude's `output_config.effort` is carried into canonical Chat
 `reasoning_effort`. Direct routes preserve supported client effort. A policy
 profile never advertises client-selectable reasoning effort: an incoming value
-is accepted only when that profile configures `tier_reasoning_effort`, and the
+is accepted only when that profile configures tier `reasoning_effort`, and the
 classifier-selected `lightweight` or `powerful` value then replaces it. If the
 tier block is omitted, an incoming effort is rejected as unsupported and an
 omitted effort proceeds without a policy-owned override. Current Claude releases
@@ -245,7 +245,7 @@ narrower terminal must reduce the enabled client catalog.
 
 Policy-owned models never advertise client-selectable reasoning effort. If
 Codex sends `reasoning.effort`, Vekil accepts it only for a profile with
-`tier_reasoning_effort`; the classifier-selected tier value then replaces it.
+tier `reasoning_effort`; the classifier-selected tier value then replaces it.
 An unmapped profile rejects incoming effort as unsupported and injects no effort
 when the field is omitted.
 

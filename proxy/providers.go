@@ -1902,17 +1902,17 @@ func (ps *providerSetup) resolveReservedModelIdentity(model string) (*providerRu
 	var route *modelRoute
 	if entry, ok := ps.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
 		profile := entry.policyConfig
-		routeID := profile.LightweightRoute
+		routeID := profile.Lightweight.Route
 		if profile.BaselineTier == policyConfigTierPowerful {
-			routeID = profile.PowerfulRoute
+			routeID = profile.Powerful.Route
 		}
 		route, _ = ps.lookupTerminalRoute(routeID)
 	} else if registry := ps.routeRegistry(); registry != nil && registry.publicEntries != nil {
 		if entry, ok := registry.publicEntries.lookupPolicyID(model); ok && entry != nil {
 			profile := entry.policyConfig
-			routeID := profile.LightweightRoute
+			routeID := profile.Lightweight.Route
 			if profile.BaselineTier == policyConfigTierPowerful {
-				routeID = profile.PowerfulRoute
+				routeID = profile.Powerful.Route
 			}
 			route, _ = ps.lookupTerminalRoute(routeID)
 		} else {
@@ -2025,19 +2025,19 @@ func (h *ProxyHandler) policyEntryRequiredRoutesForSetup(entry *publicModelEntry
 		switch effectiveMode {
 		case policyModeOff:
 			if profile.BaselineTier == policyConfigTierPowerful {
-				routeIDs = append(routeIDs, profile.PowerfulRoute)
+				routeIDs = append(routeIDs, profile.Powerful.Route)
 			} else {
-				routeIDs = append(routeIDs, profile.LightweightRoute)
+				routeIDs = append(routeIDs, profile.Lightweight.Route)
 			}
 		case policyModeObserve:
 			if profile.BaselineTier == policyConfigTierPowerful {
-				routeIDs = append(routeIDs, profile.PowerfulRoute)
+				routeIDs = append(routeIDs, profile.Powerful.Route)
 			} else {
-				routeIDs = append(routeIDs, profile.LightweightRoute)
+				routeIDs = append(routeIDs, profile.Lightweight.Route)
 			}
 			routeIDs = append(routeIDs, profile.Classifier.Route)
 		case policyModeEnforce:
-			routeIDs = append(routeIDs, profile.LightweightRoute, profile.PowerfulRoute, profile.Classifier.Route)
+			routeIDs = append(routeIDs, profile.Lightweight.Route, profile.Powerful.Route, profile.Classifier.Route)
 		}
 		routes := make([]*modelRoute, 0, len(routeIDs))
 		for _, routeID := range routeIDs {

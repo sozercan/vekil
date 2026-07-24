@@ -85,8 +85,8 @@ func TestPolicyProfileAndClassifierGenerationsChangeWithRelevantInputs(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	lightweight, _ := setup.lookupTerminalRoute(validated.config.PolicyProfiles[0].LightweightRoute)
-	powerful, _ := setup.lookupTerminalRoute(validated.config.PolicyProfiles[0].PowerfulRoute)
+	lightweight, _ := setup.lookupTerminalRoute(validated.config.PolicyProfiles[0].Lightweight.Route)
+	powerful, _ := setup.lookupTerminalRoute(validated.config.PolicyProfiles[0].Powerful.Route)
 	profile := validated.config.PolicyProfiles[0]
 	firstProfile := policyProfileGeneration(profile, entries[0].contract, lightweight, powerful)
 	profile.Classifier.TimeoutMS++
@@ -111,14 +111,16 @@ func TestPolicyTierReasoningChangesConfigAndProfileGenerations(t *testing.T) {
 	cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeEnforce)
 	cfg.ModelRoutes[0].ReasoningEffort = []string{"low", "medium"}
 	cfg.ModelRoutes[1].ReasoningEffort = []string{"medium", "max"}
-	cfg.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: " low ", Powerful: " max "}
+	cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = " low "
+	cfg.PolicyProfiles[0].Powerful.ReasoningEffort = " max "
 
 	first := policyGenerationHashesForTest(t, cfg)
-	if cfg.PolicyProfiles[0].TierReasoningEffort.Lightweight != " low " || cfg.PolicyProfiles[0].TierReasoningEffort.Powerful != " max " {
-		t.Fatalf("generation hashing mutated source config: %+v", cfg.PolicyProfiles[0].TierReasoningEffort)
+	if cfg.PolicyProfiles[0].Lightweight.ReasoningEffort != " low " || cfg.PolicyProfiles[0].Powerful.ReasoningEffort != " max " {
+		t.Fatalf("generation hashing mutated source config: lightweight=%+v powerful=%+v", cfg.PolicyProfiles[0].Lightweight, cfg.PolicyProfiles[0].Powerful)
 	}
 	normalized := cloneProvidersConfigForValidation(cfg)
-	normalized.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "max"}
+	normalized.PolicyProfiles[0].Lightweight.ReasoningEffort = "low"
+	normalized.PolicyProfiles[0].Powerful.ReasoningEffort = "max"
 	if got := policyGenerationHashesForTest(t, normalized); got != first {
 		t.Fatalf("normalized-equivalent generation hashes = %q and %q", first, got)
 	}
@@ -128,7 +130,8 @@ func TestPolicyTierReasoningChangesConfigAndProfileGenerations(t *testing.T) {
 	}
 
 	powerfulChanged := cloneProvidersConfigForValidation(cfg)
-	powerfulChanged.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "low", Powerful: "medium"}
+	powerfulChanged.PolicyProfiles[0].Lightweight.ReasoningEffort = "low"
+	powerfulChanged.PolicyProfiles[0].Powerful.ReasoningEffort = "medium"
 	powerfulHashes := policyGenerationHashesForTest(t, powerfulChanged)
 	if first[0] == powerfulHashes[0] || first[1] == powerfulHashes[1] {
 		t.Fatal("powerful tier reasoning did not change config and profile generations")
@@ -138,7 +141,8 @@ func TestPolicyTierReasoningChangesConfigAndProfileGenerations(t *testing.T) {
 	}
 
 	lightweightChanged := cloneProvidersConfigForValidation(cfg)
-	lightweightChanged.PolicyProfiles[0].TierReasoningEffort = &PolicyTierReasoningEffortConfig{Lightweight: "medium", Powerful: "max"}
+	lightweightChanged.PolicyProfiles[0].Lightweight.ReasoningEffort = "medium"
+	lightweightChanged.PolicyProfiles[0].Powerful.ReasoningEffort = "max"
 	second := policyGenerationHashesForTest(t, lightweightChanged)
 	secondEntries, err := compilePolicyPublicModelEntries(lightweightChanged)
 	if err != nil {
@@ -229,11 +233,11 @@ func policyGenerationHashesForTest(t *testing.T, cfg ProvidersConfig) [3]string 
 		t.Fatalf("runtime classifier provider base URL = %q, want %q", got, wantRuntimeBaseURL)
 	}
 	profile := validated.config.PolicyProfiles[0]
-	lightweight, ok := setup.lookupTerminalRoute(profile.LightweightRoute)
+	lightweight, ok := setup.lookupTerminalRoute(profile.Lightweight.Route)
 	if !ok {
 		t.Fatal("lightweight route not found")
 	}
-	powerful, ok := setup.lookupTerminalRoute(profile.PowerfulRoute)
+	powerful, ok := setup.lookupTerminalRoute(profile.Powerful.Route)
 	if !ok {
 		t.Fatal("powerful route not found")
 	}

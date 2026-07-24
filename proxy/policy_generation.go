@@ -53,8 +53,8 @@ func policyProfileGeneration(profile PolicyProfileConfig, contract publicModelCo
 			UseMaxCompletionTokens: contract.policy.useMaxCompletionTokens,
 		},
 		Routes: []policyProfileRouteGeneration{
-			policyProfileRouteGenerationValue(lightweight, profile.LightweightRoute),
-			policyProfileRouteGenerationValue(powerful, profile.PowerfulRoute),
+			policyProfileRouteGenerationValue(lightweight, profile.Lightweight.Route),
+			policyProfileRouteGenerationValue(powerful, profile.Powerful.Route),
 		},
 	})
 }

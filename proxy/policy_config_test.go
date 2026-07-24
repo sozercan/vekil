@@ -57,11 +57,12 @@ model_routes:
 policy_profiles:
   - id: coding-policy
     public_id: coding-policy-20260717
-    lightweight_route: light-route
-    powerful_route: powerful-route
-    tier_reasoning_effort:
-      lightweight: low
-      powerful: high
+    lightweight:
+      route: light-route
+      reasoning_effort: low
+    powerful:
+      route: powerful-route
+      reasoning_effort: high
     classifier:
       route: classifier-route
       recent_turns: 0
@@ -89,10 +90,10 @@ func loadPolicyTierReasoningConfigForTest(t *testing.T, cfg ProvidersConfig, lig
 	if !ok {
 		t.Fatal("policy profile fixture is not an object")
 	}
-	profile["tier_reasoning_effort"] = map[string]any{
-		"lightweight": lightweight,
-		"powerful":    powerful,
-	}
+	lightTier := profile["lightweight"].(map[string]any)
+	powerTier := profile["powerful"].(map[string]any)
+	lightTier["reasoning_effort"] = lightweight
+	powerTier["reasoning_effort"] = powerful
 	body, err = json.Marshal(document)
 	if err != nil {
 		t.Fatalf("marshal tier reasoning fixture: %v", err)
@@ -148,10 +149,8 @@ func TestSchemaV2PolicyConfigCompilesTerminalAndPublicRegistries(t *testing.T) {
 		}
 	}
 	var normalizedProfile struct {
-		TierReasoningEffort struct {
-			Lightweight string `json:"lightweight"`
-			Powerful    string `json:"powerful"`
-		} `json:"tier_reasoning_effort"`
+		Lightweight PolicyTierConfig `json:"lightweight"`
+		Powerful    PolicyTierConfig `json:"powerful"`
 	}
 	profileBody, err := json.Marshal(profile)
 	if err != nil {
@@ -160,8 +159,8 @@ func TestSchemaV2PolicyConfigCompilesTerminalAndPublicRegistries(t *testing.T) {
 	if err := json.Unmarshal(profileBody, &normalizedProfile); err != nil {
 		t.Fatal(err)
 	}
-	if normalizedProfile.TierReasoningEffort.Lightweight != "low" || normalizedProfile.TierReasoningEffort.Powerful != "high" {
-		t.Fatalf("tier reasoning effort = %+v", normalizedProfile.TierReasoningEffort)
+	if normalizedProfile.Lightweight.ReasoningEffort != "low" || normalizedProfile.Powerful.ReasoningEffort != "high" {
+		t.Fatalf("tier objects = lightweight:%+v powerful:%+v", normalizedProfile.Lightweight, normalizedProfile.Powerful)
 	}
 
 	entry, ok := setup.lookupPublicModelEntry(profile.PublicID)
@@ -207,7 +206,7 @@ func TestSchemaV2PolicyConfigCompilesTerminalAndPublicRegistries(t *testing.T) {
 	if raw.Capabilities.Limits.Context != 64000 || raw.Capabilities.Supports.Parallel || raw.Capabilities.Supports.Vision || len(raw.Capabilities.Supports.Reasoning) != 0 {
 		t.Fatalf("policy-owned capabilities = %+v", raw.Capabilities)
 	}
-	if strings.Contains(string(entry.contract.raw), "tier_reasoning_effort") {
+	if strings.Contains(string(entry.contract.raw), "reasoning_effort") {
 		t.Fatalf("policy catalog leaked private tier reasoning policy: %s", entry.contract.raw)
 	}
 }
@@ -227,16 +226,14 @@ func TestPolicyTierReasoningEffortValidatesTerminalAllowlists(t *testing.T) {
 			t.Fatal(err)
 		}
 		var profile struct {
-			TierReasoningEffort struct {
-				Lightweight string `json:"lightweight"`
-				Powerful    string `json:"powerful"`
-			} `json:"tier_reasoning_effort"`
+			Lightweight PolicyTierConfig `json:"lightweight"`
+			Powerful    PolicyTierConfig `json:"powerful"`
 		}
 		if err := json.Unmarshal(body, &profile); err != nil {
 			t.Fatal(err)
 		}
-		if profile.TierReasoningEffort.Lightweight != "low" || profile.TierReasoningEffort.Powerful != "max" {
-			t.Fatalf("tier reasoning effort = %+v", profile.TierReasoningEffort)
+		if profile.Lightweight.ReasoningEffort != "low" || profile.Powerful.ReasoningEffort != "max" {
+			t.Fatalf("tier objects = lightweight:%+v powerful:%+v", profile.Lightweight, profile.Powerful)
 		}
 	})
 
@@ -246,10 +243,10 @@ func TestPolicyTierReasoningEffortValidatesTerminalAllowlists(t *testing.T) {
 		powerful    any
 		want        string
 	}{
-		{name: "lightweight outside route allowlist", lightweight: "max", powerful: "max", want: "policy_profiles[0].tier_reasoning_effort.lightweight"},
-		{name: "powerful outside route allowlist", lightweight: "low", powerful: "low", want: "policy_profiles[0].tier_reasoning_effort.powerful"},
-		{name: "empty lightweight", lightweight: "", powerful: "max", want: "policy_profiles[0].tier_reasoning_effort.lightweight"},
-		{name: "null powerful", lightweight: "low", powerful: nil, want: "policy_profiles[0].tier_reasoning_effort.powerful"},
+		{name: "lightweight outside route allowlist", lightweight: "max", powerful: "max", want: "policy_profiles[0].lightweight.reasoning_effort"},
+		{name: "powerful outside route allowlist", lightweight: "low", powerful: "low", want: "policy_profiles[0].powerful.reasoning_effort"},
+		{name: "empty lightweight", lightweight: "", powerful: "max", want: "policy_profiles[0].lightweight.reasoning_effort"},
+		{name: "null powerful", lightweight: "low", powerful: nil, want: "policy_profiles[0].powerful.reasoning_effort"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := loadPolicyTierReasoningConfigForTest(t, base, tc.lightweight, tc.powerful)
@@ -530,7 +527,7 @@ func TestPolicyClassifierZeroValidFieldsRejectNull(t *testing.T) {
 		{
 			name: "json recent turns",
 			ext:  ".json",
-			body: `{"schema_version":2,"providers":[{"id":"p","type":"openai-compatible","base_url":"https://example.test","auth_type":"none","trust_domain":"org","classifier_no_store_supported":true}],"model_routes":[{"id":"l","exposure":"internal","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"l"}]},{"id":"h","exposure":"internal","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"h"}]},{"id":"c","exposure":"internal","internal_purpose":"policy_classifier","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"c"}]}],"policy_profiles":[{"id":"policy","public_id":"policy","lightweight_route":"l","powerful_route":"h","classifier":{"route":"c","recent_turns":null},"data_policy":{"content_forwarding_acknowledged":true}}]}`,
+			body: `{"schema_version":2,"providers":[{"id":"p","type":"openai-compatible","base_url":"https://example.test","auth_type":"none","trust_domain":"org","classifier_no_store_supported":true}],"model_routes":[{"id":"l","exposure":"internal","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"l"}]},{"id":"h","exposure":"internal","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"h"}]},{"id":"c","exposure":"internal","internal_purpose":"policy_classifier","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"c"}]}],"policy_profiles":[{"id":"policy","public_id":"policy","lightweight":{"route":"l"},"powerful":{"route":"h"},"classifier":{"route":"c","recent_turns":null},"data_policy":{"content_forwarding_acknowledged":true}}]}`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -571,8 +568,10 @@ model_routes:
 policy_profiles:
   - id: policy-one
     public_id: policy-one
-    lightweight_route: light-route
-    powerful_route: power-route
+    lightweight:
+      route: light-route
+    powerful:
+      route: power-route
     classifier: &shared_classifier
       route: classifier-route
       recent_turns: 0
@@ -580,8 +579,10 @@ policy_profiles:
     data_policy: {content_forwarding_acknowledged: true}
   - id: policy-two
     public_id: policy-two
-    lightweight_route: light-route
-    powerful_route: power-route
+    lightweight:
+      route: light-route
+    powerful:
+      route: power-route
     classifier: *shared_classifier
     data_policy: {content_forwarding_acknowledged: true}
 `
