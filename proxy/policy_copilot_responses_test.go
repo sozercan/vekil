@@ -1047,6 +1047,37 @@ func TestPolicyCopilotSynchronousValidationFiltersUnrelatedCatalogModels(t *test
 	}
 }
 
+func TestPolicyCopilotSynchronousValidationSkipsUnrelatedDynamicProviders(t *testing.T) {
+	copilot := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{})
+	unrelatedCalls := 0
+	unrelated := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		unrelatedCalls++
+		http.Error(w, "unrelated provider must not be queried", http.StatusInternalServerError)
+	}))
+	defer unrelated.Close()
+	cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+	cfg.Providers = append(cfg.Providers, ProviderConfig{
+		ID: "unrelated", Type: "openai-compatible", BaseURL: unrelated.URL,
+		AuthType: "none", ModelDiscovery: "openai", TrustDomain: "other",
+	})
+
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("fixture-token"),
+		nil,
+		WithCopilotBaseURL(copilot.server.URL),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("gpt-5.6-semantic"),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() contacted an unrelated dynamic provider: %v", err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	if unrelatedCalls != 0 {
+		t.Fatalf("unrelated dynamic provider calls = %d, want 0", unrelatedCalls)
+	}
+}
+
 func TestPolicyResponsesContractRejectsBeforeClassifierDispatch(t *testing.T) {
 	tests := []struct {
 		name  string

@@ -792,6 +792,9 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 			}
 			continue
 		}
+		if !h.providerMayExposeAllowedModelForSetup(setup, provider) {
+			continue
+		}
 
 		result, err := h.fetchProviderModels(ctx, provider, "", "")
 		if err != nil {
@@ -969,7 +972,7 @@ func (h *ProxyHandler) providerRequiredWithoutAllowedScope(setup *providerSetup,
 		}
 	}
 	for _, entry := range snapshot.policyEntries {
-		if h.policyEntryReferencesProvider(entry, provider) {
+		if h.policyEntryReferencesProviderForSetup(entry, provider, setup) {
 			return true
 		}
 	}
@@ -982,10 +985,13 @@ func (h *ProxyHandler) providerRequiredWithoutAllowedScope(setup *providerSetup,
 // selected model is trusted. Policy owners include only providers referenced by
 // their terminal/classifier routes; unrelated providers remain out of scope.
 func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) bool {
-	if provider == nil {
+	return h.providerMayExposeAllowedModelForSetup(h.providerSetup(), provider)
+}
+
+func (h *ProxyHandler) providerMayExposeAllowedModelForSetup(setup *providerSetup, provider *providerRuntime) bool {
+	if h == nil || setup == nil || provider == nil {
 		return false
 	}
-	setup := h.providerSetup()
 	if len(h.allowedModels) == 0 {
 		if !providerUsesDynamicModels(provider) || providerHasPublicDynamicModels(provider) {
 			return true
@@ -994,7 +1000,7 @@ func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) 
 	}
 	for model := range h.allowedModels {
 		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
-			if h.policyEntryReferencesProvider(entry, provider) {
+			if h.policyEntryReferencesProviderForSetup(entry, provider, setup) {
 				return true
 			}
 			// A policy public ID is an explicit reserved owner in launcher scope.
@@ -2049,10 +2055,14 @@ func (h *ProxyHandler) policyEntryRequiredRoutesForSetup(entry *publicModelEntry
 }
 
 func (h *ProxyHandler) policyEntryReferencesProvider(entry *publicModelEntry, provider *providerRuntime) bool {
-	if provider == nil {
+	return h.policyEntryReferencesProviderForSetup(entry, provider, h.providerSetup())
+}
+
+func (h *ProxyHandler) policyEntryReferencesProviderForSetup(entry *publicModelEntry, provider *providerRuntime, setup *providerSetup) bool {
+	if provider == nil || setup == nil {
 		return false
 	}
-	for _, route := range h.policyEntryRequiredRoutes(entry) {
+	for _, route := range h.policyEntryRequiredRoutesForSetup(entry, setup) {
 		if route == nil {
 			continue
 		}
