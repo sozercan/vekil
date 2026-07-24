@@ -101,6 +101,7 @@ pathlib.Path(os.environ["FAKE_BRIDGE_CHILD_PID_FILE"]).write_text(str(child.pid)
 models = [
     {"id": "gpt-5.4-mini", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low"]}}},
     {"id": "gpt-5.4", "supported_endpoints": ["/chat/completions", "/responses"], "capabilities": {"supports": {"reasoning_effort": ["low", "high"]}}},
+    {"id": "gemini-3.1-pro-preview", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high"]}}},
     {"id": "gpt-4.1", "supported_endpoints": ["/chat/completions"]},
     {"id": "claude-sonnet-4.6", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high", "max"]}}},
     {"id": "claude-opus-4.6", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high", "max"]}}},
@@ -169,7 +170,7 @@ set -euo pipefail
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL}" == "gpt-5.4-mini" ]]
 [[ "${LIVE_POLICY_ROUTING_CLASSIFIER_MODEL}" == "gpt-4.1" ]]
 [[ "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL}" == "gpt-5.4" ]]
-[[ "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL}" == "claude-sonnet-4.6" ]]
+[[ "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL}" == "gemini-3.1-pro-preview" ]]
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT}" == "low" ]]
 [[ "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT}" == "high" ]]
 [[ "${LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED}" == "false" ]]
@@ -220,7 +221,7 @@ main() {
     .lightweight == "gpt-5.4-mini"
     and .classifier == "gpt-4.1"
     and .primary == "gpt-5.4"
-    and .secondary == "claude-sonnet-4.6"
+    and .secondary == "gemini-3.1-pro-preview"
   ' "${RECORD}" >/dev/null || fail "wrapper selected unexpected Copilot models"
 
   local base port child_pid
