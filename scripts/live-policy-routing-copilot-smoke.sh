@@ -4,9 +4,11 @@
 #
 # Production policy profiles can target pinned Copilot models directly. This
 # wrapper still starts a private zero-config Vekil bridge because the shared live
-# harness needs independently controllable static targets and fault injection. It
-# selects live Chat-capable models from the Copilot catalog and presents the
-# loopback bridge to scripts/live-policy-routing-smoke.sh as static targets.
+# harness needs independently controllable static targets, fault injection, and
+# metadata-only capture. It selects live Chat-capable models from the Copilot
+# catalog, presents the bridge to scripts/live-policy-routing-smoke.sh as static
+# targets, then reuses it for exact Responses-native gpt-5.6-sol low/max effort
+# validation.
 #
 # Required environment:
 #   COPILOT_GITHUB_TOKEN
@@ -22,6 +24,7 @@
 #   PROXY_BIN                                  policy proxy binary; default ./vekil
 #   LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN     bridge binary; defaults to PROXY_BIN
 #   LIVE_POLICY_ROUTING_HARNESS                delegated harness path
+#   LIVE_POLICY_ROUTING_SOL_EFFORT_HARNESS     delegated exact Sol harness path
 #   LIVE_POLICY_ROUTING_SMOKE_DIR              artifact directory
 #   LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=0       delete artifacts after success
 #   SMOKE_*                                     bounded timeout overrides
@@ -51,6 +54,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 POLICY_PROXY_BIN="${PROXY_BIN:-${REPO_ROOT}/vekil}"
 COPILOT_BRIDGE_BIN="${LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN:-${POLICY_PROXY_BIN}}"
 POLICY_HARNESS="${LIVE_POLICY_ROUTING_HARNESS:-${SCRIPT_DIR}/live-policy-routing-smoke.sh}"
+SOL_EFFORT_HARNESS="${LIVE_POLICY_ROUTING_SOL_EFFORT_HARNESS:-${SCRIPT_DIR}/live-policy-routing-sol-effort-smoke.sh}"
 SMOKE_STARTUP_TIMEOUT_SECONDS="${SMOKE_STARTUP_TIMEOUT_SECONDS:-90}"
 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS="${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS:-5}"
 SMOKE_CURL_MAX_TIME_SECONDS="${SMOKE_CURL_MAX_TIME_SECONDS:-180}"
@@ -187,10 +191,11 @@ import sys
 
 path = pathlib.Path(sys.argv[1])
 limit = int(sys.argv[2])
-text = path.read_text(encoding="utf-8", errors="replace")[:limit]
+text = path.read_text(encoding="utf-8", errors="replace")
 values = set(sys.argv[3:])
 for value in sorted(values - {""}, key=len, reverse=True):
     text = text.replace(value, "[REDACTED]")
+text = text[:limit]
 print("--- copilot-bridge.log (redacted) ---", file=sys.stderr)
 print(text, file=sys.stderr)
 PY
@@ -290,16 +295,22 @@ fetch_copilot_models() {
     "${bridge_base_url}/v1/models" > "${BRIDGE_MODELS}" \
     || die "GET ${bridge_base_url}/v1/models failed"
   chmod 600 "${BRIDGE_MODELS}"
-  jq -e '[.data[]? | select(((.supported_endpoints // []) | index("/chat/completions")) != null)] | length >= 2' \
-    "${BRIDGE_MODELS}" >/dev/null || die "Copilot bridge must advertise at least two native-Chat models"
+  jq -e '
+    def chat: ((.supported_endpoints // []) | index("/chat/completions")) != null;
+    def effort($value): ((.capabilities.supports.reasoning_effort // []) | index($value)) != null;
+    ([.data[]? | select(chat and effort("low"))] | length) >= 1
+    and ([.data[]? | select(chat and effort("high"))] | length) >= 2
+  ' "${BRIDGE_MODELS}" >/dev/null || die "Copilot bridge must advertise one native-Chat low-effort model and two native-Chat high-effort models"
 }
 
-model_supports_chat() {
+model_supports_chat_effort() {
   local model="$1"
-  jq -e --arg model "${model}" '
+  local effort="$2"
+  jq -e --arg model "${model}" --arg effort "${effort}" '
     .data[]?
     | select(.id == $model)
-    | ((.supported_endpoints // []) | index("/chat/completions")) != null
+    | (((.supported_endpoints // []) | index("/chat/completions")) != null)
+      and ($effort == "" or (((.capabilities.supports.reasoning_effort // []) | index($effort)) != null))
   ' "${BRIDGE_MODELS}" >/dev/null
 }
 
@@ -307,32 +318,34 @@ pick_copilot_model() {
   local label="$1"
   local override="$2"
   local excluded="$3"
-  shift 3
+  local required_effort="$4"
+  shift 4
   local candidate
 
   if [[ -n "${override}" ]]; then
     [[ "${override}" != "${excluded}" ]] || die "${label} override must differ from ${excluded}"
-    model_supports_chat "${override}" || die "${label} override ${override} is not a Copilot native-Chat model"
+    model_supports_chat_effort "${override}" "${required_effort}" || die "${label} override ${override} is not a Copilot native-Chat model supporting reasoning effort ${required_effort:-<any>}"
     printf '%s\n' "${override}"
     return 0
   fi
 
   for candidate in "$@"; do
     [[ "${candidate}" != "${excluded}" ]] || continue
-    if model_supports_chat "${candidate}"; then
+    if model_supports_chat_effort "${candidate}" "${required_effort}"; then
       printf '%s\n' "${candidate}"
       return 0
     fi
   done
 
-  candidate="$(jq -r --arg excluded "${excluded}" '
+  candidate="$(jq -r --arg excluded "${excluded}" --arg effort "${required_effort}" '
     [.data[]?
       | select((.id | type) == "string")
       | select(.id != $excluded)
       | select(((.supported_endpoints // []) | index("/chat/completions")) != null)
+      | select($effort == "" or (((.capabilities.supports.reasoning_effort // []) | index($effort)) != null))
       | .id][0] // ""
   ' "${BRIDGE_MODELS}")"
-  [[ -n "${candidate}" ]] || die "unable to select ${label} from Copilot native-Chat models"
+  [[ -n "${candidate}" ]] || die "unable to select ${label} from Copilot native-Chat models supporting reasoning effort ${required_effort:-<any>}"
   printf '%s\n' "${candidate}"
 }
 
@@ -341,22 +354,26 @@ select_copilot_models() {
     lightweight \
     "${LIVE_POLICY_ROUTING_COPILOT_LIGHTWEIGHT_MODEL:-}" \
     "" \
+    low \
     gpt-5.4-mini claude-haiku-4.5 gpt-5-mini gpt-4.1 gpt-4o)"
   selected_classifier="$(pick_copilot_model \
     classifier \
     "${LIVE_POLICY_ROUTING_COPILOT_CLASSIFIER_MODEL:-}" \
     "" \
+    "" \
     gpt-4.1 claude-sonnet-4.6 claude-haiku-4.5 gpt-5.4-mini gpt-5-mini gpt-5.4)"
-  selected_primary="$(pick_copilot_model \
+	selected_primary="$(pick_copilot_model \
     powerful-primary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL:-}" \
     "" \
-    gpt-5.4 claude-sonnet-4.6 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
+    high \
+	    gpt-5.4 gemini-3.1-pro-preview gemini-3.5-flash claude-sonnet-4.6 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
   selected_secondary="$(pick_copilot_model \
     powerful-secondary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL:-}" \
     "${selected_primary}" \
-    claude-sonnet-4.6 gpt-5.4 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
+    high \
+	    gemini-3.1-pro-preview gemini-3.5-flash gpt-5.4 claude-sonnet-4.6 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
 
   jq -n \
     --arg lightweight "${selected_lightweight}" \
@@ -391,23 +408,37 @@ run_policy_harness() {
   env -u COPILOT_GITHUB_TOKEN \
     PROXY_BIN="${POLICY_PROXY_BIN}" \
     LIVE_POLICY_ROUTING_SMOKE_DIR="${SMOKE_DIR}" \
+    LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=1 \
     LIVE_POLICY_ROUTING_ALLOW_INSECURE_HTTP=1 \
     LIVE_POLICY_ROUTING_LIGHTWEIGHT_TYPE=openai-compatible \
     LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL="${bridge_api}" \
-    LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL="${selected_lightweight}" \
-    LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY="${lightweight_key}" \
+	    LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL="${selected_lightweight}" \
+	    LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT=low \
+	    LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY="${lightweight_key}" \
     LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_TYPE=openai-compatible \
     LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL="${bridge_api}" \
     LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL="${selected_primary}" \
     LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY="${primary_key}" \
     LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_TYPE=openai-compatible \
     LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL="${bridge_api}" \
-    LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL="${selected_secondary}" \
-    LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY="${secondary_key}" \
-    LIVE_POLICY_ROUTING_CLASSIFIER_MODEL="${selected_classifier}" \
+	    LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL="${selected_secondary}" \
+	    LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY="${secondary_key}" \
+    LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT=high \
+	    LIVE_POLICY_ROUTING_CLASSIFIER_MODEL="${selected_classifier}" \
     LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED=false \
     LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION=true \
     "${POLICY_HARNESS}"
+}
+
+run_sol_effort_harness() {
+  env -u COPILOT_GITHUB_TOKEN \
+    PROXY_BIN="${POLICY_PROXY_BIN}" \
+    LIVE_POLICY_ROUTING_SOL_BRIDGE_BASE_URL="${bridge_base_url}" \
+    LIVE_POLICY_ROUTING_SOL_MODEL=gpt-5.6-sol \
+    LIVE_POLICY_ROUTING_SOL_PUBLIC_MODEL=gpt-5.6-semantic \
+    LIVE_POLICY_ROUTING_SOL_SMOKE_DIR="${SMOKE_DIR}/sol-effort" \
+    LIVE_POLICY_ROUTING_SOL_KEEP_ARTIFACTS=1 \
+    "${SOL_EFFORT_HARNESS}"
 }
 
 main() {
@@ -422,13 +453,15 @@ main() {
   [[ -x "${POLICY_PROXY_BIN}" ]] || die "policy proxy binary not found or not executable: ${POLICY_PROXY_BIN} (run: make build)"
   [[ -x "${COPILOT_BRIDGE_BIN}" ]] || die "Copilot bridge binary not found or not executable: ${COPILOT_BRIDGE_BIN}"
   [[ -x "${POLICY_HARNESS}" ]] || die "policy harness not found or not executable: ${POLICY_HARNESS}"
+  [[ -x "${SOL_EFFORT_HARNESS}" ]] || die "Sol effort harness not found or not executable: ${SOL_EFFORT_HARNESS}"
 
   start_copilot_bridge
   fetch_copilot_models
   select_copilot_models
   run_policy_harness
+  run_sol_effort_harness
 
-  log "Copilot-backed semantic policy-routing smoke passed."
+  log "Copilot-backed semantic policy-routing and Sol low/max effort smokes passed."
   if [[ "${LIVE_POLICY_ROUTING_KEEP_ARTIFACTS:-0}" == "1" ]]; then
     log "Artifacts: ${SMOKE_DIR}"
   fi

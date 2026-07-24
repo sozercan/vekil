@@ -57,8 +57,12 @@ model_routes:
 policy_profiles:
   - id: coding-policy
     public_id: coding-policy-20260717
-    lightweight_route: light-route
-    powerful_route: powerful-route
+    lightweight:
+      route: light-route
+      reasoning_effort: low
+    powerful:
+      route: powerful-route
+      reasoning_effort: high
     classifier:
       route: classifier-route
       recent_turns: 0
@@ -66,6 +70,39 @@ policy_profiles:
     data_policy:
       content_forwarding_acknowledged: true
 `
+}
+
+func loadPolicyTierReasoningConfigForTest(t *testing.T, cfg ProvidersConfig, lightweight, powerful any) (ProvidersConfig, error) {
+	t.Helper()
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal providers config: %v", err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(body, &document); err != nil {
+		t.Fatalf("decode providers config fixture: %v", err)
+	}
+	profiles, ok := document["policy_profiles"].([]any)
+	if !ok || len(profiles) == 0 {
+		t.Fatal("providers config fixture has no policy profile")
+	}
+	profile, ok := profiles[0].(map[string]any)
+	if !ok {
+		t.Fatal("policy profile fixture is not an object")
+	}
+	lightTier := profile["lightweight"].(map[string]any)
+	powerTier := profile["powerful"].(map[string]any)
+	lightTier["reasoning_effort"] = lightweight
+	powerTier["reasoning_effort"] = powerful
+	body, err = json.Marshal(document)
+	if err != nil {
+		t.Fatalf("marshal tier reasoning fixture: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "providers.json")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write tier reasoning fixture: %v", err)
+	}
+	return LoadProvidersConfigFile(path)
 }
 
 func TestSchemaV2PolicyConfigCompilesTerminalAndPublicRegistries(t *testing.T) {
@@ -111,6 +148,20 @@ func TestSchemaV2PolicyConfigCompilesTerminalAndPublicRegistries(t *testing.T) {
 			t.Fatalf("internal route %q resolved through public static lookup", routeID)
 		}
 	}
+	var normalizedProfile struct {
+		Lightweight PolicyTierConfig `json:"lightweight"`
+		Powerful    PolicyTierConfig `json:"powerful"`
+	}
+	profileBody, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(profileBody, &normalizedProfile); err != nil {
+		t.Fatal(err)
+	}
+	if normalizedProfile.Lightweight.ReasoningEffort != "low" || normalizedProfile.Powerful.ReasoningEffort != "high" {
+		t.Fatalf("tier objects = lightweight:%+v powerful:%+v", normalizedProfile.Lightweight, normalizedProfile.Powerful)
+	}
 
 	entry, ok := setup.lookupPublicModelEntry(profile.PublicID)
 	if !ok || entry == nil || entry.kind != publicEntryPolicy || entry.policyID != profile.ID {
@@ -152,8 +203,98 @@ func TestSchemaV2PolicyConfigCompilesTerminalAndPublicRegistries(t *testing.T) {
 	if raw.OwnedBy != "vekil-policy" || len(raw.SupportedEndpoints) != 1 || raw.SupportedEndpoints[0] != providerEndpointChatCompletions {
 		t.Fatalf("policy catalog contract = %+v", raw)
 	}
-	if raw.Capabilities.Limits.Context != 64000 || raw.Capabilities.Supports.Parallel || raw.Capabilities.Supports.Vision || strings.Join(raw.Capabilities.Supports.Reasoning, ",") != "medium" {
-		t.Fatalf("conservative capabilities = %+v", raw.Capabilities)
+	if raw.Capabilities.Limits.Context != 64000 || raw.Capabilities.Supports.Parallel || raw.Capabilities.Supports.Vision || len(raw.Capabilities.Supports.Reasoning) != 0 {
+		t.Fatalf("policy-owned capabilities = %+v", raw.Capabilities)
+	}
+	if strings.Contains(string(entry.contract.raw), "reasoning_effort") {
+		t.Fatalf("policy catalog leaked private tier reasoning policy: %s", entry.contract.raw)
+	}
+}
+
+func TestPolicyTierReasoningEffortValidatesTerminalAllowlists(t *testing.T) {
+	base := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeOff)
+	base.ModelRoutes[0].ReasoningEffort = []string{"low", "medium"}
+	base.ModelRoutes[1].ReasoningEffort = []string{"high", "max"}
+
+	t.Run("normalizes independent tier values", func(t *testing.T) {
+		cfg, err := loadPolicyTierReasoningConfigForTest(t, base, " low ", " max ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(cfg.PolicyProfiles[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var profile struct {
+			Lightweight PolicyTierConfig `json:"lightweight"`
+			Powerful    PolicyTierConfig `json:"powerful"`
+		}
+		if err := json.Unmarshal(body, &profile); err != nil {
+			t.Fatal(err)
+		}
+		if profile.Lightweight.ReasoningEffort != "low" || profile.Powerful.ReasoningEffort != "max" {
+			t.Fatalf("tier objects = lightweight:%+v powerful:%+v", profile.Lightweight, profile.Powerful)
+		}
+	})
+
+	for _, tc := range []struct {
+		name        string
+		lightweight any
+		powerful    any
+		want        string
+	}{
+		{name: "lightweight outside route allowlist", lightweight: "max", powerful: "max", want: "policy_profiles[0].lightweight.reasoning_effort"},
+		{name: "powerful outside route allowlist", lightweight: "low", powerful: "low", want: "policy_profiles[0].powerful.reasoning_effort"},
+		{name: "empty lightweight", lightweight: "", powerful: "max", want: "policy_profiles[0].lightweight.reasoning_effort"},
+		{name: "null powerful", lightweight: "low", powerful: nil, want: "policy_profiles[0].powerful.reasoning_effort"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadPolicyTierReasoningConfigForTest(t, base, tc.lightweight, tc.powerful)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadProvidersConfigFile() error = %v, want path %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestProgrammaticPolicyTierReasoningEffortRejectsWhitespaceOnly(t *testing.T) {
+	cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeOff)
+	cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = " \t\n "
+
+	_, err := validateAndNormalizeProvidersConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "policy_profiles[0].lightweight.reasoning_effort") {
+		t.Fatalf("validateAndNormalizeProvidersConfig() error = %v, want lightweight reasoning_effort path", err)
+	}
+}
+
+func TestPolicyTierReasoningEffortMismatchReportsMissingTier(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		lightweight string
+		powerful    string
+		wantPath    string
+	}{
+		{
+			name:     "missing lightweight",
+			powerful: "max",
+			wantPath: "policy_profiles[0].lightweight.reasoning_effort",
+		},
+		{
+			name:        "missing powerful",
+			lightweight: "low",
+			wantPath:    "policy_profiles[0].powerful.reasoning_effort",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeOff)
+			cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = tc.lightweight
+			cfg.PolicyProfiles[0].Powerful.ReasoningEffort = tc.powerful
+
+			_, err := validateAndNormalizeProvidersConfig(cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.wantPath) {
+				t.Fatalf("validateAndNormalizeProvidersConfig() error = %v, want path %q", err, tc.wantPath)
+			}
+		})
 	}
 }
 
@@ -427,7 +568,7 @@ func TestPolicyClassifierZeroValidFieldsRejectNull(t *testing.T) {
 		{
 			name: "json recent turns",
 			ext:  ".json",
-			body: `{"schema_version":2,"providers":[{"id":"p","type":"openai-compatible","base_url":"https://example.test","auth_type":"none","trust_domain":"org","classifier_no_store_supported":true}],"model_routes":[{"id":"l","exposure":"internal","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"l"}]},{"id":"h","exposure":"internal","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"h"}]},{"id":"c","exposure":"internal","internal_purpose":"policy_classifier","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"c"}]}],"policy_profiles":[{"id":"policy","public_id":"policy","lightweight_route":"l","powerful_route":"h","classifier":{"route":"c","recent_turns":null},"data_policy":{"content_forwarding_acknowledged":true}}]}`,
+			body: `{"schema_version":2,"providers":[{"id":"p","type":"openai-compatible","base_url":"https://example.test","auth_type":"none","trust_domain":"org","classifier_no_store_supported":true}],"model_routes":[{"id":"l","exposure":"internal","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"l"}]},{"id":"h","exposure":"internal","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"h"}]},{"id":"c","exposure":"internal","internal_purpose":"policy_classifier","endpoints":["/chat/completions"],"targets":[{"id":"t","provider":"p","upstream_model":"c"}]}],"policy_profiles":[{"id":"policy","public_id":"policy","lightweight":{"route":"l"},"powerful":{"route":"h"},"classifier":{"route":"c","recent_turns":null},"data_policy":{"content_forwarding_acknowledged":true}}]}`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -468,8 +609,10 @@ model_routes:
 policy_profiles:
   - id: policy-one
     public_id: policy-one
-    lightweight_route: light-route
-    powerful_route: power-route
+    lightweight:
+      route: light-route
+    powerful:
+      route: power-route
     classifier: &shared_classifier
       route: classifier-route
       recent_turns: 0
@@ -477,8 +620,10 @@ policy_profiles:
     data_policy: {content_forwarding_acknowledged: true}
   - id: policy-two
     public_id: policy-two
-    lightweight_route: light-route
-    powerful_route: power-route
+    lightweight:
+      route: light-route
+    powerful:
+      route: power-route
     classifier: *shared_classifier
     data_policy: {content_forwarding_acknowledged: true}
 `
@@ -545,7 +690,7 @@ func TestPolicyReferencedInternalCopilotRoutesValidate(t *testing.T) {
 		},
 		PolicyProfiles: []PolicyProfileConfig{{
 			ID: "policy", PublicID: "policy-model",
-			LightweightRoute: "light-route", PowerfulRoute: "power-route",
+			Lightweight: PolicyTierConfig{Route: "light-route"}, Powerful: PolicyTierConfig{Route: "power-route"},
 			Classifier: PolicyClassifierConfig{Route: "classifier-route"},
 			DataPolicy: PolicyDataPolicyConfig{ContentForwardingAcknowledged: true},
 		}},

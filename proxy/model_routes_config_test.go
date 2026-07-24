@@ -141,6 +141,52 @@ model_routes:
 	}
 }
 
+func TestLoadProvidersConfigFileRejectsRemovedRouteDefaultReasoningEffort(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ext  string
+		body string
+	}{
+		{
+			name: "JSON",
+			ext:  ".json",
+			body: `{"schema_version":2,"providers":[{"id":"upstream","type":"openai-compatible","base_url":"https://example.test/v1","auth_type":"none"}],"model_routes":[{"id":"route","public_id":"model","endpoints":["/chat/completions"],"reasoning_effort":["low"],"default_reasoning_effort":"low","targets":[{"id":"target","provider":"upstream","upstream_model":"model"}]}]}`,
+		},
+		{
+			name: "YAML",
+			ext:  ".yaml",
+			body: `schema_version: 2
+providers:
+  - id: upstream
+    type: openai-compatible
+    base_url: https://example.test/v1
+    auth_type: none
+model_routes:
+  - id: route
+    public_id: model
+    endpoints: [/chat/completions]
+    reasoning_effort: [low]
+    default_reasoning_effort: low
+    targets:
+      - id: target
+        provider: upstream
+        upstream_model: model
+`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "providers"+tc.ext)
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadProvidersConfigFile(path)
+			if err == nil || !strings.Contains(err.Error(), `model_routes[0].default_reasoning_effort: unknown field "default_reasoning_effort"`) {
+				t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateProvidersConfigRejectsProgrammaticSchemaVersion3(t *testing.T) {
 	err := ValidateProvidersConfig(ProvidersConfig{SchemaVersion: 3})
 	if err == nil || !strings.Contains(err.Error(), "schema_version: unsupported schema version 3") {
@@ -364,6 +410,40 @@ func TestLoadProvidersConfigFileRejectsUnknownModelRouteFields(t *testing.T) {
 				t.Fatalf("LoadProvidersConfigFile() error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestLoadProvidersConfigFileRejectsUnknownPolicyTierFieldsThroughYAMLAlias(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	body := `schema_version: 2
+providers:
+  - id: upstream
+    type: openai-compatible
+    base_url: https://example.test/v1
+    auth_type: none
+    extra_headers: &tier
+      route: light-route
+      reasoning_effort: low
+      unexpected: typo
+model_routes: []
+policy_profiles:
+  - id: policy
+    public_id: policy
+    lightweight: *tier
+    powerful:
+      route: power-route
+      reasoning_effort: max
+    classifier:
+      route: classifier-route
+    data_policy:
+      content_forwarding_acknowledged: true
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadProvidersConfigFile(path)
+	if err == nil || !strings.Contains(err.Error(), `policy_profiles[0].lightweight.unexpected: unknown field "unexpected"`) {
+		t.Fatalf("LoadProvidersConfigFile() error = %v", err)
 	}
 }
 

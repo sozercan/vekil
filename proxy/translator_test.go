@@ -46,7 +46,68 @@ func TestNormalizeModelName(t *testing.T) {
 	}
 }
 
+func TestValidateAnthropicOutputConfigEffort(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "output config omitted", body: `{}`},
+		{name: "output config null", body: `{"output_config":null}`},
+		{name: "effort omitted", body: `{"output_config":{"format":{"type":"json_schema"}}}`},
+		{name: "nonblank effort", body: `{"output_config":{"effort":"high"}}`},
+		{name: "nonblank effort with surrounding whitespace", body: `{"output_config":{"effort":" high "}}`},
+	} {
+		t.Run("allows "+tc.name, func(t *testing.T) {
+			if err := validateAnthropicOutputConfigEffort([]byte(tc.body)); err != nil {
+				t.Fatalf("validateAnthropicOutputConfigEffort() error = %v", err)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "null", body: `{"output_config":{"effort":null}}`},
+		{name: "empty", body: `{"output_config":{"effort":""}}`},
+		{name: "whitespace", body: `{"output_config":{"effort":" \t\n "}}`},
+	} {
+		t.Run("rejects "+tc.name, func(t *testing.T) {
+			err := validateAnthropicOutputConfigEffort([]byte(tc.body))
+			if err == nil || !strings.Contains(err.Error(), "output_config.effort must be a non-empty string") {
+				t.Fatalf("validateAnthropicOutputConfigEffort() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestTranslateAnthropicToOpenAI(t *testing.T) {
+	t.Run("output config effort becomes canonical reasoning effort", func(t *testing.T) {
+		req := &models.AnthropicRequest{
+			Model:        "claude-3-opus",
+			MaxTokens:    intPtr(100),
+			OutputConfig: &models.AnthropicOutputConfig{Effort: " max "},
+			Messages: []models.AnthropicMessage{
+				{Role: "user", Content: json.RawMessage(`"Hello"`)},
+			},
+		}
+		got, err := TranslateAnthropicToOpenAI(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		body, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["reasoning_effort"] != "max" {
+			t.Fatalf("reasoning_effort = %#v, want max; body=%s", payload["reasoning_effort"], body)
+		}
+	})
+
 	t.Run("simple text message", func(t *testing.T) {
 		req := &models.AnthropicRequest{
 			Model:     "claude-3-opus",

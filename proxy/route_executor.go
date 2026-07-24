@@ -3338,8 +3338,8 @@ func prepareRouteTargetBody(body []byte, requestedModel, endpoint string, route 
 	}
 
 	// Every target attempt starts from its own copy of the immutable logical
-	// request. Provider-specific Responses policy must run only after target
-	// selection so one target's unsupported fields cannot leak into failover.
+	// request. Provider-specific Responses policy runs only after route/target
+	// selection so one attempt cannot mutate failover.
 	prepared := append([]byte(nil), body...)
 	if endpoint == providerEndpointResponses {
 		prepared, _ = stripUnsupportedResponsesRequestFields(prepared, target.provider)

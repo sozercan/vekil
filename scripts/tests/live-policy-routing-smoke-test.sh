@@ -25,6 +25,8 @@ PRIMARY_MODEL="local-powerful-primary-model"
 SECONDARY_MODEL="local-powerful-secondary-model"
 CLASSIFIER_MODEL="local-classifier-model"
 PUBLIC_MODEL="vekil-local-policy-smoke"
+LIGHTWEIGHT_REASONING_EFFORT="low"
+POWERFUL_REASONING_EFFORT="max"
 
 log() {
   printf '==> %s\n' "$*" >&2
@@ -435,6 +437,8 @@ class Handler(BaseHTTPRequestHandler):
 
         selected_powerful = False
         if is_classifier:
+            if "reasoning_effort" in body:
+                errors.append("classifier_reasoning_effort_present")
             signals, selected_powerful = classifier_signals(body)
             if args.role != "primary":
                 errors.append("classifier_on_non_primary")
@@ -454,6 +458,9 @@ class Handler(BaseHTTPRequestHandler):
                 errors.append("classifier_choice_invalid")
         else:
             signals = None
+            expected_effort = "low" if args.role == "lightweight" else "max"
+            if body.get("reasoning_effort") != expected_effort:
+                errors.append("terminal_reasoning_effort_invalid")
 
         entry = {
             "kind": "classifier" if is_classifier else "terminal",
@@ -464,6 +471,7 @@ class Handler(BaseHTTPRequestHandler):
             "selected_powerful": selected_powerful,
             "sampling_fields_absent": "temperature" not in body and "top_p" not in body,
             "max_completion_tokens": body.get("max_completion_tokens"),
+            "reasoning_effort": body.get("reasoning_effort"),
             "valid": not errors,
             "errors": list(errors),
         }
@@ -634,7 +642,9 @@ assert_generated_config() {
     --arg lightweight_model "${LIGHTWEIGHT_MODEL}" \
     --arg primary_model "${PRIMARY_MODEL}" \
     --arg secondary_model "${SECONDARY_MODEL}" \
-    --arg classifier_model "${CLASSIFIER_MODEL}" '
+    --arg classifier_model "${CLASSIFIER_MODEL}" \
+    --arg lightweight_effort "${LIGHTWEIGHT_REASONING_EFFORT}" \
+    --arg powerful_effort "${POWERFUL_REASONING_EFFORT}" '
       .schema_version == 2
       and (.providers | length) == 3
       and ([.providers[].type] | all(. == "openai-compatible"))
@@ -649,7 +659,12 @@ assert_generated_config() {
       and (.model_routes[] | select(.id == "live-semantic-lightweight").targets[0].upstream_model) == $lightweight_model
       and (.model_routes[] | select(.id == "live-semantic-powerful").targets | map(.upstream_model)) == [$primary_model,$secondary_model]
       and (.model_routes[] | select(.id == "live-semantic-classifier").targets[0].upstream_model) == $classifier_model
+      and (.model_routes[] | select(.id == "live-semantic-lightweight").reasoning_effort) == [$lightweight_effort]
+      and (.model_routes[] | select(.id == "live-semantic-powerful").reasoning_effort) == [$powerful_effort]
+      and ([.model_routes[] | select(has("default_reasoning_effort"))] | length) == 0
       and .policy_profiles[0].public_id == $public_model
+      and .policy_profiles[0].lightweight == {route:"live-semantic-lightweight",reasoning_effort:$lightweight_effort}
+      and .policy_profiles[0].powerful == {route:"live-semantic-powerful",reasoning_effort:$powerful_effort}
       and .policy_profiles[0].baseline_tier == "lightweight"
       and .policy_profiles[0].classifier_unavailable_tier == "lightweight"
       and .policy_profiles[0].classifier_uncertain_tier == "powerful"
@@ -740,6 +755,7 @@ main() {
     LIVE_POLICY_ROUTING_LIGHTWEIGHT_TYPE=openai-compatible \
     LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL="http://127.0.0.1:${lightweight_port}/v1" \
     LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL="${LIGHTWEIGHT_MODEL}" \
+    LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT="${LIGHTWEIGHT_REASONING_EFFORT}" \
     LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY="${LIGHTWEIGHT_SECRET}" \
     LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_TYPE=openai-compatible \
     LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL="http://127.0.0.1:${primary_port}/v1" \
@@ -749,6 +765,7 @@ main() {
     LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL="http://127.0.0.1:${secondary_port}/v1" \
     LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL="${SECONDARY_MODEL}" \
     LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY="${SECONDARY_SECRET}" \
+    LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT="${POWERFUL_REASONING_EFFORT}" \
     LIVE_POLICY_ROUTING_CLASSIFIER_MODEL="${CLASSIFIER_MODEL}" \
     LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED=true \
     SMOKE_STARTUP_TIMEOUT_SECONDS=20 \

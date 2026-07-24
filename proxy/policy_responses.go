@@ -48,6 +48,11 @@ func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusInternalServerError, "policy Responses request did not produce a routing plan", "server_error")
 		return
 	}
+	translated.Body, err = forcePolicyOpenAIChatReasoningEffort(translated.Body, policyPlan.selectedReasoningEffort)
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to apply policy reasoning effort", "server_error")
+		return
+	}
 	plannedCtx, operation, err := withPlannedChatOperation(r.Context(), r.Context(), policyPlan)
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error")

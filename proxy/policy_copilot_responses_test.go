@@ -239,11 +239,11 @@ func directCopilotResponsesPolicyConfig(profileMode string) ProvidersConfig {
 			},
 		},
 		PolicyProfiles: []PolicyProfileConfig{{
-			ID:               "semantic-policy",
-			PublicID:         "gpt-5.6-semantic",
-			Mode:             profileMode,
-			LightweightRoute: "luna-route",
-			PowerfulRoute:    "sol-route",
+			ID:          "semantic-policy",
+			PublicID:    "gpt-5.6-semantic",
+			Mode:        profileMode,
+			Lightweight: PolicyTierConfig{Route: "luna-route"},
+			Powerful:    PolicyTierConfig{Route: "sol-route"},
 			Classifier: PolicyClassifierConfig{
 				Route: "classifier-route",
 			},
@@ -752,7 +752,7 @@ func TestPolicyRoutingCopilotResponsesToolContinuationPinsSecondaryTarget(t *tes
 
 func TestPolicyResponsesReplayPreservesPowerfulTierWhenRoutesShareTerminal(t *testing.T) {
 	cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
-	cfg.PolicyProfiles[0].LightweightRoute = "sol-route"
+	cfg.PolicyProfiles[0].Lightweight.Route = "sol-route"
 	cfg.ModelRoutes = cfg.ModelRoutes[1:]
 	h, err := NewProxyHandler(
 		auth.NewTestAuthenticator("fixture-token"),
@@ -932,7 +932,7 @@ func TestPolicyCopilotDynamicValidationSkipsInactiveTierRoutes(t *testing.T) {
 			{ID: "classifier", Exposure: "internal", InternalPurpose: modelRouteInternalPurposePolicyClassifier, Endpoints: []string{providerEndpointResponses}, Targets: []ModelRouteTargetConfig{{ID: "classifier", Provider: "copilot", UpstreamModel: "classifier"}}},
 		},
 		PolicyProfiles: []PolicyProfileConfig{{
-			ID: "policy", PublicID: "semantic", Mode: policyConfigModeEnforce, LightweightRoute: "light", PowerfulRoute: "power",
+			ID: "policy", PublicID: "semantic", Mode: policyConfigModeEnforce, Lightweight: PolicyTierConfig{Route: "light"}, Powerful: PolicyTierConfig{Route: "power"},
 			Classifier: PolicyClassifierConfig{Route: "classifier"},
 			DataPolicy: PolicyDataPolicyConfig{ContentForwardingAcknowledged: true, AllowProviderRetention: true},
 		}},
@@ -1173,7 +1173,7 @@ func TestPolicyCopilotSynchronousValidationSkipsInactiveTierRoutes(t *testing.T)
 			{ID: "classifier", Exposure: "internal", InternalPurpose: modelRouteInternalPurposePolicyClassifier, Endpoints: []string{providerEndpointResponses}, Targets: []ModelRouteTargetConfig{{ID: "classifier", Provider: "copilot", UpstreamModel: "classifier"}}},
 		},
 		PolicyProfiles: []PolicyProfileConfig{{
-			ID: "policy", PublicID: "semantic", Mode: policyConfigModeEnforce, LightweightRoute: "light", PowerfulRoute: "power",
+			ID: "policy", PublicID: "semantic", Mode: policyConfigModeEnforce, Lightweight: PolicyTierConfig{Route: "light"}, Powerful: PolicyTierConfig{Route: "power"},
 			Classifier: PolicyClassifierConfig{Route: "classifier"},
 			DataPolicy: PolicyDataPolicyConfig{ContentForwardingAcknowledged: true, AllowProviderRetention: true},
 		}},

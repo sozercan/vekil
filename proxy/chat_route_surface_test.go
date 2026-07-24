@@ -1547,6 +1547,76 @@ func TestExplicitRouteGeminiCompressionAliasUsesCanonicalRouteOperation(t *testi
 	}
 }
 
+func TestExplicitRouteDoesNotInjectPolicyTierReasoningIntoTranslatedChatSurfaces(t *testing.T) {
+	tests := []struct {
+		name   string
+		handle func(*ProxyHandler, http.ResponseWriter)
+	}{
+		{
+			name: "Anthropic",
+			handle: func(h *ProxyHandler, w http.ResponseWriter) {
+				h.HandleAnthropicMessages(w, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"route-model","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`)))
+			},
+		},
+		{
+			name: "Gemini",
+			handle: func(h *ProxyHandler, w http.ResponseWriter) {
+				h.HandleGeminiModels(w, httptest.NewRequest(http.MethodPost, "/v1beta/models/route-model:generateContent", strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`)))
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var captured json.RawMessage
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer func() { _ = r.Body.Close() }()
+				var body map[string]json.RawMessage
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				captured = append(json.RawMessage(nil), body["reasoning_effort"]...)
+				var stream bool
+				_ = json.Unmarshal(body["stream"], &stream)
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "data: {\"id\":\"chat\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"physical-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"chat","object":"chat.completion","created":1,"model":"physical-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+			}))
+			defer upstream.Close()
+
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
+				SchemaVersion: 2,
+				Providers: []ProviderConfig{{
+					ID: "openai", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: upstream.URL, AuthType: "none",
+				}},
+				ModelRoutes: []ModelRouteConfig{{
+					ID: "route", PublicID: "route-model", Endpoints: []string{providerEndpointChatCompletions},
+					ReasoningEffort: []string{"low"},
+					Targets:         []ModelRouteTargetConfig{{ID: "target", Provider: "openai", UpstreamModel: "physical-model"}},
+				}},
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.BeginShutdown()
+
+			w := httptest.NewRecorder()
+			tc.handle(h, w)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+			if len(captured) != 0 {
+				t.Fatalf("direct route unexpectedly injected reasoning_effort = %s", captured)
+			}
+		})
+	}
+}
+
 func TestExplicitNativeAnthropicRouteAcceptsNormalizedAlias(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

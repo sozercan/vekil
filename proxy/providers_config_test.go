@@ -2024,7 +2024,7 @@ func TestPolicyCopilotProviderScopeFollowsEffectiveMode(t *testing.T) {
 				{ID: "classifier", Exposure: "internal", InternalPurpose: "policy_classifier", Endpoints: []string{"/responses"}, Targets: []ModelRouteTargetConfig{{ID: "classifier", Provider: classifierProvider, UpstreamModel: "classifier"}}},
 			},
 			PolicyProfiles: []PolicyProfileConfig{{
-				ID: "policy", PublicID: "semantic", Mode: "enforce", LightweightRoute: "light", PowerfulRoute: "power",
+				ID: "policy", PublicID: "semantic", Mode: "enforce", Lightweight: PolicyTierConfig{Route: "light"}, Powerful: PolicyTierConfig{Route: "power"},
 				Classifier: PolicyClassifierConfig{Route: "classifier"},
 				DataPolicy: PolicyDataPolicyConfig{ContentForwardingAcknowledged: true, AllowProviderRetention: true},
 			}},

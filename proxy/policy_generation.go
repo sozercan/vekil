@@ -33,12 +33,16 @@ type policyProfileGenerationRequestPolicy struct {
 	UseMaxCompletionTokens bool  `json:"use_max_completion_tokens"`
 }
 
-func policyProfileGeneration(profile PolicyProfileConfig, contract publicModelContract) string {
+type policyProfileRouteGeneration struct {
+	ID string `json:"id"`
+}
+
+func policyProfileGeneration(profile PolicyProfileConfig, contract publicModelContract, lightweight, powerful *modelRoute) string {
 	return policyHashValue(struct {
 		Profile       PolicyProfileConfig                  `json:"profile"`
 		Contract      json.RawMessage                      `json:"contract"`
 		RequestPolicy policyProfileGenerationRequestPolicy `json:"request_policy"`
-		Routes        []string                             `json:"routes"`
+		Routes        []policyProfileRouteGeneration       `json:"routes"`
 	}{
 		Profile:  clonePolicyProfileConfig(profile),
 		Contract: append(json.RawMessage(nil), contract.raw...),
@@ -48,8 +52,21 @@ func policyProfileGeneration(profile PolicyProfileConfig, contract publicModelCo
 			DropStopSequences:      contract.policy.dropStopSequences,
 			UseMaxCompletionTokens: contract.policy.useMaxCompletionTokens,
 		},
-		Routes: []string{profile.LightweightRoute, profile.PowerfulRoute},
+		Routes: []policyProfileRouteGeneration{
+			policyProfileRouteGenerationValue(lightweight, profile.Lightweight.Route),
+			policyProfileRouteGenerationValue(powerful, profile.Powerful.Route),
+		},
 	})
+}
+
+func policyProfileRouteGenerationValue(route *modelRoute, fallbackID string) policyProfileRouteGeneration {
+	value := policyProfileRouteGeneration{ID: strings.TrimSpace(fallbackID)}
+	if route != nil {
+		if routeID := strings.TrimSpace(route.public.routeID); routeID != "" {
+			value.ID = routeID
+		}
+	}
+	return value
 }
 
 func policyClassifierGeneration(route *modelRoute) string {

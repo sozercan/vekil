@@ -77,6 +77,16 @@ func (p *compiledPolicyProfile) routeForTier(tier policyTier) *modelRoute {
 	return p.lightweight
 }
 
+func (p *compiledPolicyProfile) reasoningEffortForTier(tier policyTier) string {
+	if p == nil || !policyProfileControlsReasoning(p.config) {
+		return ""
+	}
+	if tier == policyTierPowerful {
+		return p.config.Powerful.ReasoningEffort
+	}
+	return p.config.Lightweight.ReasoningEffort
+}
+
 type chatPolicyRoutingController struct {
 	h *ProxyHandler
 
@@ -120,13 +130,13 @@ func newChatPolicyRoutingController(h *ProxyHandler, cfg ProvidersConfig, global
 		if !ok || entry == nil || entry.kind != publicEntryPolicy {
 			return nil, configPathError(fmt.Sprintf("policy_profiles[%d].public_id", index), "compiled public policy entry %q is unavailable", profileCfg.PublicID)
 		}
-		lightweight, ok := setup.lookupTerminalRoute(profileCfg.LightweightRoute)
+		lightweight, ok := setup.lookupTerminalRoute(profileCfg.Lightweight.Route)
 		if !ok || lightweight == nil {
-			return nil, configPathError(fmt.Sprintf("policy_profiles[%d].lightweight_route", index), "compiled terminal route %q is unavailable", profileCfg.LightweightRoute)
+			return nil, configPathError(fmt.Sprintf("policy_profiles[%d].lightweight.route", index), "compiled terminal route %q is unavailable", profileCfg.Lightweight.Route)
 		}
-		powerful, ok := setup.lookupTerminalRoute(profileCfg.PowerfulRoute)
+		powerful, ok := setup.lookupTerminalRoute(profileCfg.Powerful.Route)
 		if !ok || powerful == nil {
-			return nil, configPathError(fmt.Sprintf("policy_profiles[%d].powerful_route", index), "compiled terminal route %q is unavailable", profileCfg.PowerfulRoute)
+			return nil, configPathError(fmt.Sprintf("policy_profiles[%d].powerful.route", index), "compiled terminal route %q is unavailable", profileCfg.Powerful.Route)
 		}
 		classifierRoute, ok := setup.lookupTerminalRoute(profileCfg.Classifier.Route)
 		if !ok || classifierRoute == nil {
@@ -176,7 +186,7 @@ func newChatPolicyRoutingController(h *ProxyHandler, cfg ProvidersConfig, global
 			admission:            admission,
 			breaker:              breaker,
 			configGeneration:     configGeneration,
-			profileGeneration:    policyProfileGeneration(profileCfg, entry.contract),
+			profileGeneration:    policyProfileGeneration(profileCfg, entry.contract, lightweight, powerful),
 			classifierGeneration: policyClassifierGeneration(classifierRoute),
 			binaryGeneration:     binaryGeneration,
 		}
@@ -432,7 +442,7 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 	if err != nil {
 		return chatOperationPlan{}, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("policy model %q supports text and standard function tools only: %w", entry.id, err)}
 	}
-	if err := validatePolicyPublicRequestContract(input.OriginalBody, profile.entry.contract); err != nil {
+	if err := validatePolicyPublicRequestContract(input.OriginalBody, profile.entry.contract, policyProfileControlsReasoning(profile.config)); err != nil {
 		return chatOperationPlan{}, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("policy model %q request is outside its public contract: %w", entry.id, err)}
 	}
 	if err := ctx.Err(); err != nil {
@@ -536,7 +546,7 @@ func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile 
 	return nil, policyTierUnknown, missing
 }
 
-func validatePolicyPublicRequestContract(body []byte, contract publicModelContract) error {
+func validatePolicyPublicRequestContract(body []byte, contract publicModelContract, policyControlsReasoning bool) error {
 	root, err := decodePolicyFactObject(body, "")
 	if err != nil {
 		return err
@@ -555,25 +565,8 @@ func validatePolicyPublicRequestContract(body []byte, contract publicModelContra
 		if json.Unmarshal(rawEffort, &effort) != nil || strings.TrimSpace(effort) == "" {
 			return fmt.Errorf("reasoning_effort must be a non-empty string")
 		}
-		var catalog struct {
-			Capabilities struct {
-				Supports struct {
-					Reasoning []string `json:"reasoning_effort"`
-				} `json:"supports"`
-			} `json:"capabilities"`
-		}
-		if json.Unmarshal(contract.raw, &catalog) != nil {
+		if !policyControlsReasoning {
 			return fmt.Errorf("reasoning_effort is not supported")
-		}
-		allowed := false
-		for _, candidate := range catalog.Capabilities.Supports.Reasoning {
-			if candidate == effort {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return fmt.Errorf("reasoning_effort %q is not supported", effort)
 		}
 	}
 	return nil
@@ -762,20 +755,21 @@ func (c *chatPolicyRoutingController) sealPlan(profile *compiledPolicyProfile, i
 	decision.InputBytes = len(input.OriginalBody)
 	decision.Truncated = decision.Truncated || facts.truncated()
 	return newChatOperationPlan(chatOperationPlanOptions{
-		OperationID:          input.OperationID,
-		EntryID:              profile.entry.id,
-		PublicID:             profile.entry.id,
-		RouteID:              route.public.routeID,
-		Route:                route,
-		Contract:             contract,
-		PolicyID:             profile.config.ID,
-		SelectedTier:         tier,
-		EffectiveMode:        profile.effectiveMode(),
-		ConfigGeneration:     profile.configGeneration,
-		ProfileGeneration:    profile.profileGeneration,
-		ClassifierGeneration: profile.classifierGeneration,
-		BinaryGeneration:     profile.binaryGeneration,
-		Decision:             decision,
+		OperationID:             input.OperationID,
+		EntryID:                 profile.entry.id,
+		PublicID:                profile.entry.id,
+		RouteID:                 route.public.routeID,
+		Route:                   route,
+		Contract:                contract,
+		SelectedReasoningEffort: profile.reasoningEffortForTier(tier),
+		PolicyID:                profile.config.ID,
+		SelectedTier:            tier,
+		EffectiveMode:           profile.effectiveMode(),
+		ConfigGeneration:        profile.configGeneration,
+		ProfileGeneration:       profile.profileGeneration,
+		ClassifierGeneration:    profile.classifierGeneration,
+		BinaryGeneration:        profile.binaryGeneration,
+		Decision:                decision,
 	})
 }
 
@@ -789,20 +783,21 @@ func (c *chatPolicyRoutingController) sealRoutePlan(profile *compiledPolicyProfi
 	decision.InputBytes = len(input.OriginalBody)
 	decision.Truncated = decision.Truncated || facts.truncated()
 	return newChatOperationPlan(chatOperationPlanOptions{
-		OperationID:          input.OperationID,
-		EntryID:              profile.entry.id,
-		PublicID:             profile.entry.id,
-		RouteID:              route.public.routeID,
-		Route:                route,
-		Contract:             contract,
-		PolicyID:             profile.config.ID,
-		SelectedTier:         tier,
-		EffectiveMode:        profile.effectiveMode(),
-		ConfigGeneration:     profile.configGeneration,
-		ProfileGeneration:    profile.profileGeneration,
-		ClassifierGeneration: profile.classifierGeneration,
-		BinaryGeneration:     profile.binaryGeneration,
-		Decision:             decision,
+		OperationID:             input.OperationID,
+		EntryID:                 profile.entry.id,
+		PublicID:                profile.entry.id,
+		RouteID:                 route.public.routeID,
+		Route:                   route,
+		Contract:                contract,
+		SelectedReasoningEffort: profile.reasoningEffortForTier(tier),
+		PolicyID:                profile.config.ID,
+		SelectedTier:            tier,
+		EffectiveMode:           profile.effectiveMode(),
+		ConfigGeneration:        profile.configGeneration,
+		ProfileGeneration:       profile.profileGeneration,
+		ClassifierGeneration:    profile.classifierGeneration,
+		BinaryGeneration:        profile.binaryGeneration,
+		Decision:                decision,
 	})
 }
 
