@@ -1967,6 +1967,10 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	if err := validateAnthropicOutputConfigEffort(body); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 	if err := validateAnthropicMessageTokenLimits(&req, r.Header); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -2338,6 +2342,10 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 	// handler forwarding. encoding/json resolves duplicate struct fields with the
 	// last occurrence, so validate only after decoding req.Model.
 	if err := h.validateRouteAwareRequestJSON(body, req.Model, providerEndpointMessages); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	if err := validateAnthropicOutputConfigEffort(body); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}

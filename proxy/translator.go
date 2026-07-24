@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -98,9 +99,9 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 		oaiReq.ParallelToolCalls = &parallelToolCalls
 	}
 
-	// Claude's explicit output effort is the Anthropic equivalent of Chat's
-	// reasoning_effort. Preserve it before policy validation and route-default
-	// injection so an operator default can never replace a client choice.
+	// Claude's nonblank output effort is the Anthropic equivalent of Chat's
+	// reasoning_effort. Preserve it on canonical Chat for direct-route validation;
+	// a mapped policy may later replace it with the selected tier effort.
 	if req.OutputConfig != nil {
 		oaiReq.ReasoningEffort = strings.TrimSpace(req.OutputConfig.Effort)
 	}
@@ -135,6 +136,30 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 	}
 
 	return oaiReq, nil
+}
+
+func validateAnthropicOutputConfigEffort(body []byte) error {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil // The handler reports malformed request JSON before this validation.
+	}
+	rawOutputConfig, ok := root["output_config"]
+	if !ok || bytes.Equal(bytes.TrimSpace(rawOutputConfig), []byte("null")) {
+		return nil
+	}
+	var outputConfig map[string]json.RawMessage
+	if err := json.Unmarshal(rawOutputConfig, &outputConfig); err != nil {
+		return nil // The typed Anthropic decode reports invalid output_config shapes.
+	}
+	rawEffort, ok := outputConfig["effort"]
+	if !ok {
+		return nil
+	}
+	var effort string
+	if err := json.Unmarshal(rawEffort, &effort); err != nil || strings.TrimSpace(effort) == "" {
+		return fmt.Errorf("output_config.effort must be a non-empty string")
+	}
+	return nil
 }
 
 func mergeSplitAnthropicReplayAssistantTurns(messages []models.OpenAIMessage) []models.OpenAIMessage {

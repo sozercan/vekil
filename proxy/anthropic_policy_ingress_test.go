@@ -253,6 +253,7 @@ func TestHandleAnthropicMessagesPolicyIngressUsesProfileTierReasoningEffort(t *t
 	}{
 		{name: "explicit Claude effort is overridden", outputConfig: `,"output_config":{"effort":"max"}`, wantEffort: `"low"`},
 		{name: "omitted Claude effort uses profile tier", wantEffort: `"low"`},
+		{name: "output config without effort uses profile tier", outputConfig: `,"output_config":{"format":{"type":"json_schema"}}`, wantEffort: `"low"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
@@ -281,6 +282,126 @@ func TestHandleAnthropicMessagesPolicyIngressUsesProfileTierReasoningEffort(t *t
 				t.Fatalf("reasoning_effort=%q, want %q", reasoning, tc.wantEffort)
 			}
 		})
+	}
+}
+
+func TestAnthropicPolicyIngressUnmappedReasoningEffortContract(t *testing.T) {
+	endpoints := []struct {
+		name      string
+		path      string
+		maxTokens string
+		handle    func(*ProxyHandler, http.ResponseWriter, *http.Request)
+	}{
+		{name: "messages", path: providerEndpointMessages, maxTokens: `,"max_tokens":64`, handle: (*ProxyHandler).HandleAnthropicMessages},
+		{name: "count_tokens", path: providerEndpointMessagesCount, handle: (*ProxyHandler).HandleAnthropicMessagesCountTokens},
+	}
+	requests := []struct {
+		name         string
+		outputConfig string
+		wantStatus   int
+		wantError    string
+	}{
+		{name: "effort omitted", wantStatus: http.StatusOK},
+		{name: "output config without effort", outputConfig: `,"output_config":{"format":{"type":"json_schema"}}`, wantStatus: http.StatusOK},
+		{name: "explicit effort", outputConfig: `,"output_config":{"effort":"max"}`, wantStatus: http.StatusBadRequest, wantError: "reasoning_effort is not supported"},
+	}
+
+	for _, endpoint := range endpoints {
+		for _, requestCase := range requests {
+			t.Run(endpoint.name+"/"+requestCase.name, func(t *testing.T) {
+				light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+				powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+				h, err := NewProxyHandler(nil, logger.NewWithWriter(logger.LevelError, io.Discard),
+					WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)),
+					WithPolicyRoutingMode(PolicyRoutingModeOff),
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body := `{"model":"coding-economy"` + endpoint.maxTokens + `,"messages":[{"role":"user","content":"hello"}]` + requestCase.outputConfig + `}`
+				recorder := httptest.NewRecorder()
+				endpoint.handle(h, recorder, httptest.NewRequest(http.MethodPost, endpoint.path, strings.NewReader(body)))
+				if recorder.Code != requestCase.wantStatus {
+					t.Fatalf("status=%d, want %d; body=%s", recorder.Code, requestCase.wantStatus, recorder.Body.String())
+				}
+				if requestCase.wantError != "" && !strings.Contains(recorder.Body.String(), requestCase.wantError) {
+					t.Fatalf("body=%s, want error containing %q", recorder.Body.String(), requestCase.wantError)
+				}
+				sends, _ := light.snapshot()
+				if requestCase.wantStatus == http.StatusOK {
+					if sends != 1 {
+						t.Fatalf("light sends=%d, want one", sends)
+					}
+					efforts := light.reasoningEffortSnapshot()
+					if len(efforts) != 1 || len(efforts[0]) != 0 {
+						t.Fatalf("reasoning efforts=%q, want one omitted value", efforts)
+					}
+				} else if sends != 0 {
+					t.Fatalf("light sends=%d, want zero", sends)
+				}
+			})
+		}
+	}
+}
+
+func TestAnthropicPolicyIngressRejectsBlankOutputConfigEffort(t *testing.T) {
+	endpoints := []struct {
+		name      string
+		path      string
+		maxTokens string
+		handle    func(*ProxyHandler, http.ResponseWriter, *http.Request)
+	}{
+		{name: "messages", path: providerEndpointMessages, maxTokens: `,"max_tokens":64`, handle: (*ProxyHandler).HandleAnthropicMessages},
+		{name: "count_tokens", path: providerEndpointMessagesCount, handle: (*ProxyHandler).HandleAnthropicMessagesCountTokens},
+	}
+	invalidEfforts := []struct {
+		name string
+		raw  string
+	}{
+		{name: "null", raw: "null"},
+		{name: "empty", raw: `""`},
+		{name: "whitespace", raw: `" \t\n "`},
+	}
+
+	for _, mapped := range []bool{false, true} {
+		mapping := "unmapped"
+		if mapped {
+			mapping = "mapped"
+		}
+		for _, endpoint := range endpoints {
+			for _, invalidEffort := range invalidEfforts {
+				t.Run(mapping+"/"+endpoint.name+"/"+invalidEffort.name, func(t *testing.T) {
+					light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+					powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+					cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)
+					if mapped {
+						cfg.ModelRoutes[0].ReasoningEffort = []string{"low"}
+						cfg.ModelRoutes[1].ReasoningEffort = []string{"max"}
+						cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = "low"
+						cfg.PolicyProfiles[0].Powerful.ReasoningEffort = "max"
+					}
+					h, err := NewProxyHandler(nil, logger.NewWithWriter(logger.LevelError, io.Discard),
+						WithProvidersConfig(cfg),
+						WithPolicyRoutingMode(PolicyRoutingModeOff),
+					)
+					if err != nil {
+						t.Fatal(err)
+					}
+					body := `{"model":"coding-economy"` + endpoint.maxTokens + `,"messages":[{"role":"user","content":"hello"}],"output_config":{"effort":` + invalidEffort.raw + `}}`
+					recorder := httptest.NewRecorder()
+					endpoint.handle(h, recorder, httptest.NewRequest(http.MethodPost, endpoint.path, strings.NewReader(body)))
+					if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "output_config.effort must be a non-empty string") {
+						t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+					}
+					if sends, _ := light.snapshot(); sends != 0 {
+						t.Fatalf("light sends=%d, want zero", sends)
+					}
+					if sends, _ := powerful.snapshot(); sends != 0 {
+						t.Fatalf("powerful sends=%d, want zero", sends)
+					}
+				})
+			}
+		}
 	}
 }
 
