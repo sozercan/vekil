@@ -294,8 +294,8 @@ fetch_copilot_models() {
     def chat: ((.supported_endpoints // []) | index("/chat/completions")) != null;
     def effort($value): ((.capabilities.supports.reasoning_effort // []) | index($value)) != null;
     ([.data[]? | select(chat and effort("low"))] | length) >= 1
-    and ([.data[]? | select(chat and effort("max"))] | length) >= 2
-  ' "${BRIDGE_MODELS}" >/dev/null || die "Copilot bridge must advertise one native-Chat low-effort model and two native-Chat max-effort models"
+    and ([.data[]? | select(chat and effort("high"))] | length) >= 2
+  ' "${BRIDGE_MODELS}" >/dev/null || die "Copilot bridge must advertise one native-Chat low-effort model and two native-Chat high-effort models"
 }
 
 model_supports_chat_effort() {
@@ -361,13 +361,13 @@ select_copilot_models() {
     powerful-primary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL:-}" \
     "" \
-    max \
+    high \
     gpt-5.4 claude-sonnet-4.6 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
   selected_secondary="$(pick_copilot_model \
     powerful-secondary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL:-}" \
     "${selected_primary}" \
-    max \
+    high \
     claude-sonnet-4.6 gpt-5.4 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
 
   jq -n \
@@ -417,7 +417,7 @@ run_policy_harness() {
     LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL="${bridge_api}" \
 	    LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL="${selected_secondary}" \
 	    LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY="${secondary_key}" \
-	    LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT=max \
+    LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT=high \
 	    LIVE_POLICY_ROUTING_CLASSIFIER_MODEL="${selected_classifier}" \
     LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED=false \
     LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION=true \
