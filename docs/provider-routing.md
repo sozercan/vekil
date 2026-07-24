@@ -154,12 +154,12 @@ model_routes:
 
 policy_profiles:
   - id: semantic-policy
-	lightweight:
-	  route: lightweight-route
-	  reasoning_effort: low
-	powerful:
-	  route: powerful-route
-	  reasoning_effort: max
+    lightweight:
+      route: lightweight-route
+      reasoning_effort: low
+    powerful:
+      route: powerful-route
+      reasoning_effort: max
     # classifier/data_policy: ...
 ```
 
