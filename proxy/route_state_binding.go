@@ -73,7 +73,7 @@ func (h *ProxyHandler) applyExplicitRequestStateBinding(operation *routeOperatio
 		return nil
 	case stateBindingLookupUnknown:
 		h.RecordStateBindingMiss()
-		return &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("unknown provider-bound state for explicit model route")}
+		return &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("unknown provider-bound state for explicit model route; state may have expired, been evicted, or been issued by another Vekil process")}
 	default:
 		h.RecordStateBindingMiss()
 		return &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("conflicting provider-bound state for explicit model route")}
