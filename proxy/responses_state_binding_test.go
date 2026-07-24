@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -82,6 +83,27 @@ func contextCompactionStateRequestBody(t *testing.T, tokens ...string) []byte {
 	input := make([]any, 0, len(tokens)+1)
 	for _, token := range tokens {
 		input = append(input, map[string]any{"type": "context_compaction", "encrypted_content": token})
+	}
+	input = append(input, map[string]any{"type": "message", "role": "user", "content": "continue"})
+	body, err := json.Marshal(map[string]any{
+		"model": "public-model",
+		"input": input,
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	return body
+}
+
+func reasoningStateRequestBody(t *testing.T, tokens ...string) []byte {
+	t.Helper()
+	input := make([]any, 0, len(tokens)+1)
+	for _, token := range tokens {
+		input = append(input, map[string]any{
+			"type":              "reasoning",
+			"encrypted_content": token,
+			"summary":           []any{},
+		})
 	}
 	input = append(input, map[string]any{"type": "message", "role": "user", "content": "continue"})
 	body, err := json.Marshal(map[string]any{
@@ -310,5 +332,51 @@ func TestHandleCompactValidatesContextCompactionStateBeforeSanitizing(t *testing
 				t.Fatalf("upstream compact X-Codex-Turn-State = %q, want empty", got)
 			}
 		})
+	}
+}
+
+func TestHandleResponsesRetainsIdleCodexStateAcrossDefaultChurn(t *testing.T) {
+	h, route, primary, secondary := newExplicitResponsesStateBindingHandler(t)
+	idleOwner := stateBindingOwner{routeID: route.public.routeID, targetID: route.targets[0].id}
+	churnOwner := stateBindingOwner{routeID: route.public.routeID, targetID: route.targets[1].id}
+
+	// A resumed Codex thread can replay hundreds of encrypted reasoning items.
+	// Busy local agent hosts can create tens of thousands of unrelated bindings
+	// while that thread is idle, so retain a representative same-day resume set
+	// across a 64K-entry churn window.
+	const idleTokens = 128
+	tokens := make([]stateBindingToken, 0, idleTokens)
+	values := make([]string, 0, idleTokens)
+	for i := 0; i < idleTokens; i++ {
+		value := fmt.Sprintf("idle-reasoning-%03d", i)
+		values = append(values, value)
+		tokens = append(tokens, stateBindingToken{stateType: stateBindingTypeEncryptedContent, value: value})
+	}
+	if err := h.bindExplicitStateTokens(explicitRouteResponseInfo{
+		routeID:  idleOwner.routeID,
+		targetID: idleOwner.targetID,
+	}, tokens); err != nil {
+		t.Fatalf("bind idle Codex state: %v", err)
+	}
+
+	const churnEntries = 64 * 1024
+	for i := 0; i < churnEntries; i++ {
+		result := h.stateBindings.bind(stateBindingTypeResponseID, fmt.Sprintf("churn-response-%05d", i), churnOwner)
+		if result.outcome != stateBindingLookupKnown || result.owner != churnOwner {
+			t.Fatalf("bind churn entry %d = %#v, want known owner %#v", i, result, churnOwner)
+		}
+	}
+
+	w := httptest.NewRecorder()
+	h.HandleResponses(w, httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reasoningStateRequestBody(t, values...))))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200", w.Code, w.Body.String())
+	}
+	if primary.calls.Load() != 1 || secondary.calls.Load() != 0 {
+		t.Fatalf("state-pinned calls primary=%d secondary=%d, want 1/0", primary.calls.Load(), secondary.calls.Load())
+	}
+	if stats := h.stateBindings.stats(); stats.evictions != 0 {
+		t.Fatalf("state binding evictions = %d, want none within default resume churn budget", stats.evictions)
 	}
 }

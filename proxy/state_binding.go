@@ -14,9 +14,11 @@ import (
 
 const (
 	// defaultStateBindingMaxEntries bounds process-local provider state while
-	// leaving room for concurrent response, turn-state, and opaque-artifact
-	// bindings. Capacity eviction intentionally degrades a binding to unknown.
-	defaultStateBindingMaxEntries = 32 * 1024
+	// leaving room for many concurrent Codex sessions that replay their full
+	// encrypted reasoning history when resumed. Capacity eviction intentionally
+	// degrades a binding to unknown, so keep enough headroom for same-day idle
+	// sessions on busy local agent hosts.
+	defaultStateBindingMaxEntries = 256 * 1024
 	// defaultStateBindingTTL is an absolute lifetime. Lookups update recency but
 	// never extend this window; only observing the same token from the same owner
 	// again refreshes it.
