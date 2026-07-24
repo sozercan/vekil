@@ -272,11 +272,6 @@ func validatePolicyProfileConfigReferences(
 	if err != nil {
 		return err
 	}
-	lightweightPrefersNativeChat := configRouteSupportsEndpoint(lightweight, providerEndpointChatCompletions)
-	powerfulPrefersNativeChat := configRouteSupportsEndpoint(powerful, providerEndpointChatCompletions)
-	if lightweightPrefersNativeChat != powerfulPrefersNativeChat {
-		return configPathError(path+".powerful_route", "route %q differs from lightweight route %q in preferred Chat backend", profile.PowerfulRoute, profile.LightweightRoute)
-	}
 	if boolConfigValue(lightweight.DropSamplingParams) != boolConfigValue(powerful.DropSamplingParams) {
 		return configPathError(path+".powerful_route", "route %q differs from lightweight route %q in drop_sampling_params public Chat semantics", profile.PowerfulRoute, profile.LightweightRoute)
 	}
@@ -350,8 +345,8 @@ func validatePolicyDestinationRoute(route *ModelRouteConfig, path string, provid
 	if route.InternalPurpose != "" {
 		return nil, configPathError(path, "route %q is reserved for internal purpose %q", route.ID, route.InternalPurpose)
 	}
-	if !configRouteSupportsEndpoint(route, providerEndpointChatCompletions) && !configRouteSupportsEndpoint(route, providerEndpointResponses) {
-		return nil, configPathError(path, "route %q must expose %s or %s for Chat execution", route.ID, providerEndpointChatCompletions, providerEndpointResponses)
+	if !configRouteSupportsPolicyChatExecution(route) {
+		return nil, configPathError(path, "route %q must expose %s or %s for policy Chat execution", route.ID, providerEndpointChatCompletions, providerEndpointResponses)
 	}
 
 	resolved := make([]providerConfigDescriptor, 0, len(route.Targets))
@@ -361,7 +356,7 @@ func validatePolicyDestinationRoute(route *ModelRouteConfig, path string, provid
 			return nil, configPathError(path, "route %q target %d references unknown provider %q", route.ID, targetIndex, target.Provider)
 		}
 		if descriptor.kind != providerTypeCopilot && descriptor.kind != providerTypeAzureOpenAI && descriptor.kind != providerTypeOpenAICompatible {
-			return nil, configPathError(path, "route %q target provider %q does not use the supported OpenAI Chat execution family", route.ID, descriptor.id)
+			return nil, configPathError(path, "route %q target provider %q does not use the supported native OpenAI Chat execution family", route.ID, descriptor.id)
 		}
 		if descriptor.kind != providerTypeCopilot && descriptor.modelDiscovery != providerModelDiscoveryStatic {
 			return nil, configPathError(path, "route %q target provider %q uses unsupported dynamic model_discovery %q", route.ID, descriptor.id, descriptor.modelDiscovery)
@@ -384,8 +379,8 @@ func validatePolicyClassifierRoute(route *ModelRouteConfig, path string, provide
 	if route.InternalPurpose != modelRouteInternalPurposePolicyClassifier {
 		return providerConfigDescriptor{}, configPathError(path, "route %q must set internal_purpose: %s", route.ID, modelRouteInternalPurposePolicyClassifier)
 	}
-	if !configRouteSupportsEndpoint(route, providerEndpointChatCompletions) && !configRouteSupportsEndpoint(route, providerEndpointResponses) {
-		return providerConfigDescriptor{}, configPathError(path, "route %q must expose %s or %s for forced function-tool classification", route.ID, providerEndpointChatCompletions, providerEndpointResponses)
+	if !configRouteSupportsPolicyChatExecution(route) {
+		return providerConfigDescriptor{}, configPathError(path, "route %q must expose %s or %s for policy classifier execution", route.ID, providerEndpointChatCompletions, providerEndpointResponses)
 	}
 	if len(route.Targets) != 1 {
 		return providerConfigDescriptor{}, configPathError(path, "route %q must contain exactly one target", route.ID)
@@ -423,6 +418,11 @@ func configRouteSupportsEndpoint(route *ModelRouteConfig, endpoint string) bool 
 		}
 	}
 	return false
+}
+
+func configRouteSupportsPolicyChatExecution(route *ModelRouteConfig) bool {
+	return configRouteSupportsEndpoint(route, providerEndpointChatCompletions) ||
+		configRouteSupportsEndpoint(route, providerEndpointResponses)
 }
 
 func boolConfigValue(value *bool) bool {

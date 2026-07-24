@@ -28,7 +28,7 @@
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-Chat-compatible ingress converges before provider I/O: public OpenAI Chat, translated Anthropic Messages, translated Gemini generation, their count-token probes, and dashboard insights all submit canonical Chat requests to the same execution layer. Schema-v2 policy resolution is deliberately narrower in v1 and is entered only by public `POST /v1/chat/completions`; translated protocols, token probes, and direct Responses remain outside policy selection. The selected internal terminal route may use native Chat or process-owned Chat-over-Responses. Direct `anthropic-compatible` forwarding and direct `/v1/responses` remain separate paths.
+Chat-compatible ingress converges before provider I/O: public OpenAI Chat, translated Anthropic Messages, translated Gemini generation, their count-token probes, dashboard insights, and bounded policy Responses input all submit canonical Chat requests to the same execution layer. Schema-v2 policy resolution is entered by OpenAI Chat, translated Anthropic Messages/counting, and stateless policy Responses; Gemini and ordinary direct Responses remain outside policy selection. Direct `anthropic-compatible` forwarding and non-policy `/v1/responses` remain separate paths.
 
 ## Package Responsibilities
 
@@ -64,11 +64,11 @@ Only the public registry resolves client model IDs. Internal routes have no publ
 
 Public identity stays route-owned in the catalog: `/v1/models` exposes one entry for an explicit route, and target IDs, deployment names, and temporary target availability do not become separate public models or mutate catalog metadata. Explicit Responses output, websocket metadata, and translated Anthropic/Gemini output use the public ID. Legacy OpenAI Chat normalization remains conservative and can preserve a nonempty provider-supplied `model`. Explicit routes normalize supported Chat JSON and SSE model fields and model headers to the route public ID.
 
-For a policy entry, public identity is profile-owned. `/v1/models` exposes one `owned_by: vekil-policy` entry with only `/chat/completions`; normalized Chat JSON/SSE, safe model headers, errors, and metrics retain the profile public ID even though execution uses an internal terminal route. Internal provider, terminal-route, target, and deployment identities are bounded operational provenance and do not leak through normalized output.
+For a policy entry, public identity is profile-owned. `/v1/models` exposes one `owned_by: vekil-policy` entry with `/chat/completions` metadata; normalized Chat, translated Anthropic, and adapted stateless Responses output, safe model headers, errors, and metrics retain the profile public ID even when an internal terminal route executes through Responses-backed Chat. Internal provider, terminal-route, target, and deployment identities are bounded operational provenance and do not leak through normalized output.
 
 ## Policy Planning Seam
 
-The OpenAI Chat handler sees policy routing through one planner seam. The planner owns public-entry lookup, effective mode resolution, bounded fact construction, observer/classifier admission, classifier-route health, deterministic signal mapping, terminal route selection, and bounded decision provenance. It returns a sealed operation plan containing copied candidate bindings and separate public-profile and terminal-route identity.
+Canonical Chat ingress sees policy routing through one planner seam. The planner owns public-entry lookup, effective mode resolution, bounded fact construction, observer/classifier admission, classifier-route health, deterministic signal mapping, terminal route selection, and bounded decision provenance. It returns a sealed operation plan containing copied candidate bindings and separate public-profile and terminal-route identity.
 
 The plan is sealed before first-send admission and contains no prompt text, tool arguments, credentials, or classifier rationale. The handler executes the returned plan rather than rescanning route targets or reading terminal public identity independently.
 
@@ -119,8 +119,8 @@ Bindings use keyed digests and live in a process-local index capped at 32,768 en
 - Pure `net/http` with Go `ServeMux` routing; no web framework.
 - Vekil is a multi-provider proxy. Zero-config startup currently uses GitHub Copilot, but explicit provider config can extend or replace that default behind the same public surface.
 - Public model IDs are a single namespace across legacy provider models and explicit model routes. The proxy validates normalized ownership during startup and fails fast on collisions.
-- Schema-v2 policy profiles share that public namespace but select only between `lightweight` and `powerful` OpenAI-family Chat execution routes. Internal routes are operational-only and exposed public terminal routes deliberately bypass policy.
-- Policy routing is quality/cost optimization, not authorization or spend enforcement. V1 is text/function-tool OpenAI Chat only, per-turn, stateless, and limited to one trusted user/tenant per deployment.
+- Schema-v2 policy profiles share that public namespace but select only between `lightweight` and `powerful` terminal routes that execute canonical Chat through native Chat or bounded Chat-over-Responses. Internal routes are operational-only and exposed public terminal routes deliberately bypass policy.
+- Policy routing is quality/cost optimization, not authorization or spend enforcement. Its public contract is text/function-tool canonical Chat with translated Anthropic and bounded stateless Responses ingress; selection remains per-turn, with process-local replay bound to its originating route/tier and downstream-bridge replay limited to the documented single-target `off`/`observe` exception, and is limited to one trusted user/tenant per deployment.
 - Classifier content forwarding, trust-domain crossing, and provider retention require explicit operator acknowledgements. Those acknowledgements and live protocol preflight do not prove an external provider's retention behavior.
 - Provider endpoint support is explicit. `models[].endpoints` and `model_routes[].endpoints` are allowlists, so do not expose `/chat/completions` or other routes until every target in the public contract has verified equivalent behavior.
 - Gemini is a translation path like Anthropic, not a passthrough path.

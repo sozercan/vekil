@@ -661,6 +661,7 @@ type policyClassifierHTTPResponse struct {
 	StatusCode int
 	Header     http.Header
 	Body       []byte
+	Usage      policyStatsTokenUsage
 }
 
 type policyHTTPClassifierOptions struct {

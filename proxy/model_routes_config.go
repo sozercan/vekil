@@ -287,7 +287,6 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 	routeIDs := make(map[string]string, len(validated.config.ModelRoutes))
 	routeConfigs := make(map[string]*ModelRouteConfig, len(validated.config.ModelRoutes))
 	publicIDs := make(map[string]string, len(validated.config.ModelRoutes)*2+len(validated.config.PolicyProfiles)*2)
-	policyTerminalRoutes := policyTerminalRouteReferences(validated.config.PolicyProfiles)
 	totalTargets := 0
 	for routeIndex := range validated.config.ModelRoutes {
 		routePath := fmt.Sprintf("model_routes[%d]", routeIndex)
@@ -331,18 +330,12 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 			if !exists {
 				return validatedProvidersConfig{}, configPathError(targetPath+".provider", "references unknown provider %q", target.Provider)
 			}
-			if descriptor.kind == providerTypeCopilot && route.Exposure != modelRouteExposureInternal {
-				return validatedProvidersConfig{}, configPathError(targetPath+".provider", "Copilot explicit targets require an internal policy route")
-			}
 			if descriptor.kind == providerTypeCopilot {
-				if _, referenced := policyTerminalRoutes[route.ID]; !referenced {
-					return validatedProvidersConfig{}, configPathError(targetPath+".provider", "Copilot explicit targets must be referenced by policy_profiles as a lightweight, powerful, or classifier route")
-				}
 				if !descriptor.modelFilter.allows(target.UpstreamModel) {
 					return validatedProvidersConfig{}, configPathError(targetPath+".upstream_model", "model %q is excluded by provider %q include_models/exclude_models filters", target.UpstreamModel, descriptor.id)
 				}
 			}
-			if descriptor.kind != providerTypeCopilot && !providerKindSupportsExplicitRoutes(descriptor.kind) {
+			if !providerKindSupportsExplicitRoutes(descriptor.kind) {
 				return validatedProvidersConfig{}, configPathError(targetPath+".provider", "provider %q has unsupported explicit-route type %q", descriptor.id, descriptor.kind)
 			}
 			if (descriptor.kind == providerTypeOpenAICompatible || descriptor.kind == providerTypeAnthropicCompatible) && descriptor.modelDiscovery != providerModelDiscoveryStatic {
@@ -1147,7 +1140,7 @@ func configuredPublicModelAliases(publicID string) []string {
 
 func providerKindSupportsExplicitRoutes(kind providerType) bool {
 	switch kind {
-	case providerTypeAzureOpenAI, providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		return true
 	default:
 		return false

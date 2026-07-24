@@ -15,12 +15,6 @@ func (ClaudeAdapter) Name() string { return "claude" }
 func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	model := strings.TrimSpace(input.Model.ID)
 	hasModel := model != ""
-	if hasModel && strings.TrimSpace(input.Model.OwnedBy) == PolicyModelOwner {
-		return PreparedProcess{}, fmt.Errorf(
-			"model %q is not Claude-compatible: policy-routed model IDs are not supported on Anthropic ingress; use vekil launch copilot instead",
-			model,
-		)
-	}
 	endpointMetadataKnown := !input.DryRun || input.Model.SupportedEndpoints != nil
 	if hasModel && endpointMetadataKnown &&
 		!modelSupportsEndpoint(input.Model, "/v1/messages") &&
@@ -171,6 +165,9 @@ func validateClaudeVersion(executable resolvedExecutable, environment []string) 
 }
 
 func validateClaudeForwardedArgs(args []string) error {
+	if err := validateClaudePermissionArgs(args); err != nil {
+		return err
+	}
 	expectValue := false
 	seenPositional := false
 	printMode := false
@@ -226,6 +223,42 @@ func validateClaudeForwardedArgs(args []string) error {
 		}
 	}
 	return nil
+}
+
+func validateClaudePermissionArgs(args []string) error {
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if arg == "--" {
+			return nil
+		}
+		switch {
+		case arg == "--dangerously-skip-permissions", arg == "--allow-dangerously-skip-permissions":
+			return fmt.Errorf(
+				"claude permission bypass %q is not supported by the managed Vekil launcher; use explicit --allowed-tools/--disallowed-tools rules",
+				arg,
+			)
+		case arg == "--permission-mode":
+			if index+1 >= len(args) {
+				return nil
+			}
+			index++
+			if mode := strings.TrimSpace(args[index]); mode != "manual" && mode != "default" {
+				return unsupportedClaudePermissionMode(mode)
+			}
+		case strings.HasPrefix(arg, "--permission-mode="):
+			if mode := strings.TrimSpace(strings.TrimPrefix(arg, "--permission-mode=")); mode != "manual" && mode != "default" {
+				return unsupportedClaudePermissionMode(mode)
+			}
+		}
+	}
+	return nil
+}
+
+func unsupportedClaudePermissionMode(mode string) error {
+	return fmt.Errorf(
+		"claude permission mode %q is not supported by the managed Vekil launcher while subprocess credential scrubbing is enabled; use default/manual mode with explicit --allowed-tools/--disallowed-tools rules",
+		mode,
+	)
 }
 
 func claudeNonAgentCommand(command string) bool {

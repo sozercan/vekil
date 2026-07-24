@@ -176,6 +176,10 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = r.Body.Close() }()
 	requestedModel := extractResponsesRequestModel(bodyBytes)
 	h.observePolicyRequestSummary(r.Context(), "responses", requestedModel, parseResponsesRequestMetadata(bodyBytes).Stream)
+	if publicID, ok := h.policyPublicModelID(requestedModel); ok {
+		h.handlePolicyResponses(w, r, bodyBytes, publicID)
+		return
+	}
 	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), requestedModel, providerEndpointResponses)
 	if err != nil {
 		h.writeResponsesUpstreamRequestFailure(w, r, nil, "responses_admission", err)

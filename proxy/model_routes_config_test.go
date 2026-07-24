@@ -494,28 +494,6 @@ func TestValidateModelRoutesProviderCompatibility(t *testing.T) {
 		want string
 	}{
 		{
-			name: "public copilot route is not a policy destination",
-			cfg: ProvidersConfig{SchemaVersion: 2, Providers: []ProviderConfig{{ID: "copilot", Type: "copilot"}}, ModelRoutes: []ModelRouteConfig{{
-				ID: "route", PublicID: "model", Endpoints: []string{providerEndpointResponses}, Targets: []ModelRouteTargetConfig{{ID: "target", Provider: "copilot", UpstreamModel: "model"}},
-			}}},
-			want: "Copilot explicit targets require an internal policy route",
-		},
-		{
-			name: "unreferenced internal copilot failover route is not a policy destination",
-			cfg: ProvidersConfig{SchemaVersion: 2, Providers: []ProviderConfig{
-				{ID: "copilot", Type: "copilot", Default: true},
-				{ID: "azure", Type: "azure-openai", BaseURL: "https://x.openai.azure.com/openai/v1", APIKey: "key"},
-			}, ModelRoutes: []ModelRouteConfig{{
-				ID: "internal-route", Exposure: modelRouteExposureInternal, Endpoints: []string{providerEndpointResponses},
-				Targets: []ModelRouteTargetConfig{
-					{ID: "copilot", Provider: "copilot", UpstreamModel: "model"},
-					{ID: "azure", Provider: "azure", UpstreamModel: "deployment"},
-				},
-				Routing: ModelRouteRoutingConfig{Mode: string(routeModePriorityFailover), MaxTargetAttempts: 2, MaxUpstreamSends: 2},
-			}}},
-			want: "must be referenced by policy_profiles",
-		},
-		{
 			name: "dynamic generic provider cannot be explicit target",
 			cfg: ProvidersConfig{SchemaVersion: 2, Providers: []ProviderConfig{{ID: "dynamic", Type: "openai-compatible", BaseURL: "https://example.test/v1", AuthType: "none", ModelDiscovery: "openai"}}, ModelRoutes: []ModelRouteConfig{{
 				ID: "route", PublicID: "model", Endpoints: []string{providerEndpointResponses}, Targets: []ModelRouteTargetConfig{{ID: "target", Provider: "dynamic", UpstreamModel: "model"}},
@@ -551,6 +529,31 @@ func TestValidateModelRoutesProviderCompatibility(t *testing.T) {
 				t.Fatalf("validation error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestValidateModelRoutesAllowsCopilotExplicitTargets(t *testing.T) {
+	cfg := ProvidersConfig{
+		SchemaVersion: 2,
+		Providers: []ProviderConfig{{
+			ID:          "copilot",
+			Type:        "copilot",
+			Default:     true,
+			TrustDomain: "github-copilot",
+		}},
+		ModelRoutes: []ModelRouteConfig{{
+			ID:        "route",
+			PublicID:  "semantic-model",
+			Endpoints: []string{providerEndpointChatCompletions, providerEndpointResponses},
+			Targets: []ModelRouteTargetConfig{{
+				ID:            "target",
+				Provider:      "copilot",
+				UpstreamModel: "gpt-5.6-sol",
+			}},
+		}},
+	}
+	if _, err := validateAndNormalizeProvidersConfig(cfg); err != nil {
+		t.Fatalf("validateAndNormalizeProvidersConfig() error = %v", err)
 	}
 }
 

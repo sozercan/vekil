@@ -31,9 +31,10 @@ type responsesChatRequestOptions struct {
 }
 
 type responsesChatRequestPlan struct {
-	Body         []byte
-	Stream       bool
-	IncludeUsage bool
+	Body               []byte
+	Stream             bool
+	IncludeUsage       bool
+	ReplayToolDefaults responsesChatReplayToolDefaults
 }
 
 type responsesChatRequestEnvelope struct {
@@ -82,7 +83,6 @@ func translateChatRequestToResponses(chatBody []byte, options responsesChatReque
 	if err := json.Unmarshal(messagesRaw, &messages); err != nil || len(messages) == 0 {
 		return responsesChatRequestPlan{}, newChatInvalidRequest("messages", "messages must be a non-empty array")
 	}
-
 	input, err := translateChatMessagesToResponses(messages, options)
 	if err != nil {
 		return responsesChatRequestPlan{}, err
@@ -135,7 +135,7 @@ func translateChatRequestToResponses(chatBody []byte, options responsesChatReque
 	if err != nil {
 		return responsesChatRequestPlan{}, err
 	}
-	tools, toolNames, err := translateChatTools(raw["tools"])
+	tools, toolNames, replayToolDefaults, err := translateChatTools(raw["tools"])
 	if err != nil {
 		return responsesChatRequestPlan{}, err
 	}
@@ -207,7 +207,7 @@ func translateChatRequestToResponses(chatBody []byte, options responsesChatReque
 	if marshalErr != nil {
 		return responsesChatRequestPlan{}, fmt.Errorf("marshal Responses request: %w", marshalErr)
 	}
-	return responsesChatRequestPlan{Body: body, Stream: stream, IncludeUsage: includeUsage}, nil
+	return responsesChatRequestPlan{Body: body, Stream: stream, IncludeUsage: includeUsage, ReplayToolDefaults: replayToolDefaults}, nil
 }
 
 func requiredJSONString(raw map[string]json.RawMessage, field string) (string, error) {
@@ -321,20 +321,13 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 			syntheticItems := make([]json.RawMessage, len(message.ToolCalls))
 			replayCalls := 0
 			for callIndex, callRaw := range message.ToolCalls {
-				callID, item, err := translateSyntheticChatToolCall(callRaw, index, callIndex)
+				translatedCall, err := translateSyntheticChatToolCall(callRaw, index, callIndex)
 				if err != nil {
 					return nil, err
 				}
-				var parsed struct {
-					Function struct {
-						Name      string `json:"name"`
-						Arguments string `json:"arguments"`
-					} `json:"function"`
-				}
-				_ = json.Unmarshal(callRaw, &parsed)
-				projected[callIndex] = responsesChatReplayProjectedCall{ID: callID, Name: strings.TrimSpace(parsed.Function.Name), Arguments: parsed.Function.Arguments}
-				syntheticItems[callIndex] = item
-				if isResponsesChatReplayCallID(callID) {
+				projected[callIndex] = responsesChatReplayProjectedCall{ID: translatedCall.ID, Name: translatedCall.Name, Arguments: translatedCall.Arguments}
+				syntheticItems[callIndex] = translatedCall.Item
+				if isResponsesChatReplayCallID(translatedCall.ID) {
 					replayCalls++
 				}
 			}
@@ -558,58 +551,92 @@ func isResponsesChatReplayCallID(id string) bool {
 	return true
 }
 
-func translateSyntheticChatToolCall(raw json.RawMessage, messageIndex, callIndex int) (string, json.RawMessage, error) {
+type translatedSyntheticChatToolCall struct {
+	ID        string
+	Name      string
+	Arguments string
+	Item      json.RawMessage
+}
+
+func translateSyntheticChatToolCall(raw json.RawMessage, messageIndex, callIndex int) (translatedSyntheticChatToolCall, error) {
 	param := fmt.Sprintf("messages[%d].tool_calls[%d]", messageIndex, callIndex)
-	callObject, err := validateChatRawObjectFields(raw, param, "id", "type", "function")
+	callObject, err := validateChatRawObjectFields(raw, param, "id", "type", "function", "custom")
 	if err != nil {
-		return "", nil, err
+		return translatedSyntheticChatToolCall{}, err
 	}
-	functionObject := map[string]json.RawMessage(nil)
-	if functionRaw, ok := callObject["function"]; ok {
-		var err error
-		functionObject, err = validateChatRawObjectFields(functionRaw, param+".function", "name", "arguments")
-		if err != nil {
-			return "", nil, err
-		}
+	var header struct {
+		ID   string `json:"id"`
+		Type string `json:"type"`
 	}
-	if functionObject == nil {
-		return "", nil, newChatInvalidRequest(param+".function", "function is required")
+	if err := json.Unmarshal(raw, &header); err != nil {
+		return translatedSyntheticChatToolCall{}, newChatInvalidRequest(param, "tool call must be an object")
 	}
-	rawArguments, ok := functionObject["arguments"]
-	if !ok {
-		return "", nil, newChatInvalidRequest(param+".function.arguments", "function arguments string is required")
-	}
-	var decodedArguments string
-	if bytes.Equal(bytes.TrimSpace(rawArguments), []byte("null")) {
-		return "", nil, newChatInvalidRequest(param+".function.arguments", "function arguments must be a string")
-	}
-	if err := json.Unmarshal(rawArguments, &decodedArguments); err != nil {
-		return "", nil, newChatInvalidRequest(param+".function.arguments", "function arguments must be a string")
-	}
-	var call struct {
-		ID       string `json:"id"`
-		Type     string `json:"type"`
-		Function struct {
-			Name      string `json:"name"`
-			Arguments string `json:"arguments"`
-		} `json:"function"`
-	}
-	if err := json.Unmarshal(raw, &call); err != nil {
-		return "", nil, newChatInvalidRequest(param, "tool call must be an object")
-	}
-	callID := strings.TrimSpace(call.ID)
+	callID := strings.TrimSpace(header.ID)
 	if callID == "" {
-		return "", nil, newChatInvalidRequest(param+".id", "tool call ID is required")
+		return translatedSyntheticChatToolCall{}, newChatInvalidRequest(param+".id", "tool call ID is required")
 	}
-	if call.Type != "" && call.Type != "function" {
-		return "", nil, newChatInvalidRequest(param+".type", "only function tool calls are supported")
+	callType := strings.TrimSpace(header.Type)
+	if callType == "" {
+		callType = "function"
 	}
-	name := strings.TrimSpace(call.Function.Name)
-	if name == "" {
-		return "", nil, newChatInvalidRequest(param+".function.name", "function name is required")
+
+	name := ""
+	arguments := ""
+	switch callType {
+	case "function":
+		if rawCustom, ok := callObject["custom"]; ok && !bytes.Equal(bytes.TrimSpace(rawCustom), []byte("null")) {
+			return translatedSyntheticChatToolCall{}, newChatInvalidRequest(param+".custom", "custom is not valid for a function tool call")
+		}
+		functionRaw, ok := callObject["function"]
+		if !ok {
+			return translatedSyntheticChatToolCall{}, newChatInvalidRequest(param+".function", "function is required")
+		}
+		functionObject, err := validateChatRawObjectFields(functionRaw, param+".function", "name", "arguments")
+		if err != nil {
+			return translatedSyntheticChatToolCall{}, err
+		}
+		rawArguments, ok := functionObject["arguments"]
+		if !ok {
+			return translatedSyntheticChatToolCall{}, newChatInvalidRequest(param+".function.arguments", "function arguments string is required")
+		}
+		if bytes.Equal(bytes.TrimSpace(rawArguments), []byte("null")) || json.Unmarshal(rawArguments, &arguments) != nil {
+			return translatedSyntheticChatToolCall{}, newChatInvalidRequest(param+".function.arguments", "function arguments must be a string")
+		}
+		if rawName, ok := functionObject["name"]; !ok || json.Unmarshal(rawName, &name) != nil || strings.TrimSpace(name) == "" {
+			return translatedSyntheticChatToolCall{}, newChatInvalidRequest(param+".function.name", "function name is required")
+		}
+		name = strings.TrimSpace(name)
+	case "custom":
+		if !isResponsesChatReplayCallID(callID) {
+			return translatedSyntheticChatToolCall{}, newChatInvalidRequest(param+".type", "custom tool-call history is supported only for Responses replay IDs")
+		}
+		if rawFunction, ok := callObject["function"]; ok && !bytes.Equal(bytes.TrimSpace(rawFunction), []byte("null")) {
+			return translatedSyntheticChatToolCall{}, newChatInvalidRequest(param+".function", "function is not valid for a custom tool call")
+		}
+		customRaw, ok := callObject["custom"]
+		if !ok {
+			return translatedSyntheticChatToolCall{}, newChatInvalidRequest(param+".custom", "custom is required")
+		}
+		customObject, err := validateChatRawObjectFields(customRaw, param+".custom", "name", "input")
+		if err != nil {
+			return translatedSyntheticChatToolCall{}, err
+		}
+		var input string
+		if rawName, ok := customObject["name"]; !ok || json.Unmarshal(rawName, &name) != nil || strings.TrimSpace(name) == "" {
+			return translatedSyntheticChatToolCall{}, newChatInvalidRequest(param+".custom.name", "custom tool name is required")
+		}
+		if rawInput, ok := customObject["input"]; !ok || bytes.Equal(bytes.TrimSpace(rawInput), []byte("null")) || json.Unmarshal(rawInput, &input) != nil {
+			return translatedSyntheticChatToolCall{}, newChatInvalidRequest(param+".custom.input", "custom tool input must be a string")
+		}
+		name = strings.TrimSpace(name)
+		encodedInput, _ := json.Marshal(map[string]string{"input": input})
+		arguments = string(encodedInput)
+	default:
+		return translatedSyntheticChatToolCall{}, newChatInvalidRequest(param+".type", "only function tool calls and replay-backed custom tool calls are supported")
 	}
-	item, _ := json.Marshal(map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": call.Function.Arguments})
-	return callID, item, nil
+
+	item, _ := json.Marshal(map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": arguments})
+	return translatedSyntheticChatToolCall{ID: callID, Name: name, Arguments: arguments, Item: item}, nil
 }
 
 func compactChatToolOutput(raw json.RawMessage, messageIndex int) (string, error) {
@@ -800,33 +827,34 @@ func parseChatStreamOptions(raw map[string]json.RawMessage) (bool, error) {
 	return include, nil
 }
 
-func translateChatTools(raw json.RawMessage) ([]json.RawMessage, map[string]struct{}, error) {
+func translateChatTools(raw json.RawMessage) ([]json.RawMessage, map[string]struct{}, responsesChatReplayToolDefaults, error) {
 	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	var tools []json.RawMessage
 	if err := json.Unmarshal(raw, &tools); err != nil {
-		return nil, nil, newChatInvalidRequest("tools", "tools must be an array")
+		return nil, nil, nil, newChatInvalidRequest("tools", "tools must be an array")
 	}
 	translated := make([]json.RawMessage, 0, len(tools))
 	names := make(map[string]struct{}, len(tools))
+	toolDefaults := make(responsesChatReplayToolDefaults)
 	for i, toolRaw := range tools {
 		toolParam := fmt.Sprintf("tools[%d]", i)
 		toolObject, err := validateChatRawObjectFields(toolRaw, toolParam, "type", "function")
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		var functionObject map[string]json.RawMessage
 		if functionRaw, ok := toolObject["function"]; ok {
 			functionObject, err = validateChatRawObjectFields(functionRaw, toolParam+".function", "name", "description", "parameters", "strict")
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		}
 		strict := false
 		if strictRaw, ok := functionObject["strict"]; ok && !bytes.Equal(bytes.TrimSpace(strictRaw), []byte("null")) {
 			if err := json.Unmarshal(strictRaw, &strict); err != nil {
-				return nil, nil, newChatInvalidRequest(toolParam+".function.strict", "strict must be a boolean")
+				return nil, nil, nil, newChatInvalidRequest(toolParam+".function.strict", "strict must be a boolean")
 			}
 		}
 		var tool struct {
@@ -838,17 +866,17 @@ func translateChatTools(raw json.RawMessage) ([]json.RawMessage, map[string]stru
 			} `json:"function"`
 		}
 		if err := json.Unmarshal(toolRaw, &tool); err != nil {
-			return nil, nil, newChatInvalidRequest(fmt.Sprintf("tools[%d]", i), "tool must be an object")
+			return nil, nil, nil, newChatInvalidRequest(fmt.Sprintf("tools[%d]", i), "tool must be an object")
 		}
 		if strings.TrimSpace(tool.Type) != "function" {
-			return nil, nil, newChatInvalidRequest(fmt.Sprintf("tools[%d].type", i), "only function tools are supported")
+			return nil, nil, nil, newChatInvalidRequest(fmt.Sprintf("tools[%d].type", i), "only function tools are supported")
 		}
 		name := strings.TrimSpace(tool.Function.Name)
 		if name == "" {
-			return nil, nil, newChatInvalidRequest(fmt.Sprintf("tools[%d].function.name", i), "function name is required")
+			return nil, nil, nil, newChatInvalidRequest(fmt.Sprintf("tools[%d].function.name", i), "function name is required")
 		}
 		if _, duplicate := names[name]; duplicate {
-			return nil, nil, newChatInvalidRequest(fmt.Sprintf("tools[%d].function.name", i), "function names must be unique")
+			return nil, nil, nil, newChatInvalidRequest(fmt.Sprintf("tools[%d].function.name", i), "function names must be unique")
 		}
 		names[name] = struct{}{}
 		parameters := tool.Function.Parameters
@@ -857,8 +885,11 @@ func translateChatTools(raw json.RawMessage) ([]json.RawMessage, map[string]stru
 		} else {
 			var schema map[string]json.RawMessage
 			if err := json.Unmarshal(parameters, &schema); err != nil || schema == nil {
-				return nil, nil, newChatInvalidRequest(fmt.Sprintf("tools[%d].function.parameters", i), "function parameters must be a JSON object")
+				return nil, nil, nil, newChatInvalidRequest(fmt.Sprintf("tools[%d].function.parameters", i), "function parameters must be a JSON object")
 			}
+		}
+		if defaults := replayOptionalDefaultsFromJSONSchema(parameters); len(defaults) > 0 {
+			toolDefaults[name] = defaults
 		}
 		flattened := map[string]any{
 			"type":       "function",
@@ -871,11 +902,50 @@ func translateChatTools(raw json.RawMessage) ([]json.RawMessage, map[string]stru
 		}
 		encoded, err := json.Marshal(flattened)
 		if err != nil {
-			return nil, nil, fmt.Errorf("marshal function tool: %w", err)
+			return nil, nil, nil, fmt.Errorf("marshal function tool: %w", err)
 		}
 		translated = append(translated, encoded)
 	}
-	return translated, names, nil
+	if len(toolDefaults) == 0 {
+		toolDefaults = nil
+	}
+	return translated, names, toolDefaults, nil
+}
+
+func replayOptionalDefaultsFromJSONSchema(parameters json.RawMessage) responsesChatReplayOptionalDefaults {
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	if json.Unmarshal(parameters, &schema) != nil || len(schema.Properties) == 0 {
+		return nil
+	}
+	required := make(map[string]struct{}, len(schema.Required))
+	for _, name := range schema.Required {
+		required[name] = struct{}{}
+	}
+	defaults := make(responsesChatReplayOptionalDefaults)
+	for name, propertyRaw := range schema.Properties {
+		if _, isRequired := required[name]; isRequired {
+			continue
+		}
+		var property map[string]json.RawMessage
+		if json.Unmarshal(propertyRaw, &property) != nil {
+			continue
+		}
+		defaultRaw, ok := property["default"]
+		if !ok {
+			continue
+		}
+		canonical, err := canonicalReplayJSONValue(defaultRaw)
+		if err == nil {
+			defaults[name] = cloneReplayRawMessage(canonical)
+		}
+	}
+	if len(defaults) == 0 {
+		return nil
+	}
+	return defaults
 }
 
 func translateChatToolChoice(raw json.RawMessage, toolNames map[string]struct{}) (json.RawMessage, error) {

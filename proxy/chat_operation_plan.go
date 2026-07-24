@@ -123,7 +123,13 @@ func clonePolicyOperationRoute(route *modelRoute, contract publicModelContract, 
 		return nil
 	}
 	cloned := *route
+	physicalEndpoints := append([]string(nil), route.public.endpoints...)
 	cloned.public = clonePublicModelContract(contract)
+	// The policy contract remains the client-visible Chat identity, while the
+	// sealed operation must retain the selected terminal route's physical wire
+	// endpoints so a Responses-backed target can execute Chat compatibility in
+	// process.
+	cloned.public.endpoints = physicalEndpoints
 	cloned.targets = cloneTargetBindings(candidates)
 	cloned.legacy = false
 	return &cloned
@@ -131,6 +137,20 @@ func clonePolicyOperationRoute(route *modelRoute, contract publicModelContract, 
 
 func (p chatOperationPlan) valid() bool {
 	return p.operationRoute != nil && p.publicID != "" && p.routeID != "" && len(p.candidates) > 0
+}
+
+// allowsResponsesReplayPassthrough reports whether a policy-planned Chat
+// continuation can safely preserve replay state owned by a downstream bridge.
+// Off and observe always select the baseline tier; requiring one sealed target
+// keeps that continuation pinned to the same deterministic route destination.
+// Target determinism does not create replica affinity: deployments that accept
+// downstream process-local replay IDs must use one bridge process or sticky
+// ingress to the replay-owning bridge, as documented for replay state.
+func (p chatOperationPlan) allowsResponsesReplayPassthrough() bool {
+	if !p.valid() || len(p.candidates) != 1 {
+		return false
+	}
+	return p.effectiveMode == policyModeOff || p.effectiveMode == policyModeObserve
 }
 
 func (p chatOperationPlan) routeSnapshot() *modelRoute {

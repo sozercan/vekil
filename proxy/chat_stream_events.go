@@ -356,14 +356,30 @@ func writeOpenAIChatSSEError(w http.ResponseWriter, streamErr *chatStreamError) 
 }
 
 func aggregateChatStreamEvents(stream *chatStreamEventStream) (*models.OpenAIResponse, error) {
-	aggregator := newOpenAIResponseAggregator()
+	return aggregateChatStreamEventsWithOptions(stream, openAIResponseBuildOptions{})
+}
+
+func aggregatePolicyChatStreamEvents(stream *chatStreamEventStream) (*models.OpenAIResponse, error) {
+	return aggregateChatStreamEventsWithOptions(stream, openAIResponseBuildOptions{
+		preserveInvalidToolArguments: true,
+		rejectInvalidTextDeltas:      true,
+		maxAccumulatedBytes:          maxLargeRequestBodySize,
+	})
+}
+
+func aggregateChatStreamEventsWithOptions(stream *chatStreamEventStream, options openAIResponseBuildOptions) (*models.OpenAIResponse, error) {
+	aggregator := newOpenAIResponseAggregatorWithOptions(options)
 	if err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
-		aggregator.addChunk(chunk)
-		return nil
+		return aggregator.addChunkBounded(chunk)
 	}); err != nil {
 		return nil, err
 	}
-	return aggregator.buildResponse(), nil
+	if options.rejectInvalidTextDeltas {
+		if err := aggregator.policyTextDeltaError(); err != nil {
+			return nil, err
+		}
+	}
+	return aggregator.buildResponseWithOptions(options), nil
 }
 
 func streamChatEventsToAnthropic(

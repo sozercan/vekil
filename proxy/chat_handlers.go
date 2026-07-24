@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -37,6 +38,375 @@ type chatCompletionsResponseHandlers struct {
 	streamEvents func(*chatStreamEventStream)
 	aggregate    func(*models.OpenAIResponse)
 	passthrough  func(*http.Response) error
+}
+
+type policyOpenAIStreamChoiceState struct {
+	finished      bool
+	outputBearing bool
+}
+
+type policySanitizedOpenAIStream struct {
+	body           io.ReadCloser
+	reader         *bufio.Reader
+	maxEventBytes  int
+	pending        []byte
+	pendingErr     error
+	sourceEOF      bool
+	terminal       bool
+	sawChoice      bool
+	choiceFinished bool
+}
+
+func newPolicySanitizedOpenAIStream(body io.ReadCloser) io.ReadCloser {
+	if body == nil {
+		return nil
+	}
+	return &policySanitizedOpenAIStream{
+		body:          body,
+		reader:        bufio.NewReaderSize(body, openAIStreamScannerInitialBuffer),
+		maxEventBytes: openAIStreamScannerMaxBuffer,
+	}
+}
+
+func (s *policySanitizedOpenAIStream) Read(p []byte) (int, error) {
+	for len(s.pending) == 0 {
+		if s.pendingErr != nil {
+			err := s.pendingErr
+			s.pendingErr = nil
+			return 0, err
+		}
+		if s.terminal {
+			return 0, io.EOF
+		}
+		event, err := s.readEvent()
+		s.pending = event
+		s.pendingErr = err
+	}
+	n := copy(p, s.pending)
+	s.pending = s.pending[n:]
+	return n, nil
+}
+
+func (s *policySanitizedOpenAIStream) Close() error {
+	if s == nil || s.body == nil {
+		return nil
+	}
+	return s.body.Close()
+}
+
+func (s *policySanitizedOpenAIStream) readEvent() ([]byte, error) {
+	if s.sourceEOF {
+		return s.failEvent(http.StatusBadGateway), nil
+	}
+	var raw bytes.Buffer
+	eventType := ""
+	dataLines := make([]string, 0, 1)
+	for {
+		line, err := readOpenAISSELine(s.reader)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return s.failEvent(http.StatusBadGateway), nil
+		}
+		if line != "" {
+			limit := s.maxEventBytes
+			if limit <= 0 {
+				limit = openAIStreamScannerMaxBuffer
+			}
+			if len(line) > limit-raw.Len() {
+				return s.failEvent(http.StatusBadGateway), nil
+			}
+			raw.WriteString(line)
+			content, _ := splitSSELineEnding(line)
+			if parsed, ok := parseSSEEventLine(content); ok {
+				eventType = parsed
+			}
+			if data, ok := parseSSELine(content); ok {
+				dataLines = append(dataLines, data)
+			}
+			if strings.TrimSpace(content) == "" {
+				if errors.Is(err, io.EOF) {
+					s.sourceEOF = true
+				}
+				return s.sanitizeEvent(raw.Bytes(), eventType, dataLines), nil
+			}
+		}
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			s.sourceEOF = true
+			if raw.Len() > 0 {
+				event := s.sanitizeEvent(raw.Bytes(), eventType, dataLines)
+				if s.terminal {
+					return terminatePolicySSEEvent(event), nil
+				}
+				return s.failEvent(http.StatusBadGateway), nil
+			}
+			return s.failEvent(http.StatusBadGateway), nil
+		}
+		return s.failEvent(http.StatusBadGateway), nil
+	}
+}
+
+func (s *policySanitizedOpenAIStream) sanitizeEvent(raw []byte, eventType string, dataLines []string) []byte {
+	if len(dataLines) == 0 {
+		return append([]byte(nil), raw...)
+	}
+	data := strings.Join(dataLines, "\n")
+	if strings.TrimSpace(data) == "[DONE]" {
+		if !s.allChoicesFinished() {
+			return s.failEvent(http.StatusBadGateway)
+		}
+		s.terminal = true
+		_ = s.body.Close()
+		return append([]byte(nil), raw...)
+	}
+	if !json.Valid([]byte(data)) {
+		return s.failEvent(http.StatusBadGateway)
+	}
+	if streamErr, ok := parseOpenAIStreamError(eventType, data); ok {
+		return s.failEvent(streamErr.httpStatus())
+	}
+	choice, recognized := inspectPolicyOpenAIStreamChunk(eventType, data)
+	if !recognized {
+		return s.failEvent(http.StatusBadGateway)
+	}
+	if !s.observeChunkChoice(choice) {
+		return s.failEvent(http.StatusBadGateway)
+	}
+	return append([]byte(nil), raw...)
+}
+
+func (s *policySanitizedOpenAIStream) failEvent(status int) []byte {
+	s.terminal = true
+	if s.body != nil {
+		_ = s.body.Close()
+	}
+	return policySanitizedOpenAIStreamErrorEvent(status)
+}
+
+func (s *policySanitizedOpenAIStream) observeChunkChoice(choice *policyOpenAIStreamChoiceState) bool {
+	if choice == nil {
+		return true
+	}
+	if s.choiceFinished && choice.outputBearing {
+		return false
+	}
+	s.sawChoice = true
+	if choice.finished {
+		s.choiceFinished = true
+	}
+	return true
+}
+
+func (s *policySanitizedOpenAIStream) allChoicesFinished() bool {
+	return s != nil && s.sawChoice && s.choiceFinished
+}
+
+func recognizedPolicyOpenAIStreamChunk(eventType, data string) bool {
+	_, ok := inspectPolicyOpenAIStreamChunk(eventType, data)
+	return ok
+}
+
+func inspectPolicyOpenAIStreamChunk(eventType, data string) (*policyOpenAIStreamChoiceState, bool) {
+	switch strings.ToLower(strings.TrimSpace(eventType)) {
+	case "", "message", "completion", "chat.completion.chunk":
+	default:
+		return nil, false
+	}
+
+	raw, err := decodeChatJSONObject([]byte(data), "")
+	if err != nil || raw == nil {
+		return nil, false
+	}
+	if hasCaseFoldedJSONFieldAlias(raw,
+		"id", "object", "created", "model", "choices", "usage", "moderation",
+		"system_fingerprint", "service_tier", "prompt_filter_results", "prompt_annotations",
+	) {
+		return nil, false
+	}
+	var chunk models.OpenAIStreamChunk
+	if json.Unmarshal([]byte(data), &chunk) != nil {
+		return nil, false
+	}
+	if object := strings.TrimSpace(chunk.Object); object != "" && object != "chat.completion.chunk" {
+		return nil, false
+	}
+	if recognizedFoundryPromptFilterAnnotation(raw) {
+		return nil, true
+	}
+	if recognizedOpenAIModerationChunk(raw) {
+		return nil, true
+	}
+	inspection := inspectOpenAIChatStreamEvent(eventType, data)
+	if inspection.chunk == nil || inspection.progress == upstreamProgressUnknown {
+		return nil, false
+	}
+	choicesRaw, hasChoices := raw["choices"]
+	if hasChoices {
+		if rawJSONIsNullOrEmpty(choicesRaw) {
+			return nil, false
+		}
+		var choices []json.RawMessage
+		if json.Unmarshal(choicesRaw, &choices) != nil {
+			return nil, false
+		}
+		if len(choices) > 0 {
+			// Anthropic ingress represents one assistant message and never requests
+			// multiple Chat choices, so only a single choice at index zero is safe.
+			if len(choices) != 1 {
+				return nil, false
+			}
+			choice, err := decodeChatJSONObject(choices[0], "")
+			if err != nil || choice == nil {
+				return nil, false
+			}
+			if hasCaseFoldedJSONFieldAlias(choice, "index", "delta", "finish_reason") {
+				return nil, false
+			}
+			var index int
+			indexRaw, ok := choice["index"]
+			if !ok || rawJSONIsNullOrEmpty(indexRaw) || json.Unmarshal(indexRaw, &index) != nil || index != 0 {
+				return nil, false
+			}
+			recognized := false
+			finished := false
+			outputBearing := false
+			if deltaRaw, ok := choice["delta"]; ok && !rawJSONIsNullOrEmpty(deltaRaw) {
+				delta, err := decodeChatJSONObject(deltaRaw, "")
+				if err != nil || delta == nil {
+					return nil, false
+				}
+				if hasCaseFoldedJSONFieldAlias(delta,
+					"role", "content", "refusal", "name", "tool_calls", "tool_call_id",
+					"function_call", "reasoning", "reasoning_content", "reasoning_text", "audio",
+				) {
+					return nil, false
+				}
+				deltaProgress := classifyOpenAIChatDeltaProgress(delta)
+				outputBearing = deltaProgress == upstreamProgressSemanticOutput || deltaProgress == upstreamProgressToolActivity
+				recognized = true
+			}
+			if finishRaw, ok := choice["finish_reason"]; ok {
+				if !rawJSONIsNullOrEmpty(finishRaw) {
+					var finish string
+					if json.Unmarshal(finishRaw, &finish) != nil || strings.TrimSpace(finish) == "" {
+						return nil, false
+					}
+					finished = true
+				}
+				recognized = true
+			}
+			if !recognized {
+				return nil, false
+			}
+			return &policyOpenAIStreamChoiceState{finished: finished, outputBearing: outputBearing}, true
+		}
+	}
+
+	usageRaw, hasUsage := raw["usage"]
+	if !hasUsage || rawJSONIsNullOrEmpty(usageRaw) {
+		return nil, false
+	}
+	var usage models.OpenAIUsage
+	if json.Unmarshal(usageRaw, &usage) != nil {
+		return nil, false
+	}
+	return nil, true
+}
+
+func terminatePolicySSEEvent(event []byte) []byte {
+	trimmed := bytes.TrimRight(event, "\r\n")
+	terminated := bytes.Clone(trimmed)
+	terminated = append(terminated, '\n')
+	return append(terminated, '\n')
+}
+
+func hasCaseFoldedJSONFieldAlias(object map[string]json.RawMessage, canonical ...string) bool {
+	for key := range object {
+		for _, name := range canonical {
+			if key != name && strings.EqualFold(key, name) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func recognizedFoundryPromptFilterAnnotation(raw map[string]json.RawMessage) bool {
+	choicesRaw, ok := raw["choices"]
+	if !ok || rawJSONIsNullOrEmpty(choicesRaw) {
+		return false
+	}
+	var choices []json.RawMessage
+	if json.Unmarshal(choicesRaw, &choices) != nil || len(choices) != 0 {
+		return false
+	}
+	if usageRaw, ok := raw["usage"]; ok && !rawJSONIsNullOrEmpty(usageRaw) {
+		return false
+	}
+
+	recognized := false
+	for _, name := range []string{"prompt_filter_results", "prompt_annotations"} {
+		annotationsRaw, ok := raw[name]
+		if !ok || rawJSONIsNullOrEmpty(annotationsRaw) {
+			continue
+		}
+		var annotations []json.RawMessage
+		if json.Unmarshal(annotationsRaw, &annotations) != nil || len(annotations) == 0 {
+			return false
+		}
+		for _, annotationRaw := range annotations {
+			var annotation map[string]json.RawMessage
+			if json.Unmarshal(annotationRaw, &annotation) != nil || annotation == nil {
+				return false
+			}
+		}
+		recognized = true
+	}
+	return recognized
+}
+
+func recognizedOpenAIModerationChunk(raw map[string]json.RawMessage) bool {
+	choicesRaw, ok := raw["choices"]
+	if !ok || rawJSONIsNullOrEmpty(choicesRaw) {
+		return false
+	}
+	var choices []json.RawMessage
+	if json.Unmarshal(choicesRaw, &choices) != nil || len(choices) != 0 {
+		return false
+	}
+	if usageRaw, ok := raw["usage"]; ok && !rawJSONIsNullOrEmpty(usageRaw) {
+		return false
+	}
+	moderationRaw, ok := raw["moderation"]
+	if !ok || rawJSONIsNullOrEmpty(moderationRaw) {
+		return false
+	}
+	var moderation map[string]json.RawMessage
+	if json.Unmarshal(moderationRaw, &moderation) != nil || moderation == nil {
+		return false
+	}
+	for _, name := range []string{"input", "output"} {
+		partRaw, ok := moderation[name]
+		if !ok || rawJSONIsNullOrEmpty(partRaw) {
+			return false
+		}
+		var part struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(partRaw, &part) != nil || (part.Type != "moderation_results" && part.Type != "error") {
+			return false
+		}
+	}
+	return true
+}
+
+func policySanitizedOpenAIStreamErrorEvent(status int) []byte {
+	message, errType, code := policyChatUpstreamErrorDetails(status)
+	payload, _ := json.Marshal(openAIChatStreamErrorEnvelope{Error: openAIChatStreamErrorBody{
+		Type: errType, Code: code, Message: message,
+	}})
+	return []byte("event: error\ndata: " + string(payload) + "\n\n")
 }
 
 type explicitRouteSurfaceSend func(context.Context) (*http.Response, error)
@@ -225,10 +595,16 @@ func (h *ProxyHandler) executeExplicitRouteSurfaceRequest(ctx context.Context, e
 	}
 }
 
-func (h *ProxyHandler) aggregateExplicitChatCompletionsResponse(ctx context.Context, initialResp *http.Response, body []byte, mode chatCompletionsMode, aggregate explicitRouteStreamAggregator) (*models.OpenAIResponse, *http.Response, error) {
+func (h *ProxyHandler) aggregateExplicitChatCompletionsResponse(ctx context.Context, initialResp *http.Response, body []byte, mode chatCompletionsMode, aggregate explicitRouteStreamAggregator, successfulHeaders ...*http.Header) (*models.OpenAIResponse, *http.Response, error) {
 	resp := initialResp
 	operation := routeOperationFromContext(ctx)
 	var canonical *explicitRouteCanonicalFailure
+	captureSuccessfulHeaders := func(resp *http.Response) {
+		if len(successfulHeaders) == 0 || successfulHeaders[0] == nil || resp == nil {
+			return
+		}
+		*successfulHeaders[0] = resp.Header.Clone()
+	}
 
 	for {
 		if resp == nil {
@@ -254,6 +630,9 @@ func (h *ProxyHandler) aggregateExplicitChatCompletionsResponse(ctx context.Cont
 			aggregateErr = context.Canceled
 		}
 		if operation == nil || operation.route == nil || operation.route.legacy {
+			if aggregateErr == nil {
+				captureSuccessfulHeaders(resp)
+			}
 			return response, nil, aggregateErr
 		}
 
@@ -264,6 +643,7 @@ func (h *ProxyHandler) aggregateExplicitChatCompletionsResponse(ctx context.Cont
 		if aggregateErr == nil {
 			progress = mergeUpstreamSemanticProgress(progress, upstreamProgressTerminalSuccess)
 			operation.updateAcceptedRouteAttempt(info.targetID, progress, downstreamCommitmentNone)
+			captureSuccessfulHeaders(resp)
 			return response, nil, nil
 		}
 
@@ -599,6 +979,17 @@ func explicitChatExecutionEndpoint(route *modelRoute, body []byte) (string, erro
 	}
 }
 
+func policyAwareChatExecutionEndpoint(operation *routeOperation, body []byte) (string, error) {
+	if operation == nil {
+		return explicitChatExecutionEndpoint(nil, body)
+	}
+	if plan, planned := operation.policyPlan(); planned && chatRequestContainsResponsesReplayID(body) &&
+		plan.allowsResponsesReplayPassthrough() && explicitRouteHasChatBackend(operation.route, providerEndpointChatCompletions) {
+		return providerEndpointChatCompletions, nil
+	}
+	return explicitChatExecutionEndpoint(operation.route, body)
+}
+
 func explicitResolvedChatRouteForTarget(route *modelRoute, target targetBinding, endpoint string, backend chatBackend) resolvedChatRoute {
 	if route == nil || target.provider == nil {
 		return resolvedChatRoute{}
@@ -693,7 +1084,7 @@ func withPlannedChatOperation(ctx, inbound context.Context, plan chatOperationPl
 func (h *ProxyHandler) withChatExecutionRoute(ctx, inbound context.Context, model string, body []byte) (context.Context, *routeOperation, *modelRoute, error) {
 	if operation := routeOperationFromContext(ctx); operation != nil {
 		if _, planned := operation.policyPlan(); planned {
-			endpoint, err := explicitChatExecutionEndpoint(operation.route, body)
+			endpoint, err := policyAwareChatExecutionEndpoint(operation, body)
 			if err != nil {
 				backend := chatBackendNativeChat
 				if endpoint == providerEndpointResponses || operation.route.supportsEndpoint(providerEndpointResponses) && !operation.route.supportsEndpoint(providerEndpointChatCompletions) {
@@ -852,10 +1243,11 @@ func (h *ProxyHandler) executeExplicitResponsesChat(ctx context.Context, route *
 	}
 
 	responseOptions := responsesChatResponseOptions{
-		PublicModel: route.public.id,
-		ReplayStore: h.responsesChatReplayStore(),
-		ReplayRoute: explicitResponsesChatReplayRoute(route, target),
-		UsageOnly:   options.ResponsesUsageOnly,
+		PublicModel:        route.public.id,
+		ReplayStore:        h.responsesChatReplayStore(),
+		ReplayRoute:        explicitResponsesChatReplayRoute(route, target),
+		ReplayToolDefaults: plan.ReplayToolDefaults,
+		UsageOnly:          options.ResponsesUsageOnly,
 	}
 	if plan.Stream {
 		stream, streamErr := translateResponsesSSEToChat(ctx, resp.Body, responseOptions)
@@ -923,7 +1315,7 @@ func (h *ProxyHandler) executeRoutedChatCompletions(ctx context.Context, body []
 		return h.executeChatCompletionsForRequestedModel(ctx, body, options, requestedModel)
 	}
 
-	endpoint, err := explicitChatExecutionEndpoint(operation.route, body)
+	endpoint, err := policyAwareChatExecutionEndpoint(operation, body)
 	if err != nil {
 		attachExplicitChatExecutionErrorRoute(err, operation.route, targetBinding{}, endpoint, chatBackendNativeChat)
 		return chatExecutionResult{}, err
@@ -1034,6 +1426,21 @@ const (
 )
 
 func preparePolicyOpenAIChatCompletionsRequest(body []byte, contract publicModelContract, terminalParallelToolCalls *bool) ([]byte, chatCompletionsMode) {
+	return prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body, policyParallelToolCallsPreparation(contract, terminalParallelToolCalls))
+}
+
+func applyPolicyOpenAIChatParallelToolCalls(body []byte, contract publicModelContract, terminalParallelToolCalls *bool) []byte {
+	switch policyParallelToolCallsPreparation(contract, terminalParallelToolCalls) {
+	case chatParallelToolCallsForceFalse:
+		return enforceParallelToolCallsFalse(body)
+	case chatParallelToolCallsOmit:
+		return omitParallelToolCalls(body)
+	default:
+		return injectParallelToolCalls(body)
+	}
+}
+
+func policyParallelToolCallsPreparation(contract publicModelContract, terminalParallelToolCalls *bool) chatParallelToolCallsPreparation {
 	preparation := chatParallelToolCallsDefault
 	if contract.policy.parallelToolCalls == nil || !*contract.policy.parallelToolCalls {
 		preparation = chatParallelToolCallsOmit
@@ -1041,7 +1448,7 @@ func preparePolicyOpenAIChatCompletionsRequest(body []byte, contract publicModel
 			preparation = chatParallelToolCallsForceFalse
 		}
 	}
-	return prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body, preparation)
+	return preparation
 }
 
 func prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body []byte, preparation chatParallelToolCallsPreparation) ([]byte, chatCompletionsMode) {
@@ -1513,6 +1920,11 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", message)
 		return
 	}
+	publicModel := req.Model
+	if canonicalPolicyID, ok := h.policyPublicModelID(req.Model); ok {
+		publicModel = canonicalPolicyID
+		ensurePolicyLocalRequestIdentity(w, r, publicModel)
+	}
 	// Route-aware duplicate-key validation must use the same selected model as
 	// handler forwarding. encoding/json resolves duplicate struct fields with the
 	// last occurrence, so validate only after decoding req.Model.
@@ -1565,6 +1977,40 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("translation error: %v", err))
 		return
 	}
+	policyPlan, err := h.planOpenAIChatPolicy(r.Context(), req.Model, oaiBody)
+	if err != nil {
+		if h.handleShutdownError(w, r, nil, err) {
+			return
+		}
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		if statusCode == http.StatusBadRequest {
+			writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
+		} else {
+			writePolicyAnthropicSanitizedError(w, statusCode, policyChatErrorHeaders(err), publicModel)
+		}
+		return
+	}
+	if policyPlan.valid() {
+		if admittedOperation != nil {
+			writeAnthropicError(w, http.StatusInternalServerError, "api_error", "policy model was also admitted as a direct route")
+			return
+		}
+		plannedCtx, plannedOperation, planErr := withPlannedChatOperation(r.Context(), r.Context(), policyPlan)
+		if planErr != nil {
+			writeAnthropicError(w, http.StatusInternalServerError, "api_error", planErr.Error())
+			return
+		}
+		r = r.WithContext(plannedCtx)
+		w.Header().Set("X-Vekil-Request-ID", plannedOperation.operationID())
+		publicModel = policyPlan.publicID
+
+		// The translated Anthropic request has already established whether the
+		// client asked for streaming and whether Vekil must force-stream upstream.
+		// Apply only the policy request contract from the returned body; the mode
+		// parsed by the OpenAI helper would misclassify an injected stream as a
+		// client-requested stream and leak SSE to a non-streaming Anthropic client.
+		oaiBody = applyPolicyOpenAIChatParallelToolCalls(oaiBody, policyPlan.contract, cloneBoolPtr(policyPlan.terminalParallelToolCalls))
+	}
 	oaiBody = h.rewriteOpenAIChatRequestBodyWithToolOptimizers(r.Context(), oaiBody, h.toolContexts, scope)
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
@@ -1579,18 +2025,28 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		if errors.As(err, &executionErr) {
 			observeChatExecutionError(r.Context(), executionErr)
 			observeOpenAIUsage(r.Context(), executionErr.Usage)
-			writeAnthropicError(w, executionErr.StatusCode, mapAnthropicUpstreamStatus(executionErr.StatusCode), executionErr.Message)
+			if policyPlan.valid() {
+				writePolicyAnthropicSanitizedError(w, executionErr.StatusCode, executionErr.Headers, publicModel)
+			} else {
+				writeAnthropicError(w, executionErr.StatusCode, mapAnthropicUpstreamStatus(executionErr.StatusCode), executionErr.Message)
+			}
 			return
 		}
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
-		writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
+		if policyPlan.valid() {
+			writePolicyAnthropicSanitizedError(w, statusCode, policyChatErrorHeaders(err), publicModel)
+		} else {
+			writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
+		}
 		return
 	}
 	if routeOperation != nil {
 		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
 	}
 
-	publicModel := explicitRoutePublicModel(route, req.Model)
+	if !policyPlan.valid() {
+		publicModel = explicitRoutePublicModel(route, publicModel)
+	}
 	responseReq := req
 	responseReq.Model = publicModel
 	result, err := h.executeRoutedChatCompletions(upstreamCtx, oaiBody, mode, chatExecutionOptions{}, providerModel)
@@ -1601,15 +2057,23 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		var executionErr *chatExecutionError
 		if errors.As(err, &executionErr) {
 			observeChatExecutionError(r.Context(), executionErr)
-			if len(executionErr.Headers) > 0 {
+			if !policyPlan.valid() && len(executionErr.Headers) > 0 {
 				mergeHeaderValues(w.Header(), executionErr.Headers)
 			}
 			observeOpenAIUsage(r.Context(), executionErr.Usage)
-			writeAnthropicError(w, executionErr.StatusCode, mapAnthropicUpstreamStatus(executionErr.StatusCode), executionErr.Message)
+			if policyPlan.valid() {
+				writePolicyAnthropicSanitizedError(w, executionErr.StatusCode, executionErr.Headers, publicModel)
+			} else {
+				writeAnthropicError(w, executionErr.StatusCode, mapAnthropicUpstreamStatus(executionErr.StatusCode), executionErr.Message)
+			}
 			return
 		}
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "anthropic"), logger.Err(err))
+		if policyPlan.valid() {
+			writePolicyAnthropicSanitizedError(w, statusCode, policyChatErrorHeaders(err), publicModel)
+			return
+		}
 		if statusCode == http.StatusBadRequest {
 			writeAnthropicError(w, statusCode, "invalid_request_error", err.Error())
 			return
@@ -1622,7 +2086,12 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	observeChatExecutionRoute(r.Context(), result)
 	observeUpstreamHeaders(r.Context(), result.Headers)
 	if result.Backend == chatBackendResponses && len(result.Headers) > 0 {
-		mergeHeaderValues(w.Header(), result.Headers)
+		if policyPlan.valid() {
+			result.Headers = policyChatSafeHeaders(result.Headers, publicModel)
+			mergeHeaderValues(w.Header(), result.Headers)
+		} else {
+			mergeHeaderValues(w.Header(), result.Headers)
+		}
 	}
 
 	result, err = h.aggregateExplicitRoutedChatExecution(upstreamCtx, result, oaiBody, mode)
@@ -1635,14 +2104,26 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		var executionErr *chatExecutionError
 		if errors.As(err, &executionErr) {
 			status = chatStreamErrorStatus(executionErr)
-			message = chatStreamErrorMessage(executionErr)
 			observeOpenAIUsage(r.Context(), executionErr.Usage)
+			if policyPlan.valid() {
+				writePolicyAnthropicSanitizedError(w, status, executionErr.Headers, publicModel)
+				return
+			}
+			message = chatStreamErrorMessage(executionErr)
 		} else {
 			var streamErr *openAIStreamError
 			if errors.As(err, &streamErr) {
 				status = streamErr.httpStatus()
-				message = streamErr.Error()
+				if policyPlan.valid() {
+					message, _, _ = policyChatUpstreamErrorDetails(status)
+				} else {
+					message = streamErr.Error()
+				}
 			}
+		}
+		if policyPlan.valid() {
+			writePolicyAnthropicSanitizedError(w, status, policyChatErrorHeaders(err), publicModel)
+			return
 		}
 		writeAnthropicError(w, status, mapAnthropicUpstreamStatus(status), message)
 		return
@@ -1654,6 +2135,10 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	if result.Response != nil && result.Response.StatusCode != http.StatusOK {
 		resp := result.Response
+		if policyPlan.valid() {
+			_ = writePolicyAnthropicTerminalError(w, resp, publicModel)
+			return
+		}
 		defer func() { _ = resp.Body.Close() }()
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
@@ -1671,7 +2156,12 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	err = h.routeChatExecutionResult(w, result, upstreamCtx, mode, chatCompletionsResponseHandlers{
 		stream: func(resp *http.Response) {
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentProtocolFrame)
-			body := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
+			lifecycleBody := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
+			var body io.ReadCloser = lifecycleBody
+			if policyPlan.valid() {
+				mergeHeaderValues(w.Header(), policyChatSafeHeaders(resp.Header, publicModel))
+				body = newPolicySanitizedOpenAIStream(body)
+			}
 			streamOpenAIToAnthropicWithLifecycle(
 				w,
 				body,
@@ -1679,7 +2169,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 				"msg_"+uuid.New().String(),
 				func(status int) { observeResponseFailureStatus(r.Context(), status) },
 				h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope),
-				h.lifecycleStreamHooks(r.Context(), body.canceledAtFailure, func() { h.WriteShutdownServiceUnavailable(w, r) }),
+				h.lifecycleStreamHooks(r.Context(), lifecycleBody.canceledAtFailure, func() { h.WriteShutdownServiceUnavailable(w, r) }),
 				openAIChatStreamUsageCallback(r.Context()),
 			)
 		},
@@ -1738,14 +2228,26 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		var executionErr *chatExecutionError
 		if errors.As(err, &executionErr) {
 			status = chatStreamErrorStatus(executionErr)
-			message = chatStreamErrorMessage(executionErr)
 			observeOpenAIUsage(r.Context(), executionErr.Usage)
+			if policyPlan.valid() {
+				writePolicyAnthropicSanitizedError(w, status, executionErr.Headers, publicModel)
+				return
+			}
+			message = chatStreamErrorMessage(executionErr)
 		} else {
 			var streamErr *openAIStreamError
 			if errors.As(err, &streamErr) {
 				status = streamErr.httpStatus()
-				message = streamErr.Error()
+				if policyPlan.valid() {
+					message, _, _ = policyChatUpstreamErrorDetails(status)
+				} else {
+					message = streamErr.Error()
+				}
 			}
+		}
+		if policyPlan.valid() {
+			writePolicyAnthropicSanitizedError(w, status, policyChatErrorHeaders(err), publicModel)
+			return
 		}
 		writeAnthropicError(w, status, mapAnthropicUpstreamStatus(status), message)
 	}
@@ -1787,6 +2289,11 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", message)
 		return
 	}
+	publicModel := req.Model
+	if canonicalPolicyID, ok := h.policyPublicModelID(req.Model); ok {
+		publicModel = canonicalPolicyID
+		ensurePolicyLocalRequestIdentity(w, r, publicModel)
+	}
 	// Route-aware duplicate-key validation must use the same selected model as
 	// handler forwarding. encoding/json resolves duplicate struct fields with the
 	// last occurrence, so validate only after decoding req.Model.
@@ -1815,20 +2322,74 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("translation error: %v", err))
 		return
 	}
+	if _, policyModel := h.policyPublicModelID(req.Model); policyModel {
+		// A native-Chat policy terminal may itself be a Vekil-compatible bridge
+		// backed by Responses. Use the known Responses minimum up front so a
+		// one-send terminal budget does not require protocol recovery.
+		minimum := responsesChatMinimumOutputTokens
+		oaiReq.MaxCompletionTokens = &minimum
+	}
+	policyBody, err := json.Marshal(oaiReq)
+	if err != nil {
+		writeAnthropicError(w, http.StatusInternalServerError, "api_error", "failed to prepare count_tokens policy request")
+		return
+	}
+	policyPlan, err := h.planOpenAIChatPolicy(r.Context(), req.Model, policyBody)
+	if err != nil {
+		if h.handleShutdownError(w, r, nil, err) {
+			return
+		}
+		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+		if statusCode == http.StatusBadRequest {
+			writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
+		} else {
+			writePolicyAnthropicSanitizedError(w, statusCode, policyChatErrorHeaders(err), publicModel)
+		}
+		return
+	}
+	if policyPlan.valid() {
+		if admittedOperation != nil {
+			writeAnthropicError(w, http.StatusInternalServerError, "api_error", "policy model was also admitted as a direct route")
+			return
+		}
+		policyBody = applyPolicyOpenAIChatParallelToolCalls(policyBody, policyPlan.contract, cloneBoolPtr(policyPlan.terminalParallelToolCalls))
+		var preparedProbe models.OpenAIRequest
+		if err := json.Unmarshal(policyBody, &preparedProbe); err != nil {
+			writeAnthropicError(w, http.StatusInternalServerError, "api_error", "failed to apply count_tokens policy contract")
+			return
+		}
+		oaiReq = &preparedProbe
+		plannedCtx, plannedOperation, planErr := withPlannedChatOperation(r.Context(), suppressRouteAttemptStats(r.Context()), policyPlan)
+		if planErr != nil {
+			writeAnthropicError(w, http.StatusInternalServerError, "api_error", planErr.Error())
+			return
+		}
+		r = r.WithContext(plannedCtx)
+		w.Header().Set("X-Vekil-Request-ID", plannedOperation.operationID())
+		publicModel = policyPlan.publicID
+	}
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
-	upstreamCtx, routeOperation, _, err := h.withChatExecutionRoute(upstreamCtx, suppressRouteAttemptStats(r.Context()), providerModel, nil)
+	upstreamCtx, routeOperation, _, err := h.withChatExecutionRoute(upstreamCtx, suppressRouteAttemptStats(r.Context()), providerModel, policyBody)
 	if err != nil {
 		var executionErr *chatExecutionError
 		if errors.As(err, &executionErr) {
 			observeChatExecutionError(r.Context(), executionErr)
-			writeAnthropicError(w, executionErr.StatusCode, mapAnthropicUpstreamStatus(executionErr.StatusCode), executionErr.Message)
+			if policyPlan.valid() {
+				writePolicyAnthropicSanitizedError(w, executionErr.StatusCode, executionErr.Headers, publicModel)
+			} else {
+				writeAnthropicError(w, executionErr.StatusCode, mapAnthropicUpstreamStatus(executionErr.StatusCode), executionErr.Message)
+			}
 			return
 		}
 		statusCode := upstreamStatusCode(err, http.StatusBadRequest)
-		writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
+		if policyPlan.valid() {
+			writePolicyAnthropicSanitizedError(w, statusCode, policyChatErrorHeaders(err), publicModel)
+		} else {
+			writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
+		}
 		return
 	}
 	if routeOperation != nil {
@@ -1843,16 +2404,24 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		var executionErr *chatExecutionError
 		if errors.As(err, &executionErr) {
 			observeChatExecutionError(r.Context(), executionErr)
-			if len(executionErr.Headers) > 0 {
+			if !policyPlan.valid() && len(executionErr.Headers) > 0 {
 				mergeHeaderValues(w.Header(), executionErr.Headers)
 			}
 			statusCode := chatStreamErrorStatus(executionErr)
 			observeOpenAIUsage(r.Context(), executionErr.Usage)
-			writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), chatStreamErrorMessage(executionErr))
+			if policyPlan.valid() {
+				writePolicyAnthropicSanitizedError(w, statusCode, executionErr.Headers, publicModel)
+			} else {
+				writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), chatStreamErrorMessage(executionErr))
+			}
 			return
 		}
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 		h.log.Error("upstream request failed", logger.F("endpoint", "anthropic_count_tokens"), logger.Err(err))
+		if policyPlan.valid() {
+			writePolicyAnthropicSanitizedError(w, statusCode, policyChatErrorHeaders(err), publicModel)
+			return
+		}
 		if statusCode == http.StatusBadRequest {
 			writeAnthropicError(w, statusCode, "invalid_request_error", err.Error())
 			return
@@ -1862,7 +2431,11 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 	}
 
 	if oaiResp.Usage == nil {
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream response did not include usage")
+		if policyPlan.valid() {
+			writePolicyAnthropicSanitizedError(w, http.StatusBadGateway, nil, publicModel)
+		} else {
+			writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream response did not include usage")
+		}
 		return
 	}
 	observeOpenAIUsage(r.Context(), oaiResp.Usage)
@@ -1959,7 +2532,12 @@ func (h *ProxyHandler) decodeAnthropicCountTokensProbeResponse(resp *http.Respon
 		detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
 		h.log.Error("upstream error", logger.F("endpoint", "anthropic_count_tokens"), logger.F("status", resp.StatusCode), logger.F("detail", detail))
 		h.log.Debug("upstream error body", logger.F("endpoint", "anthropic_count_tokens"), logger.F("status", resp.StatusCode), logger.F("body", string(errBody)))
-		return nil, &upstreamError{statusCode: resp.StatusCode, body: errBody}
+		return nil, &upstreamError{
+			statusCode: resp.StatusCode,
+			body:       errBody,
+			retryAfter: resp.Header.Get("Retry-After"),
+			headers:    resp.Header.Clone(),
+		}
 	}
 
 	var oaiResp models.OpenAIResponse
@@ -1968,6 +2546,26 @@ func (h *ProxyHandler) decodeAnthropicCountTokensProbeResponse(resp *http.Respon
 	}
 
 	return &oaiResp, nil
+}
+
+func ensurePolicyLocalRequestIdentity(w http.ResponseWriter, r *http.Request, publicModel string) {
+	publicModel = strings.TrimSpace(publicModel)
+	if publicModel == "" {
+		return
+	}
+	for _, name := range []string{"Openai-Model", "X-Openai-Model"} {
+		w.Header().Set(name, publicModel)
+	}
+	if w.Header().Get("X-Vekil-Request-ID") != "" {
+		return
+	}
+	operationID := uuid.NewString()
+	w.Header().Set("X-Vekil-Request-ID", operationID)
+	if r != nil {
+		if summary := RequestSummaryFromContext(r.Context()); summary != nil {
+			summary.SetOperationID(operationID)
+		}
+	}
 }
 
 func policyChatSafeHeaders(src http.Header, publicModel string) http.Header {
@@ -2117,6 +2715,29 @@ func writePolicyChatSanitizedError(w http.ResponseWriter, status int, headers ht
 	writeOpenAIErrorWithDetails(w, status, message, errType, "", code)
 }
 
+func writePolicyAnthropicSanitizedError(w http.ResponseWriter, status int, headers http.Header, publicModel string) {
+	if safeHeaders := policyChatSafeHeaders(headers, publicModel); len(safeHeaders) > 0 {
+		mergeHeaderValues(w.Header(), safeHeaders)
+	}
+	w.Header().Del("Content-Length")
+	if status < http.StatusBadRequest {
+		status = http.StatusBadGateway
+	}
+	message, _, _ := policyChatUpstreamErrorDetails(status)
+	writeAnthropicError(w, status, mapAnthropicUpstreamStatus(status), message)
+}
+
+func writePolicyAnthropicTerminalError(w http.ResponseWriter, resp *http.Response, publicModel string) error {
+	if resp == nil {
+		return &responseBodyWriteError{err: fmt.Errorf("upstream response is unavailable"), upstream: true}
+	}
+	if resp.Body != nil {
+		defer func() { _ = readRetryableUpstreamErrorBody(resp.Body) }()
+	}
+	writePolicyAnthropicSanitizedError(w, resp.StatusCode, resp.Header, publicModel)
+	return nil
+}
+
 func writePolicyChatTerminalError(w http.ResponseWriter, resp *http.Response, publicModel string) error {
 	if resp == nil {
 		return &responseBodyWriteError{err: fmt.Errorf("upstream response is unavailable"), upstream: true}
@@ -2232,11 +2853,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 
 	responseModel := explicitRoutePublicModel(route, publicModel)
-	executionOptions := chatExecutionOptions{}
-	if policyPlan.valid() {
-		executionOptions.ResponsesMinimumOutputTokens = responsesChatMinimumOutputTokens
-	}
-	result, err := h.executeRoutedChatCompletions(upstreamCtx, bodyBytes, mode, executionOptions, requestedModel)
+	result, err := h.executeRoutedChatCompletions(upstreamCtx, bodyBytes, mode, chatExecutionOptions{}, requestedModel)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -2275,6 +2892,13 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	result, bodyBytes, mode = h.retryRoutedChatExecutionWithoutInjectedStreamOptions(upstreamCtx, result, bodyBytes, mode, requestedModel)
 	observeChatExecutionRoute(r.Context(), result)
 	observeUpstreamHeaders(r.Context(), result.Headers)
+	if policyPlan.valid() && result.Backend == chatBackendResponses && len(result.Headers) > 0 {
+		// routeChatExecutionResult merges Responses-backed headers before its
+		// protocol-specific callbacks run. Replace them with the policy allowlist
+		// first so request/provider identifiers cannot escape through Chat JSON or
+		// the canonical streamEvents path.
+		result.Headers = policyChatSafeHeaders(result.Headers, responseModel)
+	}
 
 	result, err = h.aggregateExplicitRoutedChatExecution(upstreamCtx, result, bodyBytes, mode)
 	if err != nil {

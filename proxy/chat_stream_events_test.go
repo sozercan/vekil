@@ -289,6 +289,40 @@ func TestAggregateChatStreamEventsBuildsOpenAIResponse(t *testing.T) {
 	}
 }
 
+func TestAggregatePolicyChatStreamEventsPreservesInvalidToolArguments(t *testing.T) {
+	toolIndex := 0
+	finishReason := "tool_calls"
+	chunks := []models.OpenAIStreamChunk{
+		{ID: "chatcmpl-invalid", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{Role: "assistant", ToolCalls: []models.OpenAIToolCall{{ID: "call", Type: "function", Index: &toolIndex, Function: models.OpenAIFunctionCall{Name: "lookup", Arguments: `{"q":"a"}`}}}}}}},
+		{ID: "chatcmpl-invalid", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{Index: &toolIndex, Function: models.OpenAIFunctionCall{Arguments: `{"q":"b"}`}}}}}}},
+		{ID: "chatcmpl-invalid", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{}, FinishReason: &finishReason}}},
+	}
+	aggregate := func(policy bool) *models.OpenAIResponse {
+		writer, stream := newChatStreamEventPipe(context.Background())
+		producerDone := produceSuccessfulChatStream(writer, chunks)
+		var response *models.OpenAIResponse
+		var err error
+		if policy {
+			response, err = aggregatePolicyChatStreamEvents(stream)
+		} else {
+			response, err = aggregateChatStreamEvents(stream)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := <-producerDone; err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	if got := aggregate(false).Choices[0].Message.ToolCalls[0].Function.Arguments; got != "{}" {
+		t.Fatalf("generic typed arguments = %q, want compatibility fallback {}", got)
+	}
+	if got := aggregate(true).Choices[0].Message.ToolCalls[0].Function.Arguments; got != `{"q":"a"}{"q":"b"}` {
+		t.Fatalf("policy typed arguments = %q, want original malformed fragments", got)
+	}
+}
+
 func TestStreamChatEventsToAnthropicMatchesNativeTranslation(t *testing.T) {
 	toolIndex := 0
 	finishReason := "tool_calls"
@@ -659,5 +693,60 @@ func TestGeminiChatEventAdapterEmitsFinishValidationError(t *testing.T) {
 	var executionErr *chatExecutionError
 	if !errors.As(err, &executionErr) || !strings.Contains(recorder.Body.String(), `"status":"UNAVAILABLE"`) {
 		t.Fatalf("error/body = %#v %s", err, recorder.Body.String())
+	}
+}
+
+func TestAggregatePolicyChatStreamEventsRejectsMalformedTextDelta(t *testing.T) {
+	buildStream := func() *chatStreamEventStream {
+		writer, stream := newChatStreamEventPipe(t.Context())
+		if err := writer.sendChunk(models.OpenAIStreamChunk{
+			ID: "chat", Object: openAIChatCompletionChunkObject, Model: "upstream",
+			Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"safe"`)}}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.sendChunk(models.OpenAIStreamChunk{
+			ID: "chat", Object: openAIChatCompletionChunkObject, Model: "upstream",
+			Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{Content: json.RawMessage(`{"unexpected":true}`)}}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		finish := "stop"
+		if err := writer.sendChunk(models.OpenAIStreamChunk{
+			ID: "chat", Object: openAIChatCompletionChunkObject, Model: "upstream",
+			Choices: []models.OpenAIStreamChoice{{Index: 0, FinishReason: &finish}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.succeed(); err != nil {
+			t.Fatal(err)
+		}
+		return stream
+	}
+
+	if response, err := aggregateChatStreamEvents(buildStream()); err != nil {
+		t.Fatalf("generic aggregation error = %v", err)
+	} else if got := response.Choices[0].Message.Content; string(got) != `"safe"` {
+		t.Fatalf("generic content = %s, want safe prefix", got)
+	}
+	if _, err := aggregatePolicyChatStreamEvents(buildStream()); err == nil || !strings.Contains(err.Error(), "malformed content delta") {
+		t.Fatalf("policy aggregation error = %v, want malformed content rejection", err)
+	}
+}
+
+func TestAggregatePolicyChatStreamEventsEnforcesCumulativeResponseLimit(t *testing.T) {
+	writer, stream := newChatStreamEventPipe(t.Context())
+	if err := writer.sendChunk(models.OpenAIStreamChunk{
+		ID: "chat", Object: openAIChatCompletionChunkObject,
+		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{Content: json.RawMessage(`"` + strings.Repeat("x", 256) + `"`)}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.succeed(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := aggregateChatStreamEventsWithOptions(stream, openAIResponseBuildOptions{maxAccumulatedBytes: 128})
+	if err == nil || !strings.Contains(err.Error(), "128-byte response limit") {
+		t.Fatalf("aggregation error = %v, want cumulative response limit", err)
 	}
 }

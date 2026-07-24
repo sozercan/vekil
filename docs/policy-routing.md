@@ -1,6 +1,6 @@
 # Semantic Policy Routing
 
-Semantic policy routing lets one public OpenAI Chat model ID choose between a `lightweight` and a `powerful` terminal route for each root request. It is a schema-version-2 feature layered above Vekil's provider-agnostic route executor: the policy chooses one terminal route, then the existing executor owns target ordering, provider auth, model rewriting, safe physical failover, streaming, and response normalization.
+Semantic policy routing lets one public canonical-Chat model ID choose between a `lightweight` and a `powerful` terminal route for each root request. It is a schema-version-2 feature layered above Vekil's provider-agnostic route executor: the policy chooses one terminal route, then the existing executor owns target ordering, provider auth, model rewriting, safe physical failover, streaming, and response normalization.
 
 The first release is intentionally narrow. Treat the limits and operator gates in this document as part of the public contract, not as temporary suggestions.
 
@@ -19,13 +19,15 @@ The selectable v1 tiers are only `lightweight` and `powerful`. `versatile` remai
 
 ## Locked v1 scope
 
-A policy public ID is supported only for:
+A policy public ID is supported for:
 
 - `POST /v1/chat/completions`;
-- text-only Chat messages;
-- standard function tools;
-- OpenAI-family terminal routes served by native `/chat/completions` or proxy-owned Chat-over-Responses;
-- one per-turn decision with no affinity or session cache; and
+- translated `POST /v1/messages` and `/v1/messages/count_tokens`;
+- bounded stateless `POST /v1/responses` compatibility used by Responses-only agents;
+- text-only canonical Chat messages and standard function tools;
+- Responses namespace tools flattened to deterministic function aliases;
+- OpenAI-family terminal routes served by native `/chat/completions` or bounded Chat-over-Responses;
+- one per-turn decision with no general affinity or session cache, except process-local replay that remains bound to its originating route and tier; and
 - the built-in `coding_agent_v1` classifier profile.
 
 The policy can run in `off`, asynchronous `observe`, or synchronous `enforce` mode. One root request resolves one policy profile and selects one terminal route. Physical failover, if configured, stays inside that selected route.
@@ -34,24 +36,40 @@ The following are explicitly unsupported for policy public IDs in v1 and fail lo
 
 | Surface or request shape | v1 policy behavior |
 |---|---|
-| `POST /v1/responses` | Unsupported |
+| `POST /v1/responses` | Bounded stateless compatibility: `store` false/omitted, no `previous_response_id`, text plus function/namespace-child tools; output is adapted from the selected Chat terminal |
 | Proxy-owned `GET /v1/responses` websocket bridge | Unsupported |
 | `POST /v1/responses/compact` | Unsupported |
 | `POST /v1/memories/trace_summarize` | Unsupported |
-| `POST /v1/messages` and `/v1/messages/count_tokens` | Unsupported |
+| Responses-backed Chat terminal routes | Supported through the bounded Chat-over-Responses adapter; destination and classifier routes may expose `/responses` |
+| `POST /v1/messages` and `/v1/messages/count_tokens` | Translated to canonical Chat, planned by the policy, and translated back to Anthropic |
 | Gemini `generateContent`, `streamGenerateContent`, and `countTokens` routes | Unsupported |
 | Image, audio, file, or any other non-text Chat input | Unsupported |
-| Hosted/non-function tools | Unsupported |
-| Sticky Chat affinity, policy session headers, or shared policy state | Unsupported |
+| Hosted/custom tools | Unsupported; policy Responses accepts only function tools and namespace children that are functions |
+| Sticky affinity, policy session headers, or shared policy state | Unsupported; opaque downstream replay IDs are accepted only in `off`/`observe` for a single-target baseline |
 | Multi-tenant policy deployments | Unsupported |
 
-Direct public models and direct exposed terminal routes retain their existing endpoint behavior. `/v1/models` lists a policy profile as catalog metadata, but that does not extend its inference support beyond `POST /v1/chat/completions`. When both terminal routes prefer Responses-backed Chat, the strict Responses request subset is validated before classifier admission so requests guaranteed to fail never forward classifier content.
+Direct public models and direct exposed terminal routes retain their existing endpoint behavior. `/v1/models` keeps a policy profile's public metadata at `/chat/completions`; translated Anthropic, policy Responses compatibility, and an internal Responses-backed terminal do not change that public contract. When a request may execute through Responses-backed Chat, the strict shared request subset is validated before classifier admission so requests guaranteed to fail never forward classifier content.
+
+Policy Responses compatibility is deliberately not near-zero-copy passthrough. It converts bounded Responses input into canonical Chat, applies policy planning, executes the selected native or Responses-backed Chat terminal, aggregates the terminal result, and emits Responses JSON/SSE. Bounded `text.format` values are mapped to Chat `response_format`, including Codex `--output-schema` JSON schemas. It accepts Codex-style full stateless history, including prior `function_call` plus `function_call_output` items. Namespace children are flattened to deterministic names of at most 64 characters and mapped back to `namespace` plus `name` in the returned function call. Completed terminal output is checked against `tool_choice`; required or forced choices cannot complete without a matching function call. The launcher disables hosted web search, remote compaction, freeform apply-patch, Responses Lite, code-only tool modes, and inherited speed tiers for policy-owned Codex models. Deferred tool discovery remains unsupported: `defer_loading: true` and `tool_search` fail locally instead of being silently flattened or ignored. The adapter accepts large direct function catalogs for downstream Responses-backed Chat bridges. Native OpenAI/Azure Chat destinations may impose a 128-function limit, so deployments using those terminals must constrain the client catalog accordingly.
+
+When Vekil itself owns a Responses-backed terminal, `call_vekil_*` state records the originating route and policy tier, so same-process continuations remain pinned even in `enforce`. A downstream Chat-compatible bridge may also return process-local replay IDs; those continuations remain limited to an `off`/`observe` baseline with one target and require a single bridge instance or sticky ingress to the replay-owning process. One configured target proves route determinism, not replica affinity.
 
 Native Chat tool history must be complete and internally consistent before classifier admission. Assistant tool-call IDs must be unique, every tool result must reference one pending prior call exactly once, and all pending calls must receive results before the next non-tool message. Parallel results may arrive in any order. Malformed, missing, unknown, or duplicate tool-call relationships fail locally with no classifier or terminal-model send.
 
 ## Quick start
 
 Start from [`examples/policy-routing-coding-economy.yaml`](../examples/policy-routing-coding-economy.yaml), replace the placeholder URLs/models, and export the referenced credentials.
+
+For a single-process GitHub Copilot setup, use
+[`examples/policy-routing-copilot.yaml`](../examples/policy-routing-copilot.yaml).
+Its pinned Copilot Responses targets are adapted to canonical policy Chat in
+process, including classifier execution, so no second Vekil listener is needed:
+
+```bash
+vekil launch claude \
+  --model gpt-5.6-semantic \
+  --providers-config examples/policy-routing-copilot.yaml
+```
 
 Offline validation performs strict decoding and local contract checks without sending classifier traffic:
 
@@ -165,7 +183,7 @@ Validation also rejects:
 - classifier routes that are public, have the wrong internal purpose, or can send more than once;
 - classifiers that cannot perform the forced function-tool protocol;
 - missing trust-domain or data-policy acknowledgements; and
-- unsupported custom prompts, custom output schemas, arbitrary routing languages, or config hot reload.
+- unsupported custom classifier prompts, custom classifier output schemas, arbitrary routing languages, or config hot reload.
 
 ## Profile mode and global ceiling
 
@@ -337,7 +355,7 @@ A policy profile appears exactly once in `/v1/models` with:
 
 Both destinations must accept the same published Chat semantics. Per-target wire adaptations may differ only when they do not alter that public contract.
 
-For a policy request, public JSON, SSE, safe model headers, errors, and client-facing metrics use the policy profile's public ID. This identity rule also applies when an unsupported Responses, Anthropic, or Gemini surface is rejected locally before classification. Provider, terminal route, target, and deployment IDs do not leak through normalized policy output. Upstream `X-Request-ID` and `Request-ID` values are omitted; clients receive only the proxy-owned `X-Vekil-Request-ID` correlation header. Direct-route output behavior remains unchanged.
+For a policy request, public JSON, SSE, safe model headers, errors, and client-facing metrics use the policy profile's public ID. This identity rule also applies when an unsupported request shape or Gemini surface is rejected locally before classification. Provider, terminal route, target, and deployment IDs do not leak through normalized policy output. Upstream `X-Request-ID` and `Request-ID` values are omitted; clients receive only the proxy-owned `X-Vekil-Request-ID` correlation header. Direct-route output behavior remains unchanged.
 
 ## Metrics and decision provenance
 
@@ -410,6 +428,6 @@ V1 stores no policy affinity, so policy rollback requires no policy-session migr
 
 ## Deferred work
 
-Future releases may add translated Anthropic/Gemini adapters, explicit Chat affinity, native Responses/websocket first-turn selection, shared state, policy token counting, mixed-provider destination families, a local deterministic first stage, passive ranking, or a `versatile` middle tier.
+Future releases may add translated Gemini adapters, explicit cross-process Chat/Responses affinity, native Responses/websocket terminal selection, shared state, mixed Chat/Responses destinations, a local deterministic first stage, passive ranking, or a `versatile` middle tier.
 
 Vekil continues to forbid arbitrary routing DSLs, recursive policies, post-output quality retries, cross-tier failure fallback, transparent provider-state migration, classifier-driven authorization, model-reported confidence as an enforcement input, content-derived shared breaker state, implicit prompt fingerprints as session identity, and public access to classifier routes.

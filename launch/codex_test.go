@@ -190,7 +190,7 @@ func TestCodexCatalogClearsUnsupportedDonorCapabilities(t *testing.T) {
 		t.Fatalf("non-reasoning model supported_reasoning_levels = %#v, want empty", model["supported_reasoning_levels"])
 	}
 	if got := model["default_reasoning_level"]; got != "none" {
-		t.Fatalf("non-reasoning model default_reasoning_level = %#v, want none", got)
+		t.Fatalf("direct non-reasoning model default_reasoning_level = %#v, want none", got)
 	}
 	for _, key := range []string{"supports_reasoning_summaries", "support_verbosity", "supports_search_tool"} {
 		if got, _ := model[key].(bool); got {
@@ -325,4 +325,152 @@ func containsAdjacent(values []string, first, second string) bool {
 		}
 	}
 	return false
+}
+
+func TestCodexAdapterAcceptsPolicyOwnedChatModelThroughResponsesCompatibility(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := (CodexAdapter{}).Prepare(PrepareInput{
+		BaseURL: "http://127.0.0.1:43210",
+		Model: ModelInfo{
+			ID:                 "policy-model",
+			OwnedBy:            PolicyModelOwner,
+			SupportedEndpoints: []string{"/chat/completions"},
+		},
+		Binary:        binary,
+		LocalToken:    "token",
+		ForwardedArgs: []string{"exec", "--ephemeral", "--output-schema", "schema.json", "hello"},
+		DryRun:        true,
+	})
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if prepared.Cleanup != nil {
+		defer func() { _ = prepared.Cleanup() }()
+	}
+	for _, want := range []string{
+		`web_search="disabled"`,
+		`features.remote_compaction_v2=false`,
+		`features.code_mode=false`,
+		`features.code_mode_only=false`,
+	} {
+		if !containsString(prepared.Args, want) {
+			t.Fatalf("policy Codex args missing %q: %#v", want, prepared.Args)
+		}
+	}
+	if !containsAdjacent(prepared.Args, "-m", "policy-model") {
+		t.Fatalf("policy model was not pinned: %#v", prepared.Args)
+	}
+	if !containsAdjacent(prepared.Args, "--output-schema", "schema.json") {
+		t.Fatalf("policy Codex output schema args were not forwarded: %#v", prepared.Args)
+	}
+	catalogPath := codexCatalogPathFromArgs(t, prepared.Args)
+	body, err := os.ReadFile(catalogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalog codexCatalog
+	if err := json.Unmarshal(body, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Models) != 1 {
+		t.Fatalf("catalog models = %#v", catalog.Models)
+	}
+	if value, exists := catalog.Models[0]["apply_patch_tool_type"]; !exists || value != nil {
+		t.Fatalf("policy apply_patch_tool_type = %#v, want explicit null", value)
+	}
+	if value, exists := catalog.Models[0]["use_responses_lite"]; !exists || value != false {
+		t.Fatalf("policy use_responses_lite = %#v, want false", value)
+	}
+	if value, exists := catalog.Models[0]["tool_mode"]; exists {
+		t.Fatalf("policy tool_mode = %#v, want omitted", value)
+	}
+	if value, _ := catalog.Models[0]["supports_search_tool"].(bool); value {
+		t.Fatalf("policy supports_search_tool = true, want false")
+	}
+	if value, exists := catalog.Models[0]["default_reasoning_level"]; exists {
+		t.Fatalf("policy default_reasoning_level = %#v, want omitted", value)
+	}
+	for _, key := range []string{"additional_speed_tiers", "service_tiers"} {
+		values, ok := catalog.Models[0][key].([]interface{})
+		if !ok || len(values) != 0 {
+			t.Fatalf("policy %s = %#v, want empty", key, catalog.Models[0][key])
+		}
+	}
+}
+
+func TestCodexAdapterRejectsPolicyFeatureOverrides(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		feature string
+		args    []string
+	}{
+		{name: "code mode", feature: "code_mode", args: []string{"--enable", "code_mode", "exec", "hello"}},
+		{name: "code mode only", feature: "code_mode_only", args: []string{"exec", "--enable=code_mode_only", "hello"}},
+		{name: "remote compaction", feature: "remote_compaction_v2", args: []string{"exec", "hello", "--enable", "remote_compaction_v2"}},
+		{name: "web search request", feature: "web_search_request", args: []string{"--enable=web_search_request", "exec", "hello"}},
+		{name: "legacy web search spaced", feature: "web_search", args: []string{"--enable", "web_search", "exec", "hello"}},
+		{name: "legacy web search equals", feature: "web_search", args: []string{"exec", "--enable=web_search", "hello"}},
+		{name: "cached web search", feature: "web_search_cached", args: []string{"--enable", "web_search_cached", "exec", "hello"}},
+		{name: "standalone web search", feature: "standalone_web_search", args: []string{"exec", "--enable=standalone_web_search", "hello"}},
+		{name: "legacy search tool", feature: "search_tool", args: []string{"exec", "hello", "--enable", "search_tool"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := (CodexAdapter{}).Prepare(PrepareInput{
+				BaseURL: "http://127.0.0.1:43210",
+				Model: ModelInfo{
+					ID:      "policy-model",
+					OwnedBy: PolicyModelOwner,
+				},
+				Binary:        binary,
+				LocalToken:    "token",
+				ForwardedArgs: tc.args,
+				DryRun:        true,
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.feature) || !strings.Contains(err.Error(), "policy-routed") {
+				t.Fatalf("Prepare() error = %v, want rejected policy feature override", err)
+			}
+		})
+	}
+}
+
+func TestCodexAdapterRejectsPolicySearchOverride(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (CodexAdapter{}).Prepare(PrepareInput{
+		BaseURL: "http://127.0.0.1:43210",
+		Model: ModelInfo{
+			ID:      "policy-model",
+			OwnedBy: PolicyModelOwner,
+		},
+		Binary:        binary,
+		LocalToken:    "token",
+		ForwardedArgs: []string{"--search", "exec", "hello"},
+		DryRun:        true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "--search") || !strings.Contains(err.Error(), "policy-routed") {
+		t.Fatalf("Prepare() error = %v, want rejected policy search override", err)
+	}
+}
+
+func TestPolicyCodexCatalogRestrictionsClearDonorProtocolModes(t *testing.T) {
+	template := map[string]interface{}{
+		"use_responses_lite": true,
+		"tool_mode":          "code_mode_only",
+	}
+	applyPolicyCodexCatalogRestrictions(template)
+	if template["use_responses_lite"] != false {
+		t.Fatalf("use_responses_lite = %#v", template["use_responses_lite"])
+	}
+	if value, exists := template["tool_mode"]; exists {
+		t.Fatalf("tool_mode = %#v, want omitted", value)
+	}
 }

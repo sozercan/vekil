@@ -2,7 +2,7 @@
 
 Detailed behavior for Vekil-owned Responses compatibility features. For the generic endpoint list, see [API Reference](api.md). For websocket tuning flags, see [Responses WebSocket Bridge](responses-websocket.md).
 
-> **Policy-routing boundary:** schema-v2 policy profile IDs are not accepted by `POST /v1/responses`, the websocket bridge, `/v1/responses/compact`, or `/v1/memories/trace_summarize` in v1. A policy entered through `POST /v1/chat/completions` may select an internal Responses-backed Chat destination, including a pinned Copilot model. Use a direct public model/route ID for every public Responses surface; existing direct-route behavior is unchanged.
+> **Policy-routing boundary:** schema-v2 policy profile IDs are accepted by a bounded stateless `POST /v1/responses` adapter that converts text, bounded `text.format` structured output, and function/namespace-child tools to canonical Chat. It requires `store: false` or omitted and rejects `previous_response_id`, hosted/custom tools, images, the websocket bridge, `/v1/responses/compact`, and `/v1/memories/trace_summarize`. Lightweight/powerful destinations may execute canonical Chat through native `/chat/completions` or bounded Chat-over-Responses; existing direct-route Responses behavior is unchanged.
 
 ## `POST /v1/responses` and `GET /v1/responses` (OpenAI)
 

@@ -2020,6 +2020,37 @@ func TestAggregateStreamToResponse_ParallelToolCalls(t *testing.T) {
 	}
 }
 
+func TestAggregateStreamToResponse_NullContentDoesNotCreateText(t *testing.T) {
+	body := buildSSEStream(
+		`{"id":"c-null","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":null,"refusal":null}}]}`,
+		`{"id":"c-null","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		"[DONE]",
+	)
+	response, err := aggregateStreamToResponse(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := response.Choices[0].Message
+	if message.Content != nil || message.Refusal != nil {
+		t.Fatalf("null deltas became content/refusal: %+v", message)
+	}
+}
+
+func TestAggregateStreamToResponse_PreservesEmptyText(t *testing.T) {
+	body := buildSSEStream(
+		`{"id":"c-empty","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}`,
+		`{"id":"c-empty","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		"[DONE]",
+	)
+	response, err := aggregateStreamToResponse(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(response.Choices[0].Message.Content); got != `""` {
+		t.Fatalf("content = %s, want explicit empty JSON string", got)
+	}
+}
+
 func TestAggregateStreamToResponse_TextOnly(t *testing.T) {
 	body := buildSSEStream(
 		`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"}}]}`,
@@ -2102,27 +2133,31 @@ func TestAggregateStreamToResponse_MultipleChoices(t *testing.T) {
 }
 
 func TestAggregateStreamToResponse_InvalidToolArgs(t *testing.T) {
-	// Simulate concatenated JSON objects in tool call arguments (LiteLLM bug #20543)
-	body := buildSSEStream(
-		`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":""}}]}}]}`,
-		`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"ls\"}"}}]}}]}`,
-		`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"pwd\"}"}}]}}]}`,
-		`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
-		"[DONE]",
-	)
+	// Simulate concatenated JSON objects in tool call arguments (LiteLLM bug #20543).
+	stream := func() io.ReadCloser {
+		return buildSSEStream(
+			`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":""}}]}}]}`,
+			`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"ls\"}"}}]}}]}`,
+			`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"pwd\"}"}}]}}]}`,
+			`{"id":"c1","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			"[DONE]",
+		)
+	}
 
-	resp, err := aggregateStreamToResponse(body)
+	generic, err := aggregateStreamToResponse(stream())
 	if err != nil {
 		t.Fatalf("aggregateStreamToResponse: %v", err)
 	}
-
-	if len(resp.Choices[0].Message.ToolCalls) != 1 {
-		t.Fatalf("expected 1 tool call, got %d", len(resp.Choices[0].Message.ToolCalls))
+	if got := generic.Choices[0].Message.ToolCalls[0].Function.Arguments; got != "{}" {
+		t.Fatalf("generic tool arguments = %q, want compatibility fallback {}", got)
 	}
-	tc := resp.Choices[0].Message.ToolCalls[0]
-	// The concatenated arguments are invalid JSON, should be replaced with {}
-	if !json.Valid([]byte(tc.Function.Arguments)) {
-		t.Errorf("tool call arguments should be valid JSON, got %q", tc.Function.Arguments)
+
+	policy, _, err := aggregatePolicyStreamToResponseWithProgress(stream())
+	if err != nil {
+		t.Fatalf("aggregatePolicyStreamToResponseWithProgress: %v", err)
+	}
+	if got := policy.Choices[0].Message.ToolCalls[0].Function.Arguments; got != `{"cmd":"ls"}{"cmd":"pwd"}` {
+		t.Fatalf("policy tool arguments = %q, want original malformed fragments", got)
 	}
 }
 
@@ -2208,5 +2243,58 @@ func TestConsumeOpenAIStreamChunks_ErrorsOnOverLimitSSELine(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "SSE line exceeds") {
 		t.Fatalf("error = %v, want SSE line limit", err)
+	}
+}
+
+func TestClassifyOpenAIChatChunkProgressTreatsModerationAsIrreversible(t *testing.T) {
+	var moderation map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(`{"id":"chat","object":"chat.completion.chunk","choices":[],"moderation":{"input":{"results":[]}}}`), &moderation); err != nil {
+		t.Fatal(err)
+	}
+	if got := classifyOpenAIChatChunkProgress(moderation); got != upstreamProgressUnknown {
+		t.Fatalf("moderation progress = %q, want %q", got, upstreamProgressUnknown)
+	}
+
+	var empty map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(`{"id":"chat","object":"chat.completion.chunk","choices":[],"moderation":{}}`), &empty); err != nil {
+		t.Fatal(err)
+	}
+	if got := classifyOpenAIChatChunkProgress(empty); got != upstreamProgressUnknown {
+		t.Fatalf("empty moderation progress = %q, want %q", got, upstreamProgressUnknown)
+	}
+}
+
+func TestAggregatePolicyStreamRejectsMalformedTextDelta(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"chat","object":"chat.completion.chunk","model":"upstream","choices":[{"index":0,"delta":{"role":"assistant","content":"safe"}}]}`,
+		`data: {"id":"chat","object":"chat.completion.chunk","model":"upstream","choices":[{"index":0,"delta":{"content":{"unexpected":true}}}]}`,
+		`data: {"id":"chat","object":"chat.completion.chunk","model":"upstream","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+
+	if response, _, err := aggregateStreamToResponseWithProgress(io.NopCloser(strings.NewReader(stream))); err != nil {
+		t.Fatalf("generic aggregation error = %v", err)
+	} else if got := response.Choices[0].Message.Content; string(got) != `"safe"` {
+		t.Fatalf("generic content = %s, want safe prefix", got)
+	}
+
+	if _, _, err := aggregatePolicyStreamToResponseWithProgress(io.NopCloser(strings.NewReader(stream))); err == nil || !strings.Contains(err.Error(), "malformed content delta") {
+		t.Fatalf("policy aggregation error = %v, want malformed content rejection", err)
+	}
+}
+
+func TestAggregatePolicyStreamEnforcesCumulativeResponseLimit(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"chat","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"` + strings.Repeat("x", 256) + `"}}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	_, _, err := aggregateStreamToResponseWithProgressOptions(
+		io.NopCloser(strings.NewReader(stream)),
+		openAIResponseBuildOptions{maxAccumulatedBytes: 128},
+	)
+	if err == nil || !strings.Contains(err.Error(), "128-byte response limit") {
+		t.Fatalf("aggregation error = %v, want cumulative response limit", err)
 	}
 }

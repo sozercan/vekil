@@ -3366,7 +3366,7 @@ func routeAdapterMayExplicitlyReject(target targetBinding, endpoint string, stat
 		return false
 	}
 	switch target.provider.kind {
-	case providerTypeAzureOpenAI, providerTypeOpenAICompatible:
+	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICompatible:
 		return endpoint == providerEndpointResponses || endpoint == providerEndpointChatCompletions
 	case providerTypeAnthropicCompatible:
 		return endpoint == providerEndpointMessages
@@ -3387,7 +3387,7 @@ func routeAdapterCertifiesHTTPRejection(target targetBinding, endpoint string, r
 	}
 	supported := false
 	switch target.provider.kind {
-	case providerTypeAzureOpenAI, providerTypeOpenAICompatible:
+	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICompatible:
 		supported = endpoint == providerEndpointResponses || endpoint == providerEndpointChatCompletions
 	case providerTypeAnthropicCompatible:
 		supported = endpoint == providerEndpointMessages
@@ -3432,7 +3432,7 @@ func routeAdapterCertifiesStreamFailure(target targetBinding, event responsesWeb
 	case "too_many_requests", "rate_limit_exceeded":
 		return http.StatusTooManyRequests, true
 	case "model_overloaded", "engine_overloaded", "server_overloaded":
-		if target.provider.kind == providerTypeAzureOpenAI || target.provider.kind == providerTypeOpenAICompatible {
+		if target.provider.kind == providerTypeCopilot || target.provider.kind == providerTypeAzureOpenAI || target.provider.kind == providerTypeOpenAICompatible {
 			return http.StatusServiceUnavailable, true
 		}
 	case "overloaded_error":

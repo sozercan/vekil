@@ -413,42 +413,6 @@ func TestPolicyRoutingSelectsCopilotResponsesLightweightRoute(t *testing.T) {
 	}
 }
 
-func TestPolicyResponsesMinimumOutputTokensCarryIntoTerminalExecution(t *testing.T) {
-	upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{
-		TurnType:  policyTurnTypeLookup,
-		CodeScope: policyCodeScopeNone,
-		RiskLevel: policyRiskLevelLow,
-	})
-	h, err := NewProxyHandler(
-		auth.NewTestAuthenticator("fixture-token"),
-		nil,
-		WithCopilotBaseURL(upstream.server.URL),
-		WithProvidersConfig(directCopilotResponsesPolicyConfig(policyConfigModeEnforce)),
-		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
-	)
-	if err != nil {
-		t.Fatalf("NewProxyHandler() error = %v", err)
-	}
-	t.Cleanup(h.BeginShutdown)
-	if err := h.InitializePolicyRouting(t.Context()); err != nil {
-		t.Fatalf("InitializePolicyRouting() error = %v", err)
-	}
-
-	recorder := httptest.NewRecorder()
-	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, providerEndpointChatCompletions, strings.NewReader(`{
-		"model":"gpt-5.6-semantic",
-		"messages":[{"role":"user","content":"Explain one symbol."}],
-		"max_completion_tokens":1
-	}`)))
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
-	}
-	_, classifierRequests, terminalModels, _ := upstream.snapshot()
-	if classifierRequests != 2 || strings.Join(terminalModels, ",") != "gpt-5.6-luna" {
-		t.Fatalf("classifier requests = %d, terminal models = %v", classifierRequests, terminalModels)
-	}
-}
-
 func TestPolicyPublicIDMayMatchHiddenCopilotTargetModel(t *testing.T) {
 	upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{
 		TurnType:  policyTurnTypeLookup,
@@ -534,6 +498,52 @@ func TestPublicExplicitRouteMayMatchHiddenCopilotTargetModel(t *testing.T) {
 	route, ok := h.resolveModelRouteForRequest("gpt-5.6-luna", providerEndpointChatCompletions)
 	if !ok || route == nil || route.public.id != "gpt-5.6-luna" || route.public.routeID != "public-luna-route" {
 		t.Fatalf("resolved route = %+v, known = %v", route, ok)
+	}
+}
+
+func TestPublicCopilotExplicitRouteValidatesPinnedModelWithoutLegacyExposure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != providerEndpointModels {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": []any{
+			map[string]any{"id": "gpt-5.6-sol", "supported_endpoints": []string{providerEndpointResponses}},
+		}})
+	}))
+	defer upstream.Close()
+	cfg := ProvidersConfig{
+		SchemaVersion: 2,
+		Providers: []ProviderConfig{{
+			ID: "copilot", Type: "copilot", Default: true, TrustDomain: "github-copilot",
+		}},
+		ModelRoutes: []ModelRouteConfig{{
+			ID: "public-sol-route", PublicID: "semantic-model", Endpoints: []string{providerEndpointResponses},
+			Targets: []ModelRouteTargetConfig{{ID: "sol", Provider: "copilot", UpstreamModel: "gpt-5.6-sol"}},
+		}},
+	}
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("fixture-token"),
+		nil,
+		WithCopilotBaseURL(upstream.URL),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("semantic-model"),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	if !h.ModelUsesCopilot("semantic-model") {
+		t.Fatal("public Copilot route did not require Copilot authentication")
+	}
+	if _, ok := h.providerSetup().lookupPublicModelEntry("semantic-model"); !ok {
+		t.Fatal("public Copilot route was not registered")
+	}
+	if _, ok := h.providerSetup().lookupPublicModelEntry("gpt-5.6-sol"); ok {
+		t.Fatal("pinned physical Copilot model leaked into the legacy public catalog")
+	}
+	if h.modelAllowedForRequest("gpt-5.6-sol", providerEndpointResponses) {
+		t.Fatal("pinned physical Copilot model became directly requestable")
 	}
 }
 
@@ -669,7 +679,7 @@ func TestPolicyRoutingCopilotResponsesToolContinuationUsesSameProcessReplay(t *t
 			json.RawMessage(initialResponse.Choices[0].Message),
 			map[string]any{"role": "tool", "tool_call_id": assistant.ToolCalls[0].ID, "content": "main is a function"},
 		},
-		"max_completion_tokens": 1,
+		"max_completion_tokens": 256,
 	})
 	if err != nil {
 		t.Fatal(err)

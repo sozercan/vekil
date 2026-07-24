@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 )
 
@@ -326,6 +328,9 @@ func TestPolicyRoutingGlobalOffUsesBaselineWithoutClassifier(t *testing.T) {
 	if err := h.InitializePolicyRouting(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	if stats := h.responsesChatReplayStore().Stats(); stats.Groups != 0 || stats.Calls != 0 || stats.TotalBytes != 0 {
+		t.Fatalf("classifier preflight polluted client replay state: %+v", stats)
+	}
 	recorder := httptest.NewRecorder()
 	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"coding-economy","messages":[{"role":"user","content":"hello"}]}`)))
 	if recorder.Code != http.StatusOK {
@@ -337,6 +342,315 @@ func TestPolicyRoutingGlobalOffUsesBaselineWithoutClassifier(t *testing.T) {
 	}
 	if powerRequests, _ := powerful.snapshot(); powerRequests != 0 {
 		t.Fatalf("powerful requests = %d, want zero", powerRequests)
+	}
+}
+
+func TestPolicyRoutingValidatesResponsesBackedSubsetBeforeClassifier(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{
+		TurnType:  policyTurnTypePlanning,
+		CodeScope: policyCodeScopeMultiFile,
+		RiskLevel: policyRiskLevelHigh,
+	})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)
+	cfg.ModelRoutes[1].Endpoints = []string{providerEndpointResponses}
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+		WithProvidersConfig(cfg),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	lightBefore, _ := light.snapshot()
+	powerfulBefore, _ := powerful.snapshot()
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "small output", body: `{"model":"coding-economy","messages":[{"role":"user","content":"plan"}],"max_tokens":15}`},
+		{name: "multiple choices", body: `{"model":"coding-economy","messages":[{"role":"user","content":"plan"}],"n":2}`},
+		{name: "stop sequence", body: `{"model":"coding-economy","messages":[{"role":"user","content":"plan"}],"stop":"END"}`},
+		{name: "unsupported field", body: `{"model":"coding-economy","messages":[{"role":"user","content":"plan"}],"logprobs":true}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := h.planOpenAIChatPolicy(t.Context(), "coding-economy", []byte(tc.body)); err == nil {
+				t.Fatal("expected shared Responses-backed contract rejection")
+			}
+			lightAfter, _ := light.snapshot()
+			powerfulAfter, _ := powerful.snapshot()
+			if lightAfter != lightBefore || powerfulAfter != powerfulBefore {
+				t.Fatalf("invalid request dispatched classifier/terminal traffic: light %d->%d powerful %d->%d", lightBefore, lightAfter, powerfulBefore, powerfulAfter)
+			}
+		})
+	}
+}
+
+func TestResponsesClassifierMalformedAcceptedOutputIsUncertain(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"resp-malformed","status":"completed","output":[{"type":"unsupported"}]}`)
+	}))
+	t.Cleanup(upstream.Close)
+	trueValue := true
+	provider := &providerRuntime{
+		id:                         "classifier-provider",
+		kind:                       providerTypeOpenAICompatible,
+		baseURL:                    upstream.URL,
+		paths:                      providerEndpointPolicyFor(providerTypeOpenAICompatible).defaultEndpointPaths(),
+		authType:                   providerAuthTypeNone,
+		classifierNoStoreSupported: &trueValue,
+	}
+	route := &modelRoute{
+		public: publicModelContract{
+			id:        "classifier-route",
+			routeID:   "classifier-route",
+			endpoints: []string{providerEndpointResponses},
+		},
+		targets: []targetBinding{{id: "classifier", provider: provider, upstreamModel: "classifier-model"}},
+		policy:  routePolicy{mode: routeModePrimaryOnly, maxTargetAttempts: 1, maxUpstreamSends: 1},
+	}
+	h := &ProxyHandler{}
+	classifier, err := newRoutePolicyClassifier(h, route, PolicyProfileConfig{
+		PublicID: "policy",
+		Classifier: PolicyClassifierConfig{
+			MaxCompletionTokens: 64,
+			MaxRequestBytes:     4096,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, classifyErr := classifier.Classify(t.Context(), policyPreflightFacts())
+	result := newPolicyClassifierResult(policyClassifierSignals{}, classifyErr)
+	if result.Category != policyClassifierResultUncertain ||
+		(result.Failure.Category != policyClassifierFailureMissingToolCall && result.Failure.Category != policyClassifierFailureInvalidOutput) ||
+		!result.Failure.HTTPAccepted {
+		t.Fatalf("malformed accepted classifier result = %+v, error=%v", result, classifyErr)
+	}
+}
+
+func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
+	streamFixture := readResponsesChatStreamFixture(t, "stream_text.sse")
+	var mu sync.Mutex
+	var paths []string
+	var models []string
+	var authorizations []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == providerEndpointModels {
+			_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": []any{
+				map[string]any{"id": "light-model", "supported_endpoints": []string{providerEndpointResponses}},
+				map[string]any{"id": "power-model", "supported_endpoints": []string{providerEndpointResponses}},
+				map[string]any{"id": "classifier-model", "supported_endpoints": []string{providerEndpointResponses}},
+			}})
+			return
+		}
+		defer func() { _ = r.Body.Close() }()
+		var request map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var model string
+		_ = json.Unmarshal(request["model"], &model)
+		var stream bool
+		_ = json.Unmarshal(request["stream"], &stream)
+		tools := string(request["tools"])
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		models = append(models, model)
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Request-ID", "terminal-request-secret")
+		w.Header().Set("X-Azure-Request-ID", "terminal-azure-secret")
+		w.Header().Set("OpenAI-Request-ID", "terminal-openai-secret")
+		w.Header().Set("Openai-Model", model)
+		w.Header().Set("RateLimit-Remaining", "7")
+		if strings.Contains(tools, policyClassifierToolName) {
+			if _, exists := request["store"]; exists {
+				http.Error(w, "classifier store field was not removed", http.StatusUnprocessableEntity)
+				return
+			}
+			arguments, _ := json.Marshal(policyClassifierSignals{
+				TurnType:  policyTurnTypePlanning,
+				CodeScope: policyCodeScopeMultiFile,
+				RiskLevel: policyRiskLevelHigh,
+			})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":     "resp-classifier",
+				"object": "response",
+				"status": "completed",
+				"model":  model,
+				"output": []any{map[string]any{
+					"type":      "function_call",
+					"id":        "fc-classifier",
+					"call_id":   "call-classifier",
+					"name":      policyClassifierToolName,
+					"arguments": string(arguments),
+					"status":    "completed",
+				}},
+				"usage": map[string]any{"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
+			})
+			return
+		}
+		if stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write(streamFixture)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":     "resp-terminal",
+			"object": "response",
+			"status": "completed",
+			"model":  model,
+			"output": []any{map[string]any{
+				"type":   "message",
+				"id":     "msg-terminal",
+				"status": "completed",
+				"role":   "assistant",
+				"content": []any{map[string]any{
+					"type": "output_text",
+					"text": "COPILOT_POLICY_OK",
+				}},
+			}},
+			"usage": map[string]any{"input_tokens": 20, "output_tokens": 5, "total_tokens": 25},
+		})
+	}))
+	t.Cleanup(upstream.Close)
+
+	noStore := false
+	cfg := policyIntegrationConfig("", "", policyConfigModeEnforce)
+	cfg.Providers = []ProviderConfig{{
+		ID:                         "copilot",
+		Type:                       string(providerTypeCopilot),
+		Default:                    true,
+		TrustDomain:                "github-copilot",
+		ClassifierNoStoreSupported: &noStore,
+	}}
+	for routeIndex := range cfg.ModelRoutes {
+		cfg.ModelRoutes[routeIndex].Endpoints = []string{providerEndpointResponses}
+		for targetIndex := range cfg.ModelRoutes[routeIndex].Targets {
+			cfg.ModelRoutes[routeIndex].Targets[targetIndex].Provider = "copilot"
+		}
+	}
+	cfg.PolicyProfiles[0].DataPolicy.AllowProviderRetention = true
+
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("copilot-test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithCopilotBaseURL(upstream.URL),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("coding-economy"),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !h.ModelUsesCopilot("coding-economy") {
+		t.Fatal("Copilot-backed policy entry did not require authentication")
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"coding-economy","messages":[{"role":"user","content":"plan a risky multi-file change"}],"stream":true}`),
+	))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "Synthetic fixture") {
+		t.Fatalf("response body = %s", recorder.Body.String())
+	}
+	for _, name := range []string{"X-Request-ID", "X-Azure-Request-ID", "OpenAI-Request-ID"} {
+		if value := recorder.Header().Get(name); value != "" {
+			t.Fatalf("policy Chat stream leaked %s=%q", name, value)
+		}
+	}
+	if got := recorder.Header().Get("RateLimit-Remaining"); got != "7" {
+		t.Fatalf("policy Chat RateLimit-Remaining = %q, want 7", got)
+	}
+	if got := recorder.Header().Get("Openai-Model"); got != "coding-economy" {
+		t.Fatalf("policy Chat Openai-Model = %q, want policy public id", got)
+	}
+	if stats := h.responsesChatReplayStore().Stats(); stats.Groups != 0 || stats.Calls != 0 || stats.TotalBytes != 0 {
+		t.Fatalf("classifier request polluted client replay state: %+v", stats)
+	}
+
+	anthropicRecorder := httptest.NewRecorder()
+	h.HandleAnthropicMessages(anthropicRecorder, httptest.NewRequest(
+		http.MethodPost,
+		providerEndpointMessages,
+		strings.NewReader(`{"model":"coding-economy","max_tokens":64,"messages":[{"role":"user","content":"plan another risky multi-file change"}]}`),
+	))
+	if anthropicRecorder.Code != http.StatusOK {
+		t.Fatalf("Anthropic status = %d body=%s", anthropicRecorder.Code, anthropicRecorder.Body.String())
+	}
+	for _, name := range []string{"X-Request-ID", "X-Azure-Request-ID", "OpenAI-Request-ID"} {
+		if value := anthropicRecorder.Header().Get(name); value != "" {
+			t.Fatalf("policy Anthropic response leaked %s=%q", name, value)
+		}
+	}
+	if got := anthropicRecorder.Header().Get("RateLimit-Remaining"); got != "7" {
+		t.Fatalf("RateLimit-Remaining = %q, want 7", got)
+	}
+	if got := anthropicRecorder.Header().Get("Openai-Model"); got != "coding-economy" {
+		t.Fatalf("Openai-Model = %q, want policy public id", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := strings.Join(paths, ","); got != "/responses,/responses,/responses,/responses,/responses" {
+		t.Fatalf("Copilot policy paths = %q, want five Responses sends", got)
+	}
+	if got := strings.Join(models, ","); got != "classifier-model,classifier-model,power-model,classifier-model,power-model" {
+		t.Fatalf("Copilot policy models = %q", got)
+	}
+	for index, authorization := range authorizations {
+		if authorization != "Bearer copilot-test-token" {
+			t.Fatalf("Copilot Authorization[%d] = %q", index, authorization)
+		}
+	}
+}
+
+func TestPreparePolicyClassifierResponsesBodyHonorsNoStoreCapability(t *testing.T) {
+	trueValue := true
+	falseValue := false
+	for _, tc := range []struct {
+		name       string
+		capability *bool
+		wantStore  bool
+	}{
+		{name: "supported", capability: &trueValue, wantStore: true},
+		{name: "unsupported", capability: &falseValue},
+		{name: "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := preparePolicyClassifierResponsesBody(
+				[]byte(`{"model":"classifier","store":false,"input":"classify"}`),
+				targetBinding{provider: &providerRuntime{classifierNoStoreSupported: tc.capability}},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]json.RawMessage
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatal(err)
+			}
+			_, hasStore := payload["store"]
+			if hasStore != tc.wantStore {
+				t.Fatalf("store present = %v, want %v; body=%s", hasStore, tc.wantStore, body)
+			}
+		})
 	}
 }
 
@@ -419,7 +733,7 @@ func TestChatOperationPlanDefensivelyCopiesCandidates(t *testing.T) {
 	}
 }
 
-func TestPolicyPublicIDRejectedOnResponsesWithoutUpstreamSend(t *testing.T) {
+func TestPolicyPublicIDRejectsStatefulResponsesWithoutUpstreamSend(t *testing.T) {
 	var sends atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sends.Add(1)
@@ -432,7 +746,7 @@ func TestPolicyPublicIDRejectedOnResponsesWithoutUpstreamSend(t *testing.T) {
 		t.Fatal(err)
 	}
 	recorder := httptest.NewRecorder()
-	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"coding-economy","input":"hello"}`)))
+	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"coding-economy","input":"hello","previous_response_id":"resp-upstream"}`)))
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -1215,15 +1529,7 @@ func TestPolicyClientStatsUsePublicIDNotTerminalRouteID(t *testing.T) {
 	}
 }
 
-func TestPolicyResponsesReplayIDRejectedBeforeClassifierSend(t *testing.T) {
-	modes := []struct {
-		name        string
-		profileMode string
-		runtimeMode PolicyRoutingMode
-	}{
-		{name: "observe", profileMode: policyConfigModeObserve, runtimeMode: PolicyRoutingModeObserve},
-		{name: "enforce", profileMode: policyConfigModeEnforce, runtimeMode: PolicyRoutingModeEnforce},
-	}
+func TestPolicyResponsesReplayIDRejectedInEnforceBeforeClassifierSend(t *testing.T) {
 	bodies := []struct {
 		name string
 		body string
@@ -1233,33 +1539,168 @@ func TestPolicyResponsesReplayIDRejectedBeforeClassifierSend(t *testing.T) {
 		{name: "case_folded_siblings", body: `{"model":"coding-economy","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","ID":123,"type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}],"MESSAGES":123}`},
 		{name: "case_insensitive_keys", body: `{"model":"coding-economy","messages":[{"Role":"assistant","Tool_Calls":[{"ID":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"Role":"tool","Tool_Call_ID":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`},
 	}
+	for _, request := range bodies {
+		t.Run(request.name, func(t *testing.T) {
+			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+			powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			h, err := NewProxyHandler(nil, nil, WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)), WithPolicyRoutingMode(PolicyRoutingModeEnforce))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := light.snapshot()
+			recorder := httptest.NewRecorder()
+			h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(request.body)))
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			after, _ := light.snapshot()
+			if after != before {
+				t.Fatalf("classifier/terminal sends before=%d after=%d", before, after)
+			}
+			if sends, _ := powerful.snapshot(); sends != 0 {
+				t.Fatalf("powerful sends=%d", sends)
+			}
+		})
+	}
+}
+
+func TestPolicyAmbiguousCustomReplayRejectedBeforeObserveClassifierSend(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	h, err := NewProxyHandler(nil, nil,
+		WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeObserve)),
+		WithPolicyRoutingMode(PolicyRoutingModeObserve),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := light.snapshot()
+	body := `{
+		"model":"coding-economy",
+		"messages":[
+			{"role":"assistant","tool_calls":[{
+				"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA",
+				"type":"custom",
+				"custom":{"name":"apply_patch","input":"patch"},
+				"function":{"name":"apply_patch","arguments":"{}"}
+			}]},
+			{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"done"}
+		]
+	}`
+	recorder := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	waitCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := h.WaitLifecycleWorkers(waitCtx); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := light.snapshot()
+	if after != before {
+		t.Fatalf("classifier/terminal sends before=%d after=%d", before, after)
+	}
+	if sends, _ := powerful.snapshot(); sends != 0 {
+		t.Fatalf("powerful sends=%d", sends)
+	}
+}
+
+func TestPolicyResponsesReplayContinuationPlansDeterministicBaseline(t *testing.T) {
+	modes := []struct {
+		name        string
+		profileMode string
+		runtimeMode PolicyRoutingMode
+	}{
+		{name: "off", profileMode: policyConfigModeEnforce, runtimeMode: PolicyRoutingModeOff},
+		{name: "observe", profileMode: policyConfigModeObserve, runtimeMode: PolicyRoutingModeObserve},
+	}
+	body := []byte(`{"model":"coding-economy","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`)
 	for _, mode := range modes {
-		for _, request := range bodies {
-			t.Run(mode.name+"/"+request.name, func(t *testing.T) {
-				light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
-				powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
-				h, err := NewProxyHandler(nil, nil, WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, mode.profileMode)), WithPolicyRoutingMode(mode.runtimeMode))
-				if err != nil {
-					t.Fatal(err)
+		t.Run(mode.name, func(t *testing.T) {
+			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+			powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			h, err := NewProxyHandler(nil, nil, WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, mode.profileMode)), WithPolicyRoutingMode(mode.runtimeMode))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+
+			plan, err := h.planOpenAIChatPolicy(t.Context(), "coding-economy", body)
+			if err != nil {
+				t.Fatalf("planOpenAIChatPolicy() error = %v", err)
+			}
+			if !plan.valid() {
+				t.Fatalf("plan = %+v, want valid baseline plan", plan)
+			}
+			if plan.selectedTier != policyTierLightweight || len(plan.candidateSnapshot()) != 1 {
+				t.Fatalf("plan tier/candidates = %s/%d, want lightweight/1", plan.selectedTier, len(plan.candidateSnapshot()))
+			}
+			if !plan.allowsResponsesReplayPassthrough() {
+				t.Fatalf("plan = %+v, want Responses replay passthrough", plan)
+			}
+			if mode.runtimeMode == PolicyRoutingModeObserve {
+				waitCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				if err := h.WaitLifecycleWorkers(waitCtx); err != nil {
+					t.Fatalf("WaitLifecycleWorkers() error = %v", err)
 				}
-				if err := h.InitializePolicyRouting(t.Context()); err != nil {
-					t.Fatal(err)
-				}
-				before, _ := light.snapshot()
-				recorder := httptest.NewRecorder()
-				h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(request.body)))
-				if recorder.Code != http.StatusBadRequest {
-					t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
-				}
-				after, _ := light.snapshot()
-				if after != before {
-					t.Fatalf("classifier/terminal sends before=%d after=%d", before, after)
-				}
-				if sends, _ := powerful.snapshot(); sends != 0 {
-					t.Fatalf("powerful sends=%d", sends)
-				}
+			}
+		})
+	}
+}
+
+func TestPolicyResponsesReplayContinuationRejectsNondeterministicBaseline(t *testing.T) {
+	modes := []struct {
+		name        string
+		profileMode string
+		runtimeMode PolicyRoutingMode
+	}{
+		{name: "off", profileMode: policyConfigModeEnforce, runtimeMode: PolicyRoutingModeOff},
+		{name: "observe", profileMode: policyConfigModeObserve, runtimeMode: PolicyRoutingModeObserve},
+	}
+	body := []byte(`{"model":"coding-economy","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`)
+	for _, mode := range modes {
+		t.Run(mode.name, func(t *testing.T) {
+			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow})
+			powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, mode.profileMode)
+			cfg.ModelRoutes[0].Targets = append(cfg.ModelRoutes[0].Targets, ModelRouteTargetConfig{
+				ID: "light-secondary", Provider: "light-provider", UpstreamModel: "light-model-secondary",
 			})
-		}
+			h, err := NewProxyHandler(nil, nil, WithProvidersConfig(cfg), WithPolicyRoutingMode(mode.runtimeMode))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := light.snapshot()
+
+			plan, err := h.planOpenAIChatPolicy(t.Context(), "coding-economy", body)
+			if err == nil {
+				t.Fatalf("planOpenAIChatPolicy() plan = %+v, want replay rejection", plan)
+			}
+			var requestErr *providerRequestError
+			if !errors.As(err, &requestErr) || requestErr.statusCode != http.StatusBadRequest {
+				t.Fatalf("planOpenAIChatPolicy() error = %T %v, want 400 providerRequestError", err, err)
+			}
+			after, _ := light.snapshot()
+			if after != before {
+				t.Fatalf("classifier/terminal sends before=%d after=%d", before, after)
+			}
+			if sends, _ := powerful.snapshot(); sends != 0 {
+				t.Fatalf("powerful sends=%d", sends)
+			}
+		})
 	}
 }
 

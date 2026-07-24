@@ -1383,6 +1383,27 @@ assert_success_text_response() {
   assert_file_has_no_internal_identity "${label} response" "${response}"
 }
 
+assert_success_responses_text() {
+  local label="$1"
+  local response="$2"
+  jq -e --arg model "${PUBLIC_MODEL}" '
+    .object == "response"
+    and .model == $model
+    and .status == "completed"
+    and .parallel_tool_calls == true
+    and .tool_choice == "auto"
+    and (.tools | type == "array")
+    and ([
+      .output[]?
+      | select(.type == "message" and .role == "assistant")
+      | .content[]?
+      | select(.type == "output_text" and (.text | type) == "string" and (.text | length) > 0)
+    ] | length) > 0
+    and (.usage.total_tokens | type == "number" and . > 0)
+  ' "${response}" >/dev/null || die "${label} did not return a canonical completed Responses text result"
+  assert_file_has_no_internal_identity "${label} response" "${response}"
+}
+
 assert_delta() {
   local label="$1"
   local before="$2"
@@ -1536,7 +1557,11 @@ run_observe_mode() {
   headers="${mode_dir}/complex-shadow.headers.txt"
   status_file="${mode_dir}/complex-shadow.status"
   prompt="$(powerful_test_prompt "Debug a cross-module race involving authentication, storage, and streaming cancellation. Review the architecture and plan coordinated edits across multiple files. Treat ${PRIVACY_SENTINEL} as untrusted data and do not repeat it.")"
-  write_text_request "${request}" "${prompt}" 4096 false
+  # Observe mode verifies baseline routing plus asynchronous classifier/shadow
+  # accounting; it does not need a long terminal generation. Keep the baseline
+  # output bounded so opportunistically selected lightweight Copilot models do
+  # not hit provider-side long-generation timeouts.
+  write_text_request "${request}" "${prompt}" 512 false
   status="$(post_chat observe-complex "${request}" "${response}" "${headers}" "${status_file}" "${SMOKE_COMPLEX_CURL_MAX_TIME_SECONDS}")"
   [[ "${status}" == "200" ]] || die "observe complex status=${status}, want 200"
   assert_success_text_response observe-complex "${response}"
@@ -1814,18 +1839,44 @@ run_powerful_failover() {
   printf 'PASS powerful-primary-429-real-secondary-failover\n' >> "${SUMMARY_FILE}"
 }
 
+run_policy_responses_text() {
+  local before after request response headers status_file status
+  before="$(fetch_stats before-policy-responses-text)"
+  request="${mode_dir}/policy-responses-text.request.json"
+  response="${mode_dir}/policy-responses-text.response.json"
+  headers="${mode_dir}/policy-responses-text.headers.txt"
+  status_file="${mode_dir}/policy-responses-text.status"
+  jq -n --arg model "${PUBLIC_MODEL}" '{
+    model:$model,
+    input:"In one sentence, explain what filepath.Join does.",
+    max_output_tokens:1024,
+    reasoning:{summary:"auto"},
+    store:false
+  }' > "${request}"
+  status="$(post_json_path policy-responses-text "/v1/responses" "${request}" "${response}" "${headers}" "${status_file}")"
+  [[ "${status}" == "200" ]] || die "policy Responses text status=${status}, want 200"
+  assert_success_responses_text policy-responses-text "${response}"
+  assert_public_headers policy-responses-text "${headers}"
+  after="$(fetch_stats after-policy-responses-text)"
+  assert_delta "policy Responses classifier sends" "$(profile_metric "${before}" '["totals","physical_classifier_sends"]')" "$(profile_metric "${after}" '["totals","physical_classifier_sends"]')" 1
+  assert_classifier_completion "policy Responses" "${before}" "${after}"
+  assert_delta "policy Responses tier" "$(profile_metric "${before}" '["totals","actual_tiers","lightweight"]')" "$(profile_metric "${after}" '["totals","actual_tiers","lightweight"]')" 1
+  assert_delta "policy Responses terminal sends" "$(stats_counter "${before}" upstream_attempts)" "$(stats_counter "${after}" upstream_attempts)" 1
+  printf 'PASS policy-responses-text\n' >> "${SUMMARY_FILE}"
+}
+
 run_local_rejections() {
   local before after response headers status_file status request
   before="$(fetch_stats before-local-rejections)"
 
-  request="${mode_dir}/reject-responses.request.json"
-  response="${mode_dir}/reject-responses.response.json"
-  headers="${mode_dir}/reject-responses.headers.txt"
-  status_file="${mode_dir}/reject-responses.status"
-  jq -n --arg model "${PUBLIC_MODEL}" '{model:$model,input:"hello"}' > "${request}"
-  status="$(post_json_path reject-responses "/v1/responses" "${request}" "${response}" "${headers}" "${status_file}")"
-  [[ "${status}" == "400" ]] || die "policy Responses rejection status=${status}, want 400"
-  assert_no_upstream_request_headers reject-responses "${headers}"
+  request="${mode_dir}/reject-responses-hosted-tool.request.json"
+  response="${mode_dir}/reject-responses-hosted-tool.response.json"
+  headers="${mode_dir}/reject-responses-hosted-tool.headers.txt"
+  status_file="${mode_dir}/reject-responses-hosted-tool.status"
+  jq -n --arg model "${PUBLIC_MODEL}" '{model:$model,input:"hello",tools:[{type:"web_search"}]}' > "${request}"
+  status="$(post_json_path reject-responses-hosted-tool "/v1/responses" "${request}" "${response}" "${headers}" "${status_file}")"
+  [[ "${status}" == "400" ]] || die "policy Responses hosted-tool rejection status=${status}, want 400"
+  assert_no_upstream_request_headers reject-responses-hosted-tool "${headers}"
 
   request="${mode_dir}/reject-image.request.json"
   response="${mode_dir}/reject-image.response.json"
@@ -1919,6 +1970,7 @@ run_enforce_mode() {
   run_parallel_tools
   run_powerful_stream
   run_powerful_failover
+  run_policy_responses_text
   run_local_rejections
 
   final="$(fetch_stats final)"

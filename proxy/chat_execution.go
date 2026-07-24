@@ -218,9 +218,10 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 	}
 	if plan.Stream {
 		stream, streamErr := translateResponsesSSEToChat(ctx, resp.Body, responsesChatResponseOptions{
-			PublicModel: route.publicModel,
-			ReplayStore: h.responsesChatReplayStore(),
-			ReplayRoute: replayRoute,
+			PublicModel:        route.publicModel,
+			ReplayStore:        h.responsesChatReplayStore(),
+			ReplayRoute:        replayRoute,
+			ReplayToolDefaults: plan.ReplayToolDefaults,
 		})
 		if streamErr != nil {
 			attachChatExecutionErrorHeaders(streamErr, result.Headers)
@@ -241,10 +242,11 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 		return chatExecutionResult{}, fmt.Errorf("read Responses-backed Chat body: %w", readErr)
 	}
 	converted, err := translateResponsesJSONToChat(responseBody, responsesChatResponseOptions{
-		PublicModel: route.publicModel,
-		ReplayStore: h.responsesChatReplayStore(),
-		ReplayRoute: replayRoute,
-		UsageOnly:   options.ResponsesUsageOnly,
+		PublicModel:        route.publicModel,
+		ReplayStore:        h.responsesChatReplayStore(),
+		ReplayRoute:        replayRoute,
+		ReplayToolDefaults: plan.ReplayToolDefaults,
+		UsageOnly:          options.ResponsesUsageOnly,
 	})
 	if err != nil {
 		attachChatExecutionErrorHeaders(err, result.Headers)

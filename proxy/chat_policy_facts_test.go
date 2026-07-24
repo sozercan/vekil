@@ -532,3 +532,53 @@ func TestBuildPolicyClassifierFactsBoundsSourceAndArrayMaterialization(t *testin
 		t.Fatalf("array bound error = %v", err)
 	}
 }
+
+func TestBuildPolicyClassifierFactsAcceptsReplayBackedCustomToolHistory(t *testing.T) {
+	body := []byte(`{
+		"model":"policy",
+		"messages":[
+			{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"custom","custom":{"name":"apply_patch","input":"*** Begin Patch\n*** End Patch"}}]},
+			{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"Modified 1 file"}
+		]
+	}`)
+	facts, err := buildPolicyClassifierFacts(body, policyFactOptions{RecentTurns: 4, MaxRequestBytes: 4096})
+	if err != nil {
+		t.Fatalf("buildPolicyClassifierFacts() error = %v", err)
+	}
+	if facts.Counts.AssistantToolCalls != 1 || facts.Counts.ToolMessages != 1 {
+		t.Fatalf("custom replay counts=%+v", facts.Counts)
+	}
+}
+
+func TestBuildPolicyClassifierFactsRejectsAmbiguousReplayToolHistory(t *testing.T) {
+	tests := []struct {
+		name string
+		call string
+		want string
+	}{
+		{
+			name: "custom with function",
+			call: `{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"custom","custom":{"name":"apply_patch","input":"patch"},"function":{"name":"apply_patch","arguments":"{}"}}`,
+			want: "function is not valid for a custom tool call",
+		},
+		{
+			name: "function with custom",
+			call: `{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"},"custom":{"name":"lookup","input":"{}"}}`,
+			want: "custom is not valid for a function tool call",
+		},
+		{
+			name: "custom with null input",
+			call: `{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"custom","custom":{"name":"apply_patch","input":null}}`,
+			want: "custom tool input must be a string",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"policy","messages":[{"role":"assistant","tool_calls":[` + tc.call + `]}]}`)
+			_, err := buildPolicyClassifierFacts(body, policyFactOptions{RecentTurns: 4, MaxRequestBytes: 4096})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("buildPolicyClassifierFacts() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}

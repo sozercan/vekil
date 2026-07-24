@@ -742,7 +742,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 	if err != nil {
 		return nil, err
 	}
-	hideInternalCopilotRouteModels(explicitRoutes)
+	hideExplicitCopilotRouteModels(explicitRoutes)
 	policyEntries, err := compilePolicyPublicModelEntries(cfg)
 	if err != nil {
 		return nil, err
@@ -865,7 +865,7 @@ func (h *ProxyHandler) validateDynamicExplicitRouteTargets(setup *providerSetup,
 		return nil
 	}
 	for _, route := range snapshot.explicit {
-		if route == nil || !h.explicitRouteWithinAllowedPolicyScope(setup, route.public.routeID) {
+		if route == nil || !h.explicitRouteWithinDynamicValidationScope(setup, route.public.routeID) {
 			continue
 		}
 		for _, target := range route.targets {
@@ -890,12 +890,28 @@ func (h *ProxyHandler) validateDynamicExplicitRouteTargets(setup *providerSetup,
 	return nil
 }
 
-func (h *ProxyHandler) explicitRouteWithinAllowedPolicyScope(setup *providerSetup, routeID string) bool {
+func (h *ProxyHandler) explicitRouteWithinDynamicValidationScope(setup *providerSetup, routeID string) bool {
 	if h == nil || setup == nil {
 		return false
 	}
 	routeID = strings.TrimSpace(routeID)
 	if routeID == "" {
+		return false
+	}
+	route, _ := setup.lookupTerminalRoute(routeID)
+	if route == nil {
+		return false
+	}
+	if route.isPublic() {
+		if len(h.allowedModels) == 0 {
+			return true
+		}
+		for model := range h.allowedModels {
+			entry, ok := setup.lookupPublicModelEntry(model)
+			if ok && entry != nil && entry.kind == publicEntryStatic && entry.routeID == routeID {
+				return true
+			}
+		}
 		return false
 	}
 	referencesRoute := func(entry *publicModelEntry) bool {
@@ -1512,7 +1528,7 @@ func (h *ProxyHandler) providerSetupNeedsDynamicModelValidation(setup *providerS
 		return false
 	}
 	for _, route := range snapshot.explicit {
-		if route == nil || !h.explicitRouteWithinAllowedPolicyScope(setup, route.public.routeID) {
+		if route == nil || !h.explicitRouteWithinDynamicValidationScope(setup, route.public.routeID) {
 			continue
 		}
 		for _, target := range route.targets {
@@ -1539,9 +1555,9 @@ func providerHasPublicDynamicModels(provider *providerRuntime) bool {
 	return false
 }
 
-func hideInternalCopilotRouteModels(routes []*modelRoute) {
+func hideExplicitCopilotRouteModels(routes []*modelRoute) {
 	for _, route := range routes {
-		if route == nil || route.exposure != modelRouteExposureInternal {
+		if route == nil {
 			continue
 		}
 		for _, target := range route.targets {
@@ -1927,10 +1943,18 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 	if _, ok := h.allowedModels[model]; ok {
 		return true
 	}
+	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+		for allowedModel := range h.allowedModels {
+			allowedEntry, allowed := setup.lookupPublicModelEntry(allowedModel)
+			if allowed && allowedEntry != nil && allowedEntry.kind == publicEntryPolicy && allowedEntry.policyID == entry.policyID {
+				return true
+			}
+		}
+	}
 	if endpoint != providerEndpointMessages {
 		return false
 	}
-	if _, rawKnown := h.providerSetup().lookupModel(model); rawKnown {
+	if _, rawKnown := setup.lookupModel(model); rawKnown {
 		return false
 	}
 	normalizedModel := NormalizeModelName(model)

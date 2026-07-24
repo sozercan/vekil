@@ -25,20 +25,6 @@ func TestRejectedPolicySurfacesKeepStatsOnPublicPolicyIdentity(t *testing.T) {
 		handle func(*ProxyHandler, http.ResponseWriter, *http.Request)
 	}{
 		{
-			name:   "responses",
-			method: http.MethodPost,
-			path:   "/v1/responses",
-			body:   `{"model":"coding-economy","input":"hello"}`,
-			handle: (*ProxyHandler).HandleResponses,
-		},
-		{
-			name:   "responses alias",
-			method: http.MethodPost,
-			path:   "/v1/responses",
-			body:   `{"model":"coding-economy-20260717","input":"hello"}`,
-			handle: (*ProxyHandler).HandleResponses,
-		},
-		{
 			name:   "responses compact",
 			method: http.MethodPost,
 			path:   "/v1/responses/compact",
@@ -51,20 +37,6 @@ func TestRejectedPolicySurfacesKeepStatsOnPublicPolicyIdentity(t *testing.T) {
 			path:   "/v1/memories/trace_summarize",
 			body:   `{"model":"coding-economy","traces":[{"id":"trace-1","items":[]}]}`,
 			handle: (*ProxyHandler).HandleMemorySummarize,
-		},
-		{
-			name:   "anthropic",
-			method: http.MethodPost,
-			path:   "/v1/messages",
-			body:   `{"model":"coding-economy","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`,
-			handle: (*ProxyHandler).HandleAnthropicMessages,
-		},
-		{
-			name:   "anthropic count tokens",
-			method: http.MethodPost,
-			path:   "/v1/messages/count_tokens",
-			body:   `{"model":"coding-economy","messages":[{"role":"user","content":"hello"}]}`,
-			handle: (*ProxyHandler).HandleAnthropicMessagesCountTokens,
 		},
 		{
 			name:   "gemini",
@@ -106,13 +78,6 @@ func TestRejectedPolicySurfacesKeepStatsOnPublicPolicyIdentity(t *testing.T) {
 			method: http.MethodPost,
 			path:   "/v1/chat/completions",
 			body:   `{"model":"coding-economy-20260717","messages":[{"role":"user","content":"search"}],"tools":[{"type":"web_search"}]}`,
-			handle: (*ProxyHandler).HandleOpenAIChatCompletions,
-		},
-		{
-			name:   "chat responses replay",
-			method: http.MethodPost,
-			path:   "/v1/chat/completions",
-			body:   `{"model":"coding-economy","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`,
 			handle: (*ProxyHandler).HandleOpenAIChatCompletions,
 		},
 	}
