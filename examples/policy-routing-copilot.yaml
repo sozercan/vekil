@@ -1,7 +1,25 @@
-# Single-process semantic policy routing backed by GitHub Copilot.
-# The configured Copilot provider authenticates and executes Responses-backed
-# classifier/terminal routes in the same Vekil process; no loopback sidecar is
-# required.
+# Schema-v2 semantic policy routing with GitHub Copilot as the classifier and
+# both terminal tiers. The policy profile mode is authoritative by default:
+# no separate --policy-routing flag is required. Use --policy-routing=off or
+# POLICY_ROUTING_MODE=off as an emergency process-wide downgrade.
+#
+# Authenticate first:
+#   vekil login
+#
+# Validate the local contract:
+#   vekil config validate \
+#     --providers-config examples/policy-routing-copilot.yaml
+#
+# Validate live classifier protocol support:
+#   vekil config validate --live \
+#     --providers-config examples/policy-routing-copilot.yaml
+#
+# Run:
+#   vekil --providers-config examples/policy-routing-copilot.yaml
+#
+# GitHub Copilot's gpt-5.6-luna and gpt-5.6-sol currently advertise native
+# /responses. Vekil owns the Chat compatibility conversion and process-local
+# tool replay while preserving the public gpt-5.6-semantic identity.
 
 schema_version: 2
 
@@ -10,13 +28,16 @@ providers:
     type: copilot
     default: true
     trust_domain: github-copilot
+    # Vekil cannot independently attest provider retention or a supported
+    # no-store option for Copilot classifier requests.
     classifier_no_store_supported: false
 
 model_routes:
   - id: semantic-lightweight-gpt-5-6-luna-route
     exposure: internal
     name: Semantic Lightweight GPT-5.6 Luna
-    endpoints: [/responses]
+    endpoints:
+      - /responses
     parallel_tool_calls: true
     context_window: 1050000
     drop_sampling_params: true
@@ -32,7 +53,8 @@ model_routes:
   - id: semantic-powerful-gpt-5-6-sol-route
     exposure: internal
     name: Semantic Powerful GPT-5.6 Sol
-    endpoints: [/responses]
+    endpoints:
+      - /responses
     parallel_tool_calls: true
     context_window: 1050000
     drop_sampling_params: true
@@ -49,7 +71,8 @@ model_routes:
     exposure: internal
     internal_purpose: policy_classifier
     name: Semantic Routing Classifier
-    endpoints: [/responses]
+    endpoints:
+      - /responses
     drop_sampling_params: true
     targets:
       - id: copilot-classifier-gpt-5-6-sol

@@ -3942,7 +3942,7 @@ func (h *ProxyHandler) pickResponsesCompatibleModel(ctx context.Context, provide
 
 	supported := make(map[string]struct{})
 	firstAvailable := ""
-	for _, model := range h.filterAllowedModels(filterProviderModels(provider, result.models)) {
+	for _, model := range h.filterAllowedModels(filterHiddenProviderModels(provider, filterProviderModels(provider, result.models))) {
 		if model.publicID == "" || model.publicID == exclude {
 			continue
 		}

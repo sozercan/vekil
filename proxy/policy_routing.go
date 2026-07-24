@@ -400,19 +400,29 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 		}
 		return chatOperationPlan{}, &providerRequestError{statusCode: http.StatusServiceUnavailable, err: fmt.Errorf("%s for policy model %q", message, entry.id)}
 	}
+	var replayRoute *modelRoute
+	var replayTier policyTier
+	downstreamReplayPassthrough := false
 	if chatRequestContainsResponsesReplayID(input.OriginalBody) {
-		baselineRoute := profile.routeForTier(profile.baselineTier)
-		if (mode != policyModeOff && mode != policyModeObserve) || baselineRoute == nil || len(baselineRoute.targets) != 1 {
-			return chatOperationPlan{}, &providerRequestError{
-				statusCode: http.StatusBadRequest,
-				err:        fmt.Errorf("policy model %q does not support Responses replay continuations", entry.id),
+		var replayErr error
+		replayRoute, replayTier, replayErr = c.resolvePolicyResponsesReplayRoute(profile, input.OriginalBody)
+		if replayErr != nil {
+			baselineRoute := profile.routeForTier(profile.baselineTier)
+			downstreamReplayPassthrough = (mode == policyModeOff || mode == policyModeObserve) &&
+				baselineRoute != nil && len(baselineRoute.targets) == 1 &&
+				explicitRouteHasChatBackend(baselineRoute, providerEndpointChatCompletions) &&
+				(isMissingResponsesChatReplayError(replayErr) || !explicitRouteHasChatBackend(baselineRoute, providerEndpointResponses))
+			if !downstreamReplayPassthrough {
+				return chatOperationPlan{}, replayErr
 			}
 		}
 	}
-	if err := c.validateResponsesBackedPolicyRequest(profile, input.OriginalBody); err != nil {
-		return chatOperationPlan{}, &providerRequestError{
-			statusCode: http.StatusBadRequest,
-			err:        fmt.Errorf("policy model %q request is outside its shared terminal contract: %w", entry.id, err),
+	if replayRoute == nil && !downstreamReplayPassthrough {
+		if err := c.validateResponsesBackedPolicyRequest(profile, input.OriginalBody); err != nil {
+			return chatOperationPlan{}, &providerRequestError{
+				statusCode: http.StatusBadRequest,
+				err:        fmt.Errorf("policy model %q request is outside its shared terminal contract: %w", entry.id, err),
+			}
 		}
 	}
 	facts, err := buildPolicyClassifierFacts(input.OriginalBody, policyFactOptions{
@@ -429,6 +439,10 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 		return chatOperationPlan{}, err
 	}
 	bucket := policyTrafficBucket(len(input.OriginalBody), facts.Counts.FunctionTools)
+	if replayRoute != nil {
+		c.stats.record(policyStatsObservation{Profile: profile.statsID(), TrafficBucket: bucket, Eligible: true, ActualTier: replayTier.String()})
+		return c.sealRoutePlan(profile, input, facts, replayRoute, replayTier, policyDecisionRecord{Category: "replay_binding", ActualTier: replayTier}), nil
+	}
 	if mode == policyModeOff {
 		c.stats.record(policyStatsObservation{Profile: profile.statsID(), TrafficBucket: bucket, Eligible: true, ActualTier: profile.baselineTier.String()})
 		return c.sealPlan(profile, input, facts, profile.baselineTier, policyDecisionRecord{Category: "baseline", ActualTier: profile.baselineTier}), nil
@@ -462,6 +476,64 @@ func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profi
 		}
 	}
 	return nil
+}
+
+func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile *compiledPolicyProfile, body []byte) (*modelRoute, policyTier, error) {
+	if c == nil || c.h == nil || profile == nil {
+		return nil, policyTierUnknown, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("policy model does not support Responses replay continuations")}
+	}
+	type candidate struct {
+		route *modelRoute
+		tier  policyTier
+	}
+	candidates := []candidate{{route: profile.lightweight, tier: policyTierLightweight}, {route: profile.powerful, tier: policyTierPowerful}}
+	responsesCapable := false
+	var missing error
+	for _, candidate := range candidates {
+		if candidate.route == nil || !candidate.route.supportsEndpoint(providerEndpointResponses) {
+			continue
+		}
+		for _, target := range candidate.route.targets {
+			if target.provider == nil || !target.provider.supportsEndpoint(providerEndpointResponses) {
+				continue
+			}
+			responsesCapable = true
+			upstreamModel := strings.TrimSpace(target.upstreamModel)
+			if upstreamModel == "" {
+				upstreamModel = profile.entry.id
+			}
+			_, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
+				UpstreamModel: upstreamModel,
+				ReplayStore:   c.h.responsesChatReplayStore(),
+				ReplayRoute: responsesChatReplayRoute{
+					ProviderID:    target.provider.id,
+					PublicModel:   profile.entry.id,
+					UpstreamModel: upstreamModel,
+					RouteID:       candidate.route.public.routeID,
+					PolicyTier:    candidate.tier.String(),
+				},
+				DropSamplingParams: candidate.route.public.policy.dropSamplingParams,
+			})
+			if err == nil {
+				return candidate.route, candidate.tier, nil
+			}
+			if isMissingResponsesChatReplayError(err) {
+				missing = err
+				continue
+			}
+			return nil, policyTierUnknown, err
+		}
+	}
+	if !responsesCapable {
+		return nil, policyTierUnknown, &providerRequestError{
+			statusCode: http.StatusBadRequest,
+			err:        fmt.Errorf("policy model %q does not support Responses replay continuations", profile.entry.id),
+		}
+	}
+	if missing == nil {
+		missing = missingResponsesChatReplayError()
+	}
+	return nil, policyTierUnknown, missing
 }
 
 func validatePolicyPublicRequestContract(body []byte, contract publicModelContract) error {
@@ -707,6 +779,33 @@ func (c *chatPolicyRoutingController) sealPlan(profile *compiledPolicyProfile, i
 	})
 }
 
+func (c *chatPolicyRoutingController) sealRoutePlan(profile *compiledPolicyProfile, input chatPolicyInput, facts policyClassifierFacts, route *modelRoute, tier policyTier, decision policyDecisionRecord) chatOperationPlan {
+	contract := copyPublicModelContract(profile.entry.contract)
+	contract.id = profile.entry.id
+	contract.routeID = route.public.routeID
+	contract.endpoints = append([]string(nil), route.public.endpoints...)
+	decision.MessageCount = facts.Counts.Messages
+	decision.ToolCount = facts.Counts.FunctionTools
+	decision.InputBytes = len(input.OriginalBody)
+	decision.Truncated = decision.Truncated || facts.truncated()
+	return newChatOperationPlan(chatOperationPlanOptions{
+		OperationID:          input.OperationID,
+		EntryID:              profile.entry.id,
+		PublicID:             profile.entry.id,
+		RouteID:              route.public.routeID,
+		Route:                route,
+		Contract:             contract,
+		PolicyID:             profile.config.ID,
+		SelectedTier:         tier,
+		EffectiveMode:        profile.effectiveMode(),
+		ConfigGeneration:     profile.configGeneration,
+		ProfileGeneration:    profile.profileGeneration,
+		ClassifierGeneration: profile.classifierGeneration,
+		BinaryGeneration:     profile.binaryGeneration,
+		Decision:             decision,
+	})
+}
+
 type policyClassifierDispatchEvidence struct {
 	dispatched atomic.Bool
 }
@@ -789,6 +888,9 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 		}
 		owner := providerModelFromRouteTarget(route, target)
 		prepared = applyProviderModelRequestPolicy(prepared, providerEndpointChatCompletions, owner)
+		if err := validatePolicyClassifierNoStore(prepared, target.provider); err != nil {
+			return policyClassifierHTTPResponse{}, err
+		}
 
 		var response policyClassifierHTTPResponse
 		if endpoint == providerEndpointResponses {
@@ -800,7 +902,11 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 			return policyClassifierHTTPResponse{}, err
 		}
 		if stats != nil {
-			if usage := readPolicyClassifierUsage(response.Body); !usage.isZero() {
+			usage := response.Usage
+			if usage.isZero() {
+				usage = readPolicyClassifierUsage(response.Body)
+			}
+			if !usage.isZero() {
 				stats.record(policyStatsObservation{Profile: profile.PublicID, TrafficBucket: policyStatsBucketFromContext(ctx), ClassifierUsage: usage})
 			}
 		}
@@ -855,6 +961,9 @@ func (h *ProxyHandler) sendPolicyClassifierOverResponses(ctx context.Context, ro
 	if err != nil {
 		return policyClassifierHTTPResponse{}, err
 	}
+	if err := validatePolicyClassifierNoStore(requestBody, target.provider); err != nil {
+		return policyClassifierHTTPResponse{}, err
+	}
 	req, err := h.newProviderJSONRequest(ctx, target.provider, http.MethodPost, providerEndpointResponses, requestBody, headers, "", owner)
 	if err != nil {
 		return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(err, true)
@@ -877,8 +986,9 @@ func (h *ProxyHandler) sendPolicyClassifierOverResponses(ctx context.Context, ro
 	if len(responseBody) > responsesChatMaxJSONBodyBytes {
 		return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(fmt.Errorf("policy classifier Responses body exceeds %d bytes", responsesChatMaxJSONBodyBytes), false)
 	}
+	classifierUsage := readPolicyClassifierUsageForEndpoint(responseBody, providerEndpointResponses)
 	if resp.StatusCode != http.StatusOK {
-		return policyClassifierHTTPResponse{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: responseBody}, nil
+		return policyClassifierHTTPResponse{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: responseBody, Usage: classifierUsage}, nil
 	}
 	converted, err := translateResponsesJSONToChat(responseBody, responsesChatResponseOptions{
 		PublicModel:        upstreamModel,
@@ -895,9 +1005,10 @@ func (h *ProxyHandler) sendPolicyClassifierOverResponses(ctx context.Context, ro
 			StatusCode: http.StatusOK,
 			Header:     convertedChatSafeHeaders(resp.Header),
 			Body:       []byte(`{"choices":[]}`),
+			Usage:      classifierUsage,
 		}, nil
 	}
-	return policyClassifierHTTPResponse{StatusCode: http.StatusOK, Header: convertedChatSafeHeaders(resp.Header), Body: converted.Body}, nil
+	return policyClassifierHTTPResponse{StatusCode: http.StatusOK, Header: convertedChatSafeHeaders(resp.Header), Body: converted.Body, Usage: classifierUsage}, nil
 }
 
 func readPolicyClassifierHTTPResponse(resp *http.Response) (policyClassifierHTTPResponse, error) {
@@ -944,6 +1055,24 @@ func preparePolicyClassifierResponsesBody(body []byte, target targetBinding) ([]
 	return json.Marshal(payload)
 }
 
+func validatePolicyClassifierNoStore(body []byte, provider *providerRuntime) error {
+	if provider == nil || provider.classifierNoStoreSupported == nil || !*provider.classifierNoStoreSupported {
+		return nil
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return fmt.Errorf("decode final classifier request: %w", err)
+	}
+	raw, ok := payload["store"]
+	if !ok {
+		return fmt.Errorf("classifier request lost required store: false control")
+	}
+	if !bytes.Equal(bytes.TrimSpace(raw), []byte("false")) {
+		return fmt.Errorf("classifier request must retain store: false")
+	}
+	return nil
+}
+
 // PolicyStatsSnapshot returns a content-free point-in-time snapshot used by the
 // main stats payload and focused tests.
 func (c *chatPolicyRoutingController) PolicyStatsSnapshot() policyStatsSnapshot {
@@ -954,6 +1083,23 @@ func (c *chatPolicyRoutingController) PolicyStatsSnapshot() policyStatsSnapshot 
 		c.refreshBreakerStats(routeID)
 	}
 	return c.stats.snapshot()
+}
+
+func readPolicyClassifierUsageForEndpoint(body []byte, endpoint string) policyStatsTokenUsage {
+	if endpoint != providerEndpointResponses {
+		return policyStatsTokenUsage{}
+	}
+	usage := sniffResponsesUsageBody(body)
+	if usage.isZero() {
+		return policyStatsTokenUsage{}
+	}
+	return policyStatsTokenUsage{
+		InputTokens:       int64(usage.InputTokens),
+		OutputTokens:      int64(usage.OutputTokens),
+		TotalTokens:       int64(usage.totalTokens()),
+		CachedInputTokens: int64(usage.InputTokensDetails.CachedTokens),
+		ReasoningTokens:   int64(usage.OutputTokensDetails.ReasoningTokens),
+	}.normalized()
 }
 
 func readPolicyClassifierUsage(body []byte) policyStatsTokenUsage {

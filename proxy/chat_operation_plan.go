@@ -106,6 +106,7 @@ func newChatOperationPlan(options chatOperationPlanOptions) chatOperationPlan {
 		}
 		plan.routePolicy = options.Route.policy
 		plan.operationRoute = clonePolicyOperationRoute(options.Route, contract, plan.candidates)
+		plan.operationRoute.policyTier = options.SelectedTier
 	}
 	return plan
 }

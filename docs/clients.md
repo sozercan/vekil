@@ -17,7 +17,7 @@ curl http://localhost:1337/v1/chat/completions \
   }'
 ```
 
-The profile's effective mode is capped by `--policy-routing` / `POLICY_ROUTING_MODE`, which defaults to `off`. See [Semantic Policy Routing](policy-routing.md) before enabling observe or enforce.
+The profile follows its YAML `mode` by default. `--policy-routing` / `POLICY_ROUTING_MODE` can explicitly lower every profile to `off` or `observe` for rollout and rollback. See [Semantic Policy Routing](policy-routing.md) before enabling observe or enforce.
 
 ## Responses-native models on Chat-compatible clients
 

@@ -4285,6 +4285,50 @@ func TestHandleCompactDoesNotFallbackOutsideAllowedModels(t *testing.T) {
 	}
 }
 
+func TestHandleCompactDoesNotFallbackToHiddenProviderModels(t *testing.T) {
+	responsesRequests := 0
+	modelsRequests := 0
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/responses":
+			responsesRequests++
+			if responsesRequests > 1 {
+				t.Fatalf("unexpected fallback /responses request %d", responsesRequests)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"model public-model is not supported via Responses API.","code":"unsupported_api_for_model","param":"model","type":"invalid_request_error"}}`))
+		case "/models":
+			modelsRequests++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"luna","supported_endpoints":["/responses"]},{"id":"sol","supported_endpoints":["/responses"]}]}`))
+		default:
+			t.Fatalf("unexpected upstream path %q", r.URL.Path)
+		}
+	})
+	handler.providersState = defaultProviderSetup(handler)
+	provider := handler.providersState.defaultProvider()
+	provider.hideModel("luna")
+	provider.hideModel("sol")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"public-model","input":"Hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleCompact(w, req)
+
+	if responsesRequests != 1 {
+		t.Fatalf("responses requests = %d, want 1 unsupported-model attempt", responsesRequests)
+	}
+	if modelsRequests != 1 {
+		t.Fatalf("models requests = %d, want 1 fallback lookup", modelsRequests)
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want original 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestHandleResponses_RewritesSyntheticCompaction(t *testing.T) {
 	summary := "Synthetic compacted summary"
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {

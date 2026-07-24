@@ -12,10 +12,10 @@
 #   vekil config validate --live \
 #     --providers-config examples/policy-routing-coding-economy.yaml
 #
-# Observe first; the global ceiling defaults to off:
+# The default process mode follows the profile's YAML mode. This example sets
+# mode: observe below, so no separate process override is required:
 #   vekil \
-#     --providers-config examples/policy-routing-coding-economy.yaml \
-#     --policy-routing=observe
+#     --providers-config examples/policy-routing-coding-economy.yaml
 #
 # Policy observe/enforce is v1 single-tenant functionality. Keep the default
 # loopback bind. A remote bind requires an explicit acknowledgement and a
@@ -87,7 +87,7 @@ policy_profiles:
   - id: coding-economy-policy
     public_id: coding-economy
     name: Coding Economy
-    # The profile may not exceed the process-wide --policy-routing ceiling.
+    # The default process mode follows this value; an explicit process ceiling may lower it.
     mode: observe
     model_picker_enabled: true
     model_picker_category: versatile

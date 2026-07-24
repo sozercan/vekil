@@ -393,7 +393,7 @@ func TestResponsesClassifierMalformedAcceptedOutputIsUncertain(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() { _ = r.Body.Close() }()
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"id":"resp-malformed","status":"completed","output":[{"type":"unsupported"}]}`)
+		_, _ = fmt.Fprint(w, `{"id":"resp-malformed","status":"completed","output":[{"type":"unsupported"}],"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}}`)
 	}))
 	t.Cleanup(upstream.Close)
 	trueValue := true
@@ -415,13 +415,14 @@ func TestResponsesClassifierMalformedAcceptedOutputIsUncertain(t *testing.T) {
 		policy:  routePolicy{mode: routeModePrimaryOnly, maxTargetAttempts: 1, maxUpstreamSends: 1},
 	}
 	h := &ProxyHandler{}
+	stats := newPolicyStatsCollector()
 	classifier, err := newRoutePolicyClassifier(h, route, PolicyProfileConfig{
 		PublicID: "policy",
 		Classifier: PolicyClassifierConfig{
 			MaxCompletionTokens: 64,
 			MaxRequestBytes:     4096,
 		},
-	}, nil)
+	}, stats)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,6 +433,9 @@ func TestResponsesClassifierMalformedAcceptedOutputIsUncertain(t *testing.T) {
 		!result.Failure.HTTPAccepted {
 		t.Fatalf("malformed accepted classifier result = %+v, error=%v", result, classifyErr)
 	}
+	if got := stats.snapshot().Totals.ClassifierUsage; got != (policyStatsTokenUsage{InputTokens: 11, OutputTokens: 7, TotalTokens: 18}) {
+		t.Fatalf("malformed classifier usage = %+v, want parsed Responses usage", got)
+	}
 }
 
 func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
@@ -441,6 +445,14 @@ func TestPolicyRoutingUsesCopilotResponsesTargetsInProcess(t *testing.T) {
 	var models []string
 	var authorizations []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == providerEndpointModels {
+			_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": []any{
+				map[string]any{"id": "light-model", "supported_endpoints": []string{providerEndpointResponses}},
+				map[string]any{"id": "power-model", "supported_endpoints": []string{providerEndpointResponses}},
+				map[string]any{"id": "classifier-model", "supported_endpoints": []string{providerEndpointResponses}},
+			}})
+			return
+		}
 		defer func() { _ = r.Body.Close() }()
 		var request map[string]json.RawMessage
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {

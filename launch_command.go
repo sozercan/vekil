@@ -45,6 +45,10 @@ type launchCopilotModelChecker interface {
 	ModelUsesCopilot(string) bool
 }
 
+type launchCopilotScopeChecker interface {
+	UsesCopilot() bool
+}
+
 type launchTargetSpec struct {
 	name          string
 	displayName   string
@@ -145,7 +149,7 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	proxyLog := fs.String("proxy-log", "", fmt.Sprintf("Proxy JSON log path (default: ~/.config/vekil/logs/launch-%s-*.jsonl)", target.name))
 	startupTimeout := fs.Duration("startup-timeout", getEnvDuration("LAUNCH_STARTUP_TIMEOUT", 2*time.Minute), "Maximum time to authenticate and become ready")
 	streamingTimeout := fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
-	policyRoutingMode := fs.String("policy-routing", getEnv("POLICY_ROUTING_MODE", "off"), "Policy routing mode: off, observe, or enforce")
+	policyRoutingMode := fs.String("policy-routing", getPolicyRoutingModeEnv(), "Policy routing mode: config (follow providers YAML), off, observe, or enforce")
 	dryRun := fs.Bool("dry-run", false, "Print the child-process plan without starting a proxy; dynamic model metadata remains unresolved")
 	noSummary := fs.Bool("no-summary", false, "Do not print an end-of-session usage summary")
 
@@ -328,6 +332,9 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 func launchUsesCopilot(cfg proxy.ProvidersConfig, model string, checker launchCopilotModelChecker) bool {
 	model = strings.TrimSpace(model)
 	if model == "" {
+		if scoped, ok := checker.(launchCopilotScopeChecker); ok {
+			return scoped.UsesCopilot()
+		}
 		return cfg.UsesCopilot()
 	}
 	return checker.ModelUsesCopilot(model)
@@ -403,11 +410,17 @@ func (p *agentLaunchProxy) Start(ctx context.Context) error {
 		return err
 	}
 	if !p.usesCopilot {
-		if err := p.srv.ValidateDynamicProviderModels(ctx); err != nil {
-			validationErr := fmt.Errorf("provider model validation failed: %w", err)
-			stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			return errors.Join(validationErr, p.srv.Stop(stopCtx))
+		shouldValidate := true
+		if state, ok := p.srv.(dynamicProviderModelValidationState); ok {
+			shouldValidate = state.DynamicProviderValidationPending()
+		}
+		if shouldValidate {
+			if err := p.srv.ValidateDynamicProviderModels(ctx); err != nil {
+				validationErr := fmt.Errorf("provider model validation failed: %w", err)
+				stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				return errors.Join(validationErr, p.srv.Stop(stopCtx))
+			}
 		}
 	}
 	if err := p.srv.InitializePolicyRouting(ctx); err != nil {

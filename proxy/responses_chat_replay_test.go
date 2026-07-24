@@ -28,6 +28,7 @@ func TestResponsesChatReplayPublishesOpaqueIDsAndResolvesFullProjection(t *testi
 			ProviderID:    "provider-a",
 			PublicModel:   "model-a",
 			UpstreamModel: "deployment-a",
+			RouteID:       "route-a",
 		},
 		AssistantContent: json.RawMessage(`null`),
 		OutputItems: []json.RawMessage{
@@ -120,6 +121,8 @@ func TestResponsesChatReplayMissingAndCrossRouteAreTypedStateLoss(t *testing.T) 
 		{name: "provider", mutate: func(route *responsesChatReplayRoute) { route.ProviderID = "provider-b" }},
 		{name: "public model", mutate: func(route *responsesChatReplayRoute) { route.PublicModel = "model-b" }},
 		{name: "upstream model", mutate: func(route *responsesChatReplayRoute) { route.UpstreamModel = "deployment-b" }},
+		{name: "route id", mutate: func(route *responsesChatReplayRoute) { route.RouteID = "route-b" }},
+		{name: "policy tier", mutate: func(route *responsesChatReplayRoute) { route.PolicyTier = "powerful" }},
 	}
 	for _, mutation := range routeMutations {
 		t.Run("cross "+mutation.name, func(t *testing.T) {
@@ -176,6 +179,7 @@ func newResponsesChatReplayTestRequest(tag string, specs ...replayTestCallSpec) 
 			ProviderID:    "provider-a",
 			PublicModel:   "model-a",
 			UpstreamModel: "deployment-a",
+			RouteID:       "route-a",
 		},
 		AssistantContent: json.RawMessage(`null`),
 		OutputItems:      items,
@@ -494,6 +498,7 @@ func TestResponsesChatReplayResolutionSupportsFullOrPerCallPartialReplay(t *test
 			ProviderID:    "provider-a",
 			PublicModel:   "model-a",
 			UpstreamModel: "deployment-a",
+			RouteID:       "route-a",
 		},
 		AssistantContent: json.RawMessage(`"synthetic preface"`),
 		OutputItems: []json.RawMessage{

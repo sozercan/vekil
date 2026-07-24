@@ -149,6 +149,7 @@ type providerConfigDescriptor struct {
 	legacyCatalog              bool
 	trustDomain                string
 	classifierNoStoreSupported *bool
+	modelFilter                normalizedProviderModelFilter
 }
 
 // EffectiveSchemaVersion returns the public configuration version. Omitting
@@ -328,6 +329,11 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 			descriptor, exists := providers[target.Provider]
 			if !exists {
 				return validatedProvidersConfig{}, configPathError(targetPath+".provider", "references unknown provider %q", target.Provider)
+			}
+			if descriptor.kind == providerTypeCopilot {
+				if !descriptor.modelFilter.allows(target.UpstreamModel) {
+					return validatedProvidersConfig{}, configPathError(targetPath+".upstream_model", "model %q is excluded by provider %q include_models/exclude_models filters", target.UpstreamModel, descriptor.id)
+				}
 			}
 			if !providerKindSupportsExplicitRoutes(descriptor.kind) {
 				return validatedProvidersConfig{}, configPathError(targetPath+".provider", "provider %q has unsupported explicit-route type %q", descriptor.id, descriptor.kind)
@@ -572,6 +578,7 @@ func validateProviderConfigDescriptors(configured []ProviderConfig, allowRouteOn
 			models:                     provider.Models,
 			trustDomain:                strings.TrimSpace(provider.TrustDomain),
 			classifierNoStoreSupported: cloneBoolPtr(provider.ClassifierNoStoreSupported),
+			modelFilter:                newNormalizedProviderModelFilter(provider),
 		}
 		descriptor.legacyCatalog = providerConfigHasLegacyCatalog(descriptor, provider)
 		providers[id] = descriptor

@@ -7,6 +7,8 @@ import (
 
 type menubarProxyServer interface {
 	Start() error
+	UsesCopilot() bool
+	ValidateDynamicProviderModels(context.Context) error
 	InitializePolicyRouting(context.Context) error
 	Stop(context.Context) error
 	IsRunning() bool
@@ -113,6 +115,12 @@ func (l *menubarProxyLifecycle) isRunning() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.server != nil && l.server.IsRunning()
+}
+
+func (l *menubarProxyLifecycle) usesCopilot() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.server != nil && l.server.UsesCopilot()
 }
 
 func (l *menubarProxyLifecycle) detachServer() menubarProxyServer {

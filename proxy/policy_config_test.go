@@ -515,3 +515,42 @@ func TestProgrammaticPublicRouteRejectsInternalPurpose(t *testing.T) {
 		t.Fatalf("ValidateProvidersConfig() error = %v", err)
 	}
 }
+
+func TestPolicyReferencedInternalCopilotRoutesValidate(t *testing.T) {
+	parallel := true
+	cfg := ProvidersConfig{
+		SchemaVersion: ProvidersConfigSchemaVersion2,
+		Providers: []ProviderConfig{{
+			ID:                         "copilot",
+			Type:                       string(providerTypeCopilot),
+			TrustDomain:                "github-copilot",
+			ClassifierNoStoreSupported: boolPointer(true),
+		}},
+		ModelRoutes: []ModelRouteConfig{
+			{
+				ID: "light-route", Exposure: modelRouteExposureInternal,
+				Endpoints: []string{providerEndpointResponses}, ParallelToolCalls: &parallel,
+				Targets: []ModelRouteTargetConfig{{ID: "light", Provider: "copilot", UpstreamModel: "gpt-light"}},
+			},
+			{
+				ID: "power-route", Exposure: modelRouteExposureInternal,
+				Endpoints: []string{providerEndpointResponses}, ParallelToolCalls: &parallel,
+				Targets: []ModelRouteTargetConfig{{ID: "power", Provider: "copilot", UpstreamModel: "gpt-power"}},
+			},
+			{
+				ID: "classifier-route", Exposure: modelRouteExposureInternal, InternalPurpose: modelRouteInternalPurposePolicyClassifier,
+				Endpoints: []string{providerEndpointResponses}, ParallelToolCalls: &parallel,
+				Targets: []ModelRouteTargetConfig{{ID: "classifier", Provider: "copilot", UpstreamModel: "gpt-classifier"}},
+			},
+		},
+		PolicyProfiles: []PolicyProfileConfig{{
+			ID: "policy", PublicID: "policy-model",
+			LightweightRoute: "light-route", PowerfulRoute: "power-route",
+			Classifier: PolicyClassifierConfig{Route: "classifier-route"},
+			DataPolicy: PolicyDataPolicyConfig{ContentForwardingAcknowledged: true},
+		}},
+	}
+	if err := ValidateProvidersConfig(cfg); err != nil {
+		t.Fatalf("ValidateProvidersConfig() error = %v", err)
+	}
+}

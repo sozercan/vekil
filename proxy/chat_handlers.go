@@ -1141,6 +1141,8 @@ func explicitResponsesChatReplayRoute(route *modelRoute, target targetBinding) r
 		ProviderID:    target.provider.id,
 		PublicModel:   route.public.id,
 		UpstreamModel: upstreamModel,
+		RouteID:       route.public.routeID,
+		PolicyTier:    route.policyTier.String(),
 	}
 }
 
@@ -2939,6 +2941,9 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	observeChatExecutionRoute(r.Context(), result)
 	if len(result.Headers) > 0 {
 		observeUpstreamHeaders(r.Context(), result.Headers)
+	}
+	if policyPlan.valid() {
+		result.Headers = policyChatSafeHeaders(result.Headers, responseModel)
 	}
 
 	if routeOperation != nil && result.Backend == chatBackendNativeChat && result.Response != nil && !mode.clientRequestedStream && !mode.forceUpstreamStream {

@@ -5,7 +5,7 @@ Vekil supports two runtime patterns:
 - **Zero-config mode**: no `--providers-config`; the proxy uses its built-in GitHub Copilot upstream.
 - **Explicit provider routing**: pass `--providers-config` with any mix of `copilot`, `azure-openai`, `openai-codex`, `openai-compatible`, and `anthropic-compatible`. If the config omits Copilot, GitHub auth is not used.
 
-Schema version 2 is the complete explicit-routing format: it supports public and internal routes, ordered failover, and optional [semantic policy profiles](policy-routing.md) that select one native-Chat terminal route per request. Existing route-only version-2 files remain valid. Policy routing is opt-in at runtime and defaults to globally off.
+Schema version 2 is the complete explicit-routing format: it supports public and internal routes, ordered failover, and optional [semantic policy profiles](policy-routing.md) that select one Chat-capable terminal route per request. Existing route-only version-2 files remain valid. By default, each profile's YAML `mode` is authoritative; an explicit process mode can still lower the effective mode as an operational override.
 
 ## Topic Map
 
@@ -26,7 +26,7 @@ Schema version 2 is the complete explicit-routing format: it supports public and
 | `--host` | `HOST` | `127.0.0.1` | Listen host |
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
-| `--policy-routing` | `POLICY_ROUTING_MODE` | `off` | Process-wide policy-routing ceiling: `off`, `observe`, or `enforce`. A profile cannot run above this ceiling. |
+| `--policy-routing` | `POLICY_ROUTING_MODE` | `config` | Policy-routing ceiling: `config` follows each profile's YAML `mode`; `off`, `observe`, or `enforce` explicitly cap every profile. A profile cannot run above an explicit ceiling. |
 | `--policy-routing-allow-remote-single-tenant` | `POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT` | `false` | Acknowledge running policy `observe`/`enforce` on a non-loopback bind for one trusted tenant. This adds no authentication or tenant isolation. |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |

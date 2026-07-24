@@ -66,7 +66,7 @@ See [responses-websocket.md](responses-websocket.md) for tuning flags.
 
 ## Chat compatibility over a native Responses model
 
-This adapter is outside v1 semantic policy routing. A Responses-native model may still serve direct public Chat-compatible traffic as documented here, but it cannot be a v1 policy destination and a policy public ID never enters this path.
+This adapter also serves internal v1 policy destinations selected from the public Chat surface. A policy public ID never becomes a public Responses model ID, but its selected internal terminal route may use the same process-owned conversion and replay store.
 
 A model that natively allows `/responses` but not `/chat/completions` can also serve Vekil's Chat-compatible public surfaces: OpenAI Chat Completions, translated Anthropic Messages, translated Gemini generation, both translated count-token probes, and dashboard insights. Native Chat remains preferred when a model supports both endpoints.
 

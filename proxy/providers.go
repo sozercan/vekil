@@ -147,6 +147,7 @@ type providerRuntime struct {
 	classifierNoStoreSupported *bool
 	includeModels              map[string]struct{}
 	excludeModels              map[string]struct{}
+	hiddenModels               map[string]struct{}
 	staticModels               map[string]providerModel
 	staticConfigs              map[string]ProviderModelConfig
 	staticOrder                []string
@@ -171,6 +172,7 @@ type providerModel struct {
 	dropStopSequences      bool
 	useMaxCompletionTokens bool
 	disabled               bool
+	endpointsAdvertised    bool
 	raw                    json.RawMessage
 }
 
@@ -556,7 +558,7 @@ func (ps *providerSetup) addProviderModels(providerID string, models []providerM
 	}
 
 	provider := ps.providerByID(providerID)
-	models = filterProviderModels(provider, models)
+	models = filterHiddenProviderModels(provider, filterProviderModels(provider, models))
 
 	ps.modelsMu.Lock()
 	defer ps.modelsMu.Unlock()
@@ -604,7 +606,7 @@ func (ps *providerSetup) replaceProviderModelsBatch(replacements map[string][]pr
 		if provider == nil {
 			return fmt.Errorf("provider %q is not configured", providerID)
 		}
-		filtered[providerID] = filterProviderModels(provider, models)
+		filtered[providerID] = filterHiddenProviderModels(provider, filterProviderModels(provider, models))
 	}
 
 	ps.modelsMu.Lock()
@@ -722,7 +724,7 @@ func (h *ProxyHandler) initializeProviders() error {
 		return err
 	}
 	h.providersState = setup
-	h.dynamicProviderValidationPending.Store(h.deferDynamicProviderModelRefresh && needsDynamicProviderModelValidation(setup.providers))
+	h.dynamicProviderValidationPending.Store(h.deferDynamicProviderModelRefresh && h.providerSetupNeedsDynamicModelValidation(setup))
 	return nil
 }
 
@@ -740,6 +742,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 	if err != nil {
 		return nil, err
 	}
+	hideExplicitCopilotRouteModels(explicitRoutes)
 	policyEntries, err := compilePolicyPublicModelEntries(cfg)
 	if err != nil {
 		return nil, err
@@ -763,7 +766,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 		hasConfiguredState: true,
 	}
 
-	needsDynamicModelValidation := needsDynamicProviderModelValidation(providers)
+	needsDynamicModelValidation := h.providerSetupNeedsDynamicModelValidation(setup)
 
 	if !needsDynamicModelValidation || !validateDynamicModels {
 		for _, providerID := range providerOrder {
@@ -789,12 +792,18 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 			}
 			continue
 		}
+		if !h.providerMayExposeAllowedModelForSetup(setup, provider) {
+			continue
+		}
 
 		result, err := h.fetchProviderModels(ctx, provider, "", "")
 		if err != nil {
 			return nil, fmt.Errorf("load models for provider %q: %w", provider.id, err)
 		}
-		if err := setup.addProviderModels(providerID, result.models); err != nil {
+		if err := h.validateDynamicExplicitRouteTargets(setup, provider, result.models); err != nil {
+			return nil, err
+		}
+		if err := setup.addProviderModels(providerID, h.filterAllowedModels(result.models)); err != nil {
 			return nil, err
 		}
 	}
@@ -807,7 +816,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 // model-map updates are applied through providerSetup's locked replacement path.
 func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error {
 	setup := h.providerSetup()
-	if setup == nil || !setup.hasConfiguredState || !needsDynamicProviderModelValidation(setup.providers) {
+	if setup == nil || !setup.hasConfiguredState || !h.providerSetupNeedsDynamicModelValidation(setup) {
 		h.dynamicProviderValidationPending.Store(false)
 		return nil
 	}
@@ -826,6 +835,9 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 		if err != nil {
 			return fmt.Errorf("load models for provider %q: %w", provider.id, err)
 		}
+		if err := h.validateDynamicExplicitRouteTargets(setup, provider, result.models); err != nil {
+			return err
+		}
 		replacements[providerID] = h.filterAllowedModels(result.models)
 	}
 	if err := setup.replaceProviderModelsBatch(replacements); err != nil {
@@ -837,24 +849,172 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 	return nil
 }
 
-// providerMayExposeAllowedModel reports whether provider must participate in
-// allowed-model discovery. Unlike providerWithinAllowedModelScope, it ignores
-// current ownership so dynamic candidates are checked for collisions before the
-// selected model is trusted. Explicitly reserved policy owners are the exception:
-// managed launches do not discover unrelated providers for those IDs.
-func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) bool {
-	if provider == nil {
+func (h *ProxyHandler) validateDynamicExplicitRouteTargets(setup *providerSetup, provider *providerRuntime, models []providerModel) error {
+	if h == nil || setup == nil || provider == nil || provider.kind != providerTypeCopilot {
+		return nil
+	}
+	available := make(map[string]providerModel, len(models)*2)
+	for _, model := range models {
+		if model.disabled {
+			continue
+		}
+		available[strings.TrimSpace(model.publicID)] = model
+		if upstream := strings.TrimSpace(model.upstreamModel); upstream != "" {
+			available[upstream] = model
+		}
+	}
+	snapshot := setup.routeRegistry().load()
+	if snapshot == nil {
+		return nil
+	}
+	for _, route := range snapshot.explicit {
+		if route == nil || !h.explicitRouteWithinDynamicValidationScope(setup, route.public.routeID) {
+			continue
+		}
+		for _, target := range route.targets {
+			if target.provider == nil || target.provider.id != provider.id {
+				continue
+			}
+			modelID := strings.TrimSpace(target.upstreamModel)
+			model, ok := available[modelID]
+			if !ok {
+				return configPathError("providers", "pinned model %q for route %q was not retained by Copilot discovery", modelID, route.public.routeID)
+			}
+			if !model.endpointsAdvertised {
+				return configPathError("providers", "pinned model %q for route %q did not advertise supported_endpoints", modelID, route.public.routeID)
+			}
+			for _, endpoint := range route.public.endpoints {
+				if !providerModelSupportsEndpoint(model, endpoint) {
+					return configPathError("providers", "pinned model %q for route %q does not advertise endpoint %q", modelID, route.public.routeID, endpoint)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (h *ProxyHandler) explicitRouteWithinDynamicValidationScope(setup *providerSetup, routeID string) bool {
+	if h == nil || setup == nil {
+		return false
+	}
+	routeID = strings.TrimSpace(routeID)
+	if routeID == "" {
+		return false
+	}
+	route, _ := setup.lookupTerminalRoute(routeID)
+	if route == nil {
+		return false
+	}
+	if route.isPublic() {
+		if len(h.allowedModels) == 0 {
+			return true
+		}
+		for model := range h.allowedModels {
+			entry, ok := setup.lookupPublicModelEntry(model)
+			if ok && entry != nil && entry.kind == publicEntryStatic && entry.routeID == routeID {
+				return true
+			}
+		}
+		return false
+	}
+	referencesRoute := func(entry *publicModelEntry) bool {
+		for _, route := range h.policyEntryRequiredRoutesForSetup(entry, setup) {
+			if route != nil && route.public.routeID == routeID {
+				return true
+			}
+		}
 		return false
 	}
 	if len(h.allowedModels) == 0 {
-		return true
+		registry := setup.routeRegistry()
+		if registry == nil {
+			return false
+		}
+		snapshot := registry.load()
+		if snapshot == nil {
+			return false
+		}
+		for _, entry := range snapshot.policyEntries {
+			if referencesRoute(entry) {
+				return true
+			}
+		}
+		return false
 	}
-	setup := h.providerSetup()
+	for model := range h.allowedModels {
+		entry, ok := setup.lookupPublicModelEntry(model)
+		if !ok || entry == nil || entry.kind != publicEntryPolicy {
+			continue
+		}
+		if referencesRoute(entry) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *ProxyHandler) providerRequiredWithoutAllowedScope(setup *providerSetup, provider *providerRuntime) bool {
+	if h == nil || setup == nil || provider == nil {
+		return false
+	}
+	snapshot := setup.routeRegistry().load()
+	if snapshot == nil {
+		return false
+	}
+	for _, route := range snapshot.explicit {
+		if route == nil || !route.isPublic() {
+			continue
+		}
+		for _, target := range route.targets {
+			if target.provider != nil && target.provider.id == provider.id {
+				return true
+			}
+		}
+	}
+	for _, entry := range snapshot.policyEntries {
+		if h.policyEntryReferencesProviderForSetup(entry, provider, setup) {
+			return true
+		}
+	}
+	return false
+}
+
+// providerMayExposeAllowedModel reports whether provider must participate in
+// allowed-model discovery. Unlike providerWithinAllowedModelScope, it ignores
+// current ownership so dynamic candidates are checked for collisions before the
+// selected model is trusted. Policy owners include only providers referenced by
+// their terminal/classifier routes; unrelated providers remain out of scope.
+func (h *ProxyHandler) providerMayExposeAllowedModel(provider *providerRuntime) bool {
+	return h.providerMayExposeAllowedModelForSetup(h.providerSetup(), provider)
+}
+
+func (h *ProxyHandler) providerMayExposeAllowedModelForSetup(setup *providerSetup, provider *providerRuntime) bool {
+	if h == nil || setup == nil || provider == nil {
+		return false
+	}
+	if len(h.allowedModels) == 0 {
+		if !providerUsesDynamicModels(provider) || providerHasPublicDynamicModels(provider) {
+			return true
+		}
+		return h.providerRequiredWithoutAllowedScope(setup, provider)
+	}
 	for model := range h.allowedModels {
 		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+			if h.policyEntryReferencesProviderForSetup(entry, provider, setup) {
+				return true
+			}
 			// A policy public ID is an explicit reserved owner in launcher scope.
-			// Unrelated dynamic providers cannot displace it and must not force
-			// provider discovery or credentials for the managed launch.
+			// Unrelated dynamic providers cannot displace it or force credentials.
+			continue
+		}
+		if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
+			for _, target := range route.targets {
+				if target.provider != nil && target.provider.id == provider.id {
+					return true
+				}
+			}
+			// An explicit public route is a reserved owner. Unrelated dynamic
+			// providers cannot displace it or force credentials.
 			continue
 		}
 		if providerCanExposeModel(provider, model) {
@@ -868,14 +1028,19 @@ func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime
 	if provider == nil {
 		return false
 	}
-	if len(h.allowedModels) == 0 {
-		return true
-	}
 	setup := h.providerSetup()
+	if len(h.allowedModels) == 0 {
+		if !providerUsesDynamicModels(provider) || providerHasPublicDynamicModels(provider) {
+			return true
+		}
+		return h.providerRequiredWithoutAllowedScope(setup, provider)
+	}
 	for model := range h.allowedModels {
 		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
-			// Policy readiness is owned by the policy preflight, not by unrelated
-			// dynamic-provider catalogs.
+			if h.policyEntryReferencesProvider(entry, provider) {
+				return true
+			}
+			// Policy readiness excludes unrelated provider catalogs.
 			continue
 		}
 		if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
@@ -900,7 +1065,7 @@ func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime
 }
 
 func providerCanExposeModel(provider *providerRuntime, model string) bool {
-	if provider == nil || !provider.allowsModel(model) {
+	if provider == nil || provider.hidesModel(model) || !provider.allowsModel(model) {
 		return false
 	}
 	if _, ok := provider.staticConfigs[model]; ok {
@@ -1025,6 +1190,7 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 		classifierNoStoreSupported: cloneBoolPtr(cfg.ClassifierNoStoreSupported),
 		includeModels:              make(map[string]struct{}, len(cfg.IncludeModels)),
 		excludeModels:              make(map[string]struct{}, len(cfg.ExcludeModels)),
+		hiddenModels:               make(map[string]struct{}),
 		staticModels:               make(map[string]providerModel, len(cfg.Models)),
 		staticConfigs:              make(map[string]ProviderModelConfig, len(cfg.Models)),
 	}
@@ -1370,6 +1536,112 @@ func needsDynamicProviderModelValidation(providers map[string]*providerRuntime) 
 	return false
 }
 
+func (h *ProxyHandler) providerSetupNeedsDynamicModelValidation(setup *providerSetup) bool {
+	if h == nil || setup == nil {
+		return false
+	}
+	multipleProviders := len(setup.providers) > 1
+	for _, provider := range setup.providers {
+		if !providerUsesDynamicModels(provider) || !providerHasPublicDynamicModels(provider) {
+			continue
+		}
+		if multipleProviders || providerHasModelFilters(provider) {
+			return true
+		}
+	}
+	snapshot := setup.routeRegistry().load()
+	if snapshot == nil {
+		return false
+	}
+	for _, route := range snapshot.explicit {
+		if route == nil || !h.explicitRouteWithinDynamicValidationScope(setup, route.public.routeID) {
+			continue
+		}
+		for _, target := range route.targets {
+			if providerUsesDynamicModels(target.provider) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func providerHasPublicDynamicModels(provider *providerRuntime) bool {
+	if provider == nil || !providerUsesDynamicModels(provider) {
+		return false
+	}
+	if len(provider.includeModels) == 0 {
+		return true
+	}
+	for model := range provider.includeModels {
+		if !provider.hidesModel(model) {
+			return true
+		}
+	}
+	return false
+}
+
+func hideExplicitCopilotRouteModels(routes []*modelRoute) {
+	for _, route := range routes {
+		if route == nil {
+			continue
+		}
+		for _, target := range route.targets {
+			if target.provider == nil || target.provider.kind != providerTypeCopilot {
+				continue
+			}
+			target.provider.hideModel(target.upstreamModel)
+		}
+	}
+}
+
+func filterHiddenProviderModels(provider *providerRuntime, models []providerModel) []providerModel {
+	if provider == nil || len(provider.hiddenModels) == 0 {
+		return models
+	}
+	filtered := make([]providerModel, 0, len(models))
+	for _, model := range models {
+		if provider.hidesModel(model.publicID) {
+			continue
+		}
+		filtered = append(filtered, model)
+	}
+	return filtered
+}
+
+func (p *providerRuntime) hidesModel(model string) bool {
+	if p == nil {
+		return false
+	}
+	model = strings.TrimSpace(model)
+	if _, hidden := p.hiddenModels[model]; hidden {
+		return true
+	}
+	normalized := NormalizeModelName(model)
+	if normalized == model {
+		return false
+	}
+	_, hidden := p.hiddenModels[normalized]
+	return hidden
+}
+
+func (p *providerRuntime) hideModel(model string) {
+	if p == nil {
+		return
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	if p.hiddenModels == nil {
+		p.hiddenModels = make(map[string]struct{})
+	}
+	p.hiddenModels[model] = struct{}{}
+	if normalized := NormalizeModelName(model); normalized != "" {
+		p.hiddenModels[normalized] = struct{}{}
+	}
+}
+
 func providerHasModelFilters(provider *providerRuntime) bool {
 	return provider != nil && (len(provider.includeModels) > 0 || len(provider.excludeModels) > 0)
 }
@@ -1678,14 +1950,25 @@ func (ps *providerSetup) resolveReservedModelIdentity(model string) (*providerRu
 }
 
 func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
-	if h == nil || len(h.allowedModels) == 0 {
+	if h == nil {
 		return true
 	}
 	model = strings.TrimSpace(model)
+	setup := h.providerSetup()
+	entry, knownPublicEntry := setup.lookupPublicModelEntry(model)
+	if !knownPublicEntry || entry == nil {
+		for _, providerID := range setup.providerOrder {
+			if provider := setup.providerByID(providerID); provider != nil && provider.hidesModel(model) {
+				return false
+			}
+		}
+	}
+	if len(h.allowedModels) == 0 {
+		return true
+	}
 	if _, ok := h.allowedModels[model]; ok {
 		return true
 	}
-	setup := h.providerSetup()
 	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
 		for allowedModel := range h.allowedModels {
 			allowedEntry, allowed := setup.lookupPublicModelEntry(allowedModel)
@@ -1708,26 +1991,98 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 	return ok
 }
 
+func (h *ProxyHandler) policyEntryRequiredRoutesForSetup(entry *publicModelEntry, setup *providerSetup) []*modelRoute {
+	if h == nil || entry == nil || entry.kind != publicEntryPolicy || setup == nil {
+		return nil
+	}
+	if controller, ok := h.policyRoutingController.(*chatPolicyRoutingController); ok {
+		if profile := controller.profiles[entry.policyID]; profile != nil {
+			switch profile.effectiveMode() {
+			case policyModeOff:
+				return []*modelRoute{profile.routeForTier(profile.baselineTier)}
+			case policyModeObserve:
+				return []*modelRoute{profile.routeForTier(profile.baselineTier), profile.classifier}
+			case policyModeEnforce:
+				return []*modelRoute{profile.lightweight, profile.powerful, profile.classifier}
+			}
+		}
+	}
+
+	for profileIndex, configured := range h.providersConfig.PolicyProfiles {
+		if strings.TrimSpace(configured.ID) != entry.policyID {
+			continue
+		}
+		profile := clonePolicyProfileConfig(configured)
+		if err := normalizeAndValidatePolicyProfileConfig(&profile, fmt.Sprintf("policy_profiles[%d]", profileIndex)); err != nil {
+			return nil
+		}
+		profileMode, err := parsePolicyMode(profile.Mode)
+		if err != nil {
+			return nil
+		}
+		effectiveMode := effectivePolicyMode(h.policyRoutingMode.internal(), profileMode)
+		routeIDs := make([]string, 0, 3)
+		switch effectiveMode {
+		case policyModeOff:
+			if profile.BaselineTier == policyConfigTierPowerful {
+				routeIDs = append(routeIDs, profile.PowerfulRoute)
+			} else {
+				routeIDs = append(routeIDs, profile.LightweightRoute)
+			}
+		case policyModeObserve:
+			if profile.BaselineTier == policyConfigTierPowerful {
+				routeIDs = append(routeIDs, profile.PowerfulRoute)
+			} else {
+				routeIDs = append(routeIDs, profile.LightweightRoute)
+			}
+			routeIDs = append(routeIDs, profile.Classifier.Route)
+		case policyModeEnforce:
+			routeIDs = append(routeIDs, profile.LightweightRoute, profile.PowerfulRoute, profile.Classifier.Route)
+		}
+		routes := make([]*modelRoute, 0, len(routeIDs))
+		for _, routeID := range routeIDs {
+			if route, ok := setup.lookupTerminalRoute(strings.TrimSpace(routeID)); ok && route != nil {
+				routes = append(routes, route)
+			}
+		}
+		return routes
+	}
+	return nil
+}
+
+func (h *ProxyHandler) policyEntryReferencesProvider(entry *publicModelEntry, provider *providerRuntime) bool {
+	return h.policyEntryReferencesProviderForSetup(entry, provider, h.providerSetup())
+}
+
+func (h *ProxyHandler) policyEntryReferencesProviderForSetup(entry *publicModelEntry, provider *providerRuntime, setup *providerSetup) bool {
+	if provider == nil || setup == nil {
+		return false
+	}
+	for _, route := range h.policyEntryRequiredRoutesForSetup(entry, setup) {
+		if route == nil {
+			continue
+		}
+		for _, target := range route.targets {
+			if target.provider != nil && target.provider.id == provider.id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ModelUsesCopilot reports whether startup must authenticate Copilot to resolve
-// or collision-check the selected public model. Provider filters exclude
-// Copilot from this decision when it cannot expose the model.
+// or execute the selected public model. Provider filters exclude Copilot from
+// this decision when neither the public owner nor a policy terminal/classifier
+// route references it.
 func (h *ProxyHandler) ModelUsesCopilot(model string) bool {
 	setup := h.providerSetup()
 	model = strings.TrimSpace(model)
 	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
-		for _, routeID := range []string{
-			entry.policyConfig.LightweightRoute,
-			entry.policyConfig.PowerfulRoute,
-			entry.policyConfig.Classifier.Route,
-		} {
-			route, known := setup.lookupTerminalRoute(routeID)
-			if !known || route == nil {
-				continue
-			}
-			for _, target := range route.targets {
-				if target.provider != nil && target.provider.kind == providerTypeCopilot {
-					return true
-				}
+		for _, providerID := range setup.providerOrder {
+			provider := setup.providerByID(providerID)
+			if provider != nil && provider.kind == providerTypeCopilot && h.policyEntryReferencesProvider(entry, provider) {
+				return true
 			}
 		}
 		return false
@@ -1748,6 +2103,23 @@ func (h *ProxyHandler) ModelUsesCopilot(model string) bool {
 			return true
 		}
 		if providerCanExposeModel(provider, model) {
+			return true
+		}
+	}
+	return false
+}
+
+// UsesCopilot reports whether the current public/provider scope or an active
+// policy route requires Copilot authentication. Inactive hidden policy targets
+// do not force authentication on an otherwise local serve process.
+func (h *ProxyHandler) UsesCopilot() bool {
+	if h == nil {
+		return false
+	}
+	setup := h.providerSetup()
+	for _, providerID := range setup.providerOrder {
+		provider := setup.providerByID(providerID)
+		if provider != nil && provider.kind == providerTypeCopilot && h.providerMayExposeAllowedModel(provider) {
 			return true
 		}
 	}
@@ -2529,13 +2901,22 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 		}
 
 		supportedEndpoints := normalizeDynamicProviderEndpoints(provider, parsed.SupportedEndpoints)
+		endpointsAdvertised := len(supportedEndpoints) > 0
 		if len(supportedEndpoints) == 0 {
 			supportedEndpoints = provider.defaultDynamicModelEndpoints()
 		}
 		disabled := strings.EqualFold(parsed.Policy.State, "disabled")
 		if index, duplicate := indexByID[publicID]; duplicate {
 			merged := models[index]
-			merged.supportedEndpoints = mergeDynamicProviderEndpoints(merged.supportedEndpoints, supportedEndpoints)
+			switch {
+			case merged.endpointsAdvertised && !endpointsAdvertised:
+				// Keep the explicitly advertised endpoint set.
+			case !merged.endpointsAdvertised && endpointsAdvertised:
+				merged.supportedEndpoints = append([]string(nil), supportedEndpoints...)
+			default:
+				merged.supportedEndpoints = mergeDynamicProviderEndpoints(merged.supportedEndpoints, supportedEndpoints)
+			}
+			merged.endpointsAdvertised = merged.endpointsAdvertised || endpointsAdvertised
 			merged.disabled = merged.disabled && disabled
 			baseRaw := merged.raw
 			if merged.disabled != models[index].disabled && !merged.disabled {
@@ -2548,13 +2929,14 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 
 		indexByID[publicID] = len(models)
 		models = append(models, providerModel{
-			publicID:           publicID,
-			upstreamModel:      publicID,
-			providerID:         provider.id,
-			supportedEndpoints: supportedEndpoints,
-			parallelToolCalls:  providerModelParallelToolCallsFromRaw(raw),
-			disabled:           disabled,
-			raw:                mergeProviderModelRaw(raw, supportedEndpoints),
+			publicID:            publicID,
+			upstreamModel:       publicID,
+			providerID:          provider.id,
+			supportedEndpoints:  supportedEndpoints,
+			parallelToolCalls:   providerModelParallelToolCallsFromRaw(raw),
+			disabled:            disabled,
+			endpointsAdvertised: endpointsAdvertised,
+			raw:                 mergeProviderModelRaw(raw, supportedEndpoints),
 		})
 	}
 

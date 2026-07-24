@@ -81,7 +81,7 @@ Every launcher:
 1. loads Vekil provider configuration and credentials;
 2. starts a proxy on `127.0.0.1:0` unless `--port` is provided;
 3. completes startup authentication and provider-model validation;
-4. initializes configured policy routing using the `--policy-routing` / `POLICY_ROUTING_MODE` safety ceiling;
+4. initializes configured policy routing using the YAML profile mode or an explicit `--policy-routing` / `POLICY_ROUTING_MODE` safety ceiling;
 5. waits for `/readyz` and, when `--model` is supplied, verifies that model in `/v1/models`;
 6. validates the installed agent binary and, for a pinned model, endpoint compatibility;
 7. starts the agent with target-specific temporary routing configuration and either delegated or pinned model selection;
@@ -106,7 +106,7 @@ normal global policy-controller startup behavior.
 | `--binary PATH` | Agent executable override. |
 | `--startup-timeout DURATION` | Maximum startup/authentication/readiness time. |
 | `--streaming-upstream-timeout DURATION` | Upstream streaming timeout. |
-| `--policy-routing off|observe|enforce` | Process-wide policy-routing safety ceiling. Defaults to `POLICY_ROUTING_MODE` or `off`. |
+| `--policy-routing config|off|observe|enforce` | Policy-routing mode. `config` follows YAML profile modes and is the default; other values apply a process-wide safety ceiling. |
 | `--proxy-log PATH` | New JSON proxy log path; existing files and links are rejected. |
 | `--dry-run` | Print the child-process plan without starting a proxy or agent. Static model metadata is resolved; catalog-only metadata is marked unresolved. |
 | `--no-summary` | Suppress the end-of-session request/token summary. |
@@ -175,14 +175,13 @@ ephemeral launch proxy authenticates and sends those terminal/classifier Chat
 requests to Copilot in process. No separately started loopback bridge is
 required.
 
-The global policy ceiling still defaults to `off`, so the command uses the
-profile's deterministic baseline unless `--policy-routing observe` or
-`--policy-routing enforce` is supplied. Opaque `call_vekil_*` continuations from
-a downstream Responses-backed bridge are accepted only for a single-target
-baseline in `off` or `observe`, and that bridge must be one process (the normal
-loopback launcher topology) or use sticky ingress to the replay-owning replica;
-`enforce` rejects those stateful continuations until policy route affinity is
-implemented.
+The default policy mode follows the profile's YAML `mode`; an explicit
+`--policy-routing off|observe|enforce` value can still lower the process-wide
+ceiling. Locally owned `call_vekil_*` continuations retain their originating
+route and tier, including in `enforce`. Opaque continuations from a downstream
+Responses-backed bridge are accepted only for a single-target baseline in
+`off` or `observe`, and that bridge must be one process (the normal loopback
+launcher topology) or use sticky ingress to the replay-owning replica.
 
 Forwarded settings-source, detached-session, resume, model/fallback, incompatible
 permission-mode, and custom-agent overrides are rejected. Use the

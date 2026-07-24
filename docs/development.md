@@ -73,7 +73,7 @@ Schema-v2 policy routing adds a pre-dispatch planner above native OpenAI Chat. T
 Coverage should include:
 
 - schema-v2 route exposure, internal-route non-resolution/catalog exclusion, public-entry/operational-ID collisions, maximum profile count, field ranges, recursive-policy rejection, and schema-v2 feature-field rejection in v1;
-- terminal contract intersection, native `/chat/completions`-only destination validation, dynamic/unsupported provider rejection, and classifier one-target/one-attempt/one-send enforcement;
+- terminal contract intersection across native `/chat/completions` and Responses-backed Chat, pinned internal Copilot destination validation, rejection of other dynamic/unsupported provider kinds, and classifier one-target/one-attempt/one-send enforcement;
 - exact global/profile mode ceiling behavior, including `off` making zero preflight/classifier calls and observe never changing dispatch;
 - bounded canonical facts, UTF-8 truncation, non-text rejection, tool-name-only forwarding, total request cap, and exclusion of credentials, auth headers, provider state, replay IDs, physical routing metadata, parameter schemas, and tool arguments;
 - mandatory content-forwarding, trust-domain, cross-domain, non-storage, and retention acknowledgements;
@@ -256,11 +256,11 @@ Fork and Dependabot pull requests neutral-skip because GitHub withholds reposito
 
 The default pull-request check is [`Live Copilot Semantic Policy Routing Smoke`](../.github/workflows/live-policy-routing-copilot-smoke.yaml), whose uniquely named job is `semantic-policy-e2e`. It reuses the repository's existing `COPILOT_GITHUB_TOKEN` rather than requiring a second set of provider credentials. [`scripts/live-policy-routing-copilot-smoke.sh`](../scripts/live-policy-routing-copilot-smoke.sh) starts a private zero-config Vekil bridge backed by Copilot, reads its `/v1/models` catalog, selects native-Chat models, and delegates to the common [`scripts/live-policy-routing-smoke.sh`](../scripts/live-policy-routing-smoke.sh) acceptance harness.
 
-The bridge is intentional: schema-v2 policy profiles continue to reject direct dynamic `type: copilot` destinations and classifiers. The policy proxy sees only static `openai-compatible` loopback targets, so CI exercises the production policy contract without expanding the supported policy-provider matrix. The wrapper removes `COPILOT_GITHUB_TOKEN` from the delegated harness environment, gives the bridge a private token directory, auto-selects a non-default loopback port, and verifies bridge/process-group cleanup.
+The wrapper still uses a private loopback bridge because the common smoke harness needs independently controllable static targets and fault injection. Production schema-v2 policy profiles may also target pinned models on a dynamic `type: copilot` provider directly, including Responses-backed Chat models. The wrapper removes `COPILOT_GITHUB_TOKEN` from the delegated harness environment, gives the bridge a private token directory, auto-selects a non-default loopback port, and verifies bridge/process-group cleanup.
 
 By default the wrapper prefers these currently available model families, always requiring advertised native `/chat/completions` support and falling back to another catalog model when a preferred ID is absent:
 
-- lightweight: `gpt-5.4-mini`, `gpt-5-mini`, `gpt-4.1`, `gpt-4o`, then `claude-haiku-4.5`;
+- lightweight: `gpt-5.4-mini`, `claude-haiku-4.5`, `gpt-5-mini`, `gpt-4.1`, then `gpt-4o`;
 - classifier: `gpt-4.1`, `claude-sonnet-4.6`, `claude-haiku-4.5`, then GPT-5 mini/full variants;
 - powerful primary: `gpt-5.4`, `claude-sonnet-4.6`, Codex variants, then `gpt-4.1`; and
 - powerful secondary: the first distinct compatible model from the same powerful preference set.
@@ -381,5 +381,5 @@ You can also run the same smoke scripts locally after building `vekil`; the CLI 
 - Keep Chat backend selection and Responses conversion inside the deep execution seam (`chat_execution.go`, `chat_route*.go`, and `chat_over_responses_*.go`); Anthropic and Gemini handlers should consume canonical Chat results rather than Responses events directly.
 - Responses-backed Chat must reject unsupported fields instead of silently dropping them, preserve opaque replay IDs/state bounds, and use the typed internal Chat event transport for streams.
 - Preserve startup failure on public-model-ID collisions. For schema version 2, add new provider/native-endpoint/surface/mode support to the compiled route feature matrix and reject unsupported combinations rather than accepting degraded routes.
-- If the provider participates in policy routing, define and validate its `trust_domain`, classifier non-storage capability, forced function-tool support, and live-preflight behavior. Policy destinations may use native Chat or the bounded Chat-over-Responses adapter. Copilot is the only catalog-driven explicit-route exception; do not silently admit other dynamic providers, Anthropic, Gemini, multimodal, or multi-tenant policy behavior.
+- If the provider participates in policy routing, define and validate its `trust_domain`, classifier non-storage capability, forced function-tool support, and live-preflight behavior. Policy destinations may use native Chat or the bounded Chat-over-Responses adapter. Copilot is the only catalog-driven explicit-route exception; pinned targets must be validated against discovery and suppressed from the provider's legacy catalog. Do not silently admit other dynamic providers, Anthropic, Gemini, multimodal, or multi-tenant policy behavior.
 - Cross-link config examples in [`provider-routing.md`](provider-routing.md) instead of duplicating YAML here.
