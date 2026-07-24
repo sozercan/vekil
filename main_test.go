@@ -730,7 +730,11 @@ func TestStartServeServerValidatesDeferredModelsWithoutCopilotAuth(t *testing.T)
 		return "", errors.New("unexpected Copilot auth")
 	}}
 
-	if err := startServeServer(context.Background(), srv, authenticator, false, logger.NewWithWriter(logger.LevelError, io.Discard)); err != nil {
+	usesCopilot := serveUsesCopilot(srv, true)
+	if usesCopilot {
+		t.Fatal("runtime Copilot scope did not override the raw-config fallback")
+	}
+	if err := startServeServer(context.Background(), srv, authenticator, usesCopilot, logger.NewWithWriter(logger.LevelError, io.Discard)); err != nil {
 		t.Fatalf("startServeServer() error = %v", err)
 	}
 	if authCalls != 0 {
@@ -738,6 +742,9 @@ func TestStartServeServerValidatesDeferredModelsWithoutCopilotAuth(t *testing.T)
 	}
 	if validateCalls != 1 {
 		t.Fatalf("dynamic validation calls = %d, want 1", validateCalls)
+	}
+	if base.authPending || len(base.authPendingUpdates) != 1 || base.authPendingUpdates[0] {
+		t.Fatalf("startup authentication gate updates = %v, pending=%v; want one false update", base.authPendingUpdates, base.authPending)
 	}
 }
 
