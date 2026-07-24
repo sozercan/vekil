@@ -438,6 +438,7 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 	facts, err := buildPolicyClassifierFacts(input.OriginalBody, policyFactOptions{
 		RecentTurns:     profile.config.Classifier.RecentTurns,
 		MaxRequestBytes: profile.config.Classifier.MaxRequestBytes,
+		MaxSourceBytes:  input.FactSourceBytesLimit,
 	})
 	if err != nil {
 		return chatOperationPlan{}, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("policy model %q supports text and standard function tools only: %w", entry.id, err)}

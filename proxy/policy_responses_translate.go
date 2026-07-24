@@ -18,9 +18,13 @@ const (
 	policyResponsesToolKindFunction = "function"
 
 	policyResponsesMaxRequestBytes = 1 << 20
-	policyResponsesMaxJSONDepth    = 128
-	policyResponsesMaxInputItems   = 1024
-	policyResponsesMaxContentParts = 1024
+	// Translation adds canonical Chat wrappers and flattened tool aliases. Keep
+	// the public policy ingress at 1 MiB, but allow that already-bounded input to
+	// expand up to the ordinary Chat request ceiling.
+	policyResponsesMaxTranslatedChatBytes = maxRequestBodySize
+	policyResponsesMaxJSONDepth           = 128
+	policyResponsesMaxInputItems          = 1024
+	policyResponsesMaxContentParts        = 1024
 	// Responses-backed Chat bridges used by managed Codex launches can accept
 	// Responses-scale catalogs beyond the 128-function native OpenAI/Azure Chat
 	// limit. Operators using narrower native-Chat destinations must constrain the
@@ -252,8 +256,8 @@ func translatePolicyResponsesRequestToChat(body []byte) (policyResponsesChatRequ
 	if err != nil {
 		return policyResponsesChatRequest{}, fmt.Errorf("marshal policy Chat request: %w", err)
 	}
-	if len(chatBody) > policyResponsesMaxRequestBytes {
-		return policyResponsesChatRequest{}, newChatInvalidRequest("", fmt.Sprintf("translated policy Chat request exceeds %d bytes", policyResponsesMaxRequestBytes))
+	if len(chatBody) > policyResponsesMaxTranslatedChatBytes {
+		return policyResponsesChatRequest{}, newChatInvalidRequest("", fmt.Sprintf("translated policy Chat request exceeds %d bytes", policyResponsesMaxTranslatedChatBytes))
 	}
 	return policyResponsesChatRequest{
 		Body:          chatBody,
@@ -740,6 +744,17 @@ func parsePolicyResponsesTools(raw json.RawMessage) ([]policyResponsesParsedTool
 		return nil, newChatInvalidRequest("tools", "tools must be an array")
 	}
 	parsed := make([]policyResponsesParsedTool, 0, len(values))
+	flattenedDescriptionBytes := 0
+	appendTool := func(tool policyResponsesParsedTool, namespaceDescription string, namespaceDescriptionBytes int) error {
+		descriptionBytes := policyResponsesCombinedToolDescriptionJSONBytes(namespaceDescription, namespaceDescriptionBytes, tool.description)
+		if descriptionBytes > policyResponsesMaxTranslatedChatBytes-flattenedDescriptionBytes {
+			return newChatInvalidRequest(tool.param+".description", fmt.Sprintf("flattened tool descriptions exceed %d encoded bytes", policyResponsesMaxTranslatedChatBytes))
+		}
+		flattenedDescriptionBytes += descriptionBytes
+		tool.description = combinePolicyResponsesToolDescriptions(namespaceDescription, tool.description)
+		parsed = append(parsed, tool)
+		return nil
+	}
 	for index, toolRaw := range values {
 		if len(parsed) >= policyResponsesMaxFunctionTools {
 			return nil, newChatInvalidRequest("tools", fmt.Sprintf("tools may contain at most %d flattened function tools", policyResponsesMaxFunctionTools))
@@ -759,7 +774,9 @@ func parsePolicyResponsesTools(raw json.RawMessage) ([]policyResponsesParsedTool
 			if err != nil {
 				return nil, err
 			}
-			parsed = append(parsed, tool)
+			if err := appendTool(tool, "", 0); err != nil {
+				return nil, err
+			}
 		case "namespace":
 			if err := validatePolicyResponsesObjectFields(object, param, "type", "name", "description", "tools"); err != nil {
 				return nil, err
@@ -772,6 +789,7 @@ func parsePolicyResponsesTools(raw json.RawMessage) ([]policyResponsesParsedTool
 			if err != nil {
 				return nil, err
 			}
+			namespaceDescriptionBytes := policyResponsesJSONStringBytes(namespaceDescription)
 			childrenRaw, ok := object["tools"]
 			if !ok {
 				return nil, newChatInvalidRequest(param+".tools", "namespace tools are required")
@@ -800,8 +818,9 @@ func parsePolicyResponsesTools(raw json.RawMessage) ([]policyResponsesParsedTool
 				if err != nil {
 					return nil, err
 				}
-				child.description = combinePolicyResponsesToolDescriptions(namespaceDescription, child.description)
-				parsed = append(parsed, child)
+				if err := appendTool(child, namespaceDescription, namespaceDescriptionBytes); err != nil {
+					return nil, err
+				}
 			}
 		case "custom", "web_search", "web_search_preview", "image_generation", "file_search", "computer_use_preview", "tool_search", "mcp":
 			return nil, newChatInvalidRequest(param+".type", fmt.Sprintf("hosted or custom tool type %q is not supported for policy models", toolType))
@@ -810,6 +829,28 @@ func parsePolicyResponsesTools(raw json.RawMessage) ([]policyResponsesParsedTool
 		}
 	}
 	return parsed, nil
+}
+
+func policyResponsesJSONStringBytes(value string) int {
+	if value == "" {
+		return 0
+	}
+	encoded, _ := json.Marshal(value)
+	return len(encoded)
+}
+
+func policyResponsesCombinedToolDescriptionJSONBytes(namespace string, namespaceBytes int, child string) int {
+	childBytes := policyResponsesJSONStringBytes(child)
+	switch {
+	case namespace == "":
+		return childBytes
+	case child == "":
+		return namespaceBytes
+	default:
+		// Each input length includes its own quotes. The combined string drops two
+		// quote pairs, adds one pair, and encodes the two newlines as \n\n.
+		return namespaceBytes + childBytes + 2
+	}
 }
 
 func combinePolicyResponsesToolDescriptions(namespace, child string) string {

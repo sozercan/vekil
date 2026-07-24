@@ -634,6 +634,124 @@ func TestTranslatePolicyResponsesRequestToChatAcceptsCodexScaleNamespaceCatalog(
 	}
 }
 
+func TestTranslatePolicyResponsesRequestToChatAllowsBoundedCanonicalExpansion(t *testing.T) {
+	body := policyResponsesCanonicalExpansionRequest(t, "policy")
+	translated, err := translatePolicyResponsesRequestToChat(body)
+	if err != nil {
+		t.Fatalf("translate request with bounded canonical expansion: %v", err)
+	}
+	if len(translated.Body) <= policyResponsesMaxRequestBytes {
+		t.Fatalf("translated request size = %d, want expansion beyond ingress limit %d", len(translated.Body), policyResponsesMaxRequestBytes)
+	}
+	if len(translated.Body) > policyResponsesMaxTranslatedChatBytes {
+		t.Fatalf("translated request size = %d, want at most %d", len(translated.Body), policyResponsesMaxTranslatedChatBytes)
+	}
+	facts, err := buildPolicyClassifierFacts(translated.Body, policyFactOptions{MaxSourceBytes: policyResponsesMaxTranslatedChatBytes})
+	if err != nil {
+		t.Fatalf("build facts from expanded canonical request: %v", err)
+	}
+	if facts.Counts.FunctionTools != policyResponsesMaxFunctionTools {
+		t.Fatalf("function tool count = %d, want %d", facts.Counts.FunctionTools, policyResponsesMaxFunctionTools)
+	}
+}
+
+func policyResponsesCanonicalExpansionRequest(t *testing.T, model string) []byte {
+	t.Helper()
+	tools := make([]any, 0, policyResponsesMaxFunctionTools)
+	for index := 0; index < policyResponsesMaxFunctionTools; index++ {
+		tools = append(tools, map[string]any{
+			"type":       "function",
+			"name":       fmt.Sprintf("f_%04d", index),
+			"parameters": map[string]any{"type": "object"},
+		})
+	}
+	request := map[string]any{
+		"model":        model,
+		"input":        "hi",
+		"instructions": "",
+		"tools":        tools,
+		"store":        false,
+		"stream":       false,
+	}
+	base, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paddingBytes := policyResponsesMaxRequestBytes - len(base) - 1024
+	if paddingBytes <= 0 {
+		t.Fatalf("base request size = %d, want room below ingress limit %d", len(base), policyResponsesMaxRequestBytes)
+	}
+	request["instructions"] = strings.Repeat("x", paddingBytes)
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) >= policyResponsesMaxRequestBytes {
+		t.Fatalf("request size = %d, want below ingress limit %d", len(body), policyResponsesMaxRequestBytes)
+	}
+	return body
+}
+
+func TestPolicyResponsesCombinedToolDescriptionJSONBytesMatchesEncoding(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		namespace string
+		child     string
+	}{
+		{name: "empty"},
+		{name: "namespace only", namespace: "namespace <&>"},
+		{name: "child only", child: "child\n<&>"},
+		{name: "combined", namespace: "namespace <&>", child: "child\n<&>"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			combined := combinePolicyResponsesToolDescriptions(test.namespace, test.child)
+			encoded, err := json.Marshal(combined)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := policyResponsesCombinedToolDescriptionJSONBytes(test.namespace, policyResponsesJSONStringBytes(test.namespace), test.child)
+			want := len(encoded)
+			if combined == "" {
+				want = 0
+			}
+			if got != want {
+				t.Fatalf("encoded size = %d, want %d (%s)", got, want, encoded)
+			}
+		})
+	}
+}
+
+func TestTranslatePolicyResponsesRequestToChatRejectsAmplifiedNamespaceDescriptions(t *testing.T) {
+	children := make([]any, 0, policyResponsesMaxFunctionTools)
+	for index := 0; index < policyResponsesMaxFunctionTools; index++ {
+		children = append(children, map[string]any{
+			"type":       "function",
+			"name":       fmt.Sprintf("f_%04d", index),
+			"parameters": map[string]any{"type": "object"},
+		})
+	}
+	body, err := json.Marshal(map[string]any{
+		"model": "policy",
+		"input": "hi",
+		"tools": []any{map[string]any{
+			"type":        "namespace",
+			"name":        "bulk",
+			"description": strings.Repeat("<", policyResponsesMaxTranslatedChatBytes/6/policyResponsesMaxFunctionTools+1),
+			"tools":       children,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) >= policyResponsesMaxRequestBytes {
+		t.Fatalf("request size = %d, want below ingress limit %d", len(body), policyResponsesMaxRequestBytes)
+	}
+	_, err = translatePolicyResponsesRequestToChat(body)
+	if err == nil || !strings.Contains(err.Error(), "flattened tool descriptions exceed") {
+		t.Fatalf("error = %v, want flattened-description bound", err)
+	}
+}
+
 func TestTranslatePolicyResponsesRequestToChatEnforcesIngressBounds(t *testing.T) {
 	t.Run("request bytes", func(t *testing.T) {
 		body := []byte(`{"model":"policy","input":"` + strings.Repeat("x", policyResponsesMaxRequestBytes) + `"}`)
