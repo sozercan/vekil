@@ -4,9 +4,11 @@
 #
 # Production policy profiles can target pinned Copilot models directly. This
 # wrapper still starts a private zero-config Vekil bridge because the shared live
-# harness needs independently controllable static targets and fault injection. It
-# selects live Chat-capable models from the Copilot catalog and presents the
-# loopback bridge to scripts/live-policy-routing-smoke.sh as static targets.
+# harness needs independently controllable static targets, fault injection, and
+# metadata-only capture. It selects live Chat-capable models from the Copilot
+# catalog, presents the bridge to scripts/live-policy-routing-smoke.sh as static
+# targets, then reuses it for exact Responses-native gpt-5.6-sol low/max effort
+# validation.
 #
 # Required environment:
 #   COPILOT_GITHUB_TOKEN
@@ -22,6 +24,7 @@
 #   PROXY_BIN                                  policy proxy binary; default ./vekil
 #   LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN     bridge binary; defaults to PROXY_BIN
 #   LIVE_POLICY_ROUTING_HARNESS                delegated harness path
+#   LIVE_POLICY_ROUTING_SOL_EFFORT_HARNESS     delegated exact Sol harness path
 #   LIVE_POLICY_ROUTING_SMOKE_DIR              artifact directory
 #   LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=0       delete artifacts after success
 #   SMOKE_*                                     bounded timeout overrides
@@ -51,6 +54,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 POLICY_PROXY_BIN="${PROXY_BIN:-${REPO_ROOT}/vekil}"
 COPILOT_BRIDGE_BIN="${LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN:-${POLICY_PROXY_BIN}}"
 POLICY_HARNESS="${LIVE_POLICY_ROUTING_HARNESS:-${SCRIPT_DIR}/live-policy-routing-smoke.sh}"
+SOL_EFFORT_HARNESS="${LIVE_POLICY_ROUTING_SOL_EFFORT_HARNESS:-${SCRIPT_DIR}/live-policy-routing-sol-effort-smoke.sh}"
 SMOKE_STARTUP_TIMEOUT_SECONDS="${SMOKE_STARTUP_TIMEOUT_SECONDS:-90}"
 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS="${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS:-5}"
 SMOKE_CURL_MAX_TIME_SECONDS="${SMOKE_CURL_MAX_TIME_SECONDS:-180}"
@@ -187,10 +191,11 @@ import sys
 
 path = pathlib.Path(sys.argv[1])
 limit = int(sys.argv[2])
-text = path.read_text(encoding="utf-8", errors="replace")[:limit]
+text = path.read_text(encoding="utf-8", errors="replace")
 values = set(sys.argv[3:])
 for value in sorted(values - {""}, key=len, reverse=True):
     text = text.replace(value, "[REDACTED]")
+text = text[:limit]
 print("--- copilot-bridge.log (redacted) ---", file=sys.stderr)
 print(text, file=sys.stderr)
 PY
@@ -403,6 +408,7 @@ run_policy_harness() {
   env -u COPILOT_GITHUB_TOKEN \
     PROXY_BIN="${POLICY_PROXY_BIN}" \
     LIVE_POLICY_ROUTING_SMOKE_DIR="${SMOKE_DIR}" \
+    LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=1 \
     LIVE_POLICY_ROUTING_ALLOW_INSECURE_HTTP=1 \
     LIVE_POLICY_ROUTING_LIGHTWEIGHT_TYPE=openai-compatible \
     LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL="${bridge_api}" \
@@ -424,6 +430,17 @@ run_policy_harness() {
     "${POLICY_HARNESS}"
 }
 
+run_sol_effort_harness() {
+  env -u COPILOT_GITHUB_TOKEN \
+    PROXY_BIN="${POLICY_PROXY_BIN}" \
+    LIVE_POLICY_ROUTING_SOL_BRIDGE_BASE_URL="${bridge_base_url}" \
+    LIVE_POLICY_ROUTING_SOL_MODEL=gpt-5.6-sol \
+    LIVE_POLICY_ROUTING_SOL_PUBLIC_MODEL=gpt-5.6-semantic \
+    LIVE_POLICY_ROUTING_SOL_SMOKE_DIR="${SMOKE_DIR}/sol-effort" \
+    LIVE_POLICY_ROUTING_SOL_KEEP_ARTIFACTS=1 \
+    "${SOL_EFFORT_HARNESS}"
+}
+
 main() {
   require_cmd curl
   require_cmd jq
@@ -436,13 +453,15 @@ main() {
   [[ -x "${POLICY_PROXY_BIN}" ]] || die "policy proxy binary not found or not executable: ${POLICY_PROXY_BIN} (run: make build)"
   [[ -x "${COPILOT_BRIDGE_BIN}" ]] || die "Copilot bridge binary not found or not executable: ${COPILOT_BRIDGE_BIN}"
   [[ -x "${POLICY_HARNESS}" ]] || die "policy harness not found or not executable: ${POLICY_HARNESS}"
+  [[ -x "${SOL_EFFORT_HARNESS}" ]] || die "Sol effort harness not found or not executable: ${SOL_EFFORT_HARNESS}"
 
   start_copilot_bridge
   fetch_copilot_models
   select_copilot_models
   run_policy_harness
+  run_sol_effort_harness
 
-  log "Copilot-backed semantic policy-routing smoke passed."
+  log "Copilot-backed semantic policy-routing and Sol low/max effort smokes passed."
   if [[ "${LIVE_POLICY_ROUTING_KEEP_ARTIFACTS:-0}" == "1" ]]; then
     log "Artifacts: ${SMOKE_DIR}"
   fi

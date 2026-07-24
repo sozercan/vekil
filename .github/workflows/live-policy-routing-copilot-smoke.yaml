@@ -2,9 +2,10 @@ name: Live Copilot Semantic Policy Routing Smoke
 
 # Default credentialed PR acceptance coverage for schema-v2 semantic routing.
 # The wrapper starts a private zero-config Vekil bridge using the repository's
-# existing Copilot token, discovers native-Chat models, and presents them to the
-# unchanged policy harness as static openai-compatible loopback targets. This
-# keeps the common smoke harness on controllable static loopback targets.
+# existing Copilot token, discovers native-Chat models for the broad policy
+# matrix, and presents them as controllable static loopback targets. It then
+# runs a focused Responses-native gpt-5.6-sol check proving prompt-selected
+# low/max effort overrides conflicting client values through the same bridge.
 
 on:
   workflow_dispatch:
@@ -71,7 +72,7 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         run: make build
 
-      - name: Run Copilot-backed semantic policy-routing E2E
+      - name: Run Copilot-backed semantic policy-routing and Sol effort E2E
         if: steps.gate.outputs.run == 'true'
         env:
           LIVE_POLICY_ROUTING_SMOKE_DIR: ${{ runner.temp }}/live-policy-routing-copilot-smoke
