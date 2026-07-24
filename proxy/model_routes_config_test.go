@@ -494,13 +494,6 @@ func TestValidateModelRoutesProviderCompatibility(t *testing.T) {
 		want string
 	}{
 		{
-			name: "copilot cannot be explicit target",
-			cfg: ProvidersConfig{SchemaVersion: 2, Providers: []ProviderConfig{{ID: "copilot", Type: "copilot"}}, ModelRoutes: []ModelRouteConfig{{
-				ID: "route", PublicID: "model", Endpoints: []string{providerEndpointResponses}, Targets: []ModelRouteTargetConfig{{ID: "target", Provider: "copilot", UpstreamModel: "model"}},
-			}}},
-			want: "model_routes[0].targets[0].provider",
-		},
-		{
 			name: "dynamic generic provider cannot be explicit target",
 			cfg: ProvidersConfig{SchemaVersion: 2, Providers: []ProviderConfig{{ID: "dynamic", Type: "openai-compatible", BaseURL: "https://example.test/v1", AuthType: "none", ModelDiscovery: "openai"}}, ModelRoutes: []ModelRouteConfig{{
 				ID: "route", PublicID: "model", Endpoints: []string{providerEndpointResponses}, Targets: []ModelRouteTargetConfig{{ID: "target", Provider: "dynamic", UpstreamModel: "model"}},
@@ -536,6 +529,31 @@ func TestValidateModelRoutesProviderCompatibility(t *testing.T) {
 				t.Fatalf("validation error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestValidateModelRoutesAllowsCopilotExplicitTargets(t *testing.T) {
+	cfg := ProvidersConfig{
+		SchemaVersion: 2,
+		Providers: []ProviderConfig{{
+			ID:          "copilot",
+			Type:        "copilot",
+			Default:     true,
+			TrustDomain: "github-copilot",
+		}},
+		ModelRoutes: []ModelRouteConfig{{
+			ID:        "route",
+			PublicID:  "semantic-model",
+			Endpoints: []string{providerEndpointChatCompletions, providerEndpointResponses},
+			Targets: []ModelRouteTargetConfig{{
+				ID:            "target",
+				Provider:      "copilot",
+				UpstreamModel: "gpt-5.6-sol",
+			}},
+		}},
+	}
+	if _, err := validateAndNormalizeProvidersConfig(cfg); err != nil {
+		t.Fatalf("validateAndNormalizeProvidersConfig() error = %v", err)
 	}
 }
 

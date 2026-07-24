@@ -1680,21 +1680,45 @@ func aggregateStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, erro
 // before an error. Callers may only switch targets when the returned progress is
 // none or an allowed role/preamble chunk.
 func aggregateStreamToResponseWithProgress(body io.ReadCloser) (*models.OpenAIResponse, upstreamSemanticProgress, error) {
+	return aggregateStreamToResponseWithProgressOptions(body, openAIResponseBuildOptions{})
+}
+
+func aggregatePolicyStreamToResponseWithProgress(body io.ReadCloser) (*models.OpenAIResponse, upstreamSemanticProgress, error) {
+	return aggregateStreamToResponseWithProgressOptions(body, openAIResponseBuildOptions{
+		preserveInvalidToolArguments: true,
+		rejectInvalidTextDeltas:      true,
+		maxAccumulatedBytes:          maxLargeRequestBodySize,
+	})
+}
+
+func aggregateStreamToResponseWithProgressOptions(body io.ReadCloser, options openAIResponseBuildOptions) (*models.OpenAIResponse, upstreamSemanticProgress, error) {
 	defer func() { _ = body.Close() }()
 
-	aggregator := newOpenAIResponseAggregator()
+	aggregator := newOpenAIResponseAggregatorWithOptions(options)
+	var addErr error
 	sawDone, progress, err := consumeOpenAIStreamChunksWithProgress(body, func(chunk models.OpenAIStreamChunk) bool {
-		aggregator.addChunk(chunk)
+		if err := aggregator.addChunkBounded(chunk); err != nil {
+			addErr = err
+			return false
+		}
 		return true
 	})
 	if err != nil {
 		return nil, progress, err
 	}
+	if addErr != nil {
+		return nil, progress, addErr
+	}
 	if !sawDone {
 		return nil, progress, fmt.Errorf("stream ended before [DONE]")
 	}
+	if options.rejectInvalidTextDeltas {
+		if err := aggregator.policyTextDeltaError(); err != nil {
+			return nil, progress, err
+		}
+	}
 
-	return aggregator.buildResponse(), progress, nil
+	return aggregator.buildResponseWithOptions(options), progress, nil
 }
 
 type anthropicStreamState struct {
@@ -2002,21 +2026,56 @@ func (s *anthropicStreamState) finish() bool {
 type aggregatedOpenAIChoice struct {
 	role              string
 	content           strings.Builder
+	contentPresent    bool
 	refusal           strings.Builder
+	refusalPresent    bool
 	toolCalls         map[int]*models.OpenAIToolCall
 	toolCallArguments map[int]*strings.Builder
 	finishReason      *string
 }
 
+type openAIResponseBuildOptions struct {
+	preserveInvalidToolArguments bool
+	rejectInvalidTextDeltas      bool
+	maxAccumulatedBytes          int
+}
+
 type openAIResponseAggregator struct {
-	response       models.OpenAIResponse
-	choicesByIndex map[int]*aggregatedOpenAIChoice
+	response              models.OpenAIResponse
+	choicesByIndex        map[int]*aggregatedOpenAIChoice
+	invalidContentDelta   bool
+	invalidRefusalDelta   bool
+	maxAccumulatedBytes   int
+	accumulatedChunkBytes int
 }
 
 func newOpenAIResponseAggregator() *openAIResponseAggregator {
+	return newOpenAIResponseAggregatorWithOptions(openAIResponseBuildOptions{})
+}
+
+func newOpenAIResponseAggregatorWithOptions(options openAIResponseBuildOptions) *openAIResponseAggregator {
 	return &openAIResponseAggregator{
-		choicesByIndex: make(map[int]*aggregatedOpenAIChoice),
+		choicesByIndex:      make(map[int]*aggregatedOpenAIChoice),
+		maxAccumulatedBytes: options.maxAccumulatedBytes,
 	}
+}
+
+func (a *openAIResponseAggregator) addChunkBounded(chunk models.OpenAIStreamChunk) error {
+	if a == nil {
+		return nil
+	}
+	if a.maxAccumulatedBytes > 0 {
+		encoded, err := json.Marshal(chunk)
+		if err != nil {
+			return fmt.Errorf("measure streamed Chat chunk: %w", err)
+		}
+		if len(encoded) > a.maxAccumulatedBytes-a.accumulatedChunkBytes {
+			return fmt.Errorf("policy Chat stream exceeds the %d-byte response limit", a.maxAccumulatedBytes)
+		}
+		a.accumulatedChunkBytes += len(encoded)
+	}
+	a.addChunk(chunk)
+	return nil
 }
 
 func (a *openAIResponseAggregator) addChunk(chunk models.OpenAIStreamChunk) {
@@ -2045,16 +2104,22 @@ func (a *openAIResponseAggregator) addChoice(choice models.OpenAIStreamChoice) {
 		aggChoice.role = choice.Delta.Role
 	}
 
-	if choice.Delta.Content != nil {
+	if choice.Delta.Content != nil && !bytes.Equal(bytes.TrimSpace(choice.Delta.Content), []byte("null")) {
 		var text string
 		if err := json.Unmarshal(choice.Delta.Content, &text); err == nil {
+			aggChoice.contentPresent = true
 			aggChoice.content.WriteString(text)
+		} else {
+			a.invalidContentDelta = true
 		}
 	}
-	if choice.Delta.Refusal != nil {
+	if choice.Delta.Refusal != nil && !bytes.Equal(bytes.TrimSpace(choice.Delta.Refusal), []byte("null")) {
 		var refusal string
 		if err := json.Unmarshal(choice.Delta.Refusal, &refusal); err == nil {
+			aggChoice.refusalPresent = true
 			aggChoice.refusal.WriteString(refusal)
+		} else {
+			a.invalidRefusalDelta = true
 		}
 	}
 
@@ -2087,6 +2152,19 @@ func (a *openAIResponseAggregator) addChoice(choice models.OpenAIStreamChoice) {
 		finishReason := *choice.FinishReason
 		aggChoice.finishReason = &finishReason
 	}
+}
+
+func (a *openAIResponseAggregator) policyTextDeltaError() error {
+	if a == nil {
+		return nil
+	}
+	if a.invalidContentDelta {
+		return fmt.Errorf("policy Chat stream contained a malformed content delta")
+	}
+	if a.invalidRefusalDelta {
+		return fmt.Errorf("policy Chat stream contained a malformed refusal delta")
+	}
+	return nil
 }
 
 func (a *openAIResponseAggregator) choice(index int) *aggregatedOpenAIChoice {
@@ -2122,6 +2200,10 @@ func (c *aggregatedOpenAIChoice) appendToolCallArguments(index int, arguments st
 }
 
 func (a *openAIResponseAggregator) buildResponse() *models.OpenAIResponse {
+	return a.buildResponseWithOptions(openAIResponseBuildOptions{})
+}
+
+func (a *openAIResponseAggregator) buildResponseWithOptions(options openAIResponseBuildOptions) *models.OpenAIResponse {
 	choiceIndexes := make([]int, 0, len(a.choicesByIndex))
 	for choiceIndex := range a.choicesByIndex {
 		choiceIndexes = append(choiceIndexes, choiceIndex)
@@ -2133,7 +2215,7 @@ func (a *openAIResponseAggregator) buildResponse() *models.OpenAIResponse {
 		aggChoice := a.choicesByIndex[choiceIndex]
 		a.response.Choices = append(a.response.Choices, models.OpenAIChoice{
 			Index:        choiceIndex,
-			Message:      a.buildMessage(aggChoice),
+			Message:      a.buildMessage(aggChoice, options),
 			FinishReason: aggChoice.finishReason,
 		})
 	}
@@ -2141,13 +2223,13 @@ func (a *openAIResponseAggregator) buildResponse() *models.OpenAIResponse {
 	return &a.response
 }
 
-func (a *openAIResponseAggregator) buildMessage(choice *aggregatedOpenAIChoice) models.OpenAIMessage {
+func (a *openAIResponseAggregator) buildMessage(choice *aggregatedOpenAIChoice, options openAIResponseBuildOptions) models.OpenAIMessage {
 	message := models.OpenAIMessage{Role: choice.role}
-	if choice.content.Len() > 0 {
+	if choice.contentPresent {
 		content, _ := json.Marshal(choice.content.String())
 		message.Content = content
 	}
-	if choice.refusal.Len() > 0 {
+	if choice.refusalPresent {
 		refusal, _ := json.Marshal(choice.refusal.String())
 		message.Refusal = refusal
 	}
@@ -2167,7 +2249,7 @@ func (a *openAIResponseAggregator) buildMessage(choice *aggregatedOpenAIChoice) 
 		if argumentBuilder := choice.toolCallArguments[toolIndex]; argumentBuilder != nil {
 			toolCall.Function.Arguments = argumentBuilder.String()
 		}
-		if !json.Valid([]byte(toolCall.Function.Arguments)) {
+		if !options.preserveInvalidToolArguments && !json.Valid([]byte(toolCall.Function.Arguments)) {
 			toolCall.Function.Arguments = "{}"
 		}
 		message.ToolCalls = append(message.ToolCalls, toolCall)

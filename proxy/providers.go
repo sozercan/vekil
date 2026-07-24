@@ -1685,10 +1685,19 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 	if _, ok := h.allowedModels[model]; ok {
 		return true
 	}
+	setup := h.providerSetup()
+	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+		for allowedModel := range h.allowedModels {
+			allowedEntry, allowed := setup.lookupPublicModelEntry(allowedModel)
+			if allowed && allowedEntry != nil && allowedEntry.kind == publicEntryPolicy && allowedEntry.policyID == entry.policyID {
+				return true
+			}
+		}
+	}
 	if endpoint != providerEndpointMessages {
 		return false
 	}
-	if _, rawKnown := h.providerSetup().lookupModel(model); rawKnown {
+	if _, rawKnown := setup.lookupModel(model); rawKnown {
 		return false
 	}
 	normalizedModel := NormalizeModelName(model)
@@ -1706,8 +1715,21 @@ func (h *ProxyHandler) ModelUsesCopilot(model string) bool {
 	setup := h.providerSetup()
 	model = strings.TrimSpace(model)
 	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
-		// Policy destinations and classifiers cannot be Copilot providers. The
-		// reserved policy owner therefore never requires Copilot authentication.
+		for _, routeID := range []string{
+			entry.policyConfig.LightweightRoute,
+			entry.policyConfig.PowerfulRoute,
+			entry.policyConfig.Classifier.Route,
+		} {
+			route, known := setup.lookupTerminalRoute(routeID)
+			if !known || route == nil {
+				continue
+			}
+			for _, target := range route.targets {
+				if target.provider != nil && target.provider.kind == providerTypeCopilot {
+					return true
+				}
+			}
+		}
 		return false
 	}
 	if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {

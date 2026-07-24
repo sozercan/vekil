@@ -1,0 +1,75 @@
+# Single-process semantic policy routing backed by GitHub Copilot.
+# The configured Copilot provider authenticates and executes Responses-backed
+# classifier/terminal routes in the same Vekil process; no loopback sidecar is
+# required.
+
+schema_version: 2
+
+providers:
+  - id: copilot
+    type: copilot
+    default: true
+    trust_domain: github-copilot
+    classifier_no_store_supported: false
+
+model_routes:
+  - id: semantic-lightweight-gpt-5-6-luna-route
+    exposure: internal
+    name: Semantic Lightweight GPT-5.6 Luna
+    endpoints: [/responses]
+    parallel_tool_calls: true
+    context_window: 1050000
+    drop_sampling_params: true
+    targets:
+      - id: copilot-gpt-5-6-luna
+        provider: copilot
+        upstream_model: gpt-5.6-luna
+    routing:
+      mode: primary_only
+      max_target_attempts: 1
+      max_upstream_sends: 1
+
+  - id: semantic-powerful-gpt-5-6-sol-route
+    exposure: internal
+    name: Semantic Powerful GPT-5.6 Sol
+    endpoints: [/responses]
+    parallel_tool_calls: true
+    context_window: 1050000
+    drop_sampling_params: true
+    targets:
+      - id: copilot-gpt-5-6-sol
+        provider: copilot
+        upstream_model: gpt-5.6-sol
+    routing:
+      mode: primary_only
+      max_target_attempts: 1
+      max_upstream_sends: 1
+
+  - id: semantic-classifier-gpt-5-6-sol-route
+    exposure: internal
+    internal_purpose: policy_classifier
+    name: Semantic Routing Classifier
+    endpoints: [/responses]
+    drop_sampling_params: true
+    targets:
+      - id: copilot-classifier-gpt-5-6-sol
+        provider: copilot
+        upstream_model: gpt-5.6-sol
+    routing:
+      mode: primary_only
+      max_target_attempts: 1
+      max_upstream_sends: 1
+
+policy_profiles:
+  - id: gpt-5-6-semantic-policy
+    public_id: gpt-5.6-semantic
+    name: GPT-5.6 Semantic
+    mode: enforce
+    lightweight_route: semantic-lightweight-gpt-5-6-luna-route
+    powerful_route: semantic-powerful-gpt-5-6-sol-route
+    classifier:
+      route: semantic-classifier-gpt-5-6-sol-route
+      timeout_ms: 10000
+    data_policy:
+      content_forwarding_acknowledged: true
+      allow_provider_retention: true

@@ -359,23 +359,31 @@ func TestClaudeAdapterDryRunMarksUnknownEndpointCompatibilityUnresolved(t *testi
 	}
 }
 
-func TestClaudeAdapterRejectsPolicyOwnedModelBeforeBinaryResolution(t *testing.T) {
+func TestClaudeAdapterAcceptsPolicyOwnedChatModel(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
 	var model ModelInfo
 	if err := json.Unmarshal([]byte(`{"id":"policy-public","owned_by":"vekil-policy","supported_endpoints":["/chat/completions"]}`), &model); err != nil {
 		t.Fatalf("decode model metadata: %v", err)
 	}
 
-	_, err := (ClaudeAdapter{}).Prepare(PrepareInput{
+	prepared, err := (ClaudeAdapter{}).Prepare(PrepareInput{
 		BaseURL:    "http://127.0.0.1:43210",
 		Model:      model,
-		Binary:     "vekil-test-missing-claude-policy-binary",
+		Binary:     binary,
 		LocalToken: "test-token-placeholder",
+		DryRun:     true,
 	})
-	if err == nil || !strings.Contains(err.Error(), "policy") || !strings.Contains(err.Error(), "Anthropic ingress") {
-		t.Fatalf("Prepare() error = %v, want policy model Anthropic-ingress rejection", err)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
 	}
-	if errors.Is(err, ErrBinaryNotFound) {
-		t.Fatalf("Prepare() resolved the child binary before rejecting policy ownership: %v", err)
+	if prepared.Cleanup != nil {
+		t.Cleanup(func() { _ = prepared.Cleanup() })
+	}
+	if got := prepared.EnvSet["ANTHROPIC_MODEL"]; got != "policy-public" {
+		t.Fatalf("ANTHROPIC_MODEL = %q, want policy-public", got)
 	}
 }
 
@@ -413,6 +421,13 @@ func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
 		{name: "model", args: []string{"--model", "responses-only"}, want: "model or session overrides"},
 		{name: "model after prompt", args: []string{"--print", "hello", "--model", "responses-only"}, want: "model or session overrides"},
 		{name: "fallback model", args: []string{"--fallback-model", "other"}, want: "model or session overrides"},
+		{name: "dangerous permission bypass", args: []string{"--dangerously-skip-permissions"}, want: "permission bypass"},
+		{name: "enable dangerous permission bypass", args: []string{"--allow-dangerously-skip-permissions"}, want: "permission bypass"},
+		{name: "accept edits permission mode", args: []string{"--permission-mode", "acceptEdits"}, want: "permission mode"},
+		{name: "auto permission mode", args: []string{"--permission-mode=auto"}, want: "permission mode"},
+		{name: "bypass permission mode", args: []string{"--permission-mode", "bypassPermissions"}, want: "permission mode"},
+		{name: "dont ask permission mode", args: []string{"--permission-mode=dontAsk"}, want: "permission mode"},
+		{name: "plan permission mode", args: []string{"--permission-mode", "plan"}, want: "permission mode"},
 		{name: "resume", args: []string{"--resume"}, want: "model or session overrides"},
 		{name: "attached short resume", args: []string{"-rsession-id"}, want: "model or session overrides"},
 		{name: "session id", args: []string{"--session-id", "00000000-0000-0000-0000-000000000000"}, want: "model or session overrides"},
@@ -446,6 +461,36 @@ func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
 				t.Fatalf("Prepare() error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestClaudeAdapterAllowsDefaultPermissionModes(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	for _, args := range [][]string{
+		{"--permission-mode", "manual", "--print", "hello"},
+		{"--permission-mode=manual", "--print", "hello"},
+		{"--permission-mode", "default", "--print", "hello"},
+		{"--permission-mode=default", "--print", "hello"},
+	} {
+		prepared, err := (ClaudeAdapter{}).Prepare(PrepareInput{
+			BaseURL:       "http://127.0.0.1:43210",
+			Model:         ModelInfo{ID: "claude-public", SupportedEndpoints: []string{"/chat/completions"}},
+			Binary:        binary,
+			LocalToken:    "test-token-placeholder",
+			ForwardedArgs: args,
+		})
+		if err != nil {
+			t.Fatalf("Prepare(%#v) error = %v", args, err)
+		}
+		if prepared.Cleanup != nil {
+			defer func(cleanup func() error) { _ = cleanup() }(prepared.Cleanup)
+		}
+		if got := prepared.Args[len(prepared.Args)-len(args):]; !reflect.DeepEqual(got, args) {
+			t.Fatalf("forwarded args = %#v, want %#v", got, args)
+		}
 	}
 }
 

@@ -24,9 +24,10 @@ const (
 )
 
 type responsesChatStreamConfig struct {
-	PublicModel string
-	ReplayStore *responsesChatReplayStore
-	ReplayRoute responsesChatReplayRoute
+	PublicModel        string
+	ReplayStore        *responsesChatReplayStore
+	ReplayRoute        responsesChatReplayRoute
+	ReplayToolDefaults responsesChatReplayToolDefaults
 
 	PrecommitTimeout  time.Duration
 	PrecommitMaxBytes int
@@ -74,9 +75,10 @@ func (c *responsesChatStreamControl) closeBody() {
 
 func translateResponsesSSEToChat(ctx context.Context, body io.ReadCloser, options responsesChatResponseOptions) (*chatStreamEventStream, error) {
 	return prepareResponsesChatStream(ctx, body, responsesChatStreamConfig{
-		PublicModel: options.PublicModel,
-		ReplayStore: options.ReplayStore,
-		ReplayRoute: options.ReplayRoute,
+		PublicModel:        options.PublicModel,
+		ReplayStore:        options.ReplayStore,
+		ReplayRoute:        options.ReplayRoute,
+		ReplayToolDefaults: options.ReplayToolDefaults,
 	})
 }
 
@@ -1108,7 +1110,8 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 				return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "terminal function call does not match streamed arguments")
 			}
 			publishCalls = append(publishCalls, responsesChatReplayPublishCall{
-				UpstreamCallID: call.CallID, Name: call.Name, VisibleArguments: call.Arguments, OutputItemIndex: outputIndex,
+				UpstreamCallID: call.CallID, Name: call.Name, VisibleArguments: call.Arguments,
+				OptionalDefaults: s.config.ReplayToolDefaults[call.Name], OutputItemIndex: outputIndex,
 			})
 		case "reasoning":
 			terminalItemStatus := strings.TrimSpace(header.Status)

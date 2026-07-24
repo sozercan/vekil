@@ -393,7 +393,9 @@ func runStartupOperation[T any](
 		var zero T
 		return zero, fmt.Errorf("launch proxy failed before agent start: %w", normalizedProxyDoneError(proxyErr, ok))
 	case <-ctx.Done():
-		cancel()
+		// operationCtx is derived from ctx, which is already done. Let the parent
+		// cancellation propagate so a deadline cause is not downgraded to the
+		// explicit context.Canceled produced by cancel().
 		result := <-resultCh
 		if result.err != nil {
 			return result.value, result.err

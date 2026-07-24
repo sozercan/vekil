@@ -609,6 +609,7 @@ PASS forced-tool-and-continuation
 PASS parallel-distinct-tools
 PASS powerful-stream-canonical-identity
 PASS powerful-primary-429-real-secondary-failover
+PASS policy-responses-text
 PASS local-rejections-zero-upstream
 PASS public-only-stats-privacy-and-request-id
 EOF_MARKERS
@@ -621,7 +622,7 @@ EOF_MARKERS
 
   pass_count="$(grep -c '^PASS ' "${summary}" || true)"
   unique_count="$(grep '^PASS ' "${summary}" | sort -u | wc -l | tr -d ' ')"
-  [[ "${pass_count}" -eq 17 ]] || fail "summary PASS lines=${pass_count}, want 17"
+  [[ "${pass_count}" -eq 18 ]] || fail "summary PASS lines=${pass_count}, want 18"
   [[ "${unique_count}" -eq "${pass_count}" ]] || fail "summary contains duplicate PASS markers"
 }
 
@@ -770,8 +771,8 @@ main() {
   assert_wrapper_ports
   assert_ports_released
 
-  assert_mock_state lightweight 0 6
-  assert_mock_state primary 11 2
+  assert_mock_state lightweight 0 7
+  assert_mock_state primary 12 2
   assert_mock_state secondary 0 1
 
   assert_no_test_credentials "${HARNESS_STDOUT}"

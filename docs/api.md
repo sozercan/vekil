@@ -6,7 +6,7 @@ For an explicit `model_routes` entry, Vekil returns one proxy-owned `X-Vekil-Req
 
 ## `POST /v1/messages` (Anthropic)
 
-Schema-v2 policy public IDs are unsupported on this endpoint in v1 and fail locally. Use a direct public model/route ID for Anthropic Messages.
+Schema-v2 policy public IDs use the same bounded canonical Chat policy planner on this endpoint. The translated request must remain text/function-tool compatible; public responses and errors retain the policy ID.
 
 Anthropic Messages compatibility for the supported content and tool subset. Except for direct `anthropic-compatible` forwarding, requests are translated to canonical OpenAI Chat Completions, resolved through the route that owns the selected public model, executed by Vekil's shared Chat layer, and translated back to Anthropic. Native `/chat/completions` is preferred when allowed; otherwise a native `/responses` model is served through Chat-over-Responses. For `anthropic-compatible` providers, Vekil forwards Messages requests directly to the configured `messages_path`. An explicit route can switch only among its ordered equivalent targets and only before an Anthropic protocol preamble or semantic block is committed.
 
@@ -16,7 +16,7 @@ Model normalization strips dated suffixes such as `claude-sonnet-4-20250514` and
 
 ## `POST /v1/messages/count_tokens` (Anthropic)
 
-Schema-v2 policy public IDs are unsupported on count-token endpoints in v1. Policy routing does not make a classifier or terminal probe for this request.
+Schema-v2 policy public IDs translate count-token input to the canonical Chat probe, select the policy terminal under the active mode, suppress normal traffic statistics for the probe, and return the selected upstream's reported prompt-token usage.
 
 Anthropic count-tokens compatibility for clients such as Claude Code. For Chat-compatible providers, Vekil translates the Messages request to Chat Completions, sends a small non-streaming probe through the same Chat execution layer, and returns reported `usage.prompt_tokens` as Anthropic `input_tokens`. A native Chat model uses a one-output-token probe. Responses-native models require `max_output_tokens: 16`, so Vekil uses that upstream minimum, omits unsupported sampling controls, consumes usage only, and does not publish any tool replay state from the discarded probe completion. For `anthropic-compatible` providers, Vekil directly forwards count-tokens requests to `{messages_path}/count_tokens`.
 
@@ -54,7 +54,7 @@ Gemini compatibility is a translation layer over canonical Chat Completions. For
 
 ## `POST /v1/chat/completions` (OpenAI)
 
-When `model` resolves to a schema-v2 policy profile, Vekil applies the policy before normal route execution. V1 policy requests must be text-only and may use only standard function tools. Both policy destinations must expose native `/chat/completions`; policy selection never chooses a Responses-backed Chat route. Unsupported content or fields fail locally instead of falling through to a direct route.
+When `model` resolves to a schema-v2 policy profile, Vekil applies the policy before normal route execution. Policy requests must be text-only and may use only standard function tools. Both policy destinations must support canonical Chat through native `/chat/completions` or bounded Chat-over-Responses execution. Unsupported content or fields fail locally instead of falling through to a direct route.
 
 The policy's effective `off`/`observe`/`enforce` mode is bounded by the process-wide `--policy-routing` / `POLICY_ROUTING_MODE` ceiling. `off` and `observe` execute `baseline_tier`; observe classification is asynchronous and cannot change the response path. `enforce` selects one terminal tier synchronously, then seals that route before the first terminal send. Classifier admission/infrastructure failure uses `classifier_unavailable_tier`; abstention or invalid structured output uses `classifier_uncertain_tier`.
 
@@ -126,7 +126,7 @@ The client should restart that assistant tool-call turn rather than attempting t
 
 ## Responses Compatibility Endpoints
 
-Schema-v2 policy public IDs are unsupported on every Responses compatibility route in v1, including direct HTTP, the websocket bridge, compact, memory summarization, and Responses-backed Chat selection. Use a direct public model/route ID. Existing direct Responses behavior is unchanged.
+Schema-v2 policy public IDs are accepted by bounded stateless `POST /v1/responses` compatibility. It requires `store: false` or omitted, rejects `previous_response_id`, accepts text, bounded `text.format` (`text`, `json_object`, or `json_schema`) structured output, and function/namespace-child tools, converts the request to canonical Chat for policy planning, and converts the aggregated Chat result back to Responses JSON/SSE. Completed terminal output must honor required or forced `tool_choice` constraints. Hosted/custom tools, images, the websocket bridge, compact, memory summarization, and native Responses terminal selection remain unsupported for policy IDs. Existing direct Responses behavior is unchanged.
 
 Supported OpenAI/Codex-style routes:
 

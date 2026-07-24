@@ -50,7 +50,7 @@ brew install --cask sozercan/repo/vekil
 
 For explicit provider routing, start the proxy with `--providers-config /path/to/providers.{json,yaml}`.
 
-Schema-v2 policy routing defaults globally to `off`. V1 policy profiles support only text/function-tool `POST /v1/chat/completions` requests and one trusted user/tenant per deployment; see [Semantic Policy Routing](docs/policy-routing.md) before enabling `observe` or `enforce`.
+Schema-v2 policy routing defaults globally to `off`. Policy profiles use a text/function-tool canonical Chat contract, with translated Anthropic and bounded stateless Responses ingress for managed agents, and support one trusted user/tenant per deployment; see [Semantic Policy Routing](docs/policy-routing.md) before enabling `observe` or `enforce`.
 
 ### Launch a coding agent
 

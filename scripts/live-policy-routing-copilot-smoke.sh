@@ -341,7 +341,7 @@ select_copilot_models() {
     lightweight \
     "${LIVE_POLICY_ROUTING_COPILOT_LIGHTWEIGHT_MODEL:-}" \
     "" \
-    gpt-5.4-mini gpt-5-mini gpt-4.1 gpt-4o claude-haiku-4.5)"
+    claude-haiku-4.5 gpt-5.4-mini gpt-5-mini gpt-4.1 gpt-4o)"
   selected_classifier="$(pick_copilot_model \
     classifier \
     "${LIVE_POLICY_ROUTING_COPILOT_CLASSIFIER_MODEL:-}" \

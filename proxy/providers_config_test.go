@@ -1818,6 +1818,38 @@ func TestModelUsesCopilotTreatsPolicyEntryAsNonCopilotInMixedProviderConfig(t *t
 	}
 }
 
+func TestModelUsesCopilotFollowsPolicyTerminalRoutes(t *testing.T) {
+	noStore := false
+	cfg := policyIntegrationConfig("", "", policyConfigModeOff)
+	cfg.Providers = []ProviderConfig{{
+		ID:                         "copilot",
+		Type:                       string(providerTypeCopilot),
+		Default:                    true,
+		TrustDomain:                "github-copilot",
+		ClassifierNoStoreSupported: &noStore,
+	}}
+	for routeIndex := range cfg.ModelRoutes {
+		for targetIndex := range cfg.ModelRoutes[routeIndex].Targets {
+			cfg.ModelRoutes[routeIndex].Targets[targetIndex].Provider = "copilot"
+		}
+	}
+	cfg.PolicyProfiles[0].DataPolicy.AllowProviderRetention = true
+
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(cfg),
+		WithAllowedModels("coding-economy"),
+		WithDeferredDynamicProviderModelValidation(true),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	if !h.ModelUsesCopilot("coding-economy") {
+		t.Fatal("Copilot-backed policy public entry did not require Copilot authentication")
+	}
+}
+
 func TestModelUsesCopilotHonorsProviderFiltersDuringDeferredDiscovery(t *testing.T) {
 	t.Run("filtered default Copilot provider is skipped", func(t *testing.T) {
 		cfg := ProvidersConfig{Providers: []ProviderConfig{
