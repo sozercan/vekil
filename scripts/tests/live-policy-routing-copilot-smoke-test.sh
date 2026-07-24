@@ -99,10 +99,11 @@ child = subprocess.Popen(["sleep", "300"])
 pathlib.Path(os.environ["FAKE_BRIDGE_CHILD_PID_FILE"]).write_text(str(child.pid), encoding="utf-8")
 
 models = [
-    {"id": "gpt-5.4-mini", "supported_endpoints": ["/chat/completions"]},
-    {"id": "gpt-5.4", "supported_endpoints": ["/chat/completions", "/responses"]},
+    {"id": "gpt-5.4-mini", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low"]}}},
+    {"id": "gpt-5.4", "supported_endpoints": ["/chat/completions", "/responses"], "capabilities": {"supports": {"reasoning_effort": ["low", "high"]}}},
     {"id": "gpt-4.1", "supported_endpoints": ["/chat/completions"]},
-    {"id": "claude-sonnet-4.6", "supported_endpoints": ["/chat/completions"]},
+    {"id": "claude-sonnet-4.6", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high", "max"]}}},
+    {"id": "claude-opus-4.6", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high", "max"]}}},
     {"id": "responses-only", "supported_endpoints": ["/responses"]},
 ]
 
@@ -167,8 +168,10 @@ set -euo pipefail
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL}" == http://127.0.0.1:*/v1 ]]
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL}" == "gpt-5.4-mini" ]]
 [[ "${LIVE_POLICY_ROUTING_CLASSIFIER_MODEL}" == "gpt-4.1" ]]
-[[ "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL}" == "gpt-5.4" ]]
-[[ "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL}" == "claude-sonnet-4.6" ]]
+[[ "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL}" == "claude-sonnet-4.6" ]]
+[[ "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL}" == "claude-opus-4.6" ]]
+[[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT}" == "low" ]]
+[[ "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT}" == "max" ]]
 [[ "${LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED}" == "false" ]]
 [[ "${LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION}" == "true" ]]
 [[ -n "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY}" ]]
@@ -216,8 +219,8 @@ main() {
   jq -e '
     .lightweight == "gpt-5.4-mini"
     and .classifier == "gpt-4.1"
-    and .primary == "gpt-5.4"
-    and .secondary == "claude-sonnet-4.6"
+    and .primary == "claude-sonnet-4.6"
+    and .secondary == "claude-opus-4.6"
   ' "${RECORD}" >/dev/null || fail "wrapper selected unexpected Copilot models"
 
   local base port child_pid

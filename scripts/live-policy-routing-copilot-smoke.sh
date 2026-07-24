@@ -290,16 +290,22 @@ fetch_copilot_models() {
     "${bridge_base_url}/v1/models" > "${BRIDGE_MODELS}" \
     || die "GET ${bridge_base_url}/v1/models failed"
   chmod 600 "${BRIDGE_MODELS}"
-  jq -e '[.data[]? | select(((.supported_endpoints // []) | index("/chat/completions")) != null)] | length >= 2' \
-    "${BRIDGE_MODELS}" >/dev/null || die "Copilot bridge must advertise at least two native-Chat models"
+  jq -e '
+    def chat: ((.supported_endpoints // []) | index("/chat/completions")) != null;
+    def effort($value): ((.capabilities.supports.reasoning_effort // []) | index($value)) != null;
+    ([.data[]? | select(chat and effort("low"))] | length) >= 1
+    and ([.data[]? | select(chat and effort("max"))] | length) >= 2
+  ' "${BRIDGE_MODELS}" >/dev/null || die "Copilot bridge must advertise one native-Chat low-effort model and two native-Chat max-effort models"
 }
 
-model_supports_chat() {
+model_supports_chat_effort() {
   local model="$1"
-  jq -e --arg model "${model}" '
+  local effort="$2"
+  jq -e --arg model "${model}" --arg effort "${effort}" '
     .data[]?
     | select(.id == $model)
-    | ((.supported_endpoints // []) | index("/chat/completions")) != null
+    | (((.supported_endpoints // []) | index("/chat/completions")) != null)
+      and ($effort == "" or (((.capabilities.supports.reasoning_effort // []) | index($effort)) != null))
   ' "${BRIDGE_MODELS}" >/dev/null
 }
 
@@ -307,32 +313,34 @@ pick_copilot_model() {
   local label="$1"
   local override="$2"
   local excluded="$3"
-  shift 3
+  local required_effort="$4"
+  shift 4
   local candidate
 
   if [[ -n "${override}" ]]; then
     [[ "${override}" != "${excluded}" ]] || die "${label} override must differ from ${excluded}"
-    model_supports_chat "${override}" || die "${label} override ${override} is not a Copilot native-Chat model"
+    model_supports_chat_effort "${override}" "${required_effort}" || die "${label} override ${override} is not a Copilot native-Chat model supporting reasoning effort ${required_effort:-<any>}"
     printf '%s\n' "${override}"
     return 0
   fi
 
   for candidate in "$@"; do
     [[ "${candidate}" != "${excluded}" ]] || continue
-    if model_supports_chat "${candidate}"; then
+    if model_supports_chat_effort "${candidate}" "${required_effort}"; then
       printf '%s\n' "${candidate}"
       return 0
     fi
   done
 
-  candidate="$(jq -r --arg excluded "${excluded}" '
+  candidate="$(jq -r --arg excluded "${excluded}" --arg effort "${required_effort}" '
     [.data[]?
       | select((.id | type) == "string")
       | select(.id != $excluded)
       | select(((.supported_endpoints // []) | index("/chat/completions")) != null)
+      | select($effort == "" or (((.capabilities.supports.reasoning_effort // []) | index($effort)) != null))
       | .id][0] // ""
   ' "${BRIDGE_MODELS}")"
-  [[ -n "${candidate}" ]] || die "unable to select ${label} from Copilot native-Chat models"
+  [[ -n "${candidate}" ]] || die "unable to select ${label} from Copilot native-Chat models supporting reasoning effort ${required_effort:-<any>}"
   printf '%s\n' "${candidate}"
 }
 
@@ -341,21 +349,25 @@ select_copilot_models() {
     lightweight \
     "${LIVE_POLICY_ROUTING_COPILOT_LIGHTWEIGHT_MODEL:-}" \
     "" \
+    low \
     gpt-5.4-mini claude-haiku-4.5 gpt-5-mini gpt-4.1 gpt-4o)"
   selected_classifier="$(pick_copilot_model \
     classifier \
     "${LIVE_POLICY_ROUTING_COPILOT_CLASSIFIER_MODEL:-}" \
+    "" \
     "" \
     gpt-4.1 claude-sonnet-4.6 claude-haiku-4.5 gpt-5.4-mini gpt-5-mini gpt-5.4)"
   selected_primary="$(pick_copilot_model \
     powerful-primary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL:-}" \
     "" \
+    max \
     gpt-5.4 claude-sonnet-4.6 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
   selected_secondary="$(pick_copilot_model \
     powerful-secondary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL:-}" \
     "${selected_primary}" \
+    max \
     claude-sonnet-4.6 gpt-5.4 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
 
   jq -n \
