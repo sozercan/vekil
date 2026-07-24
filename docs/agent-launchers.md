@@ -173,10 +173,10 @@ path does not change terminal endpoint ownership.
 Claude's `output_config.effort` is carried into canonical Chat
 `reasoning_effort`. Direct routes preserve supported client effort. A policy
 profile never advertises client-selectable reasoning effort: an incoming value
-is accepted only when that profile configures tier `reasoning_effort`, and the
-classifier-selected `lightweight` or `powerful` value then replaces it. If the
-tier block is omitted, an incoming effort is rejected as unsupported and an
-omitted effort proceeds without a policy-owned override. Current Claude releases
+is accepted only when both tier objects configure `reasoning_effort`, and the
+classifier-selected `lightweight` or `powerful` value then replaces it. If both
+tier objects omit effort, incoming effort is rejected as unsupported and omitted
+effort proceeds without a policy-owned override. Current Claude releases
 may emit effort even when the user did not pass `--effort`, so managed Claude
 policy launches that need to accept that wire field should configure both tier
 values.
@@ -244,10 +244,10 @@ more than the native OpenAI/Azure 128-function ceiling; operators using a
 narrower terminal must reduce the enabled client catalog.
 
 Policy-owned models never advertise client-selectable reasoning effort. If
-Codex sends `reasoning.effort`, Vekil accepts it only for a profile with
-tier `reasoning_effort`; the classifier-selected tier value then replaces it.
-An unmapped profile rejects incoming effort as unsupported and injects no effort
-when the field is omitted.
+Codex sends `reasoning.effort`, Vekil accepts it only when both profile tiers
+configure `reasoning_effort`; the classifier-selected tier value then replaces
+it. If both tiers omit effort, an incoming value is rejected as unsupported and
+an omitted value remains omitted.
 
 With `--model`, a private temporary one-model Codex catalog is generated from
 the installed CLI's bundled catalog, with Vekil model context, reasoning,

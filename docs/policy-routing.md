@@ -190,7 +190,7 @@ Validation also rejects:
 - public/operational ID collisions in their applicable namespaces;
 - public metadata on an internal route;
 - recursive policy references;
-- a null or non-object tier `reasoning_effort`, or a present block with missing, empty, null, or unknown tier fields;
+- a null or non-object `lightweight`/`powerful` tier object, missing or unknown tier fields, or `reasoning_effort` configured on only one tier;
 - a tier reasoning value absent from its referenced terminal route's `reasoning_effort` allowlist;
 - destination routes without `/chat/completions` or `/responses` Chat execution support;
 - unsupported provider families or dynamic providers other than pinned `type: copilot` targets;
@@ -351,6 +351,17 @@ Mode-specific behavior:
 
 `vekil config validate` remains offline. Use `vekil config validate --live` when an operator wants the same protocol preflight without starting the server. A successful preflight proves protocol acceptance only; it does not prove external provider retention behavior.
 
+## Credentialed live CI coverage
+
+The required `semantic-policy-e2e` pull-request check runs two complementary credentialed matrices against GitHub Copilot:
+
+- a broad native-Chat matrix covering modes, tools, streaming, within-tier failover, identity, telemetry, privacy, and cleanup; and
+- an exact Responses-native Sol matrix in which both tiers target `gpt-5.6-sol` through public `POST /v1/responses`.
+
+The focused Sol matrix sends deliberately conflicting client effort values. A simple prompt supplies client `max` but must produce a successful classifier decision and a terminal `/v1/responses` request with `reasoning.effort: low`. A complex cross-module prompt supplies client `low` but must produce a successful classifier decision and terminal `reasoning.effort: max`. The capture shim records only request kind, path, model, effort, stream mode, and status; it also verifies every classifier request omits terminal effort and every public response retains `gpt-5.6-semantic` identity.
+
+[`scripts/live-policy-routing-sol-effort-smoke.sh`](../scripts/live-policy-routing-sol-effort-smoke.sh) implements the credentialed check. [`scripts/tests/live-policy-routing-sol-effort-smoke-test.sh`](../scripts/tests/live-policy-routing-sol-effort-smoke-test.sh) runs the same policy topology against a deterministic local Responses server and the real Vekil binary. Detailed local commands and CI wiring are documented in [Development](development.md).
+
 ## Catalog and output identity
 
 A policy profile appears exactly once in `/v1/models` with:
@@ -370,11 +381,11 @@ A policy profile appears exactly once in `/v1/models` with:
 
 Both destinations must accept the same published Chat semantics. Per-target wire adaptations may differ only when they do not alter that public contract.
 
-`model_routes[].reasoning_effort` remains each terminal route's capability allowlist. An optional the `lightweight` and `powerful` tier objects selects one allowed value for each tier. For a mapped profile, the planner seals the selected route and its configured effort together; request preparation then writes that value into canonical Chat before native-Chat or Chat-over-Responses execution. Every target attempt inside the selected route is rebuilt with the same sealed effort, while policy fallback never crosses tiers. An unmapped profile injects no effort.
+`model_routes[].reasoning_effort` remains each terminal route's capability allowlist. Optional `reasoning_effort` values inside the required `lightweight` and `powerful` tier objects select one allowed value for each tier. When both values are configured, the planner seals the selected route and effort together; request preparation then writes that value into canonical Chat before native-Chat or Chat-over-Responses execution. Every target attempt inside the selected route is rebuilt with the same sealed effort, while policy fallback never crosses tiers. When both tier values are omitted, the profile injects no effort.
 
-For a mapped profile, the selected tier effort is authoritative. A caller-supplied OpenAI Chat `reasoning_effort`, Anthropic `output_config.effort`, or Responses `reasoning.effort` is accepted and normalized into canonical Chat for compatibility, but the selected profile value replaces it after classification. Client effort cannot force a tier or override the profile. For an unmapped profile, an incoming effort is rejected as unsupported; an omitted effort proceeds without a policy-owned override. Direct non-policy routes retain their ordinary client-controlled reasoning behavior.
+When tier effort is configured, the selected value is authoritative. A caller-supplied OpenAI Chat `reasoning_effort`, Anthropic `output_config.effort`, or Responses `reasoning.effort` is accepted and normalized into canonical Chat for compatibility, but the selected profile value replaces it after classification. Client effort cannot force a tier or override the profile. When both tier objects omit effort, incoming effort is rejected as unsupported and omitted effort proceeds without a policy-owned override. Direct non-policy routes retain their ordinary client-controlled reasoning behavior.
 
-The private tier map is not published in `/v1/models` and does not change the policy model's public identity. Some terminal models reject reasoning effort together with function tools, so each configured tier value is an operator assertion about the corresponding route contract; Vekil does not infer compatibility from model names or silently remove the field when tools are present. Classifier requests never receive a terminal tier's effort.
+Private tier effort is not published in `/v1/models` and does not change the policy model's public identity. Some terminal models reject reasoning effort together with function tools, so each configured tier value is an operator assertion about the corresponding route contract; Vekil does not infer compatibility from model names or silently remove the field when tools are present. Classifier requests never receive a terminal tier's effort.
 
 For a policy request, public JSON, SSE, safe model headers, errors, and client-facing metrics use the policy profile's public ID. This identity rule also applies when an unsupported request shape or Gemini surface is rejected locally before classification. Provider, terminal route, target, and deployment IDs do not leak through normalized policy output. Upstream `X-Request-ID` and `Request-ID` values are omitted; clients receive only the proxy-owned `X-Vekil-Request-ID` correlation header. Direct-route output behavior remains unchanged.
 
@@ -394,7 +405,7 @@ Observe analysis is not representative unless admission is at least 95% in every
 Each bounded decision record carries IDs/enums/counts, latency/failure categories, and these generations:
 
 - `configGeneration`: canonical normalized complete providers configuration;
-- `profileGeneration`: normalized profile, including its tier reasoning map, derived public contract, terminal route IDs, and effective profile-wide request policy;
+- `profileGeneration`: normalized profile, including its tier route/effort objects, derived public contract, terminal route IDs, and effective profile-wide request policy;
 - `classifierGeneration`: classifier route/target/model plus fact schema, forced-function schema, classifier-prompt, and mapper versions; and
 - `binaryGeneration`: build version plus Git commit when available.
 

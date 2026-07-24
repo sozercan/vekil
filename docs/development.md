@@ -257,14 +257,16 @@ Fork and Dependabot pull requests neutral-skip because GitHub withholds reposito
 
 The default pull-request check is [`Live Copilot Semantic Policy Routing Smoke`](../.github/workflows/live-policy-routing-copilot-smoke.yaml), whose uniquely named job is `semantic-policy-e2e`. It reuses the repository's existing `COPILOT_GITHUB_TOKEN` rather than requiring a second set of provider credentials. [`scripts/live-policy-routing-copilot-smoke.sh`](../scripts/live-policy-routing-copilot-smoke.sh) starts a private zero-config Vekil bridge backed by Copilot, reads its `/v1/models` catalog, selects native-Chat models, and delegates to the common [`scripts/live-policy-routing-smoke.sh`](../scripts/live-policy-routing-smoke.sh) acceptance harness. It then runs [`scripts/live-policy-routing-sol-effort-smoke.sh`](../scripts/live-policy-routing-sol-effort-smoke.sh) against the same bridge with both policy tiers pinned to Responses-native `gpt-5.6-sol`: a simple prompt carries conflicting client `max` but must execute with tier `low`, while a complex prompt carries conflicting client `low` but must execute with tier `max`. The capture shim records only endpoint/model/effort metadata and verifies classifier requests never receive terminal reasoning effort.
 
-The wrapper still uses a private loopback bridge because the common smoke harness needs independently controllable static targets and fault injection. Production schema-v2 policy profiles may also target pinned models on a dynamic `type: copilot` provider directly, including Responses-backed Chat models. The wrapper removes `COPILOT_GITHUB_TOKEN` from the delegated harness environment, gives the bridge a private token directory, auto-selects a non-default loopback port, and verifies bridge/process-group cleanup.
+The bridge is intentional even though production schema-v2 policy profiles can target pinned models on a dynamic `type: copilot` provider directly, including Responses-backed Chat models. It gives the common smoke harness independently controllable static targets and fault injection, keeps the real Copilot token in one private bridge process, and permits metadata-only capture of the exact terminal `/responses` request without exposing credentials or request content. The wrapper removes `COPILOT_GITHUB_TOKEN` from delegated harness environments, gives the bridge a private token directory, auto-selects a non-default loopback port, and verifies bridge/process-group cleanup.
 
-By default the wrapper prefers these currently available model families, always requiring advertised native `/chat/completions` support and falling back to another catalog model when a preferred ID is absent:
+For the broad matrix, the wrapper selects only models whose catalog metadata advertises native `/chat/completions` support and the required tier effort. It falls back within these capability constraints when a preferred ID is absent:
 
-- lightweight: `gpt-5.4-mini`, `claude-haiku-4.5`, `gpt-5-mini`, `gpt-4.1`, then `gpt-4o`;
-- classifier: `gpt-4.1`, `claude-sonnet-4.6`, `claude-haiku-4.5`, then GPT-5 mini/full variants;
-- powerful primary: `gpt-5.4`, `claude-sonnet-4.6`, Codex variants, then `gpt-4.1`; and
-- powerful secondary: the first distinct compatible model from the same powerful preference set.
+- lightweight: a native-Chat model advertising `low`, preferring GPT mini variants;
+- classifier: any compatible native-Chat model, preferring `gpt-4.1` or Claude Sonnet;
+- powerful primary: a native-Chat model advertising `high`, preferring `gpt-5.4` and then compatible Gemini/Claude models; and
+- powerful secondary: a distinct native-Chat model advertising `high`, preferring a visible-text Gemini fallback before Claude reasoning models.
+
+The focused Sol matrix does not fall back: `gpt-5.6-sol` must advertise `/responses` plus both `low` and `max`, or the check fails.
 
 Optional repository variables pin a model instead of using dynamic selection:
 
