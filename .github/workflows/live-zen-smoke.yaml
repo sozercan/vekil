@@ -46,8 +46,12 @@ jobs:
         run: npm install -g @github/copilot@latest
 
       - name: Install Claude Code
+        env:
+          # 2.1.212 exits successfully but produces no normalized headless output
+          # against the Zen Chat path. Keep the last verified version pinned.
+          CLAUDE_CODE_VERSION: "2.1.211"
         run: |
-          curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 https://claude.ai/install.sh | bash -s stable
+          curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 https://claude.ai/install.sh | bash -s "$CLAUDE_CODE_VERSION"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install Gemini CLI
