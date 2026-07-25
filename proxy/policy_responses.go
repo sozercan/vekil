@@ -31,7 +31,9 @@ func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
-	policyPlan, err := h.planOpenAIChatPolicy(r.Context(), translated.PublicModel, translated.Body)
+	policyPlan, err := h.planOpenAIChatPolicyWithFactSourceLimit(
+		r.Context(), translated.PublicModel, translated.Body, policyResponsesMaxTranslatedChatBytes,
+	)
 	if err != nil {
 		if h.handleShutdownError(w, r, nil, err) {
 			return

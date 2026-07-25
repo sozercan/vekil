@@ -101,6 +101,31 @@ func TestPolicyResponsesIngressStreamsTextThroughBaselineChatRoute(t *testing.T)
 	}
 }
 
+func TestPolicyResponsesIngressAllowsBoundedCanonicalExpansion(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	h, err := NewProxyHandler(nil, logger.New(logger.ParseLevel("error")),
+		WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)),
+		WithPolicyRoutingMode(PolicyRoutingModeOff),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	body := policyResponsesCanonicalExpansionRequest(t, "coding-economy")
+	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body))))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if sends, models := light.snapshot(); sends != 1 || strings.Join(models, ",") != "light-model" {
+		t.Fatalf("light requests=%d models=%v", sends, models)
+	}
+	if sends, _ := powerful.snapshot(); sends != 0 {
+		t.Fatalf("powerful requests=%d", sends)
+	}
+}
+
 func TestPolicyResponsesIngressAllowsResolvedPolicyAliasWithinLaunchScope(t *testing.T) {
 	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
 	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})

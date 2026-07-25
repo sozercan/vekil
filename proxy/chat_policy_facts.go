@@ -32,6 +32,9 @@ const (
 type policyFactOptions struct {
 	RecentTurns     int
 	MaxRequestBytes int
+	// MaxSourceBytes is an internal ceiling for already-validated canonical
+	// request bodies. Zero preserves the 1 MiB public policy request limit.
+	MaxSourceBytes int
 }
 
 func (o policyFactOptions) normalized() (policyFactOptions, error) {
@@ -43,6 +46,12 @@ func (o policyFactOptions) normalized() (policyFactOptions, error) {
 	}
 	if o.MaxRequestBytes < policyFactMinRequestBytes || o.MaxRequestBytes > policyFactMaxRequestBytes {
 		return policyFactOptions{}, fmt.Errorf("max_request_bytes must be in %d..%d", policyFactMinRequestBytes, policyFactMaxRequestBytes)
+	}
+	if o.MaxSourceBytes == 0 {
+		o.MaxSourceBytes = policyFactMaxSourceBytes
+	}
+	if o.MaxSourceBytes < 1 || o.MaxSourceBytes > maxRequestBodySize {
+		return policyFactOptions{}, fmt.Errorf("max_source_bytes must be in 1..%d", maxRequestBodySize)
 	}
 	return o, nil
 }
@@ -165,12 +174,12 @@ type parsedPolicyFactMessage struct {
 // buildPolicyClassifierFacts validates the supported first-release Chat shape
 // and builds a deterministic, bounded facts snapshot from the original body.
 func buildPolicyClassifierFacts(body []byte, opts policyFactOptions) (policyClassifierFacts, error) {
-	if len(body) > policyFactMaxSourceBytes {
-		return policyClassifierFacts{}, newPolicyFactBuildError("", fmt.Sprintf("policy request exceeds %d-byte fact-processing limit", policyFactMaxSourceBytes))
-	}
 	normalized, err := opts.normalized()
 	if err != nil {
 		return policyClassifierFacts{}, err
+	}
+	if len(body) > normalized.MaxSourceBytes {
+		return policyClassifierFacts{}, newPolicyFactBuildError("", fmt.Sprintf("policy request exceeds %d-byte fact-processing limit", normalized.MaxSourceBytes))
 	}
 
 	root, err := decodePolicyFactObject(body, "")

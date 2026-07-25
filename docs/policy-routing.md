@@ -269,7 +269,7 @@ Classifier facts are built before tool-output optimization and contain bounded u
 - original byte counts and truncation flags.
 
 The serialized canonical facts JSON is capped at `max_request_bytes`; the fixed forced-tool Chat envelope is separately bounded by the implementation.
- Policy requests larger than 1 MiB are rejected before fact materialization so classifier admission cannot be bypassed with oversized message/tool arrays.
+Client policy requests larger than 1 MiB are rejected before translation or fact materialization so classifier admission cannot be bypassed with oversized message/tool arrays. The trusted policy Responses-to-Chat bridge may expand an accepted request while flattening namespace tools and adding canonical Chat wrappers; that internal body is separately capped at the ordinary 10 MiB Chat request ceiling before facts are built or a terminal route is selected.
 
 Vekil excludes provider credentials, inbound authorization, provider state, replay IDs, session identifiers, raw routing metadata, physical deployment names, function parameter schemas, and tool arguments. Classifier decisions and metrics also exclude prompt text and raw model output.
 

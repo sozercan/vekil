@@ -481,6 +481,8 @@ func TestBuildPolicyClassifierFactsRejectsInvalidOptionsAndJSON(t *testing.T) {
 		{RecentTurns: policyFactMaxRecentTurns + 1},
 		{MaxRequestBytes: policyFactMinRequestBytes - 1},
 		{MaxRequestBytes: policyFactMaxRequestBytes + 1},
+		{MaxSourceBytes: -1},
+		{MaxSourceBytes: maxRequestBodySize + 1},
 	} {
 		if _, err := buildPolicyClassifierFacts(validBody, opts); err == nil {
 			t.Fatalf("buildPolicyClassifierFacts(%#v) error = nil", opts)
