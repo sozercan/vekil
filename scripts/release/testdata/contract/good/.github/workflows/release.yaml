@@ -1,0 +1,137 @@
+name: Release fixture
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify release identity and prior state
+        run: |
+          scripts/release/verify-release-tag.sh "${GITHUB_REF_NAME}"
+          scripts/release/verify-required-workflows.sh "${GITHUB_SHA}" CI CodeQL
+          scripts/release/check-image-tag-absent.sh "ghcr.io/example/vekil:${GITHUB_REF_NAME}"
+          scripts/release/query-github-release.sh "${GITHUB_REF_NAME}"
+
+  build-cli:
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Build staged CLI files
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94
+        with:
+          distribution: goreleaser
+          version: v2.17.1
+          args: release --clean --skip=publish
+
+  evidence:
+    needs: build-cli
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Generate and verify evidence
+        run: |
+          scripts/release/generate-release-manifest.py --artifact-dir dist --output dist/release-manifest.json
+          scripts/release/verify-release-manifest.py --artifact-dir dist --manifest dist/release-manifest.json
+
+  publish-release:
+    needs: evidence
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Publish immutable release assets
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --draft
+          gh release upload "${GITHUB_REF_NAME}" dist/*
+          gh release edit "${GITHUB_REF_NAME}" --draft=false
+
+  post-publish:
+    needs: publish-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in for read-only image verification
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Verify published assets
+        run: scripts/release/verify-published-release.py --manifest dist/release-manifest.json
+
+  promote-latest:
+    needs: post-publish
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-alias-promotion
+      cancel-in-progress: false
+      queue: max
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Promote mutable alias without rebuilding
+        run: |
+          gh api repos/example/vekil/releases/latest
+          previous_standard=sha256:${IMAGE_DIGEST}
+          previous_rtk=sha256:${IMAGE_DIGEST}
+          rollback_aliases() { printf '%s %s\n' "${previous_standard}" "${previous_rtk}" >/dev/null; }
+          docker buildx imagetools create --tag ghcr.io/example/vekil:latest "ghcr.io/example/vekil@${IMAGE_DIGEST}"
+
+  homebrew-pr:
+    needs: post-publish
+    runs-on: ubuntu-latest
+    environment: homebrew
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Vekil
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Checkout Homebrew tap for branch push
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: example/homebrew-repo
+          path: homebrew-repo
+          token: ${{ secrets.HOMEBREW_REPO_TOKEN }}
+          persist-credentials: true
+      - name: Push release branch and open PR
+        env:
+          HOMEBREW_REPO_TOKEN: ${{ secrets.HOMEBREW_REPO_TOKEN }}
+        run: |
+          git -C homebrew-repo push origin "HEAD:refs/heads/release-${GITHUB_REF_NAME}"
+          gh pr create --repo example/homebrew-repo --head "release-${GITHUB_REF_NAME}" --base main --title "Release ${GITHUB_REF_NAME}"
+          printf '%s\n' isCrossRepository headRepositoryOwner headRefOid >/dev/null

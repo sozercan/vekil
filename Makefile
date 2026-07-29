@@ -7,6 +7,7 @@ VERSION ?= dev-$(shell git rev-parse --short HEAD)
 APP_VERSION := $(patsubst v%,%,$(VERSION))
 APP_CGO_LDFLAGS = -F$(abspath $(SPARKLE_UNPACK_DIR)) -Wl,-rpath,@executable_path/../Frameworks
 SPARKLE_VERSION := 2.9.0
+SPARKLE_ARCHIVE_SHA256 := 01e0f0ebf6614061ea816d414de50f937d64ffa6822ad572243031ca3676fe19
 SPARKLE_BUILD_DIR := .build/sparkle
 SPARKLE_ARCHIVE := $(SPARKLE_BUILD_DIR)/Sparkle-$(SPARKLE_VERSION).tar.xz
 SPARKLE_UNPACK_DIR := $(SPARKLE_BUILD_DIR)/unpacked
@@ -22,9 +23,15 @@ build:
 
 $(SPARKLE_ARCHIVE):
 	@mkdir -p "$(SPARKLE_BUILD_DIR)"
-	curl -fL "$(SPARKLE_DOWNLOAD_URL)" -o "$(SPARKLE_ARCHIVE)"
+	@set -eu; \
+		tmp="$(SPARKLE_ARCHIVE).tmp"; \
+		trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+		curl -fL --retry 3 "$(SPARKLE_DOWNLOAD_URL)" -o "$$tmp"; \
+		printf '%s  %s\n' "$(SPARKLE_ARCHIVE_SHA256)" "$$tmp" | shasum -a 256 -c -; \
+		mv "$$tmp" "$(SPARKLE_ARCHIVE)"
 
 $(SPARKLE_FRAMEWORK): $(SPARKLE_ARCHIVE)
+	@printf '%s  %s\n' "$(SPARKLE_ARCHIVE_SHA256)" "$(SPARKLE_ARCHIVE)" | shasum -a 256 -c -
 	@rm -rf "$(SPARKLE_UNPACK_DIR)"
 	@mkdir -p "$(SPARKLE_UNPACK_DIR)"
 	tar -xf "$(SPARKLE_ARCHIVE)" -C "$(SPARKLE_UNPACK_DIR)"

@@ -1,0 +1,14 @@
+.git
+.github
+.build
+dist
+Vekil.app
+vekil
+vekil-tray
+*.log
+providers.json
+providers.yaml
+providers.yml
+provider-v3.yaml
+release
+dry-run

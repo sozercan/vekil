@@ -1,0 +1,39 @@
+title = "Vekil release secret-scanning policy"
+
+[extend]
+useDefault = true
+
+# Deterministic canary used by scripts/tests/release-helpers-test.sh. Keeping a
+# project-specific rule makes the negative test independent of upstream rule
+# churn while normal scans still inherit the complete default ruleset.
+[[rules]]
+id = "vekil-release-canary"
+description = "Vekil release-pipeline synthetic canary"
+regex = '''VEKIL_RELEASE_CANARY_[A-Za-z0-9]{24,}'''
+keywords = ["VEKIL_RELEASE_CANARY_"]
+
+# This exact literal is source for the redaction self-test. Both the exact match
+# and exact reviewed path must agree; copying it anywhere else remains a leak.
+[[rules.allowlists]]
+description = "Release helper redaction self-test literal"
+condition = "AND"
+regexTarget = "match"
+regexes = [
+  '''^VEKIL_RELEASE_CANARY_ThisMustRemainRedacted0001$''',
+]
+paths = [
+  '''(?:^|/)scripts/tests/release-helpers-test\.sh$''',
+]
+
+# One documentation-only fixture proves that path-scoped allowlisting works.
+# The same canary value at any other path remains reportable.
+[[rules.allowlists]]
+description = "Reviewed documentation fixture"
+condition = "AND"
+regexTarget = "match"
+regexes = [
+  '''^VEKIL_RELEASE_CANARY_DocumentationFixture0001$''',
+]
+paths = [
+  '''(?:^|/)scripts/release/testdata/gitleaks/allowed-canary\.txt$''',
+]

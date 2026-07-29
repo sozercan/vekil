@@ -26,6 +26,7 @@ scripts/tests/live-chat-over-responses-smoke-test.sh  # deterministic Chat-over-
 scripts/tests/live-policy-routing-smoke-test.sh  # deterministic semantic-policy process/cleanup gates
 scripts/tests/live-policy-routing-copilot-smoke-test.sh  # deterministic Copilot bridge/model-selection wrapper gate
 scripts/tests/live-policy-routing-sol-effort-smoke-test.sh  # deterministic Responses-native Sol low/max routing gate
+scripts/tests/publish-homebrew-cask-test.sh  # deterministic cask rendering and input-safety gate
 ```
 
 `cmd/compaction-lab` starts an in-process proxy and fake `/responses` upstream, then exercises the compact-response shape, opaque compaction replay, remote compaction v2 trigger handling, and websocket `response.processed` control frames. It is intended as a quick deterministic check for compaction regressions before running live Copilot smoke tests.
@@ -183,7 +184,7 @@ make lint
 
 ## CI
 
-GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs on pushes to `main` and pull requests targeting `main`. Its jobs cover lint, tests, the full race detector, the `windows-launch` and `darwin-launch` launcher lifecycle checks, build, vet, a Kubernetes/kind operational smoke, and e2e validation. Every job has a job-level deadline. The test job runs [`scripts/tests/live-smoke-reliability-test.sh`](../scripts/tests/live-smoke-reliability-test.sh) with local mock servers and fake CLIs so stale-listener, timeout, per-client, and descendant-cleanup failures are deterministic, plus real-binary process harnesses: [`scripts/tests/live-provider-routing-smoke-test.sh`](../scripts/tests/live-provider-routing-smoke-test.sh) exercises schema-v2 two-target failover against controlled loopback Responses servers; [`scripts/tests/live-policy-routing-smoke-test.sh`](../scripts/tests/live-policy-routing-smoke-test.sh) exercises semantic-policy modes, classifier/terminal accounting, controlled failover, automatic non-default port selection, redaction, and process-group cleanup against local Chat-compatible shims; [`scripts/tests/live-policy-routing-copilot-smoke-test.sh`](../scripts/tests/live-policy-routing-copilot-smoke-test.sh) verifies Copilot bridge catalog selection, secret isolation, non-default ports, and descendant cleanup without contacting Copilot; and [`scripts/tests/live-policy-routing-sol-effort-smoke-test.sh`](../scripts/tests/live-policy-routing-sol-effort-smoke-test.sh) proves conflicting public Responses effort is replaced with prompt-selected Sol `low`/`max` effort while classifier requests remain effort-free.
+GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs on pushes to `main` and pull requests targeting `main`. Its jobs cover the release workflow/action/Docker contract, pinned `actionlint`, `govulncheck`, source secret scanning, pull-request dependency review, lint, tests, the full race detector, the `windows-launch` and `darwin-launch` launcher lifecycle checks, build, vet, a Kubernetes/kind operational smoke, and e2e validation. Every job has a job-level deadline. The test job runs [`scripts/tests/live-smoke-reliability-test.sh`](../scripts/tests/live-smoke-reliability-test.sh) with local mock servers and fake CLIs so stale-listener, timeout, per-client, and descendant-cleanup failures are deterministic, plus real-binary process harnesses: [`scripts/tests/live-provider-routing-smoke-test.sh`](../scripts/tests/live-provider-routing-smoke-test.sh) exercises schema-v2 two-target failover against controlled loopback Responses servers; [`scripts/tests/live-policy-routing-smoke-test.sh`](../scripts/tests/live-policy-routing-smoke-test.sh) exercises semantic-policy modes, classifier/terminal accounting, controlled failover, automatic non-default port selection, redaction, and process-group cleanup against local Chat-compatible shims; [`scripts/tests/live-policy-routing-copilot-smoke-test.sh`](../scripts/tests/live-policy-routing-copilot-smoke-test.sh) verifies Copilot bridge catalog selection, secret isolation, non-default ports, and descendant cleanup without contacting Copilot; and [`scripts/tests/live-policy-routing-sol-effort-smoke-test.sh`](../scripts/tests/live-policy-routing-sol-effort-smoke-test.sh) proves conflicting public Responses effort is replaced with prompt-selected Sol `low`/`max` effort while classifier requests remain effort-free.
 
 The kind smoke builds the PR image and renders the checked-in [`k8s/vekil.yaml`](../k8s/vekil.yaml), patching only the test namespace, local image/pull policy, and the deterministic provider config used in its second phase. It verifies that the `/healthz` startup probe has a coherent 60–90 second failure budget before liveness/readiness begin. It then deploys without Copilot credentials and verifies that `/healthz` remains live, the liveness probe causes zero restarts, `/readyz` stays gated, the Pod is not Ready, and the Service has no ready endpoint. Finally it rolls out a static configured provider and verifies that the same readiness probe admits the Pod and Service endpoint. The script uses an isolated kubeconfig, bounds cluster/API/port-forward work, and requires the live `kubectl port-forward` PID plus its exact listener log before accepting HTTP responses.
 
@@ -206,21 +207,28 @@ The macOS tray app has its own workflow in [`.github/workflows/macos-app.yaml`](
 
 ## Release
 
-Tag pushes to [`.github/workflows/release.yaml`](../.github/workflows/release.yaml) use [`.goreleaser.yaml`](../.goreleaser.yaml) to publish the CLI binaries and checksums to GitHub Releases for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`.
+The hardened release contract is documented in [Release Security](release-security.md). Production releases start only from exact SemVer annotated tags signed with the approved SSH key. The release preflight verifies the tag object, signature principal and fingerprint, `origin/main` ancestry, exact-commit CI state, and absence of conflicting GitHub Release or GHCR version state before any write permission or protected secret is available.
+
+Configure these public repository variables:
+
+- `RELEASE_SIGNING_PUBLIC_KEY`
+- `RELEASE_SIGNING_PRINCIPAL`
+- `RELEASE_SIGNING_FINGERPRINT`
+- `SPARKLE_PUBLIC_ED_KEY`
+
+Configure a protected `release` environment with required reviewers and the `SPARKLE_PRIVATE_ED_KEY` environment secret. Configure a separate protected `homebrew` environment with a least-privilege `HOMEBREW_REPO_TOKEN` (or equivalent GitHub App credential) that can create a branch and pull request in `sozercan/homebrew-repo` but cannot bypass default-branch protection. Do not keep either private credential as an unprotected repository secret.
+
+The release path builds CLI and macOS files once into short-lived staging artifacts, builds versioned OCI images once, and verifies checksums, SBOMs, scans, smoke tests, and GitHub attestations before finalization. GoReleaser stages CLI binaries for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`; the separate published app bundle is Apple Silicon only. The finalizer publishes the staged bytes without `--clobber`; versioned assets and image tags are never replaced. For stable releases, `latest` and `latest-rtk` move by verified digest only after all versioned outputs pass; prereleases never move those aliases. Post-publication verification re-downloads and re-hashes the release, verifies provenance with `gh attestation verify`, validates the Sparkle feed, and opens a reviewed Homebrew release PR using an independently recomputed archive checksum.
+
+Run the focused cask renderer test after changing Homebrew publication inputs or output:
+
+```bash
+scripts/tests/publish-homebrew-cask-test.sh
+```
+
+Use the release workflow's manual dry-run before changing release tooling or creating the first production tag after such a change. Dry-run jobs receive no production publication or signing credentials and publish only short-lived evidence artifacts. See [Release Security](release-security.md#dry-run) for the expected evidence and [incident response](release-security.md#incident-response-and-rollback) for withdrawal, key rotation, mutable-alias rollback, and emergency patch rules.
 
 RTK version bumps for the optional Docker variant are automated by [`.github/workflows/update-rtk.yaml`](../.github/workflows/update-rtk.yaml). The scheduled workflow runs [`scripts/update-rtk-version.sh`](../scripts/update-rtk-version.sh), updates the pinned `RTK_VERSION` Docker build arg in `Dockerfile.rtk` when `rtk-ai/rtk` publishes a new latest release, validates the rebuilt variant with `make docker-build-rtk` and `make docker-rtk-e2e`, and opens a signed PR.
-
-The same release workflow also:
-
-- builds `vekil-macos-arm64.zip` on a macOS runner and uploads it to the tagged release
-- generates and uploads `appcast.xml` for Sparkle update checks
-- updates the `vekil` cask in `sozercan/homebrew-repo`
-- pushes the multi-arch container image to GHCR
-- pushes the `-rtk` multi-arch container image variant to GHCR
-
-To publish the Homebrew cask, configure the repository secret `HOMEBREW_REPO_TOKEN` with push access to `sozercan/homebrew-repo`.
-
-To publish Sparkle updates, configure both `SPARKLE_PUBLIC_ED_KEY` and `SPARKLE_PRIVATE_ED_KEY` in the repository secrets.
 
 ## Live Copilot Smoke Workflow
 

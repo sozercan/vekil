@@ -2,173 +2,1653 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags:
+      - "v*"
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GORELEASER_VERSION: v2.17.1
+  TRIVY_VERSION: v0.72.0
+  RELEASE_ARTIFACT_RETENTION_DAYS: "3"
 
 jobs:
-  release:
+  preflight:
+    name: Verify release identity and source
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      version: ${{ steps.identity.outputs.version }}
+      commit: ${{ steps.identity.outputs.commit }}
+      tag_object: ${{ steps.identity.outputs.tag_object }}
+      prerelease: ${{ steps.identity.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out the signed tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - name: Verify annotated signed tag and mainline ancestry
+        id: identity
+        env:
+          RELEASE_SIGNING_PUBLIC_KEY: ${{ vars.RELEASE_SIGNING_PUBLIC_KEY }}
+          RELEASE_SIGNING_PRINCIPAL: ${{ vars.RELEASE_SIGNING_PRINCIPAL }}
+          RELEASE_SIGNING_FINGERPRINT: ${{ vars.RELEASE_SIGNING_FINGERPRINT }}
+        run: scripts/release/verify-release-tag.sh "${GITHUB_REF_NAME}"
+
+      - name: Verify required workflows passed on the exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/release/verify-required-workflows.sh \
+            "${{ steps.identity.outputs.commit }}" \
+            "CI" "CodeQL" "macOS App"
+
+      - name: Reject an existing GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          set +e
+          scripts/release/query-github-release.sh "${RELEASE_TAG}" existing-release.json >/dev/null
+          query_status="$?"
+          set -e
+          case "${query_status}" in
+            0)
+              echo "release ${RELEASE_TAG} already exists; published releases are never replaced" >&2
+              exit 1
+              ;;
+            4) ;;
+            *) exit "${query_status}" ;;
+          esac
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
-      - name: Test
-        run: make test
+      - name: Install pinned security tools
+        run: scripts/release/install-tools.sh actionlint govulncheck gitleaks
 
-      - name: Run GoReleaser
+      - name: Run release contract tests
+        run: scripts/release/test-release-workflow.sh
+
+      - name: Validate expiring vulnerability exceptions
+        run: scripts/release/validate-vulnerability-exceptions.py
+
+      - name: Test and vet the exact release commit
+        run: |
+          make test
+          make vet
+
+      - name: Run reachable Go vulnerability analysis
+        run: govulncheck ./...
+
+      - name: Scan release source for secrets
+        run: scripts/release/scan-secrets.sh .
+
+      - name: Reject existing versioned OCI tags
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          scripts/release/check-image-tag-absent.sh \
+            "ghcr.io/${GITHUB_REPOSITORY}:${{ steps.identity.outputs.tag }}" \
+            "ghcr.io/${GITHUB_REPOSITORY}:${{ steps.identity.outputs.tag }}-rtk"
+
+  build-cli:
+    name: Build staged CLI artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: preflight
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install pinned SBOM tool
+        run: scripts/release/install-tools.sh syft
+
+      - name: Build once with pinned GoReleaser
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
-          version: "~> v2"
-          args: release --clean
+          version: v2.17.1
+          args: release --clean --skip=publish
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ needs.preflight.outputs.tag }}
 
-  macos-app:
+      - name: Stage binaries, checksums, SBOMs, and build evidence
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          jq -r '.[] | select(.type == "Binary" and (.name | test("^vekil-(darwin|linux|windows)-"))) | [.path, .name] | @tsv' dist/artifacts.json \
+            | while IFS=$'\t' read -r source name; do cp "${source}" "release/${name}"; done
+          cp dist/checksums.txt release/checksums.txt
+          test "$(find release -maxdepth 1 -type f -name 'vekil-*' | wc -l | tr -d ' ')" -eq 6
+          (cd release && sha256sum --check checksums.txt)
+
+          for binary in release/vekil-*; do
+            syft "file:${binary}" --output "spdx-json=${binary}.spdx.json"
+          done
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          root = pathlib.Path("release")
+          files = []
+          for path in sorted(root.iterdir()):
+              if path.is_file():
+                  files.append({
+                      "name": path.name,
+                      "size": path.stat().st_size,
+                      "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                  })
+          metadata = {
+              "tag": os.environ["RELEASE_TAG"],
+              "commit": os.environ["RELEASE_COMMIT"],
+              "go_version": subprocess.check_output(["go", "version"], text=True).strip(),
+              "goreleaser_version": os.environ["GORELEASER_VERSION"],
+              "build_flags": ["CGO_ENABLED=0", "-ldflags=-s -w"],
+              "files": files,
+          }
+          (root / "cli-build-metadata.json").write_text(
+              json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+          )
+          PY
+
+      - name: Upload staged CLI artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-release-${{ github.run_id }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: ${{ env.RELEASE_ARTIFACT_RETENTION_DAYS }}
+          overwrite: false
+
+  build-macos:
+    name: Build staged macOS app
     runs-on: macos-26
-    needs: release
-    outputs:
-      app_sha256: ${{ steps.sha256.outputs.value }}
+    timeout-minutes: 30
+    needs: preflight
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out the verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
-      - name: Require Sparkle keys
+      - name: Install pinned SBOM tool
+        run: scripts/release/install-tools.sh syft
+
+      - name: Require the reviewed Sparkle public key
         env:
-          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
-          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
         run: |
-          if [ -z "$SPARKLE_PUBLIC_ED_KEY" ] || [ -z "$SPARKLE_PRIVATE_ED_KEY" ]; then
-            echo "SPARKLE_PUBLIC_ED_KEY and SPARKLE_PRIVATE_ED_KEY are required to publish Sparkle updates" >&2
+          test -n "${SPARKLE_PUBLIC_ED_KEY}" || {
+            echo "repository variable SPARKLE_PUBLIC_ED_KEY is required" >&2
             exit 1
-          fi
+          }
 
-      - name: Build macOS menubar app
+      - name: Build and verify the ad-hoc signed app bundle
         env:
-          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
-        run: VERSION=${GITHUB_REF#refs/tags/} GOARCH=arm64 make build-app
-
-      - name: Archive app bundle
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+          VERSION: ${{ needs.preflight.outputs.tag }}
         run: |
-          mkdir -p dist/macos-release
-          ditto -c -k --sequesterRsrc --keepParent "Vekil.app" dist/macos-release/"vekil-macos-arm64.zip"
+          GOARCH=arm64 make build-app
+          mkdir -p release
+          codesign --verify --deep --strict --verbose=4 Vekil.app 2>&1 | tee release/codesign-verification.txt
 
-      - name: Generate Sparkle appcast
+      - name: Stage macOS archive, SBOM, checksums, and build evidence
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+        run: |
+          set -euo pipefail
+          ditto -c -k --sequesterRsrc --keepParent Vekil.app release/vekil-macos-arm64.zip
+          syft dir:Vekil.app --output spdx-json=release/vekil-macos-arm64.spdx.json
+          (cd release && shasum -a 256 vekil-macos-arm64.zip > macos-checksums.txt)
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+
+          makefile = pathlib.Path("Makefile").read_text()
+          version = re.search(r"^SPARKLE_VERSION := (.+)$", makefile, re.MULTILINE).group(1)
+          digest = re.search(r"^SPARKLE_ARCHIVE_SHA256 := (.+)$", makefile, re.MULTILINE).group(1)
+          archive = pathlib.Path("release/vekil-macos-arm64.zip")
+          metadata = {
+              "tag": os.environ["RELEASE_TAG"],
+              "commit": os.environ["RELEASE_COMMIT"],
+              "go_version": subprocess.check_output(["go", "version"], text=True).strip(),
+              "codesign": "ad-hoc; not Developer ID signed or notarized",
+              "sparkle_version": version,
+              "sparkle_archive_sha256": digest,
+              "archive": {
+                  "name": archive.name,
+                  "size": archive.stat().st_size,
+                  "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+              },
+          }
+          pathlib.Path("release/macos-build-metadata.json").write_text(
+              json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+          )
+          PY
+
+      - name: Upload staged macOS artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-package-${{ github.run_id }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: ${{ env.RELEASE_ARTIFACT_RETENTION_DAYS }}
+          overwrite: false
+
+  sign-macos-feed:
+    name: Sign staged Sparkle feed
+    runs-on: macos-26
+    timeout-minutes: 15
+    needs: [preflight, build-macos]
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Check out verified release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          persist-credentials: false
+
+      - name: Download staged macOS artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: macos-package-${{ github.run_id }}
+          path: release
+          digest-mismatch: error
+
+      - name: Install the checksum-verified Sparkle tools
+        run: make .build/sparkle/unpacked/Sparkle.framework
+
+      - name: Reverify remote tag before using the Sparkle key
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+        run: scripts/release/verify-remote-tag-state.sh "${RELEASE_TAG}" "${RELEASE_TAG_OBJECT}" "${RELEASE_COMMIT}"
+
+      - name: Generate and verify the signed appcast
         env:
           SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
-          printf '%s' "$SPARKLE_PRIVATE_ED_KEY" | .build/sparkle/unpacked/bin/generate_appcast \
-            --ed-key-file - \
-            --download-url-prefix "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/" \
-            --full-release-notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}" \
+          set -euo pipefail
+          set +x
+          test -n "${SPARKLE_PRIVATE_ED_KEY}" || {
+            echo "release environment secret SPARKLE_PRIVATE_ED_KEY is required" >&2
+            exit 1
+          }
+
+          key_file="$(mktemp)"
+          cleanup() {
+            local key_size
+            chmod 600 "${key_file}" 2>/dev/null || true
+            key_size="$(wc -c <"${key_file}" 2>/dev/null | tr -d ' ' || true)"
+            if [[ "${key_size}" =~ ^[0-9]+$ ]] && (( key_size > 0 )); then
+              dd if=/dev/zero of="${key_file}" bs=1 count="${key_size}" conv=notrunc >/dev/null 2>&1 || true
+            fi
+            : >"${key_file}" 2>/dev/null || true
+            rm -f "${key_file}"
+          }
+          trap cleanup EXIT
+          umask 077
+          printf '%s' "${SPARKLE_PRIVATE_ED_KEY}" >"${key_file}"
+          unset SPARKLE_PRIVATE_ED_KEY
+
+          .build/sparkle/unpacked/bin/generate_appcast \
+            --ed-key-file "${key_file}" \
+            --download-url-prefix "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/" \
+            --full-release-notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}" \
             --maximum-deltas 0 \
-            dist/macos-release
+            -o release/appcast.xml \
+            release
 
-      - name: Upload macOS updater assets to release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF#refs/tags/}" dist/macos-release/vekil-macos-arm64.zip dist/macos-release/appcast.xml --clobber
+          scripts/release/verify-sparkle-update.sh \
+            release/vekil-macos-arm64.zip \
+            release/appcast.xml \
+            "${SPARKLE_PUBLIC_ED_KEY}" \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/vekil-macos-arm64.zip" \
+            "${RELEASE_VERSION}"
 
-      - name: Calculate macOS app SHA256
-        id: sha256
-        run: echo "value=$(shasum -a 256 dist/macos-release/vekil-macos-arm64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          python3 - "${key_file}" release <<'PY'
+          import pathlib
+          import sys
 
-  publish:
+          key = pathlib.Path(sys.argv[1]).read_bytes()
+          if not key:
+              raise SystemExit("Sparkle private key file is empty")
+          for path in pathlib.Path(sys.argv[2]).iterdir():
+              if path.is_file() and key in path.read_bytes():
+                  raise SystemExit(f"Sparkle private key material leaked into {path.name}")
+          PY
+
+          (cd release && shasum -a 256 appcast.xml >> macos-checksums.txt)
+          sort -o release/macos-checksums.txt release/macos-checksums.txt
+
+      - name: Upload signed macOS release payload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-release-${{ github.run_id }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: ${{ env.RELEASE_ARTIFACT_RETENTION_DAYS }}
+          overwrite: false
+
+  scan-release-artifacts:
+    name: Scan staged release artifacts
     runs-on: ubuntu-latest
-    needs: release
+    timeout-minutes: 20
+    needs: [preflight, build-cli, sign-macos-feed]
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out verified release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          persist-credentials: false
+
+      - name: Download staged CLI artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: cli-release-${{ github.run_id }}
+          path: release
+          digest-mismatch: error
+
+      - name: Download staged macOS artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: macos-release-${{ github.run_id }}
+          path: release
+          digest-mismatch: error
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install pinned secret scanner
+        run: scripts/release/install-tools.sh gitleaks
+
+      - name: Verify checksums and required evidence
+        run: |
+          set -euo pipefail
+          (cd release && sha256sum --check checksums.txt)
+          (cd release && sha256sum --check macos-checksums.txt)
+          test "$(find release -maxdepth 1 -type f -name '*.spdx.json' | wc -l | tr -d ' ')" -ge 7
+          test -s release/cli-build-metadata.json
+          test -s release/macos-build-metadata.json
+          test -s release/codesign-verification.txt
+          test -s release/appcast.xml
+
+      - name: Scan binaries, SBOMs, app bundle, and updater payload for secrets
+        run: |
+          set -euo pipefail
+          mkdir expanded-macos
+          unzip -q release/vekil-macos-arm64.zip -d expanded-macos
+          scripts/release/scan-secrets.sh release expanded-macos
+          printf '{"scanner":"gitleaks","version":"%s","findings":0}\n' "$(gitleaks version)" >release/artifact-secret-scan.json
+
+      - name: Upload verified release payload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-payload-${{ github.run_id }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: ${{ env.RELEASE_ARTIFACT_RETENTION_DAYS }}
+          overwrite: false
+
+  publish-standard-image:
+    name: Publish immutable standard OCI image
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    needs: preflight
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Check out the verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up exact Docker Engine
+        uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5.4.0
+        with:
+          version: v29.6.2
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.35.0
+          driver-opts: image=docker.io/moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
 
       - name: Log in to GHCR
         uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
-      - name: Extract version
-        id: version
-        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+      - name: Reverify remote tag before standard image publication
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+        run: scripts/release/verify-remote-tag-state.sh "${RELEASE_TAG}" "${RELEASE_TAG_OBJECT}" "${RELEASE_COMMIT}"
 
-      - name: Build and push
+      - name: Recheck immutable standard tag availability
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/release/check-image-tag-absent.sh "ghcr.io/${GITHUB_REPOSITORY}:${{ needs.preflight.outputs.tag }}"
+
+      - name: Build and push the immutable standard image once
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.tag }}
-            ghcr.io/${{ github.repository }}:latest
+          tags: ghcr.io/${{ github.repository }}:${{ needs.preflight.outputs.tag }}
+          provenance: mode=max
+          sbom: true
 
-      - name: Build and push RTK variant
+  publish-rtk-image:
+    name: Publish immutable RTK OCI image
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    needs: preflight
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Check out the verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up exact Docker Engine
+        uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5.4.0
+        with:
+          version: v29.6.2
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.35.0
+          driver-opts: image=docker.io/moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
+      - name: Log in to GHCR
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Reverify remote tag before RTK image publication
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+        run: scripts/release/verify-remote-tag-state.sh "${RELEASE_TAG}" "${RELEASE_TAG_OBJECT}" "${RELEASE_COMMIT}"
+
+      - name: Recheck immutable RTK tag availability
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/release/check-image-tag-absent.sh "ghcr.io/${GITHUB_REPOSITORY}:${{ needs.preflight.outputs.tag }}-rtk"
+
+      - name: Build and push the immutable RTK image once
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile.rtk
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.tag }}-rtk
-            ghcr.io/${{ github.repository }}:latest-rtk
+          tags: ghcr.io/${{ github.repository }}:${{ needs.preflight.outputs.tag }}-rtk
+          provenance: mode=max
+          sbom: true
+
+  attest-images:
+    name: Attest immutable OCI image digests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [preflight, publish-standard-image, publish-rtk-image]
+    environment: release
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - name: Check out verified release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.35.0
+          driver-opts: image=docker.io/moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
+      - name: Log in to GHCR
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Reverify remote tag before image attestation
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+        run: scripts/release/verify-remote-tag-state.sh "${RELEASE_TAG}" "${RELEASE_TAG_OBJECT}" "${RELEASE_COMMIT}"
+
+      - name: Verify immutable version tags resolve to recorded digests
+        env:
+          STANDARD_DIGEST: ${{ needs.publish-standard-image.outputs.digest }}
+          RTK_DIGEST: ${{ needs.publish-rtk-image.outputs.digest }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY}"
+          test "$(docker buildx imagetools inspect "${image}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')" = "${STANDARD_DIGEST}"
+          test "$(docker buildx imagetools inspect "${image}:${RELEASE_TAG}-rtk" --format '{{.Manifest.Digest}}')" = "${RTK_DIGEST}"
+
+      - name: Attest the standard image digest
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ needs.publish-standard-image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest the RTK image digest
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ needs.publish-rtk-image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Record image evidence
+        env:
+          STANDARD_DIGEST: ${{ needs.publish-standard-image.outputs.digest }}
+          RTK_DIGEST: ${{ needs.publish-rtk-image.outputs.digest }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          mkdir image-evidence
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+
+          def base_images(path):
+              images = []
+              for line in pathlib.Path(path).read_text().splitlines():
+                  match = re.match(r"^FROM\s+(\S+)", line)
+                  if match:
+                      images.append(match.group(1))
+              return images
+
+          rtk_dockerfile = pathlib.Path("Dockerfile.rtk").read_text()
+          rtk_version = re.search(r"^ARG RTK_VERSION=(\S+)$", rtk_dockerfile, re.MULTILINE).group(1)
+          rtk_amd64 = re.search(r'rtk_sha256_amd64="([0-9a-f]{64})"', rtk_dockerfile).group(1)
+          rtk_arm64 = re.search(r'rtk_sha256_arm64="([0-9a-f]{64})"', rtk_dockerfile).group(1)
+          repo = f"ghcr.io/{os.environ['GITHUB_REPOSITORY']}"
+          tag = os.environ["RELEASE_TAG"]
+          payload = {
+              "standard": {"repository": repo, "tag": tag, "digest": os.environ["STANDARD_DIGEST"]},
+              "rtk": {"repository": repo, "tag": f"{tag}-rtk", "digest": os.environ["RTK_DIGEST"]},
+              "platforms": ["linux/amd64", "linux/arm64"],
+              "buildkit_provenance": "mode=max",
+              "buildkit_sbom": True,
+              "builder_action": "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a",
+              "docker_engine_version": "v29.6.2",
+              "buildx_version": "v0.35.0",
+              "buildkit_image": "docker.io/moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec",
+              "qemu_binfmt_image": "docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0",
+              "rtk_input": {
+                  "version": rtk_version,
+                  "linux_amd64_sha256": rtk_amd64,
+                  "linux_arm64_sha256": rtk_arm64,
+              },
+              "base_images": {
+                  "Dockerfile": base_images("Dockerfile"),
+                  "Dockerfile.rtk": base_images("Dockerfile.rtk"),
+              },
+          }
+          pathlib.Path("image-evidence/oci-images.json").write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + "\n"
+          )
+          PY
+
+      - name: Upload immutable image evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-evidence-${{ github.run_id }}
+          path: image-evidence/*
+          if-no-files-found: error
+          retention-days: ${{ env.RELEASE_ARTIFACT_RETENTION_DAYS }}
+          overwrite: false
+
+  scan-images:
+    name: Scan immutable OCI digests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [preflight, publish-standard-image, publish-rtk-image, attest-images]
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check out scanner policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install pinned image secret scanner
+        run: scripts/release/install-tools.sh gitleaks
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.35.0
+          driver-opts: image=docker.io/moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
+      - name: Log in to GHCR
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Scan standard amd64 image by digest
+        id: standard_amd64_scan
+        continue-on-error: true
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}@${{ needs.publish-standard-image.outputs.digest }}
+          version: v0.72.0
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: "1"
+          format: json
+          output: trivy-standard-amd64.json
+          timeout: 20m0s
+
+      - name: Scan standard arm64 image by digest
+        id: standard_arm64_scan
+        continue-on-error: true
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}@${{ needs.publish-standard-image.outputs.digest }}
+          version: v0.72.0
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: "1"
+          format: json
+          output: trivy-standard-arm64.json
+          timeout: 20m0s
+
+      - name: Scan RTK amd64 image by digest
+        id: rtk_amd64_scan
+        continue-on-error: true
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}@${{ needs.publish-rtk-image.outputs.digest }}
+          version: v0.72.0
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: "1"
+          format: json
+          output: trivy-rtk-amd64.json
+          timeout: 20m0s
+
+      - name: Scan RTK arm64 image by digest
+        id: rtk_arm64_scan
+        continue-on-error: true
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}@${{ needs.publish-rtk-image.outputs.digest }}
+          version: v0.72.0
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: "1"
+          format: json
+          output: trivy-rtk-arm64.json
+          timeout: 20m0s
+
+      - name: Scan exported runtime filesystems for secrets
+        id: image_secret_scan
+        continue-on-error: true
+        env:
+          STANDARD_DIGEST: ${{ needs.publish-standard-image.outputs.digest }}
+          RTK_DIGEST: ${{ needs.publish-rtk-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY}"
+          mkdir -p image-rootfs
+          for digest in "${STANDARD_DIGEST}" "${RTK_DIGEST}"; do
+            for platform in linux/amd64 linux/arm64; do
+              find image-rootfs -mindepth 1 -delete
+              docker pull --platform "${platform}" "${image}@${digest}" >/dev/null
+              container_id="$(docker create --platform "${platform}" "${image}@${digest}")"
+              trap 'docker rm -f "${container_id}" >/dev/null 2>&1 || true' EXIT
+              docker export "${container_id}" | tar -xf - -C image-rootfs
+              docker rm "${container_id}" >/dev/null
+              trap - EXIT
+              scripts/release/scan-secrets.sh image-rootfs
+            done
+          done
+          printf '%s\n' '{"scanner":"gitleaks","findings":0}' >image-secret-scan.json
+
+      - name: Verify image attestations and runtime smoke
+        env:
+          STANDARD_DIGEST: ${{ needs.publish-standard-image.outputs.digest }}
+          RTK_DIGEST: ${{ needs.publish-rtk-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY}"
+          verify_buildkit_attestations() {
+            local digest="$1"
+            local attestation
+            local -a attestations
+            mapfile -t attestations < <(
+              docker buildx imagetools inspect "${image}@${digest}" --raw \
+                | jq -r '.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest'
+            )
+            test "${#attestations[@]}" -eq 2
+            for attestation in "${attestations[@]}"; do
+              docker buildx imagetools inspect "${image}@${attestation}" --raw >attestation-manifest.json
+              jq -e 'any(.layers[]; .annotations["in-toto.io/predicate-type"] == "https://slsa.dev/provenance/v1")' attestation-manifest.json >/dev/null
+              jq -e 'any(.layers[]; .annotations["in-toto.io/predicate-type"] == "https://spdx.dev/Document")' attestation-manifest.json >/dev/null
+            done
+          }
+          verify_buildkit_attestations "${STANDARD_DIGEST}"
+          verify_buildkit_attestations "${RTK_DIGEST}"
+          for platform in linux/amd64 linux/arm64; do
+            docker run --rm --platform "${platform}" "${image}@${STANDARD_DIGEST}" --help >/dev/null
+            docker run --rm --platform "${platform}" "${image}@${RTK_DIGEST}" --help >/dev/null
+            docker run --rm --platform "${platform}" --entrypoint /usr/local/bin/rtk "${image}@${RTK_DIGEST}" --version >/dev/null
+          done
+
+      - name: Write image scan summary
+        if: ${{ always() }}
+        env:
+          STANDARD_AMD64_OUTCOME: ${{ steps.standard_amd64_scan.outcome }}
+          STANDARD_ARM64_OUTCOME: ${{ steps.standard_arm64_scan.outcome }}
+          RTK_AMD64_OUTCOME: ${{ steps.rtk_amd64_scan.outcome }}
+          RTK_ARM64_OUTCOME: ${{ steps.rtk_arm64_scan.outcome }}
+          SECRET_OUTCOME: ${{ steps.image_secret_scan.outcome }}
+        run: |
+          mkdir -p image-scan
+          for report in trivy-standard-amd64.json trivy-standard-arm64.json trivy-rtk-amd64.json trivy-rtk-arm64.json; do
+            test -f "${report}" && mv "${report}" image-scan/ || printf '{}\n' >"image-scan/${report}"
+          done
+          test -f image-secret-scan.json && mv image-secret-scan.json image-scan/ || printf '{}\n' >image-scan/image-secret-scan.json
+          jq -n \
+            --arg scanner "trivy" \
+            --arg version "${TRIVY_VERSION}" \
+            --arg standard_amd64 "${STANDARD_AMD64_OUTCOME}" \
+            --arg standard_arm64 "${STANDARD_ARM64_OUTCOME}" \
+            --arg rtk_amd64 "${RTK_AMD64_OUTCOME}" \
+            --arg rtk_arm64 "${RTK_ARM64_OUTCOME}" \
+            --arg secret "${SECRET_OUTCOME}" \
+            '{scanner:$scanner,version:$version,standard_amd64_outcome:$standard_amd64,standard_arm64_outcome:$standard_arm64,rtk_amd64_outcome:$rtk_amd64,rtk_arm64_outcome:$rtk_arm64,secret_outcome:$secret}' \
+            >image-scan/image-scan-summary.json
+
+      - name: Upload image scan evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-scan-${{ github.run_id }}
+          path: image-scan/*
+          if-no-files-found: error
+          retention-days: ${{ env.RELEASE_ARTIFACT_RETENTION_DAYS }}
+          overwrite: true
+
+      - name: Enforce image vulnerability and secret policy
+        if: ${{ always() }}
+        run: |
+          test "${{ steps.standard_amd64_scan.outcome }}" = success
+          test "${{ steps.standard_arm64_scan.outcome }}" = success
+          test "${{ steps.rtk_amd64_scan.outcome }}" = success
+          test "${{ steps.rtk_arm64_scan.outcome }}" = success
+          test "${{ steps.image_secret_scan.outcome }}" = success
+
+  assemble-evidence:
+    name: Assemble deterministic release evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [preflight, scan-release-artifacts, publish-standard-image, publish-rtk-image, attest-images, scan-images]
+    permissions:
+      contents: read
+    steps:
+      - name: Check out verified release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          persist-credentials: false
+
+      - name: Download verified release payload
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-payload-${{ github.run_id }}
+          path: release
+          digest-mismatch: error
+
+      - name: Download immutable image evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image-evidence-${{ github.run_id }}
+          path: release
+          digest-mismatch: error
+
+      - name: Download image scan evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image-scan-${{ github.run_id }}
+          path: release
+          digest-mismatch: error
+
+      - name: Generate and verify release manifest
+        env:
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          RELEASE_WORKFLOW: ${{ github.workflow_ref }}
+          RELEASE_RUN_ID: ${{ github.run_id }}
+          OCI_STANDARD_DIGEST: ${{ needs.publish-standard-image.outputs.digest }}
+          OCI_RTK_DIGEST: ${{ needs.publish-rtk-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          cli = json.loads(pathlib.Path("release/cli-build-metadata.json").read_text())
+          macos = json.loads(pathlib.Path("release/macos-build-metadata.json").read_text())
+          tool_versions = {}
+          for line in pathlib.Path("scripts/release/tool-versions.env").read_text().splitlines():
+              if line and not line.startswith("#") and "=" in line:
+                  key, value = line.split("=", 1)
+                  tool_versions[key] = value.strip("'\"")
+          text = f"""## Supply-chain evidence
+
+          - Source: `{os.environ['RELEASE_COMMIT']}` at signed tag `{os.environ['RELEASE_TAG']}`
+          - Workflow run: `{os.environ['GITHUB_RUN_ID']}` (attempt `{os.environ['GITHUB_RUN_ATTEMPT']}`)
+          - CLI and macOS assets were built once, scanned, and staged before publication.
+          - Toolchain: `{cli['go_version']}`, GoReleaser `{cli['goreleaser_version']}`, Syft `{tool_versions['SYFT_VERSION']}`, Gitleaks `{tool_versions['GITLEAKS_VERSION']}`, Trivy `{os.environ['TRIVY_VERSION']}`.
+          - Sparkle: `{macos['sparkle_version']}` archive `{macos['sparkle_archive_sha256']}`.
+          - OCI images: `ghcr.io/{os.environ['GITHUB_REPOSITORY']}:{os.environ['RELEASE_TAG']}@{os.environ['OCI_STANDARD_DIGEST']}` and `ghcr.io/{os.environ['GITHUB_REPOSITORY']}:{os.environ['RELEASE_TAG']}-rtk@{os.environ['OCI_RTK_DIGEST']}`
+          - Downloadable assets include SPDX SBOMs, scan summaries, and `release-manifest.json`.
+          - Verify an asset with: `gh attestation verify <file> --repo {os.environ['GITHUB_REPOSITORY']}`
+          """
+          pathlib.Path("release/release-evidence.md").write_text(text)
+          PY
+
+          images_json="$(jq -nc \
+            --arg repository "ghcr.io/${GITHUB_REPOSITORY}" \
+            --arg tag "${RELEASE_TAG}" \
+            --arg standard "${OCI_STANDARD_DIGEST}" \
+            --arg rtk "${OCI_RTK_DIGEST}" \
+            '[{repository:$repository,tag:$tag,digest:$standard},{repository:$repository,tag:($tag+"-rtk"),digest:$rtk}]')"
+          export RELEASE_IMAGES_JSON="${images_json}"
+          export RELEASE_SCANS_JSON='[{"name":"artifact-gitleaks","status":"passed","exceptions":[]},{"name":"govulncheck","status":"passed","exceptions":[]},{"name":"oci-rtk-amd64-trivy","status":"passed","exceptions":[]},{"name":"oci-rtk-arm64-trivy","status":"passed","exceptions":[]},{"name":"oci-runtime-gitleaks","status":"passed","exceptions":[]},{"name":"oci-standard-amd64-trivy","status":"passed","exceptions":[]},{"name":"oci-standard-arm64-trivy","status":"passed","exceptions":[]},{"name":"source-gitleaks","status":"passed","exceptions":[]}]'
+          vulnerability_exceptions_json="$(scripts/release/validate-vulnerability-exceptions.py)"
+          export RELEASE_VULNERABILITY_EXCEPTIONS_JSON="${vulnerability_exceptions_json}"
+          go_version="$(jq -r .go_version release/cli-build-metadata.json)"
+          export RELEASE_GO_VERSION="${go_version}"
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+
+          root = pathlib.Path("release")
+          metadata = {}
+          attestations = []
+          for path in sorted(root.iterdir()):
+              if not path.is_file() or path.name == "release-manifest.json":
+                  continue
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              entry = {"attestation_subject_sha256": digest}
+              if path.name.startswith(("vekil-linux-", "vekil-darwin-", "vekil-windows-")) and not path.name.endswith(".spdx.json"):
+                  sbom = f"{path.name}.spdx.json"
+                  if (root / sbom).is_file():
+                      entry["sbom"] = sbom
+              elif path.name == "vekil-macos-arm64.zip":
+                  entry["sbom"] = "vekil-macos-arm64.spdx.json"
+              metadata[path.name] = entry
+              attestations.append({"subject": path.name, "sha256": digest})
+          pathlib.Path("artifact-metadata.json").write_text(json.dumps(metadata, sort_keys=True))
+          pathlib.Path("attestation-subjects.json").write_text(json.dumps(attestations, sort_keys=True))
+          PY
+          artifact_metadata_json="$(cat artifact-metadata.json)"
+          attestation_subjects_json="$(cat attestation-subjects.json)"
+          export RELEASE_ARTIFACT_METADATA_JSON="${artifact_metadata_json}"
+          export RELEASE_ATTESTATIONS_JSON="${attestation_subjects_json}"
+
+          scripts/release/generate-release-manifest.py \
+            --artifact-dir release \
+            --output release/release-manifest.json
+          scripts/release/verify-release-manifest.py \
+            --artifact-dir release \
+            --manifest release/release-manifest.json
+
+      - name: Upload final release payload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-final-${{ github.run_id }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: ${{ env.RELEASE_ARTIFACT_RETENTION_DAYS }}
+          overwrite: false
+
+  attest-release:
+    name: Attest staged release files
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [preflight, assemble-evidence]
+    environment: release
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Download final release payload
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-final-${{ github.run_id }}
+          path: release
+          digest-mismatch: error
+
+      - name: Generate GitHub build provenance attestations
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: release/*
 
   finalize-release:
+    name: Publish immutable GitHub release
     runs-on: ubuntu-latest
-    needs: [macos-app, publish]
+    timeout-minutes: 20
+    needs: [preflight, assemble-evidence, attest-release]
+    environment: release
+    permissions:
+      attestations: read
+      contents: write
     steps:
-      - name: Publish draft release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${GITHUB_REF#refs/tags/}" --draft=false --repo "${GITHUB_REPOSITORY}"
+      - name: Check out verified release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          persist-credentials: false
 
-  homebrew-cask:
-    runs-on: ubuntu-latest
-    needs: [macos-app, finalize-release]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download the attested release payload
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-final-${{ github.run_id }}
+          path: release
+          digest-mismatch: error
 
-      - name: Require tap publishing token
+      - name: Reverify remote tag before GitHub release publication
         env:
-          HOMEBREW_REPO_TOKEN: ${{ secrets.HOMEBREW_REPO_TOKEN }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+        run: scripts/release/verify-remote-tag-state.sh "${RELEASE_TAG}" "${RELEASE_TAG_OBJECT}" "${RELEASE_COMMIT}"
+
+      - name: Reverify staged bytes and GitHub attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: |
-          if [ -z "$HOMEBREW_REPO_TOKEN" ]; then
-            echo "HOMEBREW_REPO_TOKEN is required to publish the Homebrew cask" >&2
-            exit 1
+          set -euo pipefail
+          scripts/release/verify-release-manifest.py \
+            --artifact-dir release \
+            --manifest release/release-manifest.json
+          for asset in release/*; do
+            gh attestation verify "${asset}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yaml" \
+              --source-digest "${RELEASE_COMMIT}" \
+              --source-ref "refs/tags/${RELEASE_TAG}" >/dev/null
+          done
+
+      - name: Create one draft release and upload without replacement
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          set +e
+          scripts/release/query-github-release.sh "${RELEASE_TAG}" draft-release.json >/dev/null
+          query_status="$?"
+          set -e
+          if [[ "${query_status}" -eq 0 ]]; then
+            python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import urllib.parse
+          import urllib.request
+
+          class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+                  if redirected is not None:
+                      old = urllib.parse.urlsplit(req.full_url)
+                      new = urllib.parse.urlsplit(newurl)
+                      if (old.scheme, old.netloc) != (new.scheme, new.netloc):
+                          redirected.remove_header("Authorization")
+                  return redirected
+
+          opener = urllib.request.build_opener(SafeRedirectHandler())
+          local = {
+              path.name: (path, path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+              for path in pathlib.Path("release").iterdir()
+              if path.is_file()
+          }
+          release = json.loads(pathlib.Path("draft-release.json").read_text())
+          if release.get("draft") is not True:
+              raise SystemExit("an already-published release exists; refusing to modify it")
+          if bool(release.get("prerelease")) != (os.environ["IS_PRERELEASE"] == "true"):
+              raise SystemExit("existing draft prerelease flag does not match staged release")
+
+          remote = {asset["name"]: asset for asset in release.get("assets", [])}
+          extras = sorted(set(remote) - set(local))
+          if extras:
+              raise SystemExit(f"existing draft contains unexpected assets: {extras}")
+          token = os.environ.get("GH_TOKEN", "")
+          for name, asset in remote.items():
+              path, size, digest = local[name]
+              if asset.get("size") != size:
+                  raise SystemExit(f"existing draft asset size mismatch: {name}")
+              api_digest = asset.get("digest")
+              if api_digest:
+                  if api_digest != f"sha256:{digest}":
+                      raise SystemExit(f"existing draft asset digest mismatch: {name}")
+                  continue
+              request = urllib.request.Request(
+                  asset["url"],
+                  headers={
+                      "Accept": "application/octet-stream",
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              downloaded = hashlib.sha256()
+              with opener.open(request, timeout=120) as response:
+                  for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                      downloaded.update(chunk)
+              if downloaded.hexdigest() != digest:
+                  raise SystemExit(f"existing draft downloaded digest mismatch: {name}")
+          missing = sorted(set(local) - set(remote))
+          pathlib.Path("missing-assets.txt").write_text("".join(f"release/{name}\n" for name in missing))
+          PY
+          elif [[ "${query_status}" -eq 4 ]]; then
+            notes="$(cat release/release-evidence.md)"
+            create_args=(
+              "${RELEASE_TAG}"
+              --repo "${GITHUB_REPOSITORY}"
+              --verify-tag
+              --target "${RELEASE_COMMIT}"
+              --title "${RELEASE_TAG}"
+              --draft
+              --generate-notes
+              --notes "${notes}"
+            )
+            if [[ "${IS_PRERELEASE}" == "true" ]]; then
+              create_args+=(--prerelease --latest=false)
+            fi
+            gh release create "${create_args[@]}"
+            find release -maxdepth 1 -type f -print | sort >missing-assets.txt
+          else
+            exit "${query_status}"
           fi
 
-      - name: Checkout Homebrew tap repo
+          mapfile -t assets <missing-assets.txt
+          if (( ${#assets[@]} > 0 )); then
+            gh release upload "${RELEASE_TAG}" "${assets[@]}" --repo "${GITHUB_REPOSITORY}"
+          fi
+
+      - name: Verify provider-reported asset size and digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" >release-api.json
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+
+          local = {
+              path.name: (path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+              for path in pathlib.Path("release").iterdir()
+              if path.is_file()
+          }
+          remote = json.loads(pathlib.Path("release-api.json").read_text())
+          if remote.get("tag_name") != os.environ["RELEASE_TAG"] or remote.get("draft") is not True:
+              raise SystemExit("release metadata changed before publication")
+          if bool(remote.get("prerelease")) != (os.environ["IS_PRERELEASE"] == "true"):
+              raise SystemExit("release prerelease flag changed before publication")
+          assets = {asset["name"]: asset for asset in remote.get("assets", [])}
+          if set(local) != set(assets):
+              raise SystemExit(f"asset set mismatch: local={sorted(local)} remote={sorted(assets)}")
+          for name, (size, digest) in local.items():
+              asset = assets[name]
+              if asset.get("size") != size:
+                  raise SystemExit(f"size mismatch for {name}")
+              remote_digest = asset.get("digest")
+              if remote_digest and remote_digest != f"sha256:{digest}":
+                  raise SystemExit(f"digest mismatch for {name}")
+          PY
+
+      - name: Publish only after the complete draft verifies
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+        run: |
+          args=("${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false)
+          if [[ "${IS_PRERELEASE}" == "true" ]]; then
+            args+=(--prerelease --latest=false)
+          fi
+          gh release edit "${args[@]}"
+
+  homebrew-cask:
+    name: Open reviewed Homebrew cask pull request
+    runs-on: macos-26
+    timeout-minutes: 20
+    needs: [preflight, finalize-release]
+    environment: homebrew
+    permissions:
+      contents: read
+    outputs:
+      branch: ${{ steps.publish.outputs.branch }}
+      pr_number: ${{ steps.publish.outputs.pr_number }}
+      head_oid: ${{ steps.publish.outputs.head_oid }}
+      sha256: ${{ steps.publish.outputs.sha256 }}
+    steps:
+      - name: Check out verified Vekil source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          path: vekil-source
+          persist-credentials: false
+
+      - name: Check out the Homebrew tap push branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: sozercan/homebrew-repo
+          ref: main
           token: ${{ secrets.HOMEBREW_REPO_TOKEN }}
           path: homebrew-repo
+          fetch-depth: 0
+          persist-credentials: true
 
-      - name: Update Homebrew cask
+      - name: Recompute checksum from the finalized release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          ./scripts/publish-homebrew-cask.sh "$VERSION" "${{ needs.macos-app.outputs.app_sha256 }}" homebrew-repo
+          mkdir finalized-asset
+          gh release download "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern vekil-macos-arm64.zip \
+            --dir finalized-asset
 
-      - name: Commit and push Homebrew cask
+      - name: Render, audit, and smoke the cask
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
-          TAG=${GITHUB_REF#refs/tags/}
+          set -euo pipefail
+          branch="release/vekil-${RELEASE_TAG}"
+          sha256="$(shasum -a 256 finalized-asset/vekil-macos-arm64.zip | awk '{print $1}')"
           git -C homebrew-repo config user.name "github-actions[bot]"
           git -C homebrew-repo config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C homebrew-repo fetch origin "refs/heads/${branch}:refs/remotes/origin/${branch}" || true
+          if git -C homebrew-repo show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+            git -C homebrew-repo checkout -B "${branch}" "origin/${branch}"
+          else
+            git -C homebrew-repo checkout -B "${branch}" origin/main
+          fi
+          vekil-source/scripts/publish-homebrew-cask.sh "${RELEASE_VERSION}" "${sha256}" homebrew-repo
           git -C homebrew-repo add Casks/vekil.rb
-          git -C homebrew-repo diff --cached --quiet || git -C homebrew-repo commit -m "Update vekil to ${TAG}"
-          git -C homebrew-repo push origin main
+          if ! git -C homebrew-repo diff --cached --quiet; then
+            git -C homebrew-repo commit -s -m "chore(cask): update vekil to ${RELEASE_TAG}"
+          fi
+
+          brew untap sozercan/repo >/dev/null 2>&1 || true
+          brew tap sozercan/repo "$(pwd)/homebrew-repo"
+          brew audit --cask --strict sozercan/repo/vekil
+          brew install --cask --no-quarantine sozercan/repo/vekil
+          test -d /Applications/Vekil.app
+          brew uninstall --cask vekil
+          brew untap sozercan/repo
+
+      - name: Push a release branch and open or update a pull request
+        id: publish
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_REPO_TOKEN }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -n "${GH_TOKEN}" || {
+            echo "homebrew environment secret HOMEBREW_REPO_TOKEN is required" >&2
+            exit 1
+          }
+          branch="release/vekil-${RELEASE_TAG}"
+          sha256="$(shasum -a 256 finalized-asset/vekil-macos-arm64.zip | awk '{print $1}')"
+
+          git -C homebrew-repo push origin "HEAD:refs/heads/${branch}"
+          head_oid="$(git -C homebrew-repo rev-parse HEAD)"
+
+          find_canonical_pr() {
+            gh pr list --repo sozercan/homebrew-repo --state open --head "${branch}" --limit 100 \
+              --json number,headRefName,headRepositoryOwner,isCrossRepository \
+              | jq -c --arg branch "${branch}" \
+                '[.[] | select(.headRefName == $branch and .headRepositoryOwner.login == "sozercan" and .isCrossRepository == false)]'
+          }
+          matches="$(find_canonical_pr)"
+          match_count="$(jq 'length' <<<"${matches}")"
+          [[ "${match_count}" -le 1 ]] || {
+            echo "multiple canonical Homebrew PRs matched ${branch}" >&2
+            exit 1
+          }
+          pr_number="$(jq -r '.[0].number // empty' <<<"${matches}")"
+          body="Vekil ${RELEASE_TAG}. The cask checksum was independently recomputed from the finalized GitHub release asset: ${sha256}."
+          if [[ -n "${pr_number}" ]]; then
+            gh pr edit "${pr_number}" --repo sozercan/homebrew-repo \
+              --title "chore(cask): update vekil to ${RELEASE_TAG}" --body "${body}"
+          else
+            pr_url="$(gh pr create --repo sozercan/homebrew-repo --base main --head "sozercan:${branch}" \
+              --title "chore(cask): update vekil to ${RELEASE_TAG}" --body "${body}")"
+            pr_number="${pr_url##*/}"
+          fi
+          [[ "${pr_number}" =~ ^[0-9]+$ ]] || {
+            echo "failed to resolve canonical Homebrew PR number" >&2
+            exit 1
+          }
+
+          verified_pr=false
+          for _ in {1..20}; do
+            if gh pr view "${pr_number}" --repo sozercan/homebrew-repo \
+              --json state,baseRefName,headRefName,headRefOid,headRepositoryOwner,isCrossRepository,isDraft \
+              | jq -e --arg branch "${branch}" --arg oid "${head_oid}" \
+                'select(.state == "OPEN" and .baseRefName == "main" and .headRefName == $branch and .headRefOid == $oid and .headRepositoryOwner.login == "sozercan" and .isCrossRepository == false and .isDraft == false)' >/dev/null; then
+              verified_pr=true
+              break
+            fi
+            sleep 2
+          done
+          [[ "${verified_pr}" == "true" ]] || {
+            echo "Homebrew PR did not resolve to canonical ${branch}@${head_oid}" >&2
+            exit 1
+          }
+
+          {
+            echo "branch=${branch}"
+            echo "pr_number=${pr_number}"
+            echo "head_oid=${head_oid}"
+            echo "sha256=${sha256}"
+          } >>"${GITHUB_OUTPUT}"
+
+  post-publish-verification:
+    name: Verify published release across channels
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [preflight, publish-standard-image, publish-rtk-image, finalize-release, homebrew-cask]
+    permissions:
+      attestations: read
+      contents: read
+      packages: read
+    steps:
+      - name: Check out verified release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          persist-credentials: false
+
+      - name: Download every finalized GitHub release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          mkdir published
+          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir published
+
+      - name: Verify release manifest, checksums, and provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          scripts/release/verify-release-manifest.py \
+            --artifact-dir published \
+            --manifest published/release-manifest.json
+          scripts/release/verify-published-release.py \
+            --manifest published/release-manifest.json \
+            --repository "${GITHUB_REPOSITORY}" \
+            --tag "${RELEASE_TAG}"
+          (cd published && sha256sum --check checksums.txt)
+          (cd published && sha256sum --check macos-checksums.txt)
+          for asset in published/*; do
+            gh attestation verify "${asset}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yaml" \
+              --source-digest "${RELEASE_COMMIT}" \
+              --source-ref "refs/tags/${RELEASE_TAG}" >/dev/null
+          done
+
+      - name: Log in to GHCR
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.35.0
+          driver-opts: image=docker.io/moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
+      - name: Verify immutable OCI tags, attestations, SBOMs, and runtime
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          STANDARD_DIGEST: ${{ needs.publish-standard-image.outputs.digest }}
+          RTK_DIGEST: ${{ needs.publish-rtk-image.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY}"
+          test "$(docker buildx imagetools inspect "${image}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')" = "${STANDARD_DIGEST}"
+          test "$(docker buildx imagetools inspect "${image}:${RELEASE_TAG}-rtk" --format '{{.Manifest.Digest}}')" = "${RTK_DIGEST}"
+          verify_buildkit_attestations() {
+            local digest="$1"
+            local attestation
+            local -a attestations
+            mapfile -t attestations < <(
+              docker buildx imagetools inspect "${image}@${digest}" --raw \
+                | jq -r '.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest'
+            )
+            test "${#attestations[@]}" -eq 2
+            for attestation in "${attestations[@]}"; do
+              docker buildx imagetools inspect "${image}@${attestation}" --raw >attestation-manifest.json
+              jq -e 'any(.layers[]; .annotations["in-toto.io/predicate-type"] == "https://slsa.dev/provenance/v1")' attestation-manifest.json >/dev/null
+              jq -e 'any(.layers[]; .annotations["in-toto.io/predicate-type"] == "https://spdx.dev/Document")' attestation-manifest.json >/dev/null
+            done
+          }
+          for digest in "${STANDARD_DIGEST}" "${RTK_DIGEST}"; do
+            verify_buildkit_attestations "${digest}"
+            gh attestation verify "oci://${image}@${digest}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yaml" \
+              --source-digest "${RELEASE_COMMIT}" \
+              --source-ref "refs/tags/${RELEASE_TAG}" >/dev/null
+          done
+          for platform in linux/amd64 linux/arm64; do
+            docker run --rm --platform "${platform}" "${image}@${STANDARD_DIGEST}" --help >/dev/null
+            docker run --rm --platform "${platform}" "${image}@${RTK_DIGEST}" --help >/dev/null
+            docker run --rm --platform "${platform}" --entrypoint /usr/local/bin/rtk "${image}@${RTK_DIGEST}" --version >/dev/null
+          done
+
+      - name: Verify Sparkle archive metadata and signature
+        env:
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          scripts/release/verify-sparkle-update.sh \
+            published/vekil-macos-arm64.zip \
+            published/appcast.xml \
+            "${SPARKLE_PUBLIC_ED_KEY}" \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/vekil-macos-arm64.zip" \
+            "${RELEASE_VERSION}"
+
+      - name: Verify the Homebrew pull request uses the finalized checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOMEBREW_BRANCH: ${{ needs.homebrew-cask.outputs.branch }}
+          HOMEBREW_PR: ${{ needs.homebrew-cask.outputs.pr_number }}
+          HOMEBREW_HEAD_OID: ${{ needs.homebrew-cask.outputs.head_oid }}
+          EXPECTED_SHA256: ${{ needs.homebrew-cask.outputs.sha256 }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          gh pr view "${HOMEBREW_PR}" --repo sozercan/homebrew-repo \
+            --json state,baseRefName,headRefName,headRefOid,headRepositoryOwner,isCrossRepository,isDraft \
+            | jq -e --arg branch "${HOMEBREW_BRANCH}" --arg oid "${HOMEBREW_HEAD_OID}" \
+              'select(.state == "OPEN" and .baseRefName == "main" and .headRefName == $branch and .headRefOid == $oid and .headRepositoryOwner.login == "sozercan" and .isCrossRepository == false and .isDraft == false)' >/dev/null
+          gh api "repos/sozercan/homebrew-repo/contents/Casks/vekil.rb?ref=${HOMEBREW_BRANCH}" --jq .content \
+            | base64 --decode >vekil.rb
+          grep -Fq "version \"${RELEASE_VERSION}\"" vekil.rb
+          grep -Fq "sha256 \"${EXPECTED_SHA256}\"" vekil.rb
+
+      - name: Publish verification evidence summary
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          STANDARD_DIGEST: ${{ needs.publish-standard-image.outputs.digest }}
+          RTK_DIGEST: ${{ needs.publish-rtk-image.outputs.digest }}
+          HOMEBREW_PR: ${{ needs.homebrew-cask.outputs.pr_number }}
+        run: |
+          cat >>"${GITHUB_STEP_SUMMARY}" <<EOF
+          ## Verified ${RELEASE_TAG}
+
+          - GitHub assets: manifest, checksums, and GitHub attestations verified
+          - Standard OCI digest: \`${STANDARD_DIGEST}\`
+          - RTK OCI digest: \`${RTK_DIGEST}\`
+          - Sparkle archive length, URL, version, archive signature, and signed feed verified
+          - Homebrew PR: sozercan/homebrew-repo#${HOMEBREW_PR}
+          EOF
+
+  promote-images:
+    name: Promote stable mutable OCI aliases
+    if: ${{ !contains(needs.preflight.outputs.tag, '-') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: release-alias-promotion
+      cancel-in-progress: false
+      queue: max
+    needs: [preflight, publish-standard-image, publish-rtk-image, post-publish-verification]
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.35.0
+          driver-opts: image=docker.io/moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
+      - name: Log in to GHCR
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Promote by digest without rebuilding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          STANDARD_DIGEST: ${{ needs.publish-standard-image.outputs.digest }}
+          RTK_DIGEST: ${{ needs.publish-rtk-image.outputs.digest }}
+        run: |
+          set -Eeuo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY}"
+          assert_current_latest_release() {
+            local latest_tag
+            latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+            [[ "${latest_tag}" == "${RELEASE_TAG}" ]] || {
+              echo "refusing to promote ${RELEASE_TAG}; current latest stable release is ${latest_tag}" >&2
+              return 1
+            }
+          }
+
+          assert_current_latest_release
+          previous_standard="$(docker buildx imagetools inspect "${image}:latest" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+          previous_rtk="$(docker buildx imagetools inspect "${image}:latest-rtk" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+          if [[ ! "${previous_standard}" =~ ^sha256:[0-9a-f]{64}$ || ! "${previous_rtk}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "safe automatic promotion requires both existing mutable aliases so failures can restore prior state; restore or seed latest and latest-rtk under review, then rerun" >&2
+            exit 1
+          fi
+
+          rollback_aliases() {
+            local original_status="$?"
+            trap - ERR
+            set +e
+            echo "promotion failed; restoring previous mutable aliases" >&2
+            docker buildx imagetools create --tag "${image}:latest" "${image}@${previous_standard}"
+            docker buildx imagetools create --tag "${image}:latest-rtk" "${image}@${previous_rtk}"
+            test "$(docker buildx imagetools inspect "${image}:latest" --format '{{.Manifest.Digest}}')" = "${previous_standard}"
+            test "$(docker buildx imagetools inspect "${image}:latest-rtk" --format '{{.Manifest.Digest}}')" = "${previous_rtk}"
+            exit "${original_status}"
+          }
+          trap rollback_aliases ERR
+
+          assert_current_latest_release
+          docker buildx imagetools create --tag "${image}:latest" "${image}@${STANDARD_DIGEST}"
+          assert_current_latest_release
+          docker buildx imagetools create --tag "${image}:latest-rtk" "${image}@${RTK_DIGEST}"
+          test "$(docker buildx imagetools inspect "${image}:latest" --format '{{.Manifest.Digest}}')" = "${STANDARD_DIGEST}"
+          test "$(docker buildx imagetools inspect "${image}:latest-rtk" --format '{{.Manifest.Digest}}')" = "${RTK_DIGEST}"
+          assert_current_latest_release
+          trap - ERR
+
+      - name: Record promotion evidence
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          STANDARD_DIGEST: ${{ needs.publish-standard-image.outputs.digest }}
+          RTK_DIGEST: ${{ needs.publish-rtk-image.outputs.digest }}
+        run: |
+          cat >>"${GITHUB_STEP_SUMMARY}" <<EOF
+          ## Mutable alias promotion
+
+          After all publication checks passed for \`${RELEASE_TAG}\`:
+
+          - \`latest\` -> \`${STANDARD_DIGEST}\`
+          - \`latest-rtk\` -> \`${RTK_DIGEST}\`
+          EOF

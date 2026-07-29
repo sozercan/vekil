@@ -21,7 +21,8 @@ This folder is intentionally split into small, single-purpose files so humans an
 | [`architecture.md`](architecture.md) | package responsibilities, route registry/executor, Chat execution seam, replay safety, and data flow | implementation boundaries or design decisions change |
 | [`dashboard.md`](dashboard.md) | live browser traffic dashboard, route/attempt metrics, AI insights, and `/stats.json` | dashboard metrics, endpoints, insight routing, or stats behavior change |
 | [`menubar.md`](menubar.md) | macOS/Linux tray app usage | tray behavior or packaging changes |
-| [`development.md`](development.md) | build, test, route-safety, policy-routing, and Chat-over-Responses matrices, benchmark/evaluation baselines, and CI workflows | local dev, test gates, benchmark commands, evaluation gates, or CI change |
+| [`development.md`](development.md) | build, test, route-safety, policy-routing, and Chat-over-Responses matrices, benchmark/evaluation baselines, CI, and release entry points | local dev, test gates, benchmark commands, evaluation gates, CI, or release entry-point changes |
+| [`release-security.md`](release-security.md) | signed release identity, protected environments, build-once evidence, immutable publication, verification, Homebrew PRs, and incident response | release trust, artifact publication, signing keys, attestations/SBOMs, distribution channels, or rollback procedures change |
 
 ## Agent Notes
 

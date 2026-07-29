@@ -47,9 +47,11 @@ jobs:
           set -euo pipefail
 
           skip() {
-            printf 'approve=false\n' >> "$GITHUB_OUTPUT"
-            printf 'enable_auto_merge=false\n' >> "$GITHUB_OUTPUT"
-            printf 'reason=%s\n' "$1" >> "$GITHUB_OUTPUT"
+            {
+              printf 'approve=false\n'
+              printf 'enable_auto_merge=false\n'
+              printf 'reason=%s\n' "$1"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           }
 
@@ -107,10 +109,12 @@ jobs:
             reason=""
           fi
 
-          printf 'approve=%s\n' "${approve}" >> "$GITHUB_OUTPUT"
-          printf 'enable_auto_merge=%s\n' "${enable_auto_merge}" >> "$GITHUB_OUTPUT"
-          printf 'merge_flag=%s\n' "${merge_flag}" >> "$GITHUB_OUTPUT"
-          printf 'reason=%s\n' "${reason}" >> "$GITHUB_OUTPUT"
+          {
+            printf 'approve=%s\n' "${approve}"
+            printf 'enable_auto_merge=%s\n' "${enable_auto_merge}"
+            printf 'merge_flag=%s\n' "${merge_flag}"
+            printf 'reason=%s\n' "${reason}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Explain no-op
         if: ${{ !github.event.pull_request.draft && steps.state.outputs.approve != 'true' && steps.state.outputs.enable_auto_merge != 'true' }}

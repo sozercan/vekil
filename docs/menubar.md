@@ -8,13 +8,13 @@ The tray app runs Vekil without a terminal. It supports macOS and Linux; publish
 brew install --cask sozercan/repo/vekil
 ```
 
-The app is not Developer ID signed. If macOS quarantines it, run:
+Published app bundles are ad-hoc signed for bundle-integrity checks, but they are **not Developer ID signed and not notarized**. Homebrew runs the cask's quarantine-clearing postflight; if macOS still quarantines the app, or if you install the ZIP directly, run:
 
 ```bash
 xattr -cr /Applications/Vekil.app
 ```
 
-You can also download `vekil-macos-arm64.zip` from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest), unzip it, and open `Vekil.app`. Published app bundles are currently Apple Silicon (`arm64`) only; build from source on Intel Macs.
+You can also download `vekil-macos-arm64.zip` from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest), unzip it, and open `Vekil.app`. Published app bundles are currently Apple Silicon (`arm64`) only; build from source on Intel Macs. The Homebrew cask is updated through a protected tap pull request after the finalized archive is independently re-hashed, so a newly published GitHub release may appear before its cask PR merges.
 
 ## Build From Source
 
@@ -23,13 +23,13 @@ make build-app
 open "Vekil.app"
 ```
 
-`make build-app` downloads Sparkle, builds with the `sparkle` tag, embeds `Sparkle.framework`, and ad-hoc signs the bundle. Without `SPARKLE_PUBLIC_ED_KEY`, the app still builds but disables `Check for Updates…`.
+`make build-app` downloads Sparkle, builds with the `sparkle` tag, embeds `Sparkle.framework`, and ad-hoc signs the bundle. Without `SPARKLE_PUBLIC_ED_KEY`, the app still builds but disables `Check for Updates…`. The Sparkle signature authenticates updater archives; it does not provide Apple Developer ID identity or notarization.
 
 ```bash
 SPARKLE_PUBLIC_ED_KEY=your_public_key make build-app
 ```
 
-Release asset and updater-secret details live in [Development](development.md#release).
+Release asset, protected-key, verification, and incident-recovery details live in [Release Security](release-security.md). The private Sparkle key is needed only by the protected release path and must never be used for an ordinary local build.
 
 ## Menu Features
 

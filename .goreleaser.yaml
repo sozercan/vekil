@@ -30,9 +30,8 @@ archives:
 checksum:
   name_template: checksums.txt
 
+# Publication is deliberately owned by the protected finalizer in
+# .github/workflows/release.yaml. This prevents an accidental GoReleaser
+# invocation from gaining a second privileged publication path.
 release:
-  github:
-    owner: sozercan
-    name: vekil
-  draft: true
-  prerelease: auto
+  disable: true

@@ -10,6 +10,63 @@ permissions:
   contents: read
 
 jobs:
+  release-security:
+    name: Release contract and supply-chain gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out full source history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install pinned release security tools
+        run: scripts/release/install-tools.sh actionlint govulncheck gitleaks
+
+      - name: Validate every GitHub Actions workflow
+        run: actionlint -color -ignore 'unexpected key "queue" for "concurrency" section'
+
+      - name: Enforce the release workflow contract
+        run: scripts/release/test-release-workflow.sh
+
+      - name: Validate expiring vulnerability exceptions
+        run: scripts/release/validate-vulnerability-exceptions.py
+
+      - name: Run release helper and packaging tests
+        run: |
+          for test_script in scripts/tests/release-*.sh scripts/tests/publish-homebrew-cask-test.sh scripts/tests/external-input-*.sh scripts/tests/rtk-update-*.sh; do
+            [[ -e "${test_script}" ]] || continue
+            "${test_script}"
+          done
+
+      - name: Run reachable Go vulnerability analysis
+        run: govulncheck ./...
+
+      - name: Scan source for secrets
+        run: scripts/release/scan-secrets.sh .
+
+  dependency-review:
+    name: Review dependency changes
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Review newly introduced dependencies
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -121,20 +178,20 @@ jobs:
     needs: [lint, build, test, race]
     env:
       KIND_VERSION: v0.32.0
+      KIND_LINUX_AMD64_SHA256: 50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54
       KUBECTL_VERSION: v1.36.1
+      KUBECTL_LINUX_AMD64_SHA256: 629d3f410e09bf49b64ae7079f7f0bda1191efed311f7d37fdbab0ad5b0ec2b7
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install kind and kubectl
         run: |
           curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 -o /tmp/kind-linux-amd64 "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 -o /tmp/kind.sha256sum "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64.sha256sum"
-          (cd /tmp && sha256sum -c kind.sha256sum)
+          echo "${KIND_LINUX_AMD64_SHA256}  /tmp/kind-linux-amd64" | sha256sum -c -
           sudo install -m 0755 /tmp/kind-linux-amd64 /usr/local/bin/kind
 
           curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 -o /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 -o /tmp/kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
-          echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum -c -
+          echo "${KUBECTL_LINUX_AMD64_SHA256}  /tmp/kubectl" | sha256sum -c -
           sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
 
           kind version

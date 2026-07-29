@@ -1,4 +1,5 @@
-FROM golang:1.26 AS builder
+# Base image tag: golang:1.26
+FROM golang:1.26@sha256:3aff6657219a4d9c14e27fb1d8976c49c29fddb70ba835014f477e1c70636647 AS builder
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -6,31 +7,37 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /vekil .
 
-FROM debian:trixie-slim AS rtk-downloader
+# Base image tag: debian:trixie-slim
+FROM debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS rtk-downloader
 ARG RTK_VERSION=0.43.0
 ARG TARGETARCH
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl tar \
     && rm -rf /var/lib/apt/lists/*
 RUN set -eux; \
+    rtk_sha256_amd64="ff8a1e7766496e175291a85aeca1dc97c9ff6df33e51e5893d1fbc78fea2a609"; \
+    rtk_sha256_arm64="5519f7ca12e5c143a609f0d28a0a77b97413a8dce31c2681f1a41c24519a8731"; \
     arch="${TARGETARCH:-$(uname -m)}"; \
     case "${arch}" in \
-        amd64|x86_64) target="x86_64-unknown-linux-musl" ;; \
-        arm64|aarch64) target="aarch64-unknown-linux-gnu" ;; \
+        amd64|x86_64) target="x86_64-unknown-linux-musl"; expected_sha256="${rtk_sha256_amd64}" ;; \
+        arm64|aarch64) target="aarch64-unknown-linux-gnu"; expected_sha256="${rtk_sha256_arm64}" ;; \
         *) echo "unsupported RTK target architecture: ${arch}" >&2; exit 1 ;; \
     esac; \
+    case "${expected_sha256}" in \
+        *[!0-9a-f]*|'') echo "invalid pinned RTK SHA-256 for ${arch}" >&2; exit 1 ;; \
+    esac; \
+    [ "${#expected_sha256}" -eq 64 ]; \
     version="${RTK_VERSION#v}"; \
     archive="rtk-${target}.tar.gz"; \
     base_url="https://github.com/rtk-ai/rtk/releases/download/v${version}"; \
-    curl -fsSLo "/tmp/${archive}" "${base_url}/${archive}"; \
-    curl -fsSLo /tmp/checksums.txt "${base_url}/checksums.txt"; \
-    checksum="$(grep "  ${archive}$" /tmp/checksums.txt)"; \
-    printf '%s\n' "${checksum}" | (cd /tmp && sha256sum -c -); \
+    curl --fail --show-error --location --proto '=https' --tlsv1.2 --retry 3 --output "/tmp/${archive}" "${base_url}/${archive}"; \
+    printf '%s  %s\n' "${expected_sha256}" "/tmp/${archive}" | sha256sum -c -; \
     tar -xzf "/tmp/${archive}" -C /usr/local/bin rtk; \
     chmod 0755 /usr/local/bin/rtk; \
     /usr/local/bin/rtk --version
 
-FROM gcr.io/distroless/cc-debian13:nonroot
+# Base image tag: gcr.io/distroless/cc-debian13:nonroot
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
 COPY --from=builder /vekil /vekil
 COPY --from=rtk-downloader /usr/local/bin/rtk /usr/local/bin/rtk
 ENV HOST=0.0.0.0

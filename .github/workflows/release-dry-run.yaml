@@ -1,0 +1,559 @@
+name: Release Dry Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit, branch, or signed prerelease tag to build
+        required: true
+        type: string
+      version:
+        description: Prerelease version used inside staged artifacts (for example v1.2.3-rc.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-dry-run-${{ inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  GORELEASER_VERSION: v2.17.1
+  TRIVY_VERSION: v0.72.0
+  RELEASE_ARTIFACT_RETENTION_DAYS: "2"
+
+jobs:
+  preflight:
+    name: Verify dry-run source and release contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      tag_object: ${{ steps.source.outputs.tag_object }}
+      version: ${{ steps.source.outputs.version }}
+    steps:
+      - name: Check out requested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Validate prerelease version and source identity
+        id: source
+        env:
+          DRY_RUN_REF: ${{ inputs.ref }}
+          DRY_RUN_VERSION: ${{ inputs.version }}
+          RELEASE_SIGNING_PUBLIC_KEY: ${{ vars.RELEASE_SIGNING_PUBLIC_KEY }}
+          RELEASE_SIGNING_PRINCIPAL: ${{ vars.RELEASE_SIGNING_PRINCIPAL }}
+          RELEASE_SIGNING_FINGERPRINT: ${{ vars.RELEASE_SIGNING_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${DRY_RUN_VERSION}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-([0-9A-Za-z-]+)(\.[0-9A-Za-z-]+)*$ ]]; then
+            echo "dry-run version must be an explicit SemVer prerelease" >&2
+            exit 1
+          fi
+          prerelease="${DRY_RUN_VERSION#*-}"
+          while :; do
+            identifier="${prerelease%%.*}"
+            if [[ "${identifier}" =~ ^[0-9]+$ && ${#identifier} -gt 1 && "${identifier}" == 0* ]]; then
+              echo "numeric prerelease identifiers must not contain leading zeroes" >&2
+              exit 1
+            fi
+            [[ "${prerelease}" == *.* ]] || break
+            prerelease="${prerelease#*.}"
+          done
+
+          if git show-ref --verify --quiet "refs/tags/${DRY_RUN_REF}"; then
+            if [[ "${DRY_RUN_REF}" != "${DRY_RUN_VERSION}" ]]; then
+              echo "signed tag dry runs require ref and version to match" >&2
+              exit 1
+            fi
+            RELEASE_EXPECTED_COMMIT="$(git rev-parse HEAD)" \
+              scripts/release/verify-release-tag.sh "${DRY_RUN_REF}"
+          else
+            commit="$(git rev-parse HEAD)"
+            tag_date="$(git show -s --format=%cI "${commit}")"
+            GIT_COMMITTER_DATE="${tag_date}" git \
+              -c user.name="Vekil release dry run" \
+              -c user.email="release-dry-run@vekil.invalid" \
+              tag -a "${DRY_RUN_VERSION}" "${commit}" -m "Vekil release dry run ${DRY_RUN_VERSION}"
+            tag_object="$(git rev-parse "refs/tags/${DRY_RUN_VERSION}")"
+            git tag -d "${DRY_RUN_VERSION}" >/dev/null
+            {
+              echo "commit=${commit}"
+              echo "tag_object=${tag_object}"
+              echo "version=${DRY_RUN_VERSION#v}"
+            } >>"${GITHUB_OUTPUT}"
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install pinned release security tools
+        run: scripts/release/install-tools.sh actionlint govulncheck gitleaks
+
+      - name: Validate workflows and release contract
+        run: |
+          actionlint -color -ignore 'unexpected key "queue" for "concurrency" section'
+          scripts/release/test-release-workflow.sh
+
+      - name: Validate expiring vulnerability exceptions
+        run: scripts/release/validate-vulnerability-exceptions.py
+
+      - name: Test, vet, and scan the requested source
+        run: |
+          make test
+          make vet
+          govulncheck ./...
+          scripts/release/scan-secrets.sh .
+
+  build-cli:
+    name: Dry-run CLI build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: preflight
+    permissions:
+      contents: read
+    steps:
+      - name: Check out requested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install pinned SBOM tool
+        run: scripts/release/install-tools.sh syft
+
+      - name: Build a non-publishing GoReleaser snapshot
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: v2.17.1
+          args: release --snapshot --clean --skip=publish
+        env:
+          GORELEASER_CURRENT_TAG: ${{ inputs.version }}
+
+      - name: Stage CLI snapshot and SBOMs
+        run: |
+          set -euo pipefail
+          mkdir -p dry-run-cli
+          jq -r '.[] | select(.type == "Binary" and (.name | test("^vekil-(darwin|linux|windows)-"))) | [.path, .name] | @tsv' dist/artifacts.json \
+            | while IFS=$'\t' read -r source name; do cp "${source}" "dry-run-cli/${name}"; done
+          cp dist/checksums.txt dry-run-cli/checksums.txt
+          (cd dry-run-cli && sha256sum --check checksums.txt)
+          for binary in dry-run-cli/vekil-*; do
+            syft "file:${binary}" --output "spdx-json=${binary}.spdx.json"
+          done
+
+      - name: Upload dry-run CLI payload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dry-run-cli-${{ github.run_id }}
+          path: dry-run-cli/*
+          if-no-files-found: error
+          retention-days: ${{ env.RELEASE_ARTIFACT_RETENTION_DAYS }}
+          overwrite: false
+
+  build-macos:
+    name: Dry-run macOS build and Sparkle signing
+    runs-on: macos-26
+    timeout-minutes: 30
+    needs: preflight
+    permissions:
+      contents: read
+    steps:
+      - name: Check out requested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install pinned SBOM tool
+        run: scripts/release/install-tools.sh syft
+
+      - name: Generate an ephemeral dry-run Sparkle keypair
+        run: |
+          set -euo pipefail
+          umask 077
+          openssl genpkey -algorithm ED25519 -out dry-run-sparkle.pem
+          openssl pkey -in dry-run-sparkle.pem -outform DER | tail -c 32 | base64 >dry-run-sparkle-private
+          openssl pkey -in dry-run-sparkle.pem -pubout -outform DER | tail -c 32 | base64 >dry-run-sparkle-public
+
+      - name: Build, archive, and describe the macOS app
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          SPARKLE_PUBLIC_ED_KEY="$(cat dry-run-sparkle-public)" GOARCH=arm64 make build-app
+          mkdir -p dry-run-macos
+          codesign --verify --deep --strict --verbose=4 Vekil.app 2>&1 | tee dry-run-macos/codesign-verification.txt
+          ditto -c -k --sequesterRsrc --keepParent Vekil.app dry-run-macos/vekil-macos-arm64.zip
+          syft dir:Vekil.app --output spdx-json=dry-run-macos/vekil-macos-arm64.spdx.json
+
+      - name: Generate and verify a dry-run appcast
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          .build/sparkle/unpacked/bin/generate_appcast \
+            --ed-key-file dry-run-sparkle-private \
+            --download-url-prefix "https://example.invalid/dry-run/" \
+            --maximum-deltas 0 \
+            -o dry-run-macos/appcast.xml \
+            dry-run-macos
+          scripts/release/verify-sparkle-update.sh \
+            dry-run-macos/vekil-macos-arm64.zip \
+            dry-run-macos/appcast.xml \
+            "$(cat dry-run-sparkle-public)" \
+            "https://example.invalid/dry-run/vekil-macos-arm64.zip" \
+            "${RELEASE_VERSION}"
+          (cd dry-run-macos && shasum -a 256 vekil-macos-arm64.zip appcast.xml >macos-checksums.txt)
+          key_size="$(wc -c <dry-run-sparkle-private | tr -d ' ')"
+          dd if=/dev/zero of=dry-run-sparkle-private bs=1 count="${key_size}" conv=notrunc >/dev/null 2>&1
+          : >dry-run-sparkle-private
+          rm -f dry-run-sparkle-private dry-run-sparkle-public dry-run-sparkle.pem
+
+      - name: Upload dry-run macOS payload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dry-run-macos-${{ github.run_id }}
+          path: dry-run-macos/*
+          if-no-files-found: error
+          retention-days: ${{ env.RELEASE_ARTIFACT_RETENTION_DAYS }}
+          overwrite: false
+
+  build-images:
+    name: Dry-run OCI layouts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: preflight
+    permissions:
+      contents: read
+    outputs:
+      standard_digest: ${{ steps.standard.outputs.digest }}
+      rtk_digest: ${{ steps.rtk.outputs.digest }}
+    steps:
+      - name: Check out requested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Docker with the containerd image store
+        uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5.4.0
+        with:
+          version: v29.6.2
+          daemon-config: |
+            {
+              "features": {
+                "containerd-snapshotter": true
+              }
+            }
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.35.0
+          driver-opts: image=docker.io/moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
+      - name: Build standard multi-platform OCI layout without pushing
+        id: standard
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          load: true
+          tags: vekil-dry-run:${{ github.run_id }}
+          outputs: type=oci,dest=${{ runner.temp }}/vekil.oci.tar
+          provenance: mode=max
+          sbom: true
+
+      - name: Build RTK multi-platform OCI layout without pushing
+        id: rtk
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile.rtk
+          platforms: linux/amd64,linux/arm64
+          push: false
+          load: true
+          tags: vekil-dry-run:${{ github.run_id }}-rtk
+          outputs: type=oci,dest=${{ runner.temp }}/vekil-rtk.oci.tar
+          provenance: mode=max
+          sbom: true
+
+      - name: Verify local OCI SBOM and provenance attestations
+        run: |
+          python3 - "${RUNNER_TEMP}/vekil.oci.tar" "${RUNNER_TEMP}/vekil-rtk.oci.tar" <<'PY'
+          import json
+          import sys
+          import tarfile
+
+          expected = {"https://slsa.dev/provenance/v1", "https://spdx.dev/Document"}
+          for archive_name in sys.argv[1:]:
+              with tarfile.open(archive_name) as archive:
+                  members = {member.name: member for member in archive.getmembers()}
+
+                  def load_json(name):
+                      handle = archive.extractfile(members[name])
+                      if handle is None:
+                          raise SystemExit(f"missing OCI object {name} in {archive_name}")
+                      return json.load(handle)
+
+                  index = load_json("index.json")
+                  if len(index.get("manifests", [])) != 1:
+                      raise SystemExit(f"unexpected OCI layout root count in {archive_name}")
+                  root_digest = index["manifests"][0]["digest"].removeprefix("sha256:")
+                  root = load_json(f"blobs/sha256/{root_digest}")
+                  attestations = [
+                      item for item in root.get("manifests", [])
+                      if item.get("annotations", {}).get("vnd.docker.reference.type") == "attestation-manifest"
+                  ]
+                  if len(attestations) != 2:
+                      raise SystemExit(f"expected two platform attestation manifests in {archive_name}")
+                  for item in attestations:
+                      digest = item["digest"].removeprefix("sha256:")
+                      manifest = load_json(f"blobs/sha256/{digest}")
+                      predicates = {
+                          layer.get("annotations", {}).get("in-toto.io/predicate-type")
+                          for layer in manifest.get("layers", [])
+                      }
+                      if not expected.issubset(predicates):
+                          raise SystemExit(f"missing OCI SBOM/provenance predicate in {archive_name}")
+          PY
+
+      - name: Smoke-test the exact loaded multi-platform images
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            docker run --rm --platform "${platform}" "vekil-dry-run:${GITHUB_RUN_ID}" --help >/dev/null
+            docker run --rm --platform "${platform}" "vekil-dry-run:${GITHUB_RUN_ID}-rtk" --help >/dev/null
+            docker run --rm --platform "${platform}" --entrypoint /usr/local/bin/rtk \
+              "vekil-dry-run:${GITHUB_RUN_ID}-rtk" --version >/dev/null
+          done
+
+      - name: Scan standard amd64 OCI layout
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          input: ${{ runner.temp }}/vekil.oci.tar
+          version: v0.72.0
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: "1"
+          format: json
+          output: trivy-standard-amd64.json
+          timeout: 20m0s
+
+      - name: Scan standard arm64 OCI layout
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          input: ${{ runner.temp }}/vekil.oci.tar
+          version: v0.72.0
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: "1"
+          format: json
+          output: trivy-standard-arm64.json
+          timeout: 20m0s
+
+      - name: Scan RTK amd64 OCI layout
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          input: ${{ runner.temp }}/vekil-rtk.oci.tar
+          version: v0.72.0
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: "1"
+          format: json
+          output: trivy-rtk-amd64.json
+          timeout: 20m0s
+
+      - name: Scan RTK arm64 OCI layout
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          input: ${{ runner.temp }}/vekil-rtk.oci.tar
+          version: v0.72.0
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: "1"
+          format: json
+          output: trivy-rtk-arm64.json
+          timeout: 20m0s
+
+      - name: Stage dry-run OCI evidence
+        run: |
+          mkdir dry-run-images
+          cp "${RUNNER_TEMP}/vekil.oci.tar" dry-run-images/
+          cp "${RUNNER_TEMP}/vekil-rtk.oci.tar" dry-run-images/
+          mv trivy-standard-amd64.json trivy-standard-arm64.json \
+            trivy-rtk-amd64.json trivy-rtk-arm64.json dry-run-images/
+
+      - name: Upload dry-run OCI layouts and scans
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dry-run-images-${{ github.run_id }}
+          path: dry-run-images/*
+          if-no-files-found: error
+          retention-days: ${{ env.RELEASE_ARTIFACT_RETENTION_DAYS }}
+          overwrite: false
+
+  assemble:
+    name: Assemble dry-run manifest and evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [preflight, build-cli, build-macos, build-images]
+    permissions:
+      contents: read
+    steps:
+      - name: Check out requested release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          persist-credentials: false
+
+      - name: Download every dry-run artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dry-run-*-${{ github.run_id }}
+          path: dry-run
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install pinned secret scanner
+        run: scripts/release/install-tools.sh gitleaks
+
+      - name: Render a non-publishing Homebrew cask
+        env:
+          DRY_RUN_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir dry-run-homebrew
+          sha256="$(sha256sum dry-run/vekil-macos-arm64.zip | awk '{print $1}')"
+          scripts/publish-homebrew-cask.sh "${DRY_RUN_VERSION#v}" "${sha256}" dry-run-homebrew
+          cp dry-run-homebrew/Casks/vekil.rb dry-run/vekil.rb
+          ruby -c dry-run/vekil.rb
+
+      - name: Scan the complete dry-run payload
+        run: scripts/release/scan-secrets.sh dry-run
+
+      - name: Generate deterministic dry-run manifest
+        env:
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.version }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          RELEASE_WORKFLOW: ${{ github.workflow_ref }}
+          RELEASE_RUN_ID: ${{ github.run_id }}
+          OCI_STANDARD_DIGEST: ${{ needs.build-images.outputs.standard_digest }}
+          OCI_RTK_DIGEST: ${{ needs.build-images.outputs.rtk_digest }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+
+          text = f"""# Release dry run
+
+          Built and verified commit `{os.environ['RELEASE_COMMIT']}` as `{os.environ['RELEASE_TAG']}` without release, package, or tap write credentials.
+          The payload includes CLI binaries, a signed test appcast, macOS and CLI SBOMs, multi-platform OCI layouts with BuildKit provenance/SBOM attestations, a rendered Homebrew cask, scanner reports, and a deterministic manifest.
+          """
+          pathlib.Path("dry-run/release-evidence.md").write_text(text)
+          PY
+
+          images_json="$(jq -nc \
+            --arg repository "ghcr.io/${GITHUB_REPOSITORY}" \
+            --arg tag "${RELEASE_TAG}-dry-run" \
+            --arg standard "${OCI_STANDARD_DIGEST}" \
+            --arg rtk "${OCI_RTK_DIGEST}" \
+            '[{repository:$repository,tag:$tag,digest:$standard},{repository:$repository,tag:($tag+"-rtk"),digest:$rtk}]')"
+          export RELEASE_IMAGES_JSON="${images_json}"
+          export RELEASE_SCANS_JSON='[{"name":"dry-run-artifact-gitleaks","status":"passed","exceptions":[]},{"name":"dry-run-govulncheck","status":"passed","exceptions":[]},{"name":"dry-run-oci-rtk-amd64-trivy","status":"passed","exceptions":[]},{"name":"dry-run-oci-rtk-arm64-trivy","status":"passed","exceptions":[]},{"name":"dry-run-oci-standard-amd64-trivy","status":"passed","exceptions":[]},{"name":"dry-run-oci-standard-arm64-trivy","status":"passed","exceptions":[]},{"name":"dry-run-source-gitleaks","status":"passed","exceptions":[]}]'
+          vulnerability_exceptions_json="$(scripts/release/validate-vulnerability-exceptions.py)"
+          export RELEASE_VULNERABILITY_EXCEPTIONS_JSON="${vulnerability_exceptions_json}"
+          go_version="$(go version)"
+          export RELEASE_GO_VERSION="${go_version}"
+
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          root = pathlib.Path("dry-run")
+          metadata = {}
+          for path in sorted(root.iterdir()):
+              if not path.is_file() or path.name == "release-manifest.json":
+                  continue
+              entry = {}
+              if path.name.startswith(("vekil-linux-", "vekil-darwin-", "vekil-windows-")) and not path.name.endswith(".spdx.json"):
+                  sbom = f"{path.name}.spdx.json"
+                  if (root / sbom).is_file():
+                      entry["sbom"] = sbom
+              elif path.name == "vekil-macos-arm64.zip":
+                  entry["sbom"] = "vekil-macos-arm64.spdx.json"
+              if entry:
+                  metadata[path.name] = entry
+          pathlib.Path("artifact-metadata.json").write_text(json.dumps(metadata, sort_keys=True))
+          PY
+          artifact_metadata_json="$(cat artifact-metadata.json)"
+          export RELEASE_ARTIFACT_METADATA_JSON="${artifact_metadata_json}"
+
+          scripts/release/generate-release-manifest.py \
+            --artifact-dir dry-run \
+            --output dry-run/release-manifest.json
+          scripts/release/verify-release-manifest.py \
+            --artifact-dir dry-run \
+            --manifest dry-run/release-manifest.json
+
+      - name: Upload complete short-lived dry-run evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-dry-run-${{ github.run_id }}
+          path: dry-run/*
+          if-no-files-found: error
+          retention-days: ${{ env.RELEASE_ARTIFACT_RETENTION_DAYS }}
+          overwrite: false
