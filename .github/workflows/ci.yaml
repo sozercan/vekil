@@ -42,6 +42,9 @@ jobs:
           scripts/tests/live-smoke-reliability-test.sh
           scripts/tests/live-chat-over-responses-smoke-test.sh
 
+      - name: Native macOS release tooling tests
+        run: make test-macos-release-tools
+
       - name: Provider routing process smoke
         run: scripts/tests/live-provider-routing-smoke-test.sh
 

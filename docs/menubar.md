@@ -1,6 +1,12 @@
-# macOS/Linux Tray App
+# macOS App and Linux Tray
 
 The tray app runs Vekil without a terminal. It supports macOS and Linux; published macOS app bundles also include Sparkle update checks.
+
+## Implementation And Release Status
+
+The currently published `Vekil.app` is the Go/systray shell in `cmd/menubar`. It runs the proxy in the same process, uses the legacy LaunchAgent integration for launch at login, opens the browser dashboard, and is packaged as an ad-hoc-signed Apple Silicon app.
+
+The current source tree implements the native macOS 13 shell and its build-once pipeline: AppKit/SwiftUI application and status menu, singleton/window lifecycle, Swift `RuntimeController`, versioned JSONL Go helper, External Configuration switching, login-item migration, Keychain support services, native analytics, universal packaging, Sparkle 2.9.4 appcast tooling, and fail-closed release gates. This is implemented and locally testable source, not yet the published replacement. Production Developer ID signing/notarization, real N-1 Sparkle replacement, cross-version Keychain continuity, exact-artifact Homebrew installation, and forward-revert recovery remain external [release gates](development.md#native-macos-shell-and-release-gates).
 
 ## macOS Install
 
@@ -23,13 +29,20 @@ make build-app
 open "Vekil.app"
 ```
 
-`make build-app` downloads Sparkle, builds with the `sparkle` tag, embeds `Sparkle.framework`, and ad-hoc signs the bundle. Without `SPARKLE_PUBLIC_ED_KEY`, the app still builds but disables `Check for Updates…`.
+Quit any installed Vekil app before opening the source build. The published and native bundles both use `com.vekil.menubar`, so macOS otherwise activates the already-running installed app instead of launching the repository bundle.
+
+`make build-app` builds the Swift product and Go helper for `arm64` and `x86_64`, combines both slices, embeds checksum-verified Sparkle 2.9.4, writes the shared release manifest/build ID, and ad-hoc signs the local development bundle. The existing Sparkle feed URL and public key come from `build-support/macos/app-config.json`.
+
+Validate source and the assembled app with:
 
 ```bash
-SPARKLE_PUBLIC_ED_KEY=your_public_key make build-app
+go test ./internal/appcontrol ./internal/macosruntime ./cmd/macos-runtime -count=1
+swift test --package-path mac/VekilApp
+make test-app
+MACOS_SMOKE_ARCHES="arm64 x86_64" make smoke-app
 ```
 
-Release asset and updater-secret details live in [Development](development.md#release).
+`make build-legacy-app` retains the old Go/systray shell for forward-revert qualification; it is not the native release artifact. Production signing/notarization and exact-artifact promotion details live in [Development](development.md#native-macos-shell-and-release-gates).
 
 ## Menu Features
 
@@ -57,9 +70,25 @@ Use `Choose Providers Config…` to select the same JSON/YAML file you would pas
 
 Startup authentication and semantic-policy classifier preflight run in a cancellable worker. Provider-config and authentication actions are temporarily disabled while that worker is active, while Quit and the other tray events remain responsive. Use **Cancel Starting Vekil** to abort startup; Vekil closes any listener opened by the canceled attempt before an automatic config restart can begin.
 
+## Native Shell Behavior
+
+The implemented native source keeps the proxy app-owned: the Swift shell owns one helper process and both pipes, and quitting Vekil shuts down the helper and listener. It does not install a persistent proxy daemon.
+
+- **Open at Login** and **Start proxy when the app launches** are separate preferences and default off.
+- Auto-start is evaluated once after helper/configuration initialization. Reopen, **Open Vekil**, and second-launch activation do not evaluate it again.
+- Cold, login, and update relaunches remain menu-only. **Open Vekil**, application reopen, and a second launch reveal the durable main window.
+- The native status menu is intentionally compact: one status/configuration summary, an inline warning when needed, the lifecycle action (**Start Proxy**, **Cancel Starting**, **Stop Proxy**, or disabled **Stopping…**), **Open Vekil…**, **Settings…**, context-only **Copy Base URL**, and **Quit Vekil**.
+- The main window owns detailed controls: Overview shows status and endpoint actions, Providers owns authentication and configuration, and Settings owns login/startup/update preferences. Low-level runtime and revision fields are collapsed under Overview diagnostics.
+- **Open Vekil…** restores the previously selected destination; **Settings…** opens that same durable window directly on Settings.
+- Background auto-start does not open an interactive device flow; missing Copilot credentials leave the proxy stopped in an authentication-required state.
+- Zero-config Copilot remains available. A selected **External Configuration** stays user-owned and is never written or normalized by Swift.
+- Managed configuration changes require explicit **Validate and Apply** and preserve prior running/stopped intent through the helper transaction.
+
+The source includes Overview, Traffic, Requests, Providers, and Settings. These views are not current release behavior until a native bundle passes the release gates above; the published Go app continues to use **Open Dashboard** for traffic and request analytics.
+
 ## Linux Tray
 
-The same tray app runs on Linux using the DBus StatusNotifierItem protocol, supported by Waybar, KDE Plasma, GNOME with the AppIndicator extension, and others.
+The Linux tray is not replaced by the native macOS shell. It remains the Go `cmd/menubar` target and uses the DBus StatusNotifierItem protocol, supported by Waybar, KDE Plasma, GNOME with the AppIndicator extension, and others.
 
 ```bash
 make build-tray-linux
@@ -72,7 +101,7 @@ Cross-compile by setting `GOARCH`, for example:
 GOARCH=arm64 make build-tray-linux
 ```
 
-Linux supports the same start/stop, status, auth, provider-config, and XDG autostart features as macOS. `Check for Updates…` is macOS-only.
+Linux preserves the Go-shell start/stop, status, auth, provider-config, and XDG autostart features. Keychain, SwiftUI, and Sparkle behavior is macOS-only.
 
 Dialogs, notifications, and sign-in use DBus directly when possible. Optional helpers improve desktop integration:
 

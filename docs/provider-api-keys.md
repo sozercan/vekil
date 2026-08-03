@@ -14,6 +14,21 @@ Provider portals, free tiers, and model catalogs change frequently. Treat the li
 - Keep `models[].endpoints` limited to routes you have validated for that model. Vekil does not infer `/responses` from OpenAI compatibility.
 - Do not paste provider keys into client configs. Clients point at Vekil with dummy local keys; Vekil holds the upstream provider credentials.
 
+## macOS Managed Provider Secrets
+
+The CLI, server, published Go tray, and user-owned External Configuration files continue to use the key handling above. Selecting an External Configuration does not import its credentials into Keychain.
+
+The native source implements the managed-secret boundary:
+
+- Swift stores app-managed provider secrets in Keychain service `com.vekil.menubar.providers`.
+- Accounts derive from stable provider UUID, secret role, and secret generation, so rename/reorder does not retarget a key.
+- Managed YAML contains generated `api_key_env` references but no secret value.
+- The helper receives one complete write-only secret projection and resolves references through an immutable provider-scoped resolver; it does not install managed values into `os.Environ` or child-process environments.
+- Values are excluded from managed YAML, helper state, the apply journal, UserDefaults, logs, protocol responses, errors, diagnostics, and copied output.
+- Superseded generations remain available through commit or rollback, then are removed.
+
+The Keychain store, generation manager, helper projection, and Go apply/rollback transaction are implemented source; the current native Providers view does not enable managed editing. A real Developer ID-signed Sparkle A-to-B update must prove Keychain create/read/update/delete continuity without prompts or authorization failures before the editor or managed Keychain providers are release-enabled. Unit tests and same-build Keychain CRUD do not replace that external gate.
+
 ## Built-In Provider Auth
 
 | Provider | How To Authenticate | Vekil Config |

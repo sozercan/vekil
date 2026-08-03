@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
@@ -617,6 +616,10 @@ func validateProviderConfigDescriptors(configured []ProviderConfig, allowRouteOn
 }
 
 func validateProviderRuntimeEnvironment(cfg ProviderConfig, providerIndex int) error {
+	return validateProviderRuntimeEnvironmentWithResolver(cfg, providerIndex, nil)
+}
+
+func validateProviderRuntimeEnvironmentWithResolver(cfg ProviderConfig, providerIndex int, resolver ProviderSecretResolver) error {
 	if strings.TrimSpace(cfg.APIKey) != "" {
 		return nil
 	}
@@ -624,7 +627,7 @@ func validateProviderRuntimeEnvironment(cfg ProviderConfig, providerIndex int) e
 	if envName == "" {
 		return nil
 	}
-	if strings.TrimSpace(os.Getenv(envName)) == "" {
+	if resolveProviderSecret(resolver, strings.TrimSpace(cfg.ID), envName) == "" {
 		return configPathError(
 			fmt.Sprintf("providers[%d].api_key_env", providerIndex),
 			"environment variable %q is not set or is empty",

@@ -42,6 +42,25 @@ const (
 
 type providerModelDiscovery string
 
+// ProviderSecretResolver resolves an api_key_env reference within one provider
+// scope. Implementations must not return mutable backing storage or expose
+// secret values through errors. A configured resolver is authoritative: a
+// missing value does not fall back to os.Environ.
+type ProviderSecretResolver interface {
+	ResolveProviderSecret(providerID, reference string) (string, bool)
+}
+
+// ProviderSecretResolverFunc adapts a function to ProviderSecretResolver.
+type ProviderSecretResolverFunc func(providerID, reference string) (string, bool)
+
+// ResolveProviderSecret implements ProviderSecretResolver.
+func (f ProviderSecretResolverFunc) ResolveProviderSecret(providerID, reference string) (string, bool) {
+	if f == nil {
+		return "", false
+	}
+	return f(providerID, reference)
+}
+
 const (
 	providerModelDiscoveryStatic          providerModelDiscovery = "static"
 	providerModelDiscoveryOpenAI          providerModelDiscovery = "openai"
@@ -249,22 +268,33 @@ func (e *providerRequestError) Unwrap() error {
 }
 
 func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
-	var cfg ProvidersConfig
 	path = strings.TrimSpace(path)
 	if path == "" {
-		return cfg, nil
+		return ProvidersConfig{}, nil
 	}
 
 	body, err := os.ReadFile(path)
 	if err != nil {
-		return cfg, fmt.Errorf("read providers config %q: %w", path, err)
+		return ProvidersConfig{}, fmt.Errorf("read providers config %q: %w", path, err)
 	}
-	if err := decodeProvidersConfigFile(path, body, &cfg); err != nil {
+	return LoadProvidersConfigBytes(path, body)
+}
+
+// LoadProvidersConfigBytes decodes and validates one immutable configuration
+// snapshot. name is used only for format selection and sanitized error context;
+// callers remain responsible for reading the bytes safely.
+func LoadProvidersConfigBytes(name string, body []byte) (ProvidersConfig, error) {
+	var cfg ProvidersConfig
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "providers.yaml"
+	}
+	if err := decodeProvidersConfigFile(name, body, &cfg); err != nil {
 		return cfg, err
 	}
 	validated, err := validateAndNormalizeProvidersConfig(cfg)
 	if err != nil {
-		return cfg, fmt.Errorf("validate providers config %q: %w", path, err)
+		return cfg, fmt.Errorf("validate providers config %q: %w", name, err)
 	}
 	return validated.config, nil
 }
@@ -714,12 +744,22 @@ func (ps *providerSetup) modelsForProvider(providerID string) []providerModel {
 }
 
 func (h *ProxyHandler) initializeProviders() error {
+	return h.initializeProvidersContext(context.Background())
+}
+
+func (h *ProxyHandler) initializeProvidersContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(h.providersConfig.Providers) == 0 {
 		h.providersState = defaultProviderSetup(h)
 		return nil
 	}
 
-	setup, err := h.buildConfiguredProviderSetupWithDynamicValidation(context.Background(), h.providersConfig, !h.deferDynamicProviderModelRefresh)
+	setup, err := h.buildConfiguredProviderSetupWithDynamicValidation(ctx, h.providersConfig, !h.deferDynamicProviderModelRefresh)
 	if err != nil {
 		return err
 	}
@@ -1101,12 +1141,12 @@ func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*provider
 
 	for providerIndex, raw := range cfg.Providers {
 		if providersConfigSchemaUsesStrictDecoding(validated.schemaVersion) {
-			if err := validateProviderRuntimeEnvironment(raw, providerIndex); err != nil {
+			if err := validateProviderRuntimeEnvironmentWithResolver(raw, providerIndex, h.providerSecretResolver); err != nil {
 				return nil, nil, "", err
 			}
 		}
 		_, allowEmptyStaticModels := validated.routeReferencedProviders[strings.TrimSpace(raw.ID)]
-		provider, err := buildProviderRuntimeForProvidersConfig(raw, h.copilotURL, h.azureIdentityTokenSourceFactory, allowEmptyStaticModels)
+		provider, err := buildProviderRuntimeForProvidersConfigWithResolver(raw, h.copilotURL, h.azureIdentityTokenSourceFactory, allowEmptyStaticModels, h.providerSecretResolver)
 		if err != nil {
 			if providersConfigSchemaUsesStrictDecoding(validated.schemaVersion) {
 				return nil, nil, "", configPathError(fmt.Sprintf("providers[%d]", providerIndex), "%v", err)
@@ -1168,6 +1208,10 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string, azureIde
 }
 
 func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotURL string, azureIdentityFactory azureIdentityTokenSourceFactory, allowEmptyStaticModels bool) (*providerRuntime, error) {
+	return buildProviderRuntimeForProvidersConfigWithResolver(cfg, defaultCopilotURL, azureIdentityFactory, allowEmptyStaticModels, nil)
+}
+
+func buildProviderRuntimeForProvidersConfigWithResolver(cfg ProviderConfig, defaultCopilotURL string, azureIdentityFactory azureIdentityTokenSourceFactory, allowEmptyStaticModels bool, resolver ProviderSecretResolver) (*providerRuntime, error) {
 	id := strings.TrimSpace(cfg.ID)
 	if id == "" {
 		return nil, fmt.Errorf("provider id is required")
@@ -1244,7 +1288,7 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 			runtime.authMode = providerAuthModeAPIKey
 			runtime.apiKey = strings.TrimSpace(cfg.APIKey)
 			if runtime.apiKey == "" && strings.TrimSpace(cfg.APIKeyEnv) != "" {
-				runtime.apiKey = strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.APIKeyEnv)))
+				runtime.apiKey = resolveProviderSecret(resolver, id, strings.TrimSpace(cfg.APIKeyEnv))
 			}
 			if runtime.apiKey == "" {
 				return nil, fmt.Errorf("provider %q must set api_key or api_key_env", id)
@@ -1302,7 +1346,7 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 		if err != nil {
 			return nil, err
 		}
-		authType, authHeader, authPrefix, apiKey, err := configuredGenericProviderAuth(cfg)
+		authType, authHeader, authPrefix, apiKey, err := configuredGenericProviderAuthWithResolver(cfg, resolver)
 		if err != nil {
 			return nil, fmt.Errorf("provider %q: %w", id, err)
 		}
@@ -1388,10 +1432,14 @@ func normalizeProviderPath(configured, fallback, field string) (string, error) {
 }
 
 func configuredGenericProviderAuth(cfg ProviderConfig) (providerAuthType, string, string, string, error) {
+	return configuredGenericProviderAuthWithResolver(cfg, nil)
+}
+
+func configuredGenericProviderAuthWithResolver(cfg ProviderConfig, resolver ProviderSecretResolver) (providerAuthType, string, string, string, error) {
 	apiKey := strings.TrimSpace(cfg.APIKey)
 	apiKeyEnv := strings.TrimSpace(cfg.APIKeyEnv)
 	if apiKey == "" && apiKeyEnv != "" {
-		apiKey = strings.TrimSpace(os.Getenv(apiKeyEnv))
+		apiKey = resolveProviderSecret(resolver, strings.TrimSpace(cfg.ID), apiKeyEnv)
 		if apiKey == "" {
 			return "", "", "", "", fmt.Errorf("api_key_env %q is not set or is empty", apiKeyEnv)
 		}
@@ -1437,6 +1485,22 @@ func configuredGenericProviderAuth(cfg ProviderConfig) (providerAuthType, string
 		return "", "", "", "", fmt.Errorf("auth_header %q is invalid", authHeader)
 	}
 	return authType, http.CanonicalHeaderKey(authHeader), authPrefix, apiKey, nil
+}
+
+func resolveProviderSecret(resolver ProviderSecretResolver, providerID, reference string) string {
+	providerID = strings.TrimSpace(providerID)
+	reference = strings.TrimSpace(reference)
+	if reference == "" {
+		return ""
+	}
+	if resolver != nil {
+		value, ok := resolver.ResolveProviderSecret(providerID, reference)
+		if !ok {
+			return ""
+		}
+		return strings.TrimSpace(value)
+	}
+	return strings.TrimSpace(os.Getenv(reference))
 }
 
 func configuredProviderExtraHeaders(configured map[string]string) (http.Header, error) {

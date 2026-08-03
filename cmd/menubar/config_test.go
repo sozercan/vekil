@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -288,4 +289,64 @@ func stubUserConfigDir(t *testing.T) string {
 	})
 
 	return tmpDir
+}
+
+func TestVersionedNativeStateIsPreservedByForwardRevertEdits(t *testing.T) {
+	configDir := stubUserConfigDir(t)
+	configPath := filepath.Join(configDir, "vekil", menubarConfigFilename)
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	initial := `{
+  "version": 1,
+  "config_mode": "managed",
+  "managed_ownership_id": "owner-123",
+  "committed_config_revision": "cfg_managed",
+  "secret_generation": 7,
+  "providers": [{"uuid":"provider-uuid","provider_id":"copilot"}]
+}`
+	if err := os.WriteFile(configPath, []byte(initial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadMenubarConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ProvidersConfigPath != "" || cfg.versionedState == nil {
+		t.Fatalf("loaded config = %+v", cfg)
+	}
+	cfg.ProvidersConfigPath = "/tmp/external.yaml"
+	if err := saveMenubarConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(body, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state["managed_ownership_id"] != "owner-123" || state["secret_generation"] != float64(7) || state["config_mode"] != "external" || state["selected_path"] != "/tmp/external.yaml" {
+		t.Fatalf("versioned state was not preserved: %s", body)
+	}
+
+	cfg, err = loadMenubarConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ProvidersConfigPath = ""
+	if err := saveMenubarConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	body, err = os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state["managed_ownership_id"] != "owner-123" || state["config_mode"] != "legacy" {
+		t.Fatalf("clear destroyed native ownership state: %s", body)
+	}
 }

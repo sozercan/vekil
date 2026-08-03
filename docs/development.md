@@ -10,7 +10,65 @@ make docker-build-rtk   # optional RTK image variant
 make docker-rtk-e2e     # verifies bundled RTK reduces tool output through Vekil
 ```
 
-`go test ./...` and ordinary Go builds do not require Sparkle. The updater code is only compiled for the packaged macOS app build via `make build-app`, which downloads Sparkle 2.9.0 into `.build/sparkle/`, passes the `sparkle` build tag, embeds `Sparkle.framework`, and ad-hoc signs the finished app bundle.
+`go test ./...` and ordinary Go builds do not require Sparkle. `make build-app` verifies the pinned Sparkle 2.9.4 release archive and SwiftPM revision, builds the Swift executable and Go helper for `arm64` and `x86_64` with macOS 13 load metadata, assembles `Vekil.app`, and ad-hoc signs it for local development. Production mode fails closed unless Developer ID signing and notarization inputs are present.
+
+## Native macOS Shell And Release Gates
+
+Source implementation and production release evidence are separate.
+
+### Implemented source
+
+The current tree includes:
+
+- `internal/appcontrol` lifecycle admission, cancellation, startup phases, runtime generations, readiness, and listener monitoring;
+- `internal/macosruntime` strict JSONL helper protocol, bounded writer/framing, idempotency, parent/EOF/shutdown cleanup, secret projections, External Configuration, managed ownership/revisions, and crash-recoverable apply/rollback;
+- `cmd/macos-runtime` as the headless helper entry point;
+- context-aware server/proxy construction and provider-scoped secret resolution;
+- a macOS 13 Swift package pinned to Sparkle 2.9.4 with `RuntimeController`, app state/presentation, preferences/login services, Keychain generation management, stats decoding/store/projection, AppKit/SwiftUI shell/views, and unit fixtures/tests.
+
+Run the source gates directly:
+
+```bash
+make build
+make test
+make vet
+go test -race ./... -count=1
+go test ./internal/appcontrol ./internal/macosruntime ./cmd/macos-runtime -count=1
+swift test --package-path mac/VekilApp
+make build-tray-linux
+```
+
+The checked-in native gates are:
+
+```bash
+make test-macos-release-tools
+make test-macos-appcast-generation
+make test-macos-bundle-verification
+make test-app
+MACOS_SMOKE_ARCHES="arm64 x86_64" make smoke-app
+make package-app
+```
+
+They verify the universal app/helper layout, macOS 13 load commands, Sparkle 2.9.4 checksum/version, nested signatures, helper JSONL startup and port-0 health, both application slices, singleton/helper ownership, and the exact packaged ZIP. `make build-legacy-app`/`make test-legacy-app` retain the Go shell during the rollback window.
+
+### External production release gates
+
+The native replacement is publishable only after these are proven against the exact candidate ZIP:
+
+| Gate | Required evidence |
+|------|-------------------|
+| Bundle pipeline | Assemble `Contents/MacOS/Vekil`, universal `Contents/Helpers/vekil-runtime`, and pinned/checksum-verified Sparkle 2.9.4 with macOS 13 metadata and one monotonic release manifest/build ID. |
+| Artifact identity | Build once, record SHA-256, test that exact ZIP, and promote the same digest to the appcast, GitHub release, and Homebrew without rebuilding. |
+| Architecture | App/helper and applicable nested Mach-O code contain executable `arm64` and `x86_64` slices with macOS 13 `LC_BUILD_VERSION`; both slices execute from the packaged artifact. |
+| Signing/notarization | Sign nested Sparkle code, helper, executable, and app inside-out with a stable Developer ID identity; notarize, staple, and pass strict codesign, Gatekeeper, rpath/dependency, entitlement, and staple verification. Ad-hoc signing is local-only. |
+| Sparkle eligibility | Generate the appcast with verified 2.9.4 tooling and `sparkle:minimumSystemVersion=13.0`; prove macOS 10.13/12 are not offered the update and retain a compatible release. |
+| Replacement continuity | A real released N-1 Go shell installs the exact native ZIP through staging Sparkle and relaunches one healthy shell/helper/proxy while preserving auth, External Configuration, preferences, login intent, and feed. |
+| Keychain continuity | A signed build A creates managed keys; after a real A-to-B Sparkle update, build B reads, updates, and deletes them without prompts/authorization failures. Managed Keychain providers cannot ship before this passes. |
+| Login/singleton | Preserve enabled, disabled, and approval-required login intent while migrating from the validated legacy LaunchAgent to `SMAppService.mainApp`; cold/login/update/reopen/second-launch/updater cases leave one shell, at most one helper, and one listener owner. |
+| Homebrew | Require macOS 13+, install the same universal ZIP, update owned cleanup paths, and never delete user-owned External Configuration. |
+| Rollback | Keep the Go shell release-qualified for at least two native stable releases and prove a higher-`CFBundleVersion` forward-revert through Sparkle; do not rely on downgrade behavior. |
+
+Signing identities, notarization credentials, real update history, Keychain continuity, and manual promotion are external release evidence. Do not represent source tests or ad-hoc builds as satisfying them.
 
 ## Test
 
@@ -202,25 +260,27 @@ For that workflow to work, configure these repository settings and variable:
 
 The configured merge method must also be enabled for the repository; otherwise `gh pr merge --auto` cannot enable auto-merge.
 
-The macOS tray app has its own workflow in [`.github/workflows/macos-app.yaml`](../.github/workflows/macos-app.yaml). It runs `scripts/macos-app-smoke.sh` on a macOS runner, which builds `Vekil.app`, validates the bundle contents, launches the app through Launch Services, verifies it stays up, and then quits it cleanly.
+The macOS workflow in [`.github/workflows/macos-app.yaml`](../.github/workflows/macos-app.yaml) keeps the legacy Go shell buildable, then tests, builds, packages, and launches the universal native candidate on both architectures. It uses ad-hoc local/CI signatures; it is not a substitute for the production Developer ID, notarization, N-1 update, Homebrew, Keychain, and forward-revert evidence above.
 
 ## Release
 
-Tag pushes to [`.github/workflows/release.yaml`](../.github/workflows/release.yaml) use [`.goreleaser.yaml`](../.goreleaser.yaml) to publish the CLI binaries and checksums to GitHub Releases for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`.
+Production releases are started manually from protected `main` through [`.github/workflows/release.yaml`](../.github/workflows/release.yaml), with an existing semantic-version tag such as `v1.2.3` as input. The workflow fails before credentialed jobs unless that tag resolves to a commit reachable from `origin/main`, then uses [`.goreleaser.yaml`](../.goreleaser.yaml) to publish CLI binaries and checksums for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`.
 
 RTK version bumps for the optional Docker variant are automated by [`.github/workflows/update-rtk.yaml`](../.github/workflows/update-rtk.yaml). The scheduled workflow runs [`scripts/update-rtk-version.sh`](../scripts/update-rtk-version.sh), updates the pinned `RTK_VERSION` Docker build arg in `Dockerfile.rtk` when `rtk-ai/rtk` publishes a new latest release, validates the rebuilt variant with `make docker-build-rtk` and `make docker-rtk-e2e`, and opens a signed PR.
 
 The same release workflow also:
 
-- builds `vekil-macos-arm64.zip` on a macOS runner and uploads it to the tagged release
-- generates and uploads `appcast.xml` for Sparkle update checks
-- updates the `vekil` cask in `sozercan/homebrew-repo`
-- pushes the multi-arch container image to GHCR
-- pushes the `-rtk` multi-arch container image variant to GHCR
+- builds, signs, notarizes, staples, tests, and packages one `vekil-macos-universal.zip`;
+- preserves its SHA-256 through signed appcast generation, GitHub upload/download verification, and the Homebrew cask;
+- requires exact-digest N-1 update, Homebrew installation, and forward-revert attestations before publication;
+- keeps the GitHub release as a draft until the exact macOS assets and immutable versioned container manifests are published;
+- publishes the GitHub release before updating the public Homebrew cask, verifies the release asset anonymously, and only then advances the GHCR `latest` and `latest-rtk` manifests.
 
-To publish the Homebrew cask, configure the repository secret `HOMEBREW_REPO_TOKEN` with push access to `sozercan/homebrew-repo`.
+To publish the Homebrew cask, configure `HOMEBREW_REPO_TOKEN` with push access to `sozercan/homebrew-repo`. Sparkle's public key is pinned in `build-support/macos/app-config.json`; configure only `SPARKLE_PRIVATE_ED_KEY` for appcast signing. Production app signing/notarization additionally requires the Developer ID certificate, signing identity/team variables, and Apple notary API credentials listed in the release workflow.
 
-To publish Sparkle updates, configure both `SPARKLE_PUBLIC_ED_KEY` and `SPARKLE_PRIVATE_ED_KEY` in the repository secrets.
+Before enabling production releases, create the `macos-production-build`, `macos-production-appcast`, `macos-production-promotion`, and `production` GitHub environments. Restrict them to protected `main`, require reviewer approval, and move each production credential from repository-level secrets into its owning environment. Set the repository variable `PRODUCTION_RELEASE_ENVIRONMENTS_READY=true` only after those protections and environment secrets are verified; the workflow fails before any credentialed job while this variable is absent or false.
+
+Do not rotate the pinned Sparkle public key as part of an ordinary release. A key rotation needs its own continuity plan for already-installed clients. The production native appcast must not be promoted until every gate in [Native macOS Shell And Release Gates](#native-macos-shell-and-release-gates) has passed for the exact artifact.
 
 ## Live Copilot Smoke Workflow
 

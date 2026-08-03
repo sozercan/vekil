@@ -15,8 +15,21 @@ Schema version 2 is the complete explicit-routing format: it supports public and
 | Provider auth, JSON/YAML routing examples, model ownership, and provider metadata | [Provider Routing](provider-routing.md) |
 | Schema-v2 semantic policy profiles, privacy/trust acknowledgements, and rollout gates | [Semantic Policy Routing](policy-routing.md) |
 | Provider console links and API-key setup patterns | [Provider API Keys](provider-api-keys.md) |
+| macOS shell configuration ownership and release status | [macOS Configuration Ownership](#macos-configuration-ownership) and [macOS App and Linux Tray](menubar.md) |
 | Optional shell command rewrite and tool-output reduction config | [Tool Optimizers](tool-optimizers.md) |
 | Codex-style `GET /v1/responses` websocket bridge and compaction tuning | [Responses WebSocket Bridge](responses-websocket.md) |
+
+## macOS Configuration Ownership
+
+The current Go tray stores only a selected provider-file path; that JSON/YAML file remains user-owned. The native source implements three explicit modes:
+
+- **Legacy/zero-config** preserves built-in Copilot routing and existing authentication files. Users are not automatically converted to schema-v2 managed configuration.
+- **External Configuration** selects a user-owned file. Vekil does not write, normalize, import, or silently adopt it. On-disk and active revisions are tracked separately; edits require explicit reload, and an unsafe, missing, oversized, or invalid replacement leaves the prior active configuration and run intent unchanged.
+- **Managed Configuration** is explicit opt-in. The helper owns `~/Library/Application Support/vekil/providers.yaml`, versioned state in `menubar.json`, and the crash-recovery journal `managed-apply.json`; Swift owns UI preferences such as login/start behavior and window state.
+
+The implemented helper uses secure bounded snapshot reads, ownership/revision checks, stable provider UUIDs, secret generations, private directory/file modes, and atomic apply/rollback. The protocol-level **Validate and Apply** transaction validates the exact staged YAML bytes with the matching in-memory secret generation. Applying while stopped stays stopped; applying while running restores running intent only after installation and readiness succeed. Interrupted transactions are resolved from the secret-free journal before new mutations are accepted. The current native Providers view keeps managed editing disabled until the signed cross-version Keychain continuity gate passes; External Configuration and zero-config mode are the enabled parity paths.
+
+This source implementation does not add provider-schema fields or public endpoints. Shipping managed configuration remains gated by the cross-version signed Sparkle/Keychain continuity evidence described in [Development](development.md#native-macos-shell-and-release-gates). Advanced schema-v2 configuration remains available through External Configuration. See [Provider Routing](provider-routing.md#native-macos-guided-editor-scope) and [Provider API Keys](provider-api-keys.md#macos-managed-provider-secrets).
 
 ## Generic Flags
 

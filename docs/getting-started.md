@@ -20,7 +20,9 @@ brew install --cask sozercan/repo/vekil
 xattr -cr /Applications/Vekil.app  # only if macOS quarantine blocks launch
 ```
 
-For tray app details, see [macOS/Linux Tray App](menubar.md).
+The currently published cask/ZIP contains the Go tray shell, is `arm64`-only, and is ad-hoc signed rather than Developer ID signed. This source tree now contains and assembles the macOS 13 AppKit/SwiftUI shell, universal bundled helper, External Configuration and managed-config control plane, login migration, Keychain support, analytics, and build-once release tooling. The native candidate is not a production release until Developer ID signing/notarization, real N-1 update continuity, exact-artifact architecture/Homebrew checks, and forward-revert gates in [Development](development.md#native-macos-shell-and-release-gates) pass. Older installations must remain on a compatible release rather than receiving an incompatible update.
+
+For current release behavior and the native source/release boundary, see [macOS App and Linux Tray](menubar.md).
 
 Build from source:
 

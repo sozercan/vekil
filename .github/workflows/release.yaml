@@ -1,29 +1,373 @@
 name: Release
+run-name: Release ${{ inputs.tag }}
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing semantic-version release tag on protected main (for example, v1.2.3)
+        required: true
+        type: string
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag }}
+
+concurrency:
+  group: production-release
+  cancel-in-progress: false
 
 jobs:
-  release:
+  validate:
+    if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      release_sha: ${{ steps.release.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve release tag from protected main
+        id: release
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+            echo "release tag must be semantic version text prefixed by v" >&2
+            exit 1
+          }
+          git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          git fetch origin main
+          release_sha="$(git rev-list -n 1 "${RELEASE_TAG}^{commit}")"
+          git merge-base --is-ancestor "${release_sha}" origin/main || {
+            echo "release tag must resolve to a commit reachable from protected main" >&2
+            exit 1
+          }
+          echo "sha=${release_sha}" >>"${GITHUB_OUTPUT}"
+          git checkout --detach "${release_sha}"
+
+      - name: Require protected production environments
+        env:
+          PRODUCTION_RELEASE_ENVIRONMENTS_READY: ${{ vars.PRODUCTION_RELEASE_ENVIRONMENTS_READY }}
+        run: |
+          [[ "${PRODUCTION_RELEASE_ENVIRONMENTS_READY}" == "true" ]] || {
+            echo "production release environments and approval rules are not marked ready" >&2
+            exit 1
+          }
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Require complete native source contract
+        run: make require-native-macos-sources
+
+      - name: Validate release tooling
+        run: make test-macos-release-tools
+
+      - name: Test
+        run: make test
+
+      - name: Vet
+        run: make vet
+
+      - name: Race detector
+        run: go test -race ./... -count=1
+
+      - name: Keep Linux tray buildable
+        run: make build-tray-linux
+
+  macos-candidate:
+    runs-on: macos-26
+    timeout-minutes: 60
+    needs: validate
+    environment: macos-production-build
+    permissions:
+      contents: read
+    outputs:
+      app_sha256: ${{ steps.candidate.outputs.sha256 }}
+      bundle_version: ${{ steps.candidate.outputs.bundle_version }}
+      bundle_build_id: ${{ steps.candidate.outputs.bundle_build_id }}
+    env:
+      VERSION: ${{ inputs.tag }}
+      MACOS_BUNDLE_VERSION: ${{ vars.MACOS_BUNDLE_VERSION }}
+      MACOS_PREVIOUS_BUNDLE_VERSION: ${{ vars.MACOS_PREVIOUS_BUNDLE_VERSION }}
+      MACOS_BUNDLE_BUILD_ID: vekil-${{ vars.MACOS_BUNDLE_VERSION }}-${{ needs.validate.outputs.release_sha }}
+      MACOS_RELEASE: "1"
+      MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+      MACOS_EXPECTED_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+      APPLE_API_KEY_ID: ${{ vars.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ vars.APPLE_API_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
           fetch-depth: 0
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
-      - name: Test
-        run: make test
+      - name: Require explicit production inputs
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_API_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          required=(
+            MACOS_BUNDLE_VERSION
+            MACOS_PREVIOUS_BUNDLE_VERSION
+            MACOS_SIGNING_IDENTITY
+            MACOS_EXPECTED_TEAM_ID
+            APPLE_API_KEY_ID
+            APPLE_API_ISSUER_ID
+            MACOS_CERTIFICATE_P12_BASE64
+            MACOS_CERTIFICATE_PASSWORD
+            APPLE_API_PRIVATE_KEY_BASE64
+          )
+          for name in "${required[@]}"; do
+            [[ -n "${!name:-}" ]] || { echo "${name} is required" >&2; exit 1; }
+          done
+          [[ "${MACOS_BUNDLE_VERSION}" =~ ^[1-9][0-9]{0,17}$ ]] || {
+            echo "MACOS_BUNDLE_VERSION must be a numeric CFBundleVersion" >&2
+            exit 1
+          }
+          [[ "${MACOS_PREVIOUS_BUNDLE_VERSION}" =~ ^[0-9]+$ ]] || {
+            echo "MACOS_PREVIOUS_BUNDLE_VERSION must be numeric" >&2
+            exit 1
+          }
+          (( MACOS_BUNDLE_VERSION > MACOS_PREVIOUS_BUNDLE_VERSION )) || {
+            echo "MACOS_BUNDLE_VERSION must be greater than MACOS_PREVIOUS_BUNDLE_VERSION" >&2
+            exit 1
+          }
 
-      - name: Run GoReleaser
+      - name: Install Developer ID certificate and notarization key
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_API_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          keychain="${RUNNER_TEMP}/vekil-signing.keychain-db"
+          certificate="${RUNNER_TEMP}/vekil-signing.p12"
+          api_key="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY_ID}.p8"
+          keychain_password="$(uuidgen)$(uuidgen)"
+          python3 - "${certificate}" "${api_key}" <<'PY'
+          import base64
+          import os
+          import sys
+          from pathlib import Path
+          Path(sys.argv[1]).write_bytes(base64.b64decode(os.environ["MACOS_CERTIFICATE_P12_BASE64"], validate=True))
+          Path(sys.argv[2]).write_bytes(base64.b64decode(os.environ["APPLE_API_PRIVATE_KEY_BASE64"], validate=True))
+          PY
+          chmod 600 "${certificate}" "${api_key}"
+          security create-keychain -p "${keychain_password}" "${keychain}"
+          security set-keychain-settings -lut 21600 "${keychain}"
+          security unlock-keychain -p "${keychain_password}" "${keychain}"
+          security import "${certificate}" -k "${keychain}" -P "${MACOS_CERTIFICATE_PASSWORD}" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${keychain_password}" "${keychain}"
+          security list-keychains -d user -s "${keychain}"
+          security default-keychain -d user -s "${keychain}"
+          echo "MACOS_SIGNING_KEYCHAIN=${keychain}" >>"${GITHUB_ENV}"
+          echo "APPLE_API_KEY_PATH=${api_key}" >>"${GITHUB_ENV}"
+
+      - name: Test Swift package
+        run: swift test --package-path mac/VekilApp --only-use-versions-from-resolved-file
+
+      - name: Keep legacy Go shell release-qualified
+        run: make test-legacy-app
+
+      - name: Build and verify signed universal app once
+        run: make test-app
+
+      - name: Notarize, staple, and create final ZIP once
+        env:
+          MACOS_RELEASE_DIR: ${{ runner.temp }}/macos-release
+        run: scripts/package-macos-app.sh
+
+      - name: Record immutable candidate identity
+        id: candidate
+        run: |
+          release_dir="${RUNNER_TEMP}/macos-release"
+          sha256="$(awk '{print $1}' "${release_dir}/vekil-macos-universal.zip.sha256")"
+          bundle_version="$(scripts/macos-release-manifest.py get --file "${release_dir}/vekil-macos-release.json" --key bundle_version)"
+          bundle_build_id="$(scripts/macos-release-manifest.py get --file "${release_dir}/vekil-macos-release.json" --key bundle_build_id)"
+          {
+            echo "sha256=${sha256}"
+            echo "bundle_version=${bundle_version}"
+            echo "bundle_build_id=${bundle_build_id}"
+          } >>"${GITHUB_OUTPUT}"
+          {
+            echo "### Native macOS candidate"
+            echo "- ZIP SHA-256: \`${sha256}\`"
+            echo "- numeric CFBundleVersion: \`${bundle_version}\`"
+            echo "- bundle build ID: \`${bundle_build_id}\`"
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload immutable native candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-candidate
+          path: |
+            ${{ runner.temp }}/macos-release/vekil-macos-universal.zip
+            ${{ runner.temp }}/macos-release/vekil-macos-universal.zip.sha256
+            ${{ runner.temp }}/macos-release/vekil-macos-release.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Remove temporary signing material
+        if: ${{ always() }}
+        run: |
+          if [[ -n "${MACOS_SIGNING_KEYCHAIN:-}" && -f "${MACOS_SIGNING_KEYCHAIN}" ]]; then
+            security delete-keychain "${MACOS_SIGNING_KEYCHAIN}" || true
+          fi
+          rm -f "${RUNNER_TEMP}"/vekil-signing.p12 "${RUNNER_TEMP}"/AuthKey_*.p8
+
+  macos-exact-artifact-smoke:
+    runs-on: macos-26
+    timeout-minutes: 30
+    needs: [validate, macos-candidate]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-candidate
+          path: ${{ runner.temp }}/macos-release
+
+      - name: Verify exact notarized ZIP and digest
+        env:
+          EXPECTED_MACOS_ZIP_SHA256: ${{ needs.macos-candidate.outputs.app_sha256 }}
+          MACOS_RELEASE: "1"
+          MACOS_REQUIRE_NOTARIZATION: "1"
+          MACOS_EXPECTED_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+        run: |
+          scripts/verify-macos-release-artifact.sh \
+            "${RUNNER_TEMP}/macos-release/vekil-macos-universal.zip" \
+            "${RUNNER_TEMP}/macos-release/vekil-macos-release.json" \
+            "${RUNNER_TEMP}/macos-release/vekil-macos-universal.zip.sha256"
+
+      - name: Execute both app and helper slices from the exact ZIP
+        env:
+          MACOS_RELEASE: "1"
+          MACOS_REQUIRE_NOTARIZATION: "1"
+          MACOS_EXPECTED_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+          MACOS_SMOKE_ARCHES: arm64 x86_64
+        run: |
+          extract_root="${RUNNER_TEMP}/exact-macos-release"
+          mkdir -p "${extract_root}"
+          ditto -x -k "${RUNNER_TEMP}/macos-release/vekil-macos-universal.zip" "${extract_root}"
+          APP_PATH="${extract_root}/Vekil.app" \
+          MACOS_RESOLVED_MANIFEST="${RUNNER_TEMP}/macos-release/vekil-macos-release.json" \
+            scripts/macos-app-smoke.sh
+
+  appcast:
+    runs-on: macos-26
+    timeout-minutes: 20
+    needs: [validate, macos-candidate, macos-exact-artifact-smoke]
+    environment: macos-production-appcast
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-candidate
+          path: ${{ runner.temp }}/macos-release
+
+      - name: Generate signed appcast with verified Sparkle 2.9.4 tooling
+        env:
+          MACOS_RELEASE: "1"
+          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+          SPARKLE_DOWNLOAD_URL_PREFIX: https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}
+          SPARKLE_RELEASE_NOTES_URL: https://github.com/${{ github.repository }}/releases/tag/${{ inputs.tag }}
+        run: |
+          [[ -n "${SPARKLE_PRIVATE_ED_KEY}" ]] || { echo "SPARKLE_PRIVATE_ED_KEY is required" >&2; exit 1; }
+          scripts/generate-sparkle-appcast.sh \
+            "${RUNNER_TEMP}/macos-release/vekil-macos-universal.zip" \
+            "${RUNNER_TEMP}/macos-release/vekil-macos-release.json" \
+            "${RUNNER_TEMP}/macos-release/appcast.xml"
+          test "$(shasum -a 256 "${RUNNER_TEMP}/macos-release/vekil-macos-universal.zip" | awk '{print $1}')" = \
+            "${{ needs.macos-candidate.outputs.app_sha256 }}"
+
+      - name: Upload signed appcast
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-appcast
+          path: ${{ runner.temp }}/macos-release/appcast.xml
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  promotion-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [validate, macos-candidate, macos-exact-artifact-smoke, appcast]
+    environment: macos-production-promotion
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-candidate
+          path: ${{ runner.temp }}/macos-release
+
+      - name: Require exact-digest N-1, Homebrew, and forward-revert evidence
+        env:
+          MACOS_RELEASE: "1"
+          MACOS_MANAGED_CONFIG_SHIPPING: ${{ vars.MACOS_MANAGED_CONFIG_SHIPPING }}
+          MACOS_N_MINUS_ONE_UPDATE_TESTED_SHA256: ${{ vars.MACOS_N_MINUS_ONE_UPDATE_TESTED_SHA256 }}
+          MACOS_HOMEBREW_INSTALL_TESTED_SHA256: ${{ vars.MACOS_HOMEBREW_INSTALL_TESTED_SHA256 }}
+          MACOS_FORWARD_REVERT_TESTED_SHA256: ${{ vars.MACOS_FORWARD_REVERT_TESTED_SHA256 }}
+          MACOS_KEYCHAIN_CONTINUITY_TESTED_SHA256: ${{ vars.MACOS_KEYCHAIN_CONTINUITY_TESTED_SHA256 }}
+        run: |
+          actual="$(scripts/verify-macos-release-gates.sh \
+            "${RUNNER_TEMP}/macos-release/vekil-macos-universal.zip" \
+            "${RUNNER_TEMP}/macos-release/vekil-macos-universal.zip.sha256")"
+          test "${actual}" = "${{ needs.macos-candidate.outputs.app_sha256 }}"
+
+  goreleaser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [validate, promotion-gates]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Revalidate release tag before publication
+        run: |
+          git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          test "$(git rev-list -n 1 "${RELEASE_TAG}^{commit}")" = \
+            "${{ needs.validate.outputs.release_sha }}"
+
+      - name: Create draft release and publish standalone binaries
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
@@ -32,69 +376,20 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  macos-app:
-    runs-on: macos-26
-    needs: release
-    outputs:
-      app_sha256: ${{ steps.sha256.outputs.value }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-
-      - name: Require Sparkle keys
-        env:
-          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
-          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
-        run: |
-          if [ -z "$SPARKLE_PUBLIC_ED_KEY" ] || [ -z "$SPARKLE_PRIVATE_ED_KEY" ]; then
-            echo "SPARKLE_PUBLIC_ED_KEY and SPARKLE_PRIVATE_ED_KEY are required to publish Sparkle updates" >&2
-            exit 1
-          fi
-
-      - name: Build macOS menubar app
-        env:
-          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
-        run: VERSION=${GITHUB_REF#refs/tags/} GOARCH=arm64 make build-app
-
-      - name: Archive app bundle
-        run: |
-          mkdir -p dist/macos-release
-          ditto -c -k --sequesterRsrc --keepParent "Vekil.app" dist/macos-release/"vekil-macos-arm64.zip"
-
-      - name: Generate Sparkle appcast
-        env:
-          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
-        run: |
-          printf '%s' "$SPARKLE_PRIVATE_ED_KEY" | .build/sparkle/unpacked/bin/generate_appcast \
-            --ed-key-file - \
-            --download-url-prefix "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/" \
-            --full-release-notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}" \
-            --maximum-deltas 0 \
-            dist/macos-release
-
-      - name: Upload macOS updater assets to release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF#refs/tags/}" dist/macos-release/vekil-macos-arm64.zip dist/macos-release/appcast.xml --clobber
-
-      - name: Calculate macOS app SHA256
-        id: sha256
-        run: echo "value=$(shasum -a 256 dist/macos-release/vekil-macos-arm64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
-
-  publish:
+  publish-containers:
     runs-on: ubuntu-latest
-    needs: release
+    timeout-minutes: 45
+    needs: [validate, goreleaser]
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log in to GHCR
         uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
@@ -103,19 +398,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version
-        id: version
-        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-
       - name: Build and push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.tag }}
-            ghcr.io/${{ github.repository }}:latest
+          tags: ghcr.io/${{ github.repository }}:${{ inputs.tag }}
 
       - name: Build and push RTK variant
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -124,33 +413,108 @@ jobs:
           file: Dockerfile.rtk
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.tag }}-rtk
-            ghcr.io/${{ github.repository }}:latest-rtk
+          tags: ghcr.io/${{ github.repository }}:${{ inputs.tag }}-rtk
+
+  upload-macos-assets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [macos-candidate, appcast, goreleaser]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-candidate
+          path: ${{ runner.temp }}/macos-release
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-appcast
+          path: ${{ runner.temp }}/macos-release
+
+      - name: Verify digest and upload exact updater assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "${RUNNER_TEMP}/macos-release"
+          sha256sum --check vekil-macos-universal.zip.sha256
+          test "$(sha256sum vekil-macos-universal.zip | awk '{print $1}')" = \
+            "${{ needs.macos-candidate.outputs.app_sha256 }}"
+          gh release upload "${RELEASE_TAG}" \
+            vekil-macos-universal.zip \
+            vekil-macos-universal.zip.sha256 \
+            vekil-macos-release.json \
+            appcast.xml \
+            --repo "${GITHUB_REPOSITORY}"
+          mkdir github-roundtrip
+          gh release download "${RELEASE_TAG}" \
+            --pattern vekil-macos-universal.zip \
+            --dir github-roundtrip \
+            --repo "${GITHUB_REPOSITORY}"
+          test "$(sha256sum github-roundtrip/vekil-macos-universal.zip | awk '{print $1}')" = \
+            "${{ needs.macos-candidate.outputs.app_sha256 }}"
 
   finalize-release:
     runs-on: ubuntu-latest
-    needs: [macos-app, publish]
+    timeout-minutes: 10
+    needs: [upload-macos-assets, publish-containers]
+    environment: production
+    permissions:
+      contents: write
     steps:
       - name: Publish draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${GITHUB_REF#refs/tags/}" --draft=false --repo "${GITHUB_REPOSITORY}"
+        run: gh release edit "${RELEASE_TAG}" --draft=false --repo "${GITHUB_REPOSITORY}"
+
+  promote-container-latest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: finalize-release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote immutable container manifests to latest
+        run: |
+          docker buildx imagetools create \
+            --tag "ghcr.io/${GITHUB_REPOSITORY}:latest" \
+            "ghcr.io/${GITHUB_REPOSITORY}:${RELEASE_TAG}"
+          docker buildx imagetools create \
+            --tag "ghcr.io/${GITHUB_REPOSITORY}:latest-rtk" \
+            "ghcr.io/${GITHUB_REPOSITORY}:${RELEASE_TAG}-rtk"
 
   homebrew-cask:
     runs-on: ubuntu-latest
-    needs: [macos-app, finalize-release]
+    timeout-minutes: 15
+    needs: [validate, macos-candidate, finalize-release]
+    environment: production
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
 
       - name: Require tap publishing token
         env:
           HOMEBREW_REPO_TOKEN: ${{ secrets.HOMEBREW_REPO_TOKEN }}
         run: |
-          if [ -z "$HOMEBREW_REPO_TOKEN" ]; then
-            echo "HOMEBREW_REPO_TOKEN is required to publish the Homebrew cask" >&2
-            exit 1
-          fi
+          [[ -n "${HOMEBREW_REPO_TOKEN}" ]] || { echo "HOMEBREW_REPO_TOKEN is required" >&2; exit 1; }
+
+      - name: Verify the published macOS asset is publicly available
+        run: |
+          curl --fail --location --retry 5 --output /dev/null \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/vekil-macos-universal.zip"
 
       - name: Checkout Homebrew tap repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -159,16 +523,17 @@ jobs:
           token: ${{ secrets.HOMEBREW_REPO_TOKEN }}
           path: homebrew-repo
 
-      - name: Update Homebrew cask
+      - name: Update Homebrew cask with exact tested digest
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          ./scripts/publish-homebrew-cask.sh "$VERSION" "${{ needs.macos-app.outputs.app_sha256 }}" homebrew-repo
+          ./scripts/publish-homebrew-cask.sh \
+            "${RELEASE_TAG#v}" \
+            "${{ needs.macos-candidate.outputs.app_sha256 }}" \
+            homebrew-repo
 
       - name: Commit and push Homebrew cask
         run: |
-          TAG=${GITHUB_REF#refs/tags/}
           git -C homebrew-repo config user.name "github-actions[bot]"
           git -C homebrew-repo config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C homebrew-repo add Casks/vekil.rb
-          git -C homebrew-repo diff --cached --quiet || git -C homebrew-repo commit -m "Update vekil to ${TAG}"
+          git -C homebrew-repo diff --cached --quiet || git -C homebrew-repo commit -s -m "chore(cask): update vekil to ${RELEASE_TAG}"
           git -C homebrew-repo push origin main

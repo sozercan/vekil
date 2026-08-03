@@ -1,0 +1,424 @@
+package macosruntime
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/sozercan/vekil/internal/appcontrol"
+	"github.com/sozercan/vekil/proxy"
+)
+
+func deterministicUUIDs(values ...string) func() string {
+	index := 0
+	return func() string {
+		if index >= len(values) {
+			return "uuid-extra"
+		}
+		value := values[index]
+		index++
+		return value
+	}
+}
+
+func newManagerForTest(t *testing.T, ids ...string) *ConfigManager {
+	t.Helper()
+	manager, err := NewConfigManager(ConfigManagerOptions{
+		Paths: PathsInDirectory(t.TempDir()),
+		UUID:  deterministicUUIDs(ids...),
+	})
+	if err != nil {
+		t.Fatalf("NewConfigManager() error = %v", err)
+	}
+	return manager
+}
+
+func TestConfigManagerMigratesLegacyMenubarState(t *testing.T) {
+	dir := t.TempDir()
+	paths := PathsInDirectory(dir)
+	external := filepath.Join(dir, "external.yaml")
+	legacy := []byte(`{"providers_config_path":"` + external + `"}`)
+	if err := os.WriteFile(paths.State, legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewConfigManager(ConfigManagerOptions{Paths: paths, UUID: func() string { return "uuid" }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := manager.State()
+	if state.Version != StateVersion || state.ConfigMode != ConfigModeExternal || state.SelectedPath != external {
+		t.Fatalf("migrated state = %+v", state)
+	}
+	body, err := os.ReadFile(paths.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"version": 1`) || !strings.Contains(string(body), `"providers_config_path"`) {
+		t.Fatalf("rewritten state = %s", body)
+	}
+}
+
+func TestEnsureManagedConfigurationUsesExclusiveOwnedPrivateFile(t *testing.T) {
+	manager := newManagerForTest(t, "owner-id", "provider-uuid")
+	description, err := manager.EnsureManagedConfiguration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture, err := os.ReadFile(filepath.Join("testdata", "managed-copilot.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(manager.paths.Managed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != string(fixture) {
+		t.Fatalf("managed YAML = %q, want fixture %q", body, fixture)
+	}
+	if description.Mode != ConfigModeManaged || !description.ManagedOwnershipPresent || len(description.Providers) != 1 {
+		t.Fatalf("description = %+v", description)
+	}
+	fileInfo, err := os.Stat(manager.paths.Managed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fileInfo.Mode().Perm(); got != 0o600 {
+		t.Fatalf("file mode = %o", got)
+	}
+	dirInfo, err := os.Stat(manager.paths.Directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("directory mode = %o", got)
+	}
+
+	unowned := newManagerForTest(t, "different-owner", "different-provider")
+	if err := os.WriteFile(unowned.paths.Managed, []byte("do not overwrite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := unowned.EnsureManagedConfiguration(); err == nil {
+		t.Fatal("EnsureManagedConfiguration() adopted an unowned file")
+	}
+	preserved, _ := os.ReadFile(unowned.paths.Managed)
+	if string(preserved) != "do not overwrite" {
+		t.Fatalf("unowned file changed: %q", preserved)
+	}
+}
+
+func TestExternalConfigurationIsReadOnceAndNeverWritten(t *testing.T) {
+	manager := newManagerForTest(t)
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	original := []byte("schema_version: 2\nproviders:\n  - id: local\n    type: openai-compatible\n    base_url: https://example.test/v1\n    auth_type: none\n    model_discovery: static\n    models:\n      - public_id: test-model\n        endpoints: [/chat/completions]\n")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	description, err := manager.SelectExternal(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preserved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(preserved) != string(original) {
+		t.Fatal("external file was modified")
+	}
+	if err := manager.RuntimeActivated(context.Background(), appcontrol.Configuration{Revision: description.SelectedRevision}, 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	modified := append(append([]byte(nil), original...), []byte("# user edit\n")...)
+	if err := os.WriteFile(path, modified, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	description, err = manager.Describe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !description.Drifted || description.ActiveRevision == description.SelectedRevision {
+		t.Fatalf("drift description = %+v", description)
+	}
+}
+
+func TestSecureConfigReadRejectsSymlinkDirectoryAndOversize(t *testing.T) {
+	dir := t.TempDir()
+	regular := filepath.Join(dir, "regular.yaml")
+	if err := os.WriteFile(regular, []byte("providers: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	symlink := filepath.Join(dir, "link.yaml")
+	if err := os.Symlink(regular, symlink); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readSecureFile(symlink, MaxConfigBytes); err == nil || !strings.Contains(strings.ToLower(err.Error()), "symlink") {
+		t.Fatalf("symlink read error = %v", err)
+	}
+	if _, _, err := readSecureFile(dir, MaxConfigBytes); err == nil || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("directory read error = %v", err)
+	}
+	oversized := filepath.Join(dir, "oversized.yaml")
+	if err := os.WriteFile(oversized, make([]byte, 1025), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readSecureFile(oversized, 1024); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversize read error = %v", err)
+	}
+}
+
+func TestManagedProviderUUIDSurvivesRenameAndReorder(t *testing.T) {
+	manager := newManagerForTest(t, "owner", "copilot-uuid", "local-uuid")
+	if _, err := manager.EnsureManagedConfiguration(); err != nil {
+		t.Fatal(err)
+	}
+	state := manager.State()
+	copilotUUID := state.Providers[0].UUID
+	draft := ManagedDraft{Providers: []ManagedProviderDraft{
+		{Config: proxy.ProviderConfig{ID: "local", Type: "openai-compatible", BaseURL: "https://example.test/v1", AuthType: "none", ModelDiscovery: "static", Models: []proxy.ProviderModelConfig{{PublicID: "local-model", Endpoints: []string{"/chat/completions"}}}}},
+		{UUID: copilotUUID, Config: proxy.ProviderConfig{ID: "github", Type: "copilot", Default: true}},
+	}}
+	candidate, err := manager.BuildManagedCandidate(draft, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Providers[1].UUID != copilotUUID || candidate.Providers[1].ProviderID != "github" {
+		t.Fatalf("renamed identity = %+v", candidate.Providers[1])
+	}
+	if candidate.Providers[0].UUID != "local-uuid" {
+		t.Fatalf("new provider UUID = %q", candidate.Providers[0].UUID)
+	}
+	second, err := manager.BuildManagedCandidate(draft, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(second.Bytes) != string(candidate.Bytes) {
+		t.Fatal("managed serialization is not deterministic")
+	}
+}
+
+func TestManagedApplyRollbackCommitAndCrashRecovery(t *testing.T) {
+	manager := newManagerForTest(t, "owner", "copilot-uuid", "local-uuid")
+	initial, err := manager.EnsureManagedConfiguration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft := ManagedDraft{Providers: []ManagedProviderDraft{
+		{UUID: manager.State().Providers[0].UUID, Config: proxy.ProviderConfig{ID: "copilot", Type: "copilot", Default: true}},
+		{Config: proxy.ProviderConfig{ID: "local", Type: "openai-compatible", BaseURL: "https://example.test/v1", AuthType: "none", ModelDiscovery: "static", Models: []proxy.ProviderModelConfig{{PublicID: "local-model", Endpoints: []string{"/chat/completions"}}}}},
+	}}
+	candidate, err := manager.BuildManagedCandidate(draft, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := manager.PrepareManagedApply("op_rollback", candidate, initial.SelectedRevision, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Install(); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.State().CommittedConfigRevision; got != candidate.Revision {
+		t.Fatalf("installed revision = %q", got)
+	}
+	if err := tx.Rollback("startup_failed"); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.State().CommittedConfigRevision; got != initial.SelectedRevision {
+		t.Fatalf("rollback revision = %q", got)
+	}
+
+	candidate, err = manager.BuildManagedCandidate(draft, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err = manager.PrepareManagedApply("op_commit", candidate, initial.SelectedRevision, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Install(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(manager.paths.Journal); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("journal remains: %v", err)
+	}
+	committed := manager.State()
+	if committed.CommittedConfigRevision != candidate.Revision || committed.SecretGeneration != 1 {
+		t.Fatalf("committed state = %+v", committed)
+	}
+
+	// A later uncommitted install is restored by a fresh manager before commands.
+	candidate2, err := manager.BuildManagedCandidate(ManagedDraft{Providers: draft.Providers[:1]}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err = manager.PrepareManagedApply("op_crash", candidate2, candidate.Revision, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Install(); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := NewConfigManager(ConfigManagerOptions{Paths: manager.paths, UUID: func() string { return "unused" }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := recovered.State().CommittedConfigRevision; got != candidate.Revision {
+		t.Fatalf("recovered revision = %q, want %q", got, candidate.Revision)
+	}
+}
+
+func TestManagedSecretSentinelNeverPersistsOrEntersEnvironment(t *testing.T) {
+	const sentinel = "VEKIL-SECRET-SENTINEL-7d2f"
+	manager := newManagerForTest(t, "owner", "copilot-uuid", "provider-uuid")
+	if _, err := manager.EnsureManagedConfiguration(); err != nil {
+		t.Fatal(err)
+	}
+	draft := ManagedDraft{Providers: []ManagedProviderDraft{{
+		SecretRoles: []string{"api_key"},
+		Config:      proxy.ProviderConfig{ID: "local", Type: "openai-compatible", BaseURL: "https://example.test/v1", AuthType: "bearer", ModelDiscovery: "static", Models: []proxy.ProviderModelConfig{{PublicID: "model", Endpoints: []string{"/chat/completions"}}}},
+	}}}
+	candidate, err := manager.BuildManagedCandidate(draft, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference := candidate.Config.Providers[0].APIKeyEnv
+	store := NewSecretProjectionStore()
+	if err := store.Set(SecretProjection{ConfigRevision: candidate.Revision, SecretGeneration: 1, Secrets: []SecretValue{{ProviderID: "local", Reference: reference, Value: sentinel}}}); err != nil {
+		t.Fatal(err)
+	}
+	value, ok := store.Resolver(candidate.Revision, 1).ResolveProviderSecret("local", reference)
+	if !ok || value != sentinel {
+		t.Fatal("resolver did not return staged secret")
+	}
+	if strings.Contains(strings.Join(os.Environ(), "\n"), sentinel) {
+		t.Fatal("secret entered process environment")
+	}
+	tx, err := manager.PrepareManagedApply("op_secret", candidate, manager.State().CommittedConfigRevision, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Install(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	stateJSON, _ := json.Marshal(manager.State())
+	description, _ := manager.Describe()
+	descriptionJSON, _ := json.Marshal(description)
+	for _, body := range [][]byte{candidate.Bytes, stateJSON, descriptionJSON} {
+		if strings.Contains(string(body), sentinel) {
+			t.Fatal("secret leaked into serialized output")
+		}
+	}
+	entries, err := os.ReadDir(manager.paths.Directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(manager.paths.Directory, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(body), sentinel) {
+			t.Fatalf("secret leaked into %s", entry.Name())
+		}
+	}
+}
+
+func TestUsePreferredAppConfigurationFallsBackToLegacyUntilManagedOptIn(t *testing.T) {
+	manager := newManagerForTest(t, "owner", "provider")
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	body := []byte("schema_version: 2\nproviders:\n  - id: local\n    type: openai-compatible\n    default: true\n    base_url: https://example.test/v1\n    auth_type: none\n    model_discovery: static\n    models:\n      - public_id: local-model\n        endpoints: [/chat/completions]\n")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.SelectExternal(t.Context(), path); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.UsePreferredAppConfiguration(); err != nil {
+		t.Fatal(err)
+	}
+	if state := manager.State(); state.ConfigMode != ConfigModeLegacy || state.SelectedPath != "" || state.SelectedConfigRevision != LegacyConfigRevision {
+		t.Fatalf("legacy fallback state = %+v", state)
+	}
+
+	if _, err := manager.EnsureManagedConfiguration(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.SelectExternal(t.Context(), path); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.UsePreferredAppConfiguration(); err != nil {
+		t.Fatal(err)
+	}
+	if state := manager.State(); state.ConfigMode != ConfigModeManaged || state.SelectedPath != manager.paths.Managed {
+		t.Fatalf("managed preferred state = %+v", state)
+	}
+}
+
+func TestVersionedExternalStateRemainsReadableByForwardRevertShell(t *testing.T) {
+	manager := newManagerForTest(t)
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	body := []byte("schema_version: 2\nproviders:\n  - id: local\n    type: openai-compatible\n    default: true\n    base_url: https://example.test/v1\n    auth_type: none\n    model_discovery: static\n    models:\n      - public_id: local-model\n        endpoints: [/chat/completions]\n")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.SelectExternal(t.Context(), path); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := os.ReadFile(manager.paths.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy struct {
+		ProvidersConfigPath string `json:"providers_config_path"`
+	}
+	if err := json.Unmarshal(persisted, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.ProvidersConfigPath != path {
+		t.Fatalf("forward-revert providers_config_path = %q, want %q\nstate=%s", legacy.ProvidersConfigPath, path, persisted)
+	}
+}
+
+func TestStagedExternalSelectionIsNotPersistedBeforeCommit(t *testing.T) {
+	manager := newManagerForTest(t)
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	body := []byte("schema_version: 2\nproviders:\n  - id: local\n    type: openai-compatible\n    default: true\n    base_url: https://example.test/v1\n    auth_type: none\n    model_discovery: static\n    models:\n      - public_id: local-model\n        endpoints: [/chat/completions]\n")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.StageExternal(t.Context(), path); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RuntimeDeactivated(t.Context(), 1); err != nil {
+		t.Fatal(err)
+	}
+	persisted, _, err := loadPersistentState(manager.paths.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ConfigMode != ConfigModeLegacy || persisted.SelectedPath != "" {
+		t.Fatalf("staged selection leaked to disk: %+v", persisted)
+	}
+	if err := manager.CommitSelection(); err != nil {
+		t.Fatal(err)
+	}
+	persisted, _, err = loadPersistentState(manager.paths.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ConfigMode != ConfigModeExternal || persisted.SelectedPath != path {
+		t.Fatalf("committed selection missing: %+v", persisted)
+	}
+}
