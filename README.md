@@ -132,9 +132,12 @@ env ANTHROPIC_BASE_URL=http://localhost:1337 \
 
 ```bash
 env OPENAI_API_KEY=dummy \
-  OPENAI_BASE_URL=http://localhost:1337/v1 \
-  codex exec --skip-git-repo-check -m gpt-5.5 "Reply with exactly PROXY_OK"
+  codex exec --skip-git-repo-check -m gpt-5.5 \
+  -c 'openai_base_url="http://localhost:1337/v1"' \
+  "Reply with exactly PROXY_OK"
 ```
+
+Codex takes the endpoint from its own configuration, not from `OPENAI_BASE_URL`. See [Client Examples](docs/clients.md#openai-codex-cli).
 
 ### GitHub Copilot CLI
 
