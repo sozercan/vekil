@@ -4688,6 +4688,7 @@ func TestHandleResponses_RetriesCompacted413Replay(t *testing.T) {
 	var upstreamRequestsMu sync.Mutex
 	upstreamRequests := make([]map[string]interface{}, 0, 3)
 	var normalRequests atomic.Int32
+	additionalTools := responsesLiteAdditionalToolsForTest()
 
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, err := io.ReadAll(r.Body)
@@ -4731,6 +4732,7 @@ func TestHandleResponses_RetriesCompacted413Replay(t *testing.T) {
 		"model":                "gpt-5.4",
 		"previous_response_id": "resp-prev",
 		"input": []interface{}{
+			additionalTools,
 			map[string]interface{}{
 				"type": "message",
 				"role": "user",
@@ -4802,13 +4804,16 @@ func TestHandleResponses_RetriesCompacted413Replay(t *testing.T) {
 	}
 
 	initialReplayInput := upstreamInputItems(t, requests[0])
-	if len(initialReplayInput) != 5 {
+	if len(initialReplayInput) != 6 {
 		t.Fatalf("expected first upstream request to keep full replay, got %d items", len(initialReplayInput))
 	}
-	if got := requireMessageTextWithRole(t, initialReplayInput[0], "user"); got != "first turn" {
+	if !reflect.DeepEqual(initialReplayInput[0], additionalTools) {
+		t.Fatalf("expected first upstream request to preserve additional_tools, got %#v", initialReplayInput[0])
+	}
+	if got := requireMessageTextWithRole(t, initialReplayInput[1], "user"); got != "first turn" {
 		t.Fatalf("expected first upstream request to start with oldest input, got %q", got)
 	}
-	if got := requireMessageTextWithRole(t, initialReplayInput[4], "user"); got != "latest turn" {
+	if got := requireMessageTextWithRole(t, initialReplayInput[5], "user"); got != "latest turn" {
 		t.Fatalf("expected first upstream request to keep latest input, got %q", got)
 	}
 
@@ -4827,16 +4832,19 @@ func TestHandleResponses_RetriesCompacted413Replay(t *testing.T) {
 	}
 
 	retriedInput := upstreamInputItems(t, requests[2])
-	if len(retriedInput) != 3 {
-		t.Fatalf("expected retried request to include compacted checkpoint plus tail, got %d items", len(retriedInput))
+	if len(retriedInput) != 4 {
+		t.Fatalf("expected retried request to include tools, compacted checkpoint, and tail, got %d items", len(retriedInput))
 	}
-	if got := requireCompactionContextMessage(t, retriedInput[0]); !strings.Contains(got, "checkpoint summary after 413") {
+	if !reflect.DeepEqual(retriedInput[0], additionalTools) {
+		t.Fatalf("expected retried request to preserve additional_tools exactly once, got %#v", retriedInput[0])
+	}
+	if got := requireCompactionContextMessage(t, retriedInput[1]); !strings.Contains(got, "checkpoint summary after 413") {
 		t.Fatalf("expected retried request to start with compacted checkpoint, got %q", got)
 	}
-	if got := requireMessageTextWithRole(t, retriedInput[1], "assistant"); got != "second answer" {
+	if got := requireMessageTextWithRole(t, retriedInput[2], "assistant"); got != "second answer" {
 		t.Fatalf("expected retried request to keep assistant tail item, got %q", got)
 	}
-	if got := requireMessageTextWithRole(t, retriedInput[2], "user"); got != "latest turn" {
+	if got := requireMessageTextWithRole(t, retriedInput[3], "user"); got != "latest turn" {
 		t.Fatalf("expected retried request to keep latest user tail item, got %q", got)
 	}
 }
@@ -5037,6 +5045,7 @@ func TestHandleResponses_ReducesKeepTailWhenCompactedReplayStill413s(t *testing.
 	var upstreamRequestsMu sync.Mutex
 	upstreamRequests := make([]map[string]interface{}, 0, 5)
 	var normalRequests atomic.Int32
+	additionalTools := responsesLiteAdditionalToolsForTest()
 
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, err := io.ReadAll(r.Body)
@@ -5080,6 +5089,7 @@ func TestHandleResponses_ReducesKeepTailWhenCompactedReplayStill413s(t *testing.
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
 		"input": []interface{}{
+			additionalTools,
 			map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "first turn"}}},
 			map[string]interface{}{"type": "message", "role": "assistant", "content": []map[string]string{{"type": "input_text", "text": "first answer"}}},
 			map[string]interface{}{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "second turn"}}},
@@ -5124,11 +5134,17 @@ func TestHandleResponses_ReducesKeepTailWhenCompactedReplayStill413s(t *testing.
 	if len(firstCompactionInput) != 1 {
 		t.Fatalf("expected first compaction to summarize one item after shrinking default keep-tail 12 to 4, got %d", len(firstCompactionInput))
 	}
-	firstRetriedInput := upstreamInputItems(t, requests[2])
-	if len(firstRetriedInput) != 5 {
-		t.Fatalf("expected first retry to keep checkpoint plus 4 tail items, got %d", len(firstRetriedInput))
+	if got := requireMessageTextWithRole(t, firstCompactionInput[0], "user"); got != "first turn" {
+		t.Fatalf("expected first compaction to omit additional_tools and start with history, got %q", got)
 	}
-	if got := requireCompactionContextMessage(t, firstRetriedInput[0]); !strings.Contains(got, "summary for 1 items") {
+	firstRetriedInput := upstreamInputItems(t, requests[2])
+	if len(firstRetriedInput) != 6 {
+		t.Fatalf("expected first retry to keep tools, checkpoint, and 4 tail items, got %d", len(firstRetriedInput))
+	}
+	if !reflect.DeepEqual(firstRetriedInput[0], additionalTools) {
+		t.Fatalf("expected first retry to preserve additional_tools exactly once, got %#v", firstRetriedInput[0])
+	}
+	if got := requireCompactionContextMessage(t, firstRetriedInput[1]); !strings.Contains(got, "summary for 1 items") {
 		t.Fatalf("expected first retry checkpoint for 1 item, got %q", got)
 	}
 
@@ -5136,17 +5152,26 @@ func TestHandleResponses_ReducesKeepTailWhenCompactedReplayStill413s(t *testing.
 	if len(secondCompactionInput) != 3 {
 		t.Fatalf("expected second compaction to reduce keep-tail to 2 and summarize three items, got %d", len(secondCompactionInput))
 	}
-	secondRetriedInput := upstreamInputItems(t, requests[4])
-	if len(secondRetriedInput) != 3 {
-		t.Fatalf("expected second retry to keep checkpoint plus 2 tail items, got %d", len(secondRetriedInput))
+	if got := requireMessageTextWithRole(t, secondCompactionInput[0], "user"); got != "first turn" {
+		t.Fatalf("expected second compaction to omit additional_tools and start with history, got %q", got)
 	}
-	if got := requireCompactionContextMessage(t, secondRetriedInput[0]); !strings.Contains(got, "summary for 3 items") {
+	if got := requireMessageTextWithRole(t, secondCompactionInput[2], "user"); got != "second turn" {
+		t.Fatalf("expected second compaction to stop before kept tail, got %q", got)
+	}
+	secondRetriedInput := upstreamInputItems(t, requests[4])
+	if len(secondRetriedInput) != 4 {
+		t.Fatalf("expected second retry to keep tools, checkpoint, and 2 tail items, got %d", len(secondRetriedInput))
+	}
+	if !reflect.DeepEqual(secondRetriedInput[0], additionalTools) {
+		t.Fatalf("expected second retry to preserve additional_tools exactly once, got %#v", secondRetriedInput[0])
+	}
+	if got := requireCompactionContextMessage(t, secondRetriedInput[1]); !strings.Contains(got, "summary for 3 items") {
 		t.Fatalf("expected second retry checkpoint for 3 items, got %q", got)
 	}
-	if got := requireMessageTextWithRole(t, secondRetriedInput[1], "assistant"); got != "second answer" {
+	if got := requireMessageTextWithRole(t, secondRetriedInput[2], "assistant"); got != "second answer" {
 		t.Fatalf("expected reduced retry to keep assistant tail item, got %q", got)
 	}
-	if got := requireMessageTextWithRole(t, secondRetriedInput[2], "user"); got != "latest turn" {
+	if got := requireMessageTextWithRole(t, secondRetriedInput[3], "user"); got != "latest turn" {
 		t.Fatalf("expected reduced retry to keep latest user tail item, got %q", got)
 	}
 }
@@ -5695,6 +5720,21 @@ func recordMaxInt32(max *atomic.Int32, value int32) {
 func requireCompactionContextMessage(t *testing.T, raw interface{}) string {
 	t.Helper()
 	return requireMessageTextWithRole(t, raw, "developer")
+}
+
+func responsesLiteAdditionalToolsForTest() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "additional_tools",
+		"role": "developer",
+		"tools": []interface{}{
+			map[string]interface{}{
+				"type":        "custom",
+				"name":        "exec",
+				"description": "Execute shell commands",
+				"format":      map[string]interface{}{"type": "text"},
+			},
+		},
+	}
 }
 
 func requireMessageTextWithRole(t *testing.T, raw interface{}, wantRole string) string {

@@ -171,8 +171,8 @@ set -euo pipefail
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL}" == http://127.0.0.1:*/v1 ]]
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL}" == "gpt-5.4-mini" ]]
 [[ "${LIVE_POLICY_ROUTING_CLASSIFIER_MODEL}" == "gpt-4.1" ]]
-[[ "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL}" == "gpt-5.4" ]]
-[[ "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL}" == "gemini-3.1-pro-preview" ]]
+[[ "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL}" == "gemini-3.1-pro-preview" ]]
+[[ "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL}" == "claude-sonnet-4.6" ]]
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT}" == "low" ]]
 [[ "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT}" == "high" ]]
 [[ "${LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED}" == "false" ]]
@@ -252,8 +252,8 @@ main() {
   jq -e '
     .lightweight == "gpt-5.4-mini"
     and .classifier == "gpt-4.1"
-    and .primary == "gpt-5.4"
-    and .secondary == "gemini-3.1-pro-preview"
+    and .primary == "gemini-3.1-pro-preview"
+    and .secondary == "claude-sonnet-4.6"
   ' "${RECORD}" >/dev/null || fail "wrapper selected unexpected Copilot models"
 
   local base port child_pid
