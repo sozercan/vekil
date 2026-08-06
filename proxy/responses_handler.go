@@ -1002,16 +1002,8 @@ func stripCompactionAdditionalToolsInputItems(rawInput json.RawMessage) (json.Ra
 		return rawInput, 0
 	}
 
-	filtered := make([]json.RawMessage, 0, len(input))
-	removed := 0
-	for _, item := range input {
-		if responsesInputItemType(item) == "additional_tools" {
-			removed++
-			continue
-		}
-		filtered = append(filtered, item)
-	}
-	if removed == 0 {
+	additionalTools, filtered := partitionResponsesAdditionalToolsInputItems(input)
+	if len(additionalTools) == 0 {
 		return rawInput, 0
 	}
 
@@ -1019,7 +1011,20 @@ func stripCompactionAdditionalToolsInputItems(rawInput json.RawMessage) (json.Ra
 	if err != nil {
 		return rawInput, 0
 	}
-	return rewritten, removed
+	return rewritten, len(additionalTools)
+}
+
+func partitionResponsesAdditionalToolsInputItems(input []json.RawMessage) ([]json.RawMessage, []json.RawMessage) {
+	additionalTools := make([]json.RawMessage, 0, 1)
+	history := make([]json.RawMessage, 0, len(input))
+	for _, item := range input {
+		if responsesInputItemType(item) == "additional_tools" {
+			additionalTools = append(additionalTools, item)
+			continue
+		}
+		history = append(history, item)
+	}
+	return additionalTools, history
 }
 
 func compactOutputTokenLimit(requestFields map[string]json.RawMessage) (int, bool) {
@@ -3193,7 +3198,8 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 		h.log.Debug("responses 413 compaction skipped", logger.F("reason", "input_not_array"), logger.Err(err))
 		return resp, nil
 	}
-	if !isLikelyResponsesReplay(input) {
+	additionalTools, history := partitionResponsesAdditionalToolsInputItems(input)
+	if !isLikelyResponsesReplay(history) {
 		h.log.Info("responses 413 compaction skipped",
 			logger.F("reason", "not_replay_like"),
 			logger.F("input_items", len(input)),
@@ -3208,7 +3214,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 		return resp, nil
 	}
 
-	keepTailSchedule := compactedResponsesRetryKeepTailSchedule(len(input), configuredKeepTail)
+	keepTailSchedule := compactedResponsesRetryKeepTailSchedule(len(history), configuredKeepTail)
 	if len(keepTailSchedule) == 0 {
 		h.log.Debug("responses 413 compaction skipped", logger.F("reason", "not_enough_input_items"), logger.F("input_items", len(input)), logger.F("keep_tail", configuredKeepTail))
 		return resp, nil
@@ -3236,10 +3242,10 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 	}()
 	lastAlignedKeepTail := 0
 	for attempt, keepTail := range keepTailSchedule {
-		prefixLen := compactedResponsesAlignedPrefixLen(input, keepTail)
-		alignedKeepTail := len(input) - prefixLen
+		prefixLen := compactedResponsesAlignedPrefixLen(history, keepTail)
+		alignedKeepTail := len(history) - prefixLen
 		lastAlignedKeepTail = alignedKeepTail
-		summary, err := h.compactResponsesInputWithBudget(ctx, model, input[:prefixLen], extraHeaders, budget)
+		summary, err := h.compactResponsesInputWithBudget(ctx, model, history[:prefixLen], extraHeaders, budget)
 		if err != nil {
 			h.log.Debug("responses 413 compaction failed", logger.F("keep_tail", keepTail), logger.Err(err))
 			return lastResp, nil
@@ -3251,8 +3257,13 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 			return lastResp, nil
 		}
 
-		compactedInput := []json.RawMessage{checkpoint}
-		compactedInput = append(compactedInput, input[prefixLen:]...)
+		// additional_tools items are request-scoped catalogs rather than
+		// conversation history. Keep them out of prefix selection and internal
+		// summarization, then restore them on the actual inference retry.
+		compactedInput := make([]json.RawMessage, 0, len(additionalTools)+1+len(history)-prefixLen)
+		compactedInput = append(compactedInput, additionalTools...)
+		compactedInput = append(compactedInput, checkpoint)
+		compactedInput = append(compactedInput, history[prefixLen:]...)
 
 		compactedInputRaw, err := json.Marshal(compactedInput)
 		if err != nil {
