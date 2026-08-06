@@ -787,9 +787,16 @@ main() {
   assert_generated_config
   jq -e '
     .max_completion_tokens == 512
-    and (.messages[0].content | endswith("For this synthetic observe check, do not analyze the task above. Reply with exactly OBSERVE_BASELINE_OK."))
+    and (.messages[0].content | endswith("For this synthetic routing check, do not analyze the task above. Reply with exactly POLICY_ROUTE_OK."))
   ' "${SMOKE_DIR}/observe/complex-shadow.request.json" >/dev/null || \
     fail "observe request did not use the bounded fixed-response contract"
+  for request in enforce/enforce-powerful.request.json enforce/powerful-stream.request.json enforce/powerful-failover.request.json; do
+    jq -e '
+      .max_completion_tokens == 4096
+      and (.messages[0].content | endswith("For this synthetic routing check, do not analyze the task above. Reply with exactly POLICY_ROUTE_OK."))
+    ' "${SMOKE_DIR}/${request}" >/dev/null || \
+      fail "${request} did not use the bounded fixed-response contract"
+  done
   assert_wrapper_ports
   assert_ports_released
 

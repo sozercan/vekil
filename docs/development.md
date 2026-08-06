@@ -259,14 +259,14 @@ The default pull-request check is [`Live Copilot Semantic Policy Routing Smoke`]
 
 The bridge is intentional even though production schema-v2 policy profiles can target pinned models on a dynamic `type: copilot` provider directly, including Responses-backed Chat models. It gives the common smoke harness independently controllable static targets and fault injection, keeps the real Copilot token in one private bridge process, and permits metadata-only capture of the exact terminal `/responses` request without exposing credentials or request content. The wrapper removes `COPILOT_GITHUB_TOKEN` from delegated harness environments, gives the bridge a private token directory, auto-selects a non-default loopback port, and verifies bridge/process-group cleanup.
 
-The common harness keeps the observe-mode baseline at a 512-token ceiling. Its deliberately truncated synthetic task forces conservative powerful shadow mapping, while a trailing fixed-response instruction prevents the lightweight baseline from spending that budget trying to solve meaningless padding.
+The common harness keeps the observe-mode baseline at a 512-token ceiling. Every padded synthetic routing task ends with a fixed-response instruction outside the bounded classifier projection, so truncation still forces conservative powerful routing without asking terminal models to spend their budgets solving meaningless padding.
 
 For the broad matrix, the wrapper selects only models whose catalog metadata advertises native `/chat/completions` support and the required tier effort. It falls back within these capability constraints when a preferred ID is absent:
 
 - lightweight: a native-Chat model advertising `low`, preferring GPT mini variants;
 - classifier: any compatible native-Chat model, preferring `gpt-4.1` or Claude Sonnet;
-- powerful primary: a native-Chat model advertising `high`, preferring `gpt-5.4` and then compatible Gemini/Claude models; and
-- powerful secondary: a distinct native-Chat model advertising `high`, preferring a visible-text Gemini fallback before Claude reasoning models.
+- powerful primary: a native-Chat model advertising `high`, preferring visible-text Gemini and Claude models before GPT reasoning models; and
+- powerful secondary: a distinct native-Chat model advertising `high`, preferring another Gemini or Claude model before GPT reasoning models.
 
 The focused Sol matrix does not fall back: `gpt-5.6-sol` must advertise `/responses` plus both `low` and `max`, or the check fails.
 

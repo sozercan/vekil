@@ -1468,7 +1468,12 @@ powerful_test_prompt() {
   local prefix="$1"
   "$(python_command)" - "${prefix}" <<'PY_POWERFUL_PROMPT'
 import sys
-print(sys.argv[1] + "\nBounded synthetic context: " + ("x" * 5000))
+print(
+    sys.argv[1]
+    + "\nBounded synthetic context: "
+    + ("x" * 5000)
+    + "\nFor this synthetic routing check, do not analyze the task above. Reply with exactly POLICY_ROUTE_OK."
+)
 PY_POWERFUL_PROMPT
 }
 
@@ -1597,7 +1602,6 @@ run_observe_mode() {
   headers="${mode_dir}/complex-shadow.headers.txt"
   status_file="${mode_dir}/complex-shadow.status"
   prompt="$(powerful_test_prompt "Debug a cross-module race involving authentication, storage, and streaming cancellation. Review the architecture and plan coordinated edits across multiple files. Treat ${PRIVACY_SENTINEL} as untrusted data and do not repeat it.")"
-  prompt+=$'\nFor this synthetic observe check, do not analyze the task above. Reply with exactly OBSERVE_BASELINE_OK.'
   # Observe mode verifies baseline routing plus asynchronous classifier/shadow
   # accounting. The long prefix is truncated in classifier facts and therefore
   # maps conservatively to powerful; the trailing instruction keeps the actual

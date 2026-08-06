@@ -367,13 +367,13 @@ select_copilot_models() {
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL:-}" \
     "" \
     high \
-	    gpt-5.4 gemini-3.1-pro-preview gemini-3.5-flash claude-sonnet-4.6 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
+	    gemini-3.1-pro-preview gemini-3.5-flash claude-sonnet-4.6 gpt-5.4 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
   selected_secondary="$(pick_copilot_model \
     powerful-secondary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL:-}" \
     "${selected_primary}" \
     high \
-	    gemini-3.1-pro-preview gemini-3.5-flash gpt-5.4 claude-sonnet-4.6 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
+	    gemini-3.5-flash claude-sonnet-4.6 gemini-3.1-pro-preview gpt-5.4 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
 
   jq -n \
     --arg lightweight "${selected_lightweight}" \
