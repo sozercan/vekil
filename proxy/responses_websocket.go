@@ -2243,7 +2243,7 @@ func (s *responsesWebSocketSession) compactHistoryItemsWithKeepTail(h *ProxyHand
 	// additional_tools items are request-scoped catalogs rather than
 	// conversation history. Keep them out of prefix selection and internal
 	// summarization, then restore them on the actual inference replay.
-	compacted := make([]json.RawMessage, 0, len(additionalTools)+1+len(tail))
+	compacted := make([]json.RawMessage, 0, len(history))
 	compacted = append(compacted, additionalTools...)
 	compacted = append(compacted, checkpoint)
 	compacted = append(compacted, tail...)
