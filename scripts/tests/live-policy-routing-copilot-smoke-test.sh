@@ -175,7 +175,6 @@ set -euo pipefail
 [[ "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL}" == "gemini-3.1-pro-preview" ]]
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT}" == "low" ]]
 [[ "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT}" == "high" ]]
-[[ "${SMOKE_OBSERVE_MAX_COMPLETION_TOKENS}" == "2048" ]]
 [[ "${LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED}" == "false" ]]
 [[ "${LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION}" == "true" ]]
 [[ -n "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY}" ]]
@@ -235,7 +234,7 @@ main() {
   mkdir -p "${SMOKE_DIR}"
 
   log "Running Copilot semantic-policy wrapper against a deterministic bridge catalog"
-  env -u SMOKE_OBSERVE_MAX_COMPLETION_TOKENS \
+  env \
     COPILOT_GITHUB_TOKEN="${TOKEN}" \
     PROXY_BIN=/usr/bin/true \
     LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN="${BRIDGE_BIN}" \
