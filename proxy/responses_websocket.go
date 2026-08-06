@@ -2054,7 +2054,8 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 	}
 
 	originalHistory := cloneRawMessages(s.historyItems)
-	keepTailSchedule := compactedResponsesRetryKeepTailSchedule(len(originalHistory), configuredKeepTail)
+	_, replayHistory := partitionResponsesAdditionalToolsInputItems(originalHistory)
+	keepTailSchedule := compactedResponsesRetryKeepTailSchedule(len(replayHistory), configuredKeepTail)
 	if len(keepTailSchedule) == 0 {
 		return resp, nil
 	}
@@ -2187,17 +2188,19 @@ func responsesWebSocketAutoCompactKeepTail(items []json.RawMessage, cfg Response
 		return cfg.AutoCompactKeepTail
 	}
 
-	schedule := compactedResponsesRetryKeepTailSchedule(len(items), cfg.AutoCompactKeepTail)
+	additionalTools, history := partitionResponsesAdditionalToolsInputItems(items)
+	schedule := compactedResponsesRetryKeepTailSchedule(len(history), cfg.AutoCompactKeepTail)
 	if len(schedule) == 0 {
 		return cfg.AutoCompactKeepTail
 	}
 
 	for _, keepTail := range schedule {
-		prefixLen := compactedResponsesAlignedPrefixLen(items, keepTail)
+		prefixLen := compactedResponsesAlignedPrefixLen(history, keepTail)
 		if prefixLen <= 0 {
 			continue
 		}
-		if rawMessagesSize(items[prefixLen:]) < cfg.AutoCompactMaxBytes {
+		retainedBytes := rawMessagesSize(additionalTools) + rawMessagesSize(history[prefixLen:])
+		if retainedBytes < cfg.AutoCompactMaxBytes {
 			return keepTail
 		}
 	}
@@ -2210,13 +2213,14 @@ func (s *responsesWebSocketSession) compactHistoryItemsWithKeepTail(h *ProxyHand
 		return nil, result, false, nil
 	}
 
-	prefixLen := compactedResponsesAlignedPrefixLen(history, keepTail)
+	additionalTools, conversationHistory := partitionResponsesAdditionalToolsInputItems(history)
+	prefixLen := compactedResponsesAlignedPrefixLen(conversationHistory, keepTail)
 	if prefixLen <= 0 {
 		return nil, result, false, nil
 	}
 
-	prefix := history[:prefixLen]
-	tail := history[prefixLen:]
+	prefix := conversationHistory[:prefixLen]
+	tail := conversationHistory[prefixLen:]
 	result.fromItems = len(history)
 	result.fromBytes = rawMessagesSize(history)
 
@@ -2236,7 +2240,11 @@ func (s *responsesWebSocketSession) compactHistoryItemsWithKeepTail(h *ProxyHand
 		return nil, result, false, err
 	}
 
-	compacted := make([]json.RawMessage, 0, 1+len(tail))
+	// additional_tools items are request-scoped catalogs rather than
+	// conversation history. Keep them out of prefix selection and internal
+	// summarization, then restore them on the actual inference replay.
+	compacted := make([]json.RawMessage, 0, len(additionalTools)+1+len(tail))
+	compacted = append(compacted, additionalTools...)
 	compacted = append(compacted, checkpoint)
 	compacted = append(compacted, tail...)
 
