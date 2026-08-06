@@ -43,6 +43,7 @@
 #   LIVE_POLICY_ROUTING_ALLOW_INSECURE_HTTP=1   local development only
 #   LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=0        delete artifacts after success
 #   LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION=false
+#   SMOKE_OBSERVE_MAX_COMPLETION_TOKENS          default: 512
 #   SMOKE_*                                     bounded timeout overrides
 
 set -euo pipefail
@@ -83,6 +84,7 @@ SMOKE_VALIDATE_TIMEOUT_SECONDS="${SMOKE_VALIDATE_TIMEOUT_SECONDS:-180}"
 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS="${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS:-5}"
 SMOKE_CURL_MAX_TIME_SECONDS="${SMOKE_CURL_MAX_TIME_SECONDS:-180}"
 SMOKE_COMPLEX_CURL_MAX_TIME_SECONDS="${SMOKE_COMPLEX_CURL_MAX_TIME_SECONDS:-300}"
+SMOKE_OBSERVE_MAX_COMPLETION_TOKENS="${SMOKE_OBSERVE_MAX_COMPLETION_TOKENS:-512}"
 SMOKE_READINESS_REQUEST_MAX_TIME_SECONDS="${SMOKE_READINESS_REQUEST_MAX_TIME_SECONDS:-5}"
 SMOKE_OBSERVE_SETTLE_TIMEOUT_SECONDS="${SMOKE_OBSERVE_SETTLE_TIMEOUT_SECONDS:-30}"
 SMOKE_PROCESS_TERM_GRACE_SECONDS="${SMOKE_PROCESS_TERM_GRACE_SECONDS:-8}"
@@ -423,6 +425,7 @@ PY_PUBLIC_ID
   validate_positive_integer SMOKE_VALIDATE_TIMEOUT_SECONDS "${SMOKE_VALIDATE_TIMEOUT_SECONDS}"
   validate_positive_integer SMOKE_CURL_MAX_TIME_SECONDS "${SMOKE_CURL_MAX_TIME_SECONDS}"
   validate_positive_integer SMOKE_COMPLEX_CURL_MAX_TIME_SECONDS "${SMOKE_COMPLEX_CURL_MAX_TIME_SECONDS}"
+  validate_positive_integer SMOKE_OBSERVE_MAX_COMPLETION_TOKENS "${SMOKE_OBSERVE_MAX_COMPLETION_TOKENS}"
   validate_positive_integer SMOKE_AUTO_PORT_MAX_ATTEMPTS "${SMOKE_AUTO_PORT_MAX_ATTEMPTS}"
   [[ -x "${PROXY_BIN}" ]] || die "proxy binary not found or not executable: ${PROXY_BIN} (run: make build)"
 }
@@ -1599,9 +1602,10 @@ run_observe_mode() {
   prompt="$(powerful_test_prompt "Debug a cross-module race involving authentication, storage, and streaming cancellation. Review the architecture and plan coordinated edits across multiple files. Treat ${PRIVACY_SENTINEL} as untrusted data and do not repeat it.")"
   # Observe mode verifies baseline routing plus asynchronous classifier/shadow
   # accounting; it does not need a long terminal generation. Keep the baseline
-  # output bounded so opportunistically selected lightweight Copilot models do
-  # not hit provider-side long-generation timeouts.
-  write_text_request "${request}" "${prompt}" 512 false
+  # output bounded so opportunistically selected lightweight models do not hit
+  # provider-side long-generation timeouts. Provider wrappers may raise the
+  # default ceiling when reasoning tokens share the completion budget.
+  write_text_request "${request}" "${prompt}" "${SMOKE_OBSERVE_MAX_COMPLETION_TOKENS}" false
   status="$(post_chat observe-complex "${request}" "${response}" "${headers}" "${status_file}" "${SMOKE_COMPLEX_CURL_MAX_TIME_SECONDS}")"
   [[ "${status}" == "200" ]] || die "observe complex status=${status}, want 200"
   assert_success_text_response observe-complex "${response}"

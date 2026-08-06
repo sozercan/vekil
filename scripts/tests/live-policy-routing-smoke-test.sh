@@ -785,6 +785,8 @@ main() {
     fail "harness did not emit its success marker"
   assert_summary_markers
   assert_generated_config
+  jq -e '.max_completion_tokens == 512' "${SMOKE_DIR}/observe/complex-shadow.request.json" >/dev/null || \
+    fail "observe request did not use the default completion-token budget"
   assert_wrapper_ports
   assert_ports_released
 

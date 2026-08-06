@@ -259,6 +259,8 @@ The default pull-request check is [`Live Copilot Semantic Policy Routing Smoke`]
 
 The bridge is intentional even though production schema-v2 policy profiles can target pinned models on a dynamic `type: copilot` provider directly, including Responses-backed Chat models. It gives the common smoke harness independently controllable static targets and fault injection, keeps the real Copilot token in one private bridge process, and permits metadata-only capture of the exact terminal `/responses` request without exposing credentials or request content. The wrapper removes `COPILOT_GITHUB_TOKEN` from delegated harness environments, gives the bridge a private token directory, auto-selects a non-default loopback port, and verifies bridge/process-group cleanup.
 
+The common harness keeps observe-mode baseline generations at a 512-token ceiling by default. The Copilot wrapper raises only that request to 2,048 tokens so low-effort reasoning models have room to emit visible text while the live generation remains bounded.
+
 For the broad matrix, the wrapper selects only models whose catalog metadata advertises native `/chat/completions` support and the required tier effort. It falls back within these capability constraints when a preferred ID is absent:
 
 - lightweight: a native-Chat model advertising `low`, preferring GPT mini variants;
