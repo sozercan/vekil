@@ -3260,7 +3260,7 @@ func (h *ProxyHandler) maybeRetryCompactedResponsesRequest(ctx, observeCtx conte
 		// additional_tools items are request-scoped catalogs rather than
 		// conversation history. Keep them out of prefix selection and internal
 		// summarization, then restore them on the actual inference retry.
-		compactedInput := make([]json.RawMessage, 0, len(additionalTools)+1+len(history)-prefixLen)
+		compactedInput := make([]json.RawMessage, 0, len(input))
 		compactedInput = append(compactedInput, additionalTools...)
 		compactedInput = append(compactedInput, checkpoint)
 		compactedInput = append(compactedInput, history[prefixLen:]...)
