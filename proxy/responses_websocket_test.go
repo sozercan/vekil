@@ -449,6 +449,82 @@ func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 	}
 }
 
+func TestHandleResponsesWebSocket_NormalizesBlankAdditionalToolsNamespaceDescription(t *testing.T) {
+	var upstreamRequests atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests.Add(1)
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body struct {
+			Input []struct {
+				Type  string `json:"type"`
+				Tools []struct {
+					Type        string `json:"type"`
+					Name        string `json:"name"`
+					Description string `json:"description"`
+				} `json:"tools"`
+			} `json:"input"`
+		}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+		if len(body.Input) != 2 || body.Input[0].Type != "additional_tools" {
+			t.Fatalf("upstream input = %+v, want additional_tools and user message", body.Input)
+		}
+		if len(body.Input[0].Tools) != 1 {
+			t.Fatalf("upstream additional tools = %+v, want one namespace", body.Input[0].Tools)
+		}
+		namespace := body.Input[0].Tools[0]
+		if namespace.Type != "namespace" || namespace.Name != "functions" || namespace.Description != "Tools in the functions namespace." {
+			t.Fatalf("upstream namespace = %+v, want normalized functions description", namespace)
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-normalized\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-normalized\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n")
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "additional_tools",
+			"role": "developer",
+			"tools": []interface{}{
+				map[string]interface{}{
+					"type":        "namespace",
+					"name":        "functions",
+					"description": "",
+					"tools":       []interface{}{},
+				},
+			},
+		},
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+	if created := mustReadWebSocketJSON(t, conn); created["type"] != "response.created" {
+		t.Fatalf("expected response.created, got %v", created["type"])
+	}
+	if completed := mustReadWebSocketJSON(t, conn); completed["type"] != "response.completed" {
+		t.Fatalf("expected response.completed, got %v", completed["type"])
+	}
+	if got := upstreamRequests.Load(); got != 1 {
+		t.Fatalf("upstream requests = %d, want 1", got)
+	}
+}
+
 func TestHandleResponsesWebSocket_ForwardsCustomTurnMetadataFields(t *testing.T) {
 	turnMetadata := `{"turn_id":"turn-123","fiber_run_id":"fiber-123","origin":"app-server"}`
 	var gotTurnMetadata string
