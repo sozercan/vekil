@@ -2494,6 +2494,13 @@ func (h *ProxyHandler) rewriteResponsesRequestBodyForModel(bodyBytes []byte, req
 			logger.F("fields", strippedFields),
 		)
 	}
+	if rewrittenBody, normalizedCount := normalizeResponsesAdditionalToolsNamespaceDescriptions(bodyBytes); normalizedCount > 0 {
+		bodyBytes = rewrittenBody
+		h.log.Debug("normalized empty Responses namespace descriptions",
+			logger.F("endpoint", endpoint),
+			logger.F("count", normalizedCount),
+		)
+	}
 
 	contextCompactionRewriteCount := 0
 	if rewrittenBody, rewriteCount := sanitizeContextCompactionRequest(bodyBytes); rewriteCount > 0 {
