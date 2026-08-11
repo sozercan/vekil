@@ -1,29 +1,30 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
 )
 
-// showOsascriptDialog displays a macOS dialog using osascript and returns the
-// button the user clicked (e.g. "Open GitHub" or "Cancel"). If the user clicks
-// Cancel (or closes the dialog), "Cancel" is returned.
-func showOsascriptDialog(title, message, defaultButton, secondButton string) string {
+// confirmAction displays a macOS confirmation dialog using osascript and
+// returns true only when the user clicks the exact approve label. false is
+// the safe default for a declined, cancelled, or dismissed dialog.
+func confirmAction(ctx context.Context, prompt confirmationPrompt) bool {
 	script := fmt.Sprintf(
 		`display dialog %q with title %q buttons {%q, %q} default button %q`,
-		message, title, secondButton, defaultButton, defaultButton,
+		prompt.Message, prompt.Title, prompt.DeclineLabel, prompt.ApproveLabel, prompt.ApproveLabel,
 	)
-	out, err := exec.Command("osascript", "-e", script).Output()
+	out, err := exec.CommandContext(ctx, "osascript", "-e", script).Output()
 	if err != nil {
-		// User clicked Cancel or closed the dialog.
-		return "Cancel"
+		// User clicked decline, closed the dialog, or ctx was cancelled.
+		return false
 	}
 	// osascript returns "button returned:Open GitHub\n"
 	result := strings.TrimSpace(string(out))
 	result = strings.TrimPrefix(result, "button returned:")
-	return result
+	return result == prompt.ApproveLabel
 }
 
 // showErrorDialog displays a simple macOS error dialog with an OK button.
