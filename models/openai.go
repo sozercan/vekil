@@ -78,7 +78,7 @@ type OpenAIToolCall struct {
 
 // OpenAIFunctionCall contains the function name and arguments for a tool call.
 type OpenAIFunctionCall struct {
-	Name      string `json:"name"`
+	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments"`
 }
 

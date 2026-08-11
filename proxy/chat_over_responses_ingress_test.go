@@ -80,6 +80,96 @@ func TestHandleOpenAIChatCompletionsResponsesBackedStreamingText(t *testing.T) {
 	}
 }
 
+func TestHandleOpenAIChatCompletionsResponsesBackedStreamingToolCallOmitsUnchangedName(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/chat_over_responses/stream_one_tool_call.sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write(fixture)
+	}))
+	defer upstream.Close()
+
+	h := newChatExecutionTestHandler(t, upstream.URL, []string{providerEndpointResponses})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{
+		"model":"gpt-public",
+		"messages":[{"role":"user","content":"use lookup"}],
+		"stream":true,
+		"tools":[{"type":"function","function":{"name":"lookup_synthetic_widget","parameters":{"type":"object"}}}]
+	}`))
+	rec := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var sawStart, sawArguments, sawToolFinish bool
+	doneCount := 0
+	for _, event := range parseSSEEvents(rec.Body.String()) {
+		if event.Data == "[DONE]" {
+			doneCount++
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					ToolCalls []struct {
+						Function map[string]json.RawMessage `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(event.Data), &chunk); err != nil {
+			t.Fatalf("decode stream event: %v\nevent=%s", err, event.Data)
+		}
+		for _, choice := range chunk.Choices {
+			if choice.FinishReason != nil && *choice.FinishReason == "tool_calls" {
+				sawToolFinish = true
+			}
+			for _, call := range choice.Delta.ToolCalls {
+				rawName, hasName := call.Function["name"]
+				name := ""
+				if hasName {
+					if err := json.Unmarshal(rawName, &name); err != nil {
+						t.Fatalf("decode tool name: %v", err)
+					}
+					if name == "" {
+						t.Fatalf("streamed tool-call delta contains an empty function name: %s", event.Data)
+					}
+				}
+				rawArguments, hasArguments := call.Function["arguments"]
+				if !hasArguments {
+					if name == "lookup_synthetic_widget" {
+						t.Fatalf("initial tool-call delta is missing arguments: %s", event.Data)
+					}
+					continue
+				}
+				var arguments string
+				if err := json.Unmarshal(rawArguments, &arguments); err != nil {
+					t.Fatalf("decode tool arguments: %v", err)
+				}
+				if name == "lookup_synthetic_widget" {
+					if arguments != "" {
+						t.Fatalf("initial tool-call delta arguments = %q, want empty", arguments)
+					}
+					sawStart = true
+				}
+				if arguments == `{"widget":"alpha-fixture"}` {
+					if hasName {
+						t.Fatalf("argument-only tool-call delta contains function name: %s", event.Data)
+					}
+					sawArguments = true
+				}
+			}
+		}
+	}
+	if !sawStart || !sawArguments || !sawToolFinish || doneCount != 1 {
+		t.Fatalf("stream state start=%t arguments=%t tool_finish=%t done=%d\nbody=%s", sawStart, sawArguments, sawToolFinish, doneCount, rec.Body.String())
+	}
+}
+
 func TestHandleOpenAIChatCompletionsResponsesBackedForcedStreamToolCall(t *testing.T) {
 	fixture, err := os.ReadFile("testdata/chat_over_responses/stream_one_tool_call.sse")
 	if err != nil {
