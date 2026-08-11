@@ -14,6 +14,7 @@ import (
 const dbusNotifyDest = "org.freedesktop.Notifications"
 const dbusNotifyPath = "/org/freedesktop/Notifications"
 const dbusNotifyIface = "org.freedesktop.Notifications"
+const providersConfigSelectionGuidance = "install and run a desktop portal backend, run vekil --providers-config PATH, or edit the saved menubar config file directly"
 
 var (
 	errNotificationDismissed = errors.New("notification dismissed")
@@ -161,7 +162,7 @@ func portalShow(title, message, priority string) error {
 func chooseProvidersConfigPath() (string, error) {
 	conn, err := newPortalConn()
 	if err != nil {
-		return "", fmt.Errorf("connect to xdg-desktop-portal: %w; install and run a desktop portal backend", err)
+		return "", fmt.Errorf("connect to xdg-desktop-portal: %w; %s", err, providersConfigSelectionGuidance)
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -176,7 +177,7 @@ func chooseProvidersConfigPath() (string, error) {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			return "", errDialogCanceled
 		}
-		return "", fmt.Errorf("xdg-desktop-portal file chooser failed; install and run a desktop portal backend: %w", err)
+		return "", fmt.Errorf("xdg-desktop-portal file chooser failed: %w; %s", err, providersConfigSelectionGuidance)
 	}
 
 	switch resp.Code {
@@ -185,7 +186,7 @@ func chooseProvidersConfigPath() (string, error) {
 	case 1:
 		return "", errDialogCanceled
 	default:
-		return "", fmt.Errorf("xdg-desktop-portal file chooser failed (response code %d); install and run a desktop portal backend", resp.Code)
+		return "", fmt.Errorf("xdg-desktop-portal file chooser failed (response code %d); %s", resp.Code, providersConfigSelectionGuidance)
 	}
 
 	uris, err := decodePortalStringArray(resp.Results, "uris")

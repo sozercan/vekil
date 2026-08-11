@@ -302,6 +302,52 @@ func TestChooseProvidersConfigPathSetupFailureIsActionable(t *testing.T) {
 	if err == nil || errors.Is(err, errDialogCanceled) {
 		t.Fatalf("chooseProvidersConfigPath() error = %v, want a descriptive setup error", err)
 	}
+	requireProvidersConfigSelectionGuidance(t, err)
+}
+
+func TestChooseProvidersConfigPathOpenFailureIsActionable(t *testing.T) {
+	restoreDialogHooks(t)
+
+	fake := newFakePortalConn(":1.18")
+	fake.callFn = func(call fakePortalCall) ([]any, error) {
+		if call.Method == portalFileChooser+".OpenFile" {
+			return nil, errors.New("open failed")
+		}
+		return nil, nil
+	}
+	newPortalConn = func() (portalConn, error) { return fake, nil }
+
+	_, err := chooseProvidersConfigPath()
+	if err == nil || errors.Is(err, errDialogCanceled) {
+		t.Fatalf("chooseProvidersConfigPath() error = %v, want a descriptive open error", err)
+	}
+	requireProvidersConfigSelectionGuidance(t, err)
+}
+
+func TestChooseProvidersConfigPathErrorResponseIsActionable(t *testing.T) {
+	restoreDialogHooks(t)
+
+	fake := newFakePortalConn(":1.19")
+	fake.callFn = func(call fakePortalCall) ([]any, error) {
+		if call.Method == portalFileChooser+".OpenFile" {
+			handle := predictRequestPath(fake.unique, extractHandleToken(t, call))
+			go fake.emit(&dbus.Signal{
+				Sender: portalBusName,
+				Path:   handle,
+				Name:   portalRequestIface + "." + portalResponseName,
+				Body:   []any{uint32(2), map[string]dbus.Variant{}},
+			})
+			return []any{handle}, nil
+		}
+		return nil, nil
+	}
+	newPortalConn = func() (portalConn, error) { return fake, nil }
+
+	_, err := chooseProvidersConfigPath()
+	if err == nil || errors.Is(err, errDialogCanceled) {
+		t.Fatalf("chooseProvidersConfigPath() error = %v, want a descriptive portal response error", err)
+	}
+	requireProvidersConfigSelectionGuidance(t, err)
 }
 
 func TestOpenURLSuccessfulPortalCallDoesNotInvokeXDGOpen(t *testing.T) {
@@ -706,6 +752,19 @@ func TestChooseProvidersConfigPathEmptyURIsInSuccessResponseIsActionable(t *test
 	_, err := chooseProvidersConfigPath()
 	if err == nil || errors.Is(err, errDialogCanceled) {
 		t.Fatalf("chooseProvidersConfigPath() error = %v, want a distinct actionable error, not errDialogCanceled", err)
+	}
+}
+
+func requireProvidersConfigSelectionGuidance(t *testing.T, err error) {
+	t.Helper()
+
+	for _, want := range []string{
+		"vekil --providers-config PATH",
+		"edit the saved menubar config file directly",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("chooseProvidersConfigPath() error = %q, want it to contain %q", err, want)
+		}
 	}
 }
 
