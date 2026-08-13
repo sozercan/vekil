@@ -361,14 +361,30 @@ SMOKE_PROVIDER=zen PROVIDERS_CONFIG=examples/opencode-zen-free.yaml \
   scripts/live-cli-smoke.sh
 ```
 
+## Live Copilot Direct-Bearer Smoke Workflow
+
+The [`Live Copilot Direct Bearer Smoke`](../.github/workflows/live-copilot-direct-bearer-smoke.yaml) workflow is focused credentialed coverage for `COPILOT_GITHUB_TOKEN` values that GitHub accepts directly as Copilot bearers but rejects at the legacy Copilot token exchange. It uses a dedicated fine-grained PAT to verify the live sequence exactly: `/copilot_internal/v2/token` returns `404`, `/copilot_internal/user` returns `200`, Vekil returns the original environment token from `GetToken`, a second call uses the in-memory cache, and neither `access-token` nor `api-key.json` is written.
+
+Configure the repository secret `COPILOT_FINE_GRAINED_PAT` with a fine-grained personal access token for an account with Copilot access and the **Copilot Requests** permission. Do not reuse an exchange-compatible OAuth or classic token: the workflow intentionally fails unless the credential itself exercises the `404`-then-`200` fallback contract. Fork and Dependabot pull requests neutral-skip because GitHub withholds secrets. Same-repository pull requests also neutral-skip until the secret is installed; a manual dispatch with missing configuration fails.
+
+Run the exact check locally without printing the credential:
+
+```bash
+LIVE_COPILOT_DIRECT_BEARER_TEST=1 \
+  COPILOT_GITHUB_TOKEN=... \
+  go test ./auth -run '^TestLiveEnvAccessTokenDirectBearerFallback$' -count=1 -v
+```
+
 ## Live Copilot workflows setup
 
-The `Live Copilot Smoke` and `Live Copilot Semantic Policy Routing Smoke` workflows share one credential:
+The `Live Copilot Smoke` and `Live Copilot Semantic Policy Routing Smoke` workflows share one exchange-compatible credential:
 
 1. Create a GitHub token for a user that has GitHub Copilot access.
 2. Grant that token the `Copilot Requests` permission.
 3. Save it as the repository secret `COPILOT_GITHUB_TOKEN`.
 4. Run either workflow from the Actions tab; same-repository pull requests run both automatically.
+
+The direct-bearer workflow deliberately uses the separate `COPILOT_FINE_GRAINED_PAT` credential described above so the regular exchange path and the fine-grained-PAT fallback remain independently covered.
 
 These workflows remain separate from deterministic core CI. Both neutral-skip fork pull requests because GitHub does not expose repository secrets to untrusted pull-request code. The semantic-policy workflow also neutral-skips Dependabot runs; `Live Copilot Smoke` neutral-skips Dependabot only when `COPILOT_GITHUB_TOKEN` is unavailable. In other contexts, a missing token fails the workflow.
 

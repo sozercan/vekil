@@ -1,0 +1,76 @@
+name: Live Copilot Direct Bearer Smoke
+
+# Credentialed live coverage for the environment-token fallback used by
+# fine-grained PATs with Copilot Requests permission. The dedicated credential
+# must naturally receive 404 from the legacy Copilot token exchange while being
+# accepted by the Copilot user endpoint as a bearer. The test fails if either
+# side of that live contract changes, if Vekil does not return the environment
+# token directly, or if it persists the token.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-copilot-direct-bearer-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  direct-bearer-auth:
+    name: direct-bearer-auth
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_FINE_GRAINED_PAT }}
+    steps:
+      - name: Decide whether direct-bearer smoke can run
+        id: gate
+        env:
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork || false }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ "${IS_FORK}" = "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping direct-bearer smoke for fork pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${ACTOR}" = "dependabot[bot]" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping direct-bearer smoke for Dependabot because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              echo "COPILOT_FINE_GRAINED_PAT repository secret is required for the direct-bearer smoke." >&2
+              exit 1
+            fi
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping direct-bearer smoke until the COPILOT_FINE_GRAINED_PAT repository secret is installed." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Explain skipped direct-bearer smoke
+        if: steps.gate.outputs.run != 'true'
+        run: echo "${{ steps.gate.outputs.reason }}"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.gate.outputs.run == 'true'
+        with:
+          go-version-file: go.mod
+
+      - name: Verify live fine-grained PAT direct-bearer fallback
+        if: steps.gate.outputs.run == 'true'
+        env:
+          LIVE_COPILOT_DIRECT_BEARER_TEST: "1"
+        run: go test ./auth -run '^TestLiveEnvAccessTokenDirectBearerFallback$' -count=1 -v -timeout=2m
