@@ -135,6 +135,59 @@ func TestConfirmActionLegacyDismissalDeclines(t *testing.T) {
 	}
 }
 
+// TestWaitForLegacyNotificationActionReturnsQueuedApprovalWhenContextEndsSimultaneously
+// exercises the same ctx.Done()-vs-buffered-signal race as the portal action
+// path. An explicit approval already delivered to the process must win over
+// the shared confirmation deadline, and the notification must not be closed.
+func TestWaitForLegacyNotificationActionReturnsQueuedApprovalWhenContextEndsSimultaneously(t *testing.T) {
+	const notificationID = uint32(42)
+	validActions := map[string]bool{portalActionApprove: true, portalActionDecline: true}
+
+	const iterations = 30
+	for i := 0; i < iterations; i++ {
+		sigCh := make(chan *dbus.Signal, 1)
+		sigCh <- &dbus.Signal{
+			Path: dbusNotifyPath,
+			Name: dbusNotifyIface + ".ActionInvoked",
+			Body: []any{notificationID, portalActionApprove},
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		closeCalls := 0
+		action, err := waitForLegacyNotificationAction(ctx, sigCh, notificationID, validActions, func() {
+			closeCalls++
+		})
+
+		if err != nil {
+			t.Fatalf("iteration %d: waitForLegacyNotificationAction() error = %v, want queued approval honored", i, err)
+		}
+		if action != portalActionApprove {
+			t.Fatalf("iteration %d: waitForLegacyNotificationAction() = %q, want %q", i, action, portalActionApprove)
+		}
+		if closeCalls != 0 {
+			t.Fatalf("iteration %d: closeNotification calls = %d, want 0 after queued approval", i, closeCalls)
+		}
+	}
+}
+
+func TestWaitForLegacyNotificationActionCancellationClosesNotification(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	closeCalls := 0
+	_, err := waitForLegacyNotificationAction(ctx, make(chan *dbus.Signal, 1), 42, map[string]bool{}, func() {
+		closeCalls++
+	})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForLegacyNotificationAction() error = %v, want context.Canceled", err)
+	}
+	if closeCalls != 1 {
+		t.Fatalf("closeNotification calls = %d, want 1", closeCalls)
+	}
+}
+
 func TestConfirmActionTotalUIUnavailabilityDeclines(t *testing.T) {
 	restoreDialogHooks(t)
 
@@ -291,6 +344,28 @@ func TestChooseProvidersConfigPathCancellationReturnsErrDialogCanceled(t *testin
 	if !errors.Is(err, errDialogCanceled) {
 		t.Fatalf("chooseProvidersConfigPath() error = %v, want errDialogCanceled", err)
 	}
+}
+
+func TestChooseProvidersConfigPathTimeoutIsActionable(t *testing.T) {
+	restoreDialogHooks(t)
+
+	fake := newFakePortalConn(":1.34")
+	fake.callFn = func(call fakePortalCall) ([]any, error) {
+		if call.Method == portalFileChooser+".OpenFile" {
+			return nil, context.DeadlineExceeded
+		}
+		return nil, nil
+	}
+	newPortalConn = func() (portalConn, error) { return fake, nil }
+
+	_, err := chooseProvidersConfigPath()
+	if err == nil || errors.Is(err, errDialogCanceled) {
+		t.Fatalf("chooseProvidersConfigPath() error = %v, want a descriptive timeout error", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("chooseProvidersConfigPath() error = %v, want context.DeadlineExceeded preserved", err)
+	}
+	requireProvidersConfigSelectionGuidance(t, err)
 }
 
 func TestChooseProvidersConfigPathSetupFailureIsActionable(t *testing.T) {

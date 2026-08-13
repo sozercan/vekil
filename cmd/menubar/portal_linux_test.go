@@ -205,6 +205,41 @@ func TestRunPortalRequestRetainsResponseEmittedOnPredictedPathBeforeMethodReturn
 	}
 }
 
+// TestRunPortalRequestReturnsQueuedResponseWhenContextEndsSimultaneously
+// exercises the ctx.Done()-vs-buffered-response race. The request call queues
+// the matching response and cancels ctx before returning, so both select cases
+// are ready when runPortalRequest begins waiting. The completed response must
+// always win and Request.Close must not run.
+func TestRunPortalRequestReturnsQueuedResponseWhenContextEndsSimultaneously(t *testing.T) {
+	const iterations = 30
+	for i := 0; i < iterations; i++ {
+		conn := newFakePortalConn(":1.33")
+		predicted := predictRequestPath(conn.unique, "tok")
+		ctx, cancel := context.WithCancel(t.Context())
+
+		resp, err := runPortalRequest(ctx, conn, predicted, func() (dbus.ObjectPath, error) {
+			conn.emit(&dbus.Signal{
+				Sender: portalBusName,
+				Path:   predicted,
+				Name:   portalRequestIface + "." + portalResponseName,
+				Body:   []any{uint32(0), map[string]dbus.Variant{}},
+			})
+			cancel()
+			return predicted, nil
+		})
+
+		if err != nil {
+			t.Fatalf("iteration %d: runPortalRequest() error = %v, want queued response honored despite simultaneous cancellation", i, err)
+		}
+		if resp.Code != 0 {
+			t.Fatalf("iteration %d: runPortalRequest() code = %d, want 0", i, resp.Code)
+		}
+		if closeCalls := conn.callsMatching(portalRequestIface + ".Close"); len(closeCalls) != 0 {
+			t.Fatalf("iteration %d: runPortalRequest() Request.Close calls = %d, want 0 after completed response", i, len(closeCalls))
+		}
+	}
+}
+
 func TestRunPortalRequestRetainsResponseOnReturnedHandleDifferentFromPrediction(t *testing.T) {
 	conn := newFakePortalConn(":1.2")
 	predicted := predictRequestPath(conn.unique, "tok")

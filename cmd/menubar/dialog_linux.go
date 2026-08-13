@@ -174,9 +174,6 @@ func chooseProvidersConfigPath() (string, error) {
 
 	resp, err := portalOpenFile(ctx, conn, token, predicted, "Choose Providers Config")
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			return "", errDialogCanceled
-		}
 		return "", fmt.Errorf("xdg-desktop-portal file chooser failed: %w; %s", err, providersConfigSelectionGuidance)
 	}
 
@@ -361,33 +358,75 @@ func dbusNotifyWithActions(ctx context.Context, summary, body string, actions []
 		return "", err
 	}
 
+	return waitForLegacyNotificationAction(ctx, sigCh, nid, validActions, func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), portalCleanupTimeout)
+		_ = obj.CallWithContext(closeCtx, dbusNotifyIface+".CloseNotification", 0, nid).Err
+		cancel()
+	})
+}
+
+// waitForLegacyNotificationAction waits for an action or dismissal belonging
+// to notificationID. When ctx ends, an already-buffered matching result wins;
+// otherwise closeNotification is invoked before returning the context error.
+func waitForLegacyNotificationAction(ctx context.Context, sigCh <-chan *dbus.Signal, notificationID uint32, validActions map[string]bool, closeNotification func()) (string, error) {
 	for {
 		select {
 		case sig, ok := <-sigCh:
 			if !ok {
 				return "", fmt.Errorf("signal channel closed")
 			}
-			switch sig.Name {
-			case dbusNotifyIface + ".ActionInvoked":
-				if len(sig.Body) >= 2 {
-					if id, ok := sig.Body[0].(uint32); ok && id == nid {
-						if action, ok := sig.Body[1].(string); ok && validActions[action] {
-							return action, nil
-						}
-					}
-				}
-			case dbusNotifyIface + ".NotificationClosed":
-				if len(sig.Body) >= 1 {
-					if id, ok := sig.Body[0].(uint32); ok && id == nid {
-						return "", errNotificationDismissed
-					}
-				}
+			if action, err, matched := decodeLegacyNotificationResult(sig, notificationID, validActions); matched {
+				return action, err
 			}
 		case <-ctx.Done():
-			closeCtx, cancel := context.WithTimeout(context.Background(), portalCleanupTimeout)
-			_ = obj.CallWithContext(closeCtx, dbusNotifyIface+".CloseNotification", 0, nid).Err
-			cancel()
+			// A user action can already be buffered when the shared timeout
+			// expires. Preserve that explicit answer instead of randomly
+			// choosing cancellation and closing the notification first.
+			if action, err, matched := drainQueuedLegacyNotificationResult(sigCh, notificationID, validActions); matched {
+				return action, err
+			}
+			closeNotification()
 			return "", ctx.Err()
 		}
 	}
+}
+
+// drainQueuedLegacyNotificationResult non-blockingly drains signals already
+// buffered on sigCh, looking for a matching action or dismissal.
+func drainQueuedLegacyNotificationResult(sigCh <-chan *dbus.Signal, notificationID uint32, validActions map[string]bool) (string, error, bool) {
+	for {
+		select {
+		case sig, ok := <-sigCh:
+			if !ok {
+				return "", nil, false
+			}
+			if action, err, matched := decodeLegacyNotificationResult(sig, notificationID, validActions); matched {
+				return action, err, true
+			}
+		default:
+			return "", nil, false
+		}
+	}
+}
+
+// decodeLegacyNotificationResult decodes a matching ActionInvoked or
+// NotificationClosed signal for notificationID.
+func decodeLegacyNotificationResult(sig *dbus.Signal, notificationID uint32, validActions map[string]bool) (string, error, bool) {
+	switch sig.Name {
+	case dbusNotifyIface + ".ActionInvoked":
+		if len(sig.Body) >= 2 {
+			if id, ok := sig.Body[0].(uint32); ok && id == notificationID {
+				if action, ok := sig.Body[1].(string); ok && validActions[action] {
+					return action, nil, true
+				}
+			}
+		}
+	case dbusNotifyIface + ".NotificationClosed":
+		if len(sig.Body) >= 1 {
+			if id, ok := sig.Body[0].(uint32); ok && id == notificationID {
+				return "", errNotificationDismissed, true
+			}
+		}
+	}
+	return "", nil, false
 }

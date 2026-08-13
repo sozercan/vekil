@@ -302,7 +302,8 @@ type portalResponse struct {
 // match/signal on completion or on ctx cancellation. The path-namespace
 // scope keeps this subscription from also receiving every other
 // application's portal Request.Response traffic on the session bus. On
-// cancellation, Request.Close is invoked best-effort with a short,
+// cancellation, any matching response already queued on the signal channel
+// wins; otherwise Request.Close is invoked best-effort with a short,
 // independent cleanup context.
 func runPortalRequest(ctx context.Context, conn portalConn, predicted dbus.ObjectPath, call func() (dbus.ObjectPath, error)) (portalResponse, error) {
 	sigCh := make(chan *dbus.Signal, portalSignalBufferSize)
@@ -339,10 +340,36 @@ func runPortalRequest(ctx context.Context, conn portalConn, predicted dbus.Objec
 				return resp, nil
 			}
 		case <-ctx.Done():
+			// Go may choose ctx.Done() even when the matching response was
+			// already delivered and buffered. Honor that completed response
+			// before closing the request so a file selection is not discarded
+			// and a successful OpenURI request does not trigger a fallback.
+			if resp, ok := drainQueuedPortalResponse(sigCh, predicted, handle); ok {
+				return resp, nil
+			}
 			closeCtx, cancel := context.WithTimeout(context.Background(), portalCleanupTimeout)
 			_, _ = conn.Call(closeCtx, portalBusName, handle, portalRequestIface+".Close")
 			cancel()
 			return portalResponse{}, ctx.Err()
+		}
+	}
+}
+
+// drainQueuedPortalResponse non-blockingly drains signals already buffered on
+// sigCh, looking for a Request.Response matching predicted or handle. See
+// runPortalRequest's ctx.Done() case for why this is needed.
+func drainQueuedPortalResponse(sigCh <-chan *dbus.Signal, predicted, handle dbus.ObjectPath) (portalResponse, bool) {
+	for {
+		select {
+		case sig, ok := <-sigCh:
+			if !ok {
+				return portalResponse{}, false
+			}
+			if resp, matched := decodePortalResponse(sig, predicted, handle); matched {
+				return resp, true
+			}
+		default:
+			return portalResponse{}, false
 		}
 	}
 }
