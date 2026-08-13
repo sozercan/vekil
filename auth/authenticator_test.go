@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -220,6 +221,32 @@ func TestGetToken_EnvAccessTokenBearerRejectionKeepsExchangeError(t *testing.T) 
 
 	if _, err := a.GetToken(context.Background()); err == nil || !strings.Contains(err.Error(), "404") {
 		t.Fatalf("expected the original exchange error, got %v", err)
+	}
+}
+
+func TestUseEnvAccessTokenAsBearer_CanceledAfterValidationDoesNotCommit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	previousExpiry := time.Now().Add(time.Hour)
+	a := &Authenticator{
+		copilotToken:   "previous-token",
+		tokenExpiry:    previousExpiry,
+		copilotBaseURL: "http://copilot.test",
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       &cancelAfterJSONReadCloser{cancel: cancel},
+			}, nil
+		})},
+	}
+
+	if err := a.useEnvAccessTokenAsBearer(ctx, "environment-token"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("useEnvAccessTokenAsBearer() error = %v, want context.Canceled", err)
+	}
+	if a.copilotToken != "previous-token" {
+		t.Fatalf("copilot token = %q, want previous-token", a.copilotToken)
+	}
+	if !a.tokenExpiry.Equal(previousExpiry) {
+		t.Fatalf("token expiry = %v, want %v", a.tokenExpiry, previousExpiry)
 	}
 }
 
@@ -779,6 +806,23 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
+
+type cancelAfterJSONReadCloser struct {
+	cancel context.CancelFunc
+	read   bool
+}
+
+func (r *cancelAfterJSONReadCloser) Read(p []byte) (int, error) {
+	if r.read {
+		return 0, io.EOF
+	}
+	r.read = true
+	n := copy(p, `{}`)
+	r.cancel()
+	return n, io.EOF
+}
+
+func (*cancelAfterJSONReadCloser) Close() error { return nil }
 
 func writeAuthPreferencesForTest(t *testing.T, dir string, enabled bool) {
 	t.Helper()

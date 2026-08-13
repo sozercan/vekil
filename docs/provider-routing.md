@@ -6,7 +6,7 @@ Use this file when editing provider credentials, model ownership, JSON/YAML prov
 
 ### GitHub Copilot
 
-For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a GitHub token for a user with GitHub Copilot access. This is the only GitHub token environment variable Vekil consumes directly; it overrides cached Vekil login state and is exchanged for a short-lived Copilot token at startup.
+For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a GitHub token for a user with GitHub Copilot access. This is the only GitHub token environment variable Vekil consumes directly, and it overrides cached Vekil login state. Vekil first attempts to exchange it for a short-lived Copilot token. If that legacy exchange rejects a token that the Copilot user endpoint accepts directly, such as a fine-grained PAT with the Copilot Requests permission, Vekil instead uses the environment token as the Copilot bearer. That direct bearer is kept only in memory, is never written to the Copilot token cache, and is revalidated on the normal refresh cadence.
 
 Vekil intentionally ignores generic GitHub token variables such as `GH_TOKEN` and `GITHUB_TOKEN`. If you want Vekil to use an authenticated GitHub CLI account, opt in explicitly with `vekil login --github-cli` or `vekil login --gh`; Vekil then runs `gh auth token --hostname github.com` for Copilot access and keeps that token in memory only, without copying it into Vekil's `access-token` or `api-key.json` caches.
 

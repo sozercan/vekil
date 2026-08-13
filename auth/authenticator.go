@@ -632,6 +632,9 @@ func (a *Authenticator) useEnvAccessTokenAsBearer(ctx context.Context, envToken 
 	if err := a.validateGitHubCLIToken(ctx, envToken); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	a.copilotToken = envToken
 	a.tokenExpiry = time.Now().Add(githubCLITokenTTL)
 	return nil
