@@ -849,6 +849,23 @@ run_zen_classification_case "canary 404 plus transient text is hard" 404 \
 run_zen_classification_case "canary 200 bad shape plus transient text is hard" 200 \
   "service temporarily unavailable" 1
 
+removed_model_dir="${TMP_ROOT}/setup/removed-zen-model"
+start_mock_server "${removed_model_dir}/server" 401 "" "Model deepseek-v4-flash-free is not supported"
+removed_model_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${removed_model_dir}/bin" pass pass pass
+expect_success "removed Zen model is a neutral pre-client transient" 8 \
+  env PATH="${removed_model_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${removed_model_port}" \
+    LIVE_CLI_SMOKE_DIR="${removed_model_dir}/cli-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+mkdir -p "${removed_model_dir}/raw-smoke"
+expect_hard_failure_with_stderr "removed Zen model is transient in raw smoke" 8 \
+  '^TRANSIENT[[:space:]].*message:Model deepseek-v4-flash-free is not supported' \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${removed_model_port}" \
+    LIVE_ZEN_SMOKE_DIR="${removed_model_dir}/raw-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-zen-smoke.sh"
+
 hanging_chat_dir="${TMP_ROOT}/setup/hanging-chat-canary"
 start_mock_server "${hanging_chat_dir}/server" 200 "" "" 0 1
 hanging_chat_port="${MOCK_SERVER_PORT}"

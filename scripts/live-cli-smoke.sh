@@ -699,7 +699,7 @@ ZEN_ANY_CLIENT_EXERCISED=0
 zen_error_is_transient() {
   local message="$1"
   printf '%s' "${message}" | grep -qiE \
-    'promotion (has )?ended|free promotion[^[:alnum:]]+ended|rate[ -]?limit|too many requests|temporar(il)?y unavailable|service unavailable|overload(ed)?|over capacity|capacity (has been )?exceeded|upstream[^[:alnum:]]+(timeout|unavailable)|gateway timeout'
+    'promotion (has )?ended|free promotion[^[:alnum:]]+ended|^model [[:alnum:]_.:/-]+ is not supported$|rate[ -]?limit|too many requests|temporar(il)?y unavailable|service unavailable|overload(ed)?|over capacity|capacity (has been )?exceeded|upstream[^[:alnum:]]+(timeout|unavailable)|gateway timeout'
 }
 
 # zen_canary <model> [artifact-tag] -> echoes:
