@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -157,6 +158,68 @@ func TestGetToken_EnvAccessTokenCachesInMemory(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("expected exactly 1 token exchange, got %d", calls)
+	}
+}
+
+func TestGetToken_EnvAccessTokenFallsBackToDirectBearer(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "github_pat_fine_grained")
+
+	var exchangeCalls, userCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			exchangeCalls++
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"Not Found","status":404}`))
+		case "/copilot_internal/user":
+			userCalls++
+			if got := r.Header.Get("Authorization"); got != "Bearer github_pat_fine_grained" {
+				t.Errorf("expected 'Bearer github_pat_fine_grained', got %q", got)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			t.Errorf("unexpected request path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	a := &Authenticator{
+		tokenDir:       t.TempDir(),
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	token, err := a.GetToken(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if token != "github_pat_fine_grained" {
+		t.Errorf("expected the env token used as a direct bearer, got %q", token)
+	}
+	if exchangeCalls != 1 || userCalls != 1 {
+		t.Fatalf("exchange calls = %d, user validation calls = %d, want 1 and 1", exchangeCalls, userCalls)
+	}
+}
+
+func TestGetToken_EnvAccessTokenBearerRejectionKeepsExchangeError(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "rejected-token")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+	}))
+	defer server.Close()
+
+	a := &Authenticator{
+		tokenDir:       t.TempDir(),
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	if _, err := a.GetToken(context.Background()); err == nil || !strings.Contains(err.Error(), "404") {
+		t.Fatalf("expected the original exchange error, got %v", err)
 	}
 }
 
