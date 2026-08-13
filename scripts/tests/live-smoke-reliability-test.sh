@@ -233,17 +233,35 @@ write_fake_client() {
 #!/usr/bin/env bash
 set -euo pipefail
 mode=${mode_q}
+fixture_output() {
+  local arg
+  for arg in "\$@"; do
+    if [[ "\${arg}" =~ (ZX_[A-Z]+_LEFT\|ZX_[A-Z]+_RIGHT) ]]; then
+      printf '%s' "\${BASH_REMATCH[1]}"
+      return 0
+    fi
+  done
+  if [[ -f left.txt && -f right.txt ]]; then
+    printf '%s|%s' "\$(cat left.txt)" "\$(cat right.txt)"
+    return 0
+  fi
+  printf 'fake client received neither a direct Zen sentinel nor file fixtures\n' >&2
+  return 98
+}
+expected="\$(fixture_output "\$@")"
+left="\${expected%%|*}"
+right="\${expected#*|}"
 case "\${mode}" in
   pass)
-    printf '%s|%s\n' "\$(cat left.txt)" "\$(cat right.txt)"
+    printf '%s\n' "\${expected}"
     ;;
   wrapped-output)
-    python3 - <<'PY_WRAPPED_OUTPUT'
+    FAKE_LEFT="\${left}" FAKE_RIGHT="\${right}" python3 - <<'PY_WRAPPED_OUTPUT'
 import json
-import pathlib
+import os
 
-left = pathlib.Path("left.txt").read_text()
-right = pathlib.Path("right.txt").read_text()
+left = os.environ["FAKE_LEFT"]
+right = os.environ["FAKE_RIGHT"]
 print(
     json.dumps({"output": left}, separators=(",", ":"))
     + "|"
@@ -252,25 +270,25 @@ print(
 PY_WRAPPED_OUTPUT
     ;;
   json-wrapped)
-    jq -cn --arg output "\$(cat left.txt)" '{output: \$output}'
+    jq -cn --arg output "\${left}" '{output: \$output}'
     printf '|'
-    jq -cn --arg output "\$(cat right.txt)" '{output: \$output}'
+    jq -cn --arg output "\${right}" '{output: \$output}'
     ;;
   json-wrapped-whole)
-    jq -cn --arg output "\$(cat left.txt)|\$(cat right.txt)" '{output: \$output}'
+    jq -cn --arg output "\${expected}" '{output: \$output}'
     ;;
   json-wrapped-trailing-separator)
-    jq -cn --arg output "\$(cat left.txt)" '{output: \$output}'
+    jq -cn --arg output "\${left}" '{output: \$output}'
     printf '|'
-    jq -cn --arg output "\$(cat right.txt)" '{output: \$output}'
+    jq -cn --arg output "\${right}" '{output: \$output}'
     printf '|'
     ;;
   json-wrapped-three)
-    jq -cn --arg output "\$(cat left.txt)" '{output: \$output}'
+    jq -cn --arg output "\${left}" '{output: \$output}'
     printf '|'
     jq -cn --arg output 'unexpected-third-wrapper' '{output: \$output}'
     printf '|'
-    jq -cn --arg output "\$(cat right.txt)" '{output: \$output}'
+    jq -cn --arg output "\${right}" '{output: \$output}'
     ;;
   exit42)
     exit 42
@@ -287,8 +305,7 @@ PY_WRAPPED_OUTPUT
     if [[ "\${count}" -eq 1 ]]; then
       exit 42
     fi
-    printf '%s|%s
-' "\$(cat left.txt)" "\$(cat right.txt)"
+    printf '%s\n' "\${expected}"
     ;;
   fork-sleeper)
     sleep 300 &
@@ -806,11 +823,11 @@ expect_success "second canary transient permits retry but every client still pas
     SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 
-wrapped_gemini_dir="${TMP_ROOT}/setup/gemini-wrapped-read-output"
+wrapped_gemini_dir="${TMP_ROOT}/setup/gemini-wrapped-direct-output"
 start_mock_server "${wrapped_gemini_dir}/server" 200
 wrapped_gemini_port="${MOCK_SERVER_PORT}"
 write_fake_clients "${wrapped_gemini_dir}/bin" pass pass wrapped-output
-expect_success "Gemini wrapped Read outputs normalize to exact fixture text" 10 \
+expect_success "Gemini wrapped outputs normalize to exact direct-prompt text" 10 \
   env PATH="${wrapped_gemini_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
     PROXY_HOST=127.0.0.1 PROXY_PORT="${wrapped_gemini_port}" \
     LIVE_CLI_SMOKE_DIR="${wrapped_gemini_dir}/smoke" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \

@@ -372,7 +372,7 @@ read_normalized_output() {
 # Recent Gemini CLI versions may render Read results as strict
 # {"output":"..."} objects even when text output was requested. Accept either
 # one wrapper around the complete result or the exact two-wrapper sequence for
-# this smoke's two files. Leave every other shape unchanged so malformed JSON,
+# this smoke's two-part fixture. Leave every other shape unchanged so malformed JSON,
 # extra fields, unwrapped text, and unexpected commentary still fail the exact
 # assertion.
 read_gemini_normalized_output() {
@@ -678,6 +678,9 @@ EOF
 #   - every installed client must pass independently;
 #   - neutral exit 0 is allowed only if no model was reachable before any client
 #     was exercised.
+# Zen's configured free models advertise text Chat support, not reliable coding
+# tool use, so these client checks use a direct exact-text prompt. The
+# credentialed Copilot-mode checks above retain their file-reading fixture.
 # Codex is intentionally excluded: codex CLI is /responses-only and always sends
 # a nameless web_search tool that Zen free upstreams reject. Copilot CLI covers
 # the same role via COPILOT_PROVIDER_WIRE_API=completions.
@@ -839,14 +842,17 @@ run_zen_harness_once() {
   local model="$2"
   local case_dir="${SMOKE_DIR}/cases/${client}"
   local output_file="${SMOKE_DIR}/outputs/${client}.txt"
-  local expected actual rc
+  local fixture_name expected prompt actual rc
 
   rm -rf "${case_dir}"
   rm -f "${output_file}" "${SMOKE_DIR}/outputs/${client}.err"
-  expected="$(write_case_files "${case_dir}" "${client}")"
+  mkdir -p "${case_dir}"
+  fixture_name="$(printf '%s' "${client}" | tr '[:lower:]' '[:upper:]')"
+  expected="ZX_${fixture_name}_LEFT|ZX_${fixture_name}_RIGHT"
+  prompt="Answer directly without tools. Return exactly ${expected} with no quotes, markdown, or extra text."
 
   if run_with_deadline "${SMOKE_CLI_TIMEOUT_SECONDS}" "${client} CLI (${model})" \
-    "run_${client}_zen" "${case_dir}" "${model}" "${output_file}"; then
+    "run_${client}_zen" "${case_dir}" "${model}" "${output_file}" "${prompt}"; then
     rc=0
   else
     rc=$?
@@ -891,6 +897,7 @@ run_copilot_zen() {
   local case_dir="$1"
   local model="$2"
   local output_file="$3"
+  local prompt="$4"
   local home_dir="${SMOKE_DIR}/homes/copilot-home"
 
   rm -rf "${home_dir}"; mkdir -p "${home_dir}"
@@ -902,7 +909,7 @@ run_copilot_zen() {
     COPILOT_PROVIDER_WIRE_API=completions \
     COPILOT_MODEL="${model}" \
     COPILOT_OFFLINE=true \
-    copilot --allow-all-tools -p "${PROMPT}" -s \
+    copilot --allow-all-tools -p "${prompt}" -s \
       > "${output_file}" 2>"${SMOKE_DIR}/outputs/copilot.err" < /dev/null
   )
 }
@@ -911,6 +918,7 @@ run_claude_zen() {
   local case_dir="$1"
   local model="$2"
   local output_file="$3"
+  local prompt="$4"
   local home_dir="${SMOKE_DIR}/homes/claude-home"
 
   rm -rf "${home_dir}"; mkdir -p "${home_dir}/.claude"
@@ -933,7 +941,7 @@ EOF
       --print \
       --output-format text \
       --model "${model}" \
-      "${PROMPT}" \
+      "${prompt}" \
       > "${output_file}" 2>"${SMOKE_DIR}/outputs/claude.err" < /dev/null
   )
 }
@@ -942,6 +950,7 @@ run_gemini_zen() {
   local case_dir="$1"
   local model="$2"
   local output_file="$3"
+  local prompt="$4"
   local home_dir="${SMOKE_DIR}/homes/gemini-home"
 
   rm -rf "${home_dir}"; mkdir -p "${home_dir}/.gemini/tmp"
@@ -965,7 +974,7 @@ EOF
     GEMINI_CLI_TRUST_WORKSPACE=true \
     gemini \
       -m "${model}" \
-      -p "${PROMPT}" \
+      -p "${prompt}" \
       -o text \
       -y \
       > "${output_file}" 2>"${SMOKE_DIR}/outputs/gemini.err" < /dev/null
