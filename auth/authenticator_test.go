@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -207,9 +206,21 @@ func TestGetToken_EnvAccessTokenFallsBackToDirectBearer(t *testing.T) {
 func TestGetToken_EnvAccessTokenBearerRejectionKeepsExchangeError(t *testing.T) {
 	t.Setenv("COPILOT_GITHUB_TOKEN", "rejected-token")
 
+	var exchangeCalls, userCalls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			exchangeCalls++
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error_details":"exchange rejected"}`))
+		case "/copilot_internal/user":
+			userCalls++
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"bearer rejected"}`))
+		default:
+			t.Errorf("unexpected request path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
 	defer server.Close()
 
@@ -219,8 +230,15 @@ func TestGetToken_EnvAccessTokenBearerRejectionKeepsExchangeError(t *testing.T) 
 		copilotBaseURL: server.URL,
 	}
 
-	if _, err := a.GetToken(context.Background()); err == nil || !strings.Contains(err.Error(), "404") {
-		t.Fatalf("expected the original exchange error, got %v", err)
+	_, err := a.GetToken(context.Background())
+	if err == nil {
+		t.Fatal("expected the original exchange error")
+	}
+	if got, want := err.Error(), "copilot token request failed with status 404: exchange rejected"; got != want {
+		t.Fatalf("GetToken() error = %q, want %q", got, want)
+	}
+	if exchangeCalls != 1 || userCalls != 1 {
+		t.Fatalf("exchange calls = %d, user validation calls = %d, want 1 and 1", exchangeCalls, userCalls)
 	}
 }
 
