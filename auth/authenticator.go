@@ -608,7 +608,9 @@ func (a *Authenticator) performRefresh(ctx context.Context, envToken string, for
 			a.tokenExpiry = time.Time{}
 		}
 		if err := a.exchangeForCopilotToken(ctx); err != nil {
-			return "", err
+			if bearerErr := a.useEnvAccessTokenAsBearer(ctx, envToken); bearerErr != nil {
+				return "", err
+			}
 		}
 		return a.copilotToken, nil
 	}
@@ -619,10 +621,34 @@ func (a *Authenticator) performRefresh(ctx context.Context, envToken string, for
 	return a.copilotToken, nil
 }
 
+// useEnvAccessTokenAsBearer accepts environment-provided tokens that the
+// Copilot API takes directly as bearer tokens — for example fine-grained
+// personal access tokens with the Copilot Requests permission — but that the
+// legacy Copilot token exchange endpoint rejects with 404. Like GitHub CLI
+// tokens, they are validated against the Copilot user endpoint, kept in memory
+// only, never written to the Copilot token cache, and revalidated on the
+// normal refresh cadence.
+func (a *Authenticator) useEnvAccessTokenAsBearer(ctx context.Context, envToken string) error {
+	if err := a.validateGitHubCLIToken(ctx, envToken); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	a.copilotToken = envToken
+	a.tokenExpiry = time.Now().Add(githubCLITokenTTL)
+	return nil
+}
+
 func (a *Authenticator) refreshToken(ctx context.Context, allowDeviceFlow bool) error {
 	if envToken, _ := lookupAccessTokenFromEnv(); envToken != "" {
 		a.accessToken = envToken
-		return a.exchangeForCopilotToken(ctx)
+		if err := a.exchangeForCopilotToken(ctx); err != nil {
+			if bearerErr := a.useEnvAccessTokenAsBearer(ctx, envToken); bearerErr != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
 	currentAccessToken := a.accessToken

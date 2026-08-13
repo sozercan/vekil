@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -157,6 +158,113 @@ func TestGetToken_EnvAccessTokenCachesInMemory(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("expected exactly 1 token exchange, got %d", calls)
+	}
+}
+
+func TestGetToken_EnvAccessTokenFallsBackToDirectBearer(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "github_pat_fine_grained")
+
+	var exchangeCalls, userCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			exchangeCalls++
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"Not Found","status":404}`))
+		case "/copilot_internal/user":
+			userCalls++
+			if got := r.Header.Get("Authorization"); got != "Bearer github_pat_fine_grained" {
+				t.Errorf("expected 'Bearer github_pat_fine_grained', got %q", got)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			t.Errorf("unexpected request path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	a := &Authenticator{
+		tokenDir:       t.TempDir(),
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	token, err := a.GetToken(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if token != "github_pat_fine_grained" {
+		t.Errorf("expected the env token used as a direct bearer, got %q", token)
+	}
+	if exchangeCalls != 1 || userCalls != 1 {
+		t.Fatalf("exchange calls = %d, user validation calls = %d, want 1 and 1", exchangeCalls, userCalls)
+	}
+}
+
+func TestGetToken_EnvAccessTokenBearerRejectionKeepsExchangeError(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "rejected-token")
+
+	var exchangeCalls, userCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			exchangeCalls++
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error_details":"exchange rejected"}`))
+		case "/copilot_internal/user":
+			userCalls++
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"bearer rejected"}`))
+		default:
+			t.Errorf("unexpected request path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	a := &Authenticator{
+		tokenDir:       t.TempDir(),
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	_, err := a.GetToken(context.Background())
+	if err == nil {
+		t.Fatal("expected the original exchange error")
+	}
+	if got, want := err.Error(), "copilot token request failed with status 404: exchange rejected"; got != want {
+		t.Fatalf("GetToken() error = %q, want %q", got, want)
+	}
+	if exchangeCalls != 1 || userCalls != 1 {
+		t.Fatalf("exchange calls = %d, user validation calls = %d, want 1 and 1", exchangeCalls, userCalls)
+	}
+}
+
+func TestUseEnvAccessTokenAsBearer_CanceledAfterValidationDoesNotCommit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	previousExpiry := time.Now().Add(time.Hour)
+	a := &Authenticator{
+		copilotToken:   "previous-token",
+		tokenExpiry:    previousExpiry,
+		copilotBaseURL: "http://copilot.test",
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       &cancelAfterJSONReadCloser{cancel: cancel},
+			}, nil
+		})},
+	}
+
+	if err := a.useEnvAccessTokenAsBearer(ctx, "environment-token"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("useEnvAccessTokenAsBearer() error = %v, want context.Canceled", err)
+	}
+	if a.copilotToken != "previous-token" {
+		t.Fatalf("copilot token = %q, want previous-token", a.copilotToken)
+	}
+	if !a.tokenExpiry.Equal(previousExpiry) {
+		t.Fatalf("token expiry = %v, want %v", a.tokenExpiry, previousExpiry)
 	}
 }
 
@@ -716,6 +824,23 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
+
+type cancelAfterJSONReadCloser struct {
+	cancel context.CancelFunc
+	read   bool
+}
+
+func (r *cancelAfterJSONReadCloser) Read(p []byte) (int, error) {
+	if r.read {
+		return 0, io.EOF
+	}
+	r.read = true
+	n := copy(p, `{}`)
+	r.cancel()
+	return n, io.EOF
+}
+
+func (*cancelAfterJSONReadCloser) Close() error { return nil }
 
 func writeAuthPreferencesForTest(t *testing.T, dir string, enabled bool) {
 	t.Helper()

@@ -6,7 +6,7 @@ Use this file when editing provider credentials, model ownership, JSON/YAML prov
 
 ### GitHub Copilot
 
-For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a GitHub token for a user with GitHub Copilot access. This is the only GitHub token environment variable Vekil consumes directly; it overrides cached Vekil login state and is exchanged for a short-lived Copilot token at startup.
+For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a GitHub token for a user with GitHub Copilot access. This is the only GitHub token environment variable Vekil consumes directly, and it overrides cached Vekil login state. Vekil first attempts to exchange it for a short-lived Copilot token. If that legacy exchange rejects a token that the Copilot user endpoint accepts directly, such as a fine-grained PAT with the Copilot Requests permission, Vekil instead uses the environment token as the Copilot bearer. That direct bearer is kept only in memory, is never written to the Copilot token cache, and is revalidated on the normal refresh cadence.
 
 Vekil intentionally ignores generic GitHub token variables such as `GH_TOKEN` and `GITHUB_TOKEN`. If you want Vekil to use an authenticated GitHub CLI account, opt in explicitly with `vekil login --github-cli` or `vekil login --gh`; Vekil then runs `gh auth token --hostname github.com` for Copilot access and keeps that token in memory only, without copying it into Vekil's `access-token` or `api-key.json` caches.
 
@@ -456,7 +456,7 @@ providers:
       - public_id: deepseek-v4-flash-free
         endpoints:
           - /chat/completions
-      - public_id: big-pickle
+      - public_id: hy3-free
         endpoints:
           - /chat/completions
 ```
@@ -465,10 +465,10 @@ Operational notes for the free tier:
 
 - Use `model_discovery: static`, not `openai`. Dynamic discovery lists the full Zen catalog, including paid models that reject the `public` key with `401`, and there is no cost-based filter (only `include_models`/`exclude_models`). Static discovery also skips the upstream readiness probe.
 - Do not set `default: true`. Under static discovery, unlisted models return `400`, so making this the catch-all only risks routing unknown models to a revocable trial gateway.
-- The free set rotates and individual promotions end without notice. When a promo ends, that model returns an error body (observed as `401`) such as `Free promotion has ended for <model>`. Re-check the live set before relying on it: `curl -s https://opencode.ai/zen/v1/models -H 'authorization: Bearer public'`.
+- The free set rotates and individual promotions end without notice. Removed models have returned `401` messages such as `Free promotion has ended for <model>` and `Model <model> is not supported`. Re-check the live set before relying on it: `curl -s https://opencode.ai/zen/v1/models -H 'authorization: Bearer public'`.
 - `public` is a shared anonymous credential, rate-limited server-side per IP. It suits personal, low-volume use, not fan-out or automation.
-- Free models are not zero-retention ("collected data may be used to improve the model"). `north-mini-code-free` (Cohere) and `nemotron-3-ultra-free` (NVIDIA) add "trial use only / do not submit confidential data" terms. Do not route proprietary or sensitive prompts through them.
-- `/responses` support is per model. It is verified working for `deepseek-v4-flash-free`, `north-mini-code-free`, and `nemotron-3-ultra-free`; `big-pickle` returns `401` ("not supported for format openai"). Add `/responses` to a model's `endpoints` only after confirming it, and keep the others `/chat/completions`-only.
+- Free models are not zero-retention ("collected data may be used to improve the model"). Do not route proprietary or sensitive prompts through them.
+- `/responses` support is per model. It is currently verified for `deepseek-v4-flash-free`; add `/responses` to another model's `endpoints` only after confirming it, and keep the others `/chat/completions`-only.
 - Client compatibility: Claude Code (`/v1/messages`) and Gemini CLI translate to `/chat/completions` and work against the free tier. The GitHub Copilot CLI works in offline BYOK mode with `COPILOT_PROVIDER_WIRE_API=completions`. The OpenAI Codex CLI does not work against Zen free models: it is `/responses`-only and always sends a built-in `web_search` tool with no `name`, which the free upstreams reject during responses→chat translation.
 
 For the full (paid) Zen catalog or higher limits, sign in at [opencode.ai/auth](https://opencode.ai/auth) and swap `api_key: public` for `api_key_env: OPENCODE_API_KEY` (still a static key, still no refresh). Swapping the key alone is not enough to route paid models: under `model_discovery: static` only the listed `models:` entries are routable, so add each paid model's `public_id` (and `endpoints`) you want to use, or switch to `model_discovery: openai` with `include_models` to opt into specific discovered paid IDs. Validate the free tier end to end with [`scripts/live-zen-smoke.sh`](../scripts/live-zen-smoke.sh) (a quick `curl`/`jq` check), or with the CLI-driven [`Live OpenCode Zen Smoke`](../.github/workflows/live-zen-smoke.yaml) workflow described in [Development](development.md#live-opencode-zen-cli-smoke-workflow).

@@ -342,13 +342,13 @@ For a credential-free generic-provider check, [`scripts/live-zen-smoke.sh`](../s
 
 The [`Live OpenCode Zen Smoke`](../.github/workflows/live-zen-smoke.yaml) workflow runs the **same** `scripts/live-cli-smoke.sh` harness as the Copilot smoke, but in `SMOKE_PROVIDER=zen` mode: it starts vekil with `examples/opencode-zen-free.yaml` (no credentials) and drives real coding-agent CLIs against the OpenCode Zen free tier. Because it needs no secrets, it runs on **every** pull request, **including external-contributor forks** — unlike the Copilot smoke, which self-skips on forks. It is the only live end-to-end coverage of vekil's generic `openai-compatible` provider routing (config loading, bearer auth, static model catalog, and the per-model endpoint allowlist), which zero-config Copilot startup never exercises.
 
-The Zen harness runs the **GitHub Copilot CLI** (offline BYOK mode, `COPILOT_PROVIDER_WIRE_API=completions`), **Claude Code**, and **Gemini CLI**. Copilot is required; Claude and Gemini become required gates whenever they are installed. Each client must independently produce the exact fixture output—one passing client cannot mask another.
+The Zen harness runs the **GitHub Copilot CLI** (offline BYOK mode, `COPILOT_PROVIDER_WIRE_API=completions`), **Claude Code**, and **Gemini CLI**. Copilot is required; Claude and Gemini become required gates whenever they are installed. Each client must independently produce its exact client-specific prompt sentinel—one passing client cannot mask another. Zen uses a direct text-only prompt because the configured free models advertise Chat text support, not reliable coding-tool execution; the credentialed Copilot smoke retains the file-reading fixture that exercises tools.
 
 After Claude Code 2.1.212 regressed headless output, the workflow pins a verified Claude Code version. Move the pin only after the candidate version passes the live smoke.
 
 For each client/model attempt, a bounded raw chat-completions canary runs first:
 
-- Only upstream conditions evidenced by an HTTP response are skippable: a promotion-ended/rate-limit/temporary-capacity message on an eligible response, HTTP 408/425/429, or HTTP 5xx. Local curl transport failures and timeouts are hard failures because they can indicate a stuck Vekil handler. Unknown statuses, including 404 and 405, are also hard failures.
+- Only upstream conditions evidenced by an HTTP response are skippable: a promotion-ended, exact model-no-longer-supported, rate-limit, or temporary-capacity message on an eligible response, HTTP 408/425/429, or HTTP 5xx. Local curl transport failures and timeouts are hard failures because they can indicate a stuck Vekil handler. Unknown statuses, including 404 and 405, are also hard failures.
 - After a 200 canary, any CLI nonzero exit, timeout, empty result, or mismatched result is a hard failure unless one bounded second canary on that same model proves that a recognized transient appeared between the first probe and the CLI run.
 - A neutral exit 0 is allowed only when no model was reachable **before any client was exercised**. Once a reachable model has exercised a client, every installed client must pass.
 
@@ -361,16 +361,34 @@ SMOKE_PROVIDER=zen PROVIDERS_CONFIG=examples/opencode-zen-free.yaml \
   scripts/live-cli-smoke.sh
 ```
 
+## Live Copilot Direct-Bearer Smoke Workflow
+
+The [`Live Copilot Direct Bearer Smoke`](../.github/workflows/live-copilot-direct-bearer-smoke.yaml) workflow is focused credentialed coverage for `COPILOT_GITHUB_TOKEN` values that GitHub accepts directly as Copilot bearers but rejects at the legacy Copilot token exchange. It uses a dedicated fine-grained PAT to verify the live sequence exactly: `/copilot_internal/v2/token` returns `404`, `/copilot_internal/user` returns `200`, Vekil returns the original environment token from `GetToken`, a second call uses the in-memory cache, and neither `access-token` nor `api-key.json` is written.
+
+The credentialed workflow runs only from trusted default-branch code: on pushes to `main` and on its weekly schedule. It intentionally has no `pull_request` or ref-selectable manual trigger, because package initialization and `TestMain` in pull-request-controlled code could otherwise read the repository PAT before the focused test runs. Pull requests instead exercise the same fallback and error-preservation logic through deterministic local-provider tests in `auth/authenticator_test.go`; the live workflow validates the merged implementation and GitHub's current `404`-then-`200` endpoint contract.
+
+Configure the repository secret `COPILOT_FINE_GRAINED_PAT` with a fine-grained personal access token for an account with Copilot access and the **Copilot Requests** permission. Do not reuse an exchange-compatible OAuth or classic token: the workflow intentionally fails unless the credential itself exercises the `404`-then-`200` fallback contract. A missing secret is a hard workflow failure.
+
+Run the exact check locally without printing the credential:
+
+```bash
+LIVE_COPILOT_DIRECT_BEARER_TEST=1 \
+  COPILOT_GITHUB_TOKEN=... \
+  go test ./auth -run '^TestLiveEnvAccessTokenDirectBearerFallback$' -count=1 -v
+```
+
 ## Live Copilot workflows setup
 
-The `Live Copilot Smoke` and `Live Copilot Semantic Policy Routing Smoke` workflows share one credential:
+The `Live Copilot Smoke` and `Live Copilot Semantic Policy Routing Smoke` workflows share one exchange-compatible credential:
 
 1. Create a GitHub token for a user that has GitHub Copilot access.
 2. Grant that token the `Copilot Requests` permission.
 3. Save it as the repository secret `COPILOT_GITHUB_TOKEN`.
 4. Run either workflow from the Actions tab; same-repository pull requests run both automatically.
 
-These workflows remain separate from deterministic core CI. Both neutral-skip fork pull requests because GitHub does not expose repository secrets to untrusted pull-request code. The semantic-policy workflow also neutral-skips Dependabot runs; `Live Copilot Smoke` neutral-skips Dependabot only when `COPILOT_GITHUB_TOKEN` is unavailable. In other contexts, a missing token fails the workflow.
+The direct-bearer workflow deliberately uses the separate `COPILOT_FINE_GRAINED_PAT` credential described above so the regular exchange path and the fine-grained-PAT fallback remain independently covered.
+
+The two pull-request-triggered Copilot workflows remain separate from deterministic core CI. Both neutral-skip fork pull requests because GitHub does not expose repository secrets to untrusted pull-request code. The semantic-policy workflow also neutral-skips Dependabot runs; `Live Copilot Smoke` neutral-skips Dependabot only when `COPILOT_GITHUB_TOKEN` is unavailable. In other contexts, a missing token fails the workflow. The direct-bearer workflow is default-branch-only as described above.
 
 You can also run the same smoke scripts locally after building `vekil`; the CLI smoke script additionally requires those three CLIs to be installed.
 

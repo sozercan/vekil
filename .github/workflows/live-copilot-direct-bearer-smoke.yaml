@@ -1,0 +1,49 @@
+name: Live Copilot Direct Bearer Smoke
+
+# Credentialed live coverage for the environment-token fallback used by
+# fine-grained PATs with Copilot Requests permission. The dedicated credential
+# must naturally receive 404 from the legacy Copilot token exchange while being
+# accepted by the Copilot user endpoint as a bearer. The test fails if either
+# side of that live contract changes, if Vekil does not return the environment
+# token directly, or if it persists the token. It deliberately runs only from
+# the trusted default branch so the repository PAT is never exposed to
+# pull-request-controlled code.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 9 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-copilot-direct-bearer-smoke-main
+  cancel-in-progress: true
+
+jobs:
+  direct-bearer-auth:
+    name: direct-bearer-auth
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_FINE_GRAINED_PAT }}
+    steps:
+      - name: Require direct-bearer smoke credential
+        run: |
+          if [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
+            echo "COPILOT_FINE_GRAINED_PAT repository secret is required for the direct-bearer smoke." >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Verify live fine-grained PAT direct-bearer fallback
+        env:
+          LIVE_COPILOT_DIRECT_BEARER_TEST: "1"
+        run: go test ./auth -run '^TestLiveEnvAccessTokenDirectBearerFallback$' -count=1 -v -timeout=2m

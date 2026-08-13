@@ -7,9 +7,10 @@
 # configured free model.
 #
 # The OpenCode Zen free set rotates and individual promotions end without notice
-# (an ended promo returns an error body such as "Free promotion has ended ...").
-# This script treats only HTTP-evidenced transient conditions (promotion ended,
-# rate limits, or 5xx capacity failures) as unavailable and
+# (ended models currently return either "Free promotion has ended ..." or
+# "Model ... is not supported"). This script treats only HTTP-evidenced
+# transient conditions (promotion ended, model removed, rate limits, or 5xx
+# capacity failures) as unavailable and
 # passes as long as at least one configured free model returns a completion.
 # Unknown statuses such as 404/405, invalid response shapes, proxy faults, and
 # local transport errors and timeouts are hard failures.
@@ -351,7 +352,7 @@ probe_model() {
       if printf '%s' "${errmsg}" | grep -qiE 'does not support /|unknown model|no upstream'; then
         printf 'FAIL proxy:%s\n' "${errmsg:0:70}"
       elif printf '%s' "${errmsg}" | grep -qiE \
-        'promotion (has )?ended|free promotion[^[:alnum:]]+ended|rate[ -]?limit|too many requests|temporar(il)?y unavailable|service unavailable|overload(ed)?|over capacity|capacity (has been )?exceeded|upstream[^[:alnum:]]+(timeout|unavailable)|gateway timeout'; then
+        'promotion (has )?ended|free promotion[^[:alnum:]]+ended|^model [[:alnum:]_.:/-]+ is not supported$|rate[ -]?limit|too many requests|temporar(il)?y unavailable|service unavailable|overload(ed)?|over capacity|capacity (has been )?exceeded|upstream[^[:alnum:]]+(timeout|unavailable)|gateway timeout'; then
         printf 'TRANSIENT message:%s\n' "${errmsg:0:70}"
       else
         printf 'FAIL http-%s %s\n' "${code}" "${errmsg:0:60}"
