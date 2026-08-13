@@ -136,7 +136,7 @@ func onReady() {
 					startProxy()
 				}
 			case <-mDashboard.ClickedCh:
-				openDashboard()
+				go openDashboard()
 			case <-mProvidersChoose.ClickedCh:
 				selectProvidersConfig()
 			case <-mProvidersClear.ClickedCh:
@@ -431,7 +431,10 @@ func stopMenubarProxyServer(current menubarProxyServer, timeout time.Duration) e
 
 // openDashboard opens the live traffic dashboard in the default browser. It is a
 // convenience shortcut; the dashboard is served by the proxy itself and is also
-// reachable directly at the dashboard URL.
+// reachable directly at the dashboard URL. On Linux this waits on the portal's
+// bounded, asynchronous OpenURI response (see portalOpenURITimeout), so it is
+// expected to be called on its own goroutine rather than the tray's single
+// menu-dispatch loop, the same as GitHub sign-in.
 func openDashboard() {
 	if !proxyLifecycle.isRunning() {
 		showErrorDialog("Vekil Not Running", "Start Vekil before opening the dashboard.")
@@ -440,8 +443,9 @@ func openDashboard() {
 	openURL(dashboardURL())
 }
 
-// signInWithGitHub drives the interactive GitHub device-code flow via native macOS
-// dialogs. It is expected to be called in its own goroutine.
+// signInWithGitHub drives the interactive GitHub device-code flow via the
+// platform's native confirmation prompt. It is expected to be called in its
+// own goroutine.
 func signInWithGitHub() {
 	// Guard against double sign-in.
 	signInMu.Lock()
@@ -473,14 +477,20 @@ func signInWithGitHub() {
 
 	copyToClipboard(dcResp.UserCode)
 
-	button := showOsascriptDialog(
-		"Sign in to GitHub Copilot",
-		fmt.Sprintf("Your code has been copied to the clipboard.\n\nEnter this code on GitHub:\n\n%s", dcResp.UserCode),
-		"Open GitHub",
-		"Cancel",
-	)
+	// The menu title shows the device code only while confirmation is
+	// awaited: refreshSessionUI (called on every exit path below, including
+	// a decline) immediately overwrites it. Only the clipboard copy survives
+	// a decline or refresh; retrying sign-in requests a fresh code.
+	mAuthMenu.SetTitle(fmt.Sprintf("GitHub Auth: Confirm code %s to continue", dcResp.UserCode))
 
-	if button == "Cancel" {
+	approved := confirmAction(ctx, confirmationPrompt{
+		Title:        "Sign in to GitHub Copilot",
+		Message:      fmt.Sprintf("Your code has been copied to the clipboard.\n\nEnter this code on GitHub:\n\n%s", dcResp.UserCode),
+		ApproveLabel: "Open GitHub",
+		DeclineLabel: "Cancel",
+	})
+
+	if !approved {
 		cancel()
 		refreshSessionUI()
 		setAuthActionsEnabled(true)
