@@ -687,9 +687,9 @@ EOF
 ZEN_MODEL_PREFS=(
   deepseek-v4-flash-free
   mimo-v2.5-free
-  north-mini-code-free
-  nemotron-3-ultra-free
-  big-pickle
+  hy3-free
+  ling-3.0-tiny-free
+  nemotron-3.5-lightning-free
 )
 
 ATTEMPT_STATUS=""
