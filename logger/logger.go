@@ -16,6 +16,7 @@ type Level int
 const (
 	LevelDebug Level = iota
 	LevelInfo
+	LevelWarn
 	LevelError
 	LevelFatal
 )
@@ -23,6 +24,7 @@ const (
 var levelNames = map[Level]string{
 	LevelDebug: "debug",
 	LevelInfo:  "info",
+	LevelWarn:  "warn",
 	LevelError: "error",
 	LevelFatal: "fatal",
 }
@@ -32,6 +34,8 @@ func ParseLevel(s string) Level {
 	switch s {
 	case "debug":
 		return LevelDebug
+	case "warn":
+		return LevelWarn
 	case "error":
 		return LevelError
 	default:
@@ -85,6 +89,11 @@ func (l *Logger) Debug(msg string, fields ...Field) {
 // Info logs a message at info level.
 func (l *Logger) Info(msg string, fields ...Field) {
 	l.log(LevelInfo, msg, toMap(fields))
+}
+
+// Warn logs a message at warn level.
+func (l *Logger) Warn(msg string, fields ...Field) {
+	l.log(LevelWarn, msg, toMap(fields))
 }
 
 // Error logs a message at error level.
