@@ -396,6 +396,20 @@ func copilotChatProxyOptionWithModelDiscovery(baseURL string) proxy.Option {
 	}}})
 }
 
+func responsesBackedProxyOption(baseURL string) proxy.Option {
+	return proxy.WithProvidersConfig(proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{{
+		ID:       "test-provider",
+		Type:     "openai-compatible",
+		Default:  true,
+		BaseURL:  baseURL,
+		AuthType: "none",
+		Models: []proxy.ProviderModelConfig{{
+			PublicID:  "gpt-5",
+			Endpoints: []string{"/responses"},
+		}},
+	}}})
+}
+
 func TestServerInitializePolicyRoutingDelegatesWhenDisabled(t *testing.T) {
 	srv, err := New(
 		auth.NewTestAuthenticator("test-token"),
@@ -517,6 +531,7 @@ func TestRequestLogIncludesSummaryUsageAndUpstreamRequestID(t *testing.T) {
 	}
 	want := map[string]interface{}{
 		"msg":                 "request completed",
+		"level":               "info",
 		"method":              "POST",
 		"path":                "/v1/chat/completions",
 		"endpoint":            "openai_chat",
@@ -536,6 +551,194 @@ func TestRequestLogIncludesSummaryUsageAndUpstreamRequestID(t *testing.T) {
 			t.Fatalf("log[%s] = %#v, want %v in %#v", key, entry[key], expected, entry)
 		}
 	}
+}
+
+// A non-2xx must name why: type, code, param and message on the one line.
+func TestRequestLogWarnsWithErrorDetailOnNonSuccess(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("upstream called at %q; the request must be rejected locally", r.URL.Path)
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelInfo, &logs),
+		"127.0.0.1",
+		"0",
+		WithProxyOptions(copilotChatProxyOptionWithModelDiscovery(upstream.URL)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	// A replay ID on a route that has no /responses endpoint: an invalid request
+	// carrying all four of type, code, param and message.
+	body := `{"model":"gpt-5","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("StatusCode = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	entry := requestLogEntry(t, logs.String(), "request completed")
+	want := map[string]any{
+		"level":         "warn",
+		"msg":           "request completed",
+		"path":          "/v1/chat/completions",
+		"model":         "gpt-5",
+		"error_type":    "invalid_request_error",
+		"error_code":    "responses_replay_state_missing",
+		"error_param":   "messages",
+		"error_message": "Responses-backed tool state is no longer available; restart the assistant tool-call turn.",
+	}
+	for key, expected := range want {
+		if got := entry[key]; got != expected {
+			t.Fatalf("log[%s] = %#v, want %#v in %#v", key, got, expected, entry)
+		}
+	}
+	if got, ok := entry["status"].(float64); !ok || got != 400 {
+		t.Fatalf("log[status] = %#v, want 400 in %#v", entry["status"], entry)
+	}
+}
+
+// End to end: a relayed upstream error must not put its prose on this line.
+func TestRequestLogWithholdsUpstreamAuthoredErrorMessage(t *testing.T) {
+	const secret = "SSN 123-45-6789 from the user prompt"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"bad_value","param":"messages","message":"Invalid value for 'messages[0].content': `+secret+`"}}`)
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelInfo, &logs),
+		"127.0.0.1",
+		"0",
+		WithProxyOptions(responsesBackedProxyOption(upstream.URL)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	body := `{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("StatusCode = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), secret) {
+		t.Fatalf("client no longer receives the upstream message; fixture is stale: %s", w.Body.String())
+	}
+	if strings.Contains(logs.String(), secret) {
+		t.Fatalf("upstream message leaked into the log: %s", logs.String())
+	}
+	entry := requestLogEntry(t, logs.String(), "request completed")
+	if entry["level"] != "warn" {
+		t.Fatalf("log[level] = %#v, want warn in %#v", entry["level"], entry)
+	}
+	if _, ok := entry["error_message"]; ok {
+		t.Fatalf("log carried error_message for an upstream error: %#v", entry)
+	}
+}
+
+// A stream truncated after its 200 was committed is still a failure: the wire
+// status stays 200, so only the summary knows the turn did not survive.
+func TestRequestLogWarnsOnPostCommitStreamFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-1\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n")
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelInfo, &logs),
+		"127.0.0.1",
+		"0",
+		WithProxyOptions(copilotChatProxyOptionWithModelDiscovery(upstream.URL)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	body := `{"model":"gpt-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want the committed 200", w.Code)
+	}
+	entry := requestLogEntry(t, logs.String(), "request failed after response headers were committed")
+	if entry["level"] != "warn" {
+		t.Fatalf("log[level] = %#v, want warn in %#v", entry["level"], entry)
+	}
+	if got, ok := entry["status"].(float64); !ok || got != 200 {
+		t.Fatalf("log[status] = %#v, want the committed 200 in %#v", entry["status"], entry)
+	}
+	// The warn is only actionable with the recorded status that explains it; asserting the
+	// level alone would still pass if stats_status silently stopped being emitted.
+	if got, ok := entry["stats_status"].(float64); !ok || got == 200 {
+		t.Fatalf("log[stats_status] = %#v, want the diverging recorded status in %#v", entry["stats_status"], entry)
+	}
+}
+
+// The auth gate rejects before any handler runs; it still has to be logged.
+func TestRequestLogWarnsOnInboundAuthRejection(t *testing.T) {
+	var logs bytes.Buffer
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelInfo, &logs),
+		"127.0.0.1",
+		"0",
+		WithInboundAuthToken("secret-token"),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	rec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}")))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("StatusCode = %d, want 401", rec.Code)
+	}
+	entry := requestLogEntry(t, logs.String(), "request completed")
+	if entry["level"] != "warn" {
+		t.Fatalf("log[level] = %#v, want warn in %#v", entry["level"], entry)
+	}
+	if got, ok := entry["status"].(float64); !ok || got != 401 {
+		t.Fatalf("log[status] = %#v, want 401 in %#v", entry["status"], entry)
+	}
+	if strings.Contains(logs.String(), "secret-token") {
+		t.Fatalf("auth token leaked into the log: %s", logs.String())
+	}
+}
+
+func requestLogEntry(t *testing.T, logs string, wantMsg string) map[string]any {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(logs), "\n") {
+		var entry map[string]any
+		if json.Unmarshal([]byte(line), &entry) != nil {
+			continue
+		}
+		if entry["msg"] == wantMsg {
+			return entry
+		}
+	}
+	t.Fatalf("no %q log entry in %q", wantMsg, logs)
+	return nil
 }
 
 // TestStreamingChatCompletionsPassthroughThroughServer drives a streaming
@@ -1984,5 +2187,56 @@ func TestInboundAuthProtectsLaunchRoutes(t *testing.T) {
 				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, tc.wantStatus, recorder.Body.String())
 			}
 		})
+	}
+}
+
+// Auth runs inside withRequestLog so the rejection is logged. It must not also be counted:
+// an unauthenticated caller reached no inference handler, and letting it move request-rate,
+// latency and error dashboards hands a stats lever to anyone who can open a socket.
+func TestInboundAuthRejectionIsLoggedButNotCounted(t *testing.T) {
+	var logs bytes.Buffer
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelInfo, &logs),
+		"127.0.0.1", "0",
+		WithInboundAuthToken("secret-token"),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	rejected := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(rejected,
+		httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}")))
+	if rejected.Code != http.StatusUnauthorized {
+		t.Fatalf("StatusCode = %d, want 401", rejected.Code)
+	}
+	// Guard: if the rejection stopped being logged this test would pass for the wrong reason.
+	if entry := requestLogEntry(t, logs.String(), "request completed"); entry["status"].(float64) != 401 {
+		t.Fatalf("the 401 was not logged: %#v", entry)
+	}
+
+	statsReq := httptest.NewRequest(http.MethodGet, "/stats.json", nil)
+	statsReq.Header.Set("x-api-key", "secret-token")
+	stats := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(stats, statsReq)
+	body := stats.Body.String()
+	if stats.Code != http.StatusOK {
+		t.Fatalf("stats.json = %d, want 200: %s", stats.Code, body)
+	}
+	var snap map[string]any
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("decode stats.json: %v (%s)", err, body)
+	}
+	totals, ok := snap["totals"].(map[string]any)
+	if !ok {
+		t.Fatalf("stats.json has no totals object; this test would assert nothing: %s", body)
+	}
+	total, ok := totals["requests"].(float64)
+	if !ok {
+		t.Fatalf("totals.requests missing or not a number; this test would assert nothing: %s", body)
+	}
+	if total != 0 {
+		t.Fatalf("totals.requests = %v, want 0: an unauthenticated request was counted", total)
 	}
 }

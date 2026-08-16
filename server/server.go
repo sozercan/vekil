@@ -128,6 +128,10 @@ func (r *responseRecorder) Write(p []byte) (int, error) {
 	return n, err
 }
 
+func statusIsSuccess(status int) bool {
+	return status == http.StatusSwitchingProtocols || (status >= 200 && status < 300)
+}
+
 func (r *responseRecorder) Flush() {
 	if f, ok := r.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
@@ -178,6 +182,10 @@ func withInboundAuth(next http.Handler, token string) http.Handler {
 			}
 		}
 		if len(provided) != len(token) || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+			// Auth sits inside withRequestLog so the rejection is logged, but no inference
+			// handler ran: counting it would let an unauthenticated caller move request-rate,
+			// latency and error dashboards.
+			proxy.RequestSummaryFromContext(r.Context()).SuppressStats()
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			w.WriteHeader(http.StatusUnauthorized)
@@ -288,7 +296,17 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 				}
 			}
 			fields = append(fields, summary.LoggerFields()...)
-			log.Info("request completed", fields...)
+			if statsStatus != status {
+				fields = append(fields, logger.F("stats_status", statsStatus))
+			}
+			switch {
+			case statusIsSuccess(status) && statsStatus == status:
+				log.Info("request completed", fields...)
+			case statsStatus != status:
+				log.Warn("request failed after response headers were committed", fields...)
+			default:
+				log.Warn("request completed", fields...)
+			}
 		}
 	})
 }
@@ -331,8 +349,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /favicon.ico", handler.HandleFavicon)
 
 	addr := fmt.Sprintf("%s:%s", host, port)
-	httpHandler := withRequestLog(withProviderValidationGate(mux, handler), log, handler)
-	httpHandler = withInboundAuth(httpHandler, cfg.inboundAuthToken)
+	httpHandler := withRequestLog(withInboundAuth(withProviderValidationGate(mux, handler), cfg.inboundAuthToken), log, handler)
 	return &Server{
 		httpServer: &http.Server{
 			Addr:         addr,
